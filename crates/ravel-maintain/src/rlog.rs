@@ -1830,6 +1830,24 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The scratch need's margin over the inputs' stored bytes, in percent,
+    /// in place of 130, for a test whose runs outgrow the reservation.
+    static SCRATCH_NEED_PERCENT: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A unit's scratch need as a percentage of its inputs' stored bytes
+/// (ADR-3853 D2: 1.3 times).
+fn scratch_need_percent() -> u64 {
+    #[cfg(test)]
+    if let Some(percent) = SCRATCH_NEED_PERCENT.with(std::cell::Cell::get) {
+        return percent;
+    }
+    130
+}
+
 /// The calling thread's [`SCRATCH_FREE_OVERRIDE`], read before a free-space
 /// probe moves to the blocking pool.
 fn scratch_free_override() -> Option<std::result::Result<u64, i32>> {
@@ -1862,19 +1880,33 @@ fn statvfs_free(
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
 
+/// The bytes under a scratch directory, from [`scratch_used_bytes`].
+#[derive(Clone, Copy, Debug)]
+struct ScratchUsed {
+    /// Every file under the directory.
+    total: u64,
+    /// The files outside every unit subdirectory ([`SCRATCH_UNIT_PREFIX`]),
+    /// all of which belong to this process's live units once it holds the
+    /// directory's lock.
+    outside_units: u64,
+}
+
 /// The bytes of every file under `dir`, at any depth, symlinks not followed.
 /// An entry a concurrent unit wipe removes mid-walk counts as gone; any other
 /// failure is [`MaintainError::ScratchFreeUnreadable`].
-fn scratch_used_bytes(dir: &std::path::Path) -> Result<u64> {
+fn scratch_used_bytes(dir: &std::path::Path) -> Result<ScratchUsed> {
     let unreadable =
         |at: &std::path::Path, e: std::io::Error| MaintainError::ScratchFreeUnreadable {
             path: dir.to_path_buf(),
             error: format!("walk {}: {e}", at.display()),
         };
     let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
-    let mut used = 0u64;
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(next) = pending.pop() {
+    let mut used = ScratchUsed {
+        total: 0,
+        outside_units: 0,
+    };
+    let mut pending = vec![(dir.to_path_buf(), false)];
+    while let Some((next, in_unit)) = pending.pop() {
         let entries = match std::fs::read_dir(&next) {
             Ok(entries) => entries,
             Err(e) if gone(&e) && next != dir => continue,
@@ -1891,14 +1923,33 @@ fn scratch_used_bytes(dir: &std::path::Path) -> Result<u64> {
                 Err(e) if gone(&e) => continue,
                 Err(e) => return Err(unreadable(&entry.path(), e)),
             };
+            let in_unit = in_unit
+                || (next == dir
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(SCRATCH_UNIT_PREFIX));
             if meta.is_dir() {
-                pending.push(entry.path());
+                pending.push((entry.path(), in_unit));
             } else {
-                used = used.saturating_add(meta.len());
+                used.total = used.total.saturating_add(meta.len());
+                if !in_unit {
+                    used.outside_units = used.outside_units.saturating_add(meta.len());
+                }
             }
         }
     }
     Ok(used)
+}
+
+/// The figures the headroom admission reads for a scratch directory.
+#[derive(Clone, Copy, Debug)]
+struct ScratchHeadroomFigures {
+    /// The bytes the directory may still take.
+    free: u64,
+    /// Under a cap, the bytes outside every unit subdirectory
+    /// ([`ScratchUsed::outside_units`]); 0 with no cap, where it is not read.
+    baseline: u64,
 }
 
 /// The free figure the headroom admission reads for `dir` (ADR-3853 D2): the
@@ -1908,12 +1959,16 @@ fn scratch_headroom_free(
     dir: &std::path::Path,
     max_bytes: Option<u64>,
     free_override: Option<std::result::Result<u64, i32>>,
-) -> Result<u64> {
+) -> Result<ScratchHeadroomFigures> {
     let free = statvfs_free(dir, free_override)?;
     let Some(max_bytes) = max_bytes else {
-        return Ok(free);
+        return Ok(ScratchHeadroomFigures { free, baseline: 0 });
     };
-    Ok(free.min(max_bytes.saturating_sub(scratch_used_bytes(dir)?)))
+    let used = scratch_used_bytes(dir)?;
+    Ok(ScratchHeadroomFigures {
+        free: free.min(max_bytes.saturating_sub(used.total)),
+        baseline: used.outside_units,
+    })
 }
 
 /// Run the blocking scratch filesystem call `job` on tokio's blocking pool, so
@@ -1935,7 +1990,9 @@ where
 async fn scratch_free_bytes(path: &std::path::Path, max_bytes: Option<u64>) -> Result<u64> {
     let free_override = scratch_free_override();
     let path = path.to_path_buf();
-    scratch_blocking(move || scratch_headroom_free(&path, max_bytes, free_override)).await
+    scratch_blocking(move || scratch_headroom_free(&path, max_bytes, free_override))
+        .await
+        .map(|figures| figures.free)
 }
 
 /// The lock file inside a scratch directory. Its name never matches
@@ -2016,29 +2073,115 @@ fn lock_scratch_dir(scratch_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Scratch bytes the running two-level merges of this process hold reserved,
-/// per scratch directory. Units run concurrently, so each admission sets its
-/// need aside here before the next one reads the free figure.
+/// One running unit's charge against its scratch directory: the larger of its
+/// need and the run-part bytes it has written. Only a capped unit's writes
+/// raise `written`.
+#[derive(Clone, Copy, Debug)]
+struct ScratchCharge {
+    need: u64,
+    written: u64,
+}
+
+impl ScratchCharge {
+    fn bytes(self) -> u64 {
+        self.need.max(self.written)
+    }
+}
+
+/// The charges of the running two-level merges of this process, per scratch
+/// directory and unit. Units run concurrently, so each admission sets its need
+/// aside here before the next one reads the free figure.
+#[allow(clippy::type_complexity)]
 static SCRATCH_RESERVED: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+    std::sync::Mutex<
+        std::collections::HashMap<
+            std::path::PathBuf,
+            std::collections::HashMap<u64, ScratchCharge>,
+        >,
+    >,
 > = std::sync::LazyLock::new(Default::default);
 
+/// The sum of the charges in `units` other than `except`'s.
+fn scratch_charges(
+    units: Option<&std::collections::HashMap<u64, ScratchCharge>>,
+    except: Option<u64>,
+) -> u64 {
+    units.map_or(0, |units| {
+        units
+            .iter()
+            .filter(|(id, _)| Some(**id) != except)
+            .fold(0u64, |a, (_, c)| a.saturating_add(c.bytes()))
+    })
+}
+
 /// What the units of this process running in `scratch_dir` hold reserved.
+#[cfg(test)]
 fn scratch_reserved(scratch_dir: &std::path::Path) -> u64 {
-    SCRATCH_RESERVED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(scratch_dir)
-        .copied()
-        .unwrap_or(0)
+    scratch_reserved_except(scratch_dir, None)
+}
+
+/// What the units of this process running in `scratch_dir` other than
+/// `except` hold reserved.
+fn scratch_reserved_except(scratch_dir: &std::path::Path, except: Option<u64>) -> u64 {
+    scratch_charges(
+        SCRATCH_RESERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(scratch_dir),
+        except,
+    )
 }
 
 /// One unit's share of its scratch directory's headroom, given back on drop.
 struct ScratchReservation {
     dir: std::path::PathBuf,
-    bytes: u64,
+    /// The unit's key in [`SCRATCH_RESERVED`].
+    unit: u64,
+    need: u64,
     /// The free figure the unit was admitted against.
     free: u64,
+    /// The bytes under the directory outside every unit subdirectory at
+    /// admission, under a cap; 0 with none.
+    baseline: u64,
+}
+
+/// A capped unit's hold on `--maintain-scratch-max-bytes` while it runs
+/// (ADR-3853 D2).
+struct ScratchCap {
+    dir: std::path::PathBuf,
+    unit: u64,
+    need: u64,
+    baseline: u64,
+    max_bytes: u64,
+}
+
+impl ScratchCap {
+    /// Charge a run-part write of `payload` bytes to the unit: its charge
+    /// becomes the larger of its need and its written bytes with this write,
+    /// unless the baseline plus every live unit's charge would then exceed the
+    /// cap, in which case nothing changes and this returns false.
+    fn charge(&self, payload: u64) -> bool {
+        let mut reserved = SCRATCH_RESERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let units = reserved.entry(self.dir.clone()).or_default();
+        let others = scratch_charges(Some(units), Some(self.unit));
+        let mut charge = units.get(&self.unit).copied().unwrap_or(ScratchCharge {
+            need: self.need,
+            written: 0,
+        });
+        charge.written = charge.written.saturating_add(payload);
+        if self
+            .baseline
+            .saturating_add(others)
+            .saturating_add(charge.bytes())
+            > self.max_bytes
+        {
+            return false;
+        }
+        units.insert(self.unit, charge);
+        true
+    }
 }
 
 impl ScratchReservation {
@@ -2053,14 +2196,16 @@ impl ScratchReservation {
         max_bytes: Option<u64>,
         need: u64,
     ) -> Result<Self> {
+        static NEXT_UNIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let free_override = scratch_free_override();
         let dir = scratch_dir.to_path_buf();
         scratch_blocking(move || {
             let mut reserved = SCRATCH_RESERVED
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let free = scratch_headroom_free(&dir, max_bytes, free_override)?;
-            let held = reserved.get(&dir).copied().unwrap_or(0);
+            let ScratchHeadroomFigures { free, baseline } =
+                scratch_headroom_free(&dir, max_bytes, free_override)?;
+            let held = scratch_charges(reserved.get(&dir), None);
             if free.saturating_sub(held) < need {
                 return Err(MaintainError::ScratchHeadroom {
                     need,
@@ -2069,15 +2214,31 @@ impl ScratchReservation {
                     path: dir,
                 });
             }
-            let total = reserved.entry(dir.clone()).or_insert(0);
-            *total = total.saturating_add(need);
+            let unit = NEXT_UNIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            reserved
+                .entry(dir.clone())
+                .or_default()
+                .insert(unit, ScratchCharge { need, written: 0 });
             Ok(ScratchReservation {
                 dir,
-                bytes: need,
+                unit,
+                need,
                 free,
+                baseline,
             })
         })
         .await
+    }
+
+    /// The unit's hold on `max_bytes` for its writes, or `None` with no cap.
+    fn cap(&self, max_bytes: Option<u64>) -> Option<ScratchCap> {
+        Some(ScratchCap {
+            dir: self.dir.clone(),
+            unit: self.unit,
+            need: self.need,
+            baseline: self.baseline,
+            max_bytes: max_bytes?,
+        })
     }
 }
 
@@ -2086,9 +2247,9 @@ impl Drop for ScratchReservation {
         let mut reserved = SCRATCH_RESERVED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(total) = reserved.get_mut(&self.dir) {
-            *total = total.saturating_sub(self.bytes);
-            if *total == 0 {
+        if let Some(units) = reserved.get_mut(&self.dir) {
+            units.remove(&self.unit);
+            if units.is_empty() {
                 reserved.remove(&self.dir);
             }
         }
@@ -2203,13 +2364,16 @@ fn scratch_backend(store: &Arc<ScratchStore>) -> Arc<dyn ObjectStoreBackend> {
 /// A unit's scratch store that adds every byte read from it to the ledger's
 /// scratch counters (ADR-3853 D6), as stored: a run's encoded bytes, never a
 /// request phase. Writes reach it only through the level-1 workers'
-/// [`StoreProxy`], which counts them when issued. It records a write that
-/// failed for want of space in `full`. Its capabilities report no multipart
-/// upload: a multipart write would bypass that record.
+/// [`StoreProxy`], which counts them when issued. It records in `full` a write
+/// that failed for want of space, and under a cap a write it refused before
+/// issuing because the cap could not take it ([`ScratchCap::charge`]). Its
+/// capabilities report no multipart upload: a multipart write would bypass
+/// both.
 struct ScratchMeter {
     scratch: Arc<dyn ObjectStoreBackend>,
     ledger: Option<RequestLedger>,
     full: std::sync::atomic::AtomicBool,
+    cap: Option<ScratchCap>,
 }
 
 #[async_trait::async_trait]
@@ -2220,6 +2384,17 @@ impl ObjectStoreBackend for ScratchMeter {
         data: Bytes,
         opts: PutOptions,
     ) -> std::result::Result<PutOutcome, StoreError> {
+        if let Some(cap) = &self.cap
+            && !cap.charge(data.len() as u64)
+        {
+            self.full.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(StoreError::Permanent(format!(
+                "scratch directory {}: a {}-byte write would take it past its {}-byte cap",
+                cap.dir.display(),
+                data.len(),
+                cap.max_bytes
+            )));
+        }
         // The write was counted where the level-1 worker issued it
         // ([`StoreProxy::put`]).
         self.scratch.put(key, data, opts).await.inspect_err(|e| {
@@ -2375,7 +2550,9 @@ async fn two_level_merge(
     let stored = catalogs
         .iter()
         .fold(0u64, |a, c| a.saturating_add(c.object_size));
-    let need = stored.saturating_mul(13).div_ceil(10);
+    let need = stored
+        .saturating_mul(scratch_need_percent())
+        .div_ceil(100);
     let scratch_dir = target.scratch_dir.to_path_buf();
     scratch_blocking(move || {
         std::fs::create_dir_all(&scratch_dir).map_err(|e| {
@@ -2390,12 +2567,15 @@ async fn two_level_merge(
     let reservation =
         ScratchReservation::admit(target.scratch_dir, config.scratch_max_bytes, need).await?;
     let free = reservation.free;
+    let cap = reservation.cap(config.scratch_max_bytes);
+    let unit_key = reservation.unit;
 
     let unit = ScratchUnit::open(target.scratch_dir, target.input_set_hash, reservation).await?;
     let meter = ScratchMeter {
         scratch: scratch_backend(&unit.store),
         ledger: config.request_ledger.clone(),
         full: std::sync::atomic::AtomicBool::new(false),
+        cap,
     };
     let layout = TwoLevelLayout {
         per_input,
@@ -2414,7 +2594,14 @@ async fn two_level_merge(
     // still hold their space.
     let merged = match merged {
         Err(err) if meter.full.load(std::sync::atomic::Ordering::Relaxed) => {
-            scratch_full_refusal(target.scratch_dir, config.scratch_max_bytes, need, err).await
+            scratch_full_refusal(
+                target.scratch_dir,
+                config.scratch_max_bytes,
+                need,
+                unit_key,
+                err,
+            )
+            .await
         }
         other => other,
     };
@@ -2423,12 +2610,14 @@ async fn two_level_merge(
 }
 
 /// The [`MaintainError::ScratchHeadroom`] refusal for a unit whose scratch
-/// write failed with `err` for want of space, or
+/// write failed with `err` for want of space or was refused at the cap, or
 /// [`MaintainError::ScratchFreeUnreadable`] when the free figure cannot be read.
+/// `reserved` is what the process's units other than `unit` hold.
 async fn scratch_full_refusal(
     scratch_dir: &std::path::Path,
     max_bytes: Option<u64>,
     need: u64,
+    unit: u64,
     err: MaintainError,
 ) -> Result<MergeOutput> {
     let free = match scratch_free_bytes(scratch_dir, max_bytes).await {
@@ -2444,7 +2633,7 @@ async fn scratch_full_refusal(
             return Err(free_error);
         }
     };
-    let reserved = scratch_reserved(scratch_dir).saturating_sub(need);
+    let reserved = scratch_reserved_except(scratch_dir, Some(unit));
     tracing::warn!(
         path = %scratch_dir.display(),
         need,
