@@ -1286,39 +1286,38 @@ same, as for the other signals.
 
 Two limits apply to metrics only. The byte cap: a part whose `label_value`
 leaves would total more than `metrics_label_index_max_ratio_ppm` parts per
-million of its entries' object bytes (default 10,000, which is 1%; rounded
-down) gets no ref for the field, every entry is counted uncovered, and the
-fold report's `metrics_label_index_parts_over_cap` counts the part. The cap
-is checked at the end of each pass against the slices earlier passes PUT
-plus the pass's own, so a build that crosses it in a later pass has
-already PUT the earlier passes' slices; HEAD names none of them, and the
-catalog sweep removes them as unreferenced (test
+million of its entries' object bytes (default 1%, ten thousand parts per
+million; rounded down) gets no ref for the field, every entry is counted
+uncovered, and the fold report's `metrics_label_index_parts_over_cap` counts
+the part. The cap is checked at the end of each pass against the slices
+earlier passes PUT plus the pass's own, so a build that crosses it in a
+later pass has already PUT the earlier passes' slices; HEAD names none of
+them, and the catalog sweep removes them as unreferenced (test
 `slices_each_under_the_byte_cap_but_over_it_together_are_uncovered`).
 Checking before any PUT would keep every pass's encoded slices until the
 last pass, which the per-pass memory bound under "Pair budget" rules out.
 The erasure gate: before building, the fold lists the tenant's pending
 metrics erasure requests (`t/<tenant>/m/del/`) once
 (`metrics_label_index_erasure_list_requests`, also in `list_requests`).
-While any request is pending, or when that listing fails, the fold builds
-no metrics leaf, so no leaf is built while a request is pending at the
-start of the fold; every part it re-encodes is published without refs and
-counted in `metrics_label_index_parts_erasure_gated`, and a part carried
-forward by reference keeps the refs it has. A request that arrives after
-that listing does not stop the fold's build, so the gate alone does not
-keep the key8 of an erased string out of every leaf; the router prunes
-nothing on metrics while `del/` is non-empty (ADR-3694 decision 2, wired by
-T5; until then no query reads the leaf at all), so no query acts on such a
-leaf until the erasure completes. A part re-encoded while a request was pending
-is published uncovered and stays uncovered while later folds reuse it by
+While any request is pending, or when that listing fails, the fold builds no
+metrics leaf, so no leaf is built while a request is pending at the start of
+the fold; every part it re-encodes is published without refs and counted in
+`metrics_label_index_parts_erasure_gated`, and a part carried forward by
+reference keeps the refs it has. A request that arrives after that listing
+does not stop the fold's build, so the gate alone does not keep the key8 of
+an erased string out of every leaf; the router prunes nothing on metrics
+while `del/` is non-empty (ADR-3694 decision 2, wired by T5; until then no
+query reads the leaf at all), so no query acts on such a leaf until the
+erasure completes. A part re-encoded while a request was pending is
+published uncovered and stays uncovered while later folds reuse it by
 reference; after the erasure completes, `ravel-cli catalog fold
 --rebuild-key-index --signal metrics --metrics-label-index` attaches its
 leaf. `--rebuild-key-index --signal metrics --metrics-label-index` applies
 the same cap and the same gate (its report carries `parts_over_cap`,
 `parts_erasure_gated`, `erasure_list_requests` and `erasure_get_requests`,
-the GETs of the pending requests' `.dreq` objects; a gated run reads no
-part and publishes nothing),
-reads every entry by range, and writes the leaf a fold with both switches
-on writes for the same part, byte for byte
+the GETs of the pending requests' `.dreq` objects; a gated run reads no part
+and publishes nothing), reads every entry by range, and writes the leaf a
+fold with both switches on writes for the same part, byte for byte
 (`a_rebuilt_metrics_leaf_is_byte_identical_to_the_folds_leaf`). No query
 path reads the metrics leaf yet, and `ravel-server` has no flag for
 `metrics_label_index`.
