@@ -39,7 +39,7 @@ use crate::io_shape::{IoShapeCounts, PlanClass, QueryIoShape};
 use crate::limiter::GetLimiter;
 use crate::log_fetcher::{DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogSegmentFetcher};
 use crate::log_series;
-use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
+use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot, QueryPhase};
 use crate::request_budgets::RequestBudgets;
 use crate::segment_admission::{self, RequestBudget};
 
@@ -2142,6 +2142,10 @@ impl QueryEngine {
             // matcher set keeps only the segments none of its positive
             // equality values is routed away from. Every plan's segments come
             // from the one snapshot resolved over the padded union window.
+            let leaf_requests_before = accounting
+                .snapshot()
+                .phase(QueryPhase::KeyIndex)
+                .total_s3_requests();
             let plan_keeps = self
                 .route_metric_plans(
                     tenant_hash,
@@ -2154,18 +2158,21 @@ impl QueryEngine {
             drop(parts);
             // The route's leaf GETs are charged before any segment fetch
             // runs, and a plan whose every segment was pruned runs no fetch
-            // batch, so the budgets are checked here as well as per batch.
-            if let Some(err) = bytes_scanned_exceeded(
-                accounting.snapshot().pooled().total_s3_bytes(),
-                max_bytes_scanned,
-            ) {
-                return Err(err);
-            }
-            if let Some(err) = segment_admission::request_budget_exceeded(
-                accounting.snapshot().pooled().total_s3_requests(),
-                RequestBudget::new(max_s3_requests, fold_lag),
-            ) {
-                return Err(err);
+            // batch, so once the route has issued a leaf GET the budgets are
+            // checked here as well as per batch.
+            let routed = accounting.snapshot();
+            if routed.phase(QueryPhase::KeyIndex).total_s3_requests() > leaf_requests_before {
+                if let Some(err) =
+                    bytes_scanned_exceeded(routed.pooled().total_s3_bytes(), max_bytes_scanned)
+                {
+                    return Err(err);
+                }
+                if let Some(err) = segment_admission::request_budget_exceeded(
+                    routed.pooled().total_s3_requests(),
+                    RequestBudget::new(max_s3_requests, fold_lag),
+                ) {
+                    return Err(err);
+                }
             }
             let pruned_by_label_index =
                 segments_pruned_by_label_index(&plan_keeps, snapshot.segments.len());

@@ -1178,10 +1178,12 @@ proves that no object in it holds the string `v`, so no series in it carries
   leaf that names another tenant or signal fails the statement; any other
   leaf failure leaves its part `Uncovered`.
 - The leaf GETs count against `max_s3_requests` and `max_bytes_scanned`.
-  Both budgets are checked once the route returns, before the first segment
-  fetch, and also when every segment was pruned and no fetch runs, so such
-  a query refuses with the same budget error a fetch batch returns
-  (`a_route_that_prunes_every_object_is_held_to_the_budgets`).
+  When the route issued a leaf GET, both budgets are checked once it
+  returns, before the first segment fetch, and so also when every segment
+  was pruned and no fetch runs; such a query refuses with the same budget
+  error a fetch batch returns
+  (`a_route_that_prunes_every_object_is_held_to_the_budgets`). A route that
+  issued no leaf GET adds no check before the fetch batches' own.
 
 `segmentsPrunedByLabelIndex`, beside `segmentsPruned` in `data.stats`, counts
 the snapshot segments no plan reads. Unlike a dictionary drop, a pruned

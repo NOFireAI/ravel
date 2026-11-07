@@ -693,10 +693,12 @@ distinct value count beside the figure.
 
 The passes run at most `promql_fetch_fanout` at a time, the width the
 per-plan fetch passes run at. Their leaf GETs count against
-`max_s3_requests` and `max_bytes_scanned`: both budgets are checked once
-the route returns, before the first segment fetch, so a query the route
-leaves past either budget refuses with the budget error a fetch batch
-returns, also when every segment was pruned and no fetch batch runs.
+`max_s3_requests` and `max_bytes_scanned`: when the route issued a leaf
+GET, both budgets are checked once it returns, before the first segment
+fetch, so a query the route leaves past either budget refuses with the
+budget error a fetch batch returns, also when every segment was pruned and
+no fetch batch runs. A route that issued no leaf GET adds no check, and the
+fetch batches' own checks apply as before.
 
 ## Correction (issue #3865): the erasure rule reads pending requests
 
