@@ -440,8 +440,9 @@ section: `2T` ranged GETs per fold for a tail of `T` entries, up to
   bands (Acceptance, rows 7 and 8) and the production reader of decisions
   2 to 4 is on main. Until then the default stays off and the flags keep
   their meaning. (The Stage 1 amendment measured rows 7 and 8: the default
-  stays off for both signals, and #3927 bounds the advance first.) A logs tenant with no key-index declaration reads no
-  section and writes no leaf, as today.
+  stays off for both signals, and #3927 bounds the advance first.) A logs
+  tenant with no key-index declaration reads no section and writes no
+  leaf, as today.
 - Rejected here, with the reasons in Rejected alternatives: leaves for
   sealed parts only, and smaller tail parts.
 
@@ -759,7 +760,8 @@ rows 7, 8 and 11. These were not measured:
 - row 13's mutant controls and its compaction states (#3829);
 - row 16.
 
-#3928 owns rows 12, 13 and 16.
+Issue #3928 owns every item on that list except the compaction states,
+which wait on #3829.
 
 | check | target | miss | source |
 |---|---|---|---|
@@ -773,7 +775,7 @@ rows 7, 8 and 11. These were not measured:
 | 8. leaf bytes | spans at most 6 % and logs at most 2.5 % of part bytes (the logs target sits above the one measurement, 2.06 %), slices x 194 B of HEAD per (part, field) | over 2x either | predicted; T12 measured 4.40 % and 2.06 %, 194 B and 192 B, #2763 comment 6276877460 |
 | 9. month-scale lane: spans lookup without a range over 744 hour-ranged parts (`--ingest-hour-stride 1`, a month) | resolve: 1 part GET per covering part; leaf GETs = 2 x 744 = 1,488; 0 tier-1 GETs on covered objects; `partsBeyondCeiling` 0; `keyIndex` decompressed bytes per part at most `8 x sqrt(body)` as ADR-2707's row states; rows exact | more than 2 leaf GETs per part, any leaf GET outside `keyIndex`, any tier-1 GET on a covered object | predicted; the ADR-2707 month-scale row, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:877, unmeasured there |
 | 10. past `P_max` lane: 2,160 hour-ranged parts | leaf GETs = 2 x 1,024 = 2,048 exactly; `partsBeyondCeiling` 1,136, the 1,136 smallest parts by entry count; those parts' objects probed at tier 1 (3 GETs, under 16 KB each, in `probe` and `keyIndex`), 0 leaf GETs for them; rows exact | any leaf GET for a part beyond the ceiling, more than 2,048 leaf GETs, a beyond-ceiling object read whole for an absent key | predicted; restates the ADR-2707 `P_max` row (scan remainder) per decision 2's amendment, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:878 |
-| 11. `IN` lists of 1, 10, 100 and 1,000 keys, folded with leaves, logs and spans | rows equal the union of the per-key equality answers (the oracle), every list size, both tables; per covered part leaf GETs at most `1 + min(distinct buckets, 64)`; `keysProbed` equals the list size; the 1,000-key list on a 13-bit leaf (8,192 buckets) is read as at most 64 bridged ranged GETs whose bytes are at most `entry_count x 11 KiB` for the part, else the part is `Uncovered` with no further leaf read, and the report says which | any row difference; over 65 leaf GETs on one part; leaf bytes over `entry_count x 11 KiB` on one part; a 1,001-key list served by the index (the control is a 1,025-key list, and the leaf GET bound reads per slice, under the Stage 1 amendment) | predicted; k and `B_run` are decision 6's constants, confirmed or changed by the Stage 1 amendment |
+| 11. `IN` lists of 1, 10, 100 and 1,000 keys, folded with leaves, logs and spans | rows equal the union of the per-key equality answers (the oracle), every list size, both tables; per covered part leaf GETs at most `1 + min(distinct buckets, 64)` (per (part, slice) under the Stage 1 amendment); `keysProbed` equals the list size; the 1,000-key list on a 13-bit leaf (8,192 buckets) is read as at most 64 bridged ranged GETs whose bytes are at most `entry_count x 11 KiB` for the part, else the part is `Uncovered` with no further leaf read, and the report says which | any row difference; over 65 leaf GETs on one part; leaf bytes over `entry_count x 11 KiB` on one part; a 1,001-key list served by the index (the control is a 1,025-key list, and the 65 is per slice, under the Stage 1 amendment) | predicted; k and `B_run` are decision 6's constants, confirmed or changed by the Stage 1 amendment |
 | 12. scaling: matching rows fixed, irrelevant retained data 10x and 100x (objects and covering parts both grow) | folded with leaves: GETs grow by at most 2 per added covering part and wire by at most the added leaf prefixes and buckets; the unfolded control grows per object | GET growth proportional to objects on the folded arm | predicted from decision 2 |
 | 13. correctness matrix | exact agreement with the oracle on every statement of every state, including mixed sealed plus unsealed, concurrent compaction and an erasure in flight; the five negative controls of decision 9 each fail on their mutant | any disagreement, any control passing on its mutant | predicted; the mutants are run and quoted in the report |
 | 14. join baseline (ADR-2983 Stage 0): `spans JOIN logs ON trace_id`, build sides of 1, k/10, k and 10k traces, transfer absent | per scan: objects and blocks opened, requests and wire bytes per phase, recorded as the Stage 0 figures ADR-2983 defers; no band on this first measurement; both sides' `signals[]` entries present | a scan without its `signals[]` entry, or a figure missing | predicted; ADR-2983 Sequencing, docs/adrs/2983-predicate-transfer-across-signal-joins.md:325 |
@@ -1216,8 +1218,14 @@ same-region S3, on the correlated corpus of 20,000,000 traces over 24 hours
   It was pre-registered in comment 6699464859 and reported in comment
   6700944105.
 
-The evaluator's verdict is `fail` on both runs, and it stands. Each miss
-below is listed with the follow-up that owns it.
+The evaluator's verdict is `fail` on both runs, and it stands. Each
+figure below that is in its miss band, or that Stage 1 did not measure,
+names the issue that owns it. A figure short of its target but clear of
+its miss line is recorded, with its cause where Stage 1 established one:
+- rows 1 and 2's wire bytes;
+- row 6's objects past the probe, owned by #3918 because the figure's
+  basis is the harness's;
+- rows 9 and 10's leaf GETs.
 
 ### What each row measured
 
@@ -1227,11 +1235,11 @@ below is listed with the follow-up that owns it.
 | 3 | first read 8,192 B per candidate object, rows exact | holds | comment 6698223574 |
 | 4 | warm: 0 data GETs, 0 leaf GETs, 1 resolve GET | holds | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/summary.s3.txt |
 | 5 | q20 on leaves: 1 object opened, 6 GETs, 407,161 B, p50 0.68 s, 4 rows exact | holds; box B, before T5, opened 497 objects with 1,470 GETs | comment 6698223574 |
-| 6 | q20 unfolded: 970 `keyIndex` GETs, 6 GETs past the probe, scan wire 989,537 B, rows exact; `objects_past_probe` 497 against the target's holders (1); 523 `hits` objects in this load against the band's 398 | under the miss lines on GETs and wire; the objects-past-probe target misses, as on box B, and the cause is not established; whole reads of absent-key objects cannot be counted, since the stats carry no per-object breakdown | comment 6698223574 |
+| 6 | q20 unfolded: 970 `keyIndex` GETs, 6 GETs past the probe, scan wire 989,537 B, rows exact; `objects_past_probe` 497 against the target's holders (1); 523 `hits` objects in this load against the band's 398 | under the miss lines on GETs and wire; the objects-past-probe target misses, as on box B; the cause is not established, and #3918 checks the figure's basis; whole reads of absent-key objects cannot be counted, since the stats carry no per-object breakdown | comment 6698223574 |
 | 7 | spans: 240 ranged section GETs (2 x 40 new entries x 3 passes) and 1 previous-leaf GET, 3 passes, peak RSS 1,079,029,760 B; logs: 1,188 (2 x 22 x 27) and 6, 27 passes, peak RSS 1,990,848,512 B; uncovered entries 0 | inside the pass-end slice amendment's rule at `G` = 3 and 27, and not a rebuild (only new entries' sections were read on each pass); the pass counts and the logs section GETs miss their pre-registered values (below) | comment 6700944105 |
 | 8 | spans trace_id 4.38 %; logs trace_id 5.87 %, request_id 28.82 %; HEAD bytes per (part, field) not reported on this build | spans' leaf share holds; **logs trace_id misses** (over 5.0 %); request_id is restated below; the HEAD half is not measured | comment 6698223574 |
-| 9 | 744 parts: 744 covering, 747 resolve GETs, 1,451 leaf GETs, 0 past the ceiling, rows exact | under the target's exact 2 x 744 = 1,488, so the target misses; under the miss line of 2 per part | comment 6698223574 |
-| 10 | 2,160 parts: 1,994 leaf GETs, 1,136 past the ceiling, rows exact | under the exact 2,048 leaf GETs, so the target misses; not over 2,048, the miss line; 1,136 past the ceiling as predicted | comment 6698223574 |
+| 9 | 744 parts: 744 covering, 747 resolve GETs, 1,451 leaf GETs, 0 past the ceiling, rows exact | under the target's exact 2 x 744 = 1,488, so the target misses; under the miss line of 2 per part; consistent with decision 2's rule that a bucket the directory says is empty costs no GET, not checked per part | comment 6698223574 |
+| 10 | 2,160 parts: 1,994 leaf GETs, 1,136 past the ceiling, rows exact | under the exact 2,048 leaf GETs, so the target misses; not over 2,048, the miss line; read as row 9; 1,136 past the ceiling as predicted | comment 6698223574 |
 | 11 | rows exact and `keysProbed` equal to the list size at every size on both tables; logs request_id at 100 keys: 105 leaf GETs on its one covering part; spans and logs trace_id at 100 and 1,000 keys: the part `Uncovered` (`skippedByBudget` 1) after 1 leaf GET; the 1,001-key controls routed as key sets (`keysProbed` 1,001, `partsCovered` 0) | rows hold; **105 is over the 65 miss line** (below); the 1,001-key control was stale, and it becomes 1,025 keys | comment 6698223574; s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl |
 | 12 | not run: the 10x and 100x arms were in neither run | not measured; #3928 | comment 6698223574 |
 | 13 | 0 rows differ from the oracle in any state run, erasure in flight included; 8 typed 422 refusals of ClickBench q19, q33, q34 and q35 under the 4 GiB pool; the compaction states failed on #3829; the five mutant controls were not run | holds on agreement; the mutant half and the compaction states are not measured (#3928, #3829) | comment 6698223574 |
