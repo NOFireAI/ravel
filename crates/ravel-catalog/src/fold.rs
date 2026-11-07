@@ -16217,8 +16217,15 @@ pub(crate) mod tests {
             }
         }
         async fn publish_late(store: &dyn ObjectStoreBackend) {
-            publish_labeled_metrics(store, 15, KIDX_HOUR + 1, &region_series("east"), 1000, false)
-                .await;
+            publish_labeled_metrics(
+                store,
+                15,
+                KIDX_HOUR + 1,
+                &region_series("east"),
+                1000,
+                false,
+            )
+            .await;
         }
 
         let advancing = recording_store();
@@ -16249,7 +16256,11 @@ pub(crate) mod tests {
         assert_eq!(
             probe_label(&catalog, &a.parts[0], "west").await,
             matches(
-                &[(ordinal[&10], &[0]), (ordinal[&20], &[0]), (ordinal[&30], &[0])],
+                &[
+                    (ordinal[&10], &[0]),
+                    (ordinal[&20], &[0]),
+                    (ordinal[&30], &[0])
+                ],
                 &[]
             )
         );

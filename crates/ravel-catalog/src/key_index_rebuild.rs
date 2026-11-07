@@ -859,13 +859,13 @@ mod tests {
     use super::*;
     use crate::config::CatalogConfig;
     use crate::fold::KEY_INDEX_FOOTER_SUFFIX_LEN;
+    use crate::fold::METRICS_LABEL_VALUE_FIELD;
     use crate::fold::tests::{
         KIDX_HOUR, USER_ID, assert_foreign_part_error, config, declare_user_id_key_index,
         fold_through, kidx_objects, matches, metrics_kidx_config, part_ordinals, probe_part,
         publish_label_fixture, publish_trace_spans, publish_user_id_logs,
         put_metrics_erasure_request, read_signal_head, repoint_head_at_foreign_part, tenant,
     };
-    use crate::fold::METRICS_LABEL_VALUE_FIELD;
     use crate::snapshot_format::{KeyIndexLeafProbe, verify_key_index_leaf};
 
     /// Records every GET (key, range, bytes returned), every PUT key and every
@@ -2610,7 +2610,10 @@ mod tests {
         assert_eq!(store.lists(), 1);
         assert_eq!(store.data_ranged_gets(), Vec::new());
         assert_eq!(store.puts(), Vec::<String>::new());
-        assert_eq!(read_signal_head(store.as_ref(), Signal::Metrics).await, before);
+        assert_eq!(
+            read_signal_head(store.as_ref(), Signal::Metrics).await,
+            before
+        );
     }
 
     /// A part whose metrics leaf would pass the byte cap gains no ref: no
@@ -2633,6 +2636,9 @@ mod tests {
             "{:?}",
             store.puts()
         );
-        assert_eq!(read_signal_head(store.as_ref(), Signal::Metrics).await, before);
+        assert_eq!(
+            read_signal_head(store.as_ref(), Signal::Metrics).await,
+            before
+        );
     }
 }
