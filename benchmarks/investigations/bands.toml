@@ -514,14 +514,23 @@ requires_tenant = "inv"
 # The sum is safe against a rebuild: neither miss line reads it, and a figure
 # whose miss holds is a miss whatever its target says.
 #
-# The target's passes are G, the pass-end slice amendment's greedy partition
-# (evaluate.py greedy_passes), computed from the fold report's
-# key_index_pair_budget and key_index_field_run_pairs (evaluate.py G_INPUTS).
-# No fold report carries them yet (ADR-3939's fold task adds them), so
-# build_passes_g reads not-computable naming the missing inputs, build_passes,
-# judged against it, reads not-computable too, and each leaves the run
-# incomplete: row 7 cannot hold until the fold report carries G's inputs.
-# The passes still enter the section GETs and section reads per pass as the
+# The target's passes are G, the pass-end slice amendment's greedy
+# partition, bounded (evaluate.py g_bounds) from the fold report's
+# key_index_pair_budget and key_index_field_pairs, each indexed field's total
+# pairs with zero-pair fields included (evaluate.py G_INPUTS): with share
+# s = max(1, budget // F), a field of P pairs takes between ceil(P / s) and
+# 2 x ceil(P / s) - 1 groups, at least 1, and the build's passes hold between
+# the largest low and the largest high bound over fields, missing outside.
+# Per-field key8 runs would give G exactly but would make the fold hold every
+# run in memory, which the pair budget exists to prevent. No fold report
+# carries the inputs yet (issue #3948 adds them), so build_passes_low and
+# build_passes_high read not-computable naming the missing inputs,
+# build_passes, judged against them, reads not-computable too, and each
+# leaves the run incomplete: row 7 cannot hold until the fold report carries
+# G's inputs. build_passes has no miss_if: a rebuild whose passes fall
+# between the bounds reads as within range there, and the per-pass section
+# figures (section_gets, sections_per_pass) are what catch a rebuild. The
+# passes still enter the section GETs and section reads per pass as the
 # build reports them.
 requires_states = ["mixed"]
 
@@ -593,12 +602,20 @@ lane = "counter"
 target_if = "v == m['row_07.spans_previous_leaves']"
 
 [[row.figure]]
-name = "spans_build_passes_g"
+name = "spans_build_passes_low"
 statement = "fold"
 state = "fold_advance"
-metric = "fold.inv.spans.key_index_g"
+metric = "fold.inv.spans.key_index_g_low"
 lane = "counter"
 target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_build_passes_high"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_g_high"
+lane = "counter"
+target_if = "v >= m['row_07.spans_build_passes_low']"
 
 [[row.figure]]
 name = "spans_build_passes"
@@ -606,7 +623,7 @@ statement = "fold"
 state = "fold_advance"
 metric = "fold.inv.spans.key_index_build_passes"
 lane = "counter"
-target_if = "v == m['row_07.spans_build_passes_g']"
+target_if = "m['row_07.spans_build_passes_low'] <= v <= m['row_07.spans_build_passes_high']"
 
 [[row.figure]]
 name = "spans_sections_read"
@@ -704,12 +721,20 @@ lane = "counter"
 target_if = "v == m['row_07.logs_previous_leaves']"
 
 [[row.figure]]
-name = "logs_build_passes_g"
+name = "logs_build_passes_low"
 statement = "fold"
 state = "fold_advance"
-metric = "fold.inv.logs.key_index_g"
+metric = "fold.inv.logs.key_index_g_low"
 lane = "counter"
 target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_build_passes_high"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_g_high"
+lane = "counter"
+target_if = "v >= m['row_07.logs_build_passes_low']"
 
 [[row.figure]]
 name = "logs_build_passes"
@@ -717,7 +742,7 @@ statement = "fold"
 state = "fold_advance"
 metric = "fold.inv.logs.key_index_build_passes"
 lane = "counter"
-target_if = "v == m['row_07.logs_build_passes_g']"
+target_if = "m['row_07.logs_build_passes_low'] <= v <= m['row_07.logs_build_passes_high']"
 
 [[row.figure]]
 name = "logs_sections_read"

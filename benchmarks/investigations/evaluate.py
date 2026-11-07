@@ -94,10 +94,12 @@ INCOMPLETE = "incomplete"
 # Row 7's G, the pass-end slice amendment's pass count: each field's
 # ascending key8 runs cut greedily into groups of at most the pair share
 # max(1, floor(budget / F)), the part's slowest field deciding. Its inputs
-# are the fold report's pair budget and each field's key8 run sizes, under
-# these names; the fold report (FoldReport, crates/ravel-catalog/src/fold.rs)
-# carries neither yet, which ADR-3939's fold task adds.
-G_INPUTS = ("key_index_pair_budget", "key_index_field_run_pairs")
+# are the fold report's pair budget and a map from every field the build
+# indexed, zero-pair fields included, to its total pairs, under these names;
+# those bound G rather than give it (g_bounds). The fold report (FoldReport,
+# crates/ravel-catalog/src/fold.rs) carries neither yet; issue #3948 adds
+# them.
+G_INPUTS = ("key_index_pair_budget", "key_index_field_pairs")
 # Statuses a figure computed from, or judged against, another figure takes
 # over from it, reason and all.
 PASSED_ON = ("not-run", UNSUPPORTED, GUARD, NOT_COMPUTABLE, INCOMPLETE)
@@ -778,19 +780,29 @@ def statement_figure(calls, cfg, statement, state, metric, candidates=None, over
         elif name == "probe_survivors":
             # The probed objects the key index did not prune. The plan's
             # segmentsOpened counts the probed objects only when it opened
-            # exactly the objects above 512 KiB that stats did not prune.
-            pruned = c["stats"]["pruning"].get("segmentsPrunedByKeyIndex")
+            # exactly the objects above 512 KiB that stats did not prune, out
+            # of every census object (none dropped by the time window) with
+            # none skipped by threshold, which segmentsPrunedByStats omits.
+            pruning = c["stats"]["pruning"]
+            pruned = pruning.get("segmentsPrunedByKeyIndex")
             if not isinstance(pruned, int):
                 return UNSUPPORTED, None, "stats carry no pruning.segmentsPrunedByKeyIndex on this build"
-            big, why = over_512k(c) if over_512k else (None, "no census reader")
+            counts, why = over_512k(c) if over_512k else (None, "no census reader")
             if why:
                 return INCOMPLETE, None, f"probe survivors of {where(c)} not judged: {why}"
-            by_stats = c["stats"]["pruning"].get("segmentsPrunedByStats")
+            big, objects = counts
+            by_stats = pruning.get("segmentsPrunedByStats")
             if not isinstance(by_stats, int) or m["plan_segments_opened"] != big - by_stats:
                 return INCOMPLETE, None, (
                     f"probe survivors of {where(c)} not judged: plan segmentsOpened {m['plan_segments_opened']} "
                     f"is not census objects_over_512k {big} less pruning.segmentsPrunedByStats {by_stats}, so the "
                     "plan did not open exactly the objects the probe saw")
+            if pruning.get("segments") != objects or pruning.get("segmentsSkippedByThreshold") != 0:
+                return INCOMPLETE, None, (
+                    f"probe survivors of {where(c)} not judged: pruning.segments {pruning.get('segments')} is not "
+                    f"census objects {objects}, or pruning.segmentsSkippedByThreshold "
+                    f"{pruning.get('segmentsSkippedByThreshold')} is not 0, so objects the window or a threshold "
+                    "dropped may make the plan's count match by coincidence")
             v = m["plan_segments_opened"] - pruned
         elif name in m:
             v = m[name]
@@ -872,8 +884,8 @@ def window_candidates(stamps, statements, truth, c):
 
 
 def census_over_512k(census, statements, cfg, c):
-    """(count, None) of the objects above 512 KiB the census of call c's
-    state gives its statement's tenant and signal, or (None, reason)."""
+    """((objects above 512 KiB, objects), None) the census of call c's state
+    gives its statement's tenant and signal, or (None, reason)."""
     st = statements.get(c.get("statement")) or {}
     tenant = st.get("tenant") or cfg["tenant"]
     signal = signal_of(st.get("table", "spans"))
@@ -881,10 +893,10 @@ def census_over_512k(census, statements, cfg, c):
     if line == "absent" or line is None:
         return None, f"{'no census' if line == 'absent' else 'two censuses'} of {c.get('state')}"
     data = ((line.get("census") or {}).get("tenants") or {}).get(tenant, {}).get("data", {}).get(signal) or {}
-    v = data.get("objects_over_512k")
-    if not isinstance(v, int) or isinstance(v, bool):
-        return None, f"census of {c.get('state')} has no {tenant}/{signal} objects_over_512k"
-    return v, None
+    v, n = data.get("objects_over_512k"), data.get("objects")
+    if not isinstance(v, int) or isinstance(v, bool) or not isinstance(n, int) or isinstance(n, bool):
+        return None, f"census of {c.get('state')} has no {tenant}/{signal} objects_over_512k or objects"
+    return (v, n), None
 
 
 def required_stamps(run_dir, cfg, live, problems):
@@ -1210,37 +1222,33 @@ def fold_field(report, field):
     return None
 
 
-def greedy_passes(budget, field_runs):
-    """G: each field's key8 runs, in ascending key8 order, cut into groups of
-    at most the share max(1, budget // F) pairs, a single run over the share
-    its own group; the slowest field's group count, at least 1."""
-    share = max(1, budget // max(1, len(field_runs)))
-    worst = 0
-    for runs in field_runs.values():
-        groups, held = 0, 0
-        for r in runs:
-            if held and held + r > share:
-                groups, held = groups + 1, 0
-            held += r
-        worst = max(worst, groups + (1 if held else 0))
-    return max(1, worst)
+def g_bounds(budget, field_pairs):
+    """(low, high) of G from the pair budget and each indexed field's total
+    pairs. The share is s = max(1, budget // F) for F fields. A field of P
+    pairs takes at least ceil(P / s) groups, since a group holds at most s
+    pairs while no key8 run (one key's entry ordinals, at most the part's
+    entry count) exceeds the share, and at most 2 x ceil(P / s) - 1, since
+    greedy groups are maximal, so any two adjacent ones exceed s; each at
+    least 1. The slowest field decides both."""
+    share = max(1, budget // len(field_pairs))
+    need = [-(-p // share) for p in field_pairs.values()]
+    return max(1, max(need)), max(1, max(2 * n - 1 for n in need))
 
 
-def fold_g(report, where_):
-    """(status, value, reason) of row 7's G from a fold report."""
+def fold_g(report, where_, bound):
+    """(status, value, reason) of row 7's G's low or high bound from a fold report."""
     absent = [k for k in G_INPUTS if k not in report]
     if absent:
         return NOT_COMPUTABLE, None, (
             f"fold report {where_} carries no {' and no '.join(absent)}, so G (the pass-end slice amendment's "
             "greedy partition of each field's key8 runs into groups of at most the pair share) cannot be "
-            "computed")
-    budget, runs = (report[k] for k in G_INPUTS)
-    if (not isinstance(budget, int) or isinstance(budget, bool) or budget < 1 or not isinstance(runs, dict)
-            or not runs or any(not isinstance(v, list) or any(
-                not isinstance(r, int) or isinstance(r, bool) or r < 1 for r in v) for v in runs.values())):
+            "bounded")
+    budget, pairs = (report[k] for k in G_INPUTS)
+    if (not isinstance(budget, int) or isinstance(budget, bool) or budget < 1 or not isinstance(pairs, dict)
+            or not pairs or any(not isinstance(p, int) or isinstance(p, bool) or p < 0 for p in pairs.values())):
         return "missing", None, (f"fold report {where_}: {G_INPUTS[0]} is not a positive integer or "
-                                 f"{G_INPUTS[1]} is not a non-empty map of positive run sizes")
-    return "value", greedy_passes(budget, runs), ""
+                                 f"{G_INPUTS[1]} is not a non-empty map of field pair totals")
+    return "value", g_bounds(budget, pairs)[bound == "high"], ""
 
 
 def fold_figure(folds, transition, tenant, label, field):
@@ -1250,8 +1258,8 @@ def fold_figure(folds, transition, tenant, label, field):
         return "missing", None, f"no fold stamp for {transition}/{tenant}/{label}"
     if line is None:
         return "duplicate", None, f"two fold stamps for {transition}/{tenant}/{label}"
-    if field == "key_index_g":
-        return fold_g(line.get("report") or {}, f"{transition}/{tenant}/{label}")
+    if field in ("key_index_g_low", "key_index_g_high"):
+        return fold_g(line.get("report") or {}, f"{transition}/{tenant}/{label}", field.rsplit("_", 1)[1])
     if field == "peak_rss_bytes":
         v = (line.get("measure") or {}).get("peak_rss_bytes")
         return ("value", v, "") if v is not None else ("missing", None, "fold stamp has no measure")

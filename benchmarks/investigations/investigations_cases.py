@@ -22,6 +22,7 @@ import gzip
 import importlib.util
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -1739,7 +1740,7 @@ class Evaluate(Workdir):
                                      phase("probe"), phase("scan", 6, 989_537, 4, 262_144),
                                      phase("keyIndex", 970, 1_322_842)],
                           "pruning": {"blocksScanned": 5, "segments": 523, "segmentsPrunedByKeyIndex": 492,
-                                      "segmentsPrunedByStats": 26},
+                                      "segmentsPrunedByStats": 26, "segmentsSkippedByThreshold": 0},
                           "io": {"dependencyDepth": 1}, "signals": [{}]}}
 
     def check_row_6_objects_past_probe(self, evaluate_py=EVALUATE, bands=BANDS):
@@ -1751,7 +1752,12 @@ class Evaluate(Workdir):
         The figure is judged only when the plan opened exactly the objects the probe saw: plan segmentsOpened
         equal to the census's objects above 512 KiB less pruning.segmentsPrunedByStats, 519 - 26 = 493 on box
         C. The same stats with the plan opening 497 read incomplete, with no value and an incomplete line, not
-        a hold or a miss; with the precondition holding, a probe that let 2 objects through misses."""
+        a hold or a miss; with the precondition holding, a probe that let 2 objects through misses.
+
+        The equality can hold by coincidence when the time window drops objects or a threshold skips them,
+        neither of which segmentsPrunedByStats counts, so the precondition also asks pruning.segments equal
+        to the census's 523 objects and segmentsSkippedByThreshold 0: pruning.segments 522, or one segment
+        skipped by threshold, reads incomplete with the plan's count still matching."""
         mod = load_module(evaluate_py, "evaluate_row6_past_probe")
         with open(bands, "rb") as f:
             rows = {"row": [r for r in tomllib.load(f)["row"] if r["key"] == "row_06"]}
@@ -1785,6 +1791,14 @@ class Evaluate(Workdir):
         if lines != [f"figure row_06.objects_past_probe incomplete: {got['reason']}"]:
             out.append(f"plan opening 497 incomplete lines {lines}")
         plan["segmentsOpened"] = 493
+        for field, value, want in (("segments", 522, "pruning.segments 522 is not census objects 523"),
+                                   ("segmentsSkippedByThreshold", 1, "segmentsSkippedByThreshold 1 is not 0")):
+            c["stats"]["pruning"][field] = value
+            got = rows_now()["row_06.objects_past_probe"]
+            if (got["status"], got["value"], got["verdict"]) != ("incomplete", None, "incomplete") or (
+                    want not in got["reason"]):
+                out.append(f"{field} {value}: {got['status']} {got['value']} {got['verdict']} {got['reason']}")
+            c["stats"]["pruning"][field] = {"segments": 523, "segmentsSkippedByThreshold": 0}[field]
         c["stats"]["pruning"]["segmentsPrunedByKeyIndex"] = 491
         got = rows_now()["row_06.objects_past_probe"]
         if (got["value"], got["verdict"]) != (2, "miss"):
@@ -2134,46 +2148,50 @@ class Evaluate(Workdir):
         end = text.find("\n[[row]]\n", start + 1)
         return self.pass_bands(text[start:] if end < 0 else text[start:end + 1])
 
-    # G's inputs that give box D's passes: spans one field of 20 single-pair
-    # runs at budget 8 (share 8: 8 + 8 + 4, 3 groups); logs trace_id 162
-    # single-pair runs and request_id 10 two-pair runs at budget 12 (share 6:
-    # 27 groups and 4), the slowest field deciding 27.
+    # G's inputs on box D's figures (#3948): spans trace_id 20,833,333 pairs,
+    # one field, budget 8,000,000 (share 8,000,000: G in [3, 5]); logs
+    # request_id 104,166,665 and trace_id 20,833,333 pairs, budget 8,000,000
+    # (share 4,000,000: request_id in [27, 53], trace_id in [6, 11]), so the
+    # logs build's passes lie in [27, 53].
     BOX_D_G_INPUTS = {
-        "spans": (8, {"trace_id": [1] * 20}),
-        "logs": (12, {"trace_id": [1] * 162, "request_id": [2] * 10}),
+        "spans": (8_000_000, {"trace_id": 20_833_333}),
+        "logs": (8_000_000, {"request_id": 104_166_665, "trace_id": 20_833_333}),
     }
+    BOX_D_G_BOUNDS = {"spans": (3, 5), "logs": (27, 53)}
 
     def set_g_inputs(self, inputs):
-        """Write {signal: (pair budget, {field: [pairs per key8 run]})} into the fold_advance fold reports."""
+        """Write {signal: (pair budget, {field: total pairs})} into the fold_advance fold reports."""
         folds = read_jsonl(self.stamp_path("folds.jsonl"))
         for line in folds:
             if line["transition"] == "fold_advance" and line["signal"] in inputs:
-                budget, runs = inputs[line["signal"]]
-                line["report"].update(key_index_pair_budget=budget, key_index_field_run_pairs=runs)
+                budget, pairs = inputs[line["signal"]]
+                line["report"].update(key_index_pair_budget=budget, key_index_field_pairs=pairs)
         write_jsonl(self.stamp_path("folds.jsonl"), folds)
 
     def check_row_7_passes_not_computable(self, evaluate_py=EVALUATE, bands=BANDS):
-        """Box D's passes, 3 on spans and 27 on logs, are not judged against 1: the target is G, which needs
-        the pair budget and each field's key8 runs, and the fold report carries neither, so G reads
-        not-computable naming both inputs, the passes judged against it read not-computable too, and the
-        run is incomplete (exit 1) with an incomplete line for each of the four, never a hold or a miss. The
-        passes still scale the section GETs, which hold."""
+        """Box D's passes, 3 on spans and 27 on logs, are not judged against 1: the target is G's range,
+        bounded from the pair budget and each indexed field's total pairs, and the fold report carries
+        neither, so both bounds read not-computable naming both inputs, the passes judged against them read
+        not-computable too, and the run is incomplete (exit 1) with an incomplete line for each of the six,
+        never a hold or a miss. The passes still scale the section GETs, which hold."""
         self.set_row_7(self.BOX_D_ROW_7)
         code, res, _ = self.go(self.row_bands("row_07", bands), evaluate_py)
         out = []
         if (code, res["verdict"], res["problems"]) != (1, "incomplete", []):
             out.append(f"verdict {code} {res['verdict']} {res['problems']}")
         for sig, f in self.BOX_D_ROW_7.items():
-            g = figure(res, f"row_07.{sig}_build_passes_g")
-            if (g["status"], g["verdict"]) != (NOT_COMPUTABLE, NOT_COMPUTABLE) or not all(
-                    k in g["reason"] for k in ("key_index_pair_budget", "key_index_field_run_pairs")):
-                out.append(f"{sig} G {g['status']} {g['verdict']} {g['reason']}")
+            for bound in ("low", "high"):
+                g = figure(res, f"row_07.{sig}_build_passes_{bound}")
+                if (g["status"], g["verdict"]) != (NOT_COMPUTABLE, NOT_COMPUTABLE) or not all(
+                        k in g["reason"] for k in ("key_index_pair_budget", "key_index_field_pairs")):
+                    out.append(f"{sig} G {bound} {g['status']} {g['verdict']} {g['reason']}")
             p = figure(res, f"row_07.{sig}_build_passes")
             if (p["status"], p["value"], p["verdict"]) != ("value", f["passes"], NOT_COMPUTABLE):
                 out.append(f"{sig} passes {p['status']} {p['value']} {p['verdict']}")
             if "key_index_pair_budget" not in (p["reason"] or ""):
                 out.append(f"{sig} passes reason {p['reason']}")
-            for fid in (f"row_07.{sig}_build_passes_g", f"row_07.{sig}_build_passes"):
+            for fid in (f"row_07.{sig}_build_passes_low", f"row_07.{sig}_build_passes_high",
+                        f"row_07.{sig}_build_passes"):
                 if not any(line.startswith(f"figure {fid} {NOT_COMPUTABLE}: ") for line in res["incomplete"]):
                     out.append(f"no incomplete line for {fid}")
             got = figure(res, f"row_07.{sig}_section_gets")
@@ -2185,8 +2203,9 @@ class Evaluate(Workdir):
         self.assertEqual(self.check_row_7_passes_not_computable(), [])
 
     def check_row_7_g(self, evaluate_py=EVALUATE, bands=BANDS):
-        """A build whose fold report carries G's inputs: G is 3 on spans and 27 on logs, box D's passes hold
-        against it and the row passes; one pass more on either signal misses."""
+        """A build whose fold report carries G's inputs: G lies in [3, 5] on spans and [27, 53] on logs, box
+        D's 3 and 27 passes hold against them and the row passes; on logs 53 passes hold and 2 and 54
+        miss."""
         self.set_row_7(self.BOX_D_ROW_7)
         self.set_g_inputs(self.BOX_D_G_INPUTS)
         row = self.row_bands("row_07", bands)
@@ -2195,35 +2214,69 @@ class Evaluate(Workdir):
         if (code, res["verdict"], res["incomplete"]) != (0, "pass", []):
             out.append(f"verdict {code} {res['verdict']} {res['problems']} {res['incomplete']}")
         for sig, f in self.BOX_D_ROW_7.items():
-            g = figure(res, f"row_07.{sig}_build_passes_g")
+            lo, hi = (figure(res, f"row_07.{sig}_build_passes_{b}") for b in ("low", "high"))
             p = figure(res, f"row_07.{sig}_build_passes")
-            if (g["value"], g["verdict"], p["value"], p["verdict"]) != (f["passes"], "pass", f["passes"], "pass"):
-                out.append(f"{sig} G {g['value']} {g['verdict']} passes {p['value']} {p['verdict']}")
-        more = {sig: dict(f, passes=f["passes"] + 1) for sig, f in self.BOX_D_ROW_7.items()}
-        self.set_row_7(more)
-        _, res, _ = self.go(row, evaluate_py)
-        for sig, f in more.items():
-            p = figure(res, f"row_07.{sig}_build_passes")
-            if (p["value"], p["verdict"]) != (f["passes"], "miss"):
-                out.append(f"{sig} {f['passes']} passes {p['value']} {p['verdict']}")
+            got = ((lo["value"], hi["value"]), lo["verdict"], hi["verdict"], p["value"], p["verdict"])
+            if got != (self.BOX_D_G_BOUNDS[sig], "pass", "pass", f["passes"], "pass"):
+                out.append(f"{sig} G {got}")
+        for passes, want in ((53, "pass"), (2, "miss"), (54, "miss")):
+            self.set_row_7({"logs": dict(self.BOX_D_ROW_7["logs"], passes=passes)})
+            _, res, _ = self.go(row, evaluate_py)
+            p = figure(res, "row_07.logs_build_passes")
+            if (p["value"], p["verdict"]) != (passes, want):
+                out.append(f"logs {passes} passes {p['value']} {p['verdict']}, want {want}")
         return out
 
     def test_row_7_g(self):
         self.assertEqual(self.check_row_7_g(), [])
 
-    def check_greedy_passes(self, evaluate_py=EVALUATE):
-        """The pass-end slice amendment's examples: fields of 16 and 8 single-pair runs at budget 24 (share
-        12) take 2 passes; 17 pairs in runs of 4, 4, 4, 4 and 1 at budget 6 take 4 where ceil(17 / 6) is 3;
-        a single run over the share is its own group; box D's G inputs give its 3 and 27."""
-        mod = load_module(evaluate_py, "evaluate_greedy_passes")
-        cases = [((24, {"a": [1] * 16, "b": [1] * 8}), 2), ((6, {"a": [4, 4, 4, 4, 1]}), 4),
-                 ((6, {"a": [9, 1]}), 2)]
-        cases += [(inputs, self.BOX_D_ROW_7[sig]["passes"]) for sig, inputs in self.BOX_D_G_INPUTS.items()]
-        return [f"{budget} {runs}: {mod.greedy_passes(budget, runs)}, want {want}"
-                for (budget, runs), want in cases if mod.greedy_passes(budget, runs) != want]
+    def check_row_7_g_zero_pair_field(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A field the build indexed with no pairs still counts in F: box D's logs inputs with a third,
+        zero-pair field put the share at 8,000,000 // 3 = 2,666,666 and request_id's 104,166,665 pairs in
+        [40, 79], so 27 passes miss where they hold with F = 2."""
+        self.set_row_7(self.BOX_D_ROW_7)
+        budget, pairs = self.BOX_D_G_INPUTS["logs"]
+        self.set_g_inputs({"logs": (budget, dict(pairs, span_id=0))})
+        _, res, _ = self.go(self.row_bands("row_07", bands), evaluate_py)
+        lo, hi = (figure(res, f"row_07.logs_build_passes_{b}")["value"] for b in ("low", "high"))
+        p = figure(res, "row_07.logs_build_passes")
+        got = (lo, hi, p["value"], p["verdict"])
+        return [] if got == (40, 79, 27, "miss") else [f"logs with a zero-pair field {got}"]
 
-    def test_greedy_passes(self):
-        self.assertEqual(self.check_greedy_passes(), [])
+    def test_row_7_g_zero_pair_field(self):
+        self.assertEqual(self.check_row_7_g_zero_pair_field(), [])
+
+    @staticmethod
+    def greedy_groups(share, runs):
+        """The pass-end slice amendment's greedy cut of one field's ascending key8 runs into groups of at
+        most share pairs, a single run over the share its own group; at least 1."""
+        groups, held = 0, 0
+        for r in runs:
+            if held and held + r > share:
+                groups, held = groups + 1, 0
+            held += r
+        return max(1, groups + (1 if held else 0))
+
+    def check_g_bounds(self, evaluate_py=EVALUATE):
+        """g_bounds on box D's inputs gives [3, 5] and [27, 53]; a field of no pairs gives [1, 1]; and for
+        2,000 seeded run lists with every run at most the share, the greedy cut's group count lies inside
+        [ceil(P / s), 2 x ceil(P / s) - 1], at least 1, the bound the evaluator judges against."""
+        mod = load_module(evaluate_py, "evaluate_g_bounds")
+        out = [f"{sig} {mod.g_bounds(*self.BOX_D_G_INPUTS[sig])}, want {want}"
+               for sig, want in self.BOX_D_G_BOUNDS.items() if mod.g_bounds(*self.BOX_D_G_INPUTS[sig]) != want]
+        if mod.g_bounds(8, {"a": 0}) != (1, 1):
+            out.append(f"zero pairs {mod.g_bounds(8, {'a': 0})}")
+        rng = random.Random(3948)
+        for _ in range(2000):
+            share = rng.randint(1, 12)
+            runs = [rng.randint(1, share) for _ in range(rng.randint(0, 40))]
+            lo, hi = mod.g_bounds(share, {"f": sum(runs)})
+            if not lo <= self.greedy_groups(share, runs) <= hi:
+                out.append(f"share {share} runs {runs}: {self.greedy_groups(share, runs)} outside [{lo}, {hi}]")
+        return out
+
+    def test_g_bounds(self):
+        self.assertEqual(self.check_g_bounds(), [])
 
     # Uncovered entries on box D's figures: spans 10 over 3 passes, logs 5 over
     # 27, each read on every pass. Spans: 2 x (40 + 10) x 3 = 300 ranged GETs
@@ -3516,7 +3569,7 @@ FLIPS = {
         "check_row_18_uncovered",
     ),
     "row 7's G read as a fold report field": (
-        '    if field == "key_index_g":\n        return fold_g(',
+        '    if field in ("key_index_g_low", "key_index_g_high"):\n        return fold_g(',
         '    if False:\n        return fold_g(',
         "check_row_7_passes_not_computable",
     ),
@@ -3535,10 +3588,30 @@ FLIPS = {
         'PASSED_ON = ("not-run", UNSUPPORTED, GUARD, INCOMPLETE)\n',
         "check_row_7_passes_not_computable",
     ),
-    "row 7's G groups cut once the share is reached, not before a run would cross it": (
-        "            if held and held + r > share:\n",
-        "            if held >= share:\n",
-        "check_greedy_passes",
+    "row 7's F counted without zero-pair fields": (
+        "    share = max(1, budget // len(field_pairs))\n",
+        "    share = max(1, budget // len([p for p in field_pairs.values() if p]))\n",
+        "check_row_7_g_zero_pair_field",
+    ),
+    "row 7's G upper bound dropped": (
+        "    return max(1, max(need)), max(1, max(2 * n - 1 for n in need))\n",
+        "    return max(1, max(need)), max(1, max(need))\n",
+        "check_row_7_g",
+    ),
+    "row 7's G share computed with F = 1": (
+        "    share = max(1, budget // len(field_pairs))\n",
+        "    share = max(1, budget // 1)\n",
+        "check_row_7_g",
+    ),
+    "row 6's probe survivors judged without pruning.segments equal to the census objects": (
+        '            if pruning.get("segments") != objects or pruning.get("segmentsSkippedByThreshold") != 0:\n',
+        '            if pruning.get("segmentsSkippedByThreshold") != 0:\n',
+        "check_row_6_objects_past_probe",
+    ),
+    "row 6's probe survivors judged with segments skipped by threshold": (
+        '            if pruning.get("segments") != objects or pruning.get("segmentsSkippedByThreshold") != 0:\n',
+        '            if pruning.get("segments") != objects:\n',
+        "check_row_6_objects_past_probe",
     ),
     "row 6's probe survivors judged without the plan-opens-the-probed-objects precondition": (
         '            if not isinstance(by_stats, int) or m["plan_segments_opened"] != big - by_stats:\n',
@@ -3768,14 +3841,24 @@ BAND_FLIPS = {
         "miss_if = \"False\"\n",
         "check_row_7_rebuild",
     ),
-    "row 7's spans passes judged against 1, not G": (
-        "target_if = \"v == m['row_07.spans_build_passes_g']\"\n",
+    "row 7's spans passes judged against 1, not G's range": (
+        "target_if = \"m['row_07.spans_build_passes_low'] <= v <= m['row_07.spans_build_passes_high']\"\n",
         "target_if = \"v == 1\"\n",
         "check_row_7_g",
     ),
-    "row 7's logs passes judged against 1, not G": (
-        "target_if = \"v == m['row_07.logs_build_passes_g']\"\n",
+    "row 7's logs passes judged against 1, not G's range": (
+        "target_if = \"m['row_07.logs_build_passes_low'] <= v <= m['row_07.logs_build_passes_high']\"\n",
         "target_if = \"v == 1\"\n",
+        "check_row_7_g",
+    ),
+    "row 7's logs passes judged without G's upper bound": (
+        "target_if = \"m['row_07.logs_build_passes_low'] <= v <= m['row_07.logs_build_passes_high']\"\n",
+        "target_if = \"m['row_07.logs_build_passes_low'] <= v\"\n",
+        "check_row_7_g",
+    ),
+    "row 7's logs passes judged against G's low bound alone": (
+        "target_if = \"m['row_07.logs_build_passes_low'] <= v <= m['row_07.logs_build_passes_high']\"\n",
+        "target_if = \"v == m['row_07.logs_build_passes_low']\"\n",
         "check_row_7_g",
     ),
     "row 7's spans section GETs without the uncovered term": (
