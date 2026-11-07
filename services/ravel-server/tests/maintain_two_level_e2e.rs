@@ -326,12 +326,14 @@ fn scratch_entries(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Starts a maintain server over `store` with `compactor`, polls until
-/// `done(store, body)` holds (two minutes at most), and returns the last
-/// `/metrics` body.
+/// `done(store, body)` holds, and returns the last `/metrics` body. Panics
+/// naming `waiting_for` and the last body when it has not held after two
+/// minutes.
 async fn run_until<F>(
     store: &Arc<MemoryStore>,
     tenant: &TenantId,
     compactor: ravel_maintain::CompactorConfig,
+    waiting_for: &str,
     mut done: F,
 ) -> String
 where
@@ -348,14 +350,21 @@ where
     .await
     .expect("server starts");
     let mut body = String::new();
+    let mut held = false;
     for _ in 0..1_200 {
         body = scrape(server.http_addr).await;
         if done(store.as_ref(), &body).await {
+            held = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     server.shutdown().await.expect("server shuts down");
+    assert!(
+        held,
+        "timed out after 120 s (1200 polls 100 ms apart) waiting for {waiting_for}; \
+         last /metrics body:\n{body}"
+    );
     body
 }
 
@@ -379,9 +388,15 @@ async fn a_maintain_server_compacts_a_many_input_bucket_in_two_levels() {
     let config = compactor(&["--maintain-scratch-dir", scratch_dir]);
     let expected = refused_now_plus(&[]);
 
-    let body = run_until(&store, &tenant, config, async |store, body| {
-        !compaction_records(store, &tenant, hour).await.is_empty() || refused(body) != expected
-    })
+    let body = run_until(
+        &store,
+        &tenant,
+        config,
+        "a compaction record or a refusal counter to move",
+        async |store, body| {
+            !compaction_records(store, &tenant, hour).await.is_empty() || refused(body) != expected
+        },
+    )
     .await;
 
     let records = compaction_records(store.as_ref(), &tenant, hour).await;
@@ -421,9 +436,13 @@ async fn a_maintain_server_without_scratch_refuses_with_the_geometry_reason() {
     let before = refused_now_plus(&[]);
     let expected = refused_now_plus(&[CompactionRefusedReason::Geometry]);
 
-    let body = run_until(&store, &tenant, config, async |_, body| {
-        refused(body) != before
-    })
+    let body = run_until(
+        &store,
+        &tenant,
+        config,
+        "a refusal counter to move",
+        async |_, body| refused(body) != before,
+    )
     .await;
 
     assert_eq!(refused(&body), expected);
@@ -458,9 +477,13 @@ async fn a_maintain_server_with_a_short_scratch_cap_refuses_with_the_scratch_hea
     let before = refused_now_plus(&[]);
     let expected = refused_now_plus(&[CompactionRefusedReason::ScratchHeadroom]);
 
-    let body = run_until(&store, &tenant, config, async |_, body| {
-        refused(body) != before
-    })
+    let body = run_until(
+        &store,
+        &tenant,
+        config,
+        "a refusal counter to move",
+        async |_, body| refused(body) != before,
+    )
     .await;
 
     assert_eq!(refused(&body), expected);
