@@ -300,6 +300,14 @@ impl ViewHandle {
         self.cache.upgrade().map_or(0, |c| c.view_max_bytes())
     }
 
+    /// [`DecodedColumnCache::has_view_room`] for the handle's entry; `false`
+    /// once the cache is gone.
+    pub fn has_view_room(&self, cell: &Arc<ReservationCell>, bytes: u64) -> bool {
+        self.cache
+            .upgrade()
+            .is_some_and(|c| c.has_view_room(&self.key, cell, bytes, &self.counters))
+    }
+
     /// [`DecodedColumnCache::reserve_view`] for the handle's entry, with the
     /// same lock-order rules; `None` once the cache is gone.
     pub fn reserve_view<T>(
@@ -1169,6 +1177,52 @@ impl DecodedColumnCache {
             DecodedCacheCounters::bump(&counters.view_memo_fills, 1);
         }
         Some(installed)
+    }
+
+    /// Whether [`Self::reserve_view`] would take `bytes` of views for the memo
+    /// of `key`'s entry now, on its terms: a fillable memo, room in the view
+    /// budget, and the memory budget's gate and ledger admitting `bytes` while
+    /// keeping [`admission_margin`] unreserved. Reserves nothing. A `false`
+    /// for want of room counts one `viewMemoRefusals`, as the refusal in
+    /// [`Self::reserve_view`] would, so a caller that asks first and builds
+    /// only on `true` counts each refused attempt once
+    /// (`refused_fills_build_and_validate_nothing` in ravel-sql). The answer
+    /// can be stale by the time the caller reserves; [`Self::reserve_view`]
+    /// still decides.
+    pub fn has_view_room(
+        &self,
+        key: &DecodedKey,
+        cell: &Arc<ReservationCell>,
+        bytes: u64,
+        counters: &DecodedCacheCounters,
+    ) -> bool {
+        let mut inner = self.lock();
+        if Self::fillable_memo(&inner, key, cell).is_none() {
+            return false;
+        }
+        let views_fit = inner
+            .view_resident
+            .checked_add(bytes)
+            .is_some_and(|total| total <= self.view_max_bytes);
+        let ledger_fits = self.budget.as_ref().is_none_or(|budget| {
+            let gate_refuses = bytes > 0
+                && !budget.gate_open()
+                && budget.gate_available() < budget.gate_floor();
+            let ceiling = budget
+                .limit()
+                .saturating_sub(admission_margin(budget.limit()));
+            !gate_refuses
+                && budget
+                    .reserved()
+                    .checked_add(bytes)
+                    .is_some_and(|total| total <= ceiling)
+        });
+        if views_fit && ledger_fits {
+            return true;
+        }
+        inner.view_refusals += 1;
+        DecodedCacheCounters::bump(&counters.view_memo_refusals, 1);
+        false
     }
 
     /// The memo of `key`'s entry when that entry holds `cell` and its memo is

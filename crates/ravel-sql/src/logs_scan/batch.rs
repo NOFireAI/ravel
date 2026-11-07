@@ -486,6 +486,17 @@ struct StrMemo {
     /// (decision 4): the handle a fill charges its views through, and the
     /// scan's `str_cells_validated` the fill's validation counts in.
     served: Mutex<Option<Box<ServedMark>>>,
+    /// The fills that built views, installed or not.
+    #[cfg(test)]
+    view_builds: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once by the next fill on this thread between its room check and
+    /// its reservation, to stand in for a concurrent caller taking the room.
+    static AFTER_VIEW_ROOM_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Whether `array` has no null buffer: the condition the serve rule puts on
@@ -544,8 +555,12 @@ impl StrMemo {
     /// The memo's views, filled on the first call after the scan marked the
     /// memo served (decision 4). `None`, and the caller casts, when the memo
     /// was never served, has a NULL entry (decision 6), or the fill was
-    /// refused. The memo's own lock is never held across
-    /// [`ViewHandle::reserve_view`], which takes the cache's lock first.
+    /// refused. The cache is asked for room before anything is built, so a
+    /// refused fill builds and validates nothing
+    /// (`refused_fills_build_and_validate_nothing`); the fill's validation
+    /// counts only once its views are installed. The memo's own lock is never
+    /// held across [`ViewHandle::has_view_room`] or
+    /// [`ViewHandle::reserve_view`], which take the cache's lock first.
     fn views(&self) -> Option<StringViewArray> {
         if let Some(v) = self.views_slot().as_ref() {
             return Some(v.array.clone());
@@ -557,7 +572,21 @@ impl StrMemo {
         }
         let values = array.values();
         let offsets = array.value_offsets();
-        let mut views = Vec::with_capacity(offsets.len().saturating_sub(1));
+        let len = offsets.len().saturating_sub(1);
+        let bytes = u64::try_from(len.saturating_mul(16)).ok()?;
+        if !mark.handle.has_view_room(&self.cell, bytes) {
+            // Another evaluation may have filled it in the meantime.
+            return self.views_slot().as_ref().map(|v| v.array.clone());
+        }
+        #[cfg(test)]
+        {
+            self.view_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(hook) = AFTER_VIEW_ROOM_CHECK.with(|h| h.borrow_mut().take()) {
+                hook();
+            }
+        }
+        let mut views = Vec::with_capacity(len);
         for w in offsets.windows(2) {
             let start = usize::try_from(w[0]).ok()?;
             let end = usize::try_from(w[1]).ok()?;
@@ -567,8 +596,6 @@ impl StrMemo {
                 u32::try_from(start).ok()?,
             ));
         }
-        let len = views.len();
-        let bytes = u64::try_from(len.saturating_mul(16)).ok()?;
         let owner = Arc::new(ViewsOwner {
             views,
             reservation: std::sync::OnceLock::new(),
@@ -580,9 +607,6 @@ impl StrMemo {
             None,
         )
         .ok()?;
-        if let Some(validated) = &mark.validated {
-            validated.add(len);
-        }
         let installed = mark.handle.reserve_view(&self.cell, bytes, |reservation| {
             if let Some(r) = reservation {
                 // The owner is new, so its cell is empty.
@@ -595,7 +619,12 @@ impl StrMemo {
         });
         drop(owner);
         match installed {
-            Some(()) => Some(built),
+            Some(()) => {
+                if let Some(validated) = &mark.validated {
+                    validated.add(len);
+                }
+                Some(built)
+            }
             // Another evaluation may have filled it in the meantime.
             None => self.views_slot().as_ref().map(|v| v.array.clone()),
         }
@@ -870,6 +899,8 @@ fn memo_array(
             keys: std::sync::OnceLock::new(),
             views: Mutex::new(None),
             served: Mutex::new(None),
+            #[cfg(test)]
+            view_builds: std::sync::atomic::AtomicUsize::new(0),
         });
         if register {
             view_registry::insert(&memo);
@@ -3805,12 +3836,11 @@ mod tests {
     /// Write `block` as one RLOG object: the writer lays out STREAM_DIR,
     /// FIELD_DIR and the footer from seed records (row `r` on stream `r % 3`,
     /// setting the key at every type in `block.types`), then the block itself is
-    /// replaced with `block.rows` verbatim, non-UTF-8 `Str` cells included.
+    /// replaced with `block.rows` verbatim, non-UTF-8 `Str` cells included. A
+    /// block of fewer rows than [`STREAMS`] still gets one seed record per
+    /// stream, and the footer's record count and time bounds are its own.
     fn encode(block: &Block, cfg: &RlogConfig) -> Vec<u8> {
-        assert!(
-            block.rows.len() >= STREAMS,
-            "every stream has a seed record"
-        );
+        let seeds = block.rows.len().max(STREAMS);
         let stream_attrs = |s: usize| {
             let (resource, scope) = &block.overlays[s];
             let mut res = vec![("svc".to_string(), AttrValue::Str("s".into()))];
@@ -3829,7 +3859,7 @@ mod tests {
                 writer_seq: 0,
             },
         );
-        for r in 0..block.rows.len() {
+        for r in 0..seeds {
             let s = r % STREAMS;
             w.push(LogRecord {
                 stream_id: sid(s as u8),
@@ -3925,7 +3955,14 @@ mod tests {
             });
             out.extend_from_slice(&bytes);
         }
-        let patched = LogFooter { sections, ..footer };
+        let last_ts = (block.rows.len().max(1) as i64 - 1) * 10;
+        let patched = LogFooter {
+            sections,
+            record_count: block.rows.len() as u64,
+            max_ts_ns: footer.max_ts_ns.min(last_ts),
+            max_observed_ts_ns: footer.max_observed_ts_ns.min(last_ts),
+            ..footer
+        };
         write_footer_and_trailer(&mut out, &patched);
         out
     }
@@ -6980,20 +7017,44 @@ mod tests {
                 #![proptest_config(ProptestConfig::with_cases(24))]
 
                 /// ADR-3326, view memo amendment, T1: over a served plain
-                /// block of 3 to 8,192 rows (the fixture writes one seed
-                /// record per stream, so 3 is its fewest), with a narrowing
-                /// filter on and off, the group key equals arrow's cast of
-                /// the same input on views, data buffers and null buffer; and
-                /// so do permuted full-length keys over the memo and a values
-                /// array sliced from it, neither of which may take the memo
-                /// as it is.
+                /// block of 1 to 8,192 rows, with a narrowing filter on and
+                /// off, the group key equals arrow's cast of the same input
+                /// on views, data buffers and null buffer; and so do permuted
+                /// full-length keys over the memo and a values array sliced
+                /// from it, neither of which may take the memo as it is.
+                /// [`t1_covers_one_and_two_rows`] runs the 1- and 2-row cases
+                /// every time.
                 #[test]
                 fn prop_group_key_views_equal_the_cast(
-                    rows in 3usize..=8192,
+                    rows in 1usize..=8192,
                     prefix in 0usize..24,
                     empty_every in 4usize..32,
                     mask in proptest::option::of(any::<u64>()),
                 ) {
+                    t1_case(rows, prefix, empty_every, mask)?;
+                }
+            }
+
+            /// T1 at the two block sizes a random draw over 1..=8,192 rarely
+            /// reaches, with the narrowing filter off and on.
+            #[test]
+            fn t1_covers_one_and_two_rows() {
+                for rows in [1, 2] {
+                    for mask in [None, Some(0x9e37_79b9_7f4a_7c15)] {
+                        t1_case(rows, 3, 4, mask)
+                            .unwrap_or_else(|e| panic!("rows {rows}, mask {mask:?}: {e}"));
+                    }
+                }
+            }
+
+            /// One T1 case; see [`prop_group_key_views_equal_the_cast`].
+            fn t1_case(
+                rows: usize,
+                prefix: usize,
+                empty_every: usize,
+                mask: Option<u64>,
+            ) -> Result<(), TestCaseError> {
+                {
                     let cfg = RlogConfig { block_target_records: 8192, ..cfg() };
                     let value = |r: usize| {
                         if r % empty_every == 1 {
@@ -7064,6 +7125,7 @@ mod tests {
                         }
                     }
                 }
+                Ok(())
             }
 
             /// T1 is not vacuous: an unnarrowed served block's group key is
@@ -7167,6 +7229,7 @@ mod tests {
                             keys: std::sync::OnceLock::new(),
                             views: Mutex::new(None),
                             served: Mutex::new(None),
+                            view_builds: std::sync::atomic::AtomicUsize::new(0),
                         });
                         view_registry::insert(&memo);
                         memo
@@ -7232,6 +7295,7 @@ mod tests {
                             keys: std::sync::OnceLock::new(),
                             views: Mutex::new(None),
                             served: Mutex::new(None),
+                            view_builds: std::sync::atomic::AtomicUsize::new(0),
                         });
                         view_registry::insert(&memo);
                         memo
@@ -7587,6 +7651,65 @@ mod tests {
                 let later = pass(&obj, &cfg, &block, &cache, 9);
                 drop(group_key(&later.batches[0], true));
                 assert_eq!(later.validated.value(), 0);
+            }
+
+            /// A fill the view budget cannot take builds no views and
+            /// validates nothing: three evaluations over a served plain memo
+            /// with a view budget one byte short of its views count three
+            /// refusals, no build and no validated cell, and each key is the
+            /// cast. A fill the memory budget refuses after the room check
+            /// passed (the ledger filled in between) installs nothing,
+            /// charges nothing and counts no validation either.
+            #[test]
+            fn refused_fills_build_and_validate_nothing() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, cache, p) = filled(&budget, VIEW_BYTES - 1);
+                let memo = view_registry::memo_of(&values_of(&p.batches[0])).expect("registered");
+                let before = p.validated.value();
+                for call in 0..3 {
+                    let got = group_key(&p.batches[0], true);
+                    identical(&got, &group_key(&p.batches[0], false))
+                        .unwrap_or_else(|e| panic!("call {call}: {e}"));
+                }
+                assert_eq!(p.validated.value() - before, 0, "strCellsValidated");
+                assert_eq!(
+                    memo.view_builds.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "views built"
+                );
+                assert_eq!(p.counters.view_snapshot().refusals, 3, "viewMemoRefusals");
+                assert_eq!(p.counters.view_snapshot().fills, 0);
+                assert_eq!(cache.view_counters().refusals, 3);
+                assert_eq!(cache.view_resident_bytes(), 0);
+                assert_eq!(memo.extra_bytes(), 0);
+                drop(memo);
+
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                let memo = view_registry::memo_of(&values_of(&p.batches[0])).expect("registered");
+                let before = p.validated.value();
+                let filler = LIMIT - budget.reserved() - admission_margin(LIMIT);
+                let ledger = Arc::clone(&budget);
+                AFTER_VIEW_ROOM_CHECK.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        ledger.reserve_unchecked(filler);
+                    }));
+                });
+                let reserved = budget.reserved();
+                let got = group_key(&p.batches[0], true);
+                identical(&got, &group_key(&p.batches[0], false))
+                    .unwrap_or_else(|e| panic!("after a late refusal: {e}"));
+                assert_eq!(
+                    memo.view_builds.load(std::sync::atomic::Ordering::Relaxed),
+                    1,
+                    "the room check passed, so the views were built once"
+                );
+                assert_eq!(p.validated.value() - before, 0, "strCellsValidated");
+                assert_eq!(p.counters.view_snapshot().refusals, 1, "viewMemoRefusals");
+                assert_eq!(p.counters.view_snapshot().fills, 0);
+                assert_eq!(cache.view_resident_bytes(), 0);
+                assert_eq!(budget.reserved(), reserved + filler, "no views are charged");
+                assert_eq!(memo.extra_bytes(), 0);
             }
         }
     }
