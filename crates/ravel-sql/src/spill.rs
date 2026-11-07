@@ -195,18 +195,24 @@ impl SpillBudget {
         self.ceiling / self.slots()
     }
 
+    /// The smallest reservation this budget grants:
+    /// [`MIN_SPILL_RESERVATION_BYTES`], or the whole ceiling when that is
+    /// smaller, so a ceiling under 64 MiB is one share of itself.
+    pub(crate) fn min_reservation(&self) -> u64 {
+        MIN_SPILL_RESERVATION_BYTES.min(self.ceiling).max(1)
+    }
+
     /// Reserve one query's share: `min(share, what remains of the ceiling)`,
-    /// or `None` when that is below [`MIN_SPILL_RESERVATION_BYTES`] and the
-    /// query runs without spill.
+    /// or `None` when that is below [`Self::min_reservation`] and the
+    /// statement does not take its spill retry.
     pub(crate) fn reserve_share(&self) -> Option<SpillReservation> {
         self.reserve(self.share())
     }
 
     /// Reserve `min(want, what remains of the ceiling)` in one atomic step, or
-    /// `None` when that is below [`MIN_SPILL_RESERVATION_BYTES`] (or below the
-    /// ceiling, when the ceiling itself is smaller).
+    /// `None` when that is below [`Self::min_reservation`].
     pub(crate) fn reserve(&self, want: u64) -> Option<SpillReservation> {
-        let floor = MIN_SPILL_RESERVATION_BYTES.min(self.ceiling).max(1);
+        let floor = self.min_reservation();
         let mut current = self.reserved.load(Ordering::Acquire);
         loop {
             let grant = want.min(self.ceiling.saturating_sub(current));
@@ -1523,6 +1529,7 @@ mod tests {
             (16 * GIB, 2, 8 * GIB),
             (100 * GIB, 4, 25 * GIB),
             (1 << 20, 1, 1 << 20),
+            (32 * MIB, 1, 32 * MIB),
         ];
         for (ceiling, slots, share) in cases {
             let budget = SpillBudget::new(ceiling);
@@ -1532,6 +1539,20 @@ mod tests {
                 "ceiling {ceiling}"
             );
         }
+    }
+
+    /// ADR-0954 refusal-retry amendment item 4: an explicit ceiling under
+    /// 64 MiB is one share of the whole ceiling, which a spill retry can
+    /// reserve; a second share finds nothing left.
+    #[test]
+    fn a_ceiling_under_the_minimum_is_one_share_of_itself() {
+        let budget = SpillBudget::new(32 * MIB);
+        assert_eq!(budget.min_reservation(), 32 * MIB);
+        let share = budget.reserve_share().expect("the whole 32 MiB ceiling");
+        assert_eq!(share.bytes(), 32 * MIB);
+        assert!(budget.reserve_share().is_none(), "nothing remains");
+        drop(share);
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// Issue #3899: four concurrent queries under a 64 GiB ceiling each get
