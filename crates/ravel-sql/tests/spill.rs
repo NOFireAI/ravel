@@ -1977,8 +1977,8 @@ async fn a_refused_statement_with_no_spill_share_left_returns_its_first_refusal(
     let spill_off_ops = spill_off_store.total_ops() - before;
 
     let (executor, store) = counted_executor(true).await;
-    // The plan-time path reserves the configured scratch quota, which is the
-    // whole process ceiling, and holds it while the pinned plan lives.
+    // The plan-time path reserves one share, which under a 16 GiB ceiling is
+    // the whole ceiling, and holds it while the pinned plan lives.
     let accounting = QueryAccounting::new();
     let (snapshot, _) = executor
         .resolve_snapshot(q33_tenant(), &request(SHARE_SQL), &accounting)
@@ -2073,4 +2073,63 @@ async fn a_ceiling_under_the_minimum_share_is_one_share_and_the_retry_spills() {
         spilled.spill_retry_bytes_written
     );
     assert_eq!(spilled.rows, unlimited.rows, "row for row");
+}
+
+/// Issue #3899: a plan-time statement reserves one share of the spill
+/// ceiling, by the same rule as a retry, not the whole ceiling. With a
+/// ceiling of four shares, a pinned spill-eligible plan holds one 8 GiB share
+/// and leaves three, so a concurrent statement refused on the local path
+/// still reserves an 8 GiB share for its retry and spills.
+///
+/// Prove-the-test: reserve `spill.max_bytes` for `SpillAttempt::PlanTime`
+/// again and the pinned plan holds the whole 32 GiB ceiling, so the retry
+/// gets no share and the statement fails with its first refusal.
+#[tokio::test]
+async fn a_plan_time_statement_holds_one_share_and_a_concurrent_retry_still_spills() {
+    const SHARE: u64 = ravel_sql::spill::SPILL_SHARE_UNIT_BYTES;
+    const CEILING: u64 = ravel_sql::spill::MAX_SPILL_SHARES * SHARE;
+    let file = q33_parquet();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes| spill_config(scratch.path().to_path_buf(), CEILING, query_bytes);
+    let unlimited = run_top_ten(
+        &*q33_executor(config(AMPLE_QUERY_BYTES), &file).await,
+        SHARE_SQL,
+    )
+    .await;
+    assert_eq!(unlimited.spill_retries, 0);
+    let budget = usize::try_from(unlimited.peak_pool_bytes / 2).expect("fits");
+    let executor = q33_executor(config(budget), &file).await;
+
+    let accounting = QueryAccounting::new();
+    let (snapshot, _) = executor
+        .resolve_snapshot(q33_tenant(), &request(SHARE_SQL), &accounting)
+        .await
+        .expect("snapshot resolves");
+    let holder = executor
+        .plan_pinned(q33_tenant(), snapshot, SHARE_SQL, &accounting, &[])
+        .await
+        .expect("the holding statement plans");
+
+    let spilled = run_top_ten(&executor, SHARE_SQL).await;
+    assert_eq!(
+        spilled.spill_retries, 1,
+        "the statement answers on its retry"
+    );
+    assert_eq!(
+        spilled.spill_retry_share_bytes,
+        Some(SHARE),
+        "the retry reserves one of the three shares left"
+    );
+    assert!(
+        spilled.spill_retry_bytes_written.is_some_and(|b| b > 0),
+        "the retry spilled: bytes_written={:?}",
+        spilled.spill_retry_bytes_written
+    );
+    assert_eq!(spilled.rows, unlimited.rows, "row for row");
+    assert_eq!(
+        holder.spill_share_bytes(),
+        Some(SHARE),
+        "the plan-time statement holds one share, leaving three"
+    );
+    drop(holder);
 }

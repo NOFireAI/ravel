@@ -3623,16 +3623,18 @@ impl SqlExecutor {
         //
         // ADR-0954 requirement 2 (issue #2416): the query's scratch cap is
         // reserved from the process-wide ceiling first, and a query that
-        // cannot reserve the minimum runs with spill disabled. A spill retry
-        // holds one share of that ceiling (issue #3899), reserved before it
-        // started, so up to `MAX_SPILL_SHARES` retries spill at once.
+        // cannot reserve the minimum runs with spill disabled. Every spilling
+        // statement holds one share of that ceiling (issue #3899): a retry the
+        // share `run` reserved before it started, a plan-time statement one
+        // reserved here by the same rule, so up to `MAX_SPILL_SHARES`
+        // statements, retried or plan-time, hold spill at once.
         let scratch = match (spill_config, &self.spill_budget) {
             (Some(spill), Some(budget))
                 if analyzed.as_ref().is_some_and(plan_is_spill_eligible) =>
             {
                 let reserved = match extras.spill {
                     SpillAttempt::Retry => retry_share.take(),
-                    SpillAttempt::PlanTime | SpillAttempt::First => budget.reserve(spill.max_bytes),
+                    SpillAttempt::PlanTime | SpillAttempt::First => budget.reserve_share(),
                 };
                 match reserved {
                     Some(reservation) => {
@@ -5937,6 +5939,12 @@ impl PinnedQuery {
     /// `None` when the request did not ask for one.
     pub fn window_predicate(&self) -> Option<&str> {
         self.window_predicate.as_deref()
+    }
+
+    /// The scratch bytes this plan reserved from the process spill ceiling,
+    /// or `None` when it runs without spill.
+    pub fn spill_share_bytes(&self) -> Option<u64> {
+        self.spill_share
     }
 
     /// Every table this query's session registered, sorted: one provider per
