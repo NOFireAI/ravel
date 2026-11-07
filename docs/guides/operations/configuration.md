@@ -2061,23 +2061,31 @@ in `key_index_sections_read`, `key_index_entries_carried`,
 `key_index_build_passes` and `key_index_leaf_gets`.
 
 `--fold-key-index-leaves` stays off by default. An advancing fold reads
-only the new entries' sections, but it reads them once per pass. It also
-reads every previous leaf, holds those bytes in memory outside the pair
-budget, and rewrites the tail's whole leaf set.
+the sections of the new entries and of the entries still uncovered, but it
+reads them once per pass. It also reads every previous leaf with one GET
+each, holds those bytes in memory outside the pair budget, and rewrites
+the tail's whole leaf set.
 
 The pass count follows the tail's total pairs, not the new hour's, so
 every one of those costs grows with the tail's age. One measured advance,
-on real S3, of a 25-hour tail of 20,000,000 traces:
+on real S3, of a 25-hour tail of 20,000,000 traces with one new hour:
 
-| signal | passes | leaf bytes rewritten | peak RSS |
-|---|---|---|---|
-| spans | 3 | 227,528,100 B | 1,079,029,760 B |
-| logs | 27 | 1,365,715,342 B | 1,990,848,512 B |
+| signal | passes | section GETs | previous leaf GETs | leaf bytes rewritten | peak RSS |
+|---|---|---|---|---|---|
+| spans | 3 | 240 | 1 | 227,528,100 B | 1,079,029,760 B |
+| logs | 27 | 1,188 | 6 | 1,365,715,342 B | 1,990,848,512 B |
 
-At the same ingest rate, a 30-day tail projects to about 6.5 GB of spans
-leaf bytes and 39 GB of logs leaf bytes per advance. Turning the flag on
-for a tenant whose tail lives longer than about a day therefore needs a
-memory and request budget sized from these figures.
+At the same ingest rate, a 30-day tail projects to about these figures per
+advance:
+- spans: 75 passes, 6,000 section GETs and about 6.5 GB of leaf bytes;
+- logs: 750 passes, 33,000 section GETs and about 39 GB of leaf bytes.
+
+The previous leaf bytes held in memory are about the leaf bytes rewritten,
+so peak memory grows by about that much over the 25-hour figure. These
+are projections from the pass rule, not measurements. Before turning the
+flag on for a tenant whose tail lives longer than about a day, size the
+fold's memory for its tail's leaf bytes, and its request budget for the
+section GETs.
 
 ## Per-query budgets
 
