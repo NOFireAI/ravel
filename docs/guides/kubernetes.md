@@ -570,9 +570,12 @@ Deployment change, leaves any running one as it is, and sets the cluster's
 `Degraded` condition with reason `MaintainScratchExceedsEphemeralLimit`,
 naming both values. A limit at or above `sizeGi` is kept.
 
-The directory is a cache only. The server wipes it at start and when each
-merge unit ends, never publishes a run from it, and a pod that loses it
-restarts the unit from object storage. An `emptyDir` on node disk is
+The directory is a cache only. The server wipes each merge unit's
+subdirectory when the unit ends, never publishes a run from it, and a pod
+that loses it restarts the unit from object storage. Unit subdirectories a
+dead process left are removed when the first two-level merge takes the
+directory's lock; other files there are kept, and they count against the
+`sizeGi` limit the operator passes as `--maintain-scratch-max-bytes`. An `emptyDir` on node disk is
 therefore the whole contract, and no PersistentVolumeClaim is needed. Size
 it to about 1.3 times the input bytes of the largest merge unit: before a
 merge reads its first block it computes that need and refuses the unit,

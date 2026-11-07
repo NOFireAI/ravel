@@ -343,7 +343,7 @@ see [Compaction scratch](configuration.md#compaction-scratch).
 |---|---|
 | `--scratch-dir <path>` | Directory the level-1 runs go under. It is a cache: nothing durable is read from it, and each unit's subdirectory is wiped when the unit ends. The first two-level merge locks `ravel-scratch.lock` in it and removes the unit subdirectories a dead process left; other files are kept and count against `--scratch-max-bytes`. A directory another process holds is refused as `ScratchLocked`; a unit is admitted only when about 1.3 times its input bytes is free, and is otherwise refused as `ScratchHeadroom`. Omitted, a bucket whose cursor merge would decode more than 16 rows per input record is refused as `GeometryUnsupported`. |
 | `--scratch-max-bytes <n>` | Cap on the bytes the directory may hold. A unit is admitted against the smaller of the volume's free bytes and the cap less the bytes already there. Omitted, the volume's free bytes alone decide. |
-| `--level1-workers <n>` | Level-1 groups of one bucket merged at once, each under its share of the unit's memory ceiling. Omitted, it is derived per bucket from the unit's share of the usable cores and the largest count whose groups still fit. |
+| `--level1-workers <n>` | Level-1 groups of one bucket merged at once, each under its share of the unit's memory ceiling. Omitted, it is derived per bucket from the usable cores and the largest count whose groups still fit. The derivation treats each bucket as if it had every usable core, so with `compact-tenant --bucket-concurrency` above 1, set it to the cores per bucket. |
 
 A zero value, or `--scratch-max-bytes` or `--level1-workers` without
 `--scratch-dir`, is refused before any store request. A bucket that went
