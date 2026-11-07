@@ -326,14 +326,19 @@ pub struct FoldReport {
     /// section when the footer names one. The total this fold issued: a
     /// part's built leaves are kept for the whole fold, so a HEAD CAS attempt
     /// after a lost one that re-encodes the same part issues none for it.
-    /// Also counted in `get_requests`. Zero when
+    /// Also counted in `get_requests`. For metrics the section is LABEL_DICT,
+    /// and an entry whose object the postings build fetched whole and held
+    /// within `key_index_build_max_pairs` is read from those bytes with no GET.
+    /// Zero when
     /// [`CatalogConfig::build_key_index_leaves`](crate::CatalogConfig::build_key_index_leaves)
-    /// is off, for a signal other than logs and spans, and for a logs tenant
-    /// that declares no key-index column and leaves `index_trace_id` off.
+    /// is off, for metrics when
+    /// [`CatalogConfig::metrics_label_index`](crate::CatalogConfig::metrics_label_index)
+    /// is off, and for a logs tenant that declares no key-index column and
+    /// leaves `index_trace_id` off.
     pub key_index_ranged_gets: u64,
-    /// Bytes those GETs returned (footer suffixes plus KEY_IDX sections, as
-    /// transferred; a failed GET adds nothing). The total this fold read,
-    /// like `key_index_ranged_gets`.
+    /// Bytes those GETs returned (footer suffixes plus KEY_IDX or, for
+    /// metrics, LABEL_DICT sections, as transferred; a failed GET adds
+    /// nothing). The total this fold read, like `key_index_ranged_gets`.
     pub key_index_bytes_read: u64,
     /// `.kidx` leaves the published HEAD names for the parts the publishing
     /// attempt re-encoded, one per (part, field, key slice): the published
@@ -379,6 +384,21 @@ pub struct FoldReport {
     /// (field, slice), issued when a re-encoded part shares a data object
     /// with that tail. Also counted in `get_requests`.
     pub key_index_leaf_gets: u64,
+    /// Re-encoded metrics parts the publishing attempt left with no
+    /// `label_value` leaf because its leaves would have totalled more than
+    /// [`CatalogConfig::metrics_label_index_max_ratio_ppm`](crate::CatalogConfig::metrics_label_index_max_ratio_ppm)
+    /// of the part's entries' object bytes.
+    pub metrics_label_index_parts_over_cap: u64,
+    /// Re-encoded metrics parts the publishing attempt built no
+    /// `label_value` leaf for because a metrics erasure request was pending
+    /// (or the pending-erasure LIST failed) when the fold started.
+    pub metrics_label_index_parts_erasure_gated: u64,
+    /// LIST requests of the pending-erasure prefix the metrics leaf build
+    /// issued: one listing per fold when
+    /// [`CatalogConfig::metrics_label_index`](crate::CatalogConfig::metrics_label_index)
+    /// and `build_key_index_leaves` are both on, zero otherwise. Also counted
+    /// in `list_requests`.
+    pub metrics_label_index_erasure_list_requests: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -392,6 +412,7 @@ pub(crate) struct RequestCounters {
     key_index_entries_carried: u64,
     key_index_build_passes: u64,
     key_index_leaf_gets: u64,
+    metrics_label_index_erasure_list_requests: u64,
 }
 
 /// HEAD as read at the top of one fold attempt.
@@ -1220,12 +1241,15 @@ fn declared_logs_key_index_fields(
 
 /// The key-index fields `signal`'s objects carry for a tenant whose config is
 /// `config`: the declared logs fields (see [`declared_logs_key_index_fields`],
-/// none without a config), and `trace_id` for spans. `None` for a signal whose
-/// objects carry no KEY_IDX section.
+/// none without a config), `trace_id` for spans, and for metrics
+/// [`METRICS_LABEL_VALUE_FIELD`] when `catalog_config` turns on
+/// [`CatalogConfig::metrics_label_index`]. `None` for a signal the leaf build
+/// does not index.
 pub(crate) fn declared_key_index_fields(
     signal: Signal,
     config: Option<&crate::tenant_config::TenantConfig>,
     tenant: &TenantHash,
+    catalog_config: &CatalogConfig,
 ) -> Option<Vec<(String, KeyType)>> {
     match signal {
         Signal::Logs => Some(
@@ -1237,8 +1261,258 @@ pub(crate) fn declared_key_index_fields(
             ravel_rspan::TRACE_ID_FIELD.to_string(),
             KeyType::Id16,
         )]),
+        Signal::Metrics if catalog_config.metrics_label_index => {
+            Some(vec![(METRICS_LABEL_VALUE_FIELD.to_string(), KeyType::Str)])
+        }
         _ => None,
     }
+}
+
+/// The metrics key-index field (ADR-3694 decision 2): key8 of every
+/// LABEL_DICT string of an object, label names and values alike, each at
+/// block ordinal 0, which stands for the whole object.
+pub const METRICS_LABEL_VALUE_FIELD: &str = "label_value";
+
+/// RSEG section kind of LABEL_DICT (docs/segment-format.md).
+const RSEG_LABEL_DICT_KIND: u32 = 1;
+
+/// One metrics object's `label_value` field from its footer and its
+/// LABEL_DICT section's stored bytes: `(key8_str(s), 0)` for every string,
+/// sorted and deduplicated.
+fn metrics_label_value_entries(
+    footer: &ravel_segment::Footer,
+    label_dict_stored: &[u8],
+) -> Result<Vec<KeyIdxFieldEntries>, String> {
+    let strings =
+        ravel_segment::label_dict_strings(footer, label_dict_stored, ReaderLimits::default())
+            .map_err(|e| format!("LABEL_DICT: {e}"))?;
+    let mut entries: Vec<(ravel_codec::key_idx::Key8, u32)> = strings
+        .iter()
+        .map(|s| (ravel_codec::key_idx::key8_str(s), 0))
+        .collect();
+    entries.sort_unstable();
+    entries.dedup();
+    Ok(vec![KeyIdxFieldEntries {
+        name: METRICS_LABEL_VALUE_FIELD.to_string(),
+        key_type: KeyType::Str,
+        entries,
+    }])
+}
+
+/// The `label_value` field of a metrics object the fold already holds whole,
+/// read with no GET. The footer must name `tenant`.
+fn metrics_label_value_from_object(
+    tenant: &TenantHash,
+    object: &[u8],
+    location: &ravel_segment::FooterLocation,
+) -> EntryKeyIndex {
+    if location.footer.tenant_hash.as_slice() != tenant.0.as_slice() {
+        return Err("footer names another tenant".to_string());
+    }
+    let section = location
+        .footer
+        .sections
+        .iter()
+        .find(|s| s.kind == RSEG_LABEL_DICT_KIND)
+        .ok_or_else(|| "object has no LABEL_DICT section".to_string())?;
+    let stored = usize::try_from(section.offset)
+        .ok()
+        .zip(usize::try_from(section.len).ok())
+        .and_then(|(offset, len)| object.get(offset..offset.checked_add(len)?))
+        .ok_or_else(|| "LABEL_DICT range is outside the object".to_string())?;
+    metrics_label_value_entries(&location.footer, stored)
+}
+
+/// The metrics `label_value` fields the postings build read from objects it
+/// fetched whole, keyed by the entry's ordinal in the fold's sorted entries,
+/// for the leaf build to read with no GET. Only entries of a part this
+/// attempt will build a leaf for are held, and the held pairs are charged
+/// against `key_index_build_max_pairs`: an object whose pairs would take the
+/// held total past it is not held, and the leaf build reads it by range. A
+/// part's entries are released once its leaf is built.
+pub(crate) struct HeldLabelDicts {
+    /// Entry ordinal ranges of the parts the attempt builds a leaf for,
+    /// ascending and disjoint.
+    wanted: Vec<std::ops::Range<usize>>,
+    budget: u64,
+    pairs: u64,
+    by_ordinal: BTreeMap<usize, (EntryKeyIndex, u64)>,
+}
+
+impl HeldLabelDicts {
+    pub(crate) fn new(wanted: Vec<std::ops::Range<usize>>, budget: u64) -> Self {
+        Self {
+            wanted,
+            budget,
+            pairs: 0,
+            by_ordinal: BTreeMap::new(),
+        }
+    }
+
+    /// Whether entry `ordinal` belongs to a part the attempt builds a leaf
+    /// for.
+    fn wants(&self, ordinal: usize) -> bool {
+        let i = self.wanted.partition_point(|range| range.end <= ordinal);
+        self.wanted
+            .get(i)
+            .is_some_and(|range| range.contains(&ordinal))
+    }
+
+    /// Holds entry `ordinal`'s field when the entry is wanted and its pairs
+    /// fit the budget; `read` runs only for a wanted entry.
+    fn offer(&mut self, ordinal: usize, read: impl FnOnce() -> EntryKeyIndex) {
+        if !self.wants(ordinal) {
+            return;
+        }
+        let fields = read();
+        let pairs = fields
+            .as_ref()
+            .map(|fields| fields.iter().map(|f| f.entries.len() as u64).sum())
+            .unwrap_or(0);
+        let Some(total) = self
+            .pairs
+            .checked_add(pairs)
+            .filter(|&total| total <= self.budget)
+        else {
+            return;
+        };
+        self.pairs = total;
+        self.by_ordinal.insert(ordinal, (fields, pairs));
+        #[cfg(test)]
+        HELD_LABEL_DICT_LOG.with(|log| {
+            let mut log = log.borrow_mut();
+            log.held_ordinals.push(ordinal);
+            log.peak_pairs = log.peak_pairs.max(total);
+        });
+    }
+
+    /// Drops every held entry in `ordinals`.
+    fn release(&mut self, ordinals: std::ops::Range<usize>) {
+        let held: Vec<usize> = self.by_ordinal.range(ordinals).map(|(&o, _)| o).collect();
+        for ordinal in held {
+            if let Some((_, pairs)) = self.by_ordinal.remove(&ordinal) {
+                self.pairs -= pairs;
+            }
+        }
+        #[cfg(test)]
+        HELD_LABEL_DICT_LOG.with(|log| log.borrow_mut().pairs_after_release.push(self.pairs));
+    }
+
+    /// The held entries of the part whose first entry is at `start`.
+    fn part(&self, start: usize) -> HeldPart<'_> {
+        HeldPart { held: self, start }
+    }
+}
+
+/// [`HeldLabelDicts`] seen from one part, by the part's own entry ordinal.
+#[derive(Clone, Copy)]
+pub(crate) struct HeldPart<'a> {
+    held: &'a HeldLabelDicts,
+    start: usize,
+}
+
+impl HeldPart<'_> {
+    fn get(&self, part_ordinal: u64) -> Option<&EntryKeyIndex> {
+        let ordinal = usize::try_from(part_ordinal)
+            .ok()?
+            .checked_add(self.start)?;
+        self.held.by_ordinal.get(&ordinal).map(|(fields, _)| fields)
+    }
+}
+
+// Test-only: the fold ordinals [`HeldLabelDicts`] held, the most pairs it
+// held at once, and the pairs it still held after each part's release.
+#[cfg(test)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HeldLabelDictLog {
+    pub(crate) held_ordinals: Vec<usize>,
+    pub(crate) peak_pairs: u64,
+    pub(crate) pairs_after_release: Vec<u64>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static HELD_LABEL_DICT_LOG: std::cell::RefCell<HeldLabelDictLog> =
+        std::cell::RefCell::new(HeldLabelDictLog::default());
+}
+
+#[cfg(test)]
+pub(crate) fn take_held_label_dict_log_for_test() -> HeldLabelDictLog {
+    HELD_LABEL_DICT_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
+/// Reads a metrics object's `label_value` field by range: a suffix GET for
+/// the RSEG footer (a second footer GET only when the footer is longer than
+/// [`KEY_INDEX_FOOTER_SUFFIX_LEN`]), then one GET of LABEL_DICT.
+async fn read_metrics_label_value_counted(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    key: &str,
+    object_size: u64,
+    gets: &mut u64,
+    bytes: &mut u64,
+) -> Result<Vec<KeyIdxFieldEntries>, KeyIdxReadError> {
+    use ravel_segment::FooterOutcome;
+    if object_size == 0 {
+        return Err("entry names a zero-byte object".to_string().into());
+    }
+    let limits = ReaderLimits::default();
+    let suffix_len = object_size.min(KEY_INDEX_FOOTER_SUFFIX_LEN);
+    *gets += 1;
+    let tail = store
+        .get(key, GetRange::Suffix(suffix_len))
+        .await
+        .map_err(|e| KeyIdxReadError::Get(format!("footer suffix GET: {e}")))?;
+    *bytes += tail.data.len() as u64;
+    let total_size = tail.total_size;
+    let location = match ravel_segment::open_from_suffix(&tail.data, total_size, limits)
+        .map_err(|e| format!("RSEG footer: {e}"))?
+    {
+        FooterOutcome::Ready(location) => location,
+        FooterOutcome::NeedRange { offset, len } => {
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| "footer range overflows".to_string())?;
+            *gets += 1;
+            let got = store
+                .get(key, GetRange::Range(offset, end))
+                .await
+                .map_err(|e| KeyIdxReadError::Get(format!("footer range GET: {e}")))?;
+            *bytes += got.data.len() as u64;
+            match ravel_segment::open_from_suffix(&got.data, total_size, limits)
+                .map_err(|e| format!("RSEG footer: {e}"))?
+            {
+                FooterOutcome::Ready(location) => location,
+                FooterOutcome::NeedRange { .. } => {
+                    return Err("footer range GET did not cover the footer"
+                        .to_string()
+                        .into());
+                }
+            }
+        }
+    };
+    if location.footer.tenant_hash.as_slice() != tenant.0.as_slice() {
+        return Err("footer names another tenant".to_string().into());
+    }
+    let Some(section) = location
+        .footer
+        .sections
+        .iter()
+        .find(|s| s.kind == RSEG_LABEL_DICT_KIND)
+    else {
+        return Err("object has no LABEL_DICT section".to_string().into());
+    };
+    let end = section
+        .offset
+        .checked_add(section.len)
+        .ok_or_else(|| "LABEL_DICT range overflows".to_string())?;
+    *gets += 1;
+    let stored = store
+        .get(key, GetRange::Range(section.offset, end))
+        .await
+        .map_err(|e| KeyIdxReadError::Get(format!("LABEL_DICT section GET: {e}")))?;
+    *bytes += stored.data.len() as u64;
+    Ok(metrics_label_value_entries(&location.footer, &stored.data)?)
 }
 
 /// PUTs one encoded leaf at its content-addressed key under the covered
@@ -1361,7 +1635,9 @@ fn open_key_idx_footer(
 /// bytes) by range: a suffix GET for the footer (a second footer GET only
 /// when the footer is longer than [`KEY_INDEX_FOOTER_SUFFIX_LEN`]), then one
 /// GET of the section. Never reads rows. Every failure leaves the entry
-/// uncovered rather than failing the fold.
+/// uncovered rather than failing the fold. A metrics object has no KEY_IDX
+/// section: its LABEL_DICT section is read the same way instead and yields
+/// the one [`METRICS_LABEL_VALUE_FIELD`] field.
 pub(crate) async fn read_entry_key_index(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -1403,6 +1679,10 @@ async fn read_entry_key_index_counted(
     gets: &mut u64,
     bytes: &mut u64,
 ) -> Result<Vec<KeyIdxFieldEntries>, KeyIdxReadError> {
+    if signal == Signal::Metrics {
+        return read_metrics_label_value_counted(store, tenant, key, object_size, gets, bytes)
+            .await;
+    }
     if object_size == 0 {
         return Err("entry names a zero-byte object".to_string().into());
     }
@@ -2197,20 +2477,41 @@ fn record_key_index_pass_end(name: &str, field: &FieldBuild) {
 }
 
 /// What the leaf build needs beyond the part: the body ceiling, the pair
-/// budget and the read concurrency.
+/// budget, the read concurrency and the byte cap.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct KeyIndexBuildLimits {
     pub(crate) leaf: KeyIndexLeafLimits,
     pub(crate) max_pairs: u64,
     pub(crate) concurrency: usize,
+    /// Most bytes one field's leaves may total for the part; a field whose
+    /// leaves would pass it is left uncovered with no ref. `None` is no cap.
+    pub(crate) leaf_bytes_cap: Option<u64>,
 }
 
-/// One part's leaf refs, sorted by (field, key8_lo), and its uncovered
-/// (entry, field) count.
+/// The metrics `label_value` byte cap for a part whose entries' objects
+/// total `part_data_bytes`: that times `ratio_ppm` parts per million,
+/// rounded down.
+pub(crate) fn metrics_label_index_leaf_bytes_cap(part_data_bytes: u64, ratio_ppm: u32) -> u64 {
+    let cap = u128::from(part_data_bytes) * u128::from(ratio_ppm) / 1_000_000;
+    u64::try_from(cap).unwrap_or(u64::MAX)
+}
+
+/// What [`Catalog::metrics_label_index_erasure_gate`] found and the requests
+/// its listing issued.
+pub(crate) struct MetricsErasureGate {
+    pub(crate) gated: bool,
+    pub(crate) list_requests: u64,
+    pub(crate) get_requests: u64,
+}
+
+/// One part's leaf refs, sorted by (field, key8_lo), its uncovered
+/// (entry, field) count, and whether a field was left uncovered by the
+/// byte cap.
 #[derive(Debug, Clone)]
 pub(crate) struct BuiltPartKeyIndex {
     pub(crate) refs: Vec<SnapshotKeyIndexLeafRef>,
     pub(crate) uncovered_entries: u64,
+    pub(crate) over_cap: bool,
 }
 
 /// Builds and PUTs one re-encoded part's leaves (ADR-2707 decision 4, the
@@ -2250,6 +2551,7 @@ pub(crate) async fn build_part_key_index(
     part_entries: &[SnapshotEntry],
     declared: &[(String, KeyType)],
     previous_tail: Option<&PreviousTail>,
+    held: HeldPart<'_>,
     limits: &KeyIndexBuildLimits,
     counters: &mut RequestCounters,
 ) -> Result<BuiltPartKeyIndex, StoreError> {
@@ -2313,6 +2615,7 @@ pub(crate) async fn build_part_key_index(
     };
 
     'build: loop {
+        let mut over_cap = false;
         let carried = carry.take();
         let carry_active = carried.is_some();
         // An entry goes unread only when the previous leaves covered it for
@@ -2388,8 +2691,24 @@ pub(crate) async fn build_part_key_index(
                 // `Send` bound the server's spawned fold loop needs.
                 let mut reads = stream::iter(0..targets.len())
                     .map(move |i| {
-                        let (_, key, object_size) = &targets_ref[i];
-                        read_entry_key_index(store, tenant, signal, key, *object_size)
+                        let (ordinal, key, object_size) = &targets_ref[i];
+                        let held = held.get(*ordinal).cloned();
+                        async move {
+                            match held {
+                                // Read from object bytes the fold already
+                                // holds: no GET.
+                                Some(fields) => EntryKeyIndexRead {
+                                    fields,
+                                    get_failed: false,
+                                    gets: 0,
+                                    bytes: 0,
+                                },
+                                None => {
+                                    read_entry_key_index(store, tenant, signal, key, *object_size)
+                                        .await
+                                }
+                            }
+                        }
                     })
                     .buffered(limits.concurrency.max(1));
                 let mut next = 0usize;
@@ -2507,6 +2826,35 @@ pub(crate) async fn build_part_key_index(
                     record_key_index_pass_end(name, field);
                 }
             }
+            if let Some(cap) = limits.leaf_bytes_cap {
+                for (name, field) in fields.iter_mut() {
+                    if field.state == FieldBuildState::Uncovered {
+                        continue;
+                    }
+                    let put: u64 = field.refs.iter().map(|r| r.size).sum();
+                    let queued: u64 = pending
+                        .iter()
+                        .filter(|(n, attempt, _)| n == name && *attempt == field.attempt)
+                        .map(|(_, _, leaf)| leaf.bytes.len() as u64)
+                        .sum();
+                    if put.saturating_add(queued) > cap {
+                        tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            field = name.as_str(),
+                            leaf_bytes = put.saturating_add(queued),
+                            cap,
+                            "the part's key-index leaves would exceed the byte cap; the part is uncovered for the field"
+                        );
+                        field.give_up();
+                        over_cap = true;
+                    }
+                }
+                pending.retain(|(name, _, _)| {
+                    fields
+                        .get(name)
+                        .is_some_and(|field| field.state != FieldBuildState::Uncovered)
+                });
+            }
             for (name, attempt, leaf) in pending {
                 let put_result =
                     put_key_index_leaf(store, tenant, signal, part_watermark, leaf).await;
@@ -2533,6 +2881,7 @@ pub(crate) async fn build_part_key_index(
         let mut built = BuiltPartKeyIndex {
             refs: Vec::new(),
             uncovered_entries: 0,
+            over_cap,
         };
         for field in fields.into_values() {
             match field.state {
@@ -2987,11 +3336,11 @@ impl Catalog {
         //
         // ADR-2707 decision 4: the key-index fields the tenant declares at
         // fold time. `None` builds no leaves and reads no section: the
-        // switch is off, the signal's objects carry no KEY_IDX section, or a
-        // logs tenant declares no key-index field.
+        // switch is off, the signal is metrics and `metrics_label_index` is
+        // off, or a logs tenant declares no key-index field.
         let key_index_fields: Option<Vec<(String, KeyType)>> =
             if self.config().build_key_index_leaves {
-                declared_key_index_fields(signal, tenant_config.as_ref(), tenant)
+                declared_key_index_fields(signal, tenant_config.as_ref(), tenant, self.config())
                     .filter(|declared| !declared.is_empty())
             } else {
                 None
@@ -3005,6 +3354,26 @@ impl Catalog {
         // invisible to the report. Read once before the retry loop, so it is one
         // GET per fold regardless of how many CAS attempts the loop makes.
         counters.get_requests += 1;
+
+        // ADR-3694 decision 2: a metrics leaf built while an erasure request
+        // is pending would store key8s of the strings being erased, so the
+        // pending set is listed once per fold and any pending request (or a
+        // listing that fails) builds no new metrics leaf this fold. Parts
+        // carried by reference keep the refs they already have.
+        let metrics_erasure_gated = if signal == Signal::Metrics && key_index_fields.is_some() {
+            let gate = self.metrics_label_index_erasure_gate(tenant).await;
+            counters.list_requests += gate.list_requests;
+            counters.metrics_label_index_erasure_list_requests += gate.list_requests;
+            counters.get_requests += gate.get_requests;
+            gate.gated
+        } else {
+            false
+        };
+        let key_index_fields = if metrics_erasure_gated {
+            None
+        } else {
+            key_index_fields
+        };
 
         // One tally cache for the WHOLE fold, CAS retries included: a lost
         // HEAD CAS restarts the loop, and a cache constructed inside it would
@@ -3713,9 +4082,49 @@ impl Catalog {
                 HashMap::new()
             };
 
+            // A metrics leaf build takes the postings build first, so an
+            // entry it fetches whole can have its LABEL_DICT read from those
+            // bytes, and the leaf build issues no GET for an entry held.
+            // Other folds build the postings after the parts, as below. Only
+            // the entries of parts this attempt builds a leaf for are held: a
+            // part reused by reference, or one an earlier attempt already
+            // built, needs none.
+            let wanted_spans: Vec<std::ops::Range<usize>> = spans
+                .iter()
+                .zip(&span_encodings)
+                .filter_map(|(span, encoding)| {
+                    let hash = encoding.as_ref().ok()?.hash;
+                    let reused = existing_by_blake3.contains_key(hash.as_bytes().as_slice())
+                        || key_index_built.contains_key(hash.as_bytes());
+                    (!reused).then_some(span.start..span.end)
+                })
+                .collect();
+            let mut held_label_dicts =
+                HeldLabelDicts::new(wanted_spans, self.config().key_index_build_max_pairs.max(1));
+            let early_postings = if signal == Signal::Metrics && key_index_fields.is_some() {
+                Some(
+                    self.fold_postings_names(
+                        tenant,
+                        signal,
+                        &head_state,
+                        rebuilt || reconciled,
+                        previous_entries_len,
+                        &entries,
+                        Some(&mut held_label_dicts),
+                        &mut counters,
+                        &accounting,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+
             let mut part_refs: Vec<SnapshotPartRef> = Vec::with_capacity(spans.len());
             let mut part_hashes: Vec<[u8; 32]> = Vec::with_capacity(spans.len());
             let mut total_part_bytes: u64 = 0;
+            let mut metrics_label_index_parts_over_cap: u64 = 0;
+            let mut metrics_label_index_parts_erasure_gated: u64 = 0;
             let mut parts_reused: u64 = 0;
             let mut column_stats_part_objects_built: u64 = 0;
             let mut column_stats_dictionaries_dropped: u64 = 0;
@@ -4001,10 +4410,21 @@ impl Catalog {
                 // already wrote are unreferenced and left to the catalog
                 // sweep. The reads share the fold's bucket concurrency bound.
                 let mut key_index = Vec::new();
+                if metrics_erasure_gated {
+                    metrics_label_index_parts_erasure_gated += 1;
+                }
                 if let Some(declared) = &key_index_fields {
                     let built = match key_index_built.get(part_hash.as_bytes()) {
                         Some(built) => built.clone(),
                         None => {
+                            // ADR-3694 decision 2: the metrics byte cap, a
+                            // ratio of the part's own data bytes.
+                            let leaf_bytes_cap = (signal == Signal::Metrics).then(|| {
+                                metrics_label_index_leaf_bytes_cap(
+                                    part_entries.iter().map(|e| e.object_size).sum(),
+                                    self.config().metrics_label_index_max_ratio_ppm,
+                                )
+                            });
                             let built = build_part_key_index(
                                 self.store(),
                                 tenant,
@@ -4014,19 +4434,25 @@ impl Catalog {
                                 part_entries,
                                 declared,
                                 previous_tail.as_ref(),
+                                held_label_dicts.part(span.start),
                                 &KeyIndexBuildLimits {
                                     leaf: key_index_leaf_limits(),
                                     max_pairs: self.config().key_index_build_max_pairs,
                                     concurrency: self.config().fold_bucket_concurrency,
+                                    leaf_bytes_cap,
                                 },
                                 &mut counters,
                             )
                             .await
                             .map_err(CatalogError::Store)?;
+                            held_label_dicts.release(span.start..span.end);
                             key_index_built.insert(*part_hash.as_bytes(), built.clone());
                             built
                         }
                     };
+                    if built.over_cap {
+                        metrics_label_index_parts_over_cap += 1;
+                    }
                     key_index_uncovered_entries += built.uncovered_entries;
                     key_index_leaves_written += built.refs.len() as u64;
                     key_index_leaf_bytes_written +=
@@ -4096,36 +4522,22 @@ impl Catalog {
             // `decode_start = 0` here, while a bucket that arrives
             // already-compacted on its first fold is a plain hour-major
             // append and never disturbs a previously-recorded ordinal.
-            let postings_names = {
-                let (postings_baseline, postings_decode_start): (Vec<NamePostings>, usize) =
-                    if rebuilt || reconciled {
-                        (Vec::new(), 0)
-                    } else if let HeadState::Valid { head, .. } = &head_state {
-                        match self
-                            .load_previous_postings(
-                                tenant,
-                                head,
-                                previous_entries_len as u64,
-                                &mut counters,
-                                &accounting,
-                            )
-                            .await?
-                        {
-                            Some(names) => (names, previous_entries_len),
-                            None => (Vec::new(), 0),
-                        }
-                    } else {
-                        (Vec::new(), 0)
-                    };
-                self.build_postings(
-                    tenant,
-                    signal,
-                    &entries,
-                    postings_decode_start,
-                    postings_baseline,
-                    &mut counters,
-                )
-                .await
+            let postings_names = match early_postings {
+                Some(names) => names,
+                None => {
+                    self.fold_postings_names(
+                        tenant,
+                        signal,
+                        &head_state,
+                        rebuilt || reconciled,
+                        previous_entries_len,
+                        &entries,
+                        None,
+                        &mut counters,
+                        &accounting,
+                    )
+                    .await?
+                }
             };
             let mut postings_built = false;
             let mut postings_size = 0u64;
@@ -4284,6 +4696,10 @@ impl Catalog {
                         key_index_entries_carried: counters.key_index_entries_carried,
                         key_index_build_passes: counters.key_index_build_passes,
                         key_index_leaf_gets: counters.key_index_leaf_gets,
+                        metrics_label_index_parts_over_cap,
+                        metrics_label_index_parts_erasure_gated,
+                        metrics_label_index_erasure_list_requests: counters
+                            .metrics_label_index_erasure_list_requests,
                     });
                 }
                 // Another folder's HEAD CAS won first. Re-GET HEAD next
@@ -4692,6 +5108,85 @@ impl Catalog {
         Ok(Some(decoded.names.clone()))
     }
 
+    /// ADR-3694 decision 2: a metrics leaf built while an erasure request is
+    /// pending would store key8s of the strings being erased. Lists the
+    /// tenant's pending metrics erasure once; any pending request, or a
+    /// listing that fails, gates the build.
+    pub(crate) async fn metrics_label_index_erasure_gate(
+        &self,
+        tenant: &TenantHash,
+    ) -> MetricsErasureGate {
+        let accounting = QueryAccounting::new();
+        let pending = self
+            .list_pending_erasure(tenant, Signal::Metrics, &accounting)
+            .await;
+        let snapshot = accounting.snapshot();
+        let gated = match pending {
+            Ok(pending) => !pending.is_empty(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    tenant = %tenant.to_hex(),
+                    "pending-erasure listing failed; no metrics label_value leaf is built"
+                );
+                true
+            }
+        };
+        MetricsErasureGate {
+            gated,
+            list_requests: snapshot.s3_requests(AccountedOp::List),
+            get_requests: snapshot.s3_requests(AccountedOp::Get),
+        }
+    }
+
+    /// The fold's name postings for `entries`: merged forward from the
+    /// previous HEAD's postings unless `from_scratch` or no usable baseline
+    /// exists, then built by [`Catalog::build_postings`].
+    #[allow(clippy::too_many_arguments)]
+    async fn fold_postings_names(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        head_state: &HeadState,
+        from_scratch: bool,
+        previous_entries_len: usize,
+        entries: &[SnapshotEntry],
+        held_label_dicts: Option<&mut HeldLabelDicts>,
+        counters: &mut RequestCounters,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<Vec<NamePostings>>, CatalogError> {
+        let (baseline, decode_start): (Vec<NamePostings>, usize) = if from_scratch {
+            (Vec::new(), 0)
+        } else if let HeadState::Valid { head, .. } = head_state {
+            match self
+                .load_previous_postings(
+                    tenant,
+                    head,
+                    previous_entries_len as u64,
+                    counters,
+                    accounting,
+                )
+                .await?
+            {
+                Some(names) => (names, previous_entries_len),
+                None => (Vec::new(), 0),
+            }
+        } else {
+            (Vec::new(), 0)
+        };
+        Ok(self
+            .build_postings(
+                tenant,
+                signal,
+                entries,
+                decode_start,
+                baseline,
+                held_label_dicts,
+                counters,
+            )
+            .await)
+    }
+
     /// Build the name-postings index for `entries`, merging forward from `baseline` rather than re-decoding every
     /// historical segment on every fold: entries before `decode_start` keep
     /// exactly the ordinals `baseline` already recorded for them, and only
@@ -4700,6 +5195,11 @@ impl Catalog {
     /// error, or a series missing `__name__`), logging the cause: a
     /// postings build is all-or-nothing over the entries it decodes, never
     /// partial.
+    ///
+    /// With `held_label_dicts`, each fetched object's metrics `label_value`
+    /// field is offered to it from the bytes in hand, under the entry's
+    /// ordinal; an entry it holds is read by the leaf build with no GET.
+    #[allow(clippy::too_many_arguments)]
     async fn build_postings(
         &self,
         tenant: &TenantHash,
@@ -4707,6 +5207,7 @@ impl Catalog {
         entries: &[SnapshotEntry],
         decode_start: usize,
         baseline: Vec<NamePostings>,
+        mut held_label_dicts: Option<&mut HeldLabelDicts>,
         counters: &mut RequestCounters,
     ) -> Option<Vec<NamePostings>> {
         let mut by_name: BTreeMap<String, Vec<u64>> = baseline
@@ -4714,7 +5215,16 @@ impl Catalog {
             .map(|np| (np.name, np.ordinals))
             .collect();
         for (ordinal, entry) in entries.iter().enumerate().skip(decode_start) {
-            let names = match fetch_segment_names(self.store(), tenant, signal, entry).await {
+            let fetched = fetch_segment_object(self.store(), tenant, signal, entry).await;
+            let names = match fetched.and_then(|(_, data, location)| {
+                let names = segment_names_from_object(&location, &data)?;
+                if let Some(held) = held_label_dicts.as_deref_mut() {
+                    held.offer(ordinal, || {
+                        metrics_label_value_from_object(tenant, &data, &location)
+                    });
+                }
+                Ok(names)
+            }) {
                 Ok(names) => {
                     counters.get_requests += 1;
                     names
@@ -5255,6 +5765,19 @@ pub async fn fetch_segment_names(
     signal: Signal,
     entry: &SnapshotEntry,
 ) -> Result<HashSet<String>, PostingsBuildError> {
+    let (_, data, location) = fetch_segment_object(store, tenant, signal, entry).await?;
+    segment_names_from_object(&location, &data)
+}
+
+/// One entry's segment, fetched whole with one GET, its footer opened and
+/// its identity checked, with the data object key it was read from: the
+/// fetch half of [`fetch_segment_names`].
+async fn fetch_segment_object(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    entry: &SnapshotEntry,
+) -> Result<(String, Bytes, ravel_segment::FooterLocation), PostingsBuildError> {
     let content_hash: [u8; 32] = entry
         .content_hash
         .as_slice()
@@ -5313,11 +5836,19 @@ pub async fn fetch_segment_names(
     };
     let got = store.get(&data_key, GetRange::Full).await?;
 
-    let limits = ReaderLimits::default();
-    let location = ravel_segment::open_from_full(&got.data, limits)?;
+    let location = ravel_segment::open_from_full(&got.data, ReaderLimits::default())?;
     ravel_segment::check_identity(&location.footer, &expected)?;
+    Ok((data_key, got.data, location))
+}
 
-    // ADR-0027: v7 is the only supported version (`open_from_full` above has
+/// The distinct `__name__` values of a segment held whole: the decode half
+/// of [`fetch_segment_names`].
+fn segment_names_from_object(
+    location: &ravel_segment::FooterLocation,
+    data: &[u8],
+) -> Result<HashSet<String>, PostingsBuildError> {
+    let limits = ReaderLimits::default();
+    // ADR-0027: v7 is the only supported version (`open_from_full` has
     // already rejected anything else, including the retired v6). The chunked
     // v5-shaped catalog (unchanged by the v6 EXEMPLARS addition and the v7
     // per-sample provenance extension, which the postings build ignores) spans
@@ -5326,7 +5857,7 @@ pub async fn fetch_segment_names(
     // `SeriesEntry` view the postings build consumes.
     let series: Vec<ravel_segment::SeriesEntry> = match location.version {
         ravel_segment::VERSION_V7 => {
-            ravel_segment::decode_catalog_v5(&location.footer, &got.data, limits)?
+            ravel_segment::decode_catalog_v5(&location.footer, data, limits)?
                 .into_iter()
                 .map(|e| e.entry)
                 .collect()
@@ -5397,6 +5928,10 @@ fn no_op_report(
         key_index_entries_carried: counters.key_index_entries_carried,
         key_index_build_passes: counters.key_index_build_passes,
         key_index_leaf_gets: counters.key_index_leaf_gets,
+        metrics_label_index_parts_over_cap: 0,
+        metrics_label_index_parts_erasure_gated: 0,
+        metrics_label_index_erasure_list_requests: counters
+            .metrics_label_index_erasure_list_requests,
     }
 }
 
@@ -15239,6 +15774,931 @@ pub(crate) mod tests {
                 entry_ordinal: 2,
                 blocks: vec![7],
             }]
+        );
+    }
+
+    // ---- ADR-3694 decision 2: the metrics `label_value` leaf ----
+
+    use ravel_codec::key_idx::key8_str;
+
+    /// The fixture's metric name.
+    pub(crate) const CPU_SECONDS: &str = "cpu_seconds";
+
+    /// Both metrics switches on, one shard.
+    pub(crate) fn metrics_kidx_config() -> CatalogConfig {
+        CatalogConfig {
+            build_key_index_leaves: true,
+            metrics_label_index: true,
+            ..config(1)
+        }
+    }
+
+    /// Publishes one real RSEG object into `hour` (shard 0, writer
+    /// `writer_seq`): one `cpu_seconds` series per element of `series`, which
+    /// lists the series' labels besides `__name__`, each with `samples`
+    /// pseudo-random samples so the object's data bytes dwarf its LABEL_DICT.
+    /// `corrupt_label_dict` flips one byte inside the stored LABEL_DICT
+    /// section; the record's content hash is of the bytes as stored.
+    pub(crate) async fn publish_labeled_metrics(
+        store: &dyn ObjectStoreBackend,
+        writer_seq: u64,
+        hour: u32,
+        series: &[Vec<(&str, &str)>],
+        samples: usize,
+        corrupt_label_dict: bool,
+    ) -> CommitRecord {
+        let tenant_id = TenantId::new("metrics-label-index");
+        let base_ts = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
+        let mut state = writer_seq.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut inputs = Vec::with_capacity(series.len());
+        for labels in series {
+            let mut all = vec![Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: CPU_SECONDS.to_string(),
+            }];
+            all.extend(labels.iter().map(|(name, value)| Label {
+                name: (*name).to_string(),
+                value: (*value).to_string(),
+            }));
+            let labels = LabelSet::new(all).expect("valid labels");
+            let series_id = SeriesId::compute(&tenant_id, CPU_SECONDS, &labels).expect("series id");
+            let mut points = Vec::with_capacity(samples);
+            for i in 0..samples {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                points.push(Sample {
+                    ts_ns: base_ts + i as i64 * 1_000_000,
+                    value: (state >> 11) as f64 / (1u64 << 53) as f64,
+                });
+            }
+            inputs.push(SeriesInput {
+                series_id,
+                labels,
+                samples: points,
+            });
+        }
+        let writer_id = Uuid::from_u128(u128::from(writer_seq));
+        let min_ingest_ts_ns = base_ts;
+        let max_ingest_ts_ns = base_ts + samples as i64 * 1_000_000;
+        let written = SegmentWriter::write(
+            inputs,
+            SegmentIdentity {
+                tenant_hash: tenant().0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+            IngestBounds {
+                min_ingest_ts_ns,
+                max_ingest_ts_ns,
+            },
+        )
+        .expect("write segment");
+        let mut bytes = written.bytes.to_vec();
+        if corrupt_label_dict {
+            let (offset, len) = label_dict_range(&bytes);
+            bytes[(offset + len / 2) as usize] ^= 0xff;
+        }
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: base_ts,
+            ingest_hour_bucket: hour,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    /// `(offset, len)` of an RSEG object's stored LABEL_DICT section.
+    pub(crate) fn label_dict_range(object: &[u8]) -> (u64, u64) {
+        let location = match ravel_segment::open_from_suffix(
+            object,
+            object.len() as u64,
+            ReaderLimits::default(),
+        )
+        .expect("footer opens")
+        {
+            ravel_segment::FooterOutcome::Ready(location) => location,
+            ravel_segment::FooterOutcome::NeedRange { .. } => panic!("whole object in hand"),
+        };
+        let section = location
+            .footer
+            .sections
+            .iter()
+            .find(|s| s.kind == RSEG_LABEL_DICT_KIND)
+            .expect("LABEL_DICT section");
+        (section.offset, section.len)
+    }
+
+    /// Four series per object, `instance` i0 to i3, all with `region` set to
+    /// `region`.
+    pub(crate) fn region_series(region: &'static str) -> Vec<Vec<(&'static str, &'static str)>> {
+        ["i0", "i1", "i2", "i3"]
+            .into_iter()
+            .map(|instance| vec![("instance", instance), ("region", region)])
+            .collect()
+    }
+
+    /// The writers of [`publish_label_fixture`] whose objects hold "east".
+    pub(crate) const EAST_WRITERS: [u64; 2] = [2, 5];
+
+    /// Six objects in [`KIDX_HOUR`], writers 1 to 6, [`region_series`] with
+    /// 1000 samples per series: `region` is "east" for [`EAST_WRITERS`] and
+    /// "west" for the other four.
+    pub(crate) async fn publish_label_fixture(store: &dyn ObjectStoreBackend) -> Vec<CommitRecord> {
+        let mut records = Vec::new();
+        for seq in 1..=6u64 {
+            let region = if EAST_WRITERS.contains(&seq) {
+                "east"
+            } else {
+                "west"
+            };
+            records.push(
+                publish_labeled_metrics(store, seq, KIDX_HOUR, &region_series(region), 1000, false)
+                    .await,
+            );
+        }
+        records
+    }
+
+    async fn probe_label(
+        catalog: &Catalog,
+        part: &SnapshotPartRef,
+        value: &str,
+    ) -> KeyIndexLeafProbe {
+        probe_part(
+            catalog,
+            Signal::Metrics,
+            part,
+            KeyType::Str,
+            METRICS_LABEL_VALUE_FIELD,
+            key8_str(value),
+        )
+        .await
+    }
+
+    /// ADR-3694 decision 2, the acceptance test: with both switches on, the
+    /// fold builds one `label_value` leaf for the part from every object's
+    /// LABEL_DICT, and a probe names exactly the objects holding a string,
+    /// each at block 0. "east" sits in two of the six objects, "north" in
+    /// none, and the label name "region" in all six. The objects reach the
+    /// leaf build through the postings build's whole-object GETs, so the
+    /// build issues no ranged GET, and the leaf stays within 1% of the part's
+    /// data bytes.
+    ///
+    /// A build that indexed only label names answers "east" as absent; one
+    /// that read only the part's first object answers "east" as absent too.
+    #[tokio::test]
+    async fn metrics_label_leaf_routes_exactly_the_holders() {
+        let store = recording_store();
+        let records = publish_label_fixture(store.as_ref()).await;
+        let catalog = Catalog::new(store.clone(), metrics_kidx_config()).expect("catalog");
+        store.gets.lock().expect("lock").clear();
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 6, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+        assert_eq!(report.key_index_uncovered_entries, 0, "{report:?}");
+        assert_eq!(report.metrics_label_index_parts_over_cap, 0, "{report:?}");
+        assert_eq!(report.metrics_label_index_parts_erasure_gated, 0);
+        assert_eq!(report.metrics_label_index_erasure_list_requests, 1);
+        assert_eq!(
+            data_object_ranged_gets(&store),
+            Vec::<(String, GetRange)>::new(),
+            "every object is read from the postings build's bytes"
+        );
+        assert_eq!(report.key_index_ranged_gets, 0, "{report:?}");
+
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts.len(), 1);
+        let part = &head.parts[0];
+        assert_eq!(part.key_index.len(), 1);
+        assert_eq!(part.key_index[0].field, METRICS_LABEL_VALUE_FIELD);
+        let ordinal = part_ordinals(store.as_ref(), part).await;
+
+        let east: Vec<(u64, &[u32])> = EAST_WRITERS
+            .iter()
+            .map(|seq| (ordinal[seq], &[0u32][..]))
+            .collect();
+        assert_eq!(
+            probe_label(&catalog, part, "east").await,
+            matches(&east, &[])
+        );
+        assert_eq!(
+            probe_label(&catalog, part, "north").await,
+            KeyIndexLeafProbe::Absent {
+                uncovered_entry_ordinals: Vec::new()
+            }
+        );
+        let all: Vec<(u64, &[u32])> = (1..=6u64).map(|seq| (ordinal[&seq], &[0u32][..])).collect();
+        assert_eq!(
+            probe_label(&catalog, part, "region").await,
+            matches(&all, &[])
+        );
+        assert_eq!(
+            probe_label(&catalog, part, CPU_SECONDS).await,
+            matches(&all, &[])
+        );
+
+        let leaf_bytes = report.key_index_leaf_bytes_written;
+        let data_bytes: u64 = records.iter().map(|r| r.object_size).sum();
+        println!("label_value leaf bytes {leaf_bytes}, part data bytes {data_bytes}");
+        assert_eq!(leaf_bytes, part.key_index[0].size);
+        assert!(
+            leaf_bytes * 100 <= data_bytes,
+            "{leaf_bytes} leaf bytes over 1% of {data_bytes}"
+        );
+    }
+
+    /// With `build_key_index_leaves` on and `metrics_label_index` off, a
+    /// metrics fold builds no leaf, reads no LABEL_DICT by range and lists no
+    /// pending erasure.
+    #[tokio::test]
+    async fn the_metrics_leaf_is_off_without_metrics_label_index() {
+        let store = recording_store();
+        publish_label_fixture(store.as_ref()).await;
+        let cfg = CatalogConfig {
+            metrics_label_index: false,
+            ..metrics_kidx_config()
+        };
+        assert!(cfg.build_key_index_leaves);
+        assert!(!CatalogConfig::default().metrics_label_index);
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 6, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 0, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 0, "{report:?}");
+        assert_eq!(report.metrics_label_index_erasure_list_requests, 0);
+        assert_eq!(
+            data_object_ranged_gets(&store),
+            Vec::<(String, GetRange)>::new()
+        );
+        assert_eq!(
+            kidx_objects(store.as_ref(), Signal::Metrics).await,
+            Vec::<String>::new()
+        );
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert!(head.parts.iter().all(|p| p.key_index.is_empty()));
+    }
+
+    /// PUTs a pending metrics erasure request for `region = east`.
+    pub(crate) async fn put_metrics_erasure_request(store: &dyn ObjectStoreBackend) {
+        use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
+        let request_id = Uuid::from_u128(0xe7a5e);
+        let request = ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            request_id: request_id.to_string(),
+            created_unix_ns: i64::from(KIDX_HOUR) * NS_PER_HOUR,
+            predicate: vec![ErasurePredicateMatcher {
+                key: "region".to_string(),
+                value: "east".to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        };
+        let key =
+            keys::erasure_request_key(&tenant(), Signal::Metrics, request_id).expect("request key");
+        store
+            .put(
+                &key,
+                erasure::encode_request(&request),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put request");
+    }
+
+    /// A pending metrics erasure request gates the leaf build: the fold
+    /// writes no leaf and reads no LABEL_DICT, counts the part as gated and
+    /// the one LIST of the pending set. A listing that fails gates the same
+    /// way, its LIST counted too.
+    #[tokio::test]
+    async fn a_pending_erasure_request_builds_no_metrics_leaf() {
+        let store = recording_store();
+        publish_label_fixture(store.as_ref()).await;
+        put_metrics_erasure_request(store.as_ref()).await;
+        let catalog = Catalog::new(store.clone(), metrics_kidx_config()).expect("catalog");
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 6, "{report:?}");
+        assert_eq!(
+            report.metrics_label_index_parts_erasure_gated, 1,
+            "{report:?}"
+        );
+        assert_eq!(report.metrics_label_index_erasure_list_requests, 1);
+        assert_eq!(report.key_index_leaves_written, 0, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 0, "{report:?}");
+        assert_eq!(
+            data_object_ranged_gets(&store),
+            Vec::<(String, GetRange)>::new()
+        );
+        assert_eq!(
+            kidx_objects(store.as_ref(), Signal::Metrics).await,
+            Vec::<String>::new()
+        );
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert!(head.parts.iter().all(|p| p.key_index.is_empty()));
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Permanent("del LIST refused".into()),
+            )
+            .with_key_contains("/del/"),
+        );
+        let inner = Arc::new(MemoryStore::new());
+        publish_label_fixture(inner.as_ref()).await;
+        let store = Arc::new(FaultStore::new(Arc::clone(&inner), plan));
+        let catalog = Catalog::new(store.clone(), metrics_kidx_config()).expect("catalog");
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(store.fault_count(Op::List, FaultKind::Permanent), 1);
+        assert_eq!(
+            report.metrics_label_index_parts_erasure_gated, 1,
+            "{report:?}"
+        );
+        assert_eq!(report.metrics_label_index_erasure_list_requests, 1);
+        assert_eq!(report.key_index_leaves_written, 0, "{report:?}");
+        assert_eq!(
+            kidx_objects(inner.as_ref(), Signal::Metrics).await,
+            Vec::<String>::new()
+        );
+    }
+
+    /// A part whose leaf would pass the byte cap is uncovered for
+    /// `label_value`: no leaf is PUT, the part has no ref, the report counts
+    /// the part over the cap and every entry uncovered, and the fold
+    /// publishes. The cap is the part's data bytes times the ratio.
+    #[tokio::test]
+    async fn a_part_over_the_metrics_byte_cap_is_uncovered() {
+        assert_eq!(
+            metrics_label_index_leaf_bytes_cap(1_000_000, 10_000),
+            10_000
+        );
+        assert_eq!(metrics_label_index_leaf_bytes_cap(199, 10_000), 1);
+        assert_eq!(
+            metrics_label_index_leaf_bytes_cap(u64::MAX, 1_000_000),
+            u64::MAX
+        );
+        let store = recording_store();
+        publish_label_fixture(store.as_ref()).await;
+        let cfg = CatalogConfig {
+            metrics_label_index_max_ratio_ppm: 1,
+            ..metrics_kidx_config()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 6, "{report:?}");
+        assert_eq!(report.metrics_label_index_parts_over_cap, 1, "{report:?}");
+        assert_eq!(report.key_index_uncovered_entries, 6, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 0, "{report:?}");
+        assert_eq!(
+            kidx_objects(store.as_ref(), Signal::Metrics).await,
+            Vec::<String>::new()
+        );
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts.len(), 1);
+        assert!(head.parts[0].key_index.is_empty());
+    }
+
+    /// A reconciled fold over a tenant whose parts are mostly reused holds
+    /// LABEL_DICT pairs only for the part it builds a leaf for. One object
+    /// per hour, one part per hour; a tombstone on the fourth hour makes the
+    /// next fold reconcile, so its postings build fetches every entry whole,
+    /// yet the parts for the first, second, third and fifth hours are reused
+    /// by reference and only the new tail (ordinal 4, nine pairs) is held,
+    /// and released once its leaf is built. Holding by fetch rather than by
+    /// need held all five entries, 45 pairs.
+    #[tokio::test]
+    async fn a_reconciled_metrics_fold_holds_no_pairs_for_reused_parts() {
+        let store = recording_store();
+        let cfg = CatalogConfig {
+            snapshot_part_max_entries: 1,
+            metrics_label_index_max_ratio_ppm: 1_000_000,
+            ..metrics_kidx_config()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        for offset in 0..5u32 {
+            let region = if offset % 2 == 0 { "west" } else { "east" };
+            publish_labeled_metrics(
+                store.as_ref(),
+                u64::from(offset) + 1,
+                KIDX_HOUR + offset,
+                &region_series(region),
+                1000,
+                false,
+            )
+            .await;
+        }
+        let first = fold_through(&catalog, Signal::Metrics, KIDX_HOUR + 4).await;
+        assert_eq!(first.key_index_leaves_written, 5, "{first:?}");
+        take_held_label_dict_log_for_test();
+
+        publish_tombstone(&store.inner, 0, KIDX_HOUR + 3).await;
+        publish_labeled_metrics(
+            store.as_ref(),
+            6,
+            KIDX_HOUR + 5,
+            &region_series("east"),
+            1000,
+            false,
+        )
+        .await;
+        store.gets.lock().expect("lock").clear();
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR + 5).await;
+        assert_eq!(report.entry_count, 5, "{report:?}");
+        assert_eq!(report.parts_reused, 4, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+        assert_eq!(report.key_index_ranged_gets, 0, "{report:?}");
+        assert_eq!(
+            data_object_ranged_gets(&store),
+            Vec::<(String, GetRange)>::new()
+        );
+        let whole: usize = store
+            .gets
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(key, range, _)| key.ends_with(".rseg") && matches!(range, GetRange::Full))
+            .count();
+        assert_eq!(
+            whole, 5,
+            "the reconciled postings build fetches every entry"
+        );
+        assert_eq!(
+            take_held_label_dict_log_for_test(),
+            HeldLabelDictLog {
+                held_ordinals: vec![4],
+                peak_pairs: 9,
+                pairs_after_release: vec![0],
+            }
+        );
+
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts.len(), 5);
+        let tail = &head.parts[4];
+        let ordinal = part_ordinals(store.as_ref(), tail).await;
+        assert_eq!(
+            probe_label(&catalog, tail, "east").await,
+            matches(&[(ordinal[&6], &[0])], &[])
+        );
+    }
+
+    /// With `key_index_build_max_pairs` 20, the postings build holds the
+    /// first two objects' LABEL_DICT pairs (18) and no more, since a third
+    /// would take the held total to 27; the other four are read by range in
+    /// every pass. The held total never passes the budget, drops to zero once
+    /// the part's leaf is built, and the leaf answers exactly. Holding every
+    /// fetched object held all six, 54 pairs.
+    #[tokio::test]
+    async fn held_label_dict_pairs_stay_within_key_index_build_max_pairs() {
+        let store = recording_store();
+        let records = publish_label_fixture(store.as_ref()).await;
+        let cfg = CatalogConfig {
+            key_index_build_max_pairs: 20,
+            metrics_label_index_max_ratio_ppm: 1_000_000,
+            ..metrics_kidx_config()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        store.gets.lock().expect("lock").clear();
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 6, "{report:?}");
+        assert_eq!(report.key_index_uncovered_entries, 0, "{report:?}");
+        assert!(report.key_index_leaves_written > 1, "{report:?}");
+        assert!(report.key_index_build_passes > 1, "{report:?}");
+        assert_eq!(
+            take_held_label_dict_log_for_test(),
+            HeldLabelDictLog {
+                held_ordinals: vec![0, 1],
+                peak_pairs: 18,
+                pairs_after_release: vec![0],
+            }
+        );
+        assert_eq!(
+            report.key_index_ranged_gets,
+            2 * 4 * report.key_index_build_passes,
+            "{report:?}"
+        );
+
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts.len(), 1);
+        let part = &head.parts[0];
+        let ordinal = part_ordinals(store.as_ref(), part).await;
+        let held = [0u64, 1];
+        let ranged_keys: BTreeSet<String> = data_object_ranged_gets(&store)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let expected: BTreeSet<String> = records
+            .iter()
+            .filter(|r| !held.contains(&ordinal[&r.writer_seq]))
+            .map(|r| keys::reconstruct_data_key(r).expect("data key"))
+            .collect();
+        assert_eq!(ranged_keys, expected);
+        let east: Vec<(u64, &[u32])> = EAST_WRITERS
+            .iter()
+            .map(|seq| (ordinal[seq], &[0u32][..]))
+            .collect();
+        assert_eq!(
+            probe_label(&catalog, part, "east").await,
+            matches(&east, &[])
+        );
+        let all: Vec<(u64, &[u32])> = (1..=6u64).map(|seq| (ordinal[&seq], &[0u32][..])).collect();
+        assert_eq!(
+            probe_label(&catalog, part, "region").await,
+            matches(&all, &[])
+        );
+    }
+
+    /// The byte cap counts every slice of the field, not each on its own:
+    /// with `key_index_build_max_pairs` 20 the leaf is built in several
+    /// slices, and a cap at least the largest slice but under their sum
+    /// leaves the part uncovered. The passes before the one that crosses the
+    /// cap already PUT their slices; HEAD names none of them, so they are
+    /// unreferenced and left to the catalog sweep.
+    #[tokio::test]
+    async fn slices_each_under_the_byte_cap_but_over_it_together_are_uncovered() {
+        let cfg = CatalogConfig {
+            key_index_build_max_pairs: 20,
+            metrics_label_index_max_ratio_ppm: 1_000_000,
+            ..metrics_kidx_config()
+        };
+        let uncapped = recording_store();
+        let records = publish_label_fixture(uncapped.as_ref()).await;
+        let catalog = Catalog::new(uncapped.clone(), cfg).expect("catalog");
+        fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        let head = read_signal_head(uncapped.as_ref(), Signal::Metrics).await;
+        let sizes: Vec<u64> = head.parts[0].key_index.iter().map(|l| l.size).collect();
+        assert!(sizes.len() > 1, "{sizes:?}");
+        let largest = sizes.iter().copied().max().unwrap_or(0);
+        let total: u64 = sizes.iter().sum();
+        let data_bytes: u64 = records.iter().map(|r| r.object_size).sum();
+        let ppm = (1..=1_000_000u32)
+            .find(|&ppm| metrics_label_index_leaf_bytes_cap(data_bytes, ppm) >= largest)
+            .expect("a ratio reaches the largest slice");
+        let cap = metrics_label_index_leaf_bytes_cap(data_bytes, ppm);
+        assert!(largest <= cap && cap < total, "{sizes:?} cap {cap}");
+
+        let store = recording_store();
+        publish_label_fixture(store.as_ref()).await;
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                metrics_label_index_max_ratio_ppm: ppm,
+                ..cfg
+            },
+        )
+        .expect("catalog");
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 6, "{report:?}");
+        assert_eq!(report.metrics_label_index_parts_over_cap, 1, "{report:?}");
+        assert_eq!(report.key_index_uncovered_entries, 6, "{report:?}");
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts.len(), 1);
+        assert!(head.parts[0].key_index.is_empty());
+        let orphans = kidx_objects(store.as_ref(), Signal::Metrics).await;
+        assert!(!orphans.is_empty(), "the earlier passes PUT their slices");
+        assert!(orphans.len() < sizes.len(), "{orphans:?}");
+    }
+
+    /// An L1 compaction part fetched whole by the postings build is held
+    /// under its fold ordinal like an L0 object: the leaf build reads neither
+    /// by range, the fold issues one whole-object GET per entry and nothing
+    /// else on a data object, and the leaf names the L1 entry exactly.
+    #[tokio::test]
+    async fn an_l1_metrics_part_is_read_from_the_postings_bytes() {
+        let store = recording_store();
+        publish_real_compaction(
+            &store.inner,
+            0,
+            KIDX_HOUR,
+            i64::from(KIDX_HOUR) * NS_PER_HOUR + 60_000_000_000,
+            &[CPU_SECONDS, "mem_bytes"],
+        )
+        .await;
+        publish_labeled_metrics(
+            store.as_ref(),
+            7,
+            KIDX_HOUR,
+            &region_series("east"),
+            1000,
+            false,
+        )
+        .await;
+        let cfg = CatalogConfig {
+            metrics_label_index_max_ratio_ppm: 1_000_000,
+            ..metrics_kidx_config()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        store.gets.lock().expect("lock").clear();
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 2, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+        assert_eq!(report.key_index_uncovered_entries, 0, "{report:?}");
+        assert_eq!(report.key_index_ranged_gets, 0, "{report:?}");
+        let data_gets: Vec<(String, GetRange)> = store
+            .gets
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(key, _, _)| key.ends_with(".rseg"))
+            .map(|(key, range, _)| (key.clone(), *range))
+            .collect();
+        assert_eq!(data_gets.len(), 2, "{data_gets:?}");
+        assert!(
+            data_gets
+                .iter()
+                .all(|(_, range)| matches!(range, GetRange::Full))
+        );
+        assert_eq!(
+            take_held_label_dict_log_for_test().held_ordinals,
+            vec![0, 1]
+        );
+
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        let part = &head.parts[0];
+        // The L1 entry carries writer_seq 0, the L0 object 7.
+        let ordinal = part_ordinals(store.as_ref(), part).await;
+        assert_eq!(
+            probe_label(&catalog, part, "mem_bytes").await,
+            matches(&[(ordinal[&0], &[0])], &[])
+        );
+        assert_eq!(
+            probe_label(&catalog, part, "east").await,
+            matches(&[(ordinal[&7], &[0])], &[])
+        );
+        assert_eq!(
+            probe_label(&catalog, part, CPU_SECONDS).await,
+            matches(&[(ordinal[&0], &[0]), (ordinal[&7], &[0])], &[])
+        );
+    }
+
+    /// The ranged read of one metrics object: exactly a suffix GET for the
+    /// footer and one range GET of LABEL_DICT, the range the footer names.
+    #[tokio::test]
+    async fn a_metrics_label_value_read_is_one_suffix_and_one_range_get() {
+        let store = recording_store();
+        let record = publish_labeled_metrics(
+            store.as_ref(),
+            1,
+            KIDX_HOUR,
+            &region_series("east"),
+            1000,
+            false,
+        )
+        .await;
+        let key = keys::reconstruct_data_key(&record).expect("data key");
+        let object = store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("object")
+            .data
+            .to_vec();
+        let (offset, len) = label_dict_range(&object);
+        assert!(record.object_size > KEY_INDEX_FOOTER_SUFFIX_LEN);
+        store.gets.lock().expect("lock").clear();
+        let (mut gets, mut bytes) = (0u64, 0u64);
+        let Ok(fields) = read_metrics_label_value_counted(
+            store.as_ref(),
+            &tenant(),
+            &key,
+            record.object_size,
+            &mut gets,
+            &mut bytes,
+        )
+        .await
+        else {
+            panic!("the ranged read fails");
+        };
+        assert_eq!(
+            data_object_ranged_gets(&store),
+            vec![
+                (key.clone(), GetRange::Suffix(KEY_INDEX_FOOTER_SUFFIX_LEN)),
+                (key.clone(), GetRange::Range(offset, offset + len)),
+            ]
+        );
+        assert_eq!(gets, 2);
+        assert_eq!(bytes, KEY_INDEX_FOOTER_SUFFIX_LEN + len);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, METRICS_LABEL_VALUE_FIELD);
+        assert!(fields[0].entries.contains(&(key8_str("east"), 0)));
+        assert!(fields[0].entries.iter().all(|&(_, block)| block == 0));
+        assert_eq!(
+            Ok(fields.clone()),
+            metrics_label_value_from_object(
+                &tenant(),
+                &object,
+                &match ravel_segment::open_from_suffix(
+                    &object,
+                    object.len() as u64,
+                    ReaderLimits::default()
+                )
+                .expect("footer")
+                {
+                    ravel_segment::FooterOutcome::Ready(location) => location,
+                    ravel_segment::FooterOutcome::NeedRange { .. } => panic!("whole object"),
+                }
+            ),
+            "the held read and the ranged read agree"
+        );
+    }
+
+    /// A fold into the next hour with the metrics leaf newly on: the three
+    /// entries the earlier fold already decoded for postings are merged
+    /// forward, not fetched, so the re-encoded tail reads them by range, a
+    /// suffix GET and one LABEL_DICT range GET each; the new hour's object,
+    /// fetched whole for postings, costs no GET.
+    #[tokio::test]
+    async fn entries_not_held_are_read_by_range_and_held_ones_cost_no_get() {
+        let store = recording_store();
+        let mut records = Vec::new();
+        for seq in [10u64, 20, 30] {
+            records.push(
+                publish_labeled_metrics(
+                    store.as_ref(),
+                    seq,
+                    KIDX_HOUR,
+                    &region_series("west"),
+                    1000,
+                    false,
+                )
+                .await,
+            );
+        }
+        let off = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                metrics_label_index: false,
+                ..metrics_kidx_config()
+            },
+        )
+        .expect("catalog");
+        fold_through(&off, Signal::Metrics, KIDX_HOUR).await;
+        let late = publish_labeled_metrics(
+            store.as_ref(),
+            15,
+            KIDX_HOUR + 1,
+            &region_series("east"),
+            1000,
+            false,
+        )
+        .await;
+        store.gets.lock().expect("lock").clear();
+        let on = Catalog::new(store.clone(), metrics_kidx_config()).expect("catalog");
+        let report = fold_through(&on, Signal::Metrics, KIDX_HOUR + 1).await;
+        assert_eq!(report.entry_count, 4, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+        assert_eq!(report.key_index_ranged_gets, 2 * 3, "{report:?}");
+
+        let gets = data_object_ranged_gets(&store);
+        let late_key = keys::reconstruct_data_key(&late).expect("data key");
+        assert!(gets.iter().all(|(key, _)| *key != late_key), "{gets:?}");
+        for record in &records {
+            let key = keys::reconstruct_data_key(record).expect("data key");
+            let object = store
+                .inner
+                .get(&key, GetRange::Full)
+                .await
+                .expect("object")
+                .data
+                .to_vec();
+            let (offset, len) = label_dict_range(&object);
+            let mine: Vec<GetRange> = gets
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, range)| *range)
+                .collect();
+            assert_eq!(
+                mine,
+                vec![
+                    GetRange::Suffix(KEY_INDEX_FOOTER_SUFFIX_LEN),
+                    GetRange::Range(offset, offset + len)
+                ],
+                "{key}"
+            );
+        }
+
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts.len(), 1);
+        let ordinal = part_ordinals(store.as_ref(), &head.parts[0]).await;
+        assert_eq!(
+            probe_label(&on, &head.parts[0], "east").await,
+            matches(&[(ordinal[&15], &[0])], &[])
+        );
+    }
+
+    /// An advancing fold with the metrics leaf on carries the previous tail's
+    /// `label_value` pairs through its leaf, with no LABEL_DICT read for the
+    /// carried entries, and writes the leaf a single fold over the same
+    /// objects writes, byte for byte.
+    #[tokio::test]
+    async fn an_advancing_metrics_fold_carries_the_previous_leaf() {
+        async fn publish_early(store: &dyn ObjectStoreBackend) {
+            for seq in [10u64, 20, 30] {
+                publish_labeled_metrics(store, seq, KIDX_HOUR, &region_series("west"), 1000, false)
+                    .await;
+            }
+        }
+        async fn publish_late(store: &dyn ObjectStoreBackend) {
+            publish_labeled_metrics(
+                store,
+                15,
+                KIDX_HOUR + 1,
+                &region_series("east"),
+                1000,
+                false,
+            )
+            .await;
+        }
+
+        let advancing = recording_store();
+        let catalog = Catalog::new(advancing.clone(), metrics_kidx_config()).expect("catalog");
+        publish_early(advancing.as_ref()).await;
+        fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        publish_late(advancing.as_ref()).await;
+        advancing.gets.lock().expect("lock").clear();
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR + 1).await;
+        assert_eq!(report.entry_count, 4, "{report:?}");
+        assert_eq!(report.key_index_entries_carried, 3, "{report:?}");
+        assert_eq!(report.key_index_ranged_gets, 0, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+        assert_eq!(data_object_ranged_gets(&advancing), Vec::new());
+
+        let single = recording_store();
+        publish_early(single.as_ref()).await;
+        publish_late(single.as_ref()).await;
+        let once = Catalog::new(single.clone(), metrics_kidx_config()).expect("catalog");
+        fold_through(&once, Signal::Metrics, KIDX_HOUR + 1).await;
+
+        let a = read_signal_head(advancing.as_ref(), Signal::Metrics).await;
+        let b = read_signal_head(single.as_ref(), Signal::Metrics).await;
+        assert_eq!(a.parts.len(), 1);
+        assert_eq!(a.parts[0].blake3, b.parts[0].blake3);
+        assert_eq!(a.parts[0].key_index, b.parts[0].key_index);
+        let ordinal = part_ordinals(advancing.as_ref(), &a.parts[0]).await;
+        assert_eq!(
+            probe_label(&catalog, &a.parts[0], "west").await,
+            matches(
+                &[
+                    (ordinal[&10], &[0]),
+                    (ordinal[&20], &[0]),
+                    (ordinal[&30], &[0])
+                ],
+                &[]
+            )
+        );
+    }
+
+    /// An object whose stored LABEL_DICT fails its checksum is uncovered by
+    /// the part's `label_value` leaf, which is still written for the other
+    /// objects, and the fold succeeds.
+    #[tokio::test]
+    async fn a_corrupt_label_dict_leaves_the_entry_uncovered_and_the_fold_succeeds() {
+        let store = recording_store();
+        for (seq, corrupt) in [(1u64, false), (2, true), (3, false)] {
+            publish_labeled_metrics(
+                store.as_ref(),
+                seq,
+                KIDX_HOUR,
+                &region_series("west"),
+                1000,
+                corrupt,
+            )
+            .await;
+        }
+        let catalog = Catalog::new(store.clone(), metrics_kidx_config()).expect("catalog");
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 3, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+        assert_eq!(report.key_index_uncovered_entries, 1, "{report:?}");
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        let part = &head.parts[0];
+        let ordinal = part_ordinals(store.as_ref(), part).await;
+        assert_eq!(
+            probe_label(&catalog, part, "west").await,
+            matches(&[(ordinal[&1], &[0]), (ordinal[&3], &[0])], &[ordinal[&2]])
         );
     }
 }

@@ -204,6 +204,51 @@ pub async fn fold_with_key_index_budget(
     now_ns: i64,
     json: bool,
 ) -> anyhow::Result<(FoldReport, String)> {
+    fold_with_metrics_label_index(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        max_flush_lifetime_ns,
+        writers_stopped,
+        build_key_index_leaves,
+        key_index_build_max_pairs,
+        false,
+        snapshot_part_max_entries,
+        now_ns,
+        json,
+    )
+    .await
+}
+
+/// [`fold_with_key_index_budget`], plus `--metrics-label-index`: sets
+/// [`CatalogConfig::metrics_label_index`] for this fold, so with
+/// `build_key_index_leaves` a metrics fold builds the `label_value` leaf
+/// from each object's LABEL_DICT (ADR-3694 decision 2). Refused without
+/// `build_key_index_leaves`, which it would otherwise silently not apply.
+#[allow(clippy::too_many_arguments)]
+pub async fn fold_with_metrics_label_index(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    max_flush_lifetime_ns: Option<i64>,
+    writers_stopped: bool,
+    build_key_index_leaves: bool,
+    key_index_build_max_pairs: u64,
+    metrics_label_index: bool,
+    snapshot_part_max_entries: Option<usize>,
+    now_ns: i64,
+    json: bool,
+) -> anyhow::Result<(FoldReport, String)> {
+    if metrics_label_index && !build_key_index_leaves {
+        anyhow::bail!(
+            "--metrics-label-index needs --key-index-leaves (or --rebuild-key-index); \
+             without it the fold builds no leaf"
+        );
+    }
     if snapshot_part_max_entries == Some(0) {
         anyhow::bail!(
             "--snapshot-part-max-entries must be at least 1 (the most entries one snapshot part \
@@ -225,6 +270,7 @@ pub async fn fold_with_key_index_budget(
         seal_through_hour,
         build_key_index_leaves,
         key_index_build_max_pairs,
+        metrics_label_index,
         snapshot_part_max_entries,
         now_ns,
         json,
@@ -284,6 +330,7 @@ pub async fn fold_inner(
         None,
         false,
         ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+        false,
         None,
         now_ns,
         json,
@@ -303,6 +350,7 @@ async fn fold_core(
     seal_through_hour: Option<u32>,
     build_key_index_leaves: bool,
     key_index_build_max_pairs: u64,
+    metrics_label_index: bool,
     snapshot_part_max_entries: Option<usize>,
     now_ns: i64,
     json: bool,
@@ -312,6 +360,7 @@ async fn fold_core(
         shard_count,
         build_key_index_leaves,
         key_index_build_max_pairs,
+        metrics_label_index,
         ..CatalogConfig::default()
     };
     if let Some(ns) = max_flush_lifetime_ns {
@@ -537,6 +586,18 @@ fn render_fold_report(
         "key_index_leaf_gets: {}\n",
         report.key_index_leaf_gets
     ));
+    out.push_str(&format!(
+        "metrics_label_index_parts_over_cap: {}\n",
+        report.metrics_label_index_parts_over_cap
+    ));
+    out.push_str(&format!(
+        "metrics_label_index_parts_erasure_gated: {}\n",
+        report.metrics_label_index_parts_erasure_gated
+    ));
+    out.push_str(&format!(
+        "metrics_label_index_erasure_list_requests: {}\n",
+        report.metrics_label_index_erasure_list_requests
+    ));
     Ok(out)
 }
 
@@ -559,6 +620,7 @@ pub async fn rebuild_key_index(
     signal: SignalArg,
     field: Option<String>,
     batch_entries: u64,
+    metrics_label_index: bool,
     json: bool,
 ) -> anyhow::Result<(KeyIndexRebuildReport, String)> {
     let (result, out) = rebuild_key_index_outcome(
@@ -569,6 +631,7 @@ pub async fn rebuild_key_index(
         signal,
         field,
         batch_entries,
+        metrics_label_index,
         json,
     )
     .await?;
@@ -581,6 +644,8 @@ pub async fn rebuild_key_index(
 /// The testable core of [`rebuild_key_index`]: the rebuild's own result and
 /// the text the command prints for it, which is empty for an error that
 /// carries no report (one raised before any batch ran).
+/// `metrics_label_index` sets [`CatalogConfig::metrics_label_index`], without
+/// which a metrics rebuild is refused.
 #[allow(clippy::too_many_arguments)]
 pub async fn rebuild_key_index_outcome(
     store: Arc<dyn ObjectStoreBackend>,
@@ -590,6 +655,7 @@ pub async fn rebuild_key_index_outcome(
     signal: SignalArg,
     field: Option<String>,
     batch_entries: u64,
+    metrics_label_index: bool,
     json: bool,
 ) -> anyhow::Result<(Result<KeyIndexRebuildReport, KeyIndexRebuildError>, String)> {
     let tenant_hash = TenantId::new(tenant).hash();
@@ -605,6 +671,7 @@ pub async fn rebuild_key_index_outcome(
         store,
         CatalogConfig {
             shard_count,
+            metrics_label_index,
             ..CatalogConfig::default()
         },
     )
@@ -695,6 +762,19 @@ pub fn render_rebuild_report(
     out.push_str(&format!(
         "uncovered_entries: {}\n",
         report.uncovered_entries
+    ));
+    out.push_str(&format!("parts_over_cap: {}\n", report.parts_over_cap));
+    out.push_str(&format!(
+        "parts_erasure_gated: {}\n",
+        report.parts_erasure_gated
+    ));
+    out.push_str(&format!(
+        "erasure_list_requests: {}\n",
+        report.erasure_list_requests
+    ));
+    out.push_str(&format!(
+        "erasure_get_requests: {}\n",
+        report.erasure_get_requests
     ));
     out.push_str(&format!("attempt_count: {}\n", report.attempt_count));
     for (i, attempt) in report.attempts.iter().enumerate() {

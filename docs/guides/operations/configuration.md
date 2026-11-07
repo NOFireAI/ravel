@@ -2102,7 +2102,10 @@ uncovered.
 `--fold-key-index-build-max-pairs N` (ravel-server) and
 `--key-index-build-max-pairs N` (`ravel-cli catalog fold`) bound the
 (entry, key8) pairs the build holds for one part at once, the pairs read
-and the pairs carried from the previous tail together. Every field the
+and the pairs carried from the previous tail together. A metrics fold with
+`--metrics-label-index` on also holds up to N more: the LABEL_DICT pairs
+of objects its postings build fetched whole, only for the parts it builds a
+leaf for, each part's pairs released once its leaf is built. Every field the
 build indexes gets a fixed share, `max(1, N / fields)`. Each flag is
 refused without its leaf build flag (`--fold-key-index-leaves`,
 `--key-index-leaves`) and at 0; the default is 8,000,000. A part over the
