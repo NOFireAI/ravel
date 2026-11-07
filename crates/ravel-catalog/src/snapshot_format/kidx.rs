@@ -1032,6 +1032,8 @@ impl KeyIndexLeafPrefix {
                  more than one per {MIN_FRAME_ENTRY_WIRE_BYTES} bytes"
             )));
         }
+        #[cfg(test)]
+        tests::FRAME_CRC_CHECKS.with(|n| n.set(n.get() + 1));
         if crc32c::crc32c(&frame[FRAME_HEADER_LEN..]) != stored_crc {
             return Err(corrupted(format_args!(
                 "bucket {bucket} frame crc32c mismatch"
@@ -1047,6 +1049,19 @@ impl KeyIndexLeafPrefix {
         limits: &KeyIndexLeafLimits,
     ) -> Result<DecodedFrame, KeyIndexLeafRejection> {
         let (entry_count, uncompressed_len) = Self::check_frame_header(bucket, frame, limits)?;
+        self.decode_checked_frame(bucket, frame, entry_count, uncompressed_len)
+    }
+
+    /// Decodes a frame [`check_frame_header`](Self::check_frame_header)
+    /// already passed, with the `(entry_count, uncompressed_len)` it
+    /// returned; the crc is not computed again.
+    fn decode_checked_frame(
+        &self,
+        bucket: u32,
+        frame: &[u8],
+        entry_count: u32,
+        uncompressed_len: u32,
+    ) -> Result<DecodedFrame, KeyIndexLeafRejection> {
         let compressed = &frame[FRAME_HEADER_LEN..];
         #[cfg(test)]
         tests::FRAME_DECOMPRESSIONS.with(|n| n.set(n.get() + 1));
@@ -1359,6 +1374,17 @@ fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u64)> {
 /// frame is decoded, `reserve` is asked for its [`decoded_bound`]; the guard
 /// it returns is held until the probe returns, and `None` declines the leaf.
 /// A tenant or signal mismatch is the only `Err`.
+///
+/// Each selected frame passes the whole frame header check, crc included,
+/// before its reservation is asked for, and is then decoded without a second
+/// crc pass: one crc per selected frame
+/// (`the_set_probe_checks_each_frames_crc_once`), a frame that fails its
+/// header or crc check is rejected before its own reservation is asked for or
+/// any of its bytes are decompressed
+/// (`a_corrupt_frame_body_is_rejected_by_the_set_probe`), and each
+/// reservation precedes its frame's decompression
+/// (`the_set_probe_reserves_each_frame_before_decoding_it`). The gap bytes
+/// between bridged buckets are read and discarded unchecked.
 pub async fn probe_key_index_leaf_set_ranged<F, Fut, R, G>(
     leaf_ref: &SnapshotKeyIndexLeafRef,
     request: &KeyIndexLeafRequest<'_>,
@@ -1471,10 +1497,12 @@ where
             let start = (range.start - run_start) as usize;
             let end = (range.end - run_start) as usize;
             let frame = &bytes[start..end];
-            let declared = match KeyIndexLeafPrefix::check_frame_header(bucket, frame, limits) {
-                Ok((_, uncompressed_len)) => decoded_bound(uncompressed_len),
-                Err(rejection) => return reject(probe, rejection),
-            };
+            let (entry_count, uncompressed_len) =
+                match KeyIndexLeafPrefix::check_frame_header(bucket, frame, limits) {
+                    Ok(checked) => checked,
+                    Err(rejection) => return reject(probe, rejection),
+                };
+            let declared = decoded_bound(uncompressed_len);
             let Some(guard) = reserve(declared) else {
                 probe.answer =
                     KeyIndexSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused {
@@ -1483,10 +1511,11 @@ where
                 return Ok(probe);
             };
             guards.push(guard);
-            let decoded = match prefix.decode_frame(bucket, frame, limits) {
-                Ok(decoded) => decoded,
-                Err(rejection) => return reject(probe, rejection),
-            };
+            let decoded =
+                match prefix.decode_checked_frame(bucket, frame, entry_count, uncompressed_len) {
+                    Ok(decoded) => decoded,
+                    Err(rejection) => return reject(probe, rejection),
+                };
             probe.decompressed_bytes += u64::from(decoded.uncompressed_len);
             for i in key_indexes {
                 let key8 = keys[i];
