@@ -938,7 +938,7 @@ names the source, in these cases:
 
 | Case | `source` |
 |---|---|
-| The working directory is on tmpfs or ramfs, so spill would write to memory | `cwd-tmpfs` |
+| `<working-dir>/sql-spill` when it exists, or else the working directory, is on tmpfs or ramfs, so spill would write to memory | `cwd-tmpfs` |
 | The working directory cannot be read, `<working-dir>/sql-spill` cannot be created, its free space cannot be measured, or the lock of the process's own directory cannot be taken | `cwd-unavailable` |
 | Half of the free space on the volume is below 1 GiB | `cwd-insufficient-space` |
 
@@ -990,9 +990,12 @@ min((free_bytes - read_cache_bytes) / 2, 4 * memory_budget_bytes), at least 1 Gi
 When `(free_bytes - read_cache_bytes) / 2` is below 1 GiB, spill is off. Both
 startup lines then read `value=none source=cache-dir-insufficient-space`, and
 a WARN line says why. So a derived ceiling is never below 1 GiB and never
-more than half of what the read cache leaves free. The `sql_spill_max_bytes`
-line carries the two figures that it was derived from, as `free_bytes` and
-`read_cache_bytes`.
+more than half of what the read cache leaves free. Under the
+[working-directory default](#working-directory-default) the same outcome reads
+`source=cwd-insufficient-space`, the free bytes come from
+`<working-dir>/sql-spill` when it exists or else the working directory, and
+`read_cache_bytes` is 0. The `sql_spill_max_bytes` line carries the two
+figures that it was derived from, as `free_bytes` and `read_cache_bytes`.
 
 For example, take a volume with 200 GiB free and the defaults of a 30 GiB
 host (a 30,064,771,072-byte budget, a 9,019,431,321-byte read cache). The
@@ -1067,8 +1070,8 @@ A `maintain` or `gateway` process does not sweep. A process under
 `--sql-spill off` does not sweep.
 
 Under the working-directory default, the process sweeps
-`<working-dir>/sql-spill` the same way, when that directory exists and the
-working directory is not on tmpfs or ramfs. It does not sweep the working
+`<working-dir>/sql-spill` the same way, when that directory exists and is not
+on tmpfs or ramfs. It does not sweep the working
 directory when `--sql-spill off`, a spill variable or `--cache-dir` is set.
 
 When the sweep runs:

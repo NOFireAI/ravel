@@ -791,8 +791,8 @@ pub const SQL_SPILL_SOURCE_UNSET: &str = "unset";
 /// configures it (issue #3899).
 pub const SQL_SPILL_SOURCE_CWD_DEFAULT: &str = "cwd-default";
 /// `source` of both spill lines when the working-directory default is off
-/// because the working directory is on tmpfs or ramfs, where spill would
-/// write to memory.
+/// because `<cwd>/sql-spill` when it exists, or else the working directory,
+/// is on tmpfs or ramfs, where spill would write to memory.
 pub const SQL_SPILL_SOURCE_CWD_TMPFS: &str = "cwd-tmpfs";
 /// `source` of both spill lines when the working-directory default is off
 /// because the working directory, `<cwd>/sql-spill`, its free space or its
@@ -1247,7 +1247,8 @@ fn prepare_sql_spill_with(
 /// 0 because without `--cache-dir` no disk cache tier shares the volume.
 ///
 /// Never refuses startup. Spill is off, with a WARN naming the source, when
-/// the working directory is on tmpfs or ramfs (`cwd-tmpfs`), when it cannot
+/// `<cwd>/sql-spill` when it exists, or else the working directory, is on
+/// tmpfs or ramfs (`cwd-tmpfs`), when the working directory cannot
 /// be read, `<cwd>/sql-spill` cannot be created, its free space cannot be
 /// measured or this process's root cannot be locked (`cwd-unavailable`), and
 /// when half the free space is below the derived ceiling's 1 GiB floor
@@ -1305,20 +1306,21 @@ fn prepare_cwd_spill(
             );
         }
     };
-    if fs_kind(&cwd) == SpillFsKind::Memory {
+    let spill_root = cwd.join(ravel_sql::SQL_SPILL_SUBDIR);
+    let root_existed = spill_root.is_dir();
+    // An existing `<cwd>/sql-spill` may be a mount of its own, so probe and
+    // measure it; otherwise the root would be created on the working
+    // directory's volume.
+    let measured = if root_existed { &spill_root } else { &cwd };
+    if fs_kind(measured) == SpillFsKind::Memory {
         return off(
             SQL_SPILL_SOURCE_CWD_TMPFS,
-            &cwd,
-            "the working directory is on tmpfs or ramfs, so spill would write to memory",
+            measured,
+            "the SQL spill root's volume is tmpfs or ramfs, so spill would write to memory",
             Vec::new(),
         );
     }
     let left_in_place = sweep_spill_roots(&cwd);
-    let spill_root = cwd.join(ravel_sql::SQL_SPILL_SUBDIR);
-    let root_existed = spill_root.is_dir();
-    // An existing `<cwd>/sql-spill` may be a mount of its own, so measure it;
-    // otherwise the root would be created on the working directory's volume.
-    let measured = if root_existed { &spill_root } else { &cwd };
     let free_bytes = match measure_free_bytes(measured) {
         Ok(free_bytes) => free_bytes,
         Err(err) => {
@@ -4815,6 +4817,58 @@ mod tests {
         assert!(
             resolved_line(&lines, "sql_spill_dir").contains(" value=\"none\" source=\"cwd-tmpfs\"")
         );
+        let warns = capture.1.lock().clone();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains(" source=\"cwd-tmpfs\"") && warns[0].contains("tmpfs or ramfs"),
+            "{warns:?}"
+        );
+    }
+
+    /// An existing `<cwd>/sql-spill` that is a tmpfs or ramfs mount of its
+    /// own, under a disk-backed working directory, resolves spill off with
+    /// `source="cwd-tmpfs"` and a WARN, and creates and locks nothing.
+    #[test]
+    fn a_tmpfs_sql_spill_mount_under_the_working_directory_resolves_spill_off() {
+        assert_spill_env_unset();
+        let cwd = tempfile::tempdir().expect("working dir");
+        let spill_root = cwd.path().join("sql-spill");
+        std::fs::create_dir(&spill_root).expect("sql-spill");
+        let (capture, guard) = capture_info();
+        let startup = prepare_sql_spill_with(
+            None,
+            settings(false, 2 * GIB),
+            INSTANCE,
+            None,
+            None,
+            || Ok(cwd.path().to_path_buf()),
+            |path| {
+                if path == spill_root {
+                    SpillFsKind::Memory
+                } else {
+                    SpillFsKind::Other
+                }
+            },
+            |_| Ok(100 * GIB),
+        )
+        .expect("a tmpfs sql-spill mount does not refuse startup");
+        drop(guard);
+        assert_eq!(
+            startup.resolved,
+            ResolvedSqlSpill {
+                config: None,
+                dir_source: SQL_SPILL_SOURCE_CWD_TMPFS,
+                max_bytes_source: SQL_SPILL_SOURCE_CWD_TMPFS,
+                space: None,
+            }
+        );
+        assert!(startup.owner.is_none());
+        assert_eq!(startup.inputs, SqlSpillInputs::default());
+        assert_eq!(executor_spill(&startup.inputs), None);
+        let entries: Vec<_> = std::fs::read_dir(&spill_root)
+            .expect("list sql-spill")
+            .collect();
+        assert!(entries.is_empty(), "{entries:?}");
         let warns = capture.1.lock().clone();
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
