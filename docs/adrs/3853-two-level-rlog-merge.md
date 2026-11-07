@@ -723,7 +723,12 @@ level 1 with the largest block of the runs it wrote: `resident` is the
 larger of `R x 2 x price(one run block)` and the largest level-2 stream
 estimate, a cursor-mode level-2 plan is still refused, and the refusal
 `LevelTwoFit` names the runs and the two blocks per run. `E`'s `resident`
-is that same term. The parts level 1 wrote stay on the
+is that same term. The prediction is one-sided by construction: before
+level 1 no per-stream size is known (a stream's catalog entry carries its
+first and last block only), so it has no stream-estimate side, and a bucket
+with one stream larger than its runs' blocks can pass it, pay for level 1,
+and then be refused by `LevelTwoFit`. That costs one level-1 pass of reads
+and scratch writes, never an overcommitted level 2. The parts level 1 wrote stay on the
 `rlog two-level merge` log line as `run_parts`, beside `runs`.
 
 D4's table, recomputed with `R` in runs and the bound as (b) solved for `R`,

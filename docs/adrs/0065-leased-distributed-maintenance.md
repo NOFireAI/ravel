@@ -529,15 +529,18 @@ into contiguous groups of `G`, the largest size with
 `G x (raw per input + price of its blocks) + run target <= C`, and merges
 each group with the same planner and passes into a run: an RLOG in a local
 scratch directory, cut into parts at the run memory target. Level 2 merges
-the runs' `R` parts into the published parts with the same planner and
-passes, once `max(R x price(one run block), largest stream estimate) +
-reads in flight + final part target <= U` holds and the plan over the runs
-is not cursor. `R` counts run parts, not groups (ADR-3853's #3943 correction
-counts runs instead, one per group, and prices each at two blocks,
-`R x 2 x price(one run block)`): every part of every run is
-a level-2 input, so a run target that cuts each group into several parts
-multiplies the term. The stream estimate term is there because a run's part
-cut can split one stream across two of that run's blocks. Group size under
+the `R` runs into the published parts with the same planner and passes,
+once `max(R x 2 x price(one run block), largest stream estimate) + reads in
+flight + final part target <= U` holds and the plan over the runs is not
+cursor. `R` counts runs, one per group, `R = ceil(N / G)`, whatever number
+of parts the run memory target cuts each into, and each run is priced at two
+blocks: level 1 writes a run stream by stream, so a stream smaller than a
+part sits in one of the run's parts, or in two when a cut falls inside it,
+and a larger stream is priced by its stream estimate, the other side of the
+maximum. As first written, this amendment counted `R` in run parts and
+priced one block for every part of every run; ADR-3853's #3943 correction
+superseded that count, since level 2 never needs a block from every part of
+a run for one stream. Group size under
 2, short scratch headroom, a scratch directory another process holds and a
 level 2 that does not fit are each refused by name, as a terminal outcome
 the scan memo does not retry in this process (see the per-worker budget amendment
@@ -554,8 +557,8 @@ The peak this decision states then holds per level. Every input's catalog
 stays loaded across both levels. Level 1 holds one group's resident row
 groups, one pass over them and an in-progress run part bounded by the run
 memory target; level 2 holds the run parts' row groups, one pass over at
-most `R` run blocks per stream (two per run with `R` in runs, ADR-3853's
-#3943 correction), and the in-progress part. Level 1 runs one group
+most `2 x R` run blocks per stream (two per run, ADR-3853's #3943
+correction), and the in-progress part. Level 1 runs one group
 at a time (`W1 = 1`; see the per-worker budget amendment below for `W1`
 parallel workers), so the per-worker ceiling `C` is the unit ceiling `U`;
 dividing the budgets across parallel workers is ADR-3853 D4's. The runs are
