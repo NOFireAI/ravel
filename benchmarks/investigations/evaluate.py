@@ -1543,7 +1543,8 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     its row or figure lacking a state, tenant, scale or baseline the run
     never asked for (a gated figure is either not_requested or listed
     here), a figure not-measured (a row 18 cell whose covering part went
-    Uncovered), or a needle band a partial inspection could not judge."""
+    Uncovered), a row 18 figure with no value to judge (unsupported, refused
+    or missing), or a needle band a partial inspection could not judge."""
     out = []
     for s in cfg["states"]:
         if live.get(s) is not None:
@@ -1560,6 +1561,8 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
             out.append(f"figure {f['id']} not run: {f['reason']}")
         elif f["status"] == NOT_MEASURED:
             out.append(f"figure {f['id']} not measured: {f['reason']}")
+        elif f["row"] == 18 and f.get("verdict") in (UNSUPPORTED, GUARD, "refused", "missing"):
+            out.append(f"figure {f['id']} {f['verdict']}: {f['reason']}")
     out.extend((needles or {}).get("incomplete", []))
     return out
 

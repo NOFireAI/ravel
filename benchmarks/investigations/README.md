@@ -508,7 +508,9 @@ proved less than it was asked: a state `run.toml` lists that did not run, a
 planned call that was not sent in a state that did (the run deadline, an
 in-flight window too short), a figure `not-run` for a reason other than
 its row or figure needing a tenant, state, scale or baseline the run never
-asked for, or a row 18 cell `not-measured` (below). Each reason is listed under `incomplete` in the results and the
+asked for, a row 18 cell `not-measured` (below), or a row 18 figure that
+reads `unsupported-on-this-build`, `refused-by-guard`, refused or missing
+(missing also fails the run). Each reason is listed under `incomplete` in the results and the
 summary. The rows left out that way are not silent either: each is listed
 with the setting that leaves it out (`hits = false`, `baseline = false`, a
 state or scale `run.toml` does not list) under `not_requested` in the results and on the
@@ -659,7 +661,12 @@ Some bands, as transcribed:
   `skippedByBudget`, `partsBeyondCeiling`, `leavesRejected` or
   `reservationsRefused` above 0) reads `not-measured` whatever its time:
   its time is the tier-1 probe's, so it is neither a hold nor a miss, and
-  it makes the verdict at best `incomplete`. With either state absent the
+  it makes the verdict at best `incomplete`. `partsCovered` 0 with every
+  outcome counter 0 counts too: the leaves answered no part
+  (`check_row_18_covered_nothing`). A cell whose build reports no
+  keyIndex outcome counters reads `unsupported-on-this-build`, which also
+  makes the verdict `incomplete` and the exit 1, not a pass
+  (`check_row_18_unsupported_is_incomplete`). With either state absent the
   row reads `not-run` with the reason, as the committed fixture's does. The
   row also reports the slices per (part, field) the lookups touched
   (`stamp.slices`), and the logs `request_id` count after the leaf rebuild

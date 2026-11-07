@@ -2387,6 +2387,59 @@ class Evaluate(Workdir):
     def test_row_18_uncovered(self):
         self.assertEqual(self.check_row_18_uncovered(), [])
 
+    def check_row_18_covered_nothing(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A cold call whose keyIndex reports partsCovered 0 and every outcome counter 0 answered no part
+        through the leaves: its cell is not measured, even at 1.0 s under its 3.15 s bound, and the run is
+        incomplete."""
+        nothing = dict(self.COVERED, partsCovered=0, leafGetRequests=0)
+        self.set_advanced_leaves({"logs_request_in_10": ((2.8, 3.2), (1.0, 1.0), nothing)})
+        _, res, _ = self.go(bands, evaluate_py)
+        f = self.row_18(res)["logs_request_id_10_p50_s"]
+        out = []
+        if (f["status"], f["value"], f["verdict"]) != ("not-measured", None, "not-measured"):
+            out.append(f"{f['status']} {f['value']} {f['verdict']}")
+        if "a covering part went Uncovered (partsCovered 0)" not in (f["reason"] or ""):
+            out.append(f"reason {f['reason']}")
+        if not any(r.startswith("figure row_18.logs_request_id_10_p50_s not measured: ") for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_row_18_covered_nothing(self):
+        self.assertEqual(self.check_row_18_covered_nothing(), [])
+
+    def check_row_18_unsupported_is_incomplete(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A row 18 cell whose build reports no keyIndex outcome counters reads unsupported-on-this-build;
+        that proves less than the row asks, so the run is incomplete, exit 1, not a pass. A missing cell is
+        listed the same way."""
+        self.set_advanced_leaves({"spans_in_100": ((2.8, 3.2), (3.1, 3.1), {"keysProbed": 100})})
+        # Row 18 alone, so no other row's miss on this fixture decides the verdict.
+        with open(bands) as f:
+            text = f.read()
+        start = text.index('[[row]]\nkey = "row_18"')
+        if "[[row]]\n" in text[start + 1:]:
+            return ["row_18 is no longer the last row of the bands; slice it to its end"]
+        code, res, _ = self.go(self.pass_bands(text[start:]), evaluate_py)
+        f = self.row_18(res)["spans_trace_id_100_p50_s"]
+        out = []
+        if (f["status"], f["verdict"]) != (UNSUPPORTED, UNSUPPORTED):
+            out.append(f"{f['status']} {f['verdict']}")
+        want = f"figure row_18.spans_trace_id_100_p50_s {UNSUPPORTED}: "
+        if not any(r.startswith(want) for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        if (code, res["verdict"]) != (1, "incomplete"):
+            out.append(f"exit {code} verdict {res['verdict']} problems {res['problems']}")
+        mod = load_module(evaluate_py, "evaluate_row18_incomplete")
+        cfg = {"states": []}
+        missing = {"id": "row_18.logs_trace_id_10_p50_s", "row": 18, "status": "missing", "verdict": "missing",
+                   "reason": "no ok call in advanced_leaves"}
+        got = mod.incomplete_reasons(cfg, {}, mod.Calls([], mod.Problems(), {}), [missing])
+        if got != ["figure row_18.logs_trace_id_10_p50_s missing: no ok call in advanced_leaves"]:
+            out.append(f"missing cell {got}")
+        return out
+
+    def test_row_18_unsupported_is_incomplete(self):
+        self.assertEqual(self.check_row_18_unsupported_is_incomplete(), [])
+
     def test_row_18_not_run_without_its_state(self):
         # The committed fixture does not list advanced_leaves: the row is
         # not-run and listed as not requested.
@@ -3232,6 +3285,16 @@ FLIPS = {
         "        return \"value\", rnd(percentile(walls, 0.75) - percentile(walls, 0.25)), \"\"\n",
         "        return \"value\", rnd(percentile(walls, 0.75)), \"\"\n",
         "check_row_18_noise_edges",
+    ),
+    "row 18's partsCovered 0 with no outcome read as covered": (
+        '    if went or not ki["partsCovered"]:\n',
+        '    if went:\n',
+        "check_row_18_covered_nothing",
+    ),
+    "row 18's unsupported or missing cell left off the incomplete list": (
+        '        elif f["row"] == 18 and f.get("verdict") in (UNSUPPORTED, GUARD, "refused", "missing"):\n',
+        '        elif False:\n',
+        "check_row_18_unsupported_is_incomplete",
     ),
     "row 18's p50 taken without the Uncovered check": (
         "    if rest == \"leaf_wall_p50_s\":\n        for c in lines:\n",
