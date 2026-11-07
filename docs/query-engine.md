@@ -3512,7 +3512,10 @@ distributed slice that answered after a retry or a reroute: the slice's
 response carries the spend the attempts abandoned before it reported
 (ADR-0071), so its accounting can count some of its segments more than
 once. A retry whose abandoned attempt reported nothing (a transport loss
-before any summary) carries no spend and is not one of these. That spend
+before any summary) carries no spend and is not one of these. Nor does the
+estimate count the label-value route's key-index leaf GETs (ADR-3694
+decision 3), which run after it is computed: a query whose route issued at
+least one leaf GET is one of these too. That spend
 lands
 in `QueryStats::accounting`, and `QueryStats::estimate_excludes_spend` is
 true for each of these queries; the MCP envelope reads it. A federation
@@ -4206,8 +4209,9 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   compete for the same permits and are not counted here.
   Every figure here counts the whole resolved snapshot, before the
   label-value route runs: when the route prunes segments, each plan reads
-  only its own surviving segments, so none of the lower bounds below holds
-  for that query.
+  only its own surviving segments, so for that query `serviceBatches` can
+  exceed the rounds the fetch needed and none of the lower bounds below
+  holds.
   Within a single wave, that wave's own `batches_w` (defined below) is a
   true lower bound: the OUTER `buffer_unordered`'s binding capacity for
   that wave cannot service more than `capacity_w` requests per round, so

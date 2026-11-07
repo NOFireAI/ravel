@@ -133,9 +133,11 @@ pub struct QueryStats {
     /// set when the query also spent through the log lane (a selector naming a
     /// log metric, ADR-1103), through a federated remote that answered
     /// (ADR-0071), through distributed workers whose fetch then fell back to
-    /// a local re-fetch of the same segments, or through a distributed slice
+    /// a local re-fetch of the same segments, through a distributed slice
     /// that answered after a retry or reroute and carries the abandoned
-    /// attempts' spend (issue #3789).
+    /// attempts' spend (issue #3789), or through the label-value route's
+    /// key-index leaf GETs, when the route issued at least one (ADR-3694
+    /// decision 3).
     pub estimate_excludes_spend: bool,
     /// True when the query's coverage is partial: at least one federated
     /// remote cluster was skipped because it was unavailable and its
@@ -1742,8 +1744,13 @@ impl QueryEngine {
         // cumulative check across both lanes, using each lane's total
         // resolved segment count (not just the sealed subset `admit` checks)
         // as a conservative approximation -- `resolve_bounded` does not
-        // return the sealed/exempt split to its caller.
-        let total_segments = stats.segments_fetched + log_snapshot.segments.len() as u64;
+        // return the sealed/exempt split to its caller. The metrics term is
+        // the count resolved before the label-value route: `segments_fetched`
+        // has the route's pruned segments taken out, so they are added back.
+        let metrics_resolved = stats
+            .segments_fetched
+            .saturating_add(stats.segments_pruned_by_label_index);
+        let total_segments = metrics_resolved + log_snapshot.segments.len() as u64;
         if total_segments as usize > self.config.max_segments {
             return Err(QueryError::TooManySegments {
                 count: total_segments as usize,
@@ -2160,9 +2167,13 @@ impl QueryEngine {
             // The route's leaf GETs are charged before any segment fetch
             // runs, and a plan whose every segment was pruned runs no fetch
             // batch, so once the route has issued a leaf GET the budgets are
-            // checked here as well as per batch.
+            // checked here as well as per batch. `estimate_cost` has no term
+            // for those GETs, so a route that issued one also marks the
+            // estimate as excluding spend.
             let routed = accounting.snapshot();
-            if routed.phase(QueryPhase::KeyIndex).total_s3_requests() > leaf_requests_before {
+            let route_spent =
+                routed.phase(QueryPhase::KeyIndex).total_s3_requests() > leaf_requests_before;
+            if route_spent {
                 if let Some(err) =
                     bytes_scanned_exceeded(routed.pooled().total_s3_bytes(), max_bytes_scanned)
                 {
@@ -2288,10 +2299,10 @@ impl QueryEngine {
             // partials; every other yields `None`. Collect the one that did.
             let mut collected_pushdown: Option<Vec<crate::distrib::codec::PartialAggregate>> = None;
             // Whether `accounting` now holds spend the snapshot's estimate does
-            // not cover: a distributed fetch that fell back to a local re-fetch
-            // or folded a retried slice, or a federated remote that answered
-            // (below).
-            let mut excludes_spend = false;
+            // not cover: the label-value route's leaf GETs, a distributed fetch
+            // that fell back to a local re-fetch or folded a retried slice, or
+            // a federated remote that answered (below).
+            let mut excludes_spend = route_spent;
             for r in results {
                 let (histograms, per_plan_stats, pushdown_partials, plan_excludes_spend) = r?;
                 excludes_spend |= plan_excludes_spend;
@@ -2497,6 +2508,11 @@ impl QueryEngine {
         if !has_metrics_leaf {
             return Ok(unrouted());
         }
+        // A `__name__` value is routed too, though the resolve's name
+        // postings already pruned by it where they could: postings do not
+        // cover every segment, and `shared_equality_name_filter` passes no
+        // name at all when the selectors disagree on one, so a name pass can
+        // prune segments the postings kept. It costs one pass of leaf GETs.
         let plan_values: Vec<Vec<&str>> = plans
             .iter()
             .map(|plan| positive_equality_values(&plan.matchers))
