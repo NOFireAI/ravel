@@ -31,8 +31,9 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreMetrics};
 use ravel_query::http::{StaticBearerTokenResolver, TenantResolver};
 use ravel_query::{
-    EngineConfig, FetchError, GetLimiter, LogFetchError, LogSegmentFetcher,
-    QueryAdmissionController, QueryConcurrencyLimit, QueryError, ReadCache, SegmentFetcher,
+    DEFAULT_SUFFIX_LEN, DEFAULT_WHOLE_OBJECT_THRESHOLD, EngineConfig, FetchError, GetLimiter,
+    LogFetchError, LogSegmentFetcher, QueryAdmissionController, QueryConcurrencyLimit, QueryError,
+    ReadCache, SegmentFetcher,
 };
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{SpanFetchError, SqlConfig, SqlError, SqlExecutor, SqlRequest};
@@ -283,17 +284,17 @@ const LARGE_SEGMENT_QUERY_OFFSET_S: i64 = 300;
 
 /// Publishes one real RSEG segment for `tenant`/`metric`, anchored relative
 /// to `now` (real wall-clock nanoseconds), with high-entropy sample values so
-/// its data object exceeds the 512 KiB whole-object-read threshold: only past
-/// that threshold does `ensure_ranges` reserve against the process memory
-/// budget at all, rather than reading the whole object in one unbudgeted GET.
-/// Asserts the threshold was really crossed rather than assuming it from the
-/// sample count.
+/// its data object exceeds the 512 KiB whole-object-read threshold: past that
+/// threshold the open reads only the footer tail and `ensure_ranges` reserves
+/// the catalog and page reads separately, rather than the whole object arriving
+/// in one GET. Asserts the threshold was really crossed rather than assuming it
+/// from the sample count, and returns the data object's size.
 async fn publish_large_segment(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
     metric: &str,
     now: i64,
-) {
+) -> u64 {
     let tenant_hash = tenant.hash();
     let label_set = LabelSet::new(vec![Label {
         name: "__name__".to_string(),
@@ -371,6 +372,18 @@ async fn publish_large_segment(
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish");
+    object_size
+}
+
+/// The bytes the segment open's first GET reserves for a data object of
+/// `object_size` under the fetcher's default limits: the whole object at or
+/// below the whole-object threshold, else the footer tail.
+fn open_get_len(object_size: u64) -> u64 {
+    if object_size <= DEFAULT_WHOLE_OBJECT_THRESHOLD {
+        object_size
+    } else {
+        DEFAULT_SUFFIX_LEN.min(object_size)
+    }
 }
 
 /// Builds the real PromQL `AppState` via `crate::query::build_app_state`
@@ -553,47 +566,63 @@ struct ReservationStep {
 
 /// Splits [`fetch_reservation_steps`] for the one-segment instant query these
 /// tests run into the totals a held GET can observe, and the size of the
-/// catalog decode's reservation (ADR-1702 decision 6). The query reserves four
-/// times: the catalog-section range read, the catalog decode, the page read,
-/// then the sample fold's charge for the samples it retains (#3747). The decode
+/// catalog decode's reservation (ADR-1702 decision 6). The query reserves five
+/// times: the segment open's first GET (`open_get`, the footer tail of an
+/// object over the whole-object threshold), the catalog-section range read,
+/// the catalog decode, the page read, then the sample fold's charge for the
+/// samples it retains (#3747). The open GET's bytes stay held by the regions
+/// it fills (ADR-1170), so each later step reserves on top of it. The decode
 /// reserves between GETs, so no held GET sees its own running total, and it
 /// charges decoded output rather than cache-bound bytes, so it is never marked
-/// handed off. The fold reserves once the object's fetch has returned and
-/// released its own reservations, so it holds nothing else when it reserves
-/// and no held GET observes it either.
+/// handed off. The fold reserves after the page read's GET has returned, on
+/// top of everything the batch still holds, so no held GET observes it either.
 ///
-/// The decode figure is the decode step's own total less the range read, which
-/// is the pre-shrink charge. That is only the figure a held GET observes while
-/// `shrink_to_retained` leaves the reservation alone, and nothing here can
-/// check it: under the full budget the oracle run builds, the shrink's reserve
-/// is refused whatever its order. The callers' `seen == observable` assertion
-/// under an unlimited budget is what fails if the fixture ever shrinks.
-fn split_decode_step(steps: &[ReservationStep]) -> (Vec<u64>, u64) {
+/// The returned totals are the open GET's, the range read's and the page
+/// read's, in that order. The decode figure is the decode step's own total
+/// less the range read's, which is the pre-shrink charge. That is only the
+/// figure a held GET observes while `shrink_to_retained` leaves the
+/// reservation alone, and nothing here can check it: under the full budget the
+/// oracle run builds, the shrink's reserve is refused whatever its order. The
+/// callers' `seen == observable` assertion under an unlimited budget is what
+/// fails if the fixture ever shrinks.
+fn split_decode_step(steps: &[ReservationStep], open_get: u64) -> (Vec<u64>, u64) {
     assert_eq!(
         steps.len(),
-        4,
-        "range read, catalog decode, page read, sample fold: {steps:?}"
-    );
-    let range_read = steps[0].total;
-    assert_eq!(
-        steps[1].held, range_read,
-        "the catalog decode reserves on top of the range read alone: {steps:?}"
-    );
-    assert!(
-        steps[2].held >= range_read,
-        "the range read is still held when the page read reserves: {steps:?}"
+        5,
+        "open GET, range read, catalog decode, page read, sample fold: {steps:?}"
     );
     assert_eq!(
-        steps[3].held, 0,
-        "the sample fold reserves after the fetch released its reservations: {steps:?}"
+        steps[0],
+        ReservationStep {
+            held: 0,
+            total: open_get,
+        },
+        "the open GET reserves first, on an empty ledger, exactly its footer tail: {steps:?}"
+    );
+    assert_eq!(
+        steps[1].held, open_get,
+        "the range read reserves on top of the held open GET alone: {steps:?}"
+    );
+    let range_read = steps[1].total;
+    assert_eq!(
+        steps[2].held, range_read,
+        "the catalog decode reserves on top of the open GET and range read alone: {steps:?}"
     );
     assert!(
-        steps[3].total > 0,
+        steps[3].held >= range_read,
+        "the open GET and range read are still held when the page read reserves: {steps:?}"
+    );
+    assert_eq!(
+        steps[4].held, steps[3].total,
+        "the sample fold reserves on top of everything the fetch still holds: {steps:?}"
+    );
+    assert!(
+        steps[4].total > steps[4].held,
         "the sample fold charges the samples it retains: {steps:?}"
     );
     (
-        vec![range_read, steps[2].total],
-        steps[1].total - range_read,
+        vec![open_get, range_read, steps[3].total],
+        steps[2].total - range_read,
     )
 }
 
@@ -973,8 +1002,8 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
     let now = real_now_ns();
     publish_large_segment(store.as_ref(), &tenant, "big_gauge_budget", now).await;
 
-    // 4 KiB is far smaller than the >512 KiB column range this segment forces
-    // `ensure_ranges` to reserve in one all-or-nothing charge.
+    // 4 KiB is smaller than the 64 KiB footer tail the segment open reserves
+    // before its first GET, so the fetch is refused there.
     let budget = Arc::new(ravel_memory::MemoryBudget::new(4 * 1024));
     let (state, promql, _metrics) = promql_harness(Arc::clone(&store), Arc::clone(&budget), None);
     let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
@@ -1080,31 +1109,32 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
     );
 
     // The refusal left nothing behind: the shared budget reads 0 again, so the
-    // next query's reservations start from the full limit. That is the proof
-    // the process keeps serving. The query below resolves no segment (an unpublished metric) and
-    // needs no reservation, so it shows only that the same engine still routes
-    // and answers after a refusal, not that the budget admits a new charge.
+    // next query's reservations start from the full limit. The query below is
+    // the same metric one day before the segment's samples: no ingest hour in
+    // that window holds a commit, so it resolves no segment, opens nothing and
+    // reserves nothing, and must answer 200 with an empty result under the
+    // same 4,096-byte budget. It shows that the same engine still routes and
+    // answers after a refusal, not that the budget admits a new charge.
     assert_eq!(budget.reserved(), 0);
-    let request = Request::builder()
-        .method("GET")
-        .uri(format!(
-            "/api/v1/query?query=still_alive&time={query_time_s}"
-        ))
-        .header(header::AUTHORIZATION, "Bearer acme-token")
-        .body(Body::empty())
-        .expect("build request");
-    let response = promql.clone().oneshot(request).await.expect("oneshot");
+    let before_data_s = query_time_s - 86_400;
+    let (status, body) = get_promql_instant(&promql, "big_gauge_budget", before_data_s).await;
     assert_eq!(
-        response.status(),
+        status,
         StatusCode::OK,
-        "the engine must still answer a query that needs no reservation after a refusal"
+        "the engine must still answer a query that resolves no segment after a refusal: {body}"
     );
+    assert_eq!(
+        body["data"]["result"].as_array().map(Vec::len),
+        Some(0),
+        "a window before any data resolves no segment and returns no series: {body}"
+    );
+    assert_eq!(budget.reserved(), 0);
 }
 
 /// ACCEPTANCE TEST (ADR-2633 task 4, issue #2732): a PromQL fetch the
 /// process memory budget refuses answers HTTP 422 `execution` with the
 /// budget's own message, in both budget classes. The accounted class (a 4 KiB
-/// ledger the >512 KiB range read cannot fit) names the figures the typed
+/// ledger the segment open's 64 KiB footer read cannot fit) names the figures the typed
 /// refusal carries; the host-memory gate class (an unlimited ledger whose gate
 /// the test closes with the budget's own setter, available 0 below a 1-byte
 /// floor) names the reading and the floor. Reopening the gate makes the same
@@ -1123,7 +1153,7 @@ async fn a_promql_fetch_over_the_process_budget_answers_422() {
     publish_large_segment(store.as_ref(), &tenant, "big_gauge_422", now).await;
     let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
 
-    // Accounted class: the ledger's limit refuses the range read.
+    // Accounted class: the ledger's limit refuses the open's footer read.
     let budget = Arc::new(ravel_memory::MemoryBudget::new(4 * 1024));
     let (state, promql, _metrics) = promql_harness(Arc::clone(&store), Arc::clone(&budget), None);
     let refusal = match state
@@ -1398,11 +1428,9 @@ async fn a_promql_catalog_decode_refusal_answers_422() {
 /// refusals, not from the counter under test.
 ///
 /// A `FaultStore` holds every `Get` against the published segment's data key
-/// so the reservation is observable while `budget.fetch_reserved()` is
-/// nonzero; the segment's own unbudgeted footer read (which also matches the
-/// hold filter) is released without asserting on it, distinguished from the
-/// budgeted range read by `fetch_reserved() == 0` at that moment (the
-/// footer/suffix GET in `open_segment` issues no reservation at all).
+/// so each reservation is observable while its GET is in flight: the footer
+/// read `open_segment` reserves before issuing it, the catalog range read, and
+/// the page read.
 ///
 /// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
 /// `build_app_state`, and the oracle panics with "the oracle's 1-byte budget
@@ -1415,14 +1443,14 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let tenant = TenantId::new("acme".to_string());
     let now = real_now_ns();
-    publish_large_segment(store.as_ref(), &tenant, "big_gauge_gauge", now).await;
+    let object_size = publish_large_segment(store.as_ref(), &tenant, "big_gauge_gauge", now).await;
 
     let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
     let (state, _promql, metrics) = promql_harness(Arc::clone(&store), Arc::clone(&budget), None);
     let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
     let steps =
         fetch_reservation_steps(&store, &tenant, "big_gauge_gauge", query_time_s, now).await;
-    let (observable, _decode) = split_decode_step(&steps);
+    let (observable, _decode) = split_decode_step(&steps, open_get_len(object_size));
 
     let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
     let mut query = Box::pin(state.engine.instant(
@@ -1511,15 +1539,17 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
 /// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
 /// `build_app_state`, and the oracle panics as in the sibling gauge test
 /// above. Drop the `reservation.mark_handed_off()` call in
-/// `SegmentFetcher::ensure_ranges`, and the held check fails with the overlap
-/// at 0 against the first step's exact total.
+/// `SegmentFetcher::ensure_ranges`, and the held check fails at the range
+/// read's step, with the overlap short of its total by the range read's own
+/// bytes.
 #[tokio::test]
 async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetch_is_held() {
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let tenant = TenantId::new("acme".to_string());
     let now = real_now_ns();
-    publish_large_segment(store.as_ref(), &tenant, "big_gauge_overlap", now).await;
+    let object_size =
+        publish_large_segment(store.as_ref(), &tenant, "big_gauge_overlap", now).await;
 
     let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
     let cache = ReadCache::Ram(Arc::new(Cache::new(CacheLimits::new(
@@ -1532,7 +1562,7 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
     let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
     let steps =
         fetch_reservation_steps(&store, &tenant, "big_gauge_overlap", query_time_s, now).await;
-    let (observable, decode) = split_decode_step(&steps);
+    let (observable, decode) = split_decode_step(&steps, open_get_len(object_size));
 
     let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
     let mut query = Box::pin(state.engine.instant(
@@ -1571,9 +1601,9 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
                         seen.push(reserved);
                     }
                     let expected = reserved;
-                    // Past the first step the decoded catalog is held too, and
+                    // Past the range read the decoded catalog is held too, and
                     // its reservation is not a fetch the cache also holds.
-                    let decoded_held = if reserved > observable[0] { decode } else { 0 };
+                    let decoded_held = if reserved > observable[1] { decode } else { 0 };
                     let overlap = reserved - decoded_held;
                     assert_eq!(
                         budget.handoff_overlap(),
@@ -1722,10 +1752,11 @@ fn sql_budget_harness(
 /// Publishes one real RSEG segment for `tenant`/`metric`, anchored inside the
 /// fixed `[0, NOW_NS]` window the SQL tests' `post_sql`/`sql_body` already
 /// query, with high-entropy sample values so its data object exceeds the
-/// 512 KiB whole-object-read threshold: only past that threshold does
-/// `ensure_ranges` reserve against the process memory budget at all, rather
-/// than reading the whole object in one unbudgeted GET. Asserts the threshold
-/// was really crossed rather than assuming it from the sample count.
+/// 512 KiB whole-object-read threshold: past that threshold the open reads
+/// only the footer tail and `ensure_ranges` reserves the catalog and page
+/// reads separately, rather than the whole object arriving in one GET. Asserts
+/// the threshold was really crossed rather than assuming it from the sample
+/// count.
 ///
 /// Unlike `publish_large_segment` above (anchored to real wall-clock time,
 /// needed there because the raw PromQL HTTP handler's `now_ns()` is not
@@ -1842,8 +1873,7 @@ pub(crate) fn sql_log_record(ts: i64, body: &str) -> LogRecord {
 /// `LogSegmentFetcher::whole_object_bytes` reserves against the process
 /// memory budget for any object at or below the ADR-0996 fetch bound (64 MiB
 /// by default; see `EngineConfig::logs_max_fetch_run_bytes`), so a single
-/// small record is enough to force a budgeted reservation, unlike RSEG's
-/// small-object path which needs a >512 KiB fixture.
+/// small record is enough to force a budgeted reservation.
 pub(crate) async fn publish_small_log_segment(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
@@ -2001,8 +2031,8 @@ async fn publish_small_span_segment(
 /// `.with_memory_budget` at all).
 ///
 /// The fixture crosses the 512 KiB whole-object-read threshold
-/// (`publish_large_sql_segment`) so the refused reservation is the ranged
-/// read's (`ensure_ranges`) column fetch, the charge this test is about.
+/// (`publish_large_sql_segment`), so the segment open reads a 64 KiB footer
+/// tail, and that first reservation is the one the 4 KiB budget refuses.
 ///
 /// Prove-the-test: remove `.with_memory_budget(process_memory_budget.clone())`
 /// from the metrics fetcher in `build_sql_state`
@@ -2037,7 +2067,7 @@ async fn a_sql_metrics_fetch_over_the_process_budget_is_refused_and_the_process_
     let err = executor
         .execute(tenant.hash(), &request)
         .await
-        .expect_err("a 4 KiB budget must refuse a >512 KiB range read");
+        .expect_err("a 4 KiB budget must refuse the 64 KiB footer read");
     let (requested, reserved) = match err {
         SqlError::Fetch(FetchError::FetchMemoryExhausted {
             requested,

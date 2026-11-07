@@ -46,9 +46,10 @@ pub use engine::{
 };
 pub use error::{FOLD_LAST_SUCCESS_GAUGE, FoldLag, QueryError};
 pub use fetcher::{
-    CacheFetchError, DEFAULT_WHOLE_OBJECT_THRESHOLD, FetchError, FetchStats, FetchedSeries,
-    FetchedSeriesSoa, MAX_GETS_PER_L0_SEGMENT_FETCH, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache,
-    SamplePriority, SegmentFetcher, unsupported_version_message,
+    CacheFetchError, DEFAULT_SUFFIX_LEN, DEFAULT_WHOLE_OBJECT_THRESHOLD, FetchError, FetchStats,
+    FetchedSeries, FetchedSeriesSoa, MAX_GETS_PER_L0_SEGMENT_FETCH,
+    MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache, SamplePriority, SegmentFetcher,
+    unsupported_version_message,
 };
 pub use limiter::{GetLimiter, GetLimiterClosed};
 pub use log_fetcher::{
