@@ -310,10 +310,11 @@ struct RequestLedgerInner {
 /// and wire bytes, split by phase. See the [module docs](self): observation
 /// only, attributed at the call site, one ledger per concurrent run.
 ///
-/// Production never installs one ([`crate::config::CompactorConfig::request_ledger`]
-/// is `None`), so every hook compiles to a single `Option` check. Installing one
-/// is the one-line change that surfaces [`Self::report`] to an operator through
-/// the `tracing::info!` event [`crate::rewrite::rewrite_and_publish`] emits.
+/// `ravel-cli maintain` installs one when `--scratch-dir` is set, which
+/// surfaces [`Self::report`] to an operator through the `tracing::info!` event
+/// [`crate::rewrite::rewrite_and_publish`] emits; otherwise
+/// [`crate::config::CompactorConfig::request_ledger`] is `None` and every hook
+/// is a single `Option` check.
 #[derive(Clone, Debug, Default)]
 pub struct RequestLedger {
     inner: Arc<RequestLedgerInner>,

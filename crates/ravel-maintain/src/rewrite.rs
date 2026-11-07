@@ -196,8 +196,8 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
 /// fetch. Requests are logical store calls, not billed attempts (that seam is
 /// the S3 adapter's, ADR-0996 decision 3). Received and sent bytes are
 /// different kinds and are never summed with each other or with the
-/// decoded-heap peaks. Only fires when a ledger is installed (never in
-/// production today).
+/// decoded-heap peaks. Only fires when a ledger is installed, which
+/// `ravel-cli maintain` does when `--scratch-dir` is set.
 pub(crate) fn emit_request_report(config: &CompactorConfig, bucket: &Bucket, ok: bool) {
     if let Some(l) = config.request_ledger.as_ref() {
         let r = l.report();
