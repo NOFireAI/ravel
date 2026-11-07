@@ -968,7 +968,35 @@ fn memo_views(array: &ArrayRef) -> DFResult<Option<ArrayRef>> {
     if identity {
         return Ok(Some(Arc::new(views)));
     }
-    Ok(Some(datafusion::arrow::compute::take(&views, keys, None)?))
+    let gathered = datafusion::arrow::compute::take(&views, keys, None)?;
+    zero_null_views(gathered).map(Some)
+}
+
+/// `array` with a zero view (the empty inline string) at every NULL slot, as
+/// arrow's cast writes there; `take` copies the indexed view instead. An array
+/// with no NULL row comes back as it is.
+fn zero_null_views(array: ArrayRef) -> DFResult<ArrayRef> {
+    use datafusion::arrow::array::StringViewArray;
+    use datafusion::arrow::buffer::ScalarBuffer;
+
+    let Some(gathered) = array.as_any().downcast_ref::<StringViewArray>() else {
+        return Ok(array);
+    };
+    let Some(nulls) = gathered.nulls().filter(|n| n.null_count() > 0) else {
+        return Ok(array);
+    };
+    let mut views = gathered.views().to_vec();
+    for (view, valid) in views.iter_mut().zip(nulls.iter()) {
+        if !valid {
+            *view = 0;
+        }
+    }
+    let zeroed = StringViewArray::try_new(
+        ScalarBuffer::from(views),
+        gathered.data_buffers().to_vec(),
+        Some(nulls.clone()),
+    )?;
+    Ok(Arc::new(zeroed))
 }
 
 /// A dictionary-string group key with every key whose dictionary entry is NULL
