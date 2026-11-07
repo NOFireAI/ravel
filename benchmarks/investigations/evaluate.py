@@ -349,6 +349,10 @@ def call_metrics(c):
     for p in PHASES:
         v[f"{p.lower()}_gets"] = ph[p]["s3GetRequests"]
         v[f"{p.lower()}_wire_bytes"] = ph[p]["s3GetWireBytes"]
+        # The logs keyed plan counts every object whose footer its KEY_IDX
+        # probe decoded as opened in the plan phase, absent key or not; an
+        # object read past the probe is opened again in the scan phase.
+        v[f"{p.lower()}_segments_opened"] = ph[p]["segmentsOpened"]
     v["total_gets"] = sum(ph[p]["s3GetRequests"] for p in PHASES)
     v["data_gets"] = ph["probe"]["s3GetRequests"] + ph["scan"]["s3GetRequests"]
     v["list_requests"] = sum(ph[p]["s3ListRequests"] for p in PHASES)
@@ -714,7 +718,7 @@ def statement_figure(calls, cfg, statement, state, metric, candidates=None):
             return "missing", None, f"unknown metric {name}"
         vals.append(v)
     value = max(vals) if agg == "max" else min(vals)
-    if name == "segments_opened" and value == 0:
+    if name in ("segments_opened", "scan_segments_opened") and value == 0:
         scanned = [c for c in lines if call_metrics(c)["scan_gets"] >= 1]
         if scanned:
             return "dead_counter", 0, (f"segmentsOpened 0 while {where(scanned[0])} issued "

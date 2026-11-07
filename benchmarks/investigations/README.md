@@ -519,7 +519,14 @@ Some bands, as transcribed:
   `missing` too.
 - Row 6: keyIndex GETs at most 2 x the census's hits objects and at least
   one per hits object above 512 KiB (the census's `objects_over_512k`): the
-  logs keyed plan probes every object past that size (#3117).
+  logs keyed plan probes every object past that size (#3117). Objects read
+  past the probe are the scan phase's `segmentsOpened`
+  (`cold.max.scan_segments_opened`), not the sum over the phases: the keyed
+  plan counts each object whose footer its KEY_IDX probe decoded as opened
+  in the plan phase, absent key or not, so the sum counts the probed
+  objects too. Box C's q20 read 497 as that sum, with 6 GETs past the
+  probe; its case, with 496 opens in the plan phase and 1 in the scan
+  phase, reads 1 (`check_row_6_objects_past_probe`).
 - Row 7, judged per build pass (the #3704 amendment's form, with the pass
   factor of the pass-end slice amendment): ranged section GETs
   (`key_index_ranged_gets`) at most 2 x (new + uncovered entries) x

@@ -1635,6 +1635,53 @@ class Evaluate(Workdir):
     def test_row_6_floor(self):
         self.assertEqual(self.check_row_6_floor(), [])
 
+    @staticmethod
+    def box_c_q20_call():
+        """One cold q20 call on unfolded with box C's figures (#3692 comment 6698223574, the Stage 1
+        amendment's row 6): 970 keyIndex GETs, 6 GETs past the probe moving 989,537 B of scan wire, 497 objects
+        opened over every phase. Box C's summary gives the sum, not the split by phase; this case puts 496 in
+        the plan phase, the probed objects whose footer the KEY_IDX probe decoded, and 1 in the scan phase,
+        the holder read past the probe."""
+        def phase(name, gets=0, wire=0, opened=0):
+            return {"phase": name, "s3GetRequests": gets, "s3GetWireBytes": wire, "s3ListRequests": 0,
+                    "segmentsOpened": opened, "decompressedOutputBytes": 0, "cacheServedBytes": 0}
+        return {"statement": "q20_hits", "state": "unfolded", "temp": "cold", "try": 0, "outcome": "ok",
+                "truth_key": "hits.q20", "rows": 4, "wall_s": 3.0, "server_cpu_s": 1.0, "server_hwm_bytes": 1,
+                "stats": {"phases": [phase("resolve", 1, 33), phase("plan", 496, 4_063_232, 496), phase("probe"),
+                                     phase("scan", 6, 989_537, 1), phase("keyIndex", 970, 1_000_000)],
+                          "pruning": {"blocksScanned": 1, "segments": 523}, "io": {"dependencyDepth": 1},
+                          "signals": [{}]}}
+
+    def check_row_6_objects_past_probe(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 4: row 6's objects past the probe are the scan phase's segmentsOpened: 1 on box C's call,
+        where segmentsOpened summed over the phases reads 497."""
+        mod = load_module(evaluate_py, "evaluate_row6_past_probe")
+        with open(bands, "rb") as f:
+            rows = {"row": [r for r in tomllib.load(f)["row"] if r["key"] == "row_06"]}
+        c = self.box_c_q20_call()
+        problems = mod.Problems()
+        calls = mod.Calls([c], problems, {"q20_hits": {"id": "q20_hits", "tenant": "hits"}})
+        c["_judged"] = "reference"
+        census = {("unfolded",): {"state": "unfolded", "census": {"tenants": {
+            "hits": {"data": {"logs": {"objects": 523, "objects_over_512k": 496}}}}}}}
+        cfg = {"lane": "local", "hits": True, "tenant": "inv", "scales": [1], "baseline": False,
+               "states": ["unfolded"], "cold_runs": 1, "warm_runs": 0}
+        figs = {f["id"]: f for f in mod.run_rows(rows, cfg, {"unfolded": None}, calls, None, {}, census, None,
+                                                   {}, {})}
+        out = [] if not problems.lines else [f"problems {problems.lines}"]
+        got = figs["row_06.objects_past_probe"]
+        if (got["value"], got["verdict"]) != (1, "pass"):
+            out.append(f"objects_past_probe {got['value']} {got['verdict']}")
+        for name, value in (("gets_beyond_probe", 6), ("scan_wire_bytes", 989_537)):
+            if (figs[f"row_06.{name}"]["value"], figs[f"row_06.{name}"]["verdict"]) != (value, "pass"):
+                out.append(f"{name} {figs[f'row_06.{name}']}")
+        if mod.call_metrics(c)["segments_opened"] != 497:
+            out.append(f"segmentsOpened summed {mod.call_metrics(c)['segments_opened']}")
+        return out
+
+    def test_row_6_objects_past_probe(self):
+        self.assertEqual(self.check_row_6_objects_past_probe(), [])
+
     def needle_stamp(self, **fields):
         path = self.stamp_path("needle_blocks.json")
         with open(path) as f:
@@ -2910,6 +2957,11 @@ FLIPS = {
         '            return "value", len(calls.wrong) + len(calls.errors), ""\n',
         "check_typed_refusal_is_an_error_not_a_wrong_answer",
     ),
+    "a phase's segmentsOpened read as every phase's": (
+        '        v[f"{p.lower()}_segments_opened"] = ph[p]["segmentsOpened"]\n',
+        '        v[f"{p.lower()}_segments_opened"] = sum(ph[q]["segmentsOpened"] for q in PHASES)\n',
+        "check_row_6_objects_past_probe",
+    ),
     "a state with every call group unsent read as missing": (
         "        if groups and len(unsent) == len(groups):\n",
         "        if False:\n",
@@ -3117,6 +3169,11 @@ BAND_FLIPS = {
         "target_if = \"True\"\n"
         "miss_if = \"False\"\n",
         "check_row_7_rebuild",
+    ),
+    "row 6's objects past the probe read from segmentsOpened over every phase": (
+        'metric = "cold.max.scan_segments_opened"\n',
+        'metric = "cold.max.segments_opened"\n',
+        "check_row_6_objects_past_probe",
     ),
     "row 7's previous-leaf GETs not compared with the previous leaves": (
         "target_if = \"v == m['row_07.logs_previous_leaves']\"\n",

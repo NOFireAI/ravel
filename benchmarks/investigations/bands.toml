@@ -412,11 +412,18 @@ target_if = "m['row_06.hits_objects_over_512k'] <= v <= 2 * m['row_06.hits_objec
 miss_if = "v < m['row_06.hits_objects_over_512k']"
 miss_reason = "fewer keyIndex GETs than objects above 512 KiB: one was read without its probe"
 
+# Objects read past the probe are the scan phase's segmentsOpened. The logs
+# keyed plan counts every object whose footer its KEY_IDX probe decoded as
+# opened in the plan phase, absent key or not (log_fetcher.rs,
+# plan_segment_keyed and probe_segment_keyed), so segmentsOpened summed over
+# the phases counts the probed objects as well as the ones read past the
+# probe. Box C's q20 read 497 that way with 6 scan GETs, too few to open 497
+# objects past the probe. A 0 beside scan GETs is reported dead_counter.
 [[row.figure]]
 name = "objects_past_probe"
 statement = "q20_hits"
 state = "unfolded"
-metric = "cold.max.segments_opened"
+metric = "cold.max.scan_segments_opened"
 lane = "counter"
 target_if = "v == 1"
 
