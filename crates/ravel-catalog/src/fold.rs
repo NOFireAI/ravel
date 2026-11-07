@@ -16204,6 +16204,57 @@ pub(crate) mod tests {
         );
     }
 
+    /// An advancing fold with the metrics leaf on carries the previous tail's
+    /// `label_value` pairs through its leaf, with no LABEL_DICT read for the
+    /// carried entries, and writes the leaf a single fold over the same
+    /// objects writes, byte for byte.
+    #[tokio::test]
+    async fn an_advancing_metrics_fold_carries_the_previous_leaf() {
+        async fn publish_early(store: &dyn ObjectStoreBackend) {
+            for seq in [10u64, 20, 30] {
+                publish_labeled_metrics(store, seq, KIDX_HOUR, &region_series("west"), 1000, false)
+                    .await;
+            }
+        }
+        async fn publish_late(store: &dyn ObjectStoreBackend) {
+            publish_labeled_metrics(store, 15, KIDX_HOUR + 1, &region_series("east"), 1000, false)
+                .await;
+        }
+
+        let advancing = recording_store();
+        let catalog = Catalog::new(advancing.clone(), metrics_kidx_config()).expect("catalog");
+        publish_early(advancing.as_ref()).await;
+        fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        publish_late(advancing.as_ref()).await;
+        advancing.gets.lock().expect("lock").clear();
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR + 1).await;
+        assert_eq!(report.entry_count, 4, "{report:?}");
+        assert_eq!(report.key_index_entries_carried, 3, "{report:?}");
+        assert_eq!(report.key_index_ranged_gets, 0, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+        assert_eq!(data_object_ranged_gets(&advancing), Vec::new());
+
+        let single = recording_store();
+        publish_early(single.as_ref()).await;
+        publish_late(single.as_ref()).await;
+        let once = Catalog::new(single.clone(), metrics_kidx_config()).expect("catalog");
+        fold_through(&once, Signal::Metrics, KIDX_HOUR + 1).await;
+
+        let a = read_signal_head(advancing.as_ref(), Signal::Metrics).await;
+        let b = read_signal_head(single.as_ref(), Signal::Metrics).await;
+        assert_eq!(a.parts.len(), 1);
+        assert_eq!(a.parts[0].blake3, b.parts[0].blake3);
+        assert_eq!(a.parts[0].key_index, b.parts[0].key_index);
+        let ordinal = part_ordinals(advancing.as_ref(), &a.parts[0]).await;
+        assert_eq!(
+            probe_label(&catalog, &a.parts[0], "west").await,
+            matches(
+                &[(ordinal[&10], &[0]), (ordinal[&20], &[0]), (ordinal[&30], &[0])],
+                &[]
+            )
+        );
+    }
+
     /// An object whose stored LABEL_DICT fails its checksum is uncovered by
     /// the part's `label_value` leaf, which is still written for the other
     /// objects, and the fold succeeds.
