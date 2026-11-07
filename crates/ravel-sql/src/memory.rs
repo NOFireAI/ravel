@@ -943,6 +943,24 @@ impl EnvelopeGroup {
             .take(self.width)
             .fold(0u64, |sum, size| sum.saturating_add(*size as u64))
     }
+
+    /// The bytes of pool `pool_id`'s envelopes among the `width` largest, the
+    /// only envelopes on the budget. An envelope tied in size with another
+    /// pool's at the boundary is counted as outside, so the figure never
+    /// exceeds what the budget holds for this pool.
+    fn pool_top_width_sum(&self, pool_id: u64) -> u64 {
+        let mut sizes: Vec<(usize, bool)> = self
+            .envelopes
+            .iter()
+            .map(|((pool, _), size)| (*size, *pool == pool_id))
+            .collect();
+        sizes.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        sizes
+            .iter()
+            .take(self.width)
+            .filter(|(_, own)| *own)
+            .fold(0u64, |sum, (size, _)| sum.saturating_add(*size as u64))
+    }
 }
 
 /// Every live envelope in the process, grouped by the budget it is charged
@@ -971,6 +989,9 @@ enum EnvelopeCheck {
 struct EnvelopeRefused {
     delta: u64,
     exhausted: MemoryExhausted,
+    /// The refused pool's envelope bytes on the budget when it refused,
+    /// read under the same ledger lock as the refusal.
+    pool_on_budget: u64,
 }
 
 /// Set the envelope of consumer `key` on `budget` to `envelope` bytes (zero
@@ -1006,10 +1027,15 @@ fn set_process_envelope(
                     Some(previous) => group.envelopes.insert(key, previous),
                     None => group.envelopes.remove(&key),
                 };
+                let pool_on_budget = group.pool_top_width_sum(key.0);
                 if group.envelopes.is_empty() && group.on_budget == 0 {
                     ledger.remove(&budget_id);
                 }
-                return Err(EnvelopeRefused { delta, exhausted });
+                return Err(EnvelopeRefused {
+                    delta,
+                    exhausted,
+                    pool_on_budget,
+                });
             }
         } else {
             group.budget.reserve_unchecked(delta);
@@ -1055,6 +1081,14 @@ fn envelope_on_budget(budget: &Arc<MemoryBudget>) -> u64 {
     envelope_ledger()
         .get(&budget_key(budget))
         .map_or(0, |group| group.on_budget)
+}
+
+/// Pool `pool_id`'s envelope bytes on `budget` now:
+/// [`EnvelopeGroup::pool_top_width_sum`].
+fn pool_envelope_on_budget(budget: &Arc<MemoryBudget>, pool_id: u64) -> u64 {
+    envelope_ledger()
+        .get(&budget_key(budget))
+        .map_or(0, |group| group.pool_top_width_sum(pool_id))
 }
 
 /// What a pool tracks for one migrated aggregate consumer.
@@ -1190,8 +1224,9 @@ impl MemoryRefusal {
 pub(crate) struct RefusalRecord {
     /// Which limit refused.
     pub(crate) kind: MemoryRefusal,
-    /// For a tenant or process budget refusal, the budget's figures at the
-    /// moment of refusal; `None` for every other kind.
+    /// For a tenant budget, process budget or reserve-ahead refusal, the
+    /// refusing budget's figures at the moment of refusal; `None` for every
+    /// other kind.
     pub(crate) share: Option<BudgetShare>,
 }
 
@@ -1202,8 +1237,16 @@ pub(crate) struct BudgetShare {
     /// The budget's reserved bytes, before the refused grow.
     pub(crate) budget_reserved: u64,
     /// The refused pool's bytes on that budget, before the refused grow: its
-    /// charged bytes, plus its aggregate envelopes on the process budget.
-    /// Envelopes are on the process budget only, never on a tenant budget.
+    /// charged bytes, plus, on the process budget, those of its aggregate
+    /// envelopes among the process's `width` largest, which are the only
+    /// envelope bytes the budget holds. Envelopes are on the process budget
+    /// only, never on a tenant budget. Nothing else the process budget holds
+    /// for the statement is counted: its fetch reservations are made on the
+    /// shared budget with no per-statement figure to read.
+    ///
+    /// On a reserve-ahead refusal the envelopes are read under the lock the
+    /// refusal ran under. On a process budget refusal of a charge the budget
+    /// refused without that lock, so they are read just after it.
     pub(crate) own: u64,
 }
 
@@ -1555,8 +1598,9 @@ impl TenantDelegatingPool {
     }
 
     /// Record a refusal of kind `kind` of `asked` bytes asked by `consumer`,
-    /// with the refusing budget's `share` for a tenant or process budget
-    /// refusal, and return the attribution to append to its message.
+    /// with the refusing budget's `share` for a tenant budget, process budget
+    /// or reserve-ahead refusal, and return the attribution to append to its
+    /// message.
     fn refuse(
         &self,
         kind: MemoryRefusal,
@@ -1868,12 +1912,17 @@ impl TenantDelegatingPool {
             }
             let kind =
                 MemoryRefusal::of_cause(&refused.exhausted.cause, MemoryRefusal::ReserveAhead);
+            let share = (kind == MemoryRefusal::ReserveAhead).then(|| BudgetShare {
+                budget_reserved: refused.exhausted.reserved,
+                own: (self.query_used.load(Ordering::Acquire) as u64)
+                    .saturating_add(refused.pool_on_budget),
+            });
             return Err(DataFusionError::ResourcesExhausted(format!(
                 "aggregate reserve-ahead refused: the process aggregate envelope needs \
                  to grow by {} bytes: {}{}",
                 refused.delta,
                 refused.exhausted,
-                self.refuse(kind, consumer, additional, None)
+                self.refuse(kind, consumer, additional, share)
             )));
         }
         if let Err(error) = self.try_grow_charged(consumer, charged, additional) {
@@ -2106,9 +2155,14 @@ impl TenantDelegatingPool {
                 ),
                 GrowRefused::Process { exhausted, .. } => {
                     let kind = MemoryRefusal::of_cause(&exhausted.cause, MemoryRefusal::Process);
+                    // The budget refused without the envelope ledger's lock,
+                    // so the envelopes are read just after the refusal.
                     let share = (kind == MemoryRefusal::Process).then(|| BudgetShare {
                         budget_reserved: exhausted.reserved,
-                        own: charged.saturating_add(self.consumer_ledger().envelope_bytes() as u64),
+                        own: charged.saturating_add(pool_envelope_on_budget(
+                            &self.tenant.budget,
+                            self.pool_id,
+                        )),
                     });
                     (kind, share)
                 }
@@ -2341,7 +2395,7 @@ impl Drop for TenantDelegatingPool {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use datafusion::execution::memory_pool::UnboundedMemoryPool;
     use ravel_types::accounting::QueryAccounting;
 
@@ -3111,7 +3165,7 @@ mod tests {
 
     /// Serializes the tests that reserve an envelope with the one that reads
     /// the process-wide envelope figure as 0.
-    fn envelope_tests() -> MutexGuard<'static, ()> {
+    pub(crate) fn envelope_tests() -> MutexGuard<'static, ()> {
         static SERIAL: Mutex<()> = Mutex::new(());
         SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -4153,7 +4207,7 @@ mod tests {
 
     /// Charges a migrated aggregate one to one and gives it an envelope of
     /// exactly what it asked for while it is under 8 MiB.
-    const ENVELOPE_AS_ASKED: AggregateReserveAhead = AggregateReserveAhead {
+    pub(crate) const ENVELOPE_AS_ASKED: AggregateReserveAhead = AggregateReserveAhead {
         undercount_factor: 1.0,
         envelope_size_factor: 1.0,
         ..AggregateReserveAhead::OFF
@@ -4484,6 +4538,78 @@ mod tests {
                 }),
             })
         );
+    }
+
+    /// Issue #3899 (M2 review): with an envelope width of 2 the process
+    /// budget holds only the two largest envelopes in the process, so a
+    /// process budget refusal counts in the pool's own bytes only its
+    /// envelopes among them. The pool's 100-byte envelope is outside the 300
+    /// and 200 of two other pools: the budget holds those 500 plus the pool's
+    /// 100 charged bytes, and own is the 100 charged bytes and 0 envelope
+    /// bytes.
+    ///
+    /// FLIP: count every envelope of the pool and own reads 200.
+    #[test]
+    fn a_process_refusal_counts_only_the_pools_envelopes_the_budget_holds() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(650));
+        let (_tenant, pool) = ahead_pool(&budget, 2, ENVELOPE_AS_ASKED, QueryAccounting::new());
+        let aggregate = register_on(&pool, PARTIAL);
+        aggregate
+            .try_grow(100)
+            .expect("100 plus a 100-byte envelope fit");
+        let others = [(u64::MAX, 200), (u64::MAX - 1, 300)];
+        for (other_pool, envelope) in others {
+            assert!(
+                set_process_envelope(
+                    &budget,
+                    2,
+                    (other_pool, 0),
+                    envelope,
+                    EnvelopeCheck::Unchecked
+                )
+                .is_ok()
+            );
+        }
+        assert_eq!(envelope_on_budget(&budget), 500, "the two largest");
+        assert_eq!(budget.reserved(), 600, "500 enveloped and 100 charged");
+
+        let join = register_on(&pool, "HashJoinInput[0]");
+        join.try_grow(100)
+            .expect_err("700 is over the process budget's 650");
+        assert_eq!(
+            pool.first_refusal_record(),
+            Some(RefusalRecord {
+                kind: MemoryRefusal::Process,
+                share: Some(BudgetShare {
+                    budget_reserved: 600,
+                    own: 100,
+                }),
+            })
+        );
+
+        for (other_pool, _) in others {
+            clear_pool_envelopes(&budget, other_pool);
+        }
+        drop((aggregate, join));
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// An envelope tied in size with another pool's at the width boundary is
+    /// counted as outside the budget for its own pool, whichever pool asks:
+    /// each pool's figure leaves the tied 100 bytes out.
+    #[test]
+    fn a_tied_envelope_at_the_width_boundary_is_not_the_pools() {
+        let group = EnvelopeGroup {
+            budget: Arc::new(MemoryBudget::new(1000)),
+            width: 2,
+            envelopes: BTreeMap::from([((1, 0), 300), ((1, 1), 100), ((2, 0), 100)]),
+            on_budget: 400,
+        };
+        assert_eq!(group.top_width_sum(), 400);
+        assert_eq!(group.pool_top_width_sum(1), 300);
+        assert_eq!(group.pool_top_width_sum(2), 0);
+        assert_eq!(group.pool_top_width_sum(3), 0);
     }
 
     /// Issue #3899: in spill mode with `L = 1000` and `H = 100` a consumer

@@ -850,12 +850,22 @@ answered, but three properties of the decision above cost the rest:
    retries once with spill allowed, but only if all of these hold:
    - the attempt's pool recorded the refusal as a typed signal, not a
      message, and the refusal is the statement's own: its per-query
-     limit; a reserve-ahead refusal, whose consumer is always one of its
-     own hash aggregates; or a tenant or process budget refusal at which its own
-     bytes on that budget (its pool's charged bytes, plus its aggregate
-     envelopes on the process budget) were at least half of the budget's
-     reserved bytes. A fetch-layer refusal does not count, because
-     spilling does not shrink fetch buffers. Note (2026-11-07, the M2
+     limit; or a tenant budget, process budget or aggregate reserve-ahead
+     refusal at which its own bytes on the refusing budget (its pool's
+     charged bytes, plus, on the process budget, those of its aggregate
+     envelopes among the process's `width` largest, the only envelope bytes
+     the budget holds) were at least half of the budget's reserved bytes. A
+     reserve-ahead refusal is a refusal of the shared process budget, so it
+     takes the same test. The statement's fetch reservations on the process
+     budget are not counted: they are made on the shared budget with no
+     per-statement figure. A fetch-layer refusal does not count, because
+     spilling does not shrink fetch buffers. Note (2026-11-07, review of
+     the M2 fix): the M2 fix first retried every reserve-ahead refusal and
+     counted every envelope of the pool, including envelopes outside the
+     `width` largest that the process budget does not hold; under
+     concurrent load another statement could fill the process budget and
+     this statement's small envelope growth could earn a retry that wrote
+     nothing. Note (2026-11-07, the M2
      verification run): this bullet first counted every tenant and
      process budget refusal and a fetch-layer refusal of the process
      budget with an accounted cause. In the c6a.2xlarge concurrent phase
