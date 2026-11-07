@@ -2087,15 +2087,17 @@ fn lock_scratch_dir(scratch_dir: &std::path::Path) -> Result<()> {
             Err(e) => return Err(scratch_error("remove orphan", &path, e)),
         }
     }
-    release_orphaned_charges(scratch_dir);
     held.insert(scratch_dir.to_path_buf(), file);
     Ok(())
 }
 
-/// One unit's charge against its scratch directory: the larger of its need and
-/// the run-part bytes it has written. Only a capped unit's writes raise
-/// `written`. A unit whose subdirectory outlived its end keeps its charge,
-/// marked `orphaned`, until [`lock_scratch_dir`] reclaims the subdirectory.
+/// One unit's charge against its scratch directory: while it runs, the larger
+/// of its need and the run-part bytes it has written. Only a capped unit's
+/// writes raise `written`. A unit whose subdirectory outlived its end keeps a
+/// charge of `written` alone, marked `orphaned`, for the rest of the process:
+/// this process's lock is already held, so only the next process's
+/// [`lock_scratch_dir`] removes the orphan from disk, and that process starts
+/// with no charges.
 #[derive(Clone, Copy, Debug)]
 struct ScratchCharge {
     need: u64,
@@ -2105,7 +2107,11 @@ struct ScratchCharge {
 
 impl ScratchCharge {
     fn bytes(self) -> u64 {
-        self.need.max(self.written)
+        if self.orphaned {
+            self.written
+        } else {
+            self.need.max(self.written)
+        }
     }
 }
 
@@ -2122,27 +2128,41 @@ static SCRATCH_RESERVED: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(Default::default);
 
+/// Whether [`scratch_charges`] counts orphaned units' charges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Orphans {
+    /// Counted: the caller's baseline excludes unit subdirectories
+    /// ([`ScratchCap::charge`]).
+    Counted,
+    /// Left out: the caller's free figure already counts their bytes on disk
+    /// ([`scratch_headroom_free`]).
+    Excluded,
+}
+
 /// The sum of the charges in `units` other than `except`'s.
 fn scratch_charges(
     units: Option<&std::collections::HashMap<u64, ScratchCharge>>,
     except: Option<u64>,
+    orphans: Orphans,
 ) -> u64 {
     units.map_or(0, |units| {
         units
             .iter()
-            .filter(|(id, _)| Some(**id) != except)
+            .filter(|(id, c)| Some(**id) != except && (orphans == Orphans::Counted || !c.orphaned))
             .fold(0u64, |a, (_, c)| a.saturating_add(c.bytes()))
     })
 }
 
-/// What the units of this process running in `scratch_dir` hold reserved.
+/// What the units of this process running in `scratch_dir` hold reserved,
+/// orphans aside.
 #[cfg(test)]
 fn scratch_reserved(scratch_dir: &std::path::Path) -> u64 {
     scratch_reserved_except(scratch_dir, None)
 }
 
 /// What the units of this process running in `scratch_dir` other than
-/// `except` hold reserved.
+/// `except` hold reserved, orphans aside: the free figure reported beside it
+/// already counts an orphan's bytes on disk.
 fn scratch_reserved_except(scratch_dir: &std::path::Path, except: Option<u64>) -> u64 {
     scratch_charges(
         SCRATCH_RESERVED
@@ -2150,6 +2170,7 @@ fn scratch_reserved_except(scratch_dir: &std::path::Path, except: Option<u64>) -
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(scratch_dir),
         except,
+        Orphans::Excluded,
     )
 }
 
@@ -2181,14 +2202,16 @@ struct ScratchCap {
 impl ScratchCap {
     /// Charge a run-part write of `payload` bytes to the unit: its charge
     /// becomes the larger of its need and its written bytes with this write,
-    /// unless the baseline plus every live unit's charge would then exceed the
-    /// cap, in which case nothing changes and this returns false.
+    /// unless the baseline plus every unit's charge, orphans included, would
+    /// then exceed the cap, in which case nothing changes and this returns
+    /// false. The baseline excludes unit subdirectories, so an orphan's charge
+    /// is the only count of its bytes here.
     fn charge(&self, payload: u64) -> bool {
         let mut reserved = SCRATCH_RESERVED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let units = reserved.entry(self.dir.clone()).or_default();
-        let others = scratch_charges(Some(units), Some(self.unit));
+        let others = scratch_charges(Some(units), Some(self.unit), Orphans::Counted);
         let mut charge = units.get(&self.unit).copied().unwrap_or(ScratchCharge {
             need: self.need,
             written: 0,
@@ -2211,7 +2234,9 @@ impl ScratchCap {
 impl ScratchReservation {
     /// Admit a unit needing `need` bytes of `scratch_dir` (ADR-3853 D2) when
     /// its free figure ([`scratch_headroom_free`] under `max_bytes`) less what
-    /// this process's running units there hold reserved covers it; otherwise
+    /// this process's running units there hold reserved covers it; orphaned
+    /// units are left out of the reserved figure, since the free figure
+    /// already counts their bytes on disk. Otherwise
     /// [`MaintainError::ScratchHeadroom`]. The free figure is read under the
     /// reservation lock, so two admissions never count the same bytes; the
     /// read and the update run together on the blocking pool.
@@ -2229,7 +2254,7 @@ impl ScratchReservation {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let ScratchHeadroomFigures { free, baseline } =
                 scratch_headroom_free(&dir, max_bytes, free_override)?;
-            let held = scratch_charges(reserved.get(&dir), None);
+            let held = scratch_charges(reserved.get(&dir), None, Orphans::Excluded);
             if free.saturating_sub(held) < need {
                 return Err(MaintainError::ScratchHeadroom {
                     need,
@@ -2291,20 +2316,6 @@ impl Drop for ScratchReservation {
     }
 }
 
-/// Give back the charges of `scratch_dir`'s orphaned units, whose
-/// subdirectories [`lock_scratch_dir`] has just removed.
-fn release_orphaned_charges(scratch_dir: &std::path::Path) {
-    let mut reserved = SCRATCH_RESERVED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(units) = reserved.get_mut(scratch_dir) {
-        units.retain(|_, charge| !charge.orphaned);
-        if units.is_empty() {
-            reserved.remove(scratch_dir);
-        }
-    }
-}
-
 /// Whether a scratch write failed for want of space: the scratch store
 /// reports a filesystem error as [`StoreError::Permanent`] ending in the
 /// `io::Error`'s text, ENOSPC's or [`std::io::ErrorKind::StorageFull`]'s.
@@ -2321,8 +2332,9 @@ fn is_scratch_full(err: &StoreError) -> bool {
 /// [`Self::close`] wipes and removes the subdirectory on the blocking pool
 /// once the merge returns, success or error; dropping an unclosed unit, a
 /// merge future dropped mid-await, does the same inline. The reservation is
-/// given back after the runs are gone, and kept when the subdirectory could
-/// not be removed (ADR-3853 D2).
+/// given back after the runs are gone; when the subdirectory could not be
+/// removed, the bytes the unit wrote stay charged ([`ScratchCharge`],
+/// ADR-3853 D2).
 struct ScratchUnit {
     store: Arc<ScratchStore>,
     closed: bool,
@@ -2373,7 +2385,7 @@ fn remove_scratch_unit(store: &ScratchStore) -> bool {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => {
-            tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch removal failed; its charge stays until the orphan is reclaimed");
+            tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch removal failed; the bytes it wrote stay charged until the process restarts");
             false
         }
     }
@@ -16900,44 +16912,127 @@ mod tests {
         }
 
         /// A unit whose scratch wipe fails, here because its subdirectory is
-        /// read-only, keeps its charge after it ends, so a later unit under
-        /// the cap is admitted against it; reclaiming the orphan when the
-        /// scratch lock is taken gives the charge back.
+        /// read-only, keeps a charge of the bytes it wrote, not its need, for
+        /// the rest of the process: nothing in this process releases it.
         #[cfg(unix)]
         #[tokio::test]
-        async fn a_failed_wipe_keeps_the_units_charge_until_the_orphan_is_reclaimed() {
-            use std::os::unix::fs::PermissionsExt;
+        async fn a_failed_wipe_keeps_the_bytes_the_unit_wrote_as_its_charge() {
             let dir = fresh_scratch("failed-wipe");
-            std::fs::create_dir_all(&dir).expect("scratch dir");
-            let need = 4096u64;
-            let reservation = ScratchReservation::admit(&dir, None, need)
+            let orphan = OrphanedUnit::make(&dir).await;
+            assert!(orphan.root.join("run-0.rlog").exists(), "the wipe failed");
+            assert_eq!(
+                scratch_orphaned(&dir),
+                OrphanedUnit::WRITTEN,
+                "the kept charge is the bytes written, not the need"
+            );
+            assert_eq!(scratch_reserved(&dir), 0, "no running unit holds any");
+        }
+
+        /// A unit whose wipe failed is counted once at admission, by the free
+        /// figure that sees its bytes on disk: a later unit needing the cap
+        /// less those bytes is admitted, and the reserved figure the
+        /// admission reads leaves the orphan out.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn an_orphan_is_counted_once_at_admission() {
+            let dir = fresh_scratch("orphan-admission");
+            let _orphan = OrphanedUnit::make(&dir).await;
+            let on_disk = scratch_used_bytes(&dir).expect("used").total;
+            assert_eq!(on_disk, OrphanedUnit::WRITTEN);
+            let cap = OrphanedUnit::CAP;
+            let need = cap - on_disk;
+            let _second = ScratchReservation::admit(&dir, Some(cap), need)
                 .await
-                .expect("admit");
-            let unit = ScratchUnit::open(&dir, &[7u8; 32], reservation)
-                .await
-                .expect("open");
-            let root = unit.store.root().to_path_buf();
-            std::fs::write(root.join("run-0.rlog"), [7u8; 64]).expect("run");
-            let chmod = |mode: u32| {
-                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode))
-                    .expect("chmod");
-            };
-            chmod(0o555);
-            unit.close().await;
-            assert!(root.join("run-0.rlog").exists(), "the wipe failed");
-            assert_eq!(scratch_reserved(&dir), need, "the charge stays");
-            match ScratchReservation::admit(&dir, Some(2 * need - 1), need).await {
-                Err(MaintainError::ScratchHeadroom { reserved, .. }) => {
-                    assert_eq!(reserved, need);
+                .expect("the orphan's bytes are counted once");
+            match ScratchReservation::admit(&dir, Some(cap), 1).await {
+                Err(MaintainError::ScratchHeadroom { free, reserved, .. }) => {
+                    assert_eq!((free, reserved), (need, need));
                 }
                 Ok(_) => panic!("admitted past the cap"),
                 Err(e) => panic!("{e}"),
             }
+        }
 
-            chmod(0o755);
-            lock_scratch_dir(&dir).expect("lock");
-            assert!(!root.exists(), "the orphan was reclaimed");
-            assert_eq!(scratch_reserved(&dir), 0, "the charge is released");
+        /// The in-run cap check counts an orphan's kept charge, since its
+        /// baseline excludes unit subdirectories: a running unit's write that
+        /// would take its bytes plus the orphan's past the cap is refused.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn the_in_run_cap_check_counts_an_orphan() {
+            let dir = fresh_scratch("orphan-in-run");
+            let _orphan = OrphanedUnit::make(&dir).await;
+            let max_bytes = OrphanedUnit::CAP;
+            let running = ScratchReservation::admit(&dir, Some(max_bytes), 1)
+                .await
+                .expect("admit");
+            let cap = running.cap(Some(max_bytes)).expect("capped");
+            assert_eq!(cap.baseline, 0, "the orphan is not in the baseline");
+            let room = max_bytes - OrphanedUnit::WRITTEN;
+            assert!(!cap.charge(room + 1), "the orphan's bytes were counted");
+            assert!(cap.charge(room));
+        }
+
+        /// What orphaned units in `dir` keep charged.
+        #[cfg(unix)]
+        fn scratch_orphaned(dir: &std::path::Path) -> u64 {
+            SCRATCH_RESERVED
+                .lock()
+                .expect("reserved")
+                .get(dir)
+                .map_or(0, |units| {
+                    units
+                        .values()
+                        .filter(|c| c.orphaned)
+                        .map(|c| c.written)
+                        .sum()
+                })
+        }
+
+        /// A capped unit admitted with a need of [`Self::NEED`] that wrote
+        /// [`Self::WRITTEN`] bytes and whose wipe failed, its subdirectory
+        /// read-only. Its charge stays for the rest of the process; only the
+        /// next process's lock removes the subdirectory. Dropping this makes
+        /// the subdirectory writable again so the test directory can be
+        /// cleared.
+        #[cfg(unix)]
+        struct OrphanedUnit {
+            root: std::path::PathBuf,
+        }
+
+        #[cfg(unix)]
+        impl OrphanedUnit {
+            const CAP: u64 = 100_000;
+            const NEED: u64 = 40_000;
+            const WRITTEN: u64 = 1_000;
+
+            async fn make(dir: &std::path::Path) -> Self {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::create_dir_all(dir).expect("scratch dir");
+                let reservation = ScratchReservation::admit(dir, Some(Self::CAP), Self::NEED)
+                    .await
+                    .expect("admit");
+                let cap = reservation.cap(Some(Self::CAP)).expect("capped");
+                let unit = ScratchUnit::open(dir, &[7u8; 32], reservation)
+                    .await
+                    .expect("open");
+                let root = unit.store.root().to_path_buf();
+                assert!(cap.charge(Self::WRITTEN));
+                std::fs::write(root.join("run-0.rlog"), [7u8; Self::WRITTEN as usize])
+                    .expect("run");
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555))
+                    .expect("chmod");
+                unit.close().await;
+                OrphanedUnit { root }
+            }
+        }
+
+        #[cfg(unix)]
+        impl Drop for OrphanedUnit {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o755));
+            }
         }
 
         /// A scratch directory whose lock another holder has is refused with

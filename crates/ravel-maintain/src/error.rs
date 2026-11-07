@@ -367,7 +367,10 @@ pub enum MaintainError {
     },
     /// A cursor-mode merge plan would decode more than
     /// [`crate::rlog::MAX_CURSOR_DECODE_AMPLIFICATION`] times the bucket's
-    /// record count (ADR-3853 D0). Raised after the catalog phase and before
+    /// record count and more than
+    /// [`crate::CompactorConfig::geometry_floor_decoded_rows`] rows in all
+    /// (default [`crate::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS`],
+    /// ADR-3853 D0). Raised after the catalog phase and before
     /// the first block GET, so nothing was fetched or written.
     #[error(
         "RLOG compaction refused: cursor merge over {inputs} inputs, {streams} streams and {blocks} blocks would decode {predicted_decoded_rows} rows for {records} records (ADR-3853 D0); nothing fetched or published, the L0 inputs stay live"
