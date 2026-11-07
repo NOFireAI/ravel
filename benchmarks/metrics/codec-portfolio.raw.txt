@@ -1,103 +1,249 @@
-===== ts_bakeoff (timestamp codecs) =====
-    Finished `release` profile [optimized + debuginfo] target(s) in 0.76s
-     Running `/var/lib/fleet/cache/cargo-target/f1369a46-3da9-4d22-882f-61a1e0213d23/release/ts_bakeoff`
+$ cargo run --release -p ravel-bench --bin ts_bakeoff
+
 ========================================================================
 Timestamp codec bake-off (issue #312, ADR-0092 decision 6; ADR-3694 decision 7)
 ========================================================================
-cpu:     Raspberry Pi 5 Model B Rev 1.1
-cores:   4
-memory:  7.9 GiB
-os:      Linux 6.12.25+rpt-rpi-2712 aarch64
+cpu:     AMD EPYC 7R13 Processor
+cores:   16
+memory:  30.6 GiB
+os:      Linux 7.0.0-1011-aws x86_64
 rustc:   rustc 1.97.1 (8bab26f4f 2026-07-14)
-commit:  ccc99d50c0a6050fdb145df3542de878393f7b74
+commit:  c727640a7ab62672ef151b5fff29eaa4a58f8bf7
 ========================================================================
 
-bytes/sample: production INCLUDES the 6-byte RSEG page header (enc/comp/crc);
-every other column is raw codec output with no page header. A production
-lead of <= 6 bytes on a page is header overhead, not codec.
-gcd = divisor found for that page (encode_i64/gcd and gcd_forced_dod both
-divide by it first; they are asserted to find the same divisor).
+B/page, B/sample: production INCLUDES the 6-byte RSEG page header
+(enc/comp/crc); every other codec is raw codec output with no header.
+ratio = codec bytes / production bytes, as measured.
+ratio_hdr = codec bytes / (production bytes - 6), header-corrected.
+dec Mts/s = median decoded millions of timestamps/s over 9 timed rounds,
+1 thread. Production decodes a whole run (TS plus an all-zero VAL page)
+through the public API, so its figure understates TS-only decode speed.
+note: production's selected TS enc (1 TS_DELTA_VARINT, 2 TS_GCD_I64);
+gcd = divisor the GCD codecs divided the page by.
 dod_for = challenger (a): delta-of-delta, FOR-bit-packed per 128-sample block.
 gcd_forced_dod = challenger (b): page / gcd, forced onto encode_i64's
 double-delta arm alone (never its best-of search).
-Rule: a timestamp stack must not regress the exactly-regular stream; a
-challenger is adopted only if bit-exact, <= 75% of production bytes, and
-decode at least as fast.
+Rule, per row: a challenger is adopted only if bit-exact, ratio_hdr <= 0.75,
+and dec Mts/s >= production's.
 
 ===== regular_ms =====
-       n       prod B/s    enc_i64 B/s  enc_i64/gcd B/s  dod_for B/s      gcd_dod B/s      gcd
-       1         7.0000         9.0000           1.0000      10.0000           1.0000 1700000000000000000
-       2         6.0000         7.0000           3.0000       7.5000           3.0000 5000000000
-      12         2.2500         2.0000           1.2500       1.4167           1.3333 5000000000
-      60         0.4667         1.2000           1.0667       0.2833           1.0667 5000000000
-     240         0.1292         1.0500           1.0167       0.0833           1.0167 5000000000
-    3600         0.0269         1.0033           1.0011       0.0206           1.0011 5000000000
+  corpus                       n codec            B/page   B/sample    ratio ratio_hdr  dec Mts/s  roundtrip note
+  regular_ms                   1 production            7     7.0000        -         -        5.3  ok        enc=1
+  regular_ms                   1 enc_i64               9     9.0000    1.286     9.000       50.2  ok        
+  regular_ms                   1 enc_i64/gcd           1     1.0000    0.143     1.000       56.6  ok        gcd=1700000000000000000
+  regular_ms                   1 dod_for              10    10.0000    1.429    10.000       54.1  ok        
+  regular_ms                   1 gcd_forced_dod        1     1.0000    0.143     1.000       69.9  ok        gcd=1700000000000000000
+  regular_ms                   2 production           12     6.0000        -         -        9.5  ok        enc=1
+  regular_ms                   2 enc_i64              14     7.0000    1.167     2.333       53.5  ok        
+  regular_ms                   2 enc_i64/gcd           6     3.0000    0.500     1.000       60.3  ok        gcd=5000000000
+  regular_ms                   2 dod_for              15     7.5000    1.250     2.500       86.7  ok        
+  regular_ms                   2 gcd_forced_dod        6     3.0000    0.500     1.000      106.4  ok        gcd=5000000000
+  regular_ms                  12 production           27     2.2500        -         -       33.5  ok        enc=2
+  regular_ms                  12 enc_i64              24     2.0000    0.889     1.143      223.6  ok        
+  regular_ms                  12 enc_i64/gcd          15     1.2500    0.556     0.714      121.0  ok        gcd=5000000000
+  regular_ms                  12 dod_for              17     1.4167    0.630     0.810      204.3  ok        
+  regular_ms                  12 gcd_forced_dod       16     1.3333    0.593     0.762      287.2  ok        gcd=5000000000
+  regular_ms                  60 production           28     0.4667        -         -       61.5  ok        enc=1
+  regular_ms                  60 enc_i64              72     1.2000    2.571     3.273      432.4  ok        
+  regular_ms                  60 enc_i64/gcd          64     1.0667    2.286     2.909      419.1  ok        gcd=5000000000
+  regular_ms                  60 dod_for              17     0.2833    0.607     0.773      416.7  ok        
+  regular_ms                  60 gcd_forced_dod       64     1.0667    2.286     2.909      381.4  ok        gcd=5000000000
+  regular_ms                 240 production           31     0.1292        -         -       90.7  ok        enc=1
+  regular_ms                 240 enc_i64             252     1.0500    8.129    10.080      717.6  ok        
+  regular_ms                 240 enc_i64/gcd         244     1.0167    7.871     9.760      626.0  ok        gcd=5000000000
+  regular_ms                 240 dod_for              20     0.0833    0.645     0.800      481.4  ok        
+  regular_ms                 240 gcd_forced_dod      244     1.0167    7.871     9.760      407.9  ok        gcd=5000000000
+  regular_ms                3600 production           97     0.0269        -         -      106.3  ok        enc=1
+  regular_ms                3600 enc_i64            3612     1.0033   37.237    39.692      815.6  ok        
+  regular_ms                3600 enc_i64/gcd        3604     1.0011   37.155    39.604      733.3  ok        gcd=5000000000
+  regular_ms                3600 dod_for              74     0.0206    0.763     0.813      493.4  ok        
+  regular_ms                3600 gcd_forced_dod     3604     1.0011   37.155    39.604      430.8  ok        gcd=5000000000
 
 ===== jitter_ms =====
-       n       prod B/s    enc_i64 B/s  enc_i64/gcd B/s  dod_for B/s      gcd_dod B/s      gcd
-       1         7.0000         9.0000           1.0000      10.0000           1.0000 1700000000165000000
-       2         6.0000         7.0000           4.0000       7.5000           4.0000  3000000
-      12         3.2500         5.0833           2.4167       4.9167           2.4167  1000000
-      60         2.0333         4.7333           1.8667       4.1000           1.8667  1000000
-     240         1.8583         4.6292           1.8167       3.9625           1.8167  1000000
-    3600         1.8475         4.6711           1.8447       3.9253           1.8447  1000000
+  corpus                       n codec            B/page   B/sample    ratio ratio_hdr  dec Mts/s  roundtrip note
+  jitter_ms                    1 production            7     7.0000        -         -        5.2  ok        enc=1
+  jitter_ms                    1 enc_i64               9     9.0000    1.286     9.000       49.8  ok        
+  jitter_ms                    1 enc_i64/gcd           1     1.0000    0.143     1.000       56.5  ok        gcd=1700000000165000000
+  jitter_ms                    1 dod_for              10    10.0000    1.429    10.000       53.9  ok        
+  jitter_ms                    1 gcd_forced_dod        1     1.0000    0.143     1.000       69.7  ok        gcd=1700000000165000000
+  jitter_ms                    2 production           12     6.0000        -         -        6.4  ok        enc=1
+  jitter_ms                    2 enc_i64              14     7.0000    1.167     2.333       53.5  ok        
+  jitter_ms                    2 enc_i64/gcd           8     4.0000    0.667     1.333       60.2  ok        gcd=3000000
+  jitter_ms                    2 dod_for              15     7.5000    1.250     2.500       86.6  ok        
+  jitter_ms                    2 gcd_forced_dod        8     4.0000    0.667     1.333      100.3  ok        gcd=3000000
+  jitter_ms                   12 production           39     3.2500        -         -       37.1  ok        enc=2
+  jitter_ms                   12 enc_i64              61     5.0833    1.564     1.848      145.9  ok        
+  jitter_ms                   12 enc_i64/gcd          29     2.4167    0.744     0.879      180.5  ok        gcd=1000000
+  jitter_ms                   12 dod_for              59     4.9167    1.513     1.788       94.2  ok        
+  jitter_ms                   12 gcd_forced_dod       29     2.4167    0.744     0.879      242.4  ok        gcd=1000000
+  jitter_ms                   60 production          122     2.0333        -         -       81.4  ok        enc=2
+  jitter_ms                   60 enc_i64             284     4.7333    2.328     2.448      192.2  ok        
+  jitter_ms                   60 enc_i64/gcd         112     1.8667    0.918     0.966      248.9  ok        gcd=1000000
+  jitter_ms                   60 dod_for             246     4.1000    2.016     2.121      105.5  ok        
+  jitter_ms                   60 gcd_forced_dod      112     1.8667    0.918     0.966      334.3  ok        gcd=1000000
+  jitter_ms                  240 production          446     1.8583        -         -      117.7  ok        enc=2
+  jitter_ms                  240 enc_i64            1111     4.6292    2.491     2.525      191.4  ok        
+  jitter_ms                  240 enc_i64/gcd         436     1.8167    0.978     0.991      284.3  ok        gcd=1000000
+  jitter_ms                  240 dod_for             951     3.9625    2.132     2.161      102.4  ok        
+  jitter_ms                  240 gcd_forced_dod      436     1.8167    0.978     0.991      341.7  ok        gcd=1000000
+  jitter_ms                 3600 production         6651     1.8475        -         -      135.6  ok        enc=2
+  jitter_ms                 3600 enc_i64           16816     4.6711    2.528     2.531      194.8  ok        
+  jitter_ms                 3600 enc_i64/gcd        6641     1.8447    0.998     0.999      288.3  ok        gcd=1000000
+  jitter_ms                 3600 dod_for           14131     3.9253    2.125     2.127      107.1  ok        
+  jitter_ms                 3600 gcd_forced_dod     6641     1.8447    0.998     0.999      307.4  ok        gcd=1000000
 
 ===== nanos_jitter =====
-       n       prod B/s    enc_i64 B/s  enc_i64/gcd B/s  dod_for B/s      gcd_dod B/s      gcd
-       1         7.0000         9.0000           1.0000      10.0000           1.0000 1700000000087133787
-       2         6.0000         7.0000           7.0000       7.5000           7.0000        3
-      12         5.1667         5.0833           5.0833       4.9167           5.0833        1
-      60         4.8000         4.6667           4.6667       4.1000           4.6667        1
-     240         4.7333         4.7000           4.7000       3.9625           4.7000        1
-    3600         4.6731         4.6708           4.6708       3.9208           4.6708        1
+  corpus                       n codec            B/page   B/sample    ratio ratio_hdr  dec Mts/s  roundtrip note
+  nanos_jitter                 1 production            7     7.0000        -         -        5.2  ok        enc=1
+  nanos_jitter                 1 enc_i64               9     9.0000    1.286     9.000       50.1  ok        
+  nanos_jitter                 1 enc_i64/gcd           1     1.0000    0.143     1.000       56.5  ok        gcd=1700000000087133787
+  nanos_jitter                 1 dod_for              10    10.0000    1.429    10.000       54.1  ok        
+  nanos_jitter                 1 gcd_forced_dod        1     1.0000    0.143     1.000       69.8  ok        gcd=1700000000087133787
+  nanos_jitter                 2 production           12     6.0000        -         -        9.4  ok        enc=1
+  nanos_jitter                 2 enc_i64              14     7.0000    1.167     2.333       53.5  ok        
+  nanos_jitter                 2 enc_i64/gcd          14     7.0000    1.167     2.333       50.8  ok        gcd=3
+  nanos_jitter                 2 dod_for              15     7.5000    1.250     2.500       86.6  ok        
+  nanos_jitter                 2 gcd_forced_dod       14     7.0000    1.167     2.333       85.5  ok        gcd=3
+  nanos_jitter                12 production           62     5.1667        -         -       32.9  ok        enc=1
+  nanos_jitter                12 enc_i64              61     5.0833    0.984     1.089      146.4  ok        
+  nanos_jitter                12 enc_i64/gcd          61     5.0833    0.984     1.089      137.2  ok        gcd=1
+  nanos_jitter                12 dod_for              59     4.9167    0.952     1.054       93.8  ok        
+  nanos_jitter                12 gcd_forced_dod       61     5.0833    0.984     1.089      177.8  ok        gcd=1
+  nanos_jitter                60 production          288     4.8000        -         -       69.6  ok        enc=2
+  nanos_jitter                60 enc_i64             280     4.6667    0.972     0.993      196.6  ok        
+  nanos_jitter                60 enc_i64/gcd         280     4.6667    0.972     0.993      165.0  ok        gcd=1
+  nanos_jitter                60 dod_for             246     4.1000    0.854     0.872      105.4  ok        
+  nanos_jitter                60 gcd_forced_dod      280     4.6667    0.972     0.993      215.6  ok        gcd=1
+  nanos_jitter               240 production         1136     4.7333        -         -       89.9  ok        enc=2
+  nanos_jitter               240 enc_i64            1128     4.7000    0.993     0.998      193.1  ok        
+  nanos_jitter               240 enc_i64/gcd        1128     4.7000    0.993     0.998      180.4  ok        gcd=1
+  nanos_jitter               240 dod_for             951     3.9625    0.837     0.842      103.5  ok        
+  nanos_jitter               240 gcd_forced_dod     1128     4.7000    0.993     0.998      203.9  ok        gcd=1
+  nanos_jitter              3600 production        16823     4.6731        -         -      101.4  ok        enc=2
+  nanos_jitter              3600 enc_i64           16815     4.6708    1.000     1.000      196.6  ok        
+  nanos_jitter              3600 enc_i64/gcd       16815     4.6708    1.000     1.000      184.3  ok        gcd=1
+  nanos_jitter              3600 dod_for           14115     3.9208    0.839     0.839      106.6  ok        
+  nanos_jitter              3600 gcd_forced_dod    16815     4.6708    1.000     1.000      162.6  ok        gcd=1
 
 ===== irregular =====
-       n       prod B/s    enc_i64 B/s  enc_i64/gcd B/s  dod_for B/s      gcd_dod B/s      gcd
-       1         7.0000         9.0000           1.0000      10.0000           1.0000 1700000016000000000
-       2         6.5000         7.5000           3.0000       8.0000           3.0000 3000000000
-      12         2.3333         5.6667           1.3333       5.8333           1.3333 1000000000
-      60         1.2667         5.3000           1.0667       4.8667           1.0667 1000000000
-     240         1.0667         5.4167           1.0167       4.7125           1.0167 1000000000
-    3600         1.0044         5.4203           1.0011       4.6833           1.0011 1000000000
+  corpus                       n codec            B/page   B/sample    ratio ratio_hdr  dec Mts/s  roundtrip note
+  irregular                    1 production            7     7.0000        -         -        5.3  ok        enc=1
+  irregular                    1 enc_i64               9     9.0000    1.286     9.000       50.1  ok        
+  irregular                    1 enc_i64/gcd           1     1.0000    0.143     1.000       56.5  ok        gcd=1700000016000000000
+  irregular                    1 dod_for              10    10.0000    1.429    10.000       54.1  ok        
+  irregular                    1 gcd_forced_dod        1     1.0000    0.143     1.000       69.8  ok        gcd=1700000016000000000
+  irregular                    2 production           13     6.5000        -         -        9.5  ok        enc=1
+  irregular                    2 enc_i64              15     7.5000    1.154     2.143       53.1  ok        
+  irregular                    2 enc_i64/gcd           6     3.0000    0.462     0.857       60.3  ok        gcd=3000000000
+  irregular                    2 dod_for              16     8.0000    1.231     2.286       83.7  ok        
+  irregular                    2 gcd_forced_dod        6     3.0000    0.462     0.857      106.2  ok        gcd=3000000000
+  irregular                   12 production           28     2.3333        -         -       38.9  ok        enc=2
+  irregular                   12 enc_i64              68     5.6667    2.429     3.091      142.6  ok        
+  irregular                   12 enc_i64/gcd          16     1.3333    0.571     0.727      247.0  ok        gcd=1000000000
+  irregular                   12 dod_for              70     5.8333    2.500     3.182       86.4  ok        
+  irregular                   12 gcd_forced_dod       16     1.3333    0.571     0.727      286.3  ok        gcd=1000000000
+  irregular                   60 production           76     1.2667        -         -       89.7  ok        enc=2
+  irregular                   60 enc_i64             318     5.3000    4.184     4.543      543.6  ok        
+  irregular                   60 enc_i64/gcd          64     1.0667    0.842     0.914      423.2  ok        gcd=1000000000
+  irregular                   60 dod_for             292     4.8667    3.842     4.171       96.8  ok        
+  irregular                   60 gcd_forced_dod       64     1.0667    0.842     0.914      380.9  ok        gcd=1000000000
+  irregular                  240 production          256     1.0667        -         -      143.1  ok        enc=2
+  irregular                  240 enc_i64            1300     5.4167    5.078     5.200      808.2  ok        
+  irregular                  240 enc_i64/gcd         244     1.0167    0.953     0.976      611.0  ok        gcd=1000000000
+  irregular                  240 dod_for            1131     4.7125    4.418     4.524       97.5  ok        
+  irregular                  240 gcd_forced_dod      244     1.0167    0.953     0.976      398.4  ok        gcd=1000000000
+  irregular                 3600 production         3616     1.0044        -         -      187.5  ok        enc=2
+  irregular                 3600 enc_i64           19513     5.4203    5.396     5.405      205.0  ok        
+  irregular                 3600 enc_i64/gcd        3604     1.0011    0.997     0.998      732.1  ok        gcd=1000000000
+  irregular                 3600 dod_for           16860     4.6833    4.663     4.670       98.5  ok        
+  irregular                 3600 gcd_forced_dod     3604     1.0011    0.997     0.998      428.7  ok        gcd=1000000000
 
-===== out_of_order =====
-       n       prod B/s    enc_i64 B/s  enc_i64/gcd B/s  dod_for B/s      gcd_dod B/s      gcd
-       1         7.0000         9.0000           1.0000      10.0000           1.0000 1700000000000000000
-       2         6.0000         7.0000           3.0000       7.5000           3.0000 5000000000
-      12         2.2500         3.2500           1.2500       5.7500           1.3333 5000000000
-      60         1.2667         3.5333           1.0667       4.8500           1.0667 5000000000
-     240         1.0000         3.0083           1.0167       4.7125           1.0167 5000000000
-    3600         0.8267         2.8769           1.0011       4.6639           1.0011 5000000000
+===== metricsbench_cardinality (seed=927000933, steps=8, series=1, samples=8, sorted: 0 out of order, 0 duplicates dropped) =====
+  corpus                       n codec            B/page   B/sample    ratio ratio_hdr  dec Mts/s  roundtrip note
+  metricsbench_cardinality     1 production            7     7.0000        -         -        5.3  ok        enc=1
+  metricsbench_cardinality     1 enc_i64               9     9.0000    1.286     9.000       50.1  ok        
+  metricsbench_cardinality     1 enc_i64/gcd           1     1.0000    0.143     1.000       56.5  ok        gcd=1700000000000000000
+  metricsbench_cardinality     1 dod_for              10    10.0000    1.429    10.000       54.1  ok        
+  metricsbench_cardinality     1 gcd_forced_dod        1     1.0000    0.143     1.000       69.3  ok        gcd=1700000000000000000
+  metricsbench_cardinality     2 production           12     6.0000        -         -        9.4  ok        enc=1
+  metricsbench_cardinality     2 enc_i64              14     7.0000    1.167     2.333       53.6  ok        
+  metricsbench_cardinality     2 enc_i64/gcd           6     3.0000    0.500     1.000       60.4  ok        gcd=5000000000
+  metricsbench_cardinality     2 dod_for              15     7.5000    1.250     2.500       86.7  ok        
+  metricsbench_cardinality     2 gcd_forced_dod        6     3.0000    0.500     1.000      106.4  ok        gcd=5000000000
 
-===== metricsbench_cardinality (seed=927000933, steps=8, series=1) =====
-       n       prod B/s    enc_i64 B/s  enc_i64/gcd B/s  dod_for B/s      gcd_dod B/s      gcd
-       1         7.0000         9.0000           1.0000      10.0000           1.0000 1700000000000000000
-       2         6.0000         7.0000           3.0000       7.5000           3.0000 5000000000
+===== metricsbench_history (seed=927000933, steps=256, series=1, samples=253, sorted: 0 out of order, 0 duplicates dropped) =====
+  corpus                       n codec            B/page   B/sample    ratio ratio_hdr  dec Mts/s  roundtrip note
+  metricsbench_history         1 production            7     7.0000        -         -        5.3  ok        enc=1
+  metricsbench_history         1 enc_i64               9     9.0000    1.286     9.000       50.2  ok        
+  metricsbench_history         1 enc_i64/gcd           1     1.0000    0.143     1.000       56.6  ok        gcd=1700000000000000000
+  metricsbench_history         1 dod_for              10    10.0000    1.429    10.000       54.0  ok        
+  metricsbench_history         1 gcd_forced_dod        1     1.0000    0.143     1.000       69.9  ok        gcd=1700000000000000000
+  metricsbench_history         2 production           12     6.0000        -         -        9.5  ok        enc=1
+  metricsbench_history         2 enc_i64              14     7.0000    1.167     2.333       53.5  ok        
+  metricsbench_history         2 enc_i64/gcd           6     3.0000    0.500     1.000       60.2  ok        gcd=5000000000
+  metricsbench_history         2 dod_for              15     7.5000    1.250     2.500       86.6  ok        
+  metricsbench_history         2 gcd_forced_dod        6     3.0000    0.500     1.000      106.2  ok        gcd=5000000000
+  metricsbench_history        12 production           27     2.2500        -         -       33.5  ok        enc=2
+  metricsbench_history        12 enc_i64              24     2.0000    0.889     1.143      223.4  ok        
+  metricsbench_history        12 enc_i64/gcd          15     1.2500    0.556     0.714      120.9  ok        gcd=5000000000
+  metricsbench_history        12 dod_for              17     1.4167    0.630     0.810      203.5  ok        
+  metricsbench_history        12 gcd_forced_dod       16     1.3333    0.593     0.762      287.1  ok        gcd=5000000000
+  metricsbench_history        60 production           40     0.6667        -         -       69.1  ok        enc=1
+  metricsbench_history        60 enc_i64              88     1.4667    2.200     2.588      439.1  ok        
+  metricsbench_history        60 enc_i64/gcd          64     1.0667    1.600     1.882      461.6  ok        gcd=5000000000
+  metricsbench_history        60 dod_for             275     4.5833    6.875     8.088      100.0  ok        
+  metricsbench_history        60 gcd_forced_dod       64     1.0667    1.600     1.882      381.5  ok        gcd=5000000000
+  metricsbench_history       240 production           54     0.2250        -         -      104.9  ok        enc=1
+  metricsbench_history       240 enc_i64             276     1.1500    5.111     5.750      601.7  ok        
+  metricsbench_history       240 enc_i64/gcd         244     1.0167    4.519     5.083      597.1  ok        gcd=5000000000
+  metricsbench_history       240 dod_for             584     2.4333   10.815    12.167      154.5  ok        
+  metricsbench_history       240 gcd_forced_dod      244     1.0167    4.519     5.083      301.5  ok        gcd=5000000000
 
-===== metricsbench_history (seed=927000933, steps=240, series=1) =====
-       n       prod B/s    enc_i64 B/s  enc_i64/gcd B/s  dod_for B/s      gcd_dod B/s      gcd
-       1         7.0000         9.0000           1.0000      10.0000           1.0000 1700000000000000000
-       2         6.0000         7.0000           3.0000       7.5000           3.0000 5000000000
-      12         2.2500         2.0000           1.2500       1.4167           1.3333 5000000000
-      60         0.6667         1.4667           1.0667       4.5833           1.0667 5000000000
+===== adoption summary (judged on ratio_hdr) =====
+rule: bit-exact AND ratio_hdr <= 0.75 AND dec Mts/s >= production
+  regular_ms                   1 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  regular_ms                   2 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  regular_ms                  12 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  regular_ms                  60 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  regular_ms                 240 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  regular_ms                3600 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  jitter_ms                    1 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  jitter_ms                    2 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  jitter_ms                   12 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  jitter_ms                   60 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  jitter_ms                  240 adopt: none             dod_for=miss(bytes,dec)  gcd_forced_dod=miss(bytes)
+  jitter_ms                 3600 adopt: none             dod_for=miss(bytes,dec)  gcd_forced_dod=miss(bytes)
+  nanos_jitter                 1 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  nanos_jitter                 2 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  nanos_jitter                12 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  nanos_jitter                60 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  nanos_jitter               240 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  nanos_jitter              3600 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  irregular                    1 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  irregular                    2 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  irregular                   12 adopt: gcd_forced_dod   dod_for=miss(bytes)  gcd_forced_dod=clears
+  irregular                   60 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  irregular                  240 adopt: none             dod_for=miss(bytes,dec)  gcd_forced_dod=miss(bytes)
+  irregular                 3600 adopt: none             dod_for=miss(bytes,dec)  gcd_forced_dod=miss(bytes)
+  metricsbench_cardinality     1 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  metricsbench_cardinality     2 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  metricsbench_history         1 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  metricsbench_history         2 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  metricsbench_history        12 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  metricsbench_history        60 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
+  metricsbench_history       240 adopt: none             dod_for=miss(bytes)  gcd_forced_dod=miss(bytes)
 
-===== single_sample (one absolute timestamp) =====
-  prod=7 B  enc_i64=9 B  enc_i64/gcd=1 B  gcd=1700000000000000000
+$ cargo run --release -p ravel-bench --bin codec_bakeoff
 
-EXIT=0
-
-===== codec_bakeoff (value codecs) =====
-    Finished `release` profile [optimized + debuginfo] target(s) in 0.36s
-     Running `/var/lib/fleet/cache/cargo-target/f1369a46-3da9-4d22-882f-61a1e0213d23/release/codec_bakeoff`
 ========================================================================
 Value codec bake-off (issue #312, ADR-0092 decision 6)
 ========================================================================
-cpu:     Raspberry Pi 5 Model B Rev 1.1
-cores:   4
-memory:  7.9 GiB
-os:      Linux 6.12.25+rpt-rpi-2712 aarch64
+cpu:     AMD EPYC 7R13 Processor
+cores:   16
+memory:  30.6 GiB
+os:      Linux 7.0.0-1011-aws x86_64
 rustc:   rustc 1.97.1 (8bab26f4f 2026-07-14)
-commit:  ccc99d50c0a6050fdb145df3542de878393f7b74
+commit:  c727640a7ab62672ef151b5fff29eaa4a58f8bf7
 ========================================================================
 
 bytes/sample = codec payload (production excludes its 6-byte page header).
@@ -113,231 +259,233 @@ so THIS is the evidence decode is CPU-bound, not memory-bandwidth-bound. All
 throughput is single-threaded.
 'ratio' = challenger bytes / production bytes; adoption needs <= 0.75 AND
 dec >= production dec AND a bit-exact round trip.
-cores (available_parallelism): 4   (throughput below is 1 thread)
+cores (available_parallelism): 16   (throughput below is 1 thread)
 
 ======================= 60 samples per page =======================
-(metricsbench_history values: seed=927000933, n=60, drawn via metrics_stream_sample::sample_series, bounded to 8 series)
+(metricsbench_history values: seed=927000933, n=60, drawn via metrics_stream_sample::sample_series, 2 series joined end to end, at most 8)
 
-counter_int_resets  (n=60, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           0.6000          5.1         27.2         19.0        217.4        -  ok
-  alp                  1.0667         20.2        150.0        160.0       1200.3    1.778  ok
-  gcd_delta_for        0.6000         50.6         98.0         58.8        784.1    1.000  ok
-  chimp128             2.9667         10.5         32.5         96.5        260.1    4.944  ok
-  bytesplit_zstd       2.2500          8.3         68.9        155.0        551.3    3.750  ok
-  raw_f64              8.0000        646.5        669.7       5357.3       5357.3   13.333  ok
-  alp_vectorized       1.2000         69.1        105.9        127.1        847.3    2.000  ok
-  alp_rd               1.2167         15.2        106.2        129.2        849.3    2.028  ok
+counter_int_resets  (n=60, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  counter_int_resets      60 production           0.6000          7.5         53.0         37.1        423.6        -  ok
+  counter_int_resets      60 alp                  1.0667         26.8        241.5        257.6       1932.3    1.778  ok
+  counter_int_resets      60 gcd_delta_for        0.6000         61.3        192.0        115.2       1535.9    1.000  ok
+  counter_int_resets      60 chimp128             2.9667         21.7         51.6        153.0        412.6    4.944  ok
+  counter_int_resets      60 bytesplit_zstd       2.2500          8.1         22.1         49.8        177.0    3.750  ok
+  counter_int_resets      60 raw_f64              8.0000        994.1        950.2       7602.0       7602.0   13.333  ok
+  counter_int_resets      60 alp_vectorized       1.2000         65.6        212.8        255.3       1702.2    2.000  ok
+  counter_int_resets      60 alp_rd               1.2167         21.7        212.9        259.0       1703.2    2.028  ok
 
-gauge_int  (n=60, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           0.6167          5.3         27.0         19.4        216.3        -  ok
-  alp                  0.8667         20.6        162.3        140.7       1298.4    1.405  ok
-  gcd_delta_for        0.6167         53.8         97.9         60.4        783.3    1.000  ok
-  chimp128             2.5667         10.2         37.8         97.1        302.5    4.162  ok
-  bytesplit_zstd       1.6667          8.3         65.1        108.5        520.7    2.703  ok
-  raw_f64              8.0000        648.6        667.2       5337.4       5337.4   12.973  ok
-  alp_vectorized       0.8333         77.1        119.5         99.6        956.1    1.351  ok
-  alp_rd               0.8500         24.3        120.0        102.0        960.1    1.378  ok
+gauge_int  (n=60, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_int               60 production           0.6167          7.7         52.2         37.4        417.7        -  ok
+  gauge_int               60 alp                  0.8667         27.1        256.1        221.9       2048.6    1.405  ok
+  gauge_int               60 gcd_delta_for        0.6167         64.0        191.2        117.9       1529.3    1.000  ok
+  gauge_int               60 chimp128             2.5667         23.4         59.6        152.9        476.7    4.162  ok
+  gauge_int               60 bytesplit_zstd       1.6667          8.0         21.6         36.0        172.7    2.703  ok
+  gauge_int               60 raw_f64              8.0000        994.3        950.2       7602.0       7602.0   12.973  ok
+  gauge_int               60 alp_vectorized       0.8333         69.1        236.3        197.0       1890.8    1.351  ok
+  gauge_int               60 alp_rd               0.8500         28.9        236.0        200.6       1888.1    1.378  ok
 
-gauge_dec2  (n=60, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           1.1333          3.8         25.0         30.9        200.4        -  ok
-  alp                  1.3833         14.7        148.2        205.1       1185.9    1.221  ok
-  gcd_delta_for        1.1333         40.1         78.8         89.3        630.0    1.000  ok
-  chimp128             4.0000          8.9         22.6         90.4        180.7    3.529  ok
-  bytesplit_zstd       5.7167          6.9         16.7         95.3        133.4    5.044  ok
-  raw_f64              8.0000        651.2        674.4       5394.9       5394.9    7.059  ok
-  alp_vectorized       1.3500         50.4         95.0        128.3        760.3    1.191  ok
-  alp_rd               1.3667         22.0         95.3        130.2        762.3    1.206  ok
+gauge_dec2  (n=60, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_dec2              60 production           1.1333          5.7         49.6         61.1        396.4        -  ok
+  gauge_dec2              60 alp                  1.3833         18.9        260.2        359.9       2081.6    1.221  ok
+  gauge_dec2              60 gcd_delta_for        1.1333         51.1        169.6        192.2       1356.5    1.000  ok
+  gauge_dec2              60 chimp128             4.0000         19.1         34.8        139.3        278.5    3.529  ok
+  gauge_dec2              60 bytesplit_zstd       5.7167          7.1         12.7         72.8        101.9    5.044  ok
+  gauge_dec2              60 raw_f64              8.0000        990.8        947.3       7578.6       7578.6    7.059  ok
+  gauge_dec2              60 alp_vectorized       1.3500         40.3        206.6        278.9       1652.6    1.191  ok
+  gauge_dec2              60 alp_rd               1.3667         23.8        206.4        282.1       1651.0    1.206  ok
 
-gauge_dec3  (n=60, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           1.5167          3.7         24.9         40.3        199.4        -  ok
-  alp                  1.7667         14.3        157.3        277.9       1258.5    1.165  ok
-  gcd_delta_for        1.5167         39.1         74.5        113.0        596.0    1.000  ok
-  chimp128             5.5333          8.0         15.6         86.1        124.5    3.648  ok
-  bytesplit_zstd       6.6833          6.5         72.8        486.8        582.7    4.407  ok
-  raw_f64              8.0000        648.3        666.6       5332.5       5332.5    5.275  ok
-  alp_vectorized       1.7333         44.4         89.0        154.4        712.4    1.143  ok
-  alp_rd               1.7500         19.9         89.5        156.6        715.8    1.154  ok
+gauge_dec3  (n=60, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_dec3              60 production           1.5167          5.5         48.1         77.7        384.4        -  ok
+  gauge_dec3              60 alp                  1.7667         17.5        259.2        457.9       2073.5    1.165  ok
+  gauge_dec3              60 gcd_delta_for        1.5167         50.3        158.2        240.0       1265.8    1.000  ok
+  gauge_dec3              60 chimp128             5.5333         16.0         23.3        128.8        186.3    3.648  ok
+  gauge_dec3              60 bytesplit_zstd       6.6833          6.9         22.2        148.1        177.2    4.407  ok
+  gauge_dec3              60 raw_f64              8.0000        993.7        947.3       7578.6       7578.6    5.275  ok
+  gauge_dec3              60 alp_vectorized       1.7333         33.6        189.2        327.9       1513.3    1.143  ok
+  gauge_dec3              60 alp_rd               1.7500         20.1        189.3        331.3       1514.3    1.154  ok
 
 noisy_float  (n=60, production val enc=17(raw_f64))
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           8.0000          2.7         33.0        267.6        264.3        -  ok
-  alp                  8.4833          6.0         40.8        346.3        326.6    1.060  ok
-  gcd_delta_for        8.0167         86.4        587.2       4707.6       4697.8    1.002  ok
-  chimp128             7.9833          6.3         10.5         83.6         83.8    0.998  ok
-  bytesplit_zstd       8.0167          6.0         73.3        587.6        586.4    1.002  ok
-  raw_f64              8.0000        648.3        665.6       5324.6       5324.6    1.000  ok
-  alp_vectorized       8.4333         14.6         45.6        384.7        365.0    1.054  ok
-  alp_rd               8.4333          8.5         35.8        302.1        286.6    1.054  ok
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  noisy_float             60 production           8.0000          3.6         59.1        478.9        473.0        -  ok
+  noisy_float             60 alp                  8.4833          6.6         67.7        574.1        541.4    1.060  ok
+  noisy_float             60 gcd_delta_for        8.0167        138.0        943.1       7560.3       7544.6    1.002  ok
+  noisy_float             60 chimp128             7.9833         13.0         16.7        133.7        134.0    0.998  ok
+  noisy_float             60 bytesplit_zstd       8.0167          6.7         22.3        178.7        178.3    1.002  ok
+  noisy_float             60 raw_f64              8.0000        991.1        950.2       7602.0       7602.0    1.000  ok
+  noisy_float             60 alp_vectorized       8.4333         11.9         81.8        689.7        654.2    1.054  ok
+  noisy_float             60 alp_rd               8.4333          8.8         63.9        538.9        511.2    1.054  ok
 
-constant  (n=60, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           0.0833          6.7         34.6          6.3        276.8        -  ok
-  alp                  0.0833         35.6        382.0         31.8       3055.9    1.000  ok
-  gcd_delta_for        0.1000         91.6        153.1         15.3       1224.9    1.200  ok
-  chimp128             1.2500         14.9         75.2         94.0        601.7   15.000  ok
-  bytesplit_zstd       0.4167         27.9         68.0         28.3        543.8    5.000  ok
-  raw_f64              8.0000        651.5        666.6       5332.5       5332.5   96.000  ok
-  alp_vectorized       0.0667        129.5        315.4         21.0       2523.2    0.800  ok
-  alp_rd               0.0833         60.7        314.5         26.2       2515.6    1.000  ok
+constant  (n=60, production val enc=18(alp))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  constant                60 production           0.0833         10.1         65.2         12.0        521.5        -  ok
+  constant                60 alp                  0.0833         45.1        529.0         44.1       4232.2    1.000  ok
+  constant                60 gcd_delta_for        0.1000         98.6        315.3         31.5       2522.7    1.200  ok
+  constant                60 chimp128             1.2500         31.8        123.3        154.2        986.7   15.000  ok
+  constant                60 bytesplit_zstd       0.4167         15.8         22.1          9.2        177.2    5.000  ok
+  constant                60 raw_f64              8.0000        994.6        950.3       7602.3       7602.3   96.000  ok
+  constant                60 alp_vectorized       0.0667         89.7        706.8         47.1       5654.2    0.800  ok
+  constant                60 alp_rd               0.0833         56.9        698.5         58.2       5587.6    1.000  ok
 
-sparse  (n=60, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           0.5333          5.7         32.0         20.3        256.2        -  ok
-  alp                  0.5333         23.7        212.6        113.4       1700.5    1.000  ok
-  gcd_delta_for        1.4833         54.6         79.6        118.1        637.1    2.781  ok
-  chimp128             1.8333         13.2         49.3         90.4        394.6    3.438  ok
-  bytesplit_zstd       1.3500         20.6         55.3         74.6        442.3    2.531  ok
-  raw_f64              8.0000        651.5        668.1       5344.9       5344.9   15.000  ok
-  alp_vectorized       1.3167         68.4        103.4        136.2        827.3    2.469  ok
-  alp_rd               1.3333         23.2        103.7        138.3        829.9    2.500  ok
+sparse  (n=60, production val enc=18(alp))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  sparse                  60 production           0.5333          8.5         59.0         37.3        471.6        -  ok
+  sparse                  60 alp                  0.5333         31.9        336.0        179.2       2688.3    1.000  ok
+  sparse                  60 gcd_delta_for        1.4833         67.8        158.7        235.5       1270.0    2.781  ok
+  sparse                  60 chimp128             1.8333         28.2         82.0        150.3        655.9    3.438  ok
+  sparse                  60 bytesplit_zstd       1.3500         14.1         20.9         28.2        167.1    2.531  ok
+  sparse                  60 raw_f64              8.0000        994.3        947.5       7580.4       7580.4   15.000  ok
+  sparse                  60 alp_vectorized       1.3167         65.0        207.5        273.3       1660.4    2.469  ok
+  sparse                  60 alp_rd               1.3333         28.2        206.9        275.9       1655.6    2.500  ok
 
 float_counter(ctrl)  (n=60, production val enc=16(gorilla))
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           7.1833          2.8          3.9         28.1         30.9        -  ok
-  alp                  8.3500          6.2         41.1        343.3        329.0    1.162  ok
-  gcd_delta_for        8.0167         73.1        590.1       4730.5       4720.7    1.116  ok
-  chimp128             6.8833          6.7         12.1         83.4         96.9    0.958  ok
-  bytesplit_zstd       7.3500         14.2         80.8        593.7        646.2    1.023  ok
-  raw_f64              8.0000        650.9        667.4       5338.8       5338.8    1.114  ok
-  alp_vectorized       8.3000         14.7         45.7        379.7        365.9    1.155  ok
-  alp_rd               8.3167          8.1         45.9        381.6        367.1    1.158  ok
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  float_counter(ctrl)     60 production           7.1833          3.5          6.7         48.7         53.5        -  ok
+  float_counter(ctrl)     60 alp                  8.3500          6.1         68.2        569.7        545.8    1.162  ok
+  float_counter(ctrl)     60 gcd_delta_for        8.0167        105.1        946.1       7584.2       7568.4    1.116  ok
+  float_counter(ctrl)     60 chimp128             6.8833         14.8         20.0        137.3        159.6    0.958  ok
+  float_counter(ctrl)     60 bytesplit_zstd       7.3500         11.6         22.8        167.4        182.2    1.023  ok
+  float_counter(ctrl)     60 raw_f64              8.0000        990.9        950.2       7601.7       7601.7    1.114  ok
+  float_counter(ctrl)     60 alp_vectorized       8.3000         10.1         82.0        680.9        656.2    1.155  ok
+  float_counter(ctrl)     60 alp_rd               8.3167          7.7         81.9        681.4        655.4    1.158  ok
 
-metricsbench_history  (n=60, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           2.4833          3.3         23.9         61.8        191.4        -  ok
-  alp                  5.1833          8.2        145.9        756.3       1167.2    2.087  ok
-  gcd_delta_for        2.4833         29.2         65.8        163.4        526.4    1.000  ok
-  chimp128             4.5833          8.6         19.5         89.3        155.8    1.846  ok
-  bytesplit_zstd       3.5500          7.4         68.5        243.1        547.8    1.430  ok
-  raw_f64              8.0000        646.3        665.6       5324.6       5324.6    3.221  ok
-  alp_vectorized       5.1333         22.0         57.7        296.4        462.0    2.067  ok
-  alp_rd               5.1500         10.9         58.0        298.7        464.1    2.074  ok
+metricsbench_history  (n=60, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  metricsbench_history    60 production           2.4833          4.3         45.4        117.3        363.2        -  ok
+  metricsbench_history    60 alp                  5.1833          8.6        286.5       1484.8       2291.6    2.087  ok
+  metricsbench_history    60 gcd_delta_for        2.4833         41.6        136.7        339.4       1093.4    1.000  ok
+  metricsbench_history    60 chimp128             4.5833         17.5         31.4        144.0        251.3    1.846  ok
+  metricsbench_history    60 bytesplit_zstd       3.5500          7.5         22.0         78.3        176.4    1.430  ok
+  metricsbench_history    60 raw_f64              8.0000        994.3        950.2       7602.0       7602.0    3.221  ok
+  metricsbench_history    60 alp_vectorized       5.1333         15.0        110.2        565.8        881.8    2.067  ok
+  metricsbench_history    60 alp_rd               5.1500         10.6        110.3        567.8        882.0    2.074  ok
 
 ======================= 500 samples per page =======================
-(metricsbench_history values: seed=927000933, n=500, drawn via metrics_stream_sample::sample_series, bounded to 8 series)
+(metricsbench_history values: seed=927000933, n=500, drawn via metrics_stream_sample::sample_series, 2 series joined end to end, at most 8)
 
-counter_int_resets  (n=500, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           1.0260          6.8         41.0         42.6        328.1        -  ok
-  alp                  1.0260         31.4        194.1        199.1       1552.6    1.000  ok
-  gcd_delta_for        1.2620         50.4         89.7        113.2        717.3    1.230  ok
-  chimp128             2.9120         18.7         32.6         95.1        261.2    2.838  ok
-  bytesplit_zstd       1.5140         30.5         49.0         74.2        392.0    1.476  ok
-  raw_f64              8.0000        779.5        845.0       6760.0       6760.0    7.797  ok
-  alp_vectorized       1.2580         87.2        118.6        149.3        949.2    1.226  ok
-  alp_rd               1.2600         13.6        118.8        149.7        950.4    1.228  ok
+counter_int_resets  (n=500, production val enc=18(alp))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  counter_int_resets     500 production           1.0260          9.4         82.0         85.1        655.8        -  ok
+  counter_int_resets     500 alp                  1.0260         35.9        367.8        377.3       2942.1    1.000  ok
+  counter_int_resets     500 gcd_delta_for        1.2620         59.9        178.1        224.8       1425.2    1.230  ok
+  counter_int_resets     500 chimp128             2.9120         37.7         52.5        152.9        420.1    2.838  ok
+  counter_int_resets     500 bytesplit_zstd       1.5140         34.2         59.2         89.7        473.7    1.476  ok
+  counter_int_resets     500 raw_f64              8.0000       1103.8       1087.2       8697.2       8697.2    7.797  ok
+  counter_int_resets     500 alp_vectorized       1.2580         71.8        232.7        292.7       1861.5    1.226  ok
+  counter_int_resets     500 alp_rd               1.2600         20.2        232.3        292.8       1858.8    1.228  ok
 
-gauge_int  (n=500, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           0.5140          7.8         35.8         18.8        286.1        -  ok
-  alp                  1.0120         31.9        203.6        206.1       1629.1    1.969  ok
-  gcd_delta_for        0.5140         58.8        111.4         57.3        891.2    1.000  ok
-  chimp128             2.5440         20.7         38.5         97.9        307.9    4.949  ok
-  bytesplit_zstd       0.9060         39.4         60.3         54.6        482.2    1.763  ok
-  raw_f64              8.0000        781.7        844.3       6754.5       6754.5   15.564  ok
-  alp_vectorized       1.0100         91.2        125.8        127.0       1006.1    1.965  ok
-  alp_rd               1.0120         30.5        126.4        127.9       1011.2    1.969  ok
+gauge_int  (n=500, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_int              500 production           0.5140         10.3         70.9         37.3        567.5        -  ok
+  gauge_int              500 alp                  1.0120         36.5        393.6        398.3       3148.6    1.969  ok
+  gauge_int              500 gcd_delta_for        0.5140         66.5        217.9        112.0       1742.8    1.000  ok
+  gauge_int              500 chimp128             2.5440         41.5         60.2        153.1        481.6    4.949  ok
+  gauge_int              500 bytesplit_zstd       0.9060         41.3         67.9         61.5        543.2    1.763  ok
+  gauge_int              500 raw_f64              8.0000       1104.2       1084.0       8672.1       8672.1   15.564  ok
+  gauge_int              500 alp_vectorized       1.0100         73.3        249.1        251.6       1992.9    1.965  ok
+  gauge_int              500 alp_rd               1.0120         32.7        250.2        253.2       2001.4    1.969  ok
 
-gauge_dec2  (n=500, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           1.0160          5.0         32.5         33.4        260.2        -  ok
-  alp                  1.3940         23.1        233.1        324.9       1864.5    1.372  ok
-  gcd_delta_for        1.0160         49.4         86.8         88.2        694.6    1.000  ok
-  chimp128             2.8720         19.8         33.3         95.5        266.1    2.827  ok
-  bytesplit_zstd       4.5920         29.0         49.5        227.4        396.2    4.520  ok
-  raw_f64              8.0000        779.1        844.8       6758.4       6758.4    7.874  ok
-  alp_vectorized       1.3880         60.6        104.4        144.9        835.0    1.366  ok
-  alp_rd               1.3900         29.0        105.3        146.3        842.2    1.368  ok
+gauge_dec2  (n=500, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_dec2             500 production           1.0160          7.3         66.7         68.6        534.0        -  ok
+  gauge_dec2             500 alp                  1.3940         24.6        412.4        574.9       3299.3    1.372  ok
+  gauge_dec2             500 gcd_delta_for        1.0160         57.7        189.0        192.0       1512.1    1.000  ok
+  gauge_dec2             500 chimp128             2.8720         35.6         51.9        149.0        415.1    2.827  ok
+  gauge_dec2             500 bytesplit_zstd       4.5920         35.1         56.4        259.2        451.5    4.520  ok
+  gauge_dec2             500 raw_f64              8.0000       1103.2       1086.9       8695.4       8695.4    7.874  ok
+  gauge_dec2             500 alp_vectorized       1.3880         43.2        226.0        313.7       1807.8    1.366  ok
+  gauge_dec2             500 alp_rd               1.3900         26.5        226.1        314.3       1808.8    1.368  ok
 
-gauge_dec3  (n=500, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           1.3920          4.9         31.7         44.5        253.5        -  ok
-  alp                  1.8940         20.5        233.3        441.9       1866.3    1.361  ok
-  gcd_delta_for        1.3920         47.7         81.9        114.1        655.5    1.000  ok
-  chimp128             4.2260         14.2         20.9         88.5        167.6    3.036  ok
-  bytesplit_zstd       5.8780         28.3         49.6        291.6        396.9    4.223  ok
-  raw_f64              8.0000        781.9        846.9       6775.3       6775.3    5.747  ok
-  alp_vectorized       1.8880         51.6         96.0        181.3        768.4    1.356  ok
-  alp_rd               1.8900         24.9         96.0        181.4        768.0    1.358  ok
+gauge_dec3  (n=500, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_dec3             500 production           1.3920          6.9         64.8         91.0        518.6        -  ok
+  gauge_dec3             500 alp                  1.8940         21.2        416.3        788.4       3330.3    1.361  ok
+  gauge_dec3             500 gcd_delta_for        1.3920         56.4        175.4        244.1       1402.8    1.000  ok
+  gauge_dec3             500 chimp128             4.2260         27.7         29.8        126.0        238.5    3.036  ok
+  gauge_dec3             500 bytesplit_zstd       5.8780         34.7         55.4        325.9        443.5    4.223  ok
+  gauge_dec3             500 raw_f64              8.0000       1104.0       1085.0       8680.2       8680.2    5.747  ok
+  gauge_dec3             500 alp_vectorized       1.8880         35.6        200.2        378.0       1601.8    1.356  ok
+  gauge_dec3             500 alp_rd               1.8900         22.7        201.0        379.8       1607.6    1.358  ok
 
 noisy_float  (n=500, production val enc=17(raw_f64))
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           8.0000          3.4         45.9        367.4        366.8        -  ok
-  alp                  8.4560          7.8         44.5        376.1        355.8    1.057  ok
-  gcd_delta_for        8.0020        251.6        714.1       5714.4       5713.0    1.000  ok
-  chimp128             7.9600          8.7         10.3         82.3         82.7    0.995  ok
-  bytesplit_zstd       7.5140         23.3         91.9        690.4        735.0    0.939  ok
-  raw_f64              8.0000        780.7        840.8       6726.3       6726.3    1.000  ok
-  alp_vectorized       8.4500         15.6         48.3        407.9        386.2    1.056  ok
-  alp_rd               7.5500          7.8         39.3        296.6        314.3    0.944  ok
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  noisy_float            500 production           8.0000          4.2         87.1        697.6        696.6        -  ok
+  noisy_float            500 alp                  8.4560          7.4         73.3        620.2        586.8    1.057  ok
+  noisy_float            500 gcd_delta_for        8.0020        289.9       1082.2       8660.0       8657.8    1.000  ok
+  noisy_float            500 chimp128             7.9600         17.2         16.6        132.1        132.8    0.995  ok
+  noisy_float            500 bytesplit_zstd       7.5140         29.3         87.3        656.0        698.4    0.939  ok
+  noisy_float            500 raw_f64              8.0000       1102.9       1087.2       8698.0       8698.0    1.000  ok
+  noisy_float            500 alp_vectorized       8.4500         12.2         85.4        721.4        683.0    1.056  ok
+  noisy_float            500 alp_rd               7.5500          8.4         70.2        529.9        561.5    0.944  ok
 
-constant  (n=500, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           0.0100         10.6         48.1          1.1        384.9        -  ok
-  alp                  0.0100         51.7        561.1          5.6       4489.1    1.000  ok
-  gcd_delta_for        0.0120        105.5        211.1          2.5       1688.8    1.200  ok
-  chimp128             1.1400         41.0         86.4         98.5        691.3  114.000  ok
-  bytesplit_zstd       0.0540        115.3        102.6          5.5        820.9    5.400  ok
-  raw_f64              8.0000        780.2        845.5       6763.6       6763.6  800.000  ok
-  alp_vectorized       0.0080        153.2        478.9          3.8       3831.2    0.800  ok
-  alp_rd               0.0100         76.8        478.7          4.8       3829.7    1.000  ok
+constant  (n=500, production val enc=18(alp))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  constant               500 production           0.0100         13.4         92.7          2.0        741.6        -  ok
+  constant               500 alp                  0.0100         55.1        637.0          6.4       5096.2    1.000  ok
+  constant               500 gcd_delta_for        0.0120        103.9        435.4          5.2       3483.3    1.200  ok
+  constant               500 chimp128             1.1400         97.8        136.2        155.2       1089.4  114.000  ok
+  constant               500 bytesplit_zstd       0.0540         84.2        102.8          5.6        822.6    5.400  ok
+  constant               500 raw_f64              8.0000       1104.2       1086.4       8691.6       8691.6  800.000  ok
+  constant               500 alp_vectorized       0.0080         93.8        957.0          7.7       7655.9    0.800  ok
+  constant               500 alp_rd               0.0100         63.2        952.4          9.5       7619.4    1.000  ok
 
-sparse  (n=500, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           0.4020          8.8         43.9         18.2        351.4        -  ok
-  alp                  0.4020         37.8        281.5        113.1       2251.7    1.000  ok
-  gcd_delta_for        1.3880         66.0         87.8        121.9        702.5    3.453  ok
-  chimp128             1.6820         31.3         54.5         91.7        436.4    4.184  ok
-  bytesplit_zstd       0.5840         39.2         51.6         30.1        412.7    1.453  ok
-  raw_f64              8.0000        778.8        843.8       6750.5       6750.5   19.900  ok
-  alp_vectorized       1.2580         86.7        118.5        149.1        948.3    3.129  ok
-  alp_rd               1.2600         28.6        118.8        149.7        950.2    3.134  ok
+sparse  (n=500, production val enc=18(alp))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  sparse                 500 production           0.4020         11.4         84.9         35.1        679.0        -  ok
+  sparse                 500 alp                  0.4020         42.4        432.9        174.0       3463.3    1.000  ok
+  sparse                 500 gcd_delta_for        1.3880         74.2        175.7        243.8       1405.3    3.453  ok
+  sparse                 500 chimp128             1.6820         67.3         81.5        137.1        652.0    4.184  ok
+  sparse                 500 bytesplit_zstd       0.5840         41.3         60.9         35.6        487.4    1.453  ok
+  sparse                 500 raw_f64              8.0000       1137.7       1110.5       8883.9       8883.9   19.900  ok
+  sparse                 500 alp_vectorized       1.2580         71.9        234.4        294.9       1875.1    3.129  ok
+  sparse                 500 alp_rd               1.2600         32.6        234.8        295.8       1878.0    3.134  ok
 
 float_counter(ctrl)  (n=500, production val enc=17(raw_f64))
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           8.0000          3.5         45.8        366.6        366.1        -  ok
-  alp                  8.3480          7.9         44.6        372.1        356.6    1.044  ok
-  gcd_delta_for        8.0020        244.0        718.0       5745.1       5743.6    1.000  ok
-  chimp128             6.4860         10.5         12.8         83.0        102.4    0.811  ok
-  bytesplit_zstd       6.4120         45.4        110.7        710.0        885.9    0.801  ok
-  raw_f64              8.0000        780.9        844.9       6759.4       6759.4    1.000  ok
-  alp_vectorized       8.3420         15.5         48.3        402.8        386.3    1.043  ok
-  alp_rd               7.2680          7.0         40.1        291.4        320.7    0.908  ok
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  float_counter(ctrl)    500 production           8.0000          4.1         86.4        692.2        691.2        -  ok
+  float_counter(ctrl)    500 alp                  8.3480          7.1         74.0        617.7        592.0    1.044  ok
+  float_counter(ctrl)    500 gcd_delta_for        8.0020        345.7       1106.3       8852.7       8850.5    1.000  ok
+  float_counter(ctrl)    500 chimp128             6.4860         21.8         21.0        136.2        168.0    0.811  ok
+  float_counter(ctrl)    500 bytesplit_zstd       6.4120         48.8         97.4        624.6        779.2    0.801  ok
+  float_counter(ctrl)    500 raw_f64              8.0000       1136.8       1109.7       8877.2       8877.2    1.000  ok
+  float_counter(ctrl)    500 alp_vectorized       8.3420         11.0         86.4        720.8        691.2    1.043  ok
+  float_counter(ctrl)    500 alp_rd               7.2680          7.5         71.9        522.4        575.1    0.908  ok
 
-metricsbench_history  (n=500, production val enc=?)
-  codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
-  production           2.2780          4.5         29.8         68.3        238.6        -  ok
-  alp                  5.0220         11.4        234.4       1177.4       1875.6    2.205  ok
-  gcd_delta_for        2.2780         38.5         71.8        163.4        574.0    1.000  ok
-  chimp128             4.4580         13.3         19.9         88.8        159.4    1.957  ok
-  bytesplit_zstd       2.8360         28.0         54.1        153.4        432.6    1.245  ok
-  raw_f64              8.0000        780.1        845.2       6761.2       6761.2    3.512  ok
-  alp_vectorized       5.0160         25.0         62.2        312.1        497.7    2.202  ok
-  alp_rd               5.0180         11.5         62.4        313.3        499.4    2.203  ok
+metricsbench_history  (n=500, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  metricsbench_history   500 production           2.2780          5.3         60.0        137.3        479.7        -  ok
+  metricsbench_history   500 alp                  5.0220         10.0        425.1       2134.6       3400.5    2.205  ok
+  metricsbench_history   500 gcd_delta_for        2.2780         51.2        149.8        341.3       1198.5    1.000  ok
+  metricsbench_history   500 chimp128             4.4580         28.5         30.4        135.3        242.8    1.957  ok
+  metricsbench_history   500 bytesplit_zstd       2.8360         33.3         62.2        176.4        497.7    1.245  ok
+  metricsbench_history   500 raw_f64              8.0000       1136.2       1112.2       8897.7       8897.7    3.512  ok
+  metricsbench_history   500 alp_vectorized       5.0160         15.9        118.2        593.0        945.8    2.202  ok
+  metricsbench_history   500 alp_rd               5.0180         10.8        118.1        592.4        944.5    2.203  ok
 
 ======================= adoption summary =======================
 rule: bytes <= 75% of production AND dec >= production dec AND bit-exact
-  n=60   counter_int_resets   adopt: none
-  n=60   gauge_int            adopt: none
-  n=60   gauge_dec2           adopt: none
-  n=60   gauge_dec3           adopt: none
-  n=60   noisy_float          adopt: none
-  n=60   constant             adopt: none
-  n=60   sparse               adopt: none
-  n=60   float_counter(ctrl)  adopt: none
-  n=60   metricsbench_history adopt: none
-  n=500  counter_int_resets   adopt: none
-  n=500  gauge_int            adopt: none
-  n=500  gauge_dec2           adopt: none
-  n=500  gauge_dec3           adopt: none
-  n=500  noisy_float          adopt: none
-  n=500  constant             adopt: none
-  n=500  sparse               adopt: none
-  n=500  float_counter(ctrl)  adopt: none
-  n=500  metricsbench_history adopt: none
+  counter_int_resets      60 adopt: none
+  gauge_int               60 adopt: none
+  gauge_dec2              60 adopt: none
+  gauge_dec3              60 adopt: none
+  noisy_float             60 adopt: none
+  constant                60 adopt: none
+  sparse                  60 adopt: none
+  float_counter(ctrl)     60 adopt: none
+  metricsbench_history    60 adopt: none
+  counter_int_resets     500 adopt: none
+  gauge_int              500 adopt: none
+  gauge_dec2             500 adopt: none
+  gauge_dec3             500 adopt: none
+  noisy_float            500 adopt: none
+  constant               500 adopt: none
+  sparse                 500 adopt: none
+  float_counter(ctrl)    500 adopt: none
+  metricsbench_history   500 adopt: none
 
-EXIT=0
+$ curl -sS -m 15 -o /dev/null -w 'HTTP_CODE=%{http_code}\n' https://arxiv.org/abs/2601.00695
+HTTP_CODE=200
+curl exit 0
