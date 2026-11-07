@@ -2684,9 +2684,10 @@ enum CatalogCommand {
         /// entry; the tail part, re-encoded on every fold that advances the
         /// watermark, carries the entries its previous leaves cover by one
         /// GET per leaf instead, and reads again each entry those leaves left
-        /// uncovered. Applies to `--signal spans` and to a logs tenant that
-        /// declares a key-index column or turns on trace-id indexing; other
-        /// signals ignore it.
+        /// uncovered. Applies to `--signal spans`, to a logs tenant that
+        /// declares a key-index column or turns on trace-id indexing, and to
+        /// `--signal metrics` with `--metrics-label-index`; metrics without
+        /// it ignores it.
         #[arg(long)]
         key_index_leaves: bool,
         /// With `--key-index-leaves`, the most (entry, key8) pairs, read and
@@ -2705,6 +2706,20 @@ enum CatalogCommand {
               default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
               value_parser = clap::value_parser!(u64).range(1..))]
         key_index_build_max_pairs: u64,
+        /// With `--key-index-leaves` or `--rebuild-key-index` and `--signal
+        /// metrics`, build the metrics `label_value` leaf (ADR-3694 decision
+        /// 2): every label name and value in each object's LABEL_DICT, keyed
+        /// by key8_str at block 0, so a probe names the objects holding a
+        /// string. Each entry costs a footer suffix GET (a second footer GET
+        /// when the footer is larger than the 8 KiB suffix) and one LABEL_DICT
+        /// range GET, none when the fold already holds the object whole for
+        /// its name postings. A part whose leaves would pass 1% of its
+        /// objects' bytes gets no leaf (`metrics_label_index_parts_over_cap`).
+        /// While any metrics erasure request is pending, no metrics leaf is
+        /// built (`metrics_label_index_parts_erasure_gated`). Off by default;
+        /// refused without `--key-index-leaves` or `--rebuild-key-index`.
+        #[arg(long)]
+        metrics_label_index: bool,
         /// Instead of folding, attach key-index leaves to the parts already in
         /// HEAD that lack a ref for a declared field (ADR-2707 decision 4,
         /// "Lifecycle"; docs/catalog-and-mvcc.md "Rollout"). Each such part is
@@ -2717,8 +2732,10 @@ enum CatalogCommand {
         /// gains no ref and is read again by a rerun (`parts_deferred`). Needs
         /// no `--key-index-leaves` (and refuses it), holds no claim and seals
         /// no hour, so `--writers-stopped` changes nothing here. Applies to
-        /// `--signal spans` and to a logs tenant that declares a key-index
-        /// field; a logs tenant that declares none is refused.
+        /// `--signal spans`, to a logs tenant that declares a key-index
+        /// field (a logs tenant that declares none is refused), and to
+        /// `--signal metrics` with `--metrics-label-index` (refused without
+        /// it), where the ranged reads are of LABEL_DICT instead of KEY_IDX.
         #[arg(long, conflicts_with_all = ["key_index_leaves", "max_flush_lifetime"])]
         rebuild_key_index: bool,
         /// With `--rebuild-key-index`, rebuild only this field. Refused unless
@@ -3205,6 +3222,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     rebuild_key_index: true,
                     field,
                     batch_entries,
+                    metrics_label_index,
                     json,
                     tenant_kms,
                     ..
@@ -3218,6 +3236,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             signal,
             field,
             batch_entries,
+            metrics_label_index,
             json,
         )
         .await
@@ -3232,12 +3251,13 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     writers_stopped,
                     key_index_leaves,
                     key_index_build_max_pairs,
+                    metrics_label_index,
                     snapshot_part_max_entries,
                     json,
                     tenant_kms,
                     ..
                 },
-        } => catalog::fold_with_key_index_budget(
+        } => catalog::fold_with_metrics_label_index(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
@@ -3248,6 +3268,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             writers_stopped,
             key_index_leaves,
             key_index_build_max_pairs,
+            metrics_label_index,
             snapshot_part_max_entries
                 .map(usize::try_from)
                 .transpose()

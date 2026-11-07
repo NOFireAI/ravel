@@ -2377,6 +2377,14 @@ pub(crate) fn metrics_label_index_leaf_bytes_cap(part_data_bytes: u64, ratio_ppm
     u64::try_from(cap).unwrap_or(u64::MAX)
 }
 
+/// What [`Catalog::metrics_label_index_erasure_gate`] found and the requests
+/// its listing issued.
+pub(crate) struct MetricsErasureGate {
+    pub(crate) gated: bool,
+    pub(crate) list_requests: u64,
+    pub(crate) get_requests: u64,
+}
+
 /// One part's leaf refs, sorted by (field, key8_lo), its uncovered
 /// (entry, field) count, and whether a field was left uncovered by the
 /// byte cap.
@@ -3234,26 +3242,11 @@ impl Catalog {
         // listing that fails) builds no new metrics leaf this fold. Parts
         // carried by reference keep the refs they already have.
         let metrics_erasure_gated = if signal == Signal::Metrics && key_index_fields.is_some() {
-            let erasure_accounting = QueryAccounting::new();
-            let pending = self
-                .list_pending_erasure(tenant, signal, &erasure_accounting)
-                .await;
-            let snapshot = erasure_accounting.snapshot();
-            let lists = snapshot.s3_requests(AccountedOp::List);
-            counters.list_requests += lists;
-            counters.metrics_label_index_erasure_list_requests += lists;
-            counters.get_requests += snapshot.s3_requests(AccountedOp::Get);
-            match pending {
-                Ok(pending) => !pending.is_empty(),
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        tenant = %tenant.to_hex(),
-                        "pending-erasure listing failed; this fold builds no metrics label_value leaf"
-                    );
-                    true
-                }
-            }
+            let gate = self.metrics_label_index_erasure_gate(tenant).await;
+            counters.list_requests += gate.list_requests;
+            counters.metrics_label_index_erasure_list_requests += gate.list_requests;
+            counters.get_requests += gate.get_requests;
+            gate.gated
         } else {
             false
         };
@@ -4979,6 +4972,37 @@ impl Catalog {
             self.config().postings_cache_entries,
         );
         Ok(Some(decoded.names.clone()))
+    }
+
+    /// ADR-3694 decision 2: a metrics leaf built while an erasure request is
+    /// pending would store key8s of the strings being erased. Lists the
+    /// tenant's pending metrics erasure once; any pending request, or a
+    /// listing that fails, gates the build.
+    pub(crate) async fn metrics_label_index_erasure_gate(
+        &self,
+        tenant: &TenantHash,
+    ) -> MetricsErasureGate {
+        let accounting = QueryAccounting::new();
+        let pending = self
+            .list_pending_erasure(tenant, Signal::Metrics, &accounting)
+            .await;
+        let snapshot = accounting.snapshot();
+        let gated = match pending {
+            Ok(pending) => !pending.is_empty(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    tenant = %tenant.to_hex(),
+                    "pending-erasure listing failed; no metrics label_value leaf is built"
+                );
+                true
+            }
+        };
+        MetricsErasureGate {
+            gated,
+            list_requests: snapshot.s3_requests(AccountedOp::List),
+            get_requests: snapshot.s3_requests(AccountedOp::Get),
+        }
     }
 
     /// The fold's name postings for `entries`: merged forward from the
