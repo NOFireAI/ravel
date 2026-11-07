@@ -364,6 +364,9 @@ next reserve rather than release before drop.
   run decode of an L1 part for a sub-hour window is measured in the same
   row and not changed here; decision 6 inherits it as a constraint.
 
+The whole-series batch amendment below replaces the run-list cut with a
+series-group cut.
+
 ### 5. Cost is read from the statement, and the fold state is stamped
 
 - The MetricsBench read-back records each of its sample queries'
@@ -493,7 +496,8 @@ stamped before the first statement and after any fold, five cold
 repetitions per statement (restart between), the MetricsBench harness and
 corpus at their frozen versions. "Holders" is the stamped number of
 objects that contain the statement's series. Rows 4 and 12 are read with
-the probe gate amendment's extra-GET allowance.
+the probe gate amendment's extra-GET allowance. Row 6 is read with the
+whole-series batch amendment's GET allowance.
 
 | check | target | miss | source |
 |---|---|---|---|
@@ -587,3 +591,31 @@ more than twice the PromQL fetch fan-out extra GETs per selector plan the
 router does not prune, so a statement with `P` such plans may pay up to
 `2 x fan-out x P`. The owner accepted this allowance on 2026-11-06, first
 per statement and then, once the gate became per plan, per selector plan.
+
+## Amendment (issue #3864): a batch is a group of whole series
+
+<!-- amendment-applies: sections="4. One fetch call reserves one batch, and a batch is released after its decode|Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)" pointer="whole-series batch amendment" -->
+
+Decision 4 cuts the coalesced run list into batches. A run list cannot
+be cut that way: a series' timestamp pages and value pages sit in
+different sections of the object, so a batch of runs would split a
+series across batches and its decode would need bytes that were
+already released. A batch is therefore a group of whole series, in
+catalog order, whose planned page bytes are at most `fetch_batch_bytes`,
+the fetch memory limit divided by twice the GET permits with an 8 MiB
+floor; a series larger than that is its own batch. Each batch is
+planned, coalesced and fetched by `ensure_ranges` into a `FetchedRegions`
+of its own, decoded into the sample fold, and dropped before the next
+batch reserves.
+
+- L0 segments are never batched, so `MAX_GETS_PER_L0_SEGMENT_FETCH` and
+  ADR-1306's per-flush law are unchanged.
+- On L1, `max_runs` stays unbounded per batch. Every batch after the
+  first can add one GET per page section the batch touches, so a
+  statement pays at most (page sections) x (batches - 1) extra scan
+  GETs over the unbatched call, and moves no more wire bytes, since a
+  batch boundary only removes a bridged gap.
+- Acceptance row 6 reads its scan GET bound as the unbatched call's
+  plus (page sections) x (batches - 1) per segment, wire bytes at most
+  the unbatched call's. The owner accepted this restatement on
+  2026-11-06.

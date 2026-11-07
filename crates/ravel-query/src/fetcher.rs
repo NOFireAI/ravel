@@ -321,6 +321,13 @@ pub const MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT: usize = 4;
 pub const MAX_GETS_PER_L0_SEGMENT_FETCH: u64 =
     1 + 1 + 2 + MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64;
 
+/// Smallest `fetch_batch_bytes` an L1 page fetch plans a batch against,
+/// whatever the memory budget and GET permits (ADR-3694, whole-series batch
+/// amendment): a batch is a group of whole series whose planned page bytes
+/// are at most the larger of this and the budget's limit over twice the GET
+/// permits.
+pub const FETCH_BATCH_FLOOR_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Object-size floor for taking the sparse catalog-probe path in
 /// [`SegmentFetcher::decode_selected`] instead of the whole-object fallback.
 /// A sparse (>=4096-series) v5 object lays its catalog sections
@@ -1128,6 +1135,11 @@ impl FetchStats {
 #[derive(Default)]
 struct FetchedRegions {
     buffers: Vec<(u64, Bytes)>,
+    /// Slices of another `FetchedRegions`' buffers (an L1 page batch borrowing
+    /// the bytes its segment's open and catalog fetch already hold). They are
+    /// refcounted views whose bytes stay under the lender's reservations, so
+    /// these regions hold no reservation for them.
+    borrowed: Vec<(u64, Bytes)>,
     /// Fetch-layer byte reservations (ADR-1170 decision 2) covering the GETs
     /// that filled `buffers`. Owned here so a reservation lives exactly as long
     /// as the fetched regions it accounts for: dropping this `FetchedRegions`
@@ -1147,15 +1159,43 @@ impl FetchedRegions {
         self.reservations.push(reservation);
     }
 
+    /// Regions for one L1 page batch: empty, except for the parts of `needed`
+    /// that `lender` already holds, borrowed rather than fetched again.
+    fn borrowing(lender: &FetchedRegions, needed: &[(u64, u64)]) -> Self {
+        let mut regions = FetchedRegions::default();
+        for &(start, end) in needed {
+            if let Some(bytes) = lender.slice(start, end.saturating_sub(start)) {
+                regions.borrowed.push((start, bytes));
+            }
+        }
+        regions
+    }
+
+    fn all_buffers(&self) -> impl Iterator<Item = &(u64, Bytes)> {
+        self.buffers.iter().chain(self.borrowed.iter())
+    }
+
+    /// Bytes of the buffers these regions fetched themselves, borrowed slices
+    /// excluded: the bytes their reservations must cover.
+    #[cfg(test)]
+    fn owned_bytes(&self) -> u64 {
+        self.buffers.iter().map(|(_, b)| b.len() as u64).sum()
+    }
+
+    /// Bytes the reservations these regions hold account for.
+    #[cfg(test)]
+    fn reserved_bytes(&self) -> u64 {
+        self.reservations.iter().map(|r| r.size()).sum()
+    }
+
     fn covers(&self, start: u64, end: u64) -> bool {
-        self.buffers
-            .iter()
+        self.all_buffers()
             .any(|(s, b)| *s <= start && end <= s.saturating_add(b.len() as u64))
     }
 
     fn slice(&self, offset: u64, len: u64) -> Option<Bytes> {
         let end = offset.checked_add(len)?;
-        self.buffers.iter().find_map(|(s, b)| {
+        self.all_buffers().find_map(|(s, b)| {
             if *s <= offset && end <= s.saturating_add(b.len() as u64) {
                 let start_rel = usize::try_from(offset - s).ok()?;
                 let end_rel = usize::try_from(end - s).ok()?;
@@ -1302,6 +1342,28 @@ pub struct SegmentFetcher {
     /// 4). `None`, the default, decodes inline on the calling task exactly as
     /// before the gate existed.
     read_gate: Option<std::sync::Arc<ReadGate>>,
+    /// [`FETCH_BATCH_FLOOR_BYTES`], lowered by unit tests so a fixture of a
+    /// few hundred KiB spans many batches.
+    fetch_batch_floor: u64,
+    /// Records each L1 page batch's reservations once its GETs complete,
+    /// before its decode, for the batch accounting tests.
+    #[cfg(test)]
+    batch_probe: Option<std::sync::Arc<std::sync::Mutex<Vec<BatchObservation>>>>,
+}
+
+/// What the fetch memory ledger held when one page batch's GETs had
+/// completed, before its decode. Test-only.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BatchObservation {
+    /// `MemoryBudget::reserved()` at that instant.
+    pub(crate) budget_reserved: u64,
+    /// Bytes the segment's own regions (open and catalog GETs) reserve.
+    pub(crate) segment_reserved: u64,
+    /// Bytes the batch's regions reserve.
+    pub(crate) batch_reserved: u64,
+    /// Bytes the batch's regions hold that they fetched themselves.
+    pub(crate) batch_owned: u64,
 }
 
 impl SegmentFetcher {
@@ -1320,7 +1382,40 @@ impl SegmentFetcher {
             label_sets_materialized: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             memory_budget: std::sync::Arc::new(ravel_memory::MemoryBudget::unlimited()),
             read_gate: None,
+            fetch_batch_floor: FETCH_BATCH_FLOOR_BYTES,
+            #[cfg(test)]
+            batch_probe: None,
         }
+    }
+
+    /// Lowers (or raises) the [`FETCH_BATCH_FLOOR_BYTES`] floor for a test.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_fetch_batch_floor(mut self, floor: u64) -> Self {
+        self.fetch_batch_floor = floor;
+        self
+    }
+
+    /// Installs a probe that records every page batch's reservations.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_batch_probe(
+        mut self,
+        probe: std::sync::Arc<std::sync::Mutex<Vec<BatchObservation>>>,
+    ) -> Self {
+        self.batch_probe = Some(probe);
+        self
+    }
+
+    /// The most planned page bytes one L1 page batch groups: the memory
+    /// budget's limit over twice the GET permits, never below
+    /// [`FETCH_BATCH_FLOOR_BYTES`]. A series whose own pages exceed it is a
+    /// batch of its own.
+    pub(crate) fn fetch_batch_bytes(&self) -> u64 {
+        let permits = u64::try_from(self.get_limiter.permits())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        (self.memory_budget.limit() / permits.saturating_mul(2)).max(self.fetch_batch_floor)
     }
 
     /// Runs this fetcher's catalog decodes on `gate` (ADR-1702 decision 4):
@@ -1492,6 +1587,29 @@ impl SegmentFetcher {
                 limit: e.limit,
                 cause: e.cause,
             })
+    }
+
+    /// Reserves the bytes one of `open_segment`'s GETs can return, before it is
+    /// issued: the suffix length for a suffix read (an upper bound on what it
+    /// returns), the object size for a whole-object read, the range length
+    /// otherwise. A cacheable read lands in the cache's ledger too when a
+    /// cache is configured, so the reservation is marked handed off then, as
+    /// `ensure_ranges` marks its runs.
+    fn reserve_open_get(
+        &self,
+        range: GetRange,
+        object_size: u64,
+    ) -> Result<ravel_memory::Reservation, FetchError> {
+        let (len, cacheable) = match range {
+            GetRange::Suffix(n) => (n, false),
+            GetRange::Full => (object_size, true),
+            GetRange::Range(start, end) => (end.saturating_sub(start), true),
+        };
+        let mut reservation = self.reserve_fetch(len)?;
+        if cacheable && self.cache.is_some() {
+            reservation.mark_handed_off();
+        }
+        Ok(reservation)
     }
 
     /// Reserves [`catalog_decode_len`] for `footer` before a catalog decode
@@ -2062,6 +2180,10 @@ impl SegmentFetcher {
                 let footer_len = self.suffix_len.min(seg_ref.object_size);
                 GetRange::Range(seg_ref.object_size - footer_len, seg_ref.object_size)
             };
+            // The first GET's bytes are reserved before it is issued and held
+            // by the regions it fills (ADR-1170 decision 2), so a budget
+            // smaller than the footer tail refuses here with zero GETs.
+            let first_reservation = self.reserve_open_get(first_range, seg_ref.object_size)?;
             let (first, first_cost) = self
                 .guarded_get(seg_ref, tenant_hash, first_range, None, accounting)
                 .await?;
@@ -2072,6 +2194,7 @@ impl SegmentFetcher {
             let total_size = first.total_size;
             let suffix_etag = first.etag.clone();
             let mut regions = FetchedRegions::default();
+            regions.hold_reservation(first_reservation);
             let first_start = total_size.saturating_sub(first.data.len() as u64);
             regions.insert(first_start, first.data.clone());
 
@@ -2087,6 +2210,8 @@ impl SegmentFetcher {
             let footer = match opened {
                 FooterOutcome::Ready(loc) => loc.footer,
                 FooterOutcome::NeedRange { offset, len } => {
+                    let chase = GetRange::Range(offset, offset + len);
+                    regions.hold_reservation(self.reserve_open_get(chase, total_size)?);
                     let (got, got_cost) = self
                         .guarded_get(
                             seg_ref,
@@ -2599,80 +2724,41 @@ impl SegmentFetcher {
         holds.map_err(|source| corrupt(key, source))
     }
 
-    /// Coalesced page ranges for the scalar runs of `scalar` (TS/VAL) and the
-    /// histogram runs of `histogram` (TS/HIST), fetched into `regions` in one
-    /// batch, so an L0 segment's page-range GETs stay within
-    /// [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] whichever kinds a query selects.
-    /// `plan_ranges_v4` fills each histogram run's `hist_range` (and leaves
-    /// `val_range` a `(0, 0)` sentinel). Returns the scalar and the histogram
-    /// plans, one entry per run.
+    /// Fetches the page `ranges` of one page batch into `regions` in one
+    /// `ensure_ranges` call of at most `max_runs` GETs. An L0 segment is one
+    /// batch, so its page-range GETs stay within
+    /// [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] whichever kinds a query selects;
+    /// an L1 part calls this once per batch of whole series
+    /// ([`SegmentFetcher::fetch_decoded`]).
     #[allow(clippy::too_many_arguments)]
     async fn fetch_pages(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
-        footer: &Footer,
-        scalar: &[&SeriesEntryV4],
-        histogram: &[&SeriesEntryV4],
+        ranges: &[(u64, u64)],
+        page_kind: &'static str,
+        series_count: usize,
+        max_runs: usize,
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
-    ) -> Result<
-        (
-            Vec<ravel_segment::PlannedRunRange>,
-            Vec<ravel_segment::PlannedRunRange>,
-        ),
-        FetchError,
-    > {
-        let page_kind = match (scalar.is_empty(), histogram.is_empty()) {
-            (false, true) => "scalar",
-            (true, false) => "histogram",
-            _ => "mixed",
-        };
+    ) -> Result<(), FetchError> {
         // See `open_segment`'s comment: recorded on this handle directly,
         // never through `tracing::Span::current()`.
         let span = tracing::debug_span!(
             "page_fetch",
             page_kind,
-            series_count = scalar.len() + histogram.len(),
+            series_count,
             s3_requests = tracing::field::Empty,
             s3_bytes = tracing::field::Empty,
         );
         async {
-            let key = seg_ref.data_object_key.as_str();
-            let plan = |series: &[&SeriesEntryV4]| {
-                if series.is_empty() {
-                    return Ok(Vec::new());
-                }
-                plan_ranges_v4(footer, series).map_err(|source| corrupt(key, source))
-            };
-            let scalar_planned = plan(scalar)?;
-            let histogram_planned = plan(histogram)?;
-            let page_ranges: Vec<(u64, u64)> = scalar_planned
-                .iter()
-                .flat_map(|p| {
-                    [
-                        (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
-                        (p.val_range.0, p.val_range.0 + p.val_range.1),
-                    ]
-                })
-                .chain(histogram_planned.iter().flat_map(|p| {
-                    [
-                        (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
-                        (p.hist_range.0, p.hist_range.0 + p.hist_range.1),
-                    ]
-                }))
-                .collect();
-            let max_runs = match seg_ref.level {
-                SegmentLevel::L0 => MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
-                SegmentLevel::L1 { .. } => usize::MAX,
-            };
             let cost = self
                 .ensure_ranges(
                     seg_ref,
                     tenant_hash,
                     suffix_etag,
-                    &page_ranges,
+                    ranges,
                     max_runs,
                     regions,
                     accounting,
@@ -2682,13 +2768,12 @@ impl SegmentFetcher {
             // `ensure_ranges` issued for this invocation, scoped to the span.
             span.record("s3_requests", cost.requests);
             span.record("s3_bytes", cost.bytes);
-            Ok((scalar_planned, histogram_planned))
+            Ok(())
         }
         .instrument(span.clone())
         .in_get_phase(QueryPhase::Scan.into())
         .await
     }
-
     /// Decodes one scalar run's TS/VAL pages into `timestamps`/`values`
     /// (appending), returning the VAL page kind for stats. Shared by the L0
     /// and L1 sample paths; reuses the caller's decompression `scratch`.
@@ -2773,9 +2858,174 @@ impl SegmentFetcher {
         Ok(added_bytes)
     }
 
-    /// Core of `fetch`/`fetch_soa`: decodes every matched scalar series into
-    /// one [`RunDecode`] per emitted unit, with resolved provenance keyed on
-    /// the segment level:
+    /// Core of every sample fetch: opens the segment, decodes its catalog,
+    /// and fetches and decodes the pages of the matched series of `kinds`,
+    /// handing each page batch's decoded units to `sink` in catalog order.
+    ///
+    /// An L0 segment is one batch. An L1 part is cut into batches of whole
+    /// series, in catalog order, whose planned page bytes are at most
+    /// [`fetch_batch_bytes`](Self::fetch_batch_bytes); a series larger than
+    /// that is a batch of its own (ADR-3694, whole-series batch amendment).
+    /// Each batch's pages are fetched into regions of its own, so its
+    /// reservation covers exactly its coalesced runs; the batch is decoded,
+    /// handed to `sink`, and its regions dropped, releasing the reservation,
+    /// before the next batch reserves. Bytes the open and catalog fetch
+    /// already hold are borrowed from the segment's regions, not fetched
+    /// again.
+    ///
+    /// Units are emitted per level as [`fetch_runs`](Self::fetch_runs)
+    /// describes. Histogram-kind series a scalar-only fetch drops are counted
+    /// on [`FetchStats::histogram_series_skipped`].
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_decoded<E, S>(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        kinds: PageKinds,
+        count_stats: bool,
+        accounting: &PhaseAccounting,
+        mut sink: S,
+    ) -> Result<FetchStats, E>
+    where
+        E: From<FetchError>,
+        S: FnMut(Vec<RunDecode>, Vec<RunHistogramDecode>) -> Result<(), E>,
+    {
+        let key = seg_ref.data_object_key.as_str();
+        let (footer, total_size, suffix_etag, mut regions) = self
+            .open_segment(tenant_hash, seg_ref, accounting.plan())
+            .await?;
+        let selected = self
+            .decode_selected(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                total_size,
+                &suffix_etag,
+                &mut regions,
+                matchers,
+                accounting.probe(),
+                accounting.dictionary_probe(),
+            )
+            .await?;
+        let wanted: Vec<&SeriesEntryV4> = selected
+            .iter()
+            .filter(|e| kinds.wants(e.entry.value_kind))
+            .collect();
+        let mut stats = FetchStats::default();
+        if kinds == PageKinds::Scalar {
+            // The catalog is already decoded and its value kinds already read,
+            // so the count of what this filter drops is free here and nowhere
+            // else: a caller that only ever sees the scalar result cannot
+            // reconstruct it (`FetchStats::histogram_series_skipped`).
+            stats.histogram_series_skipped = (selected.len() - wanted.len()) as u64;
+        }
+        if wanted.is_empty() {
+            return Ok(stats);
+        }
+        let scalar: Vec<&SeriesEntryV4> = wanted
+            .iter()
+            .copied()
+            .filter(|e| e.entry.value_kind == ValueKind::Scalar)
+            .collect();
+        let histogram: Vec<&SeriesEntryV4> = wanted
+            .iter()
+            .copied()
+            .filter(|e| e.entry.value_kind == ValueKind::Histogram)
+            .collect();
+        // `plan_ranges_v4` fills each histogram run's `hist_range` (and leaves
+        // `val_range` a `(0, 0)` sentinel); one plan entry per run, in series
+        // order.
+        let plan = |series: &[&SeriesEntryV4]| {
+            if series.is_empty() {
+                return Ok(Vec::new());
+            }
+            plan_ranges_v4(&footer, series).map_err(|source| corrupt(key, source))
+        };
+        let scalar_planned = plan(&scalar)?;
+        let histogram_planned = plan(&histogram)?;
+        let (batch_bytes, max_runs) = match seg_ref.level {
+            SegmentLevel::L0 => (u64::MAX, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT),
+            SegmentLevel::L1 { .. } => (self.fetch_batch_bytes(), usize::MAX),
+        };
+        for batch in page_batches(&wanted, &scalar_planned, &histogram_planned, batch_bytes) {
+            let scalar_entries = scalar.get(batch.scalar).unwrap_or(&[]);
+            let scalar_plans = scalar_planned.get(batch.scalar_plans).unwrap_or(&[]);
+            let histogram_entries = histogram.get(batch.histogram).unwrap_or(&[]);
+            let histogram_plans = histogram_planned.get(batch.histogram_plans).unwrap_or(&[]);
+            let ranges = page_ranges(scalar_plans, histogram_plans);
+            let page_kind = match (scalar_entries.is_empty(), histogram_entries.is_empty()) {
+                (false, true) => "scalar",
+                (true, false) => "histogram",
+                _ => "mixed",
+            };
+            let mut batch_regions = FetchedRegions::borrowing(&regions, &ranges);
+            self.fetch_pages(
+                seg_ref,
+                tenant_hash,
+                &ranges,
+                page_kind,
+                scalar_entries.len() + histogram_entries.len(),
+                max_runs,
+                &suffix_etag,
+                &mut batch_regions,
+                accounting.scan(),
+            )
+            .await?;
+            #[cfg(test)]
+            self.observe_batch(&regions, &batch_regions);
+            let scalar_out = if scalar_entries.is_empty() {
+                Vec::new()
+            } else {
+                let (out, batch_stats) = self.build_scalar_decodes(
+                    key,
+                    seg_ref,
+                    scalar_entries,
+                    scalar_plans,
+                    &batch_regions,
+                    count_stats,
+                    accounting.scan(),
+                )?;
+                stats.raw_f64_pages += batch_stats.raw_f64_pages;
+                stats.raw_f64_bytes += batch_stats.raw_f64_bytes;
+                out
+            };
+            let histogram_out = if histogram_entries.is_empty() {
+                Vec::new()
+            } else {
+                self.build_histogram_decodes(
+                    key,
+                    seg_ref,
+                    histogram_entries,
+                    histogram_plans,
+                    &batch_regions,
+                    accounting.scan(),
+                )?
+            };
+            sink(scalar_out, histogram_out)?;
+            drop(batch_regions);
+        }
+        Ok(stats)
+    }
+
+    /// Records one page batch's reservations on the test probe, if any.
+    #[cfg(test)]
+    fn observe_batch(&self, segment: &FetchedRegions, batch: &FetchedRegions) {
+        if let Some(probe) = &self.batch_probe {
+            probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(BatchObservation {
+                    budget_reserved: self.memory_budget.reserved(),
+                    segment_reserved: segment.reserved_bytes(),
+                    batch_reserved: batch.reserved_bytes(),
+                    batch_owned: batch.owned_bytes(),
+                });
+        }
+    }
+
+    /// Decodes every matched scalar series into one [`RunDecode`] per emitted
+    /// unit, with resolved provenance keyed on the segment level:
     ///
     /// - **L0**: one unit per series, all runs concatenated in on-disk order,
     ///   stamped with the segment's commit-record provenance
@@ -2803,66 +3053,23 @@ impl SegmentFetcher {
         count_stats: bool,
         accounting: &PhaseAccounting,
     ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
-        let key = &seg_ref.data_object_key;
-        let (footer, total_size, suffix_etag, mut regions) = self
-            .open_segment(tenant_hash, seg_ref, accounting.plan())
-            .await?;
-        let selected = self
-            .decode_selected(
-                seg_ref,
+        let mut runs = Vec::new();
+        let stats = self
+            .fetch_decoded(
                 tenant_hash,
-                &footer,
-                total_size,
-                &suffix_etag,
-                &mut regions,
+                seg_ref,
                 matchers,
-                accounting.probe(),
-                accounting.dictionary_probe(),
-            )
-            .await?;
-        let scalar: Vec<&SeriesEntryV4> = selected
-            .iter()
-            .filter(|e| e.entry.value_kind == ValueKind::Scalar)
-            .collect();
-        // The catalog is already decoded and its value kinds already read, so
-        // the count of what this filter drops is free here and nowhere else:
-        // a caller that only ever sees the scalar result cannot reconstruct it
-        // (`FetchStats::histogram_series_skipped`).
-        let skipped = (selected.len() - scalar.len()) as u64;
-        if scalar.is_empty() {
-            return Ok((
-                Vec::new(),
-                FetchStats {
-                    histogram_series_skipped: skipped,
-                    ..FetchStats::default()
+                PageKinds::Scalar,
+                count_stats,
+                accounting,
+                |scalar, _| {
+                    runs.extend(scalar);
+                    Ok::<(), FetchError>(())
                 },
-            ));
-        }
-        let (planned, _) = self
-            .fetch_pages(
-                seg_ref,
-                tenant_hash,
-                &footer,
-                &scalar,
-                &[],
-                &suffix_etag,
-                &mut regions,
-                accounting.scan(),
             )
             .await?;
-        let (runs, mut stats) = self.build_scalar_decodes(
-            key,
-            seg_ref,
-            &scalar,
-            &planned,
-            &regions,
-            count_stats,
-            accounting.scan(),
-        )?;
-        stats.histogram_series_skipped = skipped;
         Ok((runs, stats))
     }
-
     /// Decodes the already-fetched scalar page bytes of `scalar` into one
     /// [`RunDecode`] per emitted unit (see [`fetch_runs`](Self::fetch_runs)
     /// for the per-level emission contract). Split out so the scalar-only
@@ -3016,52 +3223,22 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &PhaseAccounting,
     ) -> Result<Vec<RunHistogramDecode>, FetchError> {
-        let key = &seg_ref.data_object_key;
-        let (footer, total_size, suffix_etag, mut regions) = self
-            .open_segment(tenant_hash, seg_ref, accounting.plan())
-            .await?;
-        let selected = self
-            .decode_selected(
-                seg_ref,
-                tenant_hash,
-                &footer,
-                total_size,
-                &suffix_etag,
-                &mut regions,
-                matchers,
-                accounting.probe(),
-                accounting.dictionary_probe(),
-            )
-            .await?;
-        let histogram: Vec<&SeriesEntryV4> = selected
-            .iter()
-            .filter(|e| e.entry.value_kind == ValueKind::Histogram)
-            .collect();
-        if histogram.is_empty() {
-            return Ok(Vec::new());
-        }
-        let (_, planned) = self
-            .fetch_pages(
-                seg_ref,
-                tenant_hash,
-                &footer,
-                &[],
-                &histogram,
-                &suffix_etag,
-                &mut regions,
-                accounting.scan(),
-            )
-            .await?;
-        self.build_histogram_decodes(
-            key,
+        let mut runs = Vec::new();
+        self.fetch_decoded(
+            tenant_hash,
             seg_ref,
-            &histogram,
-            &planned,
-            &regions,
-            accounting.scan(),
+            matchers,
+            PageKinds::Histogram,
+            false,
+            accounting,
+            |_, histogram| {
+                runs.extend(histogram);
+                Ok::<(), FetchError>(())
+            },
         )
+        .await?;
+        Ok(runs)
     }
-
     /// Histogram counterpart to
     /// [`build_scalar_decodes`](Self::build_scalar_decodes): decodes the
     /// already-fetched histogram page bytes of `histogram` into one
@@ -3187,8 +3364,8 @@ impl SegmentFetcher {
     /// from scratch; a PromQL/SQL prefetch needs both kinds off every segment,
     /// so calling the two in sequence opened and decoded each segment twice.
     /// This shares the one `open_segment` + `decode_selected`, then fetches
-    /// and decodes the scalar and histogram pages off the same `regions`,
-    /// returning byte-for-byte the same units the two separate calls did.
+    /// and decodes the scalar and histogram pages together, returning
+    /// byte-for-byte the same units the two separate calls did.
     async fn fetch_runs_and_histograms(
         &self,
         tenant_hash: TenantHash,
@@ -3197,76 +3374,25 @@ impl SegmentFetcher {
         count_stats: bool,
         accounting: &PhaseAccounting,
     ) -> Result<(Vec<RunDecode>, FetchStats, Vec<RunHistogramDecode>), FetchError> {
-        let key = &seg_ref.data_object_key;
-        let (footer, total_size, suffix_etag, mut regions) = self
-            .open_segment(tenant_hash, seg_ref, accounting.plan())
-            .await?;
-        let selected = self
-            .decode_selected(
-                seg_ref,
+        let mut scalar_runs = Vec::new();
+        let mut histogram_runs = Vec::new();
+        let stats = self
+            .fetch_decoded(
                 tenant_hash,
-                &footer,
-                total_size,
-                &suffix_etag,
-                &mut regions,
+                seg_ref,
                 matchers,
-                accounting.probe(),
-                accounting.dictionary_probe(),
+                PageKinds::Both,
+                count_stats,
+                accounting,
+                |scalar, histogram| {
+                    scalar_runs.extend(scalar);
+                    histogram_runs.extend(histogram);
+                    Ok::<(), FetchError>(())
+                },
             )
             .await?;
-        let scalar: Vec<&SeriesEntryV4> = selected
-            .iter()
-            .filter(|e| e.entry.value_kind == ValueKind::Scalar)
-            .collect();
-        let histogram: Vec<&SeriesEntryV4> = selected
-            .iter()
-            .filter(|e| e.entry.value_kind == ValueKind::Histogram)
-            .collect();
-
-        let (scalar_planned, histogram_planned) = if scalar.is_empty() && histogram.is_empty() {
-            (Vec::new(), Vec::new())
-        } else {
-            self.fetch_pages(
-                seg_ref,
-                tenant_hash,
-                &footer,
-                &scalar,
-                &histogram,
-                &suffix_etag,
-                &mut regions,
-                accounting.scan(),
-            )
-            .await?
-        };
-
-        let (scalar_out, stats) = if scalar.is_empty() {
-            (Vec::new(), FetchStats::default())
-        } else {
-            self.build_scalar_decodes(
-                key,
-                seg_ref,
-                &scalar,
-                &scalar_planned,
-                &regions,
-                count_stats,
-                accounting.scan(),
-            )?
-        };
-        let histogram_out = if histogram.is_empty() {
-            Vec::new()
-        } else {
-            self.build_histogram_decodes(
-                key,
-                seg_ref,
-                &histogram,
-                &histogram_planned,
-                &regions,
-                accounting.scan(),
-            )?
-        };
-        Ok((scalar_out, stats, histogram_out))
+        Ok((scalar_runs, stats, histogram_runs))
     }
-
     /// Returns the series (labels only, no samples) in this segment matching
     /// `matchers`. Used by the labels/label-values/series HTTP endpoints,
     /// which never need page data. Returns the folded per-series
@@ -3589,9 +3715,11 @@ impl SegmentFetcher {
     /// Phase-split counterpart of
     /// [`fetch_soa_and_histograms_accounted`](Self::fetch_soa_and_histograms_accounted)
     /// (issue #796); see [`fetch_series_phase_accounted`](Self::fetch_series_phase_accounted)
-    /// for why both forms exist. `engine.rs` calls this directly with a real,
-    /// persistent `PhaseAccounting` for end-to-end phase visibility;
-    /// `fetch_soa_and_histograms_accounted` is a thin wrapper over this that
+    /// for why both forms exist. `engine.rs` calls its streaming form,
+    /// [`fetch_soa_and_histograms_into`](Self::fetch_soa_and_histograms_into),
+    /// with a real, persistent `PhaseAccounting` for end-to-end phase
+    /// visibility; `fetch_soa_and_histograms_accounted` is a thin wrapper over
+    /// this that
     /// runs it against a [`PhaseAccounting::pooled_over`] its single
     /// `QueryAccounting` handle, so every GET records straight onto that one
     /// handle (live, as it is issued) and its callers (`ravel-sql`'s direct
@@ -3621,6 +3749,47 @@ impl SegmentFetcher {
                 .map(RunHistogramDecode::into_fetched)
                 .collect(),
         ))
+    }
+
+    /// Streaming form of
+    /// [`fetch_soa_and_histograms_phase_accounted`](Self::fetch_soa_and_histograms_phase_accounted):
+    /// hands each page batch's decoded scalar and histogram series to `sink`
+    /// as soon as the batch decodes, before the next batch reserves its fetch
+    /// memory, in catalog order. An L0 segment is one batch; an L1 part is
+    /// one call per batch of whole series (ADR-3694, whole-series batch
+    /// amendment). The concatenation of every call's series is what the
+    /// collecting form returns. An error from `sink` stops the fetch before
+    /// the next batch's GET.
+    pub(crate) async fn fetch_soa_and_histograms_into<E, S>(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
+        mut sink: S,
+    ) -> Result<FetchStats, E>
+    where
+        E: From<FetchError>,
+        S: FnMut(Vec<FetchedSeriesSoa>, Vec<FetchedHistogramSeries>) -> Result<(), E>,
+    {
+        self.fetch_decoded(
+            tenant_hash,
+            seg_ref,
+            matchers,
+            PageKinds::Both,
+            true,
+            accounting,
+            |runs, hist_runs| {
+                sink(
+                    runs.into_iter().map(RunDecode::into_soa).collect(),
+                    hist_runs
+                        .into_iter()
+                        .map(RunHistogramDecode::into_fetched)
+                        .collect(),
+                )
+            },
+        )
+        .await
     }
 }
 
@@ -3797,12 +3966,135 @@ fn verify_l1_identity(
     Ok(())
 }
 
+/// Which value kinds' pages a sample fetch decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageKinds {
+    Scalar,
+    Histogram,
+    Both,
+}
+
+impl PageKinds {
+    fn wants(self, kind: ValueKind) -> bool {
+        match self {
+            PageKinds::Scalar => kind == ValueKind::Scalar,
+            PageKinds::Histogram => kind == ValueKind::Histogram,
+            PageKinds::Both => kind == ValueKind::Scalar || kind == ValueKind::Histogram,
+        }
+    }
+}
+
+/// One page batch of a sample fetch: index ranges into the scalar and
+/// histogram series lists and into their plans (one plan entry per run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageBatch {
+    scalar: std::ops::Range<usize>,
+    scalar_plans: std::ops::Range<usize>,
+    histogram: std::ops::Range<usize>,
+    histogram_plans: std::ops::Range<usize>,
+}
+
+/// Cuts `wanted` (catalog order) into consecutive batches of whole series
+/// whose planned page bytes sum to at most `batch_bytes`; a series larger
+/// than `batch_bytes` is a batch of its own. `scalar_planned` and
+/// `histogram_planned` are the `plan_ranges_v4` output for `wanted`'s scalar
+/// and histogram series, one entry per run, in the same order.
+fn page_batches(
+    wanted: &[&SeriesEntryV4],
+    scalar_planned: &[ravel_segment::PlannedRunRange],
+    histogram_planned: &[ravel_segment::PlannedRunRange],
+    batch_bytes: u64,
+) -> Vec<PageBatch> {
+    let mut batches = Vec::new();
+    let (mut scalar, mut scalar_plans, mut histogram, mut histogram_plans) =
+        (0usize, 0usize, 0usize, 0usize);
+    let mut current = PageBatch {
+        scalar: 0..0,
+        scalar_plans: 0..0,
+        histogram: 0..0,
+        histogram_plans: 0..0,
+    };
+    let mut current_bytes = 0u64;
+    for entry in wanted {
+        let histogram_kind = entry.entry.value_kind == ValueKind::Histogram;
+        let (plans, start) = if histogram_kind {
+            (histogram_planned, histogram_plans)
+        } else {
+            (scalar_planned, scalar_plans)
+        };
+        let end = start.saturating_add(entry.runs.len()).min(plans.len());
+        let series_bytes: u64 = plans
+            .get(start..end)
+            .unwrap_or(&[])
+            .iter()
+            .map(|p| {
+                let pages = if histogram_kind {
+                    p.hist_range.1
+                } else {
+                    p.val_range.1
+                };
+                p.ts_range.1.saturating_add(pages)
+            })
+            .fold(0u64, u64::saturating_add);
+        let current_is_empty = current.scalar.is_empty() && current.histogram.is_empty();
+        if !current_is_empty && current_bytes.saturating_add(series_bytes) > batch_bytes {
+            batches.push(current);
+            current = PageBatch {
+                scalar: scalar..scalar,
+                scalar_plans: scalar_plans..scalar_plans,
+                histogram: histogram..histogram,
+                histogram_plans: histogram_plans..histogram_plans,
+            };
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(series_bytes);
+        if histogram_kind {
+            histogram += 1;
+            histogram_plans = end;
+            current.histogram.end = histogram;
+            current.histogram_plans.end = histogram_plans;
+        } else {
+            scalar += 1;
+            scalar_plans = end;
+            current.scalar.end = scalar;
+            current.scalar_plans.end = scalar_plans;
+        }
+    }
+    if !(current.scalar.is_empty() && current.histogram.is_empty()) {
+        batches.push(current);
+    }
+    batches
+}
+
+/// The page byte ranges of one batch's plans: TS and VAL for each scalar
+/// run, TS and HIST for each histogram run.
+fn page_ranges(
+    scalar_plans: &[ravel_segment::PlannedRunRange],
+    histogram_plans: &[ravel_segment::PlannedRunRange],
+) -> Vec<(u64, u64)> {
+    scalar_plans
+        .iter()
+        .flat_map(|p| {
+            [
+                (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
+                (p.val_range.0, p.val_range.0 + p.val_range.1),
+            ]
+        })
+        .chain(histogram_plans.iter().flat_map(|p| {
+            [
+                (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
+                (p.hist_range.0, p.hist_range.0 + p.hist_range.1),
+            ]
+        }))
+        .collect()
+}
+
 /// Sequential lookup of the planned byte ranges for one run of one series,
 /// for a caller that walks `planned` in exactly the order
 /// [`plan_ranges_v4`](ravel_segment::plan_ranges_v4) built it: the same
 /// series slice, in the same order, each series' runs in run order
 /// (`build_scalar_decodes` and `build_histogram_decodes` both do, over the
-/// identical `scalar`/`histogram` slice `fetch_pages` planned from). Each
+/// identical `scalar`/`histogram` slice `fetch_decoded` planned from). Each
 /// call advances past the entry it matches, so resolving every run of an
 /// N-entry plan costs O(N) total instead of the O(N^2) a fresh scan per run
 /// costs. A call whose expected entry does not match (a caller order
@@ -6491,7 +6783,12 @@ mod tests {
             !regions.covers(0, RUN),
             "the front of the object must not be covered by the footer tail read"
         );
-        assert_eq!(budget.reserved(), 0, "open_segment reserves nothing");
+        let opened = budget.reserved();
+        assert_eq!(
+            opened,
+            regions.reserved_bytes(),
+            "open_segment's GETs are reserved and the reservation is held by its regions"
+        );
         fetcher
             .ensure_ranges(
                 &seg_ref,
@@ -6506,7 +6803,7 @@ mod tests {
             .expect("ensure_ranges");
         assert_eq!(
             budget.reserved(),
-            RUN,
+            opened + RUN,
             "the reservation equals the coalesced run-length sum while the regions are held"
         );
         drop(regions);
@@ -6989,7 +7286,7 @@ mod tests {
             .expect("open segment");
 
         const RUN: u64 = 64;
-        assert_eq!(budget.reserved(), 0, "open_segment reserves nothing");
+        let opened_overlap = budget.handoff_overlap();
         fetcher
             .ensure_ranges(
                 &seg_ref,
@@ -7004,7 +7301,7 @@ mod tests {
             .expect("ensure_ranges");
         assert_eq!(
             budget.handoff_overlap(),
-            RUN,
+            opened_overlap + RUN,
             "ensure_ranges's reservation is marked handed off while a cache is \
              configured, since every coalesced run it fetched is now \
              cache-resident too"
@@ -7378,6 +7675,530 @@ mod tests {
         assert!(gets > MAX_GETS_PER_L0_SEGMENT_FETCH);
     }
 
+    /// An L1 part of `count` series named `b000`.., `samples` samples each, one
+    /// run per series; every fourth series is a native histogram when
+    /// `histograms`. Timestamps jitter and values are pseudo-random so every
+    /// series' pages carry real bytes.
+    fn batched_l1_segment(
+        count: usize,
+        samples: usize,
+        histograms: bool,
+    ) -> (Bytes, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([15u8; 16]);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let input_set_hash = [0x55u8; 32];
+        let meta = CompactionMetaV4 {
+            ingest_hour_bucket: 0,
+            input_set_hash,
+            part_index: 0,
+            level: 1,
+        };
+        const NS: i64 = 1_000_000_000;
+        let tenant_id = TenantId::new("t".to_string());
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut series: Vec<SeriesInputV7> = (0..count)
+            .map(|i| {
+                let name = format!("b{i:03}");
+                let label_set = labels(&name);
+                let id = SeriesId::compute(&tenant_id, &name, &label_set).expect("series id");
+                let mut ts_ns = 1_000 * NS;
+                let mut stamps = Vec::with_capacity(samples);
+                for _ in 0..samples {
+                    ts_ns += 15 * NS + (next() % 1_000_000) as i64;
+                    stamps.push(ts_ns);
+                }
+                let values = if histograms && i % 4 == 3 {
+                    SeriesValues::Histogram(
+                        stamps
+                            .iter()
+                            .map(|&ts_ns| HistogramSample {
+                                ts_ns,
+                                value: hist_value(1 + next() % 50, (next() % 1_000) as f64),
+                            })
+                            .collect(),
+                    )
+                } else {
+                    SeriesValues::Scalar(
+                        stamps
+                            .iter()
+                            .map(|&ts_ns| Sample {
+                                ts_ns,
+                                value: (next() % 1_000_000) as f64 / 7.0,
+                            })
+                            .collect(),
+                    )
+                };
+                let run = encode_run_v4(&id, 100, 0, 0, &values).expect("frame run");
+                SeriesInputV7 {
+                    series_id: id,
+                    labels: label_set,
+                    runs: vec![RunInputV7 {
+                        run,
+                        provenance: None,
+                    }],
+                }
+            })
+            .collect();
+        series.sort_by_key(|s| s.series_id.0);
+        let written =
+            SegmentWriter::write_v7_with_provenance(series, identity, bounds, meta, Vec::new())
+                .expect("write L1");
+        let seg_ref = SegmentRef {
+            data_object_key: "test/batched-l1.rseg".to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: 100,
+            level: SegmentLevel::L1 {
+                input_set_hash,
+                part_index: 0,
+            },
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (written.bytes, tenant_hash, seg_ref)
+    }
+
+    /// One `fetch_soa_and_histograms_phase_accounted` call over a counting
+    /// store: its decoded series (ids, timestamps and value bits, sorted by
+    /// series id), its phase accounting, every page batch the probe saw, and
+    /// every GET the store served.
+    struct BatchRun {
+        decoded: Result<String, FetchError>,
+        phases: crate::phase_accounting::PhaseAccountingSnapshot,
+        batches: Vec<BatchObservation>,
+        store_gets: u64,
+    }
+
+    impl BatchRun {
+        fn scan_gets(&self) -> u64 {
+            self.phases
+                .phase(QueryPhase::Scan)
+                .s3_requests(AccountedOp::Get)
+        }
+
+        fn scan_bytes(&self) -> u64 {
+            self.phases
+                .phase(QueryPhase::Scan)
+                .s3_bytes(AccountedOp::Get)
+        }
+
+        fn decoded(&self) -> &str {
+            self.decoded.as_deref().expect("the fetch answers")
+        }
+    }
+
+    async fn batch_run(
+        bytes: &Bytes,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        configure: impl FnOnce(SegmentFetcher) -> SegmentFetcher,
+    ) -> BatchRun {
+        let store = counting_store_of(bytes.clone(), &seg_ref.data_object_key, 512).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let probe = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fetcher = configure(SegmentFetcher::new(backend).with_batch_probe(Arc::clone(&probe)));
+        let phase = PhaseAccounting::new();
+        let decoded = fetcher
+            .fetch_soa_and_histograms_phase_accounted(tenant_hash, seg_ref, matchers, &phase)
+            .await
+            .map(|(mut scalar, _, mut histogram)| {
+                scalar.sort_by_key(|s| s.series_id.0);
+                histogram.sort_by_key(|s| s.series_id.0);
+                let scalar: Vec<_> = scalar
+                    .iter()
+                    .map(|s| {
+                        let bits: Vec<u64> = s.values.iter().map(|v| v.to_bits()).collect();
+                        (s.series_id, s.timestamps.clone(), bits)
+                    })
+                    .collect();
+                let histogram: Vec<_> = histogram
+                    .iter()
+                    .map(|s| (s.series_id, s.timestamps.clone(), format!("{:?}", s.values)))
+                    .collect();
+                format!("{scalar:?} {histogram:?}")
+            });
+        let batches = probe.lock().expect("probe").clone();
+        BatchRun {
+            decoded,
+            phases: phase.snapshot(),
+            batches,
+            store_gets: store.sequence_progress(0),
+        }
+    }
+
+    /// A ranged L1 fetcher at a zero coalesce gap: every selected page is
+    /// fetched by a page-range GET, and adjacent pages coalesce.
+    fn ranged_l1(fetcher: SegmentFetcher) -> SegmentFetcher {
+        fetcher
+            .with_whole_object_threshold(0)
+            .with_suffix_len(16)
+            .with_coalesce_gap(0)
+    }
+
+    const BATCH_PERMITS: usize = 16;
+
+    fn limiter(permits: usize) -> Arc<crate::GetLimiter> {
+        Arc::new(crate::GetLimiter::new(permits).expect("limiter"))
+    }
+
+    /// ADR-3694 decision 4 as the whole-series batch amendment restates it:
+    /// an L1 fetch reserves one batch of whole series at a time. The budget
+    /// below would fit the whole call (every selected page plus what the
+    /// segment holds outside its pages), so a whole-call reservation succeeds;
+    /// it is the peak this test bounds: never more than one batch's coalesced
+    /// bytes plus the segment's open and catalog regions and its decoded
+    /// catalog, no batch's bytes outliving its decode, and no batch holding a
+    /// byte it has not reserved.
+    #[tokio::test]
+    async fn one_call_never_reserves_more_than_one_batch() {
+        let (bytes, tenant_hash, seg_ref) = batched_l1_segment(64, 256, false);
+        let whole = batch_run(&bytes, tenant_hash, &seg_ref, &[], |f| {
+            ranged_l1(f).with_fetch_batch_floor(u64::MAX)
+        })
+        .await;
+        assert_eq!(
+            whole.batches.len(),
+            1,
+            "a floor above the part is one batch"
+        );
+        let one = &whole.batches[0];
+        assert!(
+            one.batch_owned <= one.batch_reserved,
+            "holds {} B against a reservation of {} B",
+            one.batch_owned,
+            one.batch_reserved
+        );
+        let page_bytes = whole.scan_bytes();
+        assert_eq!(
+            one.batch_reserved, page_bytes,
+            "the one batch reserves every page"
+        );
+        let regions = one.segment_reserved;
+        // The open and catalog regions plus the decoded catalog's reservation.
+        let catalog = one.budget_reserved - page_bytes;
+        assert!(catalog > regions, "the decoded catalog is reserved too");
+        let limit = page_bytes + catalog;
+        let batch_bytes = limit / (2 * BATCH_PERMITS as u64);
+        assert!(
+            page_bytes >= 20 * batch_bytes,
+            "the selected pages ({page_bytes} B) span at least 20 batches of {batch_bytes} B"
+        );
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let configure = |f: SegmentFetcher| {
+            ranged_l1(f)
+                .with_fetch_batch_floor(1)
+                .with_get_limiter(limiter(BATCH_PERMITS))
+                .with_memory_budget(Arc::clone(&budget))
+        };
+        assert_eq!(
+            configure(SegmentFetcher::new(Arc::new(MemoryStore::new()))).fetch_batch_bytes(),
+            batch_bytes
+        );
+        let batched = batch_run(&bytes, tenant_hash, &seg_ref, &[], configure).await;
+        for (i, b) in batched.batches.iter().enumerate() {
+            assert_eq!(
+                b.segment_reserved, regions,
+                "batch {i}: open and catalog regions"
+            );
+            assert_eq!(
+                b.budget_reserved,
+                catalog + b.batch_reserved,
+                "batch {i}: no earlier batch's reservation outlives its decode"
+            );
+            assert!(
+                b.budget_reserved <= batch_bytes + catalog,
+                "batch {i}: peak fetch reservation {} exceeds one batch ({batch_bytes} B) plus \
+                 the catalog ({catalog} B)",
+                b.budget_reserved
+            );
+            assert!(
+                b.batch_owned <= b.batch_reserved,
+                "batch {i}: holds {} B against a reservation of {} B",
+                b.batch_owned,
+                b.batch_reserved
+            );
+        }
+        assert!(
+            batched.batches.len() >= 20,
+            "{} batches",
+            batched.batches.len()
+        );
+        assert_eq!(
+            batched.decoded(),
+            whole.decoded(),
+            "bitwise the same samples"
+        );
+        assert_eq!(budget.reserved(), 0, "every batch released its reservation");
+    }
+
+    /// Batching costs at most one extra GET per page section a batch touches
+    /// and never moves more wire bytes than the unbatched call: a batch
+    /// boundary can only remove a bridged gap. Every series at a zero gap
+    /// bridges nothing, so the wire bytes are exactly the unbatched call's; a
+    /// selective mixed-kind fetch at a 512-byte gap stays inside both bounds.
+    #[tokio::test]
+    async fn batching_keeps_the_gets_and_wire_bytes() {
+        let (bytes, tenant_hash, seg_ref) = batched_l1_segment(96, 128, true);
+        let every_third: Vec<String> = (0..96).step_by(3).map(|i| format!("b{i:03}")).collect();
+        let selective = [LabelMatcher::regex("__name__", every_third.join("|")).expect("regex")];
+        // (case, matchers, coalesce gap, page sections the selection touches)
+        let cases: [(&str, &[LabelMatcher], u64, u64); 2] = [
+            ("every series, zero gap", &[], 0, 3),
+            ("every third series, 512-byte gap", &selective, 512, 3),
+        ];
+        for (label, matchers, gap, sections) in cases {
+            let whole = batch_run(&bytes, tenant_hash, &seg_ref, matchers, |f| {
+                ranged_l1(f)
+                    .with_coalesce_gap(gap)
+                    .with_fetch_batch_floor(u64::MAX)
+            })
+            .await;
+            assert_eq!(whole.batches.len(), 1, "{label}: reference is one batch");
+            let planned = whole.batches[0].batch_owned;
+            let limit = 2 * BATCH_PERMITS as u64 * (planned / 20).max(1);
+            let batched = batch_run(&bytes, tenant_hash, &seg_ref, matchers, |f| {
+                ranged_l1(f)
+                    .with_coalesce_gap(gap)
+                    .with_fetch_batch_floor(1)
+                    .with_get_limiter(limiter(BATCH_PERMITS))
+                    .with_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(limit)))
+            })
+            .await;
+            let batches = batched.batches.len() as u64;
+            assert!(batches >= 10, "{label}: {batches} batches");
+            assert_eq!(batched.decoded(), whole.decoded(), "{label}: same samples");
+            assert!(
+                batched.scan_gets() <= whole.scan_gets() + sections * (batches - 1),
+                "{label}: {} scan GETs over {batches} batches, unbatched {}",
+                batched.scan_gets(),
+                whole.scan_gets()
+            );
+            assert!(
+                batched.scan_bytes() <= whole.scan_bytes(),
+                "{label}: {} wire bytes, unbatched {}",
+                batched.scan_bytes(),
+                whole.scan_bytes()
+            );
+            if gap == 0 {
+                assert_eq!(
+                    batched.scan_bytes(),
+                    whole.scan_bytes(),
+                    "{label}: with no gap bridged, the same wire bytes"
+                );
+            }
+        }
+    }
+
+    /// A budget below one batch refuses that batch before its GET, naming the
+    /// batch's own bytes, and returns no partial result: the store serves the
+    /// open and catalog GETs and no page GET.
+    #[tokio::test]
+    async fn a_limit_below_one_batch_refuses_before_any_page_get() {
+        let (bytes, tenant_hash, seg_ref) = batched_l1_segment(64, 256, false);
+        let whole = batch_run(&bytes, tenant_hash, &seg_ref, &[], |f| {
+            ranged_l1(f).with_fetch_batch_floor(u64::MAX)
+        })
+        .await;
+        let page_bytes = whole.scan_bytes();
+        let catalog = whole.batches[0].budget_reserved - whole.batches[0].batch_reserved;
+        let floor = page_bytes / 8;
+        let fits = batch_run(&bytes, tenant_hash, &seg_ref, &[], |f| {
+            ranged_l1(f)
+                .with_fetch_batch_floor(floor)
+                .with_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(
+                    catalog + page_bytes,
+                )))
+        })
+        .await;
+        assert!(fits.batches.len() >= 8, "{} batches", fits.batches.len());
+        let first_batch = fits.batches[0].batch_reserved;
+        let open_and_catalog_gets = fits.store_gets - fits.scan_gets();
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(catalog + first_batch - 1));
+        let refused = batch_run(&bytes, tenant_hash, &seg_ref, &[], |f| {
+            ranged_l1(f)
+                .with_fetch_batch_floor(floor)
+                .with_memory_budget(Arc::clone(&budget))
+        })
+        .await;
+        match &refused.decoded {
+            Err(FetchError::FetchMemoryExhausted {
+                requested, limit, ..
+            }) => {
+                assert_eq!(
+                    *requested, first_batch,
+                    "the refusal names the batch's bytes"
+                );
+                assert_eq!(*limit, catalog + first_batch - 1);
+            }
+            other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+        }
+        assert!(refused.batches.is_empty(), "no batch was fetched");
+        assert_eq!(refused.scan_gets(), 0, "no page GET was accounted");
+        assert_eq!(
+            refused.store_gets, open_and_catalog_gets,
+            "the store served the open and catalog GETs and no page GET"
+        );
+        assert_eq!(budget.reserved(), 0, "the refusal holds nothing");
+    }
+
+    /// L0 is never batched: under a fetch share far below its pages an L0
+    /// fetch issues exactly the GETs and wire bytes it issues unbudgeted, one
+    /// batch, within the per-segment pin of `MAX_GETS_PER_L0_SEGMENT_FETCH`.
+    #[tokio::test]
+    async fn l0_is_one_batch_whatever_the_fetch_share() {
+        let (bytes, tenant_hash, seg_ref, order) = many_run_segment();
+        let alternate = order
+            .iter()
+            .step_by(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("|");
+        let matchers = [LabelMatcher::regex("__name__", alternate).expect("regex")];
+        // The first GET (16-byte tail), the footer chase, one catalog GET and
+        // the four bounded page-range GETs.
+        const GETS: u64 = 7;
+        let unbudgeted = batch_run(&bytes, tenant_hash, &seg_ref, &matchers, ranged_l1).await;
+        assert_eq!(unbudgeted.batches.len(), 1);
+        let pages = unbudgeted.batches[0].batch_reserved;
+        let held = unbudgeted.batches[0].segment_reserved + pages;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(2 * held));
+        let configure = |f: SegmentFetcher| {
+            ranged_l1(f)
+                .with_fetch_batch_floor(1)
+                .with_get_limiter(limiter(BATCH_PERMITS))
+                .with_memory_budget(Arc::clone(&budget))
+        };
+        let share =
+            configure(SegmentFetcher::new(Arc::new(MemoryStore::new()))).fetch_batch_bytes();
+        assert!(
+            share * 4 < pages,
+            "an L1 part of these pages would be cut into batches: share {share}, pages {pages}"
+        );
+        let budgeted = batch_run(&bytes, tenant_hash, &seg_ref, &matchers, configure).await;
+        assert_eq!(budgeted.batches.len(), 1, "one batch");
+        assert_eq!(unbudgeted.store_gets, GETS);
+        assert_eq!(budgeted.store_gets, GETS, "GETs");
+        assert!(budgeted.store_gets <= MAX_GETS_PER_L0_SEGMENT_FETCH);
+        assert_eq!(budgeted.scan_gets(), unbudgeted.scan_gets());
+        assert_eq!(budgeted.scan_bytes(), unbudgeted.scan_bytes(), "wire bytes");
+        assert_eq!(budgeted.decoded(), unbudgeted.decoded());
+    }
+
+    /// `open_segment` reserves each GET before issuing it and its regions hold
+    /// the reservation (ADR-1170 decision 2): the footer tail and the footer
+    /// chase on a ranged open, the whole object on a whole-object open. A
+    /// budget below the GET refuses before it, naming the GET's bytes.
+    #[tokio::test]
+    async fn open_segment_reserves_each_get_before_issuing_it() {
+        const TAIL: u64 = 16;
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let bytes = store
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get bytes")
+            .data;
+        let open = |budget: u64, threshold: u64| {
+            let bytes = bytes.clone();
+            let seg_ref = seg_ref.clone();
+            async move {
+                let counted = counting_store(bytes, &seg_ref.data_object_key).await;
+                let backend: Arc<dyn ObjectStoreBackend> = counted.clone();
+                let budget = Arc::new(ravel_memory::MemoryBudget::new(budget));
+                let fetcher = SegmentFetcher::new(backend)
+                    .with_whole_object_threshold(threshold)
+                    .with_suffix_len(TAIL)
+                    .with_memory_budget(Arc::clone(&budget));
+                let accounting = QueryAccounting::new();
+                let opened = fetcher
+                    .open_segment(tenant_hash, &seg_ref, &accounting)
+                    .await
+                    .map(|(_, _, _, regions)| regions);
+                let held = budget.reserved();
+                let get_bytes = accounting.snapshot().s3_bytes(AccountedOp::Get);
+                (
+                    opened,
+                    held,
+                    get_bytes,
+                    counted.sequence_progress(0),
+                    budget,
+                )
+            }
+        };
+
+        // Ranged: the tail GET and the footer chase, each reserved.
+        let (opened, held, get_bytes, gets, budget) = open(1 << 20, 0).await;
+        let regions = opened.expect("ranged open");
+        assert_eq!(gets, 2, "the tail and the footer chase");
+        assert_eq!(held, get_bytes, "every byte the open fetched is reserved");
+        assert_eq!(regions.reserved_bytes(), held, "and held by its regions");
+        drop(regions);
+        assert_eq!(budget.reserved(), 0);
+        let chase = get_bytes - TAIL;
+
+        // A budget below the tail refuses before the first GET.
+        let (opened, _, _, gets, _) = open(TAIL - 1, 0).await;
+        match opened {
+            Err(FetchError::FetchMemoryExhausted { requested, .. }) => {
+                assert_eq!(requested, TAIL);
+            }
+            other => panic!("expected FetchMemoryExhausted, got {:?}", other.err()),
+        }
+        assert_eq!(gets, 0, "no GET was issued");
+
+        // A budget that fits the tail but not the chase refuses the chase.
+        let (opened, _, _, gets, budget) = open(TAIL + chase - 1, 0).await;
+        match opened {
+            Err(FetchError::FetchMemoryExhausted { requested, .. }) => {
+                assert_eq!(requested, chase);
+            }
+            other => panic!("expected FetchMemoryExhausted, got {:?}", other.err()),
+        }
+        assert_eq!(gets, 1, "only the tail GET was issued");
+        assert_eq!(budget.reserved(), 0);
+
+        // Whole object: one GET of the object, reserved; one byte short refuses.
+        let (opened, held, _, gets, _) = open(1 << 20, u64::MAX).await;
+        assert_eq!(gets, 1);
+        assert_eq!(held, seg_ref.object_size);
+        drop(opened);
+        let (opened, _, _, gets, _) = open(seg_ref.object_size - 1, u64::MAX).await;
+        match opened {
+            Err(FetchError::FetchMemoryExhausted { requested, .. }) => {
+                assert_eq!(requested, seg_ref.object_size);
+            }
+            other => panic!("expected FetchMemoryExhausted, got {:?}", other.err()),
+        }
+        assert_eq!(gets, 0, "no GET was issued");
+    }
+
     #[test]
     fn fetched_regions_slice_is_zero_copy_within_one_buffer() {
         let mut regions = FetchedRegions::default();
@@ -7411,13 +8232,22 @@ mod tests {
     /// object key, so `sequence_progress(0)` faithfully counts the GETs a
     /// fetch issued (the same GET-counting trick as tests/fetch_multi_get.rs).
     async fn counting_store(bytes: Bytes, key: &str) -> Arc<FaultStore<MemoryStore>> {
+        counting_store_of(bytes, key, 64).await
+    }
+
+    /// [`counting_store`] counting up to `gets` GETs.
+    async fn counting_store_of(
+        bytes: Bytes,
+        key: &str,
+        gets: usize,
+    ) -> Arc<FaultStore<MemoryStore>> {
         let inner = MemoryStore::new();
         inner
             .put(key, bytes, PutOptions::default())
             .await
             .expect("put segment object");
         let mut seq = Sequence::new(Op::Get).with_key_contains(key);
-        for _ in 0..64 {
+        for _ in 0..gets {
             seq = seq.then_passthrough();
         }
         Arc::new(FaultStore::new(
