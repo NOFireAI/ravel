@@ -417,8 +417,8 @@ miss_reason = "fewer keyIndex GETs than objects above 512 KiB: one was read with
 # opened in the plan phase, absent key or not (log_fetcher.rs,
 # plan_segment_keyed and probe_segment_keyed), so segmentsOpened summed over
 # the phases counts the probed objects as well as the ones read past the
-# probe. Box C's q20 read 497 that way with 6 scan GETs, too few to open 497
-# objects past the probe. A 0 beside scan GETs is reported dead_counter.
+# probe. Box C's q20 read 497 that way: 493 in the plan phase and 4 in the
+# scan phase. A 0 beside scan GETs is reported dead_counter.
 [[row.figure]]
 name = "objects_past_probe"
 statement = "q20_hits"

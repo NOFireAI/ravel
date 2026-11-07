@@ -1637,24 +1637,27 @@ class Evaluate(Workdir):
 
     @staticmethod
     def box_c_q20_call():
-        """One cold q20 call on unfolded with box C's figures (#3692 comment 6698223574, the Stage 1
-        amendment's row 6): 970 keyIndex GETs, 6 GETs past the probe moving 989,537 B of scan wire, 497 objects
-        opened over every phase. Box C's summary gives the sum, not the split by phase; this case puts 496 in
-        the plan phase, the probed objects whose footer the KEY_IDX probe decoded, and 1 in the scan phase,
-        the holder read past the probe."""
-        def phase(name, gets=0, wire=0, opened=0):
+        """One cold q20 call on unfolded with box C's per-phase stats, as its calls.jsonl records try 0 (and
+        try 1 the same): run investigations-20261106T154511Z-47463-23195, build b54ecc52a. The plan phase
+        opened 493 objects with 493 GETs (the KEY_IDX probe's footer reads), the key index pruned 492 of them,
+        and the scan phase opened 4 with 6 GETs and 989,537 B; 497 over every phase."""
+        def phase(name, gets=0, wire=0, opened=0, cached=0):
             return {"phase": name, "s3GetRequests": gets, "s3GetWireBytes": wire, "s3ListRequests": 0,
-                    "segmentsOpened": opened, "decompressedOutputBytes": 0, "cacheServedBytes": 0}
+                    "segmentsOpened": opened, "decompressedOutputBytes": 0, "cacheServedBytes": cached}
         return {"statement": "q20_hits", "state": "unfolded", "temp": "cold", "try": 0, "outcome": "ok",
                 "truth_key": "hits.q20", "rows": 4, "wall_s": 3.0, "server_cpu_s": 1.0, "server_hwm_bytes": 1,
-                "stats": {"phases": [phase("resolve", 1, 33), phase("plan", 496, 4_063_232, 496), phase("probe"),
-                                     phase("scan", 6, 989_537, 1), phase("keyIndex", 970, 1_000_000)],
-                          "pruning": {"blocksScanned": 1, "segments": 523}, "io": {"dependencyDepth": 1},
-                          "signals": [{}]}}
+                "stats": {"phases": [phase("resolve", 1, 33, 0, 1_287_727), phase("plan", 493, 121_939_878, 493),
+                                     phase("probe"), phase("scan", 6, 989_537, 4, 262_144),
+                                     phase("keyIndex", 970, 1_322_842)],
+                          "pruning": {"blocksScanned": 5, "segments": 523, "segmentsPrunedByKeyIndex": 492,
+                                      "segmentsPrunedByStats": 26},
+                          "io": {"dependencyDepth": 1}, "signals": [{}]}}
 
     def check_row_6_objects_past_probe(self, evaluate_py=EVALUATE, bands=BANDS):
-        """Item 4: row 6's objects past the probe are the scan phase's segmentsOpened: 1 on box C's call,
-        where segmentsOpened summed over the phases reads 497."""
+        """Item 4: row 6's objects past the probe are the scan phase's segmentsOpened: 4 on box C's call,
+        where segmentsOpened summed over the phases reads 497. 4 still misses the band's holders (1), which
+        this does not change: the scan opened 4 objects, and the census holds 4 at or under 512 KiB, which
+        the keyed plan reads without a probe."""
         mod = load_module(evaluate_py, "evaluate_row6_past_probe")
         with open(bands, "rb") as f:
             rows = {"row": [r for r in tomllib.load(f)["row"] if r["key"] == "row_06"]}
@@ -1663,14 +1666,14 @@ class Evaluate(Workdir):
         calls = mod.Calls([c], problems, {"q20_hits": {"id": "q20_hits", "tenant": "hits"}})
         c["_judged"] = "reference"
         census = {("unfolded",): {"state": "unfolded", "census": {"tenants": {
-            "hits": {"data": {"logs": {"objects": 523, "objects_over_512k": 496}}}}}}}
+            "hits": {"data": {"logs": {"objects": 523, "objects_over_512k": 519}}}}}}}
         cfg = {"lane": "local", "hits": True, "tenant": "inv", "scales": [1], "baseline": False,
                "states": ["unfolded"], "cold_runs": 1, "warm_runs": 0}
         figs = {f["id"]: f for f in mod.run_rows(rows, cfg, {"unfolded": None}, calls, None, {}, census, None,
                                                    {}, {})}
         out = [] if not problems.lines else [f"problems {problems.lines}"]
         got = figs["row_06.objects_past_probe"]
-        if (got["value"], got["verdict"]) != (1, "pass"):
+        if (got["value"], got["verdict"]) != (4, "miss"):
             out.append(f"objects_past_probe {got['value']} {got['verdict']}")
         for name, value in (("gets_beyond_probe", 6), ("scan_wire_bytes", 989_537)):
             if (figs[f"row_06.{name}"]["value"], figs[f"row_06.{name}"]["verdict"]) != (value, "pass"):

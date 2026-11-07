@@ -524,9 +524,13 @@ Some bands, as transcribed:
   (`cold.max.scan_segments_opened`), not the sum over the phases: the keyed
   plan counts each object whose footer its KEY_IDX probe decoded as opened
   in the plan phase, absent key or not, so the sum counts the probed
-  objects too. Box C's q20 read 497 as that sum, with 6 GETs past the
-  probe; its case, with 496 opens in the plan phase and 1 in the scan
-  phase, reads 1 (`check_row_6_objects_past_probe`).
+  objects too. Box C's q20 (run
+  `investigations-20261106T154511Z-47463-23195`, its `calls.jsonl`) read
+  497 as that sum: 493 opened in the plan phase with 493 GETs, 492 of them
+  pruned by the key index, and 4 opened in the scan phase with 6 GETs and
+  989,537 B. The figure is 4 (`check_row_6_objects_past_probe`), which
+  still misses the band's holders (1); that tenant's census holds 4 objects
+  at or under 512 KiB, which the keyed plan reads without a probe.
 - Row 7, judged per build pass (the #3704 amendment's form, with the pass
   factor of the pass-end slice amendment): ranged section GETs
   (`key_index_ranged_gets`) at most 2 x (new + uncovered entries) x
