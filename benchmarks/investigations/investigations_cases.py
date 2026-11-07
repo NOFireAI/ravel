@@ -312,6 +312,59 @@ target_if = "v < 0"
 """
 
 
+BLAKE3_IV = (0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19)
+BLAKE3_PERM = (2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+
+
+def blake3_compress(cv, m, block_len, flags):
+    s = list(cv) + list(BLAKE3_IV[:4]) + [0, 0, block_len, flags]
+    rot = lambda x, n: ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF
+
+    def g(a, b, c, d, x, y):
+        s[a] = (s[a] + s[b] + x) & 0xFFFFFFFF
+        s[d] = rot(s[d] ^ s[a], 16)
+        s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+        s[b] = rot(s[b] ^ s[c], 12)
+        s[a] = (s[a] + s[b] + y) & 0xFFFFFFFF
+        s[d] = rot(s[d] ^ s[a], 8)
+        s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+        s[b] = rot(s[b] ^ s[c], 7)
+    for _ in range(7):
+        for i, (a, b, c, d) in enumerate(((0, 4, 8, 12), (1, 5, 9, 13), (2, 6, 10, 14), (3, 7, 11, 15),
+                                          (0, 5, 10, 15), (1, 6, 11, 12), (2, 7, 8, 13), (3, 4, 9, 14))):
+            g(a, b, c, d, m[2 * i], m[2 * i + 1])
+        m = [m[p] for p in BLAKE3_PERM]
+    return [s[i] ^ s[i + 8] for i in range(8)]
+
+
+def blake3_single_chunk(data):
+    """BLAKE3 of an input of at most one 1,024-byte chunk, unkeyed: the
+    blake3 crate's hash() for the short keys key8_str and key8_bytes take."""
+    assert len(data) <= 1024
+    blocks = [data[i:i + 64] for i in range(0, len(data), 64)] or [b""]
+    cv = BLAKE3_IV
+    for n, block in enumerate(blocks):
+        flags = (1 if n == 0 else 0) | (2 | 8 if n == len(blocks) - 1 else 0)
+        words = [int.from_bytes(block.ljust(64, b"\0")[i:i + 4], "little") for i in range(0, 64, 4)]
+        cv = blake3_compress(cv, words, len(block), flags)
+    return b"".join(w.to_bytes(4, "little") for w in cv)
+
+
+def key8(kind, v):
+    """The 8-byte key a KEY_IDX probe sorts and dedups on
+    (crates/ravel-codec/src/key_idx.rs): an Id16's high 8 bytes, a string's
+    or bytes' blake3[..8], an i64's big-endian v ^ 1<<63."""
+    if kind == "id16":
+        return bytes.fromhex(v)[:8]
+    if kind == "str":
+        return blake3_single_chunk(v.encode())[:8]
+    if kind == "bytes":
+        return blake3_single_chunk(v)[:8]
+    if kind == "i64":
+        return ((v & 0xFFFFFFFFFFFFFFFF) ^ (1 << 63)).to_bytes(8, "big")
+    raise ValueError(kind)
+
+
 MATRIX_BANDS = PASS_BANDS + """
 [[row]]
 key = "row_t2"
@@ -782,8 +835,6 @@ class Statements(unittest.TestCase):
                 self.assertEqual(ids[len(top)], extra, field)
             if field == "request_id":
                 self.assertTrue(all(p.startswith("req-over-cap-absent-") for p in pad), pad[:3])
-            else:
-                self.assertEqual(pad, [f"{j:032x}" for j in range(1, len(pad) + 1)])
             for key in answers:
                 over, base = self.truth["answers"][key.format(1025)], self.truth["answers"][key.format(1001)]
                 self.assertEqual(over["rows"], base["rows"], key)
@@ -793,6 +844,42 @@ class Statements(unittest.TestCase):
         # 25 trace ids are padding and the request id list gains its extra.
         self.assertIsNone(self.truth["control_extra"]["trace_id"])
         self.assertIsNotNone(self.truth["control_extra"]["request_id"])
+
+    def test_blake3_matches_the_reference_vectors(self):
+        # key_idx.rs pins blake3("")[..8]; the rest are the BLAKE3 test
+        # vectors (input bytes i % 251) at one block, two blocks and a chunk
+        # less one byte.
+        for data, want in ((b"", "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"),
+                           (b"abc", "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"),
+                           (bytes(i % 251 for i in range(1023)),
+                            "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11")):
+            self.assertEqual(blake3_single_chunk(data).hex(), want, len(data))
+        self.assertEqual(key8("i64", 0), bytes([0x80] + [0] * 7))
+        self.assertEqual(key8("i64", -1), bytes([0x7f] + [0xff] * 7))
+        self.assertEqual(key8("id16", "0102030405060708090a0b0c0d0e0f10"), bytes(range(1, 9)))
+
+    def test_over_cap_lists_hold_over_1024_distinct_key8(self):
+        # KeySet::new (key_index_route.rs) sorts and dedups the IN list's
+        # key8s and refuses only above KEY_SET_MAX_KEYS, so a 1,025-key list
+        # whose padding shares key8s is a key set under the cap and row 11's
+        # over-cap control never runs. Kills trace padding that differs only
+        # in the low 8 bytes (every one key8 0) and padding whose key8 is a
+        # listed id's.
+        kinds = {"trace_id": "id16", "request_id": "str"}
+        for field, ids in self.truth["over_cap"].items():
+            distinct = len({key8(kinds[field], v) for v in ids})
+            self.assertGreater(distinct, self.inv.KEY_SET_MAX_KEYS, field)
+            self.assertEqual(distinct, len(ids), field)
+        self.assertEqual(set(self.truth["over_cap"]), set(kinds))
+        # A corpus whose largest list is smaller takes more padding: the
+        # whole 1,025 of either field is key8-distinct on its own.
+        for field, kind in kinds.items():
+            pad = self.inv.over_cap_padding(field, self.inv.OVER_CAP_KEYS, [])
+            self.assertEqual(len({key8(kind, v) for v in pad}), self.inv.OVER_CAP_KEYS, field)
+        # The small corpus has no trace outside the list (control_extra is a
+        # held id the list lacks), so padding key8-distinct from the list is
+        # padding the corpus does not hold.
+        self.assertIsNone(self.truth["control_extra"]["trace_id"])
 
     def test_erasure_victim_needs_a_corpus_with_an_unread_row(self):
         # The small corpus's 1000-key lists name every trace, so it has no

@@ -351,14 +351,20 @@ KEY_SET_MAX_KEYS = 1024
 OVER_CAP_KEYS = KEY_SET_MAX_KEYS + 1
 
 
-def over_cap_padding(field, n):
-    """n ids of `field` the corpus does not hold. gen_corpus.py writes request
-    ids as req-<16 hex>-<row> or req-planted-*, so req-over-cap-absent-* is
-    never one. Trace ids are random 128-bit draws, so the integers 1 to n are
-    held only by a draw that hits one of them."""
+def over_cap_padding(field, n, ids):
+    """n ids of `field` the corpus does not hold, each with a key8 (the 8 bytes
+    a KEY_IDX probe sorts and dedups on, crates/ravel-codec/src/key_idx.rs)
+    no other padding id shares. gen_corpus.py writes request ids as
+    req-<16 hex>-<row> or req-planted-*, so req-over-cap-absent-* is never
+    one, and their key8 is a blake3 prefix. A trace id is an Id16 whose key8
+    is its high 8 bytes, so padding j holds j there and zeros below; a random
+    128-bit draw is that id only by hitting it exactly, and j is skipped when
+    a listed id in `ids` already holds the same high 8 bytes."""
     if field == "trace_id":
-        return [f"{j:032x}" for j in range(1, n + 1)]
-    return [f"req-over-cap-absent-{j:04d}" for j in range(1, n + 1)]
+        taken = {i[:16] for i in ids}
+        highs = (f"{j:016x}" for j in range(1, n + len(taken) + 1))
+        return [h + "0" * 16 for h in highs if h not in taken][:n]
+    return [p for p in (f"req-over-cap-absent-{j:04d}" for j in range(1, n + len(ids) + 1)) if p not in ids][:n]
 
 
 def add_over_cap(truth):
@@ -381,7 +387,7 @@ def add_over_cap(truth):
         ids = list(lists[field][sizes[-1]])
         if extra.get(field):
             ids.append(extra[field])
-        ids += [p for p in over_cap_padding(field, OVER_CAP_KEYS) if p not in ids][:OVER_CAP_KEYS - len(ids)]
+        ids += over_cap_padding(field, OVER_CAP_KEYS - len(ids), ids)
         out[field] = ids
         for key in keys:
             src = answers.get(key.format(top + 1))

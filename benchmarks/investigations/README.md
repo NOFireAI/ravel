@@ -603,12 +603,18 @@ Some bands, as transcribed:
   generator's `control_extra` key (one the list does not hold) and ids the
   corpus does not hold up to 1,025 (`truth.json` `over_cap`): request ids
   `req-over-cap-absent-NNNN`, which the generator's `req-<16 hex>-<row>`
-  and `req-planted-*` forms never produce, and the trace ids 1, 2, 3 and on
-  as 128-bit integers, as many as the list needs (24 beside a
-  `control_extra` key, 25 when the 1,000-key list already names every
-  trace), which a random 128-bit draw lands on with negligible
-  odds and which, if one did, would add rows and read as a wrong answer,
-  not a pass. The padding adds no row, so the oracle (`in_trace_id.1025.*`,
+  and `req-planted-*` forms never produce, and trace ids whose high 8
+  bytes are 1, 2, 3 and on and whose low 8 bytes are zero, as many as the
+  list needs (24 beside a `control_extra` key, 25 when the 1,000-key list
+  already names every trace), skipping a high half a listed id already
+  holds. The planner dedups a list on each key's key8 before it counts the
+  keys (`KeySet::new`), and an Id16's key8 is its high 8 bytes, so padding
+  that differed only in the low half would be one key and leave the list
+  under the cap; every over-cap list holds 1,025 distinct key8s
+  (`test_over_cap_lists_hold_over_1024_distinct_key8`). A random 128-bit
+  draw lands on a padding id with negligible odds and, if one did, would
+  add rows and read as a wrong answer, not a pass. The padding adds no row,
+  so the oracle (`in_trace_id.1025.*`,
   `in_request_id.1025`) is the generator's answer for the 1,000-key list
   plus `control_extra`. The current build admits the list and does not
   route it: the SQL complexity guard charges a flat literal list one unit
