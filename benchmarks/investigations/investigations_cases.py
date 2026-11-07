@@ -1742,10 +1742,10 @@ class Evaluate(Workdir):
                           "io": {"dependencyDepth": 1}, "signals": [{}]}}
 
     def check_row_6_objects_past_probe(self, evaluate_py=EVALUATE, bands=BANDS):
-        """Item 4: row 6's objects past the probe are the scan phase's segmentsOpened: 4 on box C's call,
-        where segmentsOpened summed over the phases reads 497. 4 still misses the band's holders (1), which
-        this does not change: the scan opened 4 objects, and the census holds 4 at or under 512 KiB, which
-        the keyed plan reads without a probe."""
+        """Row 6's objects past the probe are the plan phase's segmentsOpened less
+        segmentsPrunedByKeyIndex: 493 - 492 = 1 on box C's call, the band's holders, so a pass. Neither the
+        scan phase's segmentsOpened (4) nor the sum over the phases (497) is that figure, and a build whose
+        stats carry no segmentsPrunedByKeyIndex reads unsupported-on-this-build."""
         mod = load_module(evaluate_py, "evaluate_row6_past_probe")
         with open(bands, "rb") as f:
             rows = {"row": [r for r in tomllib.load(f)["row"] if r["key"] == "row_06"]}
@@ -1761,13 +1761,19 @@ class Evaluate(Workdir):
                                                    {}, {})}
         out = [] if not problems.lines else [f"problems {problems.lines}"]
         got = figs["row_06.objects_past_probe"]
-        if (got["value"], got["verdict"]) != (4, "miss"):
+        if (got["value"], got["verdict"]) != (1, "pass"):
             out.append(f"objects_past_probe {got['value']} {got['verdict']}")
         for name, value in (("gets_beyond_probe", 6), ("scan_wire_bytes", 989_537)):
             if (figs[f"row_06.{name}"]["value"], figs[f"row_06.{name}"]["verdict"]) != (value, "pass"):
                 out.append(f"{name} {figs[f'row_06.{name}']}")
         if mod.call_metrics(c)["segments_opened"] != 497:
             out.append(f"segmentsOpened summed {mod.call_metrics(c)['segments_opened']}")
+        if mod.call_metrics(c)["scan_segments_opened"] != 4:
+            out.append(f"scan segmentsOpened {mod.call_metrics(c)['scan_segments_opened']}")
+        del c["stats"]["pruning"]["segmentsPrunedByKeyIndex"]
+        got = mod.statement_figure(calls, cfg, "q20_hits", "unfolded", "cold.max.probe_survivors")
+        if got[0] != UNSUPPORTED:
+            out.append(f"probe_survivors without segmentsPrunedByKeyIndex {got}")
         return out
 
     def test_row_6_objects_past_probe(self):
@@ -3232,6 +3238,11 @@ FLIPS = {
         "    if rest == \"leaf_wall_p50_s\":\n        for c in []:\n",
         "check_row_18_uncovered",
     ),
+    "row 6's probe survivors read from the scan phase's segmentsOpened": (
+        '            v = m["plan_segments_opened"] - pruned\n',
+        '            v = m["scan_segments_opened"]\n',
+        "check_row_6_objects_past_probe",
+    ),
     "a phase's segmentsOpened read as every phase's": (
         '        v[f"{p.lower()}_segments_opened"] = ph[p]["segmentsOpened"]\n',
         '        v[f"{p.lower()}_segments_opened"] = sum(ph[q]["segmentsOpened"] for q in PHASES)\n',
@@ -3446,8 +3457,13 @@ BAND_FLIPS = {
         "check_row_7_rebuild",
     ),
     "row 6's objects past the probe read from segmentsOpened over every phase": (
-        'metric = "cold.max.scan_segments_opened"\n',
+        'metric = "cold.max.probe_survivors"\n',
         'metric = "cold.max.segments_opened"\n',
+        "check_row_6_objects_past_probe",
+    ),
+    "row 6's objects past the probe read from the scan phase's segmentsOpened": (
+        'metric = "cold.max.probe_survivors"\n',
+        'metric = "cold.max.scan_segments_opened"\n',
         "check_row_6_objects_past_probe",
     ),
     "row 18's bound without its noise": (

@@ -355,9 +355,10 @@ def call_metrics(c):
     for p in PHASES:
         v[f"{p.lower()}_gets"] = ph[p]["s3GetRequests"]
         v[f"{p.lower()}_wire_bytes"] = ph[p]["s3GetWireBytes"]
-        # The logs keyed plan counts every object whose footer its KEY_IDX
-        # probe decoded as opened in the plan phase, absent key or not; an
-        # object read past the probe is opened again in the scan phase.
+        # The logs keyed plan counts every object whose KEY_IDX footer it
+        # probed as opened in the plan phase, absent key or not. The scan
+        # phase's count is not the probe's survivors: an object at or under
+        # 512 KiB is not probed and can still be opened by the scan.
         v[f"{p.lower()}_segments_opened"] = ph[p]["segmentsOpened"]
     v["total_gets"] = sum(ph[p]["s3GetRequests"] for p in PHASES)
     v["data_gets"] = ph["probe"]["s3GetRequests"] + ph["scan"]["s3GetRequests"]
@@ -748,6 +749,12 @@ def statement_figure(calls, cfg, statement, state, metric, candidates=None):
             if probed == 0:
                 return "missing", None, f"no candidate object for {where(c)} to divide the probe wire by"
             v = rnd(m["probe_wire_bytes"] / probed)
+        elif name == "probe_survivors":
+            # The probed objects the key index did not prune.
+            pruned = c["stats"]["pruning"].get("segmentsPrunedByKeyIndex")
+            if not isinstance(pruned, int):
+                return UNSUPPORTED, None, "stats carry no pruning.segmentsPrunedByKeyIndex on this build"
+            v = m["plan_segments_opened"] - pruned
         elif name in m:
             v = m[name]
         else:

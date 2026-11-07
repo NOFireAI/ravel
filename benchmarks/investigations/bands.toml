@@ -415,18 +415,21 @@ target_if = "m['row_06.hits_objects_over_512k'] <= v <= 2 * m['row_06.hits_objec
 miss_if = "v < m['row_06.hits_objects_over_512k']"
 miss_reason = "fewer keyIndex GETs than objects above 512 KiB: one was read without its probe"
 
-# Objects read past the probe are the scan phase's segmentsOpened. The logs
-# keyed plan counts every object whose footer its KEY_IDX probe decoded as
+# Objects read past the probe are the probed objects the key index did not
+# prune: the plan phase's segmentsOpened less pruning.segmentsPrunedByKeyIndex.
+# The logs keyed plan counts every object whose KEY_IDX footer it probed as
 # opened in the plan phase, absent key or not (log_fetcher.rs,
-# plan_segment_keyed and probe_segment_keyed), so segmentsOpened summed over
-# the phases counts the probed objects as well as the ones read past the
-# probe. Box C's q20 read 497 that way: 493 in the plan phase and 4 in the
-# scan phase. A 0 beside scan GETs is reported dead_counter.
+# plan_segment_keyed and probe_segment_keyed). The scan phase's segmentsOpened
+# is not this figure: the plan does not probe an object at or under 512 KiB,
+# so the scan can open objects no probe saw. Box C's q20: 523 objects, 26
+# pruned by stats, 4 at or under 512 KiB, 493 probed, 492 of those pruned by
+# the key index, so 1 here and 5 survivors in all; the scan opened 4 of the 5,
+# and the stats do not name which.
 [[row.figure]]
 name = "objects_past_probe"
 statement = "q20_hits"
 state = "unfolded"
-metric = "cold.max.scan_segments_opened"
+metric = "cold.max.probe_survivors"
 lane = "counter"
 target_if = "v == 1"
 

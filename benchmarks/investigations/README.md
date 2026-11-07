@@ -555,17 +555,24 @@ Some bands, as transcribed:
 - Row 6: keyIndex GETs at most 2 x the census's hits objects and at least
   one per hits object above 512 KiB (the census's `objects_over_512k`): the
   logs keyed plan probes every object past that size (#3117). Objects read
-  past the probe are the scan phase's `segmentsOpened`
-  (`cold.max.scan_segments_opened`), not the sum over the phases: the keyed
-  plan counts each object whose footer its KEY_IDX probe decoded as opened
-  in the plan phase, absent key or not, so the sum counts the probed
-  objects too. Box C's q20 (run
+  past the probe are the probed objects the key index did not prune: the
+  plan phase's `segmentsOpened` less `pruning.segmentsPrunedByKeyIndex`
+  (`cold.max.probe_survivors`), `unsupported-on-this-build` when the stats
+  carry no `segmentsPrunedByKeyIndex`. The keyed plan counts each object
+  whose KEY_IDX footer it probed as opened in the plan phase, absent key or
+  not, so `segmentsOpened` summed over the phases counts the probed objects
+  too, and the scan phase's `segmentsOpened` is not the figure either: the
+  plan does not probe an object at or under 512 KiB, so the scan can open
+  objects no probe saw. Box C's q20 (run
   `investigations-20261106T154511Z-47463-23195`, its `calls.jsonl`) read
-  497 as that sum: 493 opened in the plan phase with 493 GETs, 492 of them
-  pruned by the key index, and 4 opened in the scan phase with 6 GETs and
-  989,537 B. The figure is 4 (`check_row_6_objects_past_probe`), which
-  still misses the band's holders (1); that tenant's census holds 4 objects
-  at or under 512 KiB, which the keyed plan reads without a probe.
+  497 as the sum: of 523 objects, 26 pruned by stats and 4 at or under 512
+  KiB (the census's 523 less its 519 above), 493 opened in the plan phase
+  with 493 GETs, 492 of them pruned by the key index, and 4 opened in the
+  scan phase with 6 GETs and 989,537 B. The figure is 493 - 492 = 1, the
+  band's holders, a pass (`check_row_6_objects_past_probe`). That leaves 5
+  objects past every pruning step, the 1 probe survivor and the 4 unprobed
+  small objects, while the scan opened 4; the stats count objects and do
+  not name them, so they cannot tell which of the 5 the 4 are.
 - Row 7, judged per build pass (the #3704 amendment's form, with the pass
   factor of the pass-end slice amendment): ranged section GETs
   (`key_index_ranged_gets`) at most 2 x (new + uncovered entries) x
