@@ -7634,6 +7634,44 @@ mod tests {
                 }
             }
 
+            /// ADR-3326, view memo amendment, T6(b) with the real memo: a
+            /// pressure pass while a batch holds a clone of the memo's views
+            /// releases nothing (the view total, the memo's extra bytes and
+            /// the release count stay, and the key column's entry stays as
+            /// the one held entry, while every unheld data entry goes); once
+            /// the holder drops, a pass asked for the views frees exactly
+            /// `VIEW_BYTES` and releases them.
+            #[test]
+            fn real_memo_views_a_batch_holds_survive_a_pressure_pass() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                let memo = view_registry::memo_of(&values_of(&p.batches[0])).expect("registered");
+                let views = group_key(&p.batches[0], true);
+                drop(p);
+                assert!(cache.len() > 1, "more than the key column is cached");
+                let freed = cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
+                assert_eq!(cache.view_resident_bytes(), VIEW_BYTES, "held views stay");
+                assert_eq!(memo.extra_bytes(), VIEW_BYTES, "the memo keeps its views");
+                assert_eq!(cache.view_counters().releases, 0);
+                assert_eq!(cache.len(), 1, "the held entry stays");
+                assert!(memo.held_outside(), "the held entry is counted held");
+                assert_eq!(
+                    freed,
+                    cache.pressure_counters().freed_bytes,
+                    "the pass freed data only"
+                );
+
+                drop(views);
+                let reserved = budget.reserved();
+                let freed = cache.evict_for_pressure(VIEW_BYTES, 0, ExhaustionCause::Accounted);
+                assert_eq!(freed, VIEW_BYTES, "the second pass frees the views");
+                assert_eq!(cache.view_resident_bytes(), 0);
+                assert_eq!(memo.extra_bytes(), 0);
+                assert_eq!(cache.view_counters().releases, 1);
+                assert_eq!(cache.len(), 1, "no data entry for the views' bytes");
+                assert_eq!(budget.reserved(), reserved - VIEW_BYTES);
+            }
+
             /// ADR-3326, view memo amendment, T7 with the real memo: a CLOCK
             /// eviction of the key column's entry drops its view memo and
             /// takes its bytes off the view total; once every batch drops
