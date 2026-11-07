@@ -1307,7 +1307,7 @@ reference keeps the refs it has. A request that arrives after that listing
 does not stop the fold's build, so the gate alone does not keep the key8 of
 an erased string out of every leaf; the router prunes nothing on metrics
 while `del/` is non-empty (ADR-3694 decision 2; the PromQL resolve checks
-the pinned snapshot's pending erasures, issue #3865), so no query acts on
+the pinned snapshot's pending erasures), so no query acts on
 such a leaf until the erasure completes. A part re-encoded while a request was pending is
 published uncovered and stays uncovered while later folds reuse it by
 reference; after the erasure completes, `ravel-cli catalog fold
