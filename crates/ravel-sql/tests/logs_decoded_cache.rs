@@ -1455,3 +1455,81 @@ async fn a_fitting_fast_path_verdict_reads_and_sums_every_segment() {
         (MANY, MANY * e, true, false)
     );
 }
+
+/// The `viewMemo*` keys of `stats.decodedCache` for one call of `sql`, as the
+/// executor's per-call stats render them.
+async fn view_memo_keys(exec: &SqlExecutor, t: &TenantId, sql: &str) -> [u64; 4] {
+    let outcome = exec
+        .execute(t.hash(), &request(sql))
+        .await
+        .expect("statement executes");
+    let stats = outcome
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache");
+    let json = ravel_sql::stats_json::decoded_cache_json(&stats);
+    ["viewMemoBytes", "viewMemoFills", "viewMemoRefusals", "viewMemoReleases"].map(|k| {
+        json.get(k)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("{k} in {json}"))
+    })
+}
+
+/// ADR-3326, view memo amendment, decision 7, at the executor: repeated calls
+/// of one `GROUP BY` over the plain declared `Str` column `p` (48 distinct
+/// values in 8 blocks of 6) report `[viewMemoBytes, viewMemoFills,
+/// viewMemoRefusals, viewMemoReleases]` per call. The first call only ghosts
+/// and the second admits, so neither fills; the third is the first served
+/// call and fills one view memo per block, 8, leaving 48 * 16 = 768 bytes;
+/// the fourth fills nothing and still reports the 768-byte level. A pressure
+/// release between calls empties the views: the next call refills them and
+/// reports none of the releases, which happened before it started. With a
+/// view budget of 0 every key reads 0 on every call.
+#[tokio::test]
+async fn per_call_view_memo_stats_are_the_statements_own() {
+    const SQL: &str = "SELECT p, count(*) AS c FROM logs GROUP BY p";
+    let views = (ROWS_PER_OBJECT * OBJECTS as usize * 16) as u64;
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    for seq in 1..=OBJECTS {
+        publish_object(store.as_ref(), &t, seq).await;
+    }
+    let cache_with = |view_max_bytes: u64| {
+        Arc::new(
+            DecodedColumnCache::new(1 << 30, Some(Arc::new(MemoryBudget::unlimited())))
+                .with_view_max_bytes(view_max_bytes),
+        )
+    };
+
+    let cache = cache_with(1 << 30);
+    let exec = executor(&store, Some(Arc::clone(&cache)));
+    let mut calls = Vec::new();
+    for _ in 0..4 {
+        calls.push(view_memo_keys(&exec, &t, SQL).await);
+    }
+    assert_eq!(
+        calls,
+        [[0, 0, 0, 0], [0, 0, 0, 0], [views, 8, 0, 0], [views, 0, 0, 0]],
+        "ghost, admit, first serve, hit"
+    );
+    let freed = cache.evict_for_pressure(views, 0, ravel_memory::ExhaustionCause::Accounted);
+    assert_eq!(freed, views, "the release frees exactly the views");
+    assert_eq!(cache.view_counters().releases, 8);
+    assert_eq!(
+        view_memo_keys(&exec, &t, SQL).await,
+        [views, 8, 0, 0],
+        "the refill after a release"
+    );
+    assert_eq!(view_memo_keys(&exec, &t, SQL).await, [views, 0, 0, 0]);
+
+    let cache = cache_with(0);
+    let exec = executor(&store, Some(Arc::clone(&cache)));
+    for call in 0..4 {
+        assert_eq!(
+            view_memo_keys(&exec, &t, SQL).await,
+            [0; 4],
+            "view budget 0, call {call}"
+        );
+    }
+}

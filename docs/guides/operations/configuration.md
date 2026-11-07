@@ -2258,7 +2258,12 @@ So a higher ceiling adds breadth across prefixes and never depth within one.
 
 ### Other derived settings
 
-Five more settings are derived the same way:
+Five more settings get a derived default when unset. The three caches take a
+share of memory the same way; the view budget is derived from
+`--decoded-cache-max-bytes` and the memory budget instead
+(`resolve_decoded_cache_view_max_bytes` in
+`services/ravel-server/src/config.rs`); `--gc-max-query-duration` is a fixed
+default:
 
 | Setting | Derived value |
 |---|---|
@@ -2272,11 +2277,14 @@ The view budget holds the per-row string views a `GROUP BY` takes from a
 cached plain-page column, apart from the decoded cache's own cap and charged
 to the process memory budget; the evictor releases those views first under
 memory pressure. Startup logs `decoded column-block cache view budget` with
-the value in force and the term that bound it, `cap_quarter`, `two_gib`,
-`budget_room` or `floored_at_zero`. With a 20,487,102,875-byte budget and an
-8 GB cap it is 2,000,000,000 bytes, bound by `cap_quarter`. An explicit
-value is used as given, `0` turns the view memo off, and a value above the
-budget's room is still used, with a startup warning naming the room.
+the value in force and the term that bound it, as `ViewBudgetBound::name` in
+`services/ravel-server/src/config.rs` spells it: `cap_quarter`, `two_gib`,
+`budget_room`, `floored_at_zero`, or `explicit` for a value set by flag
+(`decoded_cache_off` while the decoded cache is off). With a
+20,487,102,875-byte budget and an 8 GB cap it is 2,000,000,000 bytes, bound
+by `cap_quarter`. An explicit value is used as given, `0` turns the view memo
+off, and a value above the budget's room is still used, with a startup
+warning naming the room and saying view fills past it may be refused.
 
 - Memory is read from the `MemTotal` of `/proc/meminfo` on Linux and is
   "unknown" everywhere else.

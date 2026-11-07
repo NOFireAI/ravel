@@ -3086,8 +3086,10 @@ pub struct Cli {
     /// smallest of a quarter of the cap, 2 GiB, and the memory budget less
     /// the cap and the admission margin, floored at 0; it is 0 while the
     /// decoded cache is off. `0` keeps no views. Startup logs the value in
-    /// force and the term that bound it, and warns when an explicit value is
-    /// above the budget's room.
+    /// force and the term that bound it (`cap_quarter`, `two_gib`,
+    /// `budget_room`, `floored_at_zero`, `explicit` or `decoded_cache_off`),
+    /// and warns when an explicit value is above the budget's room that view
+    /// fills past it may be refused.
     #[arg(long, value_name = "BYTES")]
     pub decoded_cache_view_max_bytes: Option<u64>,
 
@@ -4435,7 +4437,7 @@ impl ResolvedViewBudget {
                 decoded_cache_view_max_bytes = self.bytes,
                 room_bytes = self.room,
                 "--decoded-cache-view-max-bytes is above the memory budget less the decoded \
-                 cache's cap and its admission margin: view fills past that room are refused"
+                 cache's cap and its admission margin: view fills past that room may be refused"
             );
         }
     }
@@ -23422,6 +23424,11 @@ mod tests {
             assert_eq!(lines.len(), usize::from(warns), "{flag}: {lines:?}");
             if warns {
                 assert!(lines[0].contains("room_bytes=11413361051"), "{}", lines[0]);
+                assert!(
+                    lines[0].contains("view fills past that room may be refused"),
+                    "{}",
+                    lines[0]
+                );
             }
         }
         // A budget the cap plus the margin already exceed: an explicit value

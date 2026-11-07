@@ -6300,11 +6300,15 @@ the cap, for the per-row string views a `GROUP BY` takes from a cached
 plain-page column (see "String-keyed `GROUP BY`" below). Unset, it is the smallest of a quarter of the cap, 2 GiB, and the
 memory budget less the cap and the admission margin, floored at 0; it is 0
 while the cache is off. Startup logs the value in force and the term that
-bound it: `cap_quarter`, `two_gib`, `budget_room` or `floored_at_zero`
+bound it, as `ViewBudgetBound::name` names it: `cap_quarter`, `two_gib`,
+`budget_room` or `floored_at_zero` for a derived value
+(`view_budget_default_takes_the_smallest_term`), `explicit` for a value set
+by flag (`an_explicit_view_budget_is_used_and_warned_above_the_room`), and
+`decoded_cache_off` while the cache is off
 (`view_budget_default_takes_the_smallest_term`). With a 20,487,102,875-byte
 memory budget and an 8 GB cap it is 2,000,000,000 bytes, bound by
 `cap_quarter` (same test). An explicit value is used as given, with a
-warning when it is above that room
+warning when it is above that room that view fills past it may be refused
 (`an_explicit_view_budget_is_used_and_warned_above_the_room`), and `0` keeps
 no views (`a_view_budget_of_zero_keeps_no_view_memo`).
 
@@ -6322,11 +6326,19 @@ no views (`a_view_budget_of_zero_keeps_no_view_memo`).
 - Under memory pressure the evictor releases views nothing else holds before
   it evicts any data entry, for a ledger and a host-gate refusal alike
   (`real_memo_views_go_first_under_pressure`). Views a batch still holds
-  keep their entry and their reservation
-  (`an_entry_whose_views_a_batch_holds_is_held_with_the_real_memo`), and
+  keep their entry
+  (`an_entry_whose_views_a_batch_holds_is_held_with_the_real_memo`) and
+  their reservation (the kept-bytes assertion of
+  `real_memo_views_are_charged_to_the_view_budget_not_the_data_cap`), and
   views leave with their entry (`real_memo_views_go_with_their_entry`).
 - A fill validates the views once and adds the column's rows to
-  `strCellsValidated` (`a_view_fill_counts_its_validation_once`).
+  `strCellsValidated` (`a_view_fill_counts_its_validation_once`). A fill
+  checks for room before it builds: one the view budget or the memory budget
+  refuses builds no views, adds nothing to `strCellsValidated`, counts one
+  `viewMemoRefusals` per attempt and leaves the key on the cast, and one
+  refused after the check passed (the ledger filled in between) counts its
+  validation only if installed, so it adds nothing either
+  (`refused_fills_build_and_validate_nothing`).
 
 When the cap is nonzero each SQL response's `stats` carries `decodedCache`
 once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
@@ -6338,7 +6350,10 @@ once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
 `viewMemoFills` and `viewMemoRefusals` the statement's own fills and
 refused fills, and `viewMemoReleases` the views the memory budget's evictor
 released while the statement ran, which can include another statement's
-pressure (`decoded_cache_json_names_every_field_exactly_once`).
+pressure (`per_call_view_memo_stats_are_the_statements_own` in
+`crates/ravel-sql/tests/logs_decoded_cache.rs`; the releases are the cache's
+counter since a mark taken when the statement started, `executor.rs`'s
+`cache.view_counters().since(&view_mark)`).
 `filledCellRefusals` counts offers refused because the column already
 carries a filled reservation cell: it was admitted concurrently under
 another key, or its entry was evicted (by the cap or the age bound) while
