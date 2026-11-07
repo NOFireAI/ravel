@@ -325,9 +325,10 @@ batches by coalesced bytes, bridged gaps included, of at most
 `fetch_batch_bytes = memory_budget.limit() / (2 x get permits)`
 (predicted). A run larger than that is split at a page boundary inside
 it, each half keeping its pages whole and the bridged gap between the
-halves dropped. A batch therefore reserves at most `fetch_batch_bytes`,
-or one page when a single page exceeds it, and a page is under the
-64 MiB reader cap (`crates/ravel-segment/src/format.rs:364`), so a call's
+halves dropped. A batch therefore reserves at most `fetch_batch_bytes`
+(see the whole-series batch amendment below), or one page when a single
+page exceeds it, and a page is under the 64 MiB reader cap
+(`crates/ravel-segment/src/format.rs:364`), so a call's
 reservation is bounded by the larger of the batch and 64 MiB against the
 frozen 6.4 GB budget; #3818's 161,598,421-byte call was about 32
 coalesced runs of about 5 MB, which the cut groups into batches without
@@ -353,7 +354,8 @@ next reserve rather than release before drop.
   `max_runs`), which adds one GET per split and removes the bridged gap's
   bytes from the wire. Acceptance row 6 counts scan GETs against the
   unbatched call plus one per split run and wire bytes at most the
-  unbatched call's.
+  unbatched call's (the whole-series batch amendment below restates both
+  bounds).
 - `open_segment`'s first GET (the footer tail or the whole small object)
   reserves its bytes like every other fetch.
 - Runs are decoded in the order the batches arrive, which is the order
@@ -363,6 +365,9 @@ next reserve rather than release before drop.
 - The three #3818 statements are the acceptance (row 6). The hour-wide
   run decode of an L1 part for a sub-hour window is measured in the same
   row and not changed here; decision 6 inherits it as a constraint.
+
+The whole-series batch amendment below replaces the run-list cut with a
+series-group cut.
 
 ### 5. Cost is read from the statement, and the fold state is stamped
 
@@ -493,7 +498,8 @@ stamped before the first statement and after any fold, five cold
 repetitions per statement (restart between), the MetricsBench harness and
 corpus at their frozen versions. "Holders" is the stamped number of
 objects that contain the statement's series. Rows 4 and 12 are read with
-the probe gate amendment's extra-GET allowance.
+the probe gate amendment's extra-GET allowance. Row 6 is read with the
+whole-series batch amendment's GET and wire-byte allowances.
 
 | check | target | miss | source |
 |---|---|---|---|
@@ -587,3 +593,54 @@ more than twice the PromQL fetch fan-out extra GETs per selector plan the
 router does not prune, so a statement with `P` such plans may pay up to
 `2 x fan-out x P`. The owner accepted this allowance on 2026-11-06, first
 per statement and then, once the gate became per plan, per selector plan.
+
+## Amendment (issue #3864): a batch is a group of whole series
+
+<!-- amendment-applies: sections="4. One fetch call reserves one batch, and a batch is released after its decode|Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)" pointer="whole-series batch amendment" -->
+<!-- amendment-supersedes: phrase="A batch therefore reserves at most" pointer="whole-series batch amendment" -->
+
+Decision 4 cuts the coalesced run list into batches. A run list cannot
+be cut that way: a series' timestamp pages and value pages sit in
+different sections of the object, so a batch of runs would split a
+series across batches and its decode would need bytes that were
+already released. A batch is therefore a group of whole series, in
+catalog order, bounded by its coalesced bytes, bridged gaps included:
+at most `fetch_batch_bytes`, the fetch memory limit divided by twice
+the GET permits with an 8 MiB floor. The count keeps one tail per page
+section (TS, VAL, HIST), empty at each batch start, and charges a range
+that starts within the fetcher's coalesce gap of its section's tail only
+for its bytes past that tail and any other range its full length, plus
+the gap between two sections where one section's tail lies within the
+coalesce gap of the next section's first range. A series whose own
+coalesced bytes exceed `fetch_batch_bytes` is fetched alone, bounded by
+its own pages, each under the 64 MiB reader cap, so at most one
+timestamp and one value page section of one series, plus the gap
+between the two when the coalesce gap bridges it. Each batch is planned,
+coalesced and fetched by `ensure_ranges` into a `FetchedRegions` of its
+own, decoded into the sample fold, and dropped before the next batch
+reserves. No batch shares or chains regions with another, so a batch's
+reservation is at most its count.
+
+- L0 segments are never batched, so `MAX_GETS_PER_L0_SEGMENT_FETCH` and
+  ADR-1306's per-flush law are unchanged.
+- On L1, `max_runs` stays unbounded per batch. Within a page section a
+  batch's runs break only where the unbatched call's runs break, and each
+  batch adds at most one run per page section it touches beyond the
+  first, so a segment pays at most (page sections) x batches - 1 extra
+  scan GETs over the unbatched call. The bound is tight: two sections,
+  two batches and an unbatched call that coalesces into one run give
+  three extra GETs.
+- Batching can move more wire bytes than the unbatched call. A batch
+  whose last timestamp range lies within the coalesce gap of its first
+  value range bridges into the value section and reads the pages between
+  them, which other batches fetch too. A segment's batched wire bytes are
+  at most the unbatched call's plus (page sections - 1) x the coalesce gap
+  per batch, 64 KiB per batch on scalar data at the default gap.
+- A series fetched alone is bounded by its own pages and the gap between
+  its sections: at most two 64 MiB pages plus one coalesce gap on scalar
+  data.
+- Acceptance row 6 reads its scan GET bound as the unbatched call's plus
+  (page sections) x batches - 1 per segment, and its wire-byte bound as
+  the unbatched call's plus (page sections - 1) x the coalesce gap per
+  batch. The owner accepted the restatement per whole-series batch on
+  2026-11-07, then both corrected bounds the same day.

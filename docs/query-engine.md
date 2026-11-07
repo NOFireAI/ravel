@@ -1221,6 +1221,41 @@ tied to the buffer it accounts for:
   coalesced run lengths, reserved once ahead of the concurrent GETs. The guard
   is held by the `FetchedRegions` the runs fill, so it releases when those
   region bytes drop.
+- **RSEG segment open** (`SegmentFetcher::open_segment`): the first GET (the
+  footer tail, or the whole object below the whole-object threshold) and a
+  footer chase each reserve their length before they are issued, held by the
+  segment's `FetchedRegions` (`open_segment_reserves_each_get_before_issuing_it`).
+- **RSEG metrics page batches** (ADR-3694 decision 4, whole-series batch
+  amendment): an L1 segment's selected pages are fetched one batch at a time. A
+  batch is a group of whole series, in catalog order, whose coalesced page
+  bytes at the fetcher's coalesce gap, bridged gaps included, are at most
+  `fetch_batch_bytes`: the budget's limit divided by twice the GET permits,
+  never below 8 MiB (`FETCH_BATCH_FLOOR_BYTES`). The count keeps one tail per
+  page section (TS, VAL, HIST), reset at each batch, and also charges a gap the
+  coalescer bridges between two sections (`page_batches`,
+  `coalesced_batch_bytes_is_the_coalesced_runs`). A series whose own coalesced
+  bytes exceed `fetch_batch_bytes` is a batch alone and reserves exactly those
+  bytes (`a_series_over_the_batch_bytes_is_fetched_alone`). Each batch is one
+  `ensure_ranges` call into a `FetchedRegions` of its own, borrowing the
+  segment's open and catalog regions rather than fetching them again, and is
+  decoded into the query's sample fold and dropped before the next batch
+  reserves. The batch reservation covers the page bytes as stored; the decoded
+  samples are charged by the fold's `reserve_retained`. Every batch of more
+  than one series reserves at most `fetch_batch_bytes`, and the fetch's peak is
+  one batch over what the segment already holds
+  (`one_call_never_reserves_more_than_one_batch`,
+  `an_l1_part_over_the_fetch_limit_answers_in_batches`). A batch after the
+  first that does not fit fails the statement with fetch memory exhausted and
+  no samples (`a_later_batch_over_the_limit_fails_the_statement_with_no_samples`).
+  A segment pays at most (page sections) x batches - 1 extra scan GETs over one
+  call, and at most (page sections - 1) x the coalesce gap extra wire bytes per
+  batch, since a batch whose timestamp tail lies within the gap of its first
+  value range bridges into the value section and reads pages other batches
+  also fetch (ADR-3694, the whole-series batch amendment;
+  `batching_keeps_the_gets_and_wire_bytes` pins the tighter case where no
+  section boundary is bridged). An L0 segment is never batched,
+  so its per-flush GET bound is unchanged
+  (`l0_is_one_batch_whatever_the_fetch_share`).
 - **RLOG block-range fetch** (`BlockRangeFetcher`): a ranged read holds only
   the regions it placed, with no object-sized buffer. Each GET that places
   bytes reserves its length first; the chunk runs of `fetch_chunk_ranges` and
@@ -1260,8 +1295,12 @@ only byte counts and the budget class that refused (the ledger's limit or the
 host-memory gate) -- never an object key or tenant identity -- and is never a smaller fetch
 or a partial result: no GET is issued for the refused bytes, and the budget is
 left unchanged. This holds before any GET for the RSEG range, whole-object and
-covering reservations. A ranged RLOG read reserves per placement, so a refusal
-after its probe and directory-section GETs aborts a read that has already
+covering reservations. An RSEG page batch is refused before its own GET, with
+`requested` naming that batch's coalesced bytes
+(`a_limit_below_one_batch_refuses_before_any_page_get`); batches already folded
+do not make a partial answer, since the refusal fails the whole fetch. A
+ranged RLOG read reserves per placement, so a refusal after its probe and
+directory-section GETs aborts a read that has already
 issued those; the refused GET itself is never issued, and the regions already
 placed release with the read.
 
