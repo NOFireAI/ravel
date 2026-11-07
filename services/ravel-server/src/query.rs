@@ -4887,7 +4887,7 @@ mod tests {
         );
         let report = stdout
             .lines()
-            .find_map(|line| line.strip_prefix("SPILL-CHILD "))
+            .find_map(|line| line.split_once("SPILL-CHILD ").map(|(_, report)| report))
             .unwrap_or_else(|| panic!("the child reported nothing: {stdout}"));
         assert_eq!(
             report,
