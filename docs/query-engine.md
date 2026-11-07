@@ -1227,18 +1227,28 @@ tied to the buffer it accounts for:
   segment's `FetchedRegions` (`open_segment_reserves_each_get_before_issuing_it`).
 - **RSEG metrics page batches** (ADR-3694 decision 4, whole-series batch
   amendment): an L1 segment's selected pages are fetched one batch at a time. A
-  batch is a group of whole series, in catalog order, whose planned page bytes
-  are at most `fetch_batch_bytes`: the budget's limit divided by twice the GET
-  permits, never below 8 MiB (`FETCH_BATCH_FLOOR_BYTES`); a series larger than
-  that is a batch of its own. Each batch is one `ensure_ranges` call into a
-  `FetchedRegions` of its own, borrowing the segment's open and catalog regions
-  rather than fetching them again, and is decoded into the query's sample fold
-  and dropped before the next batch reserves, so the fetch's peak is one
-  batch's coalesced bytes over what the segment already holds
-  (`one_call_never_reserves_more_than_one_batch`). The reservation is the
-  coalesced run lengths, so a gap the coalescer bridges counts toward it even
-  though the batch bound counts planned page bytes. A batch boundary only
-  removes a bridged gap, so batching moves no more wire bytes than one call and
+  batch is a group of whole series, in catalog order, whose coalesced page
+  bytes at the fetcher's coalesce gap, bridged gaps included, are at most
+  `fetch_batch_bytes`: the budget's limit divided by twice the GET permits,
+  never below 8 MiB (`FETCH_BATCH_FLOOR_BYTES`). The count keeps one tail per
+  page section (TS, VAL, HIST), reset at each batch, and also charges a gap the
+  coalescer bridges between two sections (`page_batches`,
+  `coalesced_batch_bytes_is_the_coalesced_runs`). A series whose own coalesced
+  bytes exceed `fetch_batch_bytes` is a batch alone and reserves exactly those
+  bytes (`a_series_over_the_batch_bytes_is_fetched_alone`). Each batch is one
+  `ensure_ranges` call into a `FetchedRegions` of its own, borrowing the
+  segment's open and catalog regions rather than fetching them again, and is
+  decoded into the query's sample fold and dropped before the next batch
+  reserves. The batch reservation covers the page bytes as stored; the decoded
+  samples are charged by the fold's `reserve_retained`. Every batch of more
+  than one series reserves at most `fetch_batch_bytes`, and the fetch's peak is
+  one batch over what the segment already holds
+  (`one_call_never_reserves_more_than_one_batch`,
+  `an_l1_part_over_the_fetch_limit_answers_in_batches`). A batch after the
+  first that does not fit fails the statement with fetch memory exhausted and
+  no samples (`a_later_batch_over_the_limit_fails_the_statement_with_no_samples`).
+  A batch boundary only removes a bridged gap, so batching moves no more wire
+  bytes than one call and
   adds at most one GET per page section per extra batch
   (`batching_keeps_the_gets_and_wire_bytes`). An L0 segment is never batched,
   so its per-flush GET bound is unchanged

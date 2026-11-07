@@ -325,9 +325,10 @@ batches by coalesced bytes, bridged gaps included, of at most
 `fetch_batch_bytes = memory_budget.limit() / (2 x get permits)`
 (predicted). A run larger than that is split at a page boundary inside
 it, each half keeping its pages whole and the bridged gap between the
-halves dropped. A batch therefore reserves at most `fetch_batch_bytes`,
-or one page when a single page exceeds it, and a page is under the
-64 MiB reader cap (`crates/ravel-segment/src/format.rs:364`), so a call's
+halves dropped. A batch therefore reserves at most `fetch_batch_bytes`
+(see the whole-series batch amendment below), or one page when a single
+page exceeds it, and a page is under the 64 MiB reader cap
+(`crates/ravel-segment/src/format.rs:364`), so a call's
 reservation is bounded by the larger of the batch and 64 MiB against the
 frozen 6.4 GB budget; #3818's 161,598,421-byte call was about 32
 coalesced runs of about 5 MB, which the cut groups into batches without
@@ -595,18 +596,29 @@ per statement and then, once the gate became per plan, per selector plan.
 ## Amendment (issue #3864): a batch is a group of whole series
 
 <!-- amendment-applies: sections="4. One fetch call reserves one batch, and a batch is released after its decode|Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)" pointer="whole-series batch amendment" -->
+<!-- amendment-supersedes: phrase="A batch therefore reserves at most" pointer="whole-series batch amendment" -->
 
 Decision 4 cuts the coalesced run list into batches. A run list cannot
 be cut that way: a series' timestamp pages and value pages sit in
 different sections of the object, so a batch of runs would split a
 series across batches and its decode would need bytes that were
 already released. A batch is therefore a group of whole series, in
-catalog order, whose planned page bytes are at most `fetch_batch_bytes`,
-the fetch memory limit divided by twice the GET permits with an 8 MiB
-floor; a series larger than that is its own batch. Each batch is
-planned, coalesced and fetched by `ensure_ranges` into a `FetchedRegions`
-of its own, decoded into the sample fold, and dropped before the next
-batch reserves.
+catalog order, bounded by its coalesced bytes, bridged gaps included:
+at most `fetch_batch_bytes`, the fetch memory limit divided by twice
+the GET permits with an 8 MiB floor. The count keeps one tail per page
+section (TS, VAL, HIST), empty at each batch start, and charges a range
+that starts within the fetcher's coalesce gap of its section's tail only
+for its bytes past that tail and any other range its full length, plus
+the gap between two sections where one section's tail lies within the
+coalesce gap of the next section's first range. A series whose own
+coalesced bytes exceed `fetch_batch_bytes` is fetched alone, bounded by
+its own pages, each under the 64 MiB reader cap, so at most one
+timestamp and one value page section of one series, plus the gap
+between the two when the coalesce gap bridges it. Each batch is planned,
+coalesced and fetched by `ensure_ranges` into a `FetchedRegions` of its
+own, decoded into the sample fold, and dropped before the next batch
+reserves. No batch shares or chains regions with another, so a batch's
+reservation is at most its count.
 
 - L0 segments are never batched, so `MAX_GETS_PER_L0_SEGMENT_FETCH` and
   ADR-1306's per-flush law are unchanged.
@@ -618,4 +630,4 @@ batch reserves.
 - Acceptance row 6 reads its scan GET bound as the unbatched call's
   plus (page sections) x (batches - 1) per segment, wire bytes at most
   the unbatched call's. The owner accepted this restatement on
-  2026-11-06.
+  2026-11-07.
