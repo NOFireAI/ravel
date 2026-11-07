@@ -45,8 +45,10 @@ use ravel_commit::keys;
 use ravel_commit::publish::{self, PublishError, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::rng::RngSource;
+#[cfg(test)]
+use ravel_logseg::LogRecord;
 use ravel_logseg::{
-    ColumnarLogBatch, DynCells, LogRecord, LogSegError, ObjectIdentity, RlogConfig, RlogWriter,
+    ColumnarLogBatch, DynCells, LogSegError, ObjectIdentity, RlogConfig, RlogWriter,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
@@ -423,10 +425,10 @@ fn flush_rlog_config(config: &IngestConfig) -> RlogConfig {
 
 /// Type-level bridge from the OTLP-independent [`NormalizedLogRecord`] to the
 /// writer's [`LogRecord`]. Every field maps one to one; the only copy is the
-/// shared `stream_attrs` blob, which `LogRecord` owns per record. The flush
-/// builds its batch from the records in place; the hand-back conversion
-/// ([`take_rows_as_batch`]) still uses this, since it must give the records
-/// back by value when the build refuses.
+/// shared `stream_attrs` blob, which `LogRecord` owns per record. Production
+/// paths build from the records in place; tests use this to drive the row
+/// writer.
+#[cfg(test)]
 fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
     LogRecord {
         stream_id: rec.stream_id,
@@ -482,7 +484,8 @@ fn check_stream_attrs(records: &[NormalizedLogRecord]) -> Result<(), LogSegError
     Ok(())
 }
 
-/// The inverse of [`to_logseg_record`], for records a refused build hands back.
+/// The inverse of [`to_logseg_record`].
+#[cfg(test)]
 fn from_logseg_record(rec: LogRecord) -> NormalizedLogRecord {
     NormalizedLogRecord {
         stream_id: rec.stream_id,
@@ -499,21 +502,16 @@ fn from_logseg_record(rec: LogRecord) -> NormalizedLogRecord {
     }
 }
 
-/// [`rows_to_batch`] over a buffer's own records: they are taken rather than
-/// copied, so the buffered set is not held twice during the build, and a
-/// refusal puts them back unchanged.
+/// [`rows_to_batch`] over a buffer's own records, built from them by
+/// reference. The buffer is emptied only once the build succeeds; a refusal
+/// leaves it exactly as it was.
 fn take_rows_as_batch(
     records: &mut Vec<NormalizedLogRecord>,
-    build: impl FnOnce(&[LogRecord]) -> Result<ColumnarLogBatch, LogSegError>,
+    build: impl FnOnce(&[NormalizedLogRecord]) -> Result<ColumnarLogBatch, LogSegError>,
 ) -> Result<ColumnarLogBatch, LogWriteError> {
-    let rows: Vec<LogRecord> = std::mem::take(records)
-        .into_iter()
-        .map(to_logseg_record)
-        .collect();
-    build(&rows).map_err(|e| {
-        *records = rows.into_iter().map(from_logseg_record).collect();
-        LogWriteError::SegmentBuild(e.to_string())
-    })
+    let batch = build(records).map_err(|e| LogWriteError::SegmentBuild(e.to_string()))?;
+    records.clear();
+    Ok(batch)
 }
 
 /// A tenant's buffered payload: one representation at a time (ADR-0109 decision
@@ -730,7 +728,7 @@ impl LogTenantBuf {
             }
             FlushPayload::Columnar(batches) => {
                 if let BufContent::Rows(records) = &mut self.content {
-                    let batch = take_rows_as_batch(records, ColumnarLogBatch::try_from_records)?;
+                    let batch = take_rows_as_batch(records, ColumnarLogBatch::try_from_rows)?;
                     self.content = BufContent::Columnar(vec![batch]);
                 }
                 for batch in batches {
@@ -6655,14 +6653,79 @@ mod tests {
         assert_eq!(buf.est_bytes, before + handed_bytes);
     }
 
-    /// A refused conversion leaves the records exactly as they were, in order,
-    /// and the build sees every one of them.
+    /// Four records over two streams, each stream's two records sharing one
+    /// `stream_attrs` allocation, in the order a, b, a, b.
+    fn shared_stream_records() -> Vec<NormalizedLogRecord> {
+        let a = norm_record(&[("service.name", "svc-a")], "scope", 1_000, "a1");
+        let b = norm_record(&[("service.name", "svc-b")], "scope", 1_100, "b1");
+        let mut a2 = a.clone();
+        a2.ts_ns = 1_200;
+        a2.body = "a2".to_string();
+        let mut b2 = b.clone();
+        b2.ts_ns = 1_300;
+        b2.body = "b2".to_string();
+        vec![a, b, a2, b2]
+    }
+
+    /// A successful hand-back conversion takes the rows out of the buffer and
+    /// builds the batch `try_from_rows` builds from the same records, with one
+    /// stream directory entry per shared `stream_attrs` blob.
     #[test]
-    fn a_refused_row_conversion_puts_the_records_back() {
-        let original = HandBackRig::six_records();
+    fn a_hand_back_conversion_takes_the_rows_on_success() {
+        let original = shared_stream_records();
+        let expected = ColumnarLogBatch::try_from_rows(&original).expect("the records convert");
         let mut records = original.clone();
+        let batch = take_rows_as_batch(&mut records, ColumnarLogBatch::try_from_rows)
+            .expect("the records convert");
+        assert!(records.is_empty(), "the buffer is emptied: {records:?}");
+        assert_eq!(batch, expected);
+        assert_eq!(batch.num_rows, 4);
+        assert_eq!(batch.stream_ids.len(), 2);
+        assert_eq!(batch.stream_refs.len(), 4);
+        assert_eq!(batch.stream_attrs.len(), 2);
+        assert!(
+            batch
+                .stream_attrs
+                .contains(&original[0].stream_attrs.to_vec())
+        );
+        assert!(
+            batch
+                .stream_attrs
+                .contains(&original[1].stream_attrs.to_vec())
+        );
+    }
+
+    /// A refused conversion leaves the buffer exactly as it was: the same
+    /// records in the same order, each `stream_attrs` the same allocation with
+    /// the same reference count. The build runs over the buffer itself, not a
+    /// copy, and no record is converted to an owned `LogRecord` on the way.
+    #[test]
+    fn a_refused_hand_back_conversion_leaves_the_row_buffer_untouched() {
+        let mut records = shared_stream_records();
+        let expected = records.clone();
+        let attrs: Vec<Arc<[u8]>> = records
+            .iter()
+            .map(|r| Arc::clone(&r.stream_attrs))
+            .collect();
+        let counts: Vec<usize> = records
+            .iter()
+            .map(|r| Arc::strong_count(&r.stream_attrs))
+            .collect();
+        // a, a2, the clone in `expected` and the one in `attrs` per stream.
+        assert_eq!(counts, vec![6, 6, 6, 6]);
+        let buffer = records.as_ptr();
+
         let err = take_rows_as_batch(&mut records, |rows| {
-            assert_eq!(rows.len(), original.len(), "the build sees every record");
+            assert_eq!(rows.len(), 4, "the build sees every record");
+            assert!(
+                std::ptr::eq(rows.as_ptr(), buffer),
+                "the build reads the buffer itself"
+            );
+            let during: Vec<usize> = rows
+                .iter()
+                .map(|r| Arc::strong_count(&r.stream_attrs))
+                .collect();
+            assert_eq!(during, counts, "no stream_attrs is cloned or dropped");
             Err(LogSegError::LimitExceeded("refused for the test".into()))
         })
         .expect_err("the build refuses");
@@ -6670,7 +6733,46 @@ mod tests {
             matches!(&err, LogWriteError::SegmentBuild(msg) if msg.contains("refused for the test")),
             "got {err:?}"
         );
-        assert_eq!(records, original);
+
+        assert_eq!(records, expected);
+        for (i, (rec, original)) in records.iter().zip(&attrs).enumerate() {
+            assert!(
+                Arc::ptr_eq(&rec.stream_attrs, original),
+                "record {i} keeps its stream_attrs allocation"
+            );
+        }
+        let after: Vec<usize> = records
+            .iter()
+            .map(|r| Arc::strong_count(&r.stream_attrs))
+            .collect();
+        assert_eq!(after, counts);
+    }
+
+    /// A columnar hand-back into a row buffer whose records include a stream
+    /// id carried with two different `stream_attrs` blobs builds the batch the
+    /// owned-record build built: the first blob seen for the stream wins, with
+    /// no refusal, and records sharing a blob still share its directory entry.
+    #[test]
+    fn a_columnar_hand_back_over_colliding_rows_matches_the_owned_record_build() {
+        let mut rows = shared_stream_records();
+        let mut collider = rows[0].clone();
+        collider.stream_attrs = b"another blob".to_vec().into();
+        collider.ts_ns = 1_400;
+        rows.push(collider);
+        let owned: Vec<LogRecord> = rows.iter().cloned().map(to_logseg_record).collect();
+        let expected = ColumnarLogBatch::try_from_records(&owned).expect("the records convert");
+        assert_eq!(expected.stream_ids.len(), 2);
+        assert!(!expected.stream_attrs.contains(&b"another blob".to_vec()));
+
+        let mut buf = LogTenantBuf::default();
+        buf.merge_rows_unstamped(rows.into())
+            .expect("rows into an empty buffer");
+        buf.merge_hand_back(FlushPayload::Columnar(Vec::new()))
+            .expect("a hand-back has no writer left to refuse");
+        let BufContent::Columnar(batches) = &buf.content else {
+            panic!("the buffer now holds columnar batches");
+        };
+        assert_eq!(batches, &vec![expected]);
     }
 
     /// Advances the test clock by a fixed amount inside every GET or PUT whose
