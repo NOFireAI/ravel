@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use prost::Message;
 use ravel_cli::maintain::{
-    ClaimOptions, CompactTenantError, CompactTenantReport, SignalArg, compact_tenant,
-    compact_tenant_on_detected_memory, compact_tenant_to, compact_to,
+    ClaimOptions, CompactTenantError, CompactTenantReport, ScratchOptions, SignalArg,
+    compact_tenant, compact_tenant_on_detected_memory, compact_tenant_to, compact_to,
     compact_with_part_split_targets_to, per_bucket_config,
 };
 use ravel_cli::store::{DefaultedMemoryEmptyWalk, StoreKind, StoreSelection};
@@ -288,6 +288,7 @@ async fn compact_tenant_compacts_only_the_sealed_hour_of_every_shard() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("compact-tenant runs");
@@ -353,6 +354,7 @@ async fn max_flush_lifetime_zero_seals_and_compacts_every_hour() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("compact-tenant runs");
@@ -397,6 +399,7 @@ async fn dry_run_reports_the_same_plan_and_writes_nothing() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("dry run runs");
@@ -432,6 +435,7 @@ async fn dry_run_reports_the_same_plan_and_writes_nothing() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("real run runs");
@@ -459,6 +463,7 @@ async fn missing_shards_and_no_provisioning_record_is_a_typed_error_naming_the_t
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect_err("no --shards and no provisioning record must refuse");
@@ -502,6 +507,7 @@ async fn from_hour_and_to_hour_bound_the_walk() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("bounded run runs");
@@ -549,6 +555,7 @@ async fn zero_knob_is_refused_before_shard_resolution() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect_err("a zero byte target must be refused before any store access");
@@ -597,6 +604,7 @@ async fn defaulted_store_with_nothing_under_the_tenant_prefix_is_a_typed_refusal
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect_err("a walk over an unchosen empty store must refuse, not report zeros");
@@ -667,6 +675,7 @@ async fn defaulted_store_refuses_when_no_hour_resolves_under_a_provisioned_tenan
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect_err("zero present hours across every shard must refuse on the defaulted store");
@@ -713,6 +722,7 @@ async fn explicit_memory_with_an_empty_store_still_reports_zero_counters() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("an explicitly chosen empty memory store is a zero-count success");
@@ -765,6 +775,7 @@ async fn a_defaulted_store_that_does_hold_data_walks_normally() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("a defaulted store holding data is walked, not refused");
@@ -834,6 +845,7 @@ async fn bucket_concurrency_one_is_todays_sequential_report() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("N=1 compact-tenant runs");
@@ -912,6 +924,7 @@ async fn bucket_concurrency_four_writes_identical_objects_to_n1() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("N=4 compact-tenant runs");
@@ -933,6 +946,7 @@ async fn bucket_concurrency_four_writes_identical_objects_to_n1() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("N=1 compact-tenant runs");
@@ -997,6 +1011,7 @@ async fn one_bucket_failure_does_not_abort_its_siblings() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect_err("a failed bucket must make the run exit non-zero");
@@ -1068,6 +1083,7 @@ async fn zero_bucket_concurrency_is_refused_typed() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect_err("--bucket-concurrency 0 must be refused");
@@ -1108,6 +1124,7 @@ async fn zero_bucket_concurrency_is_refused_before_the_config_is_built() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect_err("--bucket-concurrency 0 must be refused");
@@ -1173,6 +1190,7 @@ async fn streaming_preserves_walk_order_across_out_of_order_completion() {
     let gate = fault.hold(Op::Get, Some(held_path), Occurrence::Nth(1));
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(fault);
     let claims = ClaimOptions::fresh();
+    let scratch = ScratchOptions::default();
 
     let mut out: Vec<u8> = Vec::new();
     let walk = compact_tenant_to(
@@ -1195,6 +1213,7 @@ async fn streaming_preserves_walk_order_across_out_of_order_completion() {
         None,
         now_ns(),
         &claims,
+        &scratch,
     );
 
     let releaser = async {
@@ -1646,6 +1665,7 @@ async fn run_claim_walk(
         None,
         now_ns(),
         claims,
+        &ScratchOptions::default(),
     )
     .await;
     (result, String::from_utf8(out).expect("utf-8 output"))
@@ -1896,6 +1916,7 @@ async fn a_merge_longer_than_a_third_of_the_lease_renews_its_claim() {
         ..claiming()
     };
     let key = claim_key(0, HOUR_OLD);
+    let scratch = ScratchOptions::default();
 
     let mut out: Vec<u8> = Vec::new();
     let walk = compact_tenant_to(
@@ -1917,6 +1938,7 @@ async fn a_merge_longer_than_a_third_of_the_lease_renews_its_claim() {
         None,
         now_ns(),
         &claims,
+        &scratch,
     );
     let releaser = async {
         // Bounded, so a read that never reaches the gate fails the test
@@ -1978,6 +2000,7 @@ async fn a_bucket_whose_claim_is_taken_over_mid_merge_is_reported_cancelled() {
         ..claiming()
     };
     let key = claim_key(0, HOUR_OLD);
+    let scratch = ScratchOptions::default();
     let thief = Uuid::new_v4();
 
     let mut out: Vec<u8> = Vec::new();
@@ -2000,6 +2023,7 @@ async fn a_bucket_whose_claim_is_taken_over_mid_merge_is_reported_cancelled() {
         None,
         now_ns(),
         &claims,
+        &scratch,
     );
     let thief_writes = async {
         tokio::time::timeout(Duration::from_secs(60), gate.wait_until_held(1))
@@ -2113,6 +2137,7 @@ async fn compact_bucket_skips_a_claimed_bucket_and_no_claim_compacts_it() {
                 None,
                 FixedClock::new(now_ns()),
                 &claims,
+                &ScratchOptions::default(),
             )
             .await
             .expect("compact-bucket exits zero");
@@ -2233,6 +2258,7 @@ async fn compact_bucket_reports_a_claim_lost_mid_merge_and_exits_zero() {
         ..claiming()
     };
     let key = claim_key(0, HOUR_OLD);
+    let scratch = ScratchOptions::default();
     let thief = Uuid::new_v4();
 
     let mut out: Vec<u8> = Vec::new();
@@ -2252,6 +2278,7 @@ async fn compact_bucket_reports_a_claim_lost_mid_merge_and_exits_zero() {
         None,
         FixedClock::new(now_ns()),
         &claims,
+        &scratch,
     );
     let thief_writes = async {
         tokio::time::timeout(Duration::from_secs(60), gate.wait_until_held(1))
@@ -2344,6 +2371,7 @@ async fn compact_tenant_report_with_claims(
         host_memory,
         now_ns(),
         claims,
+        &ScratchOptions::default(),
     )
     .await
     .expect("dry-run compact-tenant runs");
@@ -2527,6 +2555,7 @@ async fn compact_tenant_hands_the_detected_host_memory_to_the_walk() {
         None,
         now_ns(),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("dry-run compact-tenant runs");
@@ -2558,6 +2587,7 @@ async fn compact_bucket_hands_the_detected_host_memory_to_the_run() {
         None,
         FixedClock::new(now_ns()),
         &ClaimOptions::fresh(),
+        &ScratchOptions::default(),
     )
     .await
     .expect("dry-run compact-bucket runs");
@@ -2628,6 +2658,7 @@ async fn compact_bucket_part_split_flags_reach_the_run() {
             Some(32 * GIB),
             FixedClock::new(now_ns()),
             &ClaimOptions::fresh(),
+            &ScratchOptions::default(),
         )
         .await
         .expect("dry-run compact-bucket runs");
@@ -2727,6 +2758,7 @@ async fn compact_bucket_below_the_format_floor_is_refused_with_no_put() {
         None,
         FixedClock::new(now_ns()),
         &claiming(),
+        &ScratchOptions::default(),
     )
     .await
     .expect_err("the compaction is refused below the floor");
