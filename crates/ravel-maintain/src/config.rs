@@ -2241,6 +2241,13 @@ pub struct CompactorConfig {
     /// the single-level merge, refused under ADR-3853 D0 when its cursor
     /// decode is too amplified.
     pub scratch_dir: Option<std::path::PathBuf>,
+    /// A cap on the bytes [`Self::scratch_dir`] may hold (ADR-3853 D2), for a
+    /// directory on a volume larger than its share, such as an `emptyDir`
+    /// with a size limit on a node's root disk. With a cap, the headroom
+    /// admission takes the smaller of the filesystem's free bytes and the
+    /// cap less the bytes already under the directory as its free figure.
+    /// `None` (the default) admits against the filesystem's free bytes alone.
+    pub scratch_max_bytes: Option<u64>,
     /// The memory split target a level-1 run part closes at (ADR-3853 D2 and
     /// D4). Fixed rather than derived from host memory, and it never changes
     /// the final parts' bytes, only how the runs between the levels are cut.
@@ -2503,6 +2510,7 @@ impl Default for CompactorConfig {
             merge_cursor_budget_bytes: DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
             merge_resident_ceiling_bytes: None,
             scratch_dir: None,
+            scratch_max_bytes: None,
             rlog_run_memory_target_bytes: RLOG_RUN_MEMORY_TARGET_BYTES,
             level1_workers: None,
             merge_admission: AdmissionMode::Overlap,

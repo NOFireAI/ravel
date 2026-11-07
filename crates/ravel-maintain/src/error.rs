@@ -425,16 +425,17 @@ pub enum MaintainError {
         /// The lock file inside the configured scratch directory.
         path: std::path::PathBuf,
     },
-    /// `statvfs` of the scratch directory failed, so its free bytes are
-    /// unknown (ADR-3853 D2). Never read as zero free: the unit fails with
-    /// this error and the next tick asks again.
+    /// `statvfs` of the scratch directory failed, or, under a
+    /// `scratch_max_bytes` cap, the walk measuring the bytes under it did, so
+    /// its free bytes are unknown (ADR-3853 D2). Never read as zero free: the
+    /// unit fails with this error and the next tick asks again.
     #[error(
-        "RLOG compaction failed: could not read the free space of scratch directory {path:?}: statvfs: {error}"
+        "RLOG compaction failed: could not read the free space of scratch directory {path:?}: {error}"
     )]
     ScratchFreeUnreadable {
         /// The configured scratch directory.
         path: std::path::PathBuf,
-        /// The `statvfs` failure.
+        /// The failed call and its error: `statvfs: ...` or `walk PATH: ...`.
         error: String,
     },
     #[error("RLOG compaction refused before writing any part: {0}")]

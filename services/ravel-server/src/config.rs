@@ -1408,6 +1408,37 @@ pub struct Cli {
     #[arg(long = "maintain-l1-part-memory-target-bytes", value_name = "BYTES")]
     pub maintain_l1_part_memory_target_bytes: Option<u64>,
 
+    /// The local directory the two-level RLOG merge (`--mode maintain`,
+    /// ADR-3853) writes its level-1 runs under. It is a cache: each unit's
+    /// runs go in their own subdirectory, wiped when the unit ends, and
+    /// nothing durable is read from it, so an `emptyDir` serves. The first
+    /// two-level merge locks `ravel-scratch.lock` in it for the life of the
+    /// process, so each process needs its own directory. Size it at about
+    /// 1.3 times the input bytes of the largest bucket it merges: a unit is
+    /// admitted only when that much is free. Omitted, a bucket whose cursor
+    /// merge would decode more than 16 rows per input record is refused and
+    /// counted under `ravel_maintain_compaction_refused_total{reason="geometry"}`.
+    #[arg(long = "maintain-scratch-dir", value_name = "PATH")]
+    pub maintain_scratch_dir: Option<std::path::PathBuf>,
+
+    /// A cap on the bytes `--maintain-scratch-dir` may hold, for a directory on
+    /// a volume larger than its share (an `emptyDir` with a size limit on the
+    /// node's root disk). A two-level unit is admitted against the smaller of
+    /// the volume's free bytes and this cap less the bytes already under the
+    /// directory. Omitted, the volume's free bytes alone decide. Zero, or a
+    /// value without `--maintain-scratch-dir`, is refused at startup.
+    #[arg(long = "maintain-scratch-max-bytes", value_name = "BYTES")]
+    pub maintain_scratch_max_bytes: Option<u64>,
+
+    /// The level-1 worker count of a two-level RLOG merge (ADR-3853 D4): how
+    /// many level-1 groups of one bucket merge at once, each under its share
+    /// of the unit's memory ceiling. Omitted, it is derived per bucket from the
+    /// unit's share of the usable cores and the largest count whose groups
+    /// still fit. Zero, or a value without `--maintain-scratch-dir`, is
+    /// refused at startup.
+    #[arg(long = "maintain-level1-workers", value_name = "N")]
+    pub maintain_level1_workers: Option<usize>,
+
     /// Whether this process takes bucket claims at all (ADR-1029 decision 5's
     /// escape hatch). `off` is the fleet-wide
     /// fallback for a store whose qualification record predates the CAS
@@ -8714,6 +8745,7 @@ impl Cli {
         // cursor budget (ADR-3819 D1).
         config.merge_resident_ceiling_bytes =
             Some(config.merge_cursor_budget_bytes / self.maintain_unit_concurrency.max(1) as u64);
+        self.apply_maintain_scratch(&mut config)?;
         tracing::info!(
             setting = "rlog_l1_part_memory_target_bytes",
             value = memory_target.bytes,
@@ -8738,6 +8770,40 @@ impl Cli {
             );
         }
         Ok(config)
+    }
+
+    /// Write `--maintain-scratch-dir`, `--maintain-scratch-max-bytes` and
+    /// `--maintain-level1-workers` into `config` (ADR-3853), refusing a zero
+    /// cap or worker count and either of the last two without a directory.
+    fn apply_maintain_scratch(
+        &self,
+        config: &mut ravel_maintain::CompactorConfig,
+    ) -> anyhow::Result<()> {
+        if self.maintain_scratch_dir.is_none() {
+            if self.maintain_scratch_max_bytes.is_some() {
+                anyhow::bail!(
+                    "--maintain-scratch-max-bytes has no effect without --maintain-scratch-dir"
+                );
+            }
+            if self.maintain_level1_workers.is_some() {
+                anyhow::bail!(
+                    "--maintain-level1-workers has no effect without --maintain-scratch-dir"
+                );
+            }
+        }
+        if self.maintain_scratch_max_bytes == Some(0) {
+            anyhow::bail!(
+                "--maintain-scratch-max-bytes must be greater than 0: a zero cap refuses \
+                 every two-level merge"
+            );
+        }
+        if self.maintain_level1_workers == Some(0) {
+            anyhow::bail!("--maintain-level1-workers must be greater than 0");
+        }
+        config.scratch_dir = self.maintain_scratch_dir.clone();
+        config.scratch_max_bytes = self.maintain_scratch_max_bytes;
+        config.level1_workers = self.maintain_level1_workers;
+        Ok(())
     }
 
     /// Parse `--idle-tenant-state-ttl` into a duration (ADR-0069 decision 2),
@@ -17233,6 +17299,85 @@ mod tests {
                 "{args:?}"
             );
             assert_eq!(config.merge_resident_ceiling(), expected, "{args:?}");
+        }
+    }
+
+    /// The two-level merge flags (ADR-3853) reach `CompactorConfig`
+    /// verbatim: `--maintain-scratch-dir` as `scratch_dir`,
+    /// `--maintain-scratch-max-bytes` as `scratch_max_bytes` and
+    /// `--maintain-level1-workers` as `level1_workers`. Omitted, all three
+    /// stay `None`, so W1 is derived by ravel-maintain. A zero cap or worker
+    /// count, and either without a directory, fail resolution.
+    #[test]
+    fn maintain_scratch_flags_reach_the_compactor_config() {
+        let unset = compactor(&[]).expect("resolve");
+        assert_eq!(
+            (
+                unset.scratch_dir,
+                unset.scratch_max_bytes,
+                unset.level1_workers
+            ),
+            (None, None, None)
+        );
+
+        let dir_only = compactor(&["--maintain-scratch-dir", "/scratch"]).expect("resolve");
+        assert_eq!(
+            (
+                dir_only.scratch_dir,
+                dir_only.scratch_max_bytes,
+                dir_only.level1_workers
+            ),
+            (Some(std::path::PathBuf::from("/scratch")), None, None)
+        );
+
+        let all = compactor(&[
+            "--maintain-scratch-dir",
+            "/scratch",
+            "--maintain-scratch-max-bytes",
+            "107374182400",
+            "--maintain-level1-workers",
+            "3",
+        ])
+        .expect("resolve");
+        assert_eq!(
+            (all.scratch_dir, all.scratch_max_bytes, all.level1_workers),
+            (
+                Some(std::path::PathBuf::from("/scratch")),
+                Some(107_374_182_400),
+                Some(3)
+            )
+        );
+
+        for (args, needle) in [
+            (
+                &["--maintain-scratch-max-bytes", "1024"][..],
+                "--maintain-scratch-max-bytes has no effect without --maintain-scratch-dir",
+            ),
+            (
+                &["--maintain-level1-workers", "2"][..],
+                "--maintain-level1-workers has no effect without --maintain-scratch-dir",
+            ),
+            (
+                &[
+                    "--maintain-scratch-dir",
+                    "/scratch",
+                    "--maintain-scratch-max-bytes",
+                    "0",
+                ][..],
+                "--maintain-scratch-max-bytes must be greater than 0",
+            ),
+            (
+                &[
+                    "--maintain-scratch-dir",
+                    "/scratch",
+                    "--maintain-level1-workers",
+                    "0",
+                ][..],
+                "--maintain-level1-workers must be greater than 0",
+            ),
+        ] {
+            let err = compactor(args).expect_err("refused");
+            assert!(err.to_string().contains(needle), "{args:?}: {err:#}");
         }
     }
 

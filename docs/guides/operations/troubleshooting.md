@@ -1046,8 +1046,13 @@ prints `outcome: GeometryUnsupported` with the same figures, and
 **Action.** No data is at risk. The server records the refusal in its
 in-memory maintain memo and does not plan the bucket again until the process
 restarts; retention still runs on it. Each restart refuses it once more and
-moves the counter by one. A planned two-level merge is the fix that compacts
-these buckets; until it ships, leave them uncompacted.
+moves the counter by one. To compact these buckets, give the maintain process
+a local scratch directory with `--maintain-scratch-dir` and restart it. It then
+merges them in two levels instead of refusing them; see
+[Compaction scratch](configuration.md#compaction-scratch) for sizing. A
+two-level merge that cannot run is refused instead, and counted under
+`reason="two_level"` (its groups or runs do not fit the memory ceiling),
+`reason="scratch_headroom"` or `reason="scratch_locked"`.
 
 ### Legal hold refresh fails
 
