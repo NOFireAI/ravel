@@ -665,7 +665,8 @@ pub struct CatalogConfig {
     /// Default [`DEFAULT_FOLD_BUCKET_CONCURRENCY`].
     pub fold_bucket_concurrency: usize,
     /// Whether the fold builds per-part key-index leaves (`.kidx`, ADR-2707
-    /// decision 4). Off by default pending measurement: when on, every part
+    /// decision 4). Off by default, kept off by ADR-3692's Stage 1
+    /// measurement (an advancing fold's cost grows with the tail): when on, every part
     /// the fold re-encodes has each entry's KEY_IDX section read by ranged
     /// GET, and the tail part is re-encoded on every fold that advances the
     /// watermark. When off the fold reads no section, writes no leaf, and a

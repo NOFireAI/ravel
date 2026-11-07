@@ -2615,8 +2615,9 @@ enum CatalogCommand {
         #[arg(long)]
         writers_stopped: bool,
         /// Build per-part key-index leaves (ADR-2707 decision 4) in this
-        /// fold. Off by default pending measurement (ADR-3692 decision 5);
-        /// the spans `trace_id` lookup reads the leaves where they exist
+        /// fold. Off by default, kept off by ADR-3692's Stage 1 amendment
+        /// because an advancing fold's passes and rewritten leaf bytes grow
+        /// with the tail; the spans `trace_id` lookup reads the leaves where they exist
         /// (tier 2). When on, every part the fold re-encodes has each new
         /// entry's KEY_IDX section read by ranged GET, up to three GETs per
         /// entry; the tail part, re-encoded on every fold that advances the
