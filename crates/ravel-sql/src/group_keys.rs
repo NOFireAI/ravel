@@ -1828,15 +1828,14 @@ mod tests {
         );
         let store: Arc<dyn ravel_object_store::ObjectStoreBackend> =
             Arc::new(ravel_object_store::memory::MemoryStore::new());
-        let mut fetcher = ravel_query::LogSegmentFetcher::new(store);
-        if VIEW_MEMO.get() {
-            // A decoded cache with a view budget turns the session's view
-            // memo on (`build_session_with_tables`).
-            fetcher = fetcher.with_decoded_cache(Arc::new(
-                ravel_logseg::decoded_cache::DecodedColumnCache::new(1 << 20, None)
-                    .with_view_max_bytes(1 << 20),
-            ));
-        }
+        // A decoded cache with a view budget turns the session's view memo
+        // on (`build_session_with_tables`); a view budget of 0 keeps the cast
+        // (ADR-3326, view memo amendment, T8).
+        let view_max_bytes = if VIEW_MEMO.get() { 1 << 20 } else { 0 };
+        let fetcher = ravel_query::LogSegmentFetcher::new(store).with_decoded_cache(Arc::new(
+            ravel_logseg::decoded_cache::DecodedColumnCache::new(1 << 20, None)
+                .with_view_max_bytes(view_max_bytes),
+        ));
         let logs = crate::LogsTableProvider::new(
             ravel_catalog::Snapshot {
                 segments: Vec::new(),

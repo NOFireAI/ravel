@@ -6734,7 +6734,7 @@ mod tests {
             use datafusion::arrow::array::BooleanArray;
             use datafusion::arrow::compute::filter_record_batch;
             use datafusion::physical_expr::expressions::Column;
-            use ravel_logseg::decoded_cache::admission_margin;
+            use ravel_logseg::decoded_cache::{ViewMemoSnapshot, admission_margin};
 
             const VIEW_BUDGET: u64 = 1 << 20;
             const ROWS: usize = 12;
@@ -6925,6 +6925,33 @@ mod tests {
                 assert_eq!(fills, [0, 1, 0], "fills per call");
                 assert_eq!(cache.view_counters().fills, 1);
                 assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+            }
+
+            /// ADR-3326, view memo amendment, T8: a view budget of 0 is no
+            /// view memo, not an unlimited one: a served plain memo is not
+            /// registered, nothing fills and nothing is refused, and the
+            /// group key reads as the cast.
+            #[test]
+            fn a_view_budget_of_zero_keeps_no_view_memo() {
+                let block = dense(true, ROWS);
+                let cfg = cfg();
+                let obj = encode(&block, &cfg);
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let cache = cache_on(&budget, 0);
+                for call in 0..2 {
+                    let p = pass(&obj, &cfg, &block, &cache, 9);
+                    assert_eq!(p.fast, 1);
+                    let batch = &p.batches[0];
+                    identical(&group_key(batch, true), &group_key(batch, false))
+                        .unwrap_or_else(|e| panic!("call {call}: {e}"));
+                    assert!(view_registry::views_of(&values_of(batch)).is_none());
+                    assert_eq!(
+                        p.counters.view_snapshot(),
+                        ViewMemoSnapshot::default(),
+                        "call {call}"
+                    );
+                }
+                assert_eq!(cache.view_counters(), ViewMemoSnapshot::default());
             }
 
             /// A served, filled plain block: its object, the cache, and the

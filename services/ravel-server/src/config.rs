@@ -23361,4 +23361,88 @@ mod tests {
             "an override of 0 is refused"
         );
     }
+
+    /// ADR-3326, view memo amendment, T8: unset, the view budget is the
+    /// smallest of `cap / 4`, 2 GiB and the budget's room, floored at 0, and
+    /// the startup line carries the bytes and the term that bound it; with
+    /// the decoded cache off it is 0.
+    #[test]
+    fn view_budget_default_takes_the_smallest_term() {
+        const GB: u64 = 1_000_000_000;
+        let cases = [
+            // The ClickBench entry: budget 20,487,102,875, cap 8 GB.
+            (20_487_102_875, 8 * GB, 2_000_000_000, "cap_quarter"),
+            (80 * GB, 40 * GB, 2 << 30, "two_gib"),
+            // 9.5e9 - 8e9 - 1 GiB.
+            (9_500_000_000, 8 * GB, 426_258_176, "budget_room"),
+            (8_500_000_000, 8 * GB, 0, "floored_at_zero"),
+        ];
+        for (budget, cap, want, term) in cases {
+            let resolved = resolve_decoded_cache_view_max_bytes(None, cap, budget);
+            assert_eq!(resolved.bytes, want, "{term}");
+            assert_eq!(resolved.bound.name(), term);
+            let (lines, guard) = capture_events(tracing::Level::INFO);
+            resolved.log();
+            drop(guard);
+            let lines = lines.lock();
+            let [line] = lines.as_slice() else {
+                panic!("{term}: one startup line, got {lines:?}");
+            };
+            assert!(
+                line.contains(&format!("decoded_cache_view_max_bytes={want}"))
+                    && line.contains(&format!("bound=\"{term}\"")),
+                "{term}: {line}"
+            );
+        }
+        let room = resolve_decoded_cache_view_max_bytes(None, 8 * GB, 20_487_102_875).room;
+        assert_eq!(room, 11_413_361_051, "the ClickBench entry's budget room");
+        // The decoded cache off: no views, flag or not.
+        for flag in [None, Some(1 << 20)] {
+            let off = resolve_decoded_cache_view_max_bytes(flag, 0, 20_487_102_875);
+            assert_eq!((off.bytes, off.bound.name()), (0, "decoded_cache_off"));
+        }
+    }
+
+    /// ADR-3326, view memo amendment, T8: an explicit
+    /// `--decoded-cache-view-max-bytes` is used as given, `0` included, and
+    /// one above the budget's room is still used, with a warning naming the
+    /// room; one within it warns nothing. The flag reaches `QueryBudgets`.
+    #[test]
+    fn an_explicit_view_budget_is_used_and_warned_above_the_room() {
+        let zero = resolve_decoded_cache_view_max_bytes(Some(0), 8_000_000_000, 20_487_102_875);
+        assert_eq!((zero.bytes, zero.bound.name()), (0, "explicit"));
+        for (flag, warns) in [(1 << 30, false), (12_000_000_000, true)] {
+            let resolved =
+                resolve_decoded_cache_view_max_bytes(Some(flag), 8_000_000_000, 20_487_102_875);
+            assert_eq!(resolved.bytes, flag);
+            let (lines, guard) = capture_events(tracing::Level::WARN);
+            resolved.log();
+            drop(guard);
+            let lines = lines.lock();
+            assert_eq!(lines.len(), usize::from(warns), "{flag}: {lines:?}");
+            if warns {
+                assert!(lines[0].contains("room_bytes=11413361051"), "{}", lines[0]);
+            }
+        }
+        // A budget the cap plus the margin already exceed: an explicit value
+        // is still used, above a room of 0.
+        let tight = resolve_decoded_cache_view_max_bytes(Some(5), 8_000_000_000, 8_500_000_000);
+        assert_eq!((tight.bytes, tight.room), (5, 0));
+
+        let unset = cli(&[]);
+        assert_eq!(
+            unset
+                .query_budgets(&resolved_from(&unset))
+                .expect("budgets resolve")
+                .decoded_cache_view_max_bytes,
+            None
+        );
+        let set = cli(&["--decoded-cache-view-max-bytes", "0"]);
+        assert_eq!(
+            set.query_budgets(&resolved_from(&set))
+                .expect("budgets resolve")
+                .decoded_cache_view_max_bytes,
+            Some(0)
+        );
+    }
 }
