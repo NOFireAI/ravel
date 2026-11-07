@@ -1596,6 +1596,11 @@ struct BlockMetrics {
     /// dropped prefetch's segment goes back to its owner's work, to be opened
     /// again at its turn.
     prefetch_revocations: Count,
+    /// Retried fast-path opens the fetch memory budget refused again while
+    /// sibling partitions held opens, each of which narrowed the statement's
+    /// fan-out and parked this partition for a turn
+    /// ([`LogScanStream::on_open_refused`], issue #3899).
+    fan_out_narrowings: Count,
     /// Wall time in the synchronous decode and Arrow build sites inside
     /// `poll_next`: `next_block_columnar` plus `build_columnar_batches` on the
     /// columnar path, `next_block` on the row path. A decode on the read gate
@@ -1688,6 +1693,8 @@ impl BlockMetrics {
                 .counter("prefetch_memory_reopens", partition),
             prefetch_revocations: MetricBuilder::new(metrics)
                 .counter("prefetch_revocations", partition),
+            fan_out_narrowings: MetricBuilder::new(metrics)
+                .counter("fan_out_narrowings", partition),
             decode_build_elapsed: MetricBuilder::new(metrics)
                 .subset_time("decode_build_elapsed", partition),
             emit_elapsed: MetricBuilder::new(metrics).subset_time("emit_elapsed", partition),
@@ -3584,6 +3591,8 @@ impl ExecutionPlan for LogsScanExec {
             prefetch_pool: Arc::clone(&self.prefetch_pool),
             current_by_chunk: false,
             retrying: false,
+            retry_releases: 0,
+            admission_deadline: None,
             segments: Arc::clone(&self.segments),
             work,
             round,
@@ -3722,6 +3731,14 @@ struct LogScanStream {
     /// Whether the open in flight is [`Self::on_open_refused`]'s one retry of
     /// a refused open. Cleared when an open resolves and at the next segment.
     retrying: bool,
+    /// [`PrefetchPool::releases`] when the open in flight was reissued after
+    /// a refusal, so a refusal of it can tell whether a sibling finished a
+    /// segment in between (issue #3899).
+    retry_releases: u64,
+    /// The bound on a wait for a turn under the statement's narrowed fan-out
+    /// ([`NARROWED_ADMISSION_WAIT`]), armed when the wait begins and cleared
+    /// on a turn.
+    admission_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     /// Every segment in the snapshot, snapshot order, shared with the exec.
     /// Publication indexes this by segment position.
     segments: Arc<Vec<SegmentRef>>,

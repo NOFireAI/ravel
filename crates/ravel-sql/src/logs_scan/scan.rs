@@ -410,7 +410,51 @@ pub(super) struct PrefetchPool {
     /// Whether each partition's stream has been built, so a second `execute`
     /// of one partition cannot share a slot with the first.
     registered: Vec<AtomicBool>,
+    /// Which partitions may hold a current fast-path open at once.
+    fan_out: std::sync::Mutex<FanOut>,
 }
+
+/// One statement's admission of current fast-path opens (issue #3899): which
+/// partitions hold one, from the open's admission until the segment is
+/// finished, how many may at once, and who waits for a turn.
+///
+/// `cap` starts at the partition count, so before any narrowing a partition,
+/// which holds at most one current open, is always admitted at once.
+/// [`PrefetchPool::narrow`] lowers it to the number of siblings holding an
+/// open when one partition's retried open is refused; it never rises again.
+/// Waiters are admitted in arrival order, a narrowed partition first, so a
+/// sibling that finishes a segment cannot take the freed turn ahead of it.
+struct FanOut {
+    cap: usize,
+    holding: Vec<bool>,
+    queue: VecDeque<usize>,
+    wakers: Vec<Option<std::task::Waker>>,
+    /// Bumped whenever a partition stops holding, so a partition whose open
+    /// was refused can tell whether bytes were freed since it was issued.
+    releases: u64,
+    /// How long a partition waits for a turn: [`NARROWED_ADMISSION_WAIT`],
+    /// shortened only by tests whose driver cannot serve a wait.
+    wait: std::time::Duration,
+}
+
+/// What [`PrefetchPool::narrow`] decided for a refused retry.
+enum Narrowing {
+    /// Siblings hold opens: wait for one of them to finish, at most `cap`
+    /// partitions now holding one at a time.
+    Wait { cap: usize },
+    /// No sibling holds an open, but one stopped holding since the refused
+    /// open was issued: retry at once.
+    Retry,
+    /// No sibling holds an open and none released since: the refusal stands.
+    Alone,
+}
+
+/// How long a partition waits for its turn to hold a current fast-path open
+/// once its statement's fan-out has been narrowed ([`PrefetchPool::narrow`]).
+/// A turn comes when a sibling finishes its segment, which needs that
+/// sibling's consumer to keep polling it; the bound keeps a consumer that
+/// polls one partition at a time from waiting forever.
+pub(super) const NARROWED_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl PrefetchPool {
     pub(super) fn new(partitions: usize) -> Self {
@@ -420,7 +464,150 @@ impl PrefetchPool {
                 .map(|_| std::sync::Mutex::new(PrefetchSlot::default()))
                 .collect(),
             registered: (0..partitions).map(|_| AtomicBool::new(false)).collect(),
+            fan_out: std::sync::Mutex::new(FanOut {
+                cap: partitions,
+                holding: vec![false; partitions],
+                queue: VecDeque::new(),
+                wakers: vec![None; partitions],
+                releases: 0,
+                wait: NARROWED_ADMISSION_WAIT,
+            }),
         }
+    }
+
+    fn admission_wait(&self) -> DFResult<std::time::Duration> {
+        Ok(self.fan_out()?.wait)
+    }
+
+    /// Shortens the wait for a turn, for a test driver that polls one
+    /// partition at a time and so can never let a waiting partition's turn
+    /// come.
+    #[cfg(test)]
+    fn set_admission_wait(&self, wait: std::time::Duration) {
+        if let Ok(mut f) = self.fan_out.lock() {
+            f.wait = wait;
+        }
+    }
+
+    fn fan_out(&self) -> DFResult<std::sync::MutexGuard<'_, FanOut>> {
+        self.fan_out
+            .lock()
+            .map_err(|_| DataFusionError::Internal("logs scan fan-out lock is poisoned".into()))
+    }
+
+    /// Admits `partition` to hold a current fast-path open, or queues it and
+    /// registers `cx`'s waker. A partition already holding one is admitted.
+    fn admit(&self, partition: usize, cx: &Context<'_>) -> DFResult<bool> {
+        let mut wake = Vec::new();
+        let admitted = {
+            let mut f = self.fan_out()?;
+            let Some(&holds) = f.holding.get(partition) else {
+                return Err(DataFusionError::Internal(format!(
+                    "logs scan partition {partition} has no fan-out slot"
+                )));
+            };
+            if holds {
+                return Ok(true);
+            }
+            let held = f.holding.iter().filter(|h| **h).count();
+            let turn = f.queue.front().is_none_or(|&p| p == partition);
+            if held < f.cap && turn {
+                f.queue.retain(|&p| p != partition);
+                f.holding[partition] = true;
+                f.wakers[partition] = None;
+                if held + 1 < f.cap {
+                    wake.extend(f.wakers.iter_mut().filter_map(Option::take));
+                }
+                true
+            } else {
+                if !f.queue.contains(&partition) {
+                    f.queue.push_back(partition);
+                }
+                f.wakers[partition] = Some(cx.waker().clone());
+                false
+            }
+        };
+        wake.into_iter().for_each(std::task::Waker::wake);
+        Ok(admitted)
+    }
+
+    /// Admits `partition` whatever the cap and the queue say: the way out of
+    /// a wait that reached [`NARROWED_ADMISSION_WAIT`] for a partition that
+    /// was not itself refused.
+    fn force_admit(&self, partition: usize) -> DFResult<()> {
+        let mut f = self.fan_out()?;
+        f.queue.retain(|&p| p != partition);
+        if let Some(h) = f.holding.get_mut(partition) {
+            *h = true;
+        }
+        if let Some(w) = f.wakers.get_mut(partition) {
+            *w = None;
+        }
+        Ok(())
+    }
+
+    /// The release count a refused open is later compared against.
+    fn releases(&self) -> DFResult<u64> {
+        Ok(self.fan_out()?.releases)
+    }
+
+    /// `partition`'s retried open was refused too. While a sibling holds a
+    /// current open, which it gives back when it finishes its segment, the
+    /// cap drops to the number of siblings holding one, `partition` stops
+    /// holding and goes to the front of the queue. `since` is
+    /// [`Self::releases`] when the refused open was issued.
+    fn narrow(&self, partition: usize, since: u64) -> DFResult<Narrowing> {
+        let mut f = self.fan_out()?;
+        let others = f
+            .holding
+            .iter()
+            .enumerate()
+            .filter(|&(p, h)| *h && p != partition)
+            .count();
+        if others == 0 {
+            return Ok(if f.releases == since {
+                Narrowing::Alone
+            } else {
+                Narrowing::Retry
+            });
+        }
+        f.cap = f.cap.min(others);
+        if let Some(h) = f.holding.get_mut(partition) {
+            *h = false;
+        }
+        f.releases += 1;
+        f.queue.retain(|&p| p != partition);
+        f.queue.push_front(partition);
+        Ok(Narrowing::Wait { cap: f.cap })
+    }
+
+    /// `partition` gives back its turn and leaves the queue, waking every
+    /// waiter to re-check. Infallible, like [`Self::clear`], because it runs
+    /// on the stream's way out.
+    fn release_open(&self, partition: usize) {
+        let wake: Vec<std::task::Waker> = {
+            let mut f = self
+                .fan_out
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let was_queued = f.queue.contains(&partition);
+            f.queue.retain(|&p| p != partition);
+            let held = f
+                .holding
+                .get_mut(partition)
+                .is_some_and(|h| std::mem::replace(h, false));
+            if let Some(w) = f.wakers.get_mut(partition) {
+                *w = None;
+            }
+            if !(held || was_queued) {
+                return;
+            }
+            if held {
+                f.releases += 1;
+            }
+            f.wakers.iter_mut().filter_map(Option::take).collect()
+        };
+        wake.into_iter().for_each(std::task::Waker::wake);
     }
 
     fn is_off(&self) -> bool {
@@ -478,9 +665,9 @@ impl PrefetchPool {
         Ok(dropped)
     }
 
-    /// Drops everything `partition`'s slot holds. Used on the stream's way
-    /// out, so it clears a poisoned slot too rather than leaving its
-    /// prefetches' bytes reserved.
+    /// Drops everything `partition`'s slot holds and gives back its fan-out
+    /// turn. Used on the stream's way out, so it clears a poisoned slot too
+    /// rather than leaving its prefetches' bytes reserved.
     fn clear(&self, partition: usize) {
         if let Some(slot) = self.slots.get(partition) {
             let mut slot = slot
@@ -489,6 +676,7 @@ impl PrefetchPool {
             slot.prefetched.clear();
             slot.handed_back.clear();
         }
+        self.release_open(partition);
     }
 
     /// Gives `partition`'s slot back when its stream is dropped, so a later
@@ -503,7 +691,8 @@ impl PrefetchPool {
 }
 
 /// Which open [`LogScanStream::on_open_refused`] retries.
-enum Reopen {
+#[derive(Clone, Copy)]
+pub(super) enum Reopen {
     /// The segment's fast-path open, on the route its first open took.
     Fast,
     /// The `attrs_raw` row-path reopen, skipping the `skip` blocks of this
@@ -579,6 +768,16 @@ pub(super) enum LogScanState {
     RowFallbackBlock {
         scan: Box<LogSegmentScan>,
         skip: usize,
+    },
+    /// The current segment's retried fast-path open was refused by the fetch
+    /// memory budget while sibling partitions held opens of their own
+    /// ([`LogScanStream::on_open_refused`], issue #3899). Waits, holding no
+    /// open, for this partition's turn under the statement's narrowed
+    /// fan-out, then issues `reopen` again. `refused` is returned if the turn
+    /// does not come within [`NARROWED_ADMISSION_WAIT`].
+    Narrowed {
+        refused: DataFusionError,
+        reopen: Reopen,
     },
     /// One columnar block's decode and Arrow build, running as a read-gate
     /// job that owns the scan (ADR-1702 decision 7). Resolved, the scan goes
@@ -1066,6 +1265,17 @@ impl LogScanStream {
         Ok(None)
     }
 
+    /// Whether this partition has another owned fast-path segment to open:
+    /// one in its work, or one its slot holds as a prefetch or as a segment a
+    /// revocation handed back.
+    fn has_owned_next(&self) -> DFResult<bool> {
+        if !self.work.is_empty() {
+            return Ok(true);
+        }
+        let slot = self.prefetch_pool.slot(self.partition)?;
+        Ok(!(slot.prefetched.is_empty() && slot.handed_back.is_empty()))
+    }
+
     /// Handles a refused current open on the whole-segment fast path: a first
     /// open, a consumed prefetch ([`Reopen::Fast`]), or the `attrs_raw`
     /// row-path reopen ([`Reopen::Rows`]).
@@ -1079,26 +1289,39 @@ impl LogScanStream {
     /// back segments into its work, and retries the refused open once, at
     /// once, on the same route and, for the row-path reopen, with the same
     /// `skip`. It waits for no other stream: the bytes are released by the
-    /// drop itself. Any other error, any error off the fast path, and a
-    /// refusal of the retry itself are returned untouched.
+    /// drop itself. Any other error and any error off the fast path are
+    /// returned untouched.
+    ///
+    /// A refusal of the retry is the statement's own fan-out at work when
+    /// sibling partitions still hold current opens (issue #3899): their
+    /// bytes come back as each finishes its segment. The statement's fan-out
+    /// is then narrowed ([`PrefetchPool::narrow`]): at most as many
+    /// partitions as held an open at that moment hold one at a time from
+    /// then on, and this partition waits, at the front of the queue, for the
+    /// next turn ([`LogScanState::Narrowed`]) before it issues the open
+    /// again. Only the order and concurrency of the opens change, never what
+    /// they read. When no sibling holds an open, the retry is issued again
+    /// at once if one finished since the refused open was issued, and
+    /// otherwise the refusal is returned.
     ///
     /// The property this gives: within one statement a current open (a first
     /// open, a consumed prefetch, or the `attrs_raw` reopen) is reported
-    /// refused only if the budget refused it twice, the second
-    /// time after every unconsumed prefetch of every partition of the
-    /// statement had been dropped and the statement's pipeline turned off.
-    /// Between the drain and the retry a sibling's current open may reserve
-    /// first; the retry then meets one open per partition, which is the
-    /// sequential walk's own peak. Across statements the budget stays
-    /// fail-fast: another statement's prefetches can hold the bytes, and
-    /// that refusal is typed and reported like any contended reservation.
+    /// refused only when the budget refused it while no other partition of
+    /// the statement held a current open or a prefetch, or when its narrowed
+    /// turn did not come within [`NARROWED_ADMISSION_WAIT`]. Across
+    /// statements the budget stays fail-fast: another statement's opens can
+    /// hold the bytes, and that refusal is typed and reported like any
+    /// contended reservation.
     fn on_open_refused(&mut self, e: DataFusionError, reopen: Reopen) -> DFResult<()> {
-        if !(self.fast_whole_segment && is_fetch_memory_refusal(&e)) || self.retrying {
+        if !(self.fast_whole_segment && is_fetch_memory_refusal(&e)) {
             return Err(e);
         }
-        let Some(seg) = self.current_seg.clone() else {
+        if self.retrying {
+            return self.narrow_after_refusal(e, reopen);
+        }
+        if self.current_seg.is_none() {
             return Err(e);
-        };
+        }
         let dropped = self.prefetch_pool.revoke_all()?;
         self.reclaim_handed_back()?;
         self.retrying = true;
@@ -1112,6 +1335,49 @@ impl LogScanStream {
             "open refused by the fetch memory budget; dropped the statement's \
              prefetches and retrying once"
         );
+        self.reissue(reopen)
+    }
+
+    /// The retried open was refused too: narrow the statement's fan-out and
+    /// wait for a turn, retry at once, or return `e`
+    /// ([`Self::on_open_refused`]).
+    fn narrow_after_refusal(&mut self, e: DataFusionError, reopen: Reopen) -> DFResult<()> {
+        if self.current_seg.is_none() {
+            return Err(e);
+        }
+        match self
+            .prefetch_pool
+            .narrow(self.partition, self.retry_releases)?
+        {
+            Narrowing::Alone => Err(e),
+            Narrowing::Retry => self.reissue(reopen),
+            Narrowing::Wait { cap } => {
+                self.blocks.fan_out_narrowings.add(1);
+                tracing::debug!(
+                    partition = self.partition,
+                    segment = self.current_seg_ordinal,
+                    cap,
+                    error = %e,
+                    "retried open refused by the fetch memory budget while sibling \
+                     partitions hold opens; narrowed the statement's fan-out and \
+                     waiting for a turn"
+                );
+                self.state = LogScanState::Narrowed { refused: e, reopen };
+                Ok(())
+            }
+        }
+    }
+
+    /// Issues the current segment's open again, the way `reopen` names, and
+    /// records [`PrefetchPool::releases`] beside it for
+    /// [`Self::narrow_after_refusal`].
+    fn reissue(&mut self, reopen: Reopen) -> DFResult<()> {
+        let Some(seg) = self.current_seg.clone() else {
+            return Err(DataFusionError::Internal(
+                "logs scan reissued an open with no current segment".into(),
+            ));
+        };
+        self.retry_releases = self.prefetch_pool.releases()?;
         self.state = match reopen {
             Reopen::Fast => {
                 self.open_started.get_or_insert_with(Instant::now);
@@ -1130,6 +1396,29 @@ impl LogScanStream {
             }
         };
         Ok(())
+    }
+
+    /// Polls this partition's turn to hold a current fast-path open
+    /// ([`PrefetchPool::admit`]). `Ready(true)` is a turn; `Ready(false)` is
+    /// a wait that reached [`NARROWED_ADMISSION_WAIT`] without one. The
+    /// timer is armed only once a wait begins, so an admission granted at
+    /// once, as every admission is before a narrowing, never arms it.
+    fn poll_admission(&mut self, cx: &mut Context<'_>) -> DFResult<Poll<bool>> {
+        if self.prefetch_pool.admit(self.partition, cx)? {
+            self.admission_deadline = None;
+            return Ok(Poll::Ready(true));
+        }
+        if self.admission_deadline.is_none() {
+            let wait = self.prefetch_pool.admission_wait()?;
+            self.admission_deadline = Some(Box::pin(tokio::time::sleep(wait)));
+        }
+        if let Some(deadline) = self.admission_deadline.as_mut()
+            && deadline.as_mut().poll(cx).is_ready()
+        {
+            self.admission_deadline = None;
+            return Ok(Poll::Ready(false));
+        }
+        Ok(Poll::Pending)
     }
 
     /// The `attrs_raw` fallback's row-path reopen of `seg`, the current
@@ -1424,7 +1713,12 @@ impl LogScanStream {
     /// segment's directories and move to the next owned segment.
     fn finish_segment(&mut self) {
         self.current_dirs = None;
+        // The segment's scan, and with it the open's fetch reservations, is
+        // dropped before the turn is given back.
         self.state = LogScanState::NextSegment;
+        if self.fast_whole_segment {
+            self.prefetch_pool.release_open(self.partition);
+        }
         lock_str_values(&self.str_values).retain_live();
     }
 
@@ -1456,6 +1750,7 @@ impl LogScanStream {
             | LogScanState::NextSegment
             | LogScanState::Opening(_)
             | LogScanState::ReopenRows { .. }
+            | LogScanState::Narrowed { .. }
             | LogScanState::DecodingColumnar { .. }
             | LogScanState::DecodingRows { .. }
             | LogScanState::Done => {}
@@ -1529,6 +1824,9 @@ impl Stream for LogScanStream {
 /// reservations with it rather than when the plan is dropped.
 impl Drop for LogScanStream {
     fn drop(&mut self) {
+        // The open's fetch reservations go before the fan-out turn does.
+        self.state = LogScanState::Done;
+        self.current_dirs = None;
         self.prefetch_pool.clear(self.partition);
         self.prefetch_pool.unregister(self.partition);
     }
@@ -1632,6 +1930,29 @@ impl LogScanStream {
                     Poll::Pending => return Poll::Pending,
                 },
                 LogScanState::NextSegment => {
+                    // A fast-path segment is opened on a turn of the
+                    // statement's fan-out (issue #3899), granted at once
+                    // unless a refused open narrowed it. A wait that runs
+                    // out admits this partition anyway: it was not refused,
+                    // and its open meets the budget as any open does.
+                    if this.fast_whole_segment {
+                        let next = match this.has_owned_next() {
+                            Ok(next) => next,
+                            Err(e) => return this.fail(e),
+                        };
+                        if next {
+                            match this.poll_admission(cx) {
+                                Ok(Poll::Ready(true)) => {}
+                                Ok(Poll::Ready(false)) => {
+                                    if let Err(e) = this.prefetch_pool.force_admit(this.partition) {
+                                        return this.fail(e);
+                                    }
+                                }
+                                Ok(Poll::Pending) => return Poll::Pending,
+                                Err(e) => return this.fail(e),
+                            }
+                        }
+                    }
                     let prefetch = match this.take_next_prefetch() {
                         Ok(prefetch) => prefetch,
                         Err(e) => return this.fail(e),
@@ -1808,6 +2129,7 @@ impl LogScanStream {
                             };
                         }
                         None => {
+                            this.prefetch_pool.release_open(this.partition);
                             this.state = LogScanState::Done;
                             this.release_str_values();
                         }
@@ -1894,6 +2216,28 @@ impl LogScanStream {
                     }
                     Poll::Pending => return Poll::Pending,
                 },
+                LogScanState::Narrowed { reopen, .. } => {
+                    let reopen = *reopen;
+                    match this.poll_admission(cx) {
+                        Ok(Poll::Ready(true)) => {
+                            if let Err(e) = this.reissue(reopen) {
+                                return this.fail(e);
+                            }
+                        }
+                        Ok(Poll::Ready(false)) => {
+                            let refused =
+                                match std::mem::replace(&mut this.state, LogScanState::Done) {
+                                    LogScanState::Narrowed { refused, .. } => refused,
+                                    _ => DataFusionError::Internal(
+                                        "logs scan left the narrowed wait unexpectedly".into(),
+                                    ),
+                                };
+                            return this.fail(refused);
+                        }
+                        Ok(Poll::Pending) => return Poll::Pending,
+                        Err(e) => return this.fail(e),
+                    }
+                }
                 LogScanState::Columnar(scan) => {
                     let step = match this.decoded.take() {
                         Some(Decoded::Columnar(step)) => step,
@@ -2902,6 +3246,12 @@ mod fast_path_prefetch_tests {
     /// The largest budget [`fits_with`] bisects from; every run fits in it.
     const CEILING: u64 = 1 << 24;
 
+    /// The wait for a fan-out turn under a driver that polls one partition
+    /// at a time ([`Drive::Lockstep`], [`Drive::Order`], [`reopen_refused`]):
+    /// the sibling a narrowed partition waits on is not polled while it
+    /// waits, so its turn never comes and the wait only delays the refusal.
+    const SERIAL_DRIVER_WAIT: Duration = Duration::from_millis(1);
+
     /// How [`run_statement`] drives the partitions of one exec.
     #[derive(Clone)]
     enum Drive {
@@ -2959,6 +3309,9 @@ mod fast_path_prefetch_tests {
             partitions,
             accounting.clone(),
         ));
+        if !matches!(drive, Drive::Spawned) {
+            exec.prefetch_pool.set_admission_wait(SERIAL_DRIVER_WAIT);
+        }
         let plan: Arc<dyn ExecutionPlan> = if pipelined {
             exec
         } else {
@@ -3120,6 +3473,7 @@ mod fast_path_prefetch_tests {
         let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
         let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
         let exec = Arc::new(exec_with(fetcher, &segments, 2, PhaseAccounting::new()));
+        exec.prefetch_pool.set_admission_wait(SERIAL_DRIVER_WAIT);
         let gate = store.hold(Op::Get, Some(key(0)), Occurrence::Always);
         let mut s0 = exec
             .execute(0, Arc::new(TaskContext::default()))
@@ -3557,6 +3911,229 @@ mod fast_path_prefetch_tests {
             rows1.extend(timestamps(&[item.expect("statement 1 completes")]));
         }
         assert_eq!(rows1, rows_of(&[0, 1, 2, 3, 4, 5]));
+        drop(s1);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// What [`edge`] left behind: both streams, the rows each emitted so far,
+    /// the plan their metrics live on, and the budget.
+    struct Edge {
+        plan: Arc<dyn ExecutionPlan>,
+        s0: SendableRecordBatchStream,
+        s1: SendableRecordBatchStream,
+        rows: [Vec<i64>; 2],
+        budget: Arc<ravel_memory::MemoryBudget>,
+    }
+
+    /// Two partitions of one statement under one fetch memory budget of
+    /// `limit`. Partition 1 is polled to its first batch, so it holds
+    /// segment 1's open; then partition 0 alone, until it narrows the
+    /// statement's fan-out (`fan_out_narrowings` on partition 0 moves) or
+    /// ends, or the error it ended with.
+    async fn edge(limit: u64, pipelined: bool) -> Result<Edge, DataFusionError> {
+        let (store, segments) = fixture(None).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
+        let exec = Arc::new(exec_with(fetcher, &segments, 2, PhaseAccounting::new()));
+        let plan: Arc<dyn ExecutionPlan> = if pipelined {
+            exec
+        } else {
+            exec.with_fetch(Some(usize::MAX)).expect("fetch pushdown")
+        };
+        let mut s0 = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute 0");
+        let mut s1 = plan
+            .execute(1, Arc::new(TaskContext::default()))
+            .expect("execute 1");
+        let mut rows = [Vec::new(), Vec::new()];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let first = s1.next().await.expect("partition 1's first batch")?;
+            rows[1].extend(timestamps(&[first]));
+            while partition_metric(plan.as_ref(), "fan_out_narrowings", 0) == 0 {
+                match futures::poll!(s0.next()) {
+                    Poll::Ready(Some(item)) => rows[0].extend(timestamps(&[item?])),
+                    Poll::Ready(None) => break,
+                    Poll::Pending => tokio::task::yield_now().await,
+                }
+            }
+            Ok::<(), DataFusionError>(())
+        })
+        .await
+        .expect("partition 0 parks or ends")?;
+        Ok(Edge {
+            plan,
+            s0,
+            s1,
+            rows,
+            budget,
+        })
+    }
+
+    /// `stream`'s timestamps to its end, or its first error.
+    async fn drain(stream: &mut SendableRecordBatchStream) -> Result<Vec<i64>, DataFusionError> {
+        let mut rows = Vec::new();
+        while let Some(item) = stream.next().await {
+            rows.extend(timestamps(&[item?]));
+        }
+        Ok(rows)
+    }
+
+    /// Issue #3899. At the smallest budget one partition's sequential walk
+    /// completes in, which the two-partition walk exceeds, partition 1 holds
+    /// segment 1's open when partition 0's first open is refused, and its
+    /// retry is refused again. Partition 0 narrows the statement's fan-out
+    /// once and waits; partition 1, polled alone, finishes segment 1 and then
+    /// waits behind partition 0 rather than opening segment 3. Driven
+    /// together, the two partitions then open one segment at a time. Rows per
+    /// partition and segments opened equal an unlimited run's, with the
+    /// pipeline off and on, and exactly one narrowing is counted.
+    ///
+    /// Fails against returning the retry's refusal (partition 0 ends with
+    /// the fetch refusal inside [`edge`]), against letting partition 1 take
+    /// the next turn ahead of the narrowed partition (partition 1 emits
+    /// segments 3 and 5 while partition 0 waits), and against any order
+    /// change in a partition's rows.
+    #[tokio::test]
+    async fn an_open_refused_by_its_own_fan_out_waits_for_a_turn() {
+        let fits_1 = fits_1().await;
+        let fits_2 = fits_2(None).await;
+        assert!(
+            fits_1 < fits_2,
+            "two partitions at once need more than one: {fits_1} < {fits_2}"
+        );
+        let unlimited = run_statement(CEILING, 2, None, true, Drive::Lockstep)
+            .await
+            .expect("unlimited");
+        assert_eq!(unlimited.rows, [rows_of(&[0, 2, 4]), rows_of(&[1, 3, 5])]);
+        assert_eq!(unlimited.metric("fan_out_narrowings"), 0);
+        for pipelined in [false, true] {
+            let Edge {
+                plan,
+                mut s0,
+                mut s1,
+                mut rows,
+                budget,
+            } = edge(fits_1, pipelined)
+                .await
+                .unwrap_or_else(|e| panic!("partition 0 failed (pipelined {pipelined}): {e}"));
+            assert_eq!(
+                partition_metric(plan.as_ref(), "fan_out_narrowings", 0),
+                1,
+                "partition 0 narrowed the fan-out (pipelined {pipelined})"
+            );
+            assert!(rows[0].is_empty(), "partition 0 parked before any row");
+            // Partition 1 alone finishes segment 1, then waits behind
+            // partition 0 instead of opening segment 3.
+            let mut pending_polls = 0;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while pending_polls < 50 {
+                    match futures::poll!(s1.next()) {
+                        Poll::Ready(Some(item)) => {
+                            rows[1].extend(timestamps(&[item.expect("partition 1's batch")]));
+                            pending_polls = 0;
+                        }
+                        Poll::Ready(None) => break,
+                        Poll::Pending => pending_polls += 1,
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("partition 1 parks");
+            assert_eq!(
+                rows[1],
+                rows_of(&[1]),
+                "partition 1 waits for partition 0's turn after segment 1 \
+                 (pipelined {pipelined})"
+            );
+            let (r0, r1) = tokio::time::timeout(
+                Duration::from_secs(10),
+                futures::future::join(drain(&mut s0), drain(&mut s1)),
+            )
+            .await
+            .expect("both partitions end");
+            rows[0].extend(r0.expect("partition 0 completes"));
+            rows[1].extend(r1.expect("partition 1 completes"));
+            assert_eq!(rows.to_vec(), unlimited.rows, "pipelined {pipelined}");
+            assert_eq!(metric_total(plan.as_ref(), "fan_out_narrowings"), 1);
+            assert_eq!(metric_total(plan.as_ref(), "segments_opened"), 6);
+            drop(s0);
+            drop(s1);
+            assert_eq!(budget.reserved(), 0);
+        }
+    }
+
+    /// Issue #3899. One byte below the smallest budget one partition's
+    /// sequential walk completes in, no schedule fits: whichever way the two
+    /// partitions are driven, the statement ends with the typed
+    /// `FetchMemoryExhausted` refusal, carrying the budget's limit, inside
+    /// the timeout and with every reservation released.
+    ///
+    /// Fails against waiting on a refusal no sibling's open can relieve
+    /// (the timeout fires) and against narrowing into any other error.
+    #[tokio::test]
+    async fn a_budget_below_one_open_still_returns_the_typed_refusal() {
+        let limit = fits_1().await - 1;
+        for pipelined in [false, true] {
+            for drive in [Drive::Lockstep, Drive::Spawned] {
+                let err = run_statement(limit, 2, None, pipelined, drive)
+                    .await
+                    .err()
+                    .expect("no schedule fits");
+                let DataFusionError::External(inner) = &err else {
+                    panic!("not an external error: {err}");
+                };
+                match inner.downcast_ref::<SqlError>() {
+                    Some(SqlError::LogFetch(LogFetchError::FetchMemoryExhausted {
+                        limit: refused_at,
+                        ..
+                    })) => assert_eq!(*refused_at, limit),
+                    _ => panic!("not the typed refusal: {err}"),
+                }
+            }
+        }
+    }
+
+    /// Issue #3899. When partition 0 has narrowed the fan-out and partition
+    /// 1, which holds the open it waits on, is never polled again, partition
+    /// 0 ends with the typed refusal once [`NARROWED_ADMISSION_WAIT`] has
+    /// passed, not before. Partition 1 then completes its own segments.
+    ///
+    /// Fails against an unbounded wait (the paused clock reaches twice the
+    /// bound first) and against returning before the bound.
+    #[tokio::test]
+    async fn a_narrowed_wait_is_bounded() {
+        let fits_1 = fits_1().await;
+        let started = tokio::time::Instant::now();
+        let Edge {
+            plan,
+            mut s0,
+            mut s1,
+            mut rows,
+            budget,
+        } = edge(fits_1, false).await.expect("partition 0 parks");
+        assert_eq!(partition_metric(plan.as_ref(), "fan_out_narrowings", 0), 1);
+        tokio::time::pause();
+        let err = match tokio::time::timeout(2 * NARROWED_ADMISSION_WAIT, s0.next())
+            .await
+            .expect("partition 0's wait ends within the bound")
+        {
+            Some(Err(e)) => e,
+            Some(Ok(_)) => panic!("partition 0 emitted a row without a turn"),
+            None => panic!("partition 0 ended without its segments"),
+        };
+        // hygiene-allow: wall-clock -- `started` is a tokio Instant and the
+        // clock is paused, so this reads the injected clock the bound runs on.
+        assert!(
+            started.elapsed() >= NARROWED_ADMISSION_WAIT,
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert!(is_fetch_memory_refusal(&err), "typed refusal: {err}");
+        drop(s0);
+        rows[1].extend(drain(&mut s1).await.expect("partition 1 completes"));
+        assert_eq!(rows[1], rows_of(&[1, 3, 5]));
         drop(s1);
         assert_eq!(budget.reserved(), 0);
     }
