@@ -1311,6 +1311,18 @@ pub struct Cli {
           value_parser = clap::value_parser!(u64).range(1..))]
     pub fold_key_index_build_max_pairs: u64,
 
+    /// With `--fold-key-index-leaves`, every fold this process runs,
+    /// scheduled and on-demand, also builds the metrics `label_value` leaf
+    /// from each metrics object's LABEL_DICT (ADR-3694 decision 2). A PromQL
+    /// selector's positive equality values are then routed through those
+    /// leaves before any object is opened, and an object a value is proven
+    /// absent from is not read (ADR-3694 decision 3). Off by default. While a
+    /// tenant has a pending metrics erasure the fold writes no metrics leaf
+    /// and the query routes nothing. Refused without
+    /// `--fold-key-index-leaves` and in `--mode gateway`, which runs no fold.
+    #[arg(long)]
+    pub fold_metrics_label_index: bool,
+
     /// The interval, in seconds, of the scheduled fold another process runs
     /// for this one's catalog: set it to the maintain tier's
     /// `--fold-interval-secs`. Read only by the request-budget refusal, which
@@ -7010,6 +7022,7 @@ impl Cli {
                     "fold_key_index_build_max_pairs",
                     "--fold-key-index-build-max-pairs",
                 ),
+                ("fold_metrics_label_index", "--fold-metrics-label-index"),
             ] {
                 if passed(id) {
                     return Err(Self::command().error(
@@ -7030,6 +7043,13 @@ impl Cli {
                 "--fold-key-index-build-max-pairs bounds the key-index leaf build, which runs \
                  only with --fold-key-index-leaves. Pass --fold-key-index-leaves, or drop the \
                  flag.",
+            ));
+        }
+        if cli.fold_metrics_label_index && !cli.fold_key_index_leaves {
+            return Err(Self::command().error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "--fold-metrics-label-index needs --fold-key-index-leaves; without it the fold \
+                 builds no leaf. Pass --fold-key-index-leaves, or drop the flag.",
             ));
         }
         if !cli.mode.runs_scheduled_fold() {
@@ -11981,6 +12001,56 @@ mod tests {
         let message = err.to_string();
         assert!(
             message.contains("--fold-key-index-build-max-pairs") && message.contains("gateway"),
+            "the refusal must name the flag and the mode, got: {message}"
+        );
+    }
+
+    /// ADR-3694 decision 2 (issue #3865): `--fold-metrics-label-index` is off
+    /// by default, is accepted beside `--fold-key-index-leaves` wherever a
+    /// fold runs, and is refused without that flag and in `gateway`, as
+    /// `ravel-cli catalog fold --metrics-label-index` is.
+    #[test]
+    fn fold_metrics_label_index_is_off_by_default_and_needs_the_leaf_build() {
+        for mode in ["maintain", "all", "query"] {
+            let cli = Cli::parse_validated_from(["ravel-server", "--mode", mode])
+                .unwrap_or_else(|err| panic!("--mode {mode} starts without the flag: {err}"));
+            assert!(
+                !cli.fold_metrics_label_index,
+                "--mode {mode}: the metrics leaf build is off by default"
+            );
+            let cli = Cli::parse_validated_from([
+                "ravel-server",
+                "--mode",
+                mode,
+                "--fold-key-index-leaves",
+                "--fold-metrics-label-index",
+            ])
+            .unwrap_or_else(|err| panic!("--mode {mode} must accept the flag: {err}"));
+            assert!(cli.fold_metrics_label_index);
+            let err = Cli::parse_validated_from([
+                "ravel-server",
+                "--mode",
+                mode,
+                "--fold-metrics-label-index",
+            ])
+            .expect_err("the metrics leaf without the leaf build must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains("--fold-metrics-label-index")
+                    && message.contains("--fold-key-index-leaves"),
+                "the refusal must name both flags, got: {message}"
+            );
+        }
+        let err = Cli::parse_validated_from([
+            "ravel-server",
+            "--mode",
+            "gateway",
+            "--fold-metrics-label-index",
+        ])
+        .expect_err("a gateway runs no fold and must refuse the flag");
+        let message = err.to_string();
+        assert!(
+            message.contains("--fold-metrics-label-index") && message.contains("gateway"),
             "the refusal must name the flag and the mode, got: {message}"
         );
     }

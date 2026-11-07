@@ -353,6 +353,7 @@ pub fn build_catalog_for_server(
         CatalogConfig {
             build_key_index_leaves: config.fold.build_key_index_leaves,
             key_index_build_max_pairs: config.fold.key_index_build_max_pairs,
+            metrics_label_index: config.fold.metrics_label_index,
             ..server_catalog_config_base()
         },
         store,
@@ -2322,6 +2323,36 @@ mod catalog_cache_tests {
         assert!(
             !crate::FoldTaskConfig::default().build_key_index_leaves,
             "the leaf build is off by default"
+        );
+    }
+
+    /// `--fold-metrics-label-index` reaches the catalog both the scheduled
+    /// and the on-demand fold run with, and the metrics leaf stays off
+    /// without it.
+    #[test]
+    fn build_catalog_for_server_maps_the_metrics_label_index_switch() {
+        for enabled in [false, true] {
+            let config = crate::ServerConfig {
+                fold: crate::FoldTaskConfig {
+                    build_key_index_leaves: true,
+                    metrics_label_index: enabled,
+                    ..crate::FoldTaskConfig::default()
+                },
+                cpu_gate_permits: Default::default(),
+                ..server_config()
+            };
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let catalog = build_catalog_for_server(store, &config, 7_200_000_000_000)
+                .expect("catalog builds");
+            assert_eq!(
+                catalog.config().metrics_label_index,
+                enabled,
+                "the fold's metrics label-index switch must reach the server catalog"
+            );
+        }
+        assert!(
+            !crate::FoldTaskConfig::default().metrics_label_index,
+            "the metrics leaf build is off by default"
         );
     }
 

@@ -2524,7 +2524,43 @@ impl Catalog {
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
     ) -> Result<(Snapshot, SegmentOrigins, SnapshotParts), CatalogError> {
-        let (snapshot, origins, _generations, parts) = self
+        self.resolve_pruned_with_parts_and_generations(
+            tenant,
+            signal,
+            range,
+            min_tokens,
+            now_ns,
+            name_filter,
+            accounting,
+        )
+        .await
+        .map(|(snapshot, origins, _generations, parts)| (snapshot, origins, parts))
+    }
+
+    /// [`Catalog::resolve_pruned_with_parts`] and
+    /// [`Catalog::resolve_pruned_with_generations`] in one resolve: the parts
+    /// the key-index router reads and the generation history the ADR-0103
+    /// pushdown gate reads both come from the same scan set.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_pruned_with_parts_and_generations(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+        accounting: &QueryAccounting,
+    ) -> Result<
+        (
+            Snapshot,
+            SegmentOrigins,
+            Vec<ShardGeneration>,
+            SnapshotParts,
+        ),
+        CatalogError,
+    > {
+        let (snapshot, origins, generations, parts) = self
             .resolve_traced(
                 tenant,
                 signal,
@@ -2539,7 +2575,7 @@ impl Catalog {
         let parts = parts
             .unwrap_or_else(|| SnapshotParts::new(Vec::new(), vec![None; snapshot.segments.len()]));
         let charge = self.reserve_decoded(parts.heap_bytes(), u64::MAX)?;
-        Ok((snapshot, origins, parts.with_charge(charge)))
+        Ok((snapshot, origins, generations, parts.with_charge(charge)))
     }
 
     /// Like [`Catalog::resolve_pruned_with_admission`], but also returns the

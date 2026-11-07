@@ -78,6 +78,12 @@ pub struct FoldTaskConfig {
     /// [`crate::query::build_catalog_for_server`]. Default
     /// [`ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`].
     pub key_index_build_max_pairs: u64,
+    /// Whether those folds also build the metrics `label_value` leaf
+    /// (`--fold-metrics-label-index`, ADR-3694 decision 2), mapped onto
+    /// `CatalogConfig::metrics_label_index` by
+    /// [`crate::query::build_catalog_for_server`]. It takes effect only with
+    /// `build_key_index_leaves`. Default `false`.
+    pub metrics_label_index: bool,
 }
 
 /// Why [`spawn`] refused to start the fold loops. Nothing is spawned.
@@ -109,6 +115,7 @@ impl Default for FoldTaskConfig {
             fold_interval: DEFAULT_FOLD_INTERVAL,
             build_key_index_leaves: false,
             key_index_build_max_pairs: ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+            metrics_label_index: false,
         }
     }
 }

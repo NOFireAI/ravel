@@ -341,7 +341,7 @@ impl RouteFigures {
 }
 
 /// The signals the router serves, as metric rows.
-const ROUTED_SIGNALS: [Signal; 2] = [Signal::Spans, Signal::Logs];
+const ROUTED_SIGNALS: [Signal; 3] = [Signal::Spans, Signal::Logs, Signal::Metrics];
 
 /// Process totals behind `ravel_query_key_index_parts_total{signal,
 /// outcome}` and `ravel_query_key_index_leaf_gets_total{signal}`.

@@ -4521,7 +4521,7 @@ impl KeyIndexRouteTotals {
 }
 
 /// The key-index router family (ADR-3692 decision 7): every part a trace or
-/// log key lookup routed, by the outcome that settled it, and the leaf GETs
+/// log key lookup, or a PromQL selector's equality value, routed, by the outcome that settled it, and the leaf GETs
 /// the routing issued. Every routed signal and outcome renders, zeros
 /// included, so a rate over `outcome="covered"` exists before the first
 /// lookup. Labels are `{mode, signal}` and `outcome`, all closed sets.
@@ -4529,7 +4529,7 @@ fn render_key_index_route_family(out: &mut String, mode: Mode, totals: &KeyIndex
     write_header(
         out,
         "ravel_query_key_index_parts_total",
-        "Catalog parts the key-index router settled for an exact-key lookup, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object KEY_IDX probe.",
+        "Catalog parts the key-index router settled for an exact-key lookup or a PromQL equality value, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object probe.",
         "counter",
     );
     for (signal, outcome, parts) in &totals.parts {
@@ -4547,7 +4547,7 @@ fn render_key_index_route_family(out: &mut String, mode: Mode, totals: &KeyIndex
     write_header(
         out,
         "ravel_query_key_index_leaf_gets_total",
-        "Key-index leaf GETs the router issued for exact-key lookups, by signal, including those of a routing pass dropped before it finished.",
+        "Key-index leaf GETs the router issued for exact-key lookups and PromQL equality values, by signal, including those of a routing pass dropped before it finished.",
         "counter",
     );
     for (signal, gets) in &totals.leaf_gets {
@@ -11689,7 +11689,7 @@ mod tests {
                 "{out}"
             );
         }
-        assert_eq!(totals.parts.len(), 12, "two signals by six outcomes");
+        assert_eq!(totals.parts.len(), 18, "three signals by six outcomes");
         for (signal, outcome, parts) in &totals.parts {
             let line = format!(
                 "ravel_query_key_index_parts_total{{mode=\"query\",signal=\"{}\",outcome=\"{}\"}} {parts}\n",
@@ -11698,7 +11698,7 @@ mod tests {
             );
             assert_eq!(out.matches(&line).count(), 1, "{line} in:\n{out}");
         }
-        for signal in ["spans", "logs"] {
+        for signal in ["spans", "logs", "metrics"] {
             let line = format!(
                 "ravel_query_key_index_leaf_gets_total{{mode=\"query\",signal=\"{signal}\"}} 900\n"
             );
@@ -11706,7 +11706,7 @@ mod tests {
         }
         assert_eq!(
             out.lines().filter(|l| !l.starts_with('#')).count(),
-            14,
+            21,
             "{out}"
         );
     }

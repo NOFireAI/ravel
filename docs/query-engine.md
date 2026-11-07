@@ -1152,6 +1152,68 @@ The gate is armed by the PromQL metrics fetch (`prefetch_metric_plans`). The
 SQL, distributed and series-listing fetches leave it unarmed and run the
 one-step probe. A dropped object still counts in `segmentsFetched`.
 
+### The label-value route (ADR-3694 decision 3)
+
+Before any metrics segment is opened, `prefetch_metric_plans` takes the
+snapshot's catalog parts (`SnapshotParts`, ADR-3692 decision 1) from the same
+resolve as the snapshot and routes each distinct positive equality value `v`
+of the statement (a `k="v"` matcher with a non-empty `v`, `__name__`
+included) through the tier-2 router, `key_index_route::route`, as its own
+one-key set: field `label_value`, key type `Str`, `key8(v)` (the ADR's
+per-value routing amendment). A part whose metrics leaf answers "absent"
+proves that no object in it holds the string `v`, so no series in it carries
+`k="v"`. The leaf exists only on parts a fold built with
+`--fold-key-index-leaves` and `--fold-metrics-label-index`.
+
+- A selector plan (a distinct matcher set) drops a segment when any of its
+  values routes it `Pruned`: the values are a conjunction. `Blocks` and
+  `Uncovered` both keep the segment; a metrics object has no blocks to read,
+  so a `Blocks` list is never a read list. One multi-key set would prune a
+  part only when every key is absent from it, so a metric name held by every
+  object would keep them all
+  (`promql_query_range_prunes_non_holders_by_label_index` in
+  `services/ravel-server/tests/metrics_label_index_routing.rs`, whose metric
+  name is in every object).
+- `!=`, regex and empty-value matchers route nothing, and a plan with no
+  positive equality value is not routed and reads every segment
+  (`a_regex_only_selector_routes_nothing`).
+- In a compound query each plan routes over the padded union window the one
+  resolve covers and fetches only the segments it keeps, and those include
+  every segment holding a series the plan matches
+  (`a_compound_query_with_disjoint_selectors_equals_the_unrouted_run`).
+- A recent segment above the fold watermark and a segment resolved from a
+  `min_commit_token` belong to no part, route `Uncovered`, and are always
+  read (`an_unfolded_recent_object_is_never_pruned`).
+- While the pinned snapshot carries a pending erasure request, nothing is
+  routed: no leaf GET and no prune (`a_pending_erasure_routes_nothing`).
+- When no part a snapshot segment comes from carries a metrics leaf ref,
+  nothing is routed: no leaf GET, and no part counted in
+  `ravel_query_key_index_parts_total`
+  (`without_the_switch_the_route_does_not_run`). The parts themselves are
+  still resolved, since the check reads them.
+- Each value is one routing pass under the router's unchanged `L_max`,
+  `P_max` and `B_run` admission, so leaf GETs grow with the number of
+  distinct values. The passes run at most `promql_fetch_fanout` at a time. A
+  leaf that names another tenant or signal fails the statement; any other
+  leaf failure leaves its part `Uncovered`.
+- The leaf GETs count against `max_s3_requests` and `max_bytes_scanned`.
+  When the route issued a leaf GET, both budgets are checked once it
+  returns, before the first segment fetch, and so also when every segment
+  was pruned and no fetch runs; such a query refuses with the same budget
+  error a fetch batch returns
+  (`a_route_that_prunes_every_object_is_held_to_the_budgets`). A route that
+  issued no leaf GET adds no check before the fetch batches' own.
+
+`segmentsPrunedByLabelIndex`, beside `segmentsPruned` in `data.stats`, counts
+the snapshot segments no plan reads. Unlike a dictionary drop, a pruned
+segment is not counted in `segmentsFetched`. The leaf GETs and their wire
+bytes are charged to the `keyIndex` phase, and the route's parts and leaf
+GETs to `ravel_query_key_index_parts_total` and
+`ravel_query_key_index_leaf_gets_total` under `signal="metrics"`. With no
+metrics leaf in the snapshot, `segmentsPrunedByLabelIndex` and the
+`keyIndex` figures are zero
+(`without_the_switch_the_route_does_not_run`).
+
 ### The L0 page-range bound (ADR-1306)
 
 An unsealed L0 flush is one ingest buffer. Ingest's 8 MiB `target_bytes` size
@@ -4142,6 +4204,10 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   query: GETs that other queries, the SQL path, or the RLOG whole-object
   funnel (which takes a permit too since ADR-1195) issue at the same time
   compete for the same permits and are not counted here.
+  Every figure here counts the whole resolved snapshot, before the
+  label-value route runs: when the route prunes segments, each plan reads
+  only its own surviving segments, so none of the lower bounds below holds
+  for that query.
   Within a single wave, that wave's own `batches_w` (defined below) is a
   true lower bound: the OUTER `buffer_unordered`'s binding capacity for
   that wave cannot service more than `capacity_w` requests per round, so

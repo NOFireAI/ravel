@@ -4518,6 +4518,172 @@ fn histogram_value_footprint(v: &HistogramValue) -> u64 {
         + 1 // reset_hint: fieldless enum
 }
 
+/// The tier-2 router's [`LeafRangeReader`](crate::key_index_route::LeafRangeReader)
+/// for metrics (ADR-3694 decision 3): each leaf range goes through
+/// [`SegmentFetcher::read_leaf_range`], so it shares the read cache (keyed by
+/// the leaf's `blake3`), the GET limiter and the fetch reservation with the
+/// segment reads, and a GET that reaches the store is timed under
+/// [`QueryPhase::KeyIndex`] and charged to the router's accounting handle.
+pub(crate) struct MetricLeafRangeReader<'a> {
+    fetcher: &'a SegmentFetcher,
+    tenant_hash: TenantHash,
+}
+
+impl<'a> MetricLeafRangeReader<'a> {
+    pub(crate) fn new(fetcher: &'a SegmentFetcher, tenant_hash: TenantHash) -> Self {
+        MetricLeafRangeReader {
+            fetcher,
+            tenant_hash,
+        }
+    }
+}
+
+impl crate::key_index_route::LeafRangeReader for MetricLeafRangeReader<'_> {
+    fn read_range<'b>(
+        &'b self,
+        leaf: &'b ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef,
+        range: std::ops::Range<u64>,
+        accounting: &'b QueryAccounting,
+    ) -> futures::future::BoxFuture<'b, Result<Bytes, crate::key_index_route::LeafReadError>> {
+        Box::pin(async move {
+            let content_hash: [u8; 32] = leaf
+                .blake3
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("leaf {}: blake3 is not 32 bytes", leaf.key))?;
+            let len = range.end.saturating_sub(range.start);
+            if len == 0 || range.end > leaf.size {
+                return Err(format!(
+                    "leaf {}: range {range:?} outside {} bytes",
+                    leaf.key, leaf.size
+                )
+                .into());
+            }
+            self.fetcher
+                .read_leaf_range(
+                    &leaf.key,
+                    content_hash,
+                    self.tenant_hash,
+                    range.start,
+                    len,
+                    accounting,
+                )
+                .await
+                .map_err(|e| match e {
+                    FetchError::FetchMemoryExhausted { .. } => {
+                        crate::key_index_route::LeafReadError::ReservationRefused(e.to_string())
+                    }
+                    e => crate::key_index_route::LeafReadError::Failed(e.to_string()),
+                })
+        })
+    }
+}
+
+impl SegmentFetcher {
+    /// One exact range of an immutable key-index leaf, through the read cache
+    /// when one is set, under the fetch reservation and the GET limiter. The
+    /// GET is timed under [`QueryPhase::KeyIndex`] and counted on
+    /// `accounting` once issued; bytes count on arrival. A short read is
+    /// refused, inside the cache fetch so the cache never admits it.
+    pub(crate) async fn read_leaf_range(
+        &self,
+        key: &str,
+        content_hash: [u8; 32],
+        tenant_hash: TenantHash,
+        start: u64,
+        len: u64,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, FetchError> {
+        let range = GetRange::Range(start, start.saturating_add(len));
+        let reservation = self.reserve_fetch(len)?;
+        let short_read = |got: usize| {
+            (got as u64 != len).then(|| format!("short read: got {got} bytes of {len}"))
+        };
+        let Some(cache) = &self.cache else {
+            let got = self
+                .store_get(key, range, accounting)
+                .in_get_phase(QueryPhase::KeyIndex.into())
+                .await
+                .map_err(|source| FetchError::Store {
+                    key: key.to_string(),
+                    source,
+                })?;
+            if let Some(message) = short_read(got.data.len()) {
+                return Err(FetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(message),
+                });
+            }
+            return Ok(crate::reserved_bytes::attach_reservation(
+                got.data,
+                reservation,
+            ));
+        };
+        let cache_key = CacheKey::new(tenant_hash.0, content_hash, start, len);
+        let (bytes, outcome) = cache
+            .get_or_fetch(cache_key, accounting.access_intent(), || async move {
+                let got = self
+                    .store_get(key, range, accounting)
+                    .in_get_phase(QueryPhase::KeyIndex.into())
+                    .await
+                    .map_err(|source| CacheFetchError::Store(std::sync::Arc::new(source)))?;
+                if let Some(message) = short_read(got.data.len()) {
+                    return Err(CacheFetchError::Corrupt {
+                        key: key.to_string(),
+                        message,
+                    });
+                }
+                Ok(got.data)
+            })
+            .await
+            .map_err(|err| {
+                let message = match err {
+                    SingleFlightError::Upstream(CacheFetchError::Store(source)) => {
+                        return FetchError::Store {
+                            key: key.to_string(),
+                            source: clone_store_error(&source),
+                        };
+                    }
+                    SingleFlightError::Upstream(CacheFetchError::Corrupt { message, .. }) => {
+                        message
+                    }
+                    SingleFlightError::Upstream(CacheFetchError::EtagChanged { .. }) => {
+                        "the leaf read pins no etag".to_string()
+                    }
+                    SingleFlightError::Upstream(CacheFetchError::BudgetRefused) => {
+                        "the leaf read admits against no budget".to_string()
+                    }
+                    SingleFlightError::LeaderLost => {
+                        "cache single-flight leader lost before producing a result".to_string()
+                    }
+                };
+                FetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(message),
+                }
+            })?;
+        let mut reservation = reservation;
+        match outcome {
+            ReadOutcome::Hit => {
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+            }
+            ReadOutcome::LateServe => {
+                accounting.record_cache_miss();
+                accounting.add_late_served_bytes(bytes.len() as u64);
+            }
+            ReadOutcome::Fetched => accounting.record_cache_miss(),
+        }
+        // The returned bytes share the cache entry's allocation, which the
+        // cache's own ledger covers too (ADR-1170 decision 2).
+        reservation.mark_handed_off();
+        Ok(crate::reserved_bytes::attach_reservation(
+            bytes,
+            reservation,
+        ))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
