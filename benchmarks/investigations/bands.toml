@@ -1,4 +1,4 @@
-# ADR-3692 Acceptance rows 1 to 17, transcribed from
+# ADR-3692 Acceptance rows 1 to 18, transcribed from
 # docs/adrs/3692-selective-investigations-logs-traces.md ("Acceptance
 # (pre-registered ...)"). The text of `check`, `target`, `miss` and `source`
 # is the ADR's own cells, verbatim; the target_if and miss_if expressions are
@@ -20,8 +20,11 @@
 #   metric      what evaluate.py extracts (README.md "Evaluation"):
 #                 <temp>.max|min.<name>       a statement's call counters
 #                 <temp>.rows_exact, <temp>.rows_match_state.<state>,
-#                 <temp>.wall_p50_s, <temp>.control_1001
+#                 <temp>.wall_p50_s, <temp>.wall_iqr_s,
+#                 <temp>.leaf_wall_p50_s, <temp>.control_1025
 #                 stamp.<what>.<label>        stamps/STATE.LABEL.*.json
+#                 stamp.slices.<label>.<field> the most leaves one part
+#                                             carries for the field
 #                 leaf_share.<label>.<field>  that field's leaf bytes over the
 #                                             label's census data bytes, in %
 #                 census.<tenant>.<signal>.objects|bytes|objects_over_512k
@@ -412,11 +415,32 @@ target_if = "m['row_06.hits_objects_over_512k'] <= v <= 2 * m['row_06.hits_objec
 miss_if = "v < m['row_06.hits_objects_over_512k']"
 miss_reason = "fewer keyIndex GETs than objects above 512 KiB: one was read without its probe"
 
+# Objects read past the probe are the probed objects the key index did not
+# prune: the plan phase's segmentsOpened less pruning.segmentsPrunedByKeyIndex.
+# The logs keyed plan counts every object whose KEY_IDX footer it probed as
+# opened in the plan phase, absent key or not (log_fetcher.rs,
+# plan_segment_keyed and probe_segment_keyed). The scan phase's segmentsOpened
+# is not this figure: the plan does not probe an object at or under 512 KiB,
+# so the scan can open objects no probe saw. Box C's q20: 523 objects, 26
+# pruned by stats, 4 at or under 512 KiB, 493 probed, 492 of those pruned by
+# the key index, so 1 here and 5 survivors in all; the scan opened 4 of the 5,
+# and the stats do not name which.
+#
+# The figure is judged only when the plan opened exactly the probed objects:
+# plan segmentsOpened == census objects_over_512k - pruning.segmentsPrunedByStats
+# (box C: 519 - 26 = 493). The plan keeps objects at or under 512 KiB out
+# only when it skips sub-bound plans (plan.rs, skips_sub_bound_plans);
+# otherwise it opens them unprobed and they would count as survivors. When
+# the equality fails, or the census carries no objects_over_512k for the
+# statement's tenant and signal, the figure reads incomplete with the
+# precondition as its reason, never a hold or a miss. A small object pruned by stats also breaks
+# the equality (it is in segmentsPrunedByStats but not in objects_over_512k),
+# which reads incomplete too: the safe direction.
 [[row.figure]]
 name = "objects_past_probe"
 statement = "q20_hits"
 state = "unfolded"
-metric = "cold.max.segments_opened"
+metric = "cold.max.probe_survivors"
 lane = "counter"
 target_if = "v == 1"
 
@@ -469,6 +493,45 @@ requires_tenant = "inv"
 # reads the inspector's footer length of one census object as every new
 # entry's; the miss reads "over" as at least, since a from-scratch rebuild
 # is exactly 2 x tail entries.
+#
+# The section GETs are judged per build pass, the #3704 amendment's form as
+# the pass-end slice amendment restates it: a build of G passes re-reads its
+# new and still-uncovered entries' sections on every pass, so the target is
+# 2 x (new + uncovered) x passes ranged GETs (plus one per such entry and
+# pass whose footer exceeds 8 KiB), with the previous leaves read once per
+# fold as key_index_leaf_gets, a fold report field of its own, equal to the
+# previous leaves; the miss is 2 x tail entries per pass, 2 x tail x passes.
+# A total compared with 2 x tail entries cannot tell a rebuild from extra
+# passes: box D's logs advance read 22 new entries per pass over 27 passes,
+# 1,188 ranged GETs, over 2 x 570 = 1,140 and still no rebuild. The second
+# signal is the fold's own section count per pass, key_index_sections_read
+# over key_index_build_passes, which a rebuild puts at the tail's entry
+# count and an incremental advance at new + uncovered. Uncovered is the fold
+# report's key_index_uncovered_entries, the entries no leaf covers after the
+# fold summed over fields: each was read on every pass, and an entry
+# uncovered for two fields counts twice, which can only widen the target.
+# The report carries no per-field count, so the row cannot judge per field.
+# The sum is safe against a rebuild: neither miss line reads it, and a figure
+# whose miss holds is a miss whatever its target says.
+#
+# The target's passes are G, the pass-end slice amendment's greedy
+# partition, bounded (evaluate.py g_bounds) from the fold report's
+# key_index_pair_budget and key_index_field_pairs, each indexed field's total
+# pairs with zero-pair fields included (evaluate.py G_INPUTS): with share
+# s = max(1, budget // F), a field of P pairs takes between ceil(P / s) and
+# 2 x ceil(P / s) - 1 groups, at least 1, and the build's passes hold between
+# the largest low and the largest high bound over fields, missing outside.
+# Per-field key8 runs would give G exactly but would make the fold hold every
+# run in memory, which the pair budget exists to prevent. No fold report
+# carries the inputs yet (issue #3948 adds them), so build_passes_low and
+# build_passes_high read not-computable naming the missing inputs,
+# build_passes, judged against them, reads not-computable too, and each
+# leaves the run incomplete: row 7 cannot hold until the fold report carries
+# G's inputs. build_passes has no miss_if: a rebuild whose passes fall
+# between the bounds reads as within range there, and the per-pass section
+# figures (section_gets, sections_per_pass) are what catch a rebuild. The
+# passes still enter the section GETs and section reads per pass as the
+# build reports them.
 requires_states = ["mixed"]
 
 [[row.figure]]
@@ -513,14 +576,46 @@ lane = "counter"
 target_if = "v >= 0"
 
 [[row.figure]]
+name = "spans_uncovered_entries"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_uncovered_entries"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
 name = "spans_section_gets"
 statement = "fold"
 state = "fold_advance"
 metric = "fold.inv.spans.key_index_ranged_gets"
 lane = "counter"
-target_if = "v <= 2 * m['row_07.spans_new_entries'] + (m['row_07.spans_new_entries'] if m['row_07.spans_footer_len'] > 8192 else 0) + m['row_07.spans_previous_leaves']"
-miss_if = "v >= 2 * m['row_07.spans_tail_entries']"
-miss_reason = "from-scratch rebuild: section GETs = 2 x entry_count"
+target_if = "v <= (2 * (m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) + ((m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) if m['row_07.spans_footer_len'] > 8192 else 0)) * m['row_07.spans_build_passes']"
+miss_if = "v >= 2 * m['row_07.spans_tail_entries'] * m['row_07.spans_build_passes']"
+miss_reason = "from-scratch rebuild: section GETs = 2 x entry_count per pass"
+
+[[row.figure]]
+name = "spans_leaf_gets"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_leaf_gets"
+lane = "counter"
+target_if = "v == m['row_07.spans_previous_leaves']"
+
+[[row.figure]]
+name = "spans_build_passes_low"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_g_low"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_build_passes_high"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_g_high"
+lane = "counter"
+target_if = "v >= m['row_07.spans_build_passes_low']"
 
 [[row.figure]]
 name = "spans_build_passes"
@@ -528,7 +623,26 @@ statement = "fold"
 state = "fold_advance"
 metric = "fold.inv.spans.key_index_build_passes"
 lane = "counter"
-target_if = "v == 1"
+target_if = "m['row_07.spans_build_passes_low'] <= v <= m['row_07.spans_build_passes_high']"
+
+[[row.figure]]
+name = "spans_sections_read"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_sections_read"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "spans_sections_per_pass"
+statement = "derived"
+state = "fold_advance"
+metric = "derived"
+expr = "m['row_07.spans_sections_read'] / max(m['row_07.spans_build_passes'], 1)"
+lane = "counter"
+target_if = "v <= m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']"
+miss_if = "v >= m['row_07.spans_tail_entries']"
+miss_reason = "from-scratch rebuild: every tail entry's section read on a pass"
 
 [[row.figure]]
 name = "spans_peak_rss_bytes"
@@ -581,14 +695,46 @@ lane = "counter"
 target_if = "v >= 0"
 
 [[row.figure]]
+name = "logs_uncovered_entries"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_uncovered_entries"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
 name = "logs_section_gets"
 statement = "fold"
 state = "fold_advance"
 metric = "fold.inv.logs.key_index_ranged_gets"
 lane = "counter"
-target_if = "v <= 2 * m['row_07.logs_new_entries'] + (m['row_07.logs_new_entries'] if m['row_07.logs_footer_len'] > 8192 else 0) + m['row_07.logs_previous_leaves']"
-miss_if = "v >= 2 * m['row_07.logs_tail_entries']"
-miss_reason = "from-scratch rebuild: section GETs = 2 x entry_count"
+target_if = "v <= (2 * (m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']) + ((m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']) if m['row_07.logs_footer_len'] > 8192 else 0)) * m['row_07.logs_build_passes']"
+miss_if = "v >= 2 * m['row_07.logs_tail_entries'] * m['row_07.logs_build_passes']"
+miss_reason = "from-scratch rebuild: section GETs = 2 x entry_count per pass"
+
+[[row.figure]]
+name = "logs_leaf_gets"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_leaf_gets"
+lane = "counter"
+target_if = "v == m['row_07.logs_previous_leaves']"
+
+[[row.figure]]
+name = "logs_build_passes_low"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_g_low"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_build_passes_high"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_g_high"
+lane = "counter"
+target_if = "v >= m['row_07.logs_build_passes_low']"
 
 [[row.figure]]
 name = "logs_build_passes"
@@ -596,7 +742,26 @@ statement = "fold"
 state = "fold_advance"
 metric = "fold.inv.logs.key_index_build_passes"
 lane = "counter"
-target_if = "v == 1"
+target_if = "m['row_07.logs_build_passes_low'] <= v <= m['row_07.logs_build_passes_high']"
+
+[[row.figure]]
+name = "logs_sections_read"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_sections_read"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "logs_sections_per_pass"
+statement = "derived"
+state = "fold_advance"
+metric = "derived"
+expr = "m['row_07.logs_sections_read'] / max(m['row_07.logs_build_passes'], 1)"
+lane = "counter"
+target_if = "v <= m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']"
+miss_if = "v >= m['row_07.logs_tail_entries']"
+miss_reason = "from-scratch rebuild: every tail entry's section read on a pass"
 
 [[row.figure]]
 name = "logs_peak_rss_bytes"
@@ -1071,38 +1236,46 @@ metric = "cold.max.per_part.leaf_bytes"
 lane = "counter"
 target_if = "v <= m['row_11.logs_part_entries'] * 11 * 1024"
 
-# The 1,001-key controls, one per table and key kind (evaluate.py
-# control_1001). The 1,001-key twin is judged first: 0 when one of its cold
-# calls carries a nonzero keyIndex figure, or was served with no keyIndex
-# figure, no probe or scan GET and no block scanned; a refused twin call
-# passes. Then the 1,000-key list: refused-by-guard when the SQL complexity
+# The over-cap controls, one per table and key kind (evaluate.py
+# control_1025): 1,025 keys, one over decision 6's k = 1,024 (the Stage 1
+# amendment). The guard admits the list (a flat list costs one unit plus one
+# per 64 literals, up to 4,096 literals) and the planner carries no key set
+# past 1,024 keys, so a correct build answers it with a scan: keysProbed 0,
+# partsCovered 0, 0 leaf GETs (services/ravel-server/tests/sql_key_in.rs,
+# in_list_rows_equal_the_union_of_equalities). The 1,025-key twin is judged
+# first: 0 when one of its cold calls carries a nonzero keyIndex figure, or
+# was served with no keyIndex figure, no probe or scan GET and no block
+# scanned. Then the 1,000-key list: refused-by-guard when the SQL complexity
 # guard refused it, unsupported-on-this-build when it was refused otherwise or
 # carries no keyIndex.keysProbed and partsCovered, 0 when it probed another
-# count or covered no part, else 1. A build from before ADR-3692's key set
-# amendment refuses both lists (MAX_STATEMENT_COMPLEXITY = 1,000 at one unit
-# per token), so on such a build all three read refused-by-guard
-# (fixtures/local-smoke, pinned by test_control_1001_refused_by_guard_on_main).
+# count or reported partsCovered 0 with no part in an Uncovered outcome, or
+# when the twin was refused while it was admitted, else 1. A part Uncovered
+# by budget (partsCovered 0, skippedByBudget 1, as on box C) still carried
+# the 1,000-key set, so it passes. A build from before ADR-3692's key set amendment refuses
+# both lists (MAX_STATEMENT_COMPLEXITY = 1,000 at one unit per token), so on
+# such a build all three read refused-by-guard (fixtures/local-smoke, pinned
+# by test_control_1025_refused_by_guard_on_main).
 [[row.figure]]
-name = "spans_control_1001"
+name = "spans_control_1025"
 statement = "spans_in_1000"
 state = "folded_leaves"
-metric = "cold.control_1001"
+metric = "cold.control_1025"
 lane = "counter"
 target_if = "v == 1"
 
 [[row.figure]]
-name = "logs_trace_control_1001"
+name = "logs_trace_control_1025"
 statement = "logs_trace_in_1000"
 state = "folded_leaves"
-metric = "cold.control_1001"
+metric = "cold.control_1025"
 lane = "counter"
 target_if = "v == 1"
 
 [[row.figure]]
-name = "logs_request_control_1001"
+name = "logs_request_control_1025"
 statement = "logs_request_in_1000"
 state = "folded_leaves"
-metric = "cold.control_1001"
+metric = "cold.control_1025"
 lane = "counter"
 target_if = "v == 1"
 
@@ -1573,3 +1746,197 @@ state = "all"
 metric = "cost.break_even_without_frequency"
 lane = "counter"
 target_if = "v == 0"
+
+[[row]]
+key = "row_18"
+adr_row = 18
+check = "key-set lookup time: `IN` lists of 10 and 100 keys on logs request_id, logs trace_id and spans trace_id, folded with leaves after one fold advance (`advanced_leaves`), against the same statement unfolded (row 18 amendment)"
+target = "p50 at most the unfolded p50 of the same statement on the same box plus its noise, the larger of 5 % of that p50 and half the unfolded statement's interquartile range over its cold calls, for every field and list size, with no covering part `Uncovered`"
+miss = "over that bound for any field and list size; a cell whose part went `Uncovered` is not measured, not a hold, since its time is the tier-1 probe's"
+source = "predicted; comment 6703881894; box C before #3917: logs request_id at 100 keys 7.64 s against 3.01 s (s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl)"
+requires_tenant = "inv"
+# One cell per (field, list size): the advanced_leaves p50 of the cold calls
+# (cold.leaf_wall_p50_s) against the bound U + max(0.05 x U, 0.5 x IQR), U
+# the unfolded p50 of the same statement and IQR the 75th less the 25th
+# percentile of its unfolded cold wall times, both on this run's box. A
+# cell any of whose cold calls left a covering part Uncovered (partsCovered
+# 0, or partsUncovered, skippedByBudget, partsBeyondCeiling, leavesRejected
+# or reservationsRefused above 0) is not-measured: not a hold, and the run's
+# verdict is at best incomplete. The row is not-run, with the reason, when
+# either state is absent.
+requires_states = ["advanced_leaves", "unfolded"]
+
+[[row.figure]]
+name = "logs_request_id_10_unfolded_p50_s"
+statement = "logs_request_in_10"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_10_unfolded_iqr_s"
+statement = "logs_request_in_10"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_10_p50_s"
+statement = "logs_request_in_10"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_request_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_request_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_request_id_100_unfolded_p50_s"
+statement = "logs_request_in_100"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_100_unfolded_iqr_s"
+statement = "logs_request_in_100"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_100_p50_s"
+statement = "logs_request_in_100"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_trace_id_10_unfolded_p50_s"
+statement = "logs_trace_in_10"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_10_unfolded_iqr_s"
+statement = "logs_trace_in_10"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_10_p50_s"
+statement = "logs_trace_in_10"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_trace_id_100_unfolded_p50_s"
+statement = "logs_trace_in_100"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_100_unfolded_iqr_s"
+statement = "logs_trace_in_100"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_100_p50_s"
+statement = "logs_trace_in_100"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_100_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "spans_trace_id_10_unfolded_p50_s"
+statement = "spans_in_10"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_10_unfolded_iqr_s"
+statement = "spans_in_10"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_10_p50_s"
+statement = "spans_in_10"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.spans_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.spans_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "spans_trace_id_100_unfolded_p50_s"
+statement = "spans_in_100"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_100_unfolded_iqr_s"
+statement = "spans_in_100"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_100_p50_s"
+statement = "spans_in_100"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.spans_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.spans_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_100_unfolded_iqr_s'])"
+
+# The slices per (part, field) the lookups touched, reported beside the
+# row: the most leaves one part of the advanced_leaves catalog stamp
+# carries for each field. The state's own precondition (inv.py
+# advance-check) is that logs request_id carries more than the leaf
+# rebuild wrote, so the figure that compares them repeats it.
+[[row.figure]]
+name = "logs_request_id_slices_rebuild"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_request_id_slices"
+statement = "stamp"
+state = "advanced_leaves"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v > m['row_18.logs_request_id_slices_rebuild']"
+
+[[row.figure]]
+name = "logs_trace_id_slices"
+statement = "stamp"
+state = "advanced_leaves"
+metric = "stamp.slices.logs.trace_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_trace_id_slices"
+statement = "stamp"
+state = "advanced_leaves"
+metric = "stamp.slices.spans.trace_id"
+lane = "counter"
+target_if = "v >= 1"
