@@ -4025,15 +4025,28 @@ struct PageBatch {
 }
 
 /// The coalesced footprint of one batch's ranges in one page section (TS,
-/// VAL or HIST). Within a section a batch's ranges arrive in ascending offset
-/// order (series in catalog order, each series' runs back to back), so a
-/// range that starts within `gap` of the tail extends the run it bridges to
-/// and any other range opens a new run: `bytes` is exactly what
-/// [`coalesce_ranges`] makes of the section's ranges, bridged gaps included.
+/// VAL or HIST).
+///
+/// A well-formed segment gives each section's ranges in ascending offset
+/// order: page offsets are running totals in run order (docs/segment-format.md,
+/// "Page locations reconstruct per run"), and [`page_batches`] adds them in
+/// catalog order, run by run. A range whose start is at or above every earlier
+/// range's start extends the run it bridges to when it starts within `gap` of
+/// the tail and opens a new run otherwise, so ascending ranges are counted
+/// exactly as [`coalesce_ranges`] counts them, bridged gaps included.
+///
+/// A range that starts below the largest start seen so far, which only a
+/// malformed catalog produces, is counted as its length plus two gaps:
+/// inserted into a sorted set, a range adds at most its own length plus one
+/// bridged gap on each side. That is an upper bound, which can over-count and
+/// never undercounts, the safe direction for the reservation [`page_batches`]
+/// bounds by these bytes.
 #[derive(Debug, Clone, Copy, Default)]
 struct SectionSpan {
-    /// Start of the section's first range, `None` while the batch holds none.
+    /// Smallest start of any range so far, `None` while the batch holds none.
     first: Option<u64>,
+    /// Largest start of any range so far.
+    last_start: u64,
     /// Largest end of any range so far.
     tail: u64,
     /// Coalesced bytes so far.
@@ -4043,20 +4056,23 @@ struct SectionSpan {
 impl SectionSpan {
     fn add(&mut self, (start, end): (u64, u64), gap: u64) {
         let end = end.max(start);
-        if self.first.is_some() && start <= self.tail.saturating_add(gap) {
-            self.bytes = self.bytes.saturating_add(end.saturating_sub(self.tail));
-        } else {
-            self.first.get_or_insert(start);
-            self.bytes = self.bytes.saturating_add(end - start);
-        }
+        let len = end - start;
+        let added = match self.first {
+            Some(_) if start < self.last_start => len.saturating_add(gap.saturating_mul(2)),
+            Some(_) if start <= self.tail.saturating_add(gap) => end.saturating_sub(self.tail),
+            _ => len,
+        };
+        self.bytes = self.bytes.saturating_add(added);
+        self.first = Some(self.first.map_or(start, |first| first.min(start)));
+        self.last_start = self.last_start.max(start);
         self.tail = self.tail.max(end);
     }
 }
 
 /// The bytes the coalesced runs over a batch's ranges cover: each section's
 /// own coalesced bytes, plus the gap [`coalesce_ranges`] bridges where one
-/// section's last run ends within `gap` of the next section's first range
-/// (the page sections are disjoint and laid out one after another).
+/// section's last run ends within `gap` of the next section's lowest range
+/// start (the page sections are disjoint and laid out one after another).
 fn coalesced_batch_bytes(sections: &[SectionSpan; 3], gap: u64) -> u64 {
     let mut present: Vec<(u64, &SectionSpan)> = sections
         .iter()
@@ -4093,10 +4109,10 @@ fn coalesced_batch_bytes(sections: &[SectionSpan; 3], gap: u64) -> u64 {
 /// what bounds it by the bytes counted here. Counting ranges those regions
 /// already hold over-counts, the safe direction.
 ///
-/// A series whose runs reach past the end of its kind's planned list is an
-/// inconsistency between the catalog entries and the planned ranges, and
-/// fails with [`SegmentError::SectionOutOfBounds`](ravel_segment::SegmentError::SectionOutOfBounds)
-/// rather than batching the series with fewer plans than runs.
+/// A planned list shorter or longer than the runs of its kind's series in
+/// `wanted` is an inconsistency between the catalog entries and the planned
+/// ranges, and fails with [`SegmentError::SectionOutOfBounds`](ravel_segment::SegmentError::SectionOutOfBounds)
+/// rather than batching with fewer plans than runs or leaving plans unused.
 fn page_batches(
     wanted: &[&SeriesEntryV4],
     scalar_planned: &[ravel_segment::PlannedRunRange],
@@ -4167,6 +4183,9 @@ fn page_batches(
             current.scalar.end = scalar;
             current.scalar_plans.end = scalar_plans;
         }
+    }
+    if scalar_plans != scalar_planned.len() || histogram_plans != histogram_planned.len() {
+        return Err(ravel_segment::SegmentError::SectionOutOfBounds);
     }
     if !(current.scalar.is_empty() && current.histogram.is_empty()) {
         batches.push(current);
@@ -9689,6 +9708,220 @@ mod tests {
             "a series with more runs than planned ranges must refuse, got {:?}",
             result.map(|b| b.iter().map(|b| b.scalar_plans.clone()).collect::<Vec<_>>()),
         );
+    }
+
+    /// A planned list with more entries than its kind's runs refuses for
+    /// either kind, and exact lists for a mixed set still batch, each list
+    /// covered once end to end.
+    #[test]
+    fn page_batches_refuses_a_plan_list_longer_than_the_runs() {
+        let entry = |name: &str, kind: ValueKind, runs: u64| {
+            let series_id = SeriesId::compute(&TenantId::new("t".to_string()), name, &labels(name))
+                .expect("id");
+            SeriesEntryV4 {
+                entry: SeriesEntry {
+                    series_id,
+                    labels: labels(name),
+                    sample_count: runs as u32,
+                    min_ts_ns: 0,
+                    max_ts_ns: 0,
+                    ts_page: (0, 0),
+                    val_page: (0, 0),
+                    value_kind: kind,
+                    hist_page: (0, 0),
+                },
+                runs: (0..runs)
+                    .map(|i| RunEntry {
+                        created_unix_ns: 0,
+                        writer_epoch: 0,
+                        writer_seq: i,
+                        sample_count: 1,
+                        min_ts_ns: 0,
+                        max_ts_ns: 0,
+                        ts_page: (i * 8, 8),
+                        val_page: (i * 8, 8),
+                        hist_page: (i * 8, 8),
+                    })
+                    .collect(),
+                per_sample_provenance: Vec::new(),
+            }
+        };
+        // `g` numbers the runs across both kinds in catalog order, so every
+        // run's TS range follows the previous run's directly.
+        let plan = |e: &SeriesEntryV4, run: u64, g: u64| ravel_segment::PlannedRunRange {
+            series_id: e.entry.series_id,
+            run_index: run as usize,
+            ts_range: (100 + g * 8, 8),
+            val_range: if e.entry.value_kind == ValueKind::Histogram {
+                (0, 0)
+            } else {
+                (1_000 + g * 8, 8)
+            },
+            hist_range: if e.entry.value_kind == ValueKind::Histogram {
+                (2_000 + g * 8, 8)
+            } else {
+                (0, 0)
+            },
+        };
+        let a = entry("a", ValueKind::Scalar, 2);
+        let h = entry("h", ValueKind::Histogram, 2);
+        let b = entry("b", ValueKind::Scalar, 1);
+        let wanted = [&a, &h, &b];
+        let scalar_list = || vec![plan(&a, 0, 0), plan(&a, 1, 1), plan(&b, 0, 4)];
+        let histogram_list = || vec![plan(&h, 0, 2), plan(&h, 1, 3)];
+        let (scalar, histogram) = (scalar_list(), histogram_list());
+
+        // (i) One surplus scalar entry.
+        let mut surplus_scalar = scalar_list();
+        surplus_scalar.push(plan(&b, 1, 5));
+        assert_eq!(
+            page_batches(&wanted, &surplus_scalar, &histogram, u64::MAX, 0),
+            Err(ravel_segment::SegmentError::SectionOutOfBounds),
+            "a surplus scalar plan must refuse"
+        );
+
+        // (ii) One surplus histogram entry.
+        let mut surplus_histogram = histogram_list();
+        surplus_histogram.push(plan(&h, 2, 5));
+        assert_eq!(
+            page_batches(&wanted, &scalar, &surplus_histogram, u64::MAX, 0),
+            Err(ravel_segment::SegmentError::SectionOutOfBounds),
+            "a surplus histogram plan must refuse"
+        );
+
+        // (iii) Exact lists batch. Each run is 16 coalesced bytes, so at 32
+        // bytes per batch `a`, `h` and `b` land in three batches.
+        let batches = page_batches(&wanted, &scalar, &histogram, 32, 0).expect("consistent plans");
+        let scalar_plans: Vec<_> = batches.iter().map(|b| b.scalar_plans.clone()).collect();
+        let histogram_plans: Vec<_> = batches.iter().map(|b| b.histogram_plans.clone()).collect();
+        assert_eq!(scalar_plans, vec![0..2, 2..2, 2..3]);
+        assert_eq!(histogram_plans, vec![0..0, 0..2, 2..2]);
+        for (plans, len) in [
+            (&scalar_plans, scalar.len()),
+            (&histogram_plans, histogram.len()),
+        ] {
+            assert_eq!(plans.first().map(|r| r.start), Some(0));
+            assert_eq!(plans.last().map(|r| r.end), Some(len));
+            for pair in plans.windows(2) {
+                assert_eq!(pair[0].end, pair[1].start, "plan ranges must be contiguous");
+            }
+        }
+    }
+
+    /// An out-of-order range is counted as its length plus two gaps; ascending
+    /// ranges keep the coalesced arithmetic.
+    #[test]
+    fn section_span_counts_an_out_of_order_range_in_full() {
+        let bytes = |ranges: &[(u64, u64)], gap: u64| {
+            let mut span = SectionSpan::default();
+            for &range in ranges {
+                span.add(range, gap);
+            }
+            span.bytes
+        };
+        let coalesced = |ranges: &[(u64, u64)], gap: u64| -> u64 {
+            coalesce_ranges(ranges.to_vec(), gap)
+                .iter()
+                .map(|(start, end)| end - start)
+                .sum()
+        };
+        assert_eq!(bytes(&[(100, 200), (0, 50)], 0), 150);
+        assert_eq!(bytes(&[(0, 100), (50, 120)], 0), 120);
+        assert_eq!(bytes(&[(0, 100), (10, 20)], 0), 100);
+
+        // At the production gap the second range bridges the 60000 bytes up
+        // to the first: coalesce_ranges makes one 110000-byte run of them.
+        let late = [(100_000, 110_000), (0, 40_000)];
+        assert_eq!(coalesced(&late, DEFAULT_COALESCE_GAP), 110_000);
+        assert_eq!(
+            bytes(&late, DEFAULT_COALESCE_GAP),
+            10_000 + 40_000 + 2 * DEFAULT_COALESCE_GAP
+        );
+        assert_eq!(bytes(&late, DEFAULT_COALESCE_GAP), 181_072);
+
+        // The largest start, not the last one, decides what is out of order:
+        // (60, 70) starts below 100 and is counted in full.
+        let twice = [(100, 200), (0, 50), (60, 70)];
+        assert_eq!(coalesced(&twice, 0), 160);
+        assert_eq!(bytes(&twice, 0), 160);
+
+        // A late range can bridge a full gap on each side: (20, 40) joins
+        // both runs into one 60-byte run, which one gap of slack would miss.
+        let between = [(0, 10), (50, 60), (20, 40)];
+        assert_eq!(coalesced(&between, 10), 60);
+        assert_eq!(bytes(&between, 10), 60);
+    }
+
+    /// A section's lowest range, not its first one added, is where the bridge
+    /// from the section before it is measured.
+    #[test]
+    fn coalesced_batch_bytes_bridges_to_a_section_lowest_range() {
+        let gap = 10;
+        let mut sections = [SectionSpan::default(); 3];
+        sections[0].add((900, 1_000), gap);
+        sections[1].add((1_050, 1_060), gap);
+        sections[1].add((1_005, 1_010), gap);
+        assert_eq!(sections[1].first, Some(1_005));
+        assert_eq!(sections[0].bytes, 100);
+        assert_eq!(sections[1].bytes, 10 + 5 + 2 * gap);
+        let expected: u64 =
+            coalesce_ranges(vec![(900, 1_000), (1_050, 1_060), (1_005, 1_010)], gap)
+                .iter()
+                .map(|(start, end)| end - start)
+                .sum();
+        assert_eq!(expected, 120);
+        // 100 + 35 in the sections plus the 5-byte bridge from 1000 to 1005.
+        assert_eq!(coalesced_batch_bytes(&sections, gap), 140);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(256))]
+
+        /// Over three disjoint sections laid out one after another, with
+        /// ranges in any order, the batch figure is never below what
+        /// `coalesce_ranges` makes of the same ranges; with each section's
+        /// ranges added in ascending start order it is exactly that.
+        #[test]
+        fn section_span_never_undercounts_the_coalesced_runs(
+            gap in proptest::sample::select(vec![0u64, 10, 4096, DEFAULT_COALESCE_GAP]),
+            raw in proptest::collection::vec((0usize..3, 0u64..1_000_000, 0u64..4_000), 1..=40usize),
+            shifts in (0u64..200_000, 0u64..200_000),
+        ) {
+            // Place section k + 1 at or past section k's largest end, so the
+            // sections are disjoint and in TS, VAL, HIST order, as in a
+            // segment, with a random space between them that may be bridged.
+            let mut extent = [0u64; 3];
+            for &(s, offset, len) in &raw {
+                extent[s] = extent[s].max(offset + len);
+            }
+            let base = [0, extent[0] + shifts.0, extent[0] + shifts.0 + extent[1] + shifts.1];
+            let in_order: Vec<(usize, (u64, u64))> = raw
+                .iter()
+                .map(|&(s, offset, len)| (s, (base[s] + offset, base[s] + offset + len)))
+                .collect();
+            let expected: u64 = coalesce_ranges(in_order.iter().map(|(_, r)| *r).collect(), gap)
+                .iter()
+                .map(|(start, end)| end - start)
+                .sum();
+
+            let mut any_order = [SectionSpan::default(); 3];
+            for &(s, range) in &in_order {
+                any_order[s].add(range, gap);
+            }
+            let counted = coalesced_batch_bytes(&any_order, gap);
+            proptest::prop_assert!(
+                counted >= expected,
+                "undercount: {counted} < {expected} at gap {gap} for {in_order:?}"
+            );
+
+            let mut ascending_input = in_order.clone();
+            ascending_input.sort_by_key(|(s, (start, _))| (*s, *start));
+            let mut ascending = [SectionSpan::default(); 3];
+            for &(s, range) in &ascending_input {
+                ascending[s].add(range, gap);
+            }
+            proptest::prop_assert_eq!(coalesced_batch_bytes(&ascending, gap), expected);
+        }
     }
 }
 
