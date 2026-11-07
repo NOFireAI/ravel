@@ -5593,6 +5593,35 @@ mod tests {
         );
     }
 
+    /// `catalog fold --metrics-label-index` (ADR-3694 decision 2) is off by
+    /// default and parses beside `--key-index-leaves` and beside
+    /// `--rebuild-key-index`. Without either, the fold refuses it at run time
+    /// (`tests/catalog_fold_metrics_label_index.rs`).
+    #[test]
+    fn catalog_fold_metrics_label_index_flag() {
+        let parse = |extra: &[&str]| {
+            let argv = ["ravel", "catalog", "fold", "--tenant", "acme"]
+                .iter()
+                .chain(extra)
+                .copied()
+                .collect::<Vec<_>>();
+            match Cli::try_parse_from(argv).expect("parses").command {
+                Command::Catalog {
+                    command:
+                        super::CatalogCommand::Fold {
+                            metrics_label_index,
+                            ..
+                        },
+                } => metrics_label_index,
+                _ => panic!("expected the catalog fold subcommand"),
+            }
+        };
+        assert!(!parse(&[]), "the metrics leaf is off by default");
+        assert!(!parse(&["--key-index-leaves"]));
+        assert!(parse(&["--key-index-leaves", "--metrics-label-index"]));
+        assert!(parse(&["--rebuild-key-index", "--metrics-label-index"]));
+    }
+
     /// `catalog fold --rebuild-key-index` (ADR-2707 decision 4): `--field`
     /// and `--batch-entries` are refused without it, it is refused beside
     /// `--key-index-leaves` and `--max-flush-lifetime`, and it accepts
