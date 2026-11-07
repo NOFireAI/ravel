@@ -80,6 +80,14 @@ UNCOVERED_OUTCOMES = ("partsUncovered", "skippedByBudget", "partsBeyondCeiling",
                       "reservationsRefused")
 ALLOWLIST_BREAKDOWNS = {"per_object": "stats carry no per-object breakdown",
                         "per_part": "stats carry no per-part breakdown"}
+# Row 7's G, the pass-end slice amendment's pass count: each field's
+# ascending key8 runs cut greedily into groups of at most the pair share
+# max(1, floor(budget / F)), the part's slowest field deciding. The fold
+# report (FoldReport, crates/ravel-catalog/src/fold.rs) carries neither the
+# build's pair budget nor any field's key8 runs, so no build reports G.
+G_UNSUPPORTED = ("fold report carries no pair budget and no per-field key8 runs, so G (the pass-end slice "
+                 "amendment's greedy partition of each field's key8 runs into groups of at most the pair share) "
+                 "cannot be computed")
 # Fold report fields this build does not write.
 FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_index_sections_read",
                   "key_index_leaf_gets")
@@ -1168,6 +1176,8 @@ def fold_figure(folds, transition, tenant, label, field):
         return "missing", None, f"no fold stamp for {transition}/{tenant}/{label}"
     if line is None:
         return "duplicate", None, f"two fold stamps for {transition}/{tenant}/{label}"
+    if field == "key_index_g":
+        return UNSUPPORTED, None, G_UNSUPPORTED
     if field == "peak_rss_bytes":
         v = (line.get("measure") or {}).get("peak_rss_bytes")
         return ("value", v, "") if v is not None else ("missing", None, "fold stamp has no measure")

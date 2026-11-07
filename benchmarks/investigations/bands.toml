@@ -499,6 +499,15 @@ requires_tenant = "inv"
 # report's key_index_uncovered_entries, the entries no leaf covers after the
 # fold summed over fields: each was read on every pass, and an entry
 # uncovered for two fields counts twice, which can only widen the target.
+# The report carries no per-field count, so the row cannot judge per field.
+# The sum is safe against a rebuild: neither miss line reads it, and a figure
+# whose miss holds is a miss whatever its target says.
+#
+# The target's passes are G, the pass-end slice amendment's greedy partition
+# (evaluate.py G_UNSUPPORTED): the fold report carries no pair budget and no
+# per-field key8 runs, so build_passes_g, and with it build_passes, reads
+# unsupported-on-this-build. The passes still enter the section GETs and
+# section reads per pass as the build reports them.
 requires_states = ["mixed"]
 
 [[row.figure]]
@@ -569,12 +578,20 @@ lane = "counter"
 target_if = "v == m['row_07.spans_previous_leaves']"
 
 [[row.figure]]
+name = "spans_build_passes_g"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_g"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
 name = "spans_build_passes"
 statement = "fold"
 state = "fold_advance"
 metric = "fold.inv.spans.key_index_build_passes"
 lane = "counter"
-target_if = "v == 1"
+target_if = "v == m['row_07.spans_build_passes_g']"
 
 [[row.figure]]
 name = "spans_sections_read"
@@ -672,12 +689,20 @@ lane = "counter"
 target_if = "v == m['row_07.logs_previous_leaves']"
 
 [[row.figure]]
+name = "logs_build_passes_g"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_g"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
 name = "logs_build_passes"
 statement = "fold"
 state = "fold_advance"
 metric = "fold.inv.logs.key_index_build_passes"
 lane = "counter"
-target_if = "v == 1"
+target_if = "v == m['row_07.logs_build_passes_g']"
 
 [[row.figure]]
 name = "logs_sections_read"

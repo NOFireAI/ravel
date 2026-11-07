@@ -2099,6 +2099,61 @@ class Evaluate(Workdir):
     def test_row_7_extra_leaf_gets(self):
         self.assertEqual(self.check_row_7_extra_leaf_gets(), [])
 
+    def check_row_7_passes_unsupported(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Box D's passes, 3 on spans and 27 on logs, are not judged against 1: the target is G, which needs
+        the pair budget and each field's key8 runs, and the fold report carries neither, so each reads
+        unsupported-on-this-build with that reason, not a miss. The passes still scale the section GETs."""
+        self.set_row_7(self.BOX_D_ROW_7)
+        _, res, _ = self.go(bands, evaluate_py)
+        out = []
+        for sig, f in self.BOX_D_ROW_7.items():
+            g = figure(res, f"row_07.{sig}_build_passes_g")
+            if (g["status"], g["verdict"]) != (UNSUPPORTED, UNSUPPORTED) or "no pair budget" not in g["reason"]:
+                out.append(f"{sig} G {g['status']} {g['verdict']} {g['reason']}")
+            p = figure(res, f"row_07.{sig}_build_passes")
+            if (p["status"], p["value"], p["verdict"]) != ("value", f["passes"], UNSUPPORTED):
+                out.append(f"{sig} passes {p['status']} {p['value']} {p['verdict']}")
+            if "no per-field key8 runs" not in (p["reason"] or ""):
+                out.append(f"{sig} passes reason {p['reason']}")
+            got = figure(res, f"row_07.{sig}_section_gets")
+            if (got["value"], got["verdict"]) != (f["ranged"], "pass"):
+                out.append(f"{sig} section_gets {got['value']} {got['verdict']}")
+        if any("row_07" in p for p in res["problems"]):
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_row_7_passes_unsupported(self):
+        self.assertEqual(self.check_row_7_passes_unsupported(), [])
+
+    # Uncovered entries on box D's figures: spans 10 over 3 passes, logs 5 over
+    # 27, each read on every pass. Spans: 2 x (40 + 10) x 3 = 300 ranged GETs
+    # and 50 sections a pass, over the 240 and 40 the new entries alone allow.
+    # Logs: 2 x (22 + 5) x 27 = 1,458 and 27 a pass, over 1,188 and 22.
+    ROW_7_UNCOVERED = {
+        "spans": dict(BOX_D_ROW_7["spans"], uncovered=10, ranged=300, sections=150),
+        "logs": dict(BOX_D_ROW_7["logs"], uncovered=5, ranged=1458, sections=729),
+    }
+
+    def check_row_7_uncovered(self, evaluate_py=EVALUATE, bands=BANDS):
+        """An advance whose uncovered entries are re-read on every pass holds on section GETs and section
+        reads per pass only with the uncovered term: the new entries alone put both over their targets."""
+        self.set_row_7(self.ROW_7_UNCOVERED)
+        _, res, _ = self.go(bands, evaluate_py)
+        out = []
+        for sig, f in self.ROW_7_UNCOVERED.items():
+            new = f["tail"] - f["mixed"]
+            if f["ranged"] <= 2 * new * f["passes"] or f["sections"] / f["passes"] <= new:
+                out.append(f"{sig}: the figures hold without the uncovered term")
+            for name, value in (("uncovered_entries", f["uncovered"]), ("section_gets", f["ranged"]),
+                                ("sections_per_pass", f["sections"] / f["passes"])):
+                got = figure(res, f"row_07.{sig}_{name}")
+                if (got["value"], got["verdict"]) != (value, "pass"):
+                    out.append(f"{sig} {name} {got['value']} {got['verdict']} {got['reason']}")
+        return out
+
+    def test_row_7_uncovered(self):
+        self.assertEqual(self.check_row_7_uncovered(), [])
+
     def check_miss_reason(self, evaluate_py=EVALUATE):
         """Item 3: row 7's miss carries the from-scratch reason bands.toml gives it."""
         self.set_row_7({"spans": dict(self.BOX_D_ROW_7["spans"], ranged=2 * 840, sections=840, passes=1)})
@@ -3321,6 +3376,11 @@ FLIPS = {
         "    if rest == \"leaf_wall_p50_s\":\n        for c in []:\n",
         "check_row_18_uncovered",
     ),
+    "row 7's G read as a fold report field": (
+        '    if field == "key_index_g":\n        return UNSUPPORTED, None, G_UNSUPPORTED\n',
+        '',
+        "check_row_7_passes_unsupported",
+    ),
     "row 6's probe survivors read from the scan phase's segmentsOpened": (
         '            v = m["plan_segments_opened"] - pruned\n',
         '            v = m["scan_segments_opened"]\n',
@@ -3538,6 +3598,42 @@ BAND_FLIPS = {
         "target_if = \"True\"\n"
         "miss_if = \"False\"\n",
         "check_row_7_rebuild",
+    ),
+    "row 7's spans passes judged against 1, not G": (
+        "target_if = \"v == m['row_07.spans_build_passes_g']\"\n",
+        "target_if = \"v == 1\"\n",
+        "check_row_7_passes_unsupported",
+    ),
+    "row 7's logs passes judged against 1, not G": (
+        "target_if = \"v == m['row_07.logs_build_passes_g']\"\n",
+        "target_if = \"v == 1\"\n",
+        "check_row_7_passes_unsupported",
+    ),
+    "row 7's spans section GETs without the uncovered term": (
+        "target_if = \"v <= (2 * (m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) + "
+        "((m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) if m['row_07.spans_footer_len'] > 8192 "
+        "else 0)) * m['row_07.spans_build_passes']\"\n",
+        "target_if = \"v <= (2 * m['row_07.spans_new_entries'] + (m['row_07.spans_new_entries'] if "
+        "m['row_07.spans_footer_len'] > 8192 else 0)) * m['row_07.spans_build_passes']\"\n",
+        "check_row_7_uncovered",
+    ),
+    "row 7's spans sections per pass without the uncovered term": (
+        "target_if = \"v <= m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']\"\n",
+        "target_if = \"v <= m['row_07.spans_new_entries']\"\n",
+        "check_row_7_uncovered",
+    ),
+    "row 7's logs section GETs without the uncovered term": (
+        "target_if = \"v <= (2 * (m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']) + "
+        "((m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']) if m['row_07.logs_footer_len'] > 8192 "
+        "else 0)) * m['row_07.logs_build_passes']\"\n",
+        "target_if = \"v <= (2 * m['row_07.logs_new_entries'] + (m['row_07.logs_new_entries'] if "
+        "m['row_07.logs_footer_len'] > 8192 else 0)) * m['row_07.logs_build_passes']\"\n",
+        "check_row_7_uncovered",
+    ),
+    "row 7's logs sections per pass without the uncovered term": (
+        "target_if = \"v <= m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']\"\n",
+        "target_if = \"v <= m['row_07.logs_new_entries']\"\n",
+        "check_row_7_uncovered",
     ),
     "row 6's objects past the probe read from segmentsOpened over every phase": (
         'metric = "cold.max.probe_survivors"\n',

@@ -588,7 +588,18 @@ Some bands, as transcribed:
   22 new entries a pass over 27 passes, 1,188 ranged GETs, over 2 x 570 =
   1,140 with no rebuild (`check_row_7_box_d`), while one pass reading all
   570 entries still misses on both signals (`check_row_7_rebuild`).
-  Uncovered is the fold report's `key_index_uncovered_entries`. New
+  Uncovered is the fold report's `key_index_uncovered_entries`, which the
+  fold sums over fields (an entry uncovered for two fields counts twice);
+  the report has no per-field count, so the row judges the sum. That can
+  only widen the targets, and neither miss line reads it, so a rebuild
+  still misses (`check_row_7_uncovered` pins each signal holding only with
+  the term). The passes target is G, the pass-end slice amendment's greedy
+  partition of each field's key8 runs into groups of at most the pair
+  share: the fold report carries no pair budget and no per-field key8
+  runs, so `build_passes_g` and `build_passes` read
+  `unsupported-on-this-build` with that reason on every build; box D's 3
+  and 27 passes read that way, not as misses, and still scale the section
+  GETs (`check_row_7_passes_unsupported`). New
   entries, previous leaves and footer lengths come from the stamps; `rlog
   inspect` and `rspan inspect` print a footer length, so the footer term is
   real (0 at the smoke's 199 and 248 bytes). The miss reads "over" as at
@@ -699,6 +710,9 @@ unchanged.
 
 ## Unsupported on this build
 
+- Row 7's G (`build_passes_g`): the fold report carries no pair budget and
+  no per-field key8 runs, so the pass count the passes are judged against
+  cannot be computed, and the passes read unsupported with that reason.
 - Key-index stats (`stats.keyIndex` and its members),
   `pruning.skipIdxDropped`, the per-object and per-part breakdowns, and the
   fold report's `key_index_build_passes`, `key_index_sections_read`,
