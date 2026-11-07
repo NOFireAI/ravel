@@ -416,7 +416,11 @@ pub struct IoShapeJson {
     /// scheduler, which can take fewer rounds (a child admitted into a
     /// parent wave's leftover capacity) or more (a partial outer window). See
     /// [`crate::io_shape::service_batches_over_plan_waves`] for the model and
-    /// its counterexample.
+    /// its counterexample. The figure counts the whole resolved snapshot,
+    /// before the label-value route (ADR-3694 decision 3) prunes any segment,
+    /// so for a routed query it can exceed the rounds the fetch needed and
+    /// is not a lower bound even within one wave (the caveat on
+    /// `service_batches_over_plan_waves`).
     #[serde(rename = "serviceBatches")]
     pub service_batches: u32,
     /// EXACT count of SEGMENTS (`SegmentOrigin::Recent` entries, one per
