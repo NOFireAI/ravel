@@ -164,7 +164,7 @@ use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::{extract_logs, prune_is_rewrite_neutral};
 use crate::logs_scan::ScanExecutions;
-use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
+use crate::memory::{CeilingBreach, MemoryRefusal, TenantDelegatingPool, TenantMemoryAccountant};
 use crate::min_commit_token::MinCommitToken;
 use crate::output::QueryOutput;
 use crate::parquet::{
@@ -722,6 +722,26 @@ struct PlanExtras {
     /// 4). Empty on the pinned entry points, whose snapshots arrive without
     /// them; their lookups probe each object's KEY_IDX alone.
     lane_parts: LaneParts,
+    /// Which spill decision this plan takes (issue #3899).
+    spill: SpillAttempt,
+}
+
+/// Which spill decision a plan takes (issue #3899).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpillAttempt {
+    /// Decided at plan time from [`SqlConfig::spill`] (ADR-0954), in the
+    /// plain query pool: the pinned entry points and Flight SQL, which have
+    /// no spill retry of their own.
+    PlanTime,
+    /// An executed statement's first attempt: planned as if
+    /// [`SqlConfig::spill`] were `None`, so it runs with
+    /// [`SpillDecision::Disabled`] in the plain query pool.
+    First,
+    /// The one retry after a first attempt's memory refusal
+    /// ([`spill_retry_decision`]): the ADR-0954 plan, one share of the spill
+    /// ceiling ([`SpillBudget::reserve_share`]), and a spill-mode pool
+    /// ([`SqlConfig::query_pool_spill_mode`]) while spill is enabled.
+    Retry,
 }
 
 /// The parts a resolve returned for the lanes the tier-2 router serves.
@@ -851,7 +871,9 @@ pub struct DecodedCacheStats {
 /// what lets a caller check the executor filtered on the column it meant.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SqlStats {
-    /// `Catalog::resolve` calls. 1 normally, 2 when the retry contract fired.
+    /// `Catalog::resolve` calls. 1 normally, one more for each retry that
+    /// fired: the snapshot retry and the spill retry
+    /// ([`Self::spill_retries`]), each at most once, so at most 3.
     pub resolves: u32,
     /// Plan-and-execute attempts. Always equal to `resolves` on this path.
     pub attempts: u32,
@@ -974,6 +996,14 @@ pub struct SqlStats {
     /// that wrote it lives on [`SqlOutcome::spill_by_operator`], which does not
     /// have to stay `Copy`.
     pub spill: SpillCounts,
+    /// Spill retries this statement took: 0 or 1 (issue #3899). A statement
+    /// runs first with spill off and is retried with spill on only after a
+    /// memory refusal with nothing emitted, when spill is configured and the
+    /// statement is spill-eligible. Counted apart from the snapshot retry in
+    /// [`Self::resolves`].
+    pub spill_retries: u32,
+    /// What the spill retry saw and did, present when one ran and answered.
+    pub spill_retry: Option<SpillRetryReport>,
     /// The row filter [`SqlRequest::row_window`] applied above each scan, as
     /// the display of the [`Expr`] that was actually planted
     /// ([`window_filter_expr`]) rather than a separately formatted description
@@ -2011,6 +2041,10 @@ pub struct SqlExecutor {
     /// How many times [`Self::executed_plan`] built a plan to execute.
     #[cfg(test)]
     executed_plan_builds: std::sync::atomic::AtomicUsize,
+    /// Runs an executed statement's first pass as a spill retry, so a test
+    /// can reach the spill-enabled execute path without a memory refusal.
+    #[cfg(test)]
+    pub(crate) start_as_spill_retry: bool,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -2062,6 +2096,8 @@ impl SqlExecutor {
             spill_fallbacks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             executed_plan_builds: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            start_as_spill_retry: false,
         }
     }
 
@@ -2604,6 +2640,9 @@ impl SqlExecutor {
                     // router would read leaves; it issues no GET, so it
                     // routes nothing and shows tier 1's plan.
                     lane_parts: LaneParts::default(),
+                    // The plan an execution runs first; a spill retry runs
+                    // only after that plan's memory refusal.
+                    spill: SpillAttempt::First,
                 },
             )
             .await?;
@@ -2670,11 +2709,20 @@ impl SqlExecutor {
             .map(|cache| cache.pressure_counters())
             .unwrap_or_default();
 
-        // At most two passes: the original and the one retry the
-        // consistency model allows. Each pass gets its own QueryAccounting
-        // (ADR-0044): a discarded first attempt's counts must never bleed
-        // into the retry's.
-        for attempt in 0..2u32 {
+        // At most three passes: the original, the one snapshot retry the
+        // consistency model allows, and the one spill retry (issue #3899),
+        // each counted on its own. Each pass gets its own QueryAccounting
+        // (ADR-0044): a discarded attempt's counts must never bleed into the
+        // retry's. The caller's statement deadline covers every pass.
+        let mut snapshot_retried = false;
+        let mut spill_retry: Option<FirstRefusal> = None;
+        loop {
+            let pass_started = Instant::now();
+            let spill_attempt = if spill_retry.is_some() || self.starts_as_spill_retry() {
+                SpillAttempt::Retry
+            } else {
+                SpillAttempt::First
+            };
             let phase_accounting = StatementAccounting::new();
             // Add this attempt's handle to the caller's live view before any
             // store call, so a snapshot taken from a `Drop` or after a deadline
@@ -2792,6 +2840,7 @@ impl SqlExecutor {
                     &declared,
                     parquet,
                     lane_parts,
+                    spill_attempt,
                 )
                 .await;
             stats.batches_emitted += emitted;
@@ -2846,6 +2895,11 @@ impl SqlExecutor {
                         self.statement_read_bytes
                             .record(key, trigger_read_bytes(&accounting));
                     }
+                    if let Some(first) = spill_retry {
+                        let report = first.report(spill, caps.pool, caps.spill_share);
+                        report.emit(&statement_fingerprint(statement), "answered");
+                        stats.spill_retry = Some(report);
+                    }
                     return Ok(SqlOutcome {
                         output,
                         stats,
@@ -2875,21 +2929,70 @@ impl SqlExecutor {
                         signal_tables_named,
                     });
                 }
-                Err(err) => match retry_decision(err.is_segment_not_found(), emitted, attempt) {
-                    RetryDecision::RetryOnce => continue,
-                    RetryDecision::FailInvalidated => return Err(SqlError::SnapshotInvalidated),
-                    RetryDecision::Propagate => return Err(err),
-                },
+                Err(err) => {
+                    let err = match retry_decision(
+                        err.is_segment_not_found(),
+                        emitted,
+                        u32::from(snapshot_retried),
+                    ) {
+                        RetryDecision::RetryOnce => {
+                            snapshot_retried = true;
+                            continue;
+                        }
+                        RetryDecision::FailInvalidated => SqlError::SnapshotInvalidated,
+                        RetryDecision::Propagate => {
+                            let spill_configured = self.config.spill.is_some();
+                            let spill_retried = spill_retry.is_some();
+                            // Eligibility costs a classification plan, so it
+                            // is asked only once every other condition holds.
+                            let candidate = spill_retry_decision(
+                                &err,
+                                caps.pool,
+                                emitted,
+                                spill_configured,
+                                true,
+                                spill_retried,
+                            ) == SpillRetry::Retry;
+                            let spill_eligible = match caps.spill_probe {
+                                Some(probe) if candidate => {
+                                    self.spill_retry_eligible(
+                                        tenant_hash,
+                                        statement,
+                                        &declared,
+                                        probe,
+                                    )
+                                    .await
+                                }
+                                _ => false,
+                            };
+                            if spill_retry_decision(
+                                &err,
+                                caps.pool,
+                                emitted,
+                                spill_configured,
+                                spill_eligible,
+                                spill_retried,
+                            ) == SpillRetry::Retry
+                            {
+                                stats.spill_retries += 1;
+                                spill_retry = Some(FirstRefusal {
+                                    class: first_refusal_class(&err, caps.pool),
+                                    after: pass_started.elapsed(),
+                                });
+                                continue;
+                            }
+                            err
+                        }
+                    };
+                    if let Some(first) = spill_retry {
+                        first
+                            .report(spill, caps.pool, caps.spill_share)
+                            .emit(&statement_fingerprint(statement), "failed");
+                    }
+                    return Err(err);
+                }
             }
         }
-
-        // Unreachable: the loop either returns or `continue`s exactly once,
-        // and the second pass always returns. Kept as a typed error rather
-        // than `unreachable!()` because panicking in a query path is never
-        // an acceptable failure mode.
-        Err(SqlError::Internal(
-            "snapshot retry loop exited without a result".to_string(),
-        ))
     }
 
     /// One `Catalog::resolve` plus the `max_segments` budget check, exposed
@@ -3213,6 +3316,11 @@ impl SqlExecutor {
     /// a pooled `&QueryAccounting`, so `pooled_over` bridges it to the
     /// phase-split API `plan_pinned_with` takes without changing where the
     /// cost lands.
+    ///
+    /// Plans with [`SpillAttempt::PlanTime`]: these entry points, Flight SQL's
+    /// `GetFlightInfo` and `DoGet` among them, decide spill at plan time as
+    /// ADR-0954 does, because they have no spill retry of their own. Giving
+    /// Flight SQL the execute path's retry is follow-up task T6 of issue #3899.
     async fn plan_checked_lanes(
         &self,
         tenant_hash: TenantHash,
@@ -3242,6 +3350,10 @@ impl SqlExecutor {
                 // principal's capabilities; it authenticates a tenant only.
                 capabilities: SqlCapabilities::default(),
                 lane_parts: LaneParts::default(),
+                // Flight SQL keeps the plan-time spill decision: a DoGet has
+                // no second attempt to spill on, so `SqlExecutor::run`'s spill
+                // retry does not apply here (issue #3899 follow-up T6).
+                spill: SpillAttempt::PlanTime,
             },
         )
         .await
@@ -3275,15 +3387,14 @@ impl SqlExecutor {
         let effective = self.effective_config(extras.budgets.as_ref());
         let config: &SqlConfig = &effective;
         let principal = self.session_principal(tenant_hash, extras.capabilities);
-        // The memory pool's peak-reservation report is execution-time
-        // aggregate/sort spend, not a store request, so it has no Resolve/
-        // Plan/Probe phase home; it is charged to Scan, matching where the
-        // partitions that grow it run. The pool serves every table, so it is
-        // the statement's charge and no lane's.
-        let (pool, breach) = config.query_pool(
-            self.tenant_budget(tenant_hash),
-            phase_accounting.statement().scan().clone(),
-        );
+        // Issue #3899: every spill read below goes through this binding. A
+        // first attempt plans as if no spill were configured, so its
+        // classification, tie-order edit, column-stats input, scratch and
+        // session are the ones a deployment without spill gets.
+        let spill_config = match extras.spill {
+            SpillAttempt::First => None,
+            SpillAttempt::PlanTime | SpillAttempt::Retry => config.spill.as_ref(),
+        };
         // ADR-0094 decision 1/2: classify the query's aggregates and GROUP BY
         // keys before the real session is built, right here at the one call site
         // that funnels into `build_session`. The result flips
@@ -3387,7 +3498,7 @@ impl SqlExecutor {
         // ADR-0954: the spill eligibility predicate reads the same analyzed
         // plan, so a configured-spill deployment is a third consumer of it
         // rather than a second analyze pass.
-        let wants_spill_gate = config.spill.is_some();
+        let wants_spill_gate = spill_config.is_some();
         let analyzed = if config.parallel_final_aggregation || wants_stats_gate || wants_spill_gate
         {
             self.analyzed_classification_plan(
@@ -3414,14 +3525,21 @@ impl SqlExecutor {
         // same aggregates and distincts either way; rewriting a `Sort` node
         // changes no `Aggregate` or `Distinct` node).
         let analyzed = match analyzed {
-            Some(plan) if wants_spill_gate && plan_is_spill_eligible_ignoring_sort_order(&plan) => {
-                Some(tie_ordered_or_unchanged(
-                    plan,
-                    config.bounded_topk_max_limit,
-                ))
+            Some(plan) if wants_spill_gate => {
+                Some(spill_tie_ordered(plan, config.bounded_topk_max_limit))
             }
             other => other,
         };
+        // Issue #3899: a first attempt with spill configured keeps what the
+        // spill retry needs to classify the statement, read only if this
+        // attempt is refused. `analyzed` itself stays the unedited plan.
+        let spill_probe =
+            (extras.spill == SpillAttempt::First && config.spill.is_some()).then(|| SpillProbe {
+                analyzed: analyzed.clone(),
+                parquet_schemas: parquet_schemas.clone(),
+                principal: principal.clone(),
+                bounded_topk_max_limit: config.bounded_topk_max_limit,
+            });
         // ADR-0954: spill needs BOTH an operator-configured scratch area and a
         // plan whose every aggregate is exact under a changed folding order.
         // Fail closed the same way: an unbuildable plan is not eligible, so it
@@ -3434,12 +3552,18 @@ impl SqlExecutor {
         //
         // ADR-0954 requirement 2 (issue #2416): the query's scratch cap is
         // reserved from the process-wide ceiling first, and a query that
-        // cannot reserve the minimum runs with spill disabled.
-        let scratch = match (&config.spill, &self.spill_budget) {
+        // cannot reserve the minimum runs with spill disabled. A spill retry
+        // reserves one share of that ceiling (issue #3899), so up to
+        // `MAX_SPILL_SHARES` retries spill at once.
+        let scratch = match (spill_config, &self.spill_budget) {
             (Some(spill), Some(budget))
                 if analyzed.as_ref().is_some_and(plan_is_spill_eligible) =>
             {
-                match budget.reserve(spill.max_bytes) {
+                let reserved = match extras.spill {
+                    SpillAttempt::Retry => budget.reserve_share(),
+                    SpillAttempt::PlanTime | SpillAttempt::First => budget.reserve(spill.max_bytes),
+                };
+                match reserved {
                     Some(reservation) => {
                         let cap = reservation.bytes();
                         Some((SpillScratch::create(spill)?.holding(reservation), cap))
@@ -3688,6 +3812,18 @@ impl SqlExecutor {
                 .map(clone_session_table)
                 .collect::<Vec<_>>()
         });
+        // The memory pool's peak-reservation report is execution-time
+        // aggregate/sort spend, not a store request, so it has no Resolve/
+        // Plan/Probe phase home; it is charged to Scan, matching where the
+        // partitions that grow it run. The pool serves every table, so it is
+        // the statement's charge and no lane's.
+        let (mut pool, mut breach) = attempt_pool(
+            config,
+            extras.spill,
+            spill_enabled,
+            self.tenant_budget(tenant_hash),
+            phase_accounting.statement().scan().clone(),
+        );
         let providers = session_tables
             .iter()
             .flat_map(session_table_providers)
@@ -3739,9 +3875,19 @@ impl SqlExecutor {
                 .iter()
                 .flat_map(session_table_providers)
                 .collect();
+            // A spill-mode pool refuses a spillable consumer early so it
+            // spills; without a disk manager that refusal would fail it.
+            // Nothing has run against the pool yet, so it is replaced whole.
+            (pool, breach) = attempt_pool(
+                config,
+                extras.spill,
+                false,
+                self.tenant_budget(tenant_hash),
+                phase_accounting.statement().scan().clone(),
+            );
             ctx = build_session_with_tables(
                 config,
-                pool,
+                Arc::clone(&pool),
                 fallback_tables,
                 exact_typed_aggregates,
                 SpillDecision::Disabled,
@@ -3787,6 +3933,7 @@ impl SqlExecutor {
             None => None,
         };
         let schema = frame.schema().inner().clone();
+        let spill_share = scratch.as_ref().map(|(_, cap)| *cap);
         Ok(PinnedQuery {
             ctx,
             frame,
@@ -3795,6 +3942,8 @@ impl SqlExecutor {
             scratch: scratch.map(|(scratch, _)| scratch),
             row_cap: None,
             window_predicate,
+            spill_probe,
+            spill_share,
         })
     }
 
@@ -4880,6 +5029,18 @@ impl SqlExecutor {
         self.scan_executions.counts()
     }
 
+    /// [`Self::start_as_spill_retry`]; outside tests a first pass is always
+    /// [`SpillAttempt::First`].
+    #[cfg(test)]
+    fn starts_as_spill_retry(&self) -> bool {
+        self.start_as_spill_retry
+    }
+
+    #[cfg(not(test))]
+    fn starts_as_spill_retry(&self) -> bool {
+        false
+    }
+
     /// [`Self::analyzed_classification_plan`] for SQL text, with any error
     /// read as `None`, as the unit tests below call it.
     #[cfg(test)]
@@ -5285,6 +5446,7 @@ impl SqlExecutor {
         declared: &[DeclaredColumn],
         parquet: Option<ParquetResolution>,
         lane_parts: LaneParts,
+        spill_attempt: SpillAttempt,
     ) -> (
         Result<QueryOutput, SqlError>,
         usize,
@@ -5313,6 +5475,7 @@ impl SqlExecutor {
                     parquet: ParquetPlan::Resolved(parquet),
                     capabilities,
                     lane_parts,
+                    spill: spill_attempt,
                 },
             )
             .await
@@ -5335,6 +5498,12 @@ impl SqlExecutor {
         // the paths below that fail: the filter was applied to the plan that
         // failed, and saying otherwise would misreport what ran.
         let window_predicate = planned.window_predicate().map(str::to_string);
+        let mut planned = planned;
+        let spill_probe = planned.spill_probe.take();
+        let spill_share = planned.spill_share;
+        // The spill retry reads the pool's refusal record after a failure,
+        // which can come before a stream exists to read it from.
+        let pool = Arc::clone(&planned.ctx.runtime_env().memory_pool);
 
         let start_started = Instant::now();
         let mut stream = match planned.with_row_cap(req.max_rows).execute().await {
@@ -5351,6 +5520,9 @@ impl SqlExecutor {
                         row_cap_hit: false,
                         wall,
                         peak_asked_bytes: 0,
+                        pool: PoolReport::of(&pool),
+                        spill_probe,
+                        spill_share,
                     },
                 );
             }
@@ -5388,6 +5560,9 @@ impl SqlExecutor {
                             row_cap_hit: stream.row_cap_hit(),
                             wall,
                             peak_asked_bytes: stream.peak_asked_bytes(),
+                            pool: PoolReport::of(&pool),
+                            spill_probe,
+                            spill_share,
                         },
                     );
                 }
@@ -5410,8 +5585,121 @@ impl SqlExecutor {
                 row_cap_hit: stream.row_cap_hit(),
                 wall,
                 peak_asked_bytes: stream.peak_asked_bytes(),
+                pool: PoolReport::of(&pool),
+                spill_probe,
+                spill_share,
             },
         )
+    }
+
+    /// Whether the statement a first attempt classified into `probe` is
+    /// spill-eligible once the tie-order edit has run: the predicate the
+    /// spill retry's scratch reservation reads (issue #3899). Read only after
+    /// a refusal, so a first attempt that succeeds never pays for it. Fails
+    /// closed: a statement that does not classify is not eligible.
+    async fn spill_retry_eligible(
+        &self,
+        tenant_hash: TenantHash,
+        statement: Statement<'_>,
+        declared: &[DeclaredColumn],
+        probe: SpillProbe,
+    ) -> bool {
+        let analyzed = match probe.analyzed {
+            Some(plan) => Some(plan),
+            None => match statement.tables() {
+                Ok(tables) => self
+                    .analyzed_classification_plan(
+                        tenant_hash,
+                        statement,
+                        &tables,
+                        declared,
+                        probe.parquet_schemas.as_deref(),
+                        &probe.principal,
+                    )
+                    .await
+                    .unwrap_or(None),
+                Err(_) => None,
+            },
+        };
+        analyzed.is_some_and(|plan| {
+            plan_is_spill_eligible(&spill_tie_ordered(plan, probe.bounded_topk_max_limit))
+        })
+    }
+}
+
+/// What a first attempt keeps for [`SqlExecutor::spill_retry_eligible`]: its
+/// classification plan when it built one, and what building one takes when
+/// it did not.
+#[derive(Debug, Clone)]
+struct SpillProbe {
+    analyzed: Option<LogicalPlan>,
+    parquet_schemas: Option<Vec<(String, SchemaRef)>>,
+    principal: SessionPrincipal,
+    bounded_topk_max_limit: Option<usize>,
+}
+
+/// The ADR-0954 tie-order edit the spill decision reads: a plan
+/// disqualified for a reason no edit can fix (a `Join`, a float GROUP BY
+/// key, a non-exact aggregate) is returned unchanged.
+fn spill_tie_ordered(plan: LogicalPlan, max_limit: Option<usize>) -> LogicalPlan {
+    if plan_is_spill_eligible_ignoring_sort_order(&plan) {
+        tie_ordered_or_unchanged(plan, max_limit)
+    } else {
+        plan
+    }
+}
+
+/// The memory pool a plan's session gets. A spill retry whose spill is
+/// enabled gets the spill-mode pool, which refuses a spillable consumer
+/// early so it spills and leaves room for the consumers that cannot
+/// (issue #3899); every other plan gets the plain query pool. So does a
+/// retry whose per-query limit is no larger than the spill-mode headroom,
+/// where the spill-mode cap would be zero and no spillable consumer could
+/// hold even the batch it spills.
+fn attempt_pool(
+    config: &SqlConfig,
+    spill: SpillAttempt,
+    spill_enabled: bool,
+    tenant: Arc<TenantMemoryAccountant>,
+    accounting: QueryAccounting,
+) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
+    let spill_mode_cap = config
+        .max_query_bytes
+        .saturating_sub(crate::memory::spill_mode_headroom(config.max_query_bytes));
+    match spill {
+        SpillAttempt::Retry if spill_enabled && spill_mode_cap > 0 => {
+            config.query_pool_spill_mode(tenant, accounting)
+        }
+        SpillAttempt::Retry | SpillAttempt::PlanTime | SpillAttempt::First => {
+            config.query_pool(tenant, accounting)
+        }
+    }
+}
+
+/// What a statement's memory pool recorded by the time its attempt ended, for
+/// [`spill_retry_decision`] and the spill retry's log line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PoolReport {
+    /// [`TenantDelegatingPool::refused`].
+    pub(crate) refused: bool,
+    /// [`TenantDelegatingPool::host_gate_refused`].
+    pub(crate) host_gate: bool,
+    /// [`TenantDelegatingPool::first_refusal`].
+    pub(crate) first: Option<MemoryRefusal>,
+    /// [`TenantDelegatingPool::peak_unspillable_bytes`].
+    pub(crate) peak_unspillable_bytes: u64,
+}
+
+impl PoolReport {
+    /// Read off `pool`; all default when it is not a [`TenantDelegatingPool`].
+    fn of(pool: &Arc<dyn MemoryPool>) -> Self {
+        pool.downcast_ref::<TenantDelegatingPool>()
+            .map_or_else(PoolReport::default, |pool| PoolReport {
+                refused: pool.refused(),
+                host_gate: pool.host_gate_refused(),
+                first: pool.first_refusal(),
+                peak_unspillable_bytes: pool.peak_unspillable_bytes(),
+            })
     }
 }
 
@@ -5426,6 +5714,84 @@ struct AttemptCaps {
     row_cap_hit: bool,
     wall: PhaseWallTiming,
     peak_asked_bytes: u64,
+    /// The session pool's refusal record; default when planning failed
+    /// before a pool existed.
+    pool: PoolReport,
+    /// [`PinnedQuery::spill_probe`]: present only on a first attempt planned
+    /// with spill configured.
+    spill_probe: Option<SpillProbe>,
+    /// [`PinnedQuery::spill_share`].
+    spill_share: Option<u64>,
+}
+
+/// The refusal that earned a statement its spill retry.
+#[derive(Debug, Clone, Copy)]
+struct FirstRefusal {
+    class: &'static str,
+    after: Duration,
+}
+
+impl FirstRefusal {
+    /// This refusal beside what the retry it earned did.
+    fn report(self, spill: SpillCounts, pool: PoolReport, share: Option<u64>) -> SpillRetryReport {
+        SpillRetryReport {
+            first_refusal: self.class,
+            first_refusal_after: self.after,
+            spill_bytes_written: spill.bytes_written,
+            spill_bytes_read: spill.bytes_read,
+            spill_files: spill.files,
+            peak_unspillable_bytes: pool.peak_unspillable_bytes,
+            share_bytes: share,
+        }
+    }
+}
+
+/// What a statement's spill retry saw and did (issue #3899): the refusal
+/// that ended its first attempt, and the retry's spill totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpillRetryReport {
+    /// The first attempt's refusal class: the pool layer that refused
+    /// (`query_pool`, `tenant_budget`, `process_budget`,
+    /// `aggregate_reserve_ahead`), or `fetch_memory_exhausted` for a fetch
+    /// layer's own ledger.
+    pub first_refusal: &'static str,
+    /// Wall time from the start of the refused attempt to its refusal,
+    /// resolve included.
+    pub first_refusal_after: Duration,
+    /// [`SpillCounts::bytes_written`] of the retry.
+    pub spill_bytes_written: u64,
+    /// [`SpillCounts::bytes_read`] of the retry: `None` on DataFusion 55,
+    /// which does not measure it.
+    pub spill_bytes_read: Option<u64>,
+    /// [`SpillCounts::files`] of the retry.
+    pub spill_files: u64,
+    /// The retry pool's largest reservation by consumers that cannot spill.
+    pub peak_unspillable_bytes: u64,
+    /// The spill-budget share the retry reserved, or `None` when less than
+    /// the minimum share remained and the retry ran without spill.
+    pub share_bytes: Option<u64>,
+}
+
+impl SpillRetryReport {
+    /// The one INFO line a statement that took a spill retry logs. `outcome`
+    /// is `answered` or `failed`.
+    fn emit(&self, fingerprint: &str, outcome: &'static str) {
+        tracing::info!(
+            statement_fingerprint = fingerprint,
+            outcome,
+            first_refusal = self.first_refusal,
+            first_refusal_after_ms =
+                u64::try_from(self.first_refusal_after.as_millis()).unwrap_or(u64::MAX),
+            spill_bytes_written = self.spill_bytes_written,
+            spill_bytes_read = self
+                .spill_bytes_read
+                .map_or_else(|| "unmeasured".to_string(), |bytes| bytes.to_string()),
+            spill_files = self.spill_files,
+            peak_unspillable_bytes = self.peak_unspillable_bytes,
+            share_bytes = self.share_bytes.unwrap_or(0),
+            "SQL statement retried with spill after a memory refusal"
+        );
+    }
 }
 
 /// A query planned against one pinned snapshot, not yet executing.
@@ -5453,6 +5819,13 @@ pub struct PinnedQuery {
     /// The row filter [`SqlRequest::row_window`] put above each scan, for
     /// [`SqlStats::window_predicate`]. `None` when none was requested.
     window_predicate: Option<String>,
+    /// What the spill retry classifies the statement with, kept by a first
+    /// attempt with spill configured (issue #3899). `None` on every other
+    /// plan.
+    spill_probe: Option<SpillProbe>,
+    /// The scratch bytes this plan reserved from the spill ceiling, `None`
+    /// when it runs without spill.
+    spill_share: Option<u64>,
 }
 
 impl PinnedQuery {
@@ -5528,6 +5901,8 @@ impl PinnedQuery {
             scratch,
             row_cap,
             window_predicate: _,
+            spill_probe: _,
+            spill_share: _,
         } = self;
         // Build the physical plan explicitly rather than through
         // `frame.execute_stream()` (which does the same two steps internally)
@@ -5562,6 +5937,8 @@ impl PinnedQuery {
             scratch,
             row_cap,
             window_predicate: _,
+            spill_probe: _,
+            spill_share: _,
         } = self;
         let plan = frame.create_physical_plan().await.map_err(plan_error)?;
         let mut stream =
@@ -6076,6 +6453,100 @@ pub(crate) fn retry_decision(retryable: bool, emitted: usize, attempt: u32) -> R
     } else {
         // Second NotFound: the snapshot is genuinely gone.
         RetryDecision::FailInvalidated
+    }
+}
+
+/// What to do after an attempt failed, as far as spilling goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpillRetry {
+    /// Re-resolve and run again, planned with spill allowed, a share of the
+    /// spill budget reserved, and the spill-mode pool.
+    Retry,
+    /// Return the error as it is.
+    Propagate,
+}
+
+/// The spill retry's trigger, as a pure function of what the failed attempt
+/// left behind (issue #3899). A first attempt runs with spill off; this
+/// decides whether its failure earns one more attempt with spill on. Every
+/// condition must hold:
+///
+/// - the error is a memory refusal: a `ResourcesExhausted` the session's
+///   pool refused itself (`pool.refused`, and not through the host memory
+///   gate), or a fetch-layer `FetchMemoryExhausted` whose cause is the
+///   accounted ledger. A gate refusal is about the host, not this query, and
+///   spilling does not change it; nor does it change a spill-budget,
+///   scratch, deadline or any other error;
+/// - nothing was emitted, so the failed output can be discarded whole;
+/// - spill is configured;
+/// - the statement is spill-eligible after the tie-order edit;
+/// - no spill retry has run yet for this statement.
+///
+/// It counts independently of [`retry_decision`]: a snapshot retry does not
+/// use up the spill retry, nor the spill retry the snapshot one.
+pub(crate) fn spill_retry_decision(
+    err: &SqlError,
+    pool: PoolReport,
+    emitted: usize,
+    spill_configured: bool,
+    spill_eligible: bool,
+    spill_retried: bool,
+) -> SpillRetry {
+    let memory_refusal = match err {
+        SqlError::ResourcesExhausted(_) => pool.refused && !pool.host_gate,
+        _ => fetch_refused_accounted(err),
+    };
+    if memory_refusal && emitted == 0 && spill_configured && spill_eligible && !spill_retried {
+        SpillRetry::Retry
+    } else {
+        SpillRetry::Propagate
+    }
+}
+
+/// A fetch layer's own memory refusal against its accounted ledger.
+fn fetch_refused_accounted(err: &SqlError) -> bool {
+    use ravel_memory::ExhaustionCause;
+    use ravel_query::{FetchError, LogFetchError};
+
+    use crate::spans_fetcher::SpanFetchError;
+
+    matches!(
+        err,
+        SqlError::Fetch(FetchError::FetchMemoryExhausted {
+            cause: ExhaustionCause::Accounted,
+            ..
+        }) | SqlError::LogFetch(LogFetchError::FetchMemoryExhausted {
+            cause: ExhaustionCause::Accounted,
+            ..
+        }) | SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted {
+            cause: ExhaustionCause::Accounted,
+            ..
+        })
+    )
+}
+
+/// The refusal class a spill retry's log line names for its first attempt.
+fn first_refusal_class(err: &SqlError, pool: PoolReport) -> &'static str {
+    match err {
+        SqlError::ResourcesExhausted(_) => pool
+            .first
+            .map_or("resources_exhausted", MemoryRefusal::as_str),
+        _ => "fetch_memory_exhausted",
+    }
+}
+
+/// A short stable identifier for a statement's text in log lines: no
+/// statement fingerprint existed before the spill retry needed one.
+fn statement_fingerprint(statement: Statement<'_>) -> String {
+    use std::hash::{Hash, Hasher};
+
+    match statement.sql() {
+        Some(sql) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            sql.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        }
+        None => "lowered".to_string(),
     }
 }
 
@@ -8344,6 +8815,257 @@ pub(crate) mod tests {
         assert_eq!(retry_decision(true, 7, 1), RetryDecision::FailInvalidated);
     }
 
+    /// Issue #3899: the spill retry's trigger. A pool refusal or an accounted
+    /// fetch refusal with nothing emitted, spill configured, an eligible
+    /// statement and no spill retry yet retries; taking away any one of those
+    /// does not, and no other error retries whatever the pool recorded.
+    #[test]
+    fn the_spill_retry_fires_only_on_a_memory_refusal_with_every_condition() {
+        use ravel_memory::ExhaustionCause;
+
+        let refused = PoolReport {
+            refused: true,
+            first: Some(MemoryRefusal::Query),
+            ..PoolReport::default()
+        };
+        let pool_err = || SqlError::ResourcesExhausted("query memory pool exhausted".into());
+        let fetch_err = |cause| {
+            SqlError::Fetch(FetchError::FetchMemoryExhausted {
+                requested: 10,
+                reserved: 90,
+                limit: 100,
+                cause,
+            })
+        };
+        let decide = |err: &SqlError, pool, emitted, retried| {
+            spill_retry_decision(err, pool, emitted, true, true, retried)
+        };
+
+        assert_eq!(decide(&pool_err(), refused, 0, false), SpillRetry::Retry);
+        assert_eq!(
+            decide(
+                &fetch_err(ExhaustionCause::Accounted),
+                PoolReport::default(),
+                0,
+                false
+            ),
+            SpillRetry::Retry,
+            "an accounted fetch refusal retries though the pool refused nothing"
+        );
+
+        assert_eq!(
+            decide(&pool_err(), PoolReport::default(), 0, false),
+            SpillRetry::Propagate,
+            "a ResourcesExhausted the pool did not refuse is not a memory refusal"
+        );
+        assert_eq!(
+            decide(&pool_err(), refused, 1, false),
+            SpillRetry::Propagate,
+            "rows already emitted"
+        );
+        assert_eq!(
+            decide(&pool_err(), refused, 0, true),
+            SpillRetry::Propagate,
+            "a second refusal after the spill retry"
+        );
+        assert_eq!(
+            spill_retry_decision(&pool_err(), refused, 0, false, true, false),
+            SpillRetry::Propagate,
+            "spill not configured"
+        );
+        assert_eq!(
+            spill_retry_decision(&pool_err(), refused, 0, true, false, false),
+            SpillRetry::Propagate,
+            "statement not spill-eligible"
+        );
+
+        let gate = PoolReport {
+            refused: true,
+            host_gate: true,
+            first: Some(MemoryRefusal::HostGate),
+            ..PoolReport::default()
+        };
+        assert_eq!(
+            decide(&pool_err(), gate, 0, false),
+            SpillRetry::Propagate,
+            "a host-gate refusal"
+        );
+        assert_eq!(
+            decide(
+                &fetch_err(ExhaustionCause::HostMemory {
+                    available: 1,
+                    floor: 2
+                }),
+                refused,
+                0,
+                false
+            ),
+            SpillRetry::Propagate,
+            "a fetch refused by the host gate"
+        );
+        for err in [
+            SqlError::SpillBudgetExhausted("quota".into()),
+            SqlError::SpillUnavailable("no scratch".into()),
+            SqlError::DeadlineExceeded { millis: 5 },
+            SqlError::Internal("boom".into()),
+        ] {
+            assert_eq!(
+                decide(&err, refused, 0, false),
+                SpillRetry::Propagate,
+                "{err:?}"
+            );
+        }
+
+        // Counted independently: a snapshot retry already taken leaves the
+        // spill retry available, and a spill retry already taken leaves the
+        // snapshot retry available.
+        assert_eq!(retry_decision(true, 0, 1), RetryDecision::FailInvalidated);
+        assert_eq!(decide(&pool_err(), refused, 0, false), SpillRetry::Retry);
+        assert_eq!(decide(&pool_err(), refused, 0, true), SpillRetry::Propagate);
+        assert_eq!(retry_decision(true, 0, 0), RetryDecision::RetryOnce);
+    }
+
+    /// Issue #3899: the spill retry's pool is the spill-mode pool, so a
+    /// consumer that can spill is held to `L - H` and a consumer that cannot
+    /// spill still finds `H` free; the first attempt's pool, and a retry that
+    /// could not enable spill, let the spillable consumer take all of `L`.
+    #[test]
+    fn the_spill_retry_runs_in_the_spill_mode_pool() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        const MIB: usize = 1 << 20;
+        let config = SqlConfig {
+            max_query_bytes: 1000 * MIB,
+            ..SqlConfig::default()
+        };
+        // Whether a non-spillable consumer can take 100 MiB after a
+        // spillable one asked for 950 MiB of the 1000 MiB limit.
+        let join_fits = |spill, spill_enabled| {
+            let (pool, _breach) = attempt_pool(
+                &config,
+                spill,
+                spill_enabled,
+                TenantMemoryAccountant::new(usize::MAX),
+                QueryAccounting::new(),
+            );
+            let sorter = MemoryConsumer::new("ExternalSorter[0]")
+                .with_can_spill(true)
+                .register(&pool);
+            let _ = sorter.try_grow(950 * MIB);
+            let join = MemoryConsumer::new("HashJoinInput[0]").register(&pool);
+            join.try_grow(100 * MIB).is_ok()
+        };
+        assert_eq!(
+            [
+                join_fits(SpillAttempt::Retry, true),
+                join_fits(SpillAttempt::Retry, false),
+                join_fits(SpillAttempt::First, false),
+                join_fits(SpillAttempt::PlanTime, true),
+            ],
+            [true, false, false, false]
+        );
+    }
+
+    /// Issue #3899: the one INFO line a statement that took a spill retry
+    /// logs, field by field.
+    #[test]
+    fn the_spill_retry_logs_one_info_line_with_its_figures() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        type Fields = BTreeMap<String, String>;
+        #[derive(Clone, Default)]
+        struct Infos(Arc<Mutex<Vec<Fields>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Infos {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() != tracing::Level::INFO {
+                    return;
+                }
+                struct Visit(Fields);
+                impl tracing::field::Visit for Visit {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0
+                            .insert(field.name().to_string(), format!("{value:?}"));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+                }
+                let mut visit = Visit(Fields::new());
+                event.record(&mut visit);
+                self.0.lock().expect("not poisoned").push(visit.0);
+            }
+        }
+        static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+        let report = FirstRefusal {
+            class: "query_pool",
+            after: Duration::from_millis(1234),
+        }
+        .report(
+            SpillCounts {
+                files: 3,
+                bytes_written: 4096,
+                rows_written: 10,
+                bytes_read: None,
+                duration: Duration::from_millis(7),
+            },
+            PoolReport {
+                peak_unspillable_bytes: 2_200_000,
+                ..PoolReport::default()
+            },
+            Some(16 << 30),
+        );
+        let infos = Infos::default();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(infos.clone()),
+            || {
+                report.emit("00000000deadbeef", "answered");
+            },
+        );
+        let lines = infos.0.lock().expect("not poisoned").clone();
+        let expected: Fields = [
+            (
+                "message",
+                "SQL statement retried with spill after a memory refusal",
+            ),
+            ("statement_fingerprint", "00000000deadbeef"),
+            ("outcome", "answered"),
+            ("first_refusal", "query_pool"),
+            ("first_refusal_after_ms", "1234"),
+            ("spill_bytes_written", "4096"),
+            ("spill_bytes_read", "unmeasured"),
+            ("spill_files", "3"),
+            ("peak_unspillable_bytes", "2200000"),
+            ("share_bytes", "17179869184"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(lines, vec![expected]);
+    }
+
+    /// The fingerprint is a stable hash of the SQL text, and a lowered
+    /// statement, which has no text, says so.
+    #[test]
+    fn a_statement_fingerprint_is_sixteen_hex_digits_of_its_text() {
+        let a = statement_fingerprint(Statement::Sql("SELECT 1"));
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_eq!(a, statement_fingerprint(Statement::Sql("SELECT 1")));
+        assert_ne!(a, statement_fingerprint(Statement::Sql("SELECT 2")));
+    }
+
     #[test]
     fn target_signal_maps_the_from_clause_to_a_signal() {
         // samples -> metrics; logs -> logs.
@@ -10199,6 +10921,7 @@ pub(crate) mod tests {
             spill_enabled_config(root.path()),
         )
         .await;
+        fixture.executor.start_as_spill_retry = true;
         fixture.executor.executed_plan_tamper = Some(keep_the_first_sort_term);
         let statement = Programmatic::over_logs(
             DialectPolicy::new(Vec::<String>::new(), ["count"], Vec::<String>::new()),
@@ -10250,14 +10973,16 @@ pub(crate) mod tests {
         );
     }
 
-    /// [`executor_over`] with spill configured at `root`.
+    /// [`executor_over`] with spill configured at `root`, whose executed
+    /// statements start as a spill retry (issue #3899): only a retry plans
+    /// with spill allowed on the execute path.
     fn spill_executor_over(
         store: Arc<InstrumentedStore<FaultStore<MemoryStore>>>,
         root: &std::path::Path,
     ) -> SqlExecutor {
         let catalog =
             Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
-        SqlExecutor::new(
+        let mut executor = SqlExecutor::new(
             catalog,
             SegmentFetcher::new(store.clone()),
             LogSegmentFetcher::new(store.clone()),
@@ -10270,7 +10995,9 @@ pub(crate) mod tests {
                 ..SqlConfig::default()
             },
             1 << 30,
-        )
+        );
+        executor.start_as_spill_retry = true;
+        executor
     }
 
     /// An executor over an empty store with spill configured at `root` and a
