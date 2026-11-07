@@ -323,9 +323,9 @@ pub const MAX_GETS_PER_L0_SEGMENT_FETCH: u64 =
 
 /// Smallest `fetch_batch_bytes` an L1 page fetch plans a batch against,
 /// whatever the memory budget and GET permits (ADR-3694, whole-series batch
-/// amendment): a batch is a group of whole series whose planned page bytes
-/// are at most the larger of this and the budget's limit over twice the GET
-/// permits.
+/// amendment): a batch is a group of whole series whose coalesced page bytes,
+/// bridged gaps included, are at most the larger of this and the budget's
+/// limit over twice the GET permits.
 pub const FETCH_BATCH_FLOOR_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Object-size floor for taking the sparse catalog-probe path in
@@ -1364,6 +1364,8 @@ pub(crate) struct BatchObservation {
     pub(crate) batch_reserved: u64,
     /// Bytes the batch's regions hold that they fetched themselves.
     pub(crate) batch_owned: u64,
+    /// Series the batch fetched.
+    pub(crate) series: usize,
 }
 
 impl SegmentFetcher {
@@ -1407,10 +1409,10 @@ impl SegmentFetcher {
         self
     }
 
-    /// The most planned page bytes one L1 page batch groups: the memory
-    /// budget's limit over twice the GET permits, never below
-    /// [`FETCH_BATCH_FLOOR_BYTES`]. A series whose own pages exceed it is a
-    /// batch of its own.
+    /// The most coalesced page bytes, bridged gaps included, one L1 page
+    /// batch groups: the memory budget's limit over twice the GET permits,
+    /// never below [`FETCH_BATCH_FLOOR_BYTES`]. A series whose own coalesced
+    /// pages exceed it is a batch of its own.
     pub(crate) fn fetch_batch_bytes(&self) -> u64 {
         let permits = u64::try_from(self.get_limiter.permits())
             .unwrap_or(u64::MAX)
@@ -2863,11 +2865,13 @@ impl SegmentFetcher {
     /// handing each page batch's decoded units to `sink` in catalog order.
     ///
     /// An L0 segment is one batch. An L1 part is cut into batches of whole
-    /// series, in catalog order, whose planned page bytes are at most
-    /// [`fetch_batch_bytes`](Self::fetch_batch_bytes); a series larger than
-    /// that is a batch of its own (ADR-3694, whole-series batch amendment).
-    /// Each batch's pages are fetched into regions of its own, so its
-    /// reservation covers exactly its coalesced runs; the batch is decoded,
+    /// series, in catalog order, whose coalesced page bytes at this fetcher's
+    /// coalesce gap, bridged gaps included, are at most
+    /// [`fetch_batch_bytes`](Self::fetch_batch_bytes); a series whose own
+    /// coalesced pages exceed that is a batch of its own (ADR-3694,
+    /// whole-series batch amendment, [`page_batches`]). Each batch's pages
+    /// are fetched into regions of its own, so its reservation covers exactly
+    /// its coalesced runs; the batch is decoded,
     /// handed to `sink`, and its regions dropped, releasing the reservation,
     /// before the next batch reserves. Bytes the open and catalog fetch
     /// already hold are borrowed from the segment's regions, not fetched
@@ -2948,7 +2952,13 @@ impl SegmentFetcher {
             SegmentLevel::L0 => (u64::MAX, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT),
             SegmentLevel::L1 { .. } => (self.fetch_batch_bytes(), usize::MAX),
         };
-        for batch in page_batches(&wanted, &scalar_planned, &histogram_planned, batch_bytes) {
+        for batch in page_batches(
+            &wanted,
+            &scalar_planned,
+            &histogram_planned,
+            batch_bytes,
+            self.coalesce_gap,
+        ) {
             let scalar_entries = scalar.get(batch.scalar).unwrap_or(&[]);
             let scalar_plans = scalar_planned.get(batch.scalar_plans).unwrap_or(&[]);
             let histogram_entries = histogram.get(batch.histogram).unwrap_or(&[]);
@@ -2973,7 +2983,11 @@ impl SegmentFetcher {
             )
             .await?;
             #[cfg(test)]
-            self.observe_batch(&regions, &batch_regions);
+            self.observe_batch(
+                &regions,
+                &batch_regions,
+                scalar_entries.len() + histogram_entries.len(),
+            );
             let scalar_out = if scalar_entries.is_empty() {
                 Vec::new()
             } else {
@@ -3010,7 +3024,7 @@ impl SegmentFetcher {
 
     /// Records one page batch's reservations on the test probe, if any.
     #[cfg(test)]
-    fn observe_batch(&self, segment: &FetchedRegions, batch: &FetchedRegions) {
+    fn observe_batch(&self, segment: &FetchedRegions, batch: &FetchedRegions, series: usize) {
         if let Some(probe) = &self.batch_probe {
             probe
                 .lock()
@@ -3020,6 +3034,7 @@ impl SegmentFetcher {
                     segment_reserved: segment.reserved_bytes(),
                     batch_reserved: batch.reserved_bytes(),
                     batch_owned: batch.owned_bytes(),
+                    series,
                 });
         }
     }
@@ -3994,17 +4009,85 @@ struct PageBatch {
     histogram_plans: std::ops::Range<usize>,
 }
 
+/// The coalesced footprint of one batch's ranges in one page section (TS,
+/// VAL or HIST). Within a section a batch's ranges arrive in ascending offset
+/// order (series in catalog order, each series' runs back to back), so a
+/// range that starts within `gap` of the tail extends the run it bridges to
+/// and any other range opens a new run: `bytes` is exactly what
+/// [`coalesce_ranges`] makes of the section's ranges, bridged gaps included.
+#[derive(Debug, Clone, Copy, Default)]
+struct SectionSpan {
+    /// Start of the section's first range, `None` while the batch holds none.
+    first: Option<u64>,
+    /// Largest end of any range so far.
+    tail: u64,
+    /// Coalesced bytes so far.
+    bytes: u64,
+}
+
+impl SectionSpan {
+    fn add(&mut self, (start, end): (u64, u64), gap: u64) {
+        let end = end.max(start);
+        if self.first.is_some() && start <= self.tail.saturating_add(gap) {
+            self.bytes = self.bytes.saturating_add(end.saturating_sub(self.tail));
+        } else {
+            self.first.get_or_insert(start);
+            self.bytes = self.bytes.saturating_add(end - start);
+        }
+        self.tail = self.tail.max(end);
+    }
+}
+
+/// The bytes the coalesced runs over a batch's ranges cover: each section's
+/// own coalesced bytes, plus the gap [`coalesce_ranges`] bridges where one
+/// section's last run ends within `gap` of the next section's first range
+/// (the page sections are disjoint and laid out one after another).
+fn coalesced_batch_bytes(sections: &[SectionSpan; 3], gap: u64) -> u64 {
+    let mut present: Vec<(u64, &SectionSpan)> = sections
+        .iter()
+        .filter_map(|s| s.first.map(|first| (first, s)))
+        .collect();
+    present.sort_by_key(|(first, _)| *first);
+    let own = present
+        .iter()
+        .map(|(_, s)| s.bytes)
+        .fold(0u64, u64::saturating_add);
+    let bridged = present
+        .windows(2)
+        .filter_map(|pair| {
+            let (_, before) = pair[0];
+            let (next_first, _) = pair[1];
+            (next_first <= before.tail.saturating_add(gap))
+                .then(|| next_first.saturating_sub(before.tail))
+        })
+        .fold(0u64, u64::saturating_add);
+    own.saturating_add(bridged)
+}
+
 /// Cuts `wanted` (catalog order) into consecutive batches of whole series
-/// whose planned page bytes sum to at most `batch_bytes`; a series larger
-/// than `batch_bytes` is a batch of its own. `scalar_planned` and
+/// whose coalesced page bytes at `coalesce_gap`, bridged gaps included, are
+/// at most `batch_bytes`; a series whose own coalesced bytes exceed
+/// `batch_bytes` is a batch of its own. `scalar_planned` and
 /// `histogram_planned` are the `plan_ranges_v4` output for `wanted`'s scalar
 /// and histogram series, one entry per run, in the same order.
+///
+/// Each batch is fetched into regions of its own, so no batch shares or
+/// chains regions with another, and every section tail starts empty at each
+/// batch: a batch's reservation is the coalesced runs of its own ranges
+/// minus those the segment's open and catalog regions already hold, which is
+/// what bounds it by the bytes counted here. Counting ranges those regions
+/// already hold over-counts, the safe direction.
 fn page_batches(
     wanted: &[&SeriesEntryV4],
     scalar_planned: &[ravel_segment::PlannedRunRange],
     histogram_planned: &[ravel_segment::PlannedRunRange],
     batch_bytes: u64,
+    coalesce_gap: u64,
 ) -> Vec<PageBatch> {
+    const TS: usize = 0;
+    const VAL: usize = 1;
+    const HIST: usize = 2;
+    let range = |(offset, len): (u64, u64)| (offset, offset.saturating_add(len));
     let mut batches = Vec::new();
     let (mut scalar, mut scalar_plans, mut histogram, mut histogram_plans) =
         (0usize, 0usize, 0usize, 0usize);
@@ -4014,7 +4097,7 @@ fn page_batches(
         histogram: 0..0,
         histogram_plans: 0..0,
     };
-    let mut current_bytes = 0u64;
+    let mut sections = [SectionSpan::default(); 3];
     for entry in wanted {
         let histogram_kind = entry.entry.value_kind == ValueKind::Histogram;
         let (plans, start) = if histogram_kind {
@@ -4023,21 +4106,21 @@ fn page_batches(
             (scalar_planned, scalar_plans)
         };
         let end = start.saturating_add(entry.runs.len()).min(plans.len());
-        let series_bytes: u64 = plans
-            .get(start..end)
-            .unwrap_or(&[])
-            .iter()
-            .map(|p| {
-                let pages = if histogram_kind {
-                    p.hist_range.1
+        let series_plans = plans.get(start..end).unwrap_or(&[]);
+        let with_series = |mut sections: [SectionSpan; 3]| {
+            for p in series_plans {
+                sections[TS].add(range(p.ts_range), coalesce_gap);
+                if histogram_kind {
+                    sections[HIST].add(range(p.hist_range), coalesce_gap);
                 } else {
-                    p.val_range.1
-                };
-                p.ts_range.1.saturating_add(pages)
-            })
-            .fold(0u64, u64::saturating_add);
+                    sections[VAL].add(range(p.val_range), coalesce_gap);
+                }
+            }
+            sections
+        };
+        let joined = with_series(sections);
         let current_is_empty = current.scalar.is_empty() && current.histogram.is_empty();
-        if !current_is_empty && current_bytes.saturating_add(series_bytes) > batch_bytes {
+        if !current_is_empty && coalesced_batch_bytes(&joined, coalesce_gap) > batch_bytes {
             batches.push(current);
             current = PageBatch {
                 scalar: scalar..scalar,
@@ -4045,9 +4128,10 @@ fn page_batches(
                 histogram: histogram..histogram,
                 histogram_plans: histogram_plans..histogram_plans,
             };
-            current_bytes = 0;
+            sections = with_series([SectionSpan::default(); 3]);
+        } else {
+            sections = joined;
         }
-        current_bytes = current_bytes.saturating_add(series_bytes);
         if histogram_kind {
             histogram += 1;
             histogram_plans = end;
@@ -7867,19 +7951,37 @@ mod tests {
         Arc::new(crate::GetLimiter::new(permits).expect("limiter"))
     }
 
+    /// A ranged L1 fetcher at the default coalesce gap, so gaps between
+    /// selected pages up to [`DEFAULT_COALESCE_GAP`] are bridged.
+    fn ranged_l1_default_gap(fetcher: SegmentFetcher) -> SegmentFetcher {
+        fetcher.with_whole_object_threshold(0).with_suffix_len(16)
+    }
+
+    /// A matcher selecting every `k`th of the `count` names `b000`..; the
+    /// part's catalog is in series-id order, so the selection is spread
+    /// across it.
+    fn one_series_in(k: usize, count: usize) -> Vec<LabelMatcher> {
+        let names: Vec<String> = (0..count).step_by(k).map(|i| format!("b{i:03}")).collect();
+        vec![LabelMatcher::regex("__name__", names.join("|")).expect("regex")]
+    }
+
     /// ADR-3694 decision 4 as the whole-series batch amendment restates it:
-    /// an L1 fetch reserves one batch of whole series at a time. The budget
-    /// below would fit the whole call (every selected page plus what the
-    /// segment holds outside its pages), so a whole-call reservation succeeds;
-    /// it is the peak this test bounds: never more than one batch's coalesced
-    /// bytes plus the segment's open and catalog regions and its decoded
-    /// catalog, no batch's bytes outliving its decode, and no batch holding a
-    /// byte it has not reserved.
+    /// an L1 fetch reserves one batch of whole series at a time, and a batch
+    /// is bounded by its coalesced bytes, bridged gaps included. One series in
+    /// sixteen is selected at the default coalesce gap, so the gaps between
+    /// selected timestamp pages are bridged and a batch's coalesced runs are
+    /// several times its pages. The budget would fit the whole call; it is
+    /// the peak this test bounds: every batch reserves at most
+    /// `fetch_batch_bytes`, the peak is one batch plus the segment's open and
+    /// catalog regions and its decoded catalog, no batch's bytes outlive its
+    /// decode, and no batch holds a byte it has not reserved.
     #[tokio::test]
     async fn one_call_never_reserves_more_than_one_batch() {
-        let (bytes, tenant_hash, seg_ref) = batched_l1_segment(64, 256, false);
-        let whole = batch_run(&bytes, tenant_hash, &seg_ref, &[], |f| {
-            ranged_l1(f).with_fetch_batch_floor(u64::MAX)
+        const PERMITS: usize = 2;
+        let (bytes, tenant_hash, seg_ref) = batched_l1_segment(256, 1024, false);
+        let matchers = one_series_in(16, 256);
+        let whole = batch_run(&bytes, tenant_hash, &seg_ref, &matchers, |f| {
+            ranged_l1_default_gap(f).with_fetch_batch_floor(u64::MAX)
         })
         .await;
         assert_eq!(
@@ -7888,41 +7990,38 @@ mod tests {
             "a floor above the part is one batch"
         );
         let one = &whole.batches[0];
-        assert!(
-            one.batch_owned <= one.batch_reserved,
-            "holds {} B against a reservation of {} B",
-            one.batch_owned,
-            one.batch_reserved
-        );
+        assert_eq!(one.series, 16, "one series in sixteen");
         let page_bytes = whole.scan_bytes();
         assert_eq!(
             one.batch_reserved, page_bytes,
-            "the one batch reserves every page"
+            "the one batch reserves its coalesced runs"
         );
         let regions = one.segment_reserved;
         // The open and catalog regions plus the decoded catalog's reservation.
         let catalog = one.budget_reserved - page_bytes;
         assert!(catalog > regions, "the decoded catalog is reserved too");
         let limit = page_bytes + catalog;
-        let batch_bytes = limit / (2 * BATCH_PERMITS as u64);
-        assert!(
-            page_bytes >= 20 * batch_bytes,
-            "the selected pages ({page_bytes} B) span at least 20 batches of {batch_bytes} B"
-        );
+        let batch_bytes = limit / (2 * PERMITS as u64);
 
         let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
         let configure = |f: SegmentFetcher| {
-            ranged_l1(f)
+            ranged_l1_default_gap(f)
                 .with_fetch_batch_floor(1)
-                .with_get_limiter(limiter(BATCH_PERMITS))
+                .with_get_limiter(limiter(PERMITS))
                 .with_memory_budget(Arc::clone(&budget))
         };
         assert_eq!(
             configure(SegmentFetcher::new(Arc::new(MemoryStore::new()))).fetch_batch_bytes(),
             batch_bytes
         );
-        let batched = batch_run(&bytes, tenant_hash, &seg_ref, &[], configure).await;
+        let batched = batch_run(&bytes, tenant_hash, &seg_ref, &matchers, configure).await;
         for (i, b) in batched.batches.iter().enumerate() {
+            assert!(
+                b.batch_reserved <= batch_bytes,
+                "batch {i}: {} series reserve {} B, over fetch_batch_bytes ({batch_bytes} B)",
+                b.series,
+                b.batch_reserved
+            );
             assert_eq!(
                 b.segment_reserved, regions,
                 "batch {i}: open and catalog regions"
@@ -7933,29 +8032,146 @@ mod tests {
                 "batch {i}: no earlier batch's reservation outlives its decode"
             );
             assert!(
-                b.budget_reserved <= batch_bytes + catalog,
-                "batch {i}: peak fetch reservation {} exceeds one batch ({batch_bytes} B) plus \
-                 the catalog ({catalog} B)",
-                b.budget_reserved
-            );
-            assert!(
                 b.batch_owned <= b.batch_reserved,
                 "batch {i}: holds {} B against a reservation of {} B",
                 b.batch_owned,
                 b.batch_reserved
             );
         }
-        assert!(
-            batched.batches.len() >= 20,
-            "{} batches",
-            batched.batches.len()
-        );
+        let series: Vec<usize> = batched.batches.iter().map(|b| b.series).collect();
+        assert_eq!(series, BATCH_SERIES_AT_DEFAULT_GAP, "series per batch");
         assert_eq!(
             batched.decoded(),
             whole.decoded(),
             "bitwise the same samples"
         );
         assert_eq!(budget.reserved(), 0, "every batch released its reservation");
+    }
+
+    /// Series per batch of `one_call_never_reserves_more_than_one_batch`.
+    const BATCH_SERIES_AT_DEFAULT_GAP: [usize; 4] = [4, 4, 4, 4];
+
+    /// A series whose own coalesced bytes exceed `fetch_batch_bytes` is a
+    /// batch alone, and that batch reserves exactly its own coalesced bytes.
+    /// The part is smaller than the default coalesce gap, so one series' timestamp
+    /// and value pages are bridged across the section boundary: each series
+    /// coalesces to far more than its pages, and the batch bound sits between
+    /// the two.
+    #[tokio::test]
+    async fn a_series_over_the_batch_bytes_is_fetched_alone() {
+        const COUNT: usize = 64;
+        let (bytes, tenant_hash, seg_ref) = batched_l1_segment(COUNT, 64, false);
+        assert!(
+            seg_ref.object_size < DEFAULT_COALESCE_GAP,
+            "{} B",
+            seg_ref.object_size
+        );
+        let names: Vec<String> = (0..COUNT).step_by(4).map(|i| format!("b{i:03}")).collect();
+        // Each selected series fetched on its own, whole: its own coalesced
+        // bytes at the default gap, and its pages at a zero gap.
+        let mut own = Vec::new();
+        let mut largest_pages = 0u64;
+        for name in &names {
+            let matchers = [LabelMatcher::equal("__name__", name.as_str())];
+            let alone = batch_run(&bytes, tenant_hash, &seg_ref, &matchers, |f| {
+                ranged_l1_default_gap(f).with_fetch_batch_floor(u64::MAX)
+            })
+            .await;
+            assert_eq!(alone.batches.len(), 1, "{name}");
+            own.push(alone.batches[0].batch_reserved);
+            let pages = batch_run(&bytes, tenant_hash, &seg_ref, &matchers, |f| {
+                ranged_l1(f).with_fetch_batch_floor(u64::MAX)
+            })
+            .await;
+            largest_pages = largest_pages.max(pages.batches[0].batch_reserved);
+        }
+        let smallest_own = own.iter().copied().min().expect("selected series");
+        let batch_bytes = smallest_own - 1;
+        assert!(
+            4 * largest_pages <= batch_bytes,
+            "four series' pages ({largest_pages} B each) fit one batch of {batch_bytes} B"
+        );
+        let matchers = one_series_in(4, COUNT);
+        let configure = |f: SegmentFetcher| {
+            ranged_l1_default_gap(f)
+                .with_fetch_batch_floor(batch_bytes)
+                .with_get_limiter(limiter(BATCH_PERMITS))
+                .with_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(
+                    2 * BATCH_PERMITS as u64 * batch_bytes,
+                )))
+        };
+        assert_eq!(
+            configure(SegmentFetcher::new(Arc::new(MemoryStore::new()))).fetch_batch_bytes(),
+            batch_bytes
+        );
+        let batched = batch_run(&bytes, tenant_hash, &seg_ref, &matchers, configure).await;
+        for (i, b) in batched.batches.iter().enumerate() {
+            assert!(
+                b.series == 1 || b.batch_reserved <= batch_bytes,
+                "batch {i}: {} series reserve {} B, over fetch_batch_bytes ({batch_bytes} B)",
+                b.series,
+                b.batch_reserved
+            );
+        }
+        assert_eq!(
+            batched.batches.len(),
+            names.len(),
+            "every series is a batch alone"
+        );
+        let mut reserved: Vec<u64> = batched.batches.iter().map(|b| b.batch_reserved).collect();
+        reserved.sort_unstable();
+        own.sort_unstable();
+        assert_eq!(
+            reserved, own,
+            "each lone series reserves exactly its own coalesced bytes"
+        );
+        let whole = batch_run(&bytes, tenant_hash, &seg_ref, &matchers, |f| {
+            ranged_l1_default_gap(f).with_fetch_batch_floor(u64::MAX)
+        })
+        .await;
+        assert_eq!(batched.decoded(), whole.decoded(), "the same samples");
+    }
+
+    /// The batch count `page_batches` sizes against is exactly what
+    /// `coalesce_ranges` makes of the same ranges, bridged gaps included, both
+    /// inside a page section and across the boundary between two sections.
+    #[test]
+    fn coalesced_batch_bytes_is_the_coalesced_runs() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for gap in [0, 1, 64, 512, DEFAULT_COALESCE_GAP] {
+            for case in 0..200 {
+                // Three disjoint sections one after another, each holding
+                // ascending ranges with gaps around `gap`.
+                let mut sections = [SectionSpan::default(); 3];
+                let mut ranges = Vec::new();
+                let mut offset = next(4 * gap + 2);
+                for section in &mut sections {
+                    for _ in 0..next(6) {
+                        let start = offset + next(2 * gap + 2);
+                        let end = start + next(300);
+                        section.add((start, end), gap);
+                        ranges.push((start, end));
+                        offset = end;
+                    }
+                    offset += next(2 * gap + 2);
+                }
+                let expected: u64 = coalesce_ranges(ranges, gap)
+                    .iter()
+                    .map(|(start, end)| end - start)
+                    .sum();
+                assert_eq!(
+                    coalesced_batch_bytes(&sections, gap),
+                    expected,
+                    "gap {gap}, case {case}"
+                );
+            }
+        }
     }
 
     /// Batching costs at most one extra GET per page section a batch touches
