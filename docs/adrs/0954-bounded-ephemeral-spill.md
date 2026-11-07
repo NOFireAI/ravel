@@ -922,12 +922,15 @@ answered, but three properties of the decision above cost the rest:
    enveloped bytes would exceed its fair share, `L - H` divided by the
    number of spill-capable consumers registered in the pool, DataFusion's
    `FairSpillPool` rule. A grow within the asker's share is admitted even
-   when the total is over `L - H`; the consumer over its share is refused
-   at its next checked grow, and until then the total may stay above
-   `L - H`, bounded by `L`. On c6a.large row 14 the whole-pool cap alone
-   refused the outer final aggregate, holding 14 MB, every time, while the
-   inner aggregate held 734 MB and never got the refusal that would make
-   it spill.
+   when the total is over `L - H`, up to a hard bound of `L - H/2` (`H/2`
+   by integer division): no checked grow of a spill-capable consumer takes
+   the total past it, within its share or not, so half of `H` is always
+   left to consumers that cannot spill. The consumer over its share is
+   refused at its next checked grow, and until then the total may stay
+   above `L - H`, up to `L - H/2`. On c6a.large row 14 the whole-pool cap
+   alone refused the outer final aggregate, holding 14 MB, every time,
+   while the inner aggregate held 734 MB and never got the refusal that
+   would make it spill.
 3. **In a spill-enabled pool, a reserve-ahead refusal of a spill-capable
    consumer is a spill trigger, not a failure.** The same refusal of a
    consumer that cannot spill is unchanged, and so is any refusal in a

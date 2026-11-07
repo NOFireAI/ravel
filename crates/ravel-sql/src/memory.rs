@@ -1193,6 +1193,15 @@ pub(crate) fn spill_mode_headroom(query_limit: usize) -> usize {
     share.max(SPILL_MODE_HEADROOM_MIN_BYTES)
 }
 
+/// The spill-mode hard bound: the most spill-capable consumers may hold,
+/// charged plus enveloped, in a pool with per-query limit `query_limit` and
+/// headroom `headroom`, even when the asker is within its fair share. It is
+/// `L - H/2` (integer division, saturating at zero), so half of `H` is always
+/// left to consumers that cannot spill.
+fn spill_mode_hard_bound(query_limit: usize, headroom: usize) -> usize {
+    query_limit.saturating_sub(headroom / 2)
+}
+
 /// Which limit refused a checked grow on a [`TenantDelegatingPool`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MemoryRefusal {
@@ -1578,10 +1587,11 @@ impl TenantDelegatingPool {
     /// headroom` (saturating at zero) divided by the number of spill-capable
     /// consumers registered on the pool. A grow within its share is admitted
     /// even when all spill-capable consumers together would then exceed
-    /// `query_limit - headroom`; the consumer over its share is refused at its
-    /// next checked grow, and until then the total is bounded by the query
-    /// limit alone. Consumers that cannot spill may still grow to the query
-    /// limit. That refusal is a spill trigger, not a memory refusal, so it
+    /// `query_limit - headroom`, up to the hard bound `query_limit -
+    /// headroom / 2` ([`spill_mode_hard_bound`]), which no checked grow of a
+    /// spill-capable consumer takes the total past; the consumer over its
+    /// share is refused at its next checked grow. Half the headroom is always left to consumers that cannot
+    /// spill, which may still grow to the query limit. That refusal is a spill trigger, not a memory refusal, so it
     /// leaves [`Self::refused`] unset. A spill-capable aggregate whose
     /// reserve-ahead envelope the process budget refuses gets the same spill
     /// trigger instead of a memory refusal.
@@ -1673,7 +1683,8 @@ impl TenantDelegatingPool {
     /// unchanged). Admits everything outside spill mode, every consumer that
     /// cannot spill, any grow that adds nothing to the consumer's own charged
     /// and enveloped bytes, and any grow that leaves them within its fair
-    /// share of the spill-mode cap, whatever the other consumers hold.
+    /// share of the spill-mode cap while the spill-capable total stays within
+    /// [`spill_mode_hard_bound`], whatever the other consumers hold.
     fn spill_cap_admit(
         &self,
         consumer: &MemoryConsumer,
@@ -1688,15 +1699,17 @@ impl TenantDelegatingPool {
             return Ok(());
         }
         let cap = self.query_limit.saturating_sub(headroom);
+        let hard_bound = spill_mode_hard_bound(self.query_limit, headroom);
         let mut ledger = self.consumer_ledger();
         let consumers = ledger.spillable_registered.max(1);
         let share = cap / consumers;
         let (own, own_after) = ledger.own_after(consumer, charged, envelope);
         let (_, after) = ledger.spillable_after(consumer, charged, envelope);
-        if own_after <= share || own_after <= own {
+        let within_share = own_after <= share;
+        if own_after <= own || (within_share && after <= hard_bound) {
             if after > cap {
                 // Some other consumer is over its share; it is refused at its
-                // next checked grow. The query limit bounds the total until
+                // next checked grow. The hard bound caps the total until
                 // then.
                 tracing::debug!(
                     consumer = consumer.name(),
@@ -1712,7 +1725,15 @@ impl TenantDelegatingPool {
         }
         let attribution = ledger.attribution(consumer, asked);
         drop(ledger);
-        let message = if after > cap {
+        let message = if within_share {
+            format!(
+                "query memory pool spill threshold reached: spill-capable consumers would hold \
+                 {after} bytes charged and enveloped, over the spill-mode hard bound \
+                 {hard_bound} (per-query limit {} less half the headroom {}){attribution}",
+                self.query_limit,
+                self.query_limit - hard_bound,
+            )
+        } else if after > cap {
             format!(
                 "query memory pool spill threshold reached: spill-capable consumers would hold \
                  {after} bytes charged and enveloped, over the spill-mode cap {cap} (per-query \
@@ -4758,8 +4779,14 @@ pub(crate) mod tests {
     /// Issue #3899 (M2), the row 14 shape: A holds 880 of the 900-byte cap
     /// alone, then B registers and asks 50. The total 930 is over the cap,
     /// but 50 is within B's share of 450, so B is admitted and the total
-    /// passes `L - H`, bounded by `L`; A, over its share, is refused at its
-    /// next grow, and A's shrink brings the total back.
+    /// passes `L - H`; A, over its share, is refused at its next grow. B
+    /// takes the total to the hard bound `L - H/2 = 950` and is refused one
+    /// byte past it though still within its share, so a consumer that cannot
+    /// spill still grows by 50. A's shrink brings the total back.
+    ///
+    /// Prove-the-test: admit a grow within its share in `spill_cap_admit`
+    /// whatever the total (drop `&& after <= hard_bound`) and B's grow to 951
+    /// is admitted.
     #[test]
     fn spill_mode_admits_an_asker_within_its_share_over_the_cap() {
         let _serial = envelope_tests();
@@ -4779,11 +4806,83 @@ pub(crate) mod tests {
             ),
             "{message}"
         );
-        b.try_grow(71)
-            .expect_err("B at 121 is within its share, but L = 1000 is the outer bound");
+        b.try_grow(20)
+            .expect("B at 70 is within its share and 950 is the hard bound");
+        assert_eq!(spill.reserved(), 950);
+        let message = exhausted_message(
+            b.try_grow(1)
+                .expect_err("B at 71 is within its share, but 951 is over the hard bound"),
+        );
+        assert_eq!(
+            message,
+            "query memory pool spill threshold reached: spill-capable consumers would hold 951 \
+             bytes charged and enveloped, over the spill-mode hard bound 950 (per-query limit \
+             1000 less half the headroom 50); asked by ExternalSorter[1] (can_spill=true, 1 \
+             bytes asked); top holders: ExternalSorter[0] 880 bytes, ExternalSorter[1] 70 \
+             bytes; non-spillable consumers hold 0 bytes; this query's aggregate envelope 0 \
+             bytes"
+        );
+        assert_eq!(spill.reserved(), 950, "the refused grow reserved nothing");
+        assert!(
+            !spill.refused(),
+            "the spill trigger is not a memory refusal"
+        );
+        let join = register_on(&spill, "HashJoinInput[0]");
+        join.try_grow(50)
+            .expect("half the headroom is left to a consumer that cannot spill");
+        assert_eq!(spill.reserved(), 1000);
+        join.free();
         a.shrink(480);
-        assert_eq!(spill.reserved(), 450);
+        assert_eq!(spill.reserved(), 470);
         a.try_grow(1).expect("401 is within A's share of 450");
+    }
+
+    /// Issue #3899, the review's shape: with `L = 1000` and `H = 100`, A
+    /// grows to 899 alone, within its share of the whole 900-byte cap. Three
+    /// more spill-capable consumers register, so the share is `900 / 4 =
+    /// 225`, and each asks 30 in turn. B is admitted at a total of 929; C and
+    /// D, each within its share, would take the total to 959, over the hard
+    /// bound 950, and are refused. A consumer that cannot spill then grows by
+    /// 50, to 979. Without the hard bound all three are admitted, the total
+    /// reaches 989, and only 11 bytes of the 100-byte headroom are left.
+    ///
+    /// Prove-the-test: drop `&& after <= hard_bound` in `spill_cap_admit` and
+    /// C's grow is admitted.
+    #[test]
+    fn spill_mode_keeps_half_the_headroom_from_askers_within_their_share() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1 << 30));
+        let spill = attributed_pool(&budget, 1000, 1 << 30, Some(100));
+        let a = register_spilling(&spill, "ExternalSorter[0]");
+        a.try_grow(899)
+            .expect("899 is within A's share of 900 alone");
+        let b = register_spilling(&spill, "ExternalSorter[1]");
+        let c = register_spilling(&spill, "ExternalSorter[2]");
+        let d = register_spilling(&spill, "ExternalSorter[3]");
+        b.try_grow(30)
+            .expect("30 is within B's share of 225 and 929 is within the hard bound");
+        assert_eq!(spill.reserved(), 929);
+        for (name, asker) in [("ExternalSorter[2]", &c), ("ExternalSorter[3]", &d)] {
+            let message = exhausted_message(
+                asker
+                    .try_grow(30)
+                    .expect_err("30 is within the share of 225, but 959 is over 950"),
+            );
+            assert!(
+                message.starts_with(&format!(
+                    "query memory pool spill threshold reached: spill-capable consumers would \
+                     hold 959 bytes charged and enveloped, over the spill-mode hard bound 950 \
+                     (per-query limit 1000 less half the headroom 50); asked by {name} \
+                     (can_spill=true, 30 bytes asked)"
+                )),
+                "{message}"
+            );
+        }
+        assert_eq!(spill.reserved(), 929, "the refused grows reserved nothing");
+        let join = register_on(&spill, "HashJoinInput[0]");
+        join.try_grow(50)
+            .expect("half the headroom is left to a consumer that cannot spill");
+        assert_eq!(spill.reserved(), 979);
     }
 
     /// Issue #3899: a spill-capable aggregate's own envelope counts inside
