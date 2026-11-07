@@ -164,7 +164,9 @@ use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::{extract_logs, prune_is_rewrite_neutral};
 use crate::logs_scan::ScanExecutions;
-use crate::memory::{CeilingBreach, MemoryRefusal, TenantDelegatingPool, TenantMemoryAccountant};
+use crate::memory::{
+    BudgetShare, CeilingBreach, MemoryRefusal, TenantDelegatingPool, TenantMemoryAccountant,
+};
 use crate::min_commit_token::MinCommitToken;
 use crate::output::QueryOutput;
 use crate::parquet::{
@@ -5775,6 +5777,9 @@ pub(crate) struct PoolReport {
     pub(crate) host_gate: bool,
     /// [`TenantDelegatingPool::first_refusal`].
     pub(crate) first: Option<MemoryRefusal>,
+    /// The refusing budget's figures, when the first refusal was a tenant or
+    /// process budget refusal.
+    pub(crate) first_share: Option<BudgetShare>,
     /// [`TenantDelegatingPool::peak_unspillable_bytes`].
     pub(crate) peak_unspillable_bytes: u64,
 }
@@ -5787,6 +5792,7 @@ impl PoolReport {
                 refused: pool.refused(),
                 host_gate: pool.host_gate_refused(),
                 first: pool.first_refusal(),
+                first_share: pool.first_refusal_record().and_then(|record| record.share),
                 peak_unspillable_bytes: pool.peak_unspillable_bytes(),
             })
     }
@@ -6566,12 +6572,12 @@ pub(crate) enum SpillRetry {
 /// decides whether its failure earns one more attempt with spill on. Every
 /// condition must hold:
 ///
-/// - the error is a memory refusal: a `ResourcesExhausted` the session's
-///   pool refused itself (`pool.refused`, and not through the host memory
-///   gate), or a fetch-layer `FetchMemoryExhausted` whose cause is the
-///   accounted ledger. A gate refusal is about the host, not this query, and
-///   spilling does not change it; nor does it change a spill-budget,
-///   scratch, deadline or any other error;
+/// - the error is a `ResourcesExhausted` the session's pool refused itself
+///   (`pool.refused`), and the pool's first refusal is the statement's own
+///   ([`refusal_is_own`]). A host memory gate refusal is about the host, not
+///   this query, and spilling does not change it; nor does it change a
+///   fetch layer's `FetchMemoryExhausted`, whose buffers do not spill, or a
+///   spill-budget, scratch, deadline or any other error;
 /// - nothing was emitted, so the failed output can be discarded whole;
 /// - spill is configured;
 /// - the statement is spill-eligible after the tie-order edit;
@@ -6587,10 +6593,10 @@ pub(crate) fn spill_retry_decision(
     spill_eligible: bool,
     spill_retried: bool,
 ) -> SpillRetry {
-    let memory_refusal = match err {
-        SqlError::ResourcesExhausted(_) => pool.refused && !pool.host_gate,
-        _ => fetch_refused_accounted(err),
-    };
+    let memory_refusal = matches!(err, SqlError::ResourcesExhausted(_))
+        && pool.refused
+        && !pool.host_gate
+        && refusal_is_own(pool);
     if memory_refusal && emitted == 0 && spill_configured && spill_eligible && !spill_retried {
         SpillRetry::Retry
     } else {
@@ -6598,26 +6604,35 @@ pub(crate) fn spill_retry_decision(
     }
 }
 
-/// A fetch layer's own memory refusal against its accounted ledger.
-fn fetch_refused_accounted(err: &SqlError) -> bool {
-    use ravel_memory::ExhaustionCause;
-    use ravel_query::{FetchError, LogFetchError};
+/// The share of a tenant or process budget's reserved bytes, in percent,
+/// that the refused statement's own bytes on it must reach for that budget's
+/// refusal to earn a spill retry. Below it the refusal is contention: other
+/// statements' reservations filled the shared budget, spilling this one does
+/// not free them, and the retry holds memory and a spill share while it runs.
+pub(crate) const SPILL_RETRY_DOMINANT_SHARE_PERCENT: u64 = 50;
 
-    use crate::spans_fetcher::SpanFetchError;
-
-    matches!(
-        err,
-        SqlError::Fetch(FetchError::FetchMemoryExhausted {
-            cause: ExhaustionCause::Accounted,
-            ..
-        }) | SqlError::LogFetch(LogFetchError::FetchMemoryExhausted {
-            cause: ExhaustionCause::Accounted,
-            ..
-        }) | SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted {
-            cause: ExhaustionCause::Accounted,
-            ..
-        })
-    )
+/// Whether the pool's first refusal is one the statement's own spill can
+/// answer: its per-query limit; a reserve-ahead refusal, whose consumer is
+/// always one of its own hash aggregates; or a tenant or process budget
+/// refusal at which its own bytes on that budget were at least
+/// [`SPILL_RETRY_DOMINANT_SHARE_PERCENT`] of the budget's reserved bytes.
+///
+/// A reserve-ahead refusal is not asked whether its consumer can spill: the
+/// first attempt has no disk manager, and DataFusion registers every
+/// aggregate of such a plan as unable to spill. Its aggregates are the ones
+/// the retry plans with a disk manager, where they spill.
+fn refusal_is_own(pool: PoolReport) -> bool {
+    match pool.first {
+        Some(MemoryRefusal::Query | MemoryRefusal::ReserveAhead) => true,
+        Some(MemoryRefusal::Tenant | MemoryRefusal::Process) => {
+            pool.first_share.is_some_and(|share| {
+                u128::from(share.own) * 100
+                    >= u128::from(share.budget_reserved)
+                        * u128::from(SPILL_RETRY_DOMINANT_SHARE_PERCENT)
+            })
+        }
+        Some(MemoryRefusal::HostGate) | None => false,
+    }
 }
 
 /// The refusal class a spill retry's log line names for its first attempt.
@@ -8910,10 +8925,10 @@ pub(crate) mod tests {
         assert_eq!(retry_decision(true, 7, 1), RetryDecision::FailInvalidated);
     }
 
-    /// Issue #3899: the spill retry's trigger. A pool refusal or an accounted
-    /// fetch refusal with nothing emitted, spill configured, an eligible
-    /// statement and no spill retry yet retries; taking away any one of those
-    /// does not, and no other error retries whatever the pool recorded.
+    /// Issue #3899: the spill retry's trigger. A query-pool refusal with
+    /// nothing emitted, spill configured, an eligible statement and no spill
+    /// retry yet retries; taking away any one of those does not, and no other
+    /// error retries whatever the pool recorded, a fetch refusal included.
     #[test]
     fn the_spill_retry_fires_only_on_a_memory_refusal_with_every_condition() {
         use ravel_memory::ExhaustionCause;
@@ -8937,16 +8952,14 @@ pub(crate) mod tests {
         };
 
         assert_eq!(decide(&pool_err(), refused, 0, false), SpillRetry::Retry);
-        assert_eq!(
-            decide(
-                &fetch_err(ExhaustionCause::Accounted),
-                PoolReport::default(),
-                0,
-                false
-            ),
-            SpillRetry::Retry,
-            "an accounted fetch refusal retries though the pool refused nothing"
-        );
+        for pool in [PoolReport::default(), refused] {
+            assert_eq!(
+                decide(&fetch_err(ExhaustionCause::Accounted), pool, 0, false),
+                SpillRetry::Propagate,
+                "spilling does not shrink fetch buffers, so an accounted fetch refusal \
+                 never retries: {pool:?}"
+            );
+        }
 
         assert_eq!(
             decide(&pool_err(), PoolReport::default(), 0, false),
@@ -9018,6 +9031,98 @@ pub(crate) mod tests {
         assert_eq!(decide(&pool_err(), refused, 0, false), SpillRetry::Retry);
         assert_eq!(decide(&pool_err(), refused, 0, true), SpillRetry::Propagate);
         assert_eq!(retry_decision(true, 0, 0), RetryDecision::RetryOnce);
+    }
+
+    /// Issue #3899 (M2): a tenant or process budget refusal retries only when
+    /// the refused statement held at least half of that budget's reserved
+    /// bytes; its own query-pool refusal, and a reserve-ahead refusal, retry
+    /// whatever any budget holds; a fetch-layer refusal never retries.
+    #[test]
+    fn a_budget_refusal_retries_only_when_the_statement_dominates_the_budget() {
+        use ravel_memory::ExhaustionCause;
+
+        let pool_err = || SqlError::ResourcesExhausted("process memory budget exhausted".into());
+        let decide = |pool| spill_retry_decision(&pool_err(), pool, 0, true, true, false);
+        let refused = |first, own, budget_reserved| PoolReport {
+            refused: true,
+            first: Some(first),
+            first_share: Some(BudgetShare {
+                budget_reserved,
+                own,
+            }),
+            ..PoolReport::default()
+        };
+
+        assert_eq!(
+            decide(refused(MemoryRefusal::Process, 800, 1000)),
+            SpillRetry::Retry,
+            "the statement holds 80% of the process reservation"
+        );
+        assert_eq!(
+            decide(refused(MemoryRefusal::Process, 100, 1000)),
+            SpillRetry::Propagate,
+            "the statement holds 10% of the process reservation"
+        );
+        assert_eq!(
+            decide(refused(MemoryRefusal::Tenant, 500, 1000)),
+            SpillRetry::Retry,
+            "exactly half of the tenant reservation"
+        );
+        assert_eq!(
+            decide(refused(MemoryRefusal::Tenant, 499, 1000)),
+            SpillRetry::Propagate,
+            "just under half of the tenant reservation"
+        );
+        assert_eq!(
+            decide(PoolReport {
+                first_share: None,
+                ..refused(MemoryRefusal::Process, 0, 0)
+            }),
+            SpillRetry::Propagate,
+            "a budget refusal with no recorded figures"
+        );
+
+        assert_eq!(
+            decide(refused(MemoryRefusal::Query, 1, 1000)),
+            SpillRetry::Retry,
+            "a query-pool refusal retries whatever the budget holds"
+        );
+        assert_eq!(
+            spill_retry_decision(
+                &pool_err(),
+                refused(MemoryRefusal::Query, 1, 1000),
+                1,
+                true,
+                true,
+                false
+            ),
+            SpillRetry::Propagate,
+            "a query-pool refusal still needs every other condition"
+        );
+        assert_eq!(
+            decide(refused(MemoryRefusal::ReserveAhead, 1, 1000)),
+            SpillRetry::Retry,
+            "a reserve-ahead refusal retries whatever the budget holds"
+        );
+
+        let fetch = SqlError::Fetch(FetchError::FetchMemoryExhausted {
+            requested: 10,
+            reserved: 90,
+            limit: 100,
+            cause: ExhaustionCause::Accounted,
+        });
+        assert_eq!(
+            spill_retry_decision(
+                &fetch,
+                refused(MemoryRefusal::Process, 800, 1000),
+                0,
+                true,
+                true,
+                false
+            ),
+            SpillRetry::Propagate,
+            "a fetch-layer refusal never retries"
+        );
     }
 
     /// Issue #3899: the spill retry's pool is the spill-mode pool, so a
