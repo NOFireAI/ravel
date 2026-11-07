@@ -75,7 +75,8 @@ KEY_INDEX_METRICS = {
 ALLOWLIST_BREAKDOWNS = {"per_object": "stats carry no per-object breakdown",
                         "per_part": "stats carry no per-part breakdown"}
 # Fold report fields this build does not write.
-FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field")
+FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_index_sections_read",
+                  "key_index_leaf_gets")
 
 # Fold report fields under their names in a `catalog fold --json` report and
 # in a `--rebuild-key-index` report.

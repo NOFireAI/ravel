@@ -1,6 +1,6 @@
 selective investigations, lane local: fail
 not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 9 figures covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact (run.toml states lacks ['many_parts_744']); row 10 (run.toml states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml hits = false, baseline = false)
-refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23 figure(s), 0 call(s)
+refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29 figure(s), 0 call(s)
 
 states:
   compaction_done          run
@@ -67,16 +67,24 @@ row_07.spans_tail_entries                    value                     6  pass
 row_07.spans_new_entries                     value                     2  pass
 row_07.spans_previous_leaves                 value                     1  pass
 row_07.spans_footer_len                      value                   199  pass
-row_07.spans_section_gets                    value                    12  miss  (from-scratch rebuild: section GETs = 2 x entry_count)
+row_07.spans_uncovered_entries               value                     0  pass
+row_07.spans_section_gets                    value                    12  unsupported-on-this-build  (band refers to figure row_07.spans_build_passes, unsupported-on-this-build: fold report carries no key_index_build_passes on this build)
+row_07.spans_leaf_gets                       unsupported-                 unsupported-on-this-build  (fold report carries no key_index_leaf_gets on this build)
 row_07.spans_build_passes                    unsupported-                 unsupported-on-this-build  (fold report carries no key_index_build_passes on this build)
+row_07.spans_sections_read                   unsupported-                 unsupported-on-this-build  (fold report carries no key_index_sections_read on this build)
+row_07.spans_sections_per_pass               unsupported-                 unsupported-on-this-build  (row_07.spans_sections_read is unsupported-on-this-build: fold report carries no key_index_sections_read on this build)
 row_07.spans_peak_rss_bytes                  value              25772032  pass
 row_07.logs_mixed_entries                    value                     4  pass
 row_07.logs_tail_entries                     value                     6  pass
 row_07.logs_new_entries                      value                     2  pass
 row_07.logs_previous_leaves                  value                     2  pass
 row_07.logs_footer_len                       value                   248  pass
-row_07.logs_section_gets                     value                    12  miss  (from-scratch rebuild: section GETs = 2 x entry_count)
+row_07.logs_uncovered_entries                value                     0  pass
+row_07.logs_section_gets                     value                    12  unsupported-on-this-build  (band refers to figure row_07.logs_build_passes, unsupported-on-this-build: fold report carries no key_index_build_passes on this build)
+row_07.logs_leaf_gets                        unsupported-                 unsupported-on-this-build  (fold report carries no key_index_leaf_gets on this build)
 row_07.logs_build_passes                     unsupported-                 unsupported-on-this-build  (fold report carries no key_index_build_passes on this build)
+row_07.logs_sections_read                    unsupported-                 unsupported-on-this-build  (fold report carries no key_index_sections_read on this build)
+row_07.logs_sections_per_pass                unsupported-                 unsupported-on-this-build  (row_07.logs_sections_read is unsupported-on-this-build: fold report carries no key_index_sections_read on this build)
 row_07.logs_peak_rss_bytes                   value              42303488  pass
 row_08.spans_trace_id_leaf_pct               value           4.254542317  pass
 row_08.logs_trace_id_leaf_pct                value           5.856864287  miss
@@ -355,8 +363,6 @@ query frequency assumed (once, for every break-even below): 1000 lookups per par
 miss row_01.wire_bytes
 miss row_02.wire_bytes
 miss row_03.probe_wire_per_object
-miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
-miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_08.logs_trace_id_leaf_pct
 miss row_08.logs_request_id_leaf_pct: key cardinality equals the row count
 dead_counter segmentsOpened journey_c_1 folded_leaves

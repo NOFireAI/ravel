@@ -1046,8 +1046,6 @@ class LocalSmoke(Workdir):
             "miss row_01.wire_bytes",
             "miss row_02.wire_bytes",
             "miss row_03.probe_wire_per_object",
-            "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
-            "miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
             "miss row_08.logs_trace_id_leaf_pct",
             "miss row_08.logs_request_id_leaf_pct: key cardinality equals the row count",
             "dead_counter segmentsOpened journey_c_1 folded_leaves",
@@ -1143,15 +1141,20 @@ class LocalSmoke(Workdir):
         for name in ("covering_parts", "rows_exact"):
             self.assertEqual(figure(res, f"row_09.{name}")["status"], "not-run")
 
-    def test_section_gets_are_a_from_scratch_rebuild(self):
-        # Item 3: the advancing fold re-reads every entry's sections, old and
-        # new, not only the tail's.
+    def test_section_gets_need_the_pass_count(self):
+        # Item 3: the fixture's advancing fold read every entry's sections,
+        # 2 x its tail entries, but its build reports no
+        # key_index_build_passes, and row 7 is judged per pass, so the figure
+        # is unsupported, not a miss and not a pass (the per-pass cases are
+        # check_row_7_box_d and check_row_7_rebuild).
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         for sig in ("spans", "logs"):
             f = figure(res, f"row_07.{sig}_section_gets")
             tail = figure(res, f"row_07.{sig}_tail_entries")["value"]
-            self.assertEqual((f["value"], f["verdict"]), (2 * tail, "miss"), sig)
-            self.assertEqual(f["reason"], "from-scratch rebuild: section GETs = 2 x entry_count")
+            self.assertEqual((f["value"], f["verdict"]), (2 * tail, UNSUPPORTED), sig)
+            self.assertIn(f"band refers to figure row_07.{sig}_build_passes", f["reason"])
+            for name in ("sections_read", "sections_per_pass", "leaf_gets", "build_passes"):
+                self.assertEqual(figure(res, f"row_07.{sig}_{name}")["status"], UNSUPPORTED, (sig, name))
 
     def test_dead_counter_on_row_14(self):
         # Item 5: segmentsOpened reads 0 on calls that issued scan GETs.
@@ -1864,10 +1867,99 @@ class Evaluate(Workdir):
     def test_probe_per_object(self):
         self.assertEqual(self.check_probe_per_object(), [])
 
+    # Box D's fold_advance (#3692 comment 6700944105, the Stage 1 amendment's
+    # row 7): spans 40 new entries over 3 passes, 240 ranged GETs, 1 previous
+    # leaf; logs 22 new entries of a 570-entry tail over 27 passes, 1,188
+    # ranged GETs (594 sections, 22 a pass), 6 previous leaves (5 request_id
+    # slices and 1 trace_id); no entry uncovered.
+    BOX_D_ROW_7 = {
+        "spans": dict(mixed=800, tail=840, leaves=1, ranged=240, sections=120, passes=3, leaf_gets=1, uncovered=0),
+        "logs": dict(mixed=548, tail=570, leaves=6, ranged=1188, sections=594, passes=27, leaf_gets=6, uncovered=0),
+    }
+
+    def set_row_7(self, figures):
+        """Write {signal: dict(mixed, tail, leaves, ranged, sections, passes, leaf_gets, uncovered)} into the
+        mixed and fold_advance catalog stamps and the fold_advance fold reports."""
+        for sig, f in figures.items():
+            for state, entries in (("mixed", f["mixed"]), ("fold_advance", f["tail"])):
+                path = self.stamp_path(f"{state}.{sig}.catalog.json")
+                with open(path) as fh:
+                    doc = json.load(fh)
+                doc["entries"] = entries
+                if state == "mixed":
+                    leaf = doc["parts"][0]["leaves"][0]
+                    doc["parts"] = doc["parts"][:1]
+                    doc["parts"][0]["leaves"] = [dict(leaf) for _ in range(f["leaves"])]
+                with open(path, "w") as fh:
+                    json.dump(doc, fh)
+        folds = read_jsonl(self.stamp_path("folds.jsonl"))
+        for line in folds:
+            f = figures.get(line["signal"]) if line["transition"] == "fold_advance" else None
+            if f:
+                line["report"].update(key_index_ranged_gets=f["ranged"], key_index_sections_read=f["sections"],
+                                      key_index_build_passes=f["passes"], key_index_leaf_gets=f["leaf_gets"],
+                                      key_index_uncovered_entries=f["uncovered"])
+        write_jsonl(self.stamp_path("folds.jsonl"), folds)
+
+    def check_row_7_box_d(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 3: box D's advance holds on section GETs per pass, section reads per pass and leaf GETs, where
+        a total against 2 x tail entries (1,188 against 1,140) called it a rebuild."""
+        self.set_row_7(self.BOX_D_ROW_7)
+        _, res, _ = self.go(bands, evaluate_py)
+        out = []
+        for sig, f in self.BOX_D_ROW_7.items():
+            for name, value in (("section_gets", f["ranged"]), ("sections_per_pass", f["sections"] / f["passes"]),
+                                ("leaf_gets", f["leaf_gets"]), ("new_entries", f["tail"] - f["mixed"])):
+                got = figure(res, f"row_07.{sig}_{name}")
+                if (got["value"], got["verdict"]) != (value, "pass"):
+                    out.append(f"{sig} {name} {got['value']} {got['verdict']} {got['reason']}")
+        return out
+
+    def test_row_7_box_d(self):
+        self.assertEqual(self.check_row_7_box_d(), [])
+        # The arithmetic the case rests on, and the total the old miss line
+        # compared: 2 x 22 x 27 = 1,188 >= 2 x 570 = 1,140.
+        logs = self.BOX_D_ROW_7["logs"]
+        self.assertEqual(logs["ranged"], 2 * (logs["tail"] - logs["mixed"]) * logs["passes"])
+        self.assertEqual(logs["sections"], (logs["tail"] - logs["mixed"]) * logs["passes"])
+        self.assertGreaterEqual(logs["ranged"], 2 * logs["tail"])
+        self.assertEqual(2 * logs["tail"], 1140)
+
+    def check_row_7_rebuild(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 3: a from-scratch rebuild, every tail entry's sections read in one pass (2 x 570 = 1,140 ranged
+        GETs, 570 sections), still misses on both signals, with the rebuild reasons."""
+        rebuild = {sig: dict(f, ranged=2 * f["tail"], sections=f["tail"], passes=1)
+                   for sig, f in self.BOX_D_ROW_7.items()}
+        self.set_row_7(rebuild)
+        _, res, _ = self.go(bands, evaluate_py)
+        out = []
+        for sig in rebuild:
+            for name, reason in (("section_gets", "from-scratch rebuild: section GETs = 2 x entry_count per pass"),
+                                 ("sections_per_pass", "from-scratch rebuild: every tail entry's section read on "
+                                                       "a pass")):
+                want = f"miss row_07.{sig}_{name}: {reason}"
+                if want not in res["problems"]:
+                    out.append(f"no '{want}'")
+        return out
+
+    def test_row_7_rebuild(self):
+        self.assertEqual(self.check_row_7_rebuild(), [])
+
+    def check_row_7_extra_leaf_gets(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 3: an advance that reads the previous leaves more than once each misses on leaf GETs."""
+        self.set_row_7({"logs": dict(self.BOX_D_ROW_7["logs"], leaf_gets=12)})
+        _, res, _ = self.go(bands, evaluate_py)
+        f = figure(res, "row_07.logs_leaf_gets")
+        return [] if (f["value"], f["verdict"]) == (12, "miss") else [f"{f['value']} {f['verdict']}"]
+
+    def test_row_7_extra_leaf_gets(self):
+        self.assertEqual(self.check_row_7_extra_leaf_gets(), [])
+
     def check_miss_reason(self, evaluate_py=EVALUATE):
         """Item 3: row 7's miss carries the from-scratch reason bands.toml gives it."""
+        self.set_row_7({"spans": dict(self.BOX_D_ROW_7["spans"], ranged=2 * 840, sections=840, passes=1)})
         _, res, _ = self.go(BANDS, evaluate_py)
-        want = "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count"
+        want = "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count per pass"
         return [] if want in res["problems"] else [f"problems {res['problems']}"]
 
     def test_miss_reason(self):
@@ -3002,6 +3094,60 @@ class Flips(Workdir):
                     t.tearDown()
                 self.assertTrue(failures, f"{name}: the flipped evaluator passed {case}")
                 print(f"flip '{name}' at evaluate.py:{line} fails {case}: {failures}", file=sys.stderr)
+
+
+# Wrong bands the cases rule out: the same shape as FLIPS, with the anchor in
+# bands.toml and the case run against the real evaluate.py and the flipped
+# bands.
+BAND_FLIPS = {
+    "row 7's logs section GETs missed against 2 x tail entries, not per pass": (
+        "miss_if = \"v >= 2 * m['row_07.logs_tail_entries'] * m['row_07.logs_build_passes']\"\n",
+        "miss_if = \"v >= 2 * m['row_07.logs_tail_entries']\"\n",
+        "check_row_7_box_d",
+    ),
+    "row 7's spans section GETs target without the pass factor": (
+        "+ m['row_07.spans_uncovered_entries']) if m['row_07.spans_footer_len'] > 8192 else 0)) "
+        "* m['row_07.spans_build_passes']\"\n",
+        "+ m['row_07.spans_uncovered_entries']) if m['row_07.spans_footer_len'] > 8192 else 0))\"\n",
+        "check_row_7_box_d",
+    ),
+    "row 7's sections read per pass not judged": (
+        "target_if = \"v <= m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']\"\n"
+        "miss_if = \"v >= m['row_07.logs_tail_entries']\"\n",
+        "target_if = \"True\"\n"
+        "miss_if = \"False\"\n",
+        "check_row_7_rebuild",
+    ),
+    "row 7's previous-leaf GETs not compared with the previous leaves": (
+        "target_if = \"v == m['row_07.logs_previous_leaves']\"\n",
+        "target_if = \"v >= 0\"\n",
+        "check_row_7_extra_leaf_gets",
+    ),
+}
+
+
+class BandFlips(Workdir):
+    def test_each_wrong_band_fails_its_case(self):
+        with open(BANDS) as f:
+            src = f.read()
+        for name, (old, new, case) in BAND_FLIPS.items():
+            with self.subTest(flip=name):
+                self.assertEqual(src.count(old), 1, f"{name}: anchor gone from bands.toml; update the flip")
+                line = src[: src.index(old)].count("\n") + 1
+                flipped = self.path(f"bands_{case}.toml")
+                with open(flipped, "w") as f:
+                    f.write(src.replace(old, new))
+                t = Evaluate(case)
+                t.setUp()
+                try:
+                    self.assertEqual(getattr(t, case)(), [], f"{name}: the real bands fail their own case")
+                    t.tearDown()
+                    t.setUp()
+                    failures = getattr(t, case)(EVALUATE, flipped)
+                finally:
+                    t.tearDown()
+                self.assertTrue(failures, f"{name}: the flipped bands passed {case}")
+                print(f"flip '{name}' at bands.toml:{line} fails {case}: {failures}", file=sys.stderr)
 
 
 # --- box/ ---------------------------------------------------------------------------

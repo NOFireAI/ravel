@@ -456,7 +456,8 @@ Only an allowlist of fields this build does not report may read as
 `stats.keyIndex` and its members (`partsCovered`, `partsUncovered`,
 `partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
 `leafGetRequests`, `keysProbed`), `pruning.skipIdxDropped`, the per-object
-and per-part breakdowns, and the fold report's `key_index_build_passes` and
+and per-part breakdowns, and the fold report's `key_index_build_passes`,
+`key_index_sections_read`, `key_index_leaf_gets` and
 `head_bytes_per_part_field`. Any other absent field (`phases`, `pruning`,
 `signals`, `io`, `server_cpu_s`, `server_rss_peak`, `rows`, the duration)
 is `missing`, and no figure defaults to 0. A figure read from
@@ -519,13 +520,27 @@ Some bands, as transcribed:
 - Row 6: keyIndex GETs at most 2 x the census's hits objects and at least
   one per hits object above 512 KiB (the census's `objects_over_512k`): the
   logs keyed plan probes every object past that size (#3117).
-- Row 7: section GETs at most 2 x new entries plus one per entry whose
-  footer exceeds 8 KiB plus one per previous leaf, miss over 2 x tail
-  entries, the from-scratch rebuild. New entries, previous leaves and footer
-  lengths come from the stamps; `rlog inspect` and `rspan inspect` print a
-  footer length, so the footer term is real (0 at the smoke's 199 and 248
-  bytes). The miss reads "over" as at least: a from-scratch rebuild is
-  exactly 2 x tail entries, so equality is its signature.
+- Row 7, judged per build pass (the #3704 amendment's form, with the pass
+  factor of the pass-end slice amendment): ranged section GETs
+  (`key_index_ranged_gets`) at most 2 x (new + uncovered entries) x
+  `key_index_build_passes`, plus one per such entry and pass whose footer
+  exceeds 8 KiB, miss at 2 x tail entries x passes, the from-scratch
+  rebuild; the previous leaves' GETs (`key_index_leaf_gets`, read once per
+  fold) equal to the previous leaves; and, as a second signal, the fold's
+  section reads per pass (`key_index_sections_read` over the passes) at most
+  new + uncovered, miss at the tail's entry count. A total against 2 x tail
+  entries cannot tell a rebuild from extra passes: box D's logs advance read
+  22 new entries a pass over 27 passes, 1,188 ranged GETs, over 2 x 570 =
+  1,140 with no rebuild (`check_row_7_box_d`), while one pass reading all
+  570 entries still misses on both signals (`check_row_7_rebuild`).
+  Uncovered is the fold report's `key_index_uncovered_entries`. New
+  entries, previous leaves and footer lengths come from the stamps; `rlog
+  inspect` and `rspan inspect` print a footer length, so the footer term is
+  real (0 at the smoke's 199 and 248 bytes). The miss reads "over" as at
+  least: a from-scratch rebuild is exactly 2 x tail entries per pass, so
+  equality is its signature. A build whose fold report carries no
+  `key_index_build_passes` cannot be judged per pass, so its section GETs
+  read `unsupported-on-this-build`.
 - Row 8: leaf bytes per field over the label's census data bytes, banded at
   2.5 % on logs and 6 % on spans, with the field named in the figure. The
   ADR's band was measured on one repeated-key column (hits `UserID`, 2.06
@@ -596,7 +611,8 @@ unchanged.
 
 - Key-index stats (`stats.keyIndex` and its members),
   `pruning.skipIdxDropped`, the per-object and per-part breakdowns, and the
-  fold report's `key_index_build_passes` and `head_bytes_per_part_field`:
+  fold report's `key_index_build_passes`, `key_index_sections_read`,
+  `key_index_leaf_gets` and `head_bytes_per_part_field`:
   absent from this build's output, so their figures are unsupported with
   that reason (the allowlist above). The many_parts leaf-GET figures are
   among them: main has no tier-2 reader.
@@ -709,8 +725,6 @@ Its verdict is `fail`. The problem list, pinned by the suite:
 miss row_01.wire_bytes
 miss row_02.wire_bytes
 miss row_03.probe_wire_per_object
-miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
-miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_08.logs_trace_id_leaf_pct
 miss row_08.logs_request_id_leaf_pct: key cardinality equals the row count
 dead_counter segmentsOpened journey_c_1 folded_leaves
@@ -727,10 +741,13 @@ not implemented`.
   fixed by T4, not on main). The fixture carries the ranges stamps of
   unfolded, the only state row 3 reads and the only one the run stamps.
 - Row 7: the fold_advance rebuild issued 12 section GETs on each signal,
-  2 x the 6 entries of the whole tail, against targets of 2 x 2 new + 1
-  previous leaf = 5 (spans) and 2 x 2 + 2 = 6 (logs). Main rebuilds the leaf
-  from scratch on an advancing fold, which T6 of the epic changes; this is
-  not a scale effect.
+  2 x the 6 entries of the whole tail, where the 2 new entries would cost 4
+  a pass. The fixture's build rebuilt the leaf from scratch on an advancing
+  fold, which T6 of the epic changed; this is not a scale effect. Its fold
+  report carries no `key_index_build_passes`, `key_index_sections_read` or
+  `key_index_leaf_gets`, so row 7, judged per pass, reads those figures and
+  the section GETs `unsupported-on-this-build`, not a miss
+  (`test_section_gets_need_the_pass_count`).
 - Row 8: the logs `request_id` leaf is 27.5 % of the logs data bytes (one
   key per row) and the logs trace id leaf 5.9 %, against 2.5 %; the spans
   trace id leaf is 4.3 %, inside 6 %.

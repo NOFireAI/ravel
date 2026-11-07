@@ -469,6 +469,23 @@ requires_tenant = "inv"
 # reads the inspector's footer length of one census object as every new
 # entry's; the miss reads "over" as at least, since a from-scratch rebuild
 # is exactly 2 x tail entries.
+#
+# The section GETs are judged per build pass, the #3704 amendment's form as
+# the pass-end slice amendment restates it: a build of G passes re-reads its
+# new and still-uncovered entries' sections on every pass, so the target is
+# 2 x (new + uncovered) x passes ranged GETs (plus one per such entry and
+# pass whose footer exceeds 8 KiB), with the previous leaves read once per
+# fold as key_index_leaf_gets, a fold report field of its own, equal to the
+# previous leaves; the miss is 2 x tail entries per pass, 2 x tail x passes.
+# A total compared with 2 x tail entries cannot tell a rebuild from extra
+# passes: box D's logs advance read 22 new entries per pass over 27 passes,
+# 1,188 ranged GETs, over 2 x 570 = 1,140 and still no rebuild. The second
+# signal is the fold's own section count per pass, key_index_sections_read
+# over key_index_build_passes, which a rebuild puts at the tail's entry
+# count and an incremental advance at new + uncovered. Uncovered is the fold
+# report's key_index_uncovered_entries, the entries no leaf covers after the
+# fold summed over fields: each was read on every pass, and an entry
+# uncovered for two fields counts twice, which can only widen the target.
 requires_states = ["mixed"]
 
 [[row.figure]]
@@ -513,14 +530,30 @@ lane = "counter"
 target_if = "v >= 0"
 
 [[row.figure]]
+name = "spans_uncovered_entries"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_uncovered_entries"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
 name = "spans_section_gets"
 statement = "fold"
 state = "fold_advance"
 metric = "fold.inv.spans.key_index_ranged_gets"
 lane = "counter"
-target_if = "v <= 2 * m['row_07.spans_new_entries'] + (m['row_07.spans_new_entries'] if m['row_07.spans_footer_len'] > 8192 else 0) + m['row_07.spans_previous_leaves']"
-miss_if = "v >= 2 * m['row_07.spans_tail_entries']"
-miss_reason = "from-scratch rebuild: section GETs = 2 x entry_count"
+target_if = "v <= (2 * (m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) + ((m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) if m['row_07.spans_footer_len'] > 8192 else 0)) * m['row_07.spans_build_passes']"
+miss_if = "v >= 2 * m['row_07.spans_tail_entries'] * m['row_07.spans_build_passes']"
+miss_reason = "from-scratch rebuild: section GETs = 2 x entry_count per pass"
+
+[[row.figure]]
+name = "spans_leaf_gets"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_leaf_gets"
+lane = "counter"
+target_if = "v == m['row_07.spans_previous_leaves']"
 
 [[row.figure]]
 name = "spans_build_passes"
@@ -529,6 +562,25 @@ state = "fold_advance"
 metric = "fold.inv.spans.key_index_build_passes"
 lane = "counter"
 target_if = "v == 1"
+
+[[row.figure]]
+name = "spans_sections_read"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.spans.key_index_sections_read"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "spans_sections_per_pass"
+statement = "derived"
+state = "fold_advance"
+metric = "derived"
+expr = "m['row_07.spans_sections_read'] / max(m['row_07.spans_build_passes'], 1)"
+lane = "counter"
+target_if = "v <= m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']"
+miss_if = "v >= m['row_07.spans_tail_entries']"
+miss_reason = "from-scratch rebuild: every tail entry's section read on a pass"
 
 [[row.figure]]
 name = "spans_peak_rss_bytes"
@@ -581,14 +633,30 @@ lane = "counter"
 target_if = "v >= 0"
 
 [[row.figure]]
+name = "logs_uncovered_entries"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_uncovered_entries"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
 name = "logs_section_gets"
 statement = "fold"
 state = "fold_advance"
 metric = "fold.inv.logs.key_index_ranged_gets"
 lane = "counter"
-target_if = "v <= 2 * m['row_07.logs_new_entries'] + (m['row_07.logs_new_entries'] if m['row_07.logs_footer_len'] > 8192 else 0) + m['row_07.logs_previous_leaves']"
-miss_if = "v >= 2 * m['row_07.logs_tail_entries']"
-miss_reason = "from-scratch rebuild: section GETs = 2 x entry_count"
+target_if = "v <= (2 * (m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']) + ((m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']) if m['row_07.logs_footer_len'] > 8192 else 0)) * m['row_07.logs_build_passes']"
+miss_if = "v >= 2 * m['row_07.logs_tail_entries'] * m['row_07.logs_build_passes']"
+miss_reason = "from-scratch rebuild: section GETs = 2 x entry_count per pass"
+
+[[row.figure]]
+name = "logs_leaf_gets"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_leaf_gets"
+lane = "counter"
+target_if = "v == m['row_07.logs_previous_leaves']"
 
 [[row.figure]]
 name = "logs_build_passes"
@@ -597,6 +665,25 @@ state = "fold_advance"
 metric = "fold.inv.logs.key_index_build_passes"
 lane = "counter"
 target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_sections_read"
+statement = "fold"
+state = "fold_advance"
+metric = "fold.inv.logs.key_index_sections_read"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "logs_sections_per_pass"
+statement = "derived"
+state = "fold_advance"
+metric = "derived"
+expr = "m['row_07.logs_sections_read'] / max(m['row_07.logs_build_passes'], 1)"
+lane = "counter"
+target_if = "v <= m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']"
+miss_if = "v >= m['row_07.logs_tail_entries']"
+miss_reason = "from-scratch rebuild: every tail entry's section read on a pass"
 
 [[row.figure]]
 name = "logs_peak_rss_bytes"
