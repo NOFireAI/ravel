@@ -8605,11 +8605,10 @@ mod prefetch_tests {
     /// 5.9 KB) beside the 438 bytes the segment fetch still holds while the
     /// fold absorbs, both released before evaluation: the first two are
     /// cached, the other six are read at every step, the response carries one
-    /// info naming
-    /// them, the answer is the unconstrained one, and the budget is back to
-    /// zero afterwards. The six fallbacks are not refusals the budget counts:
-    /// the query
-    /// succeeded, so `ravel_memory_budget_refusals_total` and
+    /// info naming them, the answer is the unconstrained one, and the budget
+    /// is back to zero afterwards. The six fallbacks are not refusals the
+    /// budget counts: the query succeeded, so
+    /// `ravel_memory_budget_refusals_total` and
     /// `ravel_memory_gate_refusals_total` must not move.
     #[tokio::test]
     async fn a_range_query_over_its_memory_budget_reads_per_step_and_says_so() {
