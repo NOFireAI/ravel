@@ -340,7 +340,59 @@ def cmd_merge_truth(args):
         for k in [k for k in truth["answers"] if k.startswith("needle.")]:
             got = truth["answers"][k]["value"] + tail["answers"][k]["value"]
             truth["answers"]["mixed." + k] = {"rows": 1, "value": got}
+    add_over_cap(truth)
     write_json(args.out, truth)
+
+
+# ADR-3692 decision 6's k: a key set holds at most this many keys
+# (KEY_SET_MAX_KEYS, crates/ravel-query/src/key_index_route.rs). Row 11's
+# over-cap control is one key over it.
+KEY_SET_MAX_KEYS = 1024
+OVER_CAP_KEYS = KEY_SET_MAX_KEYS + 1
+
+
+def over_cap_padding(field, n):
+    """n ids of `field` the corpus does not hold. gen_corpus.py writes request
+    ids as req-<16 hex>-<row> or req-planted-*, so req-over-cap-absent-* is
+    never one. Trace ids are random 128-bit draws, so the integers 1 to n are
+    held only by a draw that hits one of them."""
+    if field == "trace_id":
+        return [f"{j:032x}" for j in range(1, n + 1)]
+    return [f"req-over-cap-absent-{j:04d}" for j in range(1, n + 1)]
+
+
+def add_over_cap(truth):
+    """Row 11's over-cap control lists, truth["over_cap"][field]: the
+    generator's largest IN list, its control_extra key (one the list does not
+    hold, when the corpus has one), then padding the corpus does not hold, to
+    OVER_CAP_KEYS keys. The padding adds no row, so each list's answer is the
+    generator's answer for the largest list plus control_extra, under the
+    OVER_CAP_KEYS truth key with its own requested count."""
+    lists = truth.get("in_lists") or {}
+    extra = truth.get("control_extra") or {}
+    answers = truth.setdefault("answers", {})
+    out = {}
+    for field, keys in (("trace_id", ("in_trace_id.{}.spans", "in_trace_id.{}.logs")),
+                        ("request_id", ("in_request_id.{}",))):
+        sizes = sorted(lists.get(field) or {}, key=int)
+        if not sizes:
+            continue
+        top = int(sizes[-1])
+        ids = list(lists[field][sizes[-1]])
+        if extra.get(field):
+            ids.append(extra[field])
+        ids += [p for p in over_cap_padding(field, OVER_CAP_KEYS) if p not in ids][:OVER_CAP_KEYS - len(ids)]
+        out[field] = ids
+        for key in keys:
+            src = answers.get(key.format(top + 1))
+            if src is None:
+                continue
+            per_key = src["requested"] // (top + 1) if "requested" in src else 1
+            want = dict(src, requested=OVER_CAP_KEYS * per_key)
+            want["capped"] = want["rows"] < want["requested"]
+            answers[key.format(OVER_CAP_KEYS)] = want
+    if out:
+        truth["over_cap"] = out
 
 
 def cli_base(args):
@@ -619,16 +671,11 @@ def placeholders(truth, run):
         p[f"in_trace_ids_x_{size}"] = ", ".join(f"X'{t}'" for t in ids)
     for size, ids in truth["in_lists"]["request_id"].items():
         p[f"in_request_ids_{size}"] = ", ".join(f"'{r}'" for r in ids)
-    # The 1,001-key controls: the largest list plus one key outside it.
-    extra = truth.get("control_extra") or {}
+    # Row 11's over-cap controls, as merge-truth built them.
     for field, fmt, name in (("trace_id", "X'{}'", "in_trace_ids_x"), ("request_id", "'{}'", "in_request_ids")):
-        sizes = sorted(truth["in_lists"][field], key=int)
-        if not sizes:
-            continue
-        ids = list(truth["in_lists"][field][sizes[-1]])
-        if extra.get(field):
-            ids.append(extra[field])
-        p[f"{name}_{int(sizes[-1]) + 1}"] = ", ".join(fmt.format(i) for i in ids)
+        ids = (truth.get("over_cap") or {}).get(field)
+        if ids:
+            p[f"{name}_{len(ids)}"] = ", ".join(fmt.format(i) for i in ids)
     for k, jc in truth["journey_c"].items():
         p[f"jc_start_ns_{k}"] = str(jc["start_ns"])
         p[f"jc_cut_ns_{k}"] = str(jc["cut_ns"])

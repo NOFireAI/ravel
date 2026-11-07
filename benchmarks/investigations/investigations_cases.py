@@ -758,6 +758,42 @@ class Statements(unittest.TestCase):
             if s.get("sql") and not (s.get("requires") and not t.get(s["requires"])):
                 self.inv.fill(s["sql"], self.inv.placeholders(t, 0))
 
+    def test_over_cap_control_lists(self):
+        # Row 11's control is 1,025 keys, one over KEY_SET_MAX_KEYS: the
+        # 1,000-key list, control_extra and padding the corpus cannot hold,
+        # with the generator's 1,000-plus-extra answer as its oracle. Kills a
+        # control still built at 1,001 keys (the 1,001-key list is a key set
+        # under the cap) and padding that names a real key.
+        for s in ("spans_in_1025", "logs_trace_in_1025", "logs_request_in_1025"):
+            sql = next(x for x in self.st if x["id"] == s)["sql"]
+            filled = self.inv.fill(sql, self.inv.placeholders(self.truth, 0))
+            keys = re.findall(r"X'([0-9a-f]{32})'|'(req-[^']*)'", filled)
+            self.assertEqual(len(keys), 1025, s)
+            self.assertEqual(len(set(keys)), 1025, s)
+        for field, answers in (("trace_id", ("in_trace_id.{}.spans", "in_trace_id.{}.logs")),
+                               ("request_id", ("in_request_id.{}",))):
+            ids = self.truth["over_cap"][field]
+            top = self.truth["in_lists"][field]["1000"]
+            extra = self.truth["control_extra"][field]
+            self.assertEqual(ids[:len(top)], top, field)
+            pad = ids[len(top) + (extra is not None):]
+            self.assertEqual(len(ids), 1025, field)
+            if extra is not None:
+                self.assertEqual(ids[len(top)], extra, field)
+            if field == "request_id":
+                self.assertTrue(all(p.startswith("req-over-cap-absent-") for p in pad), pad[:3])
+            else:
+                self.assertEqual(pad, [f"{j:032x}" for j in range(1, len(pad) + 1)])
+            for key in answers:
+                over, base = self.truth["answers"][key.format(1025)], self.truth["answers"][key.format(1001)]
+                self.assertEqual(over["rows"], base["rows"], key)
+                self.assertEqual(over.get("row_set"), base.get("row_set"), key)
+                self.assertEqual(over["requested"] * 1001, base["requested"] * 1025, key)
+        # The small corpus's 1,000 traces are all in the 1,000-key list, so
+        # 25 trace ids are padding and the request id list gains its extra.
+        self.assertIsNone(self.truth["control_extra"]["trace_id"])
+        self.assertIsNotNone(self.truth["control_extra"]["request_id"])
+
     def test_erasure_victim_needs_a_corpus_with_an_unread_row(self):
         # The small corpus's 1000-key lists name every trace, so it has no
         # victim and logs_erasure_victim plans as not-run; the box's corpus has one.
@@ -835,13 +871,15 @@ class Statements(unittest.TestCase):
     def test_in_list_caps_from_the_complexity_guard(self):
         # Item 9. Before ADR-3692's key set amendment an X list held at most
         # 330 keys (3n + 8) and a quoted list at most 496 (2n + 8) under
-        # MAX_STATEMENT_COMPLEXITY = 1,000, so the 1,000- and 1,001-key lists
+        # MAX_STATEMENT_COMPLEXITY = 1,000, so the 1,000- and 1,025-key lists
         # carry expect_refusal_on_main and fixtures/local-smoke reads them
         # refused. Kills a cap stated from 2 units per X element (495) or from
         # 1,000 / 2. Since the amendment a flat literal list costs one unit
         # plus one per 64 literals, so every one of these statements costs 24
-        # units at 1,000 and at 1,001 keys: kills a harness or README still
-        # reading the old caps as the current guard's.
+        # units at 1,000 keys and 25 at the 1,025-key control, which is under
+        # MAX_IN_LIST_LITERALS and so admitted, not refused: kills a harness
+        # or README still reading the old caps as the current guard's, and a
+        # control judged as a refusal the current guard never makes.
         with open(os.path.join(HERE, "..", "..", "crates", "ravel-sql", "src", "complexity_guard.rs")) as f:
             guard = f.read()
         lines = guard.splitlines()
@@ -865,11 +903,21 @@ class Statements(unittest.TestCase):
                 self.assertEqual(self.guard_units(fill(n), key_sets=False), per * n + 8, (sid, n))
             caps[sid] = max(n for n in range(1, 1001) if self.guard_units(fill(n), key_sets=False) <= 1000)
             self.assertGreater(self.guard_units(fill(1000), key_sets=False), 1000, sid)
-            self.assertGreater(self.guard_units(fill(1001), key_sets=False), 1000, sid)
-            for n, units in ((1, 9), (64, 9), (65, 10), (1000, 24), (1001, 24), (4096, 72)):
+            self.assertGreater(self.guard_units(fill(1025), key_sets=False), 1000, sid)
+            for n, units in ((1, 9), (64, 9), (65, 10), (1000, 24), (1025, 25), (4096, 72)):
                 self.assertEqual(self.guard_units(fill(n)), units, (sid, n))
             self.assertTrue(by[sid].get("expect_refusal_on_main"), sid)
-            self.assertTrue(by[sid.replace("1000", "1001")].get("expect_refusal_on_main"), sid)
+            over = by[sid.replace("1000", "1025")]
+            self.assertTrue(over.get("expect_refusal_on_main"), sid)
+            self.assertIn("_1025}", over["sql"], sid)
+            self.assertTrue(over["truth_key"].startswith(("in_trace_id.1025.", "in_request_id.1025")), sid)
+        # The control is one key over KEY_SET_MAX_KEYS and under the guard's
+        # literal cap: admitted, and carried as no key set.
+        with open(os.path.join(HERE, "..", "..", "crates", "ravel-query", "src", "key_index_route.rs")) as f:
+            self.assertIn("pub const KEY_SET_MAX_KEYS: usize = 1_024;", f.read())
+        inv = load_module(os.path.join(BOX, "lib", "inv.py"), "inv_caps")
+        self.assertEqual(inv.OVER_CAP_KEYS, 1025)
+        self.assertLessEqual(inv.OVER_CAP_KEYS, 4096)
         self.assertEqual(caps, {"spans_in_1000": 330, "logs_trace_in_1000": 330, "logs_request_in_1000": 496})
         for doc in (README, STATEMENTS):
             with open(doc) as f:
@@ -979,11 +1027,11 @@ class LocalSmoke(Workdir):
             with open(os.path.join(SMOKE, name), "rb") as a, open(self.path("out", name), "rb") as b:
                 self.assertEqual(a.read(), b.read(), name)
 
-    def test_control_1001_refused_by_guard_on_main(self):
-        """bands.toml row 11: on main the complexity guard refuses the 1,000-key lists."""
+    def test_control_1025_refused_by_guard_on_main(self):
+        """bands.toml row 11: the fixture's build refuses the 1,000-key lists."""
         with gzip.open(os.path.join(SMOKE, "results.local.json.gz"), "rt") as f:
             res = json.load(f)
-        for name in ("spans_control_1001", "logs_trace_control_1001", "logs_request_control_1001"):
+        for name in ("spans_control_1025", "logs_trace_control_1025", "logs_request_control_1025"):
             f = figure(res, f"row_11.{name}")
             self.assertEqual((f["status"], f["verdict"]), (GUARD, GUARD), name)
 
@@ -1043,9 +1091,9 @@ class LocalSmoke(Workdir):
                 for c in lines:
                     self.assertEqual((c["outcome"], c["http_status"], c["reason"]), (UNSUPPORTED, 400, REFUSAL_1000))
                     self.assertIn("wall_s", c)
-        # The 1,001-key control has no 1,000-key answer to compare against.
+        # The over-cap control has no 1,000-key answer to compare against.
         for prefix in ("spans", "logs_trace", "logs_request"):
-            f = figure(res, f"row_11.{prefix}_control_1001")
+            f = figure(res, f"row_11.{prefix}_control_1025")
             self.assertEqual((f["status"], f["value"], f["verdict"], f["reason"]),
                              (GUARD, None, GUARD, f"refused by the SQL complexity guard: {REFUSAL_1000}"))
         self.assertEqual(figure(res, "row_11.spans_1000_rows_exact")["reason"], REFUSAL_1000)
@@ -1258,6 +1306,11 @@ class LocalSmoke(Workdir):
         for t in (committed, truth):
             for doc in (t, *t["sub"].values()):
                 self.assertEqual(doc["generator"].pop("format"), "parquet" if t is committed else "jsonl")
+        # The fixture's run predates the over-cap lists merge-truth now adds;
+        # they are the only difference.
+        self.assertNotIn("over_cap", committed)
+        load_module(os.path.join(BOX, "lib", "inv.py"), "inv_over_cap").add_over_cap(committed)
+        self.assertEqual([len(v) for v in truth["over_cap"].values()], [1025, 1025])
         self.assertEqual(truth, committed)
 
 
@@ -1952,7 +2005,7 @@ class Evaluate(Workdir):
         f = figure(res, "row_13.errors")
         self.assertEqual((f["value"], f["verdict"]), (1, "miss"))
 
-    # --- in-flight overlap, refusals, the 1,001-key control -----------------
+    # --- in-flight overlap, refusals, the 1,025-key control -----------------
 
     def statement_tables(self):
         with open(STATEMENTS, "rb") as f:
@@ -2073,9 +2126,10 @@ class Evaluate(Workdir):
     def test_refused(self):
         self.assertEqual(self.check_refused(), [])
 
-    def served_1000(self, statement, keys=None, parts=1, scan=True):
+    def served_1000(self, statement, keys=None, parts=1, scan=True, leaf=None):
         """Turn statement's folded_leaves cold calls into ok calls copied from spans_in_100, which scanned 4
-        objects. keys None drops the keyIndex section; scan False zeros the probe and scan GETs and blocks."""
+        objects. keys None drops the keyIndex section; leaf sets its leafGetRequests; scan False zeros the
+        probe and scan GETs and blocks."""
         src = {c["try"]: c for c in self.select("spans_in_100")}
         for i, c in enumerate(self.calls):
             if c["statement"] == statement and c["state"] == "folded_leaves" and c.get("temp") == "cold":
@@ -2086,6 +2140,8 @@ class Evaluate(Workdir):
                 else:
                     new["stats"]["keyIndex"] = dict(new["stats"].get("keyIndex") or {}, keysProbed=keys,
                                                     partsCovered=parts)
+                    if leaf is not None:
+                        new["stats"]["keyIndex"]["leafGetRequests"] = leaf
                 if not scan:
                     for p in new["stats"]["phases"]:
                         if p["phase"] in ("probe", "scan"):
@@ -2094,31 +2150,38 @@ class Evaluate(Workdir):
                 self.calls[i] = new
 
     CONTROL = {
-        # mode: (1,000-key arm, 1,001-key arm, (status, value, verdict), reason fragment)
+        # mode: (1,000-key arm, 1,025-key arm, (status, value, verdict), reason fragment). An arm left None
+        # keeps the fixture's calls, which the complexity guard of its build refused.
         "guard": (None, None, (GUARD, None, GUARD), "refused by the SQL complexity guard: " + REFUSAL_1000),
         "unsupported": (dict(), None, (UNSUPPORTED, None, UNSUPPORTED), "carries no keyIndex.keysProbed"),
-        "pass": (dict(keys=1000), None, ("value", 1, "pass"), ""),
-        "miss": (dict(keys=1000), dict(keys=1001), ("value", 0, "miss"), "was index-served"),
+        # What the current build does with 1,025 keys: admitted, no key set, a scan with keysProbed 0,
+        # partsCovered 0 and no leaf GET (sql_key_in.rs in_list_rows_equal_the_union_of_equalities).
+        "pass": (dict(keys=1000), dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        "over-refused": (dict(keys=1000), None, ("value", 0, "miss"),
+                         "was refused (" + REFUSAL_1000 + ") while the 1,000-key list was admitted"),
+        "miss": (dict(keys=1000), dict(keys=1025), ("value", 0, "miss"), "was index-served"),
+        "leaf-gets": (dict(keys=1000), dict(keys=0, parts=0, leaf=1), ("value", 0, "miss"),
+                      "was index-served: keysProbed 0 partsCovered 0 leafGetRequests 1"),
         "served-with-scan": (dict(keys=1000), dict(), ("value", 1, "pass"), ""),
-        "served-with-keyindex": (dict(keys=1000), dict(keys=1001, scan=False), ("value", 0, "miss"),
-                                 "was index-served: keysProbed 1001 partsCovered 1"),
+        "served-with-keyindex": (dict(keys=1000), dict(keys=1025, scan=False), ("value", 0, "miss"),
+                                 "was index-served: keysProbed 1025 partsCovered 1"),
         "served-without-scan": (dict(keys=1000), dict(scan=False), ("value", 0, "miss"),
                                 "served without a visible path"),
         "zeros-without-scan": (dict(keys=1000), dict(keys=0, parts=0, scan=False), ("value", 0, "miss"),
                                "served without a visible path"),
-        "zero-parts-covered": (dict(keys=1000, parts=0), None, ("value", 0, "miss"),
+        "zero-parts-covered": (dict(keys=1000, parts=0), dict(keys=0, parts=0), ("value", 0, "miss"),
                                "probed 1000 keys with partsCovered 0"),
     }
 
     def check_control(self, mode, evaluate_py=EVALUATE):
-        arm_1000, arm_1001, want, reason = self.CONTROL[mode]
+        arm_1000, arm_1025, want, reason = self.CONTROL[mode]
         if arm_1000 is not None:
             self.served_1000("spans_in_1000", **arm_1000)
-        if arm_1001 is not None:
-            self.served_1000("spans_in_1001", **arm_1001)
+        if arm_1025 is not None:
+            self.served_1000("spans_in_1025", **arm_1025)
         self.save_calls()
         _, res, _ = self.go(BANDS, evaluate_py)
-        f = figure(res, "row_11.spans_control_1001")
+        f = figure(res, "row_11.spans_control_1025")
         out = [] if (f["status"], f["value"], f["verdict"]) == want else [f"{f['status']} {f['value']} {f['verdict']}"]
         if reason not in (f["reason"] or ""):
             out.append(f"reason {f['reason']}")
@@ -2133,27 +2196,36 @@ class Evaluate(Workdir):
         return self.check_control("unsupported", evaluate_py)
 
     def check_control_pass(self, evaluate_py=EVALUATE):
-        """1,000 keys probed and the 1,001-key list refused: the control passes."""
+        """1,000 keys probed and the 1,025-key list scanned with no route: the control passes."""
         return self.check_control("pass", evaluate_py)
 
+    def check_control_over_refused(self, evaluate_py=EVALUATE):
+        """A 1,025-key list refused while the 1,000-key list was admitted: the guard admits 1,025
+        literals, so a refusal is not the control's answer: miss."""
+        return self.check_control("over-refused", evaluate_py)
+
     def check_control_miss(self, evaluate_py=EVALUATE):
-        """A 1,001-key list the index served: the control misses."""
+        """A 1,025-key list the index served: the control misses."""
         return self.check_control("miss", evaluate_py)
 
+    def check_control_leaf_gets(self, evaluate_py=EVALUATE):
+        """A 1,025-key list with keysProbed and partsCovered 0 but a leaf GET: the index read it: miss."""
+        return self.check_control("leaf-gets", evaluate_py)
+
     def check_control_served_with_scan(self, evaluate_py=EVALUATE):
-        """A 1,001-key list served by a scan with no keyIndex figure: the control passes."""
+        """A 1,025-key list served by a scan with no keyIndex figure: the control passes."""
         return self.check_control("served-with-scan", evaluate_py)
 
     def check_control_served_with_keyindex(self, evaluate_py=EVALUATE):
-        """A 1,001-key list served with keyIndex figures and no scan: the control misses."""
+        """A 1,025-key list served with keyIndex figures and no scan: the control misses."""
         return self.check_control("served-with-keyindex", evaluate_py)
 
     def check_control_served_without_scan(self, evaluate_py=EVALUATE):
-        """Reviewer mutation (a): a 1,001-key list served with no keyIndex figure and zero GETs: miss."""
+        """Reviewer mutation (a): a 1,025-key list served with no keyIndex figure and zero GETs: miss."""
         return self.check_control("served-without-scan", evaluate_py)
 
     def check_control_zeros_without_scan(self, evaluate_py=EVALUATE):
-        """Reviewer mutation (b): a 1,001-key list whose keyIndex figures are zeros, with no scan: miss."""
+        """Reviewer mutation (b): a 1,025-key list whose keyIndex figures are zeros, with no scan: miss."""
         return self.check_control("zeros-without-scan", evaluate_py)
 
     def check_control_zero_parts_covered(self, evaluate_py=EVALUATE):
@@ -2171,6 +2243,12 @@ class Evaluate(Workdir):
 
     def test_control_miss(self):
         self.assertEqual(self.check_control_miss(), [])
+
+    def test_control_over_refused(self):
+        self.assertEqual(self.check_control_over_refused(), [])
+
+    def test_control_leaf_gets(self):
+        self.assertEqual(self.check_control_leaf_gets(), [])
 
     def test_control_served_with_scan(self):
         self.assertEqual(self.check_control_served_with_scan(), [])
@@ -2692,12 +2770,22 @@ FLIPS = {
         "        if False:",
         "check_control_zero_parts_covered",
     ),
-    "an index-served 1,001-key list not seen": (
+    "an index-served 1,025-key list not seen": (
         "        if key_index_nonzero(c):\n",
         "        if False:\n",
         "check_control_miss",
     ),
-    "a 1,001-key list served with keyIndex figures and no scan passed": (
+    "a 1,025-key list refused while the 1,000-key list was admitted passed": (
+        "    if refused_over:\n",
+        "    if False:\n",
+        "check_control_over_refused",
+    ),
+    "a 1,025-key list's leaf GETs not read as index-served": (
+        ' or ki.get("partsCovered") or ki.get("leafGetRequests"))',
+        ' or ki.get("partsCovered"))',
+        "check_control_leaf_gets",
+    ),
+    "a 1,025-key list served with keyIndex figures and no scan passed": (
         "        if key_index_nonzero(c):\n",
         "        if c.get(\"_never\"):\n",
         "check_control_served_with_keyindex",
@@ -2707,13 +2795,13 @@ FLIPS = {
         '        if m["probe_gets"] == 0:',
         "check_control_served_with_scan",
     ),
-    "a 1,001-key list served with no visible path passed": (
+    "a 1,025-key list served with no visible path passed": (
         '        if m["probe_gets"] == 0 and m["scan_gets"] == 0 and m["blocks_scanned"] == 0:',
         "        if False:",
         "check_control_served_without_scan",
     ),
     "keyIndex zeros read as index-served or passed": (
-        '    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered"))',
+        '    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered") or ki.get("leafGetRequests"))',
         '    return isinstance(ki, dict)',
         "check_control_zeros_without_scan",
     ),

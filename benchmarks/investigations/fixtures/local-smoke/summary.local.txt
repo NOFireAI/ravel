@@ -129,9 +129,9 @@ row_11.logs_trace_1000_leaf_gets_per_part    refused-by-g                 refuse
 row_11.logs_trace_1000_leaf_bytes_per_part   refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.logs_1000_leaf_gets_per_part          refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.logs_1000_leaf_bytes_per_part         refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.spans_control_1001                    refused-by-g                 refused-by-guard  (refused by the SQL complexity guard: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.logs_trace_control_1001               refused-by-g                 refused-by-guard  (refused by the SQL complexity guard: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.logs_request_control_1001             refused-by-g                 refused-by-guard  (refused by the SQL complexity guard: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.spans_control_1025                    refused-by-g                 refused-by-guard  (refused by the SQL complexity guard: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_trace_control_1025               refused-by-g                 refused-by-guard  (refused by the SQL complexity guard: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_request_control_1025             refused-by-g                 refused-by-guard  (refused by the SQL complexity guard: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_12.gets_growth_10x                       not-run                      not-run  (scales [10, 100] not in run.toml scales)
 row_12.gets_growth_100x                      not-run                      not-run  (scales [10, 100] not in run.toml scales)
 row_13.wrong_answers                         value                     0  pass
@@ -223,8 +223,8 @@ logs_request_in_100             folded_leaves        cold     0.0283595 0.028474
 logs_request_in_100             unfolded             cold     0.0296455 0.03006625     5  524321    0.04 2.38e-05  2
 logs_request_in_1000            folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 logs_request_in_1000            unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_request_in_1001            folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_request_in_1001            unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_request_in_1025            folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_request_in_1025            unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 logs_tag_common                 folded_leaves        cold     0.021619 0.0218296     5  524321    0.02 1.04e-05  2
 logs_tag_common                 unfolded             cold     0.0221095 0.02219095     5  524321   0.015 1.955e-05  2
 logs_tag_mixed_rare             mixed                cold     0.0374465 0.03776735     9 2636013    0.04 2.54e-05  2
@@ -250,8 +250,8 @@ logs_trace_in_100               folded_leaves        cold     0.0399695 0.040402
 logs_trace_in_100               unfolded             cold     0.041928 0.0423546     5  524321    0.06 2.72e-05  2
 logs_trace_in_1000              folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 logs_trace_in_1000              unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_trace_in_1001              folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_trace_in_1001              unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_trace_in_1025              folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_trace_in_1025              unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 logs_trace_norange              compaction_done      cold     0.0387855 0.04198995    17 1190933    0.02 1.46e-05  2
 logs_trace_norange              compaction_in_flight inflight 0.051145 0.0736495    14 1166687    0.02           
 logs_trace_norange              erasure_in_flight    cold     0.048491 0.0534698    18 1812938   0.035 1.755e-05  2
@@ -274,8 +274,8 @@ spans_in_100                    folded_leaves        cold     0.066715  0.067822
 spans_in_100                    unfolded             cold     0.069844 0.0715351    11 5169578   0.145 4.405e-05  0
 spans_in_1000                   folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 spans_in_1000                   unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-spans_in_1001                   folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-spans_in_1001                   unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+spans_in_1025                   folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+spans_in_1025                   unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 spans_lookup_1h                 folded_leaves        cold     0.021025 0.0233605     7  333840   0.015 1.035e-05  0
 spans_lookup_1h                 folded_leaves        warm     0.008418  0.008418     1      33    0.01           
 spans_lookup_1h                 folded_no_leaves     cold      0.0207 0.0226125     7  333649    0.01  9.5e-06  0

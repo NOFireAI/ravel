@@ -362,7 +362,7 @@ logs byte from it and issue no scan GET. Every cold call whose
 `cacheServedBytes` is above 0 is flagged `warm_served` in the results and
 counted per statement and state in the summary: in the smoke, 126 of the 196
 cold calls that returned an answer (of 220 cold calls; the other 24, 12 on the 1,000-key lists
-and 12 on their 1,001-key controls, were refused by the SQL complexity guard
+and 12 on their over-cap controls, were refused by the SQL complexity guard
 and carry no stats). The flag is a reported figure, not a problem. Each restart stamp
 records what the warmup loaded.
 
@@ -498,7 +498,7 @@ tries; `<m>` from the call's stats phases and members, such as `total_gets`,
 `data_gets`, `wire_bytes`, `leaf_gets`, `probe_wire_per_object`),
 `warm.max.<m>`, `cold.rows_exact` (1 when every try's answer was correct),
 `cold.rows_match_state.<state>`, `cold.wall_p50_s`,
-`cold.control_1001` (row 11's control, below), `stamp.<what>.<label>`
+`cold.control_1025` (row 11's control, below), `stamp.<what>.<label>`
 (covering parts, entry counts, previous leaves, footer length, leaf
 buckets), `leaf_share.<label>.<field>`,
 `census.<tenant>.<signal>.objects|bytes|objects_over_512k`,
@@ -534,16 +534,37 @@ Some bands, as transcribed:
   count".
 - Row 11: rows exact and `keysProbed` equal to the list size at 1, 10, 100
   and 1,000 keys, leaf GETs at most 1 + min(distinct buckets, 64) and leaf
-  bytes at most entry_count x 11 KiB per covered part, and a 1,001-key
+  bytes at most entry_count x 11 KiB per covered part, and an over-cap
   control on each of `spans_in_1000`, `logs_trace_in_1000` and
-  `logs_request_in_1000`: the same list plus one key it does not hold
-  (`spans_in_1001`, `logs_trace_in_1001`, `logs_request_in_1001`). The
-  control is 1 (pass) when every 1,000-key call reports `keysProbed` 1000
-  and `partsCovered` and no 1,001-key call is index-served (`keysProbed` or
-  `partsCovered` non-zero); 0 (miss) when a 1,001-key call is index-served
-  or the 1,000-key list probed another count; `refused-by-guard` when the
-  1,000-key list was refused by the SQL complexity guard, and
-  `unsupported-on-this-build` when it carries no tier-2 figures.
+  `logs_request_in_1000`: a list of 1,025 keys, one over decision 6's
+  k = 1,024 (`spans_in_1025`, `logs_trace_in_1025`, `logs_request_in_1025`).
+  `inv.py merge-truth` builds each list as the 1,000-key list, the
+  generator's `control_extra` key (one the list does not hold) and ids the
+  corpus does not hold up to 1,025 (`truth.json` `over_cap`): request ids
+  `req-over-cap-absent-NNNN`, which the generator's `req-<16 hex>-<row>`
+  and `req-planted-*` forms never produce, and the trace ids 1 to 25 as
+  128-bit integers, which a random 128-bit draw lands on with negligible
+  odds and which, if one did, would add rows and read as a wrong answer,
+  not a pass. The padding adds no row, so the oracle (`in_trace_id.1025.*`,
+  `in_request_id.1025`) is the generator's answer for the 1,000-key list
+  plus `control_extra`. The current build admits the list and does not
+  route it: the SQL complexity guard charges a flat literal list one unit
+  plus one per 64 literals and refuses only past 4,096 literals
+  (`MAX_IN_LIST_LITERALS`), so the statement costs 25 units, and the
+  planner carries no key set past 1,024 keys (`KEY_SET_MAX_KEYS`; the
+  spans `TRACE_ID_SET_MAX` and logs `KeyIn::new` both drop it), so the scan
+  has no key arm and the residual filter answers it with `keysProbed` 0 and
+  0 leaf GETs (`services/ravel-server/tests/sql_key_in.rs`,
+  `in_list_rows_equal_the_union_of_equalities`). The control is 1 (pass)
+  when every 1,000-key call reports `keysProbed` 1000 and `partsCovered`
+  and every 1,025-key call is served by a visible scan with no keyIndex
+  figure above zero; 0 (miss) when a 1,025-key call is index-served
+  (`keysProbed`, `partsCovered` or `leafGetRequests` non-zero), is served
+  with no visible path, or is refused while the 1,000-key list was
+  admitted, or when the 1,000-key list probed another count;
+  `refused-by-guard` when the 1,000-key list was refused by the SQL
+  complexity guard, and `unsupported-on-this-build` when it carries no
+  tier-2 figures.
 - Row 15: the sum of the three steps' p50 under 5 s, miss over 20 s, and the
   journey's GET total within resolve + 2 x covering parts on spans + (1 +
   min(distinct buckets, 64)) per covering part on logs + 50 x (footer +
@@ -579,11 +600,16 @@ unchanged.
   absent from this build's output, so their figures are unsupported with
   that reason (the allowlist above). The many_parts leaf-GET figures are
   among them: main has no tier-2 reader.
-- The 1,000- and 1,001-key IN lists (`spans_in_1000`, `logs_trace_in_1000`,
-  `logs_request_in_1000` and their `_1001` controls) are sent. A build from
+- The 1,000- and 1,025-key IN lists (`spans_in_1000`, `logs_trace_in_1000`,
+  `logs_request_in_1000` and their `_1025` controls) are sent. A build from
   before ADR-3692's key set amendment refuses them with HTTP 400 and
   `statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the
-  statement`, and `fixtures/local-smoke` is a run of such a build. These
+  statement`, and `fixtures/local-smoke` is a run of such a build. That run
+  sent the harness's earlier 1,001-key controls; its six control call groups
+  were renamed to the `_1025` statement ids and truth keys when the control
+  moved, and nothing else in them changed: the guard refused them before
+  their length mattered, with the same text it gives every list past its
+  cap (below). These
   statements carry `expect_refusal_on_main = true`, and evaluate.py records
   each such refusal as `refused-by-guard` ("refused by the SQL complexity
   guard") with that text, a class of its own: the summary's `refusal classes`
@@ -613,7 +639,7 @@ unchanged.
   amendment a flat list of literals costs one unit plus one per 64 literals,
   rounded up (`in_list_units` in `crates/ravel-sql/src/complexity_guard.rs`),
   up to 4,096 literals, so each of these statements costs 24 units at 1,000
-  keys and at 1,001 and is admitted.
+  keys and 25 at 1,025, and is admitted.
 - Row 13's negative controls: decision 9's mutants are not built here, so
   the figure is `not-run` ("mutant controls not implemented") and the
   verdict is at best `incomplete`.
@@ -711,7 +737,7 @@ not implemented`.
 - Rows 1 and 2: 464,912 wire bytes for the no-range lookup and 333,840 for
   the 1 h lookup, against 300 KB; the run's real figures.
 - Row 11: the 1,000-key IN lists are refused by the complexity guard
-  (1,001 units), so their figures and the 1,001-key controls read
+  (1,001 units), so their figures and the over-cap controls read
   `refused-by-guard` with the server's text (15 figures over 24 calls on
   the summary's `refusal classes` line). Row 13: every in-flight try of
   compaction_in_flight's four statements overlapped its own signal's
@@ -742,7 +768,7 @@ against the ADR's Acceptance table), evaluate.py on the fixture and on
 mutations of it (missing, duplicate, miss, wrong answer, a deleted catalog
 stamp, absent phases, CPU and leaf sizes, dead counters, full, partial, zero
 and too-short compaction overlap, a refusal outside the cap probes, the
-1,001-key control's pass, miss and unsupported readings, a skipped state
+1,025-key control's pass, miss, refused and unsupported readings, a skipped state
 and a mid-state deadline, the unsealed tail, the pending-erasure victim, a
 state absent from the results, row 3's per-object denominator, row 15's
 budget from `truth.json`, exact cost and maintenance dollars), the wrong

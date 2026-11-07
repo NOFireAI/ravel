@@ -558,40 +558,49 @@ def group_lines(calls, cfg, statement, state, temp):
 
 
 def key_index_nonzero(c):
-    """True when an ok call's stats carry a nonzero keyIndex figure."""
+    """True when an ok call's stats carry a nonzero keyIndex figure: keys
+    probed, a part covered or a leaf GET."""
     ki = (c.get("stats") or {}).get("keyIndex")
-    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered"))
+    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered") or ki.get("leafGetRequests"))
 
 
-def control_1001(calls, cfg, statement, state, temp):
-    """Row 11's 1,001-key control of a 1,000-key IN statement.
+def control_1025(calls, cfg, statement, state, temp):
+    """Row 11's over-cap control of a 1,000-key IN statement: the same table
+    and key kind at 1,025 keys, one over decision 6's k = 1,024.
+
+    The SQL complexity guard admits a flat list of up to 4,096 literals
+    (MAX_IN_LIST_LITERALS), and the planner carries no key set past 1,024
+    keys (KEY_SET_MAX_KEYS), so a correct build answers the 1,025-key list
+    with a scan and no route: keysProbed 0, partsCovered 0, 0 leaf GETs.
 
     1 when every 1,000-key call probed exactly 1,000 keys with a nonzero
-    partsCovered, and every 1,001-key call was either refused or served by a
-    visible scan (probe or scan GETs, or blocks scanned) with no keyIndex
-    figure above zero. 0 when a 1,001-key call carries a nonzero keyIndex
-    figure, or was served with neither a keyIndex figure nor a scan, or a
-    1,000-key call probed another count or covered no part. The 1,001-key
-    arm is judged first; only a 1,000-key list that was itself refused, or
-    that carries no tier-2 figures, makes the figure refused-by-guard or
-    unsupported."""
-    over = statement.replace("_1000", "_1001")
+    partsCovered, and every 1,025-key call was served by a visible scan
+    (probe or scan GETs, or blocks scanned) with no keyIndex figure above
+    zero. 0 when a 1,025-key call carries a nonzero keyIndex figure, or was
+    served with neither a keyIndex figure nor a scan, or was refused while
+    the 1,000-key list was admitted, or a 1,000-key call probed another count
+    or covered no part. The 1,025-key arm is judged first; only a 1,000-key
+    list that was itself refused, or that carries no tier-2 figures, makes
+    the figure refused-by-guard or unsupported."""
+    over = statement.replace("_1000", "_1025")
     lines, bad = group_lines(calls, cfg, statement, state, temp)
     if bad:
         return bad[0], None, bad[1]
     lines_over, bad = group_lines(calls, cfg, over, state, temp)
     if bad:
         return bad[0], None, bad[1]
+    refused_over = []
     for c in lines_over:
         outcome = c.get("outcome")
         if outcome in (GUARD, UNSUPPORTED, "refused"):
+            refused_over.append(c)
             continue
         if outcome != "ok" or c.get("_invalid"):
             return "missing", None, f"{where(c)} neither served nor refused"
         if key_index_nonzero(c):
             ki = c["stats"]["keyIndex"]
             return "value", 0, (f"{where(c)} was index-served: keysProbed {ki.get('keysProbed')} "
-                                f"partsCovered {ki.get('partsCovered')}")
+                                f"partsCovered {ki.get('partsCovered')} leafGetRequests {ki.get('leafGetRequests')}")
         m = call_metrics(c)
         if m["probe_gets"] == 0 and m["scan_gets"] == 0 and m["blocks_scanned"] == 0:
             return "value", 0, (f"{where(c)} served without a visible path: no keyIndex figure, "
@@ -609,6 +618,13 @@ def control_1001(calls, cfg, statement, state, temp):
         ki = (c.get("stats") or {}).get("keyIndex")
         if not isinstance(ki, dict) or "keysProbed" not in ki or "partsCovered" not in ki:
             return UNSUPPORTED, None, f"{where(c)} carries no keyIndex.keysProbed and partsCovered on this build"
+    if refused_over:
+        c = refused_over[0]
+        return "value", 0, (f"{where(c)} was refused ({c.get('reason') or 'no reason given'}) while the "
+                            f"1,000-key list was admitted: the guard admits up to 4,096 literals, so the "
+                            f"1,025-key list must be answered by a scan")
+    for c in lines:
+        ki = c["stats"]["keyIndex"]
         if ki["keysProbed"] != 1000:
             return "value", 0, f"{where(c)} probed {ki['keysProbed']} keys, not 1000"
         if not ki["partsCovered"]:
@@ -623,11 +639,11 @@ def statement_figure(calls, cfg, statement, state, metric, candidates=None):
 
     metric is "<temp>.<agg>.<name>", "<temp>.rows_exact",
     "<temp>.rows_match_state.<other>", "<temp>.wall_p50_s" or
-    "<temp>.control_1001".
+    "<temp>.control_1025".
     """
     temp, _, rest = metric.partition(".")
-    if rest == "control_1001":
-        return control_1001(calls, cfg, statement, state, temp)
+    if rest == "control_1025":
+        return control_1025(calls, cfg, statement, state, temp)
     lines, bad = group_lines(calls, cfg, statement, state, temp)
     if bad:
         return bad[0], None, bad[1]

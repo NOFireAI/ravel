@@ -20,7 +20,7 @@
 #   metric      what evaluate.py extracts (README.md "Evaluation"):
 #                 <temp>.max|min.<name>       a statement's call counters
 #                 <temp>.rows_exact, <temp>.rows_match_state.<state>,
-#                 <temp>.wall_p50_s, <temp>.control_1001
+#                 <temp>.wall_p50_s, <temp>.control_1025
 #                 stamp.<what>.<label>        stamps/STATE.LABEL.*.json
 #                 leaf_share.<label>.<field>  that field's leaf bytes over the
 #                                             label's census data bytes, in %
@@ -1071,38 +1071,44 @@ metric = "cold.max.per_part.leaf_bytes"
 lane = "counter"
 target_if = "v <= m['row_11.logs_part_entries'] * 11 * 1024"
 
-# The 1,001-key controls, one per table and key kind (evaluate.py
-# control_1001). The 1,001-key twin is judged first: 0 when one of its cold
-# calls carries a nonzero keyIndex figure, or was served with no keyIndex
-# figure, no probe or scan GET and no block scanned; a refused twin call
-# passes. Then the 1,000-key list: refused-by-guard when the SQL complexity
+# The over-cap controls, one per table and key kind (evaluate.py
+# control_1025): 1,025 keys, one over decision 6's k = 1,024 (the Stage 1
+# amendment). The guard admits the list (a flat list costs one unit plus one
+# per 64 literals, up to 4,096 literals) and the planner carries no key set
+# past 1,024 keys, so a correct build answers it with a scan: keysProbed 0,
+# partsCovered 0, 0 leaf GETs (services/ravel-server/tests/sql_key_in.rs,
+# in_list_rows_equal_the_union_of_equalities). The 1,025-key twin is judged
+# first: 0 when one of its cold calls carries a nonzero keyIndex figure, or
+# was served with no keyIndex figure, no probe or scan GET and no block
+# scanned. Then the 1,000-key list: refused-by-guard when the SQL complexity
 # guard refused it, unsupported-on-this-build when it was refused otherwise or
 # carries no keyIndex.keysProbed and partsCovered, 0 when it probed another
-# count or covered no part, else 1. A build from before ADR-3692's key set
-# amendment refuses both lists (MAX_STATEMENT_COMPLEXITY = 1,000 at one unit
-# per token), so on such a build all three read refused-by-guard
-# (fixtures/local-smoke, pinned by test_control_1001_refused_by_guard_on_main).
+# count or covered no part, or when the twin was refused while it was
+# admitted, else 1. A build from before ADR-3692's key set amendment refuses
+# both lists (MAX_STATEMENT_COMPLEXITY = 1,000 at one unit per token), so on
+# such a build all three read refused-by-guard (fixtures/local-smoke, pinned
+# by test_control_1025_refused_by_guard_on_main).
 [[row.figure]]
-name = "spans_control_1001"
+name = "spans_control_1025"
 statement = "spans_in_1000"
 state = "folded_leaves"
-metric = "cold.control_1001"
+metric = "cold.control_1025"
 lane = "counter"
 target_if = "v == 1"
 
 [[row.figure]]
-name = "logs_trace_control_1001"
+name = "logs_trace_control_1025"
 statement = "logs_trace_in_1000"
 state = "folded_leaves"
-metric = "cold.control_1001"
+metric = "cold.control_1025"
 lane = "counter"
 target_if = "v == 1"
 
 [[row.figure]]
-name = "logs_request_control_1001"
+name = "logs_request_control_1025"
 statement = "logs_request_in_1000"
 state = "folded_leaves"
-metric = "cold.control_1001"
+metric = "cold.control_1025"
 lane = "counter"
 target_if = "v == 1"
 

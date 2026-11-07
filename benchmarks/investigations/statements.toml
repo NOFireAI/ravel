@@ -50,7 +50,7 @@
 #              state with outcome unsupported-on-this-build and this reason.
 #              No statement sets it today.
 #   expect_refusal_on_main  true: the statement is sent, and a refusal the
-#              server returns (the 1,000- and 1,001-key IN lists against the
+#              server returns (the 1,000- and 1,025-key IN lists against the
 #              SQL complexity cap of a build from before ADR-3692's key set
 #              amendment) is recorded as refused-by-guard with the
 #              response's status and text, counted apart from
@@ -161,7 +161,7 @@ cold_only = true
 # most 496 (2n + 8), and such a build's 400 and its text are recorded as
 # refused-by-guard. Since the amendment a flat literal list costs one unit
 # plus one per 64 literals (in_list_units), so the statement costs 24 units
-# and is admitted. The 1,001-key list beside it is row 11's control.
+# and is admitted. The 1,025-key list beside it is row 11's control.
 [[statement]]
 id = "spans_in_1000"
 tenant = "inv"
@@ -174,16 +174,19 @@ states = ["unfolded", "folded_leaves"]
 cold_only = true
 expect_refusal_on_main = true
 
-# Row 11's control: the 1,000-key list plus one key it does not hold, past
-# the ceiling, so the key index must not serve it.
+# Row 11's control: one key over decision 6's k = 1,024. box/lib/inv.py
+# merge-truth builds it from the 1,000-key list, the generator's
+# control_extra key and ids the corpus cannot hold (README "Row 11"). The
+# guard admits it at 25 units, the planner carries no key set past 1,024, so
+# it is answered by a scan with keysProbed 0 and no leaf GET.
 [[statement]]
-id = "spans_in_1001"
+id = "spans_in_1025"
 tenant = "inv"
 table = "spans"
 kind = "sql"
-sql = "SELECT span_id FROM spans WHERE trace_id IN ({in_trace_ids_x_1001})"
+sql = "SELECT span_id FROM spans WHERE trace_id IN ({in_trace_ids_x_1025})"
 window = "none"
-truth_key = "in_trace_id.1001.spans"
+truth_key = "in_trace_id.1025.spans"
 states = ["unfolded", "folded_leaves"]
 cold_only = true
 expect_refusal_on_main = true
@@ -236,13 +239,13 @@ cold_only = true
 expect_refusal_on_main = true
 
 [[statement]]
-id = "logs_trace_in_1001"
+id = "logs_trace_in_1025"
 tenant = "inv"
 table = "logs"
 kind = "sql"
-sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_1001})"
+sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_1025})"
 window = "none"
-truth_key = "in_trace_id.1001.logs"
+truth_key = "in_trace_id.1025.logs"
 states = ["unfolded", "folded_leaves"]
 cold_only = true
 expect_refusal_on_main = true
@@ -359,14 +362,14 @@ cold_only = true
 expect_refusal_on_main = true
 
 [[statement]]
-id = "logs_request_in_1001"
+id = "logs_request_in_1025"
 tenant = "inv"
 table = "logs"
 kind = "sql"
-sql = "SELECT request_id FROM logs WHERE request_id IN ({in_request_ids_1001})"
+sql = "SELECT request_id FROM logs WHERE request_id IN ({in_request_ids_1025})"
 window = "wide"
 anchor = "cell"
-truth_key = "in_request_id.1001"
+truth_key = "in_request_id.1025"
 states = ["unfolded", "folded_leaves"]
 cold_only = true
 expect_refusal_on_main = true
