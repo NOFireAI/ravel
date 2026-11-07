@@ -1322,6 +1322,120 @@ fn metrics_label_value_from_object(
     metrics_label_value_entries(&location.footer, stored)
 }
 
+/// The metrics `label_value` fields the postings build read from objects it
+/// fetched whole, keyed by the entry's ordinal in the fold's sorted entries,
+/// for the leaf build to read with no GET. Only entries of a part this
+/// attempt will build a leaf for are held, and the held pairs are charged
+/// against `key_index_build_max_pairs`: an object whose pairs would take the
+/// held total past it is not held, and the leaf build reads it by range. A
+/// part's entries are released once its leaf is built.
+pub(crate) struct HeldLabelDicts {
+    /// Entry ordinal ranges of the parts the attempt builds a leaf for,
+    /// ascending and disjoint.
+    wanted: Vec<std::ops::Range<usize>>,
+    budget: u64,
+    pairs: u64,
+    by_ordinal: BTreeMap<usize, (EntryKeyIndex, u64)>,
+}
+
+impl HeldLabelDicts {
+    pub(crate) fn new(wanted: Vec<std::ops::Range<usize>>, budget: u64) -> Self {
+        Self {
+            wanted,
+            budget,
+            pairs: 0,
+            by_ordinal: BTreeMap::new(),
+        }
+    }
+
+    /// Whether entry `ordinal` belongs to a part the attempt builds a leaf
+    /// for.
+    fn wants(&self, ordinal: usize) -> bool {
+        let i = self.wanted.partition_point(|range| range.end <= ordinal);
+        self.wanted.get(i).is_some_and(|range| range.contains(&ordinal))
+    }
+
+    /// Holds entry `ordinal`'s field when the entry is wanted and its pairs
+    /// fit the budget; `read` runs only for a wanted entry.
+    fn offer(&mut self, ordinal: usize, read: impl FnOnce() -> EntryKeyIndex) {
+        if !self.wants(ordinal) {
+            return;
+        }
+        let fields = read();
+        let pairs = fields
+            .as_ref()
+            .map(|fields| fields.iter().map(|f| f.entries.len() as u64).sum())
+            .unwrap_or(0);
+        let Some(total) = self
+            .pairs
+            .checked_add(pairs)
+            .filter(|&total| total <= self.budget)
+        else {
+            return;
+        };
+        self.pairs = total;
+        self.by_ordinal.insert(ordinal, (fields, pairs));
+        #[cfg(test)]
+        HELD_LABEL_DICT_LOG.with(|log| {
+            let mut log = log.borrow_mut();
+            log.held_ordinals.push(ordinal);
+            log.peak_pairs = log.peak_pairs.max(total);
+        });
+    }
+
+    /// Drops every held entry in `ordinals`.
+    fn release(&mut self, ordinals: std::ops::Range<usize>) {
+        let held: Vec<usize> = self.by_ordinal.range(ordinals).map(|(&o, _)| o).collect();
+        for ordinal in held {
+            if let Some((_, pairs)) = self.by_ordinal.remove(&ordinal) {
+                self.pairs -= pairs;
+            }
+        }
+        #[cfg(test)]
+        HELD_LABEL_DICT_LOG.with(|log| log.borrow_mut().pairs_after_release.push(self.pairs));
+    }
+
+    /// The held entries of the part whose first entry is at `start`.
+    fn part(&self, start: usize) -> HeldPart<'_> {
+        HeldPart { held: self, start }
+    }
+}
+
+/// [`HeldLabelDicts`] seen from one part, by the part's own entry ordinal.
+#[derive(Clone, Copy)]
+pub(crate) struct HeldPart<'a> {
+    held: &'a HeldLabelDicts,
+    start: usize,
+}
+
+impl HeldPart<'_> {
+    fn get(&self, part_ordinal: u64) -> Option<&EntryKeyIndex> {
+        let ordinal = usize::try_from(part_ordinal).ok()?.checked_add(self.start)?;
+        self.held.by_ordinal.get(&ordinal).map(|(fields, _)| fields)
+    }
+}
+
+// Test-only: the fold ordinals [`HeldLabelDicts`] held, the most pairs it
+// held at once, and the pairs it still held after each part's release.
+#[cfg(test)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HeldLabelDictLog {
+    pub(crate) held_ordinals: Vec<usize>,
+    pub(crate) peak_pairs: u64,
+    pub(crate) pairs_after_release: Vec<u64>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static HELD_LABEL_DICT_LOG: std::cell::RefCell<HeldLabelDictLog> =
+        std::cell::RefCell::new(HeldLabelDictLog::default());
+}
+
+#[cfg(test)]
+pub(crate) fn take_held_label_dict_log_for_test() -> HeldLabelDictLog {
+    HELD_LABEL_DICT_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
 /// Reads a metrics object's `label_value` field by range: a suffix GET for
 /// the RSEG footer (a second footer GET only when the footer is longer than
 /// [`KEY_INDEX_FOOTER_SUFFIX_LEN`]), then one GET of LABEL_DICT.
@@ -2432,7 +2546,7 @@ pub(crate) async fn build_part_key_index(
     part_entries: &[SnapshotEntry],
     declared: &[(String, KeyType)],
     previous_tail: Option<&PreviousTail>,
-    held: &HashMap<String, EntryKeyIndex>,
+    held: HeldPart<'_>,
     limits: &KeyIndexBuildLimits,
     counters: &mut RequestCounters,
 ) -> Result<BuiltPartKeyIndex, StoreError> {
@@ -2572,8 +2686,8 @@ pub(crate) async fn build_part_key_index(
                 // `Send` bound the server's spawned fold loop needs.
                 let mut reads = stream::iter(0..targets.len())
                     .map(move |i| {
-                        let (_, key, object_size) = &targets_ref[i];
-                        let held = held.get(key).cloned();
+                        let (ordinal, key, object_size) = &targets_ref[i];
+                        let held = held.get(*ordinal).cloned();
                         async move {
                             match held {
                                 // Read from object bytes the fold already
@@ -3967,7 +4081,23 @@ impl Catalog {
             // entry it fetches whole has its LABEL_DICT read from those bytes
             // and the leaf build issues no GET for it. Other folds build the
             // postings after the parts, as below.
-            let mut held_label_dicts: HashMap<String, EntryKeyIndex> = HashMap::new();
+            // Only parts this attempt builds a leaf for hold their entries:
+            // a part reused by reference, or one an earlier attempt already
+            // built, reads nothing.
+            let wanted_spans: Vec<std::ops::Range<usize>> = spans
+                .iter()
+                .zip(&span_encodings)
+                .filter_map(|(span, encoding)| {
+                    let hash = encoding.as_ref().ok()?.hash;
+                    let reused = existing_by_blake3.contains_key(hash.as_bytes().as_slice())
+                        || key_index_built.contains_key(hash.as_bytes());
+                    (!reused).then_some(span.start..span.end)
+                })
+                .collect();
+            let mut held_label_dicts = HeldLabelDicts::new(
+                wanted_spans,
+                self.config().key_index_build_max_pairs.max(1),
+            );
             let early_postings = if signal == Signal::Metrics && key_index_fields.is_some() {
                 Some(
                     self.fold_postings_names(
@@ -4301,7 +4431,7 @@ impl Catalog {
                                 part_entries,
                                 declared,
                                 previous_tail.as_ref(),
-                                &held_label_dicts,
+                                held_label_dicts.part(span.start),
                                 &KeyIndexBuildLimits {
                                     leaf: key_index_leaf_limits(),
                                     max_pairs: self.config().key_index_build_max_pairs,
@@ -4312,6 +4442,7 @@ impl Catalog {
                             )
                             .await
                             .map_err(CatalogError::Store)?;
+                            held_label_dicts.release(span.start..span.end);
                             key_index_built.insert(*part_hash.as_bytes(), built.clone());
                             built
                         }
@@ -5017,7 +5148,7 @@ impl Catalog {
         from_scratch: bool,
         previous_entries_len: usize,
         entries: &[SnapshotEntry],
-        held_label_dicts: Option<&mut HashMap<String, EntryKeyIndex>>,
+        held_label_dicts: Option<&mut HeldLabelDicts>,
         counters: &mut RequestCounters,
         accounting: &QueryAccounting,
     ) -> Result<Option<Vec<NamePostings>>, CatalogError> {
@@ -5063,8 +5194,8 @@ impl Catalog {
     /// partial.
     ///
     /// With `held_label_dicts`, each fetched object's metrics `label_value`
-    /// field is also read from the bytes in hand and kept under its data
-    /// object key, so the leaf build reads those entries with no GET.
+    /// field is offered to it from the bytes in hand, under the entry's
+    /// ordinal; an entry it holds is read by the leaf build with no GET.
     #[allow(clippy::too_many_arguments)]
     async fn build_postings(
         &self,
@@ -5073,7 +5204,7 @@ impl Catalog {
         entries: &[SnapshotEntry],
         decode_start: usize,
         baseline: Vec<NamePostings>,
-        mut held_label_dicts: Option<&mut HashMap<String, EntryKeyIndex>>,
+        mut held_label_dicts: Option<&mut HeldLabelDicts>,
         counters: &mut RequestCounters,
     ) -> Option<Vec<NamePostings>> {
         let mut by_name: BTreeMap<String, Vec<u64>> = baseline
@@ -5082,13 +5213,12 @@ impl Catalog {
             .collect();
         for (ordinal, entry) in entries.iter().enumerate().skip(decode_start) {
             let fetched = fetch_segment_object(self.store(), tenant, signal, entry).await;
-            let names = match fetched.and_then(|(data_key, data, location)| {
+            let names = match fetched.and_then(|(_, data, location)| {
                 let names = segment_names_from_object(&location, &data)?;
                 if let Some(held) = held_label_dicts.as_deref_mut() {
-                    held.insert(
-                        data_key,
-                        metrics_label_value_from_object(tenant, &data, &location),
-                    );
+                    held.offer(ordinal, || {
+                        metrics_label_value_from_object(tenant, &data, &location)
+                    });
                 }
                 Ok(names)
             }) {
