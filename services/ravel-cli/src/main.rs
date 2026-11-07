@@ -2261,6 +2261,7 @@ impl ScratchArgs {
             scratch_max_bytes: self.scratch_max_bytes,
             level1_workers: self.level1_workers,
             merge_resident_ceiling_bytes: None,
+            geometry_floor_decoded_rows: None,
         };
         options.validate()?;
         Ok(options)
