@@ -4518,8 +4518,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// Issue #3899 (M2): a tenant or process budget refusal records the
-    /// budget's reserved bytes before the refused grow and the refused pool's
+    /// Issue #3899 (M2): a tenant or process budget refusal records SQL's
+    /// reserved bytes on the budget (here all of them, with no fetch-layer
+    /// reservation) before the refused grow and the refused pool's
     /// own bytes on it: its charged bytes on the tenant budget, its charged
     /// bytes plus its aggregate envelopes on the process budget.
     ///

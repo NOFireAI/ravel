@@ -854,12 +854,26 @@ answered, but three properties of the decision above cost the rest:
      refusal at which its own bytes on the refusing budget (its pool's
      charged bytes, plus, on the process budget, those of its aggregate
      envelopes among the process's `width` largest, the only envelope bytes
-     the budget holds) were at least half of the budget's reserved bytes. A
+     the budget holds) were at least half of SQL execution's reserved bytes
+     on that budget. On the process budget that is the reserved total less
+     what the fetch layer and caches hold through `MemoryBudget::reserve`
+     (`MemoryBudget::sql_reserved`), with the statement's own bytes capped
+     at it: spilling frees only SQL memory, and a cache or fetch buffer says
+     nothing about another statement contending. A
      reserve-ahead refusal is a refusal of the shared process budget, so it
      takes the same test. The statement's fetch reservations on the process
      budget are not counted: they are made on the shared budget with no
      per-statement figure. A fetch-layer refusal does not count, because
-     spilling does not shrink fetch buffers. Note (2026-11-07, review of
+     spilling does not shrink fetch buffers. Note (2026-11-07, second
+     review of the M2 fix): the process share was first measured against
+     the budget's whole reserved total, which includes the fetch buffers,
+     the catalog's cached decodes and the decoded column-block cache sized
+     by `--decoded-cache-max-bytes`, resident with no statement running. On
+     a 4 GB host those can hold as much of the budget as SQL does, so a
+     statement running alone read as holding under half and stopped
+     retrying; the M2 run's single-statement phase retried 22 process
+     budget and 3 reserve-ahead refusals on c6a.large and 11 and 1 on
+     c6a.xlarge. Note (2026-11-07, review of
      the M2 fix): the M2 fix first retried every reserve-ahead refusal and
      counted every envelope of the pool, including envelopes outside the
      `width` largest that the process budget does not hold; under
