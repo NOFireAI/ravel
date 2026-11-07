@@ -12174,3 +12174,255 @@ mod log_prefetch_deadline_tests {
         assert_eq!(source.log_series.len(), 1, "one stream, one series");
     }
 }
+
+/// ADR-3694 decision 4, whole-series batch amendment, end to end: a PromQL
+/// range query over one compacted L1 part whose selected pages exceed the
+/// fetch memory limit answers exactly as an unlimited engine does, because the
+/// part is fetched one batch of whole series at a time.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod l1_batch_tests {
+    use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_commit::keys::commit_key_for_record;
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_maintain::{
+        Bucket, CompactionOutcome, CompactorConfig, FixedClock, PublishOutcome, compact_bucket,
+    };
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
+    use ravel_types::{Label, TenantId};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::fetcher::BatchObservation;
+
+    const NS_PER_SEC: i64 = 1_000_000_000;
+    const NS_PER_HOUR: i64 = 3_600 * NS_PER_SEC;
+    const HOUR: u32 = 472_222;
+    const SERIES: usize = 400;
+    const SAMPLES: i64 = 360;
+    const PERMITS: usize = 16;
+    const TENANT: TenantHash = TenantHash([0x3b; 16]);
+
+    fn hour_start() -> i64 {
+        i64::from(HOUR) * NS_PER_HOUR
+    }
+
+    /// Series `i` is `m{id="i", pick=...}`, picked on every tenth series.
+    fn series(i: usize, seed: &mut u64) -> SeriesInput {
+        let labels = LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: "m".to_string(),
+            },
+            Label {
+                name: "id".to_string(),
+                value: format!("{i:04}"),
+            },
+            Label {
+                name: "pick".to_string(),
+                value: if i % 10 == 0 { "yes" } else { "no" }.to_string(),
+            },
+        ])
+        .expect("labels");
+        let series_id = SeriesId::compute(&TenantId::new("t"), "m", &labels).expect("series id");
+        let samples = (0..SAMPLES)
+            .map(|k| {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                Sample {
+                    ts_ns: hour_start() + k * 10 * NS_PER_SEC,
+                    value: (*seed % 1_000_000) as f64 / 3.0,
+                }
+            })
+            .collect();
+        SeriesInput {
+            series_id,
+            labels,
+            samples,
+        }
+    }
+
+    async fn put_l0(store: &MemoryStore, seq: u64, series: Vec<SeriesInput>) {
+        let writer_id = Uuid::from_u128(u128::from(seq));
+        let identity = SegmentIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: seq,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: hour_start(),
+            max_ingest_ts_ns: hour_start() + 10,
+        };
+        let written = SegmentWriter::write(series, identity, bounds).expect("write L0");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: TENANT,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: hour_start(),
+            max_ingest_ts_ns: hour_start() + 10,
+            segment_format_version: u32::from(VERSION_V7),
+            created_unix_ns: hour_start() + i64::try_from(seq).expect("seq"),
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("commit record");
+        store
+            .put(
+                &rec.object_key,
+                written.bytes,
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put data object");
+        let commit_key = commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(
+                &commit_key,
+                record::encode(&rec),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put commit record");
+    }
+
+    /// Two L0 flushes of disjoint halves of the series, compacted into one L1
+    /// part.
+    async fn l1_tenant() -> Arc<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut first: Vec<SeriesInput> = (0..SERIES).map(|i| series(i, &mut seed)).collect();
+        let second = first.split_off(SERIES / 2);
+        put_l0(&store, 1, first).await;
+        put_l0(&store, 2, second).await;
+        let outcome = compact_bucket(
+            store.as_ref(),
+            &FixedClock::new(hour_start() + 3 * NS_PER_HOUR),
+            &CompactorConfig::default(),
+            &Bucket::new(TENANT, Signal::Metrics, 0, HOUR),
+        )
+        .await
+        .expect("compact_bucket");
+        match outcome {
+            CompactionOutcome::Compacted { parts, publish } => {
+                assert_eq!(parts, 1, "one L1 part");
+                assert_eq!(publish, PublishOutcome::Published);
+            }
+            other => panic!("expected the hour to compact, got {other:?}"),
+        }
+        store
+    }
+
+    /// An engine with the query fan-out above one, `PERMITS` GET permits and,
+    /// when `limit` is set, a fetch memory budget of that many bytes. The
+    /// fetcher knobs are applied last, since the engine's budget and limiter
+    /// setters rebuild its fetcher.
+    fn engine(
+        store: Arc<MemoryStore>,
+        limit: Option<u64>,
+        batch_floor: u64,
+        probe: Arc<std::sync::Mutex<Vec<BatchObservation>>>,
+    ) -> QueryEngine {
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog = Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        let config = EngineConfig {
+            promql_fetch_fanout: Some(4),
+            ..EngineConfig::default()
+        };
+        let mut eng = QueryEngine::new(Arc::new(catalog), backend, config)
+            .with_get_limiter(Arc::new(GetLimiter::new(PERMITS).expect("limiter")));
+        if let Some(limit) = limit {
+            eng = eng.with_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(limit)));
+        }
+        eng.fetcher = eng
+            .fetcher
+            .clone()
+            .with_whole_object_threshold(0)
+            .with_fetch_batch_floor(batch_floor)
+            .with_batch_probe(probe);
+        eng
+    }
+
+    async fn query(eng: &QueryEngine) -> Result<Value, QueryError> {
+        let start_ms = hour_start() / 1_000_000;
+        eng.range_with_stats(
+            TENANT,
+            r#"m{pick="yes"}"#,
+            start_ms,
+            start_ms + 3_600_000,
+            60_000,
+            &[],
+            hour_start() + 3 * NS_PER_HOUR,
+            Duration::from_secs(120),
+        )
+        .await
+        .map(|(value, _stats)| value)
+    }
+
+    #[tokio::test]
+    async fn an_l1_part_over_the_fetch_limit_answers_in_batches() {
+        let store = l1_tenant().await;
+        let reference = query(&engine(Arc::clone(&store), None, 1, Arc::default()))
+            .await
+            .expect("an unlimited engine answers");
+        let reference = format!("{reference:?}");
+
+        // One whole-call reservation, as before the amendment: its peak.
+        let probe = Arc::default();
+        let whole = engine(Arc::clone(&store), None, u64::MAX, Arc::clone(&probe));
+        assert_eq!(format!("{:?}", query(&whole).await.expect("answers")), reference);
+        let observed: Vec<BatchObservation> = probe.lock().expect("probe").clone();
+        assert_eq!(observed.len(), 1, "one L1 part, fetched as one batch");
+        let whole_pages = observed[0].batch_reserved;
+        let whole_peak = observed[0].budget_reserved;
+
+        // One byte below that peak: the whole-call reservation refuses.
+        let limit = whole_peak - 1;
+        let refused = query(&engine(Arc::clone(&store), Some(limit), u64::MAX, Arc::default()))
+            .await
+            .expect_err("a whole-call reservation over the limit refuses");
+        let message = refused.to_string();
+        assert!(
+            message.contains("fetch memory exhausted"),
+            "unbatched at {limit} B: {message}"
+        );
+        assert!(
+            message.contains(&format!("requested {whole_pages} bytes")),
+            "the refusal names the whole call's pages: {message}"
+        );
+
+        // The same limit, batched: the same answer.
+        let probe = Arc::default();
+        let batched = engine(Arc::clone(&store), Some(limit), 1, Arc::clone(&probe));
+        let answer = query(&batched).await.unwrap_or_else(|e| {
+            panic!("a batched fetch at {limit} B answers, got: {e}");
+        });
+        assert_eq!(format!("{answer:?}"), reference, "the same answer as unlimited");
+        let observed: Vec<BatchObservation> = probe.lock().expect("probe").clone();
+        assert!(observed.len() >= 2, "{} batches", observed.len());
+        for (i, b) in observed.iter().enumerate() {
+            assert!(
+                b.batch_reserved < whole_pages,
+                "batch {i}: {} B, the whole call {whole_pages} B",
+                b.batch_reserved
+            );
+        }
+        let batched_pages: u64 = observed.iter().map(|b| b.batch_reserved).sum();
+        assert!(
+            batched_pages <= whole_pages,
+            "the batches reserve {batched_pages} B, the whole call {whole_pages} B"
+        );
+    }
+}
