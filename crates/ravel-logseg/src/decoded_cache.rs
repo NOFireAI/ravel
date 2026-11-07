@@ -42,7 +42,12 @@
 //! A cached string column whose text was validated carries a memo slot
 //! ([`MemoSlot`]): `ravel-sql` fills it with an Arrow values array sharing
 //! the column's buffers, through [`MemoSource`]. This crate names no Arrow
-//! type; the slot holds a [`ValuesMemo`] trait object.
+//! type; the slot holds a [`ValuesMemo`] trait object. A memo's views are
+//! charged to a view budget of their own, not to the data cap
+//! ([`DecodedColumnCache::reserve_view`];
+//! `a_view_fill_is_charged_to_the_view_budget_not_the_data_cap`), and the
+//! pressure evictor releases unheld views before any data entry
+//! (`pressure_releases_unheld_views_before_any_data_entry`).
 //!
 //! Entries age out on the ravel-cache bound (ADR-0064): an entry older than
 //! [`DEFAULT_MAX_ENTRY_AGE_NS`] is dropped at its first access, and
@@ -503,7 +508,8 @@ impl DecodedCacheCounters {
     /// read 0 here: the first is the cache's level and the second happens in
     /// the budget's evictor, not in a statement, so a call site takes both
     /// from [`DecodedColumnCache::view_counters`], as it takes the resident
-    /// and pressure figures.
+    /// and pressure figures
+    /// (`a_view_fill_is_charged_to_the_view_budget_not_the_data_cap`).
     pub fn view_snapshot(&self) -> ViewMemoSnapshot {
         ViewMemoSnapshot {
             bytes: 0,
@@ -568,7 +574,8 @@ struct Inner {
     hand: usize,
     resident: u64,
     /// Bytes of view memos, against `view_max_bytes`; never in `resident`
-    /// (ADR-3326, view memo amendment, decision 3).
+    /// (ADR-3326, view memo amendment, decision 3;
+    /// `a_view_fill_is_charged_to_the_view_budget_not_the_data_cap`).
     view_resident: u64,
     view_fills: u64,
     view_refusals: u64,
@@ -597,7 +604,8 @@ impl Inner {
 impl Inner {
     /// Takes slot `i` out of the index. The entry is returned rather than
     /// dropped so the caller can drop it after releasing the lock. Its memo's
-    /// views leave the view total here, since they go with the column.
+    /// views leave the view total here, since they go with the column
+    /// (`removing_an_entry_drops_its_views_and_lowers_the_view_total`).
     fn remove(&mut self, i: usize) -> Option<Arc<DecodedEntry>> {
         let slot = self.slots.get_mut(i)?.take()?;
         self.index.remove(&slot.key);
@@ -704,7 +712,8 @@ impl DecodedColumnCache {
 
     /// This cache with a view budget of `view_max_bytes`, apart from the
     /// data cap (ADR-3326, view memo amendment, decision 3). At 0,
-    /// [`Self::reserve_view`] refuses every fill.
+    /// [`Self::reserve_view`] refuses every fill
+    /// (`a_view_fill_is_charged_to_the_view_budget_not_the_data_cap`).
     #[must_use]
     pub fn with_view_max_bytes(mut self, view_max_bytes: u64) -> Self {
         self.view_max_bytes = view_max_bytes;
@@ -998,7 +1007,8 @@ impl DecodedColumnCache {
     /// when:
     ///
     /// - `key`'s entry is gone, holds another `cell`, has no filled memo, or
-    ///   its memo already reports views; none of these is counted;
+    ///   its memo already reports views; none of these is counted
+    ///   (`a_fill_for_no_entry_another_cell_or_a_filled_memo_is_not_charged`);
     /// - the view total plus `bytes` would pass the view budget, or the
     ///   memory budget refuses `bytes` while keeping [`admission_margin`]
     ///   unreserved. Each is a `viewMemoRefusals`
@@ -1007,13 +1017,16 @@ impl DecodedColumnCache {
     /// The reservation is [`MemoryBudget::reserve_best_effort_keeping`], which
     /// never runs the budget's evictor, and nothing here evicts, so a fill
     /// never costs a data entry or another view memo
-    /// (`a_view_fill_never_evicts_a_data_entry`). It is taken outside the
-    /// cache's lock, with the bytes claimed on the view total meanwhile.
+    /// (`a_view_fill_never_evicts_a_data_entry`).
     ///
     /// `install` runs under the cache's lock and must not call back into the
     /// cache. The view total then grows by what the memo's
-    /// [`ValuesMemo::extra_bytes`] reports, which is the figure `Inner::remove`
-    /// and [`ValuesMemo::release_extra`] later take back off.
+    /// [`ValuesMemo::extra_bytes`] reports
+    /// (`a_view_fill_is_charged_to_the_view_budget_not_the_data_cap`), which
+    /// is the figure `Inner::remove` and [`ValuesMemo::release_extra`] later
+    /// take back off
+    /// (`removing_an_entry_drops_its_views_and_lowers_the_view_total`,
+    /// `releasing_a_view_memo_lowers_the_view_total_and_the_budget_by_its_bytes`).
     pub fn reserve_view<T>(
         &self,
         key: &DecodedKey,
@@ -2460,11 +2473,7 @@ mod tests {
         c: &DecodedCacheCounters,
     ) -> bool {
         let memo = memo.upgrade().expect("the memo lives with its entry");
-        let cell = {
-            let inner = cache.lock();
-            let i = *inner.index.get(&k).expect("resident");
-            Arc::clone(&inner.slots[i].as_ref().expect("slot").entry.cell)
-        };
+        let cell = cell_of(cache, k);
         cache
             .reserve_view(&k, &cell, VIEW_BYTES, c, |reservation| {
                 let views = TestViews {
@@ -2477,6 +2486,14 @@ mod tests {
                 *memo.slot() = Some((views, VIEW_BYTES));
             })
             .is_some()
+    }
+
+    /// The reservation cell of `k`'s entry, read without marking it
+    /// referenced.
+    fn cell_of(cache: &DecodedColumnCache, k: DecodedKey) -> Arc<ReservationCell> {
+        let inner = cache.lock();
+        let i = *inner.index.get(&k).expect("resident");
+        Arc::clone(&inner.slots[i].as_ref().expect("slot").entry.cell)
     }
 
     fn extra(memo: &Weak<ViewTestMemo>) -> u64 {
@@ -2588,14 +2605,21 @@ mod tests {
         assert!(fill_at(&cache, key(0, 1), &m0, &c), "exactly at the margin");
         assert_eq!(budget.reserved(), before - 1 + VIEW_BYTES);
 
-        // A view budget one byte short of the views.
-        let cache = DecodedColumnCache::new(1 << 20, None).with_view_max_bytes(VIEW_BYTES - 1);
-        let c = DecodedCacheCounters::default();
-        let m0 = admit_memo(&cache, key(0, 1), &c);
-        assert!(!fill_at(&cache, key(0, 1), &m0, &c));
-        assert_eq!(extra(&m0), 0);
-        assert_eq!(cache.view_counters().refusals, 1);
-        assert_eq!(cache.view_resident_bytes(), 0);
+        // A view budget of 0, as `new` builds, and one byte short of the
+        // views.
+        for view_max in [None, Some(VIEW_BYTES - 1)] {
+            let cache = DecodedColumnCache::new(1 << 20, None);
+            let cache = match view_max {
+                Some(v) => cache.with_view_max_bytes(v),
+                None => cache,
+            };
+            let c = DecodedCacheCounters::default();
+            let m0 = admit_memo(&cache, key(0, 1), &c);
+            assert!(!fill_at(&cache, key(0, 1), &m0, &c), "{view_max:?}");
+            assert_eq!(extra(&m0), 0, "{view_max:?}");
+            assert_eq!(cache.view_counters().refusals, 1, "{view_max:?}");
+            assert_eq!(cache.view_resident_bytes(), 0, "{view_max:?}");
+        }
 
         // The reservation goes with the views buffer's last holder.
         let budget = Arc::new(MemoryBudget::new(4 << 30));
@@ -2952,5 +2976,53 @@ mod tests {
         assert!(fill_at(&cache, key(2, 1), &m2, &c), "admitted");
         assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
         assert_eq!(cache.view_counters().fills, 3);
+    }
+
+    /// A fill for a key with no entry, with a cell other than its entry's, on
+    /// a column whose memo slot is empty, or on a memo that already holds
+    /// views, runs no `install`, charges nothing and counts no refusal.
+    #[test]
+    fn a_fill_for_no_entry_another_cell_or_a_filled_memo_is_not_charged() {
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)))
+            .with_view_max_bytes(1 << 20);
+        let c = DecodedCacheCounters::default();
+        let m0 = admit_memo(&cache, key(0, 1), &c);
+        let bare = cache
+            .offer(key(1, 1), &plain_rows(), AccessIntent::Interactive, &c)
+            .expect("admitted");
+        let ran = AtomicU64::new(0);
+        let try_fill = |k: DecodedKey, cell: &Arc<ReservationCell>| {
+            cache
+                .reserve_view(&k, cell, VIEW_BYTES, &c, |_| {
+                    ran.fetch_add(1, Ordering::Relaxed);
+                })
+                .is_some()
+        };
+        let fresh = Arc::new(ReservationCell::default());
+        assert!(!try_fill(key(9, 1), bare.reservation_cell()), "no entry");
+        assert!(
+            !try_fill(key(0, 1), bare.reservation_cell()),
+            "another entry's cell"
+        );
+        assert!(!try_fill(key(0, 1), &fresh), "a cell no entry holds");
+        assert!(!try_fill(key(1, 1), bare.reservation_cell()), "no memo");
+        let reserved = budget.reserved();
+        assert!(fill_at(&cache, key(0, 1), &m0, &c));
+        assert!(
+            !try_fill(key(0, 1), &cell_of(&cache, key(0, 1))),
+            "the memo already holds views"
+        );
+        assert_eq!(ran.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            cache.view_counters(),
+            ViewMemoSnapshot {
+                bytes: VIEW_BYTES,
+                fills: 1,
+                refusals: 0,
+                releases: 0,
+            }
+        );
+        assert_eq!(budget.reserved(), reserved + VIEW_BYTES);
     }
 }
