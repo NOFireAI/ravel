@@ -8601,9 +8601,11 @@ mod prefetch_tests {
 
     /// Issue #3105: a range query's selector-cache entries are charged to the
     /// engine's memory budget. Eight keys of about 2.5 KB each against a
-    /// 6144-byte budget, which also holds the fetch's sample fold (about
-    /// 5.9 KB, released before evaluation): the first two are cached, the
-    /// other six are read at every step, the response carries one info naming
+    /// 6656-byte budget, which also holds the fetch's sample fold (about
+    /// 5.9 KB) beside the 438 bytes the segment fetch still holds while the
+    /// fold absorbs, both released before evaluation: the first two are
+    /// cached, the other six are read at every step, the response carries one
+    /// info naming
     /// them, the answer is the unconstrained one, and the budget is back to
     /// zero afterwards. The six fallbacks are not refusals the budget counts:
     /// the query
@@ -8611,7 +8613,7 @@ mod prefetch_tests {
     /// `ravel_memory_gate_refusals_total` must not move.
     #[tokio::test]
     async fn a_range_query_over_its_memory_budget_reads_per_step_and_says_so() {
-        let budget = Arc::new(ravel_memory::MemoryBudget::new(6144));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(6656));
         let (value, annotations, _) =
             eight_offsets_range(EngineConfig::default(), Arc::clone(&budget))
                 .await
@@ -8636,7 +8638,7 @@ mod prefetch_tests {
             annotations.infos()[0],
             "6 selector(s) read at every step instead of once per query: \
              6 refused by the query memory budget (first refusal: memory exhausted: \
-             requested 2489 bytes, 4994 of 6144 byte limit already reserved)"
+             requested 2489 bytes, 4994 of 6656 byte limit already reserved)"
         );
 
         let unconstrained = Arc::new(ravel_memory::MemoryBudget::unlimited());
