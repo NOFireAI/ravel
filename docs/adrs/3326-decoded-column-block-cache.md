@@ -2172,8 +2172,8 @@ its pull request merges.
   - The fixture: NULL keys over a registered plain memo, and a memo with NULL entries (a mixed
     memo in a unit fixture).
   - The checks: values and null bits equal arrow's cast; a session `GROUP BY` puts NULL rows in
-    the NULL group; and the null-bearing memo is not served (the cast runs, and the served-batch
-    counter does not move).
+    the NULL group; and the null-bearing memo is not served (the cast runs, and `viewMemoFills`
+    stays 0 for it).
   - Wrong implementations:
     - (a) a serve rule that skips the null-buffer condition, so the null-bearing memo is served and
       a NULL entry groups as `''` (#3521);
@@ -2334,7 +2334,7 @@ The arithmetic is in `research.md`, section 6 (alternative D).
 | `viewMemoBytes`, A | 0 on every call | any other value | predicted: A has no view memo |
 | `viewMemoReleases` per round, B | reported, at least 1 at q33 | 0 in every round | predicted |
 | `viewMemoRefusals` per round, B | 0 | above 0 | predicted: the 2.0 GB default holds the 1.36 to 1.60 GB of plain SearchPhrase views, so no fill is refused (decision 3) |
-| `viewMemoFills` per round, B, summed over q06 and q13 to q19 | in every B round, at least 90% of the distinct plain SearchPhrase blocks those calls serve | below 90% in any B round | predicted: every round starts a new server, so each served plain block fills once per round, on its first hit, and keeps its views until q33's pass releases them (decisions 6 and 7) |
+| `viewMemoFills` per round, B, summed over q06, q13 to q15 and q17 to q19 | at least 9,860 | below 9,860 in any B round | predicted: the 1.36 to 1.60 GB of views is 79 to 93% of the 13,141 SearchPhrase blocks at 16 B x 8,192 rows each (10,380 to 12,210 blocks, inference); every round starts a new server, so each plain block those calls serve fills once per round, and the floor is 0.95 of the low end |
 | Process peak resident (`ravel_process_allocator_bytes{stat="resident"}`), median over each arm's round servers, B minus A, REPORT ONLY (owner decision) | reported, expected 0 to +1.6 GB | none: not judged | predicted: the views are resident until q33's pass releases them, and jemalloc returns freed pages only on decay (see "Risks"). A reads 29.05 to 29.76 GB per round server (abneq and abq26 metrics, measured 2026-11-05 and 2026-11-06) |
 | Host memory gate, minimum available over the run (`ravel_memory_gate_available_bytes`), B against A | B at least A minus 0.5 GB | B below A minus 0.5 GB | measured 2026-11-06: A read 1.83 GB (abneq) and 1.40 GB (abq26), against a 0.66 GB floor (`ravel_memory_gate_available_floor_bytes`) |
 | Host OOM kills, either arm (`sampler/cpuab/dmesg-oom.txt`) | the file is empty | any line: a hard miss, whatever the other rows read | predicted: the one OOM path, see "Risks" |
