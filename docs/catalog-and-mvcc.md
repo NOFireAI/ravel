@@ -914,8 +914,11 @@ fold (the server's scheduled and on-demand fold and `ravel-cli catalog
 fold`) can write leaves for logs and spans. The leaf build is behind a
 switch that is off by default (`CatalogConfig::build_key_index_leaves`,
 `ravel-server --fold-key-index-leaves`, `ravel-cli catalog fold
---key-index-leaves`), pending the measurement ADR-2707's leaf build
-switch amendment describes. Every process that runs a fold for a tenant
+--key-index-leaves`). ADR-3692's Stage 1 amendment measured it on real
+S3 and kept it off for both signals. Logs missed the leaf-bytes row, and
+an advancing fold's passes, held previous leaf bytes and rewritten leaf
+bytes grow with the tail. The default is reconsidered once the advance
+is bounded by the new hour. Every process that runs a fold for a tenant
 (a maintain-mode process, and a query-mode process serving on-demand
 folds) should agree on the switch: a fold without it writes the re-encoded tail
 without refs; `ravel-cli catalog fold --rebuild-key-index` (under
