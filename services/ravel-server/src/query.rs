@@ -1263,10 +1263,7 @@ fn prepare_cwd_spill(
     working_dir: impl FnOnce() -> std::io::Result<PathBuf>,
     fs_kind: impl FnOnce(&std::path::Path) -> SpillFsKind,
     measure_free_bytes: impl FnOnce(&std::path::Path) -> std::io::Result<u64>,
-    acquire: impl FnOnce(
-        &std::path::Path,
-        &str,
-    ) -> std::io::Result<ravel_sql::spill::SpillRootOwner>,
+    acquire: impl FnOnce(&std::path::Path, &str) -> std::io::Result<ravel_sql::spill::SpillRootOwner>,
 ) -> SqlSpillStartup {
     let off = |source: &'static str,
                dir: &std::path::Path,
@@ -4906,13 +4903,11 @@ mod tests {
             eprintln!("{CWD_CHILD_ENV} is unset; this test runs only as a child process");
             return;
         }
-        let startup =
-            prepare_sql_spill(None, settings(false, 2 * GIB), INSTANCE).expect("startup");
-        let dir = startup
-            .resolved
-            .config
-            .as_ref()
-            .map_or_else(|| "none".to_string(), |config| config.dir.display().to_string());
+        let startup = prepare_sql_spill(None, settings(false, 2 * GIB), INSTANCE).expect("startup");
+        let dir = startup.resolved.config.as_ref().map_or_else(
+            || "none".to_string(),
+            |config| config.dir.display().to_string(),
+        );
         println!(
             "SPILL-CHILD dir={dir} source={}",
             startup.resolved.dir_source
