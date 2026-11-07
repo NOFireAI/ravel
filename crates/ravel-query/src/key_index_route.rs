@@ -659,11 +659,20 @@ async fn route_parts(
 
 /// How one slice's GET 1 ended.
 enum SliceStart {
-    Planned(Box<KeyIndexSetPlan>),
+    /// The plan, and GET 1's bytes, which carry a production reader's fetch
+    /// reservation for as long as they are alive.
+    Planned(Box<KeyIndexSetPlan>, Bytes),
     /// The reader's fetch reservation refused GET 1.
     ReadRefused,
     Rejected(KeyIndexLeafRejection),
     Breach(KeyIndexLeafBreach),
+}
+
+/// What decides a part at the first slice that does not go on to phase 3,
+/// unless an earlier slice's run decides it first.
+enum SliceStop {
+    Outcome(PartOutcome),
+    Breach(RouteError),
 }
 
 fn leaf_rejected(leaf_ref: &SnapshotKeyIndexLeafRef, rejection: &KeyIndexLeafRejection) {
@@ -709,22 +718,40 @@ fn merge_answer(answer: &mut PartAnswer, slice: KeyIndexSetAnswer) -> Result<(),
 ///
 /// 1. GET 1 of every slice, at most [`LEAF_READ_CONCURRENCY`] in flight, and
 ///    each slice's plan from it.
-/// 2. No reads: the slices in order. The first that did not plan decides the
-///    outcome (a breach fails the statement, a refused read is a refused
-///    reservation, anything else rejects), and each plan's bridged bytes are
-///    charged against the part's allowance; the first slice over what the
-///    earlier ones left declines the part over budget.
-/// 3. The bucket runs of every slice, at most [`LEAF_READ_CONCURRENCY`] in
-///    flight across the part, decoded in body order. The first slice in
-///    slice order whose run fails decides the outcome.
+/// 2. No reads: the slices in order, each plan's bridged bytes charged
+///    against the part's allowance. The stopping slice is the first that
+///    did not plan (a breach, a refused read, or a rejection) or whose
+///    bridged bytes exceed what the earlier slices left. Every breach GET 1
+///    showed is counted by [`Catalog::key_index_leaf_breach`] and logged,
+///    whichever slice stops.
+/// 3. The bucket runs of the slices before the stopping one, at most
+///    [`LEAF_READ_CONCURRENCY`] in flight across the part, decoded in body
+///    order.
+///
+/// The outcome is the one probing the slices one after another gives: the
+/// first slice in slice order whose run fails to read or decode, or whose
+/// decode reservation is refused, decides; failing that, the stopping slice
+/// does (a breach fails the statement, a refused read is a refused
+/// reservation, a rejection rejects, an exceeded allowance declines the
+/// part over budget); failing that, the part answers.
 ///
 /// The bytes read, and so the GET count, wire bytes and decompressed bytes,
 /// are those of probing the slices one after another whenever the part
-/// answers. A part decided in phase 2 has also read GET 1 of the slices
-/// after the deciding one, and those GETs are counted, but no run of any
-/// slice. A part decided in phase 3 may have read runs past the failing
-/// one. [`PartPlan::worst_gets`] still bounds the count: every slice
-/// issues GET 1 and at most its worst case of runs.
+/// answers. A part the stopping slice decides has also read GET 1 of the
+/// slices after it. A part decided in phase 3 has also read GET 1 of the
+/// slices after the failing one and may have issued up to
+/// `LEAF_READ_CONCURRENCY - 1` runs past the failing run. All of those
+/// reads are counted. [`PartPlan::worst_gets`] still bounds the count:
+/// every slice issues GET 1 and at most its worst case of runs.
+///
+/// Memory: at the end of phase 1 the part holds every slice's GET 1 bytes
+/// and plan. From phase 2 on it holds those of the slices before the
+/// stopping one, each until that slice's last run decodes (a slice with no
+/// runs, until the part's last run does); a production reader's fetch
+/// reservation for GET 1 is released with its bytes. On top of that it
+/// holds at most `LEAF_READ_CONCURRENCY` runs' bytes, in flight or waiting
+/// their turn to decode, and the decode reservations of the slices not yet
+/// finished.
 async fn probe_part(
     input: &RouteInput<'_>,
     plan: &PartPlan<'_>,
@@ -763,7 +790,7 @@ async fn probe_part(
                     }
                 };
                 match plan_key_index_leaf_set(&bytes, leaf_ref, request, keys, part_policy.b_run) {
-                    Ok(set_plan) => SliceStart::Planned(Box::new(set_plan)),
+                    Ok(set_plan) => SliceStart::Planned(Box::new(set_plan), bytes),
                     Err(KeyIndexLeafError::Breach(breach)) => SliceStart::Breach(breach),
                     Err(KeyIndexLeafError::Rejected(rejection)) => SliceStart::Rejected(rejection),
                 }
@@ -779,27 +806,43 @@ async fn probe_part(
     // across S slices cannot read S times the part's allowance.
     let mut bridged_left = part_policy.max_bridged_bytes;
     let mut set_plans: Vec<KeyIndexSetPlan> = Vec::with_capacity(starts.len());
+    // Parallel to `set_plans`: each slice's GET 1 bytes, dropped when the
+    // slice finishes.
+    let mut prefixes: Vec<Option<Bytes>> = Vec::with_capacity(starts.len());
+    let mut stop = None;
     for ((leaf_ref, _), start) in plan.slices.iter().zip(starts) {
         let leaf_ref: &SnapshotKeyIndexLeafRef = leaf_ref;
-        let gets = gets.load(Ordering::Relaxed);
         match start {
-            SliceStart::Planned(set_plan) => {
-                if set_plan.bridged_bytes() > bridged_left {
-                    return Ok((gets, PartOutcome::OverBudget));
+            SliceStart::Breach(breach) => {
+                let source = input.catalog.key_index_leaf_breach(leaf_ref, breach);
+                tracing::warn!(
+                    leaf = %leaf_ref.key,
+                    error = %source,
+                    "key-index leaf binds another tenant or signal"
+                );
+                if stop.is_none() {
+                    stop = Some(SliceStop::Breach(RouteError::Isolation {
+                        leaf_key: leaf_ref.key.clone(),
+                        source,
+                    }));
                 }
-                bridged_left -= set_plan.bridged_bytes();
-                set_plans.push(*set_plan);
             }
-            SliceStart::ReadRefused => return Ok((gets, PartOutcome::ReservationRefused)),
+            _ if stop.is_some() => {}
+            SliceStart::Planned(set_plan, prefix) => {
+                if set_plan.bridged_bytes() > bridged_left {
+                    stop = Some(SliceStop::Outcome(PartOutcome::OverBudget));
+                } else {
+                    bridged_left -= set_plan.bridged_bytes();
+                    set_plans.push(*set_plan);
+                    prefixes.push(Some(prefix));
+                }
+            }
+            SliceStart::ReadRefused => {
+                stop = Some(SliceStop::Outcome(PartOutcome::ReservationRefused));
+            }
             SliceStart::Rejected(rejection) => {
                 leaf_rejected(leaf_ref, &rejection);
-                return Ok((gets, PartOutcome::Rejected));
-            }
-            SliceStart::Breach(breach) => {
-                return Err(RouteError::Isolation {
-                    leaf_key: leaf_ref.key.clone(),
-                    source: input.catalog.key_index_leaf_breach(leaf_ref, breach),
-                });
+                stop = Some(SliceStop::Outcome(PartOutcome::Rejected));
             }
         }
     }
@@ -867,7 +910,10 @@ async fn probe_part(
                     };
                     match step {
                         Ok(()) => match slot.take_if(|d| d.is_done()) {
-                            Some(decoder) => finish(s, decoder, &mut decompressed, &mut answer),
+                            Some(decoder) => {
+                                prefixes[s] = None;
+                                finish(s, decoder, &mut decompressed, &mut answer)
+                            }
                             None => Ok(()),
                         },
                         Err(KeyIndexSetRunError::Rejected(rejection)) => {
@@ -886,9 +932,11 @@ async fn probe_part(
             }
         }
     }
-    let outcome = match failure {
-        Some(outcome) => outcome,
-        None => {
+    let outcome = match (failure, stop) {
+        (Some(outcome), _) => Ok(outcome),
+        (None, Some(SliceStop::Outcome(outcome))) => Ok(outcome),
+        (None, Some(SliceStop::Breach(breach))) => Err(breach),
+        (None, None) => {
             // Slices whose keys all fell in empty buckets have no runs.
             let mut finished = Ok(());
             for (s, slot) in decoders.iter_mut().enumerate() {
@@ -899,10 +947,10 @@ async fn probe_part(
                     }
                 }
             }
-            match finished {
+            Ok(match finished {
                 Ok(()) => PartOutcome::Answered(answer),
                 Err(outcome) => outcome,
-            }
+            })
         }
     };
     decompressed += decoders
@@ -911,7 +959,8 @@ async fn probe_part(
         .map(|d| d.decompressed_bytes())
         .sum::<u64>();
     leaf_accounting.add_decompressed_bytes(decompressed);
-    Ok((gets.load(Ordering::Relaxed), outcome))
+    drop(prefixes);
+    outcome.map(|outcome| (gets.load(Ordering::Relaxed), outcome))
 }
 
 #[cfg(test)]

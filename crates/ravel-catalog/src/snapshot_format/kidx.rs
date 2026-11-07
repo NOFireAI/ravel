@@ -6,8 +6,12 @@
 //! Encode, split, decode and probe. The fold (`fold.rs`) writes the leaves;
 //! `ravel_query::key_index_route` reads them for the logs and spans
 //! fetchers, through [`plan_key_index_leaf_set`] and
-//! [`KeyIndexSetPlan::decoder`]. The object key is the caller's to fill in
-//! on the returned [`SnapshotKeyIndexLeafRef`].
+//! [`KeyIndexSetPlan::decoder`], composing the steps itself across a part's
+//! slices. The composed set probe ([`probe_key_index_leaf_set_ranged`],
+//! [`read_key_index_set_runs`] and
+//! [`Catalog::probe_key_index_leaf_set_with`]) has no production caller;
+//! tests use it as the one-slice-at-a-time reference. The object key is the
+//! caller's to fill in on the returned [`SnapshotKeyIndexLeafRef`].
 
 use std::future::Future;
 use std::ops::Range;
@@ -1367,7 +1371,8 @@ fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u64)> {
 /// the allowance check, then [`read_key_index_set_runs`]. Before each
 /// frame is decoded, `reserve` is asked for its [`decoded_bound`]; the guard
 /// it returns is held until the probe returns, and `None` declines the leaf.
-/// A tenant or signal mismatch is the only `Err`.
+/// A tenant or signal mismatch is the only `Err`. No production path calls
+/// this; the tier-2 router composes the same steps across a part's slices.
 pub async fn probe_key_index_leaf_set_ranged<F, Fut, R, G>(
     leaf_ref: &SnapshotKeyIndexLeafRef,
     request: &KeyIndexLeafRequest<'_>,
@@ -1705,8 +1710,9 @@ pub struct KeyIndexSetRuns {
 /// Memory: at most `max_in_flight` runs' bytes are held at once, in flight
 /// or completed and waiting their turn to decode, plus one
 /// [`decoded_bound`] guard per decoded frame, held until this returns. This
-/// does not reserve the wire bytes: the query path's readers reserve each
-/// read's bytes before they issue it.
+/// does not reserve the wire bytes; `read` reserves them if anything does.
+/// No production path calls this: the tier-2 router reads and decodes its
+/// runs itself, through [`KeyIndexSetPlan::decoder`].
 pub async fn read_key_index_set_runs<F, Fut, R, G>(
     plan: &KeyIndexSetPlan,
     limits: &KeyIndexLeafLimits,
@@ -1812,7 +1818,7 @@ impl Catalog {
 
     /// [`probe_key_index_leaf_set_ranged`] with
     /// [`probe_key_index_leaf_with`](Self::probe_key_index_leaf_with)'s
-    /// breach handling.
+    /// breach handling. No production path calls this.
     #[allow(clippy::too_many_arguments)]
     pub async fn probe_key_index_leaf_set_with<F, Fut, R, G>(
         &self,
