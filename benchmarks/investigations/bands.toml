@@ -1151,6 +1151,18 @@ metric = "matrix.wrong_answers"
 lane = "counter"
 target_if = "v == 0"
 
+# Calls that ended in an error (a typed refusal such as HTTP 422, or any
+# other non-ok outcome evaluate.py does not class). Each is also a problem,
+# so the verdict fails on it either way; counting it apart keeps a refusal
+# from reading as a row that disagreed with the oracle.
+[[row.figure]]
+name = "errors"
+statement = "all"
+state = "all"
+metric = "matrix.errors"
+lane = "counter"
+target_if = "v == 0"
+
 [[row.figure]]
 name = "mixed_rows_exact"
 statement = "all"
