@@ -1177,6 +1177,7 @@ fn prepare_sql_spill_with(
             working_dir,
             fs_kind,
             measure_free_bytes,
+            SpillRootOwner::acquire,
         ));
     }
 
@@ -1251,6 +1252,10 @@ fn prepare_sql_spill_with(
 /// measured or this process's root cannot be locked (`cwd-unavailable`), and
 /// when half the free space is below the derived ceiling's 1 GiB floor
 /// (`cwd-insufficient-space`).
+///
+/// `<cwd>/sql-spill` is created only once spill resolves on, and whatever
+/// this call created there is removed again when `acquire` then fails, so a
+/// default that resolves off leaves the working directory as it found it.
 #[cfg(feature = "sql")]
 fn prepare_cwd_spill(
     settings: crate::config::SqlSpillSettings,
@@ -1258,6 +1263,10 @@ fn prepare_cwd_spill(
     working_dir: impl FnOnce() -> std::io::Result<PathBuf>,
     fs_kind: impl FnOnce(&std::path::Path) -> SpillFsKind,
     measure_free_bytes: impl FnOnce(&std::path::Path) -> std::io::Result<u64>,
+    acquire: impl FnOnce(
+        &std::path::Path,
+        &str,
+    ) -> std::io::Result<ravel_sql::spill::SpillRootOwner>,
 ) -> SqlSpillStartup {
     let off = |source: &'static str,
                dir: &std::path::Path,
@@ -1267,9 +1276,11 @@ fn prepare_cwd_spill(
             source,
             dir = %dir.display(),
             reason,
-            "SQL spill is off: the working-directory default cannot be used; set \
-             --cache-dir or the RAVEL_SQL_SPILL_DIR/RAVEL_SQL_SPILL_MAX_BYTES pair to \
-             spill elsewhere, or --sql-spill off to silence this"
+            "SQL spill is off: the working-directory default cannot be used; to \
+             configure spill explicitly, point --cache-dir or the \
+             RAVEL_SQL_SPILL_DIR/RAVEL_SQL_SPILL_MAX_BYTES pair at a writable volume \
+             that is not memory-backed, or pass --sql-spill off to run without spill \
+             and silence this"
         );
         let resolved = ResolvedSqlSpill {
             config: None,
@@ -1307,15 +1318,11 @@ fn prepare_cwd_spill(
     }
     let left_in_place = sweep_spill_roots(&cwd);
     let spill_root = cwd.join(ravel_sql::SQL_SPILL_SUBDIR);
-    if let Err(err) = std::fs::create_dir_all(&spill_root) {
-        return off(
-            SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
-            &spill_root,
-            &format!("could not create the SQL spill root: {err}"),
-            left_in_place,
-        );
-    }
-    let free_bytes = match measure_free_bytes(&spill_root) {
+    let root_existed = spill_root.is_dir();
+    // An existing `<cwd>/sql-spill` may be a mount of its own, so measure it;
+    // otherwise the root would be created on the working directory's volume.
+    let measured = if root_existed { &spill_root } else { &cwd };
+    let free_bytes = match measure_free_bytes(measured) {
         Ok(free_bytes) => free_bytes,
         Err(err) => {
             return off(
@@ -1357,9 +1364,26 @@ fn prepare_cwd_spill(
             left_in_place,
         };
     };
-    let owner = match ravel_sql::spill::SpillRootOwner::acquire(&cwd, instance_id) {
+    let instance_existed = config.dir.exists();
+    if let Err(err) = std::fs::create_dir_all(&spill_root) {
+        return off(
+            SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
+            &spill_root,
+            &format!("could not create the SQL spill root: {err}"),
+            left_in_place,
+        );
+    }
+    let owner = match acquire(&cwd, instance_id) {
         Ok(owner) => owner,
         Err(err) => {
+            // Best effort: spill is off either way, and `remove_dir` leaves
+            // a root another process has started using in the meantime.
+            if !instance_existed {
+                let _ = std::fs::remove_dir_all(&config.dir);
+            }
+            if !root_existed {
+                let _ = std::fs::remove_dir(&spill_root);
+            }
             return off(
                 SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
                 &config.dir,
@@ -4824,13 +4848,86 @@ mod tests {
         );
     }
 
+    /// Set on the child [`prepare_sql_spill_reads_the_process_working_directory`]
+    /// starts; without it the child test does nothing.
+    const CWD_CHILD_ENV: &str = "RAVEL_TEST_SQL_SPILL_CWD_CHILD";
+
+    /// `prepare_sql_spill` itself, not the `_with` form, resolves the default
+    /// under the process working directory: the probes it passes are the real
+    /// ones. Changing this process's working directory would race the other
+    /// tests, so the test binary re-runs itself with the working directory set
+    /// to a temporary directory under the binary's own (disk-backed) target
+    /// directory, and that child reports what it resolved.
+    #[test]
+    fn prepare_sql_spill_reads_the_process_working_directory() {
+        assert_spill_env_unset();
+        let exe = std::env::current_exe().expect("test binary");
+        let parent = exe.parent().expect("test binary directory");
+        let cwd = tempfile::tempdir_in(parent).expect("working dir");
+        let cwd_path = cwd.path().canonicalize().expect("canonical working dir");
+        let output = std::process::Command::new(&exe)
+            .args([
+                "query::tests::prepare_sql_spill_cwd_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(&cwd_path)
+            .env(CWD_CHILD_ENV, "1")
+            .env_remove(ravel_sql::ENV_SPILL_DIR)
+            .env_remove(ravel_sql::ENV_SPILL_MAX_BYTES)
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("SPILL-CHILD "))
+            .unwrap_or_else(|| panic!("the child reported nothing: {stdout}"));
+        assert_eq!(
+            report,
+            format!(
+                "dir={} source={SQL_SPILL_SOURCE_CWD_DEFAULT}",
+                cwd_path.join("sql-spill").join(INSTANCE).display()
+            )
+        );
+    }
+
+    /// The child half of [`prepare_sql_spill_reads_the_process_working_directory`].
+    #[test]
+    #[ignore = "run only as the child of prepare_sql_spill_reads_the_process_working_directory"]
+    fn prepare_sql_spill_cwd_child() {
+        if std::env::var_os(CWD_CHILD_ENV).is_none() {
+            eprintln!("{CWD_CHILD_ENV} is unset; this test runs only as a child process");
+            return;
+        }
+        let startup =
+            prepare_sql_spill(None, settings(false, 2 * GIB), INSTANCE).expect("startup");
+        let dir = startup
+            .resolved
+            .config
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |config| config.dir.display().to_string());
+        println!(
+            "SPILL-CHILD dir={dir} source={}",
+            startup.resolved.dir_source
+        );
+    }
+
     /// The working-directory default resolves off with
     /// `source="cwd-unavailable"`, never an error, when the working directory
     /// cannot be read, when `<cwd>/sql-spill` cannot be created (the working
     /// directory is a file, or a directory without write permission), when
     /// its free space cannot be measured, and when another holder has this
     /// process's root locked; and with `source="cwd-insufficient-space"` when
-    /// half the free space is below 1 GiB.
+    /// half the free space is below 1 GiB. None of those leaves a
+    /// `<cwd>/sql-spill` behind that was not there before, including a lock
+    /// failure after the root was created.
     #[test]
     fn an_unusable_working_directory_resolves_spill_off() {
         assert_spill_env_unset();
@@ -4887,6 +4984,30 @@ mod tests {
                 |_| Err(std::io::Error::other("statvfs failed")),
             ),
         );
+        assert!(
+            !cwd.path().join("sql-spill").exists(),
+            "unmeasurable: nothing is created"
+        );
+
+        let fresh = tempfile::tempdir().expect("working dir");
+        check(
+            "lock failed after creating the root",
+            Ok(prepare_cwd_spill(
+                settings(false, 2 * GIB),
+                INSTANCE,
+                || Ok(fresh.path().to_path_buf()),
+                |_| SpillFsKind::Other,
+                |_| Ok(100 * GIB),
+                |cwd, instance_id| {
+                    std::fs::create_dir(ravel_sql::cache_spill_dir(cwd, instance_id))?;
+                    Err(std::io::Error::other("lock held"))
+                },
+            )),
+        );
+        assert!(
+            !fresh.path().join("sql-spill").exists(),
+            "a failed lock removes the root this call created"
+        );
 
         let held = ravel_sql::spill::SpillRootOwner::acquire(cwd.path(), INSTANCE)
             .expect("another holder");
@@ -4898,6 +5019,10 @@ mod tests {
                 SpillFsKind::Other,
                 100 * GIB,
             ),
+        );
+        assert!(
+            held.dir().is_dir(),
+            "locked: the holder's root is left in place"
         );
         drop(held);
 
@@ -4948,6 +5073,10 @@ mod tests {
         );
         assert!(startup.owner.is_none());
         assert_eq!(executor_spill(&startup.inputs), None);
+        assert!(
+            !small.path().join("sql-spill").exists(),
+            "insufficient space: nothing is created"
+        );
         let warns = capture.1.lock().clone();
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
