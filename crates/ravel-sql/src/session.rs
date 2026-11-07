@@ -114,8 +114,8 @@
 //! and `Enabled` names one directory and one byte ceiling. See
 //! [`disk_manager_builder`]. Through `SqlExecutor::execute` a statement's
 //! first attempt always gets `Disabled`; `Enabled` is for its spill retry
-//! after a memory refusal (issue #3899), and for the Flight SQL lanes, which
-//! still decide spill at plan time.
+//! after a memory refusal (issue #3899), and for the pinned entry points
+//! (Flight SQL's among them), which still decide spill at plan time.
 //!
 //! A `SpillDecision::Enabled` query is also repartition-free: [`session_config`]
 //! forces `repartition_aggregations` off for it, whatever the ADR-0094
@@ -552,7 +552,8 @@ impl ObjectStoreRegistry for EmptyObjectStoreRegistry {
 /// has the plan. On the execute path it also needs a first attempt that was
 /// refused for memory: the first attempt is planned as if no `SpillConfig`
 /// were set and always runs `Disabled`, and only its spill retry may run
-/// `Enabled` (issue #3899). The Flight SQL lanes decide at plan time.
+/// `Enabled` (issue #3899). The pinned entry points, Flight SQL's among
+/// them, decide at plan time.
 #[derive(Debug, Clone, Copy)]
 pub enum SpillDecision<'a> {
     /// No spill. Identical to the pre-ADR-0954 behavior in every respect: an
@@ -693,9 +694,11 @@ pub fn session_config(
 ///
 /// The cost is parallelism, paid only by an attempt that may spill: on the
 /// execute path that is the spill retry of a statement whose first attempt,
-/// repartitioned as usual, was refused for memory. It is bounded: `RsegScanExec` still scans its objects in parallel, and the
-/// grouped aggregate that spill exists for still spills. What is given up is
-/// the fan-out ABOVE the merged, deduplicated stream.
+/// repartitioned as usual, was refused for memory; on the pinned entry points
+/// it is any spill-enabled plan. It is bounded: `RsegScanExec` still scans its
+/// objects in parallel, and the grouped aggregate that spill exists for still
+/// spills. What is given up is the fan-out ABOVE the merged, deduplicated
+/// stream.
 fn repartition_free(spill: SpillDecision<'_>) -> bool {
     match spill {
         SpillDecision::Enabled { .. } => true,
