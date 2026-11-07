@@ -291,12 +291,42 @@ struct Setup {
 
 struct Fixture {
     recorder: Arc<RecordingStore>,
+    flags: &'static [&'static str],
     app: Router,
     /// The sealed objects' data keys, by `seq`.
     sealed: Vec<String>,
     recent: Option<String>,
     start_s: i64,
     end_s: i64,
+}
+
+/// The PromQL router a server with `flags` and `config` builds over `store`,
+/// with a catalog and caches of its own.
+fn app_over(
+    store: Arc<dyn ObjectStoreBackend>,
+    flags: &[&str],
+    config: ravel_query::EngineConfig,
+) -> Router {
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
+    let app_state = build_app_state(
+        catalog_from_flags(Arc::clone(&store), flags),
+        store,
+        Arc::new(StaticBearerTokenResolver::new(tokens)),
+        None,
+        config,
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+        Arc::new(QueryAccountingMetrics::new(HashSet::new())),
+        ravel_query::QueryAdmissionController::shared(
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+        ),
+        None,
+        None,
+        None,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        ravel_server::cpu_gates::CpuGates::new(Default::default()).read,
+    );
+    promql_router(app_state)
 }
 
 async fn serve(setup: Setup) -> Fixture {
@@ -376,29 +406,12 @@ async fn serve(setup: Setup) -> Fixture {
         put_erasure_request(store.as_ref(), &tenant, now).await;
     }
 
-    let mut tokens = HashMap::new();
-    tokens.insert(TOKEN.to_string(), tenant);
-    let app_state = build_app_state(
-        catalog_from_flags(Arc::clone(&store), flags),
-        Arc::clone(&store),
-        Arc::new(StaticBearerTokenResolver::new(tokens)),
-        None,
-        ravel_query::EngineConfig::default(),
-        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
-        Arc::new(QueryAccountingMetrics::new(HashSet::new())),
-        ravel_query::QueryAdmissionController::shared(
-            ravel_query::QueryConcurrencyLimit::Unlimited,
-        ),
-        None,
-        None,
-        None,
-        Arc::new(ravel_memory::MemoryBudget::unlimited()),
-        ravel_server::cpu_gates::CpuGates::new(Default::default()).read,
-    );
+    let app = app_over(store, flags, ravel_query::EngineConfig::default());
     recorder.clear();
     Fixture {
         recorder,
-        app: promql_router(app_state),
+        flags,
+        app,
         sealed,
         recent,
         start_s: hour_start / NS_PER_SEC,
@@ -406,27 +419,60 @@ async fn serve(setup: Setup) -> Fixture {
     }
 }
 
+/// Sends a GET for `uri` to `app`: the status and the JSON body.
+async fn get(app: &Router, uri: String) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .expect("build request");
+    let response = app.clone().oneshot(request).await.expect("oneshot");
+    let code = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let value: Value = serde_json::from_slice(&bytes).expect("body is JSON");
+    (code, value)
+}
+
 impl Fixture {
-    async fn query_range(&self, query: &str) -> Value {
-        let uri = format!(
+    fn range_uri(&self, query: &str) -> String {
+        format!(
             "/api/v1/query_range?query={}&start={}&end={}&step=60",
             urlencode(query),
             self.start_s,
             self.end_s
-        );
-        let request = Request::builder()
-            .method("GET")
-            .uri(uri)
-            .header("authorization", format!("Bearer {TOKEN}"))
-            .body(Body::empty())
-            .expect("build request");
-        let response = self.app.clone().oneshot(request).await.expect("oneshot");
-        let code = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let value: Value = serde_json::from_slice(&bytes).expect("body is JSON");
+        )
+    }
+
+    async fn query_range(&self, query: &str) -> Value {
+        let (code, value) = get(&self.app, self.range_uri(query)).await;
         assert_eq!(code, StatusCode::OK, "query_range failed: {value}");
+        value
+    }
+
+    /// The range query over this fixture's store, served by a fresh server
+    /// built with `config`.
+    async fn query_range_under(
+        &self,
+        query: &str,
+        config: ravel_query::EngineConfig,
+    ) -> (StatusCode, Value) {
+        let store: Arc<dyn ObjectStoreBackend> = self.recorder.clone();
+        let app = app_over(store, self.flags, config);
+        get(&app, self.range_uri(query)).await
+    }
+
+    /// An instant query at the fixture's end time.
+    async fn query(&self, query: &str) -> Value {
+        let uri = format!(
+            "/api/v1/query?query={}&time={}",
+            urlencode(query),
+            self.end_s
+        );
+        let (code, value) = get(&self.app, uri).await;
+        assert_eq!(code, StatusCode::OK, "query failed: {value}");
         value
     }
 
@@ -509,6 +555,50 @@ fn matrix(value: &Value) -> Matrix {
         .collect();
     series.sort();
     series
+}
+
+type Vector = Vec<(BTreeMap<String, String>, (u64, u64))>;
+
+/// The vector result, each sample as the bit patterns of its timestamp and
+/// value, series sorted by labels.
+fn vector(value: &Value) -> Vector {
+    assert_eq!(value["data"]["resultType"], "vector", "{value}");
+    let mut series: Vector = value["data"]["result"]
+        .as_array()
+        .expect("result array")
+        .iter()
+        .map(|s| {
+            let labels = s["metric"]
+                .as_object()
+                .expect("metric object")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().expect("label value").to_string()))
+                .collect();
+            let ts = s["value"][0].as_f64().expect("timestamp");
+            let v: f64 = s["value"][1]
+                .as_str()
+                .expect("value string")
+                .parse()
+                .expect("f64");
+            (labels, (ts.to_bits(), v.to_bits()))
+        })
+        .collect();
+    series.sort();
+    series
+}
+
+/// The query's pooled store requests and bytes, every operation kind.
+fn store_totals(value: &Value) -> (u64, u64) {
+    let accounting = &value["data"]["stats"]["accounting"];
+    let field = |name: &str| {
+        accounting[name]
+            .as_u64()
+            .unwrap_or_else(|| panic!("accounting.{name} is a u64 in {value}"))
+    };
+    (
+        field("s3GetRequests") + field("s3ListRequests") + field("s3HeadRequests"),
+        field("s3GetBytes") + field("s3ListBytes") + field("s3HeadBytes"),
+    )
 }
 
 /// The metrics rows of `ravel_query_key_index_parts_total`, by outcome, and
@@ -613,20 +703,20 @@ async fn promql_query_range_prunes_non_holders_by_label_index() {
 }
 
 /// Over a tenant folded without `--fold-metrics-label-index` no part has a
-/// metrics leaf: nothing is pruned, the keyIndex phase reports zero, and no
-/// metrics leaf GET is counted.
+/// metrics leaf, so the route does not run: nothing is pruned, the keyIndex
+/// phase reports zero, and no metrics row of
+/// `ravel_query_key_index_parts_total` or the leaf GET total moves.
 #[tokio::test]
-async fn without_the_switch_nothing_is_pruned_and_the_key_index_phase_is_zero() {
+async fn without_the_switch_the_route_does_not_run() {
     let _serial = SERIAL.lock().await;
     let off = serve(Setup::default()).await;
-    let (_, leaf_gets_before) = metrics_route_totals();
+    let before = metrics_route_totals();
     let value = off
         .query_range(&format!("{METRIC}{{instance=\"{TARGET}\"}}"))
         .await;
-    let (_, leaf_gets_after) = metrics_route_totals();
+    assert_eq!(metrics_route_totals(), before);
     assert_eq!(stat(&value, "segmentsPrunedByLabelIndex"), 0);
     assert_eq!(key_index_figures(&value), [0, 0, 0]);
-    assert_eq!(leaf_gets_after, leaf_gets_before);
     assert_eq!(matrix(&value).len(), HOLDERS.len());
     assert!(off.sealed_gets().iter().all(|gets| *gets >= 1));
 }
@@ -766,4 +856,88 @@ async fn the_metrics_rows_of_key_index_parts_total_move() {
         leaf_gets_after - leaf_gets_before,
         phase(&value, "keyIndex", "s3GetRequests")
     );
+}
+
+/// An instant query routes as a range query does: the non-holders are
+/// pruned and never opened, and the answer equals the run over a tenant
+/// folded without the metrics leaf.
+#[tokio::test]
+async fn an_instant_query_prunes_non_holders_and_equals_the_unrouted_run() {
+    let _serial = SERIAL.lock().await;
+    let query = format!("count_over_time({METRIC}{{instance=\"{TARGET}\"}}[4h])");
+    let off = serve(Setup::default()).await;
+    let unrouted = off.query(&query).await;
+    let on = serve(Setup {
+        label_index: true,
+        ..Setup::default()
+    })
+    .await;
+    let routed = on.query(&query).await;
+    let non_holders = OBJECTS - HOLDERS.len() as u64;
+    assert_eq!(stat(&routed, "segmentsPrunedByLabelIndex"), non_holders);
+    assert_eq!(stat(&unrouted, "segmentsPrunedByLabelIndex"), 0);
+    let on_gets = on.sealed_gets();
+    for seq in 0..OBJECTS {
+        assert_eq!(
+            on_gets[seq as usize] >= 1,
+            HOLDERS.contains(&seq),
+            "object {seq} is read exactly when it holds the value"
+        );
+    }
+    let result = vector(&routed);
+    assert_eq!(result.len(), HOLDERS.len());
+    assert_eq!(result, vector(&unrouted), "routing changes no answer");
+}
+
+/// The route's leaf GETs count against `max_s3_requests` and
+/// `max_bytes_scanned` even when they prune every object, so no fetch batch
+/// runs: a budget one short of the query's spend refuses with the budget
+/// error, and a budget equal to it answers.
+#[tokio::test]
+async fn a_route_that_prunes_every_object_is_held_to_the_budgets() {
+    let _serial = SERIAL.lock().await;
+    let on = serve(Setup {
+        label_index: true,
+        ..Setup::default()
+    })
+    .await;
+    let query = format!("{METRIC}{{instance=\"absent\"}}");
+    let unbounded = on.query_range(&query).await;
+    assert_eq!(stat(&unbounded, "segmentsPrunedByLabelIndex"), OBJECTS);
+    assert_eq!(stat(&unbounded, "segmentsFetched"), 0);
+    assert!(on.sealed_gets().iter().all(|gets| *gets == 0));
+    let [leaf_gets, leaf_wire, _] = key_index_figures(&unbounded);
+    assert!(leaf_gets >= 1 && leaf_wire >= 1);
+    let (requests, bytes) = store_totals(&unbounded);
+
+    let refused = |(code, value): (StatusCode, Value), expected: String| {
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+        let message = value["error"].as_str().expect("error message");
+        assert!(message.contains(&expected), "{message}");
+    };
+    let under = |requests: u64, bytes: u64| ravel_query::EngineConfig {
+        max_s3_requests: ravel_query::RequestLimit::Bounded(requests),
+        max_bytes_scanned: ravel_query::ByteLimit::Bounded(bytes),
+        ..ravel_query::EngineConfig::default()
+    };
+    refused(
+        on.query_range_under(&query, under(requests - 1, bytes))
+            .await,
+        format!(
+            "query issued {requests} S3 requests, exceeding the budget of {}",
+            requests - 1
+        ),
+    );
+    refused(
+        on.query_range_under(&query, under(requests, bytes - 1))
+            .await,
+        format!(
+            "query scanned {bytes} bytes, exceeding the budget of {}",
+            bytes - 1
+        ),
+    );
+    let (code, value) = on.query_range_under(&query, under(requests, bytes)).await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    assert_eq!(store_totals(&value), (requests, bytes));
+    assert!(matrix(&value).is_empty());
 }
