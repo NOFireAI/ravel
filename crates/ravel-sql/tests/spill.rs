@@ -1364,6 +1364,8 @@ struct TopTen {
     first_refusal: Option<&'static str>,
     /// The spill retry's bytes written, when a spill retry answered.
     spill_retry_bytes_written: Option<u64>,
+    /// The spill-budget share the retry reserved, when a spill retry answered.
+    spill_retry_share_bytes: Option<u64>,
     peak_pool_bytes: u64,
 }
 
@@ -1428,6 +1430,7 @@ async fn run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> TopTen {
         spill_retries: outcome.stats.spill_retries,
         first_refusal: outcome.stats.spill_retry.map(|r| r.first_refusal),
         spill_retry_bytes_written: outcome.stats.spill_retry.map(|r| r.spill_bytes_written),
+        spill_retry_share_bytes: outcome.stats.spill_retry.and_then(|r| r.share_bytes),
         peak_pool_bytes: outcome.accounting.peak_intermediate_bytes,
     }
 }
@@ -1874,4 +1877,200 @@ async fn a_refused_ineligible_statement_is_not_retried() {
         "a retry shows in the store's requests: {retried_ops} against \
          {eligible_spill_off_ops} with spill off"
     );
+}
+
+/// The eligible q33 top ten the spill-share tests below refuse at half its
+/// unlimited peak; it answers there on its retry (see `spilled_and_in_memory`).
+const SHARE_SQL: &str =
+    "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10";
+
+/// A `tracing` writer that appends every emitted byte to a shared buffer.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log buffer lock")).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer lock")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// ADR-0954 refusal-retry amendment item 4: a statement whose first attempt
+/// is refused reserves its spill share before the retry, and with less than
+/// the minimum left it does not retry. With the whole spill ceiling held by a
+/// pinned plan, the eligible statement fails with exactly the error its
+/// spill-off run fails with, makes exactly the spill-off run's store
+/// requests (one attempt: a retry re-resolves), and logs one WARN naming the
+/// reason.
+///
+/// Prove-the-test: restore the old warn-and-continue path (no share reserved
+/// in `run`, and a retry whose `reserve_share` returns `None` plans without
+/// spill) and the statement runs a second attempt, failing the request count.
+#[tokio::test]
+async fn a_refused_statement_with_no_spill_share_left_returns_its_first_refusal() {
+    let log = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+
+    let file = q33_parquet();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes, spill: bool| {
+        let mut config = spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            query_bytes,
+        );
+        if !spill {
+            config.spill = None;
+        }
+        config
+    };
+    let unlimited = run_top_ten(
+        &*q33_executor(config(AMPLE_QUERY_BYTES, true), &file).await,
+        SHARE_SQL,
+    )
+    .await;
+    let budget = usize::try_from(unlimited.peak_pool_bytes / 2).expect("fits");
+    let counted_executor = async |spill| {
+        let store = util::CountingStore::new(Arc::new(MemoryStore::new()));
+        let executor = q33_executor_with_store(
+            config(budget, spill),
+            &file,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            Arc::clone(&store) as Arc<dyn ravel_object_store::ObjectStoreBackend>,
+        )
+        .await;
+        (executor, store)
+    };
+
+    let (spill_off, spill_off_store) = counted_executor(false).await;
+    let before = spill_off_store.total_ops();
+    let spill_off_err = spill_off
+        .execute(q33_tenant(), &request(SHARE_SQL))
+        .await
+        .expect_err("with spill off the statement does not fit half its peak");
+    let spill_off_ops = spill_off_store.total_ops() - before;
+
+    let (executor, store) = counted_executor(true).await;
+    // The plan-time path reserves the configured scratch quota, which is the
+    // whole process ceiling, and holds it while the pinned plan lives.
+    let accounting = QueryAccounting::new();
+    let (snapshot, _) = executor
+        .resolve_snapshot(q33_tenant(), &request(SHARE_SQL), &accounting)
+        .await
+        .expect("snapshot resolves");
+    let holder = executor
+        .plan_pinned(q33_tenant(), snapshot, SHARE_SQL, &accounting, &[])
+        .await
+        .expect("the holding statement plans");
+    assert_eq!(
+        spill_subdirs(scratch.path()).len(),
+        1,
+        "the pinned plan holds the spill ceiling"
+    );
+
+    let before = store.total_ops();
+    let err = executor
+        .execute(q33_tenant(), &request(SHARE_SQL))
+        .await
+        .expect_err("with no spill share left the refusal is the statement's");
+    let ops = store.total_ops() - before;
+    assert!(
+        matches!(err, SqlError::ResourcesExhausted(_)),
+        "a memory refusal; got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        spill_off_err.to_string(),
+        "the first attempt's refusal, unchanged"
+    );
+    assert_eq!(
+        ops, spill_off_ops,
+        "exactly one attempt: the store saw exactly the spill-off run's requests"
+    );
+    let text = log.text();
+    let warns: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("SQL spill retry skipped"))
+        .collect();
+    assert_eq!(warns.len(), 1, "one WARN line; captured:\n{text}");
+    assert!(
+        warns[0].contains("WARN")
+            && warns[0].contains(
+                "no spill share of at least the minimum remains of the process spill ceiling"
+            )
+            && warns[0].contains("outcome=\"skipped\""),
+        "the WARN names the reason; got {:?}",
+        warns[0]
+    );
+    assert_eq!(
+        spill_subdirs(scratch.path()).len(),
+        1,
+        "the refused statement created no scratch of its own"
+    );
+    drop(holder);
+}
+
+/// ADR-0954 refusal-retry amendment item 4: an explicit spill ceiling under
+/// 64 MiB keeps its single share equal to the whole ceiling, so a refused
+/// eligible statement takes its retry with a 32 MiB share, spills, and
+/// returns the unlimited run's rows.
+///
+/// Prove-the-test: apply a fixed 64 MiB floor in `SpillBudget::reserve_share`
+/// and no share is granted, so the statement fails with its first refusal.
+#[tokio::test]
+async fn a_ceiling_under_the_minimum_share_is_one_share_and_the_retry_spills() {
+    const CEILING: u64 = 32 * 1024 * 1024;
+    let file = q33_parquet();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes| spill_config(scratch.path().to_path_buf(), CEILING, query_bytes);
+    let unlimited = run_top_ten(
+        &*q33_executor(config(AMPLE_QUERY_BYTES), &file).await,
+        SHARE_SQL,
+    )
+    .await;
+    assert_eq!(unlimited.spill_retries, 0);
+    let budget = usize::try_from(unlimited.peak_pool_bytes / 2).expect("fits");
+    let spilled = run_top_ten(&*q33_executor(config(budget), &file).await, SHARE_SQL).await;
+    assert_eq!(
+        spilled.spill_retries, 1,
+        "the statement answers on its retry"
+    );
+    assert_eq!(
+        spilled.spill_retry_share_bytes,
+        Some(CEILING),
+        "one share of the whole 32 MiB ceiling"
+    );
+    assert!(
+        spilled.spill_files > 0 && spilled.spill_retry_bytes_written.is_some_and(|b| b > 0),
+        "the retry spilled: files={} bytes_written={:?}",
+        spilled.spill_files,
+        spilled.spill_retry_bytes_written
+    );
+    assert_eq!(spilled.rows, unlimited.rows, "row for row");
 }
