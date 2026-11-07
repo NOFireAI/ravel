@@ -56,6 +56,7 @@ STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_le
 SMOKE_STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
                 "erasure_in_flight", "many_parts_24")
 UNSUPPORTED = "unsupported-on-this-build"
+NOT_COMPUTABLE = "not-computable"
 GUARD = "refused-by-guard"
 REFUSAL_1000 = ("server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of "
                 "1000 tokens; simplify the statement")
@@ -1152,8 +1153,8 @@ class LocalSmoke(Workdir):
                 self.assertTrue(f["reason"], f["id"])
                 continue
             if f["state"] in covered:
-                self.assertIn(f["status"], ("value", UNSUPPORTED, GUARD, "dead_counter"), f["id"])
-            if f["status"] in (UNSUPPORTED, GUARD):
+                self.assertIn(f["status"], ("value", UNSUPPORTED, GUARD, NOT_COMPUTABLE, "dead_counter"), f["id"])
+            if f["status"] in (UNSUPPORTED, GUARD, NOT_COMPUTABLE):
                 self.assertTrue(f["reason"], f["id"])
 
     def test_states_section(self):
@@ -1184,7 +1185,7 @@ class LocalSmoke(Workdir):
         self.assertEqual(figure(res, "row_11.spans_1000_rows_exact")["reason"], REFUSAL_1000)
         # Item 8: the guard's refusals are counted apart from unsupported figures.
         self.assertEqual(res["refusal_classes"], {GUARD: {"figures": 15, "calls": 24},
-                                                  UNSUPPORTED: {"figures": 31, "calls": 0}})
+                                                  UNSUPPORTED: {"figures": 29, "calls": 0}})
         guarded = sorted(f["id"] for f in res["figures"] if f["status"] == GUARD)
         self.assertEqual(len(guarded), 15)
         self.assertTrue(all(i.startswith("row_11.") for i in guarded), guarded)
@@ -1210,7 +1211,7 @@ class LocalSmoke(Workdir):
             "['many_parts_744']); row 10 (run.toml "
             "states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml "
             "hits = false, baseline = false); row 18 (run.toml states lacks ['advanced_leaves'])",
-            "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 31 figure(s), "
+            "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29 figure(s), "
             "0 call(s)",
         ])
 
@@ -1708,7 +1709,7 @@ class Evaluate(Workdir):
                "states": ["unfolded"]}
         out = []
         for gets, want in ((2, "miss"), (3, "pass"), (796, "pass"), (797, "miss")):
-            def fixed(calls, cfg, statement, state, metric, candidates=None, gets=gets):
+            def fixed(calls, cfg, statement, state, metric, candidates=None, over_512k=None, gets=gets):
                 return ("value", gets, "") if metric == "cold.max.keyindex_gets" else ("missing", None, "not set")
             mod.statement_figure = fixed
             figs = mod.run_rows(bands, cfg, {"unfolded": None}, None, None, {}, census, None, {}, {})
@@ -1745,24 +1746,50 @@ class Evaluate(Workdir):
         """Row 6's objects past the probe are the plan phase's segmentsOpened less
         segmentsPrunedByKeyIndex: 493 - 492 = 1 on box C's call, the band's holders, so a pass. Neither the
         scan phase's segmentsOpened (4) nor the sum over the phases (497) is that figure, and a build whose
-        stats carry no segmentsPrunedByKeyIndex reads unsupported-on-this-build."""
+        stats carry no segmentsPrunedByKeyIndex reads unsupported-on-this-build.
+
+        The figure is judged only when the plan opened exactly the objects the probe saw: plan segmentsOpened
+        equal to the census's objects above 512 KiB less pruning.segmentsPrunedByStats, 519 - 26 = 493 on box
+        C. The same stats with the plan opening 497 read incomplete, with no value and an incomplete line, not
+        a hold or a miss; with the precondition holding, a probe that let 2 objects through misses."""
         mod = load_module(evaluate_py, "evaluate_row6_past_probe")
         with open(bands, "rb") as f:
             rows = {"row": [r for r in tomllib.load(f)["row"] if r["key"] == "row_06"]}
         c = self.box_c_q20_call()
         problems = mod.Problems()
-        calls = mod.Calls([c], problems, {"q20_hits": {"id": "q20_hits", "tenant": "hits"}})
+        statements = {"q20_hits": {"id": "q20_hits", "tenant": "hits", "table": "logs"}}
+        calls = mod.Calls([c], problems, statements)
         c["_judged"] = "reference"
         census = {("unfolded",): {"state": "unfolded", "census": {"tenants": {
             "hits": {"data": {"logs": {"objects": 523, "objects_over_512k": 519}}}}}}}
         cfg = {"lane": "local", "hits": True, "tenant": "inv", "scales": [1], "baseline": False,
                "states": ["unfolded"], "cold_runs": 1, "warm_runs": 0}
-        figs = {f["id"]: f for f in mod.run_rows(rows, cfg, {"unfolded": None}, calls, None, {}, census, None,
-                                                   {}, {})}
+
+        def rows_now():
+            return {f["id"]: f for f in mod.run_rows(rows, cfg, {"unfolded": None}, calls, None, {}, census, None,
+                                                     {}, {}, None,
+                                                     lambda x: mod.census_over_512k(census, statements, cfg, x))}
+        figs = rows_now()
         out = [] if not problems.lines else [f"problems {problems.lines}"]
         got = figs["row_06.objects_past_probe"]
         if (got["value"], got["verdict"]) != (1, "pass"):
-            out.append(f"objects_past_probe {got['value']} {got['verdict']}")
+            out.append(f"objects_past_probe {got['value']} {got['verdict']} {got['reason']}")
+        plan = next(p for p in c["stats"]["phases"] if p["phase"] == "plan")
+        plan["segmentsOpened"] = 497
+        got = rows_now()["row_06.objects_past_probe"]
+        if (got["status"], got["value"], got["verdict"]) != ("incomplete", None, "incomplete") or not all(
+                s in got["reason"] for s in ("plan segmentsOpened 497", "objects_over_512k 519",
+                                             "segmentsPrunedByStats 26")):
+            out.append(f"plan opening 497: {got['status']} {got['value']} {got['verdict']} {got['reason']}")
+        lines = mod.incomplete_reasons({"states": []}, {}, calls, [got])
+        if lines != [f"figure row_06.objects_past_probe incomplete: {got['reason']}"]:
+            out.append(f"plan opening 497 incomplete lines {lines}")
+        plan["segmentsOpened"] = 493
+        c["stats"]["pruning"]["segmentsPrunedByKeyIndex"] = 491
+        got = rows_now()["row_06.objects_past_probe"]
+        if (got["value"], got["verdict"]) != (2, "miss"):
+            out.append(f"2 past the probe: {got['value']} {got['verdict']} {got['reason']}")
+        c["stats"]["pruning"]["segmentsPrunedByKeyIndex"] = 492
         for name, value in (("gets_beyond_probe", 6), ("scan_wire_bytes", 989_537)):
             if (figs[f"row_06.{name}"]["value"], figs[f"row_06.{name}"]["verdict"]) != (value, "pass"):
                 out.append(f"{name} {figs[f'row_06.{name}']}")
@@ -2099,31 +2126,104 @@ class Evaluate(Workdir):
     def test_row_7_extra_leaf_gets(self):
         self.assertEqual(self.check_row_7_extra_leaf_gets(), [])
 
-    def check_row_7_passes_unsupported(self, evaluate_py=EVALUATE, bands=BANDS):
+    def row_bands(self, key, bands=BANDS):
+        """A bands file holding only bands.toml's row `key`."""
+        with open(bands) as f:
+            text = f.read()
+        start = text.index(f'[[row]]\nkey = "{key}"\n')
+        end = text.find("\n[[row]]\n", start + 1)
+        return self.pass_bands(text[start:] if end < 0 else text[start:end + 1])
+
+    # G's inputs that give box D's passes: spans one field of 20 single-pair
+    # runs at budget 8 (share 8: 8 + 8 + 4, 3 groups); logs trace_id 162
+    # single-pair runs and request_id 10 two-pair runs at budget 12 (share 6:
+    # 27 groups and 4), the slowest field deciding 27.
+    BOX_D_G_INPUTS = {
+        "spans": (8, {"trace_id": [1] * 20}),
+        "logs": (12, {"trace_id": [1] * 162, "request_id": [2] * 10}),
+    }
+
+    def set_g_inputs(self, inputs):
+        """Write {signal: (pair budget, {field: [pairs per key8 run]})} into the fold_advance fold reports."""
+        folds = read_jsonl(self.stamp_path("folds.jsonl"))
+        for line in folds:
+            if line["transition"] == "fold_advance" and line["signal"] in inputs:
+                budget, runs = inputs[line["signal"]]
+                line["report"].update(key_index_pair_budget=budget, key_index_field_run_pairs=runs)
+        write_jsonl(self.stamp_path("folds.jsonl"), folds)
+
+    def check_row_7_passes_not_computable(self, evaluate_py=EVALUATE, bands=BANDS):
         """Box D's passes, 3 on spans and 27 on logs, are not judged against 1: the target is G, which needs
-        the pair budget and each field's key8 runs, and the fold report carries neither, so each reads
-        unsupported-on-this-build with that reason, not a miss. The passes still scale the section GETs."""
+        the pair budget and each field's key8 runs, and the fold report carries neither, so G reads
+        not-computable naming both inputs, the passes judged against it read not-computable too, and the
+        run is incomplete (exit 1) with an incomplete line for each of the four, never a hold or a miss. The
+        passes still scale the section GETs, which hold."""
         self.set_row_7(self.BOX_D_ROW_7)
-        _, res, _ = self.go(bands, evaluate_py)
+        code, res, _ = self.go(self.row_bands("row_07", bands), evaluate_py)
         out = []
+        if (code, res["verdict"], res["problems"]) != (1, "incomplete", []):
+            out.append(f"verdict {code} {res['verdict']} {res['problems']}")
         for sig, f in self.BOX_D_ROW_7.items():
             g = figure(res, f"row_07.{sig}_build_passes_g")
-            if (g["status"], g["verdict"]) != (UNSUPPORTED, UNSUPPORTED) or "no pair budget" not in g["reason"]:
+            if (g["status"], g["verdict"]) != (NOT_COMPUTABLE, NOT_COMPUTABLE) or not all(
+                    k in g["reason"] for k in ("key_index_pair_budget", "key_index_field_run_pairs")):
                 out.append(f"{sig} G {g['status']} {g['verdict']} {g['reason']}")
             p = figure(res, f"row_07.{sig}_build_passes")
-            if (p["status"], p["value"], p["verdict"]) != ("value", f["passes"], UNSUPPORTED):
+            if (p["status"], p["value"], p["verdict"]) != ("value", f["passes"], NOT_COMPUTABLE):
                 out.append(f"{sig} passes {p['status']} {p['value']} {p['verdict']}")
-            if "no per-field key8 runs" not in (p["reason"] or ""):
+            if "key_index_pair_budget" not in (p["reason"] or ""):
                 out.append(f"{sig} passes reason {p['reason']}")
+            for fid in (f"row_07.{sig}_build_passes_g", f"row_07.{sig}_build_passes"):
+                if not any(line.startswith(f"figure {fid} {NOT_COMPUTABLE}: ") for line in res["incomplete"]):
+                    out.append(f"no incomplete line for {fid}")
             got = figure(res, f"row_07.{sig}_section_gets")
             if (got["value"], got["verdict"]) != (f["ranged"], "pass"):
                 out.append(f"{sig} section_gets {got['value']} {got['verdict']}")
-        if any("row_07" in p for p in res["problems"]):
-            out.append(f"problems {res['problems']}")
         return out
 
-    def test_row_7_passes_unsupported(self):
-        self.assertEqual(self.check_row_7_passes_unsupported(), [])
+    def test_row_7_passes_not_computable(self):
+        self.assertEqual(self.check_row_7_passes_not_computable(), [])
+
+    def check_row_7_g(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A build whose fold report carries G's inputs: G is 3 on spans and 27 on logs, box D's passes hold
+        against it and the row passes; one pass more on either signal misses."""
+        self.set_row_7(self.BOX_D_ROW_7)
+        self.set_g_inputs(self.BOX_D_G_INPUTS)
+        row = self.row_bands("row_07", bands)
+        code, res, _ = self.go(row, evaluate_py)
+        out = []
+        if (code, res["verdict"], res["incomplete"]) != (0, "pass", []):
+            out.append(f"verdict {code} {res['verdict']} {res['problems']} {res['incomplete']}")
+        for sig, f in self.BOX_D_ROW_7.items():
+            g = figure(res, f"row_07.{sig}_build_passes_g")
+            p = figure(res, f"row_07.{sig}_build_passes")
+            if (g["value"], g["verdict"], p["value"], p["verdict"]) != (f["passes"], "pass", f["passes"], "pass"):
+                out.append(f"{sig} G {g['value']} {g['verdict']} passes {p['value']} {p['verdict']}")
+        more = {sig: dict(f, passes=f["passes"] + 1) for sig, f in self.BOX_D_ROW_7.items()}
+        self.set_row_7(more)
+        _, res, _ = self.go(row, evaluate_py)
+        for sig, f in more.items():
+            p = figure(res, f"row_07.{sig}_build_passes")
+            if (p["value"], p["verdict"]) != (f["passes"], "miss"):
+                out.append(f"{sig} {f['passes']} passes {p['value']} {p['verdict']}")
+        return out
+
+    def test_row_7_g(self):
+        self.assertEqual(self.check_row_7_g(), [])
+
+    def check_greedy_passes(self, evaluate_py=EVALUATE):
+        """The pass-end slice amendment's examples: fields of 16 and 8 single-pair runs at budget 24 (share
+        12) take 2 passes; 17 pairs in runs of 4, 4, 4, 4 and 1 at budget 6 take 4 where ceil(17 / 6) is 3;
+        a single run over the share is its own group; box D's G inputs give its 3 and 27."""
+        mod = load_module(evaluate_py, "evaluate_greedy_passes")
+        cases = [((24, {"a": [1] * 16, "b": [1] * 8}), 2), ((6, {"a": [4, 4, 4, 4, 1]}), 4),
+                 ((6, {"a": [9, 1]}), 2)]
+        cases += [(inputs, self.BOX_D_ROW_7[sig]["passes"]) for sig, inputs in self.BOX_D_G_INPUTS.items()]
+        return [f"{budget} {runs}: {mod.greedy_passes(budget, runs)}, want {want}"
+                for (budget, runs), want in cases if mod.greedy_passes(budget, runs) != want]
+
+    def test_greedy_passes(self):
+        self.assertEqual(self.check_greedy_passes(), [])
 
     # Uncovered entries on box D's figures: spans 10 over 3 passes, logs 5 over
     # 27, each read on every pass. Spans: 2 x (40 + 10) x 3 = 300 ranged GETs
@@ -2640,10 +2740,11 @@ class Evaluate(Workdir):
     def test_refused(self):
         self.assertEqual(self.check_refused(), [])
 
-    def served_1000(self, statement, keys=None, parts=1, scan=True, leaf=None, skipped=None):
+    def served_1000(self, statement, keys=None, parts=1, scan=True, leaf=None, uncovered=None):
         """Turn statement's folded_leaves cold calls into ok calls copied from spans_in_100, which scanned 4
-        objects. keys None drops the keyIndex section; leaf sets its leafGetRequests and skipped its
-        skippedByBudget; scan False zeros the probe and scan GETs and blocks."""
+        objects. keys None drops the keyIndex section; leaf sets its leafGetRequests and uncovered, a
+        (field, count) pair, one Uncovered outcome's count; scan False zeros the probe and scan GETs and
+        blocks."""
         src = {c["try"]: c for c in self.select("spans_in_100")}
         for i, c in enumerate(self.calls):
             if c["statement"] == statement and c["state"] == "folded_leaves" and c.get("temp") == "cold":
@@ -2656,8 +2757,8 @@ class Evaluate(Workdir):
                                                     partsCovered=parts)
                     if leaf is not None:
                         new["stats"]["keyIndex"]["leafGetRequests"] = leaf
-                    if skipped is not None:
-                        new["stats"]["keyIndex"]["skippedByBudget"] = skipped
+                    if uncovered is not None:
+                        new["stats"]["keyIndex"][uncovered[0]] = uncovered[1]
                 if not scan:
                     for p in new["stats"]["phases"]:
                         if p["phase"] in ("probe", "scan"):
@@ -2689,8 +2790,18 @@ class Evaluate(Workdir):
                                "probed 1000 keys with partsCovered 0 and no part in an Uncovered outcome"),
         # Box C: the 1,000-key part went Uncovered by budget (partsCovered 0, skippedByBudget 1) and the
         # 1,025-key list was scanned with keysProbed 0.
-        "uncovered-by-budget": (dict(keys=1000, parts=0, skipped=1), dict(keys=0, parts=0, leaf=0),
-                                ("value", 1, "pass"), ""),
+        "uncovered-by-budget": (dict(keys=1000, parts=0, uncovered=("skippedByBudget", 1)),
+                                dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        # ADR-2707 row 11 allows every Uncovered outcome the report names, not only the budget: the part
+        # went Uncovered, so the key set was carried even though no leaf answered.
+        "uncovered-parts": (dict(keys=1000, parts=0, uncovered=("partsUncovered", 1)),
+                            dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        "uncovered-beyond-ceiling": (dict(keys=1000, parts=0, uncovered=("partsBeyondCeiling", 1)),
+                                     dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        "uncovered-leaves-rejected": (dict(keys=1000, parts=0, uncovered=("leavesRejected", 1)),
+                                      dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        "uncovered-reservations-refused": (dict(keys=1000, parts=0, uncovered=("reservationsRefused", 1)),
+                                           dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
     }
 
     def check_control(self, mode, evaluate_py=EVALUATE):
@@ -2793,6 +2904,26 @@ class Evaluate(Workdir):
 
     def test_control_uncovered_by_budget(self):
         self.assertEqual(self.check_control_uncovered_by_budget(), [])
+
+    UNCOVERED_MODES = ("uncovered-by-budget", "uncovered-parts", "uncovered-beyond-ceiling",
+                       "uncovered-leaves-rejected", "uncovered-reservations-refused")
+
+    def check_control_uncovered_outcomes(self, evaluate_py=EVALUATE):
+        """Each Uncovered outcome the ADR's row 11 allows (partsUncovered, skippedByBudget,
+        partsBeyondCeiling, leavesRejected, reservationsRefused), alone on a 1,000-key list that probed
+        1,000 keys with partsCovered 0, routes the part: the control passes."""
+        out = []
+        for mode in self.UNCOVERED_MODES:
+            out += [f"{mode}: {line}" for line in self.check_control(mode, evaluate_py)]
+        return out
+
+    def test_control_uncovered_outcomes(self):
+        self.assertEqual(self.check_control_uncovered_outcomes(), [])
+        # One case per outcome evaluate.py accepts, none left without one.
+        outcomes = {self.CONTROL[m][0]["uncovered"][0] for m in self.UNCOVERED_MODES}
+        mod = load_module(EVALUATE, "evaluate_uncovered_outcomes")
+        self.assertEqual(outcomes, set(mod.UNCOVERED_OUTCOMES))
+        self.assertEqual(len(outcomes), len(self.UNCOVERED_MODES))
 
     # --- incomplete, truth-derived budgets, absent fields -------------------
 
@@ -3053,9 +3184,9 @@ class Evaluate(Workdir):
     def check_refusal_classes(self, evaluate_py=EVALUATE):
         """Guard refusals and unsupported figures are counted apart."""
         _, res, text = self.go(BANDS, evaluate_py)
-        want = {GUARD: {"figures": 15, "calls": 24}, UNSUPPORTED: {"figures": 31, "calls": 0}}
+        want = {GUARD: {"figures": 15, "calls": 24}, UNSUPPORTED: {"figures": 29, "calls": 0}}
         out = [] if res["refusal_classes"] == want else [f"classes {res['refusal_classes']}"]
-        if "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 31" not in text:
+        if "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29" not in text:
             out.append("summary carries no refusal-class line")
         return out
 
@@ -3304,6 +3435,14 @@ FLIPS = {
         '        if not ki["partsCovered"]:',
         "check_control_uncovered_by_budget",
     ),
+    **{f"a 1,000-key part {outcome} read as covering no part": (
+        'UNCOVERED_OUTCOMES = ("partsUncovered", "skippedByBudget", "partsBeyondCeiling", "leavesRejected",\n'
+        '                      "reservationsRefused")\n',
+        "UNCOVERED_OUTCOMES = " + repr(tuple(o for o in ("partsUncovered", "skippedByBudget", "partsBeyondCeiling",
+                                                          "leavesRejected", "reservationsRefused")
+                                             if o != outcome)) + "\n",
+        "check_control_uncovered_outcomes",
+    ) for outcome in ("partsUncovered", "partsBeyondCeiling", "leavesRejected", "reservationsRefused")},
     "an index-served 1,025-key list not seen": (
         "        if key_index_nonzero(c):\n",
         "        if False:\n",
@@ -3377,9 +3516,39 @@ FLIPS = {
         "check_row_18_uncovered",
     ),
     "row 7's G read as a fold report field": (
-        '    if field == "key_index_g":\n        return UNSUPPORTED, None, G_UNSUPPORTED\n',
-        '',
-        "check_row_7_passes_unsupported",
+        '    if field == "key_index_g":\n        return fold_g(',
+        '    if False:\n        return fold_g(',
+        "check_row_7_passes_not_computable",
+    ),
+    "row 7's G without its inputs read as unsupported, not not-computable": (
+        "        return NOT_COMPUTABLE, None, (\n",
+        "        return UNSUPPORTED, None, (\n",
+        "check_row_7_passes_not_computable",
+    ),
+    "a not-computable figure, or one judged against it, leaves no incomplete reason": (
+        '        elif f.get("verdict") in (NOT_COMPUTABLE, INCOMPLETE):\n',
+        '        elif f.get("verdict") in (INCOMPLETE,):\n',
+        "check_row_7_passes_not_computable",
+    ),
+    "a figure judged against a not-computable one judged as a miss": (
+        'PASSED_ON = ("not-run", UNSUPPORTED, GUARD, NOT_COMPUTABLE, INCOMPLETE)\n',
+        'PASSED_ON = ("not-run", UNSUPPORTED, GUARD, INCOMPLETE)\n',
+        "check_row_7_passes_not_computable",
+    ),
+    "row 7's G groups cut once the share is reached, not before a run would cross it": (
+        "            if held and held + r > share:\n",
+        "            if held >= share:\n",
+        "check_greedy_passes",
+    ),
+    "row 6's probe survivors judged without the plan-opens-the-probed-objects precondition": (
+        '            if not isinstance(by_stats, int) or m["plan_segments_opened"] != big - by_stats:\n',
+        "            if False:\n",
+        "check_row_6_objects_past_probe",
+    ),
+    "an incomplete figure leaves no incomplete reason": (
+        '        elif f.get("verdict") in (NOT_COMPUTABLE, INCOMPLETE):\n',
+        '        elif f.get("verdict") in (NOT_COMPUTABLE,):\n',
+        "check_row_6_objects_past_probe",
     ),
     "row 6's probe survivors read from the scan phase's segmentsOpened": (
         '            v = m["plan_segments_opened"] - pruned\n',
@@ -3602,12 +3771,12 @@ BAND_FLIPS = {
     "row 7's spans passes judged against 1, not G": (
         "target_if = \"v == m['row_07.spans_build_passes_g']\"\n",
         "target_if = \"v == 1\"\n",
-        "check_row_7_passes_unsupported",
+        "check_row_7_g",
     ),
     "row 7's logs passes judged against 1, not G": (
         "target_if = \"v == m['row_07.logs_build_passes_g']\"\n",
         "target_if = \"v == 1\"\n",
-        "check_row_7_passes_unsupported",
+        "check_row_7_g",
     ),
     "row 7's spans section GETs without the uncovered term": (
         "target_if = \"v <= (2 * (m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) + "
@@ -4196,7 +4365,7 @@ class Box(Workdir):
         cfg = {"lane": "local", "hits": True, "tenant": "inv", "scales": [1], "baseline": False,
                "states": ["unfolded"]}
         for gets, verdict in ((10, "pass"), (11, "miss")):
-            def fixed(calls, cfg, statement, state, metric, candidates=None, gets=gets):
+            def fixed(calls, cfg, statement, state, metric, candidates=None, over_512k=None, gets=gets):
                 return ("value", gets, "") if metric == "cold.max.keyindex_gets" else ("missing", None, "not set")
             mod.statement_figure = fixed
             figs = mod.run_rows(bands, cfg, {"unfolded": None}, None, None, {}, census, None, {}, {})

@@ -20,8 +20,12 @@ byte-identical.
 Every figure bands.toml names goes through one list, `figures`, and is
 present exactly once: absent is `missing`, two inputs for it are
 `duplicate` (never the last of them), a figure this build cannot produce is
-`unsupported-on-this-build` with its reason, and a figure of a row whose
-tenant, state, scale or baseline the run lacks is `not-run` with the reason.
+`unsupported-on-this-build` with its reason, a figure whose inputs no
+build's report carries is `not-computable` with the inputs it lacks, a
+figure whose precondition does not hold on the measured state is
+`incomplete` with the precondition, and a figure of a row whose tenant,
+state, scale or baseline the run lacks is `not-run` with the reason. A
+figure computed from or judged against one of these takes its status.
 Only the fields ALLOWLISTED below may read as unsupported when a successful
 call lacks them; any other absent field is `missing`, and no figure
 defaults to 0. Each answer is judged here against truth.json, under the
@@ -34,8 +38,8 @@ non-zero) is not live: every figure of it, and of a state derived from it,
 is `not-run` with the reason "state failed at <step> (exit N)", and its
 entry in `states` reads `failed` with the step, exit code and log. The
 verdict is `fail` on any problem; else `incomplete` when an asked state, a
-planned call or an ungated figure did not run, or a row 18 cell is
-not-measured; else `pass`. Exit 0 only on pass; 1 on fail or incomplete; 64 on usage.
+planned call or an ungated figure did not run, a row 18 cell is
+not-measured, or a figure is not-computable or incomplete; else `pass`. Exit 0 only on pass; 1 on fail or incomplete; 64 on usage.
 """
 
 import argparse
@@ -80,14 +84,23 @@ UNCOVERED_OUTCOMES = ("partsUncovered", "skippedByBudget", "partsBeyondCeiling",
                       "reservationsRefused")
 ALLOWLIST_BREAKDOWNS = {"per_object": "stats carry no per-object breakdown",
                         "per_part": "stats carry no per-part breakdown"}
+# A figure no build can supply because its inputs exist in no report: it
+# proves nothing either way, so it, and every figure judged against it,
+# leaves the run incomplete.
+NOT_COMPUTABLE = "not-computable"
+# A figure whose precondition does not hold on the measured state: the value
+# exists but does not mean what the band asks.
+INCOMPLETE = "incomplete"
 # Row 7's G, the pass-end slice amendment's pass count: each field's
 # ascending key8 runs cut greedily into groups of at most the pair share
-# max(1, floor(budget / F)), the part's slowest field deciding. The fold
-# report (FoldReport, crates/ravel-catalog/src/fold.rs) carries neither the
-# build's pair budget nor any field's key8 runs, so no build reports G.
-G_UNSUPPORTED = ("fold report carries no pair budget and no per-field key8 runs, so G (the pass-end slice "
-                 "amendment's greedy partition of each field's key8 runs into groups of at most the pair share) "
-                 "cannot be computed")
+# max(1, floor(budget / F)), the part's slowest field deciding. Its inputs
+# are the fold report's pair budget and each field's key8 run sizes, under
+# these names; the fold report (FoldReport, crates/ravel-catalog/src/fold.rs)
+# carries neither yet, which ADR-3939's fold task adds.
+G_INPUTS = ("key_index_pair_budget", "key_index_field_run_pairs")
+# Statuses a figure computed from, or judged against, another figure takes
+# over from it, reason and all.
+PASSED_ON = ("not-run", UNSUPPORTED, GUARD, NOT_COMPUTABLE, INCOMPLETE)
 # Fold report fields this build does not write.
 FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_index_sections_read",
                   "key_index_leaf_gets")
@@ -674,10 +687,11 @@ def leaf_uncovered(c):
     return None
 
 
-def statement_figure(calls, cfg, statement, state, metric, candidates=None):
+def statement_figure(calls, cfg, statement, state, metric, candidates=None, over_512k=None):
     """(status, value, reason) of one statement figure. candidates(c) is
     (count, None) or (None, reason): the objects the state's ranges stamp
-    says overlap call c's window.
+    says overlap call c's window. over_512k(c) is the same shape: the
+    census count of call c's objects above 512 KiB.
 
     metric is "<temp>.<agg>.<name>", "<temp>.rows_exact",
     "<temp>.rows_match_state.<other>", "<temp>.wall_p50_s",
@@ -762,10 +776,21 @@ def statement_figure(calls, cfg, statement, state, metric, candidates=None):
                 return "missing", None, f"no candidate object for {where(c)} to divide the probe wire by"
             v = rnd(m["probe_wire_bytes"] / probed)
         elif name == "probe_survivors":
-            # The probed objects the key index did not prune.
+            # The probed objects the key index did not prune. The plan's
+            # segmentsOpened counts the probed objects only when it opened
+            # exactly the objects above 512 KiB that stats did not prune.
             pruned = c["stats"]["pruning"].get("segmentsPrunedByKeyIndex")
             if not isinstance(pruned, int):
                 return UNSUPPORTED, None, "stats carry no pruning.segmentsPrunedByKeyIndex on this build"
+            big, why = over_512k(c) if over_512k else (None, "no census reader")
+            if why:
+                return INCOMPLETE, None, f"probe survivors of {where(c)} not judged: {why}"
+            by_stats = c["stats"]["pruning"].get("segmentsPrunedByStats")
+            if not isinstance(by_stats, int) or m["plan_segments_opened"] != big - by_stats:
+                return INCOMPLETE, None, (
+                    f"probe survivors of {where(c)} not judged: plan segmentsOpened {m['plan_segments_opened']} "
+                    f"is not census objects_over_512k {big} less pruning.segmentsPrunedByStats {by_stats}, so the "
+                    "plan did not open exactly the objects the probe saw")
             v = m["plan_segments_opened"] - pruned
         elif name in m:
             v = m[name]
@@ -844,6 +869,22 @@ def window_candidates(stamps, statements, truth, c):
         return None, f"{name} carries no min_ns and max_ns for every object"
     start, end = window
     return sum(1 for o in objects if o["min_ns"] < end and o["max_ns"] >= start), None
+
+
+def census_over_512k(census, statements, cfg, c):
+    """(count, None) of the objects above 512 KiB the census of call c's
+    state gives its statement's tenant and signal, or (None, reason)."""
+    st = statements.get(c.get("statement")) or {}
+    tenant = st.get("tenant") or cfg["tenant"]
+    signal = signal_of(st.get("table", "spans"))
+    line = census.get((c.get("state"),), "absent")
+    if line == "absent" or line is None:
+        return None, f"{'no census' if line == 'absent' else 'two censuses'} of {c.get('state')}"
+    data = ((line.get("census") or {}).get("tenants") or {}).get(tenant, {}).get("data", {}).get(signal) or {}
+    v = data.get("objects_over_512k")
+    if not isinstance(v, int) or isinstance(v, bool):
+        return None, f"census of {c.get('state')} has no {tenant}/{signal} objects_over_512k"
+    return v, None
 
 
 def required_stamps(run_dir, cfg, live, problems):
@@ -1169,6 +1210,39 @@ def fold_field(report, field):
     return None
 
 
+def greedy_passes(budget, field_runs):
+    """G: each field's key8 runs, in ascending key8 order, cut into groups of
+    at most the share max(1, budget // F) pairs, a single run over the share
+    its own group; the slowest field's group count, at least 1."""
+    share = max(1, budget // max(1, len(field_runs)))
+    worst = 0
+    for runs in field_runs.values():
+        groups, held = 0, 0
+        for r in runs:
+            if held and held + r > share:
+                groups, held = groups + 1, 0
+            held += r
+        worst = max(worst, groups + (1 if held else 0))
+    return max(1, worst)
+
+
+def fold_g(report, where_):
+    """(status, value, reason) of row 7's G from a fold report."""
+    absent = [k for k in G_INPUTS if k not in report]
+    if absent:
+        return NOT_COMPUTABLE, None, (
+            f"fold report {where_} carries no {' and no '.join(absent)}, so G (the pass-end slice amendment's "
+            "greedy partition of each field's key8 runs into groups of at most the pair share) cannot be "
+            "computed")
+    budget, runs = (report[k] for k in G_INPUTS)
+    if (not isinstance(budget, int) or isinstance(budget, bool) or budget < 1 or not isinstance(runs, dict)
+            or not runs or any(not isinstance(v, list) or any(
+                not isinstance(r, int) or isinstance(r, bool) or r < 1 for r in v) for v in runs.values())):
+        return "missing", None, (f"fold report {where_}: {G_INPUTS[0]} is not a positive integer or "
+                                 f"{G_INPUTS[1]} is not a non-empty map of positive run sizes")
+    return "value", greedy_passes(budget, runs), ""
+
+
 def fold_figure(folds, transition, tenant, label, field):
     """(status, value, reason) of fold.<tenant>.<label>.<field>."""
     line = folds.get((transition, tenant, label), "absent")
@@ -1177,7 +1251,7 @@ def fold_figure(folds, transition, tenant, label, field):
     if line is None:
         return "duplicate", None, f"two fold stamps for {transition}/{tenant}/{label}"
     if field == "key_index_g":
-        return UNSUPPORTED, None, G_UNSUPPORTED
+        return fold_g(line.get("report") or {}, f"{transition}/{tenant}/{label}")
     if field == "peak_rss_bytes":
         v = (line.get("measure") or {}).get("peak_rss_bytes")
         return ("value", v, "") if v is not None else ("missing", None, "fold stamp has no measure")
@@ -1275,7 +1349,7 @@ def derived_value(expr, figures_by_id):
         ref = figures_by_id.get(e.args[0])
         if ref is None:
             return "missing", None, f"refers to figure {e.args[0]} that bands.toml does not define before it"
-        if ref["status"] in ("not-run", UNSUPPORTED, GUARD):
+        if ref["status"] in PASSED_ON:
             return ref["status"], None, f"{e.args[0]} is {ref['status']}: {ref['reason']}"
         return "missing", None, f"{e.args[0]} has no value ({ref['status']})"
     return "value", rnd(v), ""
@@ -1291,7 +1365,8 @@ def truth_figure(truth, metric):
     return "value", v, ""
 
 
-def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, truth, candidates=None):
+def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, truth, candidates=None,
+             over_512k=None):
     figures = []
     by_id = {}
     for row in bands["row"]:
@@ -1331,7 +1406,7 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
                 status, value, why = "missing", None, f"{metric} needs a run this harness lane does not perform"
             else:
                 status, value, why = statement_figure(calls, cfg, fig["statement"], fig["state"], metric,
-                                                      candidates)
+                                                      candidates, over_512k)
             entry.update(status=status, value=value, reason=why)
             figures.append(entry)
             by_id[fid] = entry
@@ -1349,7 +1424,7 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
             miss = evaluate_expr(f.get("miss_if", "False"), entry["value"], values)
         except KeyError as e:
             ref = by_id.get(e.args[0])
-            if ref is not None and ref["status"] in ("not-run", UNSUPPORTED, GUARD):
+            if ref is not None and ref["status"] in PASSED_ON:
                 entry["verdict"] = ref["status"]
                 entry["reason"] = f"band refers to figure {e.args[0]}, {ref['status']}: {ref['reason']}"
             else:
@@ -1557,8 +1632,9 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     its row or figure lacking a state, tenant, scale or baseline the run
     never asked for (a gated figure is either not_requested or listed
     here), a figure not-measured (a row 18 cell whose covering part went
-    Uncovered), a row 18 figure with no value to judge (unsupported, refused
-    or missing), or a needle band a partial inspection could not judge."""
+    Uncovered), a figure not-computable or incomplete or judged against
+    one, a row 18 figure with no value to judge (unsupported, refused or
+    missing), or a needle band a partial inspection could not judge."""
     out = []
     for s in cfg["states"]:
         if live.get(s) is not None:
@@ -1575,6 +1651,8 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
             out.append(f"figure {f['id']} not run: {f['reason']}")
         elif f["status"] == NOT_MEASURED:
             out.append(f"figure {f['id']} not measured: {f['reason']}")
+        elif f.get("verdict") in (NOT_COMPUTABLE, INCOMPLETE):
+            out.append(f"figure {f['id']} {f['verdict']}: {f['reason']}")
         elif f["row"] == 18 and f.get("verdict") in (UNSUPPORTED, GUARD, "refused", "missing"):
             out.append(f"figure {f['id']} {f['verdict']}: {f['reason']}")
     out.extend((needles or {}).get("incomplete", []))
@@ -1746,7 +1824,8 @@ def main(argv):
             or not cfg["cost"].get("lookups_per_part_month_source") else 0),
     }
     figures = run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, truth,
-                       lambda c: window_candidates(stamps, statements, truth, c))
+                       lambda c: window_candidates(stamps, statements, truth, c),
+                       lambda c: census_over_512k(census, statements, cfg, c))
     for f in figures:
         if f["verdict"] == "dead_counter":
             problems.add("dead_counter", f"segmentsOpened {f['statement']} {f['state']}")
