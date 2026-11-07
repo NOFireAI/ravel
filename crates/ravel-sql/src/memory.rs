@@ -4636,6 +4636,29 @@ pub(crate) mod tests {
         assert_eq!(budget.reserved(), 0);
     }
 
+    /// A process share's own bytes never exceed the SQL share they are
+    /// measured against: a racing read that puts own at 500 of 300 records
+    /// 300 of 300.
+    ///
+    /// FLIP: drop the clamp in `BudgetShare::of_process` and own reads 500.
+    #[test]
+    fn a_process_share_clamps_own_to_the_sql_share() {
+        assert_eq!(
+            BudgetShare::of_process(300, 500),
+            BudgetShare {
+                budget_reserved: 300,
+                own: 300,
+            }
+        );
+        assert_eq!(
+            BudgetShare::of_process(300, 100),
+            BudgetShare {
+                budget_reserved: 300,
+                own: 100,
+            }
+        );
+    }
+
     /// An envelope tied in size with another pool's at the width boundary is
     /// counted as outside the budget for its own pool, whichever pool asks:
     /// each pool's figure leaves the tied 100 bytes out.

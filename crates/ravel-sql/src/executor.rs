@@ -5777,8 +5777,8 @@ pub(crate) struct PoolReport {
     pub(crate) host_gate: bool,
     /// [`TenantDelegatingPool::first_refusal`].
     pub(crate) first: Option<MemoryRefusal>,
-    /// The refusing budget's figures, when the first refusal was a tenant or
-    /// process budget refusal.
+    /// The refusing budget's figures, when the first refusal was a tenant
+    /// budget, process budget or accounted reserve-ahead refusal.
     pub(crate) first_share: Option<BudgetShare>,
     /// [`TenantDelegatingPool::peak_unspillable_bytes`].
     pub(crate) peak_unspillable_bytes: u64,
@@ -6604,18 +6604,20 @@ pub(crate) fn spill_retry_decision(
     }
 }
 
-/// The share of a tenant or process budget's reserved bytes, in percent,
-/// that the refused statement's own bytes on it must reach for that budget's
-/// refusal to earn a spill retry. Below it the refusal is contention: other
-/// statements' reservations filled the shared budget, spilling this one does
-/// not free them, and the retry holds memory and a spill share while it runs.
+/// The share of SQL execution's reserved bytes on a tenant or process budget
+/// ([`BudgetShare::budget_reserved`]), in percent, that the refused
+/// statement's own bytes on it must reach for that budget's refusal to earn a
+/// spill retry. Below it the refusal is contention: other statements'
+/// reservations filled the shared budget, spilling this one does not free
+/// them, and the retry holds memory and a spill share while it runs.
 pub(crate) const SPILL_RETRY_DOMINANT_SHARE_PERCENT: u64 = 50;
 
 /// Whether the pool's first refusal is one the statement's own spill can
 /// answer: its per-query limit, always; or a tenant budget, process budget
 /// or reserve-ahead refusal at which its own bytes on the refusing budget
-/// were at least [`SPILL_RETRY_DOMINANT_SHARE_PERCENT`] of the budget's
-/// reserved bytes. A reserve-ahead refusal is a refusal of the shared
+/// were at least [`SPILL_RETRY_DOMINANT_SHARE_PERCENT`] of SQL execution's
+/// reserved bytes on it; on the process budget, fetch buffers and caches are
+/// not counted. A reserve-ahead refusal is a refusal of the shared
 /// process budget, so it passes the same test as a process budget refusal;
 /// one with no recorded figures does not retry.
 ///
@@ -9231,11 +9233,11 @@ pub(crate) mod tests {
     /// Issue #3899 (M2 review), the single-statement case: with one statement
     /// running, its own bytes dominate the process budget and it retries
     /// both on a reserve-ahead refusal and on a process budget refusal. The
-    /// budget's limit is 1050. A cache holds 300 outside any statement. The
+    /// budget's limit is 1050. A cache holds 300 outside any statement,
+    /// through the fetch layer's RAII path, so it is not SQL's share. The
     /// statement's two aggregates are charged 200 and 100 with envelopes of
     /// the same size, both among the 2 the budget holds, and a join holds
-    /// 100: own is 700 of 1000 reserved, 70%. Its fetch reservations are not
-    /// counted (none here).
+    /// 100: own is 700 of SQL's 700 of the 1000 reserved.
     #[test]
     fn a_single_statement_retries_on_a_reserve_ahead_and_a_process_refusal() {
         let _serial = crate::memory::tests::envelope_tests();
@@ -9262,8 +9264,8 @@ pub(crate) mod tests {
                 false,
             )
         };
-        let seventy_percent = Some(BudgetShare {
-            budget_reserved: 1000,
+        let all_of_sql = Some(BudgetShare {
+            budget_reserved: 700,
             own: 700,
         });
 
@@ -9274,7 +9276,7 @@ pub(crate) mod tests {
         let refused = report(&pool);
         assert_eq!(
             (refused.first, refused.first_share),
-            (Some(MemoryRefusal::ReserveAhead), seventy_percent)
+            (Some(MemoryRefusal::ReserveAhead), all_of_sql)
         );
         assert_eq!(decide(refused), SpillRetry::Retry);
         drop((first, second, join, pool));
@@ -9286,11 +9288,133 @@ pub(crate) mod tests {
         let refused = report(&pool);
         assert_eq!(
             (refused.first, refused.first_share),
-            (Some(MemoryRefusal::Process), seventy_percent)
+            (Some(MemoryRefusal::Process), all_of_sql)
         );
         assert_eq!(decide(refused), SpillRetry::Retry);
         drop((first, second, join, pool));
         assert_eq!(budget.reserved(), 300, "only the cache is left");
+    }
+
+    /// One statement's aggregate charged `own_asks` with an envelope of the
+    /// same size (the only envelope, width 1) refused once on a reserve-ahead
+    /// grow and once on a process budget grow, on a budget 50 bytes over what
+    /// it holds: a fetch-layer reservation of 600 bytes, the statement's
+    /// bytes and, when `other_holds` is non-zero, another statement's sorter.
+    /// Returns the reserve-ahead refusal's report, then the process one's.
+    fn refused_beside_a_fetch_reservation(own_asks: usize, other_holds: usize) -> [PoolReport; 2] {
+        let reserved = 600 + other_holds + 2 * own_asks;
+        let budget = Arc::new(MemoryBudget::new(reserved as u64 + 50));
+        let cache = budget.reserve(600).expect("the cache share fits");
+        assert_eq!(budget.fetch_reserved(), 600);
+        let other = statement_pool(&budget, 1);
+        let theirs = register(&other, "ExternalSorter[0]");
+        if other_holds > 0 {
+            theirs
+                .try_grow(other_holds)
+                .expect("the other statement fits");
+        }
+        let refusals = [true, false].map(|reserve_ahead| {
+            let pool = statement_pool(&budget, 1);
+            let aggregate = register(&pool, "PartialHashAggregateStream[0]");
+            aggregate
+                .try_grow(own_asks)
+                .expect("the asked bytes and their envelope fit");
+            assert_eq!(budget.reserved(), reserved as u64);
+            let join = register(&pool, "HashJoinInput[0]");
+            if reserve_ahead {
+                aggregate
+                    .try_grow(100)
+                    .expect_err("the envelope's 100 more bytes are over the limit");
+            } else {
+                join.try_grow(100)
+                    .expect_err("100 more charged bytes are over the limit");
+            }
+            let refused = report(&pool);
+            drop((aggregate, join, pool));
+            refused
+        });
+        drop((theirs, other, cache));
+        assert_eq!(budget.reserved(), 0);
+        refusals
+    }
+
+    /// Issue #3899 (M2 review): the process budget's dominance test counts
+    /// SQL execution's reservations only. A single statement whose own 400
+    /// bytes (200 charged, 200 enveloped) sit beside a 600-byte fetch-layer
+    /// reservation, a cache held through `MemoryBudget::reserve`, holds 400
+    /// of SQL's 400 and retries on a reserve-ahead and on a process budget
+    /// refusal, though it holds only 40% of the 1000 reserved.
+    ///
+    /// FLIP: record `exhausted.reserved` as `budget_reserved` and both read
+    /// 400 of 1000 and propagate.
+    #[test]
+    fn a_single_statement_beside_a_large_cache_retries() {
+        let _serial = crate::memory::tests::envelope_tests();
+        let [ahead, process] = refused_beside_a_fetch_reservation(200, 0);
+        for (refused, kind) in [
+            (ahead, MemoryRefusal::ReserveAhead),
+            (process, MemoryRefusal::Process),
+        ] {
+            assert_eq!(
+                (refused.first, refused.first_share),
+                (
+                    Some(kind),
+                    Some(BudgetShare {
+                        budget_reserved: 400,
+                        own: 400,
+                    })
+                )
+            );
+            assert_eq!(
+                spill_retry_decision(
+                    &SqlError::ResourcesExhausted("refused".into()),
+                    refused,
+                    0,
+                    true,
+                    true,
+                    false,
+                ),
+                SpillRetry::Retry,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// Issue #3899 (M2 review): leaving the fetch layer's 600 bytes out of
+    /// the share does not turn contention into dominance. Another statement
+    /// holds 900 bytes of SQL's 1000 and this one's 50 charged and 50
+    /// enveloped are 100 of it, 10%, so neither refusal retries.
+    #[test]
+    fn contention_beside_a_large_cache_still_propagates() {
+        let _serial = crate::memory::tests::envelope_tests();
+        let [ahead, process] = refused_beside_a_fetch_reservation(50, 900);
+        for (refused, kind) in [
+            (ahead, MemoryRefusal::ReserveAhead),
+            (process, MemoryRefusal::Process),
+        ] {
+            assert_eq!(
+                (refused.first, refused.first_share),
+                (
+                    Some(kind),
+                    Some(BudgetShare {
+                        budget_reserved: 1000,
+                        own: 100,
+                    })
+                )
+            );
+            assert_eq!(
+                spill_retry_decision(
+                    &SqlError::ResourcesExhausted("refused".into()),
+                    refused,
+                    0,
+                    true,
+                    true,
+                    false,
+                ),
+                SpillRetry::Propagate,
+                "{kind:?}"
+            );
+        }
     }
 
     /// Issue #3899: the spill retry's pool is the spill-mode pool, so a
