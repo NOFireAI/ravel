@@ -34,7 +34,11 @@
 //! - a grouped `MIN` of a string, `MAX` of an integer and `AVG` of an
 //!   `Int32`, and the ClickBench row 29 shape with its `HAVING`, spill and
 //!   return the unlimited run's result, the average bit for bit (issue
-//!   #3899).
+//!   #3899);
+//! - spill is a retry after a memory refusal (issue #3899): a reserve-ahead
+//!   refusal of the aggregate makes it spill on the retry, and a refused
+//!   ineligible statement is not retried. `spill_retry.rs` pins the first
+//!   attempt of a statement that fits.
 //!
 //! # Where each test drives the spill from
 //!
@@ -746,23 +750,33 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
 
 /// ADR-0954 requirements 3 and 5: an eligible query with spill armed at a
 /// directory that does not exist fails the typed `SpillUnavailable`, raised
-/// before any operator runs, and creates nothing.
+/// before any operator of the spill retry runs, and creates nothing. The
+/// scratch area is created only for the spill retry (issue #3899), so the
+/// query has to be refused once first, and a query that fits never touches
+/// the directory.
 #[tokio::test]
 async fn an_eligible_query_with_a_missing_spill_directory_is_spill_unavailable() {
     let tenant = tenant_id("acme");
-    // Small: the failure is at scratch creation, before planning, so the data
-    // size is irrelevant and a large fixture would only slow the test.
-    let specs = overlapping_series_specs(100, 50);
+    let small = tenant_id("small");
+    let specs = overlapping_series_specs(LONG_ROWS, SHORT_ROWS);
+    let small_specs = overlapping_series_specs(100, 50);
     let root = tempfile::tempdir().expect("scratch root");
     let missing = root.path().join("does-not-exist");
 
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
-        &[(&tenant, &specs)],
+        &[(&tenant, &specs), (&small, &small_specs)],
         spill_config(missing.clone(), AMPLE_SCRATCH_BYTES, TIGHT_QUERY_BYTES),
         1 << 40,
     )
     .await;
+
+    let fits = fixture
+        .executor
+        .execute(small.hash(), &request(SPILLING_SQL))
+        .await
+        .expect("a query that fits runs without the scratch area");
+    assert_eq!(fits.stats.spill_retries, 0);
 
     let err = fixture
         .executor
@@ -1217,6 +1231,32 @@ fn q33_parquet() -> bytes::Bytes {
 /// string group keys are accounted at their real size, so a budget below the
 /// aggregate's demand makes the aggregate the operator that spills.
 async fn q33_executor(config: SqlConfig, file: &bytes::Bytes) -> Arc<ravel_sql::SqlExecutor> {
+    q33_executor_in(
+        config,
+        file,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
+    )
+    .await
+}
+
+/// [`q33_executor`] whose tenant accountants charge `process` as the
+/// process-wide memory budget.
+async fn q33_executor_in(
+    config: SqlConfig,
+    file: &bytes::Bytes,
+    process: Arc<ravel_memory::MemoryBudget>,
+) -> Arc<ravel_sql::SqlExecutor> {
+    q33_executor_with_store(config, file, process, Arc::new(MemoryStore::new())).await
+}
+
+/// [`q33_executor_in`] over `ravel` as the Ravel object store, which holds
+/// the table's catalog entries; the Parquet file stays in its own lake store.
+async fn q33_executor_with_store(
+    config: SqlConfig,
+    file: &bytes::Bytes,
+    process: Arc<ravel_memory::MemoryBudget>,
+    ravel: Arc<dyn ravel_object_store::ObjectStoreBackend>,
+) -> Arc<ravel_sql::SqlExecutor> {
     use std::collections::{BTreeMap, HashMap};
 
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
@@ -1233,7 +1273,6 @@ async fn q33_executor(config: SqlConfig, file: &bytes::Bytes) -> Arc<ravel_sql::
     const GRANT: &str = "s3://lake/t";
     const NOW: i64 = 1_700_000_000_000_000_000;
     let tenant = q33_tenant();
-    let ravel: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let lake = Arc::new(MemoryStore::new());
     let key = "t/q33/0.parquet";
     let put = lake
@@ -1304,7 +1343,8 @@ async fn q33_executor(config: SqlConfig, file: &bytes::Bytes) -> Arc<ravel_sql::
             config,
             1 << 40,
         )
-        .with_parquet_sources(sources),
+        .with_parquet_sources(sources)
+        .with_process_memory_budget(process),
     )
 }
 
@@ -1319,6 +1359,11 @@ struct TopTen {
     batches: Vec<RecordBatch>,
     spill_files: u64,
     spill_rows_written: u64,
+    spill_retries: u32,
+    /// The first attempt's refusal class, when a spill retry answered.
+    first_refusal: Option<&'static str>,
+    /// The spill retry's bytes written, when a spill retry answered.
+    spill_retry_bytes_written: Option<u64>,
     peak_pool_bytes: u64,
 }
 
@@ -1380,6 +1425,9 @@ async fn run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> TopTen {
         batches: outcome.output.batches().to_vec(),
         spill_files: outcome.stats.spill.files,
         spill_rows_written: outcome.stats.spill.rows_written,
+        spill_retries: outcome.stats.spill_retries,
+        first_refusal: outcome.stats.spill_retry.map(|r| r.first_refusal),
+        spill_retry_bytes_written: outcome.stats.spill_retry.map(|r| r.spill_bytes_written),
         peak_pool_bytes: outcome.accounting.peak_intermediate_bytes,
     }
 }
@@ -1556,16 +1604,20 @@ async fn a_statement_the_rewrite_cannot_apply_to_runs_with_spill_disabled() {
     );
 }
 
-/// The per-query pool the spilling run of [`spilled_and_unlimited`] gets, as
-/// a fraction of the unlimited run's measured peak: half, for the reason
-/// [`spilled_and_in_memory`] gives.
-const SPILL_BUDGET_DIVISOR: u64 = 2;
+/// The per-query pool the spilling run of [`spilled_and_unlimited`] gets, in
+/// percent of the unlimited run's measured peak. The unlimited run is a first
+/// attempt, planned without spill and with repartitioning, and peaks lower
+/// than the repartition-free retry plan the spilling run answers on
+/// (measured for the `min`/`max`/`avg` statement: 35,732,780 against
+/// 44,482,860 bytes). 60 percent of the first is about half of the second,
+/// the fraction [`spilled_and_in_memory`] explains.
+const SPILL_BUDGET_PERCENT: u64 = 60;
 
 /// Run `sql` over the q33 table under [`AMPLE_QUERY_BYTES`], a pool no run
-/// over this fixture approaches, and again under a pool of the first run's
-/// peak divided by [`SPILL_BUDGET_DIVISOR`]. Asserts that the first run did
-/// not spill and the second did (files and rows written both nonzero), and
-/// returns `(spilled, unlimited)`.
+/// over this fixture approaches, and again under a pool of
+/// [`SPILL_BUDGET_PERCENT`] of the first run's peak. Asserts that the first
+/// run did not spill and the second did (files and rows written both
+/// nonzero) on its one spill retry, and returns `(spilled, unlimited)`.
 async fn spilled_and_unlimited(sql: &str) -> (TopTen, TopTen) {
     let file = q33_parquet();
     let scratch = tempfile::tempdir().expect("scratch root");
@@ -1577,23 +1629,35 @@ async fn spilled_and_unlimited(sql: &str) -> (TopTen, TopTen) {
         )
     };
     let unlimited = run_top_ten(&*q33_executor(config(AMPLE_QUERY_BYTES), &file).await, sql).await;
-    let budget = usize::try_from(unlimited.peak_pool_bytes / SPILL_BUDGET_DIVISOR).expect("fits");
+    let budget =
+        usize::try_from(unlimited.peak_pool_bytes * SPILL_BUDGET_PERCENT / 100).expect("fits");
     let spilled = run_top_ten(&*q33_executor(config(budget), &file).await, sql).await;
     eprintln!(
         "issue #3899: unlimited peak={} budget={budget} spill files={} rows_written={}",
         unlimited.peak_pool_bytes, spilled.spill_files, spilled.spill_rows_written
     );
     assert_eq!(
-        (unlimited.spill_files, unlimited.spill_rows_written),
-        (0, 0),
+        (
+            unlimited.spill_files,
+            unlimited.spill_rows_written,
+            unlimited.spill_retries
+        ),
+        (0, 0, 0),
         "the unlimited run must not spill"
     );
+    assert_eq!(
+        spilled.spill_retries, 1,
+        "the spilling run answers on its one spill retry"
+    );
     assert!(
-        spilled.spill_files > 0 && spilled.spill_rows_written > 0,
-        "under a pool of 1/{SPILL_BUDGET_DIVISOR} of its peak the statement must spill: \
-         files={} rows_written={}",
+        spilled.spill_files > 0
+            && spilled.spill_rows_written > 0
+            && spilled.spill_retry_bytes_written.is_some_and(|b| b > 0),
+        "under a pool of {SPILL_BUDGET_PERCENT} percent of its peak the statement must \
+         spill: files={} rows_written={} retry bytes_written={:?}",
         spilled.spill_files,
-        spilled.spill_rows_written
+        spilled.spill_rows_written,
+        spilled.spill_retry_bytes_written
     );
     (spilled, unlimited)
 }
@@ -1608,7 +1672,7 @@ async fn spilled_and_unlimited(sql: &str) -> (TopTen, TopTen) {
 ///
 /// Prove-the-test: take `min` out of `aggregate_expr_is_spill_exact` and the
 /// spilling run is refused with the spill-disabled `ResourcesExhausted`; set
-/// [`SPILL_BUDGET_DIVISOR`] to 1 and it never spills, failing the counter
+/// [`SPILL_BUDGET_PERCENT`] to 100 and it never spills, failing the retry
 /// assertion.
 #[tokio::test]
 async fn min_max_and_int32_avg_spill_with_the_unlimited_result() {
@@ -1650,4 +1714,164 @@ async fn the_clickbench_row_29_shape_spills_with_the_unlimited_result() {
     );
     assert_eq!(spilled.rows[0], "0000000|8.0|3|a0000000");
     assert_eq!(spilled.rows[24], "0000024|8.0|3|a0000024");
+}
+
+/// The per-query pool of [`a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry`]:
+/// ample against the statement's peak, so neither attempt is refused by the
+/// query pool and the process budget is the only limit in play.
+const RESERVE_AHEAD_QUERY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Issue #3899, the reserve-ahead trigger: with the process budget set to the
+/// statement's own unlimited peak, the first attempt's final aggregate asks
+/// the process ledger for its reserve-ahead envelope (up to 2.43 times the
+/// grow it covers) and is refused. That refusal is a spill trigger: the retry
+/// runs in a spill-mode pool, where the same refusal of a consumer that can
+/// spill tells it to spill, and the statement answers with the unlimited
+/// run's rows. With spill off the same budget fails the statement with the
+/// reserve-ahead refusal.
+///
+/// This test does not pin the spill-mode branch of the reserve-ahead refusal
+/// in `memory.rs`: DataFusion's aggregate spills on any `ResourcesExhausted`
+/// once a disk manager is configured, so the retry spills and answers with
+/// either message. The unit test
+/// `a_spill_mode_reserve_ahead_refusal_of_a_spillable_aggregate_is_a_spill_trigger`
+/// pins that branch.
+///
+/// Prove-the-test: make `spill_retry_decision` read no `ResourcesExhausted`
+/// as a memory refusal and the spill-configured run fails with the
+/// reserve-ahead refusal instead of retrying.
+#[tokio::test]
+async fn a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry() {
+    let sql = "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10";
+    let file = q33_parquet();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = || {
+        spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            RESERVE_AHEAD_QUERY_BYTES,
+        )
+    };
+    let unlimited = run_top_ten(&*q33_executor(config(), &file).await, sql).await;
+    assert_eq!(
+        (unlimited.spill_retries, unlimited.spill_files),
+        (0, 0),
+        "with an unlimited process budget the statement answers on its first attempt"
+    );
+    let process = || Arc::new(ravel_memory::MemoryBudget::new(unlimited.peak_pool_bytes));
+
+    let spilled = run_top_ten(&*q33_executor_in(config(), &file, process()).await, sql).await;
+    assert_eq!(
+        spilled.spill_retries, 1,
+        "the statement answers on its retry"
+    );
+    assert_eq!(
+        spilled.first_refusal,
+        Some("aggregate_reserve_ahead"),
+        "the first attempt was refused by the reserve-ahead envelope"
+    );
+    assert!(
+        spilled.spill_files > 0 && spilled.spill_retry_bytes_written.is_some_and(|b| b > 0),
+        "the retry's aggregate spilled: files={} bytes_written={:?}",
+        spilled.spill_files,
+        spilled.spill_retry_bytes_written
+    );
+    assert_eq!(spilled.rows, unlimited.rows, "row for row");
+
+    let mut spill_off = config();
+    spill_off.spill = None;
+    let err = q33_executor_in(spill_off, &file, process())
+        .await
+        .execute(q33_tenant(), &request(sql))
+        .await
+        .expect_err("with spill off the reserve-ahead refusal fails the statement");
+    let SqlError::ResourcesExhausted(msg) = &err else {
+        panic!("a reserve-ahead refusal is ResourcesExhausted; got {err:?}");
+    };
+    assert!(
+        msg.contains("aggregate reserve-ahead refused"),
+        "the refusal names the reserve-ahead envelope; got {msg:?}"
+    );
+}
+
+/// Issue #3899: a statement refused for memory that is not spill-eligible
+/// (an order-dependent float `avg`) is not retried, and fails with its first
+/// attempt's refusal. A retry re-resolves the snapshot, so it shows in the
+/// requests the Ravel store sees: the ineligible statement's refused run
+/// makes as many as its spill-off run, while the eligible control, refused
+/// first under the same kind of budget and answered on its retry, makes more.
+#[tokio::test]
+async fn a_refused_ineligible_statement_is_not_retried() {
+    let ineligible = "SELECT a, b, count(*) AS c, avg(CAST(y AS DOUBLE)) AS ay FROM q33 \
+                      GROUP BY a, b ORDER BY c DESC LIMIT 10";
+    let eligible = "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10";
+    let file = q33_parquet();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes, spill: bool| {
+        let mut config = spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            query_bytes,
+        );
+        if !spill {
+            config.spill = None;
+        }
+        config
+    };
+    // Half of each statement's unlimited peak: the eligible one answers there
+    // on its retry (see `spilled_and_in_memory`), and neither fits it in memory.
+    let half_peak = async |sql| {
+        let unlimited = run_top_ten(
+            &*q33_executor(config(AMPLE_QUERY_BYTES, true), &file).await,
+            sql,
+        )
+        .await;
+        assert_eq!(unlimited.rows.len(), 10);
+        usize::try_from(unlimited.peak_pool_bytes / 2).expect("fits")
+    };
+    let counted = async |sql, query_bytes, spill| {
+        let store = util::CountingStore::new(Arc::new(MemoryStore::new()));
+        let executor = q33_executor_with_store(
+            config(query_bytes, spill),
+            &file,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            Arc::clone(&store) as Arc<dyn ravel_object_store::ObjectStoreBackend>,
+        )
+        .await;
+        let before = store.total_ops();
+        let outcome = executor.execute(q33_tenant(), &request(sql)).await;
+        (outcome, store.total_ops() - before)
+    };
+
+    let budget = half_peak(ineligible).await;
+    let (refused, ops) = counted(ineligible, budget, true).await;
+    let (spill_off, spill_off_ops) = counted(ineligible, budget, false).await;
+    let err = refused.expect_err("the ineligible statement does not fit half its peak");
+    assert!(
+        matches!(err, SqlError::ResourcesExhausted(_)),
+        "an ineligible statement fails with its first attempt's refusal; got {err:?}"
+    );
+    assert!(
+        matches!(spill_off, Err(SqlError::ResourcesExhausted(_))),
+        "spill off refuses it the same way"
+    );
+    assert_eq!(
+        ops, spill_off_ops,
+        "no retry: the store saw exactly the spill-off run's requests"
+    );
+    assert!(
+        spill_subdirs(scratch.path()).is_empty(),
+        "an ineligible statement never creates a scratch directory"
+    );
+
+    let budget = half_peak(eligible).await;
+    let (retried, retried_ops) = counted(eligible, budget, true).await;
+    let (_, eligible_spill_off_ops) = counted(eligible, budget, false).await;
+    let retried = retried.expect("the eligible control answers on its retry");
+    assert_eq!(retried.stats.spill_retries, 1);
+    assert!(
+        retried_ops > eligible_spill_off_ops,
+        "a retry shows in the store's requests: {retried_ops} against \
+         {eligible_spill_off_ops} with spill off"
+    );
 }
