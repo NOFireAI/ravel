@@ -948,11 +948,27 @@ systems it does not check the type, and spill proceeds.
 To turn the default off, pass `--sql-spill off`. To put spill somewhere
 else, pass `--cache-dir` or set both spill variables.
 
-**Containers.** In a container whose working directory is on the overlay
-filesystem of the image, spill files count against the ephemeral-storage
-limit of the pod, and a large spill can get the pod evicted. Set
-`--sql-spill off`, or set `--cache-dir` to a volume sized for spill, in such
-deployments.
+**Containers.** The repository's container image sets no working directory
+of its own, so the server starts in `/home/nonroot`, the working directory of
+its distroless `nonroot` base image, and runs as that image's unprivileged
+user.
+
+- Under the operator, the root filesystem of every container is read-only, so
+  `<working-dir>/sql-spill` cannot be created. Spill resolves off with
+  `source=cwd-unavailable`, and the server logs the WARN line at each start.
+  The operator does not yet render `--cache-dir` or `--sql-spill`; rendering
+  them is a follow-up.
+- Run on its own (`docker run`, no read-only root), the image's working
+  directory is writable and lies on the image's overlay filesystem, so spill
+  is on there. On Kubernetes those spill files count against the
+  ephemeral-storage limit of the pod, and a large spill can get the pod
+  evicted.
+
+To get spill in a container, mount a writable volume that is not
+memory-backed (not a tmpfs, nor an `emptyDir` with `medium: Memory`) and pass
+`--cache-dir` on it, or set the `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES`
+pair to a directory on it. Size the volume for spill. To run without spill and
+silence the WARN line, pass `--sql-spill off`.
 
 ### Derived ceiling
 
