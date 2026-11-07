@@ -36,7 +36,8 @@ pub struct SeriesSample {
 }
 
 /// Draws up to `max_series` series' worth of samples from `profile_name`
-/// (`"cardinality"` or `"history"`) over `steps` scrapes of the committed
+/// (any manifest profile; the bake-offs draw `"cardinality"` and
+/// `"history"`) over `steps` scrapes of the committed
 /// workload manifest. Returns the manifest's seed (for the report's "fixed
 /// seed" statement) alongside the series, in first-encountered order.
 pub fn sample_series(
@@ -100,8 +101,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cardinality_profile_yields_bounded_series_with_real_manifest_seed() {
-        let (seed, series) = sample_series("cardinality", 8, 5).expect("sample cardinality");
+    /// The manifest's `ci` profile (1,000 series) exercises the same seed and
+    /// bounding as the cardinality profile the bake-offs draw, at a cost a
+    /// unit test can pay: every step generates every active series.
+    fn ci_profile_yields_bounded_series_with_real_manifest_seed() {
+        let (seed, series) = sample_series("ci", 8, 5).expect("sample ci");
         // The real manifest's seed (benchmarks/metrics/workload.json), so a
         // stale or hand-edited copy fails loud rather than reproducing
         // different numbers under the same report claim.
@@ -112,7 +116,7 @@ mod tests {
         );
         assert!(
             !series.is_empty(),
-            "the cardinality profile must emit at least one series"
+            "the ci profile must emit at least one series"
         );
         for s in &series {
             assert!(
