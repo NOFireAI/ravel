@@ -1101,6 +1101,9 @@ The scratch directory is a cache, not storage:
   the life of the process. Give each process its own directory: a second
   process that finds the lock held refuses the bucket and counts it under
   `reason="scratch_locked"`.
+- When it takes the lock, the process removes the unit subdirectories a
+  dead process left there. It leaves any other file in place, and under
+  `--maintain-scratch-max-bytes` those files count against the cap.
 
 Size the directory at about 1.3 times the stored input bytes of the largest
 bucket the process merges. A unit is admitted only when that many bytes are
