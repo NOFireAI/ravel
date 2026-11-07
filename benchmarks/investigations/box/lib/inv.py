@@ -340,7 +340,65 @@ def cmd_merge_truth(args):
         for k in [k for k in truth["answers"] if k.startswith("needle.")]:
             got = truth["answers"][k]["value"] + tail["answers"][k]["value"]
             truth["answers"]["mixed." + k] = {"rows": 1, "value": got}
+    add_over_cap(truth)
     write_json(args.out, truth)
+
+
+# ADR-3692 decision 6's k: a key set holds at most this many keys
+# (KEY_SET_MAX_KEYS, crates/ravel-query/src/key_index_route.rs). Row 11's
+# over-cap control is one key over it.
+KEY_SET_MAX_KEYS = 1024
+OVER_CAP_KEYS = KEY_SET_MAX_KEYS + 1
+
+
+def over_cap_padding(field, n, ids):
+    """n ids of `field` the corpus does not hold, each with a key8 (the 8 bytes
+    a KEY_IDX probe sorts and dedups on, crates/ravel-codec/src/key_idx.rs)
+    no other padding id shares. gen_corpus.py writes request ids as
+    req-<16 hex>-<row> or req-planted-*, so req-over-cap-absent-* is never
+    one, and their key8 is a blake3 prefix. A trace id is an Id16 whose key8
+    is its high 8 bytes, so padding j holds j there and zeros below; a random
+    128-bit draw is that id only by hitting it exactly, and j is skipped when
+    a listed id in `ids` already holds the same high 8 bytes."""
+    if field == "trace_id":
+        taken = {i[:16] for i in ids}
+        highs = (f"{j:016x}" for j in range(1, n + len(taken) + 1))
+        return [h + "0" * 16 for h in highs if h not in taken][:n]
+    return [p for p in (f"req-over-cap-absent-{j:04d}" for j in range(1, n + len(ids) + 1)) if p not in ids][:n]
+
+
+def add_over_cap(truth):
+    """Row 11's over-cap control lists, truth["over_cap"][field]: the
+    generator's largest IN list, its control_extra key (one the list does not
+    hold, when the corpus has one), then padding the corpus does not hold, to
+    OVER_CAP_KEYS keys. The padding adds no row, so each list's answer is the
+    generator's answer for the largest list plus control_extra, under the
+    OVER_CAP_KEYS truth key with its own requested count."""
+    lists = truth.get("in_lists") or {}
+    extra = truth.get("control_extra") or {}
+    answers = truth.setdefault("answers", {})
+    out = {}
+    for field, keys in (("trace_id", ("in_trace_id.{}.spans", "in_trace_id.{}.logs")),
+                        ("request_id", ("in_request_id.{}",))):
+        sizes = sorted(lists.get(field) or {}, key=int)
+        if not sizes:
+            continue
+        top = int(sizes[-1])
+        ids = list(lists[field][sizes[-1]])
+        if extra.get(field):
+            ids.append(extra[field])
+        ids += over_cap_padding(field, OVER_CAP_KEYS - len(ids), ids)
+        out[field] = ids
+        for key in keys:
+            src = answers.get(key.format(top + 1))
+            if src is None:
+                continue
+            per_key = src["requested"] // (top + 1) if "requested" in src else 1
+            want = dict(src, requested=OVER_CAP_KEYS * per_key)
+            want["capped"] = want["rows"] < want["requested"]
+            answers[key.format(OVER_CAP_KEYS)] = want
+    if out:
+        truth["over_cap"] = out
 
 
 def cli_base(args):
@@ -619,16 +677,11 @@ def placeholders(truth, run):
         p[f"in_trace_ids_x_{size}"] = ", ".join(f"X'{t}'" for t in ids)
     for size, ids in truth["in_lists"]["request_id"].items():
         p[f"in_request_ids_{size}"] = ", ".join(f"'{r}'" for r in ids)
-    # The 1,001-key controls: the largest list plus one key outside it.
-    extra = truth.get("control_extra") or {}
+    # Row 11's over-cap controls, as merge-truth built them.
     for field, fmt, name in (("trace_id", "X'{}'", "in_trace_ids_x"), ("request_id", "'{}'", "in_request_ids")):
-        sizes = sorted(truth["in_lists"][field], key=int)
-        if not sizes:
-            continue
-        ids = list(truth["in_lists"][field][sizes[-1]])
-        if extra.get(field):
-            ids.append(extra[field])
-        p[f"{name}_{int(sizes[-1]) + 1}"] = ", ".join(fmt.format(i) for i in ids)
+        ids = (truth.get("over_cap") or {}).get(field)
+        if ids:
+            p[f"{name}_{len(ids)}"] = ", ".join(fmt.format(i) for i in ids)
     for k, jc in truth["journey_c"].items():
         p[f"jc_start_ns_{k}"] = str(jc["start_ns"])
         p[f"jc_cut_ns_{k}"] = str(jc["cut_ns"])
@@ -1227,9 +1280,78 @@ def cmd_kv_report(args):
     print(json.dumps(doc, sort_keys=True))
 
 
+def leaf_slices(doc):
+    """{field: the most leaves (key slices) one part of a catalog stamp
+    carries for that field}."""
+    out = {}
+    for part in doc.get("parts", []):
+        counts = {}
+        for leaf in part.get("leaves", []):
+            counts[leaf.get("field")] = counts.get(leaf.get("field"), 0) + 1
+        for field, n in counts.items():
+            out[field] = max(out.get(field, 0), n)
+    return out
+
+
+def cmd_advance_check(args):
+    """The advanced_leaves state's two preconditions (README "States"), read
+    from the stamps the run already wrote. (i) fold_advance folded every
+    label with the leaf switch on and exited 0: a fold with the switch off
+    re-encodes the parts and drops their leaf refs. (ii) The check label's
+    check field carries more slices per part in advanced_leaves's catalog
+    stamp than in folded_leaves's, the one stamped after the leaf rebuild, so
+    the state measures an advanced tail. Prints the slices per (part, field)
+    of both stamps as one JSON line; exit 0 when both hold, 1 naming the
+    first that does not."""
+    folds = {}
+    path = os.path.join(args.stamps, "folds.jsonl")
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.strip():
+                    d = json.loads(line)
+                    if d.get("transition") == "fold_advance":
+                        folds[d.get("signal")] = d
+    except (OSError, ValueError) as e:
+        die(f"advance-check: cannot read {path}: {e}")
+    for label in args.labels:
+        line = folds.get(label)
+        if line is None:
+            die(f"advance-check: no fold_advance fold stamp for {label}: the mixed state did not fold its tail")
+        if line.get("exit") != 0:
+            die(f"advance-check: fold_advance on {label} exited {line.get('exit')}")
+        if "--key-index-leaves" not in str(line.get("kind") or "").split():
+            die(f"advance-check: fold_advance on {label} ran without --key-index-leaves (kind "
+                f"{line.get('kind')!r}): a fold with the switch off drops the parts' leaf refs")
+    slices = {}
+    for state in ("folded_leaves", "advanced_leaves"):
+        slices[state] = {}
+        for label in args.labels:
+            name = os.path.join(args.stamps, f"{state}.{label}.catalog.json")
+            try:
+                with open(name) as f:
+                    slices[state][label] = leaf_slices(json.load(f))
+            except (OSError, ValueError) as e:
+                die(f"advance-check: cannot read {name}: {e}")
+    print(json.dumps({"slices_per_part_field": slices}, sort_keys=True))
+    rebuilt = slices["folded_leaves"].get(args.check_label, {}).get(args.check_field)
+    advanced = slices["advanced_leaves"].get(args.check_label, {}).get(args.check_field)
+    if not rebuilt or not advanced or advanced <= rebuilt:
+        die(f"advance-check: {args.check_label} {args.check_field} has {advanced} slices per part in "
+            f"advanced_leaves against {rebuilt} after the leaf rebuild: the advance added no slice, so the "
+            f"state would not measure an advanced tail")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd_name", required=True)
+
+    ac = sub.add_parser("advance-check")
+    ac.add_argument("--stamps", required=True)
+    ac.add_argument("--labels", nargs="+", default=["spans", "logs"])
+    ac.add_argument("--check-label", default="logs")
+    ac.add_argument("--check-field", default="request_id")
+    ac.set_defaults(fn=cmd_advance_check)
 
     st = sub.add_parser("stamp")
     st.add_argument("--file", required=True)

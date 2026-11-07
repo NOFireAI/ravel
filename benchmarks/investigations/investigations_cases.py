@@ -22,6 +22,7 @@ import gzip
 import importlib.util
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -51,11 +52,12 @@ PY = sys.executable
 # runs every box/ script under 3.2 too.
 BASH = os.environ.get("INV_BASH", "bash")
 HOUR_NS = 3600 * 1_000_000_000
-STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight", "compaction_done",
-          "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160")
+STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves", "compaction_in_flight",
+          "compaction_done", "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160")
 SMOKE_STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
                 "erasure_in_flight", "many_parts_24")
 UNSUPPORTED = "unsupported-on-this-build"
+NOT_COMPUTABLE = "not-computable"
 GUARD = "refused-by-guard"
 REFUSAL_1000 = ("server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of "
                 "1000 tokens; simplify the statement")
@@ -310,6 +312,59 @@ metric = "cold.wall_p50_s"
 lane = "timing"
 target_if = "v < 0"
 """
+
+
+BLAKE3_IV = (0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19)
+BLAKE3_PERM = (2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+
+
+def blake3_compress(cv, m, block_len, flags):
+    s = list(cv) + list(BLAKE3_IV[:4]) + [0, 0, block_len, flags]
+    rot = lambda x, n: ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF
+
+    def g(a, b, c, d, x, y):
+        s[a] = (s[a] + s[b] + x) & 0xFFFFFFFF
+        s[d] = rot(s[d] ^ s[a], 16)
+        s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+        s[b] = rot(s[b] ^ s[c], 12)
+        s[a] = (s[a] + s[b] + y) & 0xFFFFFFFF
+        s[d] = rot(s[d] ^ s[a], 8)
+        s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+        s[b] = rot(s[b] ^ s[c], 7)
+    for _ in range(7):
+        for i, (a, b, c, d) in enumerate(((0, 4, 8, 12), (1, 5, 9, 13), (2, 6, 10, 14), (3, 7, 11, 15),
+                                          (0, 5, 10, 15), (1, 6, 11, 12), (2, 7, 8, 13), (3, 4, 9, 14))):
+            g(a, b, c, d, m[2 * i], m[2 * i + 1])
+        m = [m[p] for p in BLAKE3_PERM]
+    return [s[i] ^ s[i + 8] for i in range(8)]
+
+
+def blake3_single_chunk(data):
+    """BLAKE3 of an input of at most one 1,024-byte chunk, unkeyed: the
+    blake3 crate's hash() for the short keys key8_str and key8_bytes take."""
+    assert len(data) <= 1024
+    blocks = [data[i:i + 64] for i in range(0, len(data), 64)] or [b""]
+    cv = BLAKE3_IV
+    for n, block in enumerate(blocks):
+        flags = (1 if n == 0 else 0) | (2 | 8 if n == len(blocks) - 1 else 0)
+        words = [int.from_bytes(block.ljust(64, b"\0")[i:i + 4], "little") for i in range(0, 64, 4)]
+        cv = blake3_compress(cv, words, len(block), flags)
+    return b"".join(w.to_bytes(4, "little") for w in cv)
+
+
+def key8(kind, v):
+    """The 8-byte key a KEY_IDX probe sorts and dedups on
+    (crates/ravel-codec/src/key_idx.rs): an Id16's high 8 bytes, a string's
+    or bytes' blake3[..8], an i64's big-endian v ^ 1<<63."""
+    if kind == "id16":
+        return bytes.fromhex(v)[:8]
+    if kind == "str":
+        return blake3_single_chunk(v.encode())[:8]
+    if kind == "bytes":
+        return blake3_single_chunk(v)[:8]
+    if kind == "i64":
+        return ((v & 0xFFFFFFFFFFFFFFFF) ^ (1 << 63)).to_bytes(8, "big")
+    raise ValueError(kind)
 
 
 MATRIX_BANDS = PASS_BANDS + """
@@ -758,6 +813,76 @@ class Statements(unittest.TestCase):
             if s.get("sql") and not (s.get("requires") and not t.get(s["requires"])):
                 self.inv.fill(s["sql"], self.inv.placeholders(t, 0))
 
+    def test_over_cap_control_lists(self):
+        # Row 11's control is 1,025 keys, one over KEY_SET_MAX_KEYS: the
+        # 1,000-key list, control_extra and padding the corpus cannot hold,
+        # with the generator's 1,000-plus-extra answer as its oracle. Kills a
+        # control still built at 1,001 keys (the 1,001-key list is a key set
+        # under the cap) and padding that names a real key.
+        for s in ("spans_in_1025", "logs_trace_in_1025", "logs_request_in_1025"):
+            sql = next(x for x in self.st if x["id"] == s)["sql"]
+            filled = self.inv.fill(sql, self.inv.placeholders(self.truth, 0))
+            keys = re.findall(r"X'([0-9a-f]{32})'|'(req-[^']*)'", filled)
+            self.assertEqual(len(keys), 1025, s)
+            self.assertEqual(len(set(keys)), 1025, s)
+        for field, answers in (("trace_id", ("in_trace_id.{}.spans", "in_trace_id.{}.logs")),
+                               ("request_id", ("in_request_id.{}",))):
+            ids = self.truth["over_cap"][field]
+            top = self.truth["in_lists"][field]["1000"]
+            extra = self.truth["control_extra"][field]
+            self.assertEqual(ids[:len(top)], top, field)
+            pad = ids[len(top) + (extra is not None):]
+            self.assertEqual(len(ids), 1025, field)
+            if extra is not None:
+                self.assertEqual(ids[len(top)], extra, field)
+            if field == "request_id":
+                self.assertTrue(all(p.startswith("req-over-cap-absent-") for p in pad), pad[:3])
+            for key in answers:
+                over, base = self.truth["answers"][key.format(1025)], self.truth["answers"][key.format(1001)]
+                self.assertEqual(over["rows"], base["rows"], key)
+                self.assertEqual(over.get("row_set"), base.get("row_set"), key)
+                self.assertEqual(over["requested"] * 1001, base["requested"] * 1025, key)
+        # The small corpus's 1,000 traces are all in the 1,000-key list, so
+        # 25 trace ids are padding and the request id list gains its extra.
+        self.assertIsNone(self.truth["control_extra"]["trace_id"])
+        self.assertIsNotNone(self.truth["control_extra"]["request_id"])
+
+    def test_blake3_matches_the_reference_vectors(self):
+        # key_idx.rs pins blake3("")[..8]; the rest are the BLAKE3 test
+        # vectors (input bytes i % 251) at one block, two blocks and a chunk
+        # less one byte.
+        for data, want in ((b"", "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"),
+                           (b"abc", "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"),
+                           (bytes(i % 251 for i in range(1023)),
+                            "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11")):
+            self.assertEqual(blake3_single_chunk(data).hex(), want, len(data))
+        self.assertEqual(key8("i64", 0), bytes([0x80] + [0] * 7))
+        self.assertEqual(key8("i64", -1), bytes([0x7f] + [0xff] * 7))
+        self.assertEqual(key8("id16", "0102030405060708090a0b0c0d0e0f10"), bytes(range(1, 9)))
+
+    def test_over_cap_lists_hold_over_1024_distinct_key8(self):
+        # KeySet::new (key_index_route.rs) sorts and dedups the IN list's
+        # key8s and refuses only above KEY_SET_MAX_KEYS, so a 1,025-key list
+        # whose padding shares key8s is a key set under the cap and row 11's
+        # over-cap control never runs. Kills trace padding that differs only
+        # in the low 8 bytes (every one key8 0) and padding whose key8 is a
+        # listed id's.
+        kinds = {"trace_id": "id16", "request_id": "str"}
+        for field, ids in self.truth["over_cap"].items():
+            distinct = len({key8(kinds[field], v) for v in ids})
+            self.assertGreater(distinct, self.inv.KEY_SET_MAX_KEYS, field)
+            self.assertEqual(distinct, len(ids), field)
+        self.assertEqual(set(self.truth["over_cap"]), set(kinds))
+        # A corpus whose largest list is smaller takes more padding: the
+        # whole 1,025 of either field is key8-distinct on its own.
+        for field, kind in kinds.items():
+            pad = self.inv.over_cap_padding(field, self.inv.OVER_CAP_KEYS, [])
+            self.assertEqual(len({key8(kind, v) for v in pad}), self.inv.OVER_CAP_KEYS, field)
+        # The small corpus has no trace outside the list (control_extra is a
+        # held id the list lacks), so padding key8-distinct from the list is
+        # padding the corpus does not hold.
+        self.assertIsNone(self.truth["control_extra"]["trace_id"])
+
     def test_erasure_victim_needs_a_corpus_with_an_unread_row(self):
         # The small corpus's 1000-key lists name every trace, so it has no
         # victim and logs_erasure_victim plans as not-run; the box's corpus has one.
@@ -835,13 +960,15 @@ class Statements(unittest.TestCase):
     def test_in_list_caps_from_the_complexity_guard(self):
         # Item 9. Before ADR-3692's key set amendment an X list held at most
         # 330 keys (3n + 8) and a quoted list at most 496 (2n + 8) under
-        # MAX_STATEMENT_COMPLEXITY = 1,000, so the 1,000- and 1,001-key lists
+        # MAX_STATEMENT_COMPLEXITY = 1,000, so the 1,000- and 1,025-key lists
         # carry expect_refusal_on_main and fixtures/local-smoke reads them
         # refused. Kills a cap stated from 2 units per X element (495) or from
         # 1,000 / 2. Since the amendment a flat literal list costs one unit
         # plus one per 64 literals, so every one of these statements costs 24
-        # units at 1,000 and at 1,001 keys: kills a harness or README still
-        # reading the old caps as the current guard's.
+        # units at 1,000 keys and 25 at the 1,025-key control, which is under
+        # MAX_IN_LIST_LITERALS and so admitted, not refused: kills a harness
+        # or README still reading the old caps as the current guard's, and a
+        # control judged as a refusal the current guard never makes.
         with open(os.path.join(HERE, "..", "..", "crates", "ravel-sql", "src", "complexity_guard.rs")) as f:
             guard = f.read()
         lines = guard.splitlines()
@@ -865,11 +992,21 @@ class Statements(unittest.TestCase):
                 self.assertEqual(self.guard_units(fill(n), key_sets=False), per * n + 8, (sid, n))
             caps[sid] = max(n for n in range(1, 1001) if self.guard_units(fill(n), key_sets=False) <= 1000)
             self.assertGreater(self.guard_units(fill(1000), key_sets=False), 1000, sid)
-            self.assertGreater(self.guard_units(fill(1001), key_sets=False), 1000, sid)
-            for n, units in ((1, 9), (64, 9), (65, 10), (1000, 24), (1001, 24), (4096, 72)):
+            self.assertGreater(self.guard_units(fill(1025), key_sets=False), 1000, sid)
+            for n, units in ((1, 9), (64, 9), (65, 10), (1000, 24), (1025, 25), (4096, 72)):
                 self.assertEqual(self.guard_units(fill(n)), units, (sid, n))
             self.assertTrue(by[sid].get("expect_refusal_on_main"), sid)
-            self.assertTrue(by[sid.replace("1000", "1001")].get("expect_refusal_on_main"), sid)
+            over = by[sid.replace("1000", "1025")]
+            self.assertTrue(over.get("expect_refusal_on_main"), sid)
+            self.assertIn("_1025}", over["sql"], sid)
+            self.assertTrue(over["truth_key"].startswith(("in_trace_id.1025.", "in_request_id.1025")), sid)
+        # The control is one key over KEY_SET_MAX_KEYS and under the guard's
+        # literal cap: admitted, and carried as no key set.
+        with open(os.path.join(HERE, "..", "..", "crates", "ravel-query", "src", "key_index_route.rs")) as f:
+            self.assertIn("pub const KEY_SET_MAX_KEYS: usize = 1_024;", f.read())
+        inv = load_module(os.path.join(BOX, "lib", "inv.py"), "inv_caps")
+        self.assertEqual(inv.OVER_CAP_KEYS, 1025)
+        self.assertLessEqual(inv.OVER_CAP_KEYS, 4096)
         self.assertEqual(caps, {"spans_in_1000": 330, "logs_trace_in_1000": 330, "logs_request_in_1000": 496})
         for doc in (README, STATEMENTS):
             with open(doc) as f:
@@ -920,7 +1057,7 @@ class Statements(unittest.TestCase):
         # Item 17: each row's check, target, miss and source text is the ADR
         # Acceptance table's cell, the check without its "N. " number.
         _, adr = self.adr_band_rows()
-        self.assertEqual(len(adr), 17)
+        self.assertEqual(len(adr), 18)
         rows = self.bands["row"]
         for n, (r, cells) in enumerate(zip(rows, adr), 1):
             num, _, check = cells[0].partition(". ")
@@ -929,10 +1066,10 @@ class Statements(unittest.TestCase):
             for k, cell in zip(("target", "miss", "source"), cells[1:]):
                 self.assertEqual(r[k].strip(), cell, f"{r['key']}.{k}")
 
-    def test_bands_rows_1_to_17(self):
+    def test_bands_rows_1_to_18(self):
         rows = self.bands["row"]
-        self.assertEqual([r["adr_row"] for r in rows], list(range(1, 18)))
-        self.assertEqual([r["key"] for r in rows], [f"row_{n:02d}" for n in range(1, 18)])
+        self.assertEqual([r["adr_row"] for r in rows], list(range(1, 19)))
+        self.assertEqual([r["key"] for r in rows], [f"row_{n:02d}" for n in range(1, 19)])
         ids = {s["id"] for s in self.st} | {"fold", "all", "control", "stamp", "derived", "truth"}
         for r in rows:
             for k in ("check", "target", "miss", "source"):
@@ -951,9 +1088,9 @@ class Statements(unittest.TestCase):
             self.assertEqual(r["requires_tenant"], "hits")
             self.assertEqual({f["statement"] for f in r["figure"]}, {"q20_hits", "stamp"})
         timed = sorted({r["key"] for r in rows for f in r["figure"] if f["lane"] == "timing"})
-        # Rows 2, 5 and 15 time statements; row 16's slowdown is a timing
+        # Rows 2, 5, 15 and 18 time statements; row 16's slowdown is a timing
         # figure of a control run this harness does not perform.
-        self.assertEqual(timed, ["row_02", "row_05", "row_15", "row_16"])
+        self.assertEqual(timed, ["row_02", "row_05", "row_15", "row_16", "row_18"])
         r16 = next(r for r in rows if r["key"] == "row_16")
         self.assertEqual({f["statement"] for f in r16["figure"] if f["lane"] == "timing"}, {"control"})
         for r in rows:
@@ -979,11 +1116,11 @@ class LocalSmoke(Workdir):
             with open(os.path.join(SMOKE, name), "rb") as a, open(self.path("out", name), "rb") as b:
                 self.assertEqual(a.read(), b.read(), name)
 
-    def test_control_1001_refused_by_guard_on_main(self):
-        """bands.toml row 11: on main the complexity guard refuses the 1,000-key lists."""
+    def test_control_1025_refused_by_guard_on_main(self):
+        """bands.toml row 11: the fixture's build refuses the 1,000-key lists."""
         with gzip.open(os.path.join(SMOKE, "results.local.json.gz"), "rt") as f:
             res = json.load(f)
-        for name in ("spans_control_1001", "logs_trace_control_1001", "logs_request_control_1001"):
+        for name in ("spans_control_1025", "logs_trace_control_1025", "logs_request_control_1025"):
             f = figure(res, f"row_11.{name}")
             self.assertEqual((f["status"], f["verdict"]), (GUARD, GUARD), name)
 
@@ -998,8 +1135,6 @@ class LocalSmoke(Workdir):
             "miss row_01.wire_bytes",
             "miss row_02.wire_bytes",
             "miss row_03.probe_wire_per_object",
-            "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
-            "miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
             "miss row_08.logs_trace_id_leaf_pct",
             "miss row_08.logs_request_id_leaf_pct: key cardinality equals the row count",
             "dead_counter segmentsOpened journey_c_1 folded_leaves",
@@ -1019,8 +1154,8 @@ class LocalSmoke(Workdir):
                 self.assertTrue(f["reason"], f["id"])
                 continue
             if f["state"] in covered:
-                self.assertIn(f["status"], ("value", UNSUPPORTED, GUARD, "dead_counter"), f["id"])
-            if f["status"] in (UNSUPPORTED, GUARD):
+                self.assertIn(f["status"], ("value", UNSUPPORTED, GUARD, NOT_COMPUTABLE, "dead_counter"), f["id"])
+            if f["status"] in (UNSUPPORTED, GUARD, NOT_COMPUTABLE):
                 self.assertTrue(f["reason"], f["id"])
 
     def test_states_section(self):
@@ -1028,7 +1163,7 @@ class LocalSmoke(Workdir):
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         got = {s["state"]: (s["status"], s.get("reason")) for s in res["states"]}
         want = {s: ("run", None) for s in SMOKE_STATES + ("fold_advance", "compaction_done")}
-        want.update({s: ("not-run", "not in run.toml states") for s in ("many_parts_744", "many_parts_2160")})
+        want.update({s: ("not-run", "not in run.toml states") for s in ("advanced_leaves", "many_parts_744", "many_parts_2160")})
         self.assertEqual(got, want)
 
     def test_in_1000_is_sent_and_refused_by_the_complexity_guard(self):
@@ -1043,15 +1178,15 @@ class LocalSmoke(Workdir):
                 for c in lines:
                     self.assertEqual((c["outcome"], c["http_status"], c["reason"]), (UNSUPPORTED, 400, REFUSAL_1000))
                     self.assertIn("wall_s", c)
-        # The 1,001-key control has no 1,000-key answer to compare against.
+        # The over-cap control has no 1,000-key answer to compare against.
         for prefix in ("spans", "logs_trace", "logs_request"):
-            f = figure(res, f"row_11.{prefix}_control_1001")
+            f = figure(res, f"row_11.{prefix}_control_1025")
             self.assertEqual((f["status"], f["value"], f["verdict"], f["reason"]),
                              (GUARD, None, GUARD, f"refused by the SQL complexity guard: {REFUSAL_1000}"))
         self.assertEqual(figure(res, "row_11.spans_1000_rows_exact")["reason"], REFUSAL_1000)
         # Item 8: the guard's refusals are counted apart from unsupported figures.
         self.assertEqual(res["refusal_classes"], {GUARD: {"figures": 15, "calls": 24},
-                                                  UNSUPPORTED: {"figures": 23, "calls": 0}})
+                                                  UNSUPPORTED: {"figures": 29, "calls": 0}})
         guarded = sorted(f["id"] for f in res["figures"] if f["status"] == GUARD)
         self.assertEqual(len(guarded), 15)
         self.assertTrue(all(i.startswith("row_11.") for i in guarded), guarded)
@@ -1068,6 +1203,7 @@ class LocalSmoke(Workdir):
             {"row": 10, "key": "row_10", "reason": "run.toml states lacks ['many_parts_2160']"},
             {"row": 12, "key": "row_12", "reason": "run.toml scales lacks [10, 100]"},
             {"row": 16, "key": "row_16", "reason": "run.toml hits = false, baseline = false"},
+            {"row": 18, "key": "row_18", "reason": "run.toml states lacks ['advanced_leaves']"},
         ])
         self.assertEqual(text.splitlines()[:3], [
             "selective investigations, lane local: fail",
@@ -1075,8 +1211,8 @@ class LocalSmoke(Workdir):
             "covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact (run.toml states lacks "
             "['many_parts_744']); row 10 (run.toml "
             "states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml "
-            "hits = false, baseline = false)",
-            "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23 figure(s), "
+            "hits = false, baseline = false); row 18 (run.toml states lacks ['advanced_leaves'])",
+            "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29 figure(s), "
             "0 call(s)",
         ])
 
@@ -1095,15 +1231,20 @@ class LocalSmoke(Workdir):
         for name in ("covering_parts", "rows_exact"):
             self.assertEqual(figure(res, f"row_09.{name}")["status"], "not-run")
 
-    def test_section_gets_are_a_from_scratch_rebuild(self):
-        # Item 3: the advancing fold re-reads every entry's sections, old and
-        # new, not only the tail's.
+    def test_section_gets_need_the_pass_count(self):
+        # Item 3: the fixture's advancing fold read every entry's sections,
+        # 2 x its tail entries, but its build reports no
+        # key_index_build_passes, and row 7 is judged per pass, so the figure
+        # is unsupported, not a miss and not a pass (the per-pass cases are
+        # check_row_7_box_d and check_row_7_rebuild).
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         for sig in ("spans", "logs"):
             f = figure(res, f"row_07.{sig}_section_gets")
             tail = figure(res, f"row_07.{sig}_tail_entries")["value"]
-            self.assertEqual((f["value"], f["verdict"]), (2 * tail, "miss"), sig)
-            self.assertEqual(f["reason"], "from-scratch rebuild: section GETs = 2 x entry_count")
+            self.assertEqual((f["value"], f["verdict"]), (2 * tail, UNSUPPORTED), sig)
+            self.assertIn(f"band refers to figure row_07.{sig}_build_passes", f["reason"])
+            for name in ("sections_read", "sections_per_pass", "leaf_gets", "build_passes"):
+                self.assertEqual(figure(res, f"row_07.{sig}_{name}")["status"], UNSUPPORTED, (sig, name))
 
     def test_dead_counter_on_row_14(self):
         # Item 5: segmentsOpened reads 0 on calls that issued scan GETs.
@@ -1258,6 +1399,11 @@ class LocalSmoke(Workdir):
         for t in (committed, truth):
             for doc in (t, *t["sub"].values()):
                 self.assertEqual(doc["generator"].pop("format"), "parquet" if t is committed else "jsonl")
+        # The fixture's run predates the over-cap lists merge-truth now adds;
+        # they are the only difference.
+        self.assertNotIn("over_cap", committed)
+        load_module(os.path.join(BOX, "lib", "inv.py"), "inv_over_cap").add_over_cap(committed)
+        self.assertEqual([len(v) for v in truth["over_cap"].values()], [1025, 1025])
         self.assertEqual(truth, committed)
 
 
@@ -1564,7 +1710,7 @@ class Evaluate(Workdir):
                "states": ["unfolded"]}
         out = []
         for gets, want in ((2, "miss"), (3, "pass"), (796, "pass"), (797, "miss")):
-            def fixed(calls, cfg, statement, state, metric, candidates=None, gets=gets):
+            def fixed(calls, cfg, statement, state, metric, candidates=None, over_512k=None, gets=gets):
                 return ("value", gets, "") if metric == "cold.max.keyindex_gets" else ("missing", None, "not set")
             mod.statement_figure = fixed
             figs = mod.run_rows(bands, cfg, {"unfolded": None}, None, None, {}, census, None, {}, {})
@@ -1578,6 +1724,108 @@ class Evaluate(Workdir):
 
     def test_row_6_floor(self):
         self.assertEqual(self.check_row_6_floor(), [])
+
+    @staticmethod
+    def box_c_q20_call():
+        """One cold q20 call on unfolded with box C's per-phase stats, as its calls.jsonl records try 0 (and
+        try 1 the same): run investigations-20261106T154511Z-47463-23195, build b54ecc52a. The plan phase
+        opened 493 objects with 493 GETs (the KEY_IDX probe's footer reads), the key index pruned 492 of them,
+        and the scan phase opened 4 with 6 GETs and 989,537 B; 497 over every phase."""
+        def phase(name, gets=0, wire=0, opened=0, cached=0):
+            return {"phase": name, "s3GetRequests": gets, "s3GetWireBytes": wire, "s3ListRequests": 0,
+                    "segmentsOpened": opened, "decompressedOutputBytes": 0, "cacheServedBytes": cached}
+        return {"statement": "q20_hits", "state": "unfolded", "temp": "cold", "try": 0, "outcome": "ok",
+                "truth_key": "hits.q20", "rows": 4, "wall_s": 3.0, "server_cpu_s": 1.0, "server_hwm_bytes": 1,
+                "stats": {"phases": [phase("resolve", 1, 33, 0, 1_287_727), phase("plan", 493, 121_939_878, 493),
+                                     phase("probe"), phase("scan", 6, 989_537, 4, 262_144),
+                                     phase("keyIndex", 970, 1_322_842)],
+                          "pruning": {"blocksScanned": 5, "segments": 523, "segmentsPrunedByKeyIndex": 492,
+                                      "segmentsPrunedByStats": 26, "segmentsSkippedByThreshold": 0},
+                          "io": {"dependencyDepth": 1}, "signals": [{}]}}
+
+    def check_row_6_objects_past_probe(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Row 6's objects past the probe are the plan phase's segmentsOpened less
+        segmentsPrunedByKeyIndex: 493 - 492 = 1 on box C's call, the band's holders, so a pass. Neither the
+        scan phase's segmentsOpened (4) nor the sum over the phases (497) is that figure, and a build whose
+        stats carry no segmentsPrunedByKeyIndex reads unsupported-on-this-build.
+
+        The figure is judged only when the plan opened exactly the objects the probe saw: plan segmentsOpened
+        equal to the census's objects above 512 KiB less pruning.segmentsPrunedByStats, 519 - 26 = 493 on box
+        C. The same stats with the plan opening 497 read incomplete, with no value and an incomplete line, not
+        a hold or a miss; with the precondition holding, a probe that let 2 objects through misses.
+
+        The equality can hold by coincidence when the time window drops objects or a threshold skips them,
+        neither of which segmentsPrunedByStats counts, so the precondition also asks pruning.segments equal
+        to the census's 523 objects and segmentsSkippedByThreshold 0: pruning.segments 522, or one segment
+        skipped by threshold, reads incomplete with the plan's count still matching."""
+        mod = load_module(evaluate_py, "evaluate_row6_past_probe")
+        with open(bands, "rb") as f:
+            rows = {"row": [r for r in tomllib.load(f)["row"] if r["key"] == "row_06"]}
+        c = self.box_c_q20_call()
+        problems = mod.Problems()
+        statements = {"q20_hits": {"id": "q20_hits", "tenant": "hits", "table": "logs"}}
+        calls = mod.Calls([c], problems, statements)
+        c["_judged"] = "reference"
+        census = {("unfolded",): {"state": "unfolded", "census": {"tenants": {
+            "hits": {"data": {"logs": {"objects": 523, "objects_over_512k": 519}}}}}}}
+        cfg = {"lane": "local", "hits": True, "tenant": "inv", "scales": [1], "baseline": False,
+               "states": ["unfolded"], "cold_runs": 1, "warm_runs": 0}
+
+        def rows_now():
+            return {f["id"]: f for f in mod.run_rows(rows, cfg, {"unfolded": None}, calls, None, {}, census, None,
+                                                     {}, {}, None,
+                                                     lambda x: mod.census_over_512k(census, statements, cfg, x))}
+        figs = rows_now()
+        out = [] if not problems.lines else [f"problems {problems.lines}"]
+        got = figs["row_06.objects_past_probe"]
+        if (got["value"], got["verdict"]) != (1, "pass"):
+            out.append(f"objects_past_probe {got['value']} {got['verdict']} {got['reason']}")
+        plan = next(p for p in c["stats"]["phases"] if p["phase"] == "plan")
+        plan["segmentsOpened"] = 497
+        got = rows_now()["row_06.objects_past_probe"]
+        if (got["status"], got["value"], got["verdict"]) != ("incomplete", None, "incomplete") or not all(
+                s in got["reason"] for s in ("plan segmentsOpened 497", "objects_over_512k 519",
+                                             "segmentsPrunedByStats 26")):
+            out.append(f"plan opening 497: {got['status']} {got['value']} {got['verdict']} {got['reason']}")
+        lines = mod.incomplete_reasons({"states": []}, {}, calls, [got])
+        if lines != [f"figure row_06.objects_past_probe incomplete: {got['reason']}"]:
+            out.append(f"plan opening 497 incomplete lines {lines}")
+        plan["segmentsOpened"] = 493
+        for field, value, want in (("segments", 522, "pruning.segments 522 is not census objects 523"),
+                                   ("segmentsSkippedByThreshold", 1, "segmentsSkippedByThreshold 1 is not 0")):
+            c["stats"]["pruning"][field] = value
+            got = rows_now()["row_06.objects_past_probe"]
+            if (got["status"], got["value"], got["verdict"]) != ("incomplete", None, "incomplete") or (
+                    want not in got["reason"]):
+                out.append(f"{field} {value}: {got['status']} {got['value']} {got['verdict']} {got['reason']}")
+            c["stats"]["pruning"][field] = {"segments": 523, "segmentsSkippedByThreshold": 0}[field]
+        logs = census[("unfolded",)]["census"]["tenants"]["hits"]["data"]["logs"]
+        del logs["objects"]
+        got = rows_now()["row_06.objects_past_probe"]
+        if (got["status"], got["verdict"]) != ("incomplete", "incomplete") or (
+                "has no hits/logs objects_over_512k or objects" not in got["reason"]):
+            out.append(f"census without objects: {got['status']} {got['verdict']} {got['reason']}")
+        logs["objects"] = 523
+        c["stats"]["pruning"]["segmentsPrunedByKeyIndex"] = 491
+        got = rows_now()["row_06.objects_past_probe"]
+        if (got["value"], got["verdict"]) != (2, "miss"):
+            out.append(f"2 past the probe: {got['value']} {got['verdict']} {got['reason']}")
+        c["stats"]["pruning"]["segmentsPrunedByKeyIndex"] = 492
+        for name, value in (("gets_beyond_probe", 6), ("scan_wire_bytes", 989_537)):
+            if (figs[f"row_06.{name}"]["value"], figs[f"row_06.{name}"]["verdict"]) != (value, "pass"):
+                out.append(f"{name} {figs[f'row_06.{name}']}")
+        if mod.call_metrics(c)["segments_opened"] != 497:
+            out.append(f"segmentsOpened summed {mod.call_metrics(c)['segments_opened']}")
+        if mod.call_metrics(c)["scan_segments_opened"] != 4:
+            out.append(f"scan segmentsOpened {mod.call_metrics(c)['scan_segments_opened']}")
+        del c["stats"]["pruning"]["segmentsPrunedByKeyIndex"]
+        got = mod.statement_figure(calls, cfg, "q20_hits", "unfolded", "cold.max.probe_survivors")
+        if got[0] != UNSUPPORTED:
+            out.append(f"probe_survivors without segmentsPrunedByKeyIndex {got}")
+        return out
+
+    def test_row_6_objects_past_probe(self):
+        self.assertEqual(self.check_row_6_objects_past_probe(), [])
 
     def needle_stamp(self, **fields):
         path = self.stamp_path("needle_blocks.json")
@@ -1811,10 +2059,266 @@ class Evaluate(Workdir):
     def test_probe_per_object(self):
         self.assertEqual(self.check_probe_per_object(), [])
 
+    # Box D's fold_advance (#3692 comment 6700944105, the Stage 1 amendment's
+    # row 7): spans 40 new entries over 3 passes, 240 ranged GETs, 1 previous
+    # leaf; logs 22 new entries of a 570-entry tail over 27 passes, 1,188
+    # ranged GETs (594 sections, 22 a pass), 6 previous leaves (5 request_id
+    # slices and 1 trace_id); no entry uncovered.
+    BOX_D_ROW_7 = {
+        "spans": dict(mixed=800, tail=840, leaves=1, ranged=240, sections=120, passes=3, leaf_gets=1, uncovered=0),
+        "logs": dict(mixed=548, tail=570, leaves=6, ranged=1188, sections=594, passes=27, leaf_gets=6, uncovered=0),
+    }
+
+    def set_row_7(self, figures):
+        """Write {signal: dict(mixed, tail, leaves, ranged, sections, passes, leaf_gets, uncovered)} into the
+        mixed and fold_advance catalog stamps and the fold_advance fold reports."""
+        for sig, f in figures.items():
+            for state, entries in (("mixed", f["mixed"]), ("fold_advance", f["tail"])):
+                path = self.stamp_path(f"{state}.{sig}.catalog.json")
+                with open(path) as fh:
+                    doc = json.load(fh)
+                doc["entries"] = entries
+                if state == "mixed":
+                    leaf = doc["parts"][0]["leaves"][0]
+                    doc["parts"] = doc["parts"][:1]
+                    doc["parts"][0]["leaves"] = [dict(leaf) for _ in range(f["leaves"])]
+                with open(path, "w") as fh:
+                    json.dump(doc, fh)
+        folds = read_jsonl(self.stamp_path("folds.jsonl"))
+        for line in folds:
+            f = figures.get(line["signal"]) if line["transition"] == "fold_advance" else None
+            if f:
+                line["report"].update(key_index_ranged_gets=f["ranged"], key_index_sections_read=f["sections"],
+                                      key_index_build_passes=f["passes"], key_index_leaf_gets=f["leaf_gets"],
+                                      key_index_uncovered_entries=f["uncovered"])
+        write_jsonl(self.stamp_path("folds.jsonl"), folds)
+
+    def check_row_7_box_d(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 3: box D's advance holds on section GETs per pass, section reads per pass and leaf GETs, where
+        a total against 2 x tail entries (1,188 against 1,140) called it a rebuild."""
+        self.set_row_7(self.BOX_D_ROW_7)
+        _, res, _ = self.go(bands, evaluate_py)
+        out = []
+        for sig, f in self.BOX_D_ROW_7.items():
+            for name, value in (("section_gets", f["ranged"]), ("sections_per_pass", f["sections"] / f["passes"]),
+                                ("leaf_gets", f["leaf_gets"]), ("new_entries", f["tail"] - f["mixed"])):
+                got = figure(res, f"row_07.{sig}_{name}")
+                if (got["value"], got["verdict"]) != (value, "pass"):
+                    out.append(f"{sig} {name} {got['value']} {got['verdict']} {got['reason']}")
+        return out
+
+    def test_row_7_box_d(self):
+        self.assertEqual(self.check_row_7_box_d(), [])
+        # The arithmetic the case rests on, and the total the old miss line
+        # compared: 2 x 22 x 27 = 1,188 >= 2 x 570 = 1,140.
+        logs = self.BOX_D_ROW_7["logs"]
+        self.assertEqual(logs["ranged"], 2 * (logs["tail"] - logs["mixed"]) * logs["passes"])
+        self.assertEqual(logs["sections"], (logs["tail"] - logs["mixed"]) * logs["passes"])
+        self.assertGreaterEqual(logs["ranged"], 2 * logs["tail"])
+        self.assertEqual(2 * logs["tail"], 1140)
+
+    def check_row_7_rebuild(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 3: a from-scratch rebuild, every tail entry's sections read in one pass (2 x 570 = 1,140 ranged
+        GETs, 570 sections), still misses on both signals, with the rebuild reasons."""
+        rebuild = {sig: dict(f, ranged=2 * f["tail"], sections=f["tail"], passes=1)
+                   for sig, f in self.BOX_D_ROW_7.items()}
+        self.set_row_7(rebuild)
+        _, res, _ = self.go(bands, evaluate_py)
+        out = []
+        for sig in rebuild:
+            for name, reason in (("section_gets", "from-scratch rebuild: section GETs = 2 x entry_count per pass"),
+                                 ("sections_per_pass", "from-scratch rebuild: every tail entry's section read on "
+                                                       "a pass")):
+                want = f"miss row_07.{sig}_{name}: {reason}"
+                if want not in res["problems"]:
+                    out.append(f"no '{want}'")
+        return out
+
+    def test_row_7_rebuild(self):
+        self.assertEqual(self.check_row_7_rebuild(), [])
+
+    def check_row_7_extra_leaf_gets(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 3: an advance that reads the previous leaves more than once each misses on leaf GETs."""
+        self.set_row_7({"logs": dict(self.BOX_D_ROW_7["logs"], leaf_gets=12)})
+        _, res, _ = self.go(bands, evaluate_py)
+        f = figure(res, "row_07.logs_leaf_gets")
+        return [] if (f["value"], f["verdict"]) == (12, "miss") else [f"{f['value']} {f['verdict']}"]
+
+    def test_row_7_extra_leaf_gets(self):
+        self.assertEqual(self.check_row_7_extra_leaf_gets(), [])
+
+    def row_bands(self, key, bands=BANDS):
+        """A bands file holding only bands.toml's row `key`."""
+        with open(bands) as f:
+            text = f.read()
+        start = text.index(f'[[row]]\nkey = "{key}"\n')
+        end = text.find("\n[[row]]\n", start + 1)
+        return self.pass_bands(text[start:] if end < 0 else text[start:end + 1])
+
+    # G's inputs on box D's figures (#3948): spans trace_id 20,833,333 pairs,
+    # one field, budget 8,000,000 (share 8,000,000: G in [3, 5]); logs
+    # request_id 104,166,665 and trace_id 20,833,333 pairs, budget 8,000,000
+    # (share 4,000,000: request_id in [27, 53], trace_id in [6, 11]), so the
+    # logs build's passes lie in [27, 53].
+    BOX_D_G_INPUTS = {
+        "spans": (8_000_000, {"trace_id": 20_833_333}),
+        "logs": (8_000_000, {"request_id": 104_166_665, "trace_id": 20_833_333}),
+    }
+    BOX_D_G_BOUNDS = {"spans": (3, 5), "logs": (27, 53)}
+
+    def set_g_inputs(self, inputs):
+        """Write {signal: (pair budget, {field: total pairs})} into the fold_advance fold reports."""
+        folds = read_jsonl(self.stamp_path("folds.jsonl"))
+        for line in folds:
+            if line["transition"] == "fold_advance" and line["signal"] in inputs:
+                budget, pairs = inputs[line["signal"]]
+                line["report"].update(key_index_pair_budget=budget, key_index_field_pairs=pairs)
+        write_jsonl(self.stamp_path("folds.jsonl"), folds)
+
+    def check_row_7_passes_not_computable(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Box D's passes, 3 on spans and 27 on logs, are not judged against 1: the target is G's range,
+        bounded from the pair budget and each indexed field's total pairs, and the fold report carries
+        neither, so both bounds read not-computable naming both inputs, the passes judged against them read
+        not-computable too, and the run is incomplete (exit 1) with an incomplete line for each of the six,
+        never a hold or a miss. The passes still scale the section GETs, which hold."""
+        self.set_row_7(self.BOX_D_ROW_7)
+        code, res, _ = self.go(self.row_bands("row_07", bands), evaluate_py)
+        out = []
+        if (code, res["verdict"], res["problems"]) != (1, "incomplete", []):
+            out.append(f"verdict {code} {res['verdict']} {res['problems']}")
+        for sig, f in self.BOX_D_ROW_7.items():
+            for bound in ("low", "high"):
+                g = figure(res, f"row_07.{sig}_build_passes_{bound}")
+                if (g["status"], g["verdict"]) != (NOT_COMPUTABLE, NOT_COMPUTABLE) or not all(
+                        k in g["reason"] for k in ("key_index_pair_budget", "key_index_field_pairs")):
+                    out.append(f"{sig} G {bound} {g['status']} {g['verdict']} {g['reason']}")
+            p = figure(res, f"row_07.{sig}_build_passes")
+            if (p["status"], p["value"], p["verdict"]) != ("value", f["passes"], NOT_COMPUTABLE):
+                out.append(f"{sig} passes {p['status']} {p['value']} {p['verdict']}")
+            if "key_index_pair_budget" not in (p["reason"] or ""):
+                out.append(f"{sig} passes reason {p['reason']}")
+            for fid in (f"row_07.{sig}_build_passes_low", f"row_07.{sig}_build_passes_high",
+                        f"row_07.{sig}_build_passes"):
+                if not any(line.startswith(f"figure {fid} {NOT_COMPUTABLE}: ") for line in res["incomplete"]):
+                    out.append(f"no incomplete line for {fid}")
+            got = figure(res, f"row_07.{sig}_section_gets")
+            if (got["value"], got["verdict"]) != (f["ranged"], "pass"):
+                out.append(f"{sig} section_gets {got['value']} {got['verdict']}")
+        return out
+
+    def test_row_7_passes_not_computable(self):
+        self.assertEqual(self.check_row_7_passes_not_computable(), [])
+
+    def check_row_7_g(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A build whose fold report carries G's inputs: G lies in [3, 5] on spans and [27, 53] on logs, box
+        D's 3 and 27 passes hold against them and the row passes; on logs 53 passes hold and 2 and 54
+        miss."""
+        self.set_row_7(self.BOX_D_ROW_7)
+        self.set_g_inputs(self.BOX_D_G_INPUTS)
+        row = self.row_bands("row_07", bands)
+        code, res, _ = self.go(row, evaluate_py)
+        out = []
+        if (code, res["verdict"], res["incomplete"]) != (0, "pass", []):
+            out.append(f"verdict {code} {res['verdict']} {res['problems']} {res['incomplete']}")
+        for sig, f in self.BOX_D_ROW_7.items():
+            lo, hi = (figure(res, f"row_07.{sig}_build_passes_{b}") for b in ("low", "high"))
+            p = figure(res, f"row_07.{sig}_build_passes")
+            got = ((lo["value"], hi["value"]), lo["verdict"], hi["verdict"], p["value"], p["verdict"])
+            if got != (self.BOX_D_G_BOUNDS[sig], "pass", "pass", f["passes"], "pass"):
+                out.append(f"{sig} G {got}")
+        for passes, want in ((53, "pass"), (2, "miss"), (54, "miss")):
+            self.set_row_7({"logs": dict(self.BOX_D_ROW_7["logs"], passes=passes)})
+            _, res, _ = self.go(row, evaluate_py)
+            p = figure(res, "row_07.logs_build_passes")
+            if (p["value"], p["verdict"]) != (passes, want):
+                out.append(f"logs {passes} passes {p['value']} {p['verdict']}, want {want}")
+        return out
+
+    def test_row_7_g(self):
+        self.assertEqual(self.check_row_7_g(), [])
+
+    def check_row_7_g_zero_pair_field(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A field the build indexed with no pairs still counts in F: box D's logs inputs with a third,
+        zero-pair field put the share at 8,000,000 // 3 = 2,666,666 and request_id's 104,166,665 pairs in
+        [40, 79], so 27 passes miss where they hold with F = 2."""
+        self.set_row_7(self.BOX_D_ROW_7)
+        budget, pairs = self.BOX_D_G_INPUTS["logs"]
+        self.set_g_inputs({"logs": (budget, dict(pairs, span_id=0))})
+        _, res, _ = self.go(self.row_bands("row_07", bands), evaluate_py)
+        lo, hi = (figure(res, f"row_07.logs_build_passes_{b}")["value"] for b in ("low", "high"))
+        p = figure(res, "row_07.logs_build_passes")
+        got = (lo, hi, p["value"], p["verdict"])
+        return [] if got == (40, 79, 27, "miss") else [f"logs with a zero-pair field {got}"]
+
+    def test_row_7_g_zero_pair_field(self):
+        self.assertEqual(self.check_row_7_g_zero_pair_field(), [])
+
+    @staticmethod
+    def greedy_groups(share, runs):
+        """The pass-end slice amendment's greedy cut of one field's ascending key8 runs into groups of at
+        most share pairs, a single run over the share its own group; at least 1."""
+        groups, held = 0, 0
+        for r in runs:
+            if held and held + r > share:
+                groups, held = groups + 1, 0
+            held += r
+        return max(1, groups + (1 if held else 0))
+
+    def check_g_bounds(self, evaluate_py=EVALUATE):
+        """g_bounds on box D's inputs gives [3, 5] and [27, 53]; a field of no pairs gives [1, 1]; and for
+        2,000 seeded run lists with every run at most the share, the greedy cut's group count lies inside
+        [ceil(P / s), 2 x ceil(P / s) - 1], at least 1, the bound the evaluator judges against."""
+        mod = load_module(evaluate_py, "evaluate_g_bounds")
+        out = [f"{sig} {mod.g_bounds(*self.BOX_D_G_INPUTS[sig])}, want {want}"
+               for sig, want in self.BOX_D_G_BOUNDS.items() if mod.g_bounds(*self.BOX_D_G_INPUTS[sig]) != want]
+        if mod.g_bounds(8, {"a": 0}) != (1, 1):
+            out.append(f"zero pairs {mod.g_bounds(8, {'a': 0})}")
+        rng = random.Random(3948)
+        for _ in range(2000):
+            share = rng.randint(1, 12)
+            runs = [rng.randint(1, share) for _ in range(rng.randint(0, 40))]
+            lo, hi = mod.g_bounds(share, {"f": sum(runs)})
+            if not lo <= self.greedy_groups(share, runs) <= hi:
+                out.append(f"share {share} runs {runs}: {self.greedy_groups(share, runs)} outside [{lo}, {hi}]")
+        return out
+
+    def test_g_bounds(self):
+        self.assertEqual(self.check_g_bounds(), [])
+
+    # Uncovered entries on box D's figures: spans 10 over 3 passes, logs 5 over
+    # 27, each read on every pass. Spans: 2 x (40 + 10) x 3 = 300 ranged GETs
+    # and 50 sections a pass, over the 240 and 40 the new entries alone allow.
+    # Logs: 2 x (22 + 5) x 27 = 1,458 and 27 a pass, over 1,188 and 22.
+    ROW_7_UNCOVERED = {
+        "spans": dict(BOX_D_ROW_7["spans"], uncovered=10, ranged=300, sections=150),
+        "logs": dict(BOX_D_ROW_7["logs"], uncovered=5, ranged=1458, sections=729),
+    }
+
+    def check_row_7_uncovered(self, evaluate_py=EVALUATE, bands=BANDS):
+        """An advance whose uncovered entries are re-read on every pass holds on section GETs and section
+        reads per pass only with the uncovered term: the new entries alone put both over their targets."""
+        self.set_row_7(self.ROW_7_UNCOVERED)
+        _, res, _ = self.go(bands, evaluate_py)
+        out = []
+        for sig, f in self.ROW_7_UNCOVERED.items():
+            new = f["tail"] - f["mixed"]
+            if f["ranged"] <= 2 * new * f["passes"] or f["sections"] / f["passes"] <= new:
+                out.append(f"{sig}: the figures hold without the uncovered term")
+            for name, value in (("uncovered_entries", f["uncovered"]), ("section_gets", f["ranged"]),
+                                ("sections_per_pass", f["sections"] / f["passes"])):
+                got = figure(res, f"row_07.{sig}_{name}")
+                if (got["value"], got["verdict"]) != (value, "pass"):
+                    out.append(f"{sig} {name} {got['value']} {got['verdict']} {got['reason']}")
+        return out
+
+    def test_row_7_uncovered(self):
+        self.assertEqual(self.check_row_7_uncovered(), [])
+
     def check_miss_reason(self, evaluate_py=EVALUATE):
         """Item 3: row 7's miss carries the from-scratch reason bands.toml gives it."""
+        self.set_row_7({"spans": dict(self.BOX_D_ROW_7["spans"], ranged=2 * 840, sections=840, passes=1)})
         _, res, _ = self.go(BANDS, evaluate_py)
-        want = "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count"
+        want = "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count per pass"
         return [] if want in res["problems"] else [f"problems {res['problems']}"]
 
     def test_miss_reason(self):
@@ -1936,23 +2440,246 @@ class Evaluate(Workdir):
         self.assertEqual(figure(res, "row_13.wrong_answers")["value"], 1)
         self.assertEqual(figure(res, "row_13.errors")["value"], 0)
 
-    def test_typed_refusal_is_an_error_not_a_wrong_answer(self):
-        # Box C (#3918): eight HTTP 422 budget refusals read as eight wrong
-        # answers with no row differing from the oracle. A refusal still
-        # fails the run, as an error, and leaves wrong_answers alone.
+    def check_typed_refusal_is_an_error_not_a_wrong_answer(self, evaluate_py=EVALUATE):
+        """Box C (#3918): eight HTTP 422 budget refusals read as eight wrong answers with no row differing
+        from the oracle. A refusal still fails the run, as an error, and leaves wrong_answers alone."""
         c = next(c for c in self.select("logs_tail_request_id", "mixed") if c["try"] == 0)
         c["outcome"], c["http_status"] = "error", 422
         c["error"] = "query memory budget exhausted"
         self.save_calls()
-        code, res, _ = self.go(BANDS)
-        self.assertEqual(code, 1)
-        self.assertIn("error logs_tail_request_id/mixed/cold try 0: outcome 'error' HTTP 422", res["problems"])
-        self.assertEqual(figure(res, "row_13.wrong_answers")["value"], 0)
-        self.assertEqual(figure(res, "row_13.wrong_answers")["verdict"], "pass")
+        code, res, _ = self.go(BANDS, evaluate_py)
+        out = [] if code == 1 else [f"exit {code}"]
+        if "error logs_tail_request_id/mixed/cold try 0: outcome 'error' HTTP 422" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        f = figure(res, "row_13.wrong_answers")
+        if (f["value"], f["verdict"]) != (0, "pass"):
+            out.append(f"wrong_answers {f['value']} {f['verdict']}")
         f = figure(res, "row_13.errors")
-        self.assertEqual((f["value"], f["verdict"]), (1, "miss"))
+        if (f["value"], f["verdict"]) != (1, "miss"):
+            out.append(f"errors {f['value']} {f['verdict']}")
+        return out
 
-    # --- in-flight overlap, refusals, the 1,001-key control -----------------
+    def test_typed_refusal_is_an_error_not_a_wrong_answer(self):
+        self.assertEqual(self.check_typed_refusal_is_an_error_not_a_wrong_answer(), [])
+
+    # --- row 18, key-set lookup time ------------------------------------------
+
+    ROW_18_CELLS = {"logs_request_in_10": "logs_request_id_10", "logs_request_in_100": "logs_request_id_100",
+                    "logs_trace_in_10": "logs_trace_id_10", "logs_trace_in_100": "logs_trace_id_100",
+                    "spans_in_10": "spans_trace_id_10", "spans_in_100": "spans_trace_id_100"}
+    COVERED = {"partsCovered": 1, "partsUncovered": 0, "skippedByBudget": 0, "partsBeyondCeiling": 0,
+               "leavesRejected": 0, "reservationsRefused": 0, "leafGetRequests": 11, "keysProbed": 10}
+
+    def set_advanced_leaves(self, cells=None):
+        """An s3-lane run with advanced_leaves listed after mixed and run: its six statements' cold calls copied
+        from folded_leaves, its stamps from folded_leaves's (logs request_id at 3 slices a part against the
+        rebuild's 1). cells: {statement: (unfolded walls, advanced walls, keyIndex)}; a statement not named
+        reads unfolded (2.8, 3.2), so U 3.0 and IQR 0.2, and advanced (3.1, 3.1), covered: a hold inside the
+        noise, 3.15."""
+        cells = cells or {}
+        self.to_s3_lane()
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        with open(toml, "w") as f:
+            f.write(text.replace('"mixed", "compaction_in_flight"', '"mixed", "advanced_leaves", "compaction_in_flight"'))
+        restarts = read_jsonl(self.stamp_path("restarts.jsonl"))
+        for sid in self.ROW_18_CELLS:
+            unfolded, advanced, ki = cells.get(sid, ((2.8, 3.2), (3.1, 3.1), self.COVERED))
+            for c in self.calls:
+                if (c["statement"], c["state"], c.get("temp")) == (sid, "unfolded", "cold"):
+                    c["wall_s"] = unfolded[c["try"]]
+            for c in self.select(sid):
+                new = copy.deepcopy(c)
+                new.update(state="advanced_leaves", wall_s=advanced[c["try"]])
+                k = ki[c["try"]] if isinstance(ki, list) else ki
+                new["stats"]["keyIndex"] = dict(k)
+                self.calls.append(new)
+                restarts.append(dict(next(r for r in restarts if (r["statement"], r["state"], r["try"]) ==
+                                          (sid, "folded_leaves", c["try"])), state="advanced_leaves"))
+        self.save_calls()
+        write_jsonl(self.stamp_path("restarts.jsonl"), restarts)
+        for name in ("census.jsonl", "transitions.jsonl"):
+            lines = read_jsonl(self.stamp_path(name))
+            lines.append(dict(next(x for x in lines if x["state"] == "folded_leaves"), state="advanced_leaves"))
+            write_jsonl(self.stamp_path(name), lines)
+        for label in ("spans", "logs"):
+            with open(self.stamp_path(f"folded_leaves.{label}.catalog.json")) as f:
+                doc = json.load(f)
+            if label == "logs":
+                leaf = next(lf for lf in doc["parts"][0]["leaves"] if lf["field"] == "request_id")
+                doc["parts"][0]["leaves"] += [dict(leaf), dict(leaf)]
+            with open(self.stamp_path(f"advanced_leaves.{label}.catalog.json"), "w") as f:
+                json.dump(dict(doc, state="advanced_leaves"), f)
+        shutil.copy(self.stamp_path("folded_leaves.server.json"), self.stamp_path("advanced_leaves.server.json"))
+
+    def row_18(self, res):
+        return {f["id"][len("row_18."):]: f for f in res["figures"] if f["id"].startswith("row_18.")}
+
+    def check_row_18_hold(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 5: every cell 0.1 s over its unfolded p50 of 3.0 s, inside the noise (5 % of 3.0 = 0.15 s
+        beats half the 0.2 s range): each holds, and the slices are reported beside the row."""
+        self.set_advanced_leaves()
+        _, res, _ = self.go(bands, evaluate_py)
+        got = self.row_18(res)
+        out = [p for p in res["problems"] if "row_18" in p]
+        for cell in self.ROW_18_CELLS.values():
+            for name, value, verdict in ((f"{cell}_p50_s", 3.1, "pass"), (f"{cell}_unfolded_p50_s", 3.0, "pass"),
+                                         (f"{cell}_unfolded_iqr_s", 0.2, "pass")):
+                if (got[name]["value"], got[name]["verdict"]) != (value, verdict):
+                    out.append(f"{name} {got[name]['value']} {got[name]['verdict']} {got[name]['reason']}")
+        for name, value in (("logs_request_id_slices", 3), ("logs_request_id_slices_rebuild", 1),
+                            ("logs_trace_id_slices", 1), ("spans_trace_id_slices", 1)):
+            if (got[name]["value"], got[name]["verdict"]) != (value, "pass"):
+                out.append(f"{name} {got[name]['value']} {got[name]['verdict']}")
+        if any("row_18" in r for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_row_18_hold(self):
+        self.assertEqual(self.check_row_18_hold(), [])
+
+    def check_row_18_box_c_miss(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 5: box C's logs request_id at 100 keys, 7.64 s through the leaves against an unfolded p50 of
+        3.01 s (0.18 s of interquartile range here), misses."""
+        self.set_advanced_leaves({"logs_request_in_100": ((2.83, 3.19), (7.64, 7.64), self.COVERED)})
+        _, res, _ = self.go(bands, evaluate_py)
+        got = self.row_18(res)["logs_request_id_100_p50_s"]
+        out = [] if (got["value"], got["verdict"]) == (7.64, "miss") else [f"{got['value']} {got['verdict']}"]
+        if "miss row_18.logs_request_id_100_p50_s" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        if self.row_18(res)["logs_request_id_100_unfolded_p50_s"]["value"] != 3.01:
+            out.append(f"unfolded p50 {self.row_18(res)['logs_request_id_100_unfolded_p50_s']['value']}")
+        return out
+
+    def test_row_18_box_c_miss(self):
+        self.assertEqual(self.check_row_18_box_c_miss(), [])
+
+    # Each noise term on both sides of its edge, one cell each. Two cold calls
+    # a and b make U = (a + b) / 2 and IQR = (b - a) / 2. (2.8, 3.2): U 3.0,
+    # IQR 0.2, 5 % = 0.15 beats 0.1, so the bound is 3.15. (2.5, 3.5): U 3.0,
+    # IQR 0.5, half = 0.25 beats 0.15, so the bound is 3.25.
+    NOISE_EDGES = {
+        "logs_request_in_10": ((2.8, 3.2), 3.1499, "pass"),
+        "logs_request_in_100": ((2.8, 3.2), 3.1501, "miss"),
+        "logs_trace_in_10": ((2.5, 3.5), 3.2499, "pass"),
+        "logs_trace_in_100": ((2.5, 3.5), 3.2501, "miss"),
+    }
+
+    def check_row_18_noise_edges(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 5: the bound is U + max(5 % of U, half the IQR): inside and outside each term's edge."""
+        self.set_advanced_leaves({sid: (u, (v, v), self.COVERED) for sid, (u, v, _) in self.NOISE_EDGES.items()})
+        _, res, _ = self.go(bands, evaluate_py)
+        got = self.row_18(res)
+        out = []
+        for sid, (_, v, verdict) in self.NOISE_EDGES.items():
+            f = got[f"{self.ROW_18_CELLS[sid]}_p50_s"]
+            if (f["value"], f["verdict"]) != (v, verdict):
+                out.append(f"{sid} {f['value']} {f['verdict']}, want {verdict}")
+        return out
+
+    def test_row_18_noise_edges(self):
+        self.assertEqual(self.check_row_18_noise_edges(), [])
+
+    def check_row_18_uncovered(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 5: a cell whose part went Uncovered on one cold call (skippedByBudget 1, as box C's 100-key
+        trace_id lists) is not measured, even at 1.0 s, under its 3.15 s bound, and the run is incomplete."""
+        skipped = dict(self.COVERED, partsCovered=0, skippedByBudget=1, leafGetRequests=1)
+        self.set_advanced_leaves({"logs_trace_in_100": ((2.8, 3.2), (1.0, 1.0), [self.COVERED, skipped])})
+        _, res, _ = self.go(bands, evaluate_py)
+        f = self.row_18(res)["logs_trace_id_100_p50_s"]
+        out = []
+        if (f["status"], f["value"], f["verdict"]) != ("not-measured", None, "not-measured"):
+            out.append(f"{f['status']} {f['value']} {f['verdict']}")
+        if "cold try 1: a covering part went Uncovered (skippedByBudget 1)" not in (f["reason"] or ""):
+            out.append(f"reason {f['reason']}")
+        if not any(r.startswith("figure row_18.logs_trace_id_100_p50_s not measured: ") for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        if any("row_18" in p for p in res["problems"]):
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_row_18_uncovered(self):
+        self.assertEqual(self.check_row_18_uncovered(), [])
+
+    def check_row_18_covered_nothing(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A cold call whose keyIndex reports partsCovered 0 and every outcome counter 0 answered no part
+        through the leaves: its cell is not measured, even at 1.0 s under its 3.15 s bound, and the run is
+        incomplete."""
+        nothing = dict(self.COVERED, partsCovered=0, leafGetRequests=0)
+        self.set_advanced_leaves({"logs_request_in_10": ((2.8, 3.2), (1.0, 1.0), nothing)})
+        _, res, _ = self.go(bands, evaluate_py)
+        f = self.row_18(res)["logs_request_id_10_p50_s"]
+        out = []
+        if (f["status"], f["value"], f["verdict"]) != ("not-measured", None, "not-measured"):
+            out.append(f"{f['status']} {f['value']} {f['verdict']}")
+        if "a covering part went Uncovered (partsCovered 0)" not in (f["reason"] or ""):
+            out.append(f"reason {f['reason']}")
+        if not any(r.startswith("figure row_18.logs_request_id_10_p50_s not measured: ") for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_row_18_covered_nothing(self):
+        self.assertEqual(self.check_row_18_covered_nothing(), [])
+
+    def check_row_18_unsupported_is_incomplete(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A row 18 cell whose build reports no keyIndex outcome counters reads unsupported-on-this-build;
+        that proves less than the row asks, so the run is incomplete, exit 1, not a pass. A missing cell is
+        listed the same way."""
+        self.set_advanced_leaves({"spans_in_100": ((2.8, 3.2), (3.1, 3.1), {"keysProbed": 100})})
+        # Row 18 alone, so no other row's miss on this fixture decides the verdict.
+        with open(bands) as f:
+            text = f.read()
+        start = text.index('[[row]]\nkey = "row_18"')
+        if "[[row]]\n" in text[start + 1:]:
+            return ["row_18 is no longer the last row of the bands; slice it to its end"]
+        code, res, _ = self.go(self.pass_bands(text[start:]), evaluate_py)
+        f = self.row_18(res)["spans_trace_id_100_p50_s"]
+        out = []
+        if (f["status"], f["verdict"]) != (UNSUPPORTED, UNSUPPORTED):
+            out.append(f"{f['status']} {f['verdict']}")
+        want = f"figure row_18.spans_trace_id_100_p50_s {UNSUPPORTED}: "
+        if not any(r.startswith(want) for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        if (code, res["verdict"]) != (1, "incomplete"):
+            out.append(f"exit {code} verdict {res['verdict']} problems {res['problems']}")
+        mod = load_module(evaluate_py, "evaluate_row18_incomplete")
+        cfg = {"states": []}
+        missing = {"id": "row_18.logs_trace_id_10_p50_s", "row": 18, "status": "missing", "verdict": "missing",
+                   "reason": "no ok call in advanced_leaves"}
+        got = mod.incomplete_reasons(cfg, {}, mod.Calls([], mod.Problems(), {}), [missing])
+        if got != ["figure row_18.logs_trace_id_10_p50_s missing: no ok call in advanced_leaves"]:
+            out.append(f"missing cell {got}")
+        return out
+
+    def test_row_18_unsupported_is_incomplete(self):
+        self.assertEqual(self.check_row_18_unsupported_is_incomplete(), [])
+
+    def test_row_18_not_run_without_its_state(self):
+        # The committed fixture does not list advanced_leaves: the row is
+        # not-run and listed as not requested.
+        _, res, _ = self.go(BANDS)
+        for f in self.row_18(res).values():
+            self.assertEqual(f["status"], "not-run", f["id"])
+            self.assertIn("advanced_leaves: not in run.toml states", f["reason"])
+        self.assertIn({"row": 18, "key": "row_18", "reason": "run.toml states lacks ['advanced_leaves']"},
+                      res["not_requested"])
+        # Listed, then failed by its own precondition: not-run with the step,
+        # and the run incomplete.
+        self.set_advanced_leaves()
+        with open(self.stamp_path("failed_states.jsonl"), "w") as f:
+            f.write(json.dumps({"state": "advanced_leaves", "step": "advance-check advanced_leaves", "exit": 1,
+                                "log": "out/logs/advance-check.out"}) + "\n")
+        _, res, _ = self.go(BANDS)
+        why = "state failed at advance-check advanced_leaves (exit 1)"
+        for f in self.row_18(res).values():
+            if f["state"] == "folded_leaves":
+                continue
+            self.assertEqual(f["status"], "not-run", f["id"])
+            self.assertIn(why, f["reason"], f["id"])
+        self.assertIn(f"state advanced_leaves not run: {why}", res["incomplete"])
+
+    # --- in-flight overlap, refusals, the 1,025-key control -----------------
 
     def statement_tables(self):
         with open(STATEMENTS, "rb") as f:
@@ -2073,9 +2800,11 @@ class Evaluate(Workdir):
     def test_refused(self):
         self.assertEqual(self.check_refused(), [])
 
-    def served_1000(self, statement, keys=None, parts=1, scan=True):
+    def served_1000(self, statement, keys=None, parts=1, scan=True, leaf=None, uncovered=None):
         """Turn statement's folded_leaves cold calls into ok calls copied from spans_in_100, which scanned 4
-        objects. keys None drops the keyIndex section; scan False zeros the probe and scan GETs and blocks."""
+        objects. keys None drops the keyIndex section; leaf sets its leafGetRequests and uncovered, a
+        (field, count) pair, one Uncovered outcome's count; scan False zeros the probe and scan GETs and
+        blocks."""
         src = {c["try"]: c for c in self.select("spans_in_100")}
         for i, c in enumerate(self.calls):
             if c["statement"] == statement and c["state"] == "folded_leaves" and c.get("temp") == "cold":
@@ -2086,6 +2815,10 @@ class Evaluate(Workdir):
                 else:
                     new["stats"]["keyIndex"] = dict(new["stats"].get("keyIndex") or {}, keysProbed=keys,
                                                     partsCovered=parts)
+                    if leaf is not None:
+                        new["stats"]["keyIndex"]["leafGetRequests"] = leaf
+                    if uncovered is not None:
+                        new["stats"]["keyIndex"][uncovered[0]] = uncovered[1]
                 if not scan:
                     for p in new["stats"]["phases"]:
                         if p["phase"] in ("probe", "scan"):
@@ -2094,31 +2827,52 @@ class Evaluate(Workdir):
                 self.calls[i] = new
 
     CONTROL = {
-        # mode: (1,000-key arm, 1,001-key arm, (status, value, verdict), reason fragment)
+        # mode: (1,000-key arm, 1,025-key arm, (status, value, verdict), reason fragment). An arm left None
+        # keeps the fixture's calls, which the complexity guard of its build refused.
         "guard": (None, None, (GUARD, None, GUARD), "refused by the SQL complexity guard: " + REFUSAL_1000),
         "unsupported": (dict(), None, (UNSUPPORTED, None, UNSUPPORTED), "carries no keyIndex.keysProbed"),
-        "pass": (dict(keys=1000), None, ("value", 1, "pass"), ""),
-        "miss": (dict(keys=1000), dict(keys=1001), ("value", 0, "miss"), "was index-served"),
+        # What the current build does with 1,025 keys: admitted, no key set, a scan with keysProbed 0,
+        # partsCovered 0 and no leaf GET (sql_key_in.rs in_list_rows_equal_the_union_of_equalities).
+        "pass": (dict(keys=1000), dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        "over-refused": (dict(keys=1000), None, ("value", 0, "miss"),
+                         "was refused (" + REFUSAL_1000 + ") while the 1,000-key list was admitted"),
+        "miss": (dict(keys=1000), dict(keys=1025), ("value", 0, "miss"), "was index-served"),
+        "leaf-gets": (dict(keys=1000), dict(keys=0, parts=0, leaf=1), ("value", 0, "miss"),
+                      "was index-served: keysProbed 0 partsCovered 0 leafGetRequests 1"),
         "served-with-scan": (dict(keys=1000), dict(), ("value", 1, "pass"), ""),
-        "served-with-keyindex": (dict(keys=1000), dict(keys=1001, scan=False), ("value", 0, "miss"),
-                                 "was index-served: keysProbed 1001 partsCovered 1"),
+        "served-with-keyindex": (dict(keys=1000), dict(keys=1025, scan=False), ("value", 0, "miss"),
+                                 "was index-served: keysProbed 1025 partsCovered 1"),
         "served-without-scan": (dict(keys=1000), dict(scan=False), ("value", 0, "miss"),
                                 "served without a visible path"),
         "zeros-without-scan": (dict(keys=1000), dict(keys=0, parts=0, scan=False), ("value", 0, "miss"),
                                "served without a visible path"),
-        "zero-parts-covered": (dict(keys=1000, parts=0), None, ("value", 0, "miss"),
-                               "probed 1000 keys with partsCovered 0"),
+        "zero-parts-covered": (dict(keys=1000, parts=0), dict(keys=0, parts=0), ("value", 0, "miss"),
+                               "probed 1000 keys with partsCovered 0 and no part in an Uncovered outcome"),
+        # Box C: the 1,000-key part went Uncovered by budget (partsCovered 0, skippedByBudget 1) and the
+        # 1,025-key list was scanned with keysProbed 0.
+        "uncovered-by-budget": (dict(keys=1000, parts=0, uncovered=("skippedByBudget", 1)),
+                                dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        # ADR-2707 row 11 allows every Uncovered outcome the report names, not only the budget: the part
+        # went Uncovered, so the key set was carried even though no leaf answered.
+        "uncovered-parts": (dict(keys=1000, parts=0, uncovered=("partsUncovered", 1)),
+                            dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        "uncovered-beyond-ceiling": (dict(keys=1000, parts=0, uncovered=("partsBeyondCeiling", 1)),
+                                     dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        "uncovered-leaves-rejected": (dict(keys=1000, parts=0, uncovered=("leavesRejected", 1)),
+                                      dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        "uncovered-reservations-refused": (dict(keys=1000, parts=0, uncovered=("reservationsRefused", 1)),
+                                           dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
     }
 
     def check_control(self, mode, evaluate_py=EVALUATE):
-        arm_1000, arm_1001, want, reason = self.CONTROL[mode]
+        arm_1000, arm_1025, want, reason = self.CONTROL[mode]
         if arm_1000 is not None:
             self.served_1000("spans_in_1000", **arm_1000)
-        if arm_1001 is not None:
-            self.served_1000("spans_in_1001", **arm_1001)
+        if arm_1025 is not None:
+            self.served_1000("spans_in_1025", **arm_1025)
         self.save_calls()
         _, res, _ = self.go(BANDS, evaluate_py)
-        f = figure(res, "row_11.spans_control_1001")
+        f = figure(res, "row_11.spans_control_1025")
         out = [] if (f["status"], f["value"], f["verdict"]) == want else [f"{f['status']} {f['value']} {f['verdict']}"]
         if reason not in (f["reason"] or ""):
             out.append(f"reason {f['reason']}")
@@ -2133,27 +2887,36 @@ class Evaluate(Workdir):
         return self.check_control("unsupported", evaluate_py)
 
     def check_control_pass(self, evaluate_py=EVALUATE):
-        """1,000 keys probed and the 1,001-key list refused: the control passes."""
+        """1,000 keys probed and the 1,025-key list scanned with no route: the control passes."""
         return self.check_control("pass", evaluate_py)
 
+    def check_control_over_refused(self, evaluate_py=EVALUATE):
+        """A 1,025-key list refused while the 1,000-key list was admitted: the guard admits 1,025
+        literals, so a refusal is not the control's answer: miss."""
+        return self.check_control("over-refused", evaluate_py)
+
     def check_control_miss(self, evaluate_py=EVALUATE):
-        """A 1,001-key list the index served: the control misses."""
+        """A 1,025-key list the index served: the control misses."""
         return self.check_control("miss", evaluate_py)
 
+    def check_control_leaf_gets(self, evaluate_py=EVALUATE):
+        """A 1,025-key list with keysProbed and partsCovered 0 but a leaf GET: the index read it: miss."""
+        return self.check_control("leaf-gets", evaluate_py)
+
     def check_control_served_with_scan(self, evaluate_py=EVALUATE):
-        """A 1,001-key list served by a scan with no keyIndex figure: the control passes."""
+        """A 1,025-key list served by a scan with no keyIndex figure: the control passes."""
         return self.check_control("served-with-scan", evaluate_py)
 
     def check_control_served_with_keyindex(self, evaluate_py=EVALUATE):
-        """A 1,001-key list served with keyIndex figures and no scan: the control misses."""
+        """A 1,025-key list served with keyIndex figures and no scan: the control misses."""
         return self.check_control("served-with-keyindex", evaluate_py)
 
     def check_control_served_without_scan(self, evaluate_py=EVALUATE):
-        """Reviewer mutation (a): a 1,001-key list served with no keyIndex figure and zero GETs: miss."""
+        """Reviewer mutation (a): a 1,025-key list served with no keyIndex figure and zero GETs: miss."""
         return self.check_control("served-without-scan", evaluate_py)
 
     def check_control_zeros_without_scan(self, evaluate_py=EVALUATE):
-        """Reviewer mutation (b): a 1,001-key list whose keyIndex figures are zeros, with no scan: miss."""
+        """Reviewer mutation (b): a 1,025-key list whose keyIndex figures are zeros, with no scan: miss."""
         return self.check_control("zeros-without-scan", evaluate_py)
 
     def check_control_zero_parts_covered(self, evaluate_py=EVALUATE):
@@ -2172,6 +2935,12 @@ class Evaluate(Workdir):
     def test_control_miss(self):
         self.assertEqual(self.check_control_miss(), [])
 
+    def test_control_over_refused(self):
+        self.assertEqual(self.check_control_over_refused(), [])
+
+    def test_control_leaf_gets(self):
+        self.assertEqual(self.check_control_leaf_gets(), [])
+
     def test_control_served_with_scan(self):
         self.assertEqual(self.check_control_served_with_scan(), [])
 
@@ -2186,6 +2955,35 @@ class Evaluate(Workdir):
 
     def test_control_zero_parts_covered(self):
         self.assertEqual(self.check_control_zero_parts_covered(), [])
+
+    def check_control_uncovered_by_budget(self, evaluate_py=EVALUATE):
+        """Box C: a 1,000-key list that probed 1,000 keys and whose part went Uncovered by budget
+        (partsCovered 0, skippedByBudget 1) carried its key set; with the 1,025-key list scanned at
+        keysProbed 0 the control passes."""
+        return self.check_control("uncovered-by-budget", evaluate_py)
+
+    def test_control_uncovered_by_budget(self):
+        self.assertEqual(self.check_control_uncovered_by_budget(), [])
+
+    UNCOVERED_MODES = ("uncovered-by-budget", "uncovered-parts", "uncovered-beyond-ceiling",
+                       "uncovered-leaves-rejected", "uncovered-reservations-refused")
+
+    def check_control_uncovered_outcomes(self, evaluate_py=EVALUATE):
+        """Each Uncovered outcome the ADR's row 11 allows (partsUncovered, skippedByBudget,
+        partsBeyondCeiling, leavesRejected, reservationsRefused), alone on a 1,000-key list that probed
+        1,000 keys with partsCovered 0, routes the part: the control passes."""
+        out = []
+        for mode in self.UNCOVERED_MODES:
+            out += [f"{mode}: {line}" for line in self.check_control(mode, evaluate_py)]
+        return out
+
+    def test_control_uncovered_outcomes(self):
+        self.assertEqual(self.check_control_uncovered_outcomes(), [])
+        # One case per outcome evaluate.py accepts, none left without one.
+        outcomes = {self.CONTROL[m][0]["uncovered"][0] for m in self.UNCOVERED_MODES}
+        mod = load_module(EVALUATE, "evaluate_uncovered_outcomes")
+        self.assertEqual(outcomes, set(mod.UNCOVERED_OUTCOMES))
+        self.assertEqual(len(outcomes), len(self.UNCOVERED_MODES))
 
     # --- incomplete, truth-derived budgets, absent fields -------------------
 
@@ -2372,7 +3170,7 @@ class Evaluate(Workdir):
         got = [(r["row"], r["reason"]) for r in res["not_requested"]]
         want = [(5, "run.toml hits = false"), (6, "run.toml hits = false"),
                 (9, "run.toml states lacks ['many_parts_744']"), (10, "run.toml states lacks ['many_parts_2160']"), (12, "run.toml scales lacks [10, 100]"),
-                (16, "run.toml hits = false, baseline = false")]
+                (16, "run.toml hits = false, baseline = false"), (18, "run.toml states lacks ['advanced_leaves']")]
         out = [] if got == want else [f"not_requested {got}"]
         if "not requested: row 5 (run.toml hits = false); row 6 " not in text:
             out.append("summary carries no not-requested line")
@@ -2446,9 +3244,9 @@ class Evaluate(Workdir):
     def check_refusal_classes(self, evaluate_py=EVALUATE):
         """Guard refusals and unsupported figures are counted apart."""
         _, res, text = self.go(BANDS, evaluate_py)
-        want = {GUARD: {"figures": 15, "calls": 24}, UNSUPPORTED: {"figures": 23, "calls": 0}}
+        want = {GUARD: {"figures": 15, "calls": 24}, UNSUPPORTED: {"figures": 29, "calls": 0}}
         out = [] if res["refusal_classes"] == want else [f"classes {res['refusal_classes']}"]
-        if "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23" not in text:
+        if "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29" not in text:
             out.append("summary carries no refusal-class line")
         return out
 
@@ -2623,7 +3421,7 @@ FLIPS = {
         "check_absent_phases",
     ),
     "zero segmentsOpened taken as a value": (
-        '    if name == "segments_opened" and value == 0:',
+        '    if name in ("segments_opened", "scan_segments_opened") and value == 0:',
         "    if False:",
         "check_dead_counter",
     ),
@@ -2688,16 +3486,39 @@ FLIPS = {
         "check_control_pass",
     ),
     "a 1,000-key list covering no part passed": (
-        '        if not ki["partsCovered"]:',
+        '        if not ki["partsCovered"] and not any(ki.get(f) for f in UNCOVERED_OUTCOMES):',
         "        if False:",
         "check_control_zero_parts_covered",
     ),
-    "an index-served 1,001-key list not seen": (
+    "a 1,000-key part Uncovered by budget read as covering no part": (
+        '        if not ki["partsCovered"] and not any(ki.get(f) for f in UNCOVERED_OUTCOMES):',
+        '        if not ki["partsCovered"]:',
+        "check_control_uncovered_by_budget",
+    ),
+    **{f"a 1,000-key part {outcome} read as covering no part": (
+        'UNCOVERED_OUTCOMES = ("partsUncovered", "skippedByBudget", "partsBeyondCeiling", "leavesRejected",\n'
+        '                      "reservationsRefused")\n',
+        "UNCOVERED_OUTCOMES = " + repr(tuple(o for o in ("partsUncovered", "skippedByBudget", "partsBeyondCeiling",
+                                                          "leavesRejected", "reservationsRefused")
+                                             if o != outcome)) + "\n",
+        "check_control_uncovered_outcomes",
+    ) for outcome in ("partsUncovered", "partsBeyondCeiling", "leavesRejected", "reservationsRefused")},
+    "an index-served 1,025-key list not seen": (
         "        if key_index_nonzero(c):\n",
         "        if False:\n",
         "check_control_miss",
     ),
-    "a 1,001-key list served with keyIndex figures and no scan passed": (
+    "a 1,025-key list refused while the 1,000-key list was admitted passed": (
+        "    if refused_over:\n",
+        "    if False:\n",
+        "check_control_over_refused",
+    ),
+    "a 1,025-key list's leaf GETs not read as index-served": (
+        ' or ki.get("partsCovered") or ki.get("leafGetRequests"))',
+        ' or ki.get("partsCovered"))',
+        "check_control_leaf_gets",
+    ),
+    "a 1,025-key list served with keyIndex figures and no scan passed": (
         "        if key_index_nonzero(c):\n",
         "        if c.get(\"_never\"):\n",
         "check_control_served_with_keyindex",
@@ -2707,15 +3528,117 @@ FLIPS = {
         '        if m["probe_gets"] == 0:',
         "check_control_served_with_scan",
     ),
-    "a 1,001-key list served with no visible path passed": (
+    "a 1,025-key list served with no visible path passed": (
         '        if m["probe_gets"] == 0 and m["scan_gets"] == 0 and m["blocks_scanned"] == 0:',
         "        if False:",
         "check_control_served_without_scan",
     ),
     "keyIndex zeros read as index-served or passed": (
-        '    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered"))',
+        '    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered") or ki.get("leafGetRequests"))',
         '    return isinstance(ki, dict)',
         "check_control_zeros_without_scan",
+    ),
+    # The #3922 review: a refusal is an error, not a wrong answer, so an
+    # evaluator summing the two into matrix.wrong_answers fails the case.
+    "matrix.wrong_answers counted as wrong rows plus errors": (
+        '            return "value", len(calls.wrong), ""\n',
+        '            return "value", len(calls.wrong) + len(calls.errors), ""\n',
+        "check_typed_refusal_is_an_error_not_a_wrong_answer",
+    ),
+    "an Uncovered row 18 cell timed as if the leaves answered it": (
+        '    if went or not ki["partsCovered"]:\n',
+        "    if False:\n",
+        "check_row_18_uncovered",
+    ),
+    "a not-measured row 18 cell left out of incomplete": (
+        "        elif f[\"status\"] == NOT_MEASURED:\n",
+        "        elif False:\n",
+        "check_row_18_uncovered",
+    ),
+    "the interquartile range read as the 75th percentile": (
+        "        return \"value\", rnd(percentile(walls, 0.75) - percentile(walls, 0.25)), \"\"\n",
+        "        return \"value\", rnd(percentile(walls, 0.75)), \"\"\n",
+        "check_row_18_noise_edges",
+    ),
+    "row 18's partsCovered 0 with no outcome read as covered": (
+        '    if went or not ki["partsCovered"]:\n',
+        '    if went:\n',
+        "check_row_18_covered_nothing",
+    ),
+    "row 18's unsupported or missing cell left off the incomplete list": (
+        '        elif f["row"] == 18 and f.get("verdict") in (UNSUPPORTED, GUARD, "refused", "missing"):\n',
+        '        elif False:\n',
+        "check_row_18_unsupported_is_incomplete",
+    ),
+    "row 18's p50 taken without the Uncovered check": (
+        "    if rest == \"leaf_wall_p50_s\":\n        for c in lines:\n",
+        "    if rest == \"leaf_wall_p50_s\":\n        for c in []:\n",
+        "check_row_18_uncovered",
+    ),
+    "row 7's G read as a fold report field": (
+        '    if field in ("key_index_g_low", "key_index_g_high"):\n        return fold_g(',
+        '    if False:\n        return fold_g(',
+        "check_row_7_passes_not_computable",
+    ),
+    "row 7's G without its inputs read as unsupported, not not-computable": (
+        "        return NOT_COMPUTABLE, None, (\n",
+        "        return UNSUPPORTED, None, (\n",
+        "check_row_7_passes_not_computable",
+    ),
+    "a not-computable figure, or one judged against it, leaves no incomplete reason": (
+        '        elif f.get("verdict") in (NOT_COMPUTABLE, INCOMPLETE):\n',
+        '        elif f.get("verdict") in (INCOMPLETE,):\n',
+        "check_row_7_passes_not_computable",
+    ),
+    "a figure judged against a not-computable one judged as a miss": (
+        'PASSED_ON = ("not-run", UNSUPPORTED, GUARD, NOT_COMPUTABLE, INCOMPLETE)\n',
+        'PASSED_ON = ("not-run", UNSUPPORTED, GUARD, INCOMPLETE)\n',
+        "check_row_7_passes_not_computable",
+    ),
+    "row 7's F counted without zero-pair fields": (
+        "    share = max(1, budget // len(field_pairs))\n",
+        "    share = max(1, budget // len([p for p in field_pairs.values() if p]))\n",
+        "check_row_7_g_zero_pair_field",
+    ),
+    "row 7's G upper bound dropped": (
+        "    return max(1, max(need)), max(1, max(2 * n - 1 for n in need))\n",
+        "    return max(1, max(need)), max(1, max(need))\n",
+        "check_row_7_g",
+    ),
+    "row 7's G share computed with F = 1": (
+        "    share = max(1, budget // len(field_pairs))\n",
+        "    share = max(1, budget // 1)\n",
+        "check_row_7_g",
+    ),
+    "row 6's probe survivors judged without pruning.segments equal to the census objects": (
+        '            if pruning.get("segments") != objects or pruning.get("segmentsSkippedByThreshold") != 0:\n',
+        '            if pruning.get("segmentsSkippedByThreshold") != 0:\n',
+        "check_row_6_objects_past_probe",
+    ),
+    "row 6's probe survivors judged with segments skipped by threshold": (
+        '            if pruning.get("segments") != objects or pruning.get("segmentsSkippedByThreshold") != 0:\n',
+        '            if pruning.get("segments") != objects:\n',
+        "check_row_6_objects_past_probe",
+    ),
+    "row 6's probe survivors judged without the plan-opens-the-probed-objects precondition": (
+        '            if not isinstance(by_stats, int) or m["plan_segments_opened"] != big - by_stats:\n',
+        "            if False:\n",
+        "check_row_6_objects_past_probe",
+    ),
+    "an incomplete figure leaves no incomplete reason": (
+        '        elif f.get("verdict") in (NOT_COMPUTABLE, INCOMPLETE):\n',
+        '        elif f.get("verdict") in (NOT_COMPUTABLE,):\n',
+        "check_row_6_objects_past_probe",
+    ),
+    "row 6's probe survivors read from the scan phase's segmentsOpened": (
+        '            v = m["plan_segments_opened"] - pruned\n',
+        '            v = m["scan_segments_opened"]\n',
+        "check_row_6_objects_past_probe",
+    ),
+    "a phase's segmentsOpened read as every phase's": (
+        '        v[f"{p.lower()}_segments_opened"] = ph[p]["segmentsOpened"]\n',
+        '        v[f"{p.lower()}_segments_opened"] = sum(ph[q]["segmentsOpened"] for q in PHASES)\n',
+        "check_row_6_objects_past_probe",
     ),
     "a state with every call group unsent read as missing": (
         "        if groups and len(unsent) == len(groups):\n",
@@ -2903,6 +3826,162 @@ class Flips(Workdir):
                 print(f"flip '{name}' at evaluate.py:{line} fails {case}: {failures}", file=sys.stderr)
 
 
+# Wrong bands the cases rule out: the same shape as FLIPS, with the anchor in
+# bands.toml and the case run against the real evaluate.py and the flipped
+# bands.
+BAND_FLIPS = {
+    "row 7's logs section GETs missed against 2 x tail entries, not per pass": (
+        "miss_if = \"v >= 2 * m['row_07.logs_tail_entries'] * m['row_07.logs_build_passes']\"\n",
+        "miss_if = \"v >= 2 * m['row_07.logs_tail_entries']\"\n",
+        "check_row_7_box_d",
+    ),
+    "row 7's spans section GETs target without the pass factor": (
+        "+ m['row_07.spans_uncovered_entries']) if m['row_07.spans_footer_len'] > 8192 else 0)) "
+        "* m['row_07.spans_build_passes']\"\n",
+        "+ m['row_07.spans_uncovered_entries']) if m['row_07.spans_footer_len'] > 8192 else 0))\"\n",
+        "check_row_7_box_d",
+    ),
+    "row 7's sections read per pass not judged": (
+        "target_if = \"v <= m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']\"\n"
+        "miss_if = \"v >= m['row_07.logs_tail_entries']\"\n",
+        "target_if = \"True\"\n"
+        "miss_if = \"False\"\n",
+        "check_row_7_rebuild",
+    ),
+    "row 7's spans passes judged against 1, not G's range": (
+        "target_if = \"m['row_07.spans_build_passes_low'] <= v <= m['row_07.spans_build_passes_high']\"\n",
+        "target_if = \"v == 1\"\n",
+        "check_row_7_g",
+    ),
+    "row 7's logs passes judged against 1, not G's range": (
+        "target_if = \"m['row_07.logs_build_passes_low'] <= v <= m['row_07.logs_build_passes_high']\"\n",
+        "target_if = \"v == 1\"\n",
+        "check_row_7_g",
+    ),
+    "row 7's logs passes judged without G's upper bound": (
+        "target_if = \"m['row_07.logs_build_passes_low'] <= v <= m['row_07.logs_build_passes_high']\"\n",
+        "target_if = \"m['row_07.logs_build_passes_low'] <= v\"\n",
+        "check_row_7_g",
+    ),
+    "row 7's logs passes judged against G's low bound alone": (
+        "target_if = \"m['row_07.logs_build_passes_low'] <= v <= m['row_07.logs_build_passes_high']\"\n",
+        "target_if = \"v == m['row_07.logs_build_passes_low']\"\n",
+        "check_row_7_g",
+    ),
+    "row 7's spans section GETs without the uncovered term": (
+        "target_if = \"v <= (2 * (m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) + "
+        "((m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']) if m['row_07.spans_footer_len'] > 8192 "
+        "else 0)) * m['row_07.spans_build_passes']\"\n",
+        "target_if = \"v <= (2 * m['row_07.spans_new_entries'] + (m['row_07.spans_new_entries'] if "
+        "m['row_07.spans_footer_len'] > 8192 else 0)) * m['row_07.spans_build_passes']\"\n",
+        "check_row_7_uncovered",
+    ),
+    "row 7's spans sections per pass without the uncovered term": (
+        "target_if = \"v <= m['row_07.spans_new_entries'] + m['row_07.spans_uncovered_entries']\"\n",
+        "target_if = \"v <= m['row_07.spans_new_entries']\"\n",
+        "check_row_7_uncovered",
+    ),
+    "row 7's logs section GETs without the uncovered term": (
+        "target_if = \"v <= (2 * (m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']) + "
+        "((m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']) if m['row_07.logs_footer_len'] > 8192 "
+        "else 0)) * m['row_07.logs_build_passes']\"\n",
+        "target_if = \"v <= (2 * m['row_07.logs_new_entries'] + (m['row_07.logs_new_entries'] if "
+        "m['row_07.logs_footer_len'] > 8192 else 0)) * m['row_07.logs_build_passes']\"\n",
+        "check_row_7_uncovered",
+    ),
+    "row 7's logs sections per pass without the uncovered term": (
+        "target_if = \"v <= m['row_07.logs_new_entries'] + m['row_07.logs_uncovered_entries']\"\n",
+        "target_if = \"v <= m['row_07.logs_new_entries']\"\n",
+        "check_row_7_uncovered",
+    ),
+    "row 6's objects past the probe read from segmentsOpened over every phase": (
+        'metric = "cold.max.probe_survivors"\n',
+        'metric = "cold.max.segments_opened"\n',
+        "check_row_6_objects_past_probe",
+    ),
+    "row 6's objects past the probe read from the scan phase's segmentsOpened": (
+        'metric = "cold.max.probe_survivors"\n',
+        'metric = "cold.max.scan_segments_opened"\n',
+        "check_row_6_objects_past_probe",
+    ),
+    "row 18's bound without its noise": (
+        "target_if = \"v <= m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])\"\n",
+        "target_if = \"v <= m['row_18.logs_request_id_100_unfolded_p50_s']\"\n",
+        "check_row_18_hold",
+    ),
+    "row 18's noise without its 5 % term": (
+        "target_if = \"v <= m['row_18.logs_request_id_10_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_request_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_10_unfolded_iqr_s'])\"\n"
+        "miss_if = \"v > m['row_18.logs_request_id_10_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_request_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_10_unfolded_iqr_s'])\"\n",
+        "target_if = \"v <= m['row_18.logs_request_id_10_unfolded_p50_s'] + 0.5 * "
+        "m['row_18.logs_request_id_10_unfolded_iqr_s']\"\n"
+        "miss_if = \"v > m['row_18.logs_request_id_10_unfolded_p50_s'] + 0.5 * "
+        "m['row_18.logs_request_id_10_unfolded_iqr_s']\"\n",
+        "check_row_18_noise_edges",
+    ),
+    "row 18's noise without its interquartile term": (
+        "target_if = \"v <= m['row_18.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_10_unfolded_iqr_s'])\"\n"
+        "miss_if = \"v > m['row_18.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_10_unfolded_iqr_s'])\"\n",
+        "target_if = \"v <= m['row_18.logs_trace_id_10_unfolded_p50_s'] * 1.05\"\n"
+        "miss_if = \"v > m['row_18.logs_trace_id_10_unfolded_p50_s'] * 1.05\"\n",
+        "check_row_18_noise_edges",
+    ),
+    "row 18's noise as the whole interquartile range": (
+        "target_if = \"v <= m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_100_unfolded_iqr_s'])\"\n"
+        "miss_if = \"v > m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_100_unfolded_iqr_s'])\"\n",
+        "target_if = \"v <= m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_100_unfolded_p50_s'], m['row_18.logs_trace_id_100_unfolded_iqr_s'])\"\n"
+        "miss_if = \"v > m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_100_unfolded_p50_s'], m['row_18.logs_trace_id_100_unfolded_iqr_s'])\"\n",
+        "check_row_18_noise_edges",
+    ),
+    "row 18 judged against three times the unfolded p50": (
+        "target_if = \"v <= m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])\"\n"
+        "miss_if = \"v > m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])\"\n",
+        "target_if = \"v <= 3 * m['row_18.logs_request_id_100_unfolded_p50_s']\"\n"
+        "miss_if = \"v > 3 * m['row_18.logs_request_id_100_unfolded_p50_s']\"\n",
+        "check_row_18_box_c_miss",
+    ),
+    "row 7's previous-leaf GETs not compared with the previous leaves": (
+        "target_if = \"v == m['row_07.logs_previous_leaves']\"\n",
+        "target_if = \"v >= 0\"\n",
+        "check_row_7_extra_leaf_gets",
+    ),
+}
+
+
+class BandFlips(Workdir):
+    def test_each_wrong_band_fails_its_case(self):
+        with open(BANDS) as f:
+            src = f.read()
+        for name, (old, new, case) in BAND_FLIPS.items():
+            with self.subTest(flip=name):
+                self.assertEqual(src.count(old), 1, f"{name}: anchor gone from bands.toml; update the flip")
+                line = src[: src.index(old)].count("\n") + 1
+                flipped = self.path(f"bands_{case}.toml")
+                with open(flipped, "w") as f:
+                    f.write(src.replace(old, new))
+                t = Evaluate(case)
+                t.setUp()
+                try:
+                    self.assertEqual(getattr(t, case)(), [], f"{name}: the real bands fail their own case")
+                    t.tearDown()
+                    t.setUp()
+                    failures = getattr(t, case)(EVALUATE, flipped)
+                finally:
+                    t.tearDown()
+                self.assertTrue(failures, f"{name}: the flipped bands passed {case}")
+                print(f"flip '{name}' at bands.toml:{line} fails {case}: {failures}", file=sys.stderr)
+
+
 # --- box/ ---------------------------------------------------------------------------
 
 
@@ -2928,7 +4007,8 @@ class Box(Workdir):
         return out
 
     LANE_STATES = {"local": ("compaction_in_flight", "erasure_in_flight", "many_parts_24"),
-                   "s3": ("compaction_in_flight", "erasure_in_flight", "many_parts_744", "many_parts_2160")}
+                   "s3": ("advanced_leaves", "compaction_in_flight", "erasure_in_flight", "many_parts_744",
+                          "many_parts_2160")}
 
     def assert_flow(self, text, lane, hits=False):
         states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed") + self.LANE_STATES[lane]
@@ -3106,7 +4186,8 @@ class Box(Workdir):
         # and under set -u the run ends there with status 1, so on_exit writes
         # FAILED and neither evaluate nor the upload runs.
         code, text = run_sh("s3", self.example_toml(
-            ("states = [\"unfolded\", \"folded_no_leaves\", \"folded_leaves\", \"mixed\", \"compaction_in_flight\",\n"
+            ("states = [\"unfolded\", \"folded_no_leaves\", \"folded_leaves\", \"mixed\", \"advanced_leaves\", "
+             "\"compaction_in_flight\",\n"
              "          \"erasure_in_flight\", \"many_parts_744\", \"many_parts_2160\"]",
              "states = [\"unfolded\", \"mixed\"]")), self.path("out"))
         self.assertEqual(code, 0, text)
@@ -3374,7 +4455,7 @@ class Box(Workdir):
         cfg = {"lane": "local", "hits": True, "tenant": "inv", "scales": [1], "baseline": False,
                "states": ["unfolded"]}
         for gets, verdict in ((10, "pass"), (11, "miss")):
-            def fixed(calls, cfg, statement, state, metric, candidates=None, gets=gets):
+            def fixed(calls, cfg, statement, state, metric, candidates=None, over_512k=None, gets=gets):
                 return ("value", gets, "") if metric == "cold.max.keyindex_gets" else ("missing", None, "not set")
             mod.statement_figure = fixed
             figs = mod.run_rows(bands, cfg, {"unfolded": None}, None, None, {}, census, None, {}, {})
@@ -3492,6 +4573,95 @@ class Box(Workdir):
                             "--out", self.path("out2")], capture_output=True, text=True)
         self.assertNotEqual(m.returncode, 0, m.stdout + m.stderr)
         self.assertIn("unbound variable", m.stderr)
+
+    def advance_stamps(self, name, kind="fold --key-index-leaves", exit_code=0, rebuilt=5, advanced=27,
+                       labels=("spans", "logs")):
+        """A stamps directory as the run leaves it before advanced_leaves's check: fold_advance's fold lines
+        for LABELS and the folded_leaves and advanced_leaves catalog stamps, logs request_id at REBUILT and
+        ADVANCED slices a part (box D's 5 and 27), trace_id at 1 and 6, spans trace_id at 1 and 3."""
+        d = self.path(name)
+        os.makedirs(d)
+        write_jsonl(os.path.join(d, "folds.jsonl"), [
+            {"transition": "leaf_rebuild", "signal": s, "kind": "rebuild-key-index", "exit": 0} for s in labels] + [
+            {"transition": "fold_advance", "signal": s, "kind": kind, "exit": exit_code} for s in labels])
+        for state, logs, trace, spans in (("folded_leaves", rebuilt, 1, 1), ("advanced_leaves", advanced, 6, 3)):
+            for label, fields in (("logs", {"request_id": logs, "trace_id": trace}), ("spans", {"trace_id": spans})):
+                leaves = [{"field": f, "key": f"{f}-{i}"} for f, n in fields.items() for i in range(n)]
+                with open(os.path.join(d, f"{state}.{label}.catalog.json"), "w") as f:
+                    json.dump({"parts": [{"index": 0, "leaves": leaves}]}, f)
+        return d
+
+    def advance_check(self, stamps, inv_py=os.path.join(BOX, "lib", "inv.py")):
+        p = subprocess.run([PY, inv_py, "advance-check", "--stamps", stamps], capture_output=True, text=True)
+        return p.returncode, p.stdout, p.stderr
+
+    def test_advance_check(self):
+        # Item 5: advanced_leaves's two preconditions. Box D's stamps pass and
+        # print the slices per (part, field) of both stamps.
+        code, out, err = self.advance_check(self.advance_stamps("ok"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["slices_per_part_field"], {
+            "folded_leaves": {"logs": {"request_id": 5, "trace_id": 1}, "spans": {"trace_id": 1}},
+            "advanced_leaves": {"logs": {"request_id": 27, "trace_id": 6}, "spans": {"trace_id": 3}}})
+        for name, kw, want in (
+                ("switch-off", dict(kind="fold"), "fold_advance on spans ran without --key-index-leaves"),
+                ("fold-failed", dict(exit_code=101), "fold_advance on spans exited 101"),
+                ("no-advance", dict(labels=()), "no fold_advance fold stamp for spans"),
+                ("no-new-slice", dict(advanced=5), "logs request_id has 5 slices per part in advanced_leaves "
+                                                   "against 5 after the leaf rebuild")):
+            code, _, err = self.advance_check(self.advance_stamps(name, **kw))
+            self.assertEqual(code, 1, name)
+            self.assertIn(want, err, name)
+
+    def test_advance_check_flips(self):
+        # The wrong checks the cases above rule out, each printed with the
+        # inv.py line it flips.
+        for old, new, stamps, label in (
+                ("    if not rebuilt or not advanced or advanced <= rebuilt:\n",
+                 "    if not rebuilt or not advanced or advanced < rebuilt:\n", dict(advanced=5),
+                 "equal slices read as an advance"),
+                ('        if "--key-index-leaves" not in str(line.get("kind") or "").split():\n',
+                 "        if False:\n", dict(kind="fold"), "a fold with the switch off passed")):
+            flipped, line = self.flipped_box(old, new, "lib/inv.py")
+            code, _, _ = self.advance_check(self.advance_stamps(f"flip-{line}", **stamps), flipped)
+            self.assertEqual(code, 0, label)
+            shutil.rmtree(self.path("inv-flipped"))
+            print(f"flip '{label}' at box/lib/inv.py:{line} fails test_advance_check", file=sys.stderr)
+
+    def test_advanced_leaves_runs_the_check_after_mixed(self):
+        # Item 5: the state folds nothing, stamps itself, checks, then sends
+        # its calls; fold_advance before it folds with the switch on.
+        code, text = run_sh("s3", os.path.join(BOX, "run.example.toml"), self.path("out"))
+        self.assertEqual(code, 0, text)
+        steps = self.steps(text)
+        self.assertEqual(steps[steps.index("state:mixed") + 1], "state:advanced_leaves")
+        b = self.blocks(text)
+        adv = "\n".join(b["state:advanced_leaves"])
+        self.assertNotIn("catalog fold", adv)
+        self.assertIn("STAMP stamps/advanced_leaves.server.json", adv)
+        self.assertIn("advance-check --stamps", adv)
+        self.assertLess(adv.index("inspect-stamp"), adv.index("advance-check"))
+        self.assertLess(adv.index("advance-check"), adv.index("plan --statements"))
+        mixed = [x for x in b["state:mixed"] if "catalog fold" in x]
+        self.assertTrue(mixed and all("--key-index-leaves" in x for x in mixed), mixed)
+        # Item 8: the smoke's advance adds no slice at its scale, so it does
+        # not list the state.
+        code, text = run_sh("local", os.path.join(BOX, "run.local-smoke.toml"), self.path("out-local"))
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("state:advanced_leaves", self.steps(text))
+
+    def test_advanced_leaves_failed_check_fails_the_state(self):
+        # A failed advance-check is the state's STATE-FAILED, and the run
+        # goes on with the next state.
+        out = self.path("out-fail")
+        p = subprocess.run([BASH, os.path.join(BOX, "run.sh"), "--dry-run", "--lane", "s3", "--run-toml",
+                            os.path.join(BOX, "run.example.toml"), "--out", out], capture_output=True, text=True,
+                           env=dict(os.environ, INV_DRY_RUN_FAIL="advance-check"))
+        text = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, text)
+        self.assertIn("STATE-FAILED advanced_leaves: advance-check advanced_leaves exit 3", text)
+        steps = self.steps(text)
+        self.assertEqual(steps[steps.index("state:advanced_leaves") + 1], "state:compaction_in_flight")
 
     def flipped_box(self, old, new, script="run.sh"):
         """A copy of this directory whose box/SCRIPT has OLD (present once)

@@ -6,7 +6,7 @@ trace id or request id, an IN list, a rare, sparse or common needle, and the
 narrow joins of the investigation journeys. It runs them against a seeded
 spans and logs corpus in each state of the key-index matrix (see "States"),
 judges every answer against the generator's oracle, and judges every figure
-against `bands.toml`, which transcribes the 17 rows of ADR-3692's Acceptance
+against `bands.toml`, which transcribes the 18 rows of ADR-3692's Acceptance
 table.
 
 This is not a `ravel-bench` report: it drives the real binaries, `ravel-cli
@@ -28,7 +28,7 @@ store, from an empty bucket to `results.<lane>.json`.
   SQL or trace GET, the states it runs in, its `truth.json` key, whether it
   runs cold only, and `requires` when it needs a planted key the corpus may
   not hold.
-- `bands.toml`: ADR-3692 Acceptance rows 1 to 17. The text of each row's
+- `bands.toml`: ADR-3692 Acceptance rows 1 to 18. The text of each row's
   `check`, `target`, `miss` and `source` cells is the ADR's, verbatim; the
   `target_if` and `miss_if` expressions are transcriptions of that text into
   figures this harness extracts, and where a transcription had to choose, a
@@ -118,19 +118,20 @@ that is not `cold_only` (statement counts from `statements.toml`):
 | folded_no_leaves | 5 | 100 | 3 |
 | folded_leaves | 35 | 700 | 3 |
 | mixed | 22 | 440 | 3 |
+| advanced_leaves | 6 | 120 | 0 |
 | compaction_in_flight | 4 | 80 (one restart) | 1 |
 | compaction_done | 4 | 80 | 1 |
 | erasure_in_flight | 4 | 80 | 1 |
 | many_parts_744 | 2 | 40 | 2 |
 | many_parts_2160 | 2 | 40 | 2 |
 
-That is 2,299 calls and 2,201 restarts: 2,201 x 0.875 s = 1,926 s, plus
-2,299 x 0.032 s = 74 s, so 2,000 s, about 33 minutes of calls. The fixed
+That is 2,419 calls and 2,321 restarts: 2,321 x 0.875 s = 2,031 s, plus
+2,419 x 0.032 s = 77 s, so 2,108 s, about 35 minutes of calls. The fixed
 waits add at most 70 minutes for mixed (the next ingest hour;
 `run.mixed_wait_max_minutes`, which `box/run.sh` defaults to 70) and at most
 310 s, about 5 minutes, for compaction_in_flight (until 310 s into an hour;
-in the smoke they took 13 and 4 minutes). The estimate is 2,000 + 4,200 +
-310 = 6,510 s, about 109 minutes, against the 540-minute
+in the smoke they took 13 and 4 minutes). The estimate is 2,108 + 4,200 +
+310 = 6,618 s, about 110 minutes, against the 540-minute
 deadline, and it covers calls and waits only. It omits corpus generation,
 every load (the `hits` tenant's included) and every fold at 20,000,000
 traces: the smoke's figures for them (0.30 to 1.03 s per load, at most
@@ -215,7 +216,39 @@ its keyIndex GETs at 2 x that count.
   answers of their own: saved trace ids, a request id, needle rows, failing
   cell traces), and runs the statements over the folded hours and the
   unsealed tail together, with ids from both. Its oracle is the base answer
-  plus the tail's. Then it folds that hour (`fold_advance`).
+  plus the tail's. Then it folds that hour (`fold_advance`, `catalog fold
+  --writers-stopped --json --key-index-leaves`, the leaf switch on).
+- `advanced_leaves` (ADR-3692 row 18): runs after `mixed`, against the
+  catalog `fold_advance` left, and folds nothing itself, so the leaves have
+  been through one advance and carry its extra slices. It stamps the state
+  as every leaf state is stamped (census, catalog, object, kidx), then runs
+  `inv.py advance-check`, which fails the state (`STATE-FAILED`, step
+  `advance-check advanced_leaves`) unless two things hold: `fold_advance`
+  folded spans and logs with `--key-index-leaves` and exited 0 (its
+  `folds.jsonl` lines), since a fold with the switch off re-encodes the
+  parts and drops their leaf refs; and the logs `request_id` field carries
+  more slices per part in the state's catalog stamp than in the
+  `folded_leaves` one, stamped after the leaf rebuild, so the state really
+  measures an advanced tail. It prints the slices per (part, field) of both
+  stamps. Then it sends the `IN` lists of 10 and 100 keys on logs
+  `request_id`, logs `trace_id` and spans `trace_id` (`logs_request_in_10`,
+  `logs_request_in_100`, `logs_trace_in_10`, `logs_trace_in_100`,
+  `spans_in_10`, `spans_in_100`). Their oracle is the base answer under the
+  same truth key: the state holds the base hours plus the tail hour, and the
+  tail is a separate generator run (seed + 1) whose planted ids are its own
+  (`req-planted-tail-0001`, its saved traces and failing cell), so a listed
+  key gains rows from the tail only if a tail trace id equals a base one (a
+  128-bit draw) or, for a request id, shares its first 16 hex digits and row
+  index (`request_id_of`). A key that did would return more rows than the
+  oracle and read as a wrong answer, not a pass. The local smoke does not
+  list the state, because at its scale the second check would always fail
+  it: the smoke's 150,000 logs rows, base and tail, are 150,000
+  `request_id` pairs, under the 4,000,000-pair share each of the two logs
+  fields gets of the default 8,000,000-pair budget
+  (`DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`), so the advance takes one pass and
+  adds no slice (the committed fixture's `folded_leaves` and `fold_advance`
+  stamps both carry one `request_id` leaf). The state's flow and its check
+  are pinned on the s3 lane's dry run instead.
 - `compaction_in_flight`: waits until every earlier hour is sealed (310 s
   into the hour), starts `maintain compact-tenant` on both signals at once as
   background children, runs the statement set while they run (temp `inflight`,
@@ -362,7 +395,7 @@ logs byte from it and issue no scan GET. Every cold call whose
 `cacheServedBytes` is above 0 is flagged `warm_served` in the results and
 counted per statement and state in the summary: in the smoke, 126 of the 196
 cold calls that returned an answer (of 220 cold calls; the other 24, 12 on the 1,000-key lists
-and 12 on their 1,001-key controls, were refused by the SQL complexity guard
+and 12 on their over-cap controls, were refused by the SQL complexity guard
 and carry no stats). The flag is a reported figure, not a problem. Each restart stamp
 records what the warmup loaded.
 
@@ -449,14 +482,20 @@ pre-registered figure. Every figure `bands.toml` names goes through one
 list and is present exactly once: absent is `missing`, two inputs for it
 (calls or stamps) are `duplicate` and neither is used, and the figures of a
 row whose tenant, states, scales or baseline the run lacks are `not-run`
-with the reason.
+with the reason. A figure whose inputs no build's report carries is
+`not-computable`, with the inputs it lacks as the reason (row 7's G,
+below), and a figure whose precondition does not hold on the measured
+state is `incomplete`, with the precondition as the reason (row 6's probe
+survivors, below). A figure computed from, or judged against, a
+`not-computable` or `incomplete` figure takes that status and its reason.
 
 Only an allowlist of fields this build does not report may read as
 `unsupported-on-this-build`, and only when the call itself succeeded:
 `stats.keyIndex` and its members (`partsCovered`, `partsUncovered`,
 `partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
 `leafGetRequests`, `keysProbed`), `pruning.skipIdxDropped`, the per-object
-and per-part breakdowns, and the fold report's `key_index_build_passes` and
+and per-part breakdowns, and the fold report's `key_index_build_passes`,
+`key_index_sections_read`, `key_index_leaf_gets` and
 `head_bytes_per_part_field`. Any other absent field (`phases`, `pruning`,
 `signals`, `io`, `server_cpu_s`, `server_rss_peak`, `rows`, the duration)
 is `missing`, and no figure defaults to 0. A figure read from
@@ -465,7 +504,7 @@ while the same call's scan phase issued a GET is `dead_counter
 segmentsOpened STATEMENT STATE`, a problem: on this build the rlog and rspan
 scan paths never increment that counter.
 
-`timing` figures (rows 2, 5, 15 and 16) are judged on the s3 lane and only
+`timing` figures (rows 2, 5, 15, 16 and 18) are judged on the s3 lane and only
 reported on the local one. The output is a pure function of the run
 directory, so re-evaluating it is byte-identical.
 
@@ -473,9 +512,12 @@ The verdict is `fail` when anything is missing, duplicated, wrong, refused,
 dead, not in flight or missed. Otherwise it is `incomplete` when the run
 proved less than it was asked: a state `run.toml` lists that did not run, a
 planned call that was not sent in a state that did (the run deadline, an
-in-flight window too short), or a figure `not-run` for a reason other than
+in-flight window too short), a figure `not-run` for a reason other than
 its row or figure needing a tenant, state, scale or baseline the run never
-asked for. Each reason is listed under `incomplete` in the results and the
+asked for, a row 18 cell `not-measured` (below), a figure that reads
+`not-computable` or `incomplete` or is judged against one, or a row 18
+figure that reads `unsupported-on-this-build`, `refused-by-guard`, refused
+or missing (missing also fails the run). Each reason is listed under `incomplete` in the results and the
 summary. The rows left out that way are not silent either: each is listed
 with the setting that leaves it out (`hits = false`, `baseline = false`, a
 state or scale `run.toml` does not list) under `not_requested` in the results and on the
@@ -497,10 +539,13 @@ Metrics a band can name: `cold.max.<m>` and `cold.min.<m>` (over the cold
 tries; `<m>` from the call's stats phases and members, such as `total_gets`,
 `data_gets`, `wire_bytes`, `leaf_gets`, `probe_wire_per_object`),
 `warm.max.<m>`, `cold.rows_exact` (1 when every try's answer was correct),
-`cold.rows_match_state.<state>`, `cold.wall_p50_s`,
-`cold.control_1001` (row 11's control, below), `stamp.<what>.<label>`
+`cold.rows_match_state.<state>`, `cold.wall_p50_s`, `cold.wall_iqr_s` (the
+75th less the 25th percentile of the cold tries' wall times),
+`cold.leaf_wall_p50_s` (row 18, below),
+`cold.control_1025` (row 11's control, below), `stamp.<what>.<label>`
 (covering parts, entry counts, previous leaves, footer length, leaf
-buckets), `leaf_share.<label>.<field>`,
+buckets), `stamp.slices.<label>.<field>` (the most leaves one part carries
+for the field), `leaf_share.<label>.<field>`,
 `census.<tenant>.<signal>.objects|bytes|objects_over_512k`,
 `fold.<tenant>.<label>.<field>`, `truth.<path>` (an integer `truth.json`
 holds), and `derived` figures over those. A stamp field the inspector did
@@ -518,14 +563,109 @@ Some bands, as transcribed:
   `missing` too.
 - Row 6: keyIndex GETs at most 2 x the census's hits objects and at least
   one per hits object above 512 KiB (the census's `objects_over_512k`): the
-  logs keyed plan probes every object past that size (#3117).
-- Row 7: section GETs at most 2 x new entries plus one per entry whose
-  footer exceeds 8 KiB plus one per previous leaf, miss over 2 x tail
-  entries, the from-scratch rebuild. New entries, previous leaves and footer
-  lengths come from the stamps; `rlog inspect` and `rspan inspect` print a
-  footer length, so the footer term is real (0 at the smoke's 199 and 248
-  bytes). The miss reads "over" as at least: a from-scratch rebuild is
-  exactly 2 x tail entries, so equality is its signature.
+  logs keyed plan probes every object past that size (#3117). Objects read
+  past the probe are the probed objects the key index did not prune: the
+  plan phase's `segmentsOpened` less `pruning.segmentsPrunedByKeyIndex`
+  (`cold.max.probe_survivors`), `unsupported-on-this-build` when the stats
+  carry no `segmentsPrunedByKeyIndex`. The keyed plan counts each object
+  whose KEY_IDX footer it probed as opened in the plan phase, absent key or
+  not, so `segmentsOpened` summed over the phases counts the probed objects
+  too, and the scan phase's `segmentsOpened` is not the figure either: the
+  plan does not probe an object at or under 512 KiB, so the scan can open
+  objects no probe saw. Box C's q20 (run
+  `investigations-20261106T154511Z-47463-23195`, its `calls.jsonl`) read
+  497 as the sum: of 523 objects, 26 pruned by stats and 4 at or under 512
+  KiB (the census's 523 less its 519 above), 493 opened in the plan phase
+  with 493 GETs, 492 of them pruned by the key index, and 4 opened in the
+  scan phase with 6 GETs and 989,537 B. The figure is 493 - 492 = 1, the
+  band's holders, a pass (`check_row_6_objects_past_probe`). That leaves 5
+  objects past every pruning step, the 1 probe survivor and the 4 unprobed
+  small objects, while the scan opened 4; the stats count objects and do
+  not name them, so they cannot tell which of the 5 the 4 are. The figure
+  is judged only when the plan opened exactly the probed objects: plan
+  `segmentsOpened` equal to the census's `objects_over_512k` less
+  `pruning.segmentsPrunedByStats` (box C: 519 - 26 = 493). The plan keeps
+  objects at or under 512 KiB out of its phase only when it skips sub-bound
+  plans (`skips_sub_bound_plans` in `crates/ravel-sql/src/logs_scan/plan.rs`);
+  otherwise it opens them with no probe, and they would count as
+  survivors. When the equality fails, or the census carries no
+  `objects_over_512k` for the statement's tenant and signal, the figure
+  reads `incomplete` with the precondition as its reason, never a hold or a
+  miss, and the run is incomplete. A small object pruned by stats also
+  breaks the equality (it is in `segmentsPrunedByStats` but not in
+  `objects_over_512k`), which reads `incomplete` too: the safe direction.
+  `segmentsPrunedByStats` does not count objects the time window drops or
+  `segmentsSkippedByThreshold`, so the equality could still hold by
+  coincidence on another statement; the precondition also asks
+  `pruning.segments` equal to the census's `objects` (box C: 523) and
+  `pruning.segmentsSkippedByThreshold` 0, and reads `incomplete` otherwise,
+  or when the census carries no `objects`. The same stats with the plan
+  opening 497, with `pruning.segments` 522, or with one segment skipped by
+  threshold read `incomplete`; with the precondition holding, a probe that
+  let 2 objects through misses (`check_row_6_objects_past_probe`).
+- Row 7, judged per build pass (the #3704 amendment's form, with the pass
+  factor of the pass-end slice amendment): ranged section GETs
+  (`key_index_ranged_gets`) at most 2 x (new + uncovered entries) x
+  `key_index_build_passes`, plus one per such entry and pass whose footer
+  exceeds 8 KiB, miss at 2 x tail entries x passes, the from-scratch
+  rebuild; the previous leaves' GETs (`key_index_leaf_gets`, read once per
+  fold) equal to the previous leaves; and, as a second signal, the fold's
+  section reads per pass (`key_index_sections_read` over the passes) at most
+  new + uncovered, miss at the tail's entry count. A total against 2 x tail
+  entries cannot tell a rebuild from extra passes: box D's logs advance read
+  22 new entries a pass over 27 passes, 1,188 ranged GETs, over 2 x 570 =
+  1,140 with no rebuild (`check_row_7_box_d`), while one pass reading all
+  570 entries still misses on both signals (`check_row_7_rebuild`).
+  Uncovered is the fold report's `key_index_uncovered_entries`, which the
+  fold sums over fields (an entry uncovered for two fields counts twice);
+  the report has no per-field count, so the row judges the sum. That can
+  only widen the targets, and neither miss line reads it, so a rebuild
+  still misses (`check_row_7_uncovered` pins each signal holding only with
+  the term). The passes target is G, the pass-end slice amendment's greedy
+  partition of each field's key8 runs into groups of at most the pair
+  share s = max(1, floor(budget / F)) for F fields, a single run over the
+  share its own group and the slowest field deciding. evaluate.py bounds G
+  from the two fold report fields issue #3948 specifies:
+  `key_index_pair_budget` (the build's pair budget) and
+  `key_index_field_pairs` (a map from every field the build indexed,
+  zero-pair fields included, to its total pairs, so F is the map's size).
+  A field of P pairs takes between ceil(P / s) and 2 x ceil(P / s) - 1
+  groups, at least 1, because no group holds more than s pairs while no
+  key8 run (one key's entry ordinals) exceeds the share and greedy groups
+  are maximal, so any two adjacent groups exceed s; `build_passes_low` and
+  `build_passes_high` are the largest low and the largest high bound over
+  fields, and `build_passes` holds inside that range and misses outside it
+  (`g_bounds`, `check_g_bounds`). The fold reports totals rather than each
+  field's key8 runs, which would give G exactly, because the runs are one
+  integer per distinct key8 per field, about 20 million at the T12 corpus,
+  and holding them would hold every run in memory, which the pair budget
+  exists to prevent. No fold report carries either field yet. Until one
+  does, both bounds read `not-computable` naming the missing inputs,
+  `build_passes`, judged against them, reads `not-computable` too, and
+  each adds an incomplete reason, so the verdict is at best `incomplete`
+  and the exit 1: row 7 cannot hold until the fold report carries G's
+  inputs, which issue #3948 adds. Box D's 3 and 27 passes read that way,
+  not as holds or misses, and still scale the section GETs
+  (`check_row_7_passes_not_computable`). A fold report carrying box D's
+  inputs (spans `trace_id` 20,833,333 pairs at budget 8,000,000; logs
+  `request_id` 104,166,665 and `trace_id` 20,833,333 at the same budget)
+  bounds G in [3, 5] on spans and [27, 53] on logs (request_id [27, 53],
+  trace_id [6, 11]), so 3 and 27 hold, and on logs 53 holds while 2 and
+  54 miss (`check_row_7_g`); a third, zero-pair field still counts in F,
+  putting logs in [40, 79], where 27 misses
+  (`check_row_7_g_zero_pair_field`). `build_passes` has no miss line of its
+  own, so a rebuild whose passes fall between the bounds reads within
+  range; the per-pass section figures are what catch a rebuild. On the
+  committed local smoke both bounds read `not-computable` for that reason,
+  but `build_passes` reads `unsupported-on-this-build` before it is judged:
+  that build's fold report carries no `key_index_build_passes` at all. New
+  entries, previous leaves and footer lengths come from the stamps; `rlog
+  inspect` and `rspan inspect` print a footer length, so the footer term is
+  real (0 at the smoke's 199 and 248 bytes). The miss reads "over" as at
+  least: a from-scratch rebuild is exactly 2 x tail entries per pass, so
+  equality is its signature. A build whose fold report carries no
+  `key_index_build_passes` cannot be judged per pass, so its section GETs
+  read `unsupported-on-this-build`.
 - Row 8: leaf bytes per field over the label's census data bytes, banded at
   2.5 % on logs and 6 % on spans, with the field named in the figure. The
   ADR's band was measured on one repeated-key column (hits `UserID`, 2.06
@@ -534,16 +674,60 @@ Some bands, as transcribed:
   count".
 - Row 11: rows exact and `keysProbed` equal to the list size at 1, 10, 100
   and 1,000 keys, leaf GETs at most 1 + min(distinct buckets, 64) and leaf
-  bytes at most entry_count x 11 KiB per covered part, and a 1,001-key
+  bytes at most entry_count x 11 KiB per covered part, and an over-cap
   control on each of `spans_in_1000`, `logs_trace_in_1000` and
-  `logs_request_in_1000`: the same list plus one key it does not hold
-  (`spans_in_1001`, `logs_trace_in_1001`, `logs_request_in_1001`). The
-  control is 1 (pass) when every 1,000-key call reports `keysProbed` 1000
-  and `partsCovered` and no 1,001-key call is index-served (`keysProbed` or
-  `partsCovered` non-zero); 0 (miss) when a 1,001-key call is index-served
-  or the 1,000-key list probed another count; `refused-by-guard` when the
-  1,000-key list was refused by the SQL complexity guard, and
-  `unsupported-on-this-build` when it carries no tier-2 figures.
+  `logs_request_in_1000`: a list of 1,025 keys, one over decision 6's
+  k = 1,024 (`spans_in_1025`, `logs_trace_in_1025`, `logs_request_in_1025`).
+  `inv.py merge-truth` builds each list as the 1,000-key list, the
+  generator's `control_extra` key (one the list does not hold) and ids the
+  corpus does not hold up to 1,025 (`truth.json` `over_cap`): request ids
+  `req-over-cap-absent-NNNN`, which the generator's `req-<16 hex>-<row>`
+  and `req-planted-*` forms never produce, and trace ids whose high 8
+  bytes are 1, 2, 3 and on and whose low 8 bytes are zero, as many as the
+  list needs (24 beside a `control_extra` key, 25 when the 1,000-key list
+  already names every trace), skipping a high half a listed id already
+  holds. The logs planner dedups a list on each key's key8 before it counts
+  the keys (`KeyIn::new`, through `KeySet::new`), which is exact for logs,
+  and an Id16's key8 is its high 8 bytes, so padding that differed only in
+  the low half would be one key and leave the list under the cap. The spans
+  `trace_id IN` arm sorts and dedups the full 16-byte ids and drops the
+  list when more than `TRACE_ID_SET_MAX` (1,024) distinct ids remain,
+  before any key8 is taken (`crates/ravel-sql/src/spans_pushdown.rs`, the
+  `Expr::InList` arm); only a list that passes that cap is deduped on key8,
+  by the router's key set. Every over-cap list holds 1,025 distinct key8s,
+  so it is over the cap on both paths
+  (`test_over_cap_lists_hold_over_1024_distinct_key8`). A random 128-bit
+  draw lands on a padding id with negligible odds and, if one did, would
+  add rows and read as a wrong answer, not a pass. The padding adds no row,
+  so the oracle (`in_trace_id.1025.*`,
+  `in_request_id.1025`) is the generator's answer for the 1,000-key list
+  plus `control_extra`. The current build admits the list and does not
+  route it: the SQL complexity guard charges a flat literal list one unit
+  plus one per 64 literals and refuses only past 4,096 literals
+  (`MAX_IN_LIST_LITERALS`), so the statement costs 25 units, and the
+  planner carries no key set past 1,024 keys (`KEY_SET_MAX_KEYS`; the
+  spans `TRACE_ID_SET_MAX` and logs `KeyIn::new` both drop it), so the scan
+  has no key arm and the residual filter answers it with `keysProbed` 0 and
+  0 leaf GETs (`services/ravel-server/tests/sql_key_in.rs`,
+  `in_list_rows_equal_the_union_of_equalities`). The control is 1 (pass)
+  when every 1,000-key call reports `keysProbed` 1000 and either
+  `partsCovered` or a part in an Uncovered outcome: any of
+  `partsUncovered`, `skippedByBudget`, `partsBeyondCeiling`,
+  `leavesRejected` and `reservationsRefused`, every outcome the ADR's row
+  11 lets the report name (box C's went Uncovered by budget, `partsCovered`
+  0 and `skippedByBudget` 1, which still carried the key set:
+  `check_control_uncovered_by_budget`; each outcome alone passes in
+  `check_control_uncovered_outcomes`, which also pins that its cases cover
+  every outcome evaluate.py accepts), and
+  every 1,025-key call is served by a visible scan with no keyIndex figure
+  above zero; 0 (miss) when a 1,025-key call is index-served
+  (`keysProbed`, `partsCovered` or `leafGetRequests` non-zero), is served
+  with no visible path, or is refused while the 1,000-key list was
+  admitted, or when the 1,000-key list probed another count or reported
+  `partsCovered` 0 with no Uncovered outcome;
+  `refused-by-guard` when the 1,000-key list was refused by the SQL
+  complexity guard, and `unsupported-on-this-build` when it carries no
+  tier-2 figures.
 - Row 15: the sum of the three steps' p50 under 5 s, miss over 20 s, and the
   journey's GET total within resolve + 2 x covering parts on spans + (1 +
   min(distinct buckets, 64)) per covering part on logs + 50 x (footer +
@@ -551,6 +735,29 @@ Some bands, as transcribed:
   term comes from `truth.json`, not from the measured call: the failing
   cell's traces (`failing_cell.count`, the holders) x the logs rows planted
   per trace (`generator.logs_per_trace`), each row at most one block read.
+- Row 18, key-set lookup time, one cell per field and list size (logs
+  `request_id`, logs `trace_id` and spans `trace_id`, at 10 and 100 keys):
+  the cell's `advanced_leaves` p50 over its cold calls
+  (`cold.leaf_wall_p50_s`) at most U + max(0.05 x U, 0.5 x IQR), U the
+  `unfolded` p50 of the same statement (`cold.wall_p50_s`) and IQR its
+  unfolded interquartile range (`cold.wall_iqr_s`), both from the same
+  run; over that bound is a miss. A cell any of whose cold calls left a
+  covering part `Uncovered` (`partsCovered` 0, or `partsUncovered`,
+  `skippedByBudget`, `partsBeyondCeiling`, `leavesRejected` or
+  `reservationsRefused` above 0) reads `not-measured` whatever its time:
+  its time is the tier-1 probe's, so it is neither a hold nor a miss, and
+  it makes the verdict at best `incomplete`. `partsCovered` 0 with every
+  outcome counter 0 counts too: the leaves answered no part
+  (`check_row_18_covered_nothing`). A cell whose build reports no
+  keyIndex outcome counters reads `unsupported-on-this-build`, which also
+  makes the verdict `incomplete` and the exit 1, not a pass
+  (`check_row_18_unsupported_is_incomplete`). With either state absent the
+  row reads `not-run` with the reason, as the committed fixture's does. The
+  row also reports the slices per (part, field) the lookups touched
+  (`stamp.slices`), and the logs `request_id` count after the leaf rebuild
+  beside it. Box C, before #3917, measured logs `request_id` at 100 keys at
+  7.64 s through the leaves against 3.01 s unfolded, a miss
+  (`check_row_18` cases).
 
 Cost: per (statement, state), the mean cold call's GETs, LISTs and server
 CPU seconds times the named prices. Server CPU is `/proc/<pid>/stat` utime
@@ -573,17 +780,29 @@ unchanged.
 
 ## Unsupported on this build
 
+- Row 7's G bounds (`build_passes_low`, `build_passes_high`) are not in
+  this list: they are `not-computable`, not unsupported, because no
+  build's fold report carries their inputs (`key_index_pair_budget`,
+  `key_index_field_pairs`) yet, and they leave the run incomplete (row 7,
+  above).
 - Key-index stats (`stats.keyIndex` and its members),
   `pruning.skipIdxDropped`, the per-object and per-part breakdowns, and the
-  fold report's `key_index_build_passes` and `head_bytes_per_part_field`:
+  fold report's `key_index_build_passes`, `key_index_sections_read`,
+  `key_index_leaf_gets` and `head_bytes_per_part_field`:
   absent from this build's output, so their figures are unsupported with
   that reason (the allowlist above). The many_parts leaf-GET figures are
   among them: main has no tier-2 reader.
-- The 1,000- and 1,001-key IN lists (`spans_in_1000`, `logs_trace_in_1000`,
-  `logs_request_in_1000` and their `_1001` controls) are sent. A build from
+- The 1,000- and 1,025-key IN lists (`spans_in_1000`, `logs_trace_in_1000`,
+  `logs_request_in_1000` and their `_1025` controls) are sent. A build from
   before ADR-3692's key set amendment refuses them with HTTP 400 and
   `statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the
-  statement`, and `fixtures/local-smoke` is a run of such a build. These
+  statement`, and `fixtures/local-smoke` is a run of such a build. That run
+  sent the harness's earlier 1,001-key controls; its six control call
+  groups were renamed to the `_1025` statement ids and truth keys when the
+  control moved, and their `restarts.jsonl` stamps to the same statement
+  ids, and nothing else in them changed: the guard refused them before
+  their length mattered, with the same text it gives every list past its
+  cap (below). These
   statements carry `expect_refusal_on_main = true`, and evaluate.py records
   each such refusal as `refused-by-guard` ("refused by the SQL complexity
   guard") with that text, a class of its own: the summary's `refusal classes`
@@ -613,7 +832,7 @@ unchanged.
   amendment a flat list of literals costs one unit plus one per 64 literals,
   rounded up (`in_list_units` in `crates/ravel-sql/src/complexity_guard.rs`),
   up to 4,096 literals, so each of these statements costs 24 units at 1,000
-  keys and at 1,001 and is admitted.
+  keys and 25 at 1,025, and is admitted.
 - Row 13's negative controls: decision 9's mutants are not built here, so
   the figure is `not-run` ("mutant controls not implemented") and the
   verdict is at best `incomplete`.
@@ -683,15 +902,17 @@ Its verdict is `fail`. The problem list, pinned by the suite:
 miss row_01.wire_bytes
 miss row_02.wire_bytes
 miss row_03.probe_wire_per_object
-miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
-miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_08.logs_trace_id_leaf_pct
 miss row_08.logs_request_id_leaf_pct: key cardinality equals the row count
 dead_counter segmentsOpened journey_c_1 folded_leaves
 dead_counter segmentsOpened journey_c_10240 folded_leaves
 ```
 
-The only incomplete line is
+The incomplete lines are row 7's four G bound figures,
+`figure row_07.spans_build_passes_low not-computable: fold report
+fold_advance/inv/spans carries no key_index_pair_budget and no
+key_index_field_pairs, ...`, its `build_passes_high` twin and the logs
+pair, and
 `figure row_13.negative_controls_failing_on_mutant not run: mutant controls
 not implemented`.
 
@@ -701,17 +922,20 @@ not implemented`.
   fixed by T4, not on main). The fixture carries the ranges stamps of
   unfolded, the only state row 3 reads and the only one the run stamps.
 - Row 7: the fold_advance rebuild issued 12 section GETs on each signal,
-  2 x the 6 entries of the whole tail, against targets of 2 x 2 new + 1
-  previous leaf = 5 (spans) and 2 x 2 + 2 = 6 (logs). Main rebuilds the leaf
-  from scratch on an advancing fold, which T6 of the epic changes; this is
-  not a scale effect.
+  2 x the 6 entries of the whole tail, where the 2 new entries would cost 4
+  a pass. The fixture's build rebuilt the leaf from scratch on an advancing
+  fold, which T6 of the epic changed; this is not a scale effect. Its fold
+  report carries no `key_index_build_passes`, `key_index_sections_read` or
+  `key_index_leaf_gets`, so row 7, judged per pass, reads those figures and
+  the section GETs `unsupported-on-this-build`, not a miss
+  (`test_section_gets_need_the_pass_count`).
 - Row 8: the logs `request_id` leaf is 27.5 % of the logs data bytes (one
   key per row) and the logs trace id leaf 5.9 %, against 2.5 %; the spans
   trace id leaf is 4.3 %, inside 6 %.
 - Rows 1 and 2: 464,912 wire bytes for the no-range lookup and 333,840 for
   the 1 h lookup, against 300 KB; the run's real figures.
 - Row 11: the 1,000-key IN lists are refused by the complexity guard
-  (1,001 units), so their figures and the 1,001-key controls read
+  (1,001 units), so their figures and the over-cap controls read
   `refused-by-guard` with the server's text (15 figures over 24 calls on
   the summary's `refusal classes` line). Row 13: every in-flight try of
   compaction_in_flight's four statements overlapped its own signal's
@@ -742,12 +966,21 @@ against the ADR's Acceptance table), evaluate.py on the fixture and on
 mutations of it (missing, duplicate, miss, wrong answer, a deleted catalog
 stamp, absent phases, CPU and leaf sizes, dead counters, full, partial, zero
 and too-short compaction overlap, a refusal outside the cap probes, the
-1,001-key control's pass, miss and unsupported readings, a skipped state
+1,025-key control's pass, miss, refused and unsupported readings and each
+Uncovered outcome of its 1,000-key list, a skipped state
 and a mid-state deadline, the unsealed tail, the pending-erasure victim, a
-state absent from the results, row 3's per-object denominator, row 15's
-budget from `truth.json`, exact cost and maintenance dollars), the wrong
+state absent from the results, row 3's per-object denominator, row 6's
+objects past the probe on box C's stats, with its plan-phase precondition
+failing (incomplete) and a second survivor (miss), row 7 per pass on box
+D's figures and on a one-pass rebuild, row 7's G `not-computable` on box
+D's figures (incomplete) and computed from a fold report that carries its
+inputs (hold at box D's passes, miss one over), row 15's budget from `truth.json`, row 18's
+hold, box C miss, noise edges, `Uncovered` cell and absent state, a typed
+refusal counted as an error, exact cost and maintenance dollars), the wrong
 evaluators each of those cases must reject (each printed with the
-evaluate.py line it flips), a failed state (its figures `not-run` with
+evaluate.py line it flips) and the wrong bands (each printed with the
+bands.toml line it flips), `inv.py advance-check` on box D's slice counts
+and on each precondition failing, a failed state (its figures `not-run` with
 `state failed at <step> (exit N)`, never pass or missing), the even-hours
 corpus and the strided-load check over it at 744 hours, and the dry runs of
 `run.sh` (local, s3, s3 with hits, past the deadline, a failed state that
