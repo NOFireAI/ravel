@@ -2159,6 +2159,28 @@ flag on for a tenant whose tail lives longer than about a day, size the
 fold's memory for its tail's leaf bytes, and its request budget for the
 section GETs.
 
+### Metrics label-value leaves
+
+`--fold-metrics-label-index` (ravel-server) makes every fold the process
+runs, scheduled and on-demand, also build the metrics `label_value` leaf
+from each metrics object's LABEL_DICT (ADR-3694 decision 2), the server
+counterpart of `ravel-cli catalog fold --metrics-label-index`. It is off by
+default, refused without `--fold-key-index-leaves`, and refused in
+`--mode gateway`, which runs no fold. While a tenant has a pending metrics
+erasure the fold writes no metrics leaf.
+
+Once a part carries the leaf, a PromQL selector's positive equality values
+(`__name__` included) are routed through it before any object is opened,
+one value at a time, and an object one of them is proven absent from is not
+read (ADR-3694 decision 3). Recent objects above the fold watermark are
+always read, and nothing is routed while the snapshot has a pending
+erasure. `data.stats.segmentsPrunedByLabelIndex` counts the objects no
+selector read; the leaf GETs are charged to the `keyIndex` phase and counted
+under `signal="metrics"` in `ravel_query_key_index_parts_total` and
+`ravel_query_key_index_leaf_gets_total`. The
+[query engine spec](../../query-engine.md#the-label-value-route-adr-3694-decision-3)
+states the routing rules.
+
 ## Per-query budgets
 
 Eight flags bound what one query can spend. Unset, each resolves at startup:

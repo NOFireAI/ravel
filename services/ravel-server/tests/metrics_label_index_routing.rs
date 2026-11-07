@@ -281,8 +281,10 @@ const LABEL_INDEX_OFF: &[&str] = &["--fold-key-index-leaves"];
 #[derive(Clone, Copy, Default)]
 struct Setup {
     label_index: bool,
-    /// Also publish one non-holder object into the current, unsealed hour.
+    /// Also publish one object into the current, unsealed hour.
     recent: bool,
+    /// The recent object also holds `instance="target"`.
+    recent_holds_target: bool,
     /// File a pending metrics erasure request after the fold.
     pending_erasure: bool,
 }
@@ -356,9 +358,11 @@ async fn serve(setup: Setup) -> Fixture {
                 &tenant,
                 OBJECTS,
                 recent_hour,
-                now - 2 * NS_PER_MIN,
+                // Inside the current hour, so the commit record's created
+                // time is never in an hour before its ingest hour.
+                (now - 2 * NS_PER_MIN).max(i64::from(recent_hour) * NS_PER_HOUR),
                 "recent",
-                false,
+                setup.recent_holds_target,
             )
             .await,
         )
@@ -521,16 +525,22 @@ fn metrics_route_totals() -> (Vec<u64>, u64) {
 /// `segmentsPrunedByLabelIndex` is the non-holder count, every non-holder's
 /// data GETs drop to zero while each holder's stay as they were, the leaf
 /// GETs are charged to the keyIndex phase, and the result is bit-identical
-/// to the run over a tenant folded without the metrics leaf.
+/// to the run over a tenant folded without the metrics leaf. A recent holder,
+/// which no leaf covers, is read and its series answered.
 #[tokio::test]
 async fn promql_query_range_prunes_non_holders_by_label_index() {
     let _serial = SERIAL.lock().await;
     let query = format!("{METRIC}{{instance=\"{TARGET}\"}}");
-    let off = serve(Setup::default()).await;
+    let with_recent_holder = Setup {
+        recent: true,
+        recent_holds_target: true,
+        ..Setup::default()
+    };
+    let off = serve(with_recent_holder).await;
     let unrouted = off.query_range(&query).await;
     let on = serve(Setup {
         label_index: true,
-        ..Setup::default()
+        ..with_recent_holder
     })
     .await;
     let (_, leaf_gets_before) = metrics_route_totals();
@@ -548,9 +558,19 @@ async fn promql_query_range_prunes_non_holders_by_label_index() {
     );
 
     let result = matrix(&routed);
-    assert_eq!(result.len(), HOLDERS.len(), "one series per holder");
+    assert_eq!(
+        result.len(),
+        HOLDERS.len() + 1,
+        "one series per sealed holder and one for the recent holder"
+    );
     assert!(result.iter().all(|(_, points)| !points.is_empty()));
     assert_eq!(result, matrix(&unrouted), "routing changes no answer");
+    let recent = |fixture: &Fixture| {
+        let key = fixture.recent.as_deref().expect("a recent object");
+        fixture.recorder.gets_on(key)
+    };
+    assert!(recent(&off) >= 1);
+    assert_eq!(recent(&on), recent(&off), "the recent holder is read as before");
 
     let off_gets = off.sealed_gets();
     let on_gets = on.sealed_gets();

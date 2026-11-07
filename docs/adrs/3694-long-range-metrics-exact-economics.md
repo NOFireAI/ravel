@@ -288,7 +288,8 @@ ADR-2707 and ADR-3692 already impose on logs and spans leaves.
 
 `prefetch_metric_plans` (`engine.rs:1914-1950`) calls the one tier-2 router
 ADR-3692 decision 2 adds (`crates/ravel-query/src/key_index_route.rs`)
-with a `KeySet` of the statement's positive equality values, field
+with a `KeySet` of the statement's positive equality values (one
+one-key `KeySet` per value, see the per-value routing amendment below), field
 `label_value`, over the pinned snapshot's covering parts and their field 8
 refs (ADR-3692 decision 1's `SnapshotParts`). Per part the router's
 answer maps to: every entry of the part dropped (`Pruned`), or the part's
@@ -644,3 +645,36 @@ reservation is at most its count.
   the unbatched call's plus (page sections - 1) x the coalesce gap per
   batch. The owner accepted the restatement per whole-series batch on
   2026-11-07, then both corrected bounds the same day.
+
+## Amendment (issue #3865): each positive equality value is routed on its own
+
+<!-- amendment-applies: sections="3. The PromQL resolve routes through the leaves before any object is opened" pointer="per-value routing amendment" -->
+<!-- amendment-supersedes: phrase="a `KeySet` of the statement's positive equality values" pointer="per-value routing amendment" -->
+
+Decision 3 routes a `KeySet` of the statement's positive equality values.
+The router prunes a part for a multi-key set only when every key of the set
+is absent from it. A selector's equality matchers are a conjunction, so an
+object can be dropped as soon as any one of its values is absent, and under
+one multi-key set a metric name present in most objects would keep those
+objects whatever the selector's other values say: the route would prune
+almost nothing. One one-key `KeySet` per value, and a conjunction across
+values, replace the one set:
+
+- Each distinct positive equality value `v` of the statement (a `k="v"`
+  matcher with a non-empty `v`, `__name__` included) is routed once, as its
+  own one-key `KeySet`: field `label_value`, key type `Str`, `key8(v)`.
+  Negative, regex and empty-value matchers route nothing.
+- A selector plan (a distinct matcher set) drops a segment when any of its
+  own values routes it `Pruned`; `Blocks` and `Uncovered` keep it. A plan
+  with no positive equality value is not routed and reads every segment.
+  Each plan fetches only the segments it keeps.
+- `segmentsPrunedByLabelIndex` counts the segments no plan reads.
+- Nothing is routed while the pinned snapshot carries a pending erasure
+  (decision 2's erasure rule): no prune and no leaf GET.
+
+Leaf GETs scale with the matcher count: each distinct value is one routing
+pass under the router's `L_max`, `P_max` and `B_run` admission, so a
+statement with `n` distinct values can issue up to `n` passes' leaf GETs.
+Acceptance row 3's leaf GET band is stated for one pass; the Stage 1 run
+(T8) measures the per-value figure against row 3's band and records the
+statement's value count beside it.

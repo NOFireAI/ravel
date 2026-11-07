@@ -4219,9 +4219,6 @@ fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<Cow<'a, 
     shared
 }
 
-/// Whether every non-empty positive equality across `plans` matches
-/// `__name__`, the statement shape whose dictionary-first probe prunes
-/// nothing once the name postings applied (issue #3862).
 /// The values of `matchers`' positive equalities (`=` with a non-empty
 /// value), `__name__` included: what the label-value route probes.
 fn positive_equality_values(matchers: &[LabelMatcher]) -> Vec<&str> {
@@ -4265,6 +4262,9 @@ fn segments_pruned_by_label_index(plan_keeps: &[Option<Vec<bool>>], segments: us
     read.iter().filter(|read| !**read).count() as u64
 }
 
+/// Whether every non-empty positive equality across `plans` matches
+/// `__name__`, the statement shape whose dictionary-first probe prunes
+/// nothing once the name postings applied (issue #3862).
 fn only_name_equalities(plans: &[SelectorPlan]) -> bool {
     plans
         .iter()
