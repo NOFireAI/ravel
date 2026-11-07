@@ -1989,21 +1989,27 @@ class Evaluate(Workdir):
         self.assertEqual(figure(res, "row_13.wrong_answers")["value"], 1)
         self.assertEqual(figure(res, "row_13.errors")["value"], 0)
 
-    def test_typed_refusal_is_an_error_not_a_wrong_answer(self):
-        # Box C (#3918): eight HTTP 422 budget refusals read as eight wrong
-        # answers with no row differing from the oracle. A refusal still
-        # fails the run, as an error, and leaves wrong_answers alone.
+    def check_typed_refusal_is_an_error_not_a_wrong_answer(self, evaluate_py=EVALUATE):
+        """Box C (#3918): eight HTTP 422 budget refusals read as eight wrong answers with no row differing
+        from the oracle. A refusal still fails the run, as an error, and leaves wrong_answers alone."""
         c = next(c for c in self.select("logs_tail_request_id", "mixed") if c["try"] == 0)
         c["outcome"], c["http_status"] = "error", 422
         c["error"] = "query memory budget exhausted"
         self.save_calls()
-        code, res, _ = self.go(BANDS)
-        self.assertEqual(code, 1)
-        self.assertIn("error logs_tail_request_id/mixed/cold try 0: outcome 'error' HTTP 422", res["problems"])
-        self.assertEqual(figure(res, "row_13.wrong_answers")["value"], 0)
-        self.assertEqual(figure(res, "row_13.wrong_answers")["verdict"], "pass")
+        code, res, _ = self.go(BANDS, evaluate_py)
+        out = [] if code == 1 else [f"exit {code}"]
+        if "error logs_tail_request_id/mixed/cold try 0: outcome 'error' HTTP 422" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        f = figure(res, "row_13.wrong_answers")
+        if (f["value"], f["verdict"]) != (0, "pass"):
+            out.append(f"wrong_answers {f['value']} {f['verdict']}")
         f = figure(res, "row_13.errors")
-        self.assertEqual((f["value"], f["verdict"]), (1, "miss"))
+        if (f["value"], f["verdict"]) != (1, "miss"):
+            out.append(f"errors {f['value']} {f['verdict']}")
+        return out
+
+    def test_typed_refusal_is_an_error_not_a_wrong_answer(self):
+        self.assertEqual(self.check_typed_refusal_is_an_error_not_a_wrong_answer(), [])
 
     # --- in-flight overlap, refusals, the 1,025-key control -----------------
 
@@ -2804,6 +2810,13 @@ FLIPS = {
         '    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered") or ki.get("leafGetRequests"))',
         '    return isinstance(ki, dict)',
         "check_control_zeros_without_scan",
+    ),
+    # The #3922 review: a refusal is an error, not a wrong answer, so an
+    # evaluator summing the two into matrix.wrong_answers fails the case.
+    "matrix.wrong_answers counted as wrong rows plus errors": (
+        '            return "value", len(calls.wrong), ""\n',
+        '            return "value", len(calls.wrong) + len(calls.errors), ""\n',
+        "check_typed_refusal_is_an_error_not_a_wrong_answer",
     ),
     "a state with every call group unsent read as missing": (
         "        if groups and len(unsent) == len(groups):\n",
