@@ -30,7 +30,10 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_memory::MemoryBudget;
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, PutOptions, PutOutcome, StoreError,
+};
 use ravel_query::{CacheFetchError, LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest,
@@ -1543,4 +1546,130 @@ async fn per_call_view_memo_stats_are_the_statements_own() {
             "view budget 0, call {call}"
         );
     }
+}
+
+/// A store that runs a hook once, on the first `GET` of a data object after
+/// the hook is armed, before serving it.
+struct HookStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl HookStore {
+    fn arm(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.hook.lock().unwrap() = Some(Box::new(hook));
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for HookStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        if key.contains("/l0/") {
+            let hook = self.hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.inner.list_after(prefix, start_after, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
+/// ADR-3326, view memo amendment, decision 7, at the executor: a pressure
+/// release inside one call is that call's own. After a release of the 8 view
+/// memos between calls (so the call's release mark reads 8), a pass asked
+/// for the 768 view bytes, run on the call's first data object `GET` after
+/// its mark, releases all 8 again and evicts no data entry;
+/// that call refills them and reports `[768, 8, 0, 8]`, and the next call
+/// reports no release.
+#[tokio::test]
+async fn a_release_inside_one_call_is_that_calls_own() {
+    const SQL: &str = "SELECT p, count(*) AS c FROM logs GROUP BY p";
+    let views = (ROWS_PER_OBJECT * OBJECTS as usize * 16) as u64;
+    let t = tenant();
+    let hooked = Arc::new(HookStore {
+        inner: Arc::new(MemoryStore::new()),
+        hook: std::sync::Mutex::new(None),
+    });
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&hooked) as _;
+    for seq in 1..=OBJECTS {
+        publish_object(store.as_ref(), &t, seq).await;
+    }
+    let cache = Arc::new(
+        DecodedColumnCache::new(1 << 30, Some(Arc::new(MemoryBudget::unlimited())))
+            .with_view_max_bytes(1 << 30),
+    );
+    let exec = executor(&store, Some(Arc::clone(&cache)));
+    for _ in 0..3 {
+        view_memo_keys(&exec, &t, SQL).await;
+    }
+    assert_eq!(cache.view_resident_bytes(), views, "served and filled");
+    let freed = cache.evict_for_pressure(views, 0, ravel_memory::ExhaustionCause::Accounted);
+    assert_eq!(freed, views);
+    assert_eq!(view_memo_keys(&exec, &t, SQL).await, [views, 8, 0, 0]);
+    assert_eq!(cache.view_counters().releases, 8, "the call's mark");
+
+    let in_call = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (evictee, seen) = (Arc::clone(&cache), Arc::clone(&in_call));
+    hooked.arm(move || {
+        let freed = evictee.evict_for_pressure(views, 0, ravel_memory::ExhaustionCause::Accounted);
+        seen.store(freed, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert_eq!(
+        view_memo_keys(&exec, &t, SQL).await,
+        [views, 8, 0, 8],
+        "the release inside the call, and its refill"
+    );
+    assert_eq!(
+        in_call.load(std::sync::atomic::Ordering::SeqCst),
+        views,
+        "the pass ran inside the call and freed only the views"
+    );
+    assert_eq!(cache.view_counters().releases, 16);
+    assert_eq!(
+        cache.pressure_counters().evictions,
+        0,
+        "no data entry evicted"
+    );
+    assert_eq!(view_memo_keys(&exec, &t, SQL).await, [views, 0, 0, 0]);
 }
