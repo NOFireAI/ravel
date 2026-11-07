@@ -255,9 +255,9 @@ ADR-2707 and ADR-3692 already impose on logs and spans leaves.
   (decision 1) and the exact decode still run on survivors.
 - **Object.** The leaf is the ADR-2707 leaf object under
   `catalog/m/idx/`, referenced from `SnapshotPartRef.key_index` (field 8),
-  at `KEY_INDEX_LEAF_FORMAT_VERSION` 1 as it is. Every entry carries the
+  at `KEY_INDEX_LEAF_FORMAT_VERSION` 2 as it is. Every entry carries the
   one-block set `{0}`: the encoder refuses an empty block set
-  (`crates/ravel-catalog/src/snapshot_format/kidx.rs:321-326`) and
+  (`crates/ravel-catalog/src/snapshot_format/kidx.rs:344-349`) and
   docs/catalog-and-mvcc.md lists one as leaf corruption, so a metrics leaf
   is legal to every existing reader and writer, and block ordinal 0 is
   defined, for a signal whose objects have no block structure the leaf
