@@ -1096,6 +1096,9 @@ pub struct ScanTiming {
     /// decision A2), all partitions.
     pub prefetch_memory_reopens: u64,
     pub prefetch_revocations: u64,
+    /// Refused opens that narrowed the statement's fan-out to one partition
+    /// at a time instead of failing, all partitions.
+    pub fan_out_narrowings: u64,
     /// Synchronous decode plus Arrow build inside `poll_next`.
     pub decode_build_elapsed_ns: u64,
     pub decode_build_elapsed_max_ns: u64,
@@ -1160,6 +1163,7 @@ fn accumulate_scan_timing(metrics: &MetricsSet, timing: &mut ScanTiming) {
         timing.reopens += sum("reopens");
         timing.prefetch_memory_reopens += sum("prefetch_memory_reopens");
         timing.prefetch_revocations += sum("prefetch_revocations");
+        timing.fan_out_narrowings += sum("fan_out_narrowings");
         timing.decode_build_elapsed_ns += sum("decode_build_elapsed");
         timing.emit_elapsed_ns += sum("emit_elapsed");
         timing.plan_init_elapsed_ns += sum("plan_init_elapsed");
