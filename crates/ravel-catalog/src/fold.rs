@@ -16180,6 +16180,271 @@ pub(crate) mod tests {
         assert!(head.parts[0].key_index.is_empty());
     }
 
+    /// A reconciled fold over a tenant whose parts are mostly reused holds
+    /// LABEL_DICT pairs only for the part it builds a leaf for. One object
+    /// per hour, one part per hour; a tombstone on the fourth hour makes the
+    /// next fold reconcile, so its postings build fetches every entry whole,
+    /// yet the parts for the first, second, third and fifth hours are reused
+    /// by reference and only the new tail (ordinal 4, nine pairs) is held,
+    /// and released once its leaf is built. Holding by fetch rather than by
+    /// need held all five entries, 45 pairs.
+    #[tokio::test]
+    async fn a_reconciled_metrics_fold_holds_no_pairs_for_reused_parts() {
+        let store = recording_store();
+        let cfg = CatalogConfig {
+            snapshot_part_max_entries: 1,
+            metrics_label_index_max_ratio_ppm: 1_000_000,
+            ..metrics_kidx_config()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        for offset in 0..5u32 {
+            let region = if offset % 2 == 0 { "west" } else { "east" };
+            publish_labeled_metrics(
+                store.as_ref(),
+                u64::from(offset) + 1,
+                KIDX_HOUR + offset,
+                &region_series(region),
+                1000,
+                false,
+            )
+            .await;
+        }
+        let first = fold_through(&catalog, Signal::Metrics, KIDX_HOUR + 4).await;
+        assert_eq!(first.key_index_leaves_written, 5, "{first:?}");
+        take_held_label_dict_log_for_test();
+
+        publish_tombstone(&store.inner, 0, KIDX_HOUR + 3).await;
+        publish_labeled_metrics(
+            store.as_ref(),
+            6,
+            KIDX_HOUR + 5,
+            &region_series("east"),
+            1000,
+            false,
+        )
+        .await;
+        store.gets.lock().expect("lock").clear();
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR + 5).await;
+        assert_eq!(report.entry_count, 5, "{report:?}");
+        assert_eq!(report.parts_reused, 4, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+        assert_eq!(report.key_index_ranged_gets, 0, "{report:?}");
+        assert_eq!(
+            data_object_ranged_gets(&store),
+            Vec::<(String, GetRange)>::new()
+        );
+        let whole: usize = store
+            .gets
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(key, range, _)| key.ends_with(".rseg") && matches!(range, GetRange::Full))
+            .count();
+        assert_eq!(whole, 5, "the reconciled postings build fetches every entry");
+        assert_eq!(
+            take_held_label_dict_log_for_test(),
+            HeldLabelDictLog {
+                held_ordinals: vec![4],
+                peak_pairs: 9,
+                pairs_after_release: vec![0],
+            }
+        );
+
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts.len(), 5);
+        let tail = &head.parts[4];
+        let ordinal = part_ordinals(store.as_ref(), tail).await;
+        assert_eq!(
+            probe_label(&catalog, tail, "east").await,
+            matches(&[(ordinal[&6], &[0])], &[])
+        );
+    }
+
+    /// With `key_index_build_max_pairs` 20, the postings build holds the
+    /// first two objects' LABEL_DICT pairs (18) and no more, since a third
+    /// would take the held total to 27; the other four are read by range in
+    /// every pass. The held total never passes the budget, drops to zero once
+    /// the part's leaf is built, and the leaf answers exactly. Holding every
+    /// fetched object held all six, 54 pairs.
+    #[tokio::test]
+    async fn held_label_dict_pairs_stay_within_key_index_build_max_pairs() {
+        let store = recording_store();
+        let records = publish_label_fixture(store.as_ref()).await;
+        let cfg = CatalogConfig {
+            key_index_build_max_pairs: 20,
+            metrics_label_index_max_ratio_ppm: 1_000_000,
+            ..metrics_kidx_config()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        store.gets.lock().expect("lock").clear();
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 6, "{report:?}");
+        assert_eq!(report.key_index_uncovered_entries, 0, "{report:?}");
+        assert!(report.key_index_leaves_written > 1, "{report:?}");
+        assert!(report.key_index_build_passes > 1, "{report:?}");
+        assert_eq!(
+            take_held_label_dict_log_for_test(),
+            HeldLabelDictLog {
+                held_ordinals: vec![0, 1],
+                peak_pairs: 18,
+                pairs_after_release: vec![0],
+            }
+        );
+        assert_eq!(
+            report.key_index_ranged_gets,
+            2 * 4 * report.key_index_build_passes,
+            "{report:?}"
+        );
+
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts.len(), 1);
+        let part = &head.parts[0];
+        let ordinal = part_ordinals(store.as_ref(), part).await;
+        let held = [0u64, 1];
+        let ranged_keys: BTreeSet<String> = data_object_ranged_gets(&store)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let expected: BTreeSet<String> = records
+            .iter()
+            .filter(|r| !held.contains(&ordinal[&r.writer_seq]))
+            .map(|r| keys::reconstruct_data_key(r).expect("data key"))
+            .collect();
+        assert_eq!(ranged_keys, expected);
+        let east: Vec<(u64, &[u32])> = EAST_WRITERS
+            .iter()
+            .map(|seq| (ordinal[seq], &[0u32][..]))
+            .collect();
+        assert_eq!(
+            probe_label(&catalog, part, "east").await,
+            matches(&east, &[])
+        );
+        let all: Vec<(u64, &[u32])> = (1..=6u64).map(|seq| (ordinal[&seq], &[0u32][..])).collect();
+        assert_eq!(
+            probe_label(&catalog, part, "region").await,
+            matches(&all, &[])
+        );
+    }
+
+    /// The byte cap counts every slice of the field, not each on its own:
+    /// with `key_index_build_max_pairs` 20 the leaf is built in several
+    /// slices, and a cap at least the largest slice but under their sum
+    /// leaves the part uncovered. The passes before the one that crosses the
+    /// cap already PUT their slices; HEAD names none of them, so they are
+    /// unreferenced and left to the catalog sweep.
+    #[tokio::test]
+    async fn slices_each_under_the_byte_cap_but_over_it_together_are_uncovered() {
+        let cfg = CatalogConfig {
+            key_index_build_max_pairs: 20,
+            metrics_label_index_max_ratio_ppm: 1_000_000,
+            ..metrics_kidx_config()
+        };
+        let uncapped = recording_store();
+        let records = publish_label_fixture(uncapped.as_ref()).await;
+        let catalog = Catalog::new(uncapped.clone(), cfg.clone()).expect("catalog");
+        fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        let head = read_signal_head(uncapped.as_ref(), Signal::Metrics).await;
+        let sizes: Vec<u64> = head.parts[0].key_index.iter().map(|l| l.size).collect();
+        assert!(sizes.len() > 1, "{sizes:?}");
+        let largest = sizes.iter().copied().max().unwrap_or(0);
+        let total: u64 = sizes.iter().sum();
+        let data_bytes: u64 = records.iter().map(|r| r.object_size).sum();
+        let ppm = (1..=1_000_000u32)
+            .find(|&ppm| metrics_label_index_leaf_bytes_cap(data_bytes, ppm) >= largest)
+            .expect("a ratio reaches the largest slice");
+        let cap = metrics_label_index_leaf_bytes_cap(data_bytes, ppm);
+        assert!(largest <= cap && cap < total, "{sizes:?} cap {cap}");
+
+        let store = recording_store();
+        publish_label_fixture(store.as_ref()).await;
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                metrics_label_index_max_ratio_ppm: ppm,
+                ..cfg
+            },
+        )
+        .expect("catalog");
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 6, "{report:?}");
+        assert_eq!(report.metrics_label_index_parts_over_cap, 1, "{report:?}");
+        assert_eq!(report.key_index_uncovered_entries, 6, "{report:?}");
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts.len(), 1);
+        assert!(head.parts[0].key_index.is_empty());
+        let orphans = kidx_objects(store.as_ref(), Signal::Metrics).await;
+        assert!(!orphans.is_empty(), "the earlier passes PUT their slices");
+        assert!(orphans.len() < sizes.len(), "{orphans:?}");
+    }
+
+    /// An L1 compaction part fetched whole by the postings build is held
+    /// under its fold ordinal like an L0 object: the leaf build reads neither
+    /// by range, the fold issues one whole-object GET per entry and nothing
+    /// else on a data object, and the leaf names the L1 entry exactly.
+    #[tokio::test]
+    async fn an_l1_metrics_part_is_read_from_the_postings_bytes() {
+        let store = recording_store();
+        publish_real_compaction(
+            &store.inner,
+            0,
+            KIDX_HOUR,
+            i64::from(KIDX_HOUR) * NS_PER_HOUR + 60_000_000_000,
+            &[CPU_SECONDS, "mem_bytes"],
+        )
+        .await;
+        publish_labeled_metrics(
+            store.as_ref(),
+            7,
+            KIDX_HOUR,
+            &region_series("east"),
+            1000,
+            false,
+        )
+        .await;
+        let cfg = CatalogConfig {
+            metrics_label_index_max_ratio_ppm: 1_000_000,
+            ..metrics_kidx_config()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        store.gets.lock().expect("lock").clear();
+        let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+        assert_eq!(report.entry_count, 2, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+        assert_eq!(report.key_index_uncovered_entries, 0, "{report:?}");
+        assert_eq!(report.key_index_ranged_gets, 0, "{report:?}");
+        let data_gets: Vec<(String, GetRange)> = store
+            .gets
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(key, _, _)| key.ends_with(".rseg"))
+            .map(|(key, range, _)| (key.clone(), *range))
+            .collect();
+        assert_eq!(data_gets.len(), 2, "{data_gets:?}");
+        assert!(data_gets.iter().all(|(_, range)| matches!(range, GetRange::Full)));
+        assert_eq!(
+            take_held_label_dict_log_for_test().held_ordinals,
+            vec![0, 1]
+        );
+
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        let part = &head.parts[0];
+        // The L1 entry carries writer_seq 0, the L0 object 7.
+        let ordinal = part_ordinals(store.as_ref(), part).await;
+        assert_eq!(
+            probe_label(&catalog, part, "mem_bytes").await,
+            matches(&[(ordinal[&0], &[0])], &[])
+        );
+        assert_eq!(
+            probe_label(&catalog, part, "east").await,
+            matches(&[(ordinal[&7], &[0])], &[])
+        );
+        assert_eq!(
+            probe_label(&catalog, part, CPU_SECONDS).await,
+            matches(&[(ordinal[&0], &[0]), (ordinal[&7], &[0])], &[])
+        );
+    }
+
     /// The ranged read of one metrics object: exactly a suffix GET for the
     /// footer and one range GET of LABEL_DICT, the range the footer names.
     #[tokio::test]
