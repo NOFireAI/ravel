@@ -788,8 +788,8 @@ target_if = "v == 1"
 key = "row_11"
 adr_row = 11
 check = "`IN` lists of 1, 10, 100 and 1,000 keys, folded with leaves, logs and spans"
-target = "rows equal the union of the per-key equality answers (the oracle), every list size, both tables; per covered part leaf GETs at most `1 + min(distinct buckets, 64)`; `keysProbed` equals the list size; the 1,000-key list on a 13-bit leaf (8,192 buckets) is read as at most 64 bridged ranged GETs whose bytes are at most `entry_count x 11 KiB` for the part, else the part is `Uncovered` with no further leaf read, and the report says which"
-miss = "any row difference; over 65 leaf GETs on one part; leaf bytes over `entry_count x 11 KiB` on one part; a 1,001-key list served by the index"
+target = "rows equal the union of the per-key equality answers (the oracle), every list size, both tables; per covered part leaf GETs at most `1 + min(distinct buckets, 64)` (per (part, slice) under the Stage 1 amendment); `keysProbed` equals the list size; the 1,000-key list on a 13-bit leaf (8,192 buckets) is read as at most 64 bridged ranged GETs whose bytes are at most `entry_count x 11 KiB` for the part, else the part is `Uncovered` with no further leaf read, and the report says which"
+miss = "any row difference; over 65 leaf GETs on one part; leaf bytes over `entry_count x 11 KiB` on one part; a 1,001-key list served by the index (the control is a 1,025-key list, and the 65 is per slice, under the Stage 1 amendment)"
 source = "predicted; k and `B_run` are decision 6's constants, confirmed or changed by the Stage 1 amendment"
 requires_tenant = "inv"
 requires_states = ["folded_leaves"]

@@ -1289,22 +1289,35 @@ enum GeometryCheck<'a> {
 /// mode.
 pub const MAX_CURSOR_DECODE_AMPLIFICATION: u64 = 16;
 
+/// The default [`CompactorConfig::geometry_floor_decoded_rows`]: a cursor plan
+/// predicting at most this many decoded rows always runs as a cursor merge,
+/// whatever its ratio (ADR-3853 D0, amendment of 2026-11-07). A predicted
+/// figure: a few seconds of decode at the profile's per-row cost.
+pub const MIN_GEOMETRY_PREDICTED_DECODED_ROWS: u64 = 10_000_000;
+
 /// The ADR-3853 D0 refusal for `plan`, or `None` when the plan is not cursor
-/// mode or its predicted decode is within
-/// [`MAX_CURSOR_DECODE_AMPLIFICATION`] times its input records.
-fn geometry_refusal(plan: &MergePlan, inputs: usize, streams: usize) -> Option<MaintainError> {
+/// mode, its predicted decode is at or below `floor`, or it is within
+/// [`MAX_CURSOR_DECODE_AMPLIFICATION`] times its input records. The refusal
+/// and the two-level routing both read this one predicate.
+fn geometry_refusal(
+    plan: &MergePlan,
+    floor: u64,
+    inputs: usize,
+    streams: usize,
+) -> Option<MaintainError> {
     let limit = plan
         .input_records
         .saturating_mul(MAX_CURSOR_DECODE_AMPLIFICATION);
-    (plan.mode == MergeReadMode::Cursor && plan.predicted_decoded_rows > limit).then_some(
-        MaintainError::MergeGeometryUnsupported {
+    (plan.mode == MergeReadMode::Cursor
+        && plan.predicted_decoded_rows > floor
+        && plan.predicted_decoded_rows > limit)
+        .then_some(MaintainError::MergeGeometryUnsupported {
             inputs,
             streams,
             blocks: plan.input_blocks,
             records: plan.input_records,
             predicted_decoded_rows: plan.predicted_decoded_rows,
-        },
-    )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1428,7 +1441,12 @@ async fn merge_catalogs_with_geometry(
     // other plan runs single-level as before. Only compaction asks for the
     // refusal, and it keeps every record, so `keep` stops here.
     if let GeometryCheck::Refuse(shared) = geometry
-        && let Some(refusal) = geometry_refusal(&plan, catalogs.len(), stream_ids.len())
+        && let Some(refusal) = geometry_refusal(
+            &plan,
+            config.geometry_floor_decoded_rows,
+            catalogs.len(),
+            stream_ids.len(),
+        )
     {
         let Some(scratch_dir) = config.scratch_dir.as_deref() else {
             return Err(refusal);
@@ -2073,18 +2091,27 @@ fn lock_scratch_dir(scratch_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// One running unit's charge against its scratch directory: the larger of its
-/// need and the run-part bytes it has written. Only a capped unit's writes
-/// raise `written`.
+/// One unit's charge against its scratch directory: while it runs, the larger
+/// of its need and the run-part bytes it has written. Only a capped unit's
+/// writes raise `written`. A unit whose subdirectory outlived its end keeps a
+/// charge of `written` alone, marked `orphaned`, for the rest of the process:
+/// this process's lock is already held, so only the next process's
+/// [`lock_scratch_dir`] removes the orphan from disk, and that process starts
+/// with no charges.
 #[derive(Clone, Copy, Debug)]
 struct ScratchCharge {
     need: u64,
     written: u64,
+    orphaned: bool,
 }
 
 impl ScratchCharge {
     fn bytes(self) -> u64 {
-        self.need.max(self.written)
+        if self.orphaned {
+            self.written
+        } else {
+            self.need.max(self.written)
+        }
     }
 }
 
@@ -2101,27 +2128,41 @@ static SCRATCH_RESERVED: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(Default::default);
 
+/// Whether [`scratch_charges`] counts orphaned units' charges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Orphans {
+    /// Counted: the caller's baseline excludes unit subdirectories
+    /// ([`ScratchCap::charge`]).
+    Counted,
+    /// Left out: the caller's free figure already counts their bytes on disk
+    /// ([`scratch_headroom_free`]).
+    Excluded,
+}
+
 /// The sum of the charges in `units` other than `except`'s.
 fn scratch_charges(
     units: Option<&std::collections::HashMap<u64, ScratchCharge>>,
     except: Option<u64>,
+    orphans: Orphans,
 ) -> u64 {
     units.map_or(0, |units| {
         units
             .iter()
-            .filter(|(id, _)| Some(**id) != except)
+            .filter(|(id, c)| Some(**id) != except && (orphans == Orphans::Counted || !c.orphaned))
             .fold(0u64, |a, (_, c)| a.saturating_add(c.bytes()))
     })
 }
 
-/// What the units of this process running in `scratch_dir` hold reserved.
+/// What the units of this process running in `scratch_dir` hold reserved,
+/// orphans aside.
 #[cfg(test)]
 fn scratch_reserved(scratch_dir: &std::path::Path) -> u64 {
     scratch_reserved_except(scratch_dir, None)
 }
 
 /// What the units of this process running in `scratch_dir` other than
-/// `except` hold reserved.
+/// `except` hold reserved, orphans aside: the free figure reported beside it
+/// already counts an orphan's bytes on disk.
 fn scratch_reserved_except(scratch_dir: &std::path::Path, except: Option<u64>) -> u64 {
     scratch_charges(
         SCRATCH_RESERVED
@@ -2129,6 +2170,7 @@ fn scratch_reserved_except(scratch_dir: &std::path::Path, except: Option<u64>) -
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(scratch_dir),
         except,
+        Orphans::Excluded,
     )
 }
 
@@ -2143,6 +2185,8 @@ struct ScratchReservation {
     /// The bytes under the directory outside every unit subdirectory at
     /// admission, under a cap; 0 with none.
     baseline: u64,
+    /// The unit's subdirectory outlived it, so the charge stays on drop.
+    orphaned: bool,
 }
 
 /// A capped unit's hold on `--maintain-scratch-max-bytes` while it runs
@@ -2158,17 +2202,20 @@ struct ScratchCap {
 impl ScratchCap {
     /// Charge a run-part write of `payload` bytes to the unit: its charge
     /// becomes the larger of its need and its written bytes with this write,
-    /// unless the baseline plus every live unit's charge would then exceed the
-    /// cap, in which case nothing changes and this returns false.
+    /// unless the baseline plus every unit's charge, orphans included, would
+    /// then exceed the cap, in which case nothing changes and this returns
+    /// false. The baseline excludes unit subdirectories, so an orphan's charge
+    /// is the only count of its bytes here.
     fn charge(&self, payload: u64) -> bool {
         let mut reserved = SCRATCH_RESERVED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let units = reserved.entry(self.dir.clone()).or_default();
-        let others = scratch_charges(Some(units), Some(self.unit));
+        let others = scratch_charges(Some(units), Some(self.unit), Orphans::Counted);
         let mut charge = units.get(&self.unit).copied().unwrap_or(ScratchCharge {
             need: self.need,
             written: 0,
+            orphaned: false,
         });
         charge.written = charge.written.saturating_add(payload);
         if self
@@ -2187,7 +2234,9 @@ impl ScratchCap {
 impl ScratchReservation {
     /// Admit a unit needing `need` bytes of `scratch_dir` (ADR-3853 D2) when
     /// its free figure ([`scratch_headroom_free`] under `max_bytes`) less what
-    /// this process's running units there hold reserved covers it; otherwise
+    /// this process's running units there hold reserved covers it; orphaned
+    /// units are left out of the reserved figure, since the free figure
+    /// already counts their bytes on disk. Otherwise
     /// [`MaintainError::ScratchHeadroom`]. The free figure is read under the
     /// reservation lock, so two admissions never count the same bytes; the
     /// read and the update run together on the blocking pool.
@@ -2205,7 +2254,7 @@ impl ScratchReservation {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let ScratchHeadroomFigures { free, baseline } =
                 scratch_headroom_free(&dir, max_bytes, free_override)?;
-            let held = scratch_charges(reserved.get(&dir), None);
+            let held = scratch_charges(reserved.get(&dir), None, Orphans::Excluded);
             if free.saturating_sub(held) < need {
                 return Err(MaintainError::ScratchHeadroom {
                     need,
@@ -2215,16 +2264,21 @@ impl ScratchReservation {
                 });
             }
             let unit = NEXT_UNIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            reserved
-                .entry(dir.clone())
-                .or_default()
-                .insert(unit, ScratchCharge { need, written: 0 });
+            reserved.entry(dir.clone()).or_default().insert(
+                unit,
+                ScratchCharge {
+                    need,
+                    written: 0,
+                    orphaned: false,
+                },
+            );
             Ok(ScratchReservation {
                 dir,
                 unit,
                 need,
                 free,
                 baseline,
+                orphaned: false,
             })
         })
         .await
@@ -2248,6 +2302,12 @@ impl Drop for ScratchReservation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(units) = reserved.get_mut(&self.dir) {
+            if self.orphaned {
+                if let Some(charge) = units.get_mut(&self.unit) {
+                    charge.orphaned = true;
+                }
+                return;
+            }
             units.remove(&self.unit);
             if units.is_empty() {
                 reserved.remove(&self.dir);
@@ -2272,11 +2332,13 @@ fn is_scratch_full(err: &StoreError) -> bool {
 /// [`Self::close`] wipes and removes the subdirectory on the blocking pool
 /// once the merge returns, success or error; dropping an unclosed unit, a
 /// merge future dropped mid-await, does the same inline. The reservation is
-/// given back after the runs are gone (ADR-3853 D2).
+/// given back after the runs are gone; when the subdirectory could not be
+/// removed, the bytes the unit wrote stay charged ([`ScratchCharge`],
+/// ADR-3853 D2).
 struct ScratchUnit {
     store: Arc<ScratchStore>,
     closed: bool,
-    _reservation: ScratchReservation,
+    reservation: ScratchReservation,
 }
 
 impl ScratchUnit {
@@ -2297,45 +2359,46 @@ impl ScratchUnit {
         Ok(ScratchUnit {
             store: Arc::new(store),
             closed: false,
-            _reservation: reservation,
+            reservation,
         })
     }
 
     async fn close(mut self) {
         let store = Arc::clone(&self.store);
-        let removed = scratch_blocking(move || {
-            remove_scratch_unit(&store);
-            Ok(())
-        })
-        .await;
-        if removed.is_ok() {
+        let removed = scratch_blocking(move || Ok(remove_scratch_unit(&store))).await;
+        if let Ok(removed) = removed {
             self.closed = true;
+            self.reservation.orphaned = !removed;
         }
     }
 }
 
 /// Wipe a unit's scratch store and remove its directory, logging a failure:
 /// the next process to lock the scratch directory reclaims what is left.
-fn remove_scratch_unit(store: &ScratchStore) {
+/// Returns whether the directory is gone.
+fn remove_scratch_unit(store: &ScratchStore) -> bool {
     let dir = store.root().to_path_buf();
     if let Err(e) = store.wipe() {
         tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch wipe failed");
     }
-    if let Err(e) = std::fs::remove_dir_all(&dir)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch removal failed");
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch removal failed; the bytes it wrote stay charged until the process restarts");
+            false
+        }
     }
 }
 
 impl Drop for ScratchUnit {
-    // The _reservation field drops after this body, so the headroom is given
+    // The reservation field drops after this body, so the headroom is given
     // back only once the runs are gone.
     fn drop(&mut self) {
         // A dropped merge cannot await the blocking pool, and its scratch must
         // be gone when the drop returns.
         if !self.closed {
-            remove_scratch_unit(&self.store);
+            self.reservation.orphaned = !remove_scratch_unit(&self.store);
         }
     }
 }
@@ -14948,10 +15011,13 @@ mod tests {
             output
         }
 
+        /// The D0 fixtures predict far fewer decoded rows than the production
+        /// floor, so the floor is off here.
         fn unkeyed_base(concurrency: usize) -> CompactorConfig {
             CompactorConfig {
                 rlog_l1_part_memory_target_bytes: Some(FLOOR),
                 input_read_concurrency: concurrency,
+                geometry_floor_decoded_rows: 0,
                 ..CompactorConfig::default()
             }
         }
@@ -15909,6 +15975,7 @@ mod tests {
                 merge_resident_ceiling_bytes: Some(ceiling),
                 rlog_run_memory_target_bytes: run_target,
                 scratch_dir,
+                geometry_floor_decoded_rows: 0,
                 ..CompactorConfig::default()
             }
         }
@@ -16376,6 +16443,87 @@ mod tests {
             assert_eq!(compaction_records(&store).await, 0);
         }
 
+        /// ADR-3853 D0 floor: 2 inputs whose one block each carries 20
+        /// streams predict 800 decoded rows for 40 records, a ratio of 20, at
+        /// or below [`MIN_GEOMETRY_PREDICTED_DECODED_ROWS`]. With no scratch
+        /// directory the bucket compacts as a cursor merge and the geometry
+        /// counter does not move; with one it still compacts in one level. The
+        /// two-level fixture, 96,000 predicted rows, also merges in one level
+        /// with the floor and in two with it off.
+        #[tokio::test]
+        async fn a_tiny_many_stream_cursor_bucket_compacts_under_the_floor() {
+            let inputs = blocked(wide_inputs(2, 20, 1), 20);
+            let floored = |config: CompactorConfig| CompactorConfig {
+                geometry_floor_decoded_rows: MIN_GEOMETRY_PREDICTED_DECODED_ROWS,
+                ..config
+            };
+
+            let config = floored(cursor_forced());
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &inputs).await;
+            let (plan, _) = plan_for(&store, &keys, &config).await;
+            assert_eq!(plan.mode, MergeReadMode::Cursor);
+            assert_eq!(plan.input_records, 40);
+            assert_eq!(plan.predicted_decoded_rows, 800);
+            assert!(plan.predicted_decoded_rows > 40 * MAX_CURSOR_DECODE_AMPLIFICATION);
+            let refused = crate::compaction_refused_total(crate::CompactionRefusedReason::Geometry);
+            let (outcome, run) = compact_logged(&store, &config).await;
+            let outcome = outcome.expect("compact");
+            assert!(
+                matches!(outcome, CompactionOutcome::Compacted { .. }),
+                "{outcome:?}"
+            );
+            assert!(
+                run.mode_line().contains("mode=\"cursor\""),
+                "{}",
+                run.mode_line()
+            );
+            assert_eq!(
+                crate::compaction_refused_total(crate::CompactionRefusedReason::Geometry),
+                refused,
+                "the geometry counter did not move"
+            );
+            assert_eq!(compaction_records(&store).await, 1, "one record published");
+
+            let dir = fresh_scratch("tiny-floor");
+            let config = floored(CompactorConfig {
+                scratch_dir: Some(dir.clone()),
+                ..cursor_forced()
+            });
+            let store = ProbeStore::new();
+            seed_inputs(&store, &inputs).await;
+            let (outcome, run) = compact_logged(&store, &config).await;
+            let outcome = outcome.expect("compact");
+            assert!(
+                matches!(outcome, CompactionOutcome::Compacted { .. }),
+                "{outcome:?}"
+            );
+            assert!(
+                run.mode_line().contains("mode=\"cursor\""),
+                "{}",
+                run.mode_line()
+            );
+            assert_eq!(run.report.level1_groups, 0, "{:?}", run.report);
+            assert_eq!(run.report.scratch_write_bytes, 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 1, "one record published");
+
+            // The two-level fixture predicts 96,000 decoded rows, also under
+            // the floor: one level with it, two with it off.
+            let dir = fresh_scratch("two-level-floor");
+            let (config, _) = two_level_scratch_config(&dir).await;
+            let (outcome, run, _, _) = compact_two_level(&floored(config.clone())).await;
+            let outcome = outcome.expect("compact");
+            assert!(
+                matches!(outcome, CompactionOutcome::Compacted { .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(run.report.level1_groups, 0, "{:?}", run.report);
+            assert_eq!(config.geometry_floor_decoded_rows, 0);
+            let (outcome, run, _, _) = compact_two_level(&config).await;
+            outcome.expect("compact");
+            assert!(run.report.level1_groups > 0, "{:?}", run.report);
+        }
+
         /// Each two-level check that fails is refused by name: constraint (a)
         /// leaving G under 2 before any block GET, and constraint (b) after
         /// level 1, with the figures it compared. `W1` is named for (b), so
@@ -16763,6 +16911,130 @@ mod tests {
             assert!(dir.join(SCRATCH_LOCK_FILE).is_file());
         }
 
+        /// A unit whose scratch wipe fails, here because its subdirectory is
+        /// read-only, keeps a charge of the bytes it wrote, not its need, for
+        /// the rest of the process: nothing in this process releases it.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_failed_wipe_keeps_the_bytes_the_unit_wrote_as_its_charge() {
+            let dir = fresh_scratch("failed-wipe");
+            let orphan = OrphanedUnit::make(&dir).await;
+            assert!(orphan.root.join("run-0.rlog").exists(), "the wipe failed");
+            assert_eq!(
+                scratch_orphaned(&dir),
+                OrphanedUnit::WRITTEN,
+                "the kept charge is the bytes written, not the need"
+            );
+            assert_eq!(scratch_reserved(&dir), 0, "no running unit holds any");
+        }
+
+        /// A unit whose wipe failed is counted once at admission, by the free
+        /// figure that sees its bytes on disk: a later unit needing the cap
+        /// less those bytes is admitted, and the reserved figure the
+        /// admission reads leaves the orphan out.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn an_orphan_is_counted_once_at_admission() {
+            let dir = fresh_scratch("orphan-admission");
+            let _orphan = OrphanedUnit::make(&dir).await;
+            let on_disk = scratch_used_bytes(&dir).expect("used").total;
+            assert_eq!(on_disk, OrphanedUnit::WRITTEN);
+            let cap = OrphanedUnit::CAP;
+            let need = cap - on_disk;
+            let _second = ScratchReservation::admit(&dir, Some(cap), need)
+                .await
+                .expect("the orphan's bytes are counted once");
+            match ScratchReservation::admit(&dir, Some(cap), 1).await {
+                Err(MaintainError::ScratchHeadroom { free, reserved, .. }) => {
+                    assert_eq!((free, reserved), (need, need));
+                }
+                Ok(_) => panic!("admitted past the cap"),
+                Err(e) => panic!("{e}"),
+            }
+        }
+
+        /// The in-run cap check counts an orphan's kept charge, since its
+        /// baseline excludes unit subdirectories: a running unit's write that
+        /// would take its bytes plus the orphan's past the cap is refused.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn the_in_run_cap_check_counts_an_orphan() {
+            let dir = fresh_scratch("orphan-in-run");
+            let _orphan = OrphanedUnit::make(&dir).await;
+            let max_bytes = OrphanedUnit::CAP;
+            let running = ScratchReservation::admit(&dir, Some(max_bytes), 1)
+                .await
+                .expect("admit");
+            let cap = running.cap(Some(max_bytes)).expect("capped");
+            assert_eq!(cap.baseline, 0, "the orphan is not in the baseline");
+            let room = max_bytes - OrphanedUnit::WRITTEN;
+            assert!(!cap.charge(room + 1), "the orphan's bytes were counted");
+            assert!(cap.charge(room));
+        }
+
+        /// What orphaned units in `dir` keep charged.
+        #[cfg(unix)]
+        fn scratch_orphaned(dir: &std::path::Path) -> u64 {
+            SCRATCH_RESERVED
+                .lock()
+                .expect("reserved")
+                .get(dir)
+                .map_or(0, |units| {
+                    units
+                        .values()
+                        .filter(|c| c.orphaned)
+                        .map(|c| c.written)
+                        .sum()
+                })
+        }
+
+        /// A capped unit admitted with a need of [`Self::NEED`] that wrote
+        /// [`Self::WRITTEN`] bytes and whose wipe failed, its subdirectory
+        /// read-only. Its charge stays for the rest of the process; only the
+        /// next process's lock removes the subdirectory. Dropping this makes
+        /// the subdirectory writable again so the test directory can be
+        /// cleared.
+        #[cfg(unix)]
+        struct OrphanedUnit {
+            root: std::path::PathBuf,
+        }
+
+        #[cfg(unix)]
+        impl OrphanedUnit {
+            const CAP: u64 = 100_000;
+            const NEED: u64 = 40_000;
+            const WRITTEN: u64 = 1_000;
+
+            async fn make(dir: &std::path::Path) -> Self {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::create_dir_all(dir).expect("scratch dir");
+                let reservation = ScratchReservation::admit(dir, Some(Self::CAP), Self::NEED)
+                    .await
+                    .expect("admit");
+                let cap = reservation.cap(Some(Self::CAP)).expect("capped");
+                let unit = ScratchUnit::open(dir, &[7u8; 32], reservation)
+                    .await
+                    .expect("open");
+                let root = unit.store.root().to_path_buf();
+                assert!(cap.charge(Self::WRITTEN));
+                std::fs::write(root.join("run-0.rlog"), [7u8; Self::WRITTEN as usize])
+                    .expect("run");
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555))
+                    .expect("chmod");
+                unit.close().await;
+                OrphanedUnit { root }
+            }
+        }
+
+        #[cfg(unix)]
+        impl Drop for OrphanedUnit {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
         /// A scratch directory whose lock another holder has is refused with
         /// the lock file's path, before any block GET or scratch write.
         #[tokio::test]
@@ -17001,6 +17273,7 @@ mod tests {
                         ScratchCharge {
                             need: bytes,
                             written: 0,
+                            orphaned: false,
                         },
                     );
                 OtherUnit(dir.to_path_buf())

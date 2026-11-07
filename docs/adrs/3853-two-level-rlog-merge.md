@@ -130,6 +130,9 @@ under 2, a level-2 plan that is neither resident nor fetch-per-pass at one
 level-1 worker (D4's constraint (b) fails at `W1 = 1`), or scratch headroom
 below the unit's need (D2). The error names which of the three.
 
+A cursor plan predicting at most 10 million decoded rows is neither refused
+nor routed, whatever its ratio (see the D0 floor amendment below).
+
 ### D1. Group merges
 
 Inputs in canonical order are cut into contiguous groups of `G`. `G` is the
@@ -681,3 +684,37 @@ term carries every builder in flight, not only the open one. The floor of 2
 can take the writer term one final part target past the single one (b)
 reserves, when `U` leaves room for fewer than two parts beside the resident
 side; (b) itself is unchanged.
+
+## Amendment (2026-11-07): the D0 floor amendment (#3905)
+
+<!-- amendment-applies: sections="D0. Refuse or route" pointer="D0 floor amendment" -->
+
+D0's ratio alone refused buckets that are cheap to merge: 2 inputs whose
+one block each carries 20 streams predict 800 decoded rows for 40 records,
+a ratio of 20, and were refused, and since the refusal is memoized until the
+process restarts, never retried. D0 now has an absolute floor,
+`MIN_GEOMETRY_PREDICTED_DECODED_ROWS`, of 10,000,000 predicted decoded rows.
+A cursor plan predicting at or below the floor runs as a cursor merge: it is
+neither refused nor routed to the two-level merge, whatever its ratio.
+Above the floor D0 is unchanged. The refusal and the routing read one
+predicate, so the floor applies to both or neither.
+
+The floor's value is predicted, not measured: 10 million decoded rows is a
+few seconds of decode at the profile's per-row cost, which a cursor merge
+can afford however amplified it is. No measurement sets it.
+`CompactorConfig::geometry_floor_decoded_rows` carries it, defaulting to the
+constant; no flag sets it, and only tests lower it, to reach D0 with
+fixtures far smaller than the floor.
+
+The amendment also states one case of D2's headroom accounting. A unit
+whose scratch subdirectory cannot be removed when it ends, its wipe having
+failed, keeps a charge of the bytes it wrote (not its need, which it may
+never have reached) against the scratch directory, marked as an orphan's.
+The orphan's bytes are counted once. Admission leaves orphan charges out of
+the reserved figure, because its free figure already sees the orphan's
+bytes on disk (the bytes under the directory under a cap, `statvfs`
+without one). The in-run cap check counts the orphan charge, because its
+baseline is the bytes outside every unit subdirectory and so does not see
+them. A process locks its scratch directory once, before its first unit,
+so the charge stays until the process restarts: the next process's lock
+removes the orphan from disk, and that process starts with no charges.
