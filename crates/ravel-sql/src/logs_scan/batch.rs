@@ -7159,35 +7159,18 @@ mod tests {
                 assert_eq!(p.counters.view_snapshot().fills, 1);
             }
 
-            /// ADR-3326, view memo amendment, T2: NULL keys over a served,
-            /// filled plain memo read the cast's values and null bits, and a
-            /// session `GROUP BY` puts the NULL rows in the NULL group; a
-            /// memo with a NULL entry is never served or filled: the cast
-            /// runs and `viewMemoFills` stays 0.
-            #[tokio::test]
-            async fn null_keys_and_a_null_bearing_memo_read_as_the_cast() {
-                let budget = Arc::new(MemoryBudget::new(LIMIT));
-                let (_, _, _, _cache, p) = filled(&budget, VIEW_BUDGET);
-                let batch = &p.batches[0];
-                let keys: Int32Array = (0..ROWS as i32)
-                    .map(|k| (k % 3 != 0).then_some(k))
-                    .collect();
-                let nulled = rekeyed(batch, keys);
-                let got = group_key(&nulled, true);
-                assert_eq!(logical(&got), logical(&group_key(&nulled, false)));
-                assert_eq!(got.null_count(), ROWS / 3);
-                assert!(view_registry::views_of(&values_of(batch)).is_some());
-
-                let ctx = {
-                    let state = datafusion::execution::session_state::SessionStateBuilder::new()
-                        .with_default_features()
-                        .with_physical_optimizer_rule(Arc::new(
-                            crate::DictionaryGroupKeysAsViews::with_view_memo(true),
-                        ))
-                        .build();
-                    datafusion::prelude::SessionContext::new_with_state(state)
-                };
-                ctx.register_batch("t", nulled).expect("table");
+            /// `SELECT k, count(*) FROM t WHERE k IS NULL GROUP BY k` over
+            /// `batch` in a session with the view memo on: the NULL group's
+            /// count, after checking the result is that one group.
+            async fn null_group_count(batch: RecordBatch) -> i64 {
+                let state = datafusion::execution::session_state::SessionStateBuilder::new()
+                    .with_default_features()
+                    .with_physical_optimizer_rule(Arc::new(
+                        crate::DictionaryGroupKeysAsViews::with_view_memo(true),
+                    ))
+                    .build();
+                let ctx = datafusion::prelude::SessionContext::new_with_state(state);
+                ctx.register_batch("t", batch).expect("table");
                 let groups = ctx
                     .sql("SELECT k, count(*) AS c FROM t WHERE k IS NULL GROUP BY k")
                     .await
@@ -7200,13 +7183,40 @@ mod tests {
                 };
                 assert_eq!(group.num_rows(), 1, "one NULL group");
                 assert!(group.column(0).is_null(0));
+                group
+                    .column(1)
+                    .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                    .value(0)
+            }
+
+            /// ADR-3326, view memo amendment, T2: NULL keys over a served,
+            /// filled plain memo read the cast's values and null bits, and a
+            /// session `GROUP BY` puts the NULL rows in the NULL group, with
+            /// the memo serving that `GROUP BY` (its one view fill lands on
+            /// the serving pass's counters during the query); a memo with a
+            /// NULL entry is never served or filled: the cast runs and
+            /// `viewMemoFills` stays 0.
+            #[tokio::test]
+            async fn null_keys_and_a_null_bearing_memo_read_as_the_cast() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                let batch = &p.batches[0];
+                let keys: Int32Array = (0..ROWS as i32)
+                    .map(|k| (k % 3 != 0).then_some(k))
+                    .collect();
+                let nulled = rekeyed(batch, keys);
+                assert_eq!(p.counters.view_snapshot().fills, 0, "not filled yet");
+                assert_eq!(null_group_count(nulled.clone()).await, (ROWS / 3) as i64);
                 assert_eq!(
-                    group
-                        .column(1)
-                        .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
-                        .value(0),
-                    (ROWS / 3) as i64
+                    p.counters.view_snapshot().fills,
+                    1,
+                    "the session GROUP BY took the memo's views"
                 );
+                assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+                let got = group_key(&nulled, true);
+                assert_eq!(logical(&got), logical(&group_key(&nulled, false)));
+                assert_eq!(got.null_count(), ROWS / 3);
+                assert!(view_registry::views_of(&values_of(batch)).is_some());
 
                 // A memo with a NULL entry, put in the slot of a served
                 // plain column before the scan builds its own.
@@ -7247,6 +7257,36 @@ mod tests {
                 assert_eq!(cache.view_counters().fills, 0);
                 assert_eq!(cache.view_resident_bytes(), 0);
                 assert!(view_registry::views_of(&values_of(batch)).is_none());
+            }
+
+            /// A batch whose dictionary values are the served, filled memo's
+            /// own offsets and values buffers under a null buffer of the
+            /// batch's own is not served the memo's views: the key equals the
+            /// cast, the row whose key references the NULL entry is NULL, and
+            /// a session `GROUP BY` puts it in the NULL group.
+            #[tokio::test]
+            async fn a_null_buffer_over_the_memos_own_buffers_reads_as_the_cast() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, _cache, p) = filled(&budget, VIEW_BUDGET);
+                let batch = &p.batches[0];
+                let memo = values_of(batch);
+                assert!(view_registry::views_of(&memo).is_some(), "filled and served");
+                let nulls = NullBuffer::from((0..ROWS).map(|r| r != 1).collect::<Vec<bool>>());
+                let values =
+                    StringArray::try_new(memo.offsets().clone(), memo.values().clone(), Some(nulls))
+                        .expect("values");
+                let dict = DictionaryArray::try_new(
+                    (0..ROWS as i32).collect::<Int32Array>(),
+                    Arc::new(values) as ArrayRef,
+                )
+                .expect("dictionary");
+                let nulled = RecordBatch::try_new(batch.schema(), vec![Arc::new(dict) as ArrayRef])
+                    .expect("batch");
+                let got = group_key(&nulled, true);
+                identical(&got, &group_key(&nulled, false)).unwrap_or_else(|e| panic!("{e}"));
+                assert!(got.is_null(1), "the row keyed to the NULL entry is NULL");
+                assert_eq!(got.null_count(), 1);
+                assert_eq!(null_group_count(nulled).await, 1);
             }
 
             /// ADR-3326, view memo amendment, T10: a per-scan values array
