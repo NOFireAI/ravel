@@ -16,6 +16,8 @@ thread_local! {
     /// zstd decompressions `decode_frame` started on this thread: a frame
     /// refused before allocation leaves it unchanged.
     pub(super) static FRAME_DECOMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Frame crc32c computations `check_frame_header` ran on this thread.
+    pub(super) static FRAME_CRC_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -25,6 +27,7 @@ const FIELD: &str = "service.name";
 const UNCOVERED: [u64; 2] = [3, 6];
 
 type RefEdit = fn(&mut SnapshotKeyIndexLeafRef);
+type FrameEdit = fn(&mut [u8]);
 
 fn part_hash(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
@@ -1748,6 +1751,179 @@ fn set_probe_refused_reservation_declines_and_bad_keys_are_rejected() {
         );
         assert!(reads.is_empty());
     }
+}
+
+/// What one set probe did, frame by frame.
+struct CountedSetProbe {
+    probe: KeyIndexSetProbe,
+    /// Each reservation asked for: its bytes, and the frame decompressions
+    /// this probe had started when it was asked.
+    reserved: Vec<(u64, u64)>,
+    crc_checks: u64,
+    decompressions: u64,
+}
+
+fn counted_set_probe(
+    leaf: &[u8],
+    leaf_ref: &SnapshotKeyIndexLeafRef,
+    request: &KeyIndexLeafRequest<'_>,
+    keys: &[Key8],
+    policy: &KeyIndexSetPolicy,
+) -> CountedSetProbe {
+    let crc_before = FRAME_CRC_CHECKS.with(|n| n.get());
+    let decompressions_before = frame_decompressions();
+    let reserved = RefCell::new(Vec::new());
+    let probe = block_on(probe_key_index_leaf_set_ranged(
+        leaf_ref,
+        request,
+        keys,
+        &KeyIndexLeafLimits::default(),
+        policy,
+        |range: Range<u64>| {
+            let out = Ok(Bytes::copy_from_slice(
+                &leaf[range.start as usize..range.end as usize],
+            ));
+            async move { out }
+        },
+        |bytes| {
+            reserved
+                .borrow_mut()
+                .push((bytes, frame_decompressions() - decompressions_before));
+            Some(())
+        },
+    ))
+    .expect("no breach");
+    CountedSetProbe {
+        probe,
+        reserved: reserved.into_inner(),
+        crc_checks: FRAME_CRC_CHECKS.with(|n| n.get()) - crc_before,
+        decompressions: frame_decompressions() - decompressions_before,
+    }
+}
+
+/// Seven keys of the wide leaf in seven distinct buckets, read as one
+/// bridged run, so the non-empty buckets between them are read and not
+/// selected. Returns the keys, their buckets' frame byte ranges in the leaf
+/// (ascending), and the count of unselected non-empty buckets in the run.
+fn bridged_selection(
+    leaf: &EncodedKeyIndexLeaf,
+    req: &KeyIndexLeafRequest<'_>,
+    truth: &BTreeMap<Key8, Vec<KeyIndexMatch>>,
+) -> (Vec<Key8>, Vec<Range<usize>>, usize) {
+    let prefix = KeyIndexLeafPrefix::parse(
+        &leaf.bytes[..leaf.leaf_ref.prefix_len as usize],
+        &leaf.leaf_ref,
+        req,
+    )
+    .expect("parses");
+    let keys: Vec<Key8> = truth.keys().copied().step_by(150).collect();
+    assert_eq!(keys.len(), 7);
+    let buckets: std::collections::BTreeSet<u32> = keys
+        .iter()
+        .map(|k| prefix.locate(k).expect("in slice").expect("present").bucket)
+        .collect();
+    assert_eq!(buckets.len(), 7, "seven distinct buckets");
+    let frames: Vec<Range<usize>> = buckets
+        .iter()
+        .map(|&b| {
+            let body = prefix.bucket_body_range(b as usize);
+            (prefix.prefix_len() + body.start) as usize..(prefix.prefix_len() + body.end) as usize
+        })
+        .collect();
+    let (first, last) = (*buckets.first().expect("7"), *buckets.last().expect("7"));
+    let unselected = (first..=last)
+        .filter(|b| !buckets.contains(b) && !prefix.bucket_body_range(*b as usize).is_empty())
+        .count();
+    (keys, frames, unselected)
+}
+
+const ONE_RUN: KeyIndexSetPolicy = KeyIndexSetPolicy {
+    b_run: 1,
+    max_bridged_bytes: u64::MAX,
+};
+
+#[test]
+fn the_set_probe_checks_each_frames_crc_once() {
+    let (part, leaf, truth) = wide_leaf();
+    let req = request(&part);
+    let (keys, frames, unselected) = bridged_selection(&leaf, &req, &truth);
+    assert!(unselected > 0, "the run holds unselected frames");
+    let counted = counted_set_probe(&leaf.bytes, &leaf.leaf_ref, &req, &keys, &ONE_RUN);
+    expect_answered(&counted.probe, &keys, &truth);
+    assert_eq!(counted.probe.get_requests, 2, "prefix and one bridged run");
+    assert!(counted.probe.bridged_bytes > 0);
+    assert_eq!(frames.len(), 7);
+    assert_eq!(
+        counted.crc_checks, 7,
+        "one crc per selected frame, none for gaps"
+    );
+    assert_eq!(counted.decompressions, 7);
+    assert_eq!(counted.reserved.len(), 7);
+}
+
+#[test]
+fn a_corrupt_frame_body_is_rejected_by_the_set_probe() {
+    let (part, leaf, truth) = wide_leaf();
+    let req = request(&part);
+    let (keys, frames, _) = bridged_selection(&leaf, &req, &truth);
+    // The first selected frame: header fields at +0 (entry_count) and +4
+    // (uncompressed_len), body from +12.
+    let frame = frames[0].clone();
+    let cases: [(&str, FrameEdit, &str); 3] = [
+        (
+            "flipped body byte",
+            |f| f[FRAME_HEADER_LEN + 1] ^= 0x40,
+            "frame crc32c mismatch",
+        ),
+        (
+            "zero entries",
+            |f| f[0..4].copy_from_slice(&0u32.to_le_bytes()),
+            "declares zero entries",
+        ),
+        (
+            "over the body ceiling",
+            |f| f[4..8].copy_from_slice(&u32::MAX.to_le_bytes()),
+            "over the",
+        ),
+    ];
+    for (name, corrupt, want) in cases {
+        let mut bytes = leaf.bytes.clone();
+        corrupt(&mut bytes[frame.clone()]);
+        let counted = counted_set_probe(&bytes, &leaf.leaf_ref, &req, &keys, &ONE_RUN);
+        match &counted.probe.answer {
+            KeyIndexSetAnswer::Rejected(KeyIndexLeafRejection::Corrupted(msg)) => {
+                assert!(msg.contains(want), "{name}: {msg}")
+            }
+            other => panic!("{name}: expected Corrupted, got {other:?}"),
+        }
+        assert!(
+            counted.reserved.is_empty(),
+            "{name}: rejected before reserving"
+        );
+        assert_eq!(counted.decompressions, 0, "{name}");
+        assert_eq!(counted.probe.decompressed_bytes, 0, "{name}");
+    }
+}
+
+#[test]
+fn the_set_probe_reserves_each_frame_before_decoding_it() {
+    let (part, leaf, truth) = wide_leaf();
+    let req = request(&part);
+    let (keys, frames, _) = bridged_selection(&leaf, &req, &truth);
+    let counted = counted_set_probe(&leaf.bytes, &leaf.leaf_ref, &req, &keys, &ONE_RUN);
+    expect_answered(&counted.probe, &keys, &truth);
+    let want: Vec<(u64, u64)> = frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let uncompressed_len = le_u32(&leaf.bytes[f.clone()], 4).expect("frame header");
+            (decoded_bound(uncompressed_len), i as u64)
+        })
+        .collect();
+    assert_eq!(
+        counted.reserved, want,
+        "frame i's decoded bound is reserved after i decompressions"
+    );
 }
 
 fn entries_strategy() -> impl Strategy<Value = Vec<KeyIndexLeafEntry>> {
