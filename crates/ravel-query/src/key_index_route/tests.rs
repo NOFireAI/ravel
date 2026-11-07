@@ -1254,6 +1254,123 @@ async fn a_refused_log_leaf_fetch_counts_as_a_refused_reservation() {
     );
 }
 
+/// The spans twin of the logs refusal above: a spans leaf range the
+/// fetcher's memory budget refuses counts under `reservationsRefused`, not
+/// `leavesRejected`, issues no GET, and leaves the part uncovered, so the
+/// segment falls back to a full scan where the unrefused route answered
+/// block 0.
+/// FLIP: mapping `SpanFetchError::FetchMemoryExhausted` to
+/// `LeafReadError::Failed` in `SpanLeafRangeReader::read_range` counts it
+/// under `leavesRejected`.
+#[tokio::test]
+async fn a_refused_span_leaf_fetch_counts_as_a_refused_reservation() {
+    use crate::span_fetcher::{SpanLeafRangeReader, SpanSegmentFetcher};
+
+    let fx = fixture(
+        &[PartSpec::simple(vec![rows(&[(1, &[0])])])],
+        &[],
+        KeyType::Str,
+    )
+    .await;
+    let keys = key_set(KeyType::Str, &BTreeSet::from([1u16]));
+    let budget = ThresholdBudget::new(u64::MAX);
+
+    let unrefused = SpanSegmentFetcher::new(fx.store.clone());
+    let reader = SpanLeafRangeReader::new(&unrefused, TENANT);
+    let accounting = PhaseAccounting::new();
+    let totals = RouteTotals::new();
+    let (routes, figures) = route_under(
+        input(&fx, &keys, &accounting, &reader, &budget),
+        ADR_CEILING,
+        &totals,
+    )
+    .await
+    .expect("route");
+    assert_eq!(routes, vec![SegmentRoute::Blocks(vec![0])]);
+    assert_eq!(figures.parts_covered, 1);
+    assert_eq!(figures.reservations_refused, 0);
+
+    let fetcher = SpanSegmentFetcher::new(fx.store.clone())
+        .with_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(1)));
+    let reader = SpanLeafRangeReader::new(&fetcher, TENANT);
+    let accounting = PhaseAccounting::new();
+    let totals = RouteTotals::new();
+    let (routes, figures) = route_under(
+        input(&fx, &keys, &accounting, &reader, &budget),
+        ADR_CEILING,
+        &totals,
+    )
+    .await
+    .expect("route");
+
+    // Uncovered scans every block, so block 0's rows still reach the answer.
+    assert_eq!(routes, vec![SegmentRoute::Uncovered]);
+    assert_eq!(figures.reservations_refused, 1);
+    assert_eq!(figures.leaves_rejected, 0);
+    assert_eq!(figures.parts_covered, 0);
+    assert_eq!(
+        totals.parts(SIGNAL, KeyIndexPartOutcome::ReservationRefused),
+        1
+    );
+    assert_eq!(totals.parts(SIGNAL, KeyIndexPartOutcome::Rejected), 0);
+    assert_eq!(
+        accounting
+            .key_index()
+            .snapshot()
+            .s3_requests(AccountedOp::Get),
+        0,
+        "the refusal comes before the GET"
+    );
+}
+
+/// The control for the spans refusal: a spans leaf GET that fails in the
+/// store is still a rejected leaf, not a refused reservation.
+/// FLIP: mapping every `SpanFetchError` to `LeafReadError::ReservationRefused`
+/// in `SpanLeafRangeReader::read_range` counts it under `reservationsRefused`.
+#[tokio::test]
+async fn a_failed_span_leaf_get_still_counts_as_a_rejected_leaf() {
+    use crate::span_fetcher::{SpanLeafRangeReader, SpanSegmentFetcher};
+
+    let fx = fixture(
+        &[PartSpec::simple(vec![rows(&[(1, &[0])])])],
+        &[],
+        KeyType::Str,
+    )
+    .await;
+    let leaf_key = fx.parts.parts[0].key_index[0].key.clone();
+    let faults = Arc::new(FaultStore::new(
+        fx.store.clone(),
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("leaf gone".into()))
+                .with_key_contains(leaf_key)
+                .with_occurrence(Occurrence::Nth(1)),
+        ),
+    ));
+    let fetcher = SpanSegmentFetcher::new(faults.clone());
+    let reader = SpanLeafRangeReader::new(&fetcher, TENANT);
+    let keys = key_set(KeyType::Str, &BTreeSet::from([1u16]));
+    let accounting = PhaseAccounting::new();
+    let budget = ThresholdBudget::new(u64::MAX);
+    let totals = RouteTotals::new();
+    let (routes, figures) = route_under(
+        input(&fx, &keys, &accounting, &reader, &budget),
+        ADR_CEILING,
+        &totals,
+    )
+    .await
+    .expect("route");
+
+    assert_eq!(faults.fault_count(Op::Get, FaultKind::Permanent), 1);
+    assert_eq!(routes, vec![SegmentRoute::Uncovered]);
+    assert_eq!(figures.leaves_rejected, 1);
+    assert_eq!(figures.reservations_refused, 0);
+    assert_eq!(totals.parts(SIGNAL, KeyIndexPartOutcome::Rejected), 1);
+    assert_eq!(
+        totals.parts(SIGNAL, KeyIndexPartOutcome::ReservationRefused),
+        0
+    );
+}
+
 /// Admission walks the parts largest first and stops at the first whose
 /// worst case does not fit; it does not skip it for a smaller part that
 /// would (ADR-3692 decision 3, "until admitting the next part's worst case
