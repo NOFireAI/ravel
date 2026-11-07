@@ -2258,14 +2258,25 @@ So a higher ceiling adds breadth across prefixes and never depth within one.
 
 ### Other derived settings
 
-Four more settings are derived the same way:
+Five more settings are derived the same way:
 
 | Setting | Derived value |
 |---|---|
 | `--cache-max-bytes` (fetcher cache) | 25% normally, or 24% against a loopback `--s3-endpoint`. 256 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
 | `--catalog-cache-max-bytes` (catalog byte cache) | Always a separate 5% ceiling. 256 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
 | `--column-stats-cache-max-bytes` (column-statistics cache) | Always a separate 2% ceiling. 64 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
+| `--decoded-cache-view-max-bytes` (the decoded cache's view budget) | The smallest of a quarter of `--decoded-cache-max-bytes`, 2 GiB, and the process memory budget less that cap and the admission margin (`max(1 GiB, 5%)` of the budget), floored at 0. 0 while `--decoded-cache-max-bytes` is 0. |
 | `--gc-max-query-duration` | 11 minutes. |
+
+The view budget holds the per-row string views a `GROUP BY` takes from a
+cached plain-page column, apart from the decoded cache's own cap and charged
+to the process memory budget; the evictor releases those views first under
+memory pressure. Startup logs `decoded column-block cache view budget` with
+the value in force and the term that bound it, `cap_quarter`, `two_gib`,
+`budget_room` or `floored_at_zero`. With a 20,487,102,875-byte budget and an
+8 GB cap it is 2,000,000,000 bytes, bound by `cap_quarter`. An explicit
+value is used as given, `0` turns the view memo off, and a value above the
+budget's room is still used, with a startup warning naming the room.
 
 - Memory is read from the `MemTotal` of `/proc/meminfo` on Linux and is
   "unknown" everywhere else.

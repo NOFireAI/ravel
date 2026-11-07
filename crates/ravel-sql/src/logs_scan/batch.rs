@@ -378,10 +378,10 @@ impl<'a> StrCursor<'a> {
         ) else {
             return;
         };
-        *memo.served_slot() = Some(ServedMark {
+        *memo.served_slot() = Some(Box::new(ServedMark {
             handle: handle.clone(),
             validated: validated.cloned(),
-        });
+        }));
     }
 
     /// The dictionary's memo array, when a decoded-cache entry holds the
@@ -479,12 +479,20 @@ struct StrMemo {
     keys: std::sync::OnceLock<Buffer>,
     /// A plain memo's per-entry views, charged to the view budget (ADR-3326,
     /// view memo amendment, decision 6). Emptied on its own by
-    /// [`ValuesMemo::release_extra`].
-    views: Mutex<Option<ViewMemo>>,
+    /// [`ValuesMemo::release_extra`]. Boxed, like [`Self::served`], so a
+    /// memo that never fills carries a pointer, not the array.
+    views: Mutex<Option<Box<ViewMemo>>>,
     /// Set by the scan when it reads the memo's block served from the cache
     /// (decision 4): the handle a fill charges its views through, and the
     /// scan's `str_cells_validated` the fill's validation counts in.
-    served: Mutex<Option<ServedMark>>,
+    served: Mutex<Option<Box<ServedMark>>>,
+}
+
+/// Whether `array` has no null buffer: the condition the serve rule puts on
+/// both the batch's values and the memo, and the one a fill checks before it
+/// builds anything (ADR-3326, view memo amendment, decisions 5 and 6).
+fn without_nulls(array: &StringArray) -> bool {
+    datafusion::arrow::array::Array::nulls(array).is_none()
 }
 
 /// The views of every entry of a plain memo, as one `StringViewArray` whose
@@ -521,13 +529,13 @@ impl AsRef<[u8]> for ViewsBytes {
 }
 
 impl StrMemo {
-    fn views_slot(&self) -> std::sync::MutexGuard<'_, Option<ViewMemo>> {
+    fn views_slot(&self) -> std::sync::MutexGuard<'_, Option<Box<ViewMemo>>> {
         self.views
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn served_slot(&self) -> std::sync::MutexGuard<'_, Option<ServedMark>> {
+    fn served_slot(&self) -> std::sync::MutexGuard<'_, Option<Box<ServedMark>>> {
         self.served
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -544,7 +552,7 @@ impl StrMemo {
         }
         let mark = self.served_slot().clone()?;
         let array = self.array.as_ref()?;
-        if datafusion::arrow::array::Array::nulls(array).is_some() {
+        if !without_nulls(array) {
             return None;
         }
         let values = array.values();
@@ -580,10 +588,10 @@ impl StrMemo {
                 // The owner is new, so its cell is empty.
                 let _ = owner.reservation.set(r);
             }
-            *self.views_slot() = Some(ViewMemo {
+            *self.views_slot() = Some(Box::new(ViewMemo {
                 array: built.clone(),
                 bytes,
-            });
+            }));
         });
         drop(owner);
         match installed {
@@ -659,7 +667,7 @@ impl Drop for StrMemo {
 /// the offsets hold `rows + 1` entries and are always a real allocation.
 /// Holds memos weakly; a memo removes its own entry when it drops.
 pub(crate) mod view_registry {
-    use super::{StrMemo, StringArray, StringViewArray};
+    use super::{StrMemo, StringArray, StringViewArray, without_nulls};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
@@ -694,15 +702,14 @@ pub(crate) mod view_registry {
     /// null buffer on either side. Two live non-empty allocations cannot
     /// share an address, so equal offsets are the memo's own offsets.
     fn memo_of(values: &StringArray) -> Option<Arc<StrMemo>> {
-        use datafusion::arrow::array::Array;
         let memo = registry().get(&address(values))?.upgrade()?;
         let array = memo.array.as_ref()?;
         let same = array.offsets().inner().as_ptr() == values.offsets().inner().as_ptr()
             && array.offsets().len() == values.offsets().len()
             && array.values().as_ptr() == values.values().as_ptr()
             && array.values().len() == values.values().len()
-            && array.nulls().is_none()
-            && values.nulls().is_none();
+            && without_nulls(array)
+            && without_nulls(values);
         same.then_some(memo)
     }
 

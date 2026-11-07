@@ -6277,12 +6277,13 @@ the flag.
   the cache are all gone
   (`str_values_releases_a_memo_arrays_charge_once_no_batch_holds_it`, both
   cases). The scan takes nothing from `strDictValuesBuilt`. `offer` charges such a column
-  `VALUES_MEMO_BYTES` (576) beyond its `heap_bytes` for the memo
+  `VALUES_MEMO_BYTES` (608) beyond its `heap_bytes` for the memo
   (`the_entry_charge_includes_the_memo_constant`). The figure is measured
-  through ravel-sql's own memo build: one memo fill leaves 432 heap bytes
-  live for a plain `Text` column or a `Text` dictionary, 568 for a `Text`
-  dictionary whose keys buffer the key path has also built, and 560 for a
-  `Mixed` dictionary, which the key path refuses, and the constant is the
+  through ravel-sql's own memo build: one memo fill leaves 464 heap bytes
+  live for a plain `Text` column or a `Text` dictionary, 600 for a `Text`
+  dictionary whose keys buffer the key path has also built, and 592 for a
+  `Mixed` dictionary, which the key path refuses, each with its two empty
+  view memo slots, and the constant is the
   largest rounded up to a multiple of 16
   (`values_memo_charge_covers_the_measured_memo_and_no_more` in
   `crates/ravel-sql/tests/memo_overhead_alloc_pin.rs`). Every other column, and
@@ -6294,11 +6295,50 @@ the flag.
 - Known over-count: an `i64` column-reference column and its target are
   charged separately when both are cached.
 
+**View memo.** `--decoded-cache-view-max-bytes` sizes a second budget beside
+the cap, for the per-row string views a `GROUP BY` takes from a cached
+plain-page column (see "String-keyed `GROUP BY`" below). Unset, it is the smallest of a quarter of the cap, 2 GiB, and the
+memory budget less the cap and the admission margin, floored at 0; it is 0
+while the cache is off. Startup logs the value in force and the term that
+bound it: `cap_quarter`, `two_gib`, `budget_room` or `floored_at_zero`
+(`view_budget_default_takes_the_smallest_term`). With a 20,487,102,875-byte
+memory budget and an 8 GB cap it is 2,000,000,000 bytes, bound by
+`cap_quarter` (same test). An explicit value is used as given, with a
+warning when it is above that room
+(`an_explicit_view_budget_is_used_and_warned_above_the_room`), and `0` keeps
+no views (`a_view_budget_of_zero_keeps_no_view_memo`).
+
+- A column's views are built on the first `GROUP BY` evaluation over it
+  after a statement read its block served from the cache, never on the
+  statement that admitted it, and once
+  (`a_view_memo_fills_on_the_first_served_call_only`). They take 16 bytes a
+  row, charged to the view budget and the process memory budget, never to
+  the cap or `residentBytes`
+  (`real_memo_views_are_charged_to_the_view_budget_not_the_data_cap`).
+- A fill evicts nothing. One the view budget refuses, or the memory budget
+  refuses while keeping the admission margin, leaves the column on the cast
+  (`a_real_memo_fill_never_evicts_a_data_entry`). A column with a NULL
+  entry never fills (`null_keys_and_a_null_bearing_memo_read_as_the_cast`).
+- Under memory pressure the evictor releases views nothing else holds before
+  it evicts any data entry, for a ledger and a host-gate refusal alike
+  (`real_memo_views_go_first_under_pressure`). Views a batch still holds
+  keep their entry and their reservation
+  (`an_entry_whose_views_a_batch_holds_is_held_with_the_real_memo`), and
+  views leave with their entry (`real_memo_views_go_with_their_entry`).
+- A fill validates the views once and adds the column's rows to
+  `strCellsValidated` (`a_view_fill_counts_its_validation_once`).
+
 When the cap is nonzero each SQL response's `stats` carries `decodedCache`
 once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
 `marginSkips`, `filledCellRefusals`, `pressureEvictions`,
-`pressureFreedBytes`, `residentBytes`, `deferredServed`,
+`pressureFreedBytes`, `residentBytes`, `deferredServed`, `viewMemoBytes`,
+`viewMemoFills`, `viewMemoRefusals`, `viewMemoReleases`,
 `deferredSetEstimateBytes`, and `deferredSetEstimatePartial`.
+`viewMemoBytes` is the cache's view total when the statement finished,
+`viewMemoFills` and `viewMemoRefusals` the statement's own fills and
+refused fills, and `viewMemoReleases` the views the memory budget's evictor
+released while the statement ran, which can include another statement's
+pressure (`decoded_cache_json_names_every_field_exactly_once`).
 `filledCellRefusals` counts offers refused because the column already
 carries a filled reservation cell: it was admitted concurrently under
 another key, or its entry was evicted (by the cap or the age bound) while
@@ -6321,11 +6361,12 @@ columns, and false otherwise (`decoded_cache_json` in
 `crates/ravel-sql/src/stats_json.rs`;
 `decoded_cache_stats_appear_once_when_enabled_and_never_at_zero` in
 `services/ravel-server/tests/sql_decoded_cache_e2e.rs`).
-`/metrics` publishes `ravel_decoded_cache_resident_bytes`, `_max_bytes` and
-`_entries` as gauges and `_hits_total`, `_misses_total`, `_admissions_total`,
-`_evictions_total`, `_ghost_hits_total`, `_margin_skips_total`,
-`_pressure_evictions_total` and `_expired_drops_total` as counters (eight);
-none of these families appears at `0`.
+`/metrics` publishes `ravel_decoded_cache_resident_bytes`, `_max_bytes`,
+`_entries`, `_view_bytes` and `_view_max_bytes` as gauges and `_hits_total`,
+`_misses_total`, `_admissions_total`, `_evictions_total`, `_ghost_hits_total`,
+`_margin_skips_total`, `_pressure_evictions_total`, `_expired_drops_total`,
+`_view_fills_total`, `_view_refusals_total` and `_view_releases_total` as
+counters (eleven); none of these families appears at `0`.
 
 ## SQL over spans (the `spans` table, ADR-0045)
 
@@ -6746,6 +6787,24 @@ query's result schema is identical with and without the rule. Grouping sets and
 aggregates that already carry an output ordering are left on the original path;
 an ordered aggregate emits incrementally (`EmitTo::First`) and is bounded
 already.
+
+With the decoded column-block cache on and a nonzero view budget, the cast
+into `Utf8View` is `GroupKeyViews`, which displays as that same cast, so a
+plan's EXPLAIN text is unchanged (`the_view_memo_plan_explains_as_the_cast`).
+When a batch's dictionary values are the values array a cached plain-page
+column keeps, the same offsets and values buffers with no null buffer on
+either side, it takes that column's views instead of building them: the
+views array itself when the keys are `0..n` with no null buffer, and a
+16-byte gather per row by the keys otherwise. The output has the cast's
+views, data buffers and null buffer, narrowed by a filter or not
+(`prop_group_key_views_equal_the_cast`,
+`the_group_key_takes_the_memos_views_on_a_served_block`). Every other input,
+a dictionary page, a copy or slice of a cached array, and a column with a
+NULL entry included, takes the cast (same tests,
+`the_registry_serves_a_memo_only_its_own_buffers`,
+`null_keys_and_a_null_bearing_memo_read_as_the_cast`). A view budget of 0
+plans the cast itself (`a_null_dictionary_entry_groups_with_null`). The view
+budget is described under the decoded column-block cache above.
 
 Underneath that sits a guarantee that does not depend on the rewrite being
 right. Every batch from every SQL transport passes through `PinnedStream`, and

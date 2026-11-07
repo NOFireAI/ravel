@@ -155,16 +155,18 @@ pub trait ValuesMemo: Send + Sync {
 /// the column's bytes rather than copy them. Measured by `ravel-sql`'s
 /// `tests/memo_overhead_alloc_pin.rs`
 /// (`values_memo_charge_covers_the_measured_memo_and_no_more`), through the
-/// crate's own build, as the heap bytes one memo fill leaves live: 432 for a
-/// plain `Text` column; 432 for a block-local `Text` dictionary, and 568 once
-/// the key path has also built its keys buffer; 560 for a `Mixed`
+/// crate's own build, as the heap bytes one memo fill leaves live: 464 for a
+/// plain `Text` column; 464 for a block-local `Text` dictionary, and 600 once
+/// the key path has also built its keys buffer; 592 for a `Mixed`
 /// dictionary, whose validity adds a shared buffer, both with and without the
-/// key path, which refuses it and builds no keys buffer. Every byte allocated
+/// key path, which refuses it and builds no keys buffer. Those include the
+/// memo's two empty view memo slots (ADR-3326, view memo amendment); views
+/// themselves are charged to the view budget, not here. Every byte allocated
 /// stays live. Set to the largest, rounded up to a multiple of 16; that test
 /// fails when the constant falls below a measured figure or exceeds the
 /// largest by more than 16. `the_entry_charge_includes_the_memo_constant`
 /// pins that `offer` adds it.
-pub const VALUES_MEMO_BYTES: u64 = 576;
+pub const VALUES_MEMO_BYTES: u64 = 608;
 
 /// A cached string column's memo slot, filled at most once.
 #[derive(Default)]
