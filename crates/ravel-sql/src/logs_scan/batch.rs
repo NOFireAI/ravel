@@ -7346,8 +7346,8 @@ mod tests {
                 assert_eq!(p.counters.view_snapshot().fills, 0, "not filled yet");
                 let got = group_key(&nulled, true);
                 assert_eq!(p.counters.view_snapshot().fills, 1, "the memo served");
+                assert_eq!(got.null_count(), 2, "the keys' null buffer");
                 identical(&got, &group_key(&nulled, false)).unwrap_or_else(|e| panic!("{e}"));
-                assert_eq!(got.null_count(), 2);
                 assert_eq!(null_group_count(nulled).await, 2);
             }
 
