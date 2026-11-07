@@ -1183,8 +1183,10 @@ target_if = "v <= m['row_11.logs_part_entries'] * 11 * 1024"
 # scanned. Then the 1,000-key list: refused-by-guard when the SQL complexity
 # guard refused it, unsupported-on-this-build when it was refused otherwise or
 # carries no keyIndex.keysProbed and partsCovered, 0 when it probed another
-# count or covered no part, or when the twin was refused while it was
-# admitted, else 1. A build from before ADR-3692's key set amendment refuses
+# count or reported partsCovered 0 with no part in an Uncovered outcome, or
+# when the twin was refused while it was admitted, else 1. A part Uncovered
+# by budget (partsCovered 0, skippedByBudget 1, as on box C) still carried
+# the 1,000-key set, so it passes. A build from before ADR-3692's key set amendment refuses
 # both lists (MAX_STATEMENT_COMPLEXITY = 1,000 at one unit per token), so on
 # such a build all three read refused-by-guard (fixtures/local-smoke, pinned
 # by test_control_1025_refused_by_guard_on_main).

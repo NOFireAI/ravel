@@ -2585,10 +2585,10 @@ class Evaluate(Workdir):
     def test_refused(self):
         self.assertEqual(self.check_refused(), [])
 
-    def served_1000(self, statement, keys=None, parts=1, scan=True, leaf=None):
+    def served_1000(self, statement, keys=None, parts=1, scan=True, leaf=None, skipped=None):
         """Turn statement's folded_leaves cold calls into ok calls copied from spans_in_100, which scanned 4
-        objects. keys None drops the keyIndex section; leaf sets its leafGetRequests; scan False zeros the
-        probe and scan GETs and blocks."""
+        objects. keys None drops the keyIndex section; leaf sets its leafGetRequests and skipped its
+        skippedByBudget; scan False zeros the probe and scan GETs and blocks."""
         src = {c["try"]: c for c in self.select("spans_in_100")}
         for i, c in enumerate(self.calls):
             if c["statement"] == statement and c["state"] == "folded_leaves" and c.get("temp") == "cold":
@@ -2601,6 +2601,8 @@ class Evaluate(Workdir):
                                                     partsCovered=parts)
                     if leaf is not None:
                         new["stats"]["keyIndex"]["leafGetRequests"] = leaf
+                    if skipped is not None:
+                        new["stats"]["keyIndex"]["skippedByBudget"] = skipped
                 if not scan:
                     for p in new["stats"]["phases"]:
                         if p["phase"] in ("probe", "scan"):
@@ -2629,7 +2631,11 @@ class Evaluate(Workdir):
         "zeros-without-scan": (dict(keys=1000), dict(keys=0, parts=0, scan=False), ("value", 0, "miss"),
                                "served without a visible path"),
         "zero-parts-covered": (dict(keys=1000, parts=0), dict(keys=0, parts=0), ("value", 0, "miss"),
-                               "probed 1000 keys with partsCovered 0"),
+                               "probed 1000 keys with partsCovered 0 and no part in an Uncovered outcome"),
+        # Box C: the 1,000-key part went Uncovered by budget (partsCovered 0, skippedByBudget 1) and the
+        # 1,025-key list was scanned with keysProbed 0.
+        "uncovered-by-budget": (dict(keys=1000, parts=0, skipped=1), dict(keys=0, parts=0, leaf=0),
+                                ("value", 1, "pass"), ""),
     }
 
     def check_control(self, mode, evaluate_py=EVALUATE):
@@ -2723,6 +2729,15 @@ class Evaluate(Workdir):
 
     def test_control_zero_parts_covered(self):
         self.assertEqual(self.check_control_zero_parts_covered(), [])
+
+    def check_control_uncovered_by_budget(self, evaluate_py=EVALUATE):
+        """Box C: a 1,000-key list that probed 1,000 keys and whose part went Uncovered by budget
+        (partsCovered 0, skippedByBudget 1) carried its key set; with the 1,025-key list scanned at
+        keysProbed 0 the control passes."""
+        return self.check_control("uncovered-by-budget", evaluate_py)
+
+    def test_control_uncovered_by_budget(self):
+        self.assertEqual(self.check_control_uncovered_by_budget(), [])
 
     # --- incomplete, truth-derived budgets, absent fields -------------------
 
@@ -3225,9 +3240,14 @@ FLIPS = {
         "check_control_pass",
     ),
     "a 1,000-key list covering no part passed": (
-        '        if not ki["partsCovered"]:',
+        '        if not ki["partsCovered"] and not any(ki.get(f) for f in UNCOVERED_OUTCOMES):',
         "        if False:",
         "check_control_zero_parts_covered",
+    ),
+    "a 1,000-key part Uncovered by budget read as covering no part": (
+        '        if not ki["partsCovered"] and not any(ki.get(f) for f in UNCOVERED_OUTCOMES):',
+        '        if not ki["partsCovered"]:',
+        "check_control_uncovered_by_budget",
     ),
     "an index-served 1,025-key list not seen": (
         "        if key_index_nonzero(c):\n",

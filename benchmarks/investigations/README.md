@@ -634,12 +634,16 @@ Some bands, as transcribed:
   has no key arm and the residual filter answers it with `keysProbed` 0 and
   0 leaf GETs (`services/ravel-server/tests/sql_key_in.rs`,
   `in_list_rows_equal_the_union_of_equalities`). The control is 1 (pass)
-  when every 1,000-key call reports `keysProbed` 1000 and `partsCovered`
-  and every 1,025-key call is served by a visible scan with no keyIndex
-  figure above zero; 0 (miss) when a 1,025-key call is index-served
+  when every 1,000-key call reports `keysProbed` 1000 and either
+  `partsCovered` or a part in an Uncovered outcome (box C's went
+  Uncovered by budget, `partsCovered` 0 and `skippedByBudget` 1, which
+  still carried the key set: `check_control_uncovered_by_budget`), and
+  every 1,025-key call is served by a visible scan with no keyIndex figure
+  above zero; 0 (miss) when a 1,025-key call is index-served
   (`keysProbed`, `partsCovered` or `leafGetRequests` non-zero), is served
   with no visible path, or is refused while the 1,000-key list was
-  admitted, or when the 1,000-key list probed another count;
+  admitted, or when the 1,000-key list probed another count or reported
+  `partsCovered` 0 with no Uncovered outcome;
   `refused-by-guard` when the 1,000-key list was refused by the SQL
   complexity guard, and `unsupported-on-this-build` when it carries no
   tier-2 figures.

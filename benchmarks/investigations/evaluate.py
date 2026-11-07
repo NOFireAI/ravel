@@ -585,13 +585,16 @@ def control_1025(calls, cfg, statement, state, temp):
     keys (KEY_SET_MAX_KEYS), so a correct build answers the 1,025-key list
     with a scan and no route: keysProbed 0, partsCovered 0, 0 leaf GETs.
 
-    1 when every 1,000-key call probed exactly 1,000 keys with a nonzero
-    partsCovered, and every 1,025-key call was served by a visible scan
-    (probe or scan GETs, or blocks scanned) with no keyIndex figure above
-    zero. 0 when a 1,025-key call carries a nonzero keyIndex figure, or was
-    served with neither a keyIndex figure nor a scan, or was refused while
-    the 1,000-key list was admitted, or a 1,000-key call probed another count
-    or covered no part. The 1,025-key arm is judged first; only a 1,000-key
+    1 when every 1,000-key call probed exactly 1,000 keys and routed its
+    parts (partsCovered nonzero, or a part in an Uncovered outcome such as
+    skippedByBudget, as box C's lists went: the key set was carried even
+    though the leaves did not answer), and every 1,025-key call was served
+    by a visible scan (probe or scan GETs, or blocks scanned) with no
+    keyIndex figure above zero. 0 when a 1,025-key call carries a nonzero
+    keyIndex figure, or was served with neither a keyIndex figure nor a
+    scan, or was refused while the 1,000-key list was admitted, or a
+    1,000-key call probed another count or reported partsCovered 0 with no
+    Uncovered outcome. The 1,025-key arm is judged first; only a 1,000-key
     list that was itself refused, or that carries no tier-2 figures, makes
     the figure refused-by-guard or unsupported."""
     over = statement.replace("_1000", "_1025")
@@ -639,8 +642,9 @@ def control_1025(calls, cfg, statement, state, temp):
         ki = c["stats"]["keyIndex"]
         if ki["keysProbed"] != 1000:
             return "value", 0, f"{where(c)} probed {ki['keysProbed']} keys, not 1000"
-        if not ki["partsCovered"]:
-            return "value", 0, f"{where(c)} probed 1000 keys with partsCovered {ki['partsCovered']}"
+        if not ki["partsCovered"] and not any(ki.get(f) for f in UNCOVERED_OUTCOMES):
+            return "value", 0, (f"{where(c)} probed 1000 keys with partsCovered {ki['partsCovered']} "
+                                f"and no part in an Uncovered outcome")
     return "value", 1, ""
 
 
