@@ -782,6 +782,7 @@ which wait on #3829.
 | 15. the journey: failing traces of one service in 1 h (about 50), their logs by `trace_id IN`, their rows | total GETs at most resolve + 2 x covering parts on spans for the cell's traces + `1 + min(distinct buckets, 64)` per covering part on logs for the 50-key list (about 51 on a 13-bit leaf) + 50 x (footer + SKIP_IDX + block runs) on spans + the logs holders' block reads; under 5 s cold end to end; rows exact | over 20 s, or any whole-object read of a non-holder | predicted from decisions 2 to 6 |
 | 16. nonselective control: the 43 ClickBench statements, cold, this build against the build before Wave 1 on one box, paired | no statement over 5 % slower outside the lane's noise, and no GET or byte increase on any statement without a key | over 5 % on any statement, or any added request | predicted; the ADR-3072 decision 4 contract |
 | 17. cost per successful investigation and break-even | the dollar figure per statement of decision 8, folded against unfolded, with the index's amortised maintenance and the break-even lookups per part-month, each named with its price basis and query-frequency assumption | a figure without its basis, or a break-even stated without the frequency it assumes | predicted; the formula is decision 8's |
+| 18. key-set lookup time: `IN` lists of 10 and 100 keys on logs request_id, logs trace_id and spans trace_id, folded with leaves after one fold advance (`advanced_leaves`), against the same statement unfolded (row 18 amendment) | p50 at most the unfolded p50 of the same statement on the same box plus its noise, the larger of 5 % of that p50 and half the unfolded statement's interquartile range over its cold calls, for every field and list size, with no covering part `Uncovered` | over that bound for any field and list size; a cell whose part went `Uncovered` is not measured, not a hold, since its time is the tier-1 probe's | predicted; comment 6703881894; box C before #3917: logs request_id at 100 keys 7.64 s against 3.01 s (s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl) |
 
 ## Plan
 
@@ -1414,3 +1415,65 @@ pays the per-advance cost above.
 | advance cost at 7 days of tail | section GETs, leaf bytes and held memory per advance bounded by the new hour's pairs | the 7-day projection above | predicted; #3927 |
 
 Refs: #3707, #3692
+
+## Amendment (issue #3918): row 18, key-set lookup time
+
+<!-- amendment-applies: sections="Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)" pointer="row 18 amendment" -->
+
+Rows 7 and 8 judge what the leaf build costs the fold: its section reads,
+its memory and its leaf bytes. No row judges how long a lookup routed
+through the leaves takes. Box C measured that cost. Its logs request_id
+`IN` list of 100 keys took a p50 of 7.64 s through the leaves against
+3.01 s unfolded, because the router read 105 leaf GETs one after another
+(the Stage 1 amendment, row 11; #3917). Comment 6703881894 on #3927 makes a
+lookup time no higher than the unfolded one a precondition for the switch.
+Row 18 is that precondition. It is pre-registered here, before the run
+that measures it.
+
+The harness measures it in a state of its own, `advanced_leaves`, which
+runs after `mixed` and that state's fold advance and folds nothing itself.
+It sends the `IN` lists of 10 and 100 keys on logs request_id, logs
+trace_id and spans trace_id, 20 cold calls each, against the catalog the
+advance left. The state fails, and the row is not run, unless the advance
+ran with the leaf switch on and the logs request_id leaves carry more
+slices per part than the leaf rebuild wrote. Each cell of the row is one
+field and list size. It compares the cell's p50 with the p50 of the same
+statement in the same run's `unfolded` state.
+
+The row is measured after an advance because each advance adds slices,
+and a lookup pays per slice it touches (the pass-end slice amendment).
+Box D's logs request_id field went from 5 slices after the leaf rebuild to
+27 after one advance (the Stage 1 amendment, row 7). A lookup measured on
+the rebuild's leaves alone would understate the cost the switch turns on.
+
+The bound allows for noise, because 20 cold calls on real S3 vary. Box C's
+logs trace_id list of 100 keys read a p50 of 2.73 s folded against 2.78 s
+unfolded, and both were answered by the tier-1 probe, since the folded part
+was `Uncovered`. The interquartile range of that statement's 20 unfolded
+cold calls was 0.149 s: 2.706 s at the 25th percentile and 2.855 s at the
+75th, recomputed from the calls.jsonl that row 18's source names. So "no
+higher than the unfolded p50" in comment 6703881894 is read here as no
+higher beyond that noise. The noise is the larger of 5 % of the unfolded
+p50 and half the unfolded statement's interquartile range over its cold
+calls, and the bound is the unfolded p50 plus that noise. For that
+statement the bound would be 2.914 s: 5 % is 0.139 s and half the range is
+0.074 s. For logs request_id at 100 keys it is 3.197 s, where half the
+range, 0.186 s, is the larger term. Box C's 7.64 s is far over it.
+
+A cell whose covering part went `Uncovered` in any of its cold calls is not
+measured. That covers a part with no leaf for the field, one skipped by
+budget, one past the ceiling, a rejected leaf and a refused reservation.
+Its time is the tier-1 probe's, not the leaves', so it is neither a hold nor
+a miss, and the run's verdict is at best incomplete. The switch does not
+turn on for a field while any of its cells is not measured or misses.
+
+The unfolded baseline holds the base data only, while `advanced_leaves`
+holds the base plus the tail hour. The comparison is against a state with
+fewer objects, which makes the bar harder for the leaves, not easier.
+
+The row is predicted to hold only after #3917 lands, which reads a key
+set's leaf bucket runs concurrently. On the build Stage 1 measured, logs
+request_id at 100 keys misses it. The switch does not turn on for a signal
+while this row misses for that signal.
+
+Refs: #3918, #3692

@@ -6,7 +6,7 @@ trace id or request id, an IN list, a rare, sparse or common needle, and the
 narrow joins of the investigation journeys. It runs them against a seeded
 spans and logs corpus in each state of the key-index matrix (see "States"),
 judges every answer against the generator's oracle, and judges every figure
-against `bands.toml`, which transcribes the 17 rows of ADR-3692's Acceptance
+against `bands.toml`, which transcribes the 18 rows of ADR-3692's Acceptance
 table.
 
 This is not a `ravel-bench` report: it drives the real binaries, `ravel-cli
@@ -28,7 +28,7 @@ store, from an empty bucket to `results.<lane>.json`.
   SQL or trace GET, the states it runs in, its `truth.json` key, whether it
   runs cold only, and `requires` when it needs a planted key the corpus may
   not hold.
-- `bands.toml`: ADR-3692 Acceptance rows 1 to 17. The text of each row's
+- `bands.toml`: ADR-3692 Acceptance rows 1 to 18. The text of each row's
   `check`, `target`, `miss` and `source` cells is the ADR's, verbatim; the
   `target_if` and `miss_if` expressions are transcriptions of that text into
   figures this harness extracts, and where a transcription had to choose, a
@@ -118,19 +118,20 @@ that is not `cold_only` (statement counts from `statements.toml`):
 | folded_no_leaves | 5 | 100 | 3 |
 | folded_leaves | 35 | 700 | 3 |
 | mixed | 22 | 440 | 3 |
+| advanced_leaves | 6 | 120 | 0 |
 | compaction_in_flight | 4 | 80 (one restart) | 1 |
 | compaction_done | 4 | 80 | 1 |
 | erasure_in_flight | 4 | 80 | 1 |
 | many_parts_744 | 2 | 40 | 2 |
 | many_parts_2160 | 2 | 40 | 2 |
 
-That is 2,299 calls and 2,201 restarts: 2,201 x 0.875 s = 1,926 s, plus
-2,299 x 0.032 s = 74 s, so 2,000 s, about 33 minutes of calls. The fixed
+That is 2,419 calls and 2,321 restarts: 2,321 x 0.875 s = 2,031 s, plus
+2,419 x 0.032 s = 77 s, so 2,108 s, about 35 minutes of calls. The fixed
 waits add at most 70 minutes for mixed (the next ingest hour;
 `run.mixed_wait_max_minutes`, which `box/run.sh` defaults to 70) and at most
 310 s, about 5 minutes, for compaction_in_flight (until 310 s into an hour;
-in the smoke they took 13 and 4 minutes). The estimate is 2,000 + 4,200 +
-310 = 6,510 s, about 109 minutes, against the 540-minute
+in the smoke they took 13 and 4 minutes). The estimate is 2,108 + 4,200 +
+310 = 6,618 s, about 110 minutes, against the 540-minute
 deadline, and it covers calls and waits only. It omits corpus generation,
 every load (the `hits` tenant's included) and every fold at 20,000,000
 traces: the smoke's figures for them (0.30 to 1.03 s per load, at most
@@ -215,7 +216,38 @@ its keyIndex GETs at 2 x that count.
   answers of their own: saved trace ids, a request id, needle rows, failing
   cell traces), and runs the statements over the folded hours and the
   unsealed tail together, with ids from both. Its oracle is the base answer
-  plus the tail's. Then it folds that hour (`fold_advance`).
+  plus the tail's. Then it folds that hour (`fold_advance`, `catalog fold
+  --writers-stopped --json --key-index-leaves`, the leaf switch on).
+- `advanced_leaves` (ADR-3692 row 18): runs after `mixed`, against the
+  catalog `fold_advance` left, and folds nothing itself, so the leaves have
+  been through one advance and carry its extra slices. It stamps the state
+  as every leaf state is stamped (census, catalog, object, kidx), then runs
+  `inv.py advance-check`, which fails the state (`STATE-FAILED`, step
+  `advance-check advanced_leaves`) unless two things hold: `fold_advance`
+  folded spans and logs with `--key-index-leaves` and exited 0 (its
+  `folds.jsonl` lines), since a fold with the switch off re-encodes the
+  parts and drops their leaf refs; and the logs `request_id` field carries
+  more slices per part in the state's catalog stamp than in the
+  `folded_leaves` one, stamped after the leaf rebuild, so the state really
+  measures an advanced tail. It prints the slices per (part, field) of both
+  stamps. Then it sends the `IN` lists of 10 and 100 keys on logs
+  `request_id`, logs `trace_id` and spans `trace_id` (`logs_request_in_10`,
+  `logs_request_in_100`, `logs_trace_in_10`, `logs_trace_in_100`,
+  `spans_in_10`, `spans_in_100`). Their oracle is the base answer under the
+  same truth key: the state holds the base hours plus the tail hour, and the
+  tail is a separate generator run (seed + 1) whose planted ids are its own
+  (`req-planted-tail-0001`, its saved traces and failing cell), so a listed
+  key gains rows from the tail only if a tail trace id equals a base one (a
+  128-bit draw) or, for a request id, shares its first 16 hex digits and row
+  index (`request_id_of`). A key that did would return more rows than the
+  oracle and read as a wrong answer, not a pass. The local smoke lists the
+  state so its flow and its check run there, and it is expected to fail
+  the second check: the smoke's 150,000 logs rows, base and tail, are
+  150,000 `request_id` pairs, under the 4,000,000-pair share each of the
+  two logs fields gets of the default 8,000,000-pair budget
+  (`DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`), so the advance takes one pass and
+  adds no slice (the committed fixture's `folded_leaves` and `fold_advance`
+  stamps both carry one `request_id` leaf).
 - `compaction_in_flight`: waits until every earlier hour is sealed (310 s
   into the hour), starts `maintain compact-tenant` on both signals at once as
   background children, runs the statement set while they run (temp `inflight`,
@@ -466,7 +498,7 @@ while the same call's scan phase issued a GET is `dead_counter
 segmentsOpened STATEMENT STATE`, a problem: on this build the rlog and rspan
 scan paths never increment that counter.
 
-`timing` figures (rows 2, 5, 15 and 16) are judged on the s3 lane and only
+`timing` figures (rows 2, 5, 15, 16 and 18) are judged on the s3 lane and only
 reported on the local one. The output is a pure function of the run
 directory, so re-evaluating it is byte-identical.
 
@@ -474,9 +506,9 @@ The verdict is `fail` when anything is missing, duplicated, wrong, refused,
 dead, not in flight or missed. Otherwise it is `incomplete` when the run
 proved less than it was asked: a state `run.toml` lists that did not run, a
 planned call that was not sent in a state that did (the run deadline, an
-in-flight window too short), or a figure `not-run` for a reason other than
+in-flight window too short), a figure `not-run` for a reason other than
 its row or figure needing a tenant, state, scale or baseline the run never
-asked for. Each reason is listed under `incomplete` in the results and the
+asked for, or a row 18 cell `not-measured` (below). Each reason is listed under `incomplete` in the results and the
 summary. The rows left out that way are not silent either: each is listed
 with the setting that leaves it out (`hits = false`, `baseline = false`, a
 state or scale `run.toml` does not list) under `not_requested` in the results and on the
@@ -498,10 +530,13 @@ Metrics a band can name: `cold.max.<m>` and `cold.min.<m>` (over the cold
 tries; `<m>` from the call's stats phases and members, such as `total_gets`,
 `data_gets`, `wire_bytes`, `leaf_gets`, `probe_wire_per_object`),
 `warm.max.<m>`, `cold.rows_exact` (1 when every try's answer was correct),
-`cold.rows_match_state.<state>`, `cold.wall_p50_s`,
+`cold.rows_match_state.<state>`, `cold.wall_p50_s`, `cold.wall_iqr_s` (the
+75th less the 25th percentile of the cold tries' wall times),
+`cold.leaf_wall_p50_s` (row 18, below),
 `cold.control_1025` (row 11's control, below), `stamp.<what>.<label>`
 (covering parts, entry counts, previous leaves, footer length, leaf
-buckets), `leaf_share.<label>.<field>`,
+buckets), `stamp.slices.<label>.<field>` (the most leaves one part carries
+for the field), `leaf_share.<label>.<field>`,
 `census.<tenant>.<signal>.objects|bytes|objects_over_512k`,
 `fold.<tenant>.<label>.<field>`, `truth.<path>` (an integer `truth.json`
 holds), and `derived` figures over those. A stamp field the inspector did
@@ -598,6 +633,24 @@ Some bands, as transcribed:
   term comes from `truth.json`, not from the measured call: the failing
   cell's traces (`failing_cell.count`, the holders) x the logs rows planted
   per trace (`generator.logs_per_trace`), each row at most one block read.
+- Row 18, key-set lookup time, one cell per field and list size (logs
+  `request_id`, logs `trace_id` and spans `trace_id`, at 10 and 100 keys):
+  the cell's `advanced_leaves` p50 over its cold calls
+  (`cold.leaf_wall_p50_s`) at most U + max(0.05 x U, 0.5 x IQR), U the
+  `unfolded` p50 of the same statement (`cold.wall_p50_s`) and IQR its
+  unfolded interquartile range (`cold.wall_iqr_s`), both from the same
+  run; over that bound is a miss. A cell any of whose cold calls left a
+  covering part `Uncovered` (`partsCovered` 0, or `partsUncovered`,
+  `skippedByBudget`, `partsBeyondCeiling`, `leavesRejected` or
+  `reservationsRefused` above 0) reads `not-measured` whatever its time:
+  its time is the tier-1 probe's, so it is neither a hold nor a miss, and
+  it makes the verdict at best `incomplete`. With either state absent the
+  row reads `not-run` with the reason, as the committed fixture's does. The
+  row also reports the slices per (part, field) the lookups touched
+  (`stamp.slices`), and the logs `request_id` count after the leaf rebuild
+  beside it. Box C, before #3917, measured logs `request_id` at 100 keys at
+  7.64 s through the leaves against 3.01 s unfolded, a miss
+  (`check_row_18` cases).
 
 Cost: per (statement, state), the mean cold call's GETs, LISTs and server
 CPU seconds times the named prices. Server CPU is `/proc/<pid>/stat` utime

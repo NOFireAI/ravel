@@ -34,7 +34,8 @@ non-zero) is not live: every figure of it, and of a state derived from it,
 is `not-run` with the reason "state failed at <step> (exit N)", and its
 entry in `states` reads `failed` with the step, exit code and log. The
 verdict is `fail` on any problem; else `incomplete` when an asked state, a
-planned call or an ungated figure did not run; else `pass`. Exit 0 only on pass; 1 on fail or incomplete; 64 on usage.
+planned call or an ungated figure did not run, or a row 18 cell is
+not-measured; else `pass`. Exit 0 only on pass; 1 on fail or incomplete; 64 on usage.
 """
 
 import argparse
@@ -72,6 +73,11 @@ KEY_INDEX_METRICS = {
     "reservations_refused": "reservationsRefused",
     "keys_probed": "keysProbed",
 }
+# Row 18: a lookup cell whose covering part went to one of these router
+# outcomes was answered by tier 1, so its time is not the leaves'.
+NOT_MEASURED = "not-measured"
+UNCOVERED_OUTCOMES = ("partsUncovered", "skippedByBudget", "partsBeyondCeiling", "leavesRejected",
+                      "reservationsRefused")
 ALLOWLIST_BREAKDOWNS = {"per_object": "stats carry no per-object breakdown",
                         "per_part": "stats carry no per-part breakdown"}
 # Fold report fields this build does not write.
@@ -637,13 +643,34 @@ def control_1025(calls, cfg, statement, state, temp):
     return "value", 1, ""
 
 
+def leaf_uncovered(c):
+    """None when an ok call's leaves answered every covering part: partsCovered
+    at least 1 and no part in any other outcome. Else (status, None, reason):
+    NOT_MEASURED naming the outcome when a part went Uncovered (a part with no
+    leaf for the field, skipped by budget, beyond the ceiling, rejected, or
+    refused its reservation), since its time is the tier-1 probe's, or
+    unsupported when the build reports none of it."""
+    ki = c["stats"].get("keyIndex")
+    fields = ("partsCovered",) + UNCOVERED_OUTCOMES
+    if not isinstance(ki, dict) or any(f not in ki for f in fields):
+        return UNSUPPORTED, None, f"{where(c)} carries no keyIndex.{'/'.join(fields)} on this build"
+    went = [f"{f} {ki[f]}" for f in UNCOVERED_OUTCOMES if ki[f]]
+    if went or not ki["partsCovered"]:
+        return NOT_MEASURED, None, (f"{where(c)}: a covering part went Uncovered "
+                                    f"({', '.join(went) or 'partsCovered 0'}), so its time is the tier-1 probe's")
+    return None
+
+
 def statement_figure(calls, cfg, statement, state, metric, candidates=None):
     """(status, value, reason) of one statement figure. candidates(c) is
     (count, None) or (None, reason): the objects the state's ranges stamp
     says overlap call c's window.
 
     metric is "<temp>.<agg>.<name>", "<temp>.rows_exact",
-    "<temp>.rows_match_state.<other>", "<temp>.wall_p50_s" or
+    "<temp>.rows_match_state.<other>", "<temp>.wall_p50_s",
+    "<temp>.wall_iqr_s" (the 75th less the 25th percentile of the tries'
+    wall times), "<temp>.leaf_wall_p50_s" (the p50 when every try's leaves
+    answered every covering part, else not-measured) or
     "<temp>.control_1025".
     """
     temp, _, rest = metric.partition(".")
@@ -686,6 +713,15 @@ def statement_figure(calls, cfg, statement, state, metric, candidates=None):
                    for c, o in zip(lines, theirs))
         return "value", int(same), ""
     if rest == "wall_p50_s":
+        return "value", rnd(percentile([c["wall_s"] for c in lines], 0.5)), ""
+    if rest == "wall_iqr_s":
+        walls = [c["wall_s"] for c in lines]
+        return "value", rnd(percentile(walls, 0.75) - percentile(walls, 0.25)), ""
+    if rest == "leaf_wall_p50_s":
+        for c in lines:
+            why = leaf_uncovered(c)
+            if why:
+                return why
         return "value", rnd(percentile([c["wall_s"] for c in lines], 0.5)), ""
     agg, _, name = rest.partition(".")
     head = name.split(".", 1)[0]
@@ -1061,6 +1097,17 @@ def stamp_figure(stamps, census, cfg, state, metric):
             return "missing", None, f"a {field} leaf in stamps/{state}.{label}.catalog.json has no size"
         return "value", rnd(100.0 * lb / data["bytes"]), ""
     what, _, label = rest.partition(".")
+    if what == "slices":
+        # stamp.slices.<label>.<field>: the most leaves (key slices) one part
+        # carries for the field, from the state's catalog stamp.
+        label, _, field = label.partition(".")
+        doc = stamps.doc(state, label, "catalog")
+        if doc is None:
+            return "missing", None, f"covering_parts.{state}.{label}"
+        counts = [sum(1 for lf in p.get("leaves", []) if lf.get("field") == field) for p in doc.get("parts", [])]
+        if not any(counts):
+            return "missing", None, f"stamps/{state}.{label}.catalog.json names no {field} leaf"
+        return "value", max(counts), ""
     if what == "footer_len":
         doc = stamps.doc(state, label, "object")
         if doc is None:
@@ -1488,7 +1535,8 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     sent in a state that did, or a figure not-run for any reason other than
     its row or figure lacking a state, tenant, scale or baseline the run
     never asked for (a gated figure is either not_requested or listed
-    here), or a needle band a partial inspection could not judge."""
+    here), a figure not-measured (a row 18 cell whose covering part went
+    Uncovered), or a needle band a partial inspection could not judge."""
     out = []
     for s in cfg["states"]:
         if live.get(s) is not None:
@@ -1503,6 +1551,8 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     for f in figures:
         if f["status"] == "not-run" and not f.get("not_requested"):
             out.append(f"figure {f['id']} not run: {f['reason']}")
+        elif f["status"] == NOT_MEASURED:
+            out.append(f"figure {f['id']} not measured: {f['reason']}")
     out.extend((needles or {}).get("incomplete", []))
     return out
 

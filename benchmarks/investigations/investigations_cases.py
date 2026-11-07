@@ -51,8 +51,8 @@ PY = sys.executable
 # runs every box/ script under 3.2 too.
 BASH = os.environ.get("INV_BASH", "bash")
 HOUR_NS = 3600 * 1_000_000_000
-STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight", "compaction_done",
-          "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160")
+STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves", "compaction_in_flight",
+          "compaction_done", "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160")
 SMOKE_STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
                 "erasure_in_flight", "many_parts_24")
 UNSUPPORTED = "unsupported-on-this-build"
@@ -968,7 +968,7 @@ class Statements(unittest.TestCase):
         # Item 17: each row's check, target, miss and source text is the ADR
         # Acceptance table's cell, the check without its "N. " number.
         _, adr = self.adr_band_rows()
-        self.assertEqual(len(adr), 17)
+        self.assertEqual(len(adr), 18)
         rows = self.bands["row"]
         for n, (r, cells) in enumerate(zip(rows, adr), 1):
             num, _, check = cells[0].partition(". ")
@@ -977,10 +977,10 @@ class Statements(unittest.TestCase):
             for k, cell in zip(("target", "miss", "source"), cells[1:]):
                 self.assertEqual(r[k].strip(), cell, f"{r['key']}.{k}")
 
-    def test_bands_rows_1_to_17(self):
+    def test_bands_rows_1_to_18(self):
         rows = self.bands["row"]
-        self.assertEqual([r["adr_row"] for r in rows], list(range(1, 18)))
-        self.assertEqual([r["key"] for r in rows], [f"row_{n:02d}" for n in range(1, 18)])
+        self.assertEqual([r["adr_row"] for r in rows], list(range(1, 19)))
+        self.assertEqual([r["key"] for r in rows], [f"row_{n:02d}" for n in range(1, 19)])
         ids = {s["id"] for s in self.st} | {"fold", "all", "control", "stamp", "derived", "truth"}
         for r in rows:
             for k in ("check", "target", "miss", "source"):
@@ -999,9 +999,9 @@ class Statements(unittest.TestCase):
             self.assertEqual(r["requires_tenant"], "hits")
             self.assertEqual({f["statement"] for f in r["figure"]}, {"q20_hits", "stamp"})
         timed = sorted({r["key"] for r in rows for f in r["figure"] if f["lane"] == "timing"})
-        # Rows 2, 5 and 15 time statements; row 16's slowdown is a timing
+        # Rows 2, 5, 15 and 18 time statements; row 16's slowdown is a timing
         # figure of a control run this harness does not perform.
-        self.assertEqual(timed, ["row_02", "row_05", "row_15", "row_16"])
+        self.assertEqual(timed, ["row_02", "row_05", "row_15", "row_16", "row_18"])
         r16 = next(r for r in rows if r["key"] == "row_16")
         self.assertEqual({f["statement"] for f in r16["figure"] if f["lane"] == "timing"}, {"control"})
         for r in rows:
@@ -1074,7 +1074,7 @@ class LocalSmoke(Workdir):
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         got = {s["state"]: (s["status"], s.get("reason")) for s in res["states"]}
         want = {s: ("run", None) for s in SMOKE_STATES + ("fold_advance", "compaction_done")}
-        want.update({s: ("not-run", "not in run.toml states") for s in ("many_parts_744", "many_parts_2160")})
+        want.update({s: ("not-run", "not in run.toml states") for s in ("advanced_leaves", "many_parts_744", "many_parts_2160")})
         self.assertEqual(got, want)
 
     def test_in_1000_is_sent_and_refused_by_the_complexity_guard(self):
@@ -1097,7 +1097,7 @@ class LocalSmoke(Workdir):
         self.assertEqual(figure(res, "row_11.spans_1000_rows_exact")["reason"], REFUSAL_1000)
         # Item 8: the guard's refusals are counted apart from unsupported figures.
         self.assertEqual(res["refusal_classes"], {GUARD: {"figures": 15, "calls": 24},
-                                                  UNSUPPORTED: {"figures": 23, "calls": 0}})
+                                                  UNSUPPORTED: {"figures": 29, "calls": 0}})
         guarded = sorted(f["id"] for f in res["figures"] if f["status"] == GUARD)
         self.assertEqual(len(guarded), 15)
         self.assertTrue(all(i.startswith("row_11.") for i in guarded), guarded)
@@ -1114,6 +1114,7 @@ class LocalSmoke(Workdir):
             {"row": 10, "key": "row_10", "reason": "run.toml states lacks ['many_parts_2160']"},
             {"row": 12, "key": "row_12", "reason": "run.toml scales lacks [10, 100]"},
             {"row": 16, "key": "row_16", "reason": "run.toml hits = false, baseline = false"},
+            {"row": 18, "key": "row_18", "reason": "run.toml states lacks ['advanced_leaves']"},
         ])
         self.assertEqual(text.splitlines()[:3], [
             "selective investigations, lane local: fail",
@@ -1121,8 +1122,8 @@ class LocalSmoke(Workdir):
             "covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact (run.toml states lacks "
             "['many_parts_744']); row 10 (run.toml "
             "states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml "
-            "hits = false, baseline = false)",
-            "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23 figure(s), "
+            "hits = false, baseline = false); row 18 (run.toml states lacks ['advanced_leaves'])",
+            "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29 figure(s), "
             "0 call(s)",
         ])
 
@@ -2153,6 +2154,170 @@ class Evaluate(Workdir):
     def test_typed_refusal_is_an_error_not_a_wrong_answer(self):
         self.assertEqual(self.check_typed_refusal_is_an_error_not_a_wrong_answer(), [])
 
+    # --- row 18, key-set lookup time ------------------------------------------
+
+    ROW_18_CELLS = {"logs_request_in_10": "logs_request_id_10", "logs_request_in_100": "logs_request_id_100",
+                    "logs_trace_in_10": "logs_trace_id_10", "logs_trace_in_100": "logs_trace_id_100",
+                    "spans_in_10": "spans_trace_id_10", "spans_in_100": "spans_trace_id_100"}
+    COVERED = {"partsCovered": 1, "partsUncovered": 0, "skippedByBudget": 0, "partsBeyondCeiling": 0,
+               "leavesRejected": 0, "reservationsRefused": 0, "leafGetRequests": 11, "keysProbed": 10}
+
+    def set_advanced_leaves(self, cells=None):
+        """An s3-lane run with advanced_leaves listed after mixed and run: its six statements' cold calls copied
+        from folded_leaves, its stamps from folded_leaves's (logs request_id at 3 slices a part against the
+        rebuild's 1). cells: {statement: (unfolded walls, advanced walls, keyIndex)}; a statement not named
+        reads unfolded (2.8, 3.2), so U 3.0 and IQR 0.2, and advanced (3.1, 3.1), covered: a hold inside the
+        noise, 3.15."""
+        cells = cells or {}
+        self.to_s3_lane()
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        with open(toml, "w") as f:
+            f.write(text.replace('"mixed", "compaction_in_flight"', '"mixed", "advanced_leaves", "compaction_in_flight"'))
+        restarts = read_jsonl(self.stamp_path("restarts.jsonl"))
+        for sid in self.ROW_18_CELLS:
+            unfolded, advanced, ki = cells.get(sid, ((2.8, 3.2), (3.1, 3.1), self.COVERED))
+            for c in self.calls:
+                if (c["statement"], c["state"], c.get("temp")) == (sid, "unfolded", "cold"):
+                    c["wall_s"] = unfolded[c["try"]]
+            for c in self.select(sid):
+                new = copy.deepcopy(c)
+                new.update(state="advanced_leaves", wall_s=advanced[c["try"]])
+                k = ki[c["try"]] if isinstance(ki, list) else ki
+                new["stats"]["keyIndex"] = dict(k)
+                self.calls.append(new)
+                restarts.append(dict(next(r for r in restarts if (r["statement"], r["state"], r["try"]) ==
+                                          (sid, "folded_leaves", c["try"])), state="advanced_leaves"))
+        self.save_calls()
+        write_jsonl(self.stamp_path("restarts.jsonl"), restarts)
+        for name in ("census.jsonl", "transitions.jsonl"):
+            lines = read_jsonl(self.stamp_path(name))
+            lines.append(dict(next(x for x in lines if x["state"] == "folded_leaves"), state="advanced_leaves"))
+            write_jsonl(self.stamp_path(name), lines)
+        for label in ("spans", "logs"):
+            with open(self.stamp_path(f"folded_leaves.{label}.catalog.json")) as f:
+                doc = json.load(f)
+            if label == "logs":
+                leaf = next(lf for lf in doc["parts"][0]["leaves"] if lf["field"] == "request_id")
+                doc["parts"][0]["leaves"] += [dict(leaf), dict(leaf)]
+            with open(self.stamp_path(f"advanced_leaves.{label}.catalog.json"), "w") as f:
+                json.dump(dict(doc, state="advanced_leaves"), f)
+        shutil.copy(self.stamp_path("folded_leaves.server.json"), self.stamp_path("advanced_leaves.server.json"))
+
+    def row_18(self, res):
+        return {f["id"][len("row_18."):]: f for f in res["figures"] if f["id"].startswith("row_18.")}
+
+    def check_row_18_hold(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 5: every cell 0.1 s over its unfolded p50 of 3.0 s, inside the noise (5 % of 3.0 = 0.15 s
+        beats half the 0.2 s range): each holds, and the slices are reported beside the row."""
+        self.set_advanced_leaves()
+        _, res, _ = self.go(bands, evaluate_py)
+        got = self.row_18(res)
+        out = [p for p in res["problems"] if "row_18" in p]
+        for cell in self.ROW_18_CELLS.values():
+            for name, value, verdict in ((f"{cell}_p50_s", 3.1, "pass"), (f"{cell}_unfolded_p50_s", 3.0, "pass"),
+                                         (f"{cell}_unfolded_iqr_s", 0.2, "pass")):
+                if (got[name]["value"], got[name]["verdict"]) != (value, verdict):
+                    out.append(f"{name} {got[name]['value']} {got[name]['verdict']} {got[name]['reason']}")
+        for name, value in (("logs_request_id_slices", 3), ("logs_request_id_slices_rebuild", 1),
+                            ("logs_trace_id_slices", 1), ("spans_trace_id_slices", 1)):
+            if (got[name]["value"], got[name]["verdict"]) != (value, "pass"):
+                out.append(f"{name} {got[name]['value']} {got[name]['verdict']}")
+        if any("row_18" in r for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_row_18_hold(self):
+        self.assertEqual(self.check_row_18_hold(), [])
+
+    def check_row_18_box_c_miss(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 5: box C's logs request_id at 100 keys, 7.64 s through the leaves against an unfolded p50 of
+        3.01 s (0.18 s of interquartile range here), misses."""
+        self.set_advanced_leaves({"logs_request_in_100": ((2.83, 3.19), (7.64, 7.64), self.COVERED)})
+        _, res, _ = self.go(bands, evaluate_py)
+        got = self.row_18(res)["logs_request_id_100_p50_s"]
+        out = [] if (got["value"], got["verdict"]) == (7.64, "miss") else [f"{got['value']} {got['verdict']}"]
+        if "miss row_18.logs_request_id_100_p50_s" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        if self.row_18(res)["logs_request_id_100_unfolded_p50_s"]["value"] != 3.01:
+            out.append(f"unfolded p50 {self.row_18(res)['logs_request_id_100_unfolded_p50_s']['value']}")
+        return out
+
+    def test_row_18_box_c_miss(self):
+        self.assertEqual(self.check_row_18_box_c_miss(), [])
+
+    # Each noise term on both sides of its edge, one cell each. Two cold calls
+    # a and b make U = (a + b) / 2 and IQR = (b - a) / 2. (2.8, 3.2): U 3.0,
+    # IQR 0.2, 5 % = 0.15 beats 0.1, so the bound is 3.15. (2.5, 3.5): U 3.0,
+    # IQR 0.5, half = 0.25 beats 0.15, so the bound is 3.25.
+    NOISE_EDGES = {
+        "logs_request_in_10": ((2.8, 3.2), 3.1499, "pass"),
+        "logs_request_in_100": ((2.8, 3.2), 3.1501, "miss"),
+        "logs_trace_in_10": ((2.5, 3.5), 3.2499, "pass"),
+        "logs_trace_in_100": ((2.5, 3.5), 3.2501, "miss"),
+    }
+
+    def check_row_18_noise_edges(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 5: the bound is U + max(5 % of U, half the IQR): inside and outside each term's edge."""
+        self.set_advanced_leaves({sid: (u, (v, v), self.COVERED) for sid, (u, v, _) in self.NOISE_EDGES.items()})
+        _, res, _ = self.go(bands, evaluate_py)
+        got = self.row_18(res)
+        out = []
+        for sid, (_, v, verdict) in self.NOISE_EDGES.items():
+            f = got[f"{self.ROW_18_CELLS[sid]}_p50_s"]
+            if (f["value"], f["verdict"]) != (v, verdict):
+                out.append(f"{sid} {f['value']} {f['verdict']}, want {verdict}")
+        return out
+
+    def test_row_18_noise_edges(self):
+        self.assertEqual(self.check_row_18_noise_edges(), [])
+
+    def check_row_18_uncovered(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Item 5: a cell whose part went Uncovered on one cold call (skippedByBudget 1, as box C's 100-key
+        trace_id lists) is not measured, even at 1.0 s, under its 3.15 s bound, and the run is incomplete."""
+        skipped = dict(self.COVERED, partsCovered=0, skippedByBudget=1, leafGetRequests=1)
+        self.set_advanced_leaves({"logs_trace_in_100": ((2.8, 3.2), (1.0, 1.0), [self.COVERED, skipped])})
+        _, res, _ = self.go(bands, evaluate_py)
+        f = self.row_18(res)["logs_trace_id_100_p50_s"]
+        out = []
+        if (f["status"], f["value"], f["verdict"]) != ("not-measured", None, "not-measured"):
+            out.append(f"{f['status']} {f['value']} {f['verdict']}")
+        if "cold try 1: a covering part went Uncovered (skippedByBudget 1)" not in (f["reason"] or ""):
+            out.append(f"reason {f['reason']}")
+        if not any(r.startswith("figure row_18.logs_trace_id_100_p50_s not measured: ") for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        if any("row_18" in p for p in res["problems"]):
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_row_18_uncovered(self):
+        self.assertEqual(self.check_row_18_uncovered(), [])
+
+    def test_row_18_not_run_without_its_state(self):
+        # The committed fixture does not list advanced_leaves: the row is
+        # not-run and listed as not requested.
+        _, res, _ = self.go(BANDS)
+        for f in self.row_18(res).values():
+            self.assertEqual(f["status"], "not-run", f["id"])
+            self.assertIn("advanced_leaves: not in run.toml states", f["reason"])
+        self.assertIn({"row": 18, "key": "row_18", "reason": "run.toml states lacks ['advanced_leaves']"},
+                      res["not_requested"])
+        # Listed, then failed by its own precondition: not-run with the step,
+        # and the run incomplete.
+        self.set_advanced_leaves()
+        with open(self.stamp_path("failed_states.jsonl"), "w") as f:
+            f.write(json.dumps({"state": "advanced_leaves", "step": "advance-check advanced_leaves", "exit": 1,
+                                "log": "out/logs/advance-check.out"}) + "\n")
+        _, res, _ = self.go(BANDS)
+        why = "state failed at advance-check advanced_leaves (exit 1)"
+        for f in self.row_18(res).values():
+            if f["state"] == "folded_leaves":
+                continue
+            self.assertEqual(f["status"], "not-run", f["id"])
+            self.assertIn(why, f["reason"], f["id"])
+        self.assertIn(f"state advanced_leaves not run: {why}", res["incomplete"])
+
     # --- in-flight overlap, refusals, the 1,025-key control -----------------
 
     def statement_tables(self):
@@ -2598,7 +2763,7 @@ class Evaluate(Workdir):
         got = [(r["row"], r["reason"]) for r in res["not_requested"]]
         want = [(5, "run.toml hits = false"), (6, "run.toml hits = false"),
                 (9, "run.toml states lacks ['many_parts_744']"), (10, "run.toml states lacks ['many_parts_2160']"), (12, "run.toml scales lacks [10, 100]"),
-                (16, "run.toml hits = false, baseline = false")]
+                (16, "run.toml hits = false, baseline = false"), (18, "run.toml states lacks ['advanced_leaves']")]
         out = [] if got == want else [f"not_requested {got}"]
         if "not requested: row 5 (run.toml hits = false); row 6 " not in text:
             out.append("summary carries no not-requested line")
@@ -2672,9 +2837,9 @@ class Evaluate(Workdir):
     def check_refusal_classes(self, evaluate_py=EVALUATE):
         """Guard refusals and unsupported figures are counted apart."""
         _, res, text = self.go(BANDS, evaluate_py)
-        want = {GUARD: {"figures": 15, "calls": 24}, UNSUPPORTED: {"figures": 23, "calls": 0}}
+        want = {GUARD: {"figures": 15, "calls": 24}, UNSUPPORTED: {"figures": 29, "calls": 0}}
         out = [] if res["refusal_classes"] == want else [f"classes {res['refusal_classes']}"]
-        if "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23" not in text:
+        if "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29" not in text:
             out.append("summary carries no refusal-class line")
         return out
 
@@ -2849,7 +3014,7 @@ FLIPS = {
         "check_absent_phases",
     ),
     "zero segmentsOpened taken as a value": (
-        '    if name == "segments_opened" and value == 0:',
+        '    if name in ("segments_opened", "scan_segments_opened") and value == 0:',
         "    if False:",
         "check_dead_counter",
     ),
@@ -2959,6 +3124,26 @@ FLIPS = {
         '            return "value", len(calls.wrong), ""\n',
         '            return "value", len(calls.wrong) + len(calls.errors), ""\n',
         "check_typed_refusal_is_an_error_not_a_wrong_answer",
+    ),
+    "an Uncovered row 18 cell timed as if the leaves answered it": (
+        '    if went or not ki["partsCovered"]:\n',
+        "    if False:\n",
+        "check_row_18_uncovered",
+    ),
+    "a not-measured row 18 cell left out of incomplete": (
+        "        elif f[\"status\"] == NOT_MEASURED:\n",
+        "        elif False:\n",
+        "check_row_18_uncovered",
+    ),
+    "the interquartile range read as the 75th percentile": (
+        "        return \"value\", rnd(percentile(walls, 0.75) - percentile(walls, 0.25)), \"\"\n",
+        "        return \"value\", rnd(percentile(walls, 0.75)), \"\"\n",
+        "check_row_18_noise_edges",
+    ),
+    "row 18's p50 taken without the Uncovered check": (
+        "    if rest == \"leaf_wall_p50_s\":\n        for c in lines:\n",
+        "    if rest == \"leaf_wall_p50_s\":\n        for c in []:\n",
+        "check_row_18_uncovered",
     ),
     "a phase's segmentsOpened read as every phase's": (
         '        v[f"{p.lower()}_segments_opened"] = ph[p]["segmentsOpened"]\n',
@@ -3178,6 +3363,52 @@ BAND_FLIPS = {
         'metric = "cold.max.segments_opened"\n',
         "check_row_6_objects_past_probe",
     ),
+    "row 18's bound without its noise": (
+        "target_if = \"v <= m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])\"\n",
+        "target_if = \"v <= m['row_18.logs_request_id_100_unfolded_p50_s']\"\n",
+        "check_row_18_hold",
+    ),
+    "row 18's noise without its 5 % term": (
+        "target_if = \"v <= m['row_18.logs_request_id_10_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_request_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_10_unfolded_iqr_s'])\"\n"
+        "miss_if = \"v > m['row_18.logs_request_id_10_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_request_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_10_unfolded_iqr_s'])\"\n",
+        "target_if = \"v <= m['row_18.logs_request_id_10_unfolded_p50_s'] + 0.5 * "
+        "m['row_18.logs_request_id_10_unfolded_iqr_s']\"\n"
+        "miss_if = \"v > m['row_18.logs_request_id_10_unfolded_p50_s'] + 0.5 * "
+        "m['row_18.logs_request_id_10_unfolded_iqr_s']\"\n",
+        "check_row_18_noise_edges",
+    ),
+    "row 18's noise without its interquartile term": (
+        "target_if = \"v <= m['row_18.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_10_unfolded_iqr_s'])\"\n"
+        "miss_if = \"v > m['row_18.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_10_unfolded_iqr_s'])\"\n",
+        "target_if = \"v <= m['row_18.logs_trace_id_10_unfolded_p50_s'] * 1.05\"\n"
+        "miss_if = \"v > m['row_18.logs_trace_id_10_unfolded_p50_s'] * 1.05\"\n",
+        "check_row_18_noise_edges",
+    ),
+    "row 18's noise as the whole interquartile range": (
+        "target_if = \"v <= m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_100_unfolded_iqr_s'])\"\n"
+        "miss_if = \"v > m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_100_unfolded_iqr_s'])\"\n",
+        "target_if = \"v <= m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_100_unfolded_p50_s'], m['row_18.logs_trace_id_100_unfolded_iqr_s'])\"\n"
+        "miss_if = \"v > m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_trace_id_100_unfolded_p50_s'], m['row_18.logs_trace_id_100_unfolded_iqr_s'])\"\n",
+        "check_row_18_noise_edges",
+    ),
+    "row 18 judged against three times the unfolded p50": (
+        "target_if = \"v <= m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])\"\n"
+        "miss_if = \"v > m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * "
+        "m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])\"\n",
+        "target_if = \"v <= 3 * m['row_18.logs_request_id_100_unfolded_p50_s']\"\n"
+        "miss_if = \"v > 3 * m['row_18.logs_request_id_100_unfolded_p50_s']\"\n",
+        "check_row_18_box_c_miss",
+    ),
     "row 7's previous-leaf GETs not compared with the previous leaves": (
         "target_if = \"v == m['row_07.logs_previous_leaves']\"\n",
         "target_if = \"v >= 0\"\n",
@@ -3238,7 +3469,7 @@ class Box(Workdir):
                    "s3": ("compaction_in_flight", "erasure_in_flight", "many_parts_744", "many_parts_2160")}
 
     def assert_flow(self, text, lane, hits=False):
-        states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed") + self.LANE_STATES[lane]
+        states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves") + self.LANE_STATES[lane]
         self.assertEqual(self.steps(text), [
             "bootstrap", "store", "host", "corpus", "declare", "load-base",
             *(f"state:{s}" for s in states), "evaluate", "finish"])
@@ -3366,7 +3597,7 @@ class Box(Workdir):
         # with its reason, and the run still evaluates and finishes.
         code, text = run_sh("s3", self.example_toml(("max_minutes = 540", "max_minutes = 0")), self.path("out"))
         self.assertEqual(code, 0, text)
-        states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed") + self.LANE_STATES["s3"]
+        states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves") + self.LANE_STATES["s3"]
         lines = [x for x in text.splitlines() if x.startswith("NOT-RUN ")]
         self.assertEqual(lines, [f"NOT-RUN {s}: deadline: run.max_minutes 0 passed (0 minutes elapsed)"
                                  for s in states])
@@ -3413,7 +3644,8 @@ class Box(Workdir):
         # and under set -u the run ends there with status 1, so on_exit writes
         # FAILED and neither evaluate nor the upload runs.
         code, text = run_sh("s3", self.example_toml(
-            ("states = [\"unfolded\", \"folded_no_leaves\", \"folded_leaves\", \"mixed\", \"compaction_in_flight\",\n"
+            ("states = [\"unfolded\", \"folded_no_leaves\", \"folded_leaves\", \"mixed\", \"advanced_leaves\", "
+             "\"compaction_in_flight\",\n"
              "          \"erasure_in_flight\", \"many_parts_744\", \"many_parts_2160\"]",
              "states = [\"unfolded\", \"mixed\"]")), self.path("out"))
         self.assertEqual(code, 0, text)
@@ -3799,6 +4031,93 @@ class Box(Workdir):
                             "--out", self.path("out2")], capture_output=True, text=True)
         self.assertNotEqual(m.returncode, 0, m.stdout + m.stderr)
         self.assertIn("unbound variable", m.stderr)
+
+    def advance_stamps(self, name, kind="fold --key-index-leaves", exit_code=0, rebuilt=5, advanced=27,
+                       labels=("spans", "logs")):
+        """A stamps directory as the run leaves it before advanced_leaves's check: fold_advance's fold lines
+        for LABELS and the folded_leaves and advanced_leaves catalog stamps, logs request_id at REBUILT and
+        ADVANCED slices a part (box D's 5 and 27), trace_id at 1 and 6, spans trace_id at 1 and 3."""
+        d = self.path(name)
+        os.makedirs(d)
+        write_jsonl(os.path.join(d, "folds.jsonl"), [
+            {"transition": "leaf_rebuild", "signal": s, "kind": "rebuild-key-index", "exit": 0} for s in labels] + [
+            {"transition": "fold_advance", "signal": s, "kind": kind, "exit": exit_code} for s in labels])
+        for state, logs, trace, spans in (("folded_leaves", rebuilt, 1, 1), ("advanced_leaves", advanced, 6, 3)):
+            for label, fields in (("logs", {"request_id": logs, "trace_id": trace}), ("spans", {"trace_id": spans})):
+                leaves = [{"field": f, "key": f"{f}-{i}"} for f, n in fields.items() for i in range(n)]
+                with open(os.path.join(d, f"{state}.{label}.catalog.json"), "w") as f:
+                    json.dump({"parts": [{"index": 0, "leaves": leaves}]}, f)
+        return d
+
+    def advance_check(self, stamps, inv_py=os.path.join(BOX, "lib", "inv.py")):
+        p = subprocess.run([PY, inv_py, "advance-check", "--stamps", stamps], capture_output=True, text=True)
+        return p.returncode, p.stdout, p.stderr
+
+    def test_advance_check(self):
+        # Item 5: advanced_leaves's two preconditions. Box D's stamps pass and
+        # print the slices per (part, field) of both stamps.
+        code, out, err = self.advance_check(self.advance_stamps("ok"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["slices_per_part_field"], {
+            "folded_leaves": {"logs": {"request_id": 5, "trace_id": 1}, "spans": {"trace_id": 1}},
+            "advanced_leaves": {"logs": {"request_id": 27, "trace_id": 6}, "spans": {"trace_id": 3}}})
+        for name, kw, want in (
+                ("switch-off", dict(kind="fold"), "fold_advance on spans ran without --key-index-leaves"),
+                ("fold-failed", dict(exit_code=101), "fold_advance on spans exited 101"),
+                ("no-advance", dict(labels=()), "no fold_advance fold stamp for spans"),
+                ("no-new-slice", dict(advanced=5), "logs request_id has 5 slices per part in advanced_leaves "
+                                                   "against 5 after the leaf rebuild")):
+            code, _, err = self.advance_check(self.advance_stamps(name, **kw))
+            self.assertEqual(code, 1, name)
+            self.assertIn(want, err, name)
+
+    def test_advance_check_flips(self):
+        # The wrong checks the cases above rule out, each printed with the
+        # inv.py line it flips.
+        for old, new, stamps, label in (
+                ("    if not rebuilt or not advanced or advanced <= rebuilt:\n",
+                 "    if not rebuilt or not advanced or advanced < rebuilt:\n", dict(advanced=5),
+                 "equal slices read as an advance"),
+                ('        if "--key-index-leaves" not in str(line.get("kind") or "").split():\n',
+                 "        if False:\n", dict(kind="fold"), "a fold with the switch off passed")):
+            flipped, line = self.flipped_box(old, new, "lib/inv.py")
+            code, _, _ = self.advance_check(self.advance_stamps(f"flip-{line}", **stamps), flipped)
+            self.assertEqual(code, 0, label)
+            shutil.rmtree(self.path("inv-flipped"))
+            print(f"flip '{label}' at box/lib/inv.py:{line} fails test_advance_check", file=sys.stderr)
+
+    def test_advanced_leaves_runs_the_check_after_mixed(self):
+        # Item 5: the state folds nothing, stamps itself, checks, then sends
+        # its calls; fold_advance before it folds with the switch on.
+        code, text = run_sh("s3", os.path.join(BOX, "run.example.toml"), self.path("out"))
+        self.assertEqual(code, 0, text)
+        steps = self.steps(text)
+        self.assertEqual(steps[steps.index("state:mixed") + 1], "state:advanced_leaves")
+        b = self.blocks(text)
+        adv = "\n".join(b["state:advanced_leaves"])
+        self.assertNotIn("catalog fold", adv)
+        self.assertIn("STAMP stamps/advanced_leaves.server.json", adv)
+        self.assertIn("advance-check --stamps", adv)
+        self.assertLess(adv.index("inspect-stamp"), adv.index("advance-check"))
+        self.assertLess(adv.index("advance-check"), adv.index("plan --statements"))
+        mixed = [x for x in b["state:mixed"] if "catalog fold" in x]
+        self.assertTrue(mixed and all("--key-index-leaves" in x for x in mixed), mixed)
+        code, text = run_sh("local", os.path.join(BOX, "run.local-smoke.toml"), self.path("out-local"))
+        self.assertEqual(code, 0, text)
+        self.assertIn("state:advanced_leaves", self.steps(text))
+
+    def test_advanced_leaves_failed_check_fails_the_state(self):
+        # A failed advance-check is the state's STATE-FAILED, and the run
+        # goes on with the next state.
+        out = self.path("out-fail")
+        p = subprocess.run([BASH, os.path.join(BOX, "run.sh"), "--dry-run", "--lane", "s3", "--run-toml",
+                            os.path.join(BOX, "run.example.toml"), "--out", out], capture_output=True, text=True,
+                           env=dict(os.environ, INV_DRY_RUN_FAIL="advance-check"))
+        text = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, text)
+        self.assertIn("STATE-FAILED advanced_leaves: advance-check advanced_leaves exit 3", text)
+        steps = self.steps(text)
+        self.assertEqual(steps[steps.index("state:advanced_leaves") + 1], "state:compaction_in_flight")
 
     def flipped_box(self, old, new, script="run.sh"):
         """A copy of this directory whose box/SCRIPT has OLD (present once)

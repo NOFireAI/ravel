@@ -1274,9 +1274,78 @@ def cmd_kv_report(args):
     print(json.dumps(doc, sort_keys=True))
 
 
+def leaf_slices(doc):
+    """{field: the most leaves (key slices) one part of a catalog stamp
+    carries for that field}."""
+    out = {}
+    for part in doc.get("parts", []):
+        counts = {}
+        for leaf in part.get("leaves", []):
+            counts[leaf.get("field")] = counts.get(leaf.get("field"), 0) + 1
+        for field, n in counts.items():
+            out[field] = max(out.get(field, 0), n)
+    return out
+
+
+def cmd_advance_check(args):
+    """The advanced_leaves state's two preconditions (README "States"), read
+    from the stamps the run already wrote. (i) fold_advance folded every
+    label with the leaf switch on and exited 0: a fold with the switch off
+    re-encodes the parts and drops their leaf refs. (ii) The check label's
+    check field carries more slices per part in advanced_leaves's catalog
+    stamp than in folded_leaves's, the one stamped after the leaf rebuild, so
+    the state measures an advanced tail. Prints the slices per (part, field)
+    of both stamps as one JSON line; exit 0 when both hold, 1 naming the
+    first that does not."""
+    folds = {}
+    path = os.path.join(args.stamps, "folds.jsonl")
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.strip():
+                    d = json.loads(line)
+                    if d.get("transition") == "fold_advance":
+                        folds[d.get("signal")] = d
+    except (OSError, ValueError) as e:
+        die(f"advance-check: cannot read {path}: {e}")
+    for label in args.labels:
+        line = folds.get(label)
+        if line is None:
+            die(f"advance-check: no fold_advance fold stamp for {label}: the mixed state did not fold its tail")
+        if line.get("exit") != 0:
+            die(f"advance-check: fold_advance on {label} exited {line.get('exit')}")
+        if "--key-index-leaves" not in str(line.get("kind") or "").split():
+            die(f"advance-check: fold_advance on {label} ran without --key-index-leaves (kind "
+                f"{line.get('kind')!r}): a fold with the switch off drops the parts' leaf refs")
+    slices = {}
+    for state in ("folded_leaves", "advanced_leaves"):
+        slices[state] = {}
+        for label in args.labels:
+            name = os.path.join(args.stamps, f"{state}.{label}.catalog.json")
+            try:
+                with open(name) as f:
+                    slices[state][label] = leaf_slices(json.load(f))
+            except (OSError, ValueError) as e:
+                die(f"advance-check: cannot read {name}: {e}")
+    print(json.dumps({"slices_per_part_field": slices}, sort_keys=True))
+    rebuilt = slices["folded_leaves"].get(args.check_label, {}).get(args.check_field)
+    advanced = slices["advanced_leaves"].get(args.check_label, {}).get(args.check_field)
+    if not rebuilt or not advanced or advanced <= rebuilt:
+        die(f"advance-check: {args.check_label} {args.check_field} has {advanced} slices per part in "
+            f"advanced_leaves against {rebuilt} after the leaf rebuild: the advance added no slice, so the "
+            f"state would not measure an advanced tail")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd_name", required=True)
+
+    ac = sub.add_parser("advance-check")
+    ac.add_argument("--stamps", required=True)
+    ac.add_argument("--labels", nargs="+", default=["spans", "logs"])
+    ac.add_argument("--check-label", default="logs")
+    ac.add_argument("--check-field", default="request_id")
+    ac.set_defaults(fn=cmd_advance_check)
 
     st = sub.add_parser("stamp")
     st.add_argument("--file", required=True)

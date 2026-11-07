@@ -41,7 +41,10 @@
 #   truth_key_in  {state = key}: the truth key in those states instead, judged
 #              against truth.json even where the state's oracle is the
 #              unfolded answer
-#   states     the states the statement runs in
+#   states     the states the statement runs in. advanced_leaves (row 18)
+#              holds the base hours plus the mixed state's tail hour, and its
+#              statements keep the base truth key: the tail plants ids of its
+#              own and holds none of a base list's keys (README "States")
 #   cold_only  true: no warm repeat
 #   control    true: one of the 43 ClickBench statements of the
 #              nonselective control (ADR row 16)
@@ -138,7 +141,7 @@ kind = "sql"
 sql = "SELECT span_id FROM spans WHERE trace_id IN ({in_trace_ids_x_10})"
 window = "none"
 truth_key = "in_trace_id.10.spans"
-states = ["unfolded", "folded_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves"]
 cold_only = true
 
 [[statement]]
@@ -149,7 +152,7 @@ kind = "sql"
 sql = "SELECT span_id FROM spans WHERE trace_id IN ({in_trace_ids_x_100})"
 window = "none"
 truth_key = "in_trace_id.100.spans"
-states = ["unfolded", "folded_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves"]
 cold_only = true
 
 # Sent as written. Before ADR-3692's key set amendment ravel-sql's
@@ -212,7 +215,7 @@ kind = "sql"
 sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_10})"
 window = "none"
 truth_key = "in_trace_id.10.logs"
-states = ["unfolded", "folded_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves"]
 cold_only = true
 
 [[statement]]
@@ -223,7 +226,7 @@ kind = "sql"
 sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_100})"
 window = "none"
 truth_key = "in_trace_id.100.logs"
-states = ["unfolded", "folded_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves"]
 cold_only = true
 
 [[statement]]
@@ -333,7 +336,7 @@ sql = "SELECT request_id FROM logs WHERE request_id IN ({in_request_ids_10})"
 window = "wide"
 anchor = "cell"
 truth_key = "in_request_id.10"
-states = ["unfolded", "folded_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves"]
 cold_only = true
 
 [[statement]]
@@ -345,7 +348,7 @@ sql = "SELECT request_id FROM logs WHERE request_id IN ({in_request_ids_100})"
 window = "wide"
 anchor = "cell"
 truth_key = "in_request_id.100"
-states = ["unfolded", "folded_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves"]
 cold_only = true
 
 [[statement]]

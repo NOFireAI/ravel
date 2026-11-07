@@ -1,4 +1,4 @@
-# ADR-3692 Acceptance rows 1 to 17, transcribed from
+# ADR-3692 Acceptance rows 1 to 18, transcribed from
 # docs/adrs/3692-selective-investigations-logs-traces.md ("Acceptance
 # (pre-registered ...)"). The text of `check`, `target`, `miss` and `source`
 # is the ADR's own cells, verbatim; the target_if and miss_if expressions are
@@ -20,8 +20,11 @@
 #   metric      what evaluate.py extracts (README.md "Evaluation"):
 #                 <temp>.max|min.<name>       a statement's call counters
 #                 <temp>.rows_exact, <temp>.rows_match_state.<state>,
-#                 <temp>.wall_p50_s, <temp>.control_1025
+#                 <temp>.wall_p50_s, <temp>.wall_iqr_s,
+#                 <temp>.leaf_wall_p50_s, <temp>.control_1025
 #                 stamp.<what>.<label>        stamps/STATE.LABEL.*.json
+#                 stamp.slices.<label>.<field> the most leaves one part
+#                                             carries for the field
 #                 leaf_share.<label>.<field>  that field's leaf bytes over the
 #                                             label's census data bytes, in %
 #                 census.<tenant>.<signal>.objects|bytes|objects_over_512k
@@ -1673,3 +1676,197 @@ state = "all"
 metric = "cost.break_even_without_frequency"
 lane = "counter"
 target_if = "v == 0"
+
+[[row]]
+key = "row_18"
+adr_row = 18
+check = "key-set lookup time: `IN` lists of 10 and 100 keys on logs request_id, logs trace_id and spans trace_id, folded with leaves after one fold advance (`advanced_leaves`), against the same statement unfolded (row 18 amendment)"
+target = "p50 at most the unfolded p50 of the same statement on the same box plus its noise, the larger of 5 % of that p50 and half the unfolded statement's interquartile range over its cold calls, for every field and list size, with no covering part `Uncovered`"
+miss = "over that bound for any field and list size; a cell whose part went `Uncovered` is not measured, not a hold, since its time is the tier-1 probe's"
+source = "predicted; comment 6703881894; box C before #3917: logs request_id at 100 keys 7.64 s against 3.01 s (s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl)"
+requires_tenant = "inv"
+# One cell per (field, list size): the advanced_leaves p50 of the cold calls
+# (cold.leaf_wall_p50_s) against the bound U + max(0.05 x U, 0.5 x IQR), U
+# the unfolded p50 of the same statement and IQR the 75th less the 25th
+# percentile of its unfolded cold wall times, both on this run's box. A
+# cell any of whose cold calls left a covering part Uncovered (partsCovered
+# 0, or partsUncovered, skippedByBudget, partsBeyondCeiling, leavesRejected
+# or reservationsRefused above 0) is not-measured: not a hold, and the run's
+# verdict is at best incomplete. The row is not-run, with the reason, when
+# either state is absent.
+requires_states = ["advanced_leaves", "unfolded"]
+
+[[row.figure]]
+name = "logs_request_id_10_unfolded_p50_s"
+statement = "logs_request_in_10"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_10_unfolded_iqr_s"
+statement = "logs_request_in_10"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_10_p50_s"
+statement = "logs_request_in_10"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_request_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_request_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_request_id_100_unfolded_p50_s"
+statement = "logs_request_in_100"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_100_unfolded_iqr_s"
+statement = "logs_request_in_100"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_100_p50_s"
+statement = "logs_request_in_100"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_request_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_request_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_request_id_100_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_trace_id_10_unfolded_p50_s"
+statement = "logs_trace_in_10"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_10_unfolded_iqr_s"
+statement = "logs_trace_in_10"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_10_p50_s"
+statement = "logs_trace_in_10"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_trace_id_100_unfolded_p50_s"
+statement = "logs_trace_in_100"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_100_unfolded_iqr_s"
+statement = "logs_trace_in_100"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_100_p50_s"
+statement = "logs_trace_in_100"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.logs_trace_id_100_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "spans_trace_id_10_unfolded_p50_s"
+statement = "spans_in_10"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_10_unfolded_iqr_s"
+statement = "spans_in_10"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_10_p50_s"
+statement = "spans_in_10"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.spans_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.spans_trace_id_10_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_10_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "spans_trace_id_100_unfolded_p50_s"
+statement = "spans_in_100"
+state = "unfolded"
+metric = "cold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_100_unfolded_iqr_s"
+statement = "spans_in_100"
+state = "unfolded"
+metric = "cold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_100_p50_s"
+statement = "spans_in_100"
+state = "advanced_leaves"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['row_18.spans_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['row_18.spans_trace_id_100_unfolded_p50_s'] + max(0.05 * m['row_18.spans_trace_id_100_unfolded_p50_s'], 0.5 * m['row_18.spans_trace_id_100_unfolded_iqr_s'])"
+
+# The slices per (part, field) the lookups touched, reported beside the
+# row: the most leaves one part of the advanced_leaves catalog stamp
+# carries for each field. The state's own precondition (inv.py
+# advance-check) is that logs request_id carries more than the leaf
+# rebuild wrote, so the figure that compares them repeats it.
+[[row.figure]]
+name = "logs_request_id_slices_rebuild"
+statement = "stamp"
+state = "folded_leaves"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "logs_request_id_slices"
+statement = "stamp"
+state = "advanced_leaves"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v > m['row_18.logs_request_id_slices_rebuild']"
+
+[[row.figure]]
+name = "logs_trace_id_slices"
+statement = "stamp"
+state = "advanced_leaves"
+metric = "stamp.slices.logs.trace_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "spans_trace_id_slices"
+statement = "stamp"
+state = "advanced_leaves"
+metric = "stamp.slices.spans.trace_id"
+lane = "counter"
+target_if = "v >= 1"

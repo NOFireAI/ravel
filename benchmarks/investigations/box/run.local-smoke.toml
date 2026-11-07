@@ -8,7 +8,7 @@
 
 [run]
 lane = "local"
-states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
+states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves", "compaction_in_flight",
           "erasure_in_flight", "many_parts_24"]
 cold_runs = 2
 warm_runs = 1

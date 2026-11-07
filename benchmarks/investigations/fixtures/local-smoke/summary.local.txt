@@ -1,8 +1,9 @@
 selective investigations, lane local: fail
-not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 9 figures covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact (run.toml states lacks ['many_parts_744']); row 10 (run.toml states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml hits = false, baseline = false)
+not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 9 figures covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact (run.toml states lacks ['many_parts_744']); row 10 (run.toml states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml hits = false, baseline = false); row 18 (run.toml states lacks ['advanced_leaves'])
 refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29 figure(s), 0 call(s)
 
 states:
+  advanced_leaves          not-run  (not in run.toml states)
   compaction_done          run
   compaction_in_flight     run
   erasure_in_flight        run
@@ -188,6 +189,28 @@ row_16.added_requests                        not-run                      not-ru
 row_17.cost_figures_without_basis            value                     0  pass
 row_17.cost_statements                       value                    98  pass
 row_17.break_even_without_frequency          value                     0  pass
+row_18.logs_request_id_10_unfolded_p50_s     not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_request_id_10_unfolded_iqr_s     not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_request_id_10_p50_s              not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_request_id_100_unfolded_p50_s    not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_request_id_100_unfolded_iqr_s    not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_request_id_100_p50_s             not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_trace_id_10_unfolded_p50_s       not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_trace_id_10_unfolded_iqr_s       not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_trace_id_10_p50_s                not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_trace_id_100_unfolded_p50_s      not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_trace_id_100_unfolded_iqr_s      not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_trace_id_100_p50_s               not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.spans_trace_id_10_unfolded_p50_s      not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.spans_trace_id_10_unfolded_iqr_s      not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.spans_trace_id_10_p50_s               not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.spans_trace_id_100_unfolded_p50_s     not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.spans_trace_id_100_unfolded_iqr_s     not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.spans_trace_id_100_p50_s              not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_request_id_slices_rebuild        not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_request_id_slices                not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.logs_trace_id_slices                  not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
+row_18.spans_trace_id_slices                 not-run                      not-run  (states ['advanced_leaves'] not run: advanced_leaves: not in run.toml states)
 
 statement                       state                temp      p50_s     p95_s  gets  wire_B   cpu_s   $/call  warm_served
 failing_cell                    compaction_done      cold     0.0510495 0.05324685     6 2585131   0.085 2.185e-05  0

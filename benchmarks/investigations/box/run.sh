@@ -455,7 +455,7 @@ EOF
         [[ "${s#many_parts_}" =~ ^[1-9][0-9]*$ ]] || fail "run.toml state $s: N must be a positive integer"
         MP_SIZES="$MP_SIZES ${s#many_parts_}"
         TENANTS="$TENANTS mp${s#many_parts_}" ;;
-      unfolded | folded_no_leaves | folded_leaves | mixed | compaction_in_flight | erasure_in_flight) ;;
+      unfolded | folded_no_leaves | folded_leaves | mixed | advanced_leaves | compaction_in_flight | erasure_in_flight) ;;
       *) fail "run.toml run.states: unknown state $s" ;;
     esac
     estimate_s "$s" >/dev/null || fail "run.toml step_estimate_minutes.$s"
@@ -1201,6 +1201,23 @@ state_mixed() {
   return 0
 }
 
+# state_advanced_leaves: row 18's key-set lookups against the catalog
+# fold_advance left, so the leaves have been through one advance and carry
+# its extra slices. It folds nothing. It stamps the state, then fails
+# (STATE-FAILED) unless fold_advance folded every signal with
+# --key-index-leaves and the logs request_id leaves carry more slices per
+# part than the leaf rebuild wrote (inv.py advance-check).
+state_advanced_leaves() {
+  local log="$WORK/advance-check.out" code=0
+  stop_server
+  transition advanced_leaves "the catalog fold_advance left: leaves after one advance, no fold"
+  census advanced_leaves
+  run "$PY" "$LIB" advance-check --stamps "$STAMPS" --labels spans logs >"$log" 2>&1 || code=$?
+  [ "$code" = 0 ] || { failed_at "advance-check advanced_leaves" "$code" "$log"; return 1; }
+  statements advanced_leaves
+  return 0
+}
+
 # run_state STATE: one state. A state function returns 0 when it ran or was
 # recorded not-run, and 1 after failed_at named the command that stopped it,
 # which state_failed records before the run goes on with the next state.
@@ -1215,6 +1232,7 @@ run_state() {
     folded_no_leaves) state_folded_no_leaves ;;
     folded_leaves) state_folded_leaves ;;
     mixed) state_mixed ;;
+    advanced_leaves) state_advanced_leaves ;;
     compaction_in_flight) state_compaction ;;
     erasure_in_flight) state_erasure ;;
     many_parts_*) state_many_parts "${state#many_parts_}" ;;
