@@ -1473,7 +1473,8 @@ fewer objects, which makes the bar harder for the leaves, not easier.
 
 The row is predicted to hold only after #3917 lands, which reads a key
 set's leaf bucket runs concurrently. On the build Stage 1 measured, logs
-request_id at 100 keys misses it. The switch does not turn on for a signal
-while this row misses for that signal.
+request_id at 100 keys took 7.64 s on the leaf rebuild's 5 slices, already
+over its bound before any advance added slices. The switch does not turn
+on for a signal while this row misses for that signal.
 
 Refs: #3918, #3692

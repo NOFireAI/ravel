@@ -44,7 +44,8 @@
 #   states     the states the statement runs in. advanced_leaves (row 18)
 #              holds the base hours plus the mixed state's tail hour, and its
 #              statements keep the base truth key: the tail plants ids of its
-#              own and holds none of a base list's keys (README "States")
+#              own and holds a base list's key only through an id collision,
+#              which would read as a wrong answer (README "States")
 #   cold_only  true: no warm repeat
 #   control    true: one of the 43 ClickBench statements of the
 #              nonselective control (ADR row 16)
@@ -179,7 +180,8 @@ expect_refusal_on_main = true
 
 # Row 11's control: one key over decision 6's k = 1,024. box/lib/inv.py
 # merge-truth builds it from the 1,000-key list, the generator's
-# control_extra key and ids the corpus cannot hold (README "Row 11"). The
+# control_extra key and ids the corpus does not hold (README "Evaluation",
+# row 11). The
 # guard admits it at 25 units, the planner carries no key set past 1,024, so
 # it is answered by a scan with keysProbed 0 and no leaf GET.
 [[statement]]

@@ -603,8 +603,10 @@ Some bands, as transcribed:
   generator's `control_extra` key (one the list does not hold) and ids the
   corpus does not hold up to 1,025 (`truth.json` `over_cap`): request ids
   `req-over-cap-absent-NNNN`, which the generator's `req-<16 hex>-<row>`
-  and `req-planted-*` forms never produce, and the trace ids 1 to 25 as
-  128-bit integers, which a random 128-bit draw lands on with negligible
+  and `req-planted-*` forms never produce, and the trace ids 1, 2, 3 and on
+  as 128-bit integers, as many as the list needs (24 beside a
+  `control_extra` key, 25 when the 1,000-key list already names every
+  trace), which a random 128-bit draw lands on with negligible
   odds and which, if one did, would add rows and read as a wrong answer,
   not a pass. The padding adds no row, so the oracle (`in_trace_id.1025.*`,
   `in_request_id.1025`) is the generator's answer for the 1,000-key list
@@ -685,9 +687,10 @@ unchanged.
   before ADR-3692's key set amendment refuses them with HTTP 400 and
   `statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the
   statement`, and `fixtures/local-smoke` is a run of such a build. That run
-  sent the harness's earlier 1,001-key controls; its six control call groups
-  were renamed to the `_1025` statement ids and truth keys when the control
-  moved, and nothing else in them changed: the guard refused them before
+  sent the harness's earlier 1,001-key controls; its six control call
+  groups were renamed to the `_1025` statement ids and truth keys when the
+  control moved, and their `restarts.jsonl` stamps to the same statement
+  ids, and nothing else in them changed: the guard refused them before
   their length mattered, with the same text it gives every list past its
   cap (below). These
   statements carry `expect_refusal_on_main = true`, and evaluate.py records
@@ -851,10 +854,15 @@ stamp, absent phases, CPU and leaf sizes, dead counters, full, partial, zero
 and too-short compaction overlap, a refusal outside the cap probes, the
 1,025-key control's pass, miss, refused and unsupported readings, a skipped state
 and a mid-state deadline, the unsealed tail, the pending-erasure victim, a
-state absent from the results, row 3's per-object denominator, row 15's
-budget from `truth.json`, exact cost and maintenance dollars), the wrong
+state absent from the results, row 3's per-object denominator, row 6's
+objects past the probe on box C's stats, row 7 per pass on box D's figures
+and on a one-pass rebuild, row 15's budget from `truth.json`, row 18's
+hold, box C miss, noise edges, `Uncovered` cell and absent state, a typed
+refusal counted as an error, exact cost and maintenance dollars), the wrong
 evaluators each of those cases must reject (each printed with the
-evaluate.py line it flips), a failed state (its figures `not-run` with
+evaluate.py line it flips) and the wrong bands (each printed with the
+bands.toml line it flips), `inv.py advance-check` on box D's slice counts
+and on each precondition failing, a failed state (its figures `not-run` with
 `state failed at <step> (exit N)`, never pass or missing), the even-hours
 corpus and the strided-load check over it at 744 hours, and the dry runs of
 `run.sh` (local, s3, s3 with hits, past the deadline, a failed state that
