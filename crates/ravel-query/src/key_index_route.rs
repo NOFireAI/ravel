@@ -265,7 +265,8 @@ pub struct RouteInput<'a> {
 #[derive(Debug, thiserror::Error)]
 pub enum RouteError {
     /// A leaf under this tenant's prefix names another tenant or signal.
-    /// The statement fails; the catalog's breach counter has moved.
+    /// The statement fails, and the catalog's breach counter has moved by
+    /// one for it: every breach the route counts fails its statement.
     #[error("key-index leaf {leaf_key}: {source}")]
     Isolation {
         leaf_key: String,
@@ -670,9 +671,10 @@ enum SliceStart {
 
 /// What decides a part at the first slice that does not go on to phase 3,
 /// unless an earlier slice's run decides it first.
-enum SliceStop {
+enum SliceStop<'p> {
     Outcome(PartOutcome),
-    Breach(RouteError),
+    /// Logged only if it decides the part.
+    Rejected(&'p SnapshotKeyIndexLeafRef, KeyIndexLeafRejection),
 }
 
 fn leaf_rejected(leaf_ref: &SnapshotKeyIndexLeafRef, rejection: &KeyIndexLeafRejection) {
@@ -718,27 +720,36 @@ fn merge_answer(answer: &mut PartAnswer, slice: KeyIndexSetAnswer) -> Result<(),
 ///
 /// 1. GET 1 of every slice, at most [`LEAF_READ_CONCURRENCY`] in flight, and
 ///    each slice's plan from it.
-/// 2. No reads: the slices in order, each plan's bridged bytes charged
-///    against the part's allowance. The stopping slice is the first that
-///    did not plan (a breach, a refused read, or a rejection) or whose
-///    bridged bytes exceed what the earlier slices left. Every breach GET 1
-///    showed is counted by [`Catalog::key_index_leaf_breach`] and logged,
-///    whichever slice stops.
+/// 2. No reads: if GET 1 of any slice showed a breach, the first breaching
+///    slice in slice order is counted once by
+///    [`Catalog::key_index_leaf_breach`] and the part fails the statement
+///    with [`RouteError::Isolation`]; phase 3 does not start. Otherwise the
+///    slices in order, each plan's bridged bytes charged against the part's
+///    allowance. The stopping slice is the first that did not plan (a
+///    refused read or a rejection) or whose bridged bytes exceed what the
+///    earlier slices left.
 /// 3. The bucket runs of the slices before the stopping one, at most
 ///    [`LEAF_READ_CONCURRENCY`] in flight across the part, decoded in body
 ///    order.
 ///
-/// The outcome is the one probing the slices one after another gives: the
-/// first slice in slice order whose run fails to read or decode, or whose
-/// decode reservation is refused, decides; failing that, the stopping slice
-/// does (a breach fails the statement, a refused read is a refused
-/// reservation, a rejection rejects, an exceeded allowance declines the
-/// part over budget); failing that, the part answers.
+/// Without a breach, the outcome is the one probing the slices one after
+/// another gives: the first slice in slice order whose run fails to read or
+/// decode, or whose decode reservation is refused, decides; failing that,
+/// the stopping slice does (a refused read is a refused reservation, a
+/// rejection rejects, an exceeded allowance declines the part over budget);
+/// failing that, the part answers.
+///
+/// A breach is the one departure from that order. Phase 1 reads GET 1 of
+/// slices the serial probe would never have reached (those past a failing
+/// run or past the stopping slice), and ADR-0050 section 2 makes a
+/// tenant_hash mismatch fail the query wherever it is seen, so a breach
+/// fails the statement even where an earlier slice's run or an earlier
+/// stopping slice would have decided the part.
 ///
 /// The bytes read, and so the GET count, wire bytes and decompressed bytes,
 /// are those of probing the slices one after another whenever the part
-/// answers. A part the stopping slice decides has also read GET 1 of the
-/// slices after it. A part decided in phase 3 has also read GET 1 of the
+/// answers. A part the stopping slice decides, or a breach fails, has also
+/// read GET 1 of the slices after it. A part decided in phase 3 has also read GET 1 of the
 /// slices after the failing one and may have issued up to
 /// `LEAF_READ_CONCURRENCY - 1` runs past the failing run. All of those
 /// reads are counted. [`PartPlan::worst_gets`] still bounds the count:
@@ -820,12 +831,10 @@ async fn probe_part(
                     error = %source,
                     "key-index leaf binds another tenant or signal"
                 );
-                if stop.is_none() {
-                    stop = Some(SliceStop::Breach(RouteError::Isolation {
-                        leaf_key: leaf_ref.key.clone(),
-                        source,
-                    }));
-                }
+                return Err(RouteError::Isolation {
+                    leaf_key: leaf_ref.key.clone(),
+                    source,
+                });
             }
             _ if stop.is_some() => {}
             SliceStart::Planned(set_plan, prefix) => {
@@ -841,8 +850,7 @@ async fn probe_part(
                 stop = Some(SliceStop::Outcome(PartOutcome::ReservationRefused));
             }
             SliceStart::Rejected(rejection) => {
-                leaf_rejected(leaf_ref, &rejection);
-                stop = Some(SliceStop::Outcome(PartOutcome::Rejected));
+                stop = Some(SliceStop::Rejected(leaf_ref, rejection));
             }
         }
     }
@@ -933,9 +941,12 @@ async fn probe_part(
         }
     }
     let outcome = match (failure, stop) {
-        (Some(outcome), _) => Ok(outcome),
-        (None, Some(SliceStop::Outcome(outcome))) => Ok(outcome),
-        (None, Some(SliceStop::Breach(breach))) => Err(breach),
+        (Some(outcome), _) => outcome,
+        (None, Some(SliceStop::Outcome(outcome))) => outcome,
+        (None, Some(SliceStop::Rejected(leaf_ref, rejection))) => {
+            leaf_rejected(leaf_ref, &rejection);
+            PartOutcome::Rejected
+        }
         (None, None) => {
             // Slices whose keys all fell in empty buckets have no runs.
             let mut finished = Ok(());
@@ -947,10 +958,10 @@ async fn probe_part(
                     }
                 }
             }
-            Ok(match finished {
+            match finished {
                 Ok(()) => PartOutcome::Answered(answer),
                 Err(outcome) => outcome,
-            })
+            }
         }
     };
     decompressed += decoders
@@ -960,7 +971,7 @@ async fn probe_part(
         .sum::<u64>();
     leaf_accounting.add_decompressed_bytes(decompressed);
     drop(prefixes);
-    outcome.map(|outcome| (gets.load(Ordering::Relaxed), outcome))
+    Ok((gets.load(Ordering::Relaxed), outcome))
 }
 
 #[cfg(test)]

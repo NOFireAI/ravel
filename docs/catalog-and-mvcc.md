@@ -1113,19 +1113,24 @@ pay. The allowance is the part's, shared by every slice the set touches
 in slice order. Otherwise the part is uncovered for the statement and no
 bucket run of the slice that exceeded it, or of any later slice, is read.
 A part's leaf reads run concurrently in three phases: GET 1 of every
-touched slice; then, with no reads, the allowance charged slice by slice,
-stopping at the first slice that did not plan (a failed or refused GET 1,
-a rejected prefix, a tenant or signal breach) or whose bridged bytes
-exceed what the earlier slices left; then the bucket runs of the slices
-before the stopping one. Each read phase holds at most
+touched slice; then, with no reads, a check for a tenant or signal breach
+and the allowance charged slice by slice, stopping at the first slice that
+did not plan (a failed or refused GET 1, a rejected prefix) or whose
+bridged bytes exceed what the earlier slices left; then the bucket runs of
+the slices before the stopping one. If any slice's GET 1 shows a breach,
+the first breaching slice in slice order is counted once in the catalog's
+isolation-breach counter and logged, the statement fails, and no bucket
+run of the part is read. This is the one departure from a one-at-a-time
+probe, which would never read the GET 1 of a slice past a failing run or
+past the stopping slice: ADR-0050 section 2 fails the query on a
+tenant_hash mismatch wherever it is seen, so every breach counted fails
+its statement. Otherwise each read phase holds at most
 `LEAF_READ_CONCURRENCY` (16) reads in flight and takes their results in
 slice and body order, so the part's outcome is the one a one-at-a-time
 probe gives, whatever order the reads complete in: the first slice in
 slice order whose run fails to read or decode, or whose decode
-reservation is refused, decides; failing that, the stopping slice decides
-(a breach fails the statement); failing that, the part answers. Every
-breach a GET 1 shows is counted in the catalog's isolation-breach counter
-and logged, whichever slice decides. With 16 parts probed at once, one
+reservation is refused, decides; failing that, the stopping slice
+decides; failing that, the part answers. With 16 parts probed at once, one
 statement holds at most 256 leaf reads in flight. The logs and spans
 fetchers' leaf readers take each read under the fetch reservation and the
 GET limiter, and a slice's GET 1 bytes, with their reservation, are held
@@ -1135,8 +1140,8 @@ part asking at once, some parts' leaf reads are refused and those parts
 go to tier 1: the logs fetcher counts them as refused reservations, the
 spans fetcher as rejected leaves. The rows the lookup returns are the
 same either way. A part that answers reads exactly the bytes a
-one-at-a-time probe would. A part the stopping slice decides has also
-read GET 1 of every slice after it. A part a run decides has also read
+one-at-a-time probe would. A part the stopping slice decides, or a breach
+fails, has also read GET 1 of every slice after it. A part a run decides has also read
 GET 1 of the slices after the failing one, and may have issued up to 15
 (`LEAF_READ_CONCURRENCY - 1`) runs past the failing run. All of these
 reads are counted. Before a frame is
