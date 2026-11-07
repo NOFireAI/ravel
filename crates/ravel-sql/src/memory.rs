@@ -171,9 +171,12 @@ enum GrowRefused {
     /// `tenant_held` is the tenant total read BEFORE that rollback, so the
     /// message reports what this tenant held when it was refused rather than
     /// what it holds after the refused reservation was returned.
+    /// `sql_reserved` is the budget's [`MemoryBudget::sql_reserved`], read
+    /// immediately after the refusal.
     Process {
         exhausted: MemoryExhausted,
         tenant_held: usize,
+        sql_reserved: u64,
     },
 }
 
@@ -272,6 +275,7 @@ impl TenantMemoryAccountant {
         self.tenant_try_grow(additional)
             .map_err(|used| GrowRefused::Tenant { used })?;
         if let Err(exhausted) = self.budget.try_reserve(additional as u64) {
+            let sql_reserved = self.budget.sql_reserved();
             // Read the tenant total BEFORE the rollback: the refusal message
             // reports how much this tenant held when it was refused, and after
             // the rollback that figure excludes the very reservation being
@@ -281,6 +285,7 @@ impl TenantMemoryAccountant {
             return Err(GrowRefused::Process {
                 exhausted,
                 tenant_held,
+                sql_reserved,
             });
         }
         self.process_outstanding
@@ -992,6 +997,9 @@ struct EnvelopeRefused {
     /// The refused pool's envelope bytes on the budget when it refused,
     /// read under the same ledger lock as the refusal.
     pool_on_budget: u64,
+    /// The budget's [`MemoryBudget::sql_reserved`], read immediately after
+    /// the refusal under the same lock.
+    sql_reserved: u64,
 }
 
 /// Set the envelope of consumer `key` on `budget` to `envelope` bytes (zero
@@ -1023,6 +1031,7 @@ fn set_process_envelope(
         let delta = next - group.on_budget;
         if check == EnvelopeCheck::Checked {
             if let Err(exhausted) = group.budget.try_reserve(delta) {
+                let sql_reserved = group.budget.sql_reserved();
                 match previous {
                     Some(previous) => group.envelopes.insert(key, previous),
                     None => group.envelopes.remove(&key),
@@ -1035,6 +1044,7 @@ fn set_process_envelope(
                     delta,
                     exhausted,
                     pool_on_budget,
+                    sql_reserved,
                 });
             }
         } else {
@@ -1230,11 +1240,16 @@ pub(crate) struct RefusalRecord {
     pub(crate) share: Option<BudgetShare>,
 }
 
-/// A shared budget's reserved bytes at a refusal, and how many of them were
-/// the refused pool's own.
+/// SQL execution's reserved bytes on a shared budget at a refusal, and how
+/// many of them were the refused pool's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BudgetShare {
-    /// The budget's reserved bytes, before the refused grow.
+    /// SQL execution's reservations on the budget, before the refused grow.
+    /// On the tenant budget that is everything it holds. On the process
+    /// budget it is [`MemoryBudget::sql_reserved`]: the fetch layer's buffers
+    /// and the caches that reserve through it are left out, because spilling
+    /// frees only SQL memory, and memory a cache or a fetch buffer holds says
+    /// nothing about another statement contending for the budget.
     pub(crate) budget_reserved: u64,
     /// The refused pool's bytes on that budget, before the refused grow: its
     /// charged bytes, plus, on the process budget, those of its aggregate
@@ -1246,8 +1261,22 @@ pub(crate) struct BudgetShare {
     ///
     /// On a reserve-ahead refusal the envelopes are read under the lock the
     /// refusal ran under. On a process budget refusal of a charge the budget
-    /// refused without that lock, so they are read just after it.
+    /// refused without that lock, so they are read just after it. On the
+    /// process budget it is at most `budget_reserved`.
     pub(crate) own: u64,
+}
+
+impl BudgetShare {
+    /// The share of a process budget refusal: `own` against `sql_reserved`,
+    /// with `own` capped at `sql_reserved`, since the two are read apart and
+    /// a stale read can put `own` above it. A pool whose own bytes reach the
+    /// whole SQL share holds all of it.
+    pub(crate) fn of_sql_share(sql_reserved: u64, own: u64) -> Self {
+        BudgetShare {
+            budget_reserved: sql_reserved,
+            own: own.min(sql_reserved),
+        }
+    }
 }
 
 /// What a pool has charged on behalf of one consumer.
@@ -1912,10 +1941,12 @@ impl TenantDelegatingPool {
             }
             let kind =
                 MemoryRefusal::of_cause(&refused.exhausted.cause, MemoryRefusal::ReserveAhead);
-            let share = (kind == MemoryRefusal::ReserveAhead).then(|| BudgetShare {
-                budget_reserved: refused.exhausted.reserved,
-                own: (self.query_used.load(Ordering::Acquire) as u64)
-                    .saturating_add(refused.pool_on_budget),
+            let share = (kind == MemoryRefusal::ReserveAhead).then(|| {
+                BudgetShare::of_sql_share(
+                    refused.sql_reserved,
+                    (self.query_used.load(Ordering::Acquire) as u64)
+                        .saturating_add(refused.pool_on_budget),
+                )
             });
             return Err(DataFusionError::ResourcesExhausted(format!(
                 "aggregate reserve-ahead refused: the process aggregate envelope needs \
@@ -2153,16 +2184,22 @@ impl TenantDelegatingPool {
                         own: charged,
                     }),
                 ),
-                GrowRefused::Process { exhausted, .. } => {
+                GrowRefused::Process {
+                    exhausted,
+                    sql_reserved,
+                    ..
+                } => {
                     let kind = MemoryRefusal::of_cause(&exhausted.cause, MemoryRefusal::Process);
                     // The budget refused without the envelope ledger's lock,
                     // so the envelopes are read just after the refusal.
-                    let share = (kind == MemoryRefusal::Process).then(|| BudgetShare {
-                        budget_reserved: exhausted.reserved,
-                        own: charged.saturating_add(pool_envelope_on_budget(
-                            &self.tenant.budget,
-                            self.pool_id,
-                        )),
+                    let share = (kind == MemoryRefusal::Process).then(|| {
+                        BudgetShare::of_sql_share(
+                            *sql_reserved,
+                            charged.saturating_add(pool_envelope_on_budget(
+                                &self.tenant.budget,
+                                self.pool_id,
+                            )),
+                        )
                     });
                     (kind, share)
                 }
@@ -2180,6 +2217,7 @@ impl TenantDelegatingPool {
                 GrowRefused::Process {
                     exhausted,
                     tenant_held,
+                    ..
                 } => match exhausted.cause {
                     ExhaustionCause::Accounted => format!(
                         "process memory budget exhausted: {additional} more bytes on top of {} \
