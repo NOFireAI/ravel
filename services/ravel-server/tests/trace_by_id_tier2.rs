@@ -1360,8 +1360,8 @@ async fn scrape(app: &Router) -> String {
     String::from_utf8(bytes.to_vec()).expect("utf8 metrics")
 }
 
-const PARTS_HELP: &str = "# HELP ravel_query_key_index_parts_total Catalog parts the key-index router settled for an exact-key lookup, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object KEY_IDX probe.";
-const LEAF_GETS_HELP: &str = "# HELP ravel_query_key_index_leaf_gets_total Key-index leaf GETs the router issued for exact-key lookups, by signal, including those of a routing pass dropped before it finished.";
+const PARTS_HELP: &str = "# HELP ravel_query_key_index_parts_total Catalog parts the key-index router settled for an exact-key lookup or a PromQL equality value, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object probe.";
+const LEAF_GETS_HELP: &str = "# HELP ravel_query_key_index_leaf_gets_total Key-index leaf GETs the router issued for exact-key lookups and PromQL equality values, by signal, including those of a routing pass dropped before it finished.";
 
 /// The lines of `scrape` equal to `line`.
 fn count_lines(scrape: &str, line: &str) -> usize {
@@ -1433,16 +1433,17 @@ async fn the_metrics_page_renders_both_key_index_route_families_after_a_lookup()
         .lines()
         .filter(|l| l.starts_with("ravel_query_key_index_parts_total{"))
         .count();
-    assert_eq!(parts_samples, 2 * KeyIndexPartOutcome::ALL.len(), "{page}");
+    assert_eq!(parts_samples, 3 * KeyIndexPartOutcome::ALL.len(), "{page}");
     let leaf_samples = page
         .lines()
         .filter(|l| l.starts_with("ravel_query_key_index_leaf_gets_total{"))
         .count();
-    assert_eq!(leaf_samples, 2, "{page}");
-    for signal in [Signal::Spans, Signal::Logs] {
+    assert_eq!(leaf_samples, 3, "{page}");
+    for signal in [Signal::Spans, Signal::Logs, Signal::Metrics] {
         let name = match signal {
             Signal::Spans => "spans",
-            _ => "logs",
+            Signal::Logs => "logs",
+            _ => "metrics",
         };
         for outcome in KeyIndexPartOutcome::ALL {
             let got = sample(

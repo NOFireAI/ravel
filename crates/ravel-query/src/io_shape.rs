@@ -377,7 +377,8 @@ pub fn service_batches(item_count: u64, concurrency: u64) -> u32 {
     item_count.div_ceil(concurrency).min(u64::from(u32::MAX)) as u32
 }
 
-/// A LOWER bound on the serial service rounds a nested plan/segment fan-out
+/// For a query the label-value route does not prune: a LOWER bound on the
+/// serial service rounds a nested plan/segment fan-out
 /// needs, computed per wave of the OUTER `buffer_unordered(fanout)` over
 /// `distinct_plans` distinct matcher plans rather than once over the total
 /// work -- see the module docs' `service_batches` entry for why a single

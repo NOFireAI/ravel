@@ -277,7 +277,8 @@ ADR-2707 and ADR-3692 already impose on logs and spans leaves.
   does (docs/catalog-and-mvcc.md "Binding and coverage"). A value string is
   a subject value, so the leaf falls under ADR-2707 decision 6's erasure
   rule as `.cstat` and the logs `.kidx` do: while the tenant's `del/`
-  listing is non-empty the router prunes nothing on metrics, an erasure
+  listing is non-empty the router prunes nothing on metrics (read: while
+  an erasure request is pending, see the erasure rule correction below), an erasure
   rewrite supersedes the inputs, the next fold re-encodes the part and
   writes a new leaf, and the stale leaf is swept as unreferenced.
 - **L1 parts** are indexed like L0 entries; a compaction record re-encodes
@@ -288,7 +289,8 @@ ADR-2707 and ADR-3692 already impose on logs and spans leaves.
 
 `prefetch_metric_plans` (`engine.rs:1914-1950`) calls the one tier-2 router
 ADR-3692 decision 2 adds (`crates/ravel-query/src/key_index_route.rs`)
-with a `KeySet` of the statement's positive equality values, field
+with a `KeySet` of the statement's positive equality values (one
+one-key `KeySet` per value, see the per-value routing amendment below), field
 `label_value`, over the pinned snapshot's covering parts and their field 8
 refs (ADR-3692 decision 1's `SnapshotParts`). Per part the router's
 answer maps to: every entry of the part dropped (`Pruned`), or the part's
@@ -305,7 +307,10 @@ matcher.
 
 - A compound query with several selectors routes each selector once over
   the padded union window the prefetch already resolves, and takes the
-  union of survivors, so no selector loses an object another needs.
+  union of survivors, so no selector loses an object another needs (no
+  longer so, see the per-value routing amendment below: each plan fetches
+  only its own survivors, which include every segment holding a series it
+  matches).
 - `segmentsPrunedByLabelIndex` and the `keyIndex` phase figures land in
   `data.stats` beside `segmentsPruned`; both new counters are zero when
   the switch is off, so an unchanged tree reports an unchanged shape.
@@ -644,3 +649,70 @@ reservation is at most its count.
   the unbatched call's plus (page sections - 1) x the coalesce gap per
   batch. The owner accepted the restatement per whole-series batch on
   2026-11-07, then both corrected bounds the same day.
+
+## Amendment (issue #3865): each positive equality value is routed on its own
+
+<!-- amendment-applies: sections="3. The PromQL resolve routes through the leaves before any object is opened" pointer="per-value routing amendment" -->
+<!-- amendment-supersedes: phrase="a `KeySet` of the statement's positive equality values" pointer="per-value routing amendment" -->
+<!-- amendment-supersedes: phrase="union of survivors" pointer="per-value routing amendment" -->
+
+Decision 3 routes a `KeySet` of the statement's positive equality values.
+The router prunes a part for a multi-key set only when every key of the set
+is absent from it. A selector's equality matchers are a conjunction, so an
+object can be dropped as soon as any one of its values is absent, and under
+one multi-key set a metric name present in most objects would keep those
+objects whatever the selector's other values say: the route would prune
+almost nothing. One one-key `KeySet` per value, and a conjunction across
+values, replace the one set:
+
+- Each distinct positive equality value `v` of the statement (a `k="v"`
+  matcher with a non-empty `v`, `__name__` included) is routed once, as its
+  own one-key `KeySet`: field `label_value`, key type `Str`, `key8(v)`.
+  Negative, regex and empty-value matchers route nothing.
+- A selector plan (a distinct matcher set) drops a segment when any of its
+  own values routes it `Pruned`; `Blocks` and `Uncovered` keep it. A plan
+  with no positive equality value is not routed and reads every segment.
+  Each plan fetches only the segments it keeps, which include every
+  segment holding a series it matches; no plan reads the union of the
+  plans' survivors.
+- `segmentsPrunedByLabelIndex` counts the segments no plan reads.
+- Nothing is routed while the pinned snapshot carries a pending erasure
+  (decision 2's erasure rule): no prune and no leaf GET.
+- Nothing is routed when no part a snapshot segment comes from carries a
+  `label_value` leaf ref (a tenant folded with `metrics_label_index` off):
+  no leaf GET, and no part is counted in
+  `ravel_query_key_index_parts_total`.
+
+Leaf GETs scale with the number of distinct values: each is one routing
+pass under the router's `L_max`, `P_max` and `B_run` admission, so a
+statement with `n` distinct values can issue up to `n` passes' leaf GETs.
+Acceptance row 3's band, at most 2 x covering parts, reads as one pass's
+budget; a statement with `n` values can need up to `n` times it. The Stage 1
+run (T8) measures row 3's statement against the band and records its
+distinct value count beside the figure.
+
+The passes run at most `promql_fetch_fanout` at a time, the width the
+per-plan fetch passes run at. Their leaf GETs count against
+`max_s3_requests` and `max_bytes_scanned`: when the route issued a leaf
+GET, both budgets are checked once it returns, before the first segment
+fetch, so a query the route leaves past either budget refuses with the
+budget error a fetch batch returns, also when every segment was pruned and
+no fetch batch runs. A route that issued no leaf GET adds no check, and the
+fetch batches' own checks apply as before.
+The check runs after every pass has returned, not between passes, so a
+query under a lowered `max_s3_requests` can issue up to `n` passes' leaf
+GETs before it refuses, where the fetch path stops before its next batch.
+
+## Correction (issue #3865): the erasure rule reads pending requests
+
+<!-- amendment-applies: sections="2. The fold builds a label-value index for metrics parts, in the `.kidx` leaf" pointer="erasure rule correction" -->
+<!-- amendment-supersedes: phrase="listing is non-empty the router prunes nothing" pointer="erasure rule correction" -->
+
+Decision 2 says the router prunes nothing on metrics while the tenant's
+`del/` listing is non-empty. `del/` also keeps the `.done` completion
+record of every finished erasure, so read literally the rule would stop
+routing for good after a tenant's first erasure. The rule is: the router
+prunes nothing on metrics while an erasure request is pending, that is
+while a `.dreq` request is listed under `del/`; `.done` records do not
+count. The PromQL resolve reads this from the pinned snapshot's pending
+erasures, the `.dreq` requests that resolve decoded.

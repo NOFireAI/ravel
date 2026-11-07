@@ -1252,7 +1252,9 @@ impl Envelope {
 /// computed from a real resolved snapshot, never assumed), the three
 /// dictionary-first probe fields `segmentsPrunedByDictionary`,
 /// `segmentsProbedTwoStep` and `dictionaryProbeSwitchedOff` (this endpoint
-/// reads whole objects and never runs the sparse catalog probe), and three
+/// reads whole objects and never runs the sparse catalog probe),
+/// `segmentsPrunedByLabelIndex` (this endpoint never runs the label-value
+/// route), and three
 /// accounting counters this path can never move, each of which would be a
 /// permanently-zero field, which `ravel-query`'s own accounting JSON
 /// explicitly refuses to carry: the `rawF64Pages`/`rawF64Bytes` page
