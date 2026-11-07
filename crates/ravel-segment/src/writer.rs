@@ -4494,6 +4494,49 @@ mod page_codec_selection_v7 {
         );
     }
 
+    // --- fixed special-value rows (issue #3866 deliverable 4) -----------
+
+    /// A spread of bit-significant floats the production write path must
+    /// preserve exactly: two distinct NaN payloads, the PromQL stale marker
+    /// (`0x7ff0000000000002`, not pinned anywhere else in this module), both
+    /// signed zeros, both infinities, and a subnormal.
+    fn hard_values() -> Vec<f64> {
+        vec![
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001), // a distinct quiet NaN payload
+            f64::from_bits(0x7ff0_0000_0000_0002), // PromQL stale marker bit pattern
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits(1), // smallest positive subnormal
+            f64::MIN_POSITIVE,
+            1.0,
+            -1.0,
+            42.0,
+        ]
+    }
+
+    #[test]
+    fn hard_values_round_trip_through_production_selection() {
+        // Exercised through the real write path (frame_run -> encode_run_v4 ->
+        // frame_val_page's codec selection) and the real read path
+        // (decode_run), not a bare codec call. This frames one 12-value page,
+        // so it checks only the single VAL encoding selection picks for it
+        // (named in the failure message), not every codec selection can reach.
+        let vals = hard_values();
+        let ts = regular_ms(vals.len());
+        let run = frame_run(&ts, &vals);
+        let (dts, dvals, _kind) = decode_run(&run);
+        assert_eq!(dts, ts, "timestamps round-trip");
+        assert_eq!(
+            dvals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "hard values must round-trip bit-exactly through enc {}",
+            val_enc(&run)
+        );
+    }
+
     // --- the never-larger invariant, over arbitrary input ---------------
 
     proptest! {
