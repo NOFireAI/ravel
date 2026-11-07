@@ -701,7 +701,7 @@ pub(crate) mod view_registry {
     /// (pointer and length), the same values (pointer and length), and no
     /// null buffer on either side. Two live non-empty allocations cannot
     /// share an address, so equal offsets are the memo's own offsets.
-    fn memo_of(values: &StringArray) -> Option<Arc<StrMemo>> {
+    pub(super) fn memo_of(values: &StringArray) -> Option<Arc<StrMemo>> {
         let memo = registry().get(&address(values))?.upgrade()?;
         let array = memo.array.as_ref()?;
         let same = array.offsets().inner().as_ptr() == values.offsets().inner().as_ptr()
@@ -7359,13 +7359,24 @@ mod tests {
             fn an_entry_whose_views_a_batch_holds_is_held_with_the_real_memo() {
                 let budget = Arc::new(MemoryBudget::new(LIMIT));
                 let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                let memo = {
+                    let values = values_of(&p.batches[0]);
+                    view_registry::memo_of(&values).expect("registered")
+                };
                 let views = group_key(&p.batches[0], true);
                 drop(p);
+                assert!(memo.held_outside(), "a views clone holds the memo");
                 cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
                 assert_eq!(cache.len(), 1, "the key column's entry is held");
                 assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
                 assert_eq!(cache.view_counters().releases, 0);
                 drop(views);
+                assert_eq!(memo.extra_bytes(), VIEW_BYTES, "still filled");
+                assert!(
+                    !memo.held_outside(),
+                    "filled, with no holder, it is not held"
+                );
+                drop(memo);
                 cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
                 assert_eq!(cache.len(), 0, "with no holder it is evicted");
                 assert_eq!(cache.view_resident_bytes(), 0);
