@@ -20,8 +20,12 @@ byte-identical.
 Every figure bands.toml names goes through one list, `figures`, and is
 present exactly once: absent is `missing`, two inputs for it are
 `duplicate` (never the last of them), a figure this build cannot produce is
-`unsupported-on-this-build` with its reason, and a figure of a row whose
-tenant, state, scale or baseline the run lacks is `not-run` with the reason.
+`unsupported-on-this-build` with its reason, a figure whose inputs no
+build's report carries is `not-computable` with the inputs it lacks, a
+figure whose precondition does not hold on the measured state is
+`incomplete` with the precondition, and a figure of a row whose tenant,
+state, scale or baseline the run lacks is `not-run` with the reason. A
+figure computed from or judged against one of these takes its status.
 Only the fields ALLOWLISTED below may read as unsupported when a successful
 call lacks them; any other absent field is `missing`, and no figure
 defaults to 0. Each answer is judged here against truth.json, under the
@@ -34,7 +38,8 @@ non-zero) is not live: every figure of it, and of a state derived from it,
 is `not-run` with the reason "state failed at <step> (exit N)", and its
 entry in `states` reads `failed` with the step, exit code and log. The
 verdict is `fail` on any problem; else `incomplete` when an asked state, a
-planned call or an ungated figure did not run; else `pass`. Exit 0 only on pass; 1 on fail or incomplete; 64 on usage.
+planned call or an ungated figure did not run, a row 18 cell is
+not-measured, or a figure is not-computable or incomplete; else `pass`. Exit 0 only on pass; 1 on fail or incomplete; 64 on usage.
 """
 
 import argparse
@@ -72,10 +77,35 @@ KEY_INDEX_METRICS = {
     "reservations_refused": "reservationsRefused",
     "keys_probed": "keysProbed",
 }
+# Row 18: a lookup cell whose covering part went to one of these router
+# outcomes was answered by tier 1, so its time is not the leaves'.
+NOT_MEASURED = "not-measured"
+UNCOVERED_OUTCOMES = ("partsUncovered", "skippedByBudget", "partsBeyondCeiling", "leavesRejected",
+                      "reservationsRefused")
 ALLOWLIST_BREAKDOWNS = {"per_object": "stats carry no per-object breakdown",
                         "per_part": "stats carry no per-part breakdown"}
+# A figure no build can supply because its inputs exist in no report: it
+# proves nothing either way, so it, and every figure judged against it,
+# leaves the run incomplete.
+NOT_COMPUTABLE = "not-computable"
+# A figure whose precondition does not hold on the measured state: the value
+# exists but does not mean what the band asks.
+INCOMPLETE = "incomplete"
+# Row 7's G, the pass-end slice amendment's pass count: each field's
+# ascending key8 runs cut greedily into groups of at most the pair share
+# max(1, floor(budget / F)), the part's slowest field deciding. Its inputs
+# are the fold report's pair budget and a map from every field the build
+# indexed, zero-pair fields included, to its total pairs, under these names;
+# those bound G rather than give it (g_bounds). The fold report (FoldReport,
+# crates/ravel-catalog/src/fold.rs) carries neither yet; issue #3948 adds
+# them.
+G_INPUTS = ("key_index_pair_budget", "key_index_field_pairs")
+# Statuses a figure computed from, or judged against, another figure takes
+# over from it, reason and all.
+PASSED_ON = ("not-run", UNSUPPORTED, GUARD, NOT_COMPUTABLE, INCOMPLETE)
 # Fold report fields this build does not write.
-FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field")
+FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_index_sections_read",
+                  "key_index_leaf_gets")
 
 # Fold report fields under their names in a `catalog fold --json` report and
 # in a `--rebuild-key-index` report.
@@ -348,6 +378,11 @@ def call_metrics(c):
     for p in PHASES:
         v[f"{p.lower()}_gets"] = ph[p]["s3GetRequests"]
         v[f"{p.lower()}_wire_bytes"] = ph[p]["s3GetWireBytes"]
+        # The logs keyed plan counts every object whose KEY_IDX footer it
+        # probed as opened in the plan phase, absent key or not. The scan
+        # phase's count is not the probe's survivors: an object at or under
+        # 512 KiB is not probed and can still be opened by the scan.
+        v[f"{p.lower()}_segments_opened"] = ph[p]["segmentsOpened"]
     v["total_gets"] = sum(ph[p]["s3GetRequests"] for p in PHASES)
     v["data_gets"] = ph["probe"]["s3GetRequests"] + ph["scan"]["s3GetRequests"]
     v["list_requests"] = sum(ph[p]["s3ListRequests"] for p in PHASES)
@@ -558,40 +593,52 @@ def group_lines(calls, cfg, statement, state, temp):
 
 
 def key_index_nonzero(c):
-    """True when an ok call's stats carry a nonzero keyIndex figure."""
+    """True when an ok call's stats carry a nonzero keyIndex figure: keys
+    probed, a part covered or a leaf GET."""
     ki = (c.get("stats") or {}).get("keyIndex")
-    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered"))
+    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered") or ki.get("leafGetRequests"))
 
 
-def control_1001(calls, cfg, statement, state, temp):
-    """Row 11's 1,001-key control of a 1,000-key IN statement.
+def control_1025(calls, cfg, statement, state, temp):
+    """Row 11's over-cap control of a 1,000-key IN statement: the same table
+    and key kind at 1,025 keys, one over decision 6's k = 1,024.
 
-    1 when every 1,000-key call probed exactly 1,000 keys with a nonzero
-    partsCovered, and every 1,001-key call was either refused or served by a
-    visible scan (probe or scan GETs, or blocks scanned) with no keyIndex
-    figure above zero. 0 when a 1,001-key call carries a nonzero keyIndex
-    figure, or was served with neither a keyIndex figure nor a scan, or a
-    1,000-key call probed another count or covered no part. The 1,001-key
-    arm is judged first; only a 1,000-key list that was itself refused, or
-    that carries no tier-2 figures, makes the figure refused-by-guard or
-    unsupported."""
-    over = statement.replace("_1000", "_1001")
+    The SQL complexity guard admits a flat list of up to 4,096 literals
+    (MAX_IN_LIST_LITERALS), and the planner carries no key set past 1,024
+    keys (KEY_SET_MAX_KEYS), so a correct build answers the 1,025-key list
+    with a scan and no route: keysProbed 0, partsCovered 0, 0 leaf GETs.
+
+    1 when every 1,000-key call probed exactly 1,000 keys and routed its
+    parts (partsCovered nonzero, or a part in an Uncovered outcome such as
+    skippedByBudget, as box C's lists went: the key set was carried even
+    though the leaves did not answer), and every 1,025-key call was served
+    by a visible scan (probe or scan GETs, or blocks scanned) with no
+    keyIndex figure above zero. 0 when a 1,025-key call carries a nonzero
+    keyIndex figure, or was served with neither a keyIndex figure nor a
+    scan, or was refused while the 1,000-key list was admitted, or a
+    1,000-key call probed another count or reported partsCovered 0 with no
+    Uncovered outcome. The 1,025-key arm is judged first; only a 1,000-key
+    list that was itself refused, or that carries no tier-2 figures, makes
+    the figure refused-by-guard or unsupported."""
+    over = statement.replace("_1000", "_1025")
     lines, bad = group_lines(calls, cfg, statement, state, temp)
     if bad:
         return bad[0], None, bad[1]
     lines_over, bad = group_lines(calls, cfg, over, state, temp)
     if bad:
         return bad[0], None, bad[1]
+    refused_over = []
     for c in lines_over:
         outcome = c.get("outcome")
         if outcome in (GUARD, UNSUPPORTED, "refused"):
+            refused_over.append(c)
             continue
         if outcome != "ok" or c.get("_invalid"):
             return "missing", None, f"{where(c)} neither served nor refused"
         if key_index_nonzero(c):
             ki = c["stats"]["keyIndex"]
             return "value", 0, (f"{where(c)} was index-served: keysProbed {ki.get('keysProbed')} "
-                                f"partsCovered {ki.get('partsCovered')}")
+                                f"partsCovered {ki.get('partsCovered')} leafGetRequests {ki.get('leafGetRequests')}")
         m = call_metrics(c)
         if m["probe_gets"] == 0 and m["scan_gets"] == 0 and m["blocks_scanned"] == 0:
             return "value", 0, (f"{where(c)} served without a visible path: no keyIndex figure, "
@@ -609,25 +656,55 @@ def control_1001(calls, cfg, statement, state, temp):
         ki = (c.get("stats") or {}).get("keyIndex")
         if not isinstance(ki, dict) or "keysProbed" not in ki or "partsCovered" not in ki:
             return UNSUPPORTED, None, f"{where(c)} carries no keyIndex.keysProbed and partsCovered on this build"
+    if refused_over:
+        c = refused_over[0]
+        return "value", 0, (f"{where(c)} was refused ({c.get('reason') or 'no reason given'}) while the "
+                            f"1,000-key list was admitted: the guard admits up to 4,096 literals, so the "
+                            f"1,025-key list must be answered by a scan")
+    for c in lines:
+        ki = c["stats"]["keyIndex"]
         if ki["keysProbed"] != 1000:
             return "value", 0, f"{where(c)} probed {ki['keysProbed']} keys, not 1000"
-        if not ki["partsCovered"]:
-            return "value", 0, f"{where(c)} probed 1000 keys with partsCovered {ki['partsCovered']}"
+        if not ki["partsCovered"] and not any(ki.get(f) for f in UNCOVERED_OUTCOMES):
+            return "value", 0, (f"{where(c)} probed 1000 keys with partsCovered {ki['partsCovered']} "
+                                f"and no part in an Uncovered outcome")
     return "value", 1, ""
 
 
-def statement_figure(calls, cfg, statement, state, metric, candidates=None):
+def leaf_uncovered(c):
+    """None when an ok call's leaves answered every covering part: partsCovered
+    at least 1 and no part in any other outcome. Else (status, None, reason):
+    NOT_MEASURED naming the outcome when a part went Uncovered (a part with no
+    leaf for the field, skipped by budget, beyond the ceiling, rejected, or
+    refused its reservation), since its time is the tier-1 probe's, or
+    unsupported when the build reports none of it."""
+    ki = c["stats"].get("keyIndex")
+    fields = ("partsCovered",) + UNCOVERED_OUTCOMES
+    if not isinstance(ki, dict) or any(f not in ki for f in fields):
+        return UNSUPPORTED, None, f"{where(c)} carries no keyIndex.{'/'.join(fields)} on this build"
+    went = [f"{f} {ki[f]}" for f in UNCOVERED_OUTCOMES if ki[f]]
+    if went or not ki["partsCovered"]:
+        return NOT_MEASURED, None, (f"{where(c)}: a covering part went Uncovered "
+                                    f"({', '.join(went) or 'partsCovered 0'}), so its time is the tier-1 probe's")
+    return None
+
+
+def statement_figure(calls, cfg, statement, state, metric, candidates=None, over_512k=None):
     """(status, value, reason) of one statement figure. candidates(c) is
     (count, None) or (None, reason): the objects the state's ranges stamp
-    says overlap call c's window.
+    says overlap call c's window. over_512k(c) is the same shape: the
+    census count of call c's objects above 512 KiB.
 
     metric is "<temp>.<agg>.<name>", "<temp>.rows_exact",
-    "<temp>.rows_match_state.<other>", "<temp>.wall_p50_s" or
-    "<temp>.control_1001".
+    "<temp>.rows_match_state.<other>", "<temp>.wall_p50_s",
+    "<temp>.wall_iqr_s" (the 75th less the 25th percentile of the tries'
+    wall times), "<temp>.leaf_wall_p50_s" (the p50 when every try's leaves
+    answered every covering part, else not-measured) or
+    "<temp>.control_1025".
     """
     temp, _, rest = metric.partition(".")
-    if rest == "control_1001":
-        return control_1001(calls, cfg, statement, state, temp)
+    if rest == "control_1025":
+        return control_1025(calls, cfg, statement, state, temp)
     lines, bad = group_lines(calls, cfg, statement, state, temp)
     if bad:
         return bad[0], None, bad[1]
@@ -666,6 +743,15 @@ def statement_figure(calls, cfg, statement, state, metric, candidates=None):
         return "value", int(same), ""
     if rest == "wall_p50_s":
         return "value", rnd(percentile([c["wall_s"] for c in lines], 0.5)), ""
+    if rest == "wall_iqr_s":
+        walls = [c["wall_s"] for c in lines]
+        return "value", rnd(percentile(walls, 0.75) - percentile(walls, 0.25)), ""
+    if rest == "leaf_wall_p50_s":
+        for c in lines:
+            why = leaf_uncovered(c)
+            if why:
+                return why
+        return "value", rnd(percentile([c["wall_s"] for c in lines], 0.5)), ""
     agg, _, name = rest.partition(".")
     head = name.split(".", 1)[0]
     if head in ALLOWLIST_BREAKDOWNS:
@@ -691,13 +777,40 @@ def statement_figure(calls, cfg, statement, state, metric, candidates=None):
             if probed == 0:
                 return "missing", None, f"no candidate object for {where(c)} to divide the probe wire by"
             v = rnd(m["probe_wire_bytes"] / probed)
+        elif name == "probe_survivors":
+            # The probed objects the key index did not prune. The plan's
+            # segmentsOpened counts the probed objects only when it opened
+            # exactly the objects above 512 KiB that stats did not prune, out
+            # of every census object (none dropped by the time window) with
+            # none skipped by threshold, which segmentsPrunedByStats omits.
+            pruning = c["stats"]["pruning"]
+            pruned = pruning.get("segmentsPrunedByKeyIndex")
+            if not isinstance(pruned, int):
+                return UNSUPPORTED, None, "stats carry no pruning.segmentsPrunedByKeyIndex on this build"
+            counts, why = over_512k(c) if over_512k else (None, "no census reader")
+            if why:
+                return INCOMPLETE, None, f"probe survivors of {where(c)} not judged: {why}"
+            big, objects = counts
+            by_stats = pruning.get("segmentsPrunedByStats")
+            if not isinstance(by_stats, int) or m["plan_segments_opened"] != big - by_stats:
+                return INCOMPLETE, None, (
+                    f"probe survivors of {where(c)} not judged: plan segmentsOpened {m['plan_segments_opened']} "
+                    f"is not census objects_over_512k {big} less pruning.segmentsPrunedByStats {by_stats}, so the "
+                    "plan did not open exactly the objects the probe saw")
+            if pruning.get("segments") != objects or pruning.get("segmentsSkippedByThreshold") != 0:
+                return INCOMPLETE, None, (
+                    f"probe survivors of {where(c)} not judged: pruning.segments {pruning.get('segments')} is not "
+                    f"census objects {objects}, or pruning.segmentsSkippedByThreshold "
+                    f"{pruning.get('segmentsSkippedByThreshold')} is not 0, so objects the window or a threshold "
+                    "dropped may make the plan's count match by coincidence")
+            v = m["plan_segments_opened"] - pruned
         elif name in m:
             v = m[name]
         else:
             return "missing", None, f"unknown metric {name}"
         vals.append(v)
     value = max(vals) if agg == "max" else min(vals)
-    if name == "segments_opened" and value == 0:
+    if name in ("segments_opened", "scan_segments_opened") and value == 0:
         scanned = [c for c in lines if call_metrics(c)["scan_gets"] >= 1]
         if scanned:
             return "dead_counter", 0, (f"segmentsOpened 0 while {where(scanned[0])} issued "
@@ -768,6 +881,22 @@ def window_candidates(stamps, statements, truth, c):
         return None, f"{name} carries no min_ns and max_ns for every object"
     start, end = window
     return sum(1 for o in objects if o["min_ns"] < end and o["max_ns"] >= start), None
+
+
+def census_over_512k(census, statements, cfg, c):
+    """((objects above 512 KiB, objects), None) the census of call c's state
+    gives its statement's tenant and signal, or (None, reason)."""
+    st = statements.get(c.get("statement")) or {}
+    tenant = st.get("tenant") or cfg["tenant"]
+    signal = signal_of(st.get("table", "spans"))
+    line = census.get((c.get("state"),), "absent")
+    if line == "absent" or line is None:
+        return None, f"{'no census' if line == 'absent' else 'two censuses'} of {c.get('state')}"
+    data = ((line.get("census") or {}).get("tenants") or {}).get(tenant, {}).get("data", {}).get(signal) or {}
+    v, n = data.get("objects_over_512k"), data.get("objects")
+    if not isinstance(v, int) or isinstance(v, bool) or not isinstance(n, int) or isinstance(n, bool):
+        return None, f"census of {c.get('state')} has no {tenant}/{signal} objects_over_512k or objects"
+    return (v, n), None
 
 
 def required_stamps(run_dir, cfg, live, problems):
@@ -1040,6 +1169,17 @@ def stamp_figure(stamps, census, cfg, state, metric):
             return "missing", None, f"a {field} leaf in stamps/{state}.{label}.catalog.json has no size"
         return "value", rnd(100.0 * lb / data["bytes"]), ""
     what, _, label = rest.partition(".")
+    if what == "slices":
+        # stamp.slices.<label>.<field>: the most leaves (key slices) one part
+        # carries for the field, from the state's catalog stamp.
+        label, _, field = label.partition(".")
+        doc = stamps.doc(state, label, "catalog")
+        if doc is None:
+            return "missing", None, f"covering_parts.{state}.{label}"
+        counts = [sum(1 for lf in p.get("leaves", []) if lf.get("field") == field) for p in doc.get("parts", [])]
+        if not any(counts):
+            return "missing", None, f"stamps/{state}.{label}.catalog.json names no {field} leaf"
+        return "value", max(counts), ""
     if what == "footer_len":
         doc = stamps.doc(state, label, "object")
         if doc is None:
@@ -1082,6 +1222,35 @@ def fold_field(report, field):
     return None
 
 
+def g_bounds(budget, field_pairs):
+    """(low, high) of G from the pair budget and each indexed field's total
+    pairs. The share is s = max(1, budget // F) for F fields. A field of P
+    pairs takes at least ceil(P / s) groups, since a group holds at most s
+    pairs while no key8 run (one key's entry ordinals, at most the part's
+    entry count) exceeds the share, and at most 2 x ceil(P / s) - 1, since
+    greedy groups are maximal, so any two adjacent ones exceed s; each at
+    least 1. The slowest field decides both."""
+    share = max(1, budget // len(field_pairs))
+    need = [-(-p // share) for p in field_pairs.values()]
+    return max(1, max(need)), max(1, max(2 * n - 1 for n in need))
+
+
+def fold_g(report, where_, bound):
+    """(status, value, reason) of row 7's G's low or high bound from a fold report."""
+    absent = [k for k in G_INPUTS if k not in report]
+    if absent:
+        return NOT_COMPUTABLE, None, (
+            f"fold report {where_} carries no {' and no '.join(absent)}, so G (the pass-end slice amendment's "
+            "greedy partition of each field's key8 runs into groups of at most the pair share) cannot be "
+            "bounded")
+    budget, pairs = (report[k] for k in G_INPUTS)
+    if (not isinstance(budget, int) or isinstance(budget, bool) or budget < 1 or not isinstance(pairs, dict)
+            or not pairs or any(not isinstance(p, int) or isinstance(p, bool) or p < 0 for p in pairs.values())):
+        return "missing", None, (f"fold report {where_}: {G_INPUTS[0]} is not a positive integer or "
+                                 f"{G_INPUTS[1]} is not a non-empty map of field pair totals")
+    return "value", g_bounds(budget, pairs)[bound == "high"], ""
+
+
 def fold_figure(folds, transition, tenant, label, field):
     """(status, value, reason) of fold.<tenant>.<label>.<field>."""
     line = folds.get((transition, tenant, label), "absent")
@@ -1089,6 +1258,8 @@ def fold_figure(folds, transition, tenant, label, field):
         return "missing", None, f"no fold stamp for {transition}/{tenant}/{label}"
     if line is None:
         return "duplicate", None, f"two fold stamps for {transition}/{tenant}/{label}"
+    if field in ("key_index_g_low", "key_index_g_high"):
+        return fold_g(line.get("report") or {}, f"{transition}/{tenant}/{label}", field.rsplit("_", 1)[1])
     if field == "peak_rss_bytes":
         v = (line.get("measure") or {}).get("peak_rss_bytes")
         return ("value", v, "") if v is not None else ("missing", None, "fold stamp has no measure")
@@ -1186,7 +1357,7 @@ def derived_value(expr, figures_by_id):
         ref = figures_by_id.get(e.args[0])
         if ref is None:
             return "missing", None, f"refers to figure {e.args[0]} that bands.toml does not define before it"
-        if ref["status"] in ("not-run", UNSUPPORTED, GUARD):
+        if ref["status"] in PASSED_ON:
             return ref["status"], None, f"{e.args[0]} is {ref['status']}: {ref['reason']}"
         return "missing", None, f"{e.args[0]} has no value ({ref['status']})"
     return "value", rnd(v), ""
@@ -1202,7 +1373,8 @@ def truth_figure(truth, metric):
     return "value", v, ""
 
 
-def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, truth, candidates=None):
+def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, truth, candidates=None,
+             over_512k=None):
     figures = []
     by_id = {}
     for row in bands["row"]:
@@ -1242,7 +1414,7 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
                 status, value, why = "missing", None, f"{metric} needs a run this harness lane does not perform"
             else:
                 status, value, why = statement_figure(calls, cfg, fig["statement"], fig["state"], metric,
-                                                      candidates)
+                                                      candidates, over_512k)
             entry.update(status=status, value=value, reason=why)
             figures.append(entry)
             by_id[fid] = entry
@@ -1260,7 +1432,7 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
             miss = evaluate_expr(f.get("miss_if", "False"), entry["value"], values)
         except KeyError as e:
             ref = by_id.get(e.args[0])
-            if ref is not None and ref["status"] in ("not-run", UNSUPPORTED, GUARD):
+            if ref is not None and ref["status"] in PASSED_ON:
                 entry["verdict"] = ref["status"]
                 entry["reason"] = f"band refers to figure {e.args[0]}, {ref['status']}: {ref['reason']}"
             else:
@@ -1467,7 +1639,10 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     sent in a state that did, or a figure not-run for any reason other than
     its row or figure lacking a state, tenant, scale or baseline the run
     never asked for (a gated figure is either not_requested or listed
-    here), or a needle band a partial inspection could not judge."""
+    here), a figure not-measured (a row 18 cell whose covering part went
+    Uncovered), a figure not-computable or incomplete or judged against
+    one, a row 18 figure with no value to judge (unsupported, refused or
+    missing), or a needle band a partial inspection could not judge."""
     out = []
     for s in cfg["states"]:
         if live.get(s) is not None:
@@ -1482,6 +1657,12 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     for f in figures:
         if f["status"] == "not-run" and not f.get("not_requested"):
             out.append(f"figure {f['id']} not run: {f['reason']}")
+        elif f["status"] == NOT_MEASURED:
+            out.append(f"figure {f['id']} not measured: {f['reason']}")
+        elif f.get("verdict") in (NOT_COMPUTABLE, INCOMPLETE):
+            out.append(f"figure {f['id']} {f['verdict']}: {f['reason']}")
+        elif f["row"] == 18 and f.get("verdict") in (UNSUPPORTED, GUARD, "refused", "missing"):
+            out.append(f"figure {f['id']} {f['verdict']}: {f['reason']}")
     out.extend((needles or {}).get("incomplete", []))
     return out
 
@@ -1651,7 +1832,8 @@ def main(argv):
             or not cfg["cost"].get("lookups_per_part_month_source") else 0),
     }
     figures = run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, truth,
-                       lambda c: window_candidates(stamps, statements, truth, c))
+                       lambda c: window_candidates(stamps, statements, truth, c),
+                       lambda c: census_over_512k(census, statements, cfg, c))
     for f in figures:
         if f["verdict"] == "dead_counter":
             problems.add("dead_counter", f"segmentsOpened {f['statement']} {f['state']}")
