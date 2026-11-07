@@ -2951,7 +2951,8 @@ fn two_level_ceiling() -> u64 {
 /// record names every input, the report names the 5 level-1 groups and the
 /// one worker, and the scratch directory holds no unit subdirectory
 /// afterwards. The same call without `--scratch-dir` is refused as
-/// GeometryUnsupported and writes nothing.
+/// GeometryUnsupported and writes nothing. The fixture predicts fewer decoded
+/// rows than the default geometry floor, so both calls lower it to zero.
 ///
 /// Distinguishing: with `build_compactor_config` leaving `scratch_dir` unset
 /// the "outcome: Compacted" assertion fails on a GeometryUnsupported report;
@@ -2968,6 +2969,7 @@ async fn compact_bucket_routes_a_many_input_bucket_through_the_two_level_merge()
         refused_store.clone(),
         &ScratchOptions {
             merge_resident_ceiling_bytes: Some(two_level_ceiling()),
+            geometry_floor_decoded_rows: Some(0),
             ..ScratchOptions::default()
         },
     )
@@ -2997,6 +2999,7 @@ async fn compact_bucket_routes_a_many_input_bucket_through_the_two_level_merge()
             scratch_max_bytes: None,
             level1_workers: Some(1),
             merge_resident_ceiling_bytes: Some(two_level_ceiling()),
+            geometry_floor_decoded_rows: Some(0),
         },
     )
     .await
@@ -3056,6 +3059,7 @@ async fn compact_tenant_with_scratch_dir_compacts_the_two_level_bucket() {
             scratch_max_bytes: None,
             level1_workers: Some(1),
             merge_resident_ceiling_bytes: None,
+            geometry_floor_decoded_rows: Some(0),
         },
     )
     .await
