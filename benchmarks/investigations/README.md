@@ -240,14 +240,15 @@ its keyIndex GETs at 2 x that count.
   key gains rows from the tail only if a tail trace id equals a base one (a
   128-bit draw) or, for a request id, shares its first 16 hex digits and row
   index (`request_id_of`). A key that did would return more rows than the
-  oracle and read as a wrong answer, not a pass. The local smoke lists the
-  state so its flow and its check run there, and it is expected to fail
-  the second check: the smoke's 150,000 logs rows, base and tail, are
-  150,000 `request_id` pairs, under the 4,000,000-pair share each of the
-  two logs fields gets of the default 8,000,000-pair budget
+  oracle and read as a wrong answer, not a pass. The local smoke does not
+  list the state, because at its scale the second check would always fail
+  it: the smoke's 150,000 logs rows, base and tail, are 150,000
+  `request_id` pairs, under the 4,000,000-pair share each of the two logs
+  fields gets of the default 8,000,000-pair budget
   (`DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`), so the advance takes one pass and
   adds no slice (the committed fixture's `folded_leaves` and `fold_advance`
-  stamps both carry one `request_id` leaf).
+  stamps both carry one `request_id` leaf). The state's flow and its check
+  are pinned on the s3 lane's dry run instead.
 - `compaction_in_flight`: waits until every earlier hour is sealed (310 s
   into the hour), starts `maintain compact-tenant` on both signals at once as
   background children, runs the statement set while they run (temp `inflight`,

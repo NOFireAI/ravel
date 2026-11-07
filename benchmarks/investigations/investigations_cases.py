@@ -1184,7 +1184,7 @@ class LocalSmoke(Workdir):
         self.assertEqual(figure(res, "row_11.spans_1000_rows_exact")["reason"], REFUSAL_1000)
         # Item 8: the guard's refusals are counted apart from unsupported figures.
         self.assertEqual(res["refusal_classes"], {GUARD: {"figures": 15, "calls": 24},
-                                                  UNSUPPORTED: {"figures": 29, "calls": 0}})
+                                                  UNSUPPORTED: {"figures": 31, "calls": 0}})
         guarded = sorted(f["id"] for f in res["figures"] if f["status"] == GUARD)
         self.assertEqual(len(guarded), 15)
         self.assertTrue(all(i.startswith("row_11.") for i in guarded), guarded)
@@ -1210,7 +1210,7 @@ class LocalSmoke(Workdir):
             "['many_parts_744']); row 10 (run.toml "
             "states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml "
             "hits = false, baseline = false); row 18 (run.toml states lacks ['advanced_leaves'])",
-            "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29 figure(s), "
+            "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 31 figure(s), "
             "0 call(s)",
         ])
 
@@ -3053,9 +3053,9 @@ class Evaluate(Workdir):
     def check_refusal_classes(self, evaluate_py=EVALUATE):
         """Guard refusals and unsupported figures are counted apart."""
         _, res, text = self.go(BANDS, evaluate_py)
-        want = {GUARD: {"figures": 15, "calls": 24}, UNSUPPORTED: {"figures": 29, "calls": 0}}
+        want = {GUARD: {"figures": 15, "calls": 24}, UNSUPPORTED: {"figures": 31, "calls": 0}}
         out = [] if res["refusal_classes"] == want else [f"classes {res['refusal_classes']}"]
-        if "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29" not in text:
+        if "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 31" not in text:
             out.append("summary carries no refusal-class line")
         return out
 
@@ -3748,10 +3748,11 @@ class Box(Workdir):
         return out
 
     LANE_STATES = {"local": ("compaction_in_flight", "erasure_in_flight", "many_parts_24"),
-                   "s3": ("compaction_in_flight", "erasure_in_flight", "many_parts_744", "many_parts_2160")}
+                   "s3": ("advanced_leaves", "compaction_in_flight", "erasure_in_flight", "many_parts_744",
+                          "many_parts_2160")}
 
     def assert_flow(self, text, lane, hits=False):
-        states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves") + self.LANE_STATES[lane]
+        states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed") + self.LANE_STATES[lane]
         self.assertEqual(self.steps(text), [
             "bootstrap", "store", "host", "corpus", "declare", "load-base",
             *(f"state:{s}" for s in states), "evaluate", "finish"])
@@ -3879,7 +3880,7 @@ class Box(Workdir):
         # with its reason, and the run still evaluates and finishes.
         code, text = run_sh("s3", self.example_toml(("max_minutes = 540", "max_minutes = 0")), self.path("out"))
         self.assertEqual(code, 0, text)
-        states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves") + self.LANE_STATES["s3"]
+        states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed") + self.LANE_STATES["s3"]
         lines = [x for x in text.splitlines() if x.startswith("NOT-RUN ")]
         self.assertEqual(lines, [f"NOT-RUN {s}: deadline: run.max_minutes 0 passed (0 minutes elapsed)"
                                  for s in states])
@@ -4384,9 +4385,11 @@ class Box(Workdir):
         self.assertLess(adv.index("advance-check"), adv.index("plan --statements"))
         mixed = [x for x in b["state:mixed"] if "catalog fold" in x]
         self.assertTrue(mixed and all("--key-index-leaves" in x for x in mixed), mixed)
+        # Item 8: the smoke's advance adds no slice at its scale, so it does
+        # not list the state.
         code, text = run_sh("local", os.path.join(BOX, "run.local-smoke.toml"), self.path("out-local"))
         self.assertEqual(code, 0, text)
-        self.assertIn("state:advanced_leaves", self.steps(text))
+        self.assertNotIn("state:advanced_leaves", self.steps(text))
 
     def test_advanced_leaves_failed_check_fails_the_state(self):
         # A failed advance-check is the state's STATE-FAILED, and the run
