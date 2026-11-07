@@ -713,14 +713,6 @@ pub(crate) mod view_registry {
         memo_of(values)?.views()
     }
 
-    /// Whether a live memo is registered at `values`'s offsets address.
-    #[cfg(test)]
-    pub(crate) fn contains(values: &StringArray) -> bool {
-        registry()
-            .get(&address(values))
-            .is_some_and(|w| w.strong_count() > 0)
-    }
-
     /// Whether the registry holds an entry, live or not, pointing at the memo
     /// at `memo`, under `at`.
     #[cfg(test)]
@@ -6731,6 +6723,785 @@ mod tests {
                     );
                     assert_eq!(run(&window(&block)), [0, 0], "{case}: a later hit");
                 }
+            }
+        }
+
+        // --- view memo (ADR-3326, view memo amendment) ---------------------
+
+        mod views {
+            use super::*;
+            use crate::group_keys::group_key_as_view;
+            use datafusion::arrow::array::BooleanArray;
+            use datafusion::arrow::compute::filter_record_batch;
+            use datafusion::physical_expr::expressions::Column;
+            use ravel_logseg::decoded_cache::admission_margin;
+
+            const VIEW_BUDGET: u64 = 1 << 20;
+            const ROWS: usize = 12;
+            const VIEW_BYTES: u64 = 16 * ROWS as u64;
+            const LIMIT: u64 = 4 << 30;
+            const GATE_FLOOR: u64 = 1 << 30;
+
+            fn cache_on(
+                budget: &Arc<MemoryBudget>,
+                view_max_bytes: u64,
+            ) -> Arc<DecodedColumnCache> {
+                Arc::new(
+                    DecodedColumnCache::new(1 << 30, Some(Arc::clone(budget)))
+                        .with_view_max_bytes(view_max_bytes),
+                )
+            }
+
+            /// `cache` as `budget`'s evictor, at slack 0.
+            fn register(budget: &Arc<MemoryBudget>, cache: &Arc<DecodedColumnCache>) {
+                let evictee = Arc::downgrade(cache);
+                assert!(
+                    budget
+                        .register_evictor(
+                            Box::new(move |want, cause| {
+                                evictee
+                                    .upgrade()
+                                    .map_or(0, |c| c.evict_for_pressure(want, 0, cause))
+                            }),
+                            0,
+                        )
+                        .is_ok()
+                );
+            }
+
+            /// One columnar scan of `obj`'s first block as object `object`.
+            struct Pass {
+                batches: Vec<RecordBatch>,
+                counters: Arc<DecodedCacheCounters>,
+                validated: Count,
+                /// Plain memo fast paths the build took.
+                fast: u64,
+            }
+
+            fn pass(
+                obj: &[u8],
+                cfg: &RlogConfig,
+                block: &Block,
+                cache: &Arc<DecodedColumnCache>,
+                object: u8,
+            ) -> Pass {
+                pass_with(obj, cfg, block, cache, object, |_| {})
+            }
+
+            /// [`pass`], running `before` on the view before the build.
+            fn pass_with(
+                obj: &[u8],
+                cfg: &RlogConfig,
+                block: &Block,
+                cache: &Arc<DecodedColumnCache>,
+                object: u8,
+                before: impl FnOnce(&ColumnarBlockView<'_>),
+            ) -> Pass {
+                let reader = RlogReader::new(obj, cfg).expect("open");
+                let mut scan = reader
+                    .scan_blocks(&window(block), &[], &ColumnSelection::all())
+                    .expect("scan");
+                let mut a = attach(cache);
+                a.object = [object; 32];
+                let counters = Arc::clone(&a.counters);
+                scan.attach_decoded_cache(a);
+                let view = scan
+                    .next_block_columnar(obj)
+                    .expect("columnar exit")
+                    .expect("one block");
+                before(&view);
+                let pool = unbounded_pool();
+                let shared = test_str_values(&pool);
+                let validated = Count::new();
+                let fast = fast_paths();
+                let batches = str_batches(&view, &shared, &validated);
+                Pass {
+                    batches,
+                    counters,
+                    validated,
+                    fast: fast_paths() - fast,
+                }
+            }
+
+            /// The rule's group key over `batch`'s key column: with
+            /// `view_memo` [`crate::group_keys::GroupKeyViews`], without it
+            /// arrow's cast.
+            fn group_key(batch: &RecordBatch, view_memo: bool) -> ArrayRef {
+                group_key_as_view(Arc::new(Column::new(KEY, 0)), view_memo)
+                    .evaluate(batch)
+                    .and_then(|v| v.into_array(batch.num_rows()))
+                    .expect("the group key evaluates")
+            }
+
+            /// `got` and `want` have the same views, the same data buffers
+            /// (address and bytes) and the same null buffer.
+            fn identical(got: &ArrayRef, want: &ArrayRef) -> Result<(), String> {
+                let (g, w) = (got.as_string_view(), want.as_string_view());
+                if g.views() != w.views() {
+                    return Err("views differ".into());
+                }
+                let same_buffers = g.data_buffers().len() == w.data_buffers().len()
+                    && g.data_buffers()
+                        .iter()
+                        .zip(w.data_buffers())
+                        .all(|(a, b)| a.as_ptr() == b.as_ptr() && a.as_slice() == b.as_slice());
+                if !same_buffers {
+                    return Err("data buffers differ".into());
+                }
+                if g.nulls() != w.nulls() {
+                    return Err("null buffers differ".into());
+                }
+                Ok(())
+            }
+
+            /// Each row's value, `None` for a NULL row.
+            fn logical(array: &ArrayRef) -> Vec<Option<String>> {
+                let a = array.as_string_view();
+                (0..a.len())
+                    .map(|i| a.is_valid(i).then(|| a.value(i).to_owned()))
+                    .collect()
+            }
+
+            /// The dictionary values of `batch`'s key column.
+            fn values_of(batch: &RecordBatch) -> StringArray {
+                batch
+                    .column(0)
+                    .as_dictionary::<Int32Type>()
+                    .values()
+                    .as_string::<i32>()
+                    .clone()
+            }
+
+            /// `batch` with its key column replaced by `keys` over the same
+            /// dictionary values.
+            fn rekeyed(batch: &RecordBatch, keys: Int32Array) -> RecordBatch {
+                let dict = batch.column(0).as_dictionary::<Int32Type>();
+                let rekeyed = DictionaryArray::try_new(keys, Arc::clone(dict.values()))
+                    .expect("keys in range");
+                RecordBatch::try_new(batch.schema(), vec![Arc::new(rekeyed) as ArrayRef])
+                    .expect("batch")
+            }
+
+            /// An object of one plain block of `rows` rows whose row `r`
+            /// reads `value(r)`, every row present.
+            fn plain_object(
+                rows: usize,
+                value: impl Fn(usize) -> String,
+                cfg: &RlogConfig,
+            ) -> (Block, Vec<u8>) {
+                let block = fixed_block(
+                    &[FieldType::Str],
+                    (0..rows)
+                        .map(|r| vec![str_value(value(r).as_bytes())])
+                        .collect(),
+                    0,
+                    rows - 1,
+                );
+                let obj = encode(&block, cfg);
+                (block, obj)
+            }
+
+            /// ADR-3326, view memo amendment, T9: `viewMemoFills` is 0 on the
+            /// call that admits the block, 1 on the first call it is served,
+            /// and 0 after that; every call's group key equals the cast.
+            #[test]
+            fn a_view_memo_fills_on_the_first_served_call_only() {
+                let block = dense(true, ROWS);
+                let cfg = cfg();
+                let obj = encode(&block, &cfg);
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let cache = cache_on(&budget, VIEW_BUDGET);
+                let mut fills = Vec::new();
+                for call in 0..3 {
+                    let p = pass(&obj, &cfg, &block, &cache, 9);
+                    assert_eq!(p.fast, 1, "call {call}: the plain memo fast path ran");
+                    for batch in &p.batches {
+                        let got = group_key(batch, true);
+                        identical(&got, &group_key(batch, false))
+                            .unwrap_or_else(|e| panic!("call {call}: {e}"));
+                    }
+                    fills.push(p.counters.view_snapshot().fills);
+                }
+                assert_eq!(fills, [0, 1, 0], "fills per call");
+                assert_eq!(cache.view_counters().fills, 1);
+                assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+            }
+
+            /// A served, filled plain block: its object, the cache, and the
+            /// serving pass.
+            fn filled(
+                budget: &Arc<MemoryBudget>,
+                view_max_bytes: u64,
+            ) -> (Block, Vec<u8>, RlogConfig, Arc<DecodedColumnCache>, Pass) {
+                let block = dense(true, ROWS);
+                let cfg = cfg();
+                let obj = encode(&block, &cfg);
+                let cache = cache_on(budget, view_max_bytes);
+                drop(pass(&obj, &cfg, &block, &cache, 9));
+                let served = pass(&obj, &cfg, &block, &cache, 9);
+                (block, obj, cfg, cache, served)
+            }
+
+            proptest! {
+                #![proptest_config(ProptestConfig::with_cases(24))]
+
+                /// ADR-3326, view memo amendment, T1: over a served plain
+                /// block of 1 to 8,192 rows, with a narrowing filter on and
+                /// off, the group key equals arrow's cast of the same input
+                /// on views, data buffers and null buffer; and so do
+                /// permuted full-length keys over the memo and a values
+                /// array sliced from it, neither of which may take the memo
+                /// as it is.
+                #[test]
+                fn prop_group_key_views_equal_the_cast(
+                    rows in 1usize..=8192,
+                    prefix in 0usize..24,
+                    empty_every in 4usize..32,
+                    mask in proptest::option::of(any::<u64>()),
+                ) {
+                    let cfg = RlogConfig { block_target_records: 8192, ..cfg() };
+                    let value = |r: usize| {
+                        if r % empty_every == 1 {
+                            String::new()
+                        } else {
+                            format!("{}{r}", "x".repeat(prefix))
+                        }
+                    };
+                    let (block, obj) = plain_object(rows, value, &cfg);
+                    let budget = Arc::new(MemoryBudget::new(LIMIT));
+                    let cache = cache_on(&budget, 1 << 30);
+                    drop(pass(&obj, &cfg, &block, &cache, 9));
+                    let p = pass(&obj, &cfg, &block, &cache, 9);
+                    prop_assert!(p.fast >= 1, "the plain fast path ran");
+                    let mut state = mask.unwrap_or(0) | 1;
+                    for batch in &p.batches {
+                        let memo = values_of(batch);
+                        let batch = match mask {
+                            Some(_) => {
+                                let keep: BooleanArray = (0..batch.num_rows())
+                                    .map(|_| {
+                                        state ^= state << 13;
+                                        state ^= state >> 7;
+                                        state ^= state << 17;
+                                        Some(state % 3 != 0)
+                                    })
+                                    .collect();
+                                filter_record_batch(batch, &keep).expect("filter")
+                            }
+                            None => batch.clone(),
+                        };
+                        let got = group_key(&batch, true);
+                        prop_assert!(
+                            identical(&got, &group_key(&batch, false)).is_ok(),
+                            "{:?}",
+                            identical(&got, &group_key(&batch, false))
+                        );
+                        let views = view_registry::views_of(&memo);
+                        prop_assert!(views.is_some(), "the memo serves its own values");
+                        let n = memo.len();
+                        // Permuted full-length keys over the memo.
+                        let permuted: Int32Array =
+                            (0..n).rev().map(|k| Some(k as i32)).collect();
+                        let reversed = rekeyed(&batch, permuted);
+                        let got = group_key(&reversed, true);
+                        prop_assert!(identical(&got, &group_key(&reversed, false)).is_ok());
+                        // Keys `0..n - 1` over the memo values sliced by one.
+                        if n >= 2 {
+                            let sliced = memo.slice(1, n - 1);
+                            let dict = DictionaryArray::try_new(
+                                (0..n as i32 - 1).collect::<Int32Array>(),
+                                Arc::new(sliced) as ArrayRef,
+                            )
+                            .expect("dictionary");
+                            let sliced = RecordBatch::try_new(
+                                batch.schema(),
+                                vec![Arc::new(dict) as ArrayRef],
+                            )
+                            .expect("batch");
+                            let got = group_key(&sliced, true);
+                            prop_assert!(identical(&got, &group_key(&sliced, false)).is_ok());
+                        }
+                    }
+                }
+            }
+
+            /// T1 is not vacuous: an unnarrowed served block's group key is
+            /// the memo's own views array, shared, and a narrowed one is a
+            /// gather over the memo's views, both built from the memo.
+            #[test]
+            fn the_group_key_takes_the_memos_views_on_a_served_block() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, _cache, p) = filled(&budget, VIEW_BUDGET);
+                let batch = &p.batches[0];
+                let memo = view_registry::views_of(&values_of(batch)).expect("views");
+                let shared = group_key(batch, true);
+                assert_eq!(
+                    shared.as_string_view().views().as_ptr(),
+                    memo.views().as_ptr(),
+                    "the memo's views, shared"
+                );
+                let keep: BooleanArray = (0..ROWS).map(|r| Some(r % 2 == 0)).collect();
+                let narrowed = filter_record_batch(batch, &keep).expect("filter");
+                let gathered = group_key(&narrowed, true);
+                assert_ne!(
+                    gathered.as_string_view().views().as_ptr(),
+                    memo.views().as_ptr()
+                );
+                assert_eq!(
+                    gathered.as_string_view().data_buffers()[0].as_ptr(),
+                    memo.data_buffers()[0].as_ptr(),
+                    "a gather over the memo's values block"
+                );
+                identical(&gathered, &group_key(&narrowed, false)).expect("identical");
+                assert_eq!(p.counters.view_snapshot().fills, 1);
+            }
+
+            /// ADR-3326, view memo amendment, T2: NULL keys over a served,
+            /// filled plain memo read the cast's values and null bits, and a
+            /// session `GROUP BY` puts the NULL rows in the NULL group; a
+            /// memo with a NULL entry is never served or filled: the cast
+            /// runs and `viewMemoFills` stays 0.
+            #[tokio::test]
+            async fn null_keys_and_a_null_bearing_memo_read_as_the_cast() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, _cache, p) = filled(&budget, VIEW_BUDGET);
+                let batch = &p.batches[0];
+                let keys: Int32Array = (0..ROWS as i32)
+                    .map(|k| (k % 3 != 0).then_some(k))
+                    .collect();
+                let nulled = rekeyed(batch, keys);
+                let got = group_key(&nulled, true);
+                assert_eq!(logical(&got), logical(&group_key(&nulled, false)));
+                assert_eq!(got.null_count(), ROWS / 3);
+                assert!(view_registry::views_of(&values_of(batch)).is_some());
+
+                let ctx = {
+                    let state = datafusion::execution::session_state::SessionStateBuilder::new()
+                        .with_default_features()
+                        .with_physical_optimizer_rule(Arc::new(
+                            crate::DictionaryGroupKeysAsViews::with_view_memo(true),
+                        ))
+                        .build();
+                    datafusion::prelude::SessionContext::new_with_state(state)
+                };
+                ctx.register_batch("t", nulled).expect("table");
+                let groups = ctx
+                    .sql("SELECT k, count(*) AS c FROM t WHERE k IS NULL GROUP BY k")
+                    .await
+                    .expect("plans")
+                    .collect()
+                    .await
+                    .expect("runs");
+                let [group] = groups.as_slice() else {
+                    panic!("one batch: {groups:?}");
+                };
+                assert_eq!(group.num_rows(), 1, "one NULL group");
+                assert!(group.column(0).is_null(0));
+                assert_eq!(
+                    group
+                        .column(1)
+                        .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                        .value(0),
+                    (ROWS / 3) as i64
+                );
+
+                // A memo with a NULL entry, put in the slot of a served
+                // plain column before the scan builds its own.
+                let block = dense(true, ROWS);
+                let cfg = cfg();
+                let obj = encode(&block, &cfg);
+                let cache = cache_on(&budget, VIEW_BUDGET);
+                let mixed = || {
+                    (0..ROWS)
+                        .map(|r| (r != 1).then(|| format!("value-{r}")))
+                        .collect::<StringArray>()
+                };
+                let fill_mixed = |view: &ColumnarBlockView<'_>| {
+                    let cid = str_column_id(view).expect("a Str column");
+                    let source = view.str_values_memo(cid).expect("a memo slot");
+                    source.get_or_build(|_, cell| {
+                        let memo = Arc::new(StrMemo {
+                            array: Some(mixed()),
+                            cell,
+                            keys: std::sync::OnceLock::new(),
+                            views: Mutex::new(None),
+                            served: Mutex::new(None),
+                        });
+                        view_registry::insert(&memo);
+                        memo
+                    });
+                };
+                drop(pass_with(&obj, &cfg, &block, &cache, 9, fill_mixed));
+                let served = pass_with(&obj, &cfg, &block, &cache, 9, |_| {});
+                assert_eq!(served.fast, 1);
+                let batch = &served.batches[0];
+                assert_eq!(values_of(batch).null_count(), 1, "the mixed memo");
+                let got = group_key(batch, true);
+                assert_eq!(logical(&got), logical(&group_key(batch, false)));
+                assert!(got.is_null(1), "the NULL entry's row is NULL");
+                assert_eq!(served.counters.view_snapshot().fills, 0);
+                assert_eq!(cache.view_counters().fills, 0);
+                assert_eq!(cache.view_resident_bytes(), 0);
+                assert!(view_registry::views_of(&values_of(batch)).is_none());
+            }
+
+            /// ADR-3326, view memo amendment, T10: a per-scan values array
+            /// whose bytes equal a memo's is not served from it; two plain
+            /// blocks whose rows are all `''` each fill and serve their own
+            /// memo; and once the cache and every batch drop, the registry
+            /// holds none of their memos.
+            #[test]
+            fn the_registry_serves_a_memo_only_its_own_buffers() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                let memo = values_of(&p.batches[0]);
+                let copy: StringArray = memo.iter().collect();
+                assert_eq!(copy.values().as_slice(), memo.values().as_slice());
+                assert_eq!(copy.value_offsets(), memo.value_offsets());
+                assert!(view_registry::views_of(&memo).is_some());
+                assert!(
+                    view_registry::views_of(&copy).is_none(),
+                    "a copy is not the memo"
+                );
+                let mut ids = vec![view_registry::identity(&memo).expect("registered")];
+                drop((p, cache));
+
+                // Two plain memos whose every entry is '', under two
+                // objects, both admitted before either is served. The writer
+                // keeps an all-'' block on a dictionary page, so each plain
+                // column's memo slot is filled with the memo such a block
+                // builds (`build_str_memo` over empty values) before the
+                // scan builds its own. Their values are empty, so both values
+                // buffers have the same dangling address.
+                let cfg = cfg();
+                let block = dense(true, ROWS);
+                let obj = encode(&block, &cfg);
+                let cache = cache_on(&budget, VIEW_BUDGET);
+                let empty_memo = |view: &ColumnarBlockView<'_>| {
+                    let cid = str_column_id(view).expect("a Str column");
+                    let source = view.str_values_memo(cid).expect("a memo slot");
+                    source.get_or_build(|_, cell| {
+                        let buffers = StrBuffers::Plain {
+                            values: Arc::new(String::new()),
+                            offsets: Arc::new(vec![0; ROWS + 1]),
+                        };
+                        let memo = Arc::new(StrMemo {
+                            array: build_str_memo(buffers, Arc::clone(&cell)),
+                            cell,
+                            keys: std::sync::OnceLock::new(),
+                            views: Mutex::new(None),
+                            served: Mutex::new(None),
+                        });
+                        view_registry::insert(&memo);
+                        memo
+                    });
+                };
+                let mut addresses = Vec::new();
+                for object in [1, 2] {
+                    let p = pass_with(&obj, &cfg, &block, &cache, object, empty_memo);
+                    assert_eq!(p.fast, 1, "object {object}: a plain page");
+                    assert!(values_of(&p.batches[0]).iter().all(|v| v == Some("")));
+                    addresses.push(values_of(&p.batches[0]).values().as_ptr());
+                }
+                assert_eq!(
+                    addresses[0], addresses[1],
+                    "the empty values share an address"
+                );
+                let mut served = Vec::new();
+                for object in [1, 2] {
+                    let p = pass(&obj, &cfg, &block, &cache, object);
+                    let batch = &p.batches[0];
+                    let got = group_key(batch, true);
+                    identical(&got, &group_key(batch, false)).expect("identical");
+                    assert_eq!(
+                        p.counters.view_snapshot().fills,
+                        1,
+                        "object {object}: its own memo filled"
+                    );
+                    let views = view_registry::views_of(&values_of(batch)).expect("views");
+                    assert_eq!(
+                        got.as_string_view().views().as_ptr(),
+                        views.views().as_ptr(),
+                        "object {object}: served from its own memo"
+                    );
+                    ids.push(view_registry::identity(&values_of(batch)).expect("registered"));
+                    served.push(p);
+                }
+                assert_eq!(cache.view_resident_bytes(), 2 * VIEW_BYTES);
+                drop((served, cache));
+                for (at, memo) in ids {
+                    assert!(
+                        !view_registry::holds(at, memo),
+                        "a dropped memo left the registry"
+                    );
+                }
+            }
+
+            /// ADR-3326, view memo amendment, T3 with the real memo: a fill
+            /// grows the view total and the budget by exactly the views'
+            /// bytes and moves no data figure; a fill the budget refuses
+            /// leaves no views, counts one refusal and reads as the cast;
+            /// and a batch's views clone keeps the views reserved after the
+            /// cache is gone, since the reservation is on the views buffer's
+            /// owner.
+            #[test]
+            fn real_memo_views_are_charged_to_the_view_budget_not_the_data_cap() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let block = dense(true, ROWS);
+                let cfg = cfg();
+                let obj = encode(&block, &cfg);
+                let cache = cache_on(&budget, VIEW_BUDGET);
+                drop(pass(&obj, &cfg, &block, &cache, 9));
+                let p = pass(&obj, &cfg, &block, &cache, 9);
+                let reserved = budget.reserved();
+                let resident = cache.resident_bytes();
+                let process = cache.process_counters();
+                let pressure = cache.pressure_counters();
+                let data = p.counters.snapshot();
+                let got = group_key(&p.batches[0], true);
+                assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+                assert_eq!(budget.reserved(), reserved + VIEW_BYTES);
+                assert_eq!(cache.resident_bytes(), resident, "resident is data only");
+                assert_eq!(cache.process_counters(), process);
+                assert_eq!(cache.pressure_counters(), pressure);
+                assert_eq!(p.counters.snapshot(), data);
+                assert_eq!(p.counters.view_snapshot().fills, 1);
+                identical(&got, &group_key(&p.batches[0], false)).expect("identical");
+                drop((got, p, cache));
+
+                // A budget one byte short of the views beyond the margin.
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let cache = cache_on(&budget, VIEW_BUDGET);
+                drop(pass(&obj, &cfg, &block, &cache, 9));
+                budget.reserve_unchecked(
+                    LIMIT - budget.reserved() - (admission_margin(LIMIT) + VIEW_BYTES - 1),
+                );
+                let p = pass(&obj, &cfg, &block, &cache, 9);
+                let got = group_key(&p.batches[0], true);
+                identical(&got, &group_key(&p.batches[0], false)).expect("the cast");
+                assert_eq!(p.counters.view_snapshot().refusals, 1);
+                assert_eq!(p.counters.view_snapshot().fills, 0);
+                assert_eq!(cache.view_resident_bytes(), 0);
+                assert!(view_registry::views_of(&values_of(&p.batches[0])).is_none());
+                drop((got, p, cache));
+
+                // What the key column's entry keeps reserved past the cache
+                // when a batch holds only the memo's values (no views), and
+                // then when it holds only the views.
+                let mut kept = Vec::new();
+                for views in [false, true] {
+                    let budget = Arc::new(MemoryBudget::new(LIMIT));
+                    let start = budget.reserved();
+                    let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                    let held: ArrayRef = if views {
+                        group_key(&p.batches[0], true)
+                    } else {
+                        Arc::new(values_of(&p.batches[0]))
+                    };
+                    drop((p, cache));
+                    kept.push(budget.reserved() - start);
+                    drop(held);
+                    assert_eq!(budget.reserved(), start, "views {views}: all released");
+                }
+                assert_eq!(
+                    kept[1],
+                    kept[0] + VIEW_BYTES,
+                    "a views clone keeps the views reserved"
+                );
+            }
+
+            /// ADR-3326, view memo amendment, T4 with the real memo: an entry
+            /// whose views a batch holds, as a clone of the views array, is
+            /// held, so the pressure pass frees neither its views nor its
+            /// data; with no holder it is evictable.
+            #[test]
+            fn an_entry_whose_views_a_batch_holds_is_held_with_the_real_memo() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                let views = group_key(&p.batches[0], true);
+                drop(p);
+                cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
+                assert_eq!(cache.len(), 1, "the key column's entry is held");
+                assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+                assert_eq!(cache.view_counters().releases, 0);
+                drop(views);
+                cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
+                assert_eq!(cache.len(), 0, "with no holder it is evicted");
+                assert_eq!(cache.view_resident_bytes(), 0);
+                assert_eq!(cache.view_counters().releases, 1);
+            }
+
+            /// ADR-3326, view memo amendment, T5 with the real memo: a fill
+            /// the margin refuses under a registered evictor over unheld
+            /// data entries evicts nothing, and every entry still hits.
+            #[test]
+            fn a_real_memo_fill_never_evicts_a_data_entry() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let block = dense(true, ROWS);
+                let cfg = cfg();
+                let obj = encode(&block, &cfg);
+                let cache = cache_on(&budget, VIEW_BUDGET);
+                register(&budget, &cache);
+                let admitted = pass(&obj, &cfg, &block, &cache, 9);
+                let entries = admitted.counters.snapshot().admissions;
+                drop(admitted);
+                budget.reserve_unchecked(
+                    LIMIT - budget.reserved() - (admission_margin(LIMIT) + VIEW_BYTES - 1),
+                );
+                let p = pass(&obj, &cfg, &block, &cache, 9);
+                let got = group_key(&p.batches[0], true);
+                identical(&got, &group_key(&p.batches[0], false)).expect("the cast");
+                assert_eq!(p.counters.view_snapshot().refusals, 1);
+                assert_eq!(cache.pressure_counters().evictions, 0);
+                assert_eq!(cache.process_counters().evictions, 0);
+                drop((got, p));
+                let again = pass(&obj, &cfg, &block, &cache, 9);
+                let s = again.counters.snapshot();
+                assert_eq!((s.hits, s.misses), (entries, 0), "every entry still hits");
+            }
+
+            /// Sets `budget` so the request it returns is refused for
+            /// `gate` (else the ledger) with a shortfall of `shortfall` plus
+            /// `views`, as the ravel-logseg T6 tests do.
+            fn refuse(budget: &MemoryBudget, gate: bool, shortfall: u64, views: u64) -> u64 {
+                if gate {
+                    let n = 64;
+                    budget.set_host_memory_gate(
+                        false,
+                        GATE_FLOOR + n - shortfall - views,
+                        GATE_FLOOR,
+                    );
+                    n
+                } else {
+                    let n = 1 << 20;
+                    let held = budget.reserved() - views;
+                    budget.reserve_unchecked(budget.limit() - held - n + shortfall);
+                    n
+                }
+            }
+
+            /// ADR-3326, view memo amendment, T6 with the real memo: under a
+            /// ledger and a host-gate refusal the views cover, the pass
+            /// releases the view memo, lowers the view total and the budget
+            /// by its bytes and evicts no data entry; under a shortfall above
+            /// the views, B (with views) releases them and frees the same
+            /// data as A (without).
+            #[test]
+            fn real_memo_views_go_first_under_pressure() {
+                for gate in [false, true] {
+                    let budget = Arc::new(MemoryBudget::new(LIMIT));
+                    let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                    register(&budget, &cache);
+                    drop(group_key(&p.batches[0], true));
+                    drop(p);
+                    let resident = cache.resident_bytes();
+                    let before = budget.reserved();
+                    let n = refuse(&budget, gate, VIEW_BYTES, 0);
+                    let filler = budget.reserved() - before;
+                    MemoryBudget::try_reserve(&budget, n).expect("admitted after the pass");
+                    assert_eq!(cache.view_counters().releases, 1, "gate {gate}");
+                    assert_eq!(cache.pressure_counters().evictions, 0, "gate {gate}");
+                    assert_eq!(cache.view_resident_bytes(), 0, "gate {gate}");
+                    assert_eq!(cache.resident_bytes(), resident, "gate {gate}");
+                    assert_eq!(
+                        budget.reserved(),
+                        before + filler + n - VIEW_BYTES,
+                        "gate {gate}: the budget fell by the views"
+                    );
+
+                    let mut arms = Vec::new();
+                    for views in [false, true] {
+                        let budget = Arc::new(MemoryBudget::new(LIMIT));
+                        let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                        register(&budget, &cache);
+                        if views {
+                            drop(group_key(&p.batches[0], true));
+                        }
+                        drop(p);
+                        let view_bytes = cache.view_resident_bytes();
+                        assert_eq!(view_bytes, if views { VIEW_BYTES } else { 0 });
+                        // Above the gate case's 64-byte request, so the
+                        // host reading falls under the floor in A too.
+                        let n = refuse(&budget, gate, 65, view_bytes);
+                        MemoryBudget::try_reserve(&budget, n).expect("admitted after the pass");
+                        arms.push((
+                            cache.pressure_counters(),
+                            cache.view_counters().releases,
+                            cache.view_resident_bytes(),
+                        ));
+                    }
+                    assert!(arms[0].0.evictions > 0, "gate {gate}: A frees data");
+                    assert_eq!(arms[1].0, arms[0].0, "gate {gate}: the same data freed");
+                    assert_eq!((arms[0].1, arms[0].2), (0, 0), "gate {gate}: A");
+                    assert_eq!((arms[1].1, arms[1].2), (1, 0), "gate {gate}: B");
+                }
+            }
+
+            /// ADR-3326, view memo amendment, T7 with the real memo: a CLOCK
+            /// eviction of the key column's entry drops its view memo and
+            /// takes its bytes off the view total; once every batch drops
+            /// the budget is back where it started; and a new fill is
+            /// admitted on a view budget that holds exactly one memo.
+            #[test]
+            fn real_memo_views_go_with_their_entry() {
+                let block = dense(true, ROWS);
+                let cfg = cfg();
+                let obj = encode(&block, &cfg);
+                let one_object = {
+                    let budget = Arc::new(MemoryBudget::new(LIMIT));
+                    let cache = cache_on(&budget, 0);
+                    drop(pass(&obj, &cfg, &block, &cache, 9));
+                    cache.resident_bytes()
+                };
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let start = budget.reserved();
+                let cache = Arc::new(
+                    DecodedColumnCache::new(one_object, Some(Arc::clone(&budget)))
+                        .with_view_max_bytes(VIEW_BYTES),
+                );
+                drop(pass(&obj, &cfg, &block, &cache, 9));
+                let p = pass(&obj, &cfg, &block, &cache, 9);
+                drop(group_key(&p.batches[0], true));
+                drop(p);
+                assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+                // Another object of the same size takes the whole cap.
+                let other = pass(&obj, &cfg, &block, &cache, 8);
+                assert!(
+                    other.counters.snapshot().evictions > 0,
+                    "CLOCK evicted object 9"
+                );
+                assert_eq!(
+                    cache.view_resident_bytes(),
+                    0,
+                    "its views left the view total"
+                );
+                drop(other);
+                let served = pass(&obj, &cfg, &block, &cache, 8);
+                drop(group_key(&served.batches[0], true));
+                assert_eq!(served.counters.view_snapshot().fills, 1, "a new fill fits");
+                assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+                drop(served);
+                cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
+                assert_eq!(cache.len(), 0);
+                assert_eq!(cache.view_resident_bytes(), 0);
+                assert_eq!(budget.reserved(), start, "every reservation released");
+            }
+
+            /// A fill validates the views once: `str_cells_validated` counts
+            /// the memo's entries on the filling evaluation and nothing on a
+            /// later one.
+            #[test]
+            fn a_view_fill_counts_its_validation_once() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (block, obj, cfg, cache, p) = filled(&budget, VIEW_BUDGET);
+                let before = p.validated.value();
+                drop(group_key(&p.batches[0], true));
+                assert_eq!(p.validated.value() - before, ROWS);
+                drop(group_key(&p.batches[0], true));
+                assert_eq!(p.validated.value() - before, ROWS);
+                let later = pass(&obj, &cfg, &block, &cache, 9);
+                drop(group_key(&later.batches[0], true));
+                assert_eq!(later.validated.value(), 0);
             }
         }
     }

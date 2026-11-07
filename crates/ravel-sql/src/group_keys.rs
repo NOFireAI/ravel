@@ -844,7 +844,10 @@ fn rewrite_aggregate(
 /// The dictionary-string group key `expr` as the `Utf8View` the aggregate
 /// groups on, NULL wherever the dictionary is logically NULL: arrow's cast,
 /// or with `view_memo` a [`GroupKeyViews`] over the same input.
-fn group_key_as_view(expr: Arc<dyn PhysicalExpr>, view_memo: bool) -> Arc<dyn PhysicalExpr> {
+pub(crate) fn group_key_as_view(
+    expr: Arc<dyn PhysicalExpr>,
+    view_memo: bool,
+) -> Arc<dyn PhysicalExpr> {
     let keys: Arc<dyn PhysicalExpr> = Arc::new(NullEntriesAsNullKeys::new(expr));
     if view_memo {
         Arc::new(GroupKeyViews::new(keys))
@@ -1198,15 +1201,44 @@ mod tests {
         ctx
     }
 
+    thread_local! {
+        /// Whether [`context`] and [`ravel_session`] build the rule with the
+        /// view memo on, so a test can run both ways on one thread.
+        static VIEW_MEMO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     /// A default session, optionally carrying the rule, built the same way
     /// `crate::session::build_session` does.
     fn context(with_rule: bool) -> SessionContext {
         let mut builder = SessionStateBuilder::new().with_default_features();
         if with_rule {
-            builder = builder
-                .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews::default()));
+            builder = builder.with_physical_optimizer_rule(Arc::new(
+                DictionaryGroupKeysAsViews::with_view_memo(VIEW_MEMO.get()),
+            ));
         }
         SessionContext::new_with_state(builder.build())
+    }
+
+    /// Whether every group key `plan`'s aggregates cast to views is a
+    /// [`GroupKeyViews`] (`true`) or every one a `CastExpr` (`false`); `None`
+    /// for a mix or none.
+    fn group_keys_are_views(plan: &Arc<dyn ExecutionPlan>) -> Option<bool> {
+        let mut aggregates = Vec::new();
+        collect_aggregates(plan, &mut aggregates);
+        let kinds: Vec<bool> = aggregates
+            .iter()
+            .filter_map(|a| a.downcast_ref::<AggregateExec>())
+            .flat_map(|a| a.group_expr().expr().to_vec())
+            .filter_map(|(expr, _)| {
+                if expr.downcast_ref::<GroupKeyViews>().is_some() {
+                    Some(true)
+                } else {
+                    expr.downcast_ref::<CastExpr>().map(|_| false)
+                }
+            })
+            .collect();
+        let first = *kinds.first()?;
+        kinds.iter().all(|&k| k == first).then_some(first)
     }
 
     fn collect_aggregates(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
@@ -1296,19 +1328,73 @@ mod tests {
         (logical, table)
     }
 
+    /// ADR-3326, view memo amendment, T11: the q13 shape (a filtered
+    /// `COUNT(DISTINCT ..)` under a TopK) plans to the same EXPLAIN text with
+    /// the view memo on and off, groups on [`GroupKeyViews`] when on, and
+    /// restores the key to `Dictionary(Int32, Utf8)`.
+    #[tokio::test]
+    async fn the_view_memo_plan_explains_as_the_cast() {
+        const Q13: &str = "SELECT k, count(DISTINCT v) AS u FROM t WHERE k <> 'a' GROUP BY k ORDER BY u DESC LIMIT 10";
+        let mut texts = Vec::new();
+        for view_memo in [false, true] {
+            VIEW_MEMO.set(view_memo);
+            let plan = dict_context(true)
+                .sql(Q13)
+                .await
+                .expect("query plans")
+                .create_physical_plan()
+                .await
+                .expect("physical plan");
+            assert_eq!(
+                group_keys_are_views(&plan),
+                Some(view_memo),
+                "{}",
+                show(&plan)
+            );
+            assert_eq!(plan.schema().field(0).data_type(), &dict_type());
+            texts.push(show(&plan));
+        }
+        VIEW_MEMO.set(false);
+        assert!(
+            texts[0].contains("CAST(null_entries_as_null_keys(k"),
+            "{}",
+            texts[0]
+        );
+        assert_eq!(texts[0], texts[1]);
+    }
+
+    /// Also ADR-3326, view memo amendment, T11: the same with the rule's
+    /// view memo on, whose plan groups on [`GroupKeyViews`].
     #[tokio::test]
     async fn results_and_types_match_the_unrewritten_plan() {
-        for sql in DIFFERENTIAL {
-            let (before_schema, before) = run(false, sql).await;
-            let (after_schema, after) = run(true, sql).await;
+        for view_memo in [false, true] {
+            VIEW_MEMO.set(view_memo);
+            for sql in DIFFERENTIAL {
+                let (before_schema, before) = run(false, sql).await;
+                let (after_schema, after) = run(true, sql).await;
 
-            assert_eq!(before_schema, after_schema, "{sql}");
-            assert_eq!(before, after, "{sql}");
-            // The baseline really is the dictionary path this rule exists to
-            // avoid.
-            assert_eq!(before_schema.field(0).data_type(), &dict_type(), "{sql}");
-            assert!(before.lines().count() > 4, "{sql} returned no rows");
+                assert_eq!(before_schema, after_schema, "{sql} view memo {view_memo}");
+                assert_eq!(before, after, "{sql} view memo {view_memo}");
+                // The baseline really is the dictionary path this rule exists
+                // to avoid.
+                assert_eq!(before_schema.field(0).data_type(), &dict_type(), "{sql}");
+                assert!(before.lines().count() > 4, "{sql} returned no rows");
+                let plan = dict_context(true)
+                    .sql(sql)
+                    .await
+                    .expect("query plans")
+                    .create_physical_plan()
+                    .await
+                    .expect("physical plan");
+                assert_eq!(
+                    group_keys_are_views(&plan),
+                    Some(view_memo),
+                    "{sql}: {}",
+                    show(&plan)
+                );
+            }
         }
+        VIEW_MEMO.set(false);
         // The TopK shape returns its top two groups, so the comparison above
         // is not over an empty or truncated answer.
         let (_, top) = run(true, DIFFERENTIAL[1]).await;
@@ -1742,6 +1828,15 @@ mod tests {
         );
         let store: Arc<dyn ravel_object_store::ObjectStoreBackend> =
             Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let mut fetcher = ravel_query::LogSegmentFetcher::new(store);
+        if VIEW_MEMO.get() {
+            // A decoded cache with a view budget turns the session's view
+            // memo on (`build_session_with_tables`).
+            fetcher = fetcher.with_decoded_cache(Arc::new(
+                ravel_logseg::decoded_cache::DecodedColumnCache::new(1 << 20, None)
+                    .with_view_max_bytes(1 << 20),
+            ));
+        }
         let logs = crate::LogsTableProvider::new(
             ravel_catalog::Snapshot {
                 segments: Vec::new(),
@@ -1749,7 +1844,7 @@ mod tests {
                 pending_erasure: Vec::new(),
             },
             ravel_types::TenantHash([0u8; 16]),
-            ravel_query::LogSegmentFetcher::new(store),
+            fetcher,
             ravel_query::PhaseAccounting::new(),
         );
         let ctx = build_session(
@@ -1839,8 +1934,20 @@ mod tests {
     /// nulls from the keys only, so the five rows over the NULL entry with an
     /// empty slot joined `""` and the two over the `zz` slot formed a group
     /// of their own.
+    ///
+    /// Also ADR-3326, view memo amendment, T11: the same through a session
+    /// whose decoded cache has a view budget, which groups on
+    /// [`GroupKeyViews`].
     #[tokio::test]
     async fn a_null_dictionary_entry_groups_with_null() {
+        for view_memo in [false, true] {
+            VIEW_MEMO.set(view_memo);
+            null_dictionary_entry_case(view_memo).await;
+        }
+        VIEW_MEMO.set(false);
+    }
+
+    async fn null_dictionary_entry_case(view_memo: bool) {
         let dict = null_entry_fixture();
         let ctx = ravel_session(key_batch(dict.clone()));
         let want: Groups = vec![
@@ -1867,6 +1974,12 @@ mod tests {
                     .iter()
                     .all(|agg| agg.schema().field(0).data_type() == &DataType::Utf8View),
             "the session groups on views: {}",
+            show(&plan)
+        );
+        assert_eq!(
+            group_keys_are_views(&plan),
+            Some(view_memo),
+            "{}",
             show(&plan)
         );
         assert_eq!(session_groups(&ctx, grouped).await, want);
