@@ -1425,7 +1425,10 @@ pub struct Cli {
     /// a volume larger than its share (an `emptyDir` with a size limit on the
     /// node's root disk). A two-level unit is admitted against the smaller of
     /// the volume's free bytes and this cap less the bytes already under the
-    /// directory. Omitted, the volume's free bytes alone decide. Zero, or a
+    /// directory. A running unit whose next run write would take the
+    /// directory past the cap stops before that write and is refused under
+    /// `ravel_maintain_compaction_refused_total{reason="scratch_headroom"}`.
+    /// Omitted, the volume's free bytes alone decide. Zero, or a
     /// value without `--maintain-scratch-dir`, is refused at startup.
     #[arg(long = "maintain-scratch-max-bytes", value_name = "BYTES")]
     pub maintain_scratch_max_bytes: Option<u64>,

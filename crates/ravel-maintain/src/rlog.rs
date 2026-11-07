@@ -2550,9 +2550,7 @@ async fn two_level_merge(
     let stored = catalogs
         .iter()
         .fold(0u64, |a, c| a.saturating_add(c.object_size));
-    let need = stored
-        .saturating_mul(scratch_need_percent())
-        .div_ceil(100);
+    let need = stored.saturating_mul(scratch_need_percent()).div_ceil(100);
     let scratch_dir = target.scratch_dir.to_path_buf();
     scratch_blocking(move || {
         std::fs::create_dir_all(&scratch_dir).map_err(|e| {
