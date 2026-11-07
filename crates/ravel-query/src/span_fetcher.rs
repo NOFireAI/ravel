@@ -2401,7 +2401,12 @@ impl LeafRangeReader for SpanLeafRangeReader<'_> {
                 )
                 .in_get_phase(QueryPhase::KeyIndex.into())
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| match e {
+                    SpanFetchError::FetchMemoryExhausted { .. } => {
+                        LeafReadError::ReservationRefused(e.to_string())
+                    }
+                    e => LeafReadError::Failed(e.to_string()),
+                })?;
             if bytes.len() as u64 != len {
                 return Err(format!(
                     "leaf {}: short read, {} bytes of {len}",
