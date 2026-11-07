@@ -4025,16 +4025,25 @@ struct PageBatch {
 }
 
 /// The coalesced footprint of one batch's ranges in one page section (TS,
-/// VAL or HIST). A range whose start is at or above every earlier range's
-/// start extends the run it bridges to when it starts within `gap` of the
-/// tail, and opens a new run otherwise, so for ranges added in ascending
-/// start order `bytes` is exactly what [`coalesce_ranges`] makes of them,
-/// bridged gaps included. A range that starts below an earlier range's start
-/// is counted in full and bridges nothing, which can over-count it, the safe
-/// direction for the reservation [`page_batches`] bounds by these bytes.
+/// VAL or HIST).
+///
+/// A well-formed segment gives each section's ranges in ascending offset
+/// order: page offsets are running totals in run order (docs/segment-format.md,
+/// "Page locations reconstruct per run"), and [`page_batches`] adds them in
+/// catalog order, run by run. A range whose start is at or above every earlier
+/// range's start extends the run it bridges to when it starts within `gap` of
+/// the tail and opens a new run otherwise, so ascending ranges are counted
+/// exactly as [`coalesce_ranges`] counts them, bridged gaps included.
+///
+/// A range that starts below the largest start seen so far, which only a
+/// malformed catalog produces, is counted as its length plus two gaps:
+/// inserted into a sorted set, a range adds at most its own length plus one
+/// bridged gap on each side. That is an upper bound, which can over-count and
+/// never undercounts, the safe direction for the reservation [`page_batches`]
+/// bounds by these bytes.
 #[derive(Debug, Clone, Copy, Default)]
 struct SectionSpan {
-    /// Start of the section's first range, `None` while the batch holds none.
+    /// Smallest start of any range so far, `None` while the batch holds none.
     first: Option<u64>,
     /// Largest start of any range so far.
     last_start: u64,
@@ -4047,14 +4056,14 @@ struct SectionSpan {
 impl SectionSpan {
     fn add(&mut self, (start, end): (u64, u64), gap: u64) {
         let end = end.max(start);
-        if self.first.is_some() && start < self.last_start {
-            self.bytes = self.bytes.saturating_add(end - start);
-        } else if self.first.is_some() && start <= self.tail.saturating_add(gap) {
-            self.bytes = self.bytes.saturating_add(end.saturating_sub(self.tail));
-        } else {
-            self.first.get_or_insert(start);
-            self.bytes = self.bytes.saturating_add(end - start);
-        }
+        let len = end - start;
+        let added = match self.first {
+            Some(_) if start < self.last_start => len.saturating_add(gap.saturating_mul(2)),
+            Some(_) if start <= self.tail.saturating_add(gap) => end.saturating_sub(self.tail),
+            _ => len,
+        };
+        self.bytes = self.bytes.saturating_add(added);
+        self.first = Some(self.first.map_or(start, |first| first.min(start)));
         self.last_start = self.last_start.max(start);
         self.tail = self.tail.max(end);
     }
@@ -4062,8 +4071,8 @@ impl SectionSpan {
 
 /// The bytes the coalesced runs over a batch's ranges cover: each section's
 /// own coalesced bytes, plus the gap [`coalesce_ranges`] bridges where one
-/// section's last run ends within `gap` of the next section's first range
-/// (the page sections are disjoint and laid out one after another).
+/// section's last run ends within `gap` of the next section's lowest range
+/// start (the page sections are disjoint and laid out one after another).
 fn coalesced_batch_bytes(sections: &[SectionSpan; 3], gap: u64) -> u64 {
     let mut present: Vec<(u64, &SectionSpan)> = sections
         .iter()
@@ -9799,20 +9808,114 @@ mod tests {
         }
     }
 
-    /// An out-of-order range is counted in full; ascending ranges keep the
-    /// coalesced arithmetic.
+    /// An out-of-order range is counted as its length plus two gaps; ascending
+    /// ranges keep the coalesced arithmetic.
     #[test]
     fn section_span_counts_an_out_of_order_range_in_full() {
-        let bytes = |ranges: &[(u64, u64)]| {
+        let bytes = |ranges: &[(u64, u64)], gap: u64| {
             let mut span = SectionSpan::default();
             for &range in ranges {
-                span.add(range, 0);
+                span.add(range, gap);
             }
             span.bytes
         };
-        assert_eq!(bytes(&[(100, 200), (0, 50)]), 150);
-        assert_eq!(bytes(&[(0, 100), (50, 120)]), 120);
-        assert_eq!(bytes(&[(0, 100), (10, 20)]), 100);
+        let coalesced = |ranges: &[(u64, u64)], gap: u64| -> u64 {
+            coalesce_ranges(ranges.to_vec(), gap)
+                .iter()
+                .map(|(start, end)| end - start)
+                .sum()
+        };
+        assert_eq!(bytes(&[(100, 200), (0, 50)], 0), 150);
+        assert_eq!(bytes(&[(0, 100), (50, 120)], 0), 120);
+        assert_eq!(bytes(&[(0, 100), (10, 20)], 0), 100);
+
+        // At the production gap the second range bridges the 60000 bytes up
+        // to the first: coalesce_ranges makes one 110000-byte run of them.
+        let late = [(100_000, 110_000), (0, 40_000)];
+        assert_eq!(coalesced(&late, DEFAULT_COALESCE_GAP), 110_000);
+        assert_eq!(
+            bytes(&late, DEFAULT_COALESCE_GAP),
+            10_000 + 40_000 + 2 * DEFAULT_COALESCE_GAP
+        );
+        assert_eq!(bytes(&late, DEFAULT_COALESCE_GAP), 181_072);
+
+        // The largest start, not the last one, decides what is out of order:
+        // (60, 70) starts below 100 and is counted in full.
+        let twice = [(100, 200), (0, 50), (60, 70)];
+        assert_eq!(coalesced(&twice, 0), 160);
+        assert_eq!(bytes(&twice, 0), 160);
+    }
+
+    /// A section's lowest range, not its first one added, is where the bridge
+    /// from the section before it is measured.
+    #[test]
+    fn coalesced_batch_bytes_bridges_to_a_section_lowest_range() {
+        let gap = 10;
+        let mut sections = [SectionSpan::default(); 3];
+        sections[0].add((900, 1_000), gap);
+        sections[1].add((1_050, 1_060), gap);
+        sections[1].add((1_005, 1_010), gap);
+        assert_eq!(sections[1].first, Some(1_005));
+        assert_eq!(sections[0].bytes, 100);
+        assert_eq!(sections[1].bytes, 10 + 5 + 2 * gap);
+        let expected: u64 =
+            coalesce_ranges(vec![(900, 1_000), (1_050, 1_060), (1_005, 1_010)], gap)
+                .iter()
+                .map(|(start, end)| end - start)
+                .sum();
+        assert_eq!(expected, 120);
+        // 100 + 35 in the sections plus the 5-byte bridge from 1000 to 1005.
+        assert_eq!(coalesced_batch_bytes(&sections, gap), 140);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(256))]
+
+        /// Over three disjoint sections laid out one after another, with
+        /// ranges in any order, the batch figure is never below what
+        /// `coalesce_ranges` makes of the same ranges; with each section's
+        /// ranges added in ascending start order it is exactly that.
+        #[test]
+        fn section_span_never_undercounts_the_coalesced_runs(
+            gap in proptest::sample::select(vec![0u64, 10, 4096, DEFAULT_COALESCE_GAP]),
+            raw in proptest::collection::vec((0usize..3, 0u64..1_000_000, 0u64..4_000), 1..=40usize),
+            shifts in (0u64..200_000, 0u64..200_000),
+        ) {
+            // Place section k + 1 at or past section k's largest end, so the
+            // sections are disjoint and in TS, VAL, HIST order, as in a
+            // segment, with a random space between them that may be bridged.
+            let mut extent = [0u64; 3];
+            for &(s, offset, len) in &raw {
+                extent[s] = extent[s].max(offset + len);
+            }
+            let base = [0, extent[0] + shifts.0, extent[0] + shifts.0 + extent[1] + shifts.1];
+            let in_order: Vec<(usize, (u64, u64))> = raw
+                .iter()
+                .map(|&(s, offset, len)| (s, (base[s] + offset, base[s] + offset + len)))
+                .collect();
+            let expected: u64 = coalesce_ranges(in_order.iter().map(|(_, r)| *r).collect(), gap)
+                .iter()
+                .map(|(start, end)| end - start)
+                .sum();
+
+            let mut any_order = [SectionSpan::default(); 3];
+            for &(s, range) in &in_order {
+                any_order[s].add(range, gap);
+            }
+            let counted = coalesced_batch_bytes(&any_order, gap);
+            proptest::prop_assert!(
+                counted >= expected,
+                "undercount: {counted} < {expected} at gap {gap} for {in_order:?}"
+            );
+
+            let mut ascending_input = in_order.clone();
+            ascending_input.sort_by_key(|(s, (start, _))| (*s, *start));
+            let mut ascending = [SectionSpan::default(); 3];
+            for &(s, range) in &ascending_input {
+                ascending[s].add(range, gap);
+            }
+            proptest::prop_assert_eq!(coalesced_batch_bytes(&ascending, gap), expected);
+        }
     }
 }
 
