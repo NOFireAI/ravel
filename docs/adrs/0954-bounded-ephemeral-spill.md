@@ -617,8 +617,8 @@ completion, error and cancellation alike. A query admitted while no other
 holds a reservation reserves the whole ceiling, so while it runs a
 concurrent eligible query runs with spill disabled; that is the price of
 the bound. (The refusal-retry spill amendment below replaces the
-whole-ceiling reservation with fixed shares, reserved only on a spill
-retry.) The
+whole-ceiling reservation with fixed shares, reserved on a spill retry or,
+for a statement that keeps the per-statement decision, at planning.) The
 per-tenant quota is not implemented, and nothing bounds the sum across
 processes, so several processes sharing one cache volume can together hold
 more than one ceiling: one spilling process per volume stays the safe
@@ -897,9 +897,12 @@ answered, but three properties of the decision above cost the rest:
      time, as before.
    - A statement that keeps the per-statement decision (Flight SQL, until
      it has the retry) reserves one share the same way, at planning. When
-     no share of at least the minimum remains, it runs with spill disabled.
-     One plan-time statement therefore never takes the whole ceiling from
-     the retries.
+     no share of at least the minimum remains, it runs with spill disabled,
+     and the reason is logged at WARN.
+   - A plan-time statement therefore never holds more than one share. Where
+     the ceiling has two or more slots, the retries keep the others. Where
+     it has one, which is a ceiling under 16 GiB or the sub-64 MiB
+     exception, that one share is the whole ceiling, as it is for a retry.
 5. **Spill is on by default.** With no `--sql-spill off`, no environment
    pair and no `--cache-dir`, spill resolves as item 3 of the cache-dir
    spill default amendment does, with two differences: the process's
