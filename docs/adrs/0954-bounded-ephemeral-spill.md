@@ -926,9 +926,14 @@ answered, but three properties of the decision above cost the rest:
    purpose stands: the directory is never the OS temp directory and never
    memory-backed, and the ceiling is never DataFusion's 100 GB default.
 
-   On the repository's container image the working directory is `/` and
-   is not writable, so a container resolves `cwd-unavailable` unless it
-   mounts a volume and names it.
+   The repository's container image sets no working directory of its own.
+   It runs in `/home/nonroot`, the working directory of its distroless
+   `nonroot` base image:
+   - Under the operator the root filesystem is read-only, so the server
+     resolves `cwd-unavailable`, unless the container mounts a volume and
+     names it.
+   - Run on its own, `/home/nonroot` is writable and spill is on, in the
+     image's overlay storage.
 
 The ordering matters: item 5 without item 1 would bring the repartition-free
 plan back to every eligible statement on every default deployment.
