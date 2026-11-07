@@ -1021,8 +1021,11 @@ operator, not another retry.
 
 ### Compaction refused for merge geometry
 
-**Symptom.** `increase(ravel_maintain_compaction_refused_total{reason="geometry"}[1h]) > 0`,
-and a warn line `compaction refused a bucket: its cursor merge would decode
+**Symptom.** `ravel_maintain_compaction_refused_total{reason="geometry"} > 0`:
+the counter is nonzero since the process started. Alert on that, not on
+`increase(...[1h])`, because the refusal is memoized until the process
+restarts, so the counter moves once per bucket and an hourly increase stops
+showing it after the first hour. A warn line `compaction refused a bucket: its cursor merge would decode
 more than max_amplification rows per input record` naming the signal, shard
 and ingest hour.
 
@@ -1035,7 +1038,8 @@ would read the same blocks many times over. The refusal happens after the
 catalog reads and before the first block is fetched. Nothing is fetched or
 published, the claim is released, and the L0 inputs stay live, so queries
 still read the bucket. A cursor bucket under the ratio, with few streams per
-block, compacts as before.
+block, compacts as before. A bucket predicting at most 10 million decoded
+rows is never refused, whatever its ratio.
 
 **Confirm.** The counter on `/metrics` and the warn line, which carries the
 inputs, streams, blocks, records and predicted decoded rows.
