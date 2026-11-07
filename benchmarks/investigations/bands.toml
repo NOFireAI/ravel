@@ -431,8 +431,9 @@ miss_reason = "fewer keyIndex GETs than objects above 512 KiB: one was read with
 # (box C: 519 - 26 = 493). The plan keeps objects at or under 512 KiB out
 # only when it skips sub-bound plans (plan.rs, skips_sub_bound_plans);
 # otherwise it opens them unprobed and they would count as survivors. When
-# the equality fails the figure reads incomplete with the precondition as its
-# reason, never a hold or a miss. A small object pruned by stats also breaks
+# the equality fails, or the census carries no objects_over_512k for the
+# statement's tenant and signal, the figure reads incomplete with the
+# precondition as its reason, never a hold or a miss. A small object pruned by stats also breaks
 # the equality (it is in segmentsPrunedByStats but not in objects_over_512k),
 # which reads incomplete too: the safe direction.
 [[row.figure]]
