@@ -4854,7 +4854,10 @@ mod tests {
     /// ones. Changing this process's working directory would race the other
     /// tests, so the test binary re-runs itself with the working directory set
     /// to a temporary directory under the binary's own (disk-backed) target
-    /// directory, and that child reports what it resolved.
+    /// directory, and that child reports what it resolved and which working
+    /// directory its probes read. `cwd-insufficient-space` passes as well as
+    /// `cwd-default`: the free-space probe is real, and a nearly full build
+    /// volume is not a regression in which directory was probed.
     #[test]
     fn prepare_sql_spill_reads_the_process_working_directory() {
         assert_spill_env_unset();
@@ -4882,17 +4885,41 @@ mod tests {
             "child failed: {stdout}{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let report = stdout
-            .lines()
-            .find_map(|line| line.split_once("SPILL-CHILD ").map(|(_, report)| report))
-            .unwrap_or_else(|| panic!("the child reported nothing: {stdout}"));
+        let field = |name: &str| {
+            let prefix = format!("SPILL-CHILD {name}=");
+            let mut values = stdout
+                .lines()
+                .filter_map(|line| line.split_once(prefix.as_str()).map(|(_, value)| value));
+            let value = values
+                .next()
+                .unwrap_or_else(|| panic!("the child reported no {name}: {stdout}"));
+            assert!(
+                values.next().is_none(),
+                "the child reported {name} twice: {stdout}"
+            );
+            value
+        };
+        let (source, cwd, dir) = (field("source"), field("cwd"), field("dir"));
+        // The real free-space probe runs, so a nearly full build volume
+        // resolves off for lack of space; either way the probes must have
+        // read the child's working directory.
         assert_eq!(
-            report,
-            format!(
-                "dir={} source={SQL_SPILL_SOURCE_CWD_DEFAULT}",
-                cwd_path.join("sql-spill").join(INSTANCE).display()
-            )
+            cwd,
+            cwd_path.display().to_string(),
+            "source={source} dir={dir}"
         );
+        match source {
+            SQL_SPILL_SOURCE_CWD_DEFAULT => assert_eq!(
+                dir,
+                cwd_path
+                    .join("sql-spill")
+                    .join(INSTANCE)
+                    .display()
+                    .to_string()
+            ),
+            SQL_SPILL_SOURCE_CWD_INSUFFICIENT_SPACE => assert_eq!(dir, "none"),
+            other => panic!("unexpected source={other} cwd={cwd} dir={dir}"),
+        }
     }
 
     /// The child half of [`prepare_sql_spill_reads_the_process_working_directory`].
@@ -4908,10 +4935,15 @@ mod tests {
             || "none".to_string(),
             |config| config.dir.display().to_string(),
         );
-        println!(
-            "SPILL-CHILD dir={dir} source={}",
-            startup.resolved.dir_source
+        // The working directory the probes read, carried in the inputs both
+        // when spill resolves on and when the free space is too little.
+        let cwd = startup.inputs.cache_dir.as_ref().map_or_else(
+            || "none".to_string(),
+            |cache| cache.cache_dir.display().to_string(),
         );
+        println!("SPILL-CHILD source={}", startup.resolved.dir_source);
+        println!("SPILL-CHILD cwd={cwd}");
+        println!("SPILL-CHILD dir={dir}");
     }
 
     /// The working-directory default resolves off with
