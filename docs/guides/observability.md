@@ -2433,10 +2433,11 @@ query incurred up to that point, not zeros:
 ### Key-index routing (`ravel_query_key_index_*`)
 
 Two counters cover the tier-2 key-index router, which answers an exact-key
-lookup (a spans `trace_id =`, or a logs scan's one declared-key equality) from
-the per-part key-index leaves. Every mode renders both on every scrape, for both
-`signal="spans"` and `signal="logs"` and every `outcome`, zeros included, so a
-rate over `outcome="covered"` exists before the first lookup. Neither carries
+lookup (a spans `trace_id =`, a logs scan's one declared-key equality, or one
+positive equality value of a PromQL selector) from the per-part key-index
+leaves. Every mode renders both on every scrape, for `signal="spans"`,
+`signal="logs"` and `signal="metrics"` and every `outcome`, zeros included, so
+a rate over `outcome="covered"` exists before the first lookup. Neither carries
 `tenant_hash` or `workload_class`. The logs samples move for a statement
 over SQL on `POST /api/v1/sql`, ES|QL on `POST /api/v1/esql`, and the MCP
 tools that run SQL, `search_logs` among them. Flight SQL, pinned and
@@ -2445,12 +2446,16 @@ per-object probe and leave the logs samples unmoved. A logs
 leaf at `format_version` 1 counts under `outcome="rejected"`. A logs leaf
 range the fetch memory budget refuses counts under
 `outcome="reservation_refused"`; a spans leaf range it refuses counts under
-`outcome="rejected"`.
+`outcome="rejected"`. The metrics samples move for a PromQL evaluation whose
+selector carries a positive equality matcher, one routing pass per distinct
+value; a selector with none, and every selector of a tenant with a pending
+erasure, leaves them unmoved. A metrics leaf range the fetch memory budget
+refuses counts under `outcome="reservation_refused"`.
 
 | Metric | Labels | HELP text |
 |---|---|---|
-| `ravel_query_key_index_parts_total` | `mode`, `signal`, `outcome` (`covered`, `uncovered`, `beyond_ceiling`, `rejected`, `reservation_refused`, `skipped_by_budget`) | Catalog parts the key-index router settled for an exact-key lookup, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object KEY_IDX probe. |
-| `ravel_query_key_index_leaf_gets_total` | `mode`, `signal` | Key-index leaf GETs the router issued for exact-key lookups, by signal, including those of a routing pass dropped before it finished. |
+| `ravel_query_key_index_parts_total` | `mode`, `signal`, `outcome` (`covered`, `uncovered`, `beyond_ceiling`, `rejected`, `reservation_refused`, `skipped_by_budget`) | Catalog parts the key-index router settled for an exact-key lookup or a PromQL equality value, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object probe. |
+| `ravel_query_key_index_leaf_gets_total` | `mode`, `signal` | Key-index leaf GETs the router issued for exact-key lookups and PromQL equality values, by signal, including those of a routing pass dropped before it finished. |
 
 A single lookup's figures come back in the response's `stats.keyIndex`
 ([query engine reference](../query-engine.md)). The test

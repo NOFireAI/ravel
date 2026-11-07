@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
 use promql_parser::parser::{Expr, Offset};
-use ravel_catalog::{Catalog, SegmentOrigin, SegmentRef, ShardGeneration, Snapshot};
+use ravel_catalog::{
+    Catalog, SegmentOrigin, SegmentRef, ShardGeneration, Snapshot, SnapshotParts,
+};
 use ravel_cpu_gate::{JobSize, ReadGate, ReadSite};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
@@ -82,6 +84,12 @@ pub struct QueryStats {
     /// decision 1, issue #3862). Counted within `segments_fetched`, which
     /// counts the objects opened, not the objects that yielded series.
     pub segments_pruned_by_dictionary: u64,
+    /// Snapshot segments the label-value route (ADR-3694 decision 3) dropped
+    /// for every selector before any was opened: a segment counts once
+    /// every distinct selector that would have read it had a positive
+    /// equality value its part's leaves prove absent. Not counted in
+    /// `segments_fetched`. Zero when no metrics leaf covers the snapshot.
+    pub segments_pruned_by_label_index: u64,
     /// Fetched sparse objects whose probe read LABEL_DICT alone before the
     /// rest of the catalog, paying one GET a one-step probe would not. An
     /// object whose LABEL_DICT the footer tail already held is checked with
@@ -166,6 +174,7 @@ impl QueryStats {
             segments_fetched,
             segments_pruned,
             segments_pruned_by_dictionary: dictionary_probe.segments_pruned_by_dictionary,
+            segments_pruned_by_label_index: 0,
             segments_probed_two_step: dictionary_probe.segments_probed_two_step,
             dictionary_probe_switched_off: dictionary_probe.switched_off,
             page_stats,
@@ -189,6 +198,7 @@ impl Default for QueryStats {
             segments_fetched: 0,
             segments_pruned: 0,
             segments_pruned_by_dictionary: 0,
+            segments_pruned_by_label_index: 0,
             segments_probed_two_step: 0,
             dictionary_probe_switched_off: false,
             page_stats: FetchStats::default(),
@@ -450,6 +460,9 @@ struct ResolvedBounded {
     /// equalities are names; a recent or token-resolved segment never
     /// passed through the postings and is not here.
     postings_filtered: std::collections::HashSet<String>,
+    /// The snapshot's parts and each segment's place in them, from this
+    /// resolve, when the caller asked for them (ADR-3692 decision 1).
+    parts: Option<SnapshotParts>,
 }
 
 /// Resolves snapshots, fetches segments, merges cross-segment duplicates,
@@ -1325,7 +1338,8 @@ impl QueryEngine {
         let attempt = |snapshot: Snapshot,
                        _generations: Vec<ShardGeneration>,
                        accounting: PhaseAccounting,
-                       fold_lag: FoldLag| async move {
+                       fold_lag: FoldLag,
+                       _parts: Option<SnapshotParts>| async move {
             // The bytes-scanned budget (ADR-0061 decision 1) is enforced
             // inside `fetch_all_series`, once per completed segment fetch, so a
             // labels/series query that matches zero series still evaluates the
@@ -1402,6 +1416,7 @@ impl QueryEngine {
                 1,
                 1,
                 true, // metadata_only: discovery never fetches pages.
+                false, // with_parts: discovery routes nothing.
                 attempt,
             )
             .await?;
@@ -1431,7 +1446,8 @@ impl QueryEngine {
         let attempt = |snapshot: Snapshot,
                        _generations: Vec<ShardGeneration>,
                        accounting: PhaseAccounting,
-                       fold_lag: FoldLag| async move {
+                       fold_lag: FoldLag,
+                       _parts: Option<SnapshotParts>| async move {
             let erasure = snapshot_erasure_predicates(&snapshot);
             let req = log_series::LogSeriesRequest {
                 metric,
@@ -1491,6 +1507,7 @@ impl QueryEngine {
                 1,
                 1,
                 true, // metadata_only: log discovery never fetches pages.
+                false, // with_parts: log discovery routes nothing.
                 attempt,
             )
             .await?;
@@ -1690,6 +1707,7 @@ impl QueryEngine {
                 now_ns,
                 None,
                 false, // names_only: the log lane runs no dictionary probe.
+                false, // with_parts: the log lane routes nothing here.
                 log_accounting.resolve(),
             )
             .await?;
@@ -2042,7 +2060,8 @@ impl QueryEngine {
         let attempt = |snapshot: Snapshot,
                        generations: Vec<ShardGeneration>,
                        accounting: PhaseAccounting,
-                       fold_lag: FoldLag| async move {
+                       fold_lag: FoldLag,
+                       parts: Option<SnapshotParts>| async move {
             // Owned clones, not borrowed slice items: a closure capturing a
             // reference into `plans` through this combinator chain makes
             // rustc infer a fixed (non-higher-ranked) lifetime for the
@@ -2116,13 +2135,40 @@ impl QueryEngine {
             // its own fold.
             let scalar_fold =
                 std::sync::Mutex::new(ScalarFold::new(Arc::clone(&self.memory_budget), max_series));
-            let results: Vec<Result<PerPlan, QueryError>> = stream::iter(distinct_plans)
-                .map(|plan| {
+            // ADR-3694 decision 3: before any segment is opened, each distinct
+            // matcher set keeps only the segments none of its positive
+            // equality values is routed away from. Every plan's segments come
+            // from the one snapshot resolved over the padded union window.
+            let plan_keeps = self
+                .route_metric_plans(
+                    tenant_hash,
+                    &snapshot,
+                    parts.as_ref(),
+                    &distinct_plans,
+                    &accounting,
+                )
+                .await?;
+            drop(parts);
+            let pruned_by_label_index =
+                segments_pruned_by_label_index(&plan_keeps, snapshot.segments.len());
+            let plan_snapshots: Vec<Option<Snapshot>> = plan_keeps
+                .iter()
+                .map(|keep| {
+                    keep.as_deref()
+                        .filter(|keep| keep.iter().any(|kept| !kept))
+                        .map(|keep| snapshot_subset(&snapshot, keep))
+                })
+                .collect();
+            let results: Vec<Result<PerPlan, QueryError>> = stream::iter(
+                distinct_plans.into_iter().zip(plan_snapshots),
+            )
+                .map(|(plan, routed)| {
                     let snapshot = &snapshot;
                     let accounting = &accounting;
                     let pushdown_target = &pushdown_target;
                     let scalar_fold = &scalar_fold;
                     async move {
+                        let snapshot = routed.as_ref().unwrap_or(snapshot);
                         // ADR-0103 live: send the partial-aggregate request for
                         // the one eligible matcher set, `None` for every other
                         // plan. A worker that receives `Some(..)` returns ONLY
@@ -2353,12 +2399,13 @@ impl QueryEngine {
                     fed_warnings,
                     fed_partial,
                     excludes_spend,
+                    pruned_by_label_index,
                 ),
                 page_stats,
             ))
         };
 
-        let ((source, warnings, partial, excludes_spend), mut stats) = self
+        let ((source, warnings, partial, excludes_spend, pruned_by_label_index), mut stats) = self
             .resolve_snapshot_with_retry(
                 tenant_hash,
                 Signal::Metrics,
@@ -2370,13 +2417,122 @@ impl QueryEngine {
                 fetch_multiplier,
                 service_fetch_multiplier,
                 false, // metadata_only: this path fetches scalar/histogram pages.
+                true,  // with_parts: the label-value route reads the parts.
                 attempt,
             )
             .await?;
         stats.partial = partial;
         stats.warnings = warnings;
         stats.estimate_excludes_spend = excludes_spend;
+        stats.segments_pruned_by_label_index = pruned_by_label_index;
+        stats.segments_fetched = stats.segments_fetched.saturating_sub(pruned_by_label_index);
         Ok((source, stats))
+    }
+
+    /// The label-value route (ADR-3694 decision 3, per-value routing
+    /// amendment): for each of `plans`, `Some(keep)` parallel to
+    /// `snapshot.segments` when the plan was routed, `None` when it reads the
+    /// whole snapshot. Each distinct positive equality value, `__name__`
+    /// included, is routed once as its own one-key set on the metrics leaf
+    /// field, and a plan drops a segment when any of its values routes it
+    /// [`SegmentRoute::Pruned`](crate::key_index_route::SegmentRoute): the
+    /// values are a conjunction, while one multi-key set prunes a part only
+    /// when every key is absent. Blocks and Uncovered both keep the segment.
+    /// Negative, regex and empty-value matchers route nothing, and a plan with
+    /// no positive equality is not routed. Nothing is routed while the
+    /// snapshot carries a pending erasure, or when `parts` is `None`.
+    async fn route_metric_plans(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: &Snapshot,
+        parts: Option<&SnapshotParts>,
+        plans: &[SelectorPlan],
+        accounting: &PhaseAccounting,
+    ) -> Result<Vec<Option<Vec<bool>>>, QueryError> {
+        use crate::key_index_route::{KeySet, RouteError, RouteInput, SegmentRoute, route};
+        let unrouted = || vec![None; plans.len()];
+        let Some(parts) = parts else {
+            return Ok(unrouted());
+        };
+        if !snapshot.pending_erasure.is_empty() || snapshot.segments.is_empty() {
+            return Ok(unrouted());
+        }
+        let plan_values: Vec<Vec<&str>> = plans
+            .iter()
+            .map(|plan| positive_equality_values(&plan.matchers))
+            .collect();
+        let mut values: Vec<&str> = plan_values.iter().flatten().copied().collect();
+        values.sort_unstable();
+        values.dedup();
+        if values.is_empty() {
+            return Ok(unrouted());
+        }
+        let key_sets: Vec<(&str, KeySet)> = values
+            .iter()
+            .filter_map(|value| {
+                KeySet::new(
+                    ravel_catalog::METRICS_LABEL_VALUE_FIELD,
+                    ravel_codec::key_idx::KeyType::Str,
+                    vec![ravel_codec::key_idx::key8_str(value)],
+                )
+                .ok()
+                .map(|set| (*value, set))
+            })
+            .collect();
+        let reader = crate::fetcher::MetricLeafRangeReader::new(&self.fetcher, tenant_hash);
+        let routed = futures::future::join_all(key_sets.iter().map(|(value, key_set)| {
+            let input = RouteInput {
+                catalog: &self.catalog,
+                snapshot,
+                parts,
+                signal: Signal::Metrics,
+                tenant_hash,
+                key_set,
+                accounting,
+                reader: &reader,
+                budget: &self.memory_budget,
+                limits: ravel_catalog::KeyIndexLeafLimits::default(),
+            };
+            async move { (*value, route(input).await) }
+        }))
+        .await;
+        let mut pruned_by_value: HashMap<&str, Vec<bool>> = HashMap::with_capacity(routed.len());
+        for (value, result) in routed {
+            match result {
+                Ok((routes, _figures)) => {
+                    pruned_by_value.insert(
+                        value,
+                        routes
+                            .iter()
+                            .map(|r| matches!(r, SegmentRoute::Pruned))
+                            .collect(),
+                    );
+                }
+                Err(RouteError::Isolation { source, .. }) => return Err(source.into()),
+                // The parts came from the same resolve as the snapshot, so a
+                // mismatch is not expected; reading every segment stays exact.
+                Err(RouteError::InvalidInput(reason)) => {
+                    tracing::warn!(%reason, "metrics label-value route skipped");
+                }
+            }
+        }
+        Ok(plan_values
+            .iter()
+            .map(|values| {
+                if values.is_empty() {
+                    return None;
+                }
+                let mut keep = vec![true; snapshot.segments.len()];
+                for value in values {
+                    if let Some(pruned) = pruned_by_value.get(value) {
+                        for (kept, pruned) in keep.iter_mut().zip(pruned) {
+                            *kept &= !*pruned;
+                        }
+                    }
+                }
+                Some(keep)
+            })
+            .collect())
     }
 
     /// A fresh accounting handle for one PromQL lane or attempt. Every PromQL
@@ -2439,13 +2595,17 @@ impl QueryEngine {
         // `false` for the metrics evaluation path, which then classifies by
         // the resolve's own pruning outcome below.
         metadata_only: bool,
+        // Whether the resolve also returns the snapshot's parts (ADR-3692
+        // decision 1), which the attempt then receives as `Some`.
+        with_parts: bool,
         mut attempt: F,
     ) -> Result<(T, QueryStats), QueryError>
     where
         // The `FoldLag` is this attempt's own resolve verdict (ADR-1306
         // decision 6): a retry re-resolves, so the second attempt's fetches
         // are checked against the second resolve's tail, never the first's.
-        F: FnMut(Snapshot, Vec<ShardGeneration>, PhaseAccounting, FoldLag) -> Fut,
+        // The parts, when asked for, come from the same resolve.
+        F: FnMut(Snapshot, Vec<ShardGeneration>, PhaseAccounting, FoldLag, Option<SnapshotParts>) -> Fut,
         Fut: std::future::Future<Output = Result<(T, FetchStats), QueryError>>,
     {
         // The catalog term (ADR-0044 decision 3) is the same for both
@@ -2481,6 +2641,7 @@ impl QueryEngine {
             unfolded_segments_resolved: first_unfolded,
             fold_lag: first_fold_lag,
             postings_filtered: first_postings_filtered,
+            parts: first_parts,
         } = self
             .resolve_bounded(
                 tenant_hash,
@@ -2490,6 +2651,7 @@ impl QueryEngine {
                 now_ns,
                 name_filter,
                 names_only,
+                with_parts,
                 first_accounting.resolve(),
             )
             .await?;
@@ -2526,6 +2688,7 @@ impl QueryEngine {
             first_generations,
             first_accounting.clone(),
             first_fold_lag,
+            first_parts,
         )
         .await
         {
@@ -2541,6 +2704,7 @@ impl QueryEngine {
                     unfolded_segments_resolved: second_unfolded,
                     fold_lag: second_fold_lag,
                     postings_filtered: second_postings_filtered,
+                    parts: second_parts,
                 } = self
                     .resolve_bounded(
                         tenant_hash,
@@ -2550,6 +2714,7 @@ impl QueryEngine {
                         now_ns,
                         name_filter,
                         names_only,
+                        with_parts,
                         second_accounting.resolve(),
                     )
                     .await?;
@@ -2580,6 +2745,7 @@ impl QueryEngine {
                     second_generations,
                     second_accounting.clone(),
                     second_fold_lag,
+                    second_parts,
                 )
                 .await
                 {
@@ -2634,6 +2800,7 @@ impl QueryEngine {
         now_ns: i64,
         name_filter: Option<&str>,
         names_only: bool,
+        with_parts: bool,
         accounting: &QueryAccounting,
     ) -> Result<ResolvedBounded, QueryError> {
         // `resolve_pruned_with_generations` returns the shard-generation history
@@ -2641,18 +2808,37 @@ impl QueryEngine {
         // pushdown eligibility gate reads exactly this copy, never a separately
         // re-read one, so a generation appended between two reads can never be
         // visible in the resolved segments while invisible to the gate.
-        let (snapshot, origins, generations) = self
-            .catalog
-            .resolve_pruned_with_generations(
-                &tenant_hash,
-                signal,
-                window,
-                min_tokens,
-                now_ns,
-                name_filter,
-                accounting,
-            )
-            .await?;
+        // With `with_parts`, the parts come from the same resolve as the
+        // generations, so both read one scan set.
+        let (snapshot, origins, generations, parts) = if with_parts {
+            let (snapshot, origins, generations, parts) = self
+                .catalog
+                .resolve_pruned_with_parts_and_generations(
+                    &tenant_hash,
+                    signal,
+                    window,
+                    min_tokens,
+                    now_ns,
+                    name_filter,
+                    accounting,
+                )
+                .await?;
+            (snapshot, origins, generations, Some(parts))
+        } else {
+            let (snapshot, origins, generations) = self
+                .catalog
+                .resolve_pruned_with_generations(
+                    &tenant_hash,
+                    signal,
+                    window,
+                    min_tokens,
+                    now_ns,
+                    name_filter,
+                    accounting,
+                )
+                .await?;
+            (snapshot, origins, generations, None)
+        };
         // Sealed, below-watermark segments count against `max_segments`;
         // recent and token-resolved segments are exempt (ADR-0073 decision
         // 2). Their cost is bounded separately by the request budget
@@ -2692,6 +2878,7 @@ impl QueryEngine {
             unfolded_segments_resolved,
             fold_lag,
             postings_filtered,
+            parts,
         })
     }
 
@@ -4035,6 +4222,49 @@ fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<Cow<'a, 
 /// Whether every non-empty positive equality across `plans` matches
 /// `__name__`, the statement shape whose dictionary-first probe prunes
 /// nothing once the name postings applied (issue #3862).
+/// The values of `matchers`' positive equalities (`=` with a non-empty
+/// value), `__name__` included: what the label-value route probes.
+fn positive_equality_values(matchers: &[LabelMatcher]) -> Vec<&str> {
+    matchers
+        .iter()
+        .filter(|m| m.op == MatchOp::Eq && !m.value.is_empty())
+        .map(|m| m.value.as_str())
+        .collect()
+}
+
+/// The segments of `snapshot` that `keep` marks, with its erasure and
+/// postings figures.
+fn snapshot_subset(snapshot: &Snapshot, keep: &[bool]) -> Snapshot {
+    Snapshot {
+        segments: snapshot
+            .segments
+            .iter()
+            .zip(keep)
+            .filter(|(_, kept)| **kept)
+            .map(|(segment, _)| segment.clone())
+            .collect(),
+        segments_pruned: snapshot.segments_pruned,
+        pending_erasure: snapshot.pending_erasure.clone(),
+    }
+}
+
+/// Segments no plan reads after the label-value route: zero when any plan
+/// went unrouted, since that plan reads every segment.
+fn segments_pruned_by_label_index(plan_keeps: &[Option<Vec<bool>>], segments: usize) -> u64 {
+    let mut read = vec![false; segments];
+    for keep in plan_keeps {
+        match keep {
+            None => return 0,
+            Some(keep) => {
+                for (read, kept) in read.iter_mut().zip(keep) {
+                    *read |= *kept;
+                }
+            }
+        }
+    }
+    read.iter().filter(|read| !**read).count() as u64
+}
+
 fn only_name_equalities(plans: &[SelectorPlan]) -> bool {
     plans
         .iter()

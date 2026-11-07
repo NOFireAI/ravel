@@ -98,6 +98,10 @@ pub struct QueryStatsJson {
     pub segments_fetched: u64,
     #[serde(rename = "segmentsPruned")]
     pub segments_pruned: u64,
+    /// Snapshot segments the label-value route dropped before any was opened
+    /// (ADR-3694 decision 3, issue #3865); not counted in `segmentsFetched`.
+    #[serde(rename = "segmentsPrunedByLabelIndex")]
+    pub segments_pruned_by_label_index: u64,
     /// Fetched sparse objects the dictionary-first probe dropped on a
     /// LABEL_DICT miss (ADR-3694 decision 1, issue #3862).
     #[serde(rename = "segmentsPrunedByDictionary")]
@@ -155,6 +159,7 @@ impl From<crate::QueryStats> for QueryStatsJson {
         QueryStatsJson {
             segments_fetched: stats.segments_fetched,
             segments_pruned: stats.segments_pruned,
+            segments_pruned_by_label_index: stats.segments_pruned_by_label_index,
             segments_pruned_by_dictionary: stats.segments_pruned_by_dictionary,
             segments_probed_two_step: stats.segments_probed_two_step,
             dictionary_probe_switched_off: stats.dictionary_probe_switched_off,
@@ -1492,6 +1497,26 @@ mod tests {
         assert_eq!(value["segmentsPrunedByDictionary"], 0);
         assert_eq!(value["segmentsProbedTwoStep"], 0);
         assert_eq!(value["dictionaryProbeSwitchedOff"], false);
+    }
+
+    /// The label-value route's prune count renders beside `segmentsPruned`
+    /// from its own field, and reads zero by default.
+    #[test]
+    fn stats_json_carries_the_label_index_prune_count() {
+        let stats = crate::QueryStats {
+            segments_pruned: 2,
+            segments_pruned_by_label_index: 9,
+            segments_pruned_by_dictionary: 5,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(QueryStatsJson::from(stats)).expect("serializes");
+        assert_eq!(value["segmentsPruned"], 2);
+        assert_eq!(value["segmentsPrunedByLabelIndex"], 9);
+        assert_eq!(value["segmentsPrunedByDictionary"], 5);
+
+        let value =
+            serde_json::to_value(QueryStatsJson::from(crate::QueryStats::default())).expect("json");
+        assert_eq!(value["segmentsPrunedByLabelIndex"], 0);
     }
 
     #[test]

@@ -1494,10 +1494,12 @@ async fn route_totals_add_every_part_outcome_and_leaf_get_under_the_signal() {
             outcome.as_str()
         );
         assert_eq!(run.totals.parts(Signal::Logs, outcome), 0);
+        assert_eq!(run.totals.parts(Signal::Metrics, outcome), 0);
     }
     assert_eq!(run.totals.leaf_gets(SIGNAL), figures.leaf_get_requests);
     assert!(figures.leaf_get_requests > 0);
     assert_eq!(run.totals.leaf_gets(Signal::Logs), 0);
+    assert_eq!(run.totals.leaf_gets(Signal::Metrics), 0);
     assert_eq!(
         KeyIndexPartOutcome::ALL.map(KeyIndexPartOutcome::as_str),
         [
@@ -1509,6 +1511,29 @@ async fn route_totals_add_every_part_outcome_and_leaf_get_under_the_signal() {
             "skipped_by_budget",
         ]
     );
+}
+
+/// Spans, logs and metrics each have their own row (ADR-3694 decision 3
+/// routes metrics), and a metrics pass counts under its own row.
+#[test]
+fn every_routed_signal_has_its_own_row() {
+    assert_eq!(
+        key_index_routed_signals(),
+        &[Signal::Spans, Signal::Logs, Signal::Metrics]
+    );
+    let totals = RouteTotals::new();
+    let figures = RouteFigures {
+        parts_covered: 2,
+        ..RouteFigures::default()
+    };
+    totals.add_parts(Signal::Metrics, &figures);
+    totals.add_leaf_gets(Signal::Metrics, 5);
+    assert_eq!(totals.parts(Signal::Metrics, KeyIndexPartOutcome::Covered), 2);
+    assert_eq!(totals.leaf_gets(Signal::Metrics), 5);
+    for signal in [Signal::Spans, Signal::Logs] {
+        assert_eq!(totals.parts(signal, KeyIndexPartOutcome::Covered), 0);
+        assert_eq!(totals.leaf_gets(signal), 0);
+    }
 }
 
 #[test]
