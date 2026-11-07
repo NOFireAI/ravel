@@ -4025,15 +4025,19 @@ struct PageBatch {
 }
 
 /// The coalesced footprint of one batch's ranges in one page section (TS,
-/// VAL or HIST). Within a section a batch's ranges arrive in ascending offset
-/// order (series in catalog order, each series' runs back to back), so a
-/// range that starts within `gap` of the tail extends the run it bridges to
-/// and any other range opens a new run: `bytes` is exactly what
-/// [`coalesce_ranges`] makes of the section's ranges, bridged gaps included.
+/// VAL or HIST). A range whose start is at or above every earlier range's
+/// start extends the run it bridges to when it starts within `gap` of the
+/// tail, and opens a new run otherwise, so for ranges added in ascending
+/// start order `bytes` is exactly what [`coalesce_ranges`] makes of them,
+/// bridged gaps included. A range that starts below an earlier range's start
+/// is counted in full and bridges nothing, which can over-count it, the safe
+/// direction for the reservation [`page_batches`] bounds by these bytes.
 #[derive(Debug, Clone, Copy, Default)]
 struct SectionSpan {
     /// Start of the section's first range, `None` while the batch holds none.
     first: Option<u64>,
+    /// Largest start of any range so far.
+    last_start: u64,
     /// Largest end of any range so far.
     tail: u64,
     /// Coalesced bytes so far.
@@ -4043,12 +4047,15 @@ struct SectionSpan {
 impl SectionSpan {
     fn add(&mut self, (start, end): (u64, u64), gap: u64) {
         let end = end.max(start);
-        if self.first.is_some() && start <= self.tail.saturating_add(gap) {
+        if self.first.is_some() && start < self.last_start {
+            self.bytes = self.bytes.saturating_add(end - start);
+        } else if self.first.is_some() && start <= self.tail.saturating_add(gap) {
             self.bytes = self.bytes.saturating_add(end.saturating_sub(self.tail));
         } else {
             self.first.get_or_insert(start);
             self.bytes = self.bytes.saturating_add(end - start);
         }
+        self.last_start = self.last_start.max(start);
         self.tail = self.tail.max(end);
     }
 }
@@ -4093,10 +4100,10 @@ fn coalesced_batch_bytes(sections: &[SectionSpan; 3], gap: u64) -> u64 {
 /// what bounds it by the bytes counted here. Counting ranges those regions
 /// already hold over-counts, the safe direction.
 ///
-/// A series whose runs reach past the end of its kind's planned list is an
-/// inconsistency between the catalog entries and the planned ranges, and
-/// fails with [`SegmentError::SectionOutOfBounds`](ravel_segment::SegmentError::SectionOutOfBounds)
-/// rather than batching the series with fewer plans than runs.
+/// A planned list shorter or longer than the runs of its kind's series in
+/// `wanted` is an inconsistency between the catalog entries and the planned
+/// ranges, and fails with [`SegmentError::SectionOutOfBounds`](ravel_segment::SegmentError::SectionOutOfBounds)
+/// rather than batching with fewer plans than runs or leaving plans unused.
 fn page_batches(
     wanted: &[&SeriesEntryV4],
     scalar_planned: &[ravel_segment::PlannedRunRange],
@@ -4167,6 +4174,9 @@ fn page_batches(
             current.scalar.end = scalar;
             current.scalar_plans.end = scalar_plans;
         }
+    }
+    if scalar_plans != scalar_planned.len() || histogram_plans != histogram_planned.len() {
+        return Err(ravel_segment::SegmentError::SectionOutOfBounds);
     }
     if !(current.scalar.is_empty() && current.histogram.is_empty()) {
         batches.push(current);
@@ -9689,6 +9699,120 @@ mod tests {
             "a series with more runs than planned ranges must refuse, got {:?}",
             result.map(|b| b.iter().map(|b| b.scalar_plans.clone()).collect::<Vec<_>>()),
         );
+    }
+
+    /// A planned list with more entries than its kind's runs refuses for
+    /// either kind, and exact lists for a mixed set still batch, each list
+    /// covered once end to end.
+    #[test]
+    fn page_batches_refuses_a_plan_list_longer_than_the_runs() {
+        let entry = |name: &str, kind: ValueKind, runs: u64| {
+            let series_id = SeriesId::compute(&TenantId::new("t".to_string()), name, &labels(name))
+                .expect("id");
+            SeriesEntryV4 {
+                entry: SeriesEntry {
+                    series_id,
+                    labels: labels(name),
+                    sample_count: runs as u32,
+                    min_ts_ns: 0,
+                    max_ts_ns: 0,
+                    ts_page: (0, 0),
+                    val_page: (0, 0),
+                    value_kind: kind,
+                    hist_page: (0, 0),
+                },
+                runs: (0..runs)
+                    .map(|i| RunEntry {
+                        created_unix_ns: 0,
+                        writer_epoch: 0,
+                        writer_seq: i,
+                        sample_count: 1,
+                        min_ts_ns: 0,
+                        max_ts_ns: 0,
+                        ts_page: (i * 8, 8),
+                        val_page: (i * 8, 8),
+                        hist_page: (i * 8, 8),
+                    })
+                    .collect(),
+                per_sample_provenance: Vec::new(),
+            }
+        };
+        // `g` numbers the runs across both kinds in catalog order, so every
+        // run's TS range follows the previous run's directly.
+        let plan = |e: &SeriesEntryV4, run: u64, g: u64| ravel_segment::PlannedRunRange {
+            series_id: e.entry.series_id,
+            run_index: run as usize,
+            ts_range: (100 + g * 8, 8),
+            val_range: if e.entry.value_kind == ValueKind::Histogram {
+                (0, 0)
+            } else {
+                (1_000 + g * 8, 8)
+            },
+            hist_range: if e.entry.value_kind == ValueKind::Histogram {
+                (2_000 + g * 8, 8)
+            } else {
+                (0, 0)
+            },
+        };
+        let a = entry("a", ValueKind::Scalar, 2);
+        let h = entry("h", ValueKind::Histogram, 2);
+        let b = entry("b", ValueKind::Scalar, 1);
+        let wanted = [&a, &h, &b];
+        let scalar_list = || vec![plan(&a, 0, 0), plan(&a, 1, 1), plan(&b, 0, 4)];
+        let histogram_list = || vec![plan(&h, 0, 2), plan(&h, 1, 3)];
+        let (scalar, histogram) = (scalar_list(), histogram_list());
+
+        // (i) One surplus scalar entry.
+        let mut surplus_scalar = scalar_list();
+        surplus_scalar.push(plan(&b, 1, 5));
+        assert_eq!(
+            page_batches(&wanted, &surplus_scalar, &histogram, u64::MAX, 0),
+            Err(ravel_segment::SegmentError::SectionOutOfBounds),
+            "a surplus scalar plan must refuse"
+        );
+
+        // (ii) One surplus histogram entry.
+        let mut surplus_histogram = histogram_list();
+        surplus_histogram.push(plan(&h, 2, 5));
+        assert_eq!(
+            page_batches(&wanted, &scalar, &surplus_histogram, u64::MAX, 0),
+            Err(ravel_segment::SegmentError::SectionOutOfBounds),
+            "a surplus histogram plan must refuse"
+        );
+
+        // (iii) Exact lists batch. Each run is 16 coalesced bytes, so at 32
+        // bytes per batch `a`, `h` and `b` land in three batches.
+        let batches = page_batches(&wanted, &scalar, &histogram, 32, 0).expect("consistent plans");
+        let scalar_plans: Vec<_> = batches.iter().map(|b| b.scalar_plans.clone()).collect();
+        let histogram_plans: Vec<_> = batches.iter().map(|b| b.histogram_plans.clone()).collect();
+        assert_eq!(scalar_plans, vec![0..2, 2..2, 2..3]);
+        assert_eq!(histogram_plans, vec![0..0, 0..2, 2..2]);
+        for (plans, len) in [
+            (&scalar_plans, scalar.len()),
+            (&histogram_plans, histogram.len()),
+        ] {
+            assert_eq!(plans.first().map(|r| r.start), Some(0));
+            assert_eq!(plans.last().map(|r| r.end), Some(len));
+            for pair in plans.windows(2) {
+                assert_eq!(pair[0].end, pair[1].start, "plan ranges must be contiguous");
+            }
+        }
+    }
+
+    /// An out-of-order range is counted in full; ascending ranges keep the
+    /// coalesced arithmetic.
+    #[test]
+    fn section_span_counts_an_out_of_order_range_in_full() {
+        let bytes = |ranges: &[(u64, u64)]| {
+            let mut span = SectionSpan::default();
+            for &range in ranges {
+                span.add(range, 0);
+            }
+            span.bytes
+        };
+        assert_eq!(bytes(&[(100, 200), (0, 50)]), 150);
+        assert_eq!(bytes(&[(0, 100), (50, 120)]), 120);
+        assert_eq!(bytes(&[(0, 100), (10, 20)]), 100);
     }
 }
 
