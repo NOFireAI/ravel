@@ -8603,7 +8603,12 @@ mod prefetch_tests {
     /// engine's memory budget. Eight keys of about 2.5 KB each against a
     /// 6656-byte budget, which also holds the fetch's sample fold (about
     /// 5.9 KB) beside the 438 bytes the segment fetch still holds while the
-    /// fold absorbs, both released before evaluation: the first two are
+    /// fold absorbs, both released before evaluation. Of those 438 bytes, 351
+    /// are the open GET (the whole object), which the open now reserves, and
+    /// 87 the decoded catalog's reservation. An L0 segment is one batch and
+    /// does not need them held through the fold; the hold comes from sharing
+    /// the batched path, and it is why this budget is 6656 bytes rather than
+    /// 6144. With it the first two are
     /// cached, the other six are read at every step, the response carries one
     /// info naming them, the answer is the unconstrained one, and the budget
     /// is back to zero afterwards. The six fallbacks are not refusals the

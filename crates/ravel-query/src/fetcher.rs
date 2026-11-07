@@ -8053,10 +8053,10 @@ mod tests {
 
     /// A series whose own coalesced bytes exceed `fetch_batch_bytes` is a
     /// batch alone, and that batch reserves exactly its own coalesced bytes.
-    /// The part is smaller than the default coalesce gap, so one series' timestamp
-    /// and value pages are bridged across the section boundary: each series
-    /// coalesces to far more than its pages, and the batch bound sits between
-    /// the two.
+    /// The part is smaller than the default coalesce gap, so one series'
+    /// timestamp and value pages are bridged across the section boundary:
+    /// each series coalesces to far more than its pages, and the batch bound
+    /// sits between the two.
     #[tokio::test]
     async fn a_series_over_the_batch_bytes_is_fetched_alone() {
         const COUNT: usize = 64;
@@ -8132,7 +8132,7 @@ mod tests {
         assert_eq!(batched.decoded(), whole.decoded(), "the same samples");
     }
 
-    /// The batch count `page_batches` sizes against is exactly what
+    /// The byte count `page_batches` sizes batches against is exactly what
     /// `coalesce_ranges` makes of the same ranges, bridged gaps included, both
     /// inside a page section and across the boundary between two sections.
     #[test]
