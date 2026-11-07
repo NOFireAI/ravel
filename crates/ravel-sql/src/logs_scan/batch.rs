@@ -7392,6 +7392,39 @@ mod tests {
                 let again = pass(&obj, &cfg, &block, &cache, 9);
                 let s = again.counters.snapshot();
                 assert_eq!((s.hits, s.misses), (entries, 0), "every entry still hits");
+                drop(again);
+
+                // A full view budget: object 9's views fill it, so object 8's
+                // fill is refused, and object 9 keeps its entries and views.
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let cache = cache_on(&budget, VIEW_BYTES);
+                register(&budget, &cache);
+                for object in [9, 8] {
+                    drop(pass(&obj, &cfg, &block, &cache, object));
+                }
+                let first = pass(&obj, &cfg, &block, &cache, 9);
+                drop(group_key(&first.batches[0], true));
+                assert_eq!(first.counters.view_snapshot().fills, 1);
+                drop(first);
+                let second = pass(&obj, &cfg, &block, &cache, 8);
+                let got = group_key(&second.batches[0], true);
+                identical(&got, &group_key(&second.batches[0], false)).expect("the cast");
+                assert_eq!(
+                    second.counters.view_snapshot().refusals,
+                    1,
+                    "the view budget is full"
+                );
+                drop((got, second));
+                assert_eq!(
+                    cache.view_resident_bytes(),
+                    VIEW_BYTES,
+                    "object 9 keeps its views"
+                );
+                assert_eq!(cache.pressure_counters().evictions, 0);
+                assert_eq!(cache.process_counters().evictions, 0);
+                let again = pass(&obj, &cfg, &block, &cache, 9);
+                let s = again.counters.snapshot();
+                assert_eq!((s.hits, s.misses), (entries, 0), "object 9 still hits");
             }
 
             /// Sets `budget` so the request it returns is refused for
