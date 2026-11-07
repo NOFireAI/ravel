@@ -8184,12 +8184,13 @@ mod tests {
         let (bytes, tenant_hash, seg_ref) = batched_l1_segment(96, 128, true);
         let every_third: Vec<String> = (0..96).step_by(3).map(|i| format!("b{i:03}")).collect();
         let selective = [LabelMatcher::regex("__name__", every_third.join("|")).expect("regex")];
-        // (case, matchers, coalesce gap, page sections the selection touches)
-        let cases: [(&str, &[LabelMatcher], u64, u64); 2] = [
-            ("every series, zero gap", &[], 0, 3),
-            ("every third series, 512-byte gap", &selective, 512, 3),
+        // (case, matchers, coalesce gap, page sections the selection touches,
+        // batches)
+        let cases: [(&str, &[LabelMatcher], u64, u64, u64); 2] = [
+            ("every series, zero gap", &[], 0, 3, 23),
+            ("every third series, 512-byte gap", &selective, 512, 3, 23),
         ];
-        for (label, matchers, gap, sections) in cases {
+        for (label, matchers, gap, sections, expected_batches) in cases {
             let whole = batch_run(&bytes, tenant_hash, &seg_ref, matchers, |f| {
                 ranged_l1(f)
                     .with_coalesce_gap(gap)
@@ -8208,7 +8209,7 @@ mod tests {
             })
             .await;
             let batches = batched.batches.len() as u64;
-            assert!(batches >= 10, "{label}: {batches} batches");
+            assert_eq!(batches, expected_batches, "{label}: batches");
             assert_eq!(batched.decoded(), whole.decoded(), "{label}: same samples");
             assert!(
                 batched.scan_gets() <= whole.scan_gets() + sections * (batches - 1),
@@ -8253,7 +8254,7 @@ mod tests {
                 )))
         })
         .await;
-        assert!(fits.batches.len() >= 8, "{} batches", fits.batches.len());
+        assert_eq!(fits.batches.len(), 9, "batches");
         let first_batch = fits.batches[0].batch_reserved;
         let open_and_catalog_gets = fits.store_gets - fits.scan_gets();
 

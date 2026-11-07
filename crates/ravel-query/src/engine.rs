@@ -12373,6 +12373,12 @@ mod l1_batch_tests {
         .map(|(value, _stats)| value)
     }
 
+    /// One series in ten is selected at the default coalesce gap, and the
+    /// part's timestamp section is shorter than the gap, so every batch's
+    /// timestamp pages are bridged into one run and the first series' run
+    /// bridges into the value section too. Every batch of more than one
+    /// series reserves at most `fetch_batch_bytes`; a series over it is a
+    /// batch alone.
     #[tokio::test]
     async fn an_l1_part_over_the_fetch_limit_answers_in_batches() {
         let store = l1_tenant().await;
@@ -12425,18 +12431,86 @@ mod l1_batch_tests {
             "the same answer as unlimited"
         );
         let observed: Vec<BatchObservation> = probe.lock().expect("probe").clone();
-        assert!(observed.len() >= 2, "{} batches", observed.len());
+        let batch_bytes = batched.fetcher.fetch_batch_bytes();
+        let sizes: Vec<(usize, u64)> = observed
+            .iter()
+            .map(|b| (b.series, b.batch_reserved))
+            .collect();
         for (i, b) in observed.iter().enumerate() {
             assert!(
-                b.batch_reserved < whole_pages,
-                "batch {i}: {} B, the whole call {whole_pages} B",
+                b.series == 1 || b.batch_reserved <= batch_bytes,
+                "batch {i}: {} series reserve {} B, over fetch_batch_bytes ({batch_bytes} B)",
+                b.series,
                 b.batch_reserved
             );
         }
+        assert_eq!(
+            observed.len(),
+            21,
+            "(series, reserved B) per batch against {batch_bytes} B: {sizes:?}"
+        );
         let batched_pages: u64 = observed.iter().map(|b| b.batch_reserved).sum();
         assert!(
             batched_pages <= whole_pages,
             "the batches reserve {batched_pages} B, the whole call {whole_pages} B"
         );
+    }
+
+    /// A batch after the first that the fetch limit refuses fails the whole
+    /// statement with `FetchMemoryExhausted`: the batch before it was fetched
+    /// and folded, and the query still returns no samples, so batches already
+    /// folded never become a partial answer. The batches are sized by the
+    /// floor alone, since every limit here sits below `2 * PERMITS` floors;
+    /// the limit fits batch 0 with its fold and is one byte short of batch 1.
+    #[tokio::test]
+    async fn a_later_batch_over_the_limit_fails_the_statement_with_no_samples() {
+        let store = l1_tenant().await;
+        let probe = Arc::default();
+        let whole = engine(Arc::clone(&store), None, u64::MAX, Arc::clone(&probe));
+        query(&whole).await.expect("answers");
+        let whole_pages = probe.lock().expect("probe")[0].batch_reserved;
+        let floor = whole_pages / 4;
+
+        let probe = Arc::default();
+        let fits = engine(
+            Arc::clone(&store),
+            Some(2 * PERMITS as u64 * floor),
+            floor,
+            Arc::clone(&probe),
+        );
+        assert_eq!(fits.fetcher.fetch_batch_bytes(), floor);
+        query(&fits).await.expect("a limit of every batch answers");
+        let observed: Vec<BatchObservation> = probe.lock().expect("probe").clone();
+        let sizes: Vec<u64> = observed.iter().map(|b| b.batch_reserved).collect();
+        assert_eq!(observed.len(), 5, "batches: {sizes:?}");
+        assert!(
+            observed[1].batch_reserved > observed[0].batch_reserved,
+            "batch 1 is larger than batch 0: {sizes:?}"
+        );
+        // Before batch 1 reserves, the budget holds the catalog and batch 0's
+        // fold; batch 0's peak is the same with batch 0's pages in place of
+        // batch 1's, so it fits.
+        let limit = observed[1].budget_reserved - 1;
+
+        let probe = Arc::default();
+        let refusing = engine(Arc::clone(&store), Some(limit), floor, Arc::clone(&probe));
+        assert_eq!(refusing.fetcher.fetch_batch_bytes(), floor);
+        let refused = query(&refusing)
+            .await
+            .expect_err("batch 1 over the limit fails the statement");
+        match refused {
+            QueryError::Fetch(FetchError::FetchMemoryExhausted {
+                requested,
+                limit: refused_limit,
+                ..
+            }) => {
+                assert_eq!(requested, observed[1].batch_reserved, "batch 1's bytes");
+                assert_eq!(refused_limit, limit);
+            }
+            other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+        }
+        let seen: Vec<BatchObservation> = probe.lock().expect("probe").clone();
+        assert_eq!(seen.len(), 1, "batch 0 was fetched and folded first");
+        assert_eq!(seen[0].batch_reserved, observed[0].batch_reserved);
     }
 }
