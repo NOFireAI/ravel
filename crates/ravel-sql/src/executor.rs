@@ -1096,8 +1096,9 @@ pub struct ScanTiming {
     /// decision A2), all partitions.
     pub prefetch_memory_reopens: u64,
     pub prefetch_revocations: u64,
-    /// Refused opens that narrowed the statement's fan-out to one partition
-    /// at a time instead of failing, all partitions.
+    /// Retried opens refused again while sibling partitions held opens, each
+    /// of which narrowed the statement's fan-out instead of failing it
+    /// (issue #3899), all partitions.
     pub fan_out_narrowings: u64,
     /// Synchronous decode plus Arrow build inside `poll_next`.
     pub decode_build_elapsed_ns: u64,
@@ -11726,10 +11727,10 @@ pub(crate) mod tests {
         )
     }
 
-    /// `SqlStats::scan_timing` carries the logs scan's two prefetch-pool
+    /// `SqlStats::scan_timing` carries the logs scan's three prefetch-pool
     /// counters, summed over partitions beside `reopens`, under the metric
-    /// names the scan publishes. Fails against a fold that leaves either
-    /// field out (it reads 0).
+    /// names the scan publishes. Fails against a fold that leaves any of
+    /// them out (it reads 0).
     #[test]
     fn scan_timing_sums_the_prefetch_pool_counters() {
         use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
@@ -11744,6 +11745,12 @@ pub(crate) mod tests {
         MetricBuilder::new(&set)
             .counter("prefetch_revocations", 0)
             .add(3);
+        MetricBuilder::new(&set)
+            .counter("fan_out_narrowings", 0)
+            .add(1);
+        MetricBuilder::new(&set)
+            .counter("fan_out_narrowings", 1)
+            .add(3);
         MetricBuilder::new(&set).counter("reopens", 1).add(1);
         let mut timing = ScanTiming::default();
         accumulate_scan_timing(&set.clone_inner(), &mut timing);
@@ -11751,9 +11758,10 @@ pub(crate) mod tests {
             (
                 timing.reopens,
                 timing.prefetch_memory_reopens,
-                timing.prefetch_revocations
+                timing.prefetch_revocations,
+                timing.fan_out_narrowings
             ),
-            (1, 2, 3)
+            (1, 2, 3, 4)
         );
         let rendered = format!("{timing:?}");
         assert!(
@@ -11761,6 +11769,7 @@ pub(crate) mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("prefetch_revocations: 3"), "{rendered}");
+        assert!(rendered.contains("fan_out_narrowings: 4"), "{rendered}");
     }
 
     /// A logs statement's dependency depth reads the bound `plan_segment`

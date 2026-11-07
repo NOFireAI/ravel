@@ -4208,9 +4208,7 @@ mod fast_path_prefetch_tests {
             mut s1,
             mut rows,
             budget,
-        } = edge(fits_1, false, COUNT)
-            .await
-            .expect("partition 0 parks");
+        } = edge(fits_1, false, COUNT).await.expect("partition 0 parks");
         assert_eq!(partition_metric(plan.as_ref(), "fan_out_narrowings", 0), 1);
         assert!(rows[0].is_empty(), "partition 0 parked before any row");
         tokio::time::pause();
