@@ -6980,15 +6980,16 @@ mod tests {
                 #![proptest_config(ProptestConfig::with_cases(24))]
 
                 /// ADR-3326, view memo amendment, T1: over a served plain
-                /// block of 1 to 8,192 rows, with a narrowing filter on and
-                /// off, the group key equals arrow's cast of the same input
-                /// on views, data buffers and null buffer; and so do
-                /// permuted full-length keys over the memo and a values
+                /// block of 3 to 8,192 rows (the fixture writes one seed
+                /// record per stream, so 3 is its fewest), with a narrowing
+                /// filter on and off, the group key equals arrow's cast of
+                /// the same input on views, data buffers and null buffer; and
+                /// so do permuted full-length keys over the memo and a values
                 /// array sliced from it, neither of which may take the memo
                 /// as it is.
                 #[test]
                 fn prop_group_key_views_equal_the_cast(
-                    rows in 1usize..=8192,
+                    rows in 3usize..=8192,
                     prefix in 0usize..24,
                     empty_every in 4usize..32,
                     mask in proptest::option::of(any::<u64>()),
@@ -7038,7 +7039,10 @@ mod tests {
                             (0..n).rev().map(|k| Some(k as i32)).collect();
                         let reversed = rekeyed(&batch, permuted);
                         let got = group_key(&reversed, true);
-                        prop_assert!(identical(&got, &group_key(&reversed, false)).is_ok());
+                        prop_assert!(
+                            identical(&got, &group_key(&reversed, false)).is_ok(),
+                            "permuted keys"
+                        );
                         // Keys `0..n - 1` over the memo values sliced by one.
                         if n >= 2 {
                             let sliced = memo.slice(1, n - 1);
@@ -7053,7 +7057,10 @@ mod tests {
                             )
                             .expect("batch");
                             let got = group_key(&sliced, true);
-                            prop_assert!(identical(&got, &group_key(&sliced, false)).is_ok());
+                            prop_assert!(
+                                identical(&got, &group_key(&sliced, false)).is_ok(),
+                                "sliced values"
+                            );
                         }
                     }
                 }
