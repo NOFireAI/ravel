@@ -7009,11 +7009,11 @@ mod tests {
                     let p = pass(&obj, &cfg, &block, &cache, 9);
                     prop_assert!(p.fast >= 1, "the plain fast path ran");
                     let mut state = mask.unwrap_or(0) | 1;
-                    for batch in &p.batches {
-                        let memo = values_of(batch);
+                    for whole in &p.batches {
+                        let memo = values_of(whole);
                         let batch = match mask {
                             Some(_) => {
-                                let keep: BooleanArray = (0..batch.num_rows())
+                                let keep: BooleanArray = (0..whole.num_rows())
                                     .map(|_| {
                                         state ^= state << 13;
                                         state ^= state >> 7;
@@ -7021,9 +7021,9 @@ mod tests {
                                         Some(state % 3 != 0)
                                     })
                                     .collect();
-                                filter_record_batch(batch, &keep).expect("filter")
+                                filter_record_batch(whole, &keep).expect("filter")
                             }
-                            None => batch.clone(),
+                            None => whole.clone(),
                         };
                         let got = group_key(&batch, true);
                         prop_assert!(
@@ -7037,7 +7037,7 @@ mod tests {
                         // Permuted full-length keys over the memo.
                         let permuted: Int32Array =
                             (0..n).rev().map(|k| Some(k as i32)).collect();
-                        let reversed = rekeyed(&batch, permuted);
+                        let reversed = rekeyed(whole, permuted);
                         let got = group_key(&reversed, true);
                         prop_assert!(
                             identical(&got, &group_key(&reversed, false)).is_ok(),
@@ -7052,7 +7052,7 @@ mod tests {
                             )
                             .expect("dictionary");
                             let sliced = RecordBatch::try_new(
-                                batch.schema(),
+                                whole.schema(),
                                 vec![Arc::new(dict) as ArrayRef],
                             )
                             .expect("batch");
