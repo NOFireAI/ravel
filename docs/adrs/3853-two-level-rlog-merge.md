@@ -708,10 +708,13 @@ fixtures far smaller than the floor.
 
 The amendment also states one case of D2's headroom accounting. A unit
 whose scratch subdirectory cannot be removed when it ends, its wipe having
-failed, keeps its charge (the larger of its need and its written bytes)
-against the scratch directory, so a later unit under
-`--maintain-scratch-max-bytes` is admitted and capped against the orphan's
-bytes. A process locks its scratch directory once, before its first unit,
-so the charge stays for the rest of the process; the lock that reclaims
-orphaned unit subdirectories gives back any charge they still hold, and the
-next process's lock removes the orphan itself.
+failed, keeps a charge of the bytes it wrote (not its need, which it may
+never have reached) against the scratch directory, marked as an orphan's.
+The orphan's bytes are counted once. Admission leaves orphan charges out of
+the reserved figure, because its free figure already sees the orphan's
+bytes on disk (the bytes under the directory under a cap, `statvfs`
+without one). The in-run cap check counts the orphan charge, because its
+baseline is the bytes outside every unit subdirectory and so does not see
+them. A process locks its scratch directory once, before its first unit,
+so the charge stays until the process restarts: the next process's lock
+removes the orphan from disk, and that process starts with no charges.

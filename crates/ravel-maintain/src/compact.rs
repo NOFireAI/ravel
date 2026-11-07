@@ -60,7 +60,10 @@ pub enum CompactionOutcome {
     HeldOutOfWindow { version: u16 },
     /// The RLOG merge plan is cursor mode and would decode more than
     /// [`crate::rlog::MAX_CURSOR_DECODE_AMPLIFICATION`] times the bucket's
-    /// record count, so compaction refused it after the catalog phase and
+    /// record count and more than
+    /// [`crate::CompactorConfig::geometry_floor_decoded_rows`] rows in all
+    /// (default [`crate::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS`]), so
+    /// compaction refused it after the catalog phase and
     /// before the first block GET (ADR-3853 D0). Nothing was fetched or
     /// published and the claim is released. Retrying cannot succeed under
     /// this build, so the scan memoizes it as terminal for the bucket.
@@ -290,6 +293,7 @@ fn refuse_geometry(
     blocks: usize,
     records: u64,
     predicted_decoded_rows: u64,
+    floor_decoded_rows: u64,
 ) -> CompactionOutcome {
     count_refusal(CompactionRefusedReason::Geometry);
     tracing::warn!(
@@ -302,9 +306,11 @@ fn refuse_geometry(
         records,
         predicted_decoded_rows,
         max_amplification = crate::rlog::MAX_CURSOR_DECODE_AMPLIFICATION,
+        floor_decoded_rows,
         "compaction refused a bucket: its cursor merge would decode more than \
-         max_amplification rows per input record; nothing fetched or published, \
-         the L0 inputs stay live (ADR-3853 D0)"
+         max_amplification rows per input record and more than floor_decoded_rows \
+         rows in all; nothing fetched or published, the L0 inputs stay live \
+         (ADR-3853 D0)"
     );
     CompactionOutcome::GeometryUnsupported {
         inputs,
@@ -762,6 +768,7 @@ async fn compact_bucket_scoped(
             blocks,
             records,
             predicted_decoded_rows,
+            run_config.geometry_floor_decoded_rows,
         ),
         Err(MaintainError::MergeTwoLevelUnsupported { inputs, check }) => {
             count_refusal(CompactionRefusedReason::TwoLevel);
