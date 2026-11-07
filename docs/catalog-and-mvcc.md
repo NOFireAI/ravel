@@ -911,7 +911,8 @@ swept as unreferenced while its owning part is live.
 The proto fields, the leaf codec, the single-leaf probe, the fold's leaf
 build and HEAD attachment, and the sweep's `kidx` kind are implemented: the
 fold (the server's scheduled and on-demand fold and `ravel-cli catalog
-fold`) can write leaves for logs and spans. The leaf build is behind a
+fold`) can write leaves for logs and spans, and for metrics with a second
+switch (the `label_value` leaf, below). The leaf build is behind a
 switch that is off by default (`CatalogConfig::build_key_index_leaves`,
 `ravel-server --fold-key-index-leaves`, `ravel-cli catalog fold
 --key-index-leaves`). ADR-3692's Stage 1 amendment measured it on real
@@ -1244,6 +1245,59 @@ lost to a CAS built the same part. A leaf a build PUT and then abandoned
 is in `put_requests` and the catalog sweep removes it (test
 `the_leaves_written_are_the_published_set`). A no-op fold reports 0 for
 those three. All five are zero with the switch off.
+
+**Metrics `label_value` leaf (ADR-3694 decision 2).** RSEG objects carry no
+KEY_IDX section; their tier-1 source is LABEL_DICT
+(docs/segment-format.md), read whole by
+`ravel_segment::label_dict_strings`. With `build_key_index_leaves` and
+`CatalogConfig::metrics_label_index` both on (`ravel-cli catalog fold
+--key-index-leaves --metrics-label-index`; the CLI refuses the second
+without the first or `--rebuild-key-index`), the metrics fold builds one
+field, `label_value` (`ravel_catalog::METRICS_LABEL_VALUE_FIELD`, key type
+`str`), into the same `.kidx` leaf objects and refs as the other signals.
+Its pairs are `key8_str(s)` for every LABEL_DICT string `s` of the entry's
+object, label names and values alike (`__name__`, its metric names, every
+other label name and every value), each at block ordinal 0, which stands
+for the whole object: a match names the objects holding the string, never
+a block within one. With `metrics_label_index` off (the default) a metrics
+fold builds no leaf whatever `build_key_index_leaves` says, and the
+rebuild refuses metrics (`KeyIndexRebuildError::UnsupportedSignal`). An
+entry whose object the fold already fetched whole for its name postings is
+read from those bytes with no further GET; any other entry costs a footer
+suffix GET of the last `min(8 KiB, object size)` bytes (a second footer
+GET when the footer is longer) and one ranged GET of the LABEL_DICT
+section, counted in `key_index_ranged_gets` and `key_index_bytes_read`. A
+fold that merges the previous postings forward fetches only the new
+entries' objects; the entries it merges take their pairs from the previous
+tail's `label_value` leaf with no GET, as the incremental tail build below
+describes, and are read by range only when that tail has no such leaf (the
+switch was off on the earlier fold). A
+footer naming another tenant, a missing LABEL_DICT section, or a section
+that fails its crc, decompression or decode leaves the entry in
+`uncovered_entry_ordinals` and the fold succeeds; a failed GET does the
+same, as for the other signals.
+
+Two limits apply to metrics only. The byte cap: a part whose `label_value`
+leaves would total more than `metrics_label_index_max_ratio_ppm` parts per
+million of its entries' object bytes (default 10,000, which is 1%; rounded
+down) gets no ref for the field, every entry is counted uncovered, and the
+fold report's `metrics_label_index_parts_over_cap` counts the part. The
+erasure gate: before building, the fold lists the tenant's pending metrics
+erasure requests (`t/<tenant>/m/del/`) once
+(`metrics_label_index_erasure_list_requests`, also in `list_requests`).
+While any request is pending, or when that listing fails, the fold builds
+no metrics leaf, so a leaf never records the key8 of a string being
+erased; every part it re-encodes is published without refs and counted in
+`metrics_label_index_parts_erasure_gated`, and a part carried forward by
+reference keeps the refs it has. `--rebuild-key-index --signal metrics
+--metrics-label-index` applies the same cap and the same gate (its report
+carries `parts_over_cap`, `parts_erasure_gated` and
+`erasure_list_requests`; a gated run reads no part and publishes nothing),
+reads every entry by range, and writes the leaf a fold with both switches
+on writes for the same part, byte for byte
+(`a_rebuilt_metrics_leaf_is_byte_identical_to_the_folds_leaf`). No query
+path reads the metrics leaf yet, and `ravel-server` has no flag for
+`metrics_label_index`.
 
 **Incremental tail build (ADR-3692 decision 5).** The tail part is
 re-encoded on every fold that advances the watermark, but most of its

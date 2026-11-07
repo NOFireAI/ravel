@@ -174,6 +174,7 @@ async fn rebuild_on(
         signal,
         field.map(str::to_string),
         ravel_catalog::DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES,
+        false,
         json,
     )
     .await
@@ -230,6 +231,9 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
          leaf_prefix_gets: 0\n\
          leaf_prefix_bytes_read: 0\n\
          uncovered_entries: 0\n\
+         parts_over_cap: 0\n\
+         parts_erasure_gated: 0\n\
+         erasure_list_requests: 0\n\
          attempt_count: 1\n\
          attempt 1: parts=1 part_gets=1 ranged_gets=2 leaf_puts=1 head_cas_tries=1 \
          parts_published=1\n",
@@ -294,6 +298,7 @@ async fn rebuild_that_exhausts_its_cas_tries_prints_the_report_so_far() {
         SignalArg::Spans,
         None,
         ravel_catalog::DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES,
+        false,
         false,
     )
     .await

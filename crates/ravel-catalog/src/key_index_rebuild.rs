@@ -28,8 +28,8 @@ use crate::config::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES;
 use crate::error::CatalogError;
 use crate::fold::{
     EntryKeyIndex, EntryKeyIndexRead, HeadState, MAX_HEAD_CAS_ATTEMPTS, RequestCounters,
-    build_part_key_index_leaves, declared_key_index_fields, head_object_key, put_key_index_leaf,
-    read_entry_key_index,
+    build_part_key_index_leaves, declared_key_index_fields, head_object_key,
+    metrics_label_index_leaf_bytes_cap, put_key_index_leaf, read_entry_key_index,
 };
 use crate::snapshot_format::{
     self, KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN, KeyIndexLeafLimits, key_index_leaf_format_version,
@@ -117,6 +117,18 @@ pub struct KeyIndexRebuildReport {
     /// For each part built (deferred parts excluded) and each field built for
     /// it, the part entries no leaf covers, summed.
     pub uncovered_entries: u64,
+    /// Metrics parts given no `label_value` ref because their leaves would
+    /// pass the byte cap
+    /// [`CatalogConfig::metrics_label_index_max_ratio_ppm`](crate::CatalogConfig::metrics_label_index_max_ratio_ppm)
+    /// sets; no leaf of that field is PUT for them.
+    pub parts_over_cap: u64,
+    /// Metrics parts left unindexed because a metrics erasure request was
+    /// pending (or the pending listing failed): every part in
+    /// `parts_unindexed`, with no part read.
+    pub parts_erasure_gated: u64,
+    /// LIST requests of the pending metrics erasure listing: one page per
+    /// request, issued only on metrics with at least one unindexed part.
+    pub erasure_list_requests: u64,
     /// Batches that reached their publish step.
     pub attempt_count: u64,
     pub attempts: Vec<KeyIndexRebuildAttempt>,
@@ -134,7 +146,9 @@ pub enum KeyIndexRebuildError {
         signal: Signal,
         declared: Vec<String>,
     },
-    #[error("{0:?} objects carry no KEY_IDX section; the key-index rebuild covers logs and spans")]
+    #[error(
+        "{0:?} objects carry no KEY_IDX section; the key-index rebuild covers logs, spans, and metrics with metrics_label_index on"
+    )]
     UnsupportedSignal(Signal),
     #[error(
         "tenant {tenant} declares no key-index field for {signal:?}; declare a key_index column or turn on trace-id indexing first"
@@ -294,7 +308,20 @@ impl Catalog {
     /// entries costs the fold's ranged KEY_IDX reads. The leaves are built and
     /// PUT by the fold's own functions under the fold's key layout, then HEAD
     /// is CAS-published with every part ref unchanged except its `key_index`.
-    /// Writes no part, no `.csnap`, no `.cstat`, and lists nothing.
+    /// Writes no part, no `.csnap`, no `.cstat`, and lists nothing on logs
+    /// and spans.
+    ///
+    /// Metrics is rebuilt only under
+    /// [`crate::CatalogConfig::metrics_label_index`], and refused as
+    /// [`KeyIndexRebuildError::UnsupportedSignal`] without it. Each entry's
+    /// `label_value` field is read from its object's LABEL_DICT by the
+    /// fold's ranged reads. When at least one part is unindexed, the pending
+    /// metrics erasure requests are listed once first; any pending request,
+    /// or a listing that fails, ends the run with no part read and every
+    /// unindexed part counted in [`KeyIndexRebuildReport::parts_erasure_gated`].
+    /// A part whose leaves for a field would total more than the byte cap
+    /// gains no ref for it and is counted in
+    /// [`KeyIndexRebuildReport::parts_over_cap`].
     ///
     /// Parts go in batches (see [`KeyIndexRebuildOptions::batch_entries`]),
     /// one HEAD publish each, of up to the fold's CAS retry budget. A lost CAS
@@ -321,7 +348,8 @@ impl Catalog {
         options: &KeyIndexRebuildOptions,
     ) -> Result<KeyIndexRebuildReport, KeyIndexRebuildError> {
         let tenant_config = crate::tenant_config::read_config_values(self.store(), tenant).await?;
-        let Some(declared) = declared_key_index_fields(signal, tenant_config.as_ref(), tenant)
+        let Some(declared) =
+            declared_key_index_fields(signal, tenant_config.as_ref(), tenant, self.config())
         else {
             return Err(KeyIndexRebuildError::UnsupportedSignal(signal));
         };
@@ -418,6 +446,15 @@ impl Catalog {
             .map(|t| t.part.entry_count)
             .max()
             .unwrap_or(0);
+
+        if signal == Signal::Metrics && !targets.is_empty() {
+            let gate = self.metrics_label_index_erasure_gate(tenant).await;
+            report.erasure_list_requests = gate.list_requests;
+            if gate.gated {
+                report.parts_erasure_gated = report.parts_unindexed;
+                return Ok(report);
+            }
+        }
 
         for (index, batch) in batches(targets, options.batch_entries)
             .into_iter()
@@ -641,16 +678,51 @@ impl Catalog {
             // One pass with no pair budget, as the fold built before
             // `key_index_build_max_pairs`: a rebuild part has no previous leaf
             // to carry, and its reads are already held whole per batch.
-            let leaves = build_part_key_index_leaves(
-                tenant,
-                signal,
-                part_blake3,
-                &missing,
-                false,
-                &entry_fields,
-                &KeyIndexLeafLimits::default(),
-                u64::MAX,
-            );
+            let build = |fields: &[(String, KeyType)]| {
+                build_part_key_index_leaves(
+                    tenant,
+                    signal,
+                    part_blake3,
+                    fields,
+                    false,
+                    &entry_fields,
+                    &KeyIndexLeafLimits::default(),
+                    u64::MAX,
+                )
+            };
+            let mut leaves = build(&missing);
+            if signal == Signal::Metrics {
+                let cap = metrics_label_index_leaf_bytes_cap(
+                    entries.iter().map(|e| e.object_size).sum(),
+                    self.config().metrics_label_index_max_ratio_ppm,
+                );
+                let mut field_bytes: HashMap<&str, u64> = HashMap::new();
+                for leaf in &leaves.leaves {
+                    *field_bytes.entry(leaf.leaf_ref.field.as_str()).or_default() +=
+                        leaf.bytes.len() as u64;
+                }
+                let over: HashSet<String> = field_bytes
+                    .into_iter()
+                    .filter(|(_, bytes)| *bytes > cap)
+                    .map(|(field, _)| field.to_string())
+                    .collect();
+                if !over.is_empty() {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        part_key = %part.key,
+                        cap,
+                        "the part's key-index leaves would exceed the byte cap; the part gains no ref for the field"
+                    );
+                    report.parts_over_cap += 1;
+                    let kept: Vec<(String, KeyType)> = missing
+                        .iter()
+                        .filter(|(field, _)| !over.contains(field))
+                        .cloned()
+                        .collect();
+                    leaves = build(&kept);
+                    leaves.uncovered_entries += entries.len() as u64 * over.len() as u64;
+                }
+            }
             report.uncovered_entries += leaves.uncovered_entries;
             let mut refs = Vec::with_capacity(leaves.leaves.len());
             for leaf in leaves.leaves {
@@ -787,10 +859,12 @@ mod tests {
     use super::*;
     use crate::config::CatalogConfig;
     use crate::fold::KEY_INDEX_FOOTER_SUFFIX_LEN;
+    use crate::fold::METRICS_LABEL_VALUE_FIELD;
     use crate::fold::tests::{
         KIDX_HOUR, USER_ID, assert_foreign_part_error, config, declare_user_id_key_index,
-        fold_through, kidx_objects, matches, part_ordinals, probe_part, publish_trace_spans,
-        publish_user_id_logs, read_signal_head, repoint_head_at_foreign_part, tenant,
+        fold_through, kidx_objects, matches, metrics_kidx_config, part_ordinals, probe_part,
+        publish_label_fixture, publish_trace_spans, publish_user_id_logs,
+        put_metrics_erasure_request, read_signal_head, repoint_head_at_foreign_part, tenant,
     };
     use crate::snapshot_format::{KeyIndexLeafProbe, verify_key_index_leaf};
 
@@ -989,6 +1063,9 @@ mod tests {
                 section_bytes_read: report.section_bytes_read,
                 ranged_gets: 6,
                 uncovered_entries: 0,
+                parts_over_cap: 0,
+                parts_erasure_gated: 0,
+                erasure_list_requests: 0,
                 attempt_count: 1,
                 attempts: vec![KeyIndexRebuildAttempt {
                     parts: 1,
@@ -1374,6 +1451,9 @@ mod tests {
                 section_bytes_read: report.section_bytes_read,
                 ranged_gets: 8,
                 uncovered_entries: 0,
+                parts_over_cap: 0,
+                parts_erasure_gated: 0,
+                erasure_list_requests: 0,
                 attempt_count: 1,
                 attempts: vec![KeyIndexRebuildAttempt {
                     parts: 2,
@@ -1535,6 +1615,9 @@ mod tests {
                     section_bytes_read: report.section_bytes_read,
                     ranged_gets: 2,
                     uncovered_entries: 2,
+                    parts_over_cap: 0,
+                    parts_erasure_gated: 0,
+                    erasure_list_requests: 0,
                     attempt_count: 1,
                     attempts: vec![KeyIndexRebuildAttempt {
                         parts: 1,
@@ -1830,6 +1913,9 @@ mod tests {
                 section_bytes_read: report.section_bytes_read,
                 ranged_gets: 7,
                 uncovered_entries: 0,
+                parts_over_cap: 0,
+                parts_erasure_gated: 0,
+                erasure_list_requests: 0,
                 attempt_count: 1,
                 attempts: vec![KeyIndexRebuildAttempt {
                     parts: 2,
@@ -2435,5 +2521,124 @@ mod tests {
         );
         let head = read_signal_head(inner.as_ref(), Signal::Logs).await;
         assert_eq!(head.parts[0].key_index, vec![original]);
+    }
+
+    /// The switch-off catalog with `metrics_label_index` on and the byte cap
+    /// ratio `ratio_ppm`: the metrics rebuild's catalog.
+    fn metrics_rebuild_catalog(store: Arc<dyn ObjectStoreBackend>, ratio_ppm: u32) -> Catalog {
+        let cfg = CatalogConfig {
+            metrics_label_index: true,
+            metrics_label_index_max_ratio_ppm: ratio_ppm,
+            ..config(1)
+        };
+        assert!(!cfg.build_key_index_leaves);
+        Catalog::new(store, cfg).expect("catalog")
+    }
+
+    /// With `metrics_label_index` on, the rebuild's metrics leaf is the
+    /// fold's: the six-object fixture folded once with both switches on, and
+    /// once with the leaf build off and then rebuilt, gives the same part,
+    /// the same `label_value` ref and byte-identical leaf objects. The
+    /// rebuild lists the pending erasure set once and reads each entry with
+    /// a suffix GET and one LABEL_DICT range GET.
+    #[tokio::test]
+    async fn a_rebuilt_metrics_leaf_is_byte_identical_to_the_folds_leaf() {
+        let folded = recording_store();
+        publish_label_fixture(folded.as_ref()).await;
+        let on = Catalog::new(folded.clone(), metrics_kidx_config()).expect("catalog");
+        fold_through(&on, Signal::Metrics, KIDX_HOUR).await;
+
+        let rebuilt = recording_store();
+        publish_label_fixture(rebuilt.as_ref()).await;
+        let off = off_catalog(rebuilt.clone(), DEFAULT_SNAPSHOT_PART_MAX_ENTRIES);
+        fold_through(&off, Signal::Metrics, KIDX_HOUR).await;
+        rebuilt.clear();
+        let catalog = metrics_rebuild_catalog(rebuilt.clone(), 10_000);
+        let report = rebuild(&catalog, Signal::Metrics).await;
+        assert_eq!(report.fields, vec![METRICS_LABEL_VALUE_FIELD.to_string()]);
+        assert_eq!(report.parts_rebuilt, 1, "{report:?}");
+        assert_eq!(report.erasure_list_requests, 1, "{report:?}");
+        assert_eq!(rebuilt.lists(), 1, "the pending erasure listing only");
+        assert_eq!(report.ranged_gets, 2 * 6, "{report:?}");
+        assert_eq!(rebuilt.data_ranged_gets().len(), 2 * 6);
+        assert_eq!(report.uncovered_entries, 0, "{report:?}");
+
+        let fold_head = read_signal_head(folded.as_ref(), Signal::Metrics).await;
+        let rebuild_head = read_signal_head(rebuilt.as_ref(), Signal::Metrics).await;
+        assert_eq!(fold_head.parts.len(), 1);
+        assert_eq!(fold_head.parts[0].blake3, rebuild_head.parts[0].blake3);
+        assert_eq!(fold_head.parts[0].key_index.len(), 1);
+        assert_eq!(
+            fold_head.parts[0].key_index,
+            rebuild_head.parts[0].key_index
+        );
+        for leaf in &fold_head.parts[0].key_index {
+            let a = folded
+                .get(&leaf.key, GetRange::Full)
+                .await
+                .expect("fold leaf");
+            let b = rebuilt
+                .get(&leaf.key, GetRange::Full)
+                .await
+                .expect("rebuilt leaf");
+            assert_eq!(a.data, b.data, "{}", leaf.key);
+        }
+    }
+
+    /// A pending metrics erasure request ends the rebuild before any part is
+    /// read: no data object GET, no PUT, HEAD unchanged, the unindexed part
+    /// counted as gated and the one LIST counted.
+    #[tokio::test]
+    async fn a_pending_erasure_request_gates_the_metrics_rebuild() {
+        let store = recording_store();
+        publish_label_fixture(store.as_ref()).await;
+        put_metrics_erasure_request(store.as_ref()).await;
+        let off = off_catalog(store.clone(), DEFAULT_SNAPSHOT_PART_MAX_ENTRIES);
+        fold_through(&off, Signal::Metrics, KIDX_HOUR).await;
+        let before = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        store.clear();
+        let report = rebuild(
+            &metrics_rebuild_catalog(store.clone(), 10_000),
+            Signal::Metrics,
+        )
+        .await;
+        assert_eq!(report.parts_unindexed, 1, "{report:?}");
+        assert_eq!(report.parts_erasure_gated, 1, "{report:?}");
+        assert_eq!(report.erasure_list_requests, 1, "{report:?}");
+        assert_eq!(report.parts_rebuilt, 0, "{report:?}");
+        assert_eq!(report.attempt_count, 0, "{report:?}");
+        assert_eq!(store.lists(), 1);
+        assert_eq!(store.data_ranged_gets(), Vec::new());
+        assert_eq!(store.puts(), Vec::<String>::new());
+        assert_eq!(
+            read_signal_head(store.as_ref(), Signal::Metrics).await,
+            before
+        );
+    }
+
+    /// A part whose metrics leaf would pass the byte cap gains no ref: no
+    /// leaf PUT, no HEAD publish, the part counted over the cap and every
+    /// entry uncovered.
+    #[tokio::test]
+    async fn a_metrics_part_over_the_cap_gains_no_ref_in_the_rebuild() {
+        let store = recording_store();
+        publish_label_fixture(store.as_ref()).await;
+        let off = off_catalog(store.clone(), DEFAULT_SNAPSHOT_PART_MAX_ENTRIES);
+        fold_through(&off, Signal::Metrics, KIDX_HOUR).await;
+        let before = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        store.clear();
+        let report = rebuild(&metrics_rebuild_catalog(store.clone(), 1), Signal::Metrics).await;
+        assert_eq!(report.parts_over_cap, 1, "{report:?}");
+        assert_eq!(report.uncovered_entries, 6, "{report:?}");
+        assert_eq!(report.leaves_written, 0, "{report:?}");
+        assert!(
+            store.puts().iter().all(|key| !key.ends_with(".kidx")),
+            "{:?}",
+            store.puts()
+        );
+        assert_eq!(
+            read_signal_head(store.as_ref(), Signal::Metrics).await,
+            before
+        );
     }
 }
