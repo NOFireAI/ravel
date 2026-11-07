@@ -1097,8 +1097,9 @@ The scratch directory is a cache, not storage:
 
 - Each unit writes its runs in its own subdirectory, and the subdirectory is
   wiped when the unit ends, whether it published or failed. A unit whose
-  wipe fails keeps its share of the cap until the orphan is reclaimed, which
-  happens when the next process locks the directory.
+  wipe fails keeps the bytes it wrote charged against the cap, counted once,
+  until the process restarts; the next process removes the orphan when it
+  locks the directory.
 - Nothing durable is read from it, so an `emptyDir` serves.
 - The first two-level merge locks `ravel-scratch.lock` in the directory for
   the life of the process. Give each process its own directory: a second
