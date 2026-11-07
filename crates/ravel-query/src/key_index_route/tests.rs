@@ -30,7 +30,10 @@ enum LeafKind {
     /// This many slices of near-equal key8 width.
     Sliced(usize),
     /// `slices` slices as `Sliced`, slice `foreign` bound to another tenant.
-    SlicedForeign { slices: usize, foreign: usize },
+    SlicedForeign {
+        slices: usize,
+        foreign: usize,
+    },
     NoLeaf,
     /// One leaf, for another field.
     OtherField,
@@ -1750,9 +1753,7 @@ async fn serial_probe(fx: &Fixture, keys: &KeySet) -> Serial {
                 .expect("slices tile")
                 .expect("the part has leaves");
             match slices.last_mut() {
-                Some((last, slice_keys)) if std::ptr::eq(*last, leaf_ref) => {
-                    slice_keys.push(*key8)
-                }
+                Some((last, slice_keys)) if std::ptr::eq(*last, leaf_ref) => slice_keys.push(*key8),
                 _ => slices.push((leaf_ref, vec![*key8])),
             }
         }
@@ -2184,7 +2185,10 @@ where
                 End::Fail => {
                     self.inner.calls.fetch_add(1, Ordering::Relaxed);
                     accounting.record_s3_request(AccountedOp::Get);
-                    Err(LeafReadError::Failed(format!("{} {range:?} failed", leaf.key)))
+                    Err(LeafReadError::Failed(format!(
+                        "{} {range:?} failed",
+                        leaf.key
+                    )))
                 }
                 End::Refuse => Err(LeafReadError::ReservationRefused(format!(
                     "{} {range:?} refused",
