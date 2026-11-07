@@ -968,7 +968,14 @@ fn memo_views(array: &ArrayRef) -> DFResult<Option<ArrayRef>> {
     if identity {
         return Ok(Some(Arc::new(views)));
     }
-    let gathered = datafusion::arrow::compute::take(&views, keys, None)?;
+    // The cast leaves no null buffer under keys whose null buffer has no NULL;
+    // `take` would keep it.
+    let gathered = if keys.nulls().is_some() && keys.null_count() == 0 {
+        let keys = datafusion::arrow::array::Int32Array::new(keys.values().clone(), None);
+        datafusion::arrow::compute::take(&views, &keys, None)?
+    } else {
+        datafusion::arrow::compute::take(&views, keys, None)?
+    };
     zero_null_views(gathered).map(Some)
 }
 

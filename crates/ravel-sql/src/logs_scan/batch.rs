@@ -7021,7 +7021,8 @@ mod tests {
                 /// off, the group key equals arrow's cast of the same input
                 /// on views, data buffers and null buffer; and so do permuted
                 /// full-length keys over the memo and a values array sliced
-                /// from it, neither of which may take the memo as it is.
+                /// from it, neither of which may take the memo as it is; and
+                /// so does each batch's keys with a quarter of them NULL.
                 /// [`t1_covers_one_and_two_rows`] runs the 1- and 2-row cases
                 /// every time.
                 #[test]
@@ -7030,8 +7031,9 @@ mod tests {
                     prefix in 0usize..24,
                     empty_every in 4usize..32,
                     mask in proptest::option::of(any::<u64>()),
+                    null_seed in any::<u64>(),
                 ) {
-                    t1_case(rows, prefix, empty_every, mask)?;
+                    t1_case(rows, prefix, empty_every, mask, null_seed)?;
                 }
             }
 
@@ -7041,7 +7043,7 @@ mod tests {
             fn t1_covers_one_and_two_rows() {
                 for rows in [1, 2] {
                     for mask in [None, Some(0x9e37_79b9_7f4a_7c15)] {
-                        t1_case(rows, 3, 4, mask)
+                        t1_case(rows, 3, 4, mask, 0x2545_f491_4f6c_dd1d)
                             .unwrap_or_else(|e| panic!("rows {rows}, mask {mask:?}: {e}"));
                     }
                 }
@@ -7053,6 +7055,7 @@ mod tests {
                 prefix: usize,
                 empty_every: usize,
                 mask: Option<u64>,
+                null_seed: u64,
             ) -> Result<(), TestCaseError> {
                 {
                     let cfg = RlogConfig {
@@ -7094,6 +7097,27 @@ mod tests {
                             identical(&got, &group_key(&batch, false)).is_ok(),
                             "{:?}",
                             identical(&got, &group_key(&batch, false))
+                        );
+                        // The same keys, each NULL with probability 1/4.
+                        let keys = batch.column(0).as_dictionary::<Int32Type>().keys();
+                        let mut s = null_seed | 1;
+                        let valid: Vec<bool> = (0..keys.len())
+                            .map(|_| {
+                                s ^= s << 13;
+                                s ^= s >> 7;
+                                s ^= s << 17;
+                                !s.is_multiple_of(4)
+                            })
+                            .collect();
+                        let nulled = rekeyed(
+                            &batch,
+                            Int32Array::new(keys.values().clone(), Some(NullBuffer::from(valid))),
+                        );
+                        let got = group_key(&nulled, true);
+                        prop_assert!(
+                            identical(&got, &group_key(&nulled, false)).is_ok(),
+                            "null keys: {:?}",
+                            identical(&got, &group_key(&nulled, false))
                         );
                         let views = view_registry::views_of(&memo);
                         prop_assert!(views.is_some(), "the memo serves its own values");
@@ -7295,6 +7319,68 @@ mod tests {
                 assert!(got.is_null(1), "the row keyed to the NULL entry is NULL");
                 assert_eq!(got.null_count(), 1);
                 assert_eq!(null_group_count(nulled).await, 1);
+            }
+
+            /// `values` as keys under a null buffer valid where `valid`, so a
+            /// NULL slot keeps its key value.
+            fn null_keys(values: Vec<i32>, valid: impl Fn(usize) -> bool) -> Int32Array {
+                let nulls = NullBuffer::from((0..values.len()).map(valid).collect::<Vec<bool>>());
+                Int32Array::new(values.into(), Some(nulls))
+            }
+
+            /// ADR-3326, view memo amendment, T1 with NULL keys: keys exactly
+            /// `0..12` with rows 0 and 5 NULL (their key values still 0 and
+            /// 5) over a served, filled memo equal the cast on views, data
+            /// buffers and null buffer, the memo serving them (one view
+            /// fill); 2 rows are NULL and a session `GROUP BY` puts both in
+            /// the NULL group.
+            #[tokio::test]
+            async fn identity_keys_under_a_null_buffer_equal_the_cast() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, _cache, p) = filled(&budget, VIEW_BUDGET);
+                let batch = &p.batches[0];
+                assert_eq!(batch.num_rows(), ROWS);
+                let keys = null_keys((0..ROWS as i32).collect(), |r| r != 0 && r != 5);
+                assert_eq!((keys.value(0), keys.value(5)), (0, 5));
+                let nulled = rekeyed(batch, keys);
+                assert_eq!(p.counters.view_snapshot().fills, 0, "not filled yet");
+                let got = group_key(&nulled, true);
+                assert_eq!(p.counters.view_snapshot().fills, 1, "the memo served");
+                identical(&got, &group_key(&nulled, false)).unwrap_or_else(|e| panic!("{e}"));
+                assert_eq!(got.null_count(), 2);
+                assert_eq!(null_group_count(nulled).await, 2);
+            }
+
+            /// ADR-3326, view memo amendment, T1 with NULL keys: shuffled and
+            /// repeated keys with NULL slots (keys 7, 2 and 4 under them; 3
+            /// NULL rows of 12, then 2 of 7) over a served, filled memo equal
+            /// the cast on views, data buffers and null buffer.
+            #[test]
+            fn non_identity_null_keys_equal_the_cast() {
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, _cache, p) = filled(&budget, VIEW_BUDGET);
+                let batch = &p.batches[0];
+                assert!(view_registry::views_of(&values_of(batch)).is_some());
+                let cases = [
+                    (
+                        null_keys(vec![3, 3, 7, 0, 11, 2, 5, 5, 1, 4, 9, 10], |r| {
+                            ![2, 5, 9].contains(&r)
+                        }),
+                        3,
+                    ),
+                    (
+                        null_keys(vec![6, 6, 6, 4, 1, 0, 6], |r| r != 1 && r != 4),
+                        2,
+                    ),
+                ];
+                for (keys, nulls) in cases {
+                    let nulled = rekeyed(batch, keys);
+                    let got = group_key(&nulled, true);
+                    identical(&got, &group_key(&nulled, false))
+                        .unwrap_or_else(|e| panic!("{nulls} NULL rows: {e}"));
+                    assert_eq!(got.null_count(), nulls);
+                }
+                assert_eq!(p.counters.view_snapshot().fills, 1, "the memo served");
             }
 
             /// ADR-3326, view memo amendment, T10: a per-scan values array
