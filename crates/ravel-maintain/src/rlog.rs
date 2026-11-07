@@ -1724,15 +1724,19 @@ fn unit_core_share(cores: usize, budget: u64, ceiling: u64) -> usize {
     (cores / units).max(1)
 }
 
+/// The level-2 blocks constraint (b) prices per run (ADR-3853 D3, #3943
+/// correction): level 1 writes a run stream by stream, so a stream smaller than
+/// a part sits in one of the run's parts, or in two when a cut falls inside it.
+/// A larger stream is priced by its level-2 stream estimate.
+const LEVEL2_BLOCKS_PER_RUN: u64 = 2;
+
 /// The figures [`derive_level1_workers`] prices a worker count with, all known
 /// before level 1 reads a block.
 struct Level1Shape {
     /// `P`, the largest per-input cost of constraint (a).
     per_input: u64,
-    /// Each input's decoded bytes, in canonical order: what it adds to its
-    /// group's run, so a group of them cuts into `ceil(sum / run_target)` run
-    /// parts.
-    run_bytes: Vec<u64>,
+    /// `N`, the inputs level 1 cuts into groups.
+    inputs: usize,
     /// The price of one level-2 block, taken from the inputs' largest block.
     block_bytes: u64,
     /// The bytes `input_read_concurrency` row group GETs hold at once.
@@ -1744,40 +1748,35 @@ struct Level1Shape {
 }
 
 impl Level1Shape {
-    /// The run parts level 1 writes with groups of `group_size`.
-    fn run_parts(&self, group_size: usize) -> u64 {
-        self.run_bytes
-            .chunks(group_size.max(1))
-            .map(|g| {
-                g.iter()
-                    .fold(0u64, |a, b| a.saturating_add(*b))
-                    .div_ceil(self.run_target.max(1))
-                    .max(1)
-            })
-            .fold(0u64, u64::saturating_add)
+    /// `R = ceil(N / G)`, the runs level 1 writes with groups of `group_size`.
+    fn runs(&self, group_size: u64) -> u64 {
+        (self.inputs as u64).div_ceil(group_size.max(1))
+    }
+
+    /// Constraint (b)'s left side over the runs of groups of `group_size`:
+    /// `R x 2 x block + in_flight + part_target`.
+    fn level_two_bytes(&self, group_size: u64) -> u64 {
+        self.runs(group_size)
+            .saturating_mul(LEVEL2_BLOCKS_PER_RUN)
+            .saturating_mul(self.block_bytes)
+            .saturating_add(self.in_flight)
+            .saturating_add(self.part_target)
     }
 }
 
 /// `W1`, the level-1 worker count (ADR-3853 D4): the largest count up to
 /// `share` whose per-worker ceiling `U / W1` leaves constraint (a) a group of
-/// at least 2 and whose predicted run parts `R` keep constraint (b)'s part
-/// term, `R x block + in_flight + part_target`, under `U`; `None` when none
+/// at least 2 and whose runs `R` keep constraint (b),
+/// `R x 2 x block + in_flight + part_target`, under `U`; `None` when none
 /// does, and the unit is refused before level 1 reads a block.
 fn derive_level1_workers(shape: &Level1Shape, share: usize) -> Option<usize> {
-    let inputs = shape.run_bytes.len();
     for workers in (1..=share.max(1)).rev() {
         let ceiling = shape.ceiling / workers as u64;
-        let group = level1_group_size(shape.per_input, shape.run_target, ceiling, inputs);
+        let group = level1_group_size(shape.per_input, shape.run_target, ceiling, shape.inputs);
         if group < 2 {
             continue;
         }
-        let parts = shape.run_parts(usize::try_from(group).unwrap_or(usize::MAX));
-        let fits = parts
-            .saturating_mul(shape.block_bytes)
-            .saturating_add(shape.in_flight)
-            .saturating_add(shape.part_target)
-            <= shape.ceiling;
-        if fits {
+        if shape.level_two_bytes(group) <= shape.ceiling {
             return Some(workers);
         }
     }
@@ -2554,7 +2553,7 @@ async fn two_level_merge(
         None => {
             let shape = Level1Shape {
                 per_input,
-                run_bytes: costs.iter().map(|c| c.decoded).collect(),
+                inputs,
                 block_bytes: costs.iter().map(|c| c.largest_block).max().unwrap_or(0),
                 in_flight: largest_in_flight(
                     costs
@@ -2573,16 +2572,18 @@ async fn two_level_merge(
                 Some(workers) => workers,
                 None => {
                     // One worker gives the largest groups and so the fewest
-                    // run parts. A group under 2 there is constraint (a)'s
+                    // runs. A group under 2 there is constraint (a)'s
                     // refusal, below.
                     let group = level1_group_size(per_input, run_target, ceiling, inputs);
                     if group >= 2 {
                         return Err(MaintainError::MergeTwoLevelUnsupported {
                             inputs,
                             check: TwoLevelCheck::PredictedLevelTwoFit {
-                                run_parts: shape
-                                    .run_parts(usize::try_from(group).unwrap_or(usize::MAX)),
+                                runs: shape.runs(group),
+                                blocks_per_run: LEVEL2_BLOCKS_PER_RUN,
                                 block_bytes: shape.block_bytes,
+                                per_input_bytes: per_input,
+                                group_size: group,
                                 in_flight_bytes: shape.in_flight,
                                 part_target_bytes: shape.part_target,
                                 ceiling_bytes: ceiling,
@@ -3411,18 +3412,17 @@ async fn merge_in_unit(
     let part_target = config.rlog_memory_target_bytes();
     let plan = plan_merge(config, &runs, stream_ids, width_ns)?;
     let stream_estimate = plan.estimates.iter().copied().max().unwrap_or(0);
-    // Level 2's inputs are the run parts, not the groups: a run cut into
-    // several parts holds one block per part.
-    let run_parts = runs.len() as u64;
     let fit = TwoLevelCheck::LevelTwoFit {
-        runs: run_parts,
+        runs: runs_count as u64,
+        blocks_per_run: LEVEL2_BLOCKS_PER_RUN,
         run_block_bytes,
         stream_estimate_bytes: stream_estimate,
         in_flight_bytes: in_flight,
         part_target_bytes: part_target,
         ceiling_bytes: ceiling,
     };
-    let resident = run_parts
+    let resident = (runs_count as u64)
+        .saturating_mul(LEVEL2_BLOCKS_PER_RUN)
         .saturating_mul(run_block_bytes)
         .max(stream_estimate);
     let compared = resident
@@ -15916,10 +15916,12 @@ mod tests {
         /// same on both sides.
         const TWO_LEVEL_PART: u64 = 4096;
 
-        /// The run memory target of the G = 12 fixture, in units of the
-        /// per-input level-1 cost `P`: at `40 P` each group's run is one part
-        /// of one 480-row block and constraint (b) holds with room to spare.
-        const TWO_LEVEL_RUN_PER_INPUTS: u64 = 40;
+        /// The run memory target of the G = 12 fixture: each group's run is
+        /// cut into 20 parts of one small block, so constraint (b)'s two
+        /// blocks per run fit. A run kept whole is one block carrying every
+        /// stream, and two of those per run price above what the
+        /// single-level plan needs, so no ceiling routes it to two levels.
+        const TWO_LEVEL_RUN_TARGET: u64 = 8192;
 
         /// A scratch directory for test `name`, absent on return.
         fn fresh_scratch(name: &str) -> std::path::PathBuf {
@@ -16037,11 +16039,13 @@ mod tests {
         /// levels of G = 12 instead, and every published part has the bytes,
         /// key and content hash the resident single-level merge gives it.
         /// Level 1 decodes each input block once; level 2 reads the runs
-        /// from scratch only and decodes each run block about once.
+        /// from scratch only and decodes each run block once, plus once more
+        /// for each later pass boundary it straddles, which is at most one
+        /// block per run.
         #[tokio::test]
         async fn two_level_merge_matches_single_level_bytes_and_keys() {
             let (oracle, single, per_input) = single_level_oracle().await;
-            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let run_target = TWO_LEVEL_RUN_TARGET;
             let ceiling = group_ceiling(per_input, run_target, 12);
             let dir = fresh_scratch("matches");
             let config = two_level_config(ceiling, run_target, Some(dir.clone()));
@@ -16085,37 +16089,40 @@ mod tests {
             );
             assert_eq!(r.block_read.requests, single.report.block_read.requests);
             assert!(run_blocks > 0);
+            assert_eq!(run_blocks, 100, "{line}");
+            assert_eq!(r.level2_passes, 9, "{r:?}");
+            let straddling = (r.level2_passes - 1) * 5;
             assert!(
                 r.level2_block_decodes >= run_blocks
-                    && r.level2_block_decodes * 10 <= run_blocks * 11,
-                "level-2 decodes {} against {run_blocks} run blocks",
+                    && r.level2_block_decodes <= run_blocks + straddling,
+                "level-2 decodes {} against {run_blocks} run blocks and {straddling} \
+                 pass boundaries",
                 r.level2_block_decodes
             );
-            assert!(r.level2_passes >= 1, "{r:?}");
+            assert_eq!(r.level2_block_decodes, 136, "{r:?}");
             assert!(r.scratch_write_bytes > 0, "{r:?}");
             assert!(r.scratch_read_bytes >= r.scratch_write_bytes, "{r:?}");
             assert_eq!(scratch_entries(&dir), Vec::<std::path::PathBuf>::new());
         }
 
-        /// Run settings never reach the published parts: a run target that
-        /// cuts the runs into several parts each and one that keeps each run
-        /// whole publish the single-level bytes and keys. Both run under the
-        /// whole-run ceiling, where the small target leaves room for groups of
-        /// 48 and constraint (b) holds over their 10 run parts.
+        /// Run settings never reach the published parts: two run targets that
+        /// cut the runs into different numbers of parts publish the
+        /// single-level bytes and keys. Both run under the fixture's G = 12
+        /// ceiling, where 4,096 bytes still leaves groups of 12.
         #[tokio::test]
         async fn the_run_target_does_not_change_the_published_parts() {
             let (oracle, _, per_input) = single_level_oracle().await;
-            let whole = TWO_LEVEL_RUN_PER_INPUTS * per_input;
-            let ceiling = group_ceiling(per_input, whole, 12);
+            let ceiling = group_ceiling(per_input, TWO_LEVEL_RUN_TARGET, 12);
             let mut writes = Vec::new();
-            for (name, run_target, groups) in
-                [("small-runs", 4 * per_input, 2), ("whole-runs", whole, 5)]
-            {
+            for (name, run_target) in [
+                ("smaller-runs", TWO_LEVEL_RUN_TARGET / 2),
+                ("fixture-runs", TWO_LEVEL_RUN_TARGET),
+            ] {
                 let dir = fresh_scratch(name);
                 let config = two_level_config(ceiling, run_target, Some(dir.clone()));
                 let (outcome, run, store, _) = compact_two_level(&config).await;
                 outcome.unwrap_or_else(|e| panic!("{name}: {e}"));
-                assert_eq!(run.report.level1_groups, groups, "{name}");
+                assert_eq!(run.report.level1_groups, 5, "{name}");
                 let line = run.line("rlog two-level merge");
                 let got = published(&store).await;
                 assert_eq!(got.0, oracle.0, "{name}: part keys");
@@ -16126,8 +16133,11 @@ mod tests {
                 ));
                 assert!(scratch_entries(&dir).is_empty(), "{name}");
             }
-            assert_eq!(writes[0].0, 10, "several parts per run at the small target");
-            assert_eq!(writes[1].0, 5, "one part per run at the large target");
+            assert_eq!(writes[1].0, 100, "20 parts per run at the fixture target");
+            assert!(
+                writes[0].0 > writes[1].0,
+                "more parts at the smaller target: {writes:?}"
+            );
             assert!(writes[0].1 != writes[1].1, "{writes:?}");
         }
 
@@ -16140,8 +16150,8 @@ mod tests {
         #[tokio::test]
         async fn parallel_groups_emit_the_serial_two_level_bytes() {
             let (oracle, _, per_input) = single_level_oracle().await;
-            let run_target = 5 * per_input;
-            let ceiling = group_ceiling(per_input, TWO_LEVEL_RUN_PER_INPUTS * per_input, 12);
+            let run_target = TWO_LEVEL_RUN_TARGET;
+            let ceiling = 4 * group_ceiling(per_input, run_target, 8);
             let worker_ceiling = ceiling / 4;
 
             // One worker under U / 4 merges the 8 groups the 4 workers share
@@ -16168,7 +16178,7 @@ mod tests {
             let alone_peak = alone_peaks[0];
 
             let mut outputs = Vec::new();
-            for (workers, group_size, groups) in [(1usize, 47u64, 2u64), (4, 8, 8)] {
+            for (workers, group_size, groups) in [(1usize, 35u64, 2u64), (4, 8, 8)] {
                 let dir = fresh_scratch(&format!("parallel-{workers}"));
                 let config = CompactorConfig {
                     level1_workers: Some(workers),
@@ -16221,8 +16231,8 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn level1_workers_run_on_distinct_threads() {
             let (oracle, _, per_input) = single_level_oracle().await;
-            let run_target = 5 * per_input;
-            let ceiling = group_ceiling(per_input, TWO_LEVEL_RUN_PER_INPUTS * per_input, 12);
+            let run_target = TWO_LEVEL_RUN_TARGET;
+            let ceiling = 4 * group_ceiling(per_input, run_target, 8);
             let dir = fresh_scratch("distinct-threads");
             let config = CompactorConfig {
                 level1_workers: Some(4),
@@ -16259,8 +16269,8 @@ mod tests {
         async fn dropping_a_level1_worker_mid_encode_aborts_its_encode() {
             use std::sync::atomic::Ordering::SeqCst;
             let (_, _, per_input) = single_level_oracle().await;
-            let run_target = 5 * per_input;
-            let ceiling = group_ceiling(per_input, TWO_LEVEL_RUN_PER_INPUTS * per_input, 12);
+            let run_target = TWO_LEVEL_RUN_TARGET;
+            let ceiling = 4 * group_ceiling(per_input, run_target, 8);
             let dir = fresh_scratch("drop-mid-encode");
             let config = CompactorConfig {
                 level1_workers: Some(4),
@@ -16313,8 +16323,8 @@ mod tests {
         #[tokio::test]
         async fn each_input_is_priced_once_and_a_set_worker_count_builds_no_shape() {
             let (_, _, per_input) = single_level_oracle().await;
-            let run_target = 5 * per_input;
-            let ceiling = group_ceiling(per_input, TWO_LEVEL_RUN_PER_INPUTS * per_input, 12);
+            let run_target = TWO_LEVEL_RUN_TARGET;
+            let ceiling = 4 * group_ceiling(per_input, run_target, 8);
             let inputs = two_level_inputs().len() as u64;
             for (workers, shapes) in [(Some(4), 0), (None, 1)] {
                 let dir = fresh_scratch(&format!("priced-once-{workers:?}"));
@@ -16343,9 +16353,9 @@ mod tests {
         /// ADR-3853 D4 and D3 at the production shape: 32 cores, 4 units of
         /// 5 GiB at once or one of 20 GiB, 256 MiB run targets, the
         /// 19,177-input bucket. Measured pricing gives each unit its whole
-        /// core share, 8 or 32 workers; ceiling pricing leaves no worker
-        /// count whose run parts fit constraint (b), so the unit is refused
-        /// before level 1.
+        /// core share, 8 or 32 workers; ceiling pricing keeps constraint (b)
+        /// only at the worker count whose groups leave few enough runs, 1 of
+        /// 8 or 14 of 32.
         /// `E` is the core share while final parts fit beside level 2's
         /// resident side, and 2 when they do not.
         #[test]
@@ -16356,9 +16366,9 @@ mod tests {
             let share = unit_core_share(32, 4 * ceiling, ceiling);
             assert_eq!(share, 8);
             assert_eq!(unit_core_share(32, 20 * GIB, 64 << 20), 1);
-            let shape = |per_input: u64, run: u64, block: u64| Level1Shape {
+            let shape = |per_input: u64, block: u64| Level1Shape {
                 per_input,
-                run_bytes: vec![run; 19_177],
+                inputs: 19_177,
                 block_bytes: block,
                 in_flight: 32_000_000,
                 run_target: TARGET,
@@ -16366,47 +16376,60 @@ mod tests {
                 ceiling,
             };
 
-            let measured = shape(6_900_000, 6_000_000, 3_000_000);
+            let measured = shape(6_900_000, 3_000_000);
             assert_eq!(
                 level1_group_size(6_900_000, TARGET, ceiling / 8, 19_177),
                 58
             );
-            assert_eq!(measured.run_parts(58), 661, "330 runs of 2 parts, 1 of 1");
+            assert_eq!(measured.runs(58), 331);
+            assert_eq!(measured.level_two_bytes(58), 2_286_435_456);
             assert_eq!(derive_level1_workers(&measured, share), Some(8));
             assert_eq!(derive_level1_workers(&measured, 1), Some(1));
 
-            let priced = shape(29_900_000, 29_000_000, 22_000_000);
+            let priced = shape(29_900_000, 22_000_000);
+            assert_eq!(
+                level1_group_size(29_900_000, TARGET, ceiling / 2, 19_177),
+                80
+            );
+            assert_eq!(priced.runs(80), 240);
+            assert!(priced.level_two_bytes(80) > ceiling);
             assert_eq!(level1_group_size(29_900_000, TARGET, ceiling, 19_177), 170);
-            assert_eq!(priced.run_parts(170), 2_143);
-            assert_eq!(derive_level1_workers(&priced, share), None);
+            assert_eq!(priced.runs(170), 113);
+            assert_eq!(priced.level_two_bytes(170), 5_272_435_456);
+            assert_eq!(derive_level1_workers(&priced, share), Some(1));
 
             // One unit of 20 GiB with all 32 cores and 1 GiB final parts.
             let whole = 20 * GIB;
             assert_eq!(unit_core_share(32, whole, whole), 32);
-            let at_whole = |per_input: u64, run: u64, block: u64| Level1Shape {
+            let at_whole = |per_input: u64, block: u64| Level1Shape {
                 ceiling: whole,
                 part_target: GIB,
-                ..shape(per_input, run, block)
+                ..shape(per_input, block)
             };
-            let measured = at_whole(6_900_000, 6_000_000, 3_000_000);
+            let measured = at_whole(6_900_000, 3_000_000);
             assert_eq!(level1_group_size(6_900_000, TARGET, whole / 32, 19_177), 58);
-            assert_eq!(measured.run_parts(58), 661);
             assert_eq!(derive_level1_workers(&measured, 32), Some(32));
-            let priced = at_whole(29_900_000, 29_000_000, 22_000_000);
-            assert_eq!(level1_group_size(29_900_000, TARGET, whole, 19_177), 709);
-            assert_eq!(priced.run_parts(709), 2_083, "27 runs of 77 parts, 1 of 4");
-            assert_eq!(derive_level1_workers(&priced, 32), None);
+            let priced = at_whole(29_900_000, 22_000_000);
+            assert_eq!(
+                level1_group_size(29_900_000, TARGET, whole / 15, 19_177),
+                38
+            );
+            assert_eq!(priced.runs(38), 505);
+            assert!(priced.level_two_bytes(38) > whole);
+            assert_eq!(
+                level1_group_size(29_900_000, TARGET, whole / 14, 19_177),
+                42
+            );
+            assert_eq!(priced.runs(42), 457);
+            assert_eq!(priced.level_two_bytes(42), 21_213_741_824);
+            assert_eq!(derive_level1_workers(&priced, 32), Some(14));
 
             assert_eq!(
-                level2_encode_builders(share, ceiling, 661 * 3_000_000, 32_000_000, TARGET),
+                level2_encode_builders(share, ceiling, 331 * 2 * 3_000_000, 32_000_000, TARGET),
                 8
             );
             assert_eq!(
-                level2_encode_builders(share, ceiling, 113 * 22_000_000, 32_000_000, TARGET),
-                8
-            );
-            assert_eq!(
-                level2_encode_builders(share, ceiling, 230 * 22_000_000, 32_000_000, TARGET),
+                level2_encode_builders(share, ceiling, 113 * 2 * 22_000_000, 32_000_000, TARGET),
                 2
             );
             assert_eq!(
@@ -16423,7 +16446,7 @@ mod tests {
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
             let per_input = level1_per_input(&probe, &keys).await;
-            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let run_target = TWO_LEVEL_RUN_TARGET;
             let config =
                 two_level_config(group_ceiling(per_input, run_target, 12), run_target, None);
             let (outcome, run, store, _) = compact_two_level(&config).await;
@@ -16533,7 +16556,7 @@ mod tests {
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
             let per_input = level1_per_input(&probe, &keys).await;
-            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let run_target = TWO_LEVEL_RUN_TARGET;
 
             let dir = fresh_scratch("refusal-a");
             let ceiling = group_ceiling(per_input, run_target, 1);
@@ -16571,6 +16594,7 @@ mod tests {
                     check:
                         TwoLevelCheck::LevelTwoFit {
                             runs,
+                            blocks_per_run,
                             run_block_bytes,
                             stream_estimate_bytes,
                             in_flight_bytes,
@@ -16578,17 +16602,19 @@ mod tests {
                             ceiling_bytes,
                         },
                 }) => {
-                    assert_eq!(runs, 20, "4 parts in each of 5 runs");
+                    assert_eq!(runs, 5, "one run per group");
+                    assert_eq!(blocks_per_run, 2);
                     assert_eq!(part_target_bytes, TWO_LEVEL_PART);
                     assert_eq!(ceiling_bytes, ceiling);
                     assert!(stream_estimate_bytes >= run_block_bytes);
                     assert!(
-                        (runs * run_block_bytes).max(stream_estimate_bytes)
+                        (runs * blocks_per_run * run_block_bytes).max(stream_estimate_bytes)
                             + in_flight_bytes
                             + part_target_bytes
                             > ceiling,
-                        "(b) failed: {runs} x {run_block_bytes}, {stream_estimate_bytes}, \
-                         {in_flight_bytes}, {part_target_bytes}, {ceiling}"
+                        "(b) failed: {runs} x {blocks_per_run} x {run_block_bytes}, \
+                         {stream_estimate_bytes}, {in_flight_bytes}, {part_target_bytes}, \
+                         {ceiling}"
                     );
                 }
                 other => panic!("{other:?}"),
@@ -16599,19 +16625,18 @@ mod tests {
             assert!(scratch_entries(&dir).is_empty());
         }
 
-        /// ADR-3853 D4: when constraint (b) priced on the predicted run parts
-        /// fits at no worker count, the unit is refused before level 1, with
-        /// no block GET, no group and no run written. At a run target of 2 P
-        /// each group of 12 decodes to about 12 P of priced bytes, so 6 run
-        /// parts are predicted per group, 30 in all, against a ceiling that
-        /// holds far fewer level-2 blocks.
+        /// ADR-3853 D4: when constraint (b) priced on the predicted runs fits
+        /// at no worker count, the unit is refused before level 1, with no
+        /// block GET, no group and no run written. At a run target of 2 P and
+        /// a ceiling that leaves groups of 4, the 60 inputs predict 15 runs,
+        /// whose 30 level-2 blocks the ceiling cannot hold.
         #[tokio::test]
         async fn an_unfit_level_two_is_refused_before_any_block_get() {
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
             let per_input = level1_per_input(&probe, &keys).await;
             let run_target = 2 * per_input;
-            let ceiling = group_ceiling(per_input, run_target, 12);
+            let ceiling = group_ceiling(per_input, run_target, 4);
             let catalogs = catalogs_of(&probe, &keys).await;
             let mut block_bytes = 0u64;
             for catalog in &catalogs {
@@ -16629,20 +16654,27 @@ mod tests {
                     inputs: 60,
                     check:
                         TwoLevelCheck::PredictedLevelTwoFit {
-                            run_parts,
+                            runs,
+                            blocks_per_run,
                             block_bytes: priced,
+                            per_input_bytes,
+                            group_size,
                             in_flight_bytes,
                             part_target_bytes,
                             ceiling_bytes,
                         },
                 }) => {
-                    assert_eq!(run_parts, 30, "6 predicted parts in each of 5 groups");
+                    assert_eq!(group_size, 4, "the one-worker group");
+                    assert_eq!(runs, 15, "60 inputs in groups of 4");
+                    assert_eq!(blocks_per_run, 2);
+                    assert_eq!(per_input_bytes, per_input);
                     assert_eq!(priced, block_bytes);
                     assert_eq!(part_target_bytes, TWO_LEVEL_PART);
                     assert_eq!(ceiling_bytes, ceiling);
                     assert!(
-                        run_parts * priced + in_flight_bytes + part_target_bytes > ceiling,
-                        "(b) fails at one worker: {run_parts} x {priced}, \
+                        runs * blocks_per_run * priced + in_flight_bytes + part_target_bytes
+                            > ceiling,
+                        "(b) fails at one worker: {runs} x {blocks_per_run} x {priced}, \
                          {in_flight_bytes}, {part_target_bytes}, {ceiling}"
                     );
                 }
@@ -16658,59 +16690,122 @@ mod tests {
             assert!(!dir.exists(), "no scratch directory was even created");
         }
 
-        /// Constraint (b) prices every run part, not every group: at a run
-        /// target of 8,192 bytes each of the 5 groups' runs is cut into 20
-        /// parts, and the 100 parts are what level 2 merges. Counting the 5
-        /// groups instead would fit this ceiling and run level 2 over a
-        /// stream estimate that leaves out 95 of its blocks. `W1` is named,
-        /// so the check runs on the run parts level 1 actually wrote.
+        /// ADR-3853 D3, #3943 correction: constraint (b) counts runs,
+        /// `R = ceil(N / G)`, and prices each at two blocks, since level 1
+        /// writes a run stream by stream and one stream's rows sit in one of
+        /// its parts, or two where a cut falls inside them.
+        ///
+        /// At the production shape, 19,177 inputs of 50 MB under 20 GiB with
+        /// 32 cores, 6 workers leave groups of 66 and 291 runs, whose term
+        /// fits; 7 workers leave groups of 55 and 349 runs, whose term does
+        /// not.
+        ///
+        /// On the fixture, a run target of 8,192 bytes cuts each run into 20
+        /// parts. Under groups of 12 the 100 parts at one block each exceed
+        /// the ceiling while the 5 runs at two blocks each fit, and the merge
+        /// publishes the single-level bytes and keys. Under groups of 10 the
+        /// 6 runs fit at one block each and not at two, and the unit is
+        /// refused before level 1.
         #[tokio::test]
-        async fn constraint_b_counts_run_parts_not_groups() {
+        async fn level2_fit_counts_runs_and_prices_two_blocks_per_run() {
+            const GIB: u64 = 1 << 30;
+            let whole = 20 * GIB;
+            let shape = Level1Shape {
+                per_input: 50_000_000,
+                inputs: 19_177,
+                block_bytes: 29_769_629,
+                in_flight: 54_132_381,
+                run_target: 256 << 20,
+                part_target: 1_572_864_000,
+                ceiling: whole,
+            };
+            assert_eq!(whole, 21_474_836_480);
+            let share = unit_core_share(32, whole, whole);
+            assert_eq!(share, 32);
+            assert_eq!(derive_level1_workers(&shape, share), Some(6));
+            assert_eq!(whole / 6, 3_579_139_413);
+            let group = level1_group_size(shape.per_input, shape.run_target, whole / 6, 19_177);
+            assert_eq!(group, 66);
+            assert_eq!(shape.runs(group), 291);
+            assert_eq!(shape.level_two_bytes(group), 18_952_920_459);
+            let group = level1_group_size(shape.per_input, shape.run_target, whole / 7, 19_177);
+            assert_eq!(group, 55);
+            assert_eq!(shape.runs(group), 349);
+            assert_eq!(shape.level_two_bytes(group), 22_406_197_423);
+            assert!(shape.level_two_bytes(group) > whole);
+
+            let (oracle, _, per_input) = single_level_oracle().await;
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
-            let per_input = level1_per_input(&probe, &keys).await;
-            let run_target = 8192;
+            let mut block_bytes = 0u64;
+            let mut lens = Vec::new();
+            for catalog in &catalogs_of(&probe, &keys).await {
+                let cost = level1_input_bytes(catalog).expect("price");
+                block_bytes = block_bytes.max(cost.largest_block);
+                lens.extend(cost.extents.iter().map(|(s, e)| e - s));
+            }
+            let predicted_tail =
+                largest_in_flight(lens, CompactorConfig::default().input_read_concurrency)
+                    + TWO_LEVEL_PART;
+            let run_target = TWO_LEVEL_RUN_TARGET;
+
             let ceiling = group_ceiling(per_input, run_target, 12);
-            let dir = fresh_scratch("parts-not-groups");
-            let config = CompactorConfig {
-                level1_workers: Some(1),
-                ..two_level_config(ceiling, run_target, Some(dir.clone()))
-            };
+            let dir = fresh_scratch("runs-not-parts");
+            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            assert!(
+                matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                "{outcome:?}"
+            );
+            let line = run.line("rlog two-level merge");
+            let (runs, parts) = (log_field(&line, "runs"), log_field(&line, "run_parts"));
+            assert_eq!((runs, parts), (5, 100), "{line}");
+            assert!(parts >= 4 * runs, "{line}");
+            let tail = log_field(&line, "in_flight_bytes") + TWO_LEVEL_PART;
+            let run_block = log_field(&line, "run_block_bytes");
+            assert!(parts * run_block + tail > ceiling, "{line}");
+            assert!(runs * 2 * run_block + tail <= ceiling, "{line}");
+            assert!(parts * block_bytes + predicted_tail > ceiling);
+            assert!(runs * 2 * block_bytes + predicted_tail <= ceiling);
+            assert_eq!(run.report.level1_groups, 5, "{:?}", run.report);
+            let two_level = published(&store).await;
+            assert_eq!(two_level.0, oracle.0, "part keys");
+            assert!(two_level.1 == oracle.1, "part bytes");
+            assert!(scratch_entries(&dir).is_empty());
+
+            let ceiling = group_ceiling(per_input, run_target, 10);
+            let dir = fresh_scratch("two-blocks-per-run");
+            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
             let (outcome, run, store, _) = compact_two_level(&config).await;
             match outcome {
                 Ok(CompactionOutcome::TwoLevelUnsupported {
                     inputs: 60,
                     check:
-                        TwoLevelCheck::LevelTwoFit {
+                        TwoLevelCheck::PredictedLevelTwoFit {
                             runs,
-                            run_block_bytes,
-                            stream_estimate_bytes,
+                            blocks_per_run,
+                            block_bytes: priced,
+                            group_size,
                             in_flight_bytes,
                             part_target_bytes,
-                            ceiling_bytes,
+                            ..
                         },
                 }) => {
-                    assert_eq!(runs, 100, "20 parts in each of 5 runs");
-                    assert_eq!(ceiling_bytes, ceiling);
+                    assert_eq!((runs, blocks_per_run, group_size), (6, 2, 10));
+                    assert_eq!(priced, block_bytes);
                     let tail = in_flight_bytes + part_target_bytes;
+                    assert!(runs * priced + tail <= ceiling, "one block per run fits");
                     assert!(
-                        runs * run_block_bytes > stream_estimate_bytes,
-                        "the part term decides: {runs} x {run_block_bytes} against \
-                         {stream_estimate_bytes}"
-                    );
-                    assert!(runs * run_block_bytes + tail > ceiling, "(b) fails");
-                    assert!(
-                        (5 * run_block_bytes).max(stream_estimate_bytes) + tail <= ceiling,
-                        "the group count would have fit: 5 x {run_block_bytes}, \
-                         {stream_estimate_bytes}, {tail}, {ceiling}"
+                        runs * 2 * priced + tail > ceiling,
+                        "two blocks per run do not"
                     );
                 }
                 other => panic!("{other:?}"),
             }
-            assert_eq!(run.report.level1_groups, 5, "{:?}", run.report);
-            assert_eq!(run.report.level2_passes, 0, "{:?}", run.report);
+            assert_eq!(run.report.level1_groups, 0, "{:?}", run.report);
+            assert_eq!(run.report.scratch_write_bytes, 0, "{:?}", run.report);
             assert_eq!(compaction_records(&store).await, 0);
-            assert!(scratch_entries(&dir).is_empty());
+            assert!(!dir.exists());
         }
 
         /// ADR-3853 D0 routing: a bucket whose single-level plan reads fetch
@@ -16844,7 +16939,7 @@ mod tests {
             let store = ProbeStore::new();
             let keys = seed_inputs(&store, &two_level_inputs()).await;
             let per_input = level1_per_input(&store, &keys).await;
-            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let run_target = TWO_LEVEL_RUN_TARGET;
             let config = two_level_config(
                 group_ceiling(per_input, run_target, 12),
                 run_target,
@@ -16885,7 +16980,7 @@ mod tests {
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
             let per_input = level1_per_input(&probe, &keys).await;
-            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let run_target = TWO_LEVEL_RUN_TARGET;
             let config = two_level_config(
                 group_ceiling(per_input, run_target, 12),
                 run_target,
@@ -17053,7 +17148,7 @@ mod tests {
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
             let per_input = level1_per_input(&probe, &keys).await;
-            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let run_target = TWO_LEVEL_RUN_TARGET;
             let config = two_level_config(
                 group_ceiling(per_input, run_target, 12),
                 run_target,
@@ -17086,7 +17181,7 @@ mod tests {
                 stored += probe.head(key).await.expect("head").size;
             }
             let need = (stored * 13).div_ceil(10);
-            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let run_target = TWO_LEVEL_RUN_TARGET;
             let dir = fresh_scratch("short");
             let config = two_level_config(
                 group_ceiling(per_input, run_target, 12),
@@ -17466,7 +17561,7 @@ mod tests {
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
             let per_input = level1_per_input(&probe, &keys).await;
-            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let run_target = TWO_LEVEL_RUN_TARGET;
             let ceiling = group_ceiling(per_input, run_target, 12);
 
             let dir = fresh_scratch("success");
@@ -17547,7 +17642,7 @@ mod tests {
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
             let per_input = level1_per_input(&probe, &keys).await;
-            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let run_target = TWO_LEVEL_RUN_TARGET;
             let config = two_level_config(
                 group_ceiling(per_input, run_target, 12),
                 run_target,

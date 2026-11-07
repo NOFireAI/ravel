@@ -162,8 +162,9 @@ since the planner and the passes are the same code.
 When the profile reports `decoded_heap_bytes` of a real block, the plan
 gains a measured-ratio term and prices a block at that figure, `h`, instead.
 The sizing table is in D4, because `G`, the run count `R = N / G` and `W1`
-constrain each other through level 2 (D3) (the #3873 amendment counts `R` in
-run parts, not groups).
+constrain each other through level 2 (D3) (the #3873 amendment counted `R` in
+run parts; the #3943 correction counts runs, one per group, at two blocks
+each).
 
 ### D2. Scratch runs
 
@@ -216,8 +217,8 @@ R x price(one run block) + reads in flight + final part target <= U
 ```
 
 Solved for the run count, (b) is `R <= (U - reads in flight - final part
-target) / price(one run block)`. Level 2's inputs are the run parts, so `R`
-is their count (#3873 amendment). Reads in flight at level 2 is
+target) / price(one run block)`. What `R` counts and how many blocks each
+run is priced at are in the #3943 correction. Reads in flight at level 2 is
 `input_read_concurrency` run row groups, and a run row group is one block
 of at most 1 MB stored at zstd 1, so 32 MB at the #3856 default of 32. A
 run block of 8,192 rows costs the same 22 MB as an L0 block at ceiling
@@ -283,7 +284,8 @@ an input's blocks priced at 29 MB (22 + 7, Context) at ceiling pricing or
 MiB); final part target 268 MB at concurrency 4 and 1,074 MB (1 GiB) at
 concurrency 1; reads in flight 32 MB; `U` 5,369 MB (5 GiB) or 21,475 MB
 (20 GiB). `C = U / W1` and `G` round down, `R = N / G` rounds up (the #3873
-amendment counts run parts and recomputes `R` and `W1`), the bound
+amendment recomputes `R` and `W1`, and the #3943 correction prices each run at
+two blocks and recomputes the bound and `W1`), the bound
 is (b) solved for `R` and rounded down, and `W1` is the largest value at or
 under the core share whose `R` is at or under the bound.
 
@@ -583,7 +585,9 @@ cost by the share of encode the two changes removed.
 This records how D3 and D4 shipped, in issue #3873, corrects how D1,
 D3 and D4 count `R`, and states two cases of D2's headroom refusal.
 
-**`R` counts run parts.** D2 cuts each group's run into parts at the run
+**`R` counts run parts.** The #3943 correction supersedes this paragraph,
+its table and the paragraph after it: `R` counts runs, at two blocks each.
+D2 cuts each group's run into parts at the run
 memory target, and every run part is a level-2 input, so constraint (b)'s
 term is `R x price(one run block)` with `R` the number of run parts, not the
 number of groups `N / G`. A group of `G` inputs whose decoded bytes sum to
@@ -617,7 +621,9 @@ parts (330 groups of 2 parts and one of 1) against bounds of 1,689 and
 core share for which constraint (a) at `C = U / W1` leaves a group of at
 least 2 and the predicted run parts keep (b)'s part term,
 `R x price(the inputs' largest block) + reads in flight + final part target`,
-at or under `U`. When no count does, the unit is refused before level 1
+at or under `U` (the #3943 correction counts runs and prices two blocks
+each, here and in level 2's own check below). When no count does, the unit
+is refused before level 1
 reads a block, with the check `PredictedLevelTwoFit` and its figures at one
 worker, the count with the largest groups and so the fewest run parts.
 The core share is the usable cores
@@ -677,13 +683,74 @@ E = max(2, min(core share, (U - resident - reads in flight) / final part target)
 ```
 
 where `resident` is the larger of `R x price(one run block)` and the largest
-level-2 stream estimate, the same term (b) compares. `E` is on the
+level-2 stream estimate, the same term (b) compares (`R x 2 x price(one run
+block)` with `R` in runs, the #3943 correction). `E` is on the
 `rlog two-level merge` log line and is `encode_builders` in the request
 ledger. Parts are still PUT in `part_index` order, and the tracker's writer
 term carries every builder in flight, not only the open one. The floor of 2
 can take the writer term one final part target past the single one (b)
 reserves, when `U` leaves room for fewer than two parts beside the resident
 side; (b) itself is unchanged.
+
+## Correction (2026-11-07): constraint (b) counts runs at two blocks per run (#3943)
+
+<!-- amendment-applies: sections="D1. Group merges|D3. Level 2 over runs|D4. Parallel groups|Amendment (2026-11-06): parallel level-1 workers and a derived encode depth (#3873)" pointer="#3943 correction" -->
+<!-- amendment-supersedes: phrase="`R` counts run parts" pointer="#3943 correction" -->
+
+The #3873 amendment counted `R` in run parts, pricing one block for every
+part of every run. Level 1 writes a run stream by stream, and D2 cuts it
+into parts at the run memory target, so a stream smaller than a part sits in
+one part of a run, or in two when a cut falls inside it, and a larger stream
+is priced by its level-2 stream estimate, the other side of (b)'s maximum:
+level 2 never needs a block from every part of a run for one stream.
+Counting parts multiplied the term
+by the parts per run, and refused buckets whose level 2 fits, hour 498273
+at ceiling pricing under both ceilings among them.
+
+Constraint (b) counts runs, `R = ceil(N / G)`, one per group whatever its
+part count, and prices each run at two blocks:
+
+```
+R x 2 x price(one run block) + reads in flight + final part target <= U
+```
+
+D4's derivation evaluates it before level 1 with the inputs' largest block
+at ADR-0979 ceiling pricing (`pass_block_cost`), and refuses the unit with
+`PredictedLevelTwoFit` when no worker count fits; the refusal names `P`,
+`G`, `R` and the two blocks per run beside the price, reads in flight, the
+final part target and `U`, at one worker. Level 2 checks it again after
+level 1 with the largest block of the runs it wrote: `resident` is the
+larger of `R x 2 x price(one run block)` and the largest level-2 stream
+estimate, a cursor-mode level-2 plan is still refused, and the refusal
+`LevelTwoFit` names the runs and the two blocks per run. `E`'s `resident`
+is that same term. The parts level 1 wrote stay on the
+`rlog two-level merge` log line as `run_parts`, beside `runs`.
+
+D4's table, recomputed with `R` in runs and the bound as (b) solved for `R`,
+`(U - reads in flight - final part target) / (2 x price(one run block))`
+rounded down, every other input and rounding rule as D4 states:
+
+| U, cores per unit | pricing | W1 | C | G | R (runs) | (b) bound on R | source |
+|---|---|---|---|---|---|---|---|
+| 5,369 MB, 8 (server defaults) | ceiling | 1 | 5,369 | 170 | 113 | 115 | predicted |
+| 5,369 MB, 8 | h = 3 MB | 8 | 671 | 58 | 331 | 844 | predicted |
+| 21,475 MB, 32 (concurrency 1, compact-bucket) | ceiling | 14 | 1,533 | 42 | 457 | 462 | predicted |
+| 21,475 MB, 32 | h = 3 MB | 32 | 671 | 58 | 331 | 3,394 | predicted |
+
+At the server defaults and ceiling pricing one worker fits: at `W1 = 2`,
+`G` is 80 and `R` 240, above 115. At 20 GiB and ceiling pricing 14 workers
+fit: at 15, `C` is 1,431, `G` 38 and `R` 505, above 462. The measured-ratio
+rows keep their `W1`. The unit test
+`level1_workers_and_encode_builders_at_the_production_shape` pins every
+row's `G`, `R` and `W1`, and
+`level2_fit_counts_runs_and_prices_two_blocks_per_run` pins the shape of
+issue #3943 (19,177 inputs, a 29,769,629-byte block, 54,132,381 bytes in
+flight, a 1,572,864,000-byte final part, `U` of 21,474,836,480 bytes, and a
+per-input cost of 50,000,000 bytes the test states): `W1` 6, `G` 66, `R`
+291, and a term of 18,952,920,459 bytes. That test also merges a fixture
+whose runs are each cut into 20 parts in two levels, under a ceiling the
+parts at one block each exceed, and refuses a ceiling that holds its runs
+at one block each and not at two.
 
 ## Amendment (2026-11-07): the D0 floor amendment (#3905)
 

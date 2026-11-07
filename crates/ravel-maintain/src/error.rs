@@ -106,15 +106,19 @@ pub enum TwoLevelCheck {
         /// The group size the figures admit.
         group_size: u64,
     },
-    /// Constraint (b): one block per run part, plus the reads in flight, plus the
-    /// final part target, does not fit the resident ceiling at level 2. The
-    /// block term is the larger of `runs x run_block_bytes` and the largest
-    /// stream's level-2 estimate, which exceeds it when a run part cut splits
-    /// a stream across two blocks of one run.
+    /// Constraint (b): two blocks per run, plus the reads in flight, plus the
+    /// final part target, does not fit the resident ceiling at level 2. A run
+    /// is written stream by stream, so a stream smaller than a part sits in
+    /// one of its parts, or in two when a cut falls inside it (ADR-3853,
+    /// #3943 correction). The block term is the larger of
+    /// `runs x blocks_per_run x run_block_bytes` and the largest stream's
+    /// level-2 estimate, which prices a larger stream.
     LevelTwoFit {
-        /// Run parts merged at level 2: every part of every run, each one a
-        /// level-2 input.
+        /// Runs merged at level 2, one per level-1 group, however many parts
+        /// each was cut into.
         runs: u64,
+        /// The level-2 blocks priced per run, 2.
+        blocks_per_run: u64,
         /// The largest pass price of one run block.
         run_block_bytes: u64,
         /// The largest level-2 stream estimate: the summed pass price of every
@@ -128,16 +132,20 @@ pub enum TwoLevelCheck {
         ceiling_bytes: u64,
     },
     /// Constraint (b) priced before level 1 reads a block (ADR-3853 D4): at
-    /// no level-1 worker count up to the unit's core share do the run parts
-    /// level 1 is predicted to write fit level 2, so the unit is refused
-    /// without running level 1. Shown at one worker, the count with the
-    /// fewest run parts.
+    /// no level-1 worker count up to the unit's core share do the runs level
+    /// 1 would write fit level 2, so the unit is refused without running
+    /// level 1. Shown at one worker, the count with the fewest runs.
     PredictedLevelTwoFit {
-        /// Run parts level 1 would write at one worker: per group, its
-        /// inputs' decoded bytes over the run target, rounded up.
-        run_parts: u64,
+        /// Runs level 1 would write at one worker, `ceil(N / G)`.
+        runs: u64,
+        /// The level-2 blocks priced per run, 2.
+        blocks_per_run: u64,
         /// The price of one level-2 block, taken from the inputs' largest.
         block_bytes: u64,
+        /// `P`, the largest per-input term of constraint (a).
+        per_input_bytes: u64,
+        /// `G`, the group size constraint (a) gives at one worker.
+        group_size: u64,
         /// Bytes of the `input_read_concurrency` largest input row groups.
         in_flight_bytes: u64,
         /// The final parts' memory split target.
@@ -161,6 +169,7 @@ impl std::fmt::Display for TwoLevelCheck {
             ),
             Self::LevelTwoFit {
                 runs,
+                blocks_per_run,
                 run_block_bytes,
                 stream_estimate_bytes,
                 in_flight_bytes,
@@ -168,17 +177,20 @@ impl std::fmt::Display for TwoLevelCheck {
                 ceiling_bytes,
             } => write!(
                 f,
-                "level 2 over {runs} run parts needs the larger of {runs} x {run_block_bytes} and the largest stream estimate {stream_estimate_bytes}, + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes (constraint b)"
+                "level 2 over {runs} runs at {blocks_per_run} blocks per run needs the larger of {runs} x {blocks_per_run} x {run_block_bytes} and the largest stream estimate {stream_estimate_bytes}, + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes (constraint b)"
             ),
             Self::PredictedLevelTwoFit {
-                run_parts,
+                runs,
+                blocks_per_run,
                 block_bytes,
+                per_input_bytes,
+                group_size,
                 in_flight_bytes,
                 part_target_bytes,
                 ceiling_bytes,
             } => write!(
                 f,
-                "level 2 over a predicted {run_parts} run parts needs {run_parts} x {block_bytes} + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes at every level-1 worker count (constraint b, refused before level 1)"
+                "level 2 over a predicted {runs} runs of group size {group_size} at {per_input_bytes} bytes per input needs {runs} x {blocks_per_run} blocks x {block_bytes} + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes at every level-1 worker count (constraint b, refused before level 1)"
             ),
         }
     }

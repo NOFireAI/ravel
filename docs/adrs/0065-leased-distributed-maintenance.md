@@ -532,7 +532,9 @@ scratch directory, cut into parts at the run memory target. Level 2 merges
 the runs' `R` parts into the published parts with the same planner and
 passes, once `max(R x price(one run block), largest stream estimate) +
 reads in flight + final part target <= U` holds and the plan over the runs
-is not cursor. `R` counts run parts, not groups: every part of every run is
+is not cursor. `R` counts run parts, not groups (ADR-3853's #3943 correction
+counts runs instead, one per group, and prices each at two blocks,
+`R x 2 x price(one run block)`): every part of every run is
 a level-2 input, so a run target that cuts each group into several parts
 multiplies the term. The stream estimate term is there because a run's part
 cut can split one stream across two of that run's blocks. Group size under
@@ -552,7 +554,8 @@ The peak this decision states then holds per level. Every input's catalog
 stays loaded across both levels. Level 1 holds one group's resident row
 groups, one pass over them and an in-progress run part bounded by the run
 memory target; level 2 holds the run parts' row groups, one pass over at
-most `R` run blocks per stream, and the in-progress part. Level 1 runs one group
+most `R` run blocks per stream (two per run with `R` in runs, ADR-3853's
+#3943 correction), and the in-progress part. Level 1 runs one group
 at a time (`W1 = 1`; see the per-worker budget amendment below for `W1`
 parallel workers), so the per-worker ceiling `C` is the unit ceiling `U`;
 dividing the budgets across parallel workers is ADR-3853 D4's. The runs are
@@ -577,7 +580,8 @@ With no `scratch_dir`, the merge and the D0 refusal are unchanged.
 A two-level merge's level 1 now runs `W1` workers at once (ADR-3853 D4 and
 its #3873 amendment). `W1` is the largest count at or under the unit's core
 share whose groups and predicted run parts fit both of ADR-3853's
-constraints, or the `level1_workers` setting when one is given; when no
+constraints (predicted runs at two blocks each, ADR-3853's #3943
+correction), or the `level1_workers` setting when one is given; when no
 count fits, the unit is refused before level 1 reads a block. Each worker
 is its own task, so the workers' merges run on separate threads. Decision 4's
 bound then holds per worker: each merges its groups under its own copy of
