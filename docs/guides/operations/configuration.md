@@ -1089,7 +1089,7 @@ it:
 | Flag | Default | Effect |
 |---|---|---|
 | `--maintain-scratch-dir` | unset | The directory the level-1 runs are written under. Without it, a bucket whose cursor merge would decode more than 16 rows per input record is refused and counted under `ravel_maintain_compaction_refused_total{reason="geometry"}`. |
-| `--maintain-scratch-max-bytes` | unset | A cap on the bytes the directory may hold. A unit is admitted against the smaller of the volume's free bytes and this cap less the bytes already under the directory. Without it, the volume's free bytes alone decide. |
+| `--maintain-scratch-max-bytes` | unset | A cap on the bytes the directory may hold. A unit is admitted against the smaller of the volume's free bytes and this cap less the bytes already under the directory. A running unit whose next run write would take the directory past the cap stops before that write and is refused under `reason="scratch_headroom"`. Without it, the volume's free bytes alone decide. |
 | `--maintain-level1-workers` | derived | How many level-1 groups of one bucket merge at once, each under its share of the unit's memory ceiling. Without it, the count is derived per bucket from the unit's share of the usable cores and the largest count whose groups still fit. |
 
 The scratch directory is a cache, not storage:
@@ -1109,6 +1109,16 @@ Size the directory at about 1.3 times the stored input bytes of the largest
 bucket the process merges. A unit is admitted only when that many bytes are
 free, counting the cap when one is set. A unit that does not fit is refused
 before it fetches a block and counted under `reason="scratch_headroom"`.
+
+The cap also holds while a unit runs. Its runs can come out larger than the
+1.3 times it was admitted for, and before each run write the process adds up
+the bytes outside every unit's subdirectory at admission, each running unit's
+reservation or its written bytes, whichever is larger, and the write. A write
+that would take that total past the cap is not made: the unit stops there,
+wipes its runs and is refused under `reason="scratch_headroom"`, so the
+directory does not grow past an `emptyDir` size limit and get the pod
+evicted. Without a cap, only a write that fails for want of space ends a
+running unit this way.
 
 - When the volume has the room and only this process's other two-level
   merges hold it, the next tick tries the bucket again.
