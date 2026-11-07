@@ -1719,6 +1719,81 @@ async fn the_clickbench_row_29_shape_spills_with_the_unlimited_result() {
     assert_eq!(spilled.rows[24], "0000024|8.0|3|a0000024");
 }
 
+/// The spill-mode headroom's floor, `spill_mode_headroom`'s 64 MiB. A retry
+/// whose per-query limit is no larger gets the plain query pool, so a test of
+/// the spill-mode cap sets the limit to this plus the cap it wants.
+const SPILL_MODE_HEADROOM_FLOOR_BYTES: usize = 64 << 20;
+
+/// The spill-mode cap of [`the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry`],
+/// in percent of the unlimited run's peak.
+const ROW_14_CAP_PERCENT: u64 = 50;
+
+/// Issue #3899 (M2), the ClickBench row 14 shape: `COUNT(DISTINCT a) GROUP BY
+/// y / 2 ORDER BY u DESC LIMIT 10`, which DataFusion plans as an inner
+/// aggregate over the 200,000 `(y / 2, a)` groups under an outer one over the
+/// 100,000 `y / 2` groups, both able to spill on the retry. The process
+/// budget is the unlimited run's peak, so the first attempt is refused by it
+/// while the statement is the only one on it, and retries. The retry's spill-mode
+/// cap is [`ROW_14_CAP_PERCENT`] of that peak, and the per-query limit stays
+/// out of the way above it. The retry answers with the unlimited run's rows,
+/// having spilled.
+///
+/// Prove-the-test: replace the fair-share admission in `spill_cap_admit` with
+/// the whole-pool cap alone (`if after <= cap`) and the retry fails with
+/// "query memory pool spill threshold reached: spill-capable consumers would
+/// hold 6552498 bytes charged and enveloped, over the spill-mode cap
+/// 6430850", asked by one aggregate while the other holds 4,382,780 bytes.
+#[tokio::test]
+async fn the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry() {
+    let sql = "SELECT y / 2 AS k, COUNT(DISTINCT a) AS u FROM q33 GROUP BY y / 2 \
+               ORDER BY u DESC LIMIT 10";
+    let file = q33_parquet();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes| {
+        spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            query_bytes,
+        )
+    };
+    let unlimited = run_top_ten(&*q33_executor(config(AMPLE_QUERY_BYTES), &file).await, sql).await;
+    assert_eq!(
+        (unlimited.spill_retries, unlimited.spill_files),
+        (0, 0),
+        "the unlimited run answers on its first attempt"
+    );
+    let expected: Vec<String> = (0..10).map(|k| format!("{k}|2")).collect();
+    assert_eq!(
+        unlimited.rows, expected,
+        "every k holds two distinct a, so the tiebreak on k decides the ten"
+    );
+
+    let cap = usize::try_from(unlimited.peak_pool_bytes * ROW_14_CAP_PERCENT / 100).expect("fits");
+    let process = Arc::new(ravel_memory::MemoryBudget::new(unlimited.peak_pool_bytes));
+    let spilled = run_top_ten(
+        &*q33_executor_in(
+            config(SPILL_MODE_HEADROOM_FLOOR_BYTES + cap),
+            &file,
+            process,
+        )
+        .await,
+        sql,
+    )
+    .await;
+    assert_eq!(
+        (spilled.spill_retries, spilled.first_refusal),
+        (1, Some("process_budget")),
+        "the first attempt was refused by the process budget it dominated, and retried"
+    );
+    assert!(
+        spilled.spill_files > 0 && spilled.spill_retry_bytes_written.is_some_and(|b| b > 0),
+        "the retry spilled: files={} bytes_written={:?}",
+        spilled.spill_files,
+        spilled.spill_retry_bytes_written
+    );
+    assert_eq!(spilled.rows, unlimited.rows, "row for row");
+}
+
 /// The per-query pool of [`a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry`]:
 /// ample against the statement's peak, so neither attempt is refused by the
 /// query pool and the process budget is the only limit in play.
