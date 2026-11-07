@@ -531,19 +531,34 @@ open, a consumed prefetch, or the `attrs_raw` reopen), the partition turns the
 statement's pipeline off, drops every partition's unconsumed prefetches, whose
 segments return to the front of their owners' work in owned order and open
 again at their turns, and retries the refused open once, at once. It waits for
-no other partition to be polled: dropping a prefetch releases its bytes. A
-refused retry fails the query with the typed fetch memory error. So within one
-statement a current open is reported refused only if the budget refused it
-twice, the second time after every unconsumed prefetch of every partition of
-the statement had been dropped and the statement's pipeline turned off.
-Between the drain and the retry a sibling's current open may reserve first;
-the retry then meets one open per partition, which is the sequential walk's
-own peak. Across statements the budget stays fail-fast: another statement's
-prefetches can hold the bytes, and that refusal is typed and reported like any
-contended reservation
+no other partition to be polled: dropping a prefetch releases its bytes.
+The retry then meets one current open per partition, the sequential walk's own
+peak, and that peak can itself exceed the budget. A refused retry narrows the
+statement's fan-out when sibling partitions still hold current opens: from
+then on at most as many partitions as held one at that moment hold a current
+open at a time, and the refused partition waits at the front of a
+queue for the next turn, which comes when a sibling finishes its segment, then
+issues the open again. A sibling that finishes a segment while a partition
+waits queues behind it rather than opening its next segment first. Only the
+order and concurrency of the opens change; the rows are the unlimited run's
+(`an_open_refused_by_its_own_fan_out_waits_for_a_turn`). The wait is bounded
+at 30 seconds (`NARROWED_ADMISSION_WAIT`), since a turn needs the sibling's
+consumer to keep polling it: a refused partition still waiting then returns
+its refusal (`a_narrowed_wait_is_bounded`), and a sibling still waiting opens
+anyway. A refused retry with no sibling holding a current open fails the query
+with the typed fetch memory error
+(`a_budget_below_one_open_still_returns_the_typed_refusal`), unless a sibling
+finished a segment since the retry was issued, in which case the open is
+issued once more at once. So within one
+statement a current open is reported refused only when the budget refused it
+while no other partition of the statement held a current open or a prefetch,
+or when its turn did not come within the bound. Across statements the budget
+stays fail-fast: another statement's opens can hold the bytes, and that
+refusal is typed and reported like any contended reservation
 (`another_statements_prefetches_fail_an_open_fast_and_typed`). The scan counts
-each retry in `prefetch_memory_reopens` and each dropped prefetch in
-`prefetch_revocations`. The rows, `segments_opened`, the route split and the
+each retry in `prefetch_memory_reopens`, each dropped prefetch in
+`prefetch_revocations`, and each narrowing in `fan_out_narrowings`. The rows,
+`segments_opened`, the route split and the
 data objects touched are those of the sequential walk
 (`a_refused_open_drops_every_partitions_prefetches_and_retries_once`,
 `released_prefetches_go_back_to_work_in_owned_order`); the request, byte and

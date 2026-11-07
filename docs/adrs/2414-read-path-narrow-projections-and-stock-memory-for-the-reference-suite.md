@@ -102,7 +102,8 @@ range GETs are issued before the hold releases; today they are not.
 Within one statement a current open is reported refused by the fetch memory
 budget only if the budget refused it twice, the second time after every
 unconsumed prefetch of every partition of the statement had been dropped and
-the statement's pipeline turned off. Across statements the budget stays
+the statement's pipeline turned off (narrowed since: see the fan-out narrowing
+amendment below). Across statements the budget stays
 fail-fast: another statement's prefetches can hold the bytes, and that
 refusal is typed and reported like any contended reservation.
 
@@ -400,3 +401,35 @@ inline pointer beside the retired per-query figure in that ADR's "What the
 code does today", and that amendment cites this ADR. ADR-1170 moved to
 Accepted on 2026-10-14 and is partly implemented; its own status line names
 the decisions that are built. Decision B1 is unchanged.
+
+## Amendment (2026-11-07): a retried open its own fan-out refused narrows the fan-out (issue #3899)
+
+<!-- amendment-applies: sections="Track A: narrow projections" pointer="fan-out narrowing amendment" -->
+
+This is the fan-out narrowing amendment. Decision A2's refusal rule above
+stopped at the retry: a retry the budget refused again failed the statement,
+even when the bytes were held by the statement's own sibling partitions, each
+holding the segment it was draining. On a 4 GB host, ClickBench row 9
+(`SELECT "RegionID", COUNT(DISTINCT "UserID") ... GROUP BY "RegionID"`), a
+predicate-free full-window scan on this fast path, ran within about 16 MB of
+the fetch limit: it was refused a 19 MB fetch in one server lifetime and
+answered in another that derived 10 MB more budget.
+
+Now, when a retried fast-path open is refused while sibling partitions hold
+current opens, the statement's fan-out is narrowed: from then on at most as
+many partitions as held one at that moment hold a current open at a time, and
+the refused partition waits at the front of a queue for the next turn, which
+comes when a sibling finishes its segment, then issues the open again. A
+sibling that finishes a segment while a partition waits queues behind it. Only
+the order and concurrency of the opens change, never what they read. The wait
+is bounded at 30 seconds, because a turn needs the sibling's consumer to keep
+polling it; a refused partition still waiting then returns its refusal. A
+refused retry with no sibling holding a current open is returned as before,
+unless a sibling finished a segment since the retry was issued, in which case
+the open is issued once more. Across statements nothing changes: the budget
+stays fail-fast.
+
+Pinned by `an_open_refused_by_its_own_fan_out_waits_for_a_turn`,
+`a_budget_below_one_open_still_returns_the_typed_refusal` and
+`a_narrowed_wait_is_bounded` (ravel-sql `logs_scan::scan`). The scan counts
+each narrowing in `fan_out_narrowings`.
