@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
@@ -24,11 +24,14 @@ use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
+use ravel_query::QueryPhase;
 use ravel_query::http::{StaticBearerTokenResolver, router as promql_router};
 use ravel_query::key_index_route::{
     KeyIndexPartOutcome, key_index_leaf_gets_total, key_index_parts_total,
@@ -255,6 +258,71 @@ async fn put_erasure_request(store: &dyn ObjectStoreBackend, tenant: &TenantId, 
         .expect("put erasure request");
 }
 
+/// Writes and commits one RLOG object holding one `service.name="api"` log
+/// record at `ts`, in the ingest hour `ts` falls in.
+async fn publish_log_object(store: &dyn ObjectStoreBackend, tenant: &TenantId, ts: i64) {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    let tenant_hash = tenant.hash();
+    let writer_id = Uuid::from_u128(3_865_100);
+    let mut writer = RlogWriter::new(
+        RlogConfig::default(),
+        ObjectIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: *writer_id.as_bytes(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+    );
+    writer
+        .push(LogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "line".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        })
+        .expect("push log record");
+    let object = Bytes::from(writer.finish().expect("finish rlog"));
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Logs,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: object.len() as u64,
+        content_hash: *blake3::hash(&object).as_bytes(),
+        sample_count: 1,
+        series_count: 1,
+        min_event_ts_ns: ts,
+        max_event_ts_ns: ts,
+        min_ingest_ts_ns: ts,
+        max_ingest_ts_ns: ts,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        created_unix_ns: ts,
+        ingest_hour_bucket: u32::try_from(ts / NS_PER_HOUR).expect("hour fits u32"),
+    })
+    .expect("valid logs commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, object, PutOptions::default())
+        .await
+        .expect("put log object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish log record");
+}
+
 /// The catalog the server builds from `flags`: the two key-index switches
 /// parsed and validated by the server's own `Cli`.
 fn catalog_from_flags(store: Arc<dyn ObjectStoreBackend>, flags: &[&str]) -> Arc<Catalog> {
@@ -462,6 +530,32 @@ impl Fixture {
         let store: Arc<dyn ObjectStoreBackend> = self.recorder.clone();
         let app = app_over(store, self.flags, config);
         get(&app, self.range_uri(query)).await
+    }
+
+    /// The range query's `QueryStats`, from a `QueryEngine` over this
+    /// fixture's store with a catalog of its own: the HTTP body does not
+    /// render `estimate_excludes_spend`.
+    async fn range_stats(&self, query: &str) -> ravel_query::QueryStats {
+        let store: Arc<dyn ObjectStoreBackend> = self.recorder.clone();
+        let engine = ravel_query::QueryEngine::new(
+            catalog_from_flags(Arc::clone(&store), self.flags),
+            store,
+            ravel_query::EngineConfig::default(),
+        );
+        let (_, stats) = engine
+            .range_with_stats(
+                TenantId::new(TENANT).hash(),
+                query,
+                self.start_s * 1_000,
+                self.end_s * 1_000,
+                60_000,
+                &[],
+                now_ns(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("range query");
+        stats
     }
 
     /// An instant query at `time_s`.
@@ -937,4 +1031,116 @@ async fn a_route_that_prunes_every_object_is_held_to_the_budgets() {
     assert_eq!(code, StatusCode::OK, "{value}");
     assert_eq!(store_totals(&value), (requests, bytes));
     assert!(matrix(&value).is_empty());
+}
+
+/// Equality matchers on labels no fixture series carries, added to the
+/// estimate test's selector: each value is its own route pass and pays its
+/// own leaf GETs, enough of them to exceed the estimate's request term. The
+/// label names are short so the selector stays under the PromQL complexity
+/// limit, which counts the characters outside string literals.
+const ABSENT_VALUES: usize = 64;
+
+/// `stats.estimate` is computed before the label-value route runs and has no
+/// term for its leaf GETs, so a query whose route issued one says its
+/// estimate excludes spend (ADR-0044's escape). Here the leaf GETs alone
+/// take the query's requests above the estimate. A query the route does not
+/// run on, over a tenant without the metrics leaf or with no positive
+/// equality, keeps the flag false and its estimate covering its spend.
+#[tokio::test]
+async fn a_route_that_issued_a_leaf_get_marks_the_estimate_as_excluding_spend() {
+    let _serial = SERIAL.lock().await;
+    let absent: String = (0..ABSENT_VALUES)
+        .map(|i| format!(",a{i}=\"absent{i}\""))
+        .collect();
+    let routed_query = format!("{METRIC}{{instance=\"{TARGET}\"{absent}}}");
+    let on = serve(Setup {
+        label_index: true,
+        ..Setup::default()
+    })
+    .await;
+    let routed = on.range_stats(&routed_query).await;
+    let leaf_gets = routed
+        .phase_accounting
+        .phase(QueryPhase::KeyIndex)
+        .total_s3_requests();
+    assert!(
+        leaf_gets >= ABSENT_VALUES as u64,
+        "every absent value pays its own leaf GET: {leaf_gets}"
+    );
+    assert_eq!(routed.segments_pruned_by_label_index, OBJECTS);
+    assert!(
+        routed.accounting.total_s3_requests() > routed.estimate.estimated_requests,
+        "the leaf GETs take the query above its estimate: actual {:?}, estimate {:?}",
+        routed.accounting,
+        routed.estimate
+    );
+    assert!(routed.estimate_excludes_spend);
+
+    let off = serve(Setup::default()).await;
+    let regex_only = format!("{{__name__=~\"{METRIC}\", instance=~\"{TARGET}\"}}");
+    for (fixture, query) in [(&off, &routed_query), (&on, &regex_only)] {
+        let stats = fixture.range_stats(query).await;
+        assert_eq!(
+            stats
+                .phase_accounting
+                .phase(QueryPhase::KeyIndex)
+                .total_s3_requests(),
+            0,
+            "{query}: the route does not run"
+        );
+        assert!(!stats.estimate_excludes_spend, "{query}");
+        assert!(
+            stats.accounting.total_s3_requests() <= stats.estimate.estimated_requests,
+            "{query}: actual {:?}, estimate {:?}",
+            stats.accounting,
+            stats.estimate
+        );
+    }
+}
+
+/// ADR-1103's cumulative segment check counts the metrics segments resolved
+/// before the label-value route, not the ones left to fetch after it: a
+/// query of a metrics selector and a log selector over `OBJECTS` sealed
+/// metrics objects and one log object is refused under a `max_segments` of
+/// `OBJECTS` whether or not the route prunes, and answers under one more.
+#[tokio::test]
+async fn the_cumulative_segment_check_counts_segments_resolved_before_the_route() {
+    let _serial = SERIAL.lock().await;
+    let query = format!(
+        "count_over_time({METRIC}{{instance=\"{TARGET}\"}}[1h]) \
+         or count_over_time(ravel_log_lines{{job=\"api\"}}[1h])"
+    );
+    let capped = |max_segments: usize| ravel_query::EngineConfig {
+        max_segments,
+        ..ravel_query::EngineConfig::default()
+    };
+    let tenant = TenantId::new(TENANT);
+    let off = serve(Setup::default()).await;
+    let on = serve(Setup {
+        label_index: true,
+        ..Setup::default()
+    })
+    .await;
+    for fixture in [&off, &on] {
+        publish_log_object(fixture.recorder.as_ref(), &tenant, now_ns() - NS_PER_MIN).await;
+        let (code, value) = fixture
+            .query_range_under(&query, capped(OBJECTS as usize))
+            .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+        let message = value["error"].as_str().expect("error message");
+        let expected = format!(
+            "query matched {} segments, exceeding the limit of {OBJECTS}",
+            OBJECTS + 1
+        );
+        assert!(message.contains(&expected), "{message}");
+    }
+    let (code, value) = on
+        .query_range_under(&query, capped(OBJECTS as usize + 1))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    assert_eq!(
+        stat(&value, "segmentsPrunedByLabelIndex"),
+        OBJECTS - HOLDERS.len() as u64,
+        "the route pruned the non-holders the check still counts"
+    );
 }

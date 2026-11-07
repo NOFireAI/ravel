@@ -918,7 +918,8 @@ const EXCLUDED_SPEND_UNBOUNDED_COMPONENTS: [EstimateComponent; 3] = [
 /// federated query also spends through each remote that answered (as does a
 /// distributed fetch that fell back to fetching locally, or whose slice
 /// answered after a retry or reroute and carries the abandoned attempts'
-/// spend). None of that is in
+/// spend), and a query whose label-value route issued a key-index leaf GET
+/// spends on those GETs. None of that is in
 /// the estimate, so such a query names every component, and any other query
 /// names none.
 fn stats_unbounded_components(stats: &QueryStats) -> &'static [EstimateComponent] {
