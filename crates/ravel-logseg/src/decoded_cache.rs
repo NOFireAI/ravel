@@ -264,6 +264,52 @@ pub struct MemoSource<'a> {
     slot: &'a MemoSlot,
     cell: &'a Arc<ReservationCell>,
     buffers: MemoBuffers<'a>,
+    served: bool,
+    view: Option<ViewHandle>,
+}
+
+/// What a memo needs to charge views to the view budget of the cache that
+/// holds its entry: the cache, weakly, the entry's key, and the counters of
+/// the statement whose scan read the column (ADR-3326, view memo amendment,
+/// decision 5). [`Self::reserve_view`] is [`DecodedColumnCache::reserve_view`]
+/// for that entry.
+#[derive(Clone, Debug)]
+pub struct ViewHandle {
+    cache: std::sync::Weak<DecodedColumnCache>,
+    key: DecodedKey,
+    counters: Arc<DecodedCacheCounters>,
+}
+
+impl ViewHandle {
+    pub(crate) fn new(
+        cache: &Arc<DecodedColumnCache>,
+        key: DecodedKey,
+        counters: Arc<DecodedCacheCounters>,
+    ) -> Self {
+        ViewHandle {
+            cache: Arc::downgrade(cache),
+            key,
+            counters,
+        }
+    }
+
+    /// The cache's view budget, 0 once the cache is gone.
+    pub fn view_max_bytes(&self) -> u64 {
+        self.cache.upgrade().map_or(0, |c| c.view_max_bytes())
+    }
+
+    /// [`DecodedColumnCache::reserve_view`] for the handle's entry, with the
+    /// same lock-order rules; `None` once the cache is gone.
+    pub fn reserve_view<T>(
+        &self,
+        cell: &Arc<ReservationCell>,
+        bytes: u64,
+        install: impl FnOnce(Option<Reservation>) -> T,
+    ) -> Option<T> {
+        self.cache
+            .upgrade()?
+            .reserve_view(&self.key, cell, bytes, &self.counters, install)
+    }
 }
 
 /// Where [`MemoSource`] reads its buffers from.
@@ -282,12 +328,34 @@ impl<'a> MemoSource<'a> {
             slot,
             cell,
             buffers,
+            served: false,
+            view: None,
         }
+    }
+
+    /// This source with whether its column was served from the cache on this
+    /// read, and the handle a memo charges views through.
+    pub(crate) fn with_view(mut self, served: bool, view: Option<ViewHandle>) -> Self {
+        self.served = served;
+        self.view = view;
+        self
     }
 
     /// The memo, once filled.
     pub fn get(&self) -> Option<&'a Arc<dyn ValuesMemo>> {
         self.slot.get()
+    }
+
+    /// Whether the column was served from the cache on this read, rather than
+    /// decoded and just admitted (ADR-3326, view memo amendment, decision 4).
+    pub fn served(&self) -> bool {
+        self.served
+    }
+
+    /// The handle a memo charges views through, `None` for a scan whose
+    /// attach the view did not carry.
+    pub fn view_handle(&self) -> Option<&ViewHandle> {
+        self.view.as_ref()
     }
 
     /// The memo, built by `build` from the column's buffers and its entry's
@@ -1019,14 +1087,27 @@ impl DecodedColumnCache {
     /// never costs a data entry or another view memo
     /// (`a_view_fill_never_evicts_a_data_entry`).
     ///
-    /// `install` runs under the cache's lock and must not call back into the
-    /// cache. The view total then grows by what the memo's
-    /// [`ValuesMemo::extra_bytes`] reports
+    /// Lock order: the cache's lock comes before any lock of the memo's own,
+    /// since `Inner::remove` and the pressure pass call
+    /// [`ValuesMemo::extra_bytes`], [`ValuesMemo::release_extra`] and
+    /// [`ValuesMemo::held_outside`] under it. So a caller must not hold the
+    /// memo's own lock while it calls this, and `install`, which runs under
+    /// the cache's lock and may take the memo's, must not call back into the
+    /// cache.
+    ///
+    /// After `install` the memo's [`ValuesMemo::extra_bytes`] must equal
+    /// `bytes`; the view total then grows by `bytes`
     /// (`a_view_fill_is_charged_to_the_view_budget_not_the_data_cap`), which
     /// is the figure `Inner::remove` and [`ValuesMemo::release_extra`] later
     /// take back off
     /// (`removing_an_entry_drops_its_views_and_lowers_the_view_total`,
     /// `releasing_a_view_memo_lowers_the_view_total_and_the_budget_by_its_bytes`).
+    /// A memo that reports another figure has its views released through
+    /// [`ValuesMemo::release_extra`], `install`'s result is dropped with the
+    /// reservation it may carry, the fill counts as a refusal and `None` is
+    /// returned; the view total grows only by what the memo still reports
+    /// after that release, so it keeps matching what `Inner::remove` takes off
+    /// (`a_memo_reporting_other_bytes_than_reserved_is_refused`).
     pub fn reserve_view<T>(
         &self,
         key: &DecodedKey,
@@ -1071,6 +1152,15 @@ impl DecodedColumnCache {
         let memo = Arc::clone(Self::fillable_memo(&inner, key, cell)?);
         let installed = install(reservation);
         let charged = memo.extra_bytes();
+        if charged != bytes {
+            memo.release_extra();
+            inner.view_resident = inner.view_resident.saturating_add(memo.extra_bytes());
+            inner.view_refusals += 1;
+            DecodedCacheCounters::bump(&counters.view_memo_refusals, 1);
+            drop(inner);
+            drop(installed);
+            return None;
+        }
         inner.view_resident = inner.view_resident.saturating_add(charged);
         if charged > 0 {
             inner.view_fills += 1;
@@ -2505,6 +2595,51 @@ mod tests {
         let inner = cache.lock();
         let i = *inner.index.get(&k).expect("resident");
         DecodedEntry::held(&inner.slots[i].as_ref().expect("slot").entry)
+    }
+
+    /// A memo whose `install` records another figure than the bytes reserved
+    /// is refused: its views are released, the reservation goes back, the
+    /// view total does not move, and one refusal and no fill are counted.
+    #[test]
+    fn a_memo_reporting_other_bytes_than_reserved_is_refused() {
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)))
+            .with_view_max_bytes(1 << 20);
+        let c = DecodedCacheCounters::default();
+        let k = key(0, 1);
+        let memo = admit_memo(&cache, k, &c);
+        let reserved = budget.reserved();
+        let m = memo.upgrade().expect("the memo lives with its entry");
+        let cell = cell_of(&cache, k);
+        let installed = cache.reserve_view(&k, &cell, VIEW_BYTES, &c, |reservation| {
+            let views = TestViews {
+                views: Arc::new(ViewsOwner {
+                    _views: vec![0; ROWS],
+                    _reservation: reservation,
+                }),
+                _blocks: Arc::from(vec![Arc::clone(&m.values)]),
+            };
+            *m.slot() = Some((views, VIEW_BYTES / 2));
+        });
+        assert!(installed.is_none(), "the mismatched fill is refused");
+        assert_eq!(m.extra_bytes(), 0, "the memo's views were released");
+        assert!(m.batch().is_none());
+        assert_eq!(cache.view_resident_bytes(), 0);
+        assert_eq!(budget.reserved(), reserved, "the reservation went back");
+        assert_eq!(
+            cache.view_counters(),
+            ViewMemoSnapshot {
+                bytes: 0,
+                fills: 0,
+                refusals: 1,
+                releases: 0,
+            }
+        );
+        assert_eq!(c.view_snapshot().refusals, 1);
+        assert_eq!(c.view_snapshot().fills, 0);
+        // A matching fill afterwards is charged as usual.
+        assert!(fill_at(&cache, k, &memo, &c));
+        assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
     }
 
     /// ADR-3326, view memo amendment, T3: a fill grows the view total and the

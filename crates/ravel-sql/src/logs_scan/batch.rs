@@ -1,8 +1,13 @@
 use super::*;
+use datafusion::arrow::array::StringViewArray;
+use datafusion::arrow::array::builder::make_view;
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::datatypes::ToByteSlice;
 use ravel_logseg::Validity;
-use ravel_logseg::decoded_cache::{MemoSource, ReservationCell, StrBuffers, ValuesMemo};
+use ravel_logseg::decoded_cache::{
+    MemoSource, ReservationCell, StrBuffers, ValuesMemo, ViewHandle,
+};
+use std::sync::Mutex;
 
 /// Decode a slice of records into one [`RecordBatch`] over `schema`, which is
 /// `logs_schema_with_declared(&declared)` projected by `projection`.
@@ -356,6 +361,29 @@ impl<'a> StrCursor<'a> {
         memo_array(memo, &self.validated, record_count as u64)
     }
 
+    /// Marks the column's memo served when the decoded cache served its
+    /// block on this read, so the first `GROUP BY` evaluation over it fills
+    /// its views (ADR-3326, view memo amendment, decision 4). A block the
+    /// scan just admitted is not marked, so a one-pass scan fills nothing
+    /// (`a_view_memo_fills_on_the_first_served_call_only`).
+    fn mark_served(&self, validated: Option<&Count>) {
+        let Some(source) = self.memo.as_ref().filter(|m| m.served()) else {
+            return;
+        };
+        let (Some(handle), Some(memo)) = (
+            source.view_handle(),
+            source
+                .get()
+                .and_then(|m| m.as_any().downcast_ref::<StrMemo>()),
+        ) else {
+            return;
+        };
+        *memo.served_slot() = Some(ServedMark {
+            handle: handle.clone(),
+            validated: validated.cloned(),
+        });
+    }
+
     /// The dictionary's memo array, when a decoded-cache entry holds the
     /// dictionary in full (decision 1).
     fn dict_memo(&self) -> Option<StringArray> {
@@ -449,6 +477,121 @@ struct StrMemo {
     /// A dictionary block's keys as an Arrow buffer sharing them, built on
     /// the first [`StrCursor::dict_memo_keys`] that takes the key path.
     keys: std::sync::OnceLock<Buffer>,
+    /// A plain memo's per-entry views, charged to the view budget (ADR-3326,
+    /// view memo amendment, decision 6). Emptied on its own by
+    /// [`ValuesMemo::release_extra`].
+    views: Mutex<Option<ViewMemo>>,
+    /// Set by the scan when it reads the memo's block served from the cache
+    /// (decision 4): the handle a fill charges its views through, and the
+    /// scan's `str_cells_validated` the fill's validation counts in.
+    served: Mutex<Option<ServedMark>>,
+}
+
+/// The views of every entry of a plain memo, as one `StringViewArray` whose
+/// views buffer's owner holds the views' reservation and whose one data
+/// block is the memo's values buffer.
+struct ViewMemo {
+    array: StringViewArray,
+    bytes: u64,
+}
+
+/// What the scan leaves on a memo it served ([`StrMemo::served`]).
+#[derive(Clone)]
+struct ServedMark {
+    handle: ViewHandle,
+    validated: Option<Count>,
+}
+
+/// The owner of a view memo's views buffer: the views, and the reservation
+/// [`ViewHandle::reserve_view`] hands the fill. Shared between the buffer and
+/// the fill only until the fill installs the reservation, so the reservation
+/// goes when the last holder of the views buffer drops.
+struct ViewsOwner {
+    views: Vec<u128>,
+    reservation: std::sync::OnceLock<ravel_memory::Reservation>,
+}
+
+/// [`ViewsOwner`] as an Arrow buffer owner.
+struct ViewsBytes(Arc<ViewsOwner>);
+
+impl AsRef<[u8]> for ViewsBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.views.as_slice().to_byte_slice()
+    }
+}
+
+impl StrMemo {
+    fn views_slot(&self) -> std::sync::MutexGuard<'_, Option<ViewMemo>> {
+        self.views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn served_slot(&self) -> std::sync::MutexGuard<'_, Option<ServedMark>> {
+        self.served
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The memo's views, filled on the first call after the scan marked the
+    /// memo served (decision 4). `None`, and the caller casts, when the memo
+    /// was never served, has a NULL entry (decision 6), or the fill was
+    /// refused. The memo's own lock is never held across
+    /// [`ViewHandle::reserve_view`], which takes the cache's lock first.
+    fn views(&self) -> Option<StringViewArray> {
+        if let Some(v) = self.views_slot().as_ref() {
+            return Some(v.array.clone());
+        }
+        let mark = self.served_slot().clone()?;
+        let array = self.array.as_ref()?;
+        if datafusion::arrow::array::Array::nulls(array).is_some() {
+            return None;
+        }
+        let values = array.values();
+        let offsets = array.value_offsets();
+        let mut views = Vec::with_capacity(offsets.len().saturating_sub(1));
+        for w in offsets.windows(2) {
+            let start = usize::try_from(w[0]).ok()?;
+            let end = usize::try_from(w[1]).ok()?;
+            views.push(make_view(
+                values.get(start..end)?,
+                0,
+                u32::try_from(start).ok()?,
+            ));
+        }
+        let len = views.len();
+        let bytes = u64::try_from(len.saturating_mul(16)).ok()?;
+        let owner = Arc::new(ViewsOwner {
+            views,
+            reservation: std::sync::OnceLock::new(),
+        });
+        let buffer = Buffer::from(bytes::Bytes::from_owner(ViewsBytes(Arc::clone(&owner))));
+        let built = StringViewArray::try_new(
+            ScalarBuffer::new(buffer, 0, len),
+            vec![values.clone()],
+            None,
+        )
+        .ok()?;
+        if let Some(validated) = &mark.validated {
+            validated.add(len);
+        }
+        let installed = mark.handle.reserve_view(&self.cell, bytes, |reservation| {
+            if let Some(r) = reservation {
+                // The owner is new, so its cell is empty.
+                let _ = owner.reservation.set(r);
+            }
+            *self.views_slot() = Some(ViewMemo {
+                array: built.clone(),
+                bytes,
+            });
+        });
+        drop(owner);
+        match installed {
+            Some(()) => Some(built),
+            // Another evaluation may have filled it in the meantime.
+            None => self.views_slot().as_ref().map(|v| v.array.clone()),
+        }
+    }
 }
 
 impl ValuesMemo for StrMemo {
@@ -457,12 +600,21 @@ impl ValuesMemo for StrMemo {
     /// view array a cast built over the values buffer, or a batch holding the
     /// keys buffer. Each of those clones a `Buffer`, which moves
     /// `Buffer::strong_count`
-    /// (`a_batch_holding_only_the_shared_keys_keeps_the_entry_held`).
+    /// (`a_batch_holding_only_the_shared_keys_keeps_the_entry_held`). While
+    /// views are filled their array holds the values buffer once more, so the
+    /// values count is held above 2, and a clone of the views array moves the
+    /// views buffer's count instead (ADR-3326, view memo amendment, decision
+    /// 7; `an_entry_whose_views_a_batch_holds_is_held_with_the_real_memo`).
     fn held_outside(&self) -> bool {
         let Some(array) = &self.array else {
             return false;
         };
-        array.values().strong_count() > 1
+        let (values_own, views_held) = match self.views_slot().as_ref() {
+            Some(v) => (2, v.array.views().inner().strong_count() > 1),
+            None => (1, false),
+        };
+        array.values().strong_count() > values_own
+            || views_held
             || array.offsets().inner().inner().strong_count() > 1
             || datafusion::arrow::array::Array::nulls(array)
                 .is_some_and(|n| n.buffer().strong_count() > 1)
@@ -471,6 +623,118 @@ impl ValuesMemo for StrMemo {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn extra_bytes(&self) -> u64 {
+        self.views_slot().as_ref().map_or(0, |v| v.bytes)
+    }
+
+    /// Empties the views slot unless a batch holds a clone of the views
+    /// array; a gathered batch holds only the values buffer, so the views go.
+    fn release_extra(&self) -> u64 {
+        let mut slot = self.views_slot();
+        match slot.as_ref() {
+            Some(v) if v.array.views().inner().strong_count() == 1 => {
+                let bytes = v.bytes;
+                *slot = None;
+                bytes
+            }
+            _ => 0,
+        }
+    }
+}
+
+impl Drop for StrMemo {
+    fn drop(&mut self) {
+        if let Some(array) = &self.array {
+            view_registry::remove(array, self);
+        }
+    }
+}
+
+/// The plain memos whose views a `GROUP BY` key may take, by the address of
+/// the memo array's offsets (ADR-3326, view memo amendment, decision 5). Not
+/// by the values: every block whose rows are all `''` has an empty values
+/// `String`, and every empty `String` has the same dangling address, while
+/// the offsets hold `rows + 1` entries and are always a real allocation.
+/// Holds memos weakly; a memo removes its own entry when it drops.
+pub(crate) mod view_registry {
+    use super::{StrMemo, StringArray, StringViewArray};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+
+    fn registry() -> MutexGuard<'static, HashMap<usize, Weak<StrMemo>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<StrMemo>>>> = OnceLock::new();
+        REGISTRY
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn address(array: &StringArray) -> usize {
+        array.offsets().inner().as_ptr() as usize
+    }
+
+    pub(super) fn insert(memo: &Arc<StrMemo>) {
+        if let Some(array) = &memo.array {
+            registry().insert(address(array), Arc::downgrade(memo));
+        }
+    }
+
+    pub(super) fn remove(array: &StringArray, memo: &StrMemo) {
+        let mut map = registry();
+        let at = address(array);
+        if map.get(&at).is_some_and(|w| std::ptr::eq(w.as_ptr(), memo)) {
+            map.remove(&at);
+        }
+    }
+
+    /// The memo `values` is, when the serve rule holds: the same offsets
+    /// (pointer and length), the same values (pointer and length), and no
+    /// null buffer on either side. Two live non-empty allocations cannot
+    /// share an address, so equal offsets are the memo's own offsets.
+    fn memo_of(values: &StringArray) -> Option<Arc<StrMemo>> {
+        use datafusion::arrow::array::Array;
+        let memo = registry().get(&address(values))?.upgrade()?;
+        let array = memo.array.as_ref()?;
+        let same = array.offsets().inner().as_ptr() == values.offsets().inner().as_ptr()
+            && array.offsets().len() == values.offsets().len()
+            && array.values().as_ptr() == values.values().as_ptr()
+            && array.values().len() == values.values().len()
+            && array.nulls().is_none()
+            && values.nulls().is_none();
+        same.then_some(memo)
+    }
+
+    /// The views of the memo `values` is, under the serve rule, filling them
+    /// on the first call after the scan served the memo's block; `None` when
+    /// `values` is no registered memo or the memo has no views to give.
+    pub(crate) fn views_of(values: &StringArray) -> Option<StringViewArray> {
+        memo_of(values)?.views()
+    }
+
+    /// Whether a live memo is registered at `values`'s offsets address.
+    #[cfg(test)]
+    pub(crate) fn contains(values: &StringArray) -> bool {
+        registry()
+            .get(&address(values))
+            .is_some_and(|w| w.strong_count() > 0)
+    }
+
+    /// Whether the registry holds an entry, live or not, pointing at the memo
+    /// at `memo`, under `at`.
+    #[cfg(test)]
+    pub(crate) fn holds(at: usize, memo: *const ()) -> bool {
+        registry()
+            .get(&at)
+            .is_some_and(|w| std::ptr::eq(w.as_ptr().cast::<()>(), memo))
+    }
+
+    /// The registry address and memo pointer of the memo `values` is.
+    #[cfg(test)]
+    pub(crate) fn identity(values: &StringArray) -> Option<(usize, *const ())> {
+        let memo = memo_of(values)?;
+        Some((address(values), Arc::as_ptr(&memo).cast::<()>()))
     }
 }
 
@@ -592,16 +856,26 @@ fn memo_array(
     validated: &std::cell::Cell<u64>,
     cells: u64,
 ) -> Option<StringArray> {
+    // A plain memo is registered for the GROUP BY keys only while its cache
+    // has a view budget (ADR-3326, view memo amendment, decision 5).
+    let register =
+        source.is_plain() && source.view_handle().is_some_and(|h| h.view_max_bytes() > 0);
     let memo = source.get_or_build(|buffers, cell| {
         let array = build_str_memo(buffers, Arc::clone(&cell));
         if array.is_some() {
             validated.set(validated.get() + cells);
         }
-        Arc::new(StrMemo {
+        let memo = Arc::new(StrMemo {
             array,
             cell,
             keys: std::sync::OnceLock::new(),
-        })
+            views: Mutex::new(None),
+            served: Mutex::new(None),
+        });
+        if register {
+            view_registry::insert(&memo);
+        }
+        memo
     });
     memo.as_any().downcast_ref::<StrMemo>()?.array.clone()
 }
@@ -1413,6 +1687,9 @@ struct DeclaredResolver<'p, 'd, 'a> {
     /// A declared `Str` column's keys and values for every surviving row of
     /// the block, built by the block's first chunk and sliced by every chunk.
     str_block: Option<StrBlock>,
+    /// The scan's `str_cells_validated`, left on a served memo
+    /// ([`StrCursor::mark_served`]).
+    str_cells_validated: Option<Count>,
 }
 
 /// One block's declared `Str` column ([`build_declared_str_columnar`]).
@@ -1438,7 +1715,15 @@ impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
             resolve_count: 0,
             str_values,
             str_block: None,
+            str_cells_validated: None,
         }
+    }
+
+    /// This resolver with the scan's `str_cells_validated`, which a view
+    /// memo fill over a block it serves counts its validation in.
+    fn with_str_cells_validated(mut self, counter: &Count) -> Self {
+        self.str_cells_validated = Some(counter.clone());
+        self
     }
 
     /// The resource/scope fallback value for `stream_ref`, memoized. The
@@ -1781,6 +2066,7 @@ fn build_str_block(
     {
         let keys: Vec<i32> = (0..str_key(n)?).collect();
         let values = lock_str_values(&resolver.str_values).memo_block_values(&memo)?;
+        cursor.mark_served(resolver.str_cells_validated.as_ref());
         #[cfg(test)]
         PLAIN_MEMO_FAST_PATHS.with(|c| c.set(c.get() + 1));
         return Ok(StrBlock {
@@ -2127,7 +2413,8 @@ pub(super) fn build_columnar_batches(
         .map(|(idx, plan)| {
             (
                 *idx,
-                DeclaredResolver::with_str_values(plan, Arc::clone(str_values)),
+                DeclaredResolver::with_str_values(plan, Arc::clone(str_values))
+                    .with_str_cells_validated(str_cells_validated),
             )
         })
         .collect();

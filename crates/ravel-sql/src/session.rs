@@ -806,6 +806,10 @@ pub fn build_session_with_tables(
     principal: &SessionPrincipal,
 ) -> DFResult<SessionContext> {
     check_table_set(&tables)?;
+    let view_memo = tables.iter().any(|table| match table {
+        SessionTable::Logs(provider) => provider.decoded_cache_view_max_bytes() > 0,
+        _ => false,
+    });
     let parquet_store = tables.iter().find_map(|table| match table {
         SessionTable::Parquet(session) => Some(Arc::clone(&session.store)),
         _ => None,
@@ -849,7 +853,12 @@ pub fn build_session_with_tables(
         // `trace_id IN ('<32-hex>', ...)` against the native trace id column,
         // rewritten before `type_coercion`; see `crate::trace_id_planner`.
         .with_analyzer_rules(crate::trace_id_planner::analyzer_rules())
-        .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
+        // A `logs` table over a decoded cache with a view budget groups a
+        // plain memo's keys on the memo's views (ADR-3326, view memo
+        // amendment, decision 5); a budget of 0 keeps arrow's cast.
+        .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews::with_view_memo(
+            view_memo,
+        )))
         // ADR-0850 item 2: answer `COUNT(*) WHERE <declared column> <>
         // <literal>` and `GROUP BY <declared column>, COUNT(*)` from exact
         // per-object column statistics, with zero data-block GETs, when the
