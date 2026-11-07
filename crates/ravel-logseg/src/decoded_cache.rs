@@ -1366,6 +1366,7 @@ mod tests {
     use super::*;
     use crate::block::I64Column;
     use ravel_cache::DEFAULT_SWEEP_INTERVAL_NS;
+    use std::sync::Weak;
 
     fn key(block: u32, column: u32) -> DecodedKey {
         DecodedKey {
@@ -2344,5 +2345,612 @@ mod tests {
             Some(5)
         );
         assert_eq!(cache.lock_estimates().selection_bytes, charge);
+    }
+
+    /// Rows of every view-memo fixture column, and the bytes of its views at
+    /// 16 B a row.
+    const ROWS: usize = 64;
+    const VIEW_BYTES: u64 = 16 * ROWS as u64;
+
+    /// A test memo's views as a `StringViewArray` holds them: the views buffer
+    /// behind an owner carrying the views' reservation, and the block list
+    /// holding the memo's values buffer. Cloning it is what cloning the array
+    /// does: the views buffer's count moves, the values buffer's does not.
+    #[derive(Clone)]
+    struct TestViews {
+        views: Arc<ViewsOwner>,
+        _blocks: Arc<[Arc<String>]>,
+    }
+
+    struct ViewsOwner {
+        _views: Vec<u128>,
+        _reservation: Option<Reservation>,
+    }
+
+    /// A memo that can hold views, held outside by decision 7's rule: the
+    /// values count above 1, or above 2 while views are filled, or the views
+    /// buffer's count above 1.
+    struct ViewTestMemo {
+        values: Arc<String>,
+        views: Mutex<Option<(TestViews, u64)>>,
+    }
+
+    impl ViewTestMemo {
+        fn slot(&self) -> MutexGuard<'_, Option<(TestViews, u64)>> {
+            self.views.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// A batch's clone of the views array.
+        fn batch(&self) -> Option<TestViews> {
+            self.slot().as_ref().map(|(v, _)| v.clone())
+        }
+    }
+
+    impl ValuesMemo for ViewTestMemo {
+        fn held_outside(&self) -> bool {
+            match &*self.slot() {
+                Some((v, _)) => {
+                    Arc::strong_count(&self.values) > 2 || Arc::strong_count(&v.views) > 1
+                }
+                None => Arc::strong_count(&self.values) > 1,
+            }
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn extra_bytes(&self) -> u64 {
+            self.slot().as_ref().map_or(0, |(_, b)| *b)
+        }
+
+        fn release_extra(&self) -> u64 {
+            let mut slot = self.slot();
+            match &*slot {
+                Some((v, b)) if Arc::strong_count(&v.views) == 1 => {
+                    let b = *b;
+                    *slot = None;
+                    b
+                }
+                _ => 0,
+            }
+        }
+    }
+
+    fn plain_rows() -> CachedColumn {
+        plain(&[&b"ab"[..]; ROWS])
+    }
+
+    /// The bytes [`admit_memo`] charges an entry.
+    fn memo_entry_bytes() -> u64 {
+        plain_rows().heap_bytes() as u64 + VALUES_MEMO_BYTES
+    }
+
+    /// Admits a plain column under `k` with a [`ViewTestMemo`] in its slot and
+    /// no views, holding nothing of it, and returns the memo weakly.
+    fn admit_memo(
+        cache: &DecodedColumnCache,
+        k: DecodedKey,
+        c: &DecodedCacheCounters,
+    ) -> Weak<ViewTestMemo> {
+        let v = plain_rows();
+        let entry = cache
+            .offer(k, &v, AccessIntent::Interactive, c)
+            .expect("admitted");
+        assert_eq!(entry.bytes(), memo_entry_bytes());
+        let memo = Arc::new(ViewTestMemo {
+            values: Arc::new("ab".repeat(ROWS)),
+            views: Mutex::new(None),
+        });
+        assert!(
+            v.memo_slot()
+                .expect("a validated plain column has a slot")
+                .fill_for_test(Arc::clone(&memo) as Arc<dyn ValuesMemo>)
+        );
+        Arc::downgrade(&memo)
+    }
+
+    /// Fills `k`'s memo with [`VIEW_BYTES`] of views through
+    /// [`DecodedColumnCache::reserve_view`], the reservation moved into the
+    /// views buffer's owner. Whether the fill was charged.
+    fn fill_at(
+        cache: &DecodedColumnCache,
+        k: DecodedKey,
+        memo: &Weak<ViewTestMemo>,
+        c: &DecodedCacheCounters,
+    ) -> bool {
+        let memo = memo.upgrade().expect("the memo lives with its entry");
+        let cell = {
+            let inner = cache.lock();
+            let i = *inner.index.get(&k).expect("resident");
+            Arc::clone(&inner.slots[i].as_ref().expect("slot").entry.cell)
+        };
+        cache
+            .reserve_view(&k, &cell, VIEW_BYTES, c, |reservation| {
+                let views = TestViews {
+                    views: Arc::new(ViewsOwner {
+                        _views: vec![0; ROWS],
+                        _reservation: reservation,
+                    }),
+                    _blocks: Arc::from(vec![Arc::clone(&memo.values)]),
+                };
+                *memo.slot() = Some((views, VIEW_BYTES));
+            })
+            .is_some()
+    }
+
+    fn extra(memo: &Weak<ViewTestMemo>) -> u64 {
+        memo.upgrade().map_or(0, |m| m.extra_bytes())
+    }
+
+    /// Whether `evict_for_pressure` counts `k`'s entry as held.
+    fn entry_held(cache: &DecodedColumnCache, k: DecodedKey) -> bool {
+        let inner = cache.lock();
+        let i = *inner.index.get(&k).expect("resident");
+        DecodedEntry::held(&inner.slots[i].as_ref().expect("slot").entry)
+    }
+
+    /// ADR-3326, view memo amendment, T3: a fill grows the view total and the
+    /// budget by exactly the views' bytes and moves no data figure; a data
+    /// admission at the cap evicts what it evicts with no views; a fill the
+    /// memory budget or the view budget refuses leaves no views and counts one
+    /// refusal; and a batch's views clone keeps the views reserved past the
+    /// entry's eviction, since the reservation sits on the views buffer's
+    /// owner.
+    #[test]
+    fn a_view_fill_is_charged_to_the_view_budget_not_the_data_cap() {
+        let e = memo_entry_bytes();
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        let cache =
+            DecodedColumnCache::new(2 * e, Some(Arc::clone(&budget))).with_view_max_bytes(1 << 20);
+        let c = DecodedCacheCounters::default();
+        admit_memo(&cache, key(0, 1), &c);
+        let m1 = admit_memo(&cache, key(1, 1), &c);
+        let reserved = budget.reserved();
+        let process = cache.process_counters();
+        let pressure = cache.pressure_counters();
+        let data = c.snapshot();
+        assert_eq!(cache.resident_bytes(), 2 * e);
+        assert!(fill_at(&cache, key(1, 1), &m1, &c));
+        assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+        assert_eq!(budget.reserved(), reserved + VIEW_BYTES);
+        assert_eq!(cache.resident_bytes(), 2 * e, "resident is data only");
+        assert_eq!(cache.process_counters(), process);
+        assert_eq!(cache.pressure_counters(), pressure);
+        assert_eq!(c.snapshot(), data);
+        assert_eq!(
+            c.view_snapshot(),
+            ViewMemoSnapshot {
+                bytes: 0,
+                fills: 1,
+                refusals: 0,
+                releases: 0,
+            }
+        );
+        assert_eq!(
+            cache.view_counters(),
+            ViewMemoSnapshot {
+                bytes: VIEW_BYTES,
+                fills: 1,
+                refusals: 0,
+                releases: 0,
+            }
+        );
+
+        // The cache at its cap: the next admission evicts block 0 alone,
+        // with views on block 1 or without.
+        let mut outcomes = Vec::new();
+        for views in [false, true] {
+            let budget = Arc::new(MemoryBudget::new(4 << 30));
+            let cache = DecodedColumnCache::new(2 * e, Some(budget)).with_view_max_bytes(1 << 20);
+            let c = DecodedCacheCounters::default();
+            admit_memo(&cache, key(0, 1), &c);
+            let m1 = admit_memo(&cache, key(1, 1), &c);
+            if views {
+                assert!(fill_at(&cache, key(1, 1), &m1, &c));
+            }
+            let next = DecodedCacheCounters::default();
+            drop(cache.offer(key(2, 1), &plain_rows(), AccessIntent::Interactive, &next));
+            let kept = [0, 1, 2].map(|b| cache.entry_bytes(&key(b, 1)).is_some());
+            outcomes.push((next.snapshot().evictions, kept));
+        }
+        assert_eq!(outcomes[0], (1, [false, true, true]));
+        assert_eq!(outcomes[1], outcomes[0], "views cost no data entry");
+
+        // A memory budget one byte short of the views beyond the margin.
+        const LIMIT: u64 = 4 << 30;
+        let budget = Arc::new(MemoryBudget::new(LIMIT));
+        let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)))
+            .with_view_max_bytes(1 << 20);
+        let c = DecodedCacheCounters::default();
+        let m0 = admit_memo(&cache, key(0, 1), &c);
+        budget.reserve_unchecked(
+            LIMIT - budget.reserved() - (admission_margin(LIMIT) + VIEW_BYTES - 1),
+        );
+        let before = budget.reserved();
+        assert!(!fill_at(&cache, key(0, 1), &m0, &c), "refused");
+        let memo = m0.upgrade().expect("resident");
+        assert!(memo.batch().is_none(), "no views exist");
+        assert_eq!(memo.extra_bytes(), 0);
+        drop(memo);
+        assert_eq!(budget.reserved(), before, "nothing stays reserved");
+        assert_eq!(
+            cache.view_counters(),
+            ViewMemoSnapshot {
+                bytes: 0,
+                fills: 0,
+                refusals: 1,
+                releases: 0,
+            }
+        );
+        assert_eq!(c.view_snapshot().refusals, 1);
+        budget.release(1);
+        assert!(fill_at(&cache, key(0, 1), &m0, &c), "exactly at the margin");
+        assert_eq!(budget.reserved(), before - 1 + VIEW_BYTES);
+
+        // A view budget one byte short of the views.
+        let cache = DecodedColumnCache::new(1 << 20, None).with_view_max_bytes(VIEW_BYTES - 1);
+        let c = DecodedCacheCounters::default();
+        let m0 = admit_memo(&cache, key(0, 1), &c);
+        assert!(!fill_at(&cache, key(0, 1), &m0, &c));
+        assert_eq!(extra(&m0), 0);
+        assert_eq!(cache.view_counters().refusals, 1);
+        assert_eq!(cache.view_resident_bytes(), 0);
+
+        // The reservation goes with the views buffer's last holder.
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        let cache =
+            DecodedColumnCache::new(e, Some(Arc::clone(&budget))).with_view_max_bytes(1 << 20);
+        let c = DecodedCacheCounters::default();
+        let m0 = admit_memo(&cache, key(0, 1), &c);
+        assert!(fill_at(&cache, key(0, 1), &m0, &c));
+        let batch = m0.upgrade().and_then(|m| m.batch()).expect("views");
+        admit_memo(&cache, key(1, 1), &c);
+        assert_eq!(c.snapshot().evictions, 1);
+        assert!(cache.entry_bytes(&key(0, 1)).is_none(), "evicted by CLOCK");
+        assert!(m0.upgrade().is_none(), "the memo went with its column");
+        assert_eq!(
+            budget.reserved(),
+            e + VIEW_BYTES,
+            "the batch's views clone keeps the views reserved"
+        );
+        drop(batch);
+        assert_eq!(budget.reserved(), e);
+    }
+
+    /// ADR-3326, view memo amendment, T4: an entry whose views a batch holds,
+    /// as a clone of the views array, is held, and the pressure pass frees
+    /// neither its views nor its data; with no holder it is evictable, and
+    /// the pass frees both.
+    #[test]
+    fn an_entry_whose_views_a_batch_holds_is_held() {
+        let e = memo_entry_bytes();
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)))
+            .with_view_max_bytes(1 << 20);
+        let c = DecodedCacheCounters::default();
+        let m0 = admit_memo(&cache, key(0, 1), &c);
+        assert!(fill_at(&cache, key(0, 1), &m0, &c));
+        assert!(!entry_held(&cache, key(0, 1)), "filled, with no holder");
+
+        let batch = m0.upgrade().and_then(|m| m.batch()).expect("views");
+        assert!(entry_held(&cache, key(0, 1)), "a views clone holds it");
+        assert_eq!(
+            cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted),
+            0
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(extra(&m0), VIEW_BYTES);
+        assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+        assert_eq!(budget.reserved(), e + VIEW_BYTES);
+        assert_eq!(cache.view_counters().releases, 0);
+
+        drop(batch);
+        assert!(!entry_held(&cache, key(0, 1)));
+        assert_eq!(
+            cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted),
+            VIEW_BYTES + e
+        );
+        assert!(cache.is_empty());
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(cache.view_resident_bytes(), 0);
+        assert_eq!(
+            cache.pressure_counters(),
+            PressureSnapshot {
+                evictions: 1,
+                freed_bytes: e,
+            }
+        );
+        assert_eq!(cache.view_counters().releases, 1);
+    }
+
+    /// The cache as `budget`'s evictor, as the server wires it, with `slack`.
+    fn register(budget: &MemoryBudget, cache: &Arc<DecodedColumnCache>, slack: u64) {
+        let evictee = Arc::downgrade(cache);
+        assert!(
+            budget
+                .register_evictor(
+                    Box::new(move |want, cause| {
+                        evictee
+                            .upgrade()
+                            .map_or(0, |c| c.evict_for_pressure(want, slack, cause))
+                    }),
+                    slack,
+                )
+                .is_ok()
+        );
+    }
+
+    /// ADR-3326, view memo amendment, T5: a fill the margin refuses, and one
+    /// the limit refuses, run no evictor, though one is registered over
+    /// unheld data entries, and a fill the full view budget refuses evicts
+    /// nothing either: `evictions` and the pressure evictions stay 0 and
+    /// every data entry still hits.
+    #[test]
+    fn a_view_fill_never_evicts_a_data_entry() {
+        const LIMIT: u64 = 4 << 30;
+        let margin = admission_margin(LIMIT);
+        for (case, free) in [
+            ("margin", margin + VIEW_BYTES - 1),
+            ("limit", VIEW_BYTES - 1),
+        ] {
+            let budget = Arc::new(MemoryBudget::new(LIMIT));
+            let cache = Arc::new(
+                DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)))
+                    .with_view_max_bytes(1 << 20),
+            );
+            register(&budget, &cache, margin);
+            let c = DecodedCacheCounters::default();
+            let memos: Vec<_> = (0..4).map(|b| admit_memo(&cache, key(b, 1), &c)).collect();
+            budget.reserve_unchecked(LIMIT - budget.reserved() - free);
+            assert!(
+                !fill_at(&cache, key(3, 1), &memos[3], &c),
+                "{case}: refused"
+            );
+            assert_eq!(extra(&memos[3]), 0, "{case}");
+            assert_eq!(c.snapshot().evictions, 0, "{case}");
+            assert_eq!(cache.pressure_counters().evictions, 0, "{case}");
+            for b in 0..4 {
+                assert!(
+                    cache.lookup(&key(b, 1), ROWS, &c).is_some(),
+                    "{case}: {b} hits"
+                );
+            }
+            assert_eq!(cache.view_counters().refusals, 1, "{case}");
+            assert_eq!(cache.view_resident_bytes(), 0, "{case}");
+        }
+
+        // A full view budget.
+        let budget = Arc::new(MemoryBudget::new(LIMIT));
+        let cache = Arc::new(
+            DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)))
+                .with_view_max_bytes(VIEW_BYTES),
+        );
+        register(&budget, &cache, margin);
+        let c = DecodedCacheCounters::default();
+        let memos: Vec<_> = (0..4).map(|b| admit_memo(&cache, key(b, 1), &c)).collect();
+        assert!(fill_at(&cache, key(0, 1), &memos[0], &c));
+        assert!(
+            !fill_at(&cache, key(3, 1), &memos[3], &c),
+            "the view budget is full"
+        );
+        assert_eq!(c.snapshot().evictions, 0);
+        assert_eq!(cache.pressure_counters().evictions, 0);
+        for b in 0..4 {
+            assert!(cache.lookup(&key(b, 1), ROWS, &c).is_some(), "{b} hits");
+        }
+        assert_eq!(extra(&memos[0]), VIEW_BYTES);
+        assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+        assert_eq!(cache.view_counters().refusals, 1);
+    }
+
+    /// A refusal cause for the pressure tests, and how each sets its budget.
+    #[derive(Clone, Copy, Debug)]
+    enum Refusal {
+        Ledger,
+        Gate,
+    }
+
+    const GATE_FLOOR: u64 = 1 << 30;
+
+    /// A 4 GiB budget with the cache as its evictor at slack 0, holding `n`
+    /// unheld entries, each with views when `views`.
+    fn pressure_fixture(
+        n: u32,
+        views: bool,
+    ) -> (
+        Arc<MemoryBudget>,
+        Arc<DecodedColumnCache>,
+        Vec<Weak<ViewTestMemo>>,
+    ) {
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        let cache = Arc::new(
+            DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)))
+                .with_view_max_bytes(1 << 20),
+        );
+        register(&budget, &cache, 0);
+        let c = DecodedCacheCounters::default();
+        let memos: Vec<_> = (0..n)
+            .map(|b| {
+                let m = admit_memo(&cache, key(b, 1), &c);
+                if views {
+                    assert!(fill_at(&cache, key(b, 1), &m, &c));
+                }
+                m
+            })
+            .collect();
+        (budget, cache, memos)
+    }
+
+    /// Sets `budget` so the request it returns is refused for `cause` with a
+    /// shortfall of `shortfall` plus `views`. A ledger refusal reserves the
+    /// limit less the request plus `shortfall`, on top of what the budget holds
+    /// other than `views`; a gate refusal closes the gate with `available`
+    /// below `GATE_FLOOR` by `shortfall` less the request, and lower again by
+    /// `views`, since views are resident memory.
+    fn refuse(budget: &MemoryBudget, cause: Refusal, shortfall: u64, views: u64) -> u64 {
+        match cause {
+            Refusal::Ledger => {
+                let n = 1 << 20;
+                let held = budget.reserved() - views;
+                budget.reserve_unchecked(budget.limit() - held - n + shortfall);
+                n
+            }
+            Refusal::Gate => {
+                let n = 64;
+                budget.set_host_memory_gate(false, GATE_FLOOR + n - shortfall - views, GATE_FLOOR);
+                n
+            }
+        }
+    }
+
+    /// ADR-3326, view memo amendment, T6: under a ledger refusal and under a
+    /// host-gate refusal whose shortfall the unheld views cover, the pass
+    /// releases one view memo and evicts no data entry, and the request is
+    /// then admitted. A view memo a batch holds is skipped: the next one is
+    /// released instead and the held one keeps its views.
+    #[test]
+    fn pressure_releases_unheld_views_before_any_data_entry() {
+        for cause in [Refusal::Ledger, Refusal::Gate] {
+            for held in [false, true] {
+                let (budget, cache, memos) = pressure_fixture(8, true);
+                let batch =
+                    held.then(|| memos[0].upgrade().and_then(|m| m.batch()).expect("views"));
+                let n = refuse(&budget, cause, VIEW_BYTES, 0);
+                budget
+                    .try_reserve(n)
+                    .unwrap_or_else(|e| panic!("{cause:?} held {held}: {e:?}"));
+                let what = format!("{cause:?} held {held}");
+                assert_eq!(cache.view_counters().releases, 1, "{what}");
+                assert_eq!(cache.pressure_counters().evictions, 0, "{what}");
+                assert_eq!(cache.len(), 8, "{what}");
+                assert_eq!(cache.view_resident_bytes(), 7 * VIEW_BYTES, "{what}");
+                let released = usize::from(held);
+                for (i, m) in memos.iter().enumerate() {
+                    let want = if i == released { 0 } else { VIEW_BYTES };
+                    assert_eq!(extra(m), want, "{what}: memo {i}");
+                }
+                assert_eq!(
+                    (budget.accounted_refusals(), budget.gate_refusals()),
+                    (0, 0),
+                    "{what}"
+                );
+                drop(batch);
+            }
+        }
+    }
+
+    /// ADR-3326, view memo amendment, T6: a shortfall above the views, under
+    /// each cause, against A with no views and B with the same data entries
+    /// and 8 unheld view memos, whose budget (ledger) or host reading (gate)
+    /// carries the view bytes on top. B releases every view memo and frees
+    /// the same data bytes as A: 3 entries for a shortfall of 2 entries and
+    /// a byte.
+    #[test]
+    fn a_shortfall_above_the_views_frees_the_same_data_with_or_without_views() {
+        let e = memo_entry_bytes();
+        for cause in [Refusal::Ledger, Refusal::Gate] {
+            let mut arms = Vec::new();
+            for views in [false, true] {
+                let (budget, cache, _memos) = pressure_fixture(8, views);
+                let data = cache.resident_bytes();
+                assert_eq!(data, 8 * e);
+                let view_bytes = cache.view_resident_bytes();
+                let n = refuse(&budget, cause, 2 * e + 1, view_bytes);
+                budget
+                    .try_reserve(n)
+                    .unwrap_or_else(|err| panic!("{cause:?} views {views}: {err:?}"));
+                arms.push((
+                    cache.pressure_counters(),
+                    cache.view_counters().releases,
+                    cache.view_resident_bytes(),
+                ));
+            }
+            let freed = PressureSnapshot {
+                evictions: 3,
+                freed_bytes: 3 * e,
+            };
+            assert_eq!(arms[0], (freed, 0, 0), "{cause:?}: A");
+            assert_eq!(arms[1], (freed, 8, 0), "{cause:?}: B");
+        }
+    }
+
+    /// ADR-3326, view memo amendment, T6, the counter falls with the release:
+    /// each pass that releases a view memo whose entry stays resident lowers
+    /// the view total and the budget by exactly its bytes, down to 0, and
+    /// leaves `resident` alone.
+    #[test]
+    fn releasing_a_view_memo_lowers_the_view_total_and_the_budget_by_its_bytes() {
+        let (budget, cache, memos) = pressure_fixture(2, true);
+        let reserved = budget.reserved();
+        let resident = cache.resident_bytes();
+        assert_eq!(cache.view_resident_bytes(), 2 * VIEW_BYTES);
+        for pass in 1..=2u64 {
+            assert_eq!(
+                cache.evict_for_pressure(VIEW_BYTES, 0, ExhaustionCause::Accounted),
+                VIEW_BYTES,
+                "pass {pass}"
+            );
+            assert_eq!(
+                cache.view_resident_bytes(),
+                (2 - pass) * VIEW_BYTES,
+                "pass {pass}"
+            );
+            assert_eq!(
+                budget.reserved(),
+                reserved - pass * VIEW_BYTES,
+                "pass {pass}"
+            );
+            assert_eq!(cache.resident_bytes(), resident, "pass {pass}");
+            assert_eq!(cache.len(), 2, "pass {pass}");
+            assert_eq!(cache.view_counters().releases, pass);
+        }
+        assert!(memos.iter().all(|m| extra(m) == 0));
+        assert_eq!(cache.pressure_counters().evictions, 0);
+    }
+
+    /// ADR-3326, view memo amendment, T7: evicting an entry, by CLOCK or by
+    /// pressure, drops its memo and its views with the column and takes its
+    /// views off the view total; once the last batch drops the budget is back
+    /// where it started; and with the cache empty a new fill is admitted on a
+    /// view budget that holds one memo.
+    #[test]
+    fn removing_an_entry_drops_its_views_and_lowers_the_view_total() {
+        let e = memo_entry_bytes();
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        let cache =
+            DecodedColumnCache::new(e, Some(Arc::clone(&budget))).with_view_max_bytes(VIEW_BYTES);
+        let c = DecodedCacheCounters::default();
+
+        // By CLOCK, a batch holding the views.
+        let m0 = admit_memo(&cache, key(0, 1), &c);
+        assert!(fill_at(&cache, key(0, 1), &m0, &c));
+        let batch = m0.upgrade().and_then(|m| m.batch()).expect("views");
+        assert_eq!(budget.reserved(), e + VIEW_BYTES);
+        let m1 = admit_memo(&cache, key(1, 1), &c);
+        assert_eq!(c.snapshot().evictions, 1);
+        assert!(m0.upgrade().is_none(), "the memo went with its column");
+        assert_eq!(cache.view_resident_bytes(), 0);
+        drop(batch);
+        assert_eq!(budget.reserved(), e, "only block 1's data stays reserved");
+
+        // A fill on the view budget the evicted views left.
+        assert!(fill_at(&cache, key(1, 1), &m1, &c), "admitted");
+        assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+
+        // By pressure.
+        assert_eq!(
+            cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted),
+            e + VIEW_BYTES
+        );
+        assert!(cache.is_empty());
+        assert!(m1.upgrade().is_none(), "the memo went with its column");
+        assert_eq!(cache.view_resident_bytes(), 0);
+        assert_eq!(budget.reserved(), 0, "back to the start");
+
+        let m2 = admit_memo(&cache, key(2, 1), &c);
+        assert!(fill_at(&cache, key(2, 1), &m2, &c), "admitted");
+        assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+        assert_eq!(cache.view_counters().fills, 3);
     }
 }
