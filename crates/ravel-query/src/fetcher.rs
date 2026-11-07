@@ -9844,6 +9844,12 @@ mod tests {
         let twice = [(100, 200), (0, 50), (60, 70)];
         assert_eq!(coalesced(&twice, 0), 160);
         assert_eq!(bytes(&twice, 0), 160);
+
+        // A late range can bridge a full gap on each side: (20, 40) joins
+        // both runs into one 60-byte run, which one gap of slack would miss.
+        let between = [(0, 10), (50, 60), (20, 40)];
+        assert_eq!(coalesced(&between, 10), 60);
+        assert_eq!(bytes(&between, 10), 60);
     }
 
     /// A section's lowest range, not its first one added, is where the bridge
