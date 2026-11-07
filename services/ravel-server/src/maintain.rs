@@ -6968,8 +6968,10 @@ mod tests {
             )
             .await;
         }
+        // 800 predicted decoded rows sit under the D0 floor, which is off here.
         let config = CompactorConfig {
             merge_resident_ceiling_bytes: Some(0),
+            geometry_floor_decoded_rows: 0,
             ..CompactorConfig::default()
         };
         let safety = MaintenanceSafetyMetrics::default();

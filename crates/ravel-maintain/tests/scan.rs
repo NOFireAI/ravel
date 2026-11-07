@@ -1653,8 +1653,10 @@ async fn a_geometry_refusal_is_memoized_in_memory_and_never_persisted() {
         .await;
     }
     let clock = sealed_through(HOUR);
+    // 800 predicted decoded rows sit under the D0 floor, which is off here.
     let config = CompactorConfig {
         merge_resident_ceiling_bytes: Some(0),
+        geometry_floor_decoded_rows: 0,
         ..CompactorConfig::default()
     };
     let retention = retention_window(30 * DAY_NS);
