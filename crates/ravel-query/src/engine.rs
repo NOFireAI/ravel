@@ -12222,7 +12222,7 @@ mod l1_batch_tests {
             },
             Label {
                 name: "pick".to_string(),
-                value: if i % 10 == 0 { "yes" } else { "no" }.to_string(),
+                value: if i.is_multiple_of(10) { "yes" } else { "no" }.to_string(),
             },
         ])
         .expect("labels");
