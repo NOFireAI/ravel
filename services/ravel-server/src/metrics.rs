@@ -6080,15 +6080,17 @@ fn render_maintain_safety_family(
             "Bucket compactions refused, by reason, summed over every signal since process start \
              (ADR-3853). reason=\"geometry\": with no --maintain-scratch-dir, a cursor-mode merge \
              whose predicted decoded rows exceed {} (MAX_CURSOR_DECODE_AMPLIFICATION) times the \
-             bucket's record count, which happens when many L0 inputs each carry blocks spanning \
-             many streams; refused before the first block GET. reason=\"two_level\": such a \
+             bucket's record count and {} (MIN_GEOMETRY_PREDICTED_DECODED_ROWS) in all, which \
+             happens when many L0 inputs each carry blocks spanning many streams; refused before \
+             the first block GET. reason=\"two_level\": such a \
              bucket's two-level merge does not fit its unit's memory ceiling. \
              reason=\"scratch_headroom\": the scratch directory has less free than the two-level \
              merge needs, or a scratch write ran out of space. reason=\"scratch_locked\": another \
              process holds the scratch directory's lock. Nothing is published, the claim is \
              released and the L0 inputs stay live; the server's in-memory maintain memo stops \
              retrying the bucket until restart. A warn log line names the bucket.",
-            ravel_maintain::rlog::MAX_CURSOR_DECODE_AMPLIFICATION
+            ravel_maintain::rlog::MAX_CURSOR_DECODE_AMPLIFICATION,
+            ravel_maintain::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS
         ),
         "counter",
     );
