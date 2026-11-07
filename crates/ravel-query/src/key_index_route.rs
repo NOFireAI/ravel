@@ -749,8 +749,8 @@ fn merge_answer(answer: &mut PartAnswer, slice: KeyIndexSetAnswer) -> Result<(),
 /// The bytes read, and so the GET count, wire bytes and decompressed bytes,
 /// are those of probing the slices one after another whenever the part
 /// answers. A part the stopping slice decides, or a breach fails, has also
-/// read GET 1 of the slices after it. A part decided in phase 3 has also read GET 1 of the
-/// slices after the failing one and may have issued up to
+/// read GET 1 of the slices after it. A part decided in phase 3 has also
+/// read GET 1 of the slices after the failing one and may have issued up to
 /// `LEAF_READ_CONCURRENCY - 1` runs past the failing run. All of those
 /// reads are counted. [`PartPlan::worst_gets`] still bounds the count:
 /// every slice issues GET 1 and at most its worst case of runs.
