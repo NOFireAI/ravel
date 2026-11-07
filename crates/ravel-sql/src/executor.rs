@@ -181,7 +181,8 @@ use crate::session::{
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_provider::SpansTableProvider;
 use crate::spill::{
-    OperatorSpill, SpillBudget, SpillCounts, SpillScratch, accumulate_spill_counts,
+    OperatorSpill, SpillBudget, SpillCounts, SpillReservation, SpillScratch,
+    accumulate_spill_counts,
 };
 use crate::statement::{
     LowerError, LoweredStatement, LoweringSite, Statement, session_table_providers,
@@ -724,6 +725,10 @@ struct PlanExtras {
     lane_parts: LaneParts,
     /// Which spill decision this plan takes (issue #3899).
     spill: SpillAttempt,
+    /// The spill-budget share [`SqlExecutor::run`] reserved before a
+    /// [`SpillAttempt::Retry`]; `None` for every other attempt. A retry
+    /// planned without one is an internal error.
+    spill_share: Option<SpillReservation>,
 }
 
 /// Which spill decision a plan takes (issue #3899).
@@ -739,8 +744,9 @@ enum SpillAttempt {
     First,
     /// The one retry after a first attempt's memory refusal
     /// ([`spill_retry_decision`]): the ADR-0954 plan, one share of the spill
-    /// ceiling ([`SpillBudget::reserve_share`]), and a spill-mode pool
-    /// ([`SqlConfig::query_pool_spill_mode`]) while spill is enabled.
+    /// ceiling ([`SpillBudget::reserve_share`], reserved before the retry
+    /// starts and carried in [`PlanExtras::spill_share`]), and a spill-mode
+    /// pool ([`SqlConfig::query_pool_spill_mode`]) while spill is enabled.
     Retry,
 }
 
@@ -2643,6 +2649,7 @@ impl SqlExecutor {
                     // The plan an execution runs first; a spill retry runs
                     // only after that plan's memory refusal.
                     spill: SpillAttempt::First,
+                    spill_share: None,
                 },
             )
             .await?;
@@ -2716,6 +2723,13 @@ impl SqlExecutor {
         // retry's. The caller's statement deadline covers every pass.
         let mut snapshot_retried = false;
         let mut spill_retry: Option<FirstRefusal> = None;
+        // The spill-budget share the next retry pass plans with, reserved
+        // before that pass starts (ADR-0954, refusal-retry amendment item 4).
+        let mut retry_share = if self.starts_as_spill_retry() {
+            self.reserve_spill_share()
+        } else {
+            None
+        };
         loop {
             let pass_started = Instant::now();
             let spill_attempt = if spill_retry.is_some() || self.starts_as_spill_retry() {
@@ -2723,6 +2737,7 @@ impl SqlExecutor {
             } else {
                 SpillAttempt::First
             };
+            let spill_share = retry_share.take();
             let phase_accounting = StatementAccounting::new();
             // Add this attempt's handle to the caller's live view before any
             // store call, so a snapshot taken from a `Drop` or after a deadline
@@ -2841,6 +2856,7 @@ impl SqlExecutor {
                     parquet,
                     lane_parts,
                     spill_attempt,
+                    spill_share,
                 )
                 .await;
             stats.batches_emitted += emitted;
@@ -2937,7 +2953,28 @@ impl SqlExecutor {
                     ) {
                         RetryDecision::RetryOnce => {
                             snapshot_retried = true;
-                            continue;
+                            if spill_attempt != SpillAttempt::Retry {
+                                continue;
+                            }
+                            // The discarded pass's share was released with
+                            // its scratch, so the snapshot retry reserves
+                            // its own and never plans a retry without one.
+                            match self.reserve_spill_share() {
+                                Some(share) => {
+                                    retry_share = Some(share);
+                                    continue;
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        statement_fingerprint =
+                                            statement_fingerprint(statement).as_str(),
+                                        "SQL snapshot retry of a spill retry skipped: no spill \
+                                         share of at least the minimum remains of the process \
+                                         spill ceiling"
+                                    );
+                                    SqlError::SnapshotInvalidated
+                                }
+                            }
                         }
                         RetryDecision::FailInvalidated => SqlError::SnapshotInvalidated,
                         RetryDecision::Propagate => {
@@ -2974,12 +3011,34 @@ impl SqlExecutor {
                                 spill_retried,
                             ) == SpillRetry::Retry
                             {
-                                stats.spill_retries += 1;
-                                spill_retry = Some(FirstRefusal {
-                                    class: first_refusal_class(&err, caps.pool),
-                                    after: pass_started.elapsed(),
-                                });
-                                continue;
+                                // ADR-0954 refusal-retry amendment item 4:
+                                // the share is reserved before the retry
+                                // starts, and with none left the first
+                                // attempt's refusal is the statement's.
+                                match self.reserve_spill_share() {
+                                    Some(share) => {
+                                        stats.spill_retries += 1;
+                                        retry_share = Some(share);
+                                        spill_retry = Some(FirstRefusal {
+                                            class: first_refusal_class(&err, caps.pool),
+                                            after: pass_started.elapsed(),
+                                        });
+                                        continue;
+                                    }
+                                    None => tracing::warn!(
+                                        statement_fingerprint =
+                                            statement_fingerprint(statement).as_str(),
+                                        outcome = "skipped",
+                                        first_refusal = first_refusal_class(&err, caps.pool),
+                                        min_share_bytes = self
+                                            .spill_budget
+                                            .as_ref()
+                                            .map_or(0, SpillBudget::min_reservation),
+                                        "SQL spill retry skipped: no spill share of at least \
+                                         the minimum remains of the process spill ceiling; \
+                                         returning the first attempt's refusal"
+                                    ),
+                                }
                             }
                             err
                         }
@@ -3354,6 +3413,7 @@ impl SqlExecutor {
                 // no second attempt to spill on, so `SqlExecutor::run`'s spill
                 // retry does not apply here (issue #3899 follow-up T6).
                 spill: SpillAttempt::PlanTime,
+                spill_share: None,
             },
         )
         .await
@@ -3394,6 +3454,17 @@ impl SqlExecutor {
         let spill_config = match extras.spill {
             SpillAttempt::First => None,
             SpillAttempt::PlanTime | SpillAttempt::Retry => config.spill.as_ref(),
+        };
+        // A spill retry plans only with the share `run` reserved for it
+        // before it started (ADR-0954, refusal-retry amendment item 4).
+        let mut retry_share = match (extras.spill, extras.spill_share) {
+            (SpillAttempt::Retry, Some(share)) => Some(share),
+            (SpillAttempt::Retry, None) => {
+                return Err(SqlError::Internal(
+                    "a spill retry reached planning without a reserved spill share".to_string(),
+                ));
+            }
+            (SpillAttempt::PlanTime | SpillAttempt::First, _) => None,
         };
         // ADR-0094 decision 1/2: classify the query's aggregates and GROUP BY
         // keys before the real session is built, right here at the one call site
@@ -3553,14 +3624,14 @@ impl SqlExecutor {
         // ADR-0954 requirement 2 (issue #2416): the query's scratch cap is
         // reserved from the process-wide ceiling first, and a query that
         // cannot reserve the minimum runs with spill disabled. A spill retry
-        // reserves one share of that ceiling (issue #3899), so up to
-        // `MAX_SPILL_SHARES` retries spill at once.
+        // holds one share of that ceiling (issue #3899), reserved before it
+        // started, so up to `MAX_SPILL_SHARES` retries spill at once.
         let scratch = match (spill_config, &self.spill_budget) {
             (Some(spill), Some(budget))
                 if analyzed.as_ref().is_some_and(plan_is_spill_eligible) =>
             {
                 let reserved = match extras.spill {
-                    SpillAttempt::Retry => budget.reserve_share(),
+                    SpillAttempt::Retry => retry_share.take(),
                     SpillAttempt::PlanTime | SpillAttempt::First => budget.reserve(spill.max_bytes),
                 };
                 match reserved {
@@ -3820,7 +3891,7 @@ impl SqlExecutor {
         let (mut pool, mut breach) = attempt_pool(
             config,
             extras.spill,
-            spill_enabled,
+            decision,
             self.tenant_budget(tenant_hash),
             phase_accounting.statement().scan().clone(),
         );
@@ -3881,7 +3952,7 @@ impl SqlExecutor {
             (pool, breach) = attempt_pool(
                 config,
                 extras.spill,
-                false,
+                SpillDecision::Disabled,
                 self.tenant_budget(tenant_hash),
                 phase_accounting.statement().scan().clone(),
             );
@@ -5029,6 +5100,15 @@ impl SqlExecutor {
         self.scan_executions.counts()
     }
 
+    /// One share of the process spill ceiling for a spill retry
+    /// ([`SpillBudget::reserve_share`]), or `None` when spill is not
+    /// configured or less than the minimum remains.
+    fn reserve_spill_share(&self) -> Option<SpillReservation> {
+        self.spill_budget
+            .as_ref()
+            .and_then(SpillBudget::reserve_share)
+    }
+
     /// [`Self::start_as_spill_retry`]; outside tests a first pass is always
     /// [`SpillAttempt::First`].
     #[cfg(test)]
@@ -5447,6 +5527,7 @@ impl SqlExecutor {
         parquet: Option<ParquetResolution>,
         lane_parts: LaneParts,
         spill_attempt: SpillAttempt,
+        spill_share: Option<SpillReservation>,
     ) -> (
         Result<QueryOutput, SqlError>,
         usize,
@@ -5476,6 +5557,7 @@ impl SqlExecutor {
                     capabilities,
                     lane_parts,
                     spill: spill_attempt,
+                    spill_share,
                 },
             )
             .await
@@ -5649,17 +5731,20 @@ fn spill_tie_ordered(plan: LogicalPlan, max_limit: Option<usize>) -> LogicalPlan
     }
 }
 
-/// The memory pool a plan's session gets. A spill retry whose spill is
-/// enabled gets the spill-mode pool, which refuses a spillable consumer
-/// early so it spills and leaves room for the consumers that cannot
-/// (issue #3899); every other plan gets the plain query pool. So does a
-/// retry whose per-query limit is no larger than the spill-mode headroom,
+/// The memory pool a plan's session gets. A spill retry whose session gets
+/// a disk manager ([`SpillDecision::Enabled`]) gets the spill-mode pool,
+/// which refuses a spillable consumer early so it spills and leaves room for
+/// the consumers that cannot (issue #3899); every other plan gets the plain
+/// query pool. Taking the session's decision rather than a flag means a
+/// spill-mode pool never runs without a disk manager, where its early refusal
+/// would fail the consumer instead of spilling it. A retry whose per-query
+/// limit is no larger than the spill-mode headroom also gets the plain pool,
 /// where the spill-mode cap would be zero and no spillable consumer could
 /// hold even the batch it spills.
 fn attempt_pool(
     config: &SqlConfig,
     spill: SpillAttempt,
-    spill_enabled: bool,
+    decision: SpillDecision<'_>,
     tenant: Arc<TenantMemoryAccountant>,
     accounting: QueryAccounting,
 ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
@@ -5667,7 +5752,9 @@ fn attempt_pool(
         .max_query_bytes
         .saturating_sub(crate::memory::spill_mode_headroom(config.max_query_bytes));
     match spill {
-        SpillAttempt::Retry if spill_enabled && spill_mode_cap > 0 => {
+        SpillAttempt::Retry
+            if matches!(decision, SpillDecision::Enabled { .. }) && spill_mode_cap > 0 =>
+        {
             config.query_pool_spill_mode(tenant, accounting)
         }
         SpillAttempt::Retry | SpillAttempt::PlanTime | SpillAttempt::First => {
@@ -8940,11 +9027,19 @@ pub(crate) mod tests {
         };
         // Whether a non-spillable consumer can take 100 MiB after a
         // spillable one asked for 950 MiB of the 1000 MiB limit.
-        let join_fits = |spill, spill_enabled| {
+        let join_fits = |spill, spill_enabled: bool| {
+            let decision = if spill_enabled {
+                SpillDecision::Enabled {
+                    dir: std::path::Path::new("unused"),
+                    max_bytes: 1,
+                }
+            } else {
+                SpillDecision::Disabled
+            };
             let (pool, _breach) = attempt_pool(
                 &config,
                 spill,
-                spill_enabled,
+                decision,
                 TenantMemoryAccountant::new(usize::MAX),
                 QueryAccounting::new(),
             );
