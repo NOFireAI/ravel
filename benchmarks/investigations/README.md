@@ -482,7 +482,12 @@ pre-registered figure. Every figure `bands.toml` names goes through one
 list and is present exactly once: absent is `missing`, two inputs for it
 (calls or stamps) are `duplicate` and neither is used, and the figures of a
 row whose tenant, states, scales or baseline the run lacks are `not-run`
-with the reason.
+with the reason. A figure whose inputs no build's report carries is
+`not-computable`, with the inputs it lacks as the reason (row 7's G,
+below), and a figure whose precondition does not hold on the measured
+state is `incomplete`, with the precondition as the reason (row 6's probe
+survivors, below). A figure computed from, or judged against, a
+`not-computable` or `incomplete` figure takes that status and its reason.
 
 Only an allowlist of fields this build does not report may read as
 `unsupported-on-this-build`, and only when the call itself succeeded:
@@ -509,9 +514,10 @@ proved less than it was asked: a state `run.toml` lists that did not run, a
 planned call that was not sent in a state that did (the run deadline, an
 in-flight window too short), a figure `not-run` for a reason other than
 its row or figure needing a tenant, state, scale or baseline the run never
-asked for, a row 18 cell `not-measured` (below), or a row 18 figure that
-reads `unsupported-on-this-build`, `refused-by-guard`, refused or missing
-(missing also fails the run). Each reason is listed under `incomplete` in the results and the
+asked for, a row 18 cell `not-measured` (below), a figure that reads
+`not-computable` or `incomplete` or is judged against one, or a row 18
+figure that reads `unsupported-on-this-build`, `refused-by-guard`, refused
+or missing (missing also fails the run). Each reason is listed under `incomplete` in the results and the
 summary. The rows left out that way are not silent either: each is listed
 with the setting that leaves it out (`hits = false`, `baseline = false`, a
 state or scale `run.toml` does not list) under `not_requested` in the results and on the
@@ -575,7 +581,22 @@ Some bands, as transcribed:
   band's holders, a pass (`check_row_6_objects_past_probe`). That leaves 5
   objects past every pruning step, the 1 probe survivor and the 4 unprobed
   small objects, while the scan opened 4; the stats count objects and do
-  not name them, so they cannot tell which of the 5 the 4 are.
+  not name them, so they cannot tell which of the 5 the 4 are. The figure
+  is judged only when the plan opened exactly the probed objects: plan
+  `segmentsOpened` equal to the census's `objects_over_512k` less
+  `pruning.segmentsPrunedByStats` (box C: 519 - 26 = 493). The plan keeps
+  objects at or under 512 KiB out of its phase only when it skips sub-bound
+  plans (`skips_sub_bound_plans` in `crates/ravel-sql/src/logs_scan/plan.rs`);
+  otherwise it opens them with no probe, and they would count as
+  survivors. When the equality fails, or the census carries no
+  `objects_over_512k` for the statement's tenant and signal, the figure
+  reads `incomplete` with the precondition as its reason, never a hold or a
+  miss, and the run is incomplete. A small object pruned by stats also
+  breaks the equality (it is in `segmentsPrunedByStats` but not in
+  `objects_over_512k`), which reads `incomplete` too: the safe direction.
+  The same stats with the plan opening 497 read `incomplete`; with the
+  precondition holding, a probe that let 2 objects through misses
+  (`check_row_6_objects_past_probe`).
 - Row 7, judged per build pass (the #3704 amendment's form, with the pass
   factor of the pass-end slice amendment): ranged section GETs
   (`key_index_ranged_gets`) at most 2 x (new + uncovered entries) x
@@ -596,11 +617,24 @@ Some bands, as transcribed:
   still misses (`check_row_7_uncovered` pins each signal holding only with
   the term). The passes target is G, the pass-end slice amendment's greedy
   partition of each field's key8 runs into groups of at most the pair
-  share: the fold report carries no pair budget and no per-field key8
-  runs, so `build_passes_g` and `build_passes` read
-  `unsupported-on-this-build` with that reason on every build; box D's 3
-  and 27 passes read that way, not as misses, and still scale the section
-  GETs (`check_row_7_passes_unsupported`). New
+  share max(1, floor(budget / F)) for F fields, a single run over the share
+  its own group and the slowest field deciding (`greedy_passes`,
+  `check_greedy_passes`). evaluate.py computes G from two fold report
+  fields, `key_index_pair_budget` (the build's pair budget) and
+  `key_index_field_run_pairs` (per field, the pair count of each ascending
+  key8 run); those names are the harness's, since no fold report carries
+  either yet. Until one does, `build_passes_g` reads `not-computable`
+  naming the missing inputs, `build_passes`, judged against it, reads
+  `not-computable` too, and each adds an incomplete reason, so the verdict
+  is at best `incomplete` and the exit 1: row 7 cannot hold until the fold
+  report carries G's inputs, which ADR-3939's fold task adds. Box D's 3 and
+  27 passes read that way, not as holds or misses, and still scale the
+  section GETs (`check_row_7_passes_not_computable`); a fold report that
+  carries the inputs, giving G 3 on spans and 27 on logs, holds at 3 and 27
+  and misses at 4 and 28 (`check_row_7_g`). On the committed local smoke
+  `build_passes_g` reads `not-computable` for that reason, but
+  `build_passes` reads `unsupported-on-this-build` before it is judged:
+  that build's fold report carries no `key_index_build_passes` at all. New
   entries, previous leaves and footer lengths come from the stamps; `rlog
   inspect` and `rspan inspect` print a footer length, so the footer term is
   real (0 at the smoke's 199 and 248 bytes). The miss reads "over" as at
@@ -628,10 +662,16 @@ Some bands, as transcribed:
   bytes are 1, 2, 3 and on and whose low 8 bytes are zero, as many as the
   list needs (24 beside a `control_extra` key, 25 when the 1,000-key list
   already names every trace), skipping a high half a listed id already
-  holds. The planner dedups a list on each key's key8 before it counts the
-  keys (`KeySet::new`), and an Id16's key8 is its high 8 bytes, so padding
-  that differed only in the low half would be one key and leave the list
-  under the cap; every over-cap list holds 1,025 distinct key8s
+  holds. The logs planner dedups a list on each key's key8 before it counts
+  the keys (`KeyIn::new`, through `KeySet::new`), which is exact for logs,
+  and an Id16's key8 is its high 8 bytes, so padding that differed only in
+  the low half would be one key and leave the list under the cap. The spans
+  `trace_id IN` arm sorts and dedups the full 16-byte ids and drops the
+  list when more than `TRACE_ID_SET_MAX` (1,024) distinct ids remain,
+  before any key8 is taken (`crates/ravel-sql/src/spans_pushdown.rs`, the
+  `Expr::InList` arm); only a list that passes that cap is deduped on key8,
+  by the router's key set. Every over-cap list holds 1,025 distinct key8s,
+  so it is over the cap on both paths
   (`test_over_cap_lists_hold_over_1024_distinct_key8`). A random 128-bit
   draw lands on a padding id with negligible odds and, if one did, would
   add rows and read as a wrong answer, not a pass. The padding adds no row,
@@ -647,9 +687,14 @@ Some bands, as transcribed:
   0 leaf GETs (`services/ravel-server/tests/sql_key_in.rs`,
   `in_list_rows_equal_the_union_of_equalities`). The control is 1 (pass)
   when every 1,000-key call reports `keysProbed` 1000 and either
-  `partsCovered` or a part in an Uncovered outcome (box C's went
-  Uncovered by budget, `partsCovered` 0 and `skippedByBudget` 1, which
-  still carried the key set: `check_control_uncovered_by_budget`), and
+  `partsCovered` or a part in an Uncovered outcome: any of
+  `partsUncovered`, `skippedByBudget`, `partsBeyondCeiling`,
+  `leavesRejected` and `reservationsRefused`, every outcome the ADR's row
+  11 lets the report name (box C's went Uncovered by budget, `partsCovered`
+  0 and `skippedByBudget` 1, which still carried the key set:
+  `check_control_uncovered_by_budget`; each outcome alone passes in
+  `check_control_uncovered_outcomes`, which also pins that its cases cover
+  every outcome evaluate.py accepts), and
   every 1,025-key call is served by a visible scan with no keyIndex figure
   above zero; 0 (miss) when a 1,025-key call is index-served
   (`keysProbed`, `partsCovered` or `leafGetRequests` non-zero), is served
@@ -711,9 +756,10 @@ unchanged.
 
 ## Unsupported on this build
 
-- Row 7's G (`build_passes_g`): the fold report carries no pair budget and
-  no per-field key8 runs, so the pass count the passes are judged against
-  cannot be computed, and the passes read unsupported with that reason.
+- Row 7's G (`build_passes_g`) is not in this list: it is
+  `not-computable`, not unsupported, because no build's fold report
+  carries its inputs (`key_index_pair_budget`, `key_index_field_run_pairs`)
+  yet, and it leaves the run incomplete (row 7, above).
 - Key-index stats (`stats.keyIndex` and its members),
   `pruning.skipIdxDropped`, the per-object and per-part breakdowns, and the
   fold report's `key_index_build_passes`, `key_index_sections_read`,
@@ -837,7 +883,10 @@ dead_counter segmentsOpened journey_c_1 folded_leaves
 dead_counter segmentsOpened journey_c_10240 folded_leaves
 ```
 
-The only incomplete line is
+The incomplete lines are row 7's two G figures,
+`figure row_07.spans_build_passes_g not-computable: fold report
+fold_advance/inv/spans carries no key_index_pair_budget and no
+key_index_field_run_pairs, ...` and its logs twin, and
 `figure row_13.negative_controls_failing_on_mutant not run: mutant controls
 not implemented`.
 
@@ -891,11 +940,15 @@ against the ADR's Acceptance table), evaluate.py on the fixture and on
 mutations of it (missing, duplicate, miss, wrong answer, a deleted catalog
 stamp, absent phases, CPU and leaf sizes, dead counters, full, partial, zero
 and too-short compaction overlap, a refusal outside the cap probes, the
-1,025-key control's pass, miss, refused and unsupported readings, a skipped state
+1,025-key control's pass, miss, refused and unsupported readings and each
+Uncovered outcome of its 1,000-key list, a skipped state
 and a mid-state deadline, the unsealed tail, the pending-erasure victim, a
 state absent from the results, row 3's per-object denominator, row 6's
-objects past the probe on box C's stats, row 7 per pass on box D's figures
-and on a one-pass rebuild, row 15's budget from `truth.json`, row 18's
+objects past the probe on box C's stats, with its plan-phase precondition
+failing (incomplete) and a second survivor (miss), row 7 per pass on box
+D's figures and on a one-pass rebuild, row 7's G `not-computable` on box
+D's figures (incomplete) and computed from a fold report that carries its
+inputs (hold at box D's passes, miss one over), row 15's budget from `truth.json`, row 18's
 hold, box C miss, noise edges, `Uncovered` cell and absent state, a typed
 refusal counted as an error, exact cost and maintenance dollars), the wrong
 evaluators each of those cases must reject (each printed with the

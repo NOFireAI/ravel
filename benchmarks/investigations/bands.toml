@@ -425,6 +425,16 @@ miss_reason = "fewer keyIndex GETs than objects above 512 KiB: one was read with
 # pruned by stats, 4 at or under 512 KiB, 493 probed, 492 of those pruned by
 # the key index, so 1 here and 5 survivors in all; the scan opened 4 of the 5,
 # and the stats do not name which.
+#
+# The figure is judged only when the plan opened exactly the probed objects:
+# plan segmentsOpened == census objects_over_512k - pruning.segmentsPrunedByStats
+# (box C: 519 - 26 = 493). The plan keeps objects at or under 512 KiB out
+# only when it skips sub-bound plans (plan.rs, skips_sub_bound_plans);
+# otherwise it opens them unprobed and they would count as survivors. When
+# the equality fails the figure reads incomplete with the precondition as its
+# reason, never a hold or a miss. A small object pruned by stats also breaks
+# the equality (it is in segmentsPrunedByStats but not in objects_over_512k),
+# which reads incomplete too: the safe direction.
 [[row.figure]]
 name = "objects_past_probe"
 statement = "q20_hits"
@@ -504,10 +514,14 @@ requires_tenant = "inv"
 # whose miss holds is a miss whatever its target says.
 #
 # The target's passes are G, the pass-end slice amendment's greedy partition
-# (evaluate.py G_UNSUPPORTED): the fold report carries no pair budget and no
-# per-field key8 runs, so build_passes_g, and with it build_passes, reads
-# unsupported-on-this-build. The passes still enter the section GETs and
-# section reads per pass as the build reports them.
+# (evaluate.py greedy_passes), computed from the fold report's
+# key_index_pair_budget and key_index_field_run_pairs (evaluate.py G_INPUTS).
+# No fold report carries them yet (ADR-3939's fold task adds them), so
+# build_passes_g reads not-computable naming the missing inputs, build_passes,
+# judged against it, reads not-computable too, and each leaves the run
+# incomplete: row 7 cannot hold until the fold report carries G's inputs.
+# The passes still enter the section GETs and section reads per pass as the
+# build reports them.
 requires_states = ["mixed"]
 
 [[row.figure]]
