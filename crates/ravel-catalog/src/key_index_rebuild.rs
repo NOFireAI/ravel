@@ -861,9 +861,11 @@ mod tests {
     use crate::fold::KEY_INDEX_FOOTER_SUFFIX_LEN;
     use crate::fold::tests::{
         KIDX_HOUR, USER_ID, assert_foreign_part_error, config, declare_user_id_key_index,
-        fold_through, kidx_objects, matches, part_ordinals, probe_part, publish_trace_spans,
-        publish_user_id_logs, read_signal_head, repoint_head_at_foreign_part, tenant,
+        fold_through, kidx_objects, matches, metrics_kidx_config, part_ordinals, probe_part,
+        publish_label_fixture, publish_trace_spans, publish_user_id_logs,
+        put_metrics_erasure_request, read_signal_head, repoint_head_at_foreign_part, tenant,
     };
+    use crate::fold::METRICS_LABEL_VALUE_FIELD;
     use crate::snapshot_format::{KeyIndexLeafProbe, verify_key_index_leaf};
 
     /// Records every GET (key, range, bytes returned), every PUT key and every
@@ -2519,5 +2521,118 @@ mod tests {
         );
         let head = read_signal_head(inner.as_ref(), Signal::Logs).await;
         assert_eq!(head.parts[0].key_index, vec![original]);
+    }
+
+    /// The switch-off catalog with `metrics_label_index` on and the byte cap
+    /// ratio `ratio_ppm`: the metrics rebuild's catalog.
+    fn metrics_rebuild_catalog(store: Arc<dyn ObjectStoreBackend>, ratio_ppm: u32) -> Catalog {
+        let cfg = CatalogConfig {
+            metrics_label_index: true,
+            metrics_label_index_max_ratio_ppm: ratio_ppm,
+            ..config(1)
+        };
+        assert!(!cfg.build_key_index_leaves);
+        Catalog::new(store, cfg).expect("catalog")
+    }
+
+    /// With `metrics_label_index` on, the rebuild's metrics leaf is the
+    /// fold's: the six-object fixture folded once with both switches on, and
+    /// once with the leaf build off and then rebuilt, gives the same part,
+    /// the same `label_value` ref and byte-identical leaf objects. The
+    /// rebuild lists the pending erasure set once and reads each entry with
+    /// a suffix GET and one LABEL_DICT range GET.
+    #[tokio::test]
+    async fn a_rebuilt_metrics_leaf_is_byte_identical_to_the_folds_leaf() {
+        let folded = recording_store();
+        publish_label_fixture(folded.as_ref()).await;
+        let on = Catalog::new(folded.clone(), metrics_kidx_config()).expect("catalog");
+        fold_through(&on, Signal::Metrics, KIDX_HOUR).await;
+
+        let rebuilt = recording_store();
+        publish_label_fixture(rebuilt.as_ref()).await;
+        let off = off_catalog(rebuilt.clone(), DEFAULT_SNAPSHOT_PART_MAX_ENTRIES);
+        fold_through(&off, Signal::Metrics, KIDX_HOUR).await;
+        rebuilt.clear();
+        let catalog = metrics_rebuild_catalog(rebuilt.clone(), 10_000);
+        let report = rebuild(&catalog, Signal::Metrics).await;
+        assert_eq!(report.fields, vec![METRICS_LABEL_VALUE_FIELD.to_string()]);
+        assert_eq!(report.parts_rebuilt, 1, "{report:?}");
+        assert_eq!(report.erasure_list_requests, 1, "{report:?}");
+        assert_eq!(rebuilt.lists(), 1, "the pending erasure listing only");
+        assert_eq!(report.ranged_gets, 2 * 6, "{report:?}");
+        assert_eq!(rebuilt.data_ranged_gets().len(), 2 * 6);
+        assert_eq!(report.uncovered_entries, 0, "{report:?}");
+
+        let fold_head = read_signal_head(folded.as_ref(), Signal::Metrics).await;
+        let rebuild_head = read_signal_head(rebuilt.as_ref(), Signal::Metrics).await;
+        assert_eq!(fold_head.parts.len(), 1);
+        assert_eq!(fold_head.parts[0].blake3, rebuild_head.parts[0].blake3);
+        assert_eq!(fold_head.parts[0].key_index.len(), 1);
+        assert_eq!(
+            fold_head.parts[0].key_index,
+            rebuild_head.parts[0].key_index
+        );
+        for leaf in &fold_head.parts[0].key_index {
+            let a = folded
+                .get(&leaf.key, GetRange::Full)
+                .await
+                .expect("fold leaf");
+            let b = rebuilt
+                .get(&leaf.key, GetRange::Full)
+                .await
+                .expect("rebuilt leaf");
+            assert_eq!(a.data, b.data, "{}", leaf.key);
+        }
+    }
+
+    /// A pending metrics erasure request ends the rebuild before any part is
+    /// read: no data object GET, no PUT, HEAD unchanged, the unindexed part
+    /// counted as gated and the one LIST counted.
+    #[tokio::test]
+    async fn a_pending_erasure_request_gates_the_metrics_rebuild() {
+        let store = recording_store();
+        publish_label_fixture(store.as_ref()).await;
+        put_metrics_erasure_request(store.as_ref()).await;
+        let off = off_catalog(store.clone(), DEFAULT_SNAPSHOT_PART_MAX_ENTRIES);
+        fold_through(&off, Signal::Metrics, KIDX_HOUR).await;
+        let before = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        store.clear();
+        let report = rebuild(
+            &metrics_rebuild_catalog(store.clone(), 10_000),
+            Signal::Metrics,
+        )
+        .await;
+        assert_eq!(report.parts_unindexed, 1, "{report:?}");
+        assert_eq!(report.parts_erasure_gated, 1, "{report:?}");
+        assert_eq!(report.erasure_list_requests, 1, "{report:?}");
+        assert_eq!(report.parts_rebuilt, 0, "{report:?}");
+        assert_eq!(report.attempt_count, 0, "{report:?}");
+        assert_eq!(store.lists(), 1);
+        assert_eq!(store.data_ranged_gets(), Vec::new());
+        assert_eq!(store.puts(), Vec::<String>::new());
+        assert_eq!(read_signal_head(store.as_ref(), Signal::Metrics).await, before);
+    }
+
+    /// A part whose metrics leaf would pass the byte cap gains no ref: no
+    /// leaf PUT, no HEAD publish, the part counted over the cap and every
+    /// entry uncovered.
+    #[tokio::test]
+    async fn a_metrics_part_over_the_cap_gains_no_ref_in_the_rebuild() {
+        let store = recording_store();
+        publish_label_fixture(store.as_ref()).await;
+        let off = off_catalog(store.clone(), DEFAULT_SNAPSHOT_PART_MAX_ENTRIES);
+        fold_through(&off, Signal::Metrics, KIDX_HOUR).await;
+        let before = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        store.clear();
+        let report = rebuild(&metrics_rebuild_catalog(store.clone(), 1), Signal::Metrics).await;
+        assert_eq!(report.parts_over_cap, 1, "{report:?}");
+        assert_eq!(report.uncovered_entries, 6, "{report:?}");
+        assert_eq!(report.leaves_written, 0, "{report:?}");
+        assert!(
+            store.puts().iter().all(|key| !key.ends_with(".kidx")),
+            "{:?}",
+            store.puts()
+        );
+        assert_eq!(read_signal_head(store.as_ref(), Signal::Metrics).await, before);
     }
 }
