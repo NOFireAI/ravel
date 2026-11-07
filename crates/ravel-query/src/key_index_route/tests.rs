@@ -1974,15 +1974,14 @@ async fn allowance_case() -> AllowanceCase {
 }
 
 /// The part's allowance is charged from the slices' prefixes in slice
-/// order before any bucket is read: the third slice's bridged bytes exceed
-/// what the first two left, so the part is skipped by budget, every slice's
-/// GET 1 is read and counted (the fourth's too), and no read goes past any
-/// leaf's prefix range.
+/// order: the third slice's bridged bytes exceed what the first two left,
+/// so the part is skipped by budget. The first two slices' runs are read,
+/// as the serial probe reads them, every slice's GET 1 is read and counted
+/// (the fourth's too), and no run of the third or fourth slice is read.
 /// FLIP: charging each slice against the full allowance covers the part;
-/// the serial probe reads the first two slices' runs and never the fourth
-/// slice's GET 1.
+/// the serial probe never reads the fourth slice's GET 1.
 #[tokio::test]
-async fn the_allowance_is_decided_before_any_run_is_read() {
+async fn the_allowance_is_charged_in_slice_order() {
     let cap = ravel_catalog::KEY_INDEX_T1_BYTES;
     let AllowanceCase {
         fx,
@@ -2008,15 +2007,26 @@ async fn the_allowance_is_decided_before_any_run_is_read() {
             )
         })
         .collect();
+    // Per slice, its GET 1 reads, and its run reads with their bytes.
+    let mut gets_1 = [0u64; 4];
+    let mut runs = [0u64; 4];
+    let mut run_bytes = 0u64;
     for (leaf, range) in &ranges {
-        assert_eq!(Some(range), prefix_reads.get(leaf), "{leaf} read {range:?}");
+        let s = slice_of(leaf);
+        if Some(range) == prefix_reads.get(leaf) {
+            gets_1[s] += 1;
+        } else {
+            runs[s] += 1;
+            run_bytes += range.end - range.start;
+        }
     }
-    let read_leaves: BTreeSet<&String> = ranges.iter().map(|(leaf, _)| leaf).collect();
-    assert_eq!(read_leaves.len(), 4, "every slice's GET 1 is read");
-    assert_eq!(figures.leaf_get_requests, 4);
+    assert_eq!(gets_1, [1, 1, 1, 1], "every slice's GET 1 is read once");
+    assert!(runs[0] > 0 && runs[1] > 0, "{runs:?}");
+    assert_eq!(&runs[2..], &[0, 0], "no run of slice 2 or 3 is read");
+    assert_eq!(figures.leaf_get_requests, ranges.len() as u64);
     assert_eq!(
         figures.leaf_wire_bytes,
-        prefixes.iter().map(|p| p.len() as u64).sum::<u64>()
+        prefixes.iter().map(|p| p.len() as u64).sum::<u64>() + run_bytes
     );
     assert_accounting(&run, figures);
 }
@@ -2095,9 +2105,17 @@ async fn the_first_failing_slice_in_order_decides() {
     assert_eq!(figures.leaves_rejected, 1);
     assert_eq!(figures.reservations_refused, 0);
     assert!(routes.iter().all(|r| *r == SegmentRoute::Uncovered));
-    // Every slice's GET 1, and no run.
-    assert_eq!(ended.len(), 8);
-    assert_eq!(figures.leaf_get_requests, 8);
+    // Every slice's GET 1, and runs of slices 0 and 1 only.
+    for s in 2..8 {
+        let suffix = format!("/{s}");
+        assert_eq!(
+            ended.iter().filter(|k| k.ends_with(&suffix)).count(),
+            1,
+            "slice {s}: {ended:?}"
+        );
+    }
+    assert!(ended.len() > 8, "slices 0 and 1 read runs: {ended:?}");
+    assert_eq!(figures.leaf_get_requests, ended.len() as u64);
 }
 
 /// How a [`ScriptReader`] ends a read.
@@ -2398,9 +2416,13 @@ async fn a_breach_after_the_deciding_slice_is_counted() {
         )),
         "slice 3's GET 1 is read: {ended:?}"
     );
-    // GET 1 of every slice, and no run.
-    assert!(ended.iter().all(|(read, _)| read.prefix), "{ended:?}");
-    assert_eq!(figures.leaf_get_requests, 4);
+    // GET 1 of every slice, and runs of slice 0 only.
+    assert_eq!(ended.iter().filter(|(read, _)| read.prefix).count(), 4);
+    assert!(
+        ended.iter().all(|(read, _)| read.prefix || read.slice == 0),
+        "{ended:?}"
+    );
+    assert_eq!(figures.leaf_get_requests, ended.len() as u64);
 }
 
 /// Run reads that complete in reverse issue order, across slices, are still
@@ -2591,10 +2613,8 @@ async fn a_slices_get_1_bytes_live_until_the_slice_finishes() {
     assert_eq!(figures.parts_covered, 1);
     assert_eq!(routes, sliced_routes(&fx, &query));
     let live_at_run = std::mem::take(&mut *reader.live_at_run.lock().expect("live"));
-    assert_eq!(live_at_run.first(), Some(&24), "{live_at_run:?}");
-    assert!(
-        live_at_run.last().is_some_and(|&last| last < 24),
-        "{live_at_run:?}"
-    );
+    assert!(live_at_run.len() > 24, "{} runs", live_at_run.len());
+    assert_eq!(live_at_run.first(), Some(&24));
+    assert!(live_at_run.last().is_some_and(|&last| last < 24));
     assert_eq!(reader.live.load(Ordering::SeqCst), 0);
 }
