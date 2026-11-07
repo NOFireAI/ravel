@@ -16347,7 +16347,7 @@ pub(crate) mod tests {
         };
         let uncapped = recording_store();
         let records = publish_label_fixture(uncapped.as_ref()).await;
-        let catalog = Catalog::new(uncapped.clone(), cfg.clone()).expect("catalog");
+        let catalog = Catalog::new(uncapped.clone(), cfg).expect("catalog");
         fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
         let head = read_signal_head(uncapped.as_ref(), Signal::Metrics).await;
         let sizes: Vec<u64> = head.parts[0].key_index.iter().map(|l| l.size).collect();
