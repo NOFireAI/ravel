@@ -7082,7 +7082,7 @@ mod tests {
                                         state ^= state << 13;
                                         state ^= state >> 7;
                                         state ^= state << 17;
-                                        Some(state % 3 != 0)
+                                        Some(!state.is_multiple_of(3))
                                     })
                                     .collect();
                                 filter_record_batch(whole, &keep).expect("filter")
