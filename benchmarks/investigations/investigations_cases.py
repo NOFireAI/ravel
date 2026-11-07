@@ -1934,6 +1934,23 @@ class Evaluate(Workdir):
         self.assertEqual(code, 1)
         self.assertIn("wrong_answer logs_tail_request_id/mixed/cold try 0: rows 0 expected 1", res["problems"])
         self.assertEqual(figure(res, "row_13.wrong_answers")["value"], 1)
+        self.assertEqual(figure(res, "row_13.errors")["value"], 0)
+
+    def test_typed_refusal_is_an_error_not_a_wrong_answer(self):
+        # Box C (#3918): eight HTTP 422 budget refusals read as eight wrong
+        # answers with no row differing from the oracle. A refusal still
+        # fails the run, as an error, and leaves wrong_answers alone.
+        c = next(c for c in self.select("logs_tail_request_id", "mixed") if c["try"] == 0)
+        c["outcome"], c["http_status"] = "error", 422
+        c["error"] = "query memory budget exhausted"
+        self.save_calls()
+        code, res, _ = self.go(BANDS)
+        self.assertEqual(code, 1)
+        self.assertIn("error logs_tail_request_id/mixed/cold try 0: outcome 'error' HTTP 422", res["problems"])
+        self.assertEqual(figure(res, "row_13.wrong_answers")["value"], 0)
+        self.assertEqual(figure(res, "row_13.wrong_answers")["verdict"], "pass")
+        f = figure(res, "row_13.errors")
+        self.assertEqual((f["value"], f["verdict"]), (1, "miss"))
 
     # --- in-flight overlap, refusals, the 1,001-key control -----------------
 

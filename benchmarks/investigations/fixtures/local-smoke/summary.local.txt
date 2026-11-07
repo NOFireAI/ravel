@@ -135,6 +135,7 @@ row_11.logs_request_control_1001             refused-by-g                 refuse
 row_12.gets_growth_10x                       not-run                      not-run  (scales [10, 100] not in run.toml scales)
 row_12.gets_growth_100x                      not-run                      not-run  (scales [10, 100] not in run.toml scales)
 row_13.wrong_answers                         value                     0  pass
+row_13.errors                                value                     0  pass
 row_13.mixed_rows_exact                      value                     1  pass
 row_13.compaction_in_flight_rows_exact       value                     1  pass
 row_13.compaction_done_rows_exact            value                     1  pass

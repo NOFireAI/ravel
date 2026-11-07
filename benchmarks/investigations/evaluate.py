@@ -1617,7 +1617,9 @@ def main(argv):
 
     def matrix(metric, state):
         if metric == "matrix.wrong_answers":
-            return "value", len(calls.wrong) + len(calls.errors), ""
+            return "value", len(calls.wrong), ""
+        if metric == "matrix.errors":
+            return "value", len(calls.errors), ""
         if metric == "matrix.negative_controls":
             return "not-run", None, "mutant controls not implemented"
         groups = {k: [c for v in t.values() for c in v] for k, t in sorted(calls.groups.items()) if k[1] == state}
