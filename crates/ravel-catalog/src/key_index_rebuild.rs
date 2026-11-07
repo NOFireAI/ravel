@@ -129,6 +129,9 @@ pub struct KeyIndexRebuildReport {
     /// LIST requests of the pending metrics erasure listing: one page per
     /// request, issued only on metrics with at least one unindexed part.
     pub erasure_list_requests: u64,
+    /// GET requests of the same listing: one per pending request's `.dreq`
+    /// object it read.
+    pub erasure_get_requests: u64,
     /// Batches that reached their publish step.
     pub attempt_count: u64,
     pub attempts: Vec<KeyIndexRebuildAttempt>,
@@ -450,6 +453,7 @@ impl Catalog {
         if signal == Signal::Metrics && !targets.is_empty() {
             let gate = self.metrics_label_index_erasure_gate(tenant).await;
             report.erasure_list_requests = gate.list_requests;
+            report.erasure_get_requests = gate.get_requests;
             if gate.gated {
                 report.parts_erasure_gated = report.parts_unindexed;
                 return Ok(report);
@@ -1066,6 +1070,7 @@ mod tests {
                 parts_over_cap: 0,
                 parts_erasure_gated: 0,
                 erasure_list_requests: 0,
+                erasure_get_requests: 0,
                 attempt_count: 1,
                 attempts: vec![KeyIndexRebuildAttempt {
                     parts: 1,
@@ -1454,6 +1459,7 @@ mod tests {
                 parts_over_cap: 0,
                 parts_erasure_gated: 0,
                 erasure_list_requests: 0,
+                erasure_get_requests: 0,
                 attempt_count: 1,
                 attempts: vec![KeyIndexRebuildAttempt {
                     parts: 2,
@@ -1618,6 +1624,7 @@ mod tests {
                     parts_over_cap: 0,
                     parts_erasure_gated: 0,
                     erasure_list_requests: 0,
+                    erasure_get_requests: 0,
                     attempt_count: 1,
                     attempts: vec![KeyIndexRebuildAttempt {
                         parts: 1,
@@ -1916,6 +1923,7 @@ mod tests {
                 parts_over_cap: 0,
                 parts_erasure_gated: 0,
                 erasure_list_requests: 0,
+                erasure_get_requests: 0,
                 attempt_count: 1,
                 attempts: vec![KeyIndexRebuildAttempt {
                     parts: 2,
@@ -2558,6 +2566,7 @@ mod tests {
         assert_eq!(report.fields, vec![METRICS_LABEL_VALUE_FIELD.to_string()]);
         assert_eq!(report.parts_rebuilt, 1, "{report:?}");
         assert_eq!(report.erasure_list_requests, 1, "{report:?}");
+        assert_eq!(report.erasure_get_requests, 0, "{report:?}");
         assert_eq!(rebuilt.lists(), 1, "the pending erasure listing only");
         assert_eq!(report.ranged_gets, 2 * 6, "{report:?}");
         assert_eq!(rebuilt.data_ranged_gets().len(), 2 * 6);
@@ -2587,7 +2596,8 @@ mod tests {
 
     /// A pending metrics erasure request ends the rebuild before any part is
     /// read: no data object GET, no PUT, HEAD unchanged, the unindexed part
-    /// counted as gated and the one LIST counted.
+    /// counted as gated, and the one LIST and the one GET of the request's
+    /// `.dreq` object counted.
     #[tokio::test]
     async fn a_pending_erasure_request_gates_the_metrics_rebuild() {
         let store = recording_store();
@@ -2605,6 +2615,13 @@ mod tests {
         assert_eq!(report.parts_unindexed, 1, "{report:?}");
         assert_eq!(report.parts_erasure_gated, 1, "{report:?}");
         assert_eq!(report.erasure_list_requests, 1, "{report:?}");
+        assert_eq!(report.erasure_get_requests, 1, "{report:?}");
+        let dreq_gets = store
+            .gets()
+            .into_iter()
+            .filter(|(key, _, _)| key.ends_with(".dreq"))
+            .count();
+        assert_eq!(dreq_gets, 1, "the one pending request's object");
         assert_eq!(report.parts_rebuilt, 0, "{report:?}");
         assert_eq!(report.attempt_count, 0, "{report:?}");
         assert_eq!(store.lists(), 1);

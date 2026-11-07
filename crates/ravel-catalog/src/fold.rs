@@ -327,16 +327,17 @@ pub struct FoldReport {
     /// part's built leaves are kept for the whole fold, so a HEAD CAS attempt
     /// after a lost one that re-encodes the same part issues none for it.
     /// Also counted in `get_requests`. For metrics the section is LABEL_DICT,
-    /// and an entry whose object the postings build already fetched whole
-    /// is read from those bytes with no GET. Zero when
+    /// and an entry whose object the postings build fetched whole and held
+    /// within `key_index_build_max_pairs` is read from those bytes with no
+    /// GET. Zero when
     /// [`CatalogConfig::build_key_index_leaves`](crate::CatalogConfig::build_key_index_leaves)
     /// is off, for metrics when
     /// [`CatalogConfig::metrics_label_index`](crate::CatalogConfig::metrics_label_index)
     /// is off, and for a logs tenant that declares no key-index column and
     /// leaves `index_trace_id` off.
     pub key_index_ranged_gets: u64,
-    /// Bytes those GETs returned (footer suffixes plus KEY_IDX sections, as
-    /// transferred; a failed GET adds nothing). The total this fold read,
+    /// Bytes those GETs returned (footer suffixes plus KEY_IDX or, for
+    /// metrics, LABEL_DICT sections, as transferred; a failed GET adds nothing). The total this fold read,
     /// like `key_index_ranged_gets`.
     pub key_index_bytes_read: u64,
     /// `.kidx` leaves the published HEAD names for the parts the publishing
@@ -1352,7 +1353,9 @@ impl HeldLabelDicts {
     /// for.
     fn wants(&self, ordinal: usize) -> bool {
         let i = self.wanted.partition_point(|range| range.end <= ordinal);
-        self.wanted.get(i).is_some_and(|range| range.contains(&ordinal))
+        self.wanted
+            .get(i)
+            .is_some_and(|range| range.contains(&ordinal))
     }
 
     /// Holds entry `ordinal`'s field when the entry is wanted and its pairs
@@ -1410,7 +1413,9 @@ pub(crate) struct HeldPart<'a> {
 
 impl HeldPart<'_> {
     fn get(&self, part_ordinal: u64) -> Option<&EntryKeyIndex> {
-        let ordinal = usize::try_from(part_ordinal).ok()?.checked_add(self.start)?;
+        let ordinal = usize::try_from(part_ordinal)
+            .ok()?
+            .checked_add(self.start)?;
         self.held.by_ordinal.get(&ordinal).map(|(fields, _)| fields)
     }
 }
@@ -4077,13 +4082,13 @@ impl Catalog {
                 HashMap::new()
             };
 
-            // A metrics leaf build takes the postings build first, so every
-            // entry it fetches whole has its LABEL_DICT read from those bytes
-            // and the leaf build issues no GET for it. Other folds build the
-            // postings after the parts, as below.
-            // Only parts this attempt builds a leaf for hold their entries:
-            // a part reused by reference, or one an earlier attempt already
-            // built, reads nothing.
+            // A metrics leaf build takes the postings build first, so an
+            // entry it fetches whole can have its LABEL_DICT read from those
+            // bytes, and the leaf build issues no GET for an entry held.
+            // Other folds build the postings after the parts, as below. Only
+            // the entries of parts this attempt builds a leaf for are held: a
+            // part reused by reference, or one an earlier attempt already
+            // built, needs none.
             let wanted_spans: Vec<std::ops::Range<usize>> = spans
                 .iter()
                 .zip(&span_encodings)
@@ -4094,10 +4099,8 @@ impl Catalog {
                     (!reused).then_some(span.start..span.end)
                 })
                 .collect();
-            let mut held_label_dicts = HeldLabelDicts::new(
-                wanted_spans,
-                self.config().key_index_build_max_pairs.max(1),
-            );
+            let mut held_label_dicts =
+                HeldLabelDicts::new(wanted_spans, self.config().key_index_build_max_pairs.max(1));
             let early_postings = if signal == Signal::Metrics && key_index_fields.is_some() {
                 Some(
                     self.fold_postings_names(
@@ -16240,7 +16243,10 @@ pub(crate) mod tests {
             .iter()
             .filter(|(key, range, _)| key.ends_with(".rseg") && matches!(range, GetRange::Full))
             .count();
-        assert_eq!(whole, 5, "the reconciled postings build fetches every entry");
+        assert_eq!(
+            whole, 5,
+            "the reconciled postings build fetches every entry"
+        );
         assert_eq!(
             take_held_label_dict_log_for_test(),
             HeldLabelDictLog {
@@ -16421,7 +16427,11 @@ pub(crate) mod tests {
             .map(|(key, range, _)| (key.clone(), *range))
             .collect();
         assert_eq!(data_gets.len(), 2, "{data_gets:?}");
-        assert!(data_gets.iter().all(|(_, range)| matches!(range, GetRange::Full)));
+        assert!(
+            data_gets
+                .iter()
+                .all(|(_, range)| matches!(range, GetRange::Full))
+        );
         assert_eq!(
             take_held_label_dict_log_for_test().held_ordinals,
             vec![0, 1]

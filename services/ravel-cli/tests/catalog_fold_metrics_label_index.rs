@@ -260,4 +260,6 @@ async fn the_metrics_label_index_flag_reaches_the_rebuild() {
     assert_eq!(report.erasure_list_requests, 1, "{report:?}");
     assert_eq!(kidx_objects(&store).await, 1);
     assert!(printed.contains("erasure_list_requests: 1\n"), "{printed}");
+    assert_eq!(report.erasure_get_requests, 0, "{report:?}");
+    assert!(printed.contains("erasure_get_requests: 0\n"), "{printed}");
 }

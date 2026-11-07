@@ -1262,16 +1262,23 @@ for the whole object: a match names the objects holding the string, never
 a block within one. With `metrics_label_index` off (the default) a metrics
 fold builds no leaf whatever `build_key_index_leaves` says, and the
 rebuild refuses metrics (`KeyIndexRebuildError::UnsupportedSignal`). An
-entry whose object the fold already fetched whole for its name postings is
-read from those bytes with no further GET; any other entry costs a footer
-suffix GET of the last `min(8 KiB, object size)` bytes (a second footer
-GET when the footer is longer) and one ranged GET of the LABEL_DICT
-section, counted in `key_index_ranged_gets` and `key_index_bytes_read`. A
+entry whose object the fold fetched whole for its name postings is read
+from those bytes with no further GET, when the fold held them: the postings
+build holds an object's pairs only for the entries of parts the CAS attempt
+builds a leaf for, and only while they fit the held allowance under "Pair
+budget" below. Any other entry costs a footer suffix GET of the last
+`min(8 KiB, object size)` bytes (a second footer GET when the footer is
+longer) and one ranged GET of the LABEL_DICT section in each pass of the
+build, counted in `key_index_ranged_gets` and `key_index_bytes_read`. A
 fold that merges the previous postings forward fetches only the new
-entries' objects; the entries it merges take their pairs from the previous
-tail's `label_value` leaf with no GET, as the incremental tail build below
-describes, and are read by range only when that tail has no such leaf (the
-switch was off on the earlier fold). A
+entries' objects. The entries it merges take their pairs from the previous
+tail's `label_value` leaf with no section GET, as the incremental tail
+build below describes; the carry costs one GET per previous leaf. The
+entries that leaf listed as uncovered are read by range, and every entry
+is read by range when the tail has no such leaf (the switch was off on the
+earlier fold) or the carry is dropped: a previous leaf whose GET fails or
+that does not verify, a section read naming an undeclared field, or a
+previous leaf that verified and then no longer decodes. A
 footer naming another tenant, a missing LABEL_DICT section, or a section
 that fails its crc, decompression or decode leaves the entry in
 `uncovered_entry_ordinals` and the fold succeeds; a failed GET does the
@@ -1281,18 +1288,35 @@ Two limits apply to metrics only. The byte cap: a part whose `label_value`
 leaves would total more than `metrics_label_index_max_ratio_ppm` parts per
 million of its entries' object bytes (default 10,000, which is 1%; rounded
 down) gets no ref for the field, every entry is counted uncovered, and the
-fold report's `metrics_label_index_parts_over_cap` counts the part. The
-erasure gate: before building, the fold lists the tenant's pending metrics
-erasure requests (`t/<tenant>/m/del/`) once
+fold report's `metrics_label_index_parts_over_cap` counts the part. The cap
+is checked at the end of each pass against the slices earlier passes PUT
+plus the pass's own, so a build that crosses it in a later pass has
+already PUT the earlier passes' slices; HEAD names none of them, and the
+catalog sweep removes them as unreferenced (test
+`slices_each_under_the_byte_cap_but_over_it_together_are_uncovered`).
+Checking before any PUT would keep every pass's encoded slices until the
+last pass, which the per-pass memory bound under "Pair budget" rules out.
+The erasure gate: before building, the fold lists the tenant's pending
+metrics erasure requests (`t/<tenant>/m/del/`) once
 (`metrics_label_index_erasure_list_requests`, also in `list_requests`).
 While any request is pending, or when that listing fails, the fold builds
-no metrics leaf, so a leaf never records the key8 of a string being
-erased; every part it re-encodes is published without refs and counted in
-`metrics_label_index_parts_erasure_gated`, and a part carried forward by
-reference keeps the refs it has. `--rebuild-key-index --signal metrics
---metrics-label-index` applies the same cap and the same gate (its report
-carries `parts_over_cap`, `parts_erasure_gated` and
-`erasure_list_requests`; a gated run reads no part and publishes nothing),
+no metrics leaf, so no leaf is built while a request is pending at the
+start of the fold; every part it re-encodes is published without refs and
+counted in `metrics_label_index_parts_erasure_gated`, and a part carried
+forward by reference keeps the refs it has. A request that arrives after
+that listing does not stop the fold's build, so the gate alone does not
+keep the key8 of an erased string out of every leaf; the router prunes
+nothing on metrics while `del/` is non-empty (ADR-3694 decision 2, wired by
+T5; until then no query reads the leaf at all), so no query acts on such a
+leaf until the erasure completes. A part re-encoded while a request was pending
+is published uncovered and stays uncovered while later folds reuse it by
+reference; after the erasure completes, `ravel-cli catalog fold
+--rebuild-key-index --signal metrics --metrics-label-index` attaches its
+leaf. `--rebuild-key-index --signal metrics --metrics-label-index` applies
+the same cap and the same gate (its report carries `parts_over_cap`,
+`parts_erasure_gated`, `erasure_list_requests` and `erasure_get_requests`,
+the GETs of the pending requests' `.dreq` objects; a gated run reads no
+part and publishes nothing),
 reads every entry by range, and writes the leaf a fold with both switches
 on writes for the same part, byte for byte
 (`a_rebuilt_metrics_leaf_is_byte_identical_to_the_folds_leaf`). No query
@@ -1447,10 +1471,28 @@ budget does not bound: the previous tail's leaf bytes as stored, read once
 per fold and kept for the whole build; one decoded frame of one previous
 leaf at a time (a frame is one bucket, near `4 x 2^bucket_bits` bytes for
 keys whose key8 spreads evenly, trace ids, strings and bytes, and up to the
-whole leaf body for I64 keys that share their high bits); the KEY_IDX
-sections in flight, up to `fold_bucket_concurrency`; the encoded leaves of
-one pass until their PUTs; and per-entry bookkeeping. ADR-3692's
+whole leaf body for I64 keys that share their high bits); the KEY_IDX or
+LABEL_DICT sections in flight, up to `fold_bucket_concurrency`; the encoded
+leaves of one pass until their PUTs; and per-entry bookkeeping. ADR-3692's
 amendments to decision 5 list these.
+
+A metrics fold holds one more set of pairs, against an allowance of its
+own: the `label_value` pairs its postings build read from objects it
+fetched whole, held from the postings build until the leaf of the entry's
+part is built, so the leaf build reads them with no GET. That allowance is
+`key_index_build_max_pairs` pairs too, on top of what one pass holds. It is
+charged only for the entries of parts the CAS attempt builds a leaf for: a
+part reused by reference, or one an earlier attempt built, holds nothing.
+An object whose pairs would take the held total past the allowance is not
+held, and the leaf build reads it by range in every pass, as it does an
+object the postings build did not fetch. A part's held pairs are released
+once its leaf is built. Tests
+`a_reconciled_metrics_fold_holds_no_pairs_for_reused_parts` (a reconciled
+fold that fetches all five entries whole and reuses four of its five parts
+holds only the tail's 9 pairs) and
+`held_label_dict_pairs_stay_within_key_index_build_max_pairs` (at a budget
+of 20, two of six objects held, 18 pairs at the peak, the other four read
+by range in each pass, 0 held after the build) pin it.
 The server sets the budget with `--fold-key-index-build-max-pairs` and
 `ravel-cli catalog fold` with `--key-index-build-max-pairs`, each refused
 without the leaf build flag and at 0; the `--rebuild-key-index` repair

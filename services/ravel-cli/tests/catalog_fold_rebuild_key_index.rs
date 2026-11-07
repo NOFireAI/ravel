@@ -234,6 +234,7 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
          parts_over_cap: 0\n\
          parts_erasure_gated: 0\n\
          erasure_list_requests: 0\n\
+         erasure_get_requests: 0\n\
          attempt_count: 1\n\
          attempt 1: parts=1 part_gets=1 ranged_gets=2 leaf_puts=1 head_cas_tries=1 \
          parts_published=1\n",

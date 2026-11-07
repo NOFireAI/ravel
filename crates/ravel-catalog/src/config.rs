@@ -717,17 +717,33 @@ pub struct CatalogConfig {
     /// allocator, jemalloc, charges a one- or two-block `Vec` is its smallest
     /// size class and is not pinned here. The pass sorts its pairs in the
     /// heap buffer, copying none (pinned by
-    /// `a_pass_sorts_its_pairs_in_the_heap_buffer`). Outside the budget: the
-    /// previous tail's leaf bytes as stored, read once per fold and kept for
-    /// the whole build; one decoded frame of one previous leaf at a time; the
-    /// KEY_IDX sections in flight, up to `fold_bucket_concurrency`; the
-    /// pass's encoded leaves until their PUTs; and per-entry bookkeeping.
-    /// Default [`DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`]; 0 is read as 1.
+    /// `a_pass_sorts_its_pairs_in_the_heap_buffer`).
+    ///
+    /// A metrics fold also holds, from its postings build, the LABEL_DICT
+    /// pairs of objects it fetched whole, against a second allowance of the
+    /// same `max_pairs`, on top of the pass's pairs: only for the entries of
+    /// parts the CAS attempt builds a leaf for, never for a part reused by
+    /// reference or already built by an earlier attempt, and each part's
+    /// pairs are released once its leaf is built. An object whose pairs would
+    /// take the held total past `max_pairs` is not held and its leaf build
+    /// reads it by range (pinned by
+    /// `held_label_dict_pairs_stay_within_key_index_build_max_pairs` and
+    /// `a_reconciled_metrics_fold_holds_no_pairs_for_reused_parts`).
+    ///
+    /// Outside both: the previous tail's leaf bytes as stored, read once per
+    /// fold and kept for the whole build; one decoded frame of one previous
+    /// leaf at a time; the KEY_IDX or LABEL_DICT sections in flight, up to
+    /// `fold_bucket_concurrency`; the pass's encoded leaves until their PUTs;
+    /// and per-entry bookkeeping. Default
+    /// [`DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`]; 0 is read as 1.
     pub key_index_build_max_pairs: u64,
     /// ADR-3694 decision 2's switch: whether the fold also builds the metrics
     /// `label_value` key-index leaf, keyed by key8 of every LABEL_DICT string
-    /// (label names and values) of each metrics object, read by one ranged
-    /// GET of that section or from the object bytes the fold already holds.
+    /// (label names and values) of each metrics object, read by range (a
+    /// footer GET or two, then one GET of that section), from the object
+    /// bytes the fold holds from its postings build (see
+    /// [`Self::key_index_build_max_pairs`]), or carried from the previous
+    /// tail's leaf.
     /// Takes effect only together with [`Self::build_key_index_leaves`]; with
     /// either off the fold reads no LABEL_DICT and writes no metrics leaf.
     /// While the tenant has a pending metrics erasure request the fold

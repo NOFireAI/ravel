@@ -2691,8 +2691,12 @@ enum CatalogCommand {
         #[arg(long)]
         key_index_leaves: bool,
         /// With `--key-index-leaves`, the most (entry, key8) pairs, read and
-        /// carried from the previous tail's leaves, the leaf build holds for
-        /// one part at a time (ADR-3692 decision 5). Each field the build
+        /// carried from the previous tail's leaves, one pass of a part's leaf
+        /// build holds (ADR-3692 decision 5). With `--metrics-label-index` the
+        /// fold also holds up to N more: the LABEL_DICT pairs of objects its
+        /// name postings fetched whole, only for parts it builds a leaf for,
+        /// each part's released once its leaf is built; an object over that
+        /// allowance is read by range instead. Each field the build
         /// indexes gets a share, max(1, N / fields). A field over its share
         /// is built in passes over disjoint key8 ranges, each pass holding the
         /// whole key8s that fit, re-reading the sections it needs and closing
@@ -2710,10 +2714,15 @@ enum CatalogCommand {
         /// metrics`, build the metrics `label_value` leaf (ADR-3694 decision
         /// 2): every label name and value in each object's LABEL_DICT, keyed
         /// by key8_str at block 0, so a probe names the objects holding a
-        /// string. Each entry costs a footer suffix GET (a second footer GET
-        /// when the footer is larger than the 8 KiB suffix) and one LABEL_DICT
-        /// range GET, none when the fold already holds the object whole for
-        /// its name postings. A part whose leaves would pass 1% of its
+        /// string. Each entry read by range costs a footer suffix GET (a
+        /// second footer GET when the footer is larger than the 8 KiB suffix)
+        /// and one LABEL_DICT range GET, in every pass of the fold's build and
+        /// once in a rebuild. A fold reads none for an entry whose object its
+        /// name postings fetched whole and it holds within the
+        /// `--key-index-build-max-pairs` allowance, and none for an entry the
+        /// re-encoded tail carries from the previous tail's leaf, which costs
+        /// one GET per previous leaf; an entry that leaf left uncovered is
+        /// read by range. A part whose leaves would pass 1% of its
         /// objects' bytes gets no leaf (`metrics_label_index_parts_over_cap`).
         /// While any metrics erasure request is pending, no metrics leaf is
         /// built (`metrics_label_index_parts_erasure_gated`). Off by default;

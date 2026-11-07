@@ -772,6 +772,10 @@ pub fn render_rebuild_report(
         "erasure_list_requests: {}\n",
         report.erasure_list_requests
     ));
+    out.push_str(&format!(
+        "erasure_get_requests: {}\n",
+        report.erasure_get_requests
+    ));
     out.push_str(&format!("attempt_count: {}\n", report.attempt_count));
     for (i, attempt) in report.attempts.iter().enumerate() {
         out.push_str(&format!(
