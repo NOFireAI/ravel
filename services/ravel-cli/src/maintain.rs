@@ -17,8 +17,9 @@ use ravel_maintain::{
     CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, GcConfigValues,
     L1PartMemoryTargetSource, LegalHoldCheck, MergeMemoryTracker, MigrateBudget, MigrationPath,
     NotMigratedBucket, NotMigratedReason, PublishOutcome, ReencodeBlockedBucket,
-    ReencodeBlockedReason, ResolvedL1PartMemoryTarget, SweepReport, UnwritableBucket, Verification,
-    census_family, compact_bucket_claimed, count_below_target, migrate_family, sweep_shard,
+    ReencodeBlockedReason, RequestLedger, ResolvedL1PartMemoryTarget, SweepReport,
+    UnwritableBucket, Verification, census_family, compact_bucket_claimed, count_below_target,
+    migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -215,6 +216,67 @@ pub enum CompactorKnobError {
     ZeroMaxL1PartBytes,
     #[error("--compaction-zstd-level: {0}")]
     InvalidRlogZstdLevel(#[from] ravel_maintain::RlogZstdLevelError),
+    #[error("--scratch-max-bytes has no effect without --scratch-dir")]
+    ScratchMaxBytesWithoutDir,
+    #[error("--level1-workers has no effect without --scratch-dir")]
+    Level1WorkersWithoutDir,
+    #[error("--scratch-max-bytes must be greater than 0: a zero cap refuses every two-level merge")]
+    ZeroScratchMaxBytes,
+    #[error("--level1-workers must be greater than 0")]
+    ZeroLevel1Workers,
+}
+
+/// The two-level RLOG merge's local settings (ADR-3853 D2 and D4) one
+/// `compact-bucket` / `compact-tenant` invocation runs with: `--scratch-dir`,
+/// `--scratch-max-bytes` and `--level1-workers`, which
+/// [`build_compactor_config`] places in [`CompactorConfig::scratch_dir`],
+/// [`CompactorConfig::scratch_max_bytes`] and
+/// [`CompactorConfig::level1_workers`]. The default sets none of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScratchOptions {
+    pub scratch_dir: Option<std::path::PathBuf>,
+    pub scratch_max_bytes: Option<u64>,
+    pub level1_workers: Option<usize>,
+    /// Replaces [`CompactorConfig::merge_resident_ceiling_bytes`] on the
+    /// `compact-bucket` path when set; `compact-tenant` sets each bucket's own
+    /// ceiling ([`per_bucket_config`]). No flag sets it; a test does, to route
+    /// a small bucket through the two-level merge.
+    pub merge_resident_ceiling_bytes: Option<u64>,
+}
+
+impl ScratchOptions {
+    /// Refuse what ravel-server refuses at startup for its `--maintain-*`
+    /// spellings: either of the cap and the worker count without a directory,
+    /// a zero cap, and zero workers.
+    pub fn validate(&self) -> Result<(), CompactorKnobError> {
+        if self.scratch_dir.is_none() {
+            if self.scratch_max_bytes.is_some() {
+                return Err(CompactorKnobError::ScratchMaxBytesWithoutDir);
+            }
+            if self.level1_workers.is_some() {
+                return Err(CompactorKnobError::Level1WorkersWithoutDir);
+            }
+        }
+        if self.scratch_max_bytes == Some(0) {
+            return Err(CompactorKnobError::ZeroScratchMaxBytes);
+        }
+        if self.level1_workers == Some(0) {
+            return Err(CompactorKnobError::ZeroLevel1Workers);
+        }
+        Ok(())
+    }
+}
+
+/// A two-level unit's figures from its request ledger, for the report line;
+/// `None` for a single-level merge or a config with no ledger.
+fn two_level_figures(config: &CompactorConfig) -> Option<String> {
+    let report = config.request_ledger.as_ref()?.report();
+    (report.level1_groups > 0).then(|| {
+        format!(
+            "level1_groups={} level1_workers={}",
+            report.level1_groups, report.level1_workers
+        )
+    })
 }
 
 /// The compactor config a `compact-bucket` / `compact-tenant` invocation runs
@@ -265,6 +327,11 @@ pub enum CompactorKnobError {
 /// cap together; without it the RLOG cap follows the derived target.
 /// The resolution is returned beside the config so the caller can report where
 /// the value came from.
+///
+/// `scratch` is validated by [`ScratchOptions::validate`] before anything else
+/// and placed in the config. With a scratch directory a fresh [`RequestLedger`]
+/// is installed too, so the report can name a two-level unit's level-1 groups
+/// and workers, and `ravel_maintain` logs the run's requests by phase to stderr.
 #[allow(clippy::too_many_arguments)]
 pub fn build_compactor_config(
     dry_run: bool,
@@ -276,10 +343,17 @@ pub fn build_compactor_config(
     host_memory_total_bytes: Option<u64>,
     concurrent_merges: usize,
     claim_lease_duration: Duration,
+    scratch: &ScratchOptions,
 ) -> Result<(CompactorConfig, ResolvedL1PartMemoryTarget), CompactorKnobError> {
+    scratch.validate()?;
     let mut config = CompactorConfig {
         dry_run,
         merge_memory_tracker: Some(MergeMemoryTracker::new()),
+        request_ledger: scratch.scratch_dir.as_ref().map(|_| RequestLedger::new()),
+        scratch_dir: scratch.scratch_dir.clone(),
+        scratch_max_bytes: scratch.scratch_max_bytes,
+        level1_workers: scratch.level1_workers,
+        merge_resident_ceiling_bytes: scratch.merge_resident_ceiling_bytes,
         // ADR-1746 decision 4: refuse to write below a bucket's recorded
         // format floor, the default `migrate_family` also falls back to.
         format_floor: Some(ravel_ingest::FormatFloorPolicy::default()),
@@ -407,6 +481,7 @@ pub async fn compact(
         None,
         rlog_zstd_level,
         claims,
+        &ScratchOptions::default(),
     )
     .await
 }
@@ -430,6 +505,7 @@ pub async fn compact_with_part_split_targets(
     max_l1_part_bytes: Option<u64>,
     rlog_zstd_level: Option<i32>,
     claims: &ClaimOptions,
+    scratch: &ScratchOptions,
 ) -> anyhow::Result<()> {
     let mut out = std::io::stdout();
     compact_with_part_split_targets_to(
@@ -447,6 +523,7 @@ pub async fn compact_with_part_split_targets(
         rlog_zstd_level,
         wall_clock()?,
         claims,
+        scratch,
     )
     .await
 }
@@ -470,6 +547,7 @@ pub async fn compact_with_part_split_targets_to(
     rlog_zstd_level: Option<i32>,
     clock: FixedClock,
     claims: &ClaimOptions,
+    scratch: &ScratchOptions,
 ) -> anyhow::Result<()> {
     compact_to(
         out,
@@ -487,6 +565,7 @@ pub async fn compact_with_part_split_targets_to(
         ravel_maintain::detect_host_memory_total_bytes(),
         clock,
         claims,
+        scratch,
     )
     .await
 }
@@ -512,6 +591,7 @@ pub async fn compact_to(
     host_memory_total_bytes: Option<u64>,
     clock: FixedClock,
     claims: &ClaimOptions,
+    scratch: &ScratchOptions,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
     let bucket = Bucket::new(tenant_hash, signal.to_signal(), shard, hour);
@@ -525,6 +605,7 @@ pub async fn compact_to(
         host_memory_total_bytes,
         1,
         claim_lease_for_derivation(claims),
+        scratch,
     )?;
     if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
         eprintln!("{note}");
@@ -636,6 +717,9 @@ pub async fn compact_to(
         CompactionOutcome::Compacted { parts, publish } => {
             let verb = if dry_run { "would write" } else { "wrote" };
             writeln!(out, "outcome: Compacted")?;
+            if let Some(figures) = two_level_figures(&config) {
+                writeln!(out, "two_level: {figures}")?;
+            }
             writeln!(out, "parts ({verb}): {parts}")?;
             match publish {
                 PublishOutcome::Published => writeln!(out, "publish: Published")?,
@@ -906,6 +990,7 @@ pub async fn compact_tenant(
     rlog_zstd_level: Option<i32>,
     now_ns: i64,
     claims: &ClaimOptions,
+    scratch: &ScratchOptions,
 ) -> anyhow::Result<CompactTenantReport> {
     let mut out = std::io::stdout();
     compact_tenant_on_detected_memory(
@@ -926,6 +1011,7 @@ pub async fn compact_tenant(
         rlog_zstd_level,
         now_ns,
         claims,
+        scratch,
     )
     .await
 }
@@ -952,6 +1038,7 @@ pub async fn compact_tenant_on_detected_memory(
     rlog_zstd_level: Option<i32>,
     now_ns: i64,
     claims: &ClaimOptions,
+    scratch: &ScratchOptions,
 ) -> anyhow::Result<CompactTenantReport> {
     compact_tenant_to(
         out,
@@ -972,6 +1059,7 @@ pub async fn compact_tenant_on_detected_memory(
         ravel_maintain::detect_host_memory_total_bytes(),
         now_ns,
         claims,
+        scratch,
     )
     .await
 }
@@ -1003,6 +1091,7 @@ pub async fn compact_tenant_to(
     host_memory_total_bytes: Option<u64>,
     now_ns: i64,
     claims: &ClaimOptions,
+    scratch: &ScratchOptions,
 ) -> anyhow::Result<CompactTenantReport> {
     let started = std::time::Instant::now();
     let tenant_hash = TenantId::new(tenant).hash();
@@ -1028,6 +1117,7 @@ pub async fn compact_tenant_to(
         host_memory_total_bytes,
         bucket_concurrency,
         claim_lease_for_derivation(claims),
+        scratch,
     )?;
     let claims_line = install_claims(&mut config, dry_run, claims);
     if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
@@ -1198,11 +1288,14 @@ pub async fn compact_tenant_to(
 /// at N > 1. N=1 is the full budget either way. A `concurrency` of zero is
 /// clamped to one (callers refuse it upstream with a typed error). The
 /// bucket's RLOG resident ceiling (ADR-3819 D1) is that per-bucket budget,
-/// with no second division: the budget already is this bucket's share. Every
-/// other config field is `base`, copied verbatim.
+/// with no second division: the budget already is this bucket's share. A
+/// `base` carrying a [`RequestLedger`] gives each bucket a fresh one, for the
+/// same reason as the tracker. Every other config field is `base`, copied
+/// verbatim.
 pub fn per_bucket_config(base: &CompactorConfig, concurrency: usize) -> CompactorConfig {
     let mut config = base.clone();
     config.merge_memory_tracker = Some(MergeMemoryTracker::new());
+    config.request_ledger = base.request_ledger.as_ref().map(|_| RequestLedger::new());
     if base.merge_cursor_budget_bytes == ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES {
         config.merge_cursor_budget_bytes =
             base.merge_cursor_budget_bytes / (concurrency.max(1) as u64);
@@ -1239,8 +1332,12 @@ fn emit_bucket_outcome(
     failure_details: &mut Vec<String>,
     shard: u32,
     hour: u32,
-    outcome: Result<ClaimedCompaction, String>,
+    outcome: BucketResult,
 ) -> anyhow::Result<()> {
+    let (outcome, two_level) = match outcome {
+        Ok((outcome, two_level)) => (Ok(outcome), two_level),
+        Err(err) => (Err(err), None),
+    };
     let outcome = match outcome {
         Ok(ClaimedCompaction::Ran(outcome)) => Ok(outcome),
         Ok(ClaimedCompaction::SkippedClaimed(skip)) => {
@@ -1351,9 +1448,10 @@ fn emit_bucket_outcome(
                 }
                 PublishOutcome::Abandoned => "Abandoned".to_string(),
             };
+            let two_level = two_level.map_or_else(String::new, |figures| format!(" {figures}"));
             writeln!(
                 out,
-                "shard={shard} hour={hour} outcome=Compacted parts={parts} publish={publish}"
+                "shard={shard} hour={hour} outcome=Compacted parts={parts} publish={publish}{two_level}"
             )?;
         }
         Err(err) => {
@@ -1368,10 +1466,13 @@ fn emit_bucket_outcome(
     Ok(())
 }
 
+/// One bucket's result: its outcome beside its two-level figures
+/// ([`two_level_figures`]), or its error.
+type BucketResult = Result<(ClaimedCompaction, Option<String>), String>;
 /// One bucket's walk-order slot: `(shard, hour, outcome)`.
-type BucketSlot = (u32, u32, Result<ClaimedCompaction, String>);
+type BucketSlot = (u32, u32, BucketResult);
 /// A spawned bucket task's return value: its dispatch index plus its slot.
-type BucketTask = (usize, u32, u32, Result<ClaimedCompaction, String>);
+type BucketTask = (usize, u32, u32, BucketResult);
 
 /// Compact every bucket in `work` (already in deterministic walk order) with up
 /// to `concurrency` buckets in flight at once, invoking `on_ready` for each
@@ -1407,7 +1508,7 @@ async fn run_bucket_walk<F>(
     mut on_ready: F,
 ) -> anyhow::Result<()>
 where
-    F: FnMut(u32, u32, Result<ClaimedCompaction, String>) -> anyhow::Result<()>,
+    F: FnMut(u32, u32, BucketResult) -> anyhow::Result<()>,
 {
     // `concurrency >= 1` is guaranteed by the caller's ZeroBucketConcurrency
     // check.
@@ -1429,6 +1530,7 @@ where
             let bucket = Bucket::new(tenant_hash, signal, shard, hour);
             let result = compact_bucket_claimed(store.as_ref(), &clock, &config, &bucket)
                 .await
+                .map(|outcome| (outcome, two_level_figures(&config)))
                 .map_err(|err| err.to_string());
             (idx, shard, hour, result)
         });
@@ -3495,6 +3597,7 @@ mod tests {
             Some(32 * 1024 * 1024 * 1024),
             1,
             Duration::from_secs(300),
+            &ScratchOptions::default(),
         )
         .expect("build");
         assert_eq!(config.merge_resident_ceiling_bytes, None);

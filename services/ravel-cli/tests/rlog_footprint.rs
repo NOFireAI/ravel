@@ -371,6 +371,7 @@ async fn tenant_footprint_reads_only_directories() {
         None,
         BASE_NS + 2 * NS_PER_HOUR,
         &ClaimOptions::fresh(),
+        &ravel_cli::maintain::ScratchOptions::default(),
     )
     .await
     .expect("compact");
