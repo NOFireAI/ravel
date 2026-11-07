@@ -895,6 +895,11 @@ answered, but three properties of the decision above cost the rest:
      and the retry runs with it.
    - A ceiling under 16 GiB keeps one slot, so one spilling statement at a
      time, as before.
+   - A statement that keeps the per-statement decision (Flight SQL, until
+     it has the retry) reserves one share the same way, at planning. When
+     no share of at least the minimum remains, it runs with spill disabled.
+     One plan-time statement therefore never takes the whole ceiling from
+     the retries.
 5. **Spill is on by default.** With no `--sql-spill off`, no environment
    pair and no `--cache-dir`, spill resolves as item 3 of the cache-dir
    spill default amendment does, with two differences: the process's
