@@ -2225,7 +2225,9 @@ struct ScratchArgs {
     /// process holds is refused as ScratchLocked. Size it at about 1.3 times
     /// the input bytes of the largest bucket it merges: a unit is admitted
     /// only when that much is free, and is otherwise refused as
-    /// ScratchHeadroom. Omitted, a bucket whose cursor merge would decode more
+    /// ScratchHeadroom. compact-tenant merges --bucket-concurrency buckets
+    /// through the one directory at once, so size it there at about 1.3 times
+    /// the summed input bytes of that many of the largest buckets. Omitted, a bucket whose cursor merge would decode more
     /// than 16 rows per input record is refused as GeometryUnsupported.
     #[arg(long, value_name = "PATH")]
     scratch_dir: Option<std::path::PathBuf>,
@@ -2241,9 +2243,11 @@ struct ScratchArgs {
     /// The level-1 worker count of a two-level RLOG merge (ADR-3853 D4): how
     /// many level-1 groups of one bucket merge at once, each under its share
     /// of the unit's memory ceiling. Omitted, it is derived per bucket from
-    /// the unit's share of the usable cores and the largest count whose
-    /// groups still fit. Zero, or a value without --scratch-dir, is refused
-    /// before any store call.
+    /// the usable cores and the largest count whose groups still fit. The
+    /// derivation treats each bucket as if it had every usable core, so with
+    /// compact-tenant --bucket-concurrency above 1, set it to the cores per
+    /// bucket. Zero, or a value without --scratch-dir, is refused before any
+    /// store call.
     #[arg(long = "level1-workers", value_name = "N")]
     level1_workers: Option<usize>,
 }
