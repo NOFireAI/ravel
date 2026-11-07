@@ -7882,16 +7882,19 @@ mod tests {
         })
         .await;
         assert_eq!(whole.batches.len(), 1, "a floor above the part is one batch");
-        let page_bytes = whole.batches[0].batch_reserved;
-        let regions = whole.batches[0].segment_reserved;
-        // The open and catalog regions plus the decoded catalog's reservation.
-        let catalog = whole.batches[0].budget_reserved - page_bytes;
-        assert!(catalog > regions, "the decoded catalog is reserved too");
-        assert_eq!(
-            whole.scan_bytes(),
-            page_bytes,
-            "every selected page is fetched by the one batch"
+        let one = &whole.batches[0];
+        assert!(
+            one.batch_owned <= one.batch_reserved,
+            "holds {} B against a reservation of {} B",
+            one.batch_owned,
+            one.batch_reserved
         );
+        let page_bytes = whole.scan_bytes();
+        assert_eq!(one.batch_reserved, page_bytes, "the one batch reserves every page");
+        let regions = one.segment_reserved;
+        // The open and catalog regions plus the decoded catalog's reservation.
+        let catalog = one.budget_reserved - page_bytes;
+        assert!(catalog > regions, "the decoded catalog is reserved too");
         let limit = page_bytes + catalog;
         let batch_bytes = limit / (2 * BATCH_PERMITS as u64);
         assert!(
@@ -8004,8 +8007,8 @@ mod tests {
             ranged_l1(f).with_fetch_batch_floor(u64::MAX)
         })
         .await;
-        let page_bytes = whole.batches[0].batch_reserved;
-        let catalog = whole.batches[0].budget_reserved - page_bytes;
+        let page_bytes = whole.scan_bytes();
+        let catalog = whole.batches[0].budget_reserved - whole.batches[0].batch_reserved;
         let floor = page_bytes / 8;
         let fits = batch_run(&bytes, tenant_hash, &seg_ref, &[], |f| {
             ranged_l1(f)
