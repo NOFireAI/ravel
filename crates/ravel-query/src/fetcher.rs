@@ -4544,8 +4544,7 @@ impl crate::key_index_route::LeafRangeReader for MetricLeafRangeReader<'_> {
         leaf: &'b ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef,
         range: std::ops::Range<u64>,
         accounting: &'b QueryAccounting,
-    ) -> futures::future::BoxFuture<'b, Result<Bytes, crate::key_index_route::LeafReadError>>
-    {
+    ) -> futures::future::BoxFuture<'b, Result<Bytes, crate::key_index_route::LeafReadError>> {
         Box::pin(async move {
             let content_hash: [u8; 32] = leaf
                 .blake3
@@ -4678,7 +4677,10 @@ impl SegmentFetcher {
         // The returned bytes share the cache entry's allocation, which the
         // cache's own ledger covers too (ADR-1170 decision 2).
         reservation.mark_handed_off();
-        Ok(crate::reserved_bytes::attach_reservation(bytes, reservation))
+        Ok(crate::reserved_bytes::attach_reservation(
+            bytes,
+            reservation,
+        ))
     }
 }
 

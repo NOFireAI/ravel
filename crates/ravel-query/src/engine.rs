@@ -10,9 +10,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
 use promql_parser::parser::{Expr, Offset};
-use ravel_catalog::{
-    Catalog, SegmentOrigin, SegmentRef, ShardGeneration, Snapshot, SnapshotParts,
-};
+use ravel_catalog::{Catalog, SegmentOrigin, SegmentRef, ShardGeneration, Snapshot, SnapshotParts};
 use ravel_cpu_gate::{JobSize, ReadGate, ReadSite};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
@@ -1415,7 +1413,7 @@ impl QueryEngine {
                 false, // names_only: discovery runs no dictionary probe.
                 1,
                 1,
-                true, // metadata_only: discovery never fetches pages.
+                true,  // metadata_only: discovery never fetches pages.
                 false, // with_parts: discovery routes nothing.
                 attempt,
             )
@@ -1506,7 +1504,7 @@ impl QueryEngine {
                 false, // names_only: log discovery runs no dictionary probe.
                 1,
                 1,
-                true, // metadata_only: log discovery never fetches pages.
+                true,  // metadata_only: log discovery never fetches pages.
                 false, // with_parts: log discovery routes nothing.
                 attempt,
             )
@@ -2159,80 +2157,79 @@ impl QueryEngine {
                         .map(|keep| snapshot_subset(&snapshot, keep))
                 })
                 .collect();
-            let results: Vec<Result<PerPlan, QueryError>> = stream::iter(
-                distinct_plans.into_iter().zip(plan_snapshots),
-            )
-                .map(|(plan, routed)| {
-                    let snapshot = &snapshot;
-                    let accounting = &accounting;
-                    let pushdown_target = &pushdown_target;
-                    let scalar_fold = &scalar_fold;
-                    async move {
-                        let snapshot = routed.as_ref().unwrap_or(snapshot);
-                        // ADR-0103 live: send the partial-aggregate request for
-                        // the one eligible matcher set, `None` for every other
-                        // plan. A worker that receives `Some(..)` returns ONLY
-                        // the partial, no raw runs (`service.rs`'s
-                        // `run_slice_metrics` pushdown branch); this is safe to
-                        // set live now because the consumer
-                        // (`MergedSource::query_precomputed_count`, deliverable
-                        // 1) reads the partial back out and the
-                        // `PROTOCOL_VERSION` bump to 4 (deliverable 4) lands in
-                        // this same commit, so a version-3 worker degrades to a
-                        // silent local fallback instead of a corrupt answer.
-                        let partial_req: Option<pb::PartialAggregateRequest> =
-                            pushdown_target.as_ref().and_then(|t| {
-                                (t.matchers == plan.matchers).then_some(
-                                    pb::PartialAggregateRequest {
-                                        want_count: true,
-                                        want_min: false,
-                                        want_max: false,
-                                        reduce_start_ns: Some(t.reduce_start_ns),
-                                        reduce_end_ns: Some(t.reduce_end_ns),
-                                    },
+            let results: Vec<Result<PerPlan, QueryError>> =
+                stream::iter(distinct_plans.into_iter().zip(plan_snapshots))
+                    .map(|(plan, routed)| {
+                        let snapshot = &snapshot;
+                        let accounting = &accounting;
+                        let pushdown_target = &pushdown_target;
+                        let scalar_fold = &scalar_fold;
+                        async move {
+                            let snapshot = routed.as_ref().unwrap_or(snapshot);
+                            // ADR-0103 live: send the partial-aggregate request for
+                            // the one eligible matcher set, `None` for every other
+                            // plan. A worker that receives `Some(..)` returns ONLY
+                            // the partial, no raw runs (`service.rs`'s
+                            // `run_slice_metrics` pushdown branch); this is safe to
+                            // set live now because the consumer
+                            // (`MergedSource::query_precomputed_count`, deliverable
+                            // 1) reads the partial back out and the
+                            // `PROTOCOL_VERSION` bump to 4 (deliverable 4) lands in
+                            // this same commit, so a version-3 worker degrades to a
+                            // silent local fallback instead of a corrupt answer.
+                            let partial_req: Option<pb::PartialAggregateRequest> =
+                                pushdown_target.as_ref().and_then(|t| {
+                                    (t.matchers == plan.matchers).then_some(
+                                        pb::PartialAggregateRequest {
+                                            want_count: true,
+                                            want_min: false,
+                                            want_max: false,
+                                            reduce_start_ns: Some(t.reduce_start_ns),
+                                            reduce_end_ns: Some(t.reduce_end_ns),
+                                        },
+                                    )
+                                });
+                            // A selector's segments carry scalar and/or
+                            // native-histogram series; fetch both kinds (a series is
+                            // one kind for its whole life, so the two sets never
+                            // overlap). The two kinds come off each segment in one
+                            // open+decode pass, not two independent
+                            // segment opens.
+                            // The bytes-scanned budget (ADR-0061 decision 1) is
+                            // enforced inside `fetch_all_samples_and_histograms`
+                            // itself, once per completed segment fetch, against the
+                            // shared accounting handle every selector's concurrent
+                            // fetch charges into -- so the budget bounds the whole
+                            // query's scan and cancels it mid-fetch, not after the
+                            // merge has already paid for every byte.
+                            let mut histogram_fold =
+                                HistogramFold::new(Arc::clone(&self.memory_budget), max_series);
+                            let (page_stats, pushdown_partials, excludes_spend) = self
+                                .fetch_samples_and_histograms_maybe_distributed(
+                                    tenant_hash,
+                                    snapshot,
+                                    &plan.matchers,
+                                    accounting,
+                                    max_bytes_scanned,
+                                    RequestBudget::new(max_s3_requests, fold_lag),
+                                    wall_deadline,
+                                    partial_req,
+                                    scalar_fold,
+                                    &mut histogram_fold,
                                 )
-                            });
-                        // A selector's segments carry scalar and/or
-                        // native-histogram series; fetch both kinds (a series is
-                        // one kind for its whole life, so the two sets never
-                        // overlap). The two kinds come off each segment in one
-                        // open+decode pass, not two independent
-                        // segment opens.
-                        // The bytes-scanned budget (ADR-0061 decision 1) is
-                        // enforced inside `fetch_all_samples_and_histograms`
-                        // itself, once per completed segment fetch, against the
-                        // shared accounting handle every selector's concurrent
-                        // fetch charges into -- so the budget bounds the whole
-                        // query's scan and cancels it mid-fetch, not after the
-                        // merge has already paid for every byte.
-                        let mut histogram_fold =
-                            HistogramFold::new(Arc::clone(&self.memory_budget), max_series);
-                        let (page_stats, pushdown_partials, excludes_spend) = self
-                            .fetch_samples_and_histograms_maybe_distributed(
-                                tenant_hash,
-                                snapshot,
-                                &plan.matchers,
-                                accounting,
-                                max_bytes_scanned,
-                                RequestBudget::new(max_s3_requests, fold_lag),
-                                wall_deadline,
-                                partial_req,
-                                scalar_fold,
-                                &mut histogram_fold,
-                            )
-                            .await?;
-                        let histograms = histogram_fold.into_series(max_samples)?;
-                        Ok::<PerPlan, QueryError>((
-                            histograms,
-                            page_stats,
-                            pushdown_partials,
-                            excludes_spend,
-                        ))
-                    }
-                })
-                .buffer_unordered(concurrency)
-                .collect()
-                .await;
+                                .await?;
+                            let histograms = histogram_fold.into_series(max_samples)?;
+                            Ok::<PerPlan, QueryError>((
+                                histograms,
+                                page_stats,
+                                pushdown_partials,
+                                excludes_spend,
+                            ))
+                        }
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect()
+                    .await;
 
             // Every distinct matcher set's scalar runs were folded into
             // `scalar_fold` as their objects completed; federation's runs join
@@ -2605,7 +2602,13 @@ impl QueryEngine {
         // decision 6): a retry re-resolves, so the second attempt's fetches
         // are checked against the second resolve's tail, never the first's.
         // The parts, when asked for, come from the same resolve.
-        F: FnMut(Snapshot, Vec<ShardGeneration>, PhaseAccounting, FoldLag, Option<SnapshotParts>) -> Fut,
+        F: FnMut(
+            Snapshot,
+            Vec<ShardGeneration>,
+            PhaseAccounting,
+            FoldLag,
+            Option<SnapshotParts>,
+        ) -> Fut,
         Fut: std::future::Future<Output = Result<(T, FetchStats), QueryError>>,
     {
         // The catalog term (ADR-0044 decision 3) is the same for both

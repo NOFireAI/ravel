@@ -1528,7 +1528,10 @@ fn every_routed_signal_has_its_own_row() {
     };
     totals.add_parts(Signal::Metrics, &figures);
     totals.add_leaf_gets(Signal::Metrics, 5);
-    assert_eq!(totals.parts(Signal::Metrics, KeyIndexPartOutcome::Covered), 2);
+    assert_eq!(
+        totals.parts(Signal::Metrics, KeyIndexPartOutcome::Covered),
+        2
+    );
     assert_eq!(totals.leaf_gets(Signal::Metrics), 5);
     for signal in [Signal::Spans, Signal::Logs] {
         assert_eq!(totals.parts(signal, KeyIndexPartOutcome::Covered), 0);

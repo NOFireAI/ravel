@@ -342,7 +342,10 @@ async fn serve(setup: Setup) -> Fixture {
         )
         .await
         .expect("fold");
-    assert_eq!(report.entry_count, OBJECTS, "every object folds: {report:?}");
+    assert_eq!(
+        report.entry_count, OBJECTS,
+        "every object folds: {report:?}"
+    );
     assert_eq!(report.metrics_label_index_parts_over_cap, 0, "{report:?}");
     assert_eq!(
         report.key_index_leaves_written > 0,
@@ -570,14 +573,21 @@ async fn promql_query_range_prunes_non_holders_by_label_index() {
         fixture.recorder.gets_on(key)
     };
     assert!(recent(&off) >= 1);
-    assert_eq!(recent(&on), recent(&off), "the recent holder is read as before");
+    assert_eq!(
+        recent(&on),
+        recent(&off),
+        "the recent holder is read as before"
+    );
 
     let off_gets = off.sealed_gets();
     let on_gets = on.sealed_gets();
     for seq in 0..OBJECTS as usize {
         assert!(off_gets[seq] >= 1, "the unrouted run reads object {seq}");
         if HOLDERS.contains(&(seq as u64)) {
-            assert_eq!(on_gets[seq], off_gets[seq], "holder {seq} is read as before");
+            assert_eq!(
+                on_gets[seq], off_gets[seq],
+                "holder {seq} is read as before"
+            );
         } else {
             assert_eq!(on_gets[seq], 0, "non-holder {seq} is never opened");
         }

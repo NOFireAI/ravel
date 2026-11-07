@@ -672,9 +672,10 @@ values, replace the one set:
 - Nothing is routed while the pinned snapshot carries a pending erasure
   (decision 2's erasure rule): no prune and no leaf GET.
 
-Leaf GETs scale with the matcher count: each distinct value is one routing
+Leaf GETs scale with the number of distinct values: each is one routing
 pass under the router's `L_max`, `P_max` and `B_run` admission, so a
 statement with `n` distinct values can issue up to `n` passes' leaf GETs.
-Acceptance row 3's leaf GET band is stated for one pass; the Stage 1 run
-(T8) measures the per-value figure against row 3's band and records the
-statement's value count beside it.
+Acceptance row 3's band, at most 2 x covering parts, reads as one pass's
+budget; a statement with `n` values can need up to `n` times it. The Stage 1
+run (T8) measures row 3's statement against the band and records its
+distinct value count beside the figure.
