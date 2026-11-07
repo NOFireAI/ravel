@@ -1343,7 +1343,9 @@ async fn seed_sixty_rlog_inputs(store: &dyn ObjectStoreBackend) -> ravel_maintai
 }
 
 /// A two-level compactor config: final parts of 4 KiB, run parts closing at
-/// `run_target`, unit ceiling `ceiling`, `workers` level-1 workers.
+/// `run_target`, unit ceiling `ceiling`, `workers` level-1 workers. The
+/// fixture predicts far fewer decoded rows than the ADR-3853 D0 floor, so the
+/// floor is off.
 fn two_level(
     config: CompactorConfig,
     ceiling: u64,
@@ -1357,6 +1359,7 @@ fn two_level(
         rlog_run_memory_target_bytes: run_target,
         scratch_dir: Some(scratch.to_path_buf()),
         level1_workers: Some(workers),
+        geometry_floor_decoded_rows: 0,
         ..config
     }
 }
