@@ -16911,6 +16911,213 @@ mod tests {
             assert_eq!(scratch_entries(&dir), vec![dir.join("keep")]);
         }
 
+        /// The scratch need margin, in percent, at which the two-level
+        /// fixture's runs outgrow the unit's need.
+        const OUTGROW_PERCENT: u64 = 10;
+
+        /// The two-level fixture's inputs' stored bytes.
+        async fn two_level_stored() -> u64 {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let mut stored = 0u64;
+            for key in &keys {
+                stored += probe.head(key).await.expect("head").size;
+            }
+            stored
+        }
+
+        /// A unit's scratch store that records, after each write it stores,
+        /// the payload bytes stored so far.
+        struct RecordingScratch {
+            inner: Arc<ScratchStore>,
+            stored: Arc<std::sync::Mutex<Vec<u64>>>,
+        }
+
+        #[async_trait]
+        impl ObjectStoreBackend for RecordingScratch {
+            async fn put(
+                &self,
+                key: &str,
+                data: Bytes,
+                opts: PutOptions,
+            ) -> std::result::Result<PutOutcome, StoreError> {
+                let len = data.len() as u64;
+                let out = self.inner.put(key, data, opts).await?;
+                let mut stored = self.stored.lock().expect("stored");
+                let so_far = stored.last().copied().unwrap_or(0) + len;
+                stored.push(so_far);
+                Ok(out)
+            }
+
+            async fn get(
+                &self,
+                key: &str,
+                range: GetRange,
+            ) -> std::result::Result<GetOutcome, StoreError> {
+                self.inner.get(key, range).await
+            }
+
+            async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+                self.inner.head(key).await
+            }
+
+            async fn list(
+                &self,
+                prefix: &str,
+                page: Option<PageToken>,
+            ) -> std::result::Result<ListPage, StoreError> {
+                self.inner.list(prefix, page).await
+            }
+
+            async fn list_delimited(
+                &self,
+                prefix: &str,
+            ) -> std::result::Result<DelimitedList, StoreError> {
+                self.inner.list_delimited(prefix).await
+            }
+
+            async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+                self.inner.delete(key).await
+            }
+
+            fn capabilities(&self) -> Capabilities {
+                self.inner.capabilities()
+            }
+        }
+
+        /// Another live unit's reservation of `bytes` in a scratch directory,
+        /// held in [`SCRATCH_RESERVED`] until dropped.
+        struct OtherUnit(std::path::PathBuf);
+
+        impl OtherUnit {
+            const KEY: u64 = u64::MAX;
+
+            fn hold(dir: &std::path::Path, bytes: u64) -> Self {
+                SCRATCH_RESERVED
+                    .lock()
+                    .expect("reserved")
+                    .entry(dir.to_path_buf())
+                    .or_default()
+                    .insert(
+                        Self::KEY,
+                        ScratchCharge {
+                            need: bytes,
+                            written: 0,
+                        },
+                    );
+                OtherUnit(dir.to_path_buf())
+            }
+        }
+
+        impl Drop for OtherUnit {
+            fn drop(&mut self) {
+                let mut reserved = SCRATCH_RESERVED
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(units) = reserved.get_mut(&self.0) {
+                    units.remove(&Self::KEY);
+                    if units.is_empty() {
+                        reserved.remove(&self.0);
+                    }
+                }
+            }
+        }
+
+        /// ADR-3853 D2: a unit admitted under `scratch_max_bytes` whose runs
+        /// then outgrow its need stops before the write that would take the
+        /// directory past the cap, counting the bytes outside every unit and
+        /// another live unit's reservation, and is refused under
+        /// reason="scratch_headroom". No write the cap could not take was
+        /// stored, nothing is published, and its reservation is released.
+        #[tokio::test]
+        async fn a_unit_whose_runs_outgrow_its_reservation_stops_at_the_cap() {
+            let stray = 1000u64;
+            let dir = scratch_with_stray("cap-outgrow", stray as usize);
+            let (mut config, _) = two_level_scratch_config(&dir).await;
+            let stored_inputs = two_level_stored().await;
+            let need = (stored_inputs * OUTGROW_PERCENT).div_ceil(100);
+            // Larger than every run byte the unit writes, so a cap that ignored
+            // it would let the whole merge through.
+            let other = 4 * stored_inputs;
+            let cap = stray + other + need;
+            config.scratch_max_bytes = Some(cap);
+            let headroom = crate::CompactionRefusedReason::ScratchHeadroom;
+            let refused = crate::compaction_refused_total(headroom);
+
+            let held = OtherUnit::hold(&dir, other);
+            let stored: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+            let recorded = Arc::clone(&stored);
+            SCRATCH_STORE_WRAP.with(|w| {
+                *w.borrow_mut() = Some(Box::new(move |inner| {
+                    Arc::new(RecordingScratch {
+                        inner,
+                        stored: Arc::clone(&recorded),
+                    }) as Arc<dyn ObjectStoreBackend>
+                }));
+            });
+            SCRATCH_NEED_PERCENT.with(|p| p.set(Some(OUTGROW_PERCENT)));
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(Some(Ok(u64::MAX / 2))));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
+            SCRATCH_NEED_PERCENT.with(|p| p.set(None));
+            SCRATCH_STORE_WRAP.with(|w| *w.borrow_mut() = None);
+
+            match outcome {
+                Ok(CompactionOutcome::ScratchHeadroom {
+                    need: n,
+                    reserved,
+                    path,
+                    ..
+                }) => assert_eq!((n, reserved, path), (need, other, dir.clone())),
+                other => panic!("{other:?}"),
+            }
+            assert!(crate::compaction_refused_total(headroom) > refused);
+            for so_far in stored.lock().expect("stored").iter() {
+                assert!(
+                    stray + other + need.max(*so_far) <= cap,
+                    "a write past the cap was stored: {so_far} bytes of runs"
+                );
+            }
+            let r = &run.report;
+            assert_eq!(r.part_put.requests, 0, "{r:?}");
+            assert!(run.log.contains("outcome=refused"), "{}", run.log);
+            assert_eq!(compaction_records(&store).await, 0);
+            assert_eq!(scratch_entries(&dir), vec![dir.join("keep")]);
+            assert_eq!(
+                scratch_reserved(&dir),
+                other,
+                "the unit's charge was released"
+            );
+            drop(held);
+            assert_eq!(scratch_reserved(&dir), 0);
+        }
+
+        /// The unit of the test above, with no cap and room on the volume,
+        /// compacts, its runs writing more than its need.
+        #[tokio::test]
+        async fn a_unit_whose_runs_outgrow_its_reservation_compacts_with_no_cap() {
+            let dir = fresh_scratch("no-cap-outgrow");
+            let (config, _) = two_level_scratch_config(&dir).await;
+            let need = (two_level_stored().await * OUTGROW_PERCENT).div_ceil(100);
+            SCRATCH_NEED_PERCENT.with(|p| p.set(Some(OUTGROW_PERCENT)));
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(Some(Ok(u64::MAX / 2))));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
+            SCRATCH_NEED_PERCENT.with(|p| p.set(None));
+            assert!(
+                matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                "{outcome:?}"
+            );
+            assert!(
+                run.report.scratch_write_bytes > need,
+                "the runs outgrew the need {need}: {:?}",
+                run.report
+            );
+            assert_eq!(compaction_records(&store).await, 1);
+            assert_eq!(scratch_reserved(&dir), 0);
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
         /// A [`MemoryStore`] whose first non-claim PUT once `armed` never
         /// completes, after raising `stalled`.
         struct StallStore {
