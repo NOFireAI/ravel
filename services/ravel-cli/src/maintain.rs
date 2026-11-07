@@ -242,6 +242,11 @@ pub struct ScratchOptions {
     /// ceiling ([`per_bucket_config`]). No flag sets it; a test does, to route
     /// a small bucket through the two-level merge.
     pub merge_resident_ceiling_bytes: Option<u64>,
+    /// Test seam: replaces [`CompactorConfig::geometry_floor_decoded_rows`]
+    /// (default [`ravel_maintain::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS`])
+    /// when set. No flag sets it; a test sets `Some(0)` so a small bucket
+    /// reaches the geometry check instead of the cursor path.
+    pub geometry_floor_decoded_rows: Option<u64>,
 }
 
 impl ScratchOptions {
@@ -361,6 +366,9 @@ pub fn build_compactor_config(
     };
     if let Some(ns) = max_flush_lifetime_ns {
         config.max_flush_lifetime_ns = ns;
+    }
+    if let Some(rows) = scratch.geometry_floor_decoded_rows {
+        config.geometry_floor_decoded_rows = rows;
     }
     if l1_part_memory_target_bytes == Some(0) {
         return Err(CompactorKnobError::ZeroL1PartMemoryTarget);
