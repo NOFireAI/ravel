@@ -545,7 +545,10 @@ order and concurrency of the opens change; the rows are the unlimited run's
 at 30 seconds (`NARROWED_ADMISSION_WAIT`), since a turn needs the sibling's
 consumer to keep polling it: a refused partition still waiting then returns
 its refusal (`a_narrowed_wait_is_bounded`), and a sibling still waiting opens
-anyway. A refused retry with no sibling holding a current open fails the query
+anyway. A waiting partition whose own wait has passed the bound keeps its place
+in the queue but no longer holds up the partitions behind it, so a sibling
+whose consumer keeps polling pays the bound once, not at each of its segments
+(`a_stale_narrowed_head_delays_a_sibling_once`). A refused retry with no sibling holding a current open fails the query
 with the typed fetch memory error
 (`a_budget_below_one_open_still_returns_the_typed_refusal`), unless a sibling
 finished a segment since the retry was issued, in which case the open is
@@ -557,7 +560,8 @@ stays fail-fast: another statement's opens can hold the bytes, and that
 refusal is typed and reported like any contended reservation
 (`another_statements_prefetches_fail_an_open_fast_and_typed`). The scan counts
 each retry in `prefetch_memory_reopens`, each dropped prefetch in
-`prefetch_revocations`, and each narrowing in `fan_out_narrowings`. The rows,
+`prefetch_revocations`, and each narrowing in `fan_out_narrowings`, and
+`SqlStats::scan_timing` sums each of the three over partitions. The rows,
 `segments_opened`, the route split and the
 data objects touched are those of the sequential walk
 (`a_refused_open_drops_every_partitions_prefetches_and_retries_once`,
