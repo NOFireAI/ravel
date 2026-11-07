@@ -229,29 +229,57 @@ pub fn buckets_held_out_of_window_total() -> u64 {
 pub enum CompactionRefusedReason {
     /// [`CompactionOutcome::GeometryUnsupported`] (ADR-3853 D0).
     Geometry,
+    /// [`CompactionOutcome::TwoLevelUnsupported`] (ADR-3853 D1).
+    TwoLevel,
+    /// [`CompactionOutcome::ScratchHeadroom`] (ADR-3853 D2).
+    ScratchHeadroom,
+    /// [`CompactionOutcome::ScratchLocked`] (ADR-3853 D2).
+    ScratchLocked,
 }
 
 impl CompactionRefusedReason {
-    pub const ALL: [CompactionRefusedReason; 1] = [CompactionRefusedReason::Geometry];
+    pub const ALL: [CompactionRefusedReason; 4] = [
+        CompactionRefusedReason::Geometry,
+        CompactionRefusedReason::TwoLevel,
+        CompactionRefusedReason::ScratchHeadroom,
+        CompactionRefusedReason::ScratchLocked,
+    ];
 
     /// The `reason` label value.
     pub fn name(self) -> &'static str {
         match self {
             CompactionRefusedReason::Geometry => "geometry",
+            CompactionRefusedReason::TwoLevel => "two_level",
+            CompactionRefusedReason::ScratchHeadroom => "scratch_headroom",
+            CompactionRefusedReason::ScratchLocked => "scratch_locked",
+        }
+    }
+
+    fn counter(self) -> &'static AtomicU64 {
+        match self {
+            CompactionRefusedReason::Geometry => &COMPACTIONS_REFUSED_GEOMETRY,
+            CompactionRefusedReason::TwoLevel => &COMPACTIONS_REFUSED_TWO_LEVEL,
+            CompactionRefusedReason::ScratchHeadroom => &COMPACTIONS_REFUSED_SCRATCH_HEADROOM,
+            CompactionRefusedReason::ScratchLocked => &COMPACTIONS_REFUSED_SCRATCH_LOCKED,
         }
     }
 }
 
-/// Counter seam for `ravel_maintain_compaction_refused_total{reason="geometry"}`:
-/// compactions that ended in [`CompactionOutcome::GeometryUnsupported`].
-/// Process-wide and monotonic.
+/// Counter seams for `ravel_maintain_compaction_refused_total`, one per
+/// [`CompactionRefusedReason`]: compactions that ended in that reason's
+/// outcome. Process-wide and monotonic.
 static COMPACTIONS_REFUSED_GEOMETRY: AtomicU64 = AtomicU64::new(0);
+static COMPACTIONS_REFUSED_TWO_LEVEL: AtomicU64 = AtomicU64::new(0);
+static COMPACTIONS_REFUSED_SCRATCH_HEADROOM: AtomicU64 = AtomicU64::new(0);
+static COMPACTIONS_REFUSED_SCRATCH_LOCKED: AtomicU64 = AtomicU64::new(0);
 
 /// Compactions this process has refused for `reason` since it started.
 pub fn compaction_refused_total(reason: CompactionRefusedReason) -> u64 {
-    match reason {
-        CompactionRefusedReason::Geometry => COMPACTIONS_REFUSED_GEOMETRY.load(Ordering::Relaxed),
-    }
+    reason.counter().load(Ordering::Relaxed)
+}
+
+fn count_refusal(reason: CompactionRefusedReason) {
+    reason.counter().fetch_add(1, Ordering::Relaxed);
 }
 
 /// Count and log a geometry refusal, returning its outcome.
@@ -263,7 +291,7 @@ fn refuse_geometry(
     records: u64,
     predicted_decoded_rows: u64,
 ) -> CompactionOutcome {
-    COMPACTIONS_REFUSED_GEOMETRY.fetch_add(1, Ordering::Relaxed);
+    count_refusal(CompactionRefusedReason::Geometry);
     tracing::warn!(
         signal = ?bucket.signal,
         shard = bucket.shard,
@@ -736,6 +764,7 @@ async fn compact_bucket_scoped(
             predicted_decoded_rows,
         ),
         Err(MaintainError::MergeTwoLevelUnsupported { inputs, check }) => {
+            count_refusal(CompactionRefusedReason::TwoLevel);
             tracing::warn!(
                 signal = ?bucket.signal,
                 shard = bucket.shard,
@@ -753,6 +782,7 @@ async fn compact_bucket_scoped(
             reserved,
             path,
         }) => {
+            count_refusal(CompactionRefusedReason::ScratchHeadroom);
             tracing::warn!(
                 signal = ?bucket.signal,
                 shard = bucket.shard,
@@ -773,6 +803,7 @@ async fn compact_bucket_scoped(
             }
         }
         Err(MaintainError::ScratchLocked { path }) => {
+            count_refusal(CompactionRefusedReason::ScratchLocked);
             tracing::warn!(
                 signal = ?bucket.signal,
                 shard = bucket.shard,
