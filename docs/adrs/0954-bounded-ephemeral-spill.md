@@ -849,8 +849,31 @@ answered, but three properties of the decision above cost the rest:
    When that attempt fails with a memory-budget refusal, the statement
    retries once with spill allowed, but only if all of these hold:
    - the attempt's pool recorded the refusal as a typed signal, not a
-     message (a fetch-layer refusal of the process budget with an
-     accounted cause also counts);
+     message, and the refusal is the statement's own: its per-query
+     limit; or a tenant budget, process budget or aggregate reserve-ahead
+     refusal at which its own bytes on the refusing budget (its pool's
+     charged bytes, plus, on the process budget, those of its aggregate
+     envelopes among the process's `width` largest, the only envelope bytes
+     the budget holds) were at least half of the budget's reserved bytes. A
+     reserve-ahead refusal is a refusal of the shared process budget, so it
+     takes the same test. The statement's fetch reservations on the process
+     budget are not counted: they are made on the shared budget with no
+     per-statement figure. A fetch-layer refusal does not count, because
+     spilling does not shrink fetch buffers. Note (2026-11-07, review of
+     the M2 fix): the M2 fix first retried every reserve-ahead refusal and
+     counted every envelope of the pool, including envelopes outside the
+     `width` largest that the process budget does not hold; under
+     concurrent load another statement could fill the process budget and
+     this statement's small envelope growth could earn a retry that wrote
+     nothing. Note (2026-11-07, the M2
+     verification run): this bullet first counted every tenant and
+     process budget refusal and a fetch-layer refusal of the process
+     budget with an accounted cause. In the c6a.2xlarge concurrent phase
+     (10 connections) the error ratio rose to 0.360 from 0.119; the first
+     refusals were 62 tenant budget and 26 process budget refusals, mostly
+     other statements' reservations, and 16 of the 43 retried statements
+     wrote no spill bytes. On c6a.large row 9 a fetch-layer refusal was
+     retried and failed the same way on all three tries;
    - no batch was emitted;
    - spill is configured;
    - the statement's classification plan is spill-eligible under
@@ -878,7 +901,17 @@ answered, but three properties of the decision above cost the rest:
    about eleven times the 6.1 MB non-spillable peak the c6a.large
    measurement found, and more where 10% of `L` is larger. The peak is set
    by the data, not by `L`. `H` is re-derived if a later measurement finds
-   a peak above it.
+   a peak above it. Note (2026-11-07, the M2 verification run): a
+   spill-capable consumer is also refused once its own charged plus
+   enveloped bytes would exceed its fair share, `L - H` divided by the
+   number of spill-capable consumers registered in the pool, DataFusion's
+   `FairSpillPool` rule. A grow within the asker's share is admitted even
+   when the total is over `L - H`; the consumer over its share is refused
+   at its next checked grow, and until then the total may stay above
+   `L - H`, bounded by `L`. On c6a.large row 14 the whole-pool cap alone
+   refused the outer final aggregate, holding 14 MB, every time, while the
+   inner aggregate held 734 MB and never got the refusal that would make
+   it spill.
 3. **In a spill-enabled pool, a reserve-ahead refusal of a spill-capable
    consumer is a spill trigger, not a failure.** The same refusal of a
    consumer that cannot spill is unchanged, and so is any refusal in a
