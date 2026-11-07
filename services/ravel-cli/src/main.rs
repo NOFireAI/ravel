@@ -2211,6 +2211,58 @@ enum CommitCommand {
     },
 }
 
+/// The two-level RLOG merge's scratch flags (ADR-3853), taken by
+/// `maintain compact-bucket` and `maintain compact-tenant`.
+#[derive(Debug, Clone, Default, clap::Args)]
+struct ScratchArgs {
+    /// The local directory the two-level RLOG merge (ADR-3853) writes its
+    /// level-1 runs under. It is a cache: each unit's runs go in their own
+    /// subdirectory, wiped when the unit ends, and nothing durable is read
+    /// from it. The first two-level merge locks `ravel-scratch.lock` in it for
+    /// the life of the process and removes the unit subdirectories a dead
+    /// process left; other files there are kept and count against
+    /// --scratch-max-bytes. Each process needs its own directory: one another
+    /// process holds is refused as ScratchLocked. Size it at about 1.3 times
+    /// the input bytes of the largest bucket it merges: a unit is admitted
+    /// only when that much is free, and is otherwise refused as
+    /// ScratchHeadroom. Omitted, a bucket whose cursor merge would decode more
+    /// than 16 rows per input record is refused as GeometryUnsupported.
+    #[arg(long, value_name = "PATH")]
+    scratch_dir: Option<std::path::PathBuf>,
+    /// A cap on the bytes --scratch-dir may hold, for a directory on a volume
+    /// larger than its share. A two-level unit is admitted against the smaller
+    /// of the volume's free bytes and this cap less the bytes already under
+    /// the directory. A running unit whose next run write would take the
+    /// directory past the cap stops before that write and is refused as
+    /// ScratchHeadroom. Omitted, the volume's free bytes alone decide. Zero,
+    /// or a value without --scratch-dir, is refused before any store call.
+    #[arg(long, value_name = "BYTES")]
+    scratch_max_bytes: Option<u64>,
+    /// The level-1 worker count of a two-level RLOG merge (ADR-3853 D4): how
+    /// many level-1 groups of one bucket merge at once, each under its share
+    /// of the unit's memory ceiling. Omitted, it is derived per bucket from
+    /// the unit's share of the usable cores and the largest count whose
+    /// groups still fit. Zero, or a value without --scratch-dir, is refused
+    /// before any store call.
+    #[arg(long = "level1-workers", value_name = "N")]
+    level1_workers: Option<usize>,
+}
+
+impl ScratchArgs {
+    /// The validated options, refused with a typed error before any store
+    /// call.
+    fn options(&self) -> Result<maintain::ScratchOptions, maintain::CompactorKnobError> {
+        let options = maintain::ScratchOptions {
+            scratch_dir: self.scratch_dir.clone(),
+            scratch_max_bytes: self.scratch_max_bytes,
+            level1_workers: self.level1_workers,
+            merge_resident_ceiling_bytes: None,
+        };
+        options.validate()?;
+        Ok(options)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum MaintainCommand {
     /// Run one compaction pass over a single sealed bucket. A bucket with at
@@ -2285,6 +2337,8 @@ enum MaintainCommand {
         /// compactor default).
         #[arg(long, value_name = "LEVEL")]
         compaction_zstd_level: Option<i32>,
+        #[command(flatten)]
+        scratch: ScratchArgs,
         #[command(flatten)]
         tenant_kms: store::TenantKmsArgs,
     },
@@ -2415,6 +2469,8 @@ enum MaintainCommand {
         /// compactor default).
         #[arg(long, value_name = "LEVEL")]
         compaction_zstd_level: Option<i32>,
+        #[command(flatten)]
+        scratch: ScratchArgs,
         #[command(flatten)]
         tenant_kms: store::TenantKmsArgs,
     },
@@ -2743,6 +2799,18 @@ where
     Ok(cli)
 }
 
+/// The two-level merge scratch flags of the commands that take them.
+fn command_scratch(command: &Command) -> Option<&ScratchArgs> {
+    match command {
+        Command::Maintain {
+            command:
+                MaintainCommand::CompactBucket { scratch, .. }
+                | MaintainCommand::CompactTenant { scratch, .. },
+        } => Some(scratch),
+        _ => None,
+    }
+}
+
 /// The `--tenant-kms-config` flags of the commands that take one.
 fn command_tenant_kms(command: &Command) -> Option<&store::TenantKmsArgs> {
     match command {
@@ -2972,6 +3040,9 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
     // Refused before the store is built, so a refused run sends no request.
     if let Some(tenant_kms) = command_tenant_kms(&cli.command) {
         store::refuse_tenant_kms_under_gcs(&cli.store, tenant_kms)?;
+    }
+    if let Some(scratch) = command_scratch(&cli.command) {
+        scratch.options()?;
     }
     if cli.store.store_kind() == store::StoreKind::Gcs
         && matches!(
@@ -3232,9 +3303,11 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     l1_part_memory_target_bytes,
                     max_l1_part_bytes,
                     compaction_zstd_level,
+                    scratch,
                     tenant_kms,
                 },
         } => {
+            let scratch = scratch.options()?;
             maintain::compact_with_part_split_targets(
                 store::build_tenant_data_store(
                     &cli.store,
@@ -3256,6 +3329,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 max_l1_part_bytes,
                 compaction_zstd_level,
                 &maintain::ClaimOptions::for_invocation(no_claim),
+                &scratch,
             )
             .await
         }
@@ -3275,36 +3349,41 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     input_read_concurrency,
                     bucket_concurrency,
                     compaction_zstd_level,
+                    scratch,
                     tenant_kms,
                 },
-        } => maintain::compact_tenant(
-            store::build_tenant_data_store(
-                &cli.store,
-                &tenant_kms,
+        } => {
+            let scratch = scratch.options()?;
+            maintain::compact_tenant(
+                store::build_tenant_data_store(
+                    &cli.store,
+                    &tenant_kms,
+                    &tenant,
+                    dry_run,
+                    now_ns()?,
+                    log,
+                )
+                .await?,
+                cli.store.selection(),
                 &tenant,
+                signal,
+                shards,
+                from_hour,
+                to_hour,
                 dry_run,
+                max_flush_lifetime,
+                l1_part_memory_target_bytes,
+                max_l1_part_bytes,
+                input_read_concurrency,
+                bucket_concurrency,
+                compaction_zstd_level,
                 now_ns()?,
-                log,
+                &maintain::ClaimOptions::for_invocation(no_claim),
+                &scratch,
             )
-            .await?,
-            cli.store.selection(),
-            &tenant,
-            signal,
-            shards,
-            from_hour,
-            to_hour,
-            dry_run,
-            max_flush_lifetime,
-            l1_part_memory_target_bytes,
-            max_l1_part_bytes,
-            input_read_concurrency,
-            bucket_concurrency,
-            compaction_zstd_level,
-            now_ns()?,
-            &maintain::ClaimOptions::for_invocation(no_claim),
-        )
-        .await
-        .map(|_| ()),
+            .await
+            .map(|_| ())
+        }
         Command::Maintain {
             command:
                 MaintainCommand::Sweep {
@@ -6904,6 +6983,7 @@ mod tests {
             Some(30 * GIB),
             2,
             DEFAULT_LEASE,
+            &maintain::ScratchOptions::default(),
         )
         .expect("nonzero knobs build a config");
 
@@ -7086,6 +7166,7 @@ mod tests {
                 host,
                 merges,
                 lease,
+                &maintain::ScratchOptions::default(),
             )
             .expect("no knobs build a config");
             assert_eq!(
@@ -7353,7 +7434,8 @@ mod tests {
                     None,
                     host,
                     1,
-                    DEFAULT_LEASE
+                    DEFAULT_LEASE,
+                    &maintain::ScratchOptions::default(),
                 )
                 .expect_err("--l1-part-memory-target-bytes 0 must be refused"),
                 CompactorKnobError::ZeroL1PartMemoryTarget,
@@ -7369,7 +7451,8 @@ mod tests {
                 None,
                 None,
                 1,
-                DEFAULT_LEASE
+                DEFAULT_LEASE,
+                &maintain::ScratchOptions::default(),
             )
             .expect_err("--max-l1-part-bytes 0 must be refused"),
             CompactorKnobError::ZeroMaxL1PartBytes,
@@ -7454,6 +7537,7 @@ mod tests {
             None,
             1,
             DEFAULT_LEASE,
+            &maintain::ScratchOptions::default(),
         )
         .expect("level 4 builds a config");
         assert_eq!(
@@ -7470,6 +7554,7 @@ mod tests {
             None,
             1,
             DEFAULT_LEASE,
+            &maintain::ScratchOptions::default(),
         )
         .expect("no flag builds a config");
         assert_eq!(
@@ -7487,7 +7572,8 @@ mod tests {
                     Some(level),
                     None,
                     1,
-                    DEFAULT_LEASE
+                    DEFAULT_LEASE,
+                    &maintain::ScratchOptions::default(),
                 )
                 .expect_err("an out-of-range level must be refused"),
                 CompactorKnobError::InvalidRlogZstdLevel(ravel_maintain::RlogZstdLevelError {
@@ -7517,6 +7603,7 @@ mod tests {
             None,
             1,
             DEFAULT_LEASE,
+            &maintain::ScratchOptions::default(),
         )
         .expect("zero input-read-concurrency is tolerated, not refused");
         assert_eq!(

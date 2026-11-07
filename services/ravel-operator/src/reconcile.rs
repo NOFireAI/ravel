@@ -2212,8 +2212,8 @@ pub fn desired_maintain_deployment(
         &[KEY_FILE_SECRET_KEY],
         MAINTAIN_KEY_MOUNT_DIR,
     )];
-    // Scratch for the two-level RLOG merge (ADR-3853 D2): a cache the server
-    // wipes at start, so an emptyDir is the whole contract.
+    // Scratch for the two-level RLOG merge (ADR-3853 D2): a cache nothing
+    // durable is read from, so an emptyDir is the whole contract.
     if let Some(scratch) = &spec.maintain.scratch {
         args.push("--maintain-scratch-dir".to_string());
         args.push(scratch.mount_path.clone());

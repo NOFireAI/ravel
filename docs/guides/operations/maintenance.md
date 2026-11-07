@@ -278,11 +278,13 @@ To compact by hand, one bucket or one whole tenant and signal:
 
 ```sh
 ravel-cli maintain compact-bucket --tenant <t> --signal <metrics|logs|spans> \
-  --shard <n> --hour <n> [--dry-run] [--no-claim]
+  --shard <n> --hour <n> [--dry-run] [--no-claim] \
+  [--scratch-dir <path>] [--scratch-max-bytes <n>] [--level1-workers <n>]
 
 ravel-cli maintain compact-tenant --tenant <t> --signal <metrics|logs|spans> \
   [--shards <n>] [--from-hour <n>] [--to-hour <n>] [--bucket-concurrency <n>] \
-  [--dry-run] [--no-claim]
+  [--dry-run] [--no-claim] \
+  [--scratch-dir <path>] [--scratch-max-bytes <n>] [--level1-workers <n>]
 ```
 
 Reports go to stdout and log lines go to stderr. With `RUST_LOG` unset,
@@ -330,6 +332,25 @@ the compaction misses that writer's later-published object.
   `now >= hour_end + max_flush_lifetime + clock_skew_allowance`. A freshly
   finished load therefore waits over an hour before its final hours can be
   compacted. A lower value seals them at once.
+
+### Two-level merge scratch
+
+A logs bucket with many inputs can need the two-level RLOG merge, which writes level-1 runs to a local scratch directory. Both commands take the
+same three flags as `ravel-server`'s `--maintain-scratch-*` flags. For sizing,
+see [Compaction scratch](configuration.md#compaction-scratch).
+
+| Flag | Meaning |
+|---|---|
+| `--scratch-dir <path>` | Directory the level-1 runs go under. It is a cache: nothing durable is read from it, and each unit's subdirectory is wiped when the unit ends. The first two-level merge locks `ravel-scratch.lock` in it and removes the unit subdirectories a dead process left; other files are kept and count against `--scratch-max-bytes`. A directory another process holds is refused as `ScratchLocked`; a unit is admitted only when about 1.3 times its input bytes is free, and is otherwise refused as `ScratchHeadroom`. Omitted, a bucket whose cursor merge would decode more than 16 rows per input record is refused as `GeometryUnsupported`. |
+| `--scratch-max-bytes <n>` | Cap on the bytes the directory may hold. A unit is admitted against the smaller of the volume's free bytes and the cap less the bytes already there. Omitted, the volume's free bytes alone decide. |
+| `--level1-workers <n>` | Level-1 groups of one bucket merged at once, each under its share of the unit's memory ceiling. Omitted, it is derived per bucket from the unit's share of the usable cores and the largest count whose groups still fit. |
+
+A zero value, or `--scratch-max-bytes` or `--level1-workers` without
+`--scratch-dir`, is refused before any store request. A bucket that went
+through the two-level merge adds a `two_level: level1_groups=<n>
+level1_workers=<n>` line after `outcome: Compacted` in the `compact-bucket`
+report; `compact-tenant` appends the same two figures to that bucket's line.
+A refused bucket's outcome names the reason.
 
 ### L1 segment size
 
