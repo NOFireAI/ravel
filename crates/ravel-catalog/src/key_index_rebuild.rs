@@ -321,7 +321,8 @@ impl Catalog {
         options: &KeyIndexRebuildOptions,
     ) -> Result<KeyIndexRebuildReport, KeyIndexRebuildError> {
         let tenant_config = crate::tenant_config::read_config_values(self.store(), tenant).await?;
-        let Some(declared) = declared_key_index_fields(signal, tenant_config.as_ref(), tenant)
+        let Some(declared) =
+            declared_key_index_fields(signal, tenant_config.as_ref(), tenant, self.config())
         else {
             return Err(KeyIndexRebuildError::UnsupportedSignal(signal));
         };

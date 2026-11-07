@@ -995,6 +995,37 @@ pub fn label_dict_holds_all(
     Ok(resolve_equals(&dict_bytes, &dict_index, equals).is_some())
 }
 
+/// Every string in the LABEL_DICT section, label names and values alike, in
+/// dictionary order, decoded from that section's stored bytes alone.
+///
+/// The section is crc-verified, decompressed within `limits` and indexed
+/// exactly as [`label_dict_holds_all`] does. Unlike that function it needs no
+/// other catalog section, so it answers for an object below the sparse
+/// threshold too. A footer naming no LABEL_DICT section is
+/// `MissingSection("LABEL_DICT")`, never an empty list; corrupt or truncated
+/// bytes are a typed error.
+pub fn label_dict_strings(
+    footer: &Footer,
+    label_dict_stored: &[u8],
+    limits: ReaderLimits,
+) -> Result<Vec<String>, SegmentError> {
+    let section = find_section(footer, section_kind::LABEL_DICT)
+        .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
+    let dict_bytes = decode_section_bytes(section, label_dict_stored, limits)?;
+    let dict_index = index_label_dict(&dict_bytes)?;
+    dict_index
+        .iter()
+        .map(|&(start, len)| {
+            let slice = dict_bytes
+                .get(start..start.saturating_add(len))
+                .ok_or(SegmentError::Truncated)?;
+            std::str::from_utf8(slice)
+                .map(str::to_owned)
+                .map_err(|_| SegmentError::BadUtf8)
+        })
+        .collect()
+}
+
 /// The LABEL_DICT ordinal of every name and value in `equals`, or `None` when
 /// any of them is not in the dictionary. Ordinal 0 is checked directly; the
 /// rest are binary-searched when ordinals `1..` are byte-sorted, which is what

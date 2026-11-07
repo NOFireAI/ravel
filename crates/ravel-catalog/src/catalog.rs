@@ -4307,7 +4307,7 @@ impl Catalog {
     /// fields (ADR-0010 §7) -- which, since the listed key is already asserted
     /// under this tenant's prefix by `guarded_list_all`, also proves the
     /// request's tenant_hash/signal match this (tenant, signal).
-    async fn list_pending_erasure(
+    pub(crate) async fn list_pending_erasure(
         &self,
         tenant: &TenantHash,
         signal: Signal,
