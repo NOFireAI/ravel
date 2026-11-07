@@ -9300,8 +9300,12 @@ pub(crate) mod tests {
     /// grow and once on a process budget grow, on a budget 50 bytes over what
     /// it holds: a fetch-layer reservation of 600 bytes, the statement's
     /// bytes and, when `other_holds` is non-zero, another statement's sorter.
-    /// Returns the reserve-ahead refusal's report, then the process one's.
-    fn refused_beside_a_fetch_reservation(own_asks: usize, other_holds: usize) -> [PoolReport; 2] {
+    /// Returns, for the reserve-ahead refusal and then the process one, the
+    /// first refusal, its recorded share and the spill retry decision.
+    fn refused_beside_a_fetch_reservation(
+        own_asks: usize,
+        other_holds: usize,
+    ) -> [(Option<MemoryRefusal>, Option<BudgetShare>, SpillRetry); 2] {
         let reserved = 600 + other_holds + 2 * own_asks;
         let budget = Arc::new(MemoryBudget::new(reserved as u64 + 50));
         let cache = budget.reserve(600).expect("the cache share fits");
@@ -9331,7 +9335,15 @@ pub(crate) mod tests {
             }
             let refused = report(&pool);
             drop((aggregate, join, pool));
-            refused
+            let decision = spill_retry_decision(
+                &SqlError::ResourcesExhausted("refused".into()),
+                refused,
+                0,
+                true,
+                true,
+                false,
+            );
+            (refused.first, refused.first_share, decision)
         });
         drop((theirs, other, cache));
         assert_eq!(budget.reserved(), 0);
@@ -9350,34 +9362,17 @@ pub(crate) mod tests {
     #[test]
     fn a_single_statement_beside_a_large_cache_retries() {
         let _serial = crate::memory::tests::envelope_tests();
-        let [ahead, process] = refused_beside_a_fetch_reservation(200, 0);
-        for (refused, kind) in [
-            (ahead, MemoryRefusal::ReserveAhead),
-            (process, MemoryRefusal::Process),
-        ] {
-            assert_eq!(
-                (refused.first, refused.first_share),
-                (
-                    Some(kind),
-                    Some(BudgetShare {
-                        budget_reserved: 400,
-                        own: 400,
-                    })
-                )
-            );
-            assert_eq!(
-                spill_retry_decision(
-                    &SqlError::ResourcesExhausted("refused".into()),
-                    refused,
-                    0,
-                    true,
-                    true,
-                    false,
-                ),
-                SpillRetry::Retry,
-                "{kind:?}"
-            );
-        }
+        let share = Some(BudgetShare {
+            budget_reserved: 400,
+            own: 400,
+        });
+        assert_eq!(
+            refused_beside_a_fetch_reservation(200, 0),
+            [
+                (Some(MemoryRefusal::ReserveAhead), share, SpillRetry::Retry),
+                (Some(MemoryRefusal::Process), share, SpillRetry::Retry),
+            ]
+        );
     }
 
     /// Issue #3899 (M2 review): leaving the fetch layer's 600 bytes out of
@@ -9387,34 +9382,21 @@ pub(crate) mod tests {
     #[test]
     fn contention_beside_a_large_cache_still_propagates() {
         let _serial = crate::memory::tests::envelope_tests();
-        let [ahead, process] = refused_beside_a_fetch_reservation(50, 900);
-        for (refused, kind) in [
-            (ahead, MemoryRefusal::ReserveAhead),
-            (process, MemoryRefusal::Process),
-        ] {
-            assert_eq!(
-                (refused.first, refused.first_share),
+        let share = Some(BudgetShare {
+            budget_reserved: 1000,
+            own: 100,
+        });
+        assert_eq!(
+            refused_beside_a_fetch_reservation(50, 900),
+            [
                 (
-                    Some(kind),
-                    Some(BudgetShare {
-                        budget_reserved: 1000,
-                        own: 100,
-                    })
-                )
-            );
-            assert_eq!(
-                spill_retry_decision(
-                    &SqlError::ResourcesExhausted("refused".into()),
-                    refused,
-                    0,
-                    true,
-                    true,
-                    false,
+                    Some(MemoryRefusal::ReserveAhead),
+                    share,
+                    SpillRetry::Propagate
                 ),
-                SpillRetry::Propagate,
-                "{kind:?}"
-            );
-        }
+                (Some(MemoryRefusal::Process), share, SpillRetry::Propagate),
+            ]
+        );
     }
 
     /// Issue #3899: the spill retry's pool is the spill-mode pool, so a
