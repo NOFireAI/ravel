@@ -139,18 +139,6 @@ fn stream(kind: &str, n: usize) -> Vec<i64> {
                 })
                 .collect()
         }
-        // Regular millisecond cadence with ~15% of samples pushed two
-        // intervals back (out of order), as a bursty backfill produces.
-        "out_of_order" => (0..n)
-            .map(|i| {
-                let base = START_NS + i as i64 * STEP_15S_NS;
-                if rng.random_bool(0.15) {
-                    base - 2 * STEP_15S_NS
-                } else {
-                    base
-                }
-            })
-            .collect(),
         other => panic!("unknown stream {other}"),
     }
 }
@@ -161,13 +149,10 @@ fn seed_of(kind: &str) -> u64 {
     })
 }
 
-const MULTI_STREAMS: [&str; 5] = [
-    "regular_ms",
-    "jitter_ms",
-    "nanos_jitter",
-    "irregular",
-    "out_of_order",
-];
+/// Every stream is sorted with one sample per timestamp: a run reaches the
+/// writer in that shape (`encode_run_v4`'s contract), and the reader rejects
+/// a run whose timestamps leave its min/max bounds.
+const MULTI_STREAMS: [&str; 4] = ["regular_ms", "jitter_ms", "nanos_jitter", "irregular"];
 
 // --- self-contained varint + frame-of-reference helpers (ADR-3694 decision
 // 7 challengers only; deliberately not shared with crates/ravel-codec or
@@ -547,7 +532,7 @@ fn ratio(num: usize, den: usize) -> String {
 
 fn header_row() -> String {
     format!(
-        "  {:<22} {:>5} {:<15} {:>7} {:>10} {:>8} {:>9} {:>10}  {:<9} {}\n",
+        "  {:<24} {:>5} {:<15} {:>7} {:>10} {:>8} {:>9} {:>10}  {:<9} {}\n",
         "corpus",
         "n",
         "codec",
@@ -577,7 +562,7 @@ fn page_rows(out: &mut String, corpus: &str, n: usize, cells: &[Cell]) -> String
             (ratio(c.bytes, prod.bytes), ratio(c.bytes, prod_payload))
         };
         out.push_str(&format!(
-            "  {corpus:<22} {n:>5} {:<15} {:>7} {:>10.4} {r:>8} {r_hdr:>9} {:>10.1}  {:<9} {}\n",
+            "  {corpus:<24} {n:>5} {:<15} {:>7} {:>10.4} {r:>8} {r_hdr:>9} {:>10.1}  {:<9} {}\n",
             c.codec,
             c.bytes,
             c.bytes as f64 / n as f64,
@@ -605,7 +590,7 @@ fn page_rows(out: &mut String, corpus: &str, n: usize, cells: &[Cell]) -> String
         }
     }
     format!(
-        "  {corpus:<22} {n:>5} adopt: {:<16} {}\n",
+        "  {corpus:<24} {n:>5} adopt: {:<16} {}\n",
         if winners.is_empty() {
             "none".to_string()
         } else {
@@ -619,10 +604,33 @@ fn page_rows(out: &mut String, corpus: &str, n: usize, cells: &[Cell]) -> String
 /// `metrics_stream_sample::sample_series` draws from `profile_name` over
 /// `steps` scrapes. Millisecond timestamps are widened to nanoseconds so
 /// they share a domain with the synthetic streams above.
-fn metrics_stream(profile_name: &str, steps: u64) -> Option<(u64, Vec<i64>)> {
+///
+/// The generator emits out-of-order and duplicate samples, but a run reaches
+/// the writer sorted by timestamp with one sample per timestamp
+/// (`encode_run_v4`'s contract), so the stream is sorted and deduplicated
+/// here. Returns the seed, the stream, and how many samples arrived out of
+/// order and how many duplicates were dropped.
+fn metrics_stream(profile_name: &str, steps: u64) -> Option<MetricsStream> {
     let (seed, series) = sample_series(profile_name, steps, 1).ok()?;
     let first = series.into_iter().next()?;
-    Some((seed, first.ts_ms.into_iter().map(|ms| ms * MS_NS).collect()))
+    let mut ts: Vec<i64> = first.ts_ms.into_iter().map(|ms| ms * MS_NS).collect();
+    let out_of_order = ts.windows(2).filter(|w| w[1] < w[0]).count();
+    ts.sort_unstable();
+    let before = ts.len();
+    ts.dedup();
+    Some(MetricsStream {
+        seed,
+        out_of_order,
+        duplicates: before - ts.len(),
+        ts,
+    })
+}
+
+struct MetricsStream {
+    seed: u64,
+    ts: Vec<i64>,
+    out_of_order: usize,
+    duplicates: usize,
 }
 
 /// What one report run measures.
@@ -667,9 +675,15 @@ fn render_report(cfg: &RunConfig) -> String {
     for &(profile_name, steps) in cfg.metrics {
         let corpus = format!("metricsbench_{profile_name}");
         match metrics_stream(profile_name, steps) {
-            Some((seed, ts)) => {
+            Some(MetricsStream {
+                seed,
+                ts,
+                out_of_order,
+                duplicates,
+            }) => {
                 out.push_str(&format!(
-                    "\n===== {corpus} (seed={seed}, steps={steps}, series=1, samples={}) =====\n",
+                    "\n===== {corpus} (seed={seed}, steps={steps}, series=1, samples={}, \
+                     sorted: {out_of_order} out of order, {duplicates} duplicates dropped) =====\n",
                     ts.len()
                 ));
                 out.push_str(&header_row());
@@ -773,7 +787,7 @@ mod tests {
             .iter()
             .flat_map(|k| TEST_LENS.iter().map(move |&n| (k.to_string(), n)))
             .collect();
-        let (_seed, ts) = metrics_stream("history", 4).expect("history stream");
+        let ts = metrics_stream("history", 4).expect("history stream").ts;
         pages.extend(
             TEST_LENS
                 .iter()
