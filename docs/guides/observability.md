@@ -2448,8 +2448,10 @@ range the fetch memory budget refuses counts under
 `outcome="reservation_refused"`; a spans leaf range it refuses counts under
 `outcome="rejected"`. The metrics samples move for a PromQL evaluation whose
 selector carries a positive equality matcher, one routing pass per distinct
-value; a selector with none, and every selector of a tenant with a pending
-erasure, leaves them unmoved. A metrics leaf range the fetch memory budget
+value of the statement. A selector with none adds no pass of its own, so a
+statement whose selectors all lack one leaves them unmoved, as does a
+statement over a tenant with a pending erasure or over a snapshot whose
+parts carry no metrics leaf. A metrics leaf range the fetch memory budget
 refuses counts under `outcome="reservation_refused"`.
 
 | Metric | Labels | HELP text |

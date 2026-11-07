@@ -1,4 +1,4 @@
-//! A PromQL range query routes each selector's positive equality values
+//! A PromQL range or instant query routes each selector's positive equality values
 //! through the metrics `label_value` key-index leaves before any object is
 //! opened, and does not read an object a value is proven absent from
 //! (ADR-3694 decision 3, issue #3865).
@@ -464,13 +464,9 @@ impl Fixture {
         get(&app, self.range_uri(query)).await
     }
 
-    /// An instant query at the fixture's end time.
-    async fn query(&self, query: &str) -> Value {
-        let uri = format!(
-            "/api/v1/query?query={}&time={}",
-            urlencode(query),
-            self.end_s
-        );
+    /// An instant query at `time_s`.
+    async fn query(&self, query: &str, time_s: i64) -> Value {
+        let uri = format!("/api/v1/query?query={}&time={time_s}", urlencode(query));
         let (code, value) = get(&self.app, uri).await;
         assert_eq!(code, StatusCode::OK, "query failed: {value}");
         value
@@ -866,13 +862,14 @@ async fn an_instant_query_prunes_non_holders_and_equals_the_unrouted_run() {
     let _serial = SERIAL.lock().await;
     let query = format!("count_over_time({METRIC}{{instance=\"{TARGET}\"}}[4h])");
     let off = serve(Setup::default()).await;
-    let unrouted = off.query(&query).await;
+    // Both runs evaluate at one time, so their sample timestamps compare.
+    let unrouted = off.query(&query, off.end_s).await;
     let on = serve(Setup {
         label_index: true,
         ..Setup::default()
     })
     .await;
-    let routed = on.query(&query).await;
+    let routed = on.query(&query, off.end_s).await;
     let non_holders = OBJECTS - HOLDERS.len() as u64;
     assert_eq!(stat(&routed, "segmentsPrunedByLabelIndex"), non_holders);
     assert_eq!(stat(&unrouted, "segmentsPrunedByLabelIndex"), 0);

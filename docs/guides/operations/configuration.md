@@ -2171,8 +2171,10 @@ metrics leaf.
 
 Once a part carries the leaf, a PromQL selector's positive equality values
 (`__name__` included) are routed through it before any object is opened,
-one value at a time, and an object one of them is proven absent from is not
-read. Recent objects above the fold watermark are always read, and nothing
+one routing pass per distinct value, at most `promql_fetch_fanout` passes at
+a time, and an object one of them is proven absent from is not read. The
+leaf GETs count against `max_s3_requests` and `max_bytes_scanned`. While no
+part carries the leaf, nothing is routed. Recent objects above the fold watermark are always read, and nothing
 is routed while the snapshot has a pending erasure. `data.stats.segmentsPrunedByLabelIndex` counts the objects no
 selector read; the leaf GETs are charged to the `keyIndex` phase and counted
 under `signal="metrics"` in `ravel_query_key_index_parts_total` and

@@ -1159,18 +1159,29 @@ proves that no object in it holds the string `v`, so no series in it carries
   positive equality value is not routed and reads every segment
   (`a_regex_only_selector_routes_nothing`).
 - In a compound query each plan routes over the padded union window the one
-  resolve covers and fetches only the segments it keeps, so no plan loses a
-  segment another plan reads
+  resolve covers and fetches only the segments it keeps, and those include
+  every segment holding a series the plan matches
   (`a_compound_query_with_disjoint_selectors_equals_the_unrouted_run`).
 - A recent segment above the fold watermark and a segment resolved from a
   `min_commit_token` belong to no part, route `Uncovered`, and are always
   read (`an_unfolded_recent_object_is_never_pruned`).
 - While the pinned snapshot carries a pending erasure request, nothing is
   routed: no leaf GET and no prune (`a_pending_erasure_routes_nothing`).
+- When no part a snapshot segment comes from carries a metrics leaf ref,
+  nothing is routed: no leaf GET, and no part counted in
+  `ravel_query_key_index_parts_total`
+  (`without_the_switch_the_route_does_not_run`). The parts themselves are
+  still resolved, since the check reads them.
 - Each value is one routing pass under the router's unchanged `L_max`,
   `P_max` and `B_run` admission, so leaf GETs grow with the number of
-  distinct values. A leaf that names another tenant or signal fails the
-  statement; any other leaf failure leaves its part `Uncovered`.
+  distinct values. The passes run at most `promql_fetch_fanout` at a time. A
+  leaf that names another tenant or signal fails the statement; any other
+  leaf failure leaves its part `Uncovered`.
+- The leaf GETs count against `max_s3_requests` and `max_bytes_scanned`.
+  Both budgets are checked once the route returns, before the first segment
+  fetch, and also when every segment was pruned and no fetch runs, so such
+  a query refuses with the same budget error a fetch batch returns
+  (`a_route_that_prunes_every_object_is_held_to_the_budgets`).
 
 `segmentsPrunedByLabelIndex`, beside `segmentsPruned` in `data.stats`, counts
 the snapshot segments no plan reads. Unlike a dictionary drop, a pruned
@@ -1180,7 +1191,7 @@ GETs to `ravel_query_key_index_parts_total` and
 `ravel_query_key_index_leaf_gets_total` under `signal="metrics"`. With no
 metrics leaf in the snapshot, `segmentsPrunedByLabelIndex` and the
 `keyIndex` figures are zero
-(`without_the_switch_nothing_is_pruned_and_the_key_index_phase_is_zero`).
+(`without_the_switch_the_route_does_not_run`).
 
 ### The L0 page-range bound (ADR-1306)
 
