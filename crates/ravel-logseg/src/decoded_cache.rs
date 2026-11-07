@@ -1205,9 +1205,8 @@ impl DecodedColumnCache {
             .checked_add(bytes)
             .is_some_and(|total| total <= self.view_max_bytes);
         let ledger_fits = self.budget.as_ref().is_none_or(|budget| {
-            let gate_refuses = bytes > 0
-                && !budget.gate_open()
-                && budget.gate_available() < budget.gate_floor();
+            let gate_refuses =
+                bytes > 0 && !budget.gate_open() && budget.gate_available() < budget.gate_floor();
             let ceiling = budget
                 .limit()
                 .saturating_sub(admission_margin(budget.limit()));

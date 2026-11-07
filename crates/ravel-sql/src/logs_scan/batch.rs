@@ -7055,7 +7055,10 @@ mod tests {
                 mask: Option<u64>,
             ) -> Result<(), TestCaseError> {
                 {
-                    let cfg = RlogConfig { block_target_records: 8192, ..cfg() };
+                    let cfg = RlogConfig {
+                        block_target_records: 8192,
+                        ..cfg()
+                    };
                     let value = |r: usize| {
                         if r % empty_every == 1 {
                             String::new()
@@ -7096,8 +7099,7 @@ mod tests {
                         prop_assert!(views.is_some(), "the memo serves its own values");
                         let n = memo.len();
                         // Permuted full-length keys over the memo.
-                        let permuted: Int32Array =
-                            (0..n).rev().map(|k| Some(k as i32)).collect();
+                        let permuted: Int32Array = (0..n).rev().map(|k| Some(k as i32)).collect();
                         let reversed = rekeyed(whole, permuted);
                         let got = group_key(&reversed, true);
                         prop_assert!(
@@ -7270,11 +7272,17 @@ mod tests {
                 let (_, _, _, _cache, p) = filled(&budget, VIEW_BUDGET);
                 let batch = &p.batches[0];
                 let memo = values_of(batch);
-                assert!(view_registry::views_of(&memo).is_some(), "filled and served");
+                assert!(
+                    view_registry::views_of(&memo).is_some(),
+                    "filled and served"
+                );
                 let nulls = NullBuffer::from((0..ROWS).map(|r| r != 1).collect::<Vec<bool>>());
-                let values =
-                    StringArray::try_new(memo.offsets().clone(), memo.values().clone(), Some(nulls))
-                        .expect("values");
+                let values = StringArray::try_new(
+                    memo.offsets().clone(),
+                    memo.values().clone(),
+                    Some(nulls),
+                )
+                .expect("values");
                 let dict = DictionaryArray::try_new(
                     (0..ROWS as i32).collect::<Int32Array>(),
                     Arc::new(values) as ArrayRef,

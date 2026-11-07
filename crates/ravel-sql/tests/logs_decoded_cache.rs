@@ -1468,7 +1468,13 @@ async fn view_memo_keys(exec: &SqlExecutor, t: &TenantId, sql: &str) -> [u64; 4]
         .decoded_cache
         .expect("decodedCache stats with a cache");
     let json = ravel_sql::stats_json::decoded_cache_json(&stats);
-    ["viewMemoBytes", "viewMemoFills", "viewMemoRefusals", "viewMemoReleases"].map(|k| {
+    [
+        "viewMemoBytes",
+        "viewMemoFills",
+        "viewMemoRefusals",
+        "viewMemoReleases",
+    ]
+    .map(|k| {
         json.get(k)
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_else(|| panic!("{k} in {json}"))
@@ -1510,7 +1516,12 @@ async fn per_call_view_memo_stats_are_the_statements_own() {
     }
     assert_eq!(
         calls,
-        [[0, 0, 0, 0], [0, 0, 0, 0], [views, 8, 0, 0], [views, 0, 0, 0]],
+        [
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [views, 8, 0, 0],
+            [views, 0, 0, 0]
+        ],
         "ghost, admit, first serve, hit"
     );
     let freed = cache.evict_for_pressure(views, 0, ravel_memory::ExhaustionCause::Accounted);
