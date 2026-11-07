@@ -1135,10 +1135,10 @@ impl FetchStats {
 #[derive(Default)]
 struct FetchedRegions {
     buffers: Vec<(u64, Bytes)>,
-    /// Slices of another `FetchedRegions`' buffers (an L1 page batch borrowing
-    /// the bytes its segment's open and catalog fetch already hold). They are
-    /// refcounted views whose bytes stay under the lender's reservations, so
-    /// these regions hold no reservation for them.
+    /// Whole buffers of another `FetchedRegions` (an L1 page batch borrowing
+    /// the buffers its segment's open and catalog fetch already hold), each at
+    /// most once. They are refcounted clones whose bytes stay under the
+    /// lender's reservations, so these regions hold no reservation for them.
     borrowed: Vec<(u64, Bytes)>,
     /// Fetch-layer byte reservations (ADR-1170 decision 2) covering the GETs
     /// that filled `buffers`. Owned here so a reservation lives exactly as long
@@ -1159,13 +1159,21 @@ impl FetchedRegions {
         self.reservations.push(reservation);
     }
 
-    /// Regions for one L1 page batch: empty, except for the parts of `needed`
-    /// that `lender` already holds, borrowed rather than fetched again.
+    /// Regions for one L1 page batch: empty, except for every buffer of
+    /// `lender` that wholly contains at least one `(start, end)` range of
+    /// `needed`, borrowed once as a refcounted clone rather than fetched again.
+    /// The borrowed list is bounded by the lender's buffer count, not by the
+    /// number of ranges. A range that straddles two lender buffers is borrowed
+    /// by neither, since `slice` needs one buffer to contain it.
     fn borrowing(lender: &FetchedRegions, needed: &[(u64, u64)]) -> Self {
         let mut regions = FetchedRegions::default();
-        for &(start, end) in needed {
-            if let Some(bytes) = lender.slice(start, end.saturating_sub(start)) {
-                regions.borrowed.push((start, bytes));
+        for (s, b) in lender.all_buffers() {
+            let buffer_end = s.saturating_add(b.len() as u64);
+            if needed
+                .iter()
+                .any(|&(start, end)| *s <= start && end <= buffer_end)
+            {
+                regions.borrowed.push((*s, b.clone()));
             }
         }
         regions
@@ -2958,11 +2966,18 @@ impl SegmentFetcher {
             &histogram_planned,
             batch_bytes,
             self.coalesce_gap,
-        ) {
-            let scalar_entries = scalar.get(batch.scalar).unwrap_or(&[]);
-            let scalar_plans = scalar_planned.get(batch.scalar_plans).unwrap_or(&[]);
-            let histogram_entries = histogram.get(batch.histogram).unwrap_or(&[]);
-            let histogram_plans = histogram_planned.get(batch.histogram_plans).unwrap_or(&[]);
+        )
+        .map_err(|source| corrupt(key, source))?
+        {
+            let out_of_bounds = || corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds);
+            let scalar_entries = scalar.get(batch.scalar).ok_or_else(out_of_bounds)?;
+            let scalar_plans = scalar_planned
+                .get(batch.scalar_plans)
+                .ok_or_else(out_of_bounds)?;
+            let histogram_entries = histogram.get(batch.histogram).ok_or_else(out_of_bounds)?;
+            let histogram_plans = histogram_planned
+                .get(batch.histogram_plans)
+                .ok_or_else(out_of_bounds)?;
             let ranges = page_ranges(scalar_plans, histogram_plans);
             let page_kind = match (scalar_entries.is_empty(), histogram_entries.is_empty()) {
                 (false, true) => "scalar",
@@ -4077,13 +4092,18 @@ fn coalesced_batch_bytes(sections: &[SectionSpan; 3], gap: u64) -> u64 {
 /// minus those the segment's open and catalog regions already hold, which is
 /// what bounds it by the bytes counted here. Counting ranges those regions
 /// already hold over-counts, the safe direction.
+///
+/// A series whose runs reach past the end of its kind's planned list is an
+/// inconsistency between the catalog entries and the planned ranges, and
+/// fails with [`SegmentError::SectionOutOfBounds`](ravel_segment::SegmentError::SectionOutOfBounds)
+/// rather than batching the series with fewer plans than runs.
 fn page_batches(
     wanted: &[&SeriesEntryV4],
     scalar_planned: &[ravel_segment::PlannedRunRange],
     histogram_planned: &[ravel_segment::PlannedRunRange],
     batch_bytes: u64,
     coalesce_gap: u64,
-) -> Vec<PageBatch> {
+) -> Result<Vec<PageBatch>, ravel_segment::SegmentError> {
     const TS: usize = 0;
     const VAL: usize = 1;
     const HIST: usize = 2;
@@ -4105,8 +4125,12 @@ fn page_batches(
         } else {
             (scalar_planned, scalar_plans)
         };
-        let end = start.saturating_add(entry.runs.len()).min(plans.len());
-        let series_plans = plans.get(start..end).unwrap_or(&[]);
+        let end = start
+            .checked_add(entry.runs.len())
+            .ok_or(ravel_segment::SegmentError::SectionOutOfBounds)?;
+        let series_plans = plans
+            .get(start..end)
+            .ok_or(ravel_segment::SegmentError::SectionOutOfBounds)?;
         let with_series = |mut sections: [SectionSpan; 3]| {
             for p in series_plans {
                 sections[TS].add(range(p.ts_range), coalesce_gap);
@@ -4147,7 +4171,7 @@ fn page_batches(
     if !(current.scalar.is_empty() && current.histogram.is_empty()) {
         batches.push(current);
     }
-    batches
+    Ok(batches)
 }
 
 /// The page byte ranges of one batch's plans: TS and VAL for each scalar
@@ -9556,6 +9580,115 @@ mod tests {
                 prop_assert_eq!(ord_ids, mat_ids);
             }
         }
+    }
+
+    fn patterned(start: u64, len: usize) -> Bytes {
+        Bytes::from(
+            (0..len)
+                .map(|i| ((start as usize + i) % 251) as u8)
+                .collect::<Vec<u8>>(),
+        )
+    }
+
+    #[test]
+    fn borrowing_takes_each_covering_lender_buffer_once() {
+        let mut lender = FetchedRegions::default();
+        lender.insert(4096, patterned(4096, 16_000));
+        let needed: Vec<(u64, u64)> = (0..1_000u64)
+            .map(|i| (4096 + i * 16, 4096 + i * 16 + 12))
+            .collect();
+        let batch = FetchedRegions::borrowing(&lender, &needed);
+        assert_eq!(batch.borrowed.len(), 1);
+        assert_eq!(batch.owned_bytes(), 0);
+        assert_eq!(batch.reserved_bytes(), 0);
+        for &(start, end) in &needed {
+            assert!(batch.covers(start, end));
+            assert_eq!(
+                batch.slice(start, end - start).expect("borrowed range"),
+                lender.slice(start, end - start).expect("lender range"),
+            );
+        }
+    }
+
+    #[test]
+    fn borrowing_skips_lender_buffers_no_needed_range_touches() {
+        let mut lender = FetchedRegions::default();
+        lender.insert(0, patterned(0, 100));
+        lender.insert(1_000, patterned(1_000, 100));
+        lender.insert(5_000, patterned(5_000, 100));
+        let needed = [
+            (10, 20),
+            (30, 40),
+            (50, 90),
+            (1_000, 1_010),
+            (1_020, 1_090),
+            // Straddles past the end of the buffer at 0: no single buffer holds it.
+            (90, 110),
+        ];
+        let batch = FetchedRegions::borrowing(&lender, &needed);
+        let starts: Vec<u64> = batch.borrowed.iter().map(|(s, _)| *s).collect();
+        assert_eq!(starts, vec![0, 1_000]);
+        assert_eq!(batch.owned_bytes(), 0);
+        assert!(!batch.covers(90, 110));
+        assert!(!batch.covers(5_000, 5_010));
+        for &(start, end) in &needed[..5] {
+            assert_eq!(
+                batch.slice(start, end - start).expect("borrowed range"),
+                lender.slice(start, end - start).expect("lender range"),
+            );
+        }
+    }
+
+    #[test]
+    fn page_batches_refuses_runs_past_the_planned_list() {
+        let series_id =
+            SeriesId::compute(&TenantId::new("t".to_string()), "m", &labels("m")).expect("id");
+        let run = |i: u64| RunEntry {
+            created_unix_ns: 0,
+            writer_epoch: 0,
+            writer_seq: i,
+            sample_count: 1,
+            min_ts_ns: 0,
+            max_ts_ns: 0,
+            ts_page: (i * 8, 8),
+            val_page: (i * 8, 8),
+            hist_page: (0, 0),
+        };
+        let entry = SeriesEntryV4 {
+            entry: SeriesEntry {
+                series_id,
+                labels: labels("m"),
+                sample_count: 3,
+                min_ts_ns: 0,
+                max_ts_ns: 0,
+                ts_page: (0, 0),
+                val_page: (0, 0),
+                value_kind: ValueKind::Scalar,
+                hist_page: (0, 0),
+            },
+            runs: (0..3).map(run).collect(),
+            per_sample_provenance: Vec::new(),
+        };
+        let plan = |i: u64| ravel_segment::PlannedRunRange {
+            series_id,
+            run_index: i as usize,
+            ts_range: (100 + i * 8, 8),
+            val_range: (1_000 + i * 8, 8),
+            hist_range: (0, 0),
+        };
+        let wanted = [&entry];
+        let full: Vec<_> = (0..3).map(plan).collect();
+        let batches = page_batches(&wanted, &full, &[], u64::MAX, 0).expect("consistent plans");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].scalar_plans, 0..3);
+
+        let short: Vec<_> = (0..2).map(plan).collect();
+        let result = page_batches(&wanted, &short, &[], u64::MAX, 0);
+        assert!(
+            matches!(result, Err(ravel_segment::SegmentError::SectionOutOfBounds)),
+            "a series with more runs than planned ranges must refuse, got {:?}",
+            result.map(|b| b.iter().map(|b| b.scalar_plans.clone()).collect::<Vec<_>>()),
+        );
     }
 }
 
