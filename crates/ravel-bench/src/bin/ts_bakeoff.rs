@@ -20,10 +20,14 @@
 //!    production's payload; it is a reference, not a challenger. The divisor
 //!    found is reported.
 //! 4. **dod_for (challenger a)**: delta-of-delta with a jitter-tolerant
-//!    residual -- first delta zigzag-varint, each later delta coded as its
-//!    difference from the previous delta, those residuals frame-of-reference
-//!    bit-packed per fixed-size block (so one jittery block costs its own
-//!    bit width, not the whole page's).
+//!    residual -- first value and first delta zigzag-varint, each later delta
+//!    coded as its difference from the previous delta, those residuals
+//!    frame-of-reference bit-packed per fixed-size block (so one jittery
+//!    block costs its own bit width, not the whole page's). Each block is
+//!    `zigzag-varint min`, a bit-width byte, then the packed offsets. The
+//!    payload carries no sample count: production's TS page does not either
+//!    (the reader takes it from the run entry), and every row here decodes
+//!    with the count supplied from outside.
 //! 5. **gcd_forced_dod (challenger b)**: `uvarint gcd`, then the page divided
 //!    by that GCD forced onto the exact `enc_double_delta_i64` arm of `encode_i64`
 //!    (absolute first value, first delta, then each later delta's
@@ -207,10 +211,15 @@ fn get_ivarint(bytes: &[u8], pos: &mut usize) -> Option<i64> {
 
 /// Frame-of-reference bit-pack of one block: `zigzag min`, a bit-width byte,
 /// then the `(value - min)` offsets packed LSB-first across byte boundaries.
+/// The offset is a wrapping difference: a block holding both extremes of the
+/// i64 range spans more than `i64::MAX`, and its offset still fits a u64.
 fn for_pack_block(out: &mut Vec<u8>, block: &[i64]) {
     let min = *block.iter().min().expect("block is non-empty");
     put_ivarint(out, min);
-    let offsets: Vec<u64> = block.iter().map(|&v| (v - min) as u64).collect();
+    let offsets: Vec<u64> = block
+        .iter()
+        .map(|&v| (v as u64).wrapping_sub(min as u64))
+        .collect();
     let max_off = offsets.iter().copied().max().unwrap_or(0);
     let bit_width: u32 = 64 - max_off.leading_zeros();
     out.push(bit_width as u8);
@@ -240,6 +249,9 @@ fn for_unpack_block(bytes: &[u8], pos: &mut usize, count: usize) -> Option<Vec<i
     if bit_width == 0 {
         return Some(vec![min; count]);
     }
+    if bit_width > 64 {
+        return None;
+    }
     let mask: u128 = (1u128 << bit_width) - 1;
     let mut acc: u128 = 0;
     let mut acc_bits: u32 = 0;
@@ -254,7 +266,7 @@ fn for_unpack_block(bytes: &[u8], pos: &mut usize, count: usize) -> Option<Vec<i
         let off = (acc & mask) as u64;
         acc >>= bit_width;
         acc_bits -= bit_width;
-        out.push(min.checked_add(off as i64)?);
+        out.push((min as u64).wrapping_add(off) as i64);
     }
     Some(out)
 }
@@ -266,10 +278,11 @@ const DOD_BLOCK_LEN: usize = 128;
 
 /// Challenger (a): first value absolute, first delta zigzag-varint, each
 /// later delta's difference from the previous delta frame-of-reference
-/// bit-packed per `DOD_BLOCK_LEN`-sized block. `None` on i64 overflow.
+/// bit-packed per `DOD_BLOCK_LEN`-sized block. No sample count: like
+/// production's TS page, the reader takes it from outside. `None` on i64
+/// overflow.
 fn dod_for_encode(values: &[i64]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    put_uvarint(&mut out, values.len() as u64);
     let Some(&first) = values.first() else {
         return Some(out);
     };
@@ -294,9 +307,8 @@ fn dod_for_encode(values: &[i64]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn dod_for_decode(bytes: &[u8]) -> Option<Vec<i64>> {
+fn dod_for_decode(bytes: &[u8], n: usize) -> Option<Vec<i64>> {
     let mut pos = 0usize;
-    let n = usize::try_from(get_uvarint(bytes, &mut pos)?).ok()?;
     let mut out = Vec::with_capacity(n);
     if n == 0 {
         return Some(out);
@@ -531,7 +543,7 @@ fn measure_page(label: &str, ts: &[i64], timing: Timing) -> Vec<Cell> {
 
     let dod = dod_for_encode(ts).expect("dod_for encodes every bake-off stream");
     assert_eq!(
-        dod_for_decode(&dod).as_deref(),
+        dod_for_decode(&dod, n).as_deref(),
         Some(ts),
         "dod_for round trip failed for {label} n={n}"
     );
@@ -539,7 +551,7 @@ fn measure_page(label: &str, ts: &[i64], timing: Timing) -> Vec<Cell> {
         codec: DOD_FOR,
         bytes: dod.len(),
         dec_mtps: decode_mtps(timing, n, || {
-            black_box(dod_for_decode(black_box(&dod)));
+            black_box(dod_for_decode(black_box(&dod), n));
         }),
         note: String::new(),
     });
@@ -674,10 +686,31 @@ struct MetricsStream {
     duplicates: usize,
 }
 
+/// One MetricsBench corpus as drawn: the profile, its scrape steps, and the
+/// stream, or `None` when the profile sampled no series.
+struct MetricsCorpus {
+    profile_name: &'static str,
+    steps: u64,
+    stream: Option<MetricsStream>,
+}
+
+/// Draws every `(profile, steps)` stream once, so the renderer and anything
+/// that checks its output read the same samples.
+fn draw_metrics(profiles: &[(&'static str, u64)]) -> Vec<MetricsCorpus> {
+    profiles
+        .iter()
+        .map(|&(profile_name, steps)| MetricsCorpus {
+            profile_name,
+            steps,
+            stream: metrics_stream(profile_name, steps),
+        })
+        .collect()
+}
+
 /// What one report run measures.
 struct RunConfig<'a> {
     lens: &'a [usize],
-    metrics: &'a [(&'a str, u64)],
+    metrics: &'a [MetricsCorpus],
     timing: Timing,
 }
 
@@ -696,7 +729,8 @@ fn render_report(cfg: &RunConfig) -> String {
          note: production's selected TS enc (1 TS_DELTA_VARINT, 2 TS_GCD_I64);\n\
          gcd = divisor the GCD codecs divided the page by.\n\
          enc_i64/gcd = enc 2's payload: uvarint gcd, Enc tag byte, encode_i64(page / gcd).\n\
-         dod_for = challenger (a): delta-of-delta, FOR-bit-packed per 128-sample block.\n\
+         dod_for = challenger (a): zigzag first value, zigzag first delta, then\n\
+         delta-of-delta FOR-bit-packed per 128-sample block; no sample count.\n\
          gcd_forced_dod = challenger (b): uvarint gcd, then page / gcd forced onto\n\
          encode_i64's double-delta arm alone (never its best-of search).\n\
          Rule, per row: a challenger is adopted only if bit-exact, ratio_hdr <= 0.75,\n\
@@ -714,9 +748,14 @@ fn render_report(cfg: &RunConfig) -> String {
         }
     }
 
-    for &(profile_name, steps) in cfg.metrics {
+    for MetricsCorpus {
+        profile_name,
+        steps,
+        stream,
+    } in cfg.metrics
+    {
         let corpus = format!("metricsbench_{profile_name}");
-        match metrics_stream(profile_name, steps) {
+        match stream {
             Some(MetricsStream {
                 seed,
                 ts,
@@ -754,7 +793,7 @@ fn main() {
     );
     out.push_str(&render_report(&RunConfig {
         lens: &PAGE_LENS,
-        metrics: &METRICS_PROFILES,
+        metrics: &draw_metrics(&METRICS_PROFILES),
         timing: FULL_TIMING,
     }));
     print!("{out}");
@@ -815,37 +854,37 @@ mod tests {
 
     /// The full report `main` prints, on reduced page lengths, both
     /// MetricsBench profiles at few steps, and one timing round, plus the
-    /// cells it must hold, derived from the inputs rather than from the
-    /// renderer. Rendered once and shared, since the cardinality profile
-    /// generates every active series per step.
+    /// cells it must hold, derived from the drawn inputs rather than from
+    /// the renderer. Each stream is drawn once and rendered once, and the
+    /// result is shared, since the cardinality profile generates every
+    /// active series per step.
     fn reduced_report() -> (String, Vec<(String, usize)>) {
         static REPORT: std::sync::OnceLock<(String, Vec<(String, usize)>)> =
             std::sync::OnceLock::new();
         REPORT
             .get_or_init(|| {
+                let metrics = draw_metrics(&TEST_METRICS);
+                let mut pages: Vec<(String, usize)> = MULTI_STREAMS
+                    .iter()
+                    .flat_map(|k| TEST_LENS.iter().map(move |&n| (k.to_string(), n)))
+                    .collect();
+                for m in &metrics {
+                    let len = m.stream.as_ref().expect("MetricsBench stream").ts.len();
+                    pages.extend(
+                        TEST_LENS
+                            .iter()
+                            .filter(|&&n| n <= len)
+                            .map(|&n| (format!("metricsbench_{}", m.profile_name), n)),
+                    );
+                }
                 let out = render_report(&RunConfig {
                     lens: &TEST_LENS,
-                    metrics: &TEST_METRICS,
+                    metrics: &metrics,
                     timing: Timing {
                         rounds: 1,
                         samples_per_round: 1,
                     },
                 });
-                let mut pages: Vec<(String, usize)> = MULTI_STREAMS
-                    .iter()
-                    .flat_map(|k| TEST_LENS.iter().map(move |&n| (k.to_string(), n)))
-                    .collect();
-                for &(profile_name, steps) in &TEST_METRICS {
-                    let ts = metrics_stream(profile_name, steps)
-                        .expect("MetricsBench stream")
-                        .ts;
-                    pages.extend(
-                        TEST_LENS
-                            .iter()
-                            .filter(|&&n| n <= ts.len())
-                            .map(|&n| (format!("metricsbench_{profile_name}"), n)),
-                    );
-                }
                 (out, pages)
             })
             .clone()
@@ -958,7 +997,7 @@ mod tests {
             let encoded = dod_for_encode(&values);
             prop_assert_eq!(encoded.is_some(), dod_fits(&values));
             if let Some(bytes) = encoded {
-                prop_assert_eq!(dod_for_decode(&bytes), Some(values));
+                prop_assert_eq!(dod_for_decode(&bytes, values.len()), Some(values));
             }
         }
 
