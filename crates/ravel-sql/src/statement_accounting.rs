@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use ravel_logseg::decoded_cache::DecodedCacheSnapshot;
+use ravel_logseg::decoded_cache::{DecodedCacheSnapshot, ViewMemoSnapshot};
 use ravel_query::{EngineConfig, PhaseAccounting, PhaseAccountingSnapshot};
 use ravel_types::accounting::{AccessIntent, QueryAccountingSnapshot};
 
@@ -194,6 +194,34 @@ impl StatementAccounting {
                     sum.saturating_add(&next)
                 }),
             StatementAccounting::One(handle) => handle.decoded_cache().snapshot(),
+        }
+    }
+
+    /// This statement's view memo fills and refusals summed over every
+    /// handle (ADR-3326, view memo amendment, decision 7); `bytes` and
+    /// `releases` read 0 here, as [`DecodedCacheCounters::view_snapshot`]
+    /// says.
+    ///
+    /// [`DecodedCacheCounters::view_snapshot`]: ravel_logseg::decoded_cache::DecodedCacheCounters::view_snapshot
+    pub(crate) fn decoded_cache_view_snapshot(&self) -> ViewMemoSnapshot {
+        let sum = |a: ViewMemoSnapshot, b: ViewMemoSnapshot| ViewMemoSnapshot {
+            bytes: 0,
+            fills: a.fills.saturating_add(b.fills),
+            refusals: a.refusals.saturating_add(b.refusals),
+            releases: 0,
+        };
+        match self {
+            StatementAccounting::Split {
+                lanes,
+                parquet,
+                statement,
+                ..
+            } => lanes
+                .iter()
+                .chain([parquet, statement])
+                .map(|handle| handle.decoded_cache().view_snapshot())
+                .fold(ViewMemoSnapshot::default(), sum),
+            StatementAccounting::One(handle) => handle.decoded_cache().view_snapshot(),
         }
     }
 

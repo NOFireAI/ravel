@@ -3078,6 +3078,19 @@ pub struct Cli {
     #[arg(long, value_name = "BYTES", default_value_t = 0)]
     pub decoded_cache_max_bytes: u64,
 
+    /// View budget in bytes of the decoded column-block cache, apart from
+    /// `--decoded-cache-max-bytes` (ADR-3326, view memo amendment). A
+    /// `GROUP BY` over a declared `Str` column served from a plain page keeps
+    /// that page's per-row string views here, charged to the process memory
+    /// budget and released first under memory pressure. Unset, it is the
+    /// smallest of a quarter of the cap, 2 GiB, and the memory budget less
+    /// the cap and the admission margin, floored at 0; it is 0 while the
+    /// decoded cache is off. `0` keeps no views. Startup logs the value in
+    /// force and the term that bound it, and warns when an explicit value is
+    /// above the budget's room.
+    #[arg(long, value_name = "BYTES")]
+    pub decoded_cache_view_max_bytes: Option<u64>,
+
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
     /// both the query fetcher cache (`store::build_cache`) and the catalog byte
@@ -4284,6 +4297,10 @@ pub struct QueryBudgets {
     /// `--decoded-cache-max-bytes` (ADR-3326). `0` builds no decoded
     /// column-block cache.
     pub decoded_cache_max_bytes: u64,
+    /// `--decoded-cache-view-max-bytes` (ADR-3326, view memo amendment).
+    /// `None` takes the derived default
+    /// ([`resolve_decoded_cache_view_max_bytes`]).
+    pub decoded_cache_view_max_bytes: Option<u64>,
 }
 
 impl Default for QueryBudgets {
@@ -4315,6 +4332,111 @@ impl Default for QueryBudgets {
             fold_lag_interval: None,
             sql_spill: SqlSpillSettings::default(),
             decoded_cache_max_bytes: 0,
+            decoded_cache_view_max_bytes: None,
+        }
+    }
+}
+
+/// The term that set the decoded cache's view budget
+/// ([`resolve_decoded_cache_view_max_bytes`]), as the startup log names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewBudgetBound {
+    /// `--decoded-cache-view-max-bytes` was given.
+    Explicit,
+    /// The decoded cache is off, so there is no view memo.
+    CacheOff,
+    /// A quarter of `--decoded-cache-max-bytes`.
+    CapQuarter,
+    /// 2 GiB.
+    TwoGib,
+    /// The memory budget less the cap and the admission margin.
+    BudgetRoom,
+    /// The budget's room is negative: the cap plus the margin exceed it.
+    FlooredAtZero,
+}
+
+impl ViewBudgetBound {
+    /// The name the startup log line carries.
+    pub fn name(self) -> &'static str {
+        match self {
+            ViewBudgetBound::Explicit => "explicit",
+            ViewBudgetBound::CacheOff => "decoded_cache_off",
+            ViewBudgetBound::CapQuarter => "cap_quarter",
+            ViewBudgetBound::TwoGib => "two_gib",
+            ViewBudgetBound::BudgetRoom => "budget_room",
+            ViewBudgetBound::FlooredAtZero => "floored_at_zero",
+        }
+    }
+}
+
+/// The decoded cache's view budget as startup resolved it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedViewBudget {
+    /// The view budget the cache is built with; 0 keeps no view memo.
+    pub bytes: u64,
+    /// The term that set it.
+    pub bound: ViewBudgetBound,
+    /// The memory budget less the cap and the admission margin, floored at
+    /// 0: the most the views can take without eating into the margin.
+    pub room: u64,
+}
+
+/// 2 GiB, the derived view budget's fixed ceiling.
+pub const VIEW_BUDGET_CEILING_BYTES: u64 = 2 << 30;
+
+/// Resolves `--decoded-cache-view-max-bytes` against the decoded cache's
+/// `cap` and the process memory `budget` (ADR-3326, view memo amendment,
+/// decision 3). With the cache off (`cap` 0) it is 0. An explicit value is
+/// used as given. Unset, it is the smallest of `cap / 4`, 2 GiB and `budget -
+/// cap - admission_margin(budget)`, floored at 0, the first of those three
+/// winning a tie (`view_budget_default_takes_the_smallest_term`).
+pub fn resolve_decoded_cache_view_max_bytes(
+    flag: Option<u64>,
+    cap: u64,
+    budget: u64,
+) -> ResolvedViewBudget {
+    let margin = ravel_logseg::decoded_cache::admission_margin(budget);
+    let room = i128::from(budget) - i128::from(cap) - i128::from(margin);
+    let floored = u64::try_from(room.max(0)).unwrap_or(u64::MAX);
+    let (bytes, bound) = if cap == 0 {
+        (0, ViewBudgetBound::CacheOff)
+    } else if let Some(explicit) = flag {
+        (explicit, ViewBudgetBound::Explicit)
+    } else if room < 0 {
+        (0, ViewBudgetBound::FlooredAtZero)
+    } else {
+        [
+            (cap / 4, ViewBudgetBound::CapQuarter),
+            (VIEW_BUDGET_CEILING_BYTES, ViewBudgetBound::TwoGib),
+            (floored, ViewBudgetBound::BudgetRoom),
+        ]
+        .into_iter()
+        .reduce(|best, next| if next.0 < best.0 { next } else { best })
+        .unwrap_or((0, ViewBudgetBound::FlooredAtZero))
+    };
+    ResolvedViewBudget {
+        bytes,
+        bound,
+        room: floored,
+    }
+}
+
+impl ResolvedViewBudget {
+    /// Logs the view budget in force and the term that set it, once, and
+    /// warns when an explicit value is above the budget's room.
+    pub fn log(&self) {
+        tracing::info!(
+            decoded_cache_view_max_bytes = self.bytes,
+            bound = self.bound.name(),
+            "decoded column-block cache view budget"
+        );
+        if self.bound == ViewBudgetBound::Explicit && self.bytes > self.room {
+            tracing::warn!(
+                decoded_cache_view_max_bytes = self.bytes,
+                room_bytes = self.room,
+                "--decoded-cache-view-max-bytes is above the memory budget less the decoded \
+                 cache's cap and its admission margin: view fills past that room are refused"
+            );
         }
     }
 }
@@ -8111,6 +8233,7 @@ impl Cli {
                 },
             },
             decoded_cache_max_bytes: self.decoded_cache_max_bytes,
+            decoded_cache_view_max_bytes: self.decoded_cache_view_max_bytes,
         })
     }
 
