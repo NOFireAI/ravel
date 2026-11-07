@@ -1236,11 +1236,11 @@ its miss line is recorded, with its cause where Stage 1 established one:
 | 4 | warm: 0 data GETs, 0 leaf GETs, 1 resolve GET | holds | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/summary.s3.txt |
 | 5 | q20 on leaves: 1 object opened, 6 GETs, 407,161 B, p50 0.68 s, 4 rows exact | holds; box B, before T5, opened 497 objects with 1,470 GETs | comment 6698223574 |
 | 6 | q20 unfolded: 970 `keyIndex` GETs, 6 GETs past the probe, scan wire 989,537 B, rows exact; `objects_past_probe` 497 against the target's holders (1); 523 `hits` objects in this load against the band's 398 | under the miss lines on GETs and wire; the objects-past-probe target misses, as on box B; the cause is not established, and #3918 checks the figure's basis; whole reads of absent-key objects cannot be counted, since the stats carry no per-object breakdown | comment 6698223574 |
-| 7 | spans: 240 ranged section GETs (2 x 40 new entries x 3 passes) and 1 previous-leaf GET, 3 passes, peak RSS 1,079,029,760 B; logs: 1,188 (2 x 22 x 27) and 6, 27 passes, peak RSS 1,990,848,512 B; uncovered entries 0 | inside the pass-end slice amendment's rule at `G` = 3 and 27, and not a rebuild (only new entries' sections were read on each pass); the pass counts and the logs section GETs miss their pre-registered values (below) | comment 6700944105 |
-| 8 | spans trace_id 4.38 %; logs trace_id 5.87 %, request_id 28.82 %; HEAD bytes per (part, field) not reported on this build | spans' leaf share holds; **logs trace_id misses** (over 5.0 %); request_id is restated below; the HEAD half is not measured | comment 6698223574 |
+| 7 | spans: 240 ranged section GETs (2 x 40 new entries x 3 passes) and 1 previous-leaf GET, 3 passes, peak RSS 1,079,029,760 B; logs: 1,188 (2 x 22 x 27) and 6, 27 passes, peak RSS 1,990,848,512 B; uncovered entries 0 | inside the pass-end slice amendment's rule at `G` = 3 and 27, and not a rebuild (only new entries' sections were read on each pass); the pass counts and the logs section GETs miss their pre-registered values (below); #3918 reads the row per pass, and #3927 owns the advance's cost | comment 6700944105 |
+| 8 | spans trace_id 4.38 %; logs trace_id 5.87 %, request_id 28.82 %; HEAD bytes per (part, field) not reported on this build | spans' leaf share holds; **logs trace_id misses** (over 5.0 %): a leaf costs about 11 B per pair on every field, so the share is this corpus's pair density (below), and #3927 carries the miss into the logs switch decision; request_id is restated below; the HEAD half is not measured (#3928) | comment 6698223574 |
 | 9 | 744 parts: 744 covering, 747 resolve GETs, 1,451 leaf GETs, 0 past the ceiling, rows exact | under the target's exact 2 x 744 = 1,488, so the target misses; under the miss line of 2 per part; consistent with decision 2's rule that a bucket the directory says is empty costs no GET, not checked per part | comment 6698223574 |
 | 10 | 2,160 parts: 1,994 leaf GETs, 1,136 past the ceiling, rows exact | under the exact 2,048 leaf GETs, so the target misses; not over 2,048, the miss line; read as row 9; 1,136 past the ceiling as predicted | comment 6698223574 |
-| 11 | rows exact and `keysProbed` equal to the list size at every size on both tables; logs request_id at 100 keys: 105 leaf GETs on its one covering part; spans and logs trace_id at 100 and 1,000 keys: the part `Uncovered` (`skippedByBudget` 1) after 1 leaf GET; the 1,001-key controls routed as key sets (`keysProbed` 1,001, `partsCovered` 0) | rows hold; **105 is over the 65 miss line** (below); the 1,001-key control was stale, and it becomes 1,025 keys | comment 6698223574; s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl |
+| 11 | rows exact and `keysProbed` equal to the list size at every size on both tables; logs request_id at 100 keys: 105 leaf GETs on its one covering part; spans and logs trace_id at 100 and 1,000 keys: the part `Uncovered` (`skippedByBudget` 1) after 1 leaf GET; the 1,001-key controls routed as key sets (`keysProbed` 1,001, `partsCovered` 0) | rows hold; **105 is over the 65 miss line** (below; #3917 owns the cost); the 1,001-key control was stale, and it becomes 1,025 keys (#3918) | comment 6698223574; s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl |
 | 12 | not run: the 10x and 100x arms were in neither run | not measured; #3928 | comment 6698223574 |
 | 13 | 0 rows differ from the oracle in any state run, erasure in flight included; 8 typed 422 refusals of ClickBench q19, q33, q34 and q35 under the 4 GiB pool; the compaction states failed on #3829; the five mutant controls were not run | holds on agreement; the mutant half and the compaction states are not measured (#3928, #3829) | comment 6698223574 |
 | 14 | the logs probe side opens 548 of 548 objects at every build-side size | recorded as ADR-2983's Stage 0 baseline (its Stage 0 amendment) | comment 6698223574 |
@@ -1310,8 +1310,9 @@ list touches all 5, about 20 keys each, so it costs 105 leaf GETs on one
 part (5 x (1 + about 20)), over the row's 65: 5 prefix GETs and 100
 bucket GETs. The 10-key list cost 15 (5 + 10) against a per-part target
 of 11. The 15 misses the target; the 105 is over the miss line. Both
-stand for this run. This amendment changes the band after a measurement crossed it: from
-here on, row 11's leaf GET target is at most
+stand for this run, and #3917 owns the cost. This amendment changes the
+band after a measurement crossed it: from here on, row 11's leaf GET
+target is at most
 `1 + min(distinct buckets, 64)` GETs per (part, slice) touched, and the
 miss is over 65 on one slice. The basis for the change is the pass-end
 slice amendment's per-slice charge, written before Stage 1, together
@@ -1390,12 +1391,15 @@ pays the per-advance cost above.
 - #3913: carry two- and three-value key `IN` lists, which DataFusion
   rewrites into disjunctions, as key sets.
 - #3917: read a key set's leaf bucket runs concurrently.
-- #3918: the harness items, namely the 1,025-key control, the row 7
-  `miss_if` read per pass, and the FLIPS entry. Its fold report and
-  error-count parts landed as #3919 and #3922.
+- #3918: the harness items, which are the 1,025-key control, the row 7
+  `miss_if` read per pass, the basis of row 6's `objects_past_probe`, and
+  the FLIPS entry. Its fold report and error-count parts landed as #3919
+  and #3922.
 - #3927: bound the advancing fold's leaf build by the new hour, then the
   per-signal switch.
-- #3928: measure rows 12, 13 (mutants) and 16 on the shipped build.
+- #3928: measure what Stage 1 did not on the shipped build, which is row
+  8's HEAD bytes, row 9's 24-part figures, row 12, row 13's mutant
+  controls and row 16.
 - #3812 (the unfolded spans `IN` death) did not reproduce after T7, and
   #3829 (compaction L1 PUTs) still fails. Both stay open.
 
