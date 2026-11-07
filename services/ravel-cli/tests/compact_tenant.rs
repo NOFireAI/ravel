@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use prost::Message;
 use ravel_cli::maintain::{
-    ClaimOptions, CompactTenantError, CompactTenantReport, ScratchOptions, SignalArg,
-    compact_tenant, compact_tenant_on_detected_memory, compact_tenant_to, compact_to,
+    ClaimOptions, CompactTenantError, CompactTenantReport, CompactorKnobError, ScratchOptions,
+    SignalArg, compact_tenant, compact_tenant_on_detected_memory, compact_tenant_to, compact_to,
     compact_with_part_split_targets_to, per_bucket_config,
 };
 use ravel_cli::store::{DefaultedMemoryEmptyWalk, StoreKind, StoreSelection};
@@ -2773,4 +2773,446 @@ async fn compact_bucket_below_the_format_floor_is_refused_with_no_put() {
         before,
         "neither the claim nor a part nor a record is PUT"
     );
+}
+
+/// The two-level fixture (ADR-3853): 60 L0 RLOG inputs in one bucket, each one
+/// block of 2000 records over the same 20 streams, so a cursor merge decodes 20
+/// rows per input record, past the limit of 16. The records spread 200
+/// attribute keys, so the 60 blocks one stream's cursors hold at once outgrow a
+/// resident ceiling of the 20 GiB cursor budget over 60, and level 1 fits
+/// groups of 12 inputs under it: 5 groups.
+const TWO_LEVEL_INPUTS: u32 = 60;
+const TWO_LEVEL_STREAMS: u32 = 20;
+const TWO_LEVEL_RECORDS_PER_INPUT: u32 = 2_000;
+const TWO_LEVEL_ATTR_KEYS: u32 = 200;
+const TWO_LEVEL_ATTRS_PER_RECORD: u32 = 3;
+const TWO_LEVEL_SHARD: u32 = 0;
+const TWO_LEVEL_UNITS: u64 = 60;
+const TWO_LEVEL_PART_TARGET: u64 = 16 * 1024 * 1024;
+const TWO_LEVEL_HOST_MEMORY: u64 = 32 << 30;
+const SCRATCH_LOCK_FILE: &str = "ravel-scratch.lock";
+
+/// Seeds the two-level fixture into `HOUR_OLD` and returns the inputs' writer
+/// ids, one per input, each at writer sequence 1.
+async fn seed_two_level_bucket(store: &dyn ObjectStoreBackend) -> BTreeSet<String> {
+    let th = tenant_hash();
+    let base_ns = i64::from(HOUR_OLD) * NS_PER_HOUR + 1_000_000_000;
+    let created = i64::from(HOUR_OLD) * NS_PER_HOUR + 2_000_000_000;
+    let mut writers = BTreeSet::new();
+    for input in 0..TWO_LEVEL_INPUTS {
+        let records: Vec<LogRecord> = (0..TWO_LEVEL_RECORDS_PER_INPUT)
+            .map(|j| {
+                let stream = j % TWO_LEVEL_STREAMS;
+                let resource = vec![(
+                    "service.name".to_string(),
+                    AttrValue::Str(format!("svc{stream}")),
+                )];
+                let ts = base_ns + i64::from(j) * 1_000 + i64::from(input);
+                LogRecord {
+                    stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1", &[]),
+                    stream_attrs: ravel_logseg::stream_attrs_bytes(&resource, "scope", "1", &[]),
+                    ts_ns: ts,
+                    observed_ts_ns: ts,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: format!("in{input} r{j}"),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: (0..TWO_LEVEL_ATTRS_PER_RECORD)
+                        .map(|t| {
+                            let key = (j * TWO_LEVEL_ATTRS_PER_RECORD + t) % TWO_LEVEL_ATTR_KEYS;
+                            (format!("a{key}"), AttrValue::I64(i64::from(j)))
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        let writer_id = Uuid::from_u128(u128::from(input) + 1);
+        let identity = ObjectIdentity {
+            tenant_hash: th.0,
+            shard: TWO_LEVEL_SHARD,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+        };
+        let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+        for r in &records {
+            writer.push(r.clone()).expect("push");
+        }
+        let bytes = Bytes::from(writer.finish().expect("finish L0"));
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Logs,
+            shard: TWO_LEVEL_SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: records.len() as u64,
+            series_count: u64::from(TWO_LEVEL_STREAMS),
+            min_event_ts_ns: records.first().expect("records").ts_ns,
+            max_event_ts_ns: records.last().expect("records").ts_ns,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR_OLD,
+        })
+        .expect("build commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+        writers.insert(writer_id.to_string());
+    }
+    writers
+}
+
+/// The writer ids each compaction record in the two-level bucket names.
+async fn two_level_record_inputs(store: &dyn ObjectStoreBackend) -> Vec<BTreeSet<String>> {
+    let bucket =
+        ravel_maintain::Bucket::new(tenant_hash(), Signal::Logs, TWO_LEVEL_SHARD, HOUR_OLD);
+    let listing = ravel_maintain::read::list_bucket(store, &bucket)
+        .await
+        .expect("list bucket");
+    let mut records = Vec::new();
+    for key in listing.compaction_record_keys {
+        let got = store.get(&key, GetRange::Full).await.expect("get record");
+        let rec = record::decode_compaction(&got.data).expect("decode record");
+        assert!(
+            rec.inputs.iter().all(|input| input.writer_seq == 1),
+            "every input is its writer's sequence 1: {:?}",
+            rec.inputs
+        );
+        records.push(
+            rec.inputs
+                .into_iter()
+                .map(|input| input.writer_id)
+                .collect(),
+        );
+    }
+    records
+}
+
+/// Everything under a scratch directory except its lock file.
+fn scratch_entries(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("read scratch dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| !p.ends_with(SCRATCH_LOCK_FILE))
+        .collect()
+}
+
+/// compact-bucket over the two-level fixture with `scratch`, under the
+/// fixture's ceiling and one level-1 worker unless `scratch` sets its own.
+async fn compact_two_level_bucket(
+    store: Arc<dyn ObjectStoreBackend>,
+    scratch: &ScratchOptions,
+) -> anyhow::Result<String> {
+    let mut out: Vec<u8> = Vec::new();
+    compact_to(
+        &mut out,
+        store,
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        TWO_LEVEL_SHARD,
+        HOUR_OLD,
+        false,
+        None,
+        Some(TWO_LEVEL_PART_TARGET),
+        None,
+        None,
+        Some(TWO_LEVEL_HOST_MEMORY),
+        FixedClock::new(now_ns()),
+        &ClaimOptions::fresh(),
+        scratch,
+    )
+    .await?;
+    Ok(String::from_utf8(out).expect("utf-8"))
+}
+
+/// The fixture's resident ceiling: the default cursor budget over 60 units,
+/// as ravel-server's `--maintain-unit-concurrency 60` sets it.
+fn two_level_ceiling() -> u64 {
+    DEFAULT_MERGE_CURSOR_BUDGET_BYTES / TWO_LEVEL_UNITS
+}
+
+/// ADR-3853 through `maintain compact-bucket`: with `--scratch-dir` a bucket
+/// the single-level merge refuses is merged in two levels, the compaction
+/// record names every input, the report names the 5 level-1 groups and the
+/// one worker, and the scratch directory holds no unit subdirectory
+/// afterwards. The same call without `--scratch-dir` is refused as
+/// GeometryUnsupported and writes nothing.
+///
+/// Distinguishing: with `build_compactor_config` leaving `scratch_dir` unset
+/// the "outcome: Compacted" assertion fails on a GeometryUnsupported report;
+/// with the unit directory left behind the `scratch_entries` assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compact_bucket_routes_a_many_input_bucket_through_the_two_level_merge() {
+    let mem = Arc::new(MemoryStore::new());
+    let writers = seed_two_level_bucket(mem.as_ref()).await;
+    assert_eq!(writers.len(), TWO_LEVEL_INPUTS as usize);
+
+    let refused_store = CountingStore::new(mem.clone());
+    let keys_before = all_keys(mem.as_ref()).await;
+    let refused = compact_two_level_bucket(
+        refused_store.clone(),
+        &ScratchOptions {
+            merge_resident_ceiling_bytes: Some(two_level_ceiling()),
+            ..ScratchOptions::default()
+        },
+    )
+    .await
+    .expect("a refusal exits zero");
+    assert!(
+        refused.contains("\noutcome: GeometryUnsupported ("),
+        "without --scratch-dir the bucket is refused: {refused}"
+    );
+    assert_eq!(all_keys(mem.as_ref()).await, keys_before);
+    assert_eq!(
+        refused_store
+            .entries()
+            .iter()
+            .filter(|(op, key)| (*op == "put" || *op == "multipart")
+                && !key.starts_with(COMPACTION_CLAIMS_PREFIX))
+            .collect::<Vec<_>>(),
+        Vec::<&(&str, String)>::new(),
+        "no part or record is written"
+    );
+
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let text = compact_two_level_bucket(
+        mem.clone(),
+        &ScratchOptions {
+            scratch_dir: Some(scratch.path().to_path_buf()),
+            scratch_max_bytes: None,
+            level1_workers: Some(1),
+            merge_resident_ceiling_bytes: Some(two_level_ceiling()),
+        },
+    )
+    .await
+    .expect("compact-bucket exits zero");
+    assert!(
+        text.contains("\noutcome: Compacted\ntwo_level: level1_groups=5 level1_workers=1\n"),
+        "{text}"
+    );
+    assert!(text.contains("\npublish: Published\n"), "{text}");
+    assert_eq!(two_level_record_inputs(mem.as_ref()).await, vec![writers]);
+    assert!(
+        scratch.path().join(SCRATCH_LOCK_FILE).exists(),
+        "the two-level merge locked the scratch directory"
+    );
+    assert_eq!(
+        scratch_entries(scratch.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// `maintain compact-tenant --scratch-dir` passes the directory through to
+/// every bucket's merge: at `--bucket-concurrency 60` each bucket's ceiling is
+/// the fixture's, and the two-level bucket compacts with its figures on the
+/// bucket's line.
+///
+/// Distinguishing: with `compact_tenant_to` dropping `scratch` (passing the
+/// default options on) the bucket line reads `outcome=GeometryUnsupported` and
+/// the first assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compact_tenant_with_scratch_dir_compacts_the_two_level_bucket() {
+    let mem = Arc::new(MemoryStore::new());
+    let writers = seed_two_level_bucket(mem.as_ref()).await;
+    let scratch = tempfile::tempdir().expect("scratch dir");
+
+    let mut out: Vec<u8> = Vec::new();
+    let report = compact_tenant_to(
+        &mut out,
+        mem.clone(),
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(1),
+        Some(HOUR_OLD),
+        Some(HOUR_OLD),
+        false,
+        None,
+        Some(TWO_LEVEL_PART_TARGET),
+        None,
+        None,
+        TWO_LEVEL_UNITS as usize,
+        None,
+        Some(TWO_LEVEL_HOST_MEMORY),
+        now_ns(),
+        &ClaimOptions::fresh(),
+        &ScratchOptions {
+            scratch_dir: Some(scratch.path().to_path_buf()),
+            scratch_max_bytes: None,
+            level1_workers: Some(1),
+            merge_resident_ceiling_bytes: None,
+        },
+    )
+    .await
+    .expect("compact-tenant exits zero");
+    let text = String::from_utf8(out).expect("utf-8");
+    let line = text
+        .lines()
+        .find(|line| line.starts_with(&format!("shard={TWO_LEVEL_SHARD} hour={HOUR_OLD} ")))
+        .expect("the bucket's line");
+    assert!(
+        line.contains(" outcome=Compacted ")
+            && line.ends_with(" publish=Published level1_groups=5 level1_workers=1"),
+        "{text}"
+    );
+    assert_eq!(report.compacted, 1);
+    assert_eq!(two_level_record_inputs(mem.as_ref()).await, vec![writers]);
+    assert_eq!(
+        scratch_entries(scratch.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A zero `--scratch-max-bytes` or `--level1-workers`, and either without
+/// `--scratch-dir`, is refused with the typed error before any store request.
+///
+/// Distinguishing: without the `ScratchOptions::validate` call in
+/// `build_compactor_config` each case runs on and the `expect_err` fails.
+#[tokio::test]
+async fn invalid_scratch_options_are_refused_before_any_store_request() {
+    let dir = Some(std::path::PathBuf::from("/nonexistent/scratch"));
+    for (scratch, want) in [
+        (
+            ScratchOptions {
+                scratch_max_bytes: Some(1 << 30),
+                ..ScratchOptions::default()
+            },
+            CompactorKnobError::ScratchMaxBytesWithoutDir,
+        ),
+        (
+            ScratchOptions {
+                level1_workers: Some(2),
+                ..ScratchOptions::default()
+            },
+            CompactorKnobError::Level1WorkersWithoutDir,
+        ),
+        (
+            ScratchOptions {
+                scratch_dir: dir.clone(),
+                scratch_max_bytes: Some(0),
+                ..ScratchOptions::default()
+            },
+            CompactorKnobError::ZeroScratchMaxBytes,
+        ),
+        (
+            ScratchOptions {
+                scratch_dir: dir.clone(),
+                level1_workers: Some(0),
+                ..ScratchOptions::default()
+            },
+            CompactorKnobError::ZeroLevel1Workers,
+        ),
+    ] {
+        let store = CountingStore::new(Arc::new(MemoryStore::new()));
+        let err = compact_two_level_bucket(store.clone(), &scratch)
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            err.downcast_ref::<CompactorKnobError>(),
+            Some(&want),
+            "{scratch:?}: {err:#}"
+        );
+        assert_eq!(store.entries(), Vec::new(), "{scratch:?}");
+
+        let store = CountingStore::new(Arc::new(MemoryStore::new()));
+        let err = compact_tenant_to(
+            &mut Vec::new(),
+            store.clone(),
+            MEMORY,
+            TENANT,
+            SignalArg::Logs,
+            Some(1),
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            1,
+            None,
+            None,
+            now_ns(),
+            &ClaimOptions::fresh(),
+            &scratch,
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(
+            err.downcast_ref::<CompactorKnobError>(),
+            Some(&want),
+            "compact-tenant {scratch:?}: {err:#}"
+        );
+        assert_eq!(store.entries(), Vec::new(), "compact-tenant {scratch:?}");
+    }
+}
+
+/// The binary refuses each invalid scratch flag set on both commands with
+/// ravel-server's wording, as a failed run.
+#[test]
+fn compaction_binary_refuses_invalid_scratch_flags() {
+    let cases: [(&[&str], &str); 4] = [
+        (
+            &["--scratch-max-bytes", "1073741824"],
+            "--scratch-max-bytes has no effect without --scratch-dir",
+        ),
+        (
+            &["--level1-workers", "2"],
+            "--level1-workers has no effect without --scratch-dir",
+        ),
+        (
+            &[
+                "--scratch-dir",
+                "/nonexistent/scratch",
+                "--scratch-max-bytes",
+                "0",
+            ],
+            "--scratch-max-bytes must be greater than 0: a zero cap refuses every two-level merge",
+        ),
+        (
+            &[
+                "--scratch-dir",
+                "/nonexistent/scratch",
+                "--level1-workers",
+                "0",
+            ],
+            "--level1-workers must be greater than 0",
+        ),
+    ];
+    let commands: [&[&str]; 2] = [
+        &["compact-bucket", "--shard", "0", "--hour", "1"],
+        &["compact-tenant", "--shards", "1"],
+    ];
+    for command in commands {
+        for (flags, message) in cases {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
+                .args(["--store", "memory", "maintain"])
+                .args(command)
+                .args(["--tenant", TENANT, "--signal", "logs"])
+                .args(flags)
+                .output()
+                .expect("ravel-cli runs");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{command:?} {flags:?} must fail: {stderr}"
+            );
+            assert!(stderr.contains(message), "{command:?} {flags:?}: {stderr}");
+        }
+    }
 }
