@@ -22,7 +22,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -30,8 +30,10 @@ use futures::future::BoxFuture;
 use ravel_catalog::{
     Catalog, CatalogError, KEY_INDEX_LEAF_GET_CEILING, KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS,
     KEY_INDEX_MAX_PROBED_PARTS, KEY_INDEX_SET_PROBE_MAX_RUNS, KeyIndexKeyAnswer,
-    KeyIndexLeafLimits, KeyIndexLeafRejection, KeyIndexLeafRequest, KeyIndexSetAnswer,
-    KeyIndexSetDecline, KeyIndexSetPolicy, Snapshot, SnapshotPartHandle, SnapshotParts,
+    KeyIndexLeafBreach, KeyIndexLeafError, KeyIndexLeafLimits, KeyIndexLeafRejection,
+    KeyIndexLeafRequest, KeyIndexSetAnswer, KeyIndexSetDecline, KeyIndexSetDecoder,
+    KeyIndexSetPlan, KeyIndexSetPolicy, KeyIndexSetRunError, LEAF_READ_CONCURRENCY, Snapshot,
+    SnapshotPartHandle, SnapshotParts, key_index_leaf_prefix_range, plan_key_index_leaf_set,
     select_key_index_slice,
 };
 use ravel_codec::key_idx::{Key8, KeyType};
@@ -655,8 +657,74 @@ async fn route_parts(
     Ok(answered)
 }
 
-/// Probes every slice of one part, stopping at the first that does not
-/// answer. Returns the reads issued and the outcome.
+/// How one slice's GET 1 ended.
+enum SliceStart {
+    Planned(Box<KeyIndexSetPlan>),
+    /// The reader's fetch reservation refused GET 1.
+    ReadRefused,
+    Rejected(KeyIndexLeafRejection),
+    Breach(KeyIndexLeafBreach),
+}
+
+fn leaf_rejected(leaf_ref: &SnapshotKeyIndexLeafRef, rejection: &KeyIndexLeafRejection) {
+    tracing::warn!(
+        leaf = %leaf_ref.key,
+        reason = %rejection,
+        "key-index leaf rejected; the part is left to tier 1"
+    );
+}
+
+fn merge_answer(answer: &mut PartAnswer, slice: KeyIndexSetAnswer) -> Result<(), PartOutcome> {
+    match slice {
+        KeyIndexSetAnswer::Answered {
+            per_key,
+            uncovered_entry_ordinals,
+        } => {
+            answer.uncovered.extend(uncovered_entry_ordinals);
+            for key_answer in per_key {
+                if let KeyIndexKeyAnswer::Matches(matches) = key_answer {
+                    for m in matches {
+                        answer
+                            .blocks
+                            .entry(m.entry_ordinal)
+                            .or_default()
+                            .extend(m.blocks);
+                    }
+                }
+            }
+            Ok(())
+        }
+        KeyIndexSetAnswer::Rejected(_) => Err(PartOutcome::Rejected),
+        KeyIndexSetAnswer::Declined(KeyIndexSetDecline::OverBudget { .. }) => {
+            Err(PartOutcome::OverBudget)
+        }
+        KeyIndexSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused { .. }) => {
+            Err(PartOutcome::ReservationRefused)
+        }
+    }
+}
+
+/// Probes every slice of one part in three phases, and returns the reads
+/// issued and the outcome.
+///
+/// 1. GET 1 of every slice, at most [`LEAF_READ_CONCURRENCY`] in flight, and
+///    each slice's plan from it.
+/// 2. No reads: the slices in order. The first that did not plan decides the
+///    outcome (a breach fails the statement, a refused read is a refused
+///    reservation, anything else rejects), and each plan's bridged bytes are
+///    charged against the part's allowance; the first slice over what the
+///    earlier ones left declines the part over budget.
+/// 3. The bucket runs of every slice, at most [`LEAF_READ_CONCURRENCY`] in
+///    flight across the part, decoded in body order. The first slice in
+///    slice order whose run fails decides the outcome.
+///
+/// The bytes read, and so the GET count, wire bytes and decompressed bytes,
+/// are those of probing the slices one after another whenever the part
+/// answers. A part decided in phase 2 has also read GET 1 of the slices
+/// after the deciding one, and those GETs are counted, but no run of any
+/// slice. A part decided in phase 3 may have read runs past the failing
+/// one. [`PartPlan::worst_gets`] still bounds the count: every slice
+/// issues GET 1 and at most its worst case of runs.
 async fn probe_part(
     input: &RouteInput<'_>,
     plan: &PartPlan<'_>,
@@ -670,95 +738,180 @@ async fn probe_part(
         field: &input.key_set.field,
         key_type: input.key_set.key_type,
     };
+    let part_policy = KeyIndexSetPolicy::for_part(plan.handle.entry_count);
+    let gets = AtomicU64::new(0);
+
+    let starts: Vec<SliceStart> = {
+        let (request, gets) = (&request, &gets);
+        futures::stream::iter(0..plan.slices.len())
+            .map(|s| async move {
+                let (leaf_ref, keys) = &plan.slices[s];
+                let range = match key_index_leaf_prefix_range(leaf_ref) {
+                    Ok(range) => range,
+                    Err(rejection) => return SliceStart::Rejected(rejection),
+                };
+                gets.fetch_add(1, Ordering::Relaxed);
+                let bytes = match input
+                    .reader
+                    .read_range(leaf_ref, range, leaf_accounting)
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(LeafReadError::ReservationRefused(_)) => return SliceStart::ReadRefused,
+                    Err(LeafReadError::Failed(e)) => {
+                        return SliceStart::Rejected(KeyIndexLeafRejection::Read(e));
+                    }
+                };
+                match plan_key_index_leaf_set(&bytes, leaf_ref, request, keys, part_policy.b_run) {
+                    Ok(set_plan) => SliceStart::Planned(Box::new(set_plan)),
+                    Err(KeyIndexLeafError::Breach(breach)) => SliceStart::Breach(breach),
+                    Err(KeyIndexLeafError::Rejected(rejection)) => SliceStart::Rejected(rejection),
+                }
+            })
+            .buffered(LEAF_READ_CONCURRENCY)
+            .collect()
+            .await
+    };
+
     // The bridged-byte allowance is the part's, `entry_count x
     // KEY_INDEX_T1_BYTES` (the tier-1 cost the part's segments would
-    // otherwise pay), shared by every slice the key set tiles: each slice's
-    // probe is bounded by what the earlier slices left, so a set across S
-    // slices cannot read S times the part's allowance.
-    let part_policy = KeyIndexSetPolicy::for_part(plan.handle.entry_count);
+    // otherwise pay), shared by every slice the key set tiles, so a set
+    // across S slices cannot read S times the part's allowance.
     let mut bridged_left = part_policy.max_bridged_bytes;
-    let mut gets = 0u64;
+    let mut set_plans: Vec<KeyIndexSetPlan> = Vec::with_capacity(starts.len());
+    for ((leaf_ref, _), start) in plan.slices.iter().zip(starts) {
+        let leaf_ref: &SnapshotKeyIndexLeafRef = leaf_ref;
+        let gets = gets.load(Ordering::Relaxed);
+        match start {
+            SliceStart::Planned(set_plan) => {
+                if set_plan.bridged_bytes() > bridged_left {
+                    return Ok((gets, PartOutcome::OverBudget));
+                }
+                bridged_left -= set_plan.bridged_bytes();
+                set_plans.push(*set_plan);
+            }
+            SliceStart::ReadRefused => return Ok((gets, PartOutcome::ReservationRefused)),
+            SliceStart::Rejected(rejection) => {
+                leaf_rejected(leaf_ref, &rejection);
+                return Ok((gets, PartOutcome::Rejected));
+            }
+            SliceStart::Breach(breach) => {
+                return Err(RouteError::Isolation {
+                    leaf_key: leaf_ref.key.clone(),
+                    source: input.catalog.key_index_leaf_breach(leaf_ref, breach),
+                });
+            }
+        }
+    }
+
+    let mut decoders: Vec<Option<KeyIndexSetDecoder<'_, LeafDecodeGuard>>> =
+        set_plans.iter().map(|p| Some(p.decoder())).collect();
     let mut answer = PartAnswer {
         blocks: BTreeMap::new(),
         uncovered: BTreeSet::new(),
     };
-    for (leaf_ref, keys) in &plan.slices {
-        let leaf_ref: &SnapshotKeyIndexLeafRef = leaf_ref;
-        let policy = KeyIndexSetPolicy {
-            b_run: part_policy.b_run,
-            max_bridged_bytes: bridged_left,
-        };
-        let read_refused = AtomicBool::new(false);
-        let probe = input
-            .catalog
-            .probe_key_index_leaf_set_with(
-                leaf_ref,
-                &request,
-                keys,
-                &input.limits,
-                |range| {
-                    let read = input.reader.read_range(leaf_ref, range, leaf_accounting);
-                    let read_refused = &read_refused;
-                    async move {
-                        read.await.map_err(|err| {
-                            if matches!(err, LeafReadError::ReservationRefused(_)) {
-                                read_refused.store(true, Ordering::Relaxed);
-                            }
-                            err.to_string()
-                        })
-                    }
-                },
-                &policy,
-                |bytes| input.budget.try_reserve(bytes).ok(),
-            )
-            .await
-            .map_err(|source| RouteError::Isolation {
-                leaf_key: leaf_ref.key.clone(),
-                source,
-            })?;
-        bridged_left = bridged_left.saturating_sub(probe.bridged_bytes);
-        gets += u64::from(probe.get_requests);
-        leaf_accounting.add_decompressed_bytes(probe.decompressed_bytes);
-        match probe.answer {
-            KeyIndexSetAnswer::Answered {
-                per_key,
-                uncovered_entry_ordinals,
-            } => {
-                answer.uncovered.extend(uncovered_entry_ordinals);
-                for key_answer in per_key {
-                    if let KeyIndexKeyAnswer::Matches(matches) = key_answer {
-                        for m in matches {
-                            answer
-                                .blocks
-                                .entry(m.entry_ordinal)
-                                .or_default()
-                                .extend(m.blocks);
+    let mut decompressed = 0u64;
+    let mut reserve = |bytes| input.budget.try_reserve(bytes).ok();
+    // Finishing a slice as soon as its last run decodes releases its decode
+    // reservations before the rest of the part's runs arrive.
+    let finish = |s: usize,
+                  decoder: KeyIndexSetDecoder<'_, LeafDecodeGuard>,
+                  decompressed: &mut u64,
+                  answer: &mut PartAnswer|
+     -> Result<(), PartOutcome> {
+        *decompressed += decoder.decompressed_bytes();
+        let slice = decoder.finish();
+        if let KeyIndexSetAnswer::Rejected(rejection) = &slice {
+            leaf_rejected(plan.slices[s].0, rejection);
+        }
+        merge_answer(answer, slice)
+    };
+    let mut failure = None;
+    {
+        let runs: Vec<(usize, Range<u64>)> = set_plans
+            .iter()
+            .enumerate()
+            .flat_map(|(s, p)| p.runs().iter().map(move |run| (s, run.clone())))
+            .collect();
+        let gets = &gets;
+        let mut reads = futures::stream::iter(runs)
+            .map(|(s, range)| {
+                gets.fetch_add(1, Ordering::Relaxed);
+                let read = input
+                    .reader
+                    .read_range(plan.slices[s].0, range, leaf_accounting);
+                async move { (s, read.await) }
+            })
+            .buffered(LEAF_READ_CONCURRENCY);
+        while let Some((s, read)) = reads.next().await {
+            let leaf_ref = plan.slices[s].0;
+            let decoded = match read {
+                Err(LeafReadError::ReservationRefused(_)) => Err(PartOutcome::ReservationRefused),
+                Err(LeafReadError::Failed(e)) => {
+                    leaf_rejected(leaf_ref, &KeyIndexLeafRejection::Read(e));
+                    Err(PartOutcome::Rejected)
+                }
+                Ok(bytes) => {
+                    let slot = &mut decoders[s];
+                    let step = match slot.as_mut() {
+                        Some(decoder) => {
+                            decoder.decode_next_run(&bytes, &input.limits, &mut reserve)
+                        }
+                        // A slice's decoder is finished only after its last
+                        // run, so this is a run its plan does not hold.
+                        None => Err(KeyIndexSetRunError::Rejected(
+                            KeyIndexLeafRejection::RequestMismatch(
+                                "a bucket run past the slice's plan".to_string(),
+                            ),
+                        )),
+                    };
+                    match step {
+                        Ok(()) => match slot.take_if(|d| d.is_done()) {
+                            Some(decoder) => finish(s, decoder, &mut decompressed, &mut answer),
+                            None => Ok(()),
+                        },
+                        Err(KeyIndexSetRunError::Rejected(rejection)) => {
+                            leaf_rejected(leaf_ref, &rejection);
+                            Err(PartOutcome::Rejected)
+                        }
+                        Err(KeyIndexSetRunError::ReservationRefused { .. }) => {
+                            Err(PartOutcome::ReservationRefused)
                         }
                     }
                 }
-            }
-            KeyIndexSetAnswer::Rejected(KeyIndexLeafRejection::Read(_))
-                if read_refused.load(Ordering::Relaxed) =>
-            {
-                return Ok((gets, PartOutcome::ReservationRefused));
-            }
-            KeyIndexSetAnswer::Rejected(rejection) => {
-                tracing::warn!(
-                    leaf = %leaf_ref.key,
-                    reason = %rejection,
-                    "key-index leaf rejected; the part is left to tier 1"
-                );
-                return Ok((gets, PartOutcome::Rejected));
-            }
-            KeyIndexSetAnswer::Declined(KeyIndexSetDecline::OverBudget { .. }) => {
-                return Ok((gets, PartOutcome::OverBudget));
-            }
-            KeyIndexSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused { .. }) => {
-                return Ok((gets, PartOutcome::ReservationRefused));
+            };
+            if let Err(outcome) = decoded {
+                failure = Some(outcome);
+                break;
             }
         }
     }
-    Ok((gets, PartOutcome::Answered(answer)))
+    let outcome = match failure {
+        Some(outcome) => outcome,
+        None => {
+            // Slices whose keys all fell in empty buckets have no runs.
+            let mut finished = Ok(());
+            for (s, slot) in decoders.iter_mut().enumerate() {
+                if let Some(decoder) = slot.take() {
+                    finished = finish(s, decoder, &mut decompressed, &mut answer);
+                    if finished.is_err() {
+                        break;
+                    }
+                }
+            }
+            match finished {
+                Ok(()) => PartOutcome::Answered(answer),
+                Err(outcome) => outcome,
+            }
+        }
+    };
+    decompressed += decoders
+        .iter()
+        .flatten()
+        .map(|d| d.decompressed_bytes())
+        .sum::<u64>();
+    leaf_accounting.add_decompressed_bytes(decompressed);
+    Ok((gets.load(Ordering::Relaxed), outcome))
 }
 
 #[cfg(test)]

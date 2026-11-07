@@ -27,6 +27,8 @@ enum LeafKind {
     Good,
     /// Two slices cut at `1 << 63`.
     Split,
+    /// This many slices of near-equal key8 width.
+    Sliced(usize),
     NoLeaf,
     /// One leaf, for another field.
     OtherField,
@@ -157,6 +159,19 @@ async fn fixture(specs: &[PartSpec], recents: &[Rows], key_type: KeyType) -> Fix
         let slices: Vec<(u64, u64)> = match spec.leaf {
             LeafKind::NoLeaf => Vec::new(),
             LeafKind::Split => vec![(0, cut - 1), (cut, u64::MAX)],
+            LeafKind::Sliced(count) => {
+                let width = u64::MAX / count as u64;
+                (0..count as u64)
+                    .map(|i| {
+                        let hi = if i + 1 == count as u64 {
+                            u64::MAX
+                        } else {
+                            (i + 1) * width - 1
+                        };
+                        (i * width, hi)
+                    })
+                    .collect()
+            }
             _ => vec![(0, u64::MAX)],
         };
         let mut refs = Vec::new();
@@ -1577,4 +1592,363 @@ fn the_route_future_is_send() {
             ..RouteFigures::default()
         }
     );
+}
+
+/// Pending this many times, waking itself each time: a read that has to be
+/// polled again.
+struct Yields(u32);
+
+impl std::future::Future for Yields {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 == 0 {
+            return std::task::Poll::Ready(());
+        }
+        self.0 -= 1;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+
+/// Decrements the in-flight count when the read finishes or is dropped.
+struct InFlightGuard<'a>(&'a AtomicU64);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Counts reads in flight around `inner`: a read joins on its first poll,
+/// yields once, and leaves when it returns.
+struct InFlightReader<'r> {
+    inner: &'r CountingReader,
+    in_flight: AtomicU64,
+    peak: AtomicU64,
+    /// Every range read, in issue order.
+    ranges: std::sync::Mutex<Vec<(String, Range<u64>)>>,
+}
+
+impl<'r> InFlightReader<'r> {
+    fn new(inner: &'r CountingReader) -> Self {
+        InFlightReader {
+            inner,
+            in_flight: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            ranges: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn peak(&self) -> u64 {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+impl LeafRangeReader for InFlightReader<'_> {
+    fn read_range<'a>(
+        &'a self,
+        leaf: &'a SnapshotKeyIndexLeafRef,
+        range: Range<u64>,
+        accounting: &'a QueryAccounting,
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
+        Box::pin(async move {
+            self.ranges
+                .lock()
+                .expect("ranges")
+                .push((leaf.key.clone(), range.clone()));
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _guard = InFlightGuard(&self.in_flight);
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            Yields(1).await;
+            self.inner.read_range(leaf, range, accounting).await
+        })
+    }
+}
+
+/// Routes `keys` over `fx` through an [`InFlightReader`], returning the run
+/// and the peak number of reads in flight.
+async fn run_in_flight(
+    fx: &Fixture,
+    keys: &KeySet,
+    budget: &dyn LeafDecodeBudget,
+) -> (Run, u64, Vec<(String, Range<u64>)>) {
+    let accounting = PhaseAccounting::new();
+    let reader = CountingReader::new(fx.store.clone());
+    let totals = RouteTotals::new();
+    let (result, peak, ranges) = {
+        let in_flight = InFlightReader::new(&reader);
+        let result = route_under(
+            input(fx, keys, &accounting, &in_flight, budget),
+            UNBOUNDED,
+            &totals,
+        )
+        .await;
+        let ranges = std::mem::take(&mut *in_flight.ranges.lock().expect("ranges"));
+        (result, in_flight.peak(), ranges)
+    };
+    (
+        Run {
+            result,
+            accounting,
+            reader,
+            totals,
+        },
+        peak,
+        ranges,
+    )
+}
+
+/// One part of `slices` slices over four entries: entry `o` holds the
+/// values `v` with `v % 4 == o`, in block `v % 8`, and entry 3 is
+/// uncovered.
+fn sliced_spec(slices: usize, values: u16) -> PartSpec {
+    let mut entries: Vec<Rows> = vec![Rows::new(); 4];
+    for v in 0..values {
+        entries[usize::from(v % 4)].insert(v, BTreeSet::from([u32::from(v % 8)]));
+    }
+    let mut spec = PartSpec::simple(entries);
+    spec.uncovered[3] = true;
+    spec.leaf = LeafKind::Sliced(slices);
+    spec.bucket_bits = 6;
+    spec
+}
+
+/// A part's slices are read concurrently, never more than
+/// `LEAF_READ_CONCURRENCY` reads at once, and the answer and the leaf GET
+/// and byte figures equal those of the serial probe this replaced (pinned
+/// from a run of it on the same fixture).
+/// FLIP: the serial probe peaks at 1 read in flight; an unbounded join over
+/// the slices peaks at 24.
+#[tokio::test]
+async fn a_part_reads_its_slices_concurrently() {
+    let fx = fixture(&[sliced_spec(24, 600)], &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = (0..600).step_by(2).chain(2000..2100).collect();
+    let keys = key_set(KeyType::Str, &query);
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, peak, ranges) = run_in_flight(&fx, &keys, &budget).await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    let leaves: BTreeSet<&str> = ranges.iter().map(|(leaf, _)| leaf.as_str()).collect();
+    assert_eq!(leaves.len(), 24, "the key set touches every slice");
+    assert_eq!(peak, ravel_catalog::LEAF_READ_CONCURRENCY as u64);
+    assert_eq!(figures.parts_covered, 1);
+    // Even values only, so entries 0 and 2 hold matches and entry 1 holds
+    // none; entry 3 is uncovered.
+    assert_eq!(
+        routes,
+        &vec![
+            SegmentRoute::Blocks(vec![0, 4]),
+            SegmentRoute::Pruned,
+            SegmentRoute::Blocks(vec![2, 6]),
+            SegmentRoute::Uncovered,
+        ]
+    );
+    assert!(violations(routes, &fx.rows, &query).is_empty());
+    assert_eq!(figures.leaf_get_requests, 305);
+    assert_eq!(figures.leaf_wire_bytes, 18_569);
+    assert_eq!(
+        run.accounting.key_index().snapshot().decompressed_bytes,
+        3_751
+    );
+    assert_accounting(&run, figures);
+}
+
+/// The part's allowance is charged from the slices' prefixes in slice
+/// order before any bucket is read: the third slice's bridged bytes exceed
+/// what the first two left, so the part is skipped by budget, every slice's
+/// GET 1 is read and counted (the fourth's too), and no read goes past any
+/// leaf's prefix range.
+/// FLIP: charging each slice against the full allowance covers the part;
+/// the serial probe reads the first two slices' runs and never the fourth
+/// slice's GET 1.
+#[tokio::test]
+async fn the_allowance_is_decided_before_any_run_is_read() {
+    let cap = ravel_catalog::KEY_INDEX_T1_BYTES;
+    let values: Vec<u16> = (0..4000).collect();
+    let entry: Rows = values
+        .iter()
+        .map(|v| (*v, BTreeSet::from([0u32])))
+        .collect();
+    let mut spec = PartSpec::simple(vec![entry]);
+    spec.leaf = LeafKind::Sliced(4);
+    spec.bucket_bits = 8;
+    let fx = fixture(&[spec], &[], KeyType::Str).await;
+    let handle = &fx.parts.parts[0];
+    assert_eq!(handle.key_index.len(), 4);
+    let request = KeyIndexLeafRequest {
+        tenant_hash: TENANT,
+        signal: SIGNAL,
+        part_blake3: &handle.blake3,
+        part_entry_count: handle.entry_count,
+        field: FIELD,
+        key_type: KeyType::Str,
+    };
+    // Per slice, its values ascending by key8, and the leaf's prefix bytes.
+    let mut by_slice: Vec<Vec<(Key8, u16)>> = vec![Vec::new(); 4];
+    for v in &values {
+        let key8 = value_key8(KeyType::Str, *v);
+        let s = handle
+            .key_index
+            .iter()
+            .position(|l| (l.key8_lo..=l.key8_hi).contains(&u64::from_be_bytes(key8)))
+            .expect("a slice holds every key");
+        by_slice[s].push((key8, *v));
+    }
+    let mut prefixes = Vec::new();
+    for (s, leaf_ref) in handle.key_index.iter().enumerate() {
+        by_slice[s].sort_unstable();
+        let range = key_index_leaf_prefix_range(leaf_ref).expect("prefix range");
+        let got = fx
+            .store
+            .get(&leaf_ref.key, GetRange::Range(range.start, range.end))
+            .await
+            .expect("prefix");
+        prefixes.push(got.data);
+    }
+    // The bridged bytes of the first `n` keys of slice `s`.
+    let bridged = |s: usize, n: usize| -> u64 {
+        let keys: Vec<Key8> = by_slice[s][..n].iter().map(|(k, _)| *k).collect();
+        plan_key_index_leaf_set(
+            &prefixes[s],
+            &handle.key_index[s],
+            &request,
+            &keys,
+            KEY_INDEX_SET_PROBE_MAX_RUNS,
+        )
+        .map(|plan| plan.bridged_bytes())
+        .expect("plan")
+    };
+    let counts: Vec<usize> = (65..=320).step_by(5).collect();
+    let mut chosen = None;
+    'search: for &n in &counts {
+        let (b0, b1) = (bridged(0, n), bridged(1, n));
+        if b0 == 0 || b1 == 0 || b0 + b1 > cap {
+            continue;
+        }
+        for &m in &counts {
+            let b2 = bridged(2, m);
+            if b2 > 0 && b2 <= cap && b0 + b1 + b2 > cap {
+                chosen = Some((n, m, [b0, b1, b2]));
+                break 'search;
+            }
+        }
+    }
+    let (n, m, b) = chosen.expect("key counts whose third slice crosses the allowance");
+    let query: BTreeSet<u16> = by_slice[0][..n]
+        .iter()
+        .chain(&by_slice[1][..n])
+        .chain(&by_slice[2][..m])
+        .chain(&by_slice[3][..3])
+        .map(|(_, v)| *v)
+        .collect();
+    let keys = key_set(KeyType::Str, &query);
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, _, ranges) = run_in_flight(&fx, &keys, &budget).await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(figures.skipped_by_budget, 1, "slices {b:?} over {cap}");
+    assert_eq!(figures.parts_covered, 0);
+    assert_eq!(routes, &vec![SegmentRoute::Uncovered]);
+    let prefix_reads: BTreeMap<String, Range<u64>> = handle
+        .key_index
+        .iter()
+        .map(|l| {
+            (
+                l.key.clone(),
+                key_index_leaf_prefix_range(l).expect("range"),
+            )
+        })
+        .collect();
+    for (leaf, range) in &ranges {
+        assert_eq!(Some(range), prefix_reads.get(leaf), "{leaf} read {range:?}");
+    }
+    let read_leaves: BTreeSet<&String> = ranges.iter().map(|(leaf, _)| leaf).collect();
+    assert_eq!(read_leaves.len(), 4, "every slice's GET 1 is read");
+    assert_eq!(figures.leaf_get_requests, 4);
+    assert_eq!(
+        figures.leaf_wire_bytes,
+        prefixes.iter().map(|p| p.len() as u64).sum::<u64>()
+    );
+    assert_accounting(&run, figures);
+}
+
+/// Fails slice 2's GET 1, after slice 5's GET 1 has been refused by the
+/// reader's fetch reservation, and records the order the reads ended in.
+struct LateRejectReader<'r> {
+    inner: &'r CountingReader,
+    ended: std::sync::Mutex<Vec<String>>,
+}
+
+impl LeafRangeReader for LateRejectReader<'_> {
+    fn read_range<'a>(
+        &'a self,
+        leaf: &'a SnapshotKeyIndexLeafRef,
+        range: Range<u64>,
+        accounting: &'a QueryAccounting,
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
+        Box::pin(async move {
+            let got = if leaf.key.ends_with("/2") {
+                self.inner.calls.fetch_add(1, Ordering::Relaxed);
+                accounting.record_s3_request(AccountedOp::Get);
+                Yields(8).await;
+                Err(LeafReadError::Failed("slice 2 is gone".to_string()))
+            } else if leaf.key.ends_with("/5") {
+                self.inner.calls.fetch_add(1, Ordering::Relaxed);
+                accounting.record_s3_request(AccountedOp::Get);
+                Err(LeafReadError::ReservationRefused(
+                    "slice 5's fetch refused".to_string(),
+                ))
+            } else {
+                self.inner.read_range(leaf, range, accounting).await
+            };
+            self.ended.lock().expect("ended").push(leaf.key.clone());
+            got
+        })
+    }
+}
+
+/// When two slices fail, the earlier in slice order decides the part's
+/// outcome, not the one whose read ended first: slice 2's failed GET 1
+/// rejects the part although slice 5's refused fetch ended before it.
+/// FLIP: deciding by completion order (an unordered GET 1 stream) counts
+/// the part as a refused reservation.
+#[tokio::test]
+async fn the_first_failing_slice_in_order_decides() {
+    let fx = fixture(&[sliced_spec(8, 600)], &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = (0..600).collect();
+    let keys = key_set(KeyType::Str, &query);
+    let budget = ThresholdBudget::new(u64::MAX);
+    let accounting = PhaseAccounting::new();
+    let reader = CountingReader::new(fx.store.clone());
+    let totals = RouteTotals::new();
+    let late = LateRejectReader {
+        inner: &reader,
+        ended: std::sync::Mutex::new(Vec::new()),
+    };
+    let result = route_under(
+        input(&fx, &keys, &accounting, &late, &budget),
+        UNBOUNDED,
+        &totals,
+    )
+    .await;
+    let ended = std::mem::take(&mut *late.ended.lock().expect("ended"));
+    let position = |suffix: &str| {
+        ended
+            .iter()
+            .position(|k| k.ends_with(suffix))
+            .expect("slice read")
+    };
+    assert!(
+        position("/5") < position("/2"),
+        "slice 5's read ends first: {ended:?}"
+    );
+    let (routes, figures) = result.as_ref().expect("route");
+    assert_eq!(figures.leaves_rejected, 1);
+    assert_eq!(figures.reservations_refused, 0);
+    assert!(routes.iter().all(|r| *r == SegmentRoute::Uncovered));
+    // Every slice's GET 1, and no run.
+    assert_eq!(ended.len(), 8);
+    assert_eq!(figures.leaf_get_requests, 8);
 }

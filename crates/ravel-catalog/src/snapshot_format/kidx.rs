@@ -4,13 +4,14 @@
 //! leaves" is the normative layout and reader procedure.
 //!
 //! Encode, split, decode and probe. The fold (`fold.rs`) writes the leaves;
-//! `ravel_query::key_index_route` reads them, through
-//! [`Catalog::probe_key_index_leaf_set_with`], and no query path calls that
-//! router yet. The object key is the caller's to fill in on the returned
-//! [`SnapshotKeyIndexLeafRef`].
+//! `ravel_query::key_index_route` reads them for the logs and spans
+//! fetchers, through [`plan_key_index_leaf_set`] and
+//! [`KeyIndexSetPlan::decoder`]. The object key is the caller's to fill in
+//! on the returned [`SnapshotKeyIndexLeafRef`].
 
 use std::future::Future;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use prost::Message;
@@ -82,6 +83,12 @@ pub const KEY_INDEX_LEAF_GET_CEILING: u32 = 2_048;
 /// decision 2's `B_run`. Predicted; the Stage 1 amendment confirms or
 /// changes it.
 pub const KEY_INDEX_SET_PROBE_MAX_RUNS: usize = 64;
+
+/// Most leaf reads one part's set probe holds in flight: GET 1 of its
+/// slices, then the bucket runs of all of them. The tier-2 router probes up
+/// to 16 parts at once (its `PROBE_CONCURRENCY`), so one statement's route
+/// holds at most 16 x 16 = 256 leaf reads in flight.
+pub const LEAF_READ_CONCURRENCY: usize = 16;
 
 /// Predicted tier-1 cost of one absent object (ADR-3692 decision 2's
 /// `T1_BYTES`: the 8 KiB footer suffix, about 1 KB of prefix and about
@@ -1355,7 +1362,9 @@ fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u64)> {
 /// The set probe of one leaf for `keys` (sorted, distinct, all in the leaf's
 /// slice) over a caller-supplied ranged byte source: GET 1 is the prefix,
 /// once; the directory then names each key's bucket, and the distinct
-/// non-empty buckets are read as [`KeyIndexSetPolicy`] says. Before each
+/// non-empty buckets are read as [`KeyIndexSetPolicy`] says, at most
+/// [`LEAF_READ_CONCURRENCY`] at once. It is [`plan_key_index_leaf_set`],
+/// the allowance check, then [`read_key_index_set_runs`]. Before each
 /// frame is decoded, `reserve` is asked for its [`decoded_bound`]; the guard
 /// it returns is held until the probe returns, and `None` declines the leaf.
 /// A tenant or signal mismatch is the only `Err`.
@@ -1366,7 +1375,7 @@ pub async fn probe_key_index_leaf_set_ranged<F, Fut, R, G>(
     limits: &KeyIndexLeafLimits,
     policy: &KeyIndexSetPolicy,
     mut read: F,
-    mut reserve: R,
+    reserve: R,
 ) -> Result<KeyIndexSetProbe, KeyIndexLeafBreach>
 where
     F: FnMut(Range<u64>) -> Fut,
@@ -1388,13 +1397,8 @@ where
         probe.answer = KeyIndexSetAnswer::Rejected(rejection);
         Ok(probe)
     };
-    if keys.is_empty() || keys.windows(2).any(|w| w[0] >= w[1]) {
-        return reject(
-            probe,
-            KeyIndexLeafRejection::RequestMismatch(
-                "set probe keys empty, unsorted or repeated".to_string(),
-            ),
-        );
+    if let Err(rejection) = check_set_keys(keys) {
+        return reject(probe, rejection);
     }
     let get1 = match key_index_leaf_prefix_range(leaf_ref) {
         Ok(range) => range,
@@ -1406,90 +1410,236 @@ where
         Err(e) => return reject(probe, KeyIndexLeafRejection::Read(e)),
     };
     probe.wire_bytes += prefix_bytes.len() as u64;
-    let prefix = match KeyIndexLeafPrefix::parse(&prefix_bytes, leaf_ref, request) {
-        Ok(prefix) => prefix,
+    let plan = match plan_key_index_leaf_set(&prefix_bytes, leaf_ref, request, keys, policy.b_run) {
+        Ok(plan) => plan,
         Err(KeyIndexLeafError::Breach(breach)) => return Err(breach),
         Err(KeyIndexLeafError::Rejected(rejection)) => return reject(probe, rejection),
     };
     drop(prefix_bytes);
+    probe.distinct_buckets = plan.distinct_buckets();
+    probe.bridged_bytes = plan.bridged_bytes();
+    if plan.bridged_bytes() > policy.max_bridged_bytes {
+        probe.answer = KeyIndexSetAnswer::Declined(KeyIndexSetDecline::OverBudget {
+            distinct_buckets: probe.distinct_buckets,
+            bridged_bytes: probe.bridged_bytes,
+        });
+        return Ok(probe);
+    }
+    let runs = read_key_index_set_runs(&plan, limits, LEAF_READ_CONCURRENCY, read, reserve).await;
+    probe.get_requests += runs.get_requests;
+    probe.wire_bytes += runs.wire_bytes;
+    probe.decompressed_bytes = runs.decompressed_bytes;
+    probe.answer = runs.answer;
+    Ok(probe)
+}
+
+fn check_set_keys(keys: &[Key8]) -> Result<(), KeyIndexLeafRejection> {
+    if keys.is_empty() || keys.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(KeyIndexLeafRejection::RequestMismatch(
+            "set probe keys empty, unsorted or repeated".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The keys of a set probe that fall in one non-empty bucket.
+#[derive(Debug, Clone)]
+struct KeyIndexSetGroup {
+    bucket: u32,
+    range: Range<u64>,
+    /// Indexes into the plan's keys.
+    key_indexes: Vec<usize>,
+}
+
+/// The plan step of a set probe: what GET 1 says the bucket runs are, before
+/// any of them is read. Built by [`plan_key_index_leaf_set`]; read by
+/// [`read_key_index_set_runs`], or run by run through [`Self::decoder`].
+#[derive(Debug, Clone)]
+pub struct KeyIndexSetPlan {
+    prefix: KeyIndexLeafPrefix,
+    keys: Vec<Key8>,
+    /// Ascending by bucket, which is body order.
+    groups: Vec<KeyIndexSetGroup>,
+    /// Ascending and non-overlapping.
+    runs: Vec<Range<u64>>,
+    bridged_bytes: u64,
+}
+
+impl KeyIndexSetPlan {
+    /// The bucket runs to read, in body order: one per distinct non-empty
+    /// bucket up to `b_run` of them, above that at most `b_run` bridged
+    /// runs. Empty when every key falls in an empty bucket.
+    pub fn runs(&self) -> &[Range<u64>] {
+        &self.runs
+    }
+
+    /// Distinct non-empty buckets the keys fall in.
+    pub fn distinct_buckets(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Bytes of the runs when they were bridged (gaps included), 0 when each
+    /// bucket is read on its own. The caller checks it against its
+    /// allowance before reading any run.
+    pub fn bridged_bytes(&self) -> u64 {
+        self.bridged_bytes
+    }
+
+    /// A decoder that takes this plan's runs one at a time, in
+    /// [`runs`](Self::runs) order.
+    pub fn decoder<G>(&self) -> KeyIndexSetDecoder<'_, G> {
+        KeyIndexSetDecoder {
+            plan: self,
+            next_run: 0,
+            next_group: 0,
+            per_key: vec![KeyIndexKeyAnswer::Absent; self.keys.len()],
+            guards: Vec::new(),
+            decompressed_bytes: 0,
+        }
+    }
+}
+
+/// Parses GET 1's bytes (`prefix_bytes`, the leaf's
+/// [`key_index_leaf_prefix_range`]) and plans the bucket runs for `keys`
+/// (sorted, distinct, all in the leaf's slice), bridged down to `b_run`
+/// runs as [`KeyIndexSetPolicy`] says. It reads nothing and checks no
+/// allowance: [`KeyIndexSetPlan::bridged_bytes`] is the caller's to compare.
+pub fn plan_key_index_leaf_set(
+    prefix_bytes: &[u8],
+    leaf_ref: &SnapshotKeyIndexLeafRef,
+    request: &KeyIndexLeafRequest<'_>,
+    keys: &[Key8],
+    b_run: usize,
+) -> Result<KeyIndexSetPlan, KeyIndexLeafError> {
+    check_set_keys(keys)?;
+    let prefix = KeyIndexLeafPrefix::parse(prefix_bytes, leaf_ref, request)?;
     // Bucket -> the indexes into `keys` that fall in it. A key in an empty
     // bucket is absent and joins no group.
     let mut groups: std::collections::BTreeMap<u32, (Range<u64>, Vec<usize>)> =
         std::collections::BTreeMap::new();
     for (i, key8) in keys.iter().enumerate() {
-        match prefix.locate(key8) {
-            Ok(Some(located)) => {
-                groups
-                    .entry(located.bucket)
-                    .or_insert_with(|| (located.range, Vec::new()))
-                    .1
-                    .push(i);
-            }
-            Ok(None) => {}
-            Err(rejection) => return reject(probe, rejection),
+        if let Some(located) = prefix.locate(key8)? {
+            groups
+                .entry(located.bucket)
+                .or_insert_with(|| (located.range, Vec::new()))
+                .1
+                .push(i);
         }
     }
-    probe.distinct_buckets = groups.len();
-    let bucket_ranges: Vec<(u64, u64)> = groups.values().map(|(r, _)| (r.start, r.end)).collect();
-    let runs = if bucket_ranges.len() <= policy.b_run {
-        bucket_ranges
+    let groups: Vec<KeyIndexSetGroup> = groups
+        .into_iter()
+        .map(|(bucket, (range, key_indexes))| KeyIndexSetGroup {
+            bucket,
+            range,
+            key_indexes,
+        })
+        .collect();
+    let bucket_ranges: Vec<(u64, u64)> = groups
+        .iter()
+        .map(|g| (g.range.start, g.range.end))
+        .collect();
+    let (runs, bridged_bytes) = if bucket_ranges.len() <= b_run {
+        (bucket_ranges, 0)
     } else {
-        let runs = bound_runs(bucket_ranges, policy.b_run);
-        let bridged_bytes: u64 = runs.iter().map(|(s, e)| e - s).sum();
-        probe.bridged_bytes = bridged_bytes;
-        if bridged_bytes > policy.max_bridged_bytes {
-            probe.answer = KeyIndexSetAnswer::Declined(KeyIndexSetDecline::OverBudget {
-                distinct_buckets: probe.distinct_buckets,
-                bridged_bytes,
-            });
-            return Ok(probe);
-        }
-        runs
+        let runs = bound_runs(bucket_ranges, b_run);
+        let bridged_bytes = runs.iter().map(|(s, e)| e - s).sum();
+        (runs, bridged_bytes)
     };
-    let mut per_key: Vec<KeyIndexKeyAnswer> = vec![KeyIndexKeyAnswer::Absent; keys.len()];
-    let mut guards: Vec<G> = Vec::new();
-    let mut buckets = groups.into_iter().peekable();
-    for (run_start, run_end) in runs {
-        probe.get_requests += 1;
-        let bytes = match read(run_start..run_end).await {
-            Ok(bytes) => bytes,
-            Err(e) => return reject(probe, KeyIndexLeafRejection::Read(e)),
-        };
-        probe.wire_bytes += bytes.len() as u64;
-        if bytes.len() as u64 != run_end - run_start {
-            return reject(
-                probe,
-                corrupted(format_args!(
-                    "bucket read [{run_start}, {run_end}) returned {} bytes",
-                    bytes.len()
-                )),
-            );
+    Ok(KeyIndexSetPlan {
+        prefix,
+        keys: keys.to_vec(),
+        groups,
+        runs: runs.into_iter().map(|(s, e)| s..e).collect(),
+        bridged_bytes,
+    })
+}
+
+/// Why a run did not decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyIndexSetRunError {
+    /// The run's bytes do not answer: wrong length, a bad frame, or a read
+    /// that failed.
+    Rejected(KeyIndexLeafRejection),
+    /// The memory handle refused a frame's [`decoded_bound`].
+    ReservationRefused { bytes: u64 },
+}
+
+impl From<KeyIndexSetRunError> for KeyIndexSetAnswer {
+    fn from(error: KeyIndexSetRunError) -> Self {
+        match error {
+            KeyIndexSetRunError::Rejected(rejection) => KeyIndexSetAnswer::Rejected(rejection),
+            KeyIndexSetRunError::ReservationRefused { bytes } => {
+                KeyIndexSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused { bytes })
+            }
         }
-        while let Some((bucket, (range, key_indexes))) =
-            buckets.next_if(|(_, (range, _))| range.start < run_end)
+    }
+}
+
+/// Decodes a [`KeyIndexSetPlan`]'s runs in body order, one
+/// [`decode_next_run`](Self::decode_next_run) per run. Each frame's
+/// reservation guard is held until the decoder is finished or dropped.
+pub struct KeyIndexSetDecoder<'p, G> {
+    plan: &'p KeyIndexSetPlan,
+    next_run: usize,
+    next_group: usize,
+    per_key: Vec<KeyIndexKeyAnswer>,
+    guards: Vec<G>,
+    decompressed_bytes: u64,
+}
+
+impl<G> KeyIndexSetDecoder<'_, G> {
+    /// Decodes the next run's frames from `bytes`, the read of
+    /// `plan.runs()[n]` for the n-th call. Before each frame is decoded,
+    /// `reserve` is asked for its [`decoded_bound`]; `None` refuses the run.
+    pub fn decode_next_run<R>(
+        &mut self,
+        bytes: &[u8],
+        limits: &KeyIndexLeafLimits,
+        reserve: &mut R,
+    ) -> Result<(), KeyIndexSetRunError>
+    where
+        R: FnMut(u64) -> Option<G>,
+    {
+        let plan = self.plan;
+        let Some(run) = plan.runs.get(self.next_run) else {
+            return Err(KeyIndexSetRunError::Rejected(
+                KeyIndexLeafRejection::RequestMismatch(format!(
+                    "set probe given run {} of {}",
+                    self.next_run + 1,
+                    plan.runs.len()
+                )),
+            ));
+        };
+        self.next_run += 1;
+        let (run_start, run_end) = (run.start, run.end);
+        if bytes.len() as u64 != run_end - run_start {
+            return Err(KeyIndexSetRunError::Rejected(corrupted(format_args!(
+                "bucket read [{run_start}, {run_end}) returned {} bytes",
+                bytes.len()
+            ))));
+        }
+        while let Some(group) = plan
+            .groups
+            .get(self.next_group)
+            .filter(|g| g.range.start < run_end)
         {
-            let start = (range.start - run_start) as usize;
-            let end = (range.end - run_start) as usize;
+            self.next_group += 1;
+            let start = (group.range.start - run_start) as usize;
+            let end = (group.range.end - run_start) as usize;
             let frame = &bytes[start..end];
-            let declared = match KeyIndexLeafPrefix::check_frame_header(bucket, frame, limits) {
-                Ok((_, uncompressed_len)) => decoded_bound(uncompressed_len),
-                Err(rejection) => return reject(probe, rejection),
-            };
-            let Some(guard) = reserve(declared) else {
-                probe.answer =
-                    KeyIndexSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused {
-                        bytes: declared,
-                    });
-                return Ok(probe);
-            };
-            guards.push(guard);
-            let decoded = match prefix.decode_frame(bucket, frame, limits) {
-                Ok(decoded) => decoded,
-                Err(rejection) => return reject(probe, rejection),
-            };
-            probe.decompressed_bytes += u64::from(decoded.uncompressed_len);
-            for i in key_indexes {
-                let key8 = keys[i];
+            let declared = KeyIndexLeafPrefix::check_frame_header(group.bucket, frame, limits)
+                .map(|(_, uncompressed_len)| decoded_bound(uncompressed_len))
+                .map_err(KeyIndexSetRunError::Rejected)?;
+            let guard = reserve(declared)
+                .ok_or(KeyIndexSetRunError::ReservationRefused { bytes: declared })?;
+            self.guards.push(guard);
+            let decoded = plan
+                .prefix
+                .decode_frame(group.bucket, frame, limits)
+                .map_err(KeyIndexSetRunError::Rejected)?;
+            self.decompressed_bytes += u64::from(decoded.uncompressed_len);
+            for &i in &group.key_indexes {
+                let key8 = plan.keys[i];
                 let first = decoded.entries.partition_point(|e| e.key8 < key8);
                 let matches: Vec<KeyIndexMatch> = decoded.entries[first..]
                     .iter()
@@ -1500,17 +1650,120 @@ where
                     })
                     .collect();
                 if !matches.is_empty() {
-                    per_key[i] = KeyIndexKeyAnswer::Matches(matches);
+                    self.per_key[i] = KeyIndexKeyAnswer::Matches(matches);
                 }
             }
         }
+        Ok(())
     }
-    probe.answer = KeyIndexSetAnswer::Answered {
-        per_key,
-        uncovered_entry_ordinals: prefix.uncovered_entry_ordinals().to_vec(),
+
+    /// Sum of the decoded frames' `uncompressed_len` so far.
+    pub fn decompressed_bytes(&self) -> u64 {
+        self.decompressed_bytes
+    }
+
+    /// Whether every run has been decoded.
+    pub fn is_done(&self) -> bool {
+        self.next_run == self.plan.runs.len()
+    }
+
+    /// The answer, releasing the reservation guards. A decoder with runs
+    /// left does not answer.
+    pub fn finish(self) -> KeyIndexSetAnswer {
+        if !self.is_done() {
+            return KeyIndexSetAnswer::Rejected(KeyIndexLeafRejection::RequestMismatch(format!(
+                "set probe finished after {} of {} runs",
+                self.next_run,
+                self.plan.runs.len()
+            )));
+        }
+        KeyIndexSetAnswer::Answered {
+            per_key: self.per_key,
+            uncovered_entry_ordinals: self.plan.prefix.uncovered_entry_ordinals().to_vec(),
+        }
+    }
+}
+
+/// [`read_key_index_set_runs`]'s answer and what its reads cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIndexSetRuns {
+    pub answer: KeyIndexSetAnswer,
+    /// `read` calls issued.
+    pub get_requests: u32,
+    /// Bytes the completed calls returned.
+    pub wire_bytes: u64,
+    /// Sum of the decoded frames' `uncompressed_len`.
+    pub decompressed_bytes: u64,
+}
+
+/// The runs step of a set probe: reads `plan`'s runs with at most
+/// `max_in_flight` reads in flight (0 counts as 1), calling `read` once per
+/// run in run order, and decodes them in body order as they arrive. The
+/// first run that fails, in run order, decides the answer, whatever order
+/// the reads complete in; runs after it are not decoded.
+///
+/// Memory: at most `max_in_flight` runs' bytes are held at once, in flight
+/// or completed and waiting their turn to decode, plus one
+/// [`decoded_bound`] guard per decoded frame, held until this returns. This
+/// does not reserve the wire bytes: the query path's readers reserve each
+/// read's bytes before they issue it.
+pub async fn read_key_index_set_runs<F, Fut, R, G>(
+    plan: &KeyIndexSetPlan,
+    limits: &KeyIndexLeafLimits,
+    max_in_flight: usize,
+    mut read: F,
+    mut reserve: R,
+) -> KeyIndexSetRuns
+where
+    F: FnMut(Range<u64>) -> Fut,
+    Fut: Future<Output = Result<Bytes, String>>,
+    R: FnMut(u64) -> Option<G>,
+{
+    use futures::StreamExt;
+
+    let get_requests = AtomicU32::new(0);
+    let wire_bytes = AtomicU64::new(0);
+    let mut decoder = plan.decoder::<G>();
+    let mut failure = None;
+    {
+        let (issued, returned) = (&get_requests, &wire_bytes);
+        let mut reads = futures::stream::iter(plan.runs.iter().cloned())
+            .map(|range| {
+                issued.fetch_add(1, Ordering::Relaxed);
+                let read = read(range);
+                async move {
+                    let got = read.await;
+                    if let Ok(bytes) = &got {
+                        returned.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    }
+                    got
+                }
+            })
+            .buffered(max_in_flight.max(1));
+        while let Some(got) = reads.next().await {
+            let decoded = match got {
+                Ok(bytes) => decoder.decode_next_run(&bytes, limits, &mut reserve),
+                Err(e) => Err(KeyIndexSetRunError::Rejected(KeyIndexLeafRejection::Read(
+                    e,
+                ))),
+            };
+            if let Err(error) = decoded {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    let decompressed_bytes = decoder.decompressed_bytes();
+    let answer = match failure {
+        Some(error) => error.into(),
+        None => decoder.finish(),
     };
-    drop(guards);
-    Ok(probe)
+    KeyIndexSetRuns {
+        answer,
+        get_requests: get_requests.into_inner(),
+        wire_bytes: wire_bytes.into_inner(),
+        decompressed_bytes,
+    }
 }
 
 impl Catalog {
@@ -1554,7 +1807,7 @@ impl Catalog {
     {
         probe_key_index_leaf_ranged(leaf_ref, request, key8, limits, read)
             .await
-            .map_err(|breach| self.leaf_breach(leaf_ref, breach))
+            .map_err(|breach| self.key_index_leaf_breach(leaf_ref, breach))
     }
 
     /// [`probe_key_index_leaf_set_ranged`] with
@@ -1578,10 +1831,13 @@ impl Catalog {
     {
         probe_key_index_leaf_set_ranged(leaf_ref, request, keys, limits, policy, read, reserve)
             .await
-            .map_err(|breach| self.leaf_breach(leaf_ref, breach))
+            .map_err(|breach| self.key_index_leaf_breach(leaf_ref, breach))
     }
 
-    fn leaf_breach(
+    /// Counts `breach` in [`Catalog::isolation_breaches`] and returns it as
+    /// [`CatalogError::FieldMismatch`]: what a caller that parses a leaf
+    /// through [`plan_key_index_leaf_set`] does with a breach.
+    pub fn key_index_leaf_breach(
         &self,
         leaf_ref: &SnapshotKeyIndexLeafRef,
         breach: KeyIndexLeafBreach,

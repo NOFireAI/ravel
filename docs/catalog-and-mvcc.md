@@ -1109,8 +1109,20 @@ until at most `B_run` ranged reads remain; the gap bytes are read and
 discarded, and the read is taken only when the bridged runs, bucket bytes
 and gap bytes together, total at most `entry_count x KEY_INDEX_T1_BYTES`
 (11 KiB) for the part, the tier-1 cost the part's segments would otherwise
-pay. The allowance is the part's, shared by every slice the set touches. Otherwise the part is uncovered
-for the statement and no further leaf byte is read. Before a frame is
+pay. The allowance is the part's, shared by every slice the set touches
+in slice order. Otherwise the part is uncovered for the statement and no
+bucket run of any of its slices is read. A part's leaf reads run
+concurrently in three phases: GET 1 of every touched slice, then the
+allowance check over all of them, then the bucket runs of every slice.
+Each read phase holds at most `LEAF_READ_CONCURRENCY` (16) reads in
+flight and takes their results in slice and body order, so the first
+failing slice in that order decides the part whatever order the reads
+complete in. With 16 parts probed at once, one statement holds at most 256
+leaf reads in flight, each under the fetch reservation and the GET
+limiter. A part that answers reads exactly the bytes a one-at-a-time probe
+would. A part the allowance refuses has also read GET 1 of the slices
+after the one that exceeded it, and a part a failed read leaves uncovered
+may have read leaf bytes after the failing read; both are counted. Before a frame is
 decoded, its decoded bound (`decoded_bound`, `8 x uncompressed_len + 64`
 bytes) is reserved through the statement's memory handle; a refused
 reservation leaves the part uncovered and counts it, and never fails the
