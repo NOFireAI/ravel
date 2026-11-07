@@ -11,7 +11,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use proptest::prelude::*;
-use ravel_bench::codecs::{Alp, ByteSplitZstd, Chimp128, GcdDeltaFor, RawF64, ValueCodec};
+use ravel_bench::codecs::{
+    Alp, AlpRd, AlpVectorized, ByteSplitZstd, Chimp128, GcdDeltaFor, RawF64, ValueCodec,
+};
 
 fn bits(values: &[f64]) -> Vec<u64> {
     values.iter().map(|v| v.to_bits()).collect()
@@ -37,6 +39,8 @@ fn assert_roundtrip_all(values: &[f64]) {
     assert_roundtrip(&Chimp128, values);
     assert_roundtrip(&ByteSplitZstd, values);
     assert_roundtrip(&RawF64, values);
+    assert_roundtrip(&AlpVectorized, values);
+    assert_roundtrip(&AlpRd, values);
 }
 
 /// A grab bag of bit patterns that stress every special case: signed zeros,
@@ -51,6 +55,7 @@ fn special_values() -> Vec<f64> {
         f64::from_bits(0x7FF8_0000_0000_0001),
         f64::from_bits(0x7FF0_0000_0000_0001), // signalling NaN
         f64::from_bits(0xFFF8_DEAD_BEEF_CAFE), // negative NaN with payload
+        f64::from_bits(0x7ff0_0000_0000_0002), // PromQL stale marker bit pattern
         f64::INFINITY,
         f64::NEG_INFINITY,
         f64::MIN_POSITIVE,
@@ -95,6 +100,8 @@ proptest! {
         assert_roundtrip(&Chimp128, &values);
         assert_roundtrip(&ByteSplitZstd, &values);
         assert_roundtrip(&RawF64, &values);
+        assert_roundtrip(&AlpVectorized, &values);
+        assert_roundtrip(&AlpRd, &values);
     }
 
     // Integer- and fixed-decimal streams are the paths ALP and GCD-FOR model
@@ -113,6 +120,8 @@ proptest! {
         assert_roundtrip(&Chimp128, &values);
         assert_roundtrip(&ByteSplitZstd, &values);
         assert_roundtrip(&RawF64, &values);
+        assert_roundtrip(&AlpVectorized, &values);
+        assert_roundtrip(&AlpRd, &values);
     }
 
     // A decimal stream salted with occasional special values (NaN, -0.0, inf):
@@ -139,6 +148,8 @@ proptest! {
         }
         assert_roundtrip(&Alp, &values);
         assert_roundtrip(&GcdDeltaFor, &values);
+        assert_roundtrip(&AlpVectorized, &values);
+        assert_roundtrip(&AlpRd, &values);
     }
 
     // Streams built from a tiny alphabet of close values exercise Chimp's
@@ -157,6 +168,8 @@ proptest! {
         assert_roundtrip(&Chimp128, &values);
         assert_roundtrip(&ByteSplitZstd, &values);
         assert_roundtrip(&RawF64, &values);
+        assert_roundtrip(&AlpVectorized, &values);
+        assert_roundtrip(&AlpRd, &values);
     }
 
     // Corrupt/truncated input must never panic: for arbitrary bytes and an
@@ -171,6 +184,8 @@ proptest! {
         let _ = Chimp128.decode(&bytes, count);
         let _ = ByteSplitZstd.decode(&bytes, count);
         let _ = RawF64.decode(&bytes, count);
+        let _ = AlpVectorized.decode(&bytes, count);
+        let _ = AlpRd.decode(&bytes, count);
     }
 
     // Truncating a valid encoding must be caught as a typed error (never a
@@ -181,13 +196,15 @@ proptest! {
         values in proptest::collection::vec(any_f64(), 2..200),
         cut in 1usize..40,
     ) {
-        for codec_kind in 0..5u8 {
+        for codec_kind in 0..7u8 {
             let encoded = match codec_kind {
                 0 => Chimp128.encode(&values),
                 1 => ByteSplitZstd.encode(&values),
                 2 => RawF64.encode(&values),
                 3 => Alp.encode(&values),
-                _ => GcdDeltaFor.encode(&values),
+                4 => GcdDeltaFor.encode(&values),
+                5 => AlpVectorized.encode(&values),
+                _ => AlpRd.encode(&values),
             };
             if cut >= encoded.len() {
                 continue;
@@ -198,7 +215,9 @@ proptest! {
                 1 => ByteSplitZstd.decode(truncated, values.len()),
                 2 => RawF64.decode(truncated, values.len()),
                 3 => Alp.decode(truncated, values.len()),
-                _ => GcdDeltaFor.decode(truncated, values.len()),
+                4 => GcdDeltaFor.decode(truncated, values.len()),
+                5 => AlpVectorized.decode(truncated, values.len()),
+                _ => AlpRd.decode(truncated, values.len()),
             };
             // RawF64 loses exactly `cut` bytes so the length can never match.
             if codec_kind == 2 {

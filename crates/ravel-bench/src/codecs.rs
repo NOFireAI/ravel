@@ -38,6 +38,8 @@
 //! Decoders treat their input as untrusted: corrupt or truncated bytes return
 //! a typed [`CodecError`], never a panic.
 
+use std::collections::HashMap;
+
 use ravel_codec::encoding::{Enc, decode_i64, encode_i64};
 
 /// Typed decode failure. Encoding never fails, so only decoders return this.
@@ -859,6 +861,228 @@ impl ValueCodec for GcdDeltaFor {
     }
 }
 
+// --- vectorised ALP and ALP-rd (ADR-3694 decision 7) ---------------------
+
+/// Vector size both vectorised codecs below model independently: ALP's own
+/// paper default, and small enough that a page-wide outlier in one vector
+/// cannot force a worse-fitting exponent on the rest of the page the way
+/// whole-page [`Alp`] can.
+const ALP_VECTOR_LEN: usize = 1024;
+
+/// Per-vector ALP: [`best_exponent`] and `digit_for` chosen independently per
+/// up-to-[`ALP_VECTOR_LEN`]-value vector, digits frame-of-reference
+/// bit-packed ([`for_pack`]) rather than run through [`encode_i64`]'s
+/// best-of-many-encodings search, and exceptions (non-finite, signed zero,
+/// any value the model does not reproduce bit-exactly) stored as
+/// position-within-vector plus raw bits. It picks only a decimal exponent
+/// per vector, with no factor: this is not the paper's exponent-and-factor
+/// search. Stateless handle.
+pub struct AlpVectorized;
+
+/// Encodes one vector's values as `[exponent: u8][for_pack(digits)]
+/// [n_exceptions: uvarint]{[local_idx: uvarint][raw_bits: 8 bytes]}`.
+fn encode_alp_vector(out: &mut Vec<u8>, chunk: &[f64]) {
+    let (e, _fits) = best_exponent(chunk);
+    let mut digits = Vec::with_capacity(chunk.len());
+    let mut exceptions: Vec<(usize, u64)> = Vec::new();
+    for (i, &v) in chunk.iter().enumerate() {
+        match digit_for(v, e) {
+            Some(d) => digits.push(d),
+            None => {
+                digits.push(0);
+                exceptions.push((i, v.to_bits()));
+            }
+        }
+    }
+    out.push(e as u8);
+    for_pack(out, &digits);
+    put_uvarint(out, exceptions.len() as u64);
+    for (idx, bits) in &exceptions {
+        put_uvarint(out, *idx as u64);
+        out.extend_from_slice(&bits.to_le_bytes());
+    }
+}
+
+/// Inverse of [`encode_alp_vector`] for exactly `n` values starting at `*pos`.
+fn decode_alp_vector(bytes: &[u8], pos: &mut usize, n: usize) -> Result<Vec<f64>, CodecError> {
+    let e = usize::from(*bytes.get(*pos).ok_or(CodecError::Truncated)?);
+    *pos += 1;
+    if e > MAX_DECIMAL_EXP {
+        return Err(CodecError::Corrupt);
+    }
+    let digits = for_unpack(bytes, pos, n)?;
+    let mut out: Vec<f64> = digits.iter().map(|&d| (d as f64) / POW10[e]).collect();
+    let n_exc = usize::try_from(get_uvarint(bytes, pos)?).map_err(|_| CodecError::Overflow)?;
+    for _ in 0..n_exc {
+        let idx = usize::try_from(get_uvarint(bytes, pos)?).map_err(|_| CodecError::Overflow)?;
+        let raw_end = pos.checked_add(8).ok_or(CodecError::Truncated)?;
+        let raw = bytes.get(*pos..raw_end).ok_or(CodecError::Truncated)?;
+        *pos += 8;
+        let arr: [u8; 8] = raw.try_into().map_err(|_| CodecError::Truncated)?;
+        *out.get_mut(idx).ok_or(CodecError::Corrupt)? = f64::from_bits(u64::from_le_bytes(arr));
+    }
+    Ok(out)
+}
+
+impl ValueCodec for AlpVectorized {
+    fn name(&self) -> &'static str {
+        "alp_vectorized"
+    }
+
+    fn encode(&self, values: &[f64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in values.chunks(ALP_VECTOR_LEN) {
+            encode_alp_vector(&mut out, chunk);
+        }
+        out
+    }
+
+    fn decode(&self, bytes: &[u8], count: usize) -> Result<Vec<f64>, CodecError> {
+        let mut out = Vec::with_capacity(count);
+        let mut pos = 0usize;
+        let mut remaining = count;
+        while remaining > 0 {
+            let this_len = remaining.min(ALP_VECTOR_LEN);
+            out.extend(decode_alp_vector(bytes, &mut pos, this_len)?);
+            remaining -= this_len;
+        }
+        Ok(out)
+    }
+}
+
+/// ALP's "real doubles" (rd) fallback: splits each value's bit pattern into a
+/// 16-bit left part, dictionary-coded (insertion order, capped at 256
+/// entries; a left part seen after the cap is an exception), and a 48-bit
+/// right part, frame-of-reference bit-packed across the vector. The split is
+/// bit-exact and invertible for every `f64` regardless of distribution (`bits
+/// == (left << 48) | right`), so unlike [`AlpVectorized`] this path has no
+/// decimal-model exceptions; the dictionary escape exists only to bound the
+/// dictionary's own size. [`AlpRd`] (below) picks this or the ALP digit model
+/// per vector by encoded size, which is the "rd mode" ADR-3694 decision 7
+/// asks for.
+const RD_DICT_CAP: usize = 256;
+
+fn encode_rd_vector(out: &mut Vec<u8>, chunk: &[f64]) {
+    let mut dict: Vec<u16> = Vec::new();
+    let mut codes: Vec<i64> = Vec::with_capacity(chunk.len());
+    let mut rights: Vec<i64> = Vec::with_capacity(chunk.len());
+    let mut exceptions: Vec<(usize, u16)> = Vec::new();
+    for (i, &v) in chunk.iter().enumerate() {
+        let bits = v.to_bits();
+        let left = (bits >> 48) as u16;
+        let right = (bits & 0xFFFF_FFFF_FFFF) as i64;
+        rights.push(right);
+        if let Some(code) = dict.iter().position(|&d| d == left) {
+            codes.push(code as i64);
+        } else if dict.len() < RD_DICT_CAP {
+            dict.push(left);
+            codes.push((dict.len() - 1) as i64);
+        } else {
+            codes.push(RD_DICT_CAP as i64); // escape: see exceptions
+            exceptions.push((i, left));
+        }
+    }
+    put_uvarint(out, dict.len() as u64);
+    for &d in &dict {
+        out.extend_from_slice(&d.to_le_bytes());
+    }
+    for_pack(out, &codes);
+    for_pack(out, &rights);
+    put_uvarint(out, exceptions.len() as u64);
+    for (idx, left) in &exceptions {
+        put_uvarint(out, *idx as u64);
+        out.extend_from_slice(&left.to_le_bytes());
+    }
+}
+
+fn decode_rd_vector(bytes: &[u8], pos: &mut usize, n: usize) -> Result<Vec<f64>, CodecError> {
+    let dict_len = usize::try_from(get_uvarint(bytes, pos)?).map_err(|_| CodecError::Overflow)?;
+    let mut dict = Vec::with_capacity(dict_len);
+    for _ in 0..dict_len {
+        let end = pos.checked_add(2).ok_or(CodecError::Truncated)?;
+        let raw = bytes.get(*pos..end).ok_or(CodecError::Truncated)?;
+        *pos += 2;
+        let arr: [u8; 2] = raw.try_into().map_err(|_| CodecError::Truncated)?;
+        dict.push(u16::from_le_bytes(arr));
+    }
+    let codes = for_unpack(bytes, pos, n)?;
+    let rights = for_unpack(bytes, pos, n)?;
+    let n_exc = usize::try_from(get_uvarint(bytes, pos)?).map_err(|_| CodecError::Overflow)?;
+    let mut exc_map: HashMap<usize, u16> = HashMap::with_capacity(n_exc);
+    for _ in 0..n_exc {
+        let idx = usize::try_from(get_uvarint(bytes, pos)?).map_err(|_| CodecError::Overflow)?;
+        let end = pos.checked_add(2).ok_or(CodecError::Truncated)?;
+        let raw = bytes.get(*pos..end).ok_or(CodecError::Truncated)?;
+        *pos += 2;
+        let arr: [u8; 2] = raw.try_into().map_err(|_| CodecError::Truncated)?;
+        exc_map.insert(idx, u16::from_le_bytes(arr));
+    }
+    let mut out = Vec::with_capacity(n);
+    for (i, (&code, &right)) in codes.iter().zip(rights.iter()).enumerate() {
+        let code = usize::try_from(code).map_err(|_| CodecError::Corrupt)?;
+        let left: u16 = if code == dict.len() {
+            *exc_map.get(&i).ok_or(CodecError::Corrupt)?
+        } else {
+            *dict.get(code).ok_or(CodecError::Corrupt)?
+        };
+        let right_bits = (right as u64) & 0xFFFF_FFFF_FFFF;
+        let bits = (u64::from(left) << 48) | right_bits;
+        out.push(f64::from_bits(bits));
+    }
+    Ok(out)
+}
+
+/// Per-vector choice between the ALP digit model and the rd fallback above,
+/// by encoded size (ADR-3694 decision 7's "pick ALP or rd per vector by
+/// estimated size"). Stateless handle.
+pub struct AlpRd;
+
+const ALP_RD_MODE_ALP: u8 = 0;
+const ALP_RD_MODE_RD: u8 = 1;
+
+impl ValueCodec for AlpRd {
+    fn name(&self) -> &'static str {
+        "alp_rd"
+    }
+
+    fn encode(&self, values: &[f64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in values.chunks(ALP_VECTOR_LEN) {
+            let mut alp_bytes = Vec::new();
+            encode_alp_vector(&mut alp_bytes, chunk);
+            let mut rd_bytes = Vec::new();
+            encode_rd_vector(&mut rd_bytes, chunk);
+            if alp_bytes.len() <= rd_bytes.len() {
+                out.push(ALP_RD_MODE_ALP);
+                out.extend_from_slice(&alp_bytes);
+            } else {
+                out.push(ALP_RD_MODE_RD);
+                out.extend_from_slice(&rd_bytes);
+            }
+        }
+        out
+    }
+
+    fn decode(&self, bytes: &[u8], count: usize) -> Result<Vec<f64>, CodecError> {
+        let mut out = Vec::with_capacity(count);
+        let mut pos = 0usize;
+        let mut remaining = count;
+        while remaining > 0 {
+            let this_len = remaining.min(ALP_VECTOR_LEN);
+            let marker = *bytes.get(pos).ok_or(CodecError::Truncated)?;
+            pos += 1;
+            let vec_out = match marker {
+                ALP_RD_MODE_ALP => decode_alp_vector(bytes, &mut pos, this_len)?,
+                ALP_RD_MODE_RD => decode_rd_vector(bytes, &mut pos, this_len)?,
+                _ => return Err(CodecError::Corrupt),
+            };
+            out.extend(vec_out);
+            remaining -= this_len;
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -884,6 +1108,7 @@ mod tests {
             -f64::NAN,
             f64::from_bits(0x7FF8_0000_0000_0001), // NaN with payload
             f64::from_bits(0xFFF0_0000_0000_0007), // signalling-ish NaN payload
+            f64::from_bits(0x7ff0_0000_0000_0002), // PromQL stale marker bit pattern
             f64::INFINITY,
             f64::NEG_INFINITY,
             f64::MIN_POSITIVE,
@@ -905,6 +1130,8 @@ mod tests {
         roundtrip(&Chimp128, &values);
         roundtrip(&ByteSplitZstd, &values);
         roundtrip(&RawF64, &values);
+        roundtrip(&AlpVectorized, &values);
+        roundtrip(&AlpRd, &values);
     }
 
     #[test]
@@ -915,6 +1142,8 @@ mod tests {
             roundtrip(&Chimp128, &values);
             roundtrip(&ByteSplitZstd, &values);
             roundtrip(&RawF64, &values);
+            roundtrip(&AlpVectorized, &values);
+            roundtrip(&AlpRd, &values);
         }
     }
 
@@ -928,7 +1157,41 @@ mod tests {
         for values in [&counter, &dec2, &dec3] {
             roundtrip(&Alp, values);
             roundtrip(&GcdDeltaFor, values);
+            roundtrip(&AlpVectorized, values);
+            roundtrip(&AlpRd, values);
         }
+    }
+
+    #[test]
+    fn alp_vectorized_spans_multiple_vectors() {
+        // 2500 values crosses three 1024-length vectors, so this exercises the
+        // chunk boundary (the last vector is partial) as well as per-vector
+        // exponent selection.
+        let values: Vec<f64> = (0..2500).map(|i| (i as f64) * 0.25).collect();
+        roundtrip(&AlpVectorized, &values);
+        roundtrip(&AlpRd, &values);
+    }
+
+    #[test]
+    fn alp_rd_picks_rd_mode_for_high_entropy_vector() {
+        // A vector of arbitrary-bits floats has no small decimal exponent, so
+        // the ALP digit model falls back to one exception per value (far
+        // larger than rd's dictionary + bit-packed-right encoding): rd mode
+        // must win and the stream must still round-trip bit-exactly.
+        let values: Vec<f64> = (0u64..1500)
+            .map(|i| f64::from_bits(0x4000_0000_0000_0000 ^ (i.wrapping_mul(0x9E37_79B9))))
+            .collect();
+        let mut alp_bytes = Vec::new();
+        encode_alp_vector(&mut alp_bytes, &values[..1024]);
+        let mut rd_bytes = Vec::new();
+        encode_rd_vector(&mut rd_bytes, &values[..1024]);
+        assert!(
+            rd_bytes.len() < alp_bytes.len(),
+            "rd ({} bytes) should beat the alp digit model ({} bytes) on high-entropy doubles",
+            rd_bytes.len(),
+            alp_bytes.len()
+        );
+        roundtrip(&AlpRd, &values);
     }
 
     #[test]
@@ -978,6 +1241,8 @@ mod tests {
             RawF64.encode(&values),
             Alp.encode(&values),
             GcdDeltaFor.encode(&values),
+            AlpVectorized.encode(&values),
+            AlpRd.encode(&values),
         ]
         .into_iter()
         .enumerate()
@@ -990,7 +1255,9 @@ mod tests {
                     1 => ByteSplitZstd.decode(truncated, values.len()),
                     2 => RawF64.decode(truncated, values.len()),
                     3 => Alp.decode(truncated, values.len()),
-                    _ => GcdDeltaFor.decode(truncated, values.len()),
+                    4 => GcdDeltaFor.decode(truncated, values.len()),
+                    5 => AlpVectorized.decode(truncated, values.len()),
+                    _ => AlpRd.decode(truncated, values.len()),
                 };
                 // No panic is the assertion; result may be Ok or Err.
             }
