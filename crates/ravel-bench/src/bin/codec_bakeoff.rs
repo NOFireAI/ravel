@@ -26,9 +26,10 @@
 //! `decode_run_pages_soa`, which frame and decode a whole run -- a TS page as
 //! well as the VAL page. That charges production a fixed TS-framing cost the
 //! payload-only challengers never pay, so these numbers *understate*
-//! production's value-only decode speed. A challenger that beats production
-//! decode here beats it by at least this much; a challenger that does not is
-//! ambiguous on throughput. The bytes-per-sample figures carry no such caveat.
+//! production's value-only decode speed. A challenger slower than production
+//! here is slower than it; a challenger faster here may not be faster than a
+//! value-only production decode. The bytes-per-sample figures carry no such
+//! caveat.
 //!
 //! ## Adoption rule (ADR-0092 decision 6, applied in the summary)
 //!
@@ -78,9 +79,11 @@ fn dataset(shape: ValueShape, n: usize) -> Dataset {
 
 /// A value dataset drawn from a real MetricsBench profile
 /// (`benchmarks/metrics/workload.json`), via `metrics_stream_sample`, for
-/// exactly `n` float samples (concatenating series in first-encountered
-/// order until `n` is reached). `None` if the profile cannot supply `n`
-/// float samples within the bounded series/step budget tried here.
+/// exactly `n` float samples, joining up to 8 series end to end in
+/// first-encountered order until `n` is reached, so a page can span several
+/// series. Returns the seed, how many series were joined, and the dataset;
+/// `None` if the profile cannot supply `n` float samples within the bounded
+/// series/step budget tried here.
 ///
 /// Only `"history"` (10,000 active series) is used for value datasets, never
 /// `"cardinality"` (1,000,000 active series): measured on this box,
@@ -90,11 +93,13 @@ fn dataset(shape: ValueShape, n: usize) -> Dataset {
 /// `cardinality`'s temporal behavior is already covered by the timestamp
 /// bake-off (`ts_bakeoff`), which bounds it to 8 steps; its *value*
 /// distributions are not separately sampled here.
-fn metrics_value_dataset(n: usize) -> Option<(u64, Dataset)> {
+fn metrics_value_dataset(n: usize) -> Option<(u64, usize, Dataset)> {
     let (seed, series) = sample_series("history", n as u64, 8).ok()?;
     let mut values: Vec<f64> = Vec::with_capacity(n);
+    let mut joined = 0usize;
     for s in &series {
         values.extend(s.values.iter().copied());
+        joined += 1;
         if values.len() >= n {
             break;
         }
@@ -105,6 +110,7 @@ fn metrics_value_dataset(n: usize) -> Option<(u64, Dataset)> {
     values.truncate(n);
     Some((
         seed,
+        joined,
         Dataset {
             name: "metricsbench_history",
             values,
@@ -158,7 +164,7 @@ struct Cell {
     /// decode is CPU-bound rather than memory-bandwidth-bound.
     dec_out_mb_per_sec: f64,
     roundtrip_ok: bool,
-    /// Production enc tag (16 Gorilla, 17 raw) for the production row only.
+    /// Production's selected VAL enc tag, for the production row only.
     prod_enc: Option<u8>,
 }
 
@@ -282,12 +288,10 @@ fn measure_production(values: &[f64]) -> Cell {
     }
 }
 
-/// Renders one page size's full report block (every dataset, production row,
+/// Renders one page size's report block (every dataset, production row,
 /// every challenger row) and returns the per-dataset summaries used by the
-/// adoption pass. Split out of `main` so a reduced page size can be driven
-/// from a test: see `report_has_no_duplicate_cells` below, which is the
-/// Deliverable-3 "report fields appear exactly once per (corpus, codec, page
-/// size) cell" guard.
+/// adoption pass. Every cell row starts with its dataset, page size and
+/// codec, so a test can count each cell's line in the rendered text.
 fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
     let mut out = String::new();
     let mut summary: Vec<DatasetSummary> = Vec::new();
@@ -300,10 +304,11 @@ fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
         .map(|&shape| dataset(shape, page))
         .collect();
     match metrics_value_dataset(page) {
-        Some((seed, ds)) => {
+        Some((seed, joined, ds)) => {
             out.push_str(&format!(
                 "(metricsbench_history values: seed={seed}, n={page}, drawn via \
-                 metrics_stream_sample::sample_series, bounded to 8 series)\n"
+                 metrics_stream_sample::sample_series, {joined} series joined end to end, \
+                 at most 8)\n"
             ));
             datasets.push(ds);
         }
@@ -328,13 +333,19 @@ fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
         .map(|c| measure_challenger(*c, &ds.values))
         .collect();
 
-        let enc_tag = prod.prod_enc.map(enc_name).unwrap_or("?");
+        let enc_tag = prod
+            .prod_enc
+            .map(enc_name)
+            .unwrap_or_else(|| "none".to_string());
         out.push_str(&format!(
             "\n{}  (n={page}, production val enc={enc_tag})\n",
             ds.name
         ));
+        let name = ds.name;
         out.push_str(&format!(
-            "  {:<16} {:>10} {:>12} {:>12} {:>12} {:>12} {:>8}  {}\n",
+            "  {:<20} {:>5} {:<16} {:>10} {:>12} {:>12} {:>12} {:>12} {:>8}  {}\n",
+            "dataset",
+            "n",
             "codec",
             "B/sample",
             "enc Mval/s",
@@ -346,7 +357,7 @@ fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
         ));
         let prod_bytes = prod.bytes_per_sample;
         out.push_str(&format!(
-            "  {:<16} {:>10.4} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>8}  {}\n",
+            "  {name:<20} {page:>5} {:<16} {:>10.4} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>8}  {}\n",
             prod.codec,
             prod.bytes_per_sample,
             prod.enc_mvps,
@@ -360,7 +371,7 @@ fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
         for c in &challengers {
             let ratio = c.bytes_per_sample / prod_bytes.max(f64::MIN_POSITIVE);
             out.push_str(&format!(
-                "  {:<16} {:>10.4} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>8.3}  {}\n",
+                "  {name:<20} {page:>5} {:<16} {:>10.4} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>8.3}  {}\n",
                 c.codec,
                 c.bytes_per_sample,
                 c.enc_mvps,
@@ -389,11 +400,10 @@ fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
     (out, summary)
 }
 
-fn main() {
+/// Renders the whole report below the environment header: every page
+/// size's block, then the adoption summary. `main` prints exactly this.
+fn render_report(page_sizes: &[usize]) -> String {
     let mut out = String::new();
-    out.push_str(&env_header(
-        "Value codec bake-off (issue #312, ADR-0092 decision 6)",
-    ));
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(0);
@@ -420,7 +430,7 @@ fn main() {
     // baselines plus each challenger's summary numbers.
     let mut summary: Vec<DatasetSummary> = Vec::new();
 
-    for &page in &PAGE_SIZES {
+    for &page in page_sizes {
         let (page_out, page_summary) = page_report(page);
         out.push_str(&page_out);
         summary.extend(page_summary);
@@ -451,7 +461,7 @@ fn main() {
             .collect();
         let (page, name) = (row.page, row.name);
         out.push_str(&format!(
-            "  n={page:<4} {name:<20} adopt: {}{}\n",
+            "  {name:<20} {page:>5} adopt: {}{}\n",
             if winners.is_empty() {
                 "none".to_string()
             } else {
@@ -465,14 +475,24 @@ fn main() {
         ));
     }
 
+    out
+}
+
+fn main() {
+    let mut out = env_header("Value codec bake-off (issue #312, ADR-0092 decision 6)");
+    out.push_str(&render_report(&PAGE_SIZES));
     print!("{out}");
 }
 
-fn enc_name(tag: u8) -> &'static str {
+/// Names a production VAL enc tag (docs/segment-format.md); production's
+/// scalar selection picks among exactly 16 to 19.
+fn enc_name(tag: u8) -> String {
     match tag {
-        16 => "16(gorilla)",
-        17 => "17(raw_f64)",
-        _ => "?",
+        16 => "16(gorilla)".to_string(),
+        17 => "17(raw_f64)".to_string(),
+        18 => "18(alp)".to_string(),
+        19 => "19(gcd_delta_for)".to_string(),
+        other => format!("{other}(unknown)"),
     }
 }
 
@@ -577,59 +597,109 @@ mod tests {
         assert_eq!(dec_in_mb_per_sec(100.0, 0, 0), 0.0);
     }
 
-    /// Deliverable-3 guard: every report field appears exactly once per
-    /// (corpus, codec, page size) cell. Run on a reduced page size (4, not the
-    /// real `PAGE_SIZES`) so this stays cheap: `page_report` is the exact
-    /// function `main` drives, so a stray second push into `summary` (a
-    /// duplicated dataset, a codec measured twice) is caught here rather than
-    /// only visible by eyeballing the printed table.
+    const TEST_PAGE: usize = 4;
+    const CODECS: [&str; 8] = [
+        "production",
+        "alp",
+        "gcd_delta_for",
+        "chimp128",
+        "bytesplit_zstd",
+        "raw_f64",
+        "alp_vectorized",
+        "alp_rd",
+    ];
+
+    fn datasets() -> Vec<&'static str> {
+        let mut names: Vec<&str> = ALL_SHAPES.iter().map(|s| s.label()).collect();
+        names.push("metricsbench_history");
+        names
+    }
+
+    /// A cell line is an indented `<dataset> <n> <codec> <figures...>`; the column
+    /// header (n = "n") and the adoption lines (codec = "adopt:") are not.
+    fn cell_key(line: &str) -> Option<(&str, usize, &str)> {
+        if !line.starts_with("  ") {
+            return None;
+        }
+        let mut words = line.split_whitespace();
+        let dataset = words.next()?;
+        let n = words.next()?.parse().ok()?;
+        let codec = words.next()?;
+        (codec != "adopt:").then_some((dataset, n, codec))
+    }
+
+    /// Every (dataset, codec) cell at `page` appears on exactly one line of
+    /// the rendered report, every (dataset, page) has exactly one adoption
+    /// line, and the report holds no cell line beyond those.
+    fn check_cells(out: &str, page: usize) -> Result<(), String> {
+        let lines: Vec<&str> = out.lines().collect();
+        let cells: Vec<(&str, usize, &str)> = lines.iter().filter_map(|l| cell_key(l)).collect();
+        let names = datasets();
+        for &ds in &names {
+            for &codec in &CODECS {
+                let count = cells.iter().filter(|&&c| c == (ds, page, codec)).count();
+                if count != 1 {
+                    return Err(format!(
+                        "cell ({ds}, {codec}, n={page}) appears {count} times in the rendered \
+                         report, expected exactly 1"
+                    ));
+                }
+            }
+            let adopt = lines
+                .iter()
+                .filter(|l| {
+                    let w: Vec<&str> = l.split_whitespace().take(3).collect();
+                    w == [ds, &page.to_string(), "adopt:"]
+                })
+                .count();
+            if adopt != 1 {
+                return Err(format!(
+                    "adoption line ({ds}, n={page}) appears {adopt} times, expected exactly 1"
+                ));
+            }
+        }
+        if let Some(extra) = cells
+            .iter()
+            .find(|(ds, n, codec)| !(names.contains(ds) && *n == page && CODECS.contains(codec)))
+        {
+            return Err(format!(
+                "rendered report holds an unexpected cell line {extra:?}"
+            ));
+        }
+        Ok(())
+    }
+
     #[test]
-    fn report_has_no_duplicate_cells() {
-        let (out, summary) = page_report(4);
+    fn report_has_every_cell_exactly_once() {
+        let out = render_report(&[TEST_PAGE]);
+        check_cells(&out, TEST_PAGE).unwrap_or_else(|e| panic!("{e}"));
+    }
 
-        // No dataset name appears twice for this page: one row of production
-        // numbers per corpus, not more.
-        let mut names: Vec<&str> = summary.iter().map(|d| d.name).collect();
-        let before = names.len();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(
-            names.len(),
-            before,
-            "a dataset name was measured more than once for page=4"
-        );
-        assert!(!summary.is_empty(), "page_report(4) measured no datasets");
+    #[test]
+    fn guard_rejects_a_duplicated_cell() {
+        let out = render_report(&[TEST_PAGE]);
+        let line = out
+            .lines()
+            .find(|l| cell_key(l) == Some(("metricsbench_history", TEST_PAGE, "alp_rd")))
+            .unwrap_or_else(|| panic!("no metricsbench_history alp_rd line"))
+            .to_string();
+        let doubled = out.replacen(&line, &format!("{line}\n{line}"), 1);
+        let err = check_cells(&doubled, TEST_PAGE)
+            .err()
+            .unwrap_or_else(|| panic!("a duplicated cell passed the guard"));
+        assert!(err.contains("appears 2 times"), "{err}");
+    }
 
-        // Within each dataset, every challenger codec name appears exactly
-        // once: no codec measured twice, none silently dropped.
-        for ds in &summary {
-            let mut codecs: Vec<&str> = ds.challengers.iter().map(|c| c.codec).collect();
-            let expected = codecs.len();
-            codecs.sort_unstable();
-            codecs.dedup();
-            assert_eq!(
-                codecs.len(),
-                expected,
-                "dataset {} has a duplicated challenger codec row",
-                ds.name
-            );
-            assert_eq!(
-                expected, 7,
-                "dataset {} should report exactly the 7 wired challengers",
-                ds.name
-            );
-        }
-
-        // And in the rendered text itself: each dataset's own header line
-        // ("<name>  (n=4, ...)") appears exactly once in the page's output.
-        for ds in &summary {
-            let header = format!("\n{}  (n=4,", ds.name);
-            let occurrences = out.matches(&header).count();
-            assert_eq!(
-                occurrences, 1,
-                "dataset header for {} appears {occurrences} times, expected 1",
-                ds.name
-            );
-        }
+    #[test]
+    fn guard_rejects_a_dropped_cell() {
+        let out = render_report(&[TEST_PAGE]);
+        let kept: Vec<&str> = out
+            .lines()
+            .filter(|l| cell_key(l) != Some(("gauge_int", TEST_PAGE, "production")))
+            .collect();
+        let err = check_cells(&kept.join("\n"), TEST_PAGE)
+            .err()
+            .unwrap_or_else(|| panic!("a dropped cell passed the guard"));
+        assert!(err.contains("appears 0 times"), "{err}");
     }
 }

@@ -4496,9 +4496,8 @@ mod page_codec_selection_v7 {
 
     // --- fixed special-value rows (issue #3866 deliverable 4) -----------
 
-    /// A spread of bit-significant floats every VAL encoding reachable from
-    /// `frame_val_page` must preserve exactly, regardless of which codec
-    /// selection picks: two distinct NaN payloads, the PromQL stale marker
+    /// A spread of bit-significant floats the production write path must
+    /// preserve exactly: two distinct NaN payloads, the PromQL stale marker
     /// (`0x7ff0000000000002`, not pinned anywhere else in this module), both
     /// signed zeros, both infinities, and a subnormal.
     fn hard_values() -> Vec<f64> {
@@ -4522,9 +4521,9 @@ mod page_codec_selection_v7 {
     fn hard_values_round_trip_through_production_selection() {
         // Exercised through the real write path (frame_run -> encode_run_v4 ->
         // frame_val_page's codec selection) and the real read path
-        // (decode_run), not a bare codec call: whichever VAL encoding
-        // selection picks (Gorilla, raw, ALP, or GCD-FOR) must preserve every
-        // bit, including the ones no other test in this module pins.
+        // (decode_run), not a bare codec call. This frames one 12-value page,
+        // so it checks only the single VAL encoding selection picks for it
+        // (named in the failure message), not every codec selection can reach.
         let vals = hard_values();
         let ts = regular_ms(vals.len());
         let run = frame_run(&ts, &vals);

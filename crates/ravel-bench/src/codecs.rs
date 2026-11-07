@@ -874,7 +874,9 @@ const ALP_VECTOR_LEN: usize = 1024;
 /// bit-packed ([`for_pack`]) rather than run through [`encode_i64`]'s
 /// best-of-many-encodings search, and exceptions (non-finite, signed zero,
 /// any value the model does not reproduce bit-exactly) stored as
-/// position-within-vector plus raw bits. Stateless handle.
+/// position-within-vector plus raw bits. It picks only a decimal exponent
+/// per vector, with no factor: this is not the paper's exponent-and-factor
+/// search. Stateless handle.
 pub struct AlpVectorized;
 
 /// Encodes one vector's values as `[exponent: u8][for_pack(digits)]
