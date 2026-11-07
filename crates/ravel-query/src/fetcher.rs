@@ -1135,9 +1135,9 @@ impl FetchStats {
 #[derive(Default)]
 struct FetchedRegions {
     buffers: Vec<(u64, Bytes)>,
-    /// Slices of another `FetchedRegions`' buffers (an L1 page batch borrowing
+    /// Whole buffers of another `FetchedRegions` (an L1 page batch borrowing
     /// the bytes its segment's open and catalog fetch already hold). They are
-    /// refcounted views whose bytes stay under the lender's reservations, so
+    /// refcounted clones whose bytes stay under the lender's reservations, so
     /// these regions hold no reservation for them.
     borrowed: Vec<(u64, Bytes)>,
     /// Fetch-layer byte reservations (ADR-1170 decision 2) covering the GETs
@@ -1159,13 +1159,21 @@ impl FetchedRegions {
         self.reservations.push(reservation);
     }
 
-    /// Regions for one L1 page batch: empty, except for the parts of `needed`
-    /// that `lender` already holds, borrowed rather than fetched again.
+    /// Regions for one L1 page batch: no buffers of their own, borrowing each
+    /// of `lender`'s buffers that wholly contains at least one range of
+    /// `needed`, whole and at most once, so the borrowed list is bounded by
+    /// the lender's buffer count rather than by `needed`'s length. A range
+    /// that straddles two lender buffers is not covered by either and stays
+    /// for the batch to fetch.
     fn borrowing(lender: &FetchedRegions, needed: &[(u64, u64)]) -> Self {
         let mut regions = FetchedRegions::default();
-        for &(start, end) in needed {
-            if let Some(bytes) = lender.slice(start, end.saturating_sub(start)) {
-                regions.borrowed.push((start, bytes));
+        for (buf_start, bytes) in lender.all_buffers() {
+            let buf_end = buf_start.saturating_add(bytes.len() as u64);
+            if needed
+                .iter()
+                .any(|&(start, end)| *buf_start <= start && end.max(start) <= buf_end)
+            {
+                regions.borrowed.push((*buf_start, bytes.clone()));
             }
         }
         regions
@@ -1175,7 +1183,7 @@ impl FetchedRegions {
         self.buffers.iter().chain(self.borrowed.iter())
     }
 
-    /// Bytes of the buffers these regions fetched themselves, borrowed slices
+    /// Bytes of the buffers these regions fetched themselves, borrowed buffers
     /// excluded: the bytes their reservations must cover.
     #[cfg(test)]
     fn owned_bytes(&self) -> u64 {
@@ -2952,17 +2960,24 @@ impl SegmentFetcher {
             SegmentLevel::L0 => (u64::MAX, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT),
             SegmentLevel::L1 { .. } => (self.fetch_batch_bytes(), usize::MAX),
         };
-        for batch in page_batches(
+        let batches = page_batches(
             &wanted,
             &scalar_planned,
             &histogram_planned,
             batch_bytes,
             self.coalesce_gap,
-        ) {
-            let scalar_entries = scalar.get(batch.scalar).unwrap_or(&[]);
-            let scalar_plans = scalar_planned.get(batch.scalar_plans).unwrap_or(&[]);
-            let histogram_entries = histogram.get(batch.histogram).unwrap_or(&[]);
-            let histogram_plans = histogram_planned.get(batch.histogram_plans).unwrap_or(&[]);
+        )
+        .map_err(|source| corrupt(key, source))?;
+        let out_of_bounds = || corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds);
+        for batch in batches {
+            let scalar_entries = scalar.get(batch.scalar).ok_or_else(out_of_bounds)?;
+            let scalar_plans = scalar_planned
+                .get(batch.scalar_plans)
+                .ok_or_else(out_of_bounds)?;
+            let histogram_entries = histogram.get(batch.histogram).ok_or_else(out_of_bounds)?;
+            let histogram_plans = histogram_planned
+                .get(batch.histogram_plans)
+                .ok_or_else(out_of_bounds)?;
             let ranges = page_ranges(scalar_plans, histogram_plans);
             let page_kind = match (scalar_entries.is_empty(), histogram_entries.is_empty()) {
                 (false, true) => "scalar",
@@ -4077,13 +4092,18 @@ fn coalesced_batch_bytes(sections: &[SectionSpan; 3], gap: u64) -> u64 {
 /// minus those the segment's open and catalog regions already hold, which is
 /// what bounds it by the bytes counted here. Counting ranges those regions
 /// already hold over-counts, the safe direction.
+///
+/// A series whose runs reach past the end of its kind's planned list is a
+/// catalog and plan inconsistency, refused with
+/// [`SegmentError::SectionOutOfBounds`](ravel_segment::SegmentError::SectionOutOfBounds)
+/// rather than batched over the plans that exist.
 fn page_batches(
     wanted: &[&SeriesEntryV4],
     scalar_planned: &[ravel_segment::PlannedRunRange],
     histogram_planned: &[ravel_segment::PlannedRunRange],
     batch_bytes: u64,
     coalesce_gap: u64,
-) -> Vec<PageBatch> {
+) -> Result<Vec<PageBatch>, ravel_segment::SegmentError> {
     const TS: usize = 0;
     const VAL: usize = 1;
     const HIST: usize = 2;
@@ -4105,8 +4125,12 @@ fn page_batches(
         } else {
             (scalar_planned, scalar_plans)
         };
-        let end = start.saturating_add(entry.runs.len()).min(plans.len());
-        let series_plans = plans.get(start..end).unwrap_or(&[]);
+        let end = start
+            .checked_add(entry.runs.len())
+            .ok_or(ravel_segment::SegmentError::SectionOutOfBounds)?;
+        let series_plans = plans
+            .get(start..end)
+            .ok_or(ravel_segment::SegmentError::SectionOutOfBounds)?;
         let with_series = |mut sections: [SectionSpan; 3]| {
             for p in series_plans {
                 sections[TS].add(range(p.ts_range), coalesce_gap);
@@ -4147,7 +4171,7 @@ fn page_batches(
     if !(current.scalar.is_empty() && current.histogram.is_empty()) {
         batches.push(current);
     }
-    batches
+    Ok(batches)
 }
 
 /// The page byte ranges of one batch's plans: TS and VAL for each scalar
@@ -8172,6 +8196,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A lender buffer of `len` bytes at `start`, each byte a function of its
+    /// absolute offset so a slice taken at the wrong offset reads different
+    /// bytes.
+    fn lender_buffer(start: u64, len: u64) -> (u64, Bytes) {
+        let bytes: Vec<u8> = (start..start + len).map(|o| (o % 251) as u8).collect();
+        (start, Bytes::from(bytes))
+    }
+
+    /// A batch borrows each lender buffer that holds any of its ranges whole
+    /// and once, however many ranges fall inside it, and reads the same bytes
+    /// through it as through the lender.
+    #[test]
+    fn borrowing_takes_each_lender_buffer_once() {
+        let mut lender = FetchedRegions::default();
+        let (start, bytes) = lender_buffer(1_000, 32_000);
+        lender.insert(start, bytes);
+        let needed: Vec<(u64, u64)> = (0..1_500u64)
+            .map(|i| (1_000 + i * 20, 1_000 + i * 20 + 13))
+            .collect();
+        let batch = FetchedRegions::borrowing(&lender, &needed);
+        assert_eq!(batch.borrowed.len(), 1, "one lender buffer, one entry");
+        assert_eq!(batch.owned_bytes(), 0);
+        assert_eq!(batch.reserved_bytes(), 0);
+        for &(start, end) in &needed {
+            assert!(batch.covers(start, end));
+            assert_eq!(
+                batch.slice(start, end - start),
+                lender.slice(start, end - start),
+                "range {start}..{end}"
+            );
+        }
+
+        // Ranges spread over two of three lender buffers, plus one that
+        // straddles the first two: the two touched buffers are borrowed, the
+        // untouched one is not, and the straddling range stays uncovered.
+        let mut lender = FetchedRegions::default();
+        for (start, len) in [(0, 1_000), (1_000, 1_000), (10_000, 1_000)] {
+            let (start, bytes) = lender_buffer(start, len);
+            lender.insert(start, bytes);
+        }
+        let mut needed: Vec<(u64, u64)> = (0..40u64)
+            .map(|i| (i * 20, i * 20 + 7))
+            .chain((0..40u64).map(|i| (1_000 + i * 20, 1_000 + i * 20 + 7)))
+            .collect();
+        let straddling = (990, 1_010);
+        needed.push(straddling);
+        let batch = FetchedRegions::borrowing(&lender, &needed);
+        let starts: Vec<u64> = batch.borrowed.iter().map(|(s, _)| *s).collect();
+        assert_eq!(starts, vec![0, 1_000], "the two touched buffers, once each");
+        assert!(!batch.covers(straddling.0, straddling.1));
+        for &(start, end) in needed.iter().filter(|r| **r != straddling) {
+            assert_eq!(
+                batch.slice(start, end - start),
+                lender.slice(start, end - start),
+                "range {start}..{end}"
+            );
+        }
+    }
+
+    /// A hand-built scalar series with `runs` runs and no pages.
+    fn scalar_entry_with_runs(i: usize, runs: usize) -> SeriesEntryV4 {
+        let run = RunEntry {
+            created_unix_ns: 0,
+            writer_epoch: 0,
+            writer_seq: 0,
+            sample_count: 1,
+            min_ts_ns: 0,
+            max_ts_ns: 0,
+            ts_page: (0, 0),
+            val_page: (0, 0),
+            hist_page: (0, 0),
+        };
+        SeriesEntryV4 {
+            entry: SeriesEntry {
+                series_id: synthetic_series_id(i),
+                labels: labels("m"),
+                sample_count: runs as u32,
+                min_ts_ns: 0,
+                max_ts_ns: 0,
+                ts_page: (0, 0),
+                val_page: (0, 0),
+                value_kind: ValueKind::Scalar,
+                hist_page: (0, 0),
+            },
+            runs: vec![run; runs],
+            per_sample_provenance: Vec::new(),
+        }
+    }
+
+    /// Catalog entries whose runs outnumber the planned ranges are refused
+    /// as corrupt, not batched over the plans that exist.
+    #[test]
+    fn page_batches_refuses_runs_past_the_plan() {
+        let entries = [scalar_entry_with_runs(0, 3), scalar_entry_with_runs(1, 2)];
+        let wanted: Vec<&SeriesEntryV4> = entries.iter().collect();
+        let plans: Vec<ravel_segment::PlannedRunRange> = entries
+            .iter()
+            .flat_map(|e| {
+                (0..e.runs.len()).map(|run_index| ravel_segment::PlannedRunRange {
+                    series_id: e.entry.series_id,
+                    run_index,
+                    ts_range: (0, 8),
+                    val_range: (0, 8),
+                    hist_range: (0, 0),
+                })
+            })
+            .collect();
+        assert_eq!(plans.len(), 5);
+
+        let whole = page_batches(&wanted, &plans, &[], u64::MAX, 0).expect("consistent plan");
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].scalar_plans, 0..5);
+
+        let short = page_batches(&wanted, &plans[..4], &[], u64::MAX, 0);
+        assert!(
+            matches!(short, Err(ravel_segment::SegmentError::SectionOutOfBounds)),
+            "a plan list one short of the runs is corrupt"
+        );
     }
 
     /// In general batching costs at most (page sections) x batches - 1 extra
