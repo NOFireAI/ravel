@@ -13,18 +13,19 @@
 //!    6). The adoption summary judges the header-corrected one.
 //! 2. **encode_i64**: `ravel_codec::encoding::encode_i64` applied to the raw
 //!    timestamps (the integer path RSEG v7 uses for its provenance columns).
-//! 3. **encode_i64/gcd (enc 2 surrogate)**: the same, after dividing every
-//!    timestamp by the page's greatest common divisor -- the `encode_i64`
-//!    core of production enc 2 `TS_GCD_I64` (docs/segment-format.md), minus
-//!    its `uvarint gcd` + tag byte, which the baseline above also omits. The
-//!    divisor found is reported.
+//! 3. **encode_i64/gcd (enc 2 payload)**: production enc 2 `TS_GCD_I64`'s
+//!    payload grammar (docs/segment-format.md) -- `uvarint gcd`, one `Enc`
+//!    tag byte, then `encode_i64` of every timestamp divided by the page's
+//!    greatest common divisor. Where production picks enc 2 this row equals
+//!    production's payload; it is a reference, not a challenger. The divisor
+//!    found is reported.
 //! 4. **dod_for (challenger a)**: delta-of-delta with a jitter-tolerant
 //!    residual -- first delta zigzag-varint, each later delta coded as its
 //!    difference from the previous delta, those residuals frame-of-reference
 //!    bit-packed per fixed-size block (so one jittery block costs its own
 //!    bit width, not the whole page's).
-//! 5. **gcd_forced_dod (challenger b)**: the page divided by its GCD, then
-//!    forced onto the exact `enc_double_delta_i64` arm of `encode_i64`
+//! 5. **gcd_forced_dod (challenger b)**: `uvarint gcd`, then the page divided
+//!    by that GCD forced onto the exact `enc_double_delta_i64` arm of `encode_i64`
 //!    (absolute first value, first delta, then each later delta's
 //!    difference from the previous delta, every field a zigzag varint,
 //!    `checked_sub` overflow-checked) -- measured on its own, never as part
@@ -379,14 +380,55 @@ fn multiply_back(divided: Vec<i64>, g: i64) -> Option<Vec<i64>> {
     divided.into_iter().map(|v| v.checked_mul(g)).collect()
 }
 
-/// `encode_i64/gcd`'s decode: `decode_i64` then the divisor multiplied back.
-fn decode_i64_gcd(enc: Enc, bytes: &[u8], n: usize, g: i64) -> Option<Vec<i64>> {
-    multiply_back(decode_i64(enc, bytes, n).ok()?, g)
+/// Reads the `uvarint gcd` both GCD codecs lead their payload with; `None`
+/// for a zero divisor or one that does not fit an i64.
+fn get_divisor(bytes: &[u8], pos: &mut usize) -> Option<i64> {
+    i64::try_from(get_uvarint(bytes, pos)?)
+        .ok()
+        .filter(|&g| g > 0)
 }
 
-/// `gcd_forced_dod`'s decode: the forced double-delta arm, then the divisor.
-fn gcd_forced_dod_decode(bytes: &[u8], n: usize, g: i64) -> Option<Vec<i64>> {
-    multiply_back(double_delta_decode(bytes, n)?, g)
+/// `encode_i64/gcd`: production enc 2 `TS_GCD_I64`'s payload grammar --
+/// `uvarint gcd`, one `Enc` tag byte, then the `encode_i64` bytes of the
+/// page divided by its GCD.
+fn encode_i64_gcd(ts: &[i64]) -> Vec<u8> {
+    let g = page_gcd(ts);
+    let divided: Vec<i64> = ts.iter().map(|&v| v / g).collect();
+    let (enc, bytes) = encode_i64(&divided);
+    let mut out = Vec::with_capacity(bytes.len() + 11);
+    put_uvarint(&mut out, g.unsigned_abs());
+    out.push(enc.to_u8());
+    out.extend_from_slice(&bytes);
+    out
+}
+
+/// `encode_i64/gcd`'s decode: divisor and tag from the payload,
+/// `decode_i64`, then the divisor multiplied back.
+fn decode_i64_gcd(bytes: &[u8], n: usize) -> Option<Vec<i64>> {
+    let mut pos = 0usize;
+    let g = get_divisor(bytes, &mut pos)?;
+    let enc = Enc::from_u8(*bytes.get(pos)?).ok()?;
+    multiply_back(decode_i64(enc, bytes.get(pos + 1..)?, n).ok()?, g)
+}
+
+/// `gcd_forced_dod`: `uvarint gcd`, then the forced double-delta arm over
+/// the page divided by its GCD. `None` on i64 overflow.
+fn gcd_forced_dod_encode(ts: &[i64]) -> Option<Vec<u8>> {
+    let g = page_gcd(ts);
+    let divided: Vec<i64> = ts.iter().map(|&v| v / g).collect();
+    let body = double_delta_encode(&divided)?;
+    let mut out = Vec::with_capacity(body.len() + 10);
+    put_uvarint(&mut out, g.unsigned_abs());
+    out.extend_from_slice(&body);
+    Some(out)
+}
+
+/// `gcd_forced_dod`'s decode: divisor from the payload, the forced
+/// double-delta arm, then the divisor multiplied back.
+fn gcd_forced_dod_decode(bytes: &[u8], n: usize) -> Option<Vec<i64>> {
+    let mut pos = 0usize;
+    let g = get_divisor(bytes, &mut pos)?;
+    multiply_back(double_delta_decode(bytes.get(pos..)?, n)?, g)
 }
 
 /// Decode timing knobs. Tests shrink them so the report guard stays cheap.
@@ -472,10 +514,9 @@ fn measure_page(label: &str, ts: &[i64], timing: Timing) -> Vec<Cell> {
     });
 
     let g = page_gcd(ts);
-    let divided: Vec<i64> = ts.iter().map(|&v| v / g).collect();
-    let (genc, gbytes) = encode_i64(&divided);
+    let gbytes = encode_i64_gcd(ts);
     assert_eq!(
-        decode_i64_gcd(genc, &gbytes, n, g).as_deref(),
+        decode_i64_gcd(&gbytes, n).as_deref(),
         Some(ts),
         "encode_i64/gcd round trip failed for {label} n={n}"
     );
@@ -483,7 +524,7 @@ fn measure_page(label: &str, ts: &[i64], timing: Timing) -> Vec<Cell> {
         codec: "enc_i64/gcd",
         bytes: gbytes.len(),
         dec_mtps: decode_mtps(timing, n, || {
-            black_box(decode_i64_gcd(genc, black_box(&gbytes), n, g));
+            black_box(decode_i64_gcd(black_box(&gbytes), n));
         }),
         note: format!("gcd={g}"),
     });
@@ -503,9 +544,9 @@ fn measure_page(label: &str, ts: &[i64], timing: Timing) -> Vec<Cell> {
         note: String::new(),
     });
 
-    let gdod = double_delta_encode(&divided).expect("gcd_forced_dod encodes every bake-off stream");
+    let gdod = gcd_forced_dod_encode(ts).expect("gcd_forced_dod encodes every bake-off stream");
     assert_eq!(
-        gcd_forced_dod_decode(&gdod, n, g).as_deref(),
+        gcd_forced_dod_decode(&gdod, n).as_deref(),
         Some(ts),
         "gcd_forced_dod round trip failed for {label} n={n}"
     );
@@ -513,7 +554,7 @@ fn measure_page(label: &str, ts: &[i64], timing: Timing) -> Vec<Cell> {
         codec: GCD_FORCED_DOD,
         bytes: gdod.len(),
         dec_mtps: decode_mtps(timing, n, || {
-            black_box(gcd_forced_dod_decode(black_box(&gdod), n, g));
+            black_box(gcd_forced_dod_decode(black_box(&gdod), n));
         }),
         note: format!("gcd={g}"),
     });
@@ -654,9 +695,10 @@ fn render_report(cfg: &RunConfig) -> String {
          through the public API, so its figure understates TS-only decode speed.\n\
          note: production's selected TS enc (1 TS_DELTA_VARINT, 2 TS_GCD_I64);\n\
          gcd = divisor the GCD codecs divided the page by.\n\
+         enc_i64/gcd = enc 2's payload: uvarint gcd, Enc tag byte, encode_i64(page / gcd).\n\
          dod_for = challenger (a): delta-of-delta, FOR-bit-packed per 128-sample block.\n\
-         gcd_forced_dod = challenger (b): page / gcd, forced onto encode_i64's\n\
-         double-delta arm alone (never its best-of search).\n\
+         gcd_forced_dod = challenger (b): uvarint gcd, then page / gcd forced onto\n\
+         encode_i64's double-delta arm alone (never its best-of search).\n\
          Rule, per row: a challenger is adopted only if bit-exact, ratio_hdr <= 0.75,\n\
          and dec Mts/s >= production's.\n",
     );
@@ -769,44 +811,80 @@ mod tests {
     }
 
     const TEST_LENS: [usize; 2] = [1, 2];
-    const TEST_METRICS: [(&str, u64); 1] = [("history", 4)];
+    const TEST_METRICS: [(&str, u64); 2] = [("cardinality", 2), ("history", 4)];
 
-    /// The full report `main` prints, on reduced page lengths, one cheap
-    /// MetricsBench profile, and one timing round, plus the cells it must
-    /// hold, derived from the inputs rather than from the renderer.
+    /// The full report `main` prints, on reduced page lengths, both
+    /// MetricsBench profiles at few steps, and one timing round, plus the
+    /// cells it must hold, derived from the inputs rather than from the
+    /// renderer. Rendered once and shared, since the cardinality profile
+    /// generates every active series per step.
     fn reduced_report() -> (String, Vec<(String, usize)>) {
-        let out = render_report(&RunConfig {
-            lens: &TEST_LENS,
-            metrics: &TEST_METRICS,
-            timing: Timing {
-                rounds: 1,
-                samples_per_round: 1,
-            },
-        });
-        let mut pages: Vec<(String, usize)> = MULTI_STREAMS
-            .iter()
-            .flat_map(|k| TEST_LENS.iter().map(move |&n| (k.to_string(), n)))
-            .collect();
-        let ts = metrics_stream("history", 4).expect("history stream").ts;
-        pages.extend(
-            TEST_LENS
-                .iter()
-                .filter(|&&n| n <= ts.len())
-                .map(|&n| ("metricsbench_history".to_string(), n)),
-        );
-        (out, pages)
+        static REPORT: std::sync::OnceLock<(String, Vec<(String, usize)>)> =
+            std::sync::OnceLock::new();
+        REPORT
+            .get_or_init(|| {
+                let out = render_report(&RunConfig {
+                    lens: &TEST_LENS,
+                    metrics: &TEST_METRICS,
+                    timing: Timing {
+                        rounds: 1,
+                        samples_per_round: 1,
+                    },
+                });
+                let mut pages: Vec<(String, usize)> = MULTI_STREAMS
+                    .iter()
+                    .flat_map(|k| TEST_LENS.iter().map(move |&n| (k.to_string(), n)))
+                    .collect();
+                for &(profile_name, steps) in &TEST_METRICS {
+                    let ts = metrics_stream(profile_name, steps)
+                        .expect("MetricsBench stream")
+                        .ts;
+                    pages.extend(
+                        TEST_LENS
+                            .iter()
+                            .filter(|&&n| n <= ts.len())
+                            .map(|&n| (format!("metricsbench_{profile_name}"), n)),
+                    );
+                }
+                (out, pages)
+            })
+            .clone()
     }
 
     #[test]
     fn report_has_every_cell_exactly_once() {
         let (out, pages) = reduced_report();
-        assert!(
-            pages.iter().any(|(c, _)| c == "metricsbench_history"),
-            "the guard must cover a MetricsBench section"
-        );
+        for (profile_name, _) in TEST_METRICS {
+            let corpus = format!("metricsbench_{profile_name}");
+            assert!(
+                TEST_LENS
+                    .iter()
+                    .all(|&n| pages.iter().any(|(c, m)| *c == corpus && *m == n)),
+                "the guard must cover every {corpus} page"
+            );
+        }
         if let Err(e) = check_cells(&out, &pages) {
             panic!("{e}\n{out}");
         }
+    }
+
+    #[test]
+    fn guard_rejects_a_dropped_cardinality_cell() {
+        let (out, pages) = reduced_report();
+        let line = out
+            .lines()
+            .find(|l| {
+                l.split_whitespace()
+                    .take(3)
+                    .eq(["metricsbench_cardinality", "2", "enc_i64/gcd"])
+            })
+            .expect("cell row present");
+        let dropped = out.replacen(&format!("{line}\n"), "", 1);
+        let err = check_cells(&dropped, &pages).expect_err("a dropped cell must fail");
+        assert!(
+            err.contains("(metricsbench_cardinality, enc_i64/gcd, n=2) appears 0 times"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -888,11 +966,44 @@ mod tests {
         fn gcd_forced_dod_round_trips_any_i64_sequence(values in sequences()) {
             let g = page_gcd(&values);
             let divided: Vec<i64> = values.iter().map(|&v| v / g).collect();
-            let encoded = double_delta_encode(&divided);
+            let encoded = gcd_forced_dod_encode(&values);
             prop_assert_eq!(encoded.is_some(), dod_fits(&divided));
             if let Some(bytes) = encoded {
-                prop_assert_eq!(gcd_forced_dod_decode(&bytes, values.len(), g), Some(values));
+                let mut pos = 0usize;
+                prop_assert_eq!(get_divisor(&bytes, &mut pos), Some(g));
+                prop_assert_eq!(gcd_forced_dod_decode(&bytes, values.len()), Some(values));
             }
         }
+
+        #[test]
+        fn encode_i64_gcd_round_trips_any_i64_sequence(values in sequences()) {
+            let bytes = encode_i64_gcd(&values);
+            let mut pos = 0usize;
+            prop_assert_eq!(get_divisor(&bytes, &mut pos), Some(page_gcd(&values)));
+            prop_assert_eq!(decode_i64_gcd(&bytes, values.len()), Some(values));
+        }
+    }
+
+    /// The GCD challengers carry their divisor (and, for `enc_i64/gcd`, its
+    /// tag byte) in the payload, exactly as production enc 2 does: on a page
+    /// where production picks enc 2, `enc_i64/gcd` is production's payload
+    /// byte for byte.
+    #[test]
+    fn gcd_codecs_charge_their_divisor() {
+        let ts = stream("irregular", 12);
+        let run = production_ts_run(&ts);
+        assert_eq!(run.ts_page.first(), Some(&2), "production picks enc 2 here");
+        let gbytes = encode_i64_gcd(&ts);
+        assert_eq!(gbytes.len(), run.ts_page.len() - PAGE_HEADER_BYTES);
+        let g = page_gcd(&ts);
+        let mut divisor = Vec::new();
+        put_uvarint(&mut divisor, g.unsigned_abs());
+        let gdod = gcd_forced_dod_encode(&ts).expect("encodes");
+        assert!(gdod.starts_with(&divisor));
+        let divided: Vec<i64> = ts.iter().map(|&v| v / g).collect();
+        assert_eq!(
+            gdod.len(),
+            divisor.len() + double_delta_encode(&divided).expect("encodes").len()
+        );
     }
 }
