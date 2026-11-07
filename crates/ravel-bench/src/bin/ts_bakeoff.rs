@@ -444,6 +444,31 @@ fn print_row(out: &mut String, label: &str, ts: &[i64]) {
     ));
 }
 
+fn header_row() -> String {
+    format!(
+        "  {:>6} {:>14} {:>14} {:>16} {:>12} {:>16} {:>8}\n",
+        "n", "prod B/s", "enc_i64 B/s", "enc_i64/gcd B/s", "dod_for B/s", "gcd_dod B/s", "gcd"
+    )
+}
+
+/// Renders one synthetic stream corpus's section (header plus one row per
+/// `lens` page length) and returns the exact (corpus, page size) cells it
+/// emitted. Split out of `main` so a reduced `lens` list can drive the
+/// Deliverable-3 "report fields appear exactly once per (corpus, codec, page
+/// size) cell" guard from a test, the same way `codec_bakeoff`'s
+/// `page_report` backs `report_has_no_duplicate_cells` there.
+fn multi_stream_section(out: &mut String, label: &str, lens: &[usize]) -> Vec<(String, usize)> {
+    out.push_str(&format!("\n===== {label} =====\n"));
+    out.push_str(&header_row());
+    let mut cells = Vec::with_capacity(lens.len());
+    for &n in lens {
+        let ts = stream(label, n);
+        print_row(out, label, &ts);
+        cells.push((label.to_string(), n));
+    }
+    cells
+}
+
 fn main() {
     let mut out = String::new();
     out.push_str(&env_header(
@@ -463,18 +488,10 @@ fn main() {
          decode at least as fast.\n",
     );
 
-    let header_row = format!(
-        "  {:>6} {:>14} {:>14} {:>16} {:>12} {:>16} {:>8}\n",
-        "n", "prod B/s", "enc_i64 B/s", "enc_i64/gcd B/s", "dod_for B/s", "gcd_dod B/s", "gcd"
-    );
+    let header_row = header_row();
 
     for stream_kind in MULTI_STREAMS {
-        out.push_str(&format!("\n===== {stream_kind} =====\n"));
-        out.push_str(&header_row);
-        for &n in &PAGE_LENS {
-            let ts = stream(stream_kind, n);
-            print_row(&mut out, stream_kind, &ts);
-        }
+        multi_stream_section(&mut out, stream_kind, &PAGE_LENS);
     }
 
     // MetricsBench-generator-derived timestamps (ADR-3694 decision 7): the
@@ -524,4 +541,49 @@ fn main() {
     ));
 
     print!("{out}");
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Deliverable-3 guard, mirrored from `codec_bakeoff`'s
+    /// `report_has_no_duplicate_cells`: every report field appears exactly
+    /// once per (corpus, codec, page size) cell. Run on a reduced page-length
+    /// set (not the real `PAGE_LENS`) so this stays cheap.
+    #[test]
+    fn report_has_no_duplicate_cells() {
+        let reduced_lens = [1usize, 4];
+        let mut out = String::new();
+        let mut cells: Vec<(String, usize)> = Vec::new();
+        for stream_kind in MULTI_STREAMS {
+            cells.extend(multi_stream_section(&mut out, stream_kind, &reduced_lens));
+        }
+
+        assert_eq!(
+            cells.len(),
+            MULTI_STREAMS.len() * reduced_lens.len(),
+            "expected exactly one row per (corpus, page size) pair"
+        );
+        let mut dedup_cells = cells.clone();
+        dedup_cells.sort();
+        dedup_cells.dedup();
+        assert_eq!(
+            dedup_cells.len(),
+            cells.len(),
+            "a (corpus, page size) cell was measured more than once"
+        );
+
+        // Each stream's section header appears exactly once in the rendered
+        // text: a stray second call would duplicate the whole section.
+        for stream_kind in MULTI_STREAMS {
+            let header = format!("\n===== {stream_kind} =====\n");
+            let occurrences = out.matches(&header).count();
+            assert_eq!(
+                occurrences, 1,
+                "section header for {stream_kind} appears {occurrences} times, expected 1"
+            );
+        }
+    }
 }
