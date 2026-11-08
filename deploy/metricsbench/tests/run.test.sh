@@ -243,28 +243,52 @@
 #                                       RAVEL_SERVER_EXTRA_FLAGS (rendered by
 #                                       compose where the host has it), and a:
 #                                       compose up gets it empty, no Stage 1
-#                                       step; z: cardinality runs stage1-fold,
+#                                       step, no comparable=false; z:
+#                                       cardinality runs stage1-fold,
 #                                       -unrouted, -leaves, -restart, -routed
 #                                       and -holders after readback-folded in
 #                                       that order, the folds pass exactly
-#                                       their listed flags, up and the
-#                                       recreate get the unrouted and routed
-#                                       flags, every record its pass label and
-#                                       fold state, the compare and holders
-#                                       stamps; a and j: the query step's
-#                                       labels; z1: ci (cold not applicable);
-#                                       z2: a differing hash is recorded, exit
-#                                       0; z3: history refused 65; z4: a bad
+#                                       their listed flags, three recreates
+#                                       with --disable-fold (two unrouted, one
+#                                       routed) each followed by readiness, a
+#                                       catalog inspect stamped before each
+#                                       pass, every record its pass label and
+#                                       the inspected fold state, the leaves
+#                                       requests by name, the compare counts
+#                                       per pass, the holders listing,
+#                                       download and window check, and
+#                                       comparable=false on every provenance;
+#                                       a and j: the query step's labels; z1:
+#                                       ci (cold not applicable); z2: a
+#                                       differing hash is recorded, exit 0;
+#                                       z3: history refused 65; z4: a bad
 #                                       value and z5: the diagnostic mode are
 #                                       usage errors; z6: 0 is off; z7: a
-#                                       failed rebuild, z8: no readiness after
-#                                       the recreate and z10: a failed download
-#                                       exit 70 naming the step; z9: a failed
-#                                       ingest skips them; z11: real S3 reads
-#                                       PREFIX-ravel. stage1-check.sh: the ci
-#                                       band file clean on z1, out of band on
-#                                       z2, missing, duplicated, a profile
-#                                       mismatch (65) and usage (64)
+#                                       failed rebuild, z8a, z8b, z8: no
+#                                       readiness after each recreate, z10: a
+#                                       failed download, z12: a leaf part
+#                                       before the unrouted pass, z13: fewer
+#                                       leaf parts than rebuilt before the
+#                                       routed pass and z14: an inspect that
+#                                       does not add up exit 70 naming the
+#                                       step; z9: a failed ingest skips them;
+#                                       z11: real S3 reads PREFIX-ravel; z15:
+#                                       a failed routed record, z16: an
+#                                       unrouted record pruned by the label
+#                                       index, z17: a window mismatch and
+#                                       z18: an unchecked window are counted,
+#                                       exit 0; z19: a failed scrape before
+#                                       the query step labels its records
+#                                       unknown. stage1-check.sh: the ci band
+#                                       file clean on z1, out of band on z2,
+#                                       z15, z16 and z17, missing,
+#                                       duplicated, not finite (a NaN figure
+#                                       out of band, a NaN bound 65), a
+#                                       profile mismatch (65) and usage (64).
+#                                       box-run.sh, sourced: the band file
+#                                       per profile (refused for cardinality
+#                                       without MB_STAGE1_BANDS) and
+#                                       stage1_check's status and kept output
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -2608,6 +2632,14 @@ if grep -qE '^out of band holders_window_mismatches = [0-9]+ not in \[0, 0\] ' "
 
 # --- box-run.sh's band selection and check ----------------------------------------
 BOXRUN="${HERE}/../aws/box-run.sh"
+# Sourcing box-run.sh without its return guard would run the box itself
+# (apt-get, the build, shutdown), so the cases below need the guard first.
+if grep -qxF '[ "${BASH_SOURCE[0]}" = "$0" ] || return 0' "${BOXRUN}"; then
+  pass "box-run: sourcing it defines its functions and returns before the box steps"
+else
+  fail "box-run: no source guard; its band cases are not run"
+  BOXRUN=/dev/null
+fi
 # box_bands NAME PROFILE [VAR=VALUE ...]: stage1_bands PROFILE in a subshell with
 # the box-run functions sourced; rc, BOX_OUT and BOX_ERR.
 box_bands() {

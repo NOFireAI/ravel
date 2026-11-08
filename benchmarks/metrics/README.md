@@ -635,32 +635,51 @@ With `--ravel-metrics-url URL` (ravel-server's `/metrics`), the Ravel row's
 read-back, in a replay or `--readback-only`, also records
 `readback.query_cost`, keyed as `query_ms` (`series`, `samples.N`): `stats`,
 the `data.stats` of each answer in query order (`null` for an answer with
-none; empty for the series read, whose answer has no stats), and
-`store_get_delta` (`ravel_store_calls_total{op="get"}`), `fetch_miss_delta`
-(`ravel_cache_misses_total{cache="fetch"}`) and `catalog_get_delta` (the
-first less the second) across the query, each summed over every series of
-its family, or `scrape_error` when a scrape failed or lacked a family, which
-is an error rather than zero. Without the flag the key is left out
+none; empty for the series read, whose answer has no stats); `phases`, per
+phase (`resolve`, `plan`, `probe`, `scan`, `keyIndex`) the sum over those
+answers of the phase's `s3_get_requests`, `s3_get_wire_bytes` and
+`s3_list_requests`, `null` for the series read and whenever an answer lacks
+a phase list or a figure, never a partial sum; and the receiver's
+process-wide counters across the query, which count every request the
+process served in that interval, not only this one:
+`process_store_get_delta` (`ravel_store_calls_total{op="get"}`),
+`process_fetch_miss_delta` (`ravel_cache_misses_total{cache="fetch"}`) and
+`process_catalog_get_delta` (the first less the second), each summed over
+every series of its family. Those three are `null`, with `process_error`
+saying why, when a scrape failed or lacked a family or a counter went down
+across the query (a restart reset it), which is an error rather than zero.
+Without the flag the key is left out
 (`metrics_ingest::tests::readback_records_query_cost_when_given_a_metrics_url`,
-`metrics_ingest::tests::get_counters_refuse_a_missing_family`).
+`metrics_ingest::tests::get_counters_refuse_a_missing_family`,
+`metrics_ingest::tests::a_counter_reset_nulls_the_process_figures`,
+`metrics_ingest::tests::phase_totals_sum_answers_and_refuse_a_partial_sum`).
 
 #### Holder counts (`metricsbench_holders`)
 
-`metricsbench_holders --corpus PATH --profile NAME --objects-dir DIR --out
-PATH` counts, for each corpus entry of the profile with a `label="value"`
-matcher (non-empty value), the data objects under `DIR` (searched
-recursively for `*.rseg`) holding at least one series that matches a
-qualifying selector in full, metric name and every matcher. It decodes each
-object's series catalog with ravel-segment's public reader, with no router
-or key index, and does not apply the query window; the file's `method`
-states this (`metrics_holders::HOLDERS_METHOD`). `holders.json` holds
-`method`, `profile`, `objects_total`, `series_total`, `statements` (`id`,
-`promql`, `selectors`, `positive_equalities` and `holders` per qualifying
-entry) and `skipped` (`id` and `reason` for each entry with no qualifying
-selector, or whose selectors the corpus reader refuses). It exits 65 when the
-directory holds no `*.rseg`, 66 when the corpus or an object cannot be read
-or decoded (no file is written), and 74 when the file cannot be written
-(`metrics_holders::tests::holders_count_objects_with_a_fully_matching_series`,
+`metricsbench_holders --corpus PATH --ingest-report PATH --workload PATH
+--objects-list PATH --objects-dir DIR --out PATH` reads the data objects
+the list names (one `ravel-cli catalog list --json` line each, the L0 and
+L1 objects the folded snapshot resolves) from `DIR/<key>`. For each corpus
+statement under the ingest report's profile with a `label="value"` matcher
+(non-empty value), it computes the statement's fetch window on the run's
+query grid as Ravel's engine resolves it, counts the listed objects whose
+event time range overlaps that window (`segments_in_window`), and counts
+among them the ones holding at least one series that matches a qualifying
+selector in full, metric name and every matcher (`holders`). It decodes
+each object's series catalog with ravel-segment's public reader, with no
+router or key index; the file's `method` states the window and counting
+rules (`metrics_holders::HOLDERS_METHOD`). `holders.json` holds `method`,
+`profile`, `objects_l0`, `objects_l1`, `series_total`, `statements` (`id`,
+`promql`, `eval`, `selectors`, `positive_equalities`, `fetch_window`,
+`segments_in_window` and `holders` per qualifying entry) and `skipped` (`id`
+and `reason` for each entry with no qualifying selector, whose selectors the
+corpus reader refuses, or whose fetch window cannot be planned). It exits 65
+when the list names no object or the ingest report does not bind to the
+workload, 66 when an input cannot be read, a list line does not parse, or a
+listed object is missing or does not decode (no file is written), and 74
+when the file cannot be written
+(`metrics_holders::tests::the_fetch_window_follows_the_engine_resolve`,
+`metrics_holders::tests::holders_count_objects_in_the_window_with_a_fully_matching_series`,
 `metrics_holders::tests::an_unreadable_object_is_an_error`).
 `deploy/metricsbench/run.sh`'s `stage1-holders` step runs it.
 

@@ -153,8 +153,9 @@ struct Args {
     #[arg(long)]
     ravel_query_url: Option<String>,
     /// `ravel-server`'s Prometheus-text `/metrics` URL. When given, the Ravel
-    /// row's read-back records each series and samples query's `data.stats`
-    /// and the store GET deltas around it (`readback.query_cost`).
+    /// row's read-back records each series and samples query's `data.stats`,
+    /// their per-phase request and byte sums, and the process-wide store GET
+    /// deltas around it (`readback.query_cost`).
     #[arg(long)]
     ravel_metrics_url: Option<String>,
     /// Base URL of Prometheus's query API. Required with

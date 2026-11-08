@@ -8494,10 +8494,7 @@ mod tests {
             readback.query_cost,
             BTreeMap::from([
                 (READBACK_QUERY_SERIES.to_string(), exact(Vec::new(), None)),
-                (
-                    "samples.0".to_string(),
-                    exact(vec![answer], Some(phases))
-                ),
+                ("samples.0".to_string(), exact(vec![answer], Some(phases))),
             ]),
             "{readback:?}"
         );

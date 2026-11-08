@@ -179,9 +179,11 @@ measured check ends it with `DONE exit=23` when `run.sh` exited 0, and with
 `run.sh`'s code otherwise. A box that finds no band file for the measured
 profile ends with `DONE exit=21` before it builds anything.
 
-The box terminates itself 5 minutes after `DONE`, 30 minutes after a failed
-`ci` or a failed band check, or at the cap. Nothing on it depends on the machine that launched it,
-so an expired session or a closed laptop does not stop a run.
+The box terminates itself 30 minutes after `DONE` with 20, 22 or 23, 2
+minutes after a setup failure (`DONE` with 10 to 19, or 21), 5 minutes after
+any other `DONE`, or at the cap. Nothing on it depends on the
+machine that launched it, so an expired session or a closed laptop does not
+stop a run.
 
 The ingest step writes `ingest.json` only when it ends, after all four
 engines have ingested and been read back. That is about 3 h into a

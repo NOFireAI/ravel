@@ -141,7 +141,10 @@ pub fn fetch_window(
     };
     let plans = plan_selectors(promql, eval_start_ms, eval_end_ms).map_err(|e| e.to_string())?;
     let mut window: Option<FetchWindow> = None;
-    for plan in plans.iter().filter(|p| log_metric_of(&p.matchers).is_none()) {
+    for plan in plans
+        .iter()
+        .filter(|p| log_metric_of(&p.matchers).is_none())
+    {
         let (start, end) = match (&plan.anchor, eval) {
             (PlanAnchor::Pinned(ts), _) => (*ts, *ts),
             (PlanAnchor::Window, EvalKind::Instant) => {
@@ -437,7 +440,10 @@ mod tests {
         assert_eq!(window("rate(m[30m])", EvalKind::Instant), (70, 100));
         assert_eq!(window("m offset 10m", EvalKind::Instant), (85, 90));
         assert_eq!(window("rate(m[30m])", EvalKind::Range), (10, 96));
-        assert_eq!(window("m + rate(n[1h] offset 20m)", EvalKind::Instant), (20, 100));
+        assert_eq!(
+            window("m + rate(n[1h] offset 20m)", EvalKind::Instant),
+            (20, 100)
+        );
         assert_eq!(fetch_window("1 + 1", EvalKind::Instant, &grid()), Ok(None));
     }
 
@@ -494,8 +500,8 @@ mod tests {
             entry("name_only", "sum(http_requests)"),
             entry("empty_eq", r#"http_requests{job=""}"#),
         ];
-        let report = count_holders(&corpus, "ci", &grid(), objects.into_iter().map(Ok))
-            .expect("counts");
+        let report =
+            count_holders(&corpus, "ci", &grid(), objects.into_iter().map(Ok)).expect("counts");
         assert_eq!((report.objects_l0, report.objects_l1), (1, 3));
         assert_eq!(report.series_total, 5);
         let counts: Vec<(&str, u64, u64)> = report
@@ -529,7 +535,10 @@ mod tests {
             &corpus,
             "ci",
             &grid(),
-            [Ok((listed("broken", "L0", 90, 99), b"not an object".to_vec()))],
+            [Ok((
+                listed("broken", "L0", 90, 99),
+                b"not an object".to_vec(),
+            ))],
         )
         .expect_err("refused");
         assert_eq!(error.key, "broken");
