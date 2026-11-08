@@ -1945,8 +1945,7 @@ impl TenantDelegatingPool {
         {
             // The delta and the budget figures span every tenant on the
             // process budget, so they go to the operator log and never into
-            // the client-visible message.
-            // In spill mode a consumer that can spill answers this by
+            // the client-visible message. In spill mode a consumer that can spill answers this by
             // spilling, so it is a spill trigger and not a memory refusal.
             if self.spill_headroom.is_some() && consumer.can_spill() {
                 tracing::debug!(
