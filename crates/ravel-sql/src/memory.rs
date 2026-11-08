@@ -1943,6 +1943,9 @@ impl TenantDelegatingPool {
         if next.envelope != state.envelope
             && let Err(refused) = self.set_envelope(id, next.envelope, EnvelopeCheck::Checked)
         {
+            // The delta and the budget figures span every tenant on the
+            // process budget, so they go to the operator log and never into
+            // the client-visible message.
             // In spill mode a consumer that can spill answers this by
             // spilling, so it is a spill trigger and not a memory refusal.
             if self.spill_headroom.is_some() && consumer.can_spill() {
@@ -1950,16 +1953,28 @@ impl TenantDelegatingPool {
                     consumer = consumer.name(),
                     asked = additional,
                     delta = refused.delta,
+                    requested = refused.exhausted.requested,
+                    reserved = refused.exhausted.reserved,
+                    limit = refused.exhausted.limit,
+                    cause = refused.exhausted.cause.name(),
                     "SQL aggregate reserve-ahead refused in spill mode; the aggregate spills"
                 );
                 return Err(DataFusionError::ResourcesExhausted(format!(
-                    "query memory pool spill threshold reached: the process aggregate \
-                     envelope needs to grow by {} bytes: {}{}",
-                    refused.delta,
-                    refused.exhausted,
+                    "query memory pool spill threshold reached: the process has no room \
+                     for this aggregate's reserve-ahead envelope{}",
                     self.attribution(consumer, additional)
                 )));
             }
+            tracing::debug!(
+                consumer = consumer.name(),
+                asked = additional,
+                delta = refused.delta,
+                requested = refused.exhausted.requested,
+                reserved = refused.exhausted.reserved,
+                limit = refused.exhausted.limit,
+                cause = refused.exhausted.cause.name(),
+                "SQL aggregate reserve-ahead refused"
+            );
             let kind =
                 MemoryRefusal::of_cause(&refused.exhausted.cause, MemoryRefusal::ReserveAhead);
             let share = (kind == MemoryRefusal::ReserveAhead).then(|| {
@@ -1970,10 +1985,8 @@ impl TenantDelegatingPool {
                 )
             });
             return Err(DataFusionError::ResourcesExhausted(format!(
-                "aggregate reserve-ahead refused: the process aggregate envelope needs \
-                 to grow by {} bytes: {}{}",
-                refused.delta,
-                refused.exhausted,
+                "aggregate reserve-ahead refused: the process has no room for this \
+                 aggregate's reserve-ahead envelope{}",
                 self.refuse(kind, consumer, additional, share)
             )));
         }
@@ -3860,7 +3873,14 @@ pub(crate) mod tests {
             ),
             "{message}"
         );
-        assert!(message.contains("grow by 10192159 bytes"), "{message}");
+        assert!(
+            message.contains("aggregate reserve-ahead refused: "),
+            "{message}"
+        );
+        assert!(
+            !message.contains("10192159"),
+            "the process envelope delta stays in the log: {message}"
+        );
         assert_eq!(res.size(), 0);
         assert_eq!(pool.reserved(), 0);
         assert_eq!(tenant.reserved(), 0);
@@ -4282,6 +4302,15 @@ pub(crate) mod tests {
         headroom: Option<usize>,
     ) -> Arc<TenantDelegatingPool> {
         let tenant = TenantMemoryAccountant::with_process_budget(tenant_limit, Arc::clone(budget));
+        pool_on_tenant(tenant, query_limit, headroom)
+    }
+
+    /// [`attributed_pool`] over an existing `tenant`.
+    fn pool_on_tenant(
+        tenant: Arc<TenantMemoryAccountant>,
+        query_limit: usize,
+        headroom: Option<usize>,
+    ) -> Arc<TenantDelegatingPool> {
         let pool = TenantDelegatingPool::new(
             query_limit,
             tenant,
@@ -4418,8 +4447,8 @@ pub(crate) mod tests {
         );
         assert!(
             message.starts_with(
-                "aggregate reserve-ahead refused: the process aggregate envelope needs to grow \
-                 by 60 bytes: "
+                "aggregate reserve-ahead refused: the process has no room for this aggregate's \
+                 reserve-ahead envelope; asked by PartialHashAggregateStream[0] (can_spill="
             ),
             "{message}"
         );
@@ -4462,6 +4491,173 @@ pub(crate) mod tests {
              bytes asked); top holders: none; non-spillable consumers hold 0 bytes; this \
              query's aggregate envelope 0 bytes"
         );
+    }
+
+    /// The message and fields of every DEBUG event `f` emits on this thread
+    /// whose message starts with `SQL aggregate reserve-ahead refused`.
+    fn reserve_ahead_events<T>(f: impl FnOnce() -> T) -> (T, Vec<HashMap<String, String>>) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Events(Arc<Mutex<Vec<HashMap<String, String>>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() != tracing::Level::DEBUG {
+                    return;
+                }
+                struct Fields(HashMap<String, String>);
+                impl tracing::field::Visit for Fields {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0
+                            .insert(field.name().to_string(), format!("{value:?}"));
+                    }
+                }
+                let mut fields = Fields(HashMap::new());
+                event.record(&mut fields);
+                if fields
+                    .0
+                    .get("message")
+                    .is_some_and(|m| m.starts_with("SQL aggregate reserve-ahead refused"))
+                {
+                    self.0.lock().expect("not poisoned").push(fields.0);
+                }
+            }
+        }
+        // With one dispatcher registered, a callsite's interest is cached from
+        // whichever thread reaches it first; a second, process-wide one keeps
+        // interest computed across every live dispatcher instead.
+        static KEEP_TWO_DISPATCHERS: OnceLock<tracing::Dispatch> = OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        let events = Events::default();
+        let out = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(events.clone()),
+            f,
+        );
+        let events = events.0.lock().expect("not poisoned").clone();
+        (out, events)
+    }
+
+    /// Issue #3910: an aggregate's reserve-ahead refusal, in both its memory
+    /// refusal and its spill-mode spill trigger forms, carries only this
+    /// query's own figures. Pool B, on the same process budget, holds a
+    /// 777-byte join and a 313-byte aggregate envelope; pool A's aggregate
+    /// asks 1000 bytes on a 2001-byte process budget, and the envelope needs
+    /// to grow by 687 (only the largest envelope is on the budget). A's text
+    /// carries none of B's figures, the process limit, the process reserved
+    /// total or the delta; the DEBUG event carries the process figures.
+    #[test]
+    fn a_reserve_ahead_refusal_reports_only_this_querys_figures() {
+        let _serial = envelope_tests();
+        for (headroom, lead, event) in [
+            (
+                None,
+                "aggregate reserve-ahead refused: ",
+                "SQL aggregate reserve-ahead refused",
+            ),
+            (
+                Some(0),
+                "query memory pool spill threshold reached: ",
+                "SQL aggregate reserve-ahead refused in spill mode; the aggregate spills",
+            ),
+        ] {
+            let budget = Arc::new(MemoryBudget::new(2001));
+            let pool_b = attributed_pool(&budget, 1 << 20, 1 << 30, None);
+            let join_b = register_on(&pool_b, "HashJoinInput[0]");
+            join_b.try_grow(777).expect("within every ceiling");
+            let aggregate_b = register_spilling(&pool_b, PARTIAL);
+            aggregate_b.try_grow(313).expect("within every ceiling");
+            assert_eq!(envelope_on_budget(&budget), 313);
+            let process_reserved = budget.reserved();
+            assert_eq!(process_reserved, 1403, "777 + 313 charged + 313 envelope");
+
+            let pool_a = attributed_pool(&budget, 1 << 20, 1 << 30, headroom);
+            let aggregate_a = register_spilling(&pool_a, PARTIAL);
+            let (result, events) = reserve_ahead_events(|| aggregate_a.try_grow(1000));
+            let message = exhausted_message(
+                result.expect_err("a 687-byte delta does not fit the process's last 598"),
+            );
+            assert_eq!(
+                message,
+                format!(
+                    "{lead}the process has no room for this aggregate's reserve-ahead \
+                     envelope; asked by PartialHashAggregateStream[0] (can_spill=true, 1000 \
+                     bytes asked); top holders: none; non-spillable consumers hold 0 bytes; \
+                     this query's aggregate envelope 0 bytes"
+                )
+            );
+            for leaked in ["777", "313", "2001", "1403", "687"] {
+                assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+            }
+            assert_eq!(pool_a.refused(), headroom.is_none());
+
+            assert_eq!(events.len(), 1, "{events:?}");
+            let fields = &events[0];
+            for (name, value) in [
+                ("message", event),
+                ("consumer", PARTIAL),
+                ("asked", "1000"),
+                ("delta", "687"),
+                ("requested", "687"),
+                ("reserved", "1403"),
+                ("limit", "2001"),
+                ("cause", "limit"),
+            ] {
+                assert_eq!(
+                    fields.get(name).map(String::as_str),
+                    Some(value),
+                    "{name}: {fields:?}"
+                );
+            }
+        }
+    }
+
+    /// Issue #3910: the refusal does not report the tenant's reserved bytes
+    /// either. Pool B, a second query of A's own tenant, holds a 555-byte
+    /// join and a 222-byte aggregate envelope, so the tenant holds 999 bytes
+    /// before A's aggregate asks 1000 on a 1500-byte process budget; none of
+    /// B's figures and not the tenant's total reaches A's text.
+    #[test]
+    fn a_reserve_ahead_refusal_omits_the_tenants_other_queries() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1500));
+        let tenant = TenantMemoryAccountant::with_process_budget(1 << 30, Arc::clone(&budget));
+        let pool_b = pool_on_tenant(Arc::clone(&tenant), 1 << 20, None);
+        let join_b = register_on(&pool_b, "HashJoinInput[0]");
+        join_b.try_grow(555).expect("within every ceiling");
+        let aggregate_b = register_spilling(&pool_b, PARTIAL);
+        aggregate_b.try_grow(222).expect("within every ceiling");
+        assert_eq!(tenant.reserved(), 777, "555 + 222 charged");
+        assert_eq!(budget.reserved(), 999, "777 charged + 222 envelope");
+
+        let pool_a = pool_on_tenant(Arc::clone(&tenant), 1 << 20, None);
+        let aggregate_a = register_spilling(&pool_a, PARTIAL);
+        let message = exhausted_message(
+            aggregate_a
+                .try_grow(1000)
+                .expect_err("a 778-byte delta does not fit the process's last 501"),
+        );
+        assert_eq!(
+            message,
+            "aggregate reserve-ahead refused: the process has no room for this aggregate's \
+             reserve-ahead envelope; asked by PartialHashAggregateStream[0] (can_spill=true, \
+             1000 bytes asked); top holders: none; non-spillable consumers hold 0 bytes; this \
+             query's aggregate envelope 0 bytes"
+        );
+        for leaked in ["555", "222", "777", "999", "778", "1500"] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
     }
 
     /// Issue #3899: `refused` is set by each of the four kinds of memory
@@ -4956,8 +5152,9 @@ pub(crate) mod tests {
         let (pool, message, _join, _aggregate) = setup(Some(0), true);
         assert!(
             message.starts_with(
-                "query memory pool spill threshold reached: the process aggregate envelope \
-                 needs to grow by 60 bytes: "
+                "query memory pool spill threshold reached: the process has no room for this \
+                 aggregate's reserve-ahead envelope; asked by PartialHashAggregateStream[0] \
+                 (can_spill=true, 60 bytes asked); "
             ),
             "{message}"
         );
@@ -4968,8 +5165,8 @@ pub(crate) mod tests {
         let (pool, message, _join, _aggregate) = setup(Some(0), false);
         assert!(
             message.starts_with(
-                "aggregate reserve-ahead refused: the process aggregate envelope needs to grow \
-                 by 60 bytes: "
+                "aggregate reserve-ahead refused: the process has no room for this aggregate's \
+                 reserve-ahead envelope; asked by PartialHashAggregateStream[0] (can_spill="
             ),
             "{message}"
         );
@@ -4979,8 +5176,8 @@ pub(crate) mod tests {
         let (pool, message, _join, _aggregate) = setup(None, true);
         assert!(
             message.starts_with(
-                "aggregate reserve-ahead refused: the process aggregate envelope needs to grow \
-                 by 60 bytes: "
+                "aggregate reserve-ahead refused: the process has no room for this aggregate's \
+                 reserve-ahead envelope; asked by PartialHashAggregateStream[0] (can_spill="
             ),
             "{message}"
         );
