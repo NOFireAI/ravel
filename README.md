@@ -89,7 +89,8 @@ docker compose -f deploy/docker-compose/ravel.yml down
 ```
 
 The stored data stays in `rustfs-data/`, and the next `up` reuses it. To
-delete it, run `rm -rf rustfs-data` after `down`. That cannot be undone.
+delete it, run `rm -rf rustfs-data` after `down` (with `sudo` on Linux). That
+cannot be undone.
 
 The [getting started guide](docs/guides/getting-started.md) explains each
 response and when an empty result is correct.
@@ -114,7 +115,10 @@ loses the buffered window, and a flush that runs past its time budget is
 abandoned and loses its acknowledged rows without any crash.
 
 The [consistency model](docs/consistency-model.md) is the normative statement
-of both modes, visibility, and crash behavior.
+of both modes, visibility, and crash behavior. The protocols behind it are
+model-checked in TLA+ under stated bounds
+([formal verification](docs/guides/formal-verification.md)) and exercised by
+a deterministic fault-injection simulation.
 
 ## Is Ravel a fit
 
@@ -218,28 +222,15 @@ listener is reachable from outside localhost. All nine tools are served,
 read-only. The [MCP server guide](docs/guides/mcp-server.md) shows how to
 connect a client.
 
-## How Ravel is verified
-
-The commit, catalog, lifecycle, resharding, and maintenance protocols are
-model-checked in TLA+ under stated bounds
-([formal verification](docs/guides/formal-verification.md)). A deterministic
-simulation runs ingest, fold, compaction, sweep, and query under injected
-faults, and PromQL is tested against a real Prometheus binary.
-
 ## Documentation
 
-| To | Read |
-|---|---|
-| Run Ravel for the first time | [Getting started](docs/guides/getting-started.md) |
-| Understand the model | [Concepts](docs/concepts.md), [architecture](docs/architecture.md) |
-| Send telemetry | [Ingest guide](docs/guides/ingest.md) |
-| Query metrics, logs, and traces | [Query guide](docs/guides/query.md), [traces](docs/guides/traces.md) |
-| Run it against your own bucket | [Operations](docs/guides/operations.md), [container images](docs/guides/operations/deployment.md#container-images) |
-| Look up a flag or route | [Reference](docs/README.md#look-up) |
-| Change Ravel | [Contributing](CONTRIBUTING.md) |
-
-The [documentation index](docs/README.md) lists every page. See also the
-[changelog](CHANGELOG.md) and the [AI policy](AI_POLICY.md).
+- [Getting started](docs/guides/getting-started.md), then the
+  [ingest](docs/guides/ingest.md) and [query](docs/guides/query.md) guides.
+- [Operations](docs/guides/operations.md) to run Ravel on your own bucket,
+  including [container images](docs/guides/operations/deployment.md#container-images).
+- The [documentation index](docs/README.md) routes every other task, from
+  references to contributing ([CONTRIBUTING.md](CONTRIBUTING.md)).
+- The [changelog](CHANGELOG.md) and the [AI policy](AI_POLICY.md).
 
 ## License
 

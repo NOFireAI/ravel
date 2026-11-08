@@ -43,7 +43,8 @@ one connection. An agent that investigates an incident needs each of them:
 
 The [quickstart stack](getting-started.md) runs without `--mcp`. To turn it
 on, save this Compose override as `mcp.yml` in the repository root. It repeats
-the stack's `ravel-server` arguments and adds the two MCP flags:
+the `ravel-server` arguments from `deploy/docker-compose/ravel.yml` and adds
+the two MCP flags; if that file's `command` list changes, copy it again:
 
 ```yaml
 services:
