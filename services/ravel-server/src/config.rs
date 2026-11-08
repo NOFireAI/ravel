@@ -389,6 +389,8 @@ pub struct SqlSpillSettings {
     /// `--sql-spill-merge-fan-in`: the most spill files one merge step reads
     /// at once, `0` for unbounded. Never 1; the flag refuses it.
     pub merge_fan_in: usize,
+    /// `--sql-spill-merge-fan-in` was passed, whatever its value.
+    pub merge_fan_in_passed: bool,
 }
 
 impl Default for SqlSpillSettings {
@@ -398,6 +400,7 @@ impl Default for SqlSpillSettings {
             memory_budget_bytes: u64::MAX,
             read_cache_bytes: 0,
             merge_fan_in: DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+            merge_fan_in_passed: false,
         }
     }
 }
@@ -889,29 +892,69 @@ fn parse_audit_token_key(raw: &str) -> anyhow::Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("{AUDIT_TOKEN_KEY_ENV} did not decode to 32 bytes"))
 }
 
-/// `--sql-spill-merge-fan-in`, flattened into [`Cli`].
-#[derive(Debug, clap::Args)]
+/// `--sql-spill-merge-fan-in`, flattened into [`Cli`], and whether the flag
+/// was passed, so the startup line names its source whatever the value.
+#[derive(Debug)]
 pub struct SqlSpillMergeArgs {
+    /// The parsed value, [`DEFAULT_SQL_SPILL_MERGE_FAN_IN`] when unset.
+    pub sql_spill_merge_fan_in: usize,
+    /// The flag was on the command line, read from
+    /// [`clap::ArgMatches::value_source`].
+    pub sql_spill_merge_fan_in_passed: bool,
+}
+
+impl clap::FromArgMatches for SqlSpillMergeArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let flag = <SqlSpillMergeFlag as clap::FromArgMatches>::from_arg_matches(matches)?;
+        Ok(SqlSpillMergeArgs {
+            sql_spill_merge_fan_in: flag.sql_spill_merge_fan_in,
+            sql_spill_merge_fan_in_passed: !matches!(
+                matches.value_source("sql_spill_merge_fan_in"),
+                None | Some(clap::parser::ValueSource::DefaultValue)
+            ),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches(matches)?;
+        Ok(())
+    }
+}
+
+impl clap::Args for SqlSpillMergeArgs {
+    fn augment_args(cmd: clap::Command) -> clap::Command {
+        <SqlSpillMergeFlag as clap::Args>::augment_args(cmd)
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        <SqlSpillMergeFlag as clap::Args>::augment_args_for_update(cmd)
+    }
+}
+
+/// The `Arg` behind [`SqlSpillMergeArgs`].
+#[derive(Debug, clap::Args)]
+struct SqlSpillMergeFlag {
     /// Most spill files one SQL spill merge step reads at once (ADR-0954
-    /// item 2, issue #3899). The scratch peak is the spilled bytes plus the
-    /// largest intermediate merge output. With files of equal size the
-    /// default, 2, has the smallest worst case of any bounded value, about
-    /// 1.67 times the spilled bytes, and any value of 3 or more has a worse
-    /// one (about 1.89 times at 8, with 9 files); a last file smaller than
-    /// the rest lifts the peak toward twice the spilled bytes at any value.
-    /// 2 also leaves the most of the memory pool to the aggregate that
-    /// replays the merged files. `0` is DataFusion's unbounded fan-in, which
-    /// reads as many files at once as the pool seats, and a value at or above
-    /// that number behaves as `0`. `1` is refused at startup. The startup log's `sql_spill_merge_fan_in` line reports the
-    /// value. Meaningful only in a build with the `sql` feature and with
-    /// spill on; inert otherwise.
+    /// item 2, issue #3899). The default, 2, has the smallest worst-case
+    /// scratch peak over every run count: about 1.67 times the spilled bytes
+    /// with files of equal size, below twice them with a smaller last file.
+    /// At a given high run count a larger value can need less scratch (at 34
+    /// files 8 needed 1.23 to 1.25 times the spilled bytes, 2 needed 1.51 to
+    /// 1.52), so a host whose spill does not fit at 2 can try a larger value.
+    /// `0` is DataFusion's unbounded merge, which can fail a statement that 2
+    /// answers, because the aggregate replaying the merged files is left no
+    /// room in the memory pool (#3899 M3, rows 14 and 35); a value at or
+    /// above the number of files the pool seats behaves as `0`. `1` is
+    /// refused at startup. The startup log's `sql_spill_merge_fan_in` line
+    /// reports the value. Meaningful only in a build with the `sql` feature
+    /// and with spill on; inert otherwise.
     #[arg(
         long = "sql-spill-merge-fan-in",
         value_name = "FILES",
         default_value_t = DEFAULT_SQL_SPILL_MERGE_FAN_IN,
         value_parser = parse_sql_spill_merge_fan_in
     )]
-    pub sql_spill_merge_fan_in: usize,
+    sql_spill_merge_fan_in: usize,
 }
 
 /// Dev binary wiring gateway + ingest + query into one process.
@@ -8187,6 +8230,7 @@ impl Cli {
                         .saturating_add(resolved.catalog_cache_max_bytes)
                 },
                 merge_fan_in: self.sql_spill_merge.sql_spill_merge_fan_in,
+                merge_fan_in_passed: self.sql_spill_merge.sql_spill_merge_fan_in_passed,
             },
             decoded_cache_max_bytes: self.decoded_cache_max_bytes,
         })
@@ -17318,6 +17362,7 @@ mod tests {
                     memory_budget_bytes: 30_064_771_072,
                     read_cache_bytes,
                     merge_fan_in: DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+                    merge_fan_in_passed: false,
                 },
                 "{args:?}"
             );
@@ -17327,15 +17372,21 @@ mod tests {
     /// `--sql-spill-merge-fan-in` (ADR-0954 item 2, issue #3899): unset
     /// resolves to the named default, an explicit value reaches
     /// `QueryBudgets::sql_spill`, `0` (unbounded) is accepted, and `1` is
-    /// refused at startup with a message saying why.
+    /// refused at startup with a message saying why. Whether the flag was
+    /// passed reaches the same settings, including for an explicit 2.
+    ///
+    /// Prove-the-test: compare the value against the default in
+    /// `SqlSpillMergeArgs::from_arg_matches` instead of reading
+    /// `value_source` and the explicit-2 row reads not passed.
     #[test]
     fn sql_spill_merge_fan_in_flag_resolves_and_refuses_one() {
         assert_eq!(DEFAULT_SQL_SPILL_MERGE_FAN_IN, 2);
-        for (args, expected) in [
-            (&[][..], DEFAULT_SQL_SPILL_MERGE_FAN_IN),
-            (&["--sql-spill-merge-fan-in", "4"][..], 4),
-            (&["--sql-spill-merge-fan-in", "0"][..], 0),
-            (&["--sql-spill-merge-fan-in", "8"][..], 8),
+        for (args, expected, passed) in [
+            (&[][..], DEFAULT_SQL_SPILL_MERGE_FAN_IN, false),
+            (&["--sql-spill-merge-fan-in", "2"][..], 2, true),
+            (&["--sql-spill-merge-fan-in", "4"][..], 4, true),
+            (&["--sql-spill-merge-fan-in", "0"][..], 0, true),
+            (&["--sql-spill-merge-fan-in", "8"][..], 8, true),
         ] {
             let parsed = cli(args);
             assert_eq!(
@@ -17345,11 +17396,13 @@ mod tests {
             let resolved = resolved_from(&parsed);
             let budgets = parsed.query_budgets(&resolved).expect("budgets resolve");
             assert_eq!(budgets.sql_spill.merge_fan_in, expected, "{args:?}");
+            assert_eq!(budgets.sql_spill.merge_fan_in_passed, passed, "{args:?}");
         }
         assert_eq!(
             SqlSpillSettings::default().merge_fan_in,
             DEFAULT_SQL_SPILL_MERGE_FAN_IN
         );
+        assert!(!SqlSpillSettings::default().merge_fan_in_passed);
 
         let refused = Cli::try_parse_from(["ravel-server", "--sql-spill-merge-fan-in", "1"])
             .expect_err("--sql-spill-merge-fan-in 1 must be refused");
