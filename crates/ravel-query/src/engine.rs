@@ -88,6 +88,12 @@ pub struct QueryStats {
     /// equality value its part's leaves prove absent. Not counted in
     /// `segments_fetched`. Zero when no metrics leaf covers the snapshot.
     pub segments_pruned_by_label_index: u64,
+    /// The label-value route's passes, one per distinct routed value in the
+    /// order they were issued: the value's labels and `key8`, its leaf GETs,
+    /// wire bytes and cache hits, its part outcomes, and the segments it
+    /// pruned, alone and in all. Their leaf GETs sum to the `keyIndex`
+    /// phase's GETs. Empty when the route did not run.
+    pub label_index_values: Vec<crate::key_index_route::ValueRouteFigures>,
     /// Fetched sparse objects whose probe read LABEL_DICT alone before the
     /// rest of the catalog, paying one GET a one-step probe would not. An
     /// object whose LABEL_DICT the footer tail already held is checked with
@@ -175,6 +181,7 @@ impl QueryStats {
             segments_pruned,
             segments_pruned_by_dictionary: dictionary_probe.segments_pruned_by_dictionary,
             segments_pruned_by_label_index: 0,
+            label_index_values: Vec::new(),
             segments_probed_two_step: dictionary_probe.segments_probed_two_step,
             dictionary_probe_switched_off: dictionary_probe.switched_off,
             page_stats,
@@ -199,6 +206,7 @@ impl Default for QueryStats {
             segments_pruned: 0,
             segments_pruned_by_dictionary: 0,
             segments_pruned_by_label_index: 0,
+            label_index_values: Vec::new(),
             segments_probed_two_step: 0,
             dictionary_probe_switched_off: false,
             page_stats: FetchStats::default(),
@@ -2154,7 +2162,7 @@ impl QueryEngine {
                 .snapshot()
                 .phase(QueryPhase::KeyIndex)
                 .total_s3_requests();
-            let plan_keeps = self
+            let routing = self
                 .route_metric_plans(
                     tenant_hash,
                     &snapshot,
@@ -2163,6 +2171,8 @@ impl QueryEngine {
                     &accounting,
                 )
                 .await?;
+            let plan_keeps = routing.plan_keeps;
+            let label_index_values = routing.values;
             drop(parts);
             // The route's leaf GETs are charged before any segment fetch
             // runs, and a plan whose every segment was pruned runs no fetch
@@ -2436,12 +2446,16 @@ impl QueryEngine {
                     fed_partial,
                     excludes_spend,
                     pruned_by_label_index,
+                    label_index_values,
                 ),
                 page_stats,
             ))
         };
 
-        let ((source, warnings, partial, excludes_spend, pruned_by_label_index), mut stats) = self
+        let (
+            (source, warnings, partial, excludes_spend, pruned_by_label_index, label_index_values),
+            mut stats,
+        ) = self
             .resolve_snapshot_with_retry(
                 tenant_hash,
                 Signal::Metrics,
@@ -2461,16 +2475,18 @@ impl QueryEngine {
         stats.warnings = warnings;
         stats.estimate_excludes_spend = excludes_spend;
         stats.segments_pruned_by_label_index = pruned_by_label_index;
+        stats.label_index_values = label_index_values;
         stats.segments_fetched = stats.segments_fetched.saturating_sub(pruned_by_label_index);
         Ok((source, stats))
     }
 
     /// The label-value route (ADR-3694 decision 3, per-value routing
-    /// amendment): for each of `plans`, `Some(keep)` parallel to
+    /// amendment), [`route_values`](crate::key_index_route::route_values) on
+    /// the metrics leaf field: for each of `plans`, `Some(keep)` parallel to
     /// `snapshot.segments` when the plan was routed, `None` when it reads the
-    /// whole snapshot. Each distinct positive equality value, `__name__`
-    /// included, is routed once as its own one-key set on the metrics leaf
-    /// field, and a plan drops a segment when any of its values routes it
+    /// whole snapshot, and one entry per routing pass. Each distinct positive
+    /// equality value, `__name__` included, is routed once as its own one-key
+    /// set, and a plan drops a segment when any of its values routes it
     /// [`SegmentRoute::Pruned`](crate::key_index_route::SegmentRoute): the
     /// values are a conjunction, while one multi-key set prunes a part only
     /// when every key is absent. Blocks and Uncovered both keep the segment.
@@ -2479,9 +2495,9 @@ impl QueryEngine {
     /// snapshot carries a pending erasure, when `parts` is `None`, or when no
     /// part a snapshot segment comes from carries a metrics leaf ref (a
     /// tenant folded without `metrics_label_index`), so such a query issues
-    /// no leaf GET and settles no part. The value passes run at most
-    /// `promql_fetch_fanout` at a time, the width the per-plan fetch passes
-    /// that follow run at.
+    /// no leaf GET, settles no part and reports no pass. The value passes run
+    /// at most `promql_fetch_fanout` at a time, the width the per-plan fetch
+    /// passes that follow run at.
     async fn route_metric_plans(
         &self,
         tenant_hash: TenantHash,
@@ -2489,115 +2505,44 @@ impl QueryEngine {
         parts: Option<&SnapshotParts>,
         plans: &[SelectorPlan],
         accounting: &PhaseAccounting,
-    ) -> Result<Vec<Option<Vec<bool>>>, QueryError> {
-        use crate::key_index_route::{KeySet, RouteError, RouteInput, SegmentRoute, route};
-        let unrouted = || vec![None; plans.len()];
+    ) -> Result<crate::key_index_route::ValueRouting, QueryError> {
+        use crate::key_index_route::{RouteError, ValueRouteInput, ValueRouting, route_values};
         let Some(parts) = parts else {
-            return Ok(unrouted());
+            return Ok(ValueRouting::unrouted(plans.len()));
         };
-        if !snapshot.pending_erasure.is_empty() || snapshot.segments.is_empty() {
-            return Ok(unrouted());
-        }
-        let has_metrics_leaf = parts.origin.iter().flatten().any(|origin| {
-            parts.parts.get(origin.part as usize).is_some_and(|part| {
-                part.key_index
-                    .iter()
-                    .any(|leaf| leaf.field == ravel_catalog::METRICS_LABEL_VALUE_FIELD)
-            })
-        });
-        if !has_metrics_leaf {
-            return Ok(unrouted());
-        }
         // A `__name__` value is routed too, though the resolve's name
         // postings already pruned by it where they could: postings do not
         // cover every segment, and `shared_equality_name_filter` passes no
         // name at all when the selectors disagree on one, so a name pass can
         // prune segments the postings kept. It costs one pass of leaf GETs.
-        let plan_values: Vec<Vec<&str>> = plans
+        let plan_values: Vec<Vec<(&str, &str)>> = plans
             .iter()
             .map(|plan| positive_equality_values(&plan.matchers))
             .collect();
-        let mut values: Vec<&str> = plan_values.iter().flatten().copied().collect();
-        values.sort_unstable();
-        values.dedup();
-        if values.is_empty() {
-            return Ok(unrouted());
-        }
-        let key_sets: Vec<(&str, KeySet)> = values
-            .iter()
-            .filter_map(|value| {
-                KeySet::new(
-                    ravel_catalog::METRICS_LABEL_VALUE_FIELD,
-                    ravel_codec::key_idx::KeyType::Str,
-                    vec![ravel_codec::key_idx::key8_str(value)],
-                )
-                .ok()
-                .map(|set| (*value, set))
-            })
-            .collect();
         let reader = crate::fetcher::MetricLeafRangeReader::new(&self.fetcher, tenant_hash);
-        // The passes are built before the stream, not inside a `.map`
-        // closure on it: a closure there fails axum's higher-ranked `Send`
-        // bound on the handler future.
-        let passes: Vec<_> = key_sets
-            .iter()
-            .map(|(value, key_set)| {
-                let input = RouteInput {
-                    catalog: &self.catalog,
-                    snapshot,
-                    parts,
-                    signal: Signal::Metrics,
-                    tenant_hash,
-                    key_set,
-                    accounting,
-                    reader: &reader,
-                    budget: &self.memory_budget,
-                    limits: ravel_catalog::KeyIndexLeafLimits::default(),
-                };
-                async move { (*value, route(input).await) }
-            })
-            .collect();
-        let routed: Vec<_> = stream::iter(passes)
-            .buffer_unordered(self.config.promql_fetch_fanout().max(1))
-            .collect()
-            .await;
-        let mut pruned_by_value: HashMap<&str, Vec<bool>> = HashMap::with_capacity(routed.len());
-        for (value, result) in routed {
-            match result {
-                Ok((routes, _figures)) => {
-                    pruned_by_value.insert(
-                        value,
-                        routes
-                            .iter()
-                            .map(|r| matches!(r, SegmentRoute::Pruned))
-                            .collect(),
-                    );
-                }
-                Err(RouteError::Isolation { source, .. }) => return Err(source.into()),
-                // The parts came from the same resolve as the snapshot, so a
-                // mismatch is not expected; reading every segment stays exact.
-                Err(RouteError::InvalidInput(reason)) => {
-                    tracing::warn!(%reason, "metrics label-value route skipped");
-                }
+        let input = ValueRouteInput {
+            catalog: &self.catalog,
+            snapshot,
+            parts,
+            signal: Signal::Metrics,
+            tenant_hash,
+            field: ravel_catalog::METRICS_LABEL_VALUE_FIELD,
+            accounting,
+            reader: &reader,
+            budget: &self.memory_budget,
+            limits: ravel_catalog::KeyIndexLeafLimits::default(),
+            concurrency: self.config.promql_fetch_fanout().max(1),
+        };
+        match route_values(input, &plan_values).await {
+            Ok(routing) => Ok(routing),
+            Err(RouteError::Isolation { source, .. }) => Err(source.into()),
+            // The parts came from the same resolve as the snapshot, so a
+            // mismatch is not expected; reading every segment stays exact.
+            Err(RouteError::InvalidInput(reason)) => {
+                tracing::warn!(%reason, "metrics label-value route skipped");
+                Ok(ValueRouting::unrouted(plans.len()))
             }
         }
-        Ok(plan_values
-            .iter()
-            .map(|values| {
-                if values.is_empty() {
-                    return None;
-                }
-                let mut keep = vec![true; snapshot.segments.len()];
-                for value in values {
-                    if let Some(pruned) = pruned_by_value.get(value) {
-                        for (kept, pruned) in keep.iter_mut().zip(pruned) {
-                            *kept &= !*pruned;
-                        }
-                    }
-                }
-                Some(keep)
-            })
-            .collect())
     }
 
     /// A fresh accounting handle for one PromQL lane or attempt. Every PromQL
@@ -4290,13 +4235,13 @@ fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<Cow<'a, 
     shared
 }
 
-/// The values of `matchers`' positive equalities (`=` with a non-empty
-/// value), `__name__` included: what the label-value route probes.
-fn positive_equality_values(matchers: &[LabelMatcher]) -> Vec<&str> {
+/// The `(label, value)` pairs of `matchers`' positive equalities (`=` with a
+/// non-empty value), `__name__` included: what the label-value route probes.
+fn positive_equality_values(matchers: &[LabelMatcher]) -> Vec<(&str, &str)> {
     matchers
         .iter()
         .filter(|m| m.op == MatchOp::Eq && !m.value.is_empty())
-        .map(|m| m.value.as_str())
+        .map(|m| (m.name.as_str(), m.value.as_str()))
         .collect()
 }
 
