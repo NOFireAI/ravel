@@ -309,6 +309,7 @@ d["comparators"]["ravel"]["image"]["container"] == "c-ravel"
 d["comparators"]["ravel"]["image"]["config_image"] == "ghcr.io/nofireai/ravel-server:0.26.0@sha256:b299"
 d["comparators"]["ravel"]["runtime_flags"]["cmd"] == ["--mode", "all", "--max-ingest-lag", "45d"]
 d["comparators"]["ravel"]["runtime_flags"]["source"] == "docker inspect .Config.Cmd of compose service ravel-server"
+d["comparators"]["ravel"]["runtime_flags"]["entrypoint"] == ["/usr/local/bin/ravel-server"]
 EOF
 
 # --- i: compose ps reads ravel.yml, with RAVEL_IMAGE placeholder or passed on ---
@@ -532,6 +533,7 @@ d["comparators"]["prometheus"]["go_runtime"] == {"source": "docker inspect .Conf
 d["comparators"]["victoriametrics"]["go_runtime"] == {"source": "docker inspect .Config.Env", "GOMEMLIMIT": "7GiB"}
 d["comparators"]["mimir"]["go_runtime"] == {"source": "docker inspect .Config.Env", "GOMEMLIMIT": "7GiB"}
 ("go_runtime" in d["comparators"]["ravel"]) == False
+("entrypoint" in d["comparators"]["ravel"]["runtime_flags"]) == False
 EOF
 
 # docker-up's inspect answers carry no Env at all.

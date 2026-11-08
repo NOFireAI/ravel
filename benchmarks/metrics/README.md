@@ -631,6 +631,70 @@ regenerated stream's digest differs from the report's `run.stream_digest`
 `--ingest-report` and `--readback-system` without `--readback-only` exit 64
 too (`metricsbench_ingest::tests::readback_flags_need_readback_only`).
 
+With `--ravel-metrics-url URL` (ravel-server's `/metrics`), the Ravel row's
+read-back, in a replay or `--readback-only`, also records
+`readback.query_cost`, keyed as `query_ms` (`series`, `samples.N`): `stats`,
+the `data.stats` of each answer in query order (`null` for an answer with
+none; empty for the series read, whose answer has no stats); `phases`, per
+phase (`resolve`, `plan`, `probe`, `scan`, `keyIndex`) the sum over those
+answers of the phase's `s3_get_requests`, `s3_get_wire_bytes` and
+`s3_list_requests`, `null` for the series read and whenever an answer lacks
+a phase list or a figure, never a partial sum; and the receiver's
+process-wide counters across the query, which count every request the
+process served in that interval, not only this one:
+`process_store_get_delta` (`ravel_store_calls_total{op="get"}`),
+`process_fetch_miss_delta` (`ravel_cache_misses_total{cache="fetch"}`) and
+`process_catalog_get_delta` (the first less the second), each summed over
+every series of its family. Those three are `null`, with `process_error`
+saying why, when a scrape failed or lacked a family or a counter went down
+across the query (a restart reset it), which is an error rather than zero.
+Without the flag the key is left out
+(`metrics_ingest::tests::readback_records_query_cost_when_given_a_metrics_url`,
+`metrics_ingest::tests::get_counters_refuse_a_missing_family`,
+`metrics_ingest::tests::a_counter_reset_nulls_the_process_figures`,
+`metrics_ingest::tests::phase_totals_sum_answers_and_refuse_a_partial_sum`).
+
+#### Holder counts (`metricsbench_holders`)
+
+`metricsbench_holders --corpus PATH --ingest-report PATH --workload PATH
+--objects-list PATH --objects-dir DIR --out PATH` reads the data objects
+the list names (one `ravel-cli catalog list --json` line each, the L0 and
+L1 objects the folded snapshot resolves) from `DIR/<key>`. For each corpus
+statement under the ingest report's profile with a `label="value"` matcher
+(non-empty value), it computes the statement's fetch window on the run's
+query grid as Ravel's engine resolves it, counts the listed objects whose
+event time range overlaps that window whatever metrics they hold
+(`segments_in_window`), the ones among them holding a series of one of the
+statement's metric names (`named_in_window`), and the ones among those
+holding at least one series that matches a qualifying selector in full,
+metric name and every matcher (`holders`). `unrouted_fetched_expected` is
+what Ravel's unrouted resolve fetches: `named_in_window` when every
+selector names the same metric (`name_pruned`, the resolve prunes by that
+name's postings) and `segments_in_window` when they name different metrics.
+`route_bound` is false, with `route_bound_reason`, when a selector has no
+qualifying matcher: the router then keeps every object holding that
+selector's metric, so `holders` is no bound on what a routed query opens.
+It decodes each object's series catalog with ravel-segment's public reader,
+with no router or key index; the file's `method` states the window and
+counting rules (`metrics_holders::HOLDERS_METHOD`). `holders.json` holds
+`method`, `profile`, `objects_l0`, `objects_l1`, `series_total`,
+`statements` (`id`, `promql`, `eval`, `selectors`, `positive_equalities`,
+`metrics`, `name_pruned`, `fetch_window`, `segments_in_window`,
+`named_in_window`, `unrouted_fetched_expected`, `holders`, `route_bound`
+and `route_bound_reason` per qualifying entry) and `skipped` (`id`
+and `reason` for each entry with no qualifying selector, whose selectors the
+corpus reader refuses, or whose fetch window cannot be planned). It exits 65
+when the list names no object or the ingest report does not bind to the
+workload, 66 when an input cannot be read, a list line does not parse, or a
+listed object is missing or does not decode (no file is written), and 74
+when the file cannot be written
+(`metrics_holders::tests::the_fetch_window_follows_the_engine_resolve`,
+`metrics_holders::tests::holders_count_objects_in_the_window_with_a_fully_matching_series`,
+`metrics_holders::tests::named_in_window_counts_the_objects_holding_the_statements_metrics`,
+`metrics_holders::tests::unrouted_fetched_expected_is_what_the_engine_fetches`,
+`metrics_holders::tests::an_unreadable_object_is_an_error`).
+`deploy/metricsbench/run.sh`'s `stage1-holders` step runs it.
+
 ## Determinism
 
 One seed (`927000933`) drives everything. Every value and every injected
@@ -1140,6 +1204,24 @@ returns). Its fields
   `accounting` and `phases` both `null`
   (`ravel_cost_records_null_on_an_answer_with_no_stats`). The figures are
   descriptive: no band or exit status reads them.
+  Each object also carries `segmentsFetched`, `segmentsPruned`,
+  `segmentsPrunedByDictionary`, `segmentsPrunedByLabelIndex`, `estimate`
+  and `io`, the same-named members of `data.stats`, each copied on its own
+  and `null` (never 0) when the stats lack it; `pass_label` and
+  `fold_state`, the values of `--pass-label` and `--fold-state` (`null`
+  without them; ADR-3694 Stage 1 labels its passes `unfolded`,
+  `background-folded`, `folded-unrouted` and `folded-routed`, while `pass`
+  stays the timed pass number); and `result_hash`, `blake3:<hex>` over the
+  answer's `resultType` and `result`, with each series' labels sorted by
+  name, every timestamp and float hashed by its `f64::to_bits`, and the
+  series sorted, so equal answers hash equal whatever their series or key
+  order, while a sample order change or a one-bit value change does not
+  (`metrics_query::result_hash`; `null` for an outcome that is not a
+  successful envelope)
+  (`ravel_cost_copies_every_stats_field_and_nulls_the_absent_ones`,
+  `equal_answers_hash_equal_whatever_their_key_order`,
+  `reordered_series_hash_equal_and_reordered_samples_do_not`,
+  `a_one_bit_change_hashes_differently`).
 - `skipped_reps`: every timed repetition not sent because an earlier
   repetition of the same entry, on the same engine and in the same pass,
   timed out (ADR-0927's 2026-11-06 amendment; `metrics_query::SkippedRep`).

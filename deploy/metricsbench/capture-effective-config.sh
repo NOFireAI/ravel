@@ -418,12 +418,19 @@ def ravel_runtime_flags(containers, service):
     if err:
         return unavailable(err)
     try:
-        cmd = json.loads(stdout)[0].get("Config", {}).get("Cmd")
+        config = json.loads(stdout)[0].get("Config", {})
+        cmd = config.get("Cmd")
+        entrypoint = config.get("Entrypoint")
     except Exception as e:
         return unavailable(f"docker inspect {cid}: {type(e).__name__}")
     if not isinstance(cmd, list) or not cmd:
         return unavailable(f"docker inspect {cid}: empty .Config.Cmd")
-    return {"source": source, "cmd": cmd}
+    record = {"source": source, "cmd": cmd}
+    # ravel.yml appends RAVEL_SERVER_EXTRA_FLAGS (MB_STAGE1) to the
+    # entrypoint, so flags there are flags too.
+    if isinstance(entrypoint, list):
+        record["entrypoint"] = entrypoint
+    return record
 
 
 GO_RUNTIME_SOURCE = "docker inspect .Config.Env"

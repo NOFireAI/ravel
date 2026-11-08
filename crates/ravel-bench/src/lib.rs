@@ -44,6 +44,7 @@ pub mod logbody_report;
 pub mod logs_scan_scaling;
 pub mod metrics_correctness;
 pub mod metrics_gen;
+pub mod metrics_holders;
 pub mod metrics_ingest;
 pub mod metrics_query;
 pub mod metrics_stream_sample;

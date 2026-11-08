@@ -1138,6 +1138,52 @@ pub struct Readback {
     /// window was queried, and in a report written before the field existed.
     #[serde(default)]
     pub query_windows: BTreeMap<String, u32>,
+    /// The cost of the [`READBACK_QUERY_SERIES`] read and of each
+    /// [`READBACK_QUERY_SAMPLES`] read of the reported read-back, keyed as in
+    /// `query_ms`. Filled only when [`ReadbackConfig::metrics_url`] is set;
+    /// empty, and left out of the JSON, otherwise.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub query_cost: BTreeMap<String, ReadbackQueryCost>,
+}
+
+/// What one named read-back query cost the receiver. `phases` is the query's
+/// own accounting, read from its answers; the `process_*` figures are the
+/// receiver's process-wide counters scraped around the query, which count
+/// every request the process served in that interval, not only this one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadbackQueryCost {
+    /// `data.stats` of each `/api/v1/query` answer, one per
+    /// [`READBACK_COUNT_WINDOW`] window in query order, `null` for an answer
+    /// that carries none. Empty for the `/api/v1/series` read, whose answer
+    /// has no stats.
+    pub stats: Vec<serde_json::Value>,
+    /// Per phase (`resolve`, `plan`, `probe`, `scan`, `keyIndex`), the sum
+    /// over `stats` of each answer's `data.stats.phases` entry. `resolve` is
+    /// the catalog's share. `None` for the series read, and when any answer
+    /// lacks a phase list or a phase lacks a figure, never a partial sum.
+    pub phases: Option<BTreeMap<String, PhaseCost>>,
+    /// The change in `ravel_store_calls_total{op="get"}` across the query,
+    /// summed over every series of that family, process-wide.
+    pub process_store_get_delta: Option<i64>,
+    /// The change in `ravel_cache_misses_total{cache="fetch"}` across the
+    /// query, process-wide.
+    pub process_fetch_miss_delta: Option<i64>,
+    /// `process_store_get_delta` less `process_fetch_miss_delta`: the GETs
+    /// that were not segment fetches (the split the harness's
+    /// `readback-folded` stamp makes). `None` when either is.
+    pub process_catalog_get_delta: Option<i64>,
+    /// Why the `process_*` figures are `None`: a scrape failed or lacked a
+    /// family, or a counter went down across the query (a restart reset it).
+    pub process_error: Option<String>,
+}
+
+/// One phase's figures from a Ravel answer's `data.stats.phases`, as the
+/// server counts them: logical GET and LIST calls, and GET wire bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseCost {
+    pub s3_get_requests: u64,
+    pub s3_get_wire_bytes: u64,
+    pub s3_list_requests: u64,
 }
 
 /// The read-your-write query phase of a system's replay. Recorded as its own
@@ -4444,6 +4490,10 @@ pub struct ReadbackConfig {
     /// yet match what was sent before reporting the mismatch. Zero reads
     /// once. The same window applies to every system.
     pub settle_secs: u64,
+    /// The receiver's Prometheus-text metrics URL (Ravel's `/metrics`). When
+    /// set, the series and samples reads record their `data.stats` and the
+    /// GET deltas around each in [`Readback::query_cost`].
+    pub metrics_url: Option<String>,
 }
 
 /// The [`Readback::query_ms`] key of the `/api/v1/series` cardinality read.
@@ -4601,6 +4651,10 @@ async fn read_back_once(
         result.map_err(|detail| fail(format!("query {name} failed after {ms} ms: {detail}")))
     };
 
+    let metrics_url = config.metrics_url.as_deref();
+    let mut query_cost = BTreeMap::new();
+
+    let before = scrape_get_counters(&client, metrics_url).await;
     let started = std::time::Instant::now();
     let result = reader
         .series_count(
@@ -4612,13 +4666,28 @@ async fn read_back_once(
         )
         .await;
     let series_count = timed(READBACK_QUERY_SERIES.to_string(), started, result)?;
+    if let Some(before) = before {
+        let after = scrape_get_counters(&client, metrics_url).await;
+        query_cost.insert(
+            READBACK_QUERY_SERIES.to_string(),
+            ReadbackQueryCost::between(before, after, Vec::new()),
+        );
+    }
     let mut sample_count = 0u64;
     for (index, (probe, _)) in plan.float_probes().into_iter().enumerate() {
         let name = format!("{READBACK_QUERY_SAMPLES}.{index}");
         query_windows.insert(name.clone(), window_count);
+        let before = scrape_get_counters(&client, metrics_url).await;
+        let mut stats = Vec::new();
         let started = std::time::Instant::now();
-        let result = reader.windowed_count(&probe.selector, &count_windows).await;
-        sample_count += timed(name, started, result)?;
+        let result = reader
+            .windowed_count(&probe.selector, &count_windows, &mut stats)
+            .await;
+        sample_count += timed(name.clone(), started, result)?;
+        if let Some(before) = before {
+            let after = scrape_get_counters(&client, metrics_url).await;
+            query_cost.insert(name, ReadbackQueryCost::between(before, after, stats));
+        }
     }
     let histogram_series_count = match expected.histogram_series_count {
         Some(_) => {
@@ -4647,7 +4716,9 @@ async fn read_back_once(
         (Some(_), Some(probe)) => {
             query_windows.insert(READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(), window_count);
             let started = std::time::Instant::now();
-            let result = reader.windowed_count(&probe.selector, &count_windows).await;
+            let result = reader
+                .windowed_count(&probe.selector, &count_windows, &mut Vec::new())
+                .await;
             Some(timed(
                 READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(),
                 started,
@@ -4714,7 +4785,147 @@ async fn read_back_once(
         settled_after_ms: 0,
         query_ms,
         query_windows,
+        query_cost,
     })
+}
+
+/// `ravel_store_calls_total{op="get"}` and
+/// `ravel_cache_misses_total{cache="fetch"}`, each summed over every series
+/// of its family that carries the label, or why they could not be read.
+#[derive(Clone, Debug, PartialEq)]
+struct GetCounters(Result<(f64, f64), String>);
+
+/// The GET counters at `metrics_url`; `None` when no URL is configured, so
+/// the caller records no cost.
+async fn scrape_get_counters(
+    client: &reqwest::Client,
+    metrics_url: Option<&str>,
+) -> Option<GetCounters> {
+    let url = metrics_url?;
+    let text = async {
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("GET {url} failed: {e}"))?;
+        let code = response.status();
+        if !code.is_success() {
+            return Err(format!("GET {url} answered {code}"));
+        }
+        response
+            .text()
+            .await
+            .map_err(|e| format!("GET {url} body read failed: {e}"))
+    }
+    .await;
+    Some(GetCounters(text.and_then(|text| get_counters(&text))))
+}
+
+/// The two GET counters of a Prometheus text exposition; a family with no
+/// matching sample is an error, not zero.
+fn get_counters(exposition: &str) -> Result<(f64, f64), String> {
+    let gets = sum_samples(exposition, "ravel_store_calls_total", ("op", "get"));
+    let misses = sum_samples(exposition, "ravel_cache_misses_total", ("cache", "fetch"));
+    match (gets, misses) {
+        (Some(gets), Some(misses)) => Ok((gets, misses)),
+        (gets, _) => Err(format!(
+            "the metrics text carries no {} sample",
+            if gets.is_none() {
+                "ravel_store_calls_total{op=\"get\"}"
+            } else {
+                "ravel_cache_misses_total{cache=\"fetch\"}"
+            }
+        )),
+    }
+}
+
+/// The sum of every `family` sample whose labels include `label`, `None`
+/// when there is none.
+fn sum_samples(exposition: &str, family: &str, label: (&str, &str)) -> Option<f64> {
+    let wanted = format!("{}=\"{}\"", label.0, label.1);
+    let mut total = None;
+    for line in exposition.lines() {
+        let Some(rest) = line.strip_prefix(family) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix('{') else {
+            continue;
+        };
+        let Some((labels, value)) = rest.split_once('}') else {
+            continue;
+        };
+        let carries = labels.split(',').any(|pair| pair.trim() == wanted);
+        let value = value
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f64>().ok());
+        if let (true, Some(value)) = (carries, value) {
+            total = Some(total.unwrap_or(0.0) + value);
+        }
+    }
+    total
+}
+
+/// The per-phase sums of `stats`' `phases` lists; `None` when `stats` is
+/// empty or any answer lacks a phase list or a figure.
+fn phase_totals(stats: &[serde_json::Value]) -> Option<BTreeMap<String, PhaseCost>> {
+    if stats.is_empty() {
+        return None;
+    }
+    let mut totals: BTreeMap<String, PhaseCost> = BTreeMap::new();
+    for answer in stats {
+        for phase in answer.get("phases")?.as_array()? {
+            let figure = |key: &str| phase.get(key).and_then(serde_json::Value::as_u64);
+            let total = totals
+                .entry(phase.get("phase")?.as_str()?.to_string())
+                .or_default();
+            total.s3_get_requests += figure("s3GetRequests")?;
+            total.s3_get_wire_bytes += figure("s3GetWireBytes")?;
+            total.s3_list_requests += figure("s3ListRequests")?;
+        }
+    }
+    Some(totals)
+}
+
+impl ReadbackQueryCost {
+    /// The cost of a query between two scrapes, with the answers' `stats`.
+    fn between(
+        before: GetCounters,
+        after: Option<GetCounters>,
+        stats: Vec<serde_json::Value>,
+    ) -> Self {
+        let phases = phase_totals(&stats);
+        let after = after.unwrap_or(GetCounters(Err("no metrics URL".to_string())));
+        let deltas = match (before.0, after.0) {
+            (Ok((gets0, misses0)), Ok((gets1, misses1))) => {
+                if gets1 < gets0 || misses1 < misses0 {
+                    Err(format!(
+                        "a counter went down across the query (store GETs {gets0} to {gets1}, \
+                         fetch misses {misses0} to {misses1}): the receiver restarted"
+                    ))
+                } else {
+                    Ok(((gets1 - gets0) as i64, (misses1 - misses0) as i64))
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        };
+        match deltas {
+            Ok((store, misses)) => ReadbackQueryCost {
+                stats,
+                phases,
+                process_store_get_delta: Some(store),
+                process_fetch_miss_delta: Some(misses),
+                process_catalog_get_delta: Some(store - misses),
+                process_error: None,
+            },
+            Err(e) => ReadbackQueryCost {
+                stats,
+                phases,
+                process_error: Some(e),
+                ..ReadbackQueryCost::default()
+            },
+        }
+    }
 }
 
 /// The read-back of a plan that holds no point, so has no window to query:
@@ -4742,6 +4953,7 @@ fn empty_window_readback(query_url: String, expected: ReadbackExpected) -> Readb
         settled_after_ms: 0,
         query_ms: BTreeMap::new(),
         query_windows: BTreeMap::new(),
+        query_cost: BTreeMap::new(),
     }
 }
 
@@ -4831,22 +5043,40 @@ impl ApiReader<'_> {
 
     /// The instant vector of `query` at `ts_ms`.
     async fn instant(&self, query: &str, ts_ms: i64) -> Result<Vec<serde_json::Value>, String> {
+        Ok(self.instant_with_stats(query, ts_ms).await?.0)
+    }
+
+    /// The instant vector of `query` at `ts_ms` and the answer's
+    /// `data.stats`, `null` when it carries none.
+    async fn instant_with_stats(
+        &self,
+        query: &str,
+        ts_ms: i64,
+    ) -> Result<(Vec<serde_json::Value>, serde_json::Value), String> {
         let data = self
             .get(
                 "/api/v1/query",
                 &[("query", query.to_string()), ("time", seconds(ts_ms))],
             )
             .await?;
-        data.get("result")
+        let result = data
+            .get("result")
             .and_then(|r| r.as_array())
             .cloned()
-            .ok_or_else(|| "query data has no result array".to_string())
+            .ok_or_else(|| "query data has no result array".to_string())?;
+        Ok((result, data.get("stats").cloned().unwrap_or_default()))
     }
 
     /// The single value of a `count_over_time` instant query; an empty
-    /// result is zero.
-    async fn instant_count(&self, query: &str, ts_ms: i64) -> Result<u64, String> {
-        let result = self.instant(query, ts_ms).await?;
+    /// result is zero. The answer's `data.stats` is pushed onto `stats`.
+    async fn instant_count(
+        &self,
+        query: &str,
+        ts_ms: i64,
+        stats: &mut Vec<serde_json::Value>,
+    ) -> Result<u64, String> {
+        let (result, answer_stats) = self.instant_with_stats(query, ts_ms).await?;
+        stats.push(answer_stats);
         let mut total = 0u64;
         for element in &result {
             let text = element
@@ -4863,14 +5093,21 @@ impl ApiReader<'_> {
     }
 
     /// `count_over_time` of `selector` summed over `windows`, one instant
-    /// query per window at its end; a failure names the window.
-    async fn windowed_count(&self, selector: &str, windows: &[CountWindow]) -> Result<u64, String> {
+    /// query per window at its end; a failure names the window. Each
+    /// window's `data.stats` is pushed onto `stats` in query order.
+    async fn windowed_count(
+        &self,
+        selector: &str,
+        windows: &[CountWindow],
+        stats: &mut Vec<serde_json::Value>,
+    ) -> Result<u64, String> {
         let mut total = 0u64;
         for window in windows {
             let count = self
                 .instant_count(
                     &format!("count_over_time({selector}[{}ms])", window.range_ms),
                     window.end_ms,
+                    stats,
                 )
                 .await
                 .map_err(|e| {
@@ -7815,7 +8052,17 @@ mod tests {
                             };
                             axum::Json(serde_json::json!({
                                 "status": "success",
-                                "data": {"resultType": "vector", "result": result},
+                                "data": {
+                                    "resultType": "vector",
+                                    "result": result,
+                                    "stats": {
+                                        "segmentsFetched": 4,
+                                        "phases": [
+                                            {"phase": "resolve", "s3GetRequests": 2, "s3GetWireBytes": 300, "s3ListRequests": 1},
+                                            {"phase": "scan", "s3GetRequests": 4, "s3GetWireBytes": 9000, "s3ListRequests": 0},
+                                        ],
+                                    },
+                                },
                             }))
                         }
                     },
@@ -8062,6 +8309,7 @@ mod tests {
                     bearer_token: None,
                     timeout_secs: 5,
                     settle_secs: 0,
+                    metrics_url: None,
                 },
                 &outcome.result,
                 &outcome.plan,
@@ -8107,6 +8355,10 @@ mod tests {
                     vec!["series_count: read 4, expected 3".to_string()]
                 );
             }
+            assert!(
+                readback.query_cost.is_empty(),
+                "no metrics URL, no cost: {readback:?}"
+            );
             let seen = seen.lock().expect("lock").clone();
             assert_eq!(seen.len(), 5, "{seen:?}");
             for query in &seen {
@@ -8132,6 +8384,222 @@ mod tests {
                 "the cardinality read names only the metrics sent"
             );
         }
+    }
+
+    /// With a metrics URL, the series read and each samples read record the
+    /// GET counters' change around them and the samples read's `data.stats`
+    /// per window; the series read has no stats. The stub's counters step by
+    /// a fixed amount per scrape, so every delta is exact: two `op="get"`
+    /// series summed (10 + 1) less the fetch misses (3).
+    #[tokio::test]
+    async fn readback_records_query_cost_when_given_a_metrics_url() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let points = class_mix(base_ts_ms());
+        let (addr, server) = serve(write_stub(vec![
+            Canned::ok(Some(ravel_stub_header(1))),
+            Canned::ok(Some(ravel_stub_header(2))),
+            Canned::ok(Some(ravel_stub_header(3))),
+        ]))
+        .await;
+        let config = HttpReplayConfig {
+            receiver: Receiver::Ravel,
+            endpoint: format!("http://{addr}/api/v1/write"),
+            bearer_token: None,
+            tenant: None,
+            batch_size: 3,
+            max_retries: 0,
+            timeout_secs: 5,
+            shards: 1,
+            stall_ceiling: None,
+        };
+        let outcome = replay_over_http_with_plan(&config, &mut SlicePoints::new(&points))
+            .await
+            .expect("replay");
+        server.abort();
+
+        let scrapes = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = query_stub(0, 0, seen).route(
+            "/metrics",
+            axum::routing::get(move || {
+                let k = scrapes.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    format!(
+                        "# TYPE ravel_store_calls_total counter\n\
+                         ravel_store_calls_total{{mode=\"all\",op=\"get\"}} {}\n\
+                         ravel_store_calls_total{{op=\"get\",shard=\"1\"}} {}\n\
+                         ravel_store_calls_total{{mode=\"all\",op=\"put\"}} {}\n\
+                         ravel_cache_misses_total{{cache=\"fetch\"}} {}\n\
+                         ravel_cache_misses_total{{cache=\"list\"}} {}\n",
+                        10 * k,
+                        k,
+                        100 * k,
+                        3 * k,
+                        50 * k
+                    )
+                }
+            }),
+        );
+        let (addr, server) = serve(router).await;
+        let readback = readback_over_http(
+            &ReadbackConfig {
+                query_url: format!("http://{addr}"),
+                bearer_token: None,
+                timeout_secs: 5,
+                settle_secs: 0,
+                metrics_url: Some(format!("http://{addr}/metrics")),
+            },
+            &outcome.result,
+            &outcome.plan,
+        )
+        .await
+        .expect("read back");
+        server.abort();
+        assert!(readback.matches_expected, "{readback:?}");
+        let exact = |stats: Vec<serde_json::Value>, phases| ReadbackQueryCost {
+            stats,
+            phases,
+            process_store_get_delta: Some(11),
+            process_fetch_miss_delta: Some(3),
+            process_catalog_get_delta: Some(8),
+            process_error: None,
+        };
+        let answer = serde_json::json!({
+            "segmentsFetched": 4,
+            "phases": [
+                {"phase": "resolve", "s3GetRequests": 2, "s3GetWireBytes": 300, "s3ListRequests": 1},
+                {"phase": "scan", "s3GetRequests": 4, "s3GetWireBytes": 9000, "s3ListRequests": 0},
+            ],
+        });
+        let phases = BTreeMap::from([
+            (
+                "resolve".to_string(),
+                PhaseCost {
+                    s3_get_requests: 2,
+                    s3_get_wire_bytes: 300,
+                    s3_list_requests: 1,
+                },
+            ),
+            (
+                "scan".to_string(),
+                PhaseCost {
+                    s3_get_requests: 4,
+                    s3_get_wire_bytes: 9000,
+                    s3_list_requests: 0,
+                },
+            ),
+        ]);
+        assert_eq!(
+            readback.query_cost,
+            BTreeMap::from([
+                (READBACK_QUERY_SERIES.to_string(), exact(Vec::new(), None)),
+                ("samples.0".to_string(), exact(vec![answer], Some(phases))),
+            ]),
+            "{readback:?}"
+        );
+        let json = serde_json::to_value(&readback).expect("serializes");
+        assert_eq!(
+            json["query_cost"]["samples.0"]["process_catalog_get_delta"],
+            8
+        );
+        assert_eq!(
+            json["query_cost"]["samples.0"]["phases"]["resolve"]["s3_get_requests"],
+            2
+        );
+        assert!(json["query_cost"]["series"]["phases"].is_null());
+    }
+
+    /// A metrics text missing a family is a scrape error, never a zero delta.
+    #[test]
+    fn get_counters_refuse_a_missing_family() {
+        let text = "ravel_store_calls_total{op=\"get\"} 5\n";
+        let refused = get_counters(text).expect_err("no fetch-miss family");
+        assert!(refused.contains("ravel_cache_misses_total"), "{refused}");
+        let cost = ReadbackQueryCost::between(
+            GetCounters(get_counters(text)),
+            Some(GetCounters(get_counters(text))),
+            Vec::new(),
+        );
+        assert_eq!(cost.process_catalog_get_delta, None);
+        assert!(cost.process_error.is_some());
+        assert_eq!(
+            get_counters(
+                "ravel_store_calls_total_other{op=\"get\"} 5\n\
+                 ravel_store_calls_total{op=\"get\"} 7\n\
+                 ravel_cache_misses_total{cache=\"fetch\"} 2\n"
+            ),
+            Ok((7.0, 2.0))
+        );
+    }
+
+    /// A counter that goes down across the query (the receiver restarted)
+    /// leaves every process-wide figure null with the reason, rather than a
+    /// negative or wrapped delta; the answers' own phases still count.
+    #[test]
+    fn a_counter_reset_nulls_the_process_figures() {
+        let before = "ravel_store_calls_total{op=\"get\"} 50\n\
+                      ravel_cache_misses_total{cache=\"fetch\"} 10\n";
+        let after = "ravel_store_calls_total{op=\"get\"} 4\n\
+                     ravel_cache_misses_total{cache=\"fetch\"} 12\n";
+        let answer = serde_json::json!({"phases": [
+            {"phase": "resolve", "s3GetRequests": 3, "s3GetWireBytes": 10, "s3ListRequests": 1},
+        ]});
+        let cost = ReadbackQueryCost::between(
+            GetCounters(get_counters(before)),
+            Some(GetCounters(get_counters(after))),
+            vec![answer],
+        );
+        assert_eq!(cost.process_store_get_delta, None);
+        assert_eq!(cost.process_fetch_miss_delta, None);
+        assert_eq!(cost.process_catalog_get_delta, None);
+        let reason = cost.process_error.expect("a reason");
+        assert!(reason.contains("counter went down"), "{reason}");
+        assert_eq!(
+            cost.phases.expect("phases")["resolve"],
+            PhaseCost {
+                s3_get_requests: 3,
+                s3_get_wire_bytes: 10,
+                s3_list_requests: 1,
+            }
+        );
+    }
+
+    /// Phases sum across answers by name; one answer without a phase list,
+    /// or a phase without a figure, makes the whole sum null rather than
+    /// partial, and so does no answer at all.
+    #[test]
+    fn phase_totals_sum_answers_and_refuse_a_partial_sum() {
+        let first = serde_json::json!({"phases": [
+            {"phase": "resolve", "s3GetRequests": 2, "s3GetWireBytes": 100, "s3ListRequests": 1},
+            {"phase": "scan", "s3GetRequests": 5, "s3GetWireBytes": 700, "s3ListRequests": 0},
+        ]});
+        let second = serde_json::json!({"phases": [
+            {"phase": "resolve", "s3GetRequests": 1, "s3GetWireBytes": 50, "s3ListRequests": 2},
+        ]});
+        let totals = phase_totals(&[first.clone(), second]).expect("summed");
+        assert_eq!(
+            totals["resolve"],
+            PhaseCost {
+                s3_get_requests: 3,
+                s3_get_wire_bytes: 150,
+                s3_list_requests: 3,
+            }
+        );
+        assert_eq!(totals["scan"].s3_get_requests, 5);
+        assert_eq!(totals.len(), 2);
+        assert_eq!(
+            phase_totals(&[first.clone(), serde_json::json!({"segmentsFetched": 4})]),
+            None
+        );
+        assert_eq!(
+            phase_totals(&[
+                first,
+                serde_json::json!({"phases": [{"phase": "scan", "s3GetRequests": 1}]})
+            ]),
+            None
+        );
+        assert_eq!(phase_totals(&[]), None);
     }
 
     /// The count windows partition `[min_ts, max_ts]`: newest first, each
@@ -8422,6 +8890,7 @@ mod tests {
                 bearer_token: None,
                 timeout_secs: 5,
                 settle_secs: 0,
+                metrics_url: None,
             },
             &outcome.result,
             &outcome.plan,
@@ -8500,6 +8969,7 @@ mod tests {
                         bearer_token: None,
                         timeout_secs: 5,
                         settle_secs,
+                        metrics_url: None,
                     },
                     &outcome.result,
                     &outcome.plan,
