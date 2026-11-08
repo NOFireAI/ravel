@@ -40,7 +40,7 @@
 use std::sync::Arc;
 
 use crate::block::{BytesColRef, DecodedBlock, DictColumn, I64Column};
-use crate::decoded_cache::{DecodedCacheAttach, DecodedEntry, MemoSource, ViewHandle};
+use crate::decoded_cache::{DecodedEntry, MemoSource};
 use crate::dict_values::DictValues;
 use crate::field_dir::FieldDir;
 use crate::record::{
@@ -410,9 +410,6 @@ pub struct ColumnarBlockView<'a> {
     /// The decoded-cache entries the block shares columns with, served or
     /// just admitted.
     pins: &'a [Arc<DecodedEntry>],
-    /// The scan's decoded-cache attach and the block's index in its object,
-    /// for the view handle of a column's memo ([`Self::str_values_memo`]).
-    attach: Option<(&'a DecodedCacheAttach, u32)>,
 }
 
 /// Shape only. Formatting a block's cells would defeat the point of a view that
@@ -443,7 +440,6 @@ impl<'a> ColumnarBlockView<'a> {
             rows,
             served: &[],
             pins: &[],
-            attach: None,
         }
     }
 
@@ -457,35 +453,15 @@ impl<'a> ColumnarBlockView<'a> {
         self
     }
 
-    pub(crate) fn with_attach(
-        mut self,
-        attach: Option<&'a DecodedCacheAttach>,
-        block: u32,
-    ) -> Self {
-        self.attach = attach.map(|a| (a, block));
-        self
-    }
-
     /// The memo slot of string column `column_id`, `Some` only when a
     /// decoded-cache entry holds the very column this block reads, served or
     /// just admitted, and the column can hold a memo: a plain column whose
     /// text the decode validated, or a block's own dictionary built
     /// validated (ADR-3326, zero-copy values amendment, decision 1). A
     /// column a survivor narrowing replaced, a row group dictionary, and any
-    /// column of a scan without a decoded cache read `None`. The source says
-    /// whether the column was served on this read, and carries the handle a
-    /// memo charges views through (ADR-3326, view memo amendment, decisions 4
-    /// and 5).
+    /// column of a scan without a decoded cache read `None`.
     pub fn str_values_memo(&self, column_id: u32) -> Option<MemoSource<'a>> {
-        let source = self.block.memo_source(column_id, self.pins)?;
-        let view = self.attach.map(|(attach, block)| {
-            ViewHandle::new(
-                &attach.cache,
-                attach.key(block, column_id),
-                Arc::clone(&attach.counters),
-            )
-        });
-        Some(source.with_view(self.served.contains(&column_id), view))
+        self.block.memo_source(column_id, self.pins)
     }
 
     /// The block's total row count, before the content predicate.
