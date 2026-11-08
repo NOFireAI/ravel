@@ -2425,3 +2425,12 @@ process. The gate row and the OOM row are the memory gates.
   misses-per-round row gate.
 - Dictionary-block views (URL, q34 and q35) are left to a later amendment, once entries per memo are
   counted (`ValuesLayout::len`).
+
+**Note (2026-11-08): view memo dropped.** The GROUP BY view memo (PR #3966, merge bda687b28) was
+reverted after its paired run (abvm-20261108T1756Z, comment 6725892455) missed both decision rows:
+hot-sum saving -0.181 s against 0.18-0.35 s, 43-statement hot geomean B/A 1.0036 against
+0.9925-0.9963. The investigation (comment 6726313254) measured a plain-page fraction of 0.634 for
+SearchPhrase, a gather on narrowed batches that costs what the cast it replaces costs, and the
+removed cast CPU reappearing in the aggregate's hash probe, so no budget, lifetime or fill timing
+of this mechanism reaches the bands. A wall-time lever on q17 to q19 has to act on the probe, which
+is 5 to 10 times the cast. The code is in git history at 0468e647f for reference.
