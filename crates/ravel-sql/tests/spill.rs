@@ -2537,7 +2537,7 @@ async fn unlimited_and_budget(
         (0, 0),
         "the unlimited run answers on its first attempt"
     );
-    let budget =usize::try_from(unlimited.peak_pool_bytes * percent / 100).expect("fits");
+    let budget = usize::try_from(unlimited.peak_pool_bytes * percent / 100).expect("fits");
     (unlimited, budget)
 }
 
