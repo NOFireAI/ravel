@@ -1299,14 +1299,14 @@ elif op == "stage1-inspect":
 elif op == "stage1-holders":
     # holders.json, the unrouted and the routed pass's diagnostics, the
     # catalog listing the count read, the watermark hour of the snapshot the
-    # passes ran on, the bucket. Per statement, every unrouted record's
+    # listing was taken in, the bucket, and that snapshot's name. Per statement, every unrouted record's
     # segmentsFetched must equal unrouted_fetched_expected (the objects the
     # resolve returns plus those only a min_commit_token adds), and, for a
     # route_bound statement, every routed record's segmentsPrunedByLabelIndex
     # must equal expected_routed_prunes and its keyIndex phase must show a
     # leaf read when the resolve returns an object; prints the stamp. Exit 3
     # and why on stdout when an input cannot be read.
-    holders_path, diag_path, routed_path, list_path, watermark, bucket = args
+    holders_path, diag_path, routed_path, list_path, watermark, bucket, listing_state = args
     try:
         doc = load(holders_path)
         rows = load(diag_path)["ravel_cost"]
@@ -1372,6 +1372,7 @@ elif op == "stage1-holders":
             if unread:
                 leaf_unread.append({"id": sid, "records": unread})
     print(json.dumps({"file": "holders.json", "bucket": bucket, "method": doc.get("method"),
+                      "listing_state": listing_state, "listing_watermark_hour": int(watermark),
                       "objects_listed": len(listed), "objects_above_watermark": above,
                       "objects_l0": doc.get("objects_l0"), "objects_l1": doc.get("objects_l1"),
                       "series_total": doc.get("series_total"),
@@ -2692,8 +2693,12 @@ stage1_holders_step() {
     fail_step stage1-holders "metricsbench_holders exited $code; see ${out_dir}/stage1-holders.log"
   fi
   code=0
+  # The listing is taken after stage1-routed, so it is the routed snapshot's
+  # objects and is compared against that snapshot's watermark.
+  stage1_whole_figure holders stage1.routed_catalog.watermark_hour
   line="$(py stage1-holders "${out_dir}/holders.json" "${out_dir}/stage1-unrouted/diagnostics.json" \
-    "${out_dir}/stage1-routed/diagnostics.json" "$list_file" "$(py get "$STAMPS" stage1.unrouted_catalog.watermark_hour)" "$bucket")" || code=$?
+    "${out_dir}/stage1-routed/diagnostics.json" "$list_file" "$STAGE1_FIGURE" "$bucket" \
+    "routed: listed after stage1-routed, objects_above_watermark against stage1.routed_catalog.watermark_hour")" || code=$?
   if [ "$code" -ne 0 ]; then
     stamp_str stage1.holders "failed: ${line:-stage1-holders exited $code}"
     fail_step stage1-holders "${line:-stage1-holders exited $code}"

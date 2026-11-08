@@ -1094,9 +1094,10 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    is refused (exit 70 naming the step) when the text does not read as one
    HEAD whose part list matches its `parts` line (case z14), when the stamp
    is not written or its `label_value_leaf_parts` does not read back as a
-   whole number (cases z27a, z27c and z27e; the routed pass the same way,
-   cases z27b, z27d and z27f), or when any part carries a `label_value`
-   leaf (case z12). Then `metricsbench_query`
+   whole number (cases z28a, z28c and z28e; the routed pass the same way,
+   cases z28b, z28d and z28f), when its `watermark_hour` or `parts` cannot
+   be read back or is not a whole number (cases z29a to z29d, both passes),
+   or when any part carries a `label_value` leaf (case z12). Then `metricsbench_query`
    against Prometheus and Ravel with the full corpus and
    `--passes`/`--reps`, `--pass-label folded-unrouted` and `--fold-state
    "folded: watermark_hour=W; parts=P; label_value leaf parts=L;
@@ -1159,7 +1160,24 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    `records_pruned_by_label_index` (one above 0) and
    `segments_pruned_by_label_index` (their sum over the records that carry
    one). A difference is recorded and the run still exits 0 (cases z2, z15,
-   z16 and z22); the band file below is the verdict.
+   z16 and z22); the band file below is the verdict. Per routed record
+   that carries `labelIndexValues` (one element per value pass of the
+   label-value route, ADR-3694's per-value amendment), `routed_values` holds
+   `entry`, `rep`, `n` (the passes), `leaf_gets` (their `leafGetRequests`
+   summed), `leaf_cache_hits` (their `leafCacheHits` summed),
+   `covering_parts` (the largest `partsCovered`, since every pass routes the
+   same snapshot), `leaf_gets_bound` ((1 + n) x `covering_parts`),
+   `parts_beyond_ceiling` (their `partsBeyondCeiling` summed) and
+   `name_pruned_alone` (whether a pass whose `labels` include `__name__`
+   pruned a segment alone, `null` with no such pass). `route_values_check`
+   states the rule; `routed_records_with_values`,
+   `routed_records_without_values` (`labelIndexValues` null: the route did
+   not run), `routed_records_values_unreadable` (an element without a
+   `labels` list or a whole-number figure above, counted apart and never
+   read as 0), `statements_leaf_gets_over_bound` (entries with a record
+   whose `leaf_gets` exceeds its bound) and `parts_beyond_ceiling_total`
+   carry the totals (cases z1 and z30). The stamp leaves `routed_values`
+   out and lists the unreadable records by entry.
 7. `stage1-holders`: `ravel-cli catalog list --json` lists the L0 and L1
    data objects the folded snapshot resolves into `stage1-objects.jsonl`;
    the bucket's L0 and L1 data objects (`t/*/m/l0/*.rseg`,
@@ -1169,9 +1187,12 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    On the real-S3 lane the bucket is `<PREFIX>-ravel` (case z11). Exit 70 on
    a failed listing, download or count, or a stamp that cannot read the
    count; on a failed download no count runs (case z10). `stage1.holders` stamps
-   the bucket, the method, `objects_listed`, `objects_above_watermark`
-   (listed objects whose ingest hour is after the unrouted snapshot's
-   `watermark_hour`), `objects_l0`, `objects_l1`, `series_total`,
+   the bucket, the method, `listing_state` (the listing is taken after
+   `stage1-routed`, so it is the routed snapshot's objects) and
+   `listing_watermark_hour` (`stage1.routed_catalog.watermark_hour`, read
+   back as a whole number or the step is refused), `objects_listed`,
+   `objects_above_watermark` (listed objects whose ingest hour is after
+   `listing_watermark_hour`), `objects_l0`, `objects_l1`, `series_total`,
    `min_commit_tokens`, `token_objects` (how many listed objects those
    tokens name), `tokens_unmatched`, per statement `segments_in_window`,
    `named_in_window`, `name_pruned`, `token_only_fetched`,
@@ -1215,8 +1236,9 @@ step and of both Stage 1 passes) carries `entry`, `pass` (the timed pass
 number, from 1), `rep`, `status`, `latency_ms`, and these copied from the
 answer's `data.stats`, each `null` (never 0) when the answer has no such
 member: `accounting`, `phases`, `segmentsFetched`, `segmentsPruned`,
-`segmentsPrunedByDictionary`, `segmentsPrunedByLabelIndex`, `estimate` and
-`io`. Then `pass_label` and `fold_state` as the run passed them, and
+`segmentsPrunedByDictionary`, `segmentsPrunedByLabelIndex`,
+`labelIndexValues` (the label-value route's per-value passes, absent from
+the answer when the route did not run), `estimate` and `io`. Then `pass_label` and `fold_state` as the run passed them, and
 `result_hash`, `blake3:` and the hash of the answer's `resultType` and
 `result` with the series sorted, so two answers with the same series hash
 equal whatever order the engine listed them in, and every value hashed by
@@ -1354,7 +1376,13 @@ against a band file and is the pass/fail for a Stage 1 run.
 `key[field=value]` selects the one element of the list under `key` whose
 `field` equals `value` (`statements[id=mb_selective_job_rate_sum].holders`).
 `min` and `max` are finite numbers or `null` for no bound, at least one set;
-`basis` is required. The band file's `profile` must be the run's. Each
+`basis` is required. The band file's `profile` must be the run's. A figure
+may carry `"when": {"file": F, "path": P, "equals": V}` with V a JSON
+scalar: it is checked only when the value at P in F is V (a Stage 1 arm's
+switch), else printed as `n/a NAME: P is VALUE, not V (FILE PATH)` and not
+counted as a failure; the condition's own value must be present exactly
+once, and a `when` that is not exactly those three keys, or whose `equals`
+is not a scalar, is refused with 65 (the `when` cases). Each
 figure must be present exactly once and inside its band: a missing file,
 key or element is `missing`; a key twice in its object, a selector matching
 two elements, or a figure the band file names twice is `duplicated`; a value
@@ -1380,8 +1408,11 @@ applies; no listed object above the watermark, no statement whose unrouted
 unchecked statement; no route-bound statement whose routed
 `segmentsPrunedByLabelIndex` differs from its `expected_routed_prunes` and
 none unchecked; no routed record of a route-bound statement with a
-non-empty resolved set whose `keyIndex` phase read no leaf; and at least
-one holder for `mb_selective_job_rate_sum`, which is route-bound. The `ci`
+non-empty resolved set whose `keyIndex` phase read no leaf; at least one
+routed record with `labelIndexValues`, none unreadable, no statement whose
+summed leaf GETs exceed (1 + n) x its covering parts and no pass leaving a
+part beyond the router's ceiling (case z30 fails the last three); and at
+least one holder for `mb_selective_job_rate_sum`, which is route-bound. The `ci`
 bands ask for no routed prune: on `ci` every object's LABEL_DICT holds every
 probed value, so the router can prune none (run 42495422937 pruned none and
 read the leaf, 10 and 4 cache hits on two statements). Every basis is a
