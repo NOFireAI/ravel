@@ -16365,6 +16365,27 @@ mod tests {
                 assert_eq!(at(1).unit_core_share(16), 16, "{budget} {ceiling:?}");
                 assert_eq!(at(64).unit_core_share(16), 1, "{budget} {ceiling:?}");
                 assert_eq!(at(0).unit_core_share(16), 16, "{budget} {ceiling:?}");
+                // A shape that fits (a) and (b) at every count up to 16, so
+                // W1 is bounded by the share alone.
+                let shape = Level1Shape {
+                    per_input: 6_900_000,
+                    inputs: 19_177,
+                    block_bytes: 3_000_000,
+                    in_flight: 32_000_000,
+                    run_target: 256 << 20,
+                    part_target: 256 << 20,
+                    ceiling: 5 * GIB,
+                };
+                assert_eq!(
+                    derive_level1_workers(&shape, at(8).unit_core_share(16)),
+                    Some(2),
+                    "{budget} {ceiling:?}"
+                );
+                assert_eq!(
+                    derive_level1_workers(&shape, at(1).unit_core_share(16)),
+                    Some(16),
+                    "{budget} {ceiling:?}"
+                );
             }
             assert_eq!(CompactorConfig::default().unit_concurrency, 1);
         }
