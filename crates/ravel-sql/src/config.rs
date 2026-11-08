@@ -274,7 +274,24 @@ pub struct SpillConfig {
     /// not bytes decoded from them. Exceeding it is
     /// [`crate::SqlError::SpillBudgetExhausted`], never a partial result.
     pub max_bytes: u64,
+    /// Most spill files one merge step reads at once. Default
+    /// [`DEFAULT_SPILL_MERGE_FAN_IN`]; zero is DataFusion's unbounded default,
+    /// and DataFusion raises 1 to 2.
+    pub merge_fan_in: usize,
 }
+
+/// The default [`SpillConfig::merge_fan_in`] (ADR-0954 item 2, issue #3899).
+///
+/// DataFusion 55's multi-level merge is first in, first out, so the scratch
+/// peak is the spilled bytes S plus the largest intermediate merge output, and
+/// with runs of equal size its worst case over every run count is F + 1 runs
+/// at about `1 + F / (F + 1)` times S: 1.67 at 2, the least of any bounded F
+/// (1.89 at 8). A last run smaller than the rest lifts the peak toward twice S
+/// at any F, though never to it. 2 also seats the fewest runs in the merge
+/// that replays a spilled aggregate, leaving the most of the pool to the
+/// re-aggregation behind it; an F at or above the number of runs the pool
+/// seats is the unbounded merge. Zero means unbounded.
+pub const DEFAULT_SPILL_MERGE_FAN_IN: usize = 2;
 
 /// A [`SpillConfig`] could not be read from the environment. Loud on purpose:
 /// a half-set or unparseable spill configuration silently selects a different
@@ -344,6 +361,7 @@ impl SpillConfig {
                 return Ok(Some(SpillConfig {
                     dir: cache_spill_dir(cache_dir.cache_dir, cache_dir.instance_id),
                     max_bytes,
+                    merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
                 }));
             }
             (None, None) => {}
@@ -360,6 +378,7 @@ impl SpillConfig {
         Ok(Some(SpillConfig {
             dir: cache_spill_dir(cache_dir.cache_dir, cache_dir.instance_id),
             max_bytes,
+            merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
         }))
     }
 
@@ -380,6 +399,7 @@ impl SpillConfig {
         Ok(SpillConfig {
             dir: PathBuf::from(dir),
             max_bytes,
+            merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
         })
     }
 }
@@ -890,6 +910,7 @@ mod tests {
             Some(SpillConfig {
                 dir: PathBuf::from("/explicit/spill"),
                 max_bytes: 4096,
+                merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
             })
         );
     }
@@ -1052,6 +1073,7 @@ mod tests {
         let explicit = SpillConfig {
             dir: PathBuf::from("/explicit"),
             max_bytes: 4096,
+            merge_fan_in: 4,
         };
         let config = SqlConfig {
             spill: Some(explicit.clone()),
