@@ -889,6 +889,31 @@ fn parse_audit_token_key(raw: &str) -> anyhow::Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("{AUDIT_TOKEN_KEY_ENV} did not decode to 32 bytes"))
 }
 
+/// `--sql-spill-merge-fan-in`, flattened into [`Cli`].
+#[derive(Debug, clap::Args)]
+pub struct SqlSpillMergeArgs {
+    /// Most spill files one SQL spill merge step reads at once (ADR-0954
+    /// item 2, issue #3899). The scratch peak is the spilled bytes plus the
+    /// largest intermediate merge output. With files of equal size the
+    /// default, 2, has the smallest worst case of any bounded value, about
+    /// 1.67 times the spilled bytes, and any value of 3 or more has a worse
+    /// one (about 1.89 times at 8, with 9 files); a last file smaller than
+    /// the rest lifts the peak toward twice the spilled bytes at any value.
+    /// 2 also leaves the most of the memory pool to the aggregate that
+    /// replays the merged files. `0` is DataFusion's unbounded fan-in, which
+    /// reads as many files at once as the pool seats, and a value at or above
+    /// that number behaves as `0`. `1` is refused at startup. The startup log's `sql_spill_merge_fan_in` line reports the
+    /// value. Meaningful only in a build with the `sql` feature and with
+    /// spill on; inert otherwise.
+    #[arg(
+        long = "sql-spill-merge-fan-in",
+        value_name = "FILES",
+        default_value_t = DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+        value_parser = parse_sql_spill_merge_fan_in
+    )]
+    pub sql_spill_merge_fan_in: usize,
+}
+
 /// Dev binary wiring gateway + ingest + query into one process.
 #[derive(Debug, Parser)]
 #[command(
@@ -2011,26 +2036,11 @@ pub struct Cli {
     #[arg(long = "sql-spill", value_enum, default_value = "auto")]
     pub sql_spill: SqlSpillArg,
 
-    /// Most spill files one SQL spill merge step reads at once (ADR-0954
-    /// item 2, issue #3899). The scratch peak is the spilled bytes plus the
-    /// largest intermediate merge output. With files of equal size the
-    /// default, 2, has the smallest worst case of any bounded value, about
-    /// 1.67 times the spilled bytes, and any value of 3 or more has a worse
-    /// one (about 1.89 times at 8, with 9 files); a last file smaller than
-    /// the rest lifts the peak toward twice the spilled bytes at any value.
-    /// 2 also leaves the most of the memory pool to the aggregate that
-    /// replays the merged files. `0` is DataFusion's unbounded fan-in, which
-    /// reads as many files at once as the pool seats, and a value at or above
-    /// that number behaves as `0`. `1` is refused at startup. The startup log's `sql_spill_merge_fan_in` line reports the
-    /// value. Meaningful only in a build with the `sql` feature and with
-    /// spill on; inert otherwise.
-    #[arg(
-        long = "sql-spill-merge-fan-in",
-        value_name = "FILES",
-        default_value_t = DEFAULT_SQL_SPILL_MERGE_FAN_IN,
-        value_parser = parse_sql_spill_merge_fan_in
-    )]
-    pub sql_spill_merge_fan_in: usize,
+    // A struct of its own so its `Arg` is built in a separate frame: in an
+    // unoptimized build every flag adds about 8 KB to `Cli::augment_args`'s
+    // frame, which already takes about 1.5 MiB of a 2 MiB test thread stack.
+    #[command(flatten)]
+    pub sql_spill_merge: SqlSpillMergeArgs,
 
     /// Object size above which a logs scan reads only the pruning-relevant
     /// blocks of an RLOG object (a suffix probe plus coalesced block-range GETs)
@@ -8176,7 +8186,7 @@ impl Cli {
                         .cache_max_bytes
                         .saturating_add(resolved.catalog_cache_max_bytes)
                 },
-                merge_fan_in: self.sql_spill_merge_fan_in,
+                merge_fan_in: self.sql_spill_merge.sql_spill_merge_fan_in,
             },
             decoded_cache_max_bytes: self.decoded_cache_max_bytes,
         })
@@ -17328,7 +17338,10 @@ mod tests {
             (&["--sql-spill-merge-fan-in", "8"][..], 8),
         ] {
             let parsed = cli(args);
-            assert_eq!(parsed.sql_spill_merge_fan_in, expected, "{args:?}");
+            assert_eq!(
+                parsed.sql_spill_merge.sql_spill_merge_fan_in, expected,
+                "{args:?}"
+            );
             let resolved = resolved_from(&parsed);
             let budgets = parsed.query_budgets(&resolved).expect("budgets resolve");
             assert_eq!(budgets.sql_spill.merge_fan_in, expected, "{args:?}");
