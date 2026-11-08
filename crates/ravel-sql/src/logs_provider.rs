@@ -170,15 +170,6 @@ impl LogsTableProvider {
         }
     }
 
-    /// The view budget of the decoded cache this provider's scans read
-    /// through, 0 without one. Above 0 the session's GROUP BY rule builds
-    /// `GroupKeyViews` (ADR-3326, view memo amendment, decision 5).
-    pub(crate) fn decoded_cache_view_max_bytes(&self) -> u64 {
-        self.fetcher
-            .decoded_cache()
-            .map_or(0, |cache| cache.view_max_bytes())
-    }
-
     /// Route declared-key lookups through the parts' key-index leaves once
     /// per scan (ADR-3692 decision 4). `parts` must come from the resolve that
     /// produced this provider's snapshot; a mismatch fails the lookup.

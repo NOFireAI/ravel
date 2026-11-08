@@ -345,12 +345,12 @@ fn values_memo_charge_covers_the_measured_memo_and_no_more() {
         // The figures `VALUES_MEMO_BYTES`'s doc comment and docs/query-engine.md
         // state: a layout change that moves any of them fails here.
         let (want_len, want_nulls, want_keys, want_live) = match (case, keys) {
-            (Case::PlainText, _) => (ROWS, 0, None, 464),
-            (Case::DictText, false) => (ENTRIES, 0, None, 464),
-            (Case::DictText, true) => (ENTRIES, 0, Some(ROWS), 600),
-            (Case::DictMixed, false) => (ENTRIES, 1, None, 592),
+            (Case::PlainText, _) => (ROWS, 0, None, 432),
+            (Case::DictText, false) => (ENTRIES, 0, None, 432),
+            (Case::DictText, true) => (ENTRIES, 0, Some(ROWS), 568),
+            (Case::DictMixed, false) => (ENTRIES, 1, None, 560),
             // The key path refuses a dictionary with a NULL entry.
-            (Case::DictMixed, true) => (ENTRIES, 1, None, 592),
+            (Case::DictMixed, true) => (ENTRIES, 1, None, 560),
         };
         assert_eq!(
             live, want_live,
