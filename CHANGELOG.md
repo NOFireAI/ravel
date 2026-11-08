@@ -783,10 +783,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Compaction writes new L1 segments at zstd level 3 with the `Estimated`
   page choice** (#3878; ADR-2135, ADR-3492 and ADR-3853 amendments 2026-11-06).
   Every L1 merge path and the erasure rewrite used zstd 9 with `Exhaustive`.
-  On a 230-input, 2.74M-record logs hour, writing parts is about 80% of merge
-  CPU; level 3 cut merge wall time from 173 s to 131 s (-24%) for 1.8% more
-  L1 bytes, and `Estimated` cut encode-thread CPU from 144 s to 102 s (-29%)
-  for 0.6% more bytes. Wide typed tenants give up the 7.1% page-byte saving
+  On one synthetic logs-benchmark hour of 230 inputs and 2.74M records,
+  writing parts is about 80% of merge CPU; level 3 cut merge wall time from
+  173 s to 131 s (-24%) for 1.8% more L1 bytes, and `Estimated` cut
+  encode-thread CPU from 144 s to 102 s (-29%) for 0.6% more bytes.
+  Many-input hours that take the two-level merge are not faster by this
+  figure: phase A run 2 of #3853 already ran with this change and took
+  about 103 min per shard-hour. Wide typed tenants give up the 7.1% page-byte saving
   level 9 measured on them. `--maintain-compaction-zstd-level` and
   `ravel-cli`'s `--compaction-zstd-level` still set the level. Readers are
   unaffected: every encoding and level decodes as before, no format version
