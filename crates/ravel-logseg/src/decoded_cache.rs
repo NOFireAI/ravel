@@ -1113,12 +1113,18 @@ impl DecodedColumnCache {
     /// take back off
     /// (`removing_an_entry_drops_its_views_and_lowers_the_view_total`,
     /// `releasing_a_view_memo_lowers_the_view_total_and_the_budget_by_its_bytes`).
-    /// A memo that reports another figure has its views released through
-    /// [`ValuesMemo::release_extra`], `install`'s result is dropped with the
-    /// reservation it may carry, the fill counts as a refusal and `None` is
-    /// returned; the view total grows only by what the memo still reports
-    /// after that release, so it keeps matching what `Inner::remove` takes off
-    /// (`a_memo_reporting_other_bytes_than_reserved_is_refused`).
+    /// A memo that reports another figure is refused: it is asked to
+    /// [`ValuesMemo::release_extra`], `install`'s result is dropped, the fill
+    /// counts as a refusal and `None` is returned, and the view total grows by
+    /// what the memo still reports after that call, so it keeps matching what
+    /// `Inner::remove` takes off
+    /// (`a_memo_reporting_other_bytes_than_reserved_is_refused`, with a test
+    /// memo). That branch is defensive and unreachable for `ravel-sql`'s
+    /// `StrMemo`, whose extra bytes are the `bytes` it reserved, its rows
+    /// times 16. It assumes a memo that trips it holds the reservation in
+    /// `install`'s result or in what `release_extra` frees; a memo whose
+    /// caller still holds a clone of its views, as `StrMemo`'s does here,
+    /// would keep them, and the reservation with them.
     pub fn reserve_view<T>(
         &self,
         key: &DecodedKey,
