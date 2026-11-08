@@ -860,6 +860,7 @@ mod tests {
         let config = SpillConfig {
             dir: root.path().to_path_buf(),
             max_bytes: 1 << 20,
+            merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
         };
         let scratch = SpillScratch::create(&config).expect("scratch created");
         let dir = scratch.dir().to_path_buf();
@@ -891,6 +892,7 @@ mod tests {
         let config = SpillConfig {
             dir: root.path().to_path_buf(),
             max_bytes: 1 << 20,
+            merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
         };
         let scratch = SpillScratch::create(&config).expect("scratch created");
         let mode = std::fs::metadata(scratch.dir())
@@ -913,6 +915,7 @@ mod tests {
         let config = SpillConfig {
             dir: root.path().to_path_buf(),
             max_bytes: 1 << 20,
+            merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
         };
         let first = SpillScratch::create(&config).expect("first scratch");
         let second = SpillScratch::create(&config).expect("second scratch");
@@ -929,6 +932,7 @@ mod tests {
         let config = SpillConfig {
             dir: missing.clone(),
             max_bytes: 1 << 20,
+            merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
         };
         let err = SpillScratch::create(&config).expect_err("a missing directory must be refused");
         assert!(matches!(err, SqlError::SpillUnavailable(_)));
@@ -1006,6 +1010,7 @@ mod tests {
         let config = SpillConfig {
             dir: root.path().to_path_buf(),
             max_bytes: 1 << 20,
+            merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
         };
         let scratch = SpillScratch::create(&config).expect("scratch created");
         let name = scratch
@@ -1049,6 +1054,7 @@ mod tests {
         let config = SpillConfig {
             dir: file,
             max_bytes: 1 << 20,
+            merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
         };
         let err = SpillScratch::create(&config).expect_err("a file must be refused");
         assert!(matches!(err, SqlError::SpillUnavailable(_)));
@@ -1332,6 +1338,7 @@ mod tests {
         let config = SpillConfig {
             dir: root.path().to_path_buf(),
             max_bytes: 256 * MIB,
+            merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
         };
         let reservation = budget.reserve(256 * MIB).expect("fits");
         let scratch = SpillScratch::create(&config)
