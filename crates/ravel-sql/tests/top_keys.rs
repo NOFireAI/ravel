@@ -546,9 +546,10 @@ async fn the_n_best_keys_carry_every_row_from_every_input_partition() {
 }
 
 /// 100,000 keys, two rows each over four partitions, arriving in descending
-/// order, under a 1 MiB per-query pool. With the rule the final stage holds
-/// at most 20 groups per partition and answers, evicting along the way; with
-/// the rule off it holds every group and the pool refuses the query.
+/// order, under a 1 MiB per-query pool. With the rule each final partition
+/// cuts back to 10 groups whenever a batch takes it to 20 or more, and
+/// answers; with the rule off it holds every group and the pool refuses the
+/// query.
 #[tokio::test]
 async fn eviction_drops_the_groups_state() {
     let sql = "SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k LIMIT 10";
@@ -561,6 +562,7 @@ async fn eviction_drops_the_groups_state() {
     assert_eq!(on.bounds, vec![10], "{}", on.plan);
     assert_eq!(on.rows(), keyed_rows(0..10, 2));
     assert!(on.evictions > 0, "no group was evicted");
+    assert!(on.rebuilds > 0, "no rebuild ran");
     assert!(on.charged < MIB as u64, "charged peak {}", on.charged);
 
     let off = probed(&rule_off(&config), parts(), TIGHT, sql).await;
@@ -654,9 +656,14 @@ async fn null_keys_sort_first_or_last_as_asked() {
 async fn desc_keeps_the_largest_keys() {
     let sql = "SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k DESC LIMIT 10";
     for options in [&[][..], ONE_PARTITION] {
+        let options: Vec<_> = options
+            .iter()
+            .copied()
+            .chain([("datafusion.execution.batch_size", "512")])
+            .collect();
         let (on, off) = on_and_off(
             || keyed_parts(20_000, 4, 3, Arrival::Ascending),
-            options,
+            &options,
             sql,
         )
         .await;
@@ -664,7 +671,7 @@ async fn desc_keeps_the_largest_keys() {
         let want = keyed_rows((19_990..20_000).rev(), 3);
         assert_eq!(on.rows(), want, "{options:?}");
         assert_eq!(off.rows(), want, "{options:?}: rule off");
-        assert!(on.evictions > 0, "{options:?}: no group was evicted");
+        assert!(on.rebuilds > 0, "{options:?}: no rebuild ran");
     }
 }
 
@@ -726,15 +733,16 @@ async fn an_aggregate_filter_leaves_the_plan_unchanged() {
     assert_eq!(off.rows(), want);
 }
 
-/// `(f, k)` in one partition: a `-0.0` row and a `5.0` row, then two `+0.0`
-/// rows, then `7.0` and `8.0`, in batches of two. `-0.0` and `+0.0` are one
-/// group to the aggregate and two sort values to arrow-row.
+/// `(f, k)` in one partition: a `+0.0` row and a `-5.0` row, then two `-0.0`
+/// rows, then `-7.0` and `-8.0`, in batches of two. `-0.0` and `+0.0` are one
+/// group to the aggregate, which stores the key as `+0.0`, and two sort
+/// values to arrow-row, where `-0.0` sorts after `+0.0` in descending order.
 fn signed_zero_parts() -> Vec<Vec<RecordBatch>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("f", DataType::Float64, false),
         Field::new("k", DataType::Int64, false),
     ]));
-    let rows = [(-0.0, 1), (5.0, 2), (0.0, 3), (0.0, 4), (7.0, 5), (8.0, 6)];
+    let rows = [(0.0, 1), (-5.0, 2), (-0.0, 3), (-0.0, 4), (-7.0, 5), (-8.0, 6)];
     vec![
         rows.chunks(2)
             .map(|chunk| {
@@ -748,14 +756,24 @@ fn signed_zero_parts() -> Vec<Vec<RecordBatch>> {
 }
 
 /// A float sort expression, or a non-float one that reads a float key, is
-/// refused. Over [`signed_zero_parts`] the zero group holds three rows.
+/// refused. Over [`signed_zero_parts`] the zero group holds three rows and
+/// is the largest key.
 ///
-/// FLIP (admit float keys): the first rebuild keeps the group under `-0.0`
-/// and sets the threshold there, the `+0.0` rows sort after it and are
-/// dropped, and the group comes back with one row.
+/// FLIP (admit float keys): the first rebuild keeps the zero group, stored
+/// as `+0.0`, and sets the threshold there; the `-0.0` rows sort after it
+/// under `DESC` and are dropped, and the group comes back with one row.
 #[tokio::test]
 async fn float_sort_keys_leave_the_plan_unchanged() {
+    let sql = "SELECT f, count(*) FROM t GROUP BY f ORDER BY f DESC LIMIT 1";
+    let options = [ONE_PARTITION, TIGHT].concat();
+    let (on, _) = on_and_off(signed_zero_parts, &options, sql).await;
+    assert_eq!(
+        on.rows(),
+        vec![vec!["0.0".to_string(), "3".to_string()]],
+        "the zero group holds every zero row"
+    );
     for sql in [
+        "SELECT f, count(*) FROM t GROUP BY f ORDER BY f DESC LIMIT 1",
         "SELECT f, count(*) FROM t GROUP BY f ORDER BY f LIMIT 1",
         "SELECT f, count(*) FROM t GROUP BY f ORDER BY CAST(f AS BIGINT) LIMIT 1",
         "SELECT k, count(*) FROM t GROUP BY k ORDER BY CAST(k AS DOUBLE) LIMIT 1",
@@ -764,13 +782,6 @@ async fn float_sort_keys_leave_the_plan_unchanged() {
         assert!(on.bounds.is_empty(), "{sql}\n{}", on.plan);
         assert_eq!(on.rows(), off.rows(), "{sql}");
     }
-    let sql = "SELECT f, count(*) FROM t GROUP BY f ORDER BY f LIMIT 1";
-    let options = [ONE_PARTITION, TIGHT].concat();
-    let (on, _) = on_and_off(signed_zero_parts, &options, sql).await;
-    let rows = on.rows();
-    assert_eq!(rows.len(), 1);
-    assert!(["-0.0", "0.0"].contains(&rows[0][0].as_str()), "{rows:?}");
-    assert_eq!(rows[0][1], "3", "the zero group holds every zero row");
 }
 
 const HOURS: i64 = 100;
@@ -829,46 +840,66 @@ async fn a_sort_over_a_function_of_the_key_is_admitted() {
     assert_eq!(hours, want);
 }
 
-/// `(k, k2)` in one partition: `k2 = j` for `j` in 0..200 holds `200 - j`
-/// rows, so ordering by the count reverses the order of the key; `k` is the
-/// row number.
+/// `(k, k2)` over four partitions: `k2 = j` for `j` in 0..200 holds
+/// `200 - j` rows, so ordering by the count reverses the order of the key;
+/// `k` is the row number, and row `k` is in partition `k mod 4`.
 fn renamed_parts() -> Vec<Vec<RecordBatch>> {
     let schema = int64_schema(&["k", "k2"], false);
-    let mut rows = Vec::new();
+    let mut rows: Vec<Vec<Vec<Option<i64>>>> = vec![Vec::new(); 4];
+    let mut k = 0;
     for j in 0..200 {
         for _ in 0..200 - j {
-            rows.push(vec![Some(rows.len() as i64), Some(j)]);
+            rows[k as usize % 4].push(vec![Some(k), Some(j)]);
+            k += 1;
         }
     }
-    vec![int64_batches(&schema, &rows, 1024)]
+    rows.iter()
+        .map(|part| int64_batches(&schema, part, 1024))
+        .collect()
 }
 
 /// A sort on an aggregate, or on a column that carries a key's name and
-/// holds an aggregate, does not resolve to a group key.
+/// holds an aggregate, does not resolve to a group key. On the default
+/// session the renaming projection sits between the sort and the final
+/// aggregate, under the `CoalescePartitionsExec`, so the walk reads the sort
+/// through it.
 ///
 /// FLIP (the projection step resolves a column by its name in the
 /// projection's input): `count(*) AS k2 ... ORDER BY k2` resolves to the key
-/// `k2`, and the exec keeps the ten smallest keys, which hold the largest
-/// counts.
+/// `k2`, each final partition keeps its ten smallest keys, which hold the
+/// largest counts, and the ten smallest counts are missing from the answer.
 #[tokio::test]
 async fn a_sort_over_an_aggregate_or_a_renamed_non_key_leaves_the_plan_unchanged() {
+    let want: Vec<Vec<String>> = (190..200)
+        .rev()
+        .map(|j| vec![(200 - j).to_string(), j.to_string()])
+        .collect();
+    for options in [&[][..], ONE_PARTITION] {
+        let sql = "SELECT count(*) AS k2, k2 AS c FROM t GROUP BY k2 ORDER BY k2 LIMIT 10";
+        let (on, _) = on_and_off(renamed_parts, options, sql).await;
+        assert_eq!(on.rows(), want, "{options:?}\n{}", on.plan);
+    }
     for sql in [
         "SELECT k2, count(*) AS c FROM t GROUP BY k2 ORDER BY c LIMIT 10",
         "SELECT k2, sum(k) FROM t GROUP BY k2 ORDER BY sum(k) DESC LIMIT 10",
         "SELECT count(*) AS k2, k2 AS c FROM t GROUP BY k2 ORDER BY k2 LIMIT 10",
         "SELECT count(*) AS k, k2 AS c FROM t GROUP BY k2 ORDER BY k LIMIT 10",
     ] {
-        let (on, off) = on_and_off(renamed_parts, ONE_PARTITION, sql).await;
-        assert!(on.bounds.is_empty(), "{sql}\n{}", on.plan);
-        assert_eq!(on.rows(), off.rows(), "{sql}");
+        for options in [&[][..], ONE_PARTITION] {
+            let (on, off) = on_and_off(renamed_parts, options, sql).await;
+            assert!(on.bounds.is_empty(), "{sql}\n{}", on.plan);
+            assert_eq!(on.rows(), off.rows(), "{sql}");
+        }
     }
     let sql = "SELECT count(*) AS k2, k2 AS c FROM t GROUP BY k2 ORDER BY k2 LIMIT 10";
-    let (on, _) = on_and_off(renamed_parts, ONE_PARTITION, sql).await;
-    let want: Vec<Vec<String>> = (190..200)
-        .rev()
-        .map(|j| vec![(200 - j).to_string(), j.to_string()])
-        .collect();
-    assert_eq!(on.rows(), want);
+    let (pool, _breach) = SqlConfig::default()
+        .query_pool(TenantMemoryAccountant::new(1 << 30), QueryAccounting::new());
+    let ctx = session(&SqlConfig::default(), pool, renamed_parts(), &[]);
+    let plan = render(&plan_of(&ctx, sql).await);
+    let projection = plan.find("ProjectionExec").expect("a projection");
+    let aggregate = plan.find("AggregateExec").expect("an aggregate");
+    let sort = plan.find("SortExec").expect("a sort");
+    assert!(sort < projection && projection < aggregate, "{plan}");
 }
 
 /// Every key of [`keyed_parts`] arriving in the adversarial order for the
@@ -893,6 +924,7 @@ async fn the_exec_bounds_the_final_stages_charged_peak() {
                 on.charged, on.envelope, off.charged, off.envelope
             );
             assert_eq!(on.bounds, vec![10], "{}", on.plan);
+            assert!(on.rebuilds > 0, "{direction} {arrival:?}: no rebuild ran");
             assert_eq!(on.rows(), want, "{direction} {arrival:?}");
             assert_eq!(off.rows(), want, "{direction} {arrival:?}: rule off");
             assert!(
