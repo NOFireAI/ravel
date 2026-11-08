@@ -390,6 +390,7 @@ fn readback(query_url: &str) -> Readback {
         settled_after_ms: 0,
         query_ms: Default::default(),
         query_windows: Default::default(),
+        query_cost: Default::default(),
     }
 }
 

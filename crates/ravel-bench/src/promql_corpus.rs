@@ -671,6 +671,52 @@ struct Selector {
     argument_of: Option<String>,
 }
 
+/// A vector selector of a corpus statement, as `metricsbench_holders` reads it
+/// to count the data objects holding a matching series without Ravel's
+/// router (issue #3968).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectorMatch {
+    /// The selector as written, metric name through closing brace.
+    pub text: String,
+    /// The metric name.
+    pub metric: String,
+    /// The selector's `label="value"` matchers with a non-empty value, in
+    /// the order written; the metric name is not among them.
+    pub positive_equalities: Vec<(String, String)>,
+    matchers: Vec<Matcher>,
+}
+
+impl SelectorMatch {
+    /// Whether a series with `labels` (its `__name__` included) is selected:
+    /// its metric name is the selector's and every matcher holds, a label
+    /// the series lacks reading as the empty value.
+    pub fn matches(&self, labels: &[(String, String)]) -> bool {
+        labels
+            .iter()
+            .any(|(name, value)| name == "__name__" && *value == self.metric)
+            && self.matchers.iter().all(|m| m.matches(labels))
+    }
+}
+
+/// Every vector selector of `promql`, refused as [`read_selectors`] refuses
+/// what it does not handle.
+pub fn selector_matches(promql: &str) -> Result<Vec<SelectorMatch>, String> {
+    Ok(read_selectors(promql)?
+        .into_iter()
+        .map(|selector| SelectorMatch {
+            positive_equalities: selector
+                .matchers
+                .iter()
+                .filter(|m| m.op == MatchOp::Eq && !m.value.is_empty())
+                .map(|m| (m.label.clone(), m.value.clone()))
+                .collect(),
+            text: selector.text,
+            metric: selector.metric,
+            matchers: selector.matchers,
+        })
+        .collect())
+}
+
 const MODIFIER_KEYWORDS: &[&str] = &[
     "by",
     "without",

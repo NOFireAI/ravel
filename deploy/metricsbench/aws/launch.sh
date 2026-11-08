@@ -10,7 +10,12 @@
 # Required environment: MB_RESULTS_BUCKET, MB_SUBNET_ID, MB_SECURITY_GROUP_ID,
 # MB_INSTANCE_PROFILE. Optional: MB_PROFILE (cardinality), MB_INSTANCE_TYPE
 # (m6a.4xlarge), MB_CAP_MIN (2160), MB_VOLUME_GB (150), MB_RSS_BAND,
-# MB_OBJECTS_BAND, MB_REPO (this checkout). AWS_PROFILE and AWS_REGION select
+# MB_OBJECTS_BAND, MB_REPO (this checkout), MB_STAGE1 (1 runs run.sh's ADR-3694
+# Stage 1 steps after the measured profile's folded read-back and after the ci
+# smoke's, cardinality or ci only), MB_STAGE1_BANDS (the measured run's Stage 1
+# band file, a path relative to the repository that must exist at the harness
+# commit; required with MB_STAGE1=1 for any profile but ci, which defaults to
+# deploy/metricsbench/stage1-bands.ci.json). AWS_PROFILE and AWS_REGION select
 # the account and region as for any aws CLI call.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -35,6 +40,27 @@ if [ "$profile" != cardinality ] && { [ -z "${MB_RSS_BAND:-}" ] || [ -z "${MB_OB
   echo "MB_PROFILE=$profile needs MB_RSS_BAND and MB_OBJECTS_BAND set for it; the defaults are cardinality's" >&2
   exit 64
 fi
+# run.sh refuses the same values, but only after the box has built the
+# harness and run the ci smoke.
+stage1=${MB_STAGE1:-}
+case "$stage1" in
+  ''|0) stage1="" ;;
+  1) case "$profile" in
+       cardinality|ci) ;;
+       *) echo "MB_STAGE1=1 runs on the cardinality and ci profiles only, not MB_PROFILE=$profile" >&2; exit 64;;
+     esac ;;
+  *) echo "MB_STAGE1 must be 1, 0 or unset, not '$stage1'" >&2; exit 64;;
+esac
+# box-run.sh refuses the same, but only after the box has booted.
+stage1_bands=${MB_STAGE1_BANDS:-}
+if [ -n "$stage1" ] && [ "$profile" != ci ] && [ -z "$stage1_bands" ]; then
+  echo "MB_STAGE1=1 with MB_PROFILE=$profile needs MB_STAGE1_BANDS, a band file pre-registered for that profile" >&2
+  exit 64
+fi
+if [ -n "$stage1_bands" ] && [ -z "$stage1" ]; then
+  echo "MB_STAGE1_BANDS is set but MB_STAGE1 is not 1" >&2
+  exit 64
+fi
 rss_band=${MB_RSS_BAND:-prometheus:2147483648:6442450944}
 objects_band=${MB_OBJECTS_BAND:-14000:16500}
 boxrun="$here/box-run.sh"
@@ -44,6 +70,11 @@ region=${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/nul
 git -C "$repo" cat-file -e "${harness_commit}^{commit}" || { echo "unknown commit $harness_commit" >&2; exit 64; }
 harness_sha=$(git -C "$repo" rev-parse "$harness_commit")
 short=$(git -C "$repo" rev-parse --short=9 "$harness_commit")
+if [ -n "$stage1_bands" ] &&
+  [ "$(git -C "$repo" cat-file -t "${harness_sha}:${stage1_bands}" 2>/dev/null)" != blob ]; then
+  echo "MB_STAGE1_BANDS=$stage1_bands is not a file at $harness_commit" >&2
+  exit 64
+fi
 # run.sh refuses a --ravel-source-commit that is not a full 40-character id,
 # and only after the box has built the harness, so resolve it here.
 if git -C "$repo" cat-file -e "${ravel_source_commit}^{commit}" 2>/dev/null; then
@@ -70,7 +101,7 @@ env_block=$(
     "BOXRUN_SHA256=${boxrun_sha256}" "HARNESS_COMMIT=${harness_sha}" "RAVEL_IMAGE=${ravel_image}" \
     "RAVEL_SOURCE_COMMIT=${ravel_source_commit}" "ANCHOR_MS=${anchor_ms}" "PROFILE=${profile}" \
     "RSS_BAND=${rss_band}" "OBJECTS_BAND=${objects_band}" "REAL_S3_PREFIX=${real_s3_prefix}" \
-    "AWS_DEFAULT_REGION=${region}"; do
+    "STAGE1=${stage1}" "STAGE1_BANDS=${stage1_bands}" "AWS_DEFAULT_REGION=${region}"; do
     printf '%s=%q\n' "${kv%%=*}" "${kv#*=}"
   done
 )
