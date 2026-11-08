@@ -30,13 +30,15 @@ pub use kidx::{
     KeyIndexBucketRange, KeyIndexKeyAnswer, KeyIndexLeafBreach, KeyIndexLeafEncodeError,
     KeyIndexLeafEntry, KeyIndexLeafError, KeyIndexLeafInput, KeyIndexLeafLimits,
     KeyIndexLeafPrefix, KeyIndexLeafProbe, KeyIndexLeafRejection, KeyIndexLeafRequest,
-    KeyIndexLeafSummary, KeyIndexMatch, KeyIndexSetAnswer, KeyIndexSetDecline, KeyIndexSetPolicy,
-    KeyIndexSetProbe, KeyIndexSlice, check_key_index_leaf_set, choose_key_index_bucket_bits,
+    KeyIndexLeafSummary, KeyIndexMatch, KeyIndexSetAnswer, KeyIndexSetDecline, KeyIndexSetDecoder,
+    KeyIndexSetPlan, KeyIndexSetPolicy, KeyIndexSetProbe, KeyIndexSetRunError, KeyIndexSetRuns,
+    KeyIndexSlice, LEAF_READ_CONCURRENCY, check_key_index_leaf_set, choose_key_index_bucket_bits,
     decoded_bound, encode_key_index_leaf, encode_key_index_leaf_with_bucket_bits,
     encoded_entry_len, key_index_leaf_format_version, key_index_leaf_prefix_range,
-    key_index_leaf_version_accepted, key_index_root_shape, probe_key_index_leaf_ranged,
-    probe_key_index_leaf_set_ranged, restamp_key_index_leaf_version, select_key_index_slice,
-    split_key_index_entries, verify_key_index_leaf, verify_key_index_leaf_frames,
+    key_index_leaf_version_accepted, key_index_root_shape, plan_key_index_leaf_set,
+    probe_key_index_leaf_ranged, probe_key_index_leaf_set_ranged, read_key_index_set_runs,
+    restamp_key_index_leaf_version, select_key_index_slice, split_key_index_entries,
+    verify_key_index_leaf, verify_key_index_leaf_frames,
 };
 pub use part::{DecodedPart, decode_part, decode_part_header, encode_part, encode_part_ranged};
 pub use postings::{
