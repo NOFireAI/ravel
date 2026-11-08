@@ -2476,7 +2476,7 @@ Only the first gauge describes behaviour. The next eight repeat the
 limits refuse past their lane with 503, and `max_mailbox`, `max_receipts`
 and `max_timers` refuse past their cap with a typed error counted in
 `ravel_agents_budget_refusals_total{cap}`. `memory_budget_bytes`,
-`max_agents` and `max_state_bytes` are reported only in this release.
+`max_agents` and `max_state_bytes` are reported only; nothing enforces them.
 
 | Metric | Meaning |
 |---|---|
@@ -2538,14 +2538,6 @@ A rising `lag_max` with a rising `sink_failures_total` is an outage of the
 receiving ingest path; a rising `records_rejected_total` is data that will
 never be projected and needs no retry.
 
-Test: `metrics_scrape_reports_every_agents_family_once_with_the_mode_label`
-and `snapshot_enabled_follows_the_mount_flag` in `services/ravel-server`; the
-projection family by `projection_metrics_scrape_matches_health_after_an_outage`
-in `agents_projection_e2e`; the sweep counters by `sweep_route_counts_match_the_store_and_needs_agents_admin`
-in the `agents_timers_e2e` test binary; the evidence counter by
-`a_late_result_the_full_evidence_index_drops_is_counted` in
-`agents_effects_e2e`.
-
 ### Ravel Agents capacity
 
 How close agents are to the lifetime caps that make them refuse work
@@ -2573,18 +2565,6 @@ label.
 Alert on `ravel_agents_agents_near_cap{list="receipts"} > 0` to find agents
 that should be destroyed and recreated before they refuse sends; the state
 route's `usage` names the counts for one agent.
-
-Test: the four families with exact values on the real `/metrics`, the
-refusal's `cap` and the state route's `usage` by
-`a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter` in the
-`agents_timers_e2e` test binary; the maximum, the sealed-page basis, the
-75% count and the absence of extra requests by
-`a_directory_cycle_publishes_the_highest_fill_and_the_near_cap_counts` in
-`ravel-agents-runtime`; publication at the end of a cycle by
-`the_fill_is_published_only_when_a_directory_cycle_completes`; one count
-per refusal under the right cap, for all five caps, by
-`each_cap_refusal_moves_its_counter_by_exactly_one`, and none for a
-per-command bound by `a_per_command_refusal_is_not_counted_as_a_cap`.
 
 ### SQL DDL statements and their store cost (`ravel_sql_ddl_*`)
 
