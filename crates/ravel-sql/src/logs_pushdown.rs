@@ -177,8 +177,9 @@
 //! column declared without `key_index` yields no key and costs no KEY_IDX
 //! read. The plan probes each candidate object's KEY_IDX section with the
 //! kept keys; an object whose section does not index the field under that
-//! key type declines for that key. `OR` is not handled: a disjunction of
-//! equalities contributes no key.
+//! key type declines for that key. An equality under `OR` is no equality
+//! arm; a same-column disjunction of equalities is read as an `IN` list
+//! below.
 //!
 //! # Exact-key `IN` lists (ADR-3692 decision 6)
 //!
@@ -188,11 +189,18 @@
 //! binary or 32-character hex literals when `index_trace_id` is set. One
 //! field, 1 to 1,024 distinct values. A `NOT IN`, a mixed-type list, a list
 //! holding a NULL or an expression, more than 1,024 distinct values, and a
-//! list under `OR` carry no key; a declared I64 list keeps its envelope
+//! list nested under `OR` carry no key; a declared I64 list keeps its envelope
 //! `NumRange` arm either way. The first such list of the conjunction is
 //! kept; a second contributes nothing. DataFusion rewrites a list of at most
 //! three values into `=` disjuncts before the scan sees it (one value into a
-//! plain `=`, which is an equality arm), and a disjunction carries no key.
+//! plain `=`, which is an equality arm). A top-level `OR` whose every arm, at
+//! any nesting, is `=` between one bare column and a literal is read as the
+//! `IN` list of those literals, through the same validation, so it carries
+//! the list's key set (`a_two_value_key_disjunction_is_a_key_set`). An arm on
+//! a second column, a non-equality arm, or a literal the list would refuse
+//! leaves the disjunction without a key
+//! (`a_disjunction_across_two_key_columns_carries_no_key`,
+//! `a_non_equality_arm_carries_no_key`).
 //! The arm is `Inexact`: the residual re-applies the list over full values.
 //!
 //! A row whose attribute is stored under another type than the declared one
@@ -420,7 +428,8 @@ fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
 }
 
 /// The first top-level `IN` conjunct of `expr` that [`key_in_list`] reads,
-/// into [`LogsPushdown::key_in`] when it is still empty.
+/// or the first `OR` conjunct [`key_in_disjunction`] reads, into
+/// [`LogsPushdown::key_in`] when it is still empty.
 fn collect_key_in(
     expr: &Expr,
     out: &mut LogsPushdown,
@@ -436,8 +445,47 @@ fn collect_key_in(
             collect_key_in(right, out, declared, key_index);
         }
         Expr::InList(il) => out.key_in = key_in_list(il, declared, key_index),
+        Expr::BinaryExpr(be) if be.op == Operator::Or => {
+            out.key_in = key_in_disjunction(be, declared, key_index);
+        }
         _ => {}
     }
+}
+
+/// `col = v1 OR col = v2 [OR ...]`, at any nesting of `OR`, read by
+/// [`key_in_list`] as the `IN` list it is equal to: the shape DataFusion
+/// rewrites a list of at most three values into. `None` when an arm is not an
+/// `=` with a bare column on one side, or names another column than the first
+/// arm; [`key_in_list`] refuses every literal it would refuse in a list.
+fn key_in_disjunction(
+    be: &BinaryExpr,
+    declared: &[DeclaredColumn],
+    key_index: &KeyIndexDeclaration,
+) -> Option<KeyIn> {
+    let mut arms = Vec::new();
+    flatten_or(&be.left, &mut arms);
+    flatten_or(&be.right, &mut arms);
+    let mut column: Option<&Expr> = None;
+    let mut list = Vec::with_capacity(arms.len());
+    for arm in arms {
+        let Expr::BinaryExpr(eq) = arm else {
+            return None;
+        };
+        if eq.op != Operator::Eq {
+            return None;
+        }
+        let (c, v) = match (eq.left.as_ref(), eq.right.as_ref()) {
+            (c @ Expr::Column(_), v) | (v, c @ Expr::Column(_)) => (c, v),
+            _ => return None,
+        };
+        match column {
+            Some(first) if first != c => return None,
+            _ => column = Some(c),
+        }
+        list.push(v.clone());
+    }
+    let il = InList::new(Box::new(column?.clone()), list, false);
+    key_in_list(&il, declared, key_index)
 }
 
 /// `column IN (literals)` as a KEY_IDX key set: a declared key-index column
@@ -2124,5 +2172,244 @@ mod tests {
         );
         assert_eq!(p.key_equals.len(), 1);
         assert_eq!(p.key_in.map(|k| k.keys().len()), Some(4));
+    }
+
+    /// `keyed_decl` plus `retries`, a second I64 key-index column, and
+    /// `latency_ms`, an I64 column declared outside the key index.
+    fn two_key_decl() -> (Vec<DeclaredColumn>, KeyIndexDeclaration) {
+        let mut d = keyed_decl();
+        d.push(DeclaredColumn::new("retries", DeclaredType::I64));
+        d.push(DeclaredColumn::new("latency_ms", DeclaredType::I64));
+        let mut k = all_indexed();
+        k.columns.push("retries".to_string());
+        (d, k)
+    }
+
+    /// The key set the `IN` list `column IN (values)` carries.
+    fn in_list_key(column: &str, values: Vec<Expr>) -> Option<KeyIn> {
+        keyed(&[col(column).in_list(values, false)], &keyed_decl()).key_in
+    }
+
+    fn trace_hex() -> Expr {
+        lit("00112233445566778899aabbccddeeff")
+    }
+
+    fn trace_bin() -> Expr {
+        lit(ScalarValue::FixedSizeBinary(16, Some(vec![7u8; 16])))
+    }
+
+    /// `col = a OR col = b` carries exactly the key set of `col IN (a, b)`, in
+    /// either operand order, on an I64, Str and Bytes key column and on
+    /// `trace_id` with one hex and one binary id, also under a sibling `AND`.
+    #[test]
+    fn a_two_value_key_disjunction_is_a_key_set() {
+        let d = keyed_decl();
+        let digest_a = lit(ScalarValue::Binary(Some(vec![0xde, 0xad])));
+        let digest_b = lit(ScalarValue::Binary(Some(vec![0xbe, 0xef])));
+        let cases = [
+            (
+                or(
+                    col("status_code").eq(lit(500i64)),
+                    col("status_code").eq(lit(404i64)),
+                ),
+                in_list_key("status_code", vec![lit(500i64), lit(404i64)]),
+            ),
+            (
+                or(
+                    lit(500i64).eq(col("status_code")),
+                    col("status_code").eq(lit(404i64)),
+                ),
+                in_list_key("status_code", vec![lit(500i64), lit(404i64)]),
+            ),
+            (
+                or(col("region").eq(lit("eu")), lit("us").eq(col("region"))),
+                in_list_key("region", vec![lit("eu"), lit("us")]),
+            ),
+            (
+                or(
+                    col("digest").eq(digest_a.clone()),
+                    col("digest").eq(digest_b.clone()),
+                ),
+                in_list_key("digest", vec![digest_a, digest_b]),
+            ),
+            (
+                or(
+                    col(TRACE_ID_FIELD).eq(trace_hex()),
+                    col(TRACE_ID_FIELD).eq(trace_bin()),
+                ),
+                in_list_key(TRACE_ID_FIELD, vec![trace_hex(), trace_bin()]),
+            ),
+        ];
+        for (e, want) in cases {
+            let want = want.expect("the IN list carries a key set");
+            assert_eq!(want.keys().len(), 2, "{e}");
+            let p = keyed(std::slice::from_ref(&e), &d);
+            assert_eq!(p.key_in.as_ref(), Some(&want), "{e}");
+            assert!(p.key_equals.is_empty(), "{e}");
+            let under_and = and(col("ts").gt_eq(ts_lit(1)), e.clone());
+            assert_eq!(keyed(&[under_and], &d).key_in, Some(want), "{e}");
+        }
+        let k = keyed(
+            &[or(
+                col(TRACE_ID_FIELD).eq(trace_hex()),
+                col(TRACE_ID_FIELD).eq(trace_bin()),
+            )],
+            &d,
+        )
+        .key_in
+        .expect("trace set");
+        assert_eq!(k.key_type(), KeyType::Id16);
+    }
+
+    /// Three equalities on one key column, in either nesting of `OR`, carry
+    /// exactly the key set of the three-value `IN` list.
+    #[test]
+    fn a_three_value_key_disjunction_is_a_key_set() {
+        let d = keyed_decl();
+        let eq = |v: i64| col("status_code").eq(lit(v));
+        let want = in_list_key("status_code", vec![lit(1i64), lit(2i64), lit(3i64)])
+            .expect("the IN list carries a key set");
+        assert_eq!(want.keys().len(), 3);
+        for e in [or(or(eq(1), eq(2)), eq(3)), or(eq(1), or(eq(2), eq(3)))] {
+            assert_eq!(
+                keyed(std::slice::from_ref(&e), &d).key_in.as_ref(),
+                Some(&want),
+                "{e}"
+            );
+        }
+        let teq = |l: Expr| col(TRACE_ID_FIELD).eq(l);
+        let third = lit(ScalarValue::Binary(Some(vec![9u8; 16])));
+        let want = in_list_key(
+            TRACE_ID_FIELD,
+            vec![trace_hex(), trace_bin(), third.clone()],
+        )
+        .expect("the trace list carries a key set");
+        assert_eq!(want.keys().len(), 3);
+        let e = or(teq(trace_hex()), or(teq(trace_bin()), teq(third)));
+        assert_eq!(keyed(&[e], &d).key_in, Some(want));
+    }
+
+    /// Equalities on two different key-index columns of one type carry no key.
+    #[test]
+    fn a_disjunction_across_two_key_columns_carries_no_key() {
+        let (d, k) = two_key_decl();
+        for e in [
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("retries").eq(lit(2i64)),
+            ),
+            or(
+                or(
+                    col("status_code").eq(lit(1i64)),
+                    col("status_code").eq(lit(2i64)),
+                ),
+                col("retries").eq(lit(3i64)),
+            ),
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("region").eq(lit("eu")),
+            ),
+        ] {
+            let p = extract_logs_keyed(std::slice::from_ref(&e), &d, &k);
+            assert!(p.key_in.is_none(), "{e}");
+        }
+    }
+
+    /// An arm on a column outside the key index carries no key.
+    #[test]
+    fn a_disjunction_with_a_non_key_arm_carries_no_key() {
+        let (d, k) = two_key_decl();
+        for e in [
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("latency_ms").eq(lit(2i64)),
+            ),
+            or(
+                col("latency_ms").eq(lit(1i64)),
+                col("status_code").eq(lit(2i64)),
+            ),
+            or(col("status_code").eq(lit(1i64)), col("body").eq(lit("x"))),
+        ] {
+            let p = extract_logs_keyed(std::slice::from_ref(&e), &d, &k);
+            assert!(p.key_in.is_none(), "{e}");
+        }
+    }
+
+    /// An arm other than `=` carries no key.
+    #[test]
+    fn a_non_equality_arm_carries_no_key() {
+        let d = keyed_decl();
+        for e in [
+            or(
+                col("status_code").gt(lit(1i64)),
+                col("status_code").eq(lit(2i64)),
+            ),
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("status_code").lt_eq(lit(2i64)),
+            ),
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("status_code").not_eq(lit(2i64)),
+            ),
+            or(
+                col("status_code").eq(lit(1i64)),
+                and(
+                    col("status_code").eq(lit(2i64)),
+                    col("region").eq(lit("eu")),
+                ),
+            ),
+        ] {
+            assert!(keyed(std::slice::from_ref(&e), &d).key_in.is_none(), "{e}");
+        }
+    }
+
+    /// A NULL literal, a mixed-type literal and a wrong-width trace id each
+    /// leave the disjunction without a key.
+    #[test]
+    fn a_refused_literal_leaves_the_disjunction_without_a_key() {
+        let d = keyed_decl();
+        let short = lit(ScalarValue::Binary(Some(vec![7u8; 8])));
+        for e in [
+            or(
+                col("status_code").eq(lit(ScalarValue::Int64(None))),
+                col("status_code").eq(lit(2i64)),
+            ),
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("status_code").eq(lit("2")),
+            ),
+            or(
+                col(TRACE_ID_FIELD).eq(trace_bin()),
+                col(TRACE_ID_FIELD).eq(short),
+            ),
+            or(
+                col(TRACE_ID_FIELD).eq(trace_hex()),
+                col(TRACE_ID_FIELD).eq(lit("0011")),
+            ),
+        ] {
+            assert!(keyed(std::slice::from_ref(&e), &d).key_in.is_none(), "{e}");
+        }
+    }
+
+    /// A disjunction that carries a key set stays `Inexact`: the residual
+    /// re-applies it over full values.
+    #[test]
+    fn a_key_disjunction_residual_stays_inexact() {
+        let d = keyed_decl();
+        for e in [
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("status_code").eq(lit(2i64)),
+            ),
+            or(col("region").eq(lit("eu")), col("region").eq(lit("us"))),
+            or(
+                col(TRACE_ID_FIELD).eq(trace_hex()),
+                col(TRACE_ID_FIELD).eq(trace_bin()),
+            ),
+        ] {
+            assert!(keyed(std::slice::from_ref(&e), &d).key_in.is_some(), "{e}");
+            assert!(!filter_is_exact(&e, &d), "{e} must stay Inexact");
+        }
     }
 }

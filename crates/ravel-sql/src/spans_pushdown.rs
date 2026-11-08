@@ -40,12 +40,13 @@
 //!   sibling of `service_name`. Feeds a `COL_NAME` bloom probe (ADR-0054), the
 //!   other field the v3 per-block bloom is built over.
 //!
-//! Five of the six are conjunctive-only (ADR-0045 decision 5): a disjunction
-//! anywhere in a conjunct's own subtree ([`contains_or`]) drops that whole
-//! conjunct rather than being soundly pushed, since refusing to push is
-//! always widen-safe (the `Inexact` residual re-applies it).
+//! The ts window, `service_name` and `name` shapes are conjunctive-only
+//! (ADR-0045 decision 5): a disjunction anywhere in a conjunct's own subtree
+//! ([`contains_or`]) drops that whole conjunct rather than being soundly
+//! pushed, since refusing to push is always widen-safe (the `Inexact`
+//! residual re-applies it).
 //!
-//! The `status_code`/`duration_ns` axes are the exception: a
+//! The `status_code`/`duration_ns` axes are one exception: a
 //! **same-axis** disjunction -- every disjunct constrains the
 //! *one* axis, nothing else -- is recognized and pushed as the *union* of the
 //! per-disjunct constraints, not the AND-intersection ordinary sibling
@@ -58,21 +59,24 @@
 //! disjunction (`status_code = 2 OR duration_ns > 5e8`) is still refused: no
 //! disjunct's failure to name a single shared axis is treated as "not this
 //! increment's shape" and falls back to the ordinary widen-safe refusal
-//! ([`contains_or`]'s doc). `trace_id` is not part of this increment: RSPAN's
-//! reader only ever exposes a single-point trace lookup
-//! ([`ravel_rspan::SpanQuery::trace`]) with no range-based skip-index
-//! primitive to union against, so a `trace_id =` disjunction is refused the
-//! same as any other cross-axis case (a follow-up would need a new
-//! `ravel_rspan` primitive first, out of this crate's reach).
+//! ([`contains_or`]'s doc).
 //!
-//! A `trace_id IN (...)` conjunct (ADR-3692 decision 6) is the one
-//! disjunction on `trace_id` that is carried: its 16-byte or 32-hex literals,
-//! 2 to 1,024 distinct, become [`SpansPushdown::trace_ids`], a key set the
-//! tier-2 router and the tier-1 set probe answer, and the reader filters the
-//! rows by the ts window alone. A disjunction of `trace_id =` equalities stays
-//! refused, and DataFusion rewrites a list of at most three values into such
-//! a disjunction before the scan sees it, so a list of two or three ids
-//! carries no key (one id becomes a plain `=`).
+//! `trace_id` carries a disjunction as a key set, not a union. A
+//! `trace_id IN (...)` conjunct (ADR-3692 decision 6) and an `Or`-rooted
+//! conjunct whose every arm, at any nesting, is `trace_id = <literal>` (the
+//! form DataFusion rewrites a list of at most three values into before the
+//! scan sees it) both go through [`fold_trace_id_set`]: their 16-byte or
+//! 32-hex literals, 2 to 1,024 distinct, become [`SpansPushdown::trace_ids`],
+//! a key set the tier-2 router and the tier-1 set probe answer, and the
+//! reader filters the rows by the ts window alone; one distinct id pins
+//! [`SpansPushdown::trace_id`] like `=`
+//! (`a_two_value_key_disjunction_is_a_key_set`,
+//! `a_three_value_key_disjunction_is_a_key_set`). A disjunction with an arm
+//! on any other column, a non-equality arm, or a literal the list would
+//! refuse (a NULL, a wrong width, malformed hex) carries no key and is
+//! refused like any other cross-axis case
+//! (`a_disjunction_with_a_non_key_arm_carries_no_key`,
+//! `a_non_equality_arm_carries_no_key`).
 //!
 //! # Why one window covers both `start_ts` and `end_ts`
 //!
@@ -121,8 +125,9 @@ pub struct SpansPushdown {
     /// The single trace id an exact `trace_id = <literal>` equality pinned, if
     /// any: the RSPAN fast-path key.
     pub trace_id: Option<[u8; 16]>,
-    /// The distinct trace ids, ascending, of a `trace_id IN (...)` conjunct of
-    /// 2 to 1,024 16-byte or 32-hex literals (ADR-3692 decision 6): the tier-2
+    /// The distinct trace ids, ascending, of a `trace_id IN (...)` conjunct,
+    /// or a disjunction of `trace_id =` equalities, of 2 to 1,024 16-byte or
+    /// 32-hex literals (ADR-3692 decision 6): the tier-2
     /// router's key set and the tier-1 set probe's. Empty for any other
     /// shape, and ignored when [`Self::trace_id`] is set, which pins one id.
     /// The reader filters rows by the ts window alone for a set, so the
@@ -237,6 +242,10 @@ fn handle_leaf(expr: &Expr, out: &mut SpansPushdown) {
             }
             return;
         }
+        if let Some(values) = trace_id_disjunction_values(expr) {
+            fold_trace_id_set(out, values.into_iter());
+            return;
+        }
     }
     // A disjunction anywhere in this conjunct's subtree means the conjunct
     // as a whole cannot be soundly narrowed on any axis: see `contains_or`'s
@@ -275,27 +284,59 @@ fn handle_leaf(expr: &Expr, out: &mut SpansPushdown) {
         // A wrong-width or malformed element, or more than 1,024 distinct
         // ids, carries nothing.
         Expr::InList(il) if !il.negated && is_trace_id_col(&il.expr) => {
-            if !out.trace_ids.is_empty() {
-                return;
-            }
-            let Some(mut ids) = il.list.iter().map(lit_trace_id).collect::<Option<Vec<_>>>() else {
-                return;
-            };
-            ids.sort_unstable();
-            ids.dedup();
-            match ids.as_slice() {
-                [] => {}
-                [one] => {
-                    if out.trace_id.is_none() {
-                        out.trace_id = Some(*one);
-                    }
-                }
-                _ if ids.len() <= TRACE_ID_SET_MAX => out.trace_ids = ids,
-                _ => {}
-            }
+            fold_trace_id_set(out, il.list.iter());
         }
         _ => {}
     }
+}
+
+/// Fold the literals of a `trace_id IN (...)` list, or of the `trace_id =`
+/// disjunction [`trace_id_disjunction_values`] reads, into `out`: the first
+/// such set is the key set, and a set of one distinct id pins it like `=`. A
+/// wrong-width or malformed element, or more than 1,024 distinct ids, carries
+/// nothing.
+fn fold_trace_id_set<'a>(out: &mut SpansPushdown, values: impl Iterator<Item = &'a Expr>) {
+    if !out.trace_ids.is_empty() {
+        return;
+    }
+    let Some(mut ids) = values.map(lit_trace_id).collect::<Option<Vec<_>>>() else {
+        return;
+    };
+    ids.sort_unstable();
+    ids.dedup();
+    match ids.as_slice() {
+        [] => {}
+        [one] => {
+            if out.trace_id.is_none() {
+                out.trace_id = Some(*one);
+            }
+        }
+        _ if ids.len() <= TRACE_ID_SET_MAX => out.trace_ids = ids,
+        _ => {}
+    }
+}
+
+/// The compared values of `trace_id = v1 OR trace_id = v2 [OR ...]`, at any
+/// nesting of `OR` and either operand order: the shape DataFusion rewrites a
+/// `trace_id IN` list of at most three values into. `None` when any arm is
+/// not an `=` with the bare `trace_id` column on one side.
+fn trace_id_disjunction_values(expr: &Expr) -> Option<Vec<&Expr>> {
+    let mut arms = Vec::new();
+    flatten_or(expr, &mut arms);
+    arms.into_iter()
+        .map(|arm| match arm {
+            Expr::BinaryExpr(be) if be.op == Operator::Eq => {
+                if is_trace_id_col(&be.left) {
+                    Some(be.right.as_ref())
+                } else if is_trace_id_col(&be.right) {
+                    Some(be.left.as_ref())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn is_or(expr: &Expr) -> bool {
@@ -1448,5 +1489,164 @@ mod tests {
                 ..SpansPushdown::default()
             }
         );
+    }
+
+    fn tid_hex() -> Expr {
+        lit("00112233445566778899aabbccddeeff")
+    }
+
+    fn tid_hex_bytes() -> [u8; 16] {
+        [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]
+    }
+
+    fn tid_eq(l: Expr) -> Expr {
+        col("trace_id").eq(l)
+    }
+
+    /// The pushdown of `trace_id IN (values)`.
+    fn in_list(values: Vec<Expr>) -> SpansPushdown {
+        extract_spans(&[col("trace_id").in_list(values, false)])
+    }
+
+    /// `trace_id = a OR trace_id = b` extracts exactly what `trace_id IN (a,
+    /// b)` does, in either operand order, with one hex and one binary id, and
+    /// beside a ts bound.
+    #[test]
+    fn a_two_value_key_disjunction_is_a_key_set() {
+        let want = in_list(vec![tid_hex(), fsb([7u8; 16])]);
+        assert_eq!(want.trace_ids, vec![tid_hex_bytes(), [7u8; 16]]);
+        assert_eq!(want.trace_id, None);
+        for e in [
+            or(tid_eq(tid_hex()), tid_eq(fsb([7u8; 16]))),
+            or(
+                fsb([7u8; 16]).eq(col("trace_id")),
+                tid_hex().eq(col("trace_id")),
+            ),
+            or(
+                tid_eq(tid_hex()),
+                tid_eq(lit(ScalarValue::Binary(Some(vec![7u8; 16])))),
+            ),
+        ] {
+            assert_eq!(extract_spans(std::slice::from_ref(&e)), want, "{e}");
+        }
+        let p = extract_spans(&[
+            col("start_ts").gt_eq(ts_lit(5)),
+            or(tid_eq(tid_hex()), tid_eq(fsb([7u8; 16]))),
+        ]);
+        assert_eq!(p.trace_ids, want.trace_ids);
+        assert_eq!(p.ts_lo, Some(5));
+        // Two equal ids pin one, as a one-id list does.
+        let p = extract_spans(&[or(tid_eq(fsb([7u8; 16])), tid_eq(fsb([7u8; 16])))]);
+        assert_eq!(p, in_list(vec![fsb([7u8; 16])]));
+        assert_eq!(p.trace_id, Some([7u8; 16]));
+    }
+
+    /// Three `trace_id` equalities, in either nesting of `OR`, extract exactly
+    /// what the three-value `IN` list does.
+    #[test]
+    fn a_three_value_key_disjunction_is_a_key_set() {
+        let want = in_list(vec![fsb([3u8; 16]), fsb([1u8; 16]), fsb([2u8; 16])]);
+        assert_eq!(want.trace_ids, vec![[1u8; 16], [2u8; 16], [3u8; 16]]);
+        let a = || tid_eq(fsb([3u8; 16]));
+        let b = || tid_eq(fsb([1u8; 16]));
+        let c = || tid_eq(fsb([2u8; 16]));
+        for e in [or(or(a(), b()), c()), or(a(), or(b(), c()))] {
+            assert_eq!(extract_spans(std::slice::from_ref(&e)), want, "{e}");
+        }
+    }
+
+    /// `trace_id` is the one key column of `spans`; an arm on `span_id`, the
+    /// other id column, carries no key, so the conjunct contributes nothing.
+    #[test]
+    fn a_disjunction_across_two_key_columns_carries_no_key() {
+        let span_id = lit(ScalarValue::Binary(Some(vec![1u8; 8])));
+        for e in [
+            or(tid_eq(fsb([1u8; 16])), col("span_id").eq(span_id.clone())),
+            or(
+                or(tid_eq(fsb([1u8; 16])), tid_eq(fsb([2u8; 16]))),
+                col("span_id").eq(span_id),
+            ),
+        ] {
+            assert_eq!(
+                extract_spans(std::slice::from_ref(&e)),
+                SpansPushdown::default(),
+                "{e}"
+            );
+        }
+    }
+
+    /// An arm on a non-key column carries no key.
+    #[test]
+    fn a_disjunction_with_a_non_key_arm_carries_no_key() {
+        for e in [
+            or(tid_eq(fsb([1u8; 16])), col("service_name").eq(lit("api"))),
+            or(col("name").eq(lit("GET")), tid_eq(fsb([1u8; 16]))),
+        ] {
+            assert_eq!(
+                extract_spans(std::slice::from_ref(&e)),
+                SpansPushdown::default(),
+                "{e}"
+            );
+        }
+    }
+
+    /// An arm other than `=` carries no key.
+    #[test]
+    fn a_non_equality_arm_carries_no_key() {
+        for e in [
+            or(col("trace_id").gt(fsb([1u8; 16])), tid_eq(fsb([2u8; 16]))),
+            or(
+                tid_eq(fsb([1u8; 16])),
+                col("trace_id").not_eq(fsb([2u8; 16])),
+            ),
+            or(
+                tid_eq(fsb([1u8; 16])),
+                and(tid_eq(fsb([2u8; 16])), col("name").eq(lit("GET"))),
+            ),
+        ] {
+            assert_eq!(
+                extract_spans(std::slice::from_ref(&e)),
+                SpansPushdown::default(),
+                "{e}"
+            );
+        }
+    }
+
+    /// A NULL literal, a mixed-type literal and a wrong-width trace id each
+    /// leave the disjunction without a key.
+    #[test]
+    fn a_refused_literal_leaves_the_disjunction_without_a_key() {
+        for e in [
+            or(
+                tid_eq(lit(ScalarValue::FixedSizeBinary(16, None))),
+                tid_eq(fsb([2u8; 16])),
+            ),
+            or(tid_eq(fsb([1u8; 16])), tid_eq(lit(7i64))),
+            or(
+                tid_eq(fsb([1u8; 16])),
+                tid_eq(lit(ScalarValue::Binary(Some(vec![2u8; 8])))),
+            ),
+            or(tid_eq(tid_hex()), tid_eq(lit("0011"))),
+        ] {
+            assert_eq!(
+                extract_spans(std::slice::from_ref(&e)),
+                SpansPushdown::default(),
+                "{e}"
+            );
+        }
+    }
+
+    /// A disjunction's key set never becomes the reader's single-trace
+    /// filter: the query stays a ts-window scan and the `Inexact` residual
+    /// is the only per-row evaluator of the ids.
+    #[test]
+    fn a_key_disjunction_residual_stays_inexact() {
+        let p = extract_spans(&[or(tid_eq(fsb([1u8; 16])), tid_eq(fsb([2u8; 16])))]);
+        assert_eq!(p.trace_ids.len(), 2);
+        assert_eq!(p.trace_id, None);
+        assert_eq!(p.span_query(), SpanQuery::ts_range(i64::MIN, i64::MAX));
     }
 }
