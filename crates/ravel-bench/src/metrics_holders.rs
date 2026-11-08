@@ -14,42 +14,68 @@
 //! statement's window is the union over its selectors. An object is in the
 //! window when its event time range overlaps it, both ends inclusive.
 //!
-//! The holder test runs without Ravel's router or key index: every object in
-//! the window is opened with `ravel_segment`'s public reader
-//! ([`open_from_full`], [`decode_catalog_v5`]) and every series in its catalog
-//! is tested against the statement's selectors. It is the denominator a routed
-//! query's `segmentsFetched` is judged against, so it must not be computed by
-//! the mechanism under test.
+//! The counts run without Ravel's router or key index: every listed object is
+//! opened with `ravel_segment`'s public reader ([`open_from_full`],
+//! [`decode_catalog_v5`], [`label_dict_strings`]), every series in its catalog
+//! is tested against the statement's selectors, and its LABEL_DICT strings
+//! are read as text. The figures a routed pass is judged against must not be
+//! computed by the mechanism under test.
 //!
 //! A statement qualifies when one of its selectors carries a `label="value"`
 //! matcher with a non-empty value (the metric name alone does not count). An
 //! object holds the statement when it is in the window and one of its series
 //! matches one of the statement's qualifying selectors in full: the metric
-//! name and every matcher, `!=`, `=~` and `!~` included.
+//! name and every matcher, `!=`, `=~` and `!~` included. `holders` is the
+//! bound a series-level index could reach. It is not the label-value router's
+//! bound: the router reads one object-wide set of label strings, so an object
+//! holding `job="api"` on one series and `code="500"` on another is kept for
+//! `{job="api",code="500"}` though no series matches.
+//!
+//! `value_holders` is the router's bound. Of the objects the resolve hands the
+//! router (`named_in_window` when every selector names one metric, else
+//! `segments_in_window`), it counts those whose LABEL_DICT holds, for at least
+//! one selector, the selector's metric name and every value of its
+//! `label="value"` matchers: the router probes each such value (`__name__`
+//! included) and drops an object for a selector when one value is absent, and
+//! prunes it only when every selector drops it. `expected_routed_prunes` is
+//! the rest of those objects, the `segmentsPrunedByLabelIndex` a routed pass
+//! reports; with one selector it is `named_in_window - value_holders`. An
+//! object a `min_commit_token` adds outside that set is never routed, so it is
+//! in neither figure. The router compares 8-byte hashes of the strings, so a
+//! collision can keep an object `value_holders` leaves out; that shows as
+//! fewer prunes than expected, never as more. Both are `None` for a statement
+//! that is not `route_bound`.
 //!
 //! `segments_in_window` counts every object in the window, whatever metrics it
 //! holds. It is not what an unrouted query fetches: Ravel's resolve also
 //! prunes by name postings when every selector of the statement names the same
 //! metric, so an unrouted pass fetches the objects in the window that hold
 //! that metric (`named_in_window`), and every object in the window only when
-//! the selectors name different metrics. `unrouted_fetched_expected` is that
-//! figure, the `segmentsFetched` an unrouted pass over a folded snapshot is
-//! expected to report; ADR-3694 row 3's denominator is the unrouted pass's
-//! `segmentsFetched` itself, never `segments_in_window`.
+//! the selectors name different metrics. The resolve then adds the L0 object
+//! each `min_commit_token` names, whatever its metrics and event time (the
+//! query lane passes one token per shard); `token_only_fetched` counts those
+//! not already in the set. `unrouted_fetched_expected` is the sum, the
+//! `segmentsFetched` an unrouted pass over a folded snapshot is expected to
+//! report, and `None` when a token names no listed object, since the resolve
+//! then reads an object this count did not see. ADR-3694 row 3's denominator
+//! is the unrouted pass's `segmentsFetched` itself, never `segments_in_window`.
 //!
 //! A statement is `route_bound` when every one of its selectors carries a
 //! qualifying matcher. A selector with only its metric name gives the
-//! label-value router nothing to probe but the name, so a routed pass keeps
-//! every object holding that metric, which `holders` (counted over the
-//! qualifying selectors) does not bound; such a statement says why in
-//! `route_bound_reason` and is left out of any holders-versus-routed
-//! comparison.
+//! label-value router nothing to probe but the name, which the resolve's name
+//! postings have mostly pruned by already; such a statement says why in
+//! `route_bound_reason`, carries no `value_holders`, and is left out of any
+//! comparison with a routed pass.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
+use ravel_commit::keys::parse_data_key;
 use ravel_promql::{PlanAnchor, plan_selectors};
 use ravel_query::log_series::log_metric_of;
-use ravel_segment::{ReaderLimits, decode_catalog_v5, open_from_full};
+use ravel_segment::{
+    FooterLocation, ReaderLimits, decode_catalog_v5, label_dict_strings, open_from_full,
+};
+use ravel_types::CommitToken;
 use serde::{Deserialize, Serialize};
 
 use crate::metrics_query::QueryGrid;
@@ -67,11 +93,23 @@ pub const HOLDERS_METHOD: &str = "the data objects the folded snapshot names (L0
      resolves it; segments_in_window counts the objects whose event time range overlaps that \
      window (inclusive) whatever metrics they hold, named_in_window the ones among them with a \
      series of one of the statement's metric names, and holders the ones among them with a \
-     series matching a qualifying selector in full (metric name and every matcher); \
-     unrouted_fetched_expected is named_in_window when every selector names the same metric \
-     (Ravel's resolve then prunes by that name's postings) and segments_in_window otherwise; \
-     route_bound is false when a selector has no qualifying matcher, since the router then \
-     keeps every object holding that selector's metric";
+     series matching a qualifying selector in full (metric name and every matcher), the bound \
+     of a series-level index, not of the label-value router; the resolved set is \
+     named_in_window's objects when every selector names the same metric (Ravel's resolve then \
+     prunes by that name's postings) and segments_in_window's otherwise; token_only_fetched \
+     counts the L0 objects the query lane's min_commit_token values name (matched to listed keys \
+     by shard, writer, epoch and seq) outside the resolved set, which the resolve adds whatever \
+     their metrics and event time; unrouted_fetched_expected is the resolved set plus \
+     token_only_fetched, null when a token names no listed object; value_holders, the \
+     label-value router's bound, counts the resolved set's objects whose LABEL_DICT strings \
+     (read with label_dict_strings, compared as text) hold, for at least one selector, its \
+     metric name and every value of its label=\"value\" matchers, and expected_routed_prunes is \
+     the resolved set's size minus value_holders (named_in_window - value_holders for one \
+     selector), both null unless route_bound; route_bound is false when a selector has no \
+     qualifying matcher, since the router then probes only that selector's metric name";
+
+/// The footer section kind of LABEL_DICT (docs/segment-format.md).
+const LABEL_DICT_KIND: u32 = 1;
 
 /// One data object the snapshot names, as `ravel-cli catalog list --json`
 /// prints it.
@@ -119,14 +157,27 @@ pub struct HolderCount {
     pub segments_in_window: u64,
     /// Objects among those holding a series of one of `metrics`.
     pub named_in_window: u64,
+    /// Listed objects a `min_commit_token` names that are outside the
+    /// resolved set (`named_in_window`'s objects when `name_pruned`, else
+    /// `segments_in_window`'s).
+    pub token_only_fetched: u64,
     /// The `segmentsFetched` an unrouted pass over a folded snapshot reports:
-    /// `named_in_window` when `name_pruned`, else `segments_in_window`.
-    pub unrouted_fetched_expected: u64,
+    /// the resolved set plus `token_only_fetched`. `None` when a token names
+    /// no listed object.
+    pub unrouted_fetched_expected: Option<u64>,
     /// Objects in the window holding at least one series that matches a
-    /// qualifying selector.
+    /// qualifying selector: a series-level index's bound, not the router's.
     pub holders: u64,
-    /// Every selector has a qualifying matcher, so `holders` is comparable
-    /// with what a routed pass opens.
+    /// Objects of the resolved set whose LABEL_DICT holds, for at least one
+    /// selector, its metric name and every positive equality value: the
+    /// label-value router's bound. `None` unless `route_bound`.
+    pub value_holders: Option<u64>,
+    /// The resolved set's size minus `value_holders`: the
+    /// `segmentsPrunedByLabelIndex` a routed pass reports. `None` unless
+    /// `route_bound`.
+    pub expected_routed_prunes: Option<u64>,
+    /// Every selector has a qualifying matcher, so the engine routes the
+    /// statement and `value_holders` bounds what a routed pass opens.
     pub route_bound: bool,
     /// Why not, when `route_bound` is false.
     pub route_bound_reason: Option<String>,
@@ -149,6 +200,13 @@ pub struct HoldersReport {
     pub objects_l1: u64,
     /// Series decoded across them.
     pub series_total: u64,
+    /// The `min_commit_token` values the query lane passes, as given.
+    pub min_commit_tokens: u64,
+    /// The listed objects those tokens name.
+    pub token_objects: Vec<String>,
+    /// Tokens naming no listed object, encoded; any one leaves every
+    /// `unrouted_fetched_expected` `None`.
+    pub tokens_unmatched: Vec<String>,
     pub statements: Vec<HolderCount>,
     /// Statements under the profile that have no qualifying selector, whose
     /// selectors the corpus reader refuses, or whose fetch window cannot be
@@ -228,7 +286,7 @@ pub fn fetch_window(
 
 /// A statement being counted: its qualifying selectors, its metric names, its
 /// window, and the objects seen so far in the window, holding one of its
-/// metrics, and holding it.
+/// metrics, holding it, named only by a token, and holding its values.
 struct Tally {
     entry: usize,
     selectors: Vec<SelectorMatch>,
@@ -238,14 +296,54 @@ struct Tally {
     in_window: u64,
     named: u64,
     holders: u64,
+    token_only: u64,
+    value_holders: u64,
+}
+
+impl Tally {
+    fn name_pruned(&self) -> bool {
+        self.metrics.len() == 1
+    }
+}
+
+/// Whether `token` names the L0 object at `key`. A key that does not parse as
+/// an L0 data key names no token.
+fn token_names(token: &CommitToken, key: &str) -> bool {
+    parse_data_key(key).is_ok_and(|k| {
+        k.shard == token.shard
+            && k.writer_id == token.writer_id
+            && k.epoch == token.epoch
+            && k.seq == token.seq
+    })
+}
+
+/// The LABEL_DICT strings of the object `bytes` whose footer `location`
+/// describes.
+fn label_dict(location: &FooterLocation, bytes: &[u8]) -> Result<HashSet<String>, String> {
+    let section = location
+        .footer
+        .sections
+        .iter()
+        .find(|s| s.kind == LABEL_DICT_KIND)
+        .ok_or_else(|| "object has no LABEL_DICT section".to_string())?;
+    let stored = usize::try_from(section.offset)
+        .ok()
+        .zip(usize::try_from(section.len).ok())
+        .and_then(|(offset, len)| bytes.get(offset..offset.checked_add(len)?))
+        .ok_or_else(|| "LABEL_DICT range is outside the object".to_string())?;
+    let strings = label_dict_strings(&location.footer, stored, ReaderLimits::default())
+        .map_err(|e| format!("LABEL_DICT: {e}"))?;
+    Ok(strings.into_iter().collect())
 }
 
 /// Counts holders over `objects`, each one listed object with its whole
 /// bytes, for the entries of `corpus` that run under `profile` on `grid`.
+/// `min_tokens` are the `min_commit_token` values the query lane passes.
 pub fn count_holders<I>(
     corpus: &[CorpusEntry],
     profile: &str,
     grid: &QueryGrid,
+    min_tokens: &[CommitToken],
     objects: I,
 ) -> Result<HoldersReport, HoldersError>
 where
@@ -280,7 +378,8 @@ where
             .map(|s| {
                 format!(
                     "selector `{}` has no label=\"value\" matcher with a non-empty value, so the \
-                     router keeps every object holding `{}`, which holders does not count",
+                     router probes only `{}` for it and keeps every object holding that name, \
+                     which holders does not count",
                     s.text, s.metric
                 )
             });
@@ -304,6 +403,8 @@ where
                 in_window: 0,
                 named: 0,
                 holders: 0,
+                token_only: 0,
+                value_holders: 0,
             }),
             Ok(None) => skipped.push(skip("no metric selector".to_string())),
             Err(reason) => skipped.push(skip(format!(
@@ -335,16 +436,30 @@ where
     let mut in_window = vec![false; tallies.len()];
     let mut named = vec![false; tallies.len()];
     let mut held = vec![false; tallies.len()];
+    let mut token_matched = vec![false; min_tokens.len()];
+    let mut token_objects = Vec::new();
     for object in objects {
         let (listed, bytes) = object?;
         let fail = |detail: String| HoldersError {
             key: listed.key.clone(),
             detail,
         };
+        let mut token_named = false;
         match listed.level.as_str() {
-            "L0" => objects_l0 += 1,
+            "L0" => {
+                objects_l0 += 1;
+                for (matched, token) in token_matched.iter_mut().zip(min_tokens) {
+                    if token_names(token, &listed.key) {
+                        *matched = true;
+                        token_named = true;
+                    }
+                }
+            }
             "L1" => objects_l1 += 1,
             other => return Err(fail(format!("unknown level `{other}`"))),
+        }
+        if token_named {
+            token_objects.push(listed.key.clone());
         }
         let location = open_from_full(&bytes, limits).map_err(|e| fail(e.to_string()))?;
         let catalog =
@@ -379,24 +494,66 @@ where
                 }
             }
         }
+        let resolved: Vec<bool> = tallies
+            .iter()
+            .enumerate()
+            .map(|(t, tally)| {
+                if tally.name_pruned() {
+                    named[t]
+                } else {
+                    in_window[t]
+                }
+            })
+            .collect();
+        let routed = |t: usize| resolved[t] && tallies[t].route_unbound.is_none();
+        let dict = if (0..tallies.len()).any(routed) {
+            label_dict(&location, &bytes).map_err(fail)?
+        } else {
+            HashSet::new()
+        };
         for (t, tally) in tallies.iter_mut().enumerate() {
             tally.in_window += u64::from(in_window[t]);
             tally.named += u64::from(named[t]);
             tally.holders += u64::from(held[t]);
+            tally.token_only += u64::from(token_named && !resolved[t]);
+            if resolved[t] && tally.route_unbound.is_none() {
+                let strings = &dict;
+                let value_held = tally.selectors.iter().any(|s| {
+                    strings.contains(&s.metric)
+                        && s.positive_equalities
+                            .iter()
+                            .all(|(_, value)| strings.contains(value))
+                });
+                tally.value_holders += u64::from(value_held);
+            }
         }
     }
 
+    let tokens_unmatched: Vec<String> = min_tokens
+        .iter()
+        .zip(&token_matched)
+        .filter(|(_, matched)| !**matched)
+        .map(|(token, _)| token.encode())
+        .collect();
     Ok(HoldersReport {
         method: HOLDERS_METHOD,
         profile: profile.to_string(),
         objects_l0,
         objects_l1,
         series_total,
+        min_commit_tokens: min_tokens.len() as u64,
+        token_objects,
         statements: tallies
             .into_iter()
             .map(|tally| {
                 let entry = entries[tally.entry];
-                let name_pruned = tally.metrics.len() == 1;
+                let name_pruned = tally.name_pruned();
+                let resolved = if name_pruned {
+                    tally.named
+                } else {
+                    tally.in_window
+                };
+                let route_bound = tally.route_unbound.is_none();
                 HolderCount {
                     id: entry.id.clone(),
                     promql: entry.promql.clone(),
@@ -413,17 +570,20 @@ where
                     fetch_window: tally.window,
                     segments_in_window: tally.in_window,
                     named_in_window: tally.named,
-                    unrouted_fetched_expected: if name_pruned {
-                        tally.named
-                    } else {
-                        tally.in_window
-                    },
+                    token_only_fetched: tally.token_only,
+                    unrouted_fetched_expected: tokens_unmatched
+                        .is_empty()
+                        .then_some(resolved + tally.token_only),
                     holders: tally.holders,
-                    route_bound: tally.route_unbound.is_none(),
+                    value_holders: route_bound.then_some(tally.value_holders),
+                    expected_routed_prunes: route_bound
+                        .then(|| resolved.saturating_sub(tally.value_holders)),
+                    route_bound,
                     route_bound_reason: tally.route_unbound,
                 }
             })
             .collect(),
+        tokens_unmatched,
         skipped,
     })
 }
@@ -586,8 +746,8 @@ mod tests {
             entry("name_only", "sum(http_requests)"),
             entry("empty_eq", r#"http_requests{job=""}"#),
         ];
-        let report =
-            count_holders(&corpus, "ci", &grid(), objects.into_iter().map(Ok)).expect("counts");
+        let report = count_holders(&corpus, "ci", &grid(), &[], objects.into_iter().map(Ok))
+            .expect("counts");
         assert_eq!((report.objects_l0, report.objects_l1), (1, 3));
         assert_eq!(report.series_total, 5);
         let counts: Vec<(&str, u64, u64)> = report
@@ -646,9 +806,10 @@ mod tests {
                 r#"sum(http_requests{job="api"}) / sum(http_requests)"#,
             ),
         ];
-        let report =
-            count_holders(&corpus, "ci", &grid(), objects.into_iter().map(Ok)).expect("counts");
-        let counts: Vec<(&str, u64, u64, bool, u64, u64)> = report
+        let report = count_holders(&corpus, "ci", &grid(), &[], objects.into_iter().map(Ok))
+            .expect("counts");
+        type Counts<'a> = (&'a str, u64, u64, bool, Option<u64>, u64);
+        let counts: Vec<Counts> = report
             .statements
             .iter()
             .map(|s| {
@@ -665,10 +826,10 @@ mod tests {
         assert_eq!(
             counts,
             [
-                ("eq_only", 2, 1, true, 1, 1),
-                ("absent", 2, 0, true, 0, 0),
-                ("two_metrics", 2, 2, false, 2, 2),
-                ("ratio_unbound", 2, 1, true, 1, 1),
+                ("eq_only", 2, 1, true, Some(1), 1),
+                ("absent", 2, 0, true, Some(0), 0),
+                ("two_metrics", 2, 2, false, Some(2), 2),
+                ("ratio_unbound", 2, 1, true, Some(1), 1),
             ]
         );
         assert_eq!(
@@ -697,160 +858,98 @@ mod tests {
                     false,
                     Some(
                         "selector `http_requests` has no label=\"value\" matcher with a \
-                         non-empty value, so the router keeps every object holding \
-                         `http_requests`, which holders does not count"
+                         non-empty value, so the router probes only `http_requests` for it \
+                         and keeps every object holding that name, which holders does not \
+                         count"
                     )
                 ),
             ]
         );
     }
 
-    /// The window check's two figures, side by side on a real folded
-    /// snapshot: Ravel's engine, run unrouted over the same objects the count
-    /// reads, fetches exactly `unrouted_fetched_expected` for each statement.
-    /// `other` is in the window but outside `http_requests`' name postings,
-    /// `absent_metric` is in no object's postings, and the out-of-window
-    /// objects show that `segments_in_window` is not fetched + pruned.
-    #[tokio::test]
-    async fn unrouted_fetched_expected_is_what_the_engine_fetches() {
-        use std::sync::Arc;
-        use std::time::Duration;
+    /// One data object of the folded fixture: its metric, each series' labels
+    /// besides `__name__`, and the event time of each series' one sample.
+    struct FixtureObject {
+        metric: &'static str,
+        series: &'static [&'static [(&'static str, &'static str)]],
+        ts_ns: i64,
+    }
 
-        use ravel_catalog::{
-            Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
-            DEFAULT_MAX_FLUSH_LIFETIME_NS,
-        };
-        use ravel_commit::publish::RetryPolicy;
-        use ravel_commit::record::NewCommitRecord;
-        use ravel_commit::{keys, publish, record};
-        use ravel_object_store::ObjectStoreBackend;
-        use ravel_object_store::memory::MemoryStore;
-        use ravel_query::{EngineConfig, QueryEngine};
-        use ravel_segment::{
-            IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7,
-        };
-        use ravel_types::Signal;
+    const API: &[&[(&str, &str)]] = &[&[("job", "api")]];
 
-        const HOUR_NS: i64 = 3_600_000_000_000;
-        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let tenant = TenantId::new("holders");
-        let th = tenant.hash();
-        let hour = 5_000u32;
-        let newest_ns = i64::from(hour) * HOUR_NS + 50 * MIN;
-        let old_ns = i64::from(hour) * HOUR_NS + 10 * MIN;
-        let mut objects = Vec::new();
-        for (seq, (key, metric, ts_ns)) in [
-            ("a", "http_requests", newest_ns - MIN),
-            ("other", "other_metric", newest_ns - MIN),
-            ("old_a", "http_requests", old_ns),
-            ("old_other", "other_metric", old_ns),
+    /// The four objects of the window tests: `a` and `other` in the window,
+    /// `old_a` and `old_other` before it.
+    fn window_specs() -> [FixtureObject; 4] {
+        [
+            FixtureObject {
+                metric: "http_requests",
+                series: API,
+                ts_ns: fixture_newest_ns() - MIN,
+            },
+            FixtureObject {
+                metric: "other_metric",
+                series: API,
+                ts_ns: fixture_newest_ns() - MIN,
+            },
+            FixtureObject {
+                metric: "http_requests",
+                series: API,
+                ts_ns: fixture_old_ns(),
+            },
+            FixtureObject {
+                metric: "other_metric",
+                series: API,
+                ts_ns: fixture_old_ns(),
+            },
         ]
-        .into_iter()
-        .enumerate()
-        {
-            let labels = LabelSet::new(vec![
-                Label {
-                    name: "__name__".to_string(),
-                    value: metric.to_string(),
-                },
-                Label {
-                    name: "job".to_string(),
-                    value: "api".to_string(),
-                },
-            ])
-            .expect("labels");
-            let writer_id = uuid::Uuid::new_v4();
-            let written = SegmentWriter::write(
-                vec![SeriesInput {
-                    series_id: SeriesId::compute(&tenant, metric, &labels).expect("id"),
-                    labels,
-                    samples: vec![Sample { ts_ns, value: 1.0 }],
-                }],
-                SegmentIdentity {
-                    tenant_hash: th.0,
-                    shard: 0,
-                    writer_id: writer_id.to_string(),
-                    writer_epoch: 1,
-                    writer_seq: seq as u64 + 1,
-                },
-                IngestBounds {
-                    min_ingest_ts_ns: 0,
-                    max_ingest_ts_ns: 0,
-                },
-            )
-            .expect("segment");
-            let rec = record::build(NewCommitRecord {
-                tenant_hash: th,
-                signal: Signal::Metrics,
-                shard: 0,
-                writer_id,
-                writer_epoch: 1,
-                writer_seq: seq as u64 + 1,
-                object_size: written.bytes.len() as u64,
-                content_hash: written.summary.blake3,
-                sample_count: written.summary.sample_count,
-                series_count: written.summary.series_count,
-                min_event_ts_ns: written.summary.min_event_ts_ns,
-                max_event_ts_ns: written.summary.max_event_ts_ns,
-                min_ingest_ts_ns: written.summary.min_event_ts_ns,
-                max_ingest_ts_ns: written.summary.max_event_ts_ns,
-                segment_format_version: u32::from(VERSION_V7),
-                created_unix_ns: 0,
-                ingest_hour_bucket: hour,
-            })
-            .expect("record");
-            let data_key = keys::reconstruct_data_key(&rec).expect("data key");
-            publish::put_data_object(store.as_ref(), &data_key, written.bytes.clone())
-                .await
-                .expect("put");
-            publish::publish(store.as_ref(), &rec, &RetryPolicy::default())
-                .await
-                .expect("publish");
-            objects.push((
-                ListedObject {
-                    key: key.to_string(),
-                    level: "L0".to_string(),
-                    min_event_ts_ns: written.summary.min_event_ts_ns,
-                    max_event_ts_ns: written.summary.max_event_ts_ns,
-                },
-                written.bytes.to_vec(),
-            ));
-        }
-        let now = (i64::from(hour) + 1) * HOUR_NS
-            + DEFAULT_MAX_FLUSH_LIFETIME_NS
-            + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
-            + DEFAULT_FOLD_SAFETY_MARGIN_NS;
-        let catalog = Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog");
-        let folded = catalog
-            .fold(&th, Signal::Metrics, uuid::Uuid::new_v4(), now, &[], None)
-            .await
-            .expect("fold");
-        assert!(folded.postings_built, "the unrouted resolve prunes by name");
-        let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
+    }
 
-        let corpus = vec![
+    fn window_corpus() -> Vec<CorpusEntry> {
+        vec![
             entry("eq_only", r#"http_requests{job="api"}"#),
             entry("absent", r#"absent_metric{job="api"}"#),
             entry(
                 "two_metrics",
                 r#"http_requests{job="api"} / other_metric{job="api"}"#,
             ),
-        ];
+        ]
+    }
+
+    /// The window check's two figures, side by side on a real folded
+    /// snapshot: Ravel's engine, run unrouted with no `min_commit_token` over
+    /// the same objects the count reads, fetches exactly
+    /// `unrouted_fetched_expected` for each statement. `other` is in the
+    /// window but outside `http_requests`' name postings, `absent_metric` is
+    /// in no object's postings, and the out-of-window objects show that
+    /// `segments_in_window` is not fetched + pruned.
+    #[tokio::test]
+    async fn unrouted_fetched_expected_is_what_the_engine_fetches() {
+        use std::time::Duration;
+
+        let fixture =
+            folded_fixture(&window_specs(), ravel_catalog::CatalogConfig::default()).await;
         let grid = QueryGrid {
-            newest_ms: newest_ns / 1_000_000,
+            newest_ms: fixture.newest_ns / 1_000_000,
             ..grid()
         };
-        let report =
-            count_holders(&corpus, "ci", &grid, objects.into_iter().map(Ok)).expect("counts");
+        let report = count_holders(
+            &window_corpus(),
+            "ci",
+            &grid,
+            &[],
+            fixture.objects.into_iter().map(Ok),
+        )
+        .expect("counts");
         let mut figures = Vec::new();
         for statement in &report.statements {
-            let (_, stats) = engine
+            let (_, stats) = fixture
+                .engine
                 .instant_with_stats(
-                    th,
+                    fixture.tenant,
                     &statement.promql,
                     grid.newest_ms,
                     &[],
-                    now,
+                    fixture.now,
                     Duration::from_secs(5),
                 )
                 .await
@@ -866,16 +965,366 @@ mod tests {
         assert_eq!(
             figures,
             [
-                ("eq_only", 2, 1, 1, 2),
-                ("absent", 2, 0, 0, 4),
-                ("two_metrics", 2, 2, 2, 0),
+                ("eq_only", 2, Some(1), 1, 2),
+                ("absent", 2, Some(0), 0, 4),
+                ("two_metrics", 2, Some(2), 2, 0),
             ]
         );
-        let mismatches = figures
-            .iter()
-            .filter(|(_, _, expected, fetched, _)| expected != fetched)
-            .count();
-        assert_eq!(mismatches, 0);
+    }
+
+    /// A folded snapshot on a `MemoryStore` and the engine over it: one L0
+    /// object per element of `specs` (shard 0, its own writer, hour 5000), as
+    /// `catalog list --json` names it (its real data key), and each one's
+    /// commit token, in `specs` order.
+    struct Fixture {
+        engine: ravel_query::QueryEngine,
+        tenant: ravel_types::TenantHash,
+        now: i64,
+        newest_ns: i64,
+        objects: Vec<(ListedObject, Vec<u8>)>,
+        tokens: Vec<ravel_types::CommitToken>,
+    }
+
+    const FIXTURE_HOUR_NS: i64 = 3_600_000_000_000;
+    const FIXTURE_HOUR: u32 = 5_000;
+
+    fn fixture_newest_ns() -> i64 {
+        i64::from(FIXTURE_HOUR) * FIXTURE_HOUR_NS + 50 * MIN
+    }
+
+    fn fixture_old_ns() -> i64 {
+        i64::from(FIXTURE_HOUR) * FIXTURE_HOUR_NS + 10 * MIN
+    }
+
+    async fn folded_fixture(
+        specs: &[FixtureObject],
+        config: ravel_catalog::CatalogConfig,
+    ) -> Fixture {
+        use std::sync::Arc;
+
+        use ravel_catalog::{
+            Catalog, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
+            DEFAULT_MAX_FLUSH_LIFETIME_NS,
+        };
+        use ravel_commit::publish::RetryPolicy;
+        use ravel_commit::record::NewCommitRecord;
+        use ravel_commit::{keys, publish, record};
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_query::{EngineConfig, QueryEngine};
+        use ravel_segment::{
+            IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7,
+        };
+        use ravel_types::{CommitToken, Signal};
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("holders");
+        let th = tenant.hash();
+        let mut objects = Vec::new();
+        let mut tokens = Vec::new();
+        for (seq, spec) in specs.iter().enumerate() {
+            let seq = seq as u64 + 1;
+            let series = spec
+                .series
+                .iter()
+                .map(|series| {
+                    let mut pairs = vec![Label {
+                        name: "__name__".to_string(),
+                        value: spec.metric.to_string(),
+                    }];
+                    pairs.extend(series.iter().map(|(name, value)| Label {
+                        name: name.to_string(),
+                        value: value.to_string(),
+                    }));
+                    let labels = LabelSet::new(pairs).expect("labels");
+                    SeriesInput {
+                        series_id: SeriesId::compute(&tenant, spec.metric, &labels).expect("id"),
+                        labels,
+                        samples: vec![Sample {
+                            ts_ns: spec.ts_ns,
+                            value: 1.0,
+                        }],
+                    }
+                })
+                .collect();
+            let writer_id = uuid::Uuid::new_v4();
+            let written = SegmentWriter::write(
+                series,
+                SegmentIdentity {
+                    tenant_hash: th.0,
+                    shard: 0,
+                    writer_id: writer_id.to_string(),
+                    writer_epoch: 1,
+                    writer_seq: seq,
+                },
+                IngestBounds {
+                    min_ingest_ts_ns: 0,
+                    max_ingest_ts_ns: 0,
+                },
+            )
+            .expect("segment");
+            let rec = record::build(NewCommitRecord {
+                tenant_hash: th,
+                signal: Signal::Metrics,
+                shard: 0,
+                writer_id,
+                writer_epoch: 1,
+                writer_seq: seq,
+                object_size: written.bytes.len() as u64,
+                content_hash: written.summary.blake3,
+                sample_count: written.summary.sample_count,
+                series_count: written.summary.series_count,
+                min_event_ts_ns: written.summary.min_event_ts_ns,
+                max_event_ts_ns: written.summary.max_event_ts_ns,
+                min_ingest_ts_ns: written.summary.min_event_ts_ns,
+                max_ingest_ts_ns: written.summary.max_event_ts_ns,
+                segment_format_version: u32::from(VERSION_V7),
+                created_unix_ns: 0,
+                ingest_hour_bucket: FIXTURE_HOUR,
+            })
+            .expect("record");
+            let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+            publish::put_data_object(store.as_ref(), &data_key, written.bytes.clone())
+                .await
+                .expect("put");
+            publish::publish(store.as_ref(), &rec, &RetryPolicy::default())
+                .await
+                .expect("publish");
+            objects.push((
+                ListedObject {
+                    key: data_key,
+                    level: "L0".to_string(),
+                    min_event_ts_ns: written.summary.min_event_ts_ns,
+                    max_event_ts_ns: written.summary.max_event_ts_ns,
+                },
+                written.bytes.to_vec(),
+            ));
+            tokens.push(CommitToken {
+                shard: 0,
+                writer_id,
+                epoch: 1,
+                seq,
+                ingest_hour_bucket: FIXTURE_HOUR,
+            });
+        }
+        let now = (i64::from(FIXTURE_HOUR) + 1) * FIXTURE_HOUR_NS
+            + DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + DEFAULT_FOLD_SAFETY_MARGIN_NS;
+        let catalog = Catalog::new(Arc::clone(&store), config).expect("catalog");
+        let folded = catalog
+            .fold(&th, Signal::Metrics, uuid::Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("fold");
+        assert!(folded.postings_built, "the resolve prunes by name");
+        Fixture {
+            engine: QueryEngine::new(Arc::new(catalog), store, EngineConfig::default()),
+            tenant: th,
+            now,
+            newest_ns: fixture_newest_ns(),
+            objects,
+            tokens,
+        }
+    }
+
+    /// The resolve adds the object each `min_commit_token` names whatever
+    /// its metrics and event time: the token of `old_other` (outside the
+    /// window and outside `http_requests`' and `absent_metric`'s postings)
+    /// makes the unrouted pass fetch it for every statement, on top of the
+    /// objects in the window holding the statement's metric. The token of `a`
+    /// adds nothing for `eq_only` and `two_metrics`, which fetch `a` anyway,
+    /// and adds `a` for `absent`, whose postings prune every object.
+    #[tokio::test]
+    async fn the_min_commit_token_objects_are_fetched_whatever_their_metric() {
+        use std::time::Duration;
+
+        let fixture =
+            folded_fixture(&window_specs(), ravel_catalog::CatalogConfig::default()).await;
+        let tokens = [fixture.tokens[0].clone(), fixture.tokens[3].clone()];
+        let token_keys = [
+            fixture.objects[0].0.key.clone(),
+            fixture.objects[3].0.key.clone(),
+        ];
+        let grid = QueryGrid {
+            newest_ms: fixture.newest_ns / 1_000_000,
+            ..grid()
+        };
+        let report = count_holders(
+            &window_corpus(),
+            "ci",
+            &grid,
+            &tokens,
+            fixture.objects.into_iter().map(Ok),
+        )
+        .expect("counts");
+        assert_eq!(report.min_commit_tokens, 2);
+        assert_eq!(report.token_objects, token_keys);
+        assert!(report.tokens_unmatched.is_empty());
+        let mut figures = Vec::new();
+        for statement in &report.statements {
+            let (_, stats) = fixture
+                .engine
+                .instant_with_stats(
+                    fixture.tenant,
+                    &statement.promql,
+                    grid.newest_ms,
+                    &tokens,
+                    fixture.now,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("query");
+            figures.push((
+                statement.id.as_str(),
+                statement.token_only_fetched,
+                statement.unrouted_fetched_expected,
+                stats.segments_fetched,
+            ));
+        }
+        assert_eq!(
+            figures,
+            [
+                ("eq_only", 1, Some(2), 2),
+                ("absent", 2, Some(2), 2),
+                ("two_metrics", 1, Some(3), 3),
+            ]
+        );
+    }
+
+    /// A token naming no listed object leaves every statement's
+    /// `unrouted_fetched_expected` unknown, since the resolve reads an object
+    /// the count did not see, and is reported encoded.
+    #[tokio::test]
+    async fn an_unmatched_token_leaves_the_unrouted_expectation_unknown() {
+        let fixture =
+            folded_fixture(&window_specs(), ravel_catalog::CatalogConfig::default()).await;
+        let stray = CommitToken {
+            seq: 99,
+            ..fixture.tokens[0].clone()
+        };
+        let report = count_holders(
+            &window_corpus(),
+            "ci",
+            &grid(),
+            &[fixture.tokens[0].clone(), stray.clone()],
+            fixture.objects.into_iter().map(Ok),
+        )
+        .expect("counts");
+        assert_eq!(report.tokens_unmatched, [stray.encode()]);
+        for statement in &report.statements {
+            assert_eq!(
+                statement.unrouted_fetched_expected, None,
+                "{}",
+                statement.id
+            );
+        }
+    }
+
+    /// `value_holders` and `expected_routed_prunes` against a routed pass on
+    /// a snapshot folded with the metrics label index. `c` holds `job="api"`
+    /// and `code="500"` on different series, so it holds no series of
+    /// `cross` (holders 0) yet its LABEL_DICT holds both values and the
+    /// router keeps it (value_holders 1). For `two_metrics` the resolve hands
+    /// the router every object in the window; `a` lacks `job="web"` for the
+    /// first selector and `other_metric` for the second, so it is the one
+    /// pruned.
+    #[tokio::test]
+    async fn expected_routed_prunes_is_what_the_router_prunes() {
+        use std::time::Duration;
+
+        const API_200: &[&[(&str, &str)]] = &[&[("job", "api"), ("code", "200")]];
+        const WEB_500: &[&[(&str, &str)]] = &[&[("job", "web"), ("code", "500")]];
+        const SPLIT: &[&[(&str, &str)]] = &[
+            &[("job", "api"), ("code", "200")],
+            &[("job", "web"), ("code", "500")],
+        ];
+        let ts_ns = fixture_newest_ns() - MIN;
+        let fixture = folded_fixture(
+            &[
+                FixtureObject {
+                    metric: "http_requests",
+                    series: API_200,
+                    ts_ns,
+                },
+                FixtureObject {
+                    metric: "http_requests",
+                    series: WEB_500,
+                    ts_ns,
+                },
+                FixtureObject {
+                    metric: "http_requests",
+                    series: SPLIT,
+                    ts_ns,
+                },
+                FixtureObject {
+                    metric: "other_metric",
+                    series: API,
+                    ts_ns,
+                },
+            ],
+            ravel_catalog::CatalogConfig {
+                build_key_index_leaves: true,
+                metrics_label_index: true,
+                metrics_label_index_max_ratio_ppm: 100_000_000,
+                ..ravel_catalog::CatalogConfig::default()
+            },
+        )
+        .await;
+        let corpus = vec![
+            entry("eq_only", r#"http_requests{job="api"}"#),
+            entry("cross", r#"http_requests{job="api",code="500"}"#),
+            entry(
+                "two_metrics",
+                r#"http_requests{job="web"} / other_metric{job="api"}"#,
+            ),
+            entry(
+                "ratio_unbound",
+                r#"sum(http_requests{job="api"}) / sum(http_requests)"#,
+            ),
+        ];
+        let grid = QueryGrid {
+            newest_ms: fixture.newest_ns / 1_000_000,
+            ..grid()
+        };
+        let report = count_holders(
+            &corpus,
+            "ci",
+            &grid,
+            &[],
+            fixture.objects.into_iter().map(Ok),
+        )
+        .expect("counts");
+        let mut figures = Vec::new();
+        for statement in &report.statements {
+            let (_, stats) = fixture
+                .engine
+                .instant_with_stats(
+                    fixture.tenant,
+                    &statement.promql,
+                    grid.newest_ms,
+                    &[],
+                    fixture.now,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("query");
+            figures.push((
+                statement.id.as_str(),
+                statement.holders,
+                statement.value_holders,
+                statement.expected_routed_prunes,
+                stats.segments_pruned_by_label_index,
+            ));
+        }
+        assert_eq!(
+            figures,
+            [
+                ("eq_only", 2, Some(2), Some(1), 1),
+                ("cross", 0, Some(1), Some(2), 2),
+                ("two_metrics", 3, Some(3), Some(1), 1),
+                ("ratio_unbound", 2, None, None, 0),
+            ]
+        );
     }
 
     /// An object that does not decode voids the count rather than being
@@ -887,6 +1336,7 @@ mod tests {
             &corpus,
             "ci",
             &grid(),
+            &[],
             [Ok((
                 listed("broken", "L0", 90, 99),
                 b"not an object".to_vec(),

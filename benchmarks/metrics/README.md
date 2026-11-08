@@ -667,31 +667,51 @@ event time range overlaps that window whatever metrics they hold
 (`segments_in_window`), the ones among them holding a series of one of the
 statement's metric names (`named_in_window`), and the ones among those
 holding at least one series that matches a qualifying selector in full,
-metric name and every matcher (`holders`). `unrouted_fetched_expected` is
-what Ravel's unrouted resolve fetches: `named_in_window` when every
-selector names the same metric (`name_pruned`, the resolve prunes by that
-name's postings) and `segments_in_window` when they name different metrics.
-`route_bound` is false, with `route_bound_reason`, when a selector has no
-qualifying matcher: the router then keeps every object holding that
-selector's metric, so `holders` is no bound on what a routed query opens.
-It decodes each object's series catalog with ravel-segment's public reader,
-with no router or key index; the file's `method` states the window and
-counting rules (`metrics_holders::HOLDERS_METHOD`). `holders.json` holds
-`method`, `profile`, `objects_l0`, `objects_l1`, `series_total`,
-`statements` (`id`, `promql`, `eval`, `selectors`, `positive_equalities`,
-`metrics`, `name_pruned`, `fetch_window`, `segments_in_window`,
-`named_in_window`, `unrouted_fetched_expected`, `holders`, `route_bound`
-and `route_bound_reason` per qualifying entry) and `skipped` (`id`
-and `reason` for each entry with no qualifying selector, whose selectors the
-corpus reader refuses, or whose fetch window cannot be planned). It exits 65
-when the list names no object or the ingest report does not bind to the
-workload, 66 when an input cannot be read, a list line does not parse, or a
-listed object is missing or does not decode (no file is written), and 74
-when the file cannot be written
+metric name and every matcher (`holders`). `holders` is the bound a
+series-level index would reach, not the label-value router's. The resolved
+set is the `named_in_window` objects when every selector names the same
+metric (`name_pruned`, the resolve prunes by that name's postings) and the
+`segments_in_window` objects when they name different metrics. The resolve
+also adds the L0 object each `min_commit_token` names (the query lane
+passes the ingest report's ravel row's commit tokens, one per shard) when
+it is not already in the set, whatever its metrics and event time;
+`token_only_fetched` counts those, matched to listed keys by shard, writer,
+epoch and seq. `unrouted_fetched_expected`, what Ravel's unrouted resolve
+fetches, is the resolved set plus `token_only_fetched`, null when a token
+names no listed object. For a statement whose every selector qualifies
+(`route_bound`), `value_holders`, the label-value router's bound, counts
+the resolved set's objects whose LABEL_DICT strings hold, for at least one
+selector, its metric name and every value of its `label="value"` matchers
+(the router reads one key8 leaf per LABEL_DICT string, so it can prune only
+an object lacking one of those strings), and `expected_routed_prunes` is the
+resolved set less `value_holders`; both are null otherwise. `route_bound`
+is false, with `route_bound_reason`, when a selector has no qualifying
+matcher: the router then probes only that selector's metric name and keeps
+every object holding it. It decodes each object's series catalog and
+LABEL_DICT with ravel-segment's public reader, with no router or key index;
+the file's `method` states the window and counting rules
+(`metrics_holders::HOLDERS_METHOD`). `holders.json` holds `method`,
+`profile`, `objects_l0`, `objects_l1`, `series_total`,
+`min_commit_tokens`, `token_objects`, `tokens_unmatched`, `statements`
+(`id`, `promql`, `eval`, `selectors`, `positive_equalities`, `metrics`,
+`name_pruned`, `fetch_window`, `segments_in_window`, `named_in_window`,
+`token_only_fetched`, `unrouted_fetched_expected`, `holders`,
+`value_holders`, `expected_routed_prunes`, `route_bound` and
+`route_bound_reason` per qualifying entry) and `skipped` (`id` and `reason`
+for each entry with no qualifying selector, whose selectors the corpus
+reader refuses, or whose fetch window cannot be planned). It exits 65 when
+the list names no object, the ingest report does not bind to the workload,
+or the report has no ravel row or no commit token on it, 66 when an input
+cannot be read, a list line or a commit token does not parse, or a listed
+object is missing or does not decode (no file is written), and 74 when the
+file cannot be written
 (`metrics_holders::tests::the_fetch_window_follows_the_engine_resolve`,
 `metrics_holders::tests::holders_count_objects_in_the_window_with_a_fully_matching_series`,
 `metrics_holders::tests::named_in_window_counts_the_objects_holding_the_statements_metrics`,
 `metrics_holders::tests::unrouted_fetched_expected_is_what_the_engine_fetches`,
+`metrics_holders::tests::the_min_commit_token_objects_are_fetched_whatever_their_metric`,
+`metrics_holders::tests::an_unmatched_token_leaves_the_unrouted_expectation_unknown`,
+`metrics_holders::tests::expected_routed_prunes_is_what_the_router_prunes`,
 `metrics_holders::tests::an_unreadable_object_is_an_error`).
 `deploy/metricsbench/run.sh`'s `stage1-holders` step runs it.
 
