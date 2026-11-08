@@ -6269,9 +6269,12 @@ limit that stops reading after `n` groups, both of which return short
 counts.
 
 On its fixture of 1,000,000 distinct `(Int64, Utf8View)` groups over 8
-partitions with `LIMIT 10`, the query pool's charged peak is 9.7 to 11.8 MB
-with the rule and 86 to 93 MB with `bounded_groups_max_limit = 0`, and the
-aggregate envelopes peak at 7.86 MB against 153 to 162 MB. An ordered top-k
+partitions with `LIMIT 10`, the query pool's charged peak was 9.7 to 18.1 MB
+with the rule and 81 to 93 MB with `bounded_groups_max_limit = 0` across
+executor and CI runs, and the aggregate envelopes peaked at 1.6 to 7.86 MB
+against 81 to 162 MB. The charged peak with the rule varies with how much
+the hash exchange buffers; the aggregate envelope is the part the rule
+bounds. An ordered top-k
 by `count` or `sum` (`ORDER BY count(*) DESC LIMIT k`) is not bounded by this
 rule or by `BoundedTopKAggregate`, still builds every group, and keeps the
 ADR-0954 refusal-retry.
