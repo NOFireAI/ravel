@@ -1,10 +1,10 @@
 # Concepts
 
-Read these concepts once, in order, before the other pages. Each section
-assumes the section before it. The [architecture overview](architecture.md)
-shows where each idea lives in the running system.
-[docs/consistency-model.md](consistency-model.md) is the normative statement
-of the guarantees summarised here.
+This page explains the ideas the other pages build on. Each section builds on
+the one before it, so read it top to bottom when the model is new. For a short
+summary, read [architecture in brief](architecture.md#in-brief) first. The
+[consistency model](consistency-model.md) is the normative statement of the
+guarantees summarised here.
 
 The [glossary](#glossary) defines every Ravel term and expands every acronym.
 

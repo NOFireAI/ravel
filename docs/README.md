@@ -1,8 +1,19 @@
 # Documentation index
 
-Ravel's documentation is arranged by what you are trying to do. Each lane
-assumes the lanes above it, so read down the page in order the first time.
-Come back to one lane when you have a specific question.
+Pick the row that matches what you want to do. The sections after the table
+list every page by kind.
+
+| I want to | Start here | Then |
+|---|---|---|
+| Try Ravel on my machine | [Getting started](guides/getting-started.md) | [README support matrix](../README.md#what-works) |
+| Understand how it works | [Architecture in brief](architecture.md#in-brief) | [Concepts](concepts.md), [consistency model](consistency-model.md) |
+| Send telemetry | [Ingest guide](guides/ingest.md) | [Admission limits](guides/admission-limits.md) |
+| Query metrics, logs, or traces | [Query guide](guides/query.md) | [Traces](guides/traces.md), [HTTP API](reference/http-api.md) |
+| Run it against my own bucket | [Operations](guides/operations.md) | [Troubleshooting](guides/operations/troubleshooting.md), [Kubernetes](guides/kubernetes.md) |
+| Run durable agents | [Ravel Agents](guides/agents.md) | [SDK guide](guides/agents-sdk.md), [operating agents](guides/operations/agents.md) |
+| Let an AI client query my telemetry | [MCP server](guides/mcp-server.md) | [MCP reference](reference/mcp.md) |
+| Look up a flag or a route | [Server flags](reference/ravel-server-flags.md) | [CLI flags](reference/ravel-cli-flags.md), [HTTP API](reference/http-api.md) |
+| Change Ravel's code | [Contributing](../CONTRIBUTING.md) | [Development loop](internal/development.md) |
 
 ## Start
 
@@ -12,22 +23,20 @@ Come back to one lane when you have a specific question.
 
 ## Learn
 
-- [guides/getting-started.md](guides/getting-started.md): the recommended
-  path from nothing to a first query, on the container quickstart. It
-  explains what each response means, how long to wait for data, and when an
-  empty result is the right answer. Building from source is at the end of
-  the page. Read this first.
+- [guides/getting-started.md](guides/getting-started.md): the container
+  quickstart from a fresh clone to a first query, with what each response
+  means and when an empty result is correct. Building from source is at the
+  end of the page.
 
 ## Understand
 
 - [concepts.md](concepts.md): the ideas that every other page assumes, and
   the glossary. It defines every Ravel term once and expands every acronym
   once.
-- [architecture.md](architecture.md): the one-page overview. It covers the
-  components, the durable state, the disposable processes, and how ingest,
-  query and maintenance meet. It also covers what Ravel requires of the
-  object store, the trust and failure boundaries, and behavior under
-  concurrency and after a retry.
+- [architecture.md](architecture.md): starts with a short summary of the
+  whole system, then covers the components, the durable state, the
+  disposable processes, how ingest, query and maintenance meet, what Ravel
+  requires of the object store, and the trust and failure boundaries.
 - [consistency-model.md](consistency-model.md): the normative statement of
   what Ravel promises. Acknowledgement, visibility, read-your-write,
   snapshot isolation, and the crash matrix come first. A test asserts every
@@ -45,9 +54,9 @@ Come back to one lane when you have a specific question.
   routes, PromQL support and its rejected constructs, budgets, SQL over the
   `samples`, `logs`, `spans`, `alerts` and `audit` tables, and the HTTP
   status codes.
-- [guides/traces.md](guides/traces.md): querying spans over the `spans`
-  table, why one trace is a bounded read, which predicates prune, and what
-  an incomplete trace is.
+- [guides/traces.md](guides/traces.md): fetching one trace with
+  `GET /api/traces/<trace_id>`, querying spans over the `spans` table, which
+  predicates prune, and what an incomplete trace is.
 - [guides/correlation.md](guides/correlation.md): how an exemplar links a
   metric sample to its trace, from storage and the admission cap to the
   exemplar query and the Grafana link.
@@ -68,8 +77,8 @@ Come back to one lane when you have a specific question.
   envelope field by field, budgets and cursors, and what an empty result
   means.
 - [guides/agents.md](guides/agents.md): Ravel Agents, the durable agent
-  runtime. What an agent is, how to turn the runtime on, and what works in
-  this release milestone by milestone.
+  runtime. What an agent is, how to turn the runtime on, and what works
+  today.
 - [guides/agents-sdk.md](guides/agents-sdk.md): the TypeScript SDK for Ravel
   Agents. Scaffolding a first project, its tests and a run against a server,
   the typed errors, the testing export, the HTTP transport's limits, and
