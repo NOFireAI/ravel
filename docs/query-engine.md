@@ -6348,10 +6348,11 @@ once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
 `viewMemoFills` and `viewMemoRefusals` the statement's own fills and
 refused fills, and `viewMemoReleases` the views the memory budget's evictor
 released while the statement ran, which can include another statement's
-pressure (`per_call_view_memo_stats_are_the_statements_own` in
-`crates/ravel-sql/tests/logs_decoded_cache.rs`; the releases are the cache's
-counter since a mark taken when the statement started, `executor.rs`'s
-`cache.view_counters().since(&view_mark)`).
+pressure (`per_call_view_memo_stats_are_the_statements_own`). The releases
+are the growth of the cache's release counter from a mark taken when the
+statement starts: a release between two statements is reported by neither,
+and one inside a statement is reported by that statement
+(`a_release_inside_one_call_is_that_calls_own`).
 `filledCellRefusals` counts offers refused because the column already
 carries a filled reservation cell: it was admitted concurrently under
 another key, or its entry was evicted (by the cap or the age bound) while
