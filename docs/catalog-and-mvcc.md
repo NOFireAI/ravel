@@ -921,11 +921,46 @@ an advancing fold's passes, held previous leaf bytes and rewritten leaf
 bytes grow with the tail. The default is reconsidered once the advance
 is bounded by the new hour. Every process that runs a fold for a tenant
 (a maintain-mode process, and a query-mode process serving on-demand
-folds) should agree on the switch: a fold without it writes the re-encoded tail
-without refs; `ravel-cli catalog fold --rebuild-key-index` (under
-"Rollout") attaches them afterwards. The query path ("Reader") probes the
+folds) MUST agree on the switch, since the switch also governs the
+partition (the day seal below, and "Rollout of the day seal"): a fold
+without it writes every part it re-encodes without refs;
+`ravel-cli catalog fold --rebuild-key-index` (under "Rollout") attaches
+them afterwards. The query path ("Reader") probes the
 leaves for a spans `trace_id` lookup and for a logs scan's declared-key
 equality, once per scan (docs/query-engine.md, "Tier-2 router").
+
+**Day seal (ADR-3939 decisions 1 and 2).** With `build_key_index_leaves`
+on, the fold's sealing policy (ADR-0063 section 1: a part seals at an
+hour boundary when the next hour would take it past
+`snapshot_part_max_entries`) also seals a part where the next hour that
+holds entries falls on a later UTC day than the part's first hour, so no
+part spans two UTC days (`partition_parts`,
+`crates/ravel-catalog/src/fold.rs`). The UTC day of an
+`ingest_hour_bucket` is `hour / 24`: the bucket counts whole hours since
+the unix epoch, which is a UTC midnight. A day with no entries gets no
+part, and the entry threshold still splits inside a day (test
+`partition_parts_seals_at_utc_days_with_the_leaf_switch`). The rule reads
+the entry set alone, so two folds of the same entries under the same
+clock and config write byte-identical HEADs
+(`day_sealed_folds_of_one_entry_set_write_identical_heads`). With the
+switch off the partition is the entry threshold's alone, as before. A
+sealed day part re-encodes to the same bytes on later folds, so the fold
+carries it forward by reference, `key_index` refs included, and an
+advance builds leaves only for the parts it re-encodes: the tail, which
+holds no day before the latest UTC day with entries, and any day a late
+record changed. Day d's leaves are built once more on the fold that seals
+it: the tail that held day d was encoded with the fold watermark (and,
+while it was the only part, `min_hour` 0), the sealed part with its own
+first and last hours, so its hash changes. That rebuild takes every
+entry from the previous tail's leaves: in
+`a_sealed_utc_day_keeps_its_leaves_across_advancing_folds` the sealing
+fold issues one previous-leaf GET, one leaf PUT and no section read for
+day d, and the two advances after it issue none of the three for day d.
+A sealed day that a late compaction, tombstone or rewrite record changes
+is re-encoded and its leaves are rebuilt from sections, since the carry
+source is the previous HEAD's last part only
+(`a_tombstoned_hour_in_a_sealed_day_rebuilds_its_leaves_from_sections`:
+no previous-leaf GET, 2 ranged GETs per surviving entry per pass).
 
 The codec is `ravel_catalog::snapshot_format::kidx`, re-exported at the
 crate root: `encode_key_index_leaf` (choosing `bucket_bits` with
@@ -1744,6 +1779,27 @@ carry no field 8 (folded with the leaf build off, which writes the same
 HEAD an old folder does), then the rebuild, HEAD otherwise unchanged, and
 the probe naming the exact blocks. The second, and a new folder running
 between the old one and the rebuild, are not tested yet.
+
+**Rollout of the day seal (ADR-3939 decision 4).** The first fold with the
+switch on under the day seal re-partitions a tenant's existing tail into
+day parts and builds each day part's leaves once, under the pair budget
+per part. Every process that folds a tenant MUST agree on the switch. A
+switch-off fold partitions the whole retained entry set by entry count
+alone, so it re-encodes every part whose span differs under the entry
+threshold alone and drops the leaf refs of every part it re-encodes; the next switch-on fold splits
+the history into days again and rebuilds those days' leaves. Both
+partitions hold the same entries, so a disagreement costs object-store
+work on every pair of folds, never wrong rows. A folder that predates the
+day seal partitions the same way with the switch on, so every folder of
+a tenant runs a version with the day seal before the switch is turned on
+for that tenant. A switch-off fold whose previous HEAD has a part
+carrying key-index leaf refs sets `key_index_switch_off_over_leaves` in
+the fold report, which `ravel-cli catalog fold` prints in text and
+`--json`, and logs one warning naming the tenant and signal; it is not
+refused and its output does not change, because turning the switch off on
+purpose looks the same (tests
+`key_index_switch_off_over_leaves_is_reported_and_warned` and
+`a_switch_off_fold_over_leaves_is_reported`).
 
 ### Idempotency marker body layout
 

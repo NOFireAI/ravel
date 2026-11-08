@@ -32,6 +32,15 @@ const TENANT: &str = "cli-fold-key-index-leaves";
 /// test runs in (the same constant as `tests/catalog_signal.rs`).
 const SEALED_AGE_NS: i64 = 3 * NS_PER_HOUR;
 
+/// Noon UTC yesterday: a fold clock for a test whose objects sit at
+/// `now - 6 h` and `now - 3 h`, which then share a UTC day whatever time the
+/// test runs, so the leaf build's day seal (ADR-3939) never splits them.
+fn yesterday_noon_ns() -> i64 {
+    const NS_PER_DAY: i64 = 24 * NS_PER_HOUR;
+    let now = ravel_cli::now_ns().expect("system clock readable");
+    now.div_euclid(NS_PER_DAY) * NS_PER_DAY - NS_PER_DAY + 12 * NS_PER_HOUR
+}
+
 /// Publishes one RSPAN object, which always carries a KEY_IDX section over
 /// `trace_id`, with one span per trace id.
 async fn publish_spans(store: &MemoryStore, now_ns: i64) {
@@ -230,7 +239,7 @@ async fn the_pair_budget_reaches_the_fold_and_the_report_prints_the_build_figure
 /// printed once, and 2 leaves.
 #[tokio::test]
 async fn an_advancing_fold_reports_four_different_build_figures() {
-    let now = ravel_cli::now_ns().expect("system clock readable");
+    let now = yesterday_noon_ns();
     let store = Arc::new(MemoryStore::new());
     for (seq, ids) in [(1u64, [1u8, 2]), (2, [3, 4]), (3, [5, 6])] {
         publish_trace_spans(&store, seq, now - 6 * NS_PER_HOUR, &ids).await;
@@ -344,5 +353,54 @@ async fn the_json_report_carries_the_pair_budget_and_the_field_pairs() {
         value["key_index_field_pairs"],
         serde_json::json!({}),
         "{off}"
+    );
+}
+
+/// ADR-3939 decision 4: a fold with the leaf switch off over a HEAD a
+/// switch-on fold wrote prints `key_index_switch_off_over_leaves: true` in
+/// text and `true` under `--json`; the switch-on fold before it reports
+/// `false`.
+#[tokio::test]
+async fn a_switch_off_fold_over_leaves_is_reported() {
+    let now = yesterday_noon_ns();
+    let store = Arc::new(MemoryStore::new());
+    publish_trace_spans(&store, 1, now - 6 * NS_PER_HOUR, &[1, 2]).await;
+    let fold = |now_ns: i64, build_key_index_leaves: bool, json: bool| {
+        catalog::fold_with_key_index_budget(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            MEMORY,
+            TENANT,
+            1,
+            SignalArg::Spans,
+            None,
+            false,
+            build_key_index_leaves,
+            ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+            None,
+            now_ns,
+            json,
+        )
+    };
+    let (on, on_printed) = fold(now - 2 * NS_PER_HOUR, true, false)
+        .await
+        .expect("switch-on fold");
+    assert!(!on.key_index_switch_off_over_leaves, "{on:?}");
+    assert_eq!(
+        on_printed
+            .matches("key_index_switch_off_over_leaves: false\n")
+            .count(),
+        1,
+        "{on_printed}"
+    );
+
+    publish_trace_spans(&store, 2, now - 3 * NS_PER_HOUR, &[3]).await;
+    let (off, printed) = fold(now, false, true).await.expect("switch-off fold");
+    assert!(off.key_index_switch_off_over_leaves, "{off:?}");
+    assert_eq!(off.entry_count, 2, "the fold still runs: {off:?}");
+    let value: serde_json::Value = serde_json::from_str(&printed).expect("one JSON document");
+    assert_eq!(
+        value["key_index_switch_off_over_leaves"],
+        serde_json::json!(true),
+        "{printed}"
     );
 }
