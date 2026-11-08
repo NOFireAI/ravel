@@ -1562,12 +1562,12 @@ mod tests {
     /// other id column, carries no key, so the conjunct contributes nothing.
     #[test]
     fn a_disjunction_across_two_key_columns_carries_no_key() {
-        let span_id = lit(ScalarValue::Binary(Some(vec![1u8; 8])));
+        // A literal `trace_id` would accept, so only the column refuses it.
         for e in [
-            or(tid_eq(fsb([1u8; 16])), col("span_id").eq(span_id.clone())),
+            or(tid_eq(fsb([1u8; 16])), col("span_id").eq(fsb([3u8; 16]))),
             or(
                 or(tid_eq(fsb([1u8; 16])), tid_eq(fsb([2u8; 16]))),
-                col("span_id").eq(span_id),
+                col("span_id").eq(fsb([3u8; 16])),
             ),
         ] {
             assert_eq!(
@@ -1578,12 +1578,13 @@ mod tests {
         }
     }
 
-    /// An arm on a non-key column carries no key.
+    /// An arm on a non-key column carries no key, even with a literal
+    /// `trace_id` would accept.
     #[test]
     fn a_disjunction_with_a_non_key_arm_carries_no_key() {
         for e in [
-            or(tid_eq(fsb([1u8; 16])), col("service_name").eq(lit("api"))),
-            or(col("name").eq(lit("GET")), tid_eq(fsb([1u8; 16]))),
+            or(tid_eq(fsb([1u8; 16])), col("service_name").eq(tid_hex())),
+            or(col("name").eq(tid_hex()), tid_eq(fsb([1u8; 16]))),
         ] {
             assert_eq!(
                 extract_spans(std::slice::from_ref(&e)),
