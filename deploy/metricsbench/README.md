@@ -1104,6 +1104,12 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    `cold_ravel_diagnostic` picks it; none on `ci`, so
    `stage1.unrouted_cold` says `not applicable`, case z1) cold, into
    `stage1-unrouted/cold.json`; a cold failure is stamped, not fatal.
+   `stage1.unrouted_cold_records` then stamps the cold pass's record count:
+   `records` (the runs with a `ravel_cost`, its `runs` less `failed_runs`),
+   `expected_records` (its entries times `repetitions_per_entry`) and
+   `records_short` (the difference), all 0 with `applicable` false when the
+   cold stamp says `not applicable`; a cold stamp that failed leaves this
+   stamp a `failed:` string instead, so its band reads it as missing.
 3. `stage1-leaves`: `ravel-cli catalog fold --rebuild-key-index --signal
    metrics --metrics-label-index --json`, into `stage1-leaves.json`.
    `stage1.leaves` stamps `wall_ms` and the report's `leaves_written`,
@@ -1121,21 +1127,31 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    `stage1.restart`).
 5. `stage1-routed`: the inspect again, into `stage1-routed.inspect.txt` and
    `stage1.routed_catalog`, refused when fewer parts carry a `label_value`
-   leaf than `stage1-leaves` rebuilt (`parts_rebuilt`, case z13); then the
-   passes as in step 2 with `--pass-label folded-routed`, into
-   `stage1-routed/`.
+   leaf than `stage1-leaves` rebuilt (`parts_rebuilt`, case z13), and
+   refused naming the figure when `parts_rebuilt` is not a whole number
+   (case z24); then the passes as in step 2 with `--pass-label
+   folded-routed`, into `stage1-routed/`, and `stage1.routed_cold_records`.
 6. The two steady passes are compared into `stage1-compare.json`, stamped as
    `stage1.compare`: per corpus entry the set of `result_hash` values each
    pass's records carry, `entries_compared`, `entries_equal`,
    `entries_differing_count` with the differing entries and their hashes,
-   and `entries_without_hash_count` with those entries. Under `passes`, for
-   `unrouted` and `routed` each: `records`, `records_null_hash` (no
-   `result_hash`), `records_not_ok` (a `status` other than `ok`),
-   `records_label_index_null` (no whole-number `segmentsPrunedByLabelIndex`,
-   counted apart and never as 0), `records_pruned_by_label_index` (one above
-   0) and `segments_pruned_by_label_index` (their sum over the records that
-   carry one). A difference is recorded and the run still exits 0 (cases z2,
-   z15 and z16); the band file below is the verdict.
+   and `entries_without_hash_count` with those entries. ADR-3694 row 9 is
+   checked by status (`status_check` states the rule): per entry the set of
+   `status` values each pass's records carry is compared, and
+   `statements_status_differing` lists each entry whose two sets differ,
+   with both sets, beside its count (an entry `incorrect` in both passes
+   is not listed, case z21; one `ok` unrouted and `incorrect` routed is, case
+   z22). Under `passes`, for `unrouted` and `routed` each: `records`,
+   `records_answered` (status `ok` or `incorrect`, the two the oracle
+   answers), `records_answered_null_hash` (an answered record with no
+   `result_hash`), `records_status_unexpected` (any other status: `partial`,
+   `timeout`, `error`, `unsupported_construct`, `refused` or a failure
+   string), `records_label_index_null` (no whole-number
+   `segmentsPrunedByLabelIndex`, counted apart and never as 0),
+   `records_pruned_by_label_index` (one above 0) and
+   `segments_pruned_by_label_index` (their sum over the records that carry
+   one). A difference is recorded and the run still exits 0 (cases z2, z15,
+   z16 and z22); the band file below is the verdict.
 7. `stage1-holders`: `ravel-cli catalog list --json` lists the L0 and L1
    data objects the folded snapshot resolves into `stage1-objects.jsonl`;
    the bucket's L0 and L1 data objects (`t/*/m/l0/*.rseg`,
@@ -1148,12 +1164,20 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    the bucket, the method, `objects_listed`, `objects_above_watermark`
    (listed objects whose ingest hour is after the unrouted snapshot's
    `watermark_hour`), `objects_l0`, `objects_l1`, `series_total`, per
-   statement `segments_in_window` and `holders`, the skipped count, and the
-   window check: each statement whose `segments_in_window` is not the
-   `segmentsFetched + segmentsPruned` of every one of its `stage1-unrouted`
-   records is listed under `window_mismatches` with what the pass resolved
-   (case z17), and one with no such record, or a record lacking either
-   figure, under `window_unchecked` (case z18), each with its count.
+   statement `segments_in_window`, `named_in_window`, `name_pruned`,
+   `unrouted_fetched_expected`, `holders`, `route_bound` and
+   `route_bound_reason`, the skipped count, the window check and the
+   route-bound list. The window check compares the `segmentsFetched` of
+   every one of a statement's `stage1-unrouted` records with its
+   `unrouted_fetched_expected` (see holders.json below): one that differs is
+   listed under `window_mismatches` with both figures, `named_in_window`,
+   `segments_in_window` and the fetched values (case z17); an object in the
+   window that holds none of the statement's metric, and a metric no object
+   holds (0 expected, 0 fetched), match (case z20). A statement with no such
+   record, a record with no whole-number `segmentsFetched`, or no
+   whole-number expected figure is listed under `window_unchecked` (case
+   z18), each with its count. `route_unbound` lists each statement whose
+   `route_bound` is false with its reason (case z23).
 
 A run whose ingest verification failed, or whose steps 15 to 18 were
 skipped, runs none of them and stamps each `skipped:` and why (case z9).
@@ -1207,9 +1231,22 @@ to the folded read-back for this with or without `MB_STAGE1`.
 
 **holders.json.** How many data objects in each selective statement's fetch
 window hold a series it asks for, counted without the router or the key
-index. Holders are a subset of `segments_in_window`, the objects in the
-window, which are the segments an unrouted query resolves; the run checks
-that count against what the unrouted pass resolved (step 7). The method,
+index. `segments_in_window` is every object whose event time range overlaps
+the statement's fetch window, whatever metrics it holds; `named_in_window`
+the ones among them holding a series of one of the statement's metric
+names; `holders` the ones among those with a series matching a qualifying
+selector in full. When every selector names the same metric
+(`name_pruned`), Ravel's unrouted resolve prunes by that name's postings and
+fetches `named_in_window` objects; when the selectors name different
+metrics it does not prune by name and fetches `segments_in_window`. That
+figure is `unrouted_fetched_expected`, and the run checks it against the
+`segmentsFetched` the unrouted pass reported (step 7). ADR-3694 row 3's
+holders-to-fetched ratio takes that unrouted `segmentsFetched` as its
+denominator, not `segments_in_window`. A statement with a selector that has
+no `label="value"` matcher with a non-empty value is `route_bound` false:
+the router keeps every object holding that selector's metric, so `holders`
+is no bound on what the routed pass opens, and the statement is left out of
+every holders-versus-routed comparison. The method,
 as `metricsbench_holders` writes it into the file and `stage1.holders.method`
 stamps it:
 
@@ -1223,15 +1260,23 @@ stamps it:
 > selector's offset or pinned by its @, padded back by the selector's range
 > (5m lookback for a vector selector, the matrix range, plus enclosing
 > subquery ranges), as Ravel's engine resolves it; segments_in_window counts
-> the objects whose event time range overlaps that window (inclusive), and
-> holders the ones among them with a series matching a qualifying selector
-> in full (metric name and every matcher)
+> the objects whose event time range overlaps that window (inclusive)
+> whatever metrics they hold, named_in_window the ones among them with a
+> series of one of the statement's metric names, and holders the ones among
+> them with a series matching a qualifying selector in full (metric name and
+> every matcher); unrouted_fetched_expected is named_in_window when every
+> selector names the same metric (Ravel's resolve then prunes by that
+> name's postings) and segments_in_window otherwise; route_bound is false
+> when a selector has no qualifying matcher, since the router then keeps
+> every object holding that selector's metric
 
 The file holds `method`, `profile`, `objects_l0`, `objects_l1`,
 `series_total`, `statements` (per qualifying entry: `id`, `promql`, `eval`,
-`selectors`, `positive_equalities`, `fetch_window` with `start_ns` and
-`end_ns`, `segments_in_window` and `holders`) and `skipped` (`id` and
-`reason` for each entry that does not qualify).
+`selectors`, `positive_equalities`, `metrics`, `name_pruned`,
+`fetch_window` with `start_ns` and `end_ns`, `segments_in_window`,
+`named_in_window`, `unrouted_fetched_expected`, `holders`, `route_bound`
+and `route_bound_reason`) and `skipped` (`id` and `reason` for each entry
+that does not qualify).
 
 **Checking a run.** `stage1-check.sh BANDS OUT-DIR` checks a run's figures
 against a band file and is the pass/fail for a Stage 1 run.
@@ -1261,12 +1306,18 @@ stderr and the count; 64 is bad usage; 65 a band file that cannot be used
 one part rebuilt with a `label_value` leaf and no deferred, over-cap or
 erasure-gated part and no uncovered entry; no `label_value` leaf part in
 the unrouted snapshot and at least one in the routed one; at least one
-compared entry, every compared entry's hashes equal and none missing; in
-each pass no record with a null hash, a status other than `ok` or no
-`segmentsPrunedByLabelIndex` figure; no unrouted record and at least one
-routed record with `segmentsPrunedByLabelIndex` above 0; no listed object
-above the watermark, no window mismatch and no unchecked statement; and at
-least one holder for `mb_selective_job_rate_sum`. Every basis is a
+compared entry, every compared entry's hashes equal and none missing; per
+ADR-3694 row 9, no entry whose status set differs between the passes and,
+in each pass, no record with a status other than `ok` or `incorrect` and no
+`ok` or `incorrect` record without a hash (an entry `incorrect` in both
+passes, a 1-ULP oracle miss, passes these); in each pass no record without
+a `segmentsPrunedByLabelIndex` figure; no unrouted record and at least one
+routed record with `segmentsPrunedByLabelIndex` above 0; in each pass a
+cold record count present, with 0 records and none short on `ci`, where no
+cold entry applies; no listed object above the watermark, no statement
+whose unrouted `segmentsFetched` differs from its
+`unrouted_fetched_expected` and no unchecked statement; and at least one
+holder for `mb_selective_job_rate_sum`, which is route-bound. Every basis is a
 prediction until a `stage1=true` dispatch measures it.
 
 The nightly workflow's manual dispatch takes a `stage1` input (default

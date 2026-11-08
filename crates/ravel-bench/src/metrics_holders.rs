@@ -25,9 +25,25 @@
 //! matcher with a non-empty value (the metric name alone does not count). An
 //! object holds the statement when it is in the window and one of its series
 //! matches one of the statement's qualifying selectors in full: the metric
-//! name and every matcher, `!=`, `=~` and `!~` included. Holders are a subset
-//! of the objects in the window, which are the segments an unrouted query
-//! resolves.
+//! name and every matcher, `!=`, `=~` and `!~` included.
+//!
+//! `segments_in_window` counts every object in the window, whatever metrics it
+//! holds. It is not what an unrouted query fetches: Ravel's resolve also
+//! prunes by name postings when every selector of the statement names the same
+//! metric, so an unrouted pass fetches the objects in the window that hold
+//! that metric (`named_in_window`), and every object in the window only when
+//! the selectors name different metrics. `unrouted_fetched_expected` is that
+//! figure, the `segmentsFetched` an unrouted pass over a folded snapshot is
+//! expected to report; ADR-3694 row 3's denominator is the unrouted pass's
+//! `segmentsFetched` itself, never `segments_in_window`.
+//!
+//! A statement is `route_bound` when every one of its selectors carries a
+//! qualifying matcher. A selector with only its metric name gives the
+//! label-value router nothing to probe but the name, so a routed pass keeps
+//! every object holding that metric, which `holders` (counted over the
+//! qualifying selectors) does not bound; such a statement says why in
+//! `route_bound_reason` and is left out of any holders-versus-routed
+//! comparison.
 
 use std::collections::BTreeMap;
 
@@ -49,8 +65,13 @@ pub const HOLDERS_METHOD: &str = "the data objects the folded snapshot names (L0
      selector's offset or pinned by its @, padded back by the selector's range (5m lookback for a \
      vector selector, the matrix range, plus enclosing subquery ranges), as Ravel's engine \
      resolves it; segments_in_window counts the objects whose event time range overlaps that \
-     window (inclusive), and holders the ones among them with a series matching a qualifying \
-     selector in full (metric name and every matcher)";
+     window (inclusive) whatever metrics they hold, named_in_window the ones among them with a \
+     series of one of the statement's metric names, and holders the ones among them with a \
+     series matching a qualifying selector in full (metric name and every matcher); \
+     unrouted_fetched_expected is named_in_window when every selector names the same metric \
+     (Ravel's resolve then prunes by that name's postings) and segments_in_window otherwise; \
+     route_bound is false when a selector has no qualifying matcher, since the router then \
+     keeps every object holding that selector's metric";
 
 /// One data object the snapshot names, as `ravel-cli catalog list --json`
 /// prints it.
@@ -86,11 +107,29 @@ pub struct HolderCount {
     pub selectors: Vec<String>,
     /// Their positive equality matchers, `label="value"`, in selector order.
     pub positive_equalities: Vec<String>,
+    /// The metric names of all the statement's selectors, each once, in
+    /// selector order.
+    pub metrics: Vec<String>,
+    /// Every selector names the same metric, so Ravel's resolve prunes the
+    /// snapshot by that name's postings.
+    pub name_pruned: bool,
     pub fetch_window: FetchWindow,
-    /// Data objects whose event time range overlaps `fetch_window`.
+    /// Data objects whose event time range overlaps `fetch_window`, whatever
+    /// metrics they hold.
     pub segments_in_window: u64,
-    /// Objects among those holding at least one matching series.
+    /// Objects among those holding a series of one of `metrics`.
+    pub named_in_window: u64,
+    /// The `segmentsFetched` an unrouted pass over a folded snapshot reports:
+    /// `named_in_window` when `name_pruned`, else `segments_in_window`.
+    pub unrouted_fetched_expected: u64,
+    /// Objects in the window holding at least one series that matches a
+    /// qualifying selector.
     pub holders: u64,
+    /// Every selector has a qualifying matcher, so `holders` is comparable
+    /// with what a routed pass opens.
+    pub route_bound: bool,
+    /// Why not, when `route_bound` is false.
+    pub route_bound_reason: Option<String>,
 }
 
 /// A statement left out, and why.
@@ -187,13 +226,17 @@ pub fn fetch_window(
     Ok(window)
 }
 
-/// A statement being counted: its qualifying selectors, its window, and the
-/// objects seen so far in the window and holding it.
+/// A statement being counted: its qualifying selectors, its metric names, its
+/// window, and the objects seen so far in the window, holding one of its
+/// metrics, and holding it.
 struct Tally {
     entry: usize,
     selectors: Vec<SelectorMatch>,
+    metrics: Vec<String>,
+    route_unbound: Option<String>,
     window: FetchWindow,
     in_window: u64,
+    named: u64,
     holders: u64,
 }
 
@@ -225,6 +268,22 @@ where
                 continue;
             }
         };
+        let mut metrics: Vec<String> = Vec::new();
+        for selector in &selectors {
+            if !metrics.contains(&selector.metric) {
+                metrics.push(selector.metric.clone());
+            }
+        }
+        let route_unbound = selectors
+            .iter()
+            .find(|s| s.positive_equalities.is_empty())
+            .map(|s| {
+                format!(
+                    "selector `{}` has no label=\"value\" matcher with a non-empty value, so the \
+                     router keeps every object holding `{}`, which holders does not count",
+                    s.text, s.metric
+                )
+            });
         let qualifying: Vec<SelectorMatch> = selectors
             .into_iter()
             .filter(|s| !s.positive_equalities.is_empty())
@@ -239,8 +298,11 @@ where
             Ok(Some(window)) => tallies.push(Tally {
                 entry: index,
                 selectors: qualifying,
+                metrics,
+                route_unbound,
                 window,
                 in_window: 0,
+                named: 0,
                 holders: 0,
             }),
             Ok(None) => skipped.push(skip("no metric selector".to_string())),
@@ -260,10 +322,18 @@ where
                 .push((t, s));
         }
     }
+    // metric name -> the tallies naming it in any selector.
+    let mut by_name: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (t, tally) in tallies.iter().enumerate() {
+        for metric in &tally.metrics {
+            by_name.entry(metric.clone()).or_default().push(t);
+        }
+    }
 
     let limits = ReaderLimits::default();
     let (mut objects_l0, mut objects_l1, mut series_total) = (0u64, 0u64, 0u64);
     let mut in_window = vec![false; tallies.len()];
+    let mut named = vec![false; tallies.len()];
     let mut held = vec![false; tallies.len()];
     for object in objects {
         let (listed, bytes) = object?;
@@ -283,14 +353,18 @@ where
         for (t, tally) in tallies.iter().enumerate() {
             in_window[t] = tally.window.overlaps(&listed);
         }
+        named.iter_mut().for_each(|n| *n = false);
         held.iter_mut().for_each(|h| *h = false);
         for series in &catalog {
-            let Some(candidates) = series
-                .entry
-                .labels
-                .get("__name__")
-                .and_then(|name| by_metric.get(name))
-            else {
+            let name = series.entry.labels.get("__name__");
+            for &t in name
+                .and_then(|name| by_name.get(name))
+                .into_iter()
+                .flatten()
+            {
+                named[t] |= in_window[t];
+            }
+            let Some(candidates) = name.and_then(|name| by_metric.get(name)) else {
                 continue;
             };
             let labels: Vec<(String, String)> = series
@@ -307,6 +381,7 @@ where
         }
         for (t, tally) in tallies.iter_mut().enumerate() {
             tally.in_window += u64::from(in_window[t]);
+            tally.named += u64::from(named[t]);
             tally.holders += u64::from(held[t]);
         }
     }
@@ -321,6 +396,7 @@ where
             .into_iter()
             .map(|tally| {
                 let entry = entries[tally.entry];
+                let name_pruned = tally.metrics.len() == 1;
                 HolderCount {
                     id: entry.id.clone(),
                     promql: entry.promql.clone(),
@@ -332,9 +408,19 @@ where
                         .map(|(label, value)| format!("{label}=\"{value}\""))
                         .collect(),
                     selectors: tally.selectors.into_iter().map(|s| s.text).collect(),
+                    metrics: tally.metrics,
+                    name_pruned,
                     fetch_window: tally.window,
                     segments_in_window: tally.in_window,
+                    named_in_window: tally.named,
+                    unrouted_fetched_expected: if name_pruned {
+                        tally.named
+                    } else {
+                        tally.in_window
+                    },
                     holders: tally.holders,
+                    route_bound: tally.route_unbound.is_none(),
+                    route_bound_reason: tally.route_unbound,
                 }
             })
             .collect(),
@@ -524,6 +610,272 @@ mod tests {
         }
         let skipped: Vec<&str> = report.skipped.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(skipped, ["name_only", "empty_eq"]);
+    }
+
+    /// `named_in_window` leaves out an object in the window that holds none
+    /// of the statement's metrics (`other`), and is 0 for a statement naming
+    /// a metric no object holds; `unrouted_fetched_expected` follows it when
+    /// every selector names one metric and is `segments_in_window` when they
+    /// name two. A selector with no qualifying matcher makes the statement
+    /// not route-bound, and says which selector.
+    #[test]
+    fn named_in_window_counts_the_objects_holding_the_statements_metrics() {
+        let objects = vec![
+            (
+                listed("a", "L1", 90, 99),
+                object(&[&[("__name__", "http_requests"), ("job", "api")]]),
+            ),
+            (
+                listed("other", "L0", 90, 99),
+                object(&[&[("__name__", "other_metric"), ("job", "api")]]),
+            ),
+            (
+                listed("old_other", "L1", 0, 9),
+                object(&[&[("__name__", "other_metric"), ("job", "api")]]),
+            ),
+        ];
+        let corpus = vec![
+            entry("eq_only", r#"http_requests{job="api"}"#),
+            entry("absent", r#"absent_metric{job="api"}"#),
+            entry(
+                "two_metrics",
+                r#"http_requests{job="api"} / other_metric{job="api"}"#,
+            ),
+            entry(
+                "ratio_unbound",
+                r#"sum(http_requests{job="api"}) / sum(http_requests)"#,
+            ),
+        ];
+        let report =
+            count_holders(&corpus, "ci", &grid(), objects.into_iter().map(Ok)).expect("counts");
+        let counts: Vec<(&str, u64, u64, bool, u64, u64)> = report
+            .statements
+            .iter()
+            .map(|s| {
+                (
+                    s.id.as_str(),
+                    s.segments_in_window,
+                    s.named_in_window,
+                    s.name_pruned,
+                    s.unrouted_fetched_expected,
+                    s.holders,
+                )
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                ("eq_only", 2, 1, true, 1, 1),
+                ("absent", 2, 0, true, 0, 0),
+                ("two_metrics", 2, 2, false, 2, 2),
+                ("ratio_unbound", 2, 1, true, 1, 1),
+            ]
+        );
+        assert_eq!(
+            report.statements[2].metrics,
+            ["http_requests", "other_metric"]
+        );
+        let bound: Vec<(&str, bool, Option<&str>)> = report
+            .statements
+            .iter()
+            .map(|s| {
+                (
+                    s.id.as_str(),
+                    s.route_bound,
+                    s.route_bound_reason.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            bound,
+            [
+                ("eq_only", true, None),
+                ("absent", true, None),
+                ("two_metrics", true, None),
+                (
+                    "ratio_unbound",
+                    false,
+                    Some(
+                        "selector `http_requests` has no label=\"value\" matcher with a \
+                         non-empty value, so the router keeps every object holding \
+                         `http_requests`, which holders does not count"
+                    )
+                ),
+            ]
+        );
+    }
+
+    /// The window check's two figures, side by side on a real folded
+    /// snapshot: Ravel's engine, run unrouted over the same objects the count
+    /// reads, fetches exactly `unrouted_fetched_expected` for each statement.
+    /// `other` is in the window but outside `http_requests`' name postings,
+    /// `absent_metric` is in no object's postings, and the out-of-window
+    /// objects show that `segments_in_window` is not fetched + pruned.
+    #[tokio::test]
+    async fn unrouted_fetched_expected_is_what_the_engine_fetches() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use ravel_catalog::{
+            Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
+            DEFAULT_MAX_FLUSH_LIFETIME_NS,
+        };
+        use ravel_commit::publish::RetryPolicy;
+        use ravel_commit::record::NewCommitRecord;
+        use ravel_commit::{keys, publish, record};
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_query::{EngineConfig, QueryEngine};
+        use ravel_segment::{
+            IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7,
+        };
+        use ravel_types::Signal;
+
+        const HOUR_NS: i64 = 3_600_000_000_000;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("holders");
+        let th = tenant.hash();
+        let hour = 5_000u32;
+        let newest_ns = i64::from(hour) * HOUR_NS + 50 * MIN;
+        let old_ns = i64::from(hour) * HOUR_NS + 10 * MIN;
+        let mut objects = Vec::new();
+        for (seq, (key, metric, ts_ns)) in [
+            ("a", "http_requests", newest_ns - MIN),
+            ("other", "other_metric", newest_ns - MIN),
+            ("old_a", "http_requests", old_ns),
+            ("old_other", "other_metric", old_ns),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let labels = LabelSet::new(vec![
+                Label {
+                    name: "__name__".to_string(),
+                    value: metric.to_string(),
+                },
+                Label {
+                    name: "job".to_string(),
+                    value: "api".to_string(),
+                },
+            ])
+            .expect("labels");
+            let writer_id = uuid::Uuid::new_v4();
+            let written = SegmentWriter::write(
+                vec![SeriesInput {
+                    series_id: SeriesId::compute(&tenant, metric, &labels).expect("id"),
+                    labels,
+                    samples: vec![Sample { ts_ns, value: 1.0 }],
+                }],
+                SegmentIdentity {
+                    tenant_hash: th.0,
+                    shard: 0,
+                    writer_id: writer_id.to_string(),
+                    writer_epoch: 1,
+                    writer_seq: seq as u64 + 1,
+                },
+                IngestBounds {
+                    min_ingest_ts_ns: 0,
+                    max_ingest_ts_ns: 0,
+                },
+            )
+            .expect("segment");
+            let rec = record::build(NewCommitRecord {
+                tenant_hash: th,
+                signal: Signal::Metrics,
+                shard: 0,
+                writer_id,
+                writer_epoch: 1,
+                writer_seq: seq as u64 + 1,
+                object_size: written.bytes.len() as u64,
+                content_hash: written.summary.blake3,
+                sample_count: written.summary.sample_count,
+                series_count: written.summary.series_count,
+                min_event_ts_ns: written.summary.min_event_ts_ns,
+                max_event_ts_ns: written.summary.max_event_ts_ns,
+                min_ingest_ts_ns: written.summary.min_event_ts_ns,
+                max_ingest_ts_ns: written.summary.max_event_ts_ns,
+                segment_format_version: u32::from(VERSION_V7),
+                created_unix_ns: 0,
+                ingest_hour_bucket: hour,
+            })
+            .expect("record");
+            let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+            publish::put_data_object(store.as_ref(), &data_key, written.bytes.clone())
+                .await
+                .expect("put");
+            publish::publish(store.as_ref(), &rec, &RetryPolicy::default())
+                .await
+                .expect("publish");
+            objects.push((
+                ListedObject {
+                    key: key.to_string(),
+                    level: "L0".to_string(),
+                    min_event_ts_ns: written.summary.min_event_ts_ns,
+                    max_event_ts_ns: written.summary.max_event_ts_ns,
+                },
+                written.bytes.to_vec(),
+            ));
+        }
+        let now = (i64::from(hour) + 1) * HOUR_NS
+            + DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + DEFAULT_FOLD_SAFETY_MARGIN_NS;
+        let catalog = Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog");
+        let folded = catalog
+            .fold(&th, Signal::Metrics, uuid::Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("fold");
+        assert!(folded.postings_built, "the unrouted resolve prunes by name");
+        let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
+
+        let corpus = vec![
+            entry("eq_only", r#"http_requests{job="api"}"#),
+            entry("absent", r#"absent_metric{job="api"}"#),
+            entry(
+                "two_metrics",
+                r#"http_requests{job="api"} / other_metric{job="api"}"#,
+            ),
+        ];
+        let grid = QueryGrid {
+            newest_ms: newest_ns / 1_000_000,
+            ..grid()
+        };
+        let report =
+            count_holders(&corpus, "ci", &grid, objects.into_iter().map(Ok)).expect("counts");
+        let mut figures = Vec::new();
+        for statement in &report.statements {
+            let (_, stats) = engine
+                .instant_with_stats(
+                    th,
+                    &statement.promql,
+                    grid.newest_ms,
+                    &[],
+                    now,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("query");
+            figures.push((
+                statement.id.as_str(),
+                statement.segments_in_window,
+                statement.unrouted_fetched_expected,
+                stats.segments_fetched,
+                stats.segments_pruned,
+            ));
+        }
+        assert_eq!(
+            figures,
+            [
+                ("eq_only", 2, 1, 1, 2),
+                ("absent", 2, 0, 0, 4),
+                ("two_metrics", 2, 2, 2, 0),
+            ]
+        );
+        let mismatches = figures
+            .iter()
+            .filter(|(_, _, expected, fetched, _)| expected != fetched)
+            .count();
+        assert_eq!(mismatches, 0);
     }
 
     /// An object that does not decode voids the count rather than being

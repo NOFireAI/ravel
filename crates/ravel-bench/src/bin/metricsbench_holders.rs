@@ -6,8 +6,10 @@
 //! `deploy/metricsbench/run.sh`'s `stage1-holders` step) and writes
 //! `holders.json`: for each corpus statement under the ingest run's profile
 //! with a positive equality matcher, the objects whose time range overlaps
-//! the statement's fetch window on the run's query grid, and how many of
-//! those hold at least one matching series. The window and counting rules
+//! the statement's fetch window on the run's query grid, how many of those
+//! hold a series of one of its metrics (what an unrouted resolve fetches
+//! when every selector names one metric), and how many hold at least one
+//! matching series. The window and counting rules
 //! and the method statement live in [`ravel_bench::metrics_holders`]; no
 //! router or key index is involved.
 //!

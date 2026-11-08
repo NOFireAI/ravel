@@ -187,7 +187,9 @@
 #               provenance.json), then the cold pass's selection (see
 #               cold_ravel_diagnostic) the same way into
 #               <out>/stage1-unrouted/cold.json (a cold failure is stamped,
-#               never fatal)
+#               never fatal), its records with a ravel_cost counted against
+#               the selected entries x repetitions as
+#               stage1.unrouted_cold_records (0 of 0 when no entry applies)
 #   stage1-leaves  ravel-cli catalog fold --rebuild-key-index --signal metrics
 #               --metrics-label-index --json into <out>/stage1-leaves.json;
 #               stamped as stage1.leaves: the report's leaf, part and byte
@@ -204,10 +206,13 @@
 #               then the passes as stage1-unrouted, --pass-label
 #               folded-routed, into <out>/stage1-routed/. Then
 #               <out>/stage1-compare.json: per entry, the steady passes'
-#               result_hash sets compared, and per pass the records with a
-#               null result_hash, with a status other than ok, with no
-#               segmentsPrunedByLabelIndex figure (counted apart, never as 0)
-#               and with one above 0; stamped as stage1.compare. A difference
+#               result_hash sets compared and status sets compared (ADR-3694
+#               row 9: the entries whose set of statuses differs between the
+#               passes), and per pass the records with a status other than ok
+#               or incorrect, the ok or incorrect records with a null
+#               result_hash, the records with no segmentsPrunedByLabelIndex
+#               figure (counted apart, never as 0) and with one above 0;
+#               stamped as stage1.compare. A difference
 #               is recorded, not fatal: stage1-check.sh's band file is the
 #               verdict
 #   stage1-holders  ravel-cli catalog list --json (the L0 and L1 data objects
@@ -216,10 +221,12 @@
 #               on the createbuckets service into <out>/stage1-objects/;
 #               metricsbench_holders over the listed ones into
 #               <out>/holders.json, the download deleted. Stamped as
-#               stage1.holders: per statement segments_in_window and holders,
-#               the method, and the statements whose segments_in_window is not
-#               the unrouted pass's segmentsFetched + segmentsPruned (or could
-#               not be checked against it)
+#               stage1.holders: per statement segments_in_window,
+#               named_in_window, unrouted_fetched_expected, holders and
+#               route_bound, the method, the statements an unrouted record of
+#               which has a segmentsFetched other than
+#               unrouted_fetched_expected (or that could not be checked
+#               against it), and the statements that are not route-bound
 #
 # With or without MB_STAGE1, the query step's ravel_cost records carry
 # pass_label unfolded while ravel-server has published no fold gauge, else
@@ -333,7 +340,7 @@ STAGE1_UNROUTED_FLAGS="--disable-fold --fold-key-index-leaves"
 STAGE1_ROUTED_FLAGS="--disable-fold --fold-key-index-leaves --fold-metrics-label-index"
 # Every stage1.* stamp a step writes: null until it runs, "skipped: why" when
 # the steps do not run.
-STAGE1_KEYS="background_fold fold_restart fold unrouted_restart unrouted_catalog unrouted unrouted_cold leaves restart routed_catalog routed routed_cold compare holders"
+STAGE1_KEYS="background_fold fold_restart fold unrouted_restart unrouted_catalog unrouted unrouted_cold unrouted_cold_records leaves restart routed_catalog routed routed_cold routed_cold_records compare holders"
 
 EXIT_USAGE=64
 EXIT_REFUSED=65
@@ -1035,6 +1042,31 @@ elif op == "cold-final":
     print(json.dumps({"regime": regime, "comparable": False, "file": os.path.basename(out_path),
                       "corpus": corpus_path, "entries": ids, "repetitions_per_entry": reps, "runs": len(runs),
                       "failed_runs": len(bad), "missing_runs": missing}))
+elif op == "cold-count":
+    # The stamps file and a cold pass's stamp key: how many cold records with
+    # a ravel_cost the pass produced against the entries x repetitions it
+    # selected, or 0 of 0 when the stamp says no entry applies. Exit 3 and why
+    # on stdout when the stamp is neither, so the count is absent rather
+    # than 0.
+    stamps_path, key = args
+    cur = load(stamps_path)
+    for k in key.split("."):
+        cur = cur.get(k) if isinstance(cur, dict) else None
+    if isinstance(cur, str) and cur.startswith("not applicable:"):
+        print(json.dumps({"applicable": False, "expected_records": 0, "records": 0, "records_short": 0,
+                          "basis": f"{key} is {cur!r}"}))
+        sys.exit(0)
+    try:
+        assert isinstance(cur, dict)
+        entries, reps, runs, bad = cur["entries"], cur["repetitions_per_entry"], cur["runs"], cur["failed_runs"]
+        assert isinstance(entries, list) and all(isinstance(v, int) and not isinstance(v, bool) for v in (reps, runs, bad))
+    except (AssertionError, KeyError):
+        print(f"{key} is {json.dumps(cur)[:200]}, not a cold pass stamp")
+        sys.exit(3)
+    expected = len(entries) * reps
+    print(json.dumps({"applicable": True, "expected_records": expected, "records": runs - bad,
+                      "records_short": expected - (runs - bad),
+                      "basis": f"{key}: records with a ravel_cost (runs - failed_runs) against entries x repetitions_per_entry"}))
 elif op in ("stage1-fold", "stage1-leaves"):
     # ravel-cli catalog fold --json's report, the step's wall time in ms:
     # print the stamp. Exit 3 and why on stdout when the report is not JSON
@@ -1122,23 +1154,43 @@ elif op == "stage1-compare":
         # never as 0.
         v = rec.get("segmentsPrunedByLabelIndex")
         return v if isinstance(v, int) and not isinstance(v, bool) else None
+    # ADR-3694 row 9: the oracle's verdict on a statement is the set of
+    # statuses its records carry, and routing must not change it. ok and
+    # incorrect are the two answered statuses (a statement known to differ
+    # from Prometheus stays incorrect in both passes); any other status is a
+    # record that did not answer.
+    ANSWERED = ("ok", "incorrect")
+    def statuses(rows):
+        by = {}
+        for x in rows:
+            by.setdefault(x.get("entry"), set()).add(str(x.get("status")))
+        return by
+    us, rs = statuses(unrouted), statuses(routed)
+    status_differing = [{"entry": e, "unrouted": sorted(us.get(e, set())), "routed": sorted(rs.get(e, set()))}
+                        for e in sorted(set(us) | set(rs), key=str) if us.get(e) != rs.get(e)]
     def tally(rows):
         figures = [pruned(x) for x in rows]
+        answered = [x for x in rows if x.get("status") in ANSWERED]
         return {"records": len(rows),
-                "records_null_hash": sum(1 for x in rows if not x.get("result_hash")),
-                "records_not_ok": sum(1 for x in rows if x.get("status") != "ok"),
+                "records_answered": len(answered),
+                "records_answered_null_hash": sum(1 for x in answered if not x.get("result_hash")),
+                "records_status_unexpected": len(rows) - len(answered),
                 "records_label_index_null": sum(1 for v in figures if v is None),
                 "records_pruned_by_label_index": sum(1 for v in figures if v is not None and v > 0),
                 "segments_pruned_by_label_index": sum(v for v in figures if v is not None)}
-    doc = {"schema": "metricsbench-stage1-compare/2",
+    doc = {"schema": "metricsbench-stage1-compare/3",
            "unrouted": os.path.basename(os.path.dirname(unrouted_path)) + "/" + os.path.basename(unrouted_path),
            "routed": os.path.basename(os.path.dirname(routed_path)) + "/" + os.path.basename(routed_path),
            "entries_compared": len(equal) + len(differing), "entries_equal": len(equal),
            "entries_differing_count": len(differing), "entries_differing": differing,
            "entries_without_hash_count": len(without), "entries_without_hash": without,
+           "status_check": "per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9); records_status_unexpected counts records whose status is neither ok nor incorrect; records_answered_null_hash counts ok or incorrect records with no result_hash",
+           "statements_status_differing_count": len(status_differing),
+           "statements_status_differing": status_differing,
            "passes": {"unrouted": tally(unrouted), "routed": tally(routed)}}
     dump(out_path, doc)
-    print(json.dumps({**doc, "entries_differing": [d["entry"] for d in differing]}))
+    print(json.dumps({**doc, "entries_differing": [d["entry"] for d in differing],
+                      "statements_status_differing": [d["entry"] for d in status_differing]}))
 elif op == "stage1-inspect":
     # `catalog inspect --signal metrics` text, its file name for the stamp,
     # the command as run: the snapshot HEAD's watermark hour, its part count,
@@ -1189,10 +1241,12 @@ elif op == "stage1-inspect":
 elif op == "stage1-holders":
     # holders.json, the unrouted pass's diagnostics, the catalog listing the
     # count read, the watermark hour of the snapshot the passes ran on, the
-    # bucket. Per statement, segments_in_window must equal what the unrouted
-    # pass resolved for it (segmentsFetched + segmentsPruned of each of its
-    # records); prints the stamp. Exit 3 and why on stdout when an input
-    # cannot be read.
+    # bucket. Per statement, every unrouted record's segmentsFetched must
+    # equal the statement's unrouted_fetched_expected (named_in_window when
+    # its selectors name one metric, since the unrouted resolve prunes by that
+    # name's postings; segments_in_window when they name different metrics,
+    # which the resolve does not prune by name); prints the stamp. Exit 3 and
+    # why on stdout when an input cannot be read.
     holders_path, diag_path, list_path, watermark, bucket = args
     try:
         doc = load(holders_path)
@@ -1207,27 +1261,36 @@ elif op == "stage1-holders":
         sys.exit(3)
     def whole(v):
         return isinstance(v, int) and not isinstance(v, bool)
-    resolved = {}
+    fetched = {}
     for r in rows:
-        f, p = r.get("segmentsFetched"), r.get("segmentsPruned")
-        resolved.setdefault(r.get("entry"), []).append(f + p if whole(f) and whole(p) else None)
-    mismatches, unchecked, per = [], [], []
+        f = r.get("segmentsFetched")
+        fetched.setdefault(r.get("entry"), []).append(f if whole(f) else None)
+    mismatches, unchecked, per, unbound = [], [], [], []
     for s in statements:
-        sid, n = s.get("id"), s.get("segments_in_window")
-        per.append({"id": sid, "segments_in_window": n, "holders": s.get("holders")})
-        seen = resolved.get(sid, [])
-        if not seen or None in seen or not whole(n):
+        sid, want = s.get("id"), s.get("unrouted_fetched_expected")
+        per.append({k: s.get(k) for k in ("id", "segments_in_window", "named_in_window", "name_pruned",
+                                          "unrouted_fetched_expected", "holders", "route_bound",
+                                          "route_bound_reason")})
+        if s.get("route_bound") is not True:
+            unbound.append({"id": sid, "reason": s.get("route_bound_reason")})
+        seen = fetched.get(sid, [])
+        if not seen or None in seen or not whole(want):
             unchecked.append(sid)
-        elif any(v != n for v in seen):
-            mismatches.append({"id": sid, "segments_in_window": n, "unrouted_resolved": sorted(set(seen))})
+        elif any(v != want for v in seen):
+            mismatches.append({"id": sid, "unrouted_fetched_expected": want,
+                               "named_in_window": s.get("named_in_window"),
+                               "segments_in_window": s.get("segments_in_window"),
+                               "unrouted_fetched": sorted(set(seen))})
     print(json.dumps({"file": "holders.json", "bucket": bucket, "method": doc.get("method"),
                       "objects_listed": len(listed), "objects_above_watermark": above,
                       "objects_l0": doc.get("objects_l0"), "objects_l1": doc.get("objects_l1"),
                       "series_total": doc.get("series_total"),
                       "statements": per, "skipped": len(doc.get("skipped") or []),
-                      "window_check": "segments_in_window == segmentsFetched + segmentsPruned of every stage1-unrouted record of the statement",
+                      "window_check": "segmentsFetched of every stage1-unrouted record of the statement == unrouted_fetched_expected, which is named_in_window (the objects in the window holding a series of the statement's metric) when every selector names one metric, since the unrouted resolve prunes by that name's postings, and segments_in_window (every object in the window) when the selectors name different metrics, which the resolve does not prune by name",
                       "window_mismatches_count": len(mismatches), "window_mismatches": mismatches,
-                      "window_unchecked_count": len(unchecked), "window_unchecked": unchecked}))
+                      "window_unchecked_count": len(unchecked), "window_unchecked": unchecked,
+                      "route_bound_check": "a statement whose selectors each carry a label=\"value\" matcher with a non-empty value is route_bound; any other leaves the router keeping every object holding that selector's metric, so its holders figure is no bound on what the routed pass opens and it is left out of every holders-versus-routed comparison",
+                      "route_unbound_count": len(unbound), "route_unbound": unbound}))
 else:
     print(f"unknown op {op}", file=sys.stderr)
     sys.exit(2)
@@ -2352,6 +2415,10 @@ stage1_catalog_state() {
     fi
   else
     want="$(py get "$STAMPS" stage1.leaves.parts_rebuilt)"
+    if ! [[ "$want" =~ ^[0-9]+$ ]]; then
+      stamp_str "stage1.${which}" "refused: stage1.leaves.parts_rebuilt is '${want}', not a whole number"
+      fail_step "$step" "refused: stage1.leaves.parts_rebuilt is '${want}', not a whole number, so the routed pass's snapshot cannot be checked against it"
+    fi
     if [ "$STAGE1_LEAF_PARTS" -lt "$want" ]; then
       stamp_str "stage1.${which}" "refused: ${STAGE1_LEAF_PARTS} snapshot parts carry a label_value leaf, stage1-leaves rebuilt ${want}"
       fail_step "$step" "refused: ${STAGE1_LEAF_PARTS} snapshot parts carry a label_value leaf before the routed pass, fewer than the ${want} stage1-leaves rebuilt"
@@ -2361,11 +2428,14 @@ stage1_catalog_state() {
 
 # stage1_pass unrouted|routed: the corpus against Prometheus and Ravel, as the
 # query step runs it, into <out>/stage1-WHICH/, then the cold pass's
-# selection into <out>/stage1-WHICH/cold.json. Every ravel_cost record is
-# labelled pass_label folded-WHICH with the fold state stage1_catalog_state
-# read just before it.
+# selection into <out>/stage1-WHICH/cold.json, and the cold records with a
+# ravel_cost counted against the selected entries x repetitions as
+# stage1.WHICH_cold_records (0 of 0 when the cold stamp says not applicable;
+# a string naming why when there is no cold stamp to count). Every ravel_cost
+# record is labelled pass_label folded-WHICH with the fold state
+# stage1_catalog_state read just before it.
 stage1_pass() {
-  local which="$1" label="folded-$1" step="stage1-$1" dir="${out_dir}/stage1-$1" code=0 state flags
+  local which="$1" label="folded-$1" step="stage1-$1" dir="${out_dir}/stage1-$1" code=0 state flags line
   stage1_catalog_state "$which"
   flags="$STAGE1_UNROUTED_FLAGS"
   [ "$which" = unrouted ] || flags="$STAGE1_ROUTED_FLAGS"
@@ -2399,6 +2469,14 @@ stage1_pass() {
     "$label" "$state" "stage1-${which}/diagnostics.json" "stage1-${which}/report.json")"
   cold_pass "${dir}/cold" "${dir}/cold.json" "stage1.${which}_cold" "stage1 ${which} cold" \
     "stage1-${label}-cold" --pass-label "$label" --fold-state "$state"
+  code=0
+  line="$(py cold-count "$STAMPS" "stage1.${which}_cold")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str "stage1.${which}_cold_records" "failed: ${line:-cold-count exited $code}"
+    say "stage1 ${which} cold records: ${line:-cold-count exited $code}"
+  else
+    stamp_set "stage1.${which}_cold_records" "$line"
+  fi
   step_done "$step"
 }
 
@@ -2424,8 +2502,9 @@ stage1_compare() {
 # credentials), as the invoking user so the files can be deleted; the listed
 # ones counted by metricsbench_holders without the router, per statement over
 # the objects its fetch window overlaps. The download is removed after. The
-# stamp checks each statement's segments_in_window against what the unrouted
-# pass resolved for it.
+# stamp checks each unrouted record's segmentsFetched against the statement's
+# unrouted_fetched_expected, and lists the statements that are not
+# route-bound.
 stage1_holders_step() {
   local bucket code=0 dest="${out_dir}/stage1-objects" hours line
   local list_file="${out_dir}/stage1-objects.jsonl"

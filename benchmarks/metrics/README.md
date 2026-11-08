@@ -663,15 +663,25 @@ L1 objects the folded snapshot resolves) from `DIR/<key>`. For each corpus
 statement under the ingest report's profile with a `label="value"` matcher
 (non-empty value), it computes the statement's fetch window on the run's
 query grid as Ravel's engine resolves it, counts the listed objects whose
-event time range overlaps that window (`segments_in_window`), and counts
-among them the ones holding at least one series that matches a qualifying
-selector in full, metric name and every matcher (`holders`). It decodes
-each object's series catalog with ravel-segment's public reader, with no
-router or key index; the file's `method` states the window and counting
-rules (`metrics_holders::HOLDERS_METHOD`). `holders.json` holds `method`,
-`profile`, `objects_l0`, `objects_l1`, `series_total`, `statements` (`id`,
-`promql`, `eval`, `selectors`, `positive_equalities`, `fetch_window`,
-`segments_in_window` and `holders` per qualifying entry) and `skipped` (`id`
+event time range overlaps that window whatever metrics they hold
+(`segments_in_window`), the ones among them holding a series of one of the
+statement's metric names (`named_in_window`), and the ones among those
+holding at least one series that matches a qualifying selector in full,
+metric name and every matcher (`holders`). `unrouted_fetched_expected` is
+what Ravel's unrouted resolve fetches: `named_in_window` when every
+selector names the same metric (`name_pruned`, the resolve prunes by that
+name's postings) and `segments_in_window` when they name different metrics.
+`route_bound` is false, with `route_bound_reason`, when a selector has no
+qualifying matcher: the router then keeps every object holding that
+selector's metric, so `holders` is no bound on what a routed query opens.
+It decodes each object's series catalog with ravel-segment's public reader,
+with no router or key index; the file's `method` states the window and
+counting rules (`metrics_holders::HOLDERS_METHOD`). `holders.json` holds
+`method`, `profile`, `objects_l0`, `objects_l1`, `series_total`,
+`statements` (`id`, `promql`, `eval`, `selectors`, `positive_equalities`,
+`metrics`, `name_pruned`, `fetch_window`, `segments_in_window`,
+`named_in_window`, `unrouted_fetched_expected`, `holders`, `route_bound`
+and `route_bound_reason` per qualifying entry) and `skipped` (`id`
 and `reason` for each entry with no qualifying selector, whose selectors the
 corpus reader refuses, or whose fetch window cannot be planned). It exits 65
 when the list names no object or the ingest report does not bind to the
@@ -680,6 +690,8 @@ listed object is missing or does not decode (no file is written), and 74
 when the file cannot be written
 (`metrics_holders::tests::the_fetch_window_follows_the_engine_resolve`,
 `metrics_holders::tests::holders_count_objects_in_the_window_with_a_fully_matching_series`,
+`metrics_holders::tests::named_in_window_counts_the_objects_holding_the_statements_metrics`,
+`metrics_holders::tests::unrouted_fetched_expected_is_what_the_engine_fetches`,
 `metrics_holders::tests::an_unreadable_object_is_an_error`).
 `deploy/metricsbench/run.sh`'s `stage1-holders` step runs it.
 

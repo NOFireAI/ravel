@@ -279,9 +279,18 @@
 #                                       z18: an unchecked window are counted,
 #                                       exit 0; z19: a failed scrape before
 #                                       the query step labels its records
-#                                       unknown. stage1-check.sh: the ci band
-#                                       file clean on z1, out of band on z2,
-#                                       z15, z16 and z17, missing,
+#                                       unknown; z20: an in-window object
+#                                       outside the name's postings and an
+#                                       absent metric match the window check;
+#                                       z21: incorrect in both passes and
+#                                       z22: a routed status change (row 9);
+#                                       z23: a statement not route-bound is
+#                                       listed; z24: a parts_rebuilt that is
+#                                       not a whole number refuses the routed
+#                                       pass. stage1-check.sh: the ci band
+#                                       file clean on z1, z20 and z21, out of
+#                                       band on z2, z15, z16, z17 and z22, a
+#                                       missing cold count, missing,
 #                                       duplicated, not finite (a NaN figure
 #                                       out of band, a NaN bound 65), a
 #                                       profile mismatch (65) and usage (64).
@@ -531,7 +540,8 @@ JSON
           # ravel-server's state as it runs. With --json (the Stage 1 folds)
           # the JSON report, the store header on stderr: with
           # --rebuild-key-index the rebuild's, STUB_STAGE1_LEAVES (default 12)
-          # leaves, exit STUB_STAGE1_LEAVES_EXIT; otherwise the fold's, exit
+          # leaves and parts_rebuilt STUB_STAGE1_PARTS_REBUILT (default 3, as
+          # JSON text), exit STUB_STAGE1_LEAVES_EXIT; otherwise the fold's, exit
           # STUB_STAGE1_FOLD_EXIT.
           *" catalog fold "*)
             printf 'docker-state fold ravel-server=%s\n' "$(cat "${STUB_STATE}.ravel" 2>/dev/null || echo running)" >>"${STUB_LOG}"
@@ -541,7 +551,7 @@ JSON
                 [ "${STUB_STAGE1_LEAVES_EXIT:-0}" -eq 0 ] || exit "${STUB_STAGE1_LEAVES_EXIT}"
                 : >"${STUB_STATE}.rebuilt"
                 echo 'store: s3' >&2
-                printf '{"leaves_written":%s,"leaf_bytes_written":4096,"ranged_gets":7,"leaf_prefix_gets":2,"erasure_get_requests":1,"erasure_list_requests":1,"leaf_prefix_bytes_read":512,"section_bytes_read":2048,"parts_unindexed":3,"parts_rebuilt":3,"parts_deferred":0,"parts_over_cap":0,"parts_erasure_gated":0,"uncovered_entries":0,"attempt_count":2,"attempts":[{"parts":2,"part_gets":2,"leaf_puts":8,"head_cas_tries":2,"parts_published":0},{"parts":3,"part_gets":3,"leaf_puts":%s,"head_cas_tries":1,"parts_published":3}]}\n' "${STUB_STAGE1_LEAVES:-12}" "${STUB_STAGE1_LEAVES:-12}"
+                printf '{"leaves_written":%s,"leaf_bytes_written":4096,"ranged_gets":7,"leaf_prefix_gets":2,"erasure_get_requests":1,"erasure_list_requests":1,"leaf_prefix_bytes_read":512,"section_bytes_read":2048,"parts_unindexed":3,"parts_rebuilt":%s,"parts_deferred":0,"parts_over_cap":0,"parts_erasure_gated":0,"uncovered_entries":0,"attempt_count":2,"attempts":[{"parts":2,"part_gets":2,"leaf_puts":8,"head_cas_tries":2,"parts_published":0},{"parts":3,"part_gets":3,"leaf_puts":%s,"head_cas_tries":1,"parts_published":3}]}\n' "${STUB_STAGE1_LEAVES:-12}" "${STUB_STAGE1_PARTS_REBUILT:-3}" "${STUB_STAGE1_LEAVES:-12}"
                 exit 0
                 ;;
               *" --json "*)
@@ -834,6 +844,10 @@ esac
 # STUB_ROUTED_FAILED_ENTRY's record failed: no result_hash, no segment
 # figures, status "failed: stub". Under folded-unrouted, entry
 # STUB_UNROUTED_PRUNED_ENTRY's record says segmentsPrunedByLabelIndex 2.
+# Entry STUB_INCORRECT_ENTRY's records say status incorrect in every pass,
+# and entry STUB_ROUTED_STATUS_ENTRY's under folded-routed only, each with its
+# result_hash. Entry STUB_ABSENT_ENTRY's records say segmentsFetched 0 and
+# segmentsPruned 10, a metric no object holds.
 python3 -I - "$corpus" "$diag" "$out" "$verdict" "$@" <<'PY'
 import json, os, sys
 corpus, diag, out, verdict = sys.argv[1:5]
@@ -854,6 +868,10 @@ def record(i):
          "segmentsPrunedByLabelIndex": 3 if routed else (2 if i == unrouted_pruned else 0),
          "estimate": None, "io": None, "pass_label": label, "fold_state": state,
          "result_hash": f"blake3:{i}-routed" if routed and i == differ else f"blake3:{i}"}
+    if i == os.environ.get("STUB_INCORRECT_ENTRY") or (routed and i == os.environ.get("STUB_ROUTED_STATUS_ENTRY")):
+        r["status"] = "incorrect"
+    if i == os.environ.get("STUB_ABSENT_ENTRY"):
+        r.update({"segmentsFetched": 0, "segmentsPruned": 10})
     if i == failed:
         r.update({"status": "failed: stub", "result_hash": None, "segmentsFetched": None,
                   "segmentsPruned": None, "segmentsPrunedByLabelIndex": None})
@@ -877,9 +895,14 @@ STUB
 
 # metricsbench_holders: logs how many of the keys --objects-list names are
 # present under --objects-dir, then writes --out with one statement per corpus
-# entry, 10 segments in its window (the stub query records' 4 fetched + 6
-# pruned) and two holders each; entry STUB_HOLDERS_WINDOW_OFF gets 11 and
-# STUB_HOLDERS_WINDOW_NULL null. Exit STUB_HOLDERS_EXIT writes nothing.
+# entry: 10 segments in its window, 4 of them holding its one metric (so
+# unrouted_fetched_expected 4, the stub query records' segmentsFetched; their
+# fetched + pruned is 10), two holders, route-bound. Entry
+# STUB_HOLDERS_NAMED_SPLIT gets 7 in its window, 4 named, so fetched + pruned
+# is not segments_in_window; entry STUB_ABSENT_ENTRY 7 in its window, 0 named
+# and 0 holders; STUB_HOLDERS_WINDOW_OFF 5 named and expected;
+# STUB_HOLDERS_WINDOW_NULL null counts; STUB_HOLDERS_UNBOUND is not
+# route-bound. Exit STUB_HOLDERS_EXIT writes nothing.
 cat >"${BIN}/metricsbench_holders" <<'STUB'
 #!/usr/bin/env bash
 printf 'metricsbench_holders %s\n' "$*" >>"${STUB_LOG}"
@@ -902,15 +925,27 @@ listed = [json.loads(l) for l in open(listing).read().splitlines() if l.strip()]
 present = sum(1 for o in listed if os.path.isfile(os.path.join(objects, o["key"])))
 with open(os.environ["STUB_LOG"], "a") as log:
     log.write(f"metricsbench_holders saw {present} of {len(listed)} listed objects\n")
-off, null = os.environ.get("STUB_HOLDERS_WINDOW_OFF", ""), os.environ.get("STUB_HOLDERS_WINDOW_NULL", "")
+env = lambda k: os.environ.get(k, "")
 ids = [e["id"] for e in json.load(open(corpus))["entries"]]
-def window(i):
-    return 11 if i == off else (None if i == null else 10)
+def statement(i):
+    s = {"id": i, "promql": "up", "selectors": [], "positive_equalities": [], "metrics": ["up"],
+         "name_pruned": True, "segments_in_window": 10, "named_in_window": 4,
+         "unrouted_fetched_expected": 4, "holders": 2, "route_bound": True, "route_bound_reason": None}
+    if i == env("STUB_HOLDERS_NAMED_SPLIT"):
+        s["segments_in_window"] = 7
+    if i == env("STUB_ABSENT_ENTRY"):
+        s.update({"segments_in_window": 7, "named_in_window": 0, "unrouted_fetched_expected": 0, "holders": 0})
+    if i == env("STUB_HOLDERS_WINDOW_OFF"):
+        s.update({"named_in_window": 5, "unrouted_fetched_expected": 5})
+    if i == env("STUB_HOLDERS_WINDOW_NULL"):
+        s.update({"segments_in_window": None, "named_in_window": None, "unrouted_fetched_expected": None})
+    if i == env("STUB_HOLDERS_UNBOUND"):
+        s.update({"route_bound": False, "route_bound_reason": "stub: no qualifying matcher"})
+    return s
 json.dump({"method": "stub method", "profile": json.load(open(ingest))["profile"]["name"],
            "objects_l0": sum(1 for o in listed if o["level"] == "L0"),
            "objects_l1": sum(1 for o in listed if o["level"] == "L1"), "series_total": 40,
-           "statements": [{"id": i, "promql": "up", "selectors": [], "positive_equalities": [],
-                           "segments_in_window": window(i), "holders": 2} for i in ids],
+           "statements": [statement(i) for i in ids],
            "skipped": [{"id": "skipped_one", "reason": "no positive equality"}]}, open(out, "w"))
 PY
 STUB
@@ -2390,7 +2425,7 @@ check "z: stage1.unrouted and stage1.routed name their label, state and files" '
 check "z: stage1.restart says what was recreated" 'j("stamps.json")["stage1"]["restart"].startswith("recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='"'"'--disable-fold --fold-key-index-leaves --fold-metrics-label-index'"'"'")'
 check "z: every steady record carries its pass label and fold state" 'all(r["pass_label"] == "folded-unrouted" and r["fold_state"] == "'"${UNROUTED_STATE}"'" for r in j("stage1-unrouted/diagnostics.json")["ravel_cost"]) and all(r["pass_label"] == "folded-routed" and r["fold_state"] == "'"${ROUTED_STATE}"'" for r in j("stage1-routed/diagnostics.json")["ravel_cost"])'
 check "z: the cold selection runs in both passes, labelled, in its own regime" 'all(j(f"stage1-{w}/cold.json")["regime"] == f"stage1-folded-{w}-cold" and j(f"stage1-{w}/cold.json")["entries"] == ["mb_full_range_avg_over_time"] and len(j(f"stage1-{w}/cold.json")["runs"]) == 5 and all(r["ravel_cost"]["pass_label"] == f"folded-{w}" for r in j(f"stage1-{w}/cold.json")["runs"]) for w in ("unrouted", "routed")) and j("stamps.json")["stage1"]["routed_cold"]["file"] == "cold.json" and j("stamps.json")["stage1"]["routed_cold"]["failed_runs"] == 0'
-check "z: stage1-compare.json compares every entry's hashes and counts each pass's records" 'j("stage1-compare.json")["schema"] == "metricsbench-stage1-compare/2" and j("stage1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"') == j("stage1-compare.json")["entries_equal"] and j("stage1-compare.json")["entries_differing_count"] == 0 and j("stage1-compare.json")["entries_without_hash_count"] == 0 and j("stage1-compare.json")["passes"] == {"unrouted": {"records": len('"${CORPUS_IDS}"'), "records_null_hash": 0, "records_not_ok": 0, "records_label_index_null": 0, "records_pruned_by_label_index": 0, "segments_pruned_by_label_index": 0}, "routed": {"records": len('"${CORPUS_IDS}"'), "records_null_hash": 0, "records_not_ok": 0, "records_label_index_null": 0, "records_pruned_by_label_index": len('"${CORPUS_IDS}"'), "segments_pruned_by_label_index": 3 * len('"${CORPUS_IDS}"')}} and j("stamps.json")["stage1"]["compare"]["entries_differing"] == []'
+check "z: stage1-compare.json compares every entry's hashes and statuses and counts each pass's records" 'j("stage1-compare.json")["schema"] == "metricsbench-stage1-compare/3" and j("stage1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"') == j("stage1-compare.json")["entries_equal"] and j("stage1-compare.json")["entries_differing_count"] == 0 and j("stage1-compare.json")["entries_without_hash_count"] == 0 and j("stage1-compare.json")["statements_status_differing_count"] == 0 and j("stage1-compare.json")["statements_status_differing"] == [] and j("stage1-compare.json")["status_check"].startswith("per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9)") and j("stage1-compare.json")["passes"] == {"unrouted": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": 0, "segments_pruned_by_label_index": 0}, "routed": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": len('"${CORPUS_IDS}"'), "segments_pruned_by_label_index": 3 * len('"${CORPUS_IDS}"')}} and j("stamps.json")["stage1"]["compare"]["entries_differing"] == [] and j("stamps.json")["stage1"]["compare"]["statements_status_differing"] == []'
 expect_log "z: the holders listing is catalog list --json" "catalog list --tenant metricsbench --shards 4 --hours"
 expect_log "z: the holders download takes the L0 and L1 data objects of Ravel's bucket through the s3s endpoint" "--entrypoint aws createbuckets --endpoint-url http://s3s:9000 s3 sync s3://ravel-metricsbench/t/ /stage1-objects/t/ --exclude * --include */m/l0/*.rseg --include */m/l1/*.rseg --only-show-errors"
 expect_log "z: the download lands in the run's out dir" "-v ${OUT}/stage1-objects:/stage1-objects"
@@ -2399,7 +2434,8 @@ expect_log "z: metricsbench_holders gets the corpus, ingest report, workload, li
 expect_log "z: metricsbench_holders reads the listing beside the objects" "--objects-list ${OUT}/stage1-objects.jsonl --objects-dir ${OUT}/stage1-objects --out ${OUT}/holders.json"
 expect_no_file z stage1-objects
 expect_file z stage1-objects.jsonl
-check "z: stage1.holders stamps the method, the counts and segments_in_window and holders per statement, every window checked" 'j("stamps.json")["stage1"]["holders"] == {"file": "holders.json", "bucket": "ravel-metricsbench", "method": "stub method", "objects_listed": 300, "objects_above_watermark": 0, "objects_l0": 300, "objects_l1": 0, "series_total": 40, "statements": [{"id": i, "segments_in_window": 10, "holders": 2} for i in '"${CORPUS_IDS}"'], "skipped": 1, "window_check": "segments_in_window == segmentsFetched + segmentsPruned of every stage1-unrouted record of the statement", "window_mismatches_count": 0, "window_mismatches": [], "window_unchecked_count": 0, "window_unchecked": []}'
+check "z: stage1.holders stamps the method, the counts and the window and holder figures per statement, every window checked against segmentsFetched" 'j("stamps.json")["stage1"]["holders"] == {"file": "holders.json", "bucket": "ravel-metricsbench", "method": "stub method", "objects_listed": 300, "objects_above_watermark": 0, "objects_l0": 300, "objects_l1": 0, "series_total": 40, "statements": [{"id": i, "segments_in_window": 10, "named_in_window": 4, "name_pruned": True, "unrouted_fetched_expected": 4, "holders": 2, "route_bound": True, "route_bound_reason": None} for i in '"${CORPUS_IDS}"'], "skipped": 1, "window_check": "segmentsFetched of every stage1-unrouted record of the statement == unrouted_fetched_expected, which is named_in_window (the objects in the window holding a series of the statement'"'"'s metric) when every selector names one metric, since the unrouted resolve prunes by that name'"'"'s postings, and segments_in_window (every object in the window) when the selectors name different metrics, which the resolve does not prune by name", "window_mismatches_count": 0, "window_mismatches": [], "window_unchecked_count": 0, "window_unchecked": [], "route_bound_check": "a statement whose selectors each carry a label=\"value\" matcher with a non-empty value is route_bound; any other leaves the router keeping every object holding that selector'"'"'s metric, so its holders figure is no bound on what the routed pass opens and it is left out of every holders-versus-routed comparison", "route_unbound_count": 0, "route_unbound": []}'
+check "z: the cold records are counted against the selected entries x repetitions in both passes" 'all(j("stamps.json")["stage1"][f"{w}_cold_records"] == {"applicable": True, "expected_records": 5, "records": 5, "records_short": 0, "basis": f"stage1.{w}_cold: records with a ravel_cost (runs - failed_runs) against entries x repetitions_per_entry"} for w in ("unrouted", "routed"))'
 check "z: the query step's records keep their own label" 'all(r["pass_label"] == "background-folded" for r in j("diagnostics.json")["ravel_cost"])'
 expect_log "z: the main report's provenance is marked non-comparable with its reason" "--config comparable=false --config comparability_reason=MB_STAGE1=1: ravel-server ran with --fold-key-index-leaves (not the default command line) through this report's passes"
 if [ "$(grep '^metricsbench_report provenance ' "${LOG}" | grep -vc -- '--config diagnostic_regime=')" -eq 1 ] &&
@@ -2415,6 +2451,7 @@ MB_STAGE1=1 run_stage1 z1 ci
 expect_rc z1 0
 check "z1: ci runs every Stage 1 step" 'j("stamps.json")["steps_completed"][-6:] == ["stage1-fold","stage1-unrouted","stage1-leaves","stage1-restart","stage1-routed","stage1-holders"]'
 check "z1: ci's cold passes are not applicable" 'j("stamps.json")["stage1"]["unrouted_cold"].startswith("not applicable: ") and j("stamps.json")["stage1"]["routed_cold"].startswith("not applicable: ")'
+check "z1: ci's cold record counts are 0 of 0, naming the not-applicable stamp" 'all({k: v for k, v in j("stamps.json")["stage1"][f"{w}_cold_records"].items() if k != "basis"} == {"applicable": False, "expected_records": 0, "records": 0, "records_short": 0} and j("stamps.json")["stage1"][f"{w}_cold_records"]["basis"].startswith(f"stage1.{w}_cold is '"'"'not applicable: ") for w in ("unrouted", "routed"))'
 
 # z2: a routed hash that differs is recorded, not fatal.
 MB_STAGE1=1 STUB_ROUTED_HASH_DIFF=mb_selective_job_rate_sum run_stage1 z2 ci
@@ -2466,7 +2503,7 @@ expect_no_log "z8: no routed pass" "--pass-label folded-routed"
 # z9: after a failed ingest verification the Stage 1 steps are skipped and say why.
 MB_STAGE1=1 STUB_INGEST_READBACK_FAIL=mimir run_stage1 z9 ci
 expect_rc z9 70
-check "z9: every Stage 1 stamp says skipped and why" 'all(j("stamps.json")["stage1"][k].startswith("skipped: the ingest verification failed") for k in ("fold","unrouted","unrouted_cold","leaves","restart","routed","routed_cold","compare","holders"))'
+check "z9: every Stage 1 stamp says skipped and why" 'all(j("stamps.json")["stage1"][k].startswith("skipped: the ingest verification failed") for k in ("fold","unrouted","unrouted_cold","unrouted_cold_records","leaves","restart","routed","routed_cold","routed_cold_records","compare","holders"))'
 expect_no_log "z9: no Stage 1 fold" "--signal metrics --json"
 
 # z10: a failed download is stage1-holders' failure, and leaves nothing behind.
@@ -2503,22 +2540,53 @@ expect_no_log "z14: no unrouted pass" "--pass-label folded-unrouted"
 # z15: a routed record that failed is counted, not fatal; the band check catches it.
 MB_STAGE1=1 STUB_ROUTED_FAILED_ENTRY=mb_selective_job_rate_sum run_stage1 z15 ci
 expect_rc z15 0
-check "z15: the failed record is counted in the routed pass and the entry has no hash" 'j("stage1-compare.json")["passes"]["routed"]["records_null_hash"] == 1 and j("stage1-compare.json")["passes"]["routed"]["records_not_ok"] == 1 and j("stage1-compare.json")["passes"]["routed"]["records_label_index_null"] == 1 and j("stage1-compare.json")["passes"]["unrouted"]["records_null_hash"] == 0 and "mb_selective_job_rate_sum" in j("stage1-compare.json")["entries_without_hash"]'
+check "z15: the failed record is counted in the routed pass, its status differs from the unrouted pass and the entry has no hash" 'j("stage1-compare.json")["passes"]["routed"]["records_status_unexpected"] == 1 and j("stage1-compare.json")["passes"]["routed"]["records_answered_null_hash"] == 0 and j("stage1-compare.json")["passes"]["routed"]["records_label_index_null"] == 1 and j("stage1-compare.json")["passes"]["unrouted"]["records_status_unexpected"] == 0 and j("stage1-compare.json")["statements_status_differing"] == [{"entry": "mb_selective_job_rate_sum", "unrouted": ["ok"], "routed": ["failed: stub"]}] and "mb_selective_job_rate_sum" in j("stage1-compare.json")["entries_without_hash"]'
 
 # z16: an unrouted record the label index pruned is counted.
 MB_STAGE1=1 STUB_UNROUTED_PRUNED_ENTRY=mb_selective_job_rate_sum run_stage1 z16 ci
 expect_rc z16 0
 check "z16: one unrouted record pruned by the label index" 'j("stage1-compare.json")["passes"]["unrouted"]["records_pruned_by_label_index"] == 1 and j("stage1-compare.json")["passes"]["unrouted"]["segments_pruned_by_label_index"] == 2'
 
-# z17: segments_in_window that is not the unrouted pass's fetched + pruned is a mismatch.
+# z17: an unrouted segmentsFetched that is not unrouted_fetched_expected is a mismatch.
 MB_STAGE1=1 STUB_HOLDERS_WINDOW_OFF=mb_selective_job_rate_sum run_stage1 z17 ci
 expect_rc z17 0
-check "z17: the statement named with its count and the resolved figures" 'j("stamps.json")["stage1"]["holders"]["window_mismatches_count"] == 1 and j("stamps.json")["stage1"]["holders"]["window_mismatches"] == [{"id": "mb_selective_job_rate_sum", "segments_in_window": 11, "unrouted_resolved": [10]}] and j("stamps.json")["stage1"]["holders"]["window_unchecked_count"] == 0'
+check "z17: the statement named with its expected, named and window counts and the fetched figures" 'j("stamps.json")["stage1"]["holders"]["window_mismatches_count"] == 1 and j("stamps.json")["stage1"]["holders"]["window_mismatches"] == [{"id": "mb_selective_job_rate_sum", "unrouted_fetched_expected": 5, "named_in_window": 5, "segments_in_window": 10, "unrouted_fetched": [4]}] and j("stamps.json")["stage1"]["holders"]["window_unchecked_count"] == 0'
 
 # z18: a statement with no count is unchecked, never a match.
 MB_STAGE1=1 STUB_HOLDERS_WINDOW_NULL=mb_selective_job_rate_sum run_stage1 z18 ci
 expect_rc z18 0
 check "z18: the statement unchecked, none mismatched" 'j("stamps.json")["stage1"]["holders"]["window_unchecked_count"] == 1 and j("stamps.json")["stage1"]["holders"]["window_mismatches_count"] == 0'
+
+# z20: an in-window object outside the name's postings (7 in the window, 4
+# named, the unrouted pass fetching 4 and pruning 6) and a statement naming an
+# absent metric (7 in the window, 0 named, fetching 0 and pruning 10) are both
+# matches: segmentsFetched is compared with unrouted_fetched_expected, not
+# fetched + pruned with segments_in_window.
+MB_STAGE1=1 STUB_HOLDERS_NAMED_SPLIT=mb_single_gauge_instant STUB_ABSENT_ENTRY=mb_absent_instant run_stage1 z20 ci
+expect_rc z20 0
+check "z20: both statements carry their split figures, none mismatched or unchecked" '[{k: s[k] for k in ("segments_in_window", "named_in_window", "unrouted_fetched_expected")} for s in j("stamps.json")["stage1"]["holders"]["statements"] if s["id"] in ("mb_absent_instant", "mb_single_gauge_instant")] == [{"segments_in_window": 7, "named_in_window": 0, "unrouted_fetched_expected": 0}, {"segments_in_window": 7, "named_in_window": 4, "unrouted_fetched_expected": 4}] and j("stamps.json")["stage1"]["holders"]["window_mismatches_count"] == 0 and j("stamps.json")["stage1"]["holders"]["window_unchecked_count"] == 0'
+
+# z21: a statement incorrect in both passes (a 1-ULP gap the oracle reads as
+# incorrect) is an answered status that routing did not change.
+MB_STAGE1=1 STUB_INCORRECT_ENTRY=mb_single_counter_rate run_stage1 z21 ci
+expect_rc z21 0
+check "z21: incorrect in both passes is no status difference and no unexpected status" 'j("stage1-compare.json")["statements_status_differing_count"] == 0 and all(j("stage1-compare.json")["passes"][w]["records_status_unexpected"] == 0 and j("stage1-compare.json")["passes"][w]["records_answered"] == len('"${CORPUS_IDS}"') for w in ("unrouted", "routed")) and j("stage1-compare.json")["entries_differing_count"] == 0'
+
+# z22: a status the routed pass changes is a row 9 difference, though both are answered.
+MB_STAGE1=1 STUB_ROUTED_STATUS_ENTRY=mb_single_counter_rate run_stage1 z22 ci
+expect_rc z22 0
+check "z22: the entry named with both status sets" 'j("stage1-compare.json")["statements_status_differing"] == [{"entry": "mb_single_counter_rate", "unrouted": ["ok"], "routed": ["incorrect"]}] and j("stamps.json")["stage1"]["compare"]["statements_status_differing"] == ["mb_single_counter_rate"] and j("stage1-compare.json")["passes"]["routed"]["records_status_unexpected"] == 0'
+
+# z23: a statement with a selector lacking a qualifying matcher is listed as not route-bound.
+MB_STAGE1=1 STUB_HOLDERS_UNBOUND=mb_selective_error_ratio run_stage1 z23 ci
+expect_rc z23 0
+check "z23: the statement listed with its reason" 'j("stamps.json")["stage1"]["holders"]["route_unbound_count"] == 1 and j("stamps.json")["stage1"]["holders"]["route_unbound"] == [{"id": "mb_selective_error_ratio", "reason": "stub: no qualifying matcher"}] and [s["route_bound"] for s in j("stamps.json")["stage1"]["holders"]["statements"] if s["id"] == "mb_selective_error_ratio"] == [False]'
+
+# z24: a parts_rebuilt that is not a whole number refuses the routed pass.
+MB_STAGE1=1 STUB_STAGE1_PARTS_REBUILT=null run_stage1 z24 ci
+expect_rc z24 70
+check "z24: stage1-routed named, the refusal names the figure" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.leaves.parts_rebuilt is '"'"'None'"'"', not a whole number"'
+expect_no_log "z24: no routed pass" "--pass-label folded-routed"
 
 # z19: the scrape before the query step fails: the records say unknown and why.
 mapfile -t args < <(full_args "${TMP}/z19/out")
@@ -2621,8 +2689,30 @@ expect_check_err "check not-finite bound: refused, the bound named" "stage1-chec
 # z15's failed routed record and z16's pruned unrouted record fail the ci bands.
 run_check failed-record "${CI_BANDS}" "${TMP}/z15/out"
 expect_rc "check failed record" 1
-expect_check_err "check failed record: the null hash named" "out of band routed_records_null_hash = 1 not in [0, 0] (stage1-compare.json passes.routed.records_null_hash)"
-expect_check_err "check failed record: the failed status named" "out of band routed_records_not_ok = 1 not in [0, 0] (stage1-compare.json passes.routed.records_not_ok)"
+expect_check_err "check failed record: the status difference named" "out of band statements_status_differing = 1 not in [0, 0] (stage1-compare.json statements_status_differing_count)"
+expect_check_err "check failed record: the failed status named" "out of band routed_records_status_unexpected = 1 not in [0, 0] (stage1-compare.json passes.routed.records_status_unexpected)"
+expect_check_err "check failed record: the entry without a hash named" "out of band entries_without_hash = 1 not in [0, 0] (stage1-compare.json entries_without_hash_count)"
+expect_check_err "check failed record: four failures counted, with its missing segmentsPrunedByLabelIndex" "stage1-check: 4 of ${FIGURES} figures failed"
+run_check incorrect-both "${CI_BANDS}" "${TMP}/z21/out"
+expect_rc "check incorrect in both passes" 0
+run_check routed-status "${CI_BANDS}" "${TMP}/z22/out"
+expect_rc "check routed status" 1
+expect_check_err "check routed status: the status difference named" "out of band statements_status_differing = 1 not in [0, 0] (stage1-compare.json statements_status_differing_count)"
+expect_check_err "check routed status: one failure counted" "stage1-check: 1 of ${FIGURES} figures failed"
+run_check named-split "${CI_BANDS}" "${TMP}/z20/out"
+expect_rc "check an object outside the name's postings and an absent metric" 0
+# A cold count that is absent fails as missing, never as 0.
+cp -R "${TMP}/z1/out" "${TMP}/check-cold"
+python3 -I - "${TMP}/check-cold/stamps.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["stage1"]["routed_cold_records"] = "failed: stage1.routed_cold is 'failed: cold.json not written', not a cold pass stamp"
+json.dump(d, open(sys.argv[1], "w"))
+PY
+run_check cold "${CI_BANDS}" "${TMP}/check-cold"
+expect_rc "check cold count missing" 1
+expect_check_err "check cold count missing: named" "missing routed_cold_records: stage1.routed_cold_records is str \"failed: stage1.routed_cold is 'failed: cold.json not written', not a cold pass stamp\", not an object (stamps.json stage1.routed_cold_records.records)"
+expect_check_err "check cold count missing: both figures counted" "stage1-check: 2 of ${FIGURES} figures failed"
 run_check unrouted-pruned "${CI_BANDS}" "${TMP}/z16/out"
 expect_rc "check unrouted pruned" 1
 expect_check_err "check unrouted pruned: named" "out of band unrouted_records_pruned_by_label_index = 1 not in [0, 0] (stage1-compare.json passes.unrouted.records_pruned_by_label_index)"
