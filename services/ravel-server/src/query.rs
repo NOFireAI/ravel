@@ -806,9 +806,9 @@ pub const SQL_SPILL_SOURCE_CWD_INSUFFICIENT_SPACE: &str = "cwd-insufficient-spac
 /// `source` of the `sql_spill_compression` line when spill is on: the codec
 /// is [`ravel_sql::SpillDecision::SPILL_COMPRESSION`], which no flag sets.
 pub const SQL_SPILL_SOURCE_BUILT_IN: &str = "built-in";
-/// `source` of a `sql_spill_merge_fan_in` line whose value equals
-/// [`crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN`]; any other value reads
-/// [`crate::config::PERF_SOURCE_FLAG`]. With spill off, that line reads
+/// `source` of a `sql_spill_merge_fan_in` line when `--sql-spill-merge-fan-in`
+/// was not passed; a passed flag reads [`crate::config::PERF_SOURCE_FLAG`],
+/// whatever its value. With spill off, that line reads
 /// `value="none"` under the `sql_spill_dir` line's source instead.
 pub const SQL_SPILL_SOURCE_DEFAULT: &str = "default";
 
@@ -880,6 +880,8 @@ pub struct SqlSpillInputs {
     /// [`ravel_sql::SpillConfig::merge_fan_in`] whatever source the spill
     /// directory came from.
     pub merge_fan_in: usize,
+    /// `--sql-spill-merge-fan-in` was passed, whatever its value.
+    pub merge_fan_in_passed: bool,
 }
 
 #[cfg(feature = "sql")]
@@ -890,6 +892,7 @@ impl Default for SqlSpillInputs {
             cache_dir: None,
             cwd_default: false,
             merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+            merge_fan_in_passed: false,
         }
     }
 }
@@ -916,13 +919,13 @@ impl ResolvedSqlSpill {
     /// resolved` layout [`crate::config::ResolvedPerformanceDefaults::emit`]
     /// uses. All four lines are written whether or not spill is enabled; a
     /// disabled spill reads `value="none"` with the reason as its source. The
-    /// fan-in line's source is `default` when the value equals
-    /// [`crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN`] and `flag` otherwise.
-    /// When the ceiling was
+    /// fan-in line's source is `flag` when `inputs`, the inputs this was
+    /// resolved from, say `--sql-spill-merge-fan-in` was passed, whatever its
+    /// value, and `default` otherwise. When the ceiling was
     /// derived from `--cache-dir`, or refused for lack of space there, the
     /// `sql_spill_max_bytes` line also carries `free_bytes` and
     /// `read_cache_bytes`, the two figures it was derived from.
-    pub fn emit(&self) {
+    pub fn emit(&self, inputs: &SqlSpillInputs) {
         let free_bytes = self.space.map(|space| space.free_bytes);
         let read_cache_bytes = self.space.map(|space| space.read_cache_bytes);
         match &self.config {
@@ -952,11 +955,10 @@ impl ResolvedSqlSpill {
                 tracing::info!(
                     setting = "sql_spill_merge_fan_in",
                     value = config.merge_fan_in,
-                    source = if config.merge_fan_in == crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN
-                    {
-                        SQL_SPILL_SOURCE_DEFAULT
-                    } else {
+                    source = if inputs.merge_fan_in_passed {
                         crate::config::PERF_SOURCE_FLAG
+                    } else {
+                        SQL_SPILL_SOURCE_DEFAULT
                     },
                     "performance default resolved"
                 );
@@ -1278,9 +1280,10 @@ fn prepare_sql_spill_with(
         cache_dir: cache_dir_inputs,
         cwd_default: false,
         merge_fan_in: settings.merge_fan_in,
+        merge_fan_in_passed: settings.merge_fan_in_passed,
     };
     let resolved = resolve_sql_spill(&inputs, env_dir, env_quota)?;
-    resolved.emit();
+    resolved.emit(&inputs);
 
     let mut owner = None;
     if let (Some(cache), Some(config)) = (&inputs.cache_dir, &resolved.config)
@@ -1350,9 +1353,10 @@ fn prepare_cwd_spill(
             max_bytes_source: source,
             space: None,
         };
-        resolved.emit();
+        let inputs = SqlSpillInputs::default();
+        resolved.emit(&inputs);
         SqlSpillStartup {
-            inputs: SqlSpillInputs::default(),
+            inputs,
             resolved,
             owner: None,
             left_in_place,
@@ -1407,6 +1411,7 @@ fn prepare_cwd_spill(
         }),
         cwd_default: true,
         merge_fan_in: settings.merge_fan_in,
+        merge_fan_in_passed: settings.merge_fan_in_passed,
     };
     let resolved = match resolve_sql_spill(&inputs, None, None) {
         Ok(resolved) => resolved,
@@ -1420,7 +1425,7 @@ fn prepare_cwd_spill(
         }
     };
     let Some(config) = &resolved.config else {
-        resolved.emit();
+        resolved.emit(&inputs);
         return SqlSpillStartup {
             inputs,
             resolved,
@@ -1459,7 +1464,7 @@ fn prepare_cwd_spill(
             );
         }
     };
-    resolved.emit();
+    resolved.emit(&inputs);
     SqlSpillStartup {
         inputs,
         resolved,
@@ -3655,6 +3660,7 @@ mod tests {
             memory_budget_bytes,
             read_cache_bytes: 0,
             merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+            merge_fan_in_passed: false,
         }
     }
 
@@ -4284,6 +4290,7 @@ mod tests {
                 }),
                 cwd_default: false,
                 merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+                merge_fan_in_passed: false,
             }),
             None,
             "off in the inputs wins over a cache dir in the same inputs"
@@ -4446,7 +4453,8 @@ mod tests {
     /// `sql_spill_compression` and `sql_spill_merge_fan_in` each appear
     /// exactly once, on the `performance default resolved` layout, with the
     /// value and source of the cache-dir, env, flag fan-in, off and
-    /// insufficient-space cases. The compression line reads
+    /// insufficient-space cases. A fan-in flag passed as 2, the default
+    /// value, still reads `source="flag"`. The compression line reads
     /// `value="lz4_frame" source="built-in"` with spill on, and the spill
     /// directory line's `value="none"` and source with it off.
     ///
@@ -4456,18 +4464,19 @@ mod tests {
     /// finds no line; drop the insufficient-space arm in `resolve_sql_spill`
     /// and that row reads `source="unset"`; drop the `merge_fan_in`
     /// assignment in `resolve_sql_spill` and the flag fan-in row reads
-    /// `value=2 source="default"`.
+    /// `value=2 source="flag"`; derive the fan-in line's source from its value
+    /// in `ResolvedSqlSpill::emit` and the explicit-2 row reads
+    /// `source="default"`.
     #[test]
     fn startup_lines_carry_the_spill_dir_and_ceiling_with_their_sources() {
         let cache = tempfile::tempdir().expect("cache dir");
         let explicit = cache.path().join("explicit");
         let root = cache.path().join("sql-spill").join(INSTANCE);
-        let default_fan_in = crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN;
         let cases = [
             (
                 "cache-dir",
                 false,
-                default_fan_in,
+                None,
                 None,
                 None,
                 100 * GIB,
@@ -4481,7 +4490,7 @@ mod tests {
             (
                 "env",
                 false,
-                default_fan_in,
+                None,
                 os(explicit.to_str().expect("utf-8 temp path")),
                 os("4096"),
                 100 * GIB,
@@ -4492,7 +4501,7 @@ mod tests {
             (
                 "flag fan-in",
                 false,
-                4,
+                Some(4),
                 os(explicit.to_str().expect("utf-8 temp path")),
                 os("4096"),
                 100 * GIB,
@@ -4501,9 +4510,20 @@ mod tests {
                 " value=4 source=\"flag\"".to_string(),
             ),
             (
+                "explicit flag fan-in 2",
+                false,
+                Some(2),
+                os(explicit.to_str().expect("utf-8 temp path")),
+                os("4096"),
+                100 * GIB,
+                format!(" value={:?} source=\"env\"", explicit.display().to_string()),
+                " value=4096 source=\"env\"".to_string(),
+                " value=2 source=\"flag\"".to_string(),
+            ),
+            (
                 "off",
                 true,
-                default_fan_in,
+                None,
                 os(explicit.to_str().expect("utf-8 temp path")),
                 os("4096"),
                 100 * GIB,
@@ -4514,7 +4534,7 @@ mod tests {
             (
                 "insufficient space",
                 false,
-                default_fan_in,
+                None,
                 None,
                 None,
                 GIB,
@@ -4526,7 +4546,7 @@ mod tests {
         for (
             label,
             off,
-            merge_fan_in,
+            flag_fan_in,
             env_dir,
             env_quota,
             free_bytes,
@@ -4539,7 +4559,9 @@ mod tests {
             let startup = prepare(
                 Some(cache.path()),
                 crate::config::SqlSpillSettings {
-                    merge_fan_in,
+                    merge_fan_in: flag_fan_in
+                        .unwrap_or(crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN),
+                    merge_fan_in_passed: flag_fan_in.is_some(),
                     ..settings(off, 2 * GIB)
                 },
                 env_dir,
@@ -4622,6 +4644,7 @@ mod tests {
                     memory_budget_bytes: u64::MAX,
                     read_cache_bytes: BOUND,
                     merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+                    merge_fan_in_passed: false,
                 },
                 env_dir,
                 env_dir.map(|_| std::ffi::OsStr::new("4096")),
@@ -4968,6 +4991,7 @@ mod tests {
             memory_budget_bytes,
             read_cache_bytes,
             merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+            merge_fan_in_passed: false,
         }
     }
 
