@@ -147,7 +147,7 @@ pub use bucketed_final_aggregate::{
 pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
 pub use config::{
-    BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_TOPK_MAX_LIMIT,
+    BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_TOPK_MAX_LIMIT, DEFAULT_SPILL_MERGE_FAN_IN,
     DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES,
     DEFAULT_PARTITION_TOPK_MAX_LIMIT, DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES,
     DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE, ENV_SPILL_DIR, ENV_SPILL_MAX_BYTES,

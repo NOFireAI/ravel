@@ -82,7 +82,8 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use ravel_object_store::memory::MemoryStore;
 use ravel_sql::{
-    CeilingBreach, SpillConfig, SqlConfig, SqlError, TenantDelegatingPool, TenantMemoryAccountant,
+    CeilingBreach, DEFAULT_SPILL_MERGE_FAN_IN, SpillConfig, SqlConfig, SqlError,
+    TenantDelegatingPool, TenantMemoryAccountant,
 };
 use ravel_types::accounting::QueryAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
@@ -201,6 +202,7 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
         spill: Some(SpillConfig {
             dir: spill_dir,
             max_bytes: scratch_bytes,
+            merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
         }),
         segment_timing: false,
         aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
@@ -947,6 +949,7 @@ async fn a_spill_enabled_query_gets_no_unclassified_repartition_exec() {
         parallel_config(Some(SpillConfig {
             dir: scratch.path().to_path_buf(),
             max_bytes: AMPLE_SCRATCH_BYTES,
+            merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
         })),
         1 << 40,
     )

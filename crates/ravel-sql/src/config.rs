@@ -261,7 +261,13 @@ pub struct SpillConfig {
     /// not bytes decoded from them. Exceeding it is
     /// [`crate::SqlError::SpillBudgetExhausted`], never a partial result.
     pub max_bytes: u64,
+    /// Most spill files one merge step reads at once. Default
+    /// [`DEFAULT_SPILL_MERGE_FAN_IN`]; zero is DataFusion's unbounded default.
+    pub merge_fan_in: usize,
 }
+
+/// The default [`SpillConfig::merge_fan_in`].
+pub const DEFAULT_SPILL_MERGE_FAN_IN: usize = 2;
 
 /// A [`SpillConfig`] could not be read from the environment. Loud on purpose:
 /// a half-set or unparseable spill configuration silently selects a different
@@ -331,6 +337,7 @@ impl SpillConfig {
                 return Ok(Some(SpillConfig {
                     dir: cache_spill_dir(cache_dir.cache_dir, cache_dir.instance_id),
                     max_bytes,
+                    merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
                 }));
             }
             (None, None) => {}
@@ -347,6 +354,7 @@ impl SpillConfig {
         Ok(Some(SpillConfig {
             dir: cache_spill_dir(cache_dir.cache_dir, cache_dir.instance_id),
             max_bytes,
+            merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
         }))
     }
 
@@ -367,6 +375,7 @@ impl SpillConfig {
         Ok(SpillConfig {
             dir: PathBuf::from(dir),
             max_bytes,
+            merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
         })
     }
 }
@@ -850,6 +859,7 @@ mod tests {
             Some(SpillConfig {
                 dir: PathBuf::from("/explicit/spill"),
                 max_bytes: 4096,
+                merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
             })
         );
     }
@@ -1012,6 +1022,7 @@ mod tests {
         let explicit = SpillConfig {
             dir: PathBuf::from("/explicit"),
             max_bytes: 4096,
+            merge_fan_in: 4,
         };
         let config = SqlConfig {
             spill: Some(explicit.clone()),
