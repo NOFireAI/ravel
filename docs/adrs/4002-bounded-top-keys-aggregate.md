@@ -30,7 +30,7 @@ Neither existing bound applies:
 
 On a logs statement, `CompactSlices` later puts a `CompactSlicesExec` with a TopK pre-filter between the sort and the aggregate (`compact_slices.rs:124-146, 345-400`; pinned by `tests/logs_partition_topk.rs:249-262`). The pre-filter cuts the output rows of each batch, but the group table underneath stays unbounded. DataFusion folds `OFFSET s` into the sort's fetch and keeps a `GlobalLimitExec skip = s` above the sort (`datafusion-physical-optimizer-55.2.0/src/limit_pushdown.rs:232-247`).
 
-**The sort is already total.** Before planning, `rewrite_sort_group_key_tie_order` (`crates/ravel-sql/src/executor.rs:7820`; ADR-0954 cache-dir amendment, requirement 4) appends every group key that is not already a sort term to a `Sort` over an aggregate. The keys go in as trailing terms, ascending with nulls last. The rewrite applies when the aggregate has no float group key and only spill-family functions (`aggregate_functions_are_spill_families`), and does so in every configuration.
+**The sort is already total.** Before planning, `rewrite_sort_group_key_tie_order` (`crates/ravel-sql/src/executor.rs:7820`; ADR-0954 cache-dir amendment, requirement 4) appends every group key that is not already a sort term to a `Sort` over an aggregate. The keys go in as trailing terms, ascending with nulls last. The rewrite applies when the aggregate has no float group key, has only spill-family functions (`aggregate_functions_are_spill_families`), and the sort is not a bounded top-k candidate (`is_bounded_topk_candidate`, an order on a lone `min` or `max` output, which this ADR leaves out of scope anyway). It does so in every configuration (`total_tie_order_edit`).
 
 So for count, sum and avg over this shape, the sort's order is already a total order on the keys. A key that the projection drops is carried through it under a reserved `__ravel_tiebreak_*` name and removed again by a restore projection above the sort (`TieOrderEdit::ProjectThrough`, `executor.rs:7403, 7786`).
 
@@ -60,7 +60,11 @@ For each input batch it:
    - keeps the first n, and rebuilds the table and the accumulators from the kept keys and states;
    - sets the threshold to the n-th kept row.
 
-At end of input it applies the same cut once, then evaluates and emits at most n rows. The emit, state and merge round trip is the one `crates/ravel-sql/src/bucketed_final_aggregate.rs` already performs.
+   Two requirements of the rebuild carry the exactness argument (Decision 3), and T1 tests both:
+   - the fresh table holds the kept keys at group indexes 0 to n-1 before any later row is interned, so a key interned after the rebuild always has a larger index than every kept key;
+   - the rank is by sort row and then group index, never by sort row alone.
+
+At end of input it applies the same cut, with the same rank, once, then evaluates and emits at most n rows. The emit, state and merge round trip is the one `crates/ravel-sql/src/bucketed_final_aggregate.rs` already performs.
 
 **Memory.** Rebuilding at 2n rather than at n+1 keeps the rebuild cost amortised. In the adversarial ever-better order, and when many groups tie at the threshold, a rebuild at n+1 would run on nearly every batch.
 
@@ -109,9 +113,14 @@ A physical optimizer rule, registered in `build_session` after `FirstGroupsLimit
 
 ### 3. Why the answer is exact
 
-Let v(k) be the sort value of group k. Under the gate it is computed from the group's key alone, so it is the same for every row of the group. The final stage's hash distribution, or the single coalesced partition in `Final` mode, gives each partition every partial state of its keys (`datafusion-physical-plan-55.2.0/src/aggregates/mod.rs:2000-2012`).
+Let v(k) be the sort value of group k. Under the gate it is computed from the group's key alone, so it is the same for every row of the group. Each partition of the exec sees every input of its keys (`datafusion-physical-plan-55.2.0/src/aggregates/mod.rs:2000-2012`):
+- `FinalPartitioned` and `SinglePartitioned` require their input partitioned by the keys, so each partition gets every partial state (`FinalPartitioned`) or every row (`SinglePartitioned`) of its keys;
+- `Final` and `Single` require a single input partition, so that one partition gets all of them.
 
-- **An evicted key never returns.** At eviction the partition holds n keys with v at or before v(k). Its threshold only moves forward after that, so k is never again strictly better than its worst kept key. An evicted key is absent from the output, never partially counted.
+- **A kept group is complete.** Call a group complete when it has absorbed every input of its key that reached the partition. At each rebuild the kept groups are complete, by induction over rebuilds:
+  - A key evicted at a rebuild is outranked there by n kept keys whose sort rows are at or before its own. The threshold, the worst of those n, only moves forward after that. So a later row of the evicted key passes the mask only when its sort row equals the threshold, and is then interned as a new, partial group.
+  - That partial group has a group index of n or more (Decision 1, step 4), and the n kept keys each have a sort row at or before the threshold and a smaller index. So under the (sort row, group index) rank, the partial group ranks n-th or worse at every later rebuild and at the end-of-input cut, and is cut each time. It never reaches the output.
+  - A key that is kept at a rebuild, and was never evicted before, is complete. Each rebuild it went through kept it among the first n, so its sort row is at or before every threshold set since its first row arrived. Thresholds only move forward, so each of its rows met a threshold at or after its own sort row and passed the mask.
 - **The union is a correct answer.** Let t be the n-th best sort value over all groups, counted with multiplicity.
   - Every group with v strictly better than t is kept complete by its partition. Otherwise that partition held n complete groups strictly better than t, which is more than n over all partitions.
   - By the same argument, enough groups with v equal to t are kept complete to fill n.
@@ -158,6 +167,7 @@ Not measured yet. T1's peak test and T5's re-measurement on the Stage 0 statemen
   Those keep today's plan.
 - **`COUNT(DISTINCT)`.** It is planned as two aggregate levels (`group_keys.rs:1290-1291`). The outer final stage qualifies, but the inner `(key, value)` table stays unbounded.
 - **Unchanged parts of the plan.** The partial stage and the exchange still carry every partial group until T3. ADR-3565's per-bucket top-k (decision 4) never engages for this shape once the final stage is replaced.
+- **One plan change besides the replacement.** `CompactSlices` places a `CompactSlicesExec` directly above every `AggregateExec` and above nothing else (`compact_slices.rs:46-48`). Once the final stage is replaced, the `CompactSlicesExec` and its TopK pre-filter above that stage leave the plan; the one above the partial stage stays. The exec emits at most n rows, so the sort above it has little left to over-charge (#2720). Plans pinned for this shape change in T1.
 - **No threshold reaches the scan, and nothing regresses.** The stock `AggregateExec` forwards parent filters on grouping columns (`aggregates/mod.rs:2155-2169`), and the replacement does not, since a custom exec is a pushdown barrier by default (`execution_plan.rs:851-860`). But on main, `CompactSlicesExec` already blocks that path for this shape. Forwarding the sort's dynamic threshold to the logs scan, for latest-N time buckets, is a separate ADR (T4).
 - **Profiling still works.** `collect_aggregate_profile` reads the layout from every grouped `AggregateExec` in the plan (`memory.rs:743-770`), so the partial stage still supplies it once the final stage is replaced.
 - **Distributed queries.** Aggregation never leaves the coordinator (`distributed.rs:28-32`), so the rule sees each final stage exactly once.
