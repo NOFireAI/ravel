@@ -994,7 +994,9 @@ answered, but three properties of the decision above cost the rest:
    behind the rest, and releases the inputs when the pass ends. The scratch
    peak is therefore the spilled bytes S plus the largest intermediate
    merge output, and since no pass but the last reads every run, it stays
-   under 2S at any F. It depends on the run count N and on the size of the
+   under 2S at any F. S counts spill-file bytes on disk, as the scratch
+   quota does, so under the spill compression note above it is the
+   lz4_frame bytes. It depends on the run count N and on the size of the
    last run, which holds the remainder of the input. No closed form in F
    alone fits the measurements below: `1 + 1/F` predicts 1.25 for F = 4 at
    about 16 runs, a power of 4, which needed 1.44 to 1.46. With runs of
@@ -1004,7 +1006,8 @@ answered, but three properties of the decision above cost the rest:
    last run smaller than the others lifts that toward 2S at any F, which is
    why the F + 1 cells below sit above those figures. The smallest scratch
    quota the row 33 shape passed at, over S, with the lower figure failing
-   and the upper passing:
+   and the upper passing, measured before spill files were compressed, so
+   over uncompressed S:
 
    | Runs N | F = 2 | F = 3 | F = 4 | F = 8 |
    |---|---|---|---|---|
@@ -1015,7 +1018,7 @@ answered, but three properties of the decision above cost the rest:
    | 34 | 1.51-1.52 | 1.72-1.74 | 1.46-1.48 | 1.23-1.25 |
 
    The unbounded merge passed at 1.00-1.02 with 9 runs. At 34 runs and
-   the c6a.large figure of 6.48 GB spilled, F = 8 needs 7.96 to 8.07 GB,
+   the c6a.large figure of 6.48 GB spilled uncompressed, F = 8 needs 7.96 to 8.07 GB,
    against a margin of 8.0 GB on the 9.44 GB share; F = 2 needs 9.8 GB,
    over the share. The replay room at the geometry of a 4 GB host (row 35
    at 1.6 million groups, row 14 at 1 million, the process budget at the
@@ -1042,12 +1045,16 @@ answered, but three properties of the decision above cost the rest:
    groups, a cap that seats about six runs) 8 replays like the unbounded
    merge and fails row 35 at 50% and row 14 at 70%, which 2 passes. The
    cost is the c6a.large row 33 cell above: at 34 runs 2 needs 1.51 to 1.52
-   times S, 9.8 GB, over that host's 9.44 GB share, where 8 fit. The row 33
-   tests in `crates/ravel-sql/tests/spill.rs` pin the bound with integer
-   keys: with 3, 4, 5, 6 and 8 runs of about equal size a quota of 1.70
-   times S answers (peaks 1.65-1.66, 1.54-1.55, 1.50-1.51, 1.65-1.66 and
-   1.54-1.55), with 4 runs 1.45 is refused, and 3 runs whose last is small
-   (peak 1.93-1.94) are refused at 1.70 and answer at 2.
+   times S, 9.8 GB, over that host's 9.44 GB share, where 8 fit. Those
+   figures are uncompressed; lz4_frame shrinks S by the spill's
+   compression ratio, and the cell has not been measured on that host
+   with compressed spill files. The row 33 tests in
+   `crates/ravel-sql/tests/spill.rs` pin the bound with integer keys and
+   S in lz4_frame bytes: with 3, 4, 5, 6 and 8 runs of about equal size a
+   quota of 1.70 times S answers (peaks 1.65-1.66, 1.54-1.55, 1.50-1.51,
+   1.65-1.66 and 1.54-1.55), with 4 runs 1.45 is refused, and 3 runs whose
+   last is small (peak 1.93-1.94) are refused at 1.70 and answer at 2.
+   Uncompressed spill files bisect to the same peaks over their own S.
 3. **In a spill-enabled pool, a reserve-ahead refusal of a spill-capable
    consumer is a spill trigger, not a failure.** The same refusal of a
    consumer that cannot spill is unchanged, and so is any refusal in a

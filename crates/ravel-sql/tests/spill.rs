@@ -2766,7 +2766,9 @@ const FAN_IN_SMALL_LAST_RUN: FanInFixture = FanInFixture {
 /// quota of `quota_hundredths` of S: the spill files it wrote, or its error.
 ///
 /// S is the bytes of a retry under [`FAN_IN_REFERENCE_POOL_PERCENT`], which
-/// must merge its runs in one pass, writing nothing more. A
+/// must merge its runs in one pass, writing nothing more. Like the quota, it
+/// counts spill-file bytes on disk, which a spill-enabled session writes as
+/// lz4_frame (`SpillDecision::SPILL_COMPRESSION`). A
 /// retry under the fixture's pool with scratch ample must then spill the
 /// fixture's runs, which pins the run count through [`fifo_merge_files`]. Every
 /// answered run's rows are checked against the unlimited run's.
