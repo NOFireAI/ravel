@@ -10,8 +10,9 @@
 //! aggregate builds a table of every group its partition receives before it
 //! emits one row. With a million distinct groups that table, charged with
 //! the aggregate's undercount factor and reserve-ahead envelope, is the
-//! largest consumer of the query: ClickBench's index 17 was refused at the
-//! process ceiling and answered only by the ADR-0954 refusal-retry.
+//! largest consumer of the query: ClickBench's SQL index 17 charged 2.5 to
+//! 2.8 GB to return 10 rows and was sometimes refused at an 8 GB host's
+//! process limit, then answered by the ADR-0954 refusal-retry.
 //!
 //! # The rewrite
 //!
@@ -175,7 +176,10 @@ impl FirstGroupsLimit {
     /// output are read (`None`: all of them), if `node` is a limit or a node
     /// that passes every row of its single child through as one output row.
     /// `Err(())` for any other node, which ends the walk.
-    fn bound_below(node: &Arc<dyn ExecutionPlan>, needed: Option<usize>) -> Result<Option<usize>, ()> {
+    fn bound_below(
+        node: &Arc<dyn ExecutionPlan>,
+        needed: Option<usize>,
+    ) -> Result<Option<usize>, ()> {
         let limited = |skip: usize, fetch: usize| {
             Some(skip.saturating_add(needed.map_or(fetch, |needed| needed.min(fetch))))
         };
@@ -252,7 +256,10 @@ impl FirstGroupsLimit {
         )
     }
 
-    fn rewrite(&self, node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn ExecutionPlan>>> {
+    fn rewrite(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+    ) -> DFResult<Transformed<Arc<dyn ExecutionPlan>>> {
         let is_limit = node.is::<GlobalLimitExec>()
             || node.is::<LocalLimitExec>()
             || node
@@ -404,8 +411,9 @@ impl ExecutionPlan for FirstGroupsExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let input = self.input.execute(partition, Arc::clone(&context))?;
-        let reservation = MemoryConsumer::new(format!("{FIRST_GROUPS_CONSUMER_PREFIX}{partition}]"))
-            .register(context.memory_pool());
+        let reservation =
+            MemoryConsumer::new(format!("{FIRST_GROUPS_CONSUMER_PREFIX}{partition}]"))
+                .register(context.memory_pool());
         Ok(Box::pin(FirstGroupsStream {
             schema: input.schema(),
             input,
@@ -518,7 +526,8 @@ impl FirstGroupsStream {
         self.group_values = new_group_values(Arc::clone(&self.group_schema), &GroupOrdering::None)?;
         let mut indices = Vec::with_capacity(self.n);
         self.group_values.intern(&kept, &mut indices)?;
-        if self.group_values.len() != self.n || indices.iter().enumerate().any(|(i, index)| i != *index)
+        if self.group_values.len() != self.n
+            || indices.iter().enumerate().any(|(i, index)| i != *index)
         {
             return Err(DataFusionError::Internal(format!(
                 "FirstGroupsExec: rebuilding {} groups numbered them differently",
@@ -531,20 +540,22 @@ impl FirstGroupsStream {
 
     /// Resize the reservation to the table and the index buffer.
     fn charge(&mut self) -> DFResult<()> {
-        let size = self.group_values.size()
-            + self.group_indices.capacity() * std::mem::size_of::<usize>();
+        let size =
+            self.group_values.size() + self.group_indices.capacity() * std::mem::size_of::<usize>();
         let held = self.reservation.size();
         if size > held {
             let additional = size - held;
-            self.reservation.try_grow(additional).map_err(|err| match err {
-                DataFusionError::ResourcesExhausted(message) => {
-                    DataFusionError::ResourcesExhausted(format!(
-                        "{} refused {additional} bytes: {message}",
-                        self.reservation.consumer().name()
-                    ))
-                }
-                other => other,
-            })?;
+            self.reservation
+                .try_grow(additional)
+                .map_err(|err| match err {
+                    DataFusionError::ResourcesExhausted(message) => {
+                        DataFusionError::ResourcesExhausted(format!(
+                            "{} refused {additional} bytes: {message}",
+                            self.reservation.consumer().name()
+                        ))
+                    }
+                    other => other,
+                })?;
         } else {
             self.reservation.shrink(held - size);
         }

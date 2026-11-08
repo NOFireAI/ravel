@@ -65,7 +65,11 @@ fn empty_logs() -> SessionTable {
 }
 
 /// The production session over `pool`, with `parts` registered as `t`.
-fn session(config: &SqlConfig, pool: Arc<dyn MemoryPool>, parts: Vec<Vec<RecordBatch>>) -> SessionContext {
+fn session(
+    config: &SqlConfig,
+    pool: Arc<dyn MemoryPool>,
+    parts: Vec<Vec<RecordBatch>>,
+) -> SessionContext {
     let ctx = build_session(
         config,
         pool,
@@ -171,13 +175,22 @@ async fn an_unordered_group_by_limit_puts_a_first_groups_filter_under_the_final_
 
     let config = SqlConfig::default();
     for (sql, n) in [
-        ("SELECT k1, k2, count(*) FROM t GROUP BY k1, k2 LIMIT 10", 10),
-        ("SELECT k1, k2, count(*) FROM t GROUP BY k1, k2 OFFSET 5 LIMIT 10", 15),
+        (
+            "SELECT k1, k2, count(*) FROM t GROUP BY k1, k2 LIMIT 10",
+            10,
+        ),
+        (
+            "SELECT k1, k2, count(*) FROM t GROUP BY k1, k2 OFFSET 5 LIMIT 10",
+            15,
+        ),
     ] {
         let (all, under_final, text) = bounds(&config, sql).await;
         assert_eq!(all, vec![n], "{sql}\n{text}");
         assert_eq!(under_final, vec![n], "{sql}\n{text}");
-        assert!(text.contains(&format!("FirstGroupsExec: n={n}")), "{sql}\n{text}");
+        assert!(
+            text.contains(&format!("FirstGroupsExec: n={n}")),
+            "{sql}\n{text}"
+        );
     }
 
     for (sql, why) in [
@@ -212,7 +225,10 @@ async fn an_unordered_group_by_limit_puts_a_first_groups_filter_under_the_final_
     };
     let sql = "SELECT k1, k2, count(*) FROM t GROUP BY k1, k2 LIMIT 10";
     let (all, _, text) = bounds(&off, sql).await;
-    assert!(all.is_empty(), "bounded_groups_max_limit = 0: {sql}\n{text}");
+    assert!(
+        all.is_empty(),
+        "bounded_groups_max_limit = 0: {sql}\n{text}"
+    );
 }
 
 const PARTITIONS: i64 = 8;
@@ -292,14 +308,25 @@ async fn the_returned_groups_carry_every_row_from_every_input_partition() {
         );
         for row in 0..batch.num_rows() {
             let key = k.value(row);
-            assert!((0..GROUPS).contains(&key), "key {key} is not an input group");
+            assert!(
+                (0..GROUPS).contains(&key),
+                "key {key} is not an input group"
+            );
             assert_eq!(count.value(row), rows_of(key), "count(*) of group {key}");
             assert_eq!(sum.value(row), key * rows_of(key), "sum(v) of group {key}");
             assert!(keys.insert(key), "group {key} returned twice");
         }
     }
-    assert_eq!(keys.len(), 10, "LIMIT 10 over 65,536 groups returns 10 groups");
-    assert!(run.charged < MIB as u64, "charged peak {} reached the 1 MiB pool", run.charged);
+    assert_eq!(
+        keys.len(),
+        10,
+        "LIMIT 10 over 65,536 groups returns 10 groups"
+    );
+    assert!(
+        run.charged < MIB as u64,
+        "charged peak {} reached the 1 MiB pool",
+        run.charged
+    );
 
     // The same statement and pool with the rule off: the final aggregate
     // tracks every group and the pool refuses it.
@@ -313,7 +340,10 @@ async fn the_returned_groups_carry_every_row_from_every_input_partition() {
         "first_groups 1 MiB: charged peak {} with the bound; rule off: {err}",
         run.charged
     );
-    assert!(err.to_string().contains("Resources exhausted"), "rule off: {err}");
+    assert!(
+        err.to_string().contains("Resources exhausted"),
+        "rule off: {err}"
+    );
 }
 
 /// A `Utf8View` key whose groups the filter must count as the aggregate
@@ -354,13 +384,13 @@ async fn first_groups_keep_null_and_long_view_keys_as_the_aggregate_does() {
     for (i, start) in (0..rows.len()).step_by(3).enumerate() {
         let array = all.slice(start, 3.min(rows.len() - start));
         parts[i % 2].push(
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)])
-                .expect("batch builds"),
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)]).expect("batch builds"),
         );
     }
 
     let config = SqlConfig::default();
-    let (pool, _breach) = config.query_pool(TenantMemoryAccountant::new(1 << 30), QueryAccounting::new());
+    let (pool, _breach) =
+        config.query_pool(TenantMemoryAccountant::new(1 << 30), QueryAccounting::new());
     let ctx = session(&config, pool, parts);
     {
         let state = ctx.state_ref();
@@ -372,7 +402,12 @@ async fn first_groups_keep_null_and_long_view_keys_as_the_aggregate_does() {
     }
     let sql = "SELECT k, count(*) FROM t GROUP BY k LIMIT 10";
     let plan = plan_of(&ctx, sql).await;
-    assert_eq!(first_groups_under_final(&plan), vec![10], "{}", render(&plan));
+    assert_eq!(
+        first_groups_under_final(&plan),
+        vec![10],
+        "{}",
+        render(&plan)
+    );
     let batches = collect(plan, ctx.task_ctx()).await.expect("query runs");
 
     let mut got: BTreeMap<Option<String>, i64> = BTreeMap::new();
@@ -382,12 +417,23 @@ async fn first_groups_keep_null_and_long_view_keys_as_the_aggregate_does() {
         let count = int64(batch.column(1));
         for row in 0..batch.num_rows() {
             let key = k.is_valid(row).then(|| k.value(row).to_string());
-            assert!(got.insert(key.clone(), count.value(row)).is_none(), "{key:?} twice");
+            assert!(
+                got.insert(key.clone(), count.value(row)).is_none(),
+                "{key:?} twice"
+            );
         }
     }
     assert_eq!(got.get(&None), Some(&7), "the NULL group");
-    assert_eq!(got.get(&Some(LONG.to_string())), Some(&5), "the 13-byte group");
-    assert_eq!(got.get(&Some(SHORT.to_string())), Some(&3), "the 12-byte group");
+    assert_eq!(
+        got.get(&Some(LONG.to_string())),
+        Some(&5),
+        "the 13-byte group"
+    );
+    assert_eq!(
+        got.get(&Some(SHORT.to_string())),
+        Some(&3),
+        "the 12-byte group"
+    );
     assert_eq!(got, expected);
 }
 
@@ -480,8 +526,11 @@ fn wide_parts() -> Vec<Vec<RecordBatch>> {
                             format!("search phrase {i:08}")
                         }
                     }));
-                    RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(user), Arc::new(phrase)])
-                        .expect("batch builds")
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(user), Arc::new(phrase)],
+                    )
+                    .expect("batch builds")
                 })
                 .collect()
         })
@@ -528,8 +577,14 @@ async fn probed(
         let mut state = state.write();
         let options = state.config_mut().options_mut();
         for (key, value) in [
-            ("datafusion.execution.skip_partial_aggregation_probe_rows_threshold", "1"),
-            ("datafusion.execution.skip_partial_aggregation_probe_ratio_threshold", "0.0"),
+            (
+                "datafusion.execution.skip_partial_aggregation_probe_rows_threshold",
+                "1",
+            ),
+            (
+                "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+                "0.0",
+            ),
             ("datafusion.execution.batch_size", "1024"),
         ] {
             options.set(key, value).expect("option sets");
@@ -579,10 +634,26 @@ async fn first_groups_bound_the_final_aggregates_charged_peak() {
         let batches = run.as_ref().expect("query runs");
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
     }
-    assert!(on.charged < 16 * MIB as u64, "charged peak {} with the bound", on.charged);
-    assert!(on.envelope < 8 * MIB as i64, "envelope peak {} with the bound", on.envelope);
-    assert!(off.charged > 32 * MIB as u64, "charged peak {} with the rule off", off.charged);
-    assert!(off.envelope > 32 * MIB as i64, "envelope peak {} with the rule off", off.envelope);
+    assert!(
+        on.charged < 16 * MIB as u64,
+        "charged peak {} with the bound",
+        on.charged
+    );
+    assert!(
+        on.envelope < 8 * MIB as i64,
+        "envelope peak {} with the bound",
+        on.envelope
+    );
+    assert!(
+        off.charged > 32 * MIB as u64,
+        "charged peak {} with the rule off",
+        off.charged
+    );
+    assert!(
+        off.envelope > 32 * MIB as i64,
+        "envelope peak {} with the rule off",
+        off.envelope
+    );
 }
 
 const USER_COL: &str = "UserID";
@@ -740,7 +811,12 @@ async fn clickbench_row_18_returns_exact_counts_through_the_logs_table() {
         .create_physical_plan()
         .await
         .expect("physical plan builds");
-    assert_eq!(first_groups_under_final(&plan), vec![10], "{}", render(&plan));
+    assert_eq!(
+        first_groups_under_final(&plan),
+        vec![10],
+        "{}",
+        render(&plan)
+    );
 
     let outcome = executor
         .execute(logs_tenant().hash(), &request)

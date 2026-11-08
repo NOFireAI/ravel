@@ -1103,6 +1103,11 @@ it is measured on the statement it moves.
 - Unchanged: object storage is the only durable store, spill is per-query
   ephemeral state no other process reads, and no partial result is
   returned.
+- 2026-11-08: an unordered `GROUP BY ... LIMIT n` with an aggregate, the
+  shape of ClickBench row 18 that issue #3985 saw refused and retried, no
+  longer builds every group in its final aggregate and so no longer reaches
+  this retry on that table; see the unordered GROUP BY LIMIT amendment
+  below.
 
 ### Refusal-retry diagram
 
@@ -1122,3 +1127,21 @@ flowchart TB
     E1 --> C
     E2 --> C
 ```
+
+## Amendment (2026-11-08): an unordered GROUP BY ... LIMIT no longer reaches the refusal-retry (issue #3985)
+
+<!-- amendment-applies: sections="Amendment (2026-11-07): spill only after a refusal, shared scratch, and spill on by default (issue #3899)" pointer="unordered GROUP BY LIMIT amendment" -->
+
+This is the unordered GROUP BY LIMIT amendment. ClickBench row 18,
+`SELECT "UserID", "SearchPhrase", COUNT(*) FROM logs GROUP BY "UserID", "SearchPhrase" LIMIT 10`,
+charged 2.5 to 2.8 GB in its final aggregate on an 8 GB host and was
+occasionally refused at the process limit, then answered through this
+ADR's refusal-retry about 25 s slower (issue #3985). ADR-3985 places a
+`FirstGroupsExec` under the final aggregate of an unordered
+`GROUP BY ... LIMIT n` with at least one aggregate and `n + s` at most
+`SqlConfig::bounded_groups_max_limit` (default 1024), so each final
+partition holds at most `n + s` groups and the answer stays exact. That
+shape no longer reaches the retry through its group table. Nothing in the
+refusal-retry design changes: an ordered top-k by `count` or `sum`, such as
+row 17, and an unordered limit over a `HAVING` filter still build every
+group and keep the retry.

@@ -508,7 +508,7 @@ pub struct SqlConfig {
     /// startup, like every other field here; ravel-server takes the default
     /// and has no flag for it.
     ///
-    /// The rewrite is invisible to results: the statement may return any
+    /// The rewrite keeps the answer exact: the statement may return any
     /// `n` groups, and every group the exec keeps reaches the aggregate with
     /// all of its rows (see the `crate::first_groups` module docs for why).
     /// It changes which `n` groups come back, which the statement leaves
