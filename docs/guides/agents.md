@@ -1,11 +1,10 @@
 # Ravel Agents
 
-Ravel Agents is a durable agent runtime that keeps every agent's state in
-the same object storage bucket as your telemetry. It is distinct from the
+Ravel Agents runs long-lived agents and keeps each agent's state in the same
+object storage bucket as your telemetry. It is separate from the
 [MCP server for AI agents](mcp-server.md), which lets an AI agent host query
-Ravel. This page says what an agent is, how to turn the runtime on, and what
-works in this release. The [storage protocol](../agents.md) is the normative
-reference for every guarantee below.
+Ravel. The [storage protocol](../agents.md) is the normative reference for
+every guarantee on this page.
 
 ## What an agent is
 
@@ -66,8 +65,7 @@ the routes' admission pools: a request past its pool answers 503
 `store_unavailable`. `--agents-max-mailbox`, `--agents-max-receipts` and
 `--agents-max-timers` are the caps every agent's mailbox, receipts and
 timers are held to. `--agents-max-agents`, `--agents-max-state-bytes` and
-`--agents-memory-budget` are reported only: no route enforces them in this
-release.
+`--agents-memory-budget` are reported only: no route enforces them.
 
 Access is by three capabilities: `agents` for client operations,
 `agents_worker` for workers, and `agents_admin` for reconciliation and
@@ -85,42 +83,51 @@ that prefix to the gateway and query roles. Because of that grant, `ag` is a
 reserved Parquet table name: a table already named `ag` stops resolving,
 and `ravel-cli parquet repair --stray` reports its manifests.
 
-## What works today
+## What you can use
 
-Ravel Agents arrives in seven milestones. This release serves the client
-routes (`create`, `send`, `call`, `operation`, `result`, `resolve`,
-`cancel`, `state`, `events`, `timers`, `effects`), the worker routes
-(`worker/register`, `worker/poll`, `worker/heartbeat`, `worker/commit`,
-`worker/step`, `worker/effects/complete`, `worker/effects/fail`), the admin
-`reconcile`, `sweep` and `destroy` routes, and the inspector, all under
-`/api/v1/agents/`.
-The [HTTP API reference](../reference/http-api.md#agents-routes) gives each
-route's body and status codes. The server's `agents_e2e` tests run these
-routes against a real server, for example
-`send_then_result_through_real_server_survives_worker_replacement` and
-`call_heartbeat_and_cancel_through_real_server`.
+All routes are under `/api/v1/agents/`. The
+[HTTP API reference](../reference/http-api.md#agents-routes) gives each
+route's body and status codes.
 
-| Milestone | What it delivers | In this release |
-|---|---|---|
-| 0 Contracts | key layout, HEAD format, typed errors, the `agents` feature and `--agents` flag | yes |
-| 1 Durable kernel | create, send, read, resolve, turn commit, receipts, quotas | yes, over the client routes; the agent-count, state-size and memory quotas are reported but not enforced |
-| 2 Runtime and SDK | workers, ownership and takeover, turn dispatch, the TypeScript SDK | yes; the SDK's worker connects with `createHttpTransport` and records steps and effect results through the server's step and effect routes |
-| 3 Steps and tools | step journal, effect intents, recovery policies, cancellation | yes, in the TypeScript SDK too |
-| 4 Timers and discovery | timer firing, wake hints, the reconciliation sweep | yes; a send writes no wake hint; see the [operator guide](operations/agents.md#several-server-processes) |
-| 5 Developer experience | `ravel-cli agents`, inspector page, MCP tools, Rust client, projection into logs and traces | yes; MCP tools need a build with `mcp` |
-| 6 Release hardening | paged indexes, benchmarks, operator guide, the feature in the published image | yes; see the [operator guide](operations/agents.md) |
+| Surface | What it does |
+|---|---|
+| Client routes | `create`, `send`, `call`, `operation`, `result`, `resolve`, `cancel`, `state`, `events`, `timers`, `effects` |
+| Worker routes | `worker/register`, `worker/poll`, `worker/heartbeat`, `worker/commit`, `worker/step`, `worker/effects/complete`, `worker/effects/fail` |
+| Admin routes | `reconcile` settles an effect in doubt, `sweep` runs one discovery pass now, `destroy` ends an agent's incarnation |
+| Inspector | an embedded HTML page that shows one agent's state, timers, effects and events to an `agents` token |
+| `ravel-cli agents` | `dev`, `scaffold`, `list`, `inspect`, `operation`, `events`, `effects`, `reconcile`, `destroy` |
+| Rust client | `ravel-agents-client`: one method per client route, with typed failures; it never retries on its own |
+| MCP tools | agent tools on the MCP server, in a build with the `mcp` feature and only with `--mcp --agents` |
+| Projection | committed agent history appears in the tenant's logs and traces, redacted by default |
+| TypeScript SDK | define agents and tools, serve them from a worker, send them messages; see [below](#the-typescript-sdk) |
+
+Current limits:
+
+- **Agent lifetime.** One incarnation accepts at most `--agents-max-receipts`
+  sends, and its results, events and timers lists stop at a fixed size.
+  Nothing trims them. An agent at a cap stays there until an `agents_admin`
+  caller destroys it and it is created again. See
+  [Long-lived agents](operations/agents.md#long-lived-agents).
+- **Discovery across processes.** A send writes no wake hint. With several
+  server processes on one tenant, a worker polling a different process from
+  the one that accepted the send waits for that process's sweep to reach the
+  agent. See the [operator guide](operations/agents.md#several-server-processes).
+- **Quotas.** The agent-count, state-size and memory flags are reported but
+  not enforced.
 
 The [guarantees and limitations matrix](../agents.md#guarantees-and-limitations)
-lists each behaviour with its status and tests.
+lists each behaviour with its status and tests. The
+[operator guide](operations/agents.md) covers budgets, tokens, projection,
+reconciling and destroying.
 
 ## The TypeScript SDK
 
-The SDK lives in `sdk/typescript/packages/agents`; its
-[README](../../sdk/typescript/packages/agents/README.md) shows how to define
-an agent and a tool and drive them through the test harness. It is not
-published. Its worker reaches the worker routes through
-`createHttpTransport`, which records every step and effect result through
-the server's step and effect routes, so a worker that replaces a killed one
-in another process replays the same steps.
+The SDK lives in `sdk/typescript/packages/agents` and is not published to
+npm: a project links it from a checkout of this repository. Its worker
+connects to a server with `createHttpTransport`, which records every step and
+effect result on the server, so a worker that replaces a killed one in
+another process replays the same steps.
 [The SDK guide](agents-sdk.md) takes a first project from a scaffold to a
-run against a server.
+run against a server, and the package
+[README](../../sdk/typescript/packages/agents/README.md) is the API
+reference.

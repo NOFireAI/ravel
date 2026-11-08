@@ -1,59 +1,32 @@
 # @ravel/agents
 
-TypeScript SDK for Ravel Agents, the durable agent runtime described in
-ADR-3331 (decision 11). The package name is provisional and the package is
-never published (`"private": true` in `package.json`).
+TypeScript SDK for Ravel Agents, the durable agent runtime in `ravel-server`.
+Define agents and tools, serve them from a worker, and send them messages
+from a client. Run the same code against the in-process fake coordinator in
+`@ravel/agents/testing` or against a live `ravel-server --agents`. The
+[SDK guide](../../../../docs/guides/agents-sdk.md) is the tutorial; this
+page is the API reference.
 
-## Status and reachability
+The package is not published to npm (`"private": true` in `package.json`),
+and its name is provisional. A project links it from a checkout of this
+repository.
 
-The SDK runs against the in-process fake coordinator in
-`@ravel/agents/testing` and against a live `ravel-server --agents`:
+## Install
 
-- `ravel-server --agents` serves the client and worker routes under
-  `/api/v1/agents/`, and the wire schemas here match their bodies (the
-  golden fixtures in `sdk/fixtures/` are written by the Rust side).
-  `createClient` maps a 401 or 403 to `Forbidden`.
-- `createHttpTransport` (`@ravel/agents/worker`) is the `Transport` that
-  `serveAgents` uses against a server. It records every step and effect
-  result through the server's `worker/step`, `worker/effects/complete` and
-  `worker/effects/fail` routes, so the server holds the step journal. Its
-  behaviour is pinned under "HTTP transport" below.
-- `createClient` reads an agent's effects (`effects`) and one effect
-  (`effect`), records an in-doubt effect's outcome (`reconcile`) and
-  destroys an agent (`destroy`); see "Client" below.
-- The end-to-end tests in `e2e/` start a built `ravel-server` and kill a
-  worker inside a step (see "End-to-end tests").
-- The only way in is the package's own exports; nothing in Ravel imports
-  it.
-- CI's `sdk` job (`scripts/gates-sdk.sh`) runs `npm ci`, `npm run lint`,
-  `npm run typecheck` and `npm test`, and nothing else: it builds no
-  server, so `npm run test:e2e` runs locally only. No nightly workflow runs
-  it either. `make test-sdk` and `make lint-sdk` from the repository root
-  run the unit checks.
+From `sdk/typescript/` in a checkout (node 22.15 or later 22.x):
 
-## Entry points
+```sh
+npm ci
+node packages/agents/bin/ravel-agents-scaffold.js <dir>
+```
 
-| Import | Contents |
-|---|---|
-| `@ravel/agents` | The typed errors and shared types |
-| `@ravel/agents/client` | `createClient`: send messages to agents and follow operations |
-| `@ravel/agents/worker` | `defineAgent`, `message`, `serveAgents` and the step runner |
-| `@ravel/agents/tools` | `defineTool` |
-| `@ravel/agents/testing` | `createTestHarness`: in-process agents for tests |
-| `@ravel/agents/contract` | `generateContract`: client types from an agent's handler schemas |
-| `@ravel/agents/scaffold` | `scaffold`: write a starter project into an empty directory |
+The bin writes a starter project that links `@ravel/agents` with a relative
+`file:` dependency. Run the bin by its path, never by its bare name; [the SDK
+guide](../../../../docs/guides/agents-sdk.md#first-run) says why. From the
+repository root, `ravel-cli agents scaffold <dir>` runs this bin with node
+and passes `<dir>` through; the by-path form needs no Rust build.
 
-The package's bin, `bin/ravel-agents-scaffold.js <dir>`, runs `scaffold`.
-Run it by its path, never by its bare name; [the SDK
-guide](../../../../docs/guides/agents-sdk.md#first-run) says why.
-
-The client entry imports no server-only module: nothing under `worker/`,
-`tools/` or `testing/`, and none of `node:child_process`, `node:fs` or
-`node:net`. The test `client entry imports no server-only module` in
-`src/client/index.test.ts` walks the client entry's import graph and
-fails on any of them.
-
-## First run
+## First example
 
 Define a tool, an agent that calls it through a durable step, and drive
 both through the test harness:
@@ -99,435 +72,240 @@ await h.close();
 ```
 
 Against a server, the client side is the same with
-`createClient({ url, token }).agent<typeof order>("order", "o-1")`.
+`createClient({ url, token }).agent<typeof order>("order", "o-1")`. A worker
+connects with `createHttpTransport`; see [HTTP transport](#http-transport).
 
-## Scaffold and typed contract
+## Entry points
 
-From `sdk/typescript/`, after `npm ci`:
+| Import | Contents |
+|---|---|
+| `@ravel/agents` | The typed errors and shared types |
+| `@ravel/agents/client` | `createClient`: send messages to agents and follow operations |
+| `@ravel/agents/worker` | `defineAgent`, `message`, `serveAgents`, `createHttpTransport` and the step runner |
+| `@ravel/agents/tools` | `defineTool` |
+| `@ravel/agents/testing` | `createTestHarness`: in-process agents for tests |
+| `@ravel/agents/contract` | `generateContract`: client types from an agent's handler schemas |
+| `@ravel/agents/scaffold` | `scaffold`: write a starter project into an empty directory |
 
-```sh
-node packages/agents/bin/ravel-agents-scaffold.js <dir>
-```
+The package's bin, `bin/ravel-agents-scaffold.js <dir>`, runs `scaffold`.
 
-Run the bin by its path; [the SDK
-guide](../../../../docs/guides/agents-sdk.md#first-run) says why.
+The client entry imports no server-only module: nothing under `worker/`,
+`tools/` or `testing/`, and none of `node:child_process`, `node:fs` or
+`node:net`.
 
-It writes a starter project: one agent, `order`, whose `checkout` handler prices a line through the durable step `price`
-against a local price-list fixture (no network, no API key); the client
-types generated from its handler schemas; a client typed by them; a vitest
-suite against `@ravel/agents/testing`; and its `package.json`, `tsconfig.json`
-and README. Its suite needs no server and no API key. From the repository
-root, `ravel-cli agents scaffold <dir>` runs this bin with node and passes
-`<dir>` through; the by-path form above needs no Rust build.
+## Scaffold
 
-- The output typechecks and its own suite passes, run as a child process
-  with every `*_API_KEY` variable removed and again with poison values set,
-  and no generated file names an API key; the generated test and the files
-  it imports do not read `process.env`. The file list is exactly
-  `SCAFFOLD_FILES`. Test: `scaffold output typechecks and its tests pass
-  without an API key` (`src/scaffold/index.test.ts`). That test links the
-  SDK's own `node_modules` into the output instead of running
-  `npm install`, so npm resolving the generated `file:` dependency is not
-  under test.
+The starter project holds one agent, `order`, whose `checkout` handler
+prices a line through the durable step `price` against a local price-list
+fixture (no network, no API key); the client types generated from its
+handler schemas; a client typed by them; a vitest suite against
+`@ravel/agents/testing`; and its `package.json`, `tsconfig.json` and README.
+
+- The output typechecks and its suite passes with no `*_API_KEY` variable
+  set. No generated file names an API key, and the generated test and the
+  files it imports do not read `process.env`. The file list is exactly
+  `SCAFFOLD_FILES`.
 - A directory that is not empty, even one holding only an empty
   subdirectory, is refused with `ScaffoldError` code `target_not_empty`
   before anything is written, and a path that is a file with
-  `target_not_a_directory`; files are opened with `wx`, so none is
-  overwritten. Tests: `a second scaffold into the same directory is refused
-  and changes nothing`, `a directory holding any other file is refused and
-  nothing is written`, `a directory holding only an empty subdirectory is
-  refused`, `a path that is a file is refused`.
+  `target_not_a_directory`. Files are opened with `wx`, so none is
+  overwritten.
 - The bin exits 0 with the file list, 1 with `<code>: <message>` on stderr
-  for a refused directory, and 64 on bad usage. Test: `the bin writes a
-  project, exits 1 on a non-empty directory and 64 on bad usage`.
-- The project links `@ravel/agents` with a relative `file:` dependency and
-  pins zod, typescript, vitest and `@types/node` to the versions this
-  workspace pins. Test: `the generated package.json links this package and
-  pins the workspace's versions`.
+  for a refused directory, and 64 on bad usage.
+- The project pins zod, typescript, vitest and `@types/node` to the
+  versions this workspace pins.
+- The template's checked-in `contract.ts` is the generator's output.
+
+## Contract generator
 
 `generateContract(agent)` (`@ravel/agents/contract`) returns a TypeScript
 module of client types for one agent: `AGENT_KIND`, `AGENT_VERSION`,
 `HANDLER_NAMES`, `HandlerName`, and `InputOf<K>`, `OutputOf<K>` and
 `OperationOf<K>` for each handler. Inputs are the payload schemas' input side
 and outputs the result schemas' output side, as `PayloadOf` and `ResultOf`.
+A generated contract typechecks against the agent's own `PayloadOf`,
+`ResultOf` and `OperationHandle` types, and one that disagrees with the
+agent fails that check.
 
-- The contract generated from `examples/assistant` typechecks against the
-  agent's own `PayloadOf`, `ResultOf` and `OperationHandle` types, and a
-  contract that disagrees with the agent fails that check. Tests: `the
-  contract generated from the example assistant typechecks against the
-  agent's own types`, `a contract that disagrees with the agent fails that
-  typecheck` (`src/scaffold/contract.test.ts`).
-- The emitted text is pinned for a schema with an optional member, a
-  defaulted enum, a literal and a nullable member. Test: `emits handler
-  names, input and output types and the operation handle type`.
-- A `bigint`, a `Date`, a transform in a result schema or a recursive
-  schema is refused with `ContractError` code `unsupported_schema` naming
-  the handler side. Test: `a schema with no TypeScript form is refused with
-  a ContractError naming the handler side`.
-- A record keyed by an enum or a literal is typed by its key union:
-  `Record<"x" | "y", V>` for `z.record`, `Partial<Record<"x" | "y", V>>`
-  for `z.partialRecord`. A payload missing a key, or holding a key outside
-  the enum, fails to typecheck as zod fails to parse it. Test: `an
-  enum-keyed record is typed by its key union and typechecks against the
-  agent's own types`.
-- A record whose keys carry any other constraint (a pattern, a length) is
-  refused with `unsupported_schema` naming the keyword, since a
-  `Record<string, V>` would let a client send keys zod rejects. Test: `a
-  record whose keys are constrained other than by an enum is refused naming
-  the keyword`.
+How schemas map:
+
+| Schema | Generated type |
+|---|---|
+| Optional member, defaulted enum, literal, nullable member | their TypeScript forms |
+| `z.record` keyed by an enum or a literal | `Record<"x" \| "y", V>`; a payload missing a key, or holding a key outside the enum, fails to typecheck as zod fails to parse it |
+| `z.partialRecord` keyed by an enum or a literal | `Partial<Record<"x" \| "y", V>>` |
+| Loose object | its members `& Record<string, unknown>` |
+| Empty union (`z.union([])`) | `never` |
+
+Refused with `ContractError` code `unsupported_schema`, naming the handler
+side:
+
+- A `bigint`, a `Date`, a transform in a result schema, or a recursive
+  schema.
+- A record whose keys carry any other constraint (a pattern, a length),
+  naming the keyword, since a `Record<string, V>` would let a client send
+  keys zod rejects.
 - An object with named properties and a catchall typed other than
-  `unknown` is refused with `unsupported_schema`: intersecting the members
-  with `Record<string, V>` would type them as never, and an index signature
-  wide enough for them would accept extra keys zod rejects. A loose object
-  is typed as its members `& Record<string, unknown>`. Test: `an object
-  with named properties and a typed catchall is refused; a loose object
-  keeps its members`. An empty union (`z.union([])`) is typed `never`.
-  Test: `an empty union is typed never`.
-- The template's checked-in `contract.ts` is the generator's output. Test:
-  `the template's contract.ts is the generator's output for the template
-  agent`.
+  `unknown`: intersecting the members with `Record<string, V>` would type
+  them as never, and an index signature wide enough for them would accept
+  extra keys zod rejects.
 
-## Behaviour and the tests that pin it
-
-Worker and steps (`src/worker/`):
+## Worker and steps
 
 - A handler's state is a draft. Neither its state changes nor its emitted
   events are visible until the turn commits, and a failed turn publishes
-  neither. Tests: `state is a draft published only in the turn's commit`,
-  `a failing handler publishes neither state nor events, and dead-letters
-  after its attempts` (`steps.test.ts`).
+  neither. A failing handler dead-letters after its attempts.
 - `ctx.step(key, tool, input)` journals each step before running it. After
   a crash, a completed step is replayed from the journal without calling
-  the tool again, and the turn commits once. Test: `replay after
-  crashWorker with two completed steps replays both without calling run
-  and commits once` (`replay.test.ts`).
+  the tool again, and the turn commits once.
 - The runner decides from the journal's current record, not from the
   transcript the lease carried: a step the lease saw as started but whose
-  result landed since then replays that result. Test: `P1 a manual tool
-  completed by a dead worker after takeover is not run again`
-  (`review.test.ts`).
+  result landed since then replays that result.
 - A tool's result or failure that arrives after another attempt settled
   the step is kept as evidence only, and the step returns the journal's
-  result. Test: `a late tool result is kept as evidence and the step
-  returns the journal's result`.
+  result.
 - A tool that throws is journaled as the step's failure before the turn
   commits as failed, and a retried turn gets that failure back as
-  `StepFailed` instead of running the tool again. Test: `P11 a tool failure
-  is journaled as the step's result before the failed commit, and
-  replayed` (`review.test.ts`).
+  `StepFailed` instead of running the tool again.
 - An error a tool throws, typed or not, reaches the handler and does not
   block the operation; only the runner's own `NonDeterministicReplay` and
-  `EffectInDoubt`, and a coordinator refusal, block it. Test: `P9 a tool
-  that throws a typed RavelAgentsError does not wedge the operation`
-  (`review.test.ts`).
+  `EffectInDoubt`, and a coordinator refusal, block it.
 - A step key reused with a different tool name, tool version or input hash
   fails `NonDeterministicReplay` and blocks the operation; nothing commits.
-  Tests: `reused step key with a different input hash fails
-  NonDeterministicReplay` (`replay.test.ts`), `P3 a tool version bump under
-  a reused step key fails NonDeterministicReplay` (`review.test.ts`).
 - The input hash covers the input's JSON form (`toJSON` applied, an
   `undefined` member dropped and an `undefined` array item written as
   `null`, as `JSON.stringify` does), so a different `Date` is a different
   input and `{ cursor: undefined }` is the same input as `{}`. Any value
   that has no plain JSON form (a `Map`, `Set`, `bigint`, function,
   non-finite number or class instance, or `undefined` as the whole input)
-  is refused with `InvalidStepInput` before the tool runs. Tests: `P10 a
-  different Date under the same step key is detected` (`review.test.ts`),
-  `the JSON form drops undefined members and writes undefined items as
-  null, as JSON.stringify does` and `canonical JSON refuses %s`
-  (`identity.test.ts`), `a step input that is not plain JSON is
-  refused with InvalidStepInput before its tool runs, and fails terminally
-  uncaught`.
+  is refused with `InvalidStepInput` before the tool runs.
 - One step at a time per turn: a second `ctx.step` while one is in flight
-  rejects with `ConcurrentStepError`, which fails the operation terminally
-  if the handler does not catch it. Tests: `a second step started while one
-  is in flight is refused with ConcurrentStepError`, `an uncaught
-  ConcurrentStepError fails the operation terminally, without retries`.
+  rejects with `ConcurrentStepError`.
 - `ctx.now()` and `ctx.random()` are the same on every attempt at one
-  input. Test: `recorded time and seeded random are the same on every
-  attempt at one input`.
+  input: `ctx.now()` reads the lease's `recorded_unix_ns` and `ctx.random()`
+  is seeded from its `random_seed`.
 - A turn whose handler version or handler digest the worker does not match
-  is abandoned with `IncompatibleHandler`. Tests: `a worker without the
-  leased handler version abandons the turn with IncompatibleHandler`, `a
-  worker whose handler digest differs from the leased one abandons the turn
-  with IncompatibleHandler`.
-- A turn still leased to the worker is handed straight back to it, so
-  after a turn abandoned with an error whose `retry` is `reconcile`
-  (`EffectInDoubt`), `backoff` (`StoreUnavailable`, `MailboxFull`) or
-  `resolve` (`OutcomeUnknown`) the worker pauses before polling again,
-  doubling from `abandonDelayMs` (250 ms) up to `maxBackoffMs` (30 s). An
-  abandonment whose `retry` is `never`, such as `IncompatibleHandler`,
-  pauses the fixed `abandonDelayMs`. The doubling delay is kept per
-  operation: an operation's commit resets its own delay, and another
-  operation's abandonment starts at `abandonDelayMs` whatever the first
-  one's delay is. The pause still holds the whole poll loop, not only the
-  operation. The worker keeps a delay for at most 1024 operations and
-  forgets the least recently used past that. Tests: `doubles one
-  operation's pause after each EffectInDoubt abandonment up to the cap and
-  resets it on its commit`, `doubles the pause after each StoreUnavailable
-  heartbeat abandonment, and an IncompatibleHandler abandonment keeps the
-  fixed pause`, `an operation at the backoff cap does not raise an
-  unrelated operation's pause, and the unrelated commit does not reset
-  it`, `OperationBackoffs keeps one delay per operation and forgets the
-  least recently used past its capacity`, `a Backoff doubles from its
-  start to its cap and starts over on reset` (`serve.test.ts`).
-- Only a `Forbidden` poll error, a refused token, stops the worker: it goes
-  to `onError`, or without one rejects the handle's `done`. Any other poll
-  error, `UnsupportedFormat` included, goes to `onError` and is retried
-  after a pause doubling from 50 ms, since a proxy can answer one poll with
-  a page the SDK does not read and the next with a turn. Tests: `a
-  Forbidden poll stops the worker and rejects done with it`, `a Forbidden
-  poll goes to onError, stops the worker and fulfils done`, `a poll
-  answered with UnsupportedFormat is retried and the next poll runs its
-  turn`, `a transient OutcomeUnknown poll is retried after a doubling pause
-  and the next poll runs its turn` (`serve.test.ts`).
+  is abandoned with `IncompatibleHandler`.
 - `AgentGone` from any coordinator call in a turn (step record, effect
   result or commit) ends the turn as abandoned with that error, as
   `OwnershipLost` does: the commit is attempted once and never retried, and
-  the worker keeps polling. Test: `agent_gone at commit abandons the turn
-  without retry` (`serve.test.ts`).
+  the worker keeps polling.
 
-Unless a test file is named, the tests above are in `steps.test.ts`.
+Pauses after an abandoned turn. A turn still leased to the worker is handed
+straight back to it, so the worker pauses before polling again:
 
-Tools (`src/tools/`) take one of three recovery policies, and any other
-value is a `TypeError` (test: `refuses a recovery policy outside the
-three`). Every run receives the effect id, the attempt number and an abort
-signal (test: `a tool receives the effect id, attempt and signal`).
+| Abandoned with `retry` | Pause |
+|---|---|
+| `reconcile` (`EffectInDoubt`), `backoff` (`StoreUnavailable`, `MailboxFull`) or `resolve` (`OutcomeUnknown`) | doubling from `abandonDelayMs` (250 ms) up to `maxBackoffMs` (30 s) |
+| `never`, such as `IncompatibleHandler` | the fixed `abandonDelayMs` |
 
-| Policy | After a crash mid-run | Test |
-|---|---|---|
-| `at_least_once` | Runs again under the same effect id, attempt + 1 | `an at_least_once tool interrupted by a crash runs again under the same effect id` |
-| `provider_idempotency` | Runs again under the same effect id; the provider dedupes on it | `a tool receives the effect id, attempt and signal` (the id it would dedupe on) |
-| `manual` | Does not run again: a result recorded since replays, and an attempt with no result blocks the operation with `EffectInDoubt` | `a manual tool interrupted by a crash blocks the operation with EffectInDoubt`, `P1 a manual tool completed by a dead worker after takeover is not run again` |
+The doubling delay is kept per operation: an operation's commit resets its
+own delay, and another operation's abandonment starts at `abandonDelayMs`
+whatever the first one's delay is. The pause still holds the whole poll
+loop, not only the operation. The worker keeps a delay for at most 1024
+operations and forgets the least recently used past that.
 
-Client (`src/client/`):
+Poll errors. Only a `Forbidden` poll error, a refused token, stops the
+worker: it goes to `onError`, or without one rejects the handle's `done`.
+Any other poll error, `UnsupportedFormat` included, goes to `onError` and is
+retried after a pause doubling from 50 ms, since a proxy can answer one poll
+with a page the SDK does not read and the next with a turn.
+
+## Tools
+
+`defineTool` takes one of three recovery policies; any other value is a
+`TypeError`. Every run receives the effect id, the attempt number and an
+abort signal.
+
+| Policy | After a crash mid-run |
+|---|---|
+| `at_least_once` | Runs again under the same effect id, attempt + 1 |
+| `provider_idempotency` | Runs again under the same effect id; the provider dedupes on it |
+| `manual` | Does not run again: a result recorded since replays, and an attempt with no result blocks the operation with `EffectInDoubt` |
+
+## Client
 
 - Every retry of one request reuses its request id and request hash, so the
   coordinator answers it as the same request. Retried: network failures,
-  untyped 5xx answers, and typed errors whose hint is `backoff`. Tests: `a
-  retry after a transient 503 reuses the same request id and hash`, `an
-  untyped 5xx is retried the same way`, `retries are bounded: an exhausted
-  store_unavailable surfaces as StoreUnavailable`.
+  untyped 5xx answers, and typed errors whose hint is `backoff`. Retries are
+  bounded: an exhausted `store_unavailable` surfaces as `StoreUnavailable`.
 - A send whose outcome is unknown throws `OutcomeUnknown` carrying a
   handle. `handle.result()` first asks the coordinator to resolve the
-  request id and resends the same body only when it never landed. Tests:
-  `a send whose response misses its deadline resolves to the operation it
-  created`, `a send that never landed is resent under the same request id
-  once resolve finds nothing`.
+  request id and resends the same body only when it never landed.
 - A `result()` deadline throws `OutcomeUnknown` carrying the handle; an
-  aborted wait does not cancel the operation. Tests: `a result() deadline
-  throws OutcomeUnknown carrying the handle`, `an aborted result() wait
-  leaves the operation running`.
+  aborted wait does not cancel the operation.
 - A failed or cancelled operation rejects `result()` and `call()` with
-  `OperationFailed`. Tests: `a failed operation rejects result() and call()
-  with OperationFailed`, `cancel is idempotent and a cancelled operation
-  rejects result()`.
+  `OperationFailed`.
 - `handle.events()` yields only that operation's events, waits while it
   runs, ends once it is terminal and the first page past it has been read,
   and resumes from any event's `cursor`. A cursor names the last delivered
   event sequence, so resuming with a different page size repeats nothing.
-  Tests in `events.test.ts`, among them `a cursor is the last delivered
-  event seq, so a different page size resumes without duplicates` and `a
-  terminal operation's events end at the first page past it, not at an
-  empty page`.
 - `agent.state()` answers `state: null` for an agent that has never
-  committed a turn, and `AgentState<S>.state` is typed `S | null`. Tests:
-  `state decodes null for an agent that has never committed`, `state is
-  null before the first commit, in the harness and against the
-  state_response_uncommitted fixture`.
+  committed a turn, and `AgentState<S>.state` is typed `S | null`.
 - `agent.effects()` lists the agent's effects (`GET /api/v1/agents/effects`)
   and `client.effect(handle)` inspects one effect by its handle, with its
   attempts and the evidence of late results (`GET
-  /api/v1/agents/effects/{effect}`). Tests: `effects lists the agent's
-  effects from /api/v1/agents/effects`, `effect inspects a handle at
-  /api/v1/agents/effects/{effect}`.
+  /api/v1/agents/effects/{effect}`).
 - `client.reconcile(request)` posts an operator's decision on an in-doubt
-  effect, `retry` or `record_result`, to `/api/v1/agents/reconcile`. Test:
-  `reconcile posts the decision to /api/v1/agents/reconcile`.
+  effect, `retry` or `record_result`, to `/api/v1/agents/reconcile`.
 - `agent.destroy({ incarnation })` posts the agent's kind and key, and the
   incarnation only when one is given, to `/api/v1/agents/destroy`, and
   answers whether it destroyed the agent and what the destruction
-  abandoned. It needs a server that serves the destroy route, which
-  ravel-server gains with #3529; against an older server the call ends in
-  a 404. The request and answer follow the `destroy_agent_request` and
-  `destroy_agent_response` fixtures. Test: `destroy posts kind, key and
-  incarnation and decodes destroyed and abandoned`.
-- `reconcile` and `destroy` are sent once, never retried: a network failure
-  or an untyped 5xx is `OutcomeUnknown`, and the caller reads the effect or
-  the agent to learn whether it landed. Tests: `reconcile is sent once: a
-  network failure is OutcomeUnknown with no second request`, `destroy is
-  sent once: an untyped 503 is OutcomeUnknown with no second request`.
+  abandoned.
+- `reconcile` and `destroy` need an `agents_admin` token and are sent once,
+  never retried: a network failure or an untyped 5xx is `OutcomeUnknown`,
+  and the caller reads the effect or the agent to learn whether it landed.
 
-Unless a test file is named, the client tests above are in
-`client.test.ts`.
+## HTTP transport
 
-HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
+`createHttpTransport` (`@ravel/agents/worker`) is the `Transport` that
+`serveAgents` uses against a server. The wire schemas match the server's
+bodies: every golden fixture under `sdk/fixtures/`, written by the Rust
+side, decodes and re-encodes to the same bytes, and the identity derivations
+match the fixtures and the Rust kernel's `identity.rs`.
 
 - Each worker route is posted with the worker's bearer token, and the poll
-  wait is clamped to 20 s. Tests: `posts each worker route with the bearer
-  token`, `clamps the poll wait to 20 s and leaves a shorter one alone`.
-- An `ErrorBody` maps to the class its code names, a typed 503 to
-  `StoreUnavailable`, an untyped 5xx or a request with no answer to
-  `OutcomeUnknown`, and an off-schema 2xx or an untyped 4xx to
-  `UnsupportedFormat`. Tests: `maps an ErrorBody to the class its code
-  names, with its safe ids`, `maps a typed 503 to StoreUnavailable rather
-  than OutcomeUnknown`, `maps an untyped 5xx and a request with no answer
-  to OutcomeUnknown`, `maps an off-schema 2xx and an untyped 4xx to
-  UnsupportedFormat`.
-- A response whose body fails mid-read is `OutcomeUnknown`, like a request
-  with no answer. Test: `maps a response body that fails mid-read to
-  OutcomeUnknown`.
+  wait is clamped to 20 s.
 - `recordStep` posts the step to `worker/step` and returns the server's
   record, a started step with its effect and attempt or a recorded result
-  to replay; no heartbeat goes before it. Test: `recordStep posts
-  worker/step and replays a step from the server's record`.
+  to replay. The tool runs under the effect id and attempt that record
+  names.
 - A tool's result or error is posted to `worker/effects/complete` or
-  `worker/effects/fail` with its effect and attempt, and the tool runs
-  under the effect id and attempt the server's record named. Tests:
-  `completeEffect and failEffect post to their routes with effect, attempt
-  and result or error`, `uses the tool's effect id and attempt from the
-  server's step record`.
-- A failed commit while an attempt has no result is refused by the server's
-  409 `effect_in_doubt`, which maps to `EffectInDoubt` with the body's ids;
-  the transport sends the commit and builds no error of its own. Test: `a
-  failed commit is answered by the server's 409 effect_in_doubt, not built
-  by the client`.
-- A 404 `agent_gone` from any worker route maps to `AgentGone`, whose
-  `retry` is `never`. Test: `agent_gone from a worker route is AgentGone
-  with retry never`.
-- The worker renews the lease in the background while a turn runs: one
-  `worker/heartbeat` when the turn is assigned, then one each third of the
-  lease left by the last answered expiry (never sooner than 1 s apart), one
-  at a time, until the commit is sent or the turn is abandoned. No
-  heartbeat goes before a step. A renewal refused with `OwnershipLost` or
-  `AgentGone` aborts the handler's `ctx.signal` and abandons the turn
-  without a commit or a retry; any other failure, such as a 503, is retried
-  at the next tick, and one inside the lease never aborts, commits or fails
-  the turn by itself. When renewals have failed past the lease, the worker
-  aborts the handler's `ctx.signal` at the expiry and abandons the turn the
-  same way, with `LeaseExpired`. A `ctx.step` the handler calls after either
-  abort rejects with the abort's reason and sends no step record, so a
-  handler that never reads `ctx.signal` still cannot start an effect on a
-  turn another worker may own. A step whose record was sent inside the
-  lease and answered after the abort has already sent that record: an
-  answer that authorizes an attempt rejects with the abort's reason, and one
-  that comes back completed or failed returns the replayed output or rejects
-  with `StepFailed`. Either way that step runs no tool and reports no effect
-  (test: `a lease that expires while the step's record is in flight runs no
-  tool`). A tool already running when the abort lands, and that returns,
-  still has its result reported, so a takeover replays it rather than
-  running the effect again; when the server answers that result as late,
-  the worker sends nothing more and the step rejects with the abort's
-  reason. A tool that throws after the abort reports no failure: no
-  `worker/effects/fail` is sent. The worker measures that expiry
-  on its own timers: `leaseMs` (a `serveAgents` option, default 30 s) from
-  the moment it received the assignment, or sent the last renewal that was
-  answered, since neither answer carries the lease length and its wall clock
-  may be skewed from the server's. The server counts a renewal's lease from
-  when it processed the request, which is no earlier than the sending, and
-  the assignment's lease from when it answered the poll, so the worker's
-  first expiry, counted from when that answer arrived, can trail the
-  server's by the poll answer's travel time. The server's agents lease is
-  fixed at 30 s, with a 10 s grace (`DEFAULT_AGENTS_LEASE_MS` and
-  `DEFAULT_AGENTS_HEARTBEAT_GRACE_MS` in
-  `services/ravel-server/src/config.rs`; no flag sets either). Keep
-  `leaseMs` at or below 30000, the server's fixed lease: the abort then
-  lands before the server's grace lets another worker take the turn over,
-  as long as the poll answer travels for less than the grace. A longer
-  `leaseMs` lets a turn run past its lease. Issue #3568 tracks carrying the
-  lease length on the wire, which would remove the option. `leaseMs` must be
-  an integer from 1000 to
-  2147483647: any other value rejects `serveAgents` with
-  `InvalidWorkerOption` before it sends a request. The
-  interval is read against the worker's clock, so a clock ahead of the
-  server's renews at the 1 s floor.
-  The server keeps renewals in the memory of the coordinator that answered
-  them: with two coordinators, a worker polling the other one can still take
-  the turn over once the lease and grace run out after the takeover that
-  started it (`crates/ravel-agents-runtime/src/ownership.rs`). Tests: `a
-  turn longer than the lease renews it in the background and commits`, `a
-  refused renewal aborts the turn and nothing is committed`, `a transient
-  renewal failure inside the lease does not abort the turn`, `renewals that
-  keep failing past the lease abort the turn and send no commit`, `an
-  answered renewal restarts the lease the worker measures from its
-  sending`, `leaseMs left unset aborts at the 30 s default`, `serveAgents
-  refuses leaseMs %d at startup with InvalidWorkerOption`, `a step called
-  after the lease expired is refused locally and never reaches the server`,
-  `a lease that expires while the step's record is in flight runs no tool`,
-  `a tool that finishes after the lease expired still reports its result,
-  and nothing else is sent`, `a late result after the abort sends nothing
-  more`, `a tool that throws after the abort reports no failure`,
-  `renews a third of the lease left, and never faster than the floor`
-  (`worker/renew.test.ts`),
-  `renews once at assignment, sends nothing while a tool runs, and no
-  heartbeat before a step` (`transport/http.test.ts`).
-- `createHttpTransport` takes no `journal` option, since the server records
-  steps and effect results. Test: `takes no journal option: steps and
-  effect results are recorded on the server`.
-- A 401 or 403 in the server's plain body maps to `Forbidden` with its
-  status. Test: `maps the plain %i body to Forbidden with its status`.
+  `worker/effects/fail` with its effect and attempt. The transport takes no
+  `journal` option: the server holds the step journal.
+- A failed commit while an attempt has no result is refused by the
+  server's 409 `effect_in_doubt`, which maps to `EffectInDoubt` with the
+  body's ids.
 - The server polls an agent that has never committed with a null state and
   `base_state_version` 0; the turn starts from the agent's `initialState`.
-  Test: `starts a never-committed agent's turn from initialState when the
-  server polls a null state`.
 
-Wire (`src/wire/`): every golden fixture under `sdk/fixtures/` decodes and
-re-encodes to the same bytes, and every body schema has a fixture
-(`wire.test.ts`). The identity derivations match the fixtures and the
-Rust kernel's `identity.rs` (`identity.test.ts`).
+How answers map to errors:
+
+| Answer | Error |
+|---|---|
+| An `ErrorBody` | the class its code names, with its safe ids |
+| A typed 503 | `StoreUnavailable` |
+| An untyped 5xx, a request with no answer, or a body that fails mid-read | `OutcomeUnknown` |
+| An off-schema 2xx or an untyped 4xx | `UnsupportedFormat` |
+| A 404 `agent_gone` from any worker route | `AgentGone`, `retry` `never` |
+| A 401 or 403 with the server's plain body | `Forbidden`, with its status |
+
+The worker renews the lease in the background while a turn runs, and
+aborts the turn when a renewal is refused or the lease runs out. The
+`leaseMs` option sets the lease the worker assumes; keep it at or below
+30000. The [SDK guide](../../../../docs/guides/agents-sdk.md#lease-renewal)
+gives the rules.
 
 ## Errors
 
-The eleven errors of ADR-3331 decision 11 subclass `RavelAgentsError`. Each
-carries a `code` equal to its class name, the safe ids `ids` (agent,
-incarnation, request, operation, turn, step, effect, timer, epoch; never a
-payload), and a `retry` hint. `src/errors.test.ts` asserts the set of
-classes and each class's code and hint; `maps every ErrorBody code to its
-typed error` (`client.test.ts`) asserts the wire mapping.
+The eleven wire errors subclass `RavelAgentsError`, plus `Forbidden` for a
+refused credential. The [SDK
+guide](../../../../docs/guides/agents-sdk.md#typed-errors) lists each wire
+code with its class and `retry` hint.
 
-| Wire code | Class | `retry` |
-|---|---|---|
-| `agent_gone` | `AgentGone` | `never` |
-| `idempotency_conflict` | `IdempotencyConflict` | `never` |
-| `outcome_unknown` | `OutcomeUnknown` | `resolve` |
-| `ownership_lost` | `OwnershipLost` | `never` |
-| `incompatible_handler` | `IncompatibleHandler` | `never` |
-| `non_deterministic_replay` | `NonDeterministicReplay` | `never` |
-| `effect_in_doubt` | `EffectInDoubt` | `reconcile` |
-| `mailbox_full` | `MailboxFull` | `backoff` |
-| `budget_exceeded` | `BudgetExceeded` | `never` |
-| `store_unavailable` | `StoreUnavailable` | `backoff` |
-| `unsupported_format` | `UnsupportedFormat` | `never` |
-
-`Forbidden` has no wire code: the server refuses a credential with HTTP 401
-or 403 and a plain body, which the client and the worker transport map to
-`Forbidden` with `retry` `never`. A worker whose poll is refused stops
-instead of retrying. Every other poll failure is retried, including an
-`UnsupportedFormat` answer, although its `retry` is also `never`. Tests:
-`a Forbidden poll stops the worker and rejects done with it`, `a poll
-answered with UnsupportedFormat is retried and the next poll runs its
-turn`, `a transient OutcomeUnknown poll is retried after a doubling pause
-and the next poll runs its turn` (`serve.test.ts`).
-
-`AgentGone` is HTTP 404 with `retry` `never`. A worker route answers it for
-a lease or effect of a destroyed agent's incarnation, and the worker
-abandons the turn without retry (tests: `agent_gone from a worker route is AgentGone with
-retry never`, `http.test.ts`; `agent_gone at commit abandons the turn
-without retry`, `serve.test.ts`). `reconcile` and `destroy` are the two
-client calls sent once rather than retried, so a lost answer is
-`OutcomeUnknown` (tests: `reconcile is sent once: a network failure is
-OutcomeUnknown with no second request`, `destroy is sent once: an untyped
-503 is OutcomeUnknown with no second request`).
-
-An unknown code, or a 2xx body that does not match its schema, reads as
-`UnsupportedFormat` (test: `an unknown error code or an off-schema response
-reads as UnsupportedFormat`).
-
-Two more errors are local to the SDK and have no wire code: they are raised
-in the worker and never cross the wire. Both subclass `RavelAgentsError`
-with `retry` `never` (test: `the SDK-local errors are typed and never
-retried`), and an uncaught one fails the operation terminally (the
-`ConcurrentStepError` and `InvalidStepInput` tests in `steps.test.ts`).
+Two more errors are local to the SDK: they are raised in the worker and
+never cross the wire. Both subclass `RavelAgentsError` with `retry` `never`,
+and an uncaught one fails the operation terminally, without retries.
 
 | Class | Raised when |
 |---|---|
@@ -536,171 +314,81 @@ retried`), and an uncaught one fails the operation terminally (the
 
 A handler that catches a failed step's error sees `StepFailed`, on the run
 that recorded the failure and on every retry that replays it; it carries
-the step key and the recorded error text (test: `P11 a tool failure is
-journaled as the step's result before the failed commit, and replayed`).
+the step key and the recorded error text.
 
-## The testing export (`@ravel/agents/testing`)
+## Testing harness
 
 `createTestHarness({ agents, tools })` returns a fake coordinator
 (`coordinator`), a client over it (`client`, and `agent(definition, key)`
 for a typed one), one worker serving `agents`, the list of turns its
 workers finished or abandoned (`turns`), and `advanceTime`, `crashWorker`
-and `close`. The fake models the coordinator's protocol, not its storage.
-Each statement below names the test that pins it; unless a file is named,
-the test is in `src/testing/harness.test.ts`.
+and `close`. The [SDK
+guide](../../../../docs/guides/agents-sdk.md#the-testing-export) lists what
+the fake honours and what it does not do. A test that passes against the
+harness says the handler behaves under replay; it says nothing about what
+Ravel persists.
 
-What the fake honours:
-
-- Leases: a polled lease carries the turn's recorded time and random seed,
-  a heartbeat extends a held lease to 30 s past the fake's clock, and a
-  heartbeat on a revoked lease fails `OwnershipLost`. Test: `leases carry
-  the recorded time and seed, and heartbeats extend a held lease only`
-  (`testing/transport.test.ts`).
-- Replay: after `crashWorker()`, the new worker replays completed steps from
-  the fake's journal without calling the tool again, and the turn commits
-  once. Test: `replay after crashWorker with two completed steps replays
-  both without calling run and commits once` (`worker/replay.test.ts`).
-- At-least-once retry: an `at_least_once` tool interrupted by a crash runs
-  again under the same effect id. Test: `an at_least_once tool interrupted
-  by a crash runs again under the same effect id`
-  (`worker/steps.test.ts`).
-- In-doubt: a `manual` tool interrupted by a crash blocks the operation with
-  `EffectInDoubt` and names the effect in `blockedEffect`. Test: `a manual
-  tool interrupted by a crash blocks the operation with EffectInDoubt`
-  (`worker/steps.test.ts`). The fake refuses a failed commit while a step's
-  attempt is authorized without a result, as the kernel does. Test: `P11
-  the fake refuses FailTurn while a step's attempt is authorized without a
-  result` (`worker/review.test.ts`).
-- Cancellation: `cancel` on a running operation is recorded and applied
-  when its turn commits, a cancelled operation rejects `result()` with
-  `OperationFailed`, and a second `cancel` answers `cancelled`. Test:
-  `cancel is idempotent and a cancelled operation rejects result()`
-  (`client/client.test.ts`).
-- Retries and dead letters: a failing handler publishes neither state nor
-  events and dead-letters after its attempts. Test: `a failing handler
-  publishes neither state nor events, and dead-letters after its attempts`
-  (`worker/steps.test.ts`).
-- State: the fake answers `state: null` for an agent until its first
-  committed turn, as the server does. Test: `state is null before the first
-  commit, in the harness and against the state_response_uncommitted
-  fixture` (`client/client.test.ts`).
-- Time: `advanceTime(ms)` moves the fake's clock, and the next lease
-  records the moved time. Test: `leases carry the recorded time and seed,
-  and heartbeats extend a held lease only` (`testing/transport.test.ts`).
-
-What it does not do:
-
-- Timers: the fake has none, and its clock never expires a lease. Advancing
-  the clock an hour past a lease's expiry neither takes the turn away nor
-  runs anything. Test: `advancing the fake's clock past a lease's expiry
-  neither takes the turn away nor runs anything`.
-- Reconciliation: the fake has no reconcile route, so an operation blocked
-  with `EffectInDoubt` stays blocked through a day of clock advance and a
-  further worker. Test: `an operation blocked with EffectInDoubt stays
-  blocked: no clock advance or new worker reconciles it`.
-- Durability: every agent, operation, step and event lives in the fake's
-  memory, and a new harness has never seen the agents of one that closed.
-  Test: `nothing outlives close: a new harness has never seen the first
-  one's agent`.
-
-Kill and recover: hold a tool's run open (a promise the test resolves),
-wait until it has started, call `crashWorker()`, then release it.
-`crashWorker()` revokes the current leases and starts a fresh worker
-(`harness-worker-2`) against the same fake; it simulates a worker crash,
-not a coordinator or store crash. The killed worker's turn is reported in
-`turns` as abandoned. Tests: `replay after crashWorker with two completed
-steps replays both without calling run and commits once`
-(`worker/replay.test.ts`), `an operation blocked with EffectInDoubt stays
-blocked: no clock advance or new worker reconciles it` (the abandoned
-turn), and in a scaffolded project `a worker killed
-inside the price step is replaced and the turn commits once`, which the
-scaffold acceptance test runs. A test that passes against the harness says
-the handler behaves under replay; it says nothing about what Ravel persists.
-
-## Wire gaps
-
-The wire contract this package was written against has gaps, filled
-provisionally on the SDK side:
+## Known limits
 
 - The wire `StepState` has only `started` and `completed`, so a failed step
-  would read as `started` on the wire.
+  reads as `started` on the wire.
 - A handler pin on the wire (`HandlerPinBody`) names the handler, version
-  and digest but no agent kind, and the kernel matches a pin by handler
-  name alone. Two agents at one version sharing a handler name are told
-  apart only by the digest, which the fake coordinator matches on (test:
-  `two agents at one version sharing a handler name are each leased their
-  own turn`, `steps.test.ts`); whether the server matches on the digest
-  too is not pinned by any server test.
-- The polled lease carries the turn's `recorded_unix_ns` and `random_seed`.
-  `ctx.now()` reads the recorded time and `ctx.random()` is seeded from the
-  random seed, so a retried turn sees the same values (test: `turn random
-  seed matches the worker_poll_response fixture's lease`,
-  `identity.test.ts`).
+  and digest but no agent kind. The server starts a new turn with the first
+  pin whose handler name matches, and checks version and digest only when a
+  turn resumes. The fake coordinator tells two agents at one version that
+  share a handler name apart by the digest.
 - The canonical encoding of step input is unspecified; the SDK hashes
   sorted-key JSON of the input's JSON form and refuses anything that is not
   plain JSON.
 - u64 counters are numbers capped at `Number.MAX_SAFE_INTEGER` and refused
-  past it (test: `a u64 counter past the safe-integer range is refused,
-  not rounded`). Nanosecond timestamps are strings refused outside the i64
-  range (test: `a timestamp outside i64 is refused on decode and encode`).
+  past it. Nanosecond timestamps are strings refused outside the i64 range.
 
-## End-to-end tests
+## Development
 
-`npm run test:e2e` (from `sdk/typescript/`) runs `e2e/recover.test.ts`
-and `e2e/destroy.test.ts` against a `ravel-server` it starts itself, with `--agents` on free local
-ports. `npm test` never runs it. Build the server first:
+Run from `sdk/typescript/` after `npm ci`:
+
+| Command | What it runs |
+|---|---|
+| `npm run lint` | ESLint with the `typescript-eslint` strict type-checked rules |
+| `npm run typecheck` | `tsc` in strict mode over `src/`, `typetests/`, `e2e/` and `examples/` |
+| `npm test` | the vitest suites under `src/`, and `e2e/*.unit.test.ts`, which need no server |
+| `npm run test:e2e` | the end-to-end tests against a built server |
+
+`make test-sdk` and `make lint-sdk` from the repository root run the unit
+checks. CI's `sdk` job (`scripts/gates-sdk.sh`) runs `npm ci`, `npm run
+lint`, `npm run typecheck` and `npm test`. No CI job runs `npm run
+test:e2e`; run it locally.
+
+`npm test` excludes the scaffold template's own suite under
+`src/scaffold/template/`; the scaffold test runs it inside a generated
+project. `typetests/` holds compile-time negative tests: each
+`// @ts-expect-error` case must fail to compile, and if a type change lets
+one compile, tsc reports the unused directive as error TS2578 and
+`npm run typecheck` fails.
+
+### End-to-end tests
+
+`npm run test:e2e` starts a `ravel-server` with `--agents` on free local
+ports and kills a worker, run as a child process, with SIGKILL inside a
+step. The recover tests check that the resent request resolves to the same
+operation and that an `at_least_once` step runs again under the same effect
+id, and that a `manual` step blocks as `EffectInDoubt` until
+`client.reconcile` records its result. The destroy test checks that a
+destroy fences the worker holding the turn and that a recreate starts
+incarnation 2. Build the server first:
 
 ```sh
 cargo build --locked -p ravel-server --features agents
 ```
 
-The binary is `RAVEL_SERVER_BIN`, else
-`$CARGO_TARGET_DIR/debug/ravel-server`, else `target/debug/ravel-server`
-under the repository root. The store is `RAVEL_E2E_STORE`: `memory`
-(default, `MemoryStore`) or `rustfs` (the compose RustFS store, which
-needs `docker compose`; the run stops the RustFS container afterwards
-only if it started it). Each recover test waits out one 30 s lease and its
-10 s grace before worker B can take the turn over. Tests for the path and
-store choice, which need no server and run under `npm test`: `resolves
-the repository root to the directory holding the workspace Cargo.toml`,
-`looks for the server under the repository's target unless told
-otherwise`, `needs docker compose only for the rustfs store`
-(`e2e/plan.unit.test.ts`).
+| Variable | Meaning |
+|---|---|
+| `RAVEL_SERVER_BIN` | the server binary; else `$CARGO_TARGET_DIR/debug/ravel-server`, else `target/debug/ravel-server` under the repository root |
+| `RAVEL_E2E_STORE` | `memory` (default, `MemoryStore`) or `rustfs` (the compose RustFS store, which needs `docker compose`; the run stops the RustFS container afterwards only if it started it) |
+| `RAVEL_E2E_REQUIRE` | `1` fails the run on a missing prerequisite instead of skipping |
 
-Each recover test runs worker A as a child process and sends it SIGKILL
-inside a step, after the tool's side effect and before its result is
-recorded, then resends under the same request id and lets worker B, in the
-test's process, take the turn over. Steps and effect results go through the
-server's `worker/step` and `worker/effects/*` routes, and the effects,
-attempts and operation status are read back through the client, so
-everything worker B replays comes from the server:
-
-- `worker killed inside an at_least_once step recovers the same operation
-  on restart`: worker A exits by SIGKILL, the resend resolves to the same
-  operation id, `kb.search` runs once and is replayed, `kb.draft` runs
-  twice under one effect id (attempts 1 and 2), the server's effects read
-  `kb.search` completed on attempt 1 and `kb.draft` completed on attempt 2,
-  and the operation completes with the drafted answer.
-- `worker killed inside a manual step blocks as EffectInDoubt until the
-  admin reconcile route is called through the client`: worker B abandons
-  the turn with `EffectInDoubt` without running `desk.ticket` again; the
-  server shows the effect `in_doubt` with one `in_doubt` attempt and the
-  operation `blocked` on that effect. `client.reconcile` with an
-  `agents_admin` token records the ticket the killed run filed, and the
-  operation completes with ticket `T-1001`.
-
-`e2e/destroy.test.ts` holds a worker inside `kb.search` and destroys the
-agent through the client with the admin token:
-
-- `destroy fences a worker holding a lease and a recreate starts
-  incarnation two`: the destroy answers `destroyed: true` for incarnation 1
-  with one abandoned input, the active turn and one authorized effect; the
-  held worker, released, abandons its turn with `AgentGone` and sends no
-  commit, and the old operation answers `AgentGone`. A second destroy
-  answers `destroyed: false` with the same counts, and a client token
-  without `agents_admin` is refused with `Forbidden` (403). `create` then
-  starts incarnation 2 under the same agent id, the old operation still
-  answers `AgentGone`, and a new message completes.
+Each recover test waits out one 30 s lease and its 10 s grace before the
+second worker can take the turn over.
 
 A missing prerequisite skips every test and names it, both in a warning at
 the top of the run and in the suite title the verbose reporter prints:
@@ -712,44 +400,21 @@ e2e skipped: RAVEL_E2E_STORE=rustfs needs `docker compose`, which is not install
 
 A skipped run exits 0. With `RAVEL_E2E_REQUIRE=1` a missing prerequisite
 fails the run instead, with the same reason, so a job that must exercise
-the server cannot pass with nothing run (test: `skips on a missing
-prerequisite, and fails instead under RAVEL_E2E_REQUIRE=1`, and test:
-`names the resolved binary path when it is missing`).
+the server cannot pass with nothing run.
 
-## Demo
+### Demo
 
 `demo/agents-kill-and-recover.sh`, from the repository root, starts the
 compose RustFS store (or `MemoryStore` with
 `RAVEL_AGENTS_DEMO_STORE=memory`) and a built `ravel-server --agents` with a
-client, a worker and an `agents_admin` development token, runs the same two
-recover scenarios through `examples/assistant/kill-and-recover.ts`, and
+client, a worker and an `agents_admin` development token, and runs the same
+two recover scenarios through `examples/assistant/kill-and-recover.ts`. It
 asserts each printed `KEY=VALUE` figure against an exact value or a stated
-band, exiting 1 on any miss: among them `OP_SAME=true`,
-`WORKER_A_SIGNAL=SIGKILL`, `DRAFT_ATTEMPTS=2` (the server's attempt for the
-re-run `kb.draft`), `TICKET_RUNS_BEFORE_RECONCILE=1` and
-`STATUS_IN_DOUBT=blocked`, with `RECOVERY_MS` within [35000, 60000]. Worker
-A is a child process killed with SIGKILL, as in the tests. It needs `npm ci` in `sdk/typescript/` and node 22.15
-or later 22.x: the example's loader hook (`examples/ts-hooks.js`) uses
-`module.registerHooks`, added in Node 22.15.0, which is why the `engines`
-floor in `sdk/typescript/package.json` is 22.15.0. See
-`examples/assistant/README.md`.
-
-## Checks
-
-Run from `sdk/typescript/` after `npm ci`:
-
-- `npm run lint`: ESLint with the `typescript-eslint` strict type-checked
-  rules.
-- `npm run typecheck`: `tsc` in strict mode over `src/`, `typetests/`,
-  `e2e/` and `examples/`.
-- `npm test`: the vitest suites under `src/`, and `e2e/*.unit.test.ts`,
-  which need no server. The scaffold template's own suite under
-  `src/scaffold/template/` is excluded here; the scaffold acceptance test
-  runs it inside a generated project.
-- `npm run test:e2e`: the end-to-end tests above.
-
-`typetests/` holds compile-time negative tests. Each `// @ts-expect-error`
-case (an invalid handler signature, an invalid payload type, a step input
-that does not match its tool, and others) must fail to compile. If a type
-change lets one compile, tsc reports the unused directive as error TS2578,
-and `npm run typecheck` fails.
+band and exits 1 on any miss: among them `OP_SAME=true`,
+`WORKER_A_SIGNAL=SIGKILL`, `DRAFT_ATTEMPTS=2`,
+`TICKET_RUNS_BEFORE_RECONCILE=1` and `STATUS_IN_DOUBT=blocked`, with
+`RECOVERY_MS` within [35000, 60000]. It needs `npm ci` in `sdk/typescript/`
+and node 22.15 or later 22.x: the example's loader hook
+(`examples/ts-hooks.js`) uses `module.registerHooks`, added in Node 22.15.0,
+which is why the `engines` floor in `sdk/typescript/package.json` is
+22.15.0. See `examples/assistant/README.md`.
