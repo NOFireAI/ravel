@@ -39,30 +39,78 @@ one connection. An agent that investigates an incident needs each of them:
 - a way to move between metrics, logs, and traces on exact identifiers
 - a way to hand back a finding that a person can check again
 
+## Try it on the quickstart
+
+The [quickstart stack](getting-started.md) runs without `--mcp`. To turn it
+on, save this Compose override as `mcp.yml` in the repository root. It repeats
+the stack's `ravel-server` arguments and adds the two MCP flags:
+
+```yaml
+services:
+  ravel-server:
+    command:
+      - "--mode"
+      - "all"
+      - "--store"
+      - "s3"
+      - "--listen-http"
+      - "0.0.0.0:4318"
+      - "--listen-grpc"
+      - "0.0.0.0:4317"
+      - "--shards"
+      - "4"
+      - "--tenant-token"
+      - "demo-token=demo-tenant"
+      - "--tenant-hash-unkeyed"
+      - "--mcp"
+      - "--mcp-allowed-origins"
+      - "http://localhost"
+```
+
+The server listens on `0.0.0.0` inside its container, so it refuses `--mcp`
+without `--mcp-allowed-origins`. Start the stack with both files, then send
+an `initialize` request:
+
+```sh
+docker compose -f deploy/docker-compose/ravel.yml -f mcp.yml up -d
+
+curl -s -X POST http://127.0.0.1:4318/mcp \
+  -H "Authorization: Bearer demo-token" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
+
+The answer is an event stream whose `data:` line carries
+`"serverInfo":{"name":"ravel-server",...}`. A 404 means the server runs
+without `--mcp`. Point your MCP client at `http://127.0.0.1:4318/mcp` with the
+header `Authorization: Bearer demo-token`.
+
 ## Connecting
 
-The server will expose MCP over Streamable HTTP at `POST /mcp`, on the same
-listener as the rest of the query API. It will accept the same bearer
-credential that the HTTP query routes use: `Authorization: Bearer <token>`.
-There will be no separate agent credential and no second login step.
+The server exposes MCP over Streamable HTTP at `POST /mcp`, on the same
+listener as the rest of the query API. It accepts the same bearer credential
+that the HTTP query routes use: `Authorization: Bearer <token>`. There is no
+separate agent credential and no second login step.
 
-The bearer credential travels only over TLS:
+Beyond a loopback development stack, send the bearer credential only over
+TLS:
 
 - A deployment terminates TLS in front of the server or on the mTLS listener.
 - Every proxy hop that carries the credential runs TLS.
 - The client does not follow a redirect to plain HTTP.
 
-The server will speak two protocol revisions and will answer both on the same
+The server speaks two protocol revisions and answers both on the same
 endpoint. Use the revision that your MCP client sends.
 
 | Revision | Behavior |
 |---|---|
-| `2026-07-28` | Will carry its protocol version and method name in headers on every request. Will need no handshake. |
+| `2026-07-28` | Carries its protocol version and method name in headers on every request. Needs no handshake. |
 | `2025-11-25` | The older revision that most deployed clients still speak. It opens with an `initialize` call and keeps a session id. |
 
-Every MCP request will authenticate separately. A cursor or an evidence
+Every MCP request authenticates separately. A cursor or an evidence
 reference from an earlier call carries no authority by itself. The server
-will always check it against the credential on the current request.
+checks it against the credential on the current request.
 
 ## The nine tools
 
