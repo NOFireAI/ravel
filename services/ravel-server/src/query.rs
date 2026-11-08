@@ -1648,6 +1648,9 @@ fn build_sql_state_inner(
         // field is an in-process escape hatch and the tests' rule-off side,
         // not a server-level knob.
         bounded_topk_max_limit: SqlConfig::default().bounded_topk_max_limit,
+        // The first-groups bound under an unordered `GROUP BY ... LIMIT`
+        // (ADR-3985): the shipped default, with no flag, for the same reason.
+        bounded_groups_max_limit: SqlConfig::default().bounded_groups_max_limit,
         // The per-partition TopK's limit ceiling: the shipped default, with
         // no flag, for the same reason as the line above.
         partition_topk_max_limit: SqlConfig::default().partition_topk_max_limit,

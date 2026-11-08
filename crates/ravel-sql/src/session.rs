@@ -153,6 +153,7 @@ use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
 use crate::compact_slices::CompactSlices;
 use crate::config::SqlConfig;
+use crate::first_groups::FirstGroupsLimit;
 use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::ipcrypt_udf::SessionPrincipal;
 use crate::late_materialization::TopKLateMaterialization;
@@ -930,6 +931,16 @@ pub fn build_session_with_tables(
     if let Some(max_limit) = config.bounded_topk_max_limit {
         builder =
             builder.with_physical_optimizer_rule(Arc::new(BoundedTopKAggregate::new(max_limit)));
+    }
+    // Issue #3985 (ADR-3985): feed the final aggregate under an unordered
+    // `GROUP BY ... LIMIT` only the rows of its first `n + s` groups. After
+    // `EnforceDistribution`, so the hash exchange the exactness argument rests
+    // on is in place, and before `BucketedFinalAggregateRule` and
+    // `CompactSlices`, which wrap the aggregate it looks for. 0 plans nothing.
+    if config.bounded_groups_max_limit > 0 {
+        builder = builder.with_physical_optimizer_rule(Arc::new(FirstGroupsLimit::new(
+            config.bounded_groups_max_limit,
+        )));
     }
     // Issue #3608 (ADR-3565 decision 1): run a qualifying `FinalPartitioned`
     // aggregate in hash buckets. After `BoundedTopKAggregate`, which sets the

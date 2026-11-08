@@ -63,6 +63,19 @@ pub const DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS: usize = 8;
 /// magnitude below it.
 pub const DEFAULT_BOUNDED_TOPK_MAX_LIMIT: usize = 1024;
 
+/// Default [`SqlConfig::bounded_groups_max_limit`] (issue #3985): an unordered
+/// `GROUP BY ... LIMIT n` (`OFFSET s LIMIT n`) has its final aggregate fed only
+/// the rows of its first `n + s` groups per partition while `n + s` is at or
+/// below this.
+///
+/// Each final partition then holds at most `n + s` groups in the aggregate
+/// and in the [`crate::FirstGroupsExec`] under it, plus one batch's new keys
+/// while it interns them. The same ceiling as
+/// [`DEFAULT_BOUNDED_TOPK_MAX_LIMIT`], for the same reason: well above the
+/// `LIMIT 10` the measured statement asks for, and low enough that the bound
+/// stays small against the group tables it replaces.
+pub const DEFAULT_BOUNDED_GROUPS_MAX_LIMIT: usize = 1024;
+
 /// Default for [`SqlConfig::partition_topk_max_limit`].
 ///
 /// The per-partition TopK holds a `k`-row heap in every scan partition on top
@@ -483,6 +496,24 @@ pub struct SqlConfig {
     /// `count` or `sum`, which cannot be pruned exactly at all; see the
     /// `crate::bounded_topk` module docs for the counterexample.
     pub bounded_topk_max_limit: Option<usize>,
+    /// Row ceiling for bounding the groups of an unordered `GROUP BY ...
+    /// LIMIT` (issue #3985, ADR-3985). [`crate::FirstGroupsLimit`] places a
+    /// [`crate::FirstGroupsExec`] under a final aggregate whose output a limit
+    /// reads with no sort, filter, window, join or union between, when the
+    /// rows that limit needs (`n + s` for `OFFSET s LIMIT n`) are at most
+    /// this; 0 turns the rule off, which is the operator opt-out and the
+    /// "before" side of `tests/first_groups.rs`.
+    ///
+    /// Default [`DEFAULT_BOUNDED_GROUPS_MAX_LIMIT`]. Set once at server
+    /// startup, like every other field here; ravel-server takes the default
+    /// and has no flag for it.
+    ///
+    /// The rewrite keeps the answer exact: the statement may return any
+    /// `n` groups, and every group the exec keeps reaches the aggregate with
+    /// all of its rows (see the `crate::first_groups` module docs for why).
+    /// It changes which `n` groups come back, which the statement leaves
+    /// unspecified, and the memory the final aggregate holds.
+    pub bounded_groups_max_limit: usize,
     /// `LIMIT` ceiling for the per-partition TopK under a row-filtered `logs`
     /// scan (ADR-0093, exact not-equal amendment). `Some(k)` installs
     /// `crate::logs_scan::LogsPartitionTopK` and lets it fire on a global
@@ -564,6 +595,7 @@ impl Default for SqlConfig {
             skip_partial_aggregation: true,
             late_materialization_extra_columns: Some(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS),
             bounded_topk_max_limit: Some(DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+            bounded_groups_max_limit: DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
             partition_topk_max_limit: Some(DEFAULT_PARTITION_TOPK_MAX_LIMIT),
             bucketed_final_aggregation: None,
             // Spill off. See the field doc: this is requirement 9 of #954 (a
@@ -763,6 +795,14 @@ mod tests {
     fn bounded_topk_defaults_to_a_limit_of_1024() {
         assert_eq!(SqlConfig::default().bounded_topk_max_limit, Some(1024));
         assert_eq!(DEFAULT_BOUNDED_TOPK_MAX_LIMIT, 1024);
+    }
+
+    /// Issue #3985: the first-groups bound ships on, with a ceiling of 1024
+    /// rows.
+    #[test]
+    fn bounded_groups_defaults_to_a_limit_of_1024() {
+        assert_eq!(SqlConfig::default().bounded_groups_max_limit, 1024);
+        assert_eq!(DEFAULT_BOUNDED_GROUPS_MAX_LIMIT, 1024);
     }
 
     /// The per-partition TopK ships installed, with a `LIMIT` ceiling. Both
