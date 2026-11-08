@@ -24,11 +24,12 @@ curl -s -X POST http://127.0.0.1:4318/api/v1/sql \
   -d '{"query":"SELECT * FROM samples LIMIT 5"}'
 ```
 
-A log query, through PromQL's reserved `ravel_log_lines` name:
+A log query, through PromQL's reserved `ravel_log_lines` name. The quickstart
+Collector logs mostly at startup, so a short window can be empty:
 
 ```sh
 curl -s -H "Authorization: Bearer demo-token" \
-  --data-urlencode 'query=sum by (job) (count_over_time(ravel_log_lines[5m]))' \
+  --data-urlencode 'query=sum by (job) (count_over_time(ravel_log_lines[1h]))' \
   'http://127.0.0.1:4318/api/v1/query'
 ```
 
