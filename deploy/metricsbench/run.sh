@@ -239,6 +239,78 @@
 #               records of route-bound statements whose keyIndex phase shows
 #               no leaf read; and the statements that are not route-bound
 #
+# Four arms (issue #3969) add steps, each only when its switch is on;
+# stamps.json says which under stage1.arms, and an arm that is off stamps
+# each of its keys "skipped: arm off (...)". MB_CONTROL_IMAGE (with
+# MB_CONTROL_SOURCE_COMMIT) turns on the control arm, which runs between
+# stage1-unrouted and stage1-leaves; MB_STAGE1_ARMS, a comma list of
+# extra-hour, l1 and erasure, turns on the arms that change the tenant, which
+# run after stage1-holders in that order:
+#
+#   stage1-control  (ADR-3694 row 12) refused with exit 65 unless
+#               MB_CONTROL_IMAGE carries an @sha256: digest and
+#               MB_CONTROL_SOURCE_COMMIT is 40 hex digits. ravel-server
+#               recreated from the control image with the unrouted flags
+#               (stage1.control_restart), docker image inspect required to
+#               report that digest, both images' digests and source commits
+#               stamped as stage1.control_image, then the inspect and the
+#               passes as stage1-unrouted, --pass-label folded-control, into
+#               <out>/stage1-control/
+#   stage1-control-restore  ravel-server recreated from the main image with
+#               the unrouted flags. Then <out>/stage1-control-compare.json:
+#               per statement the median latency_ms ratio (unrouted over
+#               control) and the median GETs and wire bytes, in total and per
+#               phase, of each pass; stamped as stage1.control_compare
+#   stage1-extra-hour-ingest  (row 7) once the wall clock passes the routed
+#               snapshot's watermark hour (METRICSBENCH_SLEEP waits),
+#               metricsbench_ingest writes the profile's next hour, Ravel
+#               only, into <out>/stage1-extra-hour/
+#   stage1-extra-hour-fold-off  ravel-server stopped, the metrics catalog
+#               HEAD saved with aws s3 cp on createbuckets, catalog fold
+#               --writers-stopped with no leaf flag timed
+#               (stage1.extra_hour_fold_off)
+#   stage1-extra-hour-fold-on  the saved HEAD put back and read back (its
+#               sha256 must match), then catalog fold --writers-stopped
+#               --key-index-leaves --metrics-label-index timed
+#               (stage1.extra_hour_fold_on)
+#   stage1-extra-hour  inspect and listing into
+#               <out>/stage1-extra-hour.inspect.txt and .objects.jsonl;
+#               stamped as stage1.extra_hour: both wall times and their
+#               ratio, the leaf bytes over the new hour's data bytes, the new
+#               hour's parts with no label_value leaf or an uncovered entry;
+#               ravel-server recreated with the routed flags
+#   stage1-l1-compact  (row 6) once the newest ingest hour is sealed,
+#               ravel-server stopped and ravel-cli maintain compact-tenant
+#               --signal metrics --max-flush-lifetime 0s into
+#               <out>/stage1-l1-compact.txt (stage1.l1_compact)
+#   stage1-l1-fold  catalog fold --writers-stopped --key-index-leaves
+#               --metrics-label-index (stage1.l1_fold)
+#   stage1-l1   ravel-server recreated with the routed flags, the listing's
+#               L0 and L1 objects stamped as stage1.l1_objects, the passes
+#               as stage1-routed with --pass-label folded-l1 (steady only),
+#               and <out>/stage1-l1-compare.json comparing their hashes with
+#               stage1-routed's and counting "fetch memory exhausted"
+#   stage1-erasure-reference  (row 8) the corpus with
+#               instance!="metricsbench-instance-0" added to every selector,
+#               into <out>/stage1-erasure-reference.corpus.json, run routed;
+#               <out>/stage1-erasure-subject.json names the statements whose
+#               answer the subject changes
+#   stage1-erasure-submit  ravel-cli erase submit --signal metrics
+#               --matcher instance=metricsbench-instance-0
+#   stage1-erasure-pending  the corpus as written, run routed; then
+#               <out>/stage1-erasure-compare.json compares it with the
+#               reference and counts label-index prunes
+#   stage1-erasure-rewrite  a one-off ravel-server --mode maintain container
+#               with a throwaway record key runs until erase status says
+#               COMPLETED (METRICSBENCH_ERASURE_TRIES x
+#               METRICSBENCH_ERASURE_INTERVAL), then is removed
+#   stage1-erasure-fold  ravel-server stopped, catalog fold --writers-stopped
+#               --key-index-leaves --metrics-label-index
+#   stage1-erasure  the inspect into <out>/stage1-erasure.inspect.txt;
+#               stage1.erasure_leaves counts the leaves the snapshot still
+#               references from before the erasure over a rewritten hour;
+#               stage1.erasure_sweep says the physical sweep was not checked
+#
 # With or without MB_STAGE1, the query step's ravel_cost records carry
 # pass_label unfolded while ravel-server has published no fold gauge, else
 # background-folded, and fold_state names the gauge stamped as
@@ -296,7 +368,11 @@
 # where fetch-s3s-fs keeps the verified binary between runs),
 # METRICSBENCH_CORPUS (default benchmarks/metrics/metrics.corpus.json; the
 # path used is stamped as corpus). MB_STAGE1 (1, or 0 or unset for off) adds
-# the Stage 1 steps above.
+# the Stage 1 steps above; MB_STAGE1_ARMS, MB_CONTROL_IMAGE and
+# MB_CONTROL_SOURCE_COMMIT add its arms. METRICSBENCH_SLEEP (default sleep)
+# waits for an hour to pass or seal; METRICSBENCH_ERASURE_TRIES and
+# METRICSBENCH_ERASURE_INTERVAL (default 120 tries 15 s apart) bound the
+# erasure rewrite.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -352,6 +428,21 @@ STAGE1_ROUTED_FLAGS="--disable-fold --fold-key-index-leaves --fold-metrics-label
 # Every stage1.* stamp a step writes: null until it runs, "skipped: why" when
 # the steps do not run.
 STAGE1_KEYS="background_fold fold_restart fold unrouted_restart unrouted_catalog unrouted unrouted_cold unrouted_cold_records leaves restart routed_catalog routed routed_cold routed_cold_records compare holders"
+# Each arm's stage1.* stamps: null when the arm is on, "skipped: arm off"
+# when it is not.
+STAGE1_ARMS="control extra_hour l1 erasure"
+STAGE1_CONTROL_KEYS="control_restart control_image control_catalog control control_cold control_cold_records control_restore control_compare"
+STAGE1_EXTRA_HOUR_KEYS="extra_hour_ingest extra_hour_fold_off extra_hour_fold_on extra_hour extra_hour_restart"
+STAGE1_L1_KEYS="l1_compact l1_fold l1_restart l1_objects l1_catalog l1 l1_compare"
+STAGE1_ERASURE_KEYS="erasure_corpus erasure_reference_catalog erasure_reference erasure_subject erasure_submit erasure_pending_catalog erasure_pending erasure_compare erasure_rewrite erasure_fold erasure_catalog erasure_leaves erasure_sweep"
+# The erasure arm's subject: one value of the workload's scaling label.
+STAGE1_ERASURE_LABEL="instance"
+STAGE1_ERASURE_VALUE="metricsbench-instance-0"
+# ravel.yml's --max-ingest-lag, which the one-off maintain process repeats.
+RAVEL_MAX_INGEST_LAG="45d"
+ERASURE_TRIES="${METRICSBENCH_ERASURE_TRIES:-120}"
+ERASURE_INTERVAL="${METRICSBENCH_ERASURE_INTERVAL:-15}"
+SLEEP="${METRICSBENCH_SLEEP:-sleep}"
 
 EXIT_USAGE=64
 EXIT_REFUSED=65
@@ -378,6 +469,29 @@ refuse() {
 }
 
 utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+json_bool() { if [ "$1" -eq 1 ]; then echo true; else echo false; fi; }
+
+stage1_arm_keys() {
+  case "$1" in
+    control) echo "$STAGE1_CONTROL_KEYS" ;;
+    extra_hour) echo "$STAGE1_EXTRA_HOUR_KEYS" ;;
+    l1) echo "$STAGE1_L1_KEYS" ;;
+    erasure) echo "$STAGE1_ERASURE_KEYS" ;;
+  esac
+}
+
+stage1_arm_on() {
+  local v="arm_$1"
+  [ "${!v}" -eq 1 ]
+}
+
+stage1_arm_switch() {
+  case "$1" in
+    control) echo "MB_CONTROL_IMAGE is not set" ;;
+    *) echo "MB_STAGE1_ARMS does not name ${1//_/-}" ;;
+  esac
+}
 
 # The JSON work, in one place: python3 -I with the op as its first argument.
 read -r -d '' PYLIB <<'PY'
@@ -418,6 +532,71 @@ def inspect_rows(path):
     except (OSError, ValueError):
         return []
     return rows if isinstance(rows, list) else []
+
+def whole(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+def median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if n == 0:
+        return None
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+def cost_rows(path):
+    rows = load(path)["ravel_cost"]
+    if not isinstance(rows, list):
+        raise TypeError("ravel_cost is not a list")
+    return rows
+
+def record_cost(rec):
+    # {phase: [s3GetRequests, s3GetWireBytes]} summed over a record's
+    # phases; None when a phase lacks either figure.
+    phases = rec.get("phases")
+    if not isinstance(phases, list):
+        return None
+    out = {}
+    for p in phases:
+        if not isinstance(p, dict) or not isinstance(p.get("phase"), str) or \
+                not whole(p.get("s3GetRequests")) or not whole(p.get("s3GetWireBytes")):
+            return None
+        cur = out.setdefault(p["phase"], [0, 0])
+        cur[0] += p["s3GetRequests"]
+        cur[1] += p["s3GetWireBytes"]
+    return out
+
+def hash_sets(rows):
+    by = {}
+    for r in rows:
+        by.setdefault(r.get("entry"), set())
+        if r.get("result_hash"):
+            by[r["entry"]].add(r["result_hash"])
+    return by
+
+def inspect_parts(path):
+    # `catalog inspect` text: per part its hour range, key and size, and its
+    # key-index leaf refs.
+    parts = []
+    with open(path) as f:
+        for l in f.read().splitlines():
+            m = re.match(r"^  part\[[0-9]+\] range=([0-9]+)\.\.=([0-9]+) key=(\S+) .*size=([0-9]+)", l)
+            if m:
+                parts.append({"lo": int(m.group(1)), "hi": int(m.group(2)), "key": m.group(3),
+                              "size": int(m.group(4)), "leaves": []})
+                continue
+            m = re.match(r"^      field=(\S+) slice=\S+ entry_count=([0-9]+) uncovered_count=([0-9]+) key=(\S+)$", l)
+            if m and parts:
+                parts[-1]["leaves"].append({"field": m.group(1), "entry_count": int(m.group(2)),
+                                            "uncovered": int(m.group(3)), "key": m.group(4)})
+    return parts
+
+def listed_objects(path):
+    rows = []
+    with open(path) as f:
+        for l in f:
+            if l.startswith("{"):
+                rows.append(json.loads(l))
+    return rows
 
 op, args = sys.argv[1], sys.argv[2:]
 
@@ -1296,6 +1475,361 @@ elif op == "stage1-inspect":
                       "file": name, "watermark_hour": watermark, "parts": parts,
                       "label_value_leaf_parts": sum(1 for p in per_part if p["label_value"] > 0),
                       "label_value_leaf_refs": sum(p["label_value"] for p in per_part)}))
+elif op == "stage1-control-image":
+    # The control image's image-inspect line and source commit, the main
+    # image's reference and source commit; the main image's resolved figures
+    # come from stamps.json.
+    stamps_path, control_resolved, control_commit, main_ref, main_commit = args
+    main = load(stamps_path).get("ravel_image")
+    print(json.dumps({"control": {**json.loads(control_resolved), "source_commit": control_commit},
+                      "main": {"reference": main_ref,
+                               "resolved": main.get("resolved") if isinstance(main, dict) else None,
+                               "source_commit": main_commit}}))
+elif op == "stage1-control-compare":
+    # The unrouted and the control pass's diagnostics and the output path.
+    # Per entry and per pass, over the records whose status is ok or
+    # incorrect and whose every phase carries s3GetRequests and
+    # s3GetWireBytes: the median latency_ms, the median per-record GETs and
+    # wire bytes summed over phases, and each phase's medians. Prints the
+    # summary; exit 3 and why on stdout when a diagnostics file cannot be
+    # read.
+    unrouted_path, control_path, out_path = args
+    try:
+        passes = {"unrouted": cost_rows(unrouted_path), "control": cost_rows(control_path)}
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"the control diagnostics could not be read ({type(e).__name__}: {e})")
+        sys.exit(3)
+    def summarise(rows):
+        by, unreadable = {}, 0
+        for r in rows:
+            cost, lat = record_cost(r), r.get("latency_ms")
+            if r.get("status") not in ("ok", "incorrect") or cost is None or \
+                    isinstance(lat, bool) or not isinstance(lat, (int, float)):
+                unreadable += 1
+                continue
+            e = by.setdefault(r.get("entry"), {"latency": [], "gets": [], "bytes": [], "phases": {}})
+            e["latency"].append(lat)
+            e["gets"].append(sum(v[0] for v in cost.values()))
+            e["bytes"].append(sum(v[1] for v in cost.values()))
+            for name, (g, b) in cost.items():
+                ph = e["phases"].setdefault(name, {"gets": [], "bytes": []})
+                ph["gets"].append(g)
+                ph["bytes"].append(b)
+        return {k: {"records": len(v["latency"]), "latency_ms_median": median(v["latency"]),
+                    "s3_get_requests_median": median(v["gets"]), "s3_get_wire_bytes_median": median(v["bytes"]),
+                    "phases": {n: {"s3_get_requests_median": median(p["gets"]),
+                                   "s3_get_wire_bytes_median": median(p["bytes"])}
+                               for n, p in sorted(v["phases"].items())}}
+                for k, v in by.items()}, unreadable
+    u, u_bad = summarise(passes["unrouted"])
+    c, c_bad = summarise(passes["control"])
+    entries, more_gets, more_bytes, unchecked, ratios = [], [], [], [], []
+    for entry in sorted(set(u) | set(c) | {r.get("entry") for rows in passes.values() for r in rows}, key=str):
+        a, b = u.get(entry), c.get(entry)
+        if a is None or b is None:
+            unchecked.append(entry)
+            entries.append({"entry": entry, "unrouted": a, "control": b, "latency_ratio": None})
+            continue
+        ratio = a["latency_ms_median"] / b["latency_ms_median"] if b["latency_ms_median"] > 0 else None
+        if ratio is None:
+            unchecked.append(entry)
+        else:
+            ratios.append(ratio)
+        if a["s3_get_requests_median"] > b["s3_get_requests_median"]:
+            more_gets.append(entry)
+        if a["s3_get_wire_bytes_median"] > b["s3_get_wire_bytes_median"]:
+            more_bytes.append(entry)
+        entries.append({"entry": entry, "unrouted": a, "control": b, "latency_ratio": ratio})
+    doc = {"schema": "metricsbench-stage1-control-compare/1",
+           "method": "per entry, the median over its answered (ok or incorrect) records of each pass; GETs and wire bytes are each record's s3GetRequests and s3GetWireBytes summed over its phases; latency_ratio is the unrouted median latency_ms over the control's; an entry with no readable record in either pass, or a control median of 0 ms, is unchecked",
+           "statements_compared": len(entries) - len(unchecked),
+           "statements_more_gets_count": len(more_gets), "statements_more_gets": more_gets,
+           "statements_more_bytes_count": len(more_bytes), "statements_more_bytes": more_bytes,
+           "statements_unchecked_count": len(unchecked), "statements_unchecked": unchecked,
+           "records_unreadable": {"unrouted": u_bad, "control": c_bad},
+           "latency_ratio_median": median(ratios), "latency_ratio_max": max(ratios) if ratios else None,
+           "entries": entries}
+    dump(out_path, doc)
+    print(json.dumps({k: v for k, v in doc.items() if k != "entries"}))
+elif op == "stage1-hash-compare":
+    # A base and an other pass's diagnostics, the output path and the two
+    # passes' names. Per entry, the two passes' result_hash sets compared as
+    # stage1-compare does; and the other pass's records counted by status,
+    # by label-index prunes, and by the text "fetch memory exhausted"
+    # anywhere in the record. Prints the summary; exit 3 and why on stdout
+    # when a diagnostics file cannot be read.
+    base_path, other_path, out_path, base_name, other_name = args
+    try:
+        base, other = cost_rows(base_path), cost_rows(other_path)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"the {base_name} or {other_name} diagnostics could not be read ({type(e).__name__}: {e})")
+        sys.exit(3)
+    a, b = hash_sets(base), hash_sets(other)
+    equal, differing, without = [], [], []
+    for entry in sorted(set(a) | set(b), key=str):
+        x, y = a.get(entry, set()), b.get(entry, set())
+        if not x or not y:
+            without.append(entry)
+        elif x == y:
+            equal.append(entry)
+        else:
+            differing.append({"entry": entry, base_name: sorted(x), other_name: sorted(y)})
+    def pruned(rec):
+        v = rec.get("segmentsPrunedByLabelIndex")
+        return v if whole(v) else None
+    figures = [pruned(r) for r in other]
+    exhausted = [{"entry": r.get("entry"), "rep": r.get("rep")} for r in other
+                 if "fetch memory exhausted" in json.dumps(r)]
+    doc = {"schema": "metricsbench-stage1-hash-compare/1", "base": base_name, "other": other_name,
+           "entries_compared": len(equal) + len(differing), "entries_equal": len(equal),
+           "entries_differing_count": len(differing), "entries_differing": differing,
+           "entries_without_hash_count": len(without), "entries_without_hash": without,
+           "other_records": len(other),
+           "other_records_status_unexpected": sum(1 for r in other if r.get("status") not in ("ok", "incorrect")),
+           "other_records_label_index_null": sum(1 for v in figures if v is None),
+           "other_records_pruned_by_label_index": sum(1 for v in figures if v is not None and v > 0),
+           "other_records_fetch_memory_exhausted_count": len(exhausted),
+           "other_records_fetch_memory_exhausted": exhausted}
+    dump(out_path, doc)
+    print(json.dumps({**doc, "entries_differing": [d["entry"] for d in differing]}))
+elif op == "stage1-extra-hour":
+    # The leaf-off and leaf-on fold reports, their wall times, the HEAD
+    # sha256 each fold started from, the inspect text and catalog listing
+    # taken after the leaf-on fold. Prints the stamp; exit 3 and why on
+    # stdout when an input cannot be read or lacks a field.
+    off_path, on_path, off_ms, on_ms, off_head, on_head, inspect_path, list_path = args
+    want = ["watermark_hour", "previous_watermark_hour", "buckets_folded", "entry_count",
+            "key_index_leaves_written", "key_index_leaf_bytes_written", "key_index_uncovered_entries"]
+    try:
+        off, on = load(off_path), load(on_path)
+        assert isinstance(off, dict) and isinstance(on, dict)
+        listed = listed_objects(list_path)
+        parts = inspect_parts(inspect_path)
+    except (OSError, ValueError, AssertionError) as e:
+        print(f"an extra-hour input could not be read ({type(e).__name__}: {e})")
+        sys.exit(3)
+    missing = [f"{n}.{k}" for n, rep in (("off", off), ("on", on)) for k in want if k not in rep]
+    if missing:
+        print("the extra-hour fold reports lack " + ", ".join(missing))
+        sys.exit(3)
+    prev = on["previous_watermark_hour"]
+    if not whole(prev) or not whole(on["watermark_hour"]):
+        print(f"the leaf-on fold's watermark_hour {on['watermark_hour']!r} or previous_watermark_hour {prev!r} is not a whole number")
+        sys.exit(3)
+    tail_objects = [o for o in listed if whole(o.get("ingest_hour_bucket")) and prev < o["ingest_hour_bucket"] <= on["watermark_hour"]]
+    tail_bytes = sum(o.get("object_size", 0) for o in tail_objects if whole(o.get("object_size")))
+    tail_parts = [p for p in parts if p["hi"] > prev]
+    uncovered = [p["key"] for p in tail_parts
+                 if not any(l["field"] == "label_value" for l in p["leaves"]) or any(l["uncovered"] > 0 for l in p["leaves"])]
+    leaf_bytes = on["key_index_leaf_bytes_written"]
+    off_ms, on_ms = int(off_ms), int(on_ms)
+    print(json.dumps({
+        "method": "ravel-server stopped; the catalog HEAD (the one mutable catalog object; parts, leaves and data objects are immutable and content-keyed) saved, catalog fold --writers-stopped with no leaf flag timed, the saved HEAD put back and read back, then catalog fold --writers-stopped --key-index-leaves --metrics-label-index timed from the same HEAD",
+        "same_start": off_head == on_head and off["previous_watermark_hour"] == prev,
+        "start_mismatches": int(off_head != on_head) + int(off["previous_watermark_hour"] != prev),
+        "head_sha256": {"before_off": off_head, "before_on": on_head},
+        "previous_watermark_hour": prev, "watermark_hour": on["watermark_hour"],
+        "fold_off": {"wall_ms": off_ms, **{k: off[k] for k in want}},
+        "fold_on": {"wall_ms": on_ms, **{k: on[k] for k in want}},
+        "wall_ratio_on_off": on_ms / off_ms if off_ms > 0 else None,
+        "tail_objects": len(tail_objects), "tail_data_bytes": tail_bytes,
+        "leaf_bytes": leaf_bytes,
+        "leaf_bytes_ratio": leaf_bytes / tail_bytes if tail_bytes > 0 else None,
+        "leaf_bytes_basis": "fold_on.key_index_leaf_bytes_written over the object_size of the listed objects whose ingest_hour_bucket is above previous_watermark_hour and at or below watermark_hour",
+        "tail_parts": len(tail_parts), "uncovered_tail_parts_count": len(uncovered),
+        "uncovered_tail_parts": uncovered,
+        "uncovered_basis": "parts whose hour range ends above previous_watermark_hour and that carry no label_value leaf or a leaf with uncovered_count above 0"}))
+elif op == "stage1-compact":
+    # `maintain compact-tenant` text output, its wall time, the command:
+    # every counter it prints once at the start of a line. Exit 3 and why on
+    # stdout when a counter is absent or repeated.
+    out_path, wall_ms, cmd = args
+    keys = ["compacted", "already", "rewrite_present", "not_sealed", "below_min", "tombstoned",
+            "claim_skipped", "claim_cancelled", "held_out_of_window", "geometry_unsupported",
+            "parts (wrote)", "wall_time_ms", "failed"]
+    try:
+        with open(out_path) as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        print(f"{os.path.basename(out_path)} could not be read ({type(e).__name__})")
+        sys.exit(3)
+    stamp = {"command": cmd, "wall_ms": int(wall_ms)}
+    for k in keys:
+        hits = [l[len(k) + 2:] for l in lines if l.startswith(k + ": ")]
+        if len(hits) != 1 or not hits[0].isdigit():
+            print(f"{os.path.basename(out_path)} carries {len(hits)} '{k}:' lines, want 1 whole number")
+            sys.exit(3)
+        stamp[k.replace(" (wrote)", "_written")] = int(hits[0])
+    print(json.dumps(stamp))
+elif op == "stage1-l1":
+    # The catalog listing after the L1 fold: data objects per level.
+    (list_path,) = args
+    try:
+        listed = listed_objects(list_path)
+    except (OSError, ValueError) as e:
+        print(f"{os.path.basename(list_path)} could not be read ({type(e).__name__})")
+        sys.exit(3)
+    print(json.dumps({"file": os.path.basename(list_path),
+                      "l0_objects": sum(1 for o in listed if o.get("level") == "L0"),
+                      "l1_objects": sum(1 for o in listed if o.get("level") == "L1"),
+                      "l1_bytes": sum(o.get("object_size", 0) for o in listed
+                                      if o.get("level") == "L1" and whole(o.get("object_size")))}))
+elif op == "stage1-erasure-corpus":
+    # The corpus, the output path, a label and a value: every vector
+    # selector in each entry's promql gains LABEL!="VALUE", so the pass
+    # answers what the tenant holds without that subject's series. Prints
+    # the rewritten entry ids; exit 3 and why on stdout on text the lexer
+    # cannot follow.
+    corpus_path, out_path, label, value = args
+    KEYWORDS = {"by", "without", "on", "ignoring", "group_left", "group_right", "offset", "bool",
+                "and", "or", "unless", "atan2", "inf", "nan", "start", "end"}
+    LIST_OPENERS = {"by", "without", "on", "ignoring", "group_left", "group_right"}
+    matcher = f'{label}!="{value}"'
+    def rewrite(q):
+        out, i, n, list_next = [], 0, len(q), False
+        def skip_ws(j):
+            while j < n and q[j].isspace():
+                j += 1
+            return j
+        while i < n:
+            ch = q[i]
+            if ch in "\"'`":
+                j = i + 1
+                while j < n and q[j] != ch:
+                    j += 2 if q[j] == "\\" and ch != "`" else 1
+                if j >= n:
+                    raise ValueError(f"unterminated string at {i}")
+                out.append(q[i:j + 1])
+                i = j + 1
+            elif ch == "[":
+                j = q.find("]", i)
+                if j < 0:
+                    raise ValueError(f"unterminated range at {i}")
+                out.append(q[i:j + 1])
+                i = j + 1
+            elif ch == "(" and list_next:
+                j = q.find(")", i)
+                if j < 0:
+                    raise ValueError(f"unterminated label list at {i}")
+                out.append(q[i:j + 1])
+                i, list_next = j + 1, False
+            elif ch == "{":
+                j = skip_ws(i + 1)
+                out.append("{" + matcher + ("" if j < n and q[j] == "}" else ","))
+                i += 1
+                depth_str = None
+                while i < n and (q[i] != "}" or depth_str):
+                    if depth_str:
+                        if q[i] == "\\":
+                            out.append(q[i:i + 2])
+                            i += 2
+                            continue
+                        if q[i] == depth_str:
+                            depth_str = None
+                    elif q[i] in "\"'`":
+                        depth_str = q[i]
+                    out.append(q[i])
+                    i += 1
+                if i >= n:
+                    raise ValueError("unterminated selector")
+                out.append("}")
+                i += 1
+            elif ch.isalpha() or ch in "_:":
+                j = i
+                while j < n and (q[j].isalnum() or q[j] in "_:"):
+                    j += 1
+                word = q[i:j]
+                out.append(word)
+                k = skip_ws(j)
+                m = re.match(r"[A-Za-z_]+", q[k:])
+                if word.lower() in KEYWORDS:
+                    list_next = word in LIST_OPENERS
+                elif k < n and q[k] in "({":
+                    # A function or aggregation call, or a name the next
+                    # branch gives its matcher inside the braces.
+                    pass
+                elif m and m.group(0) in ("by", "without"):
+                    # An aggregation whose grouping comes before its argument.
+                    pass
+                else:
+                    out.append("{" + matcher + "}")
+                i = j
+            elif ch.isdigit() or ch == ".":
+                j = i
+                while j < n and (q[j].isalnum() or q[j] == "." or (q[j] in "+-" and q[j - 1] in "eE")):
+                    j += 1
+                out.append(q[i:j])
+                i = j
+            else:
+                if not ch.isspace():
+                    list_next = False
+                out.append(ch)
+                i += 1
+        return "".join(out)
+    try:
+        doc = load(corpus_path)
+        rewritten = []
+        for e in doc["entries"]:
+            q = rewrite(e["promql"])
+            if q != e["promql"]:
+                rewritten.append(e["id"])
+            e["promql"] = q
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"the corpus could not be rewritten ({type(e).__name__}: {e})")
+        sys.exit(3)
+    dump(out_path, doc)
+    print(json.dumps({"matcher": matcher, "entries": len(doc["entries"]), "rewritten": rewritten}))
+elif op == "stage1-erasure-status":
+    # `erase status` text and the request id: its state, deferral cause and
+    # per-bucket dropped counts.
+    status_path, request_id = args
+    with open(status_path) as f:
+        lines = f.read().splitlines()
+    states = [m.group(1) for m in (re.match(rf"^{re.escape(request_id)}: (PENDING|COMPLETED|UNKNOWN)", l) for l in lines) if m]
+    buckets = [{"signal": m.group(1), "shard": int(m.group(2)), "ingest_hour_bucket": int(m.group(3)),
+                "dropped_count": int(m.group(4))}
+               for m in (re.match(r"^    signal=(\S+) shard=([0-9]+) ingest_hour_bucket=([0-9]+) dropped_count=([0-9]+)$", l)
+                         for l in lines) if m]
+    causes = [l.split(":", 1)[1].strip() for l in lines if l.startswith("  deferral cause:")]
+    print(json.dumps({"request_id": request_id, "state": states[0] if len(states) == 1 else None,
+                      "deferral_cause": causes[0] if causes else None, "buckets": buckets,
+                      "dropped_total": sum(b["dropped_count"] for b in buckets)}))
+elif op == "stage1-erasure-leaves":
+    # The inspect text before the erasure and after its fold, and the
+    # stamps file holding stage1.erasure_rewrite. A stale leaf is one the
+    # post-fold snapshot still references unchanged (same leaf key as
+    # before the erasure) on a part whose hour range holds a bucket the
+    # rewrite dropped records from.
+    pre_path, post_path, stamps_path = args
+    try:
+        pre, post = inspect_parts(pre_path), inspect_parts(post_path)
+        rewrite = load(stamps_path)["stage1"]["erasure_rewrite"]
+        hours = {b["ingest_hour_bucket"] for b in rewrite["buckets"] if b["dropped_count"] > 0}
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"an erasure-leaves input could not be read ({type(e).__name__}: {e})")
+        sys.exit(3)
+    pre_keys = {l["key"] for p in pre for l in p["leaves"]}
+    touched = [p for p in post if any(p["lo"] <= h <= p["hi"] for h in hours)]
+    stale = [{"part": p["key"], "leaf": l["key"], "field": l["field"]}
+             for p in touched for l in p["leaves"] if l["key"] in pre_keys]
+    print(json.dumps({"dropped_hours": sorted(hours), "parts_before": len(pre), "parts_after": len(post),
+                      "parts_over_dropped_hours": len(touched),
+                      "leaves_after": sum(len(p["leaves"]) for p in post),
+                      "stale_leaves_count": len(stale), "stale_leaves": stale,
+                      "basis": "a leaf the post-fold snapshot references on a part whose hour range holds a bucket the rewrite dropped records from, whose key the pre-erasure snapshot already referenced"}))
+elif op == "stage1-head-sha":
+    # A directory `aws s3 cp --recursive` filled with the metrics catalog
+    # HEADs: the sha256 of the one HEAD. Exit 3 and why on stdout unless
+    # exactly one */catalog/m/HEAD is there.
+    import hashlib
+    (root,) = args
+    heads = sorted(os.path.join(d, f) for d, _, files in os.walk(root) for f in files
+                   if f == "HEAD" and d.endswith(os.path.join("catalog", "m")))
+    if len(heads) != 1:
+        print(f"{root} holds {len(heads)} metrics catalog HEADs, want 1")
+        sys.exit(3)
+    with open(heads[0], "rb") as f:
+        print(hashlib.sha256(f.read()).hexdigest())
 elif op == "stage1-holders":
     # holders.json, the unrouted and the routed pass's diagnostics, the
     # catalog listing the count read, the watermark hour of the snapshot the
@@ -1492,6 +2026,27 @@ esac
 if [ "$stage1" -eq 1 ] && [ "$diagnostic" -eq 1 ]; then
   usage_error "MB_STAGE1=1 measures the folded Ravel passes; --diagnostic-prometheus-max-samples starts no Ravel"
 fi
+arm_control=0 arm_extra_hour=0 arm_l1=0 arm_erasure=0
+if [ -n "${MB_STAGE1_ARMS:-}" ]; then
+  [ "$stage1" -eq 1 ] || usage_error "MB_STAGE1_ARMS adds Stage 1 arms and needs MB_STAGE1=1"
+  IFS=',' read -r -a stage1_arm_list <<<"$MB_STAGE1_ARMS"
+  for arm in "${stage1_arm_list[@]}"; do
+    case "$arm" in
+      extra-hour) arm_extra_hour=1 ;;
+      l1) arm_l1=1 ;;
+      erasure) arm_erasure=1 ;;
+      *) usage_error "MB_STAGE1_ARMS takes a comma list of extra-hour, l1 and erasure, got '${arm}'" ;;
+    esac
+  done
+fi
+control_image="${MB_CONTROL_IMAGE:-}"
+control_source_commit="${MB_CONTROL_SOURCE_COMMIT:-}"
+if [ -n "$control_image" ] || [ -n "$control_source_commit" ]; then
+  [ "$stage1" -eq 1 ] || usage_error "MB_CONTROL_IMAGE adds the Stage 1 control arm and needs MB_STAGE1=1"
+  [ -n "$control_image" ] && [ -n "$control_source_commit" ] ||
+    usage_error "MB_CONTROL_IMAGE and MB_CONTROL_SOURCE_COMMIT are given together or not at all"
+  arm_control=1
+fi
 
 [ -n "$profile" ] || usage_error "--profile is required"
 [ -n "$bin_dir" ] || usage_error "--bin-dir is required"
@@ -1580,6 +2135,12 @@ if [ "$stage1" -eq 1 ]; then
     ci | cardinality) ;;
     *) refuse "MB_STAGE1=1 with --profile ${profile}: the Stage 1 lanes run on cardinality (the pre-registered run) and ci (its rehearsal) only" ;;
   esac
+fi
+if [ "$arm_control" -eq 1 ]; then
+  [[ "$control_image" =~ @sha256:[0-9a-f]{64}$ ]] ||
+    refuse "MB_CONTROL_IMAGE '$control_image' carries no @sha256: digest; the control arm compares against one fixed build, and a tag could move under it"
+  [[ "$control_source_commit" =~ ^[0-9a-f]{40}$ ]] ||
+    refuse "MB_CONTROL_SOURCE_COMMIT '$control_source_commit' is not a full 40-character commit id"
 fi
 required_bins="metricsbench_ingest metricsbench_query metricsbench_report"
 [ "$stage1" -eq 0 ] || required_bins="${required_bins} metricsbench_holders"
@@ -1799,6 +2360,16 @@ if [ "$stage1" -eq 1 ]; then
   for key in $STAGE1_KEYS; do
     stamp_set "stage1.${key}" null
   done
+  stamp_set stage1.arms "{\"control\": $(json_bool "$arm_control"), \"extra_hour\": $(json_bool "$arm_extra_hour"), \"l1\": $(json_bool "$arm_l1"), \"erasure\": $(json_bool "$arm_erasure")}"
+  for arm in $STAGE1_ARMS; do
+    for key in $(stage1_arm_keys "$arm"); do
+      if stage1_arm_on "$arm"; then
+        stamp_set "stage1.${key}" null
+      else
+        stamp_str "stage1.${key}" "skipped: arm off ($(stage1_arm_switch "$arm"))"
+      fi
+    done
+  done
 else
   stamp_set stage1.enabled false
 fi
@@ -1823,6 +2394,10 @@ FAILED_STEP=""
 # diagnostic and exits 70 naming ingest at the end.
 INGEST_FAILED=0
 INGEST_FAILURE=""
+# The wall-clock hour the main ingest ended in: the newest ingest hour a
+# Stage 1 compaction waits to see sealed.
+INGEST_END_HOUR=0
+STAGE1_LAST_INGEST_HOUR=0
 CONTINUE_AFTER_FAILED_VERIFICATION=0
 # Set by memory_step --defer in a full run whose memory step failed: the
 # folded steps still run, and the run exits for the memory failure after them.
@@ -1998,6 +2573,7 @@ start_sampler() {
 run_ingest() {
   local code=0
   "${bin_dir}/metricsbench_ingest" "$@" >"${out_dir}/ingest.json" 2>"${out_dir}/ingest.log" || code=$?
+  INGEST_END_HOUR=$(($(date -u +%s) / 3600))
   if [ "$code" -ne 0 ]; then
     show_log "${out_dir}/ingest.log"
     local failed=""
@@ -2497,39 +3073,70 @@ stage1_recreate() {
 
 # stage1_whole_figure WHICH PATH: the stamp at PATH read back into
 # STAGE1_FIGURE. When it cannot be read, or is not a whole number, the stamp
-# stage1.WHICH says so and step stage1-WHICH fails, since the pass it gates
-# cannot check its snapshot.
+# stage1.WHICH says so and step stage1-WHICH (underscores as dashes) fails,
+# since the pass it gates cannot check its snapshot.
 stage1_whole_figure() {
   local which="$1" path="$2" code=0
   STAGE1_FIGURE="$(py get "$STAMPS" "$path")" || code=$?
   if [ "$code" -ne 0 ]; then
     stamp_str "stage1.${which}" "refused: ${path} could not be read (py get exited ${code})"
-    fail_step "stage1-${which}" "refused: ${path} could not be read (py get exited ${code}), so the ${which} pass's snapshot cannot be checked"
+    fail_step "stage1-${which//_/-}" "refused: ${path} could not be read (py get exited ${code}), so the ${which} pass's snapshot cannot be checked"
   fi
   if ! [[ "$STAGE1_FIGURE" =~ ^[0-9]+$ ]]; then
     stamp_str "stage1.${which}" "refused: ${path} is '${STAGE1_FIGURE}', not a whole number"
-    fail_step "stage1-${which}" "refused: ${path} is '${STAGE1_FIGURE}', not a whole number, so the ${which} pass's snapshot cannot be checked"
+    fail_step "stage1-${which//_/-}" "refused: ${path} is '${STAGE1_FIGURE}', not a whole number, so the ${which} pass's snapshot cannot be checked"
   fi
 }
 
-# stage1_catalog_state unrouted|routed: the snapshot the pass is about to
-# read, from ravel-cli catalog inspect on ravel-qualify, stamped as
-# stage1.WHICH_catalog. The pass is refused (its step fails) when the text
-# cannot be read, when the stamp cannot be written or its
-# label_value_leaf_parts, watermark_hour or parts read back as a whole
-# number, when the unrouted pass would run with any part carrying a
-# label_value leaf, or when the routed pass would run with fewer such parts
-# than stage1-leaves reported rebuilt (parts_rebuilt).
-stage1_catalog_state() {
-  local which="$1" step="stage1-$1" key="stage1.$1_catalog" code=0 line want
-  local file="stage1-$1.inspect.txt"
-  local cmd="ravel-cli catalog inspect --tenant ${RAVEL_TENANT} --signal metrics"
-  compose run --rm --no-deps -T ravel-qualify \
+# stage1_inspect STEP FILE: ravel-cli catalog inspect --signal metrics on
+# ravel-qualify into <out>/FILE, with the main image's CLI whichever image
+# ravel-server runs; a failure is STEP's.
+stage1_inspect() {
+  local code=0
+  RAVEL_IMAGE="$ravel_image" compose run --rm --no-deps -T ravel-qualify \
     --store s3 --tenant-hash-unkeyed catalog inspect \
     --tenant "$RAVEL_TENANT" --signal metrics \
-    >"${out_dir}/${file}" 2>"${out_dir}/stage1-$1.inspect.log" || code=$?
+    >"${out_dir}/$2" 2>"${out_dir}/$2.log" || code=$?
   if [ "$code" -ne 0 ]; then
-    show_log "${out_dir}/stage1-$1.inspect.log"
+    show_log "${out_dir}/$2.log"
+    fail_step "$1" "ravel-cli catalog inspect --tenant ${RAVEL_TENANT} --signal metrics exited ${code}; see ${out_dir}/$2.log"
+  fi
+}
+
+# stage1_list STEP FILE: ravel-cli catalog list --json (the data objects the
+# folded snapshot resolves, L0 and L1) into <out>/FILE; a failure is STEP's.
+stage1_list() {
+  local code=0 hours
+  hours=$((($(date -u +%s) - anchor_ms / 1000) / 3600 + 2))
+  RAVEL_IMAGE="$ravel_image" compose run --rm --no-deps -T ravel-qualify \
+    --store s3 --tenant-hash-unkeyed catalog list \
+    --tenant "$RAVEL_TENANT" --shards "$RAVEL_SHARDS" --hours "$hours" --json \
+    >"${out_dir}/$2" 2>"${out_dir}/$2.log" || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/$2.log"
+    fail_step "$1" "ravel-cli catalog list --tenant ${RAVEL_TENANT} --hours ${hours} --json exited ${code}; see ${out_dir}/$2.log"
+  fi
+}
+
+# stage1_catalog_state WHICH: the snapshot the pass WHICH (unrouted, routed,
+# control, l1, erasure_reference or erasure_pending) is about to read, from
+# ravel-cli catalog inspect on ravel-qualify (the main image's CLI), stamped
+# as stage1.WHICH_catalog. The pass is refused (its step fails) when the text
+# cannot be read, when the stamp cannot be written or its
+# label_value_leaf_parts, watermark_hour or parts read back as a whole
+# number, when the unrouted or control pass would run with any part carrying
+# a label_value leaf, or when the routed pass would run with fewer such parts
+# than stage1-leaves reported rebuilt (parts_rebuilt).
+stage1_catalog_state() {
+  local which="$1" step="stage1-${1//_/-}" key="stage1.$1_catalog" code=0 line want
+  local file="stage1-${1//_/-}.inspect.txt"
+  local cmd="ravel-cli catalog inspect --tenant ${RAVEL_TENANT} --signal metrics"
+  RAVEL_IMAGE="$ravel_image" compose run --rm --no-deps -T ravel-qualify \
+    --store s3 --tenant-hash-unkeyed catalog inspect \
+    --tenant "$RAVEL_TENANT" --signal metrics \
+    >"${out_dir}/${file}" 2>"${out_dir}/stage1-${1//_/-}.inspect.log" || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/stage1-${1//_/-}.inspect.log"
     stamp_str "$key" "failed: ${cmd} exited ${code}"
     fail_step "$step" "refused: the snapshot state could not be read: ${cmd} exited ${code}"
   fi
@@ -2551,12 +3158,12 @@ stage1_catalog_state() {
   STAGE1_WATERMARK="$STAGE1_FIGURE"
   stage1_whole_figure "$which" "${key}.parts"
   STAGE1_PARTS="$STAGE1_FIGURE"
-  if [ "$which" = unrouted ]; then
+  if [ "$which" = unrouted ] || [ "$which" = control ]; then
     if [ "$STAGE1_LEAF_PARTS" -ne 0 ]; then
-      stamp_str "stage1.${which}" "refused: ${STAGE1_LEAF_PARTS} snapshot parts carry a label_value leaf before the unrouted pass"
-      fail_step "$step" "refused: ${STAGE1_LEAF_PARTS} snapshot parts carry a label_value leaf before the unrouted pass, which must run with none"
+      stamp_str "stage1.${which}" "refused: ${STAGE1_LEAF_PARTS} snapshot parts carry a label_value leaf before the ${which} pass"
+      fail_step "$step" "refused: ${STAGE1_LEAF_PARTS} snapshot parts carry a label_value leaf before the ${which} pass, which must run with none"
     fi
-  else
+  elif [ "$which" = routed ]; then
     stage1_whole_figure "$which" stage1.leaves.parts_rebuilt
     want="$STAGE1_FIGURE"
     if [ "$STAGE1_LEAF_PARTS" -lt "$want" ]; then
@@ -2566,30 +3173,35 @@ stage1_catalog_state() {
   fi
 }
 
-# stage1_pass unrouted|routed: the corpus against Prometheus and Ravel, as the
-# query step runs it, into <out>/stage1-WHICH/, then the cold pass's
-# selection into <out>/stage1-WHICH/cold.json, and the cold records with a
-# ravel_cost counted against the selected entries x repetitions as
-# stage1.WHICH_cold_records (0 of 0 when the cold stamp says not applicable;
-# a string naming why when there is no cold stamp to count). Every ravel_cost
-# record is labelled pass_label folded-WHICH with the fold state
-# stage1_catalog_state read just before it.
+# stage1_pass WHICH: the corpus (STAGE1_PASS_CORPUS when set) against
+# Prometheus and Ravel, as the query step runs it, into <out>/stage1-WHICH/
+# (underscores as dashes throughout). For unrouted, routed and control, then
+# the cold pass's selection into <out>/stage1-WHICH/cold.json, and the cold
+# records with a ravel_cost counted against the selected entries x
+# repetitions as stage1.WHICH_cold_records (0 of 0 when the cold stamp says
+# not applicable; a string naming why when there is no cold stamp to count).
+# Every ravel_cost record is labelled pass_label folded-WHICH with the fold
+# state stage1_catalog_state read just before it.
 stage1_pass() {
-  local which="$1" label="folded-$1" step="stage1-$1" dir="${out_dir}/stage1-$1" code=0 state flags line
+  local which="$1" name="${1//_/-}" code=0 state flags line corpus="${STAGE1_PASS_CORPUS:-$CORPUS}"
+  local label="folded-${name}" step="stage1-${name}" dir="${out_dir}/stage1-${name}"
   stage1_catalog_state "$which"
-  flags="$STAGE1_UNROUTED_FLAGS"
-  [ "$which" = unrouted ] || flags="$STAGE1_ROUTED_FLAGS"
+  case "$which" in
+    unrouted | control) flags="$STAGE1_UNROUTED_FLAGS" ;;
+    *) flags="$STAGE1_ROUTED_FLAGS" ;;
+  esac
   state="folded: watermark_hour=${STAGE1_WATERMARK}; parts=${STAGE1_PARTS}; label_value leaf parts=${STAGE1_LEAF_PARTS}; ravel-server ${flags}"
+  [ "$which" != control ] || state="${state}; image ${control_image}"
   mkdir -p "$dir" || fail_step "$step" "cannot create $dir"
   "${it_env[@]}" GITHUB_SHA="$ravel_source_commit" "${bin_dir}/metricsbench_report" provenance \
-    --workload "$WORKLOAD" --corpus "$CORPUS" "${prov_tail[@]}" \
+    --workload "$WORKLOAD" --corpus "$corpus" "${prov_tail[@]}" \
     --config "diagnostic_regime=stage1-${label}" --config "comparable=false" \
     >"${dir}/provenance.json" 2>"${dir}/provenance.log" || code=$?
   if [ "$code" -ne 0 ]; then
     show_log "${dir}/provenance.log"
     fail_step "$step" "metricsbench_report provenance exited $code"
   fi
-  local query_args=(--ingest-report "${out_dir}/ingest.json" --workload "$WORKLOAD" --corpus "$CORPUS"
+  local query_args=(--ingest-report "${out_dir}/ingest.json" --workload "$WORKLOAD" --corpus "$corpus"
     --provenance "${dir}/provenance.json"
     --engine "name=prometheus,url=${PROM_BASE}"
     --engine "name=ravel,url=${RAVEL_BASE},bearer_env=${RAVEL_TOKEN_ENV}"
@@ -2606,7 +3218,14 @@ stage1_pass() {
   fi
   [ -s "${dir}/diagnostics.json" ] || fail_step "$step" "metricsbench_query exited 0 and wrote no diagnostics.json"
   stamp_set "stage1.${which}" "$(python3 -I -c 'import json,sys; print(json.dumps(dict(zip(["pass_label","fold_state","diagnostics","report"], sys.argv[1:]))))' \
-    "$label" "$state" "stage1-${which}/diagnostics.json" "stage1-${which}/report.json")"
+    "$label" "$state" "stage1-${name}/diagnostics.json" "stage1-${name}/report.json")"
+  case "$which" in
+    unrouted | routed | control) ;;
+    *)
+      step_done "$step"
+      return 0
+      ;;
+  esac
   cold_pass "${dir}/cold" "${dir}/cold.json" "stage1.${which}_cold" "stage1 ${which} cold" \
     "stage1-${label}-cold" --pass-label "$label" --fold-state "$state"
   code=0
@@ -2707,14 +3326,328 @@ stage1_holders_step() {
   step_done stage1-holders
 }
 
+# stage1_note KEY OP ARG...: the py op's line stamped as KEY, or why it failed;
+# never fatal (the band file is the verdict).
+stage1_note() {
+  local key="$1" op="$2" code=0 line
+  shift 2
+  line="$(py "$op" "$@")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str "$key" "failed: ${line:-${op} exited $code}"
+    say "${key}: ${line:-${op} exited $code}"
+    return 0
+  fi
+  stamp_set "$key" "$line"
+}
+
+# stage1_wait_until STEP EPOCH_S WHY: METRICSBENCH_SLEEP (sleep) until the
+# wall clock reaches EPOCH_S.
+stage1_wait_until() {
+  local now
+  now="$(date -u +%s)"
+  [ "$now" -lt "$2" ] || return 0
+  say "$1: waiting $(($2 - now))s: $3"
+  "$SLEEP" "$(($2 - now))" || fail_step "$1" "${SLEEP} $(($2 - now)) failed"
+}
+
+# stage1_stop STEP: ravel-server stopped, so a --writers-stopped fold or a
+# compaction runs with no writer.
+stage1_stop() {
+  local code=0 log="${out_dir}/${1}.stop.log"
+  compose stop ravel-server >"$log" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "$log"
+    fail_step "$1" "docker compose stop ravel-server exited $code"
+  fi
+}
+
+# stage1_s3 STEP LOG ARG...: aws ARGs on the createbuckets service (each
+# lane's own endpoint and credentials), as the invoking user, with
+# <out>/stage1-s3 mounted at /stage1-s3; a failure is STEP's.
+stage1_s3() {
+  local step="$1" log="$2" code=0 endpoint=()
+  shift 2
+  [ "$real_s3" -eq 1 ] || endpoint=(--endpoint-url http://s3s:9000)
+  mkdir -p "${out_dir}/stage1-s3" || fail_step "$step" "cannot create ${out_dir}/stage1-s3"
+  compose run --rm --no-deps -T --user "$(id -u):$(id -g)" -e HOME=/tmp -v "${out_dir}/stage1-s3:/stage1-s3" \
+    --entrypoint aws createbuckets ${endpoint[@]+"${endpoint[@]}"} "$@" >"$log" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "$log"
+    fail_step "$step" "aws $1 $2 exited $code; see $log"
+  fi
+}
+
+stage1_bucket() {
+  if [ "$real_s3" -eq 1 ]; then echo "${real_s3_prefix}-ravel"; else echo ravel-metricsbench; fi
+}
+
+# stage1_head_fetch STEP NAME: the tenant's metrics catalog HEAD downloaded
+# under <out>/stage1-s3/NAME/ and its sha256 printed into STAGE1_HEAD_SHA.
+stage1_head_fetch() {
+  local code=0 bucket
+  bucket="$(stage1_bucket)"
+  rm -rf "${out_dir}/stage1-s3/$2"
+  stage1_s3 "$1" "${out_dir}/${1}.$2.log" s3 cp --recursive "s3://${bucket}/t/" "/stage1-s3/$2/t/" \
+    --exclude '*' --include '*/catalog/m/HEAD' --only-show-errors
+  STAGE1_HEAD_SHA="$(py stage1-head-sha "${out_dir}/stage1-s3/$2")" || code=$?
+  [ "$code" -eq 0 ] || fail_step "$1" "${STAGE1_HEAD_SHA:-stage1-head-sha exited $code}"
+}
+
+# stage1_control_step: ADR-3694 row 12. ravel-server recreated from
+# MB_CONTROL_IMAGE with the unrouted flags on the snapshot the unrouted pass
+# read; both images' digests and source commits stamped; the corpus run as
+# stage1-control, steady and cold; ravel-server recreated from the main
+# image; <out>/stage1-control-compare.json compares the unrouted pass with
+# the control per statement (latency ratio, GETs and wire bytes per phase).
+stage1_control_step() {
+  local code=0 resolved
+  export RAVEL_IMAGE="$control_image"
+  stage1_recreate stage1-control stage1.control_restart "$STAGE1_UNROUTED_FLAGS"
+  resolved="$("$DOCKER" image inspect "$control_image" 2>/dev/null | py image-inspect "$control_image")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str stage1.control_image "failed: docker image inspect does not report the digest of ${control_image} (got: ${resolved:-no such image})"
+    fail_step stage1-control "docker image inspect does not report the digest of ${control_image}"
+  fi
+  stamp_set stage1.control_image "$(py stage1-control-image "$STAMPS" "$resolved" "$control_source_commit" \
+    "$ravel_image" "$ravel_source_commit")"
+  stage1_pass control
+  export RAVEL_IMAGE="$ravel_image"
+  stage1_recreate stage1-control-restore stage1.control_restore "$STAGE1_UNROUTED_FLAGS"
+  step_done stage1-control-restore
+  stage1_note stage1.control_compare stage1-control-compare "${out_dir}/stage1-unrouted/diagnostics.json" \
+    "${out_dir}/stage1-control/diagnostics.json" "${out_dir}/stage1-control-compare.json"
+}
+
+# stage1_extra_hour_step: ADR-3694 row 7. Once the wall clock is past the
+# routed snapshot's watermark hour (and the next hour of the profile's scrape
+# grid is no more than 5 minutes ahead of it), metricsbench_ingest writes
+# that hour to Ravel alone. ravel-server is stopped; the catalog HEAD is
+# saved; a --writers-stopped fold with no leaf switch is timed; the saved
+# HEAD is put back and read back; the same fold with --key-index-leaves
+# --metrics-label-index is timed from that same HEAD. Both start from one
+# state, so the ratio of their wall times is the leaf build's alone.
+stage1_extra_hour_step() {
+  local dir="${out_dir}/stage1-extra-hour" code=0 line watermark target extra_anchor steps end_s
+  local off_head on_head off_ms on_ms bucket
+  mkdir -p "$dir" || fail_step stage1-extra-hour-ingest "cannot create $dir"
+  stage1_whole_figure extra_hour stage1.routed_catalog.watermark_hour
+  watermark="$STAGE1_FIGURE"
+  extra_anchor=$((anchor_ms + duration_secs * 1000))
+  steps=$((3600 / interval_secs))
+  end_s=$(((extra_anchor + (steps - 1) * interval_secs * 1000) / 1000))
+  target=$(((watermark + 1) * 3600 + 60))
+  [ $((end_s - 300)) -le "$target" ] || target=$((end_s - 300))
+  stage1_wait_until stage1-extra-hour-ingest "$target" \
+    "the extra hour must land in an ingest hour above watermark_hour ${watermark}, and its last sample no more than 5 minutes ahead"
+  "${bin_dir}/metricsbench_ingest" --workload "$WORKLOAD" --profile "$profile" \
+    --anchor-ms "$extra_anchor" --steps "$steps" --no-in-process-row --tenant "$RAVEL_TENANT" \
+    --max-ingest-secs "$max_ingest_secs" --readback-timeout-secs "$readback_timeout_secs" \
+    --ravel-endpoint "${RAVEL_BASE}/api/v1/write" --ravel-tenant "$RAVEL_TENANT" \
+    --ravel-query-url "$RAVEL_BASE" --ravel-bearer-token-env "$RAVEL_TOKEN_ENV" \
+    >"${dir}/ingest.json" 2>"${dir}/ingest.log" || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${dir}/ingest.log"
+    stamp_str stage1.extra_hour_ingest "failed: metricsbench_ingest exited $code"
+    fail_step stage1-extra-hour-ingest "metricsbench_ingest exited $code; see ${dir}/ingest.log"
+  fi
+  STAGE1_LAST_INGEST_HOUR=$(($(date -u +%s) / 3600))
+  stamp_set stage1.extra_hour_ingest "{\"report\": \"stage1-extra-hour/ingest.json\", \"system\": \"ravel\", \"anchor_ms\": ${extra_anchor}, \"steps\": ${steps}, \"waited_until\": ${target}, \"ingest_end_hour\": ${STAGE1_LAST_INGEST_HOUR}, \"method\": \"metricsbench_ingest --no-in-process-row with --ravel-endpoint only, the profile's next hour on its scrape grid (anchor_ms + duration_secs)\"}"
+  step_done stage1-extra-hour-ingest
+  stage1_stop stage1-extra-hour-fold-off
+  stage1_head_fetch stage1-extra-hour-fold-off head-saved
+  off_head="$STAGE1_HEAD_SHA"
+  stage1_catalog_fold stage1-extra-hour-fold-off stage1.extra_hour_fold_off stage1-fold stage1-extra-hour-fold-off \
+    --signal metrics --writers-stopped
+  bucket="$(stage1_bucket)"
+  stage1_s3 stage1-extra-hour-fold-on "${out_dir}/stage1-extra-hour-fold-on.restore.log" \
+    s3 cp --recursive /stage1-s3/head-saved/t/ "s3://${bucket}/t/" --only-show-errors
+  stage1_head_fetch stage1-extra-hour-fold-on head-restored
+  on_head="$STAGE1_HEAD_SHA"
+  if [ "$on_head" != "$off_head" ]; then
+    stamp_str stage1.extra_hour "refused: the restored HEAD reads back as sha256 ${on_head}, the saved one is ${off_head}"
+    fail_step stage1-extra-hour-fold-on "the restored HEAD reads back as sha256 ${on_head}, not the saved ${off_head}"
+  fi
+  rm -rf "${out_dir}/stage1-s3"
+  stage1_catalog_fold stage1-extra-hour-fold-on stage1.extra_hour_fold_on stage1-fold stage1-extra-hour-fold-on \
+    --signal metrics --writers-stopped --key-index-leaves --metrics-label-index
+  stage1_inspect stage1-extra-hour stage1-extra-hour.inspect.txt
+  stage1_list stage1-extra-hour stage1-extra-hour.objects.jsonl
+  off_ms="$(py get "$STAMPS" stage1.extra_hour_fold_off.wall_ms)" || fail_step stage1-extra-hour "stage1.extra_hour_fold_off.wall_ms could not be read"
+  on_ms="$(py get "$STAMPS" stage1.extra_hour_fold_on.wall_ms)" || fail_step stage1-extra-hour "stage1.extra_hour_fold_on.wall_ms could not be read"
+  code=0
+  line="$(py stage1-extra-hour "${out_dir}/stage1-extra-hour-fold-off.json" "${out_dir}/stage1-extra-hour-fold-on.json" \
+    "$off_ms" "$on_ms" "$off_head" "$on_head" "${out_dir}/stage1-extra-hour.inspect.txt" \
+    "${out_dir}/stage1-extra-hour.objects.jsonl")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str stage1.extra_hour "failed: ${line:-stage1-extra-hour exited $code}"
+    fail_step stage1-extra-hour "${line:-stage1-extra-hour exited $code}"
+  fi
+  stamp_set stage1.extra_hour "$line"
+  stage1_recreate stage1-extra-hour stage1.extra_hour_restart "$STAGE1_ROUTED_FLAGS"
+  step_done stage1-extra-hour
+}
+
+# stage1_l1_step: ADR-3694 row 6. Once the last ingest hour is sealed,
+# ravel-server stopped, `maintain compact-tenant` compacts the tenant's
+# sealed metrics hours to L1, a --writers-stopped fold with the label index
+# publishes them, the listing stamps the L0 and L1 objects, and the corpus
+# runs routed as stage1-l1; <out>/stage1-l1-compare.json compares its hashes
+# with stage1-routed's.
+stage1_l1_step() {
+  local code=0 t0 t1 line
+  local cmd="ravel-cli maintain compact-tenant --tenant ${RAVEL_TENANT} --signal metrics --shards ${RAVEL_SHARDS} --max-flush-lifetime 0s"
+  stage1_wait_until stage1-l1-compact $(((STAGE1_LAST_INGEST_HOUR + 1) * 3600 + 360)) \
+    "compaction takes only hours sealed past the 5 minute clock-skew allowance"
+  stage1_stop stage1-l1-compact
+  t0="$(now_ms)"
+  RAVEL_IMAGE="$ravel_image" compose run --rm --no-deps -T ravel-qualify \
+    --store s3 --tenant-hash-unkeyed maintain compact-tenant \
+    --tenant "$RAVEL_TENANT" --signal metrics --shards "$RAVEL_SHARDS" --max-flush-lifetime 0s \
+    >"${out_dir}/stage1-l1-compact.txt" 2>"${out_dir}/stage1-l1-compact.log" || code=$?
+  t1="$(now_ms)"
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/stage1-l1-compact.log"
+    stamp_str stage1.l1_compact "failed: ${cmd} exited $code"
+    fail_step stage1-l1-compact "${cmd} exited $code; see ${out_dir}/stage1-l1-compact.log"
+  fi
+  code=0
+  line="$(py stage1-compact "${out_dir}/stage1-l1-compact.txt" "$((t1 - t0))" "$cmd")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str stage1.l1_compact "failed: $line"
+    fail_step stage1-l1-compact "$line"
+  fi
+  stamp_set stage1.l1_compact "$line"
+  step_done stage1-l1-compact
+  stage1_catalog_fold stage1-l1-fold stage1.l1_fold stage1-fold stage1-l1-fold \
+    --signal metrics --writers-stopped --key-index-leaves --metrics-label-index
+  stage1_recreate stage1-l1 stage1.l1_restart "$STAGE1_ROUTED_FLAGS"
+  stage1_list stage1-l1 stage1-l1.objects.jsonl
+  code=0
+  line="$(py stage1-l1 "${out_dir}/stage1-l1.objects.jsonl")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str stage1.l1_objects "failed: $line"
+    fail_step stage1-l1 "$line"
+  fi
+  stamp_set stage1.l1_objects "$line"
+  stage1_pass l1
+  stage1_note stage1.l1_compare stage1-hash-compare "${out_dir}/stage1-routed/diagnostics.json" \
+    "${out_dir}/stage1-l1/diagnostics.json" "${out_dir}/stage1-l1-compare.json" routed l1
+}
+
+# stage1_erasure_step: ADR-3694 row 8, last, since it removes a subject's
+# series from the tenant. A reference pass runs the corpus with every
+# selector excluding the subject; the erasure is submitted; the pending pass
+# runs the corpus as written and must answer as the reference with no
+# label-index prune; a one-off `ravel-server --mode maintain` container runs
+# the rewrite until `erase status` says COMPLETED; a fold and an inspect then
+# show whether any leaf from before the erasure is still referenced over a
+# rewritten hour.
+stage1_erasure_step() {
+  local code=0 line request_id key_file i state=""
+  local matcher="${STAGE1_ERASURE_LABEL}=${STAGE1_ERASURE_VALUE}" name="metricsbench-stage1-maintain"
+  local corpus="${out_dir}/stage1-erasure-reference.corpus.json" status_file="${out_dir}/stage1-erasure-status.txt"
+  line="$(py stage1-erasure-corpus "$CORPUS" "$corpus" "$STAGE1_ERASURE_LABEL" "$STAGE1_ERASURE_VALUE")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str stage1.erasure_corpus "failed: $line"
+    fail_step stage1-erasure-reference "$line"
+  fi
+  stamp_set stage1.erasure_corpus "$line"
+  STAGE1_PASS_CORPUS="$corpus" stage1_pass erasure_reference
+  stage1_note stage1.erasure_subject stage1-hash-compare "${out_dir}/stage1-routed/diagnostics.json" \
+    "${out_dir}/stage1-erasure-reference/diagnostics.json" "${out_dir}/stage1-erasure-subject.json" \
+    routed erasure_reference
+  request_id="$(python3 -I -c 'import uuid; print(uuid.uuid4())')"
+  code=0
+  RAVEL_IMAGE="$ravel_image" compose run --rm --no-deps -T ravel-qualify \
+    --store s3 --tenant-hash-unkeyed erase submit --tenant "$RAVEL_TENANT" --signal metrics \
+    --matcher "$matcher" --request-id "$request_id" --reason "metricsbench stage1 erasure arm" \
+    >"${out_dir}/stage1-erasure-submit.txt" 2>"${out_dir}/stage1-erasure-submit.log" || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/stage1-erasure-submit.log"
+    stamp_str stage1.erasure_submit "failed: ravel-cli erase submit --matcher ${matcher} exited $code"
+    fail_step stage1-erasure-submit "ravel-cli erase submit --matcher ${matcher} exited $code"
+  fi
+  stamp_set stage1.erasure_submit "{\"request_id\": \"${request_id}\", \"signal\": \"metrics\", \"matcher\": \"${STAGE1_ERASURE_LABEL}=\\\"${STAGE1_ERASURE_VALUE}\\\"\", \"submitted_at\": \"$(utc_now)\", \"file\": \"stage1-erasure-submit.txt\"}"
+  step_done stage1-erasure-submit
+  stage1_pass erasure_pending
+  stage1_note stage1.erasure_compare stage1-hash-compare "${out_dir}/stage1-erasure-reference/diagnostics.json" \
+    "${out_dir}/stage1-erasure-pending/diagnostics.json" "${out_dir}/stage1-erasure-compare.json" \
+    erasure_reference erasure_pending
+
+  key_file="${out_dir}/stage1-maintain.key"
+  (umask 077 && python3 -I -c 'import secrets; print(secrets.token_hex(32))' >"$key_file") ||
+    fail_step stage1-erasure-rewrite "cannot write the maintain record key"
+  code=0
+  compose run -d --no-deps --name "$name" --entrypoint /usr/local/bin/ravel-server \
+    -v "${key_file}:/maintain.key:ro" ravel-server \
+    --mode maintain --store s3 --tenant-hash-unkeyed --shards "$RAVEL_SHARDS" \
+    --max-ingest-lag "$RAVEL_MAX_INGEST_LAG" --maintain-tenant "$RAVEL_TENANT" \
+    --maintain-key-file /maintain.key --maintain-interval-secs 10 --disable-fold \
+    >"${out_dir}/stage1-erasure-maintain.log" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    rm -f "$key_file"
+    show_log "${out_dir}/stage1-erasure-maintain.log"
+    stamp_str stage1.erasure_rewrite "failed: the maintain container did not start (docker compose run -d exited $code)"
+    fail_step stage1-erasure-rewrite "docker compose run -d ... ravel-server --mode maintain exited $code"
+  fi
+  for ((i = 1; i <= ERASURE_TRIES; i++)); do
+    code=0
+    RAVEL_IMAGE="$ravel_image" compose run --rm --no-deps -T ravel-qualify \
+      --store s3 --tenant-hash-unkeyed erase status --tenant "$RAVEL_TENANT" --signal metrics \
+      --request-id "$request_id" >"$status_file" 2>"${out_dir}/stage1-erasure-status.log" || code=$?
+    if [ "$code" -eq 0 ] && grep -q "^${request_id}: COMPLETED" "$status_file"; then
+      state=COMPLETED
+      break
+    fi
+    "$SLEEP" "$ERASURE_INTERVAL"
+  done
+  "$DOCKER" logs "$name" >"${out_dir}/stage1-erasure-maintain.log" 2>&1 || true
+  "$DOCKER" rm -f "$name" >>"${out_dir}/stage1-erasure-maintain.rm.log" 2>&1 || true
+  rm -f "$key_file"
+  if [ "$state" != COMPLETED ]; then
+    stamp_str stage1.erasure_rewrite "failed: erase status did not say COMPLETED after ${ERASURE_TRIES} tries ${ERASURE_INTERVAL}s apart"
+    fail_step stage1-erasure-rewrite "erasure ${request_id} not COMPLETED after ${ERASURE_TRIES} tries ${ERASURE_INTERVAL}s apart; see ${status_file}"
+  fi
+  code=0
+  line="$(py stage1-erasure-status "$status_file" "$request_id")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str stage1.erasure_rewrite "failed: ${line:-stage1-erasure-status exited $code}"
+    fail_step stage1-erasure-rewrite "${line:-stage1-erasure-status exited $code}"
+  fi
+  stamp_set stage1.erasure_rewrite "$line"
+  stamp_str stage1.erasure_rewrite.path "a one-off ravel-server --mode maintain container (${name}, --maintain-tenant ${RAVEL_TENANT} --disable-fold), removed once erase status said COMPLETED"
+  step_done stage1-erasure-rewrite
+  stage1_stop stage1-erasure-fold
+  stage1_catalog_fold stage1-erasure-fold stage1.erasure_fold stage1-fold stage1-erasure-fold \
+    --signal metrics --writers-stopped --key-index-leaves --metrics-label-index
+  stage1_catalog_state erasure
+  code=0
+  line="$(py stage1-erasure-leaves "${out_dir}/stage1-erasure-reference.inspect.txt" \
+    "${out_dir}/stage1-erasure.inspect.txt" "$STAMPS")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str stage1.erasure_leaves "failed: $line"
+    fail_step stage1-erasure "$line"
+  fi
+  stamp_set stage1.erasure_leaves "$line"
+  stamp_str stage1.erasure_sweep "not checked: the erasure's physical sweep waits out the protection horizon, which is longer than a run"
+  step_done stage1-erasure
+}
+
 # stage1_steps: after readback-folded, the Stage 1 steps in their order.
 stage1_steps() {
-  local k
+  local k arm
   if [ "$INGEST_FAILED" -eq 1 ] || [ "$FOLDED_RAN" -eq 0 ]; then
     local why="the ingest verification failed, so the run is a diagnostic already"
     [ "$INGEST_FAILED" -eq 1 ] || why="the folded steps were skipped: ${FOLDED_SKIPPED}"
     for k in $STAGE1_KEYS; do
       stamp_str "stage1.${k}" "skipped: $why"
+    done
+    for arm in $STAGE1_ARMS; do
+      if stage1_arm_on "$arm"; then
+        for k in $(stage1_arm_keys "$arm"); do
+          stamp_str "stage1.${k}" "skipped: $why"
+        done
+      fi
     done
     say "stage1 steps skipped: $why"
     return 0
@@ -2726,6 +3659,9 @@ stage1_steps() {
   stage1_catalog_fold stage1-fold stage1.fold stage1-fold stage1-fold --signal metrics
   stage1_recreate stage1-unrouted stage1.unrouted_restart "$STAGE1_UNROUTED_FLAGS"
   stage1_pass unrouted
+  # The arms that change the tenant (a new hour, L1 rewrites, an erasure) run
+  # after every pass that reads the original snapshot.
+  [ "$arm_control" -eq 0 ] || stage1_control_step
   stage1_catalog_fold stage1-leaves stage1.leaves stage1-leaves stage1-leaves \
     --rebuild-key-index --signal metrics --metrics-label-index
   stage1_recreate stage1-restart stage1.restart "$STAGE1_ROUTED_FLAGS"
@@ -2733,6 +3669,10 @@ stage1_steps() {
   stage1_pass routed
   stage1_compare
   stage1_holders_step
+  STAGE1_LAST_INGEST_HOUR="$INGEST_END_HOUR"
+  [ "$arm_extra_hour" -eq 0 ] || stage1_extra_hour_step
+  [ "$arm_l1" -eq 0 ] || stage1_l1_step
+  [ "$arm_erasure" -eq 0 ] || stage1_erasure_step
 }
 
 run_diagnostic() {

@@ -8,6 +8,10 @@
 # file, the measured run against STAGE1_BANDS (MB_STAGE1_BANDS at launch, a
 # path in the source tree), which a profile other than ci must set. The
 # check's output is uploaded beside the run's as stage1-check.txt.
+# STAGE1_ARMS, CONTROL_IMAGE and CONTROL_SOURCE_COMMIT reach the measured run
+# alone, as MB_STAGE1_ARMS, MB_CONTROL_IMAGE and MB_CONTROL_SOURCE_COMMIT: the
+# arms wait for hours to pass or seal, which the ci smoke has no use for. The
+# control image is pulled beside the main one.
 # Exit codes beyond each step's own: 21 STAGE1=1 with no band file for the
 # measured profile (before anything is built), 22 the ci smoke's band check
 # failed, 23 the measured run exited 0 and its band check failed.
@@ -76,6 +80,9 @@ CARGO_INCREMENTAL=0 cargo build --release --locked -p ravel-bench \
 status_line build 0
 stage "pull image"
 docker pull "$RAVEL_IMAGE" || finish 18
+if [ -n "${CONTROL_IMAGE:-}" ]; then
+  docker pull "$CONTROL_IMAGE" || finish 18
+fi
 
 store_args=()
 ci_args=()
@@ -126,7 +133,9 @@ live=$!
 stage "$PROFILE"
 status_line "${PROFILE}-start" 0
 code=0
-deploy/metricsbench/run.sh --profile "$PROFILE" --ravel-image "$RAVEL_IMAGE" --ravel-source-commit "$RAVEL_SOURCE_COMMIT" \
+MB_STAGE1_ARMS="${STAGE1_ARMS:-}" MB_CONTROL_IMAGE="${CONTROL_IMAGE:-}" \
+  MB_CONTROL_SOURCE_COMMIT="${CONTROL_SOURCE_COMMIT:-}" \
+  deploy/metricsbench/run.sh --profile "$PROFILE" --ravel-image "$RAVEL_IMAGE" --ravel-source-commit "$RAVEL_SOURCE_COMMIT" \
   --bin-dir target/release --out-dir /mb/out-run --anchor-ms "$ANCHOR_MS" \
   --rss-band "$RSS_BAND" --ravel-objects-band "$OBJECTS_BAND" ${store_args[@]+"${store_args[@]}"} || code=$?
 kill "$met" "$cpu" "$live"
