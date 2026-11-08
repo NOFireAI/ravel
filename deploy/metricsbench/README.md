@@ -1092,8 +1092,11 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    parts carrying a `label_value` key-index leaf ref, and those refs), all
    read from the HEAD object's own fields, with that source named. The pass
    is refused (exit 70 naming the step) when the text does not read as one
-   HEAD whose part list matches its `parts` line (case z14) or when any part
-   carries a `label_value` leaf (case z12). Then `metricsbench_query`
+   HEAD whose part list matches its `parts` line (case z14), when the stamp
+   is not written or its `label_value_leaf_parts` does not read back as a
+   whole number (cases z27a, z27c and z27e; the routed pass the same way,
+   cases z27b, z27d and z27f), or when any part carries a `label_value`
+   leaf (case z12). Then `metricsbench_query`
    against Prometheus and Ravel with the full corpus and
    `--passes`/`--reps`, `--pass-label folded-unrouted` and `--fold-state
    "folded: watermark_hour=W; parts=P; label_value leaf parts=L;
@@ -1133,9 +1136,14 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    folded-routed`, into `stage1-routed/`, and `stage1.routed_cold_records`.
 6. The two steady passes are compared into `stage1-compare.json`, stamped as
    `stage1.compare`: per corpus entry the set of `result_hash` values each
-   pass's records carry, `entries_compared`, `entries_equal`,
-   `entries_differing_count` with the differing entries and their hashes,
-   and `entries_without_hash_count` with those entries. ADR-3694 row 9 is
+   pass's records carry, `entries_compared`, `entries_equal` (both passes
+   carry the same single hash), `entries_multi_hash_count` with the entries
+   whose two passes carry the same set of two or more hashes and those
+   hashes (the passes agree, but a pass did not repeat its own answer;
+   counted apart from a routing difference, case z2b),
+   `entries_differing_count` with the entries whose two hash sets differ
+   and both sets (case z2), and `entries_without_hash_count` with those
+   entries. ADR-3694 row 9 is
    checked by status (`status_check` states the rule): per entry the set of
    `status` values each pass's records carry is compared, and
    `statements_status_differing` lists each entry whose two sets differ,

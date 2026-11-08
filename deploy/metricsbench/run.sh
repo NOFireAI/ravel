@@ -179,7 +179,9 @@
 #               stamped as stage1.unrouted_catalog: the HEAD's watermark_hour,
 #               its part count and the parts carrying a label_value key-index
 #               leaf ref, with the source named; the step is refused when that
-#               text cannot be read or any part carries such a leaf. Then
+#               text cannot be read, the stamp cannot be written or its
+#               leaf part count read back as a whole number, or any part
+#               carries such a leaf. Then
 #               metricsbench_query against Prometheus and Ravel with the full
 #               corpus and --passes/--reps, --pass-label folded-unrouted and a
 #               fold_state naming those figures and the server flags, into
@@ -206,7 +208,9 @@
 #               then the passes as stage1-unrouted, --pass-label
 #               folded-routed, into <out>/stage1-routed/. Then
 #               <out>/stage1-compare.json: per entry, the steady passes'
-#               result_hash sets compared and status sets compared (ADR-3694
+#               result_hash sets compared (an entry whose two passes carry
+#               the same set of two or more hashes counted as multi-hash, not
+#               as differing) and status sets compared (ADR-3694
 #               row 9: the entries whose set of statuses differs between the
 #               passes), and per pass the records with a status other than ok
 #               or incorrect, the ok or incorrect records with a null
@@ -1125,8 +1129,10 @@ elif op in ("stage1-fold", "stage1-leaves"):
 elif op == "stage1-compare":
     # The two passes' diagnostics files and the output path. Per entry, the
     # set of result_hash values each pass's records carry; equal when both are
-    # present and the same. Prints the summary; exit 3 and why on stdout when
-    # a diagnostics file cannot be read.
+    # present and the same single hash, multi-hash when both are the same set
+    # of two or more (the passes agree, but a pass did not repeat its own
+    # answer), differing when the sets differ. Prints the summary; exit 3 and
+    # why on stdout when a diagnostics file cannot be read.
     unrouted_path, routed_path, out_path = args
     def records(path):
         doc = load(path)
@@ -1147,13 +1153,15 @@ elif op == "stage1-compare":
                 by[r["entry"]].add(r["result_hash"])
         return by
     u, r = hashes(unrouted), hashes(routed)
-    equal, differing, without = [], [], []
+    equal, multi, differing, without = [], [], [], []
     for entry in sorted(set(u) | set(r), key=str):
         a, b = u.get(entry, set()), r.get(entry, set())
         if not a or not b:
             without.append(entry)
         elif a == b and len(a) == 1:
             equal.append(entry)
+        elif a == b:
+            multi.append({"entry": entry, "hashes": sorted(a)})
         else:
             differing.append({"entry": entry, "unrouted": sorted(a), "routed": sorted(b)})
     def pruned(rec):
@@ -1185,10 +1193,11 @@ elif op == "stage1-compare":
                 "records_label_index_null": sum(1 for v in figures if v is None),
                 "records_pruned_by_label_index": sum(1 for v in figures if v is not None and v > 0),
                 "segments_pruned_by_label_index": sum(v for v in figures if v is not None)}
-    doc = {"schema": "metricsbench-stage1-compare/3",
+    doc = {"schema": "metricsbench-stage1-compare/4",
            "unrouted": os.path.basename(os.path.dirname(unrouted_path)) + "/" + os.path.basename(unrouted_path),
            "routed": os.path.basename(os.path.dirname(routed_path)) + "/" + os.path.basename(routed_path),
-           "entries_compared": len(equal) + len(differing), "entries_equal": len(equal),
+           "entries_compared": len(equal) + len(multi) + len(differing), "entries_equal": len(equal),
+           "entries_multi_hash_count": len(multi), "entries_multi_hash": multi,
            "entries_differing_count": len(differing), "entries_differing": differing,
            "entries_without_hash_count": len(without), "entries_without_hash": without,
            "status_check": "per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9); records_status_unexpected counts records whose status is neither ok nor incorrect; records_answered_null_hash counts ok or incorrect records with no result_hash",
@@ -1196,7 +1205,8 @@ elif op == "stage1-compare":
            "statements_status_differing": status_differing,
            "passes": {"unrouted": tally(unrouted), "routed": tally(routed)}}
     dump(out_path, doc)
-    print(json.dumps({**doc, "entries_differing": [d["entry"] for d in differing],
+    print(json.dumps({**doc, "entries_multi_hash": [d["entry"] for d in multi],
+                      "entries_differing": [d["entry"] for d in differing],
                       "statements_status_differing": [d["entry"] for d in status_differing]}))
 elif op == "stage1-inspect":
     # `catalog inspect --signal metrics` text, its file name for the stamp,
@@ -2433,7 +2443,8 @@ stage1_recreate() {
 # stage1_catalog_state unrouted|routed: the snapshot the pass is about to
 # read, from ravel-cli catalog inspect on ravel-qualify, stamped as
 # stage1.WHICH_catalog. The pass is refused (its step fails) when the text
-# cannot be read, when the unrouted pass would run with any part carrying a
+# cannot be read, when the stamp cannot be written or its
+# label_value_leaf_parts read back as a whole number, when the unrouted pass would run with any part carrying a
 # label_value leaf, or when the routed pass would run with fewer such parts
 # than stage1-leaves reported rebuilt (parts_rebuilt).
 stage1_catalog_state() {
@@ -2455,8 +2466,22 @@ stage1_catalog_state() {
     stamp_str "$key" "failed: ${line:-stage1-inspect exited $code}"
     fail_step "$step" "refused: the snapshot state could not be read: ${line:-stage1-inspect exited $code}"
   fi
-  stamp_set "$key" "$line"
-  STAGE1_LEAF_PARTS="$(py get "$STAMPS" "${key}.label_value_leaf_parts")"
+  code=0
+  stamp_set "$key" "$line" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str "stage1.${which}" "refused: ${key} could not be stamped (py set exited ${code})"
+    fail_step "$step" "refused: the snapshot state could not be stamped as ${key} (py set exited ${code})"
+  fi
+  code=0
+  STAGE1_LEAF_PARTS="$(py get "$STAMPS" "${key}.label_value_leaf_parts")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str "stage1.${which}" "refused: ${key}.label_value_leaf_parts could not be read (py get exited ${code})"
+    fail_step "$step" "refused: ${key}.label_value_leaf_parts could not be read (py get exited ${code}), so the ${which} pass's snapshot cannot be checked"
+  fi
+  if ! [[ "$STAGE1_LEAF_PARTS" =~ ^[0-9]+$ ]]; then
+    stamp_str "stage1.${which}" "refused: ${key}.label_value_leaf_parts is '${STAGE1_LEAF_PARTS}', not a whole number"
+    fail_step "$step" "refused: ${key}.label_value_leaf_parts is '${STAGE1_LEAF_PARTS}', not a whole number, so the ${which} pass's snapshot cannot be checked"
+  fi
   STAGE1_WATERMARK="$(py get "$STAMPS" "${key}.watermark_hour")"
   STAGE1_PARTS="$(py get "$STAMPS" "${key}.parts")"
   if [ "$which" = unrouted ]; then
