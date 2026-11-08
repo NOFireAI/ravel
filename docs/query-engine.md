@@ -1158,7 +1158,8 @@ Before any metrics segment is opened, `prefetch_metric_plans` takes the
 snapshot's catalog parts (`SnapshotParts`, ADR-3692 decision 1) from the same
 resolve as the snapshot and routes each distinct positive equality value `v`
 of the statement (a `k="v"` matcher with a non-empty `v`, `__name__`
-included) through the tier-2 router, `key_index_route::route`, as its own
+included) through the tier-2 router (`key_index_route::route_values`, one
+routing pass per value) as its own
 one-key set: field `label_value`, key type `Str`, `key8(v)` (the ADR's
 per-value routing amendment). A part whose metrics leaf answers "absent"
 proves that no object in it holds the string `v`, so no series in it carries
@@ -1193,7 +1194,8 @@ proves that no object in it holds the string `v`, so no series in it carries
   still resolved, since the check reads them.
 - Each value is one routing pass under the router's unchanged `L_max`,
   `P_max` and `B_run` admission, so leaf GETs grow with the number of
-  distinct values. The passes run at most `promql_fetch_fanout` at a time. A
+  distinct values: `KEY_INDEX_LEAF_GET_CEILING` bounds one pass, and a
+  statement with n distinct values can issue n times it. The passes run at most `promql_fetch_fanout` at a time. A
   leaf that names another tenant or signal fails the statement; any other
   leaf failure leaves its part `Uncovered`.
 - The leaf GETs count against `max_s3_requests` and `max_bytes_scanned`.
@@ -1213,6 +1215,33 @@ GETs to `ravel_query_key_index_parts_total` and
 metrics leaf in the snapshot, `segmentsPrunedByLabelIndex` and the
 `keyIndex` figures are zero
 (`without_the_switch_the_route_does_not_run`).
+
+`labelIndexValues`, beside it, lists the passes: one object per distinct
+routed value, in the order they were issued (the values' byte order). The
+field is absent when the route did not run
+(`a_route_that_did_not_run_reports_no_value`). A value is identified by
+`valueKey8`, its `key8` (the first 8 bytes of the value's unkeyed blake3,
+what the leaf indexes) as 16 lowercase hex digits; the value itself is never
+in the stats. Each object carries:
+
+- `labels`: the label names of the positive equalities carrying the value,
+  sorted. One pass serves every label with the same value.
+- `leafGetRequests` and `leafWireBytes`: the pass's leaf GETs and their wire
+  bytes as transferred, counted like the phase figures: a GET the store
+  retried counts once with the bytes of its successful read only, and a
+  range read counts the bytes it returned. The `leafGetRequests` of all
+  entries sum to the `keyIndex` phase's GETs
+  (`each_routed_value_reports_its_own_pass_and_what_it_alone_pruned`).
+- `leafCacheHits`: leaf reads the read cache served with no GET
+  (`a_passes_leaf_cache_hits_reach_its_figures`). A read handed another
+  caller's in-flight GET counts neither here nor in `leafGetRequests`.
+- `partsCovered`, `partsUncovered`, `partsBeyondCeiling`, `leavesRejected`,
+  `reservationsRefused` and `skippedByBudget`: the pass's part outcomes,
+  the figures `ravel_query_key_index_parts_total` adds up.
+- `segmentsPruned`: the segments the pass routed `Pruned`.
+- `segmentsPrunedAlone`: of those, the segments no other value of a plan
+  holding this value routed `Pruned`, so what this value removed that the
+  plan's other values would not have.
 
 ### The L0 page-range bound (ADR-1306)
 
