@@ -1810,7 +1810,10 @@ use 0 to 300 on one box (measured 2026-10-31, n = 13).
 <!-- amendment-applies: sections="4. Entries are charged to the shared memory budget and give way to queries|Amendment (2026-10-31): each cached string column keeps a zero-copy Arrow values array" pointer="view memo amendment" -->
 <!-- amendment-supersedes: phrase="Its memory is not sized" pointer="view memo amendment" -->
 
-Status: Accepted (2026-11-07). Not yet implemented; the pull requests below carry it.
+Status: Accepted (2026-11-07); dropped (2026-11-08). Pull request 1 (the view budget in the
+decoded cache) landed and has no caller. Pull request 2 landed and was reverted after pull request
+3's paired run missed, so the view memo design below is not in the tree; see the 2026-11-08 note
+"view memo dropped" at the end of this amendment.
 
 This takes the "A view memo for GROUP BY" item of the zero-copy values amendment's out-of-scope
 list.
