@@ -1161,7 +1161,7 @@ it:
 |---|---|---|
 | `--maintain-scratch-dir` | unset | The directory the level-1 runs are written under. Without it, a bucket whose cursor merge would decode more than 16 rows per input record and more than 10 million rows in all is refused and counted under `ravel_maintain_compaction_refused_total{reason="geometry"}`. |
 | `--maintain-scratch-max-bytes` | unset | A cap on the bytes the directory may hold. A unit is admitted against the smaller of the volume's free bytes and this cap less the bytes already under the directory. A running unit whose next run write would take the directory past the cap stops before that write and is refused under `reason="scratch_headroom"`. Without it, the volume's free bytes alone decide. |
-| `--maintain-level1-workers` | derived | How many level-1 groups of one bucket merge at once, each under its share of the unit's memory ceiling. Without it, the count is derived per bucket from the unit's share of the usable cores and the largest count whose groups still fit. |
+| `--maintain-level1-workers` | derived | How many level-1 groups of one bucket merge at once, each under its share of the unit's memory ceiling. Without it, the count is derived per bucket from the unit's share of the usable cores, the usable cores divided by `--maintain-unit-concurrency` and at least 1, and the largest count whose groups still fit. |
 
 The scratch directory is a cache, not storage:
 
