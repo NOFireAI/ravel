@@ -492,6 +492,7 @@ pub(crate) fn spill_enabled_config(dir: &Path) -> SqlConfig {
         spill: Some(SpillConfig {
             dir: dir.to_path_buf(),
             max_bytes: 64 * 1024 * 1024,
+            merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
         }),
         ..SqlConfig::default()
     }
