@@ -1126,9 +1126,9 @@ the GitHub Container Registry on every `vX.Y.Z` release tag, for
 an SBOM and build provenance.
 
 ```sh
-docker pull ghcr.io/nofireai/ravel-server:0.31.0
-docker pull ghcr.io/nofireai/ravel-operator:0.31.0
-docker pull ghcr.io/nofireai/ravel-ingest-router:0.31.0
+docker pull ghcr.io/nofireai/ravel-server:0.31.1
+docker pull ghcr.io/nofireai/ravel-operator:0.31.1
+docker pull ghcr.io/nofireai/ravel-ingest-router:0.31.1
 ```
 
 | Tag | Moves? |
@@ -1137,7 +1137,7 @@ docker pull ghcr.io/nofireai/ravel-ingest-router:0.31.0
 | `X.Y`, `X`, `latest` | Yes, to the newest matching release. |
 | `@sha256:...` digest | Never. Pin by digest when you need an immutable reference. |
 
-The quickstart pins `ghcr.io/nofireai/ravel-server:0.31.0`; set `RAVEL_IMAGE`
+The quickstart pins `ghcr.io/nofireai/ravel-server:0.31.1`; set `RAVEL_IMAGE`
 to override it.
 
 ### Verifying signatures
@@ -1149,12 +1149,12 @@ no pre-shared key:
 
 ```sh
 cosign verify \
-  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.31.0' \
+  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.31.1' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  ghcr.io/nofireai/ravel-server:0.31.0
+  ghcr.io/nofireai/ravel-server:0.31.1
 ```
 
-Replace `v0.31.0` and `0.31.0` with the release you verify. The tag in
+Replace `v0.31.1` and `0.31.1` with the release you verify. The tag in
 `--certificate-identity` must be the exact tag that produced the image.
 
 ## Background

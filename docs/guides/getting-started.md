@@ -24,7 +24,7 @@ The stack runs these services, all from published images:
 | Service | Address | What it does |
 |---|---|---|
 | RustFS | `127.0.0.1:9000` (S3 API), `127.0.0.1:9001` (console) | Object storage, with the `ravel-dev` bucket |
-| `ravel-server` 0.31.0 | `127.0.0.1:4318` (HTTP), `127.0.0.1:4317` (gRPC) | Ravel, with token `demo-token` for tenant `demo-tenant` |
+| `ravel-server` 0.31.1 | `127.0.0.1:4318` (HTTP), `127.0.0.1:4317` (gRPC) | Ravel, with token `demo-token` for tenant `demo-tenant` |
 | OpenTelemetry Collector | `127.0.0.1:18888` (its own metrics) | Sends your host's CPU, load, memory, and network metrics, and its own logs |
 | Grafana | `127.0.0.1:3000` (`admin` / `admin`) | Dashboards, with the Ravel datasource set up |
 
