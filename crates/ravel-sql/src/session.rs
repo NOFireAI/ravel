@@ -584,10 +584,12 @@ impl SpillDecision<'_> {
     ///
     /// The scratch quota counts live spill-file bytes, and DataFusion's
     /// multi-level merge takes runs first in, first out and keeps a pass's
-    /// inputs on disk until the pass ends, so at [`SPILL_MERGE_FAN_IN`] 2 the
-    /// live peak is the spilled bytes `S` plus the largest pass output: at
-    /// most about 1.67 times `S` for any number of equal runs, and below 2
-    /// times `S` when the last run is smaller. Compression shrinks `S`, which
+    /// inputs on disk until the pass ends, so at the default fan-in of 2
+    /// ([`crate::DEFAULT_SPILL_MERGE_FAN_IN`]) the live peak is the spilled
+    /// bytes `S` plus the largest pass output: at most about 1.67 times `S`
+    /// for any number of equal runs, and below 2 times `S` when the last run
+    /// is smaller. Those bounds hold at fan-in 2; another configured fan-in
+    /// has its own. Compression shrinks `S`, which
     /// that bound multiplies. lz4_frame rather than zstd: it costs less CPU on
     /// a 2-vCPU host, and a spill file is written and read once per merge
     /// pass, so the cheaper codec is paid on every pass. Arrow IPC writes a
