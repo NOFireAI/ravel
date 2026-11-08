@@ -199,7 +199,12 @@ A `GROUP BY ... LIMIT n` with no `ORDER BY` and at least one aggregate feeds
 its final aggregate only the rows of the first `n` groups each partition
 sees (for `n` up to 1024 by default), so its memory follows `n` rather than
 the number of groups, and every group it returns is aggregated over all of
-its rows (see the [query engine](docs/query-engine.md)).
+its rows (see the [query engine](docs/query-engine.md)). A `GROUP BY ...
+ORDER BY <group key> LIMIT n` over integer keys and counts or integer sums
+cuts its final aggregate back to its best `n` groups whenever a partition
+reaches `2n` (for `n` up to 1024 by default), and every group it returns
+carries the same aggregates as under the plan that builds every group (see
+the [query engine](docs/query-engine.md)).
 
 A tenant can also query Parquet tables. These are Parquet files read in place,
 in an S3, GCS or Azure location that an operator granted the tenant with

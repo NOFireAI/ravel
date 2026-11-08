@@ -171,6 +171,7 @@ use crate::regexp_replace_udf::regexp_replace_udf;
 use crate::spans_provider::SpansTableProvider;
 use crate::sum::checked_sum_udaf;
 use crate::sum_plus;
+use crate::top_keys::TopKeysAggregateLimit;
 use crate::trace_id_planner::trace_id_hex_literal_planner;
 use crate::udf::{label_match_udf, label_udf};
 
@@ -949,6 +950,16 @@ pub fn build_session_with_tables(
     if config.bounded_groups_max_limit > 0 {
         builder = builder.with_physical_optimizer_rule(Arc::new(FirstGroupsLimit::new(
             config.bounded_groups_max_limit,
+        )));
+    }
+    // Issue #4004 (ADR-4002): replace the final aggregate under `GROUP BY ...
+    // ORDER BY <group key> LIMIT n` with one that keeps only its best `n`
+    // keys. After `FirstGroupsLimit`, whose exec it refuses to sit over, and
+    // before `BucketedFinalAggregateRule` and `CompactSlices`, which wrap the
+    // aggregate it replaces. 0 plans nothing.
+    if config.bounded_top_keys_max_limit > 0 {
+        builder = builder.with_physical_optimizer_rule(Arc::new(TopKeysAggregateLimit::new(
+            config.bounded_top_keys_max_limit,
         )));
     }
     // Issue #3608 (ADR-3565 decision 1): run a qualifying `FinalPartitioned`
