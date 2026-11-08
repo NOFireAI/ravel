@@ -1,5 +1,26 @@
 # Ingest
 
+Send metrics, logs and traces to Ravel over OTLP or Prometheus Remote Write,
+choose when a write counts as durable, read your own writes back, and import
+existing Parquet data with `ravel-cli load`.
+
+## Common tasks
+
+| Task | Section |
+|---|---|
+| Send OTLP metrics, logs or traces | [Endpoints](#endpoints), [Logs](#logs) |
+| Send Prometheus Remote Write | [Endpoints](#endpoints) |
+| Authenticate a writer | [Authentication](#authentication) |
+| Choose strict or buffered acknowledgement | [Strict vs. buffered acknowledgement](#strict-vs-buffered-acknowledgement) |
+| Read your own write | [Commit tokens and read-your-write](#commit-tokens-and-read-your-write) |
+| Understand a rejected point or record | [Partial success and rejections](#partial-success-and-rejections), [Log rejections](#log-rejections) |
+| Send delta-temporality metrics | [Delta temporality metrics](#delta-temporality-metrics) |
+| Fix points rejected for event-time skew | [Event-time skew bounds](#event-time-skew-bounds) |
+| Import a Parquet file | [Bulk import](#bulk-import-ravel-cli-load---parquet) |
+| Export stored records | [Bulk export](#bulk-export-ravel-cli-export) |
+
+To query spans after you send them, see the [traces guide](traces.md).
+
 ## Endpoints
 
 `ravel-server` accepts OTLP metrics, logs, and traces on two transports.
@@ -24,6 +45,13 @@ transport accepts profiles.
 
 Authentication, the acknowledgement mode header (strict or buffered), the
 commit-token header, and the status-code mapping are identical on all six.
+
+Prometheus Remote Write 1.0 and 2.0 arrive at `POST /api/v1/write` on the
+same HTTP listener, under `--mode all` and `--mode gateway`. It uses the same
+authentication, always acknowledges in strict mode and returns
+`x-ravel-commit-token` (see
+[Strict vs. buffered acknowledgement](#strict-vs-buffered-acknowledgement)).
+The [ingest design](../ingest.md#structure) describes the handler.
 
 ## Compressed requests
 
@@ -118,15 +146,11 @@ tenant `acme`. A deployment is unauthenticated only if you pass no
 `--tenant-token` and no `--tenant-token-file`.
 
 `--tenant-token-file PATH` (env `RAVEL_TENANT_TOKEN_FILE` for the path) reads
-the pairs from a file, so that a token does not sit in argv or a process
-listing:
-
-- The file holds one `TOKEN=TENANT` pair per line. Blank lines and `#`
-  comments are ignored.
-- Each line is split on the first `=`, like `--tenant-token`. A token value
-  that contains `=` is mis-parsed the same way by both.
-- `--tenant-token` and `--tenant-token-file` are mutually exclusive.
-  `ravel-server` refuses to start with both set.
+the pairs from a file, one per line, so that a token does not sit in argv or a
+process listing. It is mutually exclusive with `--tenant-token`. The
+[configuration guide](operations/configuration.md#token-file) gives the file
+format. A token value that contains `=` is mis-parsed the same way by both
+sources, because each splits on the first `=`.
 
 In either source the tenant may end in `;` and a comma-separated list of
 capability words (`ddl`, `ipcrypt`, `agents`, `agents_worker`,
@@ -288,9 +312,7 @@ Ravel reports these anyway. **Every OTLP surface emits a partial success
 whenever anything was rejected. It does not wait for a unit count above
 zero.** A drop of this kind comes back as `rejected_data_points = 0` (or
 `rejected_log_records = 0`, or `rejected_spans = 0`) together with a
-populated `error_message` that names it. The OTLP proto documents
-`error_message` as a channel for warnings on an otherwise successful
-response.
+populated `error_message` that names it.
 
 The transport decides whether the report reaches you:
 
@@ -541,9 +563,7 @@ close enough to ingest time for this to hold:
   sender that tries to make data invisible to normal query ranges.
 - More than 2 hours in the past (`TooOld`): rejected. If admitted, such a
   point can land in an ingest-hour bucket that a query has already finished
-  reading, and the reader never revisits it. For the same reason
-  [scripts/demo.sh](../../scripts/demo.sh) regenerates its OTLP fixture with
-  fresh timestamps on every run.
+  reading, and the reader never revisits it.
 
 Both bounds are inclusive. A skew or lag equal to the limit is accepted. One
 nanosecond past it is rejected.
@@ -718,8 +738,7 @@ server for both.
 
 To load an existing structured dataset offline (a Parquet export, an archive
 migration, a historical backfill), use `ravel-cli load`. It imports a
-Parquet file into the signal that `--signal` names. OTLP is the only
-*networked* way to write to Ravel.
+Parquet file into the signal that `--signal` names.
 
 ```sh
 ravel-cli load --parquet events.parquet --tenant acme --mapping map.toml --shards 4
@@ -813,7 +832,7 @@ OTLP produces.**
   RSPAN holds, by the rules of OTLP: an integer and a boolean verbatim, a
   float through the same Go-compatible formatter that the `le` label uses,
   bytes as lowercase hex.
-- The resource-over-span merge is `ravel_rspan::merge_attrs`.
+- The resource-over-span merge is the one the OTLP path uses.
 - The status column goes through the enum mapping of `ravel-otlp`. A value
   outside `0..=2` normalizes to unset here as it does there, including one
   too wide for `i64`.
@@ -1062,8 +1081,8 @@ number never produce two series.
 
 **A metric loaded here lands on the same `SeriesId` as the same metric
 admitted over OTLP.** A bulk import and a live OTLP feed of the same metric
-are therefore one series. The loader applies the OTLP name pipeline
-(`ravel_otlp::normalize`) in the same order:
+are therefore one series. The loader applies the OTLP name pipeline in
+the same order:
 
 1. The raw name is checked against the metric-name length cap.
 2. Every character outside the Prometheus metric-name set is rewritten to
@@ -1124,7 +1143,7 @@ label set and `ts`:
   `_sum` series, like an OTLP data point with no `sum` field.
 - The group explodes into `<name>_bucket` (one per bound plus `+Inf`),
   `<name>_sum` and `<name>_count`. These are the same series that the
-  `explode_histogram` of `ravel_otlp::normalize` produces.
+  OTLP path produces.
 
 Counts are whole numbers. A fractional `value`, `count` or bucket count is
 refused, not truncated. An integer column is read as an integer, so a count
@@ -1369,8 +1388,8 @@ Object count is a first-order query-cost variable. Every later query over
 the affected range pays the per-object cost (LIST, footer read, per-object
 decode setup).
 
-`--target-bytes 1 --batch-rows N` restores the layout every load had
-when `1` was the default target: each write flushes at once,
+`--target-bytes 1 --batch-rows N` gives one flush per write: each write
+flushes at once,
 one flush is one object per involved shard, and `--batch-rows` sets how
 many objects a load leaves behind. A 100M-row load at `--batch-rows 10000`
 is then on the order of 10000 flushes, each an object per shard. A larger
@@ -1450,7 +1469,7 @@ is decoded, on every signal, as the lowest of three bounds:
   host memory when the flag is unset) divided by the estimated object
   bytes of one batch (`--batch-rows` times the first batch's estimated
   bytes per row), and at least 1;
-- the cap, 1,024 (`MAX_DERIVED_PIPELINE_DEPTH`): a very small
+- the cap, 1,024: a very small
   `--batch-rows` would otherwise put more than a thousand writes in
   flight.
 
@@ -1496,18 +1515,16 @@ about depth x `--batch-rows` / `--shards` rows per shard.
 
 An explicit `--target-bytes` above `1` runs the depth flush as a derived
 target does; `--target-bytes 1` turns it off, since every write then
-flushes its own buffer. The measured recipe below was run while an
-explicit target kept the depth flush off. Three things changed for every
-load, an explicit target included: `--max-flush-delay` defaults to 60 s
-instead of the router's 2 s, the end-of-input flush runs once every submitted batch
-has reached its shard, and a failed load flushes its buffered writes
-before waiting on their acks. `--target-bytes 1` without
-`--pipeline-depth` still gets the derived depth, the plain rows bound
-without the quarter, not the earlier default of 4; add `--pipeline-depth
-4` for that too.
+flushes its own buffer. On every load, an explicit target included, the
+end-of-input flush runs once every submitted batch has reached its shard,
+and a failed load flushes its buffered writes before waiting on their
+acks. `--target-bytes 1` without `--pipeline-depth` gets the derived
+depth, the plain rows bound without the quarter; add `--pipeline-depth 4`
+for a depth of 4.
 
-`--max-flush-delay` defaults to 60s on every signal, so at the defaults
-the size trigger and the depth flush, not the age trigger, close objects.
+`--max-flush-delay` defaults to 60s on every signal of a load, not the
+router's 2 s, so at the defaults the size trigger and the depth flush, not
+the age trigger, close objects.
 A buffer that reaches neither the target nor a depth flush flushes on the
 age trigger, or at the end of the input. When two checks 250 ms apart both
 find a logs load's decoder waiting for room in `--load-memory-bytes` and
@@ -1596,25 +1613,21 @@ Each setting does a separate job, and dropping any one of them changes the
 outcome:
 
 - `--target-bytes 1850000000` stored 25.1 MB mean objects on this
-  corpus, 74 times below the target. The run predates the depth flush
-  for an explicit target, which these figures do not cover:
-  it wrote 408 objects (the mean
-  is over the 407 above 100 KB), split size 390, age 14, final 4 (the final drain, which the trigger mix
-  now counts under `manual`), so the
-  target is what closed almost all of them,
-  not the age trigger. At 1,650,000,000 the objects were about 22 MB
+  corpus, 74 times below the target. The run had no depth flush for an
+  explicit target, so these figures do not cover it: it wrote 408 objects
+  (the mean is over the 407 above 100 KB), split size 390, age 14, final 4
+  (the final drain, counted under `manual` in the trigger mix), so the
+  target is what closed almost all of them, not the age trigger. At 1,650,000,000 the objects were about 22 MB
   (median, 75 times below) and at 375,000,000 5.7 MB (66 times below).
   The ratio was measured at these three target values only; scaling
   `--target-bytes` above 1,850,000,000 for still larger objects was not
   measured.
 - `--max-flush-delay 30s` lets a buffer live long enough to fill. At 2s,
-  the earlier default, 798 of 916 objects closed on age and the median
-  object was
-  10.2 MB.
+  798 of 916 objects closed on age and the median object was 10.2 MB.
 - The ack deadline follows from the two flags above: 30 s of delay plus
   60 s of margin plus 18.5 s to encode a 1,850,000,000-byte object,
-  108.5 s in all. The run predates that rule and had a 90 s deadline;
-  set `--ack-margin` to change the margin.
+  108.5 s in all. The measured run had a 90 s deadline. Set
+  `--ack-margin` to change the margin.
 - `--pipeline-depth` sets the load time once objects are large, because
   each Strict write waits for its batch's flush. At a 1,650,000,000
   target with the other flags above, depth 16 took 1,990 s, depth 24
@@ -2105,26 +2118,15 @@ commit record's `ingest_hour_bucket` and its `created_unix_ns` both fall
 in that hour. The object store's observed clock, which a flush is checked
 against for skew, is shifted by the same offset. Two readings are not
 shifted: the decode admission skew check and the shard-count provisioning
-record both use the real `now_ns`. Everything that reads
-`ingest_hour_bucket` then treats the hour as real:
-
-- the commit key, built by `ravel_commit::keys::commit_key` (ravel-commit,
-  `keys` module);
-- the fold, which seals and partitions by it in
-  `Catalog::fold_with_seal_through` (ravel-catalog, `fold` module);
-- retention, which walks and seals buckets by it in
-  `ravel_maintain::retention::retention_sweep_bucket` (ravel-maintain,
-  `retention` module) through `ravel_maintain::bucket::Bucket`
-  (`bucket` module);
-- readers, which list it in `Catalog::resolve` through
-  `Catalog::window_hour_bounds` (ravel-catalog, `catalog` module).
+record both use the real `now_ns`. The commit key, the fold, retention and
+readers all key on `ingest_hour_bucket`, so they treat the hour as real.
 
 The lane's contract:
 
 - The synthetic hours are non-decreasing, and hour `start + i * stride`
   holds exactly batch `i`'s flushes: one flush per shard the batch
-  reaches, pinned by the tests at the tested batch sizes (2 and 8 rows
-  per batch); larger batches rely on the forced flush size below.
+  reaches. This is verified at batch sizes of 2 and 8 rows; larger
+  batches rely on the forced flush size below.
 - To make that hold, the lane forces `--pipeline-depth 1`, `--read-cursors
   1` and `--target-bytes 1` (`per_batch_target_bytes`), and refuses another
   value for any of them. Batch `i` is fully acked before the clock moves to
@@ -2145,8 +2147,8 @@ The lane's contract:
   whose largest event time is not before that bound fails the load
   (exit 1), naming the batch, the event time and the bound: readers would
   miss its rows (see the readers caveat below). The load command has no
-  `max_ingest_lag` flag, so the lane uses the catalog default of 2 hours
-  (`ravel_catalog::DEFAULT_MAX_INGEST_LAG_NS`); a server configured with a
+  `max_ingest_lag` flag, so the lane uses the catalog default of 2 hours;
+  a server configured with a
   smaller lag is not visible to the loader.
 - Logs and spans only; `--signal metrics` is refused. Not combinable with
   `--fold-after-load`: fold afterwards with `catalog fold --writers-stopped`.
@@ -2158,8 +2160,7 @@ The lane's contract:
 Before any object is written, the lane refuses, exiting with code 2, when:
 
 - `--ingest-hour-start` is below unix hour 438288 (2020-01-01T00:00:00Z),
-  the earliest ingest clock the write path accepts
-  (`ravel_ingest::MIN_PLAUSIBLE_INGEST_CLOCK_NS`);
+  the earliest ingest clock the write path accepts;
 - `--ingest-hour-start` is not strictly before the current hour;
 - `start + batches * stride` is not below the current hour, with
   `batches` counted from the Parquet footer at `--batch-rows` after
@@ -2170,7 +2171,7 @@ Before any object is written, the lane refuses, exiting with code 2, when:
   catches a tenant that was loaded but never folded. The check follows
   listing pages until one carries an object or the listing ends (a page
   can hold only keys the store cannot address), bounded by the catalog's
-  list request cap (`ravel_catalog::DEFAULT_MAX_CATALOG_LIST_REQUESTS`).
+  list request cap.
   A store error on that LIST, or on the HEAD above, fails the load
   (exit 1) before any object is written; it is not a refusal.
 
@@ -2181,7 +2182,7 @@ A strided load's report JSON carries `ingest_hour_stride`,
 submitted), `synthetic_ingest_hours: true` and `ingest_hour_flush:
 "per_batch_target_bytes"`. A plain load's report has none of these fields.
 
-Readers caveat: `Catalog::resolve` lists the ingest hours from the query
+Readers caveat: a query lists the ingest hours from the query
 window's start minus `max_ingest_lag` (2 hours by default) up to now plus
 the clock-skew allowance. A row is therefore found by a window that starts
 at its event time only when that event time is at most its ingest hour
@@ -2191,7 +2192,7 @@ is missed by windows that start after it.
 
 `catalog fold --snapshot-part-max-entries <n>` overrides the most entries
 one snapshot part may hold, for that invocation only. The default stays
-250,000 (`ravel_catalog::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`) and `0` is
+250,000 and `0` is
 refused. Parts still split at hour boundaries, so with one flush per hour
 on one shard, `--snapshot-part-max-entries 2` folds 24 strided hours into
 12 parts of two hours each. The fold's JSON and human reports name the

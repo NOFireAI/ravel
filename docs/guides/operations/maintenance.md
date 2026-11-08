@@ -1,31 +1,30 @@
 # Maintenance (day 2)
 
-Run at least one `--mode maintain` process. **Only a `--mode maintain` process
-runs maintenance**: compaction, retention, the sweeper that issues the
-deletes, and the at-rest integrity scrubber.
+Keep a running deployment compact, within retention and readable by current
+builds: compact small segments, delete expired and superseded data, verify
+the catalog and stored objects, and raise on-object format versions.
 
-- A process in `--mode all` runs ingest, the query API, the catalog fold and
-  alert evaluation. It runs none of the maintenance loops.
-- A deployment made only of `all` processes never compacts an object and
-  never deletes one. Its L0 segments accumulate, retention windows have no
-  effect, and nothing reclaims storage. The quickstart is such a deployment.
-- The catalog fold runs on a timer in `maintain` and in `all`, and in no other
-  mode. A `gateway` or `query` process folds only when an operator calls
-  `POST /api/v1/admin/fold`, which stays available in `all` and `query`. See
-  [which processes fold](#which-processes-fold).
+**Only a `--mode maintain` process runs maintenance**: compaction, retention,
+the sweeper that issues the deletes, and the at-rest integrity scrubber. A
+deployment made only of `--mode all` processes never compacts an object and
+never deletes one. Its L0 segments accumulate, retention windows have no
+effect, and nothing reclaims storage. The quickstart is such a deployment. If
+nothing is reclaimed, first make sure that a `maintain` process runs.
+[Process modes](configuration.md#process-modes) lists what each mode runs,
+and [which processes fold](#which-processes-fold) covers the catalog fold.
 
-If nothing is reclaimed, first make sure that a `maintain` process runs.
-
-- [Running the maintenance loop](#running-the-maintenance-loop)
-- [Catalog fold and verify](#catalog-fold-and-verify)
-- [Compaction](#compaction)
-- [Garbage collection and retention](#garbage-collection-and-retention)
-- [The at-rest integrity scrubber](#the-at-rest-integrity-scrubber)
-- [Format migration](#format-migration)
-- [Legal hold](#legal-hold)
-- [Reclaiming a pre-namespacing cache directory](#reclaiming-a-pre-namespacing-cache-directory)
-- [Repairing a forged Parquet table version](#repairing-a-forged-parquet-table-version)
-- [The maintenance and inspection commands](#the-maintenance-and-inspection-commands)
+| Task | Section |
+|---|---|
+| Run maintenance continuously | [Running the maintenance loop](#running-the-maintenance-loop) |
+| Compact a bucket or a tenant | [Compaction](#compaction) |
+| Apply retention and delete superseded data (the sweep) | [Garbage collection and retention](#garbage-collection-and-retention) |
+| Fold or verify the catalog | [Catalog fold and verify](#catalog-fold-and-verify) |
+| Check stored objects for corruption | [The at-rest integrity scrubber](#the-at-rest-integrity-scrubber) |
+| Raise a format version | [Format migration](#format-migration), [Rolling a format bump](#rolling-a-format-bump) |
+| Keep data past its retention window | [Legal hold](#legal-hold) |
+| Remove legacy cache files | [Reclaiming a pre-namespacing cache directory](#reclaiming-a-pre-namespacing-cache-directory) |
+| Repair a forged Parquet table version | [Repairing a forged Parquet table version](#repairing-a-forged-parquet-table-version) |
+| Run one pass by hand | [The maintenance and inspection commands](#the-maintenance-and-inspection-commands) |
 
 ## Running the maintenance loop
 
@@ -1030,19 +1029,15 @@ for the order to change them in.
 - The stored maximum query duration and HEAD cache TTL set its pinned-query
   window, as they do the server's.
 
-`ravel-cli gc-config set` refuses a protection horizon below either of two
-bounds, and writes nothing:
-
-- `max_query_duration + grace + clock_skew_allowance`.
-- `max_compaction_lifetime + 4 * clock_skew_allowance`. This bound is checked
-  against this build's compiled 1 h maximum compaction lifetime.
-
-Both bounds use the 5 min default skew allowance unless
-`--clock-skew-allowance` is given. The second bound binds only a deployment
-that shortens `max_query_duration` and `grace` far below their defaults. It
-exists because a compaction or rewrite run that can still publish over a
-record's inputs must not outlive their horizon. The maintain process and
-`maintain sweep` re-check both bounds at startup against their own values.
+`ravel-cli gc-config set` refuses, and writes nothing for, a protection
+horizon below either of the two bounds that
+[the configuration page](configuration.md#retention-and-garbage-collection-configuration)
+gives. Both bounds use the 5 min default skew allowance unless
+`--clock-skew-allowance` is given, and the second is checked against this
+build's compiled 1 h maximum compaction lifetime. The second bound binds only
+a deployment that shortens `max_query_duration` and `grace` far below their
+defaults. The maintain process and `maintain sweep` re-check both bounds at
+startup against their own values.
 
 ### The pinned-query window
 
