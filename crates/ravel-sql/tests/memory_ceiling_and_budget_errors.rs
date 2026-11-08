@@ -199,6 +199,7 @@ async fn a_sort_or_aggregate_budget_error_keeps_its_type() {
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+        bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         // ADR-0954: spill off, as on the shipped default.
@@ -289,6 +290,7 @@ async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+        bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         // ADR-0954: spill off, as on the shipped default.
@@ -391,6 +393,7 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+        bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         // ADR-0954: spill off, as on the shipped default.
@@ -507,6 +510,7 @@ async fn a_large_order_by_over_budget_is_resources_exhausted() {
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+        bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         // ADR-0954: spill off, as on the shipped default.

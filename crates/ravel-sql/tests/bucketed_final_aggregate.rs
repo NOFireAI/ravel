@@ -1496,7 +1496,13 @@ async fn per_bucket_topk_does_not_engage_without_a_fetch_above() {
         routed_chunk_rows: 256,
     };
     for sql in statements {
-        let planned = Planned::new(sql, sql_config(PARTITIONS, Some(tuning), None)).await;
+        // The first-groups bound (ADR-3985) would cut the `LIMIT` with no
+        // `ORDER BY` to 10 groups per partition below this exec.
+        let config = SqlConfig {
+            bounded_groups_max_limit: 0,
+            ..sql_config(PARTITIONS, Some(tuning), None)
+        };
+        let planned = Planned::new(sql, config).await;
         let exec = planned.bucketed();
         let line = format!("{}", displayable(exec.as_ref()).one_line());
         assert!(
