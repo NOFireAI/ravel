@@ -195,6 +195,12 @@ takes the same table-qualified tokens in its `x-ravel-min-commit-token`
 metadata. A join runs on the server that received it, and the query's memory
 ceiling is best-effort for join operators.
 
+A `GROUP BY ... LIMIT n` with no `ORDER BY` and at least one aggregate feeds
+its final aggregate only the rows of the first `n` groups each partition
+sees (for `n` up to 1024 by default), so its memory follows `n` rather than
+the number of groups, and every group it returns is aggregated over all of
+its rows (see the [query engine](docs/query-engine.md)).
+
 A tenant can also query Parquet tables. These are Parquet files read in place,
 in an S3, GCS or Azure location that an operator granted the tenant with
 `ravel-cli tenant parquet-grant add`. The read goes through a credential

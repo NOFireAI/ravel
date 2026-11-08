@@ -74,6 +74,7 @@ pub mod distributed_rlog;
 mod error;
 pub mod esql;
 mod executor;
+mod first_groups;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
 #[cfg(feature = "pin-codec")]
@@ -147,9 +148,9 @@ pub use bucketed_final_aggregate::{
 pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
 pub use config::{
-    BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_TOPK_MAX_LIMIT,
-    DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES,
-    DEFAULT_PARTITION_TOPK_MAX_LIMIT, DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES,
+    BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
+    DEFAULT_BOUNDED_TOPK_MAX_LIMIT, DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS,
+    DEFAULT_MAX_QUERY_BYTES, DEFAULT_PARTITION_TOPK_MAX_LIMIT, DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES,
     DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE, ENV_SPILL_DIR, ENV_SPILL_MAX_BYTES,
     GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
     GROUP_VALUES_UNDERCOUNT_FACTOR, SQL_SPILL_SUBDIR, SpillConfig, SpillConfigError, SqlConfig,
@@ -183,6 +184,9 @@ pub use executor::{
     LiveAccounting, ParquetPlan, PhaseWallTiming, PinnedLanes, PinnedPlanInputs, PinnedQuery,
     PinnedResolve, PinnedStream, ScanTiming, SegmentTiming, SignalStats, SqlExecutor, SqlOutcome,
     SqlRequest, SqlStats, TargetSignal, refuse_several_tables, segment_set_keys,
+};
+pub use first_groups::{
+    FIRST_GROUPS_CONSUMER_PREFIX, FIRST_GROUPS_RULE, FirstGroupsExec, FirstGroupsLimit,
 };
 #[cfg(feature = "flight-sql")]
 pub use flight::{

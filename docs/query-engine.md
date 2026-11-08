@@ -6223,6 +6223,53 @@ oversights.
    `blocks_pruned_by_postings=0` and reads everything, which is the widen-only
    fallback, not a failure.
 
+#### Bounded groups for an unordered GROUP BY ... LIMIT (ADR-3985)
+
+`FirstGroupsLimit` is a physical optimizer rule (installed by `build_session`
+right after `BoundedTopKAggregate` when `SqlConfig::bounded_groups_max_limit`
+is above 0; the default is 1024 and ravel-server has no flag for it) that
+stops a `GROUP BY ... LIMIT n` with no `ORDER BY` from building every group
+in its final aggregate to return `n` rows. It places a `FirstGroupsExec`,
+shown by `EXPLAIN` as `FirstGroupsExec: n=<bound>`, as the direct child of a
+final-stage `AggregateExec` (`FinalPartitioned`, `Final`, `Single` or
+`SinglePartitioned`) when every one of these holds: the aggregate's output
+reaches a `GlobalLimitExec`, a `LocalLimitExec` or a `CoalescePartitionsExec`
+with a fetch through nothing but projections, cooperative wrappers,
+fetch-less coalesces and `CompactSlicesExec` nodes with no TopK pre-filter
+(so a sort, a `HAVING` filter, a window, a join or a union between them
+refuses); the aggregate has at least one aggregate expression, one grouping
+set with no null mask or grouping id, no limit of its own and unordered
+input; and the bound, `n + s` for `OFFSET s LIMIT n`, is between 1 and the
+configured ceiling. A `GROUP BY` with no aggregate expression is left to
+DataFusion's `LimitedDistinctAggregation`.
+
+Per output partition the exec interns each input batch's group keys in a
+DataFusion `GroupValues` built over the aggregate's own group schema, so
+NULL keys and out-of-line `Utf8View` strings group exactly as the aggregate
+groups them, and passes on only the rows of the first `bound` groups it has
+seen. When its table grows past `bound` groups it keeps the first `bound` and
+rebuilds, and it charges the table to the query pool under its own
+`FirstGroups[<partition>]` consumer. It reads its input to the end.
+
+The answer is exact because the exec sits above the hash exchange: the final
+aggregate's input distribution sends every partial state of a group to the
+one partition that owns it, so a group the exec keeps reaches the aggregate
+with every one of its rows, and a group it drops reaches it with none. SQL
+leaves unspecified which `n` groups an unordered `LIMIT` returns, so the
+groups returned can differ from the rule-off plan's; their aggregates cannot.
+`crates/ravel-sql/tests/first_groups.rs` pins the counts and sums per
+returned group against a filter placed below the exchange and against a soft
+limit that stops reading after `n` groups, both of which return short
+counts.
+
+On its fixture of 1,000,000 distinct `(Int64, Utf8View)` groups over 8
+partitions with `LIMIT 10`, the query pool's charged peak is 9.7 to 11.8 MB
+with the rule and 86 to 93 MB with `bounded_groups_max_limit = 0`, and the
+aggregate envelopes peak at 7.86 MB against 153 to 162 MB. An ordered top-k
+by `count` or `sum` (`ORDER BY count(*) DESC LIMIT k`) is not bounded by this
+rule or by `BoundedTopKAggregate`, still builds every group, and keeps the
+ADR-0954 refusal-retry.
+
 #### Bucketed final aggregation (ADR-3565)
 
 `SqlConfig::bucketed_final_aggregation` (`--sql-bucketed-final-aggregation` on

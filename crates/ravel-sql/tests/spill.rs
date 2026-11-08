@@ -198,6 +198,7 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+        bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill: Some(SpillConfig {
@@ -864,6 +865,7 @@ fn parallel_config(spill: Option<SpillConfig>) -> SqlConfig {
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+        bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill,
@@ -1022,6 +1024,7 @@ async fn spill_off_reproduces_todays_refusal() {
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+        bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill: None,
