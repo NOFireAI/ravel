@@ -577,12 +577,12 @@ jobs:
           fi
 
       # Decision 14 verification (c): cosign verify against the same immutable
-      # identity tag, using the exact invocation README.md's "Verifying
-      # signatures" section documents (exact --certificate-identity, not a
-      # regex; the same OIDC issuer). The identity is this workflow's own path
-      # and ref, which is what the Fulcio certificate binds to: on a real
-      # release from the mirror this is the NOFireAI/ravel path at
-      # refs/tags/vX.Y.Z the README shows.
+      # identity tag, using the exact invocation the "Verifying signatures"
+      # section of docs/guides/operations/deployment.md documents (exact
+      # --certificate-identity, not a regex; the same OIDC issuer). The
+      # identity is this workflow's own path and ref, which is what the Fulcio
+      # certificate binds to: on a real release from the mirror this is the
+      # NOFireAI/ravel path at refs/tags/vX.Y.Z that section shows.
       - name: Verify signature with cosign
         env:
           IDENTITY: ${{ steps.tags.outputs.identity }}
@@ -640,7 +640,7 @@ jobs:
           echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
       # Decision 2: check "extracted from the signed image" instead of assuming
-      # it. This is README.md's "Verifying signatures" invocation verbatim
+      # it. This is the deployment guide's "Verifying signatures" invocation verbatim
       # (exact --certificate-identity, not a regex; the same OIDC issuer), run
       # against each of the three immutable identity tags before anything is
       # pulled out of them.

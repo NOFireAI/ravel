@@ -16,6 +16,9 @@ the [configuration page](configuration.md) before you start.
    If you federate, also provision
    [the remote cluster credentials](#federating-to-a-remote-cluster).
 
+To pull and verify the release images, see
+[container images](#container-images).
+
 ## Qualify the store
 
 Run `store qualify` once per bucket, before the first server starts:
@@ -1114,6 +1117,45 @@ One line is logged per plaintext remote, and a TLS remote logs nothing. If you
 see this warning and did not intend plaintext, remove the `tls=false` key.
 `tls=false` together with `tls-ca-file` fails startup, because the CA bundle
 has no effect with TLS off.
+
+## Container images
+
+`ravel-server`, `ravel-operator`, and `ravel-ingest-router` are published to
+the GitHub Container Registry on every `vX.Y.Z` release tag, for
+`linux/amd64` and `linux/arm64`. Each one is an OCI image index that carries
+an SBOM and build provenance.
+
+```sh
+docker pull ghcr.io/nofireai/ravel-server:0.31.0
+docker pull ghcr.io/nofireai/ravel-operator:0.31.0
+docker pull ghcr.io/nofireai/ravel-ingest-router:0.31.0
+```
+
+| Tag | Moves? |
+|---|---|
+| `X.Y.Z` | Never. A bad release is replaced by a new patch release, not re-pushed. |
+| `X.Y`, `X`, `latest` | Yes, to the newest matching release. |
+| `@sha256:...` digest | Never. Pin by digest when you need an immutable reference. |
+
+The quickstart pins `ghcr.io/nofireai/ravel-server:0.31.0`; set `RAVEL_IMAGE`
+to override it.
+
+### Verifying signatures
+
+Every published index digest is signed with
+[cosign](https://github.com/sigstore/cosign) in keyless mode. The certificate
+binds the signature to the release workflow of this repository, so you need
+no pre-shared key:
+
+```sh
+cosign verify \
+  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.31.0' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  ghcr.io/nofireai/ravel-server:0.31.0
+```
+
+Replace `v0.31.0` and `0.31.0` with the release you verify. The tag in
+`--certificate-identity` must be the exact tag that produced the image.
 
 ## Background
 
