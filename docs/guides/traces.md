@@ -81,8 +81,11 @@ reports what the lookup did: `partsCovered`, `partsUncovered`,
 `partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
 `leafGetRequests`, `leafWireBytes`, `keysProbed`, `skippedByBudget` and
 `skipIdxDropped`. It is present only on a statement with a `trace_id`
-filter. [The query engine reference](../query-engine.md) defines each
-figure. The process exports `ravel_query_key_index_parts_total` by
+filter. `keysProbed` is the number of distinct trace ids the part-level
+check used: 1 for `trace_id = <literal>`, and the distinct count for a
+`trace_id IN (...)` list of any length from 2 or the same ids written as
+`trace_id = a OR trace_id = b`. [The query engine
+reference](../query-engine.md) defines each figure. The process exports `ravel_query_key_index_parts_total` by
 `signal` and `outcome`, and `ravel_query_key_index_leaf_gets_total` by
 `signal`. A `trace_id =` filter on the
 `logs` table probes log objects the same way when the tenant indexes
@@ -308,7 +311,10 @@ Notes on these shapes:
 - The pruning predicates must be top-level `AND` conjuncts. A disjunction
   (`OR`) inside a conjunct drops that conjunct from pruning. The exception is
   a same-axis `OR` or `IN` list on `status_code` or `duration_ns`, which
-  prunes as the union of its parts.
+  prunes as the union of its parts, and a disjunction whose every arm is
+  `trace_id = <literal>`, which uses the key index exactly as the
+  equivalent `trace_id IN (...)` list does. A `trace_id` disjunction with any
+  other arm uses no key.
 - `service_name` and `name` equality push down, and DataFusion also always
   re-checks them as a residual, because a bloom is a false-positive filter.
 - Attribute equality on the `attrs` map (`attrs['k'] = 'v'`) does not prune.

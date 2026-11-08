@@ -1142,6 +1142,12 @@ decision's text:
   a two- or three-value list reads like an unkeyed scan. On spans the set is
   `SpansPushdown::trace_ids`, and its rows are filtered by the window alone,
   the residual being the list's exact evaluator.
+
+  Note (2026-11-08, #3913): a disjunction of two or three equalities on one
+  key column, the form DataFusion rewrites a short IN list into, now carries
+  the same key set as the IN list. A disjunction across two key columns, or
+  with a non-key or non-equality arm, still carries no key, and the residual
+  filter stays inexact.
 - **Hex trace ids in a list.** `trace_id IN ('<32-hex>', ...)` plans: the
   `trace_id_hex_in_list` analyzer rule rewrites a list whose every element is
   a 32-character hex string into the column's `FixedSizeBinary(16)` literals

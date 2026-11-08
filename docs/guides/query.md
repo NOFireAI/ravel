@@ -1121,10 +1121,15 @@ does; the other lists read those objects in full:
 
 - a list of more than 1,024 distinct values;
 - `NOT IN`, a list mixing types, or a list holding `NULL` or an expression;
-- a list inside an `OR`;
-- a list of two or three values, which the planner rewrites into `=`
-  comparisons joined by `OR` before Ravel sees it. One value becomes a plain
-  `=`, which does use the key.
+- a list inside an `OR`.
+
+A key list of any length from 2 uses its key set, two or three values
+included: the planner rewrites a list that short into `=` comparisons
+joined by `OR`, and Ravel reads those comparisons as the list. Writing the
+`OR` by hand, `user_id = 7 OR user_id = 9`, does the same. An `OR` that
+mixes columns, compares with anything but `=`, or holds a value the list
+would refuse uses no key. One value becomes a plain `=`, which also uses
+the key.
 
 A list beside a second key comparison, such as
 `user_id IN (...) AND user_id = 7`, uses both keys inside each object but
