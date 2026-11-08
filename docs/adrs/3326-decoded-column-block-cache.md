@@ -1927,6 +1927,10 @@ abneq and abq26).
      Here `cap` is `--decoded-cache-max-bytes`, and `budget` is the process memory budget's limit,
      the figure `DecodedColumnCache` is built against (`lib.rs:3820-3824`). The view budget is 0,
      with no view memo, while the decoded cache is off.
+     - Note (2026-11-08): the paired run missed its decision rows (#3326 readout, comment
+       6725892455), so the view budget defaults to 0, the off switch, and the derived default
+       above applies only once a re-measurement clears the bands. An explicit
+       `--decoded-cache-view-max-bytes` still enables the view memo.
    - **The startup log.** The server logs the resolved view budget once, with the term that bound
      it: `cap_quarter`, `two_gib` or `budget_room`. It logs `floored_at_zero` when the third term is
      negative.

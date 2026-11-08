@@ -6423,19 +6423,16 @@ the flag.
 
 **View memo.** `--decoded-cache-view-max-bytes` sizes a second budget beside
 the cap, for the per-row string views a `GROUP BY` takes from a cached
-plain-page column (see "String-keyed `GROUP BY`" below). Unset, it is the
-smallest of a quarter of the cap, 2 GiB, and the memory budget less the cap
-and the admission margin, floored at 0; it is 0 while the cache is off.
-Startup logs the value in force and the term that bound it, as
-`ViewBudgetBound::name` names it: `cap_quarter`, `two_gib`, `budget_room` or
-`floored_at_zero` for a derived value
-(`view_budget_default_takes_the_smallest_term`), or `explicit` for a value set
-by flag (`an_explicit_view_budget_is_used_and_warned_above_the_room`). No
-view budget line is logged while the cache is off. With a
-20,487,102,875-byte memory budget and an 8 GB cap it is 2,000,000,000 bytes,
-bound by `cap_quarter` (`view_budget_default_takes_the_smallest_term`). An
-explicit value is used as given, with a warning when it is above that room
-that view fills past it may be refused
+plain-page column (see "String-keyed `GROUP BY`" below). Unset, it is 0 and
+the view memo is off, for every cap and memory budget
+(`an_unset_view_budget_is_off`); an explicit value enables it. It is 0 while
+the cache is off. Startup logs the value in force and the term that set it,
+as `ViewBudgetBound::name` names it: `default_off` for an unset flag
+(`an_unset_view_budget_is_off`), or `explicit` for a value set by flag
+(`an_explicit_view_budget_is_used_and_warned_above_the_room`). No view budget
+line is logged while the cache is off. An explicit value is used as given,
+with a warning when it is above the memory budget less the cap and the
+admission margin that view fills past it may be refused
 (`an_explicit_view_budget_is_used_and_warned_above_the_room`), and `0` keeps
 no views (`a_view_budget_of_zero_keeps_no_view_memo`).
 

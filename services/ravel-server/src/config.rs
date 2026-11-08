@@ -870,14 +870,12 @@ pub struct DecodedCacheViewArgs {
     /// `--decoded-cache-max-bytes` (ADR-3326, view memo amendment). A
     /// `GROUP BY` over a declared `Str` column served from a plain page keeps
     /// that page's per-row string views here, charged to the process memory
-    /// budget and released first under memory pressure. Unset, it is the
-    /// smallest of a quarter of the cap, 2 GiB, and the memory budget less
-    /// the cap and the admission margin, floored at 0; it is 0 while the
-    /// decoded cache is off. `0` keeps no views. Startup logs the value in
-    /// force and the term that bound it (`cap_quarter`, `two_gib`,
-    /// `budget_room`, `floored_at_zero` or `explicit`),
-    /// and warns when an explicit value is above the budget's room that view
-    /// fills past it may be refused.
+    /// budget and released first under memory pressure. Unset, it is 0 and
+    /// the view memo is off; an explicit value above 0 enables it. It is 0
+    /// while the decoded cache is off. Startup logs the value in force and
+    /// the term that set it (`default_off` or `explicit`), and warns when an
+    /// explicit value is above the memory budget less the cap and the
+    /// admission margin that view fills past it may be refused.
     #[arg(long, value_name = "BYTES")]
     pub decoded_cache_view_max_bytes: Option<u64>,
 }
@@ -4322,7 +4320,7 @@ pub struct QueryBudgets {
     /// column-block cache.
     pub decoded_cache_max_bytes: u64,
     /// `--decoded-cache-view-max-bytes` (ADR-3326, view memo amendment).
-    /// `None` takes the derived default
+    /// `None` keeps the view memo off
     /// ([`resolve_decoded_cache_view_max_bytes`]).
     pub decoded_cache_view_max_bytes: Option<u64>,
 }
@@ -4370,14 +4368,8 @@ pub enum ViewBudgetBound {
     Explicit,
     /// The decoded cache is off, so there is no view memo.
     CacheOff,
-    /// A quarter of `--decoded-cache-max-bytes`.
-    CapQuarter,
-    /// 2 GiB.
-    TwoGib,
-    /// The memory budget less the cap and the admission margin.
-    BudgetRoom,
-    /// The budget's room is negative: the cap plus the margin exceed it.
-    FlooredAtZero,
+    /// The flag is unset, and the view memo is off by default.
+    DefaultOff,
 }
 
 impl ViewBudgetBound {
@@ -4387,10 +4379,7 @@ impl ViewBudgetBound {
         match self {
             ViewBudgetBound::Explicit => "explicit",
             ViewBudgetBound::CacheOff => "decoded_cache_off",
-            ViewBudgetBound::CapQuarter => "cap_quarter",
-            ViewBudgetBound::TwoGib => "two_gib",
-            ViewBudgetBound::BudgetRoom => "budget_room",
-            ViewBudgetBound::FlooredAtZero => "floored_at_zero",
+            ViewBudgetBound::DefaultOff => "default_off",
         }
     }
 }
@@ -4407,15 +4396,11 @@ pub struct ResolvedViewBudget {
     pub room: u64,
 }
 
-/// 2 GiB, the derived view budget's fixed ceiling.
-pub const VIEW_BUDGET_CEILING_BYTES: u64 = 2 << 30;
-
 /// Resolves `--decoded-cache-view-max-bytes` against the decoded cache's
 /// `cap` and the process memory `budget` (ADR-3326, view memo amendment,
-/// decision 3). With the cache off (`cap` 0) it is 0. An explicit value is
-/// used as given. Unset, it is the smallest of `cap / 4`, 2 GiB and `budget -
-/// cap - admission_margin(budget)`, floored at 0, the first of those three
-/// winning a tie (`view_budget_default_takes_the_smallest_term`).
+/// decision 3 and its 2026-11-08 note). With the cache off (`cap` 0) it is 0.
+/// An explicit value is used as given. Unset, it is 0: the view memo is off
+/// by default (`an_unset_view_budget_is_off`).
 pub fn resolve_decoded_cache_view_max_bytes(
     flag: Option<u64>,
     cap: u64,
@@ -4423,28 +4408,13 @@ pub fn resolve_decoded_cache_view_max_bytes(
 ) -> ResolvedViewBudget {
     let margin = ravel_logseg::decoded_cache::admission_margin(budget);
     let room = i128::from(budget) - i128::from(cap) - i128::from(margin);
-    let floored = u64::try_from(room.max(0)).unwrap_or(u64::MAX);
-    let (bytes, bound) = if cap == 0 {
-        (0, ViewBudgetBound::CacheOff)
-    } else if let Some(explicit) = flag {
-        (explicit, ViewBudgetBound::Explicit)
-    } else if room < 0 {
-        (0, ViewBudgetBound::FlooredAtZero)
-    } else {
-        [
-            (cap / 4, ViewBudgetBound::CapQuarter),
-            (VIEW_BUDGET_CEILING_BYTES, ViewBudgetBound::TwoGib),
-            (floored, ViewBudgetBound::BudgetRoom),
-        ]
-        .into_iter()
-        .reduce(|best, next| if next.0 < best.0 { next } else { best })
-        .unwrap_or((0, ViewBudgetBound::FlooredAtZero))
+    let room = u64::try_from(room.max(0)).unwrap_or(u64::MAX);
+    let (bytes, bound) = match flag {
+        _ if cap == 0 => (0, ViewBudgetBound::CacheOff),
+        Some(explicit) => (explicit, ViewBudgetBound::Explicit),
+        None => (0, ViewBudgetBound::DefaultOff),
     };
-    ResolvedViewBudget {
-        bytes,
-        bound,
-        room: floored,
-    }
+    ResolvedViewBudget { bytes, bound, room }
 }
 
 impl ResolvedViewBudget {
@@ -23453,36 +23423,38 @@ mod tests {
         );
     }
 
-    /// ADR-3326, view memo amendment, T8: unset, the view budget is the
-    /// smallest of `cap / 4`, 2 GiB and the budget's room, floored at 0, and
-    /// the startup line carries the bytes and the term that bound it; with
-    /// the decoded cache off it is 0.
+    /// ADR-3326, view memo amendment, decision 3 note (2026-11-08): unset,
+    /// the view budget is 0 with the `default_off` bound for every cap and
+    /// budget, the ClickBench entry's included, the startup line carries
+    /// both and no warning fires; with the decoded cache off it is 0.
     #[test]
-    fn view_budget_default_takes_the_smallest_term() {
+    fn an_unset_view_budget_is_off() {
         const GB: u64 = 1_000_000_000;
         let cases = [
             // The ClickBench entry: budget 20,487,102,875, cap 8 GB.
-            (20_487_102_875, 8 * GB, 2_000_000_000, "cap_quarter"),
-            (80 * GB, 40 * GB, 2 << 30, "two_gib"),
-            // 9.5e9 - 8e9 - 1 GiB.
-            (9_500_000_000, 8 * GB, 426_258_176, "budget_room"),
-            (8_500_000_000, 8 * GB, 0, "floored_at_zero"),
+            (20_487_102_875, 8 * GB),
+            (80 * GB, 40 * GB),
+            (9_500_000_000, 8 * GB),
+            (8_500_000_000, 8 * GB),
         ];
-        for (budget, cap, want, term) in cases {
+        for (budget, cap) in cases {
             let resolved = resolve_decoded_cache_view_max_bytes(None, cap, budget);
-            assert_eq!(resolved.bytes, want, "{term}");
-            assert_eq!(resolved.bound.name(), term);
+            assert_eq!(
+                (resolved.bytes, resolved.bound.name()),
+                (0, "default_off"),
+                "budget {budget}, cap {cap}"
+            );
             let (lines, guard) = capture_events(tracing::Level::INFO);
             resolved.log();
             drop(guard);
             let lines = lines.lock();
             let [line] = lines.as_slice() else {
-                panic!("{term}: one startup line, got {lines:?}");
+                panic!("budget {budget}: one startup line, got {lines:?}");
             };
             assert!(
-                line.contains(&format!("decoded_cache_view_max_bytes={want}"))
-                    && line.contains(&format!("bound=\"{term}\"")),
-                "{term}: {line}"
+                line.contains("decoded_cache_view_max_bytes=0")
+                    && line.contains("bound=\"default_off\""),
+                "budget {budget}: {line}"
             );
         }
         let room = resolve_decoded_cache_view_max_bytes(None, 8 * GB, 20_487_102_875).room;
