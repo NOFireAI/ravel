@@ -59,9 +59,12 @@
 //! The sort value of a group is computed from its key alone, and the final
 //! stage's hash distribution (or its single partition, in the `Final` and
 //! `Single` modes) gives each partition every partial state or row of its
-//! keys. A key evicted at a rebuild has `n` kept keys at or before it, and
-//! the threshold only moves forward, so none of its later rows pass: it is
-//! absent from the output, never partial. Every group strictly better than
+//! keys. A key evicted at a rebuild has `n` kept keys ranked ahead of it.
+//! The threshold only moves forward, so its later rows pass only when its
+//! sort value ties the threshold; it then re-enters with a group index above
+//! every key already held, the rebuild re-interns kept keys in rank order,
+//! and so `n` keys stay ranked ahead of it at every later cut: it is absent
+//! from the output, never partial. Every group strictly better than
 //! the global n-th sort value is therefore kept complete by its partition,
 //! enough groups tied with it are kept complete to fill `n`, and the global
 //! sort picks `n` complete groups. The mask keeps rows at the threshold, so
