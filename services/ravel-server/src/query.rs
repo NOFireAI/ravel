@@ -4437,7 +4437,7 @@ mod tests {
     /// finds no line; drop the insufficient-space arm in `resolve_sql_spill`
     /// and that row reads `source="unset"`; drop the `merge_fan_in`
     /// assignment in `resolve_sql_spill` and the flag fan-in row reads
-    /// `value=8 source="default"`.
+    /// `value=2 source="default"`.
     #[test]
     fn startup_lines_carry_the_spill_dir_and_ceiling_with_their_sources() {
         let cache = tempfile::tempdir().expect("cache dir");
@@ -4457,7 +4457,7 @@ mod tests {
                     root.display().to_string()
                 ),
                 format!(" value={} source=\"derived\"", 8 * GIB),
-                " value=8 source=\"default\"".to_string(),
+                " value=2 source=\"default\"".to_string(),
             ),
             (
                 "env",
@@ -4468,7 +4468,7 @@ mod tests {
                 100 * GIB,
                 format!(" value={:?} source=\"env\"", explicit.display().to_string()),
                 " value=4096 source=\"env\"".to_string(),
-                " value=8 source=\"default\"".to_string(),
+                " value=2 source=\"default\"".to_string(),
             ),
             (
                 "flag fan-in",

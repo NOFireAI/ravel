@@ -269,22 +269,16 @@ pub struct SpillConfig {
 
 /// The default [`SpillConfig::merge_fan_in`] (ADR-0954 item 2, issue #3899).
 ///
-/// The value trades two constraints against each other:
-///
-/// - Scratch: a merge step writes its output while its inputs are still on
-///   disk, so the scratch peak is the spilled bytes plus the largest
-///   intermediate merge output. That depends on the run count, not on the
-///   fan-in alone: measured peak/spilled ratios were 1.51 to 1.56 at 2,
-///   1.23 to 1.25 at 8 with 34 runs, and up to 1.95 at 8 with 9 runs, when
-///   the count sits just above a power of the fan-in. A wider fan-in also
-///   rewrites fewer bytes.
-/// - Replay room: the merge seats one reservation per run it reads. At a
-///   cap that seats about six runs, any fan-in of six or more behaves as
-///   unbounded and the replay can be refused; 2 leaves room there.
-///
-/// 8 is the measured choice for a 4 GB host, where the cap seats about 49
-/// runs and every replay cell passed at 8. Zero means unbounded.
-pub const DEFAULT_SPILL_MERGE_FAN_IN: usize = 8;
+/// DataFusion 55's multi-level merge is first in, first out, so the scratch
+/// peak is the spilled bytes S plus the largest intermediate merge output, and
+/// with runs of equal size its worst case over every run count is F + 1 runs
+/// at about `1 + F / (F + 1)` times S: 1.67 at 2, the least of any bounded F
+/// (1.89 at 8). A last run smaller than the rest lifts the peak toward twice S
+/// at any F, though never to it. 2 also seats the fewest runs in the merge
+/// that replays a spilled aggregate, leaving the most of the pool to the
+/// re-aggregation behind it; an F at or above the number of runs the pool
+/// seats is the unbounded merge. Zero means unbounded.
+pub const DEFAULT_SPILL_MERGE_FAN_IN: usize = 2;
 
 /// A [`SpillConfig`] could not be read from the environment. Loud on purpose:
 /// a half-set or unparseable spill configuration silently selects a different

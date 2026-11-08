@@ -955,18 +955,27 @@ answered, but three properties of the decision above cost the rest:
    the smallest bound it applies.
 
    Note (2026-11-08, the fan-in choice, issue #3899): the fan-in is now
-   `SpillConfig::merge_fan_in`, default 8 (`DEFAULT_SPILL_MERGE_FAN_IN` in
+   `SpillConfig::merge_fan_in`, default 2 (`DEFAULT_SPILL_MERGE_FAN_IN` in
    `crates/ravel-sql/src/config.rs`), set at startup with
    `--sql-spill-merge-fan-in`. `0` is DataFusion's unbounded merge and `1`
    is refused at startup. The startup log's `sql_spill_merge_fan_in` line
-   reports the value and whether it came from the flag. Fan-in 2 broke the
-   row 33 shape on c6a.large by scratch, not memory: DataFusion's merge
-   takes the first F runs, writes their merge while the inputs are still on
-   disk, and queues the output behind the rest. The scratch peak is
-   therefore the spilled bytes S plus the largest intermediate merge
-   output. It depends on the run count N, and the `1 + 1/F` estimate holds
-   only when N is a power of F. The smallest scratch quota the row 33 shape
-   passed at, over S, with the lower figure failing and the upper passing:
+   reports the value and whether it came from the flag. DataFusion's merge
+   is first in, first out: each pass takes the first F runs of its queue,
+   writes their merge while the inputs are still on disk, queues the output
+   behind the rest, and releases the inputs when the pass ends. The scratch
+   peak is therefore the spilled bytes S plus the largest intermediate
+   merge output, and since no pass but the last reads every run, it stays
+   under 2S at any F. It depends on the run count N and on the size of the
+   last run, which holds the remainder of the input. No closed form in F
+   alone fits the measurements below: `1 + 1/F` predicts 1.25 for F = 4 at
+   about 16 runs, a power of 4, which needed 1.44 to 1.46. With runs of
+   equal size the worst N for a fan-in F is F + 1, where the first pass
+   rewrites F of the F + 1 runs, at about `1 + F / (F + 1)` times S: 1.67
+   at F = 2 and more at every larger F (1.75 at 3, 1.8 at 4, 1.89 at 8). A
+   last run smaller than the others lifts that toward 2S at any F, which is
+   why the F + 1 cells below sit above those figures. The smallest scratch
+   quota the row 33 shape passed at, over S, with the lower figure failing
+   and the upper passing:
 
    | Runs N | F = 2 | F = 3 | F = 4 | F = 8 |
    |---|---|---|---|---|
@@ -995,14 +1004,21 @@ answered, but three properties of the decision above cost the rest:
    | row 14 | 70% | 10 | 8 | 8 | 7 | 7 |
 
    Below those caps, 8 and the unbounded merge failed and passed at the
-   same caps (row 35 failed at 7% and 8%, row 14 at 5% to 12%). No value
-   met the margin outright, so 8 is chosen as the only one whose measured
-   peak reaches it, with every replay cell passed and the fewest bytes
-   rewritten. Its worst case is a run count just above a power of 8 (1.95
-   times S at 9 runs). At the small geometry of the issue #3967 tests
-   (200,000 groups, a cap that seats about six runs) 8 replays like the
-   unbounded merge and fails row 35 at 50% and row 14 at 70%, which fan-in
-   2 passes; a host with caps that small sets `--sql-spill-merge-fan-in 2`.
+   same caps (row 35 failed at 7% and 8%, row 14 at 5% to 12%). 2 is
+   chosen for its bound: with runs of equal size its worst case over every
+   run count is the least of any bounded fan-in, where 8's peak turns on
+   where N falls (1.93 to 1.95 times S at 9 runs, 1.23 to 1.25 at 34). It
+   also seats the fewest runs in the merge that replays a spilled
+   aggregate. At the small geometry of the issue #3967 tests (200,000
+   groups, a cap that seats about six runs) 8 replays like the unbounded
+   merge and fails row 35 at 50% and row 14 at 70%, which 2 passes. The
+   cost is the c6a.large row 33 cell above: at 34 runs 2 needs 1.51 to 1.52
+   times S, 9.8 GB, over that host's 9.44 GB share, where 8 fit. The row 33
+   tests in `crates/ravel-sql/tests/spill.rs` pin the bound with integer
+   keys: with 3, 4, 5, 6 and 8 runs of about equal size a quota of 1.70
+   times S answers (peaks 1.65-1.66, 1.54-1.55, 1.50-1.51, 1.65-1.66 and
+   1.54-1.55), with 4 runs 1.45 is refused, and 3 runs whose last is small
+   (peak 1.93-1.94) are refused at 1.70 and answer at 2.
 3. **In a spill-enabled pool, a reserve-ahead refusal of a spill-capable
    consumer is a spill trigger, not a failure.** The same refusal of a
    consumer that cannot spill is unchanged, and so is any refusal in a

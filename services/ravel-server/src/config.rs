@@ -477,7 +477,7 @@ fn parse_ingest_hold_queued_flushes(value: &str) -> Result<u64, String> {
 /// `ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN` (ADR-0954 item 2, issue #3899).
 /// Mirrored here (ravel-sql is an optional dependency) and pinned equal to it
 /// by `sql_spill_merge_fan_in_default_matches_ravel_sql`.
-pub const DEFAULT_SQL_SPILL_MERGE_FAN_IN: usize = 8;
+pub const DEFAULT_SQL_SPILL_MERGE_FAN_IN: usize = 2;
 
 /// Parses `--sql-spill-merge-fan-in`: `0` (DataFusion's unbounded fan-in) or
 /// at least 2. DataFusion would silently raise 1 to 2, so 1 is refused rather
@@ -2012,15 +2012,18 @@ pub struct Cli {
     pub sql_spill: SqlSpillArg,
 
     /// Most spill files one SQL spill merge step reads at once (ADR-0954
-    /// item 2, issue #3899). The default, 8, was chosen by measurement for a
-    /// 4 GB host. A wider fan-in rewrites fewer bytes but seats
-    /// one merge reservation per file it reads, so a small memory cap may need
-    /// a narrower one (2 leaves replay room where the cap seats only a few
-    /// files); the scratch peak is the spilled bytes plus the largest
-    /// intermediate merge output. `0` is DataFusion's unbounded fan-in; `1` is
-    /// refused at startup. The startup log's `sql_spill_merge_fan_in` line
-    /// reports the value. Meaningful only in a build with the `sql` feature
-    /// and with spill on; inert otherwise.
+    /// item 2, issue #3899). The scratch peak is the spilled bytes plus the
+    /// largest intermediate merge output. With files of equal size the
+    /// default, 2, has the smallest worst case of any bounded value, about
+    /// 1.67 times the spilled bytes, and any value of 3 or more has a worse
+    /// one (about 1.89 times at 8, with 9 files); a last file smaller than
+    /// the rest lifts the peak toward twice the spilled bytes at any value.
+    /// 2 also leaves the most of the memory pool to the aggregate that
+    /// replays the merged files. `0` is DataFusion's unbounded fan-in, which
+    /// reads as many files at once as the pool seats, and a value at or above
+    /// that number behaves as `0`. `1` is refused at startup. The startup log's `sql_spill_merge_fan_in` line reports the
+    /// value. Meaningful only in a build with the `sql` feature and with
+    /// spill on; inert otherwise.
     #[arg(
         long = "sql-spill-merge-fan-in",
         value_name = "FILES",
@@ -17317,12 +17320,12 @@ mod tests {
     /// refused at startup with a message saying why.
     #[test]
     fn sql_spill_merge_fan_in_flag_resolves_and_refuses_one() {
-        assert_eq!(DEFAULT_SQL_SPILL_MERGE_FAN_IN, 8);
+        assert_eq!(DEFAULT_SQL_SPILL_MERGE_FAN_IN, 2);
         for (args, expected) in [
             (&[][..], DEFAULT_SQL_SPILL_MERGE_FAN_IN),
             (&["--sql-spill-merge-fan-in", "4"][..], 4),
             (&["--sql-spill-merge-fan-in", "0"][..], 0),
-            (&["--sql-spill-merge-fan-in", "2"][..], 2),
+            (&["--sql-spill-merge-fan-in", "8"][..], 8),
         ] {
             let parsed = cli(args);
             assert_eq!(parsed.sql_spill_merge_fan_in, expected, "{args:?}");
