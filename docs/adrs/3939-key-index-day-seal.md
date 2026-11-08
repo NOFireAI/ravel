@@ -167,10 +167,13 @@ rows.
 
 - An advance rebuilds at most one UTC day of leaves. Logs: at most 26
   passes (25 by the pair rule, 26 scaling box D's measured 27 by 24/25)
-  and 1.31 GB of leaf bytes. The fold peak is predicted at about 1.91 GB
-  for a full-day tail, scaled from box D's 1.99 GB at 25 hours, so it sits
-  under the 2 GB RSS band with under 5% headroom: a tenant ingesting about
-  5% above box D's rate misses it. Spans:
+  and 1.31 GB of leaf bytes. The fold peak is a base plus the held
+  previous-leaf bytes, and only the second term scales with tail hours:
+  box D's 1.99 GB at 25 hours less one hour of logs leaves (about
+  0.055 GB) predicts about 1.93 GB for a full-day tail. That is under the
+  2 GB RSS band with under 4% headroom, and ADR-3692's Stage 1 amendment
+  reads the same measurement as at the line: a tenant ingesting about 5%
+  more leaf pairs than box D misses it. Spans:
   at most 3 passes and 0.22 GB.
 - A lookup with a time range inside one UTC day touches one part, as
   today. A longer window touches one part per day it overlaps, and the
@@ -200,8 +203,8 @@ and that figure decides whether alternative 4 becomes a follow-up.
 
 | check | target | miss | source |
 |---|---|---|---|
-| A1. advance at a full-day tail, logs, switch on | at most 26 build passes, at most 1.4 GB leaf bytes written, fold peak RSS at most 2.0 GB | more than 26 passes, over 1.6 GB, or over 2.0 GB RSS (predicted peak about 1.91 GB). An RSS miss with the passes and bytes in band is not fixed inside this decision: it opens a follow-up on a 6-hour seal span (costed above) or on the held previous-leaf rule | predicted; box D rates, comment 6700944105 |
-| A2. advance at a full-day tail, spans | at most 3 passes, at most 0.25 GB leaf bytes | more than 3 passes or over 0.3 GB | predicted; box D rates, comment 6700944105 |
+| A1. advance at a full-day tail, logs, switch on | at most 26 build passes, at most 1.4 GB leaf bytes written, fold peak RSS at most 2.0 GB | more than 26 passes, over 1.4 GB, or over 2.0 GB RSS (predicted peak about 1.93 GB). An RSS miss with the passes and bytes in band is not fixed inside this decision: it opens a follow-up on a 6-hour seal span (costed above) or on the held previous-leaf rule | predicted; box D rates, comment 6700944105 |
+| A2. advance at a full-day tail, spans | at most 3 passes, at most 0.25 GB leaf bytes | more than 3 passes or over 0.25 GB | predicted; box D rates, comment 6700944105 |
 | A3. sealed days keep their leaves | from the second fold after day d seals, an advance issues 0 leaf PUTs and 0 previous-leaf GETs for day d's part | any leaf PUT or GET for a sealed day it did not change, after its sealing fold | predicted |
 | A4. partition determinism | two folds of the same entry set produce byte-identical HEADs; the switch-off partition is unchanged | any difference | predicted |
 | A5. no-range lookup, 7 days of day parts, logs request_id IN 100 | every day covered; GETs at most 7 x 126 | any day uncovered | predicted |
@@ -212,6 +215,7 @@ and that figure decides whether alternative 4 becomes a follow-up.
 
 | task | crates | depends on | risk |
 |---|---|---|---|
-| D1 day seal in `partition_parts` behind the switch, carry-over of sealed day parts' refs, tests A3 and A4; the fold report also carries `key_index_pair_budget` and `key_index_field_pairs` (#3948), so the harness can bound ADR-3692 row 7's `G` (it reads not computable until then) | ravel-catalog (fold), ravel-cli (report) | none | high |
-| D2 docs: catalog-and-mvcc.md "Per-part key-index leaves" and rollout, the operator guide's cost section | docs | D1 | low |
-| D3 Stage 2 run on real S3: rows A1 to A7, ADR-3692 rows 7, 8, 11 and 18 | benchmarks, docs | D1, #3917, #3918 | low |
+| D1 day seal in `partition_parts` behind the switch, carry-over of sealed day parts' refs, tests A3 and A4; the fold report also carries `key_index_pair_budget` and `key_index_field_pairs` (#3948), so the harness can bound ADR-3692 row 7's `G` (it reads not computable until then); the decision 4 guards: a fold report field and a warning for a switch-off fold over a HEAD with leaf refs, and docs/catalog-and-mvcc.md stating that the folders of a tenant must agree on the switch and run this version before it is turned on, with the day seal under the sealing policy | ravel-catalog (fold), ravel-cli (report), docs/catalog-and-mvcc.md | none | high |
+| D2 docs: the operator guide's cost section (D1 updates catalog-and-mvcc.md with the behaviour) | docs | D1 | low |
+| D4 the investigations harness reads `key_index_pair_budget` and `key_index_field_pairs` and bounds row 7's `G` from them | benchmarks/investigations | D1 | low |
+| D3 Stage 2 run on real S3: rows A1 to A7, ADR-3692 rows 7, 8, 11 and 18 | benchmarks, docs | D1, D4, #3917, #3918 | low |
