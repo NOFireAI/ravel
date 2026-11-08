@@ -30,8 +30,9 @@ https://github.com/NOFireAI/ravel/issues/3692#issuecomment-6700944105).
 Box D measured one advance over a 25-hour tail: logs ran 27 build passes,
 read 1.30 GB of sections and wrote 1.37 GB of leaves in 305.8 s, with a
 fold peak of 1.99 GB; spans ran 3 passes and wrote 0.23 GB in 182.7 s. The
-Stage 1 amendment projects 39.3 GB of logs leaf bytes and 750 passes per
-advance at a 30-day tail. Each pass also ends a slice, so the advance
+Stage 1 amendment projects 750 passes and 39.3 GB of logs leaf bytes per
+advance at a 30-day tail (39.2 GB from the pair rates at 10.9 B a pair,
+the basis of the cost table below). Each pass also ends a slice, so the advance
 multiplies slices (request_id went from 5 to 27 in one advance), and a
 multi-key lookup pays per slice it touches.
 
@@ -76,20 +77,33 @@ flowchart LR
    sealed at the day boundary is encoded with its own last ingest hour as
    its watermark, while the last tail carried the fold's watermark, so the
    two can hash differently, and the sealed day's leaves are then built
-   once more at sealing. D1 either makes the two encodings agree or
+   once more at sealing. At a tenant's first day boundary there is a
+   second reason: a lone part is encoded with `min_hour` 0 (the
+   single-part override, fold.rs), and once a second part exists the
+   sealed one takes its real first hour. D1 either makes the two encodings agree or
    counts that rebuild; either way it is one day's leaves once.
 3. **No persistent format changes.** The proto, the kidx layout and the
    object key layout stay as they are. A part's leaves still bind its
    exact hash and still tile `[0, u64::MAX]` per field.
 4. **Rollout.** The first fold with the switch on under this rule
    re-partitions a tenant's existing tail into day parts and builds their
-   leaves, once, under the pair budget per part. Processes that fold one
-   tenant must agree on the switch, as docs/catalog-and-mvcc.md already
-   requires; a process on the old rule and one on this rule would rewrite
-   each other's partition on every fold, which is wasteful but never
-   wrong, since both produce valid snapshots of the same entries. The
-   rollout section of docs/catalog-and-mvcc.md says to upgrade every
-   folder before turning the switch on.
+   leaves, once, under the pair budget per part. docs/catalog-and-mvcc.md
+   ("Per-part key-index leaves") says only that the processes folding one
+   tenant should agree on the switch. Under this rule a disagreement is
+   far more expensive than today. A switch-off fold re-partitions the
+   whole retained entry set back into entry-count parts: every part gets
+   a new hash, is re-encoded and PUT, and loses its leaf refs. The next
+   switch-on fold splits it into days again and rebuilds every day's
+   leaves, which at a 30-day logs tenant is the full 39.2 GB and about 750
+   passes, on every pair of folds. Today the same disagreement costs only
+   the tail. Both rules still produce valid snapshots of the same entries,
+   so the cost is waste, never wrong rows. Two things guard against it.
+   D1 makes agreement a stated requirement in docs/catalog-and-mvcc.md,
+   with the order: every folder of a tenant runs this version before the
+   switch is turned on for that tenant. And D1 makes a disagreement
+   visible: a switch-off fold whose previous HEAD carries leaf refs
+   reports it in the fold report and logs a warning. It is not refused,
+   because turning the switch off on purpose looks the same.
 
 ### What the seal costs and saves (predicted)
 
@@ -102,9 +116,9 @@ bucket.
 | seal span | signal | passes per advance, worst | leaf bytes per advance, worst | indexed parts at 30 days | 1-key GETs, no range | 100-key GETs, no range | basis |
 |---|---|---|---|---|---|---|---|
 | none (today) | spans | 75 | 6.54 GB | 1 | 2 | about 175 | predicted from box D rates |
-| none (today) | logs | 751 | 39.2 GB | 1 | 2 | about 200 | predicted from box D rates |
+| none (today) | logs | 750 | 39.2 GB | 1 | 2 | about 200 | predicted from box D rates |
 | UTC day (this ADR) | spans | 3 | 0.22 GB | 30 | 60 | about 3,090, over `L_max`: about 19 of 30 days covered | predicted from box D rates |
-| UTC day (this ADR) | logs | 26 | 1.31 GB | 30 | 60 | about 3,780, over `L_max`: about 16 of 30 days covered | predicted from box D rates |
+| UTC day (this ADR) | logs | 25 (26 scaled from box D) | 1.31 GB | 30 | 60 | about 3,780, over `L_max`: about 16 of 30 days covered | predicted from box D rates |
 | 6 hours | spans | 1 | 0.05 GB | 120 | 240 | 100 keys in one slice bridge to 64 runs or decline | predicted from box D rates |
 | 6 hours | logs | 7 | 0.33 GB | 120 | 240 | about 12,840, about 19 of 120 parts covered | predicted from box D rates |
 | 1 hour | logs | 2 | 0.05 GB | 720 | 1,440 | 100 keys in one slice bridge or decline; at most 20 parts covered | predicted from box D rates |
@@ -152,11 +166,19 @@ rows.
 ## Consequences
 
 - An advance rebuilds at most one UTC day of leaves. Logs: at most 26
-  passes and 1.31 GB of leaf bytes, under the fold's 2 GB RSS band at box
-  D's rate, which box D's 25-hour tail already measured at 1.99 GB. Spans:
+  passes (25 by the pair rule, 26 scaling box D's measured 27 by 24/25)
+  and 1.31 GB of leaf bytes. The fold peak is predicted at about 1.91 GB
+  for a full-day tail, scaled from box D's 1.99 GB at 25 hours, so it sits
+  under the 2 GB RSS band with under 5% headroom: a tenant ingesting about
+  5% above box D's rate misses it. Spans:
   at most 3 passes and 0.22 GB.
-- A lookup with a time range costs what it costs today or less: it
-  touches its window's days only.
+- A lookup with a time range inside one UTC day touches one part, as
+  today. A longer window touches one part per day it overlaps, and the
+  router charges each part on its own, so splitting multiplies the read
+  side here too: a 7-day `request_id IN (100 keys)` on logs goes from
+  about 200 leaf GETs on one tail to about 7 x 126 = 882, and a single
+  key from 2 to 14. A 1-hour window that crosses midnight goes from 2 to
+  4.
 - A lookup with no time range touches one part per day. A single key costs
   2 GETs per day (60 at 30 days). A 100-key list over 30 days exceeds
   `L_max` after about 16 to 19 days and leaves the rest to the tier-1
@@ -178,7 +200,7 @@ and that figure decides whether alternative 4 becomes a follow-up.
 
 | check | target | miss | source |
 |---|---|---|---|
-| A1. advance at a full-day tail, logs, switch on | at most 26 build passes, at most 1.4 GB leaf bytes written, fold peak RSS at most 2.0 GB | more than 26 passes, over 1.6 GB, or over 2.0 GB RSS | predicted; box D rates, comment 6700944105 |
+| A1. advance at a full-day tail, logs, switch on | at most 26 build passes, at most 1.4 GB leaf bytes written, fold peak RSS at most 2.0 GB | more than 26 passes, over 1.6 GB, or over 2.0 GB RSS (predicted peak about 1.91 GB). An RSS miss with the passes and bytes in band is not fixed inside this decision: it opens a follow-up on a 6-hour seal span (costed above) or on the held previous-leaf rule | predicted; box D rates, comment 6700944105 |
 | A2. advance at a full-day tail, spans | at most 3 passes, at most 0.25 GB leaf bytes | more than 3 passes or over 0.3 GB | predicted; box D rates, comment 6700944105 |
 | A3. sealed days keep their leaves | from the second fold after day d seals, an advance issues 0 leaf PUTs and 0 previous-leaf GETs for day d's part | any leaf PUT or GET for a sealed day it did not change, after its sealing fold | predicted |
 | A4. partition determinism | two folds of the same entry set produce byte-identical HEADs; the switch-off partition is unchanged | any difference | predicted |
