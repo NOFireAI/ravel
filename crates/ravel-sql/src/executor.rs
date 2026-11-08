@@ -11535,6 +11535,7 @@ pub(crate) mod tests {
                 spill: Some(crate::config::SpillConfig {
                     dir: root.to_path_buf(),
                     max_bytes: 1 << 30,
+                    merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 ..SqlConfig::default()
             },
@@ -11560,6 +11561,7 @@ pub(crate) mod tests {
                 spill: Some(crate::config::SpillConfig {
                     dir: root.to_path_buf(),
                     max_bytes,
+                    merge_fan_in: crate::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 ..SqlConfig::default()
             },
