@@ -453,6 +453,7 @@ use threshold::*;
 
 #[doc(hidden)]
 pub use batch::values_memo_build;
+pub(crate) use batch::view_registry;
 pub(crate) use limit_hint::LogsLimitHint;
 pub(crate) use partition_topk::LogsPartitionTopK;
 pub(crate) use threshold::ConfirmTopKThreshold;

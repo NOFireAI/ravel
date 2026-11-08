@@ -1947,7 +1947,12 @@ abneq and abq26).
        `cap_quarter`.
      - So pull request 3's B arm runs the default, with no flag.
    - **Off switch.** `0` means no view memo: the rule builds today's `CastExpr`, and every plan and
-     counter is main's. That is the rule-off side of any later paired run.
+     view counter is main's. That is the rule-off side of any later paired run.
+     - Note (2026-11-07, pull request 2): `0` is not byte-identical to main in the data cache. Each
+       string memo carries the two view slots, so the memo constant charged to the data cap
+       (`VALUES_MEMO_BYTES`) is 608 B against main's 576 B, 32 B more per memo-capable entry, and a
+       served plain block keeps a small served mark that no budget charges. Plans and the view
+       counters are unchanged.
    - **Why that number.** Plain SearchPhrase views are at most 16 B x 99,997,497 rows = 1.60 GB, and
      1.36 GB at an 85% plain fraction (inference). 2.0 GB holds them with about 0.4 GB to spare, for
      plain blocks of other columns.
