@@ -930,7 +930,28 @@ answered, but three properties of the decision above cost the rest:
    above `L - H`, up to `L - H/2`. On c6a.large row 14 the whole-pool cap
    alone refused the outer final aggregate, holding 14 MB, every time,
    while the inner aggregate held 734 MB and never got the refusal that
-   would make it spill.
+   would make it spill. Note (2026-11-08, the M3 fix): a spill-enabled
+   session's disk manager bounds DataFusion's spill merge fan-in at 2
+   (`SPILL_MERGE_FAN_IN` in `crates/ravel-sql/src/session.rs`); a
+   spill-disabled one keeps DataFusion's default, 0, which is unbounded. A
+   spilled aggregate replays its runs through DataFusion's multi-level merge,
+   which with no bound seats one read buffer per run until the pool refuses a
+   grow, and the re-aggregation behind the merge grows on the same pool with
+   no spill to fall back on, so the first refusal it meets fails the
+   statement. With the merge left that room, the ClickBench row 35 shape
+   failed its retry at a spill-mode cap of 50% of the unlimited peak, the
+   final aggregate's replay asking past the cap, and the row 14 shape at
+   70%. The cost is extra merge passes that rewrite the runs: in the
+   issue's sweep of the two shapes at caps of 30% to 100% of the unlimited
+   peak, fan-in 2 wrote up to 2.4 times the spill bytes of the unbounded
+   merge (row 35 at 80%: 57.5 MB against 24.3 MB). It passed 15 of the 16
+   cells, against 13 unbounded and 13 at fan-in 4, 8 and 16. Fan-in 3 also
+   passed 15 and wrote fewer bytes in the cells measured, but it is one step
+   from fan-in 4, which fails row 35 at 50%, so 2 is kept for the margin.
+   The remaining failure,
+   row 14 at 40%, fails at every fan-in swept: the lone aggregate's replay
+   outgrows its fair share. DataFusion 55 raises a fan-in of 1 to 2, so 2 is
+   the smallest bound it applies.
 3. **In a spill-enabled pool, a reserve-ahead refusal of a spill-capable
    consumer is a spill trigger, not a failure.** The same refusal of a
    consumer that cannot spill is unchanged, and so is any refusal in a
