@@ -2276,8 +2276,8 @@ cached plain-page column, apart from the decoded cache's own cap and charged
 to the process memory budget; the evictor releases those views first under
 memory pressure. Startup logs `decoded column-block cache view budget` with
 the value in force and the term that bound it: `cap_quarter`, `two_gib`,
-`budget_room`, `floored_at_zero`, or `explicit` for a value set by flag
-(`decoded_cache_off` while the decoded cache is off). With a
+`budget_room`, `floored_at_zero`, or `explicit` for a value set by flag.
+With a
 20,487,102,875-byte budget and an 8 GB cap it is 2,000,000,000 bytes, bound
 by `cap_quarter`. An explicit value is used as given, `0` turns the view memo
 off, and a value above the budget's room is still used, with a startup

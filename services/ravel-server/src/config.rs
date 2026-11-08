@@ -3087,7 +3087,7 @@ pub struct Cli {
     /// the cap and the admission margin, floored at 0; it is 0 while the
     /// decoded cache is off. `0` keeps no views. Startup logs the value in
     /// force and the term that bound it (`cap_quarter`, `two_gib`,
-    /// `budget_room`, `floored_at_zero`, `explicit` or `decoded_cache_off`),
+    /// `budget_room`, `floored_at_zero` or `explicit`),
     /// and warns when an explicit value is above the budget's room that view
     /// fills past it may be refused.
     #[arg(long, value_name = "BYTES")]
