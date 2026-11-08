@@ -3111,11 +3111,25 @@ fn release_b_leaves_no_combined_role_or_removed_heartbeat_field() {
     let mut hits = Vec::new();
     let mut allowed_hits = 0;
     while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read dir") {
-            let path = entry.expect("dir entry").path();
+        // Server tests running beside this one create and delete spill and
+        // scratch directories under the crate directories, so a directory
+        // listed a moment ago can be gone by the time it is read.
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => panic!("read dir {}: {err}", dir.display()),
+        };
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => panic!("dir entry in {}: {err}", dir.display()),
+            };
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if path.is_dir() {
-                if !matches!(name, "target" | "node_modules") && !name.starts_with('.') {
+                if !matches!(name, "target" | "node_modules" | "sql-spill")
+                    && !name.starts_with('.')
+                {
                     stack.push(path);
                 }
                 continue;
