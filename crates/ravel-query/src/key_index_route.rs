@@ -473,8 +473,9 @@ pub struct ValueRouteFigures {
     pub figures: RouteFigures,
     /// Segments the pass routed [`SegmentRoute::Pruned`].
     pub segments_pruned: u64,
-    /// Of those, the segments no other value of a plan holding this value
-    /// routed `Pruned`: what this pass alone removed from that plan.
+    /// Of those, the segments for which some plan holding this value has no
+    /// other value that routed them `Pruned`: what this pass alone removed
+    /// from that plan.
     pub segments_pruned_alone: u64,
 }
 
