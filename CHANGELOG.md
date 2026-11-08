@@ -6,6 +6,890 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-11-08
+
+### Fixed
+
+- **MetricsBench's AWS launcher resolves the Ravel source commit** (#940,
+  epic #2821). `deploy/metricsbench/aws/launch.sh` turns a short
+  `ravel-source-commit` the checkout knows into its full id, and refuses with
+  exit 64 any value that is neither such a commit nor a full 40-character id,
+  before it uploads anything. `run.sh` refuses a short id only after the box
+  has built the harness, so a short id used to cost a box launch and a build.
+- Per-request usage for an exemplars query now counts a data-object read
+  that found the object gone.
+- **`rspan inspect` and `rlog inspect` now validate KEY_IDX block ordinals
+  against the object's own block count** (#3706). Previously the inspectors
+  only crc-verified the section and printed its summary; an object whose
+  KEY_IDX named a block at or past the object's real block count, which the
+  probe path already refuses, inspected clean. Each such entry is now a
+  `key_idx finding:` line naming the field, bucket, and bad ordinal, and the
+  command exits non-zero, the same as any other corrupt section
+  (`summary_reports_block_ordinals_past_the_count` in both
+  `ravel_rspan::key_index` and `ravel_logseg::key_index`, and
+  `block_ordinal_past_the_count_prints_finding_and_fails` in ravel-cli's
+  `rspan_inspect` and `rlog_inspect` integration suites).
+- **Every MCP tool that cuts rows at `max_rows` stays inside its byte cap**
+  (issue #3733, following #3765). `ravel_analyze_timeseries`,
+  `ravel_query_promql`, `ravel_query_sql` and `ravel_search_logs` now fit
+  their envelope with the row cap's `rows_omitted` count and `row_cap_hit`
+  already written, and `ravel_query_sql`'s `add_an_order_by` step and
+  `ravel_agent_events`' `resume_events` step and resume cursor go in before
+  the fit measures the envelope. Before, a response packed to its cap could
+  end up over it once those were added
+  (`a_row_capped_result_at_its_byte_cap_finishes_inside_it`,
+  `a_row_capped_answer_at_its_byte_cap_finishes_inside_it`,
+  `a_row_capped_page_at_its_byte_cap_finishes_inside_it`,
+  `a_row_capped_unpaged_page_at_its_byte_cap_finishes_inside_it`,
+  `an_ok_events_page_at_its_byte_cap_keeps_its_resume_step_inside_it`).
+- **An MCP audit record names the tool call that wrote it** (#3734, epic
+  #1374). MCP tool calls were audited under the engine's own language with
+  no id, and every envelope's `ids.query_id` was empty. Each query tool
+  call now gets one UUID, reported as `ids.query_id` and written as
+  `query.id` on every audit record the call produces, beside
+  `query.language = mcp:<tool>` and the engine's language in
+  `query.engine_language`; `ravel_search_logs` with `predicates` writes its
+  two records under the one id. A query over HTTP keeps its engine language
+  and carries neither attribute. `ravel_find_labels` now records its matcher
+  set as `query.text` instead of an empty string. `ravel_capabilities`
+  writes no audit record, since it reads no tenant data, and reports its
+  protocol revisions from the same list the route accepts
+  (`every_tool_call_writes_exactly_one_audit_record`,
+  `a_two_statement_call_audits_both_under_one_query_id`,
+  `an_http_query_keeps_the_engine_language`).
+- **MCP tools refuse `evidence_ref` alike and pick cap next steps by the
+  cap that cut the result** (#3737, review #1388 findings S10 and N3,
+  ADR-1374's 2026-11-04 amendment). `ravel_capabilities`,
+  `ravel_describe_data`, `ravel_explain_query` and the Ravel Agents tools
+  now refuse an `evidence_ref` as `invalid_argument` instead of ignoring
+  it; tools that list it still refuse it as `unsupported`. `ravel_get_trace`
+  no longer advises raising `max_rows` when the byte cap cut the trace or
+  `max_rows` is already 5,000. A result whose only cut is shortened cells is
+  now `ok` with no cursor and a `read_full_cells` step, including one row
+  in `ravel_search_logs` and `ravel_query_sql`, which used to get a cursor
+  and an equal-group step. That step names the configured
+  `max_response_bytes` ceiling, says when the cells cannot be returned in
+  full, and never advises fewer rows. A `ravel_agent_events` page whose
+  only cut is a shortened payload keeps the route's `next_cursor`.
+- **`stats.phases[].segmentsOpened` now counts on the logs, spans, audit and
+  alerts query paths and on the PromQL log lane** (#3745). Previously only
+  the metrics RSEG fetcher and the exemplars reader
+  (`read_segment_exemplars`) fed
+  this counter, so these paths reported 0 in every phase. Each object now
+  counts once per statement on the SQL and trace surfaces, and once per
+  selector fetch on `/api/v1/query` (N log selectors reading one object
+  count it N times; the metrics lane fetches once per distinct matcher
+  set), under the phase its footer read is charged to, whether the footer
+  came from a GET or from the cache. An object skipped before its footer
+  decoded does not count, nor does a GET that fails or a prefetched open
+  the statement never consumes. The logs fast-path verdict counts its
+  footer reads under `plan` and the scan does not count them again. A
+  TopK-skipped segment counts under `plan` when the plan pass decoded its
+  footer and in no phase otherwise. Remote slices of a distributed SQL
+  query still report 0, since they fold only wire bytes into the
+  coordinator
+  (`small_object_equality_opens_every_object_under_scan`,
+  `warm_logs_statement_opens_the_same_objects_with_zero_data_gets`,
+  `key_indexed_equality_opens_every_object_under_plan_not_scan`,
+  `probe_only_keyed_scan_opens_every_object_once_under_plan`,
+  `audit_table_statement_opens_every_object_under_scan`,
+  `alerts_table_statement_opens_every_object_under_scan`,
+  `log_selector_on_api_v1_query_counts_each_footer_once_under_plan`,
+  `two_log_selectors_on_api_v1_query_count_each_footer_once_per_selector`,
+  `trace_lookup_by_sql_opens_every_object_under_probe_not_scan`,
+  `trace_lookup_by_get_api_traces_opens_every_object_under_probe_not_scan`,
+  `adr_3692_row_4_warm_trace_lookup_opens_the_same_objects_with_zero_data_gets`,
+  `a_window_outside_every_object_opens_nothing`,
+  `a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served`,
+  `a_failed_get_records_no_segment_open`,
+  `a_failed_open_records_no_segment_open`).
+- **Upgrade note for the PromQL sample fold released in 0.30.0** (issue
+  #3747). The fold charges about 24 bytes per held scalar sample, and
+  substantially more per native-histogram sample, whose spans and buckets are
+  charged too, plus each series' labels. A large PromQL read can therefore
+  now be refused by the memory budget at fetch time, where before it grew
+  outside the budget until it answered or the host floor refused it. The two
+  refusals read differently:
+  - a budget refusal: `fetch memory exhausted: requested N bytes, X of Y
+    byte limit already reserved`, counted in
+    `ravel_memory_budget_refusals_total`;
+  - a host-floor refusal: `fetch memory exhausted: host available memory N
+    bytes is below the M byte floor (requested R)`, counted in
+    `ravel_memory_gate_refusals_total`.
+
+  To admit such a read, raise the budget with `--memory-budget-bytes`, or
+  narrow the statement's time range or series. On Kubernetes the budget is
+  `spec.query.memoryBudgetBytes`, and `spec.query.resources.limits.memory`
+  must rise with it: below the budget plus 256 MiB the operator does not
+  apply the query Deployment, the running pods keep the old budget, and the
+  cluster reports `Degraded=True` with reason `QueryMemoryBudgetExceedsLimit`
+  (docs/guides/kubernetes.md, "Pinning the query memory budget").
+  `max_series` is now checked as series arrive, so that refusal can come
+  before the last object is fetched.
+- **An MCP query's estimate says when it is not an upper bound** (#3752,
+  review #1388, epic #1374). Every tool that runs a query reported
+  `budget.estimate_is_upper_envelope: true`, including over `logs`, `spans`,
+  `alerts`, `audit` and Parquet tables, whose estimates the server cannot
+  bound, and reported an unbounded `decompressed_bytes` as 0.
+  `ravel_explain_query` already said false for the same statement. The flag
+  is now derived from the components the estimator cannot bound, as the
+  explain derives it: such a component is `null` in `budget.estimate` and
+  named in `budget.estimate.unbounded`, and `ravel_query_sql` and
+  `ravel_explain_query` agree on one statement
+  (`query_sql_and_explain_agree_on_the_upper_envelope`).
+  `ravel_query_promql` (instant and range) and `ravel_analyze_timeseries`
+  report `estimate_is_upper_envelope` false, with `bytes_scanned`,
+  `store_requests` and `decompressed_bytes` `null` in `budget.estimate` and
+  `budget.estimate.unbounded` listing `estimated_store_bytes`,
+  `estimated_requests` and `estimated_decompressed_bytes` (`segments_read`
+  stays a number and is never listed), when the query reads the
+  log lane (a selector naming `ravel_log_lines` or `ravel_log_bytes`) or a
+  federated remote, or when a distributed fetch fell back to fetching
+  locally; otherwise they report true with an empty `unbounded` list.
+- **An MCP tool call runs under one deadline** (#3753, review #1388, epic
+  #1374). A `ravel_search_logs` call with `predicates` gave its
+  declared-column lookup and its statement a whole deadline each, so it could
+  run for twice its deadline. The deadline is now measured from the call's
+  start and shared by every service call it makes; the statement runs under
+  what the lookup left, and a service call with nothing left fails as
+  `deadline` without reaching the store
+  (`search_logs_lookup_and_statement_share_one_deadline`,
+  `a_service_call_with_no_time_left_fails_as_deadline_before_the_store`).
+  Each page of such a call warns that `budget.actual` counts the statement
+  only (`a_page_says_its_spend_leaves_out_the_declared_column_lookup`). The
+  MCP reference, guide and ADR-1374 said a cursor expires with the minting
+  call's remaining deadline; it lives until the protection horizon less the
+  grace period from its mint, as it always did, and the documents now say so
+  (`a_cursor_lives_until_the_horizon_less_grace_not_the_calls_deadline`).
+- **An MCP PromQL range whose last step overflows is refused** (#3755,
+  review #1388, epic #1374). `ravel_query_promql` computed a range's last
+  step as `start + (end - 1 - start) / step * step` unchecked, so a range
+  under the step limit whose span does not fit an `i64` (for example
+  `-9000000000000000000` to `9000000000000000000` ns with a `2000000s`
+  step) panicked in a debug build. The arithmetic is now checked in the
+  range validation `ravel_query_promql` and `ravel_analyze_timeseries`
+  share, and such a range fails with `invalid_argument` before the backend
+  runs (`a_range_whose_last_step_overflows_is_refused_before_the_backend`).
+- **A `ravel_query_sql` walk ordered by `count(...)` pages again** (#3774,
+  following #3749, epic #1374). The cursor now pins a digest of the segment
+  set page one read. A later page under an order computed from other rows is
+  served only over the same segments, else it is `cursor_expired` with a
+  `rerun_page_one` next step, so such a walk does not serve a group twice
+  (`query_sql_a_count_order_pages_and_a_late_row_ends_the_walk_instead_of_repeating_a_group`,
+  `query_sql_a_compaction_between_pages_ends_a_count_order_walk`). A page
+  under an order on the row's own columns that observed a changed segment set
+  is served and says so in a warning, in `ravel_search_logs` too
+  (`an_own_column_walk_warns_on_every_page_after_a_move`). Other aggregate,
+  window and subquery order terms still run unpaged. Cursors minted before
+  this change decode as `cursor_invalid`.
+- **A `ravel_search_logs` page mints no cursor its own redemption would
+  refuse** (#3779, epic #1374). As `ravel_query_sql` already did, the tool
+  checks the last row's `(ts, observed_ts)` against the plan before it mints;
+  a row of the wrong kinds ends the page `ok_bounded` with no cursor and a
+  `narrow_time_range` next step instead of a cursor that answers
+  `cursor_invalid` (`a_last_row_of_the_wrong_kind_mints_no_cursor`). A
+  `ravel_query_sql` order by `sum(col)` still runs unpaged, now for a stated
+  reason: a float sum can differ in its last bits between runs, and an integer
+  sum (`Int64` for a signed column, `UInt64` for an unsigned one) wraps past
+  the 64-bit range with no error, so its order is not the order of the totals
+  (`an_integer_sum_wraps_on_overflow_at_one_and_eight_partitions`).
+- **A PromQL query whose distributed slice retried no longer claims its
+  estimate is an upper envelope.** A slice that answered after a retry or a
+  reroute carries the spend its abandoned attempts reported, which the
+  estimate does not count, so the query now sets `estimate_excludes_spend`
+  and the MCP envelope reports every estimate component unbounded with
+  `estimate_is_upper_envelope` false.
+- **The metrics (RSEG) compaction merge no longer keeps one copy of a
+  series' label set per input that carries it** (#3817). Every input's
+  catalog is retained for the whole merge, and each one held its own copy of
+  the labels of every series it carried, so a bucket of many inputs sharing
+  the same series held the bucket's label sets once per input. Catalogs now
+  share one label set per series id as they load. In the measurement test
+  (`tests/rseg_merge_memory.rs`, 512 inputs of 256 series over a 2,048-series
+  bucket) the retained label heap falls from 87,892,992 to 1,455,248 bytes,
+  the same figure as at 64 inputs, and the merge's peak resident bytes from
+  114,537,563 to 26,002,667. Compaction output is unchanged. The series and
+  run plans, and the per-series index built from them, still hold one entry
+  per input and series, so peak memory still grows with the input count.
+  The merge's memory tracker charges are now released when a merge fails or
+  loses its claim, not only when it succeeds.
+- **RLOG compaction gains two read modes that stop re-reading an input per
+  stream, and logs which mode it took** (#3819, ADR-3819). The L0 to L1
+  merge used to fetch an input's row group again for every stream in it, so
+  a many-stream logs bucket cost about inputs times streams GETs. The merge
+  now plans one of three modes from the inputs' catalogs before it fetches
+  a block: it fetches every row group once and holds it when the inputs fit
+  a resident ceiling (`merge_cursor_budget_bytes` divided by
+  `--maintain-unit-concurrency` in ravel-server), fetches the row groups
+  once per stream-range pass with `input_read_concurrency` fetches in
+  flight when that fits instead, and otherwise keeps the per-stream cursor
+  merge it used before; a stream too large for one pass keeps the cursor
+  merge in every mode. The first two modes apply when each block carries
+  one or a few streams, as on a 12-input, 60-stream test bucket where the
+  block GETs fall from 720 to 12 (resident, 8 passes) or 108 (fetch per
+  pass, 9 passes). On a bucket whose blocks each carry hundreds of streams,
+  the logs benchmark among them, the plan is still the cursor merge and the
+  cost is unchanged; ADR-3853 is the fix for those buckets. Every L1 segment
+  keeps exactly its bytes and key. The merge logs its read mode, and the
+  per-phase request report gains the pass count and resident bytes.
+- **An integer SQL `sum` that overflows fails instead of wrapping** (#3838).
+  `sum` over integer input sums exactly and fails the query with an HTTP 422
+  (`FAILED_PRECONDITION` over Flight SQL) naming the aggregate and its
+  `Int64` or `UInt64` result type, where it used to return a wrapped total
+  with no error. Only the final total is checked, so the result does not
+  depend on the partition count. `sum(DISTINCT ...)`, `FILTER` and window
+  `sum` are checked the same way; float and decimal `sum` are unchanged, and
+  ES|QL's `STATS SUM` over a long still reads null on overflow (ADR-0022,
+  integer sum amendment).
+- **SQL `sum(x + c)` over an integer column is exact and shares one
+  accumulator** (#3845). For an integer column and an integer literal,
+  `sum(x + c)`, `sum(c + x)` and `sum(x - c)` return the exact
+  `sum(x) + c * count(x)`, narrowed once to the result type, so a row whose
+  `x + c` leaves the column type no longer wraps: over `i64::MAX` and
+  `-i64::MAX`, `sum(v + 1)` returns 2 from a scan, where it used to fail with
+  the integer sum overflow while the statistics path answered 2. A total
+  that does not fit still fails with that error. Every such term over one
+  column shares one sum and count, so ClickBench q30's ninety terms run one
+  aggregate. `DISTINCT`, `sum(c - x)` and window forms keep summing the
+  per-row value, and `sum(x * c)` still wraps per row (#3847).
+- **The checked integer SQL `sum` keeps 8 bytes per group again** (#3845).
+  Grouped, it held an `i128` and a flag per group, 17 bytes against the
+  built-in's 8, and ClickBench q33 failed the process memory budget it used
+  to fit. It now keeps the result type's own `i64` or `u64` and a validity
+  bit per group, and moves a group whose running sum would leave that type
+  to an exact `i128` held aside, so results and the overflow error are
+  unchanged. `sum(x + c)`'s grouped sum and count drop from 24 to 16 bytes
+  per group the same way.
+- **`ravel-cli` prints library log lines on stderr** (#3854). It installed no
+  tracing subscriber, so a `maintain compact-bucket` or `compact-tenant` run
+  dropped the compactor's `rlog merge read mode` line. With `RUST_LOG` unset
+  it now logs warnings from every crate plus `ravel_maintain`'s info lines; a
+  set `RUST_LOG` replaces that default. Stdout still carries only the report.
+- **Compacted metrics parts fetch in batches of whole series** (#3864,
+  #3818). A query over a compacted L1 metrics part reserves fetch memory one
+  batch of whole series at a time, decoding each batch into the sample fold
+  and releasing it before the next one reserves, so a part whose selected
+  pages exceed a fetch share no longer refuses with fetch memory exhausted.
+  A batch's coalesced page bytes, including the gaps the coalescer bridges
+  between selected pages, are at most the fetch memory limit divided by twice
+  the GET permits, with an 8 MiB floor; a single series larger than that is
+  fetched alone. Opening a segment now reserves its first GET as well.
+  This is a partial fix for #3818, which stays open.
+- **`metricsbench_query` keeps the diagnostics sidecar on a
+  repetition-accounting failure** (#3898). When the timed repetitions sent
+  plus those skipped after a timeout do not add up (ADR-0927's 2026-11-06
+  amendment, decision 3), the run still exits 65 and writes no report, but
+  with `--diagnostics` it now writes the sidecar first, the same fields a
+  clean run writes, so the `skipped_reps`, `ravel_cost` and `ulp_gaps`
+  records that explain the mismatch are kept. A sidecar that cannot be
+  written on that path still exits 65 and the message names both failures.
+- **SQL spill admits exact `min`, `max` and integer `avg`** (#3899,
+  ADR-0954's exact min, max and integer avg spill amendment). With spill
+  configured, a grouped aggregate over its memory budget now spills instead
+  of being refused when it computes `min` or `max` over a non-float type
+  (integers, decimals, booleans, strings, binary, dates, times, timestamps)
+  or `avg` over `Int8` to `Int64` or `UInt8` to `UInt32`, and an
+  `ORDER BY` over a `HAVING` filter gets the same group-key tiebreak as one
+  directly over the aggregate. ClickBench row 29, refused on a 4 GB host
+  before, is eligible. `min`/`max` over floats and `avg` over `UInt64` or
+  floats are still refused. A top-k the bounded aggregate serves (the
+  bounded aggregate enabled, one GROUP BY key, a `LIMIT` plus `OFFSET` no
+  larger than `bounded_topk_max_limit`, no `HAVING`, and a single sort
+  term on the lone `max` descending or `min` ascending over a
+  non-nullable column, with a group key and value type the bounded
+  aggregate supports) keeps its single term and the bounded aggregate;
+  any other sort over a single `min` or `max`, including one over a
+  nullable logs column or a `Boolean` or `Binary` key or value, gets the
+  tiebreak.
+- **A logs scan whose own partitions hold the fetch budget waits for a turn
+  instead of failing** (#3899, ADR-2414's fan-out narrowing amendment). On
+  the whole-segment fast path, a retried segment open that the fetch memory
+  budget refuses again while sibling partitions of the same statement hold
+  their segments no longer fails the statement with `fetch memory exhausted`.
+  The statement's fan-out is narrowed to the partitions holding a segment at
+  that moment, and the refused partition opens again on the next turn, when
+  a sibling finishes its segment. Rows are unchanged; only the order and
+  concurrency of the opens change. The wait is bounded at 30 seconds, and a
+  sibling waiting behind a partition whose consumer stopped polling pays that
+  bound once, not at each of its segments. A refusal with no sibling holding
+  a segment is returned as before. The scan counts each narrowing in the
+  `fan_out_narrowings` metric and in `SqlStats::scan_timing`. ClickBench row 9
+  on a 4 GB host ran within about 16 MB of the fetch limit and was refused a
+  19 MB fetch in one server lifetime; it has not been re-measured with this
+  change.
+- **Small log buckets are no longer refused for merge geometry** (#3905,
+  ADR-3853). A cursor merge predicting at most 10 million decoded rows
+  (`MIN_GEOMETRY_PREDICTED_DECODED_ROWS`) now always runs as a cursor merge,
+  whatever its rows-per-record ratio: it is neither refused under
+  `reason="geometry"` nor routed to a two-level merge. The floor sits in the
+  one predicate both decisions read. A two-level unit whose scratch
+  subdirectory cannot be wiped now keeps the bytes it wrote charged against
+  `--maintain-scratch-max-bytes`, counted once, until the process restarts
+  and the next process to lock the directory removes the orphan, instead of
+  releasing the charge while the bytes stay on disk.
+- **The two-level merge's level-2 fit check counts runs, not run parts**
+  (#3943; ADR-3853 correction 2026-11-07). It counted every part of every
+  scratch run as a level-2 input, so a run cut into many parts multiplied
+  its price and buckets whose level 2 fits were refused, before level 1 or
+  after it. The check now counts runs, one per group, and prices each at
+  two blocks. `PredictedLevelTwoFit` names the
+  per-input cost, the group size, the runs and the blocks per run, and
+  `LevelTwoFit` names the runs and the blocks per run. Published parts are
+  unchanged.
+- A spans key-index leaf read refused by the fetch memory budget now counts under the key-index statistics figure `reservationsRefused` instead of `leavesRejected`, matching logs.
+- A metrics page fetch now refuses an inconsistent run plan instead of batching it, and no longer sizes a batch below its coalesced reads when page ranges arrive out of order.
+
+### Added
+
+- **`ravel_get_trace` returns the trace's log records with
+  `include_logs: true`** (#1382, epic #1374, ADR-1374's logs-leg
+  amendment). The call needs a `time_range` and runs `ravel_search_logs`'s
+  `trace_id` statement over it, ordered by `ts` then `observed_ts`, into a
+  new `logs` block. The leg warns that it is an unindexed scan, reports its
+  spend in `logs.budget` apart from the span lookup's
+  `logs.span_lookup_budget`, and makes the call report
+  `estimate_is_upper_envelope: false`; `budget.actual` stays the whole
+  call's. It runs under what is left of the call's deadline, is `skipped`
+  when nothing is left, and a leg that fails is `failed` with its failure
+  class while the spans are still returned. Records count against
+  `max_rows` separately from spans and share `max_response_bytes` after
+  them; a cut leg mints no cursor and points at `ravel_search_logs`.
+  `include_logs` false or omitted leaves the envelope unchanged. An
+  all-zero `parent_span_id` is now a `root`.
+- **MetricsBench's `--diagnostics` sidecar now carries Ravel's per-query
+  object-store cost** (#940, epic #2821, ADR-0927's 2026-11-04 amendment,
+  decision 4). A new `ravel_cost` array holds one record per timed
+  repetition of every pass (`entry`, `pass`, `rep`, `status`, `latency_ms`,
+  `accounting`, `phases`), never summed or pooled across repetitions, so
+  each repetition's cost sits beside its own latency. `accounting` and
+  `phases` are copied as returned from the answer's `data.stats.accounting`
+  and `data.stats.phases`, and are `null` when the answer carries no
+  `data.stats` (a timeout, for example). Warm-up passes and comparator
+  engines add nothing. A new `ravel_cost_note` field states that the
+  figures are logical object-store call counts, not billed provider
+  requests (decision 8). `report.json` is unchanged.
+- **MetricsBench scrapes Ravel and Mimir around the query step** (#940,
+  epic #2821, ADR-0927's 2026-11-04 amendment, decision 2).
+  `deploy/metricsbench/run.sh` writes `mimir-metrics-at-query.txt` beside
+  the existing `ravel-metrics-at-query.txt` before the query step, and
+  `ravel-metrics-after-query.txt` and `mimir-metrics-after-query.txt` once
+  the query step has written its report and before `validate` and `stop`,
+  so each engine's cache state over the query phase is the difference of
+  its two scrapes (case w). `stamps.json` records each scrape's outcome
+  under `query_scrapes` as `ok` or why not. A failed scrape is stamped and
+  never fails the run, and the failed new scrape's file is not left behind
+  (cases w1 to w4). The falsification run takes none of them and stamps
+  `query_scrapes` `not applicable` (case f).
+- **MetricsBench reports name their regime** (#940, epic #2821, ADR-0927
+  2026-11-04 amendment decision 1). `metricsbench_query` records
+  `regime=steady-state` in the report's provenance config on every report it
+  writes, from `ravel_bench::metrics_query::REGIME_STEADY_STATE`
+  (`the_provenance_config_records_the_steady_state_regime_once`). A report
+  written before this change carries no `regime` key.
+- **A tier-2 key-index router for spans and logs** (#3701, epic #3692,
+  ADR-3692 decisions 1 and 2). `Catalog::resolve_pruned_with_parts` returns
+  each sealed segment's part and entry ordinal with the part's leaf refs,
+  and `ravel_query::key_index_route::route` answers each segment `Pruned`,
+  `Blocks` or `Uncovered` from the part leaves alone for a set of 1 to 1,024
+  keys. Parts are admitted largest first under `KEY_INDEX_LEAF_GET_CEILING`
+  (2,048 leaf GETs) and `KEY_INDEX_MAX_PROBED_PARTS` (1,024 parts), and a
+  part beyond either goes to tier 1, never to a scan
+  (`ceiling_admits_the_largest_parts_in_order`). A stale part binding, a
+  corrupt leaf or a refused decode reservation leaves the part uncovered
+  (`stale_part_binding_leaves_the_part_uncovered`,
+  `a_refused_reservation_leaves_the_part_uncovered`), another tenant's leaf
+  fails the statement and counts an isolation breach
+  (`another_tenants_leaf_fails_the_statement_and_counts_a_breach`), and a
+  property test against a whole-scan oracle pins that no segment holding a
+  key is ever pruned (`router_never_prunes_a_segment_the_oracle_returns`).
+  Leaf frame decoding now refuses a frame whose header claims more entries
+  than its bytes can hold before decompressing it, and, after
+  decompression, an entry whose block count exceeds the bytes left before
+  allocating its block list. Spans trace lookups (#3702) and logs
+  declared-key equalities (#3703) are the query paths that call it.
+- **Spans trace lookups read the catalog's key-index leaves** (#3702, epic
+  #3692, ADR-3692 decisions 3 and 9). On a catalog folded with
+  `--fold-key-index-leaves`, a `trace_id =` lookup over SQL or
+  `GET /api/traces/<id>` routes through the tier-2 router: a covering part
+  costs two leaf GETs, an object its leaves prove the trace absent from is
+  never read, and a holder is read at the blocks the leaf names without its
+  KEY_IDX (`folded_lookup_reads_two_leaf_gets_and_no_pruned_object`). Parts
+  past the lookup's ceilings are probed at tier 1
+  (`parts_past_the_ceiling_are_probed_at_tier_one`). The fetcher's first
+  read of an object is now the fold's 8 KiB footer suffix instead of 64 KiB,
+  and KEY_IDX is read before SKIP_IDX, so an uncovered object without the
+  trace whose footer fits the 8 KiB suffix costs three requests, the first
+  at most 8 KiB and all three under 16 KiB in sum, and no SKIP_IDX read
+  (`unfolded_absent_object_costs_three_gets_under_sixteen_kib_and_no_skip_idx_read`).
+  The cold columnar path reads a holder at the routed blocks too
+  (`a_cold_columnar_lookup_reads_only_the_routed_blocks`). When the
+  process-wide memory budget refuses the charge for the parts, the
+  lookup re-resolves without them and probes every segment at tier 1
+  instead of failing
+  (`a_trace_lookup_degrades_to_tier_one_on_a_refused_parts_charge`).
+  Responses carry `stats.keyIndex` and `stats.signals[].keyIndex`
+  (`partsCovered`, `partsUncovered`, `partsBeyondCeiling`, `leavesRejected`,
+  `reservationsRefused`, `leafGetRequests`, `leafWireBytes`, `keysProbed`,
+  `skippedByBudget`, `skipIdxDropped`) whenever a trace id was pushed down,
+  and the server exports `ravel_query_key_index_parts_total{signal,outcome}`
+  and `ravel_query_key_index_leaf_gets_total{signal}` on every `/metrics`
+  page (`the_metrics_page_renders_both_key_index_route_families_after_a_lookup`).
+  A leaf GET is counted when it is issued, so one whose request is dropped
+  mid-flight is still charged
+  (`a_dropped_span_leaf_read_still_charges_the_get_it_issued`).
+- **A logs declared-key equality routes through the key-index leaves once
+  per scan** (#3703, epic #3692, ADR-3692 decisions 4 and 9). A logs scan
+  carrying exactly one declared-key equality runs the tier-2 router over its
+  ts-relevant segments once per statement, before the plan pass, on the
+  three surfaces whose executor entry passes the planned lane parts: SQL
+  over `POST /api/v1/sql`, ES|QL, and the MCP tools that run SQL
+  (`search_logs` among them). A segment the part's leaves prove the key
+  absent from is never opened, whatever its size; a segment the leaves name
+  blocks for is planned with no KEY_IDX read, restricted to those blocks
+  above the whole-object bound; every other segment, including one whose
+  leaf failed its GET, its checksum or its reservation, takes the tier-1
+  route unchanged (`folded_equality_opens_only_the_holder`,
+  `a_failed_leaf_get_leaves_the_part_uncovered`). A leaf fetch the
+  fetch-memory pool refuses counts as a refused reservation, not a rejected
+  leaf. `stats.keyIndex` and the logs entry of `stats.signals` carry the
+  router's ten figures, and the `ravel_query_key_index_*` families move
+  under `signal="logs"`. A refused parts charge degrades the scan to tier 1
+  with every figure 0 (`a_refused_parts_charge_degrades_to_tier_one`).
+  Flight SQL (pinned and distributed) and `EXPLAIN` do not route logs and
+  still probe at tier 1.
+- **The fold builds the tail part's key-index leaves incrementally, under a
+  pair budget** (#3704, epic #3692, ADR-2707's incremental tail build
+  amendment and ADR-3692's #3704 amendment). With `--fold-key-index-leaves`
+  on, the build carries the previous tail part's leaves, matched by data
+  object key, and reads KEY_IDX sections only for new entries and for
+  entries those leaves left uncovered, which are read again on every
+  advancing fold while they stay uncovered; the leaves are byte-identical
+  to a full build at the same budget. One pass holds at most
+  `max(share, largest key8 run) + 1` pairs per field, the share being
+  `--fold-key-index-build-max-pairs` (ravel-server) or
+  `--key-index-build-max-pairs` (`ravel-cli catalog fold`) split evenly
+  over the fields the build indexes, read and carried pairs together,
+  default 8,000,000 (pinned by the catalog test
+  `every_pass_holds_at_most_its_share_open_slice_included`; about 88 B a
+  one-block pair is an upper-bound estimate). A larger part is built in
+  passes over disjoint key8 ranges, each closing its leaf slices before the
+  next, and every advancing fold over a tail above the budget repeats them;
+  a key8 over its share is held whole, and the previous leaves' stored
+  bytes, one decoded leaf frame and the sections in flight sit outside it.
+  Both flags are refused without their leaf build flag and at 0. The fold report, `ravel-cli catalog fold`
+  and `/metrics` gain `key_index_sections_read`,
+  `key_index_entries_carried`, `key_index_build_passes` and
+  `key_index_leaf_gets`, and `/metrics` sums them over no-op folds too;
+  `key_index_leaves_written` counts the published leaf set.
+- **Exact-key `IN` lists on logs and spans** (#3705, epic #3692, ADR-3692
+  decision 6). `user_id IN (...)` on a declared key-index column, and
+  `trace_id IN (...)` with 16-byte binary or 32-character hex literals, carry
+  one key set of up to 1,024 keys: a folded part's leaves drop the objects
+  that hold none of the keys, and each object still read probes its own
+  KEY_IDX for the whole set, with one read of the touched bucket span once
+  the set touches more than 64 buckets. The rows equal the union of the
+  per-key `=` answers, and `stats.keyIndex.keysProbed` is the distinct key
+  count of a scan routed through the leaves, 0 for one that is not
+  (`in_list_rows_equal_the_union_of_equalities`). A scan routes through the
+  leaves only with exactly one key arm, one equality or one `IN` set. The SQL
+  complexity guard now charges a flat list of literals one unit plus one per
+  64 literals, so a 1,000-key lookup is no longer refused as too complex; a
+  list of more than 4,096 literals is refused with a message naming that
+  cap. The distributed slice ticket gains version 12, which carries the logs
+  key set and the spans trace-id list to a worker; versions 8 to 11 are
+  unchanged byte for byte.
+- **A `ravel_query_sql` walk ordered by `min(col)` or `max(col)` pages**
+  (#3779, following #3774, epic #1374). Under a plain `GROUP BY`, a `min` or
+  `max` over a NOT NULL integer, string or nanosecond timestamp column of the
+  table is proven non-null and pages over page one's segment set, as a
+  `count(...)` order does (`max_order_walks_three_pages_exactly`,
+  `a_max_order_expires_when_the_segment_set_moves`). The argument is read from
+  the table, never from a projection alias of the same name. A `min` or `max`
+  over a float, Boolean or binary column, with `FILTER` or `OVER`, or under
+  `ROLLUP`, `CUBE`, `GROUPING SETS` or no `GROUP BY` still runs unpaged. A
+  page whose last row the plan would refuse as a resume position now ends
+  `ok_bounded` instead of minting a cursor that cannot be redeemed. The cursor
+  format is unchanged.
+- **A `ravel_query_sql` walk ordered by an integer `sum(col)` pages** (#3779,
+  following #3838, epic #1374). Integer `sum` is now a checked aggregate that
+  sums exactly and fails on overflow, so under a plain `GROUP BY` a `sum` or
+  `sum(DISTINCT ...)` over a NOT NULL signed or unsigned integer column of the
+  table pages over page one's segment set, as a `min` or `max` order does, and
+  the walk is the same at one and at eight partitions
+  (`integer_sum_walk_is_identical_at_one_and_eight_partitions`). A page whose
+  sum overflows `Int64` or `UInt64` fails the call with the overflow error
+  rather than paging a wrapped order
+  (`an_overflowing_integer_sum_order_fails_rather_than_pages`). A float `sum`
+  and a `sum` with `FILTER` still run unpaged
+  (`an_integer_sum_order_plans_and_a_float_sum_does_not`), and so does `avg`.
+- **A `ravel_query_sql` walk ordered by an `avg(col)` over an integer column
+  pages** (#3779, epic #1374). The session's `avg` over `Int8` to `Int64` and
+  `UInt8` to `UInt32` adds exactly and divides once, so under a plain
+  `GROUP BY` an `avg` or `avg(DISTINCT ...)` over such a NOT NULL column of
+  the table pages over page one's segment set, as an integer `sum` order does
+  (`avg_over_an_integer_column_plans_as_a_finite_float`). The mean is a
+  finite `Float64`, never `-0.0`, carried in the cursor bit for bit with no
+  cursor format change, and the walk is the same at one and at eight
+  partitions (`integer_avg_walk_is_identical_at_one_and_eight_partitions`,
+  `an_integer_avg_of_zero_is_positive_zero`). An `avg` over a float or a
+  `UInt64` column, and `mean`, still run unpaged.
+- **`ravel-cli catalog list --json` prints the resolved metrics segments as JSON
+  lines, one JSON document per line** (#3861, epic #3694). Each line is one
+  segment with its key, level (`L0` or `L1`), shard, ingest hour bucket, object
+  size and event bounds, so a harness can histogram the event-time span of the
+  data objects; the `store:` header goes to stderr. The default text output is
+  unchanged.
+- **The fold can index metrics label names and values** (#3863, ADR-3694
+  decision 2). Off by default. With `ravel-server --fold-key-index-leaves
+  --fold-metrics-label-index`, or `ravel-cli catalog fold
+  --key-index-leaves --metrics-label-index`
+  (`CatalogConfig::metrics_label_index`), a metrics fold writes a `label_value` key-index leaf per part,
+  keyed by every string in each object's LABEL_DICT at block 0, so a probe
+  names the objects holding a label name or value. An entry read by range
+  costs a footer suffix GET (two footer GETs when the footer is longer than
+  8 KiB) and one LABEL_DICT range GET in each pass of the build. An object
+  the fold fetched whole for its name postings costs none while its pairs
+  fit a held allowance of `--key-index-build-max-pairs`, kept only for parts
+  the fold builds a leaf for and released as each leaf is built; an entry
+  the re-encoded tail carries from the previous tail's leaf costs none
+  either, while the carry itself costs one GET per previous leaf. A part whose leaf would pass
+  1% of its objects' bytes (`metrics_label_index_max_ratio_ppm`) gets no
+  ref; slices an earlier pass already PUT stay unreferenced and the catalog
+  sweep removes them. While a metrics erasure request is pending no metrics
+  leaf is built. `--rebuild-key-index --signal metrics --metrics-label-index`
+  attaches the same leaf to existing parts and reports the erasure gate's
+  LIST and GET requests. PromQL reads it through the label-value route
+  (#3865).
+- **PromQL skips metrics objects the label-value leaves prove a selector
+  cannot match** (#3865; ADR-3694 decision 3 and its per-value routing
+  amendment). With `ravel-server --fold-key-index-leaves
+  --fold-metrics-label-index` (off by default; refused without the leaf
+  build and in `--mode gateway`) the fold builds the metrics `label_value`
+  leaf, and a range or instant query routes each distinct positive equality
+  value of its selectors, `__name__` included, through those leaves before
+  any object is opened. A selector drops an object when any one of its
+  values is absent from the object's part; recent objects above the fold
+  watermark are always read, and nothing is routed while a metrics erasure
+  request is pending. Reported as `segmentsPrunedByLabelIndex` in query
+  stats, not counted in `segmentsFetched`, with the leaf GETs in the
+  `keyIndex` phase and `ravel_query_key_index_parts_total` and
+  `ravel_query_key_index_leaf_gets_total` gaining a `signal="metrics"` row.
+  The value passes run at most `promql_fetch_fanout` at a time, and their
+  leaf GETs count against `max_s3_requests` and `max_bytes_scanned`, checked
+  once routing returns.
+- **`ScratchStore`, a process-local scratch object store over a local
+  directory** (#3871, ADR-3853 D2). It is the transient run store for the
+  two-level RLOG merge: `open` empties a directory it owns (missing, empty,
+  or carrying its `.ravel-scratch` marker) and refuses any other non-empty
+  one, `wipe` empties it again, and nothing in it is durable, published, or
+  read by another process, so it must never back a tenant's data. Keys map
+  to escaped file names that cannot leave the directory or differ only by
+  case, puts are published by rename, and conditional puts, ranged and
+  suffix gets, paginated listing and multipart uploads match `MemoryStore`.
+  The two-level RLOG merge (#3872) is its only user.
+- **A many-input RLOG bucket merges in two levels instead of being refused**
+  (#3872, ADR-3853 T3a). With the new `scratch_dir` maintain setting, a
+  bucket the #3870 geometry check refuses merges each contiguous group
+  of `G` canonical inputs into a run in that local directory, `G` the largest
+  group whose resident blocks plus the run memory target
+  (`rlog_run_memory_target_bytes`, 256 MiB by default) fit the ceiling, then
+  merges the runs into the published L1 objects. A resident or
+  fetch-per-pass bucket still merges single-level. Every published object
+  keeps the bytes and key the single-level merge writes. Before its first
+  block GET the merge refuses a group size under 2 (`TwoLevelUnsupported`)
+  and a scratch volume whose free bytes, less what the process's other
+  running two-level merges have reserved there, are under 1.3 times the
+  inputs' object sizes (`ScratchHeadroom`, which reports `need`, `free` and
+  `reserved`); an admitted merge reserves its need until it ends, and a
+  scratch write that runs out of space is the same `ScratchHeadroom`
+  refusal. After level 1 it refuses a level 2 whose run parts do not fit the
+  ceiling (`TwoLevelUnsupported`), counting every part of every run. Each
+  refusal is a compaction outcome that names the check that failed, ends
+  with the merge outcome `refused`, and is held by the scan memo in memory
+  so the process does not retry the bucket. The first two-level merge takes
+  an exclusive lock on `ravel-scratch.lock` in `scratch_dir` for the life of
+  the process and removes the merge directories a killed process left
+  there; a directory another process holds is refused with the
+  `ScratchLocked` outcome, and the pass goes on compacting the buckets that
+  do not need two levels. The scratch directory is emptied however the
+  merge ends.
+  The request ledger gains `level1_groups`, `level1_passes`,
+  `level2_passes`, `level1_block_decodes`, `level2_block_decodes`,
+  `scratch_write_bytes` and `scratch_read_bytes`. With no `scratch_dir` (the
+  default), the merge and the #3870 refusal are
+  unchanged.
+- **`ravel-cli maintain compact-bucket` and `compact-tenant` take
+  `--scratch-dir`, `--scratch-max-bytes` and `--level1-workers`** (#3874,
+  ADR-3853). With `--scratch-dir`, a logs bucket whose cursor merge would
+  decode more than 16 rows per input record goes through the two-level RLOG
+  merge instead of being refused as `GeometryUnsupported`. The flags mirror
+  `ravel-server`'s `--maintain-scratch-*` flags. A zero value, or either of
+  the last two without `--scratch-dir`, is refused before any store request.
+  A two-level bucket's report carries `level1_groups` and `level1_workers`.
+- **The two-level RLOG merge runs in `--mode maintain`** (#3875, ADR-3853
+  T5). `--maintain-scratch-dir` names the local directory the level-1 runs
+  go under, and a log bucket whose cursor merge would decode more than 16
+  rows per input record now compacts in two levels instead of being refused
+  (`a_maintain_server_compacts_a_many_input_bucket_in_two_levels`).
+  `--maintain-scratch-max-bytes` caps the bytes the directory may hold: a
+  unit is admitted against the smaller of the volume's free bytes and the
+  cap less the bytes already under the directory
+  (`a_scratch_max_bytes_cap_refuses_a_unit_that_would_overflow_the_volume`),
+  and a running unit whose next run write would take the directory past the
+  cap stops before that write and is refused under `scratch_headroom`
+  (`a_unit_whose_runs_outgrow_its_reservation_stops_at_the_cap`).
+  `--maintain-level1-workers` fixes the level-1 worker count, derived per
+  bucket when omitted. `ravel_maintain_compaction_refused_total` counts each
+  refusal under its own `reason`: `geometry`, `two_level`,
+  `scratch_headroom` or `scratch_locked`
+  (`a_maintain_server_with_a_short_scratch_cap_refuses_with_the_scratch_headroom_reason`).
+- **The operator renders a scratch volume for the maintain pods** (#3876,
+  ADR-3853 D2). `spec.maintain.scratch.sizeGi` (minimum 1) gives the maintain
+  Deployment an `emptyDir` named `scratch` with that `sizeLimit` in GiB, a
+  mount at `spec.maintain.scratch.mountPath` (an absolute path, default
+  `/var/lib/ravel/scratch`), `--maintain-scratch-dir` with the mount path,
+  `--maintain-scratch-max-bytes` with the volume size in bytes, and an
+  `ephemeral-storage` request of the same size
+  (`a_scratch_size_renders_the_volume_mount_and_flag`). The directory is a
+  cache for the two-level RLOG merge; size it to about 1.3 times the largest
+  merge unit's input bytes. Both flags need a ravel-server release that
+  includes the two-level merge flags; an older image fails at startup on the
+  unknown flag. A `sizeGi` above an explicit `ephemeral-storage` limit is
+  refused with a Degraded condition naming both values, and no maintain
+  Deployment is applied
+  (`a_scratch_size_above_an_explicit_ephemeral_limit_is_refused`). Without
+  the field the maintain Deployment is unchanged
+  (`without_scratch_the_maintain_deployment_is_unchanged`).
+
+### Changed
+
+- **MetricsBench runs Prometheus, VictoriaMetrics and Mimir with
+  `GOMEMLIMIT=7GiB`** (#940, epic #2821; ADR-0927 amendment 2026-11-05).
+  Mimir was OOM-killed at its 8 GiB limit in two of three cardinality runs,
+  and none of the Go comparators knew its container's limit, so the Go
+  runtime collected only on heap growth and could overshoot the cgroup. The
+  envelope is unchanged (8 GiB, 2 CPUs per engine) and GOGC stays unset.
+  `capture-effective-config.sh` records each Go comparator's GOMEMLIMIT from
+  its container environment as `go_runtime`, `"unset"` when absent. Memory
+  figures from earlier runs are not compared with runs after this change.
+- **Cached log dictionary columns hand SQL their keys without a per-row
+  loop.** With the decoded-column cache on, a block's own string dictionary
+  whose block no filter narrowed, whose rows are all present and whose
+  entries are all valid UTF-8 now shares its keys with the cache entry
+  instead of reading one key per row. Results are unchanged. A query result
+  that holds those keys keeps the entry's memory reservation alive, and the
+  memory pressure evictor counts that entry as held.
+- **A typed string column compared with `<>` is filtered inside the scan.**
+  A declared string column compared with `<>` against a literal is now
+  filtered inside the logs scan, so such queries no longer run a separate
+  filter step. Results are unchanged.
+- **A filtered logs `ORDER BY ... LIMIT` keeps each partition's top rows
+  first.** When the logs scan evaluates a declared string `<>` comparison
+  under an `ORDER BY ... LIMIT`, each partition now keeps only its top rows
+  before the final sort reads them. The rows returned for a given sort key are
+  unchanged; which of several rows tied on the sort key is returned may
+  differ, as it already may between runs.
+- **Upgrade: key-index leaf format version 2; logs refuse version 1**
+  (#3703, ADR-3692 amendment "Leaf format version 2"). The fold and
+  `--rebuild-key-index` now write `KeyIndexLeafHeader.format_version` 2 and
+  list an entry whose RLOG KEY_IDX section is at version 1 as uncovered
+  (`version_one_sections_are_uncovered_in_the_leaf`). A logs leaf at
+  version 1 can claim absence for a key its hidden-scalar gap never
+  indexed, so the logs reader rejects it and reads the part uncovered, the
+  fold never carries one forward, and `--rebuild-key-index` replaces the
+  logs version 1 refs of every requested field with version 2 leaves under
+  new keys (one ranged prefix GET per such ref on every run). Spans accept
+  versions 1 and 2: the RSPAN `trace_id` key is a fixed column the gap
+  never touched. A binary older than this one rejects a version 2 leaf and
+  reads that part uncovered, which is slower but exact.
+- **A log query with `LIKE` and a `LIMIT` but no `ORDER BY` starts reading
+  sooner.** With the decoded-column cache on, such a query no longer reads
+  every segment's directories before its first open to decide whether its
+  `LIKE`-tested columns fit the cache. Results are unchanged; such a query's
+  statistics no longer report `deferredSetEstimateBytes`.
+- **Log compaction loads each input's catalog in one GET when the footer probe
+  holds it.** The compactor keeps the footer probe for the length of an input's
+  catalog load and slices every section it holds from it (the four directory
+  sections, POSTINGS, the KEY_IDX prefix and the BLOOM covered-column list)
+  instead of fetching each again by range; a section the probe does not wholly
+  hold is still one ranged GET. On the two-input request-ledger fixture the
+  compaction's `catalog_read` requests drop from 10 to 2. The RLOG
+  footer probe gets its own setting, `rlog_footer_probe_bytes`, 128 KiB by
+  default; metrics and trace compaction inputs keep the 64 KiB
+  `footer_probe_bytes`.
+- **Compaction keeps 32 input reads in flight by default, up from 8** (#3856,
+  ADR-3853). Object-store reads are latency-bound, so `input_read_concurrency`
+  (`ravel-cli maintain --input-read-concurrency`) now defaults to 32
+  (`the_default_input_read_concurrency_is_32`). Output bytes are unchanged. A
+  merge that fetches row groups per pass now reserves the 32 largest input
+  row groups against its resident ceiling instead of the 8 largest
+  (`the_default_in_flight_reservation_is_the_32_largest_groups`), about 30 MB
+  on a bucket of 0.94 MB L0 objects; pass `--input-read-concurrency 8` for
+  the old behavior.
+- **The sparse catalog probe reads the dictionary first on selective
+  statements** (#3862; ADR-3694 decision 1 and its probe gate amendment). A
+  PromQL selector with a positive equality matcher GETs an object's LABEL_DICT
+  alone and drops the object with no further GET when the value is absent.
+  Each selector plan in a statement carries its own gate: a plan whose first
+  dictionaries mostly hold the value switches the probe off, so it issues at
+  most twice its fan-out in extra requests, and a segment whose sealed
+  postings already filtered the plan's key keeps the one-step name-only read.
+  Reported as `segmentsPrunedByDictionary`, `segmentsProbedTwoStep` and
+  `dictionaryProbeSwitchedOff` in query stats.
+- **The derived `--max-s3-requests` budget grows by one request per unsealed
+  flush** (#3862; ADR-1306's dictionary GET amendment). An L0 segment fetch
+  can now read its catalog as two runs, so its bound is 8 GETs and an
+  unsealed flush is budgeted at 9 requests instead of 8: the default at 4
+  shards and a 2 s flush cadence goes from 343,400 to 385,700, and at 4
+  shards and 500 ms from 1,358,600 to 1,527,800. An explicit
+  `--max-s3-requests` is used verbatim, as before.
+- **Compaction refuses a cursor merge that would decode more than 16 rows per
+  input record** (#3870, ADR-3853 D0). After the catalog phase and before the
+  first block GET, a bucket whose plan is cursor and whose predicted decoded
+  rows (the record counts of every candidate block, summed over every stream
+  and every input) exceed 16 times its input records ends as
+  `MergeGeometryUnsupported`, reported as the outcome `GeometryUnsupported`.
+  Nothing is fetched or published, the claim is released, and the L0 inputs
+  stay live. The server memoizes the refusal in memory only, so the tick does
+  not plan the bucket again until restart, and
+  `ravel_maintain_compaction_refused_total{reason="geometry"}` moves by one
+  per refusal. The mode log line now carries `input_records` and
+  `predicted_decoded_rows`. A cursor bucket under the ratio compacts as
+  before.
+- **The two-level RLOG merge runs level 1 on several workers and pipelines
+  level-2 encodes** (#3873; ADR-3853 and ADR-0065 amendments 2026-11-06).
+  Level 1 merges its groups on `W1` workers, the largest count at or under
+  the unit's core share whose groups and runs still fit level 2, or
+  `level1_workers` when it is set. Each worker is its own task, so the
+  groups' decode and merge run on separate threads, while every store and
+  scratch call stays on the unit's task. Each worker gets `1 / W1` of the
+  cursor budget and resident ceiling and its own memory tracker, and the
+  first error or lost claim stops every worker before its next run part.
+  When no worker count fits level 2 on the predicted runs, the bucket
+  is refused before level 1 reads a block, with the new two-level check
+  `PredictedLevelTwoFit`. Level 2 keeps `E` part encodes in flight, derived
+  per unit from the core share and the room the final part target leaves
+  under the ceiling, never under 2. Both figures are on the
+  `rlog two-level merge` log line and in the request ledger as
+  `level1_workers` and `encode_builders`; the ledger also gains
+  `scratch_writes`, the run-part writes counted when issued. Published
+  parts are byte-for-byte unchanged.
+- **A scratch headroom refusal caused only by other running merges'
+  reservations is retried** (#3873). When the scratch volume alone has room
+  for the unit, the scan memo no longer holds the refusal, so the next tick
+  tries the bucket again. A `statvfs` of the scratch directory that fails is
+  now the error `ScratchFreeUnreadable` naming the directory and the
+  failure, where an out-of-space write used to read it as zero free.
+- **Compaction writes new L1 segments at zstd level 3 with the `Estimated`
+  page choice** (#3878; ADR-2135, ADR-3492 and ADR-3853 amendments 2026-11-06).
+  Every L1 merge path and the erasure rewrite used zstd 9 with `Exhaustive`.
+  On a 230-input, 2.74M-record logs hour, writing parts is about 80% of merge
+  CPU; level 3 cut merge wall time from 173 s to 131 s (-24%) for 1.8% more
+  L1 bytes, and `Estimated` cut encode-thread CPU from 144 s to 102 s (-29%)
+  for 0.6% more bytes. Wide typed tenants give up the 7.1% page-byte saving
+  level 9 measured on them. `--maintain-compaction-zstd-level` and
+  `ravel-cli`'s `--compaction-zstd-level` still set the level. Readers are
+  unaffected: every encoding and level decodes as before, no format version
+  changes, and segments already written are not rewritten.
+- **A MetricsBench timed pass stops repeating a statement once it times
+  out** (#3879; ADR-0927 amendment 2026-11-06). `metricsbench_query` sends an
+  engine no more repetitions of a statement in a timed pass after that
+  engine's repetition of it times out, and lists each repetition left out in
+  the diagnostics sidecar's new `skipped_reps`. The next pass starts again at
+  repetition 1, and the warm-up pass still sends every repetition. A run whose
+  sent plus skipped repetitions do not equal passes times repetitions for
+  every engine and statement writes no report. `report.json` is unchanged;
+  `ravel_cost` and `ulp_gaps` now cover only the repetitions sent.
+- **SQL memory refusals name the holders** (#3899). A query, tenant, process,
+  host-gate or aggregate reserve-ahead refusal keeps its leading text and now
+  ends with the asking consumer's name, whether it can spill and the bytes it
+  asked; the query's three largest holders by consumer name with their bytes;
+  the bytes held by consumers that cannot spill; and this query's own
+  aggregate envelope bytes. The process-wide envelope, which sums every
+  tenant's, never appears in the message; each refusal logs it at DEBUG. The
+  query pool also records whether any grow was refused for memory and the
+  peak bytes non-spillable consumers held, logged at DEBUG when the
+  statement's pool closes. `SqlConfig::query_pool_spill_mode` builds
+  the same pool with a spill-mode cap: a consumer that can spill is refused,
+  so it spills, once spill-capable consumers' charged bytes plus envelopes
+  would pass the per-query limit less a headroom of the larger of 64 MiB and
+  10% of the limit, or once its own charged bytes plus envelope would pass
+  its fair share, that cap divided by the number of spill-capable consumers
+  registered. A grow within the asker's share is admitted even over the cap,
+  so the largest holder spills at its next grow instead of a small consumer
+  failing the statement, but only up to the per-query limit less half the
+  headroom: half the headroom is always left to consumers that cannot
+  spill. That headroom is a hypothesis, not a measurement.
+  `SqlConfig::query_pool` is unchanged. A spill-enabled statement's spill
+  merge reads at most 2 runs per pass, so a spilled aggregate's replay keeps
+  pool room the merge's buffers took before, at the cost of extra passes
+  that rewrite the runs; a statement that cannot spill is unchanged.
+- **SQL spill is a retry after a memory refusal, not a plan property**
+  (#3899, ADR-0954). With SQL spill configured, a statement's first
+  attempt now plans and runs exactly as it would with spill off,
+  repartitioned final aggregate included, and creates no scratch directory.
+  Only when that attempt is refused for memory by its own pressure (its
+  per-query limit; or the tenant budget, the process budget or the aggregate
+  reserve-ahead envelope, which is a refusal of the process budget, when the
+  statement held at least half of SQL execution's reserved bytes on the
+  refusing budget, counting its charged bytes and only those of its
+  aggregate envelopes the process budget holds; on the process budget SQL's
+  share leaves out the fetch buffers and caches, such as the decoded
+  column-block cache, so a lone statement beside a large cache still
+  retries; not the host memory gate and
+  not a fetch layer's memory, which spilling does not shrink) before
+  emitting a row, and its plan is spill-eligible, is the
+  statement planned again with spill allowed and retried once in a
+  spill-mode pool, under the same deadline; the failed attempt's output is
+  discarded. A retried statement answers, but slower than one that fits in
+  memory: it pays for the refused first attempt and then for the spill's
+  disk writes and merge passes. In that pool a reserve-ahead refusal of an aggregate that can
+  spill makes it spill. The scratch budget is split into
+  `clamp(floor(ceiling / 8 GiB), 1, 4)` shares, and every spilling
+  statement, retried or Flight SQL, reserves one share, or what remains if
+  less. A spill retry that cannot reserve at least the minimum (64 MiB, or
+  the whole ceiling when that is smaller) does not run: the first attempt's
+  refusal is returned and one WARN line says why. A Flight SQL statement
+  that cannot reserve the minimum runs with spill disabled. Each
+  retried statement logs one INFO line, `SQL statement retried with spill
+  after a memory refusal`, with the first refusal and how long the first
+  attempt ran before it, the spill bytes and files, the peak unspillable
+  bytes and the share. Flight SQL still decides spill at plan time.
+- **SQL spill is on by default under the working directory** (#3899). With no
+  `--sql-spill off`, no `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` and
+  no `--cache-dir`, a server that serves SQL now spills to
+  `<working-dir>/sql-spill/<instance-id>`, with the same owner lock, startup
+  sweep and derived ceiling as `--cache-dir` and nothing subtracted for a read
+  cache. Both startup lines read `source=cwd-default`. Previously spill was
+  off there, so memory-heavy statements on small hosts were refused. The
+  default never refuses startup: spill is off, with a WARN line at startup,
+  when the
+  working directory is on tmpfs or ramfs (`cwd-tmpfs`), when
+  `<working-dir>/sql-spill` cannot be created, measured or locked
+  (`cwd-unavailable`), or when half its free space is below 1 GiB
+  (`cwd-insufficient-space`). `--sql-spill off` turns it off. In a container
+  whose working directory is overlay storage, spill counts against the pod's
+  ephemeral-storage limit: set `--sql-spill off` or `--cache-dir` there.
+  Operator-managed pods run with a read-only root filesystem and the operator
+  does not yet render either flag, so there spill stays off with
+  `source=cwd-unavailable` and a WARN line at each start; mount a writable,
+  disk-backed volume and pass `--cache-dir` on it to get spill.
+- **SQL spill files are compressed with lz4_frame** (#3899, ADR-0954
+  refusal-retry decision item 2). A spill-enabled statement now writes its
+  spill files compressed, so the same spill takes fewer bytes of the scratch
+  quota, which counts spill-file bytes on disk. On the test fixtures the
+  spill shrank 3.76 times for integer group keys and 7.42 times for string
+  keys; random binary keys shrank 1.11 times, because a buffer the codec
+  does not shrink is written uncompressed. The live scratch peak at the
+  merge fan-in of 2 is the spilled bytes plus the largest merge-pass output,
+  at most about 1.67 times the spill for equal runs and below twice it
+  otherwise. A statement whose spill does not compress and whose spill
+  exceeds about 60% of its scratch share (50% when its runs differ in size)
+  still gets the typed `spill_budget_exhausted` error. Startup logs the codec
+  on a third `performance default resolved` line, `sql_spill_compression`,
+  `value=lz4_frame source=built-in`, or `value=none` when spill is off. There
+  is no flag for it.
+
 ## [0.30.1] - 2026-11-04
 
 ### Fixed
