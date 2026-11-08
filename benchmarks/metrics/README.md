@@ -631,6 +631,39 @@ regenerated stream's digest differs from the report's `run.stream_digest`
 `--ingest-report` and `--readback-system` without `--readback-only` exit 64
 too (`metricsbench_ingest::tests::readback_flags_need_readback_only`).
 
+With `--ravel-metrics-url URL` (ravel-server's `/metrics`), the Ravel row's
+read-back, in a replay or `--readback-only`, also records
+`readback.query_cost`, keyed as `query_ms` (`series`, `samples.N`): `stats`,
+the `data.stats` of each answer in query order (`null` for an answer with
+none; empty for the series read, whose answer has no stats), and
+`store_get_delta` (`ravel_store_calls_total{op="get"}`), `fetch_miss_delta`
+(`ravel_cache_misses_total{cache="fetch"}`) and `catalog_get_delta` (the
+first less the second) across the query, each summed over every series of
+its family, or `scrape_error` when a scrape failed or lacked a family, which
+is an error rather than zero. Without the flag the key is left out
+(`metrics_ingest::tests::readback_records_query_cost_when_given_a_metrics_url`,
+`metrics_ingest::tests::get_counters_refuse_a_missing_family`).
+
+#### Holder counts (`metricsbench_holders`)
+
+`metricsbench_holders --corpus PATH --profile NAME --objects-dir DIR --out
+PATH` counts, for each corpus entry of the profile with a `label="value"`
+matcher (non-empty value), the data objects under `DIR` (searched
+recursively for `*.rseg`) holding at least one series that matches a
+qualifying selector in full, metric name and every matcher. It decodes each
+object's series catalog with ravel-segment's public reader, with no router
+or key index, and does not apply the query window; the file's `method`
+states this (`metrics_holders::HOLDERS_METHOD`). `holders.json` holds
+`method`, `profile`, `objects_total`, `series_total`, `statements` (`id`,
+`promql`, `selectors`, `positive_equalities` and `holders` per qualifying
+entry) and `skipped` (`id` and `reason` for each entry with no qualifying
+selector, or whose selectors the corpus reader refuses). It exits 65 when the
+directory holds no `*.rseg`, 66 when the corpus or an object cannot be read
+or decoded (no file is written), and 74 when the file cannot be written
+(`metrics_holders::tests::holders_count_objects_with_a_fully_matching_series`,
+`metrics_holders::tests::an_unreadable_object_is_an_error`).
+`deploy/metricsbench/run.sh`'s `stage1-holders` step runs it.
+
 ## Determinism
 
 One seed (`927000933`) drives everything. Every value and every injected
@@ -1140,6 +1173,24 @@ returns). Its fields
   `accounting` and `phases` both `null`
   (`ravel_cost_records_null_on_an_answer_with_no_stats`). The figures are
   descriptive: no band or exit status reads them.
+  Each object also carries `segmentsFetched`, `segmentsPruned`,
+  `segmentsPrunedByDictionary`, `segmentsPrunedByLabelIndex`, `estimate`
+  and `io`, the same-named members of `data.stats`, each copied on its own
+  and `null` (never 0) when the stats lack it; `pass_label` and
+  `fold_state`, the values of `--pass-label` and `--fold-state` (`null`
+  without them; ADR-3694 Stage 1 labels its passes `unfolded`,
+  `background-folded`, `folded-unrouted` and `folded-routed`, while `pass`
+  stays the timed pass number); and `result_hash`, `blake3:<hex>` over the
+  answer's `resultType` and `result`, with each series' labels sorted by
+  name, every timestamp and float hashed by its `f64::to_bits`, and the
+  series sorted, so equal answers hash equal whatever their series or key
+  order, while a sample order change or a one-bit value change does not
+  (`metrics_query::result_hash`; `null` for an outcome that is not a
+  successful envelope)
+  (`ravel_cost_copies_every_stats_field_and_nulls_the_absent_ones`,
+  `equal_answers_hash_equal_whatever_their_key_order`,
+  `reordered_series_hash_equal_and_reordered_samples_do_not`,
+  `a_one_bit_change_hashes_differently`).
 - `skipped_reps`: every timed repetition not sent because an earlier
   repetition of the same entry, on the same engine and in the same pass,
   timed out (ADR-0927's 2026-11-06 amendment; `metrics_query::SkippedRep`).

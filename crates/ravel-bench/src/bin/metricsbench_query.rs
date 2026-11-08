@@ -7,7 +7,9 @@
 //! inputs, resolves bearer tokens from the environment, and writes the report
 //! only after [`ravel_bench::report_schema::validate`] accepts it. With
 //! `--diagnostics` it then writes the [`ravel_bench::metrics_query::Diagnostics`]
-//! sidecar, which is not part of the report.
+//! sidecar, which is not part of the report. `--pass-label` and
+//! `--fold-state` are copied onto every `ravel_cost` record of that sidecar
+//! (the MB_STAGE1 lanes of `deploy/metricsbench/run.sh`, issue #3968).
 //!
 //! With `--diagnostic-after-failed-ingest` (passed by
 //! `deploy/metricsbench/run.sh` only after an ingest whose read-back failed or
@@ -36,8 +38,8 @@ use clap::Parser;
 use ravel_bench::metrics_ingest::MetricsIngestReport;
 use ravel_bench::metrics_query::{
     BindError, Binding, EX_DATAERR, EX_NOINPUT, EX_SOFTWARE, EX_USAGE, EngineSpec, Failure,
-    OutputPaths, REGIME_CONFIG_KEY, REGIME_STEADY_STATE, RunOptions, RunOutput, bind,
-    bind_diagnostic, endpoints, finish_run, parse_engine_spec, run,
+    OutputPaths, REGIME_CONFIG_KEY, REGIME_STEADY_STATE, RunError, RunOptions, RunOutput, bind,
+    bind_diagnostic, endpoints, finish_run, label_ravel_cost, parse_engine_spec, run,
 };
 use ravel_bench::metrics_workload::load_workload;
 use ravel_bench::promql_corpus::load_corpus;
@@ -106,6 +108,15 @@ struct Args {
     /// Prometheus oracle's, is refused (exit 65).
     #[arg(long)]
     diagnostic_after_failed_ingest: bool,
+    /// The harness pass this run is (`unfolded`, `folded-unrouted`,
+    /// `folded-routed`), copied onto every `ravel_cost` record as
+    /// `pass_label`.
+    #[arg(long)]
+    pass_label: Option<String>,
+    /// The catalog fold state the harness stamped before this run, copied onto
+    /// every `ravel_cost` record as `fold_state`.
+    #[arg(long)]
+    fold_state: Option<String>,
 }
 
 #[tokio::main]
@@ -209,7 +220,19 @@ async fn run_main(args: Args) -> Result<(), Failure> {
         deadline: Duration::from_millis(args.query_timeout_ms),
         oracle_retries: args.oracle_retries,
     };
-    let outcome = run(&binding, &entries, &workload, options).await;
+    let mut outcome = run(&binding, &entries, &workload, options).await;
+    let labelled = match &mut outcome {
+        Ok(output) => Some(output),
+        Err(RunError::RepsUnaccounted { output, .. }) => Some(output.as_mut()),
+        Err(_) => None,
+    };
+    if let Some(output) = labelled {
+        label_ravel_cost(
+            &mut output.ravel_cost,
+            args.pass_label.as_deref(),
+            args.fold_state.as_deref(),
+        );
+    }
     let paths = OutputPaths {
         out: &args.out,
         diagnostics: args.diagnostics.as_deref(),

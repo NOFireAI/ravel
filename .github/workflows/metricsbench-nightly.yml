@@ -39,8 +39,18 @@ name: metricsbench-nightly
 # only on a schedule and on manual dispatch, never on push/pull_request/
 # merge_group, so it can never gate a merge. A red nightly run signals a
 # problem without blocking anyone.
+#
+# A manual dispatch with stage1 set runs the ADR-3694 Stage 1 steps after the
+# folded read-back (MB_STAGE1=1, deploy/metricsbench/README.md "Stage 1") and
+# then checks the run against deploy/metricsbench/stage1-bands.ci.json. The
+# schedule never sets it.
 on:
   workflow_dispatch:
+    inputs:
+      stage1:
+        description: "Run the ADR-3694 Stage 1 steps (MB_STAGE1=1) and check them against the ci bands"
+        type: boolean
+        default: false
   schedule:
     # Daily, 02:13 UTC. Off-peak and off the :00/:30 marks, and distinct from
     # every other scheduled lane in this repo (sim-nightly 03:17, k8s-nightly
@@ -63,7 +73,7 @@ jobs:
   # cites the job id.
   metricsbench-rustfs:
     runs-on: ubuntu-latest
-    # 140 minutes = 57 + 30 + 35 + 9 + 9:
+    # 155 minutes = 57 + 30 + 35 + 9 + 9 + 15:
     #   57  the cold `docker build --target server` of the root Dockerfile,
     #       a full workspace compile at the Dockerfile's CARGO_BUILD_JOBS=2
     #       with no cache (ci.yml's docker-build job measured about 57 on a
@@ -77,11 +87,16 @@ jobs:
     #       store), about 500 s (500.2 s and 490.8 s on two smoke-pass boxes,
     #       #2821);
     #   9   the four HTTP rows' ingest and read-back, 20 corpus entries x 6
-    #       passes x 3 reps against four engines, and the out-dir upload.
+    #       passes x 3 reps against four engines, and the out-dir upload;
+    #   15  stage1 only: two more query passes against Prometheus and Ravel,
+    #       each within the four-engine pass's share of the 9 above, the two
+    #       catalog folds, and one more Ravel readiness bound (8.75 above)
+    #       after the recreate. A bound, not a measurement: no stage1 run
+    #       has been timed yet.
     # The per-row ingest ceiling (600 s, run.sh case m) and each query's
     # 120 s cap bound a stalled row or query, not a healthy run; a run that
     # spends several of those bounds at once outlasts this budget.
-    timeout-minutes: 140
+    timeout-minutes: 155
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -93,11 +108,11 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Build the MetricsBench ingest, query and report bins
+      - name: Build the MetricsBench ingest, query, report and holders bins
         run: |
           cargo build --release --locked -p ravel-bench \
             --bin metricsbench_ingest --bin metricsbench_query \
-            --bin metricsbench_report
+            --bin metricsbench_report --bin metricsbench_holders
       # The same command ci.yml's docker-build job runs, tagged locally. The
       # image is never pushed: ADR-0037 decision 4 keeps publishing off plain
       # main commits, and this run only needs it on this runner.
@@ -119,6 +134,9 @@ jobs:
           # run.sh's default of 300 would let four stalled engines outlast
           # the job timeout, which cancels the out-dir upload below.
           METRICSBENCH_READY_TRIES: "75"
+          # "1" on a dispatch with stage1 set, empty otherwise (a scheduled
+          # run has no inputs); run.sh treats empty as off.
+          MB_STAGE1: ${{ inputs.stage1 && '1' || '' }}
         run: |
           # No --anchor-ms: run.sh derives the window from the clock, ending
           # 10 minutes before the run on the 15 s grid, because ravel-server
@@ -134,6 +152,9 @@ jobs:
             --out-dir metricsbench-out
       - name: Validate the run's own report
         run: ./target/release/metricsbench_report validate metricsbench-out/report.json
+      - name: Check the Stage 1 figures against the ci bands
+        if: inputs.stage1
+        run: deploy/metricsbench/stage1-check.sh deploy/metricsbench/stage1-bands.ci.json metricsbench-out
       - name: Report-schema gate rejects a malformed report (fail-closed)
         run: |
           # The existing report-schema validator (metricsbench_report render,

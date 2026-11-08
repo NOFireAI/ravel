@@ -1,0 +1,22 @@
+{
+  "schema": "metricsbench-stage1-bands/1",
+  "profile": "ci",
+  "figures": [
+    {"name": "leaf_count", "file": "stamps.json", "path": "stage1.leaves.leaf_count", "min": 1, "max": null,
+     "basis": "predicted: the metrics rebuild with --metrics-label-index writes at least one label_value leaf for a tenant holding metrics"},
+    {"name": "leaves_parts_deferred", "file": "stamps.json", "path": "stage1.leaves.parts_deferred", "min": 0, "max": 0,
+     "basis": "predicted: the rebuild covers every part of a quiescent ci tenant in one run"},
+    {"name": "leaves_parts_erasure_gated", "file": "stamps.json", "path": "stage1.leaves.parts_erasure_gated", "min": 0, "max": 0,
+     "basis": "predicted: nothing is erased on a fresh ci tenant"},
+    {"name": "entries_compared", "file": "stage1-compare.json", "path": "entries_compared", "min": 1, "max": null,
+     "basis": "predicted: both steady passes return a result_hash for at least one corpus entry"},
+    {"name": "entries_differing", "file": "stage1-compare.json", "path": "entries_differing_count", "min": 0, "max": 0,
+     "basis": "predicted: routing prunes objects, never results, so every entry's unrouted and routed hashes are equal"},
+    {"name": "entries_without_hash", "file": "stage1-compare.json", "path": "entries_without_hash_count", "min": 0, "max": 0,
+     "basis": "predicted: every corpus entry answers in both passes on ci"},
+    {"name": "routed_records_pruned_by_label_index", "file": "stage1-compare.json", "path": "routed_records_pruned_by_label_index", "min": 1, "max": null,
+     "basis": "predicted: at least one routed positive-equality statement skips an object through a label_value leaf"},
+    {"name": "holders_selective_job_rate_sum", "file": "holders.json", "path": "statements[id=mb_selective_job_rate_sum].holders", "min": 1, "max": null,
+     "basis": "predicted: job=\"metricsbench-api\" series are written on every ci run, so at least one data object holds one"}
+  ]
+}

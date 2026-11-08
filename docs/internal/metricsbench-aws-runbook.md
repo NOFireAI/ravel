@@ -129,7 +129,13 @@ function of the anchor and the seed.
 - `MB_RSS_BAND`, one `--rss-band` value, default `prometheus:2147483648:6442450944`: the 2 to 6 GiB Prometheus band pre-registered for `cardinality` (#2821 comment 6590940753);
 - `MB_OBJECTS_BAND`, default `14000:16500`: the data-object band pre-registered for `cardinality` (#2821 comment 6611923577);
 - `MB_CAP_MIN`, the self-termination cap, default 2,160 minutes (36 h);
-- `MB_INSTANCE_TYPE`.
+- `MB_INSTANCE_TYPE`;
+- `MB_STAGE1`, `1` to run the ADR-3694 Stage 1 steps in both the ci smoke and
+  the measured run (`cardinality` or `ci` only; `launch.sh` refuses another
+  profile, and any value other than `1`, `0` or unset, with exit 64). The
+  steps, the records and the band check are in
+  [deploy/metricsbench/README.md](../../deploy/metricsbench/README.md),
+  "Stage 1".
 
 Both bands default only for `cardinality`. Another profile's count and memory
 differ, so `launch.sh` refuses a different `MB_PROFILE` unless both bands

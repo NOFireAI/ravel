@@ -153,6 +153,52 @@
 # verification). A folded step that fails after it exits 70 naming that step
 # instead, as without the memory failure.
 #
+# With MB_STAGE1=1 in the environment (ADR-3694 Stage 1, issue #3968; ci and
+# cardinality only, any other profile is refused with exit 65, and a
+# diagnostic run is a usage error) ravel-server runs with
+# --fold-key-index-leaves and without --fold-metrics-label-index from up
+# onward: RAVEL_SERVER_EXTRA_FLAGS, which ravel.yml appends to the server's
+# entrypoint, is set to it (it is empty otherwise, so the default command line
+# is unchanged). After readback-folded, and only when it ran, these steps
+# follow, each failure ending the run with exit 70 naming it:
+#
+#   stage1-fold  ravel-cli catalog fold --signal metrics --json on
+#               ravel-qualify, with no leaf flag and no --writers-stopped, into
+#               <out>/stage1-fold.json; stamped as stage1.fold with its wall time
+#   stage1-unrouted  metricsbench_query against Prometheus and Ravel with the
+#               full corpus and --passes/--reps, --pass-label folded-unrouted,
+#               into <out>/stage1-unrouted/ (report.json, diagnostics.json,
+#               provenance.json), then the cold pass's selection (see
+#               cold_ravel_diagnostic) the same way into
+#               <out>/stage1-unrouted/cold.json (a cold failure is stamped,
+#               never fatal)
+#   stage1-leaves  ravel-cli catalog fold --rebuild-key-index --signal metrics
+#               --metrics-label-index --json into <out>/stage1-leaves.json;
+#               stamped as stage1.leaves: leaf_count (leaves_written),
+#               leaf_bytes (leaf_bytes_written), gets (ranged_gets +
+#               leaf_prefix_gets + erasure_get_requests) and wall_ms
+#   stage1-restart  ravel-server recreated (compose up -d --no-deps
+#               --force-recreate) with RAVEL_SERVER_EXTRA_FLAGS set to
+#               --fold-key-index-leaves --fold-metrics-label-index, then its
+#               readiness URL answers 200
+#   stage1-routed  stage1-unrouted again, --pass-label folded-routed, into
+#               <out>/stage1-routed/. Then <out>/stage1-compare.json: per
+#               entry, the steady passes' result_hash sets compared, and the
+#               routed records with segmentsPrunedByLabelIndex above 0 counted;
+#               stamped as stage1.compare. A difference is recorded, not
+#               fatal: stage1-check.sh's band file is the verdict
+#   stage1-holders  the tenant's data objects (t/*/m/l0/*.rseg) downloaded by
+#               aws s3 sync on the createbuckets service into
+#               <out>/stage1-objects/, metricsbench_holders over them into
+#               <out>/holders.json, the download deleted. Stamped as
+#               stage1.holders with the method
+#
+# With or without MB_STAGE1, the query step's ravel_cost records carry
+# pass_label unfolded while ravel-server has published no fold gauge, else
+# background-folded, and fold_state names the gauge stamped as
+# ravel_catalog_fold. stage1-check.sh BANDS OUT-DIR checks a run's figures
+# against a band file.
+#
 # With --diagnostic-prometheus-max-samples N the run is the falsification run
 # pre-registered on #2821 instead: steps override (a compose override in the
 # out-dir setting Prometheus' --query.max-samples=N), up (Prometheus alone),
@@ -201,7 +247,8 @@
 # METRICSBENCH_S3S_FS_CACHE (default ${XDG_CACHE_HOME:-~/.cache}/ravel-metricsbench,
 # where fetch-s3s-fs keeps the verified binary between runs),
 # METRICSBENCH_CORPUS (default benchmarks/metrics/metrics.corpus.json; the
-# path used is stamped as corpus).
+# path used is stamped as corpus). MB_STAGE1 (1, or 0 or unset for off) adds
+# the Stage 1 steps above.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -245,6 +292,12 @@ MIMIR_BASE="http://127.0.0.1:9009"
 RAVEL_BASE="http://127.0.0.1:4318"
 
 FALSIFICATION_ENTRY="mb_long_range_7d_avg"
+
+STAGE1="${MB_STAGE1:-}"
+# ravel-server's extra flags in each Stage 1 phase, through ravel.yml's
+# RAVEL_SERVER_EXTRA_FLAGS.
+STAGE1_UNROUTED_FLAGS="--fold-key-index-leaves"
+STAGE1_ROUTED_FLAGS="--fold-key-index-leaves --fold-metrics-label-index"
 
 EXIT_USAGE=64
 EXIT_REFUSED=65
@@ -943,9 +996,91 @@ elif op == "cold-final":
            "profile": prof, "corpus": corpus_path, "repetitions_per_entry": reps, "entries": ids, "runs": runs}
     dump(out_path, doc)
     bad = [r for r in runs if r["ravel_cost"] is None]
-    print(json.dumps({"regime": regime, "comparable": False, "file": "cold-ravel-diagnostic.json",
+    print(json.dumps({"regime": regime, "comparable": False, "file": os.path.basename(out_path),
                       "corpus": corpus_path, "entries": ids, "repetitions_per_entry": reps, "runs": len(runs),
                       "failed_runs": len(bad), "missing_runs": missing}))
+elif op in ("stage1-fold", "stage1-leaves"):
+    # ravel-cli catalog fold --json's report, the step's wall time in ms:
+    # print the stamp. Exit 3 and why on stdout when the report is not JSON
+    # or lacks a field the stamp reads.
+    report_path, wall_ms = args
+    try:
+        rep = load(report_path)
+        assert isinstance(rep, dict)
+    except (OSError, ValueError, AssertionError) as e:
+        print(f"{os.path.basename(report_path)} is not a JSON report ({type(e).__name__})")
+        sys.exit(3)
+    if op == "stage1-fold":
+        want = ["watermark_hour", "previous_watermark_hour", "no_op", "entry_count", "buckets_folded",
+                "list_requests", "get_requests", "put_requests", "key_index_leaves_written",
+                "key_index_leaf_bytes_written"]
+    else:
+        want = ["leaves_written", "leaf_bytes_written", "ranged_gets", "leaf_prefix_gets",
+                "erasure_get_requests", "erasure_list_requests", "leaf_prefix_bytes_read",
+                "section_bytes_read", "parts_unindexed", "parts_rebuilt", "parts_deferred",
+                "parts_over_cap", "parts_erasure_gated", "uncovered_entries"]
+    missing = [k for k in want if k not in rep]
+    if missing:
+        print(f"{os.path.basename(report_path)} lacks " + ", ".join(missing))
+        sys.exit(3)
+    stamp = {"file": os.path.basename(report_path), "wall_ms": int(wall_ms)}
+    stamp.update({k: rep[k] for k in want})
+    if op == "stage1-leaves":
+        gets = [rep[k] for k in ("ranged_gets", "leaf_prefix_gets", "erasure_get_requests")]
+        if not all(isinstance(g, int) and not isinstance(g, bool) for g in gets):
+            print("a GET count in the rebuild report is not a whole number")
+            sys.exit(3)
+        stamp = {"leaf_count": rep["leaves_written"], "leaf_bytes": rep["leaf_bytes_written"],
+                 "gets": sum(gets), **stamp}
+    print(json.dumps(stamp))
+elif op == "stage1-compare":
+    # The two passes' diagnostics files and the output path. Per entry, the
+    # set of result_hash values each pass's records carry; equal when both are
+    # present and the same. Prints the summary; exit 3 and why on stdout when
+    # a diagnostics file cannot be read.
+    unrouted_path, routed_path, out_path = args
+    def records(path):
+        doc = load(path)
+        rows = doc["ravel_cost"]
+        if not isinstance(rows, list):
+            raise TypeError("ravel_cost is not a list")
+        return rows
+    try:
+        unrouted, routed = records(unrouted_path), records(routed_path)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"the stage1 diagnostics could not be read ({type(e).__name__}: {e})")
+        sys.exit(3)
+    def hashes(rows):
+        by = {}
+        for r in rows:
+            by.setdefault(r.get("entry"), set())
+            if r.get("result_hash"):
+                by[r["entry"]].add(r["result_hash"])
+        return by
+    u, r = hashes(unrouted), hashes(routed)
+    equal, differing, without = [], [], []
+    for entry in sorted(set(u) | set(r), key=str):
+        a, b = u.get(entry, set()), r.get(entry, set())
+        if not a or not b:
+            without.append(entry)
+        elif a == b and len(a) == 1:
+            equal.append(entry)
+        else:
+            differing.append({"entry": entry, "unrouted": sorted(a), "routed": sorted(b)})
+    def pruned(rec):
+        v = rec.get("segmentsPrunedByLabelIndex")
+        return v if isinstance(v, int) and not isinstance(v, bool) else 0
+    doc = {"schema": "metricsbench-stage1-compare/1",
+           "unrouted": os.path.basename(os.path.dirname(unrouted_path)) + "/" + os.path.basename(unrouted_path),
+           "routed": os.path.basename(os.path.dirname(routed_path)) + "/" + os.path.basename(routed_path),
+           "entries_compared": len(equal) + len(differing), "entries_equal": len(equal),
+           "entries_differing_count": len(differing), "entries_differing": differing,
+           "entries_without_hash_count": len(without), "entries_without_hash": without,
+           "routed_records": len(routed),
+           "routed_records_pruned_by_label_index": sum(1 for x in routed if pruned(x) > 0),
+           "routed_segments_pruned_by_label_index": sum(pruned(x) for x in routed)}
+    dump(out_path, doc)
+    print(json.dumps({**doc, "entries_differing": [d["entry"] for d in differing]}))
 else:
     print(f"unknown op {op}", file=sys.stderr)
     sys.exit(2)
@@ -1024,6 +1159,14 @@ done
 
 diagnostic=0
 [ -n "$diag_max_samples" ] && diagnostic=1
+case "$STAGE1" in
+  "" | 0) stage1=0 ;;
+  1) stage1=1 ;;
+  *) usage_error "MB_STAGE1 takes 1 (on) or 0 (off), got '$STAGE1'" ;;
+esac
+if [ "$stage1" -eq 1 ] && [ "$diagnostic" -eq 1 ]; then
+  usage_error "MB_STAGE1=1 measures the folded Ravel passes; --diagnostic-prometheus-max-samples starts no Ravel"
+fi
 
 [ -n "$profile" ] || usage_error "--profile is required"
 [ -n "$bin_dir" ] || usage_error "--bin-dir is required"
@@ -1107,7 +1250,15 @@ fi
 if [ -n "$ravel_source_commit" ] && ! [[ "$ravel_source_commit" =~ ^[0-9a-f]{40}$ ]]; then
   refuse "--ravel-source-commit '$ravel_source_commit' is not a full 40-character commit id"
 fi
-for bin in metricsbench_ingest metricsbench_query metricsbench_report; do
+if [ "$stage1" -eq 1 ]; then
+  case "$profile" in
+    ci | cardinality) ;;
+    *) refuse "MB_STAGE1=1 with --profile ${profile}: the Stage 1 lanes run on cardinality (the pre-registered run) and ci (its rehearsal) only" ;;
+  esac
+fi
+required_bins="metricsbench_ingest metricsbench_query metricsbench_report"
+[ "$stage1" -eq 0 ] || required_bins="${required_bins} metricsbench_holders"
+for bin in $required_bins; do
   [ -x "${bin_dir}/${bin}" ] || refuse "${bin_dir}/${bin} is missing or not executable"
 done
 for f in stamps.json report.json falsification.json ingest.json; do
@@ -1215,6 +1366,13 @@ export RAVEL_IMAGE="${ravel_image:-unset-diagnostic-run-starts-no-ravel}"
 # The same for docker-compose.yml's S3S_FS_BIN, which fetch-s3s-fs replaces
 # with the verified binary before `up`; this path is never started.
 export S3S_FS_BIN="/nonexistent/s3s-fs-not-fetched"
+# ravel.yml appends this to ravel-server's entrypoint; stage1-restart replaces
+# it with STAGE1_ROUTED_FLAGS.
+if [ "$stage1" -eq 1 ]; then
+  export RAVEL_SERVER_EXTRA_FLAGS="$STAGE1_UNROUTED_FLAGS"
+else
+  export RAVEL_SERVER_EXTRA_FLAGS=""
+fi
 
 compose() {
   "$DOCKER" compose "${compose_files[@]}" "$@"
@@ -1308,6 +1466,16 @@ stamp_set in_process_row null
 stamp_set query_scrapes null
 stamp_set object_spans null
 stamp_set cold_ravel_diagnostic null
+if [ "$stage1" -eq 1 ]; then
+  stamp_set stage1.enabled true
+  stamp_str stage1.server_flags_unrouted "$STAGE1_UNROUTED_FLAGS"
+  stamp_str stage1.server_flags_routed "$STAGE1_ROUTED_FLAGS"
+  for key in fold unrouted unrouted_cold leaves restart routed routed_cold compare holders; do
+    stamp_set "stage1.${key}" null
+  done
+else
+  stamp_set stage1.enabled false
+fi
 stamp_set steps_completed '[]'
 stamp_set failed_after_ingest '[]'
 stamp_set deferred_failures '[]'
@@ -1318,6 +1486,9 @@ stamp_set teardown null
 # --- teardown ----------------------------------------------------------------
 
 STACK_UP=0
+# Set by folded_readback: why its steps were skipped, or that they ran.
+FOLDED_SKIPPED=""
+FOLDED_RAN=0
 SAMPLER_PID=""
 MEMORY_DONE=0
 FAILED_STEP=""
@@ -1666,6 +1837,7 @@ readback_folded_step() {
     --readback-system ravel --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" \
     --ravel-query-url "$RAVEL_BASE" --ravel-bearer-token-env "$RAVEL_TOKEN_ENV" \
     --readback-timeout-secs "$readback_timeout_secs" --readback-settle-secs "$READBACK_SETTLE_SECS" \
+    --ravel-metrics-url "${RAVEL_BASE}/metrics" \
     >"${out_dir}/readback-folded.json" 2>"${out_dir}/readback-folded.log" || code=$?
   after_arg="$after"
   scrape_ravel_metrics "$after" || { after_arg=""; missing="${missing:+$missing and }after"; }
@@ -1700,6 +1872,7 @@ folded_readback() {
     done
     stamp_str object_spans "failed: no fold ran: $why"
     say "steps stop, fold, start and readback-folded skipped: $why"
+    FOLDED_SKIPPED="$why"
     return 0
   fi
   stop_step
@@ -1707,6 +1880,7 @@ folded_readback() {
   start_step
   readback_folded_step
   object_spans_step
+  FOLDED_RAN=1
 }
 
 # sha256_of FILE: the file's sha256 as 64 lowercase hex characters.
@@ -1860,28 +2034,38 @@ COLD_EXTRA_ENTRY="mb_full_range_avg_over_time"
 # or write is recorded (in the file, and stamped cold_ravel_diagnostic),
 # never fatal. Reads run_full's it_env, store_args and prov_tail.
 cold_ravel_diagnostic() {
-  local dir="${out_dir}/cold-ravel-diagnostic" ids id r code why line dead=""
-  local runs="${out_dir}/cold-ravel-diagnostic/runs.json"
-  mkdir -p "$dir" || { stamp_str cold_ravel_diagnostic "failed: cannot create $dir"; return 0; }
+  cold_pass "${out_dir}/cold-ravel-diagnostic" "${out_dir}/cold-ravel-diagnostic.json" \
+    cold_ravel_diagnostic "cold ravel diagnostic" "$COLD_REGIME"
+}
+
+# cold_pass DIR FINAL STAMP_KEY LABEL REGIME [QUERY_ARG ...]: the cold
+# diagnostic's selection and procedure, with its runs under DIR, its result
+# in FINAL, its outcome stamped as STAMP_KEY, its messages prefixed with
+# LABEL, and each QUERY_ARG appended to every metricsbench_query run.
+cold_pass() {
+  local dir="$1" final="$2" key="$3" label="$4" regime="$5" ids id r code why line dead=""
+  local runs="${1}/runs.json"
+  local query_extra=("${@:6}")
+  mkdir -p "$dir" || { stamp_str "$key" "failed: cannot create $dir"; return 0; }
   # cold-record appends to runs.json; a reused out-dir would otherwise carry a
   # previous pass's records into cold-final, which refuses duplicates.
   rm -f "$runs"
   code=0
   ids="$(py cold-select "$CORPUS" "$profile" "$dir" "$COLD_EXTRA_ENTRY")" || code=$?
   if [ "$code" -eq 3 ]; then
-    stamp_str cold_ravel_diagnostic "not applicable: no entry of class long_range or ${COLD_EXTRA_ENTRY} in the corpus ${CORPUS} is declared for profile ${profile}"
-    say "cold ravel diagnostic: no entry selected for profile ${profile}"
+    stamp_str "$key" "not applicable: no entry of class long_range or ${COLD_EXTRA_ENTRY} in the corpus ${CORPUS} is declared for profile ${profile}"
+    say "${label}: no entry selected for profile ${profile}"
     return 0
   elif [ "$code" -ne 0 ]; then
-    stamp_str cold_ravel_diagnostic "failed: ${ids:-cold-select exited ${code} on the corpus ${CORPUS}}"
-    say "cold ravel diagnostic: ${ids:-cold-select exited ${code}}"
+    stamp_str "$key" "failed: ${ids:-cold-select exited ${code} on the corpus ${CORPUS}}"
+    say "${label}: ${ids:-cold-select exited ${code}}"
     return 0
   fi
   for id in $ids; do
     code=0
     "${it_env[@]}" GITHUB_SHA="$ravel_source_commit" "${bin_dir}/metricsbench_report" provenance \
       --workload "$WORKLOAD" --corpus "${dir}/corpus-${id}.json" "${prov_tail[@]}" \
-      --config "diagnostic_regime=${COLD_REGIME}" --config "comparable=false" \
+      --config "diagnostic_regime=${regime}" --config "comparable=false" \
       >"${dir}/provenance-${id}.json" 2>>"${dir}/provenance.log" || code=$?
     for ((r = 1; r <= COLD_REPS; r++)); do
       why=""
@@ -1909,27 +2093,203 @@ cold_ravel_diagnostic() {
           --engine "name=ravel,url=${RAVEL_BASE},bearer_env=${RAVEL_TOKEN_ENV}" \
           --warmup-passes 0 --passes 1 --reps-per-pass 1 \
           --diagnostics "${dir}/${id}.${r}.diagnostics.json" --out "${dir}/${id}.${r}.report.json" \
+          ${query_extra[@]+"${query_extra[@]}"} \
           >"${dir}/${id}.${r}.query.log" 2>&1 || qcode=$?
         py cold-record "$runs" "$id" "$r" "$qcode" "${dir}/${id}.${r}.diagnostics.json" ||
-          say "cold ravel diagnostic: could not record ${id} repetition ${r}"
+          say "${label}: could not record ${id} repetition ${r}"
       else
-        say "cold ravel diagnostic: ${id} repetition ${r}: ${why}"
+        say "${label}: ${id} repetition ${r}: ${why}"
         py cold-record "$runs" "$id" "$r" "${why}" "${dir}/none" ||
-          say "cold ravel diagnostic: could not record ${id} repetition ${r}"
+          say "${label}: could not record ${id} repetition ${r}"
       fi
     done
   done
   code=0
   # shellcheck disable=SC2086
-  line="$(py cold-final "$runs" "${out_dir}/cold-ravel-diagnostic.json" "$profile" "$COLD_REGIME" "$COLD_REPS" \
+  line="$(py cold-final "$runs" "$final" "$profile" "$regime" "$COLD_REPS" \
     "$CORPUS" $ids)" || code=$?
   if [ "$code" -ne 0 ]; then
-    rm -f "${out_dir}/cold-ravel-diagnostic.json"
-    stamp_str cold_ravel_diagnostic "failed: cold-ravel-diagnostic.json not written: ${line:-cold-final exited ${code}}"
-    say "cold ravel diagnostic: ${line:-cold-final exited ${code}}"
+    rm -f "$final"
+    stamp_str "$key" "failed: ${final##*/} not written: ${line:-cold-final exited ${code}}"
+    say "${label}: ${line:-cold-final exited ${code}}"
     return 0
   fi
-  stamp_set cold_ravel_diagnostic "$line"
+  stamp_set "$key" "$line"
+}
+
+# --- Stage 1 (MB_STAGE1=1) ---------------------------------------------------
+
+now_ms() {
+  python3 -I -c 'import time; print(int(time.time() * 1000))'
+}
+
+# stage1_catalog_fold STEP STAMP_KEY OP FILE FOLD_ARG ...: ravel-cli catalog
+# fold --json with FOLD_ARGs on ravel-qualify into <out>/FILE.json, its
+# report read by the py op OP and stamped as STAMP_KEY with its wall time.
+stage1_catalog_fold() {
+  local step="$1" key="$2" op="$3" file="$4" code=0 t0 t1 line
+  shift 4
+  t0="$(now_ms)"
+  compose run --rm --no-deps -T ravel-qualify \
+    --store s3 --tenant-hash-unkeyed catalog fold \
+    --tenant "$RAVEL_TENANT" --shards "$RAVEL_SHARDS" "$@" --json \
+    >"${out_dir}/${file}.json" 2>"${out_dir}/${file}.log" || code=$?
+  t1="$(now_ms)"
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/${file}.log"
+    stamp_str "$key" "failed: ravel-cli catalog fold $* --json exited $code"
+    fail_step "$step" "ravel-cli catalog fold $* --json exited $code; see ${out_dir}/${file}.log"
+  fi
+  code=0
+  line="$(py "$op" "${out_dir}/${file}.json" "$((t1 - t0))")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str "$key" "failed: $line"
+    fail_step "$step" "$line"
+  fi
+  stamp_set "$key" "$line"
+  step_done "$step"
+}
+
+# stage1_pass unrouted|routed: the corpus against Prometheus and Ravel, as the
+# query step runs it, into <out>/stage1-WHICH/, then the cold pass's
+# selection into <out>/stage1-WHICH/cold.json. Every ravel_cost record is
+# labelled pass_label folded-WHICH with the fold state it ran against.
+stage1_pass() {
+  local which="$1" label="folded-$1" step="stage1-$1" dir="${out_dir}/stage1-$1" code=0 state watermark
+  watermark="$(py get "$STAMPS" stage1.fold.watermark_hour)"
+  if [ "$which" = unrouted ]; then
+    state="folded: watermark_hour=${watermark}; ravel-server ${STAGE1_UNROUTED_FLAGS}; no label_value leaf"
+  else
+    state="folded: watermark_hour=${watermark}; ravel-server ${STAGE1_ROUTED_FLAGS}; label_value leaves_written=$(py get "$STAMPS" stage1.leaves.leaf_count)"
+  fi
+  mkdir -p "$dir" || fail_step "$step" "cannot create $dir"
+  "${it_env[@]}" GITHUB_SHA="$ravel_source_commit" "${bin_dir}/metricsbench_report" provenance \
+    --workload "$WORKLOAD" --corpus "$CORPUS" "${prov_tail[@]}" \
+    --config "diagnostic_regime=stage1-${label}" --config "comparable=false" \
+    >"${dir}/provenance.json" 2>"${dir}/provenance.log" || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${dir}/provenance.log"
+    fail_step "$step" "metricsbench_report provenance exited $code"
+  fi
+  local query_args=(--ingest-report "${out_dir}/ingest.json" --workload "$WORKLOAD" --corpus "$CORPUS"
+    --provenance "${dir}/provenance.json"
+    --engine "name=prometheus,url=${PROM_BASE}"
+    --engine "name=ravel,url=${RAVEL_BASE},bearer_env=${RAVEL_TOKEN_ENV}"
+    --pass-label "$label" --fold-state "$state"
+    --diagnostics "${dir}/diagnostics.json"
+    --out "${dir}/report.json")
+  [ -z "$passes" ] || query_args+=(--passes "$passes")
+  [ -z "$reps" ] || query_args+=(--reps-per-pass "$reps")
+  code=0
+  "${bin_dir}/metricsbench_query" "${query_args[@]}" >"${dir}/query.log" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${dir}/query.log"
+    fail_step "$step" "metricsbench_query exited $code"
+  fi
+  [ -s "${dir}/diagnostics.json" ] || fail_step "$step" "metricsbench_query exited 0 and wrote no diagnostics.json"
+  stamp_set "stage1.${which}" "$(python3 -I -c 'import json,sys; print(json.dumps(dict(zip(["pass_label","fold_state","diagnostics","report"], sys.argv[1:]))))' \
+    "$label" "$state" "stage1-${which}/diagnostics.json" "stage1-${which}/report.json")"
+  cold_pass "${dir}/cold" "${dir}/cold.json" "stage1.${which}_cold" "stage1 ${which} cold" \
+    "stage1-${label}-cold" --pass-label "$label" --fold-state "$state"
+  step_done "$step"
+}
+
+# stage1_restart_step: compose recreates the container when its entrypoint
+# changes; --no-deps keeps the one-shots and the object store as they are.
+stage1_restart_step() {
+  local code=0
+  export RAVEL_SERVER_EXTRA_FLAGS="$STAGE1_ROUTED_FLAGS"
+  compose up -d --no-deps --force-recreate ravel-server >"${out_dir}/stage1-restart.log" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/stage1-restart.log"
+    stamp_str stage1.restart "failed: docker compose up -d --no-deps --force-recreate ravel-server exited $code"
+    fail_step stage1-restart "docker compose up -d --no-deps --force-recreate ravel-server exited $code"
+  fi
+  wait_ready ravel "${RAVEL_BASE}/api/v1/status/buildinfo" stage1-restart
+  stamp_str stage1.restart "recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='${STAGE1_ROUTED_FLAGS}', then ravel answered 200 on /api/v1/status/buildinfo"
+  step_done stage1-restart
+}
+
+# stage1_compare: <out>/stage1-compare.json from the two steady passes'
+# diagnostics; stamped, never fatal (the band file is the verdict).
+stage1_compare() {
+  local code=0 line
+  line="$(py stage1-compare "${out_dir}/stage1-unrouted/diagnostics.json" \
+    "${out_dir}/stage1-routed/diagnostics.json" "${out_dir}/stage1-compare.json")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    rm -f "${out_dir}/stage1-compare.json"
+    stamp_str stage1.compare "failed: ${line:-stage1-compare exited $code}"
+    say "stage1 compare: ${line:-stage1-compare exited $code}"
+    return 0
+  fi
+  stamp_set stage1.compare "$line"
+}
+
+# stage1_holders_step: every data object of the bucket downloaded through the
+# createbuckets service (each lane's own endpoint and credentials), as the
+# invoking user so the files can be deleted, then counted by
+# metricsbench_holders without the router. The download is removed after.
+stage1_holders_step() {
+  local bucket code=0 dest="${out_dir}/stage1-objects"
+  local sync_args=(s3 sync)
+  if [ "$real_s3" -eq 1 ]; then
+    bucket="${real_s3_prefix}-ravel"
+  else
+    bucket="ravel-metricsbench"
+    sync_args=(--endpoint-url http://s3s:9000 "${sync_args[@]}")
+  fi
+  rm -rf "$dest"
+  mkdir -p "$dest" || fail_step stage1-holders "cannot create $dest"
+  compose run --rm --no-deps -T --user "$(id -u):$(id -g)" -e HOME=/tmp -v "${dest}:/stage1-objects" \
+    --entrypoint aws createbuckets "${sync_args[@]}" "s3://${bucket}/t/" /stage1-objects/t/ \
+    --exclude '*' --include '*/m/l0/*.rseg' --only-show-errors \
+    >"${out_dir}/stage1-holders.download.log" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    rm -rf "$dest"
+    show_log "${out_dir}/stage1-holders.download.log"
+    stamp_str stage1.holders "failed: aws s3 sync of s3://${bucket}/t/ exited $code"
+    fail_step stage1-holders "aws s3 sync of s3://${bucket}/t/ exited $code; see ${out_dir}/stage1-holders.download.log"
+  fi
+  code=0
+  "${bin_dir}/metricsbench_holders" --corpus "$CORPUS" --profile "$profile" --objects-dir "$dest" \
+    --out "${out_dir}/holders.json" >"${out_dir}/stage1-holders.log" 2>&1 || code=$?
+  rm -rf "$dest"
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/stage1-holders.log"
+    stamp_str stage1.holders "failed: metricsbench_holders exited $code"
+    fail_step stage1-holders "metricsbench_holders exited $code; see ${out_dir}/stage1-holders.log"
+  fi
+  stamp_set stage1.holders "$(python3 -I -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+print(json.dumps({"file": "holders.json", "bucket": sys.argv[2], "method": doc.get("method"),
+                  "objects_total": doc.get("objects_total"), "series_total": doc.get("series_total"),
+                  "statements": len(doc.get("statements") or []),
+                  "skipped": len(doc.get("skipped") or [])}))' "${out_dir}/holders.json" "$bucket")" ||
+    fail_step stage1-holders "holders.json is not readable"
+  step_done stage1-holders
+}
+
+# stage1_steps: after readback-folded, the Stage 1 steps in their order.
+stage1_steps() {
+  local k
+  if [ "$INGEST_FAILED" -eq 1 ] || [ "$FOLDED_RAN" -eq 0 ]; then
+    local why="the ingest verification failed, so the run is a diagnostic already"
+    [ "$INGEST_FAILED" -eq 1 ] || why="the folded steps were skipped: ${FOLDED_SKIPPED}"
+    for k in fold unrouted unrouted_cold leaves restart routed routed_cold compare holders; do
+      stamp_str "stage1.${k}" "skipped: $why"
+    done
+    say "stage1 steps skipped: $why"
+    return 0
+  fi
+  stage1_catalog_fold stage1-fold stage1.fold stage1-fold stage1-fold --signal metrics
+  stage1_pass unrouted
+  stage1_catalog_fold stage1-leaves stage1.leaves stage1-leaves stage1-leaves \
+    --rebuild-key-index --signal metrics --metrics-label-index
+  stage1_restart_step
+  stage1_pass routed
+  stage1_compare
+  stage1_holders_step
 }
 
 run_diagnostic() {
@@ -2152,6 +2512,14 @@ run_full() {
     --engine "name=mimir,url=${MIMIR_BASE}/prometheus"
     --diagnostics "${out_dir}/diagnostics.json"
     --out "${out_dir}/report.json")
+  # The ravel_cost records say which fold state they ran against: unfolded
+  # while ravel-server has published no fold, else the gauge stamped above.
+  if [ -z "$fold" ]; then
+    query_args+=(--pass-label unfolded --fold-state "absent: no ravel_catalog_fold_last_success_timestamp_seconds")
+  else
+    query_args+=(--pass-label background-folded
+      --fold-state "ravel_catalog_fold_last_success_timestamp_seconds=${fold}")
+  fi
   [ -z "$passes" ] || query_args+=(--passes "$passes")
   [ -z "$reps" ] || query_args+=(--reps-per-pass "$reps")
   [ "$INGEST_FAILED" -eq 0 ] || query_args+=(--diagnostic-after-failed-ingest)
@@ -2193,6 +2561,7 @@ run_full() {
     cold_ravel_diagnostic
   fi
   folded_readback
+  [ "$stage1" -eq 0 ] || stage1_steps
   end_deferred_memory
   [ "$INGEST_FAILED" -eq 0 ] || fail_after_ingest
 }

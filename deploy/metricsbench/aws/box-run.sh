@@ -3,9 +3,11 @@
 # run a `ci` smoke, then the measured profile with run.sh, uploading the box
 # log, status lines and outputs to s3://$BUCKET/$PREFIX as it goes.
 # REAL_S3_PREFIX empty: the portable s3s-fs lane. Set: the real-S3 lane.
+# STAGE1=1: both run.sh invocations run with MB_STAGE1=1.
 set -uo pipefail
 export HOME=/root PATH=/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 . /mb/env
+export MB_STAGE1="${STAGE1:-}"
 log=/mb/box.log
 exec >>"$log" 2>&1
 stage() { echo "=== $(date -u +%FT%TZ) $*"; }
@@ -30,7 +32,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --defaul
 rustup toolchain install || finish 16
 stage build
 CARGO_INCREMENTAL=0 cargo build --release --locked -p ravel-bench \
-  --bin metricsbench_ingest --bin metricsbench_query --bin metricsbench_report || finish 17
+  --bin metricsbench_ingest --bin metricsbench_query --bin metricsbench_report \
+  --bin metricsbench_holders || finish 17
 status_line build 0
 stage "pull image"
 docker pull "$RAVEL_IMAGE" || finish 18

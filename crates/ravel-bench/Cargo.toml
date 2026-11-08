@@ -392,6 +392,14 @@ name = "metricsbench_query"
 path = "src/bin/metricsbench_query.rs"
 bench = false
 
+# MetricsBench Stage 1 holder counts (ADR-3694, issue #3968): per corpus
+# statement, the data objects holding a matching series, counted without the
+# router.
+[[bin]]
+name = "metricsbench_holders"
+path = "src/bin/metricsbench_holders.rs"
+bench = false
+
 [[bin]]
 name = "segment_alloc_profile"
 path = "src/bin/segment_alloc_profile.rs"

@@ -152,6 +152,11 @@ struct Args {
     /// Ravel row's read-back. Required with `--ravel-endpoint`.
     #[arg(long)]
     ravel_query_url: Option<String>,
+    /// `ravel-server`'s Prometheus-text `/metrics` URL. When given, the Ravel
+    /// row's read-back records each series and samples query's `data.stats`
+    /// and the store GET deltas around it (`readback.query_cost`).
+    #[arg(long)]
+    ravel_metrics_url: Option<String>,
     /// Base URL of Prometheus's query API. Required with
     /// `--prometheus-endpoint`.
     #[arg(long)]
@@ -980,6 +985,10 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
             bearer_token,
             timeout_secs: args.readback_timeout_secs,
             settle_secs: args.readback_settle_secs,
+            metrics_url: match receiver {
+                Receiver::Ravel => args.ravel_metrics_url.clone(),
+                _ => None,
+            },
         };
         let failed = match readback_over_http(&readback_cfg, &row, &outcome.plan).await {
             Ok(readback) => {
@@ -1284,6 +1293,10 @@ async fn run_readback_only(args: &Args) -> Result<ReadbackOnlyOutput, RunError> 
         bearer_token: target.bearer_token,
         timeout_secs: args.readback_timeout_secs,
         settle_secs: args.readback_settle_secs,
+        metrics_url: match target.receiver {
+            Receiver::Ravel => args.ravel_metrics_url.clone(),
+            _ => None,
+        },
     };
     let mut output = ReadbackOnlyOutput {
         system: system.to_string(),

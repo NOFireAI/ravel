@@ -677,9 +677,10 @@ pub struct SkippedRep {
 /// repetitions, so each repetition's cost sits beside its own latency; a
 /// repetition skipped after a timeout is a [`SkippedRep`] instead (ADR-0927's
 /// 2026-11-06 amendment).
-/// `accounting` and `phases` are `data.stats.accounting` and
-/// `data.stats.phases` copied from the answer body as returned; both are
-/// `None` when the answer carries no `data.stats`.
+/// `accounting`, `phases`, the four segment counters, `estimate` and `io` are
+/// the same-named members of `data.stats` copied from the answer body as
+/// returned, each read on its own; any one is `None` (serialized `null`, never
+/// 0) when the answer carries no `data.stats` or the stats lack that member.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct RavelCost {
     pub entry: String,
@@ -693,19 +694,242 @@ pub struct RavelCost {
     pub latency_ms: f64,
     pub accounting: Option<Json>,
     pub phases: Option<Json>,
+    #[serde(rename = "segmentsFetched")]
+    pub segments_fetched: Option<Json>,
+    #[serde(rename = "segmentsPruned")]
+    pub segments_pruned: Option<Json>,
+    #[serde(rename = "segmentsPrunedByDictionary")]
+    pub segments_pruned_by_dictionary: Option<Json>,
+    #[serde(rename = "segmentsPrunedByLabelIndex")]
+    pub segments_pruned_by_label_index: Option<Json>,
+    pub estimate: Option<Json>,
+    pub io: Option<Json>,
+    /// Which harness pass this run belongs to (`unfolded`, `folded-unrouted`,
+    /// `folded-routed`), set by `--pass-label`; `pass` stays the timed pass
+    /// number ADR-0927 defines.
+    pub pass_label: Option<String>,
+    /// The catalog fold state the run was stamped with, set by
+    /// `--fold-state`.
+    pub fold_state: Option<String>,
+    /// [`result_hash`] of the answer's `data`; `None` for an outcome that is
+    /// not a successful envelope.
+    pub result_hash: Option<String>,
 }
 
-/// `data.stats.accounting` and `data.stats.phases` from a query answer, read
-/// independently so one present without the other is not forced to null the
-/// other. Both are `None` for any outcome that is not a successful envelope
-/// (`answer_body`), and for one that is but carries no `data.stats`.
-fn ravel_cost_fields(outcome: &QueryOutcome) -> (Option<Json>, Option<Json>) {
-    match answer_body(outcome).and_then(|body| body["data"].get("stats").cloned()) {
-        Some(stats) => (
-            stats.get("accounting").cloned(),
-            stats.get("phases").cloned(),
-        ),
-        None => (None, None),
+impl RavelCost {
+    /// The record of one Ravel repetition: every cost field copied from the
+    /// outcome's `data.stats`, the hash of its `data`, and no labels yet.
+    fn of(
+        entry: &str,
+        (pass, rep): (u32, u32),
+        status: ResultStatus,
+        latency_ms: f64,
+        outcome: &QueryOutcome,
+    ) -> Self {
+        let body = answer_body(outcome);
+        let stats = body.and_then(|body| body["data"].get("stats"));
+        let field = |name: &str| stats.and_then(|stats| stats.get(name)).cloned();
+        RavelCost {
+            entry: entry.to_string(),
+            pass,
+            rep,
+            status,
+            latency_ms,
+            accounting: field("accounting"),
+            phases: field("phases"),
+            segments_fetched: field("segmentsFetched"),
+            segments_pruned: field("segmentsPruned"),
+            segments_pruned_by_dictionary: field("segmentsPrunedByDictionary"),
+            segments_pruned_by_label_index: field("segmentsPrunedByLabelIndex"),
+            estimate: field("estimate"),
+            io: field("io"),
+            pass_label: None,
+            fold_state: None,
+            result_hash: body.map(|body| result_hash(&body["data"])),
+        }
+    }
+}
+
+/// Sets the pass label and the fold state on every record of `records`.
+pub fn label_ravel_cost(
+    records: &mut [RavelCost],
+    pass_label: Option<&str>,
+    fold_state: Option<&str>,
+) {
+    for record in records {
+        record.pass_label = pass_label.map(str::to_string);
+        record.fold_state = fold_state.map(str::to_string);
+    }
+}
+
+/// A digest of a query answer's `data` (`resultType` and `result`) that is
+/// equal for equal answers and independent of series order: each series is
+/// encoded as its labels sorted by name, then its samples in order, with every
+/// timestamp and every float value hashed by its `f64::to_bits` (so NaN
+/// payloads and -0.0 are significant); a native histogram sample is hashed as
+/// its canonical (key-sorted) JSON text. The series encodings are sorted
+/// before they are hashed, so two answers listing the same series in a
+/// different order hash equal. A scalar or string result is one sample with
+/// no labels. Spelled `blake3:<hex>`.
+pub fn result_hash(data: &Json) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let result_type = data["resultType"].as_str().unwrap_or("");
+    put_bytes(&mut hasher, result_type.as_bytes());
+    let result = &data["result"];
+    let mut series: Vec<Vec<u8>> = match (result_type, result.as_array()) {
+        ("matrix" | "vector", Some(items)) => items.iter().map(encode_series).collect(),
+        ("scalar" | "string", Some(_)) => {
+            let mut out = Vec::new();
+            put_len(&mut out, 0);
+            put_len(&mut out, 1);
+            encode_sample(result, &mut out);
+            vec![out]
+        }
+        _ => {
+            let mut out = Vec::new();
+            canonical_json(result, &mut out);
+            vec![out]
+        }
+    };
+    series.sort();
+    hasher.update(&(series.len() as u64).to_le_bytes());
+    for encoded in &series {
+        put_bytes(&mut hasher, encoded);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn put_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn put_len(out: &mut Vec<u8>, len: usize) {
+    out.extend_from_slice(&(len as u64).to_le_bytes());
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_len(out, s.len());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// One series: its labels sorted by name, then `value`, `values`,
+/// `histogram` and `histograms` samples in that order, each list length
+/// prefixed.
+fn encode_series(item: &Json) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut labels: Vec<(&str, String)> = item["metric"]
+        .as_object()
+        .map(|metric| {
+            metric
+                .iter()
+                .map(|(name, value)| {
+                    let mut text = Vec::new();
+                    match value.as_str() {
+                        Some(s) => text.extend_from_slice(s.as_bytes()),
+                        None => canonical_json(value, &mut text),
+                    }
+                    (name.as_str(), String::from_utf8_lossy(&text).into_owned())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    labels.sort();
+    put_len(&mut out, labels.len());
+    for (name, value) in &labels {
+        put_str(&mut out, name);
+        put_str(&mut out, value);
+    }
+    for (key, many) in [
+        ("value", false),
+        ("values", true),
+        ("histogram", false),
+        ("histograms", true),
+    ] {
+        out.push(key.len() as u8);
+        out.extend_from_slice(key.as_bytes());
+        let samples: Vec<&Json> = match (&item[key], many) {
+            (Json::Null, _) => Vec::new(),
+            (Json::Array(list), true) => list.iter().collect(),
+            (one, _) => vec![one],
+        };
+        put_len(&mut out, samples.len());
+        for sample in samples {
+            encode_sample(sample, &mut out);
+        }
+    }
+    out
+}
+
+/// A `[timestamp, value]` pair: the timestamp as an f64's bits, a string value
+/// parsed as a Prometheus float and hashed by its bits, anything else (a
+/// histogram object, a value that does not parse) as tagged canonical JSON.
+fn encode_sample(sample: &Json, out: &mut Vec<u8>) {
+    let pair = sample.as_array().filter(|pair| pair.len() == 2);
+    let Some(pair) = pair else {
+        out.push(b'j');
+        let mut text = Vec::new();
+        canonical_json(sample, &mut text);
+        put_len(out, text.len());
+        out.extend_from_slice(&text);
+        return;
+    };
+    match pair[0].as_f64() {
+        Some(ts) => {
+            out.push(b't');
+            out.extend_from_slice(&ts.to_bits().to_le_bytes());
+        }
+        None => {
+            out.push(b'T');
+            let mut text = Vec::new();
+            canonical_json(&pair[0], &mut text);
+            put_len(out, text.len());
+            out.extend_from_slice(&text);
+        }
+    }
+    match pair[1].as_str().and_then(parse_value) {
+        Some(value) => {
+            out.push(b'f');
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        None => {
+            out.push(b'j');
+            let mut text = Vec::new();
+            canonical_json(&pair[1], &mut text);
+            put_len(out, text.len());
+            out.extend_from_slice(&text);
+        }
+    }
+}
+
+/// JSON text with every object's keys sorted, whatever order the map kept.
+fn canonical_json(value: &Json, out: &mut Vec<u8>) {
+    match value {
+        Json::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push(b'{');
+            for (i, key) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(Json::String((*key).clone()).to_string().as_bytes());
+                out.push(b':');
+                canonical_json(&map[key.as_str()], out);
+            }
+            out.push(b'}');
+        }
+        Json::Array(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                canonical_json(item, out);
+            }
+            out.push(b']');
+        }
+        scalar => out.extend_from_slice(scalar.to_string().as_bytes()),
     }
 }
 
@@ -1279,16 +1503,13 @@ pub async fn run(
                     if let Some(citation) = &record.unsupported_citation {
                         record.unsupported_answer = Some(summarize(&outcome));
                         if engine.engine == Engine::Ravel {
-                            let (accounting, phases) = ravel_cost_fields(&outcome);
-                            ravel_cost.push(RavelCost {
-                                entry: entry.id.clone(),
-                                pass,
-                                rep: repetition,
-                                status: ResultStatus::UnsupportedConstruct,
+                            ravel_cost.push(RavelCost::of(
+                                &entry.id,
+                                (pass, repetition),
+                                ResultStatus::UnsupportedConstruct,
                                 latency_ms,
-                                accounting,
-                                phases,
-                            });
+                                &outcome,
+                            ));
                         }
                         reps.push((
                             Classified {
@@ -1313,16 +1534,13 @@ pub async fn run(
                             .add(oracle.envelope(), answer_body(&outcome));
                     }
                     if engine.engine == Engine::Ravel {
-                        let (accounting, phases) = ravel_cost_fields(&outcome);
-                        ravel_cost.push(RavelCost {
-                            entry: entry.id.clone(),
-                            pass,
-                            rep: repetition,
-                            status: classified.status,
+                        ravel_cost.push(RavelCost::of(
+                            &entry.id,
+                            (pass, repetition),
+                            classified.status,
                             latency_ms,
-                            accounting,
-                            phases,
-                        });
+                            &outcome,
+                        ));
                     }
                     let timed_out = classified.status == ResultStatus::Timeout;
                     reps.push((classified, latency_ms));
@@ -1774,6 +1992,130 @@ mod tests {
         let mut gap = UlpGap::new("e", Engine::Ravel);
         gap.add(oracle, answer);
         gap
+    }
+
+    #[test]
+    fn equal_answers_hash_equal_whatever_their_key_order() {
+        let a = matrix(&[("a", &[(1.0, "1.5"), (2.0, "NaN")]), ("b", &[(1.0, "4")])]);
+        let b = serde_json::json!({"data": {
+            "result": [
+                {"values": [[1.0, "1.5"], [2.0, "NaN"]], "metric": {"instance": "a"}},
+                {"values": [[1, "4"]], "metric": {"instance": "b"}},
+            ],
+            "resultType": "matrix",
+        }});
+        assert_eq!(result_hash(&a["data"]), result_hash(&b["data"]));
+        assert!(result_hash(&a["data"]).starts_with("blake3:"));
+    }
+
+    #[test]
+    fn a_one_bit_change_hashes_differently() {
+        let one = matrix(&[("a", &[(1.0, "1")])]);
+        // 1.0000000000000002 is the next f64 above 1.0: one mantissa bit.
+        let next = matrix(&[("a", &[(1.0, "1.0000000000000002")])]);
+        assert_eq!(
+            1.0000000000000002_f64.to_bits() ^ 1.0_f64.to_bits(),
+            1,
+            "the fixture must differ in exactly one bit"
+        );
+        assert_ne!(result_hash(&one["data"]), result_hash(&next["data"]));
+        let zero = matrix(&[("a", &[(1.0, "0")])]);
+        let negative_zero = matrix(&[("a", &[(1.0, "-0")])]);
+        assert_ne!(
+            result_hash(&zero["data"]),
+            result_hash(&negative_zero["data"])
+        );
+        let later = matrix(&[("a", &[(1.0000000000000002, "1")])]);
+        assert_ne!(result_hash(&one["data"]), result_hash(&later["data"]));
+        let relabelled = matrix(&[("b", &[(1.0, "1")])]);
+        assert_ne!(result_hash(&one["data"]), result_hash(&relabelled["data"]));
+    }
+
+    #[test]
+    fn reordered_series_hash_equal_and_reordered_samples_do_not() {
+        let ab = matrix(&[("a", &[(1.0, "1"), (2.0, "2")]), ("b", &[(1.0, "3")])]);
+        let ba = matrix(&[("b", &[(1.0, "3")]), ("a", &[(1.0, "1"), (2.0, "2")])]);
+        assert_eq!(result_hash(&ab["data"]), result_hash(&ba["data"]));
+        let swapped = matrix(&[("a", &[(2.0, "2"), (1.0, "1")]), ("b", &[(1.0, "3")])]);
+        assert_ne!(result_hash(&ab["data"]), result_hash(&swapped["data"]));
+        let as_vector = serde_json::json!({"resultType": "vector", "result": [
+            {"metric": {"instance": "a"}, "value": [1.0, "1"]},
+        ]});
+        let as_matrix = matrix(&[("a", &[(1.0, "1")])]);
+        assert_ne!(result_hash(&as_vector), result_hash(&as_matrix["data"]));
+    }
+
+    #[test]
+    fn ravel_cost_copies_every_stats_field_and_nulls_the_absent_ones() {
+        use ravel_promql_difftest::prometheus_client::QueryTiming;
+        let body = serde_json::json!({"status": "success", "data": {
+            "resultType": "vector",
+            "result": [{"metric": {"instance": "a"}, "value": [1.0, "1"]}],
+            "stats": {
+                "accounting": {"requests": 5},
+                "phases": [{"name": "scan"}],
+                "segmentsFetched": 7,
+                "segmentsPruned": 3,
+                "segmentsPrunedByDictionary": 1,
+                "segmentsPrunedByLabelIndex": 2,
+                "estimate": {"segments": 9},
+            },
+        }});
+        let outcome = QueryOutcome::Envelope {
+            http_status: 200,
+            body: body.clone(),
+            timing: QueryTiming::default(),
+        };
+        let mut records = vec![RavelCost::of("e", (2, 3), ResultStatus::Ok, 4.5, &outcome)];
+        label_ravel_cost(&mut records, Some("folded-routed"), Some("folded"));
+        let record = serde_json::to_value(&records[0]).expect("serializes");
+        assert_eq!(record["entry"], "e");
+        assert_eq!(record["pass"], 2);
+        assert_eq!(record["rep"], 3);
+        assert_eq!(record["accounting"], serde_json::json!({"requests": 5}));
+        assert_eq!(record["phases"], serde_json::json!([{"name": "scan"}]));
+        assert_eq!(record["segmentsFetched"], 7);
+        assert_eq!(record["segmentsPruned"], 3);
+        assert_eq!(record["segmentsPrunedByDictionary"], 1);
+        assert_eq!(record["segmentsPrunedByLabelIndex"], 2);
+        assert_eq!(record["estimate"], serde_json::json!({"segments": 9}));
+        assert!(
+            record.as_object().expect("object").contains_key("io") && record["io"].is_null(),
+            "an absent io is recorded as null, not 0 and not left out"
+        );
+        assert_eq!(record["pass_label"], "folded-routed");
+        assert_eq!(record["fold_state"], "folded");
+        assert_eq!(
+            record["result_hash"],
+            Json::String(result_hash(&body["data"]))
+        );
+
+        let refused = QueryOutcome::Envelope {
+            http_status: 422,
+            body,
+            timing: QueryTiming::default(),
+        };
+        let record =
+            serde_json::to_value(RavelCost::of("e", (1, 1), ResultStatus::Ok, 1.0, &refused))
+                .expect("serializes");
+        for field in [
+            "accounting",
+            "phases",
+            "segmentsFetched",
+            "segmentsPruned",
+            "segmentsPrunedByDictionary",
+            "segmentsPrunedByLabelIndex",
+            "estimate",
+            "io",
+            "pass_label",
+            "fold_state",
+            "result_hash",
+        ] {
+            assert!(
+                record.as_object().expect("object").contains_key(field) && record[field].is_null(),
+                "{field} must be null on a non-2xx answer"
+            );
+        }
     }
 
     #[test]

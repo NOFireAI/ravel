@@ -572,7 +572,7 @@ script, and run in CI's `doc-scripts` job.
 | `--ravel-image REF@sha256:DIGEST` | The published form: a registry image pinned by its digest, set as `RAVEL_IMAGE`. A reference without a digest, and no `--ravel-image-id`, is refused with exit 65 (case c). Stamped `ravel_image.kind: "published"` (case a). |
 | `--ravel-image REF --ravel-image-id sha256:ID` | The local-build form: an image built on this host, which has no registry digest, named by the local tag `REF` and identified by its content. Refused with exit 65 before anything starts unless `docker image inspect REF` reports `Id` equal to `ID`, and with any profile other than `ci`, since a local build is for the nightly only. Stamped `ravel_image.kind: "local-build"` with `image_id` and `reference`, and passed to provenance as `ravel_image_kind` and `ravel_image_id` (case p). Exactly one form is required: an id with a digest-pinned `--ravel-image`, an id with no `--ravel-image`, or no image at all exits 64 (case p). |
 | `--ravel-source-commit SHA` | The full commit the image was built from, stamped as given (case a). |
-| `--bin-dir DIR` | Holds `metricsbench_ingest`, `metricsbench_query` and `metricsbench_report`. A missing one is refused with exit 65 (case h). |
+| `--bin-dir DIR` | Holds `metricsbench_ingest`, `metricsbench_query` and `metricsbench_report`, and `metricsbench_holders` with `MB_STAGE1=1`. A missing one is refused with exit 65 (case h). |
 | `--out-dir DIR` | Created if absent. One that already holds `stamps.json`, `report.json`, `ingest.json` or `falsification.json` is refused with exit 65 (case h). |
 | `--anchor-ms N` | The replay anchor, which must be on the profile's scrape grid (exit 65 otherwise, case h). Default: the profile's window ending at least 10 minutes before the run, on the grid, stamped `anchor_source` as from the clock. Ravel drops samples older than its 45-day `--max-ingest-lag`, so a fixed old anchor fails Ravel's read-back. |
 | `--passes N`, `--reps N` | Passed to `metricsbench_query` as `--passes` and `--reps-per-pass` and stamped (case g); its own defaults (5 and 3) otherwise. A timed pass stops repeating a statement for an engine once that engine's repetition times out, and lists the repetitions left out in the diagnostics sidecar's `skipped_reps` (ADR-0927, 2026-11-06 amendment). |
@@ -715,6 +715,12 @@ verification (step 6), after which the run goes on as a diagnostic:
     `run_verdict: "failed"` and `failed_bands` (case q). When the failed row
     is the Prometheus oracle's, `metricsbench_query` refuses instead, writes
     no report, and the run ends here (case q4).
+    Every `ravel_cost` record in the sidecar carries `pass_label`
+    `background-folded` and `fold_state`
+    `ravel_catalog_fold_last_success_timestamp_seconds=<value>` when step 11
+    read the gauge (case a), and `unfolded` with `absent: no
+    ravel_catalog_fold_last_success_timestamp_seconds` when it did not (case
+    j). The record's fields are under "Stage 1" below.
     Once `metricsbench_query` has written the report, and before `validate`,
     `memory` or `stop`, Ravel's and Mimir's `/metrics` are scraped again
     into `ravel-metrics-after-query.txt` and `mimir-metrics-after-query.txt`
@@ -1033,7 +1039,166 @@ f), `object_store` (release, asset arch, engine arch and its source, sha256,
 URL, cached path and whether it came from the cache or a download; `not applicable` in the diagnostic mode;
 cases a, f, n1, n5 and n7), `steps_completed`, `failed_step`,
 `failed_after_ingest` (cases a, q and q3), `exit_code`, `status` and
-`teardown`.
+`teardown`, and `stage1` (below; `{"enabled": false}` without `MB_STAGE1`,
+case a).
+
+### Stage 1 (`MB_STAGE1=1`)
+
+ADR-3694's Stage 1 run (issue #3968) measures what the metrics label index
+buys a folded catalog: the same corpus read once with key-index leaves and
+no `label_value` leaf, and once with them, on one tenant, one binary and one
+box. `MB_STAGE1=1` in the environment adds those steps to a run; `0` or unset
+leaves the run as above, any other value exits 64 (cases z4, z6). It is
+accepted with `--profile cardinality` and `--profile ci` only (another
+profile exits 65 before anything starts, case z3) and not with
+`--diagnostic-prometheus-max-samples` (exit 64, case z5).
+
+**Server flags.** `ravel.yml` sets the server's entrypoint to
+`/usr/local/bin/ravel-server ${RAVEL_SERVER_EXTRA_FLAGS:-}`, the image's own
+`ENTRYPOINT` plus one variable, so the command line is the one above when the
+variable is empty, which it is without `MB_STAGE1` (cases a and z0; z0
+renders the file with `docker compose config` where the host has compose).
+With `MB_STAGE1=1`, `up` runs with it set to `--fold-key-index-leaves`, so
+ingest and every step before Stage 1 run with key-index leaves and without
+`--fold-metrics-label-index` (case z).
+
+**Steps.** After `readback-folded` (step 18), and only when it ran, these
+run in this order (case z pins the order and each command's flags); a
+failure ends the run with exit 70 naming the step:
+
+1. `stage1-fold`: `ravel-cli catalog fold --signal metrics --json` on
+   `ravel-qualify` with no leaf flag and no `--writers-stopped`, into
+   `stage1-fold.json`. `stage1.fold` stamps its `wall_ms`, `watermark_hour`,
+   `no_op`, `entry_count`, the request counts and the key-index leaves it
+   wrote.
+2. `stage1-unrouted`: `metricsbench_query` against Prometheus and Ravel with
+   the full corpus and `--passes`/`--reps`, `--pass-label folded-unrouted`
+   and `--fold-state "folded: watermark_hour=W; ravel-server
+   --fold-key-index-leaves; no label_value leaf"`, into
+   `stage1-unrouted/` (`report.json`, `diagnostics.json`, and a
+   `provenance.json` with `comparable=false`). Then the cold
+   pass's selection (as `cold_ravel_diagnostic` picks it; none on `ci`, so
+   `stage1.unrouted_cold` says `not applicable`, case z1) cold, into
+   `stage1-unrouted/cold.json`; a cold failure is stamped, not fatal.
+3. `stage1-leaves`: `ravel-cli catalog fold --rebuild-key-index --signal
+   metrics --metrics-label-index --json`, into `stage1-leaves.json`.
+   `stage1.leaves` stamps `leaf_count` (`leaves_written`), `leaf_bytes`
+   (`leaf_bytes_written`), `gets` (`ranged_gets + leaf_prefix_gets +
+   erasure_get_requests`), `wall_ms`, and the report's part counts
+   (`parts_rebuilt`, `parts_deferred`, `parts_erasure_gated`, ...). Exit 70
+   on a failed rebuild (case z7).
+4. `stage1-restart`: `docker compose up -d --no-deps --force-recreate
+   ravel-server` with `RAVEL_SERVER_EXTRA_FLAGS` set to
+   `--fold-key-index-leaves --fold-metrics-label-index`, then
+   `/api/v1/status/buildinfo` answers 200 as in `ready`. Exit 70 when it does
+   not (case z8).
+5. `stage1-routed`: step 2 again with `--pass-label folded-routed` and
+   `--fold-state "folded: watermark_hour=W; ravel-server
+   --fold-key-index-leaves --fold-metrics-label-index; label_value
+   leaves_written=N"`, into `stage1-routed/`.
+6. The two steady passes are compared into `stage1-compare.json`, stamped as
+   `stage1.compare`: per corpus entry the set of `result_hash` values each
+   pass's records carry, `entries_compared`, `entries_equal`,
+   `entries_differing_count` with the differing entries and their hashes,
+   `entries_without_hash_count`, `routed_records` and
+   `routed_records_pruned_by_label_index` (routed records whose
+   `segmentsPrunedByLabelIndex` is above 0). A difference is recorded and
+   the run still exits 0 (case z2); the band file below is the verdict.
+7. `stage1-holders`: the tenant's data objects (`t/*/m/l0/*.rseg`) are
+   downloaded with `aws s3 sync` on the `createbuckets` service into
+   `stage1-objects/`, `metricsbench_holders` counts them into
+   `holders.json`, and the download is deleted. On the real-S3 lane the
+   bucket is `<PREFIX>-ravel` (case z11). Exit 70 on a failed download (case
+   z10).
+
+A run whose ingest verification failed, or whose steps 15 to 18 were
+skipped, runs none of them and stamps each `skipped:` and why (case z9).
+
+**Record fields.** Every `ravel_cost` record (`diagnostics.json` of the query
+step and of both Stage 1 passes) carries `entry`, `pass` (the timed pass
+number, from 1), `rep`, `status`, `latency_ms`, and these copied from the
+answer's `data.stats`, each `null` (never 0) when the answer has no such
+member: `accounting`, `phases`, `segmentsFetched`, `segmentsPruned`,
+`segmentsPrunedByDictionary`, `segmentsPrunedByLabelIndex`, `estimate` and
+`io`. Then `pass_label` and `fold_state` as the run passed them, and
+`result_hash`, `blake3:` and the hash of the answer's `resultType` and
+`result` with the series sorted, so two answers with the same series hash
+equal whatever order the engine listed them in, and every value hashed by
+its bits (`null` for an answer that is not a successful envelope; the
+encoding is in benchmarks/metrics/README.md, "Diagnostics sidecar"). For
+example (values illustrative):
+
+```json
+{"entry": "mb_selective_job_rate_sum", "pass": 1, "rep": 2, "status": "ok",
+ "latency_ms": 41.7, "accounting": {...}, "phases": {...},
+ "segmentsFetched": 4, "segmentsPruned": 6, "segmentsPrunedByDictionary": 3,
+ "segmentsPrunedByLabelIndex": 3, "estimate": null, "io": null,
+ "pass_label": "folded-routed",
+ "fold_state": "folded: watermark_hour=490001; ravel-server --fold-key-index-leaves --fold-metrics-label-index; label_value leaves_written=12",
+ "result_hash": "blake3:..."}
+```
+
+`readback-folded.json` also records, per read-back query (`series` and each
+`samples.N`), `readback.query_cost`: the answers' `data.stats` (`stats`, one
+per window; empty for `series`, whose answer has none), and the change in
+`ravel_store_calls_total{op="get"}` (`store_get_delta`) and
+`ravel_cache_misses_total{cache="fetch"}` (`fetch_miss_delta`) across the
+query, with `catalog_get_delta` their difference, or `scrape_error`.
+`run.sh` passes Ravel's `/metrics` URL to the folded read-back for this with
+or without `MB_STAGE1`.
+
+**holders.json.** How many data objects hold a series each selective
+statement asks for, counted without the router or the key index, so that
+the routed pass's pruning can be compared with what a perfect router could
+have skipped. The method, as `metricsbench_holders` writes it into the file
+and `stage1.holders.method` stamps it:
+
+> every data object (t/<tenant>/m/l0/*.rseg) was downloaded and its full
+> series catalog decoded with ravel-segment's public reader (open_from_full +
+> decode_catalog_v5), without the router or key index; a statement qualifies
+> when a selector has a label="value" matcher with a non-empty value, and an
+> object holds it when one of its series matches a qualifying selector in
+> full (metric name and every matcher); the query window is not applied
+
+The file holds `method`, `profile`, `objects_total`, `series_total`,
+`statements` (per qualifying entry: `id`, `promql`, `selectors`,
+`positive_equalities` and `holders`) and `skipped` (`id` and `reason` for
+each entry that does not qualify).
+
+**Checking a run.** `stage1-check.sh BANDS OUT-DIR` checks a run's figures
+against a band file and is the pass/fail for a Stage 1 run.
+`stage1-bands.ci.json` is the `ci` profile's:
+
+```json
+{"schema": "metricsbench-stage1-bands/1", "profile": "ci",
+ "figures": [{"name": "leaf_count", "file": "stamps.json",
+              "path": "stage1.leaves.leaf_count", "min": 1, "max": null,
+              "basis": "predicted: ..."}, ...]}
+```
+
+`file` is relative to OUT-DIR; `path` is dot-separated keys, and a segment
+`key[field=value]` selects the one element of the list under `key` whose
+`field` equals `value` (`statements[id=mb_selective_job_rate_sum].holders`).
+`min` and `max` are numbers or `null` for no bound, at least one set;
+`basis` is required. The band file's `profile` must be the run's. Each
+figure must be present exactly once and inside its band: a missing file,
+key or element is `missing`; a key twice in its object, a selector matching
+two elements, or a figure the band file names twice is `duplicated`; a value
+that is not a number or lies outside the band is `out of band`. Exit 0
+prints `ok NAME = VALUE in [MIN, MAX] (FILE PATH)` per figure; exit 1 prints
+each failing figure on stderr and the count; 64 is bad usage; 65 a band file
+that cannot be used or is for another profile (run.test.sh, the
+`stage1-check` cases). The `ci` bands require at least one `label_value`
+leaf, no deferred or erasure-gated part, every compared entry's hashes equal
+and none missing, at least one routed record with
+`segmentsPrunedByLabelIndex` above 0, and at least one holder for
+`mb_selective_job_rate_sum`; every basis is a prediction until a
+`stage1=true` dispatch measures it.
+
+The nightly workflow's manual dispatch takes a `stage1` input (default
+false) that sets `MB_STAGE1=1` and then runs `stage1-check.sh` with the `ci`
+bands; `aws/launch.sh` passes `MB_STAGE1` to both of the box's `run.sh`
+invocations.
 
 ### The real-S3 lane
 

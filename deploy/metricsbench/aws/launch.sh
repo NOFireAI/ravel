@@ -10,8 +10,10 @@
 # Required environment: MB_RESULTS_BUCKET, MB_SUBNET_ID, MB_SECURITY_GROUP_ID,
 # MB_INSTANCE_PROFILE. Optional: MB_PROFILE (cardinality), MB_INSTANCE_TYPE
 # (m6a.4xlarge), MB_CAP_MIN (2160), MB_VOLUME_GB (150), MB_RSS_BAND,
-# MB_OBJECTS_BAND, MB_REPO (this checkout). AWS_PROFILE and AWS_REGION select
-# the account and region as for any aws CLI call.
+# MB_OBJECTS_BAND, MB_REPO (this checkout), MB_STAGE1 (1 runs run.sh's ADR-3694
+# Stage 1 steps after the measured profile's folded read-back and after the ci
+# smoke's, cardinality or ci only). AWS_PROFILE and AWS_REGION select the
+# account and region as for any aws CLI call.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=${MB_REPO:-$(cd "$here/../../.." && pwd)}
@@ -35,6 +37,17 @@ if [ "$profile" != cardinality ] && { [ -z "${MB_RSS_BAND:-}" ] || [ -z "${MB_OB
   echo "MB_PROFILE=$profile needs MB_RSS_BAND and MB_OBJECTS_BAND set for it; the defaults are cardinality's" >&2
   exit 64
 fi
+# run.sh refuses the same values, but only after the box has built the
+# harness and run the ci smoke.
+stage1=${MB_STAGE1:-}
+case "$stage1" in
+  ''|0) stage1="" ;;
+  1) case "$profile" in
+       cardinality|ci) ;;
+       *) echo "MB_STAGE1=1 runs on the cardinality and ci profiles only, not MB_PROFILE=$profile" >&2; exit 64;;
+     esac ;;
+  *) echo "MB_STAGE1 must be 1, 0 or unset, not '$stage1'" >&2; exit 64;;
+esac
 rss_band=${MB_RSS_BAND:-prometheus:2147483648:6442450944}
 objects_band=${MB_OBJECTS_BAND:-14000:16500}
 boxrun="$here/box-run.sh"
@@ -70,7 +83,7 @@ env_block=$(
     "BOXRUN_SHA256=${boxrun_sha256}" "HARNESS_COMMIT=${harness_sha}" "RAVEL_IMAGE=${ravel_image}" \
     "RAVEL_SOURCE_COMMIT=${ravel_source_commit}" "ANCHOR_MS=${anchor_ms}" "PROFILE=${profile}" \
     "RSS_BAND=${rss_band}" "OBJECTS_BAND=${objects_band}" "REAL_S3_PREFIX=${real_s3_prefix}" \
-    "AWS_DEFAULT_REGION=${region}"; do
+    "STAGE1=${stage1}" "AWS_DEFAULT_REGION=${region}"; do
     printf '%s=%q\n' "${kv%%=*}" "${kv#*=}"
   done
 )

@@ -6,6 +6,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **MetricsBench runs ADR-3694's Stage 1 lanes with `MB_STAGE1=1`** (issue
+  #3968). On the `cardinality` and `ci` profiles, `run.sh` starts
+  ravel-server with `--fold-key-index-leaves`, and after the folded read-back
+  folds, queries the corpus with no label index (`folded-unrouted`),
+  rebuilds the key index with `--metrics-label-index` and stamps its leaf
+  count, bytes, GETs and wall time, recreates the server with
+  `--fold-metrics-label-index`, queries again (`folded-routed`), compares the
+  two passes' result hashes into `stage1-compare.json`, and counts each
+  selective statement's holding objects without the router into
+  `holders.json`. Every `ravel_cost` record now carries the segment
+  counters, `estimate`, `io`, `pass_label`, `fold_state` and a
+  `result_hash` independent of series order, and the folded read-back records each
+  query's `data.stats` and catalog GET delta. `stage1-check.sh BANDS OUT-DIR`
+  checks a run against a band file (`stage1-bands.ci.json` for `ci`), and the
+  nightly workflow's manual dispatch takes a `stage1` input. Without
+  `MB_STAGE1` the server's command line is unchanged (`run.test.sh` cases a,
+  z0 to z11 and the `stage1-check` cases).
+
 ## [0.30.1] - 2026-11-04
 
 ### Fixed
