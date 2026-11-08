@@ -125,11 +125,11 @@ matrix says which.
 The matrix describes `main`. Its "In published image" column means that the
 image built from `main` compiles the surface in. A surface that lands after
 the tag that the quickstart pins is not yet in the quickstart image. Every
-entry below that the published image compiles in is in the pinned `0.30.1`
+entry below that the published image compiles in is in the pinned `0.31.0`
 image, the Agents API and the MCP server included: `0.29.0` was the first
 release whose image is built with the `agents` and `mcp` features. After the
 next feature lands,
-`git log v0.30.1..main` tells you whether that is still true. `CHANGELOG.md`
+`git log v0.31.0..main` tells you whether that is still true. `CHANGELOG.md`
 records the release that each surface first shipped in.
 
 <!-- BEGIN SUPPORT MATRIX -->
@@ -503,7 +503,7 @@ route with its body and status codes.
 ### Running it
 
 The published `ravel-server` image includes the `agents` feature from
-`0.29.0` on, and the quickstart pins `0.30.1`. The routes mount only when the
+`0.29.0` on, and the quickstart pins `0.31.0`. The routes mount only when the
 server also runs with `--agents`, in `--mode all` or `--mode query`.
 
 Know these limits before you put agents in production:
@@ -561,7 +561,7 @@ reported as a heuristic).
 GitHub Container Registry on every `vX.Y.Z` release tag, built from the root
 `Dockerfile`. Both `linux/amd64` and `linux/arm64` are published. Each published
 object is an OCI image index that carries an SBOM and full build provenance. The
-quickstart pins `ghcr.io/nofireai/ravel-server:0.30.1`. Override it with
+quickstart pins `ghcr.io/nofireai/ravel-server:0.31.0`. Override it with
 `RAVEL_IMAGE`.
 
 ```sh
@@ -585,12 +585,12 @@ so that is the identity in the certificate:
 
 ```sh
 cosign verify \
-  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.30.1' \
+  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.31.0' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  ghcr.io/nofireai/ravel-server:0.30.1
+  ghcr.io/nofireai/ravel-server:0.31.0
 ```
 
-Replace `v0.30.1` and `0.30.1` with the release you are verifying. The tag ref in
+Replace `v0.31.0` and `0.31.0` with the release you are verifying. The tag ref in
 `--certificate-identity` must be the exact tag that produced the image.
 
 ## How Ravel is verified
