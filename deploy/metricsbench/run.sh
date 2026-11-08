@@ -1193,7 +1193,37 @@ elif op == "stage1-compare":
                 "records_label_index_null": sum(1 for v in figures if v is None),
                 "records_pruned_by_label_index": sum(1 for v in figures if v is not None and v > 0),
                 "segments_pruned_by_label_index": sum(v for v in figures if v is not None)}
-    doc = {"schema": "metricsbench-stage1-compare/4",
+    # ADR-3694's per-value routing amendment: each distinct positive equality
+    # value is its own routing pass, so a statement with n values may issue
+    # up to n passes' leaf GETs. Per routed record, the passes' figures
+    # summed; covering parts is the most any pass covered (every pass routes
+    # the same snapshot).
+    VALUE_FIELDS = ("leafGetRequests", "leafCacheHits", "partsCovered", "partsBeyondCeiling", "segmentsPrunedAlone")
+    route_values, values_null, values_unreadable, over_bound = [], 0, [], set()
+    for x in routed:
+        vals = x.get("labelIndexValues")
+        if vals is None:
+            values_null += 1
+            continue
+        if not isinstance(vals, list) or not all(
+                isinstance(v, dict) and isinstance(v.get("labels"), list)
+                and all(isinstance(v.get(k), int) and not isinstance(v.get(k), bool) and v[k] >= 0 for k in VALUE_FIELDS)
+                for v in vals):
+            values_unreadable.append({"entry": x.get("entry"), "rep": x.get("rep")})
+            continue
+        n = len(vals)
+        covering = max((v["partsCovered"] for v in vals), default=0)
+        leaf_gets = sum(v["leafGetRequests"] for v in vals)
+        named = [v for v in vals if "__name__" in v["labels"]]
+        row = {"entry": x.get("entry"), "rep": x.get("rep"), "n": n, "leaf_gets": leaf_gets,
+               "leaf_cache_hits": sum(v["leafCacheHits"] for v in vals),
+               "covering_parts": covering, "leaf_gets_bound": (1 + n) * covering,
+               "parts_beyond_ceiling": sum(v["partsBeyondCeiling"] for v in vals),
+               "name_pruned_alone": any(v["segmentsPrunedAlone"] > 0 for v in named) if named else None}
+        if leaf_gets > row["leaf_gets_bound"]:
+            over_bound.add(x.get("entry"))
+        route_values.append(row)
+    doc = {"schema": "metricsbench-stage1-compare/5",
            "unrouted": os.path.basename(os.path.dirname(unrouted_path)) + "/" + os.path.basename(unrouted_path),
            "routed": os.path.basename(os.path.dirname(routed_path)) + "/" + os.path.basename(routed_path),
            "entries_compared": len(equal) + len(multi) + len(differing), "entries_equal": len(equal),
@@ -1203,9 +1233,20 @@ elif op == "stage1-compare":
            "status_check": "per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9); records_status_unexpected counts records whose status is neither ok nor incorrect; records_answered_null_hash counts ok or incorrect records with no result_hash",
            "statements_status_differing_count": len(status_differing),
            "statements_status_differing": status_differing,
-           "passes": {"unrouted": tally(unrouted), "routed": tally(routed)}}
+           "passes": {"unrouted": tally(unrouted), "routed": tally(routed)},
+           "route_values_check": "per stage1-routed record whose labelIndexValues is a list (one element per routing pass, ADR-3694's per-value routing amendment): n distinct values, leaf_gets the passes' leafGetRequests summed, leaf_cache_hits their leafCacheHits summed, covering_parts the most partsCovered of any pass, leaf_gets_bound (1 + n) x covering_parts, parts_beyond_ceiling the passes' partsBeyondCeiling summed, and name_pruned_alone whether the __name__ pass pruned a segment no other value of a plan pruned (null when no pass carries __name__); a record with a null labelIndexValues (the route did not run) is counted in routed_records_without_values, one whose passes lack a whole-number figure in routed_records_values_unreadable",
+           "routed_values": route_values,
+           "routed_records_with_values": len(route_values),
+           "routed_records_without_values": values_null,
+           "routed_records_values_unreadable_count": len(values_unreadable),
+           "routed_records_values_unreadable": values_unreadable,
+           "statements_leaf_gets_over_bound_count": len(over_bound),
+           "statements_leaf_gets_over_bound": sorted(over_bound, key=str),
+           "parts_beyond_ceiling_total": sum(v["parts_beyond_ceiling"] for v in route_values)}
     dump(out_path, doc)
-    print(json.dumps({**doc, "entries_multi_hash": [d["entry"] for d in multi],
+    print(json.dumps({**{k: v for k, v in doc.items() if k != "routed_values"},
+                      "routed_records_values_unreadable": [d["entry"] for d in values_unreadable],
+                      "entries_multi_hash": [d["entry"] for d in multi],
                       "entries_differing": [d["entry"] for d in differing],
                       "statements_status_differing": [d["entry"] for d in status_differing]}))
 elif op == "stage1-inspect":

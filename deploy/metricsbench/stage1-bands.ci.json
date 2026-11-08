@@ -60,6 +60,14 @@
      "basis": "predicted: every route_bound statement has routed records, each with a whole-number segmentsPrunedByLabelIndex, and a whole-number expected_routed_prunes"},
     {"name": "holders_routed_leaf_unread", "file": "stamps.json", "path": "stage1.holders.routed_leaf_unread_count", "min": 0, "max": 0,
      "basis": "predicted: every routed record of a route_bound statement whose resolved set holds an object shows a leaf read in its keyIndex phase (s3GetRequests or cacheHits above 0), so a prune count of 0 means the router read the leaves and kept every object, not that it never ran; a statement whose resolved set is empty is not counted (its snapshot holds only token objects, which carry no leaf). Run 42495422937 would give 0: its routed keyIndex phases showed cacheHits of 10 and 4 with no GET"},
+    {"name": "route_values_records", "file": "stage1-compare.json", "path": "routed_records_with_values", "min": 1, "max": null,
+     "basis": "predicted: every corpus selector carries a __name__ equality and the routed snapshot carries label_value leaves, so the route runs and at least one routed record lists its passes in labelIndexValues; 0 means no per-value figure below was measured"},
+    {"name": "route_values_unreadable", "file": "stage1-compare.json", "path": "routed_records_values_unreadable_count", "min": 0, "max": 0,
+     "basis": "predicted: every routed record's labelIndexValues element carries labels and whole-number leafGetRequests, leafCacheHits, partsCovered, partsBeyondCeiling and segmentsPrunedAlone, as the server renders them"},
+    {"name": "route_values_leaf_gets_over_bound", "file": "stage1-compare.json", "path": "statements_leaf_gets_over_bound_count", "min": 0, "max": 0,
+     "basis": "predicted (ADR-3694 per-value routing amendment): a statement with n distinct values issues at most n passes' leaf GETs, so no routed record's summed leafGetRequests exceeds (1 + n) x the parts its passes cover"},
+    {"name": "route_values_parts_beyond_ceiling", "file": "stage1-compare.json", "path": "parts_beyond_ceiling_total", "min": 0, "max": 0,
+     "basis": "predicted: a ci snapshot holds few enough parts that no pass reaches the router's leaf GET or part ceiling, so no pass leaves a part unprobed (partsBeyondCeiling summed over every routed record's passes)"},
     {"name": "holders_selective_job_rate_sum", "file": "holders.json", "path": "statements[id=mb_selective_job_rate_sum].holders", "min": 1, "max": null,
      "basis": "predicted: job=\"metricsbench-api\" series are written on every ci run, so at least one data object holds a series matching the statement's one selector in full (holders is a series-level index's bound; the router's is value_holders, checked through holders_routed_prune_mismatches)"}
   ]
