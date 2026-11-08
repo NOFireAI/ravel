@@ -83,7 +83,7 @@ reports what the lookup did: `partsCovered`, `partsUncovered`,
 `skipIdxDropped`. It is present only on a statement with a `trace_id`
 filter. `keysProbed` is the number of distinct trace ids the part-level
 check used: 1 for `trace_id = <literal>`, and the distinct count for a
-`trace_id IN (...)` list of any length from 2 or the same ids written as
+`trace_id IN (...)` list of 2 to 1,024 distinct ids or the same ids written as
 `trace_id = a OR trace_id = b`. [The query engine
 reference](../query-engine.md) defines each figure. The process exports `ravel_query_key_index_parts_total` by
 `signal` and `outcome`, and `ravel_query_key_index_leaf_gets_total` by

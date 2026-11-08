@@ -1123,7 +1123,7 @@ does; the other lists read those objects in full:
 - `NOT IN`, a list mixing types, or a list holding `NULL` or an expression;
 - a list inside an `OR`.
 
-A key list of any length from 2 uses its key set, two or three values
+A key list of 2 to 1,024 distinct values uses its key set, two or three values
 included: the planner rewrites a list that short into `=` comparisons
 joined by `OR`, and Ravel reads those comparisons as the list. Writing the
 `OR` by hand, `user_id = 7 OR user_id = 9`, does the same. An `OR` that
