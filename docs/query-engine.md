@@ -6304,7 +6304,8 @@ Startup logs the value in force and the term that bound it, as
 `ViewBudgetBound::name` names it: `cap_quarter`, `two_gib`, `budget_room` or
 `floored_at_zero` for a derived value
 (`view_budget_default_takes_the_smallest_term`), or `explicit` for a value set
-by flag (`an_explicit_view_budget_is_used_and_warned_above_the_room`). With a
+by flag (`an_explicit_view_budget_is_used_and_warned_above_the_room`). No
+view budget line is logged while the cache is off. With a
 20,487,102,875-byte memory budget and an 8 GB cap it is 2,000,000,000 bytes,
 bound by `cap_quarter` (`view_budget_default_takes_the_smallest_term`). An
 explicit value is used as given, with a warning when it is above that room
