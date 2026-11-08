@@ -236,22 +236,8 @@ pub const DICTIONARY_GROUP_KEYS_RULE: &str = "dictionary_group_keys_as_views";
 
 /// Rewrites dictionary-encoded string group keys to `Utf8View` for the
 /// duration of an aggregation. See the module docs for why.
-///
-/// [`Self::default`] casts every key with arrow's cast.
-/// [`Self::with_view_memo`]`(true)` builds [`GroupKeyViews`] in its place,
-/// which takes a plain memo's views where the decoded cache keeps them
-/// (ADR-3326, view memo amendment, decision 5).
 #[derive(Debug, Default)]
-pub struct DictionaryGroupKeysAsViews {
-    view_memo: bool,
-}
-
-impl DictionaryGroupKeysAsViews {
-    /// The rule, building [`GroupKeyViews`] for each key when `view_memo`.
-    pub fn with_view_memo(view_memo: bool) -> Self {
-        DictionaryGroupKeysAsViews { view_memo }
-    }
-}
+pub struct DictionaryGroupKeysAsViews;
 
 impl PhysicalOptimizerRule for DictionaryGroupKeysAsViews {
     fn optimize(
@@ -259,7 +245,7 @@ impl PhysicalOptimizerRule for DictionaryGroupKeysAsViews {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let rewritten = rewrite(&plan, false, false, self.view_memo)?;
+        let rewritten = rewrite(&plan, false, false)?;
         restore_schema(rewritten, &plan.schema())
     }
 
@@ -296,20 +282,17 @@ fn is_dictionary_string(ty: &DataType) -> bool {
 /// so in strict mode no operator whose output is ordered on a carried column
 /// carries it: the restore goes below that operator, which then orders the
 /// declared type itself.
-///
-/// `view_memo` is [`DictionaryGroupKeysAsViews::with_view_memo`]'s flag.
 fn rewrite(
     node: &Arc<dyn ExecutionPlan>,
     parent_is_aggregate: bool,
     strict: bool,
-    view_memo: bool,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     let is_aggregate = node.is::<AggregateExec>();
     let children = node.children();
     let mut rewritten = Vec::with_capacity(children.len());
     let mut changed = false;
     for child in &children {
-        let new_child = rewrite(child, is_aggregate, strict, view_memo)?;
+        let new_child = rewrite(child, is_aggregate, strict)?;
         changed |= !Arc::ptr_eq(child, &new_child);
         let carried = carried_columns(&child.schema(), &new_child.schema());
         let views = only_views(&child.schema(), &new_child.schema(), &carried);
@@ -334,7 +317,7 @@ fn rewrite(
                 carrying = true;
             } else {
                 if !strict && orders_on(&new_child, &carried) {
-                    new_child = rewrite(child, is_aggregate, true, view_memo)?;
+                    new_child = rewrite(child, is_aggregate, true)?;
                 }
                 new_child = restore_schema(new_child, &child.schema())?;
             }
@@ -342,7 +325,7 @@ fn rewrite(
         new_children.push(keep_join_partitioning(node, child, new_child)?);
     }
 
-    let rebuilt = rebuild(node, new_children.clone(), changed, carrying, view_memo)?;
+    let rebuilt = rebuild(node, new_children.clone(), changed, carrying)?;
     if strict
         && carrying
         && orders_on(
@@ -351,7 +334,7 @@ fn rewrite(
         )
     {
         let restored = restore_children(node, &children, new_children)?;
-        return rebuild(node, restored, true, false, view_memo);
+        return rebuild(node, restored, true, false);
     }
     Ok(rebuilt)
 }
@@ -373,10 +356,9 @@ fn rebuild(
     children: Vec<Arc<dyn ExecutionPlan>>,
     changed: bool,
     carrying: bool,
-    view_memo: bool,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     if let Some(agg) = node.downcast_ref::<AggregateExec>() {
-        return rewrite_aggregate(node, agg, children, changed, view_memo);
+        return rewrite_aggregate(node, agg, children, changed);
     }
     if !changed {
         return Ok(Arc::clone(node));
@@ -781,7 +763,6 @@ fn rewrite_aggregate(
     agg: &AggregateExec,
     new_children: Vec<Arc<dyn ExecutionPlan>>,
     changed: bool,
-    view_memo: bool,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     let unchanged = || -> DFResult<Arc<dyn ExecutionPlan>> {
         if changed {
@@ -811,7 +792,7 @@ fn rewrite_aggregate(
     for (expr, name) in group_by.expr() {
         let ty = expr.data_type(&input_schema)?;
         if !ordered && is_dictionary_string(&ty) {
-            exprs.push((group_key_as_view(Arc::clone(expr), view_memo), name.clone()));
+            exprs.push((group_key_as_view(Arc::clone(expr)), name.clone()));
             cast_any = true;
         } else {
             exprs.push((Arc::clone(expr), name.clone()));
@@ -842,135 +823,10 @@ fn rewrite_aggregate(
 }
 
 /// The dictionary-string group key `expr` as the `Utf8View` the aggregate
-/// groups on, NULL wherever the dictionary is logically NULL: arrow's cast,
-/// or with `view_memo` a [`GroupKeyViews`] over the same input.
-pub(crate) fn group_key_as_view(
-    expr: Arc<dyn PhysicalExpr>,
-    view_memo: bool,
-) -> Arc<dyn PhysicalExpr> {
-    let keys: Arc<dyn PhysicalExpr> = Arc::new(NullEntriesAsNullKeys::new(expr));
-    if view_memo {
-        Arc::new(GroupKeyViews::new(keys))
-    } else {
-        Arc::new(CastExpr::new(keys, GROUP_KEY_TYPE, None))
-    }
-}
-
-/// The cast of a dictionary-string group key to `Utf8View` that takes a
-/// plain memo's views when the batch's dictionary values are that memo
-/// (ADR-3326, view memo amendment, decision 5): the memo's views array itself
-/// when the keys are `0..n` with no null buffer, otherwise a gather of it by
-/// the keys, a 16 B copy per row with no string read. Any other input, a
-/// memo with no views, or one whose fill the view budget refuses takes
-/// arrow's cast, which this wraps and displays as, so a plan's EXPLAIN text
-/// is the cast's (`the_view_memo_plan_explains_as_the_cast`). Under keys with
-/// no null buffer the output is the cast's views, buffers and null buffer; at
-/// a NULL key it carries the cast's null bit, while the view under that bit,
-/// which arrow leaves unspecified, may differ from the cast's zero view
-/// (decision 8; `prop_group_key_views_equal_the_cast`).
-#[derive(Debug, Eq)]
-struct GroupKeyViews {
-    cast: CastExpr,
-}
-
-impl PartialEq for GroupKeyViews {
-    fn eq(&self, other: &Self) -> bool {
-        self.cast.eq(&other.cast)
-    }
-}
-
-impl std::hash::Hash for GroupKeyViews {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.cast.hash(state);
-    }
-}
-
-impl GroupKeyViews {
-    fn new(arg: Arc<dyn PhysicalExpr>) -> Self {
-        GroupKeyViews {
-            cast: CastExpr::new(arg, GROUP_KEY_TYPE, None),
-        }
-    }
-}
-
-impl std::fmt::Display for GroupKeyViews {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.cast, f)
-    }
-}
-
-impl PhysicalExpr for GroupKeyViews {
-    fn data_type(&self, input_schema: &Schema) -> DFResult<DataType> {
-        self.cast.data_type(input_schema)
-    }
-
-    fn nullable(&self, input_schema: &Schema) -> DFResult<bool> {
-        self.cast.nullable(input_schema)
-    }
-
-    fn return_field(&self, input_schema: &Schema) -> DFResult<FieldRef> {
-        self.cast.return_field(input_schema)
-    }
-
-    fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
-        let value = self.cast.expr().evaluate(batch)?;
-        if let ColumnarValue::Array(array) = &value
-            && let Some(views) = memo_views(array)?
-        {
-            return Ok(ColumnarValue::Array(views));
-        }
-        value.cast_to(self.cast.cast_type(), Some(self.cast.cast_options()))
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
-        vec![self.cast.expr()]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalExpr>>,
-    ) -> DFResult<Arc<dyn PhysicalExpr>> {
-        let [arg] = <[_; 1]>::try_from(children).map_err(|children| {
-            datafusion::error::DataFusionError::Internal(format!(
-                "group key views take one child, got {}",
-                children.len()
-            ))
-        })?;
-        Ok(Arc::new(GroupKeyViews::new(arg)))
-    }
-
-    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.cast.fmt_sql(f)
-    }
-}
-
-/// The memo views [`GroupKeyViews`] serves `array` from, when `array` is an
-/// `Int32` dictionary over a registered plain memo that has views.
-fn memo_views(array: &ArrayRef) -> DFResult<Option<ArrayRef>> {
-    let Some(dict) = array
-        .as_any()
-        .downcast_ref::<DictionaryArray<datafusion::arrow::datatypes::Int32Type>>()
-    else {
-        return Ok(None);
-    };
-    let Some(values) = dict
-        .values()
-        .as_any()
-        .downcast_ref::<datafusion::arrow::array::StringArray>()
-    else {
-        return Ok(None);
-    };
-    let Some(views) = crate::logs_scan::view_registry::views_of(values) else {
-        return Ok(None);
-    };
-    let keys = dict.keys();
-    let identity = keys.len() == views.len()
-        && keys.nulls().is_none()
-        && keys.values().iter().copied().eq(0..keys.len() as i32);
-    if identity {
-        return Ok(Some(Arc::new(views)));
-    }
-    Ok(Some(datafusion::arrow::compute::take(&views, keys, None)?))
+/// groups on, NULL wherever the dictionary is logically NULL.
+fn group_key_as_view(expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
+    let keys = Arc::new(NullEntriesAsNullKeys::new(expr));
+    Arc::new(CastExpr::new(keys, GROUP_KEY_TYPE, None))
 }
 
 /// A dictionary-string group key with every key whose dictionary entry is NULL
@@ -1203,44 +1059,14 @@ mod tests {
         ctx
     }
 
-    thread_local! {
-        /// Whether [`context`] and [`ravel_session`] build the rule with the
-        /// view memo on, so a test can run both ways on one thread.
-        static VIEW_MEMO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
     /// A default session, optionally carrying the rule, built the same way
     /// `crate::session::build_session` does.
     fn context(with_rule: bool) -> SessionContext {
         let mut builder = SessionStateBuilder::new().with_default_features();
         if with_rule {
-            builder = builder.with_physical_optimizer_rule(Arc::new(
-                DictionaryGroupKeysAsViews::with_view_memo(VIEW_MEMO.get()),
-            ));
+            builder = builder.with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews));
         }
         SessionContext::new_with_state(builder.build())
-    }
-
-    /// Whether every group key `plan`'s aggregates cast to views is a
-    /// [`GroupKeyViews`] (`true`) or every one a `CastExpr` (`false`); `None`
-    /// for a mix or none.
-    fn group_keys_are_views(plan: &Arc<dyn ExecutionPlan>) -> Option<bool> {
-        let mut aggregates = Vec::new();
-        collect_aggregates(plan, &mut aggregates);
-        let kinds: Vec<bool> = aggregates
-            .iter()
-            .filter_map(|a| a.downcast_ref::<AggregateExec>())
-            .flat_map(|a| a.group_expr().expr().to_vec())
-            .filter_map(|(expr, _)| {
-                if expr.downcast_ref::<GroupKeyViews>().is_some() {
-                    Some(true)
-                } else {
-                    expr.downcast_ref::<CastExpr>().map(|_| false)
-                }
-            })
-            .collect();
-        let first = *kinds.first()?;
-        kinds.iter().all(|&k| k == first).then_some(first)
     }
 
     fn collect_aggregates(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
@@ -1330,73 +1156,19 @@ mod tests {
         (logical, table)
     }
 
-    /// ADR-3326, view memo amendment, T11: the q13 shape (a filtered
-    /// `COUNT(DISTINCT ..)` under a TopK) plans to the same EXPLAIN text with
-    /// the view memo on and off, groups on [`GroupKeyViews`] when on, and
-    /// restores the key to `Dictionary(Int32, Utf8)`.
-    #[tokio::test]
-    async fn the_view_memo_plan_explains_as_the_cast() {
-        const Q13: &str = "SELECT k, count(DISTINCT v) AS u FROM t WHERE k <> 'a' GROUP BY k ORDER BY u DESC LIMIT 10";
-        let mut texts = Vec::new();
-        for view_memo in [false, true] {
-            VIEW_MEMO.set(view_memo);
-            let plan = dict_context(true)
-                .sql(Q13)
-                .await
-                .expect("query plans")
-                .create_physical_plan()
-                .await
-                .expect("physical plan");
-            assert_eq!(
-                group_keys_are_views(&plan),
-                Some(view_memo),
-                "{}",
-                show(&plan)
-            );
-            assert_eq!(plan.schema().field(0).data_type(), &dict_type());
-            texts.push(show(&plan));
-        }
-        VIEW_MEMO.set(false);
-        assert!(
-            texts[0].contains("CAST(null_entries_as_null_keys(k"),
-            "{}",
-            texts[0]
-        );
-        assert_eq!(texts[0], texts[1]);
-    }
-
-    /// Also ADR-3326, view memo amendment, T11: the same with the rule's
-    /// view memo on, whose plan groups on [`GroupKeyViews`].
     #[tokio::test]
     async fn results_and_types_match_the_unrewritten_plan() {
-        for view_memo in [false, true] {
-            VIEW_MEMO.set(view_memo);
-            for sql in DIFFERENTIAL {
-                let (before_schema, before) = run(false, sql).await;
-                let (after_schema, after) = run(true, sql).await;
+        for sql in DIFFERENTIAL {
+            let (before_schema, before) = run(false, sql).await;
+            let (after_schema, after) = run(true, sql).await;
 
-                assert_eq!(before_schema, after_schema, "{sql} view memo {view_memo}");
-                assert_eq!(before, after, "{sql} view memo {view_memo}");
-                // The baseline really is the dictionary path this rule exists
-                // to avoid.
-                assert_eq!(before_schema.field(0).data_type(), &dict_type(), "{sql}");
-                assert!(before.lines().count() > 4, "{sql} returned no rows");
-                let plan = dict_context(true)
-                    .sql(sql)
-                    .await
-                    .expect("query plans")
-                    .create_physical_plan()
-                    .await
-                    .expect("physical plan");
-                assert_eq!(
-                    group_keys_are_views(&plan),
-                    Some(view_memo),
-                    "{sql}: {}",
-                    show(&plan)
-                );
-            }
+            assert_eq!(before_schema, after_schema, "{sql}");
+            assert_eq!(before, after, "{sql}");
+            // The baseline really is the dictionary path this rule exists to
+            // avoid.
+            assert_eq!(before_schema.field(0).data_type(), &dict_type(), "{sql}");
+            assert!(before.lines().count() > 4, "{sql} returned no rows");
         }
-        VIEW_MEMO.set(false);
         // The TopK shape returns its top two groups, so the comparison above
         // is not over an empty or truncated answer.
         let (_, top) = run(true, DIFFERENTIAL[1]).await;
@@ -1476,14 +1248,10 @@ mod tests {
         }
     }
 
-    /// True when `expr` is a `CastExpr` to `ty`, or the [`GroupKeyViews`]
-    /// that stands in for one.
+    /// True when `expr` is a `CastExpr` to `ty`.
     fn casts_to(expr: &Arc<dyn PhysicalExpr>, ty: &DataType) -> bool {
         expr.downcast_ref::<CastExpr>()
             .is_some_and(|cast| cast.cast_type() == ty)
-            || expr
-                .downcast_ref::<GroupKeyViews>()
-                .is_some_and(|views| views.cast.cast_type() == ty)
     }
 
     /// The two inputs and the keys of a hash join planned, without the rule,
@@ -1595,7 +1363,7 @@ mod tests {
 
     /// The plan the rule makes of `join`, and the one `HashJoinExec` in it.
     fn optimize_join(join: HashJoinExec) -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) {
-        let plan = DictionaryGroupKeysAsViews::default()
+        let plan = DictionaryGroupKeysAsViews
             .optimize(Arc::new(join), &ConfigOptions::default())
             .expect("rule runs");
         let mut joins = Vec::new();
@@ -1830,14 +1598,6 @@ mod tests {
         );
         let store: Arc<dyn ravel_object_store::ObjectStoreBackend> =
             Arc::new(ravel_object_store::memory::MemoryStore::new());
-        // A decoded cache with a view budget turns the session's view memo
-        // on (`build_session_with_tables`); a view budget of 0 keeps the cast
-        // (ADR-3326, view memo amendment, T8).
-        let view_max_bytes = if VIEW_MEMO.get() { 1 << 20 } else { 0 };
-        let fetcher = ravel_query::LogSegmentFetcher::new(store).with_decoded_cache(Arc::new(
-            ravel_logseg::decoded_cache::DecodedColumnCache::new(1 << 20, None)
-                .with_view_max_bytes(view_max_bytes),
-        ));
         let logs = crate::LogsTableProvider::new(
             ravel_catalog::Snapshot {
                 segments: Vec::new(),
@@ -1845,7 +1605,7 @@ mod tests {
                 pending_erasure: Vec::new(),
             },
             ravel_types::TenantHash([0u8; 16]),
-            fetcher,
+            ravel_query::LogSegmentFetcher::new(store),
             ravel_query::PhaseAccounting::new(),
         );
         let ctx = build_session(
@@ -1935,20 +1695,8 @@ mod tests {
     /// nulls from the keys only, so the five rows over the NULL entry with an
     /// empty slot joined `""` and the two over the `zz` slot formed a group
     /// of their own.
-    ///
-    /// Also ADR-3326, view memo amendment, T11: the same through a session
-    /// whose decoded cache has a view budget, which groups on
-    /// [`GroupKeyViews`].
     #[tokio::test]
     async fn a_null_dictionary_entry_groups_with_null() {
-        for view_memo in [false, true] {
-            VIEW_MEMO.set(view_memo);
-            null_dictionary_entry_case(view_memo).await;
-        }
-        VIEW_MEMO.set(false);
-    }
-
-    async fn null_dictionary_entry_case(view_memo: bool) {
         let dict = null_entry_fixture();
         let ctx = ravel_session(key_batch(dict.clone()));
         let want: Groups = vec![
@@ -1975,12 +1723,6 @@ mod tests {
                     .iter()
                     .all(|agg| agg.schema().field(0).data_type() == &DataType::Utf8View),
             "the session groups on views: {}",
-            show(&plan)
-        );
-        assert_eq!(
-            group_keys_are_views(&plan),
-            Some(view_memo),
-            "{}",
             show(&plan)
         );
         assert_eq!(session_groups(&ctx, grouped).await, want);
@@ -2078,19 +1820,13 @@ mod tests {
         Ok(())
     }
 
-    /// The rule's own group-key expression, [`group_key_as_view`], evaluated,
-    /// with and without the view memo: over an array that is no memo,
-    /// [`GroupKeyViews`] answers exactly as the cast does.
+    /// The rule's own group-key expression, [`group_key_as_view`], evaluated.
     fn rule_views(dict: &DictionaryArray<Int32Type>) -> ArrayRef {
         let batch = key_batch(dict.clone());
-        let [cast, views] = [false, true].map(|view_memo| {
-            group_key_as_view(Arc::new(Column::new("k", 0)), view_memo)
-                .evaluate(&batch)
-                .and_then(|value| value.into_array(batch.num_rows()))
-                .expect("the group key evaluates")
-        });
-        assert_eq!(cast.to_data(), views.to_data());
-        cast
+        group_key_as_view(Arc::new(Column::new("k", 0)))
+            .evaluate(&batch)
+            .and_then(|value| value.into_array(batch.num_rows()))
+            .expect("the group key evaluates")
     }
 
     /// Arrow's cast alone, what the rule ran before issue #3521: nulls from

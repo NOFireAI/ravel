@@ -213,13 +213,7 @@ pub fn cache_json(cache: &StatementCacheStats) -> Json {
 /// serve-if-fits verdict, in its plan pass or on the whole-segment fast path
 /// (`compute_fast_path_verdict`), and `deferredSetEstimatePartial: true` only
 /// when such a scan stopped reading directories early, making that estimate a
-/// lower bound (ADR-3326, serve-if-fits amendment). The four `viewMemo*` keys
-/// are always present (ADR-3326, view memo amendment, decision 7):
-/// `viewMemoBytes` is the cache's view total when the statement finished,
-/// `viewMemoFills` and `viewMemoRefusals` the fills and refusals on blocks
-/// whose last mark was this statement's
-/// (`a_concurrent_statements_view_figures_sum_to_the_caches`), and
-/// `viewMemoReleases` the pressure releases over its lifetime.
+/// lower bound (ADR-3326, serve-if-fits amendment).
 pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
     let mut out = json!({
         "hits": stats.counters.hits,
@@ -233,10 +227,6 @@ pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
         "pressureEvictions": stats.pressure.evictions,
         "pressureFreedBytes": stats.pressure.freed_bytes,
         "deferredServed": stats.counters.deferred_served,
-        "viewMemoBytes": stats.views.bytes,
-        "viewMemoFills": stats.views.fills,
-        "viewMemoRefusals": stats.views.refusals,
-        "viewMemoReleases": stats.views.releases,
     });
     if let (Some(estimate), Some(map)) = (
         stats.counters.deferred_set_estimate_bytes,
@@ -324,9 +314,9 @@ mod tests {
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
     }
 
-    /// `decoded_cache_json` renders exactly the seventeen ADR-3326 keys for a
+    /// `decoded_cache_json` renders exactly the thirteen ADR-3326 keys for a
     /// statement whose scan has a `Contains` arm and stopped its estimate
-    /// early, each carrying its own distinct source figure, and the fifteen
+    /// early, each carrying its own distinct source figure, and the eleven
     /// without `deferredSetEstimateBytes` or `deferredSetEstimatePartial` for
     /// one with no estimate.
     #[test]
@@ -350,12 +340,6 @@ mod tests {
                 evictions: 7,
                 freed_bytes: 8,
             },
-            views: ravel_logseg::decoded_cache::ViewMemoSnapshot {
-                bytes: 13,
-                fills: 14,
-                refusals: 15,
-                releases: 16,
-            },
         };
         assert_eq!(
             decoded_cache_json(&stats),
@@ -371,10 +355,6 @@ mod tests {
                 "pressureEvictions": 7,
                 "pressureFreedBytes": 8,
                 "deferredServed": true,
-                "viewMemoBytes": 13,
-                "viewMemoFills": 14,
-                "viewMemoRefusals": 15,
-                "viewMemoReleases": 16,
                 "deferredSetEstimateBytes": 10,
                 "deferredSetEstimatePartial": true,
             })
@@ -399,10 +379,6 @@ mod tests {
                 "pressureEvictions": 7,
                 "pressureFreedBytes": 8,
                 "deferredServed": false,
-                "viewMemoBytes": 13,
-                "viewMemoFills": 14,
-                "viewMemoRefusals": 15,
-                "viewMemoReleases": 16,
             })
         );
     }

@@ -1572,20 +1572,10 @@ impl BlockScan {
             ts.and_then(|c| c.get(row))
                 .ok_or_else(|| LogSegError::Corrupted(format!("missing i64 col {COL_TS}")))?;
         }
-        // `decode_block` advanced `next` past the block it decoded.
-        let block_index = self
-            .next
-            .checked_sub(1)
-            .and_then(|i| self.blocks.get(i))
-            .map(|loc| loc.block_index);
         Ok(Some(
             ColumnarBlockView::new(&self.stream_dir, &self.field_dir, decoded, &self.surviving)
                 .with_served(&self.served)
-                .with_pins(&self.pins)
-                .with_attach(
-                    block_index.and(self.decoded_cache.as_ref()),
-                    block_index.unwrap_or(0),
-                ),
+                .with_pins(&self.pins),
         ))
     }
 

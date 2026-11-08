@@ -712,8 +712,7 @@ fn join_context(with_rule: bool) -> SessionContext {
         .with_config(config)
         .with_default_features();
     if with_rule {
-        builder =
-            builder.with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews::default()));
+        builder = builder.with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews));
     }
     let ctx = SessionContext::new_with_state(builder.build());
     let table = MemTable::try_new(schema, partitions).expect("mem table builds");
@@ -1195,8 +1194,7 @@ fn key_context(
         builder = builder.with_runtime_env(runtime);
     }
     if with_rule {
-        builder =
-            builder.with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews::default()));
+        builder = builder.with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews));
     }
     let ctx = SessionContext::new_with_state(builder.build());
     let table = MemTable::try_new(schema, vec![batches]).expect("mem table builds");
