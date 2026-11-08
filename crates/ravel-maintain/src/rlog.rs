@@ -16373,8 +16373,8 @@ mod tests {
                     block_bytes: 3_000_000,
                     in_flight: 32_000_000,
                     run_target: 256 << 20,
-                    part_target: 256 << 20,
-                    ceiling: 5 * GIB,
+                    part_target: GIB,
+                    ceiling: 20 * GIB,
                 };
                 assert_eq!(
                     derive_level1_workers(&shape, at(8).unit_core_share(16)),
