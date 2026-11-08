@@ -129,6 +129,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use datafusion::common::config::SpillCompression;
 use datafusion::common::plan_err;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
@@ -576,6 +577,27 @@ pub enum SpillDecision<'a> {
     },
 }
 
+impl SpillDecision<'_> {
+    /// The spill-file compression of a [`SpillDecision::Enabled`] session
+    /// (ADR-0954, refusal-retry decision item 2); a `Disabled` session keeps
+    /// DataFusion's default, uncompressed, and never spills.
+    ///
+    /// The scratch quota counts live spill-file bytes, and DataFusion's
+    /// multi-level merge takes runs first in, first out and keeps a pass's
+    /// inputs on disk until the pass ends, so at [`SPILL_MERGE_FAN_IN`] 2 the
+    /// live peak is the spilled bytes `S` plus the largest pass output: at
+    /// most about 1.67 times `S` for any number of equal runs, and below 2
+    /// times `S` when the last run is smaller. Compression shrinks `S`, which
+    /// that bound multiplies. lz4_frame rather than zstd: it costs less CPU on
+    /// a 2-vCPU host, and a spill file is written and read once per merge
+    /// pass, so the cheaper codec is paid on every pass. Arrow IPC writes a
+    /// buffer the codec does not shrink uncompressed, so incompressible data
+    /// costs CPU and no disk. A statement whose spill does not compress and
+    /// whose `S` exceeds about 60% of its scratch share (50% when its runs
+    /// differ in size) still gets the typed `spill_budget_exhausted` error.
+    pub const SPILL_COMPRESSION: SpillCompression = SpillCompression::Lz4Frame;
+}
+
 /// The disk manager for one query.
 ///
 /// [`SpillDecision::Disabled`] is `DiskManagerMode::Disabled`, unchanged from
@@ -679,6 +701,11 @@ pub fn session_config(
             .options_mut()
             .optimizer
             .enable_round_robin_repartition = false;
+    }
+
+    // Issue #3899: a typed field, for the same reason as the knobs above.
+    if let SpillDecision::Enabled { .. } = spill {
+        session.options_mut().execution.spill_compression = SpillDecision::SPILL_COMPRESSION;
     }
 
     session
@@ -1424,6 +1451,43 @@ mod tests {
         assert_eq!(fan_in(enabled), 2);
         assert_eq!(fan_in(SpillDecision::Disabled), 0);
         assert_eq!(DEFAULT_MAX_SPILL_MERGE_FAN_IN, 0);
+    }
+
+    /// Issue #3899: a spill-enabled session, built through [`build_session`],
+    /// compresses its spill files with lz4_frame, the option DataFusion's
+    /// aggregate, sort and join spill writers read; a spill-disabled one keeps
+    /// DataFusion's default, uncompressed.
+    #[test]
+    fn a_spill_enabled_session_compresses_its_spill_files_with_lz4() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let compression = |spill| {
+            build_session(
+                &SqlConfig::default(),
+                test_pool(),
+                metrics_table(&store),
+                false,
+                spill,
+                &no_capabilities(),
+            )
+            .expect("session builds")
+            .state()
+            .config()
+            .spill_compression()
+        };
+        let enabled = SpillDecision::Enabled {
+            dir: scratch.path(),
+            max_bytes: 1 << 20,
+        };
+        assert_eq!(compression(enabled), SpillCompression::Lz4Frame);
+        assert_eq!(
+            compression(SpillDecision::Disabled),
+            SpillCompression::Uncompressed
+        );
+        assert_eq!(
+            SessionConfig::new().spill_compression(),
+            SpillCompression::Uncompressed
+        );
     }
 
     /// Issue #680: a default session tightens both skip-partial-aggregation

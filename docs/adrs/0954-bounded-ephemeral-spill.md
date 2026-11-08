@@ -951,7 +951,36 @@ answered, but three properties of the decision above cost the rest:
    The remaining failure,
    row 14 at 40%, fails at every fan-in swept: the lone aggregate's replay
    outgrows its fair share. DataFusion 55 raises a fan-in of 1 to 2, so 2 is
-   the smallest bound it applies.
+   the smallest bound it applies. Note (2026-11-08, spill compression): a
+   spill-enabled session writes its spill files as lz4_frame
+   (`SpillDecision::SPILL_COMPRESSION` in `crates/ravel-sql/src/session.rs`,
+   logged at startup as the `sql_spill_compression` setting); a
+   spill-disabled one keeps DataFusion's default, uncompressed. The scratch
+   quota counts live spill-file bytes, and the multi-level merge takes runs
+   first in, first out and keeps a pass's inputs on disk until the pass
+   ends, so at fan-in 2 the live peak is the spilled bytes `S` plus the
+   largest pass output: at most about 1.67 times `S` for any number of equal
+   runs, and below 2 times `S` when the last run is smaller. `S` is now the
+   compressed bytes. In the M4 c6a.large readout (issue #3899) ClickBench
+   row 33 spilled about 6.5 GB uncompressed and failed every try against
+   its 9,437,761,536-byte scratch quota. On the fixtures in
+   `crates/ravel-sql/tests/spill.rs` lz4_frame wrote, as the operators'
+   spilled-bytes metric counts them (bytes in the files on disk):
+   - the integer-keyed row 33 shape, 8,835,488 bytes against 33,183,392
+     uncompressed, a ratio of 3.76. Its retry takes a merge pass and peaked
+     at about 8.70 MB live against 32.69 MB, about 1.79 times its first runs'
+     bytes because its last run was the smallest; it fits a 16 MiB quota
+     only compressed;
+   - the string-keyed q33 shape, 1,090,336 bytes against 8,094,736, 7.42;
+   - random 128-byte binary keys, 13,697,776 bytes against 15,229,920, 1.11:
+     Arrow IPC writes a buffer the codec does not shrink uncompressed, so
+     incompressible data costs CPU and no extra disk.
+
+   lz4_frame rather than zstd: it costs less CPU on a 2-vCPU host, and a
+   spill file is written and read once per merge pass. Still exposed: a
+   statement whose spill does not compress and whose `S` exceeds about 60%
+   of its scratch share (50% when its runs differ in size) still gets the
+   typed `spill_budget_exhausted` error.
 3. **In a spill-enabled pool, a reserve-ahead refusal of a spill-capable
    consumer is a spill trigger, not a failure.** The same refusal of a
    consumer that cannot spill is unchanged, and so is any refusal in a
