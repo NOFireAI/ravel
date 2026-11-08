@@ -66,16 +66,21 @@
 //! postings have mostly pruned by already; such a statement says why in
 //! `route_bound_reason`, carries no `value_holders`, and is left out of any
 //! comparison with a routed pass.
+//!
+//! A `ravel_log_lines` or `ravel_log_bytes` selector runs on the engine's log
+//! lane and never reaches the metrics resolve or its router, so every count
+//! here, the fetch window included, leaves it out; a statement with no other
+//! selector is skipped as having no metric selector.
 
 use std::collections::{BTreeMap, HashSet};
 
 use ravel_commit::keys::parse_data_key;
-use ravel_promql::{PlanAnchor, plan_selectors};
+use ravel_promql::{LabelMatcher, PlanAnchor, plan_selectors};
 use ravel_query::log_series::log_metric_of;
 use ravel_segment::{
     FooterLocation, ReaderLimits, decode_catalog_v5, label_dict_strings, open_from_full,
 };
-use ravel_types::CommitToken;
+use ravel_types::{CommitToken, METRIC_NAME_LABEL};
 use serde::{Deserialize, Serialize};
 
 use crate::metrics_query::QueryGrid;
@@ -145,8 +150,8 @@ pub struct HolderCount {
     pub selectors: Vec<String>,
     /// Their positive equality matchers, `label="value"`, in selector order.
     pub positive_equalities: Vec<String>,
-    /// The metric names of all the statement's selectors, each once, in
-    /// selector order.
+    /// The metric names of all the statement's metric (not log) selectors,
+    /// each once, in selector order.
     pub metrics: Vec<String>,
     /// Every selector names the same metric, so Ravel's resolve prunes the
     /// snapshot by that name's postings.
@@ -284,6 +289,16 @@ pub fn fetch_window(
     Ok(window)
 }
 
+/// Whether `selector` names a log metric, the test `fetch_window` applies to
+/// the engine's own selector plans.
+fn is_log(selector: &SelectorMatch) -> bool {
+    log_metric_of(&[LabelMatcher::equal(
+        METRIC_NAME_LABEL,
+        selector.metric.as_str(),
+    )])
+    .is_some()
+}
+
 /// A statement being counted: its qualifying selectors, its metric names, its
 /// window, and the objects seen so far in the window, holding one of its
 /// metrics, holding it, named only by a token, and holding its values.
@@ -357,8 +372,8 @@ where
             id: entry.id.clone(),
             reason,
         };
-        let selectors = match selector_matches(&entry.promql) {
-            Ok(selectors) => selectors,
+        let selectors: Vec<SelectorMatch> = match selector_matches(&entry.promql) {
+            Ok(selectors) => selectors.into_iter().filter(|s| !is_log(s)).collect(),
             Err(reason) => {
                 skipped.push(skip(format!(
                     "the corpus reader refuses its selectors: {reason}"
@@ -366,6 +381,10 @@ where
                 continue;
             }
         };
+        if selectors.is_empty() {
+            skipped.push(skip("no metric selector".to_string()));
+            continue;
+        }
         let mut metrics: Vec<String> = Vec::new();
         for selector in &selectors {
             if !metrics.contains(&selector.metric) {
@@ -864,6 +883,63 @@ mod tests {
                     )
                 ),
             ]
+        );
+    }
+
+    /// A log selector is left out as `fetch_window` leaves it out: beside a
+    /// metric selector it adds no second metric (so the statement stays
+    /// name-pruned and fetches only the object holding `http_requests`, not
+    /// `other` as well) and, with no qualifying matcher of its own, does not
+    /// make the statement unbound. A statement of log selectors only is
+    /// skipped as having no metric selector.
+    #[test]
+    fn a_log_selector_is_left_out_of_the_metrics_counts() {
+        let objects = vec![
+            (
+                listed("a", "L1", 90, 99),
+                object(&[&[("__name__", "http_requests"), ("job", "api")]]),
+            ),
+            (
+                listed("other", "L0", 90, 99),
+                object(&[&[("__name__", "other_metric"), ("job", "api")]]),
+            ),
+        ];
+        let corpus = vec![
+            entry(
+                "mixed",
+                r#"sum(http_requests{job="api"}) + sum(ravel_log_lines)"#,
+            ),
+            entry("log_only", r#"sum(ravel_log_bytes{job="api"})"#),
+        ];
+        let report = count_holders(&corpus, "ci", &grid(), &[], objects.into_iter().map(Ok))
+            .expect("counts");
+        let [mixed] = report.statements.as_slice() else {
+            panic!("one counted statement, got {:?}", report.statements);
+        };
+        assert_eq!(mixed.id, "mixed");
+        assert_eq!(mixed.selectors, [r#"http_requests{job="api"}"#]);
+        assert_eq!(mixed.metrics, ["http_requests"]);
+        assert!(mixed.name_pruned);
+        assert_eq!(
+            (
+                mixed.segments_in_window,
+                mixed.named_in_window,
+                mixed.unrouted_fetched_expected
+            ),
+            (2, 1, Some(1))
+        );
+        assert!(mixed.route_bound);
+        assert_eq!(mixed.route_bound_reason, None);
+        assert_eq!(
+            (mixed.value_holders, mixed.expected_routed_prunes),
+            (Some(1), Some(0))
+        );
+        assert_eq!(
+            report.skipped,
+            [HolderSkip {
+                id: "log_only".to_string(),
+                reason: "no metric selector".to_string(),
+            }]
         );
     }
 

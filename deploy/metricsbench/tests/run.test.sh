@@ -261,6 +261,8 @@
 #                                       a and j: the query step's labels; z1:
 #                                       ci (cold not applicable); z2: a
 #                                       differing hash is recorded, exit 0;
+#                                       z2b: the same two hashes in both
+#                                       passes are multi-hash, not differing;
 #                                       z3: history refused 65; z4: a bad
 #                                       value and z5: the diagnostic mode are
 #                                       usage errors; z6: 0 is off; z7: a
@@ -287,9 +289,13 @@
 #                                       z23: a statement not route-bound is
 #                                       listed; z24: a parts_rebuilt that is
 #                                       not a whole number refuses the routed
-#                                       pass. stage1-check.sh: the ci band
-#                                       file clean on z1, z20 and z21, out of
-#                                       band on z2, z15, z16, z17 and z22, a
+#                                       pass; z27a-f: an inspect stamp not
+#                                       written, a leaf part count not read
+#                                       back or not a whole number refuses
+#                                       each pass. stage1-check.sh: the ci
+#                                       band file clean on z1, z20 and z21,
+#                                       out of band on z2, z2b, z15, z16, z17
+#                                       and z22, a
 #                                       missing cold count, missing,
 #                                       duplicated, not finite (a NaN figure
 #                                       out of band, a NaN bound 65), a
@@ -749,6 +755,27 @@ for d in "${path_dirs[@]}"; do
   done
 done
 
+# python3 (in PYFAIL_DIR, ahead of everything on PATH only while STUB_PY_OP is
+# set): run.sh's py OP STAMPS KEY ... call whose OP is STUB_PY_OP and KEY is
+# STUB_PY_KEY exits 1 writing and printing nothing, as a py set or py get that
+# failed would, or with STUB_PY_PRINT set prints that and exits 0; every other
+# call runs the real python3.
+PYFAIL_DIR="${TMP}/pyfail"
+mkdir -p "${PYFAIL_DIR}"
+cat >"${PYFAIL_DIR}/python3" <<STUB
+#!/usr/bin/env bash
+if [ "\$1 \$2" = "-I -c" ] && [ "\${4:-}" = "\${STUB_PY_OP}" ] && [ "\${6:-}" = "\${STUB_PY_KEY}" ]; then
+  printf 'python3 %s %s %s: stub\n' "\$4" "\$5" "\$6" >>"\${STUB_LOG}"
+  if [ -n "\${STUB_PY_PRINT:-}" ]; then
+    printf '%s\n' "\${STUB_PY_PRINT}"
+    exit 0
+  fi
+  exit 1
+fi
+exec $(command -v python3) "\$@"
+STUB
+chmod +x "${PYFAIL_DIR}/python3"
+
 # metricsbench_ingest: an ingest report with a row per endpoint flag given.
 cat >"${BIN}/metricsbench_ingest" <<'STUB'
 #!/usr/bin/env bash
@@ -856,6 +883,8 @@ esac
 # STUB_RUN_FIGURES names a JSON file whose "records" object maps a pass label
 # to entry ids ("*" for every entry) to the fields that replace the record's;
 # a "keyIndex" field there replaces the routed keyIndex phase's figures.
+# Entry STUB_TWO_HASH_ENTRY gets a second record in every pass, rep 2, with
+# result_hash blake3:<entry>-rep2.
 python3 -I - "$corpus" "$diag" "$out" "$verdict" "$@" <<'PY'
 import json, os, sys
 corpus, diag, out, verdict = sys.argv[1:5]
@@ -898,7 +927,11 @@ def record(i):
             r["phases"] = phases + [{"phase": "keyIndex", **key_figs}]
     return r
 if diag:
-    json.dump({"ravel_cost": [record(i) for i in ids]}, open(diag, "w"))
+    rows = [record(i) for i in ids]
+    two = os.environ.get("STUB_TWO_HASH_ENTRY")
+    if two in ids:
+        rows.append({**record(two), "rep": 2, "result_hash": f"blake3:{two}-rep2"})
+    json.dump({"ravel_cost": rows}, open(diag, "w"))
 if out:
     report = {"stub": "report", "timed_rows": len(ids)}
     if verdict:
@@ -1041,6 +1074,7 @@ run_case() {
     shasum) run_path="${BIN}:${SHASUM_DIR}:${NOHASH_DIR}" ;;
     none) run_path="${BIN}:${NOHASH_DIR}" ;;
   esac
+  [ -z "${STUB_PY_OP:-}" ] || run_path="${PYFAIL_DIR}:${run_path}"
   PATH="${run_path}" \
     STUB_LOG="${LOG}" STUB_STATE="${TMP}/${name}/state" STUB_REAL_UNAME="${REAL_UNAME}" \
     METRICSBENCH_S3S_FS_CACHE="${TMP}/${name}/cache" \
@@ -2465,7 +2499,7 @@ check "z: stage1.unrouted and stage1.routed name their label, state and files" '
 check "z: stage1.restart says what was recreated" 'j("stamps.json")["stage1"]["restart"].startswith("recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='"'"'--disable-fold --fold-key-index-leaves --fold-metrics-label-index'"'"'")'
 check "z: every steady record carries its pass label and fold state" 'all(r["pass_label"] == "folded-unrouted" and r["fold_state"] == "'"${UNROUTED_STATE}"'" for r in j("stage1-unrouted/diagnostics.json")["ravel_cost"]) and all(r["pass_label"] == "folded-routed" and r["fold_state"] == "'"${ROUTED_STATE}"'" for r in j("stage1-routed/diagnostics.json")["ravel_cost"])'
 check "z: the cold selection runs in both passes, labelled, in its own regime" 'all(j(f"stage1-{w}/cold.json")["regime"] == f"stage1-folded-{w}-cold" and j(f"stage1-{w}/cold.json")["entries"] == ["mb_full_range_avg_over_time"] and len(j(f"stage1-{w}/cold.json")["runs"]) == 5 and all(r["ravel_cost"]["pass_label"] == f"folded-{w}" for r in j(f"stage1-{w}/cold.json")["runs"]) for w in ("unrouted", "routed")) and j("stamps.json")["stage1"]["routed_cold"]["file"] == "cold.json" and j("stamps.json")["stage1"]["routed_cold"]["failed_runs"] == 0'
-check "z: stage1-compare.json compares every entry's hashes and statuses and counts each pass's records" 'j("stage1-compare.json")["schema"] == "metricsbench-stage1-compare/3" and j("stage1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"') == j("stage1-compare.json")["entries_equal"] and j("stage1-compare.json")["entries_differing_count"] == 0 and j("stage1-compare.json")["entries_without_hash_count"] == 0 and j("stage1-compare.json")["statements_status_differing_count"] == 0 and j("stage1-compare.json")["statements_status_differing"] == [] and j("stage1-compare.json")["status_check"].startswith("per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9)") and j("stage1-compare.json")["passes"] == {"unrouted": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": 0, "segments_pruned_by_label_index": 0}, "routed": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": len('"${CORPUS_IDS}"'), "segments_pruned_by_label_index": 3 * len('"${CORPUS_IDS}"')}} and j("stamps.json")["stage1"]["compare"]["entries_differing"] == [] and j("stamps.json")["stage1"]["compare"]["statements_status_differing"] == []'
+check "z: stage1-compare.json compares every entry's hashes and statuses and counts each pass's records" 'j("stage1-compare.json")["schema"] == "metricsbench-stage1-compare/4" and j("stage1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"') == j("stage1-compare.json")["entries_equal"] and j("stage1-compare.json")["entries_multi_hash_count"] == 0 and j("stage1-compare.json")["entries_differing_count"] == 0 and j("stage1-compare.json")["entries_without_hash_count"] == 0 and j("stage1-compare.json")["statements_status_differing_count"] == 0 and j("stage1-compare.json")["statements_status_differing"] == [] and j("stage1-compare.json")["status_check"].startswith("per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9)") and j("stage1-compare.json")["passes"] == {"unrouted": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": 0, "segments_pruned_by_label_index": 0}, "routed": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": len('"${CORPUS_IDS}"'), "segments_pruned_by_label_index": 3 * len('"${CORPUS_IDS}"')}} and j("stamps.json")["stage1"]["compare"]["entries_differing"] == [] and j("stamps.json")["stage1"]["compare"]["statements_status_differing"] == []'
 expect_log "z: the holders listing is catalog list --json" "catalog list --tenant metricsbench --shards 4 --hours"
 expect_log "z: the holders download takes the L0 and L1 data objects of Ravel's bucket through the s3s endpoint" "--entrypoint aws createbuckets --endpoint-url http://s3s:9000 s3 sync s3://ravel-metricsbench/t/ /stage1-objects/t/ --exclude * --include */m/l0/*.rseg --include */m/l1/*.rseg --only-show-errors"
 expect_log "z: the download lands in the run's out dir" "-v ${OUT}/stage1-objects:/stage1-objects"
@@ -2498,6 +2532,11 @@ check "z1: ci's cold record counts are 0 of 0, naming the not-applicable stamp" 
 MB_STAGE1=1 STUB_ROUTED_HASH_DIFF=mb_selective_job_rate_sum run_stage1 z2 ci
 expect_rc z2 0
 check "z2: the differing entry is named with both hashes, the run passes" 'j("stage1-compare.json")["entries_differing"] == [{"entry": "mb_selective_job_rate_sum", "unrouted": ["blake3:mb_selective_job_rate_sum"], "routed": ["blake3:mb_selective_job_rate_sum-routed"]}] and j("stamps.json")["stage1"]["compare"]["entries_differing"] == ["mb_selective_job_rate_sum"] and j("stamps.json")["status"] == "passed"'
+
+# z2b: an entry whose two passes carry the same two hashes is multi-hash, not differing.
+MB_STAGE1=1 STUB_TWO_HASH_ENTRY=mb_selective_job_rate_sum run_stage1 z2b ci
+expect_rc z2b 0
+check "z2b: the two-hash entry is listed as multi-hash with its hashes, not as differing or equal" 'j("stage1-compare.json")["entries_multi_hash_count"] == 1 and j("stage1-compare.json")["entries_multi_hash"] == [{"entry": "mb_selective_job_rate_sum", "hashes": ["blake3:mb_selective_job_rate_sum", "blake3:mb_selective_job_rate_sum-rep2"]}] and j("stamps.json")["stage1"]["compare"]["entries_multi_hash"] == ["mb_selective_job_rate_sum"] and j("stage1-compare.json")["entries_differing_count"] == 0 and j("stage1-compare.json")["entries_differing"] == [] and j("stage1-compare.json")["entries_equal"] == len('"${CORPUS_IDS}"') - 1 and j("stage1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"')'
 
 # z3: a profile other than cardinality and ci is refused before anything starts.
 MB_STAGE1=1 run_stage1 z3 history
@@ -2629,6 +2668,33 @@ expect_rc z24 70
 check "z24: stage1-routed named, the refusal names the figure" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.leaves.parts_rebuilt is '"'"'None'"'"', not a whole number"'
 expect_no_log "z24: no routed pass" "--pass-label folded-routed"
 
+# z27: an inspect stamp that was not written, or whose label_value leaf part
+# count cannot be read back as a whole number, refuses the pass it gates.
+MB_STAGE1=1 STUB_PY_OP=set STUB_PY_KEY=stage1.unrouted_catalog run_stage1 z27a ci
+expect_rc z27a 70
+check "z27a: stage1-unrouted named, the refusal names the unwritten stamp" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog could not be stamped (py set exited 1)"'
+expect_no_log "z27a: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=set STUB_PY_KEY=stage1.routed_catalog run_stage1 z27b ci
+expect_rc z27b 70
+check "z27b: stage1-routed named, the refusal names the unwritten stamp" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog could not be stamped (py set exited 1)"'
+expect_no_log "z27b: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.label_value_leaf_parts run_stage1 z27c ci
+expect_rc z27c 70
+check "z27c: stage1-unrouted named, the refusal names the unread figure" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.label_value_leaf_parts could not be read (py get exited 1)"'
+expect_no_log "z27c: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.label_value_leaf_parts run_stage1 z27d ci
+expect_rc z27d 70
+check "z27d: stage1-routed named, the refusal names the unread figure" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.label_value_leaf_parts could not be read (py get exited 1)"'
+expect_no_log "z27d: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.label_value_leaf_parts STUB_PY_PRINT=None run_stage1 z27e ci
+expect_rc z27e 70
+check "z27e: stage1-unrouted named, the refusal names the figure that is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.label_value_leaf_parts is '"'"'None'"'"', not a whole number"'
+expect_no_log "z27e: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.label_value_leaf_parts STUB_PY_PRINT=None run_stage1 z27f ci
+expect_rc z27f 70
+check "z27f: stage1-routed named, the refusal names the figure that is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.label_value_leaf_parts is '"'"'None'"'"', not a whole number"'
+expect_no_log "z27f: no routed pass" "--pass-label folded-routed"
+
 # z25: a routed segmentsPrunedByLabelIndex that is not expected_routed_prunes is a mismatch.
 MB_STAGE1=1 STUB_HOLDERS_PRUNES_OFF=mb_selective_job_rate_sum run_stage1 z25 ci
 expect_rc z25 0
@@ -2725,6 +2791,12 @@ run_check oob "${CI_BANDS}" "${TMP}/z2/out"
 expect_rc "check out-of-band" 1
 expect_check_err "check out-of-band: the figure, value and band named" "out of band entries_differing = 1 not in [0, 0] (stage1-compare.json entries_differing_count)"
 expect_check_err "check out-of-band: one failure counted" "stage1-check: 1 of ${FIGURES} figures failed"
+
+# Out of band: case z2b's multi-hash entry fails its own band, not entries_differing's.
+run_check oob-multi "${CI_BANDS}" "${TMP}/z2b/out"
+expect_rc "check out-of-band multi-hash" 1
+expect_check_err "check out-of-band multi-hash: the figure, value and band named" "out of band entries_multi_hash = 1 not in [0, 0] (stage1-compare.json entries_multi_hash_count)"
+expect_check_err "check out-of-band multi-hash: one failure counted" "stage1-check: 1 of ${FIGURES} figures failed"
 
 # Missing: z1's run without holders.json, and with a stage1 stamp that is a failure string.
 cp -R "${TMP}/z1/out" "${TMP}/check-missing"

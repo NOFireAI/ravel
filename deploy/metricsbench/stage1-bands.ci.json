@@ -20,6 +20,8 @@
      "basis": "predicted: both steady passes return a result_hash for at least one corpus entry"},
     {"name": "entries_differing", "file": "stage1-compare.json", "path": "entries_differing_count", "min": 0, "max": 0,
      "basis": "predicted: routing prunes objects, never results, so every entry's unrouted and routed hashes are equal"},
+    {"name": "entries_multi_hash", "file": "stage1-compare.json", "path": "entries_multi_hash_count", "min": 0, "max": 0,
+     "basis": "predicted: every pass repeats its own answer, so no entry carries two or more result_hash values within a pass; an entry whose two passes carry the same set of several hashes is non-determinism inside a pass, not a routing difference"},
     {"name": "entries_without_hash", "file": "stage1-compare.json", "path": "entries_without_hash_count", "min": 0, "max": 0,
      "basis": "predicted: every corpus entry answers (ok or incorrect, both carrying a result_hash) in both passes on ci"},
     {"name": "statements_status_differing", "file": "stage1-compare.json", "path": "statements_status_differing_count", "min": 0, "max": 0,
