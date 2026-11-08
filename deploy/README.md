@@ -1,150 +1,132 @@
 # deploy/
 
-Deployment assets for Ravel: Docker Compose stacks, Kubernetes manifests, and
-the IAM policy documents the operator renders into Secrets.
+Deployment assets for Ravel: Docker Compose stacks, Kubernetes manifests, the
+IAM policy documents the operator renders into Secrets, a Prometheus rule
+file and a Grafana dashboard.
 
 ## Prometheus alerting rules (`prometheus/ravel.rules.yaml`)
 
-`prometheus/ravel.rules.yaml` is the shipped alert rule file: 36 alerts in 9
-groups. Each carries the threshold its source document states, and the
-duration that document states where it states one. The sources are
-[the observability guide](../docs/guides/observability.md), which explains the
-groups it states durations for, and
-[the troubleshooting guide](../docs/guides/operations/troubleshooting.md),
-whose symptom table states the rest. 17 of the 36 carry no `for:` because the
-row they come from states no duration; each of those says so in an
-`as_documented` annotation, and every rule carries a `runbook` annotation
-naming the section to read when it fires.
-
-Load it from a Prometheus server's `rule_files:` key:
+Load the shipped alert rule file from a Prometheus server's `rule_files:` key:
 
 ```yaml
 rule_files:
   - /etc/prometheus/ravel.rules.yaml
 ```
 
-or wrap the same `groups:` list in a `PrometheusRule` custom resource under
-the Prometheus Operator. This directory ships the rule file alone, not a
-scrape configuration: point your own Prometheus at the Ravel processes you
-run.
+Under the Prometheus Operator, wrap the same `groups:` list in a
+`PrometheusRule` custom resource. This directory ships no scrape
+configuration: point your own Prometheus at the Ravel processes you run.
 
-`services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs` pins the
-names. It parses this file into its 9 groups and 36 rules, extracts the 42
-distinct `ravel_` metric names their expressions and annotations reference,
-and asserts each one appears on a `# TYPE` line of a `/metrics` body rendered
-by a running server, so renaming a metric in the code fails the test instead
-of leaving a rule here matching no series. Parsing rather than scanning is
-what makes the rule count mean something: a corruption that leaves the
-`- alert:` lines intact keeps a string count at 36 while Prometheus refuses
-the whole file, and the reader the test uses refuses any line it cannot
-account for, so that corruption fails there instead. It also checks the
-`for:` duration against Prometheus's duration grammar and parses every
-`expr` with Ravel's own PromQL parser.
+The file holds 36 alerts in 9 groups. Each carries the threshold its source
+document states, and the duration that document states where it states one:
 
-The same test parses the seven fenced `yaml` blocks the
-[observability guide](../docs/guides/observability.md) prints, and asserts
-that each of the 16 rules they hold carries the same expression, `for:`
-duration and severity as the rule of that name here. The blocks stay on the
-page because they are where each rule is explained, and the comparison is
-what stops them drifting into rules a reader can copy but nothing else
-ships.
+- [The observability guide](../docs/guides/observability.md) explains the
+  groups it states durations for.
+- [The troubleshooting guide](../docs/guides/operations/troubleshooting.md)
+  symptom table states the rest. 17 of the 36 carry no `for:` because the row
+  they come from states no duration; each of those says so in an
+  `as_documented` annotation.
+
+Every rule carries a `runbook` annotation naming the section to read when it
+fires.
 
 ## Grafana dashboard (`grafana/dashboards-standalone/ravel.json`)
 
-`grafana/dashboards-standalone/ravel.json` is the shipped dashboard over Ravel's own
-`ravel_` families: 36 panels in 6 rows, named Ingest, Query, Catalog fold,
-Maintenance, Object store and probe, and Alerting. Between them the panels
-reference 117 distinct `ravel_` metric names. Import it into Grafana and pick
-the Prometheus data source that scrapes your Ravel processes; the dashboard
+Import `grafana/dashboards-standalone/ravel.json` into Grafana and pick the
+Prometheus data source that scrapes your Ravel processes. The dashboard
 carries a single `ds` data-source variable and no hardcoded data-source uid.
 
-It lives OUTSIDE `grafana/dashboards/`, and that placement is load-bearing.
-`deploy/docker-compose/ravel.yml` mounts the whole `grafana/dashboards`
-directory into the quickstart's Grafana, and
+It graphs Ravel's own `ravel_` families: 36 panels in 6 rows, named Ingest,
+Query, Catalog fold, Maintenance, Object store and probe, and Alerting.
+Between them the panels reference 117 distinct `ravel_` metric names.
+
+Keep it outside `grafana/dashboards/`. `deploy/docker-compose/ravel.yml`
+mounts that whole directory into the quickstart's Grafana, and
 `grafana/provisioning/dashboards/ravel.yaml` is a `type: file` provider over
-that path, so anything dropped in there is auto-provisioned. The quickstart
-scrapes no Ravel process: its collector declares only the `hostmetrics`
-receiver, so no `ravel_` series exists in the only datasource that dashboard
-could reach, and all 36 panels would draw nothing. A blank dashboard as the
-quickstart's first impression is the same silent failure this file's own test
-exists to prevent. Do not move it back under `grafana/dashboards/` without
-also giving the quickstart a scrape path for ravel-server's `/metrics`.
+it, so anything there is auto-provisioned. The quickstart scrapes no Ravel
+process: its collector declares only the `hostmetrics` receiver, so no
+`ravel_` series exists in the only data source that dashboard could reach,
+and all 36 panels would draw nothing. Move it there only after giving the
+quickstart a scrape path for ravel-server's `/metrics`.
 
-`grafana/dashboards/ravel-overview.json` is a different thing and stays where
-it is: it belongs to the quickstart compose stack and graphs the bundled
-collector's host CPU, not any Ravel family.
+`grafana/dashboards/ravel-overview.json` belongs to the quickstart compose
+stack and stays where it is. It graphs the bundled collector's host CPU, not
+any Ravel family.
 
-The same test that pins the rule file's names,
-`services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs`, pins the
-dashboard's. It parses the JSON, walks every object carrying a `targets`
-array, extracts the metric names from each target's PromQL expression, and
-asserts each one appears on a `# TYPE` line of a `/metrics` body rendered by a
-running server, through the same scanner and the same rendered bodies the rule
-file goes through. It also asserts that every one of the 42 metric names the
-shipped rules alert on is graphed by some panel here, so a page always has a
-panel to land on. The 6 rows, 36 panels, 114 targets and 117 names are pinned
-as literals, so a walk that stops finding panels fails rather than checking an
-empty set.
+## How the rules and the dashboard are checked
 
-What that check covers is the metric NAMES. It does not validate the PromQL
-around them, the label matchers inside a selector, the panel layout, or the
-dashboard against Grafana's own schema, and it cannot tell that a panel will
-draw data in your deployment: a name that renders here may still carry no
-series for a label combination a panel splits on, or for a family behind a
-setting your processes leave off.
+`services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs` checks
+both files against a `/metrics` body rendered by a running server:
 
-## Why the object store and the OpenTelemetry Collector are not pulled from Docker Hub
+- It parses the rule file into its 9 groups and 36 rules and asserts that
+  each of the 42 distinct `ravel_` metric names their expressions and
+  annotations reference appears on a `# TYPE` line. It also checks each
+  `for:` duration against Prometheus's duration grammar and parses every
+  `expr` with Ravel's own PromQL parser.
+- It parses the seven fenced `yaml` blocks the
+  [observability guide](../docs/guides/observability.md) prints, and asserts
+  that each of the 16 rules they hold carries the same expression, `for:`
+  duration and severity as the rule of that name here.
+- It extracts the metric names from every dashboard target's PromQL and
+  asserts each one appears on a `# TYPE` line, and that every one of the 42
+  names the rules alert on is graphed by some panel. The 6 rows, 36 panels,
+  114 targets and 117 names are pinned as literals.
+
+The dashboard check covers metric names only. It does not validate the
+PromQL around them, the label matchers inside a selector, the panel layout,
+or the dashboard against Grafana's schema. A panel can still draw nothing in
+your deployment: a name that renders here may carry no series for a label
+combination the panel splits on, or for a family behind a setting your
+processes leave off.
+
+## Image registries
 
 Docker Hub's anonymous pull allowance is per source IP and shared across
-every project on a runner. A public image still fails to pull with "pull
-access denied ... may require 'docker login'" once that shared allowance is
-exhausted, which reads like a permissions problem rather than a rate limit.
+every project on a runner. Once it runs out, a public image fails with "pull
+access denied ... may require 'docker login'", which reads like a
+permissions problem rather than a rate limit. So this directory pulls from
+registries that do not share that allowance:
 
-Where an anonymous mirror exists on another registry, this directory pulls
-from there instead: the object store from `ghcr.io/rustfs/rustfs`, its
-client from `public.ecr.aws/aws-cli/aws-cli` (everywhere except
-deploy/metricsbench, which pulls it from Docker Hub; see below), and
-the OpenTelemetry Collector from
-`ghcr.io/open-telemetry/opentelemetry-collector-releases/...`. None of those
-registries shares Docker Hub's allowance. Every file that does this
-points back to this note with a one-line comment instead of repeating the
-rationale.
+| Image | Registry |
+|---|---|
+| Object store (RustFS) | `ghcr.io/rustfs/rustfs` |
+| Its client, the AWS CLI | `public.ecr.aws/aws-cli/aws-cli`, except in deploy/metricsbench, which pulls it from Docker Hub |
+| OpenTelemetry Collector | `ghcr.io/open-telemetry/opentelemetry-collector-releases/...` |
 
-ECR Public does throttle unauthenticated pulls per source IP on its own
-terms, answering a burst with `toomanyrequests: Rate exceeded`, which
-`docker run` reports as exit 125. The CI jobs that create a RustFS bucket
-(ci.yml's `object-store-contract` and `bench-smoke`) do not pull the AWS CLI
-image: they create their bucket with the aws CLI the GitHub runner image ships
-(`scripts/ci-create-bucket.sh`). The documented quickstart runs
-`createbucket` from ECR Public, and the scheduled `quickstart-published`
-workflow runs it; it does not gate a merge. metricsbench-nightly's
-`metricsbench-rustfs` runs the whole deploy/metricsbench compose stack
-through `deploy/metricsbench/run.sh` once a day and pulls Prometheus,
-VictoriaMetrics, Mimir and the AWS CLI for its `createbuckets` service from
-Docker Hub; deploy/metricsbench/README.md, "Pinned image digests", says why
-the AWS CLI is there. It does not gate a merge either: a throttled pull
-fails that night's run and nothing else. The ECR Public image is also
-pulled by `docker-compose/rustfs.yml`, `deploy/k8s`, `scripts/demo.sh`,
-`scripts/dr`, `scripts/chaos`, and the interop-nightly Flight SQL test.
+Each file that does this points back here with a one-line comment. MinIO is
+not used because its public images cannot be pulled without credentials from
+Docker Hub or quay.io. An image left on Docker Hub (for example
+`grafana/grafana` in `docker-compose/ravel.yml`) carries its own comment
+naming the other registries checked and why none had a usable copy.
 
-MinIO is not an option: its public images cannot be pulled without
-credentials from Docker Hub or quay.io, so the object store is RustFS and its
-client is the AWS CLI.
+ECR Public throttles unauthenticated pulls per source IP on its own terms. A
+burst gets `toomanyrequests: Rate exceeded`, which `docker run` reports as
+exit 125. Where that matters:
 
-An image left on Docker Hub in this directory (for example `grafana/grafana`
-in `docker-compose/ravel.yml`) carries its own comment naming the other
-registries checked and why none of them had a usable copy.
+- The CI jobs that create a RustFS bucket (ci.yml's `object-store-contract`
+  and `bench-smoke`) do not pull the AWS CLI image. They use the aws CLI the
+  GitHub runner image ships (`scripts/ci-create-bucket.sh`).
+- The quickstart runs `createbucket` from ECR Public, and so does the
+  scheduled `quickstart-published` workflow, which does not gate a merge.
+- metricsbench-nightly's `metricsbench-rustfs` job runs the deploy/metricsbench
+  stack through `deploy/metricsbench/run.sh` once a day and pulls Prometheus,
+  VictoriaMetrics, Mimir and the AWS CLI for its `createbuckets` service from
+  Docker Hub (deploy/metricsbench/README.md, "Pinned image digests", says
+  why). It does not gate a merge either: a throttled pull fails that night's
+  run and nothing else.
+- `docker-compose/rustfs.yml`, `deploy/k8s`, `scripts/demo.sh`, `scripts/dr`,
+  `scripts/chaos` and the interop-nightly Flight SQL test also pull the ECR
+  Public image.
 
 ## Pinned image digests (docker-compose/ravel.yml and docker-compose/rustfs.yml)
 
 Every third-party image in the two quickstart compose files is pinned to a
-release tag plus an immutable `@sha256:` manifest digest, the
-same convention `deploy/metricsbench/` uses. `docker-compose/rustfs.yml` is
-`docker-compose/ravel.yml`'s standalone object-store-and-bucket mirror (same
-credentials, same `ravel-dev` bucket), so it carries the identical RustFS
-pins. The RustFS and AWS CLI pair reuses the exact pins already resolved for
-`deploy/metricsbench/docker-compose.yml`; see that directory's README for
-the resolution recipe per registry.
+release tag plus an immutable `@sha256:` manifest digest, as in
+`deploy/metricsbench/`. `docker-compose/rustfs.yml` is the standalone
+object-store-and-bucket mirror of `docker-compose/ravel.yml` (same
+credentials, same `ravel-dev` bucket), so it carries the same RustFS pins. The
+RustFS and AWS CLI pins are the ones `deploy/metricsbench/docker-compose.yml`
+uses; that directory's README has the resolution recipe per registry.
 
 | Image | Registry | Tag | Digest |
 |---|---|---|---|
@@ -153,11 +135,12 @@ the resolution recipe per registry.
 | `open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib` | ghcr.io | `0.160.0` | `sha256:799dc6cf12c96192af37b5bdba804da8c10b3bc563b43cb90c3f3c58d9572ad6` |
 | `grafana/grafana` | docker.io | `13.2.2` | `sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0` |
 
-`deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh` enforces
-this: every `image:` line in `docker-compose/ravel.yml` and
-`docker-compose/rustfs.yml`, except the two `${RAVEL_IMAGE:-...}` references
-in `ravel.yml`, must carry a digest, checked in CI's `doc-scripts` job.
-`deploy/k8s`'s four registry images carry digests too, checked by the same
-job. The two locally built placeholders there (`ravel-server`,
-`ravel-operator`) are loaded into kind by tag and are exempt by exact
-string.
+CI's `doc-scripts` job enforces the pins with
+`deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh`:
+
+- Every `image:` line in `docker-compose/ravel.yml` and
+  `docker-compose/rustfs.yml` must carry a digest, except the two
+  `${RAVEL_IMAGE:-...}` references in `ravel.yml`.
+- The four registry images in `deploy/k8s` carry digests too. The two locally
+  built placeholders there (`ravel-server`, `ravel-operator`) are loaded into
+  kind by tag and are exempt by exact string.

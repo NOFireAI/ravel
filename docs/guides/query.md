@@ -2,6 +2,49 @@
 
 ![query path](../diagrams/query-path.svg)
 
+## Run a query
+
+These commands run against the [README quickstart](../../README.md#quickstart)
+stack, which listens on `127.0.0.1:4318` and accepts the bearer token
+`demo-token`. The examples further down use `devtoken`; substitute your own.
+
+A PromQL instant query:
+
+```sh
+curl -s -H "Authorization: Bearer demo-token" \
+  'http://127.0.0.1:4318/api/v1/query?query=system_cpu_load_average_1m'
+```
+
+A SQL query over metrics:
+
+```sh
+curl -s -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer demo-token" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"SELECT * FROM samples LIMIT 5"}'
+```
+
+A log query, through PromQL's reserved `ravel_log_lines` name:
+
+```sh
+curl -s -H "Authorization: Bearer demo-token" \
+  --data-urlencode 'query=sum by (job) (count_over_time(ravel_log_lines[5m]))' \
+  'http://127.0.0.1:4318/api/v1/query'
+```
+
+| To do this | Read |
+|---|---|
+| Query metrics with PromQL, and see which constructs are refused | [Endpoints](#endpoints), [PromQL support](#promql-support) |
+| Count or measure log lines with PromQL | [PromQL over logs](#promql-over-logs) |
+| Query `samples`, `logs`, `spans`, `alerts` or `audit` with SQL | [SQL queries](#sql-queries) |
+| Query logs with ES\|QL (needs a build with the `esql` cargo feature, which the published image lacks) | [ES\|QL queries](#esql-queries) |
+| Read your own write | [`min_commit_token`](#min_commit_token) |
+| Know the limits a query runs under | [Query budgets](#query-budgets) |
+| Read an error status | [HTTP status codes](#http-status-codes) |
+| Fetch one trace | [the traces guide](traces.md) |
+
+## Endpoints
+
 Ravel registers eleven routes under `/api/v1` on `--listen-http`. All but two
 require the same tenant authentication as ingest: `Authorization: Bearer
 <token>`, or the dev header if `--dev-insecure-tenant-header` is set. The two
@@ -11,11 +54,11 @@ exceptions are:
 - `/api/v1/metadata` answers an empty object to a request it cannot resolve.
 
 A build with the `esql` cargo feature registers a twelfth,
-`POST /api/v1/esql`, described under [ES|QL queries](#esql-queries).
+`POST /api/v1/esql` (see [ES|QL queries](#esql-queries)). The maintenance
+route `POST /api/v1/admin/fold` is not a query route.
 
 `POST /api/v1/sql`, `POST /api/v1/esql` and `POST /api/v1/analytics` return a
-described-schema JSON envelope, documented with each. Operators trigger the maintenance route
-`POST /api/v1/admin/fold`, which is not a query route. The Prometheus-shaped
+described-schema JSON envelope, documented with each. The Prometheus-shaped
 endpoints return the Prometheus-compatible JSON envelope:
 
 ```json
@@ -23,7 +66,8 @@ endpoints return the Prometheus-compatible JSON envelope:
 {"status": "error", "errorType": "bad_data", "error": "..."}
 ```
 
-## Endpoints
+[The HTTP API reference](../reference/http-api.md#query-routes) lists every
+route with its parameters, status codes and cargo feature.
 
 ### `GET/POST /api/v1/query`
 
@@ -133,16 +177,16 @@ curl -G http://127.0.0.1:4318/api/v1/series \
 {"status": "success", "data": [{"__name__": "demo_requests_total", "job": "checkout"}]}
 ```
 
-If you omit `match[]` on `/series`, you get a `400 bad_data` error
+`/series` without `match[]` is a `400 bad_data` error
 (`missing required parameter "match[]"`). `/labels` and `/label/{name}/values`
 accept a request without `match[]` and match every series in the window.
 
 When `start` and `end` are unset, `/labels`, `/label/{name}/values`, and
 `/series` use the hour before now as their window.
 
-If you give more than one `match[]` selector, each selector resolves its own
-catalog snapshot independently. Ravel unions the results by series identity.
-The selectors do not share one snapshot for the request.
+With more than one `match[]` selector, each selector resolves its own catalog
+snapshot, and Ravel unions the results by series identity. The selectors do
+not share one snapshot for the request.
 
 ### `GET /api/v1/status/buildinfo` and `GET /api/v1/metadata`
 
@@ -158,16 +202,13 @@ SHA of the build when the build exported `RAVEL_GIT_SHA`. Otherwise it is
 empty.
 
 `/api/v1/metadata` returns the per-metric type, help, and unit for each metric
-whose ingest carried them. The shape is the documented Prometheus shape:
-`data` maps each family name to a length-1 array of `{type, help, unit}`.
-
-- The route resolves the tenant from the same bearer credential that the other
-  query routes use.
-- It serves the metadata of that tenant from a per-process, per-tenant cache.
-  The cost is one object read per tenant per refresh horizon, never a read per
-  request.
-- The optional `metric` and `limit` query parameters filter to one family and
-  cap the number of names, as in Prometheus.
+whose ingest carried them, in the Prometheus shape: `data` maps each family
+name to a length-1 array of `{type, help, unit}`. The optional `metric` and
+`limit` query parameters filter to one family and cap the number of names, as
+in Prometheus. The route resolves the tenant from the same bearer credential
+as the other query routes, and serves it from a per-process, per-tenant
+cache: one object read per tenant per refresh horizon, never a read per
+request.
 
 Metadata is best-effort:
 
@@ -180,37 +221,34 @@ the OTLP name suffixing that decides the family names.
 
 ### `GET/POST /api/v1/query_exemplars`
 
-Prometheus exemplar lookup. It returns the trace references that metric
-samples carried, for a metric selector over a `start`/`end` window. It takes
-the Prometheus `query`, `start`, and `end` parameters and returns the
-Prometheus exemplar shape. Ravel stores exemplars only from OTLP ingest. For
-the full walkthrough, including the Grafana metric-to-trace link, see
-[correlation.md](correlation.md).
+Returns the trace references that metric samples carried, for a metric
+selector over a `start`/`end` window. It takes the Prometheus `query`,
+`start`, and `end` parameters and returns the Prometheus exemplar shape.
+Ravel stores exemplars only from OTLP ingest. See
+[correlation.md](correlation.md) for the Grafana metric-to-trace link.
 
 ### `POST /api/v1/analytics`
 
-A JSON-body endpoint that runs a range evaluation and applies one analytic to
-each series of the result. It accepts two operations: change point detection
-and summary statistics. It shares the query listener and needs no cargo
-feature. The request and response schema, the operations, and the status
-table are in [analytics.md](../analytics.md#endpoint).
+Runs a range evaluation and applies one analytic to each series of the
+result: change point detection or summary statistics. It takes a JSON body,
+shares the query listener and needs no cargo feature. The schema, the
+operations, and the status table are in
+[analytics.md](../analytics.md#endpoint).
 
 ## PromQL support
 
 Ravel supports function calls, aggregations, binary operators, subqueries,
-unary and paren expressions, the `@` modifier, and vector matching. The
-evaluator is differentially tested against real Prometheus.
+unary and paren expressions, the `@` modifier, and vector matching.
 
 The generated conformance table in
 [docs/query-engine.md](../query-engine.md#promql-conformance-adr-0035) is
 authoritative. It classifies every construct as supported, intentionally
-rejected, or an accepted divergence. Its counts come from a Ravel-only run.
-Agreement with the pinned Prometheus binary is a separate row of that table,
-and the committed table does not carry measured figures for it.
+rejected, or an accepted divergence. Its counts come from a Ravel-only run;
+agreement with Prometheus is a separate row of that table, with no measured
+figures in the committed copy.
 
-Ravel intentionally rejects a small set of constructs. Each one answers with a
-typed `422 unprocessable_entity` error that names the construct, never a panic
-and never silently wrong data. The current set is:
+Ravel rejects these constructs with a typed `422 unprocessable_entity` error
+that names the construct, never a panic and never silently wrong data:
 
 | Rejected | Error names it as |
 |---|---|
@@ -305,8 +343,7 @@ Only scalar attributes become labels:
 
 To sanitize a name for use as a label, Ravel rewrites the first character to
 `[A-Za-z_]` and every later character to `[A-Za-z0-9_]` in place. For example,
-`k8s.pod.name` becomes `k8s_pod_name`. This is the rule that
-`ravel_otlp::normalize::sanitize_label_name` applies to metrics.
+`k8s.pod.name` becomes `k8s_pod_name`. Metrics ingest applies the same rule.
 
 The `__`-prefixed namespace is reserved. Ravel drops an attribute whose
 sanitized name lands there. The only `__` label on a log-derived series is the
@@ -348,32 +385,28 @@ count_over_time(ravel_log_lines{job="api"}[5m]) / 300
 ### Budgets and reserved names
 
 A log selector uses the same [query budgets](#query-budgets) as a metrics
-selector, in the same query. `max_samples`, `max_series`, `max_segments`,
-`max_bytes_scanned`, and `max_s3_requests` are shared totals across every
-selector that a query contains, metrics and log alike. A query that exceeds
-one gets the same typed `422` that a metrics-only query gets.
+selector. `max_samples`, `max_series`, `max_segments`, `max_bytes_scanned`,
+and `max_s3_requests` are shared totals across every selector in a query,
+metrics and log alike, and exceeding one is the same typed `422`.
 
 `/api/v1/label/__name__/values` lists the reserved names as follows:
 
 - A request with no `match[]` gets both `ravel_log_lines` and
   `ravel_log_bytes`.
-- A request where at least one `match[]` selector is a log selector gets both.
-  A `match[]` that names one reserved name currently returns both of them.
+- A request where at least one `match[]` selector is a log selector gets both,
+  even when that selector names only one of them.
 - A request whose selectors name only metrics gets metrics names only.
 
-The names are listed even on a tenant that never ingested a log, because they
-exist independently of the data.
-
-`/api/v1/metadata` always includes both reserved names, each with a fixed
-`type`, `help`, and `unit`. The same `metric` and `limit` filters apply as for
-a metrics request. Neither entry depends on ingested log data.
+The names are listed even on a tenant that never ingested a log.
+`/api/v1/metadata` always includes both, each with a fixed `type`, `help`,
+and `unit`, under the same `metric` and `limit` filters as a metrics name.
 
 ### Local evaluation only
 
 The query coordinator answers a log selector directly against object storage.
-A log selector does not fan out over `--distributed-query` federation the way a
-metrics selector does. A federated deployment still answers a log selector,
-from the local view of the coordinator and without a cluster-wide merge.
+It does not fan out over `--distributed-query` federation the way a metrics
+selector does: a federated deployment answers it from the coordinator's local
+view, without a cluster-wide merge.
 
 ### Examples
 
@@ -471,12 +504,17 @@ write passes each write's token, qualified:
 ```
 
 Flight SQL takes the same forms in its `x-ravel-min-commit-token` request
-metadata, one metadata entry per token, under the same rules. A refusal under
-those rules carries the same text, as `INVALID_ARGUMENT` at `GetFlightInfo`
-where the SQL endpoint answers 400; a value that does not parse is
-`INVALID_ARGUMENT`, `invalid x-ravel-min-commit-token`, quoting the value;
-and a token whose commit a table cannot see is `UNAVAILABLE`. `POST /api/v1/esql` takes no `min_commit_token`. A trace lookup (`GET /api/traces/{trace_id}`) reads only
-`spans`, so its token is unqualified or `spans:<token>`.
+metadata, one metadata entry per token, under the same rules:
+
+- A refusal under those rules carries the same text, as `INVALID_ARGUMENT` at
+  `GetFlightInfo`, where the SQL endpoint answers 400.
+- A value that does not parse is `INVALID_ARGUMENT`,
+  `invalid x-ravel-min-commit-token`, quoting the value.
+- A token whose commit a table cannot see is `UNAVAILABLE`.
+
+`POST /api/v1/esql` takes no `min_commit_token`. A trace lookup
+(`GET /api/traces/{trace_id}`) reads only `spans`, so its token is
+unqualified or `spans:<token>`.
 
 ## Query budgets
 
@@ -502,53 +540,39 @@ SQL queries have one more bound: a per-query byte ceiling on the DataFusion
 memory pool. The default is 50% of the memory of the host, which is the whole
 SQL share of the tenant (~15 GiB on a 30 GB host). See
 [Operator-configurable budgets](#operator-configurable-budgets-server-flags).
+A query that exceeds it gets an HTTP 422 `execution` error that names the
+pool, never a truncated result.
 
-The ceiling bounds the memory that the query holds at one instant: what a
-scan has decoded, the batch that it hands downstream, and the aggregate state
-that the operators above it accumulate. It does not bound the number of bytes
-that the query produces over its lifetime.
-
-- A full-table scan over `logs` does not exhaust the pool only because it is
-  large. The logs scan streams one block at a time and releases each block
-  before it decodes the next, so its contribution follows block size and
-  partition count.
-- An `ORDER BY` or a high-cardinality `GROUP BY` over a large result is what
-  accumulates.
-
-A query that exceeds the ceiling gets an HTTP 422 `execution` error that names
-the pool, never a truncated result.
+The ceiling bounds the memory that the query holds at one instant (what a
+scan has decoded, the batch it hands downstream, and the aggregate state the
+operators above it accumulate), not the bytes it produces over its lifetime.
+A full-table scan over `logs` does not exhaust the pool only because it is
+large: the logs scan streams one block at a time and releases each block
+before it decodes the next. An `ORDER BY` or a high-cardinality `GROUP BY`
+over a large result is what accumulates.
 
 ### Operator-configurable budgets (server flags)
 
 Eight of these budgets are process-wide server flags. None is per-tenant. An
-unset flag resolves at startup, and only some resolve **from host
-resources**:
+unset flag resolves at startup: the concurrency flags follow the core count,
+the two SQL ceilings follow memory (shares of `MemTotal`, capped by the
+cgroup memory limit in a container), and the segment, series and sample caps
+are fixed on every host. Ravel uses a nonzero flag value verbatim, with one
+exception: it clamps the per-query SQL pool to an explicit per-tenant ceiling
+that is set below it. The "Reference host" column is what a 16-core, 30 GB
+host resolves to.
 
-- `--store-get-concurrency`, `--sql-partition-count`, and
-  `--promql-fetch-fanout` follow the core count. The legacy
-  `--fetch-concurrency` sets all three.
-- The two SQL ceilings follow memory: shares of `MemTotal`, capped by the
-  cgroup memory limit in a container.
-- `--max-segments` is a fixed 1,000,000 on every host.
-- `--max-series` and `--max-samples` are a fixed 10,000 and 10,000,000 on
-  every host.
-
-Ravel uses a nonzero flag value verbatim, with one exception: it clamps the
-per-query SQL pool to an explicit per-tenant ceiling that is set below it. The
-"Reference host" column is what a 16-core, 30 GB host resolves to. The
-published ClickBench run used these settings.
-
-| Flag | Reaches | Default (unset) | Reference host |
+| Flag | Sets | Default (unset) | Reference host |
 |---|---|---|---|
-| `--fetch-concurrency <N>` | legacy: sets all three rows below together (source `legacy-flag`) | derived: `max(8, 2 x cores)` | 32 |
-| `--store-get-concurrency <N>` | `EngineConfig::store_get_concurrency`, the process-wide `GetLimiter` permit count | derived: `max(8, 2 x cores)` | 32 |
-| `--sql-partition-count <N>` | `EngineConfig::sql_partition_count`, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
-| `--promql-fetch-fanout <N>` | `EngineConfig::promql_fetch_fanout`, per-selector fetch stream fan-out | derived: `max(8, 2 x cores)` | 32 |
-| `--max-segments <N>` | `EngineConfig::max_segments` | fixed: 1,000,000 (host-independent) | 1,000,000 |
-| `--max-series <N>` | `EngineConfig::max_series` | fixed: 10,000 (host-independent) | 10,000 |
-| `--max-samples <N>` | `EngineConfig::max_samples`, and the selector-cache cap derived from it | fixed: 10,000,000 (host-independent) | 10,000,000 |
-| `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | derived: 50% of MemTotal, the tenant's share (256 MiB if unknown) | 16,106,127,360 |
-| `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | derived: 50% of MemTotal (1 GiB if unknown) | 16,106,127,360 |
+| `--fetch-concurrency <N>` | legacy: sets the three rows below together (source `legacy-flag`) | derived: `max(8, 2 x cores)` | 32 |
+| `--store-get-concurrency <N>` | the process-wide object-store GET ceiling, one `GetLimiter` that every fetcher and engine in the process shares | derived: `max(8, 2 x cores)` | 32 |
+| `--sql-partition-count <N>` | the SQL scan partition count, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
+| `--promql-fetch-fanout <N>` | the PromQL/analytics per-query segment fetch fan-out, per selector | derived: `max(8, 2 x cores)` | 32 |
+| `--max-segments <N>` | segments one query fans out over | fixed: 1,000,000 (host-independent) | 1,000,000 |
+| `--max-series <N>` | distinct series per query | fixed: 10,000 (host-independent) | 10,000 |
+| `--max-samples <N>` | samples per query, and the selector-cache cap derived from it | fixed: 10,000,000 (host-independent) | 10,000,000 |
+| `--sql-max-query-bytes <BYTES>` | the per-query SQL memory pool | derived: 50% of MemTotal, the tenant's share (256 MiB if unknown) | 16,106,127,360 |
+| `--sql-tenant-max-bytes <BYTES>` | the per-tenant SQL memory ceiling | derived: 50% of MemTotal (1 GiB if unknown) | 16,106,127,360 |
 
 Two combinations fail startup:
 
@@ -568,11 +592,9 @@ depends on what the operator set:
 | `--sql-max-query-bytes` above a derived or fallback tenant ceiling | The ceiling is raised to match the pool. |
 | Neither flag | The derived values already satisfy the order. |
 
-Startup logs both adjustments: `clamped` and `raised` on the resolved lines,
-plus a WARN.
-
-Startup logs every resolved value, one line per setting with its source
-(`derived`, `flag`, `fallback`, or `legacy-flag`):
+Startup logs both adjustments, `clamped` and `raised` on the resolved lines,
+plus a WARN. It logs every resolved value, one line per setting with its
+source (`derived`, `flag`, `fallback`, or `legacy-flag`):
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
@@ -582,43 +604,29 @@ INFO performance default resolved setting="promql_fetch_fanout" value=32 source=
 INFO performance default resolved setting="cache_max_bytes" value=8053063680 source="derived"
 ```
 
-The three concurrency flags set three independent values:
-
-- `--store-get-concurrency`: the process-wide object-store GET ceiling, one
-  `Arc<GetLimiter>` that every fetcher and engine in the process shares.
-- `--sql-partition-count`: the SQL scan partition count.
-- `--promql-fetch-fanout`: the PromQL/analytics per-query segment fetch
-  fan-out.
-
-`--fetch-concurrency` sets all three together, for a configuration written
-before the three flags existed.
-
 `--logs-fetch-policy latency-first` resolves these three concurrency settings
 the same way as every other policy. It is the unset policy against a loopback
-`--s3-endpoint`, where it measured faster cold than `cost-based` at the
-derived concurrency. On real S3 it pays off only after an operator raises
-them explicitly, and it has a memory caveat. Before you turn it on, read the
-fetch-policy table in
+`--s3-endpoint`. On real S3 it pays off only after you raise the three
+settings explicitly, and it has a memory caveat. Before you turn it on, read
+the fetch-policy table in
 [Operations: configuration](operations/configuration.md#logs-fetch-policy-and-store-cost-profile).
 
-`--max-segments` caps how many segments one query fans out over. Only the
-narrow recent set (`SegmentOrigin::Recent`, roughly the last couple of hours)
-is exempt. Everything older counts toward the cap, including compacted L0/L1
+`--max-segments` exempts only the narrow recent set (roughly the last couple
+of hours). Everything older counts toward the cap, including compacted L0/L1
 objects. A wide scan over a tenant with many sealed objects reaches the cap
 directly. Raise this flag for such a workload.
 
 `--sql-max-query-bytes` bounds the DataFusion memory pool of one SQL query.
 `--sql-tenant-max-bytes` bounds the memory that one tenant can hold across its
-concurrent SQL queries. It is the multi-tenant isolation ceiling. Neither
-flag counts columns a scan is served from the decoded column-block cache:
-those count against the process memory budget only. At the
+concurrent SQL queries. It is the multi-tenant isolation ceiling. At the
 derived defaults it equals the per-query pool: one statement can use the whole
-share, and a second concurrent statement gets what the first left. Both flags
-apply only in a build with the `sql` feature.
+share, and a second concurrent statement gets what the first left. Neither
+flag counts columns a scan is served from the decoded column-block cache:
+those count against the process memory budget only. Both flags apply only in
+a build with the `sql` feature.
 
-Per-tenant SQL budgets are **not** configurable in the `--limits-file`. Its
-per-tenant query overrides are not consulted at query time and are inert, so
-these ceilings are process-wide flags.
+The `--limits-file` cannot set per-tenant SQL budgets: its per-tenant query
+overrides are not consulted at query time.
 
 `max_bytes_scanned` is **not** a flag. It is a `--limits-file` entry
 (`query_defaults.max_bytes_scanned`, default Unlimited). See
@@ -626,8 +634,7 @@ these ceilings are process-wide flags.
 When you omit it, Ravel derives it from `--shards` and the flush cadence.
 
 `--gc-max-query-duration` sets the wall-clock deadline that the engine
-enforces. Unset, it is a fixed **11 minutes** on every host, the deadline that
-the published ClickBench run was configured with. It must be **`<=`** the
+enforces. Unset, it is a fixed **11 minutes** on every host. It must be **`<=`** the
 durable `sys/gc.max_query_duration` of the tenant (default 1h), which the
 derived value satisfies. Ravel **rejects a higher value at startup** with a
 hard error and does not clamp it. If you need a longer engine deadline, raise
@@ -636,11 +643,10 @@ hard error and does not clamp it. If you need a longer engine deadline, raise
 Ravel checks the catalog-list budget before it makes any object-store request:
 
 - The catalog lists one prefix per (shard, ingest hour) from the start of the
-  window to the current hour. A query whose `start` reaches far back can
-  therefore ask for hundreds of thousands of LIST requests against object
-  storage in one call. A `start` of `0` (epoch) is the usual cause.
-- Ravel refuses such a query before it can run up an object-store bill or
-  saturate the listing path.
+  window to the current hour, so a `start` far back can ask for hundreds of
+  thousands of LIST requests in one call. A `start` of `0` (epoch) is the
+  usual cause. Ravel refuses such a query before it can run up an
+  object-store bill or saturate the listing path.
 - The error reports the estimate and the limit. Narrow the time range by the
   reported factor and retry.
 - The ceiling permits roughly an 11-year window at one shard and about 8.5
@@ -671,53 +677,64 @@ FROM samples JOIN logs ON samples.ts = logs.ts
 ORDER BY samples.ts
 ```
 
-Such a query reads one snapshot per signal, with no ordering between them: it
-may see a span whose log lines are not visible yet, or the reverse. An HTTP
-retry resolves every table again; a Flight SQL `DoGet` retry reads the same
-snapshots its ticket pinned. The join runs on the server that received the
-query, under the query's one memory pool, and that pool's ceiling is
-best-effort for a join: join operators grow their memory without a check
-against the limit, so a join over budget is not guaranteed to fail with the
-memory error. `min_commit_token` on a query
-that names two or more of the five must be qualified with the table it bounds,
-`samples:<token>` or `logs:<token>`, and each token waits only for its own
-table; an unqualified one is an HTTP 400 before any catalog listing (see
-[Qualifying a token by table](#qualifying-a-token-by-table-sql)). Flight SQL
-runs such a query too, and its `DoGet` reads exactly the snapshots of every
-table that `GetFlightInfo` resolved. Its tokens are qualified the same way,
-in the `x-ravel-min-commit-token` metadata, and an unqualified one is refused
-with `INVALID_ARGUMENT` at `GetFlightInfo`. ES|QL still reads one of
-the five per query. The request body, auth, window (`start`/`end`), and
-`min_commit_token` handling are otherwise the same for all five tables.
+The request body, auth, window (`start`/`end`), and `min_commit_token`
+handling are the same for all five tables. ES|QL reads one of the five per
+query.
 
-In a query that reads two or more tables, an alias or CTE name may not be a
-table name: `FROM samples AS logs JOIN logs AS l`, `WITH logs AS (...)`
-beside another table, or a subquery aliased `logs` is an HTTP 400 (Flight
-SQL: `INVALID_ARGUMENT`) naming both names, before any catalog listing.
-Rename the alias. Aliasing a table by its own name, `FROM logs AS logs`, is
-allowed. A `LIKE` on `logs.<column>` in such a query behaves as it does in a
-query over `logs` alone, including `ESCAPE` and a non-string typed
-attribute column; a `LIKE` on a column of `logs` aliased under another name (`FROM
-logs AS l` ... `l.body LIKE ...`) uses the built-in operator, which accepts
-only the backslash escape and string operands.
+### Joins across tables
+
+A join reads one snapshot per signal, with no ordering between them: it may
+see a span whose log lines are not visible yet, or the reverse.
+
+- An HTTP retry resolves every table again. Flight SQL runs joins too, and a
+  `DoGet`, retried or not, reads exactly the snapshots of every table that
+  `GetFlightInfo` resolved.
+- The join runs on the server that received the query, under the query's one
+  memory pool. That pool's ceiling is best-effort for a join: join operators
+  grow their memory without a check against the limit, so a join over budget
+  is not guaranteed to fail with the memory error.
+- Every `min_commit_token` must be qualified with the table it bounds,
+  `samples:<token>` or `logs:<token>`, and each token waits only for its own
+  table; an unqualified one is an HTTP 400 before any catalog listing (see
+  [Qualifying a token by table](#qualifying-a-token-by-table-sql)). Flight SQL
+  qualifies its `x-ravel-min-commit-token` metadata the same way and refuses
+  an unqualified one with `INVALID_ARGUMENT` at `GetFlightInfo`.
+- An alias or CTE name may not be a table name.
+  `FROM samples AS logs JOIN logs AS l`, `WITH logs AS (...)` beside another
+  table, or a subquery aliased `logs` is an HTTP 400 (Flight SQL: `INVALID_ARGUMENT`) naming both
+  names, before any catalog listing. Rename the alias. Aliasing a table by its
+  own name, `FROM logs AS logs`, is allowed.
+- A `LIKE` on `logs.<column>` behaves as it does in a query over `logs`
+  alone, including `ESCAPE` and a non-string typed attribute column. A `LIKE`
+  on a column of `logs` aliased under another name (`FROM logs AS l` ...
+  `l.body LIKE ...`) uses the built-in operator, which accepts only the
+  backslash escape and string operands.
+
+### Parquet tables
 
 The same endpoint also serves the Parquet tables of the tenant. A query can
 join Parquet tables with each other and with any of the five, over this
 endpoint and Flight SQL. Ravel reads the Parquet manifests first, then one
-snapshot of each of the five the query names. Three checks compare the
-query's total, Parquet and signal reads together, against its budgets: the
-`max_s3_requests` check made as each of the five resolves, which counts the
-Parquet manifest reads; the Parquet reader's `max_s3_requests` and
-`max_bytes_scanned` check before each Parquet read; and the `samples` scan's
-check of both as it fetches. The `logs`, `spans`, `alerts` and `audit` scans
-check neither budget while they read, so a query over them is refused only by
-one of those three checks. A `min_commit_token` bounds the five only:
-qualified with a Parquet table's name it is an HTTP 400, and on a query that
-names only Parquet tables any token is a 400 over HTTP and `INVALID_ARGUMENT`
-over Flight SQL. A row window filters the rows of the five and leaves the
-Parquet rows whole. Beside a Parquet table, a `samples` filter on `__name__`
-does not prune segments by metric name: the `samples` scan reads every
-segment in the window.
+snapshot of each of the five the query names.
+
+Three checks compare the query's total reads, Parquet and signal together,
+against its budgets:
+
+- the `max_s3_requests` check made as each of the five resolves, which counts the Parquet manifest reads;
+- the Parquet reader's `max_s3_requests` and `max_bytes_scanned` check before each Parquet read;
+- the `samples` scan's check of both as it fetches.
+
+The `logs`, `spans`, `alerts` and `audit` scans check neither budget while
+they read, so a query over them is refused only by one of those three checks.
+
+A `min_commit_token` bounds the five only. Qualified with a Parquet table's
+name it is an HTTP 400. On a query that names only Parquet tables, any token
+is a 400 over HTTP and `INVALID_ARGUMENT` over Flight SQL.
+
+A row window filters the rows of the five and leaves the Parquet rows whole.
+Beside a Parquet table, a `samples` filter on `__name__` does not prune
+segments by metric name: the `samples` scan reads every segment in the
+window.
 
 ### Integer `sum` overflow
 
@@ -728,19 +745,24 @@ total does not fit the result type, the query fails with an HTTP 422,
 result type: the exact integer total is out of range, and no wrapped value
 is returned; cast the argument to DOUBLE for an approximate sum` (`UInt64`
 for unsigned input). Flight SQL returns the same text with
-`FAILED_PRECONDITION`. Only the final total is checked, so a total that fits
-is returned even if a running total passed the limit on the way. The check
-applies to `sum(DISTINCT ...)`, to a `FILTER` clause, and to a window
-`sum`, where each frame's total is checked. `sum(v + 1)`, `sum(1 + v)` and
-`sum(v - 1)` with an integer literal are exact too: the result is the exact
-`sum(v) + 1 * count(v)`, so over rows `9223372036854775807` and
-`-9223372036854775807` `sum(v + 1)` returns 2 even though the first row's
-`v + 1` leaves `BIGINT`, and only a total that does not fit fails. Every such term
-over one column shares one sum and count, so ninety `sum(v + k)` columns
-cost about one. With `DISTINCT`, as `sum(1 - v)`, or as a window `sum` the
-argument is still computed per row. Other arithmetic inside the argument
-is not checked: `sum(v * 2)` wraps in `v * 2` before the sum sees it. A
-`sum` over a `DOUBLE` or `DECIMAL` is unchanged. ES|QL's `STATS SUM` over a
+`FAILED_PRECONDITION`.
+
+- Only the final total is checked, so a total that fits is returned even if
+  a running total passed the limit on the way.
+- The check applies to `sum(DISTINCT ...)`, to a `FILTER` clause, and to a
+  window `sum`, where each frame's total is checked.
+- `sum(v + 1)`, `sum(1 + v)` and `sum(v - 1)` with an integer literal are
+  exact too: the result is the exact `sum(v) + 1 * count(v)`. Over rows
+  `9223372036854775807` and `-9223372036854775807`, `sum(v + 1)` returns 2
+  even though the first row's `v + 1` leaves `BIGINT`; only a total that does
+  not fit fails. Every such term over one column shares one sum and count, so
+  ninety `sum(v + k)` columns cost about one. With `DISTINCT`, as
+  `sum(1 - v)`, or as a window `sum`, the argument is still computed per row.
+- Other arithmetic inside the argument is not checked: `sum(v * 2)` wraps in
+  `v * 2` before the sum sees it.
+- A `sum` over a `DOUBLE` or `DECIMAL` is unchanged.
+
+ES|QL's `STATS SUM` over a
 long reads null on overflow instead (see [ES|QL queries](#esql-queries)).
 
 ### `DISTINCT ON`
@@ -758,58 +780,15 @@ ORDER BY series_id, ts DESC, value
 This returns the latest sample of each series. The same statement without
 the trailing `value` is refused with an HTTP 400 that names `DISTINCT ON`,
 even though `ts` is unique within a series, and so is a `DISTINCT ON` with
-no `ORDER BY`. Without that rule, two rows that tie on the `ORDER BY` could
-differ in a selected column, and which one came back would depend on how the
-data is stored rather than on the statement. When the rule holds, the result
-is the same on every run.
+no `ORDER BY`. The rule keeps the result the same on every run: without it,
+two rows that tie on the `ORDER BY` could differ in a selected column.
 
-`first_value` is not a supported aggregate or window function. Ravel uses it
-internally to answer `DISTINCT ON`, but a statement that calls it directly is
-refused with an HTTP 400.
+A statement that calls `first_value` directly, as an aggregate or a window
+function, is refused with an HTTP 400.
 
 ### Parquet table DDL
 
-The same endpoint creates and drops Parquet tables. The server routes a
-statement to the DDL path when its first keyword, after whitespace and
-comments, is `CREATE` or `DROP`, whatever comes after that keyword.
-
-A caller needs the `ddl` capability, which is absent by default. Without it,
-Ravel refuses `CREATE` and `DROP` with 403 `forbidden`. These callers hold the
-capability:
-
-- a bearer token whose tenant is written `TENANT;ddl`
-  (`--tenant-token NAME=TENANT;ddl`)
-- an OIDC token whose `--oidc-ddl-claim` claim is `true`
-
-The `LOCATION` must also lie inside a location grant recorded for the tenant.
-The server needs `--parquet-profiles PATH`, which points at the
-credential-profile file that the grant resolves against. Without that flag, no
-Parquet table is queryable at all. Grant the location with `ravel-cli`, against
-the same profile file:
-
-```sh
-ravel-cli --parquet-profiles profiles.json tenant parquet-grant add \
-  --tenant acme --location s3://lake/data/clicks/ --profile lake
-```
-
-A success is a JSON body with `outcome` (`created`, `dropped`, or `noop`) and
-the table name, even when `Accept` asks for Arrow. A `CREATE` of a table that
-already exists is a 409. A `DROP` of a missing table is a 404.
-
-The response and the per-query cost family do not carry the object-store
-requests and bytes of a DDL statement. `/metrics` reports them per phase in
-the
-[`ravel_sql_ddl_*` families](observability.md#sql-ddl-statements-and-their-store-cost-ravel_sql_ddl_).
-
-Each statement that changes a table writes its next manifest version. No
-statement writes a version above 4294967296 (2^32). Ravel refuses a statement
-that needs a higher version, with a 422 that names the table, the version and
-that bound.
-
-A version above the bound can only have been put into the bucket directly.
-Queries and DDL ignore it and keep using the newest version of the table at or
-below the bound. An operator removes it with `ravel-cli parquet repair` (see
-[repairing a forged Parquet table version](operations/maintenance.md#repairing-a-forged-parquet-table-version)).
+The same endpoint creates and drops Parquet tables:
 
 ```sh
 curl -X POST http://127.0.0.1:4318/api/v1/sql \
@@ -823,11 +802,47 @@ curl -X POST http://127.0.0.1:4318/api/v1/sql \
   -d '{"query": "DROP TABLE clicks"}'
 ```
 
-In this example the server was started with `--tenant-token devtoken=acme;ddl
---parquet-profiles profiles.json`. The `;ddl` suffix is on the tenant half of
-that mapping, not on the bearer value. `Authorization` therefore still carries
-only the plain token (`devtoken`) that the client sends. The grant and the
-token mapping of the server must agree on the same tenant (`acme` in both).
+This example's server was started with `--tenant-token devtoken=acme;ddl
+--parquet-profiles profiles.json`, and the location was granted with:
+
+```sh
+ravel-cli --parquet-profiles profiles.json tenant parquet-grant add \
+  --tenant acme --location s3://lake/data/clicks/ --profile lake
+```
+
+The `;ddl` suffix is on the tenant half of the token mapping, so
+`Authorization` still carries only the plain token (`devtoken`). The grant
+and the token mapping must agree on the same tenant (`acme` in both).
+
+What a DDL statement needs:
+
+- The `ddl` capability, which is absent by default. Without it, Ravel refuses
+  `CREATE` and `DROP` with 403 `forbidden`. A bearer token whose tenant is
+  written `TENANT;ddl` (`--tenant-token NAME=TENANT;ddl`) holds it, and so
+  does an OIDC token whose `--oidc-ddl-claim` claim is `true`.
+- A `LOCATION` inside a location grant recorded for the tenant.
+- `--parquet-profiles PATH` on the server, pointing at the credential-profile
+  file that the grant resolves against. Without that flag, no Parquet table
+  is queryable at all.
+
+The server routes a statement to the DDL path when its first keyword, after
+whitespace and comments, is `CREATE` or `DROP`, whatever comes after that
+keyword. A success is a JSON body with `outcome` (`created`, `dropped`, or
+`noop`) and the table name, even when `Accept` asks for Arrow. A `CREATE` of
+a table that already exists is a 409. A `DROP` of a missing table is a 404.
+
+The response and the per-query cost family do not carry the object-store
+requests and bytes of a DDL statement. `/metrics` reports them per phase in
+the
+[`ravel_sql_ddl_*` families](observability.md#sql-ddl-statements-and-their-store-cost-ravel_sql_ddl_).
+
+Each statement that changes a table writes its next manifest version. No
+statement writes a version above 4294967296 (2^32): Ravel refuses a statement
+that needs one with a 422 that names the table, the version and that bound.
+A version above the bound can only have been put into the bucket directly.
+Queries and DDL ignore it and keep using the newest version at or below the
+bound. An operator removes it with `ravel-cli parquet repair` (see
+[repairing a forged Parquet table version](operations/maintenance.md#repairing-a-forged-parquet-table-version)).
 
 ### The `samples` table
 
@@ -846,20 +861,14 @@ rows in `samples` and no query over it can see them**:
 Query native histograms through PromQL, which has a full histogram model. Do
 not reconcile a totals count against SQL.
 
-A statement whose scan met histogram data and excluded it says so. The JSON
-response carries a top-level `warnings` array of strings beside `status`,
-`data`, and `stats`. The shape and the omit-when-empty rule are the same as on
-the PromQL endpoints. A response with no `warnings` key is a complete answer
-over what the table can represent.
-
-Two cases carry no warning even though the exclusion applies:
-
-- An Arrow IPC response (`Accept: application/vnd.apache.arrow.stream`). It is
-  a bare columnar payload with nowhere to put a warning.
-- Flight SQL, which has no such envelope either.
-
-A client on those encodings must assume that the exclusion applies to its
-tenant.
+A JSON response whose scan met histogram data and excluded it says so in a
+top-level `warnings` array of strings beside `status`, `data`, and `stats`,
+with the same shape and omit-when-empty rule as on the PromQL endpoints. A
+response with no `warnings` key is a complete answer over what the table can
+represent. An Arrow IPC response
+(`Accept: application/vnd.apache.arrow.stream`) and Flight SQL have no
+envelope to carry the warning, so a client on those encodings must assume
+that the exclusion applies to its tenant.
 
 ```json
 {
@@ -965,17 +974,17 @@ no slower than the equivalent `attrs['k']` filter:
   digits>'`, also probe the exact-key index of each object when the tenant
   indexes the field (see
   [exact-key index fields](operations/configuration.md#exact-key-index-fields)).
-  The probe reads the index's prefix once and at most one small bucket per
-  key. An object that does not hold the value is dropped after those reads,
-  and an object that does reads only the blocks holding it. This reads fewer
-  bytes, but possibly more requests: every probed object pays those index
-  reads whether or not it holds the value. Equalities joined by `AND` narrow
-  together; an `OR`, a negation, and a column inside an expression
-  (`status_code + 0 = 500`) do not probe. An equality on a column the tenant
-  does not index issues no index read. The response reports the dropped
-  objects in `stats.pruning.segmentsPrunedByKeyIndex`, the dropped blocks in
-  `stats.pruning.blocksPrunedByKeyIndex`, and the index reads under the
-  `keyIndex` entry of `stats.phases`.
+
+The exact-key probe reads the index's prefix once and at most one small
+bucket per key. An object that does not hold the value is dropped after those
+reads, and an object that does reads only the blocks holding it. This reads
+fewer bytes, but possibly more requests, since every probed object pays those
+index reads. Equalities joined by `AND` narrow together. An `OR`, a negation,
+a column inside an expression (`status_code + 0 = 500`), and a column the
+tenant does not index issue no index read. The response reports the dropped
+objects in `stats.pruning.segmentsPrunedByKeyIndex`, the dropped blocks in
+`stats.pruning.blocksPrunedByKeyIndex`, and the index reads under the
+`keyIndex` entry of `stats.phases`.
 
 Pruning is always widen-only, because Ravel applies the original predicate
 again above the scan. The coarser range of the `IN` envelope and any
@@ -1024,15 +1033,14 @@ entry into a typed attribute column of the same-named type (`str`/`i64`/`bool`/
   is written.
 - A key that starts with `__ravel_` (case-sensitive) is rejected, and
   nothing is written. That prefix is reserved for Ravel's own synthetic
-  columns. A tenant record stored before this rule keeps the `__ravel_` keys
-  it already declares.
+  columns. A stored tenant record that already declares `__ravel_` keys
+  keeps them.
 
 **Queries do not see a new declaration instantly.** A `set` is durable at
-once. A query-serving process resolves the durable declaration behind a
-**staleness horizon** (60s by default). A query can keep using the previous
-declaration until the server refreshes within that horizon. No restart is
-needed. Wait for the horizon to pass before you assert that a new declaration
-reads as a typed attribute column.
+once, but a query-serving process resolves it behind a **staleness horizon**
+(60s by default) and can keep using the previous declaration until then. No
+restart is needed. Wait for the horizon to pass before you assert that a new
+declaration reads as a typed attribute column.
 
 An attribute that overflowed the dynamic-column budget of the load (see
 [ingest.md](ingest.md#the-dynamic-column-budget-and-its-warnings)) stays
@@ -1074,14 +1082,12 @@ curl -X POST http://127.0.0.1:4318/api/v1/sql \
   -d '{"query": "SELECT ts, body FROM logs WHERE attrs['\''service.name'\''] = '\''api'\'' ORDER BY ts"}'
 ```
 
-The `attrs` column merges three sources of attributes into one map. The
-sources are the resource, the scope, and the log record. If more than one
-source sets the same key, the value from the record wins.
+The `attrs` column merges the resource, scope, and log record attributes into
+one map; when more than one sets the same key, the record's value wins. A key
+that no record carries returns zero rows, not an error.
 
-A key that no record carries returns zero rows. It is not an error.
-
-Attribute equality does not change which objects Ravel reads. The `ts` range
-selects them. Inside an object, pruning works as follows:
+The `ts` range selects which objects Ravel reads; attribute equality does not
+change that. Inside an object:
 
 - An equality on an indexed field or a typed attribute column prunes blocks
   through the POSTINGS index before decode.
@@ -1113,11 +1119,8 @@ A trace id is a 32-character hex string or a 16-byte binary literal
 type: integers for an `i64` column, strings for a `str` column, binary
 literals for a `bytes` column.
 
-These lists still return the right rows but use no key, so Ravel reads the
-time window's objects without the key index. An `IN` list (not `NOT IN`) on
-a declared `i64` column, outside an `OR`, still skips the blocks whose values
-all fall outside the list's smallest-to-largest range, as a range comparison
-does; the other lists read those objects in full:
+These lists return the right rows but use no key, so Ravel reads the time
+window's objects without the key index:
 
 - a list of more than 1,024 distinct values;
 - `NOT IN`, a list mixing types, or a list holding `NULL` or an expression;
@@ -1130,6 +1133,11 @@ joined by `OR`, and Ravel reads those comparisons as the list. Writing the
 mixes columns, compares with anything but `=`, or holds a value the list
 would refuse uses no key. One value becomes a plain `=`, which also uses
 the key.
+
+Of these, an `IN` list (not `NOT IN`) on a declared `i64` column, outside an
+`OR`, still skips the blocks whose values all fall outside the list's
+smallest-to-largest range, as a range comparison does. The other lists read
+those objects in full.
 
 A list beside a second key comparison, such as
 `user_id IN (...) AND user_id = 7`, uses both keys inside each object but
@@ -1171,9 +1179,9 @@ The server registers both functions for a query only when all four hold:
   (the default), or `--audit-text redacted`. Under `--audit-text plaintext`
   the address in the call would be written to the audit table as typed.
 
-Otherwise a call is refused exactly as a call to a function that does not
-exist: on `POST /api/v1/sql`, HTTP 422 with the same planning error, and on
-every other surface, the unknown-function error that surface returns.
+Otherwise a call is refused like a call to an unknown function: on
+`POST /api/v1/sql`, HTTP 422 with the same planning error, and on every
+other surface, the unknown-function error that surface returns.
 
 Take the variant and the epoch from the rule in the policy file. A query
 server does not read that file, so the epoch has no default: pass the rule's
@@ -1202,12 +1210,12 @@ curl -X POST http://127.0.0.1:4318/api/v1/sql \
 
 ### At-least-once rows
 
-Log rows are at-least-once, and a `SELECT` (or `COUNT(*)`) reflects that. A
-client retry after a lost ack ingests the batch again. Logs have no query-time
-dedup, unlike metrics, so the query returns the retried rows as extra rows. A
-`COUNT` over logs is therefore a lower-bounded count, not an exact one, for
-any window that a retry can have touched. The same terms apply to span rows
-in the `spans` table on the same endpoint.
+Log rows are at-least-once. A client retry after a lost ack ingests the batch
+again, and logs have no query-time dedup, unlike metrics, so a `SELECT` or
+`COUNT(*)` returns the retried rows as extra rows. A `COUNT` over logs is
+therefore a lower-bounded count, not an exact one, for any window that a
+retry can have touched. The same terms apply to span rows in the `spans`
+table.
 
 The `x-ravel-idempotency-key` suppresses this for keyed sequential retries.
 Unkeyed ingest gets plain at-least-once. See
@@ -1222,6 +1230,8 @@ published image does not carry; build `ravel-server` with
 `--features esql` to get it. The request, response and status codes are in
 the [HTTP API reference](../reference/http-api.md#apiv1esql).
 
+A statement that counts errors per service in 5-minute buckets:
+
 ```esql
 FROM logs
 | WHERE @timestamp >= NOW() - 1 hour
@@ -1230,7 +1240,7 @@ FROM logs
 | SORT window ASC, service.name ASC
 ```
 
-What runs today:
+The supported language:
 
 - Source commands: `FROM logs` and `ROW`. `ROW` reads nothing from storage.
 - Processing commands: `WHERE`, `EVAL`, `KEEP`, `DROP`, `RENAME`,
@@ -1262,8 +1272,9 @@ Field names map onto the `logs` table this way:
   attributes with the record's value winning, as a `keyword`. A row without the key reads null. After a `KEEP` or a `STATS`,
   only the columns it kept or produced resolve.
 
-The time window. The statement's own `@timestamp` bounds choose the
-segments read: the `WHERE` conditions joined by `AND` ahead of the first
+### ES|QL time window
+
+The statement's own `@timestamp` bounds choose the segments read: the `WHERE` conditions joined by `AND` ahead of the first
 `LIMIT`, `STATS`, or stage that redefines `@timestamp`, compared against a
 date constant such as `NOW() - 1 hour`. The request's `start` and `end`
 narrow that window. The window is a row filter too, so the bounds it fills
@@ -1278,8 +1289,9 @@ in when the statement gives none also filter rows:
   retention, and the catalog list request budget can refuse it with 422
   (`query window too wide`).
 
-Row limits. A statement that does not end in its own `LIMIT` returns at most
-1,000 rows. A final `LIMIT` above 10,000 runs as `LIMIT 10000`, and the
+### ES|QL row limits
+
+A statement that does not end in its own `LIMIT` returns at most 1,000 rows. A final `LIMIT` above 10,000 runs as `LIMIT 10000`, and the
 response's `warnings` says so. A `LIMIT` before a later stage limits that
 stage's input, so it changes the answer:
 
@@ -1291,6 +1303,8 @@ FROM logs
 ```
 
 counts the errors among the latest 100 rows, not all errors.
+
+### ES|QL refusals and audit
 
 Everything else is refused with a typed 400 before the statement runs: `LIKE`
 and `RLIKE`, casts, other functions such as `TO_UPPER`, calendar intervals
@@ -1335,10 +1349,59 @@ the modes that evaluate it, and the sinks are in the
 | 403 | `forbidden` | A SQL `CREATE` or `DROP` from a caller without the `ddl` capability. |
 | 404 | `not_found` | A plain `DROP TABLE` naming a missing table. |
 | 409 | `conflict` | A plain `CREATE EXTERNAL TABLE` naming a table that already exists. |
-| 422 | `execution` | A well-formed DDL statement the tenant cannot serve, such as a `LOCATION` outside its grants, or an intentionally rejected PromQL construct (the set listed under PromQL support: `histogram_stddev`/`histogram_stdvar` over native histograms, an or-grouped label matcher, vector-matching fill values, a subquery over native histograms, or the experimental `limitk`/`limit_ratio` operators), or a query budget (segments/series/samples, bytes scanned, object-store requests, the catalog-list window ceiling, or the SQL memory pool) exceeded, or a process memory budget refusal of a segment fetch or a catalog decode, on PromQL and SQL alike: the message is the budget's own, naming either the bytes requested against the ledger's limit or the host's available memory against the gate's floor. Also a stored data object (RSEG, RLOG or RSPAN) whose format version is outside this build's reader window and whose bytes match the content hash recorded for it: the message is `stored object version N is outside this build's reader window; it needs migration`, and the object key is logged server-side only. One lane does not give this answer yet: a Flight SQL statement served by the distributed fan-out (`--distributed-query`) reports a worker's refusal of such an object as an internal error when the commit record declares a version inside the window and only the object's trailer does not. |
-| 500 | `internal` | Permanent data corruption: a corrupt catalog record, segment, field, or key (including a data object whose trailer names an out-of-window version but whose bytes do not match their recorded content hash), a catalog object (commit, compaction or rewrite record, erasure request, HEAD, snapshot part or postings) whose stored bytes fail to decode at a format version this build covers, carry a format version below the lowest it supports, or leave an enum field unset (proto3's default 0) where a value is required, an erasure request or rewrite record naming a signal this build does not know, a provisioning record that fails to decode, is misfiled, carries a corrupt shard-generation or format-floor history, or carries a format version below the lowest this build supports, a supersession chain of compaction or rewrite records that is cyclic, deeper than the resolver's fixed bound, or names a predecessor with a different input set, or a non-monotonic sample sequence. The message is a fixed internal-error string; the storage-layer detail is redacted and logged server-side. |
-| 503 | `unavailable` | Transient catalog or segment fetch failure, a catalog object (commit, compaction or rewrite record, erasure request, HEAD, snapshot part or postings) written in a format version above the highest this build reads, or carrying an enum value above the highest it reads (a snapshot part entry level), which a peer on a newer build can read during a rolling upgrade, a provisioning record written in a format version above the highest this build reads, an unresolvable `min_commit_token`, or a snapshot invalidated by concurrent GC/compaction. A checksum mismatch on a catalog or segment read answers 500, not 503, and a memory budget refusal of a segment fetch or a catalog decode answers 422, not 503 (the DDL footer-read refusal still answers 503). A decode job for a catalog snapshot part, postings or column-statistics object that panics, or that the read CPU gate cancels at shutdown, answers no error: the query still answers exactly, by a slower path. |
+| 422 | `execution` | The query cannot be served as written, or a budget refused it. See below. |
+| 500 | `internal` | Permanent data corruption in stored objects. Not retryable. See below. |
+| 503 | `unavailable` | A transient fault. Retryable. See below. |
 | 504 | `timeout` | Query exceeded its deadline. |
+
+A 422 is one of these:
+
+- A well-formed DDL statement the tenant cannot serve, such as a `LOCATION`
+  outside its grants.
+- An intentionally rejected PromQL construct (the set listed under
+  [PromQL support](#promql-support): `histogram_stddev`/`histogram_stdvar`
+  over native histograms, an or-grouped label matcher, vector-matching fill
+  values, a subquery over native histograms, or the experimental
+  `limitk`/`limit_ratio` operators).
+- A query budget exceeded: segments/series/samples, bytes scanned,
+  object-store requests, the catalog-list window ceiling, or the SQL memory
+  pool.
+- A process memory budget refusal of a segment fetch or a catalog decode, on
+  PromQL and SQL alike. The message is the budget's own, naming either the
+  bytes requested against the ledger's limit or the host's available memory
+  against the gate's floor.
+- A stored data object (RSEG, RLOG or RSPAN) whose format version is outside
+  this build's reader window and whose bytes match the content hash recorded
+  for it. The message is
+  `stored object version N is outside this build's reader window; it needs migration`,
+  and the object key is logged
+  server-side only. The exception: a Flight SQL statement served by the
+  distributed fan-out (`--distributed-query`) reports a worker's refusal of
+  such an object as an internal error when the commit record declares a
+  version inside the window and only the object's trailer does not.
+
+A 500 covers a corrupt catalog record, segment, field, or key, including a
+data object whose trailer names an out-of-window version but whose bytes do
+not match their recorded content hash, and a non-monotonic sample sequence.
+It also covers catalog, erasure, rewrite, provisioning and supersession
+records that fail to decode or break their format rules; the
+[HTTP API reference](../reference/http-api.md#query-status-codes) lists each.
+The message is a fixed internal-error string; the storage-layer detail is
+redacted and logged server-side.
+
+A 503 covers a transient catalog or segment fetch failure, an unresolvable
+`min_commit_token`, a snapshot invalidated by concurrent GC/compaction, and
+a catalog object or provisioning record written in a format version above
+the highest this build reads, which a peer on a newer build can read during
+a rolling upgrade (the reference lists each). Three nearby faults answer
+otherwise:
+
+- A checksum mismatch on a catalog or segment read answers 500.
+- A memory budget refusal of a segment fetch or a catalog decode answers 422
+  (the DDL footer-read refusal still answers 503).
+- A decode job for a catalog snapshot part, postings or column-statistics
+  object that panics, or that the read CPU gate cancels at shutdown, answers
+  no error: the query still answers exactly, by a slower path.
 
 ## Background
 
