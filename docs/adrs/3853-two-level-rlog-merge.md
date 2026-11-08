@@ -627,10 +627,9 @@ each, here and in level 2's own check below). When no count does, the unit
 is refused before level 1
 reads a block, with the check `PredictedLevelTwoFit` and its figures at one
 worker, the count with the largest groups and so the fewest run parts.
-The core share is the usable cores
-divided by the units `merge_cursor_budget_bytes` runs at once
-(`budget / U`), at least 1; the core share amendment states that count
-explicitly. `CompactorConfig::level1_workers` names `W1`
+The core share was derived as the usable cores
+over `budget / U`; the core share amendment replaces that with the stated
+`unit_concurrency`. `CompactorConfig::level1_workers` names `W1`
 outright, wins over the derivation and skips that prediction. Either way
 level 2 checks (b) again against the run parts level 1 actually wrote,
 which the prediction prices from the inputs and can overstate. Each worker
@@ -796,6 +795,7 @@ removes the orphan from disk, and that process starts with no charges.
 ## Amendment (2026-11-08): the unit's core share is stated, not inferred (#3934)
 
 <!-- amendment-applies: sections="D4. Parallel groups|Amendment (2026-11-06): parallel level-1 workers and a derived encode depth (#3873)" pointer="core share amendment" -->
+<!-- amendment-supersedes: phrase="The core share is the usable cores" pointer="core share amendment" -->
 
 The #3873 amendment derives the core share as the usable cores divided by
 the units `merge_cursor_budget_bytes` runs at once, the budget over the
