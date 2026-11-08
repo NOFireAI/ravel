@@ -1581,6 +1581,55 @@ mod tests {
     }
 
     #[test]
+    fn stats_json_carries_one_label_index_value_per_routed_value() {
+        let value_figures = crate::key_index_route::ValueRouteFigures {
+            labels: vec!["env".to_string(), "job".to_string()],
+            key8_hex: "0123456789abcdef".to_string(),
+            figures: crate::key_index_route::RouteFigures {
+                keys_probed: 1,
+                parts_covered: 3,
+                parts_uncovered: 4,
+                parts_beyond_ceiling: 5,
+                leaves_rejected: 6,
+                reservations_refused: 7,
+                leaf_get_requests: 8,
+                leaf_wire_bytes: 9,
+                leaf_cache_hits: 10,
+                skipped_by_budget: 11,
+            },
+            segments_pruned: 12,
+            segments_pruned_alone: 2,
+        };
+        let stats = crate::QueryStats {
+            label_index_values: vec![value_figures],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(QueryStatsJson::from(stats)).expect("serializes");
+        assert_eq!(
+            value["labelIndexValues"],
+            serde_json::json!([{
+                "labels": ["env", "job"],
+                "valueKey8": "0123456789abcdef",
+                "leafGetRequests": 8,
+                "leafWireBytes": 9,
+                "leafCacheHits": 10,
+                "partsCovered": 3,
+                "partsUncovered": 4,
+                "partsBeyondCeiling": 5,
+                "leavesRejected": 6,
+                "reservationsRefused": 7,
+                "skippedByBudget": 11,
+                "segmentsPruned": 12,
+                "segmentsPrunedAlone": 2,
+            }])
+        );
+
+        let value =
+            serde_json::to_value(QueryStatsJson::from(crate::QueryStats::default())).expect("json");
+        assert!(value.get("labelIndexValues").is_none());
+    }
+
+    #[test]
     fn stats_json_carries_io_shape_with_every_figure_exactly_once() {
         // ACCEPTANCE TEST (issue #1214). `io` sits beside `phases` in the
         // stats object and must carry every `QueryIoShape` figure exactly

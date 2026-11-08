@@ -1723,3 +1723,158 @@ fn the_route_future_is_send() {
         }
     );
 }
+
+fn value_input<'a>(
+    fx: &'a Fixture,
+    accounting: &'a PhaseAccounting,
+    reader: &'a dyn LeafRangeReader,
+    budget: &'a dyn LeafDecodeBudget,
+) -> ValueRouteInput<'a> {
+    ValueRouteInput {
+        catalog: &fx.catalog,
+        snapshot: &fx.snapshot,
+        parts: &fx.parts,
+        signal: SIGNAL,
+        tenant_hash: TENANT,
+        field: FIELD,
+        accounting,
+        reader,
+        budget,
+        limits: KeyIndexLeafLimits::default(),
+        concurrency: 2,
+    }
+}
+
+#[tokio::test]
+async fn each_routed_value_reports_its_own_pass_and_what_it_alone_pruned() {
+    // value-1 is missing only from segment 3; value-2 is missing from
+    // segments 1, 2 and 3. Segment 3 is pruned by both values, so only
+    // segments 1 and 2 are value-2's alone.
+    let spec = PartSpec::simple(vec![
+        rows(&[(1, &[0]), (2, &[1])]),
+        rows(&[(1, &[0])]),
+        rows(&[(1, &[2])]),
+        rows(&[(3, &[0])]),
+    ]);
+    let fx = fixture(&[spec], &[], KeyType::Str).await;
+    let accounting = PhaseAccounting::new();
+    let reader = CountingReader::new(fx.store.clone());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let totals = RouteTotals::new();
+    let plans = vec![vec![
+        ("__name__", "value-1"),
+        ("job", "value-2"),
+        ("env", "value-2"),
+    ]];
+    let routing = route_values_under(
+        value_input(&fx, &accounting, &reader, &budget),
+        &plans,
+        UNBOUNDED,
+        &totals,
+    )
+    .await
+    .expect("route");
+
+    assert_eq!(
+        routing.plan_keeps,
+        vec![Some(vec![true, false, false, false])]
+    );
+    assert_eq!(routing.values.len(), 2);
+    let (first, second) = (&routing.values[0], &routing.values[1]);
+    assert_eq!(first.labels, vec!["__name__".to_string()]);
+    assert_eq!(second.labels, vec!["env".to_string(), "job".to_string()]);
+    assert_eq!(first.key8_hex, hex::encode(key8_str("value-1")));
+    assert_eq!(second.key8_hex, hex::encode(key8_str("value-2")));
+    assert_eq!(first.key8_hex.len(), 16);
+    assert_eq!((first.segments_pruned, second.segments_pruned), (1, 3));
+    assert_eq!(
+        (first.segments_pruned_alone, second.segments_pruned_alone),
+        (0, 2)
+    );
+    for value in &routing.values {
+        assert_eq!(value.figures.keys_probed, 1);
+        assert_eq!(value.figures.parts_covered, 1);
+        assert!(value.figures.leaf_get_requests > 0);
+    }
+
+    let key_index = accounting.key_index().snapshot();
+    let leaf_gets: u64 = routing
+        .values
+        .iter()
+        .map(|v| v.figures.leaf_get_requests)
+        .sum();
+    let leaf_bytes: u64 = routing
+        .values
+        .iter()
+        .map(|v| v.figures.leaf_wire_bytes)
+        .sum();
+    assert_eq!(leaf_gets, key_index.s3_requests(AccountedOp::Get));
+    assert_eq!(leaf_gets, key_index.total_s3_requests());
+    assert_eq!(leaf_gets, reader.calls.load(Ordering::Relaxed));
+    assert_eq!(leaf_bytes, key_index.s3_bytes(AccountedOp::Get));
+}
+
+#[tokio::test]
+async fn a_route_that_did_not_run_reports_no_value() {
+    let mut spec = PartSpec::simple(vec![rows(&[(1, &[0])]), rows(&[(2, &[0])])]);
+    spec.leaf = LeafKind::OtherField;
+    let fx = fixture(&[spec], &[], KeyType::Str).await;
+    let accounting = PhaseAccounting::new();
+    let reader = CountingReader::new(fx.store.clone());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let totals = RouteTotals::new();
+    let plans = vec![vec![("__name__", "value-1")]];
+    let routing = route_values_under(
+        value_input(&fx, &accounting, &reader, &budget),
+        &plans,
+        UNBOUNDED,
+        &totals,
+    )
+    .await
+    .expect("route");
+    assert_eq!(routing, ValueRouting::unrouted(1));
+    assert!(routing.values.is_empty());
+    assert_eq!(reader.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(accounting.key_index().snapshot().total_s3_requests(), 0);
+}
+
+/// Reports every leaf read as a cache hit, then reads it from the store.
+struct CacheHitReader(StoreLeafReader);
+
+impl LeafRangeReader for CacheHitReader {
+    fn read_range<'a>(
+        &'a self,
+        leaf: &'a SnapshotKeyIndexLeafRef,
+        range: Range<u64>,
+        accounting: &'a QueryAccounting,
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
+        accounting.record_cache_hit();
+        self.0.read_range(leaf, range, accounting)
+    }
+}
+
+#[tokio::test]
+async fn a_passes_leaf_cache_hits_reach_its_figures() {
+    let fx = fixture(
+        &[PartSpec::simple(vec![rows(&[(1, &[0])])])],
+        &[],
+        KeyType::Str,
+    )
+    .await;
+    let accounting = PhaseAccounting::new();
+    let reader = CacheHitReader(StoreLeafReader::new(fx.store.clone()));
+    let budget = ThresholdBudget::new(u64::MAX);
+    let totals = RouteTotals::new();
+    let plans = vec![vec![("__name__", "value-1")]];
+    let routing = route_values_under(
+        value_input(&fx, &accounting, &reader, &budget),
+        &plans,
+        UNBOUNDED,
+        &totals,
+    )
+    .await
+    .expect("route");
+    let figures = &routing.values[0].figures;
+    assert!(figures.leaf_get_requests > 0);
+    assert_eq!(figures.leaf_cache_hits, figures.leaf_get_requests);
+}
