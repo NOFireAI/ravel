@@ -51,8 +51,8 @@ use crate::metrics_correctness::{
     Classified, ClassifyError, Denominators, Engine, EntryExpectation, OracleAnswer, classify,
 };
 use crate::metrics_ingest::{
-    IN_PROCESS_SYSTEM, MetricsIngestReport, PayloadClass, check_row_accounting, check_row_band6,
-    workload_digest,
+    IN_PROCESS_SYSTEM, MetricsIngestReport, PayloadClass, SystemIngestResult, check_row_accounting,
+    check_row_band6, workload_digest,
 };
 use crate::metrics_workload::{FamilyKind, Profile, WorkloadFile};
 use crate::promql_corpus::{CorpusEntry, EvalKind};
@@ -437,6 +437,26 @@ fn bound_run<'w>(
     Ok((run, profile))
 }
 
+/// The `min_commit_token` values the Ravel query lane passes for an ingest
+/// `row`: one per shard from `commit_tokens_by_shard`, else
+/// `last_commit_token` split on commas, blank values dropped.
+pub fn min_commit_tokens(row: &SystemIngestResult) -> Vec<String> {
+    let tokens: Vec<String> = match &row.commit_tokens_by_shard {
+        Some(by_shard) => by_shard.values().cloned().collect(),
+        None => row
+            .last_commit_token
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::to_string)
+            .collect(),
+    };
+    tokens
+        .into_iter()
+        .filter(|t| !t.trim().is_empty())
+        .collect()
+}
+
 /// The run `ingest` records and the grid every entry of a query run over it
 /// evaluates on, checked against `workload` as [`bind`] checks it, without
 /// binding any engine.
@@ -592,19 +612,8 @@ fn bind_rows(
                 })?),
             };
         let extra_params = if spec.engine == Engine::Ravel {
-            let tokens: Vec<String> = match &row.commit_tokens_by_shard {
-                Some(by_shard) => by_shard.values().cloned().collect(),
-                None => row
-                    .last_commit_token
-                    .as_deref()
-                    .unwrap_or_default()
-                    .split(',')
-                    .map(str::to_string)
-                    .collect(),
-            };
-            let params: Vec<(String, String)> = tokens
+            let params: Vec<(String, String)> = min_commit_tokens(row)
                 .into_iter()
-                .filter(|t| !t.trim().is_empty())
                 .map(|t| (MIN_COMMIT_TOKEN_PARAM.to_string(), t))
                 .collect();
             if params.is_empty() {
