@@ -1780,8 +1780,9 @@ async fn the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry(
 /// unbounded default, and the retry fails with "query memory pool spill
 /// threshold reached: SingleHashAggregateStream[0] would hold 4628510 bytes
 /// charged and enveloped, over its fair share 4501595 of the spill-mode cap
-/// 9003190": the outer aggregate's replay, behind a merge that seated a
-/// buffer for every run, grows past its share with no spill to fall back on.
+/// 9003190": with the merge free to seat a buffer for every run, the
+/// aggregate replaying them grows past its share with no spill to fall back
+/// on.
 #[tokio::test]
 async fn the_clickbench_row_14_shape_replays_its_spill_within_a_70_percent_cap() {
     row_14_answers_on_the_retry(ROW_14_REPLAY_CAP_PERCENT).await;
