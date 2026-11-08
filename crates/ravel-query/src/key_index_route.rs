@@ -17,6 +17,11 @@
 //! has run, the GETs it did not issue go back to the budget and the first
 //! part that did not fit is evaluated again. Parts left over are
 //! [`SegmentRoute::Uncovered`], never sent to a scan.
+//!
+//! The ceiling bounds one routing pass, one [`route`] call. [`route_values`]
+//! runs one pass per distinct value, so the metrics label-value route issues
+//! up to the ceiling once per distinct positive equality value of the
+//! statement.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -115,9 +120,9 @@ pub enum SegmentRoute {
 }
 
 /// The router's figures (ADR-3692 decision 7's `stats.keyIndex`, snake_case,
-/// plus `leaf_wire_bytes` and `skipped_by_budget`). Every part with at
-/// least one segment in the snapshot counts in exactly one of the six part
-/// outcomes.
+/// plus `leaf_wire_bytes`, `leaf_cache_hits` and `skipped_by_budget`).
+/// Every part with at least one segment in the snapshot counts in exactly one
+/// of the six part outcomes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RouteFigures {
     /// Parts whose leaves answered the whole key set.
@@ -134,6 +139,10 @@ pub struct RouteFigures {
     pub leaf_get_requests: u64,
     /// Wire bytes of those GETs.
     pub leaf_wire_bytes: u64,
+    /// Leaf reads the reader's cache served with no GET. A read handed
+    /// another caller's in-flight GET counts neither here nor in
+    /// `leaf_get_requests`.
+    pub leaf_cache_hits: u64,
     /// The key set's size.
     pub keys_probed: u64,
     /// Parts whose bridged bucket read exceeded `entry_count x T1_BYTES`.
@@ -275,8 +284,9 @@ pub enum RouteError {
     InvalidInput(String),
 }
 
-/// The admission bounds. [`route`] uses the ADR constants; tests use smaller
-/// ones.
+/// The admission bounds of one routing pass. [`route`] uses the ADR
+/// constants; tests use smaller ones. `KEY_INDEX_LEAF_GET_CEILING` is a
+/// per-pass bound: a statement that routes n values runs n passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ceiling {
     leaf_gets: u64,
@@ -430,6 +440,219 @@ pub async fn route_with_max_parts(
     route_under(input, ceiling, &ROUTE_TOTALS).await
 }
 
+/// Everything a per-value routing run reads: [`RouteInput`] with the field
+/// in place of a key set, since each value is routed as its own one-key set.
+pub struct ValueRouteInput<'a> {
+    pub catalog: &'a Catalog,
+    pub snapshot: &'a Snapshot,
+    /// From the same `resolve_pruned_with_parts` call as `snapshot`.
+    pub parts: &'a SnapshotParts,
+    pub signal: Signal,
+    pub tenant_hash: TenantHash,
+    /// The `Str` leaf field every value is routed on.
+    pub field: &'a str,
+    pub accounting: &'a PhaseAccounting,
+    pub reader: &'a dyn LeafRangeReader,
+    pub budget: &'a dyn LeafDecodeBudget,
+    pub limits: KeyIndexLeafLimits,
+    /// The most passes in flight at once.
+    pub concurrency: usize,
+}
+
+/// One distinct value's routing pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueRouteFigures {
+    /// The label names of the positive equalities carrying the value, sorted
+    /// and distinct. One pass serves them all.
+    pub labels: Vec<String>,
+    /// The value's `key8` (the first 8 bytes of its unkeyed blake3, what the
+    /// leaf indexes) as 16 lowercase hex digits, so stats never carry the
+    /// raw value.
+    pub key8_hex: String,
+    /// The pass's own figures.
+    pub figures: RouteFigures,
+    /// Segments the pass routed [`SegmentRoute::Pruned`].
+    pub segments_pruned: u64,
+    /// Of those, the segments for which some plan holding this value has no
+    /// other value that routed them `Pruned`: what this pass alone removed
+    /// from that plan.
+    pub segments_pruned_alone: u64,
+}
+
+/// What [`route_values`] decided for each plan, and each pass's figures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueRouting {
+    /// Per plan, `Some(keep)` parallel to the snapshot's segments when the
+    /// plan was routed, `None` when it reads every segment.
+    pub plan_keeps: Vec<Option<Vec<bool>>>,
+    /// One entry per routed value, in the order the passes were issued (the
+    /// values' byte order). Empty when nothing was routed.
+    pub values: Vec<ValueRouteFigures>,
+}
+
+impl ValueRouting {
+    /// `plans` plans that each read every segment, and no pass.
+    pub fn unrouted(plans: usize) -> Self {
+        ValueRouting {
+            plan_keeps: vec![None; plans],
+            values: Vec::new(),
+        }
+    }
+}
+
+/// Routes each distinct value of `plans` (each plan's positive equality
+/// `(label, value)` pairs) as its own one-key `Str` set on `input.field`, at
+/// most `input.concurrency` passes at a time. A plan drops a segment when any
+/// of its values routes it [`SegmentRoute::Pruned`]: the values are a
+/// conjunction. A plan with no value is not routed. Nothing is routed, and
+/// no leaf is read, while the snapshot carries a pending erasure or when no
+/// part a snapshot segment comes from has a leaf for `input.field`.
+pub async fn route_values(
+    input: ValueRouteInput<'_>,
+    plans: &[Vec<(&str, &str)>],
+) -> Result<ValueRouting, RouteError> {
+    route_values_under(input, plans, ADR_CEILING, &ROUTE_TOTALS).await
+}
+
+async fn route_values_under(
+    input: ValueRouteInput<'_>,
+    plans: &[Vec<(&str, &str)>],
+    ceiling: Ceiling,
+    totals: &RouteTotals,
+) -> Result<ValueRouting, RouteError> {
+    let snapshot = input.snapshot;
+    let parts = input.parts;
+    if !snapshot.pending_erasure.is_empty() || snapshot.segments.is_empty() {
+        return Ok(ValueRouting::unrouted(plans.len()));
+    }
+    let has_leaf = parts.origin.iter().flatten().any(|origin| {
+        parts
+            .parts
+            .get(origin.part as usize)
+            .is_some_and(|part| part.key_index.iter().any(|leaf| leaf.field == input.field))
+    });
+    if !has_leaf {
+        return Ok(ValueRouting::unrouted(plans.len()));
+    }
+    let mut labels_by_value: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (label, value) in plans.iter().flatten() {
+        labels_by_value.entry(*value).or_default().insert(*label);
+    }
+    if labels_by_value.is_empty() {
+        return Ok(ValueRouting::unrouted(plans.len()));
+    }
+    let key_sets: Vec<(&str, KeySet)> = labels_by_value
+        .keys()
+        .filter_map(|value| {
+            KeySet::new(
+                input.field,
+                KeyType::Str,
+                vec![ravel_codec::key_idx::key8_str(value)],
+            )
+            .ok()
+            .map(|set| (*value, set))
+        })
+        .collect();
+    // The passes are built before the stream, not inside a `.map` closure on
+    // it: a closure there fails axum's higher-ranked `Send` bound on the
+    // handler future.
+    let passes: Vec<_> = key_sets
+        .iter()
+        .enumerate()
+        .map(|(i, (_, key_set))| {
+            let pass = RouteInput {
+                catalog: input.catalog,
+                snapshot,
+                parts,
+                signal: input.signal,
+                tenant_hash: input.tenant_hash,
+                key_set,
+                accounting: input.accounting,
+                reader: input.reader,
+                budget: input.budget,
+                limits: input.limits,
+            };
+            async move { (i, route_under(pass, ceiling, totals).await) }
+        })
+        .collect();
+    let mut routed: Vec<_> = futures::stream::iter(passes)
+        .buffer_unordered(input.concurrency.max(1))
+        .collect()
+        .await;
+    routed.sort_by_key(|(i, _)| *i);
+    let mut pruned: Vec<Vec<bool>> = Vec::with_capacity(routed.len());
+    let mut figures: Vec<RouteFigures> = Vec::with_capacity(routed.len());
+    for (_, result) in routed {
+        let (routes, pass_figures) = result?;
+        pruned.push(
+            routes
+                .iter()
+                .map(|r| matches!(r, SegmentRoute::Pruned))
+                .collect(),
+        );
+        figures.push(pass_figures);
+    }
+
+    // Each plan's values as distinct indexes into `key_sets`.
+    let plan_values: Vec<Vec<usize>> = plans
+        .iter()
+        .map(|values| {
+            let mut idx: Vec<usize> = values
+                .iter()
+                .filter_map(|(_, value)| key_sets.iter().position(|(v, _)| v == value))
+                .collect();
+            idx.sort_unstable();
+            idx.dedup();
+            idx
+        })
+        .collect();
+    let plan_keeps = plans
+        .iter()
+        .zip(&plan_values)
+        .map(|(values, idx)| {
+            if values.is_empty() {
+                return None;
+            }
+            let mut keep = vec![true; snapshot.segments.len()];
+            for i in idx {
+                for (kept, pruned) in keep.iter_mut().zip(&pruned[*i]) {
+                    *kept &= !*pruned;
+                }
+            }
+            Some(keep)
+        })
+        .collect();
+    let values = key_sets
+        .iter()
+        .zip(figures)
+        .enumerate()
+        .map(|(i, ((value, key_set), figures))| {
+            let segments_pruned = pruned[i].iter().filter(|p| **p).count() as u64;
+            let segments_pruned_alone = (0..snapshot.segments.len())
+                .filter(|s| {
+                    pruned[i][*s]
+                        && plan_values.iter().any(|idx| {
+                            idx.contains(&i) && idx.iter().all(|j| *j == i || !pruned[*j][*s])
+                        })
+                })
+                .count() as u64;
+            ValueRouteFigures {
+                labels: labels_by_value
+                    .get(value)
+                    .into_iter()
+                    .flatten()
+                    .map(|label| label.to_string())
+                    .collect(),
+                key8_hex: key_set.keys().iter().map(hex::encode).collect(),
+                figures,
+                segments_pruned,
+                segments_pruned_alone,
+            }
+        })
+        .collect();
+    Ok(ValueRouting { plan_keeps, values })
+}
+
 /// Owns the leaf reads' accounting for one pass and merges it into the
 /// caller's `keyIndex` handle when dropped, so a pass that errors, or whose
 /// future is dropped mid-probe, still charges every GET it issued.
@@ -492,6 +715,7 @@ async fn route_under(
     drop(charge);
     figures.leaf_get_requests = leaf.s3_requests(AccountedOp::Get);
     figures.leaf_wire_bytes = leaf.s3_bytes(AccountedOp::Get);
+    figures.leaf_cache_hits = leaf.cache_hits;
     let answered = answered?;
 
     let mut routes = vec![SegmentRoute::Uncovered; segment_count];
