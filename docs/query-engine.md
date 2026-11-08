@@ -4141,7 +4141,8 @@ the logs entry holding the same ten fields as `stats.keyIndex`
   the read cache is not counted.
 - `leafWireBytes`: the bytes those GETs returned, as transferred.
 - `keysProbed`: keys in the probed set, 1 for a `trace_id =` lookup the
-  router ran for, 0 when the lookup fell back to tier 1 before routing (a
+  router ran for and the distinct id count for a routed `trace_id IN` list
+  of any length from 2, 0 when the lookup fell back to tier 1 before routing (a
   refused parts charge, below).
 - `skippedByBudget`: parts the bridged-read allowance left uncovered.
 - `skipIdxDropped`: objects the fetcher read the key present in and then
@@ -5466,12 +5467,17 @@ hex literals; a hex list plans because the `trace_id_hex_in_list` analyzer
 rule rewrites it into the column's native literals before type coercion
 (`crates/ravel-sql/src/trace_id_planner.rs`). A `NOT IN`, a mixed-type list, a
 list holding a NULL or an expression, a list of more than 1,024 distinct
-values, and a list under `OR` carry no key; a declared `i64` list keeps its
-envelope `NumRange` prune arm whatever happens to the key. The first such list
-of a conjunction is the set; a second carries nothing. DataFusion rewrites a
-list of at most three values into `=` disjuncts before the scan sees it (one
-value into a plain `=`, which is an equality arm), and a disjunction carries
-no key. The pushdown stays `Inexact`: the residual re-applies the list over
+values, and a list nested under `OR` carry no key; a declared `i64` list
+keeps its envelope `NumRange` prune arm whatever happens to the key. The first
+such list of a conjunction is the set; a second carries nothing. DataFusion
+rewrites a list of at most three values into `=` disjuncts before the scan
+sees it (one value into a plain `=`, which is an equality arm). A top-level
+disjunction whose every arm, at any nesting of `OR`, is `=` between one key
+column and a literal the list would accept carries the same key set as that
+list, so a key list of any length from 2 carries its key set. A disjunction
+with arms on two columns, an arm on a non-key column, a non-equality arm, or a
+literal the list would refuse (a NULL, another type, a wrong-width trace id)
+carries no key. The pushdown stays `Inexact`: the residual re-applies the list over
 the full values, so a `key8` collision only adds a block. On spans the reader
 filters a set's rows by the time window alone, and the residual is the `IN`
 list's exact evaluator.
@@ -6673,8 +6679,9 @@ disjunction inside a conjunct's subtree drops that whole conjunct from pruning
 (refusing is always widen-safe: the residual re-applies it). The exception is a
 **same-axis** `OR`/`IN` on `status_code` or `duration_ns`, pushed as the union
 of its disjuncts; a **cross-axis** disjunction (`status_code = 2 OR duration_ns
-> 5e8`) is refused. `trace_id` is a single-point lookup with no range primitive
-to union, so a `trace_id` disjunction is refused too.
+> 5e8`) is refused. A disjunction whose every arm is `trace_id = <literal>`
+carries the same key set as the equivalent `trace_id IN` list (see "Exact-key
+`IN` lists"); a `trace_id` disjunction with any other arm is refused.
 
 Scan paths and their partition metrics (ADR-0110). `SpansScanExec` runs one of
 two paths per partition: a columnar fast path that builds Arrow arrays straight
