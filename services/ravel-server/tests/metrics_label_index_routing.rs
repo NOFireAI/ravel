@@ -355,6 +355,10 @@ struct Setup {
     recent_holds_target: bool,
     /// File a pending metrics erasure request after the fold.
     pending_erasure: bool,
+    /// The wall-clock time the fixture is built at, so two fixtures whose
+    /// answers a test compares see the same hours, samples and query
+    /// window. `None` reads the clock.
+    now: Option<i64>,
 }
 
 struct Fixture {
@@ -404,7 +408,7 @@ async fn serve(setup: Setup) -> Fixture {
     });
     let store: Arc<dyn ObjectStoreBackend> = recorder.clone();
     let tenant = TenantId::new(TENANT);
-    let now = now_ns();
+    let now = setup.now.unwrap_or_else(now_ns);
     let hour = u32::try_from(now / NS_PER_HOUR - SEALED_HOURS_AGO).expect("hour fits u32");
     let hour_start = i64::from(hour) * NS_PER_HOUR;
 
@@ -717,6 +721,7 @@ async fn promql_query_range_prunes_non_holders_by_label_index() {
     let with_recent_holder = Setup {
         recent: true,
         recent_holds_target: true,
+        now: Some(now_ns()),
         ..Setup::default()
     };
     let off = serve(with_recent_holder).await;
@@ -818,12 +823,16 @@ async fn without_the_switch_the_route_does_not_run() {
 async fn a_pending_erasure_routes_nothing() {
     let _serial = SERIAL.lock().await;
     let query = format!("{METRIC}{{instance=\"{TARGET}\"}}");
-    let off = serve(Setup::default()).await;
+    let at_now = Setup {
+        now: Some(now_ns()),
+        ..Setup::default()
+    };
+    let off = serve(at_now).await;
     let unrouted = off.query_range(&query).await;
     let gated = serve(Setup {
         label_index: true,
         pending_erasure: true,
-        ..Setup::default()
+        ..at_now
     })
     .await;
     let value = gated.query_range(&query).await;
@@ -843,11 +852,15 @@ async fn a_compound_query_with_disjoint_selectors_equals_the_unrouted_run() {
         "sum(count_over_time({METRIC}{{instance=\"{TARGET}\"}}[1h])) \
          + sum(count_over_time({METRIC}{{instance=\"obj2\"}}[1h]))"
     );
-    let off = serve(Setup::default()).await;
+    let at_now = Setup {
+        now: Some(now_ns()),
+        ..Setup::default()
+    };
+    let off = serve(at_now).await;
     let unrouted = off.query_range(&query).await;
     let on = serve(Setup {
         label_index: true,
-        ..Setup::default()
+        ..at_now
     })
     .await;
     let routed = on.query_range(&query).await;
@@ -902,11 +915,15 @@ async fn an_unfolded_recent_object_is_never_pruned() {
 async fn a_regex_only_selector_routes_nothing() {
     let _serial = SERIAL.lock().await;
     let query = format!("{{__name__=~\"{METRIC}\", instance=~\"{TARGET}\"}}");
-    let off = serve(Setup::default()).await;
+    let at_now = Setup {
+        now: Some(now_ns()),
+        ..Setup::default()
+    };
+    let off = serve(at_now).await;
     let unrouted = off.query_range(&query).await;
     let on = serve(Setup {
         label_index: true,
-        ..Setup::default()
+        ..at_now
     })
     .await;
     let (before, leaf_gets_before) = metrics_route_totals();
@@ -955,12 +972,16 @@ async fn the_metrics_rows_of_key_index_parts_total_move() {
 async fn an_instant_query_prunes_non_holders_and_equals_the_unrouted_run() {
     let _serial = SERIAL.lock().await;
     let query = format!("count_over_time({METRIC}{{instance=\"{TARGET}\"}}[4h])");
-    let off = serve(Setup::default()).await;
+    let at_now = Setup {
+        now: Some(now_ns()),
+        ..Setup::default()
+    };
+    let off = serve(at_now).await;
     // Both runs evaluate at one time, so their sample timestamps compare.
     let unrouted = off.query(&query, off.end_s).await;
     let on = serve(Setup {
         label_index: true,
-        ..Setup::default()
+        ..at_now
     })
     .await;
     let routed = on.query(&query, off.end_s).await;
