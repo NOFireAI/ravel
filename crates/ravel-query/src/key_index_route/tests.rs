@@ -27,6 +27,13 @@ enum LeafKind {
     Good,
     /// Two slices cut at `1 << 63`.
     Split,
+    /// This many slices of near-equal key8 width.
+    Sliced(usize),
+    /// `slices` slices as `Sliced`, slice `foreign` bound to another tenant.
+    SlicedForeign {
+        slices: usize,
+        foreign: usize,
+    },
     NoLeaf,
     /// One leaf, for another field.
     OtherField,
@@ -157,6 +164,19 @@ async fn fixture(specs: &[PartSpec], recents: &[Rows], key_type: KeyType) -> Fix
         let slices: Vec<(u64, u64)> = match spec.leaf {
             LeafKind::NoLeaf => Vec::new(),
             LeafKind::Split => vec![(0, cut - 1), (cut, u64::MAX)],
+            LeafKind::Sliced(count) | LeafKind::SlicedForeign { slices: count, .. } => {
+                let width = u64::MAX / count as u64;
+                (0..count as u64)
+                    .map(|i| {
+                        let hi = if i + 1 == count as u64 {
+                            u64::MAX
+                        } else {
+                            (i + 1) * width - 1
+                        };
+                        (i * width, hi)
+                    })
+                    .collect()
+            }
             _ => vec![(0, u64::MAX)],
         };
         let mut refs = Vec::new();
@@ -169,6 +189,7 @@ async fn fixture(specs: &[PartSpec], recents: &[Rows], key_type: KeyType) -> Fix
             let input = KeyIndexLeafInput {
                 tenant_hash: match spec.leaf {
                     LeafKind::OtherTenant => OTHER_TENANT,
+                    LeafKind::SlicedForeign { foreign, .. } if foreign == s => OTHER_TENANT,
                     _ => TENANT,
                 },
                 signal: match spec.leaf {
@@ -2039,4 +2060,1153 @@ async fn a_passes_leaf_cache_hits_reach_its_figures() {
     assert_eq!(leaf_gets, store_gets);
     assert_eq!(leaf_gets, key_index.s3_requests(AccountedOp::Get));
     assert_eq!(leaf_gets, key_index.total_s3_requests());
+}
+
+/// Pending this many times, waking itself each time: a read that has to be
+/// polled again.
+struct Yields(u32);
+
+impl std::future::Future for Yields {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 == 0 {
+            return std::task::Poll::Ready(());
+        }
+        self.0 -= 1;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+
+/// Decrements the in-flight count when the read finishes or is dropped.
+struct InFlightGuard<'a>(&'a AtomicU64);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Counts reads in flight around `inner`: a read joins on its first poll,
+/// yields once, and leaves when it returns.
+struct InFlightReader<'r> {
+    inner: &'r CountingReader,
+    in_flight: AtomicU64,
+    peak: AtomicU64,
+    /// Every range read, in issue order.
+    ranges: std::sync::Mutex<Vec<(String, Range<u64>)>>,
+}
+
+impl<'r> InFlightReader<'r> {
+    fn new(inner: &'r CountingReader) -> Self {
+        InFlightReader {
+            inner,
+            in_flight: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            ranges: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn peak(&self) -> u64 {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+impl LeafRangeReader for InFlightReader<'_> {
+    fn read_range<'a>(
+        &'a self,
+        leaf: &'a SnapshotKeyIndexLeafRef,
+        range: Range<u64>,
+        accounting: &'a QueryAccounting,
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
+        Box::pin(async move {
+            self.ranges
+                .lock()
+                .expect("ranges")
+                .push((leaf.key.clone(), range.clone()));
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _guard = InFlightGuard(&self.in_flight);
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            Yields(1).await;
+            self.inner.read_range(leaf, range, accounting).await
+        })
+    }
+}
+
+/// Routes `keys` over `fx` through an [`InFlightReader`], returning the run
+/// and the peak number of reads in flight.
+async fn run_in_flight(
+    fx: &Fixture,
+    keys: &KeySet,
+    budget: &dyn LeafDecodeBudget,
+) -> (Run, u64, Vec<(String, Range<u64>)>) {
+    let accounting = PhaseAccounting::new();
+    let reader = CountingReader::new(fx.store.clone());
+    let totals = RouteTotals::new();
+    let (result, peak, ranges) = {
+        let in_flight = InFlightReader::new(&reader);
+        let result = route_under(
+            input(fx, keys, &accounting, &in_flight, budget),
+            UNBOUNDED,
+            &totals,
+        )
+        .await;
+        let ranges = std::mem::take(&mut *in_flight.ranges.lock().expect("ranges"));
+        (result, in_flight.peak(), ranges)
+    };
+    (
+        Run {
+            result,
+            accounting,
+            reader,
+            totals,
+        },
+        peak,
+        ranges,
+    )
+}
+
+/// One part of `slices` slices over four entries: entry `o` holds the
+/// values `v` with `v % 4 == o`, in block `v % 8`, and entry 3 is
+/// uncovered.
+fn sliced_spec(slices: usize, values: u16) -> PartSpec {
+    let mut entries: Vec<Rows> = vec![Rows::new(); 4];
+    for v in 0..values {
+        entries[usize::from(v % 4)].insert(v, BTreeSet::from([u32::from(v % 8)]));
+    }
+    let mut spec = PartSpec::simple(entries);
+    spec.uncovered[3] = true;
+    spec.leaf = LeafKind::Sliced(slices);
+    spec.bucket_bits = 6;
+    spec
+}
+
+/// What probing every part's slices one after another gives: the routes,
+/// and the GETs, wire bytes and decompressed bytes it cost.
+#[derive(Debug)]
+struct Serial {
+    routes: Vec<SegmentRoute>,
+    get_requests: u64,
+    wire_bytes: u64,
+    decompressed_bytes: u64,
+    /// Every read it issued, GET 1s included, in issue order.
+    reads: Vec<(String, Range<u64>)>,
+}
+
+/// Per slice of part 0, the bucket-run reads among `reads` (every read but
+/// the slice's GET 1) and the bytes they ask for.
+fn runs_by_slice<'r>(
+    fx: &Fixture,
+    reads: impl IntoIterator<Item = (&'r str, &'r Range<u64>)>,
+) -> Vec<(u64, u64)> {
+    let refs = &fx.parts.parts[0].key_index;
+    let mut runs = vec![(0u64, 0u64); refs.len()];
+    for (leaf, range) in reads {
+        let s = slice_of(leaf);
+        if key_index_leaf_prefix_range(&refs[s]).expect("range") != *range {
+            runs[s].0 += 1;
+            runs[s].1 += range.end - range.start;
+        }
+    }
+    runs
+}
+
+/// The serial oracle's [`runs_by_slice`] for the values of `query` that
+/// fall in part 0's first `slices` slices: what probing those slices one
+/// after another reads before the slice that stops it.
+async fn serial_runs_before(fx: &Fixture, query: &BTreeSet<u16>, slices: usize) -> Vec<(u64, u64)> {
+    let before: BTreeSet<u16> = values_by_slice(fx, query.iter().copied())
+        .into_iter()
+        .take(slices)
+        .flatten()
+        .collect();
+    let serial = serial_probe(fx, &key_set(KeyType::Str, &before)).await;
+    let runs = runs_by_slice(
+        fx,
+        serial
+            .reads
+            .iter()
+            .map(|(leaf, range)| (leaf.as_str(), range)),
+    );
+    assert!(
+        runs[..slices].iter().all(|(n, _)| *n > 0),
+        "every slice before the stopping one reads runs: {runs:?}"
+    );
+    runs
+}
+
+/// The serial oracle: each part's touched slices in slice order, each
+/// through `probe_key_index_leaf_set_ranged` with one read in flight at a
+/// time, the part's allowance charged slice by slice. Every slice must
+/// answer.
+async fn serial_probe(fx: &Fixture, keys: &KeySet) -> Serial {
+    let one_read = tokio::sync::Mutex::new(());
+    let mut serial = Serial {
+        routes: vec![SegmentRoute::Uncovered; fx.snapshot.segments.len()],
+        get_requests: 0,
+        wire_bytes: 0,
+        decompressed_bytes: 0,
+        reads: Vec::new(),
+    };
+    let reads = std::sync::Mutex::new(Vec::new());
+    let mut answers: BTreeMap<usize, PartAnswer> = BTreeMap::new();
+    for (p, handle) in fx.parts.parts.iter().enumerate() {
+        let mut slices: Vec<(&SnapshotKeyIndexLeafRef, Vec<Key8>)> = Vec::new();
+        for key8 in keys.keys() {
+            let leaf_ref = select_key_index_slice(&handle.key_index, FIELD, key8)
+                .expect("slices tile")
+                .expect("the part has leaves");
+            match slices.last_mut() {
+                Some((last, slice_keys)) if std::ptr::eq(*last, leaf_ref) => slice_keys.push(*key8),
+                _ => slices.push((leaf_ref, vec![*key8])),
+            }
+        }
+        let request = KeyIndexLeafRequest {
+            tenant_hash: TENANT,
+            signal: SIGNAL,
+            part_blake3: &handle.blake3,
+            part_entry_count: handle.entry_count,
+            field: FIELD,
+            key_type: keys.key_type(),
+        };
+        let mut bridged_left = KeyIndexSetPolicy::for_part(handle.entry_count).max_bridged_bytes;
+        let mut answer = PartAnswer {
+            blocks: BTreeMap::new(),
+            uncovered: BTreeSet::new(),
+        };
+        for (leaf_ref, slice_keys) in &slices {
+            let policy = KeyIndexSetPolicy {
+                b_run: KEY_INDEX_SET_PROBE_MAX_RUNS,
+                max_bridged_bytes: bridged_left,
+            };
+            let read = |range: Range<u64>| {
+                reads
+                    .lock()
+                    .expect("reads")
+                    .push((leaf_ref.key.clone(), range.clone()));
+                let (store, key, one_read) = (fx.store.clone(), leaf_ref.key.clone(), &one_read);
+                async move {
+                    let _one = one_read.lock().await;
+                    store
+                        .get(&key, GetRange::Range(range.start, range.end))
+                        .await
+                        .map(|got| got.data)
+                        .map_err(|e| e.to_string())
+                }
+            };
+            let probe = ravel_catalog::probe_key_index_leaf_set_ranged(
+                leaf_ref,
+                &request,
+                slice_keys,
+                &KeyIndexLeafLimits::default(),
+                &policy,
+                read,
+                |_| Some(()),
+            )
+            .await
+            .expect("no breach");
+            serial.get_requests += u64::from(probe.get_requests);
+            serial.wire_bytes += probe.wire_bytes;
+            serial.decompressed_bytes += probe.decompressed_bytes;
+            bridged_left -= probe.bridged_bytes;
+            assert!(
+                merge_answer(&mut answer, probe.answer).is_ok(),
+                "slice {} answers",
+                leaf_ref.key
+            );
+        }
+        answers.insert(p, answer);
+    }
+    serial.reads = reads.into_inner().expect("reads");
+    for (route, origin) in serial.routes.iter_mut().zip(&fx.parts.origin) {
+        let Some(origin) = origin else { continue };
+        let answer = &answers[&(origin.part as usize)];
+        let ordinal = u64::from(origin.ordinal);
+        if answer.uncovered.contains(&ordinal) {
+            continue;
+        }
+        *route = match answer.blocks.get(&ordinal) {
+            Some(blocks) => SegmentRoute::Blocks(blocks.iter().copied().collect()),
+            None => SegmentRoute::Pruned,
+        };
+    }
+    serial
+}
+
+/// A part's slices are read concurrently, never more than
+/// `LEAF_READ_CONCURRENCY` reads at once, and the routes and the leaf GET,
+/// wire-byte and decompressed figures equal those of the serial oracle on
+/// the same part.
+/// FLIP: the serial probe peaks at 1 read in flight; an unbounded join over
+/// the slices peaks at 24.
+#[tokio::test]
+async fn a_part_reads_its_slices_concurrently() {
+    let fx = fixture(&[sliced_spec(24, 600)], &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = (0..600).step_by(2).chain(2000..2100).collect();
+    let keys = key_set(KeyType::Str, &query);
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, peak, ranges) = run_in_flight(&fx, &keys, &budget).await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    let leaves: BTreeSet<&str> = ranges.iter().map(|(leaf, _)| leaf.as_str()).collect();
+    assert_eq!(leaves.len(), 24, "the key set touches every slice");
+    assert_eq!(peak, ravel_catalog::LEAF_READ_CONCURRENCY as u64);
+    assert_eq!(figures.parts_covered, 1);
+    let serial = serial_probe(&fx, &keys).await;
+    assert_eq!(routes, &serial.routes);
+    assert_eq!(figures.leaf_get_requests, serial.get_requests);
+    assert_eq!(figures.leaf_wire_bytes, serial.wire_bytes);
+    assert_eq!(
+        run.accounting.key_index().snapshot().decompressed_bytes,
+        serial.decompressed_bytes
+    );
+    // Even values only, so entries 0 and 2 hold matches and entry 1 holds
+    // none; entry 3 is uncovered.
+    assert_eq!(
+        routes,
+        &vec![
+            SegmentRoute::Blocks(vec![0, 4]),
+            SegmentRoute::Pruned,
+            SegmentRoute::Blocks(vec![2, 6]),
+            SegmentRoute::Uncovered,
+        ]
+    );
+    assert!(violations(routes, &fx.rows, &query).is_empty());
+    // The oracle's figures on this fixture, as literals.
+    assert_eq!(figures.leaf_get_requests, 305);
+    assert_eq!(figures.leaf_wire_bytes, 18_569);
+    assert_eq!(
+        run.accounting.key_index().snapshot().decompressed_bytes,
+        3_751
+    );
+    assert_accounting(&run, figures);
+}
+
+/// A part whose third slice's bridged bytes exceed what the first two left
+/// of the allowance.
+struct AllowanceCase {
+    fx: Fixture,
+    query: BTreeSet<u16>,
+    /// The first three slices' bridged bytes for `query`.
+    bridged: [u64; 3],
+    /// Every slice's GET 1 bytes.
+    prefixes: Vec<Bytes>,
+}
+
+/// One part of four slices over one entry of 4000 values, and a query
+/// whose first two slices fit the part's allowance and whose third, though
+/// it fits on its own, exceeds what they left; the fourth slice holds three
+/// keys.
+async fn allowance_case() -> AllowanceCase {
+    let cap = ravel_catalog::KEY_INDEX_T1_BYTES;
+    let values: Vec<u16> = (0..4000).collect();
+    let entry: Rows = values
+        .iter()
+        .map(|v| (*v, BTreeSet::from([0u32])))
+        .collect();
+    let mut spec = PartSpec::simple(vec![entry]);
+    spec.leaf = LeafKind::Sliced(4);
+    spec.bucket_bits = 8;
+    let fx = fixture(&[spec], &[], KeyType::Str).await;
+    let handle = &fx.parts.parts[0];
+    assert_eq!(handle.key_index.len(), 4);
+    let request = KeyIndexLeafRequest {
+        tenant_hash: TENANT,
+        signal: SIGNAL,
+        part_blake3: &handle.blake3,
+        part_entry_count: handle.entry_count,
+        field: FIELD,
+        key_type: KeyType::Str,
+    };
+    // Per slice, its values ascending by key8, and the leaf's prefix bytes.
+    let mut by_slice: Vec<Vec<(Key8, u16)>> = vec![Vec::new(); 4];
+    for v in &values {
+        let key8 = value_key8(KeyType::Str, *v);
+        let s = handle
+            .key_index
+            .iter()
+            .position(|l| (l.key8_lo..=l.key8_hi).contains(&u64::from_be_bytes(key8)))
+            .expect("a slice holds every key");
+        by_slice[s].push((key8, *v));
+    }
+    let mut prefixes = Vec::new();
+    for (s, leaf_ref) in handle.key_index.iter().enumerate() {
+        by_slice[s].sort_unstable();
+        let range = key_index_leaf_prefix_range(leaf_ref).expect("prefix range");
+        let got = fx
+            .store
+            .get(&leaf_ref.key, GetRange::Range(range.start, range.end))
+            .await
+            .expect("prefix");
+        prefixes.push(got.data);
+    }
+    // The bridged bytes of the first `n` keys of slice `s`.
+    let bridged = |s: usize, n: usize| -> u64 {
+        let keys: Vec<Key8> = by_slice[s][..n].iter().map(|(k, _)| *k).collect();
+        plan_key_index_leaf_set(
+            &prefixes[s],
+            &handle.key_index[s],
+            &request,
+            &keys,
+            KEY_INDEX_SET_PROBE_MAX_RUNS,
+        )
+        .map(|plan| plan.bridged_bytes())
+        .expect("plan")
+    };
+    let counts: Vec<usize> = (65..=320).step_by(5).collect();
+    let mut chosen = None;
+    'search: for &n in &counts {
+        let (b0, b1) = (bridged(0, n), bridged(1, n));
+        if b0 == 0 || b1 == 0 || b0 + b1 > cap {
+            continue;
+        }
+        for &m in &counts {
+            let b2 = bridged(2, m);
+            if b2 > 0 && b2 <= cap && b0 + b1 + b2 > cap {
+                chosen = Some((n, m, [b0, b1, b2]));
+                break 'search;
+            }
+        }
+    }
+    let (n, m, b) = chosen.expect("key counts whose third slice crosses the allowance");
+    let query: BTreeSet<u16> = by_slice[0][..n]
+        .iter()
+        .chain(&by_slice[1][..n])
+        .chain(&by_slice[2][..m])
+        .chain(&by_slice[3][..3])
+        .map(|(_, v)| *v)
+        .collect();
+    AllowanceCase {
+        fx,
+        query,
+        bridged: b,
+        prefixes,
+    }
+}
+
+/// The part's allowance is charged from the slices' prefixes in slice
+/// order: the third slice's bridged bytes exceed what the first two left,
+/// so the part is skipped by budget. The first two slices read exactly the
+/// serial probe's runs, in count and bytes per slice, every slice's GET 1
+/// is read and counted (the fourth's too), and no run of the third or
+/// fourth slice is read.
+/// FLIP: charging each slice against the full allowance covers the part;
+/// the serial probe never reads the fourth slice's GET 1; skipping slice
+/// 0's last run leaves slice 0 one run and its bytes short.
+#[tokio::test]
+async fn the_allowance_is_charged_in_slice_order() {
+    let cap = ravel_catalog::KEY_INDEX_T1_BYTES;
+    let AllowanceCase {
+        fx,
+        query,
+        bridged: b,
+        prefixes,
+    } = allowance_case().await;
+    let handle = &fx.parts.parts[0];
+    let keys = key_set(KeyType::Str, &query);
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, _, ranges) = run_in_flight(&fx, &keys, &budget).await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(figures.skipped_by_budget, 1, "slices {b:?} over {cap}");
+    assert_eq!(figures.parts_covered, 0);
+    assert_eq!(routes, &vec![SegmentRoute::Uncovered]);
+    let prefix_reads: BTreeMap<String, Range<u64>> = handle
+        .key_index
+        .iter()
+        .map(|l| {
+            (
+                l.key.clone(),
+                key_index_leaf_prefix_range(l).expect("range"),
+            )
+        })
+        .collect();
+    // Per slice, its GET 1 reads, and its run reads with their bytes.
+    let mut gets_1 = [0u64; 4];
+    let mut runs = [0u64; 4];
+    let mut run_bytes = 0u64;
+    for (leaf, range) in &ranges {
+        let s = slice_of(leaf);
+        if Some(range) == prefix_reads.get(leaf) {
+            gets_1[s] += 1;
+        } else {
+            runs[s] += 1;
+            run_bytes += range.end - range.start;
+        }
+    }
+    assert_eq!(gets_1, [1, 1, 1, 1], "every slice's GET 1 is read once");
+    assert_eq!(&runs[2..], &[0, 0], "no run of slice 2 or 3 is read");
+    let read = runs_by_slice(
+        &fx,
+        ranges.iter().map(|(leaf, range)| (leaf.as_str(), range)),
+    );
+    assert_eq!(
+        read[..2],
+        serial_runs_before(&fx, &query, 2).await[..2],
+        "slices 0 and 1 read the serial probe's runs, (count, bytes) per slice"
+    );
+    assert_eq!(figures.leaf_get_requests, ranges.len() as u64);
+    assert_eq!(
+        figures.leaf_wire_bytes,
+        prefixes.iter().map(|p| p.len() as u64).sum::<u64>() + run_bytes
+    );
+    assert_accounting(&run, figures);
+}
+
+/// Fails slice 2's GET 1, after slice 5's GET 1 has been refused by the
+/// reader's fetch reservation, and records the order the reads ended in.
+struct LateRejectReader<'r> {
+    inner: &'r CountingReader,
+    ended: std::sync::Mutex<Vec<(String, Range<u64>)>>,
+}
+
+impl LeafRangeReader for LateRejectReader<'_> {
+    fn read_range<'a>(
+        &'a self,
+        leaf: &'a SnapshotKeyIndexLeafRef,
+        range: Range<u64>,
+        accounting: &'a QueryAccounting,
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
+        Box::pin(async move {
+            let asked = range.clone();
+            let got = if leaf.key.ends_with("/2") {
+                self.inner.calls.fetch_add(1, Ordering::Relaxed);
+                accounting.record_s3_request(AccountedOp::Get);
+                Yields(8).await;
+                Err(LeafReadError::Failed("slice 2 is gone".to_string()))
+            } else if leaf.key.ends_with("/5") {
+                self.inner.calls.fetch_add(1, Ordering::Relaxed);
+                accounting.record_s3_request(AccountedOp::Get);
+                Err(LeafReadError::ReservationRefused(
+                    "slice 5's fetch refused".to_string(),
+                ))
+            } else {
+                self.inner.read_range(leaf, range, accounting).await
+            };
+            self.ended
+                .lock()
+                .expect("ended")
+                .push((leaf.key.clone(), asked));
+            got
+        })
+    }
+}
+
+/// When two slices fail, the earlier in slice order decides the part's
+/// outcome, not the one whose read ended first: slice 2's failed GET 1
+/// rejects the part although slice 5's refused fetch ended before it.
+/// Slices 0 and 1 read exactly the serial probe's runs.
+/// FLIP: deciding by completion order (an unordered GET 1 stream) counts
+/// the part as a refused reservation; skipping slice 0's last run leaves
+/// slice 0 one run and its bytes short.
+#[tokio::test]
+async fn the_first_failing_slice_in_order_decides() {
+    let fx = fixture(&[sliced_spec(8, 600)], &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = (0..600).collect();
+    let keys = key_set(KeyType::Str, &query);
+    let budget = ThresholdBudget::new(u64::MAX);
+    let accounting = PhaseAccounting::new();
+    let reader = CountingReader::new(fx.store.clone());
+    let totals = RouteTotals::new();
+    let late = LateRejectReader {
+        inner: &reader,
+        ended: std::sync::Mutex::new(Vec::new()),
+    };
+    let result = route_under(
+        input(&fx, &keys, &accounting, &late, &budget),
+        UNBOUNDED,
+        &totals,
+    )
+    .await;
+    let ended = std::mem::take(&mut *late.ended.lock().expect("ended"));
+    let position = |suffix: &str| {
+        ended
+            .iter()
+            .position(|(k, _)| k.ends_with(suffix))
+            .expect("slice read")
+    };
+    assert!(
+        position("/5") < position("/2"),
+        "slice 5's read ends first: {ended:?}"
+    );
+    let (routes, figures) = result.as_ref().expect("route");
+    assert_eq!(figures.leaves_rejected, 1);
+    assert_eq!(figures.reservations_refused, 0);
+    assert!(routes.iter().all(|r| *r == SegmentRoute::Uncovered));
+    // Every slice's GET 1, and runs of slices 0 and 1 only: exactly the
+    // serial probe's, in count and bytes per slice.
+    for s in 2..8 {
+        let suffix = format!("/{s}");
+        assert_eq!(
+            ended.iter().filter(|(k, _)| k.ends_with(&suffix)).count(),
+            1,
+            "slice {s}: {ended:?}"
+        );
+    }
+    let runs = runs_by_slice(
+        &fx,
+        ended.iter().map(|(leaf, range)| (leaf.as_str(), range)),
+    );
+    assert_eq!(
+        runs[..2],
+        serial_runs_before(&fx, &query, 2).await[..2],
+        "(count, bytes) per slice"
+    );
+    assert_eq!(&runs[2..], &[(0, 0); 6]);
+    assert_eq!(figures.leaf_get_requests, ended.len() as u64);
+}
+
+/// How a [`ScriptReader`] ends a read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    Pass,
+    Fail,
+    /// Refused by the reader's fetch reservation, before any GET.
+    Refuse,
+}
+
+/// One read as a [`ScriptReader`]'s script sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScriptedRead {
+    slice: usize,
+    /// The slice's GET 1, not a bucket run.
+    prefix: bool,
+    /// Its place among the pass's run reads, in issue order; 0 for GET 1.
+    run: u64,
+}
+
+/// The slice index a fixture leaf key ends in.
+fn slice_of(leaf_key: &str) -> usize {
+    leaf_key
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .expect("slice index")
+}
+
+/// Reads through `inner` as `script` says: pending for the polls it names,
+/// then passing, failing, or refused. Records each read as it ends.
+struct ScriptReader<'r, S> {
+    inner: &'r CountingReader,
+    script: S,
+    runs_issued: AtomicU64,
+    ended: std::sync::Mutex<Vec<(ScriptedRead, End)>>,
+}
+
+impl<S> LeafRangeReader for ScriptReader<'_, S>
+where
+    S: Fn(ScriptedRead) -> (u32, End) + Sync,
+{
+    fn read_range<'a>(
+        &'a self,
+        leaf: &'a SnapshotKeyIndexLeafRef,
+        range: Range<u64>,
+        accounting: &'a QueryAccounting,
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
+        let prefix = key_index_leaf_prefix_range(leaf).ok() == Some(range.clone());
+        let run = if prefix {
+            0
+        } else {
+            self.runs_issued.fetch_add(1, Ordering::SeqCst)
+        };
+        let read = ScriptedRead {
+            slice: slice_of(&leaf.key),
+            prefix,
+            run,
+        };
+        let (polls, end) = (self.script)(read);
+        Box::pin(async move {
+            Yields(polls).await;
+            let got = match end {
+                End::Pass => self.inner.read_range(leaf, range, accounting).await,
+                End::Fail => {
+                    self.inner.calls.fetch_add(1, Ordering::Relaxed);
+                    accounting.record_s3_request(AccountedOp::Get);
+                    Err(LeafReadError::Failed(format!(
+                        "{} {range:?} failed",
+                        leaf.key
+                    )))
+                }
+                End::Refuse => Err(LeafReadError::ReservationRefused(format!(
+                    "{} {range:?} refused",
+                    leaf.key
+                ))),
+            };
+            self.ended.lock().expect("ended").push((read, end));
+            got
+        })
+    }
+}
+
+/// Routes `keys` over `fx` through a [`ScriptReader`] running `script`,
+/// returning the run and the reads in the order they ended.
+async fn run_scripted<S>(
+    fx: &Fixture,
+    keys: &KeySet,
+    budget: &dyn LeafDecodeBudget,
+    script: S,
+) -> (Run, Vec<(ScriptedRead, End)>)
+where
+    S: Fn(ScriptedRead) -> (u32, End) + Sync,
+{
+    let accounting = PhaseAccounting::new();
+    let reader = CountingReader::new(fx.store.clone());
+    let totals = RouteTotals::new();
+    let (result, ended) = {
+        let scripted = ScriptReader {
+            inner: &reader,
+            script,
+            runs_issued: AtomicU64::new(0),
+            ended: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = route_under(
+            input(fx, keys, &accounting, &scripted, budget),
+            UNBOUNDED,
+            &totals,
+        )
+        .await;
+        let ended = std::mem::take(&mut *scripted.ended.lock().expect("ended"));
+        (result, ended)
+    };
+    (
+        Run {
+            result,
+            accounting,
+            reader,
+            totals,
+        },
+        ended,
+    )
+}
+
+/// `values` grouped by the slice of part 0 whose key8 range holds them.
+fn values_by_slice(fx: &Fixture, values: impl IntoIterator<Item = u16>) -> Vec<Vec<u16>> {
+    let refs = &fx.parts.parts[0].key_index;
+    let mut by_slice = vec![Vec::new(); refs.len()];
+    for v in values {
+        let key8 = u64::from_be_bytes(value_key8(KeyType::Str, v));
+        let s = refs
+            .iter()
+            .position(|l| (l.key8_lo..=l.key8_hi).contains(&key8))
+            .expect("a slice holds every key");
+        by_slice[s].push(v);
+    }
+    by_slice
+}
+
+/// The routes a whole scan gives `sliced_spec`'s part for `query`: entry 3
+/// uncovered, every other entry the blocks of the queried values it holds.
+fn sliced_routes(fx: &Fixture, query: &BTreeSet<u16>) -> Vec<SegmentRoute> {
+    fx.rows
+        .iter()
+        .enumerate()
+        .map(|(o, seg)| {
+            let blocks: BTreeSet<u32> = seg
+                .iter()
+                .filter(|(v, _)| query.contains(v))
+                .flat_map(|(_, blocks)| blocks.iter().copied())
+                .collect();
+            match o {
+                3 => SegmentRoute::Uncovered,
+                _ if blocks.is_empty() => SegmentRoute::Pruned,
+                _ => SegmentRoute::Blocks(blocks.into_iter().collect()),
+            }
+        })
+        .collect()
+}
+
+/// The statement failed with `RouteError::Isolation` naming slice `foreign`
+/// of part 0, the breach counter moved by exactly one from `before`, every
+/// slice's GET 1 was read once, and no bucket run of any slice was read.
+fn assert_fails_closed_at(
+    fx: &Fixture,
+    run: &Run,
+    ended: &[(ScriptedRead, End)],
+    foreign: usize,
+    before: u64,
+) {
+    let refs = &fx.parts.parts[0].key_index;
+    match &run.result {
+        Err(RouteError::Isolation { leaf_key, source }) => {
+            assert_eq!(leaf_key, &refs[foreign].key);
+            assert!(
+                matches!(source, CatalogError::FieldMismatch { field, .. } if *field == "tenant_hash"),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected an isolation error, got {other:?}"),
+    }
+    assert_eq!(fx.catalog.isolation_breaches(), before + 1);
+    assert!(
+        ended.iter().all(|(read, _)| read.prefix),
+        "no bucket run is read: {ended:?}"
+    );
+    for s in 0..refs.len() {
+        assert_eq!(
+            ended.iter().filter(|(read, _)| read.slice == s).count(),
+            1,
+            "slice {s}'s GET 1: {ended:?}"
+        );
+    }
+    assert_eq!(
+        run.accounting
+            .key_index()
+            .snapshot()
+            .s3_requests(AccountedOp::Get),
+        run.reader.calls.load(Ordering::Relaxed)
+    );
+}
+
+/// Slice 1's breach fails the statement although slice 0's run read would
+/// have rejected the part first, as probing the slices one after another
+/// does: ADR-0050 section 2 fails the query on any breach seen. Phase 3
+/// never starts, so slice 0's runs are not read, and the counter moves by
+/// one.
+/// FLIP: a752bafe3 reads slice 0's runs, lets the failed one reject the
+/// part, and the statement goes on.
+#[tokio::test]
+async fn a_breach_after_a_failing_run_still_fails_the_statement() {
+    let mut spec = sliced_spec(2, 600);
+    spec.leaf = LeafKind::SlicedForeign {
+        slices: 2,
+        foreign: 1,
+    };
+    let fx = fixture(&[spec], &[], KeyType::Str).await;
+    let before = fx.catalog.isolation_breaches();
+    let keys = key_set(KeyType::Str, &(0..600).collect());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, ended) = run_scripted(&fx, &keys, &budget, |read| match read {
+        ScriptedRead {
+            slice: 0,
+            prefix: false,
+            ..
+        } => (0, End::Fail),
+        _ => (0, End::Pass),
+    })
+    .await;
+    assert_fails_closed_at(&fx, &run, &ended, 1, before);
+}
+
+/// A breach at the stopping slice, with every earlier slice planning,
+/// fails the statement before any bucket run is read: slice 2's foreign
+/// header gives `RouteError::Isolation` and the counter moves by one.
+/// FLIP: a752bafe3 reads the runs of slices 0 and 1 in phase 3 before
+/// returning the breach.
+#[tokio::test]
+async fn a_breach_at_the_stopping_slice_fails_before_any_run_is_read() {
+    let mut spec = sliced_spec(4, 600);
+    spec.leaf = LeafKind::SlicedForeign {
+        slices: 4,
+        foreign: 2,
+    };
+    let fx = fixture(&[spec], &[], KeyType::Str).await;
+    let before = fx.catalog.isolation_breaches();
+    let keys = key_set(KeyType::Str, &(0..600).collect());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, ended) = run_scripted(&fx, &keys, &budget, |_| (0, End::Pass)).await;
+    assert!(
+        ended.iter().all(|(_, end)| *end == End::Pass),
+        "every read answers: {ended:?}"
+    );
+    assert_fails_closed_at(&fx, &run, &ended, 2, before);
+}
+
+/// Slice 0's refused decode reservation decides the part before slice 2's
+/// bridged bytes exceed what slices 0 and 1 left of the allowance: the part
+/// counts as a refused reservation, not as skipped by budget.
+/// FLIP: bd2e2ceaa decides the allowance in phase 2, before slice 0's runs
+/// are decoded, and counts the part as skipped by budget.
+#[tokio::test]
+async fn a_refused_decode_before_a_slice_over_the_allowance_refuses_the_part() {
+    let AllowanceCase { fx, query, .. } = allowance_case().await;
+    let keys = key_set(KeyType::Str, &query);
+    // With every reservation granted, slice 2 exceeds the allowance.
+    let granted = run(&fx, &keys, &ThresholdBudget::new(u64::MAX), UNBOUNDED).await;
+    let (_, granted) = granted.result.as_ref().expect("route");
+    assert_eq!(granted.skipped_by_budget, 1);
+
+    let budget = ThresholdBudget::new(0);
+    let refused = run(&fx, &keys, &budget, UNBOUNDED).await;
+    let (routes, figures) = refused.result.as_ref().expect("route");
+    assert_eq!(figures.reservations_refused, 1);
+    assert_eq!(figures.skipped_by_budget, 0);
+    assert_eq!(budget.refused.load(Ordering::Relaxed), 1);
+    assert_eq!(routes, &vec![SegmentRoute::Uncovered]);
+    assert_accounting(&refused, figures);
+}
+
+/// Slice 0's failed run reads decide the part before slice 1's GET 1 is
+/// refused by the reader's fetch reservation: the part is rejected.
+/// FLIP: bd2e2ceaa decides slice 1's refused GET 1 in phase 2 and counts the
+/// part as a refused reservation.
+#[tokio::test]
+async fn failed_runs_before_a_refused_prefix_reject_the_part() {
+    let fx = fixture(&[sliced_spec(2, 600)], &[], KeyType::Str).await;
+    let keys = key_set(KeyType::Str, &(0..600).collect());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, ended) = run_scripted(&fx, &keys, &budget, |read| match read {
+        ScriptedRead {
+            slice: 0,
+            prefix: false,
+            ..
+        } => (0, End::Fail),
+        ScriptedRead {
+            slice: 1,
+            prefix: true,
+            ..
+        } => (0, End::Refuse),
+        _ => (0, End::Pass),
+    })
+    .await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(figures.leaves_rejected, 1);
+    assert_eq!(figures.reservations_refused, 0);
+    assert!(routes.iter().all(|r| *r == SegmentRoute::Uncovered));
+    assert!(
+        ended.contains(&(
+            ScriptedRead {
+                slice: 1,
+                prefix: true,
+                run: 0
+            },
+            End::Refuse
+        )),
+        "{ended:?}"
+    );
+}
+
+/// A breach in the GET 1 of a slice after the stopping one fails the
+/// statement: slice 1's failed GET 1 would reject the part, but slice 3's
+/// foreign header gives `RouteError::Isolation`, the counter moves by one,
+/// and no run of slice 0 is read.
+/// FLIP: a752bafe3 counts slice 3's breach, rejects the part at slice 1,
+/// and the statement goes on.
+#[tokio::test]
+async fn a_breach_after_the_stopping_slice_fails_the_statement() {
+    let mut spec = sliced_spec(4, 600);
+    spec.leaf = LeafKind::SlicedForeign {
+        slices: 4,
+        foreign: 3,
+    };
+    let fx = fixture(&[spec], &[], KeyType::Str).await;
+    let before = fx.catalog.isolation_breaches();
+    let keys = key_set(KeyType::Str, &(0..600).collect());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, ended) = run_scripted(&fx, &keys, &budget, |read| match read {
+        ScriptedRead {
+            slice: 1,
+            prefix: true,
+            ..
+        } => (0, End::Fail),
+        _ => (0, End::Pass),
+    })
+    .await;
+    assert!(
+        ended.contains(&(
+            ScriptedRead {
+                slice: 1,
+                prefix: true,
+                run: 0
+            },
+            End::Fail
+        )),
+        "slice 1's GET 1 fails: {ended:?}"
+    );
+    assert_fails_closed_at(&fx, &run, &ended, 3, before);
+}
+
+/// Run reads that complete in reverse issue order, across slices, are still
+/// decoded in body order per slice: the routes are the exact blocks a whole
+/// scan gives, and equal the serial oracle's.
+/// FLIP: `buffer_unordered` at phase 3 hands a decoder another run's bytes,
+/// which rejects the part.
+#[tokio::test]
+async fn runs_completing_in_reverse_order_answer_as_the_serial_probe() {
+    let fx = fixture(&[sliced_spec(4, 600)], &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = (0..600).step_by(15).collect();
+    let keys = key_set(KeyType::Str, &query);
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, ended) = run_scripted(&fx, &keys, &budget, |read| match read.prefix {
+        true => (0, End::Pass),
+        false => (64u64.saturating_sub(read.run) as u32, End::Pass),
+    })
+    .await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(figures.parts_covered, 1);
+    assert_eq!(routes, &sliced_routes(&fx, &query));
+    assert_eq!(routes, &serial_probe(&fx, &keys).await.routes);
+    let runs: Vec<ScriptedRead> = ended
+        .iter()
+        .filter(|(read, _)| !read.prefix)
+        .map(|(read, _)| *read)
+        .collect();
+    let slices: BTreeSet<usize> = runs.iter().map(|r| r.slice).collect();
+    assert_eq!(slices.len(), 4, "every slice has runs: {runs:?}");
+    assert!(
+        runs.iter()
+            .enumerate()
+            .any(|(i, a)| runs[i + 1..].iter().any(|b| b.slice < a.slice)),
+        "a later slice's run ends before an earlier slice's: {runs:?}"
+    );
+    assert_accounting(&run, figures);
+}
+
+/// When runs of two slices fail, the earlier slice decides although the
+/// later slice's failure ends first: slice 0's first run, refused after 32
+/// polls, beats slice 1's runs, which fail at once.
+/// FLIP: `buffer_unordered` at phase 3 takes slice 1's failure first and
+/// rejects the part.
+#[tokio::test]
+async fn the_earlier_slices_failing_run_decides_over_a_faster_later_one() {
+    let fx = fixture(&[sliced_spec(2, 600)], &[], KeyType::Str).await;
+    let by_slice = values_by_slice(&fx, 0..600);
+    let query: BTreeSet<u16> = by_slice[0][..4]
+        .iter()
+        .chain(&by_slice[1][..4])
+        .copied()
+        .collect();
+    let keys = key_set(KeyType::Str, &query);
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, ended) = run_scripted(&fx, &keys, &budget, |read| match read {
+        ScriptedRead {
+            slice: 0,
+            prefix: false,
+            run: 0,
+        } => (32, End::Refuse),
+        ScriptedRead {
+            slice: 1,
+            prefix: false,
+            ..
+        } => (0, End::Fail),
+        _ => (0, End::Pass),
+    })
+    .await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(figures.reservations_refused, 1);
+    assert_eq!(figures.leaves_rejected, 0);
+    assert!(routes.iter().all(|r| *r == SegmentRoute::Uncovered));
+    let position = |slice: usize, end: End| {
+        ended
+            .iter()
+            .position(|(read, e)| read.slice == slice && !read.prefix && *e == end)
+            .expect("run read ended")
+    };
+    assert!(
+        position(1, End::Fail) < position(0, End::Refuse),
+        "slice 1's failure ends first: {ended:?}"
+    );
+}
+
+/// Phase 3's reads are bounded on their own: a part of one slice, whose
+/// GET 1 is the only phase-1 read, holds exactly `LEAF_READ_CONCURRENCY`
+/// run reads in flight.
+/// FLIP: a serial phase 3 peaks at 1.
+#[tokio::test]
+async fn a_parts_runs_peak_at_the_bound() {
+    let fx = fixture(&[sliced_spec(1, 600)], &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = (0..600).collect();
+    let keys = key_set(KeyType::Str, &query);
+    let budget = ThresholdBudget::new(u64::MAX);
+    let (run, peak, ranges) = run_in_flight(&fx, &keys, &budget).await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(figures.parts_covered, 1);
+    assert_eq!(routes, &sliced_routes(&fx, &query));
+    let leaf = &fx.parts.parts[0].key_index[0];
+    let prefix = key_index_leaf_prefix_range(leaf).expect("prefix range");
+    let runs = ranges.iter().filter(|(_, range)| *range != prefix).count();
+    assert_eq!(ranges.len(), runs + 1, "one GET 1");
+    assert!(runs >= 20, "{runs} runs");
+    assert_eq!(peak, ravel_catalog::LEAF_READ_CONCURRENCY as u64);
+}
+
+/// One GET 1 buffer; dropping it is counted.
+struct LiveBuffer {
+    bytes: Bytes,
+    live: Arc<AtomicU64>,
+}
+
+impl AsRef<[u8]> for LiveBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for LiveBuffer {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Hands out GET 1's bytes in buffers whose drop it counts, as a production
+/// reader's fetch reservation is released with its bytes, and records how
+/// many are alive as each run read is issued.
+struct PrefixLifeReader<'r> {
+    inner: &'r CountingReader,
+    live: Arc<AtomicU64>,
+    live_at_run: std::sync::Mutex<Vec<u64>>,
+}
+
+impl LeafRangeReader for PrefixLifeReader<'_> {
+    fn read_range<'a>(
+        &'a self,
+        leaf: &'a SnapshotKeyIndexLeafRef,
+        range: Range<u64>,
+        accounting: &'a QueryAccounting,
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
+        let prefix = key_index_leaf_prefix_range(leaf).ok() == Some(range.clone());
+        if !prefix {
+            self.live_at_run
+                .lock()
+                .expect("live")
+                .push(self.live.load(Ordering::SeqCst));
+        }
+        Box::pin(async move {
+            let bytes = self.inner.read_range(leaf, range, accounting).await?;
+            if !prefix {
+                return Ok(bytes);
+            }
+            self.live.fetch_add(1, Ordering::SeqCst);
+            Ok(Bytes::from_owner(LiveBuffer {
+                bytes,
+                live: self.live.clone(),
+            }))
+        })
+    }
+}
+
+/// Each planned slice keeps its GET 1 bytes, and so a production reader's
+/// fetch reservation for them, until the slice finishes: all 24 are alive
+/// when the first run read is issued, fewer when the last one is, and none
+/// once the route returns.
+/// FLIP: bd2e2ceaa drops every GET 1 buffer in phase 1, so none is alive at
+/// the first run read.
+#[tokio::test]
+async fn a_slices_get_1_bytes_live_until_the_slice_finishes() {
+    let fx = fixture(&[sliced_spec(24, 600)], &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = (0..600).step_by(2).chain(2000..2100).collect();
+    let keys = key_set(KeyType::Str, &query);
+    let budget = ThresholdBudget::new(u64::MAX);
+    let accounting = PhaseAccounting::new();
+    let counting = CountingReader::new(fx.store.clone());
+    let reader = PrefixLifeReader {
+        inner: &counting,
+        live: Arc::new(AtomicU64::new(0)),
+        live_at_run: std::sync::Mutex::new(Vec::new()),
+    };
+    let (routes, figures) = route_under(
+        input(&fx, &keys, &accounting, &reader, &budget),
+        UNBOUNDED,
+        &RouteTotals::new(),
+    )
+    .await
+    .expect("route");
+    assert_eq!(figures.parts_covered, 1);
+    assert_eq!(routes, sliced_routes(&fx, &query));
+    let live_at_run = std::mem::take(&mut *reader.live_at_run.lock().expect("live"));
+    assert!(live_at_run.len() > 24, "{} runs", live_at_run.len());
+    assert_eq!(live_at_run.first(), Some(&24));
+    assert!(live_at_run.last().is_some_and(|&last| last < 24));
+    assert_eq!(reader.live.load(Ordering::SeqCst), 0);
 }

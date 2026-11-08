@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -1924,6 +1924,178 @@ fn the_set_probe_reserves_each_frame_before_decoding_it() {
         counted.reserved, want,
         "frame i's decoded bound is reserved after i decompressions"
     );
+}
+
+/// Pending this many times, waking itself each time.
+struct Yields(u32);
+
+impl Future for Yields {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 == 0 {
+            return std::task::Poll::Ready(());
+        }
+        self.0 -= 1;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+
+/// Leaves the in-flight count when its read ends or is dropped.
+struct Flight<'a>(&'a Cell<u64>);
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+/// The plan of the first `n` keys of [`wide_leaf`], ascending by key8.
+fn wide_plan(n: usize) -> (EncodedKeyIndexLeaf, Vec<Key8>, KeyIndexSetPlan) {
+    let (part, leaf, truth) = wide_leaf();
+    let keys: Vec<Key8> = truth.keys().copied().take(n).collect();
+    let plan = plan_key_index_leaf_set(
+        &leaf.bytes[..leaf.leaf_ref.prefix_len as usize],
+        &leaf.leaf_ref,
+        &request(&part),
+        &keys,
+        KEY_INDEX_SET_PROBE_MAX_RUNS,
+    )
+    .expect("plan");
+    (leaf, keys, plan)
+}
+
+/// [`read_key_index_set_runs`] over `leaf`'s bytes. Run `i` (in issue
+/// order) joins the in-flight count on its first poll, is pending
+/// `yields(i)` times, and fails when `fails(i)`. Returns the runs, the peak
+/// in flight, and the run indexes in the order their reads ended.
+fn read_runs_with(
+    leaf: &[u8],
+    plan: &KeyIndexSetPlan,
+    max_in_flight: usize,
+    yields: impl Fn(usize) -> u32,
+    fails: impl Fn(usize) -> bool,
+) -> (KeyIndexSetRuns, u64, Vec<usize>) {
+    let in_flight = Cell::new(0u64);
+    let peak = Cell::new(0u64);
+    let ended = RefCell::new(Vec::new());
+    let mut issued = 0usize;
+    let runs = block_on(read_key_index_set_runs(
+        plan,
+        &KeyIndexLeafLimits::default(),
+        max_in_flight,
+        |range: Range<u64>| {
+            let i = issued;
+            issued += 1;
+            let out = if fails(i) {
+                Err(format!("run {i} {range:?} failed"))
+            } else {
+                Ok(Bytes::copy_from_slice(
+                    &leaf[range.start as usize..range.end as usize],
+                ))
+            };
+            let pending = yields(i);
+            let (in_flight, peak, ended) = (&in_flight, &peak, &ended);
+            async move {
+                in_flight.set(in_flight.get() + 1);
+                peak.set(peak.get().max(in_flight.get()));
+                let _flight = Flight(in_flight);
+                Yields(pending).await;
+                ended.borrow_mut().push(i);
+                out
+            }
+        },
+        |_bytes| Some(()),
+    ));
+    (runs, peak.get(), ended.into_inner())
+}
+
+fn runs_probe(runs: &KeyIndexSetRuns) -> KeyIndexSetProbe {
+    KeyIndexSetProbe {
+        answer: runs.answer.clone(),
+        get_requests: runs.get_requests,
+        wire_bytes: runs.wire_bytes,
+        decompressed_bytes: runs.decompressed_bytes,
+        distinct_buckets: 0,
+        bridged_bytes: 0,
+    }
+}
+
+/// The runs step holds exactly its bound of reads in flight, and answers
+/// and costs what a one-at-a-time read of the same plan does.
+/// FLIP: a bound of 1 (the serial probe) peaks at 1; an unbounded join
+/// peaks at every run.
+#[test]
+fn set_probe_reads_runs_concurrently_up_to_the_bound() {
+    let (leaf, keys, plan) = wide_plan(40);
+    let (_, _, truth) = wide_leaf();
+    assert!(plan.runs().len() >= 20, "{}", plan.runs().len());
+    assert_eq!(plan.bridged_bytes(), 0);
+
+    let (serial, serial_peak, _) = read_runs_with(&leaf.bytes, &plan, 1, |_| 1, |_| false);
+    assert_eq!(serial_peak, 1);
+    expect_answered(&runs_probe(&serial), &keys, &truth);
+    assert_eq!(serial.get_requests as usize, plan.runs().len());
+    let run_bytes: u64 = plan.runs().iter().map(|r| r.end - r.start).sum();
+    assert_eq!(serial.wire_bytes, run_bytes);
+
+    let (bounded, peak, _) = read_runs_with(&leaf.bytes, &plan, 8, |_| 1, |_| false);
+    assert_eq!(peak, 8);
+    assert_eq!(bounded.answer, serial.answer);
+    assert_eq!(bounded.get_requests, serial.get_requests);
+    assert_eq!(bounded.wire_bytes, serial.wire_bytes);
+    assert_eq!(bounded.decompressed_bytes, serial.decompressed_bytes);
+    assert!(bounded.decompressed_bytes > 0);
+}
+
+/// Runs whose reads end in reverse issue order still decode in body order
+/// and give every key exactly its blocks.
+/// FLIP: taking reads in completion order (`buffer_unordered`) hands the
+/// decoder the last run first, and the probe rejects the leaf.
+#[test]
+fn set_probe_runs_completing_out_of_order() {
+    let (leaf, keys, plan) = wide_plan(40);
+    let (_, _, truth) = wide_leaf();
+    let n = plan.runs().len();
+    let (runs, peak, ended) = read_runs_with(&leaf.bytes, &plan, n, |i| (n - i) as u32, |_| false);
+    expect_answered(&runs_probe(&runs), &keys, &truth);
+    assert_eq!(peak as usize, n);
+    assert_eq!(ended, (0..n).rev().collect::<Vec<_>>());
+    assert_eq!(runs.get_requests as usize, n);
+}
+
+/// Of two failing runs, the earlier in run order names the rejection,
+/// although the later one's read ends first.
+/// FLIP: deciding by completion order names run 10.
+#[test]
+fn set_probe_first_failing_run_wins() {
+    let (leaf, _, plan) = wide_plan(40);
+    let n = plan.runs().len();
+    let (runs, _, ended) = read_runs_with(
+        &leaf.bytes,
+        &plan,
+        n,
+        |i| match i {
+            3 => 20,
+            10 => 0,
+            _ => 1,
+        },
+        |i| i == 3 || i == 10,
+    );
+    let third = &plan.runs()[3];
+    assert_eq!(
+        runs.answer,
+        KeyIndexSetAnswer::Rejected(KeyIndexLeafRejection::Read(format!(
+            "run 3 {third:?} failed"
+        )))
+    );
+    let position = |run: usize| ended.iter().position(|&i| i == run).expect("ended");
+    assert!(position(10) < position(3), "{ended:?}");
+    assert_eq!(runs.get_requests as usize, n);
 }
 
 fn entries_strategy() -> impl Strategy<Value = Vec<KeyIndexLeafEntry>> {
