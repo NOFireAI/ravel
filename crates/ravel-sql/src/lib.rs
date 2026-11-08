@@ -74,6 +74,7 @@ pub mod distributed_rlog;
 mod error;
 pub mod esql;
 mod executor;
+mod first_groups;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
 #[cfg(feature = "pin-codec")]
@@ -145,9 +146,13 @@ pub use bucketed_final_aggregate::{
     BUCKETED_FINAL_AGGREGATE_RULE, BucketedFinalAggregateExec, BucketedFinalAggregateRule,
 };
 pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
+pub use first_groups::{
+    FIRST_GROUPS_CONSUMER_PREFIX, FIRST_GROUPS_RULE, FirstGroupsExec, FirstGroupsLimit,
+};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
 pub use config::{
-    BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_TOPK_MAX_LIMIT,
+    BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
+    DEFAULT_BOUNDED_TOPK_MAX_LIMIT,
     DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES,
     DEFAULT_PARTITION_TOPK_MAX_LIMIT, DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES,
     DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE, ENV_SPILL_DIR, ENV_SPILL_MAX_BYTES,
