@@ -556,9 +556,11 @@ impl StrMemo {
     /// memo served (decision 4). `None`, and the caller casts, when the memo
     /// was never served, has a NULL entry (decision 6), or the fill was
     /// refused. The cache is asked for room before anything is built, so a
-    /// refused fill builds and validates nothing
-    /// (`refused_fills_build_and_validate_nothing`); the fill's validation
-    /// counts only once its views are installed. The memo's own lock is never
+    /// fill the room check refuses builds and validates nothing; one that
+    /// passed the check and is then refused by the reservation builds its
+    /// views and drops them unpaid (`refused_fills_build_and_validate_nothing`).
+    /// The fill's validation counts only once its views are installed. The
+    /// memo's own lock is never
     /// held across [`ViewHandle::has_view_room`] or
     /// [`ViewHandle::reserve_view`], which take the cache's lock first.
     fn views(&self) -> Option<StringViewArray> {
@@ -7338,8 +7340,9 @@ mod tests {
             /// own offsets and values buffers under a null buffer of the
             /// batch's own is not served the memo's views (the registry's
             /// serve count does not move, while the memo's own batch moves it
-            /// by 1): the key equals the cast, the row whose key references the NULL entry is NULL, and
-            /// a session `GROUP BY` puts it in the NULL group.
+            /// by 1): the key equals the cast, the row whose key references
+            /// the NULL entry is NULL, and a session `GROUP BY` puts it in
+            /// the NULL group.
             #[tokio::test]
             async fn a_null_buffer_over_the_memos_own_buffers_reads_as_the_cast() {
                 let budget = Arc::new(MemoryBudget::new(LIMIT));
@@ -7648,11 +7651,11 @@ mod tests {
             }
 
             /// ADR-3326, view memo amendment, T5 with the real memo: a fill
-            /// the margin refuses under a registered evictor over unheld
-            /// data entries builds no views, validates nothing, evicts
-            /// nothing, and every entry still hits. With exactly the margin
-            /// plus the views free the fill succeeds, and a closed host gate
-            /// refuses the fill before it builds.
+            /// the margin refuses at the room check under a registered
+            /// evictor over unheld data entries builds no views, validates
+            /// nothing, evicts nothing, and every entry still hits. With
+            /// exactly the margin plus the views free the fill succeeds, and
+            /// a closed host gate refuses the fill before it builds.
             #[test]
             fn a_real_memo_fill_never_evicts_a_data_entry() {
                 let budget = Arc::new(MemoryBudget::new(LIMIT));
@@ -7940,13 +7943,13 @@ mod tests {
                 assert_eq!(later.validated.value(), 0);
             }
 
-            /// A fill the view budget cannot take builds no views and
-            /// validates nothing: three evaluations over a served plain memo
-            /// with a view budget one byte short of its views count three
-            /// refusals, no build and no validated cell, and each key is the
-            /// cast. A fill the memory budget refuses after the room check
-            /// passed (the ledger filled in between) installs nothing,
-            /// charges nothing and counts no validation either.
+            /// A fill the room check refuses builds no views and validates
+            /// nothing: three evaluations over a served plain memo with a view
+            /// budget one byte short of its views count three refusals, no
+            /// build and no validated cell, and each key is the cast. A fill
+            /// the reservation refuses after the room check passed (the ledger
+            /// filled in between) builds its views once and drops them unpaid:
+            /// it installs nothing, charges nothing and counts no validation.
             #[test]
             fn refused_fills_build_and_validate_nothing() {
                 let budget = Arc::new(MemoryBudget::new(LIMIT));
