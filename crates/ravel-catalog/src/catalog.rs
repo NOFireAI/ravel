@@ -1583,9 +1583,10 @@ impl Catalog {
         }
     }
 
-    /// Count of hard isolation-breach failures observed across this
-    /// catalog's lifetime (ADR-0050 §2): a HEAD/postings tenant_hash
-    /// mismatch or an out-of-prefix listing result. See
+    /// Count of isolation breaches observed across this catalog's lifetime
+    /// (ADR-0050 §2): a HEAD, postings or key-index leaf tenant_hash
+    /// mismatch, or an out-of-prefix listing result. Every breach counted
+    /// here fails the statement or operation that saw it. See
     /// docs/catalog-and-mvcc.md.
     pub fn isolation_breaches(&self) -> u64 {
         self.isolation_breaches.load(Ordering::Relaxed)
