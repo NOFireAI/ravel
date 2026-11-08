@@ -673,9 +673,14 @@ pub struct CatalogConfig {
     /// measurement (an advancing fold's cost grows with the tail): when on, every part
     /// the fold re-encodes has each entry's KEY_IDX section read by ranged
     /// GET, and the tail part is re-encoded on every fold that advances the
-    /// watermark. When off the fold reads no section, writes no leaf, and a
+    /// watermark. When on, the fold also seals a part at every UTC day
+    /// boundary (ADR-3939 decision 1), so the tail holds only the latest UTC
+    /// day with entries and a sealed day part keeps its leaves. When off the
+    /// fold reads no section, writes no leaf, and a
     /// part it re-encodes carries no `key_index` refs; a part carried forward
-    /// by reference keeps the refs it has. Default `false`.
+    /// by reference keeps the refs it has. Since the switch also sets the
+    /// partition, every process folding a tenant must agree on it
+    /// (docs/catalog-and-mvcc.md, "Rollout of the day seal"). Default `false`.
     pub build_key_index_leaves: bool,
     /// Most (entry, key8) pairs the leaf build holds at once for one part,
     /// read from KEY_IDX sections and carried from the previous tail's leaves
