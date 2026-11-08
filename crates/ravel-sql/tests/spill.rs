@@ -1953,14 +1953,16 @@ async fn sweep_cell() {
             (
                 if ok { "PASS" } else { "WRONG" },
                 format!(
-                    "retries={} stat_files={}",
-                    outcome.stats.spill_retries, outcome.stats.spill.files
+                    "retries={} stat_files={} bytes_written={:?}",
+                    outcome.stats.spill_retries,
+                    outcome.stats.spill.files,
+                    outcome.stats.spill_retry.map(|r| r.spill_bytes_written)
                 ),
             )
         }
         Err(err) => {
             let s = format!("{err}");
-            ("FAIL", s.chars().take(260).collect::<String>())
+            ("FAIL", s.chars().take(1200).collect::<String>())
         }
     };
     println!(
