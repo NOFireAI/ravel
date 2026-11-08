@@ -864,10 +864,10 @@ pub(crate) fn group_key_as_view(
 /// memo with no views, or one whose fill the view budget refuses takes
 /// arrow's cast, which this wraps and displays as, so a plan's EXPLAIN text
 /// is the cast's (`the_view_memo_plan_explains_as_the_cast`). Under keys with
-/// no NULL the output is the cast's views, buffers and null buffer; at a NULL
-/// key it carries the cast's null bit, while the view under that bit, which
-/// arrow leaves unspecified, may differ from the cast's zero view (decision 8;
-/// `prop_group_key_views_equal_the_cast`).
+/// no null buffer the output is the cast's views, buffers and null buffer; at
+/// a NULL key it carries the cast's null bit, while the view under that bit,
+/// which arrow leaves unspecified, may differ from the cast's zero view
+/// (decision 8; `prop_group_key_views_equal_the_cast`).
 #[derive(Debug, Eq)]
 struct GroupKeyViews {
     cast: CastExpr,
