@@ -653,9 +653,10 @@ async fn read_segment_exemplars(
     let data_object_key = seg.data_object_key.as_str();
     let limits = ReaderLimits::default();
 
-    // One whole-object GET per matched segment, recorded at the same funnel
-    // the sample fetcher uses (ADR-0044): request count, transferred bytes,
-    // and one opened segment. A `NotFound` here means a pinned object vanished
+    // One whole-object GET per matched segment (ADR-0044): the request is
+    // recorded once issued, before the store call is awaited, as the sample
+    // fetcher's `store_get` records it; the transferred bytes and one opened
+    // segment only on success. A `NotFound` here means a pinned object vanished
     // under a concurrent publish-and-sweep: surface it as `SnapshotStale` so
     // the caller re-resolves once, exactly as the sample path does. Any other
     // store fault is fatal.
@@ -663,6 +664,7 @@ async fn read_segment_exemplars(
     // like every fetcher-issued GET, so it counts against
     // `--store-get-concurrency` instead of escaping the bound uncounted.
     let _permit = state.get_limiter.acquire().await;
+    accounting.record_s3_request(AccountedOp::Get);
     let got = match state.store.get(data_object_key, GetRange::Full).await {
         Ok(got) => got,
         Err(StoreError::NotFound) => return Err(CollectError::SnapshotStale),
@@ -673,7 +675,6 @@ async fn read_segment_exemplars(
             )));
         }
     };
-    accounting.record_s3_request(AccountedOp::Get);
     accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
     accounting.add_segments_opened(1);
     let object = got.data;
@@ -1796,12 +1797,21 @@ mod tests {
         engine_config: EngineConfig,
         max_exemplars: usize,
     ) -> Router {
+        router(build_state(backend, deadline, engine_config, max_exemplars))
+    }
+
+    fn build_state(
+        backend: Arc<dyn ObjectStoreBackend>,
+        deadline: Duration,
+        engine_config: EngineConfig,
+        max_exemplars: usize,
+    ) -> ExemplarsState {
         let catalog =
             Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
         let mut tokens = HashMap::new();
         tokens.insert(TOKEN.to_string(), tenant());
         tokens.insert(TOKEN_B.to_string(), tenant_b());
-        let state = ExemplarsState {
+        ExemplarsState {
             catalog,
             store: backend,
             tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
@@ -1813,8 +1823,7 @@ mod tests {
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
             query_admission: QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
             query_accounting: default_query_accounting(),
-        };
-        router(state)
+        }
     }
 
     /// Captures every submitted audit event and reports durability success.
@@ -2906,6 +2915,117 @@ mod tests {
             1,
             "the injected NotFound must have fired exactly once"
         );
+    }
+
+    /// The data-object GET a `NotFound` answers was issued against the store,
+    /// so it is billed as a request, as the sample fetcher bills it; it moved
+    /// no bytes and opened no segment, so neither is added. Reads the segment
+    /// twice into one accounting handle, as the stale attempt and its retry
+    /// together spend on this path.
+    #[tokio::test]
+    async fn not_found_data_get_is_billed_as_a_request_without_bytes() {
+        let mem = MemoryStore::new();
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        let ex = exemplar(sid, NOW - 30 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
+        publish_segment(&mem, 1, vec![series], vec![ex]).await;
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                .with_key_contains(".rseg")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let faulted = Arc::new(FaultStore::new(mem, plan));
+        let counter = faulted.clone();
+        let backend: Arc<dyn ObjectStoreBackend> = faulted;
+        let state = build_state(
+            backend,
+            Duration::from_secs(30),
+            EngineConfig::default(),
+            DEFAULT_MAX_EXEMPLARS,
+        );
+
+        let tenant_hash = tenant().hash();
+        let (snapshot, _) = state
+            .catalog
+            .resolve_pruned_with_admission(
+                &tenant_hash,
+                Signal::Metrics,
+                TimeRange {
+                    start_ns: NOW - NS_PER_HOUR,
+                    end_ns: NOW,
+                },
+                &[],
+                NOW,
+                Some("m"),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), 1);
+        let seg = &snapshot.segments[0];
+        let object_len = state
+            .store
+            .head(&seg.data_object_key)
+            .await
+            .expect("head")
+            .size;
+        assert!(object_len > 0);
+        let matcher_sets: Vec<Vec<LabelMatcher>> =
+            plan_selectors("m", (NOW - NS_PER_HOUR) / NS_PER_MS, NOW / NS_PER_MS)
+                .expect("plan")
+                .into_iter()
+                .map(|p| p.matchers)
+                .collect();
+
+        let accounting = QueryAccounting::new();
+        let mut seen = HashSet::new();
+        let mut collected = Vec::new();
+        let stale = read_segment_exemplars(
+            &state,
+            tenant_hash,
+            seg,
+            &matcher_sets,
+            &[],
+            NOW - NS_PER_HOUR,
+            NOW,
+            &accounting,
+            &mut seen,
+            &mut collected,
+        )
+        .await;
+        assert!(
+            matches!(stale, Err(CollectError::SnapshotStale)),
+            "the first GET's NotFound surfaces as SnapshotStale"
+        );
+        assert_eq!(
+            counter.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1,
+            "the injected NotFound must have fired exactly once"
+        );
+        let after_404 = accounting.snapshot();
+        assert_eq!(after_404.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(after_404.s3_bytes(AccountedOp::Get), 0);
+        assert_eq!(after_404.segments_opened, 0);
+
+        let read = read_segment_exemplars(
+            &state,
+            tenant_hash,
+            seg,
+            &matcher_sets,
+            &[],
+            NOW - NS_PER_HOUR,
+            NOW,
+            &accounting,
+            &mut seen,
+            &mut collected,
+        )
+        .await;
+        assert!(read.is_ok(), "the second GET reads the object");
+        assert_eq!(collected.len(), 1);
+        let total = accounting.snapshot();
+        assert_eq!(total.s3_requests(AccountedOp::Get), 2);
+        assert_eq!(total.s3_bytes(AccountedOp::Get), object_len);
+        assert_eq!(total.segments_opened, 1);
     }
 
     /// F5: the ADR-0010 section 7 footer identity check. An object whose
