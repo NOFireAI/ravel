@@ -1257,6 +1257,19 @@ async fn q33_executor_with_store(
     process: Arc<ravel_memory::MemoryBudget>,
     ravel: Arc<dyn ravel_object_store::ObjectStoreBackend>,
 ) -> Arc<ravel_sql::SqlExecutor> {
+    parquet_table_executor(config, &[(file.clone(), Q33_ROWS)], process, ravel, "q33").await
+}
+
+/// [`q33_executor_with_store`] for a Parquet table named `table` made of
+/// `files`, each given with its row count. A spill-enabled plan does not
+/// split a file across partitions, so each file is at most one partition.
+async fn parquet_table_executor(
+    config: SqlConfig,
+    files: &[(bytes::Bytes, u64)],
+    process: Arc<ravel_memory::MemoryBudget>,
+    ravel: Arc<dyn ravel_object_store::ObjectStoreBackend>,
+    table: &str,
+) -> Arc<ravel_sql::SqlExecutor> {
     use std::collections::{BTreeMap, HashMap};
 
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
@@ -1274,23 +1287,26 @@ async fn q33_executor_with_store(
     const NOW: i64 = 1_700_000_000_000_000_000;
     let tenant = q33_tenant();
     let lake = Arc::new(MemoryStore::new());
-    let key = "t/q33/0.parquet";
-    let put = lake
-        .put(key, file.clone(), PutOptions::default())
-        .await
-        .expect("put");
-    let mut word = [0u8; 4];
-    word.copy_from_slice(&file[file.len() - 8..file.len() - 4]);
-    let parquet_file = ParquetFile {
-        profile: PROFILE.to_string(),
-        bucket: "lake".to_string(),
-        key: key.as_bytes().to_vec(),
-        size: file.len() as u64,
-        etag: put.etag.0,
-        version: String::new(),
-        row_count: Q33_ROWS,
-        footer_len: u32::from_le_bytes(word),
-    };
+    let mut parquet_files = Vec::new();
+    for (index, (file, row_count)) in files.iter().enumerate() {
+        let key = format!("t/{table}/{index}.parquet");
+        let put = lake
+            .put(&key, file.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        let mut word = [0u8; 4];
+        word.copy_from_slice(&file[file.len() - 8..file.len() - 4]);
+        parquet_files.push(ParquetFile {
+            profile: PROFILE.to_string(),
+            bucket: "lake".to_string(),
+            key: key.as_bytes().to_vec(),
+            size: file.len() as u64,
+            etag: put.etag.0,
+            version: String::new(),
+            row_count: *row_count,
+            footer_len: u32::from_le_bytes(word),
+        });
+    }
     ravel_pqtable::grants::add(
         ravel.as_ref(),
         &tenant,
@@ -1304,15 +1320,15 @@ async fn q33_executor_with_store(
     writer::apply(
         ravel.as_ref(),
         &tenant,
-        "q33",
+        table,
         Intent::Create {
             if_not_exists: false,
-            location: format!("{GRANT}/q33/"),
+            location: format!("{GRANT}/{table}/"),
             grant: GRANT.to_string(),
-            files: vec![parquet_file],
+            files: parquet_files,
             options: BTreeMap::new(),
             created_by: "test".to_string(),
-            statement: "CREATE EXTERNAL TABLE q33 ...".to_string(),
+            statement: format!("CREATE EXTERNAL TABLE {table} ..."),
         },
         &FixedClock::new(NOW),
         60_000,
@@ -1793,6 +1809,171 @@ async fn the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry(
     );
     assert_eq!(spilled.rows, unlimited.rows, "row for row");
 }
+
+/// Distinct `url` values in the row 35 fixture, and how many files (scan
+/// partitions) they are split over.
+const ROW_35_GROUPS: u64 = 200_000;
+const ROW_35_FILES: u64 = 2;
+
+/// The `url` of group `g`: about 100 bytes, zero padded so every group is
+/// one distinct string of the same length.
+fn row_35_url(g: u64) -> String {
+    format!(
+        "https://www.example.com/catalog/section/{g:07}/item?ref=clickbench&utm_source=row35&pad=xxxxxxxx"
+    )
+}
+
+/// One file of the row 35 table: every group `g` with `g % ROW_35_FILES ==
+/// file` once, and group `g < 10` another `11 - g` times, so groups 0 to 9
+/// hold the ten highest counts, 12 down to 3, and the top ten is decided by
+/// the counts alone. Returns the file and its row count.
+fn row_35_parquet(file: u64) -> (bytes::Bytes, u64) {
+    use datafusion::arrow::array::{ArrayRef, StringArray};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let mut groups: Vec<u64> = (0..ROW_35_GROUPS)
+        .map(|i| (i * 7_919) % ROW_35_GROUPS)
+        .filter(|g| g % ROW_35_FILES == file)
+        .collect();
+    for g in (0..10).filter(|g| g % ROW_35_FILES == file) {
+        groups.extend(std::iter::repeat_n(
+            g,
+            usize::try_from(11 - g).expect("small"),
+        ));
+    }
+    let schema = Arc::new(Schema::new(vec![Field::new("url", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from_iter_values(
+            groups.iter().map(|&g| row_35_url(g)),
+        )) as ArrayRef],
+    )
+    .expect("batch");
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_max_row_group_row_count(Some(8_192))
+        .build();
+    let mut out = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut out, schema, Some(properties)).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+    (bytes::Bytes::from(out), groups.len() as u64)
+}
+
+// SWEEP-SCAFFOLD begin
+fn sweep_env(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+#[tokio::test]
+async fn sweep_cell() {
+    let Some(shape) = sweep_env("RAVEL_SWEEP_SHAPE") else {
+        return;
+    };
+    let cap_percent = sweep_env("RAVEL_SWEEP_CAP_PERCENT").expect("cap");
+    let log = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let (sql, table, files, parallel): (&str, &str, Vec<(bytes::Bytes, u64)>, bool) = match shape {
+        14 => (
+            "SELECT y / 2 AS k, COUNT(DISTINCT a) AS u FROM q33 GROUP BY y / 2 ORDER BY u DESC LIMIT 10",
+            "q33",
+            vec![(q33_parquet(), Q33_ROWS)],
+            false,
+        ),
+        35 => (
+            "SELECT 1, url, COUNT(*) AS c FROM row35 GROUP BY 1, url ORDER BY c DESC LIMIT 10",
+            "row35",
+            (0..ROW_35_FILES).map(row_35_parquet).collect(),
+            true,
+        ),
+        _ => panic!("shape"),
+    };
+    let config = |query_bytes| {
+        let mut config = spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            query_bytes,
+        );
+        if parallel {
+            config.engine.fetch_concurrency = usize::try_from(ROW_35_FILES).expect("small");
+            config.parallel_final_aggregation = true;
+        }
+        config
+    };
+    let executor = |config: SqlConfig, process: Arc<ravel_memory::MemoryBudget>| {
+        parquet_table_executor(config, &files, process, Arc::new(MemoryStore::new()), table)
+    };
+    let unlimited = run_top_ten(
+        &*executor(
+            config(AMPLE_QUERY_BYTES),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        )
+        .await,
+        sql,
+    )
+    .await;
+    assert_eq!(unlimited.spill_files, 0);
+    let cap = usize::try_from(unlimited.peak_pool_bytes * cap_percent / 100).expect("fits");
+    let process = Arc::new(ravel_memory::MemoryBudget::new(unlimited.peak_pool_bytes));
+    let spilled = executor(config(SPILL_MODE_HEADROOM_FLOOR_BYTES + cap), process).await;
+    let outcome = spilled.execute(q33_tenant(), &request(sql)).await;
+    let text = log.text();
+    let field = |name: &str| {
+        text.lines()
+            .filter(|l| l.contains("retried with spill"))
+            .filter_map(|l| {
+                l.split_whitespace()
+                    .find_map(|w| w.strip_prefix(name).map(str::to_string))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let (result, detail) = match outcome {
+        Ok(outcome) => {
+            use datafusion::arrow::util::display::array_value_to_string;
+            let mut rows = Vec::new();
+            for batch in outcome.output.batches() {
+                for row in 0..batch.num_rows() {
+                    let cells: Vec<String> = batch
+                        .columns()
+                        .iter()
+                        .map(|c| array_value_to_string(c, row).expect("renderable"))
+                        .collect();
+                    rows.push(cells.join("|"));
+                }
+            }
+            let ok = rows == unlimited.rows;
+            (
+                if ok { "PASS" } else { "WRONG" },
+                format!(
+                    "retries={} stat_files={}",
+                    outcome.stats.spill_retries, outcome.stats.spill.files
+                ),
+            )
+        }
+        Err(err) => {
+            let s = format!("{err}");
+            ("FAIL", s.chars().take(260).collect::<String>())
+        }
+    };
+    println!(
+        "SWEEP_RESULT shape={shape} cap={cap_percent} fan_in={} alt_rule={} peak={} result={result} \
+         log_outcome={} log_files={} detail={detail}",
+        std::env::var("RAVEL_SWEEP_FAN_IN").unwrap_or_default(),
+        std::env::var_os("RAVEL_SWEEP_ALT_RULE").is_some(),
+        unlimited.peak_pool_bytes,
+        field("outcome="),
+        field("spill_files="),
+    );
+}
+// SWEEP-SCAFFOLD end
 
 /// The per-query pool of [`a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry`]:
 /// ample against the statement's peak, so neither attempt is refused by the

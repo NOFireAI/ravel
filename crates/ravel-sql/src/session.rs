@@ -596,7 +596,13 @@ fn disk_manager_builder(spill: SpillDecision<'_>) -> DiskManagerBuilder {
         }
         SpillDecision::Enabled { dir, max_bytes } => DiskManagerBuilder::default()
             .with_mode(DiskManagerMode::Directories(vec![dir.to_path_buf()]))
-            .with_max_temp_directory_size(max_bytes),
+            .with_max_temp_directory_size(max_bytes)
+            .with_max_spill_merge_fan_in(
+                std::env::var("RAVEL_SWEEP_FAN_IN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
+            ),
     }
 }
 
