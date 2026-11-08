@@ -1049,7 +1049,7 @@ async fn usage_on_cancel_sums_both_attempts_of_a_retry() {
 ///
 /// FLIP: make `LiveCost::install` replace the held handle instead of pushing
 /// one, and the record reads the held attempt's 2 requests (1 list, 1 get)
-/// instead of 6.
+/// instead of 7.
 #[tokio::test]
 async fn usage_on_cancel_sums_both_attempts_of_an_exemplars_retry() {
     let plan = FaultPlan::empty().with_rule(
@@ -1080,18 +1080,20 @@ async fn usage_on_cancel_sums_both_attempts_of_an_exemplars_retry() {
     let usage = h.usage.records();
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].1, UsageStatus::Canceled);
-    // The discarded attempt's whole resolve plus what the second attempt had
-    // reached. Unlike the engine, this path records a segment GET only once
-    // it returns an object, so the 404 itself is in neither part.
+    // The discarded attempt in full, its 404'd segment GET included, plus what
+    // the second attempt had reached. As in the engine, the segment GET is
+    // billed once issued, so the 404 counts as one request.
     assert_eq!(
         usage[0].2.total_s3_requests(),
-        SPEND_PER_RESOLVE_WITH_ONE_SEGMENT + SPEND_BEFORE_FIRST_LIST
+        SPEND_PER_RESOLVE_WITH_ONE_SEGMENT
+            + SPEND_OF_THE_INVALIDATED_FETCH
+            + SPEND_BEFORE_FIRST_LIST
     );
     // Split by operation: the discarded attempt's two listings and the held
-    // attempt's one, and three gets (each attempt's catalog HEAD read and the
-    // discarded attempt's commit-record read).
+    // attempt's one, and four gets (each attempt's catalog HEAD read, the
+    // discarded attempt's commit-record read, and its 404'd segment GET).
     assert_eq!(usage[0].2.s3_requests(AccountedOp::List), 3);
-    assert_eq!(usage[0].2.s3_requests(AccountedOp::Get), 3);
+    assert_eq!(usage[0].2.s3_requests(AccountedOp::Get), 4);
     assert_eq!(h.cost.records().len(), 0);
 }
 
@@ -1100,7 +1102,7 @@ async fn usage_on_cancel_sums_both_attempts_of_an_exemplars_retry() {
 /// its `stats` report, as a completed PromQL or SQL call is.
 ///
 /// FLIP: fold the completed read's usage and cost from the live view, and both
-/// records read 8 requests (the discarded attempt's 4 beside these 4).
+/// records read 9 requests (the discarded attempt's 5 beside these 4).
 #[tokio::test]
 async fn completed_exemplars_retry_bills_the_attempt_that_answered() {
     use ravel_object_store::fault::Sequence;
@@ -1133,7 +1135,7 @@ async fn completed_exemplars_retry_bills_the_attempt_that_answered() {
     assert_eq!(fault_store.sequence_progress(0), 1);
 
     // The answering attempt: its two listings, its catalog HEAD read and its
-    // segment read. None of the discarded attempt's 4 requests.
+    // segment read. None of the discarded attempt's 5 requests.
     let spend = outcome.stats.spend();
     assert_eq!(spend.s3_requests(AccountedOp::List), LISTS_PER_RESOLVE);
     assert_eq!(spend.s3_requests(AccountedOp::Get), 2);
