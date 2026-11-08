@@ -7621,7 +7621,10 @@ mod tests {
 
             /// ADR-3326, view memo amendment, T5 with the real memo: a fill
             /// the margin refuses under a registered evictor over unheld
-            /// data entries evicts nothing, and every entry still hits.
+            /// data entries builds no views, validates nothing, evicts
+            /// nothing, and every entry still hits. With exactly the margin
+            /// plus the views free the fill succeeds, and a closed host gate
+            /// refuses the fill before it builds.
             #[test]
             fn a_real_memo_fill_never_evicts_a_data_entry() {
                 let budget = Arc::new(MemoryBudget::new(LIMIT));
@@ -7637,12 +7640,21 @@ mod tests {
                     LIMIT - budget.reserved() - (admission_margin(LIMIT) + VIEW_BYTES - 1),
                 );
                 let p = pass(&obj, &cfg, &block, &cache, 9);
+                let memo = view_registry::memo_of(&values_of(&p.batches[0])).expect("registered");
+                let before = p.validated.value();
                 let got = group_key(&p.batches[0], true);
                 identical(&got, &group_key(&p.batches[0], false)).expect("the cast");
                 assert_eq!(p.counters.view_snapshot().refusals, 1);
+                assert_eq!(p.counters.view_snapshot().fills, 0);
+                assert_eq!(
+                    memo.view_builds.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "the refused fill built no views"
+                );
+                assert_eq!(p.validated.value() - before, 0, "strCellsValidated");
                 assert_eq!(cache.pressure_counters().evictions, 0);
                 assert_eq!(cache.process_counters().evictions, 0);
-                drop((got, p));
+                drop((got, p, memo));
                 let again = pass(&obj, &cfg, &block, &cache, 9);
                 let s = again.counters.snapshot();
                 assert_eq!((s.hits, s.misses), (entries, 0), "every entry still hits");
@@ -7679,6 +7691,43 @@ mod tests {
                 let again = pass(&obj, &cfg, &block, &cache, 9);
                 let s = again.counters.snapshot();
                 assert_eq!((s.hits, s.misses), (entries, 0), "object 9 still hits");
+                drop(again);
+
+                // Exactly the margin plus the views free: the fill fits.
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                budget.reserve_unchecked(
+                    LIMIT - budget.reserved() - (admission_margin(LIMIT) + VIEW_BYTES),
+                );
+                let memo = view_registry::memo_of(&values_of(&p.batches[0])).expect("registered");
+                let got = group_key(&p.batches[0], true);
+                identical(&got, &group_key(&p.batches[0], false)).expect("the cast");
+                assert_eq!(p.counters.view_snapshot().fills, 1, "the boundary fill");
+                assert_eq!(p.counters.view_snapshot().refusals, 0);
+                assert_eq!(cache.view_resident_bytes(), VIEW_BYTES);
+                assert_eq!(
+                    memo.view_builds.load(std::sync::atomic::Ordering::Relaxed),
+                    1
+                );
+                drop((got, p, memo, cache));
+
+                // A closed host gate below its floor: refused before the build.
+                let budget = Arc::new(MemoryBudget::new(LIMIT));
+                let (_, _, _, cache, p) = filled(&budget, VIEW_BUDGET);
+                budget.set_host_memory_gate(false, GATE_FLOOR - 1, GATE_FLOOR);
+                let memo = view_registry::memo_of(&values_of(&p.batches[0])).expect("registered");
+                let before = p.validated.value();
+                let got = group_key(&p.batches[0], true);
+                identical(&got, &group_key(&p.batches[0], false)).expect("the cast");
+                assert_eq!(p.counters.view_snapshot().refusals, 1, "the gate refuses");
+                assert_eq!(p.counters.view_snapshot().fills, 0);
+                assert_eq!(
+                    memo.view_builds.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "the gate refused before the build"
+                );
+                assert_eq!(p.validated.value() - before, 0, "strCellsValidated");
+                assert_eq!(cache.view_resident_bytes(), 0);
             }
 
             /// Sets `budget` so the request it returns is refused for
