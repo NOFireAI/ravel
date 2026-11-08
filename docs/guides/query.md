@@ -715,6 +715,13 @@ see a span whose log lines are not visible yet, or the reverse.
   `l.body LIKE ...`) uses the built-in operator, which accepts only the
   backslash escape and string operands.
 
+A `GROUP BY ... LIMIT n` with no `ORDER BY` and at least one aggregate feeds
+its final aggregate only the rows of the first `n` groups each partition
+sees (for `n` up to 1024 by default), so its memory follows `n` rather than
+the number of groups, and every group it returns is aggregated over all of
+its rows (see the
+[query engine](../query-engine.md#bounded-groups-for-an-unordered-group-by--limit-adr-3985)).
+
 ### Parquet tables
 
 The same endpoint also serves the Parquet tables of the tenant. A query can
