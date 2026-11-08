@@ -1219,7 +1219,8 @@ metrics leaf in the snapshot, `segmentsPrunedByLabelIndex` and the
 `labelIndexValues`, beside it, lists the passes: one object per distinct
 routed value, in the order they were issued (the values' byte order). The
 field is absent when the route did not run
-(`a_route_that_did_not_run_reports_no_value`). A value is identified by
+(`a_route_that_did_not_run_reports_no_value`,
+`a_pending_erasure_routes_no_value`). A value is identified by
 `valueKey8`, its `key8` (the first 8 bytes of the value's unkeyed blake3,
 what the leaf indexes) as 16 lowercase hex digits; the value itself is never
 in the stats. Each object carries:
@@ -1230,18 +1231,25 @@ in the stats. Each object carries:
   bytes as transferred, counted like the phase figures: a GET the store
   retried counts once with the bytes of its successful read only, and a
   range read counts the bytes it returned. The `leafGetRequests` of all
-  entries sum to the `keyIndex` phase's GETs
-  (`each_routed_value_reports_its_own_pass_and_what_it_alone_pruned`).
-- `leafCacheHits`: leaf reads the read cache served with no GET
-  (`a_passes_leaf_cache_hits_reach_its_figures`). A read handed another
+  entries sum to the metrics route's own leaf GETs, which are the `keyIndex`
+  phase's GETs for a statement that reads only metrics
+  (`each_routed_value_reports_its_own_pass_and_what_it_alone_pruned`). A
+  statement that also reads logs merges the log lane's phases into the same
+  totals, and the log lane's keyed page reads charge `keyIndex` too.
+- `leafCacheHits`: leaf reads the read cache served with no GET; they add
+  nothing to `leafGetRequests` (`a_passes_leaf_cache_hits_reach_its_figures`).
+  A read handed another
   caller's in-flight GET counts neither here nor in `leafGetRequests`.
 - `partsCovered`, `partsUncovered`, `partsBeyondCeiling`, `leavesRejected`,
   `reservationsRefused` and `skippedByBudget`: the pass's part outcomes,
   the figures `ravel_query_key_index_parts_total` adds up.
 - `segmentsPruned`: the segments the pass routed `Pruned`.
-- `segmentsPrunedAlone`: of those, the segments no other value of a plan
-  holding this value routed `Pruned`, so what this value removed that the
-  plan's other values would not have.
+- `segmentsPrunedAlone`: of those, the segments for which some plan holding
+  this value has no other value that routed them `Pruned`, so what this value
+  removed that that plan's other values would not have. A plan drops a
+  segment only for its own values: a value another plan carries prunes
+  nothing from it
+  (`a_value_only_another_plan_carries_prunes_nothing_from_this_plan`).
 
 ### The L0 page-range bound (ADR-1306)
 

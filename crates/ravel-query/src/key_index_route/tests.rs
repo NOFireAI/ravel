@@ -1838,31 +1838,22 @@ async fn a_route_that_did_not_run_reports_no_value() {
     assert_eq!(accounting.key_index().snapshot().total_s3_requests(), 0);
 }
 
-/// Reports every leaf read as a cache hit, then reads it from the store.
-struct CacheHitReader(StoreLeafReader);
-
-impl LeafRangeReader for CacheHitReader {
-    fn read_range<'a>(
-        &'a self,
-        leaf: &'a SnapshotKeyIndexLeafRef,
-        range: Range<u64>,
-        accounting: &'a QueryAccounting,
-    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
-        accounting.record_cache_hit();
-        self.0.read_range(leaf, range, accounting)
-    }
-}
-
 #[tokio::test]
-async fn a_passes_leaf_cache_hits_reach_its_figures() {
-    let fx = fixture(
-        &[PartSpec::simple(vec![rows(&[(1, &[0])])])],
+async fn a_pending_erasure_routes_no_value() {
+    let mut fx = fixture(
+        &[PartSpec::simple(vec![
+            rows(&[(1, &[0])]),
+            rows(&[(2, &[0])]),
+        ])],
         &[],
         KeyType::Str,
     )
     .await;
+    fx.snapshot
+        .pending_erasure
+        .push(ravel_proto::commit::v1::ErasureRequest::default());
     let accounting = PhaseAccounting::new();
-    let reader = CacheHitReader(StoreLeafReader::new(fx.store.clone()));
+    let reader = CountingReader::new(fx.store.clone());
     let budget = ThresholdBudget::new(u64::MAX);
     let totals = RouteTotals::new();
     let plans = vec![vec![("__name__", "value-1")]];
@@ -1874,7 +1865,178 @@ async fn a_passes_leaf_cache_hits_reach_its_figures() {
     )
     .await
     .expect("route");
-    let figures = &routing.values[0].figures;
-    assert!(figures.leaf_get_requests > 0);
-    assert_eq!(figures.leaf_cache_hits, figures.leaf_get_requests);
+    assert_eq!(routing, ValueRouting::unrouted(1));
+    assert!(routing.values.is_empty());
+    assert_eq!(reader.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(accounting.key_index().snapshot().total_s3_requests(), 0);
+}
+
+#[tokio::test]
+async fn a_value_only_another_plan_carries_prunes_nothing_from_this_plan() {
+    // Plan A holds value-1; plan B holds value-1 and value-2. Segment 0
+    // holds both values, segment 1 only value-1, segment 2 neither, and
+    // segment 3 only value-2.
+    let spec = PartSpec::simple(vec![
+        rows(&[(1, &[0]), (2, &[1])]),
+        rows(&[(1, &[0])]),
+        rows(&[(3, &[0])]),
+        rows(&[(2, &[0])]),
+    ]);
+    let fx = fixture(&[spec], &[], KeyType::Str).await;
+    let accounting = PhaseAccounting::new();
+    let reader = CountingReader::new(fx.store.clone());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let totals = RouteTotals::new();
+    let plans = vec![
+        vec![("__name__", "value-1")],
+        vec![("__name__", "value-1"), ("job", "value-2")],
+    ];
+    let routing = route_values_under(
+        value_input(&fx, &accounting, &reader, &budget),
+        &plans,
+        UNBOUNDED,
+        &totals,
+    )
+    .await
+    .expect("route");
+
+    // value-2 prunes segment 1, which plan A reads and plan B drops.
+    assert_eq!(
+        routing.plan_keeps,
+        vec![
+            Some(vec![true, true, false, false]),
+            Some(vec![true, false, false, false]),
+        ]
+    );
+    assert_eq!(routing.values.len(), 2);
+    let (first, second) = (&routing.values[0], &routing.values[1]);
+    assert_eq!(first.key8_hex, hex::encode(key8_str("value-1")));
+    assert_eq!(second.key8_hex, hex::encode(key8_str("value-2")));
+    assert_eq!(first.labels, vec!["__name__".to_string()]);
+    assert_eq!(second.labels, vec!["job".to_string()]);
+    assert_eq!((first.segments_pruned, second.segments_pruned), (2, 2));
+    // value-1 alone pruned segment 3 in both plans and segment 2 in plan A,
+    // which holds no other value, though value-2 also pruned segment 2 in
+    // plan B. value-2 alone pruned segment 1 only: in plan B, the one plan
+    // holding it, value-1 also pruned segment 2.
+    assert_eq!(
+        (first.segments_pruned_alone, second.segments_pruned_alone),
+        (2, 1)
+    );
+}
+
+/// Serves a range it has already read from memory as a cache hit with no
+/// GET, as `read_leaf_range` does on `ReadOutcome::Hit`; any other range is
+/// one GET through the store, a miss.
+struct CachingLeafReader {
+    store: CountingReader,
+    cached: std::sync::Mutex<BTreeMap<(String, u64, u64), Bytes>>,
+    hits: AtomicU64,
+}
+
+impl CachingLeafReader {
+    fn new(store: Arc<dyn ObjectStoreBackend>) -> Self {
+        CachingLeafReader {
+            store: CountingReader::new(store),
+            cached: std::sync::Mutex::new(BTreeMap::new()),
+            hits: AtomicU64::new(0),
+        }
+    }
+}
+
+impl LeafRangeReader for CachingLeafReader {
+    fn read_range<'a>(
+        &'a self,
+        leaf: &'a SnapshotKeyIndexLeafRef,
+        range: Range<u64>,
+        accounting: &'a QueryAccounting,
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
+        Box::pin(async move {
+            let key = (leaf.key.clone(), range.start, range.end);
+            let cached = self.cached.lock().expect("cache lock").get(&key).cloned();
+            if let Some(bytes) = cached {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+                return Ok(bytes);
+            }
+            let bytes = self.store.read_range(leaf, range, accounting).await?;
+            accounting.record_cache_miss();
+            self.cached
+                .lock()
+                .expect("cache lock")
+                .insert(key, bytes.clone());
+            Ok(bytes)
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_passes_leaf_cache_hits_reach_its_figures() {
+    let fx = fixture(
+        &[PartSpec::simple(vec![
+            rows(&[(1, &[0]), (2, &[1])]),
+            rows(&[(1, &[0])]),
+        ])],
+        &[],
+        KeyType::Str,
+    )
+    .await;
+    let reader = CachingLeafReader::new(fx.store.clone());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let totals = RouteTotals::new();
+
+    // A cold pass for value-1 warms the reader.
+    let cold_accounting = PhaseAccounting::new();
+    let cold = route_values_under(
+        value_input(&fx, &cold_accounting, &reader, &budget),
+        &[vec![("__name__", "value-1")]],
+        UNBOUNDED,
+        &totals,
+    )
+    .await
+    .expect("cold route");
+    let cold_gets = reader.store.calls.load(Ordering::Relaxed);
+    assert!(cold_gets > 0);
+    assert_eq!(cold.values[0].figures.leaf_get_requests, cold_gets);
+    assert_eq!(cold.values[0].figures.leaf_cache_hits, 0);
+
+    // value-1's second pass reads the same ranges, all cached; value-2's
+    // pass, issued after it, reads whatever was not.
+    let accounting = PhaseAccounting::new();
+    let routing = route_values_under(
+        ValueRouteInput {
+            concurrency: 1,
+            ..value_input(&fx, &accounting, &reader, &budget)
+        },
+        &[vec![("__name__", "value-1"), ("job", "value-2")]],
+        UNBOUNDED,
+        &totals,
+    )
+    .await
+    .expect("route");
+    let warm = &routing.values[0].figures;
+    assert_eq!(routing.values[0].key8_hex, hex::encode(key8_str("value-1")));
+    assert_eq!(warm.leaf_cache_hits, cold_gets);
+    assert_eq!(warm.leaf_get_requests, 0);
+    assert_eq!(warm.leaf_wire_bytes, 0);
+
+    let store_gets = reader.store.calls.load(Ordering::Relaxed) - cold_gets;
+    let hits = reader.hits.load(Ordering::Relaxed);
+    let key_index = accounting.key_index().snapshot();
+    let leaf_gets: u64 = routing
+        .values
+        .iter()
+        .map(|v| v.figures.leaf_get_requests)
+        .sum();
+    let leaf_hits: u64 = routing
+        .values
+        .iter()
+        .map(|v| v.figures.leaf_cache_hits)
+        .sum();
+    assert_eq!(leaf_hits, hits);
+    assert_eq!(leaf_hits, key_index.cache_hits);
+    assert_eq!(leaf_gets, store_gets);
+    assert_eq!(leaf_gets, key_index.s3_requests(AccountedOp::Get));
+    assert_eq!(leaf_gets, key_index.total_s3_requests());
 }
