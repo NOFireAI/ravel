@@ -4378,6 +4378,10 @@ pub struct DecodedCacheMetrics {
     pub counters: ravel_logseg::decoded_cache::DecodedCacheSnapshot,
     pub pressure: ravel_logseg::decoded_cache::PressureSnapshot,
     pub expired_drops: u64,
+    /// The view budget (`--decoded-cache-view-max-bytes`, resolved).
+    pub view_max_bytes: u64,
+    /// The view memo figures (ADR-3326, view memo amendment, decision 7).
+    pub views: ravel_logseg::decoded_cache::ViewMemoSnapshot,
 }
 
 impl DecodedCacheMetrics {
@@ -4389,15 +4393,29 @@ impl DecodedCacheMetrics {
             counters: cache.process_counters(),
             pressure: cache.pressure_counters(),
             expired_drops: cache.expired_drops(),
+            view_max_bytes: cache.view_max_bytes(),
+            views: cache.view_counters(),
         }
     }
 }
 
 /// The ADR-3326 decoded column-block cache families, `{mode}` only: occupancy
 /// as gauges, and the process-wide hit, miss, admission, eviction, ghost-hit,
-/// margin-skip, pressure-eviction and age-drop counts as counters.
+/// margin-skip, pressure-eviction and age-drop counts as counters, with the
+/// view memo's bytes and budget as gauges and its fills, refusals and
+/// pressure releases as counters.
 fn render_decoded_cache_family(out: &mut String, mode: Mode, m: &DecodedCacheMetrics) {
     let gauges = [
+        (
+            "ravel_decoded_cache_view_bytes",
+            "Bytes of view memos the decoded column-block cache's entries hold, against its view budget.",
+            m.views.bytes,
+        ),
+        (
+            "ravel_decoded_cache_view_max_bytes",
+            "The decoded column-block cache's view budget (--decoded-cache-view-max-bytes, resolved).",
+            m.view_max_bytes,
+        ),
         (
             "ravel_decoded_cache_resident_bytes",
             "Bytes of decoded columns the decoded column-block cache's index holds.",
@@ -4458,6 +4476,21 @@ fn render_decoded_cache_family(out: &mut String, mode: Mode, m: &DecodedCacheMet
             "ravel_decoded_cache_expired_drops_total",
             "Entries dropped for exceeding the age bound, at access or by the periodic sweep.",
             m.expired_drops,
+        ),
+        (
+            "ravel_decoded_cache_view_fills_total",
+            "View memos charged to the decoded column-block cache's view budget.",
+            m.views.fills,
+        ),
+        (
+            "ravel_decoded_cache_view_refusals_total",
+            "View memo fills the view budget or the memory budget refused.",
+            m.views.refusals,
+        ),
+        (
+            "ravel_decoded_cache_view_releases_total",
+            "View memos the memory budget's evictor released before any data entry.",
+            m.views.releases,
         ),
     ];
     for (name, help, value) in counters {

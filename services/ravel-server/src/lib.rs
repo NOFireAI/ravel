@@ -3817,10 +3817,22 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             let mut state = state;
             let decoded_cache_max_bytes = config.query_budgets.decoded_cache_max_bytes;
             if decoded_cache_max_bytes > 0 {
-                let cache = Arc::new(ravel_logseg::decoded_cache::DecodedColumnCache::new(
+                // The view memo's budget beside the data cap (ADR-3326, view
+                // memo amendment, decision 3), logged with the term that set
+                // it.
+                let view_budget = config::resolve_decoded_cache_view_max_bytes(
+                    config.query_budgets.decoded_cache_view_max_bytes,
                     decoded_cache_max_bytes,
-                    Some(process_memory_budget.clone()),
-                ));
+                    process_memory_budget.limit(),
+                );
+                view_budget.log();
+                let cache = Arc::new(
+                    ravel_logseg::decoded_cache::DecodedColumnCache::new(
+                        decoded_cache_max_bytes,
+                        Some(process_memory_budget.clone()),
+                    )
+                    .with_view_max_bytes(view_budget.bytes),
+                );
                 let limit = process_memory_budget.limit();
                 let margin = ravel_logseg::decoded_cache::admission_margin(limit);
                 if limit < margin.saturating_mul(2) {

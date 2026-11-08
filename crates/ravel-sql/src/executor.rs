@@ -130,7 +130,7 @@ use futures::{Stream, StreamExt};
 use ravel_catalog::{
     Catalog, CatalogError, ColumnStatsRequest, SegmentOrigins, Snapshot, SnapshotParts,
 };
-use ravel_logseg::decoded_cache::{DecodedCacheSnapshot, PressureSnapshot};
+use ravel_logseg::decoded_cache::{DecodedCacheSnapshot, PressureSnapshot, ViewMemoSnapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
 use ravel_pqtable::clock::Clock;
@@ -865,11 +865,18 @@ impl Clocks {
 /// statement's start and its end: the budget's evictor does not know which
 /// statement's reservation asked, so a concurrent statement's evictions land
 /// here too.
+///
+/// `views` is the view memo figures (ADR-3326, view memo amendment, decision
+/// 7): the statement's own fills and refusals, the cache's view total when
+/// the statement finished, and the process-wide pressure releases between its
+/// start and its end, which, like `pressure`, can include a concurrent
+/// statement's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DecodedCacheStats {
     pub counters: DecodedCacheSnapshot,
     pub resident_bytes: u64,
     pub pressure: PressureSnapshot,
+    pub views: ViewMemoSnapshot,
 }
 
 /// What the executor actually did, for tests and operator metrics.
@@ -2722,6 +2729,11 @@ impl SqlExecutor {
             .decoded_cache()
             .map(|cache| cache.pressure_counters())
             .unwrap_or_default();
+        let view_mark = self
+            .log_fetcher
+            .decoded_cache()
+            .map(|cache| cache.view_counters())
+            .unwrap_or_default();
 
         // At most three passes: the original, the one snapshot retry the
         // consistency model allows, and the one spill retry (issue #3899),
@@ -2904,14 +2916,21 @@ impl SqlExecutor {
                     stats.cache = cache_mark
                         .as_ref()
                         .map(|mark| mark.since(phase_accounting.access_intent()));
-                    stats.decoded_cache =
-                        self.log_fetcher
-                            .decoded_cache()
-                            .map(|cache| DecodedCacheStats {
-                                counters: phase_accounting.decoded_cache_snapshot(),
-                                resident_bytes: cache.resident_bytes(),
-                                pressure: cache.pressure_counters().since(&pressure_mark),
-                            });
+                    stats.decoded_cache = self.log_fetcher.decoded_cache().map(|cache| {
+                        let statement = phase_accounting.decoded_cache_view_snapshot();
+                        let process = cache.view_counters().since(&view_mark);
+                        DecodedCacheStats {
+                            counters: phase_accounting.decoded_cache_snapshot(),
+                            resident_bytes: cache.resident_bytes(),
+                            pressure: cache.pressure_counters().since(&pressure_mark),
+                            views: ViewMemoSnapshot {
+                                bytes: process.bytes,
+                                fills: statement.fills,
+                                refusals: statement.refusals,
+                                releases: process.releases,
+                            },
+                        }
+                    });
                     let phase_snapshot = phase_accounting.snapshot();
                     let accounting = phase_snapshot.pooled();
                     if let Some(key) = read_bytes_key {

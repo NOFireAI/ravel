@@ -39,7 +39,7 @@ const STATEMENT: &str = "SELECT count(*) AS n FROM logs WHERE severity_text = 'I
 /// `Contains` arm.
 const URL: &str = "url";
 const LIKE_STATEMENT: &str = "SELECT count(*) AS n FROM logs WHERE url LIKE '%example%'";
-const FIELDS: [&str; 11] = [
+const FIELDS: [&str; 15] = [
     "hits",
     "misses",
     "admissions",
@@ -51,6 +51,10 @@ const FIELDS: [&str; 11] = [
     "pressureEvictions",
     "pressureFreedBytes",
     "deferredServed",
+    "viewMemoBytes",
+    "viewMemoFills",
+    "viewMemoRefusals",
+    "viewMemoReleases",
 ];
 
 fn tenant_hash() -> TenantHash {
@@ -367,10 +371,15 @@ async fn an_over_cap_fast_path_statement_reports_a_partial_estimate() {
     assert!(estimate * 20 > TINY_DECODED_CACHE * 19, "{stats}");
 }
 
-const METRIC_FAMILIES: [&str; 11] = [
+const METRIC_FAMILIES: [&str; 16] = [
     "ravel_decoded_cache_resident_bytes",
     "ravel_decoded_cache_max_bytes",
     "ravel_decoded_cache_entries",
+    "ravel_decoded_cache_view_bytes",
+    "ravel_decoded_cache_view_max_bytes",
+    "ravel_decoded_cache_view_fills_total",
+    "ravel_decoded_cache_view_refusals_total",
+    "ravel_decoded_cache_view_releases_total",
     "ravel_decoded_cache_hits_total",
     "ravel_decoded_cache_misses_total",
     "ravel_decoded_cache_admissions_total",
