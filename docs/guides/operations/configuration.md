@@ -1019,13 +1019,14 @@ The ceiling is one budget for the whole process:
 
 ### Startup log
 
-Startup logs the result on two `performance default resolved` lines, in the
+Startup logs the result on three `performance default resolved` lines, in the
 same `setting=... value=... source=...` layout as `sql_max_query_bytes`:
 
 | `setting` | `value` | `source` |
 |---|---|---|
 | `sql_spill_dir` | the spill directory, or `none` | `env`, `cache-dir`, `cache-dir-insufficient-space`, `cwd-default`, `cwd-tmpfs`, `cwd-unavailable`, `cwd-insufficient-space` or `flag-off` |
 | `sql_spill_max_bytes` | the process spill ceiling in bytes, or `none` | `env`, `env-override` (the variable alone over a `--cache-dir` root), `derived`, `cache-dir-insufficient-space`, `cwd-default`, `cwd-tmpfs`, `cwd-unavailable`, `cwd-insufficient-space` or `flag-off` |
+| `sql_spill_compression` | `lz4_frame`, the codec every spill file is written with, or `none` | `built-in` (no flag sets it), or the `sql_spill_dir` line's source when spill is off |
 
 Under `derived`, `cache-dir-insufficient-space`, `cwd-default` and
 `cwd-insufficient-space`, the `sql_spill_max_bytes` line also carries

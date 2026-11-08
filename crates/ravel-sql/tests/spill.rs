@@ -109,8 +109,10 @@ const AMPLE_SCRATCH_BYTES: u64 = 512 * 1024 * 1024;
 
 /// A per-query scratch quota far too small to hold the spilled group state, so
 /// the disk manager refuses a spill write and the query fails
-/// `SpillBudgetExhausted`. 64 KiB is below one spilled batch of the fixture.
-const TINY_SCRATCH_BYTES: u64 = 64 * 1024;
+/// `SpillBudgetExhausted`. 16 KiB is below one spilled batch of the fixture as
+/// lz4_frame writes it (measured: 33,584 bytes for the first 8,192 rows, which
+/// a 64 KiB quota admits).
+const TINY_SCRATCH_BYTES: u64 = 16 * 1024;
 
 /// Documented overhead the spilling query's pool-accounted peak reservation is
 /// allowed above the configured `max_query_bytes` cap. Zero: the pool's
@@ -681,7 +683,7 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
     );
     // The gauge the figure comes from (`DiskManager::used_disk_space`) excludes
     // the refused write and the spill file that write was for, which is gone by
-    // the time the error reaches the stream. Measured: 0 bytes of a 65,536-byte
+    // the time the error reaches the stream. Measured: 0 bytes of a 16,384-byte
     // quota.
     assert!(
         written < quota,
@@ -1421,12 +1423,16 @@ impl TopTen {
 }
 
 async fn run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> TopTen {
+    try_run_top_ten(executor, sql)
+        .await
+        .expect("the top-ten statement completes")
+}
+
+/// [`run_top_ten`] returning the statement's error instead of panicking.
+async fn try_run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> Result<TopTen, SqlError> {
     use datafusion::arrow::util::display::array_value_to_string;
 
-    let outcome = executor
-        .execute(q33_tenant(), &request(sql))
-        .await
-        .expect("the top-ten statement completes");
+    let outcome = executor.execute(q33_tenant(), &request(sql)).await?;
     let mut rows = Vec::new();
     for batch in outcome.output.batches() {
         for row in 0..batch.num_rows() {
@@ -1438,7 +1444,7 @@ async fn run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> TopTen {
             rows.push(cells.join("|"));
         }
     }
-    TopTen {
+    Ok(TopTen {
         rows,
         batches: outcome.output.batches().to_vec(),
         spill_files: outcome.stats.spill.files,
@@ -1448,7 +1454,7 @@ async fn run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> TopTen {
         spill_retry_bytes_written: outcome.stats.spill_retry.map(|r| r.spill_bytes_written),
         spill_retry_share_bytes: outcome.stats.spill_retry.and_then(|r| r.share_bytes),
         peak_pool_bytes: outcome.accounting.peak_intermediate_bytes,
-    }
+    })
 }
 
 /// Run `sql` over the q33 table three times: in memory under
@@ -2391,4 +2397,288 @@ async fn a_plan_time_statement_holds_one_share_and_a_concurrent_retry_still_spil
         "the plan-time statement holds one share, leaving three"
     );
     drop(holder);
+}
+
+/// SplitMix64's output function: a fixed bijection on `u64`, so fixture
+/// values look random and are the same on every run.
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Group `g` of a fixture written once per group in a scrambled order (a
+/// stride coprime to `groups`), with group `g < 10` another `11 - g` times at
+/// the end, so groups 0 to 9 hold the ten highest counts, 12 down to 3, and
+/// the top ten is decided by the counts alone.
+fn top_ten_groups(groups: u64) -> Vec<u64> {
+    let mut order: Vec<u64> = (0..groups).map(|i| (i * 7_919) % groups).collect();
+    for g in 0..10 {
+        order.extend(std::iter::repeat_n(
+            g,
+            usize::try_from(11 - g).expect("small"),
+        ));
+    }
+    order
+}
+
+/// `batch` as one Parquet object of 8,192-row row groups.
+fn parquet_of(batch: &RecordBatch) -> bytes::Bytes {
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_max_row_group_row_count(Some(8_192))
+        .build();
+    let mut out = Vec::new();
+    let mut writer =
+        ArrowWriter::try_new(&mut out, batch.schema(), Some(properties)).expect("writer");
+    writer.write(batch).expect("write");
+    writer.close().expect("close");
+    bytes::Bytes::from(out)
+}
+
+/// Distinct `(watch_id, client_ip)` groups in the row 33 fixture.
+const ROW_33_GROUPS: u64 = 300_000;
+
+/// The row 33 group key of group `g`: a random `watch_id`, so the key is
+/// near-unique, and a random `client_ip`.
+fn row_33_key(g: u64) -> (i64, i32) {
+    let watch_id = i64::from_ne_bytes(splitmix64(g).to_ne_bytes());
+    let high = u32::try_from(splitmix64(g ^ 0xC1) >> 32).expect("32 bits");
+    (watch_id, i32::from_ne_bytes(high.to_ne_bytes()))
+}
+
+/// The row 33 table, `row33`, with the ClickBench column types: `watch_id`
+/// (`Int64`) and `client_ip` (`Int32`) from [`row_33_key`], `is_refresh`
+/// (`Int16`, 0 or 1) and `resolution_width` (`Int16`, five screen widths),
+/// in the [`top_ten_groups`] order. Returns the file and its row count.
+fn row_33_parquet() -> (bytes::Bytes, u64) {
+    use datafusion::arrow::array::{ArrayRef, Int16Array, Int32Array};
+
+    const WIDTHS: [i16; 5] = [1024, 1280, 1366, 1440, 1920];
+    let groups = top_ten_groups(ROW_33_GROUPS);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("watch_id", DataType::Int64, false),
+        Field::new("client_ip", DataType::Int32, false),
+        Field::new("is_refresh", DataType::Int16, false),
+        Field::new("resolution_width", DataType::Int16, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                groups.iter().map(|&g| row_33_key(g).0),
+            )) as ArrayRef,
+            Arc::new(Int32Array::from_iter_values(
+                groups.iter().map(|&g| row_33_key(g).1),
+            )),
+            Arc::new(Int16Array::from_iter_values(
+                (0..groups.len()).map(|row| i16::from(row % 3 == 0)),
+            )),
+            Arc::new(Int16Array::from_iter_values(
+                (0..groups.len()).map(|row| WIDTHS[row % WIDTHS.len()]),
+            )),
+        ],
+    )
+    .expect("batch");
+    (parquet_of(&batch), groups.len() as u64)
+}
+
+/// Run `sql` over the one-file Parquet table `table`, spill configured with
+/// a scratch quota of `scratch_bytes` and a per-query pool of `query_bytes`.
+async fn run_one_file_table(
+    file: &(bytes::Bytes, u64),
+    table: &str,
+    sql: &str,
+    scratch_bytes: u64,
+    query_bytes: usize,
+) -> Result<TopTen, SqlError> {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = spill_config(scratch.path().to_path_buf(), scratch_bytes, query_bytes);
+    let executor = parquet_table_executor(
+        config,
+        std::slice::from_ref(file),
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        Arc::new(MemoryStore::new()),
+        table,
+    )
+    .await;
+    try_run_top_ten(&executor, sql).await
+}
+
+/// `sql` over `file` unlimited, asserting it answered on its first attempt
+/// without spilling, and the per-query pool that is `percent` of its peak.
+async fn unlimited_and_budget(
+    file: &(bytes::Bytes, u64),
+    table: &str,
+    sql: &str,
+    percent: u64,
+) -> (TopTen, usize) {
+    let unlimited = run_one_file_table(file, table, sql, AMPLE_SCRATCH_BYTES, AMPLE_QUERY_BYTES)
+        .await
+        .expect("the unlimited run answers");
+    assert_eq!(
+        (unlimited.spill_retries, unlimited.spill_files),
+        (0, 0),
+        "the unlimited run answers on its first attempt"
+    );
+    let budget = usize::try_from(unlimited.peak_pool_bytes * percent / 100).expect("fits");
+    (unlimited, budget)
+}
+
+/// The per-query pool of the row 33 retry, in percent of the unlimited run's
+/// peak: low enough that the retry takes a merge pass, writing four spill
+/// files and 545,769 rows for the fixture's 300,000 groups.
+const ROW_33_POOL_PERCENT: u64 = 30;
+
+/// The row 33 scratch quota: strictly between the retry's live scratch peak
+/// with lz4_frame spill files (between 8,697,433 and 8,710,375 bytes,
+/// bisected) and with uncompressed ones (between 32,664,901 and 32,713,509),
+/// about twice the first and half the second.
+const ROW_33_SCRATCH_BYTES: u64 = 16 << 20;
+
+/// Issue #3899, the ClickBench row 33 shape with integer keys: `GROUP BY` a
+/// near-unique `Int64` and an `Int32`, with `COUNT(*)`, a `SUM` of a 0/1
+/// column and an `AVG` of a five-valued one, `ORDER BY` the count. Its retry
+/// writes 8,835,488 spill bytes as lz4_frame (33,183,392 uncompressed, a
+/// ratio of 3.76) and fits a scratch quota its uncompressed spill does not,
+/// answering with the unlimited run's rows.
+///
+/// Prove-the-test: set `SpillDecision::SPILL_COMPRESSION` in `session.rs` to
+/// `SpillCompression::Uncompressed` and the retry fails with
+/// `SpillBudgetExhausted`.
+#[tokio::test]
+async fn the_clickbench_row_33_shape_fits_its_scratch_quota_with_lz4_spill_files() {
+    let sql = "SELECT watch_id, client_ip, COUNT(*) AS c, SUM(is_refresh) AS r, \
+               AVG(resolution_width) AS w FROM row33 GROUP BY watch_id, client_ip \
+               ORDER BY c DESC LIMIT 10";
+    let file = row_33_parquet();
+    let (unlimited, budget) = unlimited_and_budget(&file, "row33", sql, ROW_33_POOL_PERCENT).await;
+    let keys: Vec<String> = unlimited
+        .rows
+        .iter()
+        .map(|row| row.split('|').take(3).collect::<Vec<_>>().join("|"))
+        .collect();
+    let expected: Vec<String> = (0..10)
+        .map(|g| {
+            let (watch_id, client_ip) = row_33_key(g);
+            format!("{watch_id}|{client_ip}|{}", 12 - g)
+        })
+        .collect();
+    assert_eq!(keys, expected, "groups 0 to 9 by count");
+
+    let spilled = run_one_file_table(&file, "row33", sql, ROW_33_SCRATCH_BYTES, budget)
+        .await
+        .expect("the retry fits the scratch quota");
+    eprintln!(
+        "issue #3899 row 33: pool={budget} scratch quota={ROW_33_SCRATCH_BYTES} spill files={} \
+         rows_written={} bytes_written={:?}",
+        spilled.spill_files, spilled.spill_rows_written, spilled.spill_retry_bytes_written
+    );
+    assert_eq!(spilled.spill_retries, 1, "answered on the spill retry");
+    assert!(
+        spilled.spill_files >= 3,
+        "the retry spilled at least two runs and a merge pass: files={}",
+        spilled.spill_files
+    );
+    assert!(
+        spilled
+            .spill_retry_bytes_written
+            .is_some_and(|b| b > 0 && b < ROW_33_SCRATCH_BYTES),
+        "bytes_written={:?}",
+        spilled.spill_retry_bytes_written
+    );
+    assert_eq!(spilled.rows, unlimited.rows, "row for row");
+}
+
+/// Issue #3899, string keys: the q33 `GROUP BY a, b` statement's retry spills
+/// lz4_frame runs. Its compression ratio (8,094,736 bytes uncompressed
+/// against 1,090,336, 7.42) is context printed here, not asserted.
+#[tokio::test]
+async fn a_string_keyed_spill_is_written_with_lz4() {
+    let (spilled, _) = spilled_and_unlimited(
+        "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10",
+    )
+    .await;
+    eprintln!(
+        "issue #3899 q33 strings: spill files={} rows_written={} bytes_written={:?}",
+        spilled.spill_files, spilled.spill_rows_written, spilled.spill_retry_bytes_written
+    );
+}
+
+/// Distinct keys in the incompressible fixture, and the bytes of each key.
+const RANDOM_GROUPS: u64 = 100_000;
+const RANDOM_KEY_BYTES: u64 = 128;
+
+/// The incompressible table, `noise`: one `Binary` column `k` of
+/// [`RANDOM_KEY_BYTES`] SplitMix64 bytes per group, in the
+/// [`top_ten_groups`] order. Returns the file and its row count.
+fn random_parquet() -> (bytes::Bytes, u64) {
+    use datafusion::arrow::array::{ArrayRef, BinaryArray};
+
+    let words = RANDOM_KEY_BYTES / 8;
+    let key = |g: u64| -> Vec<u8> {
+        (0..words)
+            .flat_map(|word| splitmix64(g * words + word).to_le_bytes())
+            .collect()
+    };
+    let keys: Vec<Vec<u8>> = top_ten_groups(RANDOM_GROUPS).into_iter().map(key).collect();
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Binary, false)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(BinaryArray::from_iter_values(keys.iter())) as ArrayRef],
+    )
+    .expect("batch");
+    (parquet_of(&batch), keys.len() as u64)
+}
+
+/// The per-query pool of the incompressible retry, in percent of the
+/// unlimited run's peak. Its 128-byte keys leave the aggregate less room per
+/// group than the integer and string fixtures do, and at 60 percent the
+/// retry's own grow is refused.
+const RANDOM_POOL_PERCENT: u64 = 80;
+
+/// The incompressible retry's spill bytes with uncompressed spill files,
+/// measured with `SpillDecision::SPILL_COMPRESSION` set to
+/// `SpillCompression::Uncompressed`. With lz4_frame it writes 13,697,776, a
+/// ratio of 1.11: the keys stay as written and the offsets and counts shrink.
+const RANDOM_UNCOMPRESSED_SPILL_BYTES: u64 = 15_229_920;
+
+/// Issue #3899, incompressible data: grouping by random 128-byte keys, the
+/// retry answers with the unlimited run's rows, and its lz4_frame spill takes
+/// at most 1.05 times the bytes of the uncompressed one, because Arrow IPC
+/// keeps a buffer the codec does not shrink uncompressed.
+#[tokio::test]
+async fn an_incompressible_spill_costs_no_more_disk_with_lz4() {
+    let sql = "SELECT k, COUNT(*) AS c FROM noise GROUP BY k ORDER BY c DESC LIMIT 10";
+    let file = random_parquet();
+    let (unlimited, budget) = unlimited_and_budget(&file, "noise", sql, RANDOM_POOL_PERCENT).await;
+    let counts: Vec<String> = unlimited
+        .rows
+        .iter()
+        .map(|row| row.split('|').nth(1).expect("count").to_string())
+        .collect();
+    let expected: Vec<String> = (0..10).map(|g| (12 - g).to_string()).collect();
+    assert_eq!(counts, expected, "groups 0 to 9 by count");
+
+    let spilled = run_one_file_table(&file, "noise", sql, AMPLE_SCRATCH_BYTES, budget)
+        .await
+        .expect("the retry answers");
+    eprintln!(
+        "issue #3899 incompressible: pool={budget} spill files={} rows_written={} \
+         bytes_written={:?}, uncompressed {RANDOM_UNCOMPRESSED_SPILL_BYTES}",
+        spilled.spill_files, spilled.spill_rows_written, spilled.spill_retry_bytes_written
+    );
+    assert_eq!(spilled.spill_retries, 1, "answered on the spill retry");
+    let written = spilled
+        .spill_retry_bytes_written
+        .expect("the retry reports its spill bytes");
+    assert!(
+        written > 0 && written * 100 <= RANDOM_UNCOMPRESSED_SPILL_BYTES * 105,
+        "lz4_frame spill bytes {written} against {RANDOM_UNCOMPRESSED_SPILL_BYTES} uncompressed"
+    );
+    assert_eq!(spilled.rows, unlimited.rows, "row for row");
 }

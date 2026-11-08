@@ -803,6 +803,9 @@ pub const SQL_SPILL_SOURCE_CWD_UNAVAILABLE: &str = "cwd-unavailable";
 /// because half the volume's free space is below the 1 GiB floor
 /// ([`ravel_sql::derive_spill_max_bytes`] returns `None`).
 pub const SQL_SPILL_SOURCE_CWD_INSUFFICIENT_SPACE: &str = "cwd-insufficient-space";
+/// `source` of the `sql_spill_compression` line when spill is on: the codec
+/// is [`ravel_sql::SpillDecision::SPILL_COMPRESSION`], which no flag sets.
+pub const SQL_SPILL_SOURCE_BUILT_IN: &str = "built-in";
 
 /// The owned form of [`ravel_sql::CacheDirSpill`]: what a `--cache-dir`
 /// deployment resolves its SQL spill root and ceiling from (ADR-0954, amended
@@ -886,9 +889,9 @@ pub struct ResolvedSqlSpill {
 
 #[cfg(feature = "sql")]
 impl ResolvedSqlSpill {
-    /// The `sql_spill_dir` and `sql_spill_max_bytes` startup lines, in the
-    /// `performance default resolved` layout
-    /// [`crate::config::ResolvedPerformanceDefaults::emit`] uses. Both lines
+    /// The `sql_spill_dir`, `sql_spill_max_bytes` and `sql_spill_compression`
+    /// startup lines, in the `performance default resolved` layout
+    /// [`crate::config::ResolvedPerformanceDefaults::emit`] uses. All three
     /// are written whether or not spill is enabled; a disabled spill reads
     /// `value="none"` with the reason as its source. When the ceiling was
     /// derived from `--cache-dir`, or refused for lack of space there, the
@@ -914,6 +917,13 @@ impl ResolvedSqlSpill {
                     read_cache_bytes,
                     "performance default resolved"
                 );
+                let compression = ravel_sql::SpillDecision::SPILL_COMPRESSION.to_string();
+                tracing::info!(
+                    setting = "sql_spill_compression",
+                    value = compression.as_str(),
+                    source = SQL_SPILL_SOURCE_BUILT_IN,
+                    "performance default resolved"
+                );
             }
             None => {
                 tracing::info!(
@@ -928,6 +938,12 @@ impl ResolvedSqlSpill {
                     source = self.max_bytes_source,
                     free_bytes,
                     read_cache_bytes,
+                    "performance default resolved"
+                );
+                tracing::info!(
+                    setting = "sql_spill_compression",
+                    value = "none",
+                    source = self.dir_source,
                     "performance default resolved"
                 );
                 if self.max_bytes_source == SQL_SPILL_SOURCE_INSUFFICIENT_SPACE {
@@ -4258,14 +4274,16 @@ mod tests {
         state.executor.config().spill.clone()
     }
 
-    /// The startup lines: `sql_spill_dir` and `sql_spill_max_bytes` each
-    /// appear exactly once, on the `performance default resolved` layout, with
-    /// the value and source of the cache-dir, env, off and insufficient-space
-    /// cases.
+    /// The startup lines: `sql_spill_dir`, `sql_spill_max_bytes` and
+    /// `sql_spill_compression` each appear exactly once, on the `performance
+    /// default resolved` layout, with the value and source of the cache-dir,
+    /// env, off and insufficient-space cases. The compression line reads
+    /// `value="lz4_frame" source="built-in"` with spill on, and the spill
+    /// directory line's `value="none"` and source with it off.
     ///
     /// Prove-the-test: label the cache-dir ceiling `SQL_SPILL_SOURCE_ENV` in
     /// `resolve_sql_spill` and the cache-dir row reads `source="env"`; drop
-    /// the `None` arm's two lines in `ResolvedSqlSpill::emit` and the off row
+    /// the `None` arm's three lines in `ResolvedSqlSpill::emit` and the off row
     /// finds no line; drop the insufficient-space arm in `resolve_sql_spill`
     /// and that row reads `source="unset"`.
     #[test]
@@ -4331,6 +4349,16 @@ mod tests {
             assert!(dir_line.contains(&dir_fields), "{label}: {dir_line}");
             let max_line = resolved_line(&lines, "sql_spill_max_bytes");
             assert!(max_line.contains(&max_fields), "{label}: {max_line}");
+            let compression_fields = if dir_fields.starts_with(" value=\"none\"") {
+                dir_fields
+            } else {
+                " value=\"lz4_frame\" source=\"built-in\"".to_string()
+            };
+            let compression_line = resolved_line(&lines, "sql_spill_compression");
+            assert!(
+                compression_line.contains(&compression_fields),
+                "{label}: {compression_line}"
+            );
         }
     }
 
