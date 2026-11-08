@@ -1744,6 +1744,13 @@ const SPILL_MODE_HEADROOM_FLOOR_BYTES: usize = 64 << 20;
 /// in percent of the unlimited run's peak.
 const ROW_14_CAP_PERCENT: u64 = 50;
 
+/// The spill-mode cap of
+/// [`the_clickbench_row_14_shape_replays_its_spill_within_a_70_percent_cap`],
+/// in percent of the unlimited run's peak: with the spill merge fan-in
+/// unbounded, the cap of the 30 to 100 percent sweep in issue #3899 at which
+/// this shape's replay fails. At [`ROW_14_CAP_PERCENT`] it passes either way.
+const ROW_14_REPLAY_CAP_PERCENT: u64 = 70;
+
 /// Issue #3899 (M2), the ClickBench row 14 shape: `COUNT(DISTINCT a) GROUP BY
 /// y / 2 ORDER BY u DESC LIMIT 10`, which DataFusion plans as an inner
 /// aggregate over the 200,000 `(y / 2, a)` groups under an outer one over the
@@ -1761,6 +1768,30 @@ const ROW_14_CAP_PERCENT: u64 = 50;
 /// 6430850", asked by one aggregate while the other holds 4,382,780 bytes.
 #[tokio::test]
 async fn the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry() {
+    row_14_answers_on_the_retry(ROW_14_CAP_PERCENT).await;
+}
+
+/// Issue #3899, the row 14 shape of
+/// [`the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry`]
+/// at a spill-mode cap of [`ROW_14_REPLAY_CAP_PERCENT`] of the unlimited
+/// run's peak. The retry spills and answers with the unlimited run's rows.
+///
+/// Prove-the-test: set `SPILL_MERGE_FAN_IN` in `session.rs` to 0, DataFusion's
+/// unbounded default, and the retry fails with "query memory pool spill
+/// threshold reached: SingleHashAggregateStream[0] would hold 4628510 bytes
+/// charged and enveloped, over its fair share 4501595 of the spill-mode cap
+/// 9003190": the outer aggregate's replay, behind a merge that seated a
+/// buffer for every run, grows past its share with no spill to fall back on.
+#[tokio::test]
+async fn the_clickbench_row_14_shape_replays_its_spill_within_a_70_percent_cap() {
+    row_14_answers_on_the_retry(ROW_14_REPLAY_CAP_PERCENT).await;
+}
+
+/// Runs the row 14 shape unlimited, then through the spill retry with the
+/// process budget at the unlimited peak and a spill-mode cap of
+/// `cap_percent` of it, and asserts the retry spilled and answered row for
+/// row.
+async fn row_14_answers_on_the_retry(cap_percent: u64) {
     let sql = "SELECT y / 2 AS k, COUNT(DISTINCT a) AS u FROM q33 GROUP BY y / 2 \
                ORDER BY u DESC LIMIT 10";
     let file = q33_parquet();
@@ -1784,7 +1815,7 @@ async fn the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry(
         "every k holds two distinct a, so the tiebreak on k decides the ten"
     );
 
-    let cap = usize::try_from(unlimited.peak_pool_bytes * ROW_14_CAP_PERCENT / 100).expect("fits");
+    let cap = usize::try_from(unlimited.peak_pool_bytes * cap_percent / 100).expect("fits");
     let process = Arc::new(ravel_memory::MemoryBudget::new(unlimited.peak_pool_bytes));
     let spilled = run_top_ten(
         &*q33_executor_in(
@@ -1861,54 +1892,49 @@ fn row_35_parquet(file: u64) -> (bytes::Bytes, u64) {
     (bytes::Bytes::from(out), groups.len() as u64)
 }
 
-// SWEEP-SCAFFOLD begin
-fn sweep_env(name: &str) -> Option<u64> {
-    std::env::var(name).ok().and_then(|v| v.parse().ok())
-}
+/// The spill-mode cap of [`the_clickbench_row_35_shape_spills_and_answers_on_the_retry`],
+/// in percent of the unlimited run's peak: with the spill merge fan-in
+/// unbounded, the cap of the 30 to 100 percent sweep in issue #3899 at which
+/// this shape's retry fails.
+const ROW_35_CAP_PERCENT: u64 = 50;
 
+/// Issue #3899 (M3), the ClickBench row 35 shape: `SELECT 1, url, COUNT(*)
+/// GROUP BY 1, url ORDER BY c DESC LIMIT 10` over a wide string key, scanned
+/// in [`ROW_35_FILES`] partitions, run through the spill retry the way the
+/// row 14 shape is. The retry plans a partial aggregate per partition under
+/// one final aggregate, all able to spill, and answers with the unlimited
+/// run's rows, having spilled.
+///
+/// Prove-the-test: set `SPILL_MERGE_FAN_IN` in `session.rs` to 0, DataFusion's
+/// unbounded default, and the final aggregate's replay fails the retry with
+/// "query memory pool spill threshold reached: spill-capable consumers would
+/// hold 22758830 bytes charged and enveloped, over the spill-mode cap
+/// 22444127", asked by `FinalHashAggregateStream[0]`, the M3 failure.
 #[tokio::test]
-async fn sweep_cell() {
-    let Some(shape) = sweep_env("RAVEL_SWEEP_SHAPE") else {
-        return;
-    };
-    let cap_percent = sweep_env("RAVEL_SWEEP_CAP_PERCENT").expect("cap");
-    let log = CapturedLog::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(log.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    let _log_guard = tracing::subscriber::set_default(subscriber);
+async fn the_clickbench_row_35_shape_spills_and_answers_on_the_retry() {
+    let sql = "SELECT 1, url, COUNT(*) AS c FROM row35 GROUP BY 1, url ORDER BY c DESC LIMIT 10";
+    let files: Vec<_> = (0..ROW_35_FILES).map(row_35_parquet).collect();
     let scratch = tempfile::tempdir().expect("scratch root");
-    let (sql, table, files, parallel): (&str, &str, Vec<(bytes::Bytes, u64)>, bool) = match shape {
-        14 => (
-            "SELECT y / 2 AS k, COUNT(DISTINCT a) AS u FROM q33 GROUP BY y / 2 ORDER BY u DESC LIMIT 10",
-            "q33",
-            vec![(q33_parquet(), Q33_ROWS)],
-            false,
-        ),
-        35 => (
-            "SELECT 1, url, COUNT(*) AS c FROM row35 GROUP BY 1, url ORDER BY c DESC LIMIT 10",
-            "row35",
-            (0..ROW_35_FILES).map(row_35_parquet).collect(),
-            true,
-        ),
-        _ => panic!("shape"),
-    };
     let config = |query_bytes| {
         let mut config = spill_config(
             scratch.path().to_path_buf(),
             AMPLE_SCRATCH_BYTES,
             query_bytes,
         );
-        if parallel {
-            config.engine.fetch_concurrency = usize::try_from(ROW_35_FILES).expect("small");
-            config.parallel_final_aggregation = true;
-        }
+        config.engine.fetch_concurrency = usize::try_from(ROW_35_FILES).expect("small");
+        // A Parquet table scans in more than one file group only for an
+        // exact-typed statement with this on (ADR-2040 D6).
+        config.parallel_final_aggregation = true;
         config
     };
     let executor = |config: SqlConfig, process: Arc<ravel_memory::MemoryBudget>| {
-        parquet_table_executor(config, &files, process, Arc::new(MemoryStore::new()), table)
+        parquet_table_executor(
+            config,
+            &files,
+            process,
+            Arc::new(MemoryStore::new()),
+            "row35",
+        )
     };
     let unlimited = run_top_ten(
         &*executor(
@@ -1919,63 +1945,38 @@ async fn sweep_cell() {
         sql,
     )
     .await;
-    assert_eq!(unlimited.spill_files, 0);
-    let cap = usize::try_from(unlimited.peak_pool_bytes * cap_percent / 100).expect("fits");
-    let process = Arc::new(ravel_memory::MemoryBudget::new(unlimited.peak_pool_bytes));
-    let spilled = executor(config(SPILL_MODE_HEADROOM_FLOOR_BYTES + cap), process).await;
-    let outcome = spilled.execute(q33_tenant(), &request(sql)).await;
-    let text = log.text();
-    let field = |name: &str| {
-        text.lines()
-            .filter(|l| l.contains("retried with spill"))
-            .filter_map(|l| {
-                l.split_whitespace()
-                    .find_map(|w| w.strip_prefix(name).map(str::to_string))
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let (result, detail) = match outcome {
-        Ok(outcome) => {
-            use datafusion::arrow::util::display::array_value_to_string;
-            let mut rows = Vec::new();
-            for batch in outcome.output.batches() {
-                for row in 0..batch.num_rows() {
-                    let cells: Vec<String> = batch
-                        .columns()
-                        .iter()
-                        .map(|c| array_value_to_string(c, row).expect("renderable"))
-                        .collect();
-                    rows.push(cells.join("|"));
-                }
-            }
-            let ok = rows == unlimited.rows;
-            (
-                if ok { "PASS" } else { "WRONG" },
-                format!(
-                    "retries={} stat_files={} bytes_written={:?}",
-                    outcome.stats.spill_retries,
-                    outcome.stats.spill.files,
-                    outcome.stats.spill_retry.map(|r| r.spill_bytes_written)
-                ),
-            )
-        }
-        Err(err) => {
-            let s = format!("{err}");
-            ("FAIL", s.chars().take(1200).collect::<String>())
-        }
-    };
-    println!(
-        "SWEEP_RESULT shape={shape} cap={cap_percent} fan_in={} alt_rule={} peak={} result={result} \
-         log_outcome={} log_files={} detail={detail}",
-        std::env::var("RAVEL_SWEEP_FAN_IN").unwrap_or_default(),
-        std::env::var_os("RAVEL_SWEEP_ALT_RULE").is_some(),
-        unlimited.peak_pool_bytes,
-        field("outcome="),
-        field("spill_files="),
+    assert_eq!(
+        (unlimited.spill_retries, unlimited.spill_files),
+        (0, 0),
+        "the unlimited run answers on its first attempt"
     );
+    let expected: Vec<String> = (0..10)
+        .map(|g| format!("1|{}|{}", row_35_url(g), 12 - g))
+        .collect();
+    assert_eq!(unlimited.rows, expected);
+
+    let cap = usize::try_from(unlimited.peak_pool_bytes * ROW_35_CAP_PERCENT / 100).expect("fits");
+    let process = Arc::new(ravel_memory::MemoryBudget::new(unlimited.peak_pool_bytes));
+    let spilled = run_top_ten(
+        &*executor(config(SPILL_MODE_HEADROOM_FLOOR_BYTES + cap), process).await,
+        sql,
+    )
+    .await;
+    // Which check refuses the first attempt depends on the order the two
+    // partitions' batches arrive in, so only the retry itself is pinned.
+    assert_eq!(
+        spilled.spill_retries, 1,
+        "the first attempt was refused and retried: {:?}",
+        spilled.first_refusal
+    );
+    assert!(
+        spilled.spill_files > 0 && spilled.spill_retry_bytes_written.is_some_and(|b| b > 0),
+        "the retry spilled: files={} bytes_written={:?}",
+        spilled.spill_files,
+        spilled.spill_retry_bytes_written
+    );
+    assert_eq!(spilled.rows, unlimited.rows, "row for row");
 }
-// SWEEP-SCAFFOLD end
 
 /// The per-query pool of [`a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry`]:
 /// ample against the statement's peak, so neither attempt is refused by the

@@ -1706,8 +1706,7 @@ impl TenantDelegatingPool {
         let (own, own_after) = ledger.own_after(consumer, charged, envelope);
         let (_, after) = ledger.spillable_after(consumer, charged, envelope);
         let within_share = own_after <= share;
-        let sweep_alt = std::env::var_os("RAVEL_SWEEP_ALT_RULE").is_some() && after <= cap;
-        if own_after <= own || sweep_alt || (within_share && after <= hard_bound) {
+        if own_after <= own || (within_share && after <= hard_bound) {
             if after > cap {
                 // Some other consumer is over its share; it is refused at its
                 // next checked grow. The hard bound caps the total until

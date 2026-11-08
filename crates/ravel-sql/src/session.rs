@@ -597,14 +597,21 @@ fn disk_manager_builder(spill: SpillDecision<'_>) -> DiskManagerBuilder {
         SpillDecision::Enabled { dir, max_bytes } => DiskManagerBuilder::default()
             .with_mode(DiskManagerMode::Directories(vec![dir.to_path_buf()]))
             .with_max_temp_directory_size(max_bytes)
-            .with_max_spill_merge_fan_in(
-                std::env::var("RAVEL_SWEEP_FAN_IN")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0),
-            ),
+            .with_max_spill_merge_fan_in(SPILL_MERGE_FAN_IN),
     }
 }
+
+/// The most spill runs one pass of DataFusion's multi-level merge reads at
+/// once in a spill-enabled session (ADR-0954, refusal-retry decision item 2).
+///
+/// A spilled aggregate replays its runs through that merge, which seats one
+/// read buffer per run until the pool refuses a grow, with no fan-in limit by
+/// default. The re-aggregation behind it grows on the same pool and cannot
+/// spill, so a refused grow there fails the statement: the bound leaves the
+/// replay the room an unbounded merge would take, at the cost of extra merge
+/// passes that rewrite the runs. DataFusion 55 reads 0 as unbounded and
+/// raises 1 to 2, so 2 is the smallest bound it applies.
+const SPILL_MERGE_FAN_IN: usize = 2;
 
 /// Build the per-query `SessionConfig`. Separated from [`build_session`] so
 /// the invariants above can be asserted without constructing a provider.
@@ -1384,6 +1391,39 @@ mod tests {
                 .enable_round_robin_repartition,
             "spill off must leave DataFusion's round-robin default alone"
         );
+    }
+
+    /// Issue #3899: the disk manager of a spill-enabled session, built through
+    /// [`build_session`] as every SQL statement's is, bounds the spill merge
+    /// fan-in at [`SPILL_MERGE_FAN_IN`], 2; a spill-disabled one keeps
+    /// DataFusion's default, 0 (unbounded).
+    #[test]
+    fn a_spill_enabled_session_bounds_the_spill_merge_fan_in() {
+        use datafusion::execution::disk_manager::DEFAULT_MAX_SPILL_MERGE_FAN_IN;
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let fan_in = |spill| {
+            build_session(
+                &SqlConfig::default(),
+                test_pool(),
+                metrics_table(&store),
+                false,
+                spill,
+                &no_capabilities(),
+            )
+            .expect("session builds")
+            .runtime_env()
+            .disk_manager
+            .max_spill_merge_fan_in()
+        };
+        let enabled = SpillDecision::Enabled {
+            dir: scratch.path(),
+            max_bytes: 1 << 20,
+        };
+        assert_eq!(fan_in(enabled), 2);
+        assert_eq!(fan_in(SpillDecision::Disabled), 0);
+        assert_eq!(DEFAULT_MAX_SPILL_MERGE_FAN_IN, 0);
     }
 
     /// Issue #680: a default session tightens both skip-partial-aggregation
