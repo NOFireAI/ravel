@@ -1,14 +1,12 @@
 # The Ravel Agents TypeScript SDK
 
-The SDK in `sdk/typescript/packages/agents` (package `@ravel/agents`, not
-published) defines agents and tools, serves them from a worker, and sends
-them messages from a client. This page takes a first project from an empty
-directory to a passing test suite, then to a running server, and lists what
-the SDK covers and what it does not. Every statement about behaviour names
-the test that pins it; the tests live under
-`sdk/typescript/packages/agents/src/` unless another path is given, and the
-package [README](../../sdk/typescript/packages/agents/README.md) lists the
-rest.
+The SDK in `sdk/typescript/packages/agents` (package `@ravel/agents`)
+defines agents and tools, serves them from a worker, and sends them messages
+from a client. The package is not published to npm: a project links it from
+a checkout of this repository. This page takes a first project from an empty
+directory to a passing test suite, then to a running server. The package
+[README](../../sdk/typescript/packages/agents/README.md) is the API
+reference.
 
 ## First run
 
@@ -33,9 +31,7 @@ You need node 22.15 or later 22.x and a checkout of this repository.
    the checkout (`--scaffold-bin` names another, `--node` another node),
    passes DIR through as given, refuses a DIR that exists and is not empty
    before starting node, and reports the bin's exit code and stderr when it
-   fails. `agents dev` prints this command once its server is ready. Test:
-   `scaffold_runs_the_sdk_generator_and_refuses_a_non_empty_dir_before_spawning`
-   (`ravel-cli`'s `agents_commands` suite).
+   fails. `agents dev` prints this command once its server is ready.
 
    The project holds one agent, `order`, whose `checkout` handler prices a
    line through a durable step against a local price-list fixture, the
@@ -43,9 +39,7 @@ You need node 22.15 or later 22.x and a checkout of this repository.
    a vitest suite and its `package.json`, `tsconfig.json` and README. It
    links `@ravel/agents` from your checkout through a relative `file:`
    dependency. A directory that is not empty is refused and nothing is
-   written. Tests: `the bin writes a project, exits 1 on a non-empty
-   directory and 64 on bad usage`, `a directory holding any other file is
-   refused and nothing is written` (`scaffold/index.test.ts`).
+   written.
 
 2. Run its tests:
 
@@ -58,12 +52,7 @@ You need node 22.15 or later 22.x and a checkout of this repository.
    They run the agent against the SDK's in-process fake coordinator, so they
    need no server, no network and no API key. They cover a checkout, an
    unknown SKU, a worker killed inside the price step, and the generated
-   client types matching the agent. Test: `scaffold output typechecks and
-   its tests pass without an API key` (`scaffold/index.test.ts`), which
-   typechecks a generated project and runs its suite with every `*_API_KEY`
-   variable removed. It links the SDK's own `node_modules` into the project
-   in place of `npm install`, so npm resolving the `file:` dependency is not
-   under test.
+   client types matching the agent.
 
 3. Run it against a server. Turn the runtime on as
    [the Ravel Agents guide](agents.md#turning-it-on) describes, with one
@@ -85,209 +74,180 @@ You need node 22.15 or later 22.x and a checkout of this repository.
 
    It serves the agent with a worker over the HTTP transport, sends
    `checkout` to a new order, and prints the operation id, the line and the
-   total. No test runs `npm start`; the SDK's end-to-end test
-   `worker killed inside an at_least_once step recovers the same operation
-   on restart` (`sdk/typescript/packages/agents/e2e/recover.test.ts`)
-   drives the same client and worker calls against a built server, with the
-   first worker in a child process killed with SIGKILL inside a step.
+   total.
 
-After changing a payload or result schema, `npm run contract` regenerates
-the client types. The generated test `contract.ts is the generator's output
-for the agent` fails until you do. The generator is `generateContract` in
-`@ravel/agents/contract`; a contract generated from the repository's example
-assistant typechecks against the agent's own types, and one that disagrees
-fails. Tests: `the contract generated from the example assistant typechecks
-against the agent's own types`, `a contract that disagrees with the agent
-fails that typecheck` (`scaffold/contract.test.ts`).
+After changing a payload or result schema, run `npm run contract` to
+regenerate the client types. The project's own test fails until you do. The
+generator is `generateContract` in `@ravel/agents/contract`.
+
+The SDK's automated checks do not run `npm start`, and they link the SDK's
+own `node_modules` into a scaffolded project instead of running
+`npm install`, so npm resolving the `file:` dependency is not exercised. The
+SDK's end-to-end tests drive the same client and worker calls as `npm start`
+against a built server.
 
 ## Typed errors
 
 Every error the SDK raises from the wire subclasses `RavelAgentsError` and
 carries a `code` equal to its class name, the safe ids of what it concerns
-(never a payload), and a `retry` hint. The client maps each wire code to its
-class. Test: `maps every ErrorBody code to its typed error`
-(`client/client.test.ts`). The Test column names, first, the test that pins
-the class's code and hint (`errors.test.ts`), then one that raises it.
+in `ids` (agent, incarnation, request, operation, turn, step, effect, timer,
+epoch; never a payload), and a `retry` hint. The client and the worker
+transport map each wire code to its class.
 
-| Wire code | Class | `retry` | Tests |
-|---|---|---|---|
-| `agent_gone` | `AgentGone` | `never` | `AgentGone carries its code, retry hint and safe ids`; `nothing outlives close: a new harness has never seen the first one's agent` |
-| `idempotency_conflict` | `IdempotencyConflict` | `never` | `IdempotencyConflict carries its code, retry hint and safe ids`; `the same request id with a different payload fails IdempotencyConflict` |
-| `outcome_unknown` | `OutcomeUnknown` | `resolve` | `OutcomeUnknown carries its code, retry hint and safe ids`; `a result() deadline throws OutcomeUnknown carrying the handle` |
-| `ownership_lost` | `OwnershipLost` | `never` | `OwnershipLost carries its code, retry hint and safe ids`; `leases carry the recorded time and seed, and heartbeats extend a held lease only` |
-| `incompatible_handler` | `IncompatibleHandler` | `never` | `IncompatibleHandler carries its code, retry hint and safe ids`; `a worker without the leased handler version abandons the turn with IncompatibleHandler` |
-| `non_deterministic_replay` | `NonDeterministicReplay` | `never` | `NonDeterministicReplay carries its code, retry hint and safe ids`; `reused step key with a different input hash fails NonDeterministicReplay` |
-| `effect_in_doubt` | `EffectInDoubt` | `reconcile` | `EffectInDoubt carries its code, retry hint and safe ids`; `a manual tool interrupted by a crash blocks the operation with EffectInDoubt` |
-| `mailbox_full` | `MailboxFull` | `backoff` | `MailboxFull carries its code, retry hint and safe ids`; `maps every ErrorBody code to its typed error` |
-| `budget_exceeded` | `BudgetExceeded` | `never` | `BudgetExceeded carries its code, retry hint and safe ids`; `maps every ErrorBody code to its typed error` |
-| `store_unavailable` | `StoreUnavailable` | `backoff` | `StoreUnavailable carries its code, retry hint and safe ids`; `retries are bounded: an exhausted store_unavailable surfaces as StoreUnavailable` |
-| `unsupported_format` | `UnsupportedFormat` | `never` | `UnsupportedFormat carries its code, retry hint and safe ids`; `an unknown error code or an off-schema response reads as UnsupportedFormat` |
+| Wire code | Class | `retry` |
+|---|---|---|
+| `agent_gone` | `AgentGone` | `never` |
+| `idempotency_conflict` | `IdempotencyConflict` | `never` |
+| `outcome_unknown` | `OutcomeUnknown` | `resolve` |
+| `ownership_lost` | `OwnershipLost` | `never` |
+| `incompatible_handler` | `IncompatibleHandler` | `never` |
+| `non_deterministic_replay` | `NonDeterministicReplay` | `never` |
+| `effect_in_doubt` | `EffectInDoubt` | `reconcile` |
+| `mailbox_full` | `MailboxFull` | `backoff` |
+| `budget_exceeded` | `BudgetExceeded` | `never` |
+| `store_unavailable` | `StoreUnavailable` | `backoff` |
+| `unsupported_format` | `UnsupportedFormat` | `never` |
 
 `Forbidden` has no wire code: the server refuses a credential with HTTP 401
 or 403, which the SDK maps to `Forbidden` with `retry` `never`, and a worker
-whose poll is refused stops. Tests: `the auth refusal is typed, carries its
-HTTP status and is never retried` (`errors.test.ts`), `a 401 or 403 with the server's plain
-error body is Forbidden, not retried` (`client/client.test.ts`), `a
-Forbidden poll stops the worker and rejects done with it`
-(`worker/serve.test.ts`). `ConcurrentStepError` and `InvalidStepInput` are
-raised in the worker and never cross the wire. Test: `the SDK-local errors
-are typed and never retried` (`errors.test.ts`).
+whose poll is refused stops. An unknown code, or a 2xx body that does not
+match its schema, reads as `UnsupportedFormat`. `ConcurrentStepError` and
+`InvalidStepInput` are raised in the worker and never cross the wire.
 
 ## The testing export
 
 `createTestHarness` in `@ravel/agents/testing` runs a fake coordinator, a
-client over it and one worker, all in process memory. Unless a file is
-named, the tests below are in `testing/harness.test.ts`.
+client over it and one worker, all in process memory. The fake models the
+coordinator's protocol, not its storage.
 
 What the fake honours:
 
 - Leases carry the turn's recorded time and seed, a heartbeat extends a
-  held lease, and a heartbeat on a revoked lease fails `OwnershipLost`.
-  Test: `leases carry the recorded time and seed, and heartbeats extend a
-  held lease only` (`testing/transport.test.ts`).
+  held lease to 30 s past the fake's clock, and a heartbeat on a revoked
+  lease fails `OwnershipLost`.
 - After `crashWorker()`, completed steps replay from the fake's journal
-  without calling the tool, and the turn commits once. Test: `replay after
-  crashWorker with two completed steps replays both without calling run and
-  commits once` (`worker/replay.test.ts`).
+  without calling the tool, and the turn commits once.
+- An `at_least_once` tool interrupted by a crash runs again under the same
+  effect id.
 - A `manual` tool interrupted by a crash blocks the operation with
-  `EffectInDoubt`. Test: `a manual tool interrupted by a crash blocks the
-  operation with EffectInDoubt` (`worker/steps.test.ts`).
-- `cancel` on a running operation applies when its turn commits, and the
-  cancelled operation rejects `result()`. Test: `cancel is idempotent and a
-  cancelled operation rejects result()` (`client/client.test.ts`).
+  `EffectInDoubt` and names the effect in `blockedEffect`. The fake refuses
+  a failed commit while a step's attempt is authorized without a result, as
+  the server does.
+- `cancel` on a running operation applies when its turn commits, the
+  cancelled operation rejects `result()` with `OperationFailed`, and a
+  second `cancel` answers `cancelled`.
+- A failing handler publishes neither state nor events and dead-letters
+  after its attempts.
+- An agent's state reads `null` until its first committed turn, as on the
+  server.
 - `advanceTime(ms)` moves the fake's clock, and the next lease records the
-  moved time. Test: `leases carry the recorded time and seed, and
-  heartbeats extend a held lease only` (`testing/transport.test.ts`).
+  moved time.
 
 What it does not do:
 
-- It has no timers, and its clock never expires a lease. Test: `advancing
-  the fake's clock past a lease's expiry neither takes the turn away nor
-  runs anything`.
-- It has no reconcile route, so an operation in doubt stays blocked. Test:
-  `an operation blocked with EffectInDoubt stays blocked: no clock advance
-  or new worker reconciles it`.
-- It keeps nothing past `close()`. Test: `nothing outlives close: a new
-  harness has never seen the first one's agent`.
+- It has no timers, and its clock never expires a lease.
+- It has no reconcile route, so an operation in doubt stays blocked.
+- It keeps nothing past `close()`.
 
 To drive a kill and a recovery, hold a tool's run open on a promise the
 test controls, wait until it has started, call `crashWorker()`, then
-release it: the killed worker's turn is reported as abandoned and a fresh
-worker takes the turn over. Tests: `an operation blocked with EffectInDoubt
-stays blocked: no clock advance or new worker reconciles it`, and in a
-scaffolded project `a worker killed inside the price step is replaced and
-the turn commits once`, which `scaffold output typechecks and its tests
-pass without an API key` runs.
+release it. `crashWorker()` revokes the current leases and starts a fresh
+worker (`harness-worker-2`) against the same fake: it simulates a worker
+crash, not a coordinator or store crash. The killed worker's turn is
+reported in `turns` as abandoned, and the fresh worker takes the turn over.
 
 A test that passes against the harness shows how the handler behaves under
-replay. It shows nothing about what Ravel stores.
+replay. It shows nothing about what Ravel stores. Step 3 of
+[First run](#first-run) runs the project against a server.
 
 ## Effects, reconcile and destroy
 
-The client reads and settles effects and destroys agents. `agent.effects()`
-lists an agent's effects and `client.effect(handle)` inspects one by its
-handle, with its attempts and the evidence of late results. Tests: `effects
-lists the agent's effects from /api/v1/agents/effects`, `effect inspects a
-handle at /api/v1/agents/effects/{effect}` (`client/client.test.ts`).
-`client.reconcile(request)` records an operator's decision on an in-doubt
-effect, and `agent.destroy({ incarnation })` destroys an agent, pinned to
-an incarnation when one is given; both need a token holding `agents_admin`,
-and a token without it is refused with `Forbidden`. Tests: `reconcile
-posts the decision to /api/v1/agents/reconcile`, `destroy posts kind, key
-and incarnation and decodes destroyed and abandoned`. Against a built
-server, the end-to-end test `worker killed inside a manual step blocks as
-EffectInDoubt until the admin reconcile route is called through the client`
-reconciles an effect left in doubt by a worker killed with SIGKILL, and
-`destroy fences a worker holding a lease and a recreate starts incarnation
-two` (`e2e/destroy.test.ts`) destroys an agent whose worker holds the turn:
-the worker abandons it with `AgentGone` and sends no commit, a second
-destroy answers `destroyed: false` with the same abandoned counts, and
-`create` starts incarnation 2 under the same agent id. The client's
-`reconcile` and `destroy` are sent once and never retried, so a lost answer
-is `OutcomeUnknown`: read
-`client.effect(handle)` or the agent to learn whether it landed. Tests:
-`reconcile is sent once: a network failure is OutcomeUnknown with no second
-request`, `destroy is sent once: an untyped 503 is OutcomeUnknown with no
-second request`. A destroyed agent's worker routes answer `AgentGone`, and
-the worker abandons the turn without retry. Tests: `agent_gone from a
-worker route is AgentGone with retry never` (`transport/http.test.ts`),
-`agent_gone at commit abandons the turn without retry`
-(`worker/serve.test.ts`).
+The client reads and settles effects and destroys agents:
+
+- `agent.effects()` lists an agent's effects.
+- `client.effect(handle)` inspects one effect by its handle, with its
+  attempts and the evidence of late results.
+- `client.reconcile(request)` records an operator's decision on an in-doubt
+  effect.
+- `agent.destroy({ incarnation })` destroys an agent, pinned to an
+  incarnation when one is given.
+
+`reconcile` and `destroy` need a token holding `agents_admin`; a token
+without it is refused with `Forbidden`. Both are sent once and never
+retried, so a lost answer is `OutcomeUnknown`: read `client.effect(handle)`
+or the agent to learn whether it landed.
+
+After a destroy, the worker holding the turn abandons it with `AgentGone`
+and sends no commit. A destroyed agent's worker routes answer `AgentGone`,
+and the worker abandons the turn without retry. A second destroy answers
+`destroyed: false` with the same abandoned counts, and `create` starts
+incarnation 2 under the same agent id. The
+[operator guide](operations/agents.md#destroying-an-agent) covers when to
+destroy an agent.
 
 ## HTTP transport limits
 
 `createHttpTransport` in `@ravel/agents/worker` connects a worker to a
-server. Its tests are in `transport/http.test.ts`.
+server.
 
-- The poll wait is clamped to 20 s. Test: `clamps the poll wait to 20 s and
-  leaves a shorter one alone`.
-- The worker renews the lease in the background while a turn runs: a
-  heartbeat when the turn is assigned, then one each third of the lease
-  left by the last answered expiry, never sooner than 1 s apart, until the
-  commit is sent. A renewal refused with `OwnershipLost` or `AgentGone`
-  aborts the handler's signal and abandons the turn without a commit; any
-  other failure is retried at the next tick, and one inside the lease does
-  not abort the turn. Once renewals have failed past the lease, the worker
-  aborts the handler's signal at the expiry and abandons the turn without a
-  commit, with `LeaseExpired`. A step the handler calls after either abort
-  rejects with the abort's reason and sends no step record. A step whose
-  record was sent inside the lease and answered after the abort has already
-  sent that record: an answer that authorizes an attempt rejects with the
-  abort's reason, and one that comes back completed or failed returns the
-  replayed output or rejects with `StepFailed`. Either way that step runs no
-  tool and reports no effect (test: `a lease that expires while the step's
-  record is in flight runs no tool`). A tool already running at the abort
-  that returns still has its result reported, so a takeover replays it
-  rather than running the effect again; when the server answers that result
-  as late, the worker sends nothing more and the step rejects with the
-  abort's reason. A tool that throws after the abort reports no failure. The
-  worker measures the expiry on its own timers, `leaseMs` (a `serveAgents`
-  option, default 30000) after it received the assignment or sent the last
-  renewal that was answered, because no answer carries the lease length and
-  the two wall clocks may disagree. The server counts a renewal's lease from
-  when it processed the request, no earlier than the sending, and the
-  assignment's lease from when it answered the poll, so the worker's first
-  expiry, counted from when that answer arrived, can trail the server's by
-  the poll answer's travel time. The server's agents lease is fixed at
-  30000 with a grace of 10000 (`DEFAULT_AGENTS_LEASE_MS` and
-  `DEFAULT_AGENTS_HEARTBEAT_GRACE_MS`, which no flag sets; the agents
-  runtime's `RuntimeConfig::default` uses the same two values). Keep
-  `leaseMs` at or below 30000, the server's fixed lease: the abort then
-  lands before the server's grace lets another worker take the turn over,
-  as long as the poll answer travels for less than the grace. Carrying the
-  lease length on the wire, which is tracked as planned work, would remove
-  the option.
-  `leaseMs` outside 1000 to 2147483647, or not an integer, rejects
-  `serveAgents` with `InvalidWorkerOption` before any request. Renewals
-  live in the memory of the coordinator that answered them, so with two
-  coordinators a worker polling the other one can still take a turn over
-  once the lease and grace run out after its takeover. Tests: `a turn longer than the lease renews
-  it in the background and commits`, `a refused renewal aborts the turn
-  and nothing is committed`, `a transient renewal failure inside the lease
-  does not abort the turn`, `renewals that keep failing past the lease abort
-  the turn and send no commit`, `an answered renewal restarts the lease the
-  worker measures from its sending`, `leaseMs left unset aborts at the 30 s
-  default`, `serveAgents refuses leaseMs %d at startup with
-  InvalidWorkerOption`, `a step called after the lease expired is refused
-  locally and never reaches the server`, `a lease that expires while the
-  step's record is in flight runs no tool`, `a tool that finishes after the
-  lease expired still reports its result, and nothing else is sent`, `a
-  late result after the abort sends nothing more`, `a tool that throws after
-  the abort reports no failure` (`worker/renew.test.ts`),
-  `renews once at assignment, sends nothing while a tool runs, and no
-  heartbeat before a step`.
-- There is no `journal` option: steps and effect results are recorded on
-  the server. Test: `takes no journal option: steps and effect results are
-  recorded on the server`.
+- The poll wait is clamped to 20 s.
+- Steps and effect results are recorded on the server. The transport has no
+  `journal` option.
 - An untyped 5xx, a request with no answer, or a body that fails mid-read
-  is `OutcomeUnknown`. Tests: `maps an untyped 5xx and a request with no
-  answer to OutcomeUnknown`, `maps a response body that fails mid-read to
-  OutcomeUnknown`.
+  is `OutcomeUnknown`.
 
-## What the SDK does not do yet
+### Lease renewal
 
-- The fake coordinator has no timers. Test: `advancing the fake's clock
-  past a lease's expiry neither takes the turn away nor runs anything`.
-- The package is not published; a project links it from a checkout. Test:
-  `the generated package.json links this package and pins the workspace's
-  versions` (`scaffold/index.test.ts`).
+The worker renews the lease in the background while a turn runs: a
+`worker/heartbeat` when the turn is assigned, then one each third of the
+lease left by the last answered expiry, never sooner than 1 s apart, one at
+a time, until the commit is sent or the turn is abandoned. No heartbeat goes
+before a step. The interval is read against the worker's clock, so a clock
+ahead of the server's renews at the 1 s floor.
+
+- A renewal refused with `OwnershipLost` or `AgentGone` aborts the
+  handler's signal and abandons the turn without a commit.
+- Any other renewal failure is retried at the next tick. One inside the
+  lease does not abort the turn.
+- Once renewals have failed past the lease, the worker aborts the handler's
+  signal at the expiry and abandons the turn without a commit, with
+  `LeaseExpired`.
+
+After either abort:
+
+- A step the handler calls rejects with the abort's reason and sends no
+  step record, so a handler that never reads `ctx.signal` still cannot
+  start an effect on a turn another worker may own.
+- A step whose record was sent inside the lease and answered after the abort
+  runs no tool and reports no effect. An answer that authorizes an attempt
+  rejects with the abort's reason; one that comes back completed or failed
+  returns the replayed output or rejects with `StepFailed`.
+- A tool already running that returns still has its result reported, so a
+  takeover replays it rather than running the effect again. When the server
+  answers that result as late, the worker sends nothing more and the step
+  rejects with the abort's reason.
+- A tool that throws reports no failure: no `worker/effects/fail` is sent.
+
+The worker measures the expiry on its own timers, `leaseMs` (a
+`serveAgents` option, default 30000) after it received the assignment or
+sent the last renewal that was answered, because no answer carries the lease
+length and the two wall clocks may disagree. The server counts a renewal's
+lease from when it processed the request, no earlier than the sending, and
+the assignment's lease from when it answered the poll, so the worker's first
+expiry, counted from when that answer arrived, can trail the server's by the
+poll answer's travel time.
+
+The server's agents lease is fixed at 30000 with a grace of 10000
+(`DEFAULT_AGENTS_LEASE_MS` and `DEFAULT_AGENTS_HEARTBEAT_GRACE_MS`, which no
+flag sets; the agents runtime's `RuntimeConfig::default` uses the same two
+values). Keep `leaseMs` at or below 30000, the server's fixed lease: the
+abort then lands before the server's grace lets another worker take the turn
+over, as long as the poll answer travels for less than the grace. A longer
+`leaseMs` lets a turn run past its lease.
+
+`leaseMs` outside 1000 to 2147483647, or not an integer, rejects
+`serveAgents` with `InvalidWorkerOption` before any request.
+
+Renewals live in the memory of the coordinator that answered them, so with
+two coordinators a worker polling the other one can still take a turn over
+once the lease and grace run out after its takeover.
