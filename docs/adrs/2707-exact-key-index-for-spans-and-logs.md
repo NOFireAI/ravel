@@ -541,7 +541,9 @@ flowchart LR
   extra block read (derived).
 - **Budget.** `L_point` is `2 x min(p, P_max)` leaf GETs for `p` covering
   parts, with `P_max` = 1,024 a constant of the layout fixed in root
-  validation (a ceiling of 2,048 leaf GETs, not a measurement). Beyond
+  validation (a ceiling of 2,048 leaf GETs, not a measurement; for a key
+  set it scales with the set size under ADR-3692's key-set ceiling
+  amendment). Beyond
   `P_max` the remaining parts are scanned, not probed (retired by the
   tier-2 trace lookup amendment below: they go to tier 1), and the shape lint
   reports it. A probe count that follows the covering part count is a

@@ -156,7 +156,7 @@ Read from the tree at 50c104c4e on 2026-11-02.
 ```mermaid
 flowchart LR
   Q["lookup: field = value,<br/>or field IN (k values)"] --> R["resolve (pinned HEAD):<br/>parts + field 8 refs,<br/>segment -> (part, ordinal)"]
-  R --> T2["tier 2 router (decision 2)<br/>per covered part, in the one slice:<br/>GET 1 prefix, GET 2 bucket(s)<br/>under L_max = 2,048, P_max = 1,024"]
+  R --> T2["tier 2 router (decision 2)<br/>per covered part, in the one slice:<br/>GET 1 prefix, GET 2 bucket(s)<br/>under L_max = 2,048, P_max = 1,024<br/>(key-set ceiling amendment)"]
   T2 -->|"absent"| D["segments dropped<br/>(segmentsPrunedByKeyIndex)"]
   T2 -->|"matches"| B["segments with block sets<br/>-> block reads only"]
   T2 -->|"uncovered entry, no leaf,<br/>rejected leaf, over the ceiling,<br/>reservation refused, unsealed tail"| T1["tier 1 per object:<br/>footer, KEY_IDX prefix, bucket(s)"]
@@ -240,7 +240,9 @@ docs/catalog-and-mvcc.md, with these choices fixed here:
   covers every part. Parts are admitted in descending `entry_count`, ties
   by descending `watermark_hour`, until admitting the next part's worst
   case would exceed `L_max` = 2,048 leaf GETs for the statement or the
-  admitted count would exceed `P_max` = 1,024 parts. Both are constants in
+  admitted count would exceed `P_max` = 1,024 parts (key-set ceiling amendment:
+  the ceiling now scales with the key set, and each part is also tested
+  against its tier-1 cost). Both are constants in
   `ravel_catalog::snapshot_format::kidx` (`KEY_INDEX_LEAF_GET_CEILING`,
   `KEY_INDEX_MAX_PROBED_PARTS`), asserted by root validation's shape lint
   as ADR-0849 section 2's part-bound point root amendment requires, and
@@ -741,8 +743,13 @@ off-repo T12 scripts.
   its pre-registration already written.
 - Every band below is checked on real S3 with the state stamped; a miss
   is investigated before the epic closes, as ADR-2707's table was.
+- The leaf GET ceiling for a key set is `P_max x (1 + min(k, B_run))`,
+  and a part is admitted only when its leaf route costs at most its tier-1
+  probe; see the key-set ceiling amendment.
 
 ## Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)
+
+Rows 19 to 21 in the key-set ceiling amendment extend this table.
 
 Every arm runs on the harness of decision 8: one c6a.4xlarge, same-region
 S3, the build's SHA stamped, state verified and stamped before the first
@@ -1484,3 +1491,90 @@ over its bound before any advance added slices. The switch does not turn
 on for a signal while this row misses for that signal.
 
 Refs: #3918, #3692
+
+## Amendment (issue #3939, key-set ceiling): the leaf GET ceiling scales with the key set, and a part is admitted against its own tier-1 cost
+
+<!-- amendment-applies: sections="2. One tier-2 router in ravel-query, shared by spans and logs|Consequences|Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)" pointer="key-set ceiling amendment" -->
+<!-- amendment-supersedes: phrase="`L_max` = 2,048 leaf GETs for the statement" pointer="key-set ceiling amendment" -->
+
+Date: 2026-11-08. Owner decision of the same day, under ADR-3939's
+multi-day amendment.
+
+**Why.** `L_max` = 2,048 is ADR-2707 decision 5's point-lookup budget, two
+GETs for each of `P_max` = 1,024 parts. Decision 2 applied the same constant
+to key sets, whose per-part charge is `1 + min(k, 2^bucket_bits, B_run)`.
+With ADR-3939's day parts a 100-key `request_id IN` list over 30 days
+charges 30 x 126 = 3,780, so the ceiling admits 16 of 30 days and sends 14
+days of 552 entries each to the tier-1 probe at 2 x 552 = 1,104 ranged GETs
+a day: the ceiling refuses 126 leaf GETs to spend 1,104 on the same part.
+A ceiling meant to bound cost was inverting it.
+
+**The rule.**
+
+- The per-statement ceiling is `P_max x (1 + min(k, B_run))` leaf GETs for
+  a set of `k` keys: 1,024 x 2 = 2,048 at k = 1, exactly ADR-2707's budget,
+  and 1,024 x 65 = 66,560 at k >= 64. It is an absolute cap on the
+  statement, not a per-part budget: it charges each part as if the set sat
+  in one slice, while a part's real worst case (next bullet) is up to
+  `S + k` over its `S` touched slices. The per-part tier-1 test is the
+  bound that keeps the leaf route no dearer than tier 1; the cap only
+  bounds how many leaf GETs one statement may issue. Admission charges each
+  part's worst case against the cap in order, and after each wave it
+  refunds a probed part's charge down to the GETs it actually issued, so
+  the worst-case division is the guaranteed minimum it admits:
+  floor(66,560 / 126) = 528 logs day parts at k = 100 and
+  floor(66,560 / 1,050) = 63 at k = 1,024 (a day part's 26 + 1,024). Keys
+  that share bucket runs, or a slice that stops early, leave headroom that
+  admits more. Parts past the cap fall to tier 1, as today. A single-key lookup touches one
+  slice per part, so its charge is 2 and its behaviour is unchanged.
+- A part is admitted only when its worst case, `sum over touched slices of
+  (1 + min(k_s, 2^bits, B_run))`, is at most `2 x entry_count`, the tier-1
+  probe's cost for the part's own segments (ADR-2707 decision 5: two ranged
+  GETs per object; three as measured on spans, two being the conservative
+  value). A part over that is left to tier 1 by the existing uncovered
+  arm, never scanned. For a logs day part at 100 keys this is 126 against
+  1,104. The charge uses each slice's own key count `k_s`, so a set of
+  `k` keys costs at most `S + k` over a part's `S` touched slices: at
+  k = 1,024 (`KEY_SET_MAX_KEYS`) a logs day part costs at most 26 + 1,024
+  = 1,050 against 1,104 and is admitted at tier 2. Reaching 65 GETs in
+  every one of 26 slices would take at least 1,664 keys.
+- `P_max`, `B_run`, `T1_BYTES` and the admission order (descending
+  `entry_count`, ties by descending `watermark_hour`) are unchanged. The
+  returned-budget rule after GET 1 is unchanged. `KEY_INDEX_LEAF_GET_CEILING`
+  becomes the k = 1 value and the router computes the statement's ceiling
+  from `k`; `key_index_root_shape` returns the pair unchanged, since no root
+  lint consumes it yet.
+
+**Cost.** No persistent format changes. Bytes stay bounded by the per-part
+test: at about 11 KB a leaf GET a statement admitted up to its tier-1 cost
+moves fewer bytes than the probe it replaces (a tier-1 probe of one absent
+object is `T1_BYTES` = 11 KiB plus its footer). The memory reservation per
+decoded frame (`decoded_bound`) is unchanged; with 16 parts in flight and
+16 bucket reads each after #3917, at most 256 frames are reserved at once.
+
+**Predicted figures (ADR-3939 day parts, logs request_id, box D rates).**
+
+| lookup | leaf GETs | covered | basis |
+|---|---|---|---|
+| 30 days, no range, 100 keys | 30 x 126 = 3,780 of a 66,560 ceiling | 30 of 30 (16 of 30 under the old constant) | predicted; comment 6700944105 |
+| 30 days, no range, 1 key | 60 of 2,048 | 30 of 30 | predicted |
+| 30 days, no range, 1,024 keys, logs | at most 30 x 1,050 = 31,500 of a 66,560 ceiling; each day part at most 1,050 <= 1,104 | 30 of 30 at tier 2 | predicted |
+| 64 or more day parts, no range, 1,024 keys, logs | the cap admits at least 63 parts (63 x 1,050 = 66,150 <= 66,560), more as refunds free headroom | at least 63 at tier 2, the rest at tier 1 | predicted |
+
+**Acceptance (added rows; predicted, a figure outside its band is a miss).**
+
+| row | target | miss | source |
+|---|---|---|---|
+| 19 key-set ceiling: a 100-key logs request_id list over 30 day parts | 30 of 30 parts covered, `parts_beyond_ceiling` 0, leaf GETs at most 3,780, 0 tier-1 probes on covered parts | any part beyond the ceiling | predicted; services/ravel-server/tests/sql_key_in.rs |
+| 21 the cap at the largest set: a 1,024-key logs request_id list over 64 day parts | at least 63 parts covered at tier 2, covered plus `parts_beyond_ceiling` equal to 64, rows exact | fewer than 63 covered, or any wrong row | predicted; the admission loop in key_index_route.rs `route_parts` |
+| 20 per-part tier-1 test: a part whose worst case exceeds `2 x entry_count` | left uncovered after 0 leaf GETs, counted in `parts_uncovered` or a new `parts_over_tier_one` figure, rows exact | the part probed at tier 2 | predicted; the admission loop in key_index_route.rs `route_parts` |
+| 11 (restated) single-key ceiling | a 1-key lookup over 1,025 parts admits 1,024 and leaves 1 beyond the ceiling, as before | any change | predicted; key_index_route.rs `ADR_CEILING` |
+
+Tests the implementing task names, each with the mutant it fails on:
+`a_key_set_ceiling_scales_with_the_set_size` (mutant: the constant
+ceiling; fails on `parts_beyond_ceiling` > 0 at 30 parts x 100 keys),
+`a_single_key_ceiling_is_unchanged_at_2048` (mutant: `k` applied at k = 1;
+fails on the 1,025-part control), `a_part_costing_more_than_its_tier_one_probe_is_left_to_tier_one`
+(mutant: the test dropped; fails on a leaf GET against a 2-entry part
+probed with 100 keys). The row 18 time bound and the harness's
+`advanced_leaves` state are unchanged.
