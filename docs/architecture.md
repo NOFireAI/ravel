@@ -5,9 +5,29 @@ is no write-ahead log, no replicated block device, and no local disk whose
 loss loses data. Any process can die at any instant, and every strictly
 acknowledged write survives.
 
-Each section below is short and links to the document that holds the detail.
-[docs/concepts.md](concepts.md) defines every term used below and expands
-every acronym. Read it first if the vocabulary is new.
+## In brief
+
+- **One bucket holds everything.** Telemetry lives in immutable data objects
+  called segments. A small commit record publishes each one. The catalog
+  folds commit records into snapshots that queries read.
+- **Writes go to the bucket first.** An ingest shard buffers points for a
+  short flush delay, writes the segment, writes the commit record, and only
+  then acknowledges the sender. The commit token in the response lets a later
+  query read that exact write.
+- **Reads resolve a snapshot.** A query takes a catalog snapshot, prunes the
+  segments it cannot need, and fetches the rest through a read cache. PromQL
+  and SQL run on the same snapshot model.
+- **Maintenance never edits a data object.** Compaction merges small L0 segments
+  into L1 segments, retention drops old data, and the sweep deletes objects
+  nothing references. Each step publishes a new record instead of changing an
+  old object.
+- **Every process is disposable.** One `ravel-server` binary runs as `all`,
+  `gateway`, `query`, or `maintain`. Any process can be killed and replaced
+  with no handoff, because no process holds state another one needs.
+
+The sections below give each part in more detail, and each links to the page
+that owns the full contract. [Concepts](concepts.md) defines every term, and
+the [consistency model](consistency-model.md) states the guarantees.
 
 ## Which components exist
 
@@ -123,9 +143,11 @@ model.
 `/healthz` answers 200 whenever the HTTP loop is serving. It never depends on
 store reachability, so a store outage cannot get healthy processes killed.
 
-`/readyz` has three inputs:
+`/readyz` has four inputs:
 
 - Startup. `/readyz` gates on completed startup.
+- Drain. On SIGTERM, `/readyz` turns 503 before the process drains (see
+  [Shutdown](#shutdown)).
 - A background store probe with asymmetric hysteresis. Four consecutive probe
   failures flip `/readyz` to 503, and one success recovers it. The kubelet
   path reads an in-memory atomic and does not touch the store.
