@@ -1296,10 +1296,12 @@ pub async fn compact_tenant_to(
 /// at N > 1. N=1 is the full budget either way. A `concurrency` of zero is
 /// clamped to one (callers refuse it upstream with a typed error). The
 /// bucket's RLOG resident ceiling (ADR-3819 D1) is that per-bucket budget,
-/// with no second division: the budget already is this bucket's share. A
-/// `base` carrying a [`RequestLedger`] gives each bucket a fresh one, for the
-/// same reason as the tracker. Every other config field is `base`, copied
-/// verbatim.
+/// with no second division: the budget already is this bucket's share. Its
+/// [`CompactorConfig::unit_concurrency`] is `concurrency` (clamped to one), so
+/// a two-level merge's level-1 workers take the usable cores over the buckets
+/// running at once (ADR-3853 core share amendment). A `base` carrying a
+/// [`RequestLedger`] gives each bucket a fresh one, for the same reason as the
+/// tracker. Every other config field is `base`, copied verbatim.
 pub fn per_bucket_config(base: &CompactorConfig, concurrency: usize) -> CompactorConfig {
     let mut config = base.clone();
     config.merge_memory_tracker = Some(MergeMemoryTracker::new());
@@ -1309,6 +1311,7 @@ pub fn per_bucket_config(base: &CompactorConfig, concurrency: usize) -> Compacto
             base.merge_cursor_budget_bytes / (concurrency.max(1) as u64);
     }
     config.merge_resident_ceiling_bytes = Some(config.merge_cursor_budget_bytes);
+    config.unit_concurrency = concurrency.max(1);
     config
 }
 
@@ -3588,6 +3591,24 @@ mod tests {
     /// These fixtures build their own `MemoryStore`, which is the explicit
     /// `--store memory` case (issue #1024): an empty result stays a success.
     const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
+
+    /// ADR-3853 core share amendment: N buckets at once each state N as the
+    /// unit concurrency, so on 16 cores N = 8 derives level-1 workers from a
+    /// share of 2, not all 16. The default budget is still divided by N and
+    /// the ceiling is that per-bucket budget, divided once.
+    #[test]
+    fn per_bucket_config_names_its_bucket_share() {
+        let base = CompactorConfig::default();
+        let config = per_bucket_config(&base, 8);
+        assert_eq!(config.unit_core_share(16), 2, "the W1 share on 16 cores");
+        assert_eq!(config.unit_concurrency, 8);
+        let budget = ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES / 8;
+        assert_eq!(config.merge_cursor_budget_bytes, budget);
+        assert_eq!(config.merge_resident_ceiling_bytes, Some(budget));
+        assert_eq!(config.merge_resident_ceiling(), budget);
+        assert_eq!(per_bucket_config(&base, 1).unit_core_share(16), 16);
+        assert_eq!(per_bucket_config(&base, 0).unit_concurrency, 1);
+    }
 
     /// `compact-bucket` runs one merge, so its RLOG resident ceiling (ADR-3819
     /// D1) is the whole merge cursor budget: the config `compact_to` builds

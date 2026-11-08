@@ -1715,15 +1715,6 @@ fn level1_group_size(per_input: u64, run_target: u64, ceiling: u64, inputs: usiz
     (room / per_input.max(1)).min(inputs as u64)
 }
 
-/// The cores one merge unit may use (ADR-3853 D4): the host's `cores` divided
-/// by the units the cursor budget runs at once (`budget / ceiling`), at least 1.
-fn unit_core_share(cores: usize, budget: u64, ceiling: u64) -> usize {
-    let units = usize::try_from(budget / ceiling.max(1))
-        .unwrap_or(usize::MAX)
-        .max(1);
-    (cores / units).max(1)
-}
-
 /// The level-2 blocks constraint (b) prices per run (ADR-3853 D3, #3943
 /// correction): level 1 writes a run stream by stream, so a stream smaller than
 /// a part sits in one of the run's parts, or in two when a cut falls inside it.
@@ -2543,10 +2534,8 @@ async fn two_level_merge(
         .map(level1_input_bytes)
         .collect::<Result<Vec<_>>>()?;
     let per_input = costs.iter().map(Level1InputCost::total).max().unwrap_or(0);
-    let share = unit_core_share(
+    let share = config.unit_core_share(
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-        config.merge_cursor_budget_bytes,
-        ceiling,
     );
     let workers = match config.level1_workers {
         Some(workers) => workers.max(1),
@@ -2728,7 +2717,7 @@ fn largest_in_flight(mut lens: Vec<u64>, concurrency: usize) -> u64 {
 struct TwoLevelLayout {
     per_input: u64,
     group_size: u64,
-    /// The cores the unit may use ([`unit_core_share`]).
+    /// The cores the unit may use ([`CompactorConfig::unit_core_share`]).
     share: usize,
     /// `W1`.
     workers: usize,
@@ -16353,6 +16342,33 @@ mod tests {
             }
         }
 
+        fn units(unit_concurrency: usize) -> CompactorConfig {
+            CompactorConfig {
+                unit_concurrency,
+                ..CompactorConfig::default()
+            }
+        }
+
+        /// ADR-3853 core share amendment: the share is the usable cores over
+        /// the stated unit concurrency, whatever the cursor budget and the
+        /// resident ceiling are, and at least 1.
+        #[test]
+        fn level1_workers_derive_from_the_units_core_share() {
+            const GIB: u64 = 1 << 30;
+            for (budget, ceiling) in [(GIB, Some(GIB)), (20 * GIB, Some(GIB)), (8 * GIB, None)] {
+                let at = |unit_concurrency: usize| CompactorConfig {
+                    merge_cursor_budget_bytes: budget,
+                    merge_resident_ceiling_bytes: ceiling,
+                    ..units(unit_concurrency)
+                };
+                assert_eq!(at(8).unit_core_share(16), 2, "{budget} {ceiling:?}");
+                assert_eq!(at(1).unit_core_share(16), 16, "{budget} {ceiling:?}");
+                assert_eq!(at(64).unit_core_share(16), 1, "{budget} {ceiling:?}");
+                assert_eq!(at(0).unit_core_share(16), 16, "{budget} {ceiling:?}");
+            }
+            assert_eq!(CompactorConfig::default().unit_concurrency, 1);
+        }
+
         /// ADR-3853 D4 and D3 at the production shape: 32 cores, 4 units of
         /// 5 GiB at once or one of 20 GiB, 256 MiB run targets, the
         /// 19,177-input bucket. Measured pricing gives each unit its whole
@@ -16366,9 +16382,9 @@ mod tests {
             const GIB: u64 = 1 << 30;
             const TARGET: u64 = 256 << 20;
             let ceiling = 5 * GIB;
-            let share = unit_core_share(32, 4 * ceiling, ceiling);
+            let share = units(4).unit_core_share(32);
             assert_eq!(share, 8);
-            assert_eq!(unit_core_share(32, 20 * GIB, 64 << 20), 1);
+            assert_eq!(units(320).unit_core_share(32), 1);
             let shape = |per_input: u64, block: u64| Level1Shape {
                 per_input,
                 inputs: 19_177,
@@ -16403,7 +16419,7 @@ mod tests {
 
             // One unit of 20 GiB with all 32 cores and 1 GiB final parts.
             let whole = 20 * GIB;
-            assert_eq!(unit_core_share(32, whole, whole), 32);
+            assert_eq!(units(1).unit_core_share(32), 32);
             let at_whole = |per_input: u64, block: u64| Level1Shape {
                 ceiling: whole,
                 part_target: GIB,
@@ -16723,7 +16739,7 @@ mod tests {
                 ceiling: whole,
             };
             assert_eq!(whole, 21_474_836_480);
-            let share = unit_core_share(32, whole, whole);
+            let share = CompactorConfig::default().unit_core_share(32);
             assert_eq!(share, 32);
             assert_eq!(derive_level1_workers(&shape, share), Some(6));
             assert_eq!(whole / 6, 3_579_139_413);
