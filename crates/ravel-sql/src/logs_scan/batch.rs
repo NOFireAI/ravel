@@ -746,7 +746,21 @@ pub(crate) mod view_registry {
     /// on the first call after the scan served the memo's block; `None` when
     /// `values` is no registered memo or the memo has no views to give.
     pub(crate) fn views_of(values: &StringArray) -> Option<StringViewArray> {
-        memo_of(values)?.views()
+        let views = memo_of(values)?.views()?;
+        #[cfg(test)]
+        SERVED.with(|n| n.set(n.get() + 1));
+        Some(views)
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static SERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// How many times [`views_of`] gave a memo's views on this thread.
+    #[cfg(test)]
+    pub(crate) fn served() -> usize {
+        SERVED.with(std::cell::Cell::get)
     }
 
     /// Whether the registry holds an entry, live or not, pointing at the memo
@@ -7322,8 +7336,9 @@ mod tests {
 
             /// A batch whose dictionary values are the served, filled memo's
             /// own offsets and values buffers under a null buffer of the
-            /// batch's own is not served the memo's views: the key equals the
-            /// cast, the row whose key references the NULL entry is NULL, and
+            /// batch's own is not served the memo's views (the registry's
+            /// serve count does not move, while the memo's own batch moves it
+            /// by 1): the key equals the cast, the row whose key references the NULL entry is NULL, and
             /// a session `GROUP BY` puts it in the NULL group.
             #[tokio::test]
             async fn a_null_buffer_over_the_memos_own_buffers_reads_as_the_cast() {
@@ -7349,7 +7364,20 @@ mod tests {
                 .expect("dictionary");
                 let nulled = RecordBatch::try_new(batch.schema(), vec![Arc::new(dict) as ArrayRef])
                     .expect("batch");
+                let served = view_registry::served();
                 let got = group_key(&nulled, true);
+                assert_eq!(
+                    view_registry::served() - served,
+                    0,
+                    "the batch is not served the memo's views"
+                );
+                let served = view_registry::served();
+                drop(group_key(batch, true));
+                assert_eq!(
+                    view_registry::served() - served,
+                    1,
+                    "the memo's own batch is served"
+                );
                 identical(&got, &group_key(&nulled, false)).unwrap_or_else(|e| panic!("{e}"));
                 assert!(got.is_null(1), "the row keyed to the NULL entry is NULL");
                 assert_eq!(got.null_count(), 1);
