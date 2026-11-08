@@ -318,13 +318,15 @@ async fn the_returned_groups_carry_every_row_from_every_input_partition() {
 
 /// A `Utf8View` key whose groups the filter must count as the aggregate
 /// does: a NULL group, a 13-byte string stored out of line and a 12-byte
-/// string stored inline, beside seven out-of-line filler groups. Partial
-/// aggregation is skipped from the first batch on, so the rows reach the
-/// filter one per row with views into different buffers and offsets.
+/// string stored inline, beside seven out-of-line filler groups. Every batch
+/// is a slice of one array, so each out-of-line row's view carries its own
+/// buffer offset. Partial aggregation is skipped after the first row and the
+/// plan has one final partition, so the filter sees every group, and nearly
+/// every row as its own view.
 ///
 /// FLIP: interning the raw 128-bit views instead of the strings splits each
-/// out-of-line group into one group per row, the filter keeps only the
-/// first ten of those, and the counts read short.
+/// out-of-line group into one group per view; the filler rows, which sort
+/// first, fill the ten slots, and the 13-byte group is dropped.
 #[tokio::test]
 async fn first_groups_keep_null_and_long_view_keys_as_the_aggregate_does() {
     const LONG: &str = "thirteen-byte";
@@ -347,9 +349,10 @@ async fn first_groups_keep_null_and_long_view_keys_as_the_aggregate_does() {
             rows.push(key.clone());
         }
     }
+    let all = StringViewArray::from_iter(rows.iter().map(|k| k.as_deref()));
     let mut parts: Vec<Vec<RecordBatch>> = vec![Vec::new(), Vec::new()];
-    for (i, chunk) in rows.chunks(3).enumerate() {
-        let array = StringViewArray::from_iter(chunk.iter().map(|k| k.as_deref()));
+    for (i, start) in (0..rows.len()).step_by(3).enumerate() {
+        let array = all.slice(start, 3.min(rows.len() - start));
         parts[i % 2].push(
             RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)])
                 .expect("batch builds"),
@@ -365,6 +368,7 @@ async fn first_groups_keep_null_and_long_view_keys_as_the_aggregate_does() {
         let options = &mut state.config_mut().options_mut().execution;
         options.skip_partial_aggregation_probe_rows_threshold = 1;
         options.skip_partial_aggregation_probe_ratio_threshold = 0.0;
+        options.target_partitions = 1;
     }
     let sql = "SELECT k, count(*) FROM t GROUP BY k LIMIT 10";
     let plan = plan_of(&ctx, sql).await;
