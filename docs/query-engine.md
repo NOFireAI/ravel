@@ -6346,7 +6346,8 @@ once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
 `deferredSetEstimateBytes`, and `deferredSetEstimatePartial`.
 `viewMemoBytes` is the cache's view total when the statement finished,
 `viewMemoFills` and `viewMemoRefusals` the statement's own fills and
-refused fills, and `viewMemoReleases` the views the memory budget's evictor
+refused fills, none of another statement's on the same cache
+(`a_concurrent_statements_fills_and_refusals_are_not_the_calls`), and `viewMemoReleases` the views the memory budget's evictor
 released while the statement ran, which can include another statement's
 pressure (`per_call_view_memo_stats_are_the_statements_own`). The releases
 are the growth of the cache's release counter from a mark taken when the

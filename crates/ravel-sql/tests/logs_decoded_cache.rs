@@ -1673,3 +1673,108 @@ async fn a_release_inside_one_call_is_that_calls_own() {
     );
     assert_eq!(view_memo_keys(&exec, &t, SQL).await, [views, 0, 0, 0]);
 }
+
+/// ADR-3326, view memo amendment, decision 7, at the executor: a call's
+/// `viewMemoFills` and `viewMemoRefusals` are its own while another statement
+/// on the same cache fills or is refused inside its window. Call A is held on
+/// its first data object `GET` while call B, on a second executor over the
+/// same cache, runs to completion.
+///
+/// With the 8 view memos (4 per object) released before A starts, B fills at
+/// least the 4 of the object A is held on, A's other partition may fill the
+/// other object's 4 first, and the two calls' `viewMemoFills` sum to the 8
+/// refills; both report 768 view bytes and no refusal or release.
+/// Under a view budget one byte short of the 768 view bytes, 7 memos fill
+/// (672 bytes) and every served call is refused the eighth once: B and A each
+/// report `[672, 0, 1, 0]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_concurrent_statements_fills_and_refusals_are_not_the_calls() {
+    const SQL: &str = "SELECT p, count(*) AS c FROM logs GROUP BY p";
+    let views = (ROWS_PER_OBJECT * OBJECTS as usize * 16) as u64;
+    let block = (ROWS_PER_BLOCK * 16) as u64;
+    let t = tenant();
+    let hooked = Arc::new(HookStore {
+        inner: Arc::new(MemoryStore::new()),
+        hook: std::sync::Mutex::new(None),
+    });
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&hooked) as _;
+    for seq in 1..=OBJECTS {
+        publish_object(store.as_ref(), &t, seq).await;
+    }
+
+    // B runs while A is held; A's call is awaited after B's.
+    let overlapped = |exec_a: Arc<SqlExecutor>, exec_b: SqlExecutor| {
+        let (hooked, t) = (Arc::clone(&hooked), t.clone());
+        async move {
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            hooked.arm(move || {
+                reached_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            let ta = t.clone();
+            let a = tokio::spawn(async move { view_memo_keys(&exec_a, &ta, SQL).await });
+            tokio::task::spawn_blocking(move || reached_rx.recv())
+                .await
+                .unwrap()
+                .expect("A reached its first data GET");
+            let b = view_memo_keys(&exec_b, &t, SQL).await;
+            release_tx.send(()).unwrap();
+            (a.await.unwrap(), b)
+        }
+    };
+
+    let cache_with = |view_max_bytes: u64| {
+        Arc::new(
+            DecodedColumnCache::new(1 << 30, Some(Arc::new(MemoryBudget::unlimited())))
+                .with_view_max_bytes(view_max_bytes),
+        )
+    };
+
+    let cache = cache_with(1 << 30);
+    let exec_a = Arc::new(executor(&store, Some(Arc::clone(&cache))));
+    for _ in 0..4 {
+        view_memo_keys(&exec_a, &t, SQL).await;
+    }
+    assert_eq!(cache.view_resident_bytes(), views, "served and filled");
+    let freed = cache.evict_for_pressure(views, 0, ravel_memory::ExhaustionCause::Accounted);
+    assert_eq!(freed, views);
+    let (a, b) = overlapped(
+        Arc::clone(&exec_a),
+        executor(&store, Some(Arc::clone(&cache))),
+    )
+    .await;
+    assert_eq!(
+        (a[1] + b[1], cache.view_counters().fills),
+        (8, 16),
+        "A and B together refill the 8 memos once"
+    );
+    assert!(
+        b[1] >= 4,
+        "B fills at least the held object's 4 memos: {b:?}"
+    );
+    assert_eq!(
+        (a[0], a[2], a[3], b[0], b[2], b[3]),
+        (views, 0, 0, views, 0, 0)
+    );
+
+    let cache = cache_with(views - 1);
+    let exec_a = Arc::new(executor(&store, Some(Arc::clone(&cache))));
+    let mut warm = Vec::new();
+    for _ in 0..4 {
+        warm.push(view_memo_keys(&exec_a, &t, SQL).await);
+    }
+    assert_eq!(
+        warm[2..],
+        [[7 * block, 7, 1, 0], [7 * block, 0, 1, 0]],
+        "7 of 8 memos fill; the eighth is refused per served call"
+    );
+    let (a, b) = overlapped(
+        Arc::clone(&exec_a),
+        executor(&store, Some(Arc::clone(&cache))),
+    )
+    .await;
+    assert_eq!(b, [7 * block, 0, 1, 0], "B is refused once");
+    assert_eq!(a, [7 * block, 0, 1, 0], "A reports only its own refusal");
+    assert_eq!(cache.view_counters().refusals, 4);
+}
