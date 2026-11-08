@@ -1,107 +1,30 @@
-# Querying traces
+# Query traces
 
-Ravel stores every span in RSPAN objects and serves them through the `spans`
-SQL table. Read the [query guide](query.md) first for the shared
-`POST /api/v1/sql` mechanics.
+Ravel serves traces three ways:
 
-## How Ravel stores spans
+- `GET /api/traces/<trace_id>` returns every span of one trace.
+- The `spans` SQL table answers any span query on `POST /api/v1/sql` and
+  Flight SQL.
+- The MCP tool `ravel_get_trace` returns one trace as a span tree (see the
+  [MCP reference](../reference/mcp.md#ravel_get_trace)).
 
-A span is one record in an RSPAN segment object. Object storage is the only
-durable copy. Records in a segment sort by `(trace_id, start_ts)`, so all
-spans of one trace occupy a contiguous run of blocks.
+Ravel has no Jaeger or Tempo query API and no TraceQL. The examples use the
+quickstart's token and listener; the [query guide](query.md) covers the
+shared `POST /api/v1/sql` mechanics.
 
-The reader uses these structures to skip blocks that cannot match a query:
+<a id="fetching-one-trace-by-id"></a>
 
-- A skip index in each object. For each block it holds the `trace_id` range,
-  the time interval (`start_ts` minimum and `end_ts` maximum), the
-  `duration_ns` range, and a one-byte `status_mask`.
-- A BLOOM section, with a per-block bloom filter over the tokens of
-  `service.name` and span `name`.
-- A block-local `service_name` column.
+## Fetch one trace
 
-The full, normative spec of the on-disk layout is
-[docs/span-segment-format.md](../span-segment-format.md).
-
-## Bounded trace reads
-
-A `trace_id =` query decodes only the blocks that can hold the trace. Every
-object no key-index leaf covers is probed in its KEY_IDX section, which
-indexes the first 8 bytes of every trace id the object holds, before its
-skip index is read. The probe is answered by small ranged reads: the
-object's last 8 KiB (its footer), then the index directory and one bucket.
-A trace KEY_IDX does not find is absent from the object, so the object is
-not read further: with a footer that fits the 8 KiB suffix that is three
-requests, the first at most 8 KiB and all three under 16 KiB, and no
-SKIP_IDX read
-(`unfolded_absent_object_costs_three_gets_under_sixteen_kib_and_no_skip_idx_read`).
-An object that
-holds the trace then reads its skip index, which drops every block whose
-`trace_id` range excludes the trace or whose bounds miss the statement's
-other predicates, and only the kept block run (the same test, and
-`a_cold_columnar_lookup_reads_only_the_routed_blocks` for the blocks a leaf
-names). The probe trades block reads for index reads: a
-lookup reads fewer bytes, but it can issue more requests, since every
-uncovered object pays those reads whether or not it holds the trace. A
-trace it does find may be another trace sharing those 8 bytes; the decoded
-rows are matched against the full trace id, which removes it.
-
-Ingest routes each span to a shard by its `trace_id`. The router hashes the
-`trace_id` with BLAKE3 and picks the shard from the hash. All spans of one
-trace land on the same shard. In the objects of that shard they sort together
-into a contiguous block run.
-
-The catalog listing at query time does not use this routing. A `trace_id =`
-query lists the segments of every shard in the matched time window, the same
-as any other query. On every object no leaf covers, KEY_IDX is probed from
-the footer suffix before the skip index, and an object KEY_IDX proves the
-trace absent from never reads SKIP_IDX
-(`unfolded_absent_object_costs_three_gets_under_sixteen_kib_and_no_skip_idx_read`;
-`parts_past_the_ceiling_are_probed_at_tier_one` pins the same read order on
-the objects of a part the router left to the probe). Objects KEY_IDX ruled
-out are counted in `stats.pruning.segmentsPrunedByKeyIndex` (both tests),
-and the KEY_IDX reads are reported under the `keyIndex` entry of
-`stats.phases` (`a_trace_lookup_degrades_to_tier_one_on_a_refused_parts_charge`).
-
-### Key-index leaves
-
-When the catalog is folded with key-index leaves (`ravel-server
---fold-key-index-leaves`, or `ravel-cli catalog fold --key-index-leaves`),
-each folded part also carries a small index of the trace ids its objects
-hold. A `trace_id =` lookup reads two ranged GETs of that index per part,
-then opens only the objects that hold the trace, each at the blocks the
-index names, without reading their KEY_IDX. Objects of the part that do not
-hold the trace are not read at all. Objects no leaf covers (the unsealed
-tail, a part folded without leaves, and the parts past the lookup's
-ceiling of 1,024 parts or 2,048 leaf GETs) fall back to the per-object
-KEY_IDX probe above.
-
-Objects a leaf ruled out are also counted in
-`stats.pruning.segmentsPrunedByKeyIndex`. The response's `stats.keyIndex`
-reports what the lookup did: `partsCovered`, `partsUncovered`,
-`partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
-`leafGetRequests`, `leafWireBytes`, `keysProbed`, `skippedByBudget` and
-`skipIdxDropped`. It is present only on a statement with a `trace_id`
-filter. `keysProbed` is the number of distinct trace ids the part-level
-check used: 1 for `trace_id = <literal>`, and the distinct count for a
-`trace_id IN (...)` list of 2 to 1,024 distinct ids or the same ids written as
-`trace_id = a OR trace_id = b`. [The query engine
-reference](../query-engine.md) defines each figure. The process exports `ravel_query_key_index_parts_total` by
-`signal` and `outcome`, and `ravel_query_key_index_leaf_gets_total` by
-`signal`. A `trace_id =` filter on the
-`logs` table probes log objects the same way when the tenant indexes
-`trace_id` (see
-[exact-key index fields](operations/configuration.md#exact-key-index-fields)).
-
-Online resharding can move a tenant to a new shard count while spans still
-arrive. A trace whose spans straddle a reshard activation can split across
-two shards. A trace-by-id query still returns every stored span from
-wherever it landed.
-
-## Fetching one trace by id
-
-```text
-GET /api/traces/<trace_id>
+```sh
+curl -s -H "Authorization: Bearer demo-token" \
+  http://127.0.0.1:4318/api/traces/00112233445566778899aabbccddeeff
 ```
+
+The response is the `POST /api/v1/sql` envelope (`status`, `data` with
+`columns` and `rows`, and `stats`), one row per span in the row shape of
+[the `spans` table](#the-spans-table). Send
+`Accept: application/vnd.apache.arrow.stream` to get Arrow IPC instead.
 
 `trace_id` is 32 hexadecimal characters, in either case. Any other value is
 a 400 with a typed body, before any data is read:
@@ -109,6 +32,9 @@ a 400 with a typed body, before any data is read:
 ```json
 {"status": "error", "errorType": "bad_data", "error": "invalid trace id \"7a7a\": expected 32 hexadecimal characters"}
 ```
+
+A trace the tenant does not hold is a 200 with zero rows, not a 404. The
+route needs the `sql` cargo feature, which the published image carries.
 
 The query string takes the same optional parameters as `POST /api/v1/sql`:
 
@@ -119,222 +45,51 @@ The query string takes the same optional parameters as `POST /api/v1/sql`:
   a 400.
 
 The route runs `SELECT * FROM spans WHERE trace_id = X'<trace_id>' ORDER BY
-start_ts, span_id` through the SQL endpoint's own handler path. It uses the
-same authentication, tenant, limits, deadline, and query audit record.
-
-The response is the SQL endpoint's envelope:
-
-- `status`
-- `data`, with `columns` and `rows` in the row shape of
-  [the `spans` table](#the-spans-table)
-- `stats`
-
-`Accept: application/vnd.apache.arrow.stream` returns Arrow IPC, the same as
-on the SQL endpoint.
-
-A trace the tenant does not hold is a 200 with zero rows, not a 404. The
-route needs the `sql` cargo feature, which the published image carries.
-
-```sh
-curl -s -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:4318/api/traces/00112233445566778899aabbccddeeff
-```
+start_ts, span_id` through the SQL endpoint's handler, with the same
+authentication, tenant, limits, deadline, and query audit record.
 
 ### Lookups without a window
 
-A lookup pinned to one trace id with no explicit start resolves from time
-zero. It covers every folded part and the unsealed tail that the tenant still
-retains, instead of the SQL endpoint's one hour before `end`.
+With no `start`, the lookup resolves from time zero. It covers every folded
+part and the unsealed tail that the tenant still retains, instead of the SQL
+endpoint's one hour before `end`. An omitted `end` is the current time.
 
-Explicit bounds are kept exactly. `start` and `end` bound which objects are
-listed, as they do on `POST /api/v1/sql`. An omitted `end` is the current
-time.
+Explicit `start` and `end` are kept exactly and bound which objects are
+listed. On this route they do not filter rows: a span that starts outside the
+window can still be returned when its object is read. `ravel_get_trace`
+resolves its `time_range` the same way and also filters rows, so it returns
+only the spans that start inside the range.
 
-On this route, `start` and `end` choose which objects are read and do not
-filter rows. A span that starts outside the window can still be returned
-when its object is read. The MCP tool `ravel_get_trace` resolves its
-`time_range` the same way and also filters rows: it returns only the spans
-that start inside the range.
-
-The no-window rule covers this route and the MCP tool `ravel_get_trace`. A
+The no-window rule covers this route and `ravel_get_trace` only. A
 `POST /api/v1/sql` request that gives no window still reads one hour before
 `end`, even when its statement pins a `trace_id`. To read a whole trace over
 SQL, pass `"start": 0`.
 
 A lookup without a window resolves every part of the tenant, so its cost
-grows with retention. Each covering part costs catalog reads, and each
-segment no leaf covers still costs a KEY_IDX probe, even though only the
-blocks that can hold the trace are decoded. On a catalog folded with
-key-index leaves, a covered part costs two leaf reads instead of one probe
-per object. When you know roughly when the trace ran, pass `start` and
-`end`.
+grows with retention: each covering part costs catalog reads, and each
+segment no [key-index leaf](#key-index-leaves) covers costs a KEY_IDX probe.
+When you know roughly when the trace ran, pass `start` and `end`.
 
-## The `spans` table
+## Query spans with SQL
 
-`POST /api/v1/sql` serves five tables from one endpoint: `samples`
-(metrics), `logs`, `spans`, `alerts` (alert state transitions), and `audit`
-(the audit trail). Ravel decides which tables a query reads from its `FROM`
-clause before planning. `POST /api/v1/sql` and Flight SQL can join `spans`
-with the other four tables, reading one snapshot per signal. On both, a
-`min_commit_token` on such a query is qualified with the table it bounds
-(`spans:<token>`). The [query guide](query.md) gives the terms of a join,
-including its best-effort memory ceiling.
+Send a statement over `spans` to `POST /api/v1/sql`:
 
-The `spans` table has these columns:
-
-| column           | type                          | notes                                        |
-|------------------|-------------------------------|----------------------------------------------|
-| `trace_id`       | `FixedSizeBinary(16)`         | trace identity, never null                   |
-| `span_id`        | `FixedSizeBinary(8)`          | span identity, never null                    |
-| `parent_span_id` | `FixedSizeBinary(8)`          | null on a root span                          |
-| `name`           | `Utf8`                        | span (operation) name                        |
-| `start_ts`       | `Timestamp(ns)`               | span start                                   |
-| `end_ts`         | `Timestamp(ns)`               | span end                                     |
-| `status_code`    | `UInt8`                       | `0` Unset, `1` Ok, `2` Error                 |
-| `status_message` | `Utf8`                        | null when the span set no message            |
-| `attrs`          | `Map(Utf8, Utf8)`             | merged resource, scope, and span attributes  |
-| `service_name`   | `Utf8`                        | from `attrs["service.name"]`, null when absent |
-| `duration_ns`    | `Int64`                       | computed `end_ts - start_ts`, never stored   |
-| `events`         | `List(Struct{ts_unix_nano Int64, name Utf8, attrs Map(Utf8, Utf8)})` | span events, null when the span carried none |
-| `links`          | `List(Struct{trace_id FixedSizeBinary(16), span_id FixedSizeBinary(8), trace_state Utf8, attrs Map(Utf8, Utf8)})` | span links, null when the span carried none |
-
-`status_code` is the stored OTLP byte. To read it as text, map the three
-values in SQL, for example `CASE status_code WHEN 0 THEN 'Unset' WHEN 1 THEN
-'Ok' WHEN 2 THEN 'Error' END`.
-
-`duration_ns` is a computed column, `end_ts - start_ts`. Query it like any
-other column (`WHERE duration_ns > 5e8`). The reader answers it from the
-stored duration range of each block.
-
-### Span events
-
-`events` is a list of structs, one element per OTLP span event, in the order
-that the span recorded them. Each element carries:
-
-- `ts_unix_nano`: the raw OTLP `time_unix_nano`, not a `Timestamp` column.
-- `name`: the name of the event.
-- `attrs`: a `Map(Utf8, Utf8)` in the same shape as the span's own `attrs`.
-
-On a span that carried no events, the column is null, not an empty list.
-
-Event attribute values are stringified the same way as span attributes:
-
-- A string stays as it is.
-- An integer or a boolean is spelled as in Prometheus text (`42`, `true`,
-  `+Inf`).
-- A byte value becomes lowercase hex.
-- An array or a key-value-list value has no `Map(Utf8, Utf8)` spelling and is
-  dropped from `attrs`.
-
-The column is therefore a lossy projection. The raw bytes stay available as
-`attrs['_events_raw']` for anything that the column cannot represent.
-
-To filter on one event, expand the list with `unnest`:
-
-```sql
-SELECT trace_id, span_id, e['name'] AS event_name,
-       e['attrs']['exception.type'] AS exception_type
-FROM (SELECT trace_id, span_id, unnest(events) AS e FROM spans
-      WHERE start_ts >= TIMESTAMP '2026-08-19T00:00:00')
-WHERE e['name'] = 'exception';
+```sh
+curl -s -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer demo-token" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT trace_id, span_id, service_name, name, duration_ns FROM spans WHERE status_code = 2 ORDER BY start_ts LIMIT 20"}'
 ```
 
-`unnest` drops a span whose `events` is null, so the result holds one row per
-event, not per span. Both subscripts above are `get_field` lookups.
-`e['name']` reads a struct field. `e['attrs']['exception.type']` reads a map
-key, and evaluates to null when the event did not set that key.
-
-### Span links
-
-`links` is a list of structs, one element per OTLP span link, in the order
-that the span recorded them. Each element carries:
-
-- `trace_id` and `span_id` of the linked span: `FixedSizeBinary`, the same
-  widths as the span-level `trace_id`/`span_id` columns.
-- `trace_state`: empty, never null, when the link set none.
-- `attrs`: a `Map(Utf8, Utf8)` in the same shape as the span's own `attrs`.
-
-On a span that carried no links, the column is null, not an empty list.
-
-Link attribute values are stringified the same way as event and span
-attribute values. `attrs['_links_raw']` is the lossless hex form for the
-value kinds that `Map(Utf8, Utf8)` cannot spell.
-
-To filter on the attributes of one link, expand the list with `unnest`:
-
-```sql
-SELECT trace_id, span_id, l['trace_id'] AS linked_trace_id,
-       l['attrs']['relationship'] AS relationship
-FROM (SELECT trace_id, span_id, unnest(links) AS l FROM spans
-      WHERE start_ts >= TIMESTAMP '2026-08-19T00:00:00')
-WHERE l['attrs']['relationship'] = 'follows_from';
-```
-
-`events` reads RSPAN's nested event columns. `links` has no separate
-column on disk. On every RSPAN version, Ravel decodes `links` straight from
-the plain `_links_raw` attribute. The column costs one protobuf decode per
-row whenever a query selects it.
-
-### Which predicates prune
-
-All pruning is widen-only. DataFusion always applies the original `WHERE`
-predicate again above the scan, so a query never returns a wrong row. Pruning
-only decides which blocks the reader decodes. A predicate that the reader
-cannot prune with still filters rows exactly, and the query reads more
-blocks.
-
-These predicates prune at the skip-index level:
-
-- `trace_id = <literal>` selects the trace fast path. The literal is a 16-byte
-  binary or a 32-character hex string. The reader drops every block whose
-  `trace_id` range excludes the target.
-- `start_ts` and `end_ts` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and
-  `BETWEEN`) fold into one time window. The reader drops every block whose time
-  interval does not overlap it.
-- `duration_ns` range comparisons fold into a duration window. The reader drops
-  every block whose stored `duration_ns` range does not overlap it.
-- `status_code = <literal>` (and `status_code IN (...)`, and a same-axis `OR`
-  of `status_code` equalities) maps to status bits. The reader drops every
-  block whose `status_mask` clears every requested bit. A `status_code = 2`
-  query skips every block with no Error span.
-
-These predicates prune at the bloom level:
-
-- `service_name = <literal>` probes the block's `service.name` bloom. The
-  reader skips a block whose bloom proves the token absent. A bloom never proves
-  presence, so a positive probe still reads the block.
-- `name = <literal>` probes the block's span-name bloom the same way.
-
-Every other predicate is a DataFusion residual only. It prunes no blocks.
-Notes on these shapes:
-
-- The pruning predicates must be top-level `AND` conjuncts. A disjunction
-  (`OR`) inside a conjunct drops that conjunct from pruning. The exception is
-  a same-axis `OR` or `IN` list on `status_code` or `duration_ns`, which
-  prunes as the union of its parts, and a disjunction whose every arm is
-  `trace_id = <literal>`, which uses the key index exactly as the
-  equivalent `trace_id IN (...)` list does. A `trace_id` disjunction with any
-  other arm uses no key.
-- `service_name` and `name` equality push down, and DataFusion also always
-  re-checks them as a residual, because a bloom is a false-positive filter.
-- Attribute equality on the `attrs` map (`attrs['k'] = 'v'`) does not prune.
-  It is evaluated exactly over the merged map.
-- A predicate over `events` does not prune. A query that selects the column
-  turns off the columnar fast path: Ravel rebuilds the events from the
-  attribute pages of the span, the same as `attrs`. A single-node query that
-  does not select `events` never builds the column.
-- A predicate over `links` does not prune. A query that selects the column
-  also turns off the columnar fast path, because the fast path never builds
-  the merged `attrs` map that `links` decodes `_links_raw` out of. A
-  single-node query that does not select `links` never decodes it.
-- Under distributed execution, the column selection is not pushed to the
-  workers. Each worker scans the full `spans` schema, `events` and `links`
-  included, for every row that it returns. The coordinator drops the columns
-  that the query did not select.
+`POST /api/v1/sql` and Flight SQL can join `spans` with `samples`, `logs`,
+`alerts` and `audit`, reading one snapshot per signal; a `min_commit_token`
+on such a join is qualified with the table it bounds (`spans:<token>`). See
+[Joins across tables](query.md#joins-across-tables) for the terms, including
+the best-effort memory ceiling.
 
 ### Worked queries
 
-Find one trace by id and order its spans by start time:
+One trace, its spans ordered by start time:
 
 ```sql
 SELECT span_id, parent_span_id, name, service_name, start_ts, duration_ns,
@@ -378,20 +133,114 @@ ORDER BY duration_ns DESC;
 ```
 
 The first query uses the `trace_id` fast path. The others combine a time
-window with a status, service, name, or duration prune.
+window with a status, service, name, or duration prune (see
+[Which predicates prune](#which-predicates-prune)).
 
-How a `trace_id` literal plans:
+### Trace id literals
 
 - For `=` and `!=`, a 32-character hex string and a 16-byte binary literal
   (`X'00112233...'`) plan identically. Both take the `trace_id` fast path and
-  return the same rows. Ravel plans the literal, and re-applies it as a
-  residual, over the real `FixedSizeBinary(16)` column.
-- For `IN`, only the binary form plans. `trace_id IN (X'00112233...', ...)`
-  works, and `trace_id IN ('00112233...', ...)` still fails to plan.
-  DataFusion builds an `IN` list directly from its operands and does not
-  consult an expression planner.
+  return the same rows.
+- For `IN` and `NOT IN`, use one form for the whole list: every element a
+  32-character hex string, or every element a binary literal. A list that
+  mixes a hex string with any other element fails to plan.
 - The hex-string spelling also plans against the `trace_id` column of the
   `logs` table, which is `FixedSizeBinary(16)` at the same width.
+
+### The `spans` table
+
+| column           | type                          | notes                                        |
+|------------------|-------------------------------|----------------------------------------------|
+| `trace_id`       | `FixedSizeBinary(16)`         | trace identity, never null                   |
+| `span_id`        | `FixedSizeBinary(8)`          | span identity, never null                    |
+| `parent_span_id` | `FixedSizeBinary(8)`          | null on a root span                          |
+| `name`           | `Utf8`                        | span (operation) name                        |
+| `start_ts`       | `Timestamp(ns)`               | span start                                   |
+| `end_ts`         | `Timestamp(ns)`               | span end                                     |
+| `status_code`    | `UInt8`                       | `0` Unset, `1` Ok, `2` Error                 |
+| `status_message` | `Utf8`                        | null when the span set no message            |
+| `attrs`          | `Map(Utf8, Utf8)`             | merged resource, scope, and span attributes  |
+| `service_name`   | `Utf8`                        | from `attrs["service.name"]`, null when absent |
+| `duration_ns`    | `Int64`                       | computed `end_ts - start_ts`, never stored   |
+| `events`         | `List(Struct{ts_unix_nano Int64, name Utf8, attrs Map(Utf8, Utf8)})` | span events, null when the span carried none |
+| `links`          | `List(Struct{trace_id FixedSizeBinary(16), span_id FixedSizeBinary(8), trace_state Utf8, attrs Map(Utf8, Utf8)})` | span links, null when the span carried none |
+
+`status_code` is the stored OTLP byte. To read it as text, map the three
+values in SQL, for example `CASE status_code WHEN 0 THEN 'Unset' WHEN 1 THEN
+'Ok' WHEN 2 THEN 'Error' END`.
+
+Query `duration_ns` like any other column (`WHERE duration_ns > 5e8`). The
+reader answers it from the stored duration range of each block.
+
+Span rows are at-least-once, like log rows: a client retry after a lost ack
+can return a span more than once (see
+[At-least-once rows](query.md#at-least-once-rows)).
+
+### Span events
+
+`events` holds one element per OTLP span event, in the order the span
+recorded them. Each element carries:
+
+- `ts_unix_nano`: the raw OTLP `time_unix_nano`, not a `Timestamp` column.
+- `name`: the name of the event.
+- `attrs`: a `Map(Utf8, Utf8)` in the same shape as the span's own `attrs`.
+
+On a span that carried no events, the column is null, not an empty list.
+
+Event attribute values are stringified the same way as span attributes:
+
+- A string stays as it is.
+- An integer or a boolean is spelled as in Prometheus text (`42`, `true`,
+  `+Inf`).
+- A byte value becomes lowercase hex.
+- An array or a key-value-list value has no `Map(Utf8, Utf8)` spelling and is
+  dropped from `attrs`.
+
+The column is therefore a lossy projection. The raw bytes stay available as
+`attrs['_events_raw']` for anything that the column cannot represent.
+
+To filter on one event, expand the list with `unnest`:
+
+```sql
+SELECT trace_id, span_id, e['name'] AS event_name,
+       e['attrs']['exception.type'] AS exception_type
+FROM (SELECT trace_id, span_id, unnest(events) AS e FROM spans
+      WHERE start_ts >= TIMESTAMP '2026-08-19T00:00:00')
+WHERE e['name'] = 'exception';
+```
+
+`unnest` drops a span whose `events` is null, so the result holds one row per
+event, not per span. `e['name']` reads a struct field.
+`e['attrs']['exception.type']` reads a map key, and is null when the event
+did not set that key.
+
+### Span links
+
+`links` holds one element per OTLP span link, in the order the span recorded
+them. Each element carries:
+
+- `trace_id` and `span_id` of the linked span: `FixedSizeBinary`, the same
+  widths as the span-level `trace_id`/`span_id` columns.
+- `trace_state`: empty, never null, when the link set none.
+- `attrs`: a `Map(Utf8, Utf8)` in the same shape as the span's own `attrs`.
+
+On a span that carried no links, the column is null, not an empty list.
+
+Link attribute values are stringified the same way as event and span
+attribute values. `attrs['_links_raw']` is the lossless hex form for the
+value kinds that `Map(Utf8, Utf8)` cannot spell. Ravel decodes `links` from
+that attribute, at one protobuf decode per row whenever a query selects the
+column.
+
+To filter on the attributes of one link, expand the list with `unnest`:
+
+```sql
+SELECT trace_id, span_id, l['trace_id'] AS linked_trace_id,
+       l['attrs']['relationship'] AS relationship
+FROM (SELECT trace_id, span_id, unnest(links) AS l FROM spans
+      WHERE start_ts >= TIMESTAMP '2026-08-19T00:00:00')
+WHERE l['attrs']['relationship'] = 'follows_from';
+```
 
 ## Incomplete traces
 
@@ -408,9 +257,142 @@ happens in two ways:
 
 To read a whole trace regardless of the window, use
 [`GET /api/traces/<trace_id>`](#fetching-one-trace-by-id) without `start`
-and `end`, or query by `trace_id` over SQL with `"start": 0`. Neither that
-route nor SQL flags a result as incomplete. The MCP tool `ravel_get_trace`
-is the one place that does: it labels each span whose parent is not among
-the returned spans `missing` or, when a cap cut the result, `not_returned`
-(see the [MCP reference](../reference/mcp.md#span-tree)). No route waits
-for a missing root or sibling; each returns the spans in view.
+and `end`, or query by `trace_id` over SQL with `"start": 0`. Neither flags a
+result as incomplete. The MCP tool `ravel_get_trace` does: it labels each
+span whose parent is not among the returned spans `missing` or, when a cap
+cut the result, `not_returned` (see the
+[MCP reference](../reference/mcp.md#span-tree)). No route waits for a missing
+root or sibling; each returns the spans in view.
+
+## How Ravel stores and reads spans
+
+A span is one record in an RSPAN segment object. Object storage is the only
+durable copy. Records in a segment sort by `(trace_id, start_ts)`, so all
+spans of one trace occupy a contiguous run of blocks.
+
+Ingest routes each span to a shard by a BLAKE3 hash of its `trace_id`, so all
+spans of one trace land on the same shard. A trace whose spans straddle an
+online reshard activation can split across two shards; a lookup by id still
+returns every stored span from wherever it landed.
+
+The reader skips blocks that cannot match a query with:
+
+- A skip index in each object. For each block it holds the `trace_id` range,
+  the time interval (`start_ts` minimum and `end_ts` maximum), the
+  `duration_ns` range, and a one-byte `status_mask`.
+- A BLOOM section, with a per-block bloom filter over the tokens of
+  `service.name` and span `name`.
+- A block-local `service_name` column.
+- A KEY_IDX section, which indexes the first 8 bytes of every trace id the
+  object holds.
+
+[docs/span-segment-format.md](../span-segment-format.md) is the normative
+spec of the layout.
+
+### Bounded trace reads
+
+A `trace_id =` query lists the segments of every shard in the matched time
+window, as any other query does; the ingest routing does not narrow the
+listing. It then decodes only the blocks that can hold the trace:
+
+1. Each object no [key-index leaf](#key-index-leaves) covers is probed in its
+   KEY_IDX with small ranged reads: the object's last 8 KiB (its footer),
+   then the index directory and one bucket.
+2. An object KEY_IDX proves the trace absent from is not read further. With a
+   footer that fits the 8 KiB suffix, that costs three requests, the first at
+   most 8 KiB and all three under 16 KiB, and no skip index read.
+3. An object that holds the trace reads its skip index, drops every block
+   whose `trace_id` range excludes the trace or whose bounds miss the
+   statement's other predicates, and reads only the kept block run.
+
+A trace that shares those 8 bytes can pass the probe; the decoded rows are
+matched against the full trace id, which removes it. The probe trades block
+reads for index reads: a lookup reads fewer bytes, but it can issue more
+requests, since every uncovered object pays those reads whether or not it
+holds the trace.
+
+Objects KEY_IDX ruled out are counted in
+`stats.pruning.segmentsPrunedByKeyIndex`, and the KEY_IDX reads are reported
+under the `keyIndex` entry of `stats.phases`.
+
+### Key-index leaves
+
+When the catalog is folded with key-index leaves (`ravel-server
+--fold-key-index-leaves`, or `ravel-cli catalog fold --key-index-leaves`),
+each folded part also carries a small index of the trace ids its objects
+hold. A `trace_id =` lookup reads two ranged GETs of that index per part,
+then opens only the objects that hold the trace, each at the blocks the
+index names, without reading their KEY_IDX. Objects of the part that do not
+hold the trace are not read at all. Objects no leaf covers (the unsealed
+tail, a part folded without leaves, and the parts past the lookup's
+ceiling of 1,024 parts or 2,048 leaf GETs) fall back to the per-object
+KEY_IDX probe above.
+
+Objects a leaf ruled out are also counted in
+`stats.pruning.segmentsPrunedByKeyIndex`. The response's `stats.keyIndex`
+reports what the lookup did: `partsCovered`, `partsUncovered`,
+`partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
+`leafGetRequests`, `leafWireBytes`, `keysProbed`, `skippedByBudget` and
+`skipIdxDropped`. It is present only on a statement with a `trace_id`
+filter. `keysProbed` is the number of distinct trace ids the part-level
+check used: 1 for `trace_id = <literal>`, and the distinct count for a
+`trace_id IN (...)` list of 2 to 1,024 distinct ids or the same ids written as
+`trace_id = a OR trace_id = b`. [The query engine
+reference](../query-engine.md) defines each figure. The process exports `ravel_query_key_index_parts_total` by
+`signal` and `outcome`, and `ravel_query_key_index_leaf_gets_total` by
+`signal`.
+
+A `trace_id =` filter on the `logs` table probes log objects the same way
+when the tenant indexes `trace_id` (see
+[exact-key index fields](operations/configuration.md#exact-key-index-fields)).
+
+### Which predicates prune
+
+Pruning only decides which blocks the reader decodes. DataFusion always
+applies the original `WHERE` predicate again above the scan, so a query never
+returns a wrong row. A predicate that the reader cannot prune with still
+filters rows exactly, and the query reads more blocks.
+
+These predicates prune at the skip-index level:
+
+- `trace_id = <literal>` selects the trace fast path. The literal is a 16-byte
+  binary or a 32-character hex string. The reader drops every block whose
+  `trace_id` range excludes the target.
+- `start_ts` and `end_ts` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and
+  `BETWEEN`) fold into one time window. The reader drops every block whose time
+  interval does not overlap it.
+- `duration_ns` range comparisons fold into a duration window. The reader drops
+  every block whose stored `duration_ns` range does not overlap it.
+- `status_code = <literal>` (and `status_code IN (...)`, and a same-axis `OR`
+  of `status_code` equalities) maps to status bits. The reader drops every
+  block whose `status_mask` clears every requested bit. A `status_code = 2`
+  query skips every block with no Error span.
+
+These predicates prune at the bloom level:
+
+- `service_name = <literal>` probes the block's `service.name` bloom. The
+  reader skips a block whose bloom proves the token absent. A bloom never proves
+  presence, so a positive probe still reads the block, and the predicate is
+  always re-checked as a residual.
+- `name = <literal>` probes the block's span-name bloom the same way.
+
+Every other predicate filters rows only and prunes no blocks:
+
+- The pruning predicates must be top-level `AND` conjuncts. A disjunction
+  (`OR`) inside a conjunct drops that conjunct from pruning. The exception is
+  a same-axis `OR` or `IN` list on `status_code` or `duration_ns`, which
+  prunes as the union of its parts, and a disjunction whose every arm is
+  `trace_id = <literal>`, which uses the key index exactly as the
+  equivalent `trace_id IN (...)` list does. A `trace_id` disjunction with any
+  other arm uses no key.
+- Attribute equality on the `attrs` map (`attrs['k'] = 'v'`) does not prune.
+  It is evaluated exactly over the merged map.
+- A predicate over `events` or `links` does not prune. A query that selects
+  either column turns off the columnar fast path: Ravel rebuilds `events`
+  from the span's attribute pages, as it does `attrs`, and decodes `links`
+  out of the merged `attrs` map. A single-node query that selects neither
+  column never builds them.
+- Under distributed execution, the column selection is not pushed to the
+  workers. Each worker scans the full `spans` schema, `events` and `links`
+  included, for every row that it returns. The coordinator drops the columns
+  that the query did not select.
