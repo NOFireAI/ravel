@@ -263,7 +263,8 @@ Level-1 groups run `W1` at a time as tokio tasks (their store and scratch
 calls served on the unit's own task, see the #3873 amendment). `W1` is at most the
 unit's core share (the usable cores divided by `--maintain-unit-concurrency`
 in ravel-server, all usable cores for `compact-bucket`: 8 at the server
-defaults on the 32-core reference box, 32 at concurrency 1), and the plan
+defaults on the 32-core reference box, 32 at concurrency 1; how
+`compact-tenant` states it is in the core share amendment), and the plan
 takes the largest `W1` at or under that share for which D1's constraint (a)
 and D3's constraint (b) both hold, since a larger `W1` lowers `C`, which
 lowers `G`, which raises `R` until level 2 no longer fits. The per-merge
@@ -628,7 +629,8 @@ reads a block, with the check `PredictedLevelTwoFit` and its figures at one
 worker, the count with the largest groups and so the fewest run parts.
 The core share is the usable cores
 divided by the units `merge_cursor_budget_bytes` runs at once
-(`budget / U`), at least 1. `CompactorConfig::level1_workers` names `W1`
+(`budget / U`), at least 1; the core share amendment states that count
+explicitly. `CompactorConfig::level1_workers` names `W1`
 outright, wins over the derivation and skips that prediction. Either way
 level 2 checks (b) again against the run parts level 1 actually wrote,
 which the prediction prices from the inputs and can overstate. Each worker
@@ -790,3 +792,21 @@ baseline is the bytes outside every unit subdirectory and so does not see
 them. A process locks its scratch directory once, before its first unit,
 so the charge stays until the process restarts: the next process's lock
 removes the orphan from disk, and that process starts with no charges.
+
+## Amendment (2026-11-08): the unit's core share is stated, not inferred (#3934)
+
+<!-- amendment-applies: sections="D4. Parallel groups|Amendment (2026-11-06): parallel level-1 workers and a derived encode depth (#3873)" pointer="core share amendment" -->
+
+The #3873 amendment derives the core share as the usable cores divided by
+the units `merge_cursor_budget_bytes` runs at once, the budget over the
+resident ceiling. That ratio is the unit concurrency only where ravel-server
+sets it: ravel-server keeps the cursor budget and divides the ceiling by
+`--maintain-unit-concurrency`, while
+`ravel-cli compact-tenant --bucket-concurrency N` divides both by N, so the
+ratio was 1 and every bucket took all usable cores. `CompactorConfig` now
+carries the unit concurrency explicitly in `unit_concurrency`: ravel-server
+sets it to `--maintain-unit-concurrency` and `compact-tenant` to
+`--bucket-concurrency`, and the core share is the usable cores divided by
+it, at least 1. `level1_workers` still names `W1` outright and wins over
+the derivation. D4's figures, 8 workers at the server defaults on the
+32-core reference box and 32 at concurrency 1, are unchanged.

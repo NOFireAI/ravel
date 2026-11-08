@@ -2253,13 +2253,18 @@ pub struct CompactorConfig {
     /// the final parts' bytes, only how the runs between the levels are cut.
     /// Default [`RLOG_RUN_MEMORY_TARGET_BYTES`].
     pub rlog_run_memory_target_bytes: u64,
+    /// The number of merge units that run at once and share the usable cores
+    /// (ADR-3853 D4, core share amendment): a unit's core share is the usable
+    /// cores divided by it, at least 1. ravel-server sets it to
+    /// `--maintain-unit-concurrency`; `ravel-cli maintain compact-tenant` to
+    /// its `--bucket-concurrency`. Default 1; 0 reads as one.
+    pub unit_concurrency: usize,
     /// The level-1 worker count `W1` of a two-level RLOG merge (ADR-3853 D4).
     /// `None` (the default) derives it: the largest count at or under the
-    /// unit's core share (the usable cores over the units the cursor budget
-    /// admits at this ceiling) at which constraint (a) still leaves groups of
-    /// two and the predicted level 2 fits constraint (b). `Some(n)` overrides
-    /// the derivation; `Some(0)` reads as one. Each worker merges its groups
-    /// under `merge_cursor_budget_bytes / W1` and
+    /// unit's core share ([`Self::unit_concurrency`]) at which constraint (a)
+    /// still leaves groups of two and the predicted level 2 fits constraint
+    /// (b). `Some(n)` overrides the derivation; `Some(0)` reads as one. Each
+    /// worker merges its groups under `merge_cursor_budget_bytes / W1` and
     /// `merge_resident_ceiling / W1`.
     pub level1_workers: Option<usize>,
     /// The predicted decoded rows at or below which a cursor plan always runs
@@ -2518,6 +2523,7 @@ impl Default for CompactorConfig {
             scratch_dir: None,
             scratch_max_bytes: None,
             rlog_run_memory_target_bytes: RLOG_RUN_MEMORY_TARGET_BYTES,
+            unit_concurrency: 1,
             level1_workers: None,
             geometry_floor_decoded_rows: crate::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS,
             merge_admission: AdmissionMode::Overlap,
@@ -2551,6 +2557,13 @@ impl Default for CompactorConfig {
 }
 
 impl CompactorConfig {
+    /// The cores one merge unit may use (ADR-3853 D4, core share amendment):
+    /// the host's `cores` divided by [`Self::unit_concurrency`], at least 1.
+    /// [`Self::level1_workers`] derives `W1` at or under it.
+    pub fn unit_core_share(&self, cores: usize) -> usize {
+        (cores / self.unit_concurrency.max(1)).max(1)
+    }
+
     /// [`Self::merge_resident_ceiling_bytes`], or
     /// [`Self::merge_cursor_budget_bytes`] when it is unset. A ceiling above
     /// the cursor budget is clamped to it with a warning: the budget is the
