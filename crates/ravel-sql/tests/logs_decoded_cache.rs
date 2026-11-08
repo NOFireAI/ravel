@@ -1674,21 +1674,24 @@ async fn a_release_inside_one_call_is_that_calls_own() {
     assert_eq!(view_memo_keys(&exec, &t, SQL).await, [views, 0, 0, 0]);
 }
 
-/// ADR-3326, view memo amendment, decision 7, at the executor: a call's
-/// `viewMemoFills` and `viewMemoRefusals` are its own while another statement
-/// on the same cache fills or is refused inside its window. Call A is held on
-/// its first data object `GET` while call B, on a second executor over the
-/// same cache, runs to completion.
+/// ADR-3326, view memo amendment, decision 7, at the executor: each fill or
+/// refused fill is counted once, against the statement whose scan last marked
+/// the block, so two statements serving the same blocks concurrently report
+/// figures that sum to the cache's. Call A is held on its first data object
+/// `GET` while call B, on a second executor over the same cache, runs to
+/// completion.
 ///
 /// With the 8 view memos (4 per object) released before A starts, B fills at
 /// least the 4 of the object A is held on, A's other partition may fill the
 /// other object's 4 first, and the two calls' `viewMemoFills` sum to the 8
 /// refills; both report 768 view bytes and no refusal or release.
 /// Under a view budget one byte short of the 768 view bytes, 7 memos fill
-/// (672 bytes) and every served call is refused the eighth once: B and A each
-/// report `[672, 0, 1, 0]`.
+/// (672 bytes) and every served call is refused the eighth once: both report
+/// 672 view bytes, no fill and no release, and their `viewMemoRefusals` sum
+/// to 2, the growth of the cache's refusal counter from 2 to 4. Which of the
+/// two each refusal lands on depends on which marked the block last.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_concurrent_statements_fills_and_refusals_are_not_the_calls() {
+async fn a_concurrent_statements_view_figures_sum_to_the_caches() {
     const SQL: &str = "SELECT p, count(*) AS c FROM logs GROUP BY p";
     let views = (ROWS_PER_OBJECT * OBJECTS as usize * 16) as u64;
     let block = (ROWS_PER_BLOCK * 16) as u64;
@@ -1714,10 +1717,10 @@ async fn a_concurrent_statements_fills_and_refusals_are_not_the_calls() {
             });
             let ta = t.clone();
             let a = tokio::spawn(async move { view_memo_keys(&exec_a, &ta, SQL).await });
-            tokio::task::spawn_blocking(move || reached_rx.recv())
+            tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(60)))
                 .await
                 .unwrap()
-                .expect("A reached its first data GET");
+                .expect("A did not reach its first data GET within 60 s");
             let b = view_memo_keys(&exec_b, &t, SQL).await;
             release_tx.send(()).unwrap();
             (a.await.unwrap(), b)
@@ -1774,7 +1777,13 @@ async fn a_concurrent_statements_fills_and_refusals_are_not_the_calls() {
         executor(&store, Some(Arc::clone(&cache))),
     )
     .await;
-    assert_eq!(b, [7 * block, 0, 1, 0], "B is refused once");
-    assert_eq!(a, [7 * block, 0, 1, 0], "A reports only its own refusal");
-    assert_eq!(cache.view_counters().refusals, 4);
+    assert_eq!(
+        (a[0], a[1], a[3], b[0], b[1], b[3]),
+        (7 * block, 0, 0, 7 * block, 0, 0)
+    );
+    assert_eq!(
+        (a[2] + b[2], cache.view_counters().refusals),
+        (2, 4),
+        "A and B are refused the eighth memo once each, counted once between them"
+    );
 }

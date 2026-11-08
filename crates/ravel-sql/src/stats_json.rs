@@ -216,7 +216,9 @@ pub fn cache_json(cache: &StatementCacheStats) -> Json {
 /// lower bound (ADR-3326, serve-if-fits amendment). The four `viewMemo*` keys
 /// are always present (ADR-3326, view memo amendment, decision 7):
 /// `viewMemoBytes` is the cache's view total when the statement finished,
-/// `viewMemoFills` and `viewMemoRefusals` the statement's own, and
+/// `viewMemoFills` and `viewMemoRefusals` the fills and refusals on blocks
+/// whose last mark was this statement's
+/// (`a_concurrent_statements_view_figures_sum_to_the_caches`), and
 /// `viewMemoReleases` the pressure releases over its lifetime.
 pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
     let mut out = json!({
