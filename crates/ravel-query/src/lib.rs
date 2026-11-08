@@ -42,7 +42,8 @@ pub use config::{
 };
 pub use dedup_order::{DedupKey, serves_over};
 pub use engine::{
-    Coverage, LiveQueryAccounting, QueryEngine, QueryStats, snapshot_erasure_predicates,
+    Coverage, LabelValueRouteStats, LiveQueryAccounting, QueryEngine, QueryStats,
+    snapshot_erasure_predicates,
 };
 pub use error::{FOLD_LAST_SUCCESS_GAUGE, FoldLag, QueryError};
 pub use fetcher::{

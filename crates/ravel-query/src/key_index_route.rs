@@ -17,6 +17,11 @@
 //! has run, the GETs it did not issue go back to the budget and the first
 //! part that did not fit is evaluated again. Parts left over are
 //! [`SegmentRoute::Uncovered`], never sent to a scan.
+//!
+//! The ceiling bounds one routing pass, one [`route`] call over one
+//! [`KeySet`]. A spans or logs statement runs one pass; a metrics statement
+//! runs one pass per distinct positive equality value of its selectors, so
+//! its leaf GETs are bounded by that value count times the ceiling.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -134,6 +139,9 @@ pub struct RouteFigures {
     pub leaf_get_requests: u64,
     /// Wire bytes of those GETs.
     pub leaf_wire_bytes: u64,
+    /// Leaf reads the read cache served, which issued no GET and are not in
+    /// `leaf_get_requests`.
+    pub leaf_cache_hits: u64,
     /// The key set's size.
     pub keys_probed: u64,
     /// Parts whose bridged bucket read exceeded `entry_count x T1_BYTES`.
@@ -275,8 +283,8 @@ pub enum RouteError {
     InvalidInput(String),
 }
 
-/// The admission bounds. [`route`] uses the ADR constants; tests use smaller
-/// ones.
+/// The admission bounds of one routing pass. [`route`] uses the ADR
+/// constants; tests use smaller ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ceiling {
     leaf_gets: u64,
@@ -492,6 +500,7 @@ async fn route_under(
     drop(charge);
     figures.leaf_get_requests = leaf.s3_requests(AccountedOp::Get);
     figures.leaf_wire_bytes = leaf.s3_bytes(AccountedOp::Get);
+    figures.leaf_cache_hits = leaf.cache_hits;
     let answered = answered?;
 
     let mut routes = vec![SegmentRoute::Uncovered; segment_count];

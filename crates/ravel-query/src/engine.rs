@@ -88,6 +88,12 @@ pub struct QueryStats {
     /// equality value its part's leaves prove absent. Not counted in
     /// `segments_fetched`. Zero when no metrics leaf covers the snapshot.
     pub segments_pruned_by_label_index: u64,
+    /// The label-value route's passes, one per distinct positive equality
+    /// value it routed, in routing order. Empty when the route did not run.
+    /// Their `leaf_get_requests` sum to the `keyIndex` phase's requests,
+    /// plus the key probes of a log-metric selector, which that phase also
+    /// carries.
+    pub label_value_routes: Vec<LabelValueRouteStats>,
     /// Fetched sparse objects whose probe read LABEL_DICT alone before the
     /// rest of the catalog, paying one GET a one-step probe would not. An
     /// object whose LABEL_DICT the footer tail already held is checked with
@@ -159,6 +165,26 @@ pub struct QueryStats {
     pub io_shape: QueryIoShape,
 }
 
+/// One pass of the label-value route (ADR-3694 decision 3): the figures of
+/// one distinct positive equality value, in [`QueryStats::label_value_routes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelValueRouteStats {
+    /// The label names whose positive equality matchers carry the value,
+    /// sorted and distinct. The metrics leaf is keyed by value alone, so one
+    /// pass serves every label that carries it.
+    pub labels: Vec<String>,
+    /// The value's `key8`, the leaf key the pass probed, as 16 lowercase hex
+    /// digits. Stats never carry the raw value, which can be subject data.
+    pub key8_hex: String,
+    /// The pass's leaf GETs, wire bytes and cache hits, and its part
+    /// outcomes.
+    pub figures: crate::key_index_route::RouteFigures,
+    /// Segments this value routed Pruned that, in at least one plan holding
+    /// the value, no other value of that plan routed Pruned: the segments
+    /// that plan would have read had this pass not run.
+    pub segments_pruned_alone: u64,
+}
+
 impl QueryStats {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -175,6 +201,7 @@ impl QueryStats {
             segments_pruned,
             segments_pruned_by_dictionary: dictionary_probe.segments_pruned_by_dictionary,
             segments_pruned_by_label_index: 0,
+            label_value_routes: Vec::new(),
             segments_probed_two_step: dictionary_probe.segments_probed_two_step,
             dictionary_probe_switched_off: dictionary_probe.switched_off,
             page_stats,
@@ -199,6 +226,7 @@ impl Default for QueryStats {
             segments_pruned: 0,
             segments_pruned_by_dictionary: 0,
             segments_pruned_by_label_index: 0,
+            label_value_routes: Vec::new(),
             segments_probed_two_step: 0,
             dictionary_probe_switched_off: false,
             page_stats: FetchStats::default(),
@@ -2154,7 +2182,7 @@ impl QueryEngine {
                 .snapshot()
                 .phase(QueryPhase::KeyIndex)
                 .total_s3_requests();
-            let plan_keeps = self
+            let (plan_keeps, label_value_routes) = self
                 .route_metric_plans(
                     tenant_hash,
                     &snapshot,
@@ -2436,12 +2464,16 @@ impl QueryEngine {
                     fed_partial,
                     excludes_spend,
                     pruned_by_label_index,
+                    label_value_routes,
                 ),
                 page_stats,
             ))
         };
 
-        let ((source, warnings, partial, excludes_spend, pruned_by_label_index), mut stats) = self
+        let (
+            (source, warnings, partial, excludes_spend, pruned_by_label_index, label_value_routes),
+            mut stats,
+        ) = self
             .resolve_snapshot_with_retry(
                 tenant_hash,
                 Signal::Metrics,
@@ -2461,6 +2493,7 @@ impl QueryEngine {
         stats.warnings = warnings;
         stats.estimate_excludes_spend = excludes_spend;
         stats.segments_pruned_by_label_index = pruned_by_label_index;
+        stats.label_value_routes = label_value_routes;
         stats.segments_fetched = stats.segments_fetched.saturating_sub(pruned_by_label_index);
         Ok((source, stats))
     }
@@ -2481,7 +2514,8 @@ impl QueryEngine {
     /// tenant folded without `metrics_label_index`), so such a query issues
     /// no leaf GET and settles no part. The value passes run at most
     /// `promql_fetch_fanout` at a time, the width the per-plan fetch passes
-    /// that follow run at.
+    /// that follow run at. Also returns each pass's stats, in value order,
+    /// empty when nothing was routed.
     async fn route_metric_plans(
         &self,
         tenant_hash: TenantHash,
@@ -2489,9 +2523,9 @@ impl QueryEngine {
         parts: Option<&SnapshotParts>,
         plans: &[SelectorPlan],
         accounting: &PhaseAccounting,
-    ) -> Result<Vec<Option<Vec<bool>>>, QueryError> {
+    ) -> Result<(Vec<Option<Vec<bool>>>, Vec<LabelValueRouteStats>), QueryError> {
         use crate::key_index_route::{KeySet, RouteError, RouteInput, SegmentRoute, route};
-        let unrouted = || vec![None; plans.len()];
+        let unrouted = || (vec![None; plans.len()], Vec::new());
         let Some(parts) = parts else {
             return Ok(unrouted());
         };
@@ -2562,9 +2596,10 @@ impl QueryEngine {
             .collect()
             .await;
         let mut pruned_by_value: HashMap<&str, Vec<bool>> = HashMap::with_capacity(routed.len());
+        let mut figures_by_value = HashMap::with_capacity(routed.len());
         for (value, result) in routed {
             match result {
-                Ok((routes, _figures)) => {
+                Ok((routes, figures)) => {
                     pruned_by_value.insert(
                         value,
                         routes
@@ -2572,6 +2607,7 @@ impl QueryEngine {
                             .map(|r| matches!(r, SegmentRoute::Pruned))
                             .collect(),
                     );
+                    figures_by_value.insert(value, figures);
                 }
                 Err(RouteError::Isolation { source, .. }) => return Err(source.into()),
                 // The parts came from the same resolve as the snapshot, so a
@@ -2581,7 +2617,7 @@ impl QueryEngine {
                 }
             }
         }
-        Ok(plan_values
+        let keeps = plan_values
             .iter()
             .map(|values| {
                 if values.is_empty() {
@@ -2597,7 +2633,32 @@ impl QueryEngine {
                 }
                 Some(keep)
             })
-            .collect())
+            .collect();
+        let route_stats = values
+            .iter()
+            .filter_map(|value| {
+                let figures = *figures_by_value.get(value)?;
+                let mut labels: Vec<String> = plans
+                    .iter()
+                    .flat_map(|plan| positive_equalities(&plan.matchers))
+                    .filter(|m| m.value == *value)
+                    .map(|m| m.name.clone())
+                    .collect();
+                labels.sort_unstable();
+                labels.dedup();
+                Some(LabelValueRouteStats {
+                    labels,
+                    key8_hex: hex::encode(ravel_codec::key_idx::key8_str(value)),
+                    figures,
+                    segments_pruned_alone: segments_pruned_alone(
+                        value,
+                        &plan_values,
+                        &pruned_by_value,
+                    ),
+                })
+            })
+            .collect();
+        Ok((keeps, route_stats))
     }
 
     /// A fresh accounting handle for one PromQL lane or attempt. Every PromQL
@@ -4293,11 +4354,42 @@ fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<Cow<'a, 
 /// The values of `matchers`' positive equalities (`=` with a non-empty
 /// value), `__name__` included: what the label-value route probes.
 fn positive_equality_values(matchers: &[LabelMatcher]) -> Vec<&str> {
+    positive_equalities(matchers)
+        .map(|m| m.value.as_str())
+        .collect()
+}
+
+/// The matchers [`positive_equality_values`] takes its values from.
+fn positive_equalities(matchers: &[LabelMatcher]) -> impl Iterator<Item = &LabelMatcher> {
     matchers
         .iter()
         .filter(|m| m.op == MatchOp::Eq && !m.value.is_empty())
-        .map(|m| m.value.as_str())
-        .collect()
+}
+
+/// Segments `value` routed Pruned that some plan holding `value` would keep
+/// without it: no other value of that plan routed them Pruned.
+fn segments_pruned_alone(
+    value: &str,
+    plan_values: &[Vec<&str>],
+    pruned_by_value: &HashMap<&str, Vec<bool>>,
+) -> u64 {
+    let Some(pruned) = pruned_by_value.get(value) else {
+        return 0;
+    };
+    let mut alone = vec![false; pruned.len()];
+    for plan in plan_values.iter().filter(|plan| plan.contains(&value)) {
+        let others: Vec<&Vec<bool>> = plan
+            .iter()
+            .filter(|other| **other != value)
+            .filter_map(|other| pruned_by_value.get(other))
+            .collect();
+        for (segment, (alone, pruned)) in alone.iter_mut().zip(pruned).enumerate() {
+            if *pruned && !others.iter().any(|other| other.get(segment) == Some(&true)) {
+                *alone = true;
+            }
+        }
+    }
+    alone.iter().filter(|alone| **alone).count() as u64
 }
 
 /// The segments of `snapshot` that `keep` marks, with its erasure and
