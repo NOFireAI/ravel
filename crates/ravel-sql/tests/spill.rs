@@ -82,7 +82,8 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use ravel_object_store::memory::MemoryStore;
 use ravel_sql::{
-    CeilingBreach, SpillConfig, SqlConfig, SqlError, TenantDelegatingPool, TenantMemoryAccountant,
+    CeilingBreach, DEFAULT_SPILL_MERGE_FAN_IN, SpillConfig, SqlConfig, SqlError,
+    TenantDelegatingPool, TenantMemoryAccountant,
 };
 use ravel_types::accounting::QueryAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
@@ -201,6 +202,7 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
         spill: Some(SpillConfig {
             dir: spill_dir,
             max_bytes: scratch_bytes,
+            merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
         }),
         segment_timing: false,
         aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
@@ -947,6 +949,7 @@ async fn a_spill_enabled_query_gets_no_unclassified_repartition_exec() {
         parallel_config(Some(SpillConfig {
             dir: scratch.path().to_path_buf(),
             max_bytes: AMPLE_SCRATCH_BYTES,
+            merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
         })),
         1 << 40,
     )
@@ -1184,11 +1187,19 @@ fn q33_row(g: u64) -> (String, String, i64, i64, i32) {
 /// two extra rows of each top group are appended at the end, so neither the
 /// arrival order nor a hash order coincides with the sorted order.
 fn q33_parquet() -> bytes::Bytes {
+    q33_parquet_with_groups(Q33_GROUPS).0
+}
+
+/// [`q33_parquet`] over `group_count` groups, which must be coprime to the
+/// 7,919 stride, with its row count.
+fn q33_parquet_with_groups(group_count: u64) -> (bytes::Bytes, u64) {
     use datafusion::arrow::array::{ArrayRef, Int32Array, StringArray};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
 
-    let mut groups: Vec<u64> = (0..Q33_GROUPS).map(|i| (i * 7_919) % Q33_GROUPS).collect();
+    let mut groups: Vec<u64> = (0..group_count)
+        .map(|i| (i * 7_919) % group_count)
+        .collect();
     groups.extend((0..Q33_TOP_GROUPS).rev());
     groups.extend(0..Q33_TOP_GROUPS);
     let rows: Vec<_> = groups.into_iter().map(q33_row).collect();
@@ -1218,7 +1229,7 @@ fn q33_parquet() -> bytes::Bytes {
     let mut writer = ArrowWriter::try_new(&mut out, schema, Some(properties)).expect("writer");
     writer.write(&batch).expect("write");
     writer.close().expect("close");
-    bytes::Bytes::from(out)
+    (bytes::Bytes::from(out), rows.len() as u64)
 }
 
 /// An executor over `config` whose tenant [`q33_tenant`] has one Parquet
@@ -1751,6 +1762,13 @@ const ROW_14_CAP_PERCENT: u64 = 50;
 /// this shape's replay fails. At [`ROW_14_CAP_PERCENT`] it passes either way.
 const ROW_14_REPLAY_CAP_PERCENT: u64 = 70;
 
+/// The spill merge fan-in of the row 14 replay and row 35 tests. Their caps
+/// seat read buffers for about six runs, so any fan-in of six or more,
+/// [`DEFAULT_SPILL_MERGE_FAN_IN`] included, replays like the unbounded one
+/// and fails the same way (measured in issue #3899); 2 is the setting an
+/// operator gives a host with caps this small.
+const SMALL_CAP_MERGE_FAN_IN: usize = 2;
+
 /// Issue #3899 (M2), the ClickBench row 14 shape: `COUNT(DISTINCT a) GROUP BY
 /// y / 2 ORDER BY u DESC LIMIT 10`, which DataFusion plans as an inner
 /// aggregate over the 200,000 `(y / 2, a)` groups under an outer one over the
@@ -1768,16 +1786,17 @@ const ROW_14_REPLAY_CAP_PERCENT: u64 = 70;
 /// 6430850", asked by one aggregate while the other holds 4,382,780 bytes.
 #[tokio::test]
 async fn the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry() {
-    row_14_answers_on_the_retry(ROW_14_CAP_PERCENT).await;
+    row_14_answers_on_the_retry(ROW_14_CAP_PERCENT, DEFAULT_SPILL_MERGE_FAN_IN).await;
 }
 
 /// Issue #3899, the row 14 shape of
 /// [`the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry`]
 /// at a spill-mode cap of [`ROW_14_REPLAY_CAP_PERCENT`] of the unlimited
-/// run's peak. The retry spills and answers with the unlimited run's rows.
+/// run's peak, with the merge fan-in at [`SMALL_CAP_MERGE_FAN_IN`]. The retry
+/// spills and answers with the unlimited run's rows.
 ///
-/// Prove-the-test: set `SPILL_MERGE_FAN_IN` in `session.rs` to 0, DataFusion's
-/// unbounded default, and the retry fails with "query memory pool spill
+/// Prove-the-test: pass 0, DataFusion's unbounded default, as the fan-in
+/// below and the retry fails with "query memory pool spill
 /// threshold reached: SingleHashAggregateStream[0] would hold 4628510 bytes
 /// charged and enveloped, over its fair share 4501595 of the spill-mode cap
 /// 9003190": with the merge free to seat a buffer for every run, the
@@ -1785,24 +1804,26 @@ async fn the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry(
 /// on.
 #[tokio::test]
 async fn the_clickbench_row_14_shape_replays_its_spill_within_a_70_percent_cap() {
-    row_14_answers_on_the_retry(ROW_14_REPLAY_CAP_PERCENT).await;
+    row_14_answers_on_the_retry(ROW_14_REPLAY_CAP_PERCENT, SMALL_CAP_MERGE_FAN_IN).await;
 }
 
 /// Runs the row 14 shape unlimited, then through the spill retry with the
-/// process budget at the unlimited peak and a spill-mode cap of
-/// `cap_percent` of it, and asserts the retry spilled and answered row for
-/// row.
-async fn row_14_answers_on_the_retry(cap_percent: u64) {
+/// process budget at the unlimited peak, a spill-mode cap of `cap_percent` of
+/// it and a spill merge fan-in of `merge_fan_in`, and asserts the retry
+/// spilled and answered row for row.
+async fn row_14_answers_on_the_retry(cap_percent: u64, merge_fan_in: usize) {
     let sql = "SELECT y / 2 AS k, COUNT(DISTINCT a) AS u FROM q33 GROUP BY y / 2 \
                ORDER BY u DESC LIMIT 10";
     let file = q33_parquet();
     let scratch = tempfile::tempdir().expect("scratch root");
     let config = |query_bytes| {
-        spill_config(
+        let mut config = spill_config(
             scratch.path().to_path_buf(),
             AMPLE_SCRATCH_BYTES,
             query_bytes,
-        )
+        );
+        config.spill.as_mut().expect("spill is on").merge_fan_in = merge_fan_in;
+        config
     };
     let unlimited = run_top_ten(&*q33_executor(config(AMPLE_QUERY_BYTES), &file).await, sql).await;
     assert_eq!(
@@ -1902,11 +1923,11 @@ const ROW_35_CAP_PERCENT: u64 = 50;
 /// Issue #3899 (M3), the ClickBench row 35 shape: `SELECT 1, url, COUNT(*)
 /// GROUP BY 1, url ORDER BY c DESC LIMIT 10` over a wide string key, scanned
 /// in [`ROW_35_FILES`] partitions, run through the spill retry the way the
-/// row 14 shape is. The retry answers with the unlimited run's rows, having
-/// spilled.
+/// row 14 shape is, with the merge fan-in at [`SMALL_CAP_MERGE_FAN_IN`]. The
+/// retry answers with the unlimited run's rows, having spilled.
 ///
-/// Prove-the-test: set `SPILL_MERGE_FAN_IN` in `session.rs` to 0, DataFusion's
-/// unbounded default, and the final aggregate's replay fails the retry with
+/// Prove-the-test: set the fan-in below to 0, DataFusion's unbounded
+/// default, and the final aggregate's replay fails the retry with
 /// "query memory pool spill threshold reached: spill-capable consumers would
 /// hold 22758830 bytes charged and enveloped, over the spill-mode cap
 /// 22444127", asked by `FinalHashAggregateStream[0]`, the M3 failure.
@@ -1925,6 +1946,7 @@ async fn the_clickbench_row_35_shape_spills_and_answers_on_the_retry() {
         // A Parquet table scans in more than one file group only for an
         // exact-typed statement with this on (ADR-2040 D6).
         config.parallel_final_aggregation = true;
+        config.spill.as_mut().expect("spill is on").merge_fan_in = SMALL_CAP_MERGE_FAN_IN;
         config
     };
     let executor = |config: SqlConfig, process: Arc<ravel_memory::MemoryBudget>| {
@@ -2391,4 +2413,113 @@ async fn a_plan_time_statement_holds_one_share_and_a_concurrent_retry_still_spil
         "the plan-time statement holds one share, leaving three"
     );
     drop(holder);
+}
+
+/// Distinct groups of the q33 table in
+/// [`a_bounded_merge_fan_in_fits_a_scratch_quota_the_two_way_merge_does_not`],
+/// its per-query pool in percent of the unlimited run's peak, and the runs
+/// the retry's aggregate spills under that pool (measured in issue #3899: 4
+/// runs, 40,436,736 bytes).
+const SCRATCH_PEAK_GROUPS: u64 = 500_000;
+const SCRATCH_PEAK_POOL_PERCENT: u64 = 40;
+const SCRATCH_PEAK_RUNS: u64 = 4;
+
+/// Issue #3899: a spill merge's scratch peak is the spilled bytes plus its
+/// largest intermediate merge output, and the fan-in decides that output.
+/// With [`SCRATCH_PEAK_RUNS`] runs, [`DEFAULT_SPILL_MERGE_FAN_IN`] merges them
+/// all in the final pass and writes nothing more (measured peak 1.00 to 1.02
+/// times the spilled bytes), while a fan-in of 2 first writes two-run merges
+/// while their inputs are still on disk (measured 1.52 to 1.54 times). Under a
+/// scratch quota of 1.25 times the spilled bytes the default answers with the
+/// unlimited run's rows and the two-way merge is refused
+/// `SpillBudgetExhausted`.
+///
+/// Prove-the-test: run the quota-bound default run below with a fan-in of 2
+/// and it fails with `SpillBudgetExhausted`.
+#[tokio::test]
+async fn a_bounded_merge_fan_in_fits_a_scratch_quota_the_two_way_merge_does_not() {
+    let sql = "SELECT a, b, count(*) AS c, sum(x) AS sx, avg(y) AS ay FROM q33 \
+               GROUP BY a, b ORDER BY c DESC LIMIT 10";
+    let files = vec![q33_parquet_with_groups(SCRATCH_PEAK_GROUPS)];
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes: usize, quota: u64, merge_fan_in: usize| {
+        let mut config = spill_config(scratch.path().to_path_buf(), quota, query_bytes);
+        config.spill.as_mut().expect("spill is on").merge_fan_in = merge_fan_in;
+        config
+    };
+    let executor = |config: SqlConfig| {
+        parquet_table_executor(
+            config,
+            &files,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            Arc::new(MemoryStore::new()),
+            "q33",
+        )
+    };
+    let unlimited = run_top_ten(
+        &*executor(config(
+            AMPLE_QUERY_BYTES,
+            AMPLE_SCRATCH_BYTES,
+            DEFAULT_SPILL_MERGE_FAN_IN,
+        ))
+        .await,
+        sql,
+    )
+    .await;
+    assert_eq!(
+        (unlimited.spill_retries, unlimited.spill_files),
+        (0, 0),
+        "the unlimited run answers on its first attempt"
+    );
+    let pool =
+        usize::try_from(unlimited.peak_pool_bytes * SCRATCH_PEAK_POOL_PERCENT / 100).expect("fits");
+
+    let ample = run_top_ten(
+        &*executor(config(
+            pool,
+            AMPLE_SCRATCH_BYTES,
+            DEFAULT_SPILL_MERGE_FAN_IN,
+        ))
+        .await,
+        sql,
+    )
+    .await;
+    assert_eq!(
+        (ample.spill_retries, ample.spill_files),
+        (1, SCRATCH_PEAK_RUNS),
+        "under {SCRATCH_PEAK_POOL_PERCENT} percent of its peak the retry spills \
+         {SCRATCH_PEAK_RUNS} runs"
+    );
+    assert_eq!(ample.rows, unlimited.rows, "row for row");
+    let spilled = ample
+        .spill_retry_bytes_written
+        .expect("the retry reports its spilled bytes");
+
+    let quota = spilled + spilled / 4;
+    let fits = run_top_ten(
+        &*executor(config(pool, quota, DEFAULT_SPILL_MERGE_FAN_IN)).await,
+        sql,
+    )
+    .await;
+    eprintln!(
+        "issue #3899 scratch peak: spilled={spilled} quota={quota} files={}",
+        fits.spill_files
+    );
+    assert_eq!(
+        (fits.spill_files, fits.spill_retry_bytes_written),
+        (SCRATCH_PEAK_RUNS, Some(spilled)),
+        "the default fan-in merges every run in the final pass and writes nothing more"
+    );
+    assert_eq!(fits.rows, unlimited.rows, "row for row");
+
+    let err = executor(config(pool, quota, 2))
+        .await
+        .execute(q33_tenant(), &request(sql))
+        .await
+        .expect_err("the two-way merge's intermediate output overruns the quota");
+    assert!(
+        err.to_string().contains("scratch budget exhausted"),
+        "the two-way merge is refused by the scratch quota; got {err:?}"
+    );
+    assert_eq!(scratch_figures(&err).1, quota, "the quota it names is ours");
 }

@@ -169,6 +169,7 @@ fn spill(dir: &std::path::Path) -> Option<SpillConfig> {
     Some(SpillConfig {
         dir: dir.to_path_buf(),
         max_bytes: 512 * 1024 * 1024,
+        merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
     })
 }
 

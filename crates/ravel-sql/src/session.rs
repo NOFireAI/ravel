@@ -151,7 +151,7 @@ use crate::avg::sequential_avg_udaf;
 use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
 use crate::compact_slices::CompactSlices;
-use crate::config::SqlConfig;
+use crate::config::{DEFAULT_SPILL_MERGE_FAN_IN, SqlConfig};
 use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::ipcrypt_udf::SessionPrincipal;
 use crate::late_materialization::TopKLateMaterialization;
@@ -588,8 +588,10 @@ pub enum SpillDecision<'a> {
 ///
 /// [`SpillDecision::Enabled`] names exactly one directory and one ceiling.
 /// Both are explicit: a directory with DataFusion's default ceiling would be
-/// the same unbounded behavior in a different place.
-fn disk_manager_builder(spill: SpillDecision<'_>) -> DiskManagerBuilder {
+/// the same unbounded behavior in a different place. Its merge fan-in is
+/// `merge_fan_in`, the configured
+/// [`SpillConfig::merge_fan_in`](crate::SpillConfig::merge_fan_in).
+fn disk_manager_builder(spill: SpillDecision<'_>, merge_fan_in: usize) -> DiskManagerBuilder {
     match spill {
         SpillDecision::Disabled => {
             DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)
@@ -597,21 +599,9 @@ fn disk_manager_builder(spill: SpillDecision<'_>) -> DiskManagerBuilder {
         SpillDecision::Enabled { dir, max_bytes } => DiskManagerBuilder::default()
             .with_mode(DiskManagerMode::Directories(vec![dir.to_path_buf()]))
             .with_max_temp_directory_size(max_bytes)
-            .with_max_spill_merge_fan_in(SPILL_MERGE_FAN_IN),
+            .with_max_spill_merge_fan_in(merge_fan_in),
     }
 }
-
-/// The most spill runs one pass of DataFusion's multi-level merge reads at
-/// once in a spill-enabled session (ADR-0954, refusal-retry decision item 2).
-///
-/// A spilled aggregate replays its runs through that merge, which seats one
-/// read buffer per run until the pool refuses a grow, with no fan-in limit by
-/// default. The re-aggregation behind it grows on the same pool and cannot
-/// spill, so a refused grow there fails the statement: the bound leaves the
-/// replay the room an unbounded merge would take, at the cost of extra merge
-/// passes that rewrite the runs. DataFusion 55 reads 0 as unbounded and
-/// raises 1 to 2, so 2 is the smallest bound it applies.
-const SPILL_MERGE_FAN_IN: usize = 2;
 
 /// Build the per-query `SessionConfig`. Separated from [`build_session`] so
 /// the invariants above can be asserted without constructing a provider.
@@ -834,7 +824,13 @@ pub fn build_session_with_tables(
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_object_store_registry(registry)
-        .with_disk_manager_builder(disk_manager_builder(spill))
+        .with_disk_manager_builder(disk_manager_builder(
+            spill,
+            config
+                .spill
+                .as_ref()
+                .map_or(DEFAULT_SPILL_MERGE_FAN_IN, |spill| spill.merge_fan_in),
+        ))
         .build_arc()?;
     let mut session = session_config(config, exact_typed_aggregates, spill);
     if parquet_store.is_some() {
@@ -1395,17 +1391,18 @@ mod tests {
 
     /// Issue #3899: the disk manager of a spill-enabled session, built through
     /// [`build_session`] as every SQL statement's is, bounds the spill merge
-    /// fan-in at [`SPILL_MERGE_FAN_IN`], 2; a spill-disabled one keeps
-    /// DataFusion's default, 0 (unbounded).
+    /// fan-in at the configured [`crate::SpillConfig::merge_fan_in`], and at
+    /// [`DEFAULT_SPILL_MERGE_FAN_IN`] when the config carries none; a
+    /// spill-disabled one keeps DataFusion's default, 0 (unbounded).
     #[test]
     fn a_spill_enabled_session_bounds_the_spill_merge_fan_in() {
         use datafusion::execution::disk_manager::DEFAULT_MAX_SPILL_MERGE_FAN_IN;
 
         let scratch = tempfile::tempdir().expect("scratch dir");
         let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let fan_in = |spill| {
+        let fan_in = |config: &SqlConfig, spill| {
             build_session(
-                &SqlConfig::default(),
+                config,
                 test_pool(),
                 metrics_table(&store),
                 false,
@@ -1417,12 +1414,29 @@ mod tests {
             .disk_manager
             .max_spill_merge_fan_in()
         };
-        let enabled = SpillDecision::Enabled {
+        let enabled = || SpillDecision::Enabled {
             dir: scratch.path(),
             max_bytes: 1 << 20,
         };
-        assert_eq!(fan_in(enabled), 2);
-        assert_eq!(fan_in(SpillDecision::Disabled), 0);
+        let with_fan_in = |merge_fan_in| SqlConfig {
+            spill: Some(crate::SpillConfig {
+                dir: scratch.path().to_path_buf(),
+                max_bytes: 1 << 20,
+                merge_fan_in,
+            }),
+            ..SqlConfig::default()
+        };
+        assert_eq!(
+            fan_in(&SqlConfig::default(), enabled()),
+            DEFAULT_SPILL_MERGE_FAN_IN
+        );
+        assert_eq!(
+            fan_in(&with_fan_in(DEFAULT_SPILL_MERGE_FAN_IN), enabled()),
+            DEFAULT_SPILL_MERGE_FAN_IN
+        );
+        assert_eq!(fan_in(&with_fan_in(4), enabled()), 4);
+        assert_eq!(fan_in(&with_fan_in(0), enabled()), 0);
+        assert_eq!(fan_in(&with_fan_in(4), SpillDecision::Disabled), 0);
         assert_eq!(DEFAULT_MAX_SPILL_MERGE_FAN_IN, 0);
     }
 

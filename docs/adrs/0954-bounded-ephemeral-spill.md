@@ -931,8 +931,9 @@ answered, but three properties of the decision above cost the rest:
    alone refused the outer final aggregate, holding 14 MB, every time,
    while the inner aggregate held 734 MB and never got the refusal that
    would make it spill. Note (2026-11-08, the M3 fix): a spill-enabled
-   session's disk manager bounds DataFusion's spill merge fan-in at 2
-   (`SPILL_MERGE_FAN_IN` in `crates/ravel-sql/src/session.rs`); a
+   session's disk manager bounded DataFusion's spill merge fan-in at 2 (a
+   constant in `crates/ravel-sql/src/session.rs`, replaced by the setting
+   in the next note); a
    spill-disabled one keeps DataFusion's default, 0, which is unbounded. A
    spilled aggregate replays its runs through DataFusion's multi-level merge,
    which with no bound seats one read buffer per run until the pool refuses a
@@ -952,6 +953,56 @@ answered, but three properties of the decision above cost the rest:
    row 14 at 40%, fails at every fan-in swept: the lone aggregate's replay
    outgrows its fair share. DataFusion 55 raises a fan-in of 1 to 2, so 2 is
    the smallest bound it applies.
+
+   Note (2026-11-08, the fan-in choice, issue #3899): the fan-in is now
+   `SpillConfig::merge_fan_in`, default 8 (`DEFAULT_SPILL_MERGE_FAN_IN` in
+   `crates/ravel-sql/src/config.rs`), set at startup with
+   `--sql-spill-merge-fan-in`. `0` is DataFusion's unbounded merge and `1`
+   is refused at startup. The startup log's `sql_spill_merge_fan_in` line
+   reports the value and whether it came from the flag. Fan-in 2 broke the
+   row 33 shape on c6a.large by scratch, not memory: DataFusion's merge
+   takes the first F runs, writes their merge while the inputs are still on
+   disk, and queues the output behind the rest. The scratch peak is
+   therefore the spilled bytes S plus the largest intermediate merge
+   output. It depends on the run count N, and the `1 + 1/F` estimate holds
+   only when N is a power of F. The smallest scratch quota the row 33 shape
+   passed at, over S, with the lower figure failing and the upper passing:
+
+   | Runs N | F = 2 | F = 3 | F = 4 | F = 8 |
+   |---|---|---|---|---|
+   | 4 | 1.52-1.54 | 1.80-1.82 | 1.00-1.02 | 1.00-1.02 |
+   | 5 | 1.52-1.54 | 1.69-1.71 | 1.92-1.93 | 1.00-1.02 |
+   | 9 | 1.51-1.52 | 1.34-1.36 | 1.46-1.48 | 1.93-1.95 |
+   | about 16 | 1.54-1.56 | 1.61-1.62 | 1.44-1.46 | 1.41-1.43 |
+   | 34 | 1.51-1.52 | 1.72-1.74 | 1.46-1.48 | 1.23-1.25 |
+
+   The unbounded merge passed at 1.00-1.02 with 9 runs. At 34 runs and
+   the c6a.large figure of 6.48 GB spilled, F = 8 needs 7.96 to 8.07 GB,
+   against a margin of 8.0 GB on the 9.44 GB share; F = 2 needs 9.8 GB,
+   over the share. The replay room at the geometry of a 4 GB host (row 35
+   at 1.6 million groups, row 14 at 1 million, the process budget at the
+   unlimited peak) separated nothing: every fan-in of 2, 3, 4 and 8, and
+   the unbounded merge, answered at spill-mode caps of 40%, 50% and 70%
+   with the unlimited rows. Spill files written:
+
+   | Shape | Cap | F = 2 | F = 3 | F = 4 | F = 8 | Unbounded |
+   |---|---|---|---|---|---|---|
+   | row 35 | 40% | 14 | 11 | 10 | 8 | 8 |
+   | row 35 | 50% | 12 | 9 | 8 | 7 | 7 |
+   | row 35 | 70% | 8 | 6 | 6 | 5 | 5 |
+   | row 14 | 40% | 14 | 11 | 10 | 9 | 9 |
+   | row 14 | 50% | 12 | 9 | 9 | 8 | 8 |
+   | row 14 | 70% | 10 | 8 | 8 | 7 | 7 |
+
+   Below those caps, 8 and the unbounded merge failed and passed at the
+   same caps (row 35 failed at 7% and 8%, row 14 at 5% to 12%). No value
+   met the margin outright, so 8 is chosen as the only one whose measured
+   peak reaches it, with every replay cell passed and the fewest bytes
+   rewritten. Its worst case is a run count just above a power of 8 (1.95
+   times S at 9 runs). At the small geometry of the issue #3967 tests
+   (200,000 groups, a cap that seats about six runs) 8 replays like the
+   unbounded merge and fails row 35 at 50% and row 14 at 70%, which fan-in
+   2 passes; a host with caps that small sets `--sql-spill-merge-fan-in 2`.
 3. **In a spill-enabled pool, a reserve-ahead refusal of a spill-capable
    consumer is a spill trigger, not a failure.** The same refusal of a
    consumer that cannot spill is unchanged, and so is any refusal in a

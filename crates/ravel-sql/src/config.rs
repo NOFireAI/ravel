@@ -261,7 +261,30 @@ pub struct SpillConfig {
     /// not bytes decoded from them. Exceeding it is
     /// [`crate::SqlError::SpillBudgetExhausted`], never a partial result.
     pub max_bytes: u64,
+    /// Most spill files one merge step reads at once. Default
+    /// [`DEFAULT_SPILL_MERGE_FAN_IN`]; zero is DataFusion's unbounded default,
+    /// and DataFusion raises 1 to 2.
+    pub merge_fan_in: usize,
 }
+
+/// The default [`SpillConfig::merge_fan_in`] (ADR-0954 item 2, issue #3899).
+///
+/// The value trades two constraints against each other:
+///
+/// - Scratch: a merge step writes its output while its inputs are still on
+///   disk, so the scratch peak is the spilled bytes plus the largest
+///   intermediate merge output. That depends on the run count, not on the
+///   fan-in alone: measured peak/spilled ratios were 1.51 to 1.56 at 2,
+///   1.23 to 1.25 at 8 with 34 runs, and up to 1.95 at 8 with 9 runs, when
+///   the count sits just above a power of the fan-in. A wider fan-in also
+///   rewrites fewer bytes.
+/// - Replay room: the merge seats one reservation per run it reads. At a
+///   cap that seats about six runs, any fan-in of six or more behaves as
+///   unbounded and the replay can be refused; 2 leaves room there.
+///
+/// 8 is the measured choice for a 4 GB host, where the cap seats about 49
+/// runs and every replay cell passed at 8. Zero means unbounded.
+pub const DEFAULT_SPILL_MERGE_FAN_IN: usize = 8;
 
 /// A [`SpillConfig`] could not be read from the environment. Loud on purpose:
 /// a half-set or unparseable spill configuration silently selects a different
@@ -331,6 +354,7 @@ impl SpillConfig {
                 return Ok(Some(SpillConfig {
                     dir: cache_spill_dir(cache_dir.cache_dir, cache_dir.instance_id),
                     max_bytes,
+                    merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
                 }));
             }
             (None, None) => {}
@@ -347,6 +371,7 @@ impl SpillConfig {
         Ok(Some(SpillConfig {
             dir: cache_spill_dir(cache_dir.cache_dir, cache_dir.instance_id),
             max_bytes,
+            merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
         }))
     }
 
@@ -367,6 +392,7 @@ impl SpillConfig {
         Ok(SpillConfig {
             dir: PathBuf::from(dir),
             max_bytes,
+            merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
         })
     }
 }
@@ -850,6 +876,7 @@ mod tests {
             Some(SpillConfig {
                 dir: PathBuf::from("/explicit/spill"),
                 max_bytes: 4096,
+                merge_fan_in: DEFAULT_SPILL_MERGE_FAN_IN,
             })
         );
     }
@@ -1012,6 +1039,7 @@ mod tests {
         let explicit = SpillConfig {
             dir: PathBuf::from("/explicit"),
             max_bytes: 4096,
+            merge_fan_in: 4,
         };
         let config = SqlConfig {
             spill: Some(explicit.clone()),
