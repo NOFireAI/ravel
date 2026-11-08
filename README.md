@@ -34,7 +34,7 @@ docker compose -f deploy/docker-compose/ravel.yml up -d
 ```
 
 This pulls published images and starts RustFS for object storage,
-`ravel-server` 0.31.0, an OpenTelemetry Collector that sends your host's
+`ravel-server` 0.31.1, an OpenTelemetry Collector that sends your host's
 metrics and its own logs, and Grafana. Wait for the server to report ready:
 
 ```sh
@@ -173,7 +173,7 @@ surfaces also need a runtime flag.
 <!-- END SUPPORT MATRIX -->
 
 "In published image" describes the image built from `main`; every such entry
-is also in the 0.31.0 image the quickstart pins. Query surfaces serve in
+is also in the 0.31.1 image the quickstart pins. Query surfaces serve in
 `--mode all` and `--mode query`.
 
 - SQL tables: `samples` (metrics, without native histograms, which PromQL
