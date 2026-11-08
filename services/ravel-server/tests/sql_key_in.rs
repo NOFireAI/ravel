@@ -634,6 +634,61 @@ async fn in_list_rows_equal_the_union_of_equalities() {
     }
 }
 
+/// A list of two or three keys, which DataFusion rewrites into a disjunction
+/// of equalities before the scan, carries its key set on both lanes:
+/// `keysProbed` is 2 and 3, the scan opens exactly the objects holding the
+/// keys and prunes the rest, and the rows equal the per-key equality union
+/// and the fixture's oracle. Keys `{0, 4}` both live in object 0 (3 of 4
+/// objects pruned); keys `{0, 1, 2}` live in objects 0, 1 and 2 (1 pruned).
+/// The disjunction spelled out by hand answers the same.
+///
+/// Flip to watch it fail: drop the `Or` arm of `collect_key_in` (logs) or
+/// the `trace_id_disjunction_values` branch of `handle_leaf` (spans).
+/// `keysProbed` then reads 0 instead of 2, and no object is pruned.
+#[tokio::test]
+async fn a_two_or_three_key_list_carries_its_key_set() {
+    let store = fixture().await;
+    let app = serve(store);
+    for lane in [Lane::Logs, Lane::Spans] {
+        for (keys, pruned) in [(vec![0, 4], 3u64), (vec![0, 1, 2], 1)] {
+            let equalities: BTreeSet<String> = futures::stream::iter(keys.clone())
+                .then(|j| {
+                    let app = app.clone();
+                    async move { rows(&sql(&app, &lane.equality(j)).await) }
+                })
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+            let spelled = lane.select(
+                &keys
+                    .iter()
+                    .map(|&j| format!("{} = {}", lane.column(), lane.literal(j)))
+                    .collect::<Vec<_>>()
+                    .join(" OR "),
+            );
+            for statement in [lane.in_keys(&keys), spelled] {
+                let v = sql(&app, &statement).await;
+                assert_eq!(rows(&v), oracle_of(&keys), "{lane:?} {keys:?}: {v}");
+                assert_eq!(rows(&v), equalities, "{lane:?} {keys:?}: {v}");
+                assert_eq!(
+                    key_index(&v, "keysProbed"),
+                    keys.len() as u64,
+                    "{lane:?} {keys:?}: {v}"
+                );
+                assert_eq!(pruning(&v, "segments"), OBJECTS as u64, "{lane:?}: {v}");
+                assert_eq!(
+                    pruning(&v, "segmentsPrunedByKeyIndex"),
+                    pruned,
+                    "{lane:?} {keys:?}: opened {} of {OBJECTS}: {v}",
+                    OBJECTS as u64 - pruning(&v, "segmentsPrunedByKeyIndex")
+                );
+            }
+        }
+    }
+}
+
 /// `trace_id IN` 32-character hex strings plans against the native trace id
 /// column (the analyzer rule rewrites them before type coercion) and carries
 /// the same key set as the binary literals: the same rows, `keysProbed` the
