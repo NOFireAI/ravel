@@ -1237,6 +1237,16 @@ impl MemoryRefusal {
     }
 }
 
+/// The cause of a reserve-ahead refusal in the class words of the process
+/// refusal's text, without its figures: both the budget's and the gate's are
+/// process-wide.
+fn reserve_ahead_cause(cause: &ExhaustionCause) -> &'static str {
+    match cause {
+        ExhaustionCause::Accounted => "process memory budget exhausted",
+        ExhaustionCause::HostMemory { .. } => "host memory gate refused the reservation",
+    }
+}
+
 /// What a pool recorded about its first memory refusal, read by the spill
 /// retry's trigger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1943,10 +1953,15 @@ impl TenantDelegatingPool {
         if next.envelope != state.envelope
             && let Err(refused) = self.set_envelope(id, next.envelope, EnvelopeCheck::Checked)
         {
-            // The delta and the budget figures span every tenant on the
-            // process budget, so they go to the operator log and never into
-            // the client-visible message. In spill mode a consumer that can spill answers this by
-            // spilling, so it is a spill trigger and not a memory refusal.
+            // The delta, the budget figures and the gate's figures are
+            // process-wide, so they go to the operator log and never into the
+            // client-visible message, which names only the cause. In spill
+            // mode a consumer that can spill answers this by spilling, so it
+            // is a spill trigger and not a memory refusal.
+            let (gate_available, gate_floor) = match refused.exhausted.cause {
+                ExhaustionCause::HostMemory { available, floor } => (Some(available), Some(floor)),
+                ExhaustionCause::Accounted => (None, None),
+            };
             if self.spill_headroom.is_some() && consumer.can_spill() {
                 tracing::debug!(
                     consumer = consumer.name(),
@@ -1956,11 +1971,14 @@ impl TenantDelegatingPool {
                     reserved = refused.exhausted.reserved,
                     limit = refused.exhausted.limit,
                     cause = refused.exhausted.cause.name(),
+                    available = gate_available,
+                    floor = gate_floor,
                     "SQL aggregate reserve-ahead refused in spill mode; the aggregate spills"
                 );
                 return Err(DataFusionError::ResourcesExhausted(format!(
-                    "query memory pool spill threshold reached: the process has no room \
-                     for this aggregate's reserve-ahead envelope{}",
+                    "query memory pool spill threshold reached: {} for this aggregate's \
+                     reserve-ahead envelope{}",
+                    reserve_ahead_cause(&refused.exhausted.cause),
                     self.attribution(consumer, additional)
                 )));
             }
@@ -1972,6 +1990,8 @@ impl TenantDelegatingPool {
                 reserved = refused.exhausted.reserved,
                 limit = refused.exhausted.limit,
                 cause = refused.exhausted.cause.name(),
+                available = gate_available,
+                floor = gate_floor,
                 "SQL aggregate reserve-ahead refused"
             );
             let kind =
@@ -1984,8 +2004,9 @@ impl TenantDelegatingPool {
                 )
             });
             return Err(DataFusionError::ResourcesExhausted(format!(
-                "aggregate reserve-ahead refused: the process has no room for this \
-                 aggregate's reserve-ahead envelope{}",
+                "aggregate reserve-ahead refused: {} for this aggregate's reserve-ahead \
+                 envelope{}",
+                reserve_ahead_cause(&refused.exhausted.cause),
                 self.refuse(kind, consumer, additional, share)
             )));
         }
@@ -3862,9 +3883,14 @@ pub(crate) mod tests {
         );
         let res = register_on(&pool, PARTIAL);
 
-        let err = res
-            .try_grow(4 * MIB)
-            .expect_err("a 10,192,159-byte envelope cannot fit a 6 MiB budget");
+        let (result, events) = reserve_ahead_events(|| res.try_grow(4 * MIB));
+        let err = result.expect_err("a 10,192,159-byte envelope cannot fit a 6 MiB budget");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events[0].get("delta").map(String::as_str),
+            Some("10192159"),
+            "{events:?}"
+        );
         let message = err.to_string();
         assert!(
             message.contains(
@@ -4446,8 +4472,9 @@ pub(crate) mod tests {
         );
         assert!(
             message.starts_with(
-                "aggregate reserve-ahead refused: the process has no room for this aggregate's \
-                 reserve-ahead envelope; asked by PartialHashAggregateStream[0] (can_spill="
+                "aggregate reserve-ahead refused: process memory budget exhausted for \
+                 this aggregate's reserve-ahead envelope; asked by \
+                 PartialHashAggregateStream[0] (can_spill="
             ),
             "{message}"
         );
@@ -4593,7 +4620,7 @@ pub(crate) mod tests {
             assert_eq!(
                 message,
                 format!(
-                    "{lead}the process has no room for this aggregate's reserve-ahead \
+                    "{lead}process memory budget exhausted for this aggregate's reserve-ahead \
                      envelope; asked by PartialHashAggregateStream[0] (can_spill=true, 1000 \
                      bytes asked); top holders: none; non-spillable consumers hold 0 bytes; \
                      this query's aggregate envelope 0 bytes"
@@ -4612,6 +4639,83 @@ pub(crate) mod tests {
                 ("reserved", "1403"),
                 ("limit", "2001"),
                 ("cause", "limit"),
+            ] {
+                assert_eq!(
+                    fields.get(name).map(String::as_str),
+                    Some(value),
+                    "{name}: {fields:?}"
+                );
+            }
+            for absent in ["available", "floor"] {
+                assert!(!fields.contains_key(absent), "{absent}: {fields:?}");
+            }
+        }
+    }
+
+    /// Issue #3910: a reserve-ahead refusal by a closed host memory gate names
+    /// the gate in its client text, in the process refusal's class words, but
+    /// none of the gate's figures (1234 bytes available, 5678 floor) nor the
+    /// process's (1403 reserved, 1048576 limit, a 687-byte delta) nor pool B's
+    /// (777 and 313). The DEBUG event carries the gate's figures beside the
+    /// process's, and the memory refusal is recorded as a host-gate refusal.
+    #[test]
+    fn a_host_gate_reserve_ahead_refusal_names_the_gate_without_its_figures() {
+        let _serial = envelope_tests();
+        for (headroom, lead, event) in [
+            (
+                None,
+                "aggregate reserve-ahead refused: ",
+                "SQL aggregate reserve-ahead refused",
+            ),
+            (
+                Some(0),
+                "query memory pool spill threshold reached: ",
+                "SQL aggregate reserve-ahead refused in spill mode; the aggregate spills",
+            ),
+        ] {
+            let budget = Arc::new(MemoryBudget::new(1 << 20));
+            let pool_b = attributed_pool(&budget, 1 << 20, 1 << 30, None);
+            let join_b = register_on(&pool_b, "HashJoinInput[0]");
+            join_b.try_grow(777).expect("within every ceiling");
+            let aggregate_b = register_spilling(&pool_b, PARTIAL);
+            aggregate_b.try_grow(313).expect("within every ceiling");
+            assert_eq!(budget.reserved(), 1403, "777 + 313 charged + 313 envelope");
+            budget.set_host_memory_gate(false, 1_234, 5_678);
+
+            let pool_a = attributed_pool(&budget, 1 << 20, 1 << 30, headroom);
+            let aggregate_a = register_spilling(&pool_a, PARTIAL);
+            let (result, events) = reserve_ahead_events(|| aggregate_a.try_grow(1000));
+            let message =
+                exhausted_message(result.expect_err("a closed host gate refuses the envelope"));
+            for leaked in ["1234", "5678", "777", "313", "1403", "1048576", "687"] {
+                assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+            }
+            assert_eq!(
+                message,
+                format!(
+                    "{lead}host memory gate refused the reservation for this aggregate's \
+                     reserve-ahead envelope; asked by PartialHashAggregateStream[0] \
+                     (can_spill=true, 1000 bytes asked); top holders: none; non-spillable \
+                     consumers hold 0 bytes; this query's aggregate envelope 0 bytes"
+                )
+            );
+            assert_eq!(
+                (pool_a.refused(), pool_a.host_gate_refused()),
+                (headroom.is_none(), headroom.is_none())
+            );
+
+            assert_eq!(events.len(), 1, "{events:?}");
+            let fields = &events[0];
+            for (name, value) in [
+                ("message", event),
+                ("consumer", PARTIAL),
+                ("asked", "1000"),
+                ("delta", "687"),
+                ("reserved", "1403"),
+                ("limit", "1048576"),
+                ("cause", "host_gate"),
+                ("available", "1234"),
+                ("floor", "5678"),
             ] {
                 assert_eq!(
                     fields.get(name).map(String::as_str),
@@ -4653,10 +4757,10 @@ pub(crate) mod tests {
         }
         assert_eq!(
             message,
-            "aggregate reserve-ahead refused: the process has no room for this aggregate's \
-             reserve-ahead envelope; asked by PartialHashAggregateStream[0] (can_spill=true, \
-             1000 bytes asked); top holders: none; non-spillable consumers hold 0 bytes; this \
-             query's aggregate envelope 0 bytes"
+            "aggregate reserve-ahead refused: process memory budget exhausted for \
+             this aggregate's reserve-ahead envelope; asked by PartialHashAggregateStream[0] \
+             (can_spill=true, 1000 bytes asked); top holders: none; non-spillable consumers hold \
+             0 bytes; this query's aggregate envelope 0 bytes"
         );
     }
 
@@ -5152,9 +5256,9 @@ pub(crate) mod tests {
         let (pool, message, _join, _aggregate) = setup(Some(0), true);
         assert!(
             message.starts_with(
-                "query memory pool spill threshold reached: the process has no room for this \
-                 aggregate's reserve-ahead envelope; asked by PartialHashAggregateStream[0] \
-                 (can_spill=true, 60 bytes asked); "
+                "query memory pool spill threshold reached: process memory budget exhausted \
+                 for this aggregate's reserve-ahead envelope; asked by \
+                 PartialHashAggregateStream[0] (can_spill=true, 60 bytes asked); "
             ),
             "{message}"
         );
@@ -5165,8 +5269,9 @@ pub(crate) mod tests {
         let (pool, message, _join, _aggregate) = setup(Some(0), false);
         assert!(
             message.starts_with(
-                "aggregate reserve-ahead refused: the process has no room for this aggregate's \
-                 reserve-ahead envelope; asked by PartialHashAggregateStream[0] (can_spill="
+                "aggregate reserve-ahead refused: process memory budget exhausted for \
+                 this aggregate's reserve-ahead envelope; asked by \
+                 PartialHashAggregateStream[0] (can_spill="
             ),
             "{message}"
         );
@@ -5176,8 +5281,9 @@ pub(crate) mod tests {
         let (pool, message, _join, _aggregate) = setup(None, true);
         assert!(
             message.starts_with(
-                "aggregate reserve-ahead refused: the process has no room for this aggregate's \
-                 reserve-ahead envelope; asked by PartialHashAggregateStream[0] (can_spill="
+                "aggregate reserve-ahead refused: process memory budget exhausted for \
+                 this aggregate's reserve-ahead envelope; asked by \
+                 PartialHashAggregateStream[0] (can_spill="
             ),
             "{message}"
         );
