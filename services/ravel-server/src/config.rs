@@ -386,6 +386,9 @@ pub struct SqlSpillSettings {
     /// `--cache-dir`-derived spill ceiling is taken from the volume's free
     /// bytes less this.
     pub read_cache_bytes: u64,
+    /// `--sql-spill-merge-fan-in`: the most spill files one merge step reads
+    /// at once, `0` for unbounded. Never 1; the flag refuses it.
+    pub merge_fan_in: usize,
 }
 
 impl Default for SqlSpillSettings {
@@ -394,6 +397,7 @@ impl Default for SqlSpillSettings {
             off: false,
             memory_budget_bytes: u64::MAX,
             read_cache_bytes: 0,
+            merge_fan_in: DEFAULT_SQL_SPILL_MERGE_FAN_IN,
         }
     }
 }
@@ -466,6 +470,28 @@ fn parse_ingest_hold_queued_flushes(value: &str) -> Result<u64, String> {
         return Err("must be at least 1".to_string());
     }
     Ok(bound)
+}
+
+/// `--sql-spill-merge-fan-in` when the flag is unset: the most spill files one
+/// merge step reads at once, the compiled-in
+/// `ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN` (ADR-0954 item 2, issue #3899).
+/// Mirrored here (ravel-sql is an optional dependency) and pinned equal to it
+/// by `sql_spill_merge_fan_in_default_matches_ravel_sql`.
+pub const DEFAULT_SQL_SPILL_MERGE_FAN_IN: usize = 2;
+
+/// Parses `--sql-spill-merge-fan-in`: `0` (DataFusion's unbounded fan-in) or
+/// at least 2. DataFusion would silently raise 1 to 2, so 1 is refused rather
+/// than run as a value the operator did not ask for.
+fn parse_sql_spill_merge_fan_in(value: &str) -> Result<usize, String> {
+    let fan_in: usize = value.parse().map_err(|err| format!("{err}"))?;
+    if fan_in == 1 {
+        return Err(
+            "must be 0 (unbounded) or at least 2: a merge step that reads one spill file \
+             merges nothing"
+                .to_string(),
+        );
+    }
+    Ok(fan_in)
 }
 
 /// The longest `--ingest-hold-max-wait` accepted: the listener-join slice of
@@ -861,6 +887,31 @@ fn parse_audit_token_key(raw: &str) -> anyhow::Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("{AUDIT_TOKEN_KEY_ENV} did not decode to 32 bytes"))
+}
+
+/// `--sql-spill-merge-fan-in`, flattened into [`Cli`].
+#[derive(Debug, clap::Args)]
+pub struct SqlSpillMergeArgs {
+    /// Most spill files one SQL spill merge step reads at once (ADR-0954
+    /// item 2, issue #3899). The scratch peak is the spilled bytes plus the
+    /// largest intermediate merge output. With files of equal size the
+    /// default, 2, has the smallest worst case of any bounded value, about
+    /// 1.67 times the spilled bytes, and any value of 3 or more has a worse
+    /// one (about 1.89 times at 8, with 9 files); a last file smaller than
+    /// the rest lifts the peak toward twice the spilled bytes at any value.
+    /// 2 also leaves the most of the memory pool to the aggregate that
+    /// replays the merged files. `0` is DataFusion's unbounded fan-in, which
+    /// reads as many files at once as the pool seats, and a value at or above
+    /// that number behaves as `0`. `1` is refused at startup. The startup log's `sql_spill_merge_fan_in` line reports the
+    /// value. Meaningful only in a build with the `sql` feature and with
+    /// spill on; inert otherwise.
+    #[arg(
+        long = "sql-spill-merge-fan-in",
+        value_name = "FILES",
+        default_value_t = DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+        value_parser = parse_sql_spill_merge_fan_in
+    )]
+    pub sql_spill_merge_fan_in: usize,
 }
 
 /// Dev binary wiring gateway + ingest + query into one process.
@@ -1984,6 +2035,12 @@ pub struct Cli {
     /// serves queries; inert otherwise.
     #[arg(long = "sql-spill", value_enum, default_value = "auto")]
     pub sql_spill: SqlSpillArg,
+
+    // A struct of its own so its `Arg` is built in a separate frame: in an
+    // unoptimized build every flag adds about 8 KB to `Cli::augment_args`'s
+    // frame, which already takes about 1.5 MiB of a 2 MiB test thread stack.
+    #[command(flatten)]
+    pub sql_spill_merge: SqlSpillMergeArgs,
 
     /// Object size above which a logs scan reads only the pruning-relevant
     /// blocks of an RLOG object (a suffix probe plus coalesced block-range GETs)
@@ -8129,6 +8186,7 @@ impl Cli {
                         .cache_max_bytes
                         .saturating_add(resolved.catalog_cache_max_bytes)
                 },
+                merge_fan_in: self.sql_spill_merge.sql_spill_merge_fan_in,
             },
             decoded_cache_max_bytes: self.decoded_cache_max_bytes,
         })
@@ -17261,10 +17319,65 @@ mod tests {
                     off,
                     memory_budget_bytes: 30_064_771_072,
                     read_cache_bytes,
+                    merge_fan_in: DEFAULT_SQL_SPILL_MERGE_FAN_IN,
                 },
                 "{args:?}"
             );
         }
+    }
+
+    /// `--sql-spill-merge-fan-in` (ADR-0954 item 2, issue #3899): unset
+    /// resolves to the named default, an explicit value reaches
+    /// `QueryBudgets::sql_spill`, `0` (unbounded) is accepted, and `1` is
+    /// refused at startup with a message saying why.
+    #[test]
+    fn sql_spill_merge_fan_in_flag_resolves_and_refuses_one() {
+        assert_eq!(DEFAULT_SQL_SPILL_MERGE_FAN_IN, 2);
+        for (args, expected) in [
+            (&[][..], DEFAULT_SQL_SPILL_MERGE_FAN_IN),
+            (&["--sql-spill-merge-fan-in", "4"][..], 4),
+            (&["--sql-spill-merge-fan-in", "0"][..], 0),
+            (&["--sql-spill-merge-fan-in", "8"][..], 8),
+        ] {
+            let parsed = cli(args);
+            assert_eq!(
+                parsed.sql_spill_merge.sql_spill_merge_fan_in, expected,
+                "{args:?}"
+            );
+            let resolved = resolved_from(&parsed);
+            let budgets = parsed.query_budgets(&resolved).expect("budgets resolve");
+            assert_eq!(budgets.sql_spill.merge_fan_in, expected, "{args:?}");
+        }
+        assert_eq!(
+            SqlSpillSettings::default().merge_fan_in,
+            DEFAULT_SQL_SPILL_MERGE_FAN_IN
+        );
+
+        let refused = Cli::try_parse_from(["ravel-server", "--sql-spill-merge-fan-in", "1"])
+            .expect_err("--sql-spill-merge-fan-in 1 must be refused");
+        let message = refused.to_string();
+        assert!(
+            message.contains("--sql-spill-merge-fan-in")
+                && message.contains("must be 0 (unbounded) or at least 2"),
+            "{message}"
+        );
+        for word in ["-1", "two", ""] {
+            assert!(
+                Cli::try_parse_from(["ravel-server", "--sql-spill-merge-fan-in", word]).is_err(),
+                "--sql-spill-merge-fan-in {word:?} must be refused"
+            );
+        }
+    }
+
+    /// The server's `--sql-spill-merge-fan-in` default and ravel-sql's
+    /// compiled-in default are one value.
+    #[cfg(feature = "sql")]
+    #[test]
+    fn sql_spill_merge_fan_in_default_matches_ravel_sql() {
+        assert_eq!(
+            DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+            ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN
+        );
     }
 
     /// `--alert-retention` defaults to 90 days, accepts `0` as the opt-out,

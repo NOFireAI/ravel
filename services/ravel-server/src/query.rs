@@ -806,6 +806,11 @@ pub const SQL_SPILL_SOURCE_CWD_INSUFFICIENT_SPACE: &str = "cwd-insufficient-spac
 /// `source` of the `sql_spill_compression` line when spill is on: the codec
 /// is [`ravel_sql::SpillDecision::SPILL_COMPRESSION`], which no flag sets.
 pub const SQL_SPILL_SOURCE_BUILT_IN: &str = "built-in";
+/// `source` of a `sql_spill_merge_fan_in` line whose value equals
+/// [`crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN`]; any other value reads
+/// [`crate::config::PERF_SOURCE_FLAG`]. With spill off, that line reads
+/// `value="none"` under the `sql_spill_dir` line's source instead.
+pub const SQL_SPILL_SOURCE_DEFAULT: &str = "default";
 
 /// The owned form of [`ravel_sql::CacheDirSpill`]: what a `--cache-dir`
 /// deployment resolves its SQL spill root and ceiling from (ADR-0954, amended
@@ -856,9 +861,10 @@ pub struct SpillSpace {
 }
 
 /// The two arguments [`build_sql_state_with_parquet`] hands
-/// `SqlConfig::with_spill_resolved`.
+/// `SqlConfig::with_spill_resolved`, and the merge fan-in it sets on the
+/// result.
 #[cfg(feature = "sql")]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlSpillInputs {
     /// `--sql-spill off`.
     pub off: bool,
@@ -870,6 +876,22 @@ pub struct SqlSpillInputs {
     pub cache_dir: Option<CacheDirSpillInputs>,
     /// `cache_dir` holds the working-directory default, not `--cache-dir`.
     pub cwd_default: bool,
+    /// `--sql-spill-merge-fan-in`, set on the resolved
+    /// [`ravel_sql::SpillConfig::merge_fan_in`] whatever source the spill
+    /// directory came from.
+    pub merge_fan_in: usize,
+}
+
+#[cfg(feature = "sql")]
+impl Default for SqlSpillInputs {
+    fn default() -> Self {
+        SqlSpillInputs {
+            off: false,
+            cache_dir: None,
+            cwd_default: false,
+            merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
+        }
+    }
 }
 
 /// The spill configuration startup resolved, and where each half came from.
@@ -889,11 +911,14 @@ pub struct ResolvedSqlSpill {
 
 #[cfg(feature = "sql")]
 impl ResolvedSqlSpill {
-    /// The `sql_spill_dir`, `sql_spill_max_bytes` and `sql_spill_compression`
-    /// startup lines, in the `performance default resolved` layout
-    /// [`crate::config::ResolvedPerformanceDefaults::emit`] uses. All three
-    /// are written whether or not spill is enabled; a disabled spill reads
-    /// `value="none"` with the reason as its source. When the ceiling was
+    /// The `sql_spill_dir`, `sql_spill_max_bytes`, `sql_spill_compression`
+    /// and `sql_spill_merge_fan_in` startup lines, in the `performance default
+    /// resolved` layout [`crate::config::ResolvedPerformanceDefaults::emit`]
+    /// uses. All four lines are written whether or not spill is enabled; a
+    /// disabled spill reads `value="none"` with the reason as its source. The
+    /// fan-in line's source is `default` when the value equals
+    /// [`crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN`] and `flag` otherwise.
+    /// When the ceiling was
     /// derived from `--cache-dir`, or refused for lack of space there, the
     /// `sql_spill_max_bytes` line also carries `free_bytes` and
     /// `read_cache_bytes`, the two figures it was derived from.
@@ -924,6 +949,17 @@ impl ResolvedSqlSpill {
                     source = SQL_SPILL_SOURCE_BUILT_IN,
                     "performance default resolved"
                 );
+                tracing::info!(
+                    setting = "sql_spill_merge_fan_in",
+                    value = config.merge_fan_in,
+                    source = if config.merge_fan_in == crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN
+                    {
+                        SQL_SPILL_SOURCE_DEFAULT
+                    } else {
+                        crate::config::PERF_SOURCE_FLAG
+                    },
+                    "performance default resolved"
+                );
             }
             None => {
                 tracing::info!(
@@ -942,6 +978,12 @@ impl ResolvedSqlSpill {
                 );
                 tracing::info!(
                     setting = "sql_spill_compression",
+                    value = "none",
+                    source = self.dir_source,
+                    "performance default resolved"
+                );
+                tracing::info!(
+                    setting = "sql_spill_merge_fan_in",
                     value = "none",
                     source = self.dir_source,
                     "performance default resolved"
@@ -1004,19 +1046,23 @@ pub fn resolve_sql_spill(
         .cache_dir
         .as_ref()
         .map(CacheDirSpillInputs::as_cache_dir_spill);
-    let config = SpillConfig::resolve(env_dir, env_quota, cache_dir).map_err(|err| match err {
-        SpillConfigError::Incomplete if env_dir.is_some() => anyhow::anyhow!(
-            "{ENV_SPILL_MAX_BYTES} is not set but {ENV_SPILL_DIR} is: set both to spill to \
+    let mut config =
+        SpillConfig::resolve(env_dir, env_quota, cache_dir).map_err(|err| match err {
+            SpillConfigError::Incomplete if env_dir.is_some() => anyhow::anyhow!(
+                "{ENV_SPILL_MAX_BYTES} is not set but {ENV_SPILL_DIR} is: set both to spill to \
              that directory, or unset {ENV_SPILL_DIR} (with --cache-dir set, spill then goes \
              under it)"
-        ),
-        SpillConfigError::Incomplete => anyhow::anyhow!(
-            "{ENV_SPILL_DIR} is not set but {ENV_SPILL_MAX_BYTES} is, and there is no \
+            ),
+            SpillConfigError::Incomplete => anyhow::anyhow!(
+                "{ENV_SPILL_DIR} is not set but {ENV_SPILL_MAX_BYTES} is, and there is no \
              --cache-dir to place the spill directory under: set {ENV_SPILL_DIR}, set \
              --cache-dir, or unset {ENV_SPILL_MAX_BYTES}"
-        ),
-        other => anyhow::Error::new(other),
-    })?;
+            ),
+            other => anyhow::Error::new(other),
+        })?;
+    if let Some(config) = config.as_mut() {
+        config.merge_fan_in = inputs.merge_fan_in;
+    }
     // With a cache directory and no env directory, `resolve` returns `None`
     // only when the derived ceiling finds too little free space: a bare env
     // quota there always enables spill.
@@ -1231,6 +1277,7 @@ fn prepare_sql_spill_with(
         off: settings.off,
         cache_dir: cache_dir_inputs,
         cwd_default: false,
+        merge_fan_in: settings.merge_fan_in,
     };
     let resolved = resolve_sql_spill(&inputs, env_dir, env_quota)?;
     resolved.emit();
@@ -1359,6 +1406,7 @@ fn prepare_cwd_spill(
             memory_budget_bytes: settings.memory_budget_bytes,
         }),
         cwd_default: true,
+        merge_fan_in: settings.merge_fan_in,
     };
     let resolved = match resolve_sql_spill(&inputs, None, None) {
         Ok(resolved) => resolved,
@@ -1495,7 +1543,7 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 ///
 /// `spill` is what [`prepare_sql_spill`] settled: the executor's
 /// `SqlConfig::spill` comes from `SqlConfig::with_spill_resolved(spill.off,
-/// spill.cache_dir)`.
+/// spill.cache_dir)`, with `spill.merge_fan_in` set on it.
 ///
 /// `read_gate` is the process's ADR-1702 read CPU gate, attached to the logs
 /// and spans fetchers so the `logs` and `spans` scans decode their blocks on
@@ -1623,7 +1671,7 @@ fn build_sql_state_inner(
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
 
-    let config = SqlConfig {
+    let mut config = SqlConfig {
         engine: engine_config,
         max_query_bytes,
         // ADR-0094 (amended by #741): the process-wide exact-typed repartition
@@ -1678,6 +1726,9 @@ fn build_sql_state_inner(
             .as_ref()
             .map(CacheDirSpillInputs::as_cache_dir_spill),
     )?;
+    if let Some(resolved) = config.spill.as_mut() {
+        resolved.merge_fan_in = spill.merge_fan_in;
+    }
     let max_deadline = config.engine.deadline;
     let mut metrics_fetcher = SegmentFetcher::new(store.clone())
         .with_get_limiter(get_limiter.clone())
@@ -3606,6 +3657,7 @@ mod tests {
             off,
             memory_budget_bytes,
             read_cache_bytes: 0,
+            merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
         }
     }
 
@@ -3870,6 +3922,7 @@ mod tests {
                 Some(ravel_sql::SpillConfig {
                     dir: cache.path().join("sql-spill").join(INSTANCE),
                     max_bytes: expected,
+                    merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 "{label}"
             );
@@ -3945,6 +3998,7 @@ mod tests {
                 config: Some(ravel_sql::SpillConfig {
                     dir: cache.path().join("sql-spill").join(INSTANCE),
                     max_bytes: GIB,
+                    merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 dir_source: SQL_SPILL_SOURCE_CACHE_DIR,
                 max_bytes_source: SQL_SPILL_SOURCE_DERIVED,
@@ -4036,6 +4090,7 @@ mod tests {
                 config: Some(ravel_sql::SpillConfig {
                     dir: explicit.clone(),
                     max_bytes: 4096,
+                    merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 dir_source: SQL_SPILL_SOURCE_ENV,
                 max_bytes_source: SQL_SPILL_SOURCE_ENV,
@@ -4081,6 +4136,7 @@ mod tests {
                 config: Some(ravel_sql::SpillConfig {
                     dir: cwd.path().join("sql-spill").join(INSTANCE),
                     max_bytes: 8 * GIB,
+                    merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 dir_source: SQL_SPILL_SOURCE_CWD_DEFAULT,
                 max_bytes_source: SQL_SPILL_SOURCE_CWD_DEFAULT,
@@ -4106,6 +4162,7 @@ mod tests {
                 config: Some(ravel_sql::SpillConfig {
                     dir: cache.path().join("sql-spill").join(INSTANCE),
                     max_bytes: 777,
+                    merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 dir_source: SQL_SPILL_SOURCE_CACHE_DIR,
                 max_bytes_source: SQL_SPILL_SOURCE_ENV_OVERRIDE,
@@ -4201,6 +4258,7 @@ mod tests {
             Some(ravel_sql::SpillConfig {
                 dir: cache.path().join("sql-spill").join(INSTANCE),
                 max_bytes: 120_259_084_288,
+                merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
             })
         );
         for (free_bytes, expected) in [(40 * GIB, 16_965_120_819), (200 * GIB, 102_864_466_739)] {
@@ -4210,6 +4268,7 @@ mod tests {
                 Some(ravel_sql::SpillConfig {
                     dir: cache.path().join("sql-spill").join(INSTANCE),
                     max_bytes: expected,
+                    merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 "free_bytes={free_bytes}"
             );
@@ -4227,15 +4286,124 @@ mod tests {
                     memory_budget_bytes: 30_064_771_072,
                 }),
                 cwd_default: false,
+                merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
             }),
             None,
             "off in the inputs wins over a cache dir in the same inputs"
         );
     }
 
+    /// `--sql-spill-merge-fan-in` (ADR-0954 item 2, issue #3899) reaches the
+    /// disk manager of the sessions the server's SQL executor builds, traced
+    /// from the parsed command line through `query_budgets`,
+    /// `prepare_sql_spill_with`, `build_sql_state_with_parquet` and
+    /// `ravel_sql::build_session`: unset is the named default, 4 is 4, and 0
+    /// is DataFusion's unbounded fan-in.
+    ///
+    /// Prove-the-test: drop the `merge_fan_in` override after
+    /// `.with_spill_resolved(...)` in `build_sql_state_inner` and the 4 and 0
+    /// rows read the default.
+    #[test]
+    fn sql_spill_merge_fan_in_reaches_the_disk_manager_from_cli() {
+        use clap::Parser;
+
+        assert_spill_env_unset();
+        for (args, expected) in [
+            (&[][..], crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN),
+            (&["--sql-spill-merge-fan-in", "4"][..], 4),
+            (&["--sql-spill-merge-fan-in", "0"][..], 0),
+        ] {
+            let cache = tempfile::tempdir().expect("cache dir");
+            let mut argv = vec!["ravel-server", "--cache-dir"];
+            argv.push(cache.path().to_str().expect("utf-8 temp path"));
+            argv.extend_from_slice(args);
+            let cli = crate::Cli::try_parse_from(argv).expect("flags parse");
+            let resolved = cli
+                .resolve_performance(crate::config::HostProfile::new(
+                    16,
+                    Some(32_212_254_720),
+                    Some(32_212_254_720),
+                    None,
+                    None,
+                    None,
+                ))
+                .expect("performance defaults resolve");
+            let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
+            let startup = prepare(
+                cli.cache_dir.as_deref(),
+                budgets.sql_spill,
+                None,
+                None,
+                300 * GIB,
+            )
+            .expect("spill resolves");
+            assert_eq!(
+                startup
+                    .resolved
+                    .config
+                    .as_ref()
+                    .map(|config| config.merge_fan_in),
+                Some(expected),
+                "{args:?}: the startup line's value"
+            );
+            let config = executor_config(&startup.inputs);
+            assert_eq!(
+                config.spill.as_ref().map(|spill| spill.merge_fan_in),
+                Some(expected),
+                "{args:?}"
+            );
+            assert_eq!(session_merge_fan_in(&config), expected, "{args:?}");
+        }
+    }
+
     /// The `SqlConfig::spill` of an executor `build_sql_state_with_parquet`
     /// builds from `inputs`.
     fn executor_spill(inputs: &SqlSpillInputs) -> Option<ravel_sql::SpillConfig> {
+        executor_config(inputs).spill
+    }
+
+    /// The spill merge fan-in on the disk manager of a spill-enabled session
+    /// `ravel_sql::build_session` builds from `config`, the path every SQL
+    /// statement's session takes.
+    fn session_merge_fan_in(config: &ravel_sql::SqlConfig) -> usize {
+        let spill = config.spill.as_ref().expect("spill resolved");
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantHash([0u8; 16]);
+        let table = ravel_sql::SessionTable::Metrics(Arc::new(ravel_sql::RavelTableProvider::new(
+            ravel_catalog::Snapshot {
+                segments: Vec::new(),
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            },
+            tenant,
+            ravel_query::SegmentFetcher::new(store),
+            config.clone(),
+            ravel_query::PhaseAccounting::new(),
+        )));
+        let (pool, _breach) = config.query_pool(
+            ravel_sql::TenantMemoryAccountant::new(1 << 30),
+            ravel_types::accounting::QueryAccounting::new(),
+        );
+        ravel_sql::build_session(
+            config,
+            pool,
+            table,
+            false,
+            ravel_sql::SpillDecision::Enabled {
+                dir: &spill.dir,
+                max_bytes: spill.max_bytes,
+            },
+            &ravel_sql::SessionPrincipal::without_capabilities(tenant),
+        )
+        .expect("session builds")
+        .runtime_env()
+        .disk_manager
+        .max_spill_merge_fan_in()
+    }
+
+    /// The `SqlConfig` of an executor `build_sql_state_with_parquet` builds
+    /// from `inputs`.
+    fn executor_config(inputs: &SqlSpillInputs) -> ravel_sql::SqlConfig {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let catalog = build_catalog(
             store.clone(),
@@ -4274,30 +4442,35 @@ mod tests {
             None,
         )
         .expect("sql state builds");
-        state.executor.config().spill.clone()
+        state.executor.config().clone()
     }
 
-    /// The startup lines: `sql_spill_dir`, `sql_spill_max_bytes` and
-    /// `sql_spill_compression` each appear exactly once, on the `performance
-    /// default resolved` layout, with the value and source of the cache-dir,
-    /// env, off and insufficient-space cases. The compression line reads
+    /// The startup lines: `sql_spill_dir`, `sql_spill_max_bytes`,
+    /// `sql_spill_compression` and `sql_spill_merge_fan_in` each appear
+    /// exactly once, on the `performance default resolved` layout, with the
+    /// value and source of the cache-dir, env, flag fan-in, off and
+    /// insufficient-space cases. The compression line reads
     /// `value="lz4_frame" source="built-in"` with spill on, and the spill
     /// directory line's `value="none"` and source with it off.
     ///
     /// Prove-the-test: label the cache-dir ceiling `SQL_SPILL_SOURCE_ENV` in
     /// `resolve_sql_spill` and the cache-dir row reads `source="env"`; drop
-    /// the `None` arm's three lines in `ResolvedSqlSpill::emit` and the off row
+    /// the `None` arm's lines in `ResolvedSqlSpill::emit` and the off row
     /// finds no line; drop the insufficient-space arm in `resolve_sql_spill`
-    /// and that row reads `source="unset"`.
+    /// and that row reads `source="unset"`; drop the `merge_fan_in`
+    /// assignment in `resolve_sql_spill` and the flag fan-in row reads
+    /// `value=2 source="default"`.
     #[test]
     fn startup_lines_carry_the_spill_dir_and_ceiling_with_their_sources() {
         let cache = tempfile::tempdir().expect("cache dir");
         let explicit = cache.path().join("explicit");
         let root = cache.path().join("sql-spill").join(INSTANCE);
+        let default_fan_in = crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN;
         let cases = [
             (
                 "cache-dir",
                 false,
+                default_fan_in,
                 None,
                 None,
                 100 * GIB,
@@ -4306,40 +4479,72 @@ mod tests {
                     root.display().to_string()
                 ),
                 format!(" value={} source=\"derived\"", 8 * GIB),
+                " value=2 source=\"default\"".to_string(),
             ),
             (
                 "env",
                 false,
+                default_fan_in,
                 os(explicit.to_str().expect("utf-8 temp path")),
                 os("4096"),
                 100 * GIB,
                 format!(" value={:?} source=\"env\"", explicit.display().to_string()),
                 " value=4096 source=\"env\"".to_string(),
+                " value=2 source=\"default\"".to_string(),
+            ),
+            (
+                "flag fan-in",
+                false,
+                4,
+                os(explicit.to_str().expect("utf-8 temp path")),
+                os("4096"),
+                100 * GIB,
+                format!(" value={:?} source=\"env\"", explicit.display().to_string()),
+                " value=4096 source=\"env\"".to_string(),
+                " value=4 source=\"flag\"".to_string(),
             ),
             (
                 "off",
                 true,
+                default_fan_in,
                 os(explicit.to_str().expect("utf-8 temp path")),
                 os("4096"),
                 100 * GIB,
+                " value=\"none\" source=\"flag-off\"".to_string(),
                 " value=\"none\" source=\"flag-off\"".to_string(),
                 " value=\"none\" source=\"flag-off\"".to_string(),
             ),
             (
                 "insufficient space",
                 false,
+                default_fan_in,
                 None,
                 None,
                 GIB,
                 " value=\"none\" source=\"cache-dir-insufficient-space\"".to_string(),
                 " value=\"none\" source=\"cache-dir-insufficient-space\"".to_string(),
+                " value=\"none\" source=\"cache-dir-insufficient-space\"".to_string(),
             ),
         ];
-        for (label, off, env_dir, env_quota, free_bytes, dir_fields, max_fields) in cases {
+        for (
+            label,
+            off,
+            merge_fan_in,
+            env_dir,
+            env_quota,
+            free_bytes,
+            dir_fields,
+            max_fields,
+            fan_in_fields,
+        ) in cases
+        {
             let (capture, guard) = capture_info();
             let startup = prepare(
                 Some(cache.path()),
-                settings(off, 2 * GIB),
+                crate::config::SqlSpillSettings {
+                    merge_fan_in,
+                    ..settings(off, 2 * GIB)
+                },
                 env_dir,
                 env_quota,
                 free_bytes,
@@ -4361,6 +4566,11 @@ mod tests {
             assert!(
                 compression_line.contains(&compression_fields),
                 "{label}: {compression_line}"
+            );
+            let fan_in_line = resolved_line(&lines, "sql_spill_merge_fan_in");
+            assert!(
+                fan_in_line.contains(&fan_in_fields),
+                "{label}: {fan_in_line}"
             );
         }
     }
@@ -4414,6 +4624,7 @@ mod tests {
                     off: false,
                     memory_budget_bytes: u64::MAX,
                     read_cache_bytes: BOUND,
+                    merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
                 },
                 env_dir,
                 env_dir.map(|_| std::ffi::OsStr::new("4096")),
@@ -4602,6 +4813,7 @@ mod tests {
                 config: Some(ravel_sql::SpillConfig {
                     dir: cache.path().join("sql-spill").join(INSTANCE),
                     max_bytes: 5 * GIB,
+                    merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 dir_source: SQL_SPILL_SOURCE_CACHE_DIR,
                 max_bytes_source: SQL_SPILL_SOURCE_DERIVED,
@@ -4758,6 +4970,7 @@ mod tests {
             off: false,
             memory_budget_bytes,
             read_cache_bytes,
+            merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
         }
     }
 
@@ -4796,6 +5009,7 @@ mod tests {
             let config = ravel_sql::SpillConfig {
                 dir: dir.clone(),
                 max_bytes: expected,
+                merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
             };
             assert_eq!(
                 startup.resolved,
@@ -5289,6 +5503,7 @@ mod tests {
                 Some(ravel_sql::SpillConfig {
                     dir: explicit.clone(),
                     max_bytes: 4096,
+                    merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 SQL_SPILL_SOURCE_ENV
             )
@@ -5315,6 +5530,7 @@ mod tests {
                 Some(ravel_sql::SpillConfig {
                     dir: cache.path().join("sql-spill").join(INSTANCE),
                     max_bytes: 8 * GIB,
+                    merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
                 }),
                 SQL_SPILL_SOURCE_CACHE_DIR,
                 SQL_SPILL_SOURCE_DERIVED
