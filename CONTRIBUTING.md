@@ -44,24 +44,46 @@ For AI-assisted contributions, see [AI_POLICY.md](AI_POLICY.md).
 
 ## Building and testing
 
-Ravel is a Rust workspace.
+### Prerequisites
 
-For fast iteration on a crate:
+* Rust, pinned in [`rust-toolchain.toml`](rust-toolchain.toml). With `rustup`, the first `cargo` command in the repository installs it.
+* Docker with `docker compose`, for the local RustFS object store.
+* Python 3.9 or later, for the documentation and script checks.
+* Node 22, only for the TypeScript SDK under `sdk/typescript`.
+
+### Build and run
+
+```bash
+cargo build -p ravel-server -p ravel-cli
+make rustfs        # local object store on 127.0.0.1:9000
+make demo          # release-builds the workspace, then runs one write and read
+```
+
+No crate has default cargo features. The published image is built with `--features sql,flight-sql,otap,agents,mcp`; pass the features your change needs. [Building from source](docs/guides/getting-started.md#building-from-source) shows how to run a server by hand.
+
+### Iterate
+
+While you work, check and test only the crate you are changing:
 
 ```bash
 cargo check -p <crate>
 cargo test -p <crate>
 ```
 
-Before submitting a pull request, run the repository gates:
+### Run the checks before a pull request
+
+Run the gate script once, right before you open or update a pull request:
 
 ```bash
-scripts/gates.sh
+scripts/gates.sh -p <crate>   # your crate and every crate that depends on it
+scripts/gates.sh              # the whole workspace
 ```
 
-At minimum these enforce formatting, Clippy with warnings denied, and tests. The gate script also handles feature-specific checks such as SQL and Flight SQL where applicable.
+The script runs `cargo fmt --check`, Clippy with warnings denied, the tests, and the feature lanes (`sql`, `flight-sql`, `esql`, and others) that a plain `cargo test` does not compile. The workspace run also checks the TypeScript SDK and needs Node 22; set `RAVEL_GATES_SKIP_SDK=1` to skip that part and leave it to CI. A full workspace run needs a lot of disk, so use the scoped form for most changes. `scripts/gates.sh --dry-run -p <crate>` prints what it would run.
 
-Do not submit a PR that claims tests or benchmarks passed unless you ran them.
+For a documentation change, run `make check-docs` (links, anchors, terminology, and the claims registry) and `make doc-drift`. Both need only Python.
+
+CI runs the same checks on every pull request. Do not claim that tests or benchmarks passed unless you ran them. [docs/internal/development.md](docs/internal/development.md) explains how CI shares build work.
 
 ## Commits
 
@@ -95,6 +117,8 @@ or, when the change fully resolves it:
 Fixes: #123
 ```
 
+A `feat` or `fix` change under `crates/` or `services/` adds a changelog fragment, as [changelog.d/README.md](changelog.d/README.md) describes, or carries a `Changelog: none` trailer.
+
 ## Pull requests
 
 Before opening a PR:
@@ -102,7 +126,7 @@ Before opening a PR:
 1. Rebase or update your branch against current `main`.
 2. Review your own diff.
 3. Remove unrelated changes and generated noise.
-4. Run `scripts/gates.sh`.
+4. Run `scripts/gates.sh` (see [the checks](#run-the-checks-before-a-pull-request)).
 5. Update documentation where behavior changed.
 
 In the pull request, explain:

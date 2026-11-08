@@ -16,44 +16,40 @@ when you are changing Ravel's code, because it does not run your build.
 make demo
 ```
 
-It builds `ravel-server` and `ravel-cli` in release mode from the current tree,
-starts `ravel-server --store s3` against the local RustFS stack, ingests one
-generated OTLP export, and queries it back by commit token
-([scripts/demo.sh](../../scripts/demo.sh)).
+It first runs `make build`, a release build of the whole workspace with no
+cargo features. Then [scripts/demo.sh](../../scripts/demo.sh) builds debug
+`ravel-server` and `ravel-cli`, also with no features, starts
+`ravel-server --store s3` against the local RustFS stack, ingests one
+generated OTLP export, and queries it back by commit token. The demo runs the
+debug binaries, not the release build.
 
-One capability difference to keep in mind: the published image is built with
-`--features sql,flight-sql,otap,agents,mcp`, so `POST /api/v1/sql` and Flight SQL
-work in the compose quickstart, and `--otap`, `--agents` and `--mcp` are
-accepted there. The image first carries `agents` and `mcp` in `0.29.0`, and
-the compose quickstart pins `0.31.0`.
-`make demo` builds the default feature set and enables none of the five, so
-those surfaces are
-unavailable on the from-source path. PromQL, ingest, and the rest are identical
-on both. To exercise them from source, run `ravel-server` yourself with the
-same `--features` list, or use the compose quickstart.
+The published image is built with `--features sql,flight-sql,otap,agents,mcp`.
+`make demo` builds none of those features, so the demo server serves no SQL,
+Flight SQL, OTAP, Agents, or MCP routes. PromQL and ingest behave the same on
+both paths. To exercise a feature from source, run `ravel-server` yourself
+with that `--features` list, or use the compose quickstart.
 
 ## Fast local iteration
 
-Every commit must pass this gate list (it is also in CLAUDE.md):
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p <your-crate>        # plus --workspace when cross-crate
-```
-
-All three after every edit is slow. While you iterate, use a tight loop
-instead:
+While you iterate, use a tight loop on the crate you are changing:
 
 ```sh
 cargo check -p <crate>            # fast type/borrow feedback on one crate
 cargo check --workspace           # only when the change is genuinely cross-crate
+cargo test -p <crate>
 ```
 
-Run the full fmt/clippy/test gate list once, right before you commit, not
-after every edit.
+Before you commit, run the gate script once, not after every edit:
 
-CI still runs the full fmt, clippy, and test gates on every push.
+```sh
+scripts/gates.sh -p <crate>       # the crate and everything that depends on it
+```
+
+[CONTRIBUTING.md](../../CONTRIBUTING.md#run-the-checks-before-a-pull-request)
+lists what the script runs, its workspace form, and the documentation checks.
+A plain `cargo fmt`, `cargo clippy`, and `cargo test` list is not equivalent:
+it skips the `sql`, `flight-sql`, `esql` and other feature lanes. CI runs the
+full gates on every push.
 
 ## What CI does to keep those gates fast
 
