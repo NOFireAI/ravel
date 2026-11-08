@@ -847,7 +847,15 @@ esac
 # Entry STUB_INCORRECT_ENTRY's records say status incorrect in every pass,
 # and entry STUB_ROUTED_STATUS_ENTRY's under folded-routed only, each with its
 # result_hash. Entry STUB_ABSENT_ENTRY's records say segmentsFetched 0 and
-# segmentsPruned 10, a metric no object holds.
+# segmentsPruned 10, a metric no object holds, and under folded-routed
+# segmentsPrunedByLabelIndex 0. Under folded-routed, each
+# record's phases end with a keyIndex phase in the server's shape, 0 GETs and
+# STUB_ROUTED_KEYINDEX_HITS (default 2) cache hits; entry
+# STUB_ROUTED_LEAF_UNREAD_ENTRY's shows 0 of both, and with
+# STUB_ROUTED_PRUNES set every record's segmentsPrunedByLabelIndex is that.
+# STUB_RUN_FIGURES names a JSON file whose "records" object maps a pass label
+# to entry ids ("*" for every entry) to the fields that replace the record's;
+# a "keyIndex" field there replaces the routed keyIndex phase's figures.
 python3 -I - "$corpus" "$diag" "$out" "$verdict" "$@" <<'PY'
 import json, os, sys
 corpus, diag, out, verdict = sys.argv[1:5]
@@ -861,20 +869,33 @@ failed = os.environ.get("STUB_ROUTED_FAILED_ENTRY", "") if routed else ""
 unrouted_pruned = os.environ.get("STUB_UNROUTED_PRUNED_ENTRY", "") if label == "folded-unrouted" else ""
 ids = [e["id"] for e in json.load(open(corpus))["entries"]]
 phases = [{"name": n, "requests": 1} for n in ("resolve", "plan", "probe", "scan", "decode")]
+routed_prunes = int(os.environ.get("STUB_ROUTED_PRUNES") or 3)
+def key_index(i):
+    hits = 0 if i == os.environ.get("STUB_ROUTED_LEAF_UNREAD_ENTRY") else int(os.environ.get("STUB_ROUTED_KEYINDEX_HITS") or 2)
+    return [{"phase": "keyIndex", "s3GetRequests": 0, "cacheHits": hits}]
 def record(i):
     r = {"entry": i, "pass": 1, "rep": 1, "status": "ok", "latency_ms": 12.5,
-         "accounting": {"requests": 5}, "phases": phases,
+         "accounting": {"requests": 5}, "phases": phases + key_index(i) if routed else phases,
          "segmentsFetched": 4, "segmentsPruned": 6, "segmentsPrunedByDictionary": 3,
-         "segmentsPrunedByLabelIndex": 3 if routed else (2 if i == unrouted_pruned else 0),
+         "segmentsPrunedByLabelIndex": routed_prunes if routed else (2 if i == unrouted_pruned else 0),
          "estimate": None, "io": None, "pass_label": label, "fold_state": state,
          "result_hash": f"blake3:{i}-routed" if routed and i == differ else f"blake3:{i}"}
     if i == os.environ.get("STUB_INCORRECT_ENTRY") or (routed and i == os.environ.get("STUB_ROUTED_STATUS_ENTRY")):
         r["status"] = "incorrect"
     if i == os.environ.get("STUB_ABSENT_ENTRY"):
         r.update({"segmentsFetched": 0, "segmentsPruned": 10})
+        if routed:
+            r["segmentsPrunedByLabelIndex"] = 0
     if i == failed:
         r.update({"status": "failed: stub", "result_hash": None, "segmentsFetched": None,
                   "segmentsPruned": None, "segmentsPrunedByLabelIndex": None})
+    if os.environ.get("STUB_RUN_FIGURES"):
+        figs = json.load(open(os.environ["STUB_RUN_FIGURES"]))["records"].get(label) or {}
+        over = {**figs.get("*", {}), **figs.get(i, {})}
+        key_figs = over.pop("keyIndex", None)
+        r.update(over)
+        if routed and key_figs is not None:
+            r["phases"] = phases + [{"phase": "keyIndex", **key_figs}]
     return r
 if diag:
     json.dump({"ravel_cost": [record(i) for i in ids]}, open(diag, "w"))
@@ -897,12 +918,18 @@ STUB
 # present under --objects-dir, then writes --out with one statement per corpus
 # entry: 10 segments in its window, 4 of them holding its one metric (so
 # unrouted_fetched_expected 4, the stub query records' segmentsFetched; their
-# fetched + pruned is 10), two holders, route-bound. Entry
-# STUB_HOLDERS_NAMED_SPLIT gets 7 in its window, 4 named, so fetched + pruned
-# is not segments_in_window; entry STUB_ABSENT_ENTRY 7 in its window, 0 named
-# and 0 holders; STUB_HOLDERS_WINDOW_OFF 5 named and expected;
-# STUB_HOLDERS_WINDOW_NULL null counts; STUB_HOLDERS_UNBOUND is not
-# route-bound. Exit STUB_HOLDERS_EXIT writes nothing.
+# fetched + pruned is 10), no token-only object, two holders, route-bound,
+# one value holder, so expected_routed_prunes 3, the stub routed records'
+# segmentsPrunedByLabelIndex. It reports one commit token naming one object.
+# Entry STUB_HOLDERS_NAMED_SPLIT gets 7 in its window, 4 named, so fetched +
+# pruned is not segments_in_window; entry STUB_ABSENT_ENTRY 7 in its window, 0
+# named, 0 holders and 0 value holders; STUB_HOLDERS_WINDOW_OFF 5 named and
+# expected; STUB_HOLDERS_WINDOW_NULL null counts; STUB_HOLDERS_UNBOUND is not
+# route-bound and carries no value holders; STUB_HOLDERS_PRUNES_OFF expects 2
+# routed prunes. STUB_RUN_FIGURES names a JSON file whose "holders" object
+# holds "report", the top-level fields to replace, and "statements", entry ids
+# ("*" for every entry) to the fields to replace. Exit STUB_HOLDERS_EXIT
+# writes nothing.
 cat >"${BIN}/metricsbench_holders" <<'STUB'
 #!/usr/bin/env bash
 printf 'metricsbench_holders %s\n' "$*" >>"${STUB_LOG}"
@@ -929,24 +956,37 @@ env = lambda k: os.environ.get(k, "")
 ids = [e["id"] for e in json.load(open(corpus))["entries"]]
 def statement(i):
     s = {"id": i, "promql": "up", "selectors": [], "positive_equalities": [], "metrics": ["up"],
-         "name_pruned": True, "segments_in_window": 10, "named_in_window": 4,
-         "unrouted_fetched_expected": 4, "holders": 2, "route_bound": True, "route_bound_reason": None}
+         "name_pruned": True, "segments_in_window": 10, "named_in_window": 4, "token_only_fetched": 0,
+         "unrouted_fetched_expected": 4, "holders": 2, "value_holders": 1, "expected_routed_prunes": 3,
+         "route_bound": True, "route_bound_reason": None}
     if i == env("STUB_HOLDERS_NAMED_SPLIT"):
         s["segments_in_window"] = 7
     if i == env("STUB_ABSENT_ENTRY"):
-        s.update({"segments_in_window": 7, "named_in_window": 0, "unrouted_fetched_expected": 0, "holders": 0})
+        s.update({"segments_in_window": 7, "named_in_window": 0, "unrouted_fetched_expected": 0, "holders": 0,
+                  "value_holders": 0, "expected_routed_prunes": 0})
     if i == env("STUB_HOLDERS_WINDOW_OFF"):
         s.update({"named_in_window": 5, "unrouted_fetched_expected": 5})
     if i == env("STUB_HOLDERS_WINDOW_NULL"):
         s.update({"segments_in_window": None, "named_in_window": None, "unrouted_fetched_expected": None})
     if i == env("STUB_HOLDERS_UNBOUND"):
-        s.update({"route_bound": False, "route_bound_reason": "stub: no qualifying matcher"})
+        s.update({"route_bound": False, "route_bound_reason": "stub: no qualifying matcher",
+                  "value_holders": None, "expected_routed_prunes": None})
+    if i == env("STUB_HOLDERS_PRUNES_OFF"):
+        s.update({"value_holders": 2, "expected_routed_prunes": 2})
+    if figs:
+        s.update(figs["statements"].get("*", {}))
+        s.update(figs["statements"].get(i, {}))
     return s
-json.dump({"method": "stub method", "profile": json.load(open(ingest))["profile"]["name"],
-           "objects_l0": sum(1 for o in listed if o["level"] == "L0"),
-           "objects_l1": sum(1 for o in listed if o["level"] == "L1"), "series_total": 40,
-           "statements": [statement(i) for i in ids],
-           "skipped": [{"id": "skipped_one", "reason": "no positive equality"}]}, open(out, "w"))
+figs = json.load(open(env("STUB_RUN_FIGURES")))["holders"] if env("STUB_RUN_FIGURES") else None
+report = {"method": "stub method", "profile": json.load(open(ingest))["profile"]["name"],
+          "objects_l0": sum(1 for o in listed if o["level"] == "L0"),
+          "objects_l1": sum(1 for o in listed if o["level"] == "L1"), "series_total": 40,
+          "min_commit_tokens": 1, "token_objects": ["t/stub/token-object"], "tokens_unmatched": [],
+          "statements": [statement(i) for i in ids],
+          "skipped": [{"id": "skipped_one", "reason": "no positive equality"}]}
+if figs:
+    report.update(figs["report"])
+json.dump(report, open(out, "w"))
 PY
 STUB
 
@@ -2434,7 +2474,8 @@ expect_log "z: metricsbench_holders gets the corpus, ingest report, workload, li
 expect_log "z: metricsbench_holders reads the listing beside the objects" "--objects-list ${OUT}/stage1-objects.jsonl --objects-dir ${OUT}/stage1-objects --out ${OUT}/holders.json"
 expect_no_file z stage1-objects
 expect_file z stage1-objects.jsonl
-check "z: stage1.holders stamps the method, the counts and the window and holder figures per statement, every window checked against segmentsFetched" 'j("stamps.json")["stage1"]["holders"] == {"file": "holders.json", "bucket": "ravel-metricsbench", "method": "stub method", "objects_listed": 300, "objects_above_watermark": 0, "objects_l0": 300, "objects_l1": 0, "series_total": 40, "statements": [{"id": i, "segments_in_window": 10, "named_in_window": 4, "name_pruned": True, "unrouted_fetched_expected": 4, "holders": 2, "route_bound": True, "route_bound_reason": None} for i in '"${CORPUS_IDS}"'], "skipped": 1, "window_check": "segmentsFetched of every stage1-unrouted record of the statement == unrouted_fetched_expected, which is named_in_window (the objects in the window holding a series of the statement'"'"'s metric) when every selector names one metric, since the unrouted resolve prunes by that name'"'"'s postings, and segments_in_window (every object in the window) when the selectors name different metrics, which the resolve does not prune by name", "window_mismatches_count": 0, "window_mismatches": [], "window_unchecked_count": 0, "window_unchecked": [], "route_bound_check": "a statement whose selectors each carry a label=\"value\" matcher with a non-empty value is route_bound; any other leaves the router keeping every object holding that selector'"'"'s metric, so its holders figure is no bound on what the routed pass opens and it is left out of every holders-versus-routed comparison", "route_unbound_count": 0, "route_unbound": []}'
+check "z: stage1.holders stamps the method, the counts and the window, holder and value-holder figures per statement, every window checked against segmentsFetched and every routed prune against expected_routed_prunes" '{k: v for k, v in j("stamps.json")["stage1"]["holders"].items() if not k.endswith("_check")} == {"file": "holders.json", "bucket": "ravel-metricsbench", "method": "stub method", "objects_listed": 300, "objects_above_watermark": 0, "objects_l0": 300, "objects_l1": 0, "series_total": 40, "min_commit_tokens": 1, "token_objects": 1, "tokens_unmatched": [], "statements": [{"id": i, "segments_in_window": 10, "named_in_window": 4, "name_pruned": True, "token_only_fetched": 0, "unrouted_fetched_expected": 4, "holders": 2, "value_holders": 1, "expected_routed_prunes": 3, "route_bound": True, "route_bound_reason": None, "routed_pruned_by_label_index": [3]} for i in '"${CORPUS_IDS}"'], "skipped": 1, "window_mismatches_count": 0, "window_mismatches": [], "window_unchecked_count": 0, "window_unchecked": [], "routed_prune_mismatches_count": 0, "routed_prune_mismatches": [], "routed_prune_unchecked_count": 0, "routed_prune_unchecked": [], "routed_leaf_unread_count": 0, "routed_leaf_unread": [], "route_unbound_count": 0, "route_unbound": []}'
+check "z: each check sentence names what it compares" 'sorted(k for k in j("stamps.json")["stage1"]["holders"] if k.endswith("_check")) == ["bound_check", "route_bound_check", "routed_leaf_check", "routed_prune_check", "window_check"] and all(w in j("stamps.json")["stage1"]["holders"]["window_check"] for w in ("segmentsFetched of every stage1-unrouted record", "== unrouted_fetched_expected", "token_only_fetched", "min_commit_token", "unchecked")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_prune_check"] for w in ("segmentsPrunedByLabelIndex of every stage1-routed record", "== expected_routed_prunes", "unchecked")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_leaf_check"] for w in ("keyIndex phase", "s3GetRequests", "cacheHits")) and all(w in j("stamps.json")["stage1"]["holders"]["bound_check"] for w in ("series-level index", "not the label-value router", "value_holders", "LABEL_DICT", "the router'"'"'s bound"))'
 check "z: the cold records are counted against the selected entries x repetitions in both passes" 'all(j("stamps.json")["stage1"][f"{w}_cold_records"] == {"applicable": True, "expected_records": 5, "records": 5, "records_short": 0, "basis": f"stage1.{w}_cold: records with a ravel_cost (runs - failed_runs) against entries x repetitions_per_entry"} for w in ("unrouted", "routed"))'
 check "z: the query step's records keep their own label" 'all(r["pass_label"] == "background-folded" for r in j("diagnostics.json")["ravel_cost"])'
 expect_log "z: the main report's provenance is marked non-comparable with its reason" "--config comparable=false --config comparability_reason=MB_STAGE1=1: ravel-server ran with --fold-key-index-leaves (not the default command line) through this report's passes"
@@ -2550,7 +2591,7 @@ check "z16: one unrouted record pruned by the label index" 'j("stage1-compare.js
 # z17: an unrouted segmentsFetched that is not unrouted_fetched_expected is a mismatch.
 MB_STAGE1=1 STUB_HOLDERS_WINDOW_OFF=mb_selective_job_rate_sum run_stage1 z17 ci
 expect_rc z17 0
-check "z17: the statement named with its expected, named and window counts and the fetched figures" 'j("stamps.json")["stage1"]["holders"]["window_mismatches_count"] == 1 and j("stamps.json")["stage1"]["holders"]["window_mismatches"] == [{"id": "mb_selective_job_rate_sum", "unrouted_fetched_expected": 5, "named_in_window": 5, "segments_in_window": 10, "unrouted_fetched": [4]}] and j("stamps.json")["stage1"]["holders"]["window_unchecked_count"] == 0'
+check "z17: the statement named with its expected, named and window counts and the fetched figures" 'j("stamps.json")["stage1"]["holders"]["window_mismatches_count"] == 1 and j("stamps.json")["stage1"]["holders"]["window_mismatches"] == [{"id": "mb_selective_job_rate_sum", "unrouted_fetched_expected": 5, "named_in_window": 5, "segments_in_window": 10, "token_only_fetched": 0, "unrouted_fetched": [4]}] and j("stamps.json")["stage1"]["holders"]["window_unchecked_count"] == 0'
 
 # z18: a statement with no count is unchecked, never a match.
 MB_STAGE1=1 STUB_HOLDERS_WINDOW_NULL=mb_selective_job_rate_sum run_stage1 z18 ci
@@ -2587,6 +2628,63 @@ MB_STAGE1=1 STUB_STAGE1_PARTS_REBUILT=null run_stage1 z24 ci
 expect_rc z24 70
 check "z24: stage1-routed named, the refusal names the figure" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.leaves.parts_rebuilt is '"'"'None'"'"', not a whole number"'
 expect_no_log "z24: no routed pass" "--pass-label folded-routed"
+
+# z25: a routed segmentsPrunedByLabelIndex that is not expected_routed_prunes is a mismatch.
+MB_STAGE1=1 STUB_HOLDERS_PRUNES_OFF=mb_selective_job_rate_sum run_stage1 z25 ci
+expect_rc z25 0
+check "z25: the statement named with its expected prunes, value holders and the routed figures" 'j("stamps.json")["stage1"]["holders"]["routed_prune_mismatches_count"] == 1 and j("stamps.json")["stage1"]["holders"]["routed_prune_mismatches"] == [{"id": "mb_selective_job_rate_sum", "expected_routed_prunes": 2, "value_holders": 2, "routed_pruned_by_label_index": [3]}] and j("stamps.json")["stage1"]["holders"]["routed_prune_unchecked_count"] == 0'
+
+# z26: a routed record of a route_bound statement whose keyIndex phase read no
+# leaf is counted; a statement that is not route_bound is not.
+MB_STAGE1=1 STUB_ROUTED_LEAF_UNREAD_ENTRY=mb_single_counter_rate run_stage1 z26 ci
+expect_rc z26 0
+check "z26: the statement named with its unread record count" 'j("stamps.json")["stage1"]["holders"]["routed_leaf_unread_count"] == 1 and j("stamps.json")["stage1"]["holders"]["routed_leaf_unread"] == [{"id": "mb_single_counter_rate", "records": 1}]'
+MB_STAGE1=1 STUB_ROUTED_LEAF_UNREAD_ENTRY=mb_selective_error_ratio STUB_HOLDERS_UNBOUND=mb_selective_error_ratio run_stage1 z26u ci
+expect_rc z26u 0
+check "z26u: no unread record counted for a statement that is not route_bound" 'j("stamps.json")["stage1"]["holders"]["routed_leaf_unread_count"] == 0 and j("stamps.json")["stage1"]["holders"]["routed_prune_unchecked_count"] == 0'
+
+# z27: the figures of metricsbench-nightly run 42495422937 (ci, stage1=true),
+# copied from its out-dir as issue #3968's fix round 3 quotes them: 8 L0
+# objects; mb_absent_selective_labels names a metric no object holds (0 named,
+# 0 holders), and both passes' records fetched 4 and pruned 8, the 4 L0 objects
+# its 4 shards' min_commit_tokens name, which the resolve adds whatever their
+# metric; every routed record says segmentsPrunedByLabelIndex 0, since every
+# ci object's LABEL_DICT holds every probed value (value holders = named);
+# mb_single_counter_rate's routed keyIndex phase shows 10 cache hits and
+# mb_selective_job_rate_sum's 4, both with 0 GETs; three statements name 8
+# objects with 2 holders. The run quoted no keyIndex figure for the other
+# routed records; they are given mb_selective_job_rate_sum's. The absent
+# statement's routed record reads no leaf: its snapshot holds only the token
+# objects, which carry no part, so the engine does not route it.
+cat >"${TMP}/run-42495422937.json" <<'JSON'
+{"holders": {
+   "report": {"objects_l0": 8, "objects_l1": 0, "min_commit_tokens": 4,
+              "token_objects": ["t/h1/m/l0/s0", "t/h1/m/l0/s1", "t/h1/m/l0/s2", "t/h1/m/l0/s3"],
+              "tokens_unmatched": []},
+   "statements": {
+     "*": {"segments_in_window": 8, "named_in_window": 8, "name_pruned": true, "token_only_fetched": 0,
+           "unrouted_fetched_expected": 8, "value_holders": 8, "expected_routed_prunes": 0},
+     "mb_absent_selective_labels": {"named_in_window": 0, "token_only_fetched": 4, "unrouted_fetched_expected": 4,
+                                    "holders": 0, "value_holders": 0, "expected_routed_prunes": 0},
+     "mb_single_counter_rate": {"holders": 2},
+     "mb_single_gauge_instant": {"holders": 2},
+     "mb_selective_job_rate_sum": {"holders": 2}}},
+ "records": {
+   "folded-unrouted": {
+     "*": {"segmentsFetched": 8, "segmentsPruned": 0, "segmentsPrunedByLabelIndex": 0},
+     "mb_absent_selective_labels": {"segmentsFetched": 4, "segmentsPruned": 8}},
+   "folded-routed": {
+     "*": {"segmentsFetched": 8, "segmentsPruned": 0, "segmentsPrunedByLabelIndex": 0,
+           "keyIndex": {"s3GetRequests": 0, "cacheHits": 4}},
+     "mb_absent_selective_labels": {"segmentsFetched": 4, "segmentsPruned": 8,
+                                    "keyIndex": {"s3GetRequests": 0, "cacheHits": 0}},
+     "mb_single_counter_rate": {"keyIndex": {"s3GetRequests": 0, "cacheHits": 10}}}}}
+JSON
+MB_STAGE1=1 STUB_RUN_FIGURES="${TMP}/run-42495422937.json" run_stage1 z27 ci
+expect_rc z27 0
+check "z27: the absent statement expects its 4 token objects and fetched them" '[{k: s[k] for k in ("named_in_window", "token_only_fetched", "unrouted_fetched_expected", "value_holders", "expected_routed_prunes", "routed_pruned_by_label_index")} for s in j("stamps.json")["stage1"]["holders"]["statements"] if s["id"] == "mb_absent_selective_labels"] == [{"named_in_window": 0, "token_only_fetched": 4, "unrouted_fetched_expected": 4, "value_holders": 0, "expected_routed_prunes": 0, "routed_pruned_by_label_index": [0]}]'
+check "z27: no window or prune mismatch, nothing unchecked, no unread leaf, 4 token objects" 'all(j("stamps.json")["stage1"]["holders"][k] == 0 for k in ("window_mismatches_count", "window_unchecked_count", "routed_prune_mismatches_count", "routed_prune_unchecked_count", "routed_leaf_unread_count")) and j("stamps.json")["stage1"]["holders"]["token_objects"] == 4 and j("stamps.json")["stage1"]["holders"]["min_commit_tokens"] == 4'
+check "z27: the routed pass pruned nothing by the label index" 'j("stage1-compare.json")["passes"]["routed"]["records_pruned_by_label_index"] == 0'
 
 # z19: the scrape before the query step fails: the records say unknown and why.
 mapfile -t args < <(full_args "${TMP}/z19/out")
@@ -2692,7 +2790,8 @@ expect_rc "check failed record" 1
 expect_check_err "check failed record: the status difference named" "out of band statements_status_differing = 1 not in [0, 0] (stage1-compare.json statements_status_differing_count)"
 expect_check_err "check failed record: the failed status named" "out of band routed_records_status_unexpected = 1 not in [0, 0] (stage1-compare.json passes.routed.records_status_unexpected)"
 expect_check_err "check failed record: the entry without a hash named" "out of band entries_without_hash = 1 not in [0, 0] (stage1-compare.json entries_without_hash_count)"
-expect_check_err "check failed record: four failures counted, with its missing segmentsPrunedByLabelIndex" "stage1-check: 4 of ${FIGURES} figures failed"
+expect_check_err "check failed record: its routed prune unchecked" "out of band holders_routed_prune_unchecked = 1 not in [0, 0] (stamps.json stage1.holders.routed_prune_unchecked_count)"
+expect_check_err "check failed record: five failures counted, with its missing segmentsPrunedByLabelIndex in the compare and the holders check" "stage1-check: 5 of ${FIGURES} figures failed"
 run_check incorrect-both "${CI_BANDS}" "${TMP}/z21/out"
 expect_rc "check incorrect in both passes" 0
 run_check routed-status "${CI_BANDS}" "${TMP}/z22/out"
@@ -2719,6 +2818,28 @@ expect_check_err "check unrouted pruned: named" "out of band unrouted_records_pr
 run_check window "${CI_BANDS}" "${TMP}/z17/out"
 expect_rc "check window mismatch" 1
 if grep -qE '^out of band holders_window_mismatches = [0-9]+ not in \[0, 0\] ' "${CHECK_ERR}"; then pass "check window mismatch: named"; else fail "check window mismatch: stderr $(cat "${CHECK_ERR}")"; fi
+run_check routed-prunes "${CI_BANDS}" "${TMP}/z25/out"
+expect_rc "check routed prune mismatch" 1
+expect_check_err "check routed prune mismatch: named" "out of band holders_routed_prune_mismatches = 1 not in [0, 0] (stamps.json stage1.holders.routed_prune_mismatches_count)"
+expect_check_err "check routed prune mismatch: one failure counted" "stage1-check: 1 of ${FIGURES} figures failed"
+run_check leaf-unread "${CI_BANDS}" "${TMP}/z26/out"
+expect_rc "check routed leaf unread" 1
+expect_check_err "check routed leaf unread: named" "out of band holders_routed_leaf_unread = 1 not in [0, 0] (stamps.json stage1.holders.routed_leaf_unread_count)"
+expect_check_err "check routed leaf unread: one failure counted" "stage1-check: 1 of ${FIGURES} figures failed"
+run_check leaf-unread-unbound "${CI_BANDS}" "${TMP}/z26u/out"
+expect_rc "check routed leaf unread on a statement that is not route_bound" 0
+# Run 42495422937's figures hold every ci band; that run failed 2 of 27 figures
+# against the band file before this one.
+run_check run-42495422937 "${CI_BANDS}" "${TMP}/z27/out"
+expect_rc "check run 42495422937" 0
+if grep -qxF 'ok holders_window_mismatches = 0 in [0, 0] (stamps.json stage1.holders.window_mismatches_count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok holders_routed_prune_mismatches = 0 in [0, 0] (stamps.json stage1.holders.routed_prune_mismatches_count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok holders_routed_leaf_unread = 0 in [0, 0] (stamps.json stage1.holders.routed_leaf_unread_count)' "${CHECK_OUT}" &&
+  ! grep -qF ' routed_records_pruned_by_label_index ' "${CHECK_OUT}"; then
+  pass "check run 42495422937: the window, routed prune and leaf figures are 0, and no band asks the routed pass to prune"
+else
+  fail "check run 42495422937: stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
+fi
 
 # --- box-run.sh's band selection and check ----------------------------------------
 BOXRUN="${HERE}/../aws/box-run.sh"

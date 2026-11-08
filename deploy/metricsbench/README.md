@@ -1163,21 +1163,41 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    count; on a failed download no count runs (case z10). `stage1.holders` stamps
    the bucket, the method, `objects_listed`, `objects_above_watermark`
    (listed objects whose ingest hour is after the unrouted snapshot's
-   `watermark_hour`), `objects_l0`, `objects_l1`, `series_total`, per
-   statement `segments_in_window`, `named_in_window`, `name_pruned`,
-   `unrouted_fetched_expected`, `holders`, `route_bound` and
-   `route_bound_reason`, the skipped count, the window check and the
+   `watermark_hour`), `objects_l0`, `objects_l1`, `series_total`,
+   `min_commit_tokens`, `token_objects` (how many listed objects those
+   tokens name), `tokens_unmatched`, per statement `segments_in_window`,
+   `named_in_window`, `name_pruned`, `token_only_fetched`,
+   `unrouted_fetched_expected`, `holders`, `value_holders`,
+   `expected_routed_prunes`, `route_bound`, `route_bound_reason` and
+   `routed_pruned_by_label_index` (the distinct whole-number
+   `segmentsPrunedByLabelIndex` values of its `stage1-routed` records), the
+   skipped count, each check below with the sentence stating it, and the
    route-bound list. The window check compares the `segmentsFetched` of
    every one of a statement's `stage1-unrouted` records with its
    `unrouted_fetched_expected` (see holders.json below): one that differs is
    listed under `window_mismatches` with both figures, `named_in_window`,
-   `segments_in_window` and the fetched values (case z17); an object in the
-   window that holds none of the statement's metric, and a metric no object
-   holds (0 expected, 0 fetched), match (case z20). A statement with no such
-   record, a record with no whole-number `segmentsFetched`, or no
-   whole-number expected figure is listed under `window_unchecked` (case
-   z18), each with its count. `route_unbound` lists each statement whose
-   `route_bound` is false with its reason (case z23).
+   `segments_in_window`, `token_only_fetched` and the fetched values (case
+   z17); an object in the window that holds none of the statement's metric,
+   and a metric no object holds, match (cases z20 and z27, the second with
+   the 4 token objects run 42495422937 fetched for its absent metric). A
+   statement with no such record, a record with no whole-number
+   `segmentsFetched`, or no whole-number expected figure is listed under
+   `window_unchecked` (case z18), each with its count. For each route-bound
+   statement, the routed prune check compares the
+   `segmentsPrunedByLabelIndex` of every one of its `stage1-routed` records
+   with its `expected_routed_prunes`: one that differs is listed under
+   `routed_prune_mismatches` with both figures and `value_holders` (case
+   z25); no routed record, a record with no whole-number figure, or no
+   whole-number expectation is listed under `routed_prune_unchecked` (cases
+   z15 and the `stage1-check` failed-record case). The leaf check counts,
+   for each route-bound statement whose resolved set holds an object, its
+   `stage1-routed` records whose `keyIndex` phase shows neither an
+   `s3GetRequests` nor a `cacheHits` above 0, or that have no `keyIndex`
+   phase, under `routed_leaf_unread` (case z26); a statement whose resolved
+   set is empty is not counted, since its snapshot holds only token
+   objects, which carry no leaf (case z27). Statements that are not
+   route-bound are in neither routed check (case z26u). `route_unbound` lists
+   each statement whose `route_bound` is false with its reason (case z23).
 
 A run whose ingest verification failed, or whose steps 15 to 18 were
 skipped, runs none of them and stamps each `skipped:` and why (case z9).
@@ -1235,18 +1255,36 @@ index. `segments_in_window` is every object whose event time range overlaps
 the statement's fetch window, whatever metrics it holds; `named_in_window`
 the ones among them holding a series of one of the statement's metric
 names; `holders` the ones among those with a series matching a qualifying
-selector in full. When every selector names the same metric
-(`name_pruned`), Ravel's unrouted resolve prunes by that name's postings and
-fetches `named_in_window` objects; when the selectors name different
-metrics it does not prune by name and fetches `segments_in_window`. That
-figure is `unrouted_fetched_expected`, and the run checks it against the
-`segmentsFetched` the unrouted pass reported (step 7). ADR-3694 row 3's
-holders-to-fetched ratio takes that unrouted `segmentsFetched` as its
-denominator, not `segments_in_window`. A statement with a selector that has
-no `label="value"` matcher with a non-empty value is `route_bound` false:
-the router keeps every object holding that selector's metric, so `holders`
-is no bound on what the routed pass opens, and the statement is left out of
-every holders-versus-routed comparison. The method,
+selector in full. `holders` is the bound a series-level index would reach,
+not the label-value router's: the router reads one key8 leaf per value
+string of an object's LABEL_DICT, so it can only prune an object that lacks
+the metric name or one of the selector's value strings, and an object
+holding each value on a different series is kept. When every selector
+names the same metric (`name_pruned`), Ravel's unrouted resolve prunes by
+that name's postings and its resolved set is the `named_in_window` objects;
+when the selectors name different metrics it does not prune by name and
+the resolved set is the `segments_in_window` objects. The resolve then adds
+the L0 object each `min_commit_token` names (the query lane passes one per
+shard, the ingest report's ravel row's commit tokens) when it is not
+already in the set, whatever its metrics and event time;
+`token_only_fetched` counts those. `unrouted_fetched_expected` is the
+resolved set plus `token_only_fetched` (null when a token names no listed
+object), and the run checks it against the `segmentsFetched` the unrouted
+pass reported (step 7). ADR-3694 row 3's holders-to-fetched ratio takes
+that unrouted `segmentsFetched` as its denominator, not
+`segments_in_window`. `value_holders`, the label-value router's bound, is
+the resolved set's objects whose LABEL_DICT holds, for at least one
+selector, its metric name and every value of its `label="value"` matchers;
+`expected_routed_prunes` is the resolved set less `value_holders`
+(`named_in_window - value_holders` for one selector), and the run checks it
+against every routed record's `segmentsPrunedByLabelIndex` (step 7). The
+token objects carry no part, so the router never prunes them. On `ci` every
+object's LABEL_DICT holds every probed value, so `value_holders` equals the
+resolved set and 0 prunes are expected. A statement with a selector that
+has no `label="value"` matcher with a non-empty value is `route_bound`
+false: the router probes only that selector's metric name and keeps every
+object holding it, so the statement carries no `value_holders` and is left
+out of every comparison with the routed pass. The method,
 as `metricsbench_holders` writes it into the file and `stage1.holders.method`
 stamps it:
 
@@ -1264,19 +1302,34 @@ stamps it:
 > whatever metrics they hold, named_in_window the ones among them with a
 > series of one of the statement's metric names, and holders the ones among
 > them with a series matching a qualifying selector in full (metric name and
-> every matcher); unrouted_fetched_expected is named_in_window when every
-> selector names the same metric (Ravel's resolve then prunes by that
-> name's postings) and segments_in_window otherwise; route_bound is false
-> when a selector has no qualifying matcher, since the router then keeps
-> every object holding that selector's metric
+> every matcher), the bound of a series-level index, not of the label-value
+> router; the resolved set is named_in_window's objects when every selector
+> names the same metric (Ravel's resolve then prunes by that name's
+> postings) and segments_in_window's otherwise; token_only_fetched counts
+> the L0 objects the query lane's min_commit_token values name (matched to
+> listed keys by shard, writer, epoch and seq) outside the resolved set,
+> which the resolve adds whatever their metrics and event time;
+> unrouted_fetched_expected is the resolved set plus token_only_fetched,
+> null when a token names no listed object; value_holders, the label-value
+> router's bound, counts the resolved set's objects whose LABEL_DICT strings
+> (read with label_dict_strings, compared as text) hold, for at least one
+> selector, its metric name and every value of its label="value" matchers,
+> and expected_routed_prunes is the resolved set's size minus value_holders
+> (named_in_window - value_holders for one selector), both null unless
+> route_bound; route_bound is false when a selector has no qualifying
+> matcher, since the router then probes only that selector's metric name
 
 The file holds `method`, `profile`, `objects_l0`, `objects_l1`,
-`series_total`, `statements` (per qualifying entry: `id`, `promql`, `eval`,
-`selectors`, `positive_equalities`, `metrics`, `name_pruned`,
-`fetch_window` with `start_ns` and `end_ns`, `segments_in_window`,
-`named_in_window`, `unrouted_fetched_expected`, `holders`, `route_bound`
-and `route_bound_reason`) and `skipped` (`id` and `reason` for each entry
-that does not qualify).
+`series_total`, `min_commit_tokens` (how many tokens the ingest report's
+ravel row carries), `token_objects` (the listed keys they name),
+`tokens_unmatched` (the tokens naming no listed object), `statements` (per
+qualifying entry: `id`, `promql`, `eval`, `selectors`,
+`positive_equalities`, `metrics`, `name_pruned`, `fetch_window` with
+`start_ns` and `end_ns`, `segments_in_window`, `named_in_window`,
+`token_only_fetched`, `unrouted_fetched_expected`, `holders`,
+`value_holders`, `expected_routed_prunes`, `route_bound` and
+`route_bound_reason`) and `skipped` (`id` and `reason` for each entry that
+does not qualify).
 
 **Checking a run.** `stage1-check.sh BANDS OUT-DIR` checks a run's figures
 against a band file and is the pass/fail for a Stage 1 run.
@@ -1311,13 +1364,19 @@ ADR-3694 row 9, no entry whose status set differs between the passes and,
 in each pass, no record with a status other than `ok` or `incorrect` and no
 `ok` or `incorrect` record without a hash (an entry `incorrect` in both
 passes, a 1-ULP oracle miss, passes these); in each pass no record without
-a `segmentsPrunedByLabelIndex` figure; no unrouted record and at least one
-routed record with `segmentsPrunedByLabelIndex` above 0; in each pass a
-cold record count present, with 0 records and none short on `ci`, where no
-cold entry applies; no listed object above the watermark, no statement
-whose unrouted `segmentsFetched` differs from its
-`unrouted_fetched_expected` and no unchecked statement; and at least one
-holder for `mb_selective_job_rate_sum`, which is route-bound. Every basis is a
+a `segmentsPrunedByLabelIndex` figure; no unrouted record with
+`segmentsPrunedByLabelIndex` above 0; in each pass a cold record count
+present, with 0 records and none short on `ci`, where no cold entry
+applies; no listed object above the watermark, no statement whose unrouted
+`segmentsFetched` differs from its `unrouted_fetched_expected` and no
+unchecked statement; no route-bound statement whose routed
+`segmentsPrunedByLabelIndex` differs from its `expected_routed_prunes` and
+none unchecked; no routed record of a route-bound statement with a
+non-empty resolved set whose `keyIndex` phase read no leaf; and at least
+one holder for `mb_selective_job_rate_sum`, which is route-bound. The `ci`
+bands ask for no routed prune: on `ci` every object's LABEL_DICT holds every
+probed value, so the router can prune none (run 42495422937 pruned none and
+read the leaf, 10 and 4 cache hits on two statements). Every basis is a
 prediction until a `stage1=true` dispatch measures it.
 
 The nightly workflow's manual dispatch takes a `stage1` input (default

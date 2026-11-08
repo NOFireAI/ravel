@@ -222,11 +222,18 @@
 #               metricsbench_holders over the listed ones into
 #               <out>/holders.json, the download deleted. Stamped as
 #               stage1.holders: per statement segments_in_window,
-#               named_in_window, unrouted_fetched_expected, holders and
-#               route_bound, the method, the statements an unrouted record of
-#               which has a segmentsFetched other than
-#               unrouted_fetched_expected (or that could not be checked
-#               against it), and the statements that are not route-bound
+#               named_in_window, token_only_fetched,
+#               unrouted_fetched_expected, holders (a series-level index's
+#               bound), value_holders (the label-value router's bound),
+#               expected_routed_prunes, the routed records'
+#               segmentsPrunedByLabelIndex values and route_bound; the method;
+#               the statements an unrouted record of which has a
+#               segmentsFetched other than unrouted_fetched_expected, and the
+#               route-bound statements a routed record of which has a
+#               segmentsPrunedByLabelIndex other than expected_routed_prunes
+#               (each with those that could not be checked); the routed
+#               records of route-bound statements whose keyIndex phase shows
+#               no leaf read; and the statements that are not route-bound
 #
 # With or without MB_STAGE1, the query step's ravel_cost records carry
 # pass_label unfolded while ravel-server has published no fold gauge, else
@@ -1239,38 +1246,56 @@ elif op == "stage1-inspect":
                       "label_value_leaf_parts": sum(1 for p in per_part if p["label_value"] > 0),
                       "label_value_leaf_refs": sum(p["label_value"] for p in per_part)}))
 elif op == "stage1-holders":
-    # holders.json, the unrouted pass's diagnostics, the catalog listing the
-    # count read, the watermark hour of the snapshot the passes ran on, the
-    # bucket. Per statement, every unrouted record's segmentsFetched must
-    # equal the statement's unrouted_fetched_expected (named_in_window when
-    # its selectors name one metric, since the unrouted resolve prunes by that
-    # name's postings; segments_in_window when they name different metrics,
-    # which the resolve does not prune by name); prints the stamp. Exit 3 and
-    # why on stdout when an input cannot be read.
-    holders_path, diag_path, list_path, watermark, bucket = args
+    # holders.json, the unrouted and the routed pass's diagnostics, the
+    # catalog listing the count read, the watermark hour of the snapshot the
+    # passes ran on, the bucket. Per statement, every unrouted record's
+    # segmentsFetched must equal unrouted_fetched_expected (the objects the
+    # resolve returns plus those only a min_commit_token adds), and, for a
+    # route_bound statement, every routed record's segmentsPrunedByLabelIndex
+    # must equal expected_routed_prunes and its keyIndex phase must show a
+    # leaf read when the resolve returns an object; prints the stamp. Exit 3
+    # and why on stdout when an input cannot be read.
+    holders_path, diag_path, routed_path, list_path, watermark, bucket = args
     try:
         doc = load(holders_path)
         rows = load(diag_path)["ravel_cost"]
+        routed_rows = load(routed_path)["ravel_cost"]
         with open(list_path) as f:
             listed = [json.loads(l) for l in f.read().splitlines() if l.strip()]
         statements = doc["statements"]
-        assert isinstance(rows, list) and isinstance(statements, list)
+        assert isinstance(rows, list) and isinstance(routed_rows, list) and isinstance(statements, list)
         above = sum(1 for o in listed if o["ingest_hour_bucket"] > int(watermark))
     except (OSError, ValueError, KeyError, TypeError, AssertionError) as e:
         print(f"the holders inputs could not be read ({type(e).__name__}: {e})")
         sys.exit(3)
     def whole(v):
         return isinstance(v, int) and not isinstance(v, bool)
-    fetched = {}
-    for r in rows:
-        f = r.get("segmentsFetched")
-        fetched.setdefault(r.get("entry"), []).append(f if whole(f) else None)
+    def by_entry(records, field):
+        out = {}
+        for r in records:
+            v = r.get(field)
+            out.setdefault(r.get("entry"), []).append(v if whole(v) else None)
+        return out
+    def leaf_read(r):
+        phases = r.get("phases")
+        key_index = [p for p in phases if isinstance(p, dict) and p.get("phase") == "keyIndex"] \
+            if isinstance(phases, list) else []
+        return any((whole(p.get("s3GetRequests")) and p["s3GetRequests"] > 0)
+                   or (whole(p.get("cacheHits")) and p["cacheHits"] > 0) for p in key_index)
+    fetched = by_entry(rows, "segmentsFetched")
+    routed_pruned = by_entry(routed_rows, "segmentsPrunedByLabelIndex")
     mismatches, unchecked, per, unbound = [], [], [], []
+    prune_mismatches, prune_unchecked, leaf_unread = [], [], []
     for s in statements:
         sid, want = s.get("id"), s.get("unrouted_fetched_expected")
-        per.append({k: s.get(k) for k in ("id", "segments_in_window", "named_in_window", "name_pruned",
-                                          "unrouted_fetched_expected", "holders", "route_bound",
-                                          "route_bound_reason")})
+        resolved = s.get("named_in_window") if s.get("name_pruned") else s.get("segments_in_window")
+        seen_pruned = routed_pruned.get(sid, [])
+        row = {k: s.get(k) for k in ("id", "segments_in_window", "named_in_window", "name_pruned",
+                                     "token_only_fetched", "unrouted_fetched_expected", "holders",
+                                     "value_holders", "expected_routed_prunes", "route_bound",
+                                     "route_bound_reason")}
+        row["routed_pruned_by_label_index"] = sorted(set(v for v in seen_pruned if v is not None))
+        per.append(row)
         if s.get("route_bound") is not True:
             unbound.append({"id": sid, "reason": s.get("route_bound_reason")})
         seen = fetched.get(sid, [])
@@ -1280,16 +1305,42 @@ elif op == "stage1-holders":
             mismatches.append({"id": sid, "unrouted_fetched_expected": want,
                                "named_in_window": s.get("named_in_window"),
                                "segments_in_window": s.get("segments_in_window"),
+                               "token_only_fetched": s.get("token_only_fetched"),
                                "unrouted_fetched": sorted(set(seen))})
+        if s.get("route_bound") is not True:
+            continue
+        expected_prunes = s.get("expected_routed_prunes")
+        if not seen_pruned or None in seen_pruned or not whole(expected_prunes):
+            prune_unchecked.append(sid)
+        elif any(v != expected_prunes for v in seen_pruned):
+            prune_mismatches.append({"id": sid, "expected_routed_prunes": expected_prunes,
+                                     "value_holders": s.get("value_holders"),
+                                     "routed_pruned_by_label_index": sorted(set(seen_pruned))})
+        if whole(resolved) and resolved > 0:
+            unread = sum(1 for r in routed_rows if r.get("entry") == sid and not leaf_read(r))
+            if unread:
+                leaf_unread.append({"id": sid, "records": unread})
     print(json.dumps({"file": "holders.json", "bucket": bucket, "method": doc.get("method"),
                       "objects_listed": len(listed), "objects_above_watermark": above,
                       "objects_l0": doc.get("objects_l0"), "objects_l1": doc.get("objects_l1"),
                       "series_total": doc.get("series_total"),
+                      "min_commit_tokens": doc.get("min_commit_tokens"),
+                      "token_objects": len(doc.get("token_objects") or []),
+                      "tokens_unmatched": doc.get("tokens_unmatched"),
                       "statements": per, "skipped": len(doc.get("skipped") or []),
-                      "window_check": "segmentsFetched of every stage1-unrouted record of the statement == unrouted_fetched_expected, which is named_in_window (the objects in the window holding a series of the statement's metric) when every selector names one metric, since the unrouted resolve prunes by that name's postings, and segments_in_window (every object in the window) when the selectors name different metrics, which the resolve does not prune by name",
+                      "window_check": "segmentsFetched of every stage1-unrouted record of the statement == unrouted_fetched_expected, which is the resolved set plus token_only_fetched: the resolved set is named_in_window (the objects in the window holding a series of the statement's metric) when every selector names one metric, since the unrouted resolve prunes by that name's postings, and segments_in_window (every object in the window) when the selectors name different metrics, which the resolve does not prune by name; token_only_fetched is the listed L0 objects outside that set that a min_commit_token the query lane passed names, which the resolve adds whatever their metrics and event time; a statement with no unrouted record, a record with no whole-number segmentsFetched, or a null unrouted_fetched_expected (a token naming no listed object) is counted as unchecked instead",
                       "window_mismatches_count": len(mismatches), "window_mismatches": mismatches,
                       "window_unchecked_count": len(unchecked), "window_unchecked": unchecked,
-                      "route_bound_check": "a statement whose selectors each carry a label=\"value\" matcher with a non-empty value is route_bound; any other leaves the router keeping every object holding that selector's metric, so its holders figure is no bound on what the routed pass opens and it is left out of every holders-versus-routed comparison",
+                      "bound_check": "holders (objects in the window with a series matching a qualifying selector in full) is the bound a series-level index could reach, not the label-value router's; value_holders (objects of the resolved set whose LABEL_DICT holds, for at least one selector, its metric name and every label=\"value\" value) is the router's bound, and expected_routed_prunes is the resolved set less value_holders",
+                      "routed_prune_check": "for each route_bound statement, segmentsPrunedByLabelIndex of every stage1-routed record of the statement == expected_routed_prunes; a route_bound statement with no routed record, a record with no whole-number segmentsPrunedByLabelIndex, or a null expected_routed_prunes is counted as unchecked instead; statements that are not route_bound are not compared",
+                      "routed_prune_mismatches_count": len(prune_mismatches),
+                      "routed_prune_mismatches": prune_mismatches,
+                      "routed_prune_unchecked_count": len(prune_unchecked),
+                      "routed_prune_unchecked": prune_unchecked,
+                      "routed_leaf_check": "for each route_bound statement whose resolved set holds at least one object, the stage1-routed records whose keyIndex phase shows no leaf read (no s3GetRequests and no cacheHits, or no keyIndex phase at all); a statement whose resolved set is empty is not counted, since its snapshot holds only token objects, which carry no part and so no leaf to read",
+                      "routed_leaf_unread_count": sum(u["records"] for u in leaf_unread),
+                      "routed_leaf_unread": leaf_unread,
+                      "route_bound_check": "a statement whose selectors each carry a label=\"value\" matcher with a non-empty value is route_bound; for any other the router probes only that selector's metric name and keeps every object holding it, so it carries no value_holders and is left out of every comparison with the routed pass",
                       "route_unbound_count": len(unbound), "route_unbound": unbound}))
 else:
     print(f"unknown op {op}", file=sys.stderr)
@@ -2501,10 +2552,12 @@ stage1_compare() {
 # through the createbuckets service (each lane's own endpoint and
 # credentials), as the invoking user so the files can be deleted; the listed
 # ones counted by metricsbench_holders without the router, per statement over
-# the objects its fetch window overlaps. The download is removed after. The
-# stamp checks each unrouted record's segmentsFetched against the statement's
-# unrouted_fetched_expected, and lists the statements that are not
-# route-bound.
+# the objects its fetch window overlaps and the commit tokens the query lane
+# passed. The download is removed after. The stamp checks each unrouted
+# record's segmentsFetched against the statement's unrouted_fetched_expected,
+# each routed record of a route-bound statement's segmentsPrunedByLabelIndex
+# against its expected_routed_prunes and its keyIndex phase for a leaf read,
+# and lists the statements that are not route-bound.
 stage1_holders_step() {
   local bucket code=0 dest="${out_dir}/stage1-objects" hours line
   local list_file="${out_dir}/stage1-objects.jsonl"
@@ -2552,7 +2605,7 @@ stage1_holders_step() {
   fi
   code=0
   line="$(py stage1-holders "${out_dir}/holders.json" "${out_dir}/stage1-unrouted/diagnostics.json" \
-    "$list_file" "$(py get "$STAMPS" stage1.unrouted_catalog.watermark_hour)" "$bucket")" || code=$?
+    "${out_dir}/stage1-routed/diagnostics.json" "$list_file" "$(py get "$STAMPS" stage1.unrouted_catalog.watermark_hour)" "$bucket")" || code=$?
   if [ "$code" -ne 0 ]; then
     stamp_str stage1.holders "failed: ${line:-stage1-holders exited $code}"
     fail_step stage1-holders "${line:-stage1-holders exited $code}"

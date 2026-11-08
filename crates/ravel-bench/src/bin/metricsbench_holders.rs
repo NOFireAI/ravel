@@ -8,26 +8,33 @@
 //! with a positive equality matcher, the objects whose time range overlaps
 //! the statement's fetch window on the run's query grid, how many of those
 //! hold a series of one of its metrics (what an unrouted resolve fetches
-//! when every selector names one metric), and how many hold at least one
-//! matching series. The window and counting rules
-//! and the method statement live in [`ravel_bench::metrics_holders`]; no
-//! router or key index is involved.
+//! when every selector names one metric), how many hold at least one
+//! matching series (a series-level index's bound), how many listed objects
+//! the ingest report's ravel row's commit tokens add to an unrouted fetch
+//! (the `min_commit_token` values the query lane passes, one per shard), and
+//! how many of the resolved objects' LABEL_DICTs hold the statement's values
+//! (the label-value router's bound). The window and counting rules and the
+//! method statement live in [`ravel_bench::metrics_holders`]; no router or
+//! key index is involved.
 //!
-//! Exit codes: 0 the report was written; 65 the list names no object, or the
-//! ingest report does not bind to the workload; 66 an input is unreadable, a
-//! list line does not parse, or a listed object is missing or does not
-//! decode, and no report is written; 74 the report could not be written.
+//! Exit codes: 0 the report was written; 65 the list names no object, the
+//! ingest report does not bind to the workload, or it has no ravel row or no
+//! commit token on it; 66 an input is unreadable, a list line or a commit
+//! token does not parse, or a listed object is missing or does not decode,
+//! and no report is written; 74 the report could not be written.
 
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
+use ravel_bench::metrics_correctness::Engine;
 use ravel_bench::metrics_holders::{HoldersError, ListedObject, count_holders};
 use ravel_bench::metrics_ingest::MetricsIngestReport;
-use ravel_bench::metrics_query::run_grid;
+use ravel_bench::metrics_query::{min_commit_tokens, run_grid, system_name};
 use ravel_bench::metrics_workload::load_workload;
 use ravel_bench::promql_corpus::load_corpus;
+use ravel_types::CommitToken;
 
 #[derive(Parser, Debug)]
 #[command(about = "Count, per corpus statement, the data objects holding a matching series")]
@@ -93,6 +100,24 @@ fn main() -> ExitCode {
         Ok(bound) => bound,
         Err(e) => return fail(65, e.to_string()),
     };
+    let system = system_name(Engine::Ravel);
+    let Some(row) = ingest.row(system) else {
+        return fail(65, format!("the ingest report has no `{system}` row"));
+    };
+    let encoded = min_commit_tokens(row);
+    if encoded.is_empty() {
+        return fail(
+            65,
+            format!("the ingest report's `{system}` row has no commit token"),
+        );
+    }
+    let mut tokens = Vec::with_capacity(encoded.len());
+    for text in &encoded {
+        match CommitToken::decode(text.trim()) {
+            Ok(token) => tokens.push(token),
+            Err(e) => return fail(66, format!("commit token {text:?}: {e}")),
+        }
+    }
     let list_text = match fs::read_to_string(&args.objects_list) {
         Ok(text) => text,
         Err(e) => return fail(66, format!("{}: {e}", args.objects_list.display())),
@@ -128,7 +153,7 @@ fn main() -> ExitCode {
             }),
         }
     });
-    let report = match count_holders(&corpus, &run.profile, &grid, objects) {
+    let report = match count_holders(&corpus, &run.profile, &grid, &tokens, objects) {
         Ok(report) => report,
         Err(e) => return fail(66, e.to_string()),
     };
@@ -140,12 +165,15 @@ fn main() -> ExitCode {
         return fail(74, format!("{}: {e}", args.out.display()));
     }
     println!(
-        "metricsbench_holders: {} statements counted, {} skipped, over {} L0 and {} L1 objects ({} series)",
+        "metricsbench_holders: {} statements counted, {} skipped, over {} L0 and {} L1 objects ({} series); {} commit tokens name {} objects, {} unmatched",
         report.statements.len(),
         report.skipped.len(),
         report.objects_l0,
         report.objects_l1,
-        report.series_total
+        report.series_total,
+        report.min_commit_tokens,
+        report.token_objects.len(),
+        report.tokens_unmatched.len()
     );
     ExitCode::SUCCESS
 }
