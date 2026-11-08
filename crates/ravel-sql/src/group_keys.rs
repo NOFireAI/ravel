@@ -863,9 +863,11 @@ pub(crate) fn group_key_as_view(
 /// the keys, a 16 B copy per row with no string read. Any other input, a
 /// memo with no views, or one whose fill the view budget refuses takes
 /// arrow's cast, which this wraps and displays as, so a plan's EXPLAIN text
-/// is the cast's (`the_view_memo_plan_explains_as_the_cast`). The output is
-/// the cast's views, buffers and null buffer
-/// (`prop_group_key_views_equal_the_cast`).
+/// is the cast's (`the_view_memo_plan_explains_as_the_cast`). Under keys with
+/// no NULL the output is the cast's views, buffers and null buffer; at a NULL
+/// key it carries the cast's null bit, while the view under that bit, which
+/// arrow leaves unspecified, may differ from the cast's zero view (decision 8;
+/// `prop_group_key_views_equal_the_cast`).
 #[derive(Debug, Eq)]
 struct GroupKeyViews {
     cast: CastExpr,
@@ -968,42 +970,7 @@ fn memo_views(array: &ArrayRef) -> DFResult<Option<ArrayRef>> {
     if identity {
         return Ok(Some(Arc::new(views)));
     }
-    // The cast leaves no null buffer under keys whose null buffer has no NULL;
-    // `take` would keep it.
-    let gathered = if keys.nulls().is_some() && keys.null_count() == 0 {
-        let keys = datafusion::arrow::array::Int32Array::new(keys.values().clone(), None);
-        datafusion::arrow::compute::take(&views, &keys, None)?
-    } else {
-        datafusion::arrow::compute::take(&views, keys, None)?
-    };
-    zero_null_views(gathered).map(Some)
-}
-
-/// `array` with a zero view (the empty inline string) at every NULL slot, as
-/// arrow's cast writes there; `take` copies the indexed view instead. An array
-/// with no NULL row comes back as it is.
-fn zero_null_views(array: ArrayRef) -> DFResult<ArrayRef> {
-    use datafusion::arrow::array::StringViewArray;
-    use datafusion::arrow::buffer::ScalarBuffer;
-
-    let Some(gathered) = array.as_any().downcast_ref::<StringViewArray>() else {
-        return Ok(array);
-    };
-    let Some(nulls) = gathered.nulls().filter(|n| n.null_count() > 0) else {
-        return Ok(array);
-    };
-    let mut views = gathered.views().to_vec();
-    for (view, valid) in views.iter_mut().zip(nulls.iter()) {
-        if !valid {
-            *view = 0;
-        }
-    }
-    let zeroed = StringViewArray::try_new(
-        ScalarBuffer::from(views),
-        gathered.data_buffers().to_vec(),
-        Some(nulls.clone()),
-    )?;
-    Ok(Arc::new(zeroed))
+    Ok(Some(datafusion::arrow::compute::take(&views, keys, None)?))
 }
 
 /// A dictionary-string group key with every key whose dictionary entry is NULL

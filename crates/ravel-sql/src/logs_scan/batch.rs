@@ -6898,6 +6898,39 @@ mod tests {
                 Ok(())
             }
 
+            /// `got` reads as the cast `want` under ADR-3326's view memo
+            /// amendment, decision 8: each row's null bit (`is_null`, so a
+            /// null buffer with no NULL in it reads as none), each non-NULL
+            /// row's value and view, and the null count are equal. The view
+            /// under a NULL slot is not compared.
+            fn read_as_the_cast(got: &ArrayRef, want: &ArrayRef) -> Result<(), String> {
+                let (g, w) = (got.as_string_view(), want.as_string_view());
+                if g.len() != w.len() {
+                    return Err(format!("{} rows, the cast has {}", g.len(), w.len()));
+                }
+                for r in 0..g.len() {
+                    if g.is_null(r) != w.is_null(r) {
+                        return Err(format!("row {r}: null bit differs"));
+                    }
+                    if w.is_valid(r) {
+                        if g.value(r) != w.value(r) {
+                            return Err(format!("row {r}: value differs"));
+                        }
+                        if g.views()[r] != w.views()[r] {
+                            return Err(format!("row {r}: view differs"));
+                        }
+                    }
+                }
+                if g.null_count() != w.null_count() {
+                    return Err(format!(
+                        "null_count {}, the cast's {}",
+                        g.null_count(),
+                        w.null_count()
+                    ));
+                }
+                Ok(())
+            }
+
             /// Each row's value, `None` for a NULL row.
             fn logical(array: &ArrayRef) -> Vec<Option<String>> {
                 let a = array.as_string_view();
@@ -7021,8 +7054,10 @@ mod tests {
                 /// off, the group key equals arrow's cast of the same input
                 /// on views, data buffers and null buffer; and so do permuted
                 /// full-length keys over the memo and a values array sliced
-                /// from it, neither of which may take the memo as it is; and
-                /// so does each batch's keys with a quarter of them NULL.
+                /// from it, neither of which may take the memo as it is. Each
+                /// batch's keys under a null buffer with a quarter of them
+                /// NULL read as the cast under decision 8
+                /// ([`read_as_the_cast`]).
                 /// [`t1_covers_one_and_two_rows`] runs the 1- and 2-row cases
                 /// every time.
                 #[test]
@@ -7115,9 +7150,9 @@ mod tests {
                         );
                         let got = group_key(&nulled, true);
                         prop_assert!(
-                            identical(&got, &group_key(&nulled, false)).is_ok(),
+                            read_as_the_cast(&got, &group_key(&nulled, false)).is_ok(),
                             "null keys: {:?}",
-                            identical(&got, &group_key(&nulled, false))
+                            read_as_the_cast(&got, &group_key(&nulled, false))
                         );
                         let views = view_registry::views_of(&memo);
                         prop_assert!(views.is_some(), "the memo serves its own values");
@@ -7328,14 +7363,13 @@ mod tests {
                 Int32Array::new(values.into(), Some(nulls))
             }
 
-            /// ADR-3326, view memo amendment, T1 with NULL keys: keys exactly
-            /// `0..12` with rows 0 and 5 NULL (their key values still 0 and
-            /// 5) over a served, filled memo equal the cast on views, data
-            /// buffers and null buffer, the memo serving them (one view
-            /// fill); 2 rows are NULL and a session `GROUP BY` puts both in
-            /// the NULL group.
+            /// ADR-3326, view memo amendment, decision 8: keys exactly `0..12`
+            /// with rows 0 and 5 NULL (their key values still 0 and 5) over a
+            /// served, filled memo read as the cast ([`read_as_the_cast`]),
+            /// the memo serving them (one view fill); 2 rows are NULL and a
+            /// session `GROUP BY` puts both in the NULL group.
             #[tokio::test]
-            async fn identity_keys_under_a_null_buffer_equal_the_cast() {
+            async fn identity_keys_under_a_null_buffer_read_as_the_cast() {
                 let budget = Arc::new(MemoryBudget::new(LIMIT));
                 let (_, _, _, _cache, p) = filled(&budget, VIEW_BUDGET);
                 let batch = &p.batches[0];
@@ -7346,17 +7380,20 @@ mod tests {
                 assert_eq!(p.counters.view_snapshot().fills, 0, "not filled yet");
                 let got = group_key(&nulled, true);
                 assert_eq!(p.counters.view_snapshot().fills, 1, "the memo served");
+                read_as_the_cast(&got, &group_key(&nulled, false))
+                    .unwrap_or_else(|e| panic!("{e}"));
                 assert_eq!(got.null_count(), 2, "the keys' null buffer");
-                identical(&got, &group_key(&nulled, false)).unwrap_or_else(|e| panic!("{e}"));
+                assert!(got.is_null(0) && got.is_null(5));
                 assert_eq!(null_group_count(nulled).await, 2);
             }
 
-            /// ADR-3326, view memo amendment, T1 with NULL keys: shuffled and
+            /// ADR-3326, view memo amendment, decision 8: shuffled and
             /// repeated keys with NULL slots (keys 7, 2 and 4 under them; 3
-            /// NULL rows of 12, then 2 of 7) over a served, filled memo equal
-            /// the cast on views, data buffers and null buffer.
-            #[test]
-            fn non_identity_null_keys_equal_the_cast() {
+            /// NULL rows of 12, then 2 of 7) over a served, filled memo read
+            /// as the cast ([`read_as_the_cast`]), and a session `GROUP BY`
+            /// puts the NULL rows in the NULL group.
+            #[tokio::test]
+            async fn non_identity_null_keys_read_as_the_cast() {
                 let budget = Arc::new(MemoryBudget::new(LIMIT));
                 let (_, _, _, _cache, p) = filled(&budget, VIEW_BUDGET);
                 let batch = &p.batches[0];
@@ -7376,9 +7413,10 @@ mod tests {
                 for (keys, nulls) in cases {
                     let nulled = rekeyed(batch, keys);
                     let got = group_key(&nulled, true);
-                    identical(&got, &group_key(&nulled, false))
+                    read_as_the_cast(&got, &group_key(&nulled, false))
                         .unwrap_or_else(|e| panic!("{nulls} NULL rows: {e}"));
                     assert_eq!(got.null_count(), nulls);
+                    assert_eq!(null_group_count(nulled).await, nulls as i64);
                 }
                 assert_eq!(p.counters.view_snapshot().fills, 1, "the memo served");
             }

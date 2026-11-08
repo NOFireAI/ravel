@@ -6810,10 +6810,15 @@ When a batch's dictionary values are the values array a cached plain-page
 column keeps, the same offsets and values buffers with no null buffer on
 either side, it takes that column's views instead of building them: the
 views array itself when the keys are `0..n` with no null buffer, and a
-16-byte gather per row by the keys otherwise. The output has the cast's
-views, data buffers and null buffer, narrowed by a filter or not
-(`prop_group_key_views_equal_the_cast`,
-`the_group_key_takes_the_memos_views_on_a_served_block`). Every other input,
+16-byte gather per row by the keys otherwise. Under keys with no null buffer
+the output has the cast's views, data buffers and null buffer, narrowed by a
+filter or not (`prop_group_key_views_equal_the_cast`,
+`the_group_key_takes_the_memos_views_on_a_served_block`). Under keys with a
+null buffer it has the cast's null bit on every row and the cast's value and
+view on every non-NULL row; the view under a NULL slot, which arrow leaves
+unspecified, can differ from the cast's
+(`identity_keys_under_a_null_buffer_read_as_the_cast`,
+`non_identity_null_keys_read_as_the_cast`). Every other input,
 a dictionary page, a copy or slice of a cached array, and a column with a
 NULL entry included, takes the cast (same tests,
 `the_registry_serves_a_memo_only_its_own_buffers`,
