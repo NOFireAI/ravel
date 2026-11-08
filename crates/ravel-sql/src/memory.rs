@@ -4588,6 +4588,9 @@ pub(crate) mod tests {
             let message = exhausted_message(
                 result.expect_err("a 687-byte delta does not fit the process's last 598"),
             );
+            for leaked in ["777", "313", "2001", "1403", "687"] {
+                assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+            }
             assert_eq!(
                 message,
                 format!(
@@ -4597,9 +4600,6 @@ pub(crate) mod tests {
                      this query's aggregate envelope 0 bytes"
                 )
             );
-            for leaked in ["777", "313", "2001", "1403", "687"] {
-                assert!(!message.contains(leaked), "{leaked} leaked: {message}");
-            }
             assert_eq!(pool_a.refused(), headroom.is_none());
 
             assert_eq!(events.len(), 1, "{events:?}");
@@ -4625,9 +4625,10 @@ pub(crate) mod tests {
 
     /// Issue #3910: the refusal does not report the tenant's reserved bytes
     /// either. Pool B, a second query of A's own tenant, holds a 555-byte
-    /// join and a 222-byte aggregate envelope, so the tenant holds 999 bytes
-    /// before A's aggregate asks 1000 on a 1500-byte process budget; none of
-    /// B's figures and not the tenant's total reaches A's text.
+    /// join and a 222-byte aggregate, so the tenant has 777 bytes reserved and
+    /// the process 999 (the envelope on top) before A's aggregate asks 1000
+    /// on a 1500-byte process budget and its envelope needs 778 more. None of
+    /// those figures reaches A's text.
     #[test]
     fn a_reserve_ahead_refusal_omits_the_tenants_other_queries() {
         let _serial = envelope_tests();
@@ -4648,6 +4649,9 @@ pub(crate) mod tests {
                 .try_grow(1000)
                 .expect_err("a 778-byte delta does not fit the process's last 501"),
         );
+        for leaked in ["555", "222", "777", "999", "778", "1500"] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
         assert_eq!(
             message,
             "aggregate reserve-ahead refused: the process has no room for this aggregate's \
@@ -4655,9 +4659,6 @@ pub(crate) mod tests {
              1000 bytes asked); top holders: none; non-spillable consumers hold 0 bytes; this \
              query's aggregate envelope 0 bytes"
         );
-        for leaked in ["555", "222", "777", "999", "778", "1500"] {
-            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
-        }
     }
 
     /// Issue #3899: `refused` is set by each of the four kinds of memory
