@@ -2243,9 +2243,10 @@ struct ScratchArgs {
     /// The level-1 worker count of a two-level RLOG merge (ADR-3853 D4): how
     /// many level-1 groups of one bucket merge at once, each under its share
     /// of the unit's memory ceiling. Omitted, it is derived per bucket from
-    /// the bucket's share of the usable cores (the usable cores divided by
-    /// compact-tenant's --bucket-concurrency, at least 1) and the largest
-    /// count whose groups still fit. Zero, or a value without --scratch-dir,
+    /// the bucket's share of the usable cores and the largest count whose
+    /// groups still fit. compact-bucket's share is all usable cores;
+    /// compact-tenant's is the usable cores divided by --bucket-concurrency,
+    /// at least 1. Zero, or a value without --scratch-dir,
     /// is refused before any store call.
     #[arg(long = "level1-workers", value_name = "N")]
     level1_workers: Option<usize>,
