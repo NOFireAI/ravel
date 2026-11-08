@@ -1132,14 +1132,15 @@ probe gives, whatever order the reads complete in: the first slice in
 slice order whose run fails to read or decode, or whose decode
 reservation is refused, decides; failing that, the stopping slice
 decides; failing that, the part answers. With 16 parts probed at once, one
-statement holds at most 256 leaf reads in flight. The logs and spans
-fetchers' leaf readers take each read under the fetch reservation and the
-GET limiter, and a slice's GET 1 bytes, with their reservation, are held
-until that slice finishes decoding. The fetch reservation refuses at once
-rather than waiting, so under memory pressure, with up to 16 reads of a
-part asking at once, some parts' leaf reads are refused and those parts
-go to tier 1: the logs fetcher counts them as refused reservations, the
-spans fetcher as rejected leaves. The rows the lookup returns are the
+routing pass holds at most 256 leaf reads in flight; the metrics
+`label_value` route runs up to `promql_fetch_fanout` passes at once, one
+per distinct value. The logs, spans and metrics fetchers' leaf readers
+take each read under the fetch reservation and the GET limiter, and a
+slice's GET 1 bytes, with their reservation, are held until that slice
+finishes decoding. The fetch reservation refuses at once rather than
+waiting, so under memory pressure, with up to 16 reads of a part asking
+at once, some parts' leaf reads are refused and those parts go to tier 1,
+each counted as a refused reservation. The rows the lookup returns are the
 same either way. A part that answers reads exactly the bytes a
 one-at-a-time probe would. A part the stopping slice decides, or a breach
 fails, has also read GET 1 of every slice after it. A part a run decides has also read
