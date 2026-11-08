@@ -3763,7 +3763,8 @@ mod tests {
     //!
     //! `RlogWriter` only writes valid UTF-8 `Str` cells, so every fixture here
     //! is a writer-produced object whose one block is rewritten with the cells
-    //! a test names, through the writer's own `write_block` and block layout.
+    //! a test names, through the writer's own `write_block_with` and block
+    //! layout.
 
     use super::columnar_lookup_tests::{declared_cells, sid};
     use super::*;
@@ -3771,7 +3772,7 @@ mod tests {
     use proptest::prelude::*;
     use proptest::strategy::ValueTree;
     use proptest::test_runner::TestRunner;
-    use ravel_logseg::block::{ColumnPlan, write_block};
+    use ravel_logseg::block::{ColumnPlan, PageChoice, write_block_with};
     use ravel_logseg::decoded_cache::{
         DecodedCacheAttach, DecodedCacheCounters, DecodedCacheSnapshot, DecodedColumnCache,
     };
@@ -3854,7 +3855,8 @@ mod tests {
     /// setting the key at every type in `block.types`), then the block itself is
     /// replaced with `block.rows` verbatim, non-UTF-8 `Str` cells included. A
     /// block of fewer rows than [`STREAMS`] still gets one seed record per
-    /// stream, and the footer's record count and time bounds are its own.
+    /// stream, and the footer's record count and time bounds are its own. The
+    /// rewritten block's pages are picked as `cfg.page_choice` says.
     fn encode(block: &Block, cfg: &RlogConfig) -> Vec<u8> {
         let seeds = block.rows.len().max(STREAMS);
         let stream_attrs = |s: usize| {
@@ -3936,7 +3938,8 @@ mod tests {
             })
             .collect();
         let plans: Vec<ColumnPlan> = plans.into_iter().map(|(_, p)| p).collect();
-        let written = write_block(&rows, &plans, cfg.zstd_level).expect("write one block");
+        let written = write_block_with(&rows, &plans, cfg.zstd_level, cfg.page_choice)
+            .expect("write one block");
         let mut layout = BlocksBuilder::version_4(cfg.group_target_blocks);
         layout.push(written);
         let (blocks_bytes, l0, page_dir) = layout.finish();
@@ -6976,21 +6979,36 @@ mod tests {
             }
 
             /// An object of one plain block of `rows` rows whose row `r`
-            /// reads `value(r)`, every row present.
+            /// reads `value(r)`, every row present. The page is written under
+            /// [`PageChoice::Estimated`], which picks plain whenever more than
+            /// half the values are distinct, so `value` must give that;
+            /// `cfg.page_choice` is not used.
             fn plain_object(
                 rows: usize,
                 value: impl Fn(usize) -> String,
                 cfg: &RlogConfig,
             ) -> (Block, Vec<u8>) {
+                let values: Vec<String> = (0..rows).map(value).collect();
+                let distinct: std::collections::HashSet<&String> = values.iter().collect();
+                assert!(
+                    distinct.len() * 2 > rows,
+                    "{} distinct values of {rows} rows do not make a plain page",
+                    distinct.len()
+                );
                 let block = fixed_block(
                     &[FieldType::Str],
-                    (0..rows)
-                        .map(|r| vec![str_value(value(r).as_bytes())])
+                    values
+                        .iter()
+                        .map(|v| vec![str_value(v.as_bytes())])
                         .collect(),
                     0,
                     rows - 1,
                 );
-                let obj = encode(&block, cfg);
+                let cfg = RlogConfig {
+                    page_choice: PageChoice::Estimated,
+                    ..*cfg
+                };
+                let obj = encode(&block, &cfg);
                 (block, obj)
             }
 
