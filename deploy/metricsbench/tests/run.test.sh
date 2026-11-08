@@ -289,10 +289,19 @@
 #                                       z23: a statement not route-bound is
 #                                       listed; z24: a parts_rebuilt that is
 #                                       not a whole number refuses the routed
-#                                       pass; z27a-f: an inspect stamp not
-#                                       written, a leaf part count not read
+#                                       pass; z25: a routed prune count that
+#                                       is not the expected one is a
+#                                       mismatch; z26: a route-bound routed
+#                                       record that read no leaf is counted,
+#                                       z26u: one not route-bound is not;
+#                                       z27: the figures of nightly run
+#                                       42495422937 check clean; z28a-f: an
+#                                       inspect stamp not written, a leaf part
+#                                       count not read back or not a whole
+#                                       number refuses each pass; z29a-d: a
+#                                       watermark or parts figure not read
 #                                       back or not a whole number refuses
-#                                       each pass. stage1-check.sh: the ci
+#                                       the pass. stage1-check.sh: the ci
 #                                       band file clean on z1, z20 and z21,
 #                                       out of band on z2, z2b, z15, z16, z17
 #                                       and z22, a
@@ -2668,32 +2677,51 @@ expect_rc z24 70
 check "z24: stage1-routed named, the refusal names the figure" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.leaves.parts_rebuilt is '"'"'None'"'"', not a whole number"'
 expect_no_log "z24: no routed pass" "--pass-label folded-routed"
 
-# z27: an inspect stamp that was not written, or whose label_value leaf part
+# z28: an inspect stamp that was not written, or whose label_value leaf part
 # count cannot be read back as a whole number, refuses the pass it gates.
-MB_STAGE1=1 STUB_PY_OP=set STUB_PY_KEY=stage1.unrouted_catalog run_stage1 z27a ci
-expect_rc z27a 70
-check "z27a: stage1-unrouted named, the refusal names the unwritten stamp" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog could not be stamped (py set exited 1)"'
-expect_no_log "z27a: no unrouted pass" "--pass-label folded-unrouted"
-MB_STAGE1=1 STUB_PY_OP=set STUB_PY_KEY=stage1.routed_catalog run_stage1 z27b ci
-expect_rc z27b 70
-check "z27b: stage1-routed named, the refusal names the unwritten stamp" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog could not be stamped (py set exited 1)"'
-expect_no_log "z27b: no routed pass" "--pass-label folded-routed"
-MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.label_value_leaf_parts run_stage1 z27c ci
-expect_rc z27c 70
-check "z27c: stage1-unrouted named, the refusal names the unread figure" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.label_value_leaf_parts could not be read (py get exited 1)"'
-expect_no_log "z27c: no unrouted pass" "--pass-label folded-unrouted"
-MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.label_value_leaf_parts run_stage1 z27d ci
-expect_rc z27d 70
-check "z27d: stage1-routed named, the refusal names the unread figure" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.label_value_leaf_parts could not be read (py get exited 1)"'
-expect_no_log "z27d: no routed pass" "--pass-label folded-routed"
-MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.label_value_leaf_parts STUB_PY_PRINT=None run_stage1 z27e ci
-expect_rc z27e 70
-check "z27e: stage1-unrouted named, the refusal names the figure that is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.label_value_leaf_parts is '"'"'None'"'"', not a whole number"'
-expect_no_log "z27e: no unrouted pass" "--pass-label folded-unrouted"
-MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.label_value_leaf_parts STUB_PY_PRINT=None run_stage1 z27f ci
-expect_rc z27f 70
-check "z27f: stage1-routed named, the refusal names the figure that is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.label_value_leaf_parts is '"'"'None'"'"', not a whole number"'
-expect_no_log "z27f: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=set STUB_PY_KEY=stage1.unrouted_catalog run_stage1 z28a ci
+expect_rc z28a 70
+check "z28a: stage1-unrouted named, the refusal names the unwritten stamp" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog could not be stamped (py set exited 1)"'
+expect_no_log "z28a: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=set STUB_PY_KEY=stage1.routed_catalog run_stage1 z28b ci
+expect_rc z28b 70
+check "z28b: stage1-routed named, the refusal names the unwritten stamp" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog could not be stamped (py set exited 1)"'
+expect_no_log "z28b: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.label_value_leaf_parts run_stage1 z28c ci
+expect_rc z28c 70
+check "z28c: stage1-unrouted named, the refusal names the unread figure" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.label_value_leaf_parts could not be read (py get exited 1)"'
+expect_no_log "z28c: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.label_value_leaf_parts run_stage1 z28d ci
+expect_rc z28d 70
+check "z28d: stage1-routed named, the refusal names the unread figure" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.label_value_leaf_parts could not be read (py get exited 1)"'
+expect_no_log "z28d: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.label_value_leaf_parts STUB_PY_PRINT=None run_stage1 z28e ci
+expect_rc z28e 70
+check "z28e: stage1-unrouted named, the refusal names the figure that is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.label_value_leaf_parts is '"'"'None'"'"', not a whole number"'
+expect_no_log "z28e: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.label_value_leaf_parts STUB_PY_PRINT=None run_stage1 z28f ci
+expect_rc z28f 70
+check "z28f: stage1-routed named, the refusal names the figure that is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.label_value_leaf_parts is '"'"'None'"'"', not a whole number"'
+expect_no_log "z28f: no routed pass" "--pass-label folded-routed"
+
+# z29: a watermark or parts figure the fold state names that cannot be read
+# back as a whole number refuses the pass, as the leaf part count does.
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.watermark_hour run_stage1 z29a ci
+expect_rc z29a 70
+check "z29a: stage1-unrouted named, the refusal names the unread watermark" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.watermark_hour could not be read (py get exited 1)"'
+expect_no_log "z29a: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.parts run_stage1 z29b ci
+expect_rc z29b 70
+check "z29b: stage1-routed named, the refusal names the unread parts count" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.parts could not be read (py get exited 1)"'
+expect_no_log "z29b: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.watermark_hour STUB_PY_PRINT=None run_stage1 z29c ci
+expect_rc z29c 70
+check "z29c: stage1-routed named, the watermark is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.watermark_hour is '"'"'None'"'"', not a whole number"'
+expect_no_log "z29c: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.parts STUB_PY_PRINT=None run_stage1 z29d ci
+expect_rc z29d 70
+check "z29d: stage1-unrouted named, the parts count is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.parts is '"'"'None'"'"', not a whole number"'
+expect_no_log "z29d: no unrouted pass" "--pass-label folded-unrouted"
 
 # z25: a routed segmentsPrunedByLabelIndex that is not expected_routed_prunes is a mismatch.
 MB_STAGE1=1 STUB_HOLDERS_PRUNES_OFF=mb_selective_job_rate_sum run_stage1 z25 ci
@@ -2831,8 +2859,8 @@ run_check dup "${TMP}/check-dup-bands.json" "${TMP}/check-dup"
 expect_rc "check duplicated" 1
 expect_check_err "check duplicated: a selector matching two elements" "duplicated holders_selective_job_rate_sum: 2 elements of statements have id=mb_selective_job_rate_sum (holders.json statements[id=mb_selective_job_rate_sum].holders)"
 expect_check_err "check duplicated: a key twice in its object" "duplicated entries_compared: entries_compared occurs more than once in the top level (stage1-compare.json entries_compared)"
-expect_check_err "check duplicated: a figure the band file names twice, each time" "duplicated leaves_parts_rebuilt: the band file names it 2 times (stamps.json stage1.leaves.parts_rebuilt)"
-if [ "$(grep -c '^duplicated leaves_parts_rebuilt: ' "${CHECK_ERR}")" -eq 2 ]; then pass "check duplicated: both copies of the figure reported"; else fail "check duplicated: leaves_parts_rebuilt reported $(grep -c '^duplicated leaves_parts_rebuilt: ' "${CHECK_ERR}") times"; fi
+expect_check_err "check duplicated: a figure the band file names twice" "duplicated leaves_parts_rebuilt: the band file names it 2 times (stamps.json stage1.leaves.parts_rebuilt)"
+if [ "$(grep -c '^duplicated leaves_parts_rebuilt: ' "${CHECK_ERR}")" -eq 1 ]; then pass "check duplicated: the figure reported once, not once per copy"; else fail "check duplicated: leaves_parts_rebuilt reported $(grep -c '^duplicated leaves_parts_rebuilt: ' "${CHECK_ERR}") times"; fi
 
 # Not finite: a NaN figure is out of band, a NaN bound refuses the band file.
 cp -R "${TMP}/z1/out" "${TMP}/check-nan"

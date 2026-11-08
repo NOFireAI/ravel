@@ -1357,8 +1357,20 @@ else:
     sys.exit(2)
 PY
 
+# PYLIB is imported as a module from a private directory, so its bytecode is
+# compiled once per run instead of once per call.
+PYLIB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/metricsbench-pylib.XXXXXX")" || {
+  echo "metricsbench-run: cannot create a directory for the python helpers" >&2
+  exit 70
+}
+trap 'rm -rf "$PYLIB_DIR"' EXIT
+printf '%s\n' "$PYLIB" >"${PYLIB_DIR}/mbpylib.py" || {
+  echo "metricsbench-run: cannot write ${PYLIB_DIR}/mbpylib.py" >&2
+  exit 70
+}
+
 py() {
-  python3 -I -c "$PYLIB" "$@"
+  MB_PYLIB_DIR="$PYLIB_DIR" python3 -I -c 'import os, sys; sys.path.insert(0, os.environ["MB_PYLIB_DIR"]); import mbpylib' "$@"
 }
 
 stamp_set() { py set "$STAMPS" "$1" "$2"; }
@@ -1865,6 +1877,7 @@ on_exit() {
   else
     stamp_str status failed
   fi
+  rm -rf "$PYLIB_DIR"
   exit "$code"
 }
 trap on_exit EXIT
@@ -2440,11 +2453,29 @@ stage1_recreate() {
   stamp_str "$key" "recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='$3', then ravel answered 200 on /api/v1/status/buildinfo"
 }
 
+# stage1_whole_figure WHICH PATH: the stamp at PATH read back into
+# STAGE1_FIGURE. When it cannot be read, or is not a whole number, the stamp
+# stage1.WHICH says so and step stage1-WHICH fails, since the pass it gates
+# cannot check its snapshot.
+stage1_whole_figure() {
+  local which="$1" path="$2" code=0
+  STAGE1_FIGURE="$(py get "$STAMPS" "$path")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str "stage1.${which}" "refused: ${path} could not be read (py get exited ${code})"
+    fail_step "stage1-${which}" "refused: ${path} could not be read (py get exited ${code}), so the ${which} pass's snapshot cannot be checked"
+  fi
+  if ! [[ "$STAGE1_FIGURE" =~ ^[0-9]+$ ]]; then
+    stamp_str "stage1.${which}" "refused: ${path} is '${STAGE1_FIGURE}', not a whole number"
+    fail_step "stage1-${which}" "refused: ${path} is '${STAGE1_FIGURE}', not a whole number, so the ${which} pass's snapshot cannot be checked"
+  fi
+}
+
 # stage1_catalog_state unrouted|routed: the snapshot the pass is about to
 # read, from ravel-cli catalog inspect on ravel-qualify, stamped as
 # stage1.WHICH_catalog. The pass is refused (its step fails) when the text
 # cannot be read, when the stamp cannot be written or its
-# label_value_leaf_parts read back as a whole number, when the unrouted pass would run with any part carrying a
+# label_value_leaf_parts, watermark_hour or parts read back as a whole
+# number, when the unrouted pass would run with any part carrying a
 # label_value leaf, or when the routed pass would run with fewer such parts
 # than stage1-leaves reported rebuilt (parts_rebuilt).
 stage1_catalog_state() {
@@ -2472,29 +2503,20 @@ stage1_catalog_state() {
     stamp_str "stage1.${which}" "refused: ${key} could not be stamped (py set exited ${code})"
     fail_step "$step" "refused: the snapshot state could not be stamped as ${key} (py set exited ${code})"
   fi
-  code=0
-  STAGE1_LEAF_PARTS="$(py get "$STAMPS" "${key}.label_value_leaf_parts")" || code=$?
-  if [ "$code" -ne 0 ]; then
-    stamp_str "stage1.${which}" "refused: ${key}.label_value_leaf_parts could not be read (py get exited ${code})"
-    fail_step "$step" "refused: ${key}.label_value_leaf_parts could not be read (py get exited ${code}), so the ${which} pass's snapshot cannot be checked"
-  fi
-  if ! [[ "$STAGE1_LEAF_PARTS" =~ ^[0-9]+$ ]]; then
-    stamp_str "stage1.${which}" "refused: ${key}.label_value_leaf_parts is '${STAGE1_LEAF_PARTS}', not a whole number"
-    fail_step "$step" "refused: ${key}.label_value_leaf_parts is '${STAGE1_LEAF_PARTS}', not a whole number, so the ${which} pass's snapshot cannot be checked"
-  fi
-  STAGE1_WATERMARK="$(py get "$STAMPS" "${key}.watermark_hour")"
-  STAGE1_PARTS="$(py get "$STAMPS" "${key}.parts")"
+  stage1_whole_figure "$which" "${key}.label_value_leaf_parts"
+  STAGE1_LEAF_PARTS="$STAGE1_FIGURE"
+  stage1_whole_figure "$which" "${key}.watermark_hour"
+  STAGE1_WATERMARK="$STAGE1_FIGURE"
+  stage1_whole_figure "$which" "${key}.parts"
+  STAGE1_PARTS="$STAGE1_FIGURE"
   if [ "$which" = unrouted ]; then
     if [ "$STAGE1_LEAF_PARTS" -ne 0 ]; then
       stamp_str "stage1.${which}" "refused: ${STAGE1_LEAF_PARTS} snapshot parts carry a label_value leaf before the unrouted pass"
       fail_step "$step" "refused: ${STAGE1_LEAF_PARTS} snapshot parts carry a label_value leaf before the unrouted pass, which must run with none"
     fi
   else
-    want="$(py get "$STAMPS" stage1.leaves.parts_rebuilt)"
-    if ! [[ "$want" =~ ^[0-9]+$ ]]; then
-      stamp_str "stage1.${which}" "refused: stage1.leaves.parts_rebuilt is '${want}', not a whole number"
-      fail_step "$step" "refused: stage1.leaves.parts_rebuilt is '${want}', not a whole number, so the routed pass's snapshot cannot be checked against it"
-    fi
+    stage1_whole_figure "$which" stage1.leaves.parts_rebuilt
+    want="$STAGE1_FIGURE"
     if [ "$STAGE1_LEAF_PARTS" -lt "$want" ]; then
       stamp_str "stage1.${which}" "refused: ${STAGE1_LEAF_PARTS} snapshot parts carry a label_value leaf, stage1-leaves rebuilt ${want}"
       fail_step "$step" "refused: ${STAGE1_LEAF_PARTS} snapshot parts carry a label_value leaf before the routed pass, fewer than the ${want} stage1-leaves rebuilt"
