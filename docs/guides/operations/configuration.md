@@ -1425,9 +1425,9 @@ is the text before the LAST `;`. Each capability is absent by default.
 - `agents`, `agents_worker` and `agents_admin`: the three Ravel Agents roles:
   client operations, worker registration and turn commits, and
   reconciliation. Each word grants only its own role;
-  `agents_admin` does not imply `agents`. No route checks them in this
-  release: `GET /api/v1/agents/health` is the only agents route and is
-  unauthenticated.
+  `agents_admin` does not imply `agents`. The
+  [Ravel Agents guide](../agents.md#turning-it-on) says which routes require
+  each one.
 
 `acme;ddl`, `acme;ipcrypt`, `acme;ddl,ipcrypt`, `acme;ipcrypt,ddl` and
 `acme;ddl,agents,agents_worker` all name tenant `acme`, each granting the
@@ -1439,9 +1439,9 @@ label is 1 to 64 bytes drawn from `A-Z a-z 0-9 . _ @ + -`, and the entry
 appears at most once. `acme;ddl,subject=alice` names tenant `acme`, grants
 `ddl`, and carries subject `alice`; `acme;subject=alice` names tenant `acme`
 with subject `alice` and no capability. A subject grants nothing. It is not a
-secret: it is meant for audit records only, and the agents and query audit
-records carry it once the server records it. This release records it
-nowhere.
+secret: it is meant for audit records only. The query audit records carry
+it as `query.principal.subject` ([audit guide](../audit.md)), and the agents
+audit events carry it as `agents.principal.subject`.
 
 - A name other than the five above and `subject=LABEL`, a name listed twice,
   a second `subject=` entry, a `subject` entry with no label or with a label
