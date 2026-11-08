@@ -153,13 +153,15 @@ four runs:
 
 - the query pool's charged peak was 9.7 to 11.8 MB with the rule and 86 to
   93 MB without it. A CI run of main at the merge of this change measured
-  18.1 MB with the rule and 81.5 MB without it, the difference being the
-  hash exchange's buffers, which depend on scheduling. The test therefore
-  requires the peak with the rule under half the peak without it, and the
-  peak without it over 32 MiB;
-- the aggregate envelopes' peak was 7.86 MB with the rule, all of it the
-  eight partial aggregates', and 153 to 162 MB without it (1.6 MB and
-  81.2 MB in the CI run); the test requires under 8 MiB and over 32 MiB.
+  18.1 MB with the rule and 81.5 MB without it. The test requires under
+  32 MiB with the rule, about twice the largest figure, and over 32 MiB
+  without it;
+- the aggregate envelopes' peak was 7.86 MB with the rule and 153 to
+  162 MB without it; the CI run measured 1.6 MB and 81.2 MB. With the rule
+  the envelope is the eight partial aggregates', and this ADR does not
+  account for the difference between the two runs. The test requires
+  under 16 MiB with the rule, about twice the largest figure, and over
+  32 MiB without it.
 
 `the_returned_groups_carry_every_row_from_every_input_partition` runs the
 exactness fixture under a 1 MiB pool: 749,408 bytes charged at peak with the
