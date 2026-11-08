@@ -7,13 +7,13 @@
 # BANDS is a JSON document:
 #
 #   {"schema": "metricsbench-stage1-bands/1", "profile": "ci",
-#    "figures": [{"name": "leaf_count", "file": "stamps.json",
-#                 "path": "stage1.leaves.leaf_count", "min": 1, "max": null,
+#    "figures": [{"name": "leaves_parts_rebuilt", "file": "stamps.json",
+#                 "path": "stage1.leaves.parts_rebuilt", "min": 1, "max": null,
 #                 "basis": "why this band"}, ...]}
 #
 # file is relative to OUT-DIR. path is dot-separated keys; a segment
 # key[field=value] selects the one element of the list under key whose field
-# equals value (compared as text). min and max are numbers or null for no
+# equals value (compared as text). min and max are finite numbers or null for no
 # bound, at least one of them a number; basis is required. The band file's
 # profile must be the run's (stamps.json's profile).
 #
@@ -23,8 +23,8 @@
 #   duplicated  a key on the path occurs twice in its object, a selector
 #               matches more than one element, or the band file names the
 #               figure twice
-#   out of band the value is not a number (a bool or a string is not), or
-#               lies outside [min, max]
+#   out of band the value is not a finite number (a bool, a string, NaN or
+#               Infinity is not), or lies outside [min, max]
 #
 # Exit 0 prints one line per figure: ok NAME = VALUE in [MIN, MAX] (FILE PATH).
 # Exit 1 prints one line per failing figure on stderr, then a count.
@@ -71,7 +71,7 @@ def refuse(msg):
 
 
 def is_number(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and not (isinstance(v, float) and math.isnan(v))
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 try:

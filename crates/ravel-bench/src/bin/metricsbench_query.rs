@@ -108,9 +108,10 @@ struct Args {
     /// Prometheus oracle's, is refused (exit 65).
     #[arg(long)]
     diagnostic_after_failed_ingest: bool,
-    /// The harness pass this run is (`unfolded`, `folded-unrouted`,
-    /// `folded-routed`), copied onto every `ravel_cost` record as
-    /// `pass_label`.
+    /// The harness pass this run is (`unfolded`, `background-folded`,
+    /// `unknown` when the harness could not read the fold state,
+    /// `folded-unrouted`, `folded-routed`), copied onto every `ravel_cost`
+    /// record as `pass_label`.
     #[arg(long)]
     pass_label: Option<String>,
     /// The catalog fold state the harness stamped before this run, copied onto

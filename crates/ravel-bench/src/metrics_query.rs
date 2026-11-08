@@ -382,15 +382,13 @@ pub fn bind_diagnostic(
     Ok((binding, failed))
 }
 
-fn bind_rows(
+/// The run `ingest` records, checked against `workload` (digest, version,
+/// seed), and the workload profile it ran.
+fn bound_run<'w>(
     ingest: &MetricsIngestReport,
     workload_bytes: &[u8],
-    workload: &WorkloadFile,
-    specs: &[EngineSpec],
-    env: impl Fn(&str) -> Option<String>,
-    diagnostic: bool,
-) -> Result<(Binding, Vec<FailedBand>), BindError> {
-    let mut failed = Vec::new();
+    workload: &'w WorkloadFile,
+) -> Result<(IngestRun, &'w Profile), BindError> {
     let profile_record = ingest
         .profile
         .as_ref()
@@ -436,6 +434,32 @@ fn bind_rows(
     let profile = workload
         .profile(&run.profile)
         .ok_or_else(|| BindError::UnknownProfile(run.profile.clone()))?;
+    Ok((run, profile))
+}
+
+/// The run `ingest` records and the grid every entry of a query run over it
+/// evaluates on, checked against `workload` as [`bind`] checks it, without
+/// binding any engine.
+pub fn run_grid(
+    ingest: &MetricsIngestReport,
+    workload_bytes: &[u8],
+    workload: &WorkloadFile,
+) -> Result<(IngestRun, QueryGrid), BindError> {
+    let (run, profile) = bound_run(ingest, workload_bytes, workload)?;
+    let grid = QueryGrid::from_run(&run, profile)?;
+    Ok((run, grid))
+}
+
+fn bind_rows(
+    ingest: &MetricsIngestReport,
+    workload_bytes: &[u8],
+    workload: &WorkloadFile,
+    specs: &[EngineSpec],
+    env: impl Fn(&str) -> Option<String>,
+    diagnostic: bool,
+) -> Result<(Binding, Vec<FailedBand>), BindError> {
+    let mut failed = Vec::new();
+    let (run, profile) = bound_run(ingest, workload_bytes, workload)?;
 
     for row in ingest
         .systems

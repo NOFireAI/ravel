@@ -135,7 +135,15 @@ function of the anchor and the seed.
   profile, and any value other than `1`, `0` or unset, with exit 64). The
   steps, the records and the band check are in
   [deploy/metricsbench/README.md](../../deploy/metricsbench/README.md),
-  "Stage 1".
+  "Stage 1". After each `run.sh`, the box runs `stage1-check.sh` on its
+  outputs: the ci smoke against `deploy/metricsbench/stage1-bands.ci.json`,
+  the measured run against `MB_STAGE1_BANDS`;
+- `MB_STAGE1_BANDS`, the measured run's Stage 1 band file, a path relative to
+  the repository that must exist at the harness commit. Required with
+  `MB_STAGE1=1` for every profile but `ci`, which defaults to
+  `deploy/metricsbench/stage1-bands.ci.json`; `launch.sh` refuses it unset
+  where it is required, a path that is not a file at the harness commit, and
+  the variable set without `MB_STAGE1=1`, with exit 64.
 
 Both bands default only for `cardinality`. Another profile's count and memory
 differ, so `launch.sh` refuses a different `MB_PROFILE` unless both bands
@@ -162,8 +170,17 @@ aws s3 cp s3://$MB_RESULTS_BUCKET/metricsbench/<run-id>/cpu.log - | tail -1
 - `<profile> exit=N`, where N is `run.sh`'s exit code;
 - `DONE exit=N`, carrying the same code (20 after a failed `ci`).
 
+With `MB_STAGE1=1`, `ci-stage1-check exit=N` follows `ci exit=0` and
+`<profile>-stage1-check exit=N` follows `<profile> exit=N`, N being
+`stage1-check.sh`'s exit code; its output is uploaded as
+`out-ci/stage1-check.txt` and `out-run/stage1-check.txt`, after the run's
+outputs. A failed ci check ends the box with `DONE exit=22`; a failed
+measured check ends it with `DONE exit=23` when `run.sh` exited 0, and with
+`run.sh`'s code otherwise. A box that finds no band file for the measured
+profile ends with `DONE exit=21` before it builds anything.
+
 The box terminates itself 5 minutes after `DONE`, 30 minutes after a failed
-`ci`, or at the cap. Nothing on it depends on the machine that launched it,
+`ci` or a failed band check, or at the cap. Nothing on it depends on the machine that launched it,
 so an expired session or a closed laptop does not stop a run.
 
 The ingest step writes `ingest.json` only when it ends, after all four

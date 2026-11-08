@@ -73,12 +73,13 @@ jobs:
   # cites the job id.
   metricsbench-rustfs:
     runs-on: ubuntu-latest
-    # 155 minutes = 57 + 30 + 35 + 9 + 9 + 15:
+    # 140 minutes = 57 + 30 + 35 + 9 + 9, and 155 = 140 + 15 on a dispatch
+    # with the stage1 input set:
     #   57  the cold `docker build --target server` of the root Dockerfile,
     #       a full workspace compile at the Dockerfile's CARGO_BUILD_JOBS=2
     #       with no cache (ci.yml's docker-build job measured about 57 on a
     #       constrained host);
-    #   30  the cold release build of the three bins, most of 30 on its own;
+    #   30  the cold release build of the four bins, most of 30 on its own;
     #   35  the engine readiness bound: METRICSBENCH_READY_TRIES below gives
     #       each engine 75 tries, 2.5 minutes when a refused connection fails
     #       fast and up to 8.75 (75 x the 2 s interval plus curl's 5 s cap)
@@ -90,13 +91,15 @@ jobs:
     #       passes x 3 reps against four engines, and the out-dir upload;
     #   15  stage1 only: two more query passes against Prometheus and Ravel,
     #       each within the four-engine pass's share of the 9 above, the two
-    #       catalog folds, and one more Ravel readiness bound (8.75 above)
-    #       after the recreate. A bound, not a measurement: no stage1 run
-    #       has been timed yet.
+    #       catalog folds, two catalog inspects, the catalog list, the object
+    #       download and holder count, and three ravel-server recreates, each
+    #       answering readiness within seconds on a healthy run (three
+    #       worst-case readiness bounds, 8.75 each, would not fit). A bound,
+    #       not a measurement: no stage1 run has been timed yet.
     # The per-row ingest ceiling (600 s, run.sh case m) and each query's
     # 120 s cap bound a stalled row or query, not a healthy run; a run that
     # spends several of those bounds at once outlasts this budget.
-    timeout-minutes: 155
+    timeout-minutes: ${{ inputs.stage1 && 155 || 140 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
