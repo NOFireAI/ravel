@@ -171,8 +171,8 @@ rows.
 How much do key-set lookups with no time range over more than about two
 weeks matter? The owner approved this decision without settling it, so
 rejected alternative 4 (tiering day parts into weeks) stays deferred. D3
-times a no-range 100-key lookup over the run's full window, and that
-figure decides whether alternative 4 becomes a follow-up.
+times a no-range 100-key lookup over every day part the run holds (A7),
+and that figure decides whether alternative 4 becomes a follow-up.
 
 ## Acceptance (pre-registered; a figure outside its band is a miss)
 
@@ -184,6 +184,7 @@ figure decides whether alternative 4 becomes a follow-up.
 | A4. partition determinism | two folds of the same entry set produce byte-identical HEADs; the switch-off partition is unchanged | any difference | predicted |
 | A5. no-range lookup, 7 days of day parts, logs request_id IN 100 | every day covered; GETs at most 7 x 126 | any day uncovered | predicted |
 | A6. ADR-3692 row 18 (key-set lookup time) on the day-sealed tail | as row 18 | as row 18 | predicted; issue #3918 |
+| A7. no-range lookup over every day part the run holds, logs request_id IN 100 | at most 126 GETs per day part; days covered equal to min(days held, floor(2,048 / GETs per day)) | over 126 GETs per day part, or fewer days covered than that | predicted from box D rates |
 
 ## Plan
 
@@ -191,4 +192,4 @@ figure decides whether alternative 4 becomes a follow-up.
 |---|---|---|---|
 | D1 day seal in `partition_parts` behind the switch, carry-over of sealed day parts' refs, tests A3 and A4; the fold report also carries `key_index_pair_budget` and `key_index_field_pairs` (#3948), so the harness can bound ADR-3692 row 7's `G` (it reads not computable until then) | ravel-catalog (fold), ravel-cli (report) | none | high |
 | D2 docs: catalog-and-mvcc.md "Per-part key-index leaves" and rollout, the operator guide's cost section | docs | D1 | low |
-| D3 Stage 2 run on real S3: rows A1 to A6, ADR-3692 rows 7, 8, 11 and 18 | benchmarks, docs | D1, #3917, #3918 | low |
+| D3 Stage 2 run on real S3: rows A1 to A7, ADR-3692 rows 7, 8, 11 and 18 | benchmarks, docs | D1, #3917, #3918 | low |
