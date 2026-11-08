@@ -177,7 +177,7 @@ jobs:
 
       # Second telemetrygen step: injects deterministic LOG records so the
       # README's PromQL-over-logs block (`sum by (job) (count_over_time(
-      # ravel_log_lines [5m]))`) has a log source to match against the PUBLISHED
+      # ravel_log_lines [1h]))`) has a log source to match against the PUBLISHED
       # image. The collector's own internal-logs export is not a CI-usable source
       # (its record count and timing depend on log level), so this lane supplies
       # its own the same way it supplies the `gen` metric series. The resource
