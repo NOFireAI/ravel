@@ -1,29 +1,29 @@
 # Configuration (day 0)
 
-Make these decisions before you start a process for the first time. You can
-change some of them with a restart (cache sizes, admission limits). Others are
-permanent for the lifetime of a bucket (the tenant hash scheme, a tenant's
-shard count), and each section says which.
+Choose how a deployment stores, authenticates and limits its data before you
+start a process for the first time. You can change some of these choices with
+a restart (cache sizes, admission limits). Others are permanent for the
+lifetime of a bucket (the tenant hash scheme, a tenant's shard count), and
+each section says which.
 
-For the name, the environment variable and the default of every flag, see
+This page tells you how to choose a value. For the name, the environment
+variable and the default of every flag, see
 [the generated server flag reference](../../reference/ravel-server-flags.md)
 and [the generated CLI flag reference](../../reference/ravel-cli-flags.md).
-The sections below tell you how to choose a value.
 
-- [Process modes](#process-modes)
-- [Storage backend and credentials](#storage-backend-and-credentials)
-- [Storage credential roles](#storage-credential-roles)
-- [Encrypting objects with SSE-KMS](#encrypting-objects-with-sse-kms)
-- [Admission limits](#admission-limits)
-- [Read cache tiers](#read-cache-tiers)
-- [SQL spill](#sql-spill)
-- [Compaction scratch](#compaction-scratch)
-- [Retention and garbage-collection configuration](#retention-and-garbage-collection-configuration)
-- [Tenancy setup](#tenancy-setup)
-- [Durable shard count](#durable-shard-count)
-- [Logs fetch policy and store cost profile](#logs-fetch-policy-and-store-cost-profile)
-- [Indexed fields and typed attribute columns](#indexed-fields-and-typed-attribute-columns)
-- [Per-query budgets](#per-query-budgets)
+| Task | Section |
+|---|---|
+| Choose which jobs a process runs | [Process modes](#process-modes) |
+| Choose a store and its credentials | [Storage backend and credentials](#storage-backend-and-credentials), [Choosing a credential source](#choosing-a-credential-source), [Google Cloud Storage](#google-cloud-storage) |
+| Scope a credential to one job | [Storage credential roles](#storage-credential-roles) |
+| Encrypt objects with a KMS key | [Encrypting objects with SSE-KMS](#encrypting-objects-with-sse-kms) |
+| Add tenants and tokens | [Tenancy setup](#tenancy-setup), [Token file](#token-file), [Production authentication](#production-authentication) |
+| Choose the tenant hash scheme (permanent) | [Tenant hash scheme](#tenant-hash-scheme) |
+| Fix a tenant's shard count (permanent) | [Durable shard count](#durable-shard-count) |
+| Set retention and audit retention | [Retention and garbage-collection configuration](#retention-and-garbage-collection-configuration), [Age-based retention](#age-based-retention), [audit guide](../audit.md) |
+| Cap a tenant's ingest | [Admission limits](#admission-limits) |
+| Size memory, caches and spill | [Read cache tiers](#read-cache-tiers), [SQL spill](#sql-spill), [Compaction scratch](#compaction-scratch), [Process memory budget](#process-memory-budget) |
+| Tune log reads and query limits | [Logs fetch policy and store cost profile](#logs-fetch-policy-and-store-cost-profile), [Indexed fields and typed attribute columns](#indexed-fields-and-typed-attribute-columns), [Per-query budgets](#per-query-budgets) |
 
 ## Process modes
 
@@ -261,25 +261,18 @@ An explicit `--store memory` keeps the zero-count report.
 
 ### Upload checksums
 
-`ravel-cli --store s3` attaches a server-verified checksum to every PUT and
-asks for the stored one on every read, as the server does (see
-[Upload and read checksums](#upload-and-read-checksums)).
+`ravel-cli --store s3` takes `--s3-upload-integrity` and
+`--s3-request-stored-checksum`, with the same environment variables, values,
+defaults and remedies as the server (see
+[Upload and read checksums](#upload-and-read-checksums)). `sha256` attaches
+`x-amz-checksum-sha256`. Two details differ:
 
-- `--s3-upload-integrity` (`RAVEL_S3_UPLOAD_INTEGRITY`): `crc64nvme`, the
-  default, attaches `x-amz-checksum-crc64nvme`. `sha256` attaches
-  `x-amz-checksum-sha256`. `off` attaches none.
-- An endpoint that does not support the header fails the first write. `off`
-  is the remedy there, and commit records written under it are unverified.
-- With a checksum on, every object goes out as one PUT, not in parts. So an
-  overwrite above S3's 5 GiB single-request limit is refused, and the refusal
-  names `off` as the remedy. No `ravel-cli` write comes near that size.
-- `--s3-request-stored-checksum` (`RAVEL_S3_REQUEST_STORED_CHECKSUM`): on by
-  default, it sends `x-amz-checksum-mode: ENABLED`. A whole-object read is
-  checked against a returned CRC-64/NVME or CRC-32C checksum before its bytes
-  are used, and a mismatch is an error.
-- A read that returns no checksum, or a SHA-256 one, is served unverified.
-- `--s3-request-stored-checksum=false` stops sending the header, for an
-  endpoint that rejects it.
+- With a checksum on, an overwrite above S3's 5 GiB single-request limit is
+  refused, and the refusal names `off` as the remedy. No `ravel-cli` write
+  comes near that size.
+- A whole-object read is checked against a returned CRC-64/NVME or CRC-32C
+  checksum before its bytes are used, and a mismatch is an error. A read that
+  returns no checksum, or a SHA-256 one, is served unverified.
 
 `ravel-cli store qualify` reports whether the endpoint returns the stored
 checksum. See [qualify the store](deployment.md#qualify-the-store).
@@ -1712,11 +1705,9 @@ For any policy value a query returns the same rows. Only request counts and
 timing differ.
 
 The policy is an operator setting only. It is never derived from query text,
-a header or a ticket. Under request billing, a tenant that can force
-`byte-minimal` per query multiplies the request bill of the deployment by the
-measured amplification factor. The running engine also never changes its own
-policy. If a measurement shows that the default is wrong for a deployment,
-set `--logs-fetch-policy` explicitly.
+a header or a ticket, and the running engine never changes its own policy. If
+a measurement shows that the default is wrong for a deployment, set
+`--logs-fetch-policy` explicitly.
 
 Startup logs the resolved policy and its source on the
 `logs fetch policy resolved` line. The source is `flag` (explicit),
@@ -1734,11 +1725,9 @@ Startup logs the resolved policy and its source on the
 | GET requests | 5.30x (570,752 against 107,781) |
 | Cold time | 52% less, with a per-rep range of 50.3% to 54.2% |
 
-That ratio is a measurement of two code paths on one build, not a property of
-the policy. The decision record for the fetch objective names the build that
-it was taken on.
-Measure again on the build that you run, and do not treat the ratio as a
-constant.
+That ratio was measured on one build, and it is not a property of the policy.
+The decision record for the fetch objective names the build that it was taken
+on. Measure again on the build that you run.
 
 - `latency-first` resolves `--store-get-concurrency`,
   `--sql-partition-count`, and `--promql-fetch-fanout` as every other policy
@@ -1794,8 +1783,7 @@ per_connection_throughput_bytes_per_s = 90000000  # optional; set with the laten
 timings_measured = "measured on the reference box of the reference suite, intra-region against the object store"
 ```
 
-**Prices.** Prices are integer nanodollars, never floats, because they are
-exact decimal contract figures. The reference values model S3 standard
+**Prices.** Prices are integer nanodollars, never floats. The reference values model S3 standard
 intra-region 2026 list prices: PUT class $5.00 per million requests, GET
 class $0.40 per million, transfer and retrieval free. One PUT costs 12.5 GETs
 at those prices. Every price is a modeled figure under a named profile, not a
@@ -1808,9 +1796,7 @@ connection transfers per second. They are optional, and you set both or
 neither.
 
 `timings_measured` is a free-text note of their provenance, and nothing
-derives a figure from it. The reference values were measured on the reference
-box of the reference suite, intra-region against the object store. The note
-of the reference profile says so and records no date.
+derives a figure from it. The reference profile's note records no date.
 
 **Validation.** Every field is required except `delete_class_nanodollars` and
 the three timing fields. Loading is fail-closed. Each of these refuses
@@ -1822,9 +1808,7 @@ startup with an error that names the flag:
 - one timing without the other (the error names the missing one)
 - a blank name
 
-Ravel never falls back to the reference prices. With a fallback, a deployment
-stamps one profile into its reports while it resolves its fetch policy from
-another.
+Ravel never falls back to the reference prices.
 
 **How `cost-based` resolves.** It converts the profile into the one byte
 quantity that the fetch layer runs on: how many transferred bytes one saved
@@ -1842,12 +1826,11 @@ time term  = request_latency_micros x per_connection_throughput_bytes_per_s / 1,
 request_cost_bytes = the larger of the two terms
 ```
 
-- `BYTES_PER_GIB` is 2^30. The arithmetic multiplies before it divides, in
-  128-bit, so a sub-nanodollar per-byte price does not truncate to zero.
+- `BYTES_PER_GIB` is 2^30. A sub-nanodollar per-byte price does not
+  truncate to zero.
 - Retrieval is a per-byte charge, as transfer is, and enters the denominator
   the same way. So a profile with free transfer but priced retrieval still
-  routes byte-minimally. It does not report retrieval dollars that a
-  request-minimal plan never spends.
+  routes byte-minimally.
 - The result is floor-rounded, held at a minimum of one byte, and clamped to
   the coalescing-gap and routing-threshold floors.
 - Two cases saturate the price term: a zero denominator, where no per-byte
@@ -1900,8 +1883,7 @@ every policy, so at the reference profile it is 6,300,000 bytes.
 `--logs-max-fetch-run-bytes` caps the length of one covering request.
 
 - Its default is 64 MiB, and it applies under every policy.
-- Zero is refused with an error, because the segmented fallback divides the
-  object size by it.
+- Zero is refused with an error.
 - An object at or under the bound is read in one covering request.
 - An object above the bound is read as sequential block-aligned covering
   sub-ranges. So no single request moves more than the bound, however large
@@ -2118,8 +2100,7 @@ shared by several entries counts once per entry: a field's passes are the
 greedy packing of its key8 runs into groups of at most its share, more
 than `ceil(pairs / share)` when keys repeat across entries, and the part
 takes as many passes as its slowest field. A pass holds at most
-`max(share, largest key8 run) + 1` pairs per field (catalog test
-`every_pass_holds_at_most_its_share_open_slice_included`); about 88 B a
+`max(share, largest key8 run) + 1` pairs per field; about 88 B a
 one-block pair is an upper-bound estimate, not a measured figure. The
 leaves depend on the budget: they equal a build from scratch at the same
 budget, and lookups read them the same at any budget. A section read that
