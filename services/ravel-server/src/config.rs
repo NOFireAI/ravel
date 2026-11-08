@@ -863,6 +863,25 @@ fn parse_audit_token_key(raw: &str) -> anyhow::Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("{AUDIT_TOKEN_KEY_ENV} did not decode to 32 bytes"))
 }
 
+/// `--decoded-cache-view-max-bytes`, flattened into [`Cli`].
+#[derive(Debug, clap::Args)]
+pub struct DecodedCacheViewArgs {
+    /// View budget in bytes of the decoded column-block cache, apart from
+    /// `--decoded-cache-max-bytes` (ADR-3326, view memo amendment). A
+    /// `GROUP BY` over a declared `Str` column served from a plain page keeps
+    /// that page's per-row string views here, charged to the process memory
+    /// budget and released first under memory pressure. Unset, it is the
+    /// smallest of a quarter of the cap, 2 GiB, and the memory budget less
+    /// the cap and the admission margin, floored at 0; it is 0 while the
+    /// decoded cache is off. `0` keeps no views. Startup logs the value in
+    /// force and the term that bound it (`cap_quarter`, `two_gib`,
+    /// `budget_room`, `floored_at_zero` or `explicit`),
+    /// and warns when an explicit value is above the budget's room that view
+    /// fills past it may be refused.
+    #[arg(long, value_name = "BYTES")]
+    pub decoded_cache_view_max_bytes: Option<u64>,
+}
+
 /// Dev binary wiring gateway + ingest + query into one process.
 #[derive(Debug, Parser)]
 #[command(
@@ -3090,20 +3109,11 @@ pub struct Cli {
     #[arg(long, value_name = "BYTES", default_value_t = 0)]
     pub decoded_cache_max_bytes: u64,
 
-    /// View budget in bytes of the decoded column-block cache, apart from
-    /// `--decoded-cache-max-bytes` (ADR-3326, view memo amendment). A
-    /// `GROUP BY` over a declared `Str` column served from a plain page keeps
-    /// that page's per-row string views here, charged to the process memory
-    /// budget and released first under memory pressure. Unset, it is the
-    /// smallest of a quarter of the cap, 2 GiB, and the memory budget less
-    /// the cap and the admission margin, floored at 0; it is 0 while the
-    /// decoded cache is off. `0` keeps no views. Startup logs the value in
-    /// force and the term that bound it (`cap_quarter`, `two_gib`,
-    /// `budget_room`, `floored_at_zero` or `explicit`),
-    /// and warns when an explicit value is above the budget's room that view
-    /// fills past it may be refused.
-    #[arg(long, value_name = "BYTES")]
-    pub decoded_cache_view_max_bytes: Option<u64>,
+    // A struct of its own so its `Arg` is built in a separate frame: in an
+    // unoptimized build every flag adds about 8 KB to `Cli::augment_args`'s
+    // frame, which already takes about 1.5 MiB of a 2 MiB test thread stack.
+    #[command(flatten)]
+    pub decoded_cache_view: DecodedCacheViewArgs,
 
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
@@ -8257,7 +8267,7 @@ impl Cli {
                 },
             },
             decoded_cache_max_bytes: self.decoded_cache_max_bytes,
-            decoded_cache_view_max_bytes: self.decoded_cache_view_max_bytes,
+            decoded_cache_view_max_bytes: self.decoded_cache_view.decoded_cache_view_max_bytes,
         })
     }
 
