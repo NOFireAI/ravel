@@ -46,15 +46,14 @@ curl -s -H "Authorization: Bearer demo-token" \
 
 ## Endpoints
 
-Ravel registers eleven routes under `/api/v1` on `--listen-http`. All but two
-require the same tenant authentication as ingest: `Authorization: Bearer
-<token>`, or the dev header if `--dev-insecure-tenant-header` is set. The two
-exceptions are:
+The query routes below are served on `--listen-http`. All but two require the
+same tenant authentication as ingest: `Authorization: Bearer <token>`, or the
+dev header if `--dev-insecure-tenant-header` is set. The two exceptions are:
 
 - `/api/v1/status/buildinfo` takes no credential.
 - `/api/v1/metadata` answers an empty object to a request it cannot resolve.
 
-A build with the `esql` cargo feature registers a twelfth,
+A build with the `esql` cargo feature also registers
 `POST /api/v1/esql` (see [ES|QL queries](#esql-queries)). The maintenance
 route `POST /api/v1/admin/fold` is not a query route.
 
@@ -296,6 +295,10 @@ metric names:
   `count_over_time` counts lines.
 - `ravel_log_bytes`: one sample per log line. The value is the length of the
   `body` of the line in bytes. `sum_over_time` sums bytes.
+
+These names chart log volume and error rate, for example from a Grafana
+Prometheus datasource. They return counts, not the lines themselves; read
+lines with [SQL over `logs`](#the-logs-table).
 
 `/api/v1/query`, `/api/v1/query_range` and `/api/v1/metadata` serve these two
 names as they serve any other metric name. The discovery endpoints treat a
@@ -641,20 +644,19 @@ derived value satisfies. Ravel **rejects a higher value at startup** with a
 hard error and does not clamp it. If you need a longer engine deadline, raise
 `sys/gc.max_query_duration` first (`ravel-cli gc-config set`).
 
-Ravel checks the catalog-list budget before it makes any object-store request:
+The catalog-list budget caps the LIST requests one query's catalog lookup
+issues (100,000 by default):
 
-- The catalog lists one prefix per (shard, ingest hour) from the start of the
-  window to the current hour, so a `start` far back can ask for hundreds of
-  thousands of LIST requests in one call. A `start` of `0` (epoch) is the
-  usual cause. Ravel refuses such a query before it can run up an
-  object-store bill or saturate the listing path.
-- The error reports the estimate and the limit. Narrow the time range by the
-  reported factor and retry.
-- The ceiling permits roughly an 11-year window at one shard and about 8.5
-  months at sixteen. It decreases as the shard count rises.
-- The limit is on the *start* of the query. A narrow `start`/`end` pair costs
-  little however recent it is. To correct the error, always move `start`
-  forward. Never change `end`.
+- A wide window, such as a `start` of `0` (epoch), is not refused up front.
+  The catalog reads it with a prefix scan that lists only the objects that
+  exist, so a wide but sparse window answers.
+- Every LIST page counts against the budget as it is issued. A lookup that
+  reaches the budget stops listing and is refused with an error that reports
+  the estimate and the limit.
+- To correct the error, move `start` forward. The listing runs from `start`
+  to the current hour, so changing `end` does not help.
+
+[Catalog resolution](../catalog-and-mvcc.md) holds the full listing contract.
 
 <a id="sql-over-samples-logs-and-spans"></a>
 
@@ -680,7 +682,9 @@ ORDER BY samples.ts
 
 The request body, auth, window (`start`/`end`), and `min_commit_token`
 handling are the same for all five tables. ES|QL reads one of the five per
-query.
+query. Flight SQL, a gRPC service on `--listen-grpc` in the published image,
+serves the same tables to ad-hoc statements; it answers prepared statements
+with `unimplemented`.
 
 ### Joins across tables
 

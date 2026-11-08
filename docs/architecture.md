@@ -71,8 +71,10 @@ Write payloads normalise to the shape that OTLP produces and enter the same
 router call, so there is no second flush or commit path.
 
 The query surfaces are the Prometheus-compatible `/api/v1/*` routes,
-`POST /api/v1/sql`, Flight SQL behind a cargo feature, and
-`POST /api/v1/analytics`. The Prometheus-compatible routes also serve the
+`POST /api/v1/sql` and the `GET /api/traces/<trace_id>` lookup (the `sql`
+cargo feature), Flight SQL (`flight-sql`), `POST /api/v1/esql` (`esql`),
+`POST /api/v1/analytics`, and the MCP server at `POST /mcp` (`mcp`, with
+`--mcp`). The Prometheus-compatible routes also serve the
 logs signal. A selector with exact `__name__` equality on the reserved
 `ravel_log_lines` or `ravel_log_bytes` metric name is answered from log data.
 The query coordinator evaluates it locally and does not federate it
