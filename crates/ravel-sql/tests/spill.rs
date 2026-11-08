@@ -1257,6 +1257,19 @@ async fn q33_executor_with_store(
     process: Arc<ravel_memory::MemoryBudget>,
     ravel: Arc<dyn ravel_object_store::ObjectStoreBackend>,
 ) -> Arc<ravel_sql::SqlExecutor> {
+    parquet_table_executor(config, &[(file.clone(), Q33_ROWS)], process, ravel, "q33").await
+}
+
+/// [`q33_executor_with_store`] for a Parquet table named `table` made of
+/// `files`, each given with its row count. A spill-enabled plan does not
+/// split a file across partitions, so each file is at most one partition.
+async fn parquet_table_executor(
+    config: SqlConfig,
+    files: &[(bytes::Bytes, u64)],
+    process: Arc<ravel_memory::MemoryBudget>,
+    ravel: Arc<dyn ravel_object_store::ObjectStoreBackend>,
+    table: &str,
+) -> Arc<ravel_sql::SqlExecutor> {
     use std::collections::{BTreeMap, HashMap};
 
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
@@ -1274,23 +1287,26 @@ async fn q33_executor_with_store(
     const NOW: i64 = 1_700_000_000_000_000_000;
     let tenant = q33_tenant();
     let lake = Arc::new(MemoryStore::new());
-    let key = "t/q33/0.parquet";
-    let put = lake
-        .put(key, file.clone(), PutOptions::default())
-        .await
-        .expect("put");
-    let mut word = [0u8; 4];
-    word.copy_from_slice(&file[file.len() - 8..file.len() - 4]);
-    let parquet_file = ParquetFile {
-        profile: PROFILE.to_string(),
-        bucket: "lake".to_string(),
-        key: key.as_bytes().to_vec(),
-        size: file.len() as u64,
-        etag: put.etag.0,
-        version: String::new(),
-        row_count: Q33_ROWS,
-        footer_len: u32::from_le_bytes(word),
-    };
+    let mut parquet_files = Vec::new();
+    for (index, (file, row_count)) in files.iter().enumerate() {
+        let key = format!("t/{table}/{index}.parquet");
+        let put = lake
+            .put(&key, file.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        let mut word = [0u8; 4];
+        word.copy_from_slice(&file[file.len() - 8..file.len() - 4]);
+        parquet_files.push(ParquetFile {
+            profile: PROFILE.to_string(),
+            bucket: "lake".to_string(),
+            key: key.as_bytes().to_vec(),
+            size: file.len() as u64,
+            etag: put.etag.0,
+            version: String::new(),
+            row_count: *row_count,
+            footer_len: u32::from_le_bytes(word),
+        });
+    }
     ravel_pqtable::grants::add(
         ravel.as_ref(),
         &tenant,
@@ -1304,15 +1320,15 @@ async fn q33_executor_with_store(
     writer::apply(
         ravel.as_ref(),
         &tenant,
-        "q33",
+        table,
         Intent::Create {
             if_not_exists: false,
-            location: format!("{GRANT}/q33/"),
+            location: format!("{GRANT}/{table}/"),
             grant: GRANT.to_string(),
-            files: vec![parquet_file],
+            files: parquet_files,
             options: BTreeMap::new(),
             created_by: "test".to_string(),
-            statement: "CREATE EXTERNAL TABLE q33 ...".to_string(),
+            statement: format!("CREATE EXTERNAL TABLE {table} ..."),
         },
         &FixedClock::new(NOW),
         60_000,
@@ -1726,7 +1742,15 @@ const SPILL_MODE_HEADROOM_FLOOR_BYTES: usize = 64 << 20;
 
 /// The spill-mode cap of [`the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry`],
 /// in percent of the unlimited run's peak.
-const ROW_14_CAP_PERCENT: u64 = 50;
+///
+/// 70, not the 50 the M2 run used. With the fair share applied only over the
+/// cap, at 30 to 60 percent the inner aggregate grows past its share while
+/// the outer one holds nothing, spills a few large runs, and its replay seats
+/// all of them and holds more than its share; once the outer aggregate starts
+/// the replay's next grow is over the cap and over its share, and the replay
+/// has no spill context, so the retry fails, at 50 with the same figures as
+/// under the whole-pool cap. At 70 and above it answers under both rules.
+const ROW_14_CAP_PERCENT: u64 = 70;
 
 /// Issue #3899 (M2), the ClickBench row 14 shape: `COUNT(DISTINCT a) GROUP BY
 /// y / 2 ORDER BY u DESC LIMIT 10`, which DataFusion plans as an inner
@@ -1738,11 +1762,14 @@ const ROW_14_CAP_PERCENT: u64 = 50;
 /// out of the way above it. The retry answers with the unlimited run's rows,
 /// having spilled.
 ///
-/// Prove-the-test: replace the fair-share admission in `spill_cap_admit` with
-/// the whole-pool cap alone (`if after <= cap`) and the retry fails with
-/// "query memory pool spill threshold reached: spill-capable consumers would
-/// hold 6552498 bytes charged and enveloped, over the spill-mode cap
-/// 6430850", asked by one aggregate while the other holds 4,382,780 bytes.
+/// Prove-the-test: apply the fair share under the cap too (drop `after <= cap
+/// ||` from `spill_cap_admit`) and the inner aggregate's replay is refused
+/// with "SingleHashAggregateStream[0] would hold 4628510 bytes, over its fair
+/// share 4501595 (2 spill-capable consumers)" while the total is under the cap
+/// 9003190. The whole-pool cap alone (`own_after <= own || after <= cap`)
+/// answers at this cap; `spill_mode_admits_an_asker_within_its_share_over_the_cap`
+/// and `spill_mode_keeps_half_the_headroom_from_askers_within_their_share` in
+/// `memory.rs` are what refuse it.
 #[tokio::test]
 async fn the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry() {
     let sql = "SELECT y / 2 AS k, COUNT(DISTINCT a) AS u FROM q33 GROUP BY y / 2 \
@@ -1792,6 +1819,163 @@ async fn the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry(
         spilled.spill_retry_bytes_written
     );
     assert_eq!(spilled.rows, unlimited.rows, "row for row");
+}
+
+/// Distinct `url` values in the row 35 fixture, and how many files (scan
+/// partitions) they are split over.
+const ROW_35_GROUPS: u64 = 200_000;
+const ROW_35_FILES: u64 = 2;
+
+/// The `url` of group `g`: about 100 bytes, zero padded so every group is
+/// one distinct string of the same length.
+fn row_35_url(g: u64) -> String {
+    format!(
+        "https://www.example.com/catalog/section/{g:07}/item?ref=clickbench&utm_source=row35&pad=xxxxxxxx"
+    )
+}
+
+/// One file of the row 35 table: every group `g` with `g % ROW_35_FILES ==
+/// file` once, and group `g < 10` another `11 - g` times, so groups 0 to 9
+/// hold the ten highest counts, 12 down to 3, and the top ten is decided by
+/// the counts alone. Returns the file and its row count.
+fn row_35_parquet(file: u64) -> (bytes::Bytes, u64) {
+    use datafusion::arrow::array::{ArrayRef, StringArray};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let mut groups: Vec<u64> = (0..ROW_35_GROUPS)
+        .map(|i| (i * 7_919) % ROW_35_GROUPS)
+        .filter(|g| g % ROW_35_FILES == file)
+        .collect();
+    for g in (0..10).filter(|g| g % ROW_35_FILES == file) {
+        groups.extend(std::iter::repeat_n(
+            g,
+            usize::try_from(11 - g).expect("small"),
+        ));
+    }
+    let schema = Arc::new(Schema::new(vec![Field::new("url", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from_iter_values(
+            groups.iter().map(|&g| row_35_url(g)),
+        )) as ArrayRef],
+    )
+    .expect("batch");
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_max_row_group_row_count(Some(8_192))
+        .build();
+    let mut out = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut out, schema, Some(properties)).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+    (bytes::Bytes::from(out), groups.len() as u64)
+}
+
+/// The spill-mode cap of [`the_clickbench_row_35_shape_spills_no_more_runs_than_the_whole_pool_cap`],
+/// in percent of the unlimited run's peak.
+const ROW_35_CAP_PERCENT: u64 = 50;
+
+/// Spill files the row 35 retry writes under the whole-pool cap alone (the
+/// rule before #3954, `own_after <= own || after <= cap`), measured on this
+/// fixture: 3, the same in three runs. The fair-share rule writes 3 too.
+const ROW_35_WHOLE_POOL_CAP_FILES: u64 = 3;
+
+/// Issue #3899 (M3), the ClickBench row 35 shape: `SELECT 1, url, COUNT(*)
+/// GROUP BY 1, url ORDER BY c DESC LIMIT 10` over a wide string key, scanned
+/// in [`ROW_35_FILES`] partitions, run through the spill retry the way
+/// [`the_clickbench_row_14_shape_spills_the_holder_and_answers_on_the_retry`]
+/// is. The retry plans a partial aggregate per partition under one final
+/// aggregate, three spill-capable consumers, and answers with the unlimited
+/// run's rows, writing no more spill files than the whole-pool cap does plus
+/// one per partition.
+///
+/// Prove-the-test: refuse a grow over the asker's fair share under the cap
+/// too (drop `after <= cap ||` from `spill_cap_admit`, the #3954 rule) and
+/// the final aggregate is refused at a third of the cap six times, spilling
+/// a run each time, and its replay then fails the retry with "query memory
+/// pool spill threshold reached: spill-capable consumers would hold 22758830
+/// bytes charged and enveloped, over the spill-mode cap 22444127", asked by
+/// `FinalHashAggregateStream[0]`, the M3 failure.
+#[tokio::test]
+async fn the_clickbench_row_35_shape_spills_no_more_runs_than_the_whole_pool_cap() {
+    let sql = "SELECT 1, url, COUNT(*) AS c FROM row35 GROUP BY 1, url ORDER BY c DESC LIMIT 10";
+    let files: Vec<_> = (0..ROW_35_FILES).map(row_35_parquet).collect();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes| {
+        let mut config = spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            query_bytes,
+        );
+        config.engine.fetch_concurrency = usize::try_from(ROW_35_FILES).expect("small");
+        // A Parquet table scans in more than one file group only for an
+        // exact-typed statement with this on (ADR-2040 D6).
+        config.parallel_final_aggregation = true;
+        config
+    };
+    let executor = |config: SqlConfig, process: Arc<ravel_memory::MemoryBudget>| {
+        parquet_table_executor(
+            config,
+            &files,
+            process,
+            Arc::new(MemoryStore::new()),
+            "row35",
+        )
+    };
+    let unlimited = run_top_ten(
+        &*executor(
+            config(AMPLE_QUERY_BYTES),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        )
+        .await,
+        sql,
+    )
+    .await;
+    assert_eq!(
+        (unlimited.spill_retries, unlimited.spill_files),
+        (0, 0),
+        "the unlimited run answers on its first attempt"
+    );
+    let expected: Vec<String> = (0..10)
+        .map(|g| format!("1|{}|{}", row_35_url(g), 12 - g))
+        .collect();
+    assert_eq!(unlimited.rows, expected);
+
+    let cap = usize::try_from(unlimited.peak_pool_bytes * ROW_35_CAP_PERCENT / 100).expect("fits");
+    let process = Arc::new(ravel_memory::MemoryBudget::new(unlimited.peak_pool_bytes));
+    let spilled = run_top_ten(
+        &*executor(config(SPILL_MODE_HEADROOM_FLOOR_BYTES + cap), process).await,
+        sql,
+    )
+    .await;
+    eprintln!(
+        "issue #3899 row 35: unlimited peak={} cap={cap} spill files={} rows_written={} retry peak={}",
+        unlimited.peak_pool_bytes,
+        spilled.spill_files,
+        spilled.spill_rows_written,
+        spilled.peak_pool_bytes
+    );
+    // The first attempt is refused by the process budget, either on a grow
+    // or on the final aggregate's reserve-ahead envelope, depending on
+    // which partition's batches arrive first.
+    assert_eq!(
+        spilled.spill_retries, 1,
+        "the first attempt was refused and retried: {:?}",
+        spilled.first_refusal
+    );
+    assert!(
+        spilled.spill_files > 0,
+        "the retry spilled: files={}",
+        spilled.spill_files
+    );
+    assert_eq!(spilled.rows, unlimited.rows, "row for row");
+    assert!(
+        spilled.spill_files <= ROW_35_WHOLE_POOL_CAP_FILES + ROW_35_FILES,
+        "the retry wrote {} spill files, over the whole-pool cap's {ROW_35_WHOLE_POOL_CAP_FILES} \
+         plus one per partition ({ROW_35_FILES})",
+        spilled.spill_files
+    );
 }
 
 /// The per-query pool of [`a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry`]:

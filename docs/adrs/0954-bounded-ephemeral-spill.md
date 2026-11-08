@@ -930,7 +930,26 @@ answered, but three properties of the decision above cost the rest:
    above `L - H`, up to `L - H/2`. On c6a.large row 14 the whole-pool cap
    alone refused the outer final aggregate, holding 14 MB, every time,
    while the inner aggregate held 734 MB and never got the refusal that
-   would make it spill.
+   would make it spill. Note (2026-11-08, the M3 verification run): the
+   fair-share refusal applies only once the total would also exceed
+   `L - H`. A grow that keeps the total at or under `L - H` is admitted
+   whatever the asker holds; over `L - H`, a grow within the asker's share
+   is admitted up to `L - H/2` and one over its share is refused, as the
+   note above says. Applied under the cap as well, the share made every
+   spill-capable consumer spill at `(L - H) / n` while most of `L - H` was
+   free. On c6a.large row 35 the holders wrote many small runs, and the
+   final aggregate's replay, which merges every run at once and cannot
+   spill again, grew past the cap with them and failed the retry. On a
+   test fixture of that shape, with the cap at half the unlimited peak and
+   three spill-capable consumers, the final aggregate was refused at its
+   share six times and its replay then failed; the whole-pool cap alone
+   and this rule each wrote three spill files and answered. Because a
+   replay cannot spill, a consumer that grows past its share while the
+   others hold little can still, under either rule, hold a replay over its
+   share when the others start: the row 14 test fixture fails that way
+   with the cap at 30 to 60 percent of its unlimited peak (the whole-pool
+   cap fails at 30, 50 and 60 percent), and answers at 70 percent and
+   above.
 3. **In a spill-enabled pool, a reserve-ahead refusal of a spill-capable
    consumer is a spill trigger, not a failure.** The same refusal of a
    consumer that cannot spill is unchanged, and so is any refusal in a
