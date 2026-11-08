@@ -102,6 +102,10 @@ pub struct QueryStatsJson {
     /// (ADR-3694 decision 3, issue #3865); not counted in `segmentsFetched`.
     #[serde(rename = "segmentsPrunedByLabelIndex")]
     pub segments_pruned_by_label_index: u64,
+    /// The label-value route's passes, one per distinct routed value
+    /// (issue #3960). Absent when the route did not run.
+    #[serde(rename = "labelIndexValues", skip_serializing_if = "Vec::is_empty")]
+    pub label_index_values: Vec<LabelIndexValueJson>,
     /// Fetched sparse objects the dictionary-first probe dropped on a
     /// LABEL_DICT miss (ADR-3694 decision 1, issue #3862).
     #[serde(rename = "segmentsPrunedByDictionary")]
@@ -160,6 +164,11 @@ impl From<crate::QueryStats> for QueryStatsJson {
             segments_fetched: stats.segments_fetched,
             segments_pruned: stats.segments_pruned,
             segments_pruned_by_label_index: stats.segments_pruned_by_label_index,
+            label_index_values: stats
+                .label_index_values
+                .iter()
+                .map(LabelIndexValueJson::from)
+                .collect(),
             segments_pruned_by_dictionary: stats.segments_pruned_by_dictionary,
             segments_probed_two_step: stats.segments_probed_two_step,
             dictionary_probe_switched_off: stats.dictionary_probe_switched_off,
@@ -169,6 +178,54 @@ impl From<crate::QueryStats> for QueryStatsJson {
             estimate: stats.estimate.into(),
             partial: stats.partial,
             warnings: stats.warnings.clone(),
+        }
+    }
+}
+
+/// One label-value routing pass, rendered as one element of
+/// `stats.labelIndexValues`: [`crate::key_index_route::ValueRouteFigures`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelIndexValueJson {
+    /// The label names whose positive equalities carry the value.
+    pub labels: Vec<String>,
+    /// The value's `key8` as 16 lowercase hex digits, never the value.
+    pub value_key8: String,
+    /// Leaf GETs the pass issued, on the logical-call basis of
+    /// [`PhaseCostJson::s3_get_requests`]. Counted in the `keyIndex` phase.
+    pub leaf_get_requests: u64,
+    /// Wire bytes of those GETs, as transferred: each range read's returned
+    /// bytes, a retried GET's failed attempts excluded.
+    pub leaf_wire_bytes: u64,
+    /// Leaf reads the read cache served with no GET.
+    pub leaf_cache_hits: u64,
+    pub parts_covered: u64,
+    pub parts_uncovered: u64,
+    pub parts_beyond_ceiling: u64,
+    pub leaves_rejected: u64,
+    pub reservations_refused: u64,
+    pub skipped_by_budget: u64,
+    pub segments_pruned: u64,
+    pub segments_pruned_alone: u64,
+}
+
+impl From<&crate::key_index_route::ValueRouteFigures> for LabelIndexValueJson {
+    fn from(value: &crate::key_index_route::ValueRouteFigures) -> Self {
+        let figures = &value.figures;
+        LabelIndexValueJson {
+            labels: value.labels.clone(),
+            value_key8: value.key8_hex.clone(),
+            leaf_get_requests: figures.leaf_get_requests,
+            leaf_wire_bytes: figures.leaf_wire_bytes,
+            leaf_cache_hits: figures.leaf_cache_hits,
+            parts_covered: figures.parts_covered,
+            parts_uncovered: figures.parts_uncovered,
+            parts_beyond_ceiling: figures.parts_beyond_ceiling,
+            leaves_rejected: figures.leaves_rejected,
+            reservations_refused: figures.reservations_refused,
+            skipped_by_budget: figures.skipped_by_budget,
+            segments_pruned: value.segments_pruned,
+            segments_pruned_alone: value.segments_pruned_alone,
         }
     }
 }
@@ -1521,6 +1578,55 @@ mod tests {
         let value =
             serde_json::to_value(QueryStatsJson::from(crate::QueryStats::default())).expect("json");
         assert_eq!(value["segmentsPrunedByLabelIndex"], 0);
+    }
+
+    #[test]
+    fn stats_json_carries_one_label_index_value_per_routed_value() {
+        let value_figures = crate::key_index_route::ValueRouteFigures {
+            labels: vec!["env".to_string(), "job".to_string()],
+            key8_hex: "0123456789abcdef".to_string(),
+            figures: crate::key_index_route::RouteFigures {
+                keys_probed: 1,
+                parts_covered: 3,
+                parts_uncovered: 4,
+                parts_beyond_ceiling: 5,
+                leaves_rejected: 6,
+                reservations_refused: 7,
+                leaf_get_requests: 8,
+                leaf_wire_bytes: 9,
+                leaf_cache_hits: 10,
+                skipped_by_budget: 11,
+            },
+            segments_pruned: 12,
+            segments_pruned_alone: 2,
+        };
+        let stats = crate::QueryStats {
+            label_index_values: vec![value_figures],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(QueryStatsJson::from(stats)).expect("serializes");
+        assert_eq!(
+            value["labelIndexValues"],
+            serde_json::json!([{
+                "labels": ["env", "job"],
+                "valueKey8": "0123456789abcdef",
+                "leafGetRequests": 8,
+                "leafWireBytes": 9,
+                "leafCacheHits": 10,
+                "partsCovered": 3,
+                "partsUncovered": 4,
+                "partsBeyondCeiling": 5,
+                "leavesRejected": 6,
+                "reservationsRefused": 7,
+                "skippedByBudget": 11,
+                "segmentsPruned": 12,
+                "segmentsPrunedAlone": 2,
+            }])
+        );
+
+        let value =
+            serde_json::to_value(QueryStatsJson::from(crate::QueryStats::default())).expect("json");
+        assert!(value.get("labelIndexValues").is_none());
     }
 
     #[test]
