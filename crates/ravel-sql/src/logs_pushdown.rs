@@ -668,7 +668,8 @@ fn handle_binary(be: &BinaryExpr, out: &mut LogsPushdown, declared: &[DeclaredCo
 
 /// The nine fixed `logs` schema columns ([`crate::logs_schema::logs_schema`]).
 /// A bare `Expr::Column` naming one of these is handled by the fixed-column path
-/// (only `ts` extracts anything today) and is NEVER resolved against declared
+/// (`ts` ranges, `body` and `severity_text` word predicates, and `trace_id`
+/// keys extract today) and is NEVER resolved against declared
 /// columns, even if a tenant also happens to declare a column of the same name:
 /// the fixed schema always wins, per ADR-0093's resolution-order guard.
 const FIXED_LOG_COLUMNS: [&str; 9] = [

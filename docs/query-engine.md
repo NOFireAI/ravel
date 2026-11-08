@@ -4142,7 +4142,7 @@ the logs entry holding the same ten fields as `stats.keyIndex`
 - `leafWireBytes`: the bytes those GETs returned, as transferred.
 - `keysProbed`: keys in the probed set, 1 for a `trace_id =` lookup the
   router ran for and the distinct id count for a routed `trace_id IN` list
-  of any length from 2, 0 when the lookup fell back to tier 1 before routing (a
+  of 2 to 1,024 distinct ids, 0 when the lookup fell back to tier 1 before routing (a
   refused parts charge, below).
 - `skippedByBudget`: parts the bridged-read allowance left uncovered.
 - `skipIdxDropped`: objects the fetcher read the key present in and then
@@ -5474,7 +5474,7 @@ rewrites a list of at most three values into `=` disjuncts before the scan
 sees it (one value into a plain `=`, which is an equality arm). A top-level
 disjunction whose every arm, at any nesting of `OR`, is `=` between one key
 column and a literal the list would accept carries the same key set as that
-list, so a key list of any length from 2 carries its key set. A disjunction
+list, so a key list of 2 to 1,024 distinct values carries its key set. A disjunction
 with arms on two columns, an arm on a non-key column, a non-equality arm, or a
 literal the list would refuse (a NULL, another type, a wrong-width trace id)
 carries no key. The pushdown stays `Inexact`: the residual re-applies the list over
