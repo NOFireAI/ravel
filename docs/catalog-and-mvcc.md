@@ -1573,6 +1573,22 @@ and `an_advancing_fold_reports_four_different_build_figures`, the second
 an advancing fold reading 4 sections, carrying 3 entries, in 2 passes with
 1 leaf GET, writing 2 leaves; both in `services/ravel-cli/tests/catalog_fold_key_index_leaves.rs`).
 
+The report also carries two figures that are not `/metrics` counters,
+so a reader can bound the pass count from the report alone:
+`key_index_pair_budget`, the budget the build ran under
+(`key_index_build_max_pairs`, at least 1), and `key_index_field_pairs`, a
+map from each field the build indexed to its pairs, one per distinct
+(key8, entry), summed over the parts the publishing attempt re-encoded. A
+declared field no section names is in the map with 0, and so is a field
+a section named during the build, so for a fold that re-encodes one part
+the map's size is the field count `F` the share `max(1, budget / F)`
+divides by. One fold covers one signal, so the map is keyed by field
+alone. Both are zero or empty with the switch off and on a no-op fold
+(test `the_fold_report_carries_the_pair_budget_and_every_fields_pairs`:
+`absent_key` 0, `session` 5 and `user_id` 5 under a budget of 6), and
+`ravel-cli catalog fold` prints both, under `--json` as a number and an
+object (test `the_json_report_carries_the_pair_budget_and_the_field_pairs`).
+
 When a compaction or erasure rewrite record lands, the fold re-encodes the
 part and rebuilds its leaves from the new entry set. An erasure rewrite
 therefore removes the subject's `key8` from the next leaf; the stale leaf is
