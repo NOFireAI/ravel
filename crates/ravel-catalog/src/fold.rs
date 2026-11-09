@@ -380,6 +380,24 @@ pub struct FoldReport {
     /// first range with the complete uncovered list, which adds its passes
     /// here.
     pub key_index_build_passes: u64,
+    /// The pair budget the leaf build ran under:
+    /// [`CatalogConfig::key_index_build_max_pairs`](crate::CatalogConfig::key_index_build_max_pairs),
+    /// at least 1. Each field the build indexes gets `max(1, budget / F)` pairs a pass,
+    /// where F is the number of fields in `key_index_field_pairs`. Zero when
+    /// the fold builds no leaf for this tenant and signal: the switch is off,
+    /// the signal is not indexed, a logs tenant declares no key-index field,
+    /// or a metrics erasure is pending; and on a no-op fold, which publishes
+    /// no leaf.
+    pub key_index_pair_budget: u64,
+    /// For each field the leaf build indexed, its key pairs, one per
+    /// distinct (key8, entry), summed over the parts the publishing attempt
+    /// re-encoded. A declared field with no pairs is present with 0, and so
+    /// is a field a section named during the build. For a field rebuilt
+    /// after a later pass found a new uncovered entry, the pairs of the
+    /// rebuild only. Keyed by field name alone: one fold covers one signal.
+    /// Empty when `key_index_pair_budget` is zero and on a fold that
+    /// re-encoded no part.
+    pub key_index_field_pairs: BTreeMap<String, u64>,
     /// GETs of the previous tail part's leaves, whole objects, one per
     /// (field, slice), issued when a re-encoded part shares a data object
     /// with that tail. Also counted in `get_requests`.
@@ -2283,6 +2301,9 @@ struct FieldBuild {
     attempt: u32,
     state: FieldBuildState,
     refs: Vec<SnapshotKeyIndexLeafRef>,
+    /// Pairs held by this attempt's passes, summed: each pass holds the
+    /// pairs of its own key8 range, and the ranges tile the key space.
+    pairs: u64,
 }
 
 impl FieldBuild {
@@ -2301,6 +2322,7 @@ impl FieldBuild {
             attempt: 0,
             state: FieldBuildState::Building,
             refs: Vec::new(),
+            pairs: 0,
         }
     }
 
@@ -2512,6 +2534,9 @@ pub(crate) struct BuiltPartKeyIndex {
     pub(crate) refs: Vec<SnapshotKeyIndexLeafRef>,
     pub(crate) uncovered_entries: u64,
     pub(crate) over_cap: bool,
+    /// Each field the build indexed, declared or named by a section, and
+    /// its pairs ([`FoldReport::key_index_field_pairs`]).
+    pub(crate) field_pairs: BTreeMap<String, u64>,
 }
 
 /// Builds and PUTs one re-encoded part's leaves (ADR-2707 decision 4, the
@@ -2882,8 +2907,10 @@ pub(crate) async fn build_part_key_index(
             refs: Vec::new(),
             uncovered_entries: 0,
             over_cap,
+            field_pairs: BTreeMap::new(),
         };
-        for field in fields.into_values() {
+        for (name, field) in fields {
+            built.field_pairs.insert(name, field.pairs);
             match field.state {
                 FieldBuildState::Done => {
                     built.uncovered_entries += field.uncovered.len() as u64;
@@ -2917,6 +2944,7 @@ fn end_key_index_pass(
     pending: &mut Vec<(String, u32, EncodedKeyIndexLeaf)>,
 ) {
     let mut held = key_index_sorted_pairs(std::mem::take(&mut field.held));
+    field.pairs += held.len() as u64;
     field.held_min = None;
     field.held_peak = 0;
     let end = field.end.take();
@@ -3011,6 +3039,7 @@ fn end_key_index_pass(
             field.lo = 0;
             field.slice_lo = 0;
             field.refs.clear();
+            field.pairs = 0;
         }
         None if field.stale => {
             tracing::warn!(
@@ -4131,6 +4160,7 @@ impl Catalog {
             let mut key_index_uncovered_entries: u64 = 0;
             let mut key_index_leaves_written: u64 = 0;
             let mut key_index_leaf_bytes_written: u64 = 0;
+            let mut key_index_field_pairs: BTreeMap<String, u64> = BTreeMap::new();
             for (span, encoding) in spans.iter().zip(span_encodings) {
                 // Single-part fold keeps exact v1 semantics: min_hour 0 (the
                 // epoch floor) and the fold watermark, byte-identical to the
@@ -4457,6 +4487,9 @@ impl Catalog {
                     key_index_leaves_written += built.refs.len() as u64;
                     key_index_leaf_bytes_written +=
                         built.refs.iter().map(|leaf| leaf.size).sum::<u64>();
+                    for (field, pairs) in built.field_pairs {
+                        *key_index_field_pairs.entry(field).or_insert(0) += pairs;
+                    }
                     key_index = built.refs;
                 }
 
@@ -4695,6 +4728,12 @@ impl Catalog {
                         key_index_sections_read: counters.key_index_sections_read,
                         key_index_entries_carried: counters.key_index_entries_carried,
                         key_index_build_passes: counters.key_index_build_passes,
+                        key_index_pair_budget: if key_index_fields.is_some() {
+                            self.config().key_index_build_max_pairs.max(1)
+                        } else {
+                            0
+                        },
+                        key_index_field_pairs,
                         key_index_leaf_gets: counters.key_index_leaf_gets,
                         metrics_label_index_parts_over_cap,
                         metrics_label_index_parts_erasure_gated,
@@ -5927,6 +5966,8 @@ fn no_op_report(
         key_index_sections_read: counters.key_index_sections_read,
         key_index_entries_carried: counters.key_index_entries_carried,
         key_index_build_passes: counters.key_index_build_passes,
+        key_index_pair_budget: 0,
+        key_index_field_pairs: BTreeMap::new(),
         key_index_leaf_gets: counters.key_index_leaf_gets,
         metrics_label_index_parts_over_cap: 0,
         metrics_label_index_parts_erasure_gated: 0,
@@ -15504,6 +15545,70 @@ pub(crate) mod tests {
             )
             .await
         );
+    }
+
+    /// #3948: the report carries the pair budget the build ran under and
+    /// every indexed field's pairs. `user_id` and `absent_key` are declared;
+    /// the sections name `user_id` and `session`, so `session` joins during
+    /// the build and `absent_key` holds no pair. Entry 1's ids 10, 10, 20 and
+    /// entry 2's 30, 40, 40, 50 are 2 + 3 distinct (key, entry) pairs per
+    /// named field, held over several passes under a budget of 6 (2 a field).
+    /// With the switch off the same fold reports neither.
+    #[tokio::test]
+    async fn the_fold_report_carries_the_pair_budget_and_every_fields_pairs() {
+        use crate::tenant_config::DeclaredColumnType;
+        const ABSENT: &str = "absent_key";
+        let fold_once = |build_key_index_leaves: bool| async move {
+            let store = Arc::new(MemoryStore::new());
+            declare_key_index_columns(
+                store.as_ref(),
+                &[
+                    (USER_ID, DeclaredColumnType::I64),
+                    (ABSENT, DeclaredColumnType::I64),
+                ],
+                1,
+            )
+            .await;
+            let fields = [(USER_ID, KeyType::I64), (SESSION, KeyType::I64)];
+            publish_keyed_logs(store.as_ref(), 1, KIDX_HOUR, &[10, 10, 20], 2, 0, &fields).await;
+            publish_keyed_logs(
+                store.as_ref(),
+                2,
+                KIDX_HOUR,
+                &[30, 40, 40, 50],
+                2,
+                0,
+                &fields,
+            )
+            .await;
+            let catalog = Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    build_key_index_leaves,
+                    key_index_build_max_pairs: 6,
+                    ..config(1)
+                },
+            )
+            .expect("catalog");
+            fold_through(&catalog, Signal::Logs, KIDX_HOUR).await
+        };
+
+        let on = fold_once(true).await;
+        assert_eq!(on.key_index_pair_budget, 6, "{on:?}");
+        assert_eq!(
+            on.key_index_field_pairs,
+            BTreeMap::from([
+                (ABSENT.to_string(), 0),
+                (SESSION.to_string(), 5),
+                (USER_ID.to_string(), 5),
+            ]),
+            "{on:?}"
+        );
+        assert!(on.key_index_build_passes > 1, "{on:?}");
+
+        let off = fold_once(false).await;
+        assert_eq!(off.key_index_pair_budget, 0, "{off:?}");
+        assert!(off.key_index_field_pairs.is_empty(), "{off:?}");
     }
 
     /// A new entry whose section names a field the tenant does not declare,
