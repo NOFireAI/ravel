@@ -338,15 +338,22 @@
 #                                       the next hour waits for it too; zj:
 #                                       an erasure that rewrote no part; zc3:
 #                                       a re-encoded old part is a tail part;
-#                                       zk: parts carried over an erased
-#                                       hour; zl: an unrelated re-encode is
-#                                       not an erased hour; zm: a dead
-#                                       maintain container ends the run (70).
+#                                       zk: parts carried over the erased
+#                                       hours; zl: an unrelated re-encode is
+#                                       not an erased hour; zm: a maintain
+#                                       container dead 60 s after it starts
+#                                       ends the run (70) before the seal
+#                                       wait; zn: the erasure alone, its
+#                                       reference snapshot stamped routed;
+#                                       zo: a rewrite that left hour
+#                                       490001's keys listed.
 #                                       stage1-check.sh: the ci band file
-#                                       clean on z1 (arm figures n/a), za,
-#                                       zb2, zc2, zc3, z20 and z21, out of
-#                                       band on z2, z2b, z15, z16, z17, z22,
-#                                       zb, zc, zd, ze, zj, zk, zl and an
+#                                       clean on z1 (arm figures n/a), za
+#                                       (the reference prune band n/a),
+#                                       zn, zb2, zc2, zc3, z20 and z21, out
+#                                       of band on z2, z2b, z15, z16, z17,
+#                                       z22, zb, zc, zd, ze, zj, zk, zl, zo
+#                                       and an
 #                                       edited copy of
 #                                       za, a
 #                                       missing cold count, missing,
@@ -668,12 +675,17 @@ JSON
           # STUB_SPANS_HEADER_STDOUT); STUB_SPANS_L1 makes every third
           # segment an L1 part; exit STUB_SPANS_LIST_EXIT /
           # STUB_SPANS_INSPECT_EXIT. Once the erasure completed (and without
-          # STUB_ERASURE_UNCHANGED) the hour-490000 objects (the even ones,
-          # shards 0 and 2) are gone and one rewrite output per shard is
-          # listed in their place, an L1 key in the same hour whose input-set
-          # and content hashes are new (erasure_rewrite.rs:1474-1482
-          # build_rewrite_part, keys.rs:520-542 l1_part_key, the line as
-          # main.rs:5139-5153 catalog_list_json_line prints it). Inspect prints a HEAD at watermark hour
+          # STUB_ERASURE_UNCHANGED) every listed object is gone, in every
+          # hour the extra hour 490002 included, since a windowless erasure
+          # rewrites every listed (shard, hour) bucket
+          # (services/ravel-server/src/maintain.rs:3614-3626), and one rewrite
+          # output per (shard, hour) is listed in their place, an L1 key in
+          # the same hour whose input-set and content hashes are new
+          # (erasure_rewrite.rs:1474-1482 build_rewrite_part, keys.rs:520-542
+          # l1_part_key, the line as main.rs:5139-5153 catalog_list_json_line
+          # prints it); STUB_ERASURE_PARTIAL replaces only the hour-490000
+          # objects (the even ones, shards 0 and 2), a rewrite that missed
+          # buckets. Inspect prints a HEAD at watermark hour
           # 490001 with three parts; the first STUB_INSPECT_LEAF_PARTS
           # (default 0) of them carry a label_value leaf, and once a
           # --rebuild-key-index fold has run the first
@@ -693,7 +705,7 @@ JSON
             [ ! -e "${STUB_STATE}.compacted" ] || l1=1
             [ ! -e "${STUB_STATE}.extra" ] || extra=1
             [ ! -e "${STUB_STATE}.erased" ] || [ -n "${STUB_ERASURE_UNCHANGED:-}" ] || erased=1
-            python3 -I -c 'import json,sys; n=int(sys.argv[1]); l1=sys.argv[2]=="1"; x=sys.argv[3]=="1"; e=sys.argv[4]=="1"; H=3600*10**9; spans=[H//2,3*H//2,3*H,12*H,30*H]; print("\n".join([json.dumps({"key":f"t/h1/m/l0/{i:06d}.rseg","level":"L1" if l1 and i%3==0 else "L0","shard":i%4,"ingest_hour_bucket":490002 if x and i%10==9 else 490000+i%2,"object_size":100,"min_event_ts_ns":10**18,"max_event_ts_ns":10**18+spans[i%5]}) for i in range(n) if not (e and i%2==0)] + [json.dumps({"key":f"t/h1/m/l1/{s:04d}/490000/{0xe0+s:016x}.0000.{0xe1+s:016x}.rseg","level":"L1","shard":s,"ingest_hour_bucket":490000,"object_size":100,"min_event_ts_ns":10**18,"max_event_ts_ns":10**18+H//2}) for s in ((0, 2) if e else ())]))' "${STUB_LIST_DATA:-300}" "$l1" "$extra" "$erased"
+            python3 -I -c 'import json,sys; n=int(sys.argv[1]); l1=sys.argv[2]=="1"; x=sys.argv[3]=="1"; e=sys.argv[4]=="1"; part=sys.argv[5]!=""; H=3600*10**9; spans=[H//2,3*H//2,3*H,12*H,30*H]; rows=[{"key":f"t/h1/m/l0/{i:06d}.rseg","level":"L1" if l1 and i%3==0 else "L0","shard":i%4,"ingest_hour_bucket":490002 if x and i%10==9 else 490000+i%2,"object_size":100,"min_event_ts_ns":10**18,"max_event_ts_ns":10**18+spans[i%5]} for i in range(n)]; gone=lambda r: e and (not part or r["ingest_hour_bucket"]==490000); print("\n".join([json.dumps(r) for r in rows if not gone(r)] + [json.dumps({"key":f"t/h1/m/l1/{s:04d}/{h}/{0xe0+s+16*(h-490000):016x}.0000.{0xe1+s+16*(h-490000):016x}.rseg","level":"L1","shard":s,"ingest_hour_bucket":h,"object_size":100,"min_event_ts_ns":10**18,"max_event_ts_ns":10**18+H//2}) for s, h in sorted({(r["shard"], r["ingest_hour_bucket"]) for r in rows if gone(r)})]))' "${STUB_LIST_DATA:-300}" "$l1" "$extra" "$erased" "${STUB_ERASURE_PARTIAL:-}"
             ;;
           *" catalog inspect "*)
             [ "${STUB_SPANS_INSPECT_EXIT:-0}" -eq 0 ] || exit "${STUB_SPANS_INSPECT_EXIT}"
@@ -708,8 +720,10 @@ JSON
               # STUB_UNRELATED_PART adds a part 4 over 490005..=490005, an
               # hour the listing never holds, re-encoded (new key and blake3)
               # once the erasure completed. Once the erasure completed, every
-              # part whose range holds the erased hour 490000 is rewritten (the
-              # parts STUB_ERASURE_REWRITTEN names instead when it is set; set
+              # part whose range holds an erased hour (490000 to 490002, the
+              # hours the listing above replaces; 490000 alone with
+              # STUB_ERASURE_PARTIAL) is rewritten (the parts
+              # STUB_ERASURE_REWRITTEN names instead when it is set; set
               # and empty rewrites none): a new key and blake3, and a new
               # label_value leaf unless STUB_ERASURE_STALE keeps the old one;
               # STUB_ERASURE_UNCHANGED rewrites nothing. STUB_EXTRA_REENCODE
@@ -717,6 +731,8 @@ JSON
               [ -z "${STUB_UNRELATED_PART:-}" ] || parts="${parts} 4"
               erased=""
               [ ! -e "${STUB_STATE}.erased" ] || [ -n "${STUB_ERASURE_UNCHANGED:-}" ] || erased=1
+              erased_hours="490000 490001 490002"
+              [ -z "${STUB_ERASURE_PARTIAL:-}" ] || erased_hours=490000
               printf 'format_version: 1\n'                        # catalog.rs:870
               printf 'tenant_hash: %064x\n' 7                     # catalog.rs:871-874
               printf 'signal: metrics (1)\n'                      # catalog.rs:878-882, 971-992
@@ -741,8 +757,10 @@ JSON
                     rewrite=1
                   elif [ -n "${STUB_ERASURE_REWRITTEN+set}" ]; then
                     case " ${STUB_ERASURE_REWRITTEN} " in *" $i "*) rewrite=1 ;; esac
-                  elif [ "$lo" -le 490000 ] && [ "$hi" -ge 490000 ]; then
-                    rewrite=1
+                  else
+                    for h in $erased_hours; do
+                      if [ "$lo" -le "$h" ] && [ "$hi" -ge "$h" ]; then rewrite=1; fi
+                    done
                   fi
                 fi
                 if [ -n "$rewrite" ]; then
@@ -830,8 +848,9 @@ JSON
     ;;
   inspect)
     shift
-    # run.sh's per-poll liveness check on the maintain container
-    # (stage1_erasure_step, docker inspect --format '{{.State.Status}}').
+    # run.sh's liveness check on the maintain container, 60 s after it
+    # starts and at every poll (stage1_maintain_alive, docker inspect
+    # --format '{{.State.Status}}').
     if [ "$1" = --format ]; then
       if [ -n "${STUB_MAINTAIN_EXITED:-}" ]; then echo exited; else echo running; fi
       exit 0
@@ -855,7 +874,7 @@ JSON
     done
     printf ']\n'
     ;;
-  # docker logs on the maintain container (run.sh stage1_erasure_step,
+  # docker logs on the maintain container (run.sh stage1_maintain_alive,
   # "$DOCKER" logs "$name").
   logs)
     echo "stub maintain log for $2"
@@ -3275,8 +3294,8 @@ check "za: the leaf-on fold started from the routed HEAD, the leaf-off fold from
 check "za: the extra hour's tail objects, leaf bytes over the bytes of the objects its tail parts cover and its one covered tail part" '{k: j("stamps.json")["stage1"]["extra_hour"][k] for k in ("tail_objects", "tail_data_bytes", "leaf_bytes", "leaf_bytes_denominator_objects", "leaf_bytes_denominator", "leaf_bytes_ratio", "tail_parts", "repartitioned_parts", "uncovered_tail_parts_count")} == {"tail_objects": 30, "tail_data_bytes": 3000, "leaf_bytes": 10, "leaf_bytes_denominator_objects": 30, "leaf_bytes_denominator": 3000, "tail_parts": 1, "repartitioned_parts": 0, "leaf_bytes_ratio": 10 / 3000, "uncovered_tail_parts_count": 0}'
 check "za: the control pass ran on the control image and compares GETs, bytes and latency per statement" 'j("stamps.json")["stage1"]["control"]["fold_state"].endswith("; image '"${CONTROL_IMAGE}"'") and j("stamps.json")["stage1"]["control_image"]["control"]["source_commit"] == "'"${CONTROL_COMMIT}"'" and {k: j("stage1-control-compare.json")[k] for k in ("statements_compared", "statements_more_gets_count", "statements_more_bytes_count", "statements_unchecked_count", "statements_slower_count", "latency_ratio_max")} == {"statements_compared": len('"${CORPUS_IDS}"'), "statements_more_gets_count": 0, "statements_more_bytes_count": 0, "statements_unchecked_count": 0, "statements_slower_count": 0, "latency_ratio_max": 1.0}'
 check "za: compact-tenant's counters, the L1 objects listed and the l1 pass equal to the routed one" 'j("stamps.json")["stage1"]["l1_compact"]["compacted"] == 2 and j("stamps.json")["stage1"]["l1_compact"]["failed"] == 0 and j("stamps.json")["stage1"]["l1_objects"]["l1_objects"] == 100 and j("stage1-l1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"') == j("stage1-l1-compare.json")["entries_equal"]'
-check "za: the erasure names its subject, the rewrite's state and path, one erased hour whose three overlapping parts are all gone with no stale leaf, and leaves the sweep unchecked" 'j("stamps.json")["stage1"]["erasure_submit"]["matcher"] == "instance=\"metricsbench-instance-0\"" and j("stamps.json")["stage1"]["erasure_rewrite"]["state"] == "COMPLETED" and j("stamps.json")["stage1"]["erasure_rewrite"]["deferral_cause"] == "none (completed cleanly)" and "dropped_total" not in j("stamps.json")["stage1"]["erasure_rewrite"] and j("stamps.json")["stage1"]["erasure_rewrite"]["path"].startswith("a one-off ravel-server --mode maintain container") and {k: j("stamps.json")["stage1"]["erasure_leaves"][k] for k in ("parts_before", "parts_after", "objects_before", "objects_after", "erased_hours_count", "erased_hours", "overlapping_parts_count", "carried_over_parts_count", "stale_leaves_count")} == {"parts_before": 4, "parts_after": 4, "objects_before": 300, "objects_after": 152, "erased_hours_count": 1, "erased_hours": [{"hour": 490000, "keys_before": 150, "keys_gone": 150, "keys_new": 2}], "overlapping_parts_count": 3, "carried_over_parts_count": 0, "stale_leaves_count": 0} and j("stamps.json")["stage1"]["erasure_sweep"].startswith("not checked: ") and j("stage1-erasure-compare.json")["base"] == "erasure_reference" and j("stage1-erasure-compare.json")["other"] == "erasure_pending" and j("stage1-erasure-compare.json")["entries_differing_count"] == 0'
-check "za: the subject compare: the reference pass pruned by the label index as the routed pass did, one entry answered without the subject's series" 'j("stage1-erasure-subject.json")["base"] == "routed" and j("stage1-erasure-subject.json")["other"] == "erasure_reference" and j("stage1-erasure-subject.json")["other_records_pruned_by_label_index"] == len('"${CORPUS_IDS}"') and j("stage1-erasure-subject.json")["label_index_prune_mismatch_count"] == 0 and j("stage1-erasure-subject.json")["entries_differing_count"] == 1'
+check "za: the erasure names its subject, the rewrite's state and path, every listed key replaced in all three hours (one rewrite output per shard and hour), the four overlapping parts all gone with no stale leaf, and leaves the sweep unchecked" 'j("stamps.json")["stage1"]["erasure_submit"]["matcher"] == "instance=\"metricsbench-instance-0\"" and j("stamps.json")["stage1"]["erasure_rewrite"]["state"] == "COMPLETED" and j("stamps.json")["stage1"]["erasure_rewrite"]["deferral_cause"] == "none (completed cleanly)" and "dropped_total" not in j("stamps.json")["stage1"]["erasure_rewrite"] and j("stamps.json")["stage1"]["erasure_rewrite"]["path"].startswith("a one-off ravel-server --mode maintain container") and {k: j("stamps.json")["stage1"]["erasure_leaves"][k] for k in ("parts_before", "parts_after", "objects_before", "objects_after", "hours_before_count", "keys_surviving_count", "keys_surviving", "erased_hours_count", "erased_hours", "overlapping_parts_count", "carried_over_parts_count", "stale_leaves_count")} == {"parts_before": 4, "parts_after": 4, "objects_before": 300, "objects_after": 6, "hours_before_count": 3, "keys_surviving_count": 0, "keys_surviving": [], "erased_hours_count": 3, "erased_hours": [{"hour": 490000, "keys_before": 150, "keys_gone": 150, "keys_new": 2}, {"hour": 490001, "keys_before": 120, "keys_gone": 120, "keys_new": 2}, {"hour": 490002, "keys_before": 30, "keys_gone": 30, "keys_new": 2}], "overlapping_parts_count": 4, "carried_over_parts_count": 0, "stale_leaves_count": 0} and j("stamps.json")["stage1"]["erasure_sweep"].startswith("not checked: ") and j("stage1-erasure-compare.json")["base"] == "erasure_reference" and j("stage1-erasure-compare.json")["other"] == "erasure_pending" and j("stage1-erasure-compare.json")["entries_differing_count"] == 0'
+check "za: the subject compare: the reference pass pruned by the label index as the routed pass did, one entry answered without the subject's series, and the reference snapshot stamped changed by the extra-hour and l1 arms" 'j("stamps.json")["stage1"]["erasure_reference_snapshot"].startswith("changed: extra-hour, l1 (") and j("stage1-erasure-subject.json")["base"] == "routed" and j("stage1-erasure-subject.json")["other"] == "erasure_reference" and j("stage1-erasure-subject.json")["other_records_pruned_by_label_index"] == len('"${CORPUS_IDS}"') and j("stage1-erasure-subject.json")["label_index_prune_mismatch_count"] == 0 and j("stage1-erasure-subject.json")["entries_differing_count"] == 1'
 check "za: the seal wait, from the hour holding submit + 300 s, and the maintain container's flags, user and start time are stamped" 'set(j("stamps.json")["stage1"]["erasure_seal_wait"]) == {"submitted_unix_s", "deadline_unix_s", "sleep_s", "waited_s", "basis"} and j("stamps.json")["stage1"]["erasure_seal_wait"]["deadline_unix_s"] == ((j("stamps.json")["stage1"]["erasure_seal_wait"]["submitted_unix_s"] + 300) // 3600 + 1) * 3600 + 3900 and set(j("stamps.json")["stage1"]["erasure_maintain"]) == {"command", "user", "started_unix_s", "note"} and j("stamps.json")["stage1"]["erasure_maintain"]["command"].startswith("ravel-server --mode maintain --store s3 ") and "--maintain-key-file /maintain.key" in j("stamps.json")["stage1"]["erasure_maintain"]["command"] and j("stamps.json")["stage1"]["erasure_maintain"]["user"] == "'"$(id -u):$(id -g)"'" and j("stamps.json")["stage1"]["erasure_maintain"]["started_unix_s"] >= j("stamps.json")["stage1"]["erasure_seal_wait"]["submitted_unix_s"] and "no ravel-server flag turns compaction off" in j("stamps.json")["stage1"]["erasure_maintain"]["note"]'
 expect_log "za: the maintain container runs as the invoking user, so it can read the 0600 key file" "run -d --no-deps --user $(id -u):$(id -g) --name metricsbench-stage1-maintain --entrypoint /usr/local/bin/ravel-server"
 check "za: l1 is stamped not measured" 'isinstance(j("stamps.json")["stage1"]["l1_not_measured"], str) and j("stamps.json")["stage1"]["l1_not_measured"] != ""'
@@ -3353,7 +3372,7 @@ MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASURE_STALE=1 STUB_RUN_FIGURES="${TMP}
 expect_rc ze 0
 check "ze: the erasure steps alone, after stage1-holders" 'j("stamps.json")["steps_completed"][-7:] == ["stage1-holders","stage1-erasure-reference","stage1-erasure-submit","stage1-erasure-pending","stage1-erasure-rewrite","stage1-erasure-fold","stage1-erasure"] and j("stamps.json")["stage1"]["arms"] == {"control": False, "extra_hour": False, "l1": False, "erasure": True}'
 check "ze: each rewritten part still referencing its pre-erasure leaf is named" 'j("stamps.json")["stage1"]["erasure_leaves"]["carried_over_parts_count"] == 0 and j("stamps.json")["stage1"]["erasure_leaves"]["stale_leaves"] == [{"part_before": f"t/h1/m/catalog/part-{i}", "part_after": f"t/h1/m/catalog/part-{i}-e", "leaf": f"t/h1/m/ki/{i}-v", "field": "label_value"} for i in range(3)]'
-check "ze: the reference's prunes against the routed pass's, per entry, and the pending record with no prune figure" 'j("stage1-erasure-subject.json")["label_index_prune_mismatch_count"] == len('"${CORPUS_IDS}"') and j("stage1-erasure-subject.json")["label_index_prune_mismatch"][0] == {"entry": j("stage1-erasure-subject.json")["label_index_prune_mismatch"][0]["entry"], "routed": [3], "erasure_reference": [2]} and j("stage1-erasure-compare.json")["other_records_label_index_null"] == 1 and j("stage1-erasure-compare.json")["other_records_pruned_by_label_index"] == len('"${CORPUS_IDS}"') - 1'
+check "ze: the reference's prunes against the routed pass's, per entry, on a reference snapshot stamped routed, and the pending record with no prune figure" 'j("stamps.json")["stage1"]["erasure_reference_snapshot"] == "routed" and j("stage1-erasure-subject.json")["label_index_prune_mismatch_count"] == len('"${CORPUS_IDS}"') and j("stage1-erasure-subject.json")["label_index_prune_mismatch"][0] == {"entry": j("stage1-erasure-subject.json")["label_index_prune_mismatch"][0]["entry"], "routed": [3], "erasure_reference": [2]} and j("stage1-erasure-compare.json")["other_records_label_index_null"] == 1 and j("stage1-erasure-compare.json")["other_records_pruned_by_label_index"] == len('"${CORPUS_IDS}"') - 1'
 
 # zf: the switches are refused before anything starts.
 MB_STAGE1=1 MB_CONTROL_IMAGE="stub/ravel-control:latest" MB_CONTROL_SOURCE_COMMIT="${CONTROL_COMMIT}" run_stage1 zf1 ci
@@ -3398,17 +3417,18 @@ else
   fail "zh: the maintain record key mount '${key_mount:-}' is under ${OUT} or still exists"
 fi
 
-# zm: a maintain container that exited before the erasure completed ends the
-# run at the first poll, its log captured, rather than after every try.
+# zm: a maintain container already exited 60 s after it started ends the run
+# there, its log captured, before the seal wait and the first poll.
 MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASE_PENDING=1 STUB_MAINTAIN_EXITED=1 METRICSBENCH_ERASURE_TRIES=3 run_stage1 zm ci
 expect_rc zm 70
-expect_err "zm: the failure names the step, the container state and the poll" "step stage1-erasure-rewrite failed: the maintain container metricsbench-stage1-maintain is exited at poll 1 and erasure "
-check "zm: the rewrite is stamped failed and the steps stop before it" 'j("stamps.json")["stage1"]["erasure_rewrite"] == "failed: the maintain container is exited at poll 1, before erase status said COMPLETED" and j("stamps.json")["steps_completed"][-1] == "stage1-erasure-pending"'
-if [ "$(grep -c ' erase status ' "${LOG}")" -eq 1 ] && ! grep -qx 'stubsleep 15' "${LOG}" &&
+expect_err "zm: the failure names the step, the container state and the 60 s check" "step stage1-erasure-rewrite failed: the maintain container metricsbench-stage1-maintain is exited 60 s after it started and erasure "
+check "zm: the rewrite is stamped failed and the steps stop before it" 'j("stamps.json")["stage1"]["erasure_rewrite"] == "failed: the maintain container is exited 60 s after it started, before erase status said COMPLETED" and j("stamps.json")["steps_completed"][-1] == "stage1-erasure-pending"'
+if [ "$(grep -c ' erase status ' "${LOG}")" -eq 0 ] && [ "$(sed -n '/ --mode maintain /,$p' "${LOG}" | grep -c '^stubsleep ')" -eq 1 ] &&
+  [ "$(sed -n '/ --mode maintain /,$p' "${LOG}" | grep -m1 '^stubsleep ')" = 'stubsleep 60' ] &&
   grep -qxF 'stub maintain log for metricsbench-stage1-maintain' "${OUT}/stage1-erasure-maintain.log"; then
-  pass "zm: one erase status, no poll sleep, and the container's log in stage1-erasure-maintain.log"
+  pass "zm: after the maintain container starts, one 60 s sleep, no seal sleep, no erase status, and the container's log in stage1-erasure-maintain.log"
 else
-  fail "zm: $(grep -c ' erase status ' "${LOG}") erase status calls, or a poll sleep, or no captured log"
+  fail "zm: $(grep -c ' erase status ' "${LOG}") erase status calls, sleeps after the maintain start: $(sed -n '/ --mode maintain /,$p' "${LOG}" | grep '^stubsleep ' | tr '\n' ' '), or no captured log"
 fi
 if key_mount="$(grep '^docker compose .* --mode maintain ' "${LOG}" | grep -oE -- '-v [^ ]+:/maintain.key:ro' | sed -e 's/^-v //' -e 's/:\/maintain.key:ro$//')" &&
   [ -n "${key_mount}" ] && [ ! -e "${key_mount}" ]; then
@@ -3458,17 +3478,31 @@ MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASURE_UNCHANGED=1 STUB_RUN_FIGURES="${
 expect_rc zj 0
 check "zj: no erased hour, so no overlapping part, carried part or stale leaf either" '{k: j("stamps.json")["stage1"]["erasure_leaves"][k] for k in ("erased_hours_count", "overlapping_parts_count", "carried_over_parts_count", "stale_leaves_count")} == {"erased_hours_count": 0, "overlapping_parts_count": 0, "carried_over_parts_count": 0, "stale_leaves_count": 0}'
 
-# zk: the rewrite replaced hour 490000's objects but the fold kept parts 1
-# and 2, whose ranges hold that hour, with their keys, blake3 and leaves.
+# zk: the rewrite replaced every object (hours 490000 and 490001) but the
+# fold kept parts 1 and 2, whose ranges hold both hours, with their keys,
+# blake3 and leaves.
 MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASURE_REWRITTEN=0 STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 zk ci
 expect_rc zk 0
-check "zk: the two carried parts over the erased hour and their leaves are named" 'j("stamps.json")["stage1"]["erasure_leaves"]["erased_hours_count"] == 1 and j("stamps.json")["stage1"]["erasure_leaves"]["carried_over_parts"] == [{"key": f"t/h1/m/catalog/part-{i}", "blake3": f"{i + 1:064x}", "range": [490000, 490001], "erased_hours": [490000]} for i in (1, 2)] and [l["leaf"] for l in j("stamps.json")["stage1"]["erasure_leaves"]["stale_leaves"]] == ["t/h1/m/ki/1-v", "t/h1/m/ki/2-v"]'
+check "zk: the two carried parts over the erased hours and their leaves are named" 'j("stamps.json")["stage1"]["erasure_leaves"]["erased_hours_count"] == 2 and j("stamps.json")["stage1"]["erasure_leaves"]["keys_surviving_count"] == 0 and j("stamps.json")["stage1"]["erasure_leaves"]["carried_over_parts"] == [{"key": f"t/h1/m/catalog/part-{i}", "blake3": f"{i + 1:064x}", "range": [490000, 490001], "erased_hours": [490000, 490001]} for i in (1, 2)] and [l["leaf"] for l in j("stamps.json")["stage1"]["erasure_leaves"]["stale_leaves"]] == ["t/h1/m/ki/1-v", "t/h1/m/ki/2-v"]'
 
-# zl: no part over the erased hour is rewritten; a part over an hour no
+# zl: no part over the erased hours is rewritten; a part over an hour no
 # listed object holds (490005) is re-encoded, and does not count.
 MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASURE_REWRITTEN="" STUB_UNRELATED_PART=1 STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 zl ci
 expect_rc zl 0
-check "zl: the re-encode outside the erased hours is neither overlapping nor carried; the three parts over 490000 are carried" '{k: j("stamps.json")["stage1"]["erasure_leaves"][k] for k in ("parts_before", "erased_hours_count", "overlapping_parts_count", "carried_over_parts_count", "stale_leaves_count")} == {"parts_before": 4, "erased_hours_count": 1, "overlapping_parts_count": 3, "carried_over_parts_count": 3, "stale_leaves_count": 3} and "t/h1/m/catalog/part-4" not in [p["key"] for p in j("stamps.json")["stage1"]["erasure_leaves"]["carried_over_parts"]]'
+check "zl: the re-encode outside the erased hours is neither overlapping nor carried; the three parts over 490000 and 490001 are carried" '{k: j("stamps.json")["stage1"]["erasure_leaves"][k] for k in ("parts_before", "erased_hours_count", "overlapping_parts_count", "carried_over_parts_count", "stale_leaves_count")} == {"parts_before": 4, "erased_hours_count": 2, "overlapping_parts_count": 3, "carried_over_parts_count": 3, "stale_leaves_count": 3} and "t/h1/m/catalog/part-4" not in [p["key"] for p in j("stamps.json")["stage1"]["erasure_leaves"]["carried_over_parts"]]'
+
+# zn: the erasure alone, every figure in band: the reference reads the
+# routed pass's snapshot and is stamped routed, every listed key in both
+# hours is replaced.
+MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 zn ci
+expect_rc zn 0
+check "zn: the reference snapshot stamped routed, no key surviving, both hours erased" 'j("stamps.json")["stage1"]["erasure_reference_snapshot"] == "routed" and {k: j("stamps.json")["stage1"]["erasure_leaves"][k] for k in ("objects_before", "objects_after", "hours_before_count", "keys_surviving_count", "keys_surviving", "erased_hours_count")} == {"objects_before": 300, "objects_after": 4, "hours_before_count": 2, "keys_surviving_count": 0, "keys_surviving": [], "erased_hours_count": 2}'
+
+# zo: a rewrite that replaced hour 490000's objects only, leaving hour
+# 490001's listed as they were: the surviving keys are counted and named.
+MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASURE_PARTIAL=1 STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 zo ci
+expect_rc zo 0
+check "zo: 150 surviving keys, the first 20 named, one erased hour of two" '{k: j("stamps.json")["stage1"]["erasure_leaves"][k] for k in ("objects_before", "objects_after", "hours_before_count", "keys_surviving_count", "keys_surviving", "erased_hours_count", "erased_hours")} == {"objects_before": 300, "objects_after": 152, "hours_before_count": 2, "keys_surviving_count": 150, "keys_surviving": [f"t/h1/m/l0/{i:06d}.rseg" for i in range(1, 40, 2)], "erased_hours_count": 1, "erased_hours": [{"hour": 490000, "keys_before": 150, "keys_gone": 150, "keys_new": 2}]}'
 
 # za1: no arm switch: the arm steps do not run and each arm's stamps say so.
 OUT="${TMP}/z1/out"
@@ -3501,8 +3535,10 @@ ARM_FIGURES="$(python3 -I -c 'import json,sys; print(sum("when" in f for f in js
 # Clean: the shipped ci band file against case z1's run, every arm's figure n/a.
 run_check clean "${CI_BANDS}" "${TMP}/z1/out"
 if [ "${rc}" -eq 0 ] && [ "$(wc -l <"${CHECK_OUT}")" -eq "${FIGURES}" ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq $((FIGURES - ARM_FIGURES)) ] &&
-  [ "$(grep -c '^n/a ' "${CHECK_OUT}")" -eq "${ARM_FIGURES}" ] && [ "${ARM_FIGURES}" -eq 25 ] &&
+  [ "$(grep -c '^n/a ' "${CHECK_OUT}")" -eq "${ARM_FIGURES}" ] && [ "${ARM_FIGURES}" -eq 26 ] &&
   grep -qxF 'n/a l1_objects: stage1.arms.l1 is false, not true (stamps.json stage1.l1_objects.l1_objects)' "${CHECK_OUT}" &&
+  grep -qxF 'n/a erasure_keys_surviving: stage1.arms.erasure is false, not true (stamps.json stage1.erasure_leaves.keys_surviving_count)' "${CHECK_OUT}" &&
+  grep -q '^n/a erasure_reference_prune_mismatch: stage1.erasure_reference_snapshot is "skipped: ' "${CHECK_OUT}" &&
   grep -qxF 'ok leaves_parts_rebuilt = 3 in [1, null] (stamps.json stage1.leaves.parts_rebuilt)' "${CHECK_OUT}" &&
   grep -qxF 'ok unrouted_records_pruned_by_label_index = 0 in [0, 0] (stage1-compare.json passes.unrouted.records_pruned_by_label_index)' "${CHECK_OUT}" &&
   grep -qxF 'ok holders_selective_job_rate_sum = 2 in [1, null] (holders.json statements[id=mb_selective_job_rate_sum].holders)' "${CHECK_OUT}"; then
@@ -3511,22 +3547,25 @@ else
   fail "check clean: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
 fi
 
-# The arms' bands: every figure in band on case za's run, every arm on.
+# The arms' bands: every figure in band on case za's run, every arm on, but
+# the reference prune band, n/a since the extra-hour and l1 arms changed the
+# snapshot the reference pass reads.
 run_check arms "${CI_BANDS}" "${TMP}/za/out"
-if [ "${rc}" -eq 0 ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq "${FIGURES}" ] &&
+if [ "${rc}" -eq 0 ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq $((FIGURES - 1)) ] && [ "$(grep -c '^n/a ' "${CHECK_OUT}")" -eq 1 ] &&
   grep -qxF 'ok extra_hour_leaf_bytes_ratio = 0.0033333333333333335 in [0, 0.01] (stamps.json stage1.extra_hour.leaf_bytes_ratio)' "${CHECK_OUT}" &&
   grep -qxF 'ok extra_hour_tail_parts = 1 in [1, null] (stamps.json stage1.extra_hour.tail_parts)' "${CHECK_OUT}" &&
   grep -qxF 'ok control_statements_slower = 0 in [0, 0] (stage1-control-compare.json statements_slower_count)' "${CHECK_OUT}" &&
-  grep -qxF 'ok erasure_reference_prune_mismatch = 0 in [0, 0] (stage1-erasure-subject.json label_index_prune_mismatch_count)' "${CHECK_OUT}" &&
+  grep -qxF 'n/a erasure_reference_prune_mismatch: stage1.erasure_reference_snapshot is "changed: extra-hour, l1 (run after the routed pass, so the reference pass reads a snapshot the routed pass did not)", not "routed" (stage1-erasure-subject.json label_index_prune_mismatch_count)' "${CHECK_OUT}" &&
   grep -qxF 'ok erasure_pending_label_index_null = 0 in [0, 0] (stage1-erasure-compare.json other_records_label_index_null)' "${CHECK_OUT}" &&
   grep -qxF 'ok erasure_subject_entries_differing = 1 in [1, null] (stage1-erasure-subject.json entries_differing_count)' "${CHECK_OUT}" &&
   grep -qxF 'ok erasure_pending_status_unexpected = 0 in [0, 0] (stage1-erasure-compare.json other_records_status_unexpected)' "${CHECK_OUT}" &&
   grep -qxF 'ok erasure_pending_entries_without_hash = 0 in [0, 0] (stage1-erasure-compare.json entries_without_hash_count)' "${CHECK_OUT}" &&
-  grep -qxF 'ok erasure_erased_hours = 1 in [1, null] (stamps.json stage1.erasure_leaves.erased_hours_count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok erasure_erased_hours = 3 in [1, null] (stamps.json stage1.erasure_leaves.erased_hours_count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok erasure_keys_surviving = 0 in [0, 0] (stamps.json stage1.erasure_leaves.keys_surviving_count)' "${CHECK_OUT}" &&
   grep -qxF 'ok erasure_carried_over_erased_hours = 0 in [0, 0] (stamps.json stage1.erasure_leaves.carried_over_parts_count)' "${CHECK_OUT}" &&
   grep -qxF 'ok erasure_stale_leaves = 0 in [0, 0] (stamps.json stage1.erasure_leaves.stale_leaves_count)' "${CHECK_OUT}" &&
   ! grep -q 'dropped_total\|fetch_memory' "${CHECK_OUT}"; then
-  pass "check arms: exit 0, every figure ok on za's run"
+  pass "check arms: exit 0, every figure ok on za's run but the reference prune band, n/a on a changed snapshot"
 else
   fail "check arms: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
 fi
@@ -3565,17 +3604,30 @@ run_check arm-erasure "${CI_BANDS}" "${TMP}/ze/out"
 expect_rc "check erasure" 1
 expect_check_err "check erasure: a pending record the label index pruned" "out of band erasure_pending_pruned_by_label_index = 23 not in [0, 0] (stage1-erasure-compare.json other_records_pruned_by_label_index)"
 expect_check_err "check erasure: the stale leaves" "out of band erasure_stale_leaves = 3 not in [0, 0] (stamps.json stage1.erasure_leaves.stale_leaves_count)"
-expect_check_err "check erasure: a reference pass pruning fewer segments than the routed one" "out of band erasure_reference_prune_mismatch = 24 not in [0, 0] (stage1-erasure-subject.json label_index_prune_mismatch_count)"
+expect_check_err "check erasure: a reference pass on the routed snapshot pruning fewer segments than the routed one" "out of band erasure_reference_prune_mismatch = 24 not in [0, 0] (stage1-erasure-subject.json label_index_prune_mismatch_count)"
 expect_check_err "check erasure: a reference pass answering as the routed one" "out of band erasure_subject_entries_differing = 0 not in [1, null] (stage1-erasure-subject.json entries_differing_count)"
 expect_check_err "check erasure: a pending record with no prune figure" "out of band erasure_pending_label_index_null = 1 not in [0, 0] (stage1-erasure-compare.json other_records_label_index_null)"
 expect_check_err "check erasure: five failures counted" "stage1-check: 5 of ${FIGURES} figures failed"
 run_check arm-erasure-unchanged "${CI_BANDS}" "${TMP}/zj/out"
 expect_rc "check erasure unchanged" 1
 expect_check_err "check erasure unchanged: no erased hour" "out of band erasure_erased_hours = 0 not in [1, null] (stamps.json stage1.erasure_leaves.erased_hours_count)"
-expect_check_err "check erasure unchanged: one failure counted" "stage1-check: 1 of ${FIGURES} figures failed"
+expect_check_err "check erasure unchanged: every key surviving" "out of band erasure_keys_surviving = 300 not in [0, 0] (stamps.json stage1.erasure_leaves.keys_surviving_count)"
+expect_check_err "check erasure unchanged: two failures counted" "stage1-check: 2 of ${FIGURES} figures failed"
+run_check arm-erasure-routed "${CI_BANDS}" "${TMP}/zn/out"
+if [ "${rc}" -eq 0 ] &&
+  grep -qxF 'ok erasure_reference_prune_mismatch = 0 in [0, 0] (stage1-erasure-subject.json label_index_prune_mismatch_count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok erasure_keys_surviving = 0 in [0, 0] (stamps.json stage1.erasure_leaves.keys_surviving_count)' "${CHECK_OUT}"; then
+  pass "check erasure routed: zn's reference snapshot is routed, so the prune band is checked, and passes"
+else
+  fail "check erasure routed: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
+fi
+run_check arm-erasure-partial "${CI_BANDS}" "${TMP}/zo/out"
+expect_rc "check erasure partial" 1
+expect_check_err "check erasure partial: hour 490001's keys surviving the rewrite" "out of band erasure_keys_surviving = 150 not in [0, 0] (stamps.json stage1.erasure_leaves.keys_surviving_count)"
+expect_check_err "check erasure partial: one failure counted" "stage1-check: 1 of ${FIGURES} figures failed"
 run_check arm-erasure-carried "${CI_BANDS}" "${TMP}/zk/out"
 expect_rc "check erasure carried" 1
-expect_check_err "check erasure carried: parts 1 and 2 still over the erased hour" "out of band erasure_carried_over_erased_hours = 2 not in [0, 0] (stamps.json stage1.erasure_leaves.carried_over_parts_count)"
+expect_check_err "check erasure carried: parts 1 and 2 still over the erased hours" "out of band erasure_carried_over_erased_hours = 2 not in [0, 0] (stamps.json stage1.erasure_leaves.carried_over_parts_count)"
 expect_check_err "check erasure carried: their leaves" "out of band erasure_stale_leaves = 2 not in [0, 0] (stamps.json stage1.erasure_leaves.stale_leaves_count)"
 expect_check_err "check erasure carried: two failures counted" "stage1-check: 2 of ${FIGURES} figures failed"
 run_check arm-erasure-unrelated "${CI_BANDS}" "${TMP}/zl/out"
