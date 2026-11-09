@@ -423,6 +423,23 @@ tenant per day. The decision is design only: its partition rule is fixed
 here so D1's policy value can take it, and the task is dispatched only on
 a miss of the flip rows below.
 
+### Decision 2, clarified: a carried part keeps exactly its refs
+
+A part carried by reference keeps exactly the leaf refs it had; the fold
+never builds leaves for a part it carries. A day sealed while the metrics
+erasure gate held, or before a key-index field was declared, stays without
+that field's leaves until `ravel-cli catalog fold --rebuild-key-index`
+attaches them, as for any sealed part (ADR-2707 decision 4, Lifecycle). The
+fold report counts such parts (`key_index_parts_missing_declared_leaves`)
+and logs one warning per fold naming the fields, so the gap is visible.
+Retrying the build in the fold was rejected: a field whose build ends
+with no ref (over the metrics byte cap, every entry uncovered, no pairs)
+would re-read the day's sections on every fold, about 28,704 ranged GETs
+and 31.4 GB for a logs day, which A3 forbids. Declaring a key-index field
+for a tenant with the switch on is therefore followed by the repair over
+its sealed days. The repair builds in one pass today, about 6.8 GB of
+pairs for a logs day, over the 2 GB band; #4018 gives it the pair budget.
+
 ### Acceptance (added rows; predicted, a figure outside its band is a miss)
 
 | check | target | miss | source |
