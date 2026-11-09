@@ -58,8 +58,8 @@
 # [published.<instance_type>] rows (kit.py published, ADR-4034 D6): each
 # statement's hot and cold time at most published.statement_max_ratio x the
 # published one, a statement the published row answered and the arm did not
-# a miss, and concurrent QPS at least published.qps_min_ratio x the
-# published QPS. A miss names the statement, the figure, both values and
+# a miss, and concurrent QPS at least published.concurrent_qps_min_ratio x
+# the published QPS. A miss names the statement, the figure, both values and
 # their ratio, and counts as any other miss.
 #
 # A band that cannot be judged (a concurrent or q29_probe band on a run where

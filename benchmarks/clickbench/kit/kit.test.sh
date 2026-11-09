@@ -629,8 +629,8 @@ band_case "published malformed" 's/^q09 = \[13.433, 14.736\]$/q09 = [13.433, "no
   "published.c6a.large.q09 must be [hot, cold], each a number of at least 0 or 'null', got [13.433, 'none']"
 band_case "published source" 's/^\(source = ".*c6a.large.json\)@[0-9a-f]*"$/\1"/' \
   "published.c6a.large.source must be <file>.json@<40-hex commit>"
-band_case "published ratio" '/^\[published\]$/,/^\[/{/^qps_min_ratio = /d;}' \
-  'missing required key(s) published.qps_min_ratio'
+band_case "published ratio" '/^concurrent_qps_min_ratio = /d' \
+  'missing required key(s) published.concurrent_qps_min_ratio'
 
 # run_case NAME SED WANT: kit.py check-run on a copy of the run.toml edited by
 # SED must exit 2 with WANT in its message.

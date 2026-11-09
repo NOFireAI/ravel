@@ -154,7 +154,7 @@ STATEMENT_KEYS = tuple("q%02d" % n for n in range(1, 44))
 # and per statement [hot, cold] seconds, PUBLISHED_NULL where the published
 # run did not answer.
 PUBLISHED_LANES = ("rlog",)
-PUBLISHED_KEYS = ("statement_max_ratio", "qps_min_ratio")
+PUBLISHED_KEYS = ("statement_max_ratio", "concurrent_qps_min_ratio")
 PUBLISHED_MACHINE_KEYS = ("source", "concurrent_qps") + STATEMENT_KEYS
 PUBLISHED_NULL = "null"
 PUBLISHED_SOURCE_RE = re.compile(r"^\S+\.json@[0-9a-f]{40}$")
@@ -968,12 +968,12 @@ def published_bands(path, machine, report):
     ClickBench's results format always is. Each statement figure the
     published row answered misses above statement_max_ratio times the
     published seconds, or when the run did not answer it; concurrent QPS
-    misses below qps_min_ratio times the published QPS."""
+    misses below concurrent_qps_min_ratio times the published QPS."""
     if "result" not in report and "published" not in report["provenance"]["band_sections"]:
         return []
     top, pub = published_table(lane_of(path), path, machine)
     figures, qps, qps_note = _published_measured(path, report)
-    r, q = top["statement_max_ratio"], top["qps_min_ratio"]
+    r, q = top["statement_max_ratio"], top["concurrent_qps_min_ratio"]
     out = []
     for n, key in enumerate(STATEMENT_KEYS, 1):
         for i, figure in enumerate(("hot", "cold")):

@@ -193,13 +193,13 @@ q43 = "FILL-IN-ON-REFERENCE-MACHINE"
 # A statement misses when its measured hot or cold time exceeds
 # statement_max_ratio times the published one, or when the published row
 # answered it and the measured one did not. Concurrent QPS misses below
-# qps_min_ratio times the published figure; it is inconclusive when the run
-# had no concurrent phase. Basis: ADR-4034 D6. Two v0.31 runs on c6a.large
-# read 0.098 and 0.112 QPS, 13 percent apart, so a QPS factor closer to 1
-# would miss on run-to-run noise.
+# concurrent_qps_min_ratio times the published figure; it is inconclusive
+# when the run had no concurrent phase. Basis: ADR-4034 D6. Two v0.31 runs on
+# c6a.large read 0.098 and 0.112 QPS, 13 percent apart, so a QPS factor
+# closer to 1 would miss on run-to-run noise.
 [published]
 statement_max_ratio = 1.10
-qps_min_ratio = 0.90
+concurrent_qps_min_ratio = 0.90
 
 # One table per machine. source is the upstream results file and the
 # ClickBench commit it was read at, as <file>@<commit>, the form the
