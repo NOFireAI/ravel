@@ -63,6 +63,39 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+      # The TLC jar through the pinned-tool cache (D3, ADR-4034), placed where
+      # check-tla.sh's ensure_jar looks for it so it finds the cache hit and
+      # skips its own fetch. These values must match scripts/check-tla.sh's
+      # TLA_VERSION/TLA_JAR_SHA256/TLA_JAR_URL exactly: that sha256 stays the
+      # trust anchor, this cache only saves seven matrix legs' worth of
+      # download per run.
+      - name: Fetch pinned TLC jar
+        uses: ./.github/actions/fetch-pinned-tool
+        with:
+          name: tla2tools
+          version: "1.7.4"
+          url: https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          sha256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+          dest: .cache/tla/tla2tools-1.7.4.jar
+      # Nothing above enforces that this step's version/dest agree with
+      # scripts/check-tla.sh's own TLA_VERSION pin: if they drift apart, the
+      # cache silently does nothing (ensure_jar looks for a jar that was never
+      # placed) and every leg pays for a fresh download instead of failing
+      # loud. Derive the expected path from the script itself and fail if it
+      # is not there.
+      - name: Confirm the fetched jar matches check-tla.sh's expected path
+        run: |
+          set -u
+          expected_version="$(sed -nE 's/^TLA_VERSION="([^"]+)"$/\1/p' scripts/check-tla.sh | head -1)"
+          if [ -z "$expected_version" ]; then
+            echo "::error::could not read TLA_VERSION from scripts/check-tla.sh"
+            exit 1
+          fi
+          expected=".cache/tla/tla2tools-${expected_version}.jar"
+          if [ ! -f "$expected" ]; then
+            echo "::error::scripts/check-tla.sh expects the jar at $expected (TLA_VERSION=$expected_version); this workflow's fetch-pinned-tool version/dest has drifted from the script's pin"
+            exit 1
+          fi
       - name: Exhaustive model check
         # State CI's resource choice rather than inheriting the script's
         # laptop-safe default of 2 workers: `auto` is the previous behaviour

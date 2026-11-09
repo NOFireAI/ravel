@@ -652,6 +652,39 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+      # The TLC jar through the pinned-tool cache (D3, ADR-4034), placed where
+      # check-tla.sh's ensure_jar looks for it so it finds the cache hit and
+      # skips its own fetch. These values must match scripts/check-tla.sh's
+      # TLA_VERSION/TLA_JAR_SHA256/TLA_JAR_URL exactly: that sha256 stays the
+      # trust anchor, this cache only saves seven matrix legs' worth of
+      # download per run.
+      - name: Fetch pinned TLC jar
+        uses: ./.github/actions/fetch-pinned-tool
+        with:
+          name: tla2tools
+          version: "1.7.4"
+          url: https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          sha256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+          dest: .cache/tla/tla2tools-1.7.4.jar
+      # Nothing above enforces that this step's version/dest agree with
+      # scripts/check-tla.sh's own TLA_VERSION pin: if they drift apart, the
+      # cache silently does nothing (ensure_jar looks for a jar that was never
+      # placed) and every leg pays for a fresh download instead of failing
+      # loud. Derive the expected path from the script itself and fail if it
+      # is not there.
+      - name: Confirm the fetched jar matches check-tla.sh's expected path
+        run: |
+          set -u
+          expected_version="$(sed -nE 's/^TLA_VERSION="([^"]+)"$/\1/p' scripts/check-tla.sh | head -1)"
+          if [ -z "$expected_version" ]; then
+            echo "::error::could not read TLA_VERSION from scripts/check-tla.sh"
+            exit 1
+          fi
+          expected=".cache/tla/tla2tools-${expected_version}.jar"
+          if [ ! -f "$expected" ]; then
+            echo "::error::scripts/check-tla.sh expects the jar at $expected (TLA_VERSION=$expected_version); this workflow's fetch-pinned-tool version/dest has drifted from the script's pin"
+            exit 1
+          fi
       - name: Fast lane (smoke, negatives, traceability)
         env:
           RAVEL_TLA_WORKERS: auto
@@ -829,14 +862,14 @@ jobs:
       ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
       SHELLCHECK_VERSION: v0.10.0
       SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+      LINT_BIN_DIR: ${{ runner.temp }}/lint-bin
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Install pinned shellcheck and actionlint
+      - name: Install pinned shellcheck
         run: |
-          bin_dir="${RUNNER_TEMP}/lint-bin"
-          mkdir -p "$bin_dir"
+          mkdir -p "$LINT_BIN_DIR"
 
           # Verify the shellcheck archive's sha256 before extracting, then
           # place the binary on PATH for the assert and lint steps below.
@@ -844,16 +877,25 @@ jobs:
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
           echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
           tar -xJf shellcheck.tar.xz
-          mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$bin_dir/shellcheck"
+          mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$LINT_BIN_DIR/shellcheck"
 
-          # actionlint: same verify-then-extract shape.
-          curl -fsSL -o actionlint.tar.gz \
-            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          echo "$LINT_BIN_DIR" >> "$GITHUB_PATH"
+      # actionlint's tarball through the pinned-tool cache (D3, ADR-4034): the
+      # sha256 pin above stays the trust anchor, the cache only saves the
+      # download itself (GitHub release downloads have returned 504 here).
+      - name: Fetch pinned actionlint
+        uses: ./.github/actions/fetch-pinned-tool
+        with:
+          name: actionlint
+          version: ${{ env.ACTIONLINT_VERSION }}
+          url: https://github.com/rhysd/actionlint/releases/download/v${{ env.ACTIONLINT_VERSION }}/actionlint_${{ env.ACTIONLINT_VERSION }}_linux_amd64.tar.gz
+          sha256: ${{ env.ACTIONLINT_SHA256 }}
+          dest: actionlint.tar.gz
+      - name: Extract actionlint
+        run: |
+          mkdir -p "$LINT_BIN_DIR"
           tar -xzf actionlint.tar.gz actionlint
-          mv actionlint "$bin_dir/actionlint"
-
-          echo "$bin_dir" >> "$GITHUB_PATH"
+          mv actionlint "$LINT_BIN_DIR/actionlint"
       - name: Assert shellcheck is available
         run: |
           # actionlint exits 0 when shellcheck is missing, silently linting

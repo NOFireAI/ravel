@@ -1,0 +1,104 @@
+name: Fetch pinned tool through a cache with retries
+description: >
+  Restores a sha256-pinned tool download from actions/cache, keyed on name,
+  version and sha256 so a version bump or a pin change never serves a stale
+  file. On a cache miss, downloads `url` with three attempts and a 15 s
+  backoff between them (overridable with FETCH_PINNED_TOOL_RETRY_DELAY_S, for
+  callers that need a faster test), verifies the download's sha256 against
+  `sha256`, and refuses with no file left at `dest` on a mismatch. Saves to
+  the cache only on a push to `main` (ADR-4034 D3): a cache written on a PR
+  or queue ref is readable by nothing else and dies with the ref, same as the
+  `save-if` rule every Swatinem/rust-cache step in this repo's ci.yml already
+  follows. `sha256` stays the trust anchor; the cache is only a transport.
+inputs:
+  name:
+    description: Short tool name used in the cache key, e.g. actionlint.
+    required: true
+  version:
+    description: Pinned tool version, used in the cache key.
+    required: true
+  url:
+    description: URL to download the tool from on a cache miss.
+    required: true
+  sha256:
+    description: Expected sha256 of the downloaded file. A mismatch fails the step.
+    required: true
+  dest:
+    description: Path (relative to the workspace) to place the verified file at.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Restore ${{ inputs.name }} from cache
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ inputs.dest }}
+        key: tool-${{ inputs.name }}-${{ inputs.version }}-${{ inputs.sha256 }}
+    - name: Download ${{ inputs.name }} on a cache miss
+      if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        TOOL_NAME: ${{ inputs.name }}
+        TOOL_URL: ${{ inputs.url }}
+        TOOL_SHA256: ${{ inputs.sha256 }}
+        TOOL_DEST: ${{ inputs.dest }}
+      run: |
+        set -u
+        mkdir -p "$(dirname "$TOOL_DEST")"
+        tmp="${TOOL_DEST}.download"
+        delay="${FETCH_PINNED_TOOL_RETRY_DELAY_S:-15}"
+        ok=0
+        for attempt in 1 2 3; do
+          echo "fetch-pinned-tool: downloading $TOOL_NAME from $TOOL_URL (attempt $attempt/3)"
+          if curl -fsSL "$TOOL_URL" -o "$tmp"; then
+            ok=1
+            break
+          fi
+          rm -f "$tmp"
+          if [ "$attempt" -lt 3 ]; then
+            echo "fetch-pinned-tool: download failed, retrying in ${delay}s"
+            sleep "$delay"
+          fi
+        done
+        if [ "$ok" -ne 1 ]; then
+          echo "::error::fetch-pinned-tool: download of $TOOL_NAME failed from $TOOL_URL after 3 attempts"
+          exit 1
+        fi
+        got="$(sha256sum "$tmp" | awk '{print $1}')"
+        if [ "$got" != "$TOOL_SHA256" ]; then
+          rm -f "$tmp"
+          echo "::error::fetch-pinned-tool: $TOOL_NAME sha256 $got != expected $TOOL_SHA256; refusing to use it"
+          exit 1
+        fi
+        mv "$tmp" "$TOOL_DEST"
+    - name: Verify ${{ inputs.name }} sha256
+      # Unconditional: a cache hit skips the download step above, and the
+      # sha256 pin is the trust anchor on a hit as much as on a miss (the
+      # cache is only a transport, ADR-4034 D3). Runs after both the restore
+      # and the download, before the save, so a bad file is never cached.
+      shell: bash
+      env:
+        TOOL_NAME: ${{ inputs.name }}
+        TOOL_SHA256: ${{ inputs.sha256 }}
+        TOOL_DEST: ${{ inputs.dest }}
+      run: |
+        set -u
+        if command -v sha256sum >/dev/null 2>&1; then
+          sum_cmd="sha256sum"
+        else
+          sum_cmd="shasum -a 256"
+        fi
+        if ! printf '%s  %s\n' "$TOOL_SHA256" "$TOOL_DEST" | $sum_cmd -c - >/dev/null 2>&1; then
+          got="$($sum_cmd "$TOOL_DEST" | awk '{print $1}')"
+          echo "::error::fetch-pinned-tool: $TOOL_NAME sha256 $got != expected $TOOL_SHA256; refusing to use it"
+          exit 1
+        fi
+    - name: Save ${{ inputs.name }} to cache
+      # Restore everywhere, save only on a push to main: see the description
+      # above.
+      if: steps.restore.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ inputs.dest }}
+        key: tool-${{ inputs.name }}-${{ inputs.version }}-${{ inputs.sha256 }}
