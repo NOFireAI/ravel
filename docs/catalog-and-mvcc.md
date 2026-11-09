@@ -925,7 +925,11 @@ folds) MUST agree on the switch, since the switch also governs the
 partition (the day seal below, and "Rollout of the day seal"): a fold
 without it writes every part it re-encodes without refs;
 `ravel-cli catalog fold --rebuild-key-index` (under "Rollout") attaches
-them afterwards. The query path ("Reader") probes the
+them afterwards. Every later switch-off fold over those refs then logs the
+switch-disagreement warning and sets `key_index_switch_off_over_leaves`
+(test `key_index_switch_off_over_leaves_is_reported_and_warned`), from
+whichever part carries them
+(`key_index_switch_off_over_leaves_reads_a_non_tail_part`). The query path ("Reader") probes the
 leaves for a spans `trace_id` lookup and for a logs scan's declared-key
 equality, once per scan (docs/query-engine.md, "Tier-2 router").
 
@@ -956,11 +960,35 @@ entry from the previous tail's leaves: in
 `a_sealed_utc_day_keeps_its_leaves_across_advancing_folds` the sealing
 fold issues one previous-leaf GET, one leaf PUT and no section read for
 day d, and the two advances after it issue none of the three for day d.
-A sealed day that a late compaction, tombstone or rewrite record changes
-is re-encoded and its leaves are rebuilt from sections, since the carry
-source is the previous HEAD's last part only
-(`a_tombstoned_hour_in_a_sealed_day_rebuilds_its_leaves_from_sections`:
-no previous-leaf GET, 2 ranged GETs per surviving entry per pass).
+Today a sealed day that a late record changes (a retention tombstone, a
+compaction, an erasure rewrite) is re-encoded and its leaves are rebuilt
+from its sections, since the carry source is the previous HEAD's last part
+only (`a_tombstoned_hour_in_a_sealed_day_rebuilds_its_leaves_from_sections`:
+no previous-leaf GET and 2 ranged GETs per surviving entry per pass, 8 for
+the day's 2 surviving entries over 2 passes). ADR-3939 decision 5 (task
+C1) removes that rebuild by carrying from every previous part the
+re-encoded part overlaps.
+
+A sealed day part carried by reference without a leaf for a declared
+field (sealed while a metrics erasure request was pending, or before the
+field was declared with the type its sections index) gets that field's
+leaves on a later switch-on fold with no erasure pending, without being
+re-encoded: the part keeps its key, blake3 and existing refs and gains a
+ref per new leaf (`build_part_key_index` with the fields it lacks). In
+`a_sealed_day_missing_a_fields_leaves_gets_them_without_a_part_put` the
+attaching fold issues no PUT of day d's part, one leaf PUT for the missing
+field and 4 ranged GETs for day d's 2 entries, and the fold after it none;
+in `a_metrics_day_sealed_under_a_pending_erasure_gets_its_leaf_once_it_clears`
+a fold while the request is pending attaches nothing and the first fold
+after it is gone PUTs the day's one leaf. A carried part with a leaf for
+every declared field gets no leaf work, whatever other fields its leaves
+name (`a_sealed_day_with_every_declared_fields_leaves_gets_no_new_leaf`).
+A field the attach writes no leaf for (no entry of the day indexes it,
+every entry is uncovered, or a metrics leaf would pass the byte cap) stays
+missing, so every switch-on fold reads that day's sections again: in
+`a_declared_field_a_sealed_day_never_indexed_is_tried_on_every_fold`, a
+field declared after the day was written costs 4 ranged GETs for the
+day's 2 entries on each fold, and no leaf.
 
 The codec is `ravel_catalog::snapshot_format::kidx`, re-exported at the
 crate root: `encode_key_index_leaf` (choosing `bucket_bits` with
@@ -1647,8 +1675,10 @@ can constrain such a folder: it predates every field here, and the fold
 builds HEAD as a fresh struct, so an unknown field does not survive its
 CAS. The regular fold re-indexes a part only when it re-encodes it, and a
 sealed, compacted historical part with no erasure pending is never
-re-encoded by the regular fold, so the repair is explicit and is not a
-fold: `ravel-cli catalog fold --rebuild-key-index [--field <name>]
+re-encoded by the regular fold. A switch-on fold attaches a declared
+field's missing leaves to each part it carries ("Day seal" above); a
+switch-off fold attaches none, and the regular fold never replaces a ref
+a part already has, so the repair is explicit and is not a fold: `ravel-cli catalog fold --rebuild-key-index [--field <name>]
 [--batch-entries <n>]` (`Catalog::rebuild_key_index`,
 `crates/ravel-catalog/src/key_index_rebuild.rs`) attaches leaves to parts
 it leaves unchanged. For every part in HEAD that lacks a `key_index` ref
