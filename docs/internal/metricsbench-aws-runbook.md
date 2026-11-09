@@ -141,7 +141,8 @@ function of the anchor and the seed.
 - `MB_STAGE1_BANDS`, the measured run's Stage 1 band file, a path relative to
   the repository that must exist at the harness commit. Required with
   `MB_STAGE1=1` for every profile but `ci`, which defaults to
-  `deploy/metricsbench/stage1-bands.ci.json`; `launch.sh` refuses it unset
+  `deploy/metricsbench/stage1-bands.ci.json` (a `cardinality` run uses
+  `deploy/metricsbench/stage1-bands.cardinality.json`); `launch.sh` refuses it unset
   where it is required, a path that is not a file at the harness commit, and
   the variable set without `MB_STAGE1=1`, with exit 64;
 - `MB_STAGE1_ARMS`, `MB_CONTROL_IMAGE` and `MB_CONTROL_SOURCE_COMMIT`, the
