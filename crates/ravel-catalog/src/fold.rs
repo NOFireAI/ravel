@@ -2603,6 +2603,10 @@ pub(crate) struct BuiltPartKeyIndex {
 /// holding pairs keeps passing to the end of the key space, collecting every
 /// uncovered entry, and is then rebuilt once from the first range with the
 /// complete list; a further finding in the rebuild leaves it with no leaf.
+///
+/// `indexed` names fields the part already has leaves for: the build neither
+/// builds them nor adds them when a section names them. Empty for a part the
+/// fold re-encodes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_part_key_index(
     store: &dyn ObjectStoreBackend,
@@ -2612,6 +2616,7 @@ pub(crate) async fn build_part_key_index(
     part_watermark: u32,
     part_entries: &[SnapshotEntry],
     declared: &[(String, KeyType)],
+    indexed: &BTreeSet<String>,
     previous_tail: Option<&PreviousTail>,
     held: HeldPart<'_>,
     limits: &KeyIndexBuildLimits,
@@ -2804,7 +2809,7 @@ pub(crate) async fn build_part_key_index(
                     };
                     let mut added = false;
                     for section in sections {
-                        if fields.contains_key(&section.name) {
+                        if fields.contains_key(&section.name) || indexed.contains(&section.name) {
                             continue;
                         }
                         if carry_active {
@@ -3454,6 +3459,10 @@ impl Catalog {
         // same part reads none of its sections or previous leaves again. The
         // leaves are content-addressed and already stored.
         let mut key_index_built: HashMap<[u8; 32], BuiltPartKeyIndex> = HashMap::new();
+        // The same for leaves attached to a carried part, by part hash and the
+        // fields it lacked.
+        let mut key_index_attached: HashMap<([u8; 32], Vec<String>), BuiltPartKeyIndex> =
+            HashMap::new();
         let mut warned_switch_off_over_leaves = false;
 
         loop {
@@ -4250,9 +4259,82 @@ impl Catalog {
                     // object with these exact bytes, so no PUT is issued and
                     // the existing ref (same key/size/entry_count/range) is
                     // forwarded unchanged.
+                    let mut carried = existing.clone();
+                    // ADR-3939: a sealed day is carried for good, so a
+                    // declared field it has no leaf for (built while a
+                    // metrics erasure was pending, declared later, or left
+                    // uncovered) gets its leaves here, without re-encoding
+                    // the part. A pending erasure leaves `key_index_fields`
+                    // `None` and the next fold attaches them.
+                    if let Some(declared) = &key_index_fields {
+                        let indexed: BTreeSet<String> = carried
+                            .key_index
+                            .iter()
+                            .map(|leaf| leaf.field.clone())
+                            .collect();
+                        let missing: Vec<(String, KeyType)> = declared
+                            .iter()
+                            .filter(|(name, _)| !indexed.contains(name))
+                            .cloned()
+                            .collect();
+                        if !missing.is_empty() {
+                            let cache_key = (
+                                *part_hash.as_bytes(),
+                                missing.iter().map(|(name, _)| name.clone()).collect(),
+                            );
+                            let built = match key_index_attached.get(&cache_key) {
+                                Some(built) => built.clone(),
+                                None => {
+                                    let leaf_bytes_cap = (signal == Signal::Metrics).then(|| {
+                                        metrics_label_index_leaf_bytes_cap(
+                                            part_entries.iter().map(|e| e.object_size).sum(),
+                                            self.config().metrics_label_index_max_ratio_ppm,
+                                        )
+                                    });
+                                    let built = build_part_key_index(
+                                        self.store(),
+                                        tenant,
+                                        signal,
+                                        *part_hash.as_bytes(),
+                                        part_watermark,
+                                        part_entries,
+                                        &missing,
+                                        &indexed,
+                                        None,
+                                        held_label_dicts.part(span.start),
+                                        &KeyIndexBuildLimits {
+                                            leaf: key_index_leaf_limits(),
+                                            max_pairs: self.config().key_index_build_max_pairs,
+                                            concurrency: self.config().fold_bucket_concurrency,
+                                            leaf_bytes_cap,
+                                        },
+                                        &mut counters,
+                                    )
+                                    .await
+                                    .map_err(CatalogError::Store)?;
+                                    key_index_attached.insert(cache_key, built.clone());
+                                    built
+                                }
+                            };
+                            if built.over_cap {
+                                metrics_label_index_parts_over_cap += 1;
+                            }
+                            key_index_uncovered_entries += built.uncovered_entries;
+                            key_index_leaves_written += built.refs.len() as u64;
+                            key_index_leaf_bytes_written +=
+                                built.refs.iter().map(|leaf| leaf.size).sum::<u64>();
+                            for (field, pairs) in built.field_pairs {
+                                *key_index_field_pairs.entry(field).or_insert(0) += pairs;
+                            }
+                            carried.key_index.extend(built.refs);
+                            carried
+                                .key_index
+                                .sort_by(|a, b| (&a.field, a.key8_lo).cmp(&(&b.field, b.key8_lo)));
+                        }
+                    }
                     total_part_bytes += existing.size;
                     part_hashes.push(*part_hash.as_bytes());
-                    part_refs.push(existing.clone());
+                    part_refs.push(carried);
                     parts_reused += 1;
                     continue;
                 }
@@ -4530,6 +4612,7 @@ impl Catalog {
                                 part_watermark,
                                 part_entries,
                                 declared,
+                                &BTreeSet::new(),
                                 previous_tail.as_ref(),
                                 held_label_dicts.part(span.start),
                                 &KeyIndexBuildLimits {
