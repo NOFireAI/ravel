@@ -359,7 +359,8 @@ async fn the_json_report_carries_the_pair_budget_and_the_field_pairs() {
 /// ADR-3939 decision 4: a fold with the leaf switch off over a HEAD a
 /// switch-on fold wrote prints `key_index_switch_off_over_leaves: true` in
 /// text and `true` under `--json`; the switch-on fold before it reports
-/// `false`.
+/// `false`. Both print `key_index_parts_missing_declared_leaves: 0`: the
+/// first fold carries no part, and the count is zero with the switch off.
 #[tokio::test]
 async fn a_switch_off_fold_over_leaves_is_reported() {
     let now = yesterday_noon_ns();
@@ -392,6 +393,14 @@ async fn a_switch_off_fold_over_leaves_is_reported() {
         1,
         "{on_printed}"
     );
+    assert_eq!(on.key_index_parts_missing_declared_leaves, 0, "{on:?}");
+    assert_eq!(
+        on_printed
+            .matches("key_index_parts_missing_declared_leaves: 0\n")
+            .count(),
+        1,
+        "{on_printed}"
+    );
 
     publish_trace_spans(&store, 2, now - 3 * NS_PER_HOUR, &[3]).await;
     let (off, printed) = fold(now, false, true).await.expect("switch-off fold");
@@ -402,5 +411,10 @@ async fn a_switch_off_fold_over_leaves_is_reported() {
         value["key_index_switch_off_over_leaves"],
         serde_json::json!(true),
         "{printed}"
+    );
+    assert_eq!(
+        value["key_index_parts_missing_declared_leaves"],
+        serde_json::json!(0),
+        "the leaf switch is off: {printed}"
     );
 }
