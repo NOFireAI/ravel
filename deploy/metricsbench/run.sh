@@ -304,17 +304,20 @@
 #               instance!="metricsbench-instance-0" added to every selector,
 #               into <out>/stage1-erasure-reference.corpus.json, run routed;
 #               <out>/stage1-erasure-subject.json names the statements whose
-#               answer the subject changes
+#               answer the subject changes; stage1.erasure_reference_snapshot
+#               says routed when no extra-hour or l1 arm changed the snapshot
+#               since the routed pass, else changed: and the arms
 #   stage1-erasure-submit  ravel-cli erase submit --signal metrics
 #               --matcher instance=metricsbench-instance-0
 #   stage1-erasure-pending  the corpus as written, run routed; then
 #               <out>/stage1-erasure-compare.json compares it with the
 #               reference and counts label-index prunes
-#   stage1-erasure-rewrite  METRICSBENCH_SLEEP until the submit's ingest
-#               hour seals (its end + max_flush_lifetime 1 h + clock skew
-#               5 min, stage1.erasure_seal_wait); then a one-off ravel-server
-#               --mode maintain container (stage1.erasure_maintain) with a
-#               throwaway record key from mktemp outside the out dir runs
+#   stage1-erasure-rewrite  a one-off ravel-server --mode maintain
+#               container (stage1.erasure_maintain) with a throwaway record
+#               key from mktemp outside the out dir starts, is checked alive
+#               60 s later, and runs through METRICSBENCH_SLEEP until the
+#               last ingest hour in scope seals (its end + max_flush_lifetime
+#               1 h + clock skew 5 min, stage1.erasure_seal_wait) and on
 #               until erase status says COMPLETED
 #               (METRICSBENCH_ERASURE_TRIES x METRICSBENCH_ERASURE_INTERVAL),
 #               then is removed, and the key with it
@@ -449,7 +452,7 @@ STAGE1_ARMS="control extra_hour l1 erasure"
 STAGE1_CONTROL_KEYS="control_restart control_image control_catalog control control_cold control_cold_records control_restore control_compare"
 STAGE1_EXTRA_HOUR_KEYS="extra_hour_ingest extra_hour_fold_off extra_hour_fold_on extra_hour extra_hour_restart"
 STAGE1_L1_KEYS="l1_compact l1_fold l1_restart l1_objects l1_catalog l1 l1_compare l1_not_measured"
-STAGE1_ERASURE_KEYS="erasure_corpus erasure_reference_catalog erasure_reference erasure_subject erasure_submit erasure_pending_catalog erasure_pending erasure_compare erasure_seal_wait erasure_maintain erasure_rewrite erasure_fold erasure_catalog erasure_leaves erasure_sweep"
+STAGE1_ERASURE_KEYS="erasure_corpus erasure_reference_catalog erasure_reference erasure_subject erasure_reference_snapshot erasure_submit erasure_pending_catalog erasure_pending erasure_compare erasure_seal_wait erasure_maintain erasure_rewrite erasure_fold erasure_catalog erasure_leaves erasure_sweep"
 # The erasure arm's subject: one value of the workload's scaling label.
 STAGE1_ERASURE_LABEL="instance"
 STAGE1_ERASURE_VALUE="metricsbench-instance-0"
@@ -1867,7 +1870,12 @@ elif op == "stage1-erasure-leaves":
     # key (crates/ravel-maintain/src/erasure_rewrite.rs:1474-1482,
     # keys::l1_part_key) whose rewrite record supersedes its inputs, so an
     # erased hour is an ingest hour holding a data-object key before that
-    # the listing after no longer resolves. Every pre-erasure part whose
+    # the listing after no longer resolves. A completed windowless erasure
+    # rewrites every listed (shard, hour) bucket
+    # (services/ravel-server/src/maintain.rs:3614-3626), copying the series
+    # it does not erase into the new part (erasure_rewrite.rs:1180-1192), so
+    # a key listed both before and after is a bucket the rewrite missed
+    # (keys_surviving). Every pre-erasure part whose
     # lo..=hi range holds an erased hour must be gone after the fold (no part
     # after carries its key and blake3), and no leaf such a part referenced
     # may be referenced after.
@@ -1891,6 +1899,7 @@ elif op == "stage1-erasure-leaves":
     by_hour = {}
     for o in pre_list:
         by_hour.setdefault(o["ingest_hour_bucket"], set()).add(o["key"])
+    surviving = sorted(keys_before & keys_after)
     erased = [{"hour": h, "keys_before": len(ks), "keys_gone": len(ks - keys_after),
                "keys_new": len({o["key"] for o in post_list if o["ingest_hour_bucket"] == h} - keys_before)}
               for h, ks in sorted(by_hour.items()) if ks - keys_after]
@@ -1906,12 +1915,14 @@ elif op == "stage1-erasure-leaves":
              for p in overlapping for l in p["leaves"] if l["key"] in post_leaves]
     print(json.dumps({"parts_before": len(pre), "parts_after": len(post),
                       "objects_before": len(pre_list), "objects_after": len(post_list),
+                      "hours_before_count": len(by_hour),
+                      "keys_surviving_count": len(surviving), "keys_surviving": surviving[:20],
                       "erased_hours_count": len(erased), "erased_hours": erased,
                       "overlapping_parts_count": len(overlapping),
                       "carried_over_parts_count": len(carried), "carried_over_parts": carried,
                       "leaves_after": sum(len(p["leaves"]) for p in post),
                       "stale_leaves_count": len(stale), "stale_leaves": stale,
-                      "basis": "catalog list --json before the erasure (stage1-erasure-reference.objects.jsonl) and after its fold (stage1-erasure.objects.jsonl): an erased hour is an ingest_hour_bucket holding a key before that is not listed after, since the rewrite's output is a new content-keyed L1 key that supersedes its inputs; a compaction the maintain container ran in the same window replaces keys the same way and also reads as an erased hour. catalog inspect before (stage1-erasure-reference.inspect.txt) and after (stage1-erasure.inspect.txt): an overlapping part is a part before whose lo..=hi range holds an erased hour; a carried-over part is an overlapping part whose key and blake3 a part after still carries; a stale leaf is a leaf key an overlapping part referenced that a part after still references"}))
+                      "basis": "catalog list --json before the erasure (stage1-erasure-reference.objects.jsonl) and after its fold (stage1-erasure.objects.jsonl): an erased hour is an ingest_hour_bucket holding a key before that is not listed after, since the rewrite's output is a new content-keyed L1 key that supersedes its inputs; a surviving key is a key listed both before and after (keys_surviving names at most 20 of them), which a completed windowless erasure leaves none of, since it rewrites every listed (shard, hour) bucket; hours_before_count is the ingest hours listed before; a compaction the maintain container ran in the same window replaces keys the same way and also reads as an erased hour. catalog inspect before (stage1-erasure-reference.inspect.txt) and after (stage1-erasure.inspect.txt): an overlapping part is a part before whose lo..=hi range holds an erased hour; a carried-over part is an overlapping part whose key and blake3 a part after still carries; a stale leaf is a leaf key an overlapping part referenced that a part after still references"}))
 elif op == "stage1-head-sha":
     # A directory `aws s3 cp --recursive` filled with the metrics catalog
     # HEADs: the sha256 of the one HEAD. Exit 3 and why on stdout unless
@@ -3653,6 +3664,21 @@ stage1_l1_step() {
   stamp_str stage1.l1_not_measured "ADR-3694 row 6 bounds this run does not check: peak container memory under 8 GiB (no memory sample covers the L1 pass), scan GETs at most the unbatched call's plus one per split run and scan wire bytes at most the unbatched call's (no unbatched reference runs; each L1 record's phases are recorded)"
 }
 
+# stage1_maintain_alive NAME KEY_FILE REQUEST_ID WHEN: returns while the
+# maintain container NAME is running; otherwise copies its log, removes it
+# and the record key, and fails stage1-erasure-rewrite naming WHEN.
+stage1_maintain_alive() {
+  local name="$1" key_file="$2" request_id="$3" when="$4" code=0 cstate
+  cstate="$("$DOCKER" inspect --format '{{.State.Status}}' "$name" 2>/dev/null)" || code=$?
+  [ "$code" -ne 0 ] || [ "$cstate" != running ] || return 0
+  "$DOCKER" logs "$name" >"${out_dir}/stage1-erasure-maintain.log" 2>&1 || true
+  "$DOCKER" rm -f "$name" >>"${out_dir}/stage1-erasure-maintain.rm.log" 2>&1 || true
+  rm -f "$key_file"
+  STAGE1_KEY_FILE=""
+  stamp_str stage1.erasure_rewrite "failed: the maintain container is ${cstate:-not inspectable (docker inspect exited $code)} ${when}, before erase status said COMPLETED"
+  fail_step stage1-erasure-rewrite "the maintain container ${name} is ${cstate:-not inspectable (docker inspect exited $code)} ${when} and erasure ${request_id} is not COMPLETED; see ${out_dir}/stage1-erasure-maintain.log"
+}
+
 # stage1_erasure_step: ADR-3694 row 8, last, since it removes a subject's
 # series from the tenant. A reference pass runs the corpus with every
 # selector excluding the subject, and the data objects are listed; the
@@ -3663,7 +3689,7 @@ stage1_l1_step() {
 # second listing then show which hours the rewrite replaced and whether any
 # part or leaf from before the erasure is still referenced over one.
 stage1_erasure_step() {
-  local code=0 line request_id key_file i state="" submit_s deadline_s wait_from_s maintain_s cstate
+  local code=0 line request_id key_file i state="" submit_s deadline_s wait_from_s maintain_s
   local matcher="${STAGE1_ERASURE_LABEL}=${STAGE1_ERASURE_VALUE}" name="metricsbench-stage1-maintain"
   local corpus="${out_dir}/stage1-erasure-reference.corpus.json" status_file="${out_dir}/stage1-erasure-status.txt"
   line="$(py stage1-erasure-corpus "$CORPUS" "$corpus" "$STAGE1_ERASURE_LABEL" "$STAGE1_ERASURE_VALUE")" || code=$?
@@ -3676,6 +3702,17 @@ stage1_erasure_step() {
   stage1_note stage1.erasure_subject stage1-hash-compare "${out_dir}/stage1-routed/diagnostics.json" \
     "${out_dir}/stage1-erasure-reference/diagnostics.json" "${out_dir}/stage1-erasure-subject.json" \
     routed erasure_reference
+  # The extra-hour and l1 arms change the snapshot after the routed pass, so
+  # the reference then routes over different parts and its prunes may differ.
+  local changed="" arm
+  for arm in extra_hour l1; do
+    if stage1_arm_on "$arm"; then changed="${changed:+${changed}, }${arm//_/-}"; fi
+  done
+  if [ -z "$changed" ]; then
+    stamp_str stage1.erasure_reference_snapshot routed
+  else
+    stamp_str stage1.erasure_reference_snapshot "changed: ${changed} (run after the routed pass, so the reference pass reads a snapshot the routed pass did not)"
+  fi
   stage1_list stage1-erasure-submit stage1-erasure-reference.objects.jsonl
   request_id="$(python3 -I -c 'import uuid; print(uuid.uuid4())')"
   code=0
@@ -3718,7 +3755,9 @@ stage1_erasure_step() {
     fail_step stage1-erasure-rewrite "docker compose run -d ... ravel-server --mode maintain exited $code"
   fi
   maintain_s="$(date -u +%s)"
-  stamp_set stage1.erasure_maintain "{\"command\": \"ravel-server ${STAGE1_MAINTAIN_FLAGS}\", \"user\": \"$(id -u):$(id -g)\", \"started_unix_s\": ${maintain_s}, \"note\": \"/maintain.key is a throwaway record key, created 0600, mounted read-only and removed when the step ends; the container starts right after the pending pass and runs through the seal wait; no ravel-server flag turns compaction off, so each maintain tick (services/ravel-server/src/maintain.rs run_tick) also runs retention, compaction, the GC sweep and the catalog-object sweeps over the tenant\"}"
+  stamp_set stage1.erasure_maintain "{\"command\": \"ravel-server ${STAGE1_MAINTAIN_FLAGS}\", \"user\": \"$(id -u):$(id -g)\", \"started_unix_s\": ${maintain_s}, \"note\": \"/maintain.key is a throwaway record key, created 0600, mounted read-only and removed when the step ends; the container starts right after the pending pass, is checked running 60 s later, before the seal wait, and at every erase status poll, and runs through the seal wait; no ravel-server flag turns compaction off, so each maintain tick (services/ravel-server/src/maintain.rs run_tick) also runs retention, compaction, the GC sweep and the catalog-object sweeps over the tenant\"}"
+  "$SLEEP" 60 || fail_step stage1-erasure-rewrite "${SLEEP} 60 failed"
+  stage1_maintain_alive "$name" "$key_file" "$request_id" "60 s after it started"
 
   # The rewrite cannot complete before every hour in the request's scope
   # seals: its end plus max_flush_lifetime plus the clock-skew allowance
@@ -3743,16 +3782,7 @@ stage1_erasure_step() {
       state=COMPLETED
       break
     fi
-    code=0
-    cstate="$("$DOCKER" inspect --format '{{.State.Status}}' "$name" 2>/dev/null)" || code=$?
-    if [ "$code" -ne 0 ] || [ "$cstate" != running ]; then
-      "$DOCKER" logs "$name" >"${out_dir}/stage1-erasure-maintain.log" 2>&1 || true
-      "$DOCKER" rm -f "$name" >>"${out_dir}/stage1-erasure-maintain.rm.log" 2>&1 || true
-      rm -f "$key_file"
-      STAGE1_KEY_FILE=""
-      stamp_str stage1.erasure_rewrite "failed: the maintain container is ${cstate:-not inspectable (docker inspect exited $code)} at poll ${i}, before erase status said COMPLETED"
-      fail_step stage1-erasure-rewrite "the maintain container ${name} is ${cstate:-not inspectable (docker inspect exited $code)} at poll ${i} and erasure ${request_id} is not COMPLETED; see ${out_dir}/stage1-erasure-maintain.log"
-    fi
+    stage1_maintain_alive "$name" "$key_file" "$request_id" "at poll ${i}"
     "$SLEEP" "$ERASURE_INTERVAL"
   done
   "$DOCKER" logs "$name" >"${out_dir}/stage1-erasure-maintain.log" 2>&1 || true
