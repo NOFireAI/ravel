@@ -183,3 +183,176 @@ q40 = "FILL-IN-ON-REFERENCE-MACHINE"
 q41 = "FILL-IN-ON-REFERENCE-MACHINE"
 q42 = "FILL-IN-ON-REFERENCE-MACHINE"
 q43 = "FILL-IN-ON-REFERENCE-MACHINE"
+
+# One arm judged against ClickBench's published Ravel figures for the machine
+# the run used (ADR-4034 D6; kit.py published_bands). Select "published" in
+# run.toml's band_sections; the kit then refuses a run.toml whose
+# instance_type has no [published.<instance_type>] table below. fetch.sh
+# judges both arms and exits 1 on a miss.
+#
+# A statement misses when its measured hot or cold time exceeds
+# statement_max_ratio times the published one, or when the published row
+# answered it and the measured one did not. Concurrent QPS misses below
+# qps_min_ratio times the published figure; it is inconclusive when the run
+# had no concurrent phase. Basis: ADR-4034 D6. Two v0.31 runs on c6a.large
+# read 0.098 and 0.112 QPS, 13 percent apart, so a QPS factor closer to 1
+# would miss on run-to-run noise.
+[published]
+statement_max_ratio = 1.10
+qps_min_ratio = 0.90
+
+# One table per machine. source is the upstream results file and the
+# ClickBench commit it was read at, as <file>@<commit>, the form the
+# pre-registration's published baseline line quotes. Each qNN row is
+# [hot, cold] in seconds, read from that file's result row: hot is the best of
+# its second and third tries, cold its first, the definitions this file's
+# header gives. "null" is a figure the published run did not answer; it has no
+# band. concurrent_qps is the file's concurrent_qps. The kit's copies of these
+# files are benchmarks/clickbench/kit/testdata/published/v0.28.0/.
+
+# Source: ClickHouse/ClickBench ravel/results/20261103/c6a.large.json at
+# cd7c2516ebde295c6dadefd878fa9215ca29f1d2 (Ravel v0.28.0).
+[published.c6a.large]
+source = "ClickHouse/ClickBench/ravel/results/20261103/c6a.large.json@cd7c2516ebde295c6dadefd878fa9215ca29f1d2"
+concurrent_qps = 0.137
+q01 = [0.048, 0.113]
+q02 = [1.004, 6.705]
+q03 = [2.521, 10.33]
+q04 = [3.663, 10.862]
+q05 = [5.712, 11.501]
+q06 = [8.846, 12.247]
+q07 = [0.05, 0.106]
+q08 = [1.005, 6.638]
+q09 = [13.433, 14.736]
+q10 = [13.667, 15.382]
+q11 = [11.365, 12.698]
+q12 = [11.683, 12.638]
+q13 = [8.175, 11.48]
+q14 = ["null", "null"]
+q15 = [8.631, 11.691]
+q16 = [6.901, 11.742]
+q17 = ["null", "null"]
+q18 = ["null", "null"]
+q19 = ["null", "null"]
+q20 = [1.118, 8.894]
+q21 = [14.3, 15.212]
+q22 = [18.119, 18.901]
+q23 = [29.113, 29.098]
+q24 = [14.186, 15.007]
+q25 = [0.199, 0.972]
+q26 = [7.01, 10.751]
+q27 = [0.2, 0.966]
+q28 = [18.871, 19.615]
+q29 = ["null", "null"]
+q30 = [2.266, 10.301]
+q31 = [13.052, 13.989]
+q32 = ["null", "null"]
+q33 = ["null", "null"]
+q34 = ["null", "null"]
+q35 = ["null", "null"]
+q36 = [5.328, 8.83]
+q37 = [0.238, 0.586]
+q38 = [0.163, 0.454]
+q39 = [0.187, 0.51]
+q40 = [0.393, 0.894]
+q41 = [0.135, 0.533]
+q42 = [0.124, 0.462]
+q43 = [0.101, 0.377]
+
+# Source: ClickHouse/ClickBench ravel/results/20261103/c6a.xlarge.json at
+# cd7c2516ebde295c6dadefd878fa9215ca29f1d2 (Ravel v0.28.0).
+[published.c6a.xlarge]
+source = "ClickHouse/ClickBench/ravel/results/20261103/c6a.xlarge.json@cd7c2516ebde295c6dadefd878fa9215ca29f1d2"
+concurrent_qps = 0.232
+q01 = [0.034, 0.093]
+q02 = [0.494, 5.469]
+q03 = [1.156, 8.073]
+q04 = [1.609, 8.399]
+q05 = [2.76, 8.883]
+q06 = [4.121, 9.006]
+q07 = [0.035, 0.089]
+q08 = [0.5, 5.537]
+q09 = [3.52, 11.071]
+q10 = [3.976, 11.51]
+q11 = [2.455, 10.44]
+q12 = [2.613, 10.53]
+q13 = [3.762, 8.881]
+q14 = [5.036, 12.019]
+q15 = [3.927, 8.931]
+q16 = [2.925, 8.948]
+q17 = [6.13, "null"]
+q18 = [5.826, 11.835]
+q19 = ["null", "null"]
+q20 = [0.693, 7.802]
+q21 = [5.993, 10.242]
+q22 = [11.218, 12.496]
+q23 = [14.508, 15.36]
+q24 = [3.727, 10.474]
+q25 = [0.138, 1.436]
+q26 = [3, 8.564]
+q27 = [0.139, 1.427]
+q28 = [8.037, 11.429]
+q29 = [18.693, 21.49]
+q30 = [1.092, 8.135]
+q31 = [5.089, 10.76]
+q32 = [11.873, 13.308]
+q33 = ["null", "null"]
+q34 = ["null", "null"]
+q35 = ["null", "null"]
+q36 = [2.479, 6.689]
+q37 = [0.161, 0.921]
+q38 = [0.124, 0.884]
+q39 = [0.127, 0.84]
+q40 = [0.259, 1.241]
+q41 = [0.102, 1.08]
+q42 = [0.096, 0.998]
+q43 = [0.074, 0.671]
+
+# Source: ClickHouse/ClickBench ravel/results/20261103/c6a.2xlarge.json at
+# cd7c2516ebde295c6dadefd878fa9215ca29f1d2 (Ravel v0.28.0).
+[published.c6a.2xlarge]
+source = "ClickHouse/ClickBench/ravel/results/20261103/c6a.2xlarge.json@cd7c2516ebde295c6dadefd878fa9215ca29f1d2"
+concurrent_qps = 0.478
+q01 = [0.031, 0.09]
+q02 = [0.258, 2.685]
+q03 = [0.581, 3.942]
+q04 = [0.787, 4.095]
+q05 = [1.443, 4.207]
+q06 = [2.06, 4.234]
+q07 = [0.032, 0.083]
+q08 = [0.258, 2.691]
+q09 = [1.857, 5.277]
+q10 = [2.176, 5.418]
+q11 = [1.228, 5.11]
+q12 = [1.283, 5.13]
+q13 = [1.875, 4.259]
+q14 = [2.552, 5.625]
+q15 = [1.975, 4.235]
+q16 = [1.599, 4.292]
+q17 = [3.183, 5.724]
+q18 = [3.116, 5.486]
+q19 = [4.293, 6.477]
+q20 = [0.403, 3.762]
+q21 = [2.473, 6.165]
+q22 = [2.876, 7.939]
+q23 = [5.206, 13.861]
+q24 = [2.252, 6.172]
+q25 = [0.215, 0.86]
+q26 = [1.479, 4.057]
+q27 = [0.174, 0.816]
+q28 = [3.514, 6.304]
+q29 = [9.137, 10.978]
+q30 = [0.555, 4.04]
+q31 = [2.177, 5.195]
+q32 = [2.52, 8.524]
+q33 = ["null", "null"]
+q34 = [5.695, 7.866]
+q35 = [5.72, 7.897]
+q36 = [1.373, 3.249]
+q37 = [0.107, 0.557]
+q38 = [0.083, 0.509]
+q39 = [0.092, 0.465]
+q40 = [0.197, 0.714]
+q41 = [0.072, 0.599]
+q42 = [0.069, 0.566]
+q43 = [0.063, 0.389]

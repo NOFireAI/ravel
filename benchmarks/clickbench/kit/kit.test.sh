@@ -446,7 +446,8 @@ SHA_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 SHA_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 # A filled copy of the rlog lane's band file: 43 statements at 0.5 s sum to
-# 21.5 s hot and cold, under 30; at 2.0 s they miss.
+# 21.5 s hot and cold, under 30; at 2.0 s they miss. The [published] rows are
+# left as checked in.
 BANDS="$TMP/rlog.toml"
 sed -e 's/^hot_sum_s_max = .*/hot_sum_s_max = 30/' \
   -e 's/^cold_sum_s_max = .*/cold_sum_s_max = 30/' \
@@ -454,7 +455,7 @@ sed -e 's/^hot_sum_s_max = .*/hot_sum_s_max = 30/' \
   -e 's/^concurrent_qps_min = .*/concurrent_qps_min = 1.0/' \
   -e 's/^concurrent_error_pooled_max = .*/concurrent_error_pooled_max = 0.1/' \
   -e 's/^q29_probe_s_max = .*/q29_probe_s_max = 1.0/' \
-  -e 's/^\(q[0-9][0-9]\) = .*/\1 = 1.0/' \
+  -e '/^\[absolute\.hot_s_max\]$/,/^\[/s/^\(q[0-9][0-9]\) = .*/\1 = 1.0/' \
   "$REPO_ROOT/benchmarks/clickbench/bands/rlog.toml" >"$BANDS"
 DATASET_SHA=1111111111111111111111111111111111111111111111111111111111111111
 
