@@ -1789,7 +1789,11 @@ fn order_sensitive_batches() -> Vec<RecordBatch> {
         Field::new("k", DataType::Int64, false),
         Field::new("f", DataType::Float64, false),
     ]));
-    let filler = || (2..=ORDER_SENSITIVE_KEYS).rev().map(|k| (k, k as f64 + 0.25));
+    let filler = || {
+        (2..=ORDER_SENSITIVE_KEYS)
+            .rev()
+            .map(|k| (k, k as f64 + 0.25))
+    };
     let mut rows: Vec<(i64, f64)> = vec![(0, 1e16), (1, -0.0)];
     rows.extend(filler());
     rows.extend([(0, 1.0), (1, -0.0)]);
@@ -1930,7 +1934,8 @@ async fn a_float_avg_is_exact_through_rebuilds_in_the_final_and_single_modes() {
         assert_eq!(on.modes, vec![mode], "{}", on.plan);
         assert!(off.bounds.is_empty(), "{mode:?}: rule off\n{}", off.plan);
         assert!(
-            off.plan.contains(&format!("AggregateExec: mode={mode:?}, ")),
+            off.plan
+                .contains(&format!("AggregateExec: mode={mode:?}, ")),
             "{}",
             off.plan
         );
@@ -1951,11 +1956,13 @@ async fn a_float_avg_is_exact_through_rebuilds_in_the_final_and_single_modes() {
         let got = key_averages(on.result.as_ref().expect("query runs"));
         assert_eq!(got, want, "{mode:?}");
 
-
         // The batches before the one holding the second rows of keys 0 and 1
         // already rebuild, and hold exactly the first row of each.
         let before = probed_typed(&config, prefix, &options, sql, false).await;
-        assert!(before.rebuilds > 0, "{mode:?}: no rebuild before the second rows");
+        assert!(
+            before.rebuilds > 0,
+            "{mode:?}: no rebuild before the second rows"
+        );
         let early = key_averages(before.result.as_ref().expect("query runs"));
         assert_eq!(
             early[..2],
