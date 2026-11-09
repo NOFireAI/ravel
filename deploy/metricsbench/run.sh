@@ -1799,8 +1799,12 @@ elif op == "stage1-erasure-corpus":
                 out.append(word)
                 k = skip_ws(j)
                 m = re.match(r"[A-Za-z_]+", q[k:])
+                # Every word decides whether a following ( is a label list,
+                # so a bare group_left or group_right (its list is optional)
+                # leaves the next word's ( to be read as a call.
+                list_next = word in LIST_OPENERS
                 if word.lower() in KEYWORDS:
-                    list_next = word in LIST_OPENERS
+                    pass
                 elif k < n and q[k] in "({":
                     # A function or aggregation call, or a name the next
                     # branch gives its matcher inside the braces.
