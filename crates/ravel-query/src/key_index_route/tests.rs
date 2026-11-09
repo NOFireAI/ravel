@@ -453,7 +453,12 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-const UNBOUNDED: Ceiling = ADR_CEILING;
+/// The ADR bounds without the per-part tier-1 test, for fixtures whose
+/// parts hold fewer entries than their leaf reads.
+const UNBOUNDED: Ceiling = Ceiling {
+    gets_per_entry: u64::MAX,
+    ..ADR_CEILING
+};
 
 fn leaf_kind() -> impl Strategy<Value = LeafKind> {
     prop_oneof![
@@ -507,13 +512,14 @@ proptest! {
         extra_keys in prop_oneof![3 => Just(0usize), 1 => 0usize..=1018],
         ceiling_gets in prop_oneof![Just(KEY_INDEX_LEAF_GET_CEILING as u64), 1u64..=150],
         ceiling_parts in 1usize..=6,
+        gets_per_entry in prop_oneof![Just(TIER_ONE_GETS_PER_ENTRY), Just(u64::MAX)],
         budget_max in prop::option::weighted(0.2, 64u64..4096),
     ) {
         let key_type = if id16 { KeyType::Id16 } else { KeyType::Str };
         let mut query = present_keys.clone();
         query.extend((0..extra_keys).map(|i| 1000 + i as u16));
         let keys = key_set(key_type, &query);
-        let ceiling = Ceiling { leaf_gets: ceiling_gets, parts: ceiling_parts };
+        let ceiling = Ceiling { leaf_gets: ceiling_gets, parts: ceiling_parts, gets_per_entry };
         let budget = ThresholdBudget::new(budget_max.unwrap_or(u64::MAX));
         let (fx, run) = block_on(async {
             let fx = fixture(&specs, &recents, key_type).await;
@@ -619,7 +625,7 @@ async fn ceiling_admits_the_largest_parts_in_order() {
     // L_max room for exactly 2 parts: the two largest by entry_count.
     let ceiling = Ceiling {
         leaf_gets: 5,
-        parts: KEY_INDEX_MAX_PROBED_PARTS,
+        ..ADR_CEILING
     };
     let run_gets = run(&fx, &keys, &budget, ceiling).await;
     let (routes, figures) = run_gets.result.as_ref().expect("route");
@@ -646,6 +652,7 @@ async fn ceiling_admits_the_largest_parts_in_order() {
         Ceiling {
             leaf_gets: KEY_INDEX_LEAF_GET_CEILING as u64,
             parts: 2,
+            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
         },
     )
     .await;
@@ -663,6 +670,7 @@ async fn ceiling_admits_the_largest_parts_in_order() {
         Ceiling {
             leaf_gets: 2,
             parts: KEY_INDEX_MAX_PROBED_PARTS,
+            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
         },
     )
     .await;
@@ -700,6 +708,7 @@ async fn refunded_gets_admit_the_next_part() {
         Ceiling {
             leaf_gets: 4,
             parts: KEY_INDEX_MAX_PROBED_PARTS,
+            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
         },
     )
     .await;
@@ -1021,7 +1030,7 @@ async fn the_bridged_byte_budget_is_the_parts_not_each_slices() {
     let (fx, keys, values, b0, b1) =
         chosen.expect("a key count whose slices each fit the part's allowance but not together");
 
-    let both = run(&fx, &keys, &budget, ADR_CEILING).await;
+    let both = run(&fx, &keys, &budget, UNBOUNDED).await;
     let (routes, figures) = both.result.as_ref().expect("route");
     assert_eq!(
         figures.skipped_by_budget, 1,
@@ -1037,7 +1046,7 @@ async fn the_bridged_byte_budget_is_the_parts_not_each_slices() {
         .copied()
         .filter(|v| u64::from_be_bytes(value_key8(KeyType::Str, *v)) < cut)
         .collect();
-    let one = run(&fx, &key_set(KeyType::Str, &low), &budget, ADR_CEILING).await;
+    let one = run(&fx, &key_set(KeyType::Str, &low), &budget, UNBOUNDED).await;
     let (_, figures) = one.result.as_ref().expect("route");
     assert_eq!(
         figures.skipped_by_budget, 0,
@@ -1427,7 +1436,7 @@ async fn admission_is_largest_first_and_stops_at_the_first_part_that_does_not_fi
     let budget = ThresholdBudget::new(u64::MAX);
     let ceiling = |leaf_gets| Ceiling {
         leaf_gets,
-        parts: KEY_INDEX_MAX_PROBED_PARTS,
+        ..UNBOUNDED
     };
 
     let tight = run(&fx, &keys, &budget, ceiling(3)).await;
@@ -1609,6 +1618,7 @@ async fn route_totals_add_every_part_outcome_and_leaf_get_under_the_signal() {
         Ceiling {
             leaf_gets: 4,
             parts: KEY_INDEX_MAX_PROBED_PARTS,
+            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
         },
     )
     .await;
