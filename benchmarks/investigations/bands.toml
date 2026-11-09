@@ -2353,9 +2353,9 @@ source = "predicted from box D rates"
 # under 3 is not-run for every figure that depends on it, not a pass. The
 # total is judged against 30 x (T(S) + 100), the 30-day state's 30 day parts;
 # a state holding other than 30 parts is not that state, so the total is
-# not-run there rather than rescaled. The stats carry no per-part leaf GET
-# breakdown on this build, so the per-part figure reads unsupported until
-# they do.
+# not-run there rather than rescaled. evaluate.py reads no per-part leaf GET
+# breakdown from the stats, so the per-part figure reads unsupported on every
+# run until evaluate.py reads one.
 requires_tenant = "inv"
 requires_states = ["day_parts_30"]
 
@@ -2748,8 +2748,8 @@ source = "predicted"
 # S is under 3 is not-run for every figure that depends on it (the
 # harness-state amendment). Each day part is held to T(S) + 100 leaf GETs as
 # A7's is, besides the 30-day total, so one part over the bound cannot hide
-# under the total; the stats carry no per-part breakdown on this build, so
-# that figure reads unsupported until they do. The tier-1 probes are the
+# under the total; evaluate.py reads no per-part breakdown from the stats, so
+# that figure reads unsupported on every run until evaluate.py reads one. The tier-1 probes are the
 # calls' probe-phase GETs.
 requires_tenant = "inv"
 requires_states = ["day_parts_30"]
