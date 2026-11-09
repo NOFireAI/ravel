@@ -6291,7 +6291,8 @@ holds:
 - a `SortExec` with a fetch and no preserved partitioning reads the aggregate
   through nothing but projections, cooperative wrappers and coalesces, none of
   them with a fetch of its own. A subquery's `LIMIT` or `OFFSET` between them
-  refuses, since its skip could drop kept keys;
+  refuses, since its skip could drop kept keys, and so does a `HAVING`
+  filter;
 - the bound, `n + s` for `OFFSET s LIMIT n`, is between 1 and the configured
   ceiling;
 - every sort expression is deterministic, is not a float, and reads only
@@ -6315,13 +6316,16 @@ DataFusion `GroupValues` built over the aggregate's own group schema and
 merges the partial states (or, in the single modes, updates from the rows)
 into one `GroupsAccumulator` per aggregate expression. It encodes each key's
 sort value as an arrow row with the sort's own options. Once the table holds
-`2n` groups or more it ranks them by sort row and then by the order they
-were first seen, keeps the first `n`, rebuilds the table and fresh
-accumulators from them, and from then on drops input rows whose sort row
-comes after the worst kept key's. Rows tied with that key pass. At end of
-input it evaluates every group, applies the same cut once and emits at most
-`n` rows. `EXPLAIN ANALYZE` reports `rebuilds`, `evictions` and
-`dropped_rows`. The table, the accumulators and each rebuild's transient
+`2n` groups or more it ranks them by sort row and then by group index,
+keeps the first `n`, rebuilds the table and fresh accumulators from them
+with the kept keys at indexes 0 to `n - 1` in rank order, and from then on
+drops input rows whose sort row comes after the worst kept key's. Rows tied
+with that key pass. At end of input it evaluates every group, applies the
+same cut once and emits at most `n` rows. `EXPLAIN ANALYZE` reports
+`rebuilds`, `evictions`, `dropped_rows` and `interned_at_threshold`, the
+groups interned after a rebuild whose sort row equals the threshold; every
+evicted key that is seen again is among them, since its rows pass only on a
+tie. The table, the accumulators and each rebuild's transient
 copies are charged to the query pool under the exec's own `TopKeys[<partition>]`
 consumer, one to one; a refused grow fails the query with
 `ResourcesExhausted`, and nothing spills.
@@ -6329,11 +6333,14 @@ consumer, one to one; a refused grow fails the query with
 The answer is exact because a group's sort value depends only on its key and
 the final stage's distribution gives each partition every partial state of
 the keys it owns: a key the exec evicts already has `n` kept keys ranked
-ahead of it, and stays behind them at every later cut, so it is absent from
-the output rather than partial. `crates/ravel-sql/tests/top_keys.rs` pins the
-counts and sums of every returned group against the rule-off plan, under
-ascending, descending and shuffled arrival, with ties at the `n`-th key,
-NULL keys first and last, and `OFFSET`; among keys tied on the sort, which
+ahead of it, and if it is seen again it re-enters with a group index above
+every kept key's, so it stays behind them at every later cut and is absent
+from the output rather than partial. `crates/ravel-sql/tests/top_keys.rs`
+pins every returned group against the rule-off plan, under ascending,
+descending and shuffled arrival, with ties at the `n`-th key, an evicted key
+seen again, NULL keys first and last, and `OFFSET`, in all four modes. The
+aggregates it covers are `count(*)`, `count`, `sum`, `avg`, `min` and `max`
+over integer columns, with non-float keys. Among keys tied on the sort, which
 ones are returned follows arrival order, which SQL leaves unspecified, and
 under the tie-order rewrite the sort is total on the keys. Float keys are
 refused because `GroupValues` folds -0.0 into +0.0 while the row encoding
@@ -6342,9 +6349,14 @@ state into a fresh accumulator, and `0.0 + -0.0` is +0.0.
 
 On its fixture of 1,000,000 distinct `Int64` keys over 8 partitions with
 `ORDER BY k LIMIT 10`, keys arriving in the worst order or shuffled, the
-query pool's charged peak is 6.6 to 8.2 MB with the rule and 66 to 71 MB
-with `bounded_top_keys_max_limit = 0`; the test asserts below 16 MiB and
-above 32 MiB. The partial stage and the exchange still carry every group.
+query pool's charged peak measured 4.1 to 8.9 MB with the rule and 60 to 71
+MB with `bounded_top_keys_max_limit = 0`, and the test asserts below 16 MiB
+and above 32 MiB. The memory envelope measured 4.7 to 6.2 MB with the rule
+and 107 to 134 MB without it, asserted the same way. Each `TopKeys[`
+consumer's own peak measured 0.9 to 1.0 MB, and the test asserts it below
+`(2n + batch size) × 256` bytes, 2,102,272 at the default batch of 8192:
+the exec holds at most `2n` groups plus one batch's keys. The partial stage
+and the exchange still carry every group.
 
 #### Bucketed final aggregation (ADR-3565)
 

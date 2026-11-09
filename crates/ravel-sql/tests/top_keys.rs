@@ -14,20 +14,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, TimestampNanosecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
-use datafusion::common::Result as DFResult;
+use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::datasource::MemTable;
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
-use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 use proptest::prelude::*;
@@ -44,8 +44,9 @@ use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
     BucketedFinalAggregateExec, BucketedFinalAggregation, DeclaredColumn, DeclaredType,
     FirstGroupsExec, LogsTableProvider, SessionPrincipal, SessionTable, SpanSegmentFetcher,
-    SpillDecision, SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns, TenantDelegatingPool,
-    TenantMemoryAccountant, TopKeysAggregateExec, build_session, plan_aggregate_profile,
+    SpillDecision, SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns,
+    TOP_KEYS_CONSUMER_PREFIX, TenantDelegatingPool, TenantMemoryAccountant, TopKeysAggregateExec,
+    build_session, plan_aggregate_profile,
 };
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::AttrValue;
@@ -206,18 +207,42 @@ fn sorted(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
 
 /// Forwards to the query's `TenantDelegatingPool` and records, after every
 /// call, the bytes the process budget holds beyond the tenant's charge: the
-/// aggregate envelopes, which are charged on the process budget alone.
+/// aggregate envelopes, which are charged on the process budget alone. It
+/// also records the reservation of each `TopKeys[` consumer and its peak.
 #[derive(Debug)]
 struct EnvelopeProbe {
     inner: Arc<dyn MemoryPool>,
     tenant: Arc<TenantMemoryAccountant>,
     peak: AtomicI64,
+    /// `(reserved, peak)` per `TopKeys[` consumer name.
+    top_keys: Mutex<BTreeMap<String, (usize, usize)>>,
 }
 
 impl EnvelopeProbe {
     fn sample(&self) {
         let envelope = self.tenant.process_reserved() as i64 - self.tenant.reserved() as i64;
         self.peak.fetch_max(envelope, Ordering::Relaxed);
+    }
+
+    /// Record `reservation` growing by `grown` bytes and shrinking by
+    /// `shrunk`, when its consumer is a `TopKeys[` one.
+    fn track(&self, reservation: &MemoryReservation, grown: usize, shrunk: usize) {
+        let name = reservation.consumer().name();
+        if !name.starts_with(TOP_KEYS_CONSUMER_PREFIX) {
+            return;
+        }
+        let mut consumers = self.top_keys.lock().expect("probe lock");
+        let (reserved, peak) = consumers.entry(name.to_string()).or_default();
+        *reserved = (*reserved + grown).saturating_sub(shrunk);
+        *peak = (*peak).max(*reserved);
+    }
+
+    /// The largest peak any one `TopKeys[` consumer reached, and how many
+    /// such consumers registered a reservation.
+    fn top_keys_peak(&self) -> (usize, usize) {
+        let consumers = self.top_keys.lock().expect("probe lock");
+        let peak = consumers.values().map(|(_, peak)| *peak).max().unwrap_or(0);
+        (peak, consumers.len())
     }
 }
 
@@ -244,16 +269,21 @@ impl MemoryPool for EnvelopeProbe {
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         self.inner.grow(reservation, additional);
+        self.track(reservation, additional, 0);
         self.sample();
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.inner.shrink(reservation, shrink);
+        self.track(reservation, 0, shrink);
         self.sample();
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
         let result = self.inner.try_grow(reservation, additional);
+        if result.is_ok() {
+            self.track(reservation, additional, 0);
+        }
         self.sample();
         result
     }
@@ -271,22 +301,43 @@ impl MemoryPool for EnvelopeProbe {
 struct Probed {
     /// The `n` of each `TopKeysAggregateExec` in the plan.
     bounds: Vec<usize>,
+    /// The mode of the aggregate each `TopKeysAggregateExec` replaced.
+    modes: Vec<AggregateMode>,
     plan: String,
     result: DFResult<Vec<RecordBatch>>,
-    /// The summed `evictions` and `rebuilds` metrics of the plan's
-    /// `TopKeysAggregateExec` nodes, after the run.
+    /// The summed `evictions`, `rebuilds`, `dropped_rows` and
+    /// `interned_at_threshold` metrics of the plan's `TopKeysAggregateExec`
+    /// nodes, after the run.
     evictions: usize,
     rebuilds: usize,
+    dropped: usize,
+    interned_at_threshold: usize,
     /// The query pool's charged peak, `peak_intermediate_bytes`.
     charged: u64,
     /// The largest aggregate envelope the process budget held.
     envelope: i64,
+    /// The largest reservation one `TopKeys[` consumer held, and how many
+    /// such consumers reserved anything.
+    top_keys_peak: usize,
+    top_keys_consumers: usize,
 }
 
 impl Probed {
     fn rows(&self) -> Vec<Vec<String>> {
         cells(self.result.as_ref().expect("query runs"))
     }
+}
+
+/// The mode of the aggregate inside every `TopKeysAggregateExec` in `plan`.
+fn top_keys_modes(plan: &Arc<dyn ExecutionPlan>) -> Vec<AggregateMode> {
+    let mut out = Vec::new();
+    if let Some(node) = plan.downcast_ref::<TopKeysAggregateExec>() {
+        out.push(*node.aggregate().mode());
+    }
+    for child in plan.children() {
+        out.extend(top_keys_modes(child));
+    }
+    out
 }
 
 /// Run `sql` over `parts` on the production session with `options` set, its
@@ -306,6 +357,7 @@ async fn probed(
         inner: Arc::clone(&inner),
         tenant,
         peak: AtomicI64::new(0),
+        top_keys: Mutex::new(BTreeMap::new()),
     });
     let ctx = session(
         config,
@@ -323,14 +375,20 @@ async fn probed(
     let bounds = top_keys_bounds(&plan);
     let text = render(&plan);
     let result = collect(Arc::clone(&plan), ctx.task_ctx()).await;
+    let (top_keys_peak, top_keys_consumers) = probe.top_keys_peak();
     Probed {
         bounds,
+        modes: top_keys_modes(&plan),
         plan: text,
         result,
         evictions: top_keys_metric(&plan, "evictions"),
         rebuilds: top_keys_metric(&plan, "rebuilds"),
+        dropped: top_keys_metric(&plan, "dropped_rows"),
+        interned_at_threshold: top_keys_metric(&plan, "interned_at_threshold"),
         charged: accounting.snapshot().peak_intermediate_bytes,
         envelope: probe.peak.load(Ordering::Relaxed),
+        top_keys_peak,
+        top_keys_consumers,
     }
 }
 
@@ -340,9 +398,18 @@ async fn on_and_off(
     options: &[(&str, &str)],
     sql: &str,
 ) -> (Probed, Probed) {
-    let config = SqlConfig::default();
-    let on = probed(&config, parts(), options, sql).await;
-    let off = probed(&rule_off(&config), parts(), options, sql).await;
+    on_and_off_with(&SqlConfig::default(), parts, options, sql).await
+}
+
+/// `sql` under `config`, and under `config` with the rule off.
+async fn on_and_off_with(
+    config: &SqlConfig,
+    parts: impl Fn() -> Vec<Vec<RecordBatch>>,
+    options: &[(&str, &str)],
+    sql: &str,
+) -> (Probed, Probed) {
+    let on = probed(config, parts(), options, sql).await;
+    let off = probed(&rule_off(config), parts(), options, sql).await;
     assert!(off.bounds.is_empty(), "rule off: {sql}\n{}", off.plan);
     (on, off)
 }
@@ -564,6 +631,7 @@ async fn eviction_drops_the_groups_state() {
     assert_eq!(on.rows(), keyed_rows(0..10, 2));
     assert!(on.evictions > 0, "no group was evicted");
     assert!(on.rebuilds > 0, "no rebuild ran");
+    assert!(on.dropped > 0, "no row was dropped at the threshold");
     assert!(on.charged < MIB as u64, "charged peak {}", on.charged);
 
     let off = probed(&rule_off(&config), parts(), TIGHT, sql).await;
@@ -576,6 +644,113 @@ async fn eviction_drops_the_groups_state() {
         err.to_string().contains("Resources exhausted"),
         "rule off: {err}"
     );
+}
+
+/// A pool too small for the exec's own table refuses its consumer, and the
+/// query fails with `ResourcesExhausted` naming it rather than panicking. On
+/// one partition the plan is a `Single` aggregate over the source, so the
+/// exec is the first consumer to reserve.
+#[tokio::test]
+async fn a_refused_reservation_fails_the_query_with_the_consumer_named() {
+    let sql = "SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k LIMIT 1000";
+    let config = SqlConfig {
+        max_query_bytes: 64 * 1024,
+        ..SqlConfig::default()
+    };
+    let on = probed(
+        &config,
+        keyed_parts(100_000, 1, 1, Arrival::Descending),
+        ONE_PARTITION,
+        sql,
+    )
+    .await;
+    assert_eq!(on.bounds, vec![1000], "{}", on.plan);
+    assert_eq!(on.modes, vec![AggregateMode::Single], "{}", on.plan);
+    let err = on.result.expect_err("the exec's table exceeds 64 KiB");
+    let message = err.to_string();
+    assert!(
+        matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+        "{err:?}"
+    );
+    assert!(
+        message.contains(&format!("{TOP_KEYS_CONSUMER_PREFIX}0] refused")),
+        "{message}"
+    );
+    assert!(!message.to_lowercase().contains("panic"), "{message}");
+}
+
+/// The integer `avg` keeps an exact `Decimal128` sum and an `Int64` count,
+/// no float state, so it is admitted, beside the other integer aggregates the
+/// session registers. Over [`tied_parts`] with `ORDER BY g, k` the answer is
+/// determined, through at least one rebuild, and equals the rule-off run row
+/// for row with every aggregate complete.
+#[tokio::test]
+async fn integer_avg_is_admitted_and_exact_through_rebuilds() {
+    let sql = "SELECT g, k, avg(v), count(*), count(v), sum(v), min(v), max(v) \
+               FROM t GROUP BY g, k ORDER BY g, k LIMIT 100";
+    for options in [&[][..], ONE_PARTITION] {
+        let options: Vec<_> = options
+            .iter()
+            .copied()
+            .chain([("datafusion.execution.batch_size", "512")])
+            .collect();
+        let (on, off) = on_and_off(tied_parts, &options, sql).await;
+        assert_eq!(on.bounds, vec![100], "{options:?}\n{}", on.plan);
+        assert!(on.rebuilds > 0, "{options:?}: no rebuild ran");
+        let rows = on.rows();
+        assert_eq!(rows, off.rows(), "{options:?}");
+        for (k, row) in rows.iter().enumerate() {
+            let [g, k, count, sum, max] = tied_group(k as i64);
+            assert_eq!(row[0], g.to_string());
+            assert_eq!(row[1], k.to_string());
+            assert_eq!(
+                row[2],
+                format!("{:?}", sum as f64 / count as f64),
+                "avg of {k}"
+            );
+            assert_eq!(row[3], count.to_string());
+            assert_eq!(row[4], count.to_string());
+            assert_eq!(row[5], sum.to_string());
+            assert_eq!(row[6], (10 * k).to_string(), "min of {k}");
+            assert_eq!(row[7], max.to_string());
+        }
+    }
+}
+
+/// The `Single` modes update from rows instead of merging states. One input
+/// partition on one target partition plans a `Single` aggregate over the
+/// source; a `GROUP BY k` over a subquery already grouped and hash
+/// partitioned on `k` plans a `SinglePartitioned` one. Both run through
+/// rebuilds over [`tied_parts`] and equal the complete figures row for row.
+#[tokio::test]
+async fn the_single_modes_are_admitted_and_exact() {
+    let batch = [("datafusion.execution.batch_size", "512")];
+    let one = [ONE_PARTITION, &batch[..]].concat();
+    let sql = "SELECT g, k, count(*), sum(v) FROM t GROUP BY g, k ORDER BY g, k LIMIT 100";
+    let (on, off) = on_and_off(|| vec![tied_parts().concat()], &one, sql).await;
+    assert_eq!(on.modes, vec![AggregateMode::Single], "{}", on.plan);
+    assert!(on.rebuilds > 0, "Single: no rebuild ran");
+    let want: Vec<Vec<String>> = (0..100)
+        .map(|k| tied_group(k)[..4].iter().map(i64::to_string).collect())
+        .collect();
+    assert_eq!(on.rows(), want, "Single");
+    assert_eq!(off.rows(), want, "Single: rule off");
+
+    let sql = "SELECT k, count(*), sum(s) FROM (SELECT k, sum(v) AS s FROM t GROUP BY k) \
+               GROUP BY k ORDER BY k LIMIT 100";
+    let (on, off) = on_and_off(tied_parts, &batch, sql).await;
+    assert_eq!(
+        on.modes,
+        vec![AggregateMode::SinglePartitioned],
+        "{}",
+        on.plan
+    );
+    assert!(on.rebuilds > 0, "SinglePartitioned: no rebuild ran");
+    let want: Vec<Vec<String>> = (0..100)
+        .map(|k| vec![k.to_string(), "1".to_string(), tied_group(k)[3].to_string()])
+        .collect();
+    assert_eq!(on.rows(), want, "SinglePartitioned");
+    assert_eq!(off.rows(), want, "SinglePartitioned: rule off");
 }
 
 /// `ORDER BY g LIMIT 40` over [`tied_parts`] cuts through the 64 keys that
@@ -603,6 +778,76 @@ async fn ties_at_the_nth_key_return_complete_groups() {
         assert_eq!(sort_values(&rows), vec!["0".to_string(); 40]);
         assert_eq!(sort_values(&off.rows()), vec!["0".to_string(); 40]);
     }
+}
+
+/// `(g, k, v)` in one partition, two batches. The first, 80 rows: tied keys
+/// `k` 100 to 169 with `g = 0`, then keys 0 to 9 with `g = k - 10`. The
+/// second, 20 rows: one more `g = 0` row for each of keys 130 to 139, then
+/// keys 200 to 209 with `g = -800 - k`. Row `j` of key `k` has `v = 10k + j`.
+fn reentry_parts() -> Vec<Vec<RecordBatch>> {
+    let schema = int64_schema(&["g", "k", "v"], false);
+    let mut rows = Vec::new();
+    let mut push = |g: i64, k: i64, j: i64| rows.push(vec![Some(g), Some(k), Some(10 * k + j)]);
+    for k in 100..170 {
+        push(0, k, 0);
+    }
+    for k in 0..10 {
+        push(k - 10, k, 0);
+    }
+    for k in 130..140 {
+        push(0, k, 1);
+    }
+    for k in 200..210 {
+        push(-800 - k, k, 0);
+    }
+    vec![int64_batches(&schema, &rows, 80)]
+}
+
+/// Over [`reentry_parts`] with `LIMIT 40` on one final partition, the first
+/// batch takes the exec to 80 groups and the rebuild keeps keys 0 to 9 and
+/// the first 30 tied keys, 100 to 129, and evicts 130 to 169 at the
+/// threshold `g = 0`. The second batch's rows for 130 to 139 tie the
+/// threshold, so they pass the mask and those keys re-enter holding one of
+/// their two rows; ten better keys follow them. The end-of-input cut must
+/// pick the 20 tied keys it keeps from the ones the rebuild kept.
+///
+/// FLIP (the rebuild interns the kept keys after the next batch's new keys):
+/// the re-entered keys get indexes 0 to 9, the cut picks all ten, and each
+/// comes back with a count of 1 where the complete group has 2.
+/// FLIP (the end-of-input cut ranks by sort row alone, with
+/// `sort_unstable_by`): the unstable sort orders the tied keys by neither
+/// index nor arrival, and re-entered keys come back with a count of 1.
+#[tokio::test]
+async fn a_key_evicted_at_the_threshold_and_seen_again_is_cut() {
+    let sql = "SELECT g, k, count(*), sum(v) FROM t GROUP BY g, k ORDER BY g LIMIT 40";
+    let (on, off) = on_and_off(reentry_parts, ONE_PARTITION, sql).await;
+    assert_eq!(on.bounds, vec![40], "{}", on.plan);
+    assert_eq!(on.modes, vec![AggregateMode::Single], "{}", on.plan);
+    assert_eq!(on.rebuilds, 1, "{}", on.plan);
+    assert_eq!(on.interned_at_threshold, 10, "{}", on.plan);
+    let all = probed(
+        &rule_off(&SqlConfig::default()),
+        reentry_parts(),
+        ONE_PARTITION,
+        "SELECT g, k, count(*), sum(v) FROM t GROUP BY g, k",
+    )
+    .await
+    .rows();
+    let complete: BTreeMap<String, Vec<String>> =
+        all.into_iter().map(|row| (row[1].clone(), row)).collect();
+    let rows = on.rows();
+    assert_eq!(rows.len(), 40, "{sql}");
+    let mut seen = BTreeSet::new();
+    for row in &rows {
+        assert_eq!(
+            Some(row),
+            complete.get(&row[1]),
+            "group {} is partial",
+            row[1]
+        );
+        assert!(seen.insert(row[1].clone()), "key {} returned twice", row[1]);
+    }
+    assert_eq!(sort_values(&rows), sort_values(&off.rows()), "{sql}");
 }
 
 /// `(k, v)`, `k` nullable: keys 1 to 1,000, one row each, over four
@@ -735,6 +980,141 @@ async fn an_aggregate_filter_leaves_the_plan_unchanged() {
         .collect();
     assert_eq!(on.rows(), want);
     assert_eq!(off.rows(), want);
+}
+
+/// `(k, v)` over four partitions in descending order: keys 0 to 1,999, `v =
+/// k`, keys below 100 with one row and the rest with two.
+fn having_parts() -> Vec<Vec<RecordBatch>> {
+    let schema = int64_schema(&["k", "v"], false);
+    let mut rows: Vec<Vec<Vec<Option<i64>>>> = vec![Vec::new(); 4];
+    for k in 0..2_000 {
+        for j in 0..if k < 100 { 1 } else { 2 } {
+            rows[((k + j) % 4) as usize].push(vec![Some(k), Some(k)]);
+        }
+    }
+    rows.into_iter()
+        .map(|mut part| {
+            part.reverse();
+            int64_batches(&schema, &part, 1024)
+        })
+        .collect()
+}
+
+/// `HAVING` puts a `FilterExec` between the sort and the aggregate, and the
+/// walk refuses it: the filter drops groups after the aggregate, so the n
+/// best groups the exec would keep are not the n best that survive it. Over
+/// [`having_parts`] the answer is keys 100 to 109.
+///
+/// FLIP (the walk passes through a `FilterExec`): each final partition keeps
+/// its ten smallest keys, all below 100, the filter drops every one, and the
+/// query returns no rows.
+#[tokio::test]
+async fn having_leaves_the_plan_unchanged() {
+    let sql = "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 1 ORDER BY k LIMIT 10";
+    let want: Vec<Vec<String>> = (100..110)
+        .map(|k| vec![k.to_string(), "2".to_string()])
+        .collect();
+    for options in [&[][..], ONE_PARTITION] {
+        let (on, off) = on_and_off(having_parts, options, sql).await;
+        assert_eq!(on.rows(), want, "{options:?}");
+        assert_eq!(off.rows(), want, "{options:?}: rule off");
+        assert!(on.bounds.is_empty(), "{options:?}\n{}", on.plan);
+        assert!(on.plan.contains("FilterExec"), "{}", on.plan);
+    }
+}
+
+/// An aggregate with its own `ORDER BY` is refused: the exec merges states
+/// without the ordering they carry. `first_value` is the one ordered
+/// aggregate the session registers, for the `DISTINCT ON` rewrite, which is
+/// the spelling that reaches it through the executor.
+#[tokio::test]
+async fn an_aggregate_order_by_leaves_the_plan_unchanged() {
+    for sql in [
+        "SELECT k, first_value(v ORDER BY v) FROM t GROUP BY k ORDER BY k LIMIT 10",
+        "SELECT DISTINCT ON (k) k, v FROM t ORDER BY k, v LIMIT 10",
+    ] {
+        let (on, off) =
+            on_and_off(|| keyed_parts(1_000, 4, 2, Arrival::Descending), &[], sql).await;
+        assert!(on.bounds.is_empty(), "{sql}\n{}", on.plan);
+        assert_eq!(on.rows().len(), 10, "{sql}");
+        assert_eq!(on.rows(), off.rows(), "{sql}");
+    }
+}
+
+/// A fetch above `bounded_top_keys_max_limit` is refused: 1,025 under the
+/// default ceiling of 1,024, and 10 under a ceiling of 5. The fetch at each
+/// ceiling is admitted.
+#[tokio::test]
+async fn a_limit_above_the_ceiling_leaves_the_plan_unchanged() {
+    let parts = || keyed_parts(3_000, 4, 2, Arrival::Descending);
+    let low = SqlConfig {
+        bounded_top_keys_max_limit: 5,
+        ..SqlConfig::default()
+    };
+    for (config, limit, bounds) in [
+        (SqlConfig::default(), 1_025, vec![]),
+        (SqlConfig::default(), 1_024, vec![1_024]),
+        (low.clone(), 10, vec![]),
+        (low, 5, vec![5]),
+    ] {
+        let sql = format!("SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k LIMIT {limit}");
+        let (on, off) = on_and_off_with(&config, parts, &[], &sql).await;
+        assert_eq!(on.bounds, bounds, "{sql}\n{}", on.plan);
+        assert_eq!(on.rows(), keyed_rows(0..limit, 2), "{sql}");
+        assert_eq!(off.rows(), keyed_rows(0..limit, 2), "{sql}: rule off");
+    }
+}
+
+/// `(k, f)` over four partitions in descending order: keys 0 to 1,999, two
+/// rows each. Key 0 holds three `-0.0` rows and nothing else; key `k` holds
+/// `f = k + 0.25`.
+fn float_state_parts() -> Vec<Vec<RecordBatch>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("f", DataType::Float64, false),
+    ]));
+    let mut rows: Vec<Vec<(i64, f64)>> = vec![Vec::new(); 4];
+    for k in 0..2_000i64 {
+        let copies = if k == 0 { 3 } else { 2 };
+        let f = if k == 0 { -0.0 } else { k as f64 + 0.25 };
+        for j in 0..copies {
+            rows[((k + j) % 4) as usize].push((k, f));
+        }
+    }
+    rows.into_iter()
+        .map(|mut part| {
+            part.reverse();
+            part.chunks(1024)
+                .map(|chunk| {
+                    let k = Int64Array::from_iter_values(chunk.iter().map(|row| row.0));
+                    let f = Float64Array::from_iter_values(chunk.iter().map(|row| row.1));
+                    RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(k), Arc::new(f)])
+                        .expect("batch builds")
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// A float state is refused even when the key is an integer: a rebuild
+/// merges each kept state into a fresh accumulator, and `0.0 + -0.0` is
+/// `+0.0`, so the `-0.0` group of [`float_state_parts`] could change sign.
+#[tokio::test]
+async fn a_float_state_leaves_the_plan_unchanged() {
+    for sql in [
+        "SELECT k, sum(f) FROM t GROUP BY k ORDER BY k LIMIT 10",
+        "SELECT k, avg(f) FROM t GROUP BY k ORDER BY k LIMIT 10",
+        "SELECT k, sum(f), avg(f), count(*) FROM t GROUP BY k ORDER BY k LIMIT 10",
+    ] {
+        for options in [&[][..], ONE_PARTITION] {
+            let (on, off) = on_and_off(float_state_parts, options, sql).await;
+            assert!(on.bounds.is_empty(), "{sql}\n{}", on.plan);
+            let rows = on.rows();
+            assert_eq!(rows.len(), 10, "{sql}");
+            assert_eq!(rows[0][0], "0", "{sql}");
+            assert_eq!(rows, off.rows(), "{sql}");
+        }
+    }
 }
 
 /// `(f, k)` in one partition: a `+0.0` row and a `-5.0` row, then two `-0.0`
@@ -916,12 +1296,20 @@ async fn a_sort_over_an_aggregate_or_a_renamed_non_key_leaves_the_plan_unchanged
 /// Every key of [`keyed_parts`] arriving in the adversarial order for the
 /// sort, and in a fixed shuffle, at 1,000,000 keys over 8 partitions,
 /// `LIMIT 10`, in both directions. With the rule each final partition holds
-/// at most 20 groups plus one batch's keys; the charged peak that remains is
-/// the hash exchange and the partial aggregates. With the rule off the final
-/// stage holds every group.
+/// at most 20 groups plus one batch's keys, and its `TopKeys[` reservation
+/// stays under [`BYTES_PER_HELD_GROUP`] times that many groups; the charged
+/// peak that remains is the hash exchange and the partial aggregates. With
+/// the rule off the final stage holds every group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_exec_bounds_the_final_stages_charged_peak() {
     const KEYS: i64 = 1_000_000;
+    const N: usize = 10;
+    // DataFusion's default, which the session keeps.
+    const BATCH: usize = 8192;
+    // About twice the 110 to 125 bytes per group the exec's peak measures
+    // here: key, count and sum, hash table, and the mask and sort-row scratch.
+    const BYTES_PER_HELD_GROUP: usize = 256;
+    let exec_bound = (2 * N + BATCH) * BYTES_PER_HELD_GROUP;
     for (direction, adversarial, want) in [
         ("ASC", Arrival::Descending, keyed_rows(0..10, 1)),
         (
@@ -935,23 +1323,46 @@ async fn the_exec_bounds_the_final_stages_charged_peak() {
         for arrival in [adversarial, Arrival::Shuffled(4004)] {
             let (on, off) = on_and_off(|| keyed_parts(KEYS, 8, 1, arrival), &[], &sql).await;
             eprintln!(
-                "top_keys peaks, {direction} {arrival:?}: on charged={} envelope={}; \
-                 off charged={} envelope={}",
-                on.charged, on.envelope, off.charged, off.envelope
+                "top_keys peaks, {direction} {arrival:?}: on charged={} envelope={} \
+                 exec={} over {} consumers; off charged={} envelope={}",
+                on.charged,
+                on.envelope,
+                on.top_keys_peak,
+                on.top_keys_consumers,
+                off.charged,
+                off.envelope
             );
             assert_eq!(on.bounds, vec![10], "{}", on.plan);
             assert!(on.rebuilds > 0, "{direction} {arrival:?}: no rebuild ran");
             assert_eq!(on.rows(), want, "{direction} {arrival:?}");
             assert_eq!(off.rows(), want, "{direction} {arrival:?}: rule off");
+            assert!(on.top_keys_consumers > 0, "{direction} {arrival:?}");
+            assert!(
+                on.top_keys_peak < exec_bound,
+                "{direction} {arrival:?}: the exec's own peak {} against {exec_bound}",
+                on.top_keys_peak
+            );
             assert!(
                 on.charged < 16 * MIB as u64,
                 "{direction} {arrival:?}: charged peak {} with the rule",
                 on.charged
             );
+            // The partial aggregates' envelope, which the rule leaves as it
+            // is: 4.7 to 6.2 MB measured.
+            assert!(
+                on.envelope < 16 * MIB as i64,
+                "{direction} {arrival:?}: envelope {} with the rule",
+                on.envelope
+            );
             assert!(
                 off.charged > 32 * MIB as u64,
                 "{direction} {arrival:?}: charged peak {} with the rule off",
                 off.charged
+            );
+            assert!(
+                off.envelope > 32 * MIB as i64,
+                "{direction} {arrival:?}: envelope {} with the rule off",
+                off.envelope
             );
         }
     }
@@ -1263,7 +1674,9 @@ async fn the_tie_order_rewrites_two_term_and_project_through_shapes_are_admitted
 /// executor: two objects, 40,000 rows over 1,500 minutes, each minute
 /// visited once per pass of 1,500 rows. Some passes carry another counter, a
 /// refresh or a third day, which the `WHERE` drops. The page is minutes
-/// 1,000 to 1,009 with their exact counts, as with the rule off.
+/// 1,000 to 1,009 with their exact counts, as with the rule off. The rule-off
+/// plan has a `CompactSlicesExec` between the sort and the final aggregate;
+/// with the rule on, none stands between the sort and the exec.
 #[tokio::test]
 async fn clickbench_row_43_returns_exact_counts_through_the_logs_table() {
     let tenant = TenantId::new("top-keys-4004-q43".to_string());
@@ -1309,11 +1722,25 @@ async fn clickbench_row_43_returns_exact_counts_through_the_logs_table() {
                LIMIT 10 OFFSET 1000";
     let (plan, rows) = plan_and_run(&on, &tenant, sql).await;
     assert_eq!(top_keys_bounds(&plan), vec![1010], "{}", render(&plan));
+    let text = render(&plan);
+    let sort = text.find("SortExec").expect("a sort");
+    let exec = text.find("TopKeysAggregateExec").expect("the exec");
+    assert!(
+        sort < exec && !text[sort..exec].contains("CompactSlicesExec"),
+        "{text}"
+    );
     let (plan_off, rows_off) = plan_and_run(&off, &tenant, sql).await;
     assert!(
         top_keys_bounds(&plan_off).is_empty(),
         "{}",
         render(&plan_off)
+    );
+    let text_off = render(&plan_off);
+    let sort = text_off.find("SortExec").expect("a sort");
+    let aggregate = text_off.find("AggregateExec").expect("the final aggregate");
+    assert!(
+        sort < aggregate && text_off[sort..aggregate].contains("CompactSlicesExec"),
+        "{text_off}"
     );
 
     let minute_text = |minute: i64| {
