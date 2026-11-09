@@ -1094,9 +1094,10 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    is refused (exit 70 naming the step) when the text does not read as one
    HEAD whose part list matches its `parts` line (case z14), when the stamp
    is not written or its `label_value_leaf_parts` does not read back as a
-   whole number (cases z27a, z27c and z27e; the routed pass the same way,
-   cases z27b, z27d and z27f), or when any part carries a `label_value`
-   leaf (case z12). Then `metricsbench_query`
+   whole number (cases z28a, z28c and z28e; the routed pass the same way,
+   cases z28b, z28d and z28f), when its `watermark_hour` or `parts` cannot
+   be read back or is not a whole number (cases z29a to z29d, both passes),
+   or when any part carries a `label_value` leaf (case z12). Then `metricsbench_query`
    against Prometheus and Ravel with the full corpus and
    `--passes`/`--reps`, `--pass-label folded-unrouted` and `--fold-state
    "folded: watermark_hour=W; parts=P; label_value leaf parts=L;
@@ -1159,7 +1160,24 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    `records_pruned_by_label_index` (one above 0) and
    `segments_pruned_by_label_index` (their sum over the records that carry
    one). A difference is recorded and the run still exits 0 (cases z2, z15,
-   z16 and z22); the band file below is the verdict.
+   z16 and z22); the band file below is the verdict. Per routed record
+   that carries `labelIndexValues` (one element per value pass of the
+   label-value route, ADR-3694's per-value amendment), `routed_values` holds
+   `entry`, `rep`, `n` (the passes), `leaf_gets` (their `leafGetRequests`
+   summed), `leaf_cache_hits` (their `leafCacheHits` summed),
+   `covering_parts` (the largest `partsCovered`, since every pass routes the
+   same snapshot), `leaf_gets_bound` ((1 + n) x `covering_parts`),
+   `parts_beyond_ceiling` (their `partsBeyondCeiling` summed) and
+   `name_pruned_alone` (whether a pass whose `labels` include `__name__`
+   pruned a segment alone, `null` with no such pass). `route_values_check`
+   states the rule; `routed_records_with_values`,
+   `routed_records_without_values` (`labelIndexValues` null: the route did
+   not run), `routed_records_values_unreadable` (an element without a
+   `labels` list or a whole-number figure above, counted apart and never
+   read as 0), `statements_leaf_gets_over_bound` (entries with a record
+   whose `leaf_gets` exceeds its bound) and `parts_beyond_ceiling_total`
+   carry the totals (cases z1 and z30). The stamp leaves `routed_values`
+   out and lists the unreadable records by entry.
 7. `stage1-holders`: `ravel-cli catalog list --json` lists the L0 and L1
    data objects the folded snapshot resolves into `stage1-objects.jsonl`;
    the bucket's L0 and L1 data objects (`t/*/m/l0/*.rseg`,
@@ -1169,9 +1187,12 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    On the real-S3 lane the bucket is `<PREFIX>-ravel` (case z11). Exit 70 on
    a failed listing, download or count, or a stamp that cannot read the
    count; on a failed download no count runs (case z10). `stage1.holders` stamps
-   the bucket, the method, `objects_listed`, `objects_above_watermark`
-   (listed objects whose ingest hour is after the unrouted snapshot's
-   `watermark_hour`), `objects_l0`, `objects_l1`, `series_total`,
+   the bucket, the method, `listing_state` (the listing is taken after
+   `stage1-routed`, so it is the routed snapshot's objects) and
+   `listing_watermark_hour` (`stage1.routed_catalog.watermark_hour`, read
+   back as a whole number or the step is refused), `objects_listed`,
+   `objects_above_watermark` (listed objects whose ingest hour is after
+   `listing_watermark_hour`), `objects_l0`, `objects_l1`, `series_total`,
    `min_commit_tokens`, `token_objects` (how many listed objects those
    tokens name), `tokens_unmatched`, per statement `segments_in_window`,
    `named_in_window`, `name_pruned`, `token_only_fetched`,
@@ -1207,16 +1228,173 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    route-bound are in neither routed check (case z26u). `route_unbound` lists
    each statement whose `route_bound` is false with its reason (case z23).
 
+**Arms.** Four more measurements of ADR-3694's Stage 1 table (issue #3969)
+run only when switched on, so a run without the switches is the one above
+(case za1). `stage1.arms` stamps `control`, `extra_hour`, `l1` and `erasure`
+as booleans, and an arm that is off stamps each of its keys `skipped: arm off
+(MB_CONTROL_IMAGE is not set)` or `skipped: arm off (MB_STAGE1_ARMS does not
+name ARM)`. The switches:
+
+- `MB_CONTROL_IMAGE` and `MB_CONTROL_SOURCE_COMMIT`, given together or not at
+  all (exit 64, case zf2), turn on the control arm (ADR-3694 row 12). The
+  image must carry an `@sha256:` digest and the commit must be 40 hex digits
+  (exit 65 before anything starts, case zf1).
+- `MB_STAGE1_ARMS`, a comma list of `extra-hour`, `l1` and `erasure` (any
+  other name exits 64, case zf4), turns on the arms that change the tenant.
+- Every switch needs `MB_STAGE1=1` (exit 64, case zf3).
+
+`METRICSBENCH_SLEEP` (default `sleep`) is the command that waits for an hour
+to pass or seal, and `METRICSBENCH_ERASURE_TRIES` and
+`METRICSBENCH_ERASURE_INTERVAL` (default 120 tries 15 s apart) bound the wait
+for the erasure rewrite. Case za runs all four arms and pins the step order,
+every recreate's flags and image, the fold flags and the order of the store
+and container calls. The control arm runs between `stage1-unrouted` and
+`stage1-leaves`, on the snapshot the unrouted pass read; the other three run
+after `stage1-holders`, in the order below, since each changes what the
+routed pass read. Each arm's cost in requests and bytes is listed under its
+own step, as the run records it; a request the run does not count says so.
+
+8. `stage1-control` (row 12): ravel-server recreated from `MB_CONTROL_IMAGE`
+   with the unrouted flags (`stage1.control_restart`); `docker image inspect`
+   must report the digest (exit 70 naming the step when it does not). Both
+   images' digests and source commits are stamped as `stage1.control_image`
+   (`main` and `control`). Then the passes as in step 2 with `--pass-label
+   folded-control` and the image appended to `--fold-state`, into
+   `stage1-control/`, steady and cold.
+   Cost: every record carries its `phases` (per phase `s3GetRequests` and
+   `s3GetWireBytes` as the server counts them); the recreate and the image
+   inspect touch no object store.
+9. `stage1-control-restore`: ravel-server recreated from the main image with
+   the unrouted flags (`stage1.control_restore`). Then
+   `stage1-control-compare.json` (schema
+   `metricsbench-stage1-control-compare/1`, stamped as
+   `stage1.control_compare`): per entry, over its answered records in each
+   pass, the median `latency_ms`, the median GETs and wire bytes summed over
+   phases and each phase's medians, and `latency_ratio` (unrouted over
+   control); `statements_more_gets` and `statements_more_bytes` (entries
+   whose unrouted median exceeds the control's), `statements_unchecked`
+   (no readable record in either pass, or a control median of 0 ms), each
+   with its count, and `latency_ratio_median` (case zb).
+   Cost: the compare file is the arm's request and byte figure, per
+   statement and per phase, for both builds on one snapshot.
+10. `stage1-extra-hour-ingest` (row 7): once the wall clock is past the hour
+    after the routed snapshot's `watermark_hour` and the profile's next
+    scrape-grid hour (`anchor_ms + duration_secs`) ends no more than 5
+    minutes ahead, `metricsbench_ingest --no-in-process-row` writes that hour
+    to Ravel alone, into `stage1-extra-hour/` (`stage1.extra_hour_ingest`:
+    the anchor, steps, the time waited until and the ingest end hour).
+    Cost: `stage1-extra-hour/ingest.json`, the ingest report's write and
+    read-back figures for one hour.
+11. `stage1-extra-hour-fold-off`: ravel-server stopped; the tenant's metrics
+    catalog HEAD saved with `aws s3 cp --recursive ... --exclude '*'
+    --include '*/catalog/m/HEAD'` on `createbuckets`; `catalog fold --signal
+    metrics --writers-stopped` with no leaf flag, timed
+    (`stage1.extra_hour_fold_off`).
+    Cost: the fold report's `list_requests`, `get_requests` and
+    `put_requests`, stamped; the HEAD save is one listing of the `t/`
+    prefix and one GET per HEAD, not counted.
+12. `stage1-extra-hour-fold-on`: the saved HEAD put back with `aws s3 cp`
+    and read back; a read-back whose sha256 differs from the saved one ends
+    the run with exit 70 (case zg). Then `catalog fold --signal metrics
+    --writers-stopped --key-index-leaves --metrics-label-index` from that
+    same HEAD, timed (`stage1.extra_hour_fold_on`).
+    Cost: the fold report's LIST, GET and PUT counts and the key-index
+    leaves and leaf bytes it wrote, stamped; the restore is one PUT and the
+    read-back one listing and one GET per HEAD, not counted.
+13. `stage1-extra-hour`: the inspect and the listing into
+    `stage1-extra-hour.inspect.txt` and `stage1-extra-hour.objects.jsonl`,
+    then `stage1.extra_hour`: `same_start` (both folds' HEAD sha256 and
+    `previous_watermark_hour`), `start_mismatches`, `fold_off` and `fold_on`
+    (each fold's `wall_ms` and `watermark_hour`), `wall_ratio_on_off`,
+    `tail_objects` and `tail_data_bytes` (the listed data objects above the
+    routed `watermark_hour`), `leaf_bytes` (the leaf-on fold's
+    `key_index_leaf_bytes_written`), `leaf_bytes_ratio` (over
+    `tail_data_bytes`), `tail_parts` and `uncovered_tail_parts` (parts over
+    the new hour with no `label_value` leaf), each with its basis (case
+    zc). Then ravel-server recreated with the routed flags
+    (`stage1.extra_hour_restart`).
+    Cost: the leaf bytes over the hour's data bytes is the arm's write
+    figure; the listing is one `catalog list`.
+14. `stage1-l1-compact` (row 6, issue #3818): once the last ingest hour is
+    sealed (its end plus 6 minutes), ravel-server stopped and `ravel-cli
+    maintain compact-tenant --tenant metricsbench --signal metrics --shards
+    4 --max-flush-lifetime 0s` into `stage1-l1-compact.txt`;
+    `stage1.l1_compact` stamps the command, `wall_ms` and every counter it
+    prints (`compacted`, `already`, `not_sealed`, `parts_written`,
+    `failed` and the rest), each required exactly once.
+    Cost: compact-tenant reports hours and parts, not requests or bytes; the
+    L1 bytes it wrote are `stage1.l1_objects.l1_bytes` (step 16).
+15. `stage1-l1-fold`: `catalog fold --signal metrics --writers-stopped
+    --key-index-leaves --metrics-label-index` (`stage1.l1_fold`).
+    Cost: the fold report's LIST, GET and PUT counts and leaf bytes,
+    stamped.
+16. `stage1-l1`: ravel-server recreated with the routed flags
+    (`stage1.l1_restart`); the listing into `stage1-l1.objects.jsonl`,
+    stamped as `stage1.l1_objects` (`l0_objects`, `l1_objects`,
+    `l1_bytes`); the steady passes with `--pass-label folded-l1`, into
+    `stage1-l1/`; and `stage1-l1-compare.json` (`stage1.l1_compare`): the
+    routed and L1 hash sets per entry as in step 6, `entries_compared`,
+    `entries_differing_count`, and for the L1 records
+    `other_records_status_unexpected`,
+    `other_records_fetch_memory_exhausted_count` (status naming `fetch
+    memory exhausted`, #3818's failure) and the label-index counts (case zd).
+    Cost: every L1 record's `phases`, against the routed pass's.
+17. `stage1-erasure-reference` (row 8): the corpus with
+    `instance!="metricsbench-instance-0"` added to every selector, into
+    `stage1-erasure-reference.corpus.json` (`stage1.erasure_corpus`), run
+    with the routed flags into `stage1-erasure-reference/`;
+    `stage1-erasure-subject.json` (`stage1.erasure_subject`) compares it with
+    the routed pass, so the entries the subject changes are named.
+    Cost: every reference record's `phases`.
+18. `stage1-erasure-submit`: `ravel-cli erase submit --signal metrics
+    --matcher instance=metricsbench-instance-0` with a fresh request id
+    (`stage1.erasure_submit`).
+    Cost: the erasure record's write, not counted.
+19. `stage1-erasure-pending`: the corpus as written, routed, into
+    `stage1-erasure-pending/`; `stage1-erasure-compare.json`
+    (`stage1.erasure_compare`) compares it with the reference and counts
+    the pending records with `segmentsPrunedByLabelIndex` above 0 (case ze).
+    Cost: every pending record's `phases`, against the reference's.
+20. `stage1-erasure-rewrite`: a one-off `ravel-server --mode maintain`
+    container (`--maintain-tenant metricsbench --disable-fold`, a throwaway
+    record key) runs until `erase status` says `COMPLETED`, polled
+    `METRICSBENCH_ERASURE_TRIES` times `METRICSBENCH_ERASURE_INTERVAL`
+    seconds apart, then is removed; not completed in time ends the run
+    with exit 70 (case zh). `stage1.erasure_rewrite` stamps the request id,
+    state, deferral cause, per-bucket dropped counts, `dropped_total` and
+    the path.
+    Cost: the rewrite's requests are not counted; its log is
+    `stage1-erasure-maintain.log`.
+21. `stage1-erasure-fold`: ravel-server stopped, `catalog fold --signal
+    metrics --writers-stopped --key-index-leaves --metrics-label-index`
+    (`stage1.erasure_fold`).
+    Cost: the fold report's LIST, GET and PUT counts and leaf bytes,
+    stamped.
+22. `stage1-erasure`: the inspect into `stage1-erasure.inspect.txt` and
+    `stage1.erasure_leaves`: the parts over a rewritten hour and the leaves
+    they reference that the pre-erasure snapshot also referenced
+    (`stale_leaves`, `stale_leaves_count`). `stage1.erasure_sweep` says the
+    physical sweep was not checked: it waits out the protection horizon,
+    which is longer than a run.
+    Cost: one inspect, not counted.
+
+ADR-3694 row 8 says a pending erasure's results equal the unrouted pass's;
+the run compares the pending pass with a routed reference that excludes the
+subject, since the pending erasure hides the subject's series at query time
+and the routed corpus then answers without them.
+
 A run whose ingest verification failed, or whose steps 15 to 18 were
-skipped, runs none of them and stamps each `skipped:` and why (case z9).
+skipped, runs none of them and stamps each `skipped:` and why, arm keys
+included when their arm is on (case z9).
 
 **Record fields.** Every `ravel_cost` record (`diagnostics.json` of the query
 step and of both Stage 1 passes) carries `entry`, `pass` (the timed pass
 number, from 1), `rep`, `status`, `latency_ms`, and these copied from the
 answer's `data.stats`, each `null` (never 0) when the answer has no such
 member: `accounting`, `phases`, `segmentsFetched`, `segmentsPruned`,
-`segmentsPrunedByDictionary`, `segmentsPrunedByLabelIndex`, `estimate` and
-`io`. Then `pass_label` and `fold_state` as the run passed them, and
+`segmentsPrunedByDictionary`, `segmentsPrunedByLabelIndex`,
+`labelIndexValues` (the label-value route's per-value passes, absent from
+the answer when the route did not run), `estimate` and `io`. Then `pass_label` and `fold_state` as the run passed them, and
 `result_hash`, `blake3:` and the hash of the answer's `resultType` and
 `result` with the series sorted, so two answers with the same series hash
 equal whatever order the engine listed them in, and every value hashed by
@@ -1354,7 +1532,13 @@ against a band file and is the pass/fail for a Stage 1 run.
 `key[field=value]` selects the one element of the list under `key` whose
 `field` equals `value` (`statements[id=mb_selective_job_rate_sum].holders`).
 `min` and `max` are finite numbers or `null` for no bound, at least one set;
-`basis` is required. The band file's `profile` must be the run's. Each
+`basis` is required. The band file's `profile` must be the run's. A figure
+may carry `"when": {"file": F, "path": P, "equals": V}` with V a JSON
+scalar: it is checked only when the value at P in F is V (a Stage 1 arm's
+switch), else printed as `n/a NAME: P is VALUE, not V (FILE PATH)` and not
+counted as a failure; the condition's own value must be present exactly
+once, and a `when` that is not exactly those three keys, or whose `equals`
+is not a scalar, is refused with 65 (the `when` cases). Each
 figure must be present exactly once and inside its band: a missing file,
 key or element is `missing`; a key twice in its object, a selector matching
 two elements, or a figure the band file names twice is `duplicated`; a value
@@ -1380,8 +1564,23 @@ applies; no listed object above the watermark, no statement whose unrouted
 unchecked statement; no route-bound statement whose routed
 `segmentsPrunedByLabelIndex` differs from its `expected_routed_prunes` and
 none unchecked; no routed record of a route-bound statement with a
-non-empty resolved set whose `keyIndex` phase read no leaf; and at least
-one holder for `mb_selective_job_rate_sum`, which is route-bound. The `ci`
+non-empty resolved set whose `keyIndex` phase read no leaf; at least one
+routed record with `labelIndexValues`, none unreadable, no statement whose
+summed leaf GETs exceed (1 + n) x its covering parts and no pass leaving a
+part beyond the router's ceiling (case z30 fails the last three); and at
+least one holder for `mb_selective_job_rate_sum`, which is route-bound. The
+19 arm figures carry a `when` on `stage1.arms.ARM` and read `n/a` with the
+arm off: for the control arm no statement with more unrouted GETs or wire
+bytes than the control, none unchecked, and a median latency ratio in [0.5,
+2]; for the extra hour at least one new data object, no start mismatch, leaf
+bytes within 1% of the hour's data bytes, no uncovered part and a leaf-on
+over leaf-off wall ratio at most 10; for L1 at least one L1 object and one
+compared entry, no differing entry, no unexpected status and no `fetch
+memory exhausted` record; for the erasure no pending label-index prune, no
+pending entry differing from the reference, at least one compared entry, at
+least one dropped record and no stale leaf (the `stage1-check` arm cases
+fail figures of each arm). The L1 band assumes the extra hour lies after every query
+window, so compaction cannot change an answer. The `ci`
 bands ask for no routed prune: on `ci` every object's LABEL_DICT holds every
 probed value, so the router can prune none (run 42495422937 pruned none and
 read the leaf, 10 and 4 cache hits on two statements). Every basis is a
@@ -1397,7 +1596,13 @@ launch refuses a missing one with 64, and `box-run.sh` refuses it with exit
 bands and the measured run against its band file, uploads each check's
 output as `stage1-check.txt` beside its run, and ends with exit 22 when the
 smoke's check fails and 23 when the measured run exited 0 and its check
-failed (run.test.sh, the `box-run` cases).
+failed (run.test.sh, the `box-run` cases). `MB_STAGE1_ARMS`,
+`MB_CONTROL_IMAGE` and `MB_CONTROL_SOURCE_COMMIT` at launch reach the
+measured run alone (the arms wait for hours to pass or seal, which the ci
+smoke has no use for), launch refuses them without `MB_STAGE1=1` and an
+undigested control image with 64, and the box pulls the control image
+beside the main one. The nightly workflow sets none of them: the arms run
+on an AWS box only.
 
 ### The real-S3 lane
 

@@ -15,7 +15,9 @@
 # smoke's, cardinality or ci only), MB_STAGE1_BANDS (the measured run's Stage 1
 # band file, a path relative to the repository that must exist at the harness
 # commit; required with MB_STAGE1=1 for any profile but ci, which defaults to
-# deploy/metricsbench/stage1-bands.ci.json). AWS_PROFILE and AWS_REGION select
+# deploy/metricsbench/stage1-bands.ci.json), MB_STAGE1_ARMS, MB_CONTROL_IMAGE
+# (digest-pinned) and MB_CONTROL_SOURCE_COMMIT (run.sh's Stage 1 arms, on the
+# measured run only; each needs MB_STAGE1=1). AWS_PROFILE and AWS_REGION select
 # the account and region as for any aws CLI call.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -61,6 +63,17 @@ if [ -n "$stage1_bands" ] && [ -z "$stage1" ]; then
   echo "MB_STAGE1_BANDS is set but MB_STAGE1 is not 1" >&2
   exit 64
 fi
+stage1_arms=${MB_STAGE1_ARMS:-}
+control_image=${MB_CONTROL_IMAGE:-}
+control_source_commit=${MB_CONTROL_SOURCE_COMMIT:-}
+if { [ -n "$stage1_arms" ] || [ -n "$control_image" ] || [ -n "$control_source_commit" ]; } && [ -z "$stage1" ]; then
+  echo "MB_STAGE1_ARMS and MB_CONTROL_IMAGE add Stage 1 arms and need MB_STAGE1=1" >&2
+  exit 64
+fi
+if [ -n "$control_image" ] || [ -n "$control_source_commit" ]; then
+  case "$control_image" in *@sha256:*) ;; *) echo "MB_CONTROL_IMAGE must be digest-pinned (name@sha256:...)" >&2; exit 64;; esac
+  [ -n "$control_source_commit" ] || { echo "MB_CONTROL_IMAGE needs MB_CONTROL_SOURCE_COMMIT" >&2; exit 64; }
+fi
 rss_band=${MB_RSS_BAND:-prometheus:2147483648:6442450944}
 objects_band=${MB_OBJECTS_BAND:-14000:16500}
 boxrun="$here/box-run.sh"
@@ -84,6 +97,15 @@ case "$ravel_source_commit" in
   *[!0-9a-f]*) echo "ravel-source-commit must be a commit in $repo or a full 40-character id" >&2; exit 64;;
 esac
 [ "${#ravel_source_commit}" -eq 40 ] || { echo "ravel-source-commit must be a commit in $repo or a full 40-character id" >&2; exit 64; }
+if [ -n "$control_source_commit" ]; then
+  if git -C "$repo" cat-file -e "${control_source_commit}^{commit}" 2>/dev/null; then
+    control_source_commit=$(git -C "$repo" rev-parse "${control_source_commit}^{commit}")
+  fi
+  case "$control_source_commit" in
+    *[!0-9a-f]*) echo "MB_CONTROL_SOURCE_COMMIT must be a commit in $repo or a full 40-character id" >&2; exit 64;;
+  esac
+  [ "${#control_source_commit}" -eq 40 ] || { echo "MB_CONTROL_SOURCE_COMMIT must be a commit in $repo or a full 40-character id" >&2; exit 64; }
+fi
 run_id="mb-${label}-$(date -u +%Y%m%dT%H%M%SZ)-${short}"
 prefix="metricsbench/${run_id}"
 work=$(mktemp -d)
@@ -101,7 +123,9 @@ env_block=$(
     "BOXRUN_SHA256=${boxrun_sha256}" "HARNESS_COMMIT=${harness_sha}" "RAVEL_IMAGE=${ravel_image}" \
     "RAVEL_SOURCE_COMMIT=${ravel_source_commit}" "ANCHOR_MS=${anchor_ms}" "PROFILE=${profile}" \
     "RSS_BAND=${rss_band}" "OBJECTS_BAND=${objects_band}" "REAL_S3_PREFIX=${real_s3_prefix}" \
-    "STAGE1=${stage1}" "STAGE1_BANDS=${stage1_bands}" "AWS_DEFAULT_REGION=${region}"; do
+    "STAGE1=${stage1}" "STAGE1_BANDS=${stage1_bands}" "STAGE1_ARMS=${stage1_arms}" \
+    "CONTROL_IMAGE=${control_image}" "CONTROL_SOURCE_COMMIT=${control_source_commit}" \
+    "AWS_DEFAULT_REGION=${region}"; do
     printf '%s=%q\n' "${kv%%=*}" "${kv#*=}"
   done
 )

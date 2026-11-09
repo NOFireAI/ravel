@@ -17,16 +17,22 @@
 # bound, at least one of them a number; basis is required. The band file's
 # profile must be the run's (stamps.json's profile).
 #
+# A figure may carry "when": {"file": F, "path": P, "equals": V}, V a JSON
+# scalar: the figure is checked only when the value at P in F equals V (a
+# Stage 1 arm's switch, say); otherwise it is reported as not applicable. The
+# condition's own value must be present exactly once, as a figure's must.
+#
 # Each figure must be present exactly once and inside [min, max]:
 #   missing     the file, a key or a list element is absent, or the file is
 #               not JSON
 #   duplicated  a key on the path occurs twice in its object, a selector
 #               matches more than one element, or the band file names the
-#               figure twice
+#               figure more than once (reported once per name)
 #   out of band the value is not a finite number (a bool, a string, NaN or
 #               Infinity is not), or lies outside [min, max]
 #
-# Exit 0 prints one line per figure: ok NAME = VALUE in [MIN, MAX] (FILE PATH).
+# Exit 0 prints one line per figure: ok NAME = VALUE in [MIN, MAX] (FILE PATH),
+# or n/a NAME: P is VALUE, not V (FILE PATH) for one whose when does not hold.
 # Exit 1 prints one line per failing figure on stderr, then a count.
 # Exit 64 is bad usage; 65 a band file that cannot be used or whose profile is
 # not the run's.
@@ -99,6 +105,15 @@ for i, fig in enumerate(figures):
         refuse(f"figure {fig['name']}: neither min nor max is set")
     if fig["min"] is not None and fig["max"] is not None and fig["min"] > fig["max"]:
         refuse(f"figure {fig['name']}: min {fig['min']} is above max {fig['max']}")
+    if "when" in fig:
+        when = fig["when"]
+        if not isinstance(when, dict) or set(when) != {"file", "path", "equals"}:
+            refuse(f"figure {fig['name']}: when is not an object of exactly file, path and equals")
+        for k in ("file", "path"):
+            if not isinstance(when[k], str) or not when[k]:
+                refuse(f"figure {fig['name']}: when has no {k}")
+        if not (when["equals"] is None or isinstance(when["equals"], (bool, str)) or is_number(when["equals"])):
+            refuse(f"figure {fig['name']}: when.equals is not a JSON scalar")
 
 try:
     with open(os.path.join(out_dir, "stamps.json")) as f:
@@ -162,12 +177,28 @@ counts = {}
 for fig in figures:
     counts[fig["name"]] = counts.get(fig["name"], 0) + 1
 
-ok, bad = [], []
+ok, bad, reported = [], [], set()
 for fig in figures:
     name, where = fig["name"], f"({fig['file']} {fig['path']})"
     if counts[name] > 1:
-        bad.append(f"duplicated {name}: the band file names it {counts[name]} times {where}")
+        if name not in reported:
+            reported.add(name)
+            bad.append(f"duplicated {name}: the band file names it {counts[name]} times {where}")
         continue
+    if "when" in fig:
+        when = fig["when"]
+        cond = f"when {when['file']} {when['path']}"
+        doc, err = load(when["file"])
+        if err:
+            bad.append(f"missing {name}: {cond}: {err} {where}")
+            continue
+        value, why = resolve(doc, when["path"])
+        if why:
+            bad.append(f"{why[0]} {name}: {cond}: {why[1]} {where}")
+            continue
+        if json.dumps(value) != json.dumps(when["equals"]):
+            ok.append(f"n/a {name}: {when['path']} is {json.dumps(value)[:120]}, not {json.dumps(when['equals'])} {where}")
+            continue
     doc, err = load(fig["file"])
     if err:
         bad.append(f"missing {name}: {err} {where}")
