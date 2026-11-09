@@ -1191,9 +1191,9 @@ proves that no object in it holds the string `v`, so no series in it carries
   `ravel_query_key_index_parts_total`
   (`without_the_switch_the_route_does_not_run`). The parts themselves are
   still resolved, since the check reads them.
-- Each value is one routing pass under the router's unchanged `L_max`,
-  `P_max` and `B_run` admission, so leaf GETs grow with the number of
-  distinct values: `KEY_INDEX_LEAF_GET_CEILING` bounds one pass, and a
+- Each value is one routing pass under the router's one-key leaf GET
+  ceiling, `P_max` and `B_run` admission, so leaf GETs grow with the number
+  of distinct values: `KEY_INDEX_LEAF_GET_CEILING` bounds one pass, and a
   statement with n distinct values can issue n times it. The passes run at
   most `promql_fetch_fanout` at a time. A leaf that names another tenant or
   signal fails the statement; any other leaf failure leaves its part
@@ -4127,10 +4127,11 @@ the logs entry holding the same ten fields as `stats.keyIndex`
 (`ravel_sql::key_index_json`):
 
 - `partsCovered`: parts the router answered from their leaves.
-- `partsUncovered`: parts with no leaf for `trace_id`, whose segments go to
-  the tier-1 probe.
-- `partsBeyondCeiling`: parts past `L_max` or the probed-parts ceiling,
-  whose segments go to the tier-1 probe.
+- `partsUncovered`: parts with no leaf for `trace_id`, and parts whose
+  worst-case leaf GET count exceeds `2 x entry_count`, their tier-1 probe's
+  cost, whose segments go to the tier-1 probe.
+- `partsBeyondCeiling`: parts past the statement's leaf GET ceiling or the
+  probed-parts ceiling, whose segments go to the tier-1 probe.
 - `leavesRejected`: parts whose leaf did not answer, read as uncovered: a
   leaf that failed validation (`Corrupted`, a stale part binding), a leaf
   GET that failed, or leaf refs whose slices do not tile the key space
@@ -5517,10 +5518,19 @@ each sealed segment's `(part, ordinal)` and each part's handle (blake3,
 entry count, hours and leaf refs), it answers every segment `Pruned` (the
 part's leaves prove every key of the set absent), `Blocks` (the blocks
 holding the set) or `Uncovered` (tier 1 decides), from the leaves alone: it
-reads no part object and no HEAD. The admission order, the `L_max`, `P_max`
-and `B_run` ceilings, the bridged read and the decoded-bound reservation are
-the leaf reader's rules in docs/catalog-and-mvcc.md, "Per-part key-index
-leaves". A part the ceilings leave out, a rejected leaf, a refused
+reads no part object and no HEAD. The statement's leaf GET ceiling is
+`P_max x (1 + min(k, B_run))` for a set of `k` keys (2,048 at k = 1, 66,560
+at k >= 64; ADR-3692's key-set ceiling amendment), computed from the set
+where `route` builds its bounds. It is an absolute cap: each admitted part
+is charged its worst case and refunded down to the GETs it issued, so the
+cap's worst-case division is the fewest parts it admits. A part whose worst
+case exceeds `2 x entry_count`, its own tier-1 probe's cost, is not probed
+and counts in `partsUncovered`
+(`a_part_costing_more_than_its_tier_one_probe_is_left_to_tier_one`). The
+admission order, the `P_max` and `B_run` ceilings, the bridged read and the
+decoded-bound reservation are the leaf reader's rules in
+docs/catalog-and-mvcc.md, "Per-part key-index leaves". A part the ceilings
+leave out, a part dearer than its tier-1 probe, a rejected leaf, a refused
 reservation and a part without a leaf for the field are `Uncovered`, never
 sent to a scan; a leaf of another tenant or signal fails the statement and
 moves `ravel_catalog_isolation_breach_total`. Leaf reads are charged to the
