@@ -1018,6 +1018,18 @@ impl Catalog {
         self.decoded.memory_evictions()
     }
 
+    /// Give memory back to another consumer's refused reservation on the
+    /// shared [`ravel_memory::MemoryBudget`] (ADR-3326 decision 4,
+    /// pressure-evictor amendment): drop this catalog's decoded parts and
+    /// postings cache entries, least-recently-used first across every
+    /// tenant, until the evicted entries' reservation bytes reach `want` or
+    /// no entry remains, and return their sum. This evicts whether or not a
+    /// decoded-cache byte bound is configured. Each entry dropped this way is
+    /// counted in [`Catalog::decoded_cache_memory_evictions`].
+    pub fn evict_decoded_for_pressure(&self, want: u64) -> u64 {
+        self.decoded.evict_for_pressure(want)
+    }
+
     /// Decoded-output cache entries dropped by the byte bound
     /// ([`CatalogConfig::decoded_cache_max_bytes`]), cumulative. Not counted in
     /// [`Catalog::decoded_cache_memory_evictions`]. A value not cached because
@@ -14096,6 +14108,89 @@ mod tests {
             .expect("the freed budget admits the newcomer");
         assert_eq!(snapshot.segments.len(), 1);
         assert_eq!(budget.reserved(), arriving);
+    }
+
+    /// ADR-3326 decision 4, pressure-evictor amendment (issue #4015):
+    /// `Catalog::evict_decoded_for_pressure` gives memory back to ANOTHER
+    /// consumer's refused reservation, not this catalog's own. It evicts
+    /// least-recently-used across every tenant until `want` bytes are freed
+    /// or nothing remains, on a catalog whose own budget has room (the
+    /// default, unlimited one) and with no decoded-cache byte bound set.
+    ///
+    /// An implementation that evicts until the budget's reservation fits,
+    /// as `evict_until_fits` does, evicts nothing here and returns 0. One
+    /// that returns the entry count fails the exact-bytes assertion, and one
+    /// that evicts the most recent entry first fails the eviction count.
+    #[tokio::test]
+    async fn evict_for_pressure_frees_lru_entries_until_want_is_covered() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        let tenants: Vec<TenantHash> = (0..3u8).map(|i| TenantHash([0x70 + i; 16])).collect();
+
+        let mut sizes = Vec::new();
+        for (i, tenant_hash) in tenants.iter().enumerate() {
+            let part_len = fold_one_part_for(&store, *tenant_hash, sealed_hour, i as u64 + 1).await;
+            sizes.push(part_len);
+        }
+        assert!(
+            sizes[0] < sizes[1] && sizes[1] < sizes[2],
+            "the fixture's segment counts must give three distinct, increasing part sizes: \
+             {sizes:?}"
+        );
+
+        // No budget configured: the default catalog, so any wrong
+        // implementation that leans on the budget's own reservation (W1)
+        // has nothing to react to.
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        for tenant_hash in &tenants {
+            catalog
+                .resolve(tenant_hash, Signal::Metrics, range, &[], now_ns)
+                .await
+                .expect("resolve fills the part cache");
+        }
+        assert_eq!(catalog.part_cache().total_entries(), 3);
+        let total: u64 = sizes.iter().sum();
+        assert_eq!(catalog.decoded_part_cache_reserved_bytes(), total);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
+
+        // tenants[0] was resolved first and is the least-recently-used
+        // entry, and also (by construction) the smallest.
+        let want = sizes[0] + 1;
+        let freed = catalog.evict_decoded_for_pressure(want);
+        assert_eq!(
+            freed,
+            sizes[0] + sizes[1],
+            "one entry's bytes do not cover want, so the pass must take a second"
+        );
+        assert_eq!(
+            catalog.decoded_part_cache_reserved_bytes(),
+            sizes[2],
+            "only the coldest two entries are released"
+        );
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 2);
+        assert_eq!(catalog.part_cache().entry_count(&tenants[0]), 0);
+        assert_eq!(catalog.part_cache().entry_count(&tenants[1]), 0);
+        assert_eq!(
+            catalog.part_cache().entry_count(&tenants[2]),
+            1,
+            "the most-recently-used entry stays"
+        );
+
+        // A want above everything held empties the caches and returns the
+        // total held, not more.
+        let remaining = sizes[2];
+        let freed_rest = catalog.evict_decoded_for_pressure(remaining + 1_000_000);
+        assert_eq!(freed_rest, remaining);
+        assert_eq!(catalog.decoded_part_cache_reserved_bytes(), 0);
+        assert_eq!(catalog.part_cache().total_entries(), 0);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 3);
+
+        // A third call against empty caches frees nothing and evicts
+        // nothing more.
+        assert_eq!(catalog.evict_decoded_for_pressure(1), 0);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 3);
     }
 
     /// A decode no budget could ever admit fails on its FIRST refusal, with no
