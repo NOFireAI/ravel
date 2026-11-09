@@ -4095,14 +4095,29 @@ mod tests {
     }
 
     /// Issue #4014, through the builder `start` calls: on a 2-core host the
-    /// executor's in-memory attempt plans 16 partitions and its spill attempt
-    /// the derived 8, while `--sql-partition-count 8` plans 8 for both.
+    /// executor carries a first-attempt floor of 16 for the derived count of 8,
+    /// and the hash exchange under the final aggregate of an explained grouped
+    /// statement has 16 partitions; `--sql-partition-count 8` and
+    /// `--fetch-concurrency 8` carry a floor of 0 and plan that exchange at 8.
     ///
-    /// FLIP: resolving an explicit count like a derived one plans the
-    /// flag's in-memory attempt at 16.
-    #[test]
-    fn an_explicit_sql_partition_count_leaves_the_in_memory_attempt_unfloored() {
-        let planned = |argv: &[&str]| {
+    /// FLIP: resolve an explicit count like a derived one and both flags read
+    /// (16, 16) against (0, 8).
+    #[tokio::test]
+    async fn an_explicit_sql_partition_count_leaves_the_final_exchange_unfloored() {
+        /// The partition count of the plan's one hash `RepartitionExec`.
+        fn hash_partitions(plan: &str) -> usize {
+            let mut lines = plan
+                .lines()
+                .filter(|line| line.contains("RepartitionExec: partitioning=Hash("));
+            let line = lines.next().expect("a hash exchange");
+            assert!(lines.next().is_none(), "one hash exchange:\n{plan}");
+            let after = &line[line.find("], ").expect("hash partition count") + 3..];
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().expect("hash partition count")
+        }
+
+        async fn planned(argv: &[&str]) -> (usize, usize) {
+            let tenant = ravel_types::TenantId::new("floor-4014".to_string());
             let budgets = budgets_from_cli(argv, 2);
             let first_attempt = resolve_sql_first_attempt_partitions(
                 budgets.sql_partition_count,
@@ -4112,6 +4127,12 @@ mod tests {
                 .apply_to_engine(EngineConfig::default())
                 .expect("engine config");
             let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            // Data, so the scan is fanned out and the final aggregation is
+            // `FinalPartitioned` over a hash exchange.
+            let records: Vec<_> = (1..=64)
+                .map(|ts| crate::tests::sql_log_record(ts, &format!("row-{}", ts % 4)))
+                .collect();
+            crate::tests::publish_small_log_segment(store.as_ref(), &tenant, &records).await;
             let catalog = build_catalog(
                 store.clone(),
                 1,
@@ -4150,26 +4171,41 @@ mod tests {
                 first_attempt.min_partitions,
             )
             .expect("sql state builds");
-            let dir = std::path::PathBuf::from("/tmp/does-not-need-to-exist");
-            let target_partitions = |spill| {
-                ravel_sql::session_config(state.executor.config(), true, spill)
-                    .options()
-                    .execution
-                    .target_partitions
+            let request = ravel_sql::SqlRequest {
+                sql: "SELECT body, count(*) AS n FROM logs GROUP BY body".to_string(),
+                window: ravel_types::TimeRange {
+                    start_ns: 0,
+                    end_ns: i64::MAX,
+                },
+                min_tokens: Vec::new(),
+                now_ns: 1_000_000,
+                deadline: Duration::from_secs(30),
+                row_window: false,
+                max_rows: None,
+                budgets: None,
             };
+            let plan = state
+                .executor
+                .explain(tenant.hash(), &request)
+                .await
+                .expect("explain runs")
+                .plan_text;
             (
-                target_partitions(ravel_sql::SpillDecision::Disabled),
-                target_partitions(ravel_sql::SpillDecision::Enabled {
-                    dir: dir.as_path(),
-                    max_bytes: 1 << 20,
-                }),
+                state.executor.config().first_attempt_min_partitions,
+                hash_partitions(&plan),
             )
-        };
-        assert_eq!(planned(&["ravel-server"]), (16, 8), "derived 8");
+        }
+
+        assert_eq!(planned(&["ravel-server"]).await, (16, 16), "derived 8");
         assert_eq!(
-            planned(&["ravel-server", "--sql-partition-count", "8"]),
-            (8, 8),
+            planned(&["ravel-server", "--sql-partition-count", "8"]).await,
+            (0, 8),
             "--sql-partition-count 8"
+        );
+        assert_eq!(
+            planned(&["ravel-server", "--fetch-concurrency", "8"]).await,
+            (0, 8),
+            "--fetch-concurrency 8"
         );
     }
 

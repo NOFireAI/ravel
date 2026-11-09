@@ -2408,10 +2408,15 @@ mod tests {
         assert_eq!(last.name(), crate::memory::AGGREGATE_PROFILE_RULE);
     }
 
-    /// Issue #4014: the exchange floor is the first of Ravel's appended rules,
-    /// directly before `DictionaryGroupKeysAsViews`.
+    /// Issue #4014: the exchange floor runs after every DataFusion default
+    /// rule, `SanityCheckPlan` last among them, so it sees the exchange
+    /// `EnforceDistribution` placed, and it is the first of Ravel's appended
+    /// rules, directly before `DictionaryGroupKeysAsViews`.
+    ///
+    /// FLIP: install the floor with `with_physical_optimizer_rules` ahead of
+    /// the defaults and the prefix no longer matches them.
     #[test]
-    fn the_exchange_floor_is_the_first_appended_physical_optimizer_rule() {
+    fn the_exchange_floor_runs_after_the_default_rules_and_first_of_ravels() {
         let ctx = samples_and_logs();
         let state = ctx.state();
         let names: Vec<&str> = state
@@ -2419,13 +2424,22 @@ mod tests {
             .iter()
             .map(|rule| rule.name())
             .collect();
-        let at = names
-            .iter()
-            .position(|name| *name == crate::exchange_floor::FINAL_EXCHANGE_FLOOR_RULE)
-            .expect("the floor rule is installed");
+        let defaults = datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new();
+        let default_names: Vec<&str> = defaults.rules.iter().map(|rule| rule.name()).collect();
+        assert_eq!(default_names.last(), Some(&"SanityCheckPlan"));
         assert_eq!(
-            names.get(at + 1),
-            Some(&crate::group_keys::DICTIONARY_GROUP_KEYS_RULE),
+            names.get(..default_names.len()),
+            Some(default_names.as_slice()),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.get(default_names.len()..default_names.len() + 2),
+            Some(
+                &[
+                    crate::exchange_floor::FINAL_EXCHANGE_FLOOR_RULE,
+                    crate::group_keys::DICTIONARY_GROUP_KEYS_RULE,
+                ][..]
+            ),
             "{names:?}"
         );
     }
