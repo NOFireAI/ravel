@@ -16257,6 +16257,373 @@ pub(crate) mod tests {
         );
     }
 
+    /// Day d's two records and its sealed part's leaf refs, with `session`
+    /// declared under `session_type`, folded through day d + 1's first entry
+    /// into a store whose op log is then cleared. Every entry's KEY_IDX
+    /// section indexes `user_id` and `session`, both I64.
+    async fn sealed_day_with_session(
+        store: &Arc<OpLogStore>,
+        catalog: &Catalog,
+        session_type: crate::tenant_config::DeclaredColumnType,
+    ) -> (Vec<CommitRecord>, SnapshotPartRef) {
+        use crate::tenant_config::DeclaredColumnType;
+        declare_key_index_columns(
+            store.as_ref(),
+            &[(USER_ID, DeclaredColumnType::I64), (SESSION, session_type)],
+            1,
+        )
+        .await;
+        let fields = [(USER_ID, KeyType::I64), (SESSION, KeyType::I64)];
+        let mut day_d = Vec::new();
+        for (seq, hour, ids) in [(1u64, DAY_D + 20, [10, 20]), (2, DAY_D + 22, [30, 40])] {
+            let (record, _) =
+                publish_keyed_logs(store.as_ref(), seq, hour, &ids, 2, 0, &fields).await;
+            day_d.push(record);
+        }
+        publish_keyed_logs(store.as_ref(), 3, DAY_D + 25, &[50], 2, 0, &fields).await;
+        fold_through(catalog, Signal::Logs, DAY_D + 25).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            head.parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour))
+                .collect::<Vec<_>>(),
+            vec![(DAY_D + 20, DAY_D + 22), (DAY_D + 25, DAY_D + 25)],
+            "day d is sealed"
+        );
+        store.clear();
+        (day_d, head.parts[0].clone())
+    }
+
+    fn leaf_fields(part: &SnapshotPartRef) -> Vec<&str> {
+        part.key_index
+            .iter()
+            .map(|leaf| leaf.field.as_str())
+            .collect()
+    }
+
+    /// ADR-3939: a sealed day part carried by reference without a leaf for
+    /// a declared field gets that field's leaves on the next fold, without
+    /// re-encoding the part. Day d is folded with `session` declared Str
+    /// while its sections index it I64, so every entry is uncovered for it
+    /// and day d seals with a `user_id` leaf only. Once `session` is declared
+    /// I64, the next fold carries day d (same key, same hash), PUTs no part
+    /// object for it, reads its two entries' footers and sections once (4
+    /// ranged GETs) and PUTs exactly one leaf, the `session` slice, and
+    /// day d's leaves are then the from-scratch leaves of both fields. The
+    /// fold after that issues no leaf PUT and no section read for day d.
+    ///
+    /// Without the attach (the carried ref forwarded as is), day d keeps no
+    /// `session` leaf. Building every declared field for the carried part
+    /// instead of the missing one re-PUTs the `user_id` leaf (2 leaf PUTs)
+    /// and names it twice.
+    #[tokio::test]
+    async fn a_sealed_day_missing_a_fields_leaves_gets_them_without_a_part_put() {
+        use crate::tenant_config::DeclaredColumnType;
+        let store = OpLogStore::empty();
+        let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        let (day_d, sealed) =
+            sealed_day_with_session(&store, &catalog, DeclaredColumnType::Str).await;
+        assert_eq!(leaf_fields(&sealed), vec![USER_ID]);
+
+        declare_key_index_columns(
+            store.as_ref(),
+            &[
+                (USER_ID, DeclaredColumnType::I64),
+                (SESSION, DeclaredColumnType::I64),
+            ],
+            2,
+        )
+        .await;
+        let fields = [(USER_ID, KeyType::I64), (SESSION, KeyType::I64)];
+        publish_keyed_logs(store.as_ref(), 4, DAY_D + 26, &[60], 2, 0, &fields).await;
+        store.clear();
+        let report = fold_through(&catalog, Signal::Logs, DAY_D + 26).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let attached = &head.parts[0];
+        assert_eq!(
+            (&attached.key, &attached.blake3, attached.size),
+            (&sealed.key, &sealed.blake3, sealed.size),
+            "day d is carried, not re-encoded"
+        );
+        assert_eq!(report.parts_reused, 1, "{report:?}");
+        assert!(
+            !store
+                .puts
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|key| *key == sealed.key),
+            "no PUT of day d's part object"
+        );
+        assert_eq!(
+            (
+                store.leaf_puts_for_part_watermark(DAY_D + 22),
+                store.section_gets_of(&day_d.iter().collect::<Vec<_>>()),
+            ),
+            (1, 2 * 2),
+            "one session leaf PUT, one footer and one section GET per entry"
+        );
+        assert_eq!(leaf_fields(attached), vec![SESSION, USER_ID]);
+        assert_eq!(
+            attached.key_index.iter().find(|leaf| leaf.field == USER_ID),
+            sealed.key_index.first(),
+            "the user_id ref is the sealed one"
+        );
+        let mut stored = stored_leaves(store.as_ref(), attached).await;
+        let mut expected = from_scratch_leaves_declaring(
+            store.as_ref(),
+            attached,
+            &[
+                (USER_ID.to_string(), KeyType::I64),
+                (SESSION.to_string(), KeyType::I64),
+            ],
+        )
+        .await;
+        stored.sort();
+        expected.sort();
+        assert_eq!(stored, expected);
+
+        publish_keyed_logs(store.as_ref(), 5, DAY_D + 27, &[70], 2, 0, &fields).await;
+        store.clear();
+        fold_through(&catalog, Signal::Logs, DAY_D + 27).await;
+        let next = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(next.parts[0], *attached);
+        assert_eq!(
+            (
+                store.leaf_puts_for_part_watermark(DAY_D + 22),
+                store.section_gets_of(&day_d.iter().collect::<Vec<_>>()),
+            ),
+            (0, 0),
+            "attached once"
+        );
+    }
+
+    /// ADR-3939 acceptance A3 with a field the tenant does not declare: day
+    /// d's sections name `session` beside the declared `user_id`, so it seals
+    /// with a leaf for each, and the next advance carries it with no leaf
+    /// PUT, no GET of its leaves and no section read. A carried part counts
+    /// as complete when it has a leaf for every declared field, whatever
+    /// else it has.
+    ///
+    /// Rebuilding the leaves of every carried part, and treating a part as
+    /// complete only when its leaf fields equal the declared set (so the
+    /// section-named `session` sends it to a rebuild), each PUT leaves for
+    /// day d here.
+    #[tokio::test]
+    async fn a_sealed_day_with_every_declared_fields_leaves_gets_no_new_leaf() {
+        use crate::tenant_config::DeclaredColumnType;
+        let store = OpLogStore::empty();
+        declare_key_index_columns(store.as_ref(), &[(USER_ID, DeclaredColumnType::I64)], 1).await;
+        let fields = [(USER_ID, KeyType::I64), (SESSION, KeyType::I64)];
+        let mut day_d = Vec::new();
+        for (seq, hour, ids) in [(1u64, DAY_D + 20, [10, 20]), (2, DAY_D + 22, [30, 40])] {
+            let (record, _) =
+                publish_keyed_logs(store.as_ref(), seq, hour, &ids, 2, 0, &fields).await;
+            day_d.push(record);
+        }
+        publish_keyed_logs(store.as_ref(), 3, DAY_D + 25, &[50], 2, 0, &fields).await;
+        let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        fold_through(&catalog, Signal::Logs, DAY_D + 25).await;
+        let sealed = read_signal_head(store.as_ref(), Signal::Logs).await.parts[0].clone();
+        assert_eq!(leaf_fields(&sealed), vec![SESSION, USER_ID]);
+
+        publish_keyed_logs(store.as_ref(), 4, DAY_D + 26, &[60], 2, 0, &fields).await;
+        store.clear();
+        let report = fold_through(&catalog, Signal::Logs, DAY_D + 26).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(head.parts[0], sealed);
+        assert_eq!(report.parts_reused, 1, "{report:?}");
+        assert_eq!(
+            (
+                store.leaf_puts_for_part_watermark(DAY_D + 22),
+                store.gets_of_leaves(&sealed.key_index),
+                store.section_gets_of(&day_d.iter().collect::<Vec<_>>()),
+            ),
+            (0, 0, 0),
+            "no leaf PUT, leaf GET or section read for sealed day d"
+        );
+    }
+
+    /// The cost of the attach for a field no entry of a sealed day indexes:
+    /// a field declared after day d was written, which day d's sections
+    /// never name. Every fold reads day d's sections again (4 ranged GETs
+    /// for 2 entries), finds no pair and PUTs no leaf, so day d keeps its
+    /// one `user_id` leaf.
+    #[tokio::test]
+    async fn a_declared_field_a_sealed_day_never_indexed_is_tried_on_every_fold() {
+        use crate::tenant_config::DeclaredColumnType;
+        let store = OpLogStore::empty();
+        declare_key_index_columns(store.as_ref(), &[(USER_ID, DeclaredColumnType::I64)], 1).await;
+        let mut day_d = Vec::new();
+        for (seq, hour, ids) in [(1u64, DAY_D + 20, [10, 20]), (2, DAY_D + 22, [30, 40])] {
+            let (record, _) =
+                publish_user_id_logs(store.as_ref(), seq, hour, &ids, 2, 0, true).await;
+            day_d.push(record);
+        }
+        publish_user_id_logs(store.as_ref(), 3, DAY_D + 25, &[50], 2, 0, true).await;
+        let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        fold_through(&catalog, Signal::Logs, DAY_D + 25).await;
+        let sealed = read_signal_head(store.as_ref(), Signal::Logs).await.parts[0].clone();
+        declare_key_index_columns(
+            store.as_ref(),
+            &[
+                (USER_ID, DeclaredColumnType::I64),
+                (SESSION, DeclaredColumnType::I64),
+            ],
+            2,
+        )
+        .await;
+        let fields = [(USER_ID, KeyType::I64), (SESSION, KeyType::I64)];
+        for (seq, hour) in [(4u64, DAY_D + 26), (5, DAY_D + 27)] {
+            publish_keyed_logs(store.as_ref(), seq, hour, &[seq as i64], 2, 0, &fields).await;
+            store.clear();
+            fold_through(&catalog, Signal::Logs, hour).await;
+            let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+            assert_eq!(head.parts[0], sealed, "{hour}");
+            assert_eq!(
+                (
+                    store.leaf_puts_for_part_watermark(DAY_D + 22),
+                    store.section_gets_of(&day_d.iter().collect::<Vec<_>>()),
+                ),
+                (0, 2 * 2),
+                "{hour}: day d's sections are read again and no leaf is PUT"
+            );
+        }
+    }
+
+    /// ADR-3939 with ADR-3694 decision 2: a metrics day sealed while an
+    /// erasure request was pending carries no `label_value` leaf. While the
+    /// request stays pending, a fold that carries the day attaches nothing
+    /// (no leaf PUT for it); the first fold after the request is gone
+    /// attaches one leaf to the carried part, with no PUT of the part.
+    ///
+    /// Forwarding the carried ref as is leaves day d leafless after the
+    /// request is gone; attaching from the fields declared before the
+    /// erasure gate PUTs day d's leaf while the request is still pending.
+    #[tokio::test]
+    async fn a_metrics_day_sealed_under_a_pending_erasure_gets_its_leaf_once_it_clears() {
+        let store = OpLogStore::empty();
+        let catalog = Catalog::new(store.clone(), metrics_kidx_config()).expect("catalog");
+        put_metrics_erasure_request(store.as_ref()).await;
+        for (seq, hour) in [(1u64, DAY_D + 20), (2, DAY_D + 22)] {
+            publish_labeled_metrics(
+                store.as_ref(),
+                seq,
+                hour,
+                &region_series("east"),
+                1000,
+                false,
+            )
+            .await;
+        }
+        publish_labeled_metrics(
+            store.as_ref(),
+            3,
+            DAY_D + 25,
+            &region_series("west"),
+            1000,
+            false,
+        )
+        .await;
+        let gated = fold_through(&catalog, Signal::Metrics, DAY_D + 25).await;
+        assert_eq!(
+            gated.metrics_label_index_parts_erasure_gated, 2,
+            "{gated:?}"
+        );
+        let sealed = read_signal_head(store.as_ref(), Signal::Metrics)
+            .await
+            .parts[0]
+            .clone();
+        assert_eq!(
+            (sealed.min_hour, sealed.watermark_hour),
+            (DAY_D + 20, DAY_D + 22)
+        );
+        assert!(sealed.key_index.is_empty(), "{sealed:?}");
+
+        publish_labeled_metrics(
+            store.as_ref(),
+            4,
+            DAY_D + 26,
+            &region_series("west"),
+            1000,
+            false,
+        )
+        .await;
+        store.clear();
+        fold_through(&catalog, Signal::Metrics, DAY_D + 26).await;
+        let pending = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(pending.parts[0], sealed, "still pending: nothing attached");
+        assert_eq!(store.leaf_puts_for_part_watermark(DAY_D + 22), 0);
+
+        let request_key =
+            keys::erasure_request_key(&tenant(), Signal::Metrics, Uuid::from_u128(0xe7a5e))
+                .expect("request key");
+        store.delete(&request_key).await.expect("drop the request");
+        publish_labeled_metrics(
+            store.as_ref(),
+            5,
+            DAY_D + 27,
+            &region_series("west"),
+            1000,
+            false,
+        )
+        .await;
+        store.clear();
+        let report = fold_through(&catalog, Signal::Metrics, DAY_D + 27).await;
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        let attached = &head.parts[0];
+        assert_eq!(
+            (&attached.key, &attached.blake3),
+            (&sealed.key, &sealed.blake3)
+        );
+        assert_eq!(leaf_fields(attached), vec![METRICS_LABEL_VALUE_FIELD]);
+        assert_eq!(report.metrics_label_index_parts_erasure_gated, 0);
+        assert_eq!(store.leaf_puts_for_part_watermark(DAY_D + 22), 1);
+        assert!(
+            !store
+                .puts
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|key| *key == sealed.key),
+            "no PUT of day d's part object"
+        );
+    }
+
+    /// `key_index_switch_off_over_leaves` reads every part of the HEAD: here
+    /// only sealed day d carries a leaf ref, since day d + 1's entry indexes
+    /// no field, and a switch-off fold still reports it. A check of the
+    /// tail part alone reports `false`.
+    #[tokio::test]
+    async fn key_index_switch_off_over_leaves_reads_a_non_tail_part() {
+        let store = Arc::new(MemoryStore::new());
+        declare_user_id_key_index(store.as_ref()).await;
+        publish_user_id_logs(store.as_ref(), 1, DAY_D + 20, &[10], 2, 0, true).await;
+        publish_user_id_logs(store.as_ref(), 2, DAY_D + 25, &[20], 2, 0, false).await;
+        let on = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        fold_through(&on, Signal::Logs, DAY_D + 25).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            head.parts
+                .iter()
+                .map(|p| p.key_index.len())
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        publish_user_id_logs(store.as_ref(), 3, DAY_D + 26, &[30], 2, 0, false).await;
+        let off = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                build_key_index_leaves: false,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        let report = fold_through(&off, Signal::Logs, DAY_D + 26).await;
+        assert!(report.key_index_switch_off_over_leaves, "{report:?}");
+    }
+
     /// A new entry whose section names a field the tenant does not declare,
     /// read while the carry is active, drops the carry: the build restarts
     /// with every entry read and stores what the from-scratch build stores,
