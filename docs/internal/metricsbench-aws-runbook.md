@@ -156,8 +156,9 @@ function of the anchor and the seed.
   (predicted, not measured); the erasure arm first waits until every ingest
   hour in its scope seals (the last one starts within 5 min after the
   submit; its end plus 1 h 5 min, so up to about 2 h 10 min after the
-  submit), then for its rewrite, at most 120 polls 15 s apart, and ends with
-  exit 70 at the first poll that finds the maintain container dead. The
+  submit), then for its rewrite, at most 120 polls 15 s apart. It ends with
+  exit 70 when the maintain container is found dead, either 60 s after it
+  starts, before the seal wait, or at a poll (run.test.sh case zm). The
   rewrite runs in a one-off `ravel-server --mode maintain` container, started
   right after the pending pass; no ravel-server flag turns compaction off, so
   each of its ticks also runs retention, compaction and the GC and catalog
