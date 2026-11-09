@@ -549,8 +549,8 @@ proptest! {
 
         let with_segments = specs.iter().filter(|s| s.present.iter().any(|p| *p)).count() as u64;
         prop_assert_eq!(
-            figures.parts_covered + figures.parts_uncovered + figures.parts_beyond_ceiling
-                + figures.leaves_rejected + figures.reservations_refused
+            figures.parts_covered + figures.parts_uncovered + figures.parts_over_tier_one
+                + figures.parts_beyond_ceiling + figures.leaves_rejected + figures.reservations_refused
                 + figures.skipped_by_budget,
             with_segments
         );
@@ -727,15 +727,21 @@ const DAY_PART_SLICES: usize = 26;
 
 /// A part shaped like an ADR-3939 logs day: 552 entries, 26 leaf slices.
 /// Value `values[i]` sits in entry `i % 552`, block 0, so every key of a
-/// set over `values` reads its own bucket. The first 8 entries' segments
-/// are in the snapshot.
+/// set over `values` reads its own bucket. Every entry's segment is in the
+/// snapshot, as for a query with no time range.
 fn day_part(values: &[u16], watermark_hour: u32) -> PartSpec {
+    day_part_window(values, watermark_hour, DAY_PART_ENTRIES)
+}
+
+/// [`day_part`] with only the first `present` entries' segments in the
+/// snapshot, as for a time range narrower than the day.
+fn day_part_window(values: &[u16], watermark_hour: u32, present: usize) -> PartSpec {
     let mut entries = vec![Rows::new(); DAY_PART_ENTRIES];
     for (i, v) in values.iter().enumerate() {
         entries[i % DAY_PART_ENTRIES].insert(*v, BTreeSet::from([0u32]));
     }
     let mut spec = PartSpec::simple(entries);
-    spec.present = (0..DAY_PART_ENTRIES).map(|o| o < 8).collect();
+    spec.present = (0..DAY_PART_ENTRIES).map(|o| o < present).collect();
     spec.watermark_hour = watermark_hour;
     spec.bucket_bits = 10;
     spec.leaf = LeafKind::Sliced(DAY_PART_SLICES);
@@ -798,6 +804,7 @@ async fn a_key_set_ceiling_scales_with_the_set_size() {
     assert_eq!(figures.parts_covered, 30);
     assert_eq!(figures.parts_beyond_ceiling, 0);
     assert_eq!(figures.parts_uncovered, 0);
+    assert_eq!(figures.parts_over_tier_one, 0);
     assert!(figures.leaf_get_requests <= 30 * 126);
     assert!(routes.iter().all(|r| *r != SegmentRoute::Uncovered));
     assert!(violations(routes, &fx.rows, &query).is_empty());
@@ -836,8 +843,8 @@ async fn a_single_key_ceiling_is_unchanged_at_2048() {
 
 /// ADR-3692 key-set ceiling amendment, row 20: a 2-entry part probed with
 /// 100 keys over 26 slices has a worst case above its tier-1 cost of
-/// 2 x 2 = 4 GETs, so it is left to tier 1 with no leaf GET and counted
-/// in `parts_uncovered`.
+/// 2 x 2 = 4 GETs for its 2 segments, so it is left to tier 1 with no leaf
+/// GET and counted in `parts_over_tier_one`, not `parts_uncovered`.
 /// FLIP: without the per-part tier-1 arm in `route_parts` the part is
 /// probed and covered.
 #[tokio::test]
@@ -855,7 +862,7 @@ async fn a_part_costing_more_than_its_tier_one_probe_is_left_to_tier_one() {
     assert_eq!(
         *figures,
         RouteFigures {
-            parts_uncovered: 1,
+            parts_over_tier_one: 1,
             keys_probed: 100,
             ..RouteFigures::default()
         }
@@ -874,6 +881,79 @@ async fn a_part_costing_more_than_its_tier_one_probe_is_left_to_tier_one() {
     let (_, figures) = probed.result.as_ref().expect("route");
     assert_eq!(figures.parts_covered, 1);
     assert!(figures.leaf_get_requests > 4);
+}
+
+/// The tier-1 test charges a part 2 GETs for each of its segments in the
+/// routed snapshot, not for each of its entries: both callers narrow the
+/// snapshot to the query's time range first. A 552-entry day part with 23 of
+/// its segments in the snapshot (about one hour) costs tier 1 2 x 23 = 46
+/// GETs, under the 126 a 100-key set charges, so it is left to tier 1 with no
+/// leaf GET and counted in `parts_over_tier_one` and its metric outcome.
+/// FLIP: comparing with `2 x entry_count` (1,104) admits and probes it.
+#[tokio::test]
+async fn a_part_with_few_segments_in_the_routed_snapshot_is_left_to_tier_one() {
+    let values: Vec<u16> = (0..100).collect();
+    let fx = fixture(&[day_part_window(&values, 0, 23)], &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = values.iter().copied().collect();
+    let keys = key_set(KeyType::Str, &query);
+    let worst = worst_gets(&fx, &keys);
+    assert!(
+        worst[0] > 2 * 23 && worst[0] <= 2 * DAY_PART_ENTRIES as u64,
+        "fixture: over the window's tier-1 cost, under the whole part's: {worst:?}"
+    );
+
+    let routed = run(&fx, &keys, &ThresholdBudget::new(u64::MAX), ADR_CEILING).await;
+    let (routes, figures) = routed.result.as_ref().expect("route");
+    assert_eq!(
+        *figures,
+        RouteFigures {
+            parts_over_tier_one: 1,
+            keys_probed: 100,
+            ..RouteFigures::default()
+        }
+    );
+    assert_eq!(routed.reader.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(routes, &vec![SegmentRoute::Uncovered; 23]);
+    assert_eq!(
+        routed
+            .totals
+            .parts(SIGNAL, KeyIndexPartOutcome::OverTierOne),
+        1
+    );
+    assert_eq!(
+        routed.totals.parts(SIGNAL, KeyIndexPartOutcome::Uncovered),
+        0
+    );
+    assert_accounting(&routed, figures);
+}
+
+/// The same 552-entry day part with every segment in the routed snapshot
+/// costs tier 1 2 x 552 = 1,104 GETs, over the 126 a 100-key set charges, so
+/// it is admitted and covered at tier 2.
+/// FLIP: counting each part's presence in the snapshot once instead of its
+/// segments charges tier 1 2 GETs and leaves the part to tier 1.
+#[tokio::test]
+async fn the_same_part_with_every_segment_in_the_routed_snapshot_is_admitted() {
+    let values: Vec<u16> = (0..100).collect();
+    let fx = fixture(&[day_part(&values, 0)], &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = values.iter().copied().collect();
+    let keys = key_set(KeyType::Str, &query);
+
+    let routed = run(&fx, &keys, &ThresholdBudget::new(u64::MAX), ADR_CEILING).await;
+    let (routes, figures) = routed.result.as_ref().expect("route");
+    assert_eq!(figures.parts_covered, 1);
+    assert_eq!(figures.parts_over_tier_one, 0);
+    assert!(figures.leaf_get_requests > 0);
+    assert!(figures.leaf_get_requests <= 126);
+    assert_eq!(
+        routed
+            .totals
+            .parts(SIGNAL, KeyIndexPartOutcome::OverTierOne),
+        0
+    );
+    assert!(routes.iter().all(|r| *r != SegmentRoute::Uncovered));
+    assert!(violations(routes, &fx.rows, &query).is_empty());
+    assert_accounting(&routed, figures);
 }
 
 /// ADR-3692 key-set ceiling amendment, row 21: 1,024 keys over 64 day
@@ -895,8 +975,9 @@ async fn a_1024_key_set_over_64_day_parts_covers_at_least_63() {
 
     let run = run_statement(&fx, &keys).await;
     let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(figures.parts_uncovered, 0);
     assert_eq!(
-        figures.parts_uncovered, 0,
+        figures.parts_over_tier_one, 0,
         "every part passes its tier-1 test"
     );
     assert!(
@@ -1844,6 +1925,7 @@ async fn route_totals_add_every_part_outcome_and_leaf_get_under_the_signal() {
         [
             "covered",
             "uncovered",
+            "over_tier_one",
             "beyond_ceiling",
             "rejected",
             "reservation_refused",

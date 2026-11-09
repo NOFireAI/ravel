@@ -11,9 +11,10 @@
 //!
 //! A part's worst case is `1 + min(k_s, 2^bucket_bits, B_run)` per leaf
 //! slice the key set touches, `k_s` the slice's own key count. A part whose
-//! worst case exceeds `2 x entry_count`, the tier-1 probe's cost for its own
-//! segments, is left [`SegmentRoute::Uncovered`] with no leaf GET (ADR-3692's
-//! key-set ceiling amendment). The others are admitted in descending
+//! worst case exceeds 2 GETs for each of its segments in the routed snapshot,
+//! the tier-1 probe's cost for those segments, is left
+//! [`SegmentRoute::Uncovered`] with no leaf GET (ADR-3692's key-set ceiling
+//! amendment). The others are admitted in descending
 //! `entry_count`, ties by descending `watermark_hour`, while the next part's
 //! worst case fits under the pass's leaf GET ceiling, `P_max x (1 + min(k,
 //! B_run))` for a set of `k` keys ([`KEY_INDEX_LEAF_GET_CEILING`] at k = 1),
@@ -129,14 +130,17 @@ pub enum SegmentRoute {
 /// The router's figures (ADR-3692 decision 7's `stats.keyIndex`, snake_case,
 /// plus `leaf_wire_bytes`, `leaf_cache_hits` and `skipped_by_budget`).
 /// Every part with at least one segment in the snapshot counts in exactly one
-/// of the six part outcomes.
+/// of the seven part outcomes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RouteFigures {
     /// Parts whose leaves answered the whole key set.
     pub parts_covered: u64,
-    /// Parts with no leaf for the field, and parts whose worst-case leaf GET
-    /// count exceeds `2 x entry_count`, their tier-1 probe's cost.
+    /// Parts with no leaf for the field.
     pub parts_uncovered: u64,
+    /// Parts left to tier 1 because their worst-case leaf GET count exceeds
+    /// the tier-1 probe's cost for their segments in the routed snapshot,
+    /// 2 GETs a segment.
+    pub parts_over_tier_one: u64,
     /// Parts the leaf GET or part ceiling left unprobed.
     pub parts_beyond_ceiling: u64,
     /// Parts whose leaf, or whose leaf refs, did not answer.
@@ -294,7 +298,8 @@ pub enum RouteError {
 }
 
 /// Ranged GETs the tier-1 probe issues per object (ADR-2707 decision 5;
-/// three as measured on spans, two being the conservative value).
+/// three as measured on spans, two being the conservative value), charged
+/// for each of a part's segments in the routed snapshot.
 const TIER_ONE_GETS_PER_ENTRY: u64 = 2;
 
 /// The admission bounds of one routing pass. [`route`] computes them from
@@ -305,8 +310,9 @@ const TIER_ONE_GETS_PER_ENTRY: u64 = 2;
 struct Ceiling {
     leaf_gets: u64,
     parts: usize,
-    /// A part is admitted only when its worst case is at most `entry_count`
-    /// times this: its own tier-1 probe's cost.
+    /// A part is admitted only when its worst case is at most its segment
+    /// count in the routed snapshot times this: the tier-1 probe's cost for
+    /// those segments.
     gets_per_entry: u64,
 }
 
@@ -335,12 +341,13 @@ const ADR_CEILING: Ceiling = Ceiling {
 
 const _: () = assert!(Ceiling::for_keys(1).leaf_gets == ADR_CEILING.leaf_gets);
 
-/// The `outcome` label of `ravel_query_key_index_parts_total`: the six part
-/// outcomes of [`RouteFigures`].
+/// The `outcome` label of `ravel_query_key_index_parts_total`: the seven
+/// part outcomes of [`RouteFigures`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum KeyIndexPartOutcome {
     Covered,
     Uncovered,
+    OverTierOne,
     BeyondCeiling,
     Rejected,
     ReservationRefused,
@@ -348,9 +355,10 @@ pub enum KeyIndexPartOutcome {
 }
 
 impl KeyIndexPartOutcome {
-    pub const ALL: [KeyIndexPartOutcome; 6] = [
+    pub const ALL: [KeyIndexPartOutcome; 7] = [
         KeyIndexPartOutcome::Covered,
         KeyIndexPartOutcome::Uncovered,
+        KeyIndexPartOutcome::OverTierOne,
         KeyIndexPartOutcome::BeyondCeiling,
         KeyIndexPartOutcome::Rejected,
         KeyIndexPartOutcome::ReservationRefused,
@@ -361,6 +369,7 @@ impl KeyIndexPartOutcome {
         match self {
             KeyIndexPartOutcome::Covered => "covered",
             KeyIndexPartOutcome::Uncovered => "uncovered",
+            KeyIndexPartOutcome::OverTierOne => "over_tier_one",
             KeyIndexPartOutcome::BeyondCeiling => "beyond_ceiling",
             KeyIndexPartOutcome::Rejected => "rejected",
             KeyIndexPartOutcome::ReservationRefused => "reservation_refused",
@@ -379,6 +388,7 @@ impl RouteFigures {
         match outcome {
             KeyIndexPartOutcome::Covered => self.parts_covered,
             KeyIndexPartOutcome::Uncovered => self.parts_uncovered,
+            KeyIndexPartOutcome::OverTierOne => self.parts_over_tier_one,
             KeyIndexPartOutcome::BeyondCeiling => self.parts_beyond_ceiling,
             KeyIndexPartOutcome::Rejected => self.leaves_rejected,
             KeyIndexPartOutcome::ReservationRefused => self.reservations_refused,
@@ -393,14 +403,15 @@ const ROUTED_SIGNALS: [Signal; 3] = [Signal::Spans, Signal::Logs, Signal::Metric
 /// Process totals behind `ravel_query_key_index_parts_total{signal,
 /// outcome}` and `ravel_query_key_index_leaf_gets_total{signal}`.
 struct RouteTotals {
-    parts: [[AtomicU64; 6]; ROUTED_SIGNALS.len()],
+    parts: [[AtomicU64; KeyIndexPartOutcome::ALL.len()]; ROUTED_SIGNALS.len()],
     leaf_gets: [AtomicU64; ROUTED_SIGNALS.len()],
 }
 
 impl RouteTotals {
     const fn new() -> Self {
         RouteTotals {
-            parts: [const { [const { AtomicU64::new(0) }; 6] }; ROUTED_SIGNALS.len()],
+            parts: [const { [const { AtomicU64::new(0) }; KeyIndexPartOutcome::ALL.len()] };
+                ROUTED_SIGNALS.len()],
             leaf_gets: [const { AtomicU64::new(0) }; ROUTED_SIGNALS.len()],
         }
     }
@@ -724,16 +735,18 @@ async fn route_under(
             input.parts.origin.len()
         )));
     }
-    let mut has_segment = vec![false; input.parts.parts.len()];
+    // Each part's segments in the snapshot this pass routes: what tier 1
+    // would probe for it.
+    let mut segments_in_snapshot = vec![0u64; input.parts.parts.len()];
     for origin in input.parts.origin.iter().flatten() {
-        let Some(slot) = has_segment.get_mut(origin.part as usize) else {
+        let Some(slot) = segments_in_snapshot.get_mut(origin.part as usize) else {
             return Err(RouteError::InvalidInput(format!(
                 "segment origin names part {} of {}",
                 origin.part,
                 input.parts.parts.len()
             )));
         };
-        *slot = true;
+        *slot += 1;
     }
     let mut figures = RouteFigures {
         keys_probed: input.key_set.keys.len() as u64,
@@ -750,7 +763,14 @@ async fn route_under(
     charge
         .leaf
         .set_access_intent(input.accounting.key_index().access_intent());
-    let answered = route_parts(&input, ceiling, &has_segment, &charge.leaf, &mut figures).await;
+    let answered = route_parts(
+        &input,
+        ceiling,
+        &segments_in_snapshot,
+        &charge.leaf,
+        &mut figures,
+    )
+    .await;
     let leaf = charge.leaf.snapshot();
     drop(charge);
     figures.leaf_get_requests = leaf.s3_requests(AccountedOp::Get);
@@ -842,22 +862,21 @@ fn plan_part<'a>(
 async fn route_parts(
     input: &RouteInput<'_>,
     ceiling: Ceiling,
-    has_segment: &[bool],
+    segments_in_snapshot: &[u64],
     leaf_accounting: &QueryAccounting,
     figures: &mut RouteFigures,
 ) -> Result<BTreeMap<usize, PartAnswer>, RouteError> {
     let mut plans: Vec<PartPlan<'_>> = Vec::new();
     for (part, handle) in input.parts.parts.iter().enumerate() {
-        if !has_segment[part] {
+        let segments = segments_in_snapshot[part];
+        if segments == 0 {
             continue;
         }
         match plan_part(part, handle, input.key_set) {
-            // Dearer than the tier-1 probe of the part's own segments: tier 1
-            // answers it instead.
-            Ok(Some(plan))
-                if plan.worst_gets > handle.entry_count.saturating_mul(ceiling.gets_per_entry) =>
-            {
-                figures.parts_uncovered += 1;
+            // Dearer than the tier-1 probe of the part's segments in this
+            // snapshot: tier 1 answers it instead.
+            Ok(Some(plan)) if plan.worst_gets > segments.saturating_mul(ceiling.gets_per_entry) => {
+                figures.parts_over_tier_one += 1;
             }
             Ok(Some(plan)) => plans.push(plan),
             Ok(None) => figures.parts_uncovered += 1,
