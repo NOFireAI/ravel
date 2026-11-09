@@ -87,7 +87,8 @@ flowchart LR
    exact hash and still tile `[0, u64::MAX]` per field.
 4. **Rollout.** The first fold with the switch on under this rule
    re-partitions a tenant's existing tail into day parts and builds their
-   leaves, once, under the pair budget per part. docs/catalog-and-mvcc.md
+   leaves, once, under the pair budget per part (all retained history, not
+   only the tail: see the multi-day amendment). docs/catalog-and-mvcc.md
    ("Per-part key-index leaves") says only that the processes folding one
    tenant should agree on the switch. Under this rule a disagreement is
    far more expensive than today. A switch-off fold re-partitions the
@@ -422,6 +423,16 @@ lookup for 9 GB a day of writes, a break-even near 2,250 such lookups per
 tenant per day. The decision is design only: its partition rule is fixed
 here so D1's policy value can take it, and the task is dispatched only on
 a miss of the flip rows below.
+
+### Decision 4, corrected: the first switch-on fold re-partitions all history
+
+Decision 4 says the first switch-on fold re-partitions "a tenant's existing
+tail". It re-partitions the whole retained entry set: every part spanning
+more than one UTC day is re-encoded, which at the default
+`snapshot_part_max_entries` of 250,000 against box D's 552 logs entries a
+day (23 an hour) is every part, and every day's leaves are built once. For a 30-day
+logs tenant that is about 39.2 GB of leaves and 750 passes in one fold,
+the cost decision 4 gives a switch disagreement, paid once.
 
 ### Decision 2, clarified: a carried part keeps exactly its refs
 

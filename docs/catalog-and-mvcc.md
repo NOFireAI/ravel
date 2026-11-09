@@ -1823,9 +1823,13 @@ the probe naming the exact blocks. The second, and a new folder running
 between the old one and the rebuild, are not tested yet.
 
 **Rollout of the day seal (ADR-3939 decision 4).** The first fold with the
-switch on under the day seal re-partitions a tenant's existing tail into
-day parts and builds each day part's leaves once, under the pair budget
-per part. Every process that folds a tenant MUST agree on the switch. A
+switch on under the day seal re-partitions the whole retained entry set:
+every part that spans more than one UTC day is re-encoded into day parts,
+which at the default `snapshot_part_max_entries` of 250,000 is every part
+(a logs day held 552 entries at ADR-3939's box D rate), and every day part's leaves are
+built once, under the pair budget per part. For a 30-day logs tenant that
+one fold writes about 39.2 GB of leaves over about 750 passes, the cost
+ADR-3939 decision 4 states for a switch disagreement, paid once. Every process that folds a tenant MUST agree on the switch. A
 switch-off fold partitions the whole retained entry set by entry count
 alone, so it re-encodes every part whose span differs under the entry
 threshold alone and drops the leaf refs of every part it re-encodes; the next switch-on fold splits
@@ -1835,12 +1839,11 @@ work on every pair of folds, never wrong rows. A folder that predates the
 day seal partitions the same way with the switch on, so every folder of
 a tenant runs a version with the day seal before the switch is turned on
 for that tenant. The fold builds no leaf for a part it carries by
-reference, so a day sealed without a declared field's leaves, whatever the
-cause, is repaired by `ravel-cli catalog fold --rebuild-key-index` and
-counted until then in the fold report's
-`key_index_parts_missing_declared_leaves` (under "Day seal"); declaring a
-key-index field for a tenant with the switch on is followed by that repair
-over its sealed days. A switch-off fold whose previous HEAD has a part
+reference, so a day sealed without a declared field's leaves is counted in the fold report's
+`key_index_parts_missing_declared_leaves` (under "Day seal", which says
+which cases `ravel-cli catalog fold --rebuild-key-index` repairs and which
+stay counted); declaring a key-index field for a tenant with the switch on
+is followed by that repair over its sealed days. A switch-off fold whose previous HEAD has a part
 carrying key-index leaf refs sets `key_index_switch_off_over_leaves` in
 the fold report, which `ravel-cli catalog fold` prints in text and
 `--json`, and logs one warning naming the tenant and signal; it is not
