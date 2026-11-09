@@ -114,7 +114,10 @@ G_INPUTS = ("key_index_pair_budget", "key_index_field_pairs")
 # Statuses a figure computed from, or judged against, another figure takes
 # over from it, reason and all.
 PASSED_ON = ("not-run", UNSUPPORTED, GUARD, NOT_COMPUTABLE, INCOMPLETE)
-# Fold report fields this build does not write.
+# ADR-3939's rows whose timing figures are judged as row 18's are: a timing
+# figure of one of them with no value leaves the run incomplete, as row 18's.
+AS_ROW_18 = ("A6", "W4", "F1", "F2")
+# Fold report fields a build may not write: absent, they read unsupported.
 FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_index_sections_read",
                   "key_index_leaf_gets", "sealed_day_leaf_puts", "sealed_day_previous_leaf_gets", "head_digest",
                   "switch_off_partition_changed", "key_index_unchanged_section_gets", "key_index_part_puts",
@@ -1208,17 +1211,27 @@ def stamp_figure(stamps, census, cfg, state, metric):
         if not isinstance(doc.get("footer_len"), int):
             return "missing", None, f"stamps/{state}.{label}.object.json carries no footer length"
         return "value", doc["footer_len"], ""
+    if what == "drop_parts_holding_hour":
+        return drop_parts_holding_hour(stamps, state, label)
     if what in H1B_STAMPS:
         name = f"stamps/{state}.{label}.{H1B_STAMPS[what]}.json"
         doc = stamps.doc(state, label, H1B_STAMPS[what])
         if doc is None:
             return UNSUPPORTED, None, f"no {name} on this build (task H1b, #4048, writes it)"
         if what == "fold_binary_pre_r2":
-            # W2's binary: the fold binary's SHA, carrying C1 and not R2.
+            # W2's binary: the fold binary's SHA, carrying C1 and not R2. Any
+            # other binary is one W2 is not measured on (the harness-state
+            # amendment runs the other rows on the R2 build), so W2 is
+            # not-run there, never a miss.
             if not isinstance(doc.get("sha"), str) or not all(
                     isinstance(doc.get(k), bool) for k in ("carries_c1", "carries_r2")):
                 return "missing", None, f"{name} carries no sha, carries_c1 and carries_r2"
-            return "value", int(doc["carries_c1"] and not doc["carries_r2"]), ""
+            if doc["carries_c1"] and not doc["carries_r2"]:
+                return "value", 1, ""
+            carries = "R2" if doc["carries_r2"] else "no C1"
+            return "not-run", None, (f"the retired_hour fold binary {doc['sha']} carries {carries}, and W2 is "
+                                     "measured only on a binary carrying C1 and not R2 (the harness-state "
+                                     "amendment)")
         field = {"tombstoned_hour": "hour", "retired_hour_segments": "segments"}[what]
         if not isinstance(doc.get(field), int) or isinstance(doc.get(field), bool):
             return "missing", None, f"{name} carries no {field}"
@@ -1249,6 +1262,38 @@ def stamp_figure(stamps, census, cfg, state, metric):
         v = leaf_bytes(doc)
         return ("value", v, "") if v is not None else ("missing", None, f"{name}: a leaf has no size")
     return "missing", None, f"unknown stamp figure {what}"
+
+
+def part_hours(part):
+    """(first, last) hour of a catalog stamp part's `range` ("LO..=HI"), or None."""
+    m = re.fullmatch(r"(\d+)\.\.=(\d+)", str(part.get("range")))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def drop_parts_holding_hour(stamps, state, label):
+    """(status, value, reason) of W3's drop figure: how many parts of the HEAD
+    the fold at the day's last tombstone wrote still hold the tombstoned hour,
+    from the catalog stamp taken after that fold (state STATE_drop) and the
+    tombstone stamp's hour, both hour indexes as the part ranges count them."""
+    tomb_name = f"stamps/{state}.{label}.tombstone.json"
+    head_name = f"stamps/{state}_drop.{label}.catalog.json"
+    tomb = stamps.doc(state, label, "tombstone")
+    head = stamps.doc(f"{state}_drop", label, "catalog")
+    for name, doc in ((tomb_name, tomb), (head_name, head)):
+        if doc is None:
+            return UNSUPPORTED, None, f"no {name} on this build (task H1b, #4048, writes it)"
+    hour = tomb.get("hour")
+    if not isinstance(hour, int) or isinstance(hour, bool):
+        return "missing", None, f"{tomb_name} carries no hour"
+    if head.get("head") is None:
+        return "missing", None, f"{head_name} records no HEAD"
+    parts = head.get("parts", [])
+    if head.get("parts_declared") != len(parts):
+        return "missing", None, f"{head_name} declares {head.get('parts_declared')} parts and lists {len(parts)}"
+    spans = [part_hours(p) for p in parts]
+    if None in spans:
+        return "missing", None, f"{head_name}: a part has no LO..=HI range"
+    return "value", sum(1 for lo, hi in spans if lo <= hour <= hi), ""
 
 
 def fold_field(report, field):
@@ -1402,7 +1447,8 @@ def day_part_bound(s, factor=1):
     return math.floor(factor * base + 0.5)
 
 
-EXPR_BUILTINS = {"min": min, "max": max, "day_part_bound": day_part_bound}
+EXPR_BUILTINS = {"min": min, "max": max, "day_part_bound": day_part_bound, "isinstance": isinstance, "str": str,
+                 "len": len}
 
 
 def evaluate_expr(expr, v, m):
@@ -1468,6 +1514,11 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
             gate = None if why_not else figure_gate(fig, by_id)
             if gate:
                 status, value, why = "not-run", None, gate
+                refs = [by_id.get(r, {}) for r in re.findall(r"m\['([^']+)'\]", fig["not_run_unless"])]
+                gap = next((r["not_requested"] for r in refs if r.get("not_requested")), None)
+                if gap:
+                    entry["gated"] = True
+                    entry["not_requested"] = gap
             elif why_not:
                 status, value, why = "not-run", None, why_not
                 entry["gated"] = True
@@ -1484,6 +1535,10 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
                         entry["not_requested"] = gap
             elif metric.startswith(("stamp.", "leaf_share.", "census.")):
                 status, value, why = stamp_figure(stamps, census, cfg, fig["state"], metric)
+                if status == "not-run":
+                    # A build the row is not measured on: not asked of this run.
+                    entry["gated"] = True
+                    entry["not_requested"] = why
             elif metric.startswith("fold."):
                 _, tenant, label, field = metric.split(".", 3)
                 status, value, why = fold_figure(folds, fig.get("transition", fig["state"]), tenant, label, field)
@@ -1721,11 +1776,13 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     state run.toml asks for that did not run, a planned call that was not
     sent in a state that did, or a figure not-run for any reason other than
     its row or figure lacking a state, tenant, scale or baseline the run
-    never asked for (a gated figure is either not_requested or listed
-    here), a figure not-measured (a row 18 cell whose covering part was
-    left to tier 1), a figure not-computable or incomplete or judged against
-    one, a row 18 figure with no value to judge (unsupported, refused or
-    missing), or a needle band a partial inspection could not judge."""
+    never asked for, or W2 on a fold binary it is not measured on (a gated
+    figure is either not_requested or listed here), a figure not-measured
+    (a row 18 cell whose covering part was left to tier 1), a figure
+    not-computable or incomplete or judged against one, a row 18 figure, or
+    a timing figure of an ADR-3939 row judged as row 18 (AS_ROW_18), with
+    no value to judge (unsupported, refused or missing), or a needle band a
+    partial inspection could not judge."""
     out = []
     for s in cfg["states"]:
         if live.get(s) is not None:
@@ -1744,7 +1801,8 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
             out.append(f"figure {f['id']} not measured: {f['reason']}")
         elif f.get("verdict") in (NOT_COMPUTABLE, INCOMPLETE):
             out.append(f"figure {f['id']} {f['verdict']}: {f['reason']}")
-        elif f["row"] == 18 and f.get("verdict") in (UNSUPPORTED, GUARD, "refused", "missing"):
+        elif ((f["row"] == 18 or (f.get("adr") == "ADR-3939" and f["row"] in AS_ROW_18 and f["lane"] == "timing"))
+              and f.get("verdict") in (UNSUPPORTED, GUARD, "refused", "missing")):
             out.append(f"figure {f['id']} {f['verdict']}: {f['reason']}")
     out.extend((needles or {}).get("incomplete", []))
     return out

@@ -31,9 +31,13 @@
 #              benchmarks/clickbench/hits.corpus.json whose sql is run
 #   window     "none" (no start: the whole tenant), "1h", "narrow" (5 min) or
 #              "wide" (the corpus span plus one hour), each centred on the
-#              anchor below, or "midnight" (the hour centred on a UTC midnight
-#              the state's corpus holds; box/lib/inv.py refuses it until task
-#              H1b, #4048, adds it with the day_parts_7 state)
+#              anchor below, or "midnight" (the hour that spans a UTC
+#              midnight the state's corpus holds, 23:30 to 00:30, so it reads
+#              the day parts either side of it). Task H1b, #4048, adds it with
+#              the day_parts_7 state: until then truth.json has no midnight
+#              field, so box/lib/inv.py plan records the call not-run through
+#              requires = "midnight" before it computes any window (its
+#              window_bounds has no midnight arm yet and would exit 64)
 #   anchor     "trace" (the run's saved trace start) or "cell" (the middle of
 #              the failing hour); unused for window = "none"
 #   per_run    "saved_trace": cold run i reads saved trace i, so every cold
@@ -651,7 +655,8 @@ cold_only = true
 # ADR-3939 rows A5, A7, W4 to W7, F1 to F3: logs request_id key sets over
 # day parts with no time range, so the lookup reads every day part the state
 # holds (7 in day_parts_7, 30 in day_parts_30), and one key over the hour
-# across a UTC midnight, which reads the two day parts either side of it.
+# that spans a UTC midnight (23:30 to 00:30), which reads the two day parts
+# either side of it.
 [[statement]]
 id = "logs_request_in_100_7d"
 tenant = "inv"
@@ -685,7 +690,7 @@ truth_key = "in_request_id.1"
 states = ["day_parts_7"]
 cold_only = true
 
-# The key is one request_id inside the hour across midnight, so the answer
+# The key is one request_id inside the hour spanning midnight, so the answer
 # is that key's row. gen_corpus.py writes no midnight truth yet (task H1b,
 # #4048): until it does, truth.json carries no midnight field and box/lib/
 # inv.py plan records the call not-run, as for any statement whose requires

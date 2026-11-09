@@ -489,14 +489,17 @@ state is `incomplete`, with the precondition as the reason (row 6's probe
 survivors, below). A figure computed from, or judged against, a
 `not-computable` or `incomplete` figure takes that status and its reason.
 
-Only an allowlist of fields this build does not report may read as
-`unsupported-on-this-build`, and only when the call itself succeeded:
+Only an allowlist of fields a build may not report may read as
+`unsupported-on-this-build`, only when the field is absent, and only when
+the call itself succeeded:
 `stats.keyIndex` and its members (`partsCovered`, `partsUncovered`,
 `partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
 `leafGetRequests`, `keysProbed`), `pruning.skipIdxDropped`, the per-object
 and per-part breakdowns, and the fold report's `key_index_build_passes`,
 `key_index_sections_read`, `key_index_leaf_gets` and
-`head_bytes_per_part_field`, plus, for ADR-3939's rows,
+`head_bytes_per_part_field` (main's `FoldReport`,
+`crates/ravel-catalog/src/fold.rs`, writes the first three, so they read
+unsupported only from a report that lacks them), plus, for ADR-3939's rows,
 `stats.keyIndex.leafRoundTrips`, `io.s3SlowDownResponses`, the fold
 report's fields and the H1b stamps listed under "ADR-3939's rows". Any
 other absent field (`phases`, `pruning`, `signals`, `io`, `server_cpu_s`, `server_rss_peak`, `rows`, the duration)
@@ -814,16 +817,24 @@ not in run.toml states` (or the state it lacks), and the states section
 lists each as `not-run (not in run.toml states)`; the rows are not
 requested, so they leave no run incomplete. H1b sends each multi-day
 state's calls before its fold under temp `prefold` (the unfolded
-baselines of A6, W4 and F2) and after it cold; evaluate.py counts a
-`prefold` call as cold.
+baselines of A6, W4 and F2) and after it cold. evaluate.py has no rule
+that names `prefold`: the try count and the oracle test a call's temp for
+`warm` (and the in-flight checks for `inflight`), so a `prefold` call is
+held to `cold_runs` tries and judged as a cold one by falling through
+those tests, and a `prefold.*` figure reads the `prefold` group only.
 
 New statements, cold only, on the states their rows need:
 `logs_request_in_100_7d` (A5, W4) and `logs_request_in_100_30d` (A7, W5),
 the 100-key `request_id` list over the 7 and 30 days; `logs_request_in_1_7d`
 (W6), one key; and `logs_request_in_1_midnight` (W7), one key from the hour
-that starts at UTC midnight, with window `midnight` and truth key
+that spans a UTC midnight (23:30 to 00:30, so it reads the two day parts
+either side of it), with window `midnight` and truth key
 `midnight.request_id.1`. The run records the midnight call `not-run` until
-`truth.json` carries that key (H1b). The six row-18 lookups also run on
+`truth.json` carries that key (H1b): `box/lib/inv.py plan` checks
+`requires = "midnight"` before it computes a window. 4 leaf GETs alone
+would also hold for a window that read one day part, so W7 also pins the
+calls' `keyIndex.partsCovered` to exactly 2 (lowest and highest across the
+tries) and `partsUncovered` to 0. The six row-18 lookups also run on
 `day_parts_7`, for A6.
 
 ### The reduced-rate rule
@@ -832,10 +843,20 @@ The 30-day state is loaded at a reduced rate: S slices per day part, read
 off the catalog stamp (`stamp.slices.logs.request_id`) as figure `slices`.
 A day part's bound for 100 keys is T(S) + 100, with T(S) = S × (1 − (1 −
 1/S)^100), computed by `day_part_bound(S, factor=1)` in a band expression:
-126 at S = 26, 176 at S = 175, 194 at S = 750. W5 and A7 judge each day
-part against that bound and the 30 days against 30 × (T(S) + 100); A7's
-ceiling figure also checks 30 × (T(S) + 100) ≤ 66,560, the clause under
-which every day held is covered. F3's W5 figures use 1.1 × (T(S) + 100),
+126 at S = 26, 176 at S = 175, 194 at S = 750. W5 and A7 check the same
+two leaf GET figures of `logs_request_in_100_30d`: `leaf_gets_per_part`,
+the largest per-part leaf GET count of any cold call, at most T(S) + 100,
+and `leaf_gets`, the largest total of any cold call, at most 30 × (T(S) +
+100). The stats carry no per-part breakdown on this build, so
+`leaf_gets_per_part` reads `unsupported-on-this-build` ("stats carry no
+per-part breakdown") in both rows until they do. A7's total is 30 times
+the bound, not the parts held times it: the 30-day state holds 30 day
+parts, and a state holding any other number is not that state, so A7's
+`leaf_gets` is `not-run` there (it carries `parts_held == 30` in its
+`not_run_unless`) rather than judged against a rescaled total. W5's 30
+days covered is its own figure, and a state short of 30 parts misses it.
+A7's ceiling figure also checks 30 × (T(S) + 100) ≤ 66,560, the clause
+under which every day held is covered. F3's W5 figures use 1.1 × (T(S) + 100),
 `day_part_bound(S, 1.1)` (139 at S = 26). No bound is hardcoded: each
 follows the stamped S. Below S = 3 the multi-slice term is not exercised,
 so every figure that reads S carries `not_run_unless = "m['...slices'] >=
@@ -849,24 +870,55 @@ After R2 a tombstoned hour in a sealed day takes the `retired_hours` path
 and is not re-encoded, so W2 means something only on a fold binary that
 carries C1 and not R2. Its first figure, `fold_binary_pre_r2`, reads
 `stamps/retired_hour.logs.fold_binary.json` (`sha`, `carries_c1`,
-`carries_r2`) and is 1 only for C1 without R2; a stamp missing any of the
+`carries_r2`) and is 1 for C1 without R2; a stamp missing any of the
 three fields is `missing`. Its other figures are `not-run` unless that
-figure is 1. No build writes the stamp yet, so the binary figure is
+figure is 1. The harness-state amendment runs every other row on the R2
+build, so a binary carrying R2 (or no C1) is one W2 is not measured on, not
+a miss: the binary figure is `not-run` with the binary's SHA and what it
+carries, the other W2 figures are `not-run` naming it, and all of them are
+listed under `not requested` with that reason, so a run on the R2 build
+holding `retired_hour` for W3 and W8 is neither failed nor left incomplete
+by W2. No build writes the stamp yet, so the binary figure is
 `unsupported-on-this-build` ("no stamps/retired_hour.logs.fold_binary.json
 on this build (task H1b, #4048, writes it)"). W3's tombstoned hour and
 retired-hour resolve read `stamps/retired_hour.logs.tombstone.json` and
 `stamps/retired_hour.logs.retired_resolve.json` the same way.
 
+### W3's drop and W8's retired hours
+
+W3's "the part leaves HEAD with 0 PUTs at the day's last tombstone" is
+three figures, not two: 0 part PUTs and 0 leaf PUTs in the drop fold's
+report (transition `retired_hour_drop`), and `drop_parts_holding_hour`, the
+number of parts in the catalog stamp taken after that fold
+(`stamps/retired_hour_drop.logs.catalog.json`) whose hour range holds the
+tombstoned hour, which must be 0. A drop fold that drops nothing writes no
+PUT either, and misses on that count. No build writes either stamp yet, so
+it reads `unsupported-on-this-build`, naming the absent stamp; a stamp
+with no HEAD, a part count that disagrees with the parts listed, or a part
+without a `LO..=HI` range is `missing`.
+
+W8's two folds each report `retired_hours`, and each must equal `[h]` for
+W3's tombstoned hour `h`, besides being identical: two folds that observed
+no tombstone report `[]` alike and miss. A4's and W8's HEAD digests must be
+non-empty strings, so two empty digests do not read as identical HEADs.
+
 ### Unsupported figures in these rows
 
-These figures name fields no build reports yet, so they read
-`unsupported-on-this-build` once their state runs: the fold report's
-`key_index_build_passes`, `key_index_leaf_gets`,
-`sealed_day_leaf_puts`, `sealed_day_previous_leaf_gets`,
-`key_index_unchanged_section_gets`, `key_index_part_puts`, `head_digest`,
-`switch_off_partition_changed` and `retired_hours` (A1 to A4, W1 to W3,
-W8); the per-part leaf GETs (A7, F3); `stats.keyIndex.leafRoundTrips` (W6);
-`io.s3SlowDownResponses` (F3); and the three H1b stamps above.
+These figures read `unsupported-on-this-build` when the field they name is
+absent from the report (the allowlist applies only then): the fold
+report's `key_index_build_passes` and `key_index_leaf_gets`, which main's
+`FoldReport` writes, so they read unsupported only from a build whose
+report lacks them, and `sealed_day_leaf_puts`,
+`sealed_day_previous_leaf_gets`, `key_index_unchanged_section_gets`,
+`key_index_part_puts`, `head_digest`, `switch_off_partition_changed` and
+`retired_hours` (A1 to A4, W1 to W3, W8), which no build writes yet; the per-part leaf GETs (A7, W5, F3);
+`stats.keyIndex.leafRoundTrips` (W6); `io.s3SlowDownResponses` (F3); and
+the four H1b stamps above.
+
+A timing figure of A6, W4, F1 or F2 (`AS_ROW_18` in evaluate.py) is
+judged as row 18's are, so like row 18's it leaves the run incomplete when
+it has no value to judge (`unsupported-on-this-build`, `refused-by-guard`,
+`refused` or `missing`), rather than letting the run pass without its p50.
 
 ## Unsupported on this build
 
@@ -879,9 +931,10 @@ W8); the per-part leaf GETs (A7, F3); `stats.keyIndex.leafRoundTrips` (W6);
   `pruning.skipIdxDropped`, the per-object and per-part breakdowns, and the
   fold report's `key_index_build_passes`, `key_index_sections_read`,
   `key_index_leaf_gets` and `head_bytes_per_part_field` (ADR-3939's rows
-  add the fields listed under "ADR-3939's rows"):
-  absent from this build's output, so their figures are unsupported with
-  that reason (the allowlist above). The many_parts leaf-GET figures are
+  add the fields listed under "ADR-3939's rows"): when one is absent from
+  a build's output its figures are unsupported with that reason (the
+  allowlist above). Main's fold report writes the first three; a build
+  that predates them reads unsupported. The many_parts leaf-GET figures are
   among them: main has no tier-2 reader.
 - The 1,000- and 1,025-key IN lists (`spans_in_1000`, `logs_trace_in_1000`,
   `logs_request_in_1000` and their `_1025` controls) are sent. A build from
