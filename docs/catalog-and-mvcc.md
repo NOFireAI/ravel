@@ -1149,16 +1149,24 @@ verified, and a binary search yields the `(entry_ordinal, block set)`
 matches; an empty bucket needs no GET 2 and answers absent from the
 directory alone. At most two ranged GETs per covering
 part for one key, issued concurrently across parts, under the per-statement
-ceilings `KEY_INDEX_LEAF_GET_CEILING` (`L_max`, 2,048 leaf GETs) and
-`KEY_INDEX_MAX_PROBED_PARTS` (`P_max`, 1,024 parts), both in
+ceilings `KEY_INDEX_LEAF_GET_CEILING` (2,048 leaf GETs, the one-key value)
+and `KEY_INDEX_MAX_PROBED_PARTS` (`P_max`, 1,024 parts), both in
 `ravel_catalog` and read together through `key_index_root_shape`, which a
 test pins (ADR-3692 decision 2 asks root validation to lint them as well;
-no root shape lint exists yet). Parts are admitted in descending `entry_count`, ties
-by descending `watermark_hour`, until the next part's worst case would
-exceed `L_max` or the admitted count would exceed `P_max`; a part beyond
-either ceiling is uncovered and goes to the tier-1 probe like every other
-uncovered segment, never to a scan (ADR-3692 decision 2 amends ADR-2707
-decision 5's remainder rule). Candidates are the matches over covered
+no root shape lint exists yet). A statement's leaf GET ceiling scales with
+its key set (ADR-3692's key-set ceiling amendment): `P_max x (1 + min(k,
+B_run))` for a set of `k` keys, 1,024 x 2 = 2,048 at k = 1 and 1,024 x 65
+= 66,560 at k >= 64, computed by the router from `k`. It is an absolute
+cap on the statement that charges each part as if the set sat in one
+slice, not a per-part budget. Parts are admitted in descending
+`entry_count`, ties by descending `watermark_hour`, until the next part's
+worst case would exceed the cap or the admitted count would exceed `P_max`;
+a part beyond either ceiling is uncovered and goes to the tier-1 probe like
+every other uncovered segment, never to a scan (ADR-3692 decision 2 amends
+ADR-2707 decision 5's remainder rule). Since a probed part's charge is
+refunded down to the GETs it issued, the cap's worst-case division is the
+fewest parts it admits: 528 logs day parts at k = 100 (66,560 / 126) and
+63 at k = 1,024 (66,560 / 1,050). Candidates are the matches over covered
 entries plus every uncovered segment: the entries a leaf lists as
 uncovered, every part without a leaf for the field, every leaf that failed
 validation, every part the ceilings left unprobed, every segment above the
@@ -1172,8 +1180,14 @@ segment to the tier-1 probe.
 
 A key set of 1 to 1,024 keys (`IN`, ADR-3692 decision 2) issues GET 1 once
 per (part, slice) the set touches. A part's worst case, admitted against
-`L_max` before GET 1, is `1 + min(k, 2^bucket_bits, B_run)` per touched
-slice, with `B_run` = `KEY_INDEX_SET_PROBE_MAX_RUNS` (64); once the probe
+the statement's cap before GET 1, is `1 + min(k_s, 2^bucket_bits, B_run)`
+per touched slice, `k_s` the slice's own key count, with `B_run` =
+`KEY_INDEX_SET_PROBE_MAX_RUNS` (64), so a set of `k` keys costs at most
+`S + k` over a part's `S` touched slices. A part whose worst case exceeds
+`2 x entry_count`, the tier-1 probe's two ranged GETs for each of its
+segments, is not admitted: it reads as uncovered after no leaf GET and is
+counted in `parts_uncovered`. A logs day part (26 slices, 552 entries) at
+k = 1,024 costs at most 1,050 against 1,104 and is admitted; once the probe
 has run, the GETs it did not issue go back to the budget and the first
 part that did not fit is evaluated again, so the admitted set is the one
 sequential evaluation would give. When the set touches at most `B_run`

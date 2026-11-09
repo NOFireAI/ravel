@@ -9,19 +9,24 @@
 //! or HEAD: a segment's `(part, ordinal)` from [`SnapshotParts`] is the only
 //! link between a leaf answer and a segment.
 //!
-//! Parts are admitted in descending `entry_count`, ties by descending
-//! `watermark_hour`, while the next part's worst-case leaf GET count fits
-//! under [`KEY_INDEX_LEAF_GET_CEILING`] and the admitted count stays within
-//! [`KEY_INDEX_MAX_PROBED_PARTS`]. A part's worst case is `1 + min(k,
-//! 2^bucket_bits, B_run)` per leaf slice the key set touches; once its probe
-//! has run, the GETs it did not issue go back to the budget and the first
-//! part that did not fit is evaluated again. Parts left over are
-//! [`SegmentRoute::Uncovered`], never sent to a scan.
+//! A part's worst case is `1 + min(k_s, 2^bucket_bits, B_run)` per leaf
+//! slice the key set touches, `k_s` the slice's own key count. A part whose
+//! worst case exceeds `2 x entry_count`, the tier-1 probe's cost for its own
+//! segments, is left [`SegmentRoute::Uncovered`] with no leaf GET (ADR-3692's
+//! key-set ceiling amendment). The others are admitted in descending
+//! `entry_count`, ties by descending `watermark_hour`, while the next part's
+//! worst case fits under the pass's leaf GET ceiling, `P_max x (1 + min(k,
+//! B_run))` for a set of `k` keys ([`KEY_INDEX_LEAF_GET_CEILING`] at k = 1),
+//! and the admitted count stays within [`KEY_INDEX_MAX_PROBED_PARTS`]. Once a
+//! part's probe has run, the GETs it did not issue go back to the budget and
+//! the first part that did not fit is evaluated again, so the ceiling is an
+//! absolute cap and its worst-case division the fewest parts it admits.
+//! Parts left over are [`SegmentRoute::Uncovered`], never sent to a scan.
 //!
 //! The ceiling bounds one routing pass, one [`route`] call. [`route_values`]
-//! runs one pass per distinct value, so the metrics label-value route issues
-//! up to the ceiling once per distinct positive equality value of the
-//! statement.
+//! runs one one-key pass per distinct value, so the metrics label-value route
+//! issues up to the k = 1 ceiling once per distinct positive equality value
+//! of the statement.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -129,7 +134,8 @@ pub enum SegmentRoute {
 pub struct RouteFigures {
     /// Parts whose leaves answered the whole key set.
     pub parts_covered: u64,
-    /// Parts with no leaf for the field.
+    /// Parts with no leaf for the field, and parts whose worst-case leaf GET
+    /// count exceeds `2 x entry_count`, their tier-1 probe's cost.
     pub parts_uncovered: u64,
     /// Parts the leaf GET or part ceiling left unprobed.
     pub parts_beyond_ceiling: u64,
@@ -287,19 +293,47 @@ pub enum RouteError {
     InvalidInput(String),
 }
 
-/// The admission bounds of one routing pass. [`route`] uses the ADR
-/// constants; tests use smaller ones. `KEY_INDEX_LEAF_GET_CEILING` is a
-/// per-pass bound: a statement that routes n values runs n passes.
+/// Ranged GETs the tier-1 probe issues per object (ADR-2707 decision 5;
+/// three as measured on spans, two being the conservative value).
+const TIER_ONE_GETS_PER_ENTRY: u64 = 2;
+
+/// The admission bounds of one routing pass. [`route`] computes them from
+/// the key set with [`Ceiling::for_keys`]; tests use smaller ones. The leaf
+/// GET ceiling is a per-pass bound: a statement that routes n values runs n
+/// passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ceiling {
     leaf_gets: u64,
     parts: usize,
+    /// A part is admitted only when its worst case is at most `entry_count`
+    /// times this: its own tier-1 probe's cost.
+    gets_per_entry: u64,
 }
 
+impl Ceiling {
+    /// The ADR bounds for a set of `k` keys: `P_max` parts and `P_max x (1 +
+    /// min(k, B_run))` leaf GETs, each part charged as if the set sat in one
+    /// slice.
+    const fn for_keys(k: usize) -> Ceiling {
+        let b_run = KEY_INDEX_SET_PROBE_MAX_RUNS as u64;
+        let k = k as u64;
+        let per_part = 1 + if k < b_run { k } else { b_run };
+        Ceiling {
+            leaf_gets: KEY_INDEX_MAX_PROBED_PARTS as u64 * per_part,
+            parts: KEY_INDEX_MAX_PROBED_PARTS,
+            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
+        }
+    }
+}
+
+/// The one-key bounds: ADR-2707 decision 5's point-lookup budget.
 const ADR_CEILING: Ceiling = Ceiling {
     leaf_gets: KEY_INDEX_LEAF_GET_CEILING as u64,
     parts: KEY_INDEX_MAX_PROBED_PARTS,
+    gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
 };
+
+const _: () = assert!(Ceiling::for_keys(1).leaf_gets == ADR_CEILING.leaf_gets);
 
 /// The `outcome` label of `ravel_query_key_index_parts_total`: the six part
 /// outcomes of [`RouteFigures`].
@@ -426,19 +460,22 @@ pub fn key_index_leaf_gets_total(signal: Signal) -> u64 {
 /// statement-failing outcome besides a `parts`/`snapshot` mismatch; every
 /// other failure leaves the part [`SegmentRoute::Uncovered`] and counts it.
 pub async fn route(input: RouteInput<'_>) -> Result<(Vec<SegmentRoute>, RouteFigures), RouteError> {
-    route_under(input, ADR_CEILING, &ROUTE_TOTALS).await
+    let ceiling = Ceiling::for_keys(input.key_set.keys.len());
+    route_under(input, ceiling, &ROUTE_TOTALS).await
 }
 
 /// [`route`] with the part ceiling lowered to `max_parts`, never raised past
 /// the ADR's `P_max`: a test reaches the beyond-ceiling outcome with a
-/// handful of parts instead of a thousand.
+/// handful of parts instead of a thousand. The leaf GET ceiling stays the
+/// key set's.
 pub async fn route_with_max_parts(
     input: RouteInput<'_>,
     max_parts: usize,
 ) -> Result<(Vec<SegmentRoute>, RouteFigures), RouteError> {
+    let statement = Ceiling::for_keys(input.key_set.keys.len());
     let ceiling = Ceiling {
-        parts: max_parts.min(ADR_CEILING.parts),
-        ..ADR_CEILING
+        parts: max_parts.min(statement.parts),
+        ..statement
     };
     route_under(input, ceiling, &ROUTE_TOTALS).await
 }
@@ -815,6 +852,13 @@ async fn route_parts(
             continue;
         }
         match plan_part(part, handle, input.key_set) {
+            // Dearer than the tier-1 probe of the part's own segments: tier 1
+            // answers it instead.
+            Ok(Some(plan))
+                if plan.worst_gets > handle.entry_count.saturating_mul(ceiling.gets_per_entry) =>
+            {
+                figures.parts_uncovered += 1;
+            }
             Ok(Some(plan)) => plans.push(plan),
             Ok(None) => figures.parts_uncovered += 1,
             Err(rejection) => {
