@@ -711,9 +711,9 @@ Some bands, as transcribed:
   0 leaf GETs (`services/ravel-server/tests/sql_key_in.rs`,
   `in_list_rows_equal_the_union_of_equalities`). The control is 1 (pass)
   when every 1,000-key call reports `keysProbed` 1000 and either
-  `partsCovered` or a part in an Uncovered outcome: any of
-  `partsUncovered`, `skippedByBudget`, `partsBeyondCeiling`,
-  `leavesRejected` and `reservationsRefused`, every outcome the ADR's row
+  `partsCovered` or a part left to tier 1: any of `partsUncovered`,
+  `skippedByBudget`, `partsBeyondCeiling`, `leavesRejected`,
+  `reservationsRefused` and `partsOverTierOne`, every outcome the ADR's row
   11 lets the report name (box C's went Uncovered by budget, `partsCovered`
   0 and `skippedByBudget` 1, which still carried the key set:
   `check_control_uncovered_by_budget`; each outcome alone passes in
@@ -724,7 +724,7 @@ Some bands, as transcribed:
   (`keysProbed`, `partsCovered` or `leafGetRequests` non-zero), is served
   with no visible path, or is refused while the 1,000-key list was
   admitted, or when the 1,000-key list probed another count or reported
-  `partsCovered` 0 with no Uncovered outcome;
+  `partsCovered` 0 with no part left to tier 1;
   `refused-by-guard` when the 1,000-key list was refused by the SQL
   complexity guard, and `unsupported-on-this-build` when it carries no
   tier-2 figures.
@@ -742,16 +742,20 @@ Some bands, as transcribed:
   `unfolded` p50 of the same statement (`cold.wall_p50_s`) and IQR its
   unfolded interquartile range (`cold.wall_iqr_s`), both from the same
   run; over that bound is a miss. A cell any of whose cold calls left a
-  covering part `Uncovered` (`partsCovered` 0, or `partsUncovered`,
-  `skippedByBudget`, `partsBeyondCeiling`, `leavesRejected` or
-  `reservationsRefused` above 0) reads `not-measured` whatever its time:
+  covering part to tier 1 (`partsCovered` 0, or `partsUncovered`,
+  `skippedByBudget`, `partsBeyondCeiling`, `leavesRejected`,
+  `reservationsRefused` or `partsOverTierOne` above 0) reads `not-measured`
+  whatever its time (`check_row_18_over_tier_one` for the last):
   its time is the tier-1 probe's, so it is neither a hold nor a miss, and
   it makes the verdict at best `incomplete`. `partsCovered` 0 with every
   outcome counter 0 counts too: the leaves answered no part
   (`check_row_18_covered_nothing`). A cell whose build reports no
   keyIndex outcome counters reads `unsupported-on-this-build`, which also
   makes the verdict `incomplete` and the exit 1, not a pass
-  (`check_row_18_unsupported_is_incomplete`). With either state absent the
+  (`check_row_18_unsupported_is_incomplete`). `partsOverTierOne` alone may
+  be absent: a build that predates it left no part to tier 1 by cost, so
+  it reads as 0 and the other five decide
+  (`check_row_18_predates_over_tier_one`). With either state absent the
   row reads `not-run` with the reason, as the committed fixture's does. The
   row also reports the slices per (part, field) the lookups touched
   (`stamp.slices`), and the logs `request_id` count after the leaf rebuild
@@ -967,7 +971,7 @@ mutations of it (missing, duplicate, miss, wrong answer, a deleted catalog
 stamp, absent phases, CPU and leaf sizes, dead counters, full, partial, zero
 and too-short compaction overlap, a refusal outside the cap probes, the
 1,025-key control's pass, miss, refused and unsupported readings and each
-Uncovered outcome of its 1,000-key list, a skipped state
+outcome of its 1,000-key list that leaves a part to tier 1, a skipped state
 and a mid-state deadline, the unsealed tail, the pending-erasure victim, a
 state absent from the results, row 3's per-object denominator, row 6's
 objects past the probe on box C's stats, with its plan-phase precondition

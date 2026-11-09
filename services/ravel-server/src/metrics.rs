@@ -11659,7 +11659,7 @@ mod tests {
     }
 
     /// The key-index router family renders one header per family, a parts
-    /// sample for every routed signal and every one of the six outcomes, and a
+    /// sample for every routed signal and every one of the seven outcomes, and a
     /// leaf-GET sample per routed signal, each carrying its own figure.
     #[test]
     fn key_index_route_family_renders_every_signal_and_outcome() {
@@ -11689,7 +11689,7 @@ mod tests {
                 "{out}"
             );
         }
-        assert_eq!(totals.parts.len(), 18, "three signals by six outcomes");
+        assert_eq!(totals.parts.len(), 21, "three signals by seven outcomes");
         for (signal, outcome, parts) in &totals.parts {
             let line = format!(
                 "ravel_query_key_index_parts_total{{mode=\"query\",signal=\"{}\",outcome=\"{}\"}} {parts}\n",
@@ -11706,7 +11706,7 @@ mod tests {
         }
         assert_eq!(
             out.lines().filter(|l| !l.starts_with('#')).count(),
-            21,
+            24,
             "{out}"
         );
     }
