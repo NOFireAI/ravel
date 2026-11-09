@@ -3607,7 +3607,8 @@ class Evaluate(Workdir):
 
     def check_row_18_timing_rows_leave_run_incomplete(self, evaluate_py=EVALUATE, bands=BANDS):
         """A timing figure judged as row 18's (A6's six p50 cells, W4's p50, F1 and F2) with an unsupported
-        value leaves the run incomplete, as row 18's does; W4's unsupported leaf GETs, a counter, do not."""
+        value leaves the run incomplete, as row 18's does, and so does any other ADR-3939 figure with no
+        value, whatever its lane: W4's unsupported leaf GETs, a counter, are listed too."""
         mod = load_module(evaluate_py, "evaluate_as_row_18")
         live = {"day_parts_7": None, "day_parts_30": None}
         keys = ("adr3939_a6", "adr3939_w4", "adr3939_f1", "adr3939_f2")
@@ -3624,8 +3625,10 @@ class Evaluate(Workdir):
                 out.append(f"{i} {figs[i]['verdict']}, want {UNSUPPORTED}")
             if f"figure {i} {UNSUPPORTED}" not in listed:
                 out.append(f"{i} unsupported, not incomplete")
-        if "figure adr3939_w4.leaf_gets " in listed:
-            out.append("W4's leaf GETs listed incomplete")
+        if figs["adr3939_w4.leaf_gets"]["verdict"] != UNSUPPORTED:
+            out.append(f"W4's leaf GETs {figs['adr3939_w4.leaf_gets']['verdict']}, want {UNSUPPORTED}")
+        if f"figure adr3939_w4.leaf_gets {UNSUPPORTED}" not in listed:
+            out.append("W4's unsupported leaf GETs, a counter, not incomplete")
         return out
 
     def test_row_18_timing_rows_leave_run_incomplete(self):
@@ -4052,8 +4055,8 @@ FLIPS = {
         "check_row_18_covered_nothing",
     ),
     "row 18's unsupported or missing cell left off the incomplete list": (
-        '        elif ((f["row"] == 18 or (',
-        '        elif ((False or (',
+        '        elif ((f["row"] == 18 or f.get("adr")',
+        '        elif ((False or f.get("adr")',
         "check_row_18_unsupported_is_incomplete",
     ),
     "row 18's p50 taken without the Uncovered check": (
@@ -4319,9 +4322,9 @@ FLIPS = {
         "0",
         "check_w3_drop_leaves_head",
     ),
-    "only row 18's own timing figures leave the run incomplete": (
-        'f["row"] in AS_ROW_18 and f["lane"] == "timing"',
-        'f["row"] in () and f["lane"] == "timing"',
+    "only row 18's own figures leave the run incomplete": (
+        'f["row"] == 18 or f.get("adr") == "ADR-3939")',
+        'f["row"] == 18 or f.get("adr") == "none")',
         "check_row_18_timing_rows_leave_run_incomplete",
     ),
 }
