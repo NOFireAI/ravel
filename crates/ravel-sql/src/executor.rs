@@ -1232,10 +1232,12 @@ fn accumulate_scan_timing(metrics: &MetricsSet, timing: &mut ScanTiming) {
 
 /// What a spans `trace_id` lookup's or a logs declared-key lookup's key
 /// indexes did (ADR-3692 decisions 4 and 7), rendered as `stats.keyIndex`
-/// and as the matching entry's `keyIndex` in `stats.signals`. The first nine are the tier-2 router's
+/// and as the matching entry's `keyIndex` in `stats.signals`. All but
+/// `skip_idx_dropped` are the tier-2 router's
 /// (`ravel_query::key_index_route::RouteFigures`); a part counts in exactly
-/// one of `parts_covered`, `parts_uncovered`, `parts_beyond_ceiling`,
-/// `leaves_rejected`, `reservations_refused` and `skipped_by_budget`.
+/// one of `parts_covered`, `parts_uncovered`, `parts_over_tier_one`,
+/// `parts_beyond_ceiling`, `leaves_rejected`, `reservations_refused` and
+/// `skipped_by_budget`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KeyIndexStats {
     /// Parts whose leaves answered the key.
@@ -1243,6 +1245,10 @@ pub struct KeyIndexStats {
     /// Parts with no leaf for the signal and field; their segments go to
     /// tier 1.
     pub parts_uncovered: u64,
+    /// Parts whose worst-case leaf GETs exceed the tier-1 probe's cost for
+    /// their segments in the routed snapshot, 2 GETs a segment; their
+    /// segments go to tier 1 with no leaf GET.
+    pub parts_over_tier_one: u64,
     /// Parts past the leaf GET or part ceiling; their segments go to tier 1.
     pub parts_beyond_ceiling: u64,
     /// Parts whose leaf, or whose leaf refs, did not answer.
@@ -1267,6 +1273,7 @@ impl KeyIndexStats {
     fn add(&mut self, other: &KeyIndexStats) {
         self.parts_covered += other.parts_covered;
         self.parts_uncovered += other.parts_uncovered;
+        self.parts_over_tier_one += other.parts_over_tier_one;
         self.parts_beyond_ceiling += other.parts_beyond_ceiling;
         self.leaves_rejected += other.leaves_rejected;
         self.reservations_refused += other.reservations_refused;
@@ -1286,7 +1293,7 @@ impl KeyIndexStats {
         if !present {
             return None;
         }
-        let v: [u64; 10] = std::array::from_fn(|i| {
+        let v: [u64; 11] = std::array::from_fn(|i| {
             metrics
                 .sum_by_name(NAMES[i])
                 .map_or(0, |v| v.as_usize() as u64)
@@ -1301,7 +1308,8 @@ impl KeyIndexStats {
             leaf_wire_bytes: v[6],
             keys_probed: v[7],
             skipped_by_budget: v[8],
-            skip_idx_dropped: v[9],
+            parts_over_tier_one: v[9],
+            skip_idx_dropped: v[10],
         })
     }
 }

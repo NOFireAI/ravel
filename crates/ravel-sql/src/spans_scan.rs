@@ -132,7 +132,7 @@ const METRIC_BLOCKS_PRUNED_BY_KEY_INDEX: &str = "blocks_pruned_by_key_index";
 /// registered only when the scan carries a `trace_id` key so their presence is
 /// what tells the stats renderer a trace key was pushed down. Order matches
 /// [`KeyIndexFigureCounters::counts`].
-pub(crate) const METRIC_KEY_INDEX_FIGURES: [&str; 10] = [
+pub(crate) const METRIC_KEY_INDEX_FIGURES: [&str; 11] = [
     "key_index_parts_covered",
     "key_index_parts_uncovered",
     "key_index_parts_beyond_ceiling",
@@ -142,6 +142,7 @@ pub(crate) const METRIC_KEY_INDEX_FIGURES: [&str; 10] = [
     "key_index_leaf_wire_bytes",
     "key_index_keys_probed",
     "key_index_skipped_by_budget",
+    "key_index_parts_over_tier_one",
     "key_index_skip_idx_dropped",
 ];
 
@@ -300,7 +301,7 @@ struct ScanSegment {
 /// once at plan time; `skip_idx_dropped` is shared with every partition.
 #[derive(Clone)]
 struct KeyIndexFigureCounters {
-    figures: [Count; 9],
+    figures: [Count; 10],
     skip_idx_dropped: Count,
     tier2_pruned: Count,
 }
@@ -313,7 +314,7 @@ impl KeyIndexFigureCounters {
         KeyIndexFigureCounters {
             figures,
             skip_idx_dropped: MetricBuilder::new(metrics)
-                .global_counter(METRIC_KEY_INDEX_FIGURES[9]),
+                .global_counter(METRIC_KEY_INDEX_FIGURES[10]),
             tier2_pruned: MetricBuilder::new(metrics)
                 .global_counter(METRIC_SEGMENTS_PRUNED_BY_KEY_INDEX),
         }
@@ -330,6 +331,7 @@ impl KeyIndexFigureCounters {
             f.leaf_wire_bytes,
             f.keys_probed,
             f.skipped_by_budget,
+            f.parts_over_tier_one,
         ];
         for (count, v) in self.figures.iter().zip(values) {
             count.add(v as usize);

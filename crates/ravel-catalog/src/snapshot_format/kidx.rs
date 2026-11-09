@@ -88,7 +88,8 @@ pub const KEY_INDEX_MAX_PROBED_PARTS: usize = 1_024;
 /// admission charges each part's real worst case against it and refunds
 /// the GETs a probed part did not issue, so its worst-case division is the
 /// fewest parts it admits. Separately, a part whose worst case exceeds
-/// `2 x entry_count`, its tier-1 probe's cost, is not probed.
+/// two GETs for each of its segments in the routed snapshot, its tier-1
+/// probe's cost, is not probed.
 pub const KEY_INDEX_LEAF_GET_CEILING: u32 = 2_048;
 
 /// Most bucket GETs one set probe issues against one leaf: ADR-3692

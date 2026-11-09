@@ -1240,8 +1240,9 @@ in the stats. Each object carries:
   nothing to `leafGetRequests` (`a_passes_leaf_cache_hits_reach_its_figures`).
   A read handed another
   caller's in-flight GET counts neither here nor in `leafGetRequests`.
-- `partsCovered`, `partsUncovered`, `partsBeyondCeiling`, `leavesRejected`,
-  `reservationsRefused` and `skippedByBudget`: the pass's part outcomes,
+- `partsCovered`, `partsUncovered`, `partsOverTierOne`, `partsBeyondCeiling`,
+  `leavesRejected`, `reservationsRefused` and `skippedByBudget`: the pass's
+  part outcomes,
   the figures `ravel_query_key_index_parts_total` adds up.
 - `segmentsPruned`: the segments the pass routed `Pruned`.
 - `segmentsPrunedAlone`: of those, the segments for which some plan holding
@@ -4127,9 +4128,11 @@ the logs entry holding the same ten fields as `stats.keyIndex`
 (`ravel_sql::key_index_json`):
 
 - `partsCovered`: parts the router answered from their leaves.
-- `partsUncovered`: parts with no leaf for `trace_id`, and parts whose
-  worst-case leaf GET count exceeds `2 x entry_count`, their tier-1 probe's
-  cost, whose segments go to the tier-1 probe.
+- `partsUncovered`: parts with no leaf for `trace_id`, whose segments go
+  to the tier-1 probe.
+- `partsOverTierOne`: parts whose worst-case leaf GET count exceeds two GETs
+  for each of the part's segments in the routed snapshot, their tier-1
+  probe's cost, left to the tier-1 probe without a leaf GET.
 - `partsBeyondCeiling`: parts past the statement's leaf GET ceiling or the
   probed-parts ceiling, whose segments go to the tier-1 probe.
 - `leavesRejected`: parts whose leaf did not answer, read as uncovered: a
@@ -5524,9 +5527,12 @@ at k >= 64; ADR-3692's key-set ceiling amendment), computed from the set
 where `route` builds its bounds. It is an absolute cap: each admitted part
 is charged its worst case and refunded down to the GETs it issued, so the
 cap's worst-case division is the fewest parts it admits. A part whose worst
-case exceeds `2 x entry_count`, its own tier-1 probe's cost, is not probed
-and counts in `partsUncovered`
-(`a_part_costing_more_than_its_tier_one_probe_is_left_to_tier_one`). The
+case exceeds two GETs for each of its segments in the routed snapshot, its
+own tier-1 probe's cost over the statement's window, is not probed and
+counts in `partsOverTierOne`, not `partsUncovered`
+(`a_part_costing_more_than_its_tier_one_probe_is_left_to_tier_one`,
+`a_part_with_few_segments_in_the_routed_snapshot_is_left_to_tier_one`,
+`the_same_part_with_every_segment_in_the_routed_snapshot_is_admitted`). The
 admission order, the `P_max` and `B_run` ceilings, the bridged read and the
 decoded-bound reservation are the leaf reader's rules in
 docs/catalog-and-mvcc.md, "Per-part key-index leaves". A part the ceilings
@@ -5582,7 +5588,8 @@ or the trace's bucket is empty; a holder costs its suffix, SKIP_IDX and its
 runs, plus the two KEY_IDX reads when it is uncovered; a part past the
 ceilings sends its segments to tier 1. The process counters are
 `ravel_query_key_index_parts_total{signal,outcome}`, the parts the router
-settled with `outcome` one of `covered`, `uncovered`, `beyond_ceiling`,
+settled with `outcome` one of `covered`, `uncovered`, `over_tier_one`,
+`beyond_ceiling`,
 `rejected`, `reservation_refused` and `skipped_by_budget`, and
 `ravel_query_key_index_leaf_gets_total{signal}`, the leaf GETs it issued.
 The Flight SQL pinned path and `EXPLAIN` do not route: they probe at tier 1.

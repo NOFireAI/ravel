@@ -972,6 +972,7 @@ async fn unfolded_absent_object_costs_three_gets_under_sixteen_kib_and_no_skip_i
     for field in [
         "partsCovered",
         "partsUncovered",
+        "partsOverTierOne",
         "partsBeyondCeiling",
         "leavesRejected",
         "reservationsRefused",
@@ -1596,6 +1597,7 @@ async fn a_trace_lookup_degrades_to_tier_one_on_a_refused_parts_charge() {
         "keysProbed",
         "partsCovered",
         "partsUncovered",
+        "partsOverTierOne",
         "partsBeyondCeiling",
         "leavesRejected",
         "reservationsRefused",
