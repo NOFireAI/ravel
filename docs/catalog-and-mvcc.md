@@ -2901,11 +2901,26 @@ refusal never hides a foreign part; the refusal is
 `LoadPostingsError::MemoryExhausted` or
 `SealDivergenceError::MemoryExhausted`. A tenant_hash mismatch on the postings
 object in `load_covering_postings` (`LoadPostingsError::TenantHashMismatch`)
-is not counted. Four readers still decode a part with no tenant_hash check,
-so a foreign part they read is neither refused nor counted: the on-demand
-fold's `read_entry_ids` (`services/ravel-server/src/fold_on_demand.rs`), the
-format-window audit (`services/ravel-server/src/format_window.rs`), the GC
-reachability sweep (`crates/ravel-maintain/src/reachability.rs`) and
+is not counted.
+
+The GC reachability sweep (`crates/ravel-maintain/src/reachability.rs`) also
+checks, but holds no `Catalog` to count a breach on: it calls the same
+tenant-checked decode (`ravel_catalog::check_part_tenant` /
+`decode_part_for_tenant`, the public primitives `Catalog::decode_tenant_part`
+itself calls) directly on a HEAD-named part before reading its entries. A
+foreign tenant_hash refuses the part and takes the fail-closed path the sweep
+already uses for an undecodable part: the refusal is cached for the rest of
+the pass, the delete gate answers `SnapshotBlock::Unreadable`, the candidate
+is not deleted (the retention sweep counts it on the pass report's
+`blocked_by_unreadable_head`, the superseded-input sweep on
+`held_by_unreadable_head`), and the sweep logs one error-level line (`key`,
+`expected_tenant`, `actual_tenant`). It does not increment
+`ravel_catalog_isolation_breach_total`, because it holds no `Catalog`.
+
+Three readers still decode a part with no tenant_hash check, so a foreign
+part they read is neither refused nor counted: the on-demand fold's
+`read_entry_ids` (`services/ravel-server/src/fold_on_demand.rs`), the
+format-window audit (`services/ravel-server/src/format_window.rs`), and
 `ravel-cli catalog inspect` (`services/ravel-cli/src/catalog.rs`).
 The counter is rendered at `/metrics` beside the
 existing `ravel_catalog_interlock_violations_total` and

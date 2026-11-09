@@ -1722,6 +1722,150 @@ async fn scan_reports_blocked_by_unreadable_head_counter() {
     assert_eq!(r2.blocked_by_snapshot, 0);
 }
 
+/// Republishes the bucket's HEAD-named snapshot part re-encoded for a
+/// different tenant (ADR-0050 §2), keeping the HEAD's own blake3/size/hour
+/// range correct for the republished bytes, so only the part's own header
+/// names the wrong tenant. `entries` controls whether the republished part's
+/// own entries still name the seeded bucket (fixture a) or name nothing
+/// (fixture b): both must block fail-closed.
+async fn republish_part_for_foreign_tenant(
+    store: &Arc<MemoryStore>,
+    signal: Signal,
+    entries: Vec<ravel_proto::catalog::v1::SnapshotEntry>,
+) {
+    let head_bytes = get_full(store.as_ref(), &head_key(signal)).await;
+    let mut head = ravel_catalog::decode_head(head_bytes.as_ref()).expect("HEAD decodes");
+    assert_eq!(head.parts.len(), 1, "single-part HEAD on this fixture");
+    let part_key = head.parts[0].key.clone();
+    let part_bytes = get_full(store.as_ref(), &part_key).await;
+    let limits = ravel_catalog::PartLimits {
+        max_snapshot_part_bytes: ravel_catalog::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
+    };
+    let part = ravel_catalog::decode_part(part_bytes.as_ref(), &limits).expect("part decodes");
+
+    let foreign_tenant = [0xBBu8; 16];
+    let foreign_part = ravel_catalog::encode_part(
+        foreign_tenant,
+        part.header.signal,
+        part.header.shard_count,
+        part.header.watermark_hour,
+        &entries,
+    )
+    .expect("encode part for a foreign tenant");
+    store
+        .put(
+            &part_key,
+            Bytes::from(foreign_part.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .expect("republish the part");
+    head.parts[0].blake3 = blake3::hash(&foreign_part).as_bytes().to_vec();
+    head.parts[0].size = foreign_part.len() as u64;
+    head.parts[0].entry_count = entries.len() as u64;
+    let encoded_head = ravel_catalog::encode_head(&head).expect("HEAD still encodes");
+    store
+        .put(
+            &head_key(signal),
+            Bytes::from(encoded_head),
+            PutOptions::default(),
+        )
+        .await
+        .expect("republish HEAD");
+}
+
+/// Deliverable 5 (counters), foreign-tenant case: a HEAD-named part whose
+/// header names another tenant blocks fail-closed as `Unreadable`, counted
+/// distinctly from `blocked_by_snapshot`, and deletes nothing -- whether or
+/// not the foreign part's own entries happen to name the candidate bucket.
+///
+/// FLIP (W1): have the maintain sweep's part read skip the tenant check (read
+/// the foreign part as if it were readable). Fixture (a) (foreign entries
+/// name the bucket) then blocks as `Blocked(Named)` and fixture (b) (foreign
+/// entries name nothing) clears the delete; either way
+/// `blocked_by_unreadable_head` reads 0 and the first assertion below fails.
+///
+/// FLIP (W2): answer an unreadable covering part as `Blocked(Named)` (treat
+/// the foreign part as reachable). `blocked_by_unreadable_head` reads 0 and
+/// the same assertion fails; `blocked_by_snapshot` would read 1.
+#[tokio::test]
+async fn scan_blocks_fail_closed_when_head_part_names_foreign_tenant() {
+    for (case, entries) in [
+        (
+            "foreign part's entries name the candidate bucket",
+            vec![ravel_proto::catalog::v1::SnapshotEntry {
+                level: 0,
+                shard: SHARD,
+                ingest_hour_bucket: bucket().ingest_hour_bucket,
+                writer_id: vec![0xCC; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+                content_hash: vec![1; 32],
+                object_size: 100,
+                min_event_ts_ns: 0,
+                max_event_ts_ns: 0,
+                sample_count: 0,
+                series_count: 0,
+                segment_format_version: 0,
+                created_unix_ns: 0,
+                declared_column_stats: Vec::new(),
+            }],
+        ),
+        ("foreign part's entries name nothing here", Vec::new()),
+    ] {
+        let store = Arc::new(MemoryStore::new());
+        let created = sealed_now_ns();
+        let clock = FixedClock::new(created);
+        seed_two(store.as_ref(), Sig::Metrics).await;
+        let config = cfg();
+        let retention = retention_at_floor(&config);
+
+        fold_head(&store, Signal::Metrics, created, None).await;
+        republish_part_for_foreign_tenant(&store, Signal::Metrics, entries).await;
+
+        // Pass 1: tombstone.
+        scan_and_maintain(
+            store.as_ref(),
+            &clock,
+            &config,
+            &retention,
+            &NoLeases,
+            tenant_hash(),
+            Signal::Metrics,
+            SHARD,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("scan pass 1 ({case}): {err:?}"));
+
+        // Pass 2, past the horizon: fail-closed block, counted distinctly.
+        clock.set(created + config.protection_horizon_ns + 1);
+        let r2 = scan_and_maintain(
+            store.as_ref(),
+            &clock,
+            &config,
+            &retention,
+            &NoLeases,
+            tenant_hash(),
+            Signal::Metrics,
+            SHARD,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("scan pass 2 ({case}): {err:?}"));
+        assert_eq!(
+            r2.blocked_by_unreadable_head, 1,
+            "a foreign-tenant part blocks fail-closed as Unreadable ({case})"
+        );
+        assert_eq!(
+            r2.blocked_by_snapshot, 0,
+            "not the Named-block path ({case})"
+        );
+        assert!(
+            !bucket_is_empty(store.as_ref(), &bucket()).await,
+            "nothing is deleted while the HEAD-named part fails the tenant check ({case})"
+        );
+    }
+}
+
 // --- #1113 traceability: TombstoneBucket / commit-token query --------------
 
 /// TombstoneBucket (commit traceability row 5): a commit-token query for a
