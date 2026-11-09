@@ -453,7 +453,12 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-const UNBOUNDED: Ceiling = ADR_CEILING;
+/// The ADR bounds without the per-part tier-1 test, for fixtures whose
+/// parts hold fewer entries than their leaf reads.
+const UNBOUNDED: Ceiling = Ceiling {
+    gets_per_entry: u64::MAX,
+    ..ADR_CEILING
+};
 
 fn leaf_kind() -> impl Strategy<Value = LeafKind> {
     prop_oneof![
@@ -507,13 +512,14 @@ proptest! {
         extra_keys in prop_oneof![3 => Just(0usize), 1 => 0usize..=1018],
         ceiling_gets in prop_oneof![Just(KEY_INDEX_LEAF_GET_CEILING as u64), 1u64..=150],
         ceiling_parts in 1usize..=6,
+        gets_per_entry in prop_oneof![Just(TIER_ONE_GETS_PER_ENTRY), Just(u64::MAX)],
         budget_max in prop::option::weighted(0.2, 64u64..4096),
     ) {
         let key_type = if id16 { KeyType::Id16 } else { KeyType::Str };
         let mut query = present_keys.clone();
         query.extend((0..extra_keys).map(|i| 1000 + i as u16));
         let keys = key_set(key_type, &query);
-        let ceiling = Ceiling { leaf_gets: ceiling_gets, parts: ceiling_parts };
+        let ceiling = Ceiling { leaf_gets: ceiling_gets, parts: ceiling_parts, gets_per_entry };
         let budget = ThresholdBudget::new(budget_max.unwrap_or(u64::MAX));
         let (fx, run) = block_on(async {
             let fx = fixture(&specs, &recents, key_type).await;
@@ -619,7 +625,7 @@ async fn ceiling_admits_the_largest_parts_in_order() {
     // L_max room for exactly 2 parts: the two largest by entry_count.
     let ceiling = Ceiling {
         leaf_gets: 5,
-        parts: KEY_INDEX_MAX_PROBED_PARTS,
+        ..ADR_CEILING
     };
     let run_gets = run(&fx, &keys, &budget, ceiling).await;
     let (routes, figures) = run_gets.result.as_ref().expect("route");
@@ -646,6 +652,7 @@ async fn ceiling_admits_the_largest_parts_in_order() {
         Ceiling {
             leaf_gets: KEY_INDEX_LEAF_GET_CEILING as u64,
             parts: 2,
+            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
         },
     )
     .await;
@@ -663,6 +670,7 @@ async fn ceiling_admits_the_largest_parts_in_order() {
         Ceiling {
             leaf_gets: 2,
             parts: KEY_INDEX_MAX_PROBED_PARTS,
+            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
         },
     )
     .await;
@@ -700,6 +708,7 @@ async fn refunded_gets_admit_the_next_part() {
         Ceiling {
             leaf_gets: 4,
             parts: KEY_INDEX_MAX_PROBED_PARTS,
+            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
         },
     )
     .await;
@@ -708,6 +717,197 @@ async fn refunded_gets_admit_the_next_part() {
     assert_eq!(figures.parts_beyond_ceiling, 0);
     assert_eq!(figures.leaf_get_requests, 3);
     assert!(routes.iter().all(|r| *r == SegmentRoute::Pruned));
+}
+
+/// Entries in an ADR-3939 logs day part.
+const DAY_PART_ENTRIES: usize = 552;
+
+/// Leaf slices of an ADR-3939 logs day part.
+const DAY_PART_SLICES: usize = 26;
+
+/// A part shaped like an ADR-3939 logs day: 552 entries, 26 leaf slices.
+/// Value `values[i]` sits in entry `i % 552`, block 0, so every key of a
+/// set over `values` reads its own bucket. The first 8 entries' segments
+/// are in the snapshot.
+fn day_part(values: &[u16], watermark_hour: u32) -> PartSpec {
+    let mut entries = vec![Rows::new(); DAY_PART_ENTRIES];
+    for (i, v) in values.iter().enumerate() {
+        entries[i % DAY_PART_ENTRIES].insert(*v, BTreeSet::from([0u32]));
+    }
+    let mut spec = PartSpec::simple(entries);
+    spec.present = (0..DAY_PART_ENTRIES).map(|o| o < 8).collect();
+    spec.watermark_hour = watermark_hour;
+    spec.bucket_bits = 10;
+    spec.leaf = LeafKind::Sliced(DAY_PART_SLICES);
+    spec
+}
+
+/// Each part's worst-case leaf GET count for `keys`.
+fn worst_gets(fx: &Fixture, keys: &KeySet) -> Vec<u64> {
+    fx.parts
+        .parts
+        .iter()
+        .enumerate()
+        .map(|(p, handle)| {
+            plan_part(p, handle, keys)
+                .expect("plan")
+                .expect("covered")
+                .worst_gets
+        })
+        .collect()
+}
+
+/// [`route`] itself, so the ceiling is the one it computes from the set.
+async fn run_statement(fx: &Fixture, keys: &KeySet) -> Run {
+    let accounting = PhaseAccounting::new();
+    let reader = CountingReader::new(fx.store.clone());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let result = route(input(fx, keys, &accounting, &reader, &budget)).await;
+    Run {
+        result,
+        accounting,
+        reader,
+        totals: RouteTotals::new(),
+    }
+}
+
+/// ADR-3692 key-set ceiling amendment, row 19: a 100-key set over 30 logs
+/// day parts charges 30 x 126 = 3,780 worst-case GETs, over the constant
+/// 2,048, and the statement's ceiling of 1,024 x 65 covers every part.
+/// FLIP: `route` passing the constant `ADR_CEILING` covers 16 parts and
+/// leaves 14 beyond the ceiling.
+#[tokio::test]
+async fn a_key_set_ceiling_scales_with_the_set_size() {
+    let values: Vec<u16> = (0..100).collect();
+    let specs: Vec<PartSpec> = (0..30).map(|h| day_part(&values, h)).collect();
+    let fx = fixture(&specs, &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = values.iter().copied().collect();
+    let keys = key_set(KeyType::Str, &query);
+    let worst = worst_gets(&fx, &keys);
+    assert!(
+        worst.iter().all(|w| *w <= 126),
+        "fixture: a day part charges at most 26 + 100: {worst:?}"
+    );
+    assert!(
+        worst.iter().sum::<u64>() > KEY_INDEX_LEAF_GET_CEILING as u64,
+        "fixture: the parts do not fit the constant ceiling: {worst:?}"
+    );
+
+    let run = run_statement(&fx, &keys).await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(figures.parts_covered, 30);
+    assert_eq!(figures.parts_beyond_ceiling, 0);
+    assert_eq!(figures.parts_uncovered, 0);
+    assert!(figures.leaf_get_requests <= 30 * 126);
+    assert!(routes.iter().all(|r| *r != SegmentRoute::Uncovered));
+    assert!(violations(routes, &fx.rows, &query).is_empty());
+    assert_accounting(&run, figures);
+}
+
+/// ADR-3692 key-set ceiling amendment, row 11 restated: one key over 1,025
+/// one-slice parts admits 1,024 and leaves 1 beyond the ceiling, and the
+/// k = 1 ceiling is 2,048, ADR-2707 decision 5's point-lookup budget.
+/// FLIP: a ceiling of `P_max x (2 + min(k, B_run))` is 3,072 at k = 1 and
+/// fails the equality with 2,048.
+#[tokio::test]
+async fn a_single_key_ceiling_is_unchanged_at_2048() {
+    assert_eq!(Ceiling::for_keys(1), ADR_CEILING);
+    assert_eq!(Ceiling::for_keys(1).leaf_gets, 2_048);
+    assert_eq!(
+        Ceiling::for_keys(KEY_SET_MAX_KEYS).leaf_gets,
+        1_024 * 65,
+        "k >= B_run charges 1 + 64 per part"
+    );
+
+    let specs: Vec<PartSpec> = (0..1_025)
+        .map(|_| PartSpec::simple(vec![rows(&[(1, &[0])])]))
+        .collect();
+    let fx = fixture(&specs, &[], KeyType::Str).await;
+    let query = BTreeSet::from([1u16]);
+    let keys = key_set(KeyType::Str, &query);
+    let run = run_statement(&fx, &keys).await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(figures.parts_covered, 1_024);
+    assert_eq!(figures.parts_beyond_ceiling, 1);
+    assert_eq!(figures.leaf_get_requests, 2_048);
+    assert!(violations(routes, &fx.rows, &query).is_empty());
+    assert_accounting(&run, figures);
+}
+
+/// ADR-3692 key-set ceiling amendment, row 20: a 2-entry part probed with
+/// 100 keys over 26 slices has a worst case above its tier-1 cost of
+/// 2 x 2 = 4 GETs, so it is left to tier 1 with no leaf GET and counted
+/// in `parts_uncovered`.
+/// FLIP: without the per-part tier-1 arm in `route_parts` the part is
+/// probed and covered.
+#[tokio::test]
+async fn a_part_costing_more_than_its_tier_one_probe_is_left_to_tier_one() {
+    let mut small = PartSpec::simple(vec![rows(&[(0, &[0])]), rows(&[(1, &[1])])]);
+    small.leaf = LeafKind::Sliced(DAY_PART_SLICES);
+    let fx = fixture(&[small], &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = (0..100).collect();
+    let keys = key_set(KeyType::Str, &query);
+    let worst = worst_gets(&fx, &keys);
+    assert!(worst[0] > 4, "fixture: worst case over 2 x 2: {worst:?}");
+
+    let routed = run_statement(&fx, &keys).await;
+    let (routes, figures) = routed.result.as_ref().expect("route");
+    assert_eq!(
+        *figures,
+        RouteFigures {
+            parts_uncovered: 1,
+            keys_probed: 100,
+            ..RouteFigures::default()
+        }
+    );
+    assert_eq!(routed.reader.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        routes,
+        &vec![SegmentRoute::Uncovered; 2],
+        "tier 1 reads both segments"
+    );
+    assert_accounting(&routed, figures);
+
+    // The same part without the tier-1 test is probed, so the test above is
+    // what kept it at tier 1.
+    let probed = run(&fx, &keys, &ThresholdBudget::new(u64::MAX), UNBOUNDED).await;
+    let (_, figures) = probed.result.as_ref().expect("route");
+    assert_eq!(figures.parts_covered, 1);
+    assert!(figures.leaf_get_requests > 4);
+}
+
+/// ADR-3692 key-set ceiling amendment, row 21: 1,024 keys over 64 day
+/// parts charge each part at most 26 + 1,024 = 1,050, under its tier-1
+/// cost of 1,104, and the 66,560 cap admits at least 63 of them.
+/// FLIP: the constant 2,048 ceiling admits 1 part.
+#[tokio::test]
+async fn a_1024_key_set_over_64_day_parts_covers_at_least_63() {
+    let values: Vec<u16> = (0..KEY_SET_MAX_KEYS as u16).collect();
+    let specs: Vec<PartSpec> = (0..64).map(|h| day_part(&values, h)).collect();
+    let fx = fixture(&specs, &[], KeyType::Str).await;
+    let query: BTreeSet<u16> = values.iter().copied().collect();
+    let keys = key_set(KeyType::Str, &query);
+    let worst = worst_gets(&fx, &keys);
+    assert!(
+        worst.iter().all(|w| *w <= 1_050),
+        "fixture: a day part charges at most 26 + 1,024: {worst:?}"
+    );
+
+    let run = run_statement(&fx, &keys).await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(
+        figures.parts_uncovered, 0,
+        "every part passes its tier-1 test"
+    );
+    assert!(
+        figures.parts_covered >= 63,
+        "covered {}",
+        figures.parts_covered
+    );
+    assert_eq!(figures.parts_covered + figures.parts_beyond_ceiling, 64);
+    assert!(figures.leaf_get_requests <= 66_560);
+    assert!(violations(routes, &fx.rows, &query).is_empty());
+    assert_accounting(&run, figures);
 }
 
 #[tokio::test]
@@ -1021,7 +1221,7 @@ async fn the_bridged_byte_budget_is_the_parts_not_each_slices() {
     let (fx, keys, values, b0, b1) =
         chosen.expect("a key count whose slices each fit the part's allowance but not together");
 
-    let both = run(&fx, &keys, &budget, ADR_CEILING).await;
+    let both = run(&fx, &keys, &budget, UNBOUNDED).await;
     let (routes, figures) = both.result.as_ref().expect("route");
     assert_eq!(
         figures.skipped_by_budget, 1,
@@ -1037,7 +1237,7 @@ async fn the_bridged_byte_budget_is_the_parts_not_each_slices() {
         .copied()
         .filter(|v| u64::from_be_bytes(value_key8(KeyType::Str, *v)) < cut)
         .collect();
-    let one = run(&fx, &key_set(KeyType::Str, &low), &budget, ADR_CEILING).await;
+    let one = run(&fx, &key_set(KeyType::Str, &low), &budget, UNBOUNDED).await;
     let (_, figures) = one.result.as_ref().expect("route");
     assert_eq!(
         figures.skipped_by_budget, 0,
@@ -1427,7 +1627,7 @@ async fn admission_is_largest_first_and_stops_at_the_first_part_that_does_not_fi
     let budget = ThresholdBudget::new(u64::MAX);
     let ceiling = |leaf_gets| Ceiling {
         leaf_gets,
-        parts: KEY_INDEX_MAX_PROBED_PARTS,
+        ..UNBOUNDED
     };
 
     let tight = run(&fx, &keys, &budget, ceiling(3)).await;
@@ -1609,6 +1809,7 @@ async fn route_totals_add_every_part_outcome_and_leaf_get_under_the_signal() {
         Ceiling {
             leaf_gets: 4,
             parts: KEY_INDEX_MAX_PROBED_PARTS,
+            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
         },
     )
     .await;
