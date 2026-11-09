@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Test-hygiene guard: the three defect shapes CLAUDE.md names under "Testing
-# patterns" as ones that bit twice and therefore become a check rather than
-# another paragraph.
+# Test-hygiene guard: five defect shapes. CLAUDE.md's "Testing patterns"
+# names the first three (wall-clock, unseeded-rng, proptest-seed) as ones
+# that bit twice and therefore became a check rather than another paragraph;
+# ignore-flaky and clock-compared are two later additions this guard also
+# tracks.
 #
 #   wall-clock    an assertion whose subject is elapsed real time. Flaky on a
 #                 loaded box, vacuous on a fast one. Library logic takes a
@@ -236,11 +238,18 @@ function in_test(line) {
   return is_test_file || (cfg_test_line > 0 && line >= cfg_test_line)
 }
 # A function signature names an injected clock: a parameter called exactly
-# `now`/`clock`, or ending/starting with `_now`/`now_`/`_clock`/`clock_`. A
-# helper taking one is the fix, not the defect, however its own body reads a
-# clock it never uses -- so this check is the whole difference between the
-# pre- and post-#4000 shape of `serve()`: the parameter is what lets a caller
-# pass one reading into two fixtures instead of the helper taking its own.
+# `now`/`clock`, or ending/starting with `_now`/`now_`/`_clock`/`clock_`. This
+# is narrower than the #4000 fix itself: post-fix `serve(setup: Setup)`
+# escapes find_clock_fns because its body reads
+# `setup.now.unwrap_or_else(now_ns)`, which the unconditional-call pattern
+# below never matches -- not because its signature carries a now/clock
+# parameter (it carries none; `setup: Setup` matches nothing here). This
+# check exists for the shape that pattern alone would miss: a helper whose
+# signature takes the clock directly (`fn fixture(now: i64)`) but whose body
+# still has a literal `let fallback = now_ns();` as a default for when the
+# caller passes nothing. Without this exemption that body shape alone would
+# mark the helper a clock-reader even though the caller already controls the
+# time.
 function fn_sig_has_now_param(sigbuf,   lb) {
   lb = tolower(sigbuf)
   return (lb ~ /[(,][ \t]*(mut[ \t]+)?now[ \t]*:/) \
@@ -289,7 +298,7 @@ function find_clock_fns(   i, k, name, sig, depth, started, seg, bi, nb, bc) {
 # runs top to bottom, so this needs no fixpoint the way Pass A2 does) to a
 # a clock-reading helper call. Two differently-tagged identifiers meeting in
 # one assertion is two independent clock readings compared: the #4000 shape.
-function scan_clock(   i, j, k, cj, cap, name, start, attr_ok, depth, started, seg, bi, nb, bc,
+function scan_clock(   i, j, k, cj, cap, name, attr_ok, depth, started, seg, bi, nb, bc,
                         buf, b, lhs, rhs, parts, ntok, tok, ident, call, cnt, tagkey, seen, tagctr) {
   for (i = 1; i <= nlines; i++) {
     if (clean[i] !~ /fn[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(/) continue
@@ -304,7 +313,6 @@ function scan_clock(   i, j, k, cj, cap, name, start, attr_ok, depth, started, s
       break
     }
     if (!attr_ok) continue
-    start = i
     depth = 0; started = 0; tagctr = 0
     delete clocktag
     for (k = i; k <= nlines && k <= i + 4000; k++) {
@@ -361,7 +369,7 @@ function scan_clock(   i, j, k, cj, cap, name, start, attr_ok, depth, started, s
             }
           }
           if (cnt >= 2) {
-            report("clock-compared", start, "two independently-read clock values compared in one assertion: build both fixtures from one reading, passed in rather than read by the helper")
+            report("clock-compared", k, "two independently-read clock values compared in one assertion: build both fixtures from one reading, passed in rather than read by the helper")
           }
         }
       }
@@ -371,14 +379,19 @@ function scan_clock(   i, j, k, cj, cap, name, start, attr_ok, depth, started, s
 }
 # An #[ignore] whose reason names "flaky" but cites no issue (#<digits>). Raw
 # lines, not the stripped skeleton: the reason lives inside a string literal
-# or a comment, both of which strip_line removes from clean[].
+# or a comment, both of which strip_line removes from clean[]. The walk
+# upward passes over other attribute lines (`#[test]` can sit between the
+# comment and `#[ignore]`, in either order) without stopping, so a reason
+# commented above the whole attribute block is read regardless of where
+# `#[ignore]` falls within it.
 function scan_ignore_flaky(   i, j, combined) {
   for (i = 1; i <= nlines; i++) {
     if (raw[i] !~ /#\[[ \t]*ignore([ \t]*=|[ \t]*\])/) continue
     combined = raw[i]
     for (j = i - 1; j >= 1; j--) {
-      if (raw[j] !~ /^[ \t]*\/\//) break
-      combined = combined " " raw[j]
+      if (raw[j] ~ /^[ \t]*\/\//) { combined = combined " " raw[j]; continue }
+      if (raw[j] ~ /^[ \t]*#\[/) continue
+      break
     }
     if (tolower(combined) !~ /flaky/) continue
     if (combined ~ /#[0-9]+/) continue
