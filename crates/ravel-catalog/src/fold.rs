@@ -15837,6 +15837,17 @@ pub(crate) mod tests {
                 .count()
         }
 
+        /// `.kidx` GETs of the leaves of the part whose watermark is `hour`.
+        fn leaf_gets_for_part_watermark(&self, hour: u32) -> usize {
+            let needle = format!("/idx/{}.", keys::ingest_hour_string(hour));
+            self.gets
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(key, _)| key.ends_with(".kidx") && key.contains(&needle))
+                .count()
+        }
+
         /// GETs of any of `leaves`' objects.
         fn gets_of_leaves(&self, leaves: &[SnapshotKeyIndexLeafRef]) -> usize {
             self.gets
@@ -16217,6 +16228,421 @@ pub(crate) mod tests {
             2 * 2 * 2,
             "2 ranged GETs x 2 surviving entries x 2 passes"
         );
+    }
+
+    /// The warning a fold logs when it carries a part that lacks a declared
+    /// field's leaf.
+    const MISSING_LEAVES_WARNING: &str = "lack a key-index leaf for a declared field";
+
+    /// [`fold_through`], returning the WARN lines it logged.
+    async fn fold_capturing_warnings(
+        catalog: &Catalog,
+        signal: Signal,
+        hour: u32,
+    ) -> (FoldReport, Vec<String>) {
+        let capture = LevelCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let report = {
+            let _default = tracing::subscriber::set_default(subscriber);
+            fold_through(catalog, signal, hour).await
+        };
+        let warnings = capture
+            .lines()
+            .into_iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, line)| line)
+            .collect();
+        (report, warnings)
+    }
+
+    /// The one missing-leaves warning in `warnings`.
+    fn missing_leaves_warning(warnings: &[String]) -> &str {
+        let found: Vec<&String> = warnings
+            .iter()
+            .filter(|line| line.contains(MISSING_LEAVES_WARNING))
+            .collect();
+        assert_eq!(found.len(), 1, "{warnings:?}");
+        found[0]
+    }
+
+    fn leaf_fields(part: &SnapshotPartRef) -> Vec<&str> {
+        let mut fields: Vec<&str> = part
+            .key_index
+            .iter()
+            .map(|leaf| leaf.field.as_str())
+            .collect();
+        fields.sort_unstable();
+        fields.dedup();
+        fields
+    }
+
+    /// Day d's two records and its sealed part's ref, folded through day
+    /// d + 1's first entry into a store whose op log is then cleared. Every
+    /// entry's KEY_IDX section indexes `user_id` and `session`, both I64,
+    /// while `session` is declared Str, so every entry is uncovered for it
+    /// and day d seals with a `user_id` leaf and no `session` leaf.
+    async fn sealed_day_missing_session(
+        store: &Arc<OpLogStore>,
+        catalog: &Catalog,
+    ) -> (Vec<CommitRecord>, SnapshotPartRef) {
+        use crate::tenant_config::DeclaredColumnType;
+        declare_key_index_columns(
+            store.as_ref(),
+            &[
+                (USER_ID, DeclaredColumnType::I64),
+                (SESSION, DeclaredColumnType::Str),
+            ],
+            1,
+        )
+        .await;
+        let fields = [(USER_ID, KeyType::I64), (SESSION, KeyType::I64)];
+        let mut day_d = Vec::new();
+        for (seq, hour, ids) in [(1u64, DAY_D + 20, [10, 20]), (2, DAY_D + 22, [30, 40])] {
+            let (record, _) =
+                publish_keyed_logs(store.as_ref(), seq, hour, &ids, 2, 0, &fields).await;
+            day_d.push(record);
+        }
+        publish_keyed_logs(store.as_ref(), 3, DAY_D + 25, &[50], 2, 0, &fields).await;
+        fold_through(catalog, Signal::Logs, DAY_D + 25).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            head.parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour))
+                .collect::<Vec<_>>(),
+            vec![(DAY_D + 20, DAY_D + 22), (DAY_D + 25, DAY_D + 25)],
+            "day d is sealed"
+        );
+        store.clear();
+        (day_d, head.parts[0].clone())
+    }
+
+    /// ADR-3939 decision 2: the fold builds no leaf for a part it carries by
+    /// reference. Day d seals with a `user_id` leaf only (see
+    /// [`sealed_day_missing_session`]); once `session` is declared with the
+    /// type its sections index, two advancing folds each carry day d's ref
+    /// byte for byte, read none of its sections, GET and PUT none of its
+    /// leaves, count it in `key_index_parts_missing_declared_leaves` and warn
+    /// once naming the tenant, the signal and `session` alone. The repair,
+    /// `rebuild_key_index` for `session`, attaches the leaf to the same part
+    /// object, and the fold after it carries the repaired ref with no GET or
+    /// PUT for day d and counts 0.
+    ///
+    /// An attach in the fold reads day d's sections on the first fold after
+    /// the declaration; a count over re-encoded parts instead of carried ones
+    /// reports 0 on both.
+    #[tokio::test]
+    async fn a_sealed_day_missing_a_declared_fields_leaf_is_carried_unchanged_and_counted() {
+        use crate::tenant_config::DeclaredColumnType;
+        let store = OpLogStore::empty();
+        let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        let (day_d, sealed) = sealed_day_missing_session(&store, &catalog).await;
+        let day_d: Vec<&CommitRecord> = day_d.iter().collect();
+        assert_eq!(leaf_fields(&sealed), vec![USER_ID]);
+
+        declare_key_index_columns(
+            store.as_ref(),
+            &[
+                (USER_ID, DeclaredColumnType::I64),
+                (SESSION, DeclaredColumnType::I64),
+            ],
+            2,
+        )
+        .await;
+        let fields = [(USER_ID, KeyType::I64), (SESSION, KeyType::I64)];
+        for (seq, hour) in [(4u64, DAY_D + 26), (5, DAY_D + 27)] {
+            publish_keyed_logs(store.as_ref(), seq, hour, &[seq as i64 * 10], 2, 0, &fields).await;
+            store.clear();
+            let (report, warnings) = fold_capturing_warnings(&catalog, Signal::Logs, hour).await;
+            let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+            assert_eq!(
+                head.parts[0].encode_to_vec(),
+                sealed.encode_to_vec(),
+                "{hour}: day d's ref is carried byte for byte"
+            );
+            assert_eq!(
+                (
+                    store.section_gets_of(&day_d),
+                    store.leaf_gets_for_part_watermark(DAY_D + 22),
+                    store.leaf_puts_for_part_watermark(DAY_D + 22),
+                ),
+                (0, 0, 0),
+                "{hour}: no section GET, leaf GET or leaf PUT for day d"
+            );
+            assert_eq!(
+                report.key_index_parts_missing_declared_leaves, 1,
+                "{hour}: {report:?}"
+            );
+            let warning = missing_leaves_warning(&warnings);
+            assert!(
+                warning.contains(&format!("tenant={}", tenant().to_hex()))
+                    && warning.contains("signal=Logs")
+                    && warning.contains("parts=1")
+                    && warning.contains("{\"session\"}")
+                    && warning.contains("--rebuild-key-index"),
+                "{hour}: {warning}"
+            );
+        }
+
+        catalog
+            .rebuild_key_index(
+                &tenant(),
+                Signal::Logs,
+                &crate::KeyIndexRebuildOptions {
+                    field: Some(SESSION.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("repair");
+        let repaired = read_signal_head(store.as_ref(), Signal::Logs).await.parts[0].clone();
+        assert_eq!(
+            (&repaired.key, &repaired.blake3),
+            (&sealed.key, &sealed.blake3)
+        );
+        assert_eq!(leaf_fields(&repaired), vec![SESSION, USER_ID]);
+
+        publish_keyed_logs(store.as_ref(), 6, DAY_D + 28, &[60], 2, 0, &fields).await;
+        store.clear();
+        let (report, warnings) = fold_capturing_warnings(&catalog, Signal::Logs, DAY_D + 28).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(head.parts[0], repaired);
+        assert_eq!(
+            (
+                store.section_gets_of(&day_d),
+                store.leaf_gets_for_part_watermark(DAY_D + 22),
+                store.leaf_puts_for_part_watermark(DAY_D + 22),
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            report.key_index_parts_missing_declared_leaves, 0,
+            "{report:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|line| line.contains(MISSING_LEAVES_WARNING)),
+            "{warnings:?}"
+        );
+    }
+
+    /// ADR-3694 decision 2 under the day seal: a metrics day sealed while an
+    /// erasure request is pending is published with no `label_value` leaf.
+    /// Once the request is gone, every fold carries the day by reference
+    /// with no leaf GET or PUT for it, counts it in
+    /// `key_index_parts_missing_declared_leaves` and warns naming
+    /// `label_value`; the sealing fold re-encoded it, so counts 0. The
+    /// metrics repair attaches the day's leaf and the next fold counts 0.
+    ///
+    /// A count over parts sealed by the entry cap alone misses the day part.
+    #[tokio::test]
+    async fn a_metrics_day_sealed_under_the_erasure_gate_is_counted_until_repaired() {
+        let store = OpLogStore::empty();
+        let catalog = Catalog::new(store.clone(), metrics_kidx_config()).expect("catalog");
+        put_metrics_erasure_request(store.as_ref()).await;
+        for (seq, hour, region) in [
+            (1u64, DAY_D + 20, "east"),
+            (2, DAY_D + 22, "east"),
+            (3, DAY_D + 25, "west"),
+        ] {
+            publish_labeled_metrics(
+                store.as_ref(),
+                seq,
+                hour,
+                &region_series(region),
+                1000,
+                false,
+            )
+            .await;
+        }
+        let sealing = fold_through(&catalog, Signal::Metrics, DAY_D + 25).await;
+        assert_eq!(
+            sealing.metrics_label_index_parts_erasure_gated, 2,
+            "{sealing:?}"
+        );
+        assert_eq!(
+            sealing.key_index_parts_missing_declared_leaves, 0,
+            "the sealing fold re-encodes day d: {sealing:?}"
+        );
+        let sealed = read_signal_head(store.as_ref(), Signal::Metrics)
+            .await
+            .parts[0]
+            .clone();
+        assert_eq!(
+            (sealed.min_hour, sealed.watermark_hour),
+            (DAY_D + 20, DAY_D + 22)
+        );
+        assert!(sealed.key_index.is_empty(), "{sealed:?}");
+
+        let request_key =
+            keys::erasure_request_key(&tenant(), Signal::Metrics, Uuid::from_u128(0xe7a5e))
+                .expect("request key");
+        store.delete(&request_key).await.expect("drop the request");
+        for (seq, hour) in [(4u64, DAY_D + 26), (5, DAY_D + 27)] {
+            publish_labeled_metrics(
+                store.as_ref(),
+                seq,
+                hour,
+                &region_series("west"),
+                1000,
+                false,
+            )
+            .await;
+            store.clear();
+            let (report, warnings) = fold_capturing_warnings(&catalog, Signal::Metrics, hour).await;
+            let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+            assert_eq!(head.parts[0], sealed, "{hour}: day d is carried unchanged");
+            assert_eq!(
+                report.metrics_label_index_parts_erasure_gated, 0,
+                "{hour}: {report:?}"
+            );
+            assert_eq!(
+                report.key_index_parts_missing_declared_leaves, 1,
+                "{hour}: {report:?}"
+            );
+            assert_eq!(
+                (
+                    store.leaf_gets_for_part_watermark(DAY_D + 22),
+                    store.leaf_puts_for_part_watermark(DAY_D + 22),
+                ),
+                (0, 0),
+                "{hour}: no leaf GET or PUT for day d"
+            );
+            let warning = missing_leaves_warning(&warnings);
+            assert!(
+                warning.contains("signal=Metrics")
+                    && warning.contains(&format!("{{\"{METRICS_LABEL_VALUE_FIELD}\"}}")),
+                "{hour}: {warning}"
+            );
+        }
+
+        catalog
+            .rebuild_key_index(&tenant(), Signal::Metrics, &Default::default())
+            .await
+            .expect("repair");
+        let repaired = read_signal_head(store.as_ref(), Signal::Metrics)
+            .await
+            .parts[0]
+            .clone();
+        assert_eq!(
+            (&repaired.key, &repaired.blake3),
+            (&sealed.key, &sealed.blake3)
+        );
+        assert_eq!(leaf_fields(&repaired), vec![METRICS_LABEL_VALUE_FIELD]);
+
+        publish_labeled_metrics(
+            store.as_ref(),
+            6,
+            DAY_D + 28,
+            &region_series("west"),
+            1000,
+            false,
+        )
+        .await;
+        store.clear();
+        let report = fold_through(&catalog, Signal::Metrics, DAY_D + 28).await;
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts[0], repaired);
+        assert_eq!(
+            report.key_index_parts_missing_declared_leaves, 0,
+            "{report:?}"
+        );
+        assert_eq!(
+            (
+                store.leaf_gets_for_part_watermark(DAY_D + 22),
+                store.leaf_puts_for_part_watermark(DAY_D + 22),
+            ),
+            (0, 0)
+        );
+    }
+
+    /// `key_index_parts_missing_declared_leaves` is 0 with the leaf switch
+    /// off. Under an entry threshold of 1, a switch-on fold seals day d's
+    /// one indexed entry with a `user_id` leaf and leaves day d + 1's
+    /// unindexed entry with none; the next fold re-partitions identically
+    /// under either switch and carries both parts by reference. Switch on,
+    /// it counts the leafless part; switch off, it counts 0 and reports
+    /// `key_index_switch_off_over_leaves`.
+    ///
+    /// A count that reads the declared fields whatever the switch reports 1
+    /// for the switch-off fold.
+    #[tokio::test]
+    async fn the_missing_leaves_count_is_zero_with_the_switch_off() {
+        let fold_pair = |second_on: bool| async move {
+            let store = Arc::new(MemoryStore::new());
+            declare_user_id_key_index(store.as_ref()).await;
+            publish_user_id_logs(store.as_ref(), 1, DAY_D + 20, &[10], 2, 0, true).await;
+            publish_user_id_logs(store.as_ref(), 2, DAY_D + 25, &[20], 2, 0, false).await;
+            let catalog_with = |build_key_index_leaves: bool| {
+                Catalog::new(
+                    store.clone(),
+                    CatalogConfig {
+                        build_key_index_leaves,
+                        snapshot_part_max_entries: 1,
+                        ..config(1)
+                    },
+                )
+                .expect("catalog")
+            };
+            fold_through(&catalog_with(true), Signal::Logs, DAY_D + 25).await;
+            let first = read_signal_head(store.as_ref(), Signal::Logs).await;
+            assert_eq!(
+                first
+                    .parts
+                    .iter()
+                    .map(|p| p.key_index.len())
+                    .collect::<Vec<_>>(),
+                vec![1, 0]
+            );
+            publish_user_id_logs(store.as_ref(), 3, DAY_D + 26, &[30], 2, 0, false).await;
+            let report = fold_through(&catalog_with(second_on), Signal::Logs, DAY_D + 26).await;
+            let second = read_signal_head(store.as_ref(), Signal::Logs).await;
+            assert_eq!(report.parts_reused, 2, "{second_on}: {report:?}");
+            assert_eq!(second.parts[..2], first.parts[..], "{second_on}");
+            report
+        };
+
+        let on = fold_pair(true).await;
+        assert_eq!(on.key_index_parts_missing_declared_leaves, 1, "{on:?}");
+        assert!(!on.key_index_switch_off_over_leaves, "{on:?}");
+
+        let off = fold_pair(false).await;
+        assert_eq!(off.key_index_parts_missing_declared_leaves, 0, "{off:?}");
+        assert!(off.key_index_switch_off_over_leaves, "{off:?}");
+    }
+
+    /// `key_index_switch_off_over_leaves` reads every part of the HEAD: here
+    /// only sealed day d carries a leaf ref, since day d + 1's entry indexes
+    /// no field, and a switch-off fold still reports it. A check of the
+    /// tail part alone reports `false`.
+    #[tokio::test]
+    async fn key_index_switch_off_over_leaves_reads_a_non_tail_part() {
+        let store = Arc::new(MemoryStore::new());
+        declare_user_id_key_index(store.as_ref()).await;
+        publish_user_id_logs(store.as_ref(), 1, DAY_D + 20, &[10], 2, 0, true).await;
+        publish_user_id_logs(store.as_ref(), 2, DAY_D + 25, &[20], 2, 0, false).await;
+        let on = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        fold_through(&on, Signal::Logs, DAY_D + 25).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            head.parts
+                .iter()
+                .map(|p| p.key_index.len())
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        publish_user_id_logs(store.as_ref(), 3, DAY_D + 26, &[30], 2, 0, false).await;
+        let off = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                build_key_index_leaves: false,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        let report = fold_through(&off, Signal::Logs, DAY_D + 26).await;
+        assert!(report.key_index_switch_off_over_leaves, "{report:?}");
     }
 
     /// A new entry whose section names a field the tenant does not declare,
