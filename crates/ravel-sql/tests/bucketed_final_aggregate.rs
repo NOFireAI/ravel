@@ -178,6 +178,7 @@ fn sql_config(
         ..SqlConfig::default()
     };
     config.engine.sql_partition_count = Some(partitions);
+    config.first_attempt_min_partitions = 0;
     config
 }
 

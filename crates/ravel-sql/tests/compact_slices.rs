@@ -134,6 +134,7 @@ const SPILL_DISABLED: &str = "DiskManager is disabled";
 fn config(max_query_bytes: usize) -> SqlConfig {
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(PARTITIONS);
+    config.first_attempt_min_partitions = 0;
     config.max_query_bytes = max_query_bytes;
     config
 }

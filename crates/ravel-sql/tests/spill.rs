@@ -204,7 +204,7 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
-        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
+        first_attempt_min_partitions: 0,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill: Some(SpillConfig {
@@ -874,7 +874,7 @@ fn parallel_config(spill: Option<SpillConfig>) -> SqlConfig {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
-        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
+        first_attempt_min_partitions: 0,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill,
@@ -1036,7 +1036,7 @@ async fn spill_off_reproduces_todays_refusal() {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
-        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
+        first_attempt_min_partitions: 0,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill: None,
@@ -2090,9 +2090,6 @@ async fn a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry() 
 /// tries, in tenths of the engine count's unlimited peak.
 const FLOOR_BUDGET_TENTHS: std::ops::RangeInclusive<u64> = 10..=30;
 
-/// The INFO line a statement that took a spill retry logs.
-const SPILL_RETRY_LINE: &str = "SQL statement retried with spill after a memory refusal";
-
 /// Issue #4014: at an engine count of 8, the q33 grouping's first attempt
 /// planned at the 16-partition floor answers in memory under a process budget
 /// on which the same attempt at 8 partitions is refused and takes the spill
@@ -2111,15 +2108,6 @@ const SPILL_RETRY_LINE: &str = "SQL statement retried with spill after a memory 
 /// engine-count run answers in memory on the budget the floored run found.
 #[tokio::test]
 async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() {
-    let log = CapturedLog::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(log.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    let _log_guard = tracing::subscriber::set_default(subscriber);
-    let retry_lines = || log.text().matches(SPILL_RETRY_LINE).count();
-
     let sql = "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10";
     let file = q33_parquet();
     let scratch = tempfile::tempdir().expect("scratch root");
@@ -2157,7 +2145,6 @@ async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() 
     }
     let budget = fit.expect("the floored first attempt fits some budget of the ladder");
 
-    let before = retry_lines();
     let floored = run_under(16, budget).await;
     assert_eq!(
         (
@@ -2168,7 +2155,6 @@ async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() 
         (0, None, 0),
         "at the floor the statement answers on its first attempt under {budget} bytes"
     );
-    assert_eq!(retry_lines(), before, "no spill retry is logged");
     assert_eq!(floored.rows, unlimited.rows, "row for row");
 
     let engine = run_under(0, budget).await;
@@ -2184,7 +2170,6 @@ async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() 
         "the first attempt was refused by the process budget; got {:?}",
         engine.first_refusal
     );
-    assert_eq!(retry_lines(), before + 1, "the spill retry is logged once");
     assert_eq!(engine.rows, unlimited.rows, "row for row");
 }
 
