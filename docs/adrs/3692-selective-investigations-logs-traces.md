@@ -1528,15 +1528,21 @@ A ceiling meant to bound cost was inverting it.
   admits more. Parts past the cap fall to tier 1, as today. A single-key lookup touches one
   slice per part, so its charge is 2 and its behaviour is unchanged.
 - A part is admitted only when its worst case, `sum over touched slices of
-  (1 + min(k_s, 2^bits, B_run))`, is at most `2 x entry_count`, the tier-1
-  probe's cost for the part's own segments (ADR-2707 decision 5: two ranged
-  GETs per object; three as measured on spans, two being the conservative
-  value). A part over that is left to tier 1 by the existing uncovered
-  arm, never scanned. For a logs day part at 100 keys this is 126 against
-  1,104. The charge uses each slice's own key count `k_s`, so a set of
+  (1 + min(k_s, 2^bits, B_run))`, is at most 2 x the part's segments in
+  the routed snapshot, the tier-1 probe's cost for those segments (ADR-2707
+  decision 5: two ranged GETs per object; three as measured on spans, two
+  being the conservative value). The routed snapshot is already narrowed
+  to the statement's time window, so this is the part's segments in that
+  window, not its `entry_count`: a one-hour window over a logs day part
+  holds about 23 of its 552 segments, a tier-1 cost of about 46. A part
+  over that is left to tier 1 with 0 leaf GETs, never scanned, and counted
+  in `parts_over_tier_one` (stats `partsOverTierOne`, outcome
+  `over_tier_one`), not in `parts_uncovered`. For a logs day part wholly
+  in the window at 100 keys this is 126 against 1,104. The charge uses each slice's own key count `k_s`, so a set of
   `k` keys costs at most `S + k` over a part's `S` touched slices: at
   k = 1,024 (`KEY_SET_MAX_KEYS`) a logs day part costs at most 26 + 1,024
-  = 1,050 against 1,104 and is admitted at tier 2. Reaching 65 GETs in
+  = 1,050 against 1,104 and is admitted at tier 2 when the whole day is
+  in the window. Reaching 65 GETs in
   every one of 26 slices would take at least 1,664 keys.
 - `P_max`, `B_run`, `T1_BYTES` and the admission order (descending
   `entry_count`, ties by descending `watermark_hour`) are unchanged. The
@@ -1567,7 +1573,7 @@ decoded frame (`decoded_bound`) is unchanged; with 16 parts in flight and
 |---|---|---|---|
 | 19 key-set ceiling: a 100-key logs request_id list over 30 day parts | 30 of 30 parts covered, `parts_beyond_ceiling` 0, leaf GETs at most 3,780, 0 tier-1 probes on covered parts | any part beyond the ceiling | predicted; services/ravel-server/tests/sql_key_in.rs |
 | 21 the cap at the largest set: a 1,024-key logs request_id list over 64 day parts | at least 63 parts covered at tier 2, covered plus `parts_beyond_ceiling` equal to 64, rows exact | fewer than 63 covered, or any wrong row | predicted; the admission loop in key_index_route.rs `route_parts` |
-| 20 per-part tier-1 test: a part whose worst case exceeds `2 x entry_count` | left uncovered after 0 leaf GETs, counted in `parts_uncovered` or a new `parts_over_tier_one` figure, rows exact | the part probed at tier 2 | predicted; the admission loop in key_index_route.rs `route_parts` |
+| 20 per-part tier-1 test: a part whose worst case exceeds 2 x its segments in the routed snapshot | left to tier 1 after 0 leaf GETs, counted in `parts_over_tier_one` and not in `parts_uncovered`, rows exact | the part probed at tier 2 | predicted; the admission loop in key_index_route.rs `route_parts` |
 | 11 (restated) single-key ceiling | a 1-key lookup over 1,025 parts admits 1,024 and leaves 1 beyond the ceiling, as before | any change | predicted; key_index_route.rs `ADR_CEILING` |
 
 Tests the implementing task names, each with the mutant it fails on:
