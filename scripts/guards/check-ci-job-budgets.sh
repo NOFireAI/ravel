@@ -18,6 +18,11 @@
 #           5 minutes: a job of a few seconds moves by 25 percent on runner
 #           noise alone.
 #
+# Neither rule judges a job with fewer than 3 rows in the current window, and
+# the growth rule also needs 3 in the older one. Jobs gated by the changes job
+# can appear in one or two runs, and one slow run is not a trend. Such a row
+# is printed with "not judged (n<3)".
+#
 # A job in the API response that cannot be mapped back to a ci.yml job key is
 # printed as `cap=unmapped ratio=n/a`, never dropped (it still takes part in
 # the growth rule, which needs no cap).
@@ -47,6 +52,7 @@ DEFAULT_RUNS=30
 CAP_RATIO_THRESHOLD="0.7"
 GROWTH_RATIO_THRESHOLD="1.25"
 GROWTH_MIN_MINUTES=5
+MIN_SAMPLES=3
 OLD_WINDOW_DAYS=14
 GITHUB_DEFAULT_TIMEOUT_MINUTES=360
 
@@ -379,7 +385,7 @@ fetch_run_ids() {
 fetch_jobs_for_run() {
   local run_id="$1" out rc
   out="$(gh_api_retry "repos/${repo}/actions/runs/${run_id}/jobs?per_page=100" \
-    --jq '.jobs[] | "\(.name)\t\(.conclusion)\t\(.started_at)\t\(.completed_at)"')"
+    --jq '.jobs[] | "\(.name)\t\(.conclusion)\t\(.started_at // "")\t\(.completed_at // "")"')"
   rc=$?
   if ((rc != 0)); then
     echo "check-ci-job-budgets.sh: gh api jobs for run ${run_id} failed: $(printf '%s' "${out}" | tail -n1)" >&2
@@ -427,7 +433,7 @@ build_pool() {
           *) continue ;;
         esac
         # A cancelled job that never started has no runtime to measure.
-        if ((killed == 1)) && [[ -z "${jstarted}" || "${jstarted}" == "0001-01-01T00:00:00Z" ]]; then
+        if ((killed == 1)) && [[ -z "${jstarted}" || "${jstarted}" == "null" || "${jstarted}" == "0001-01-01T00:00:00Z" ]]; then
           continue
         fi
         dur="$(duration_minutes "${jstarted}" "${jcompleted}")"
@@ -496,21 +502,28 @@ while IFS=$'\t' read -r key p50 p90 count; do
     cap="$(cap_for_key "${key}")"
     cap_display="${cap}"
     ratio_display="$(awk -v p="${p90}" -v c="${cap}" 'BEGIN{printf "%.4f", p/c}')"
-    cap_finding="$(awk -v r="${ratio_display}" -v t="${CAP_RATIO_THRESHOLD}" 'BEGIN{print (r>t)?1:0}')"
+    if ((count >= MIN_SAMPLES)); then
+      cap_finding="$(awk -v r="${ratio_display}" -v t="${CAP_RATIO_THRESHOLD}" 'BEGIN{print (r>t)?1:0}')"
+    fi
   fi
 
   growth_display="n/a"
   growth_finding=0
   older_p90="$(awk -F'\t' -v k="${key}" '$1==k{print $3; exit}' "${older_stats}")"
+  older_count="$(awk -F'\t' -v k="${key}" '$1==k{print $4; exit}' "${older_stats}")"
   if [[ -n "${older_p90}" ]]; then
     growth_display="$(awk -v cp="${p90}" -v op="${older_p90}" 'BEGIN{ if (op+0==0) {print "n/a"} else {printf "%.4f", cp/op} }')"
-    if [[ "${growth_display}" != "n/a" ]]; then
+    if [[ "${growth_display}" != "n/a" ]] && ((count >= MIN_SAMPLES && ${older_count:-0} >= MIN_SAMPLES)); then
       growth_finding="$(awk -v r="${growth_display}" -v t="${GROWTH_RATIO_THRESHOLD}" -v cp="${p90}" -v m="${GROWTH_MIN_MINUTES}" 'BEGIN{print (r>=t && cp>=m)?1:0}')"
     fi
   fi
 
-  printf '%s\tp50=%sm\tp90=%sm\tcap=%s\tratio=%s\tgrowth=%s\tn=%s\n' \
-    "${key}" "${p50}" "${p90}" "${cap_display}" "${ratio_display}" "${growth_display}" "${count}"
+  judged=""
+  if ((count < MIN_SAMPLES)); then
+    judged=$'\t'"not judged (n<${MIN_SAMPLES})"
+  fi
+  printf '%s\tp50=%sm\tp90=%sm\tcap=%s\tratio=%s\tgrowth=%s\tn=%s%s\n' \
+    "${key}" "${p50}" "${p90}" "${cap_display}" "${ratio_display}" "${growth_display}" "${count}" "${judged}"
 
   if [[ "${cap_finding}" == "1" ]]; then
     echo "check-ci-job-budgets.sh: FINDING cap job=${key} p90=${p90}m cap=${cap_display}m ratio=${ratio_display} (threshold ${CAP_RATIO_THRESHOLD})"
