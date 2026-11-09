@@ -198,6 +198,8 @@ mod sql_postings_pruning;
 mod statement_complexity;
 #[path = "stddev_var_family_rejected.rs"]
 mod stddev_var_family_rejected;
+#[path = "top_keys.rs"]
+mod top_keys;
 #[path = "topk_threshold_skip_order.rs"]
 mod topk_threshold_skip_order;
 #[path = "validate_grouped_minmax_and_stddev.rs"]
