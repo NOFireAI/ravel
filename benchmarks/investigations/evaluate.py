@@ -77,11 +77,14 @@ KEY_INDEX_METRICS = {
     "reservations_refused": "reservationsRefused",
     "keys_probed": "keysProbed",
 }
-# Row 18: a lookup cell whose covering part went to one of these router
-# outcomes was answered by tier 1, so its time is not the leaves'.
+# Rows 11 and 18: a part in one of these router outcomes was left to tier 1,
+# so a lookup cell's time is not the leaves'.
 NOT_MEASURED = "not-measured"
 UNCOVERED_OUTCOMES = ("partsUncovered", "skippedByBudget", "partsBeyondCeiling", "leavesRejected",
-                      "reservationsRefused")
+                      "reservationsRefused", "partsOverTierOne")
+# Outcomes a build may omit: a build that predates partsOverTierOne left no
+# part to tier 1 by cost, so its absence reads as 0, not as unsupported.
+OPTIONAL_OUTCOMES = ("partsOverTierOne",)
 ALLOWLIST_BREAKDOWNS = {"per_object": "stats carry no per-object breakdown",
                         "per_part": "stats carry no per-part breakdown"}
 # A figure no build can supply because its inputs exist in no report: it
@@ -609,15 +612,16 @@ def control_1025(calls, cfg, statement, state, temp):
     with a scan and no route: keysProbed 0, partsCovered 0, 0 leaf GETs.
 
     1 when every 1,000-key call probed exactly 1,000 keys and routed its
-    parts (partsCovered nonzero, or a part in an Uncovered outcome such as
-    skippedByBudget, as box C's lists went: the key set was carried even
-    though the leaves did not answer), and every 1,025-key call was served
+    parts (partsCovered nonzero, or a part left to tier 1, in an Uncovered
+    outcome such as skippedByBudget, as box C's lists went, or by cost in
+    partsOverTierOne: the key set was carried even though the leaves did not
+    answer), and every 1,025-key call was served
     by a visible scan (probe or scan GETs, or blocks scanned) with no
     keyIndex figure above zero. 0 when a 1,025-key call carries a nonzero
     keyIndex figure, or was served with neither a keyIndex figure nor a
     scan, or was refused while the 1,000-key list was admitted, or a
     1,000-key call probed another count or reported partsCovered 0 with no
-    Uncovered outcome. The 1,025-key arm is judged first; only a 1,000-key
+    part left to tier 1. The 1,025-key arm is judged first; only a 1,000-key
     list that was itself refused, or that carries no tier-2 figures, makes
     the figure refused-by-guard or unsupported."""
     over = statement.replace("_1000", "_1025")
@@ -667,24 +671,25 @@ def control_1025(calls, cfg, statement, state, temp):
             return "value", 0, f"{where(c)} probed {ki['keysProbed']} keys, not 1000"
         if not ki["partsCovered"] and not any(ki.get(f) for f in UNCOVERED_OUTCOMES):
             return "value", 0, (f"{where(c)} probed 1000 keys with partsCovered {ki['partsCovered']} "
-                                f"and no part in an Uncovered outcome")
+                                f"and no part left to tier 1")
     return "value", 1, ""
 
 
 def leaf_uncovered(c):
     """None when an ok call's leaves answered every covering part: partsCovered
     at least 1 and no part in any other outcome. Else (status, None, reason):
-    NOT_MEASURED naming the outcome when a part went Uncovered (a part with no
-    leaf for the field, skipped by budget, beyond the ceiling, rejected, or
-    refused its reservation), since its time is the tier-1 probe's, or
-    unsupported when the build reports none of it."""
+    NOT_MEASURED naming the outcome when a part was left to tier 1 (a part
+    with no leaf for the field, skipped by budget, beyond the ceiling,
+    rejected, refused its reservation, or over tier one by cost), since its
+    time is the tier-1 probe's, or unsupported when the build reports none
+    of it. A field in OPTIONAL_OUTCOMES may be absent and reads as 0."""
     ki = c["stats"].get("keyIndex")
-    fields = ("partsCovered",) + UNCOVERED_OUTCOMES
+    fields = ("partsCovered",) + tuple(f for f in UNCOVERED_OUTCOMES if f not in OPTIONAL_OUTCOMES)
     if not isinstance(ki, dict) or any(f not in ki for f in fields):
         return UNSUPPORTED, None, f"{where(c)} carries no keyIndex.{'/'.join(fields)} on this build"
-    went = [f"{f} {ki[f]}" for f in UNCOVERED_OUTCOMES if ki[f]]
+    went = [f"{f} {ki[f]}" for f in UNCOVERED_OUTCOMES if ki.get(f)]
     if went or not ki["partsCovered"]:
-        return NOT_MEASURED, None, (f"{where(c)}: a covering part went Uncovered "
+        return NOT_MEASURED, None, (f"{where(c)}: a covering part was left to tier 1 "
                                     f"({', '.join(went) or 'partsCovered 0'}), so its time is the tier-1 probe's")
     return None
 
@@ -1639,8 +1644,8 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     sent in a state that did, or a figure not-run for any reason other than
     its row or figure lacking a state, tenant, scale or baseline the run
     never asked for (a gated figure is either not_requested or listed
-    here), a figure not-measured (a row 18 cell whose covering part went
-    Uncovered), a figure not-computable or incomplete or judged against
+    here), a figure not-measured (a row 18 cell whose covering part was
+    left to tier 1), a figure not-computable or incomplete or judged against
     one, a row 18 figure with no value to judge (unsupported, refused or
     missing), or a needle band a partial inspection could not judge."""
     out = []
