@@ -3411,9 +3411,10 @@ class Evaluate(Workdir):
     def check_w2_requires_pre_r2_binary_stamp(self, evaluate_py=EVALUATE, bands=BANDS):
         """W2 is judged only on a fold binary that carries C1 and not R2. With no fold-binary stamp (this
         build: task H1b writes it) the binary figure is unsupported, naming the stamp, and every other W2
-        figure not-run with the amendment's reason; a binary carrying R2 misses and leaves the rest
-        not-run; a stamp with no sha is missing; C1 without R2 judges the fold, 31 previous-leaf GETs
-        passing."""
+        figure not-run with the amendment's reason; a binary carrying R2, or no C1, is not-run with its SHA,
+        never a miss, and every W2 figure is listed not requested and none incomplete, so the R2 build's
+        run holding retired_hour is free of a W2 miss; a stamp with no sha is missing; C1 without R2 judges
+        the fold, 31 previous-leaf GETs passing."""
         mod = load_module(evaluate_py, "evaluate_w2")
         live = {"retired_hour": None}
         report = {"key_index_leaf_gets": 31, "key_index_unchanged_section_gets": 0,
@@ -3423,8 +3424,10 @@ class Evaluate(Workdir):
         out = []
         for case, stamp, binary, rest in (
                 ("no stamp", None, (UNSUPPORTED, None, UNSUPPORTED), "not-run"),
-                ("C1 and R2", {"sha": "c1r2", "carries_c1": True, "carries_r2": True}, ("value", 0, "miss"),
-                 "not-run"),
+                ("C1 and R2", {"sha": "c1r2", "carries_c1": True, "carries_r2": True},
+                 ("not-run", None, "not-run"), "not-run"),
+                ("no C1", {"sha": "c0", "carries_c1": False, "carries_r2": False},
+                 ("not-run", None, "not-run"), "not-run"),
                 ("no sha", {"carries_c1": True, "carries_r2": False}, ("missing", None, "missing"), "not-run"),
                 ("C1 without R2", {"sha": "c1", "carries_c1": True, "carries_r2": False}, ("value", 1, "pass"),
                  "pass")):
@@ -3440,10 +3443,193 @@ class Evaluate(Workdir):
                     continue
                 if f["verdict"] != rest or (rest == "not-run" and "carries C1 and not R2" not in f["reason"]):
                     out.append(f"{case}: {i} {f['status']} {f['value']} {f['verdict']} {f['reason']}")
+            if binary[0] == "not-run":
+                sha = stamp["sha"]
+                misses = [i for i, f in figs.items() if f.get("verdict") == "miss"]
+                if misses:
+                    out.append(f"{case}: W2 misses {misses}")
+                for i, f in figs.items():
+                    if sha not in (f.get("not_requested") or "") or not f.get("gated"):
+                        out.append(f"{case}: {i} not listed not requested ({f.get('not_requested')})")
+                listed = mod.incomplete_reasons({"states": []}, {}, mod.Calls([], mod.Problems()), list(figs.values()))
+                if listed:
+                    out.append(f"{case}: incomplete {listed}")
         return out
 
     def test_w2_requires_pre_r2_binary_stamp(self):
         self.assertEqual(self.check_w2_requires_pre_r2_binary_stamp(), [])
+
+    def check_w5_a7_per_part_and_thirty_parts(self, evaluate_py=EVALUATE, bands=BANDS):
+        """W5 and A7 each hold the largest per-part leaf GET count to T(S) + 100 besides the total: at
+        S 26 a 127-GET part misses in both rows while the 3,000-GET total holds, a stats line with no
+        per-part breakdown is unsupported naming it, and A7's total is 30 x (T(S) + 100), not-run on a
+        state holding 29 parts rather than judged against 29 x the bound."""
+        mod = load_module(evaluate_py, "evaluate_w5_a7_parts")
+        live = {"day_parts_30": None}
+        out = []
+        if mod.ALLOWLIST_BREAKDOWNS.get("per_part") != "stats carry no per-part breakdown":
+            out.append(f"per_part breakdown reason {mod.ALLOWLIST_BREAKDOWNS.get('per_part')}")
+        for case, parts, per_part, want in (("127 in one part", 30, 127, "miss"), ("126 per part", 30, 126, "pass"),
+                                            ("no breakdown", 30, None, UNSUPPORTED)):
+            docs = {("day_parts_30", "logs", "catalog"): self.day_part_catalog(parts, 26)}
+            values = {("logs_request_in_100_30d", m): v for m, v in (
+                ("cold.max.leaf_gets", 3000), ("cold.min.parts_covered", 30), ("cold.max.parts_uncovered", 0),
+                ("cold.max.probe_gets", 0), ("cold.max.parts_beyond_ceiling", 0), ("cold.rows_exact", 1))}
+            if per_part is not None:
+                values[("logs_request_in_100_30d", "cold.max.per_part.leaf_gets")] = per_part
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_a7", "adr3939_w5"), live, docs, values)
+            for key in ("adr3939_a7", "adr3939_w5"):
+                f = figs.get(f"{key}.leaf_gets_per_part")
+                if f is None:
+                    out.append(f"{case}: {key} has no per-part figure")
+                    continue
+                if f["verdict"] != want:
+                    out.append(f"{case}: {key}.leaf_gets_per_part {f['value']} {f['verdict']}, want {want}")
+                if f["metric"] != "cold.max.per_part.leaf_gets":
+                    out.append(f"{case}: {key}.leaf_gets_per_part reads {f['metric']}")
+                total = figs[f"{key}.leaf_gets"]
+                if total["verdict"] != "pass":
+                    out.append(f"{case}: {key}.leaf_gets {total['value']} {total['verdict']}")
+        for parts, gets, want in ((30, 3780, "pass"), (30, 3781, "miss"), (29, 3000, "not-run")):
+            docs = {("day_parts_30", "logs", "catalog"): self.day_part_catalog(parts, 26)}
+            values = {("logs_request_in_100_30d", "cold.max.leaf_gets"): gets}
+            a7 = self.adr3939_rows_now(mod, bands, ("adr3939_a7",), live, docs, values)["adr3939_a7.leaf_gets"]
+            if a7["verdict"] != want or (want == "not-run" and "adr3939_a7.parts_held 29" not in a7["reason"]):
+                out.append(f"{parts} parts, {gets} GETs: A7 leaf_gets {a7['verdict']} {a7['reason']}, want {want}")
+        return out
+
+    def test_w5_a7_per_part_and_thirty_parts(self):
+        self.assertEqual(self.check_w5_a7_per_part_and_thirty_parts(), [])
+
+    @staticmethod
+    def retired_hour_folds(retired, refold_retired, digests=("d1", "d1")):
+        report = {"key_index_part_puts": 0, "key_index_leaves_written": 0, "retired_hours": retired,
+                  "head_digest": digests[0]}
+        refold = {"retired_hours": refold_retired, "head_digest": digests[1]}
+        return {("retired_hour", "inv", "logs"): {"report": report},
+                ("retired_hour_drop", "inv", "logs"): {"report": {"key_index_part_puts": 0,
+                                                                  "key_index_leaves_written": 0}},
+                ("retired_hour_refold", "inv", "logs"): {"report": refold}}
+
+    @staticmethod
+    def drop_catalog(*ranges, declared=None):
+        return {"head": {"watermark_hour": 500}, "parts_declared": len(ranges) if declared is None else declared,
+                "parts": [{"range": r, "leaves": []} for r in ranges]}
+
+    def check_w3_drop_leaves_head(self, evaluate_py=EVALUATE, bands=BANDS):
+        """W3's drop fold with 0 part and 0 leaf PUTs passes only when the catalog stamp after it holds no
+        part whose hour range holds the tombstoned hour: a part 96..=119 still holding hour 100 misses,
+        parts 72..=95 and 120..=143 pass, an absent drop stamp is unsupported naming it, and a stamp with no
+        HEAD or a part count that disagrees with its parts is missing."""
+        mod = load_module(evaluate_py, "evaluate_w3_drop")
+        live = {"retired_hour": None}
+        name = "stamps/retired_hour_drop.logs.catalog.json"
+        out = []
+        for case, head, want in (
+                ("part still in HEAD", self.drop_catalog("72..=95", "96..=119", "120..=143"), ("value", 1, "miss")),
+                ("part gone", self.drop_catalog("72..=95", "120..=143"), ("value", 0, "pass")),
+                ("no drop stamp", None, (UNSUPPORTED, None, UNSUPPORTED)),
+                ("no HEAD", {"head": None, "parts": []}, ("missing", None, "missing")),
+                ("parts disagree", self.drop_catalog("72..=95", declared=2), ("missing", None, "missing"))):
+            docs = {("retired_hour", "logs", "tombstone"): {"hour": 100}}
+            if head is not None:
+                docs[("retired_hour_drop", "logs", "catalog")] = head
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w3",), live, docs, {}, self.retired_hour_folds([100], [100]))
+            f = figs.get("adr3939_w3.drop_parts_holding_hour")
+            if f is None:
+                verdicts = {i: g["verdict"] for i, g in figs.items() if i.startswith("adr3939_w3.drop_")}
+                out.append(f"{case}: W3 has no drop-part figure; its drop figures {verdicts}")
+                continue
+            if (f["status"], f["value"], f["verdict"]) != want:
+                out.append(f"{case}: {f['status']} {f['value']} {f['verdict']} {f['reason']}, want {want}")
+            if head is None and name not in f["reason"]:
+                out.append(f"{case}: reason {f['reason']}")
+        return out
+
+    def test_w3_drop_leaves_head(self):
+        self.assertEqual(self.check_w3_drop_leaves_head(), [])
+
+    def check_w8_retired_hours_are_the_tombstoned_hour(self, evaluate_py=EVALUATE, bands=BANDS):
+        """W8's two folds pass only when each reports retired_hours [h] for W3's tombstoned hour h: both []
+        (no tombstone observed) miss though identical, [h] and [h] pass; A4's and W8's HEAD digests must be
+        non-empty strings, so two empty digests miss though equal."""
+        mod = load_module(evaluate_py, "evaluate_w8")
+        live = {"retired_hour": None, "day_parts_7": None}
+        docs = {("retired_hour", "logs", "tombstone"): {"hour": 100}}
+        out = []
+        for case, retired, digests, want in (("both []", ([], []), ("d1", "d1"), ("miss", "pass")),
+                                             ("both [h]", ([100], [100]), ("d1", "d1"), ("pass", "pass")),
+                                             ("empty digests", ([100], [100]), ("", ""), ("pass", "miss"))):
+            folds = self.retired_hour_folds(*retired, digests)
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w3", "adr3939_w8"), live, docs, {}, folds)
+            for name in ("retired_hours", "refold_retired_hours"):
+                f = figs[f"adr3939_w8.{name}"]
+                if f["verdict"] != want[0]:
+                    out.append(f"{case}: W8 {name} {f['value']} {f['verdict']}, want {want[0]}")
+            for name in ("head_digest", "refold_head_digest"):
+                f = figs[f"adr3939_w8.{name}"]
+                if f["verdict"] != want[1]:
+                    out.append(f"{case}: W8 {name} {f['value']!r} {f['verdict']}, want {want[1]}")
+            if case == "empty digests":
+                a4_folds = {("day_parts_7", "inv", "logs"): {"report": {"head_digest": ""}},
+                            ("day_parts_7_refold", "inv", "logs"): {"report": {"head_digest": ""}}}
+                a4 = self.adr3939_rows_now(mod, bands, ("adr3939_a4",), live, {}, {}, a4_folds)
+                for name in ("head_digest", "refold_head_digest"):
+                    if a4[f"adr3939_a4.{name}"]["verdict"] != "miss":
+                        out.append(f"{case}: A4 {name} {a4[f'adr3939_a4.{name}']['verdict']}, want miss")
+        return out
+
+    def test_w8_retired_hours_are_the_tombstoned_hour(self):
+        self.assertEqual(self.check_w8_retired_hours_are_the_tombstoned_hour(), [])
+
+    def check_w7_reads_two_day_parts(self, evaluate_py=EVALUATE, bands=BANDS):
+        """W7's midnight call passes only when every try covered exactly 2 day parts and left none
+        uncovered: 4 leaf GETs over 1 covered part (a window inside one day) misses, as does a third part
+        or an uncovered one; 2 parts and 4 GETs pass."""
+        mod = load_module(evaluate_py, "evaluate_w7")
+        live = {"day_parts_7": None}
+        out = []
+        for case, lo, hi, uncovered, want in (("one part", 1, 1, 0, "miss"), ("two parts", 2, 2, 0, "pass"),
+                                              ("a third part", 2, 3, 0, "miss"), ("one uncovered", 2, 2, 1, "miss")):
+            values = {("logs_request_in_1_midnight", m): v for m, v in (
+                ("cold.max.leaf_gets", 4), ("cold.rows_exact", 1), ("cold.min.parts_covered", lo),
+                ("cold.max.parts_covered", hi), ("cold.max.parts_uncovered", uncovered))}
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w7",), live, {}, values)
+            verdicts = {i: f["verdict"] for i, f in figs.items()}
+            got = "miss" if "miss" in verdicts.values() else (
+                "pass" if set(verdicts.values()) == {"pass"} else str(verdicts))
+            if got != want:
+                out.append(f"{case}: W7 {verdicts}, want {want}")
+        return out
+
+    def test_w7_reads_two_day_parts(self):
+        self.assertEqual(self.check_w7_reads_two_day_parts(), [])
+
+    def check_row_18_timing_rows_leave_run_incomplete(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A timing figure judged as row 18's (A6's six p50 cells, W4's p50, F1 and F2) with an unsupported
+        value leaves the run incomplete, as row 18's does; W4's unsupported leaf GETs, a counter, do not."""
+        mod = load_module(evaluate_py, "evaluate_as_row_18")
+        live = {"day_parts_7": None, "day_parts_30": None}
+        keys = ("adr3939_a6", "adr3939_w4", "adr3939_f1", "adr3939_f2")
+        figs = self.adr3939_rows_now(mod, bands, keys, live, {("day_parts_7", "logs", "catalog"): {
+            "part_count": 7, "parts": []}}, {})
+        listed = "\n".join(mod.incomplete_reasons({"states": []}, {}, mod.Calls([], mod.Problems()),
+                                                  list(figs.values())))
+        out = []
+        p50s = [i for i in figs if i.endswith("p50_s") and "unfolded" not in i]
+        if len(p50s) != 9:
+            out.append(f"{len(p50s)} p50 figures: {p50s}")
+        for i in p50s:
+            if figs[i]["verdict"] != UNSUPPORTED:
+                out.append(f"{i} {figs[i]['verdict']}, want {UNSUPPORTED}")
+            if f"figure {i} {UNSUPPORTED}" not in listed:
+                out.append(f"{i} unsupported, not incomplete")
+        if "figure adr3939_w4.leaf_gets " in listed:
+            out.append("W4's leaf GETs listed incomplete")
+        return out
+
+    def test_row_18_timing_rows_leave_run_incomplete(self):
+        self.assertEqual(self.check_row_18_timing_rows_leave_run_incomplete(), [])
 
     def check_adr3939_rows_run_on_their_states(self, evaluate_py=EVALUATE, bands=BANDS):
         """Each ADR-3939 row needs its multi-day state (F3 each half its own), and every statement it
@@ -3866,8 +4052,8 @@ FLIPS = {
         "check_row_18_covered_nothing",
     ),
     "row 18's unsupported or missing cell left off the incomplete list": (
-        '        elif f["row"] == 18 and f.get("verdict") in (UNSUPPORTED, GUARD, "refused", "missing"):\n',
-        '        elif False:\n',
+        '        elif ((f["row"] == 18 or (',
+        '        elif ((False or (',
         "check_row_18_unsupported_is_incomplete",
     ),
     "row 18's p50 taken without the Uncovered check": (
@@ -4114,9 +4300,29 @@ FLIPS = {
         "check_w5_a7_targets_follow_stamped_slices",
     ),
     "W2's binary read off C1 alone, so an R2 binary passes": (
-        'int(doc["carries_c1"] and not doc["carries_r2"])',
-        'int(doc["carries_c1"])',
+        'if doc["carries_c1"] and not doc["carries_r2"]:\n',
+        'if doc["carries_c1"]:\n',
         "check_w2_requires_pre_r2_binary_stamp",
+    ),
+    "an R2 binary scored as a W2 miss": (
+        'return "not-run", None, (f"the retired_hour fold binary',
+        'return "value", 0, (f"the retired_hour fold binary',
+        "check_w2_requires_pre_r2_binary_stamp",
+    ),
+    "a stamp figure not-run for its build left incomplete, not unrequested": (
+        '                    entry["gated"] = True\n                    entry["not_requested"] = why\n',
+        '                    pass\n',
+        "check_w2_requires_pre_r2_binary_stamp",
+    ),
+    "W3's drop counted as leaving no part that holds the hour": (
+        "sum(1 for lo, hi in spans if lo <= hour <= hi)",
+        "0",
+        "check_w3_drop_leaves_head",
+    ),
+    "only row 18's own timing figures leave the run incomplete": (
+        'f["row"] in AS_ROW_18 and f["lane"] == "timing"',
+        'f["row"] in () and f["lane"] == "timing"',
+        "check_row_18_timing_rows_leave_run_incomplete",
     ),
 }
 
@@ -4296,6 +4502,41 @@ BAND_FLIPS = {
         "not_run_unless = \"m['adr3939_w2.fold_binary_pre_r2'] == 1\"\n",
         "metric = \"fold.inv.logs.key_index_leaf_gets\"\nlane = \"counter\"\n",
         "check_w2_requires_pre_r2_binary_stamp",
+    ),
+    "W5's per-part leaf GETs held to the 30-day total": (
+        "target_if = \"v <= m['adr3939_w5.per_day_bound']\"\n",
+        "target_if = \"v <= 30 * m['adr3939_w5.per_day_bound']\"\n",
+        "check_w5_a7_per_part_and_thirty_parts",
+    ),
+    "A7's total judged on a state holding other than 30 parts": (
+        "not_run_unless = \"m['adr3939_a7.slices'] >= 3 and m['adr3939_a7.parts_held'] == 30\"\n",
+        "not_run_unless = \"m['adr3939_a7.slices'] >= 3\"\n",
+        "check_w5_a7_per_part_and_thirty_parts",
+    ),
+    "W7's midnight call passing over a third day part": (
+        "metric = \"cold.max.parts_covered\"\nlane = \"counter\"\ntarget_if = \"v == 2\"\n",
+        "metric = \"cold.max.parts_covered\"\nlane = \"counter\"\ntarget_if = \"v >= 2\"\n",
+        "check_w7_reads_two_day_parts",
+    ),
+    "W8's refold passing with no hour retired": (
+        "transition = \"retired_hour_refold\"\nmetric = \"fold.inv.logs.retired_hours\"\nlane = \"counter\"\n"
+        "target_if = \"v == [m['adr3939_w3.tombstoned_hour']]\"\n",
+        "transition = \"retired_hour_refold\"\nmetric = \"fold.inv.logs.retired_hours\"\nlane = \"counter\"\n"
+        "target_if = \"v == v\"\n",
+        "check_w8_retired_hours_are_the_tombstoned_hour",
+    ),
+    "A4's refold digest passing whenever present": (
+        "transition = \"day_parts_7_refold\"\nmetric = \"fold.inv.logs.head_digest\"\nlane = \"counter\"\n"
+        "target_if = \"isinstance(v, str) and len(v) > 0\"\n",
+        "transition = \"day_parts_7_refold\"\nmetric = \"fold.inv.logs.head_digest\"\nlane = \"counter\"\n"
+        "target_if = \"v is not None\"\n",
+        "check_w8_retired_hours_are_the_tombstoned_hour",
+    ),
+    "W3's drop judged with HEAD still holding the hour": (
+        "metric = \"stamp.drop_parts_holding_hour.logs\"\nlane = \"counter\"\ntarget_if = \"v == 0\"\n"
+        "miss_if = \"v > 0\"\n",
+        "metric = \"stamp.drop_parts_holding_hour.logs\"\nlane = \"counter\"\ntarget_if = \"v >= 0\"\n",
+        "check_w3_drop_leaves_head",
     ),
     "a one-character drift in W4's target cell": (
         'target = "at most 882 leaf GETs, 7 of 7 days covered',
