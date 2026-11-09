@@ -1244,7 +1244,8 @@ name ARM)`. The switches:
 - Every switch needs `MB_STAGE1=1` (exit 64, case zf3).
 
 `METRICSBENCH_SLEEP` (default `sleep`) is the command that waits for an hour
-to pass or seal, and `METRICSBENCH_ERASURE_TRIES` and
+to pass or seal, the erasure's seal wait included (step 20), and
+`METRICSBENCH_ERASURE_TRIES` and
 `METRICSBENCH_ERASURE_INTERVAL` (default 120 tries 15 s apart) bound the wait
 for the erasure rewrite. Case za runs all four arms and pins the step order,
 every recreate's flags and image, the fold flags and the order of the store
@@ -1269,12 +1270,17 @@ own step, as the run records it; a request the run does not count says so.
    `stage1-control-compare.json` (schema
    `metricsbench-stage1-control-compare/1`, stamped as
    `stage1.control_compare`): per entry, over its answered records in each
-   pass, the median `latency_ms`, the median GETs and wire bytes summed over
-   phases and each phase's medians, and `latency_ratio` (unrouted over
-   control); `statements_more_gets` and `statements_more_bytes` (entries
-   whose unrouted median exceeds the control's), `statements_unchecked`
-   (no readable record in either pass, or a control median of 0 ms), each
-   with its count, and `latency_ratio_median` (case zb).
+   pass, the median `latency_ms` and `latency_ms_spread` (the largest minus
+   the smallest), the median GETs and wire bytes summed over phases and each
+   phase's medians, and `latency_ratio` (unrouted over control);
+   `statements_more_gets` and `statements_more_bytes` (entries whose
+   unrouted median exceeds the control's), `statements_slower` (entries
+   whose unrouted median latency exceeds the control's by more than 5% of
+   the control's and by more than the larger spread of the two passes, row
+   12's "outside the lane's noise"), `statements_unchecked` (no readable
+   record in either pass, or a control median of 0 ms), each with its
+   count, and `latency_ratio_median` and `latency_ratio_max` (cases zb,
+   zb2).
    Cost: the compare file is the arm's request and byte figure, per
    statement and per phase, for both builds on one snapshot.
 10. `stage1-extra-hour-ingest` (row 7): once the wall clock is past the hour
@@ -1285,35 +1291,55 @@ own step, as the run records it; a request the run does not count says so.
     the anchor, steps, the time waited until and the ingest end hour).
     Cost: `stage1-extra-hour/ingest.json`, the ingest report's write and
     read-back figures for one hour.
-11. `stage1-extra-hour-fold-off`: ravel-server stopped; the tenant's metrics
-    catalog HEAD saved with `aws s3 cp --recursive ... --exclude '*'
-    --include '*/catalog/m/HEAD'` on `createbuckets`; `catalog fold --signal
-    metrics --writers-stopped` with no leaf flag, timed
-    (`stage1.extra_hour_fold_off`).
-    Cost: the fold report's `list_requests`, `get_requests` and
-    `put_requests`, stamped; the HEAD save is one listing of the `t/`
-    prefix and one GET per HEAD, not counted.
-12. `stage1-extra-hour-fold-on`: the saved HEAD put back with `aws s3 cp`
-    and read back; a read-back whose sha256 differs from the saved one ends
-    the run with exit 70 (case zg). Then `catalog fold --signal metrics
-    --writers-stopped --key-index-leaves --metrics-label-index` from that
-    same HEAD, timed (`stage1.extra_hour_fold_on`).
+11. `stage1-extra-hour-fold-on`: ravel-server stopped; the routed HEAD put
+    back with `aws s3 cp` on `createbuckets` and read back; a read-back whose
+    sha256 differs from the saved one ends the run with exit 70 (case zg).
+    With the arm on, the run saves two HEADs with `aws s3 cp --recursive
+    ... --exclude '*' --include '*/catalog/m/HEAD'`: the leafless one before
+    `stage1-leaves` (`head-leafless`, the HEAD `stage1-fold` published, which
+    no leaf build has touched) and the routed one after it
+    (`head-routed`). Then `catalog fold --signal metrics --writers-stopped
+    --key-index-leaves --metrics-label-index` from the routed HEAD, timed
+    (`stage1.extra_hour_fold_on`), and the HEAD it published saved
+    (`head-fold-on`).
     Cost: the fold report's LIST, GET and PUT counts and the key-index
-    leaves and leaf bytes it wrote, stamped; the restore is one PUT and the
-    read-back one listing and one GET per HEAD, not counted.
-13. `stage1-extra-hour`: the inspect and the listing into
+    leaves and leaf bytes it wrote, stamped; each HEAD save is one listing of
+    the `t/` prefix and one GET per HEAD, each restore one PUT and its
+    read-back one listing and one GET per HEAD, none counted.
+12. `stage1-extra-hour-fold-off`: the leafless HEAD put back and read back
+    the same way, then `catalog fold --signal metrics --writers-stopped` with
+    no leaf flag, timed (`stage1.extra_hour_fold_off`). A fold-off report
+    whose `key_index_switch_off_over_leaves` is not `false` ends the run with
+    exit 70 and `stage1.extra_hour` stamped `refused:` (case zg2): that flag
+    says the fold read a HEAD carrying leaf refs, so it re-encoded parts the
+    leaf-on fold did not and the two wall times would not time the same
+    work. Each fold's `put_requests` and `key_index_switch_off_over_leaves`
+    are stamped with the rest of its report. The leaf-off fold runs second,
+    on whatever the leaf-on fold left warm, so `wall_ratio_on_off` errs
+    high, never low.
+    Cost: the fold report's `list_requests`, `get_requests` and
+    `put_requests`, stamped.
+13. `stage1-extra-hour`: the leaf-on fold's HEAD put back and read back the
+    same way, so the later steps read the snapshot the leaf-on fold
+    published; the inspect and the listing into
     `stage1-extra-hour.inspect.txt` and `stage1-extra-hour.objects.jsonl`,
-    then `stage1.extra_hour`: `same_start` (both folds' HEAD sha256 and
-    `previous_watermark_hour`), `start_mismatches`, `fold_off` and `fold_on`
-    (each fold's `wall_ms` and `watermark_hour`), `wall_ratio_on_off`,
+    then `stage1.extra_hour`: `head_sha256` (each fold's start HEAD and the
+    one put back after both), `start_mismatches` (1 when the two folds'
+    `previous_watermark_hour` differ), `fold_off` and `fold_on` (each fold's
+    `wall_ms`, `watermark_hour` and `put_requests`), `wall_ratio_on_off`,
     `tail_objects` and `tail_data_bytes` (the listed data objects above the
     routed `watermark_hour`), `leaf_bytes` (the leaf-on fold's
-    `key_index_leaf_bytes_written`), `leaf_bytes_ratio` (over
-    `tail_data_bytes`), `tail_parts` and `uncovered_tail_parts` (parts over
-    the new hour with no `label_value` leaf), each with its basis (case
-    zc). Then ravel-server recreated with the routed flags
+    `key_index_leaf_bytes_written`), `leaf_bytes_ratio` over
+    `leaf_bytes_denominator` (the bytes of every listed data object whose
+    ingest hour lies in some tail part's `range=lo..=hi`, each object
+    once, since a tail part's leaves index every object in its range, not
+    only the new hour's; `leaf_bytes_denominator_objects` counts them),
+    `tail_parts` and `uncovered_tail_parts` (tail parts, those whose range
+    ends above the routed `watermark_hour`, with no `label_value` leaf or an
+    uncovered entry), each with its basis (cases zc, zc2). Then
+    ravel-server recreated with the routed flags
     (`stage1.extra_hour_restart`).
-    Cost: the leaf bytes over the hour's data bytes is the arm's write
+    Cost: the leaf bytes over the tail parts' data bytes is the arm's write
     figure; the listing is one `catalog list`.
 14. `stage1-l1-compact` (row 6, issue #3818): once the last ingest hour is
     sealed (its end plus 6 minutes), ravel-server stopped and `ravel-cli
@@ -1335,34 +1361,60 @@ own step, as the run records it; a request the run does not count says so.
     `stage1-l1/`; and `stage1-l1-compare.json` (`stage1.l1_compare`): the
     routed and L1 hash sets per entry as in step 6, `entries_compared`,
     `entries_differing_count`, and for the L1 records
-    `other_records_status_unexpected`,
-    `other_records_fetch_memory_exhausted_count` (status naming `fetch
-    memory exhausted`, #3818's failure) and the label-index counts (case zd).
+    `other_records_status_unexpected` (any status but `ok` or `incorrect`,
+    so a refusal of any kind, #3818's included, fails its band at 0) and
+    the label-index counts (case zd). `stage1.l1_not_measured` says row 6's memory, GET and
+    byte figures against the unbatched call are not measured by this arm.
     Cost: every L1 record's `phases`, against the routed pass's.
 17. `stage1-erasure-reference` (row 8): the corpus with
     `instance!="metricsbench-instance-0"` added to every selector, into
     `stage1-erasure-reference.corpus.json` (`stage1.erasure_corpus`), run
     with the routed flags into `stage1-erasure-reference/`;
     `stage1-erasure-subject.json` (`stage1.erasure_subject`) compares it with
-    the routed pass, so the entries the subject changes are named.
+    the routed pass, so the entries the subject changes are named; its bands
+    want at least one reference record pruned by the label index and at
+    least one entry the subject changes, so the comparison in step 19 can
+    tell a pending prune and a leaked subject from a corpus the subject does
+    not touch.
     Cost: every reference record's `phases`.
 18. `stage1-erasure-submit`: `ravel-cli erase submit --signal metrics
     --matcher instance=metricsbench-instance-0` with a fresh request id
-    (`stage1.erasure_submit`).
+    (`stage1.erasure_submit`, with `submitted_unix_s`, the clock read once
+    the submit returned).
     Cost: the erasure record's write, not counted.
 19. `stage1-erasure-pending`: the corpus as written, routed, into
     `stage1-erasure-pending/`; `stage1-erasure-compare.json`
     (`stage1.erasure_compare`) compares it with the reference and counts
-    the pending records with `segmentsPrunedByLabelIndex` above 0 (case ze).
+    the pending records with `segmentsPrunedByLabelIndex` above 0 (case ze);
+    its bands also want no pending record with a status other than `ok` or
+    `incorrect` and no entry without a result hash, since either would
+    compare as equal while answering nothing.
     Cost: every pending record's `phases`, against the reference's.
-20. `stage1-erasure-rewrite`: a one-off `ravel-server --mode maintain`
-    container (`--maintain-tenant metricsbench --disable-fold`, a throwaway
-    record key) runs until `erase status` says `COMPLETED`, polled
-    `METRICSBENCH_ERASURE_TRIES` times `METRICSBENCH_ERASURE_INTERVAL`
-    seconds apart, then is removed; not completed in time ends the run
-    with exit 70 (case zh). `stage1.erasure_rewrite` stamps the request id,
-    state, deferral cause, per-bucket dropped counts, `dropped_total` and
-    the path.
+20. `stage1-erasure-rewrite`: the rewrite cannot complete before the ingest
+    hour open at the acknowledgement seals, at its end plus
+    `max_flush_lifetime` (1 h, `DEFAULT_MAX_FLUSH_LIFETIME_NS` in
+    crates/ravel-maintain/src/config.rs) plus the clock-skew allowance
+    (5 min, `DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`), so after the pending pass
+    the run waits with `METRICSBENCH_SLEEP` until `(submit_s / 3600 + 1) *
+    3600 + 3600 + 300`, up to 2 h 5 min after the submit, and stamps
+    `stage1.erasure_seal_wait` (`submitted_unix_s`, `deadline_unix_s`,
+    `sleep_s`, `waited_s`; case zi). Then a one-off `ravel-server --mode
+    maintain` container runs with the flags `stage1.erasure_maintain`
+    stamps (`--maintain-tenant metricsbench --maintain-interval-secs 10
+    --disable-fold`, and `--maintain-key-file` a throwaway record key
+    written with `mktemp` under `TMPDIR`, outside the output directory,
+    mounted read-only and removed on every exit path) until `erase status`
+    says `COMPLETED`, polled `METRICSBENCH_ERASURE_TRIES` times
+    `METRICSBENCH_ERASURE_INTERVAL` seconds apart, then is removed; not
+    completed in time ends the run with exit 70 (case zh). No ravel-server
+    flag turns compaction off: each maintain tick
+    (services/ravel-server/src/maintain.rs, `run_tick`) runs retention,
+    compaction, the GC sweep and the catalog-object sweeps over the tenant
+    as well as the erasure rewrite. `stage1.erasure_rewrite` stamps the
+    request id, state, deferral cause, `requested_unix_ns`,
+    `completed_unix_ns` and the path. `erase status` prints no per-bucket
+    dropped count for a completed request (the completion record's bucket
+    drops are empty), so the rewrite is read from the catalog in step 22.
     Cost: the rewrite's requests are not counted; its log is
     `stage1-erasure-maintain.log`.
 21. `stage1-erasure-fold`: ravel-server stopped, `catalog fold --signal
@@ -1371,17 +1423,27 @@ own step, as the run records it; a request the run does not count says so.
     Cost: the fold report's LIST, GET and PUT counts and leaf bytes,
     stamped.
 22. `stage1-erasure`: the inspect into `stage1-erasure.inspect.txt` and
-    `stage1.erasure_leaves`: the parts over a rewritten hour and the leaves
-    they reference that the pre-erasure snapshot also referenced
-    (`stale_leaves`, `stale_leaves_count`). `stage1.erasure_sweep` says the
-    physical sweep was not checked: it waits out the protection horizon,
-    which is longer than a run.
+    `stage1.erasure_leaves`, a diff of it against the inspect taken before
+    the submit (`stage1-erasure-reference.inspect.txt`): a rewritten part
+    is a part before whose key and blake3 no part after carries
+    (`rewritten_parts`, `rewritten_parts_count`, band at least 1), and a
+    stale leaf is a leaf key a rewritten part referenced that a part after
+    still references (`stale_leaves`, `stale_leaves_count`, band 0; cases
+    ze, zj). `stage1.erasure_sweep` says the physical sweep was not
+    checked: it waits out the protection horizon, which is longer than a
+    run.
     Cost: one inspect, not counted.
 
-ADR-3694 row 8 says a pending erasure's results equal the unrouted pass's;
-the run compares the pending pass with a routed reference that excludes the
-subject, since the pending erasure hides the subject's series at query time
-and the routed corpus then answers without them.
+ADR-3694 row 8 says a pending erasure's results equal the unrouted pass's.
+The run checks three things: (a) no pending statement is pruned by the
+label index (`erasure_pending_pruned_by_label_index` at 0); (b) the pending
+results equal a routed reference that excludes the subject; routing is
+skipped while an erasure is pending, so the pending pass is in effect
+unrouted, and the pending erasure hides the subject's series at query time,
+so the reference answers the same without them; (c) after the rewrite and
+the fold, at least one part was rewritten and none of them left a leaf the
+new snapshot still references. The physical sweep of the erased objects is
+not checked.
 
 A run whose ingest verification failed, or whose steps 15 to 18 were
 skipped, runs none of them and stamps each `skipped:` and why, arm keys
@@ -1569,21 +1631,28 @@ routed record with `labelIndexValues`, none unreadable, no statement whose
 summed leaf GETs exceed (1 + n) x its covering parts and no pass leaving a
 part beyond the router's ceiling (case z30 fails the last three); and at
 least one holder for `mb_selective_job_rate_sum`, which is route-bound. The
-19 arm figures carry a `when` on `stage1.arms.ARM` and read `n/a` with the
+23 arm figures carry a `when` on `stage1.arms.ARM` and read `n/a` with the
 arm off: for the control arm no statement with more unrouted GETs or wire
-bytes than the control, none unchecked, and a median latency ratio in [0.5,
-2]; for the extra hour at least one new data object, no start mismatch, leaf
-bytes within 1% of the hour's data bytes, no uncovered part and a leaf-on
-over leaf-off wall ratio at most 10; for L1 at least one L1 object and one
-compared entry, no differing entry, no unexpected status and no `fetch
-memory exhausted` record; for the erasure no pending label-index prune, no
-pending entry differing from the reference, at least one compared entry, at
-least one dropped record and no stale leaf (the `stage1-check` arm cases
-fail figures of each arm). The L1 band assumes the extra hour lies after every query
+bytes than the control, none unchecked, and none slower (`statements_slower`,
+ADR-3694 row 12); for the extra hour at least one new data object and one
+tail part, no start mismatch, leaf bytes within 1% of the tail parts' data
+bytes, no uncovered part and a leaf-on over leaf-off wall ratio at most 10
+(a `ci` sanity bound, not row 7's 1.10 target); for L1 at least one L1
+object and one compared entry, no differing entry and no unexpected status;
+for the erasure at least one reference record pruned by the label index and
+one entry the subject changes, no pending label-index prune, no pending
+record with an unexpected status, no pending entry without a hash or
+differing from the reference, at least one compared entry, at least one
+rewritten part and no stale leaf (the `stage1-check` arm cases fail figures
+of each arm). The L1 band assumes the extra hour lies after every query
 window, so compaction cannot change an answer. The `ci`
 bands ask for no routed prune: on `ci` every object's LABEL_DICT holds every
 probed value, so the router can prune none (run 42495422937 pruned none and
-read the leaf, 10 and 4 cache hits on two statements). Every basis is a
+read the leaf, 10 and 4 cache hits on two statements). The erasure arm's
+`erasure_subject_pruned_by_label_index` band asks for at least one, which on
+`ci` it may not get for that reason; its basis says so, and a `ci` arm run
+that fails it is reporting that the reference pass cannot show a pending
+prune there, not a defect in the erasure. Every basis is a
 prediction until a `stage1=true` dispatch measures it.
 
 The nightly workflow's manual dispatch takes a `stage1` input (default
