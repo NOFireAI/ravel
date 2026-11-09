@@ -42,8 +42,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::joins::{
-    HashJoinExec, PartitionMode, SortMergeJoinExec, StreamJoinPartitionMode,
-    SymmetricHashJoinExec,
+    HashJoinExec, PartitionMode, SortMergeJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::InterleaveExec;
