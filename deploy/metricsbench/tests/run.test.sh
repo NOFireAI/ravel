@@ -3934,6 +3934,20 @@ for c in u1 u2b u3; do
   check "${c}: a failed folded step leaves object_spans stamped not taken" 'j("stamps.json")["object_spans"] == "not taken: the run ended before the object spans step" and j("stamps.json")["cold_ravel_diagnostic"].startswith("not applicable: no entry of class long_range")'
 done
 
+# stage1-erasure-corpus on its own: the label list after by, without, on,
+# ignoring, group_left and group_right is copied as written, and a bare
+# group_left or group_right (its list is optional) leaves the next ( to the
+# call it opens, so the selectors inside it gain the matcher too.
+EC="${TMP}/erasure-corpus"
+mkdir -p "${EC}"
+sed -n "/^read -r -d '' PYLIB <<'PY'\$/,/^PY\$/p" "${SCRIPT}" | sed '1d;$d' >"${EC}/mbpylib.py"
+python3 -I -c 'import json, sys; json.dump({"entries": [{"id": "bare", "promql": "a * on (job) group_left max(b)"}, {"id": "listed", "promql": "a * on (job) group_left (v) max(b)"}, {"id": "right", "promql": "a * ignoring (x) group_right sum by (job) (rate(b[5m]))"}]}, open(sys.argv[1], "w"))' "${EC}/corpus.json"
+rc=0
+(cd "${EC}" && python3 -I -c 'import sys; sys.path.insert(0, "."); import mbpylib' stage1-erasure-corpus corpus.json out.json instance metricsbench-instance-0 >stdout.txt 2>&1) || rc=$?
+expect_rc "erasure corpus: the rewrite exits 0" 0
+OUT="${EC}"
+check "erasure corpus: a bare group_left or group_right leaves the next call's selectors rewritten; a listed one copies its list" '{e["id"]: e["promql"] for e in j("out.json")["entries"]} == {"bare": "a{instance!=\"metricsbench-instance-0\"} * on (job) group_left max(b{instance!=\"metricsbench-instance-0\"})", "listed": "a{instance!=\"metricsbench-instance-0\"} * on (job) group_left (v) max(b{instance!=\"metricsbench-instance-0\"})", "right": "a{instance!=\"metricsbench-instance-0\"} * ignoring (x) group_right sum by (job) (rate(b{instance!=\"metricsbench-instance-0\"}[5m]))"}'
+
 echo
 echo "${passes} passed, ${fails} failed"
 [ "${fails}" -eq 0 ]
