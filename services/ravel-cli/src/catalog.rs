@@ -595,6 +595,10 @@ fn render_fold_report(
         report.key_index_switch_off_over_leaves
     ));
     out.push_str(&format!(
+        "key_index_parts_missing_declared_leaves: {}\n",
+        report.key_index_parts_missing_declared_leaves
+    ));
+    out.push_str(&format!(
         "key_index_leaf_gets: {}\n",
         report.key_index_leaf_gets
     ));

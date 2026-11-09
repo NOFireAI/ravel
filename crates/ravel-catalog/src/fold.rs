@@ -408,6 +408,19 @@ pub struct FoldReport {
     /// warning naming the tenant and signal: turning the switch off on
     /// purpose looks the same. Always `false` with the switch on.
     pub key_index_switch_off_over_leaves: bool,
+    /// Parts the published HEAD carries by reference, each with at least one
+    /// entry, that hold no key-index leaf ref for at least one field the
+    /// tenant's key-index set names at fold time: the declared logs fields,
+    /// spans `trace_id`, metrics `label_value` under
+    /// [`CatalogConfig::metrics_label_index`](crate::CatalogConfig::metrics_label_index),
+    /// whether or not a metrics erasure request is pending. The fold never
+    /// builds leaves for a part it carries (ADR-3939 decision 2), so such a
+    /// part keeps its refs until `ravel-cli catalog fold --rebuild-key-index`
+    /// attaches the missing ones; a field no entry of the part indexes stays
+    /// missing after that too. Nonzero logs one warning per fold naming the
+    /// tenant, signal and the missing fields. Zero with the leaf switch off
+    /// and on a no-op fold.
+    pub key_index_parts_missing_declared_leaves: u64,
     /// GETs of the previous tail part's leaves, whole objects, one per
     /// (field, slice), issued when a re-encoded part shares a data object
     /// with that tail. Also counted in `get_requests`.
@@ -3435,6 +3448,13 @@ impl Catalog {
         } else {
             false
         };
+        // Taken before the erasure gate: a part carried while a request is
+        // pending lacks a leaf the tenant declares all the same.
+        let key_index_declared: Vec<String> = key_index_fields
+            .iter()
+            .flatten()
+            .map(|(name, _)| name.clone())
+            .collect();
         let key_index_fields = if metrics_erasure_gated {
             None
         } else {
@@ -4222,6 +4242,8 @@ impl Catalog {
             let mut metrics_label_index_parts_over_cap: u64 = 0;
             let mut metrics_label_index_parts_erasure_gated: u64 = 0;
             let mut parts_reused: u64 = 0;
+            let mut key_index_parts_missing_declared_leaves: u64 = 0;
+            let mut key_index_missing_fields: BTreeSet<&str> = BTreeSet::new();
             let mut column_stats_part_objects_built: u64 = 0;
             let mut column_stats_dictionaries_dropped: u64 = 0;
             let mut key_index_uncovered_entries: u64 = 0;
@@ -4254,6 +4276,18 @@ impl Catalog {
                     part_hashes.push(*part_hash.as_bytes());
                     part_refs.push(existing.clone());
                     parts_reused += 1;
+                    if existing.entry_count > 0 {
+                        let mut missing = key_index_declared
+                            .iter()
+                            .filter(|field| {
+                                !existing.key_index.iter().any(|leaf| &leaf.field == *field)
+                            })
+                            .peekable();
+                        if missing.peek().is_some() {
+                            key_index_parts_missing_declared_leaves += 1;
+                            key_index_missing_fields.extend(missing.map(String::as_str));
+                        }
+                    }
                     continue;
                 }
                 let part_bytes_len = part_bytes.len() as u64;
@@ -4763,6 +4797,15 @@ impl Catalog {
                     // counted exactly once, by whichever attempt won.
                     declared_stats::observe_fold_stamp_coverage(coverage);
                     observe_fold_key_index(&counters);
+                    if key_index_parts_missing_declared_leaves > 0 {
+                        tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            parts = key_index_parts_missing_declared_leaves,
+                            fields = ?key_index_missing_fields,
+                            "parts carried by reference lack a key-index leaf for a declared field; the fold builds no leaf for a part it carries, so run ravel-cli catalog fold --rebuild-key-index to attach them"
+                        );
+                    }
                     return Ok(FoldReport {
                         watermark_hour: Some(watermark_hour),
                         previous_watermark_hour: head_state.watermark_hour(),
@@ -4802,6 +4845,7 @@ impl Catalog {
                         },
                         key_index_field_pairs,
                         key_index_switch_off_over_leaves,
+                        key_index_parts_missing_declared_leaves,
                         key_index_leaf_gets: counters.key_index_leaf_gets,
                         metrics_label_index_parts_over_cap,
                         metrics_label_index_parts_erasure_gated,
@@ -6038,6 +6082,7 @@ fn no_op_report(
         key_index_pair_budget: 0,
         key_index_field_pairs: BTreeMap::new(),
         key_index_switch_off_over_leaves,
+        key_index_parts_missing_declared_leaves: 0,
         key_index_leaf_gets: counters.key_index_leaf_gets,
         metrics_label_index_parts_over_cap: 0,
         metrics_label_index_parts_erasure_gated: 0,
