@@ -6307,12 +6307,14 @@ holds:
   tie-order rewrite;
 - the aggregate has one grouping set with no null mask or grouping id, no
   limit of its own, unordered input, and at least one aggregate expression,
-  each with a `GroupsAccumulator`, no `ORDER BY`, no `FILTER` and no float
-  state field, and its input is not a `FirstGroupsExec`.
+  each with a `GroupsAccumulator`, no `ORDER BY`, no `FILTER`, and either no
+  float state field or a float state on the allowlist below, and its input is
+  not a `FirstGroupsExec`.
 
 An `ORDER BY` on an aggregate stays with `BoundedTopKAggregate`, an
-aggregate with float state such as a float `sum` keeps the stock plan, and
-any refused statement keeps the ADR-0954 refusal-retry.
+aggregate with a float state off the allowlist, such as a float `sum`, keeps
+the stock plan, and any refused statement keeps the ADR-0954 refusal-retry.
+Non-distinct `avg` over a `Float64` or `Float32` column is admitted.
 
 Per output partition the exec interns each input batch's group keys in a
 DataFusion `GroupValues` built over the aggregate's own group schema and
@@ -6343,12 +6345,24 @@ pins every returned group against the rule-off plan, under ascending,
 descending and shuffled arrival, with ties at the `n`-th key, an evicted key
 seen again, NULL keys first and last, and `OFFSET`, in all four modes. The
 aggregates it covers are `count(*)`, `count`, `sum`, `avg`, `min` and `max`
-over integer columns, with non-float keys. Among keys tied on the sort, which
+over integer columns, and non-distinct `avg` over float columns, with
+non-float keys. Among keys tied on the sort, which
 ones are returned follows arrival order, which SQL leaves unspecified, and
 under the tie-order rewrite the sort is total on the keys. Float keys are
 refused because `GroupValues` folds -0.0 into +0.0 while the row encoding
-orders them apart; float states are refused because a rebuild merges each
-state into a fresh accumulator, and `0.0 + -0.0` is +0.0.
+orders them apart. A rebuild merges each kept state into a fresh
+accumulator, so a float state is admitted only when that merge returns it bit
+for bit (ADR-4002, float-state allowlist amendment). Ravel's sequential-fold
+`avg`, state `[Float64 sum, Int64 count]`, qualifies: a fresh group holds no
+sum, and merging copies the incoming sum rather than adding it to a seed, so
+-0.0, NaN payloads, infinities and subnormals survive. The match is on the
+function's implementation type, its argument type and its state layout, so a
+same-named `avg` with another accumulator stays refused. A float `sum`
+starts each group at 0.0, and `0.0 + -0.0` is +0.0, so it stays refused.
+`the_identity_merge_is_bit_exact_for_admitted_float_states`,
+`an_admitted_float_aggregate_is_exact_through_rebuilds`,
+`a_float_state_that_is_not_an_identity_stays_refused` and
+`a_same_named_avg_with_another_accumulator_stays_refused` pin this.
 
 On its fixture of 1,000,000 distinct `Int64` keys over 8 partitions with
 `ORDER BY k LIMIT 10`, keys arriving in the worst order or shuffled, the
