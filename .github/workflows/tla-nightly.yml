@@ -63,6 +63,20 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+      # The TLC jar through the pinned-tool cache (D3, ADR-4034), placed where
+      # check-tla.sh's ensure_jar looks for it so it finds the cache hit and
+      # skips its own fetch. These values must match scripts/check-tla.sh's
+      # TLA_VERSION/TLA_JAR_SHA256/TLA_JAR_URL exactly: that sha256 stays the
+      # trust anchor, this cache only saves seven matrix legs' worth of
+      # download per run.
+      - name: Fetch pinned TLC jar
+        uses: ./.github/actions/fetch-pinned-tool
+        with:
+          name: tla2tools
+          version: "1.7.4"
+          url: https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          sha256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+          dest: .cache/tla/tla2tools-1.7.4.jar
       - name: Exhaustive model check
         # State CI's resource choice rather than inheriting the script's
         # laptop-safe default of 2 workers: `auto` is the previous behaviour
