@@ -3758,6 +3758,14 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 cache.as_ref().map(|_| config.cache_max_bytes),
             );
             bulk_scan_min_bytes.emit();
+            // Issue #4014: the in-memory first attempt plans at least 16
+            // partitions when the count is derived, and the count as given
+            // when an operator set it.
+            let first_attempt_partitions = query::resolve_sql_first_attempt_partitions(
+                config.query_budgets.sql_partition_count,
+                config.query_budgets.sql_partition_count_source,
+            );
+            first_attempt_partitions.emit();
             let state = query::build_sql_state_with_parquet(
                 catalog.clone(),
                 store.clone(),
@@ -3810,6 +3818,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                         ),
                 ),
                 bulk_scan_min_bytes.value,
+                first_attempt_partitions.min_partitions,
             )?;
             // ADR-3326: `--decoded-cache-max-bytes` above zero installs one
             // process-wide decoded-column cache on the logs fetcher, its
