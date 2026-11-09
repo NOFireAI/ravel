@@ -12,7 +12,9 @@
 //! The fixture is one tenant holding four RLOG objects and four RSPAN
 //! objects of 1,024 records each, every record carrying a distinct
 //! `user_id` (logs) or trace id (spans), folded into one part per signal
-//! with key-index leaves.
+//! with key-index leaves. Cases whose part must be no dearer to route than
+//! to probe at tier 1 add filler objects of their own ids, up to
+//! `WIDE_OBJECTS` entries per part.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -62,6 +64,15 @@ const TOKEN: &str = "acme-token";
 const OBJECTS: usize = 4;
 const RECORDS: usize = 1_024;
 const PER_BLOCK: usize = 16;
+/// Entries of the part the leaf route must be no dearer for than tier 1 is:
+/// a 1,000-key set on a 13-bit leaf touches 1 + B_run = 65 leaves, at most
+/// `2 x 36 = 72`, the tier-1 probe of the part's segments.
+const WIDE_OBJECTS: usize = 36;
+/// Records in each filler object. Twice [`RECORDS`] keeps the 13-bit leaf's
+/// bucket bytes above the part's bridged allowance of `entries x T1_BYTES`
+/// (11 KiB per entry); at 1,024 a filler adds about 9.3 KiB of buckets and
+/// the 1,000-key read fits.
+const FILLER_RECORDS: usize = 2 * RECORDS;
 /// The list sizes the acceptance runs.
 const SIZES: [usize; 4] = [1, 10, 100, 1_000];
 
@@ -83,14 +94,34 @@ fn key_record(j: usize) -> (usize, usize) {
     (j % OBJECTS, (j / OBJECTS * 37) % RECORDS)
 }
 
+/// Records in `object`: [`RECORDS`] in the four key objects, and
+/// [`FILLER_RECORDS`] in a filler.
+fn records(object: usize) -> usize {
+    if object < OBJECTS {
+        RECORDS
+    } else {
+        FILLER_RECORDS
+    }
+}
+
+/// Record `i` of `object`'s number across the tenant, distinct for every
+/// record of every object.
+fn record_number(object: usize, i: usize) -> usize {
+    if object < OBJECTS {
+        object * RECORDS + i
+    } else {
+        OBJECTS * RECORDS + (object - OBJECTS) * FILLER_RECORDS + i
+    }
+}
+
 fn user_id(object: usize, i: usize) -> i64 {
-    1_000_000 + (object * RECORDS + i) as i64
+    1_000_000 + record_number(object, i) as i64
 }
 
 fn trace_id(object: usize, i: usize) -> [u8; 16] {
     let mut t = [0u8; 16];
     t.copy_from_slice(
-        &blake3::hash(&((object * RECORDS + i) as u64).to_le_bytes()).as_bytes()[..16],
+        &blake3::hash(&(record_number(object, i) as u64).to_le_bytes()).as_bytes()[..16],
     );
     t
 }
@@ -171,9 +202,9 @@ impl Lane {
     }
 }
 
-async fn publish_logs(store: &Arc<dyn ObjectStoreBackend>) {
+async fn publish_logs(store: &Arc<dyn ObjectStoreBackend>, objects: usize) {
     let tenant_hash = tenant().hash();
-    for object in 0..OBJECTS {
+    for object in 0..objects {
         let writer_id = Uuid::from_u128(3_705_000 + object as u128);
         let mut writer = RlogWriter::new(
             RlogConfig {
@@ -194,7 +225,7 @@ async fn publish_logs(store: &Arc<dyn ObjectStoreBackend>) {
             AttrValue::Str("api".to_string()),
         )];
         let (mut min, mut max) = (i64::MAX, i64::MIN);
-        for i in 0..RECORDS {
+        for i in 0..records(object) {
             let ts = 1_000 + (i * OBJECTS + object) as i64;
             min = min.min(ts);
             max = max.max(ts);
@@ -224,7 +255,7 @@ async fn publish_logs(store: &Arc<dyn ObjectStoreBackend>) {
             writer_seq: object as u64 + 1,
             object_size: bytes.len() as u64,
             content_hash: *blake3::hash(&bytes).as_bytes(),
-            sample_count: RECORDS as u64,
+            sample_count: records(object) as u64,
             series_count: 1,
             min_event_ts_ns: min,
             max_event_ts_ns: max,
@@ -246,7 +277,7 @@ async fn publish_logs(store: &Arc<dyn ObjectStoreBackend>) {
     }
 }
 
-async fn publish_spans(store: &Arc<dyn ObjectStoreBackend>) {
+async fn publish_spans(store: &Arc<dyn ObjectStoreBackend>, objects: usize) {
     let tenant_hash = tenant().hash();
     validate_or_adopt(
         store.as_ref(),
@@ -258,7 +289,7 @@ async fn publish_spans(store: &Arc<dyn ObjectStoreBackend>) {
     )
     .await
     .expect("generation 0");
-    for object in 0..OBJECTS {
+    for object in 0..objects {
         let writer_id = Uuid::from_u128(3_705_100 + object as u128);
         let mut writer = ravel_rspan::RspanWriter::new(
             ravel_rspan::RspanConfig {
@@ -274,7 +305,7 @@ async fn publish_spans(store: &Arc<dyn ObjectStoreBackend>) {
             },
         );
         let (mut min, mut max) = (i64::MAX, i64::MIN);
-        for i in 0..RECORDS {
+        for i in 0..records(object) {
             let start = 1_000 + (i * OBJECTS + object) as i64;
             min = min.min(start);
             max = max.max(start + 100);
@@ -300,8 +331,8 @@ async fn publish_spans(store: &Arc<dyn ObjectStoreBackend>) {
             writer_seq: 1,
             object_size: bytes.len() as u64,
             content_hash: *blake3::hash(&bytes).as_bytes(),
-            sample_count: RECORDS as u64,
-            series_count: RECORDS as u64,
+            sample_count: records(object) as u64,
+            series_count: records(object) as u64,
             min_event_ts_ns: min,
             max_event_ts_ns: max,
             min_ingest_ts_ns: min,
@@ -338,9 +369,17 @@ fn leaf_catalog(store: Arc<dyn ObjectStoreBackend>) -> Catalog {
 /// Both signals published, `user_id` declared, and each signal folded into
 /// one part with leaves.
 async fn fixture() -> Arc<dyn ObjectStoreBackend> {
+    fixture_of(OBJECTS).await
+}
+
+/// [`fixture`] with `objects - OBJECTS` more objects per signal beside the
+/// four the keys live in, each holding its own distinct ids, so the one part
+/// has `objects` entries and its tier-1 probe costs `2 x objects` GETs.
+async fn fixture_of(objects: usize) -> Arc<dyn ObjectStoreBackend> {
+    assert!(objects >= OBJECTS);
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    publish_logs(&store).await;
-    publish_spans(&store).await;
+    publish_logs(&store, objects).await;
+    publish_spans(&store, objects).await;
     let mut config = TenantConfig {
         typed_attr_columns: Some(vec![DeclaredTypedColumn {
             key: "user_id".to_string(),
@@ -369,7 +408,7 @@ async fn fixture() -> Arc<dyn ObjectStoreBackend> {
             )
             .await
             .expect("fold");
-        assert_eq!(report.entry_count, OBJECTS as u64, "{signal:?}: {report:?}");
+        assert_eq!(report.entry_count, objects as u64, "{signal:?}: {report:?}");
     }
     store
 }
@@ -618,7 +657,10 @@ async fn in_list_rows_equal_the_union_of_equalities() {
     assert_eq!(key_index(&v, "partsCovered"), 0, "{v}");
 
     // On a 13-bit leaf the 1,000-key set's bridged read exceeds the part's
-    // allowance: the part is uncovered after GET 1, and tier 1 answers.
+    // allowance: the part is uncovered after GET 1, and tier 1 answers. The
+    // part needs `WIDE_OBJECTS` entries for its worst case of 65 leaf GETs to
+    // be admitted at all.
+    let store = fixture_of(WIDE_OBJECTS).await;
     for lane in [Lane::Logs, Lane::Spans] {
         swap_in_a_13_bit_leaf(&store, lane).await;
         let v = sql(&serve(Arc::clone(&store)), &lane.in_list(1_000)).await;
@@ -719,24 +761,25 @@ async fn a_hex_trace_id_list_plans_and_carries_the_key_set() {
 /// A logs key set whose every key is absent from an object prunes that
 /// object, both when the part's leaves route the set and when the part is
 /// uncovered and each object's own KEY_IDX answers the set. Key `j` lives in
-/// object `j % 4`: ten keys of object 0 leave objects 1 to 3 without a key,
-/// and on a 13-bit leaf 1,000 keys of objects 0 and 1 leave objects 2 and 3
-/// without one.
+/// object `j % 4`: ten keys of object 0 leave objects 1 to 3 and the 32
+/// fillers without a key, and on a 13-bit leaf 1,000 keys of objects 0 and 1
+/// leave objects 2 and 3 and the fillers without one.
 ///
 /// Flip to watch it fail: in ravel-query's `probe_key_index` (log_fetcher), push
 /// the key set's answer only when it is not `Absent`. Every object is then
-/// kept and the tier-1 count reads 0 instead of 2.
+/// kept and the tier-1 count reads 0 instead of 34.
 #[tokio::test]
 async fn a_logs_set_absent_from_an_object_prunes_it() {
-    let store = fixture().await;
+    let store = fixture_of(WIDE_OBJECTS).await;
     let lane = Lane::Logs;
+    let fillers = (WIDE_OBJECTS - OBJECTS) as u64;
 
     let one_object: Vec<usize> = (0..10).map(|n| n * OBJECTS).collect();
     let v = sql(&serve(Arc::clone(&store)), &lane.in_keys(&one_object)).await;
     assert_eq!(rows(&v), oracle_of(&one_object), "{v}");
     assert_eq!(key_index(&v, "keysProbed"), 10, "{v}");
     assert_eq!(key_index(&v, "partsCovered"), 1, "{v}");
-    assert_eq!(pruning(&v, "segmentsPrunedByKeyIndex"), 3, "{v}");
+    assert_eq!(pruning(&v, "segmentsPrunedByKeyIndex"), 3 + fillers, "{v}");
 
     swap_in_a_13_bit_leaf(&store, lane).await;
     let two_objects: Vec<usize> = (0..).filter(|j| j % OBJECTS < 2).take(SIZES[3]).collect();
@@ -745,5 +788,49 @@ async fn a_logs_set_absent_from_an_object_prunes_it() {
     assert_eq!(key_index(&v, "keysProbed"), 1_000, "{v}");
     assert_eq!(key_index(&v, "partsCovered"), 0, "{v}");
     assert_eq!(key_index(&v, "skippedByBudget"), 1, "{v}");
-    assert_eq!(pruning(&v, "segmentsPrunedByKeyIndex"), 2, "{v}");
+    assert_eq!(pruning(&v, "segmentsPrunedByKeyIndex"), 2 + fillers, "{v}");
+}
+
+/// A part whose leaf route would cost more than its tier-1 probe is left to
+/// tier 1 (ADR-3692's key-set ceiling amendment): ten keys of object 0 touch
+/// one slice for a worst case of 1 + 10 = 11 leaf GETs against the 4-entry
+/// part's tier-1 cost of 2 x 4 = 8. The part counts in `partsUncovered`, no
+/// leaf is read, each object's own KEY_IDX prunes objects 1 to 3, and the
+/// rows equal those of the same keys padded past k = 1,024 with absent ids,
+/// a list that carries no key set and is not routed.
+///
+/// Flip to watch it fail: in ravel-query's `route_parts`, drop the arm that
+/// counts a part whose `worst_gets` exceeds `entry_count x gets_per_entry` as
+/// uncovered. The part is then probed and covered: `partsUncovered` reads 0
+/// and `leafGetRequests` is non-zero.
+#[tokio::test]
+async fn a_part_dearer_to_route_than_to_probe_is_left_to_tier_one() {
+    let store = fixture().await;
+    let app = serve(store);
+    let lane = Lane::Logs;
+    let one_object: Vec<usize> = (0..10).map(|n| n * OBJECTS).collect();
+
+    let v = sql(&app, &lane.in_keys(&one_object)).await;
+    assert_eq!(rows(&v), oracle_of(&one_object), "{v}");
+    assert_eq!(key_index(&v, "keysProbed"), 10, "{v}");
+    assert_eq!(key_index(&v, "partsUncovered"), 1, "{v}");
+    assert_eq!(key_index(&v, "partsCovered"), 0, "{v}");
+    assert_eq!(key_index(&v, "skippedByBudget"), 0, "{v}");
+    assert_eq!(key_index(&v, "leafGetRequests"), 0, "{v}");
+    assert_eq!(pruning(&v, "segmentsPrunedByKeyIndex"), 3, "{v}");
+
+    let padded: Vec<String> = one_object
+        .iter()
+        .map(|&j| lane.literal(j))
+        .chain((1..=1_015).map(|id: i64| id.to_string()))
+        .collect();
+    assert_eq!(padded.len(), 1_025);
+    let unrouted = sql(
+        &app,
+        &lane.select(&format!("user_id IN ({})", padded.join(", "))),
+    )
+    .await;
+    assert_eq!(key_index(&unrouted, "keysProbed"), 0, "{unrouted}");
+    assert_eq!(key_index(&unrouted, "leafGetRequests"), 0, "{unrouted}");
+    assert_eq!(rows(&v), rows(&unrouted), "{v}\n{unrouted}");
 }
