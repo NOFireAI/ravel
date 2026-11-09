@@ -39,9 +39,9 @@
 //!   refusal of the aggregate makes it spill on the retry, and a refused
 //!   ineligible statement is not retried. `spill_retry.rs` pins the first
 //!   attempt of a statement that fits;
-//! - the first attempt's 16-partition floor answers in memory under a process
-//!   budget on which the engine count of 8 takes the spill retry (issue
-//!   #4014).
+//! - the first attempt's 16-partition floor on the final aggregate's hash
+//!   exchange answers in memory under a process budget on which the engine
+//!   count of 8 takes the spill retry (issue #4014).
 //!
 //! # Where each test drives the spill from
 //!
@@ -204,7 +204,7 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
-        first_attempt_min_partitions: 0,
+        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill: Some(SpillConfig {
@@ -950,6 +950,12 @@ async fn a_spill_enabled_query_gets_no_unclassified_repartition_exec() {
     assert!(
         control_plan.contains("AggregateExec: mode=FinalPartitioned"),
         "the control's final aggregate must be the fanned-out one; got:\n{control_plan}"
+    );
+    // Issue #4014: the default floor widened the control's exchange from the
+    // session's 8 to 16; the subject below has no exchange for it to widen.
+    assert!(
+        control_plan.contains(", 16), input_partitions=8"),
+        "the control's exchange is at the first-attempt floor; got:\n{control_plan}"
     );
 
     // Subject: the identical statement with spill configured. Eligible, so the
@@ -2090,9 +2096,10 @@ async fn a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry() 
 /// tries, in tenths of the engine count's unlimited peak.
 const FLOOR_BUDGET_TENTHS: std::ops::RangeInclusive<u64> = 10..=30;
 
-/// Issue #4014: at an engine count of 8, the q33 grouping's first attempt
-/// planned at the 16-partition floor answers in memory under a process budget
-/// on which the same attempt at 8 partitions is refused and takes the spill
+/// Issue #4014: at an engine count of 8, the q33 grouping's first attempt,
+/// with the hash exchange under its final aggregate widened to the
+/// 16-partition floor, answers in memory under a process budget on which the
+/// same attempt with an 8-partition exchange is refused and takes the spill
 /// retry. Twice the final-aggregate partitions halve each hash table, and with
 /// it the reserve-ahead envelope of the next doubling the process ledger holds
 /// for the widest tables.
@@ -2104,8 +2111,9 @@ const FLOOR_BUDGET_TENTHS: std::ops::RangeInclusive<u64> = 10..=30;
 /// 21,630,240 at 8; the floored attempt fit from 14 tenths (30,282,336 bytes)
 /// and the 8-partition attempt from 19 (41,097,456).
 ///
-/// Prove-the-test: drop the floor in `SqlConfig::partition_count_for` and the
-/// engine-count run answers in memory on the budget the floored run found.
+/// Prove-the-test: return `Transformed::no` at the top of
+/// `FinalExchangeFloor::rewrite` and the floored run takes the spill retry on
+/// every budget of the ladder, so no budget is found.
 #[tokio::test]
 async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() {
     let sql = "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10";

@@ -406,7 +406,6 @@ fn run_once(
 ) -> Run {
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(partitions);
-    config.first_attempt_min_partitions = 0;
     config.max_query_bytes = 64 << 30;
     assert_eq!(
         config.aggregate_reserve_ahead,
@@ -694,7 +693,6 @@ fn skip_probe_session(
         ..SqlConfig::default()
     };
     config.engine.sql_partition_count = Some(partitions);
-    config.first_attempt_min_partitions = 0;
     let tenant = TenantMemoryAccountant::new(64 << 20);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
     let store = Arc::new(MemoryStore::new());

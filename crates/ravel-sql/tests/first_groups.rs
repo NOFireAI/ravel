@@ -293,6 +293,8 @@ async fn the_returned_groups_carry_every_row_from_every_input_partition() {
     let sql = "SELECT k, count(*), sum(v) FROM t GROUP BY k LIMIT 10";
     let config = SqlConfig {
         max_query_bytes: MIB,
+        // Sixteen final streams do not fit the 1 MiB pool even with the rule
+        // on; the claim is about the engine's eight.
         first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };

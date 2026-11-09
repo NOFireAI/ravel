@@ -177,7 +177,6 @@ fn executor(store: &Arc<MemoryStore>) -> SqlExecutor {
                 sql_partition_count: Some(PARTITIONS),
                 ..EngineConfig::default()
             },
-            first_attempt_min_partitions: 0,
             ..SqlConfig::default()
         },
         1 << 30,

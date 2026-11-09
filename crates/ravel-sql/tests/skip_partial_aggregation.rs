@@ -458,7 +458,6 @@ async fn run(
         ..SqlConfig::default()
     };
     config.engine.fetch_concurrency = target_partitions;
-    config.first_attempt_min_partitions = 0;
 
     let accounting = QueryAccounting::new();
     let accountant = TenantMemoryAccountant::new(16 << 30);
@@ -699,7 +698,6 @@ async fn skipped_rows_for(groups: i64) -> usize {
 
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(THRESHOLD_PARTITIONS);
-    config.first_attempt_min_partitions = 0;
     let accountant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(accountant, QueryAccounting::new());
     let logs = SessionTable::Logs(Arc::new(LogsTableProvider::new(

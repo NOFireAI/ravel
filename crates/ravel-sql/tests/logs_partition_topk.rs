@@ -299,7 +299,6 @@ fn session_with_max_limit(provider: LogsTableProvider, max_limit: Option<usize>)
         ..SqlConfig::default()
     };
     config.engine.sql_partition_count = Some(PARTITIONS);
-    config.first_attempt_min_partitions = 0;
     let pool = Arc::new(TenantDelegatingPool::new(
         1 << 30,
         TenantMemoryAccountant::new(1 << 30),

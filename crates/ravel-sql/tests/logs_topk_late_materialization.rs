@@ -356,7 +356,6 @@ fn config(setup: Setup) -> SqlConfig {
     // `target_partitions` comes from `fetch_concurrency`. One, by default: see
     // the module header for why every figure below depends on it.
     config.engine.fetch_concurrency = setup.partitions;
-    config.first_attempt_min_partitions = 0;
     config.late_materialization_extra_columns = if setup.rule {
         SqlConfig::default().late_materialization_extra_columns
     } else {

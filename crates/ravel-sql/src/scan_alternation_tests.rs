@@ -85,7 +85,6 @@ fn executor(store: Arc<dyn ObjectStoreBackend>, cache: Arc<Cache<CacheFetchError
             sql_partition_count: Some(1),
             ..ravel_query::EngineConfig::default()
         },
-        first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };
     SqlExecutor::new(

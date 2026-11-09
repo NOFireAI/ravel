@@ -92,9 +92,9 @@ so that the three can diverge later, deliberately, rather than by accident here.
 No default moves. The SQL partition default in particular stays where it is:
 `crates/ravel-sql/src/session.rs:540-544` sets `target_partitions` immediately
 above `with_repartition_aggregations`, which ADR-0094 and ADR-0954 depend on, and
-moving it silently would put those in scope. (A derived count no longer sets the
-in-memory attempt's partitions alone: see the first-attempt floor amendment
-below.)
+moving it silently would put those in scope. (While the count is derived, the
+hash exchange under a final aggregate has at least 16 partitions: see the
+first-attempt floor amendment below.)
 
 **GET concurrency becomes one process-owned limiter**, an `Arc` constructed once
 and shared by every query-side fetcher, replacing the per-fetcher semaphore. The
@@ -170,13 +170,14 @@ changing that default pulls ADR-0094's aggregation gate into scope.
 - No performance claim. If a benchmark moves on this change alone, that is a
   finding to investigate, not the expected outcome.
 
-## Amendment (2026-11-09): the in-memory attempt plans at least 16 partitions (issue #4014)
+## Amendment (2026-11-09): the hash exchange under a final aggregate has at least 16 partitions (issue #4014)
 
 <!-- amendment-applies: sections="Decision" pointer="first-attempt floor amendment" -->
 
 This is the first-attempt floor amendment. The derived `--sql-partition-count`
-default does not move. What changes is that, when the count is derived, a
-statement's in-memory attempt plans at least 16 DataFusion partitions.
+default does not move, and neither does the session's `target_partitions`.
+What changes is that, when the count is derived, the hash exchange feeding a
+final grouped aggregate has at least 16 partitions.
 
 ### First-attempt floor context
 
@@ -197,21 +198,38 @@ when the retry also planned 16 partitions, because it wrote about twice the
 spill files and needed one more merge pass at fan-in 2 (#4014 comment
 6741262204).
 
+Those figures were measured with the floor applied to the whole session's
+`target_partitions`. That moved every scan too, because the scan providers
+read their fan-out from it (`crates/ravel-sql/src/logs_provider.rs:627`,
+`crates/ravel-sql/src/provider.rs:361`,
+`crates/ravel-sql/src/spans_provider.rs:503`): the logs fast path, the
+small-object plan skip, the plan-pass directory reads and the metrics scan's
+memory. The decision below floors only the final aggregate's exchange, and it
+has not been measured again on c6a.large. The effect at the exchange alone is
+pinned by `the_partition_floor_answers_in_memory_where_the_engine_count_retries`
+(`crates/ravel-sql/tests/spill.rs`): on an 8-partition session, a two-key
+`GROUP BY` with a top-10 answers in memory under a process budget on which the
+same statement with an 8-partition exchange takes the spill retry.
+
 ### First-attempt floor decision
 
-1. **A session planned without spill uses at least 16 partitions.**
-   `SqlConfig::first_attempt_min_partitions` (default
-   `DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS`, 16) floors `target_partitions`
-   for a `SpillDecision::Disabled` session at
-   `max(sql_partition_count, floor)`, through
-   `SqlConfig::attempt_partition_count`. On the execute path that is every
-   first attempt, and any statement that plans without spill. A floor of 0
-   turns it off.
-2. **The spill retry keeps the derived count.** Its session is
-   `SpillDecision::Enabled`, so it plans `sql_partition_count` unchanged,
-   because more partitions on the retry cost spill files and a merge pass. A
-   plan-time statement (Flight SQL, pinned plans) that plans with spill keeps
-   the count for the same reason.
+1. **The hash exchange under a final aggregate has at least 16
+   partitions.** `FinalExchangeFloor`
+   (`crates/ravel-sql/src/exchange_floor.rs:44`) rewrites an `AggregateExec`
+   in mode `FinalPartitioned` whose direct input is a `RepartitionExec` with
+   `Hash(exprs, n)` and `n` below `SqlConfig::first_attempt_min_partitions`
+   (default `DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS`, 16): the exchange becomes
+   `Hash(exprs, floor)` over the same input, keeping `preserve_order`. It
+   never inserts an exchange, and an `n` at or above the floor, or a floor of
+   0, leaves the plan as it is. It is the first of Ravel's appended physical
+   optimizer rules (`crates/ravel-sql/src/session.rs:900`), so every later
+   rule matches the final aggregate over the exchange it runs with. The
+   session's `target_partitions` stays at `sql_partition_count`.
+2. **The spill retry is untouched.** Its session is
+   `SpillDecision::Enabled`, which ADR-0954 plans repartition-free, so it has
+   no hash exchange to widen. More partitions on the retry would cost spill
+   files and a merge pass. A plan-time statement (Flight SQL, pinned plans)
+   planned with spill is the same.
 3. **An explicit count turns the floor off.** ravel-server passes the floor
    of 16 only when `sql_partition_count` was derived.
    `--sql-partition-count`, or the legacy `--fetch-concurrency`, sets the
@@ -219,22 +237,45 @@ spill files and needed one more merge pass at fan-in 2 (#4014 comment
    a count chose it, and raising it would override that choice without
    saying so. No flag sets the floor.
 4. **Startup says which.** ravel-server logs
-   `setting="sql_first_attempt_partitions"` with the in-memory attempt's
-   `value` and a `source`: `derived-floor` (a derived count under 16, raised
-   to 16), `derived` (a derived count of 16 or more, unchanged) or `flag` (an
-   explicit count, unchanged).
-5. **The other reads of the count.** The SQL I/O shape takes the attempt's
-   partition count as its scan fan-out. The aggregate reserve-ahead
-   envelope width (`process_envelope_width`) keeps reading the engine count,
-   because one width is shared by every pool on a process budget. A derived
-   count is at least the core count, so that width is the core count either
-   way.
+   `setting="sql_first_attempt_partitions"` with the partition count of the
+   hash exchange under a final aggregate as `value` and a `source`:
+   `derived-floor` (a derived count under 16, raised to 16), `derived` (a
+   derived count of 16 or more, unchanged) or `flag` (an explicit count,
+   unchanged).
+5. **Every other read of the count keeps the engine count.** The scan
+   providers, the SQL I/O shape's scan fan-out (`SqlExecutor::sql_io_shape`)
+   and the aggregate reserve-ahead envelope width (`process_envelope_width`)
+   read `sql_partition_count`.
 
 ### First-attempt floor consequences
 
-- On a host with fewer than 8 cores and a derived count, the in-memory
-  attempt plans 16 partitions where it planned the derived 8 to 14. On 8 or
-  more cores the derived count is already at least 16 and nothing changes.
-- A retry that falls back to planning without spill (its plan is not
-  spill-eligible, or it has no spill share) is planned at the floored count,
-  while its I/O shape was computed with the engine count as its fan-out.
+- On a host with fewer than 8 cores and a derived count, the exchange under
+  a final aggregate has 16 partitions where it had the derived 8 to 14. On 8
+  or more cores the derived count is already at least 16 and nothing
+  changes.
+- Each final stream carries a fixed cost, so the floor raises that cost on a
+  small host: the top-keys heaps and first-groups filters keep one per
+  stream, and a bucketed final aggregate holds about 17 MB per stream
+  (16,987,032 bytes per stream in `top_keys`, 19,146,864 in
+  `bucketed_final_aggregate`), where 16 streams exhaust a 256 MiB pool that
+  their 4 or 8 fit. Under a bounded top-k aggregate the 16 streams' fixed
+  cost puts the peak at 2,100,224 bytes at both 20,000 and 200,000 keys
+  (`bounded_topk_aggregate`). Those tests, and `first_groups`' 1 MiB pool
+  test, set the floor to 0.
+- The operators above a widened final aggregate, up to the next exchange or
+  merge, run at 16 streams. In a `COUNT(DISTINCT)` plan that includes the
+  outer partial aggregate, which sits on the inner final aggregate: ClickBench
+  statement 9's shape on an 8-partition session scans at `RoundRobinBatch(8)`,
+  hashes into 16 partitions from 8 for the inner final aggregate, and into 16
+  from 16 for the outer one (`crates/ravel-sql/tests/final_exchange_floor.rs`).
+- Scans and the first partial aggregate keep the engine count, and with them
+  the logs fast path, the small-object plan skip, the plan-pass directory
+  reads and the metrics scan's memory: `logs_limit_hint` keeps its figures,
+  no verdict read on a `LIKE ... LIMIT` and one directory read per object for
+  a top-k, at the default floor.
+- A statement with no hash exchange under a final aggregate keeps its plan:
+  one whose aggregates are not exact-typed (ADR-0094), a spill-enabled
+  attempt, and a statement with no grouped aggregate.
+- A spill-enabled attempt whose executed plan fails the spill re-check is
+  rebuilt without spill (`SqlExecutor::plan_pinned_with`), and that session's
+  exchange is widened like a first attempt's.

@@ -178,6 +178,9 @@ fn sql_config(
         ..SqlConfig::default()
     };
     config.engine.sql_partition_count = Some(partitions);
+    // The tests read per-partition metrics and drive `partitions` streams by
+    // index, and 16 bucketed streams at about 19 MB each exhaust the 256 MiB
+    // pool, so the final stage runs at `partitions`.
     config.first_attempt_min_partitions = 0;
     config
 }

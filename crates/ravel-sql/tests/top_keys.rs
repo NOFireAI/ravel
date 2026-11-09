@@ -430,7 +430,9 @@ async fn probed_typed(
 }
 
 /// `sql` with the rule on and off, on a 1 GiB pool, at the engine's default
-/// 8 partitions the peak bounds below were measured at.
+/// 8 partitions the peak bounds below were measured at. With 16 final
+/// streams the rule-off envelope falls to about 27 MB, under the 32 MiB
+/// bound that separates it from the rule-on figure.
 async fn on_and_off(
     parts: impl Fn() -> Vec<Vec<RecordBatch>>,
     options: &[(&str, &str)],
@@ -2308,6 +2310,8 @@ async fn the_bucketed_rule_leaves_the_exec_alone() {
             engage_groups: 16,
             ..BucketedFinalAggregation::default()
         }),
+        // Each bucketed final stream holds about 17 MB, so 16 of them exhaust
+        // the default 256 MiB pool with the top-keys rule off.
         first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };

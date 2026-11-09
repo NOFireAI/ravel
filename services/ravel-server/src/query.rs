@@ -622,7 +622,7 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 /// signal table resolves as it did before Parquet tables existed.
 /// [`build_sql_state_with_parquet`] is the same state with Parquet sources
 /// installed, which is what [`crate::start`] builds. This one keeps
-/// `SqlConfig`'s default in-memory partition floor (issue #4014) whatever
+/// `SqlConfig`'s default final-exchange partition floor (issue #4014) whatever
 /// `engine_config.sql_partition_count` says; [`crate::start`] resolves it
 /// with [`resolve_sql_first_attempt_partitions`].
 #[cfg(feature = "sql")]
@@ -769,25 +769,28 @@ impl ResolvedBulkScanMinBytes {
 }
 
 /// `source` of a `sql_first_attempt_partitions` line whose derived partition
-/// count is below the floor, so the in-memory attempt plans the floor.
+/// count is below the floor, so the in-memory attempt's final hash exchange is
+/// widened to the floor.
 pub const FIRST_ATTEMPT_SOURCE_DERIVED_FLOOR: &str = "derived-floor";
 /// `source` of a `sql_first_attempt_partitions` line whose derived partition
-/// count is already at or above the floor, so the attempt plans that count.
+/// count is already at or above the floor, so that exchange keeps that count.
 pub const FIRST_ATTEMPT_SOURCE_DERIVED: &str = "derived";
 /// `source` of a `sql_first_attempt_partitions` line whose partition count was
 /// set by `--sql-partition-count` or the legacy `--fetch-concurrency`, which
 /// turns the floor off.
 pub const FIRST_ATTEMPT_SOURCE_FLAG: &str = "flag";
 
-/// The partition count an executed SQL statement's in-memory first attempt
-/// plans (issue #4014), and the floor that produced it.
+/// The partition count of the hash exchange under a final grouped aggregate
+/// on an executed SQL statement's in-memory first attempt (issue #4014), and
+/// the floor that produced it. Scans and partial aggregates keep
+/// `sql_partition_count`.
 #[cfg(feature = "sql")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedFirstAttemptPartitions {
     /// `SqlConfig::first_attempt_min_partitions`: the default floor for a
     /// derived count, `0` (off) for an explicit one.
     pub min_partitions: usize,
-    /// What the in-memory attempt plans: `max(sql_partition_count,
+    /// That exchange's partition count: `max(sql_partition_count,
     /// min_partitions)`.
     pub value: usize,
     /// One of the `FIRST_ATTEMPT_SOURCE_*` constants.
@@ -798,7 +801,8 @@ pub struct ResolvedFirstAttemptPartitions {
 /// `sql_partition_count` and its `PERF_SOURCE_*` source. A derived count keeps
 /// `SqlConfig`'s default floor; a count the operator set, through
 /// `--sql-partition-count` or `--fetch-concurrency`, is planned as given. The
-/// spill retry plans `sql_partition_count` either way.
+/// spill retry has no hash exchange to widen, so it plans
+/// `sql_partition_count` either way.
 #[cfg(feature = "sql")]
 pub fn resolve_sql_first_attempt_partitions(
     sql_partition_count: usize,

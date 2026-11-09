@@ -1864,7 +1864,8 @@ fn cold_executor(
             // `fetch_concurrency` is always set here, as `ravel-server
             // --fetch-concurrency` sets it, and that flag turns the
             // first-attempt floor off; it also keeps
-            // `sql_partition_count_effective` the count every attempt plans.
+            // `sql_partition_count_effective` the count a final aggregate's
+            // exchange plans.
             first_attempt_min_partitions: 0,
             ..SqlConfig::default()
         },

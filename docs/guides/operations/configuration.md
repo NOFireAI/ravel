@@ -2187,7 +2187,7 @@ published ClickBench run used.
 |---|---|---|---|
 | `--fetch-concurrency` | derived: `max(8, 2 x cores)` | 32 | Legacy combined knob: sets `--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout` together (source `legacy-flag`). Combining it with any of the three is a startup error naming both flags. |
 | `--store-get-concurrency` | derived: `max(8, 2 x cores)` | 32 | Permit count for the one process-wide `GetLimiter` every fetcher (RSEG, RLOG, RSPAN) shares. Host cores and the store's request budget. |
-| `--sql-partition-count` | derived: `max(8, 2 x cores)` | 32 | DataFusion `target_partitions` for every SQL session the server builds, except that while it is derived a statement's in-memory attempt plans at least 16 (see below). Host cores and query parallelism vs. per-partition overhead. |
+| `--sql-partition-count` | derived: `max(8, 2 x cores)` | 32 | DataFusion `target_partitions` for every SQL session the server builds. While it is derived, the hash exchange under a final grouped aggregate has at least 16 partitions (see below). Host cores and query parallelism vs. per-partition overhead. |
 | `--promql-fetch-fanout` | derived: `max(8, 2 x cores)` | 32 | PromQL/analytics per-query segment fetch fan-out. Host cores and the store's request budget. |
 | `--max-segments` | fixed: 1,000,000 (host-independent) | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
 | `--max-series` | fixed: 10,000 (host-independent) | 10,000 | Distinct series one PromQL query may materialize. A count that bounds plan width; the bytes behind it are bounded by the memory budget. Process-wide, with no limits-file key. |
@@ -2205,13 +2205,16 @@ A value of `0` in any of `--fetch-concurrency`, `--store-get-concurrency`,
 names that flag. Startup raises it before any fetcher, engine, or SQL session
 exists.
 
-While the SQL partition count is derived, a statement's in-memory attempt
-plans at least 16 partitions. A high-cardinality `GROUP BY` then builds
-smaller hash tables and fits in less memory, so on a small host it answers
-in memory more often instead of taking the spill retry. The spill retry
-plans the derived count, and `--sql-partition-count` or `--fetch-concurrency`
-turns the floor off, so every attempt plans the count you set. There is no
-flag for the floor itself. Startup logs the in-memory attempt's count:
+While the SQL partition count is derived, the hash exchange that feeds a
+final grouped aggregate has at least 16 partitions. A high-cardinality
+`GROUP BY` then builds smaller final hash tables and fits in less memory, so
+on a small host it answers in memory more often instead of taking the spill
+retry. Scans and partial aggregation keep the derived count, and so does
+everything else in the plan below that exchange. A statement with no such
+exchange is unchanged: one whose aggregates are not exact-typed, and the spill
+retry, which plans without exchanges. `--sql-partition-count` or
+`--fetch-concurrency` turns the floor off, so the exchange has the count you
+set. There is no flag for the floor itself. Startup logs the exchange's count:
 
 ```
 INFO performance default resolved setting="sql_first_attempt_partitions" value=16 source="derived-floor"

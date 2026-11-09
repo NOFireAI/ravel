@@ -3758,9 +3758,9 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 cache.as_ref().map(|_| config.cache_max_bytes),
             );
             bulk_scan_min_bytes.emit();
-            // Issue #4014: the in-memory first attempt plans at least 16
-            // partitions when the count is derived, and the count as given
-            // when an operator set it.
+            // Issue #4014: the in-memory first attempt's final hash exchange
+            // has at least 16 partitions when the count is derived, and the
+            // count as given when an operator set it.
             let first_attempt_partitions = query::resolve_sql_first_attempt_partitions(
                 config.query_budgets.sql_partition_count,
                 config.query_budgets.sql_partition_count_source,

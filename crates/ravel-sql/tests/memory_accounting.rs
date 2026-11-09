@@ -237,7 +237,6 @@ async fn held_during_group_by(spill: SpillDecision<'_>) -> (usize, usize, usize)
     // under a limit.
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(1);
-    config.first_attempt_min_partitions = 0;
     let accountant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());
     let held = || {

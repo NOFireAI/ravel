@@ -71,7 +71,6 @@ async fn run(reserve_ahead: AggregateReserveAhead) -> SqlOutcome {
     // scheduling jitter alone shifts it a little between otherwise identical
     // runs. One partition makes both runs' timing the same.
     config.engine.sql_partition_count = Some(1);
-    config.first_attempt_min_partitions = 0;
     let fixture = Fixture::build(store, &[(&tenant, &specs)], config, 1 << 30).await;
     fixture
         .executor

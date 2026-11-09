@@ -123,7 +123,6 @@ fn single_partition_config(segment_timing: bool) -> SqlConfig {
             ..EngineConfig::default()
         },
         segment_timing,
-        first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     }
 }

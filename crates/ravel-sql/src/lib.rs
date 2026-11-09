@@ -73,6 +73,7 @@ pub mod distributed;
 pub mod distributed_rlog;
 mod error;
 pub mod esql;
+mod exchange_floor;
 mod executor;
 mod first_groups;
 #[cfg(feature = "flight-sql")]

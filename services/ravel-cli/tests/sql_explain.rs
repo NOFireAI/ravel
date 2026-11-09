@@ -290,9 +290,10 @@ fn hash_partitions(output: &str) -> usize {
     digits.parse().expect("hash partition count")
 }
 
-/// Without `--sql-partitions` the plan takes the default configuration's
-/// first-attempt floor of 16 partitions over the default count of 8; with
-/// `--sql-partitions 4` it plans 4, as the server does for an explicit
+/// Without `--sql-partitions` the hash exchange under the final aggregate
+/// takes the default configuration's first-attempt floor of 16 partitions over
+/// the default count of 8; with `--sql-partitions 4` it plans 4, as the server
+/// does for an explicit
 /// `--sql-partition-count 4`, which turns the floor off.
 #[tokio::test]
 async fn sql_partitions_turns_the_first_attempt_floor_off_as_the_server_flag_does() {

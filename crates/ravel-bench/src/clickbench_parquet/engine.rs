@@ -57,7 +57,8 @@ pub trait SuiteEngine: Send + Sync {
 /// runs and the comparator's ULP tolerance has to cover that. 8 is the count
 /// `SqlConfig::default()` resolves to (`ravel_query::DEFAULT_FETCH_CONCURRENCY`).
 /// [`InProcessEngine`] turns the first-attempt floor off, which would
-/// otherwise plan its in-memory attempt at 16 while the reference plans 8.
+/// otherwise widen its final aggregates' exchanges to 16 while the reference
+/// plans 8.
 pub const PLAN_PARTITIONS: usize = 8;
 
 /// In-process `SqlExecutor`, wired to a second "lake" `MemoryStore` the way

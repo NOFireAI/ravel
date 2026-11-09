@@ -4480,7 +4480,7 @@ pub struct QueryBudgets {
     /// Where [`Self::sql_partition_count`] came from, one of the
     /// `PERF_SOURCE_*` constants [`resolve_performance_defaults`] gave it.
     /// `query::resolve_sql_first_attempt_partitions` reads it to keep the
-    /// in-memory attempt's floor (issue #4014) off an operator's explicit
+    /// final-exchange partition floor (issue #4014) off an operator's explicit
     /// count.
     pub sql_partition_count_source: &'static str,
     /// The resolved PromQL fetch fan-out width (ADR-1195), same resolution

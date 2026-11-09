@@ -230,12 +230,7 @@ fn executor(store: &Arc<dyn ObjectStoreBackend>) -> SqlExecutor {
         SegmentFetcher::new(Arc::clone(store)),
         logs,
         SpanSegmentFetcher::new(Arc::clone(store)),
-        // The engine's default 8 partitions, as many as [`OBJECTS`], so the
-        // fast path takes each scan.
-        SqlConfig {
-            first_attempt_min_partitions: 0,
-            ..SqlConfig::default()
-        },
+        SqlConfig::default(),
         1 << 30,
     )
     .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared())))

@@ -153,6 +153,7 @@ use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
 use crate::compact_slices::CompactSlices;
 use crate::config::{DEFAULT_SPILL_MERGE_FAN_IN, SqlConfig};
+use crate::exchange_floor::FinalExchangeFloor;
 use crate::first_groups::FirstGroupsLimit;
 use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::ipcrypt_udf::SessionPrincipal;
@@ -642,9 +643,6 @@ fn disk_manager_builder(spill: SpillDecision<'_>, merge_fan_in: usize) -> DiskMa
 /// [`SpillDecision::Enabled`] query gets no `RepartitionExec` at all, so
 /// `repartition_aggregations` is forced off and DataFusion's round-robin
 /// repartitioning is disabled with it. See [`repartition_free`] for why.
-/// It also picks `target_partitions`, through
-/// [`SqlConfig::attempt_partition_count`]: a `Disabled` session takes the
-/// in-memory attempt's floor (issue #4014) and an `Enabled` one does not.
 pub fn session_config(
     config: &SqlConfig,
     exact_typed_aggregates: bool,
@@ -653,7 +651,7 @@ pub fn session_config(
     let repartition_free = repartition_free(spill);
     let mut session = SessionConfig::new()
         .with_information_schema(false)
-        .with_target_partitions(config.attempt_partition_count(spill))
+        .with_target_partitions(config.engine.sql_partition_count())
         // ADR-0094: the only knob that is ever true, and only for a query whose
         // aggregates and group keys are all exact-typed. See the module docs.
         // ADR-0954 takes it back for a spill-enabled query.
@@ -892,6 +890,16 @@ pub fn build_session_with_tables(
         // `trace_id IN ('<32-hex>', ...)` against the native trace id column,
         // rewritten before `type_coercion`; see `crate::trace_id_planner`.
         .with_analyzer_rules(crate::trace_id_planner::analyzer_rules())
+        // Issue #4014 (ADR-1195 amendment of 2026-11-09): widen the hash
+        // exchange under a `FinalPartitioned` aggregate to the floor. First of
+        // the appended rules, so every rule below matches the final aggregate
+        // over the exchange it will run with, and before
+        // `DictionaryGroupKeysAsViews`, which can put a cast between the two.
+        // A spill-enabled session has no exchange to widen. See
+        // `crate::exchange_floor`.
+        .with_physical_optimizer_rule(Arc::new(FinalExchangeFloor::new(
+            config.first_attempt_min_partitions,
+        )))
         .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
         // ADR-0850 item 2: answer `COUNT(*) WHERE <declared column> <>
         // <literal>` and `GROUP BY <declared column>, COUNT(*)` from exact
@@ -1326,8 +1334,7 @@ mod tests {
 
     /// ADR-1195: `target_partitions` follows the resolved
     /// `sql_partition_count` knob, not the legacy `fetch_concurrency` field
-    /// directly, once an explicit override is set. The floor is off here, as
-    /// ravel-server sets it for an explicit count.
+    /// directly, once an explicit override is set.
     #[test]
     fn target_partitions_follows_the_resolved_sql_partition_count() {
         let config = SqlConfig {
@@ -1336,52 +1343,10 @@ mod tests {
                 sql_partition_count: Some(5),
                 ..ravel_query::EngineConfig::default()
             },
-            first_attempt_min_partitions: 0,
             ..SqlConfig::default()
         };
         let session = session_config(&config, false, SpillDecision::Disabled);
         assert_eq!(session.options().execution.target_partitions, 5);
-    }
-
-    /// Issue #4014: a `Disabled` session plans at least
-    /// `first_attempt_min_partitions` partitions and an `Enabled` one, the
-    /// spill retry on the execute path, plans the engine count; a floor of 0
-    /// plans the engine count for both, and an engine count at or above the
-    /// floor is unchanged for both.
-    #[test]
-    fn the_in_memory_attempt_is_floored_and_the_spill_attempt_is_not() {
-        let dir = std::path::PathBuf::from("/tmp/does-not-need-to-exist");
-        let enabled = SpillDecision::Enabled {
-            dir: dir.as_path(),
-            max_bytes: 1 << 20,
-        };
-        let config = |count: usize, floor: usize| SqlConfig {
-            engine: ravel_query::EngineConfig {
-                sql_partition_count: Some(count),
-                ..ravel_query::EngineConfig::default()
-            },
-            first_attempt_min_partitions: floor,
-            ..SqlConfig::default()
-        };
-        let planned = |config: &SqlConfig, spill: SpillDecision<'_>| {
-            let session = session_config(config, true, spill);
-            (
-                session.options().execution.target_partitions,
-                config.attempt_partition_count(spill),
-            )
-        };
-
-        let floored = config(8, SqlConfig::default().first_attempt_min_partitions);
-        assert_eq!(planned(&floored, SpillDecision::Disabled), (16, 16));
-        assert_eq!(planned(&floored, enabled), (8, 8));
-
-        let off = config(8, 0);
-        assert_eq!(planned(&off, SpillDecision::Disabled), (8, 8));
-        assert_eq!(planned(&off, enabled), (8, 8));
-
-        let wide = config(32, SqlConfig::default().first_attempt_min_partitions);
-        assert_eq!(planned(&wide, SpillDecision::Disabled), (32, 32));
-        assert_eq!(planned(&wide, enabled), (32, 32));
     }
 
     #[test]
@@ -2441,6 +2406,28 @@ mod tests {
             .last()
             .expect("the session has physical optimizer rules");
         assert_eq!(last.name(), crate::memory::AGGREGATE_PROFILE_RULE);
+    }
+
+    /// Issue #4014: the exchange floor is the first of Ravel's appended rules,
+    /// directly before `DictionaryGroupKeysAsViews`.
+    #[test]
+    fn the_exchange_floor_is_the_first_appended_physical_optimizer_rule() {
+        let ctx = samples_and_logs();
+        let state = ctx.state();
+        let names: Vec<&str> = state
+            .physical_optimizers()
+            .iter()
+            .map(|rule| rule.name())
+            .collect();
+        let at = names
+            .iter()
+            .position(|name| *name == crate::exchange_floor::FINAL_EXCHANGE_FLOOR_RULE)
+            .expect("the floor rule is installed");
+        assert_eq!(
+            names.get(at + 1),
+            Some(&crate::group_keys::DICTIONARY_GROUP_KEYS_RULE),
+            "{names:?}"
+        );
     }
 
     fn session_with(tables: Vec<SessionTable>) -> SessionContext {

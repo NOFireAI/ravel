@@ -204,12 +204,7 @@ fn executor_with(
         SegmentFetcher::new(Arc::clone(store)),
         logs,
         SpanSegmentFetcher::new(Arc::clone(store)),
-        // The engine's default 8 partitions, the count [`striped`] and the
-        // fast-path tests below are written against.
-        SqlConfig {
-            first_attempt_min_partitions: 0,
-            ..SqlConfig::default()
-        },
+        SqlConfig::default(),
         1 << 30,
     )
     .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared())))
