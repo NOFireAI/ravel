@@ -710,10 +710,11 @@ pub struct SkippedRep {
 /// repetitions, so each repetition's cost sits beside its own latency; a
 /// repetition skipped after a timeout is a [`SkippedRep`] instead (ADR-0927's
 /// 2026-11-06 amendment).
-/// `accounting`, `phases`, the four segment counters, `estimate` and `io` are
-/// the same-named members of `data.stats` copied from the answer body as
-/// returned, each read on its own; any one is `None` (serialized `null`, never
-/// 0) when the answer carries no `data.stats` or the stats lack that member.
+/// `accounting`, `phases`, the four segment counters, `labelIndexValues`,
+/// `estimate` and `io` are the same-named members of `data.stats` copied from
+/// the answer body as returned, each read on its own; any one is `None`
+/// (serialized `null`, never 0) when the answer carries no `data.stats` or the
+/// stats lack that member.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct RavelCost {
     pub entry: String,
@@ -735,6 +736,11 @@ pub struct RavelCost {
     pub segments_pruned_by_dictionary: Option<Json>,
     #[serde(rename = "segmentsPrunedByLabelIndex")]
     pub segments_pruned_by_label_index: Option<Json>,
+    /// The per-value label index route figures (one element per routed
+    /// matcher value: leaf GETs, cache hits, covering parts and parts beyond
+    /// the ceiling among them).
+    #[serde(rename = "labelIndexValues")]
+    pub label_index_values: Option<Json>,
     pub estimate: Option<Json>,
     pub io: Option<Json>,
     /// Which harness pass this run belongs to (`unfolded`, `folded-unrouted`,
@@ -774,6 +780,7 @@ impl RavelCost {
             segments_pruned: field("segmentsPruned"),
             segments_pruned_by_dictionary: field("segmentsPrunedByDictionary"),
             segments_pruned_by_label_index: field("segmentsPrunedByLabelIndex"),
+            label_index_values: field("labelIndexValues"),
             estimate: field("estimate"),
             io: field("io"),
             pass_label: None,
@@ -2079,6 +2086,32 @@ mod tests {
     }
 
     #[test]
+    fn ravel_cost_label_index_values_is_null_when_the_stats_lack_it() {
+        use ravel_promql_difftest::prometheus_client::QueryTiming;
+        let outcome = QueryOutcome::Envelope {
+            http_status: 200,
+            body: serde_json::json!({"status": "success", "data": {
+                "resultType": "vector",
+                "result": [],
+                "stats": {"segmentsPrunedByLabelIndex": 0},
+            }}),
+            timing: QueryTiming::default(),
+        };
+        let record =
+            serde_json::to_value(RavelCost::of("e", (1, 1), ResultStatus::Ok, 1.0, &outcome))
+                .expect("serializes");
+        assert_eq!(record["segmentsPrunedByLabelIndex"], 0);
+        assert!(
+            record
+                .as_object()
+                .expect("object")
+                .contains_key("labelIndexValues")
+                && record["labelIndexValues"].is_null(),
+            "stats without labelIndexValues record it as null, not left out"
+        );
+    }
+
+    #[test]
     fn ravel_cost_copies_every_stats_field_and_nulls_the_absent_ones() {
         use ravel_promql_difftest::prometheus_client::QueryTiming;
         let body = serde_json::json!({"status": "success", "data": {
@@ -2091,6 +2124,8 @@ mod tests {
                 "segmentsPruned": 3,
                 "segmentsPrunedByDictionary": 1,
                 "segmentsPrunedByLabelIndex": 2,
+                "labelIndexValues": [{"labels": ["job"], "leafGetRequests": 1,
+                                      "partsCovered": 2, "partsBeyondCeiling": 0}],
                 "estimate": {"segments": 9},
             },
         }});
@@ -2111,6 +2146,11 @@ mod tests {
         assert_eq!(record["segmentsPruned"], 3);
         assert_eq!(record["segmentsPrunedByDictionary"], 1);
         assert_eq!(record["segmentsPrunedByLabelIndex"], 2);
+        assert_eq!(
+            record["labelIndexValues"],
+            serde_json::json!([{"labels": ["job"], "leafGetRequests": 1,
+                                "partsCovered": 2, "partsBeyondCeiling": 0}])
+        );
         assert_eq!(record["estimate"], serde_json::json!({"segments": 9}));
         assert!(
             record.as_object().expect("object").contains_key("io") && record["io"].is_null(),
@@ -2138,6 +2178,7 @@ mod tests {
             "segmentsPruned",
             "segmentsPrunedByDictionary",
             "segmentsPrunedByLabelIndex",
+            "labelIndexValues",
             "estimate",
             "io",
             "pass_label",

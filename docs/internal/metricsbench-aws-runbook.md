@@ -143,7 +143,18 @@ function of the anchor and the seed.
   `MB_STAGE1=1` for every profile but `ci`, which defaults to
   `deploy/metricsbench/stage1-bands.ci.json`; `launch.sh` refuses it unset
   where it is required, a path that is not a file at the harness commit, and
-  the variable set without `MB_STAGE1=1`, with exit 64.
+  the variable set without `MB_STAGE1=1`, with exit 64;
+- `MB_STAGE1_ARMS`, `MB_CONTROL_IMAGE` and `MB_CONTROL_SOURCE_COMMIT`, the
+  Stage 1 arms of issue #3969 (`run.sh`'s `MB_STAGE1_ARMS`, a comma list of
+  `extra-hour`, `l1` and `erasure`, and the control image, digest-pinned,
+  with the commit it was built from). They reach the measured run only, not
+  the ci smoke, and the box pulls the control image beside the main one;
+  `launch.sh` refuses any of them without `MB_STAGE1=1`, a control image
+  without `@sha256:` and one without its commit, with exit 64. The
+  extra-hour arm waits until its hour lands above the routed watermark and
+  the l1 arm until the newest ingest hour seals, each up to about an hour
+  (predicted, not measured); the erasure arm waits for its rewrite, at most
+  120 polls 15 s apart. The nightly workflow sets none of them.
 
 Both bands default only for `cardinality`. Another profile's count and memory
 differ, so `launch.sh` refuses a different `MB_PROFILE` unless both bands

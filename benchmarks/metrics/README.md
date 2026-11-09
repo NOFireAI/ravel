@@ -1230,7 +1230,9 @@ returns). Its fields
   and `null` (never 0) when the stats lack it; `pass_label` and
   `fold_state`, the values of `--pass-label` and `--fold-state` (`null`
   without them; ADR-3694 Stage 1 labels its passes `unfolded`,
-  `background-folded`, `folded-unrouted` and `folded-routed`, while `pass`
+  `background-folded`, `folded-unrouted` and `folded-routed`, and its arms
+  `folded-control`, `folded-l1`, `folded-erasure-reference` and
+  `folded-erasure-pending`, while `pass`
   stays the timed pass number); and `result_hash`, `blake3:<hex>` over the
   answer's `resultType` and `result`, with each series' labels sorted by
   name, every timestamp and float hashed by its `f64::to_bits`, and the

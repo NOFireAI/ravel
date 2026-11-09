@@ -289,13 +289,46 @@
 #                                       z23: a statement not route-bound is
 #                                       listed; z24: a parts_rebuilt that is
 #                                       not a whole number refuses the routed
-#                                       pass; z27a-f: an inspect stamp not
-#                                       written, a leaf part count not read
+#                                       pass; z25: a routed prune count that
+#                                       is not the expected one is a
+#                                       mismatch; z26: a route-bound routed
+#                                       record that read no leaf is counted,
+#                                       z26u: one not route-bound is not;
+#                                       z27: the figures of nightly run
+#                                       42495422937 check clean; z28a-f: an
+#                                       inspect stamp not written, a leaf part
+#                                       count not read back or not a whole
+#                                       number refuses each pass; z29a-d: a
+#                                       watermark or parts figure not read
 #                                       back or not a whole number refuses
-#                                       each pass. stage1-check.sh: the ci
-#                                       band file clean on z1, z20 and z21,
-#                                       out of band on z2, z2b, z15, z16, z17
-#                                       and z22, a
+#                                       the pass; z30: per-value route
+#                                       figures over their bound counted.
+#                                       Arms (issue #3969): za: every arm
+#                                       on, their steps in order, seven
+#                                       recreates (the control's alone on
+#                                       the control image), the arm folds'
+#                                       flags, both extra-hour folds from
+#                                       one HEAD, the seal wait before
+#                                       compact-tenant, the erasure's
+#                                       submit, pending pass, maintain
+#                                       container and status in order; za1
+#                                       (z1's run): no arm step, each arm
+#                                       stamped skipped; zb (control), zc
+#                                       (extra hour), zd (l1), ze (erasure):
+#                                       each arm alone, with figures out of
+#                                       its bands; zf1: a control image with
+#                                       no digest 65, zf2: no source commit,
+#                                       zf3: arms without MB_STAGE1 and zf4:
+#                                       an unknown arm 64; zg: a HEAD that
+#                                       does not read back refuses the
+#                                       second extra-hour fold (70); zh: an
+#                                       erasure never COMPLETED ends the run
+#                                       at stage1-erasure-rewrite (70).
+#                                       stage1-check.sh: the ci band file
+#                                       clean on z1 (arm figures n/a), za,
+#                                       z20 and z21, out of band on z2, z2b,
+#                                       z15, z16, z17, z22, zb, zc, zd, ze
+#                                       and an edited copy of za, a
 #                                       missing cold count, missing,
 #                                       duplicated, not finite (a NaN figure
 #                                       out of band, a NaN bound 65), a
@@ -386,10 +419,16 @@ case "$1" in
           exit 1
           ;;
       esac
-      [ "${STUB_START_EXIT:-0}" -eq 0 ] || exit "${STUB_START_EXIT}"
-      echo running >"${STUB_STATE}.ravel"
-      rm -f "${STUB_STATE}.notready"
-      exit 0
+      # A recreate of the stopped container is logged as any other recreate.
+      case " $* " in
+        *" --force-recreate "*) echo running >"${STUB_STATE}.ravel" ;;
+        *)
+          [ "${STUB_START_EXIT:-0}" -eq 0 ] || exit "${STUB_START_EXIT}"
+          echo running >"${STUB_STATE}.ravel"
+          rm -f "${STUB_STATE}.notready"
+          exit 0
+          ;;
+      esac
     fi
     case "$sub" in
       # The Stage 1 recreates of ravel-server: each logs the flags ravel.yml
@@ -399,6 +438,7 @@ case "$1" in
         case " $* " in
           *" --force-recreate "*)
             printf 'docker-env recreate RAVEL_SERVER_EXTRA_FLAGS=%s\n' "${RAVEL_SERVER_EXTRA_FLAGS-<unset>}" >>"${STUB_LOG}"
+            printf 'docker-image recreate RAVEL_IMAGE=%s\n' "${RAVEL_IMAGE-<unset>}" >>"${STUB_LOG}"
             [ "${STUB_RECREATE_EXIT:-0}" -eq 0 ] || exit "${STUB_RECREATE_EXIT}"
             n=$(($(cat "${STUB_STATE}.recreates" 2>/dev/null || echo 0) + 1))
             echo "$n" >"${STUB_STATE}.recreates"
@@ -472,7 +512,68 @@ JSON
         [ -z "${STUB_RESTART_NOT_READY:-}" ] || : >"${STUB_STATE}.notready"
         ;;
       run)
+        printf 'docker-image run RAVEL_IMAGE=%s\n' "${RAVEL_IMAGE-<unset>}" >>"${STUB_LOG}"
         case " $* " in
+          # The Stage 1 arms' HEAD save and restore (aws s3 cp on
+          # createbuckets): a download to /stage1-s3/NAME/ writes the HEAD
+          # $STUB_STATE.head holds (default head-0) under the host directory
+          # mounted at /stage1-s3; an upload from there puts it back, or
+          # "broken" with STUB_HEAD_RESTORE_BROKEN.
+          *" s3 cp "*)
+            argv_=("$@")
+            host="" src="" dst=""
+            for ((i = 0; i < ${#argv_[@]}; i++)); do
+              case "${argv_[$i]}" in
+                -v) [ "${argv_[$((i + 1))]#*:}" != /stage1-s3 ] || host="${argv_[$((i + 1))]%%:*}" ;;
+                cp) src="${argv_[$((i + 2))]}" dst="${argv_[$((i + 3))]}" ;;
+              esac
+            done
+            case "$dst" in
+              /stage1-s3/*)
+                head="${host}${dst#/stage1-s3}h1/catalog/m"
+                mkdir -p "$head"
+                if [ -s "${STUB_STATE}.head" ]; then cp "${STUB_STATE}.head" "${head}/HEAD"; else echo head-0 >"${head}/HEAD"; fi
+                ;;
+              *)
+                if [ -n "${STUB_HEAD_RESTORE_BROKEN:-}" ]; then
+                  echo broken >"${STUB_STATE}.head"
+                else
+                  cp "${host}${src#/stage1-s3}h1/catalog/m/HEAD" "${STUB_STATE}.head"
+                fi
+                ;;
+            esac
+            ;;
+          # maintain compact-tenant: every counter line, 2 hours compacted
+          # and 2 parts written; exit STUB_COMPACT_EXIT.
+          *" compact-tenant "*)
+            [ "${STUB_COMPACT_EXIT:-0}" -eq 0 ] || exit "${STUB_COMPACT_EXIT}"
+            printf 'compacted: 2\nalready: 0\nrewrite_present: 0\nnot_sealed: 0\nbelow_min: 0\ntombstoned: 0\nclaim_skipped: 0\nclaim_cancelled: 0\nheld_out_of_window: 0\ngeometry_unsupported: 0\nparts (wrote): 2\nwall_time_ms: 40\nfailed: 0\n'
+            : >"${STUB_STATE}.compacted"
+            ;;
+          *" erase submit "*)
+            [ "${STUB_ERASE_SUBMIT_EXIT:-0}" -eq 0 ] || exit "${STUB_ERASE_SUBMIT_EXIT}"
+            echo "submitted"
+            ;;
+          # erase status: COMPLETED with 5 records dropped from ingest hour
+          # 490000 once the maintain container has started, PENDING before
+          # it or with STUB_ERASE_PENDING.
+          *" erase status "*)
+            argv_=("$@")
+            for ((i = 0; i < ${#argv_[@]}; i++)); do
+              [ "${argv_[$i]}" != --request-id ] || id="${argv_[$((i + 1))]}"
+            done
+            if [ -z "${STUB_ERASE_PENDING:-}" ] && [ -e "${STUB_STATE}.maintain" ]; then
+              printf '%s: COMPLETED\n  deferral cause: none\n  buckets:\n    signal=metrics shard=0 ingest_hour_bucket=490000 dropped_count=5\n' "$id"
+              : >"${STUB_STATE}.erased"
+            else
+              printf '%s: PENDING\n  deferral cause: none\n' "$id"
+            fi
+            ;;
+          *" --mode maintain "*)
+            [ "${STUB_MAINTAIN_EXIT:-0}" -eq 0 ] || exit "${STUB_MAINTAIN_EXIT}"
+            : >"${STUB_STATE}.maintain"
+            echo "id-maintain"
+            ;;
           *" list-objects-v2 "*)
             # The objects step's listing of Ravel's bucket: STUB_LISTING's
             # file, else STUB_LIST_DATA (default 300) data objects and one
@@ -519,7 +620,10 @@ JSON
             [ "${STUB_SPANS_LIST_EXIT:-0}" -eq 0 ] || exit "${STUB_SPANS_LIST_EXIT}"
             [ -z "${STUB_SPANS_OBJECTS_GONE:-}" ] || rm -f "${STUB_SPANS_OBJECTS_GONE}"
             if [ -n "${STUB_SPANS_HEADER_STDOUT:-}" ]; then echo 'store: s3'; else echo 'store: s3' >&2; fi
-            python3 -I -c 'import json,sys; n=int(sys.argv[1]); l1=sys.argv[2]=="1"; H=3600*10**9; spans=[H//2,3*H//2,3*H,12*H,30*H]; print("\n".join(json.dumps({"key":f"t/h1/m/l0/{i:06d}.rseg","level":"L1" if l1 and i%3==0 else "L0","shard":i%4,"ingest_hour_bucket":490000+i%2,"object_size":100,"min_event_ts_ns":10**18,"max_event_ts_ns":10**18+spans[i%5]}) for i in range(n)))' "${STUB_LIST_DATA:-300}" "${STUB_SPANS_L1:-0}"
+            l1="${STUB_SPANS_L1:-0}" extra=0
+            [ ! -e "${STUB_STATE}.compacted" ] || l1=1
+            [ ! -e "${STUB_STATE}.extra" ] || extra=1
+            python3 -I -c 'import json,sys; n=int(sys.argv[1]); l1=sys.argv[2]=="1"; x=sys.argv[3]=="1"; H=3600*10**9; spans=[H//2,3*H//2,3*H,12*H,30*H]; print("\n".join(json.dumps({"key":f"t/h1/m/l0/{i:06d}.rseg","level":"L1" if l1 and i%3==0 else "L0","shard":i%4,"ingest_hour_bucket":490002 if x and i%10==9 else 490000+i%2,"object_size":100,"min_event_ts_ns":10**18,"max_event_ts_ns":10**18+spans[i%5]}) for i in range(n)))' "${STUB_LIST_DATA:-300}" "$l1" "$extra"
             ;;
           *" catalog inspect "*)
             [ "${STUB_SPANS_INSPECT_EXIT:-0}" -eq 0 ] || exit "${STUB_SPANS_INSPECT_EXIT}"
@@ -527,17 +631,21 @@ JSON
             if [ -n "${STUB_INSPECT_HEAD_ABSENT:-}" ]; then
               echo 'HEAD at t/h1/m/head is absent or unreadable: not found'
             else
-              printf 'format_version: 1\nshard_count: 4\nwatermark_hour: 490001\nparts: %s\n' "${STUB_INSPECT_PARTS_LINE:-3}"
+              wm=490001 parts="0 1 2" sfx="" tail_uncovered="${STUB_EXTRA_UNCOVERED:-0}"
+              [ ! -e "${STUB_STATE}.extra" ] || { wm=490002 parts="0 1 2 3"; }
+              [ ! -e "${STUB_STATE}.erased" ] || [ -n "${STUB_ERASURE_STALE:-}" ] || sfx=-e
+              printf 'format_version: 1\nshard_count: 4\nwatermark_hour: %s\nparts: %s\n' "$wm" "${STUB_INSPECT_PARTS_LINE:-$(echo $parts | wc -w)}"
               leaf_parts="${STUB_INSPECT_LEAF_PARTS:-0}"
               [ ! -e "${STUB_STATE}.rebuilt" ] || leaf_parts="${STUB_INSPECT_REBUILT_LEAF_PARTS:-3}"
-              for i in 0 1 2; do
-                refs=1
+              for i in $parts; do
+                refs=1 lo=490000 hi=490001 unc=0
                 [ "$i" -ge "$leaf_parts" ] || refs=2
-                printf '  part[%s] range=[490000,490001] key=t/h1/m/catalog/part-%s\n' "$i" "$i"
+                [ "$i" -ne 3 ] || { refs=2 lo=490002 hi=490002 unc="$tail_uncovered"; }
+                printf '  part[%s] range=%s..=%s key=t/h1/m/catalog/part-%s blake3=b%s size=1000 entry_count=10\n' "$i" "$lo" "$hi" "$i" "$i"
                 printf '    column_stats (field 7): ABSENT\n    key_index (field 8): %s\n' "$refs"
-                printf '      field=metric_name slice=0..64 key=t/h1/m/ki/%s-n\n' "$i"
-                [ "$refs" -eq 1 ] || printf '      field=label_value slice=0..128 key=t/h1/m/ki/%s-v\n' "$i"
-                printf '    header: format_version=1 watermark_hour=490001\n    entries (decoded): 10\n'
+                printf '      field=metric_name slice=0x00..=0x7f entry_count=10 uncovered_count=0 key=t/h1/m/ki/%s-n%s\n' "$i" "$sfx"
+                [ "$refs" -eq 1 ] || printf '      field=label_value slice=0x00..=0xff entry_count=10 uncovered_count=%s key=t/h1/m/ki/%s-v%s\n' "$unc" "$i" "$sfx"
+                printf '    header: format_version=1 watermark_hour=%s\n    entries (decoded): 10\n' "$wm"
               done
             fi
             ;;
@@ -563,7 +671,16 @@ JSON
               *" --json "*)
                 [ "${STUB_STAGE1_FOLD_EXIT:-0}" -eq 0 ] || exit "${STUB_STAGE1_FOLD_EXIT}"
                 echo 'store: s3' >&2
-                printf '{"watermark_hour":490001,"previous_watermark_hour":490001,"no_op":true,"entry_count":0,"buckets_folded":0,"list_requests":4,"get_requests":6,"put_requests":0,"key_index_leaves_written":0,"key_index_leaf_bytes_written":0}\n'
+                n=$(($(cat "${STUB_STATE}.folds" 2>/dev/null || echo 0) + 1))
+                echo "$n" >"${STUB_STATE}.folds"
+                echo "head-${n}" >"${STUB_STATE}.head"
+                if [ ! -e "${STUB_STATE}.extra" ]; then
+                  printf '{"watermark_hour":490001,"previous_watermark_hour":490001,"no_op":true,"entry_count":0,"buckets_folded":0,"list_requests":4,"get_requests":6,"put_requests":0,"key_index_leaves_written":0,"key_index_leaf_bytes_written":0,"key_index_uncovered_entries":0}\n'
+                else
+                  leaves=0 bytes=0
+                  case " $* " in *" --key-index-leaves "*) leaves=2 bytes="${STUB_EXTRA_LEAF_BYTES:-10}" ;; esac
+                  printf '{"watermark_hour":490002,"previous_watermark_hour":490001,"no_op":false,"entry_count":30,"buckets_folded":4,"list_requests":4,"get_requests":6,"put_requests":3,"key_index_leaves_written":%s,"key_index_leaf_bytes_written":%s,"key_index_uncovered_entries":0}\n' "$leaves" "$bytes"
+                fi
                 exit 0
                 ;;
             esac
@@ -790,6 +907,14 @@ if [ "${1:-}" = "--readback-only" ]; then
   esac
   exit "${STUB_READBACK_ONLY_EXIT:-0}"
 fi
+# --steps: the Stage 1 extra hour, after which the catalog stub lists and
+# folds an ingest hour 490002; exit STUB_EXTRA_INGEST_EXIT.
+case " $* " in
+  *" --steps "*)
+    [ "${STUB_EXTRA_INGEST_EXIT:-0}" -eq 0 ] || exit "${STUB_EXTRA_INGEST_EXIT}"
+    : >"${STUB_STATE}.extra"
+    ;;
+esac
 if [ -n "${STUB_INGEST_EXIT:-}" ]; then
   echo "stub ingest: remote write refused" >&2
   exit "${STUB_INGEST_EXIT}"
@@ -880,9 +1005,14 @@ esac
 # STUB_ROUTED_KEYINDEX_HITS (default 2) cache hits; entry
 # STUB_ROUTED_LEAF_UNREAD_ENTRY's shows 0 of both, and with
 # STUB_ROUTED_PRUNES set every record's segmentsPrunedByLabelIndex is that.
+# A folded-routed record's labelIndexValues holds one __name__ pass: no leaf
+# GET, the keyIndex phase's cache hits, 3 parts covered, every prune its own;
+# any other record's is null.
 # STUB_RUN_FIGURES names a JSON file whose "records" object maps a pass label
 # to entry ids ("*" for every entry) to the fields that replace the record's;
 # a "keyIndex" field there replaces the routed keyIndex phase's figures.
+# Every phase also carries the per-phase cost the server reports: 1 GET of
+# 100 wire bytes.
 # Entry STUB_TWO_HASH_ENTRY gets a second record in every pass, rep 2, with
 # result_hash blake3:<entry>-rep2.
 python3 -I - "$corpus" "$diag" "$out" "$verdict" "$@" <<'PY'
@@ -897,16 +1027,25 @@ differ = os.environ.get("STUB_ROUTED_HASH_DIFF", "")
 failed = os.environ.get("STUB_ROUTED_FAILED_ENTRY", "") if routed else ""
 unrouted_pruned = os.environ.get("STUB_UNROUTED_PRUNED_ENTRY", "") if label == "folded-unrouted" else ""
 ids = [e["id"] for e in json.load(open(corpus))["entries"]]
-phases = [{"name": n, "requests": 1} for n in ("resolve", "plan", "probe", "scan", "decode")]
+phases = [{"name": n, "requests": 1, "phase": n, "s3GetRequests": 1, "s3GetWireBytes": 100}
+          for n in ("resolve", "plan", "probe", "scan", "decode")]
 routed_prunes = int(os.environ.get("STUB_ROUTED_PRUNES") or 3)
 def key_index(i):
     hits = 0 if i == os.environ.get("STUB_ROUTED_LEAF_UNREAD_ENTRY") else int(os.environ.get("STUB_ROUTED_KEYINDEX_HITS") or 2)
     return [{"phase": "keyIndex", "s3GetRequests": 0, "cacheHits": hits}]
+def values(i):
+    hits = key_index(i)[0]["cacheHits"]
+    return [{"labels": ["__name__"], "valueKey8": "00112233445566ff", "leafGetRequests": 0,
+             "leafWireBytes": 0, "leafCacheHits": hits, "partsCovered": 3, "partsUncovered": 0,
+             "partsBeyondCeiling": 0, "leavesRejected": 0, "reservationsRefused": 0,
+             "skippedByBudget": 0, "segmentsPruned": routed_prunes,
+             "segmentsPrunedAlone": routed_prunes}]
 def record(i):
     r = {"entry": i, "pass": 1, "rep": 1, "status": "ok", "latency_ms": 12.5,
          "accounting": {"requests": 5}, "phases": phases + key_index(i) if routed else phases,
          "segmentsFetched": 4, "segmentsPruned": 6, "segmentsPrunedByDictionary": 3,
          "segmentsPrunedByLabelIndex": routed_prunes if routed else (2 if i == unrouted_pruned else 0),
+         "labelIndexValues": values(i) if routed else None,
          "estimate": None, "io": None, "pass_label": label, "fold_state": state,
          "result_hash": f"blake3:{i}-routed" if routed and i == differ else f"blake3:{i}"}
     if i == os.environ.get("STUB_INCORRECT_ENTRY") or (routed and i == os.environ.get("STUB_ROUTED_STATUS_ENTRY")):
@@ -917,7 +1056,7 @@ def record(i):
             r["segmentsPrunedByLabelIndex"] = 0
     if i == failed:
         r.update({"status": "failed: stub", "result_hash": None, "segmentsFetched": None,
-                  "segmentsPruned": None, "segmentsPrunedByLabelIndex": None})
+                  "segmentsPruned": None, "segmentsPrunedByLabelIndex": None, "labelIndexValues": None})
     if os.environ.get("STUB_RUN_FIGURES"):
         figs = json.load(open(os.environ["STUB_RUN_FIGURES"]))["records"].get(label) or {}
         over = {**figs.get("*", {}), **figs.get(i, {})}
@@ -1059,6 +1198,13 @@ chmod +x "${BIN}"/*
 # rc, OUT (the out-dir), LOG (every stub call) and ERR (run.sh's stderr).
 # HASH_TOOLS picks the hash stubs on PATH: sha256sum (default), shasum, or
 # none; the latter two drop the host's own from PATH as well.
+# METRICSBENCH_SLEEP: the Stage 1 arms' waits, logged and not slept.
+cat >"${BIN}/stubsleep" <<'STUB'
+#!/usr/bin/env bash
+printf 'stubsleep %s\n' "$*" >>"${STUB_LOG}"
+STUB
+chmod +x "${BIN}/stubsleep"
+
 run_case() {
   local name="$1"
   shift
@@ -1081,7 +1227,7 @@ run_case() {
     METRICSBENCH_CAPTURE="${BIN}/capture" \
     METRICSBENCH_SAMPLE_INTERVAL=0.1 \
     METRICSBENCH_READY_TRIES=3 METRICSBENCH_READY_INTERVAL=0 \
-    METRICSBENCH_IMDS="http://imds.invalid" \
+    METRICSBENCH_IMDS="http://imds.invalid" METRICSBENCH_SLEEP="${BIN}/stubsleep" \
     bash "${SCRIPT}" "$@" 2>"${ERR}" >/dev/null || rc=$?
 }
 
@@ -2499,7 +2645,7 @@ check "z: stage1.unrouted and stage1.routed name their label, state and files" '
 check "z: stage1.restart says what was recreated" 'j("stamps.json")["stage1"]["restart"].startswith("recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='"'"'--disable-fold --fold-key-index-leaves --fold-metrics-label-index'"'"'")'
 check "z: every steady record carries its pass label and fold state" 'all(r["pass_label"] == "folded-unrouted" and r["fold_state"] == "'"${UNROUTED_STATE}"'" for r in j("stage1-unrouted/diagnostics.json")["ravel_cost"]) and all(r["pass_label"] == "folded-routed" and r["fold_state"] == "'"${ROUTED_STATE}"'" for r in j("stage1-routed/diagnostics.json")["ravel_cost"])'
 check "z: the cold selection runs in both passes, labelled, in its own regime" 'all(j(f"stage1-{w}/cold.json")["regime"] == f"stage1-folded-{w}-cold" and j(f"stage1-{w}/cold.json")["entries"] == ["mb_full_range_avg_over_time"] and len(j(f"stage1-{w}/cold.json")["runs"]) == 5 and all(r["ravel_cost"]["pass_label"] == f"folded-{w}" for r in j(f"stage1-{w}/cold.json")["runs"]) for w in ("unrouted", "routed")) and j("stamps.json")["stage1"]["routed_cold"]["file"] == "cold.json" and j("stamps.json")["stage1"]["routed_cold"]["failed_runs"] == 0'
-check "z: stage1-compare.json compares every entry's hashes and statuses and counts each pass's records" 'j("stage1-compare.json")["schema"] == "metricsbench-stage1-compare/4" and j("stage1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"') == j("stage1-compare.json")["entries_equal"] and j("stage1-compare.json")["entries_multi_hash_count"] == 0 and j("stage1-compare.json")["entries_differing_count"] == 0 and j("stage1-compare.json")["entries_without_hash_count"] == 0 and j("stage1-compare.json")["statements_status_differing_count"] == 0 and j("stage1-compare.json")["statements_status_differing"] == [] and j("stage1-compare.json")["status_check"].startswith("per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9)") and j("stage1-compare.json")["passes"] == {"unrouted": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": 0, "segments_pruned_by_label_index": 0}, "routed": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": len('"${CORPUS_IDS}"'), "segments_pruned_by_label_index": 3 * len('"${CORPUS_IDS}"')}} and j("stamps.json")["stage1"]["compare"]["entries_differing"] == [] and j("stamps.json")["stage1"]["compare"]["statements_status_differing"] == []'
+check "z: stage1-compare.json compares every entry's hashes and statuses and counts each pass's records" 'j("stage1-compare.json")["schema"] == "metricsbench-stage1-compare/5" and j("stage1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"') == j("stage1-compare.json")["entries_equal"] and j("stage1-compare.json")["entries_multi_hash_count"] == 0 and j("stage1-compare.json")["entries_differing_count"] == 0 and j("stage1-compare.json")["entries_without_hash_count"] == 0 and j("stage1-compare.json")["statements_status_differing_count"] == 0 and j("stage1-compare.json")["statements_status_differing"] == [] and j("stage1-compare.json")["status_check"].startswith("per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9)") and j("stage1-compare.json")["passes"] == {"unrouted": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": 0, "segments_pruned_by_label_index": 0}, "routed": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": len('"${CORPUS_IDS}"'), "segments_pruned_by_label_index": 3 * len('"${CORPUS_IDS}"')}} and j("stamps.json")["stage1"]["compare"]["entries_differing"] == [] and j("stamps.json")["stage1"]["compare"]["statements_status_differing"] == []'
 expect_log "z: the holders listing is catalog list --json" "catalog list --tenant metricsbench --shards 4 --hours"
 expect_log "z: the holders download takes the L0 and L1 data objects of Ravel's bucket through the s3s endpoint" "--entrypoint aws createbuckets --endpoint-url http://s3s:9000 s3 sync s3://ravel-metricsbench/t/ /stage1-objects/t/ --exclude * --include */m/l0/*.rseg --include */m/l1/*.rseg --only-show-errors"
 expect_log "z: the download lands in the run's out dir" "-v ${OUT}/stage1-objects:/stage1-objects"
@@ -2508,7 +2654,7 @@ expect_log "z: metricsbench_holders gets the corpus, ingest report, workload, li
 expect_log "z: metricsbench_holders reads the listing beside the objects" "--objects-list ${OUT}/stage1-objects.jsonl --objects-dir ${OUT}/stage1-objects --out ${OUT}/holders.json"
 expect_no_file z stage1-objects
 expect_file z stage1-objects.jsonl
-check "z: stage1.holders stamps the method, the counts and the window, holder and value-holder figures per statement, every window checked against segmentsFetched and every routed prune against expected_routed_prunes" '{k: v for k, v in j("stamps.json")["stage1"]["holders"].items() if not k.endswith("_check")} == {"file": "holders.json", "bucket": "ravel-metricsbench", "method": "stub method", "objects_listed": 300, "objects_above_watermark": 0, "objects_l0": 300, "objects_l1": 0, "series_total": 40, "min_commit_tokens": 1, "token_objects": 1, "tokens_unmatched": [], "statements": [{"id": i, "segments_in_window": 10, "named_in_window": 4, "name_pruned": True, "token_only_fetched": 0, "unrouted_fetched_expected": 4, "holders": 2, "value_holders": 1, "expected_routed_prunes": 3, "route_bound": True, "route_bound_reason": None, "routed_pruned_by_label_index": [3]} for i in '"${CORPUS_IDS}"'], "skipped": 1, "window_mismatches_count": 0, "window_mismatches": [], "window_unchecked_count": 0, "window_unchecked": [], "routed_prune_mismatches_count": 0, "routed_prune_mismatches": [], "routed_prune_unchecked_count": 0, "routed_prune_unchecked": [], "routed_leaf_unread_count": 0, "routed_leaf_unread": [], "route_unbound_count": 0, "route_unbound": []}'
+check "z: stage1.holders stamps the method, the counts and the window, holder and value-holder figures per statement, every window checked against segmentsFetched and every routed prune against expected_routed_prunes" '{k: v for k, v in j("stamps.json")["stage1"]["holders"].items() if not k.endswith("_check")} == {"file": "holders.json", "bucket": "ravel-metricsbench", "method": "stub method", "listing_state": "routed: listed after stage1-routed, objects_above_watermark against stage1.routed_catalog.watermark_hour", "listing_watermark_hour": 490001, "objects_listed": 300, "objects_above_watermark": 0, "objects_l0": 300, "objects_l1": 0, "series_total": 40, "min_commit_tokens": 1, "token_objects": 1, "tokens_unmatched": [], "statements": [{"id": i, "segments_in_window": 10, "named_in_window": 4, "name_pruned": True, "token_only_fetched": 0, "unrouted_fetched_expected": 4, "holders": 2, "value_holders": 1, "expected_routed_prunes": 3, "route_bound": True, "route_bound_reason": None, "routed_pruned_by_label_index": [3]} for i in '"${CORPUS_IDS}"'], "skipped": 1, "window_mismatches_count": 0, "window_mismatches": [], "window_unchecked_count": 0, "window_unchecked": [], "routed_prune_mismatches_count": 0, "routed_prune_mismatches": [], "routed_prune_unchecked_count": 0, "routed_prune_unchecked": [], "routed_leaf_unread_count": 0, "routed_leaf_unread": [], "route_unbound_count": 0, "route_unbound": []}'
 check "z: each check sentence names what it compares" 'sorted(k for k in j("stamps.json")["stage1"]["holders"] if k.endswith("_check")) == ["bound_check", "route_bound_check", "routed_leaf_check", "routed_prune_check", "window_check"] and all(w in j("stamps.json")["stage1"]["holders"]["window_check"] for w in ("segmentsFetched of every stage1-unrouted record", "== unrouted_fetched_expected", "token_only_fetched", "min_commit_token", "unchecked")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_prune_check"] for w in ("segmentsPrunedByLabelIndex of every stage1-routed record", "== expected_routed_prunes", "unchecked")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_leaf_check"] for w in ("keyIndex phase", "s3GetRequests", "cacheHits")) and all(w in j("stamps.json")["stage1"]["holders"]["bound_check"] for w in ("series-level index", "not the label-value router", "value_holders", "LABEL_DICT", "the router'"'"'s bound"))'
 check "z: the cold records are counted against the selected entries x repetitions in both passes" 'all(j("stamps.json")["stage1"][f"{w}_cold_records"] == {"applicable": True, "expected_records": 5, "records": 5, "records_short": 0, "basis": f"stage1.{w}_cold: records with a ravel_cost (runs - failed_runs) against entries x repetitions_per_entry"} for w in ("unrouted", "routed"))'
 check "z: the query step's records keep their own label" 'all(r["pass_label"] == "background-folded" for r in j("diagnostics.json")["ravel_cost"])'
@@ -2525,6 +2671,7 @@ fi
 MB_STAGE1=1 run_stage1 z1 ci
 expect_rc z1 0
 check "z1: ci runs every Stage 1 step" 'j("stamps.json")["steps_completed"][-6:] == ["stage1-fold","stage1-unrouted","stage1-leaves","stage1-restart","stage1-routed","stage1-holders"]'
+check "z1: each routed record's per-value route figures: one __name__ pass, its cache hits, 3 parts covered, the (1 + n) x covering bound, nothing over it or beyond the ceiling" 'j("stage1-compare.json")["routed_values"] == [{"entry": i, "rep": 1, "n": 1, "leaf_gets": 0, "leaf_cache_hits": 2, "covering_parts": 3, "leaf_gets_bound": 6, "parts_beyond_ceiling": 0, "name_pruned_alone": True} for i in '"${CORPUS_IDS}"'] and {k: j("stage1-compare.json")[k] for k in ("routed_records_with_values", "routed_records_without_values", "routed_records_values_unreadable_count", "statements_leaf_gets_over_bound_count", "statements_leaf_gets_over_bound", "parts_beyond_ceiling_total")} == {"routed_records_with_values": len('"${CORPUS_IDS}"'), "routed_records_without_values": 0, "routed_records_values_unreadable_count": 0, "statements_leaf_gets_over_bound_count": 0, "statements_leaf_gets_over_bound": [], "parts_beyond_ceiling_total": 0} and "(1 + n) x covering_parts" in j("stage1-compare.json")["route_values_check"] and "routed_values" not in j("stamps.json")["stage1"]["compare"] and j("stamps.json")["stage1"]["compare"]["routed_records_with_values"] == len('"${CORPUS_IDS}"')'
 check "z1: ci's cold passes are not applicable" 'j("stamps.json")["stage1"]["unrouted_cold"].startswith("not applicable: ") and j("stamps.json")["stage1"]["routed_cold"].startswith("not applicable: ")'
 check "z1: ci's cold record counts are 0 of 0, naming the not-applicable stamp" 'all({k: v for k, v in j("stamps.json")["stage1"][f"{w}_cold_records"].items() if k != "basis"} == {"applicable": False, "expected_records": 0, "records": 0, "records_short": 0} and j("stamps.json")["stage1"][f"{w}_cold_records"]["basis"].startswith(f"stage1.{w}_cold is '"'"'not applicable: ") for w in ("unrouted", "routed"))'
 
@@ -2668,32 +2815,51 @@ expect_rc z24 70
 check "z24: stage1-routed named, the refusal names the figure" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.leaves.parts_rebuilt is '"'"'None'"'"', not a whole number"'
 expect_no_log "z24: no routed pass" "--pass-label folded-routed"
 
-# z27: an inspect stamp that was not written, or whose label_value leaf part
+# z28: an inspect stamp that was not written, or whose label_value leaf part
 # count cannot be read back as a whole number, refuses the pass it gates.
-MB_STAGE1=1 STUB_PY_OP=set STUB_PY_KEY=stage1.unrouted_catalog run_stage1 z27a ci
-expect_rc z27a 70
-check "z27a: stage1-unrouted named, the refusal names the unwritten stamp" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog could not be stamped (py set exited 1)"'
-expect_no_log "z27a: no unrouted pass" "--pass-label folded-unrouted"
-MB_STAGE1=1 STUB_PY_OP=set STUB_PY_KEY=stage1.routed_catalog run_stage1 z27b ci
-expect_rc z27b 70
-check "z27b: stage1-routed named, the refusal names the unwritten stamp" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog could not be stamped (py set exited 1)"'
-expect_no_log "z27b: no routed pass" "--pass-label folded-routed"
-MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.label_value_leaf_parts run_stage1 z27c ci
-expect_rc z27c 70
-check "z27c: stage1-unrouted named, the refusal names the unread figure" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.label_value_leaf_parts could not be read (py get exited 1)"'
-expect_no_log "z27c: no unrouted pass" "--pass-label folded-unrouted"
-MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.label_value_leaf_parts run_stage1 z27d ci
-expect_rc z27d 70
-check "z27d: stage1-routed named, the refusal names the unread figure" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.label_value_leaf_parts could not be read (py get exited 1)"'
-expect_no_log "z27d: no routed pass" "--pass-label folded-routed"
-MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.label_value_leaf_parts STUB_PY_PRINT=None run_stage1 z27e ci
-expect_rc z27e 70
-check "z27e: stage1-unrouted named, the refusal names the figure that is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.label_value_leaf_parts is '"'"'None'"'"', not a whole number"'
-expect_no_log "z27e: no unrouted pass" "--pass-label folded-unrouted"
-MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.label_value_leaf_parts STUB_PY_PRINT=None run_stage1 z27f ci
-expect_rc z27f 70
-check "z27f: stage1-routed named, the refusal names the figure that is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.label_value_leaf_parts is '"'"'None'"'"', not a whole number"'
-expect_no_log "z27f: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=set STUB_PY_KEY=stage1.unrouted_catalog run_stage1 z28a ci
+expect_rc z28a 70
+check "z28a: stage1-unrouted named, the refusal names the unwritten stamp" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog could not be stamped (py set exited 1)"'
+expect_no_log "z28a: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=set STUB_PY_KEY=stage1.routed_catalog run_stage1 z28b ci
+expect_rc z28b 70
+check "z28b: stage1-routed named, the refusal names the unwritten stamp" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog could not be stamped (py set exited 1)"'
+expect_no_log "z28b: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.label_value_leaf_parts run_stage1 z28c ci
+expect_rc z28c 70
+check "z28c: stage1-unrouted named, the refusal names the unread figure" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.label_value_leaf_parts could not be read (py get exited 1)"'
+expect_no_log "z28c: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.label_value_leaf_parts run_stage1 z28d ci
+expect_rc z28d 70
+check "z28d: stage1-routed named, the refusal names the unread figure" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.label_value_leaf_parts could not be read (py get exited 1)"'
+expect_no_log "z28d: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.label_value_leaf_parts STUB_PY_PRINT=None run_stage1 z28e ci
+expect_rc z28e 70
+check "z28e: stage1-unrouted named, the refusal names the figure that is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.label_value_leaf_parts is '"'"'None'"'"', not a whole number"'
+expect_no_log "z28e: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.label_value_leaf_parts STUB_PY_PRINT=None run_stage1 z28f ci
+expect_rc z28f 70
+check "z28f: stage1-routed named, the refusal names the figure that is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.label_value_leaf_parts is '"'"'None'"'"', not a whole number"'
+expect_no_log "z28f: no routed pass" "--pass-label folded-routed"
+
+# z29: a watermark or parts figure the fold state names that cannot be read
+# back as a whole number refuses the pass, as the leaf part count does.
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.watermark_hour run_stage1 z29a ci
+expect_rc z29a 70
+check "z29a: stage1-unrouted named, the refusal names the unread watermark" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.watermark_hour could not be read (py get exited 1)"'
+expect_no_log "z29a: no unrouted pass" "--pass-label folded-unrouted"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.parts run_stage1 z29b ci
+expect_rc z29b 70
+check "z29b: stage1-routed named, the refusal names the unread parts count" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.parts could not be read (py get exited 1)"'
+expect_no_log "z29b: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.routed_catalog.watermark_hour STUB_PY_PRINT=None run_stage1 z29c ci
+expect_rc z29c 70
+check "z29c: stage1-routed named, the watermark is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-routed" and j("stamps.json")["stage1"]["routed"] == "refused: stage1.routed_catalog.watermark_hour is '"'"'None'"'"', not a whole number"'
+expect_no_log "z29c: no routed pass" "--pass-label folded-routed"
+MB_STAGE1=1 STUB_PY_OP=get STUB_PY_KEY=stage1.unrouted_catalog.parts STUB_PY_PRINT=None run_stage1 z29d ci
+expect_rc z29d 70
+check "z29d: stage1-unrouted named, the parts count is not a whole number" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.unrouted_catalog.parts is '"'"'None'"'"', not a whole number"'
+expect_no_log "z29d: no unrouted pass" "--pass-label folded-unrouted"
 
 # z25: a routed segmentsPrunedByLabelIndex that is not expected_routed_prunes is a mismatch.
 MB_STAGE1=1 STUB_HOLDERS_PRUNES_OFF=mb_selective_job_rate_sum run_stage1 z25 ci
@@ -2752,6 +2918,167 @@ check "z27: the absent statement expects its 4 token objects and fetched them" '
 check "z27: no window or prune mismatch, nothing unchecked, no unread leaf, 4 token objects" 'all(j("stamps.json")["stage1"]["holders"][k] == 0 for k in ("window_mismatches_count", "window_unchecked_count", "routed_prune_mismatches_count", "routed_prune_unchecked_count", "routed_leaf_unread_count")) and j("stamps.json")["stage1"]["holders"]["token_objects"] == 4 and j("stamps.json")["stage1"]["holders"]["min_commit_tokens"] == 4'
 check "z27: the routed pass pruned nothing by the label index" 'j("stage1-compare.json")["passes"]["routed"]["records_pruned_by_label_index"] == 0'
 
+# z30: a routed record whose two passes issued 7 leaf GETs over 2 covered
+# parts (bound (1 + 2) x 2 = 6) with a part beyond the ceiling, and one whose
+# labelIndexValues carries no whole-number figure.
+cat >"${TMP}/run-values.json" <<'JSON'
+{"holders": {"report": {}, "statements": {}},
+ "records": {"folded-routed": {
+   "mb_selective_job_rate_sum": {"labelIndexValues": [
+     {"labels": ["__name__"], "valueKey8": "00112233445566aa", "leafGetRequests": 5, "leafWireBytes": 900,
+      "leafCacheHits": 0, "partsCovered": 2, "partsUncovered": 0, "partsBeyondCeiling": 0, "leavesRejected": 0,
+      "reservationsRefused": 0, "skippedByBudget": 0, "segmentsPruned": 1, "segmentsPrunedAlone": 0},
+     {"labels": ["job"], "valueKey8": "00112233445566bb", "leafGetRequests": 2, "leafWireBytes": 300,
+      "leafCacheHits": 1, "partsCovered": 2, "partsUncovered": 0, "partsBeyondCeiling": 1, "leavesRejected": 0,
+      "reservationsRefused": 0, "skippedByBudget": 0, "segmentsPruned": 3, "segmentsPrunedAlone": 2}]},
+   "mb_single_counter_rate": {"labelIndexValues": [{"labels": ["__name__"], "leafGetRequests": "1"}]}}}}
+JSON
+MB_STAGE1=1 STUB_RUN_FIGURES="${TMP}/run-values.json" run_stage1 z30 ci
+expect_rc z30 0
+check "z30: the over-bound record's figures, its __name__ pass pruned nothing alone" '[v for v in j("stage1-compare.json")["routed_values"] if v["entry"] == "mb_selective_job_rate_sum"] == [{"entry": "mb_selective_job_rate_sum", "rep": 1, "n": 2, "leaf_gets": 7, "leaf_cache_hits": 1, "covering_parts": 2, "leaf_gets_bound": 6, "parts_beyond_ceiling": 1, "name_pruned_alone": False}]'
+check "z30: the statement over its bound, the part beyond the ceiling and the unreadable record are counted" '{k: j("stage1-compare.json")[k] for k in ("routed_records_with_values", "routed_records_values_unreadable_count", "routed_records_values_unreadable", "statements_leaf_gets_over_bound_count", "statements_leaf_gets_over_bound", "parts_beyond_ceiling_total")} == {"routed_records_with_values": len('"${CORPUS_IDS}"') - 1, "routed_records_values_unreadable_count": 1, "routed_records_values_unreadable": [{"entry": "mb_single_counter_rate", "rep": 1}], "statements_leaf_gets_over_bound_count": 1, "statements_leaf_gets_over_bound": ["mb_selective_job_rate_sum"], "parts_beyond_ceiling_total": 1} and j("stamps.json")["stage1"]["compare"]["routed_records_values_unreadable"] == ["mb_single_counter_rate"]'
+
+# --- za: the Stage 1 arms (issue #3969) -----------------------------------------------
+CONTROL_IMAGE="stub/ravel-control@sha256:$(printf 'c%.0s' {1..64})"
+CONTROL_COMMIT="$(printf 'd%.0s' {1..40})"
+# za: every arm on: each arm's steps after stage1-holders, in order.
+MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour,l1,erasure MB_CONTROL_IMAGE="${CONTROL_IMAGE}" MB_CONTROL_SOURCE_COMMIT="${CONTROL_COMMIT}" \
+  run_stage1 za ci
+expect_rc za 0
+
+check "za: the arm steps follow stage1-holders in order, the control's between stage1-unrouted and stage1-leaves" 'j("stamps.json")["steps_completed"][j("stamps.json")["steps_completed"].index("stage1-fold"):] == ["stage1-fold","stage1-unrouted","stage1-control","stage1-control-restore","stage1-leaves","stage1-restart","stage1-routed","stage1-holders","stage1-extra-hour-ingest","stage1-extra-hour-fold-off","stage1-extra-hour-fold-on","stage1-extra-hour","stage1-l1-compact","stage1-l1-fold","stage1-l1","stage1-erasure-reference","stage1-erasure-submit","stage1-erasure-pending","stage1-erasure-rewrite","stage1-erasure-fold","stage1-erasure"] and j("stamps.json")["status"] == "passed"'
+check "za: every arm stamped on" 'j("stamps.json")["stage1"]["arms"] == {"control": True, "extra_hour": True, "l1": True, "erasure": True}'
+if python3 -I - "${LOG}" "${IMAGE}" "${CONTROL_IMAGE}" <<'PY'; then
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+main, control = sys.argv[2:4]
+unrouted = "--disable-fold --fold-key-index-leaves"
+routed = unrouted + " --fold-metrics-label-index"
+want = [(unrouted, main), (unrouted, main), (unrouted, control), (unrouted, main),
+        (routed, main), (routed, main), (routed, main)]
+flags = [l.split("=", 1)[1] for l in lines if l.startswith("docker-env recreate ")]
+images = [l.split("=", 1)[1] for l in lines if l.startswith("docker-image recreate ")]
+folds = [re.search(r" catalog fold --tenant \S+ --shards \S+ (.*)$", l).group(1)
+         for l in lines if l.startswith("docker compose ") and " catalog fold " in l]
+leafy = "--signal metrics --writers-stopped --key-index-leaves --metrics-label-index --json"
+ok = (list(zip(flags, images)) == want
+      and folds[3:] == ["--signal metrics --writers-stopped --json", leafy, leafy, leafy])
+if not ok:
+    print(list(zip(flags, images)), folds)
+sys.exit(0 if ok else 1)
+PY
+  pass "za: seven recreates, the control's alone on the control image, and the arm folds with their listed flags"
+else
+  fail "za: the recreates or the arm folds are not the listed ones"
+fi
+if python3 -I - "${LOG}" <<'PY'; then
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+def first(pred):
+    return next((i for i, l in enumerate(lines) if pred(l)), -1)
+ingest = first(lambda l: l.startswith("metricsbench_ingest ") and " --steps " in l)
+def cp(l):
+    m = re.search(r" s3 cp (?:--recursive )?(\S+) (\S+)", l)
+    return (m.group(1), m.group(2)) if m else ("", "")
+save = first(lambda l: cp(l)[1].startswith("/stage1-s3/head-saved/"))
+restore = first(lambda l: cp(l)[0].startswith("/stage1-s3/head-saved/") and cp(l)[1].startswith("s3://"))
+sleep = first(lambda l: l.startswith("stubsleep "))
+compact = first(lambda l: " compact-tenant " in l)
+l1 = first(lambda l: "--pass-label folded-l1" in l)
+submit = first(lambda l: " erase submit " in l and "--matcher instance=metricsbench-instance-0" in l)
+pending = first(lambda l: "--pass-label folded-erasure-pending" in l)
+maintain = first(lambda l: " --mode maintain " in l)
+status_ = first(lambda l: " erase status " in l)
+ok = 0 <= ingest < save < restore < sleep < compact < l1 < submit < pending < maintain < status_
+if not ok:
+    print(dict(ingest=ingest, save=save, restore=restore, sleep=sleep, compact=compact, l1=l1,
+               submit=submit, pending=pending, maintain=maintain, status=status_))
+sys.exit(0 if ok else 1)
+PY
+  pass "za: extra-hour ingest, HEAD saved, HEAD put back, the wait for the seal, compact-tenant, the l1 pass, erase submit, the pending pass, the maintain container, erase status"
+else
+  fail "za: the arm calls are not in their order"
+fi
+check "za: both extra-hour folds started from the same HEAD and folded the extra hour, the leaf build only in the second" 'j("stamps.json")["stage1"]["extra_hour"]["same_start"] is True and j("stamps.json")["stage1"]["extra_hour"]["start_mismatches"] == 0 and j("stamps.json")["stage1"]["extra_hour"]["head_sha256"]["before_off"] == j("stamps.json")["stage1"]["extra_hour"]["head_sha256"]["before_on"] and j("stamps.json")["stage1"]["extra_hour_fold_off"]["key_index_leaves_written"] == 0 and j("stamps.json")["stage1"]["extra_hour_fold_on"]["key_index_leaves_written"] == 2 and j("stamps.json")["stage1"]["extra_hour"]["watermark_hour"] == 490002'
+check "za: the extra hour's tail objects, leaf bytes over their bytes and its one covered tail part" '{k: j("stamps.json")["stage1"]["extra_hour"][k] for k in ("tail_objects", "tail_data_bytes", "leaf_bytes_ratio", "tail_parts", "uncovered_tail_parts_count")} == {"tail_objects": 30, "tail_data_bytes": 3000, "tail_parts": 1, "leaf_bytes_ratio": 10 / 3000, "uncovered_tail_parts_count": 0}'
+check "za: the control pass ran on the control image and compares GETs, bytes and latency per statement" 'j("stamps.json")["stage1"]["control"]["fold_state"].endswith("; image '"${CONTROL_IMAGE}"'") and j("stamps.json")["stage1"]["control_image"]["control"]["source_commit"] == "'"${CONTROL_COMMIT}"'" and {k: j("stage1-control-compare.json")[k] for k in ("statements_compared", "statements_more_gets_count", "statements_more_bytes_count", "statements_unchecked_count", "latency_ratio_median")} == {"statements_compared": len('"${CORPUS_IDS}"'), "statements_more_gets_count": 0, "statements_more_bytes_count": 0, "statements_unchecked_count": 0, "latency_ratio_median": 1.0}'
+check "za: compact-tenant's counters, the L1 objects listed and the l1 pass equal to the routed one" 'j("stamps.json")["stage1"]["l1_compact"]["compacted"] == 2 and j("stamps.json")["stage1"]["l1_compact"]["failed"] == 0 and j("stamps.json")["stage1"]["l1_objects"]["l1_objects"] == 100 and j("stage1-l1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"') == j("stage1-l1-compare.json")["entries_equal"]'
+check "za: the erasure names its subject, the rewrite's dropped records and path, no stale leaf, and leaves the sweep unchecked" 'j("stamps.json")["stage1"]["erasure_submit"]["matcher"] == "instance=\"metricsbench-instance-0\"" and j("stamps.json")["stage1"]["erasure_rewrite"]["state"] == "COMPLETED" and j("stamps.json")["stage1"]["erasure_rewrite"]["dropped_total"] == 5 and j("stamps.json")["stage1"]["erasure_rewrite"]["path"].startswith("a one-off ravel-server --mode maintain container") and j("stamps.json")["stage1"]["erasure_leaves"]["stale_leaves_count"] == 0 and j("stamps.json")["stage1"]["erasure_sweep"].startswith("not checked: ") and j("stage1-erasure-compare.json")["base"] == "erasure_reference" and j("stage1-erasure-compare.json")["other"] == "erasure_pending" and j("stage1-erasure-compare.json")["entries_differing_count"] == 0'
+
+# zb-ze: each arm alone runs its own steps only, with figures its bands
+# reject (the band checks are under stage1-check.sh below). zb: a control
+# image whose records issue fewer GETs and bytes and answer in 1 ms.
+cat >"${TMP}/run-control.json" <<'JSON'
+{"holders": {"report": {}, "statements": {}},
+ "records": {"folded-control": {"*": {"latency_ms": 1, "phases": [
+   {"name": "scan", "requests": 1, "phase": "scan", "s3GetRequests": 0, "s3GetWireBytes": 50}]}}}}
+JSON
+MB_STAGE1=1 MB_CONTROL_IMAGE="${CONTROL_IMAGE}" MB_CONTROL_SOURCE_COMMIT="${CONTROL_COMMIT}" \
+  STUB_RUN_FIGURES="${TMP}/run-control.json" run_stage1 zb ci
+expect_rc zb 0
+check "zb: the control's steps alone, between stage1-unrouted and stage1-leaves" 'j("stamps.json")["steps_completed"][-7:] == ["stage1-unrouted","stage1-control","stage1-control-restore","stage1-leaves","stage1-restart","stage1-routed","stage1-holders"] and j("stamps.json")["stage1"]["arms"] == {"control": True, "extra_hour": False, "l1": False, "erasure": False}'
+# zc: an extra hour whose leaves are a third of its data bytes, on a tail
+# part whose leaf leaves an entry uncovered.
+MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour STUB_EXTRA_LEAF_BYTES=1000 STUB_EXTRA_UNCOVERED=1 run_stage1 zc ci
+expect_rc zc 0
+check "zc: the extra hour's steps alone, after stage1-holders" 'j("stamps.json")["steps_completed"][-5:] == ["stage1-holders","stage1-extra-hour-ingest","stage1-extra-hour-fold-off","stage1-extra-hour-fold-on","stage1-extra-hour"] and j("stamps.json")["stage1"]["arms"] == {"control": False, "extra_hour": True, "l1": False, "erasure": False}'
+check "zc: the uncovered tail part is named" 'j("stamps.json")["stage1"]["extra_hour"]["uncovered_tail_parts_count"] == 1 and j("stamps.json")["stage1"]["extra_hour"]["leaf_bytes_ratio"] == 1000 / 3000'
+# zd: an L1 pass whose hash differs on one entry and that ran out of fetch
+# memory on another.
+cat >"${TMP}/run-l1.json" <<'JSON'
+{"holders": {"report": {}, "statements": {}},
+ "records": {"folded-l1": {
+   "mb_selective_job_rate_sum": {"result_hash": "blake3:mb_selective_job_rate_sum-l1"},
+   "mb_single_counter_rate": {"status": "failed: fetch memory exhausted", "result_hash": null}}}}
+JSON
+MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_RUN_FIGURES="${TMP}/run-l1.json" run_stage1 zd ci
+expect_rc zd 0
+check "zd: the l1 steps alone, after stage1-holders, with compact-tenant waiting for the seal" 'j("stamps.json")["steps_completed"][-4:] == ["stage1-holders","stage1-l1-compact","stage1-l1-fold","stage1-l1"] and j("stamps.json")["stage1"]["arms"] == {"control": False, "extra_hour": False, "l1": True, "erasure": False}'
+expect_log "zd: the wait before compact-tenant goes through the sleep" "stubsleep "
+# ze: an erasure-pending pass the label index pruned, and a post-erasure
+# snapshot that still references the pre-erasure leaves.
+cat >"${TMP}/run-erasure.json" <<'JSON'
+{"holders": {"report": {}, "statements": {}},
+ "records": {"folded-erasure-pending": {"*": {"segmentsPrunedByLabelIndex": 2}}}}
+JSON
+MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASURE_STALE=1 STUB_RUN_FIGURES="${TMP}/run-erasure.json" run_stage1 ze ci
+expect_rc ze 0
+check "ze: the erasure steps alone, after stage1-holders" 'j("stamps.json")["steps_completed"][-7:] == ["stage1-holders","stage1-erasure-reference","stage1-erasure-submit","stage1-erasure-pending","stage1-erasure-rewrite","stage1-erasure-fold","stage1-erasure"] and j("stamps.json")["stage1"]["arms"] == {"control": False, "extra_hour": False, "l1": False, "erasure": True}'
+check "ze: the stale leaves are named" 'j("stamps.json")["stage1"]["erasure_leaves"]["stale_leaves_count"] == 6'
+
+# zf: the switches are refused before anything starts.
+MB_STAGE1=1 MB_CONTROL_IMAGE="stub/ravel-control:latest" MB_CONTROL_SOURCE_COMMIT="${CONTROL_COMMIT}" run_stage1 zf1 ci
+expect_rc zf1 65
+expect_err "zf1: a control image with no digest is refused" "refused: MB_CONTROL_IMAGE 'stub/ravel-control:latest' carries no @sha256: digest"
+expect_no_log "zf1: nothing brought up" "ravel.yml up -d"
+MB_STAGE1=1 MB_CONTROL_IMAGE="${CONTROL_IMAGE}" run_stage1 zf2 ci
+expect_rc zf2 64
+expect_err "zf2: the control image needs its source commit" "MB_CONTROL_IMAGE and MB_CONTROL_SOURCE_COMMIT are given together or not at all"
+MB_STAGE1_ARMS=l1 run_stage1 zf3 ci
+expect_rc zf3 64
+expect_err "zf3: the arms need MB_STAGE1=1" "MB_STAGE1_ARMS adds Stage 1 arms and needs MB_STAGE1=1"
+MB_STAGE1=1 MB_STAGE1_ARMS=l1,compaction run_stage1 zf4 ci
+expect_rc zf4 64
+expect_err "zf4: an unknown arm is named" "MB_STAGE1_ARMS takes a comma list of extra-hour, l1 and erasure, got 'compaction'"
+expect_no_log "zf4: nothing brought up" "ravel.yml up -d"
+
+# zg: a HEAD that does not read back as saved refuses the second extra-hour fold.
+MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour STUB_HEAD_RESTORE_BROKEN=1 run_stage1 zg ci
+expect_rc zg 70
+expect_err "zg: the refusal names the step and both HEAD digests" "step stage1-extra-hour-fold-on failed: the restored HEAD reads back as sha256 "
+check "zg: the extra hour is stamped refused, the second fold never ran" 'j("stamps.json")["stage1"]["extra_hour"].startswith("refused: ") and "stage1-extra-hour-fold-on" not in j("stamps.json")["steps_completed"]'
+
+# zh: an erasure still pending after every status poll ends the run at the rewrite.
+MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASE_PENDING=1 METRICSBENCH_ERASURE_TRIES=2 run_stage1 zh ci
+expect_rc zh 70
+expect_err "zh: the failure names the step and the tries" "step stage1-erasure-rewrite failed: erasure "
+expect_err "zh: the tries are counted" " not COMPLETED after 2 tries 15s apart"
+check "zh: the steps stop before the rewrite" 'j("stamps.json")["steps_completed"][-1] == "stage1-erasure-pending"'
+
+# za1: no arm switch: the arm steps do not run and each arm's stamps say so.
+OUT="${TMP}/z1/out"
+check "za1 (z1's run): no arm step ran, every arm stamped off" 'not any(s.startswith(("stage1-control", "stage1-extra-hour", "stage1-l1", "stage1-erasure")) for s in j("stamps.json")["steps_completed"]) and j("stamps.json")["stage1"]["arms"] == {"control": False, "extra_hour": False, "l1": False, "erasure": False} and all(j("stamps.json")["stage1"][k].startswith("skipped: ") for k in ("control_compare", "extra_hour", "l1_compare", "erasure_compare"))'
+
 # z19: the scrape before the query step fails: the records say unknown and why.
 mapfile -t args < <(full_args "${TMP}/z19/out")
 STUB_METRICS_DOWN_AT=1 run_case z19 "${args[@]}"
@@ -2774,17 +3101,85 @@ expect_check_err() {
   if grep -qxF -- "$2" "${CHECK_ERR}"; then pass "$1"; else fail "$1 (no line '$2' in stderr: $(cat "${CHECK_ERR}"))"; fi
 }
 FIGURES="$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["figures"]))' "${CI_BANDS}")"
+ARM_FIGURES="$(python3 -I -c 'import json,sys; print(sum("when" in f for f in json.load(open(sys.argv[1]))["figures"]))' "${CI_BANDS}")"
 
-# Clean: the shipped ci band file against case z1's run.
+# Clean: the shipped ci band file against case z1's run, every arm's figure n/a.
 run_check clean "${CI_BANDS}" "${TMP}/z1/out"
-if [ "${rc}" -eq 0 ] && [ "$(wc -l <"${CHECK_OUT}")" -eq "${FIGURES}" ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq "${FIGURES}" ] &&
+if [ "${rc}" -eq 0 ] && [ "$(wc -l <"${CHECK_OUT}")" -eq "${FIGURES}" ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq $((FIGURES - ARM_FIGURES)) ] &&
+  [ "$(grep -c '^n/a ' "${CHECK_OUT}")" -eq "${ARM_FIGURES}" ] && [ "${ARM_FIGURES}" -eq 19 ] &&
+  grep -qxF 'n/a l1_objects: stage1.arms.l1 is false, not true (stamps.json stage1.l1_objects.l1_objects)' "${CHECK_OUT}" &&
   grep -qxF 'ok leaves_parts_rebuilt = 3 in [1, null] (stamps.json stage1.leaves.parts_rebuilt)' "${CHECK_OUT}" &&
   grep -qxF 'ok unrouted_records_pruned_by_label_index = 0 in [0, 0] (stage1-compare.json passes.unrouted.records_pruned_by_label_index)' "${CHECK_OUT}" &&
   grep -qxF 'ok holders_selective_job_rate_sum = 2 in [1, null] (holders.json statements[id=mb_selective_job_rate_sum].holders)' "${CHECK_OUT}"; then
-  pass "check clean: exit 0, one ok line per figure (${FIGURES})"
+  pass "check clean: exit 0, one ok line per figure (${FIGURES}) but the ${ARM_FIGURES} arm figures, n/a with every arm off"
 else
   fail "check clean: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
 fi
+
+# The arms' bands: every figure in band on case za's run, every arm on.
+run_check arms "${CI_BANDS}" "${TMP}/za/out"
+if [ "${rc}" -eq 0 ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq "${FIGURES}" ] &&
+  grep -qxF 'ok extra_hour_leaf_bytes_ratio = 0.0033333333333333335 in [0, 0.01] (stamps.json stage1.extra_hour.leaf_bytes_ratio)' "${CHECK_OUT}" &&
+  grep -qxF 'ok erasure_dropped_total = 5 in [1, null] (stamps.json stage1.erasure_rewrite.dropped_total)' "${CHECK_OUT}"; then
+  pass "check arms: exit 0, every figure ok on za's run"
+else
+  fail "check arms: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
+fi
+# Each arm's failing case: zb's control, zc's extra hour, zd's l1, ze's erasure.
+run_check arm-control "${CI_BANDS}" "${TMP}/zb/out"
+expect_rc "check control" 1
+expect_check_err "check control: more GETs than the control" "out of band control_statements_more_gets = 24 not in [0, 0] (stage1-control-compare.json statements_more_gets_count)"
+expect_check_err "check control: more bytes than the control" "out of band control_statements_more_bytes = 24 not in [0, 0] (stage1-control-compare.json statements_more_bytes_count)"
+expect_check_err "check control: the latency ratio" "out of band control_latency_ratio_median = 12.5 not in [0.5, 2.0] (stage1-control-compare.json latency_ratio_median)"
+expect_check_err "check control: three failures counted" "stage1-check: 3 of ${FIGURES} figures failed"
+run_check arm-extra-hour "${CI_BANDS}" "${TMP}/zc/out"
+expect_rc "check extra hour" 1
+expect_check_err "check extra hour: the leaf bytes ratio" "out of band extra_hour_leaf_bytes_ratio = 0.3333333333333333 not in [0, 0.01] (stamps.json stage1.extra_hour.leaf_bytes_ratio)"
+expect_check_err "check extra hour: the uncovered tail part" "out of band extra_hour_uncovered_tail_parts = 1 not in [0, 0] (stamps.json stage1.extra_hour.uncovered_tail_parts_count)"
+expect_check_err "check extra hour: two failures counted" "stage1-check: 2 of ${FIGURES} figures failed"
+run_check arm-l1 "${CI_BANDS}" "${TMP}/zd/out"
+expect_rc "check l1" 1
+expect_check_err "check l1: the differing hash" "out of band l1_entries_differing = 1 not in [0, 0] (stage1-l1-compare.json entries_differing_count)"
+expect_check_err "check l1: the fetch memory exhausted" "out of band l1_fetch_memory_exhausted = 1 not in [0, 0] (stage1-l1-compare.json other_records_fetch_memory_exhausted_count)"
+expect_check_err "check l1: the failed status" "out of band l1_records_status_unexpected = 1 not in [0, 0] (stage1-l1-compare.json other_records_status_unexpected)"
+expect_check_err "check l1: three failures counted" "stage1-check: 3 of ${FIGURES} figures failed"
+run_check arm-erasure "${CI_BANDS}" "${TMP}/ze/out"
+expect_rc "check erasure" 1
+expect_check_err "check erasure: a pending record the label index pruned" "out of band erasure_pending_pruned_by_label_index = 24 not in [0, 0] (stage1-erasure-compare.json other_records_pruned_by_label_index)"
+expect_check_err "check erasure: the stale leaves" "out of band erasure_stale_leaves = 6 not in [0, 0] (stamps.json stage1.erasure_leaves.stale_leaves_count)"
+expect_check_err "check erasure: two failures counted" "stage1-check: 2 of ${FIGURES} figures failed"
+# The arm figures no stub case moves out of band, set out of band in a copy of za's run.
+cp -R "${TMP}/za/out" "${TMP}/check-arms"
+python3 -I - "${TMP}/check-arms" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+def edit(name, fn):
+    p = os.path.join(d, name)
+    doc = json.load(open(p))
+    fn(doc)
+    json.dump(doc, open(p, "w"))
+def stamps(doc):
+    s = doc["stage1"]
+    s["extra_hour"].update(tail_objects=0, start_mismatches=1, wall_ratio_on_off=11)
+    s["l1_objects"]["l1_objects"] = 0
+    s["erasure_rewrite"]["dropped_total"] = 0
+edit("stamps.json", stamps)
+edit("stage1-control-compare.json", lambda c: c.update(statements_unchecked_count=1))
+edit("stage1-l1-compare.json", lambda c: c.update(entries_compared=0))
+edit("stage1-erasure-compare.json", lambda c: c.update(entries_compared=0, entries_differing_count=1))
+PY
+run_check arms-edited "${CI_BANDS}" "${TMP}/check-arms"
+expect_rc "check arm figures" 1
+expect_check_err "check arm figures: an unchecked control statement" "out of band control_statements_unchecked = 1 not in [0, 0] (stage1-control-compare.json statements_unchecked_count)"
+expect_check_err "check arm figures: no tail object" "out of band extra_hour_tail_objects = 0 not in [1, null] (stamps.json stage1.extra_hour.tail_objects)"
+expect_check_err "check arm figures: the folds' start HEADs differ" "out of band extra_hour_start_mismatches = 1 not in [0, 0] (stamps.json stage1.extra_hour.start_mismatches)"
+expect_check_err "check arm figures: the leaf build's wall ratio" "out of band extra_hour_wall_ratio_on_off = 11 not in [0, 10] (stamps.json stage1.extra_hour.wall_ratio_on_off)"
+expect_check_err "check arm figures: no L1 object" "out of band l1_objects = 0 not in [1, null] (stamps.json stage1.l1_objects.l1_objects)"
+expect_check_err "check arm figures: no l1 entry compared" "out of band l1_entries_compared = 0 not in [1, null] (stage1-l1-compare.json entries_compared)"
+expect_check_err "check arm figures: a pending hash differing" "out of band erasure_pending_entries_differing = 1 not in [0, 0] (stage1-erasure-compare.json entries_differing_count)"
+expect_check_err "check arm figures: no pending entry compared" "out of band erasure_pending_entries_compared = 0 not in [1, null] (stage1-erasure-compare.json entries_compared)"
+expect_check_err "check arm figures: nothing dropped" "out of band erasure_dropped_total = 0 not in [1, null] (stamps.json stage1.erasure_rewrite.dropped_total)"
+expect_check_err "check arm figures: nine failures counted" "stage1-check: 9 of ${FIGURES} figures failed"
 
 # Out of band: case z2's differing hash.
 run_check oob "${CI_BANDS}" "${TMP}/z2/out"
@@ -2831,8 +3226,8 @@ run_check dup "${TMP}/check-dup-bands.json" "${TMP}/check-dup"
 expect_rc "check duplicated" 1
 expect_check_err "check duplicated: a selector matching two elements" "duplicated holders_selective_job_rate_sum: 2 elements of statements have id=mb_selective_job_rate_sum (holders.json statements[id=mb_selective_job_rate_sum].holders)"
 expect_check_err "check duplicated: a key twice in its object" "duplicated entries_compared: entries_compared occurs more than once in the top level (stage1-compare.json entries_compared)"
-expect_check_err "check duplicated: a figure the band file names twice, each time" "duplicated leaves_parts_rebuilt: the band file names it 2 times (stamps.json stage1.leaves.parts_rebuilt)"
-if [ "$(grep -c '^duplicated leaves_parts_rebuilt: ' "${CHECK_ERR}")" -eq 2 ]; then pass "check duplicated: both copies of the figure reported"; else fail "check duplicated: leaves_parts_rebuilt reported $(grep -c '^duplicated leaves_parts_rebuilt: ' "${CHECK_ERR}") times"; fi
+expect_check_err "check duplicated: a figure the band file names twice" "duplicated leaves_parts_rebuilt: the band file names it 2 times (stamps.json stage1.leaves.parts_rebuilt)"
+if [ "$(grep -c '^duplicated leaves_parts_rebuilt: ' "${CHECK_ERR}")" -eq 1 ]; then pass "check duplicated: the figure reported once, not once per copy"; else fail "check duplicated: leaves_parts_rebuilt reported $(grep -c '^duplicated leaves_parts_rebuilt: ' "${CHECK_ERR}") times"; fi
 
 # Not finite: a NaN figure is out of band, a NaN bound refuses the band file.
 cp -R "${TMP}/z1/out" "${TMP}/check-nan"
@@ -2900,6 +3295,55 @@ expect_check_err "check routed leaf unread: named" "out of band holders_routed_l
 expect_check_err "check routed leaf unread: one failure counted" "stage1-check: 1 of ${FIGURES} figures failed"
 run_check leaf-unread-unbound "${CI_BANDS}" "${TMP}/z26u/out"
 expect_rc "check routed leaf unread on a statement that is not route_bound" 0
+# when: a figure is checked only while its condition holds; a condition that
+# cannot be read fails like a figure, and a malformed one refuses the file.
+python3 -I - "${TMP}/check-when" <<'PY'
+import json, sys
+base = {"schema": "metricsbench-stage1-bands/1", "profile": "ci"}
+fig = {"file": "stamps.json", "path": "stage1.leaves.parts_rebuilt", "min": 1, "max": None, "basis": "b"}
+def write(name, figures):
+    json.dump({**base, "figures": figures}, open(f"{sys.argv[1]}-{name}.json", "w"))
+write("holds", [{**fig, "name": "held", "when": {"file": "stamps.json", "path": "profile", "equals": "ci"}},
+                {**fig, "name": "not_held", "min": 99, "when": {"file": "stamps.json", "path": "profile", "equals": "box"}}])
+write("unread", [{**fig, "name": "unread", "when": {"file": "stamps.json", "path": "stage1.no_such_switch", "equals": True}}])
+write("shape", [{**fig, "name": "shape", "when": {"file": "stamps.json", "path": "profile"}}])
+write("scalar", [{**fig, "name": "scalar", "when": {"file": "stamps.json", "path": "profile", "equals": ["ci"]}}])
+PY
+run_check when-holds "${TMP}/check-when-holds.json" "${TMP}/z1/out"
+expect_rc "check when" 0
+if [ "$(cat "${CHECK_OUT}")" = 'ok held = 3 in [1, null] (stamps.json stage1.leaves.parts_rebuilt)
+n/a not_held: profile is "ci", not "box" (stamps.json stage1.leaves.parts_rebuilt)' ]; then
+  pass "check when: the held figure checked, the other reported not applicable instead of out of band"
+else
+  fail "check when: stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
+fi
+run_check when-unread "${TMP}/check-when-unread.json" "${TMP}/z1/out"
+expect_rc "check when unread" 1
+expect_check_err "check when unread: the condition's missing value named" "missing unread: when stamps.json stage1.no_such_switch: no no_such_switch in stage1 (stamps.json stage1.leaves.parts_rebuilt)"
+run_check when-shape "${TMP}/check-when-shape.json" "${TMP}/z1/out"
+expect_rc "check when without equals" 65
+expect_check_err "check when without equals: refused" "stage1-check: ${TMP}/check-when-shape.json: figure shape: when is not an object of exactly file, path and equals"
+run_check when-scalar "${TMP}/check-when-scalar.json" "${TMP}/z1/out"
+expect_rc "check when equals a list" 65
+expect_check_err "check when equals a list: refused" "stage1-check: ${TMP}/check-when-scalar.json: figure scalar: when.equals is not a JSON scalar"
+
+run_check route-values "${CI_BANDS}" "${TMP}/z30/out"
+expect_rc "check per-value route" 1
+expect_check_err "check per-value route: the statement over its leaf GET bound named" "out of band route_values_leaf_gets_over_bound = 1 not in [0, 0] (stage1-compare.json statements_leaf_gets_over_bound_count)"
+expect_check_err "check per-value route: the part beyond the ceiling named" "out of band route_values_parts_beyond_ceiling = 1 not in [0, 0] (stage1-compare.json parts_beyond_ceiling_total)"
+expect_check_err "check per-value route: the unreadable record named" "out of band route_values_unreadable = 1 not in [0, 0] (stage1-compare.json routed_records_values_unreadable_count)"
+expect_check_err "check per-value route: three failures counted" "stage1-check: 3 of ${FIGURES} figures failed"
+cp -R "${TMP}/z1/out" "${TMP}/check-no-values"
+python3 -I - "${TMP}/check-no-values/stage1-compare.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["routed_records_without_values"] += d["routed_records_with_values"]
+d["routed_records_with_values"] = 0
+json.dump(d, open(sys.argv[1], "w"))
+PY
+run_check no-values "${CI_BANDS}" "${TMP}/check-no-values"
+expect_rc "check per-value route not measured" 1
+expect_check_err "check per-value route not measured: named" "out of band route_values_records = 0 not in [1, null] (stage1-compare.json routed_records_with_values)"
 # Run 42495422937's figures hold every ci band; that run failed 2 of 27 figures
 # against the band file before this one.
 run_check run-42495422937 "${CI_BANDS}" "${TMP}/z27/out"
