@@ -31,8 +31,9 @@
 //!   (`FinalPartitioned`, `Final`, `Single`, `SinglePartitioned`), linear
 //!   input, one grouping set with no null mask and no grouping id, no limit
 //!   and no dynamic filter, and at least one aggregate expression, each with
-//!   a `GroupsAccumulator`, no `ORDER BY`, no `FILTER` and no float state
-//!   field. Its input is not a [`crate::FirstGroupsExec`].
+//!   a `GroupsAccumulator`, no `ORDER BY` and no `FILTER`, and either no
+//!   float state field or a float state on the allowlist below. Its input is
+//!   not a [`crate::FirstGroupsExec`].
 //!
 //! 0 turns the rule off. `EXPLAIN` prints the exec as
 //! `TopKeysAggregateExec: n=<n>`.
@@ -73,8 +74,26 @@
 //! under the tie-order rewrite the sort is total on the keys and the answer
 //! is fully determined. Float keys are refused because `GroupValues` folds
 //! -0.0 into +0.0 while arrow-row orders them apart, so one group could have
-//! two sort values; float states are refused because a rebuild merges each
-//! state into a fresh accumulator, and `0.0 + -0.0` is +0.0.
+//! two sort values.
+//!
+//! A rebuild merges each kept state into a fresh accumulator, so a state is
+//! admitted only when that merge returns it bit for bit. Integer states are:
+//! an integer sum or count seeded at 0 is unchanged by adding 0. A float
+//! state generally is not, since a fresh sum seeded at `0.0` turns a `-0.0`
+//! state into `+0.0` and quiets a signalling NaN. The float states admitted
+//! are the ones [`float_state_is_identity`] names, keyed on the accumulator
+//! implementation that runs rather than on the function's name:
+//!
+//! - non-distinct `avg`/`mean` resolved to Ravel's sequential-fold UDAF
+//!   ([`crate::avg::sequential_avg_udaf`]) over a `Float64` argument (a
+//!   `Float32` argument is cast to `Float64` by its coercion), with state
+//!   `[Float64 sum, Int64 count]`. Its fresh group holds no sum and a count of
+//!   0; merging a state copies an incoming sum into an empty slot without
+//!   arithmetic, keeps a null sum null, and adds the count to 0, so the
+//!   rebuilt state and the average evaluated from it are the incoming ones.
+//!
+//! A float `sum` runs DataFusion's built-in accumulator seeded at `0.0` and
+//! stays refused, as does any other float state.
 //!
 //! # Memory
 //!
@@ -83,8 +102,10 @@
 //! to one with no reserve-ahead envelope. The table, accumulators, scratch
 //! and pending output are charged by their `size()` after each batch; the
 //! emitted keys and states of a rebuild, the sort rows of a batch and of a
-//! rebuild, and the evaluated output before its cut are each charged before
-//! they are used and released after. Resident state is at most `2n` groups
+//! rebuild, and the evaluated output before its cut are each allocated, then
+//! charged by their built size before the step that consumes them, and
+//! released after; a refused grow fails the stream after that allocation, not
+//! before it. Resident state is at most `2n` groups
 //! plus one batch's new keys. A refused grow fails the stream with the pool's
 //! `ResourcesExhausted`, prefixed with the consumer's name. Nothing spills.
 //!
@@ -93,12 +114,12 @@
 
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll, ready};
 
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array};
 use datafusion::arrow::compute::{filter, take, take_record_batch};
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::arrow::row::{OwnedRow, RowConverter, Rows, SortField};
 use datafusion::common::Result as DFResult;
@@ -107,7 +128,7 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, Tr
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Aggregate, EmitTo, GroupsAccumulator};
+use datafusion::logical_expr::{Aggregate, AggregateUDF, EmitTo, GroupsAccumulator};
 use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{PhysicalExpr, PhysicalSortExpr};
@@ -133,6 +154,7 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 
+use crate::avg::sequential_avg_udaf;
 use crate::first_groups::FirstGroupsExec;
 use crate::minmax::is_float;
 
@@ -161,7 +183,8 @@ impl TopKeysAggregateLimit {
     /// final mode, linear input, one grouping set with no null mask and no
     /// grouping id column, no limit or dynamic filter of its own, and at
     /// least one aggregate expression, each with a `GroupsAccumulator`, no
-    /// `ORDER BY`, no `FILTER` and no float state field.
+    /// `ORDER BY` and no `FILTER`, and either no float state field or a float
+    /// state whose rebuild is an identity (see the module docs).
     pub fn admits(aggregate: &AggregateExec) -> bool {
         if !matches!(
             aggregate.mode(),
@@ -194,13 +217,15 @@ impl TopKeysAggregateLimit {
                     .iter()
                     .all(|field| field.name() != Aggregate::INTERNAL_GROUPING_ID)
             });
+        let input_schema = aggregate.input_schema();
         no_grouping_id
             && aggregate.aggr_expr().iter().all(|aggr| {
                 aggr.groups_accumulator_supported()
                     && aggr.order_bys().is_empty()
-                    && aggr
+                    && (aggr
                         .state_fields()
                         .is_ok_and(|fields| fields.iter().all(|field| !is_float(field.data_type())))
+                        || float_state_is_identity(aggr, &input_schema))
             })
     }
 
@@ -868,6 +893,8 @@ impl TopKeysStream {
         if groups == 0 {
             return Ok(());
         }
+        let elapsed = self.metrics.baseline.elapsed_compute().clone();
+        let _timer = elapsed.timer();
         let mut columns = self.group_values.emit(EmitTo::All)?;
         let keys = columns.len();
         for accumulator in &mut self.accumulators {
@@ -962,6 +989,32 @@ impl TopKeysStream {
         self.release();
         Poll::Ready(Some(Err(err)))
     }
+}
+
+/// Whether `aggr` is a float-state aggregate that merging into a fresh
+/// accumulator returns bit for bit: non-distinct sequential-fold `avg` over a
+/// `Float64` argument with state `[Float64, Int64]`. `AggregateUDF` equality
+/// downcasts to the implementation type, so a same-named function with a
+/// different accumulator does not match. `input_schema` is the schema the
+/// aggregate's argument expressions are evaluated against.
+fn float_state_is_identity(aggr: &AggregateFunctionExpr, input_schema: &Schema) -> bool {
+    static SEQUENTIAL_AVG: LazyLock<AggregateUDF> = LazyLock::new(sequential_avg_udaf);
+    let float64_argument = match &aggr.expressions()[..] {
+        [argument] => argument
+            .data_type(input_schema)
+            .is_ok_and(|data_type| data_type == DataType::Float64),
+        _ => false,
+    };
+    let sum_and_count = aggr.state_fields().is_ok_and(|fields| {
+        matches!(
+            fields
+                .iter()
+                .map(|field| field.data_type())
+                .collect::<Vec<_>>()[..],
+            [DataType::Float64, DataType::Int64]
+        )
+    });
+    aggr.fun() == &*SEQUENTIAL_AVG && !aggr.is_distinct() && float64_argument && sum_and_count
 }
 
 fn fresh_accumulators(
