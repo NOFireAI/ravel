@@ -226,7 +226,7 @@ schemars = { version = "1.2", features = ["derive"] }
 # (`transport-streamable-http-server`) and `tower` are left for the
 # `services/ravel-server` adapter (#1381), which is the only crate that mounts
 # a transport. `ravel-mcp` itself stays transport-independent.
-rmcp = { version = "=3.2.0" }
+rmcp = { version = "=3.9.0" }
 
 # build
 prost-build = "0.14"
