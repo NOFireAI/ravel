@@ -78,7 +78,8 @@
 //!
 //! A rebuild merges each kept state into a fresh accumulator, so a state is
 //! admitted only when that merge returns it bit for bit. Integer states are:
-//! an integer sum or count seeded at 0 is unchanged by adding 0. A float
+//! a sum or count seeded at 0 is unchanged by adding 0, and a min or max
+//! seeded at its type's extreme is unchanged by comparing with it. A float
 //! state generally is not, since a fresh sum seeded at `0.0` turns a `-0.0`
 //! state into `+0.0` and quiets a signalling NaN. The float states admitted
 //! are the ones [`float_state_is_identity`] names, keyed on the accumulator
