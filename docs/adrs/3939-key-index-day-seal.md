@@ -379,10 +379,13 @@ cost, not correctness.
 
 ADR-3692's key-set ceiling amendment replaces `L_max` = 2,048 with
 `P_max x (1 + min(k, B_run))` and admits a part only when its worst case is
-at most `2 x entry_count`. Under it every multi-day lookup in the
-Consequences is covered: 30 day parts x 126 = 3,780 leaf GETs against a
-ceiling of 1,024 x 65 = 66,560, and 126 against a day part's tier-1 cost of
-1,104.
+at most 2 x its segments in the routed snapshot, which is narrowed to the
+statement's time window. Under it every multi-day lookup in the
+Consequences is covered when its window holds whole days: 30 day parts x
+126 = 3,780 leaf GETs against a ceiling of 1,024 x 65 = 66,560, and 126
+against a whole day part's tier-1 cost of 1,104. A window holding only a
+few hours of a day part is left to tier 1 for that part when that is
+cheaper.
 
 ### What multi-day lookups cost, restated (predicted)
 
