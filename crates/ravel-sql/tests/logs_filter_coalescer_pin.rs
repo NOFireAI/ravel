@@ -304,6 +304,7 @@ fn session(fx: &Fixture, pool: Arc<dyn MemoryPool>) -> SessionContext {
             sql_partition_count: Some(1),
             ..EngineConfig::default()
         },
+        first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };
     build_session(
