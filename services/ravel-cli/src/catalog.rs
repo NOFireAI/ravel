@@ -603,6 +603,10 @@ fn render_fold_report(
         report.key_index_leaf_gets
     ));
     out.push_str(&format!(
+        "key_index_carry_peak_held_bytes: {}\n",
+        report.key_index_carry_peak_held_bytes
+    ));
+    out.push_str(&format!(
         "metrics_label_index_parts_over_cap: {}\n",
         report.metrics_label_index_parts_over_cap
     ));
