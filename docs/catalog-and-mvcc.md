@@ -1470,7 +1470,15 @@ watermark_hour]` overlaps the part's own, and a source sharing no data
 object with the part costs no GET
 (`an_overlapping_part_sharing_no_object_is_not_a_carry_source`). Each
 source is mapped onto the part by data object key, never by ordinal,
-since the new part's ordinals shift wherever a late entry sorts in, and a
+since the new part's ordinals shift wherever a late entry sorts in. A
+source's keys are derived once per fold attempt and only when needed: for
+a source a re-encoded part overlaps, or for one whose hours a reconcile
+or a late entry is about to change, whichever comes first, so an
+advancing fold derives the tail's keys and no other part's
+(`carry_keys_are_derived_only_for_overlapping_sources`). The source's
+entries are then found as the attempt's entries in its hour range, and
+used only when they hash to the digest taken before the first change;
+otherwise the source is not carried. A
 part can carry from several sources: a part over the end of one previous
 part and the start of the next carries from both
 (`a_part_carries_from_two_previous_parts`), and a re-encoded sealed day
@@ -1766,9 +1774,12 @@ carried parts that lack a declared field's leaf (under "Day seal"), which
 `a_switch_off_fold_over_leaves_is_reported`), and
 `key_index_carry_peak_held_bytes`, the most previous-leaf bytes the carry
 held at once while building any one part in the fold, every source and
-field together (under "Incremental tail build"; 0 when no part carried,
-and 0 with the switch off, test `a_switch_off_fold_over_leaves_is_reported`,
-whose switch-off fold runs over a HEAD whose part has a leaf). It equals
+field together (under "Incremental tail build"; 0 when no previous slice
+was fetched, and 0 with the switch off, test
+`a_switch_off_fold_over_leaves_is_reported`, whose switch-off fold runs
+over a HEAD whose part has a leaf). A slice fetched by a source's load
+that then fails on another field counts, since its bytes were held
+(test `a_slice_released_by_a_failed_load_stays_in_the_peak`). It equals
 the largest total the passes held in
 `the_carry_holds_at_most_two_slices_per_field_per_source`, and
 `ravel-cli catalog fold` prints it in text and `--json` (test
