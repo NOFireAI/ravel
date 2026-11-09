@@ -1704,6 +1704,9 @@ fn build_sql_state_inner(
         // The first-groups bound under an unordered `GROUP BY ... LIMIT`
         // (ADR-3985): the shipped default, with no flag, for the same reason.
         bounded_groups_max_limit: SqlConfig::default().bounded_groups_max_limit,
+        // The top-keys bound under `GROUP BY ... ORDER BY <group key> LIMIT`
+        // (ADR-4002): the shipped default, with no flag, for the same reason.
+        bounded_top_keys_max_limit: SqlConfig::default().bounded_top_keys_max_limit,
         // The per-partition TopK's limit ceiling: the shipped default, with
         // no flag, for the same reason as the line above.
         partition_topk_max_limit: SqlConfig::default().partition_topk_max_limit,

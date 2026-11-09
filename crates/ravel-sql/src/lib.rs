@@ -123,6 +123,7 @@ mod statement_accounting;
 pub mod stats_json;
 mod sum;
 mod sum_plus;
+mod top_keys;
 mod trace_id_planner;
 mod udf;
 mod validate;
@@ -149,8 +150,9 @@ pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, 
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
 pub use config::{
     BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
-    DEFAULT_BOUNDED_TOPK_MAX_LIMIT, DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS,
-    DEFAULT_MAX_QUERY_BYTES, DEFAULT_PARTITION_TOPK_MAX_LIMIT, DEFAULT_SPILL_MERGE_FAN_IN,
+    DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT, DEFAULT_BOUNDED_TOPK_MAX_LIMIT,
+    DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES,
+    DEFAULT_PARTITION_TOPK_MAX_LIMIT, DEFAULT_SPILL_MERGE_FAN_IN,
     DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES, DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE, ENV_SPILL_DIR,
     ENV_SPILL_MAX_BYTES, GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
     GROUP_VALUES_UNDERCOUNT_FACTOR, SQL_SPILL_SUBDIR, SpillConfig, SpillConfigError, SqlConfig,
@@ -271,6 +273,9 @@ pub use spans_schema::{
 };
 pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
 pub use statement::{DialectPolicy, LoweredStatement, LoweringContext, StatementTarget};
+pub use top_keys::{
+    TOP_KEYS_AGGREGATE_RULE, TOP_KEYS_CONSUMER_PREFIX, TopKeysAggregateExec, TopKeysAggregateLimit,
+};
 pub use udf::{label_match_udf, label_udf};
 pub use validate::{
     DdlIntent, DdlKind, DdlValidationError, StatementKind, ValidationError, ddl_kind,

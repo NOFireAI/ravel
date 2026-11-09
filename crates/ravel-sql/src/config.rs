@@ -76,6 +76,17 @@ pub const DEFAULT_BOUNDED_TOPK_MAX_LIMIT: usize = 1024;
 /// stays small against the group tables it replaces.
 pub const DEFAULT_BOUNDED_GROUPS_MAX_LIMIT: usize = 1024;
 
+/// Default [`SqlConfig::bounded_top_keys_max_limit`] (issue #4004,
+/// ADR-4002): a `GROUP BY ... ORDER BY <group key> LIMIT n` (`OFFSET s LIMIT
+/// n`) has its final aggregate replaced by a [`crate::TopKeysAggregateExec`]
+/// while `n + s` is at or below this.
+///
+/// Each final partition then holds at most `2(n + s)` groups plus one batch's
+/// new keys, and one rebuild transient of the same size. The same ceiling as
+/// [`DEFAULT_BOUNDED_GROUPS_MAX_LIMIT`]; it covers ClickBench row 43's
+/// `LIMIT 10 OFFSET 1000`, a fetch of 1010.
+pub const DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT: usize = 1024;
+
 /// Default for [`SqlConfig::partition_topk_max_limit`].
 ///
 /// The per-partition TopK holds a `k`-row heap in every scan partition on top
@@ -534,6 +545,24 @@ pub struct SqlConfig {
     /// It changes which `n` groups come back, which the statement leaves
     /// unspecified, and the memory the final aggregate holds.
     pub bounded_groups_max_limit: usize,
+    /// Row ceiling for bounding the final aggregate of a `GROUP BY ... ORDER
+    /// BY <group key> LIMIT` (issue #4004, ADR-4002).
+    /// [`crate::TopKeysAggregateLimit`] replaces a final aggregate with a
+    /// [`crate::TopKeysAggregateExec`] when a global sort with a fetch of
+    /// `n + s` (for `OFFSET s LIMIT n`) reads it through projections and
+    /// partition merges alone, orders by non-float functions of its group
+    /// keys, and `n + s` is at most this; 0 turns the rule off, which is the
+    /// operator opt-out and the "before" side of `tests/top_keys.rs`.
+    ///
+    /// Default [`DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT`]. Set once at server
+    /// startup, like every other field here; ravel-server takes the default
+    /// and has no flag for it.
+    ///
+    /// The rewrite keeps the answer exact: every group the exec emits is
+    /// complete, and a key it evicts is absent rather than partial (see the
+    /// `crate::top_keys` module docs for why). Among keys whose sort values
+    /// tie at the n-th, which come back is unspecified, as SQL leaves it.
+    pub bounded_top_keys_max_limit: usize,
     /// `LIMIT` ceiling for the per-partition TopK under a row-filtered `logs`
     /// scan (ADR-0093, exact not-equal amendment). `Some(k)` installs
     /// `crate::logs_scan::LogsPartitionTopK` and lets it fire on a global
@@ -616,6 +645,7 @@ impl Default for SqlConfig {
             late_materialization_extra_columns: Some(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS),
             bounded_topk_max_limit: Some(DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
             bounded_groups_max_limit: DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
+            bounded_top_keys_max_limit: DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
             partition_topk_max_limit: Some(DEFAULT_PARTITION_TOPK_MAX_LIMIT),
             bucketed_final_aggregation: None,
             // Spill off. See the field doc: this is requirement 9 of #954 (a
@@ -823,6 +853,13 @@ mod tests {
     fn bounded_groups_defaults_to_a_limit_of_1024() {
         assert_eq!(SqlConfig::default().bounded_groups_max_limit, 1024);
         assert_eq!(DEFAULT_BOUNDED_GROUPS_MAX_LIMIT, 1024);
+    }
+
+    /// Issue #4004: the top-keys bound ships on, with a ceiling of 1024 rows.
+    #[test]
+    fn bounded_top_keys_defaults_to_a_limit_of_1024() {
+        assert_eq!(SqlConfig::default().bounded_top_keys_max_limit, 1024);
+        assert_eq!(DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT, 1024);
     }
 
     /// The per-partition TopK ships installed, with a `LIMIT` ceiling. Both

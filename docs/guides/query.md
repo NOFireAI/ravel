@@ -722,6 +722,14 @@ the number of groups, and every group it returns is aggregated over all of
 its rows (see the
 [query engine](../query-engine.md#bounded-groups-for-an-unordered-group-by--limit-adr-3985)).
 
+A `GROUP BY ... ORDER BY <group key> LIMIT n` whose keys and aggregate states
+are not floating point cuts its final aggregate back to its best `n` groups
+whenever a partition reaches `2n` (for `n` up to 1024 by default), and every
+group it returns carries the same aggregates as under the plan that builds
+every group (see the
+[query engine](../query-engine.md#bounded-keys-for-group-by--order-by-group-key-limit-adr-4002)
+for the full conditions).
+
 ### Parquet tables
 
 The same endpoint also serves the Parquet tables of the tenant. A query can

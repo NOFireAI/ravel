@@ -15,7 +15,21 @@ SELECT date_trunc('minute', ts) AS m, count(*) FROM logs GROUP BY m ORDER BY m D
 
 builds every group before the sort picks n of them. The second statement is the "latest N buckets" query that observability dashboards issue. On a high-cardinality key the final aggregate's memory grows with the number of distinct keys, not with n. On small hosts that ends in a memory refusal and the ADR-0954 spill retry, or in a failed query.
 
-Stage 0 (#4002) measures the charged peak, the aggregate envelope and the wall time on main for these shapes, at 100,000, 1,000,000 and 10,000,000 distinct keys. The figures are recorded on #4002, and this section gains a table from them in the commit that lands T1.
+Stage 0 (#4002, comment 6728794535) measured the charged peak, the aggregate envelope and the wall time on main at b5aa2c8b5 for these shapes, at 100,000, 1,000,000 and 10,000,000 distinct keys. It used the session `build_session` produces, 8 partitions, a MemTable and 3 rows per key, on a 4-core aarch64 executor with `max_query_bytes` raised to 4 GiB. Medians of 3 runs; charged and envelope in MiB:
+
+| statement | 100k charged / envelope | 1M charged / envelope | 10M charged / envelope | 10M wall |
+|---|---|---|---|---|
+| `ORDER BY k LIMIT 10`, Int64 key | 6.52 / 5.18 | 58.63 / 54.07 | 607.89 / 280.00 | 2.04 s |
+| the same, Utf8View key of 8 to 40 bytes | 21.65 / 11.93 | 161.43 / 75.98 | 1260.60 / 551.25 | 4.77 s |
+| `ORDER BY k DESC` | 6.52 / 5.53 | 57.63 / 54.07 | 614.15 / 280.00 | 2.06 s |
+| `count`, `sum`, `avg` | 15.14 / 12.44 | 104.54 / 76.09 | 1257.14 / 539.00 | 4.06 s |
+| two keys, ordered by both | 8.99 / 7.29 | 71.88 / 64.39 | 767.44 / 280.00 | 2.81 s |
+| `date_trunc('minute')`, `DESC LIMIT 60` | 6.35 / 5.23 | 58.38 / 54.07 | 607.50 / 280.00 | 2.06 s |
+| `min(v)`, ordered by key | 6.53 / 5.34 | 57.50 / 54.07 | 610.51 / 280.00 | 2.09 s |
+| control: unordered `GROUP BY k LIMIT 10` | 1.96 / 0.05 | 3.84 / 0.04 | 7.47 / 0.04 | 1.36 s |
+| control: `ORDER BY count(*) DESC` | 6.33 / 5.44 | 58.88 / 54.07 | 611.89 / 280.00 | 1.98 s |
+
+Every ordered statement built the full group table, linear in the number of keys, as the out-of-scope `ORDER BY count(*)` control does. Only the unordered control, bounded by `FirstGroupsExec`, stayed flat. At the default 256 MiB query limit, every statement but that control would be refused at 10,000,000 keys.
 
 Neither existing bound applies:
 
@@ -138,7 +152,13 @@ The default ceiling of 1024 covers the dashboard shapes and ClickBench row 43, w
 
 ### 5. Measured
 
-Not measured yet. T1's peak test and T5's re-measurement on the Stage 0 statement set fill this section, against the Stage 0 figures.
+T1's peak test, `the_exec_bounds_the_final_stages_charged_peak` in `crates/ravel-sql/tests/top_keys.rs`, measured on a 16-core x86_64 executor on 1,000,000 distinct `Int64` keys over 8 partitions with `ORDER BY k LIMIT 10`, ascending and descending, with keys arriving in the worst order or shuffled:
+
+- the query pool's charged peak: 4.1 to 8.9 MB with the rule, 60 to 71 MB with `bounded_top_keys_max_limit = 0`;
+- the aggregate envelope: 4.7 to 6.2 MB with the rule, all of it the partial stage's, and 107 to 134 MB without it;
+- each `TopKeys[` consumer's own peak: 895,768 to 1,027,547 bytes. The test bounds it by `(2n + batch size) × 256` bytes, 2,102,272 at the default batch of 8192.
+
+The test asserts the charged peak below 32 MiB with the rule, about twice the largest figure because the hash exchange's buffers vary with scheduling, and above 32 MiB without it. T5's re-measurement on the Stage 0 statement set adds the after-figures for the table in Context.
 
 ## Rejected alternatives
 
