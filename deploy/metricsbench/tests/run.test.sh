@@ -332,14 +332,22 @@
 #                                       erasure never COMPLETED ends the run
 #                                       at stage1-erasure-rewrite (70), its
 #                                       key removed; zi: the erasure sleeps
-#                                       to its seal deadline before the
-#                                       first poll; zj: an erasure that
-#                                       rewrote no part.
+#                                       to its seal deadline, from the submit
+#                                       time, before the first poll; zi2: a
+#                                       submit within the skew allowance of
+#                                       the next hour waits for it too; zj:
+#                                       an erasure that rewrote no part; zc3:
+#                                       a re-encoded old part is a tail part;
+#                                       zk: parts carried over an erased
+#                                       hour; zl: an unrelated re-encode is
+#                                       not an erased hour; zm: a dead
+#                                       maintain container ends the run (70).
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za,
-#                                       zb2, zc2, z20 and z21, out of band
-#                                       on z2, z2b, z15, z16, z17, z22, zb,
-#                                       zc, zd, ze, zj and an edited copy of
+#                                       zb2, zc2, zc3, z20 and z21, out of
+#                                       band on z2, z2b, z15, z16, z17, z22,
+#                                       zb, zc, zd, ze, zj, zk, zl and an
+#                                       edited copy of
 #                                       za, a
 #                                       missing cold count, missing,
 #                                       duplicated, not finite (a NaN figure
