@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, TimestampNanosecondArray};
+use datafusion::arrow::array::{
+    ArrayRef, Float32Array, Float64Array, Int64Array, TimestampNanosecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -27,6 +29,8 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
+use datafusion::logical_expr::EmitTo;
+use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
@@ -1096,14 +1100,21 @@ fn float_state_parts() -> Vec<Vec<RecordBatch>> {
         .collect()
 }
 
-/// A float state is refused even when the key is an integer: a rebuild
-/// merges each kept state into a fresh accumulator, and `0.0 + -0.0` is
-/// `+0.0`, so the `-0.0` group of [`float_state_parts`] could change sign.
+/// A float state whose merge into a fresh accumulator is not an identity is
+/// refused even when the key is an integer. A float `sum` runs DataFusion's
+/// built-in accumulator, whose fresh group is seeded at `0.0`, and
+/// `0.0 + -0.0` is `+0.0`, so a `-0.0` state does not survive that merge.
+/// The same seed already makes the stock plan's sum of the `-0.0` group of
+/// [`float_state_parts`] `+0.0`, so the refusal is pinned by the plan, and
+/// the values by the rule-off run. One such aggregate beside an admitted
+/// `avg` refuses the whole statement.
+///
+/// FLIP (admit every float state): the plan holds `TopKeysAggregateExec:
+/// n=10` and the first assertion fails.
 #[tokio::test]
-async fn a_float_state_leaves_the_plan_unchanged() {
+async fn a_float_state_that_is_not_an_identity_stays_refused() {
     for sql in [
         "SELECT k, sum(f) FROM t GROUP BY k ORDER BY k LIMIT 10",
-        "SELECT k, avg(f) FROM t GROUP BY k ORDER BY k LIMIT 10",
         "SELECT k, sum(f), avg(f), count(*) FROM t GROUP BY k ORDER BY k LIMIT 10",
     ] {
         for options in [&[][..], ONE_PARTITION] {
@@ -1112,9 +1123,371 @@ async fn a_float_state_leaves_the_plan_unchanged() {
             let rows = on.rows();
             assert_eq!(rows.len(), 10, "{sql}");
             assert_eq!(rows[0][0], "0", "{sql}");
+            assert_eq!(rows[0][1], "0.0", "{sql}: the -0.0 group's sum");
+            assert_eq!(rows[1][..2], ["1", "2.5"], "{sql}");
             assert_eq!(rows, off.rows(), "{sql}");
         }
     }
+}
+
+/// A function registered under the name `avg` whose accumulator is not
+/// Ravel's sequential fold is refused: the allowlist matches the
+/// implementation, not the name. DataFusion's built-in `avg` seeds a fresh
+/// group's sum at `0.0`.
+///
+/// FLIP (key the allowlist on the name `avg`): the built-in is admitted and
+/// the plan holds `TopKeysAggregateExec: n=10`.
+#[tokio::test]
+async fn a_same_named_avg_with_another_accumulator_stays_refused() {
+    let sql = "SELECT k, avg(f) FROM t GROUP BY k ORDER BY k LIMIT 10";
+    let (pool, _breach) = SqlConfig::default()
+        .query_pool(TenantMemoryAccountant::new(1 << 30), QueryAccounting::new());
+    let ctx = session(&SqlConfig::default(), pool, float_state_parts(), &[]);
+    let builtin = datafusion::functions_aggregate::average::avg_udaf();
+    assert_eq!(builtin.name(), "avg");
+    ctx.register_udaf(builtin.as_ref().clone());
+    let plan = plan_of(&ctx, sql).await;
+    assert!(top_keys_bounds(&plan).is_empty(), "{}", render(&plan));
+    let mut names = Vec::new();
+    aggregate_function_names(&plan, &mut names);
+    assert!(!names.is_empty(), "{}", render(&plan));
+    assert!(names.iter().all(|name| name == "avg"), "{names:?}");
+}
+
+/// The function name of every aggregate expression of every `AggregateExec`
+/// in `plan`.
+fn aggregate_function_names(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<String>) {
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+        out.extend(
+            aggregate
+                .aggr_expr()
+                .iter()
+                .map(|aggr| aggr.fun().name().to_string()),
+        );
+    }
+    for child in plan.children() {
+        aggregate_function_names(child, out);
+    }
+}
+
+/// A quiet NaN with payload 1, a quiet NaN with the sign bit and payload
+/// `0xb0`, and a signalling NaN with payload 1.
+const NAN_A: u64 = 0x7ff8_0000_0000_0001;
+const NAN_B: u64 = 0xfff8_0000_0000_00b0;
+const SNAN: u64 = 0x7ff0_0000_0000_0001;
+/// The smallest positive subnormal, `5e-324`.
+const SUBNORMAL: u64 = 0x0000_0000_0000_0001;
+
+/// Each value of a `Float64` array as its bits; NULL as `None`.
+fn float_bits(array: &ArrayRef) -> Vec<Option<u64>> {
+    array
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("a Float64 array")
+        .iter()
+        .map(|value| value.map(f64::to_bits))
+        .collect()
+}
+
+fn int_values(array: &ArrayRef) -> Vec<Option<i64>> {
+    array
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("an Int64 array")
+        .iter()
+        .collect()
+}
+
+/// The aggregate expression `avg` of `sql`'s `TopKeysAggregateExec`, which
+/// must be present: the statement is admitted.
+async fn admitted_avg(
+    parts: Vec<Vec<RecordBatch>>,
+    sql: &str,
+) -> Arc<AggregateFunctionExpr> {
+    let (pool, _breach) = SqlConfig::default()
+        .query_pool(TenantMemoryAccountant::new(1 << 30), QueryAccounting::new());
+    let ctx = session(&SqlConfig::default(), pool, parts, &[]);
+    let plan = plan_of(&ctx, sql).await;
+    fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<&TopKeysAggregateExec> {
+        plan.downcast_ref::<TopKeysAggregateExec>()
+            .or_else(|| plan.children().into_iter().find_map(find))
+    }
+    let node = find(&plan).unwrap_or_else(|| panic!("{sql}: not admitted\n{}", render(&plan)));
+    let aggr = Arc::clone(&node.aggregate().aggr_expr()[0]);
+    assert_eq!(aggr.fun().name(), "avg");
+    aggr
+}
+
+/// [`float_state_parts`] with `f` as `Float32`.
+fn float32_state_parts() -> Vec<Vec<RecordBatch>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("g", DataType::Float32, false),
+    ]));
+    float_state_parts()
+        .into_iter()
+        .map(|part| {
+            part.into_iter()
+                .map(|batch| {
+                    let g = Float32Array::from_iter_values(
+                        batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .expect("f is Float64")
+                            .values()
+                            .iter()
+                            .map(|f| *f as f32),
+                    );
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::clone(batch.column(0)), Arc::new(g)],
+                    )
+                    .expect("batch builds")
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The admitted `avg` state, `[Float64 sum, Int64 count]`, merged into a
+/// fresh accumulator over the same group indexes is the same state bit for
+/// bit, and so is the value evaluated from it. That merge is exactly what a
+/// rebuild does to each kept group. Twelve groups cover `-0.0` (one and two
+/// rows), `+0.0`, two quiet NaN payloads (one with the sign bit set, one
+/// beside a finite row), a signalling NaN, `+inf`, `-inf`, the smallest
+/// subnormal, a NULL-only group, a group with no rows (both are the null sum
+/// with count 0), and a finite mixed group. The source accumulator is filled
+/// by `update_batch`, as the partial stage fills it. An empty state merges
+/// to an empty state. The same holds for the `avg` planned over a `Float32`
+/// column, which coerces to `Float64` before the accumulator.
+///
+/// FLIP (seed a fresh group's sum at `Some(0.0)` in `avg.rs`): the `-0.0`
+/// groups come back as `+0.0` and the signalling NaN comes back quieted.
+#[tokio::test]
+async fn the_identity_merge_is_bit_exact_for_admitted_float_states() {
+    let rows: [(usize, Option<u64>); 15] = [
+        (0, Some((-0.0f64).to_bits())),
+        (1, Some((-0.0f64).to_bits())),
+        (1, Some((-0.0f64).to_bits())),
+        (2, Some(0.0f64.to_bits())),
+        (3, Some(NAN_A)),
+        (4, Some(NAN_B)),
+        (4, Some(1.0f64.to_bits())),
+        (5, Some(SNAN)),
+        (6, Some(f64::INFINITY.to_bits())),
+        (7, Some(f64::NEG_INFINITY.to_bits())),
+        (8, Some(SUBNORMAL)),
+        (9, None),
+        (11, Some(1.5f64.to_bits())),
+        (11, Some((-0.5f64).to_bits())),
+        (11, Some(0.0f64.to_bits())),
+    ];
+    const GROUPS: usize = 12;
+    let want_sums: [Option<u64>; GROUPS] = [
+        Some((-0.0f64).to_bits()),
+        Some((-0.0f64).to_bits()),
+        Some(0.0f64.to_bits()),
+        Some(NAN_A),
+        Some(NAN_B),
+        Some(SNAN),
+        Some(f64::INFINITY.to_bits()),
+        Some(f64::NEG_INFINITY.to_bits()),
+        Some(SUBNORMAL),
+        None,
+        None,
+        Some(1.0f64.to_bits()),
+    ];
+    let want_counts: [Option<i64>; GROUPS] = [1, 2, 1, 1, 2, 1, 1, 1, 1, 0, 0, 3].map(Some);
+    let values: ArrayRef = Arc::new(Float64Array::from_iter(
+        rows.iter().map(|(_, value)| value.map(f64::from_bits)),
+    ));
+    let groups: Vec<usize> = rows.iter().map(|(group, _)| *group).collect();
+    let indexes: Vec<usize> = (0..GROUPS).collect();
+
+    for (parts, sql) in [
+        (
+            float_state_parts(),
+            "SELECT k, avg(f) FROM t GROUP BY k ORDER BY k LIMIT 10",
+        ),
+        (
+            float32_state_parts(),
+            "SELECT k, avg(g) FROM t GROUP BY k ORDER BY k LIMIT 10",
+        ),
+    ] {
+        let aggr = admitted_avg(parts, sql).await;
+        let state_types: Vec<DataType> = aggr
+            .state_fields()
+            .expect("state fields")
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect();
+        assert_eq!(state_types, [DataType::Float64, DataType::Int64], "{sql}");
+        let updated = || {
+            let mut source = aggr.create_groups_accumulator().expect("accumulator");
+            source
+                .update_batch(&[Arc::clone(&values)], &groups, None, GROUPS)
+                .expect("update");
+            source
+        };
+        let state = updated().state(EmitTo::All).expect("state");
+        assert_eq!(float_bits(&state[0]), want_sums, "{sql}: the source sums");
+        assert_eq!(int_values(&state[1]), want_counts, "{sql}: the source counts");
+        let evaluated = updated().evaluate(EmitTo::All).expect("evaluate");
+
+        let merged = || {
+            let mut fresh = aggr.create_groups_accumulator().expect("accumulator");
+            fresh
+                .merge_batch(&state, &indexes, GROUPS)
+                .expect("merge");
+            fresh
+        };
+        let rebuilt = merged().state(EmitTo::All).expect("state");
+        assert_eq!(float_bits(&rebuilt[0]), want_sums, "{sql}: rebuilt sums");
+        assert_eq!(int_values(&rebuilt[1]), want_counts, "{sql}: rebuilt counts");
+        let rebuilt_evaluated = merged().evaluate(EmitTo::All).expect("evaluate");
+        assert_eq!(
+            float_bits(&rebuilt_evaluated),
+            float_bits(&evaluated),
+            "{sql}: the evaluated averages"
+        );
+        let averages = float_bits(&evaluated);
+        assert_eq!(averages[0], Some((-0.0f64).to_bits()), "{sql}");
+        assert_eq!(averages[1], Some((-0.0f64).to_bits()), "{sql}");
+        assert_eq!(averages[3], Some(NAN_A), "{sql}");
+        assert_eq!(averages[4], Some(NAN_B), "{sql}");
+        assert_eq!(averages[8], Some(SUBNORMAL), "{sql}");
+        assert_eq!(averages[9..11], [None, None], "{sql}");
+        assert_eq!(averages[11], Some((1.0f64 / 3.0).to_bits()), "{sql}");
+
+        let mut empty = aggr.create_groups_accumulator().expect("accumulator");
+        let none: Vec<ArrayRef> = vec![
+            Arc::new(Float64Array::from(Vec::<f64>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+        ];
+        empty.merge_batch(&none, &[], 0).expect("merge");
+        let emptied = empty.state(EmitTo::All).expect("state");
+        assert_eq!(emptied.iter().map(|column| column.len()).collect::<Vec<_>>(), [0, 0]);
+    }
+}
+
+/// 2,000 minutes of `(ts, v)`, `ts` a nanosecond timestamp a few seconds
+/// into its minute, over 8 partitions; row `j` of minute `m` is in partition
+/// `(m + j) mod 8` and every partition holds its minutes in ascending order,
+/// the adversarial order for `ORDER BY ... DESC`. A minute's rows follow its
+/// class `m mod 8`, see [`minute_class_rows`].
+fn float_minute_parts() -> Vec<Vec<RecordBatch>> {
+    const PARTITIONS: usize = 8;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("v", DataType::Float64, true),
+    ]));
+    let mut rows: Vec<Vec<(i64, Option<f64>)>> = vec![Vec::new(); PARTITIONS];
+    for minute in 0..FLOAT_MINUTES {
+        for (j, value) in minute_class_rows(minute).into_iter().enumerate() {
+            let ts = minute * MINUTE_NS + (j as i64 + 1) * 7_000_000_000;
+            rows[(minute as usize + j) % PARTITIONS].push((ts, value));
+        }
+    }
+    rows.into_iter()
+        .map(|part| {
+            part.chunks(512)
+                .map(|chunk| {
+                    let ts =
+                        TimestampNanosecondArray::from_iter_values(chunk.iter().map(|row| row.0));
+                    let v = Float64Array::from_iter(chunk.iter().map(|row| row.1));
+                    RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ts), Arc::new(v)])
+                        .expect("batch builds")
+                })
+                .collect()
+        })
+        .collect()
+}
+
+const FLOAT_MINUTES: i64 = 2_000;
+
+/// The rows of minute `minute`, by class `minute mod 8`; their average is
+/// [`minute_class_average`]. Each class holds at most one NaN payload, never both
+/// infinities, and only small dyadic finite values, so every fold order the
+/// partitions can produce gives the same bits.
+fn minute_class_rows(minute: i64) -> Vec<Option<f64>> {
+    let nan_a = f64::from_bits(NAN_A);
+    let nan_b = f64::from_bits(NAN_B);
+    let subnormal = f64::from_bits(SUBNORMAL);
+    match minute % 8 {
+        0 => vec![Some(-0.0), Some(-0.0)],
+        1 => vec![Some(nan_a), Some(1.0), Some(2.0)],
+        2 => vec![Some(nan_b), Some(-3.0)],
+        3 => vec![Some(-0.0), Some(0.0), Some(1.5), Some(-0.5)],
+        4 => vec![Some(f64::INFINITY), Some(5.0)],
+        5 => vec![Some(f64::NEG_INFINITY), Some(-0.0)],
+        6 => vec![Some(subnormal), Some(subnormal), None],
+        _ => vec![None, None],
+    }
+}
+
+/// The bits of the average of [`minute_class_rows`] for `minute`; NULL as
+/// `None`.
+fn minute_class_average(minute: i64) -> Option<u64> {
+    match minute % 8 {
+        0 => Some((-0.0f64).to_bits()),
+        1 => Some(NAN_A),
+        2 => Some(NAN_B),
+        3 => Some(0.25f64.to_bits()),
+        4 => Some(f64::INFINITY.to_bits()),
+        5 => Some(f64::NEG_INFINITY.to_bits()),
+        6 => Some(SUBNORMAL),
+        _ => None,
+    }
+}
+
+/// Every `(minute, average bits)` row of `batches`, in order.
+fn minute_averages(batches: &[RecordBatch]) -> Vec<(i64, Option<u64>)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let minutes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("a nanosecond timestamp");
+        out.extend(
+            minutes
+                .values()
+                .iter()
+                .map(|ts| ts / MINUTE_NS)
+                .zip(float_bits(batch.column(1))),
+        );
+    }
+    out
+}
+
+/// `avg(v)` per minute bucket, newest 60 first, over [`float_minute_parts`]:
+/// the admitted float state goes through the exec's rebuilds and every
+/// average equals the rule-off run's bit for bit, `-0.0`, both NaN payloads,
+/// both infinities and the subnormal included. Minutes 1,940 to 1,999 come
+/// back, each with its class's average.
+///
+/// FLIP (merge a `(0.0, 0)` state into each fresh accumulator before the kept
+/// states in `rebuild`): the `-0.0` minutes come back as `+0.0`.
+#[tokio::test]
+async fn an_admitted_float_aggregate_is_exact_through_rebuilds() {
+    let sql = "SELECT date_trunc('minute', ts) AS m, avg(v) FROM t \
+               GROUP BY m ORDER BY m DESC LIMIT 60";
+    let options = [("datafusion.execution.target_partitions", "8")];
+    let (on, off) = on_and_off(float_minute_parts, &options, sql).await;
+    assert_eq!(on.bounds, vec![60], "{}", on.plan);
+    assert!(on.rebuilds > 0, "rebuilds {}\n{}", on.rebuilds, on.plan);
+    let got = minute_averages(on.result.as_ref().expect("query runs"));
+    let want: Vec<(i64, Option<u64>)> = (FLOAT_MINUTES - 60..FLOAT_MINUTES)
+        .rev()
+        .map(|minute| (minute, minute_class_average(minute)))
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(
+        minute_averages(off.result.as_ref().expect("query runs")),
+        want,
+        "rule off"
+    );
 }
 
 /// `(f, k)` in one partition: a `+0.0` row and a `-5.0` row, then two `-0.0`
@@ -1308,6 +1681,8 @@ async fn the_exec_bounds_the_final_stages_charged_peak() {
     const BATCH: usize = 8192;
     // About twice the 110 to 125 bytes per group the exec's peak measures
     // here: key, count and sum, hash table, and the mask and sort-row scratch.
+    // Only this single `Int64` key is measured and asserted; a wider key
+    // needs its own figure, not this constant.
     const BYTES_PER_HELD_GROUP: usize = 256;
     let exec_bound = (2 * N + BATCH) * BYTES_PER_HELD_GROUP;
     for (direction, adversarial, want) in [
