@@ -1,7 +1,9 @@
 """Unit tests for bin/agent-cli's parsing helpers (no network, no gh)."""
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -274,6 +276,64 @@ class Usage(unittest.TestCase):
             self.skipTest("no Claude Code transcripts for this repository on this machine")
         root = dirs[0].name.split("-wt-")[0]
         self.assertTrue(all(d.name.startswith(root) for d in dirs))
+
+
+class CiBudgets(unittest.TestCase):
+    def _fixture(self, d, exit_code):
+        # A stub check-ci-job-budgets.sh standing in for the real guard
+        # (issue #4037): echoes the argv it was called with, so the
+        # assertions below can pin exactly what cmd_ci_budgets forwarded.
+        root = pathlib.Path(d)
+        guard_dir = root / "scripts" / "guards"
+        guard_dir.mkdir(parents=True)
+        guard = guard_dir / "check-ci-job-budgets.sh"
+        guard.write_text(f"#!/usr/bin/env bash\necho \"args: $*\"\nexit {exit_code}\n")
+        guard.chmod(0o755)
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=root, check=True,
+                        env={**os.environ, **env})
+        return root
+
+    def _run_ci_budgets(self, root, argv):
+        cwd_before = os.getcwd()
+        os.chdir(root)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = cli.main(argv)
+        finally:
+            os.chdir(cwd_before)
+        return rc, buf.getvalue()
+
+    def test_passes_through_exit_code_and_forwards_repo_runs_flags(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._fixture(d, 1)
+            rc, out = self._run_ci_budgets(
+                root, ["--json", "ci-budgets", "--repo", "acme/widgets", "--runs", "10"])
+        # FLIP: if cmd_ci_budgets dropped the --repo/--runs forwarding, or
+        # swallowed the guard's exit code behind a fixed return of its own,
+        # this would either miss the flags in detail below or report rc=0.
+        self.assertEqual(rc, 1)
+        detail = json.loads(out)["detail"]
+        self.assertIn("--repo", detail)
+        self.assertIn("acme/widgets", detail)
+        self.assertIn("--runs", detail)
+        self.assertIn("10", detail)
+
+    def test_omits_repo_and_runs_flags_when_neither_is_given(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._fixture(d, 0)
+            rc, out = self._run_ci_budgets(root, ["--json", "ci-budgets"])
+        # FLIP: a cmd_ci_budgets that always passed a default --repo/--runs
+        # through to the script would fail this, pinning that the flags are
+        # genuinely optional.
+        self.assertEqual(rc, 0)
+        detail = json.loads(out)["detail"]
+        self.assertNotIn("--repo", detail)
+        self.assertNotIn("--runs", detail)
 
 
 class Parser(unittest.TestCase):
