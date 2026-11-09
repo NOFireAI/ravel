@@ -2413,8 +2413,8 @@ mod tests {
     /// `EnforceDistribution` placed, and it is the first of Ravel's appended
     /// rules, directly before `DictionaryGroupKeysAsViews`.
     ///
-    /// FLIP: install the floor with `with_physical_optimizer_rules` ahead of
-    /// the defaults and the prefix no longer matches them.
+    /// FLIP: install the floor after `DictionaryGroupKeysAsViews` and the pair
+    /// after the defaults reads reversed.
     #[test]
     fn the_exchange_floor_runs_after_the_default_rules_and_first_of_ravels() {
         let ctx = samples_and_logs();

@@ -727,6 +727,16 @@ impl SqlConfig {
         Ok(self)
     }
 
+    /// How many aggregate streams a query can run at once, which bounds the
+    /// reserve-ahead envelope width: `engine.sql_partition_count()`, or the
+    /// floored final aggregate's [`SqlConfig::first_attempt_min_partitions`]
+    /// when that is wider (ADR-1195, issue #4014 amendment).
+    pub fn aggregate_stream_count(&self) -> usize {
+        self.engine
+            .sql_partition_count()
+            .max(self.first_attempt_min_partitions)
+    }
+
     /// Build the query's DataFusion memory pool: a [`TenantDelegatingPool`]
     /// capped at `max_query_bytes` that forwards every grow/shrink to
     /// `tenant`. Install it on the query's `RuntimeEnv` via
@@ -766,7 +776,7 @@ impl SqlConfig {
             )
             .with_aggregate_reserve_ahead(
                 self.aggregate_reserve_ahead,
-                process_envelope_width(self.engine.sql_partition_count()),
+                process_envelope_width(self.aggregate_stream_count()),
             ),
         );
         (pool, breach)
@@ -793,7 +803,7 @@ impl SqlConfig {
             )
             .with_aggregate_reserve_ahead(
                 self.aggregate_reserve_ahead,
-                process_envelope_width(self.engine.sql_partition_count()),
+                process_envelope_width(self.aggregate_stream_count()),
             )
             .with_spill_headroom(crate::memory::spill_mode_headroom(self.max_query_bytes)),
         );
@@ -891,6 +901,25 @@ mod tests {
     fn first_attempt_min_partitions_defaults_to_16() {
         assert_eq!(SqlConfig::default().first_attempt_min_partitions, 16);
         assert_eq!(DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS, 16);
+    }
+
+    /// Issue #4014: the envelope width counts the floored final aggregate's
+    /// streams while the floor is on, and the engine count when it is off or
+    /// lower. FLIP: return `engine.sql_partition_count()` alone and the first
+    /// case reads 4.
+    #[test]
+    fn aggregate_stream_count_is_the_wider_of_the_count_and_the_floor() {
+        let cases = [(4, 16, 16), (4, 0, 4), (32, 16, 32)];
+        for (partitions, floor, streams) in cases {
+            let mut config = SqlConfig::default();
+            config.engine.sql_partition_count = Some(partitions);
+            config.first_attempt_min_partitions = floor;
+            assert_eq!(
+                config.aggregate_stream_count(),
+                streams,
+                "count {partitions}, floor {floor}"
+            );
+        }
     }
 
     /// Issue #4004: the top-keys bound ships on, with a ceiling of 1024 rows.

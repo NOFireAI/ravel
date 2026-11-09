@@ -178,9 +178,13 @@ fn sql_config(
         ..SqlConfig::default()
     };
     config.engine.sql_partition_count = Some(partitions);
-    // The tests read per-partition metrics and drive `partitions` streams by
-    // index, and 16 bucketed streams at about 19 MB each exhaust the 256 MiB
-    // pool, so the final stage runs at `partitions`.
+    // The tests drive `partitions` output streams by index and read
+    // per-partition metrics, so the final stage must have exactly that many.
+    // At the floor they would drive 2 of 16: DataFusion keeps an undriven
+    // partition's channel and reservation in its ConsumingInputStreamsState
+    // until the plan drops, so a test holding the plan reads those bytes as
+    // still reserved (1,837,696 at 16, and the same at 8 streams), and the
+    // pool counts 16 bucketed streams at about 19 MB each against 256 MiB.
     config.first_attempt_min_partitions = 0;
     config
 }
