@@ -472,6 +472,62 @@ RS
 check "a flaky comment above #[test] is read even when #[ignore] sits below it" \
   "${d}" 1 "ignore-flaky"
 
+# The rule is about the ignore's reason (ADR-4034 D5). A doc comment describes
+# the test, and here the ignore carries a reason of its own that is not about
+# flakiness.
+d="$(new_repo doc-comment-mentioning-flaky)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+/// Covers the retry path whose absence made ingest flaky in production.
+#[test]
+#[ignore = "needs a live S3 endpoint"]
+fn retry_path_against_s3() {
+    assert!(true);
+}
+RS
+check "doc_comment_mentioning_flaky_is_clean" "${d}" 0 "clean"
+
+# An ignore with a reason string is judged on that reason alone, not on a plain
+# comment above the attribute block.
+d="$(new_repo plain-comment-above-reasoned-ignore)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+// The flaky retry this replaced is gone; this one runs against real S3.
+#[test]
+#[ignore = "needs a live S3 endpoint"]
+fn retry_path_against_s3() {
+    assert!(true);
+}
+RS
+check "plain_comment_above_reasoned_ignore_is_clean" "${d}" 0 "clean"
+
+# A bare ignore reads the plain comment above for its reason, but never a doc
+# comment: the plain comment here is the reason and names no flakiness.
+d="$(new_repo doc-comment-above-bare-ignore)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+/// Covers the retry path whose absence made ingest flaky in production.
+// needs a live S3 endpoint
+#[test]
+#[ignore]
+fn retry_path_against_s3() {
+    assert!(true);
+}
+RS
+check "doc_comment_above_bare_ignore_is_clean" "${d}" 0 "clean"
+
+d="$(new_repo ignore-flaky-allow)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+// hygiene-allow: ignore-flaky -- a probe of upstream flakiness, never meant to run in CI
+#[test]
+#[ignore = "flaky by design: measures upstream retry behaviour"]
+fn upstream_flakiness_probe() {
+    assert!(true);
+}
+RS
+check "ignore_flaky_allow_marker_suppresses" "${d}" 0 "clean"
+
 # --- clock-compared ----------------------------------------------------------
 
 d="$(new_repo clock-reads-compared)"
@@ -640,6 +696,93 @@ else
   fails=$((fails + 1))
 fi
 
+# A clock-reading `new` inside `impl A` says nothing about `B::new`, which
+# reads no clock. Matching helpers by bare name reports this test.
+d="$(new_repo unrelated-same-name-constructor)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+struct A;
+struct B;
+
+impl A {
+    fn new() -> A {
+        let now = now_ns();
+        A
+    }
+}
+
+impl B {
+    fn new() -> B {
+        B
+    }
+}
+
+#[test]
+fn b_is_built_twice() {
+    let a = B::new();
+    let b = B::new();
+    assert_eq!(a, b);
+}
+RS
+check "unrelated_same_name_constructor_is_clean" "${d}" 0 "clean"
+
+# The other side: scoping by impl type must still catch the type whose
+# constructor does read the clock.
+d="$(new_repo same-type-clock-constructor)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+struct A;
+
+impl A {
+    fn new() -> A {
+        let now = now_ns();
+        A
+    }
+}
+
+#[test]
+fn a_is_built_twice() {
+    let a = A::new();
+    let b = A::new();
+    assert_eq!(a, b);
+}
+RS
+check "type_qualified_clock_constructor_is_a_finding" "${d}" 1 "t.rs:14: clock-compared"
+
+d="$(new_repo clock-compared-allow)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn serve() -> i64 {
+    let now = now_ns();
+    now
+}
+
+#[test]
+fn two_reads_are_ordered() {
+    let a = serve();
+    let b = serve();
+    // hygiene-allow: clock-compared -- the ordering of two live reads is the
+    // subject of this test.
+    assert!(a <= b);
+}
+RS
+check "clock_compared_allow_marker_suppresses" "${d}" 0 "clean"
+
+d="$(new_repo inline-clock-calls)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn serve() -> i64 {
+    let now = now_ns();
+    now
+}
+
+#[test]
+fn two_inline_reads() {
+    assert_eq!(serve(), serve());
+}
+RS
+check "inline_clock_calls_in_one_assertion_is_a_finding" "${d}" 1 "t.rs:8: clock-compared"
+
 # --- usage -----------------------------------------------------------------
 
 d="$(new_repo usage)"
@@ -664,6 +807,17 @@ if [[ "${rc}" == "0" && "${out}" == *"test-hygiene"* ]]; then
   passes=$((passes + 1))
 else
   printf 'FAIL  --help prints the header and exits 0: got %s / %s\n' "${rc}" "${out}"
+  fails=$((fails + 1))
+fi
+
+# The header's last line, read off the guard, so a header that grows past a
+# fixed print range fails here.
+last_header="$(awk 'NR > 1 && !/^#/ { print prev; exit } { prev = $0 }' "${GUARD}")"
+if [[ -n "${last_header}" && "${rc}" == "0" && "${out}" == *"${last_header}"* ]]; then
+  printf 'ok    help_prints_whole_header\n'
+  passes=$((passes + 1))
+else
+  printf 'FAIL  help_prints_whole_header: missing %s\n' "${last_header}"
   fails=$((fails + 1))
 fi
 
