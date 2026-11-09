@@ -459,8 +459,9 @@ pairs for a logs day, over the 2 GB band; #4018 gives it the pair budget.
 
 ### Acceptance (added rows; predicted, a figure outside its band is a miss)
 
-W2 is measured on the C1 binary, and W5, F2 and F3 on the 30-day state at
-a reduced rate per day, as the harness-state amendment states.
+W2 is measured on the C1 binary, W5 and F2 on the 30-day state at a
+reduced rate per day, and F3 on both the 7-day and the 30-day state, as the
+harness-state amendment states.
 
 | check | target | miss | source |
 |---|---|---|---|
@@ -511,10 +512,16 @@ its many-parts state. One `catalog fold --writers-stopped
 corrected), and the advance rows run on a tail loaded through the server
 after it. The lane writes one object per shard per hour: 192 entries a day
 at 8 shards, against box D's 552. The leaf GET figures depend on slices
-per day part, not on entries, and the run stamps both.
+per day part, not on entries, and the run stamps both. Days covered do
+depend on entries: ADR-3692's key-set ceiling amendment admits a part only
+when its worst case is at most 2 x its segments in the routed snapshot, so
+a harness day part with no time range admits at 384 against box D's 1,104,
+and the headroom over the predicted 126 falls from about 9 x to about 3 x.
+An uncovered day on these states is read against 384 first.
 
 **Two states.** A 7-day state at box D's logs rate, for A5, W4, W6, W7, F1
-and F3. A 30-day state at a reduced rate per day, for A7, W5 and F2,
+and F3 on W4. A 30-day state at a reduced rate per day, for A7, W5, F2 and
+F3 on W5,
 because 30 days at box D's rate cost about 4 hours of fold and about 20
 hours of corpus generation, which no single run's deadline holds. At the
 reduced rate the per-day figures follow the slices the run stamps: with
@@ -530,20 +537,25 @@ ADR-3692's key-set ceiling amendment: every day held is covered while `30 x
 (T(S) + 100)` is at most 66,560. F2 is a ratio to the same statement's
 unfolded p50 and needs no restatement.
 
-**W2 runs on the C1 binary.** After R2, a tombstoned hour in a sealed day
-takes the `retired_hours` path and is not re-encoded, and a late level-0
-commit is reconciled only in a bucket that lists a compaction record,
-tombstone or rewrite record, or in a held-open hour above the fold margin
-(crates/ravel-catalog/src/fold.rs `bucket_needs_reconcile` and
-`held_open_hours`), which is the tail, not a sealed day. No dirtying event
-on an R2 build reaches W2's mechanism, so W2 is measured on the main SHA
-that carries C1 and not R2, and the D3' run stamps the fold binary's SHA
-beside W2. Every other row runs on the R2 build.
+**W2 runs on the C1 binary.** W2's trigger is a tombstoned hour, and after
+R2 a tombstoned hour in a sealed day takes the `retired_hours` path and is
+not re-encoded. So W2, as written, is measured on the main SHA that carries
+C1 and not R2, and the D3' run stamps the fold binary's SHA beside it.
+Every other row runs on the R2 build. The mechanism W2 measures, a dirtied
+sealed day carried from its own previous leaves, stays reachable on the R2
+build through the other dirtying events below; a variant measured that way
+records its trigger and does not stand in for W2.
 
-**Decision 6, corrected.** Its sentence "a compaction record, an erasure
-rewrite record or a late commit still dirties the part" holds for a late
-commit only into a held-open hour; a sealed day cannot receive one under
-the seal lemma (ADR-0063).
+**Decision 6, corrected.** A late level-0 commit is reconciled only in a
+bucket that lists a compaction record, tombstone or rewrite record, or in a
+held-open hour (crates/ravel-catalog/src/fold.rs `bucket_needs_reconcile`
+and `held_open_hours`), so decision 6's "a late commit still dirties the
+part" holds for a late commit into a held-open hour. Held-open hours run
+from the fold margin up to the watermark, floored at
+`fold_reconcile_window_hours` (default 26) below it, so they can reach into
+the previous UTC day, whose part is sealed: a late commit there dirties
+that sealed day part, as do a compaction record and an erasure rewrite
+record anywhere in it.
 
 **Plan.** H1 splits in two. H1a adds A1 to A7, W1 to W8 and F1 to F3 to the
 investigations harness's bands, each reporting not-run until its state
