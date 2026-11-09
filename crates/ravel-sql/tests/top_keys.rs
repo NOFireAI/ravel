@@ -1276,12 +1276,20 @@ async fn a_sort_over_an_aggregate_or_a_renamed_non_key_leaves_the_plan_unchanged
 /// Every key of [`keyed_parts`] arriving in the adversarial order for the
 /// sort, and in a fixed shuffle, at 1,000,000 keys over 8 partitions,
 /// `LIMIT 10`, in both directions. With the rule each final partition holds
-/// at most 20 groups plus one batch's keys; the charged peak that remains is
-/// the hash exchange and the partial aggregates. With the rule off the final
-/// stage holds every group.
+/// at most 20 groups plus one batch's keys, and its `TopKeys[` reservation
+/// stays under [`BYTES_PER_HELD_GROUP`] times that many groups; the charged
+/// peak that remains is the hash exchange and the partial aggregates. With
+/// the rule off the final stage holds every group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_exec_bounds_the_final_stages_charged_peak() {
     const KEYS: i64 = 1_000_000;
+    const N: usize = 10;
+    // DataFusion's default, which the session keeps.
+    const BATCH: usize = 8192;
+    // About twice the 110 to 125 bytes per group the exec's peak measures
+    // here: key, count and sum, hash table, and the mask and sort-row scratch.
+    const BYTES_PER_HELD_GROUP: usize = 256;
+    let exec_bound = (2 * N + BATCH) * BYTES_PER_HELD_GROUP;
     for (direction, adversarial, want) in [
         ("ASC", Arrival::Descending, keyed_rows(0..10, 1)),
         (
@@ -1295,23 +1303,46 @@ async fn the_exec_bounds_the_final_stages_charged_peak() {
         for arrival in [adversarial, Arrival::Shuffled(4004)] {
             let (on, off) = on_and_off(|| keyed_parts(KEYS, 8, 1, arrival), &[], &sql).await;
             eprintln!(
-                "top_keys peaks, {direction} {arrival:?}: on charged={} envelope={}; \
-                 off charged={} envelope={}",
-                on.charged, on.envelope, off.charged, off.envelope
+                "top_keys peaks, {direction} {arrival:?}: on charged={} envelope={} \
+                 exec={} over {} consumers; off charged={} envelope={}",
+                on.charged,
+                on.envelope,
+                on.top_keys_peak,
+                on.top_keys_consumers,
+                off.charged,
+                off.envelope
             );
             assert_eq!(on.bounds, vec![10], "{}", on.plan);
             assert!(on.rebuilds > 0, "{direction} {arrival:?}: no rebuild ran");
             assert_eq!(on.rows(), want, "{direction} {arrival:?}");
             assert_eq!(off.rows(), want, "{direction} {arrival:?}: rule off");
+            assert!(on.top_keys_consumers > 0, "{direction} {arrival:?}");
+            assert!(
+                on.top_keys_peak < exec_bound,
+                "{direction} {arrival:?}: the exec's own peak {} against {exec_bound}",
+                on.top_keys_peak
+            );
             assert!(
                 on.charged < 16 * MIB as u64,
                 "{direction} {arrival:?}: charged peak {} with the rule",
                 on.charged
             );
+            // The partial aggregates' envelope, which the rule leaves as it
+            // is: 4.7 to 6.2 MB measured.
+            assert!(
+                on.envelope < 16 * MIB as i64,
+                "{direction} {arrival:?}: envelope {} with the rule",
+                on.envelope
+            );
             assert!(
                 off.charged > 32 * MIB as u64,
                 "{direction} {arrival:?}: charged peak {} with the rule off",
                 off.charged
+            );
+            assert!(
+                off.envelope > 32 * MIB as i64,
+                "{direction} {arrival:?}: envelope {} with the rule off",
+                off.envelope
             );
         }
     }
