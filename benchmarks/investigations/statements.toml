@@ -31,7 +31,9 @@
 #              benchmarks/clickbench/hits.corpus.json whose sql is run
 #   window     "none" (no start: the whole tenant), "1h", "narrow" (5 min) or
 #              "wide" (the corpus span plus one hour), each centred on the
-#              anchor below
+#              anchor below, or "midnight" (the hour centred on a UTC midnight
+#              the state's corpus holds; box/lib/inv.py refuses it until task
+#              H1b, #4048, adds it with the day_parts_7 state)
 #   anchor     "trace" (the run's saved trace start) or "cell" (the middle of
 #              the failing hour); unused for window = "none"
 #   per_run    "saved_trace": cold run i reads saved trace i, so every cold
@@ -45,7 +47,11 @@
 #              holds the base hours plus the mixed state's tail hour, and its
 #              statements keep the base truth key: the tail plants ids of its
 #              own and holds a base list's key only through an id collision,
-#              which would read as a wrong answer (README "States")
+#              which would read as a wrong answer (README "States").
+#              day_parts_7, day_parts_30 and retired_hour are ADR-3939's
+#              multi-day states, which box/run.sh does not build yet (task
+#              H1b, #4048); row 18's six key-set statements also run in
+#              day_parts_7 for ADR-3939 row A6
 #   cold_only  true: no warm repeat
 #   control    true: one of the 43 ClickBench statements of the
 #              nonselective control (ADR row 16)
@@ -142,7 +148,7 @@ kind = "sql"
 sql = "SELECT span_id FROM spans WHERE trace_id IN ({in_trace_ids_x_10})"
 window = "none"
 truth_key = "in_trace_id.10.spans"
-states = ["unfolded", "folded_leaves", "advanced_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves", "day_parts_7"]
 cold_only = true
 
 [[statement]]
@@ -153,7 +159,7 @@ kind = "sql"
 sql = "SELECT span_id FROM spans WHERE trace_id IN ({in_trace_ids_x_100})"
 window = "none"
 truth_key = "in_trace_id.100.spans"
-states = ["unfolded", "folded_leaves", "advanced_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves", "day_parts_7"]
 cold_only = true
 
 # Sent as written. Before ADR-3692's key set amendment ravel-sql's
@@ -217,7 +223,7 @@ kind = "sql"
 sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_10})"
 window = "none"
 truth_key = "in_trace_id.10.logs"
-states = ["unfolded", "folded_leaves", "advanced_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves", "day_parts_7"]
 cold_only = true
 
 [[statement]]
@@ -228,7 +234,7 @@ kind = "sql"
 sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_100})"
 window = "none"
 truth_key = "in_trace_id.100.logs"
-states = ["unfolded", "folded_leaves", "advanced_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves", "day_parts_7"]
 cold_only = true
 
 [[statement]]
@@ -338,7 +344,7 @@ sql = "SELECT request_id FROM logs WHERE request_id IN ({in_request_ids_10})"
 window = "wide"
 anchor = "cell"
 truth_key = "in_request_id.10"
-states = ["unfolded", "folded_leaves", "advanced_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves", "day_parts_7"]
 cold_only = true
 
 [[statement]]
@@ -350,7 +356,7 @@ sql = "SELECT request_id FROM logs WHERE request_id IN ({in_request_ids_100})"
 window = "wide"
 anchor = "cell"
 truth_key = "in_request_id.100"
-states = ["unfolded", "folded_leaves", "advanced_leaves"]
+states = ["unfolded", "folded_leaves", "advanced_leaves", "day_parts_7"]
 cold_only = true
 
 [[statement]]
@@ -640,6 +646,60 @@ window = "none"
 oracle = "unfolded"
 truth_key = "hits.q20"
 states = ["unfolded", "folded_leaves"]
+cold_only = true
+
+# ADR-3939 rows A5, A7, W4 to W7, F1 to F3: logs request_id key sets over
+# day parts with no time range, so the lookup reads every day part the state
+# holds (7 in day_parts_7, 30 in day_parts_30), and one key over the hour
+# across a UTC midnight, which reads the two day parts either side of it.
+[[statement]]
+id = "logs_request_in_100_7d"
+tenant = "inv"
+table = "logs"
+kind = "sql"
+sql = "SELECT request_id FROM logs WHERE request_id IN ({in_request_ids_100})"
+window = "none"
+truth_key = "in_request_id.100"
+states = ["day_parts_7"]
+cold_only = true
+
+[[statement]]
+id = "logs_request_in_100_30d"
+tenant = "inv"
+table = "logs"
+kind = "sql"
+sql = "SELECT request_id FROM logs WHERE request_id IN ({in_request_ids_100})"
+window = "none"
+truth_key = "in_request_id.100"
+states = ["day_parts_30"]
+cold_only = true
+
+[[statement]]
+id = "logs_request_in_1_7d"
+tenant = "inv"
+table = "logs"
+kind = "sql"
+sql = "SELECT request_id FROM logs WHERE request_id IN ({in_request_ids_1})"
+window = "none"
+truth_key = "in_request_id.1"
+states = ["day_parts_7"]
+cold_only = true
+
+# The key is one request_id inside the hour across midnight, so the answer
+# is that key's row. gen_corpus.py writes no midnight truth yet (task H1b,
+# #4048): until it does, truth.json carries no midnight field and box/lib/
+# inv.py plan records the call not-run, as for any statement whose requires
+# field is null.
+[[statement]]
+id = "logs_request_in_1_midnight"
+tenant = "inv"
+table = "logs"
+kind = "sql"
+sql = "SELECT request_id FROM logs WHERE request_id IN ({midnight_request_ids_1})"
+window = "midnight"
+requires = "midnight"
+truth_key = "midnight.request_id.1"
+states = ["day_parts_7"]
 cold_only = true
 
 # ADR row 16: the 43 ClickBench statements as the nonselective control.
