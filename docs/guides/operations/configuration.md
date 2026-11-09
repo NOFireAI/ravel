@@ -2086,7 +2086,7 @@ uncovered.
 `--fold-key-index-build-max-pairs N` (ravel-server) and
 `--key-index-build-max-pairs N` (`ravel-cli catalog fold`) bound the
 (entry, key8) pairs the build holds for one part at once, the pairs read
-and the pairs carried from the previous tail together. A metrics fold with
+and the pairs carried from previous parts' leaves together. A metrics fold with
 `--metrics-label-index` on also holds up to N more: the LABEL_DICT pairs
 of objects its postings build fetched whole, only for the parts it builds a
 leaf for, each part's pairs released once its leaf is built. Every field the
@@ -2106,7 +2106,9 @@ one-block pair is an upper-bound estimate, not a measured figure. The
 leaves depend on the budget: they equal a build from scratch at the same
 budget, and lookups read them the same at any budget. A section read that
 fails in some passes only leaves its entry uncovered. The budget
-does not cover the previous tail's stored leaf bytes, the one frame of a
+does not cover the previous leaf slices the carry holds (at most two per
+field per source while the build's passes advance through a source's
+slices, up to a sparse source's whole set for one pass), the one frame of a
 previous leaf being decoded, the sections in flight or one pass's encoded
 leaves; the
 [catalog spec](../../catalog-and-mvcc.md#per-part-key-index-leaves-adr-2707)

@@ -1048,7 +1048,7 @@ pub struct Cli {
     pub fold_key_index_leaves: bool,
 
     /// With `--fold-key-index-leaves`, the most (entry, key8) pairs, read and
-    /// carried from the previous tail's leaves, the key-index leaf build
+    /// carried from previous parts' leaves, the key-index leaf build
     /// holds for one part at a time (ADR-3692 decision 5). Each field the
     /// build indexes gets a share, max(1, N / fields). A field over its
     /// share is built in passes over disjoint key8 ranges, each pass holding the
