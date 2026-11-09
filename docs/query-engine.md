@@ -6355,10 +6355,10 @@ states, and `Single` on one partition. Those two read one fixed arrival
 order: the first rows of an order-sensitive group (`1e16`, `1.0`, `-1e16`)
 and of a `-0.0`-only group, then 199 keys descending, adversarial for
 `ORDER BY k`, then the next rows of both groups, so both are held across a
-rebuild and receive rows after it. `SinglePartitioned`, shuffled arrival and
-descending arrival are not covered for the float `avg`. Among keys tied on
-the sort, which ones are returned follows arrival order, which SQL leaves unspecified, and
-under the tie-order rewrite the sort is total on the keys. Float keys are
+rebuild and receive rows after it. `SinglePartitioned` and shuffled arrival
+are not covered for the float `avg`. Among keys tied on the sort, which ones
+are returned follows arrival order, which SQL leaves unspecified, and under
+the tie-order rewrite the sort is total on the keys. Float keys are
 refused because `GroupValues` folds -0.0 into +0.0 while the row encoding
 orders them apart. A rebuild merges each kept state into a fresh
 accumulator, so a float state is admitted only when that merge returns it bit
