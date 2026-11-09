@@ -1586,9 +1586,11 @@ elif op == "stage1-control-compare":
 elif op == "stage1-hash-compare":
     # A base and an other pass's diagnostics, the output path and the two
     # passes' names. Per entry, the two passes' result_hash sets compared as
-    # stage1-compare does; and the other pass's records counted by status
-    # and by label-index prunes. Prints the summary; exit 3 and why on
-    # stdout when a diagnostics file cannot be read.
+    # stage1-compare does; the other pass's records counted by status and
+    # by label-index prunes; and the entries both passes answered whose
+    # segmentsPrunedByLabelIndex figures differ between them. Prints the
+    # summary; exit 3 and why on stdout when a diagnostics file cannot be
+    # read.
     base_path, other_path, out_path, base_name, other_name = args
     try:
         base, other = cost_rows(base_path), cost_rows(other_path)
@@ -1609,6 +1611,12 @@ elif op == "stage1-hash-compare":
         v = rec.get("segmentsPrunedByLabelIndex")
         return v if whole(v) else None
     figures = [pruned(r) for r in other]
+    def prunes(rows, entry):
+        # A record with no whole figure sorts as -1, so it never equals one.
+        return sorted(-1 if pruned(r) is None else pruned(r) for r in rows if r.get("entry") == entry)
+    answered = [e for e in sorted(set(a) | set(b), key=str) if a.get(e) and b.get(e)]
+    prune_mismatch = [{"entry": e, base_name: prunes(base, e), other_name: prunes(other, e)}
+                      for e in answered if prunes(base, e) != prunes(other, e)]
     doc = {"schema": "metricsbench-stage1-hash-compare/1", "base": base_name, "other": other_name,
            "entries_compared": len(equal) + len(differing), "entries_equal": len(equal),
            "entries_differing_count": len(differing), "entries_differing": differing,
@@ -1616,16 +1624,19 @@ elif op == "stage1-hash-compare":
            "other_records": len(other),
            "other_records_status_unexpected": sum(1 for r in other if r.get("status") not in ("ok", "incorrect")),
            "other_records_label_index_null": sum(1 for v in figures if v is None),
-           "other_records_pruned_by_label_index": sum(1 for v in figures if v is not None and v > 0)}
+           "other_records_pruned_by_label_index": sum(1 for v in figures if v is not None and v > 0),
+           "label_index_prune_mismatch_count": len(prune_mismatch), "label_index_prune_mismatch": prune_mismatch,
+           "label_index_prune_basis": "per entry with a result_hash in both passes, the sorted segmentsPrunedByLabelIndex of its records in each pass, a record with no whole figure as -1; an entry whose two lists differ is a mismatch"}
     dump(out_path, doc)
     print(json.dumps({**doc, "entries_differing": [d["entry"] for d in differing]}))
 elif op == "stage1-extra-hour":
     # The leaf-off and leaf-on fold reports, their wall times, the sha256 of
     # the HEAD each fold started from and of the leaf-on fold's HEAD put back
-    # after both, the inspect text and catalog listing taken after that.
+    # after both, the inspect text and catalog listing taken after that, and
+    # the inspect text of the routed HEAD the leaf-on fold started from.
     # Prints the stamp; exit 3 and why on stdout when an input cannot be
     # read or lacks a field.
-    off_path, on_path, off_ms, on_ms, off_head, on_head, end_head, inspect_path, list_path = args
+    off_path, on_path, off_ms, on_ms, off_head, on_head, end_head, inspect_path, list_path, base_inspect_path = args
     want = ["watermark_hour", "previous_watermark_hour", "buckets_folded", "entry_count", "put_requests",
             "key_index_leaves_written", "key_index_leaf_bytes_written", "key_index_uncovered_entries",
             "key_index_switch_off_over_leaves"]
@@ -1634,6 +1645,7 @@ elif op == "stage1-extra-hour":
         assert isinstance(off, dict) and isinstance(on, dict)
         listed = listed_objects(list_path)
         parts = inspect_parts(inspect_path)
+        base_parts = inspect_parts(base_inspect_path)
     except (OSError, ValueError, AssertionError) as e:
         print(f"an extra-hour input could not be read ({type(e).__name__}: {e})")
         sys.exit(3)
@@ -1650,7 +1662,12 @@ elif op == "stage1-extra-hour":
     def data_bytes(objs):
         return sum(o["object_size"] for o in objs if whole(o.get("object_size")))
     tail_objects = [o for o in listed if in_hours(o, prev + 1, on["watermark_hour"])]
-    tail_parts = [p for p in parts if p["hi"] > prev]
+    # The parts the leaf-on fold wrote: every part its HEAD carries that the
+    # routed HEAD it started from does not, by key and blake3. A re-encoded
+    # part whose hours all lie at or below prev is one of them.
+    base_ids = {(p["key"], p["blake3"]) for p in base_parts}
+    tail_parts = [p for p in parts if (p["key"], p["blake3"]) not in base_ids]
+    repartitioned = [p for p in tail_parts if p["hi"] <= prev]
     # Each listed object once, however many tail parts' ranges hold its hour.
     covered = [o for o in listed if any(in_hours(o, p["lo"], p["hi"]) for p in tail_parts)]
     covered_bytes = data_bytes(covered)
@@ -1670,10 +1687,12 @@ elif op == "stage1-extra-hour":
         "leaf_bytes": leaf_bytes,
         "leaf_bytes_denominator_objects": len(covered), "leaf_bytes_denominator": covered_bytes,
         "leaf_bytes_ratio": leaf_bytes / covered_bytes if covered_bytes > 0 else None,
-        "leaf_bytes_basis": "fold_on.key_index_leaf_bytes_written (leaf_bytes) over the object_size of the listed objects whose ingest_hour_bucket lies in the lo..=hi range of some tail part, each object counted once (leaf_bytes_denominator): the leaf-on fold re-encodes every tail part, and a part's leaves index all its hours, not only the new one",
-        "tail_parts": len(tail_parts), "uncovered_tail_parts_count": len(uncovered),
+        "leaf_bytes_basis": "fold_on.key_index_leaf_bytes_written (leaf_bytes) over the object_size of the listed objects whose ingest_hour_bucket lies in the lo..=hi range of some tail part, each object counted once (leaf_bytes_denominator); a tail part is a part of the leaf-on fold's HEAD whose key and blake3 the routed HEAD it started from (stage1-routed.inspect.txt) does not carry, so every part that fold wrote, a re-encoded part over older hours included, and a part's leaves index all its hours, not only the new one",
+        "tail_parts": len(tail_parts), "repartitioned_parts": len(repartitioned),
+        "repartitioned_parts_keys": [p["key"] for p in repartitioned],
+        "uncovered_tail_parts_count": len(uncovered),
         "uncovered_tail_parts": uncovered,
-        "uncovered_basis": "parts whose hour range ends above previous_watermark_hour and that carry no label_value leaf or a leaf with uncovered_count above 0"}))
+        "uncovered_basis": "tail parts (as for leaf_bytes_basis) that carry no label_value leaf or a leaf with uncovered_count above 0; repartitioned_parts counts the tail parts whose range ends at or below previous_watermark_hour"}))
 elif op == "stage1-compact":
     # `maintain compact-tenant` text output, its wall time, the command:
     # every counter it prints once at the start of a line. Exit 3 and why on
@@ -1841,33 +1860,58 @@ elif op == "stage1-erasure-status":
                       "requested_unix_ns": ns("requested_unix_ns"),
                       "completed_unix_ns": ns("completed_unix_ns")}))
 elif op == "stage1-erasure-leaves":
-    # The inspect text before the erasure and after its fold. erase status
-    # prints no per-bucket figure and the completion record's bucket drops
-    # are empty, so the rewrite is read from the catalog: a rewritten part is
-    # a pre-erasure part whose key and blake3 no post-fold part carries, and
-    # a stale leaf is a leaf key a rewritten part referenced that some
-    # post-fold part still references.
-    pre_path, post_path = args
+    # The inspect text and the catalog listing before the erasure and after
+    # its fold. erase status prints no per-bucket figure and the completion
+    # record's bucket drops are empty, so the erased hours are read from the
+    # listings: the rewrite writes each output under a new content-keyed L1
+    # key (crates/ravel-maintain/src/erasure_rewrite.rs:1474-1482,
+    # keys::l1_part_key) whose rewrite record supersedes its inputs, so an
+    # erased hour is an ingest hour holding a data-object key before that
+    # the listing after no longer resolves. Every pre-erasure part whose
+    # lo..=hi range holds an erased hour must be gone after the fold (no part
+    # after carries its key and blake3), and no leaf such a part referenced
+    # may be referenced after.
+    pre_path, post_path, pre_list_path, post_list_path = args
     try:
         pre, post = inspect_parts(pre_path), inspect_parts(post_path)
-    except OSError as e:
+        pre_list, post_list = listed_objects(pre_list_path), listed_objects(post_list_path)
+    except (OSError, ValueError) as e:
         print(f"an erasure-leaves input could not be read ({type(e).__name__}: {e})")
         sys.exit(3)
     if not pre or not post:
         print(f"the inspect text lists {len(pre)} parts before the erasure and {len(post)} after, want at least 1 each")
         sys.exit(3)
+    bad = [n for n, rows in (("before", pre_list), ("after", post_list)) for o in rows
+           if not isinstance(o.get("key"), str) or not whole(o.get("ingest_hour_bucket"))]
+    if bad:
+        print(f"the catalog listing {bad[0]} the erasure has a line without a key or a whole ingest_hour_bucket")
+        sys.exit(3)
+    keys_after = {o["key"] for o in post_list}
+    keys_before = {o["key"] for o in pre_list}
+    by_hour = {}
+    for o in pre_list:
+        by_hour.setdefault(o["ingest_hour_bucket"], set()).add(o["key"])
+    erased = [{"hour": h, "keys_before": len(ks), "keys_gone": len(ks - keys_after),
+               "keys_new": len({o["key"] for o in post_list if o["ingest_hour_bucket"] == h} - keys_before)}
+              for h, ks in sorted(by_hour.items()) if ks - keys_after]
+    hours = [e["hour"] for e in erased]
+    def over(p):
+        return [h for h in hours if p["lo"] <= h <= p["hi"]]
+    overlapping = [p for p in pre if over(p)]
     after = {(p["key"], p["blake3"]) for p in post}
-    rewritten = [p for p in pre if (p["key"], p["blake3"]) not in after]
+    carried = [{"key": p["key"], "blake3": p["blake3"], "range": [p["lo"], p["hi"]], "erased_hours": over(p)}
+               for p in overlapping if (p["key"], p["blake3"]) in after]
     post_leaves = {l["key"]: p["key"] for p in post for l in p["leaves"]}
     stale = [{"part_before": p["key"], "part_after": post_leaves[l["key"]], "leaf": l["key"], "field": l["field"]}
-             for p in rewritten for l in p["leaves"] if l["key"] in post_leaves]
+             for p in overlapping for l in p["leaves"] if l["key"] in post_leaves]
     print(json.dumps({"parts_before": len(pre), "parts_after": len(post),
-                      "rewritten_parts_count": len(rewritten),
-                      "rewritten_parts": [{"key": p["key"], "blake3": p["blake3"], "range": [p["lo"], p["hi"]]}
-                                          for p in rewritten],
+                      "objects_before": len(pre_list), "objects_after": len(post_list),
+                      "erased_hours_count": len(erased), "erased_hours": erased,
+                      "overlapping_parts_count": len(overlapping),
+                      "carried_over_parts_count": len(carried), "carried_over_parts": carried,
                       "leaves_after": sum(len(p["leaves"]) for p in post),
                       "stale_leaves_count": len(stale), "stale_leaves": stale,
-                      "basis": "catalog inspect before the erasure (stage1-erasure-reference.inspect.txt) and after its fold (stage1-erasure.inspect.txt): a rewritten part is a part before whose key and blake3 no part after carries; a stale leaf is a leaf key a rewritten part referenced that a part after still references"}))
+                      "basis": "catalog list --json before the erasure (stage1-erasure-reference.objects.jsonl) and after its fold (stage1-erasure.objects.jsonl): an erased hour is an ingest_hour_bucket holding a key before that is not listed after, since the rewrite's output is a new content-keyed L1 key that supersedes its inputs; a compaction the maintain container ran in the same window replaces keys the same way and also reads as an erased hour. catalog inspect before (stage1-erasure-reference.inspect.txt) and after (stage1-erasure.inspect.txt): an overlapping part is a part before whose lo..=hi range holds an erased hour; a carried-over part is an overlapping part whose key and blake3 a part after still carries; a stale leaf is a leaf key an overlapping part referenced that a part after still references"}))
 elif op == "stage1-head-sha":
     # A directory `aws s3 cp --recursive` filled with the metrics catalog
     # HEADs: the sha256 of the one HEAD. Exit 3 and why on stdout unless
@@ -3550,7 +3594,8 @@ stage1_extra_hour_step() {
   code=0
   line="$(py stage1-extra-hour "${out_dir}/stage1-extra-hour-fold-off.json" "${out_dir}/stage1-extra-hour-fold-on.json" \
     "$off_ms" "$on_ms" "$STAGE1_LEAFLESS_HEAD" "$STAGE1_ROUTED_HEAD" "$fold_on_head" \
-    "${out_dir}/stage1-extra-hour.inspect.txt" "${out_dir}/stage1-extra-hour.objects.jsonl")" || code=$?
+    "${out_dir}/stage1-extra-hour.inspect.txt" "${out_dir}/stage1-extra-hour.objects.jsonl" \
+    "${out_dir}/stage1-routed.inspect.txt")" || code=$?
   if [ "$code" -ne 0 ]; then
     stamp_str stage1.extra_hour "failed: ${line:-stage1-extra-hour exited $code}"
     fail_step stage1-extra-hour "${line:-stage1-extra-hour exited $code}"
@@ -3610,14 +3655,15 @@ stage1_l1_step() {
 
 # stage1_erasure_step: ADR-3694 row 8, last, since it removes a subject's
 # series from the tenant. A reference pass runs the corpus with every
-# selector excluding the subject; the erasure is submitted; the pending pass
-# runs the corpus as written and must answer as the reference with no
-# label-index prune; a one-off `ravel-server --mode maintain` container runs
-# the rewrite until `erase status` says COMPLETED; a fold and an inspect then
-# show whether any leaf from before the erasure is still referenced over a
-# rewritten hour.
+# selector excluding the subject, and the data objects are listed; the
+# erasure is submitted; the pending pass runs the corpus as written and must
+# answer as the reference with no label-index prune; a one-off `ravel-server
+# --mode maintain` container starts and runs the rewrite until `erase status`
+# says COMPLETED, polled from the seal deadline on; a fold, an inspect and a
+# second listing then show which hours the rewrite replaced and whether any
+# part or leaf from before the erasure is still referenced over one.
 stage1_erasure_step() {
-  local code=0 line request_id key_file i state="" submit_s deadline_s wait_from_s
+  local code=0 line request_id key_file i state="" submit_s deadline_s wait_from_s maintain_s cstate
   local matcher="${STAGE1_ERASURE_LABEL}=${STAGE1_ERASURE_VALUE}" name="metricsbench-stage1-maintain"
   local corpus="${out_dir}/stage1-erasure-reference.corpus.json" status_file="${out_dir}/stage1-erasure-status.txt"
   line="$(py stage1-erasure-corpus "$CORPUS" "$corpus" "$STAGE1_ERASURE_LABEL" "$STAGE1_ERASURE_VALUE")" || code=$?
@@ -3630,6 +3676,7 @@ stage1_erasure_step() {
   stage1_note stage1.erasure_subject stage1-hash-compare "${out_dir}/stage1-routed/diagnostics.json" \
     "${out_dir}/stage1-erasure-reference/diagnostics.json" "${out_dir}/stage1-erasure-subject.json" \
     routed erasure_reference
+  stage1_list stage1-erasure-submit stage1-erasure-reference.objects.jsonl
   request_id="$(python3 -I -c 'import uuid; print(uuid.uuid4())')"
   code=0
   RAVEL_IMAGE="$ravel_image" compose run --rm --no-deps -T ravel-qualify \
@@ -3649,17 +3696,8 @@ stage1_erasure_step() {
     "${out_dir}/stage1-erasure-pending/diagnostics.json" "${out_dir}/stage1-erasure-compare.json" \
     erasure_reference erasure_pending
 
-  # The rewrite cannot complete before the hour open at the acknowledgement
-  # seals: its end plus max_flush_lifetime plus the clock-skew allowance
-  # (crates/ravel-maintain/src/erasure_rewrite.rs ack_open_ingest_hours,
-  # seal_margin_ns). Reading the clock after the submit returns can only
-  # name that hour or a later one.
-  deadline_s=$(((submit_s / 3600 + 1) * 3600 + ERASURE_MAX_FLUSH_LIFETIME_S + ERASURE_CLOCK_SKEW_S))
-  wait_from_s="$(date -u +%s)"
-  stage1_wait_until stage1-erasure-rewrite "$deadline_s" \
-    "the hour open at the erasure's acknowledgement seals at its end plus max_flush_lifetime plus the clock-skew allowance"
-  stamp_set stage1.erasure_seal_wait "{\"submitted_unix_s\": ${submit_s}, \"deadline_unix_s\": ${deadline_s}, \"sleep_s\": $((deadline_s > wait_from_s ? deadline_s - wait_from_s : 0)), \"waited_s\": $(($(date -u +%s) - wait_from_s)), \"basis\": \"deadline = the end of the submit's ingest hour + max_flush_lifetime ${ERASURE_MAX_FLUSH_LIFETIME_S}s (crates/ravel-maintain/src/config.rs DEFAULT_MAX_FLUSH_LIFETIME_NS) + clock_skew_allowance ${ERASURE_CLOCK_SKEW_S}s (DEFAULT_CLOCK_SKEW_ALLOWANCE_NS); the pending pass ran first, then METRICSBENCH_SLEEP until the deadline, then the maintain container\"}"
-
+  # mktemp creates the key file 0600; the container runs as the invoking
+  # user, as stage1_s3 does, so it can read the file through the mount.
   key_file="$(mktemp "${TMPDIR:-/tmp}/metricsbench-maintain.key.XXXXXX")" ||
     fail_step stage1-erasure-rewrite "cannot create the maintain record key file"
   STAGE1_KEY_FILE="$key_file"
@@ -3667,10 +3705,9 @@ stage1_erasure_step() {
     rm -f "$key_file"
     fail_step stage1-erasure-rewrite "cannot write the maintain record key"
   }
-  stamp_str stage1.erasure_maintain "ravel-server ${STAGE1_MAINTAIN_FLAGS} (/maintain.key a throwaway record key, mounted read-only and removed when the step ends); no ravel-server flag turns compaction off, so each maintain tick (services/ravel-server/src/maintain.rs run_tick) also runs retention, compaction, the GC sweep and the catalog-object sweeps over the tenant"
   code=0
   # shellcheck disable=SC2086 # STAGE1_MAINTAIN_FLAGS is a word list
-  compose run -d --no-deps --name "$name" --entrypoint /usr/local/bin/ravel-server \
+  compose run -d --no-deps --user "$(id -u):$(id -g)" --name "$name" --entrypoint /usr/local/bin/ravel-server \
     -v "${key_file}:/maintain.key:ro" ravel-server \
     $STAGE1_MAINTAIN_FLAGS \
     >"${out_dir}/stage1-erasure-maintain.log" 2>&1 || code=$?
@@ -3680,6 +3717,23 @@ stage1_erasure_step() {
     stamp_str stage1.erasure_rewrite "failed: the maintain container did not start (docker compose run -d exited $code)"
     fail_step stage1-erasure-rewrite "docker compose run -d ... ravel-server --mode maintain exited $code"
   fi
+  maintain_s="$(date -u +%s)"
+  stamp_set stage1.erasure_maintain "{\"command\": \"ravel-server ${STAGE1_MAINTAIN_FLAGS}\", \"user\": \"$(id -u):$(id -g)\", \"started_unix_s\": ${maintain_s}, \"note\": \"/maintain.key is a throwaway record key, created 0600, mounted read-only and removed when the step ends; the container starts right after the pending pass and runs through the seal wait; no ravel-server flag turns compaction off, so each maintain tick (services/ravel-server/src/maintain.rs run_tick) also runs retention, compaction, the GC sweep and the catalog-object sweeps over the tenant\"}"
+
+  # The rewrite cannot complete before every hour in the request's scope
+  # seals: its end plus max_flush_lifetime plus the clock-skew allowance
+  # (crates/ravel-maintain/src/erasure_rewrite.rs ack_open_ingest_hours,
+  # seal_margin_ns). bucket_in_scope_at_ack (erasure_rewrite.rs:2747-2756)
+  # also puts the next hour in scope when it starts within the clock-skew
+  # allowance of the acknowledgement, so the last hour in scope is the one
+  # holding submit_s + 300. Reading the clock after the submit returns can
+  # only name that hour or a later one.
+  deadline_s=$((((submit_s + ERASURE_CLOCK_SKEW_S) / 3600 + 1) * 3600 + ERASURE_MAX_FLUSH_LIFETIME_S + ERASURE_CLOCK_SKEW_S))
+  wait_from_s="$(date -u +%s)"
+  stage1_wait_until stage1-erasure-rewrite "$deadline_s" \
+    "the last hour in the erasure's scope at acknowledgement seals at its end plus max_flush_lifetime plus the clock-skew allowance"
+  stamp_set stage1.erasure_seal_wait "{\"submitted_unix_s\": ${submit_s}, \"deadline_unix_s\": ${deadline_s}, \"sleep_s\": $((deadline_s > wait_from_s ? deadline_s - wait_from_s : 0)), \"waited_s\": $(($(date -u +%s) - wait_from_s)), \"basis\": \"deadline = the end of the ingest hour holding submit + clock_skew_allowance (bucket_in_scope_at_ack, crates/ravel-maintain/src/erasure_rewrite.rs:2747-2756) + max_flush_lifetime ${ERASURE_MAX_FLUSH_LIFETIME_S}s (crates/ravel-maintain/src/config.rs DEFAULT_MAX_FLUSH_LIFETIME_NS) + clock_skew_allowance ${ERASURE_CLOCK_SKEW_S}s (DEFAULT_CLOCK_SKEW_ALLOWANCE_NS); the pending pass ran first, then the maintain container started, then METRICSBENCH_SLEEP until the deadline, then the first erase status\"}"
+
   for ((i = 1; i <= ERASURE_TRIES; i++)); do
     code=0
     RAVEL_IMAGE="$ravel_image" compose run --rm --no-deps -T ravel-qualify \
@@ -3688,6 +3742,16 @@ stage1_erasure_step() {
     if [ "$code" -eq 0 ] && grep -q "^${request_id}: COMPLETED" "$status_file"; then
       state=COMPLETED
       break
+    fi
+    code=0
+    cstate="$("$DOCKER" inspect --format '{{.State.Status}}' "$name" 2>/dev/null)" || code=$?
+    if [ "$code" -ne 0 ] || [ "$cstate" != running ]; then
+      "$DOCKER" logs "$name" >"${out_dir}/stage1-erasure-maintain.log" 2>&1 || true
+      "$DOCKER" rm -f "$name" >>"${out_dir}/stage1-erasure-maintain.rm.log" 2>&1 || true
+      rm -f "$key_file"
+      STAGE1_KEY_FILE=""
+      stamp_str stage1.erasure_rewrite "failed: the maintain container is ${cstate:-not inspectable (docker inspect exited $code)} at poll ${i}, before erase status said COMPLETED"
+      fail_step stage1-erasure-rewrite "the maintain container ${name} is ${cstate:-not inspectable (docker inspect exited $code)} at poll ${i} and erasure ${request_id} is not COMPLETED; see ${out_dir}/stage1-erasure-maintain.log"
     fi
     "$SLEEP" "$ERASURE_INTERVAL"
   done
@@ -3712,9 +3776,11 @@ stage1_erasure_step() {
   stage1_catalog_fold stage1-erasure-fold stage1.erasure_fold stage1-fold stage1-erasure-fold \
     --signal metrics --writers-stopped --key-index-leaves --metrics-label-index
   stage1_catalog_state erasure
+  stage1_list stage1-erasure stage1-erasure.objects.jsonl
   code=0
   line="$(py stage1-erasure-leaves "${out_dir}/stage1-erasure-reference.inspect.txt" \
-    "${out_dir}/stage1-erasure.inspect.txt")" || code=$?
+    "${out_dir}/stage1-erasure.inspect.txt" "${out_dir}/stage1-erasure-reference.objects.jsonl" \
+    "${out_dir}/stage1-erasure.objects.jsonl")" || code=$?
   if [ "$code" -ne 0 ]; then
     stamp_str stage1.erasure_leaves "failed: $line"
     fail_step stage1-erasure "$line"
