@@ -2219,8 +2219,7 @@ INFO performance default resolved setting="sql_first_attempt_partitions" value=1
 
 `source` is `derived-floor` when a derived count under 16 was raised to 16,
 `derived` when the derived count was already 16 or more, and `flag` when you
-set the count. [ADR-1195](../../adrs/1195-unbundle-fetch-concurrency.md)'s
-first-attempt floor amendment records the measurements.
+set the count.
 
 ### SQL ceilings
 
