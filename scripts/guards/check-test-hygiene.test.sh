@@ -420,6 +420,226 @@ proptest! {
 RS
 check "flags a failure_persistence override" "${d}" 1 "failure_persistence"
 
+# --- ignore-flaky ------------------------------------------------------------
+
+d="$(new_repo ignore-flaky-no-issue)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+#[ignore = "flaky: fails about 1 in 20 runs"]
+fn occasionally_fails() {
+    assert!(true);
+}
+RS
+check "an ignore naming flaky with no issue is a finding" "${d}" 1 "ignore-flaky"
+
+d="$(new_repo ignore-flaky-with-issue)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+#[ignore = "flaky: see #4000 for the root cause"]
+fn occasionally_fails() {
+    assert!(true);
+}
+RS
+check "an ignore naming flaky that cites an issue passes" "${d}" 0 "clean"
+
+d="$(new_repo ignore-not-flaky)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+#[ignore = "requires a live network; not run in CI"]
+fn needs_network() {
+    assert!(true);
+}
+RS
+check "an ignore naming no flakiness passes" "${d}" 0 "clean"
+
+# #[ignore] need not sit directly above fn: it can follow #[test] instead of
+# preceding it, with the flaky reason commented above the whole attribute
+# block. A walk that stops at the first non-comment line (here, #[test])
+# never reaches that comment and misses the finding.
+d="$(new_repo ignore-flaky-comment-above-test-attr)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+// flaky, cause unknown
+#[test]
+#[ignore]
+fn occasionally_fails_order_flipped() {
+    assert!(true);
+}
+RS
+check "a flaky comment above #[test] is read even when #[ignore] sits below it" \
+  "${d}" 1 "ignore-flaky"
+
+# --- clock-compared ----------------------------------------------------------
+
+d="$(new_repo clock-reads-compared)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+}
+
+fn serve() -> i64 {
+    let now = now_ns();
+    now
+}
+
+#[test]
+fn two_fixtures_created_close_together() {
+    let a = serve();
+    let b = serve();
+    assert_eq!(a, b);
+}
+RS
+check "a helper that reads the clock itself, called twice and compared, is a finding" \
+  "${d}" 1 "clock-compared"
+
+d="$(new_repo clock-read-once-shared)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+}
+
+fn serve(now_ns: i64) -> i64 {
+    now_ns + 1
+}
+
+#[test]
+fn one_reading_shared_by_both_fixtures() {
+    let now = now_ns();
+    let a = serve(now);
+    let b = serve(now);
+    assert_eq!(a, b);
+}
+RS
+check "a helper taking its reading as a parameter, called twice, passes" \
+  "${d}" 0 "clean"
+
+d="$(new_repo clock-helper-with-clock-param)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn serve(clock: i64) -> i64 {
+    clock + 1
+}
+
+#[test]
+fn helper_with_clock_param_is_not_flagged() {
+    let now = 1_000;
+    let a = serve(now);
+    let b = serve(now);
+    assert_eq!(a, b);
+}
+RS
+check "a helper taking an explicit clock parameter passes" "${d}" 0 "clean"
+
+# fn_sig_has_now_param's own exemption, isolated from the #4000 serve() shape
+# it is NOT responsible for (that one escapes via the unconditional-call
+# pattern never matching `setup.now.unwrap_or_else(now_ns)`, not via this
+# signature check). This is the shape the signature check alone has to cover:
+# a helper that takes the clock as a direct parameter but still falls back to
+# reading it itself when the caller passes nothing.
+d="$(new_repo clock-helper-sig-param-with-fallback-read)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+}
+
+fn fixture(now: Option<i64>) -> i64 {
+    let fallback = now_ns();
+    now.unwrap_or(fallback)
+}
+
+#[test]
+fn signature_param_with_clock_fallback_is_not_flagged() {
+    let a = fixture(None);
+    let b = fixture(None);
+    assert_eq!(a, b);
+}
+RS
+check "a helper whose signature takes now but falls back to reading the clock passes" \
+  "${d}" 0 "clean"
+
+# A helper is called twice but only one of the two reads feeds an assertion:
+# the rule fires on two independently-tagged reads meeting in one assertion,
+# not on a clock-reading helper merely being called twice in a test. A wrong
+# implementation that flagged any such helper called twice would flag this.
+d="$(new_repo clock-helper-called-twice-one-asserted)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+}
+
+fn serve() -> i64 {
+    let now = now_ns();
+    now
+}
+
+#[test]
+fn two_calls_but_only_one_asserted() {
+    let a = serve();
+    let b = serve();
+    assert!(a >= 0, "the first fixture is sane");
+    record(b);
+}
+RS
+check "a clock helper called twice with only one result asserted passes" \
+  "${d}" 0 "clean"
+
+# issue #4000's actual shape: more than one assertion in the same test, each
+# independently comparing the two clock reads. Each must be reported on its
+# OWN line, not the line of the enclosing #[test] fn (the bug this guards
+# against: on the pre-fix fixture upstream, every one of five findings in one
+# test printed the test function's own line instead of its own assertion's).
+d="$(new_repo clock-compared-per-assertion-line)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+}
+
+fn serve() -> i64 {
+    let now = now_ns();
+    now
+}
+
+#[test]
+fn two_assertions_each_compare_independent_reads() {
+    let a = serve();
+    let b = serve();
+    assert_eq!(a, b);
+    assert_eq!(a, b, "same again");
+}
+RS
+out="$(cd "${d}" && bash scripts/guards/check-test-hygiene.sh crates 2>&1)"
+rc=$?
+if [[ "${rc}" == "1" && "${out}" == *"t.rs:17: clock-compared"* && "${out}" == *"t.rs:18: clock-compared"* ]]; then
+  printf 'ok    clock-compared reports each assertion own line, not the test fn line\n'
+  passes=$((passes + 1))
+else
+  printf 'FAIL  clock-compared reports each assertion own line: got %s / %s\n' "${rc}" "${out}"
+  fails=$((fails + 1))
+fi
+
 # --- usage -----------------------------------------------------------------
 
 d="$(new_repo usage)"
