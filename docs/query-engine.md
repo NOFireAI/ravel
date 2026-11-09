@@ -4122,7 +4122,7 @@ scan. On spans both are present, zeros included, exactly when a spans scan
 carried a pushed `trace_id`, and absent for every other spans statement
 (`key_index_stats_are_absent_without_a_trace_key`). On logs both are
 present, zeros included, when a logs scan carried a declared-key equality,
-the logs entry holding the same ten fields as `stats.keyIndex`
+the logs entry holding the same eleven fields as `stats.keyIndex`
 (`folded_equality_opens_only_the_holder`, and the zeros of
 `a_refused_parts_charge_degrades_to_tier_one`). The keys, in render order
 (`ravel_sql::key_index_json`):

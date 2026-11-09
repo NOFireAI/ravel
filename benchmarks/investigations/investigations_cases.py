@@ -2591,7 +2591,7 @@ class Evaluate(Workdir):
         out = []
         if (f["status"], f["value"], f["verdict"]) != ("not-measured", None, "not-measured"):
             out.append(f"{f['status']} {f['value']} {f['verdict']}")
-        if "cold try 1: a covering part went Uncovered (skippedByBudget 1)" not in (f["reason"] or ""):
+        if "cold try 1: a covering part was left to tier 1 (skippedByBudget 1)" not in (f["reason"] or ""):
             out.append(f"reason {f['reason']}")
         if not any(r.startswith("figure row_18.logs_trace_id_100_p50_s not measured: ") for r in res["incomplete"]):
             out.append(f"incomplete {res['incomplete']}")
@@ -2613,7 +2613,7 @@ class Evaluate(Workdir):
         out = []
         if (f["status"], f["value"], f["verdict"]) != ("not-measured", None, "not-measured"):
             out.append(f"{f['status']} {f['value']} {f['verdict']}")
-        if "a covering part went Uncovered (partsCovered 0)" not in (f["reason"] or ""):
+        if "a covering part was left to tier 1 (partsCovered 0)" not in (f["reason"] or ""):
             out.append(f"reason {f['reason']}")
         if not any(r.startswith("figure row_18.logs_request_id_10_p50_s not measured: ") for r in res["incomplete"]):
             out.append(f"incomplete {res['incomplete']}")
@@ -2621,6 +2621,45 @@ class Evaluate(Workdir):
 
     def test_row_18_covered_nothing(self):
         self.assertEqual(self.check_row_18_covered_nothing(), [])
+
+    def check_row_18_over_tier_one(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A cell whose part the router left to tier 1 by cost on one cold call (partsOverTierOne 1) is not
+        measured, even at 1.0 s under its 3.15 s bound, and the run is incomplete."""
+        over = dict(self.COVERED, partsCovered=0, partsOverTierOne=1, leafGetRequests=0)
+        self.set_advanced_leaves({"spans_in_10": ((2.8, 3.2), (1.0, 1.0), [self.COVERED, over])})
+        _, res, _ = self.go(bands, evaluate_py)
+        f = self.row_18(res)["spans_trace_id_10_p50_s"]
+        out = []
+        if (f["status"], f["value"], f["verdict"]) != ("not-measured", None, "not-measured"):
+            out.append(f"{f['status']} {f['value']} {f['verdict']}")
+        if "cold try 1: a covering part was left to tier 1 (partsOverTierOne 1)" not in (f["reason"] or ""):
+            out.append(f"reason {f['reason']}")
+        if not any(r.startswith("figure row_18.spans_trace_id_10_p50_s not measured: ") for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_row_18_over_tier_one(self):
+        self.assertEqual(self.check_row_18_over_tier_one(), [])
+
+    def check_row_18_predates_over_tier_one(self, evaluate_py=EVALUATE):
+        """A build that predates partsOverTierOne reports the other five outcome counters and not it: its
+        covered call is measured, not unsupported, while a build missing one of the five still is."""
+        mod = load_module(evaluate_py, "evaluate_row18_predates_over_tier_one")
+        out = []
+        if "partsOverTierOne" in self.COVERED:
+            out.append("COVERED carries partsOverTierOne; it must stand for a build without it")
+        call = {"statement": "spans_in_10", "state": "advanced_leaves", "try": 0}
+        got = mod.leaf_uncovered(dict(call, stats={"keyIndex": dict(self.COVERED)}))
+        if got is not None:
+            out.append(f"no partsOverTierOne: {got}")
+        older = {k: v for k, v in self.COVERED.items() if k != "reservationsRefused"}
+        got = mod.leaf_uncovered(dict(call, stats={"keyIndex": older}))
+        if got is None or got[0] != UNSUPPORTED:
+            out.append(f"no reservationsRefused: {got}")
+        return out
+
+    def test_row_18_predates_over_tier_one(self):
+        self.assertEqual(self.check_row_18_predates_over_tier_one(), [])
 
     def check_row_18_unsupported_is_incomplete(self, evaluate_py=EVALUATE, bands=BANDS):
         """A row 18 cell whose build reports no keyIndex outcome counters reads unsupported-on-this-build;
@@ -2847,7 +2886,7 @@ class Evaluate(Workdir):
         "zeros-without-scan": (dict(keys=1000), dict(keys=0, parts=0, scan=False), ("value", 0, "miss"),
                                "served without a visible path"),
         "zero-parts-covered": (dict(keys=1000, parts=0), dict(keys=0, parts=0), ("value", 0, "miss"),
-                               "probed 1000 keys with partsCovered 0 and no part in an Uncovered outcome"),
+                               "probed 1000 keys with partsCovered 0 and no part left to tier 1"),
         # Box C: the 1,000-key part went Uncovered by budget (partsCovered 0, skippedByBudget 1) and the
         # 1,025-key list was scanned with keysProbed 0.
         "uncovered-by-budget": (dict(keys=1000, parts=0, uncovered=("skippedByBudget", 1)),
@@ -2862,6 +2901,10 @@ class Evaluate(Workdir):
                                       dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
         "uncovered-reservations-refused": (dict(keys=1000, parts=0, uncovered=("reservationsRefused", 1)),
                                            dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
+        # The part's leaf route cost more than tier 1's probe of its segments in the routed window, so the
+        # router left it to tier 1 by cost: the key set was still carried.
+        "over-tier-one": (dict(keys=1000, parts=0, uncovered=("partsOverTierOne", 1)),
+                          dict(keys=0, parts=0, leaf=0), ("value", 1, "pass"), ""),
     }
 
     def check_control(self, mode, evaluate_py=EVALUATE):
@@ -2966,12 +3009,13 @@ class Evaluate(Workdir):
         self.assertEqual(self.check_control_uncovered_by_budget(), [])
 
     UNCOVERED_MODES = ("uncovered-by-budget", "uncovered-parts", "uncovered-beyond-ceiling",
-                       "uncovered-leaves-rejected", "uncovered-reservations-refused")
+                       "uncovered-leaves-rejected", "uncovered-reservations-refused", "over-tier-one")
 
     def check_control_uncovered_outcomes(self, evaluate_py=EVALUATE):
-        """Each Uncovered outcome the ADR's row 11 allows (partsUncovered, skippedByBudget,
-        partsBeyondCeiling, leavesRejected, reservationsRefused), alone on a 1,000-key list that probed
-        1,000 keys with partsCovered 0, routes the part: the control passes."""
+        """Each outcome that leaves a part to tier 1 the ADR's row 11 allows (partsUncovered,
+        skippedByBudget, partsBeyondCeiling, leavesRejected, reservationsRefused, partsOverTierOne), alone
+        on a 1,000-key list that probed 1,000 keys with partsCovered 0, routes the part: the control
+        passes."""
         out = []
         for mode in self.UNCOVERED_MODES:
             out += [f"{mode}: {line}" for line in self.check_control(mode, evaluate_py)]
@@ -3497,12 +3541,14 @@ FLIPS = {
     ),
     **{f"a 1,000-key part {outcome} read as covering no part": (
         'UNCOVERED_OUTCOMES = ("partsUncovered", "skippedByBudget", "partsBeyondCeiling", "leavesRejected",\n'
-        '                      "reservationsRefused")\n',
+        '                      "reservationsRefused", "partsOverTierOne")\n',
         "UNCOVERED_OUTCOMES = " + repr(tuple(o for o in ("partsUncovered", "skippedByBudget", "partsBeyondCeiling",
-                                                          "leavesRejected", "reservationsRefused")
+                                                          "leavesRejected", "reservationsRefused",
+                                                          "partsOverTierOne")
                                              if o != outcome)) + "\n",
         "check_control_uncovered_outcomes",
-    ) for outcome in ("partsUncovered", "partsBeyondCeiling", "leavesRejected", "reservationsRefused")},
+    ) for outcome in ("partsUncovered", "partsBeyondCeiling", "leavesRejected", "reservationsRefused",
+                      "partsOverTierOne")},
     "an index-served 1,025-key list not seen": (
         "        if key_index_nonzero(c):\n",
         "        if False:\n",
@@ -3559,6 +3605,16 @@ FLIPS = {
         "        return \"value\", rnd(percentile(walls, 0.75) - percentile(walls, 0.25)), \"\"\n",
         "        return \"value\", rnd(percentile(walls, 0.75)), \"\"\n",
         "check_row_18_noise_edges",
+    ),
+    "row 18's over-tier-one part read as covered": (
+        'reservationsRefused", "partsOverTierOne")\n',
+        'reservationsRefused")\n',
+        "check_row_18_over_tier_one",
+    ),
+    "a build without partsOverTierOne read as unsupported": (
+        '    fields = ("partsCovered",) + tuple(f for f in UNCOVERED_OUTCOMES if f not in OPTIONAL_OUTCOMES)\n',
+        '    fields = ("partsCovered",) + UNCOVERED_OUTCOMES\n',
+        "check_row_18_predates_over_tier_one",
     ),
     "row 18's partsCovered 0 with no outcome read as covered": (
         '    if went or not ki["partsCovered"]:\n',
