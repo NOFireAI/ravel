@@ -956,17 +956,20 @@ record changed. Day d's leaves are built once more on the fold that seals
 it: the tail that held day d was encoded with the fold watermark (and,
 while it was the only part, `min_hour` 0), the sealed part with its own
 first and last hours, so its hash changes. That rebuild takes every
-entry from the previous tail's leaves: in
+entry from the leaves of the previous part that held day d: in
 `a_sealed_utc_day_keeps_its_leaves_across_advancing_folds` the sealing
 fold issues one previous-leaf GET, one leaf PUT and no section read for
 day d, and the two advances after it issue none of the three for day d.
-Today a sealed day that a late record changes (a retention tombstone, a
-compaction, an erasure rewrite) is re-encoded and its leaves are rebuilt
-from its sections, since the carry source is the previous HEAD's last part
-only (`a_tombstoned_hour_in_a_sealed_day_rebuilds_its_leaves_from_sections`:
-no previous-leaf GET and 2 ranged GETs per surviving entry per pass, 8 for
-the day's 2 surviving entries over 2 passes). ADR-3939 decision 5 (task
-C1) removes that rebuild.
+A sealed day that a late record changes (a retention tombstone, a
+compaction, an erasure rewrite) is re-encoded, and since the carry source
+is every overlapping previous part with leaves (ADR-3939 decision 5, under
+"Incremental tail build" below), its build carries from the day's own
+previous leaves and reads sections only for the entries those leaves do
+not cover (`a_dirty_sealed_day_carries_its_own_previous_leaves`: a
+tombstoned hour leaves 2 entries, and the re-encode GETs each of the
+day's 3 previous leaves once, reads no section of the 2 entries, and
+writes the leaves a fold of those 2 entries into a fresh store writes,
+byte for byte).
 
 The fold never builds leaves for a part it carries by reference
 (ADR-3939 decision 2): a carried part keeps exactly the `key_index` refs
@@ -1396,14 +1399,16 @@ budget" below. Any other entry costs a footer suffix GET of the last
 longer) and one ranged GET of the LABEL_DICT section in each pass of the
 build, counted in `key_index_ranged_gets` and `key_index_bytes_read`. A
 fold that merges the previous postings forward fetches only the new
-entries' objects. The entries it merges take their pairs from the previous
-tail's `label_value` leaf with no section GET, as the incremental tail
-build below describes; the carry costs one GET per previous leaf. The
-entries that leaf listed as uncovered are read by range, and every entry
-is read by range when the tail has no such leaf (the switch was off on the
-earlier fold) or the carry is dropped: a previous leaf whose GET fails or
-that does not verify, a section read naming an undeclared field, or a
-previous leaf that verified and then no longer decodes. A
+entries' objects. The entries it merges take their pairs from the
+`label_value` leaves of the previous parts they sat in, with no section
+GET, as the incremental tail build below describes; the carry costs one
+GET per previous leaf a pass reaches. The entries those leaves listed as
+uncovered are read by range. A previous part's entries are all read by
+range when that part has no such leaf (the switch was off on the earlier
+fold) or its lowest leaf's GET fails or the leaf does not verify, and
+every entry is read by range when the carry is dropped: a later previous
+leaf whose GET fails, that does not verify or that no longer decodes, or a
+section read naming an undeclared field. A
 footer naming another tenant, a missing LABEL_DICT section, or a section
 that fails its crc, decompression or decode leaves the entry in
 `uncovered_entry_ordinals` and the fold succeeds; a failed GET does the
@@ -1449,47 +1454,84 @@ fold with both switches on writes for the same part, byte for byte
 path reads the metrics leaf yet, and `ravel-server` has no flag for
 `metrics_label_index`.
 
-**Incremental tail build (ADR-3692 decision 5).** The tail part is
-re-encoded on every fold that advances the watermark, but most of its
-entries were in the previous HEAD's tail, whose leaves already hold their
-pairs. When a part the fold re-encodes shares a data object with the
-previous tail, the build GETs each of that tail's leaves once, verifies it
-(the leaf's own checks, its ref, and its tenant, signal, part hash and
-part entry count) and keeps its bytes, not its decoded entries; each pass
-decodes the leaves its key8 range overlaps again, one frame at a time. An
-entry the leaves cover for every declared field is taken from them,
-matched by data object key and never by ordinal, since the new part's
-ordinals shift wherever a late entry sorts in (`load_carried_key_index`,
-`crates/ravel-catalog/src/fold.rs`). Only the entries new to the part, and
-the entries the previous leaves listed as uncovered, have their sections
-read, so an entry that stays uncovered is read again on every advancing
-fold, not once; the leaves are byte-identical to a build that read every
-section (test `advancing_fold_reads_sections_for_new_entries_only`: three
-carried entries, two late ones read, and the leaf equal to a from-scratch
-build). The carry is refused, and every entry's section read, when a
-previous leaf is a logs leaf at format version 1, which the reader rejects
-(`an_advancing_fold_does_not_carry_a_logs_version_one_leaf`), when a
-previous leaf cannot be read or does not verify
+**Incremental tail build (ADR-3692 decision 5, ADR-3939 decision 5).** The
+tail part is re-encoded on every fold that advances the watermark, and a
+sealed day is re-encoded when a late record changes it, but most of their
+entries were in a part of the previous HEAD whose leaves already hold
+their pairs. On a fold from a trusted HEAD (not a rebuild) with the leaf
+switch on, the carry sources of a part the fold re-encodes are every part
+of the previous HEAD that has leaves and whose `[min_hour,
+watermark_hour]` overlaps the part's own, and a source sharing no data
+object with the part costs no GET
+(`an_overlapping_part_sharing_no_object_is_not_a_carry_source`). Each
+source is mapped onto the part by data object key, never by ordinal,
+since the new part's ordinals shift wherever a late entry sorts in, and a
+part can carry from several sources: a part over the end of one previous
+part and the start of the next carries from both
+(`a_part_carries_from_two_previous_parts`), and a re-encoded sealed day
+carries from its own previous leaves
+(`a_dirty_sealed_day_carries_its_own_previous_leaves`). A data object that
+two previous parts both list, which a valid HEAD never does, drops the
+whole carry for the part. Previous leaf bytes are held per pass, not for
+the build. Per source and field the build GETs only the lowest slice up
+front and verifies it (the leaf's own checks, its ref, and its tenant,
+signal, part hash and part entry count); its header gives the uncovered
+entries of the whole set, and the refs alone are checked for the rest
+(slices that tile the key8 space, one key type, one `uncovered_count`, the
+source's part hash). A pass fetches each later slice when its key8 range
+first reaches the slice's `key8_lo`, verifies it the same way and against
+the lowest slice's uncovered list, and the bytes are dropped once a pass
+starts past the slice's `key8_hi`, so each slice is fetched once per field
+build attempt. Each pass decodes the slices its range overlaps again, one
+frame at a time, from the kept bytes. A pass therefore holds, per field
+and source, the slices its range overlaps and the first one past it that
+the cut has not yet ruled out. When the previous slices were cut under the
+same budget from the same pairs, a pass's range spans one of them and the
+carry holds at most two slices per field per source
+(`the_carry_holds_at_most_two_slices_per_field_per_source`: 2 at the most
+in each of 7 passes over 6 slices a field, each slice fetched once); a pass
+wider than the previous slices, as after a tombstone removes entries,
+holds every slice its range overlaps (in
+`a_dirty_sealed_day_carries_its_own_previous_leaves` the first pass holds
+all 3 of day d's). The fold report's `key_index_carry_peak_held_bytes` is
+the most previous-leaf bytes held at once. An entry is taken from its source
+when that source's leaves cover it for every declared field
+(`load_carry_source`, `crates/ravel-catalog/src/fold.rs`). Only the
+entries new to the part, and the entries the previous leaves listed as
+uncovered, have their sections read, so an entry that stays uncovered is
+read again on every advancing fold, not once; the leaves are
+byte-identical to a build that read every section (test
+`advancing_fold_reads_sections_for_new_entries_only`: three carried
+entries, two late ones read, and the leaf equal to a from-scratch build).
+A source is not carried, and its entries' sections are read, when its
+lowest slice is a logs leaf at format version 1, which the reader rejects
+(`an_advancing_fold_does_not_carry_a_logs_version_one_leaf`), when that
+slice cannot be read or does not verify
 (`a_failed_previous_leaf_get_falls_back_to_section_reads`,
-`a_corrupt_previous_leaf_falls_back_to_section_reads`), when a declared
-field has no previous leaf
-(`a_key_index_field_declared_between_folds_reads_every_entry`), when a
-previous leaf's field is not declared under its key type
-(`a_key_index_field_retyped_between_folds_carries_no_old_type_pair`), and
-when a section read names a field the tenant does not declare, since a
+`a_corrupt_previous_leaf_falls_back_to_section_reads`), when its refs do
+not form one set, when a declared field has no leaf in it
+(`a_key_index_field_declared_between_folds_reads_every_entry`), or when one
+of its leaves' field is not declared under its key type
+(`a_key_index_field_retyped_between_folds_carries_no_old_type_pair`).
+Dropping one source leaves the others carried, and the leaves stay the
+same either way, since a carried entry contributes the pairs its section
+would. The whole carry is dropped, and the build restarts reading every
+entry's section, when a later slice cannot be read, does not verify or no
+longer decodes
+(`a_later_slice_whose_get_fails_restarts_the_build_without_the_carry`:
+2 previous-leaf GETs before the restart, the from-scratch leaves after it),
+and when a section read names a field the tenant does not declare, since a
 carried entry might name it too
-(`a_section_naming_an_undeclared_field_drops_the_carry`). Independently of
-those checks, an entry is carried only when every declared field's
-previous leaves cover it. A part carried forward by reference, a sealed
-part included, keeps its refs and costs no GET at all
-(`sealed_tail_carries_its_leaf_refs_without_a_build`,
+(`a_section_naming_an_undeclared_field_drops_the_carry`). A part carried
+forward by reference, a sealed part included, keeps its refs and costs no
+GET at all (`sealed_tail_carries_its_leaf_refs_without_a_build`,
 `a_part_carried_forward_keeps_its_key_index_refs`).
 
 **Pair budget (ADR-3692 decision 5).** `key_index_build_max_pairs`
 (default 8,000,000; `DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`,
 `crates/ravel-catalog/src/config.rs`) bounds the (entry, key8) pairs the
 build holds for one part, the pairs read from sections and the pairs
-carried from the previous tail together. Every field the build indexes gets
+carried from previous parts together. Every field the build indexes gets
 a share, `max(1, floor(budget / F))` for `F` such fields, the ones the
 tenant declares and the ones a section names, whether or not a field is
 still building. The share is fixed once the first pass has read every
@@ -1593,8 +1635,13 @@ pass log `pass_ranges` asserts both on every pass of the tests above). The
 8 B a one- or two-block list costs is jemalloc's smallest size class, the
 binaries' allocator, and no test pins it. The sort reuses the heap buffer
 and copies no pair (test `a_pass_sorts_its_pairs_in_the_heap_buffer`). The
-budget does not bound: the previous tail's leaf bytes as stored, read once
-per fold and kept for the whole build; one decoded frame of one previous
+budget does not bound: the previous leaf bytes as stored that the carry
+holds, each slice fetched once per field build attempt and held from the
+pass that first reaches it until a pass starts past it (under "Incremental
+tail build": at most two slices per field per source when the previous
+slices were cut under the same budget from the same pairs, more when a pass
+is wider than they are; `key_index_carry_peak_held_bytes` reports the
+most); one decoded frame of one previous
 leaf at a time (a frame is one bucket, near `4 x 2^bucket_bits` bytes for
 keys whose key8 spreads evenly, trace ids, strings and bytes, and up to the
 whole leaf body for I64 keys that share their high bits); the KEY_IDX or
@@ -1638,9 +1685,9 @@ summed over every fold that returned a report, a no-op included
   entries over three passes in
   `pair_budget_builds_in_passes_and_closes_a_slice_at_each_pass_end`.
 - `key_index_entries_carried` (`ravel_catalog_fold_key_index_entries_carried_total`):
-  entries whose pairs came from the previous tail's leaves instead of a
+  entries whose pairs came from previous parts' leaves instead of a
   section read. It is 3 in `advancing_fold_reads_sections_for_new_entries_only`
-  and 0 whenever the carry was dropped
+  and 0 when the one source's carry was dropped
   (`a_failed_previous_leaf_get_falls_back_to_section_reads`).
 - `key_index_build_passes` (`ravel_catalog_fold_key_index_build_passes_total`):
   build passes summed over the re-encoded parts, by the pass rule above,
@@ -1648,12 +1695,13 @@ summed over every fold that returned a report, a no-op included
   `u64::MAX` in
   `pair_budget_builds_in_passes_and_closes_a_slice_at_each_pass_end`.
 - `key_index_leaf_gets` (`ravel_catalog_fold_key_index_leaf_gets_total`):
-  whole-object GETs of the previous tail's leaves, one per (field, slice),
-  also counted in `get_requests`; a pass decodes them again from the bytes
-  it kept, with no further GET. It is 1 in
-  `advancing_fold_reads_sections_for_new_entries_only` and 0 in
+  whole-object GETs of previous parts' leaves, one per (field, slice) a
+  build fetches, also counted in `get_requests`; a pass decodes a kept
+  slice again from its bytes, with no further GET. It is 1 in
+  `advancing_fold_reads_sections_for_new_entries_only`, 12 for 12 slices in
+  `the_carry_holds_at_most_two_slices_per_field_per_source`, and 0 in
   `sealed_tail_carries_its_leaf_refs_without_a_build`, where no
-  re-encoded part shares an object with the previous tail.
+  re-encoded part shares an object with a previous part.
 
 All four are zero with the switch off (test
 `the_key_index_leaves_flag_reaches_the_fold`), and `ravel-cli catalog fold`
@@ -1681,7 +1729,15 @@ object (test `the_json_report_carries_the_pair_budget_and_the_field_pairs`).
 It also carries `key_index_parts_missing_declared_leaves`, the count of
 carried parts that lack a declared field's leaf (under "Day seal"), which
 `ravel-cli catalog fold` prints in text and `--json` (test
-`a_switch_off_fold_over_leaves_is_reported`).
+`a_switch_off_fold_over_leaves_is_reported`), and
+`key_index_carry_peak_held_bytes`, the most previous-leaf bytes the carry
+held at once while building any one part in the fold, every source and
+field together (under "Incremental tail build"; 0 with the switch off and
+when no part carried). It equals the largest total the passes held in
+`the_carry_holds_at_most_two_slices_per_field_per_source`, and
+`ravel-cli catalog fold` prints it in text and `--json` (test
+`fold_human_report_prints_every_fold_report_field`, which checks every
+serialized field against the text report).
 
 When a compaction or erasure rewrite record lands, the fold re-encodes the
 part and rebuilds its leaves from the new entry set. An erasure rewrite
