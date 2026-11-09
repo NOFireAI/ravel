@@ -73,14 +73,22 @@ pub const KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS: u8 = 16;
 pub const DEFAULT_MAX_KEY_INDEX_LEAF_BODY_BYTES: u64 = DEFAULT_MAX_COLUMN_STATS_BYTES;
 
 /// Most parts one statement's tier-2 router probes: ADR-2707 decision 5's
-/// `P_max`, a constant here per ADR-3692 decision 2. Parts past it are
-/// uncovered and fall to tier 1, never to a whole scan.
+/// `P_max`, a constant here per ADR-3692 decision 2, and the factor of the
+/// statement's leaf GET ceiling (see [`KEY_INDEX_LEAF_GET_CEILING`]). Parts
+/// past it are uncovered and fall to tier 1, never to a whole scan.
 pub const KEY_INDEX_MAX_PROBED_PARTS: usize = 1_024;
 
-/// Most leaf GETs one statement's tier-2 router issues: ADR-3692 decision
-/// 2's `L_max`, two GETs (prefix and one bucket) for each of
-/// [`KEY_INDEX_MAX_PROBED_PARTS`] parts, ADR-2707 decision 5's point-lookup
-/// budget.
+/// Most leaf GETs a one-key statement's tier-2 router issues: two GETs
+/// (prefix and one bucket) for each of [`KEY_INDEX_MAX_PROBED_PARTS`] parts,
+/// ADR-2707 decision 5's point-lookup budget. Under ADR-3692's key-set
+/// ceiling amendment the router computes a set of `k` keys' ceiling as
+/// `P_max x (1 + min(k, B_run))` ([`KEY_INDEX_SET_PROBE_MAX_RUNS`]), which
+/// is this value at k = 1 and 66,560 at k >= 64. It is an absolute cap on
+/// the statement, charging each part as if the set sat in one slice;
+/// admission charges each part's real worst case against it and refunds
+/// the GETs a probed part did not issue, so its worst-case division is the
+/// fewest parts it admits. Separately, a part whose worst case exceeds
+/// `2 x entry_count`, its tier-1 probe's cost, is not probed.
 pub const KEY_INDEX_LEAF_GET_CEILING: u32 = 2_048;
 
 /// Most bucket GETs one set probe issues against one leaf: ADR-3692
