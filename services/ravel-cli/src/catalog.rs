@@ -583,6 +583,14 @@ fn render_fold_report(
         report.key_index_build_passes
     ));
     out.push_str(&format!(
+        "key_index_pair_budget: {}\n",
+        report.key_index_pair_budget
+    ));
+    // The same object `--json` carries, keys in name order.
+    let field_pairs = serde_json::to_string(&report.key_index_field_pairs)
+        .map_err(|err| anyhow::anyhow!("failed to serialize key_index_field_pairs: {err}"))?;
+    out.push_str(&format!("key_index_field_pairs: {field_pairs}\n"));
+    out.push_str(&format!(
         "key_index_leaf_gets: {}\n",
         report.key_index_leaf_gets
     ));

@@ -278,3 +278,71 @@ async fn an_advancing_fold_reports_four_different_build_figures() {
         assert_eq!(printed.matches(line).count(), 1, "printed once: {line:?}");
     }
 }
+
+/// #3948: `--json` carries the pair budget the build ran under and each
+/// indexed field's pairs, and the text report prints both. The one spans
+/// entry's three trace ids are three pairs of `trace_id`. A fold without
+/// the switch reports a zero budget and no field.
+#[tokio::test]
+async fn the_json_report_carries_the_pair_budget_and_the_field_pairs() {
+    let fold = |build_key_index_leaves: bool, json: bool| async move {
+        let now = ravel_cli::now_ns().expect("system clock readable");
+        let store = Arc::new(MemoryStore::new());
+        publish_spans(&store, now).await;
+        catalog::fold_with_key_index_budget(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            MEMORY,
+            TENANT,
+            1,
+            SignalArg::Spans,
+            None,
+            false,
+            build_key_index_leaves,
+            7,
+            None,
+            now,
+            json,
+        )
+        .await
+        .expect("fold succeeds")
+    };
+
+    let (on, printed) = fold(true, true).await;
+    let value: serde_json::Value = serde_json::from_str(&printed).expect("one JSON document");
+    assert_eq!(
+        value["key_index_pair_budget"],
+        serde_json::json!(7),
+        "{printed}"
+    );
+    assert_eq!(
+        value["key_index_field_pairs"],
+        serde_json::json!({ "trace_id": 3 }),
+        "{printed}"
+    );
+    assert_eq!(on.key_index_pair_budget, 7);
+
+    let (_, text) = fold(true, false).await;
+    for line in [
+        "key_index_pair_budget: 7\n",
+        "key_index_field_pairs: {\"trace_id\":3}\n",
+    ] {
+        assert_eq!(
+            text.matches(line).count(),
+            1,
+            "printed once: {line:?}\n{text}"
+        );
+    }
+
+    let (_, off) = fold(false, true).await;
+    let value: serde_json::Value = serde_json::from_str(&off).expect("one JSON document");
+    assert_eq!(
+        value["key_index_pair_budget"],
+        serde_json::json!(0),
+        "{off}"
+    );
+    assert_eq!(
+        value["key_index_field_pairs"],
+        serde_json::json!({}),
+        "{off}"
+    );
+}
