@@ -387,9 +387,9 @@ async fn build_gated_app(get_limiter: Arc<GetLimiter>) -> (Router, GateHandle) {
     let catalog = build_catalog(
         Arc::clone(&store),
         1,
-        cli.disable_cache,
+        cli.cache.disable_cache,
         ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
-        cli.cache_dir.clone(),
+        cli.cache.cache_dir.clone(),
         None,
         None,
         cli.resolve_flush_cadence()

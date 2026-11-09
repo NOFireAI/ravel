@@ -70,7 +70,7 @@ fn capture(args: &[&str]) -> (String, u64, u64) {
         .with_ansi(false)
         .finish();
     tracing::subscriber::with_default(subscriber, || {
-        log_resolved_request_budget(limit, seal_margin, cli.max_s3_requests.is_some());
+        log_resolved_request_budget(limit, seal_margin, cli.limits.max_s3_requests.is_some());
     });
 
     let bytes = buffer.lock().expect("log buffer lock").clone();

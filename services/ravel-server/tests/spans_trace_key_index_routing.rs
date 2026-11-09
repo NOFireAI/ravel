@@ -411,7 +411,7 @@ async fn serve(
             true,
             ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
             None,
-            cli.catalog_resolve_concurrency,
+            cli.cache.catalog_resolve_concurrency,
             None,
             cli.resolve_flush_cadence()
                 .expect("flush cadence resolves")
