@@ -2100,7 +2100,7 @@ state = "day_parts_7"
 transition = "day_parts_7"
 metric = "fold.inv.logs.head_digest"
 lane = "counter"
-target_if = "v is not None"
+target_if = "isinstance(v, str) and len(v) > 0"
 
 [[row.figure]]
 name = "refold_head_digest"
@@ -2109,7 +2109,7 @@ state = "day_parts_7"
 transition = "day_parts_7_refold"
 metric = "fold.inv.logs.head_digest"
 lane = "counter"
-target_if = "v is not None"
+target_if = "isinstance(v, str) and len(v) > 0"
 
 [[row.figure]]
 name = "heads_differ"
@@ -2351,8 +2351,11 @@ source = "predicted from box D rates"
 # that per part the state holds, and every day held is covered while
 # 30 x (T(S) + 100) is at most the key-set ceiling's 66,560. A run whose S is
 # under 3 is not-run for every figure that depends on it, not a pass. The
-# stats carry no per-part leaf GET breakdown on this build, so the per-part
-# figure reads unsupported and the total is judged instead.
+# total is judged against 30 x (T(S) + 100), the 30-day state's 30 day parts;
+# a state holding other than 30 parts is not that state, so the total is
+# not-run there rather than rescaled. The stats carry no per-part leaf GET
+# breakdown on this build, so the per-part figure reads unsupported until
+# they do.
 requires_tenant = "inv"
 requires_states = ["day_parts_30"]
 
@@ -2399,9 +2402,9 @@ statement = "logs_request_in_100_30d"
 state = "day_parts_30"
 metric = "cold.max.leaf_gets"
 lane = "counter"
-not_run_unless = "m['adr3939_a7.slices'] >= 3"
-not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
-target_if = "v <= m['adr3939_a7.parts_held'] * m['adr3939_a7.per_day_bound']"
+not_run_unless = "m['adr3939_a7.slices'] >= 3 and m['adr3939_a7.parts_held'] == 30"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised, and that state holds 30 day parts, so the total is 30 x (T(S) + 100)"
+target_if = "v <= 30 * m['adr3939_a7.per_day_bound']"
 
 [[row.figure]]
 name = "ceiling_gets"
@@ -2499,7 +2502,10 @@ source = "predicted; fold.rs `PreviousTail::from_head` and `feed_carried_key_ind
 # stamps/retired_hour.logs.fold_binary.json names its binary: sha,
 # carries_c1, carries_r2. No build writes that stamp yet (task H1b, #4048),
 # so the binary figure is unsupported and every other figure is not-run until
-# it says C1 without R2.
+# it says C1 without R2. A binary carrying R2 (or no C1) is one W2 is not
+# measured on: the binary figure and the rest are not-run and listed not
+# requested with the binary's SHA, never a miss, so a run on the R2 build
+# that holds retired_hour for W3 and W8 is not failed by W2.
 requires_tenant = "inv"
 requires_states = ["retired_hour"]
 
@@ -2559,7 +2565,11 @@ source = "predicted"
 # fold are stamps task H1b (#4048) writes (stamps/retired_hour.logs.tombstone.json
 # hour, stamps/retired_hour.logs.retired_resolve.json segments, both tiers);
 # the part PUTs and retired_hours are fold report fields this build does not
-# write. Each reads unsupported until its source exists.
+# write. The part leaving HEAD is the count of parts in the catalog stamp
+# taken after the drop fold (stamps/retired_hour_drop.logs.catalog.json, H1b)
+# whose hour range holds the tombstoned hour, so a drop fold that drops
+# nothing misses rather than passing on its 0 PUTs. Each reads unsupported
+# until its source exists.
 requires_tenant = "inv"
 requires_states = ["retired_hour"]
 
@@ -2625,6 +2635,15 @@ statement = "fold"
 state = "retired_hour"
 transition = "retired_hour_drop"
 metric = "fold.inv.logs.leaves_written"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "drop_parts_holding_hour"
+statement = "stamp"
+state = "retired_hour"
+metric = "stamp.drop_parts_holding_hour.logs"
 lane = "counter"
 target_if = "v == 0"
 miss_if = "v > 0"
@@ -2727,8 +2746,11 @@ source = "predicted"
 # At the reduced rate: 3,780 is the box D instance of 30 x (T(S) + 100),
 # with S the most slices one day part carries for request_id, and a run whose
 # S is under 3 is not-run for every figure that depends on it (the
-# harness-state amendment). The tier-1 probes are the calls' probe-phase
-# GETs.
+# harness-state amendment). Each day part is held to T(S) + 100 leaf GETs as
+# A7's is, besides the 30-day total, so one part over the bound cannot hide
+# under the total; the stats carry no per-part breakdown on this build, so
+# that figure reads unsupported until they do. The tier-1 probes are the
+# calls' probe-phase GETs.
 requires_tenant = "inv"
 requires_states = ["day_parts_30"]
 
@@ -2760,6 +2782,16 @@ lane = "counter"
 not_run_unless = "m['adr3939_w5.slices'] >= 3"
 not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
 target_if = "v <= 30 * m['adr3939_w5.per_day_bound']"
+
+[[row.figure]]
+name = "leaf_gets_per_part"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= m['adr3939_w5.per_day_bound']"
 
 [[row.figure]]
 name = "days_covered"
@@ -2859,7 +2891,10 @@ check = "W7 1 hour across midnight"
 target = "4 leaf GETs"
 miss = "over 4"
 source = "predicted"
-# One key over the hour centred on a UTC midnight of the 7-day state.
+# One key over the hour that spans a UTC midnight of the 7-day state (23:30
+# to 00:30), so it reads the two day parts either side of it. 4 leaf GETs
+# alone would also hold for a window reading one part, so the calls must
+# cover exactly 2 parts and leave none uncovered.
 requires_tenant = "inv"
 requires_states = ["day_parts_7"]
 
@@ -2871,6 +2906,30 @@ metric = "cold.max.leaf_gets"
 lane = "counter"
 target_if = "v <= 4"
 miss_if = "v > 4"
+
+[[row.figure]]
+name = "parts_covered_min"
+statement = "logs_request_in_1_midnight"
+state = "day_parts_7"
+metric = "cold.min.parts_covered"
+lane = "counter"
+target_if = "v == 2"
+
+[[row.figure]]
+name = "parts_covered_max"
+statement = "logs_request_in_1_midnight"
+state = "day_parts_7"
+metric = "cold.max.parts_covered"
+lane = "counter"
+target_if = "v == 2"
+
+[[row.figure]]
+name = "parts_uncovered"
+statement = "logs_request_in_1_midnight"
+state = "day_parts_7"
+metric = "cold.max.parts_uncovered"
+lane = "counter"
+target_if = "v == 0"
 
 [[row.figure]]
 name = "rows_exact"
@@ -2890,7 +2949,9 @@ miss = "any difference"
 source = "predicted"
 # As A4 on the retired_hour state: its fold and a second fold observing the
 # same tombstones (transition retired_hour_refold), each reporting its HEAD
-# digest and retired_hours. The fold report carries neither on this build.
+# digest and retired_hours. Each fold's retired_hours must be exactly [h] for
+# W3's tombstoned hour h, so two folds that observed no tombstone (both [])
+# miss rather than agree. The fold report carries neither on this build.
 requires_tenant = "inv"
 requires_states = ["retired_hour"]
 
@@ -2901,7 +2962,7 @@ state = "retired_hour"
 transition = "retired_hour"
 metric = "fold.inv.logs.head_digest"
 lane = "counter"
-target_if = "v is not None"
+target_if = "isinstance(v, str) and len(v) > 0"
 
 [[row.figure]]
 name = "refold_head_digest"
@@ -2910,7 +2971,7 @@ state = "retired_hour"
 transition = "retired_hour_refold"
 metric = "fold.inv.logs.head_digest"
 lane = "counter"
-target_if = "v is not None"
+target_if = "isinstance(v, str) and len(v) > 0"
 
 [[row.figure]]
 name = "heads_differ"
@@ -2928,7 +2989,7 @@ state = "retired_hour"
 transition = "retired_hour"
 metric = "fold.inv.logs.retired_hours"
 lane = "counter"
-target_if = "v is not None"
+target_if = "v == [m['adr3939_w3.tombstoned_hour']]"
 
 [[row.figure]]
 name = "refold_retired_hours"
@@ -2937,7 +2998,7 @@ state = "retired_hour"
 transition = "retired_hour_refold"
 metric = "fold.inv.logs.retired_hours"
 lane = "counter"
-target_if = "v is not None"
+target_if = "v == [m['adr3939_w3.tombstoned_hour']]"
 
 [[row.figure]]
 name = "retired_hours_differ"
