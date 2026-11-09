@@ -1478,23 +1478,44 @@ front and verifies it (the leaf's own checks, its ref, and its tenant,
 signal, part hash and part entry count); its header gives the uncovered
 entries of the whole set, and the refs alone are checked for the rest
 (slices that tile the key8 space, one key type, one `uncovered_count`, the
-source's part hash). A pass fetches each later slice when its key8 range
-first reaches the slice's `key8_lo`, verifies it the same way and against
-the lowest slice's uncovered list, and the bytes are dropped once a pass
-starts past the slice's `key8_hi`, so each slice is fetched once per field
-build attempt. Each pass decodes the slices its range overlaps again, one
-frame at a time, from the kept bytes. A pass therefore holds, per field
-and source, the slices its range overlaps and the first one past it that
-the cut has not yet ruled out. When the previous slices were cut under the
-same budget from the same pairs, a pass's range spans one of them and the
-carry holds at most two slices per field per source
+source's part hash). A pass feeds a field its carried pairs before it
+reads any section, walking each source's slices in key8 order from the one
+holding the pass's start. It fetches each later slice it walks to and has
+not kept, verifies it the same way and against the lowest slice's
+uncovered list (`a_later_slice_listing_other_uncovered_entries_is_refused`:
+a ref binds only `uncovered_count`, so a slice listing other entries at
+the same length is refused), and stops at the first slice whose `key8_lo`
+is at or past the end that the pairs fed so far have cut. The sections
+read after the feed can lower the end further, but cannot undo a fetch.
+A slice's bytes are dropped once a pass starts past its `key8_hi`, so
+each slice is fetched once per field build attempt. When a field is
+rebuilt after a pass finds a new uncovered entry, its passes start again
+from key8 0: a slice dropped during the first attempt is fetched again,
+and a slice still kept from it stays held through the rebuild until a
+pass starts past it. Each pass decodes the slices its range overlaps
+again, one frame at a time, from the kept bytes. A pass therefore holds,
+per field and source, every slice from the one holding its start through
+the last one it fetched, and any slice it kept from an earlier pass or
+attempt that no pass has yet started past. The bound is per source, and
+it holds while the cut advances through that source's slices. When the
+previous slices were cut under the same budget from the same pairs, a
+pass's range spans the slices one previous pass wrote and its feed stops
+at the first slice of the next, so the carry holds at most two slices per
+field per source when each previous pass wrote one slice
 (`the_carry_holds_at_most_two_slices_per_field_per_source`: 2 at the most
-in each of 7 passes over 6 slices a field, each slice fetched once); a pass
-wider than the previous slices, as after a tombstone removes entries,
-holds every slice its range overlaps (in
+in each of 7 passes over 6 slices a field, each slice fetched once), and
+one more than a previous pass wrote when the body ceiling split it into
+several. A pass wider than the previous slices, as after a tombstone
+removes entries, holds every slice its range overlaps (in
 `a_dirty_sealed_day_carries_its_own_previous_leaves` the first pass holds
-all 3 of day d's). The fold report's `key_index_carry_peak_held_bytes` is
-the most previous-leaf bytes held at once. An entry is taken from its source
+all 3 of day d's). A source whose entries in the part are few feeds few
+pairs, so the cut may not fire while its slices are walked, and the first
+pass fetches every slice of its set and holds each until a pass starts
+past it: such a source can hold up to its whole previous leaf set, every
+declared field together, for one pass. The fold that seals a day is that
+case, since its new tail carries only the next day's few entries from the
+previous tail. The fold report's `key_index_carry_peak_held_bytes` is the
+most previous-leaf bytes held at once. An entry is taken from its source
 when that source's leaves cover it for every declared field
 (`load_carry_source`, `crates/ravel-catalog/src/fold.rs`). Only the
 entries new to the part, and the entries the previous leaves listed as
@@ -1515,8 +1536,12 @@ of its leaves' field is not declared under its key type
 (`a_key_index_field_retyped_between_folds_carries_no_old_type_pair`).
 Dropping one source leaves the others carried, and the leaves stay the
 same either way, since a carried entry contributes the pairs its section
-would. The whole carry is dropped, and the build restarts reading every
-entry's section, when a later slice cannot be read, does not verify or no
+would (`a_failing_source_drops_only_its_own_entries_from_the_carry`: the
+GET of one source's lowest slice fails, that source's surviving entry has
+its section read in both passes, the other source's entries have none
+read, and the leaves equal a fold of the same entries into a fresh store,
+byte for byte). The whole carry is dropped, and the build restarts reading
+every entry's section, when a later slice cannot be read, does not verify or no
 longer decodes
 (`a_later_slice_whose_get_fails_restarts_the_build_without_the_carry`:
 2 previous-leaf GETs before the restart, the from-scratch leaves after it),
@@ -1636,12 +1661,16 @@ pass log `pass_ranges` asserts both on every pass of the tests above). The
 binaries' allocator, and no test pins it. The sort reuses the heap buffer
 and copies no pair (test `a_pass_sorts_its_pairs_in_the_heap_buffer`). The
 budget does not bound: the previous leaf bytes as stored that the carry
-holds, each slice fetched once per field build attempt and held from the
-pass that first reaches it until a pass starts past it (under "Incremental
-tail build": at most two slices per field per source when the previous
-slices were cut under the same budget from the same pairs, more when a pass
-is wider than they are; `key_index_carry_peak_held_bytes` reports the
-most); one decoded frame of one previous
+holds, each slice fetched once per field build attempt (again when a
+field is rebuilt) and held until a pass starts past it, the lowest slice of
+each source and field from the load before the first pass and every later
+slice from the pass that fetches it (under "Incremental tail build": at
+most two slices per field per source when the previous slices were cut
+under the same budget from the same pairs and each previous pass wrote one
+slice, more when a pass is wider than they are or a source has few entries
+in the part, up to that source's whole previous leaf set;
+`key_index_carry_peak_held_bytes` reports the most); one decoded frame of
+one previous
 leaf at a time (a frame is one bucket, near `4 x 2^bucket_bits` bytes for
 keys whose key8 spreads evenly, trace ids, strings and bytes, and up to the
 whole leaf body for I64 keys that share their high bits); the KEY_IDX or
@@ -1732,8 +1761,10 @@ carried parts that lack a declared field's leaf (under "Day seal"), which
 `a_switch_off_fold_over_leaves_is_reported`), and
 `key_index_carry_peak_held_bytes`, the most previous-leaf bytes the carry
 held at once while building any one part in the fold, every source and
-field together (under "Incremental tail build"; 0 with the switch off and
-when no part carried). It equals the largest total the passes held in
+field together (under "Incremental tail build"; 0 when no part carried,
+and 0 with the switch off, test `a_switch_off_fold_over_leaves_is_reported`,
+whose switch-off fold runs over a HEAD whose part has a leaf). It equals
+the largest total the passes held in
 `the_carry_holds_at_most_two_slices_per_field_per_source`, and
 `ravel-cli catalog fold` prints it in text and `--json` (test
 `fold_human_report_prints_every_fold_report_field`, which checks every
