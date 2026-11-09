@@ -426,13 +426,13 @@ impl Cli {
         host: HostProfile,
     ) -> anyhow::Result<MemoryGate> {
         let flags = MemoryGateFlags {
-            min_available_bytes: self.memory_gate_min_available_bytes,
-            purge_available_bytes: self.memory_gate_purge_available_bytes,
-            purge_min_interval_ms: self.memory_gate_purge_min_interval_ms,
-            interval_ms: self.memory_gate_interval_ms,
-            close_after_samples: self.memory_gate_close_after_samples,
-            wait_ms: self.memory_gate_wait_ms,
-            disabled: self.disable_memory_gate,
+            min_available_bytes: self.gates.memory_gate_min_available_bytes,
+            purge_available_bytes: self.gates.memory_gate_purge_available_bytes,
+            purge_min_interval_ms: self.gates.memory_gate_purge_min_interval_ms,
+            interval_ms: self.gates.memory_gate_interval_ms,
+            close_after_samples: self.gates.memory_gate_close_after_samples,
+            wait_ms: self.gates.memory_gate_wait_ms,
+            disabled: self.gates.disable_memory_gate,
         };
         Ok(resolve(
             flags,
@@ -2591,11 +2591,12 @@ mod tests {
         for (accepted, expected) in [("1", 1), ("100", 100)] {
             let cli = parse_cli(&["--memory-gate-close-after-samples", accepted])
                 .expect("inside 1 to 100");
-            assert_eq!(cli.memory_gate_close_after_samples, expected);
+            assert_eq!(cli.gates.memory_gate_close_after_samples, expected);
         }
         assert_eq!(
             parse_cli(&[])
                 .expect("defaults parse")
+                .gates
                 .memory_gate_close_after_samples,
             DEFAULT_CLOSE_AFTER_SAMPLES
         );
@@ -2607,7 +2608,10 @@ mod tests {
         assert_eq!(refused.kind(), clap::error::ErrorKind::ValueValidation);
         let accepted =
             parse_cli(&["--memory-gate-min-available-bytes", "67108864"]).expect("64 MiB parses");
-        assert_eq!(accepted.memory_gate_min_available_bytes, Some(64 * MIB));
+        assert_eq!(
+            accepted.gates.memory_gate_min_available_bytes,
+            Some(64 * MIB)
+        );
         assert_eq!(MIN_AVAILABLE_FLOOR_BYTES, 67_108_864);
 
         for refused in ["99", "600001"] {
@@ -2618,11 +2622,12 @@ mod tests {
         for (accepted, expected) in [("100", 100), ("600000", 600_000)] {
             let cli = parse_cli(&["--memory-gate-purge-min-interval-ms", accepted])
                 .expect("inside 100 to 600000");
-            assert_eq!(cli.memory_gate_purge_min_interval_ms, expected);
+            assert_eq!(cli.gates.memory_gate_purge_min_interval_ms, expected);
         }
         assert_eq!(
             parse_cli(&[])
                 .expect("defaults parse")
+                .gates
                 .memory_gate_purge_min_interval_ms,
             DEFAULT_PURGE_MIN_INTERVAL_MS
         );
@@ -2785,12 +2790,12 @@ mod tests {
             "7",
         ])
         .expect("flags parse");
-        assert_eq!(cli.memory_gate_close_after_samples, 7);
+        assert_eq!(cli.gates.memory_gate_close_after_samples, 7);
         let performance = cli
             .resolve_performance(host())
             .expect("performance resolves");
         let flagged = MemoryGateFlags {
-            close_after_samples: cli.memory_gate_close_after_samples,
+            close_after_samples: cli.gates.memory_gate_close_after_samples,
             ..flags()
         };
         let gate = resolve(flagged, cli.mode, &performance, host(), true).expect("resolves");

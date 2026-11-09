@@ -335,7 +335,7 @@ fn catalog_from_flags(store: Arc<dyn ObjectStoreBackend>, flags: &[&str]) -> Arc
             CatalogConfig {
                 shard_count: 1,
                 build_key_index_leaves: cli.fold_key_index_leaves,
-                metrics_label_index: cli.fold_metrics_label_index,
+                metrics_label_index: cli.maintenance.fold_metrics_label_index,
                 ..server_catalog_config_base()
             },
         )

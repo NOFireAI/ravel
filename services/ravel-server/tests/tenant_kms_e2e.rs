@@ -618,12 +618,12 @@ async fn tenant_kms_config_routes_each_tenants_puts_to_its_own_key() {
 /// Reachability proof for the OTHER SSE-KMS
 /// mechanism `build_store` wires up -- `--s3-kms-key`, a single deployment-
 /// wide key applied to the default `S3Store` unconditionally
-/// (`services/ravel-server/src/store.rs`'s `kms_key_id: cli.s3_kms_key.clone()`),
+/// (`services/ravel-server/src/store.rs`'s `kms_key_id: cli.object_store.s3_kms_key.clone()`),
 /// independent of and reachable with no `--tenant-kms-config` at all. Before
 /// this test, `--s3-kms-key` had unit coverage nowhere: `store.rs` has no
 /// `#[cfg(test)]` module exercising the field, and this file's existing two
 /// tests only ever drive `--tenant-kms-config`'s `KmsRoutingStore` path. A
-/// typo turning `kms_key_id: cli.s3_kms_key.clone()` into
+/// typo turning `kms_key_id: cli.object_store.s3_kms_key.clone()` into
 /// `kms_key_id: None` (or dropping the field from the built `S3Config`
 /// entirely) would leave every real PUT unencrypted under this flag with no
 /// test anywhere failing.

@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     // refuses startup outright; see `Cli::validate`.
     cli.validate()?;
 
-    ravel_server::warn_dev_insecure_tenant_header(cli.dev_insecure_tenant_header);
+    ravel_server::warn_dev_insecure_tenant_header(cli.tenancy.dev_insecure_tenant_header);
 
     // Host-derived performance defaults (ADR-0088 as amended by issue #1141).
     // The host is read exactly once, here, and the six settings are resolved
@@ -98,14 +98,14 @@ async fn main() -> anyhow::Result<()> {
     // OTAP (ADR-0011) is opt-in even in a build with the `otap` feature: the
     // feature links the arrow decode stack, `--otap` decides whether this
     // process registers the ArrowMetricsService (ServerConfig::otap, read by
-    // `start`). `cli.otap` only exists in an `otap`-featured build; a build
+    // `start`). `cli.otap_ingest.otap` only exists in an `otap`-featured build; a build
     // without the feature never registers the service regardless.
     #[cfg(feature = "otap")]
-    let otap = cli.otap;
+    let otap = cli.otap_ingest.otap;
     #[cfg(not(feature = "otap"))]
     let otap = false;
     #[cfg(feature = "otap")]
-    let otap_max_decoded_batch_bytes = cli.otap_max_decoded_batch_bytes;
+    let otap_max_decoded_batch_bytes = cli.otap_ingest.otap_max_decoded_batch_bytes;
     #[cfg(not(feature = "otap"))]
     let otap_max_decoded_batch_bytes = ravel_server::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES;
 
@@ -160,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
     // instead of blocking. `--store gcs` never reaches this with the flag
     // set: argument parsing refuses it there (ADR-3456 decision D6).
     ravel_server::bucket_protection::enforce_at_startup_on(
-        cli.require_bucket_protection,
+        cli.startup_checks.require_bucket_protection,
         store_s3.as_deref(),
         store.as_ref(),
     )
@@ -335,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
     // sits: after `install_tenant_hash_scheme`, so `TenantId::hash()` inside
     // resolves under the scheme the request path uses, and before
     // `ensure_federation_tenant_mapping` and any listener bind.
-    let alert_rules = match cli.alert_rules_file.as_deref() {
+    let alert_rules = match cli.alerting.alert_rules_file.as_deref() {
         Some(path) => load_rules_file(path)?,
         None => HashMap::new(),
     };
@@ -349,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
         &remote_clusters,
         &tenant_tokens,
         &alert_rule_tenants,
-        cli.dev_insecure_tenant_header,
+        cli.tenancy.dev_insecure_tenant_header,
         ravel_server::durable_auth_enabled(cli.mode, deployment_key.is_some()),
         &auth,
     )?;
@@ -358,31 +358,34 @@ async fn main() -> anyhow::Result<()> {
     // ADR-2708 D5c: count catalog entries outside this build's reader window
     // for every statically known tenant, before any listener binds, so
     // `--format-window-check refuse` stops startup here. Off by default.
-    if ravel_server::format_window::should_run(cli.format_window_check) {
+    if ravel_server::format_window::should_run(cli.startup_checks.format_window_check) {
         let format_window_tenants =
             ravel_server::format_window::tenants_to_check(&fold_tenants, &alert_rule_tenants);
         let format_window_report = ravel_server::format_window::check(
             store.as_ref(),
             &format_window_tenants,
-            cli.format_window_check_timeout,
+            cli.startup_checks.format_window_check_timeout,
         )
         .await;
-        ravel_server::format_window::enforce(cli.format_window_check, &format_window_report)?;
+        ravel_server::format_window::enforce(
+            cli.startup_checks.format_window_check,
+            &format_window_report,
+        )?;
     } else {
         tracing::debug!("format-window check off (--format-window-check off)");
     }
 
     let resolver_bundle = ravel_server::tenant::build_auth_resolver_with_principals(
         tenant_principals,
-        cli.dev_insecure_tenant_header,
+        cli.tenancy.dev_insecure_tenant_header,
         auth,
         ravel_server::tenant::OidcCapabilityClaims {
-            ddl: cli.oidc_ddl_claim.clone(),
-            ipcrypt: cli.oidc_ipcrypt_claim.clone(),
-            agents: cli.oidc_agents_claim.clone(),
-            agents_worker: cli.oidc_agents_worker_claim.clone(),
-            agents_admin: cli.oidc_agents_admin_claim.clone(),
-            subject: cli.oidc_subject_claim.clone(),
+            ddl: cli.auth.oidc_ddl_claim.clone(),
+            ipcrypt: cli.auth.oidc_ipcrypt_claim.clone(),
+            agents: cli.auth.oidc_agents_claim.clone(),
+            agents_worker: cli.auth.oidc_agents_worker_claim.clone(),
+            agents_admin: cli.auth.oidc_agents_admin_claim.clone(),
+            subject: cli.auth.oidc_subject_claim.clone(),
         },
     )?;
     // Retention windows are validated at startup against the ADR-0019 floor
@@ -487,7 +490,7 @@ async fn main() -> anyhow::Result<()> {
         max_active_streams = ?limits.defaults.max_active_streams,
         max_bytes_scanned = ?limits.query_defaults.max_bytes_scanned,
         "admission limits resolved from {}",
-        cli.limits_file
+        cli.limits.limits_file
             .as_deref()
             .map_or_else(|| "shipped defaults".to_string(), |p| p.display().to_string())
     );
@@ -570,6 +573,7 @@ async fn main() -> anyhow::Result<()> {
     // `mtls_resolver` from that same --mtls-enabled flag, so this zip is
     // Some exactly when both were configured, and never partially.
     let mtls_listener = cli
+        .auth
         .mtls_listener
         .zip(resolver_bundle.mtls_resolver)
         .map(|(addr, resolver)| ravel_server::MtlsListenerConfig { addr, resolver });
@@ -592,7 +596,7 @@ async fn main() -> anyhow::Result<()> {
     ravel_server::log_resolved_request_budget(
         max_s3_requests,
         seal_margin,
-        cli.max_s3_requests.is_some(),
+        cli.limits.max_s3_requests.is_some(),
     );
 
     let config = ServerConfig {
@@ -623,7 +627,7 @@ async fn main() -> anyhow::Result<()> {
             fold_interval: Duration::from_secs(cli.fold_interval_secs),
             build_key_index_leaves: cli.fold_key_index_leaves,
             key_index_build_max_pairs: cli.fold_key_index_build_max_pairs,
-            metrics_label_index: cli.fold_metrics_label_index,
+            metrics_label_index: cli.maintenance.fold_metrics_label_index,
         },
         maintain: MaintenanceTaskConfig {
             enabled: matches!(cli.mode, Mode::Maintain),
@@ -638,7 +642,7 @@ async fn main() -> anyhow::Result<()> {
         },
         alerting: AlertEvalConfig {
             enabled: !alert_rules.is_empty(),
-            interval: Duration::from_secs(cli.alert_eval_interval_secs),
+            interval: Duration::from_secs(cli.alerting.alert_eval_interval_secs),
             rules: Arc::new(alert_rules),
             sinks: Arc::new(alert_sinks),
             query_deadline: DEFAULT_QUERY_DEADLINE,
@@ -649,7 +653,7 @@ async fn main() -> anyhow::Result<()> {
         otap,
         otap_max_decoded_batch_bytes,
         limits,
-        metrics_tenant_labels: cli.metrics_tenant_labels,
+        metrics_tenant_labels: cli.limits.metrics_tenant_labels,
         deployment_key,
         gc,
         query_deadline: gc_runtime.query_deadline,
@@ -672,13 +676,13 @@ async fn main() -> anyhow::Result<()> {
         indexed_fields,
         typed_attr_columns,
         parquet_profiles,
-        disable_cache: cli.disable_cache,
+        disable_cache: cli.cache.disable_cache,
         cache_max_bytes: performance.cache_max_bytes,
         catalog_cache_max_bytes: performance.catalog_cache_max_bytes,
         process_memory_budget_bytes: performance.memory_remainder_bytes,
         process_memory_budget_is_fallback: performance.sources.memory_budget_bytes
             == ravel_server::config::PERF_SOURCE_FALLBACK,
-        cache_dir: cli.cache_dir.clone(),
+        cache_dir: cli.cache.cache_dir.clone(),
         catalog_resolve_concurrency: Some(performance.catalog_resolve_concurrency),
         cpu_gate_permits,
         ingest_hold,

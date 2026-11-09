@@ -2063,9 +2063,9 @@ mod catalog_cache_tests {
         let catalog = build_catalog(
             store,
             1,
-            cli.disable_cache,
+            cli.cache.disable_cache,
             resolved.catalog_cache_max_bytes,
-            cli.cache_dir.clone(),
+            cli.cache.cache_dir.clone(),
             None,
             None,
             Duration::from_secs(2),
@@ -2116,9 +2116,9 @@ mod catalog_cache_tests {
         let catalog = build_catalog(
             store,
             1,
-            catalog_flagged.disable_cache,
+            catalog_flagged.cache.disable_cache,
             resolved.catalog_cache_max_bytes,
-            catalog_flagged.cache_dir.clone(),
+            catalog_flagged.cache.cache_dir.clone(),
             None,
             None,
             Duration::from_secs(2),
@@ -4248,7 +4248,7 @@ mod tests {
                 .expect("performance defaults resolve");
             let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
             let startup = prepare(
-                cli.cache_dir.as_deref(),
+                cli.cache.cache_dir.as_deref(),
                 budgets.sql_spill,
                 None,
                 None,
@@ -4340,7 +4340,7 @@ mod tests {
                 .expect("performance defaults resolve");
             let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
             let startup = prepare(
-                cli.cache_dir.as_deref(),
+                cli.cache.cache_dir.as_deref(),
                 budgets.sql_spill,
                 None,
                 None,

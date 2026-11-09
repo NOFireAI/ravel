@@ -480,10 +480,10 @@ fn serve_with(
     let catalog = build_catalog(
         Arc::clone(&store),
         SHARDS,
-        cli.disable_cache,
+        cli.cache.disable_cache,
         ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
         None,
-        cli.catalog_resolve_concurrency,
+        cli.cache.catalog_resolve_concurrency,
         None,
         cli.resolve_flush_cadence()
             .expect("flush cadence resolves")

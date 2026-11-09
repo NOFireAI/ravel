@@ -121,7 +121,7 @@ async fn startup_gate(
     built: &BuiltStore,
 ) -> anyhow::Result<Option<BucketProtectionOutcome>> {
     ravel_server::bucket_protection::enforce_at_startup_on(
-        cli.require_bucket_protection,
+        cli.startup_checks.require_bucket_protection,
         built.s3.as_deref(),
         built.foreground.as_ref(),
     )

@@ -1231,7 +1231,7 @@ async fn audit_off_by_default_installs_no_pipeline_and_writes_no_record() {
         .expect("the default arguments parse");
     assert_eq!(cli.mode, Mode::All);
     assert_eq!(
-        cli.audit_text,
+        cli.audit.audit_text,
         ravel_server::config::AuditTextArg::Redacted,
         "the default text posture is redacted, the one that needs a key"
     );
@@ -1240,8 +1240,8 @@ async fn audit_off_by_default_installs_no_pipeline_and_writes_no_record() {
         .expect("the default audit config resolves");
     let audit_text = ravel_server::config::resolve_audit_text_policy_for_mode(
         cli.mode,
-        cli.audit_mode,
-        cli.audit_text,
+        cli.audit.audit_mode,
+        cli.audit.audit_text,
         None,
         None,
     )

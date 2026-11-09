@@ -892,7 +892,7 @@ fn parse_audit_token_key(raw: &str) -> anyhow::Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("{AUDIT_TOKEN_KEY_ENV} did not decode to 32 bytes"))
 }
 
-/// `--sql-spill-merge-fan-in`, flattened into [`Cli`], and whether the flag
+/// `--sql-spill-merge-fan-in`, flattened into [`SqlArgs`], and whether the flag
 /// was passed, so the startup line names its source whatever the value.
 #[derive(Debug)]
 pub struct SqlSpillMergeArgs {
@@ -958,6 +958,12 @@ struct SqlSpillMergeFlag {
 }
 
 /// Dev binary wiring gateway + ingest + query into one process.
+///
+/// The flags are split into flattened groups by area because clap's derive
+/// builds every flag of one struct in a single `augment_args` stack frame,
+/// and in an unoptimized build that frame grows by about 8 KB per flag: one
+/// struct holding every flag took about 1.5 MiB of stack to parse. The
+/// `cli_parse_small_stack` test parses on a 512 KiB thread.
 #[derive(Debug, Parser)]
 #[command(
     name = "ravel-server",
@@ -996,6 +1002,252 @@ pub struct Cli {
     #[arg(long, default_value_t = 4)]
     pub shards: u32,
 
+    #[command(flatten)]
+    pub tenancy: TenancyArgs,
+
+    #[command(flatten)]
+    pub startup_checks: StartupCheckArgs,
+
+    #[command(flatten)]
+    pub audit: AuditArgs,
+
+    #[command(flatten)]
+    pub object_store: ObjectStoreArgs,
+
+    #[command(flatten)]
+    pub tenant_config: TenantConfigArgs,
+
+    // The fold, maintenance and ingest flags between the groups below stay on
+    // `Cli` itself because ravel-bench's `mcp_walk_expiry` reads them by name.
+    /// Disables the per-(tenant, signal) background catalog fold task, which
+    /// runs in `--mode maintain` and `--mode all` and nowhere else. The other
+    /// two modes refuse this flag at startup rather than ignore it.
+    /// Folding is a pure optimization
+    /// for query resolve cost; disabling it never changes query results, only
+    /// their cost (ADR-0020).
+    #[arg(long)]
+    pub disable_fold: bool,
+
+    /// How often each tenant's fold task wakes up to check for newly sealed
+    /// hours, in seconds. Read only in the modes that run that task, and
+    /// refused at startup in the two that do not. Zero is refused at startup.
+    #[arg(long, default_value_t = 300)]
+    pub fold_interval_secs: u64,
+
+    /// Builds per-part key-index leaves (ADR-2707 decision 4) in every fold
+    /// this process runs, scheduled and on-demand. Off by default, kept off
+    /// by ADR-3692's Stage 1 amendment because an advancing fold's passes
+    /// and rewritten leaf bytes grow with the tail; the spans `trace_id` lookup reads
+    /// the leaves where they exist (tier 2). When on, every part a fold
+    /// re-encodes has each new entry's KEY_IDX section read by ranged GET, up
+    /// to three GETs per entry; the tail part, re-encoded on every fold that
+    /// advances the watermark, carries the entries its previous leaves cover
+    /// by one GET per leaf instead, and reads again each entry those leaves
+    /// left uncovered. Refused in `--mode gateway`, which runs no fold.
+    #[arg(long)]
+    pub fold_key_index_leaves: bool,
+
+    /// With `--fold-key-index-leaves`, the most (entry, key8) pairs, read and
+    /// carried from the previous tail's leaves, the key-index leaf build
+    /// holds for one part at a time (ADR-3692 decision 5). Each field the
+    /// build indexes gets a share, max(1, N / fields). A field over its
+    /// share is built in passes over disjoint key8 ranges, each pass holding the
+    /// whole key8s that fit, re-reading the sections it needs and closing
+    /// its leaf slices before the next; one key8 is never split, so one over
+    /// the share is held whole. A pass holds at most max(share, largest key8
+    /// run) + 1 pairs per field, pinned by the catalog test
+    /// every_pass_holds_at_most_its_share_open_slice_included; about 88 B a
+    /// one-block pair is an upper-bound estimate. The leaves equal a build
+    /// from scratch at the same budget. At least 1. Refused without
+    /// `--fold-key-index-leaves` and in `--mode gateway`, which runs no fold.
+    #[arg(long,
+          default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    pub fold_key_index_build_max_pairs: u64,
+
+    /// How often each tenant's maintenance task (`--mode maintain`) wakes up to
+    /// run retention, compaction, and the sweeper over every shard, in seconds.
+    /// Zero is refused at startup.
+    #[arg(long, default_value_t = 300)]
+    pub maintain_interval_secs: u64,
+
+    /// Bounded intra-process unit concurrency for the maintenance supervisor
+    /// (`--mode maintain`): the maximum number of owned `(signal, shard)` units
+    /// maintained at once within a tenant's tick, replacing the pre-ADR-0065
+    /// strictly-sequential per-shard walk so one pathological unit cannot starve
+    /// the rest of this process's ownership (ADR-0065 decision 2's stuck-owner
+    /// mitigation). Clamped to at least 1.
+    #[arg(long, default_value_t = 4)]
+    pub maintain_unit_concurrency: usize,
+
+    /// Consecutive failed ticks an owned `(tenant, signal, shard)` unit must
+    /// accrue, with no intervening success, before it counts toward
+    /// `ravel_maintain_units_stalled` (ADR-0065 decision 2's stuck-owner
+    /// mitigation). A single success resets a unit's counter to zero.
+    #[arg(long, default_value_t = 3)]
+    pub maintain_stalled_after_intervals: u32,
+
+    #[command(flatten)]
+    pub maintenance: MaintenanceArgs,
+
+    #[command(flatten)]
+    pub retention: RetentionArgs,
+
+    #[command(flatten)]
+    pub columns: ColumnArgs,
+
+    #[command(flatten)]
+    pub alerting: AlertingArgs,
+
+    #[command(flatten)]
+    pub auth: AuthArgs,
+
+    #[command(flatten)]
+    pub limits: LimitsArgs,
+
+    #[command(flatten)]
+    pub sql: SqlArgs,
+
+    #[command(flatten)]
+    pub query: QueryArgs,
+
+    /// The process-wide ceiling on strict write requests between admission
+    /// and their durability acknowledgement, summed across metrics, logs,
+    /// traces and Remote Write, every listener and every transport.
+    /// On OTLP HTTP, OTLP gRPC and Remote Write a strict request takes a
+    /// slot at its request head, after the in-flight permit and the
+    /// credential check and before its body is read, and holds it through
+    /// the body read, the decode and the ack wait. It returns the slot when
+    /// its acknowledgement resolves, its ack deadline elapses, or the request
+    /// ends without a write. An OTAP batch takes its slot after decode, when
+    /// it is submitted.
+    /// Over the limit, the request is refused before it is buffered and holds
+    /// no buffer byte charge: HTTP gets 429 with `Retry-After`, gRPC gets
+    /// `RESOURCE_EXHAUSTED`. Every Remote Write is strict; buffered OTLP
+    /// writes never take a slot.
+    /// Because a slot is held while the body is still being read or decoded,
+    /// a limit below `--max-inflight-ingest-requests`, or any limit while
+    /// that ceiling is `0`, also bounds strict requests still in that phase,
+    /// and strict writes can be shed while fewer acknowledgements than the
+    /// limit are pending. `0` disables the limit; a value above the tokio
+    /// semaphore's maximum permit count is refused at startup.
+    #[arg(
+        long = "max-pending-strict-acks",
+        env = "RAVEL_MAX_PENDING_STRICT_ACKS",
+        default_value_t = 8192
+    )]
+    pub max_pending_strict_acks: u64,
+
+    /// How many of a shard's `--max-inflight-flushes` permits one tenant's
+    /// flushes may hold or wait on at once, for all three ingest pipelines
+    /// (ADR-2708 D3). Unset resolves to `max(1, --max-inflight-flushes - 1)`,
+    /// so one stalled tenant leaves at least one permit free for the shard's
+    /// other tenants whenever there is more than one. A trigger from a tenant
+    /// at its share is deferred and counted on
+    /// `ravel_ingest_flush_trigger_deferred_total`; its buffer keeps merging
+    /// until a slot frees, the memory backstop crosses, or its object
+    /// estimate reaches `--flush-object-backstop-multiple` times the flush
+    /// target, which fire regardless. `0` is
+    /// rejected by [`Cli::validate`] (every trigger would defer), and so is a
+    /// value above `--max-inflight-flushes`, which a tenant could never use.
+    #[arg(
+        long = "max-inflight-flushes-per-tenant",
+        env = "RAVEL_MAX_INFLIGHT_FLUSHES_PER_TENANT"
+    )]
+    pub max_inflight_flushes_per_tenant: Option<usize>,
+
+    /// How many flush targets (`target_bytes`, 8 MiB, not a flag) of estimated
+    /// object a deferred buffer may hold before the object backstop exempts it
+    /// from the per-tenant share
+    /// (ADR-2708 D3, configurable since issue #3662,
+    /// docs/adrs/2708-due-diligence-p1-fixes.md's 2026-11-02 amendment): once
+    /// a tenant at its share's deferred buffer reaches this many multiples of
+    /// the flush target, its trigger fires regardless of the share, the same
+    /// exemption the memory backstop already gets. Matches
+    /// [`ravel_ingest::IngestConfig::flush_object_backstop_multiple`]'s own
+    /// default of 4. `0` is rejected by [`Cli::validate`]: it would fire the
+    /// backstop on every buffer regardless of size, defeating the per-tenant
+    /// share entirely.
+    #[arg(
+        long = "flush-object-backstop-multiple",
+        env = "RAVEL_FLUSH_OBJECT_BACKSTOP_MULTIPLE",
+        default_value_t = 4
+    )]
+    pub flush_object_backstop_multiple: usize,
+
+    /// Enables the adaptive flush-delay corridor for the metrics ingest
+    /// pipeline (ADR-0067 decision 3): instead of always
+    /// flushing a tenant's buffer on the fixed `--max-flush-delay` age, the
+    /// age threshold adapts within `[max_flush_delay, ceiling]`, where the
+    /// ceiling derives from the shard's observed PUT p99 RTT and the
+    /// strict-write visibility budget. Off by default
+    /// (matches [`ravel_ingest::IngestConfig::adaptive_flush_delay`]'s own
+    /// default), which keeps today's fixed-delay behavior so an operator
+    /// opts in deliberately. Applies only to the metrics ingest pipeline;
+    /// log and span shard actors are unaffected.
+    #[arg(long = "adaptive-flush-delay")]
+    pub adaptive_flush_delay: bool,
+
+    /// When a strict write's flush opens, process-wide (ADR-2793 decision
+    /// 1). `aged` (the default) flushes on the `--max-flush-delay` age
+    /// threshold or the size trigger, whichever comes first. `arrival`
+    /// opens the flush as soon as the write is buffered, or as soon as the
+    /// tenant's in-flight flush on that shard completes, which cuts strict
+    /// write latency at the cost of more object-store PUTs. The
+    /// acknowledgement contract is the same under both. On OTLP HTTP, OTLP
+    /// gRPC and OTAP, the `x-ravel-ingest-mode` header values
+    /// `strict-arrival` and `strict-aged` override this flag for one
+    /// request (on OTAP, for one stream); `strict`, an absent header, and an unknown value use it, and
+    /// `buffered` is unaffected. Prometheus Remote Write reads no header
+    /// and always uses this flag.
+    #[arg(
+        long = "strict-flush-policy",
+        value_enum,
+        env = "RAVEL_STRICT_FLUSH_POLICY",
+        default_value_t = StrictFlushPolicy::Aged
+    )]
+    pub strict_flush_policy: StrictFlushPolicy,
+
+    #[command(flatten)]
+    pub ingest: IngestArgs,
+
+    #[command(flatten)]
+    pub mcp_server: McpArgs,
+
+    #[command(flatten)]
+    pub agents_runtime: AgentsArgs,
+
+    #[command(flatten)]
+    pub otap_ingest: OtapArgs,
+
+    #[command(flatten)]
+    pub cache: CacheArgs,
+
+    #[command(flatten)]
+    pub gates: LoadGateArgs,
+
+    #[command(flatten)]
+    pub tenant_hash: TenantHashArgs,
+
+    #[command(flatten)]
+    pub gc: GcArgs,
+
+    #[command(flatten)]
+    pub lifecycle: LifecycleArgs,
+
+    #[command(flatten)]
+    pub distrib: DistribArgs,
+
+    #[command(flatten)]
+    pub federation: FederationArgs,
+
+    #[command(flatten)]
+    pub store_scheduler: StoreSchedulerArgs,
+}
+
+/// Static tenant credentials and the tenants this process maintains.
+#[derive(Debug, clap::Args)]
+pub struct TenancyArgs {
     /// Repeatable `token=tenant` pair for the static bearer map. The tenant
     /// may end in `;` and a comma-separated capability list drawn from `ddl`
     /// (tenant-scoped DDL), `ipcrypt` (the IPCrypt SQL functions), `agents`,
@@ -1053,7 +1305,11 @@ pub struct Cli {
     /// OTLP gRPC, and Flight SQL), not just HTTP.
     #[arg(long)]
     pub dev_insecure_tenant_header: bool,
+}
 
+/// Startup refusals that check the bucket and the on-object formats.
+#[derive(Debug, clap::Args)]
+pub struct StartupCheckArgs {
     /// Gate startup on the ADR-0072 decision 3 bucket-protection contract
     /// (docs/object-store-contract.md "Required bucket configuration"). On
     /// `--store s3` the check reads the bucket's versioning, lifecycle and
@@ -1117,7 +1373,11 @@ pub struct Cli {
         env = "RAVEL_FORMAT_WINDOW_CHECK_TIMEOUT"
     )]
     pub format_window_check_timeout: Duration,
+}
 
+/// The query-audit pipeline (ADR-0062).
+#[derive(Debug, clap::Args)]
+pub struct AuditArgs {
     /// Whether the query-audit pipeline runs, and its failure posture
     /// (ADR-0062 decision 2b and its opt-in amendment): `off` (default)
     /// installs no query-audit pipeline and writes no query-audit record;
@@ -1180,7 +1440,11 @@ pub struct Cli {
         env = "RAVEL_AUDIT_MAX_AGE"
     )]
     pub audit_max_age: Option<String>,
+}
 
+/// The GCS and S3 backends behind `--store`.
+#[derive(Debug, clap::Args)]
+pub struct ObjectStoreArgs {
     /// The Google Cloud Storage bucket `--store gcs` keeps every object in
     /// (ADR-3456 decision D5). Required under `--store gcs` and refused under
     /// any other store. Credentials are Application Default Credentials only
@@ -1308,7 +1572,11 @@ pub struct Cli {
     /// its default key, set outside Ravel (ADR-3456 D6).
     #[arg(long, env = "RAVEL_S3_KMS_KEY")]
     pub s3_kms_key: Option<String>,
+}
 
+/// Per-tenant configuration files: KMS routing, IPCrypt and Parquet profiles.
+#[derive(Debug, clap::Args)]
+pub struct TenantConfigArgs {
     /// Path to a TOML per-tenant SSE-KMS file (ADR-0062 decision 1,
     /// ADR-0072 decision 2): a `[tenants]` table mapping tenant name to KMS
     /// key ARN. Requires `--store s3` (`KmsRoutingStore`'s per-tenant
@@ -1358,53 +1626,12 @@ pub struct Cli {
         value_name = "PATH"
     )]
     pub parquet_profiles: Option<PathBuf>,
+}
 
-    /// Disables the per-(tenant, signal) background catalog fold task, which
-    /// runs in `--mode maintain` and `--mode all` and nowhere else. The other
-    /// two modes refuse this flag at startup rather than ignore it.
-    /// Folding is a pure optimization
-    /// for query resolve cost; disabling it never changes query results, only
-    /// their cost (ADR-0020).
-    #[arg(long)]
-    pub disable_fold: bool,
-
-    /// How often each tenant's fold task wakes up to check for newly sealed
-    /// hours, in seconds. Read only in the modes that run that task, and
-    /// refused at startup in the two that do not. Zero is refused at startup.
-    #[arg(long, default_value_t = 300)]
-    pub fold_interval_secs: u64,
-
-    /// Builds per-part key-index leaves (ADR-2707 decision 4) in every fold
-    /// this process runs, scheduled and on-demand. Off by default, kept off
-    /// by ADR-3692's Stage 1 amendment because an advancing fold's passes
-    /// and rewritten leaf bytes grow with the tail; the spans `trace_id` lookup reads
-    /// the leaves where they exist (tier 2). When on, every part a fold
-    /// re-encodes has each new entry's KEY_IDX section read by ranged GET, up
-    /// to three GETs per entry; the tail part, re-encoded on every fold that
-    /// advances the watermark, carries the entries its previous leaves cover
-    /// by one GET per leaf instead, and reads again each entry those leaves
-    /// left uncovered. Refused in `--mode gateway`, which runs no fold.
-    #[arg(long)]
-    pub fold_key_index_leaves: bool,
-
-    /// With `--fold-key-index-leaves`, the most (entry, key8) pairs, read and
-    /// carried from the previous tail's leaves, the key-index leaf build
-    /// holds for one part at a time (ADR-3692 decision 5). Each field the
-    /// build indexes gets a share, max(1, N / fields). A field over its
-    /// share is built in passes over disjoint key8 ranges, each pass holding the
-    /// whole key8s that fit, re-reading the sections it needs and closing
-    /// its leaf slices before the next; one key8 is never split, so one over
-    /// the share is held whole. A pass holds at most max(share, largest key8
-    /// run) + 1 pairs per field, pinned by the catalog test
-    /// every_pass_holds_at_most_its_share_open_slice_included; about 88 B a
-    /// one-block pair is an upper-bound estimate. The leaves equal a build
-    /// from scratch at the same budget. At least 1. Refused without
-    /// `--fold-key-index-leaves` and in `--mode gateway`, which runs no fold.
-    #[arg(long,
-          default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
-          value_parser = clap::value_parser!(u64).range(1..))]
-    pub fold_key_index_build_max_pairs: u64,
-
+/// The fold and the maintenance loop (`--mode maintain` and `--mode all`),
+/// apart from the fold and maintenance flags kept on [`Cli`] itself.
+#[derive(Debug, clap::Args)]
+pub struct MaintenanceArgs {
     /// With `--fold-key-index-leaves`, every fold this process runs,
     /// scheduled and on-demand, also builds the metrics `label_value` leaf
     /// from each metrics object's LABEL_DICT (ADR-3694 decision 2). A PromQL
@@ -1430,28 +1657,6 @@ pub struct Cli {
     /// `--fold-interval-secs`'s default. Zero is refused at startup.
     #[arg(long, value_name = "SECS")]
     pub fold_lag_interval_secs: Option<u64>,
-
-    /// How often each tenant's maintenance task (`--mode maintain`) wakes up to
-    /// run retention, compaction, and the sweeper over every shard, in seconds.
-    /// Zero is refused at startup.
-    #[arg(long, default_value_t = 300)]
-    pub maintain_interval_secs: u64,
-
-    /// Bounded intra-process unit concurrency for the maintenance supervisor
-    /// (`--mode maintain`): the maximum number of owned `(signal, shard)` units
-    /// maintained at once within a tenant's tick, replacing the pre-ADR-0065
-    /// strictly-sequential per-shard walk so one pathological unit cannot starve
-    /// the rest of this process's ownership (ADR-0065 decision 2's stuck-owner
-    /// mitigation). Clamped to at least 1.
-    #[arg(long, default_value_t = 4)]
-    pub maintain_unit_concurrency: usize,
-
-    /// Consecutive failed ticks an owned `(tenant, signal, shard)` unit must
-    /// accrue, with no intervening success, before it counts toward
-    /// `ravel_maintain_units_stalled` (ADR-0065 decision 2's stuck-owner
-    /// mitigation). A single success resets a unit's counter to zero.
-    #[arg(long, default_value_t = 3)]
-    pub maintain_stalled_after_intervals: u32,
 
     /// Slow safety-net re-verify cadence for the maintenance loop's interior
     /// zone (ADR-0065 decision 3), as a humantime duration (e.g. `6h`). A
@@ -1575,7 +1780,12 @@ pub struct Cli {
     /// migrate` and the re-encodes `migrate` runs always refuse below a floor.
     #[arg(long = "write-below-format-floor")]
     pub write_below_format_floor: bool,
+}
 
+/// Retention windows: the defaults, per-tenant overrides, and the alert and
+/// audit trails.
+#[derive(Debug, clap::Args)]
+pub struct RetentionArgs {
     /// Age past which the maintenance loop deletes alert transition records,
     /// as a humantime duration (e.g. `90d`), ADR-1688 decision 5. Each alert
     /// identity's current-state record is kept whatever its age. A tenant
@@ -1624,7 +1834,12 @@ pub struct Cli {
     /// existing duration-string convention in this crate.
     #[arg(long = "retention-tenant", value_name = "TENANT=DURATION")]
     pub retention_tenants: Vec<String>,
+}
 
+/// Indexed fields and typed attribute columns, the defaults and per-tenant
+/// overrides.
+#[derive(Debug, clap::Args)]
+pub struct ColumnArgs {
     /// Default POSTINGS indexed-field list (ADR-0049 decision 3),
     /// as a repeatable `--indexed-field FIELD`. These are the attribute names
     /// the log writer builds an exact block-level index over, so an equality or
@@ -1669,7 +1884,11 @@ pub struct Cli {
     /// how `--indexed-field-tenant` overrides `--indexed-field`).
     #[arg(long = "typed-attr-column-tenant", value_name = "TENANT:KEY:TYPE")]
     pub typed_attr_column_tenants: Vec<String>,
+}
 
+/// Alert rule evaluation and its webhook and Alertmanager sinks.
+#[derive(Debug, clap::Args)]
+pub struct AlertingArgs {
     /// Path to the JSON alert-rules file (ADR-0043 decision 2). Alert
     /// evaluation is off unless this names a file with at least one rule. A
     /// file rather than a repeatable flag because a rule carries free-form
@@ -1717,7 +1936,11 @@ pub struct Cli {
     /// applies above the scan.
     #[arg(long, value_name = "DURATION", default_value = "5m")]
     pub alert_sql_lookback: String,
+}
 
+/// OIDC bearer authentication and the mTLS listener.
+#[derive(Debug, clap::Args)]
+pub struct AuthArgs {
     /// OIDC issuer URL (the exact `iss` every JWT must carry). Setting this and
     /// `--oidc-jwks-url` enables the OIDC tenant resolver (ADR-0042 decision 6).
     /// Both must be set together.
@@ -1872,7 +2095,11 @@ pub struct Cli {
     /// deliberately.
     #[arg(long = "mtls-trust-forwarded-header")]
     pub mtls_trust_forwarded_header: bool,
+}
 
+/// Per-tenant limits, query admission and the per-query S3 request budget.
+#[derive(Debug, clap::Args)]
+pub struct LimitsArgs {
     /// Path to a TOML admission-limits file (ADR-0051 section 3): a
     /// `[defaults]` table plus repeatable `[tenants.<id>]` override tables,
     /// deserialized into `ravel_ingest::AdmissionLimits`. Absent
@@ -1945,7 +2172,11 @@ pub struct Cli {
     /// verbatim. `0` is rejected: it would reject every query.
     #[arg(long = "max-s3-requests", value_name = "COUNT")]
     pub max_s3_requests: Option<u64>,
+}
 
+/// The SQL engine's memory pools, aggregation strategy and spill.
+#[derive(Debug, clap::Args)]
+pub struct SqlArgs {
     /// Per-query ceiling, in bytes, on the SQL DataFusion memory pool
     /// (ADR-0088), threaded into `ravel_sql::SqlConfig::max_query_bytes`.
     /// Governs a single SQL query's intermediate `RecordBatch` footprint; a
@@ -2079,12 +2310,14 @@ pub struct Cli {
     #[arg(long = "sql-spill", value_enum, default_value = "auto")]
     pub sql_spill: SqlSpillArg,
 
-    // A struct of its own so its `Arg` is built in a separate frame: in an
-    // unoptimized build every flag adds about 8 KB to `Cli::augment_args`'s
-    // frame, which already takes about 1.5 MiB of a 2 MiB test thread stack.
     #[command(flatten)]
     pub sql_spill_merge: SqlSpillMergeArgs,
+}
 
+/// The read path: logs fetch policy, request fan-out and per-query series,
+/// sample and segment limits.
+#[derive(Debug, clap::Args)]
+pub struct QueryArgs {
     /// Object size above which a logs scan reads only the pruning-relevant
     /// blocks of an RLOG object (a suffix probe plus coalesced block-range GETs)
     /// instead of one whole-object GET (ADR-0107), threaded into
@@ -2341,7 +2574,12 @@ pub struct Cli {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
     )]
     pub max_samples: Option<usize>,
+}
 
+/// Ingest admission, the buffer byte budget and the flush cadence and
+/// concurrency, apart from the ingest flags kept on [`Cli`] itself.
+#[derive(Debug, clap::Args)]
+pub struct IngestArgs {
     /// The process-wide in-flight ingest-request ceiling: the
     /// maximum number of OTLP metrics/logs/traces and Remote Write requests
     /// this process admits at once, across every listener (public and mTLS)
@@ -2372,33 +2610,6 @@ pub struct Cli {
     /// `0` disables the limit.
     #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]
     pub max_inflight_ingest_requests: u64,
-
-    /// The process-wide ceiling on strict write requests between admission
-    /// and their durability acknowledgement, summed across metrics, logs,
-    /// traces and Remote Write, every listener and every transport.
-    /// On OTLP HTTP, OTLP gRPC and Remote Write a strict request takes a
-    /// slot at its request head, after the in-flight permit and the
-    /// credential check and before its body is read, and holds it through
-    /// the body read, the decode and the ack wait. It returns the slot when
-    /// its acknowledgement resolves, its ack deadline elapses, or the request
-    /// ends without a write. An OTAP batch takes its slot after decode, when
-    /// it is submitted.
-    /// Over the limit, the request is refused before it is buffered and holds
-    /// no buffer byte charge: HTTP gets 429 with `Retry-After`, gRPC gets
-    /// `RESOURCE_EXHAUSTED`. Every Remote Write is strict; buffered OTLP
-    /// writes never take a slot.
-    /// Because a slot is held while the body is still being read or decoded,
-    /// a limit below `--max-inflight-ingest-requests`, or any limit while
-    /// that ceiling is `0`, also bounds strict requests still in that phase,
-    /// and strict writes can be shed while fewer acknowledgements than the
-    /// limit are pending. `0` disables the limit; a value above the tokio
-    /// semaphore's maximum permit count is refused at startup.
-    #[arg(
-        long = "max-pending-strict-acks",
-        env = "RAVEL_MAX_PENDING_STRICT_ACKS",
-        default_value_t = 8192
-    )]
-    pub max_pending_strict_acks: u64,
 
     /// The process-wide ingest buffer byte budget (ADR-0069 decision 1,
     /// amended by issues #1297 and #1419): a ceiling on the sum of estimated
@@ -2542,43 +2753,6 @@ pub struct Cli {
     #[arg(long = "max-inflight-flushes", default_value_t = 8)]
     pub max_inflight_flushes: u32,
 
-    /// How many of a shard's `--max-inflight-flushes` permits one tenant's
-    /// flushes may hold or wait on at once, for all three ingest pipelines
-    /// (ADR-2708 D3). Unset resolves to `max(1, --max-inflight-flushes - 1)`,
-    /// so one stalled tenant leaves at least one permit free for the shard's
-    /// other tenants whenever there is more than one. A trigger from a tenant
-    /// at its share is deferred and counted on
-    /// `ravel_ingest_flush_trigger_deferred_total`; its buffer keeps merging
-    /// until a slot frees, the memory backstop crosses, or its object
-    /// estimate reaches `--flush-object-backstop-multiple` times the flush
-    /// target, which fire regardless. `0` is
-    /// rejected by [`Cli::validate`] (every trigger would defer), and so is a
-    /// value above `--max-inflight-flushes`, which a tenant could never use.
-    #[arg(
-        long = "max-inflight-flushes-per-tenant",
-        env = "RAVEL_MAX_INFLIGHT_FLUSHES_PER_TENANT"
-    )]
-    pub max_inflight_flushes_per_tenant: Option<usize>,
-
-    /// How many flush targets (`target_bytes`, 8 MiB, not a flag) of estimated
-    /// object a deferred buffer may hold before the object backstop exempts it
-    /// from the per-tenant share
-    /// (ADR-2708 D3, configurable since issue #3662,
-    /// docs/adrs/2708-due-diligence-p1-fixes.md's 2026-11-02 amendment): once
-    /// a tenant at its share's deferred buffer reaches this many multiples of
-    /// the flush target, its trigger fires regardless of the share, the same
-    /// exemption the memory backstop already gets. Matches
-    /// [`ravel_ingest::IngestConfig::flush_object_backstop_multiple`]'s own
-    /// default of 4. `0` is rejected by [`Cli::validate`]: it would fire the
-    /// backstop on every buffer regardless of size, defeating the per-tenant
-    /// share entirely.
-    #[arg(
-        long = "flush-object-backstop-multiple",
-        env = "RAVEL_FLUSH_OBJECT_BACKSTOP_MULTIPLE",
-        default_value_t = 4
-    )]
-    pub flush_object_backstop_multiple: usize,
-
     /// Per-shard bound on flush tasks spawned and not yet reaped, for all
     /// three ingest pipelines (issue #1740). ADR-1642 moved the
     /// `--max-inflight-flushes` permit acquisition inside the spawned task so
@@ -2664,39 +2838,6 @@ pub struct Cli {
         default_value_t = 8
     )]
     pub max_queued_flushes: u32,
-
-    /// Enables the adaptive flush-delay corridor for the metrics ingest
-    /// pipeline (ADR-0067 decision 3): instead of always
-    /// flushing a tenant's buffer on the fixed `--max-flush-delay` age, the
-    /// age threshold adapts within `[max_flush_delay, ceiling]`, where the
-    /// ceiling derives from the shard's observed PUT p99 RTT and the
-    /// strict-write visibility budget. Off by default
-    /// (matches [`ravel_ingest::IngestConfig::adaptive_flush_delay`]'s own
-    /// default), which keeps today's fixed-delay behavior so an operator
-    /// opts in deliberately. Applies only to the metrics ingest pipeline;
-    /// log and span shard actors are unaffected.
-    #[arg(long = "adaptive-flush-delay")]
-    pub adaptive_flush_delay: bool,
-
-    /// When a strict write's flush opens, process-wide (ADR-2793 decision
-    /// 1). `aged` (the default) flushes on the `--max-flush-delay` age
-    /// threshold or the size trigger, whichever comes first. `arrival`
-    /// opens the flush as soon as the write is buffered, or as soon as the
-    /// tenant's in-flight flush on that shard completes, which cuts strict
-    /// write latency at the cost of more object-store PUTs. The
-    /// acknowledgement contract is the same under both. On OTLP HTTP, OTLP
-    /// gRPC and OTAP, the `x-ravel-ingest-mode` header values
-    /// `strict-arrival` and `strict-aged` override this flag for one
-    /// request (on OTAP, for one stream); `strict`, an absent header, and an unknown value use it, and
-    /// `buffered` is unaffected. Prometheus Remote Write reads no header
-    /// and always uses this flag.
-    #[arg(
-        long = "strict-flush-policy",
-        value_enum,
-        env = "RAVEL_STRICT_FLUSH_POLICY",
-        default_value_t = StrictFlushPolicy::Aged
-    )]
-    pub strict_flush_policy: StrictFlushPolicy,
 
     /// Fast-tier flush age threshold, shared by all three ingest pipelines
     /// (ADR-0076 decision 4), as a humantime duration (e.g. `2s`). Applied
@@ -2799,7 +2940,11 @@ pub struct Cli {
     /// they did before ADR-0069).
     #[arg(long = "idle-tenant-state-ttl", value_name = "DURATION")]
     pub idle_tenant_state_ttl: Option<String>,
+}
 
+/// The MCP endpoint.
+#[derive(Debug, clap::Args)]
+pub struct McpArgs {
     /// Serve the native MCP adapter at `POST /mcp` on the query router
     /// (ADR-1374 decision 9). Off by default, and meaningful only in a build
     /// with the `mcp` cargo feature: without the feature the route is never
@@ -2838,7 +2983,11 @@ pub struct Cli {
         default_value_t = DEFAULT_MCP_MAX_BODY_BYTES
     )]
     pub mcp_max_body_bytes: u64,
+}
 
+/// The Ravel Agents runtime and its projection.
+#[derive(Debug, clap::Args)]
+pub struct AgentsArgs {
     /// Serve the Ravel Agents API under `/api/v1/agents/` (ADR-3331 decision
     /// 9). Off by default. Declared in every build, but a build without the
     /// `agents` cargo feature refuses it at startup rather than ignoring it.
@@ -2971,7 +3120,11 @@ pub struct Cli {
     /// are redacted to a hash and a size by default. Repeatable.
     #[arg(long = "agents-projection-payload-tenant", value_name = "TENANT")]
     pub agents_projection_payload_tenant: Vec<String>,
+}
 
+/// OTAP (OTel Arrow) ingest.
+#[derive(Debug, clap::Args)]
+pub struct OtapArgs {
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
     /// stack; this flag is the runtime opt-in that decides whether a given
@@ -3001,7 +3154,11 @@ pub struct Cli {
         value_parser = parse_otap_max_decoded_batch_bytes
     )]
     pub otap_max_decoded_batch_bytes: u64,
+}
 
+/// The process memory budget and the read caches it is split into.
+#[derive(Debug, clap::Args)]
+pub struct CacheArgs {
     /// Explicit override for the process-wide memory budget
     /// (`memory_budget_bytes`, ADR-1170, amended 2026-10-03 by issue #2367)
     /// that `--cache-max-bytes` and `--catalog-cache-max-bytes` derive their
@@ -3239,6 +3396,32 @@ pub struct Cli {
     #[arg(long = "catalog-resolve-concurrency", value_name = "COUNT")]
     pub catalog_resolve_concurrency: Option<usize>,
 
+    /// Disables every ADR-0046 read cache in the process entirely: the query
+    /// fetcher cache (`store::build_cache`) and the catalog's byte cache
+    /// (`query::build_catalog`) both, not just the fetcher cache.
+    /// With this set, no cache of either kind is constructed, so query results
+    /// are byte-for-byte identical to a build with no read-cache wiring at all
+    /// and the process holds no read-cache memory. This is the flag for a
+    /// memory-constrained container.
+    ///
+    /// The catalog's per-tenant commit-record and compaction-record caches are
+    /// outside its scope: they are per-tenant bounds on decoded records, not
+    /// ADR-0046 read caches, and turning them off would put every resolve back
+    /// on a per-record GET. The flag does hold them to
+    /// `ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT` instead of the
+    /// derived capacity (`query::build_catalog`), which is the lowest capacity
+    /// short of disabling the resolve path's record cache entirely: 10,000
+    /// entries and a 9 MB byte budget in each of the two caches, about 18 MB
+    /// per actively-queried tenant. It cannot be combined with
+    /// `--catalog-record-cache-max-bytes-per-tenant`, the flag that raises the
+    /// record caches' per-tenant budget above its 45 MB default.
+    #[arg(long)]
+    pub disable_cache: bool,
+}
+
+/// The read and write CPU gates, the ingest head hold and the memory gate.
+#[derive(Debug, clap::Args)]
+pub struct LoadGateArgs {
     /// Jobs the read CPU gate runs at once (ADR-1702 decision 3): decodes
     /// above the gate's inline floor, each on a blocking-pool thread holding
     /// one permit. That covers the catalog's snapshot part, postings and
@@ -3305,28 +3488,6 @@ pub struct Cli {
         value_parser = parse_ingest_hold_max_wait
     )]
     pub ingest_hold_max_wait: Duration,
-
-    /// Disables every ADR-0046 read cache in the process entirely: the query
-    /// fetcher cache (`store::build_cache`) and the catalog's byte cache
-    /// (`query::build_catalog`) both, not just the fetcher cache.
-    /// With this set, no cache of either kind is constructed, so query results
-    /// are byte-for-byte identical to a build with no read-cache wiring at all
-    /// and the process holds no read-cache memory. This is the flag for a
-    /// memory-constrained container.
-    ///
-    /// The catalog's per-tenant commit-record and compaction-record caches are
-    /// outside its scope: they are per-tenant bounds on decoded records, not
-    /// ADR-0046 read caches, and turning them off would put every resolve back
-    /// on a per-record GET. The flag does hold them to
-    /// `ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT` instead of the
-    /// derived capacity (`query::build_catalog`), which is the lowest capacity
-    /// short of disabling the resolve path's record cache entirely: 10,000
-    /// entries and a 9 MB byte budget in each of the two caches, about 18 MB
-    /// per actively-queried tenant. It cannot be combined with
-    /// `--catalog-record-cache-max-bytes-per-tenant`, the flag that raises the
-    /// record caches' per-tenant budget above its 45 MB default.
-    #[arg(long)]
-    pub disable_cache: bool,
 
     /// Close the memory gate once the host's available memory has been below this many bytes for --memory-gate-close-after-samples consecutive samples (64 MiB or more); default min(max(512 MiB, 2% of host memory), host memory / 8).
     ///
@@ -3429,7 +3590,11 @@ pub struct Cli {
     /// Turn the memory gate off: no sampler thread, no forced purge, and the gate never closes.
     #[arg(long)]
     pub disable_memory_gate: bool,
+}
 
+/// The keyed tenant hash.
+#[derive(Debug, clap::Args)]
+pub struct TenantHashArgs {
     /// Path to the 32-byte deployment key that keys the tenant hash
     /// (ADR-0050 section 3). A file, never an env var or inline value, so the
     /// secret never appears in a process listing. Contents are either 64 hex
@@ -3447,7 +3612,11 @@ pub struct Cli {
     /// refuses to start. Mutually exclusive with `--tenant-hash-key-file`.
     #[arg(long)]
     pub tenant_hash_unkeyed: bool,
+}
 
+/// Object garbage collection and its safety horizons.
+#[derive(Debug, clap::Args)]
+pub struct GcArgs {
     /// This process's GC protection horizon, as a humantime duration (e.g.
     /// `25h`). Maintain-mode startup requires it to EQUAL the durable
     /// `sys/gc` `protection_horizon` (must-match, ADR-0050 section 4); this
@@ -3519,7 +3688,11 @@ pub struct Cli {
     /// value safe here.
     #[arg(long, value_name = "DURATION")]
     pub gc_max_flush_lifetime: Option<String>,
+}
 
+/// Process lifecycle: the store probe, shutdown, ingest lag and trace export.
+#[derive(Debug, clap::Args)]
+pub struct LifecycleArgs {
     /// How often the background store-reachability probe GETs the fixed
     /// `sys/tenancy` object, as a humantime duration (e.g. `30s`), ADR-0050
     /// section 7 (EC7). Jittered, so replicas do not probe in lockstep. After
@@ -3570,7 +3743,12 @@ pub struct Cli {
     /// never blocking a query (ADR-0060 decisions 3 and 6).
     #[arg(long = "otlp-trace-endpoint", value_name = "URL")]
     pub otlp_trace_endpoint: Option<String>,
+}
 
+/// Distributed SQL: the fragment listener, its keys and TLS, and the
+/// distribution thresholds.
+#[derive(Debug, clap::Args)]
+pub struct DistribArgs {
     /// Opt this process into ADR-0071 distributed read fan-out.
     /// Off by default: a process with this unset resolves and fetches every
     /// query on the byte-identical local path, exactly as before this flag
@@ -3747,7 +3925,11 @@ pub struct Cli {
     /// 8 (`ravel_query::distrib::partition::DEFAULT_MAX_PARALLEL_SLICES`).
     #[arg(long = "max-parallel-slices", default_value_t = 8)]
     pub max_parallel_slices: usize,
+}
 
+/// Federation to remote clusters.
+#[derive(Debug, clap::Args)]
+pub struct FederationArgs {
     /// A remote cluster this coordinator federates a query out to (ADR-0071
     /// cross-cluster federation). Repeatable: one flag per remote. Its
     /// credential belongs to one local tenant, named by the `tenant` key; a
@@ -3817,7 +3999,11 @@ pub struct Cli {
     /// `ravel_query::distrib::DEFAULT_REMOTE_SOFT_TIMEOUT` when unset.
     #[arg(long = "remote-cluster-soft-timeout", value_name = "DURATION")]
     pub remote_cluster_soft_timeout: Option<String>,
+}
 
+/// The store request scheduler (ADR-0070).
+#[derive(Debug, clap::Args)]
+pub struct StoreSchedulerArgs {
     /// Enable the two-class object-store request scheduler (ADR-0070 decision
     /// 1). Off by default (decision 2): both the foreground and the background
     /// store handles pass straight through to the same backend, byte-for-byte
@@ -7145,7 +7331,7 @@ impl Cli {
                  flag.",
             ));
         }
-        if cli.fold_metrics_label_index && !cli.fold_key_index_leaves {
+        if cli.maintenance.fold_metrics_label_index && !cli.fold_key_index_leaves {
             return Err(Self::command().error(
                 clap::error::ErrorKind::MissingRequiredArgument,
                 "--fold-metrics-label-index needs --fold-key-index-leaves; without it the fold \
@@ -7170,7 +7356,7 @@ impl Cli {
             }
         }
         if cli.store == StoreKind::Gcs {
-            if cli.gcs_bucket.is_none() {
+            if cli.object_store.gcs_bucket.is_none() {
                 return Err(Self::command().error(
                     clap::error::ErrorKind::MissingRequiredArgument,
                     "--store gcs requires --gcs-bucket (or RAVEL_GCS_BUCKET): the Google Cloud \
@@ -7220,12 +7406,12 @@ impl Cli {
         match self.store {
             StoreKind::Memory => None,
             StoreKind::S3 => Some(ravel_object_store::conformance::s3_backend_identity(
-                self.s3_bucket.as_deref(),
-                self.s3_endpoint.as_deref(),
+                self.object_store.s3_bucket.as_deref(),
+                self.object_store.s3_endpoint.as_deref(),
             )),
             StoreKind::Gcs => Some(ravel_object_store::conformance::gcs_backend_identity(
-                self.gcs_bucket.as_deref().unwrap_or_default(),
-                self.gcs_endpoint.as_deref(),
+                self.object_store.gcs_bucket.as_deref().unwrap_or_default(),
+                self.object_store.gcs_endpoint.as_deref(),
             )),
         }
     }
@@ -7239,13 +7425,13 @@ impl Cli {
     /// 5) -- rather than each independently re-deriving it and risking the
     /// two silently drifting apart on a future `Mode` variant.
     pub fn otlp_export_config(&self) -> Option<ravel_tracing_export::OtlpExportConfig> {
-        self.otlp_trace_endpoint
-            .as_ref()
-            .map(|endpoint| ravel_tracing_export::OtlpExportConfig {
+        self.lifecycle.otlp_trace_endpoint.as_ref().map(|endpoint| {
+            ravel_tracing_export::OtlpExportConfig {
                 endpoint: endpoint.clone(),
                 service_name: "ravel-server".to_string(),
                 mode: crate::metrics::mode_name(self.mode).to_string(),
-            })
+            }
+        })
     }
 
     pub fn parse_tenant_tokens(&self) -> anyhow::Result<HashMap<String, TenantId>> {
@@ -7320,7 +7506,7 @@ impl Cli {
             Ok(())
         };
 
-        for (i, pair) in self.tenant_tokens.iter().enumerate() {
+        for (i, pair) in self.tenancy.tenant_tokens.iter().enumerate() {
             insert_pair(
                 &mut map,
                 &mut origins,
@@ -7329,7 +7515,7 @@ impl Cli {
             )?;
         }
 
-        if let Some(path) = &self.tenant_token_file {
+        if let Some(path) = &self.tenancy.tenant_token_file {
             let raw = std::fs::read_to_string(path).map_err(|e| {
                 anyhow::anyhow!("failed to read --tenant-token-file {}: {e}", path.display())
             })?;
@@ -7359,8 +7545,8 @@ impl Cli {
     /// carry. An empty name is rejected here, fail-fast at startup, the same
     /// way `parse_tenant_tokens` rejects a malformed pair.
     pub fn parse_maintain_tenants(&self) -> anyhow::Result<Vec<TenantId>> {
-        let mut tenants = Vec::with_capacity(self.maintain_tenants.len());
-        for name in &self.maintain_tenants {
+        let mut tenants = Vec::with_capacity(self.tenancy.maintain_tenants.len());
+        for name in &self.tenancy.maintain_tenants {
             if name.is_empty() {
                 anyhow::bail!("invalid --maintain-tenant '', expected a non-empty tenant name");
             }
@@ -7378,12 +7564,13 @@ impl Cli {
     /// against the running process's actual compactor and catalog config.
     pub fn parse_retention_policy(&self) -> anyhow::Result<RetentionPolicy> {
         let default = self
+            .retention
             .retention_default
             .as_deref()
             .map(parse_window_ns)
             .transpose()?;
-        let mut tenants = Vec::with_capacity(self.retention_tenants.len());
-        for pair in &self.retention_tenants {
+        let mut tenants = Vec::with_capacity(self.retention.retention_tenants.len());
+        for pair in &self.retention.retention_tenants {
             let (tenant, dur) = pair.split_once('=').ok_or_else(|| {
                 anyhow::anyhow!("invalid --retention-tenant '{pair}', expected TENANT=DURATION")
             })?;
@@ -7406,7 +7593,7 @@ impl Cli {
     /// `parse_retention_policy` defers floor validation to
     /// `RetentionConfig::from_policy`.
     pub fn parse_indexed_field_policy(&self) -> anyhow::Result<IndexedFieldPolicy> {
-        let default = if self.indexed_field_defaults.is_empty() {
+        let default = if self.columns.indexed_field_defaults.is_empty() {
             None
         } else {
             // Trim each value the same way the per-tenant list below does, so
@@ -7414,14 +7601,15 @@ impl Cli {
             // instead of a field named " service.name" (which matches
             // nothing, so it silently indexes nothing).
             Some(
-                self.indexed_field_defaults
+                self.columns
+                    .indexed_field_defaults
                     .iter()
                     .map(|f| f.trim().to_string())
                     .collect(),
             )
         };
-        let mut tenants = Vec::with_capacity(self.indexed_field_tenants.len());
-        for pair in &self.indexed_field_tenants {
+        let mut tenants = Vec::with_capacity(self.columns.indexed_field_tenants.len());
+        for pair in &self.columns.indexed_field_tenants {
             let (tenant, fields) = pair.split_once('=').ok_or_else(|| {
                 anyhow::anyhow!("invalid --indexed-field-tenant '{pair}', expected TENANT=FIELDS")
             })?;
@@ -7463,15 +7651,15 @@ impl Cli {
     /// `--typed-attr-column-tenant` flags for one tenant accumulate in flag
     /// order into that tenant's single declaration.
     pub fn parse_typed_attr_column_policy(&self) -> anyhow::Result<TypedAttrColumnPolicy> {
-        let mut default = Vec::with_capacity(self.typed_attr_columns.len());
-        for spec in &self.typed_attr_columns {
+        let mut default = Vec::with_capacity(self.columns.typed_attr_columns.len());
+        for spec in &self.columns.typed_attr_columns {
             default.push(parse_column_spec("--typed-attr-column", spec.trim())?);
         }
 
         // A Vec of (tenant, columns) rather than a map, so a tenant's
         // declaration keeps flag order and the whole policy stays ordered.
         let mut tenants: Vec<(String, Vec<ravel_catalog::DeclaredTypedColumn>)> = Vec::new();
-        for spec in &self.typed_attr_column_tenants {
+        for spec in &self.columns.typed_attr_column_tenants {
             let spec = spec.trim();
             let (tenant, rest) = spec.split_once(':').ok_or_else(|| {
                 anyhow::anyhow!(
@@ -7501,31 +7689,31 @@ impl Cli {
     /// come before the authenticated specs, both in flag order.
     pub fn parse_alert_sinks(&self) -> anyhow::Result<Vec<AlertSink>> {
         let mut sinks = Vec::with_capacity(
-            self.alert_webhook_urls.len()
-                + self.alertmanager_urls.len()
-                + self.alert_webhooks.len()
-                + self.alertmanagers.len(),
+            self.alerting.alert_webhook_urls.len()
+                + self.alerting.alertmanager_urls.len()
+                + self.alerting.alert_webhooks.len()
+                + self.alerting.alertmanagers.len(),
         );
-        for url in &self.alert_webhook_urls {
+        for url in &self.alerting.alert_webhook_urls {
             sinks.push(AlertSink::webhook(validated_sink_url(
                 "--alert-webhook-url",
                 url,
             )?));
         }
-        for spec in &self.alert_webhooks {
+        for spec in &self.alerting.alert_webhooks {
             let (url, credential) = parse_authenticated_sink("--alert-webhook", spec)?;
             sinks.push(
                 AlertSink::webhook(validated_sink_url("--alert-webhook", &url)?)
                     .with_credential(credential),
             );
         }
-        for url in &self.alertmanager_urls {
+        for url in &self.alerting.alertmanager_urls {
             sinks.push(AlertSink::alertmanager(validated_sink_url(
                 "--alertmanager-url",
                 url,
             )?));
         }
-        for spec in &self.alertmanagers {
+        for spec in &self.alerting.alertmanagers {
             let (url, credential) = parse_authenticated_sink("--alertmanager", spec)?;
             sinks.push(
                 AlertSink::alertmanager(validated_sink_url("--alertmanager", &url)?)
@@ -7543,7 +7731,10 @@ impl Cli {
     /// `--mtls-enabled`) fails startup here rather than being silently ignored,
     /// mirroring the fail-fast style of `parse_tenant_tokens`.
     pub fn parse_auth_resolvers(&self) -> anyhow::Result<AuthResolverSettings> {
-        let oidc = match (self.oidc_issuer.as_deref(), self.oidc_jwks_url.as_deref()) {
+        let oidc = match (
+            self.auth.oidc_issuer.as_deref(),
+            self.auth.oidc_jwks_url.as_deref(),
+        ) {
             (Some(issuer), Some(jwks_url)) => {
                 if issuer.is_empty() || jwks_url.is_empty() {
                     anyhow::bail!("--oidc-issuer and --oidc-jwks-url must be non-empty");
@@ -7561,7 +7752,7 @@ impl Cli {
                 // completely different application at the same IdP would be
                 // accepted. Fail fast rather than run a deployment that trusts
                 // every token the issuer ever mints.
-                if self.oidc_audiences.is_empty() {
+                if self.auth.oidc_audiences.is_empty() {
                     anyhow::bail!(
                         "OIDC is enabled but no --oidc-audience is set: without an audience \
                          any correctly-signed, unexpired token from this issuer authenticates, \
@@ -7569,18 +7760,21 @@ impl Cli {
                          --oidc-audience naming this deployment."
                     );
                 }
-                if self.oidc_audiences.iter().any(|a| a.is_empty()) {
+                if self.auth.oidc_audiences.iter().any(|a| a.is_empty()) {
                     anyhow::bail!("--oidc-audience must be non-empty");
                 }
                 Some(OidcSettings {
                     issuer: issuer.to_string(),
                     jwks_url: jwks_url.to_string(),
-                    audiences: self.oidc_audiences.clone(),
+                    audiences: self.auth.oidc_audiences.clone(),
                     tenant_claim: self
+                        .auth
                         .oidc_tenant_claim
                         .clone()
                         .unwrap_or_else(|| "tenant".to_string()),
-                    refresh_interval: Duration::from_secs(self.oidc_jwks_refresh_interval_secs),
+                    refresh_interval: Duration::from_secs(
+                        self.auth.oidc_jwks_refresh_interval_secs,
+                    ),
                 })
             }
             (None, None) => None,
@@ -7589,19 +7783,25 @@ impl Cli {
             ),
         };
 
-        if self.oidc_ddl_claim.as_deref() == Some("") {
+        if self.auth.oidc_ddl_claim.as_deref() == Some("") {
             anyhow::bail!("--oidc-ddl-claim must be non-empty");
         }
-        if self.oidc_ipcrypt_claim.as_deref() == Some("") {
+        if self.auth.oidc_ipcrypt_claim.as_deref() == Some("") {
             anyhow::bail!("--oidc-ipcrypt-claim must be non-empty");
         }
-        if self.oidc_subject_claim.as_deref() == Some("") {
+        if self.auth.oidc_subject_claim.as_deref() == Some("") {
             anyhow::bail!("--oidc-subject-claim must be non-empty");
         }
         let agents_claims = [
-            (&self.oidc_agents_claim, "--oidc-agents-claim"),
-            (&self.oidc_agents_worker_claim, "--oidc-agents-worker-claim"),
-            (&self.oidc_agents_admin_claim, "--oidc-agents-admin-claim"),
+            (&self.auth.oidc_agents_claim, "--oidc-agents-claim"),
+            (
+                &self.auth.oidc_agents_worker_claim,
+                "--oidc-agents-worker-claim",
+            ),
+            (
+                &self.auth.oidc_agents_admin_claim,
+                "--oidc-agents-admin-claim",
+            ),
         ];
         for (claim, flag) in agents_claims {
             if claim.as_deref() == Some("") {
@@ -7618,31 +7818,31 @@ impl Cli {
                     );
                 }
             }
-            if self.oidc_tenant_claim.is_some() {
+            if self.auth.oidc_tenant_claim.is_some() {
                 anyhow::bail!(
                     "--oidc-tenant-claim was set but OIDC is not enabled (set --oidc-issuer and \
                      --oidc-jwks-url)"
                 );
             }
-            if self.oidc_ddl_claim.is_some() {
+            if self.auth.oidc_ddl_claim.is_some() {
                 anyhow::bail!(
                     "--oidc-ddl-claim was set but OIDC is not enabled (set --oidc-issuer and \
                      --oidc-jwks-url)"
                 );
             }
-            if self.oidc_ipcrypt_claim.is_some() {
+            if self.auth.oidc_ipcrypt_claim.is_some() {
                 anyhow::bail!(
                     "--oidc-ipcrypt-claim was set but OIDC is not enabled (set --oidc-issuer and \
                      --oidc-jwks-url)"
                 );
             }
-            if self.oidc_subject_claim.is_some() {
+            if self.auth.oidc_subject_claim.is_some() {
                 anyhow::bail!(
                     "--oidc-subject-claim was set but OIDC is not enabled (set --oidc-issuer and \
                      --oidc-jwks-url)"
                 );
             }
-            if !self.oidc_audiences.is_empty() {
+            if !self.auth.oidc_audiences.is_empty() {
                 anyhow::bail!(
                     "--oidc-audience was set but OIDC is not enabled (set --oidc-issuer and \
                      --oidc-jwks-url)"
@@ -7650,8 +7850,9 @@ impl Cli {
             }
         }
 
-        let mtls_header = if self.mtls_enabled {
+        let mtls_header = if self.auth.mtls_enabled {
             let header = self
+                .auth
                 .mtls_header
                 .clone()
                 .unwrap_or_else(|| "x-ravel-client-cert-cn".to_string());
@@ -7660,13 +7861,13 @@ impl Cli {
             }
             Some(header)
         } else {
-            if self.mtls_header.is_some() {
+            if self.auth.mtls_header.is_some() {
                 anyhow::bail!("--mtls-header was set but --mtls-enabled was not");
             }
             None
         };
 
-        let mtls_subject_header = match (&self.mtls_subject_header, &mtls_header) {
+        let mtls_subject_header = match (&self.auth.mtls_subject_header, &mtls_header) {
             (None, _) => None,
             (Some(subject), _) if subject.is_empty() => {
                 anyhow::bail!("--mtls-subject-header must be non-empty")
@@ -7706,7 +7907,7 @@ impl Cli {
     /// when unset. Rejects a zero or unparseable duration rather than probing
     /// in a tight loop or silently doing nothing.
     pub fn parse_store_probe_interval(&self) -> anyhow::Result<Duration> {
-        match self.store_probe_interval.as_deref() {
+        match self.lifecycle.store_probe_interval.as_deref() {
             None => Ok(crate::store_probe::DEFAULT_STORE_PROBE_INTERVAL),
             Some(s) => {
                 let dur = humantime::parse_duration(s)
@@ -7731,7 +7932,7 @@ impl Cli {
     /// value would panic on a `Duration` overflow at shutdown rather than being
     /// caught at startup.
     pub fn parse_shutdown_timeout(&self) -> anyhow::Result<Duration> {
-        match self.shutdown_timeout.as_deref() {
+        match self.lifecycle.shutdown_timeout.as_deref() {
             None => Ok(crate::DEFAULT_SHUTDOWN_TIMEOUT),
             Some(s) => {
                 let dur = humantime::parse_duration(s)
@@ -7762,7 +7963,7 @@ impl Cli {
     /// admission bound and the catalog listing window; see
     /// [`crate::resolve_ingest_lag`] for how the coordinated pair is built.
     pub fn parse_max_ingest_lag(&self) -> anyhow::Result<Duration> {
-        match self.max_ingest_lag.as_deref() {
+        match self.lifecycle.max_ingest_lag.as_deref() {
             None => Ok(crate::DEFAULT_MAX_INGEST_LAG),
             Some(s) => {
                 let dur = humantime::parse_duration(s)
@@ -7785,7 +7986,7 @@ impl Cli {
     /// reconciling in a tight loop or silently doing nothing, mirroring
     /// [`Self::parse_store_probe_interval`].
     pub fn parse_admission_reconcile_interval(&self) -> anyhow::Result<Duration> {
-        match self.admission_reconcile_interval.as_deref() {
+        match self.limits.admission_reconcile_interval.as_deref() {
             None => Ok(ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL),
             Some(s) => {
                 let dur = humantime::parse_duration(s).map_err(|e| {
@@ -7807,7 +8008,7 @@ impl Cli {
     /// which says whether the mode serves queries at all; `start` spawns a
     /// pipeline only when both hold.
     pub fn query_audit_enabled(&self) -> bool {
-        self.audit_mode != AuditModeArg::Off
+        self.audit.audit_mode != AuditModeArg::Off
     }
 
     /// Resolve `--audit-mode`, `--audit-max-batch`, and `--audit-max-age` into
@@ -7823,10 +8024,10 @@ impl Cli {
     pub fn resolve_audit_pipeline_config(
         &self,
     ) -> anyhow::Result<Option<ravel_maintain::AuditPipelineConfig>> {
-        let Some(audit_mode) = self.audit_mode.mode() else {
+        let Some(audit_mode) = self.audit.audit_mode.mode() else {
             return Ok(None);
         };
-        let max_batch = match self.audit_max_batch {
+        let max_batch = match self.audit.audit_max_batch {
             None => ravel_maintain::config::DEFAULT_AUDIT_MAX_BATCH,
             Some(0) => anyhow::bail!(
                 "--audit-max-batch '0' would flush every submitted audit event as its own \
@@ -7835,7 +8036,7 @@ impl Cli {
             ),
             Some(n) => n,
         };
-        let max_age = match self.audit_max_age.as_deref() {
+        let max_age = match self.audit.audit_max_age.as_deref() {
             None => ravel_maintain::config::DEFAULT_AUDIT_MAX_AGE,
             Some(s) => {
                 let dur = humantime::parse_duration(s)
@@ -7873,8 +8074,8 @@ impl Cli {
         let raw = std::env::var(AUDIT_TOKEN_KEY_ENV).ok();
         resolve_audit_text_policy_for_mode(
             self.mode,
-            self.audit_mode,
-            self.audit_text,
+            self.audit.audit_mode,
+            self.audit.audit_text,
             raw.as_deref(),
             deployment_key,
         )
@@ -7889,7 +8090,7 @@ impl Cli {
     pub fn parse_query_concurrency_limit(
         &self,
     ) -> anyhow::Result<ravel_query::QueryConcurrencyLimit> {
-        match self.max_concurrent_queries {
+        match self.limits.max_concurrent_queries {
             None => Ok(ravel_query::QueryConcurrencyLimit::Unlimited),
             Some(0) => anyhow::bail!(
                 "--max-concurrent-queries '0' would reject every query; omit the flag for no \
@@ -7912,9 +8113,9 @@ impl Cli {
     /// so the value validated is the value enforced.
     pub fn resolve_flush_cadence(&self) -> anyhow::Result<FlushCadence> {
         let (max_flush_delay, max_flush_delay_idle, min_flush_bytes) = match (
-            self.max_flush_delay.as_deref(),
-            self.max_flush_delay_idle.as_deref(),
-            self.min_flush_bytes,
+            self.ingest.max_flush_delay.as_deref(),
+            self.ingest.max_flush_delay_idle.as_deref(),
+            self.ingest.min_flush_bytes,
         ) {
             (None, None, None) => {
                 let default = ravel_ingest::IngestConfig::default();
@@ -7964,7 +8165,7 @@ impl Cli {
     /// taken from `IngestConfig::default()`, so a `validate` rule on another
     /// field would be judged against defaults, not the operator's values.
     pub fn resolve_idle_flush_byte_floor(&self) -> anyhow::Result<usize> {
-        let floor = usize::try_from(self.idle_flush_byte_floor).unwrap_or(usize::MAX);
+        let floor = usize::try_from(self.ingest.idle_flush_byte_floor).unwrap_or(usize::MAX);
         ravel_ingest::IngestConfig {
             min_flush_bytes: self.resolve_flush_cadence()?.min_flush_bytes,
             idle_flush_byte_floor: floor,
@@ -7998,8 +8199,8 @@ impl Cli {
     /// by [`Self::validate`]; clamping a zero would invent a configuration
     /// nobody asked for.
     pub fn resolve_flush_concurrency(&self) -> FlushConcurrency {
-        let max_inflight_flushes = self.max_inflight_flushes;
-        let mut max_queued_flushes = self.max_queued_flushes;
+        let max_inflight_flushes = self.ingest.max_inflight_flushes;
+        let mut max_queued_flushes = self.ingest.max_queued_flushes;
         if max_inflight_flushes > max_queued_flushes {
             tracing::warn!(
                 max_inflight_flushes,
@@ -8023,9 +8224,9 @@ impl Cli {
     pub fn resolve_cpu_gate_permits(&self, host: HostProfile) -> CpuGatePermits {
         let derived = CpuGatePermits::derive(host.cores);
         CpuGatePermits {
-            read: self.cpu_gate_read_permits.unwrap_or(derived.read),
-            write: self.cpu_gate_write_permits.unwrap_or(derived.write),
-            write_inline_floor_bytes: self.cpu_gate_write_inline_floor_bytes,
+            read: self.gates.cpu_gate_read_permits.unwrap_or(derived.read),
+            write: self.gates.cpu_gate_write_permits.unwrap_or(derived.write),
+            write_inline_floor_bytes: self.gates.cpu_gate_write_inline_floor_bytes,
         }
     }
 
@@ -8033,8 +8234,8 @@ impl Cli {
     /// their value parsers already enforce the legal ranges.
     pub fn resolve_ingest_hold(&self) -> IngestHoldConfig {
         IngestHoldConfig {
-            queued_flushes: self.ingest_hold_queued_flushes,
-            max_wait: self.ingest_hold_max_wait,
+            queued_flushes: self.gates.ingest_hold_queued_flushes,
+            max_wait: self.gates.ingest_hold_max_wait,
         }
     }
 
@@ -8090,7 +8291,7 @@ impl Cli {
         &self,
         seal_margin: ravel_query::SealMargin,
     ) -> anyhow::Result<ravel_query::RequestLimit> {
-        Ok(match self.max_s3_requests {
+        Ok(match self.limits.max_s3_requests {
             Some(n) => ravel_query::RequestLimit::Bounded(n),
             None => ravel_query::RequestLimit::Bounded(ravel_query::derive_max_s3_requests_for(
                 self.shards,
@@ -8111,8 +8312,8 @@ impl Cli {
     pub(crate) fn store_is_loopback(&self) -> bool {
         let endpoint = match self.store {
             StoreKind::Memory => None,
-            StoreKind::S3 => self.s3_endpoint.as_deref(),
-            StoreKind::Gcs => self.gcs_endpoint.as_deref(),
+            StoreKind::S3 => self.object_store.s3_endpoint.as_deref(),
+            StoreKind::Gcs => self.object_store.gcs_endpoint.as_deref(),
         };
         endpoint.is_some_and(crate::store::is_loopback_endpoint)
     }
@@ -8131,7 +8332,7 @@ impl Cli {
     /// deployment resolves `cost-based` ([`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]),
     /// exactly as ADR-1196.
     pub fn resolve_logs_fetch_policy(&self) -> (LogsFetchPolicyArg, &'static str) {
-        match self.logs_fetch_policy {
+        match self.query.logs_fetch_policy {
             Some(policy) => (policy, LOGS_FETCH_POLICY_SOURCE_FLAG),
             None if self.store_is_loopback() => (
                 LogsFetchPolicyArg::LatencyFirst,
@@ -8152,8 +8353,8 @@ impl Cli {
     ///
     /// The four ADR-0088 budgets are taken from `resolved`, never from the raw
     /// flags: an unset flag is a host-derived value (issue #1141), and reading
-    /// `self.fetch_concurrency` here would put the compiled-in constant back
-    /// into the engine while the startup log claimed the derived one.
+    /// `self.query.fetch_concurrency` here would put the compiled-in constant
+    /// back into the engine while the startup log claimed the derived one.
     ///
     /// Fallible only for `--store-cost-profile`, which reads a file: every
     /// other field is a clap-parsed value or an already-resolved default. A
@@ -8175,35 +8376,36 @@ impl Cli {
             max_samples: resolved.max_samples,
             sql_max_query_bytes: resolved.sql_max_query_bytes,
             sql_tenant_max_bytes: resolved.sql_tenant_max_bytes,
-            sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
-            sql_bucketed_final_aggregation: self.sql_bucketed_final_aggregation,
-            sql_scan_decode_inline: self.sql_scan_decode_inline,
-            sql_cache_bulk_scan_min_bytes: self.cache_bulk_scan_min_bytes,
-            logs_block_range_threshold: self.logs_block_range_threshold,
-            logs_request_cost_bytes: self.logs_request_cost_bytes,
+            sql_parallel_final_aggregation: self.sql.sql_parallel_final_aggregation,
+            sql_bucketed_final_aggregation: self.sql.sql_bucketed_final_aggregation,
+            sql_scan_decode_inline: self.sql.sql_scan_decode_inline,
+            sql_cache_bulk_scan_min_bytes: self.cache.cache_bulk_scan_min_bytes,
+            logs_block_range_threshold: self.query.logs_block_range_threshold,
+            logs_request_cost_bytes: self.query.logs_request_cost_bytes,
             logs_fetch_policy: logs_fetch_policy.policy(),
             logs_fetch_policy_source,
             store_cost_profile: self.resolve_store_cost_profile()?,
-            logs_max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
+            logs_max_fetch_run_bytes: self.query.logs_max_fetch_run_bytes,
             column_stats_cache_max_bytes: resolved.column_stats_cache_max_bytes,
             record_cache_max_bytes_per_tenant: self
+                .cache
                 .catalog_record_cache_max_bytes_per_tenant
                 .unwrap_or(ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT),
             mcp: McpConfig {
-                enabled: self.mcp,
-                allowed_origins: self.mcp_allowed_origins.clone(),
-                max_body_bytes: self.mcp_max_body_bytes,
+                enabled: self.mcp_server.mcp,
+                allowed_origins: self.mcp_server.mcp_allowed_origins.clone(),
+                max_body_bytes: self.mcp_server.mcp_max_body_bytes,
             },
             agents: AgentsConfig {
-                enabled: self.agents,
-                activation_concurrency: self.agents_activation_concurrency,
-                poll_concurrency: self.agents_poll_concurrency,
-                memory_budget_bytes: self.agents_memory_budget,
-                max_agents: self.agents_max_agents,
-                max_mailbox: self.agents_max_mailbox,
-                max_state_bytes: self.agents_max_state_bytes,
-                max_receipts: self.agents_max_receipts,
-                max_timers: self.agents_max_timers,
+                enabled: self.agents_runtime.agents,
+                activation_concurrency: self.agents_runtime.agents_activation_concurrency,
+                poll_concurrency: self.agents_runtime.agents_poll_concurrency,
+                memory_budget_bytes: self.agents_runtime.agents_memory_budget,
+                max_agents: self.agents_runtime.agents_max_agents,
+                max_mailbox: self.agents_runtime.agents_max_mailbox,
+                max_state_bytes: self.agents_runtime.agents_max_state_bytes,
+                max_receipts: self.agents_runtime.agents_max_receipts,
+                max_timers: self.agents_runtime.agents_max_timers,
                 max_body_bytes: DEFAULT_AGENTS_MAX_BODY_BYTES,
                 lease_ms: DEFAULT_AGENTS_LEASE_MS,
                 heartbeat_grace_ms: DEFAULT_AGENTS_HEARTBEAT_GRACE_MS,
@@ -8211,16 +8413,19 @@ impl Cli {
                 max_evidence_effects: DEFAULT_AGENTS_MAX_EVIDENCE_EFFECTS,
                 clock: AgentsClock::default(),
                 projection: AgentsProjectionConfig {
-                    switch: self.agents_projection,
-                    endpoint: self.agents_projection_endpoint.clone(),
-                    backlog: self.agents_projection_backlog,
-                    payload_tenants: self.agents_projection_payload_tenant.clone(),
+                    switch: self.agents_runtime.agents_projection,
+                    endpoint: self.agents_runtime.agents_projection_endpoint.clone(),
+                    backlog: self.agents_runtime.agents_projection_backlog,
+                    payload_tenants: self.agents_runtime.agents_projection_payload_tenant.clone(),
                     ..AgentsProjectionConfig::default()
                 },
             },
-            fold_lag_interval: self.fold_lag_interval_secs.map(Duration::from_secs),
+            fold_lag_interval: self
+                .maintenance
+                .fold_lag_interval_secs
+                .map(Duration::from_secs),
             sql_spill: SqlSpillSettings {
-                off: self.sql_spill == SqlSpillArg::Off,
+                off: self.sql.sql_spill == SqlSpillArg::Off,
                 memory_budget_bytes: resolved.memory_budget_bytes,
                 read_cache_bytes: if resolved.cache_disabled {
                     0
@@ -8229,10 +8434,10 @@ impl Cli {
                         .cache_max_bytes
                         .saturating_add(resolved.catalog_cache_max_bytes)
                 },
-                merge_fan_in: self.sql_spill_merge.sql_spill_merge_fan_in,
-                merge_fan_in_passed: self.sql_spill_merge.sql_spill_merge_fan_in_passed,
+                merge_fan_in: self.sql.sql_spill_merge.sql_spill_merge_fan_in,
+                merge_fan_in_passed: self.sql.sql_spill_merge.sql_spill_merge_fan_in_passed,
             },
-            decoded_cache_max_bytes: self.decoded_cache_max_bytes,
+            decoded_cache_max_bytes: self.cache.decoded_cache_max_bytes,
         })
     }
 
@@ -8246,7 +8451,7 @@ impl Cli {
     /// the reference prices would stamp one profile into its reports while
     /// resolving its fetch policy from another.
     pub fn resolve_store_cost_profile(&self) -> anyhow::Result<StoreCostProfile> {
-        let Some(path) = self.store_cost_profile.as_deref() else {
+        let Some(path) = self.query.store_cost_profile.as_deref() else {
             return Ok(StoreCostProfile::reference());
         };
         let raw = std::fs::read_to_string(path).map_err(|e| {
@@ -8268,7 +8473,7 @@ impl Cli {
     pub fn parse_ingest_concurrency_limit(
         &self,
     ) -> anyhow::Result<crate::ingest_concurrency::IngestConcurrencyLimit> {
-        Ok(match self.max_inflight_ingest_requests {
+        Ok(match self.ingest.max_inflight_ingest_requests {
             0 => crate::ingest_concurrency::IngestConcurrencyLimit::Unlimited,
             n => crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(n),
         })
@@ -8280,7 +8485,7 @@ impl Cli {
     pub fn parse_maintain_record_keys(
         &self,
     ) -> anyhow::Result<Option<ravel_maintain::worker_set::MaintainRecordKeys>> {
-        let Some(path) = &self.maintain_key_file else {
+        let Some(path) = &self.distrib.maintain_key_file else {
             return Ok(None);
         };
         let raw = std::fs::read_to_string(path).map_err(|e| {
@@ -8301,19 +8506,19 @@ impl Cli {
     /// keeps the secret out of the process listing (mirrors
     /// `--tenant-hash-key-file`).
     pub fn parse_distrib_settings(&self) -> anyhow::Result<Option<DistribSettings>> {
-        if !self.distributed_query {
+        if !self.distrib.distributed_query {
             return Ok(None);
         }
-        let path = self
-            .fragment_key_file
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("--distributed-query requires --fragment-key-file"))?;
+        let path =
+            self.distrib.fragment_key_file.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("--distributed-query requires --fragment-key-file")
+            })?;
         let raw = std::fs::read_to_string(path).map_err(|e| {
             anyhow::anyhow!("failed to read --fragment-key-file {}: {e}", path.display())
         })?;
         let fragment_keys = parse_fragment_keys(&raw)
             .map_err(|e| anyhow::anyhow!("invalid --fragment-key-file {}: {e}", path.display()))?;
-        let sql_ticket_keys = match &self.sql_ticket_key_file {
+        let sql_ticket_keys = match &self.distrib.sql_ticket_key_file {
             Some(path) => {
                 let raw = std::fs::read_to_string(path).map_err(|e| {
                     anyhow::anyhow!(
@@ -8337,7 +8542,7 @@ impl Cli {
             // these, so a missing one here is a bug, not an operator error;
             // surface it as a typed error rather than panic (no `expect` on
             // a production path).
-            let addr = self.fragment_listener.ok_or_else(|| {
+            let addr = self.distrib.fragment_listener.ok_or_else(|| {
                 anyhow::anyhow!("--distributed-query requires --fragment-listener")
             })?;
             fn require_path<'a>(flag: &str, path: Option<&'a Path>) -> anyhow::Result<&'a Path> {
@@ -8347,7 +8552,10 @@ impl Cli {
                 std::fs::read(path)
                     .map_err(|e| anyhow::anyhow!("failed to read {flag} {}: {e}", path.display()))
             };
-            let cert_path = require_path("--fragment-tls-cert", self.fragment_tls_cert.as_deref())?;
+            let cert_path = require_path(
+                "--fragment-tls-cert",
+                self.distrib.fragment_tls_cert.as_deref(),
+            )?;
             let tls_cert_pem = read_pem("--fragment-tls-cert", cert_path)?;
             // One certificate serves both halves of the mutual handshake
             // (issue #1690): without clientAuth it serves fetches while
@@ -8355,8 +8563,12 @@ impl Cli {
             // while failing every inbound one. Refuse here rather than
             // degrade silently in one direction.
             crate::fragment_cert::ensure_mutual_auth_ekus(cert_path, &tls_cert_pem)?;
-            let key_path = require_path("--fragment-tls-key", self.fragment_tls_key.as_deref())?;
-            let ca_path = require_path("--fragment-tls-ca", self.fragment_tls_ca.as_deref())?;
+            let key_path = require_path(
+                "--fragment-tls-key",
+                self.distrib.fragment_tls_key.as_deref(),
+            )?;
+            let ca_path =
+                require_path("--fragment-tls-ca", self.distrib.fragment_tls_ca.as_deref())?;
             FragmentListenerSettings {
                 addr,
                 tls_cert_pem,
@@ -8367,12 +8579,13 @@ impl Cli {
         Ok(Some(DistribSettings {
             fragment_keys,
             sql_ticket_keys,
-            max_inflight_fragments: self.max_inflight_fragments.max(1) as usize,
-            max_inflight_federated_resolves: self.max_inflight_federated_resolves.max(1) as usize,
+            max_inflight_fragments: self.distrib.max_inflight_fragments.max(1) as usize,
+            max_inflight_federated_resolves: self.distrib.max_inflight_federated_resolves.max(1)
+                as usize,
             thresholds: ravel_query::distrib::partition::DistribThresholds {
-                min_store_bytes: self.distribute_bytes_threshold,
-                min_segments: self.distribute_segments_threshold,
-                max_parallel_slices: self.max_parallel_slices.max(1),
+                min_store_bytes: self.distrib.distribute_bytes_threshold,
+                min_segments: self.distrib.distribute_segments_threshold,
+                max_parallel_slices: self.distrib.max_parallel_slices.max(1),
             },
             fragment_listener,
             advertise_endpoint: self.parse_advertise_fragment_endpoint()?,
@@ -8384,7 +8597,8 @@ impl Cli {
     /// settings build, so a malformed value fails startup at the same point
     /// every other cross-flag invariant does.
     pub fn parse_advertise_fragment_endpoint(&self) -> anyhow::Result<Option<AdvertisedEndpoint>> {
-        self.advertise_fragment_endpoint
+        self.distrib
+            .advertise_fragment_endpoint
             .as_deref()
             .map(AdvertisedEndpoint::parse)
             .transpose()
@@ -8399,7 +8613,8 @@ impl Cli {
     /// there has to be added here too, or its wildcard bind stops being
     /// refused.
     fn advertised_listeners(&self) -> Vec<(&'static str, SocketAddr)> {
-        self.fragment_listener
+        self.distrib
+            .fragment_listener
             .map(|fragment_listener| ("--fragment-listener", fragment_listener))
             .into_iter()
             .collect()
@@ -8411,7 +8626,7 @@ impl Cli {
     /// a zero or unparseable duration: a zero timeout would treat every remote
     /// as instantly unavailable.
     pub fn parse_remote_cluster_soft_timeout(&self) -> anyhow::Result<Duration> {
-        match self.remote_cluster_soft_timeout.as_deref() {
+        match self.federation.remote_cluster_soft_timeout.as_deref() {
             None => Ok(ravel_query::distrib::DEFAULT_REMOTE_SOFT_TIMEOUT),
             Some(s) => {
                 let dur = humantime::parse_duration(s).map_err(|e| {
@@ -8454,9 +8669,9 @@ impl Cli {
     /// because there the CA bundle would be inert.
     pub fn parse_remote_clusters(&self) -> anyhow::Result<Vec<RemoteClusterConfig>> {
         let default_timeout = self.parse_remote_cluster_soft_timeout()?;
-        let mut clusters = Vec::with_capacity(self.remote_clusters.len());
+        let mut clusters = Vec::with_capacity(self.federation.remote_clusters.len());
         let mut seen_names: HashSet<String> = HashSet::new();
-        for spec in &self.remote_clusters {
+        for spec in &self.federation.remote_clusters {
             let mut name = None;
             let mut endpoint = None;
             let mut credential_file = None;
@@ -8603,7 +8818,7 @@ impl Cli {
     pub fn parse_ingest_buffer_budget(
         &self,
     ) -> anyhow::Result<ravel_ingest::IngestByteBudgetLimit> {
-        Ok(match self.max_ingest_buffer_bytes {
+        Ok(match self.ingest.max_ingest_buffer_bytes {
             0 => ravel_ingest::IngestByteBudgetLimit::Unlimited,
             n => ravel_ingest::IngestByteBudgetLimit::Bounded(n),
         })
@@ -8614,7 +8829,7 @@ impl Cli {
     /// unparseable duration rather than rotating the scrubber in a tight loop,
     /// mirroring [`Self::parse_admission_reconcile_interval`].
     pub fn parse_scrub_period(&self) -> anyhow::Result<Duration> {
-        match self.scrub_period.as_deref() {
+        match self.ingest.scrub_period.as_deref() {
             None => Ok(crate::scrub::DEFAULT_SCRUB_PERIOD),
             Some(s) => {
                 let dur = humantime::parse_duration(s)
@@ -8640,7 +8855,7 @@ impl Cli {
     /// has no tick-cadence caller to spin. Only an unparseable duration fails
     /// startup.
     pub fn parse_maintain_interior_reverify(&self) -> anyhow::Result<i64> {
-        match self.maintain_interior_reverify.as_deref() {
+        match self.maintenance.maintain_interior_reverify.as_deref() {
             None => Ok(ravel_maintain::config::DEFAULT_INTERIOR_REVERIFY_NS),
             Some(s) => {
                 let dur = humantime::parse_duration(s).map_err(|e| {
@@ -8659,7 +8874,7 @@ impl Cli {
     /// claim theft-prone by construction, and `--maintain-claims off` is the
     /// actual way to disable claiming.
     pub fn parse_maintain_claim_lease(&self) -> anyhow::Result<std::time::Duration> {
-        match self.maintain_claim_lease.as_deref() {
+        match self.maintenance.maintain_claim_lease.as_deref() {
             None => Ok(ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION),
             Some(s) => {
                 let dur = humantime::parse_duration(s)
@@ -8682,7 +8897,7 @@ impl Cli {
     /// The value has no effect since the 2026-10-03 amendment; zero is still
     /// refused, as it was before, so the accepted set of values is unchanged.
     pub fn parse_maintain_claim_min_input_bytes(&self) -> anyhow::Result<u64> {
-        match self.maintain_claim_min_input_bytes {
+        match self.maintenance.maintain_claim_min_input_bytes {
             None => Ok(ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES),
             Some(0) => anyhow::bail!(
                 "--maintain-claim-min-input-bytes must be nonzero; the flag has no effect and \
@@ -8696,7 +8911,7 @@ impl Cli {
     /// defaulting to [`ravel_maintain::config::DEFAULT_RLOG_ZSTD_LEVEL`] when
     /// unset and refusing a level outside 1..=22.
     pub fn parse_maintain_compaction_zstd_level(&self) -> anyhow::Result<i32> {
-        match self.maintain_compaction_zstd_level {
+        match self.maintenance.maintain_compaction_zstd_level {
             None => Ok(ravel_maintain::config::DEFAULT_RLOG_ZSTD_LEVEL),
             Some(level) => ravel_maintain::validate_rlog_zstd_level(level)
                 .map_err(|e| anyhow::anyhow!("--maintain-compaction-zstd-level: {e}")),
@@ -8715,7 +8930,7 @@ impl Cli {
     /// indistinguishable at runtime from a broken evaluator: every tick counts
     /// `watermark_below_floor` and nothing is ever swept.
     pub fn parse_alert_retention(&self) -> anyhow::Result<i64> {
-        let Some(s) = self.alert_retention.as_deref() else {
+        let Some(s) = self.retention.alert_retention.as_deref() else {
             return Ok(ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS);
         };
         let dur = humantime::parse_duration(s)
@@ -8732,7 +8947,7 @@ impl Cli {
                  shorter window puts the expiry floor above every watermark the evaluator writes, \
                  so every maintenance tick skips the sweep. Use 0 to disable the sweep instead.",
                 humantime::format_duration(floor),
-                self.alert_eval_interval_secs,
+                self.alerting.alert_eval_interval_secs,
             );
         }
         Ok(window_ns)
@@ -8747,8 +8962,10 @@ impl Cli {
     /// leaves the floor one hour above the watermark whenever the two fall on
     /// opposite sides of an hour boundary, which is most of the time.
     fn alert_retention_floor(&self) -> Duration {
-        crate::alerting::alert_memo_seal_margin(Duration::from_secs(self.alert_eval_interval_secs))
-            .saturating_add(Duration::from_secs(3600))
+        crate::alerting::alert_memo_seal_margin(Duration::from_secs(
+            self.alerting.alert_eval_interval_secs,
+        ))
+        .saturating_add(Duration::from_secs(3600))
     }
 
     /// Parse `--audit-retention` into the
@@ -8765,7 +8982,7 @@ impl Cli {
     /// record is past the protection horizon, and every flush writes a new
     /// immutable record, so no window deletes an event younger than itself.
     pub fn parse_audit_retention(&self) -> anyhow::Result<i64> {
-        let Some(s) = self.audit_retention.as_deref() else {
+        let Some(s) = self.retention.audit_retention.as_deref() else {
             return Ok(ravel_maintain::config::DEFAULT_AUDIT_RETENTION_NS);
         };
         let dur = humantime::parse_duration(s)
@@ -8796,7 +9013,7 @@ impl Cli {
         claim_lease_duration: Duration,
         merge_cursor_budget_bytes: u64,
     ) -> anyhow::Result<ravel_maintain::ResolvedL1PartMemoryTarget> {
-        if self.maintain_l1_part_memory_target_bytes == Some(0) {
+        if self.maintenance.maintain_l1_part_memory_target_bytes == Some(0) {
             anyhow::bail!(
                 "--maintain-l1-part-memory-target-bytes must be greater than 0: it is the decoded \
                  record-heap budget an in-progress L1 part is closed at, and 0 would close a part \
@@ -8810,7 +9027,7 @@ impl Cli {
                 merge_cursor_budget_bytes,
             ));
         Ok(ravel_maintain::ResolvedL1PartMemoryTarget::resolve(
-            self.maintain_l1_part_memory_target_bytes,
+            self.maintenance.maintain_l1_part_memory_target_bytes,
             budget,
             self.maintain_unit_concurrency.max(1),
             claim_lease_duration,
@@ -8857,12 +9074,12 @@ impl Cli {
             interior_reverify_ns,
             audit_retention_window_ns,
             alert_retention_window_ns,
-            coordination: self.maintain_claims.mode(),
+            coordination: self.maintenance.maintain_claims.mode(),
             claim_lease_duration,
             claim_min_input_bytes,
             rlog_zstd_level,
             format_floor: Some(ravel_ingest::FormatFloorPolicy::new(
-                self.write_below_format_floor,
+                self.maintenance.write_below_format_floor,
                 ravel_ingest::format_floor_metrics(),
             )),
             ..ravel_maintain::CompactorConfig::default()
@@ -8914,30 +9131,30 @@ impl Cli {
         &self,
         config: &mut ravel_maintain::CompactorConfig,
     ) -> anyhow::Result<()> {
-        if self.maintain_scratch_dir.is_none() {
-            if self.maintain_scratch_max_bytes.is_some() {
+        if self.maintenance.maintain_scratch_dir.is_none() {
+            if self.maintenance.maintain_scratch_max_bytes.is_some() {
                 anyhow::bail!(
                     "--maintain-scratch-max-bytes has no effect without --maintain-scratch-dir"
                 );
             }
-            if self.maintain_level1_workers.is_some() {
+            if self.maintenance.maintain_level1_workers.is_some() {
                 anyhow::bail!(
                     "--maintain-level1-workers has no effect without --maintain-scratch-dir"
                 );
             }
         }
-        if self.maintain_scratch_max_bytes == Some(0) {
+        if self.maintenance.maintain_scratch_max_bytes == Some(0) {
             anyhow::bail!(
                 "--maintain-scratch-max-bytes must be greater than 0: a zero cap refuses \
                  every two-level merge"
             );
         }
-        if self.maintain_level1_workers == Some(0) {
+        if self.maintenance.maintain_level1_workers == Some(0) {
             anyhow::bail!("--maintain-level1-workers must be greater than 0");
         }
-        config.scratch_dir = self.maintain_scratch_dir.clone();
-        config.scratch_max_bytes = self.maintain_scratch_max_bytes;
-        config.level1_workers = self.maintain_level1_workers;
+        config.scratch_dir = self.maintenance.maintain_scratch_dir.clone();
+        config.scratch_max_bytes = self.maintenance.maintain_scratch_max_bytes;
+        config.level1_workers = self.maintenance.maintain_level1_workers;
         Ok(())
     }
 
@@ -8948,7 +9165,7 @@ impl Cli {
     /// value ([`crate::start`] spawns no task for a zero TTL), not a
     /// tight-loop footgun. Only an unparseable duration fails startup.
     pub fn parse_idle_tenant_state_ttl(&self) -> anyhow::Result<Duration> {
-        match self.idle_tenant_state_ttl.as_deref() {
+        match self.ingest.idle_tenant_state_ttl.as_deref() {
             None => Ok(crate::idle_tenant_state::DEFAULT_IDLE_TENANT_STATE_TTL),
             Some(s) => humantime::parse_duration(s)
                 .map_err(|e| anyhow::anyhow!("invalid --idle-tenant-state-ttl '{s}': {e}")),
@@ -8957,10 +9174,10 @@ impl Cli {
 
     /// Parse `--alert-sql-lookback` into a duration.
     pub fn parse_alert_sql_lookback(&self) -> anyhow::Result<Duration> {
-        humantime::parse_duration(&self.alert_sql_lookback).map_err(|e| {
+        humantime::parse_duration(&self.alerting.alert_sql_lookback).map_err(|e| {
             anyhow::anyhow!(
                 "invalid --alert-sql-lookback '{}': {e}",
-                self.alert_sql_lookback
+                self.alerting.alert_sql_lookback
             )
         })
     }
@@ -8977,7 +9194,7 @@ impl Cli {
     /// origin allowlist silently stops being required on it.
     fn mcp_route_listeners(&self) -> Vec<(&'static str, SocketAddr)> {
         let mut listeners = vec![("--listen-http", self.listen_http)];
-        if let Some(mtls_listener) = self.mtls_listener {
+        if let Some(mtls_listener) = self.auth.mtls_listener {
             listeners.push(("--mtls-listener", mtls_listener));
         }
         listeners
@@ -9007,7 +9224,7 @@ impl Cli {
         // Two sources for the same static bearer map: refuse both at once
         // rather than silently picking one, mirroring the
         // --distributed-query/--fragment-key-file pairing checks below.
-        if !self.tenant_tokens.is_empty() && self.tenant_token_file.is_some() {
+        if !self.tenancy.tenant_tokens.is_empty() && self.tenancy.tenant_token_file.is_some() {
             anyhow::bail!(
                 "--tenant-token and --tenant-token-file are mutually exclusive: both populate \
                  the same static bearer map. Drop --tenant-token, or drop --tenant-token-file."
@@ -9023,12 +9240,12 @@ impl Cli {
             StoreKind::Memory => {}
             StoreKind::S3 => {
                 crate::store::resolve_s3_allow_http(
-                    self.s3_endpoint.as_deref(),
-                    self.s3_allow_http,
+                    self.object_store.s3_endpoint.as_deref(),
+                    self.object_store.s3_allow_http,
                 )?;
             }
             StoreKind::Gcs => {
-                crate::store::resolve_gcs_allow_http(self.gcs_endpoint.as_deref())?;
+                crate::store::resolve_gcs_allow_http(self.object_store.gcs_endpoint.as_deref())?;
             }
         }
 
@@ -9058,7 +9275,7 @@ impl Cli {
         // isn't available yet at this point in startup.
         self.resolve_audit_pipeline_config()?;
 
-        if self.max_inflight_flushes == 0 {
+        if self.ingest.max_inflight_flushes == 0 {
             anyhow::bail!(
                 "--max-inflight-flushes '0' would deadlock every flush: a shard could never \
                  acquire a permit to run one. Set a positive count (1 keeps today's \
@@ -9073,16 +9290,16 @@ impl Cli {
                      or leave it unset for max(1, --max-inflight-flushes - 1)."
                 );
             }
-            if !u32::try_from(share).is_ok_and(|s| s <= self.max_inflight_flushes) {
+            if !u32::try_from(share).is_ok_and(|s| s <= self.ingest.max_inflight_flushes) {
                 anyhow::bail!(
                     "--max-inflight-flushes-per-tenant '{share}' exceeds \
                      --max-inflight-flushes '{}': a tenant can hold at most every permit on \
                      its shard.",
-                    self.max_inflight_flushes
+                    self.ingest.max_inflight_flushes
                 );
             }
         }
-        if self.max_inflight_flushes == 1 {
+        if self.ingest.max_inflight_flushes == 1 {
             tracing::warn!(
                 "--max-inflight-flushes 1 gives no cross-tenant flush isolation: a tenant \
                  whose object-store prefix stalls holds its shard's only flush permit, and \
@@ -9090,7 +9307,7 @@ impl Cli {
             );
         }
 
-        if self.max_queued_flushes == 0 {
+        if self.ingest.max_queued_flushes == 0 {
             anyhow::bail!(
                 "--max-queued-flushes '0' would refuse every age and size trigger: a shard \
                  could never spawn a flush outside a drain. Set a positive count (8 is the \
@@ -9121,12 +9338,12 @@ impl Cli {
             ),
             (
                 "--alert-eval-interval-secs",
-                self.alert_eval_interval_secs,
+                self.alerting.alert_eval_interval_secs,
                 "every tenant's alert evaluator",
             ),
             (
                 "--oidc-jwks-refresh-interval-secs",
-                self.oidc_jwks_refresh_interval_secs,
+                self.auth.oidc_jwks_refresh_interval_secs,
                 "the JWKS refetch against the issuer",
             ),
         ] {
@@ -9138,7 +9355,7 @@ impl Cli {
             }
         }
 
-        if self.fold_lag_interval_secs == Some(0) {
+        if self.maintenance.fold_lag_interval_secs == Some(0) {
             anyhow::bail!(
                 "--fold-lag-interval-secs '0' names a fold that runs back to back with no \
                  pause, which --fold-interval-secs refuses, so no maintain tier runs one. Set \
@@ -9153,14 +9370,14 @@ impl Cli {
         // the queue-cap default, with no custom-resource field able to raise
         // the cap in response.
 
-        if self.max_s3_requests == Some(0) {
+        if self.limits.max_s3_requests == Some(0) {
             anyhow::bail!(
                 "--max-s3-requests '0' would reject every query; omit the flag to derive the \
                  budget from --shards and the flush cadence, or set a positive count"
             );
         }
 
-        if self.catalog_resolve_concurrency == Some(0) {
+        if self.cache.catalog_resolve_concurrency == Some(0) {
             anyhow::bail!(
                 "--catalog-resolve-concurrency '0' would deadlock every catalog resolve: a \
                  zero-permit semaphore can never be acquired. Omit the flag to use the \
@@ -9168,7 +9385,7 @@ impl Cli {
             );
         }
 
-        if let Some(concurrency) = self.catalog_resolve_concurrency
+        if let Some(concurrency) = self.cache.catalog_resolve_concurrency
             && concurrency > ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY
         {
             anyhow::bail!(
@@ -9182,7 +9399,7 @@ impl Cli {
 
         // ADR-3513: the record-cache budget only ever raises the entry bound,
         // and only where something reads the record caches.
-        if let Some(budget) = self.catalog_record_cache_max_bytes_per_tenant {
+        if let Some(budget) = self.cache.catalog_record_cache_max_bytes_per_tenant {
             let floor = ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT;
             if budget < floor {
                 anyhow::bail!(
@@ -9191,7 +9408,7 @@ impl Cli {
                      budget. Omit it to keep the default, or set {floor} or more."
                 );
             }
-            if self.disable_cache {
+            if self.cache.disable_cache {
                 anyhow::bail!(
                     "--catalog-record-cache-max-bytes-per-tenant was set with --disable-cache: \
                      --disable-cache holds the record caches at the \
@@ -9211,8 +9428,11 @@ impl Cli {
         }
 
         for (flag, permits) in [
-            ("--cpu-gate-read-permits", self.cpu_gate_read_permits),
-            ("--cpu-gate-write-permits", self.cpu_gate_write_permits),
+            ("--cpu-gate-read-permits", self.gates.cpu_gate_read_permits),
+            (
+                "--cpu-gate-write-permits",
+                self.gates.cpu_gate_write_permits,
+            ),
         ] {
             if permits == Some(0) {
                 anyhow::bail!(
@@ -9298,7 +9518,7 @@ impl Cli {
         // reachable on a non-loopback `--listen-grpc`, forging tenant identity
         // on the public gRPC/Flight surfaces (issue #1293). ADR-0009 promises
         // refusal on any reachable port, so require both listeners loopback.
-        if self.dev_insecure_tenant_header
+        if self.tenancy.dev_insecure_tenant_header
             && (!self.listen_http.ip().is_loopback() || !self.listen_grpc.ip().is_loopback())
         {
             anyhow::bail!(
@@ -9317,7 +9537,7 @@ impl Cli {
         // startup rather than serving an open route. Every listener the route
         // is mounted on counts, not just `--listen-http`: the same mistake the
         // dev-header rule above made before issue #1293.
-        if self.mcp && self.mcp_allowed_origins.is_empty() {
+        if self.mcp_server.mcp && self.mcp_server.mcp_allowed_origins.is_empty() {
             let public = self.public_mcp_route_listeners();
             if !public.is_empty() {
                 let named = public
@@ -9334,7 +9554,7 @@ impl Cli {
             }
         }
 
-        if self.mcp_max_body_bytes == 0 {
+        if self.mcp_server.mcp_max_body_bytes == 0 {
             anyhow::bail!(
                 "--mcp-max-body-bytes 0 would refuse every MCP request; set a positive cap or \
                  leave the flag unset for the 1 MiB default"
@@ -9348,7 +9568,7 @@ impl Cli {
         // so the route never mounts and `--mcp` is silently inert. Refuse it
         // at startup so an operator cannot believe MCP is being served when
         // nothing serves it.
-        if self.mcp && !self.mode.installs_query_audit_pipeline() {
+        if self.mcp_server.mcp && !self.mode.installs_query_audit_pipeline() {
             anyhow::bail!(
                 "--mcp is only supported under --mode all or --mode query: POST /mcp is mounted \
                  only by a query-serving process, so under --mode {:?} this flag would be \
@@ -9360,7 +9580,7 @@ impl Cli {
         // ADR-3331 decision 9: `--agents` is declared in every build, so a
         // build without the feature must refuse it instead of ignoring it.
         #[cfg(not(feature = "agents"))]
-        if self.agents {
+        if self.agents_runtime.agents {
             anyhow::bail!(
                 "--agents requires a ravel-server built with the `agents` cargo feature; this \
                  build does not carry it. Drop --agents, or rebuild with --features agents."
@@ -9369,7 +9589,7 @@ impl Cli {
 
         // The agents routes mount from the same query block as `POST /mcp`,
         // so the same reasoning as the `--mcp` refusal above applies.
-        if self.agents && !self.mode.installs_query_audit_pipeline() {
+        if self.agents_runtime.agents && !self.mode.installs_query_audit_pipeline() {
             anyhow::bail!(
                 "--agents is only supported under --mode all or --mode query: the agents routes \
                  are mounted only by a query-serving process, so under --mode {:?} this flag \
@@ -9378,7 +9598,7 @@ impl Cli {
             );
         }
 
-        if self.agents_activation_concurrency == 0 {
+        if self.agents_runtime.agents_activation_concurrency == 0 {
             anyhow::bail!(
                 "--agents-activation-concurrency 0 would never activate an agent turn; set a \
                  positive limit or leave the flag unset for the default of \
@@ -9386,7 +9606,7 @@ impl Cli {
             );
         }
 
-        if self.agents_poll_concurrency == 0 {
+        if self.agents_runtime.agents_poll_concurrency == 0 {
             anyhow::bail!(
                 "--agents-poll-concurrency 0 would refuse every worker long-poll; set a positive \
                  limit or leave the flag unset for the default of \
@@ -9394,7 +9614,7 @@ impl Cli {
             );
         }
 
-        if self.agents_projection_backlog == 0 {
+        if self.agents_runtime.agents_projection_backlog == 0 {
             anyhow::bail!(
                 "--agents-projection-backlog 0 would hold no projected record, so nothing would \
                  ever project; set a positive bound or leave the flag unset for the default of \
@@ -9408,14 +9628,14 @@ impl Cli {
         // there. ADR-0050 section 1 assumes `--mtls-listener` only ever
         // appears paired with `--mtls-enabled`; this is the case that makes
         // the pairing load-bearing rather than implicit.
-        if self.mtls_listener.is_some() && !self.mtls_enabled {
+        if self.auth.mtls_listener.is_some() && !self.auth.mtls_enabled {
             anyhow::bail!(
                 "--mtls-listener was set but --mtls-enabled was not: the listener would bind \
                  with no resolver installed on it. Set --mtls-enabled, or drop --mtls-listener."
             );
         }
 
-        if self.mtls_enabled && self.mtls_listener.is_none() {
+        if self.auth.mtls_enabled && self.auth.mtls_listener.is_none() {
             anyhow::bail!(
                 "--mtls-enabled requires --mtls-listener: the mTLS resolver is only installed on \
                  its own dedicated listener (ADR-0050 section 1), never on the public HTTP or \
@@ -9434,7 +9654,7 @@ impl Cli {
         // it. The supported set is derived from that `Mode::All | Mode::Query`
         // guard, not guessed.
         if !matches!(self.mode, Mode::All | Mode::Query)
-            && (self.distributed_query || self.fragment_listener.is_some())
+            && (self.distrib.distributed_query || self.distrib.fragment_listener.is_some())
         {
             anyhow::bail!(
                 "--distributed-query and --fragment-listener are only supported under \
@@ -9451,7 +9671,7 @@ impl Cli {
         // enabled. Reject either half of the pair on its own so a misconfiguration
         // fails startup rather than exposing an unauthenticated fetch surface or
         // leaving a configured secret inert.
-        if self.distributed_query && self.fragment_key_file.is_none() {
+        if self.distrib.distributed_query && self.distrib.fragment_key_file.is_none() {
             anyhow::bail!(
                 "--distributed-query requires --fragment-key-file: the ADR-0071 fragment \
                  SeriesFetch surface authorizes Pinned fetches only with a per-tenant capability \
@@ -9462,7 +9682,7 @@ impl Cli {
         // ADR-1689 decision 4: both distributed lanes dial only the dedicated
         // TLS fragment listener, and SQL slice tickets are keyed only from the
         // SQL ticket key file. There is no plaintext layout to fall back to.
-        if self.distributed_query && self.fragment_listener.is_none() {
+        if self.distrib.distributed_query && self.distrib.fragment_listener.is_none() {
             anyhow::bail!(
                 "--distributed-query requires --fragment-listener (ADR-1689 decision 4): both \
                  distributed lanes dial each worker's dedicated TLS fragment listener, and there \
@@ -9471,7 +9691,10 @@ impl Cli {
                  --distributed-query."
             );
         }
-        if self.distributed_query && flight_sql && self.sql_ticket_key_file.is_none() {
+        if self.distrib.distributed_query
+            && flight_sql
+            && self.distrib.sql_ticket_key_file.is_none()
+        {
             anyhow::bail!(
                 "--distributed-query requires --sql-ticket-key-file (ADR-1689 decision 4): \
                  every node signs and verifies Flight SQL slice tickets with the keys in that \
@@ -9479,7 +9702,7 @@ impl Cli {
                  file, or drop --distributed-query."
             );
         }
-        if self.fragment_key_file.is_some() && !self.distributed_query {
+        if self.distrib.fragment_key_file.is_some() && !self.distrib.distributed_query {
             anyhow::bail!(
                 "--fragment-key-file was set but --distributed-query was not: the fragment \
                  surface is only registered under --distributed-query, so the key file would be \
@@ -9489,7 +9712,7 @@ impl Cli {
         // ADR-3130 decision 1: the maintain-worker registry is written and read
         // only by `--mode maintain`, so its key file is required there and
         // refused everywhere else rather than left inert.
-        if matches!(self.mode, Mode::Maintain) && self.maintain_key_file.is_none() {
+        if matches!(self.mode, Mode::Maintain) && self.distrib.maintain_key_file.is_none() {
             anyhow::bail!(
                 "--mode maintain requires --maintain-key-file (ADR-3130): a maintain process \
                  admits a sibling into its live set only when the sibling's registry record is \
@@ -9497,7 +9720,7 @@ impl Cli {
                  the cluster shares."
             );
         }
-        if self.maintain_key_file.is_some() && !matches!(self.mode, Mode::Maintain) {
+        if self.distrib.maintain_key_file.is_some() && !matches!(self.mode, Mode::Maintain) {
             anyhow::bail!(
                 "--maintain-key-file was set with --mode {:?}: only --mode maintain writes or \
                  reads maintain-worker registry records, so the key file would be inert. Drop \
@@ -9505,7 +9728,7 @@ impl Cli {
                 self.mode
             );
         }
-        if self.sql_ticket_key_file.is_some() && !self.distributed_query {
+        if self.distrib.sql_ticket_key_file.is_some() && !self.distrib.distributed_query {
             anyhow::bail!(
                 "--sql-ticket-key-file was set but --distributed-query was not: the SQL ticket \
                  key file is only read under --distributed-query, so the key file would be \
@@ -9517,8 +9740,8 @@ impl Cli {
         // so "genuinely separate listener with TLS" holds by construction, not by
         // operator care (the same posture ADR-0050 section 1 takes for
         // `--mtls-listener`).
-        if let Some(fragment_listener) = self.fragment_listener {
-            if !self.distributed_query {
+        if let Some(fragment_listener) = self.distrib.fragment_listener {
+            if !self.distrib.distributed_query {
                 anyhow::bail!(
                     "--fragment-listener '{fragment_listener}' requires --distributed-query: the \
                      fragment SeriesFetch surface only exists under --distributed-query, so a \
@@ -9529,9 +9752,9 @@ impl Cli {
             // listener (capabilities travel on it, and a coordinator authenticates
             // the worker by the pinned CA). Refuse a listener with incomplete
             // material rather than binding a plaintext fragment port.
-            if self.fragment_tls_cert.is_none()
-                || self.fragment_tls_key.is_none()
-                || self.fragment_tls_ca.is_none()
+            if self.distrib.fragment_tls_cert.is_none()
+                || self.distrib.fragment_tls_key.is_none()
+                || self.distrib.fragment_tls_ca.is_none()
             {
                 anyhow::bail!(
                     "--fragment-listener '{fragment_listener}' requires --fragment-tls-cert, \
@@ -9560,7 +9783,7 @@ impl Cli {
                     self.listen_grpc
                 );
             }
-            if self.mtls_listener == Some(fragment_listener) {
+            if self.auth.mtls_listener == Some(fragment_listener) {
                 anyhow::bail!(
                     "--fragment-listener '{fragment_listener}' must not equal --mtls-listener \
                      '{fragment_listener}': each dedicated listener (mTLS, fragment) must bind its \
@@ -9571,10 +9794,10 @@ impl Cli {
         // Symmetry: a TLS PEM flag set without `--fragment-listener` is inert and
         // almost certainly a misconfiguration; refuse it rather than silently
         // ignore an operator's certificate intent.
-        if self.fragment_listener.is_none()
-            && (self.fragment_tls_cert.is_some()
-                || self.fragment_tls_key.is_some()
-                || self.fragment_tls_ca.is_some())
+        if self.distrib.fragment_listener.is_none()
+            && (self.distrib.fragment_tls_cert.is_some()
+                || self.distrib.fragment_tls_key.is_some()
+                || self.distrib.fragment_tls_ca.is_some())
         {
             anyhow::bail!(
                 "--fragment-tls-cert/--fragment-tls-key/--fragment-tls-ca were set but \
@@ -9586,7 +9809,7 @@ impl Cli {
         // Parsed unconditionally so a malformed value fails startup even in a
         // configuration where it would never be read.
         let advertise = self.parse_advertise_fragment_endpoint()?;
-        if advertise.is_some() && !self.distributed_query {
+        if advertise.is_some() && !self.distrib.distributed_query {
             anyhow::bail!(
                 "--advertise-fragment-endpoint was set but --distributed-query was not: the \
                  advertised endpoints are only published in the sys/query/workers heartbeat \
@@ -9594,7 +9817,7 @@ impl Cli {
                  inert. Set --distributed-query, or drop --advertise-fragment-endpoint."
             );
         }
-        if self.distributed_query {
+        if self.distrib.distributed_query {
             // Issue #1724: under `--distributed-query` this process publishes
             // its fragment endpoint for sibling coordinators to dial, and the
             // published value defaults to the address the listener bound. A
@@ -9634,10 +9857,10 @@ impl Cli {
             // not as whichever credential file happens to be unreadable too.
             self.parse_distrib_settings()?;
         }
-        if self.max_parallel_slices == 0 {
+        if self.distrib.max_parallel_slices == 0 {
             anyhow::bail!("--max-parallel-slices must be at least 1");
         }
-        if self.max_inflight_federated_resolves == 0 {
+        if self.distrib.max_inflight_federated_resolves == 0 {
             anyhow::bail!("--max-inflight-federated-resolves must be at least 1");
         }
 
@@ -9658,7 +9881,7 @@ impl Cli {
         // A key file and the unkeyed opt-out are contradictory: one selects
         // the keyed derivation, the other refuses it. There is no meaningful
         // resolution, so refuse rather than pick one (ADR-0050 section 3).
-        if self.tenant_hash_key_file.is_some() && self.tenant_hash_unkeyed {
+        if self.tenant_hash.tenant_hash_key_file.is_some() && self.tenant_hash.tenant_hash_unkeyed {
             anyhow::bail!(
                 "--tenant-hash-key-file and --tenant-hash-unkeyed are mutually exclusive: the \
                  first keys the tenant hash, the second opts out of keying. Pass exactly one."
@@ -9671,8 +9894,8 @@ impl Cli {
             let others = [
                 ("--listen-http", Some(self.listen_http)),
                 ("--listen-grpc", Some(self.listen_grpc)),
-                ("--mtls-listener", self.mtls_listener),
-                ("--fragment-listener", self.fragment_listener),
+                ("--mtls-listener", self.auth.mtls_listener),
+                ("--fragment-listener", self.distrib.fragment_listener),
             ];
             for (flag, other) in others {
                 if other == Some(listen_health) {
@@ -9685,11 +9908,11 @@ impl Cli {
             }
         }
 
-        if let Some(mtls_listener) = self.mtls_listener {
+        if let Some(mtls_listener) = self.auth.mtls_listener {
             // More specific than the general aliasing check below: names the
             // exact combination (dev header plus mTLS listener on the public
             // HTTP address) rather than just "listener address collides".
-            if self.dev_insecure_tenant_header && mtls_listener == self.listen_http {
+            if self.tenancy.dev_insecure_tenant_header && mtls_listener == self.listen_http {
                 anyhow::bail!(
                     "--mtls-listener '{mtls_listener}' is the same address as --listen-http, \
                      which also has --dev-insecure-tenant-header enabled: the mTLS listener \
@@ -9709,7 +9932,7 @@ impl Cli {
             // of that header; any other bind makes the trust a property of the
             // deployment, which this process cannot observe. Refuse until the
             // operator states it.
-            if !mtls_listener.ip().is_loopback() && !self.mtls_trust_forwarded_header {
+            if !mtls_listener.ip().is_loopback() && !self.auth.mtls_trust_forwarded_header {
                 anyhow::bail!(
                     "--mtls-listener '{mtls_listener}' does not bind a loopback address, which \
                      requires --mtls-trust-forwarded-header. The mTLS resolver does not verify \
@@ -9721,7 +9944,7 @@ impl Cli {
                 );
             }
         }
-        if self.mtls_trust_forwarded_header && self.mtls_listener.is_none() {
+        if self.auth.mtls_trust_forwarded_header && self.auth.mtls_listener.is_none() {
             anyhow::bail!(
                 "--mtls-trust-forwarded-header was set but --mtls-listener was not: the flag \
                  only relaxes the loopback requirement on that listener, so without it the \
@@ -9736,7 +9959,7 @@ impl Cli {
         // one from, so the flag would be silently inert. Fail startup instead.
         // `parse_validated_from` already refuses it under `--store gcs`
         // (ADR-3456 decision D6); this covers a `Cli` built without it.
-        if self.tenant_kms_config.is_some() && !matches!(self.store, StoreKind::S3) {
+        if self.tenant_config.tenant_kms_config.is_some() && !matches!(self.store, StoreKind::S3) {
             let store = match self.store {
                 StoreKind::Gcs => "--store gcs",
                 StoreKind::Memory | StoreKind::S3 => "--store memory",
@@ -9751,25 +9974,25 @@ impl Cli {
         // ADR-1195: a zero value in any of the four fetch-concurrency-family
         // flags is refused here, before configuration resolution builds any
         // fetcher, engine, or SQL session, with the flag named in the error.
-        if self.fetch_concurrency == Some(0) {
+        if self.query.fetch_concurrency == Some(0) {
             anyhow::bail!(
                 "--fetch-concurrency '0' would admit no concurrent segment fetches; omit the \
                  flag to derive the default from host cores, or set a positive count"
             );
         }
-        if self.store_get_concurrency == Some(0) {
+        if self.query.store_get_concurrency == Some(0) {
             anyhow::bail!(
                 "--store-get-concurrency '0' would admit no concurrent object-store GETs; omit \
                  the flag to derive the default from host cores, or set a positive count"
             );
         }
-        if self.sql_partition_count == Some(0) {
+        if self.query.sql_partition_count == Some(0) {
             anyhow::bail!(
                 "--sql-partition-count '0' would give DataFusion zero scan partitions; omit the \
                  flag to derive the default from host cores, or set a positive count"
             );
         }
-        if self.promql_fetch_fanout == Some(0) {
+        if self.query.promql_fetch_fanout == Some(0) {
             anyhow::bail!(
                 "--promql-fetch-fanout '0' would admit no concurrent PromQL segment fetches; \
                  omit the flag to derive the default from host cores, or set a positive count"
@@ -9780,11 +10003,11 @@ impl Cli {
         // knobs together when none of them is given explicitly. Combining it
         // with any of the three is a startup error naming both flags, not a
         // silent precedence rule.
-        if self.fetch_concurrency.is_some() {
+        if self.query.fetch_concurrency.is_some() {
             let conflicting = [
-                ("--store-get-concurrency", self.store_get_concurrency),
-                ("--sql-partition-count", self.sql_partition_count),
-                ("--promql-fetch-fanout", self.promql_fetch_fanout),
+                ("--store-get-concurrency", self.query.store_get_concurrency),
+                ("--sql-partition-count", self.query.sql_partition_count),
+                ("--promql-fetch-fanout", self.query.promql_fetch_fanout),
             ]
             .into_iter()
             .find(|(_, value)| value.is_some());
@@ -9809,7 +10032,7 @@ impl Cli {
     /// truncating or padding a wrong-length key into place.
     pub fn resolve_tenancy_config(&self) -> anyhow::Result<crate::tenancy::ConfiguredScheme> {
         use crate::tenancy::ConfiguredScheme;
-        if let Some(path) = self.tenant_hash_key_file.as_deref() {
+        if let Some(path) = self.tenant_hash.tenant_hash_key_file.as_deref() {
             let raw = std::fs::read(path).map_err(|e| {
                 anyhow::anyhow!("could not read --tenant-hash-key-file {path:?}: {e}")
             })?;
@@ -9818,7 +10041,7 @@ impl Cli {
             })?;
             return Ok(ConfiguredScheme::Keyed(Box::new(key)));
         }
-        if self.tenant_hash_unkeyed {
+        if self.tenant_hash.tenant_hash_unkeyed {
             return Ok(ConfiguredScheme::Unkeyed);
         }
         Ok(ConfiguredScheme::Unspecified)
@@ -9834,7 +10057,7 @@ impl Cli {
     /// `invalid --gc-max-query-duration` shapes are unchanged from when
     /// `resolve_gc_runtime` did the parse.
     pub fn performance_flags(&self) -> anyhow::Result<PerformanceFlags> {
-        let query_deadline = match self.gc_max_query_duration.as_deref() {
+        let query_deadline = match self.gc.gc_max_query_duration.as_deref() {
             Some(s) => {
                 let ns = parse_gc_duration_ns("--gc-max-query-duration", s)?;
                 Some(Duration::from_nanos(u64::try_from(ns).unwrap_or(0)))
@@ -9842,25 +10065,25 @@ impl Cli {
             None => None,
         };
         Ok(PerformanceFlags {
-            fetch_concurrency: self.fetch_concurrency,
-            store_get_concurrency: self.store_get_concurrency,
-            sql_partition_count: self.sql_partition_count,
-            promql_fetch_fanout: self.promql_fetch_fanout,
-            catalog_resolve_concurrency: self.catalog_resolve_concurrency,
-            max_concurrent_queries: self.max_concurrent_queries,
-            max_segments: self.max_segments,
-            max_series: self.max_series,
-            max_samples: self.max_samples,
-            cache_max_bytes: self.cache_max_bytes,
-            catalog_cache_max_bytes: self.catalog_cache_max_bytes,
-            column_stats_cache_max_bytes: self.column_stats_cache_max_bytes,
+            fetch_concurrency: self.query.fetch_concurrency,
+            store_get_concurrency: self.query.store_get_concurrency,
+            sql_partition_count: self.query.sql_partition_count,
+            promql_fetch_fanout: self.query.promql_fetch_fanout,
+            catalog_resolve_concurrency: self.cache.catalog_resolve_concurrency,
+            max_concurrent_queries: self.limits.max_concurrent_queries,
+            max_segments: self.query.max_segments,
+            max_series: self.query.max_series,
+            max_samples: self.query.max_samples,
+            cache_max_bytes: self.cache.cache_max_bytes,
+            catalog_cache_max_bytes: self.cache.catalog_cache_max_bytes,
+            column_stats_cache_max_bytes: self.cache.column_stats_cache_max_bytes,
             store_is_loopback: self.store_is_loopback(),
-            sql_max_query_bytes: self.sql_max_query_bytes,
-            sql_tenant_max_bytes: self.sql_tenant_max_bytes,
+            sql_max_query_bytes: self.sql.sql_max_query_bytes,
+            sql_tenant_max_bytes: self.sql.sql_tenant_max_bytes,
             query_deadline,
-            disable_cache: self.disable_cache,
+            disable_cache: self.cache.disable_cache,
             memory_budget_not_applicable: !self.mode.uses_memory_budget(),
-            memory_budget_bytes: self.memory_budget_bytes,
+            memory_budget_bytes: self.cache.memory_budget_bytes,
             ingest_buffer_limit: if self.mode.holds_ingest_buffer() {
                 Some(self.parse_ingest_buffer_budget()?)
             } else {
@@ -9904,11 +10127,11 @@ impl Cli {
     /// both are checked against the exact same resolved value, whether it
     /// came from the flag or from the compiled-in default.
     fn resolve_gc_max_flush_lifetime_ns(&self) -> anyhow::Result<i64> {
-        let configured_ns = match self.gc_max_flush_lifetime.as_deref() {
+        let configured_ns = match self.gc.gc_max_flush_lifetime.as_deref() {
             Some(s) => parse_gc_duration_ns("--gc-max-flush-lifetime", s)?,
             None => ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS,
         };
-        check_gc_max_flush_lifetime_floor(self.gc_max_flush_lifetime.as_deref(), configured_ns)?;
+        check_gc_max_flush_lifetime_floor(self.gc.gc_max_flush_lifetime.as_deref(), configured_ns)?;
         Ok(configured_ns)
     }
 
@@ -9934,11 +10157,11 @@ impl Cli {
     pub fn resolve_gc_runtime(&self, query_deadline: Duration) -> anyhow::Result<GcRuntimeConfig> {
         use ravel_maintain::config::{DEFAULT_GRACE_NS, DEFAULT_PROTECTION_HORIZON_NS};
 
-        let protection_horizon_ns = match self.gc_protection_horizon.as_deref() {
+        let protection_horizon_ns = match self.gc.gc_protection_horizon.as_deref() {
             Some(s) => parse_gc_duration_ns("--gc-protection-horizon", s)?,
             None => DEFAULT_PROTECTION_HORIZON_NS,
         };
-        let grace_ns = match self.gc_grace.as_deref() {
+        let grace_ns = match self.gc.gc_grace.as_deref() {
             Some(s) => parse_gc_duration_ns("--gc-grace", s)?,
             None => DEFAULT_GRACE_NS,
         };
@@ -9957,7 +10180,7 @@ impl Cli {
     /// rules; every failure here fails startup rather than falling back to
     /// defaults.
     pub fn parse_limits_file(&self) -> anyhow::Result<limits::LimitsConfig> {
-        let Some(path) = self.limits_file.as_deref() else {
+        let Some(path) = self.limits.limits_file.as_deref() else {
             return Ok(limits::LimitsConfig::default());
         };
         let text = std::fs::read_to_string(path)
@@ -9969,7 +10192,8 @@ impl Cli {
     /// `--s3-region`, or `us-east-1` when it is not set: the region
     /// `--store s3` reaches its bucket in.
     pub fn s3_region_or_default(&self) -> String {
-        self.s3_region
+        self.object_store
+            .s3_region
             .clone()
             .unwrap_or_else(|| "us-east-1".to_string())
     }
@@ -9979,8 +10203,8 @@ impl Cli {
     /// `--s3-upload-integrity` and `--s3-request-stored-checksum`.
     pub fn s3_http_config(&self) -> ravel_object_store::s3::S3HttpConfig {
         ravel_object_store::s3::S3HttpConfig {
-            upload_integrity: self.s3_upload_integrity.mode(),
-            request_stored_checksum: self.s3_request_stored_checksum,
+            upload_integrity: self.object_store.s3_upload_integrity.mode(),
+            request_stored_checksum: self.object_store.s3_request_stored_checksum,
             ..Default::default()
         }
     }
@@ -9989,7 +10213,7 @@ impl Cli {
     /// [`ravel_object_store::external::load_profiles`], with Ravel's own data
     /// bucket beside them. `None` when the flag is absent.
     pub fn parse_parquet_profiles(&self) -> anyhow::Result<Option<ParquetProfiles>> {
-        let Some(path) = self.parquet_profiles.as_deref() else {
+        let Some(path) = self.tenant_config.parquet_profiles.as_deref() else {
             return Ok(None);
         };
         let json = std::fs::read_to_string(path)
@@ -9998,15 +10222,23 @@ impl Cli {
             .map_err(|e| anyhow::anyhow!("invalid --parquet-profiles {}: {e}", path.display()))?;
         let ravel_bucket = match self.store {
             StoreKind::Memory => None,
-            StoreKind::S3 => self.s3_bucket.clone().map(|bucket| RavelBucket::S3 {
-                bucket,
-                endpoint: self.s3_endpoint.clone(),
-                region: self.s3_region_or_default(),
-            }),
-            StoreKind::Gcs => self.gcs_bucket.clone().map(|bucket| RavelBucket::Gcs {
-                bucket,
-                endpoint: self.gcs_endpoint.clone(),
-            }),
+            StoreKind::S3 => self
+                .object_store
+                .s3_bucket
+                .clone()
+                .map(|bucket| RavelBucket::S3 {
+                    bucket,
+                    endpoint: self.object_store.s3_endpoint.clone(),
+                    region: self.s3_region_or_default(),
+                }),
+            StoreKind::Gcs => self
+                .object_store
+                .gcs_bucket
+                .clone()
+                .map(|bucket| RavelBucket::Gcs {
+                    bucket,
+                    endpoint: self.object_store.gcs_endpoint.clone(),
+                }),
         };
         Ok(Some(ParquetProfiles {
             profiles,
@@ -10020,7 +10252,7 @@ impl Cli {
     /// `build_store` inserts no `KmsRoutingStore`. `Cli::validate` already
     /// refused this flag under `--store memory`.
     pub fn parse_tenant_kms_config(&self) -> anyhow::Result<crate::tenant_kms::TenantKmsConfig> {
-        let Some(path) = self.tenant_kms_config.as_deref() else {
+        let Some(path) = self.tenant_config.tenant_kms_config.as_deref() else {
             return Ok(crate::tenant_kms::TenantKmsConfig::default());
         };
         let text = std::fs::read_to_string(path)
@@ -10036,7 +10268,7 @@ impl Cli {
     /// requirement is checked later, by [`crate::ipcrypt::IpcryptPolicy::new`],
     /// once the bucket's tenancy marker has been resolved.
     pub fn parse_ipcrypt_config(&self) -> anyhow::Result<ravel_ipcrypt::policy::PolicyFile> {
-        let Some(path) = self.ipcrypt_config.as_deref() else {
+        let Some(path) = self.tenant_config.ipcrypt_config.as_deref() else {
             return Ok(ravel_ipcrypt::policy::PolicyFile::default());
         };
         let text = std::fs::read_to_string(path)
@@ -11060,10 +11292,10 @@ mod tests {
     #[test]
     fn cache_bulk_share_defaults_to_one_half_and_refuses_values_outside_zero_to_one() {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
-        assert_eq!(cli.cache_bulk_share.to_bits(), 0.5f64.to_bits());
+        assert_eq!(cli.cache.cache_bulk_share.to_bits(), 0.5f64.to_bits());
         let cli = Cli::try_parse_from(["ravel-server", "--cache-bulk-share", "0.25"])
             .expect("0.25 parses");
-        assert_eq!(cli.cache_bulk_share.to_bits(), 0.25f64.to_bits());
+        assert_eq!(cli.cache.cache_bulk_share.to_bits(), 0.25f64.to_bits());
         for refused in ["0", "1", "1.5", "-0.1", "NaN", "inf", "half"] {
             assert!(
                 Cli::try_parse_from(["ravel-server", "--cache-bulk-share", refused]).is_err(),
@@ -11075,10 +11307,10 @@ mod tests {
     #[test]
     fn cache_bulk_scan_min_bytes_is_off_by_default_and_takes_a_byte_count() {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
-        assert_eq!(cli.cache_bulk_scan_min_bytes, None);
+        assert_eq!(cli.cache.cache_bulk_scan_min_bytes, None);
         let cli = Cli::try_parse_from(["ravel-server", "--cache-bulk-scan-min-bytes", "522460"])
             .expect("a byte count parses");
-        assert_eq!(cli.cache_bulk_scan_min_bytes, Some(522_460));
+        assert_eq!(cli.cache.cache_bulk_scan_min_bytes, Some(522_460));
         for refused in ["0", "-1", "half", ""] {
             assert!(
                 Cli::try_parse_from(["ravel-server", "--cache-bulk-scan-min-bytes", refused])
@@ -11150,7 +11382,7 @@ mod tests {
             "help must state the disabled-budget backstop as \"{unlimited_needle}\": {help}"
         );
 
-        let default_budget = cli(&[]).max_ingest_buffer_bytes;
+        let default_budget = cli(&[]).ingest.max_ingest_buffer_bytes;
         let bounded = ravel_ingest::buffer_memory_backstop_bytes(
             &ingest_defaults,
             ravel_ingest::IngestByteBudgetLimit::Bounded(default_budget),
@@ -12119,7 +12351,7 @@ mod tests {
             let cli = Cli::parse_validated_from(["ravel-server", "--mode", mode])
                 .unwrap_or_else(|err| panic!("--mode {mode} starts without the flag: {err}"));
             assert!(
-                !cli.fold_metrics_label_index,
+                !cli.maintenance.fold_metrics_label_index,
                 "--mode {mode}: the metrics leaf build is off by default"
             );
             let cli = Cli::parse_validated_from([
@@ -12130,7 +12362,7 @@ mod tests {
                 "--fold-metrics-label-index",
             ])
             .unwrap_or_else(|err| panic!("--mode {mode} must accept the flag: {err}"));
-            assert!(cli.fold_metrics_label_index);
+            assert!(cli.maintenance.fold_metrics_label_index);
             let err = Cli::parse_validated_from([
                 "ravel-server",
                 "--mode",
@@ -12218,7 +12450,7 @@ mod tests {
             "900",
         ])
         .expect("--mode query accepts --fold-lag-interval-secs");
-        assert_eq!(cli.fold_lag_interval_secs, Some(900));
+        assert_eq!(cli.maintenance.fold_lag_interval_secs, Some(900));
         cli.validate().expect("a positive interval validates");
 
         let err = Cli::parse_validated_from([
@@ -12238,7 +12470,7 @@ mod tests {
 
         let cli = Cli::parse_validated_from(["ravel-server", "--mode", "query"])
             .expect("a query process that names no fold-lag interval starts");
-        assert_eq!(cli.fold_lag_interval_secs, None);
+        assert_eq!(cli.maintenance.fold_lag_interval_secs, None);
     }
 
     /// A zero (or negative) `--gc-*` duration must be rejected at parse time,
@@ -12302,7 +12534,7 @@ mod tests {
     #[test]
     fn default_audit_mode_is_off_and_resolves_no_pipeline() {
         let cli = Cli::parse_validated_from(["ravel-server"]).expect("no flags parse");
-        assert_eq!(cli.audit_mode, AuditModeArg::Off);
+        assert_eq!(cli.audit.audit_mode, AuditModeArg::Off);
         assert!(!cli.query_audit_enabled());
         assert!(
             cli.resolve_audit_pipeline_config()
@@ -14142,7 +14374,7 @@ mod tests {
     /// loopback-SHAPED endpoint under `--store memory`, which never resolves
     /// it.
     ///
-    /// Prove-the-test (b/d): map `StoreKind::Memory` to `self.s3_endpoint` in
+    /// Prove-the-test (b/d): map `StoreKind::Memory` to `self.object_store.s3_endpoint` in
     /// `Cli::store_is_loopback`'s match. The `--store memory` case
     /// below then derives `budget-carve-loopback`/7,215,545,057 from the
     /// loopback-shaped `--s3-endpoint` alone, against the expected
@@ -14163,7 +14395,7 @@ mod tests {
         // `--s3-endpoint` is env-backed: clear any ambient RAVEL_S3_ENDPOINT
         // so this case asserts the absence it names.
         let mut no_endpoint = cli(&["--store", "s3"]);
-        no_endpoint.s3_endpoint = None;
+        no_endpoint.object_store.s3_endpoint = None;
         let resolved = resolved_from(&no_endpoint);
         assert_eq!(resolved.cache_max_bytes, REFERENCE_CACHE_MAX_BYTES);
         assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
@@ -14437,9 +14669,11 @@ mod tests {
     #[test]
     fn column_stats_cache_flag_parses_and_is_documented() {
         use clap::CommandFactory;
-        assert_eq!(cli(&[]).column_stats_cache_max_bytes, None);
+        assert_eq!(cli(&[]).cache.column_stats_cache_max_bytes, None);
         assert_eq!(
-            cli(&["--column-stats-cache-max-bytes", "0"]).column_stats_cache_max_bytes,
+            cli(&["--column-stats-cache-max-bytes", "0"])
+                .cache
+                .column_stats_cache_max_bytes,
             Some(0)
         );
         assert!(
@@ -16070,7 +16304,7 @@ mod tests {
         // `--s3-endpoint` is env-backed: clear any ambient RAVEL_S3_ENDPOINT so
         // this case asserts the absence it names.
         let mut no_endpoint = cli(&["--store", "s3"]);
-        no_endpoint.s3_endpoint = None;
+        no_endpoint.object_store.s3_endpoint = None;
         assert_eq!(
             no_endpoint.resolve_logs_fetch_policy(),
             (
@@ -16394,7 +16628,7 @@ mod tests {
         let path = dir.path().join("nope.toml");
         std::fs::write(&path, "not toml at all [").expect("write");
         let mut cli = Cli::parse_from(["ravel-server"]);
-        cli.store_cost_profile = Some(path);
+        cli.query.store_cost_profile = Some(path);
         let err = cli
             .validate()
             .expect_err("a bad profile must fail pre-flight");
@@ -17054,7 +17288,7 @@ mod tests {
         use clap::CommandFactory;
 
         let unset = Cli::try_parse_from(["ravel-server"]).expect("parses");
-        assert!(!unset.sql_scan_decode_inline);
+        assert!(!unset.sql.sql_scan_decode_inline);
         assert!(
             !unset
                 .query_budgets(&resolved_from(&unset))
@@ -17253,19 +17487,19 @@ mod tests {
     fn idle_flush_byte_floor_defaults_to_the_disabled_library_value() {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert_eq!(
-            cli.idle_flush_byte_floor as usize,
+            cli.ingest.idle_flush_byte_floor as usize,
             ravel_ingest::IngestConfig::default().idle_flush_byte_floor,
             "--idle-flush-byte-floor must default to IngestConfig's own value"
         );
         assert_eq!(
-            cli.idle_flush_byte_floor, 0,
+            cli.ingest.idle_flush_byte_floor, 0,
             "the shipped default must be 0 (the sub-floor hold disabled), since \
              a non-zero floor widens the buffered-mode loss window"
         );
 
         let set = Cli::try_parse_from(["ravel-server", "--idle-flush-byte-floor", "8192"])
             .expect("an explicit floor parses");
-        assert_eq!(set.idle_flush_byte_floor, 8192);
+        assert_eq!(set.ingest.idle_flush_byte_floor, 8192);
     }
 
     #[test]
@@ -17328,9 +17562,12 @@ mod tests {
     /// `--disable-cache` row reads 9,019,431,321 against 0.
     #[test]
     fn sql_spill_flag_parses_auto_and_off_and_reaches_query_budgets() {
-        assert_eq!(cli(&[]).sql_spill, SqlSpillArg::Auto);
-        assert_eq!(cli(&["--sql-spill", "auto"]).sql_spill, SqlSpillArg::Auto);
-        assert_eq!(cli(&["--sql-spill", "off"]).sql_spill, SqlSpillArg::Off);
+        assert_eq!(cli(&[]).sql.sql_spill, SqlSpillArg::Auto);
+        assert_eq!(
+            cli(&["--sql-spill", "auto"]).sql.sql_spill,
+            SqlSpillArg::Auto
+        );
+        assert_eq!(cli(&["--sql-spill", "off"]).sql.sql_spill, SqlSpillArg::Off);
         for word in ["on", "true", "false", "disabled", "OFF", ""] {
             assert!(
                 Cli::try_parse_from(["ravel-server", "--sql-spill", word]).is_err(),
@@ -17392,7 +17629,7 @@ mod tests {
         ] {
             let parsed = cli(args);
             assert_eq!(
-                parsed.sql_spill_merge.sql_spill_merge_fan_in, expected,
+                parsed.sql.sql_spill_merge.sql_spill_merge_fan_in, expected,
                 "{args:?}"
             );
             let resolved = resolved_from(&parsed);
@@ -18239,15 +18476,21 @@ mod tests {
     #[test]
     fn maintain_claims_flag_defaults_on_and_maps_to_coordination() {
         assert_eq!(
-            cli(&[]).maintain_claims.mode(),
+            cli(&[]).maintenance.maintain_claims.mode(),
             ravel_maintain::config::Coordination::On
         );
         assert_eq!(
-            cli(&["--maintain-claims", "off"]).maintain_claims.mode(),
+            cli(&["--maintain-claims", "off"])
+                .maintenance
+                .maintain_claims
+                .mode(),
             ravel_maintain::config::Coordination::Off
         );
         assert_eq!(
-            cli(&["--maintain-claims", "on"]).maintain_claims.mode(),
+            cli(&["--maintain-claims", "on"])
+                .maintenance
+                .maintain_claims
+                .mode(),
             ravel_maintain::config::Coordination::On
         );
     }
@@ -18372,7 +18615,7 @@ mod tests {
             .expect("a plain --store gcs start is accepted");
         assert_eq!(cli.store, StoreKind::Gcs);
         assert!(
-            cli.s3_request_stored_checksum,
+            cli.object_store.s3_request_stored_checksum,
             "the defaulted value is still true, and is not a refusal"
         );
         cli.validate().expect("a plain --store gcs start validates");
@@ -18993,16 +19236,27 @@ mod tests {
         // The `otap` cargo feature links the service; the flag is the runtime
         // opt-in (ADR-0011). Absent, it defaults false, so an otap-enabled
         // build still does not register the service unless asked.
-        assert!(!cli(&[]).otap, "--otap defaults off even in an otap build");
-        assert!(cli(&["--otap"]).otap, "--otap enables the service");
+        assert!(
+            !cli(&[]).otap_ingest.otap,
+            "--otap defaults off even in an otap build"
+        );
+        assert!(
+            cli(&["--otap"]).otap_ingest.otap,
+            "--otap enables the service"
+        );
     }
 
     #[cfg(feature = "otap")]
     #[test]
     fn otap_max_decoded_batch_bytes_defaults_to_64_mib_and_refuses_zero() {
-        assert_eq!(cli(&[]).otap_max_decoded_batch_bytes, 67_108_864);
         assert_eq!(
-            cli(&["--otap-max-decoded-batch-bytes", "268435456"]).otap_max_decoded_batch_bytes,
+            cli(&[]).otap_ingest.otap_max_decoded_batch_bytes,
+            67_108_864
+        );
+        assert_eq!(
+            cli(&["--otap-max-decoded-batch-bytes", "268435456"])
+                .otap_ingest
+                .otap_max_decoded_batch_bytes,
             268_435_456
         );
         let err = Cli::try_parse_from(["ravel-server", "--otap-max-decoded-batch-bytes", "0"])
@@ -19239,7 +19493,7 @@ mod tests {
             "globex",
         ])
         .expect("every agents flag parses");
-        assert!(parsed.agents);
+        assert!(parsed.agents_runtime.agents);
         let budgets = parsed
             .query_budgets(&resolved_from(&parsed))
             .expect("budgets resolve");
@@ -19272,7 +19526,7 @@ mod tests {
     #[test]
     fn agents_flags_default_to_off_and_the_documented_values() {
         let unset = cli(&[]);
-        assert!(!unset.agents);
+        assert!(!unset.agents_runtime.agents);
         let budgets = unset
             .query_budgets(&resolved_from(&unset))
             .expect("budgets resolve");
@@ -20880,8 +21134,8 @@ mod tests {
         let parsed = cli(&[]);
         assert_eq!(parsed.fold_interval_secs, 300);
         assert_eq!(parsed.maintain_interval_secs, 300);
-        assert_eq!(parsed.alert_eval_interval_secs, 60);
-        assert_eq!(parsed.oidc_jwks_refresh_interval_secs, 300);
+        assert_eq!(parsed.alerting.alert_eval_interval_secs, 60);
+        assert_eq!(parsed.auth.oidc_jwks_refresh_interval_secs, 300);
         parsed.validate().expect("the default intervals start");
     }
 
@@ -20897,7 +21151,7 @@ mod tests {
     /// successfully and log a warning":
     ///
     /// 1. Clamp a local copy and leave the resolved value alone (return
-    ///    `self.max_queued_flushes` from `resolve_flush_concurrency` after
+    ///    `self.ingest.max_queued_flushes` from `resolve_flush_concurrency` after
     ///    warning): the `effective.max_queued_flushes` assertion reads 8, not
     ///    16. `main.rs` fills `ServerConfig::max_queued_flushes` from this
     ///    same resolver, so the value asserted here is the one the shards are
@@ -20909,7 +21163,7 @@ mod tests {
     fn max_inflight_above_max_queued_clamps_the_queue_cap_instead_of_refusing() {
         let parsed = cli(&["--max-inflight-flushes", "16"]);
         assert_eq!(
-            parsed.max_queued_flushes, 8,
+            parsed.ingest.max_queued_flushes, 8,
             "the fixture is the CRD-reachable pair: 16 permits against the default queue cap"
         );
 
@@ -20983,7 +21237,7 @@ mod tests {
     #[test]
     fn max_queued_flushes_default() {
         assert_eq!(
-            cli(&[]).max_queued_flushes,
+            cli(&[]).ingest.max_queued_flushes,
             8,
             "default matches ravel_ingest::IngestConfig::max_queued_flushes"
         );
@@ -20993,7 +21247,7 @@ mod tests {
     fn max_inflight_flushes_and_adaptive_flush_delay_default() {
         let parsed = cli(&[]);
         assert_eq!(
-            parsed.max_inflight_flushes, 8,
+            parsed.ingest.max_inflight_flushes, 8,
             "default matches ravel_ingest::IngestConfig::max_inflight_flushes"
         );
         assert_eq!(
@@ -21001,7 +21255,10 @@ mod tests {
             "unset resolves to N-1 inside ravel_ingest"
         );
         let defaults = ravel_ingest::IngestConfig::default();
-        assert_eq!(defaults.max_inflight_flushes, parsed.max_inflight_flushes);
+        assert_eq!(
+            defaults.max_inflight_flushes,
+            parsed.ingest.max_inflight_flushes
+        );
         assert_eq!(
             defaults.max_inflight_flushes_per_tenant,
             parsed.max_inflight_flushes_per_tenant
@@ -21757,11 +22014,11 @@ mod tests {
         let mut set = oidc.to_vec();
         set.extend(["--oidc-subject-claim", "sub"]);
         let parsed = cli(&set);
-        assert_eq!(parsed.oidc_subject_claim.as_deref(), Some("sub"));
+        assert_eq!(parsed.auth.oidc_subject_claim.as_deref(), Some("sub"));
         parsed
             .parse_auth_resolvers()
             .expect("--oidc-subject-claim with OIDC parses");
-        assert_eq!(cli(&oidc).oidc_subject_claim, None, "no default");
+        assert_eq!(cli(&oidc).auth.oidc_subject_claim, None, "no default");
     }
 
     /// `--mtls-subject-header` is refused empty, without `--mtls-enabled`, and
@@ -21928,13 +22185,19 @@ mod tests {
             "can_admin",
         ])
         .expect("the three agents claim flags parse");
-        assert_eq!(parsed.oidc_agents_claim.as_deref(), Some("can_agents"));
-        assert_eq!(parsed.oidc_agents_worker_claim.as_deref(), Some("can_work"));
-        assert_eq!(parsed.oidc_agents_admin_claim.as_deref(), Some("can_admin"));
+        assert_eq!(parsed.auth.oidc_agents_claim.as_deref(), Some("can_agents"));
+        assert_eq!(
+            parsed.auth.oidc_agents_worker_claim.as_deref(),
+            Some("can_work")
+        );
+        assert_eq!(
+            parsed.auth.oidc_agents_admin_claim.as_deref(),
+            Some("can_admin")
+        );
         let unset = Cli::try_parse_from(["ravel-server"]).expect("no flags parse");
-        assert_eq!(unset.oidc_agents_claim, None);
-        assert_eq!(unset.oidc_agents_worker_claim, None);
-        assert_eq!(unset.oidc_agents_admin_claim, None);
+        assert_eq!(unset.auth.oidc_agents_claim, None);
+        assert_eq!(unset.auth.oidc_agents_worker_claim, None);
+        assert_eq!(unset.auth.oidc_agents_admin_claim, None);
     }
 
     #[test]
@@ -23353,7 +23616,10 @@ mod tests {
     #[test]
     fn the_default_mode_is_off() {
         let cli = Cli::parse_validated_from(["ravel-server"]).expect("default config validates");
-        assert_eq!(cli.format_window_check, FormatWindowCheck::Off);
+        assert_eq!(
+            cli.startup_checks.format_window_check,
+            FormatWindowCheck::Off
+        );
     }
 
     #[test]
@@ -23366,8 +23632,14 @@ mod tests {
             "5s",
         ])
         .expect("a timeout under off is not an error");
-        assert_eq!(cli.format_window_check, FormatWindowCheck::Off);
-        assert_eq!(cli.format_window_check_timeout, Duration::from_secs(5));
+        assert_eq!(
+            cli.startup_checks.format_window_check,
+            FormatWindowCheck::Off
+        );
+        assert_eq!(
+            cli.startup_checks.format_window_check_timeout,
+            Duration::from_secs(5)
+        );
     }
 
     #[test]
@@ -23379,7 +23651,7 @@ mod tests {
         ] {
             let cli = Cli::parse_validated_from(["ravel-server", "--format-window-check", value])
                 .expect("a known value validates");
-            assert_eq!(cli.format_window_check, expected, "{value}");
+            assert_eq!(cli.startup_checks.format_window_check, expected, "{value}");
         }
         let err = Cli::parse_validated_from(["ravel-server", "--format-window-check", "ignore"])
             .expect_err("an unknown value is rejected");
@@ -23389,11 +23661,17 @@ mod tests {
     #[test]
     fn format_window_check_timeout_defaults_to_20s_and_refuses_zero() {
         let cli = Cli::parse_validated_from(["ravel-server"]).expect("default config validates");
-        assert_eq!(cli.format_window_check_timeout, Duration::from_secs(20));
+        assert_eq!(
+            cli.startup_checks.format_window_check_timeout,
+            Duration::from_secs(20)
+        );
         let cli =
             Cli::parse_validated_from(["ravel-server", "--format-window-check-timeout", "5s"])
                 .expect("a non-zero duration validates");
-        assert_eq!(cli.format_window_check_timeout, Duration::from_secs(5));
+        assert_eq!(
+            cli.startup_checks.format_window_check_timeout,
+            Duration::from_secs(5)
+        );
         for value in ["0s", "soon"] {
             let err =
                 Cli::parse_validated_from(["ravel-server", "--format-window-check-timeout", value])

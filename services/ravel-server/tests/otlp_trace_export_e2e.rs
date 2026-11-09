@@ -294,7 +294,7 @@ async fn sql_query_span_is_exported_to_the_configured_collector() {
     let mock = start_mock_collector();
 
     // Parse a real Cli carrying the flag, proving the CLI surface (deliverable
-    // 4) reaches `cli.otlp_trace_endpoint`, then derive the export config
+    // 4) reaches `cli.lifecycle.otlp_trace_endpoint`, then derive the export config
     // through `Cli::otlp_export_config` -- the same method `main.rs` calls,
     // not a second, independently-written derivation that could drift from
     // it (this test previously copied the expression verbatim; a change to
@@ -308,7 +308,7 @@ async fn sql_query_span_is_exported_to_the_configured_collector() {
     ])
     .expect("cli parses --otlp-trace-endpoint");
     assert_eq!(
-        cli.otlp_trace_endpoint.as_deref(),
+        cli.lifecycle.otlp_trace_endpoint.as_deref(),
         Some(mock.endpoint().as_str())
     );
 
