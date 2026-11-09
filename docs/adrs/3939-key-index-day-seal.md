@@ -214,6 +214,8 @@ matter, and the week merge is designed and gated on a pre-registered band.
 ## Acceptance (pre-registered; a figure outside its band is a miss)
 
 Rows W1 to W8 and F1 to F3 in the multi-day amendment extend this table.
+A5 and A7 run on the multi-day states, and A7 at a reduced rate per day,
+as the harness-state amendment states.
 
 | check | target | miss | source |
 |---|---|---|---|
@@ -316,7 +318,8 @@ publishes under the one HEAD CAS. When every hour of a UTC day that the
 part holds is tombstoned, a day part leaves HEAD with no PUT; a longer part
 is re-encoded without that day through decision 5's carry and keeps only
 other days' hours in `retired_hours`. A compaction record, an erasure
-rewrite record or a late commit still dirties the part and re-encodes it in
+rewrite record or a late commit still dirties the part (a late commit only
+into a held-open hour; see the harness-state amendment) and re-encodes it in
 the same fold, so an erasure never lags; a re-encoded part drops its
 retired hours' entries for good and its new ref carries none.
 
@@ -453,6 +456,9 @@ pairs for a logs day, over the 2 GB band; #4018 gives it the pair budget.
 
 ### Acceptance (added rows; predicted, a figure outside its band is a miss)
 
+W2 is measured on the C1 binary, and W5, F2 and F3 on the 30-day state at
+a reduced rate per day, as the harness-state amendment states.
+
 | check | target | miss | source |
 |---|---|---|---|
 | W1 advance at a full-day tail, logs, decision 5 landed | at most 26 passes, at most 1.4 GB leaf bytes, fold peak RSS at most 1.2 GB | more than 26 passes, over 1.4 GB, or RSS over 1.2 GB | predicted; comment 6700944105 (1.99 GB less 1.31 GB held plus 0.17 GB) |
@@ -469,6 +475,8 @@ pairs for a logs day, over the 2 GB band; #4018 gives it the pair budget.
 
 ### Plan (added and edited rows)
 
+H1 splits into H1a and H1b, as the harness-state amendment states.
+
 | task | crates | depends on | risk |
 |---|---|---|---|
 | D1 as specced, with a policy value instead of a bool and a report line stating the from-sections cost of a dirty sealed day as owned by C1 | ravel-catalog, ravel-cli, docs | #3917 (same crate) | high |
@@ -478,3 +486,64 @@ pairs for a logs day, over the 2 GB band; #4018 gives it the pair budget.
 | H1 harness rows W1 to W8 and F1 to F3 | benchmarks/investigations | D1 | low |
 | D3' Stage 2 run: A1 to A7, W1 to W8, F1 to F3, ADR-3692 rows 7, 8, 11, 18 | benchmarks, docs | R2, H1 | low |
 | M1 the week merge, dispatched only on an F1 to F3 miss | ravel-catalog, docs, its own ADR | C1, R2, D3' | high |
+
+## Amendment (issue #3939, harness states): how Stage 2 builds day parts, which binary measures W2, and W5 and A7 at a reduced rate
+
+<!-- amendment-applies: sections="Acceptance (pre-registered; a figure outside its band is a miss)" pointer="harness-state amendment" -->
+<!-- amendment-supersedes: phrase="a late commit still dirties the part" pointer="harness-state amendment" -->
+
+Date: 2026-11-09. Recorded before any Stage 2 figure exists, so it changes
+what is measured and how, not a result.
+
+**Day parts by ingest hour.** A day part is a UTC day of ingest hours,
+which the server's clock assigns, so a corpus loaded through the server in
+one sitting lands in one or two days. Stage 2 builds its multi-day states
+with the hour-stride lane of `ravel-cli load` (`--ingest-hour-stride 1
+--ingest-hour-start`), which drives the production log and span routers
+under an offset clock (services/ravel-cli/src/load/hour_stride.rs), into a
+fresh tenant, one fully acknowledged batch per shard per hour, every hour
+strictly in the past, and the investigations harness already uses it for
+its many-parts state. One `catalog fold --writers-stopped
+--key-index-leaves` then builds every day's leaves once (decision 4,
+corrected), and the advance rows run on a tail loaded through the server
+after it. The lane writes one object per shard per hour: 192 entries a day
+at 8 shards, against box D's 552. The leaf GET figures depend on slices
+per day part, not on entries, and the run stamps both.
+
+**Two states.** A 7-day state at box D's logs rate, for A5, W4, W6, W7, F1
+and F3. A 30-day state at a reduced rate per day, for A7, W5 and F2,
+because 30 days at box D's rate cost about 4 hours of fold and about 20
+hours of corpus generation, which no single run's deadline holds. At the
+reduced rate the per-day figures follow the slices the run stamps: with
+`S` the most slices one day part carries for `request_id` (the harness's
+`stamp.slices` figure) and `T(S)` as defined under "What multi-day lookups
+cost, restated", A7 and W5 target at most `T(S) + 100` leaf GETs per day
+part and `30 x (T(S) + 100)` in all, and F3's bound on the 30-day state is
+`1.1 x (T(S) + 100)` per day part. The state must give `S` of at least 3,
+so the multi-slice term is exercised; a run with fewer is not-run for those
+rows, not a pass. 3,780 and 126 stay the box D instance of the same rule.
+A7's days-covered clause, written against the 2,048 ceiling, reads under
+ADR-3692's key-set ceiling amendment: every day held is covered while `30 x
+(T(S) + 100)` is at most 66,560. F2 is a ratio to the same statement's
+unfolded p50 and needs no restatement.
+
+**W2 runs on the C1 binary.** After R2, a tombstoned hour in a sealed day
+takes the `retired_hours` path and is not re-encoded, and a late level-0
+commit is reconciled only in a bucket that lists a compaction record,
+tombstone or rewrite record, or in a held-open hour above the fold margin
+(crates/ravel-catalog/src/fold.rs `bucket_needs_reconcile` and
+`held_open_hours`), which is the tail, not a sealed day. No dirtying event
+on an R2 build reaches W2's mechanism, so W2 is measured on the main SHA
+that carries C1 and not R2, and the D3' run stamps the fold binary's SHA
+beside W2. Every other row runs on the R2 build.
+
+**Decision 6, corrected.** Its sentence "a compaction record, an erasure
+rewrite record or a late commit still dirties the part" holds for a late
+commit only into a held-open hour; a sealed day cannot receive one under
+the seal lemma (ADR-0063).
+
+**Plan.** H1 splits in two. H1a adds A1 to A7, W1 to W8 and F1 to F3 to the
+investigations harness's bands, each reporting not-run until its state
+exists; it touches benchmarks/investigations only. H1b adds the 7-day,
+30-day and retired-hour states to the box scripts. D3' runs W2 on the C1
+SHA.
