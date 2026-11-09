@@ -279,28 +279,38 @@ fn int64(column: &ArrayRef) -> &Int64Array {
 /// The whole input lives in eight partitions and every group spreads over up
 /// to eight of them, so a group's count is right only if the filter sits
 /// after the hash repartition, where each group lives in one partition. The
-/// pool is 1 MiB, and the run skips partial aggregation from the first row
-/// and uses 1,024-row batches ([`probed`]'s `tight`), so the exchange and the
-/// partial stage fit and the final aggregate decides whether the pool holds:
-/// with the rule off it does not, and the query is refused.
+/// final stage runs at the shipped first-attempt floor, 16 streams over the
+/// engine's 8. The run skips partial aggregation from the first row and uses
+/// 1,024-row batches ([`probed`]'s `tight`), so the exchange and the partial
+/// stage fit and the final aggregate decides whether the 4 MiB pool holds:
+/// with the rule on the charged peak measured 1.13 to 1.53 MB, and with it
+/// off the final aggregates need about 6.6 MB and the query is refused.
 ///
 /// FLIP 1: a rule that puts the filter on the repartition's input, before
 /// the hash exchange, returns counts short of `1 + (k mod 13)`.
 /// FLIP 2: a filter that ends its input once it holds `n` groups, as a soft
 /// limit would, returns counts short of `1 + (k mod 13)`.
+/// FLIP 3: set `first_attempt_min_partitions: 0` and the exchange reads 8
+/// partitions, not 16.
 #[tokio::test]
 async fn the_returned_groups_carry_every_row_from_every_input_partition() {
+    const POOL: usize = 4 * MIB;
     let sql = "SELECT k, count(*), sum(v) FROM t GROUP BY k LIMIT 10";
     let config = SqlConfig {
-        max_query_bytes: MIB,
-        // Sixteen final streams do not fit the 1 MiB pool even with the rule
-        // on; the claim is about the engine's eight.
-        first_attempt_min_partitions: 0,
+        max_query_bytes: POOL,
         ..SqlConfig::default()
     };
     let run = probed(&config, spread_parts(), sql, true).await;
     assert_eq!(run.bounds, vec![10], "{}", run.plan);
-    let batches = run.result.expect("query runs in 1 MiB");
+    assert!(
+        run.plan
+            .lines()
+            .any(|line| line.contains("RepartitionExec: partitioning=Hash(")
+                && line.contains("], 16)")),
+        "the final stage runs at the floor's 16 streams:\n{}",
+        run.plan
+    );
+    let batches = run.result.expect("query runs in 4 MiB");
 
     let mut keys = BTreeSet::new();
     for batch in &batches {
@@ -326,8 +336,8 @@ async fn the_returned_groups_carry_every_row_from_every_input_partition() {
         "LIMIT 10 over 65,536 groups returns 10 groups"
     );
     assert!(
-        run.charged < MIB as u64,
-        "charged peak {} reached the 1 MiB pool",
+        run.charged < POOL as u64,
+        "charged peak {} reached the 4 MiB pool",
         run.charged
     );
 
@@ -338,9 +348,9 @@ async fn the_returned_groups_carry_every_row_from_every_input_partition() {
         ..config.clone()
     };
     let off = probed(&off, spread_parts(), sql, true).await;
-    let err = off.result.expect_err("the rule-off plan exceeds 1 MiB");
+    let err = off.result.expect_err("the rule-off plan exceeds 4 MiB");
     eprintln!(
-        "first_groups 1 MiB: charged peak {} with the bound; rule off: {err}",
+        "first_groups 4 MiB: charged peak {} with the bound; rule off: {err}",
         run.charged
     );
     assert!(
@@ -553,7 +563,7 @@ struct Probed {
 }
 
 /// Run `sql` over `parts` on the production session, its pool wrapped in an
-/// [`EnvelopeProbe`]. `tight` fits the run's fixed costs under a 1 MiB pool:
+/// [`EnvelopeProbe`]. `tight` fits the run's fixed costs under a pool of a few MiB:
 /// DataFusion's partial-aggregation probe decides after the first row, so a
 /// partial aggregate over keys that barely repeat passes its rows on rather
 /// than holding up to 8,192 rows' worth of groups first, and batches hold

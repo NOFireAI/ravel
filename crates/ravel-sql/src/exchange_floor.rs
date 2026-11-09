@@ -346,9 +346,9 @@ mod tests {
     /// the two inputs at 16 and 8 partitions.
     ///
     /// FLIP: drop the `co_partitions_its_inputs` skip in `optimize`, and the
-    /// interleave's rebuild fails ("Not all InterleaveExec children have a
-    /// consistent hash or range partitioning") while the join's left input
-    /// reads 16.
+    /// join's left input reads `Hash([k@0], 16)` against the right's 8, while
+    /// the interleave's rebuild fails ("Can not create InterleaveExec: new
+    /// children can not be interleaved").
     #[test]
     fn a_plan_that_co_partitions_its_inputs_is_left_unrewritten() {
         let interleaved: Arc<dyn ExecutionPlan> = Arc::new(
@@ -380,7 +380,7 @@ mod tests {
             .expect("join"),
         );
 
-        for plan in [interleaved, joined] {
+        for plan in [joined, interleaved] {
             let before = plan_text(&plan);
             let after = FinalExchangeFloor::new(16)
                 .optimize(plan, &ConfigOptions::default())
