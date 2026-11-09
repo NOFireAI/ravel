@@ -2160,7 +2160,11 @@ async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() 
     let before = retry_lines();
     let floored = run_under(16, budget).await;
     assert_eq!(
-        (floored.spill_retries, floored.first_refusal, floored.spill_files),
+        (
+            floored.spill_retries,
+            floored.first_refusal,
+            floored.spill_files
+        ),
         (0, None, 0),
         "at the floor the statement answers on its first attempt under {budget} bytes"
     );
