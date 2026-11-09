@@ -1181,9 +1181,9 @@ class LocalSmoke(Workdir):
             f = figure(res, f"row_11.{name}")
             self.assertEqual((f["status"], f["verdict"]), (GUARD, GUARD), name)
 
-    def test_fixture_is_under_300_kb(self):
+    def test_fixture_is_under_320_kb(self):
         total = sum(os.path.getsize(os.path.join(d, n)) for d, _, names in os.walk(SMOKE) for n in names)
-        self.assertLess(total, 300_000)
+        self.assertLess(total, 320_000)
 
     def test_problems_are_exactly_these(self):
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))

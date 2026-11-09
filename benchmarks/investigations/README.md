@@ -985,7 +985,7 @@ log rows fill 14 store blocks. It took 23 minutes, 13 of them the mixed
 state's wait for the next ingest hour. Imported
 with `investigations_cases.py --import-local-smoke DIR`. Its `calls.jsonl`,
 `truth.json`, `results.local.json` and every stamp are gzipped, which keeps
-the fixture under 300 KB; `summary.local.txt` and `run.toml` are plain.
+the fixture under 320 KB; `summary.local.txt` and `run.toml` are plain.
 
 Its verdict is `fail`. The problem list, pinned by the suite:
 
