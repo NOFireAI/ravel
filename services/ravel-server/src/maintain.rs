@@ -8182,6 +8182,161 @@ mod tests {
         );
     }
 
+    /// A claim of a future `format_version` (a rolled-back build meeting a
+    /// newer one's claim) holds an erasure rewrite back only until it is older
+    /// than the 24 h lease ceiling plus this process's jitter (ADR-1029, the
+    /// 2026-11-09 amendment). Before that the pass backs off and the request
+    /// stays pending; after it the pass steals the claim under CAS, publishes
+    /// the rewrite and completes the request, with no write to the claim object
+    /// by anyone in between.
+    ///
+    /// Shown failing against an observation that gives an unreadable claim the
+    /// configured lease (the first pass steals: counters `(1, 1, 0)`), and
+    /// against a claim guard that never steals one (the second pass backs off
+    /// again: `(0, 0, 2, 0)`).
+    #[tokio::test]
+    async fn a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling() {
+        use prost::Message as _;
+        use ravel_fleet::claim::{
+            CLAIM_FORMAT_VERSION, ClaimConfig, MAX_OBSERVED_LEASE_MS, WorkIdentity,
+            compaction_claim_key, jitter_ms,
+        };
+
+        let store = MemoryStore::new();
+        let plant_ms = TEST_ERASURE_NOW_NS / 1_000_000;
+        store.set_clock_ms(plant_ms as u64);
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+        let request_id = Uuid::from_u128(0x3209);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let work_id = WorkIdentity::new(tenant, Signal::Metrics, 0, 0).work_id();
+        let claim_key = compaction_claim_key(&work_id);
+        let future = ravel_proto::sys::v1::CompactionClaim {
+            format_version: CLAIM_FORMAT_VERSION + 1,
+            owner_process_id: Uuid::from_u128(0xF0F0).as_bytes().to_vec(),
+            attempt_id: Uuid::from_u128(0xF0F1).as_bytes().to_vec(),
+            input_set_hash: Vec::new(),
+            state: ravel_proto::sys::v1::ClaimState::Running as i32,
+            renewed_count: 0,
+            lease_duration_ns: 1_000_000_000,
+            owner_clock_ns: TEST_ERASURE_NOW_NS,
+        };
+        let planted = store
+            .put(
+                &claim_key,
+                future.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("plant the future-format claim")
+            .version;
+
+        let process = Uuid::from_u128(0xE2A5);
+        let compactor_at = |clock: &FixedClock| CompactorConfig {
+            coordination: Coordination::On,
+            claim_participant: Some(ClaimParticipant::new(
+                process,
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            ..CompactorConfig::default()
+        };
+        let lease_ms = CompactorConfig::default().claim_lease_duration.as_millis() as i64;
+        let jitter = jitter_ms(
+            &work_id,
+            &process,
+            lease_ms,
+            &ClaimConfig {
+                lease_duration: CompactorConfig::default().claim_lease_duration,
+                ..ClaimConfig::default()
+            },
+        );
+        let safety = MaintenanceSafetyMetrics::default();
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Older than the claim's own declared lease and the configured lease,
+        // each plus jitter: still held.
+        let clock = FixedClock::new((plant_ms + lease_ms + jitter + 1) * 1_000_000);
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor_at(&clock),
+            &ravel_maintain::NoLeases,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+            &safety,
+        )
+        .await;
+        assert_eq!(
+            (
+                safety.claims_acquired(Signal::Metrics),
+                safety.claims_stolen(Signal::Metrics),
+                safety.claims_skipped(Signal::Metrics),
+            ),
+            (0, 0, 1),
+            "inside the ceiling the pass backs off"
+        );
+        assert!(rewrite_records(&store, &tenant).await.is_empty());
+        assert!(store.get(&done_key, GetRange::Full).await.is_err());
+        assert!(store.get(&dreq_key, GetRange::Full).await.is_ok());
+
+        // One millisecond past the ceiling plus jitter: stolen and published.
+        clock.set((plant_ms + MAX_OBSERVED_LEASE_MS + jitter + 1) * 1_000_000);
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor_at(&clock),
+            &ravel_maintain::NoLeases,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+            &safety,
+        )
+        .await;
+        assert_eq!(
+            (
+                safety.claims_acquired(Signal::Metrics),
+                safety.claims_stolen(Signal::Metrics),
+                safety.claims_skipped(Signal::Metrics),
+                safety.claims_lost(Signal::Metrics),
+            ),
+            (1, 1, 1, 0),
+            "past the ceiling the pass steals the claim"
+        );
+        let records = rewrite_records(&store, &tenant).await;
+        assert_eq!(records.len(), 1, "the stolen bucket is rewritten once");
+        assert_eq!(records[0].drops.len(), 1);
+        assert_eq!(records[0].drops[0].request_id, request_id.to_string());
+        assert_eq!(
+            rewritten_label_sets(&store, &records[0]).await,
+            vec![subject_labels(TEST_SURVIVING_SUBJECT)],
+            "the subject is gone and the bystander is intact"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            "the request completes"
+        );
+        assert_ne!(
+            store.head(&claim_key).await.expect("claim head").version,
+            planted,
+            "the steal wrote the claim object"
+        );
+    }
+
     /// The `.done` predicate hash is what makes a permanent completion record
     /// PII-free, so it must be stable across matcher orderings (two
     /// submissions of the same erasure hash the same) and must never contain

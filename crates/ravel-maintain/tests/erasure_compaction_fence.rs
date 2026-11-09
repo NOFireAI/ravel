@@ -579,25 +579,30 @@ async fn the_pre_publish_relist_aborts_when_the_record_set_changed() {
     assert_eq!(record_sets(store.as_ref()).await, (1, 0));
 }
 
-/// A stale unreadable claim holds the bucket against both passes: neither runs
+/// A stale unreadable claim holds the bucket against both passes until it is
+/// older than the lease ceiling plus the contender's jitter: neither runs
 /// unclaimed past it, since a pass without the claim would publish unfenced.
+/// Past the ceiling the erasure rewrite steals the claim and publishes holding
+/// it, so the forged object stalled the erasure for one ceiling and no longer.
 ///
-/// Shown failing against the pre-fix compaction path, where
-/// `Acquire::Unclaimed` ran the bucket unclaimed (`Ran(Compacted { .. })`).
-/// The removed line is the `Acquire::Unclaimed { key } =>` arm of
-/// `claim_guard::claim_bucket` that builds the `UnreadableClaim` skip.
+/// Shown failing against an observation that gives an unreadable claim the
+/// configured lease (the compaction runs instead of backing off), and against
+/// a claim guard that never steals one (the erasure rewrite past the ceiling
+/// abandons with `ClaimHeld`).
 #[tokio::test]
-async fn a_stale_unreadable_claim_holds_the_bucket_against_both_passes() {
+async fn a_stale_unreadable_claim_holds_both_passes_until_the_lease_ceiling() {
     use bytes::Bytes;
-    use ravel_fleet::claim::{WorkIdentity, compaction_claim_key};
+    use ravel_fleet::claim::{
+        ClaimConfig, MAX_OBSERVED_LEASE_MS, WorkIdentity, compaction_claim_key, jitter_ms,
+    };
     use ravel_object_store::PutOptions;
 
     let now_ns = sealed_now_ns();
     let store = seeded_store(now_ns).await;
     let b = bucket();
-    let claim_key = compaction_claim_key(
-        &WorkIdentity::new(b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket).work_id(),
-    );
+    let work_id =
+        WorkIdentity::new(b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket).work_id();
+    let claim_key = compaction_claim_key(&work_id);
     store
         .put(
             &claim_key,
@@ -606,6 +611,14 @@ async fn a_stale_unreadable_claim_holds_the_bucket_against_both_passes() {
         )
         .await
         .expect("seed an unreadable claim");
+    let written_ms = i64::try_from(ms(now_ns)).expect("ms");
+    let claim_cfg = ClaimConfig {
+        lease_duration: LEASE,
+        ..ClaimConfig::default()
+    };
+    let lease_ms = i64::try_from(LEASE.as_millis()).expect("ms");
+    let jitter =
+        |process: u128| jitter_ms(&work_id, &Uuid::from_u128(process), lease_ms, &claim_cfg);
     // Well past one lease plus any jitter on both the store's and the passes'
     // clocks.
     let later_ns = now_ns + 10 * PAST_LEASE_NS;
@@ -622,8 +635,8 @@ async fn a_stale_unreadable_claim_holds_the_bucket_against_both_passes() {
             assert_eq!(skip.reason, ClaimSkipReason::UnreadableClaim);
             assert_eq!(
                 skip.reschedule_after_unix_ms,
-                i64::try_from(ms(later_ns)).expect("ms") + 3_000,
-                "retried one lease later"
+                written_ms + MAX_OBSERVED_LEASE_MS + jitter(1) + 1,
+                "retried once the claim is older than the ceiling plus jitter"
             );
         }
         other => panic!("the compaction must back off: {other:?}"),
@@ -652,6 +665,25 @@ async fn a_stale_unreadable_claim_holds_the_bucket_against_both_passes() {
         Bytes::from_static(b"\xff\xff not a claim"),
         "the unreadable claim is left in place"
     );
+
+    // One millisecond past the ceiling plus the erasure rewrite's jitter, on
+    // the passes' clock only: the claim object's last_modified does not move.
+    let past_ms = written_ms + MAX_OBSERVED_LEASE_MS + jitter(2) + 1;
+    clock.set(past_ms * 1_000_000);
+    let outcome = erasure(store.as_ref(), &clock, &e_config).await;
+    assert!(
+        matches!(
+            outcome,
+            ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                abandoned: None,
+                claim: Some(ClaimAcquisition { stolen: true }),
+                ..
+            }
+        ),
+        "past the ceiling the erasure rewrite steals the claim and publishes: {outcome:?}"
+    );
+    assert_eq!(record_sets(store.as_ref()).await, (0, 1));
 }
 
 /// A run past its `max_compaction_lifetime` deadline publishes nothing and says

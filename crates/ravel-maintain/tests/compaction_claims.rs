@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::*;
-use ravel_fleet::claim::{COMPACTION_CLAIMS_PREFIX, ClaimConfig};
+use ravel_fleet::claim::{
+    COMPACTION_CLAIMS_PREFIX, ClaimConfig, MAX_OBSERVED_LEASE_MS, WorkIdentity, jitter_ms,
+};
 use ravel_maintain::claim_guard::{Acquire, ClaimGuard, ClaimSleeper};
 use ravel_maintain::{
     Checkpoint, ClaimParticipant, ClaimSkipReason, ClaimedCompaction, Clock, CompactionOutcome,
@@ -1051,28 +1053,31 @@ async fn a_failed_completion_keeps_the_published_outcome_and_the_pass_goes_on() 
     }
 }
 
-/// An unreadable claim older than one lease plus jitter holds its bucket: the
-/// run backs off rather than publish unfenced against an erasure rewrite
-/// (ADR-1029, the 2026-10-03 amendment), the claim object is left untouched,
-/// and the claim protocol issues only the contention path (no steal, no
-/// completion).
+/// An unreadable claim younger than the lease ceiling plus jitter holds its
+/// bucket even once it is older than one lease: the run backs off rather than
+/// publish unfenced against an erasure rewrite (ADR-1029, the 2026-10-03
+/// amendment), the claim object is left untouched, and the claim protocol
+/// issues only the contention path (no steal, no completion). Past the
+/// ceiling plus jitter the run steals the claim and compacts the bucket.
 ///
-/// Shown failing against the pre-amendment compaction path, which ran such a
-/// bucket unclaimed: the outcome is `Ran(Compacted { .. })` instead.
+/// Shown failing against an observation that gives an unreadable claim the
+/// configured lease (the first run compacts), and against a claim guard that
+/// never steals one (the run past the ceiling is still skipped).
 #[tokio::test]
-async fn a_stale_unreadable_claim_holds_the_bucket() {
+async fn a_stale_unreadable_claim_holds_the_bucket_until_the_lease_ceiling() {
     let store = MemoryStore::new();
     let now_ns = sealed_now_ns();
     let written_ms = now_ns / 1_000_000;
     store.set_clock_ms(written_ms as u64);
     seed_two_metric_inputs(&store).await;
+    let claim_cfg = ClaimConfig {
+        lease_duration: LEASE,
+        ..ClaimConfig::default()
+    };
     let holder = ClaimGuard::new(
         &bucket(),
         &participant(9, &FixedClock::new(now_ns)),
-        ClaimConfig {
-            lease_duration: LEASE,
-            ..ClaimConfig::default()
-        },
+        claim_cfg,
         None,
     );
     let key = format!("{COMPACTION_CLAIMS_PREFIX}{}", holder.work_id_hex());
@@ -1081,6 +1086,13 @@ async fn a_stale_unreadable_claim_holds_the_bucket() {
         .put(&key, garbage.clone(), PutOptions::create_if_absent())
         .await
         .expect("seed an unreadable claim");
+    let b = bucket();
+    let jitter = jitter_ms(
+        &WorkIdentity::new(b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket).work_id(),
+        &Uuid::from_u128(2),
+        LEASE.as_millis() as i64,
+        &claim_cfg,
+    );
 
     // Well past one lease plus the largest possible jitter (10% of the lease).
     let later_ns = now_ns + 2 * LEASE.as_nanos() as i64;
@@ -1099,8 +1111,8 @@ async fn a_stale_unreadable_claim_holds_the_bucket() {
             assert_eq!(skip.reason, ClaimSkipReason::UnreadableClaim);
             assert_eq!(
                 skip.reschedule_after_unix_ms,
-                later_ns / 1_000_000 + LEASE.as_millis() as i64,
-                "the bucket is retried one lease later"
+                written_ms + MAX_OBSERVED_LEASE_MS + jitter + 1,
+                "the bucket is retried once the claim is older than the ceiling plus jitter"
             );
         }
         other => panic!("a stale unreadable claim holds the bucket: {other:?}"),
@@ -1125,6 +1137,35 @@ async fn a_stale_unreadable_claim_holds_the_bucket() {
         "the unreadable claim is left in place"
     );
     assert_eq!(record_keys(&store).await.len(), 0);
+
+    // Past the ceiling plus jitter: the run steals the claim and compacts.
+    clock.set((written_ms + MAX_OBSERVED_LEASE_MS + jitter + 1) * 1_000_000);
+    let ledger = RequestLedger::new();
+    let outcome = compact_bucket_claimed(
+        &store,
+        &clock,
+        &claiming_config(2, &clock, 1, &ledger),
+        &bucket(),
+    )
+    .await
+    .expect("compact");
+    assert!(
+        matches!(
+            outcome,
+            ClaimedCompaction::Ran(CompactionOutcome::Compacted { .. })
+        ),
+        "past the ceiling the run steals the claim and compacts: {outcome:?}"
+    );
+    assert_ne!(
+        store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("claim read")
+            .data,
+        garbage,
+        "the unreadable claim was overwritten by the steal"
+    );
+    assert_eq!(record_keys(&store).await.len(), 1);
 }
 
 /// The Publish checkpoint (rewrite.rs, immediately before the record PUT)

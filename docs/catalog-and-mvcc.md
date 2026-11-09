@@ -208,11 +208,16 @@ deterministic per-contender jitter, and never polls. Nothing deletes these
 objects PROGRAMMATICALLY: an unconditional DELETE by a worker whose claim was
 already stolen would destroy the newer owner's claim, so completion is a CAS
 state flip and reclamation is lifecycle aging. A claim whose payload no longer
-decodes is observed with the fallback lease and never stolen (never overwrite
-what you cannot read), and it holds its bucket against both the compaction and
-the erasure rewrite until an OPERATOR deletes that one key by hand: a pass that
-ran past it would publish unfenced. Delete it only once no compaction, migration
-or erasure rewrite of that bucket is running. Like the heartbeat and the memo it must sit
+decodes is judged by the 24 hour ceiling: it holds its bucket against both the
+compaction and the erasure rewrite until its `last_modified` is more than
+`MAX_OBSERVED_LEASE_MS` plus the contender's jitter in the past, and then a
+contender steals it under CAS on the observed version, so the stealing pass
+runs fenced (ADR-1029, 2026-11-09 amendment). A pass never runs past an
+unreadable claim unclaimed, since it would publish unfenced. An operator who
+needs the bucket sooner may delete that one key by hand, but only once no
+compaction, migration or erasure rewrite of that bucket is running. A writer
+that re-PUTs a claim more often than every 24 hours still holds the bucket.
+Like the heartbeat and the memo it must sit
 outside any WORM-protected prefix, since it is mutated in place.
 
 Between two compactions the claim is **advisory and reconstructible**: it

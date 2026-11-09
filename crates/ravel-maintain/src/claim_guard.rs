@@ -61,19 +61,18 @@
 //! it pays the jitter once, before its steal (ADR-1029, the amendment on
 //! jitter on the contended path).
 //!
-//! # An unreadable claim holds its bucket
+//! # An unreadable claim holds its bucket up to the lease ceiling
 //!
-//! A claim whose payload does not decode (corruption, or a newer format
-//! written before a rollback) is never stolen: a reader that cannot read a
-//! claim cannot know it is safe to overwrite. Once the unreadable object's age
-//! by the store's `last_modified` exceeds one lease plus this contender's
-//! jitter, [`ClaimGuard::acquire`] reports [`Acquire::Unclaimed`] with a
-//! warning naming the key; before that age the bucket is deferred like any
-//! held claim. Neither pass that uses this guard runs on an
-//! `Acquire::Unclaimed`: [`claim_bucket`] turns it into a back-off, because
-//! the claim fences the compaction publish against the erasure rewrite
-//! publish of the same bucket (ADR-1029, the 2026-10-03 amendment), and a run
-//! past an unreadable claim would publish unfenced.
+//! A claim whose payload does not decode (corruption, a forged object, or a
+//! newer format written before a rollback) declares no lease this build can
+//! read, so it is judged by [`ravel_fleet::claim::MAX_OBSERVED_LEASE_MS`].
+//! Until its age by the store's `last_modified` exceeds that ceiling plus this
+//! contender's jitter, the bucket is deferred with
+//! [`ClaimSkipReason::UnreadableClaim`]. Past it, [`ClaimGuard::acquire`]
+//! steals the claim under CAS on the observed version, so the pass that runs
+//! holds the claim and is fenced like any other (ADR-1029, the 2026-10-03 and
+//! 2026-11-09 amendments). The reschedule point already carries the jitter,
+//! so that steal waits none.
 //!
 //! # The claim fences compaction against the erasure rewrite
 //!
@@ -192,12 +191,11 @@ pub enum ClaimSkipReason {
     /// steal), or the claim object was gone by the steal's CAS.
     StealLost,
     /// The claim's payload does not decode, or declares a format floor this
-    /// build does not understand. Such a claim is never stolen: a reader that
-    /// cannot read a claim cannot know it is safe to take. Before it is older
-    /// than one lease plus this contender's jitter the guard reports this skip
-    /// itself; past that age the guard reports [`Acquire::Unclaimed`] and
-    /// [`claim_bucket`] reports this skip instead, so the bucket stays held
-    /// until an operator removes the unreadable object.
+    /// build does not understand, and the claim is not yet older than
+    /// [`ravel_fleet::claim::MAX_OBSERVED_LEASE_MS`] plus this contender's
+    /// jitter by the store's `last_modified`. Past that age the guard steals
+    /// it, so without a write to the object the bucket is held for at most
+    /// that long.
     UnreadableClaim,
     /// The claim existed at the `CreateIfAbsent` and was gone by the read that
     /// followed, twice in a row. One retry is free; a second vanishing means
@@ -236,8 +234,8 @@ pub struct ClaimSkip {
     /// It carries no jitter, because the retry waits out this contender's
     /// jitter itself before it steals the expired claim. For an unreadable
     /// claim it is the instant the claim stops holding the bucket back, one
-    /// millisecond past one lease plus this contender's jitter, since that
-    /// retry steals nothing and so waits nothing. Never poll before it.
+    /// millisecond past the lease ceiling plus this contender's jitter, and
+    /// the retry from it steals without a further wait. Never poll before it.
     pub reschedule_after_unix_ms: i64,
 }
 
@@ -250,16 +248,6 @@ pub enum Acquire {
     Acquired,
     /// The claim is not available to this run; see [`ClaimSkip`].
     Skipped(ClaimSkip),
-    /// The claim object is unreadable and older than one lease plus this
-    /// contender's jitter by the store's `last_modified`. It is left in place
-    /// (never stolen, never deleted), and this run holds no claim. The
-    /// maintenance passes do not run on it: [`claim_bucket`] reports it as a
-    /// [`ClaimSkipReason::UnreadableClaim`] back-off, because a pass without the
-    /// claim would publish unfenced against the other pass.
-    Unclaimed {
-        /// The unreadable claim's object key.
-        key: String,
-    },
 }
 
 /// How the contended-path jitter is waited out.
@@ -513,8 +501,9 @@ impl ClaimGuard {
         }
     }
 
-    /// The contention path: steal an expired claim, run past a stale
-    /// unreadable one, or report the skip.
+    /// The contention path: steal an expired claim (an unreadable one once
+    /// past the lease ceiling plus this contender's jitter), or report the
+    /// skip.
     async fn contend(
         &self,
         store: &dyn ObjectStoreBackend,
@@ -522,12 +511,13 @@ impl ClaimGuard {
     ) -> Result<Acquire> {
         let inner = &self.inner;
         let now_ms = self.now_unix_ms();
+        let unreadable = observed.holder.is_none();
         let skip = |reason: ClaimSkipReason| {
             // A held claim's retry steals, and waits out the jitter before it,
-            // so its reschedule point is the bare expiry. An unreadable claim's
-            // retry steals nothing, so it is rescheduled to the observation's
-            // own point, which adds the jitter: the instant `past_unreadable`
-            // lets the run proceed. A lost steal or reclaim means another
+            // so its reschedule point is the bare expiry. An unreadable claim
+            // is rescheduled to the observation's own point, which adds the
+            // jitter, and its retry steals with no further wait. A lost steal
+            // or reclaim means another
             // write just gave the claim a fresh lease, so the observed expiry
             // no longer bounds it and the retry waits one full lease from now.
             let reschedule_after_unix_ms = match reason {
@@ -547,10 +537,8 @@ impl ClaimGuard {
                 reschedule_after_unix_ms,
             })
         };
-        if observed.holder.is_none() {
-            return Ok(self
-                .past_unreadable(&observed, now_ms)
-                .unwrap_or_else(|| skip(ClaimSkipReason::UnreadableClaim)));
+        if unreadable && now_ms < observed.reschedule_after_unix_ms {
+            return Ok(skip(ClaimSkipReason::UnreadableClaim));
         }
         if observed.holder_process_id() == Some(inner.owner.process_id) {
             // This process's own claim, left behind by an earlier run of this
@@ -596,9 +584,21 @@ impl ClaimGuard {
             return Ok(skip(ClaimSkipReason::HeldByAnother));
         }
 
-        // Contenders rescheduled to the same expiry arrive here together; the
-        // jitter spreads their steals.
-        self.wait_jitter().await;
+        if unreadable {
+            // Each contender's threshold above already carries its own jitter,
+            // so contenders do not arrive here together and none is waited.
+            tracing::warn!(
+                key = %observed.key,
+                work_id = %observed.work_id.hex(),
+                last_modified_unix_ms = observed.last_modified_unix_ms,
+                "compaction claim is unreadable and older than the lease ceiling plus \
+                 jitter; stealing it under CAS (ADR-1029)"
+            );
+        } else {
+            // Contenders rescheduled to the same expiry arrive here together;
+            // the jitter spreads their steals.
+            self.wait_jitter().await;
+        }
         let now_ms = self.now_unix_ms();
         let stolen = match claim::steal(store, &observed, &inner.owner, &inner.cfg, now_ms).await {
             // The claim object was deleted between the observation and the
@@ -629,40 +629,11 @@ impl ClaimGuard {
                 self.note_requests(1).await;
                 Ok(skip(ClaimSkipReason::StealLost))
             }
-            // Refused locally: no store request was issued at all. The
-            // unreadable case is answered above before any steal; this arm
-            // only keeps the primitive's refusal from being misread.
-            Steal::Refused(claim::StealRefused::UnreadableClaim) => Ok(self
-                .past_unreadable(&observed, now_ms)
-                .unwrap_or_else(|| skip(ClaimSkipReason::UnreadableClaim))),
+            // Refused locally: no store request was issued at all.
             Steal::Refused(claim::StealRefused::NotExpired { .. }) => {
                 Ok(skip(ClaimSkipReason::HeldByAnother))
             }
         }
-    }
-
-    /// [`Acquire::Unclaimed`] once an unreadable claim's age by the store's
-    /// `last_modified` exceeds one lease plus this contender's jitter, and
-    /// `None` before that.
-    ///
-    /// The threshold is the observation's own reschedule point
-    /// (`last_modified + lease + jitter + 1`), which is also the reschedule
-    /// point an unreadable claim's skip reports, so the retry scheduled from
-    /// that skip is the attempt that runs.
-    fn past_unreadable(&self, observed: &ClaimObservation, now_ms: i64) -> Option<Acquire> {
-        if now_ms < observed.reschedule_after_unix_ms {
-            return None;
-        }
-        tracing::warn!(
-            key = %observed.key,
-            work_id = %observed.work_id.hex(),
-            last_modified_unix_ms = observed.last_modified_unix_ms,
-            "compaction claim is unreadable and older than one lease plus jitter; \
-             leaving the claim in place (ADR-1029)"
-        );
-        Some(Acquire::Unclaimed {
-            key: observed.key.clone(),
-        })
     }
 
     /// Consult the claim at `at`: renew when a third of the lease has elapsed
@@ -865,9 +836,10 @@ pub(crate) enum BucketClaim {
 /// Both passes call this, so both contend for the one claim object the
 /// bucket's work id names: a compaction and an erasure rewrite of the same
 /// bucket can never both hold it. Every outcome other than an acquisition is a
-/// back-off when the caller participates; in particular a stale unreadable
-/// claim ([`Acquire::Unclaimed`]) holds the bucket rather than letting the pass
-/// publish unfenced.
+/// back-off when the caller participates. An unreadable claim is one such
+/// back-off ([`ClaimSkipReason::UnreadableClaim`]) only until it is older than
+/// [`ravel_fleet::claim::MAX_OBSERVED_LEASE_MS`] plus this contender's jitter;
+/// after that the guard steals it and the pass runs holding the claim.
 pub(crate) async fn claim_bucket(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -898,28 +870,6 @@ pub(crate) async fn claim_bucket(
             let stolen = guard.stolen().await;
             return Ok(BucketClaim::Held { guard, stolen });
         }
-        Acquire::Unclaimed { key } => {
-            let now_ms = participant.clock().now_ns() / 1_000_000;
-            let lease_ms =
-                i64::try_from(config.claim_lease_duration.as_millis()).unwrap_or(i64::MAX);
-            tracing::warn!(
-                pass,
-                key = %key,
-                signal = ?bucket.signal,
-                shard = bucket.shard,
-                ingest_hour_bucket = bucket.ingest_hour_bucket,
-                "bucket claim is unreadable; the pass backs off rather than publish \
-                 unfenced, and the bucket stays held until the claim object is removed \
-                 (ADR-1029)"
-            );
-            ClaimSkip {
-                reason: ClaimSkipReason::UnreadableClaim,
-                work_id_hex: guard.work_id_hex(),
-                holder_process_id: None,
-                expiry_unix_ms: 0,
-                reschedule_after_unix_ms: now_ms.saturating_add(lease_ms),
-            }
-        }
         Acquire::Skipped(skip) => skip,
     };
     tracing::info!(
@@ -941,7 +891,8 @@ pub(crate) async fn claim_bucket(
 mod tests {
     use std::time::Duration;
 
-    use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
+    use prost::Message;
+    use ravel_fleet::claim::{COMPACTION_CLAIMS_PREFIX, MAX_OBSERVED_LEASE_MS};
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, PutOptions};
@@ -1488,20 +1439,18 @@ mod tests {
     }
 
     /// An unreadable claim is deferred while its age by the store's
-    /// `last_modified` is at most one lease plus this contender's jitter, and
-    /// past that the run goes ahead unclaimed. Neither side steals: the
-    /// unreadable object is left exactly as it was, and no PUT is issued
-    /// beyond the rejected `CreateIfAbsent`.
+    /// `last_modified` is at most the lease ceiling plus this contender's
+    /// jitter, and one millisecond past that the guard steals it under CAS
+    /// with no further jitter wait, so the pass runs holding the claim.
     ///
-    /// Shown failing against a guard that skips an unreadable claim whatever
-    /// its age (`past_unreadable` always `None`): "past one lease plus jitter
-    /// the run proceeds unclaimed" panics with `Skipped(ClaimSkip { reason:
-    /// UnreadableClaim, .. })`. Against a skip that reschedules an unreadable
-    /// claim to one millisecond past expiry, as a held one is, "the retry is
-    /// scheduled for the attempt that runs unclaimed" reads left
-    /// 1700000003001, right 1700000003164.
+    /// Shown failing against an observation that gives an unreadable claim
+    /// the configured lease (the young step's expiry reads one lease), against
+    /// a guard that never steals one (the step past the ceiling skips),
+    /// against one that waits out the jitter again before the steal (the
+    /// sleeper records a wait), and against a young-claim threshold of the
+    /// bare expiry (the step at exactly the ceiling plus jitter steals).
     #[tokio::test]
-    async fn an_unreadable_claim_defers_until_a_lease_plus_jitter_then_runs_unclaimed() {
+    async fn an_unreadable_claim_defers_until_the_lease_ceiling_plus_jitter_then_steals() {
         let store = MemoryStore::new();
         let written_ms: i64 = 1_700_000_000_000;
         store.set_clock_ms(written_ms as u64);
@@ -1512,28 +1461,29 @@ mod tests {
             .await
             .expect("seed an unreadable claim");
         let lease_ms = cfg().lease_duration.as_millis() as i64;
-        let jitter = jitter_ms(
-            &bucket_identity().work_id(),
-            &Uuid::from_u128(2),
-            lease_ms,
-            &cfg(),
-        );
+        let jitter = contender_jitter().as_millis() as i64;
+        let ceiling = written_ms + MAX_OBSERVED_LEASE_MS;
         let clock = FixedClock::new(0);
-
-        // Younger than the lease: deferred to the instant it stops holding the
-        // bucket back, one millisecond past one lease plus jitter.
-        clock.set((written_ms + 1_000) * 1_000_000);
-        let young = guard(&clock, 2, None);
-        let skip = match young.acquire(&store).await.expect("young observes") {
-            Acquire::Skipped(skip) => skip,
-            other => panic!("an unreadable claim younger than the lease defers: {other:?}"),
+        let (contender, sleeper) = recording_participant(2, &clock);
+        let guard_at = |now_ms: i64| {
+            clock.set(now_ms * 1_000_000);
+            ClaimGuard::new(&bucket(), &contender, cfg(), None)
         };
+        let skipped = |outcome: Acquire, what: &str| match outcome {
+            Acquire::Skipped(skip) => skip,
+            other => panic!("{what}: expected a skip, got {other:?}"),
+        };
+
+        // Younger than the lease: deferred to one millisecond past the ceiling
+        // plus jitter.
+        let young = guard_at(written_ms + 1_000);
+        let skip = skipped(young.acquire(&store).await.expect("young"), "young");
         assert_eq!(skip.reason, ClaimSkipReason::UnreadableClaim);
-        assert_eq!(skip.expiry_unix_ms, written_ms + lease_ms);
+        assert_eq!(skip.expiry_unix_ms, ceiling);
         assert_eq!(
             skip.reschedule_after_unix_ms,
-            written_ms + lease_ms + jitter + 1,
-            "the retry is scheduled for the attempt that runs unclaimed"
+            ceiling + jitter + 1,
+            "the retry is scheduled for the attempt that steals"
         );
         assert_eq!(
             young.requests().await,
@@ -1541,41 +1491,64 @@ mod tests {
             "rejected PUT, GET, HEAD; no steal"
         );
 
-        // Exactly one lease plus jitter old: still deferred.
-        clock.set((written_ms + lease_ms + jitter) * 1_000_000);
-        let boundary = guard(&clock, 2, None);
-        assert!(
-            matches!(
-                boundary.acquire(&store).await.expect("boundary observes"),
-                Acquire::Skipped(ClaimSkip {
-                    reason: ClaimSkipReason::UnreadableClaim,
-                    ..
-                })
-            ),
-            "at exactly one lease plus jitter the claim still defers"
+        // One configured lease plus jitter old: still deferred.
+        let one_lease = guard_at(written_ms + lease_ms + jitter + 1);
+        let skip = skipped(
+            one_lease.acquire(&store).await.expect("one lease"),
+            "one configured lease past the write",
+        );
+        assert_eq!(
+            skip.reason,
+            ClaimSkipReason::UnreadableClaim,
+            "one configured lease does not release an unreadable claim"
         );
 
-        // Past it: the run proceeds unclaimed, and the claim is untouched.
-        clock.set((written_ms + lease_ms + jitter + 1) * 1_000_000);
-        let old = guard(&clock, 2, None);
-        match old.acquire(&store).await.expect("old observes") {
-            Acquire::Unclaimed { key: seen } => assert_eq!(seen, key),
-            other => panic!("past one lease plus jitter the run proceeds unclaimed: {other:?}"),
-        }
-        assert!(!old.is_held().await, "an unclaimed run holds nothing");
+        // Exactly the ceiling plus jitter: still deferred.
+        let boundary = guard_at(ceiling + jitter);
+        let skip = skipped(
+            boundary.acquire(&store).await.expect("boundary"),
+            "at exactly the ceiling plus jitter",
+        );
+        assert_eq!(skip.reason, ClaimSkipReason::UnreadableClaim);
         assert_eq!(
-            old.requests().await,
-            3,
-            "rejected PUT, GET, HEAD; no steal was issued"
+            sleeper.waits(),
+            Vec::<Duration>::new(),
+            "a deferral waits for nothing"
         );
         let after = store.get(&key, GetRange::Full).await.expect("claim read");
+        assert_eq!(after.data, garbage, "a deferral writes nothing");
+        assert_eq!(after.version, written.version);
+
+        // One millisecond past: stolen, with the jitter already spent in the
+        // reschedule point.
+        let past = guard_at(ceiling + jitter + 1);
+        assert!(
+            matches!(past.acquire(&store).await.expect("past"), Acquire::Acquired),
+            "past the ceiling plus jitter the unreadable claim is stolen"
+        );
+        assert!(past.stolen().await, "the acquisition is a steal");
+        assert!(past.is_held().await);
         assert_eq!(
-            after.data, garbage,
-            "the unreadable claim was not overwritten"
+            past.requests().await,
+            4,
+            "rejected PUT, GET, HEAD, and the steal CAS"
         );
         assert_eq!(
-            after.version, written.version,
-            "and its version never moved"
+            sleeper.waits(),
+            Vec::<Duration>::new(),
+            "the steal of an unreadable claim waits no second jitter"
+        );
+        let after = store.get(&key, GetRange::Full).await.expect("claim read");
+        assert_ne!(after.version, written.version, "the version moved");
+        let stored = CompactionClaim::decode(after.data.as_ref()).expect("decodes");
+        assert_eq!(
+            stored.owner_process_id,
+            Uuid::from_u128(2).as_bytes().to_vec()
+        );
+        assert_eq!(
+            stored.lease_duration_ns,
+            cfg().lease_duration.as_nanos() as i64,
+            "this guard's payload, on its own lease"
         );
     }
 
