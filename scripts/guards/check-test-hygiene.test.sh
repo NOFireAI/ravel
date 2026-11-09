@@ -420,6 +420,110 @@ proptest! {
 RS
 check "flags a failure_persistence override" "${d}" 1 "failure_persistence"
 
+# --- ignore-flaky ------------------------------------------------------------
+
+d="$(new_repo ignore-flaky-no-issue)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+#[ignore = "flaky: fails about 1 in 20 runs"]
+fn occasionally_fails() {
+    assert!(true);
+}
+RS
+check "an ignore naming flaky with no issue is a finding" "${d}" 1 "ignore-flaky"
+
+d="$(new_repo ignore-flaky-with-issue)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+#[ignore = "flaky: see #4000 for the root cause"]
+fn occasionally_fails() {
+    assert!(true);
+}
+RS
+check "an ignore naming flaky that cites an issue passes" "${d}" 0 "clean"
+
+d="$(new_repo ignore-not-flaky)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+#[ignore = "requires a live network; not run in CI"]
+fn needs_network() {
+    assert!(true);
+}
+RS
+check "an ignore naming no flakiness passes" "${d}" 0 "clean"
+
+# --- clock-compared ----------------------------------------------------------
+
+d="$(new_repo clock-reads-compared)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+}
+
+fn serve() -> i64 {
+    let now = now_ns();
+    now
+}
+
+#[test]
+fn two_fixtures_created_close_together() {
+    let a = serve();
+    let b = serve();
+    assert_eq!(a, b);
+}
+RS
+check "a helper that reads the clock itself, called twice and compared, is a finding" \
+  "${d}" 1 "clock-compared"
+
+d="$(new_repo clock-read-once-shared)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+}
+
+fn serve(now_ns: i64) -> i64 {
+    now_ns + 1
+}
+
+#[test]
+fn one_reading_shared_by_both_fixtures() {
+    let now = now_ns();
+    let a = serve(now);
+    let b = serve(now);
+    assert_eq!(a, b);
+}
+RS
+check "a helper taking its reading as a parameter, called twice, passes" \
+  "${d}" 0 "clean"
+
+d="$(new_repo clock-helper-with-clock-param)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+fn serve(clock: i64) -> i64 {
+    clock + 1
+}
+
+#[test]
+fn helper_with_clock_param_is_not_flagged() {
+    let now = 1_000;
+    let a = serve(now);
+    let b = serve(now);
+    assert_eq!(a, b);
+}
+RS
+check "a helper taking an explicit clock parameter passes" "${d}" 0 "clean"
+
 # --- usage -----------------------------------------------------------------
 
 d="$(new_repo usage)"
