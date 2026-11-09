@@ -357,6 +357,149 @@ check_eq "gates: runs check-doc-claims.py" "1" \
 check_eq "gates: check-doc-claims.py runs after the dry-run exit" "1" \
   "$([[ -n "${dry_exit_line}" && -n "${claims_line}" && ${claims_line} -gt ${dry_exit_line} ]] && echo 1 || echo 0)"
 
+# --- gates.sh --tier (ADR-4034 D1) ---------------------------------------
+
+# Every line that starts a cargo invocation, an `env VAR=value` prefix included.
+cargo_lines() { grep -E '^==> (env [A-Z_]+=[^ ]+ )?cargo ' "$1"; }
+cargo_count() { grep -cE '^==> (env [A-Z_]+=[^ ]+ )?cargo ' "$1"; }
+
+# tier_executor_ravel_query_checks_dependents_tests_only_edited: ravel-query's
+# dependents are compiled by one `cargo check` carrying every lane feature the
+# closure reaches, and nothing but ravel-query is tested.
+run_stubbed exec_query bash "${SCRIPTS}/gates.sh" --tier executor -p ravel-query --dry-run
+out="${tmp}/exec_query.out"
+check_eq "tier executor -p ravel-query: exit 0" "0" "${rc}"
+check_eq "tier executor -p ravel-query: first line names the tier" "1" \
+  "$(head -1 "${out}" | grep -c '^gates.sh: dry run; tier executor:')"
+check_eq "tier executor -p ravel-query: clippy of the edited crate" "1" \
+  "$(count "${out}" '==> cargo clippy --locked -p ravel-query --all-targets -- -D warnings')"
+check_eq "tier executor -p ravel-query: tests of the edited crate, ci profile" "1" \
+  "$(count "${out}" '==> cargo nextest run --locked -p ravel-query --cargo-profile ci')"
+check_eq "tier executor -p ravel-query: doctests of the edited crate" "1" \
+  "$(count "${out}" '==> cargo test --locked --doc --profile ci -p ravel-query')"
+check_eq "tier executor -p ravel-query: the test commands name only ravel-query" "-p ravel-query" \
+  "$(cargo_lines "${out}" | grep -E '^==> (env [^ ]+ )?cargo (nextest run|test) ' |
+    grep -oE -- '-p [a-z-]+' | sort -u | paste -sd' ' -)"
+check_eq "tier executor -p ravel-query: one cargo check" "1" \
+  "$(count_matching "${out}" '^==> cargo check ')"
+check_eq "tier executor -p ravel-query: ravel-server only in the check line" "1" \
+  "$(cargo_lines "${out}" | grep -c 'ravel-server')"
+check_eq "tier executor -p ravel-query: ravel-sql only in the check line" "1" \
+  "$(cargo_lines "${out}" | grep -c 'ravel-sql')"
+check_eq "tier executor -p ravel-query: the check line compiles ravel-server and ravel-sql" "1" \
+  "$(count_matching "${out}" '^==> cargo check --locked (-p [a-z-]+ )*-p ravel-sql (-p [a-z-]+ )*-p ravel-server (-p [a-z-]+ )*--all-targets --features ')"
+check_eq "tier executor -p ravel-query: the check line leaves ravel-query out" "0" \
+  "$(count_matching "${out}" '^==> cargo check .*-p ravel-query ')"
+for f in ravel-server/sql ravel-server/esql ravel-server/flight-sql ravel-server/agents \
+  ravel-server/mcp ravel-sql/flight-sql ravel-bench/saturation ravel-cli/sql-explain; do
+  check_eq "tier executor -p ravel-query: check line carries ${f}" "1" \
+    "$(count_matching "${out}" "^==> cargo check .*--features ([a-z/,-]+,)?${f}(,|$)")"
+done
+check_eq "tier executor -p ravel-query: no lane reached only through a dependent runs" "0" \
+  "$(count_matching "${out}" '^==> cargo (clippy|nextest run|test) .*--features ')"
+check_eq "tier executor -p ravel-query: builds nothing" "0" "$(builds "${tmp}/exec_query.calls")"
+
+# The executor tier for an edited crate that carries lanes: each lane's clippy
+# restricted to it, and one test run with the lane features unified.
+run_stubbed exec_server bash "${SCRIPTS}/gates.sh" --tier executor -p ravel-server --dry-run
+out="${tmp}/exec_server.out"
+check_eq "tier executor -p ravel-server: exit 0" "0" "${rc}"
+for l in "${sql_clippy}" "${agents_clippy}" "${mcp_clippy}" "${mcp_agents_clippy}" "${esql_clippy}" \
+  '==> cargo clippy --locked -p ravel-server --features flight-sql --all-targets -- -D warnings'; do
+  check_eq "tier executor -p ravel-server: lane clippy ${l#==> cargo clippy --locked }" "1" "$(count "${out}" "${l}")"
+done
+check_eq "tier executor -p ravel-server: one lane test run, features unified" "1" \
+  "$(count "${out}" '==> cargo nextest run --locked -p ravel-server --features ravel-server/sql,ravel-server/agents,ravel-server/mcp,ravel-server/flight-sql,ravel-server/esql --cargo-profile ci')"
+check_eq "tier executor -p ravel-server: no test of a dependent" "0" \
+  "$(count_matching "${out}" '^==> cargo (nextest run|test) .*-p ravel-(bench|cli|catalog)( |$)')"
+
+# -p ravel-ingest: its shipping-features clippy is the edited crate's own
+# clippy, listed once; its stage-timing lane runs restricted to it.
+run_stubbed exec_ingest bash "${SCRIPTS}/gates.sh" --tier executor -p ravel-ingest --dry-run
+out="${tmp}/exec_ingest.out"
+check_eq "tier executor -p ravel-ingest: exit 0" "0" "${rc}"
+check_eq "tier executor -p ravel-ingest: shipping clippy once" "1" "$(count "${out}" "${ingest_shipping_clippy}")"
+check_eq "tier executor -p ravel-ingest: stage-timing lane clippy restricted" "1" \
+  "$(count "${out}" '==> cargo clippy --locked -p ravel-ingest --features stage-timing --all-targets -- -D warnings')"
+check_eq "tier executor -p ravel-ingest: no ravel-logseg anywhere" "0" "$(cargo_lines "${out}" | grep -c 'ravel-logseg')"
+
+# tier_merge_is_default_unchanged: no --tier and --tier merge print the same
+# output, and the merge list for -p ravel-query is pinned in full, so a
+# changed merge command fails here and not only in the per-lane cases above.
+cat >"${tmp}/query_merge.want" <<'EOF'
+==> closure of -p ravel-query: ravel-query ravel-sql ravel-server ravel-bench ravel-cli
+==> cargo clippy --locked -p ravel-query -p ravel-sql -p ravel-server -p ravel-bench -p ravel-cli --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-query -p ravel-sql -p ravel-server -p ravel-bench -p ravel-cli --cargo-profile ci
+==> cargo test --locked --doc --profile ci -p ravel-query -p ravel-sql -p ravel-server -p ravel-bench -p ravel-cli
+==> cargo clippy --locked -p ravel-server --features sql --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-server --features sql
+==> cargo clippy --locked -p ravel-server --features agents --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-server --features agents --test agents_seam --test agents_effects_e2e --test agents_e2e --test agents_timers_e2e --test agents_projection_e2e --test agents_real_store
+==> cargo nextest run --locked -p ravel-server --features agents --lib
+==> cargo nextest run --locked -p ravel-catalog --test sys_proto_format_version_classification
+==> cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-server --features mcp --test mcp_e2e --test trace_by_id --test mcp_conformance --test mcp_escape_routes --test mcp_audit --test mcp_adversarial_isolation --test mcp_adversarial_replay --test mcp_adversarial_hostile --test mcp_adversarial_precision --test mcp_adversarial_paging
+==> cargo nextest run --locked -p ravel-server --features mcp --lib
+==> cargo clippy --locked -p ravel-server --features mcp,agents --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-server --features mcp,agents --test mcp_agents_e2e
+==> cargo clippy --locked -p ravel-server -p ravel-sql --features flight-sql --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
+==> cargo clippy --locked -p ravel-server --features esql --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-server --features esql
+==> cargo clippy --locked -p ravel-bench --features sql-latency,profiling,flight-lane --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-bench --features sql-latency,profiling,flight-lane
+==> cargo clippy --locked -p ravel-bench --features saturation --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-bench --features saturation
+==> cargo clippy --locked -p ravel-bench --features walk-expiry --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-bench --features walk-expiry
+==> cargo check --locked -p ravel-bench --features stage-timing --all-targets
+==> cargo test --locked -p ravel-bench --features stage-timing
+==> cargo clippy --locked -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-logseg -p ravel-ingest --features stage-timing
+==> cargo clippy --locked -p ravel-cli --features sql-explain --all-targets -- -D warnings
+==> cargo nextest run --locked -p ravel-cli --features sql-explain
+EOF
+for c in ravel-query ravel-server; do
+  run_stubbed "merge_default_${c}" bash "${SCRIPTS}/gates.sh" -p "${c}" --dry-run
+  run_stubbed "merge_named_${c}" bash "${SCRIPTS}/gates.sh" --tier merge -p "${c}" --dry-run
+  check_eq "tier merge -p ${c}: exit 0" "0" "${rc}"
+  check_eq "tier merge -p ${c}: identical to no --tier" "1" \
+    "$(cmp -s "${tmp}/merge_default_${c}.out" "${tmp}/merge_named_${c}.out" && echo 1 || echo 0)"
+  check_eq "tier merge -p ${c}: first line names the tier" "1" \
+    "$(head -1 "${tmp}/merge_named_${c}.out" | grep -c '^gates.sh: dry run; tier merge:')"
+done
+check_eq "tier merge -p ravel-query: the pinned command list" "1" \
+  "$(tail -n +2 "${tmp}/merge_default_ravel-query.out" | cmp -s - "${tmp}/query_merge.want" && echo 1 || echo 0)"
+
+# tier_executor_unscoped_refused: no -p is refused before any work, with a
+# one-line reason. The hatch is set so the fleet-clone refusal cannot be the
+# one that answers.
+RAVEL_GATES_ALLOW_UNSCOPED=1 run_stubbed exec_unscoped bash "${SCRIPTS}/gates.sh" --tier executor --dry-run
+check_eq "tier executor unscoped: exit 64" "64" "${rc}"
+check_eq "tier executor unscoped: one line of output" "1" "$(wc -l <"${tmp}/exec_unscoped.out" | tr -d ' ')"
+check_eq "tier executor unscoped: says why" "1" \
+  "$(count_matching "${tmp}/exec_unscoped.out" '^gates.sh: --tier executor needs at least one -p CRATE')"
+check_eq "tier executor unscoped: builds nothing" "0" "$(wc -l <"${tmp}/exec_unscoped.calls" | tr -d ' ')"
+
+# tier_executor_command_count_bar: ADR-4034 D1's bar, at most 40 percent of the
+# merge tier's cargo commands, for the three closures it names.
+for c in ravel-query ravel-server ravel-ingest; do
+  run_stubbed "bar_merge_${c}" bash "${SCRIPTS}/gates.sh" -p "${c}" --dry-run
+  run_stubbed "bar_exec_${c}" bash "${SCRIPTS}/gates.sh" --tier executor -p "${c}" --dry-run
+  merge_n="$(cargo_count "${tmp}/bar_merge_${c}.out")"
+  exec_n="$(cargo_count "${tmp}/bar_exec_${c}.out")"
+  check_eq "tier executor -p ${c}: ${exec_n} of ${merge_n} cargo commands is at most 40 percent" "1" \
+    "$([[ ${merge_n} -gt 0 && $((exec_n * 100)) -le $((merge_n * 40)) ]] && echo 1 || echo 0)"
+done
+
+# tier_unknown_value_refused: an unknown tier, and --tier with no value.
+run_stubbed tier_fast bash "${SCRIPTS}/gates.sh" --tier fast -p ravel-query --dry-run
+check_eq "tier fast: exit 64" "64" "${rc}"
+check_eq "tier fast: names the value" "1" "$(count_matching "${tmp}/tier_fast.out" '^gates.sh: unknown tier: fast ')"
+check_eq "tier fast: builds nothing" "0" "$(wc -l <"${tmp}/tier_fast.calls" | tr -d ' ')"
+run_stubbed tier_empty bash "${SCRIPTS}/gates.sh" -p ravel-query --tier
+check_eq "tier with no value: exit 64" "64" "${rc}"
+
 # --- affected-tests.sh --------------------------------------------------
 
 # -n prints the closure line and nothing else, and runs no test.
