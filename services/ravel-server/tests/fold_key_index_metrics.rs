@@ -32,21 +32,27 @@ const TOKEN: &str = "operator-token";
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const USER_ID: &str = "user_id";
 
-/// The first fold runs this long before now, directly through the catalog,
-/// and seals every hour ending at least the default `max_flush_lifetime (1h)
-/// + clock_skew_allowance (5m) + fold_safety_margin (15m)` before it.
-const FIRST_FOLD_AGE_HOURS: i64 = 2;
-/// The first batch's age: its hour ends at least 5 h before now, so the first
-/// fold seals it.
-const FIRST_BATCH_AGE_HOURS: i64 = 6;
-/// The second batch's age: its hour starts after every hour the first fold
-/// sealed and ends at least 2 h before now, so only the second fold, through
-/// the on-demand route, folds it, re-encoding the first fold's tail part.
-const SECOND_BATCH_AGE_HOURS: i64 = 3;
-
-fn hour_aged(now: i64, age_hours: i64) -> u32 {
-    u32::try_from((now - age_hours * NS_PER_HOUR) / NS_PER_HOUR).expect("hour fits u32")
+/// The first hour of the UTC day before the one `now` falls in. Every hour
+/// this test seeds or folds through lies in that day, so the on-demand fold,
+/// which reads the wall clock, finds both batches on one UTC day whatever
+/// hour it runs at: batches on two UTC days would seal the first day apart
+/// from the second and add a build pass.
+fn yesterday_start_hour(now: i64) -> u32 {
+    u32::try_from((now / NS_PER_HOUR / 24 - 1) * 24).expect("hour fits u32")
 }
+
+/// The first batch's hour of that day.
+const FIRST_BATCH_HOUR_OF_DAY: u32 = 1;
+/// The first fold runs at the start of this hour of that day, directly
+/// through the catalog, and seals every hour ending at least the default
+/// `max_flush_lifetime (1h) + clock_skew_allowance (5m) + fold_safety_margin
+/// (15m)` before it: the first batch's hour and none after hour 2.
+const FIRST_FOLD_HOUR_OF_DAY: u32 = 4;
+/// The second batch's hour: after every hour the first fold sealed, and
+/// ending 3 h before the day does, before the earliest time the on-demand
+/// fold can run, so only that fold, through the on-demand route, folds it,
+/// re-encoding the first fold's tail part.
+const SECOND_BATCH_HOUR_OF_DAY: u32 = 20;
 
 fn now_ns() -> i64 {
     SystemTime::now()
@@ -224,10 +230,10 @@ fn leaf_building_config(
 }
 
 /// Three commits with a KEY_IDX section each, folded with the leaf build on
-/// two hours ago directly through the catalog: a first fold has no previous
-/// tail, so it reads all three sections in one pass, carries nothing and GETs
-/// no leaf. Two later commits are then folded by the on-demand route, which
-/// re-encodes that tail: it GETs the previous tail's one leaf, carries its
+/// directly through the catalog: a first fold has no previous tail, so it
+/// reads all three sections in one pass, carries nothing and GETs no leaf.
+/// Two later commits on the same UTC day are then folded by the on-demand
+/// route, which re-encodes that tail: it GETs the previous tail's one leaf, carries its
 /// three entries and reads the two new sections in one pass. The totals are
 /// process-wide, so `/metrics` must render each of the four families exactly
 /// once with its HELP and counter TYPE and the two folds' sums: 3 + 2 = 5
@@ -242,8 +248,10 @@ async fn a_leaf_building_fold_renders_the_key_index_build_families() {
     let store = Arc::new(MemoryStore::new());
 
     declare_user_id_key_index(store.as_ref(), &tenant).await;
-    let now = now_ns();
-    let first_hour = hour_aged(now, FIRST_BATCH_AGE_HOURS);
+    let day = yesterday_start_hour(now_ns());
+    let first_hour = day + FIRST_BATCH_HOUR_OF_DAY;
+    let second_hour = day + SECOND_BATCH_HOUR_OF_DAY;
+    assert_eq!(first_hour / 24, second_hour / 24, "one UTC day");
     for (seq, user_ids) in [(0u64, [1i64, 2]), (1, [2, 3]), (2, [3, 4])] {
         seed_sealed_log_commit(store.as_ref(), &tenant, first_hour, seq, &user_ids).await;
     }
@@ -261,7 +269,7 @@ async fn a_leaf_building_fold_renders_the_key_index_build_families() {
             &tenant.hash(),
             Signal::Logs,
             Uuid::from_u128(7),
-            now - FIRST_FOLD_AGE_HOURS * NS_PER_HOUR,
+            i64::from(day + FIRST_FOLD_HOUR_OF_DAY) * NS_PER_HOUR,
             &[],
             None,
         )
@@ -269,7 +277,6 @@ async fn a_leaf_building_fold_renders_the_key_index_build_families() {
         .expect("first fold");
     assert_eq!(first.entry_count, 3, "{first:?}");
     assert_eq!(first.key_index_leaves_written, 1, "{first:?}");
-    let second_hour = hour_aged(now, SECOND_BATCH_AGE_HOURS);
     assert!(
         first.watermark_hour.is_some_and(|w| w < second_hour),
         "{first:?}"
