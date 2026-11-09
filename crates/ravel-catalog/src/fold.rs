@@ -2118,24 +2118,28 @@ fn observe_fold_key_index(counters: &RequestCounters) {
 }
 
 /// A part of the previous HEAD with key-index leaves, a carry source of the
-/// incremental leaf build: its ref and each of its entries' data object key
-/// by ordinal.
+/// incremental leaf build: its ref, a digest of its entries, and each of its
+/// entries' data object key by ordinal once derived.
+///
+/// The keys are derived at most once per fold attempt, for a source a
+/// re-encoded part's build carries from, or for one whose hours a reconcile
+/// is about to change, whichever comes first. By then the attempt's entry
+/// set has gained, lost and re-sorted entries, so the source's entries are
+/// found again as those in its hour range, and used only when they hash to
+/// the digest taken before the first change.
 pub(crate) struct CarrySource {
     part: SnapshotPartRef,
-    object_keys: Vec<Option<String>>,
+    entries_digest: [u8; 32],
+    /// `Some(None)` once the entries in its hours no longer match the digest.
+    object_keys: std::sync::OnceLock<Option<Vec<Option<String>>>>,
 }
 
 impl CarrySource {
     /// Every part of `head` that carries a leaf ref, in HEAD order, each
-    /// with its entries sliced from `previous_entries` (every part's entries
-    /// concatenated in HEAD order) by cumulative `entry_count`. Empty when
-    /// the parts' entry counts do not sum to `previous_entries.len()`.
-    fn all_of_head(
-        tenant: &TenantHash,
-        signal: Signal,
-        head: &SnapshotHead,
-        previous_entries: &[SnapshotEntry],
-    ) -> Vec<Self> {
+    /// digesting its entries sliced from `previous_entries` (every part's
+    /// entries concatenated in HEAD order) by cumulative `entry_count`. Empty
+    /// when the parts' entry counts do not sum to `previous_entries.len()`.
+    fn all_of_head(head: &SnapshotHead, previous_entries: &[SnapshotEntry]) -> Vec<Self> {
         let mut sources = Vec::new();
         let mut start = 0usize;
         for part in &head.parts {
@@ -2149,12 +2153,8 @@ impl CarrySource {
             if !part.key_index.is_empty() {
                 sources.push(Self {
                     part: part.clone(),
-                    object_keys: previous_entries[start..end]
-                        .iter()
-                        .map(|entry| {
-                            column_stats_build::segment_data_key(tenant, signal, entry).ok()
-                        })
-                        .collect(),
+                    entries_digest: carry_entries_digest(previous_entries[start..end].iter()),
+                    object_keys: std::sync::OnceLock::new(),
                 });
             }
             start = end;
@@ -2170,6 +2170,111 @@ impl CarrySource {
     fn overlaps_hours(&self, min_hour: u32, watermark_hour: u32) -> bool {
         self.part.min_hour <= watermark_hour && min_hour <= self.part.watermark_hour
     }
+
+    fn holds_hour(&self, hour: u32) -> bool {
+        self.overlaps_hours(hour, hour)
+    }
+
+    /// The entries of `entries` in this part's hour range, in order.
+    fn entries_in<'a>(
+        &self,
+        entries: &'a [SnapshotEntry],
+    ) -> impl Iterator<Item = &'a SnapshotEntry> + use<'a> {
+        let hours = self.part.min_hour..=self.part.watermark_hour;
+        entries
+            .iter()
+            .filter(move |entry| hours.contains(&entry.ingest_hour_bucket))
+    }
+
+    /// This part's entries' data object keys by ordinal, derived from
+    /// `entries` on the first call. `None` when the entries in its hour range
+    /// are no longer the part's own, which leaves the part uncarried.
+    fn derive_object_keys(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        entries: &[SnapshotEntry],
+    ) -> Option<&[Option<String>]> {
+        self.object_keys
+            .get_or_init(|| {
+                if carry_entries_digest(self.entries_in(entries)) != self.entries_digest {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        part = %self.part.key,
+                        "previous part's entries changed before its keys were derived; its leaves are not carried"
+                    );
+                    return None;
+                }
+                #[cfg(test)]
+                KEY_INDEX_CARRY_KEYS_DERIVED
+                    .with(|derived| derived.set(derived.get() + self.part.entry_count));
+                Some(
+                    self.entries_in(entries)
+                        .map(|entry| {
+                            column_stats_build::segment_data_key(tenant, signal, entry).ok()
+                        })
+                        .collect(),
+                )
+            })
+            .as_deref()
+    }
+
+    /// The keys [`Self::derive_object_keys`] derived; empty before it ran or
+    /// when it found the entries changed.
+    fn object_keys(&self) -> &[Option<String>] {
+        self.object_keys
+            .get()
+            .and_then(Option::as_deref)
+            .unwrap_or(&[])
+    }
+}
+
+/// Derives the keys of every source holding one of `hours`, before the
+/// caller changes the entries in those hours.
+fn derive_carry_keys_before_change(
+    sources: &[CarrySource],
+    tenant: &TenantHash,
+    signal: Signal,
+    entries: &[SnapshotEntry],
+    hours: &[u32],
+) {
+    for source in sources {
+        if hours.iter().any(|&hour| source.holds_hour(hour)) {
+            source.derive_object_keys(tenant, signal, entries);
+        }
+    }
+}
+
+/// blake3 over every field [`column_stats_build::segment_data_key`] reads,
+/// entry by entry, and the entry count.
+fn carry_entries_digest<'a>(entries: impl Iterator<Item = &'a SnapshotEntry>) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    let mut count = 0u64;
+    for entry in entries {
+        count += 1;
+        hasher.update(&entry.level.to_le_bytes());
+        hasher.update(&entry.shard.to_le_bytes());
+        hasher.update(&entry.ingest_hour_bucket.to_le_bytes());
+        hasher.update(&entry.writer_epoch.to_le_bytes());
+        hasher.update(&entry.writer_seq.to_le_bytes());
+        hasher.update(&(entry.writer_id.len() as u64).to_le_bytes());
+        hasher.update(&entry.writer_id);
+        hasher.update(&(entry.content_hash.len() as u64).to_le_bytes());
+        hasher.update(&entry.content_hash);
+    }
+    hasher.update(&count.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+// Test-only: entries whose data object keys a carry source derived.
+#[cfg(test)]
+thread_local! {
+    static KEY_INDEX_CARRY_KEYS_DERIVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_key_index_carry_keys_derived_for_test() -> u64 {
+    KEY_INDEX_CARRY_KEYS_DERIVED.with(|derived| derived.replace(0))
 }
 
 /// Previous-leaf bytes the carry holds now, and the most it held at once.
@@ -2317,7 +2422,7 @@ async fn load_carry_source(
     {
         return Err(format!("declared field {name:?} has no previous leaf"));
     }
-    if source.object_keys.len() as u64 != source.part.entry_count {
+    if source.object_keys().len() as u64 != source.part.entry_count {
         return Err("previous part entry list does not match its ref".to_string());
     }
     for name in fields.keys() {
@@ -2331,7 +2436,7 @@ async fn load_carry_source(
         }
     }
     let onto: Vec<Option<u64>> = source
-        .object_keys
+        .object_keys()
         .iter()
         .map(|key| {
             key.as_deref()
@@ -2901,7 +3006,7 @@ pub(crate) async fn build_part_key_index(
         .copied()
         .filter(|source| {
             source
-                .object_keys
+                .object_keys()
                 .iter()
                 .flatten()
                 .any(|key| ordinal_by_key.contains_key(key.as_str()))
@@ -2910,7 +3015,7 @@ pub(crate) async fn build_part_key_index(
     let mut mapped: HashSet<&str> = HashSet::new();
     let duplicate = sharing.iter().find_map(|source| {
         source
-            .object_keys
+            .object_keys()
             .iter()
             .flatten()
             .filter(|key| ordinal_by_key.contains_key(key.as_str()))
@@ -3954,7 +4059,7 @@ impl Catalog {
             // whose hour range overlaps its own.
             let carry_sources: Vec<CarrySource> = match &head_state {
                 HeadState::Valid { head, .. } if !rebuilt && key_index_fields.is_some() => {
-                    CarrySource::all_of_head(tenant, signal, head, &entries)
+                    CarrySource::all_of_head(head, &entries)
                 }
                 _ => Vec::new(),
             };
@@ -4021,6 +4126,13 @@ impl Catalog {
                     )
                     .await?;
                 for (entry, is_canonical) in contribution {
+                    derive_carry_keys_before_change(
+                        &carry_sources,
+                        tenant,
+                        signal,
+                        &entries,
+                        &[entry.ingest_hour_bucket],
+                    );
                     fold_in_entry(
                         &mut entries,
                         &mut seen,
@@ -4074,6 +4186,7 @@ impl Catalog {
                         listing,
                         &accounting,
                         &mut entries,
+                        &carry_sources,
                         &mut seen,
                         &mut dirty_hours,
                         &mut counters,
@@ -4094,6 +4207,7 @@ impl Catalog {
                         |hour| (held.0..=held.1).contains(&hour),
                         &accounting,
                         &mut entries,
+                        &carry_sources,
                         &mut seen,
                         &mut dirty_hours,
                         &mut counters,
@@ -4127,6 +4241,7 @@ impl Catalog {
                         listing,
                         &accounting,
                         &mut entries,
+                        &carry_sources,
                         &mut seen,
                         &mut dirty_hours,
                         &mut counters,
@@ -4217,6 +4332,7 @@ impl Catalog {
                                 listing,
                                 &accounting,
                                 &mut entries,
+                                &carry_sources,
                                 &mut seen,
                                 &mut dirty_hours,
                                 &mut counters,
@@ -4254,6 +4370,7 @@ impl Catalog {
                         |hour| hour >= lo || frontier_listed_hours.contains(&hour),
                         &accounting,
                         &mut entries,
+                        &carry_sources,
                         &mut seen,
                         &mut dirty_hours,
                         &mut counters,
@@ -4866,6 +4983,9 @@ impl Catalog {
                                 .iter()
                                 .filter(|source| {
                                     source.overlaps_hours(part_min_hour, part_watermark)
+                                        && source
+                                            .derive_object_keys(tenant, signal, &entries)
+                                            .is_some()
                                 })
                                 .collect();
                             let built = build_part_key_index(
@@ -5796,6 +5916,7 @@ impl Catalog {
         listing: &[ObjectMeta],
         accounting: &QueryAccounting,
         entries: &mut Vec<SnapshotEntry>,
+        carry_sources: &[CarrySource],
         seen: &mut HashMap<EntryIdentity, (usize, bool)>,
         dirty_hours: &mut HashSet<u32>,
         counters: &mut RequestCounters,
@@ -5842,6 +5963,10 @@ impl Catalog {
         // inputs previously folded in directly, or a late tombstone means the
         // hour now contributes nothing): replace exactly this bucket's entries,
         // leave every other entry untouched, and mark the hour dirty.
+        let changed_hours: Vec<u32> = std::iter::once(hour)
+            .chain(desired.iter().map(|e| e.ingest_hour_bucket))
+            .collect();
+        derive_carry_keys_before_change(carry_sources, tenant, signal, entries, &changed_hours);
         entries.retain(|e| !(e.shard == shard && e.ingest_hour_bucket == hour));
         // `seen`'s cached indices go stale the instant `entries` is mutated by
         // anything other than `fold_in_entry` (the `retain` above shifts every
@@ -5888,6 +6013,7 @@ impl Catalog {
         exclude: impl Fn(u32) -> bool,
         accounting: &QueryAccounting,
         entries: &mut Vec<SnapshotEntry>,
+        carry_sources: &[CarrySource],
         seen: &mut HashMap<EntryIdentity, (usize, bool)>,
         dirty_hours: &mut HashSet<u32>,
         counters: &mut RequestCounters,
@@ -5934,6 +6060,7 @@ impl Catalog {
                 listing,
                 accounting,
                 entries,
+                carry_sources,
                 seen,
                 dirty_hours,
                 counters,
@@ -16802,6 +16929,74 @@ pub(crate) mod tests {
             )
             .await
         );
+    }
+
+    /// A carry source's data object keys are derived only for a source a
+    /// re-encoded part overlaps. Under a 2-entry part threshold, day d's
+    /// writers at hours 1 to 5 fold into three parts with leaves, hours 1 and
+    /// 2, 3 and 4, and 5. A writer lands at hour 6, so the advancing fold
+    /// re-encodes only the tail, now hours 5 and 6, and derives the key of the
+    /// tail's one previous entry, not the five of every previous part.
+    #[tokio::test]
+    async fn carry_keys_are_derived_only_for_overlapping_sources() {
+        let store = OpLogStore::empty();
+        declare_user_id_key_index(store.as_ref()).await;
+        let mut writers = Vec::new();
+        for seq in 1u64..=5 {
+            let ids = [seq as i64 * 2 - 1, seq as i64 * 2];
+            let (record, _) =
+                publish_user_id_logs(store.as_ref(), seq, DAY_D + seq as u32, &ids, 2, 0, true)
+                    .await;
+            writers.push(record);
+        }
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                snapshot_part_max_entries: 2,
+                ..kidx_config()
+            },
+        )
+        .expect("catalog");
+        fold_through(&catalog, Signal::Logs, DAY_D + 5).await;
+        let first = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            first
+                .parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour, p.key_index.is_empty()))
+                .collect::<Vec<_>>(),
+            vec![
+                (DAY_D + 1, DAY_D + 2, false),
+                (DAY_D + 3, DAY_D + 4, false),
+                (DAY_D + 5, DAY_D + 5, false)
+            ]
+        );
+
+        publish_user_id_logs(store.as_ref(), 6, DAY_D + 6, &[11], 2, 0, true).await;
+        store.clear();
+        take_key_index_carry_keys_derived_for_test();
+        let report = fold_through(&catalog, Signal::Logs, DAY_D + 6).await;
+        let derived = take_key_index_carry_keys_derived_for_test();
+        let second = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            second
+                .parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour))
+                .collect::<Vec<_>>(),
+            vec![
+                (DAY_D + 1, DAY_D + 2),
+                (DAY_D + 3, DAY_D + 4),
+                (DAY_D + 5, DAY_D + 6)
+            ]
+        );
+        assert_eq!(report.parts_reused, 2, "{report:?}");
+        assert_eq!(
+            store.section_gets_of(&[&writers[4]]),
+            0,
+            "the tail's previous entry is carried"
+        );
+        assert_eq!(derived, 1, "only the tail source's one entry is keyed");
     }
 
     /// ADR-3939 decision 5: a part carries from every previous part it shares
