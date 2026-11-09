@@ -72,9 +72,32 @@ runs:
           exit 1
         fi
         mv "$tmp" "$TOOL_DEST"
+    - name: Verify ${{ inputs.name }} sha256
+      # Unconditional: a cache hit skips the download step above, and the
+      # sha256 pin is the trust anchor on a hit as much as on a miss (the
+      # cache is only a transport, ADR-4034 D3). Runs after both the restore
+      # and the download, before the save, so a bad file is never cached.
+      shell: bash
+      env:
+        TOOL_NAME: ${{ inputs.name }}
+        TOOL_SHA256: ${{ inputs.sha256 }}
+        TOOL_DEST: ${{ inputs.dest }}
+      run: |
+        set -u
+        if command -v sha256sum >/dev/null 2>&1; then
+          sum_cmd="sha256sum"
+        else
+          sum_cmd="shasum -a 256"
+        fi
+        if ! printf '%s  %s\n' "$TOOL_SHA256" "$TOOL_DEST" | $sum_cmd -c - >/dev/null 2>&1; then
+          got="$($sum_cmd "$TOOL_DEST" | awk '{print $1}')"
+          echo "::error::fetch-pinned-tool: $TOOL_NAME sha256 $got != expected $TOOL_SHA256; refusing to use it"
+          exit 1
+        fi
     - name: Save ${{ inputs.name }} to cache
-      # Restore everywhere, save only on main: see the description above.
-      if: steps.restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      # Restore everywhere, save only on a push to main: see the description
+      # above.
+      if: steps.restore.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ inputs.dest }}
