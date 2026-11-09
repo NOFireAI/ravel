@@ -133,6 +133,7 @@ async fn fixture_with(fetch_concurrency: usize, parallel_final_aggregation: bool
             ..EngineConfig::default()
         },
         parallel_final_aggregation,
+        first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };
     let t = tenant();

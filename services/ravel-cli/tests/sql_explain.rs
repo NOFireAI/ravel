@@ -282,6 +282,32 @@ async fn explain_without_analyze_prints_the_plan_only() {
     assert!(!output.contains("rows:"), "{output}");
 }
 
+/// The hash repartition's partition count on the plan's `RepartitionExec`.
+fn hash_partitions(output: &str) -> usize {
+    let line = operator_line(output, "RepartitionExec: partitioning=Hash(");
+    let after = &line[line.find("], ").expect("hash partition count") + 3..];
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().expect("hash partition count")
+}
+
+/// Without `--sql-partitions` the plan takes the default configuration's
+/// first-attempt floor of 16 partitions over the default count of 8; with
+/// `--sql-partitions 4` it plans 4, as the server does for an explicit
+/// `--sql-partition-count 4`, which turns the floor off.
+#[tokio::test]
+async fn sql_partitions_turns_the_first_attempt_floor_off_as_the_server_flag_does() {
+    let store = loaded_store().await;
+    let output = explain(store.clone(), &options(GROUPED, false))
+        .await
+        .expect("sql explain");
+    assert_eq!(hash_partitions(&output), 16, "{output}");
+
+    let mut opts = options(GROUPED, false);
+    opts.sql_partitions = Some(4);
+    let output = explain(store, &opts).await.expect("sql explain");
+    assert_eq!(hash_partitions(&output), 4, "{output}");
+}
+
 /// The executor still refuses an `EXPLAIN` statement through `execute`, the
 /// path the HTTP endpoint takes: the subcommand renders plans itself rather
 /// than admitting `EXPLAIN` into the gate.

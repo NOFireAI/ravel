@@ -293,6 +293,7 @@ async fn the_returned_groups_carry_every_row_from_every_input_partition() {
     let sql = "SELECT k, count(*), sum(v) FROM t GROUP BY k LIMIT 10";
     let config = SqlConfig {
         max_query_bytes: MIB,
+        first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };
     let run = probed(&config, spread_parts(), sql, true).await;

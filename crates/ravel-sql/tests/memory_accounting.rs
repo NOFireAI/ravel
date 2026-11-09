@@ -237,6 +237,7 @@ async fn held_during_group_by(spill: SpillDecision<'_>) -> (usize, usize, usize)
     // under a limit.
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(1);
+    config.first_attempt_min_partitions = 0;
     let accountant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());
     let held = || {
@@ -380,6 +381,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
+        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         // ADR-0954: spill off, as on the shipped default.

@@ -437,6 +437,9 @@ async fn run_combo(
     let sql_config = SqlConfig {
         engine,
         parallel_final_aggregation: parallel,
+        // The sweep sets the partition count; the floor would lift every
+        // point under 16 to 16.
+        first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };
     let executor = SqlExecutor::new(
@@ -1032,6 +1035,9 @@ async fn run_distinct_combo(
         engine,
         max_query_bytes: max_bytes,
         skip_partial_aggregation,
+        // The sweep sets the partition count; the floor would lift every
+        // point under 16 to 16.
+        first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };
     let executor = SqlExecutor::new(

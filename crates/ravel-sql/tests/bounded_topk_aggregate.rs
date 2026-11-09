@@ -201,6 +201,7 @@ async fn executor_with_records(records: Vec<LogRecord>, max_limit: Option<usize>
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let config = SqlConfig {
         bounded_topk_max_limit: max_limit,
+        first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };
     SqlExecutor::new(

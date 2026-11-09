@@ -683,6 +683,9 @@ async fn run_combo(
     };
     let sql_config = SqlConfig {
         engine,
+        // The sweep sets the partition count; the floor would lift every
+        // point under 16 to 16.
+        first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };
 

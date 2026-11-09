@@ -642,6 +642,9 @@ fn disk_manager_builder(spill: SpillDecision<'_>, merge_fan_in: usize) -> DiskMa
 /// [`SpillDecision::Enabled`] query gets no `RepartitionExec` at all, so
 /// `repartition_aggregations` is forced off and DataFusion's round-robin
 /// repartitioning is disabled with it. See [`repartition_free`] for why.
+/// It also picks `target_partitions`, through
+/// [`SqlConfig::attempt_partition_count`]: a `Disabled` session takes the
+/// in-memory attempt's floor (issue #4014) and an `Enabled` one does not.
 pub fn session_config(
     config: &SqlConfig,
     exact_typed_aggregates: bool,
@@ -650,7 +653,7 @@ pub fn session_config(
     let repartition_free = repartition_free(spill);
     let mut session = SessionConfig::new()
         .with_information_schema(false)
-        .with_target_partitions(config.engine.sql_partition_count())
+        .with_target_partitions(config.attempt_partition_count(spill))
         // ADR-0094: the only knob that is ever true, and only for a query whose
         // aggregates and group keys are all exact-typed. See the module docs.
         // ADR-0954 takes it back for a spill-enabled query.
@@ -1323,7 +1326,8 @@ mod tests {
 
     /// ADR-1195: `target_partitions` follows the resolved
     /// `sql_partition_count` knob, not the legacy `fetch_concurrency` field
-    /// directly, once an explicit override is set.
+    /// directly, once an explicit override is set. The floor is off here, as
+    /// ravel-server sets it for an explicit count.
     #[test]
     fn target_partitions_follows_the_resolved_sql_partition_count() {
         let config = SqlConfig {
@@ -1332,10 +1336,52 @@ mod tests {
                 sql_partition_count: Some(5),
                 ..ravel_query::EngineConfig::default()
             },
+            first_attempt_min_partitions: 0,
             ..SqlConfig::default()
         };
         let session = session_config(&config, false, SpillDecision::Disabled);
         assert_eq!(session.options().execution.target_partitions, 5);
+    }
+
+    /// Issue #4014: a `Disabled` session plans at least
+    /// `first_attempt_min_partitions` partitions and an `Enabled` one, the
+    /// spill retry on the execute path, plans the engine count; a floor of 0
+    /// plans the engine count for both, and an engine count at or above the
+    /// floor is unchanged for both.
+    #[test]
+    fn the_in_memory_attempt_is_floored_and_the_spill_attempt_is_not() {
+        let dir = std::path::PathBuf::from("/tmp/does-not-need-to-exist");
+        let enabled = SpillDecision::Enabled {
+            dir: dir.as_path(),
+            max_bytes: 1 << 20,
+        };
+        let config = |count: usize, floor: usize| SqlConfig {
+            engine: ravel_query::EngineConfig {
+                sql_partition_count: Some(count),
+                ..ravel_query::EngineConfig::default()
+            },
+            first_attempt_min_partitions: floor,
+            ..SqlConfig::default()
+        };
+        let planned = |config: &SqlConfig, spill: SpillDecision<'_>| {
+            let session = session_config(config, true, spill);
+            (
+                session.options().execution.target_partitions,
+                config.attempt_partition_count(spill),
+            )
+        };
+
+        let floored = config(8, SqlConfig::default().first_attempt_min_partitions);
+        assert_eq!(planned(&floored, SpillDecision::Disabled), (16, 16));
+        assert_eq!(planned(&floored, enabled), (8, 8));
+
+        let off = config(8, 0);
+        assert_eq!(planned(&off, SpillDecision::Disabled), (8, 8));
+        assert_eq!(planned(&off, enabled), (8, 8));
+
+        let wide = config(32, SqlConfig::default().first_attempt_min_partitions);
+        assert_eq!(planned(&wide, SpillDecision::Disabled), (32, 32));
+        assert_eq!(planned(&wide, enabled), (32, 32));
     }
 
     #[test]
