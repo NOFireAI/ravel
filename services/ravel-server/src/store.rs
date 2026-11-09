@@ -60,12 +60,12 @@ const CACHE_MAX_ENTRIES: usize = 1_000_000;
 /// inside a Tokio runtime; `build_store`'s caller (`main`) is `#[tokio::main]`,
 /// so this holds on every `--cache-dir` startup.
 pub fn build_cache(cli: &Cli, cache_max_bytes: u64) -> Option<ravel_query::ReadCache> {
-    if cli.disable_cache || cache_max_bytes == 0 {
+    if cli.cache.disable_cache || cache_max_bytes == 0 {
         return None;
     }
     let ram_limits = CacheLimits::new(cache_max_bytes, CACHE_MAX_ENTRIES, CACHE_MAX_ENTRY_BYTES)
-        .with_bulk_share(cli.cache_bulk_share);
-    match &cli.cache_dir {
+        .with_bulk_share(cli.cache.cache_bulk_share);
+    match &cli.cache.cache_dir {
         None => Some(ravel_query::ReadCache::Ram(Arc::new(Cache::new(
             ram_limits,
         )))),
@@ -390,19 +390,19 @@ pub fn resolve_gcs_allow_http(endpoint: Option<&str>) -> anyhow::Result<bool> {
 fn instance_role_credential_conflict(cli: &Cli) -> Option<anyhow::Error> {
     let conflicting: Vec<&str> = [
         (
-            cli.s3_access_key.is_some(),
+            cli.object_store.s3_access_key.is_some(),
             "--s3-access-key (RAVEL_S3_ACCESS_KEY)",
         ),
         (
-            cli.s3_secret_key.is_some(),
+            cli.object_store.s3_secret_key.is_some(),
             "--s3-secret-key (RAVEL_S3_SECRET_KEY)",
         ),
         (
-            cli.s3_session_token.is_some(),
+            cli.object_store.s3_session_token.is_some(),
             "--s3-session-token (RAVEL_S3_SESSION_TOKEN)",
         ),
         (
-            cli.s3_credentials_file.is_some(),
+            cli.object_store.s3_credentials_file.is_some(),
             "--s3-credentials-file (RAVEL_S3_CREDENTIALS_FILE)",
         ),
     ]
@@ -441,21 +441,22 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
         }
         StoreKind::S3 => {
             let bucket = cli
+                .object_store
                 .s3_bucket
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("--store s3 requires RAVEL_S3_BUCKET"))?;
             let region = cli.s3_region_or_default();
-            let auth = cli.s3_auth.mode();
+            let auth = cli.object_store.s3_auth.mode();
             let (access_key_id, secret_access_key, session_token, credentials_file) = match auth {
                 S3AuthMode::Static => (
-                    cli.s3_access_key.clone().ok_or_else(|| {
+                    cli.object_store.s3_access_key.clone().ok_or_else(|| {
                         anyhow::anyhow!("--store s3 requires RAVEL_S3_ACCESS_KEY")
                     })?,
-                    cli.s3_secret_key.clone().ok_or_else(|| {
+                    cli.object_store.s3_secret_key.clone().ok_or_else(|| {
                         anyhow::anyhow!("--store s3 requires RAVEL_S3_SECRET_KEY")
                     })?,
-                    cli.s3_session_token.clone(),
-                    cli.s3_credentials_file.clone(),
+                    cli.object_store.s3_session_token.clone(),
+                    cli.object_store.s3_credentials_file.clone(),
                 ),
                 S3AuthMode::InstanceRole => {
                     if let Some(conflict) = instance_role_credential_conflict(cli) {
@@ -464,8 +465,9 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
                     (String::new(), String::new(), None, None)
                 }
             };
-            let endpoint = cli.s3_endpoint.clone();
-            let allow_http = resolve_s3_allow_http(endpoint.as_deref(), cli.s3_allow_http)?;
+            let endpoint = cli.object_store.s3_endpoint.clone();
+            let allow_http =
+                resolve_s3_allow_http(endpoint.as_deref(), cli.object_store.s3_allow_http)?;
 
             let config = S3Config {
                 bucket,
@@ -475,11 +477,11 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
                 secret_access_key,
                 allow_http,
                 force_path_style: true,
-                kms_key_id: cli.s3_kms_key.clone(),
+                kms_key_id: cli.object_store.s3_kms_key.clone(),
                 session_token,
                 credentials_file,
                 auth,
-                instance_metadata_endpoint: cli.s3_instance_metadata_endpoint.clone(),
+                instance_metadata_endpoint: cli.object_store.s3_instance_metadata_endpoint.clone(),
             };
             // One shared metrics block for the whole S3 chain: the counting HTTP
             // connector inside `S3Store` records billed HTTP requests (attempts,
@@ -506,7 +508,7 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
             // Per-tenant SSE-KMS routing (ADR-0062 decision 1, ADR-0072
             // decision 2): off by default. Without --tenant-kms-config this builds exactly
             // today's store, byte-for-byte, no KmsRoutingStore in the chain.
-            if cli.tenant_kms_config.is_some() {
+            if cli.tenant_config.tenant_kms_config.is_some() {
                 // Thread the SAME metrics handle into the per-tenant store
                 // factory: each KMS-routed S3Store records its billed HTTP
                 // requests (attempts) into the one block the base store and the
@@ -531,15 +533,15 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
             }
         }
         StoreKind::Gcs => {
-            let bucket = cli.gcs_bucket.clone().ok_or_else(|| {
+            let bucket = cli.object_store.gcs_bucket.clone().ok_or_else(|| {
                 anyhow::anyhow!("--store gcs requires --gcs-bucket (RAVEL_GCS_BUCKET)")
             })?;
-            let allow_http = resolve_gcs_allow_http(cli.gcs_endpoint.as_deref())?;
+            let allow_http = resolve_gcs_allow_http(cli.object_store.gcs_endpoint.as_deref())?;
             // The S3 path's timeouts, so a slow request is cut at the same
             // point whichever store the bucket is on.
             let http = cli.s3_http_config();
             let mut config = GcsConfig::new(bucket);
-            config.base_url = cli.gcs_endpoint.clone();
+            config.base_url = cli.object_store.gcs_endpoint.clone();
             config.allow_http = allow_http;
             config.request_timeout = http.request_timeout;
             config.connect_timeout = http.connect_timeout;
@@ -580,10 +582,14 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
     // ADR-0070's "a foreground acquire is never delayed by more than one
     // in-flight background request" guarantee hold; it is deliberately not a
     // CLI knob.
-    let classed = Arc::new(if cli.store_scheduling {
+    let classed = Arc::new(if cli.store_scheduler.store_scheduling {
         ClassedStore::scheduled(
             store,
-            SchedulerConfig::new(cli.store_fg_permits, cli.store_bg_permits, 1),
+            SchedulerConfig::new(
+                cli.store_scheduler.store_fg_permits,
+                cli.store_scheduler.store_bg_permits,
+                1,
+            ),
         )
     } else {
         ClassedStore::passthrough(store)
@@ -1772,7 +1778,7 @@ mod tests {
         ])
         .expect("instance-role flags parse");
         assert!(
-            cli.s3_access_key.is_none() && cli.s3_secret_key.is_none(),
+            cli.object_store.s3_access_key.is_none() && cli.object_store.s3_secret_key.is_none(),
             "precondition: instance-role starts with no inline keys set"
         );
 
@@ -2078,12 +2084,15 @@ mod tests {
         ];
         let cli = Cli::try_parse_from(base).expect("flags parse");
         assert_eq!(
-            cli.s3_auth,
+            cli.object_store.s3_auth,
             crate::config::S3Auth::Static,
             "--s3-auth must default to static"
         );
-        assert!(cli.s3_session_token.is_none() && cli.s3_credentials_file.is_none());
-        assert!(cli.s3_instance_metadata_endpoint.is_none());
+        assert!(
+            cli.object_store.s3_session_token.is_none()
+                && cli.object_store.s3_credentials_file.is_none()
+        );
+        assert!(cli.object_store.s3_instance_metadata_endpoint.is_none());
 
         assert_eq!(
             build_store_error(&cli, "static mode without keys must fail"),
@@ -2128,7 +2137,10 @@ mod tests {
         let mut with_token = base.to_vec();
         with_token.extend(["--s3-session-token", "sts-token"]);
         let cli = Cli::try_parse_from(with_token).expect("flags parse");
-        assert_eq!(cli.s3_session_token.as_deref(), Some("sts-token"));
+        assert_eq!(
+            cli.object_store.s3_session_token.as_deref(),
+            Some("sts-token")
+        );
         build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
             .expect("a session token must not break construction");
 
@@ -2182,7 +2194,7 @@ mod tests {
         // (a) Off by default: passthrough hands out one shared store.
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert!(
-            !cli.store_scheduling,
+            !cli.store_scheduler.store_scheduling,
             "the store scheduler must default off (ADR-0070 decision 2)"
         );
         let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
@@ -2199,7 +2211,7 @@ mod tests {
         // (b) Scheduling on: two distinct scheduled handles over one scheduler.
         let cli = Cli::try_parse_from(["ravel-server", "--store-scheduling"])
             .expect("scheduling flag parses");
-        assert!(cli.store_scheduling);
+        assert!(cli.store_scheduler.store_scheduling);
         let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
             .expect("scheduled memory backend must build");
         assert!(

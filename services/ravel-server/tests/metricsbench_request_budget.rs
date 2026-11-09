@@ -112,9 +112,10 @@ fn check(compose: &str, readme: &str) -> Result<u64, String> {
     let mut cli = Cli::try_parse_from(std::iter::once("ravel-server".to_string()).chain(args))
         .map_err(|e| format!("the compose command does not parse as ravel-server's CLI: {e}"))?;
     let stated = cli
+        .limits
         .max_s3_requests
         .ok_or("the compose command does not state --max-s3-requests")?;
-    cli.max_s3_requests = None;
+    cli.limits.max_s3_requests = None;
     let flush = cli
         .resolve_flush_cadence()
         .map_err(|e| format!("the compose command's flush cadence does not resolve: {e}"))?

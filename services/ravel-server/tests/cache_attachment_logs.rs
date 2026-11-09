@@ -204,10 +204,10 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
     let catalog = build_catalog(
         Arc::clone(&store),
         1,
-        cli.disable_cache,
+        cli.cache.disable_cache,
         ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
-        cli.cache_dir.clone(),
-        cli.catalog_resolve_concurrency,
+        cli.cache.cache_dir.clone(),
+        cli.cache.catalog_resolve_concurrency,
         None,
         cli.resolve_flush_cadence()
             .expect("flush cadence resolves")
