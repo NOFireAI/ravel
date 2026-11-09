@@ -12,6 +12,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -19,9 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use datafusion::arrow::array::{
-    ArrayRef, Float32Array, Float64Array, Int64Array, TimestampNanosecondArray,
+    ArrayRef, BooleanArray, Float32Array, Float64Array, Int64Array, TimestampNanosecondArray,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::common::{DataFusionError, Result as DFResult};
@@ -29,7 +30,10 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
-use datafusion::logical_expr::EmitTo;
+use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+use datafusion::logical_expr::{
+    Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator, Signature, Volatility,
+};
 use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
@@ -99,18 +103,31 @@ const TIGHT: &[(&str, &str)] = &[
 ];
 
 /// The production session over `pool`, with `parts` registered as `t` and
-/// each of `options` set.
+/// each of `options` set, for a statement classified exact-typed.
 fn session(
     config: &SqlConfig,
     pool: Arc<dyn MemoryPool>,
     parts: Vec<Vec<RecordBatch>>,
     options: &[(&str, &str)],
 ) -> SessionContext {
+    session_typed(config, pool, parts, options, true)
+}
+
+/// [`session`] under the executor's `exact_typed_aggregates` classification.
+/// `true` turns `repartition_aggregations` on (ADR-0094); a float `avg` is
+/// never exact-typed, so production plans it under `false`.
+fn session_typed(
+    config: &SqlConfig,
+    pool: Arc<dyn MemoryPool>,
+    parts: Vec<Vec<RecordBatch>>,
+    options: &[(&str, &str)],
+    exact_typed: bool,
+) -> SessionContext {
     let ctx = build_session(
         config,
         pool,
         empty_logs(),
-        true,
+        exact_typed,
         SpillDecision::Disabled,
         &SessionPrincipal::without_capabilities(TenantHash([0u8; 16])),
     )
@@ -315,6 +332,9 @@ struct Probed {
     evictions: usize,
     rebuilds: usize,
     dropped: usize,
+    /// The rows the plan's `AggregateExec` nodes passed on as states without
+    /// aggregating them (`skipped_aggregation_rows`).
+    skipped_aggregation_rows: usize,
     interned_at_threshold: usize,
     /// The query pool's charged peak, `peak_intermediate_bytes`.
     charged: u64,
@@ -353,6 +373,17 @@ async fn probed(
     options: &[(&str, &str)],
     sql: &str,
 ) -> Probed {
+    probed_typed(config, parts, options, sql, true).await
+}
+
+/// [`probed`] on a session built by [`session_typed`] with `exact_typed`.
+async fn probed_typed(
+    config: &SqlConfig,
+    parts: Vec<Vec<RecordBatch>>,
+    options: &[(&str, &str)],
+    sql: &str,
+    exact_typed: bool,
+) -> Probed {
     let tenant =
         TenantMemoryAccountant::with_process_budget(1 << 34, Arc::new(MemoryBudget::unlimited()));
     let accounting = QueryAccounting::new();
@@ -363,11 +394,12 @@ async fn probed(
         peak: AtomicI64::new(0),
         top_keys: Mutex::new(BTreeMap::new()),
     });
-    let ctx = session(
+    let ctx = session_typed(
         config,
         Arc::clone(&probe) as Arc<dyn MemoryPool>,
         parts,
         options,
+        exact_typed,
     );
     let plan = plan_of(&ctx, sql).await;
     if let Some(profile) = plan_aggregate_profile(&plan) {
@@ -388,6 +420,7 @@ async fn probed(
         evictions: top_keys_metric(&plan, "evictions"),
         rebuilds: top_keys_metric(&plan, "rebuilds"),
         dropped: top_keys_metric(&plan, "dropped_rows"),
+        skipped_aggregation_rows: aggregate_metric(&plan, "skipped_aggregation_rows"),
         interned_at_threshold: top_keys_metric(&plan, "interned_at_threshold"),
         charged: accounting.snapshot().peak_intermediate_bytes,
         envelope: probe.peak.load(Ordering::Relaxed),
@@ -1130,15 +1163,15 @@ async fn a_float_state_that_is_not_an_identity_stays_refused() {
     }
 }
 
-/// A function registered under the name `avg` whose accumulator is not
-/// Ravel's sequential fold is refused: the allowlist matches the
-/// implementation, not the name. DataFusion's built-in `avg` seeds a fresh
-/// group's sum at `0.0`.
+/// DataFusion's built-in `avg`, registered under the name `avg` over Ravel's,
+/// is refused by the state layout: its state is a `UInt64` count and then a
+/// `Float64` sum, not `[Float64, Int64]`. The implementation check refuses it
+/// too, so this test does not pin that check on its own;
+/// [`a_same_named_avg_with_a_matching_state_layout_stays_refused`] does.
 ///
 /// FLIP (key the allowlist on the name `avg`, dropping the implementation
 /// and state-layout checks): the built-in is admitted and the plan holds
-/// `TopKeysAggregateExec: n=10`. The state-layout check alone also refuses
-/// it, since the built-in's state is a count and then a sum.
+/// `TopKeysAggregateExec: n=10`.
 #[tokio::test]
 async fn a_same_named_avg_with_another_accumulator_stays_refused() {
     let sql = "SELECT k, avg(f) FROM t GROUP BY k ORDER BY k LIMIT 10";
@@ -1154,6 +1187,235 @@ async fn a_same_named_avg_with_another_accumulator_stays_refused() {
     aggregate_function_names(&plan, &mut names);
     assert!(!names.is_empty(), "{}", render(&plan));
     assert!(names.iter().all(|name| name == "avg"), "{names:?}");
+    let mut states = Vec::new();
+    aggregate_state_types(&plan, &mut states);
+    assert!(!states.is_empty(), "{}", render(&plan));
+    assert!(
+        states
+            .iter()
+            .all(|types| types[..] == [DataType::UInt64, DataType::Float64]),
+        "{states:?}"
+    );
+}
+
+/// A test-local aggregate named `avg` with Ravel's float state layout,
+/// `[Float64 sum, Int64 count]`, and a `GroupsAccumulator` whose fresh group's
+/// sum is seeded at `0.0`, so merging a `-0.0` state into it gives `+0.0`:
+/// its rebuild is not an identity.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SeededAvg {
+    signature: Signature,
+}
+
+impl AggregateUDFImpl for SeededAvg {
+    fn name(&self) -> &str {
+        "avg"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn accumulator(&self, _args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
+        Err(DataFusionError::NotImplemented(
+            "SeededAvg runs only as a GroupsAccumulator".to_string(),
+        ))
+    }
+
+    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
+        Ok(vec![
+            Arc::new(Field::new(
+                format!("{}[sum]", args.name),
+                DataType::Float64,
+                true,
+            )),
+            Arc::new(Field::new(
+                format!("{}[count]", args.name),
+                DataType::Int64,
+                true,
+            )),
+        ])
+    }
+
+    fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+        true
+    }
+
+    fn create_groups_accumulator(
+        &self,
+        _args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn GroupsAccumulator>> {
+        Ok(Box::new(SeededAvgGroups::default()))
+    }
+}
+
+#[derive(Debug, Default)]
+struct SeededAvgGroups {
+    sums: Vec<f64>,
+    counts: Vec<i64>,
+}
+
+impl SeededAvgGroups {
+    fn resize(&mut self, total_num_groups: usize) {
+        self.sums.resize(total_num_groups, 0.0);
+        self.counts.resize(total_num_groups, 0);
+    }
+}
+
+impl GroupsAccumulator for SeededAvgGroups {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        _opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> DFResult<()> {
+        self.resize(total_num_groups);
+        let values = values[0]
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("a Float64 argument");
+        for (value, &group) in values.iter().zip(group_indices) {
+            if let Some(value) = value {
+                self.sums[group] += value;
+                self.counts[group] += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        total_num_groups: usize,
+    ) -> DFResult<()> {
+        self.resize(total_num_groups);
+        let sums = values[0]
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("a Float64 sum");
+        let counts = values[1]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("an Int64 count");
+        for (row, &group) in group_indices.iter().enumerate() {
+            self.sums[group] += sums.value(row);
+            self.counts[group] += counts.value(row);
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> DFResult<ArrayRef> {
+        let sums = emit_to.take_needed(&mut self.sums);
+        let counts = emit_to.take_needed(&mut self.counts);
+        Ok(Arc::new(Float64Array::from_iter(
+            sums.into_iter()
+                .zip(counts)
+                .map(|(sum, count)| (count > 0).then(|| sum / count as f64)),
+        )))
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> DFResult<Vec<ArrayRef>> {
+        let sums = emit_to.take_needed(&mut self.sums);
+        let counts = emit_to.take_needed(&mut self.counts);
+        Ok(vec![
+            Arc::new(Float64Array::from(sums)),
+            Arc::new(Int64Array::from(counts)),
+        ])
+    }
+
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        _opt_filter: Option<&BooleanArray>,
+    ) -> DFResult<Vec<ArrayRef>> {
+        let values = values[0]
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("a Float64 argument");
+        Ok(vec![
+            Arc::new(Float64Array::from_iter_values(
+                values.iter().map(|value| value.unwrap_or(0.0)),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                values.iter().map(|value| i64::from(value.is_some())),
+            )),
+        ])
+    }
+
+    fn size(&self) -> usize {
+        self.sums.capacity() * size_of::<f64>() + self.counts.capacity() * size_of::<i64>()
+    }
+}
+
+/// An `avg` that matches the allowlist on every point but the implementation
+/// (the name, one `Float64` argument, not distinct, state `[Float64, Int64]`)
+/// is refused: [`SeededAvg`] seeds a fresh sum at `0.0`, so its rebuild would
+/// turn a `-0.0` state into `+0.0`. The plan is checked to run that aggregate,
+/// with that state layout, so only the implementation check refuses it.
+///
+/// FLIP (delete the `aggr.fun() == &*SEQUENTIAL_AVG` conjunct from
+/// `float_state_is_identity`): the plan holds `TopKeysAggregateExec: n=10`
+/// and the first assertion fails.
+#[tokio::test]
+async fn a_same_named_avg_with_a_matching_state_layout_stays_refused() {
+    let sql = "SELECT k, avg(f) FROM t GROUP BY k ORDER BY k LIMIT 10";
+    let (pool, _breach) = SqlConfig::default()
+        .query_pool(TenantMemoryAccountant::new(1 << 30), QueryAccounting::new());
+    let ctx = session_typed(&SqlConfig::default(), pool, float_state_parts(), &[], false);
+    ctx.register_udaf(AggregateUDF::new_from_impl(SeededAvg {
+        signature: Signature::exact(vec![DataType::Float64], Volatility::Immutable),
+    }));
+    let plan = plan_of(&ctx, sql).await;
+    assert!(top_keys_bounds(&plan).is_empty(), "{}", render(&plan));
+    let mut seeded = 0;
+    let mut states = Vec::new();
+    for_each_aggregate(&plan, &mut |aggregate| {
+        for aggr in aggregate.aggr_expr() {
+            assert_eq!(aggr.fun().name(), "avg");
+            let implementation: &dyn Any = aggr.fun().inner().as_ref();
+            assert!(implementation.is::<SeededAvg>(), "{:?}", aggr.fun());
+            assert!(!aggr.is_distinct());
+            seeded += 1;
+        }
+    });
+    aggregate_state_types(&plan, &mut states);
+    assert!(seeded > 0, "{}", render(&plan));
+    assert!(
+        states
+            .iter()
+            .all(|types| types[..] == [DataType::Float64, DataType::Int64]),
+        "{states:?}"
+    );
+}
+
+/// Call `f` on every `AggregateExec` in `plan`, in pre-order.
+fn for_each_aggregate(plan: &Arc<dyn ExecutionPlan>, f: &mut dyn FnMut(&AggregateExec)) {
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+        f(aggregate);
+    }
+    for child in plan.children() {
+        for_each_aggregate(child, f);
+    }
+}
+
+/// The state field types of every aggregate expression of every
+/// `AggregateExec` in `plan`.
+fn aggregate_state_types(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Vec<DataType>>) {
+    for_each_aggregate(plan, &mut |aggregate| {
+        out.extend(aggregate.aggr_expr().iter().map(|aggr| {
+            aggr.state_fields()
+                .expect("state fields")
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect::<Vec<_>>()
+        }));
+    });
 }
 
 /// The function name of every aggregate expression of every `AggregateExec`
@@ -1506,6 +1768,209 @@ async fn an_admitted_float_aggregate_is_exact_through_rebuilds() {
         want,
         "rule off"
     );
+}
+
+/// The largest key of [`order_sensitive_batches`].
+const ORDER_SENSITIVE_KEYS: i64 = 200;
+
+/// The 8-row batches of [`order_sensitive_batches`] wholly before the second
+/// rows of keys 0 and 1, which follow 2 + 199 rows.
+const BEFORE_SECOND_ROWS: usize = (2 + ORDER_SENSITIVE_KEYS as usize - 1) / 8;
+
+/// `(k, f)` in one fixed arrival order, in batches of 8 rows. Key 0 holds
+/// `1e16`, `1.0` and `-1e16`, whose sum is `+0.0` folded in that order and
+/// `1.0` folded as `(1e16 + -1e16) + 1.0`. Key 1 holds three `-0.0` rows.
+/// Keys 2 to 200 hold `k + 0.25` twice. The rows arrive as: the first rows
+/// of keys 0 and 1; keys 200 down to 2, the adversarial order for
+/// `ORDER BY k`; the second rows of keys 0 and 1; keys 200 down to 2 again;
+/// the last rows of keys 0 and 1.
+fn order_sensitive_batches() -> Vec<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("f", DataType::Float64, false),
+    ]));
+    let filler = || (2..=ORDER_SENSITIVE_KEYS).rev().map(|k| (k, k as f64 + 0.25));
+    let mut rows: Vec<(i64, f64)> = vec![(0, 1e16), (1, -0.0)];
+    rows.extend(filler());
+    rows.extend([(0, 1.0), (1, -0.0)]);
+    rows.extend(filler());
+    rows.extend([(0, -1e16), (1, -0.0)]);
+    rows.chunks(8)
+        .map(|chunk| {
+            let k = Int64Array::from_iter_values(chunk.iter().map(|row| row.0));
+            let f = Float64Array::from_iter_values(chunk.iter().map(|row| row.1));
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(k), Arc::new(f)])
+                .expect("batch builds")
+        })
+        .collect()
+}
+
+/// Every `(k, avg bits, count)` row of `batches`, in order.
+fn key_averages(batches: &[RecordBatch]) -> Vec<(i64, Option<u64>, i64)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let keys = int_values(batch.column(0));
+        let averages = float_bits(batch.column(1));
+        let counts = int_values(batch.column(2));
+        out.extend(
+            keys.into_iter()
+                .zip(averages)
+                .zip(counts)
+                .map(|((k, average), count)| {
+                    (k.expect("k is not null"), average, count.expect("a count"))
+                }),
+        );
+    }
+    out
+}
+
+/// The summed value of the metric `name` over every `AggregateExec` in `plan`.
+fn aggregate_metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
+    let mut total = 0;
+    for_each_aggregate(plan, &mut |aggregate| {
+        total += aggregate
+            .metrics()
+            .and_then(|metrics| metrics.sum_by_name(name))
+            .map_or(0, |value| value.as_usize());
+    });
+    total
+}
+
+/// `avg(f)` over a float column in the plan shapes production gives it. A
+/// float `avg` is not exact-typed (ADR-0094), so its final aggregate is never
+/// `FinalPartitioned`: at the session's own partition count it is `Final`
+/// over a `CoalescePartitionsExec`, where the exact-typed session would plan
+/// `FinalPartitioned`. Both runs then use the not-exact-typed session on one
+/// target partition with 8-row batches over [`order_sensitive_batches`]:
+///
+/// - `Final`: the batches in one partition beside an empty one, so the
+///   partial stage runs on two partitions under a `CoalescePartitionsExec`
+///   whose only producer is the non-empty one, and the final stage sees the
+///   partial output in arrival order. The partial stage passes rows on after
+///   its first batch, so the later rows of keys 0 and 1 reach the exec as
+///   their own states and are merged after a rebuild.
+/// - `Single`: the batches in one partition, so the exec reads them directly
+///   and the later rows of keys 0 and 1 go through `update_batch` after a
+///   rebuild.
+///
+/// Keys 0 and 1 are held across a rebuild and kept, in both modes, by
+/// construction, not by chance: their first rows are the exec's first two
+/// keys, a rebuild runs only at the end of a batch once 20 groups are held,
+/// so both are held at the first rebuild, and as the two smallest keys under
+/// `ORDER BY k` with `n = 10` they rank first at every rebuild and are never
+/// evicted. Their second rows follow 199 rows of distinct keys, so at least
+/// one rebuild has run before them; a run over only the batches before them
+/// pins that. Every returned average, count included,
+/// equals the rule-off run of the same plan shape bit for bit: key 0's is the
+/// in-order fold `(1e16 + 1.0) + -1e16` over 3, key 1's is `-0.0`.
+///
+/// FLIP (merge a `(0.0, 0)` state into each fresh accumulator before the kept
+/// states in `rebuild`): key 1's average comes back `+0.0` in both modes.
+#[tokio::test]
+async fn a_float_avg_is_exact_through_rebuilds_in_the_final_and_single_modes() {
+    let sql = "SELECT k, avg(f), count(*) FROM t GROUP BY k ORDER BY k LIMIT 10";
+    let config = SqlConfig::default();
+    for (exact_typed, mode) in [
+        (false, AggregateMode::Final),
+        (true, AggregateMode::FinalPartitioned),
+    ] {
+        let (pool, _breach) =
+            config.query_pool(TenantMemoryAccountant::new(1 << 30), QueryAccounting::new());
+        let ctx = session_typed(
+            &config,
+            pool,
+            vec![order_sensitive_batches(), order_sensitive_batches()],
+            &[],
+            exact_typed,
+        );
+        let plan = plan_of(&ctx, sql).await;
+        assert_eq!(top_keys_bounds(&plan), vec![10], "{}", render(&plan));
+        assert_eq!(top_keys_modes(&plan), vec![mode], "{}", render(&plan));
+    }
+
+    let folded = (1e16f64 + 1.0) + -1e16;
+    assert_ne!(folded.to_bits(), ((1e16f64 + -1e16) + 1.0).to_bits());
+    let want: Vec<(i64, Option<u64>, i64)> = (0..10)
+        .map(|k| match k {
+            0 => (0, Some((folded / 3.0).to_bits()), 3),
+            1 => (1, Some((-0.0f64).to_bits()), 3),
+            k => (k, Some((k as f64 + 0.25).to_bits()), 2),
+        })
+        .collect();
+    let batch = [("datafusion.execution.batch_size", "8")];
+    let pass_rows = [
+        (
+            "datafusion.execution.skip_partial_aggregation_probe_rows_threshold",
+            "1",
+        ),
+        (
+            "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+            "0.0",
+        ),
+    ];
+    for (mode, parts, options) in [
+        (
+            AggregateMode::Final,
+            vec![order_sensitive_batches(), Vec::new()],
+            [ONE_PARTITION, &batch, &pass_rows].concat(),
+        ),
+        (
+            AggregateMode::Single,
+            vec![order_sensitive_batches()],
+            [ONE_PARTITION, &batch].concat(),
+        ),
+    ] {
+        let prefix: Vec<Vec<RecordBatch>> = parts
+            .iter()
+            .map(|part| part.iter().take(BEFORE_SECOND_ROWS).cloned().collect())
+            .collect();
+        let on = probed_typed(&config, parts.clone(), &options, sql, false).await;
+        let off = probed_typed(&rule_off(&config), parts, &options, sql, false).await;
+        assert_eq!(on.bounds, vec![10], "{mode:?}\n{}", on.plan);
+        assert_eq!(on.modes, vec![mode], "{}", on.plan);
+        assert!(off.bounds.is_empty(), "{mode:?}: rule off\n{}", off.plan);
+        assert!(
+            off.plan.contains(&format!("AggregateExec: mode={mode:?}, ")),
+            "{}",
+            off.plan
+        );
+        assert_eq!(
+            on.plan.contains("CoalescePartitionsExec"),
+            mode == AggregateMode::Final,
+            "{}",
+            on.plan
+        );
+        assert_eq!(on.rebuilds, 12, "{mode:?}");
+        assert_eq!(on.evictions, 191, "{mode:?}: 201 keys less the 10 kept");
+        assert!(on.dropped > 0, "{mode:?}: no row was dropped");
+        let skipped = if mode == AggregateMode::Final { 396 } else { 0 };
+        assert_eq!(
+            on.skipped_aggregation_rows, skipped,
+            "{mode:?}: every row after the first batch passes as its own state"
+        );
+        let got = key_averages(on.result.as_ref().expect("query runs"));
+        assert_eq!(got, want, "{mode:?}");
+
+
+        // The batches before the one holding the second rows of keys 0 and 1
+        // already rebuild, and hold exactly the first row of each.
+        let before = probed_typed(&config, prefix, &options, sql, false).await;
+        assert!(before.rebuilds > 0, "{mode:?}: no rebuild before the second rows");
+        let early = key_averages(before.result.as_ref().expect("query runs"));
+        assert_eq!(
+            early[..2],
+            [
+                (0, Some(1e16f64.to_bits()), 1),
+                (1, Some((-0.0f64).to_bits()), 1)
+            ],
+            "{mode:?}"
+        );
+        assert_eq!(
+            key_averages(off.result.as_ref().expect("query runs")),
+            want,
+            "{mode:?}: rule off"
+        );
+    }
 }
 
 /// `(f, k)` in one partition: a `+0.0` row and a `-5.0` row, then two `-0.0`
