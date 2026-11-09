@@ -3547,25 +3547,28 @@ else
   fail "check clean: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
 fi
 
-# The cardinality band file (issue #3868's pre-registration) against case za's
-# run, every arm on, re-stamped as a cardinality run: the file is not refused
+# The cardinality band file (issue #3868's pre-registration) against cases za
+# and zn, re-stamped as cardinality runs: the file is not refused
 # (exit 64 or 65), and every figure's file, path and when resolve, so no line
 # reads missing or duplicated. Its bounds are the cardinality tenant's, so some
 # of the stub's figures fall outside them; that is not what this checks.
 CARD_BANDS="${HERE}/../stage1-bands.cardinality.json"
 CARD_FIGURES="$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["figures"]))' "${CARD_BANDS}")"
-rm -rf "${TMP}/check-card" && cp -R "${TMP}/za/out" "${TMP}/check-card"
-python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["profile"]="cardinality"; json.dump(d,open(p,"w"))' "${TMP}/check-card/stamps.json"
-run_check card "${CARD_BANDS}" "${TMP}/check-card"
-card_failed="$(sed -n 's/^stage1-check: \([0-9]*\) of [0-9]* figures failed$/\1/p' "${CHECK_ERR}")"
-card_lines=$(( $(grep -c '^ok \|^n/a ' "${CHECK_OUT}") + ${card_failed:-0} ))
-if { [ "${rc}" -eq 0 ] || [ "${rc}" -eq 1 ]; } && ! grep -qE '^(missing|duplicated) ' "${CHECK_ERR}" &&
-  { [ "${rc}" -eq 0 ] && [ "$(wc -l <"${CHECK_OUT}")" -eq "${CARD_FIGURES}" ] || [ "${rc}" -eq 1 ] && [ -n "${card_failed}" ]; } &&
-  [ "${CARD_FIGURES}" -eq 62 ]; then
-  pass "check cardinality: the pre-registered file resolves every one of its ${CARD_FIGURES} figures on an all-arms run (exit ${rc}, ${card_failed:-0} outside the cardinality bounds)"
-else
-  fail "check cardinality: exit ${rc} (${card_lines} lines), stderr $(cat "${CHECK_ERR}")"
-fi
+# za runs every arm; zn runs the erasure arm alone, so every figure of the
+# other arms must read n/a there rather than missing.
+for c in za zn; do
+  rm -rf "${TMP}/check-card-${c}" && cp -R "${TMP}/${c}/out" "${TMP}/check-card-${c}"
+  python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["profile"]="cardinality"; json.dump(d,open(p,"w"))' "${TMP}/check-card-${c}/stamps.json"
+  run_check "card-${c}" "${CARD_BANDS}" "${TMP}/check-card-${c}"
+  card_failed="$(sed -n 's/^stage1-check: \([0-9]*\) of [0-9]* figures failed$/\1/p' "${CHECK_ERR}")"
+  if { [ "${rc}" -eq 0 ] || [ "${rc}" -eq 1 ]; } && ! grep -qE '^(missing|duplicated) ' "${CHECK_ERR}" &&
+    { { [ "${rc}" -eq 0 ] && [ "$(wc -l <"${CHECK_OUT}")" -eq "${CARD_FIGURES}" ]; } || { [ "${rc}" -eq 1 ] && [ -n "${card_failed}" ]; }; } &&
+    [ "${CARD_FIGURES}" -eq 62 ]; then
+    pass "check cardinality ${c}: the pre-registered file resolves every one of its ${CARD_FIGURES} figures (exit ${rc}, ${card_failed:-0} outside the cardinality bounds)"
+  else
+    fail "check cardinality ${c}: exit ${rc}, stderr $(cat "${CHECK_ERR}")"
+  fi
+done
 
 # The arms' bands: every figure in band on case za's run, every arm on, but
 # the reference prune band, n/a since the extra-hour and l1 arms changed the
