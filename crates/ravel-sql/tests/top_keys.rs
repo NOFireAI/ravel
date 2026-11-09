@@ -672,6 +672,71 @@ async fn ties_at_the_nth_key_return_complete_groups() {
     }
 }
 
+/// `(g, k, v)` in one partition, two batches. The first, 80 rows: tied keys
+/// `k` 100 to 169 with `g = 0`, then keys 0 to 9 with `g = k - 10`. The
+/// second, 20 rows: one more `g = 0` row for each of keys 130 to 139, then
+/// keys 200 to 209 with `g = -800 - k`. Row `j` of key `k` has `v = 10k + j`.
+fn reentry_parts() -> Vec<Vec<RecordBatch>> {
+    let schema = int64_schema(&["g", "k", "v"], false);
+    let mut rows = Vec::new();
+    let mut push = |g: i64, k: i64, j: i64| rows.push(vec![Some(g), Some(k), Some(10 * k + j)]);
+    for k in 100..170 {
+        push(0, k, 0);
+    }
+    for k in 0..10 {
+        push(k - 10, k, 0);
+    }
+    for k in 130..140 {
+        push(0, k, 1);
+    }
+    for k in 200..210 {
+        push(-800 - k, k, 0);
+    }
+    vec![int64_batches(&schema, &rows, 80)]
+}
+
+/// Over [`reentry_parts`] with `LIMIT 40` on one final partition, the first
+/// batch takes the exec to 80 groups and the rebuild keeps keys 0 to 9 and
+/// the first 30 tied keys, 100 to 129, and evicts 130 to 169 at the
+/// threshold `g = 0`. The second batch's rows for 130 to 139 tie the
+/// threshold, so they pass the mask and those keys re-enter holding one of
+/// their two rows; ten better keys follow them. The end-of-input cut must
+/// pick the 20 tied keys it keeps from the ones the rebuild kept.
+///
+/// FLIP (the rebuild interns the kept keys after the next batch's new keys):
+/// the re-entered keys get indexes 0 to 9, the cut picks all ten, and each
+/// comes back with a count of 1 where the complete group has 2.
+/// FLIP (the end-of-input cut ranks by sort row alone, with
+/// `sort_unstable_by`): the unstable sort orders the tied keys by neither
+/// index nor arrival, and re-entered keys come back with a count of 1.
+#[tokio::test]
+async fn a_key_evicted_at_the_threshold_and_seen_again_is_cut() {
+    let sql = "SELECT g, k, count(*), sum(v) FROM t GROUP BY g, k ORDER BY g LIMIT 40";
+    let (on, off) = on_and_off(reentry_parts, ONE_PARTITION, sql).await;
+    assert_eq!(on.bounds, vec![40], "{}", on.plan);
+    assert_eq!(on.modes, vec![AggregateMode::Single], "{}", on.plan);
+    assert_eq!(on.rebuilds, 1, "{}", on.plan);
+    assert_eq!(on.interned_at_threshold, 10, "{}", on.plan);
+    let all = probed(
+        &rule_off(&SqlConfig::default()),
+        reentry_parts(),
+        ONE_PARTITION,
+        "SELECT g, k, count(*), sum(v) FROM t GROUP BY g, k",
+    )
+    .await
+    .rows();
+    let complete: BTreeMap<String, Vec<String>> =
+        all.into_iter().map(|row| (row[1].clone(), row)).collect();
+    let rows = on.rows();
+    assert_eq!(rows.len(), 40, "{sql}");
+    let mut seen = BTreeSet::new();
+    for row in &rows {
+        assert_eq!(Some(row), complete.get(&row[1]), "group {} is partial", row[1]);
+        assert!(seen.insert(row[1].clone()), "key {} returned twice", row[1]);
+    }
+    assert_eq!(sort_values(&rows), sort_values(&off.rows()), "{sql}");
+}
+
 /// `(k, v)`, `k` nullable: keys 1 to 1,000, one row each, over four
 /// partitions in descending order, and eight NULL-key rows, one first and
 /// one last in every partition, each with `v = 7`.

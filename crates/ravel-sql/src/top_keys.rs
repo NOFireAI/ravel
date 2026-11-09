@@ -62,10 +62,10 @@
 //! keys. A key evicted at a rebuild has `n` kept keys ranked ahead of it.
 //! The threshold only moves forward, so its later rows pass only when its
 //! sort value ties the threshold; it then re-enters with a group index above
-//! every key already held, the rebuild re-interns kept keys in rank order,
-//! and so `n` keys stay ranked ahead of it at every later cut: it is absent
-//! from the output, never partial. Every group strictly better than
-//! the global n-th sort value is therefore kept complete by its partition,
+//! every key already held, the kept keys get indexes 0 to n-1 before any
+//! later row, and so `n` keys stay ranked ahead of it at every later cut:
+//! it is absent from the output, never partial. Every group strictly better
+//! than the global n-th sort value is therefore kept complete by its partition,
 //! enough groups tied with it are kept complete to fill `n`, and the global
 //! sort picks `n` complete groups. The mask keeps rows at the threshold, so
 //! the worst kept key's later rows are never lost. Among keys whose sort
