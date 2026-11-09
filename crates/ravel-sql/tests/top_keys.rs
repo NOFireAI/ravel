@@ -1135,8 +1135,10 @@ async fn a_float_state_that_is_not_an_identity_stays_refused() {
 /// implementation, not the name. DataFusion's built-in `avg` seeds a fresh
 /// group's sum at `0.0`.
 ///
-/// FLIP (key the allowlist on the name `avg`): the built-in is admitted and
-/// the plan holds `TopKeysAggregateExec: n=10`.
+/// FLIP (key the allowlist on the name `avg`, dropping the implementation
+/// and state-layout checks): the built-in is admitted and the plan holds
+/// `TopKeysAggregateExec: n=10`. The state-layout check alone also refuses
+/// it, since the built-in's state is a count and then a sum.
 #[tokio::test]
 async fn a_same_named_avg_with_another_accumulator_stays_refused() {
     let sql = "SELECT k, avg(f) FROM t GROUP BY k ORDER BY k LIMIT 10";
@@ -1263,7 +1265,9 @@ fn float32_state_parts() -> Vec<Vec<RecordBatch>> {
 /// column, which coerces to `Float64` before the accumulator.
 ///
 /// FLIP (seed a fresh group's sum at `Some(0.0)` in `avg.rs`): the `-0.0`
-/// groups come back as `+0.0` and the signalling NaN comes back quieted.
+/// groups come back as `+0.0`, the signalling NaN comes back quieted and the
+/// two empty groups as `+0.0`; the source sums already differ, since
+/// `update_batch` starts from the same seed.
 #[tokio::test]
 async fn the_identity_merge_is_bit_exact_for_admitted_float_states() {
     let rows: [(usize, Option<u64>); 15] = [
@@ -1465,7 +1469,9 @@ fn minute_averages(batches: &[RecordBatch]) -> Vec<(i64, Option<u64>)> {
 /// the admitted float state goes through the exec's rebuilds and every
 /// average equals the rule-off run's bit for bit, `-0.0`, both NaN payloads,
 /// both infinities and the subnormal included. Minutes 1,940 to 1,999 come
-/// back, each with its class's average.
+/// back, each with its class's average. Batches of 64 rows make each final
+/// partition take its partial states over many batches, so a kept group's
+/// rebuilt state is merged with partial states that arrive after the rebuild.
 ///
 /// FLIP (merge a `(0.0, 0)` state into each fresh accumulator before the kept
 /// states in `rebuild`): the `-0.0` minutes come back as `+0.0`.
@@ -1473,11 +1479,13 @@ fn minute_averages(batches: &[RecordBatch]) -> Vec<(i64, Option<u64>)> {
 async fn an_admitted_float_aggregate_is_exact_through_rebuilds() {
     let sql = "SELECT date_trunc('minute', ts) AS m, avg(v) FROM t \
                GROUP BY m ORDER BY m DESC LIMIT 60";
-    let options = [("datafusion.execution.target_partitions", "8")];
+    let options = [
+        ("datafusion.execution.target_partitions", "8"),
+        ("datafusion.execution.batch_size", "64"),
+    ];
     let (on, off) = on_and_off(float_minute_parts, &options, sql).await;
     assert_eq!(on.bounds, vec![60], "{}", on.plan);
-    assert!(on.rebuilds > 0, "rebuilds {}\n{}", on.rebuilds, on.plan);
-    let got = minute_averages(on.result.as_ref().expect("query runs"));
+    assert!(on.rebuilds > 0, "rebuilds {}\n{}", on.rebuilds, on.plan);    let got = minute_averages(on.result.as_ref().expect("query runs"));
     let want: Vec<(i64, Option<u64>)> = (FLOAT_MINUTES - 60..FLOAT_MINUTES)
         .rev()
         .map(|minute| (minute, minute_class_average(minute)))
