@@ -65,12 +65,7 @@ runs:
           echo "::error::fetch-pinned-tool: download of $TOOL_NAME failed from $TOOL_URL after 3 attempts"
           exit 1
         fi
-        got="$(sha256sum "$tmp" | awk '{print $1}')"
-        if [ "$got" != "$TOOL_SHA256" ]; then
-          rm -f "$tmp"
-          echo "::error::fetch-pinned-tool: $TOOL_NAME sha256 $got != expected $TOOL_SHA256; refusing to use it"
-          exit 1
-        fi
+        # The verify step below checks the sha256 on this path and on a hit.
         mv "$tmp" "$TOOL_DEST"
     - name: Verify ${{ inputs.name }} sha256
       # Unconditional: a cache hit skips the download step above, and the
@@ -90,8 +85,9 @@ runs:
           sum_cmd="shasum -a 256"
         fi
         if ! printf '%s  %s\n' "$TOOL_SHA256" "$TOOL_DEST" | $sum_cmd -c - >/dev/null 2>&1; then
-          got="$($sum_cmd "$TOOL_DEST" | awk '{print $1}')"
-          echo "::error::fetch-pinned-tool: $TOOL_NAME sha256 $got != expected $TOOL_SHA256; refusing to use it"
+          got="$($sum_cmd "$TOOL_DEST" 2>/dev/null | awk '{print $1}')"
+          rm -f "$TOOL_DEST"
+          echo "::error::fetch-pinned-tool: $TOOL_NAME sha256 ${got:-missing} != expected $TOOL_SHA256; removed it and refusing to use it"
           exit 1
         fi
     - name: Save ${{ inputs.name }} to cache
