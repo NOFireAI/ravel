@@ -160,7 +160,7 @@ Let v(k) be the sort value of group k. Under the gate it is computed from the gr
   - Under the tie-order rewrite, which covers count, sum and avg with no float key, the sort is total on the keys, so v is injective and the answer is fully determined.
   - Otherwise, ties among keys with equal sort values are resolved by arrival order, which SQL leaves unspecified. `BoundedTopKAggregate` documents the same stance.
 - **Float keys are refused, not canonicalised.** `GroupValues` folds -0.0 into +0.0 for group equality and keeps NaN payloads distinct (`group_values/single_group_by/primitive.rs:88-92`). arrow-row orders floats by total-order bits, with -0.0 before +0.0 (`arrow-row-59.3.0/src/fixed.rs:152-157`). A group holding both zeros would therefore have two sort values, and a kept group could lose its +0.0 rows. ADR-0022 keeps -0.0 and NaN payloads significant, so canonicalising is not an option.
-- **Float accumulator states are refused.** A rebuild merges each kept group's one emitted state into a freshly initialised accumulator. For a float state seeded at 0.0, that identity merge is not bit-exact: `0.0 + -0.0 = +0.0`, so a group whose true sum is -0.0 would come back as +0.0. ADR-0022 forbids that. A float accumulator whose fresh state is a bit-exact identity under merge (for example one seeded from its first value) could be admitted once a test proves it. That is follow-up T6.
+- **A float accumulator state is admitted only when its rebuild is an identity** (see the float-state allowlist amendment below). A rebuild merges each kept group's one emitted state into a freshly initialised accumulator. For a float state seeded at 0.0 that merge is not bit-exact: `0.0 + -0.0 = +0.0`, which ADR-0022 forbids. Ravel's sequential-fold `avg` over a `Float64` argument starts a fresh group with no sum and a count of 0, so the merge copies the sum without arithmetic and adds the count to 0: the state and the average evaluated from it come back bit for bit. That one state is admitted, matched on the accumulator's implementation and state layout rather than on the function's name (`float_state_is_identity` in `top_keys.rs`); every other float state, a float `sum` among them, stays refused.
 
 ### 4. The bound and its ceiling
 
@@ -216,8 +216,8 @@ Against the pre-registration (comment 6730613003 on #4002), every band held but 
 ## Consequences
 
 - **Bounded memory.** The final stage of `GROUP BY ... ORDER BY <key> LIMIT n` uses O(n) memory per partition: 2n groups resident plus one batch and one rebuild transient.
-- **Coverage today.** The bounded path covers `count(*)`, `count(x)` and integer `sum` and `avg`. It does not cover the rest:
-  - float `sum` and `avg` (for example `avg(latency)` per minute bucket), whose state is refused (Decision 3, follow-up T6);
+- **Coverage today.** The bounded path covers `count(*)`, `count(x)`, integer `sum` and `avg`, and non-distinct `avg` over a `Float64` or `Float32` column (for example `avg(latency)` per minute bucket; see the float-state allowlist amendment below). It does not cover the rest:
+  - float `sum`, whose state is refused (Decision 3), and `avg(DISTINCT)` over a float, which does not support a `GroupsAccumulator`;
   - float `min` and `max`, which do not support a `GroupsAccumulator` (`minmax.rs:187-196`);
   - float sort keys;
   - ordering by an aggregate;
@@ -246,3 +246,27 @@ flowchart TB
     X -- yes --> K["emit states, keep best n (stable), rebuild, move threshold"]
   end
 ```
+
+## Amendment (2026-11-09): the float-state allowlist (T6, #4006)
+
+<!-- amendment-applies: sections="3. Why the answer is exact|Consequences" pointer="float-state allowlist amendment" -->
+<!-- amendment-supersedes: phrase="Float accumulator states are refused" pointer="float-state allowlist amendment" -->
+
+Decision 3 refused every float accumulator state, which "Float accumulator states are refused" stated. This amendment replaces that with an allowlist: a float state is admitted when merging it into a fresh accumulator returns it bit for bit, which is all a rebuild does to a kept group. Decision 3 and Consequences, "Coverage today", now point here.
+
+**What runs for each float-state aggregate under Ravel's session.**
+
+- `avg`/`mean` over `Float64`, and over `Float32`, which its coercion casts to `Float64`, non-distinct: Ravel's `SequentialAvgGroupsAccumulator` (`crates/ravel-sql/src/avg.rs:503-633`), a `GroupsAccumulator`. State `[sum Float64 nullable, count Int64]`. A fresh group holds no sum and a count of 0 (`resize`, `avg.rs:516-519`). `merge_batch` (`avg.rs:551-576`) folds a non-null incoming sum with `fold`, which stores the value itself into an empty slot (`None => value`, `avg.rs:521-526`), skips a null one, and adds the incoming count to 0. So for every state S, `-0.0`, `+0.0`, NaN of any payload and sign, a signalling NaN, `+inf`, `-inf`, subnormals and the null sum with count 0 included, the merged state equals S: no float arithmetic touches the sum. `evaluate` is a pure function of `(sum, count)` (`avg.rs:578-590`), so the average is unchanged too. Admitted.
+- `avg(DISTINCT)` over a float: no `GroupsAccumulator` (`avg.rs:320-325`); refused by the existing condition.
+- `sum` over `Float64` or `Float32` (coerced to `Float64`): DataFusion's built-in, which Ravel does not replace for float input (ADR-0022 decision 3, ADR-0024). It runs `PrimitiveGroupsAccumulator<Float64Type>` (`datafusion-functions-aggregate-55.2.0/src/sum.rs:314-316`) with state `[sum Float64 nullable]`, a fresh value of `0.0` (`prim_op.rs:72, 100`), and a merge that adds the incoming sum to it. `0.0 + -0.0` is `+0.0` and the addition quiets a signalling NaN, so the merge is not an identity. Refused. `sum(DISTINCT)` has no `GroupsAccumulator`.
+- `min`/`max` over a float: `TotalOrderMinMax` returns no `GroupsAccumulator` for a float result (`minmax.rs:187-196`); refused.
+- `count` has an `Int64` state, `first_value` carries an `ORDER BY` and is refused for it, and `exact_sum_count` is integer only. No other Ravel UDAF has a float state.
+
+**The gate.** `float_state_is_identity` in `crates/ravel-sql/src/top_keys.rs` admits an aggregate expression with a float state field only when all of these hold: its function equals `sequential_avg_udaf()`, where `AggregateUDF` equality downcasts to the implementation type, so a same-named built-in or user function does not match; it is not distinct; it has exactly one argument, of type `Float64` against the aggregate's input schema; and its state types are exactly `[Float64, Int64]`. Float group keys and float sort expressions stay refused (Decision 3).
+
+**The tests**, in `crates/ravel-sql/tests/top_keys.rs`:
+
+- `the_identity_merge_is_bit_exact_for_admitted_float_states` builds the admitted accumulator from a planned `avg` over `Float64` and over `Float32`, fills twelve groups by `update_batch` (`-0.0` with one and two rows, `+0.0`, two quiet NaN payloads, a signalling NaN, `+inf`, `-inf`, the smallest subnormal, a NULL-only group, a group with no rows, a finite group), merges the emitted state into fresh accumulators, and asserts the bits of every sum, every count and every evaluated average against the unmerged ones, and that an empty state merges to an empty state.
+- `an_admitted_float_aggregate_is_exact_through_rebuilds` runs `avg(v)` per minute bucket, `ORDER BY` the bucket `DESC LIMIT 60`, over 2,000 minutes on 8 partitions arriving oldest first, with groups of `-0.0` only, a NaN payload with finite rows, the other NaN payload with a finite row, mixed signed zeros and finite values, each infinity with a finite or `-0.0` row, subnormals with a NULL, and NULL only. It asserts the plan holds `TopKeysAggregateExec: n=60`, that the exec rebuilt, and that each of the 60 averages equals its expected bits and the rule-off run's.
+- `a_float_state_that_is_not_an_identity_stays_refused` asserts that `sum(f)`, alone and beside an admitted `avg(f)`, keeps the stock plan over the `-0.0` group fixture.
+- `a_same_named_avg_with_another_accumulator_stays_refused` registers DataFusion's built-in `avg` under the name `avg` and asserts the plan keeps the stock aggregate.
