@@ -554,6 +554,10 @@ struct TopKeysMetrics {
     evictions: Count,
     /// Times the table was rebuilt from its best `n` groups.
     rebuilds: Count,
+    /// Groups interned after a rebuild whose sort row equals the threshold
+    /// when interned. Every key evicted at a rebuild and seen again is among
+    /// them, since its later rows pass the mask only on a tie.
+    interned_at_threshold: Count,
 }
 
 impl TopKeysMetrics {
@@ -563,6 +567,8 @@ impl TopKeysMetrics {
             dropped_rows: MetricBuilder::new(metrics).counter("dropped_rows", partition),
             evictions: MetricBuilder::new(metrics).counter("evictions", partition),
             rebuilds: MetricBuilder::new(metrics).counter("rebuilds", partition),
+            interned_at_threshold: MetricBuilder::new(metrics)
+                .counter("interned_at_threshold", partition),
         }
     }
 }
@@ -726,18 +732,32 @@ impl TopKeysStream {
             ));
         };
         let mut values = evaluate_many(&self.args, batch)?;
+        // Whether each kept row's sort row equals the threshold, and the
+        // flags that count each new group once; both empty before the first
+        // rebuild, and charged as `flags` bytes.
+        let mut tied = Vec::new();
+        let mut flags = 0;
         if let Some(threshold) = &self.threshold {
             let sort_rows = self.sort_rows(&keys, rows)?;
             let scratch = sort_rows.size();
-            try_grow_named(&mut self.reservation, scratch)?;
-            let mask: BooleanArray = (0..rows)
-                .map(|row| Some(sort_rows.row(row) <= threshold.row()))
-                .collect();
+            flags = 2 * rows;
+            try_grow_named(&mut self.reservation, scratch + flags)?;
+            tied.reserve_exact(rows);
+            let mut mask = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let order = sort_rows.row(row).cmp(&threshold.row());
+                mask.push(order.is_le());
+                if order.is_le() {
+                    tied.push(order.is_eq());
+                }
+            }
+            let mask = BooleanArray::from(mask);
             drop(sort_rows);
             self.reservation.shrink(scratch);
             let kept = mask.true_count();
             self.metrics.dropped_rows.add(rows - kept);
             if kept == 0 {
+                self.reservation.shrink(flags);
                 return Ok(());
             }
             if kept < rows {
@@ -753,8 +773,24 @@ impl TopKeysStream {
                 }
             }
         }
+        let held = self.group_values.len();
         self.group_values.intern(&keys, &mut self.group_indices)?;
         let total_groups = self.group_values.len();
+        if !tied.is_empty() {
+            let mut counted = vec![false; total_groups - held];
+            for (&group, &tied) in self.group_indices.iter().zip(&tied) {
+                let Some(seen) = group.checked_sub(held).and_then(|new| counted.get_mut(new))
+                else {
+                    continue;
+                };
+                if tied && !*seen {
+                    *seen = true;
+                    self.metrics.interned_at_threshold.add(1);
+                }
+            }
+        }
+        drop(tied);
+        self.reservation.shrink(flags);
         for (accumulator, args) in self.accumulators.iter_mut().zip(&values) {
             if self.merge {
                 accumulator.merge_batch(args, &self.group_indices, total_groups)?;

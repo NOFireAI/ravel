@@ -14,8 +14,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, TimestampNanosecondArray};
@@ -27,7 +27,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
-use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 use proptest::prelude::*;
@@ -44,8 +44,9 @@ use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
     BucketedFinalAggregateExec, BucketedFinalAggregation, DeclaredColumn, DeclaredType,
     FirstGroupsExec, LogsTableProvider, SessionPrincipal, SessionTable, SpanSegmentFetcher,
-    SpillDecision, SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns, TenantDelegatingPool,
-    TenantMemoryAccountant, TopKeysAggregateExec, build_session, plan_aggregate_profile,
+    SpillDecision, SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns, TOP_KEYS_CONSUMER_PREFIX,
+    TenantDelegatingPool, TenantMemoryAccountant, TopKeysAggregateExec, build_session,
+    plan_aggregate_profile,
 };
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::AttrValue;
@@ -206,18 +207,42 @@ fn sorted(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
 
 /// Forwards to the query's `TenantDelegatingPool` and records, after every
 /// call, the bytes the process budget holds beyond the tenant's charge: the
-/// aggregate envelopes, which are charged on the process budget alone.
+/// aggregate envelopes, which are charged on the process budget alone. It
+/// also records the reservation of each `TopKeys[` consumer and its peak.
 #[derive(Debug)]
 struct EnvelopeProbe {
     inner: Arc<dyn MemoryPool>,
     tenant: Arc<TenantMemoryAccountant>,
     peak: AtomicI64,
+    /// `(reserved, peak)` per `TopKeys[` consumer name.
+    top_keys: Mutex<BTreeMap<String, (usize, usize)>>,
 }
 
 impl EnvelopeProbe {
     fn sample(&self) {
         let envelope = self.tenant.process_reserved() as i64 - self.tenant.reserved() as i64;
         self.peak.fetch_max(envelope, Ordering::Relaxed);
+    }
+
+    /// Record `reservation` growing by `grown` bytes and shrinking by
+    /// `shrunk`, when its consumer is a `TopKeys[` one.
+    fn track(&self, reservation: &MemoryReservation, grown: usize, shrunk: usize) {
+        let name = reservation.consumer().name();
+        if !name.starts_with(TOP_KEYS_CONSUMER_PREFIX) {
+            return;
+        }
+        let mut consumers = self.top_keys.lock().expect("probe lock");
+        let (reserved, peak) = consumers.entry(name.to_string()).or_default();
+        *reserved = (*reserved + grown).saturating_sub(shrunk);
+        *peak = (*peak).max(*reserved);
+    }
+
+    /// The largest peak any one `TopKeys[` consumer reached, and how many
+    /// such consumers registered a reservation.
+    fn top_keys_peak(&self) -> (usize, usize) {
+        let consumers = self.top_keys.lock().expect("probe lock");
+        let peak = consumers.values().map(|(_, peak)| *peak).max().unwrap_or(0);
+        (peak, consumers.len())
     }
 }
 
@@ -244,16 +269,21 @@ impl MemoryPool for EnvelopeProbe {
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         self.inner.grow(reservation, additional);
+        self.track(reservation, additional, 0);
         self.sample();
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.inner.shrink(reservation, shrink);
+        self.track(reservation, 0, shrink);
         self.sample();
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
         let result = self.inner.try_grow(reservation, additional);
+        if result.is_ok() {
+            self.track(reservation, additional, 0);
+        }
         self.sample();
         result
     }
@@ -271,22 +301,43 @@ impl MemoryPool for EnvelopeProbe {
 struct Probed {
     /// The `n` of each `TopKeysAggregateExec` in the plan.
     bounds: Vec<usize>,
+    /// The mode of the aggregate each `TopKeysAggregateExec` replaced.
+    modes: Vec<AggregateMode>,
     plan: String,
     result: DFResult<Vec<RecordBatch>>,
-    /// The summed `evictions` and `rebuilds` metrics of the plan's
-    /// `TopKeysAggregateExec` nodes, after the run.
+    /// The summed `evictions`, `rebuilds`, `dropped_rows` and
+    /// `interned_at_threshold` metrics of the plan's `TopKeysAggregateExec`
+    /// nodes, after the run.
     evictions: usize,
     rebuilds: usize,
+    dropped: usize,
+    interned_at_threshold: usize,
     /// The query pool's charged peak, `peak_intermediate_bytes`.
     charged: u64,
     /// The largest aggregate envelope the process budget held.
     envelope: i64,
+    /// The largest reservation one `TopKeys[` consumer held, and how many
+    /// such consumers reserved anything.
+    top_keys_peak: usize,
+    top_keys_consumers: usize,
 }
 
 impl Probed {
     fn rows(&self) -> Vec<Vec<String>> {
         cells(self.result.as_ref().expect("query runs"))
     }
+}
+
+/// The mode of the aggregate inside every `TopKeysAggregateExec` in `plan`.
+fn top_keys_modes(plan: &Arc<dyn ExecutionPlan>) -> Vec<AggregateMode> {
+    let mut out = Vec::new();
+    if let Some(node) = plan.downcast_ref::<TopKeysAggregateExec>() {
+        out.push(*node.aggregate().mode());
+    }
+    for child in plan.children() {
+        out.extend(top_keys_modes(child));
+    }
+    out
 }
 
 /// Run `sql` over `parts` on the production session with `options` set, its
@@ -306,6 +357,7 @@ async fn probed(
         inner: Arc::clone(&inner),
         tenant,
         peak: AtomicI64::new(0),
+        top_keys: Mutex::new(BTreeMap::new()),
     });
     let ctx = session(
         config,
@@ -323,14 +375,20 @@ async fn probed(
     let bounds = top_keys_bounds(&plan);
     let text = render(&plan);
     let result = collect(Arc::clone(&plan), ctx.task_ctx()).await;
+    let (top_keys_peak, top_keys_consumers) = probe.top_keys_peak();
     Probed {
         bounds,
+        modes: top_keys_modes(&plan),
         plan: text,
         result,
         evictions: top_keys_metric(&plan, "evictions"),
         rebuilds: top_keys_metric(&plan, "rebuilds"),
+        dropped: top_keys_metric(&plan, "dropped_rows"),
+        interned_at_threshold: top_keys_metric(&plan, "interned_at_threshold"),
         charged: accounting.snapshot().peak_intermediate_bytes,
         envelope: probe.peak.load(Ordering::Relaxed),
+        top_keys_peak,
+        top_keys_consumers,
     }
 }
 
@@ -340,9 +398,18 @@ async fn on_and_off(
     options: &[(&str, &str)],
     sql: &str,
 ) -> (Probed, Probed) {
-    let config = SqlConfig::default();
-    let on = probed(&config, parts(), options, sql).await;
-    let off = probed(&rule_off(&config), parts(), options, sql).await;
+    on_and_off_with(&SqlConfig::default(), parts, options, sql).await
+}
+
+/// `sql` under `config`, and under `config` with the rule off.
+async fn on_and_off_with(
+    config: &SqlConfig,
+    parts: impl Fn() -> Vec<Vec<RecordBatch>>,
+    options: &[(&str, &str)],
+    sql: &str,
+) -> (Probed, Probed) {
+    let on = probed(config, parts(), options, sql).await;
+    let off = probed(&rule_off(config), parts(), options, sql).await;
     assert!(off.bounds.is_empty(), "rule off: {sql}\n{}", off.plan);
     (on, off)
 }
