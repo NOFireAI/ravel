@@ -1,0 +1,188 @@
+name: ci-budget-nightly
+
+# CI job runtime budget guard (ADR-4034 D3, issue #4037). ci.yml has no
+# `schedule:` trigger at all (its single `on:` block is shared by all of its
+# jobs, so adding one there would fire every job nightly just to get one
+# budget read), so this is its own workflow, on the supply-chain-nightly.yml
+# pattern.
+#
+# Three jobs beyond `cases`:
+#   raise-check   pull_request only, git-only (no gh api call): refuses a
+#                 `timeout-minutes` increase in this PR's ci.yml that carries
+#                 no `# budget: p90 <N> min on <YYYY-MM-DD>` comment. Wiring
+#                 this into the required `doc-scripts` job in ci.yml itself is
+#                 the epic's T7, in the next wave; this job is this task's own
+#                 CI coverage for the same script surface in the meantime.
+#   budgets       schedule and workflow_dispatch only: the live p50/p90/growth
+#                 read against the real run history, uploaded as an artifact
+#                 so `report` can quote it without re-running the gh queries.
+#   report        on a red `budgets` run, files or updates one tracking issue
+#                 (supply-chain-nightly.yml's report-job pattern: a separate
+#                 job, the only one with `issues: write`, deduped by a
+#                 deterministic marker in the issue title).
+#
+# Top-level permissions floor is `contents: read`; `budgets` adds
+# `actions: read` for the run and job queries, and `issues: write` lives only
+# on `report`, which runs no third-party code and no checkout.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly, 06:11 UTC. Off-peak, off the :00/:30 marks, and distinct from
+    # every other scheduled lane (supply-chain-nightly 05:43, sim-nightly
+    # 03:17, k8s-nightly 03:00, tla-nightly 04:37, bench-s3 weekly 04:17,
+    # quickstart-published weekly 06:29).
+    - cron: "11 6 * * *"
+  pull_request:
+    paths:
+      - ".github/workflows/ci.yml"
+      - "scripts/guards/check-ci-job-budgets.sh"
+      - "scripts/guards/check-ci-job-budgets.test.sh"
+
+permissions:
+  contents: read
+
+env:
+  ISSUE_LABEL: ci-budget
+
+jobs:
+  cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: CI job runtime budget guard cases (issue #4037)
+        run: bash scripts/guards/check-ci-job-budgets.test.sh
+
+  # git-only: no gh api call, so no GH_TOKEN is needed here at all. Needs
+  # full history to read ci.yml at the PR's base commit via `git show`.
+  raise-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: CI job runtime budget guard --raise-check (issue #4037)
+        run: scripts/guards/check-ci-job-budgets.sh --raise-check "${{ github.event.pull_request.base.sha }}"
+
+  budgets:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # actions: read for the guard's workflow-run and job queries.
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      rc: ${{ steps.guard.outputs.rc }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Captured to a file and exit code read on the next line, not through a
+      # pipe: a `| tee` here would let a real failure's exit code hide behind
+      # tee's own.
+      - name: CI job runtime budget guard
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          scripts/guards/check-ci-job-budgets.sh > ci-budgets-output.txt 2>&1
+          rc=$?
+          cat ci-budgets-output.txt
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "finding=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "finding=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$rc"
+      - name: Upload budget report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-budgets-output
+          path: ci-budgets-output.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+  # Failure routing, deliberately a separate job: this is the only place that
+  # needs `issues: write`, and it is the only job that runs no third-party
+  # code. `needs: budgets` alone would skip this job on failure (a dependent
+  # of a failed job is skipped by default); the condition names the job's
+  # `result` explicitly so a `budgets` run killed by its own timeout-minutes
+  # (which reports `failure` but runs no further step of its own) still routes
+  # here.
+  report:
+    needs: budgets
+    if: ${{ always() && needs.budgets.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    # Serialize this job only, across runs, so the read-then-create below
+    # cannot race two failing runs into two issues (supply-chain-nightly.yml's
+    # same reasoning).
+    concurrency:
+      group: ci-budget-nightly-report
+      cancel-in-progress: false
+    steps:
+      - name: Download the budget report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ci-budgets-output
+          path: .
+      - name: File or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MARKER: "Nightly CI job runtime budget guard is red"
+          GUARD_RC: ${{ needs.budgets.outputs.rc }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          case "$GUARD_RC" in
+            1) summary="The nightly \`ci-budget-nightly\` lane found a job runtime budget finding." ;;
+            2) summary="The nightly \`ci-budget-nightly\` lane could not ask: a GitHub API query failed or returned no usable job rows. This is not a finding, and it is not a clean run either." ;;
+            "") summary="The nightly \`ci-budget-nightly\` guard step did not finish (no exit code recorded); nothing was asked." ;;
+            *) summary="The nightly \`ci-budget-nightly\` guard could not run (exit $GUARD_RC); nothing was asked." ;;
+          esac
+          output="$(cat ci-budgets-output.txt 2>/dev/null || echo '(no report uploaded)')"
+          gh label create "$ISSUE_LABEL" \
+            --color BFD4F2 \
+            --description "Nightly CI job runtime budget guard findings (issue #4037)" \
+            2>/dev/null || true
+          existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty') || existing=""
+          body_file="$(mktemp)"
+          {
+            echo "$summary"
+            echo
+            echo "- Run: $run_url"
+            echo
+            echo '```'
+            echo "$output"
+            echo '```'
+            echo
+            echo "A cap finding means a job's p90 runtime over the last run window exceeds"
+            echo "0.7 of its \`timeout-minutes\` cap; a growth finding means a job's p90 is"
+            echo "25 percent or more above its own p90 from the window that ended more than"
+            echo "14 days earlier, whatever the cap. See \`scripts/guards/check-ci-job-budgets.sh\`"
+            echo "for both rules."
+          } >"$body_file"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$body_file"
+            echo "commented on existing issue #$existing"
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body-file "$body_file"
+          fi
