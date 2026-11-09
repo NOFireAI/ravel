@@ -23,10 +23,18 @@
 #                                     # and doctests for the named (edited)
 #                                     # crates only; one `cargo check` of the
 #                                     # rest of the closure with every lane
-#                                     # feature it reaches; and the clippy
-#                                     # and tests of each lane that covers an
-#                                     # edited crate. Dependents' tests and
-#                                     # their lane suites are left to CI.
+#                                     # feature it reaches; the clippy of
+#                                     # each lane that covers an edited
+#                                     # crate, restricted to the edited
+#                                     # crates it names; and one test run of
+#                                     # the edited crates with all of those
+#                                     # lanes' features unified, dropping
+#                                     # each lane's own --test selection. A
+#                                     # test that fails only with one lane
+#                                     # feature on alone is not run here;
+#                                     # CI's own lane jobs run it. Dependents'
+#                                     # tests and their lane suites are also
+#                                     # left to CI.
 #                                     # Needs at least one -p. `--tier merge`
 #                                     # is the default and is the full gate
 #                                     # described above.
@@ -506,7 +514,14 @@ run_feature_lanes() {
 # -p; the rest of the closure is compiled, not tested, and CI runs its tests
 # and lane suites. The lanes come from run_feature_lanes itself, run dry with
 # every lane selected, so a lane added there reaches this tier without a
-# second list:
+# second list. Its output is captured into a variable first and its exit
+# status checked explicitly (the same pattern the closure computation above
+# uses for affected-tests.sh), not read by a `while` loop fed through process
+# substitution: that loses the subshell's exit status, so a lane listing that
+# fails partway would silently drop every lane clippy and test line after the
+# failure instead of refusing.
+#
+# Parsing rules for each listed line:
 #   - a clippy or check line naming an edited crate runs restricted to the
 #     edited crates it names;
 #   - a test line with features contributes those features, per edited
@@ -552,6 +567,32 @@ run_executor_gates() {
   local check_features="" lane_test_crates="" lane_test_features=""
   local lint_cmds=() env_test_cmds=()
   local line words envp kind cmd pkgs feats other restricted p f n seen w
+
+  # Capture run_feature_lanes' dry-run listing into a variable and check its
+  # exit status before parsing it: a `while read` fed by `< <(...)` discards
+  # the subshell's exit status, so a listing that fails partway would pass
+  # silently and drop every lane clippy and test line after the failure.
+  # RAVEL_GATES_TEST_FORCE_LANE_LISTING_FAILURE=1 is a test-only seam: nothing
+  # in the listing runs a real command under --dry-run, so this is how the
+  # refusal path below is exercised at all.
+  local lanes_output
+  local lanes_rc=0
+  lanes_output="$(
+    if [[ "${RAVEL_GATES_TEST_FORCE_LANE_LISTING_FAILURE:-0}" == "1" ]]; then
+      echo "gates.sh: RAVEL_GATES_TEST_FORCE_LANE_LISTING_FAILURE=1 (test-only forced failure)" >&2
+      exit 3
+    fi
+    dry_run=1
+    want_sql=1 want_agents=1 want_agents_small_pages=1 want_mcp=1
+    want_flight_sql=1 want_esql=1 want_bench=1 want_stage_timing=1
+    want_cli_sql_explain=1 want_ingest_shipping=1
+    run_feature_lanes
+  )" || lanes_rc=$?
+  if [[ ${lanes_rc} -ne 0 ]]; then
+    echo "gates.sh: could not list the executor tier's lanes (run_feature_lanes exited ${lanes_rc} under --dry-run); refusing rather than silently dropping lane clippy and tests" >&2
+    exit 70
+  fi
+
   while IFS= read -r line; do
     read -r -a words <<<"${line#==> }"
     envp=""
@@ -603,13 +644,7 @@ run_executor_gates() {
     elif [[ -z "${feats}" && -n "${envp}" ]]; then
       env_test_cmds+=("${envp} $(executor_test_cmd "${restricted}")")
     fi
-  done < <(
-    dry_run=1
-    want_sql=1 want_agents=1 want_agents_small_pages=1 want_mcp=1
-    want_flight_sql=1 want_esql=1 want_bench=1 want_stage_timing=1
-    want_cli_sql_explain=1 want_ingest_shipping=1
-    run_feature_lanes
-  )
+  done <<<"${lanes_output}"
 
   echo "==> closure of ${crate_args[*]}: ${gate_crates[*]}"
   echo "==> executor tier: tests for ${edited}; compile only for ${rest:-nothing else}"

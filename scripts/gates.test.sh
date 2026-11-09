@@ -424,8 +424,10 @@ check_eq "tier executor -p ravel-ingest: stage-timing lane clippy restricted" "1
 check_eq "tier executor -p ravel-ingest: no ravel-logseg anywhere" "0" "$(cargo_lines "${out}" | grep -c 'ravel-logseg')"
 
 # tier_merge_is_default_unchanged: no --tier and --tier merge print the same
-# output, and the merge list for -p ravel-query is pinned in full, so a
-# changed merge command fails here and not only in the per-lane cases above.
+# output, and merge's own command list is unchanged apart from the dry-run
+# header line (which now names the tier); the merge list for -p ravel-query
+# is pinned in full, so a changed merge command fails here and not only in
+# the per-lane cases above.
 cat >"${tmp}/query_merge.want" <<'EOF'
 ==> closure of -p ravel-query: ravel-query ravel-sql ravel-server ravel-bench ravel-cli
 ==> cargo clippy --locked -p ravel-query -p ravel-sql -p ravel-server -p ravel-bench -p ravel-cli --all-targets -- -D warnings
@@ -480,6 +482,23 @@ check_eq "tier executor unscoped: one line of output" "1" "$(wc -l <"${tmp}/exec
 check_eq "tier executor unscoped: says why" "1" \
   "$(count_matching "${tmp}/exec_unscoped.out" '^gates.sh: --tier executor needs at least one -p CRATE')"
 check_eq "tier executor unscoped: builds nothing" "0" "$(wc -l <"${tmp}/exec_unscoped.calls" | tr -d ' ')"
+
+# tier_executor_lane_listing_failure_refused: run_executor_gates reads the
+# lane list from run_feature_lanes' own --dry-run output by capturing it into
+# a variable first and checking its exit status explicitly. This rules out
+# the prior implementation, a `while read` loop fed by process substitution
+# (`done < <(...)`), which discards that subshell's exit status: under it, a
+# lane listing that failed partway would print nothing, exit 0, and silently
+# drop every lane clippy and test line after the failure instead of refusing.
+# Nothing in the listing runs a real command under --dry-run, so
+# RAVEL_GATES_TEST_FORCE_LANE_LISTING_FAILURE=1 is the only way to exercise
+# this path: it makes the listing subshell exit 3 before producing any output.
+RAVEL_GATES_TEST_FORCE_LANE_LISTING_FAILURE=1 run_stubbed exec_lane_listing_fail \
+  bash "${SCRIPTS}/gates.sh" --tier executor -p ravel-query --dry-run
+check_eq "tier executor lane listing failure: exit 70" "70" "${rc}"
+check_eq "tier executor lane listing failure: refuses with a reason" "1" \
+  "$(count_matching "${tmp}/exec_lane_listing_fail.out" '^gates.sh: could not list the executor tier')"
+check_eq "tier executor lane listing failure: builds nothing" "0" "$(builds "${tmp}/exec_lane_listing_fail.calls")"
 
 # tier_executor_command_count_bar: ADR-4034 D1's bar, at most 40 percent of the
 # merge tier's cargo commands, for the three closures it names.
