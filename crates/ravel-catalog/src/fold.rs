@@ -320,7 +320,8 @@ pub struct FoldReport {
     /// hour was supplied or the margin already sealed it.
     pub seal_through_hour: Option<u32>,
     /// Ranged GETs the key-index leaf build issued (ADR-2707 decision 4), for
-    /// the entries of the parts this fold re-encoded: a footer suffix GET of
+    /// the entries of the parts this fold re-encoded and of the carried parts
+    /// it attached leaves to (ADR-3939): a footer suffix GET of
     /// at most [`KEY_INDEX_FOOTER_SUFFIX_LEN`] bytes, one more footer GET
     /// only when the footer is longer than that, and a GET of the KEY_IDX
     /// section when the footer names one. The total this fold issued: a
@@ -341,12 +342,15 @@ pub struct FoldReport {
     /// nothing). The total this fold read, like `key_index_ranged_gets`.
     pub key_index_bytes_read: u64,
     /// `.kidx` leaves the published HEAD names for the parts the publishing
-    /// attempt re-encoded, one per (part, field, key slice): the published
+    /// attempt re-encoded or attached leaves to, one per (part, field, key
+    /// slice): the published
     /// leaf set. Each was PUT by this fold (an `AlreadyExists` included: the
     /// content-addressed object is there either way), by the publishing
     /// attempt or by an attempt lost to a HEAD CAS that built the same part.
-    /// A part carried forward by reference keeps its `key_index` refs and
-    /// adds none. A leaf a build PUT and then abandoned, because a later pass
+    /// A part carried forward by reference keeps its `key_index` refs; with
+    /// the switch on and no metrics erasure pending, the fold builds and
+    /// attaches leaves for each declared field it has none for, counted here,
+    /// and re-encodes nothing. A leaf a build PUT and then abandoned, because a later pass
     /// found a new uncovered entry (see `key_index_build_passes`), is not
     /// named by HEAD and is not counted; `put_requests` counts its PUT and
     /// the catalog sweep removes it. Zero on a no-op fold.
@@ -354,7 +358,8 @@ pub struct FoldReport {
     /// Total bytes of those leaves.
     pub key_index_leaf_bytes_written: u64,
     /// For each part the publishing attempt re-encoded and each field of its
-    /// key-index set, the part entries no leaf covers, summed: the entries
+    /// key-index set, and for each carried part it attached leaves to and
+    /// each field it lacked, the part entries no leaf covers, summed: the entries
     /// whose `uncovered_entry_ordinals` lists them, plus every entry of a
     /// field that wrote no leaf.
     pub key_index_uncovered_entries: u64,
@@ -391,12 +396,12 @@ pub struct FoldReport {
     pub key_index_pair_budget: u64,
     /// For each field the leaf build indexed, its key pairs, one per
     /// distinct (key8, entry), summed over the parts the publishing attempt
-    /// re-encoded. A declared field with no pairs is present with 0, and so
+    /// re-encoded or attached leaves to. A declared field with no pairs is present with 0, and so
     /// is a field a section named during the build. For a field rebuilt
     /// after a later pass found a new uncovered entry, the pairs of the
     /// rebuild only. Keyed by field name alone: one fold covers one signal.
     /// Empty when `key_index_pair_budget` is zero and on a fold that
-    /// re-encoded no part.
+    /// re-encoded no part and attached no leaf.
     pub key_index_field_pairs: BTreeMap<String, u64>,
     /// `true` when the leaf switch
     /// ([`CatalogConfig::build_key_index_leaves`](crate::CatalogConfig::build_key_index_leaves))
@@ -412,8 +417,8 @@ pub struct FoldReport {
     /// (field, slice), issued when a re-encoded part shares a data object
     /// with that tail. Also counted in `get_requests`.
     pub key_index_leaf_gets: u64,
-    /// Re-encoded metrics parts the publishing attempt left with no
-    /// `label_value` leaf because its leaves would have totalled more than
+    /// Re-encoded metrics parts, and carried ones it tried to attach a leaf
+    /// to, the publishing attempt left with no `label_value` leaf because its leaves would have totalled more than
     /// [`CatalogConfig::metrics_label_index_max_ratio_ppm`](crate::CatalogConfig::metrics_label_index_max_ratio_ppm)
     /// of the part's entries' object bytes.
     pub metrics_label_index_parts_over_cap: u64,
