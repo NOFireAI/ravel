@@ -685,6 +685,12 @@ jobs:
             echo "::error::scripts/check-tla.sh expects the jar at $expected (TLA_VERSION=$expected_version); this workflow's fetch-pinned-tool version/dest has drifted from the script's pin"
             exit 1
           fi
+          expected_sha="$(sed -nE 's/^TLA_JAR_SHA256="([^"]+)"$/\1/p' scripts/check-tla.sh | head -1)"
+          got_sha="$(sha256sum "$expected" | awk '{print $1}')"
+          if [ -z "$expected_sha" ] || [ "$got_sha" != "$expected_sha" ]; then
+            echo "::error::$expected has sha256 $got_sha but scripts/check-tla.sh pins TLA_JAR_SHA256=${expected_sha:-unreadable}; this workflow's sha256 has drifted from the script's pin"
+            exit 1
+          fi
       - name: Fast lane (smoke, negatives, traceability)
         env:
           RAVEL_TLA_WORKERS: auto
@@ -862,27 +868,29 @@ jobs:
       ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
       SHELLCHECK_VERSION: v0.10.0
       SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
-      LINT_BIN_DIR: ${{ runner.temp }}/lint-bin
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      # Both archives come through the pinned-tool cache (D3, ADR-4034): the
+      # sha256 pins above stay the trust anchor, checked on a hit and a miss,
+      # and the cache only saves the download (GitHub release downloads have
+      # returned 504 here).
+      - name: Fetch pinned shellcheck
+        uses: ./.github/actions/fetch-pinned-tool
+        with:
+          name: shellcheck
+          version: ${{ env.SHELLCHECK_VERSION }}
+          url: https://github.com/koalaman/shellcheck/releases/download/${{ env.SHELLCHECK_VERSION }}/shellcheck-${{ env.SHELLCHECK_VERSION }}.linux.x86_64.tar.xz
+          sha256: ${{ env.SHELLCHECK_SHA256 }}
+          dest: shellcheck.tar.xz
       - name: Install pinned shellcheck
         run: |
-          mkdir -p "$LINT_BIN_DIR"
-
-          # Verify the shellcheck archive's sha256 before extracting, then
-          # place the binary on PATH for the assert and lint steps below.
-          curl -fsSL -o shellcheck.tar.xz \
-            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
-          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
+          bin_dir="$RUNNER_TEMP/lint-bin"
+          mkdir -p "$bin_dir"
           tar -xJf shellcheck.tar.xz
-          mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$LINT_BIN_DIR/shellcheck"
-
-          echo "$LINT_BIN_DIR" >> "$GITHUB_PATH"
-      # actionlint's tarball through the pinned-tool cache (D3, ADR-4034): the
-      # sha256 pin above stays the trust anchor, the cache only saves the
-      # download itself (GitHub release downloads have returned 504 here).
+          mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$bin_dir/shellcheck"
+          echo "$bin_dir" >> "$GITHUB_PATH"
       - name: Fetch pinned actionlint
         uses: ./.github/actions/fetch-pinned-tool
         with:
@@ -893,9 +901,10 @@ jobs:
           dest: actionlint.tar.gz
       - name: Extract actionlint
         run: |
-          mkdir -p "$LINT_BIN_DIR"
+          bin_dir="$RUNNER_TEMP/lint-bin"
+          mkdir -p "$bin_dir"
           tar -xzf actionlint.tar.gz actionlint
-          mv actionlint "$LINT_BIN_DIR/actionlint"
+          mv actionlint "$bin_dir/actionlint"
       - name: Assert shellcheck is available
         run: |
           # actionlint exits 0 when shellcheck is missing, silently linting

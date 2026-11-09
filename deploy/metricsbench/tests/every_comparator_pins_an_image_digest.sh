@@ -189,8 +189,9 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # job (a checkout, a rust-cache and an upload-artifact), epic #3331 task T22.
 # Raised 118->122 when k8s-nightly.yml gained the agents-chaos job (a
 # checkout, an sccache-action, a rust-cache and an upload-artifact), epic
-# #3331 task T29.
-WORKFLOW_EXPECTED_ACTION_COUNT=122
+# #3331 task T29. Raised 122->124 when the fetch-pinned-tool composite action
+# was added (an actions/cache restore and save), epic #4034 task T6.
+WORKFLOW_EXPECTED_ACTION_COUNT=124
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,

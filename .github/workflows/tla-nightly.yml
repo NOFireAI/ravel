@@ -96,6 +96,12 @@ jobs:
             echo "::error::scripts/check-tla.sh expects the jar at $expected (TLA_VERSION=$expected_version); this workflow's fetch-pinned-tool version/dest has drifted from the script's pin"
             exit 1
           fi
+          expected_sha="$(sed -nE 's/^TLA_JAR_SHA256="([^"]+)"$/\1/p' scripts/check-tla.sh | head -1)"
+          got_sha="$(sha256sum "$expected" | awk '{print $1}')"
+          if [ -z "$expected_sha" ] || [ "$got_sha" != "$expected_sha" ]; then
+            echo "::error::$expected has sha256 $got_sha but scripts/check-tla.sh pins TLA_JAR_SHA256=${expected_sha:-unreadable}; this workflow's sha256 has drifted from the script's pin"
+            exit 1
+          fi
       - name: Exhaustive model check
         # State CI's resource choice rather than inheriting the script's
         # laptop-safe default of 2 workers: `auto` is the previous behaviour
