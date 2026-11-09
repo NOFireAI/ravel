@@ -44,9 +44,9 @@ use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
     BucketedFinalAggregateExec, BucketedFinalAggregation, DeclaredColumn, DeclaredType,
     FirstGroupsExec, LogsTableProvider, SessionPrincipal, SessionTable, SpanSegmentFetcher,
-    SpillDecision, SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns, TOP_KEYS_CONSUMER_PREFIX,
-    TenantDelegatingPool, TenantMemoryAccountant, TopKeysAggregateExec, build_session,
-    plan_aggregate_profile,
+    SpillDecision, SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns,
+    TOP_KEYS_CONSUMER_PREFIX, TenantDelegatingPool, TenantMemoryAccountant, TopKeysAggregateExec,
+    build_session, plan_aggregate_profile,
 };
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::AttrValue;
@@ -703,7 +703,11 @@ async fn integer_avg_is_admitted_and_exact_through_rebuilds() {
             let [g, k, count, sum, max] = tied_group(k as i64);
             assert_eq!(row[0], g.to_string());
             assert_eq!(row[1], k.to_string());
-            assert_eq!(row[2], format!("{:?}", sum as f64 / count as f64), "avg of {k}");
+            assert_eq!(
+                row[2],
+                format!("{:?}", sum as f64 / count as f64),
+                "avg of {k}"
+            );
             assert_eq!(row[3], count.to_string());
             assert_eq!(row[4], count.to_string());
             assert_eq!(row[5], sum.to_string());
@@ -735,7 +739,12 @@ async fn the_single_modes_are_admitted_and_exact() {
     let sql = "SELECT k, count(*), sum(s) FROM (SELECT k, sum(v) AS s FROM t GROUP BY k) \
                GROUP BY k ORDER BY k LIMIT 100";
     let (on, off) = on_and_off(tied_parts, &batch, sql).await;
-    assert_eq!(on.modes, vec![AggregateMode::SinglePartitioned], "{}", on.plan);
+    assert_eq!(
+        on.modes,
+        vec![AggregateMode::SinglePartitioned],
+        "{}",
+        on.plan
+    );
     assert!(on.rebuilds > 0, "SinglePartitioned: no rebuild ran");
     let want: Vec<Vec<String>> = (0..100)
         .map(|k| vec![k.to_string(), "1".to_string(), tied_group(k)[3].to_string()])
@@ -830,7 +839,12 @@ async fn a_key_evicted_at_the_threshold_and_seen_again_is_cut() {
     assert_eq!(rows.len(), 40, "{sql}");
     let mut seen = BTreeSet::new();
     for row in &rows {
-        assert_eq!(Some(row), complete.get(&row[1]), "group {} is partial", row[1]);
+        assert_eq!(
+            Some(row),
+            complete.get(&row[1]),
+            "group {} is partial",
+            row[1]
+        );
         assert!(seen.insert(row[1].clone()), "key {} returned twice", row[1]);
     }
     assert_eq!(sort_values(&rows), sort_values(&off.rows()), "{sql}");
