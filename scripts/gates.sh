@@ -17,6 +17,19 @@
 #                                     # anything (scoped mode still reads
 #                                     # `cargo metadata --no-deps` for the
 #                                     # closure)
+#   scripts/gates.sh --tier executor -p CRATE ... [--dry-run]
+#                                     # the executor tier (ADR-4034 D1): fmt
+#                                     # and the source guards; clippy, tests
+#                                     # and doctests for the named (edited)
+#                                     # crates only; one `cargo check` of the
+#                                     # rest of the closure with every lane
+#                                     # feature it reaches; and the clippy
+#                                     # and tests of each lane that covers an
+#                                     # edited crate. Dependents' tests and
+#                                     # their lane suites are left to CI.
+#                                     # Needs at least one -p. `--tier merge`
+#                                     # is the default and is the full gate
+#                                     # described above.
 #
 # In a dispatched fleet clone (a checkout under the fleet work root:
 # /fleet/work/ or /var/lib/fleet) an unscoped run is refused with exit 64
@@ -45,8 +58,24 @@ crate_args=()
 dry_run=0
 flag_doc_guard_only=0
 flag_doc_guard_file=""
+tier=merge
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --tier)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "gates.sh: --tier requires executor or merge" >&2
+        exit 64
+      fi
+      case "$1" in
+        executor | merge) tier="$1" ;;
+        *)
+          echo "gates.sh: unknown tier: $1 (want executor or merge)" >&2
+          exit 64
+          ;;
+      esac
+      shift
+      ;;
     -p)
       shift
       if [[ $# -eq 0 ]]; then
@@ -74,6 +103,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "${tier}" == "executor" && ${#crate_args[@]} -eq 0 ]]; then
+  echo "gates.sh: --tier executor needs at least one -p CRATE: it tests the edited crates and only compiles their dependents" >&2
+  exit 64
+fi
 
 # Unscoped in a fleet clone: see the header. Judged on the script's own
 # checkout, not the caller's cwd, since the gate runs on the tree it lives in.
@@ -468,6 +502,150 @@ run_feature_lanes() {
   fi
 }
 
+# The executor tier (ADR-4034 D1). The edited crates are the ones named with
+# -p; the rest of the closure is compiled, not tested, and CI runs its tests
+# and lane suites. The lanes come from run_feature_lanes itself, run dry with
+# every lane selected, so a lane added there reaches this tier without a
+# second list:
+#   - a clippy or check line naming an edited crate runs restricted to the
+#     edited crates it names;
+#   - a test line with features contributes those features, per edited
+#     crate, to ONE test run of the edited crates with all of them unified;
+#   - a test line with an environment prefix runs restricted, on ci;
+#   - a test line with neither is a test of a crate's default build, which
+#     the edited crates' own test run already covers;
+#   - every feature a lane line gives a non-edited crate goes on the one
+#     `cargo check` of the rest of the closure.
+# Commands are kept as space-joined words: no lane argument contains a space.
+executor_test_cmd() {
+  if [[ ${have_nextest} -eq 1 ]]; then
+    echo "cargo nextest run --locked $* --cargo-profile ci"
+  else
+    echo "cargo test --locked --profile ci $*"
+  fi
+}
+
+# add_word <list> <word>: <list> with <word> appended unless already present.
+add_word() {
+  if [[ " $1 " == *" $2 "* ]]; then
+    echo "$1"
+  else
+    echo "${1:+$1 }$2"
+  fi
+}
+
+run_executor_gates() {
+  local edited="" rest="" edited_sel="" rest_sel="" c
+  local i
+  for ((i = 1; i < ${#crate_args[@]}; i += 2)); do
+    edited="$(add_word "${edited}" "${crate_args[i]}")"
+  done
+  for c in "${gate_crates[@]}"; do
+    if [[ " ${edited} " != *" ${c} "* ]]; then
+      rest="$(add_word "${rest}" "${c}")"
+    fi
+  done
+  for c in ${edited}; do edited_sel="${edited_sel:+${edited_sel} }-p ${c}"; done
+  for c in ${rest}; do rest_sel="${rest_sel:+${rest_sel} }-p ${c}"; done
+
+  local edited_clippy="cargo clippy --locked ${edited_sel} --all-targets -- -D warnings"
+  local check_features="" lane_test_crates="" lane_test_features=""
+  local lint_cmds=() env_test_cmds=()
+  local line words envp kind cmd pkgs feats other restricted p f n seen w
+  while IFS= read -r line; do
+    read -r -a words <<<"${line#==> }"
+    envp=""
+    if [[ "${words[0]:-}" == "env" ]]; then
+      envp="${words[0]} ${words[1]}"
+      words=("${words[@]:2}")
+    fi
+    [[ "${words[0]:-}" == "cargo" ]] || continue
+    case "${words[1]:-}" in
+      clippy | check) kind=lint cmd="cargo ${words[1]}" i=2 ;;
+      nextest) kind=test cmd="" i=3 ;;
+      test) kind=test cmd="" i=2 ;;
+      *) continue ;;
+    esac
+    pkgs="" feats="" other=""
+    n=${#words[@]}
+    while [[ ${i} -lt ${n} ]]; do
+      case "${words[i]}" in
+        --locked) i=$((i + 1)) ;;
+        -p) pkgs="${pkgs:+${pkgs} }${words[i + 1]}" i=$((i + 2)) ;;
+        --features) feats="${words[i + 1]}" i=$((i + 2)) ;;
+        *) other="${other:+${other} }${words[i]}" i=$((i + 1)) ;;
+      esac
+    done
+    restricted=""
+    for p in ${pkgs}; do
+      if [[ " ${edited} " == *" ${p} "* ]]; then
+        restricted="${restricted:+${restricted} }-p ${p}"
+        if [[ -n "${feats}" && "${kind}" == "test" ]]; then
+          lane_test_crates="$(add_word "${lane_test_crates}" "-p ${p}")"
+          for f in ${feats//,/ }; do
+            lane_test_features="$(add_word "${lane_test_features}" "${p}/${f}")"
+          done
+        fi
+      elif [[ " ${rest} " == *" ${p} "* ]]; then
+        for f in ${feats//,/ }; do
+          check_features="$(add_word "${check_features}" "${p}/${f}")"
+        done
+      fi
+    done
+    [[ -n "${restricted}" ]] || continue
+    if [[ "${kind}" == "lint" ]]; then
+      cmd="${cmd} --locked ${restricted}${feats:+ --features ${feats}}${other:+ ${other}}"
+      seen=0
+      for w in "${edited_clippy}" ${lint_cmds[@]+"${lint_cmds[@]}"}; do
+        [[ "${w}" == "${cmd}" ]] && seen=1
+      done
+      [[ ${seen} -eq 1 ]] || lint_cmds+=("${cmd}")
+    elif [[ -z "${feats}" && -n "${envp}" ]]; then
+      env_test_cmds+=("${envp} $(executor_test_cmd "${restricted}")")
+    fi
+  done < <(
+    dry_run=1
+    want_sql=1 want_agents=1 want_agents_small_pages=1 want_mcp=1
+    want_flight_sql=1 want_esql=1 want_bench=1 want_stage_timing=1
+    want_cli_sql_explain=1 want_ingest_shipping=1
+    run_feature_lanes
+  )
+
+  echo "==> closure of ${crate_args[*]}: ${gate_crates[*]}"
+  echo "==> executor tier: tests for ${edited}; compile only for ${rest:-nothing else}"
+  local all=()
+  all+=("${edited_clippy}")
+  all+=("$(executor_test_cmd "${edited_sel}")")
+  all+=("cargo test --locked --doc --profile ci ${edited_sel}")
+  if [[ -n "${rest}" ]]; then
+    check_features="${check_features// /,}"
+    all+=("cargo check --locked ${rest_sel} --all-targets${check_features:+ --features ${check_features}}")
+  fi
+  if [[ ${#lint_cmds[@]} -gt 0 ]]; then
+    all+=("${lint_cmds[@]}")
+  fi
+  if [[ -n "${lane_test_crates}" ]]; then
+    lane_test_features="${lane_test_features// /,}"
+    all+=("$(executor_test_cmd "${lane_test_crates} --features ${lane_test_features}")")
+  fi
+  if [[ ${#env_test_cmds[@]} -gt 0 ]]; then
+    all+=("${env_test_cmds[@]}")
+  fi
+  for cmd in "${all[@]}"; do
+    read -r -a w <<<"${cmd}"
+    run "${w[@]}"
+  done
+}
+
+run_tier_gates() {
+  if [[ "${tier}" == "executor" ]]; then
+    run_executor_gates
+  else
+    run_cargo_gates
+    run_feature_lanes
+  fi
+}
+
 # The TypeScript SDK gate (scripts/gates-sdk.sh: npm ci, lint, typecheck and
 # test under sdk/typescript). Workspace mode only: scoped mode selects cargo
 # packages and the SDK is not one, so no -p argument reaches it. It refuses
@@ -489,10 +667,9 @@ run_sdk_gate() {
 }
 
 if [[ ${dry_run} -eq 1 ]]; then
-  echo "gates.sh: dry run; the cargo commands below are printed, not run, and fmt and the source guards are skipped"
+  echo "gates.sh: dry run; tier ${tier}: the cargo commands below are printed, not run, and fmt and the source guards are skipped"
   run_sdk_gate
-  run_cargo_gates
-  run_feature_lanes
+  run_tier_gates
   exit 0
 fi
 
@@ -692,8 +869,7 @@ echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"
 check_ingest_memory_flag_docs "${config_rs}"
 
 run_sdk_gate
-run_cargo_gates
-run_feature_lanes
+run_tier_gates
 
 # --- Gates-pass receipt ---------------------------------------------------
 # Record the tree this run passed. fleet-result-merge.sh honors
