@@ -153,8 +153,13 @@ function of the anchor and the seed.
   without `@sha256:` and one without its commit, with exit 64. The
   extra-hour arm waits until its hour lands above the routed watermark and
   the l1 arm until the newest ingest hour seals, each up to about an hour
-  (predicted, not measured); the erasure arm waits for its rewrite, at most
-  120 polls 15 s apart. The nightly workflow sets none of them.
+  (predicted, not measured); the erasure arm first waits until the ingest
+  hour open at its submit seals (that hour's end plus 1 h 5 min, so up to
+  about 2 h 5 min after the submit), then for its rewrite, at most 120 polls
+  15 s apart. The rewrite runs in a one-off `ravel-server --mode maintain`
+  container; no ravel-server flag turns compaction off, so each of its ticks
+  also runs retention, compaction and the GC and catalog sweeps over the
+  tenant. The nightly workflow sets none of them.
 
 Both bands default only for `cardinality`. Another profile's count and memory
 differ, so `launch.sh` refuses a different `MB_PROFILE` unless both bands

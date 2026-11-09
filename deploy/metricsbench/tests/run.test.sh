@@ -307,28 +307,40 @@
 #                                       on, their steps in order, seven
 #                                       recreates (the control's alone on
 #                                       the control image), the arm folds'
-#                                       flags, both extra-hour folds from
-#                                       one HEAD, the seal wait before
-#                                       compact-tenant, the erasure's
-#                                       submit, pending pass, maintain
-#                                       container and status in order; za1
-#                                       (z1's run): no arm step, each arm
+#                                       flags, the leaf-on extra-hour fold
+#                                       from the routed HEAD and the
+#                                       leaf-off one from the leafless HEAD,
+#                                       the seal wait before compact-tenant,
+#                                       the erasure's submit, pending pass,
+#                                       maintain container (its key outside
+#                                       the out dir) and status in order;
+#                                       za1 (z1's run): no arm step, each arm
 #                                       stamped skipped; zb (control), zc
 #                                       (extra hour), zd (l1), ze (erasure):
 #                                       each arm alone, with figures out of
-#                                       its bands; zf1: a control image with
-#                                       no digest 65, zf2: no source commit,
-#                                       zf3: arms without MB_STAGE1 and zf4:
-#                                       an unknown arm 64; zg: a HEAD that
-#                                       does not read back refuses the
-#                                       second extra-hour fold (70); zh: an
+#                                       its bands; zb2: a 6% excess inside
+#                                       the spread is not slower; zc2: the
+#                                       leaf bytes over every object a tail
+#                                       part covers; zf1: a control image
+#                                       with no digest 65, zf2: no source
+#                                       commit, zf3: arms without MB_STAGE1
+#                                       and zf4: an unknown arm 64; zg: a
+#                                       routed HEAD that does not read back
+#                                       refuses the leaf-on fold (70); zg2:
+#                                       a leaf-off fold switching off over
+#                                       leaves is refused (70); zh: an
 #                                       erasure never COMPLETED ends the run
-#                                       at stage1-erasure-rewrite (70).
+#                                       at stage1-erasure-rewrite (70), its
+#                                       key removed; zi: the erasure sleeps
+#                                       to its seal deadline before the
+#                                       first poll; zj: an erasure that
+#                                       rewrote no part.
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za,
-#                                       z20 and z21, out of band on z2, z2b,
-#                                       z15, z16, z17, z22, zb, zc, zd, ze
-#                                       and an edited copy of za, a
+#                                       zb2, zc2, z20 and z21, out of band
+#                                       on z2, z2b, z15, z16, z17, z22, zb,
+#                                       zc, zd, ze, zj and an edited copy of
+#                                       za, a
 #                                       missing cold count, missing,
 #                                       duplicated, not finite (a NaN figure
 #                                       out of band, a NaN bound 65), a
@@ -368,6 +380,7 @@ ANCHOR=1760000010000
 BIN="${TMP}/bin"
 mkdir -p "${BIN}"
 REAL_UNAME="$(command -v uname)"
+REAL_DATE="$(command -v date)"
 
 S3S_RELEASE="s3s-fs-0.17.0-ravel.3"
 S3S_SHA_X86_64="99592a8a64cbb773c34aee9966537eb4d1091d9a91b70699220f1f34dd4b384e"
@@ -543,30 +556,68 @@ JSON
                 ;;
             esac
             ;;
-          # maintain compact-tenant: every counter line, 2 hours compacted
-          # and 2 parts written; exit STUB_COMPACT_EXIT.
+          # maintain compact-tenant (services/ravel-cli/src/maintain.rs):
+          # the header, 2 hours compacted on shard 0 and 2 parts written;
+          # exit STUB_COMPACT_EXIT.
           *" compact-tenant "*)
             [ "${STUB_COMPACT_EXIT:-0}" -eq 0 ] || exit "${STUB_COMPACT_EXIT}"
-            printf 'compacted: 2\nalready: 0\nrewrite_present: 0\nnot_sealed: 0\nbelow_min: 0\ntombstoned: 0\nclaim_skipped: 0\nclaim_cancelled: 0\nheld_out_of_window: 0\ngeometry_unsupported: 0\nparts (wrote): 2\nwall_time_ms: 40\nfailed: 0\n'
+            echo 'store: s3'                                      # maintain.rs:1134 (store.rs:90-96)
+            echo 'tenant: metricsbench'                           # maintain.rs:1153
+            echo 'signal: Metrics'                                # maintain.rs:1154
+            echo 'shards: 4'                                      # maintain.rs:1155
+            echo 'hour_range: [0, 490002]'                        # maintain.rs:1156
+            echo 'max_flush_lifetime_ns: 0'                       # maintain.rs:1157-1161
+            # maintain.rs:438 (crates/ravel-maintain/src/config.rs:1441-1465)
+            echo 'rlog_l1_part_memory_target_bytes: 268435456 (resolved from a memory budget of 1073741824 over 1 concurrent merge; bound by the 268435456-byte floor)'
+            echo 'rlog_max_l1_part_bytes: 268435456'              # maintain.rs:439-443
+            echo 'rspan_l1_part_memory_target_bytes: 268435456'   # maintain.rs:444-448
+            echo 'max_l1_part_bytes: 268435456'                   # maintain.rs:449
+            echo 'input_read_concurrency: 32'                     # maintain.rs:1162-1166
+            echo 'dry_run: false'                                 # maintain.rs:1168
+            echo 'claims: on process_id=stub min_input_bytes=67108864 lease_ms=300000' # maintain.rs:171-176, 1169
+            echo 'shard=0 hour=490000 outcome=Compacted parts=1 publish=Published' # maintain.rs:1463-1466
+            echo 'shard=0 hour=490001 outcome=Compacted parts=1 publish=Published' # maintain.rs:1463-1466
+            printf 'compacted: 2\nalready: 0\nrewrite_present: 0\nnot_sealed: 0\nbelow_min: 0\ntombstoned: 0\nclaim_skipped: 0\nclaim_cancelled: 0\nheld_out_of_window: 0\ngeometry_unsupported: 0\n' # maintain.rs:1232-1241
+            printf 'parts (wrote): 2\nwall_time_ms: 40\n'        # maintain.rs:1242-1243
+            printf 'failed: 0\nbucket_concurrency: 4\n'           # maintain.rs:1258-1259
             : >"${STUB_STATE}.compacted"
             ;;
+          # erase submit (services/ravel-cli/src/erase.rs): with
+          # STUB_CLOCK_AT_SUBMIT, the stubbed date reads that instant from
+          # here on.
           *" erase submit "*)
             [ "${STUB_ERASE_SUBMIT_EXIT:-0}" -eq 0 ] || exit "${STUB_ERASE_SUBMIT_EXIT}"
-            echo "submitted"
+            argv_=("$@")
+            for ((i = 0; i < ${#argv_[@]}; i++)); do
+              [ "${argv_[$i]}" != --request-id ] || id="${argv_[$((i + 1))]}"
+            done
+            echo "submitted erasure request ${id}"               # erase.rs:138
+            echo "  key: t/h1/m/del/${id}.dreq"                  # erase.rs:139 (crates/ravel-commit/src/keys.rs:824-847)
+            [ -z "${STUB_CLOCK_AT_SUBMIT:-}" ] || echo "${STUB_CLOCK_AT_SUBMIT}" >"${STUB_STATE}.clock"
             ;;
-          # erase status: COMPLETED with 5 records dropped from ingest hour
-          # 490000 once the maintain container has started, PENDING before
-          # it or with STUB_ERASE_PENDING.
+          # erase status (services/ravel-cli/src/erase.rs print_state):
+          # COMPLETED once the maintain container has started, PENDING before
+          # it or with STUB_ERASE_PENDING. A completion record's bucket drops
+          # are empty (services/ravel-server/src/maintain.rs:3799-3819), so
+          # COMPLETED lists no bucket line.
           *" erase status "*)
             argv_=("$@")
             for ((i = 0; i < ${#argv_[@]}; i++)); do
               [ "${argv_[$i]}" != --request-id ] || id="${argv_[$((i + 1))]}"
             done
             if [ -z "${STUB_ERASE_PENDING:-}" ] && [ -e "${STUB_STATE}.maintain" ]; then
-              printf '%s: COMPLETED\n  deferral cause: none\n  buckets:\n    signal=metrics shard=0 ingest_hour_bucket=490000 dropped_count=5\n' "$id"
+              echo "${id}: COMPLETED"                             # erase.rs:764
+              echo '  requested_unix_ns: 1764001800000000000'     # erase.rs:765
+              echo '  completed_unix_ns: 1764007560000000000'     # erase.rs:766
+              echo '  deferral cause: none (completed cleanly)'   # erase.rs:767-770, 729
+              echo '  per-bucket dropped counts (0 bucket(s), 0 record(s) total):' # erase.rs:776-779
               : >"${STUB_STATE}.erased"
             else
-              printf '%s: PENDING\n  deferral cause: none\n' "$id"
+              echo "${id}: PENDING"                               # erase.rs:742
+              echo '  created_unix_ns: 1764001800000000000'       # erase.rs:743
+              echo '  predicate: instance=metricsbench-instance-0' # erase.rs:744-750
+              echo '  event-time window: none (whole retained history)' # erase.rs:757
+              echo '  reason: metricsbench stage1 erasure arm'    # erase.rs:759-761
             fi
             ;;
           *" --mode maintain "*)
@@ -608,10 +659,13 @@ JSON
           # STUB_SPANS_HEADER_STDOUT); STUB_SPANS_L1 makes every third
           # segment an L1 part; exit STUB_SPANS_LIST_EXIT /
           # STUB_SPANS_INSPECT_EXIT. Inspect prints a HEAD at watermark hour
-          # 490001 with three parts, each with a metric_name key-index leaf;
-          # the first STUB_INSPECT_LEAF_PARTS (default 0) of them also carry a
-          # label_value leaf, and once a --rebuild-key-index fold has run the
-          # first STUB_INSPECT_REBUILT_LEAF_PARTS (default 3).
+          # 490001 with three parts; the first STUB_INSPECT_LEAF_PARTS
+          # (default 0) of them carry a label_value leaf, and once a
+          # --rebuild-key-index fold has run the first
+          # STUB_INSPECT_REBUILT_LEAF_PARTS (default 3). After the extra hour
+          # folds, a fourth part over 490002..=490002 (490000..=490002 with
+          # STUB_TAIL_SPAN) carries a leaf with STUB_EXTRA_UNCOVERED
+          # uncovered entries.
           # STUB_INSPECT_HEAD_ABSENT prints the line the CLI prints for a
           # tenant with no snapshot HEAD; STUB_INSPECT_PARTS_LINE replaces the
           # parts count the header states.
@@ -627,36 +681,67 @@ JSON
             ;;
           *" catalog inspect "*)
             [ "${STUB_SPANS_INSPECT_EXIT:-0}" -eq 0 ] || exit "${STUB_SPANS_INSPECT_EXIT}"
-            echo 'store: s3'
+            # services/ravel-cli/src/catalog.rs render_inspect, line by line.
+            echo 'store: s3'                                      # catalog.rs:849 (store.rs:90-96)
             if [ -n "${STUB_INSPECT_HEAD_ABSENT:-}" ]; then
-              echo 'HEAD at t/h1/m/head is absent or unreadable: not found'
+              echo 'HEAD at t/h1/m/head is absent or unreadable: not found' # catalog.rs:863
             else
-              wm=490001 parts="0 1 2" sfx="" tail_uncovered="${STUB_EXTRA_UNCOVERED:-0}"
+              wm=490001 parts="0 1 2" tail_uncovered="${STUB_EXTRA_UNCOVERED:-0}" tail_lo=490002
               [ ! -e "${STUB_STATE}.extra" ] || { wm=490002 parts="0 1 2 3"; }
-              [ ! -e "${STUB_STATE}.erased" ] || [ -n "${STUB_ERASURE_STALE:-}" ] || sfx=-e
-              printf 'format_version: 1\nshard_count: 4\nwatermark_hour: %s\nparts: %s\n' "$wm" "${STUB_INSPECT_PARTS_LINE:-$(echo $parts | wc -w)}"
+              [ -z "${STUB_TAIL_SPAN:-}" ] || tail_lo=490000
+              # Once the erasure completed, part 0 (over the subject's hours)
+              # is rewritten: a new key and blake3, and a new label_value
+              # leaf unless STUB_ERASURE_STALE keeps the old one;
+              # STUB_ERASURE_UNCHANGED rewrites nothing.
+              rewritten=""
+              [ ! -e "${STUB_STATE}.erased" ] || [ -n "${STUB_ERASURE_UNCHANGED:-}" ] || rewritten=0
+              printf 'format_version: 1\n'                        # catalog.rs:870
+              printf 'tenant_hash: %064x\n' 7                     # catalog.rs:871-874
+              printf 'signal: metrics (1)\n'                      # catalog.rs:878-882, 971-992
+              printf 'shard_count: 4\n'                           # catalog.rs:883
+              printf 'watermark_hour: %s\n' "$wm"                 # catalog.rs:884
+              printf 'folder_id: 0b5e2c1a-4d6f-4e3a-9b7c-1f2e3d4c5b6a\n' # catalog.rs:885-888, 1005-1009
+              printf 'created_unix_ns: 1764000000000000000\n'     # catalog.rs:889
+              printf 'parts: %s\n' "${STUB_INSPECT_PARTS_LINE:-$(echo $parts | wc -w)}" # catalog.rs:890
               leaf_parts="${STUB_INSPECT_LEAF_PARTS:-0}"
               [ ! -e "${STUB_STATE}.rebuilt" ] || leaf_parts="${STUB_INSPECT_REBUILT_LEAF_PARTS:-3}"
               for i in $parts; do
-                refs=1 lo=490000 hi=490001 unc=0
-                [ "$i" -ge "$leaf_parts" ] || refs=2
-                [ "$i" -ne 3 ] || { refs=2 lo=490002 hi=490002 unc="$tail_uncovered"; }
-                printf '  part[%s] range=%s..=%s key=t/h1/m/catalog/part-%s blake3=b%s size=1000 entry_count=10\n' "$i" "$lo" "$hi" "$i" "$i"
-                printf '    column_stats (field 7): ABSENT\n    key_index (field 8): %s\n' "$refs"
-                printf '      field=metric_name slice=0x00..=0x7f entry_count=10 uncovered_count=0 key=t/h1/m/ki/%s-n%s\n' "$i" "$sfx"
-                [ "$refs" -eq 1 ] || printf '      field=label_value slice=0x00..=0xff entry_count=10 uncovered_count=%s key=t/h1/m/ki/%s-v%s\n' "$unc" "$i" "$sfx"
-                printf '    header: format_version=1 watermark_hour=%s\n    entries (decoded): 10\n' "$wm"
+                refs=0 lo=490000 hi=490001 unc=0 key="t/h1/m/catalog/part-${i}" b3=$((i + 1)) leaf="t/h1/m/ki/${i}-v"
+                [ "$i" -ge "$leaf_parts" ] || refs=1
+                [ "$i" -ne 3 ] || { refs=1 lo="$tail_lo" hi=490002 unc="$tail_uncovered"; }
+                if [ "$i" = "$rewritten" ]; then
+                  key="${key}-e" b3=$((b3 + 224))
+                  [ -n "${STUB_ERASURE_STALE:-}" ] || leaf="${leaf}-e"
+                fi
+                # catalog.rs:897-904
+                printf '  part[%s] range=%s..=%s key=%s blake3=%064x size=1000 entry_count=10\n' "$i" "$lo" "$hi" "$key" "$b3"
+                printf '    column_stats (field 7): ABSENT\n'     # catalog.rs:913-916
+                if [ "$refs" -eq 0 ]; then
+                  printf '    key_index (field 8): ABSENT\n'      # catalog.rs:957
+                else
+                  printf '    key_index (field 8): 1\n'           # catalog.rs:960
+                  # catalog.rs:961-965; a metrics part's only key-index field
+                  # is label_value (crates/ravel-catalog/src/fold.rs:1341).
+                  printf '      field=label_value slice=0x0000000000000000..=0xffffffffffffffff entry_count=10 uncovered_count=%s key=%s\n' "$unc" "$leaf"
+                fi
+                # catalog.rs:924-932
+                printf '    header: format_version=1 min_hour=%s watermark_hour=%s shard_count=4 entry_count=10 entries_uncompressed_len=640\n' "$lo" "$hi"
+                printf '    entries (decoded): 10\n'              # catalog.rs:933-936
               done
             fi
             ;;
-          # ravel-cli catalog fold on the ravel-qualify service: its text
-          # report, the hours in the clock's current hour bucket. It logs
-          # ravel-server's state as it runs. With --json (the Stage 1 folds)
-          # the JSON report, the store header on stderr: with
-          # --rebuild-key-index the rebuild's, STUB_STAGE1_LEAVES (default 12)
-          # leaves and parts_rebuilt STUB_STAGE1_PARTS_REBUILT (default 3, as
-          # JSON text), exit STUB_STAGE1_LEAVES_EXIT; otherwise the fold's, exit
-          # STUB_STAGE1_FOLD_EXIT.
+          # ravel-cli catalog fold on the ravel-qualify service, its report
+          # written by foldreport below: the text report, the hours in the
+          # clock's current hour bucket. It logs ravel-server's state as it
+          # runs. With --json (the Stage 1 folds) the JSON report, nothing on
+          # stderr: with --rebuild-key-index the rebuild's, STUB_STAGE1_LEAVES
+          # (default 12) leaves and parts_rebuilt STUB_STAGE1_PARTS_REBUILT
+          # (default 3, as JSON text), exit STUB_STAGE1_LEAVES_EXIT; otherwise
+          # the fold's, exit STUB_STAGE1_FOLD_EXIT. Each publishes a HEAD into
+          # $STUB_STATE.head, named "-leaves" when it carries leaf refs; a
+          # fold with no --key-index-leaves over such a HEAD reports
+          # key_index_switch_off_over_leaves true (fold.rs:401-410), as does
+          # every fold with STUB_SWITCH_OFF_OVER_LEAVES.
           *" catalog fold "*)
             printf 'docker-state fold ravel-server=%s\n' "$(cat "${STUB_STATE}.ravel" 2>/dev/null || echo running)" >>"${STUB_LOG}"
             [ "${STUB_FOLD_EXIT:-0}" -eq 0 ] || exit "${STUB_FOLD_EXIT}"
@@ -664,31 +749,36 @@ JSON
               *" --rebuild-key-index "*)
                 [ "${STUB_STAGE1_LEAVES_EXIT:-0}" -eq 0 ] || exit "${STUB_STAGE1_LEAVES_EXIT}"
                 : >"${STUB_STATE}.rebuilt"
-                echo 'store: s3' >&2
-                printf '{"leaves_written":%s,"leaf_bytes_written":4096,"ranged_gets":7,"leaf_prefix_gets":2,"erasure_get_requests":1,"erasure_list_requests":1,"leaf_prefix_bytes_read":512,"section_bytes_read":2048,"parts_unindexed":3,"parts_rebuilt":%s,"parts_deferred":0,"parts_over_cap":0,"parts_erasure_gated":0,"uncovered_entries":0,"attempt_count":2,"attempts":[{"parts":2,"part_gets":2,"leaf_puts":8,"head_cas_tries":2,"parts_published":0},{"parts":3,"part_gets":3,"leaf_puts":%s,"head_cas_tries":1,"parts_published":3}]}\n' "${STUB_STAGE1_LEAVES:-12}" "${STUB_STAGE1_PARTS_REBUILT:-3}" "${STUB_STAGE1_LEAVES:-12}"
+                echo head-rebuilt-leaves >"${STUB_STATE}.head"
+                foldreport rebuild "{\"leaves_written\": ${STUB_STAGE1_LEAVES:-12}, \"parts_rebuilt\": ${STUB_STAGE1_PARTS_REBUILT:-3}}"
                 exit 0
                 ;;
               *" --json "*)
                 [ "${STUB_STAGE1_FOLD_EXIT:-0}" -eq 0 ] || exit "${STUB_STAGE1_FOLD_EXIT}"
-                echo 'store: s3' >&2
                 n=$(($(cat "${STUB_STATE}.folds" 2>/dev/null || echo 0) + 1))
                 echo "$n" >"${STUB_STATE}.folds"
-                echo "head-${n}" >"${STUB_STATE}.head"
+                prev_head="$(cat "${STUB_STATE}.head" 2>/dev/null || echo head-0)"
+                switch_off=false leafy=""
+                case " $* " in
+                  *" --key-index-leaves "*) leafy=-leaves ;;
+                  *) case "$prev_head" in *leaves*) switch_off=true ;; esac ;;
+                esac
+                [ -z "${STUB_SWITCH_OFF_OVER_LEAVES:-}" ] || switch_off=true
+                echo "head-${n}${leafy}" >"${STUB_STATE}.head"
                 if [ ! -e "${STUB_STATE}.extra" ]; then
-                  printf '{"watermark_hour":490001,"previous_watermark_hour":490001,"no_op":true,"entry_count":0,"buckets_folded":0,"list_requests":4,"get_requests":6,"put_requests":0,"key_index_leaves_written":0,"key_index_leaf_bytes_written":0,"key_index_uncovered_entries":0}\n'
+                  foldreport json "{\"watermark_hour\": 490001, \"previous_watermark_hour\": 490001, \"no_op\": true, \"list_requests\": 4, \"get_requests\": 6, \"key_index_switch_off_over_leaves\": ${switch_off}}"
                 else
                   leaves=0 bytes=0
-                  case " $* " in *" --key-index-leaves "*) leaves=2 bytes="${STUB_EXTRA_LEAF_BYTES:-10}" ;; esac
-                  printf '{"watermark_hour":490002,"previous_watermark_hour":490001,"no_op":false,"entry_count":30,"buckets_folded":4,"list_requests":4,"get_requests":6,"put_requests":3,"key_index_leaves_written":%s,"key_index_leaf_bytes_written":%s,"key_index_uncovered_entries":0}\n' "$leaves" "$bytes"
+                  [ -z "$leafy" ] || { leaves=2 bytes="${STUB_EXTRA_LEAF_BYTES:-10}"; }
+                  foldreport json "{\"watermark_hour\": 490002, \"previous_watermark_hour\": 490001, \"entry_count\": 30, \"buckets_folded\": 4, \"list_requests\": 4, \"get_requests\": 6, \"put_requests\": 3, \"key_index_leaves_written\": ${leaves}, \"key_index_leaf_bytes_written\": ${bytes}, \"key_index_switch_off_over_leaves\": ${switch_off}}"
                 fi
                 exit 0
                 ;;
             esac
             hour=$(($(date -u +%s) / 3600))
-            printf 'store: s3\nsignal: metrics\nno_op: false\nrebuilt: false\nprevious_watermark_hour: None\n'
-            printf 'watermark_hour: Some(%s)\nseal_margin: 1h 20m\n' "$((hour - ${STUB_FOLD_WATERMARK_LAG:-0}))"
-            printf 'seal_through_hour: %s\nbuckets_folded: 2\nentry_count: 420\npart_bytes: 9000\n' \
-              "${STUB_FOLD_SEAL:-Some(${hour})}"
+            seal="${STUB_FOLD_SEAL:-Some(${hour})}"
+            case "$seal" in Some\(*\)) seal="${seal#Some(}" seal="${seal%)}" ;; *) seal=null ;; esac
+            foldreport text "{\"watermark_hour\": $((hour - ${STUB_FOLD_WATERMARK_LAG:-0})), \"buckets_folded\": 2, \"entry_count\": 420, \"part_bytes\": 9000, \"seal_through_hour\": ${seal}}"
             ;;
         esac
         ;;
@@ -737,6 +827,104 @@ JSON
     ;;
 esac
 exit 0
+STUB
+
+# foldreport MODE OVERRIDES: a catalog fold report as ravel-cli prints it,
+# every field at its zero value but the JSON object OVERRIDES. MODE json is
+# `catalog fold --json`, text the plain fold, rebuild `catalog fold
+# --rebuild-key-index --json`; all on stdout, nothing on stderr.
+cat >"${BIN}/foldreport" <<'STUB'
+#!/usr/bin/env python3
+import json
+import sys
+
+mode, overrides = sys.argv[1], json.loads(sys.argv[2])
+if mode == "rebuild":
+    # crates/ravel-catalog/src/key_index_rebuild.rs:83-138, every field.
+    leaves = overrides.get("leaves_written", 0)
+    doc = {"largest_unindexed_part_entries": 10, "fields": ["label_value"], "parts_unindexed": 3,
+           "parts_with_refused_leaves": 0, "leaf_prefix_gets": 2, "leaf_prefix_bytes_read": 512,
+           "parts_rebuilt": 0, "parts_deferred": 0, "leaves_written": 0, "leaf_bytes_written": 4096,
+           "section_bytes_read": 2048, "ranged_gets": 7, "uncovered_entries": 0, "parts_over_cap": 0,
+           "parts_erasure_gated": 0, "erasure_list_requests": 1, "erasure_get_requests": 1,
+           "attempt_count": 2,
+           # key_index_rebuild.rs:65-80, every field.
+           "attempts": [{"parts": 2, "part_gets": 2, "ranged_gets": 3, "leaf_puts": 8, "head_cas_tries": 2, "parts_published": 0},
+                        {"parts": 3, "part_gets": 3, "ranged_gets": 4, "leaf_puts": leaves, "head_cas_tries": 1, "parts_published": 3}]}
+    doc.update(overrides)
+    # services/ravel-cli/src/catalog.rs:722-746: the report plus store and
+    # signal, serde_json pretty (no preserve_order, so keys sorted).
+    doc.update({"store": "s3", "signal": "metrics"})
+    print(json.dumps(doc, indent=2, sort_keys=True))
+    sys.exit(0)
+
+# crates/ravel-catalog/src/fold.rs:179-442 FoldReport, every field in
+# declaration order.
+doc = {"watermark_hour": None, "previous_watermark_hour": None, "no_op": False, "rebuilt": False,
+       "buckets_folded": 0, "entry_count": 0, "part_bytes": 0, "parts_total": 0, "parts_reused": 0,
+       "list_requests": 0, "get_requests": 0, "put_requests": 0, "postings_built": False,
+       "postings_bytes": 0, "column_stats_part_objects_built": 0, "column_stats_dictionaries_dropped": 0,
+       "layout_drift_count": 0, "frontier_hours_reconciled": 0, "frontier_hours_deferred": 0,
+       "refold_hours_reconciled": 0, "stamped_records": 0, "stamped_entries": 0,
+       "seal_through_hour": None, "key_index_ranged_gets": 0, "key_index_bytes_read": 0,
+       "key_index_leaves_written": 0, "key_index_leaf_bytes_written": 0, "key_index_uncovered_entries": 0,
+       "key_index_sections_read": 0, "key_index_entries_carried": 0, "key_index_build_passes": 0,
+       "key_index_pair_budget": 0, "key_index_field_pairs": {}, "key_index_switch_off_over_leaves": False,
+       "key_index_parts_missing_declared_leaves": 0, "key_index_leaf_gets": 0,
+       "metrics_label_index_parts_over_cap": 0, "metrics_label_index_parts_erasure_gated": 0,
+       "metrics_label_index_erasure_list_requests": 0}
+doc.update(overrides)
+if mode == "json":
+    # catalog.rs:428-489: the report plus store, signal, seal_margin and
+    # snapshot_part_max_entries, serde_json pretty with keys sorted.
+    doc.update({"store": "s3", "signal": "metrics", "seal_margin": "1h 20m",
+                "snapshot_part_max_entries": 250000})
+    print(json.dumps(doc, indent=2, sort_keys=True))
+    sys.exit(0)
+
+# catalog.rs:494-617, the text report line by line: Option as {:?}, bools
+# lowercase, key_index_field_pairs as compact JSON.
+def show(v):
+    if isinstance(v, bool):
+        return str(v).lower()
+    return str(v)
+def opt(v):
+    return "None" if v is None else f"Some({v})"
+print("store: s3")
+print("signal: metrics")
+print(f"no_op: {show(doc['no_op'])}")
+print(f"rebuilt: {show(doc['rebuilt'])}")
+print(f"previous_watermark_hour: {opt(doc['previous_watermark_hour'])}")
+print(f"watermark_hour: {opt(doc['watermark_hour'])}")
+print("seal_margin: 1h 20m")
+print(f"seal_through_hour: {opt(doc['seal_through_hour'])}")
+print("snapshot_part_max_entries: 250000")
+for k in ["buckets_folded", "entry_count", "part_bytes", "parts_total", "parts_reused", "list_requests",
+          "get_requests", "put_requests", "postings_built", "postings_bytes",
+          "column_stats_part_objects_built", "column_stats_dictionaries_dropped", "layout_drift_count",
+          "frontier_hours_reconciled", "frontier_hours_deferred", "refold_hours_reconciled",
+          "stamped_records", "stamped_entries", "key_index_ranged_gets", "key_index_bytes_read",
+          "key_index_leaves_written", "key_index_leaf_bytes_written", "key_index_uncovered_entries",
+          "key_index_sections_read", "key_index_entries_carried", "key_index_build_passes",
+          "key_index_pair_budget"]:
+    print(f"{k}: {show(doc[k])}")
+print("key_index_field_pairs: " + json.dumps(doc["key_index_field_pairs"], separators=(",", ":"), sort_keys=True))
+for k in ["key_index_switch_off_over_leaves", "key_index_parts_missing_declared_leaves", "key_index_leaf_gets",
+          "metrics_label_index_parts_over_cap", "metrics_label_index_parts_erasure_gated",
+          "metrics_label_index_erasure_list_requests"]:
+    print(f"{k}: {show(doc[k])}")
+STUB
+
+# date: the host's own, except `date -u +%s` once $STUB_STATE.clock exists
+# (the erase submit stub writes STUB_CLOCK_AT_SUBMIT there), which prints
+# that instant.
+cat >"${BIN}/date" <<'STUB'
+#!/usr/bin/env bash
+if [ "$*" = "-u +%s" ] && [ -s "${STUB_STATE}.clock" ]; then
+  cat "${STUB_STATE}.clock"
+  exit 0
+fi
+exec "${STUB_REAL_DATE}" "$@"
 STUB
 
 # curl: readiness 200, IMDS unreachable, Ravel's /metrics with or without the
@@ -1010,7 +1198,9 @@ esac
 # any other record's is null.
 # STUB_RUN_FIGURES names a JSON file whose "records" object maps a pass label
 # to entry ids ("*" for every entry) to the fields that replace the record's;
-# a "keyIndex" field there replaces the routed keyIndex phase's figures.
+# a "keyIndex" field there replaces the routed keyIndex phase's figures. Its
+# "rep2" object, keyed the same way, adds a rep-2 record per entry to that
+# pass with those fields replaced.
 # Every phase also carries the per-phase cost the server reports: 1 GET of
 # 100 wire bytes.
 # Entry STUB_TWO_HASH_ENTRY gets a second record in every pass, rep 2, with
@@ -1070,6 +1260,10 @@ if diag:
     two = os.environ.get("STUB_TWO_HASH_ENTRY")
     if two in ids:
         rows.append({**record(two), "rep": 2, "result_hash": f"blake3:{two}-rep2"})
+    if os.environ.get("STUB_RUN_FIGURES"):
+        rep2 = (json.load(open(os.environ["STUB_RUN_FIGURES"])).get("rep2") or {}).get(label) or {}
+        rows += [{**record(i), "rep": 2, **rep2.get("*", {}), **rep2.get(i, {})}
+                 for i in ids if rep2]
     json.dump({"ravel_cost": rows}, open(diag, "w"))
 if out:
     report = {"stub": "report", "timed_rows": len(ids)}
@@ -1222,7 +1416,7 @@ run_case() {
   esac
   [ -z "${STUB_PY_OP:-}" ] || run_path="${PYFAIL_DIR}:${run_path}"
   PATH="${run_path}" \
-    STUB_LOG="${LOG}" STUB_STATE="${TMP}/${name}/state" STUB_REAL_UNAME="${REAL_UNAME}" \
+    STUB_LOG="${LOG}" STUB_STATE="${TMP}/${name}/state" STUB_REAL_UNAME="${REAL_UNAME}" STUB_REAL_DATE="${REAL_DATE}" \
     METRICSBENCH_S3S_FS_CACHE="${TMP}/${name}/cache" \
     METRICSBENCH_CAPTURE="${BIN}/capture" \
     METRICSBENCH_SAMPLE_INTERVAL=0.1 \
@@ -2941,12 +3135,21 @@ check "z30: the statement over its bound, the part beyond the ceiling and the un
 # --- za: the Stage 1 arms (issue #3969) -----------------------------------------------
 CONTROL_IMAGE="stub/ravel-control@sha256:$(printf 'c%.0s' {1..64})"
 CONTROL_COMMIT="$(printf 'd%.0s' {1..40})"
-# za: every arm on: each arm's steps after stage1-holders, in order.
+# za: every arm on: each arm's steps after stage1-holders, in order. The
+# erasure reference pass (the corpus without the subject's series, routed)
+# is pruned by the label index and answers one entry differently from the
+# routed pass, and the pending pass answers as the reference does.
+cat >"${TMP}/run-arms.json" <<'JSON'
+{"holders": {"report": {}, "statements": {}},
+ "records": {"folded-erasure-reference": {"*": {"segmentsPrunedByLabelIndex": 3},
+                                          "mb_selective_job_rate_sum": {"result_hash": "blake3:mb_selective_job_rate_sum-erased"}},
+             "folded-erasure-pending": {"mb_selective_job_rate_sum": {"result_hash": "blake3:mb_selective_job_rate_sum-erased"}}}}
+JSON
 MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour,l1,erasure MB_CONTROL_IMAGE="${CONTROL_IMAGE}" MB_CONTROL_SOURCE_COMMIT="${CONTROL_COMMIT}" \
-  run_stage1 za ci
+  STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 za ci
 expect_rc za 0
 
-check "za: the arm steps follow stage1-holders in order, the control's between stage1-unrouted and stage1-leaves" 'j("stamps.json")["steps_completed"][j("stamps.json")["steps_completed"].index("stage1-fold"):] == ["stage1-fold","stage1-unrouted","stage1-control","stage1-control-restore","stage1-leaves","stage1-restart","stage1-routed","stage1-holders","stage1-extra-hour-ingest","stage1-extra-hour-fold-off","stage1-extra-hour-fold-on","stage1-extra-hour","stage1-l1-compact","stage1-l1-fold","stage1-l1","stage1-erasure-reference","stage1-erasure-submit","stage1-erasure-pending","stage1-erasure-rewrite","stage1-erasure-fold","stage1-erasure"] and j("stamps.json")["status"] == "passed"'
+check "za: the arm steps follow stage1-holders in order, the control's between stage1-unrouted and stage1-leaves" 'j("stamps.json")["steps_completed"][j("stamps.json")["steps_completed"].index("stage1-fold"):] == ["stage1-fold","stage1-unrouted","stage1-control","stage1-control-restore","stage1-leaves","stage1-restart","stage1-routed","stage1-holders","stage1-extra-hour-ingest","stage1-extra-hour-fold-on","stage1-extra-hour-fold-off","stage1-extra-hour","stage1-l1-compact","stage1-l1-fold","stage1-l1","stage1-erasure-reference","stage1-erasure-submit","stage1-erasure-pending","stage1-erasure-rewrite","stage1-erasure-fold","stage1-erasure"] and j("stamps.json")["status"] == "passed"'
 check "za: every arm stamped on" 'j("stamps.json")["stage1"]["arms"] == {"control": True, "extra_hour": True, "l1": True, "erasure": True}'
 if python3 -I - "${LOG}" "${IMAGE}" "${CONTROL_IMAGE}" <<'PY'; then
 import re, sys
@@ -2962,12 +3165,12 @@ folds = [re.search(r" catalog fold --tenant \S+ --shards \S+ (.*)$", l).group(1)
          for l in lines if l.startswith("docker compose ") and " catalog fold " in l]
 leafy = "--signal metrics --writers-stopped --key-index-leaves --metrics-label-index --json"
 ok = (list(zip(flags, images)) == want
-      and folds[3:] == ["--signal metrics --writers-stopped --json", leafy, leafy, leafy])
+      and folds[3:] == [leafy, "--signal metrics --writers-stopped --json", leafy, leafy])
 if not ok:
     print(list(zip(flags, images)), folds)
 sys.exit(0 if ok else 1)
 PY
-  pass "za: seven recreates, the control's alone on the control image, and the arm folds with their listed flags"
+  pass "za: seven recreates, the control's alone on the control image, and the arm folds with their listed flags, the leaf-on extra-hour fold first"
 else
   fail "za: the recreates or the arm folds are not the listed ones"
 fi
@@ -2980,30 +3183,50 @@ ingest = first(lambda l: l.startswith("metricsbench_ingest ") and " --steps " in
 def cp(l):
     m = re.search(r" s3 cp (?:--recursive )?(\S+) (\S+)", l)
     return (m.group(1), m.group(2)) if m else ("", "")
-save = first(lambda l: cp(l)[1].startswith("/stage1-s3/head-saved/"))
-restore = first(lambda l: cp(l)[0].startswith("/stage1-s3/head-saved/") and cp(l)[1].startswith("s3://"))
-sleep = first(lambda l: l.startswith("stubsleep "))
+def save(name):
+    return first(lambda l: cp(l)[0].startswith("s3://") and cp(l)[1].startswith(f"/stage1-s3/{name}/"))
+def restore(name):
+    return first(lambda l: cp(l)[0].startswith(f"/stage1-s3/{name}/") and cp(l)[1].startswith("s3://"))
+def fold(leafy, after):
+    return next((i for i, l in enumerate(lines) if i > after and " catalog fold " in l and " --writers-stopped " in l
+                 and (" --key-index-leaves " in l) == leafy), -1)
+rebuild = first(lambda l: " --rebuild-key-index " in l)
+fold_on = fold(True, ingest)
+fold_off = fold(False, ingest)
+sleep = next((i for i, l in enumerate(lines) if i > fold_off and l.startswith("stubsleep ")), -1)
 compact = first(lambda l: " compact-tenant " in l)
 l1 = first(lambda l: "--pass-label folded-l1" in l)
 submit = first(lambda l: " erase submit " in l and "--matcher instance=metricsbench-instance-0" in l)
 pending = first(lambda l: "--pass-label folded-erasure-pending" in l)
 maintain = first(lambda l: " --mode maintain " in l)
 status_ = first(lambda l: " erase status " in l)
-ok = 0 <= ingest < save < restore < sleep < compact < l1 < submit < pending < maintain < status_
+order = dict(save_leafless=save("head-leafless"), rebuild=rebuild, save_routed=save("head-routed"), ingest=ingest,
+             restore_routed=restore("head-routed"), fold_on=fold_on, save_fold_on=save("head-fold-on"),
+             restore_leafless=restore("head-leafless"), fold_off=fold_off, restore_fold_on=restore("head-fold-on"),
+             sleep=sleep, compact=compact, l1=l1, submit=submit, pending=pending, maintain=maintain, status=status_)
+ok = list(order.values()) == sorted(order.values()) and min(order.values()) >= 0
 if not ok:
-    print(dict(ingest=ingest, save=save, restore=restore, sleep=sleep, compact=compact, l1=l1,
-               submit=submit, pending=pending, maintain=maintain, status=status_))
+    print(order)
 sys.exit(0 if ok else 1)
 PY
-  pass "za: extra-hour ingest, HEAD saved, HEAD put back, the wait for the seal, compact-tenant, the l1 pass, erase submit, the pending pass, the maintain container, erase status"
+  pass "za: leafless HEAD saved, the leaf rebuild, routed HEAD saved, extra-hour ingest, routed HEAD put back, the leaf-on fold, its HEAD saved, leafless HEAD put back, the leaf-off fold, the leaf-on HEAD put back, the wait for the seal, compact-tenant, the l1 pass, erase submit, the pending pass, the maintain container, erase status"
 else
   fail "za: the arm calls are not in their order"
 fi
-check "za: both extra-hour folds started from the same HEAD and folded the extra hour, the leaf build only in the second" 'j("stamps.json")["stage1"]["extra_hour"]["same_start"] is True and j("stamps.json")["stage1"]["extra_hour"]["start_mismatches"] == 0 and j("stamps.json")["stage1"]["extra_hour"]["head_sha256"]["before_off"] == j("stamps.json")["stage1"]["extra_hour"]["head_sha256"]["before_on"] and j("stamps.json")["stage1"]["extra_hour_fold_off"]["key_index_leaves_written"] == 0 and j("stamps.json")["stage1"]["extra_hour_fold_on"]["key_index_leaves_written"] == 2 and j("stamps.json")["stage1"]["extra_hour"]["watermark_hour"] == 490002'
-check "za: the extra hour's tail objects, leaf bytes over their bytes and its one covered tail part" '{k: j("stamps.json")["stage1"]["extra_hour"][k] for k in ("tail_objects", "tail_data_bytes", "leaf_bytes_ratio", "tail_parts", "uncovered_tail_parts_count")} == {"tail_objects": 30, "tail_data_bytes": 3000, "tail_parts": 1, "leaf_bytes_ratio": 10 / 3000, "uncovered_tail_parts_count": 0}'
-check "za: the control pass ran on the control image and compares GETs, bytes and latency per statement" 'j("stamps.json")["stage1"]["control"]["fold_state"].endswith("; image '"${CONTROL_IMAGE}"'") and j("stamps.json")["stage1"]["control_image"]["control"]["source_commit"] == "'"${CONTROL_COMMIT}"'" and {k: j("stage1-control-compare.json")[k] for k in ("statements_compared", "statements_more_gets_count", "statements_more_bytes_count", "statements_unchecked_count", "latency_ratio_median")} == {"statements_compared": len('"${CORPUS_IDS}"'), "statements_more_gets_count": 0, "statements_more_bytes_count": 0, "statements_unchecked_count": 0, "latency_ratio_median": 1.0}'
+check "za: the leaf-on fold started from the routed HEAD, the leaf-off fold from the leafless one with no switch-off over leaves, both from the same watermark, the leaf build only in the leaf-on fold" 'j("stamps.json")["stage1"]["extra_hour"]["start_mismatches"] == 0 and set(j("stamps.json")["stage1"]["extra_hour"]["head_sha256"]) == {"fold_off_start", "fold_on_start", "after"} and len(set(j("stamps.json")["stage1"]["extra_hour"]["head_sha256"].values())) == 3 and j("stamps.json")["stage1"]["extra_hour"]["fold_off"]["key_index_switch_off_over_leaves"] is False and j("stamps.json")["stage1"]["extra_hour"]["fold_off"]["put_requests"] == 3 == j("stamps.json")["stage1"]["extra_hour"]["fold_on"]["put_requests"] and j("stamps.json")["stage1"]["extra_hour_fold_off"]["key_index_leaves_written"] == 0 and j("stamps.json")["stage1"]["extra_hour_fold_on"]["key_index_leaves_written"] == 2 and j("stamps.json")["stage1"]["extra_hour"]["watermark_hour"] == 490002 and "wall_ratio_on_off errs high" in j("stamps.json")["stage1"]["extra_hour"]["method"]'
+check "za: the extra hour's tail objects, leaf bytes over the bytes of the objects its tail parts cover and its one covered tail part" '{k: j("stamps.json")["stage1"]["extra_hour"][k] for k in ("tail_objects", "tail_data_bytes", "leaf_bytes", "leaf_bytes_denominator_objects", "leaf_bytes_denominator", "leaf_bytes_ratio", "tail_parts", "uncovered_tail_parts_count")} == {"tail_objects": 30, "tail_data_bytes": 3000, "leaf_bytes": 10, "leaf_bytes_denominator_objects": 30, "leaf_bytes_denominator": 3000, "tail_parts": 1, "leaf_bytes_ratio": 10 / 3000, "uncovered_tail_parts_count": 0}'
+check "za: the control pass ran on the control image and compares GETs, bytes and latency per statement" 'j("stamps.json")["stage1"]["control"]["fold_state"].endswith("; image '"${CONTROL_IMAGE}"'") and j("stamps.json")["stage1"]["control_image"]["control"]["source_commit"] == "'"${CONTROL_COMMIT}"'" and {k: j("stage1-control-compare.json")[k] for k in ("statements_compared", "statements_more_gets_count", "statements_more_bytes_count", "statements_unchecked_count", "statements_slower_count", "latency_ratio_max")} == {"statements_compared": len('"${CORPUS_IDS}"'), "statements_more_gets_count": 0, "statements_more_bytes_count": 0, "statements_unchecked_count": 0, "statements_slower_count": 0, "latency_ratio_max": 1.0}'
 check "za: compact-tenant's counters, the L1 objects listed and the l1 pass equal to the routed one" 'j("stamps.json")["stage1"]["l1_compact"]["compacted"] == 2 and j("stamps.json")["stage1"]["l1_compact"]["failed"] == 0 and j("stamps.json")["stage1"]["l1_objects"]["l1_objects"] == 100 and j("stage1-l1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"') == j("stage1-l1-compare.json")["entries_equal"]'
-check "za: the erasure names its subject, the rewrite's dropped records and path, no stale leaf, and leaves the sweep unchecked" 'j("stamps.json")["stage1"]["erasure_submit"]["matcher"] == "instance=\"metricsbench-instance-0\"" and j("stamps.json")["stage1"]["erasure_rewrite"]["state"] == "COMPLETED" and j("stamps.json")["stage1"]["erasure_rewrite"]["dropped_total"] == 5 and j("stamps.json")["stage1"]["erasure_rewrite"]["path"].startswith("a one-off ravel-server --mode maintain container") and j("stamps.json")["stage1"]["erasure_leaves"]["stale_leaves_count"] == 0 and j("stamps.json")["stage1"]["erasure_sweep"].startswith("not checked: ") and j("stage1-erasure-compare.json")["base"] == "erasure_reference" and j("stage1-erasure-compare.json")["other"] == "erasure_pending" and j("stage1-erasure-compare.json")["entries_differing_count"] == 0'
+check "za: the erasure names its subject, the rewrite's state and path, one rewritten part with no stale leaf, and leaves the sweep unchecked" 'j("stamps.json")["stage1"]["erasure_submit"]["matcher"] == "instance=\"metricsbench-instance-0\"" and j("stamps.json")["stage1"]["erasure_rewrite"]["state"] == "COMPLETED" and j("stamps.json")["stage1"]["erasure_rewrite"]["deferral_cause"] == "none (completed cleanly)" and "dropped_total" not in j("stamps.json")["stage1"]["erasure_rewrite"] and j("stamps.json")["stage1"]["erasure_rewrite"]["path"].startswith("a one-off ravel-server --mode maintain container") and {k: j("stamps.json")["stage1"]["erasure_leaves"][k] for k in ("parts_before", "parts_after", "rewritten_parts_count", "stale_leaves_count")} == {"parts_before": 4, "parts_after": 4, "rewritten_parts_count": 1, "stale_leaves_count": 0} and j("stamps.json")["stage1"]["erasure_leaves"]["rewritten_parts"][0]["key"] == "t/h1/m/catalog/part-0" and j("stamps.json")["stage1"]["erasure_sweep"].startswith("not checked: ") and j("stage1-erasure-compare.json")["base"] == "erasure_reference" and j("stage1-erasure-compare.json")["other"] == "erasure_pending" and j("stage1-erasure-compare.json")["entries_differing_count"] == 0'
+check "za: the subject compare: the reference pass pruned by the label index, one entry answered without the subject's series" 'j("stage1-erasure-subject.json")["base"] == "routed" and j("stage1-erasure-subject.json")["other"] == "erasure_reference" and j("stage1-erasure-subject.json")["other_records_pruned_by_label_index"] == len('"${CORPUS_IDS}"') and j("stage1-erasure-subject.json")["entries_differing_count"] == 1'
+check "za: the seal wait and the maintain container's flags are stamped" 'set(j("stamps.json")["stage1"]["erasure_seal_wait"]) == {"submitted_unix_s", "deadline_unix_s", "sleep_s", "waited_s", "basis"} and j("stamps.json")["stage1"]["erasure_seal_wait"]["deadline_unix_s"] == (j("stamps.json")["stage1"]["erasure_seal_wait"]["submitted_unix_s"] // 3600 + 1) * 3600 + 3900 and j("stamps.json")["stage1"]["erasure_maintain"].startswith("ravel-server --mode maintain --store s3 ") and "--maintain-key-file /maintain.key" in j("stamps.json")["stage1"]["erasure_maintain"] and "no ravel-server flag turns compaction off" in j("stamps.json")["stage1"]["erasure_maintain"]'
+check "za: l1 is stamped not measured" 'isinstance(j("stamps.json")["stage1"]["l1_not_measured"], str) and j("stamps.json")["stage1"]["l1_not_measured"] != ""'
+if key_mount="$(grep '^docker compose .* --mode maintain ' "${LOG}" | grep -oE -- '-v [^ ]+:/maintain.key:ro' | sed -e 's/^-v //' -e 's/:\/maintain.key:ro$//')" &&
+  [ -n "${key_mount}" ] && [ "${key_mount#"${OUT}"}" = "${key_mount}" ] && [ ! -e "${key_mount}" ]; then
+  pass "za: the maintain record key lives outside the out dir and is gone once the step ends"
+else
+  fail "za: the maintain record key mount '${key_mount:-}' is under ${OUT} or still exists"
+fi
 
 # zb-ze: each arm alone runs its own steps only, with figures its bands
 # reject (the band checks are under stage1-check.sh below). zb: a control
@@ -3017,19 +3240,35 @@ MB_STAGE1=1 MB_CONTROL_IMAGE="${CONTROL_IMAGE}" MB_CONTROL_SOURCE_COMMIT="${CONT
   STUB_RUN_FIGURES="${TMP}/run-control.json" run_stage1 zb ci
 expect_rc zb 0
 check "zb: the control's steps alone, between stage1-unrouted and stage1-leaves" 'j("stamps.json")["steps_completed"][-7:] == ["stage1-unrouted","stage1-control","stage1-control-restore","stage1-leaves","stage1-restart","stage1-routed","stage1-holders"] and j("stamps.json")["stage1"]["arms"] == {"control": True, "extra_hour": False, "l1": False, "erasure": False}'
+check "zb: every statement 12.5x the control's latency with no spread is slower" 'j("stage1-control-compare.json")["statements_slower_count"] == len('"${CORPUS_IDS}"') and j("stage1-control-compare.json")["latency_ratio_max"] == 12.5 and j("stage1-control-compare.json")["entries"][0]["control"]["latency_ms_spread"] == 0'
+# zb2: the unrouted median 12.5 ms is about 6% above the control's 11.8 ms,
+# whose two reps (11.0 and 12.6 ms) spread wider than that excess.
+cat >"${TMP}/run-control-spread.json" <<'JSON'
+{"holders": {"report": {}, "statements": {}},
+ "records": {"folded-control": {"*": {"latency_ms": 11.0}}},
+ "rep2": {"folded-control": {"*": {"latency_ms": 12.6}}}}
+JSON
+MB_STAGE1=1 MB_CONTROL_IMAGE="${CONTROL_IMAGE}" MB_CONTROL_SOURCE_COMMIT="${CONTROL_COMMIT}" \
+  STUB_RUN_FIGURES="${TMP}/run-control-spread.json" run_stage1 zb2 ci
+expect_rc zb2 0
+check "zb2: a 6% excess inside the control's spread is not slower" 'j("stage1-control-compare.json")["statements_slower_count"] == 0 and abs(j("stage1-control-compare.json")["entries"][0]["control"]["latency_ms_spread"] - 1.6) < 1e-9 and abs(j("stage1-control-compare.json")["latency_ratio_max"] - 12.5 / 11.8) < 1e-9'
 # zc: an extra hour whose leaves are a third of its data bytes, on a tail
 # part whose leaf leaves an entry uncovered.
 MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour STUB_EXTRA_LEAF_BYTES=1000 STUB_EXTRA_UNCOVERED=1 run_stage1 zc ci
 expect_rc zc 0
-check "zc: the extra hour's steps alone, after stage1-holders" 'j("stamps.json")["steps_completed"][-5:] == ["stage1-holders","stage1-extra-hour-ingest","stage1-extra-hour-fold-off","stage1-extra-hour-fold-on","stage1-extra-hour"] and j("stamps.json")["stage1"]["arms"] == {"control": False, "extra_hour": True, "l1": False, "erasure": False}'
+check "zc: the extra hour's steps alone, after stage1-holders" 'j("stamps.json")["steps_completed"][-5:] == ["stage1-holders","stage1-extra-hour-ingest","stage1-extra-hour-fold-on","stage1-extra-hour-fold-off","stage1-extra-hour"] and j("stamps.json")["stage1"]["arms"] == {"control": False, "extra_hour": True, "l1": False, "erasure": False}'
 check "zc: the uncovered tail part is named" 'j("stamps.json")["stage1"]["extra_hour"]["uncovered_tail_parts_count"] == 1 and j("stamps.json")["stage1"]["extra_hour"]["leaf_bytes_ratio"] == 1000 / 3000'
-# zd: an L1 pass whose hash differs on one entry and that ran out of fetch
-# memory on another.
+# zc2: a tail part whose range reaches back over every ingest hour: the
+# leaves index all 300 objects (30000 bytes), not only the 30 new ones.
+MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour STUB_TAIL_SPAN=1 STUB_EXTRA_LEAF_BYTES=200 run_stage1 zc2 ci
+expect_rc zc2 0
+check "zc2: the leaf bytes ratio is over the union of the objects the tail part covers" '{k: j("stamps.json")["stage1"]["extra_hour"][k] for k in ("tail_objects", "tail_data_bytes", "leaf_bytes", "leaf_bytes_denominator_objects", "leaf_bytes_denominator", "leaf_bytes_ratio")} == {"tail_objects": 30, "tail_data_bytes": 3000, "leaf_bytes": 200, "leaf_bytes_denominator_objects": 300, "leaf_bytes_denominator": 30000, "leaf_bytes_ratio": 200 / 30000}'
+# zd: an L1 pass whose hash differs on one entry and that failed on another.
 cat >"${TMP}/run-l1.json" <<'JSON'
 {"holders": {"report": {}, "statements": {}},
  "records": {"folded-l1": {
    "mb_selective_job_rate_sum": {"result_hash": "blake3:mb_selective_job_rate_sum-l1"},
-   "mb_single_counter_rate": {"status": "failed: fetch memory exhausted", "result_hash": null}}}}
+   "mb_single_counter_rate": {"status": "failed: stub", "result_hash": null}}}}
 JSON
 MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_RUN_FIGURES="${TMP}/run-l1.json" run_stage1 zd ci
 expect_rc zd 0
@@ -3044,7 +3283,7 @@ JSON
 MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASURE_STALE=1 STUB_RUN_FIGURES="${TMP}/run-erasure.json" run_stage1 ze ci
 expect_rc ze 0
 check "ze: the erasure steps alone, after stage1-holders" 'j("stamps.json")["steps_completed"][-7:] == ["stage1-holders","stage1-erasure-reference","stage1-erasure-submit","stage1-erasure-pending","stage1-erasure-rewrite","stage1-erasure-fold","stage1-erasure"] and j("stamps.json")["stage1"]["arms"] == {"control": False, "extra_hour": False, "l1": False, "erasure": True}'
-check "ze: the stale leaves are named" 'j("stamps.json")["stage1"]["erasure_leaves"]["stale_leaves_count"] == 6'
+check "ze: the rewritten part still referencing its pre-erasure leaf is named" 'j("stamps.json")["stage1"]["erasure_leaves"]["rewritten_parts_count"] == 1 and j("stamps.json")["stage1"]["erasure_leaves"]["stale_leaves"] == [{"part_before": "t/h1/m/catalog/part-0", "part_after": "t/h1/m/catalog/part-0-e", "leaf": "t/h1/m/ki/0-v", "field": "label_value"}]'
 
 # zf: the switches are refused before anything starts.
 MB_STAGE1=1 MB_CONTROL_IMAGE="stub/ravel-control:latest" MB_CONTROL_SOURCE_COMMIT="${CONTROL_COMMIT}" run_stage1 zf1 ci
@@ -3062,11 +3301,19 @@ expect_rc zf4 64
 expect_err "zf4: an unknown arm is named" "MB_STAGE1_ARMS takes a comma list of extra-hour, l1 and erasure, got 'compaction'"
 expect_no_log "zf4: nothing brought up" "ravel.yml up -d"
 
-# zg: a HEAD that does not read back as saved refuses the second extra-hour fold.
+# zg: a routed HEAD that does not read back as saved refuses the leaf-on fold.
 MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour STUB_HEAD_RESTORE_BROKEN=1 run_stage1 zg ci
 expect_rc zg 70
-expect_err "zg: the refusal names the step and both HEAD digests" "step stage1-extra-hour-fold-on failed: the restored HEAD reads back as sha256 "
-check "zg: the extra hour is stamped refused, the second fold never ran" 'j("stamps.json")["stage1"]["extra_hour"].startswith("refused: ") and "stage1-extra-hour-fold-on" not in j("stamps.json")["steps_completed"]'
+expect_err "zg: the refusal names the step, the HEAD and both digests" "step stage1-extra-hour-fold-on failed: the restored head-routed HEAD reads back as sha256 "
+check "zg: the extra hour is stamped refused, neither fold ran" 'j("stamps.json")["stage1"]["extra_hour"].startswith("refused: the restored head-routed HEAD ") and not any(s.startswith("stage1-extra-hour-fold") for s in j("stamps.json")["steps_completed"])'
+expect_no_log "zg: no extra-hour fold ran" "--writers-stopped --key-index-leaves"
+
+# zg2: a leaf-off fold that reports a switch-off over leaves did not start
+# from a leafless lineage and is refused.
+MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour STUB_SWITCH_OFF_OVER_LEAVES=1 run_stage1 zg2 ci
+expect_rc zg2 70
+expect_err "zg2: the refusal names the step and the flag" "step stage1-extra-hour failed: the leaf-off fold reports key_index_switch_off_over_leaves True, want false"
+check "zg2: the extra hour is stamped refused after both folds" 'j("stamps.json")["stage1"]["extra_hour"] == "refused: the leaf-off fold reports key_index_switch_off_over_leaves True, so it did not start from a leafless lineage" and j("stamps.json")["steps_completed"][-2:] == ["stage1-extra-hour-fold-on", "stage1-extra-hour-fold-off"]'
 
 # zh: an erasure still pending after every status poll ends the run at the rewrite.
 MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASE_PENDING=1 METRICSBENCH_ERASURE_TRIES=2 run_stage1 zh ci
@@ -3074,6 +3321,42 @@ expect_rc zh 70
 expect_err "zh: the failure names the step and the tries" "step stage1-erasure-rewrite failed: erasure "
 expect_err "zh: the tries are counted" " not COMPLETED after 2 tries 15s apart"
 check "zh: the steps stop before the rewrite" 'j("stamps.json")["steps_completed"][-1] == "stage1-erasure-pending"'
+if key_mount="$(grep '^docker compose .* --mode maintain ' "${LOG}" | grep -oE -- '-v [^ ]+:/maintain.key:ro' | sed -e 's/^-v //' -e 's/:\/maintain.key:ro$//')" &&
+  [ -n "${key_mount}" ] && [ "${key_mount#"${OUT}"}" = "${key_mount}" ] && [ ! -e "${key_mount}" ]; then
+  pass "zh: the maintain record key lives outside the out dir and is gone on the failure path too"
+else
+  fail "zh: the maintain record key mount '${key_mount:-}' is under ${OUT} or still exists"
+fi
+
+# zi: an erasure submitted mid-hour (the stubbed clock stops at
+# 1764001800, half past hour 490000) sleeps to that hour's end plus
+# max_flush_lifetime plus the clock-skew allowance before the first poll.
+MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_CLOCK_AT_SUBMIT=1764001800 run_stage1 zi ci
+expect_rc zi 0
+check "zi: the seal wait is stamped: deadline 490001 * 3600 + 3600 + 300, the whole 5700 s slept" '{k: v for k, v in j("stamps.json")["stage1"]["erasure_seal_wait"].items() if k != "basis"} == {"submitted_unix_s": 1764001800, "deadline_unix_s": 1764007500, "sleep_s": 5700, "waited_s": 0}'
+if python3 -I - "${LOG}" <<'PY'; then
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+def first(pred):
+    return next((i for i, l in enumerate(lines) if pred(l)), -1)
+pending = first(lambda l: "--pass-label folded-erasure-pending" in l)
+sleep = first(lambda l: l == "stubsleep 5700")
+maintain = first(lambda l: " --mode maintain " in l)
+status_ = first(lambda l: " erase status " in l)
+ok = 0 <= pending < sleep < maintain < status_
+if not ok:
+    print(dict(pending=pending, sleep=sleep, maintain=maintain, status=status_))
+sys.exit(0 if ok else 1)
+PY
+  pass "zi: the pending pass, then the 5700 s sleep, then the maintain container and the first erase status"
+else
+  fail "zi: the seal wait is not between the pending pass and the first poll"
+fi
+
+# zj: an erasure whose fold leaves every part as it was rewrote nothing.
+MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_ERASURE_UNCHANGED=1 STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 zj ci
+expect_rc zj 0
+check "zj: no rewritten part, so no stale leaf either" 'j("stamps.json")["stage1"]["erasure_leaves"]["rewritten_parts_count"] == 0 and j("stamps.json")["stage1"]["erasure_leaves"]["stale_leaves_count"] == 0'
 
 # za1: no arm switch: the arm steps do not run and each arm's stamps say so.
 OUT="${TMP}/z1/out"
@@ -3106,7 +3389,7 @@ ARM_FIGURES="$(python3 -I -c 'import json,sys; print(sum("when" in f for f in js
 # Clean: the shipped ci band file against case z1's run, every arm's figure n/a.
 run_check clean "${CI_BANDS}" "${TMP}/z1/out"
 if [ "${rc}" -eq 0 ] && [ "$(wc -l <"${CHECK_OUT}")" -eq "${FIGURES}" ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq $((FIGURES - ARM_FIGURES)) ] &&
-  [ "$(grep -c '^n/a ' "${CHECK_OUT}")" -eq "${ARM_FIGURES}" ] && [ "${ARM_FIGURES}" -eq 19 ] &&
+  [ "$(grep -c '^n/a ' "${CHECK_OUT}")" -eq "${ARM_FIGURES}" ] && [ "${ARM_FIGURES}" -eq 23 ] &&
   grep -qxF 'n/a l1_objects: stage1.arms.l1 is false, not true (stamps.json stage1.l1_objects.l1_objects)' "${CHECK_OUT}" &&
   grep -qxF 'ok leaves_parts_rebuilt = 3 in [1, null] (stamps.json stage1.leaves.parts_rebuilt)' "${CHECK_OUT}" &&
   grep -qxF 'ok unrouted_records_pruned_by_label_index = 0 in [0, 0] (stage1-compare.json passes.unrouted.records_pruned_by_label_index)' "${CHECK_OUT}" &&
@@ -3120,7 +3403,15 @@ fi
 run_check arms "${CI_BANDS}" "${TMP}/za/out"
 if [ "${rc}" -eq 0 ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq "${FIGURES}" ] &&
   grep -qxF 'ok extra_hour_leaf_bytes_ratio = 0.0033333333333333335 in [0, 0.01] (stamps.json stage1.extra_hour.leaf_bytes_ratio)' "${CHECK_OUT}" &&
-  grep -qxF 'ok erasure_dropped_total = 5 in [1, null] (stamps.json stage1.erasure_rewrite.dropped_total)' "${CHECK_OUT}"; then
+  grep -qxF 'ok extra_hour_tail_parts = 1 in [1, null] (stamps.json stage1.extra_hour.tail_parts)' "${CHECK_OUT}" &&
+  grep -qxF 'ok control_statements_slower = 0 in [0, 0] (stage1-control-compare.json statements_slower_count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok erasure_subject_pruned_by_label_index = 24 in [1, null] (stage1-erasure-subject.json other_records_pruned_by_label_index)' "${CHECK_OUT}" &&
+  grep -qxF 'ok erasure_subject_entries_differing = 1 in [1, null] (stage1-erasure-subject.json entries_differing_count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok erasure_pending_status_unexpected = 0 in [0, 0] (stage1-erasure-compare.json other_records_status_unexpected)' "${CHECK_OUT}" &&
+  grep -qxF 'ok erasure_pending_entries_without_hash = 0 in [0, 0] (stage1-erasure-compare.json entries_without_hash_count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok erasure_rewritten_parts = 1 in [1, null] (stamps.json stage1.erasure_leaves.rewritten_parts_count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok erasure_stale_leaves = 0 in [0, 0] (stamps.json stage1.erasure_leaves.stale_leaves_count)' "${CHECK_OUT}" &&
+  ! grep -q 'dropped_total\|fetch_memory' "${CHECK_OUT}"; then
   pass "check arms: exit 0, every figure ok on za's run"
 else
   fail "check arms: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
@@ -3130,8 +3421,22 @@ run_check arm-control "${CI_BANDS}" "${TMP}/zb/out"
 expect_rc "check control" 1
 expect_check_err "check control: more GETs than the control" "out of band control_statements_more_gets = 24 not in [0, 0] (stage1-control-compare.json statements_more_gets_count)"
 expect_check_err "check control: more bytes than the control" "out of band control_statements_more_bytes = 24 not in [0, 0] (stage1-control-compare.json statements_more_bytes_count)"
-expect_check_err "check control: the latency ratio" "out of band control_latency_ratio_median = 12.5 not in [0.5, 2.0] (stage1-control-compare.json latency_ratio_median)"
+expect_check_err "check control: every statement slower" "out of band control_statements_slower = 24 not in [0, 0] (stage1-control-compare.json statements_slower_count)"
 expect_check_err "check control: three failures counted" "stage1-check: 3 of ${FIGURES} figures failed"
+run_check arm-control-spread "${CI_BANDS}" "${TMP}/zb2/out"
+if [ "${rc}" -eq 0 ] &&
+  grep -qxF 'ok control_statements_slower = 0 in [0, 0] (stage1-control-compare.json statements_slower_count)' "${CHECK_OUT}"; then
+  pass "check control spread: zb2's 6% excess inside the spread passes"
+else
+  fail "check control spread: exit ${rc}, stderr $(cat "${CHECK_ERR}")"
+fi
+run_check arm-extra-hour-span "${CI_BANDS}" "${TMP}/zc2/out"
+if [ "${rc}" -eq 0 ] &&
+  grep -qxF 'ok extra_hour_leaf_bytes_ratio = 0.006666666666666667 in [0, 0.01] (stamps.json stage1.extra_hour.leaf_bytes_ratio)' "${CHECK_OUT}"; then
+  pass "check extra hour span: zc2's 200 leaf bytes over the 30000 bytes the tail part covers pass"
+else
+  fail "check extra hour span: exit ${rc}, stderr $(cat "${CHECK_ERR}")"
+fi
 run_check arm-extra-hour "${CI_BANDS}" "${TMP}/zc/out"
 expect_rc "check extra hour" 1
 expect_check_err "check extra hour: the leaf bytes ratio" "out of band extra_hour_leaf_bytes_ratio = 0.3333333333333333 not in [0, 0.01] (stamps.json stage1.extra_hour.leaf_bytes_ratio)"
@@ -3140,14 +3445,19 @@ expect_check_err "check extra hour: two failures counted" "stage1-check: 2 of ${
 run_check arm-l1 "${CI_BANDS}" "${TMP}/zd/out"
 expect_rc "check l1" 1
 expect_check_err "check l1: the differing hash" "out of band l1_entries_differing = 1 not in [0, 0] (stage1-l1-compare.json entries_differing_count)"
-expect_check_err "check l1: the fetch memory exhausted" "out of band l1_fetch_memory_exhausted = 1 not in [0, 0] (stage1-l1-compare.json other_records_fetch_memory_exhausted_count)"
 expect_check_err "check l1: the failed status" "out of band l1_records_status_unexpected = 1 not in [0, 0] (stage1-l1-compare.json other_records_status_unexpected)"
-expect_check_err "check l1: three failures counted" "stage1-check: 3 of ${FIGURES} figures failed"
+expect_check_err "check l1: two failures counted" "stage1-check: 2 of ${FIGURES} figures failed"
 run_check arm-erasure "${CI_BANDS}" "${TMP}/ze/out"
 expect_rc "check erasure" 1
 expect_check_err "check erasure: a pending record the label index pruned" "out of band erasure_pending_pruned_by_label_index = 24 not in [0, 0] (stage1-erasure-compare.json other_records_pruned_by_label_index)"
-expect_check_err "check erasure: the stale leaves" "out of band erasure_stale_leaves = 6 not in [0, 0] (stamps.json stage1.erasure_leaves.stale_leaves_count)"
-expect_check_err "check erasure: two failures counted" "stage1-check: 2 of ${FIGURES} figures failed"
+expect_check_err "check erasure: the stale leaf" "out of band erasure_stale_leaves = 1 not in [0, 0] (stamps.json stage1.erasure_leaves.stale_leaves_count)"
+expect_check_err "check erasure: a reference pass the label index did not prune" "out of band erasure_subject_pruned_by_label_index = 0 not in [1, null] (stage1-erasure-subject.json other_records_pruned_by_label_index)"
+expect_check_err "check erasure: a reference pass answering as the routed one" "out of band erasure_subject_entries_differing = 0 not in [1, null] (stage1-erasure-subject.json entries_differing_count)"
+expect_check_err "check erasure: four failures counted" "stage1-check: 4 of ${FIGURES} figures failed"
+run_check arm-erasure-unchanged "${CI_BANDS}" "${TMP}/zj/out"
+expect_rc "check erasure unchanged" 1
+expect_check_err "check erasure unchanged: no rewritten part" "out of band erasure_rewritten_parts = 0 not in [1, null] (stamps.json stage1.erasure_leaves.rewritten_parts_count)"
+expect_check_err "check erasure unchanged: one failure counted" "stage1-check: 1 of ${FIGURES} figures failed"
 # The arm figures no stub case moves out of band, set out of band in a copy of za's run.
 cp -R "${TMP}/za/out" "${TMP}/check-arms"
 python3 -I - "${TMP}/check-arms" <<'PY'
@@ -3160,13 +3470,14 @@ def edit(name, fn):
     json.dump(doc, open(p, "w"))
 def stamps(doc):
     s = doc["stage1"]
-    s["extra_hour"].update(tail_objects=0, start_mismatches=1, wall_ratio_on_off=11)
+    s["extra_hour"].update(tail_objects=0, start_mismatches=1, wall_ratio_on_off=11, tail_parts=0)
     s["l1_objects"]["l1_objects"] = 0
-    s["erasure_rewrite"]["dropped_total"] = 0
+    s["erasure_leaves"]["rewritten_parts_count"] = 0
 edit("stamps.json", stamps)
 edit("stage1-control-compare.json", lambda c: c.update(statements_unchecked_count=1))
 edit("stage1-l1-compare.json", lambda c: c.update(entries_compared=0))
-edit("stage1-erasure-compare.json", lambda c: c.update(entries_compared=0, entries_differing_count=1))
+edit("stage1-erasure-compare.json", lambda c: c.update(entries_compared=0, entries_differing_count=1,
+                                                       other_records_status_unexpected=1, entries_without_hash_count=1))
 PY
 run_check arms-edited "${CI_BANDS}" "${TMP}/check-arms"
 expect_rc "check arm figures" 1
@@ -3178,8 +3489,11 @@ expect_check_err "check arm figures: no L1 object" "out of band l1_objects = 0 n
 expect_check_err "check arm figures: no l1 entry compared" "out of band l1_entries_compared = 0 not in [1, null] (stage1-l1-compare.json entries_compared)"
 expect_check_err "check arm figures: a pending hash differing" "out of band erasure_pending_entries_differing = 1 not in [0, 0] (stage1-erasure-compare.json entries_differing_count)"
 expect_check_err "check arm figures: no pending entry compared" "out of band erasure_pending_entries_compared = 0 not in [1, null] (stage1-erasure-compare.json entries_compared)"
-expect_check_err "check arm figures: nothing dropped" "out of band erasure_dropped_total = 0 not in [1, null] (stamps.json stage1.erasure_rewrite.dropped_total)"
-expect_check_err "check arm figures: nine failures counted" "stage1-check: 9 of ${FIGURES} figures failed"
+expect_check_err "check arm figures: no tail part" "out of band extra_hour_tail_parts = 0 not in [1, null] (stamps.json stage1.extra_hour.tail_parts)"
+expect_check_err "check arm figures: a pending status other than ok or incorrect" "out of band erasure_pending_status_unexpected = 1 not in [0, 0] (stage1-erasure-compare.json other_records_status_unexpected)"
+expect_check_err "check arm figures: a pending entry without a hash" "out of band erasure_pending_entries_without_hash = 1 not in [0, 0] (stage1-erasure-compare.json entries_without_hash_count)"
+expect_check_err "check arm figures: no rewritten part" "out of band erasure_rewritten_parts = 0 not in [1, null] (stamps.json stage1.erasure_leaves.rewritten_parts_count)"
+expect_check_err "check arm figures: twelve failures counted" "stage1-check: 12 of ${FIGURES} figures failed"
 
 # Out of band: case z2's differing hash.
 run_check oob "${CI_BANDS}" "${TMP}/z2/out"
