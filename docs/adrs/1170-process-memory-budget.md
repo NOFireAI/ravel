@@ -162,8 +162,11 @@ counter, because its two consumers account differently:
   last-release hold amendment below extends to the migrated final and
   single-stage streams' shrink to zero; the migrated aggregate streams are
   charged a factor above what they ask for, and the process counter alone
-  can carry an envelope for their next doubling, off by default, see the
-  reserve-ahead amendment below); the
+  carries an envelope for their next step, on by default since the layout
+  envelope amendment below, see the reserve-ahead amendment below; a
+  capacity-accounted table of 16-byte entries sizes its table term from
+  what its next doubling allocates, see the derived table term amendment
+  below); the
   adapter forwards
   each of those to the
   process counter with the same delta, in the same order, so process-level
@@ -1549,7 +1552,9 @@ builds, so a per-batch grow that lands on a low rung is not its next step
 and does not lower the envelope. A building stream's envelope, at asked size
 `S`, is `2.43 x S` while `S` is under 8 MiB, else
 `min(2.43 x S, max(m_t x J_t, 2.1 x J_v x (1 + w_max / W)))`, with `m_t`
-5.0 for 16-byte entries and 4.9 for 32-byte ones. The table term covers a
+5.0 for 16-byte entries and 4.9 for 32-byte ones (a capacity-accounted
+table of 16-byte entries takes a derived table term instead, see the
+derived table term amendment below). The table term covers a
 rehash with the old table live; the `Vec` term covers every state `Vec`
 reallocating once with the widest still in flight. A stream with an Unknown
 profile, no profile, or no matched step falls back to `5 x J_max`. A layout
@@ -1862,7 +1867,10 @@ sits 16% above the table step `56 x 2^j` and 42% below `112 x 2^j`, and a
 table step `56 x 2^m` sits 13.8% below the `Vec` step `65 x 2^m`, all
 outside the 3% step tolerance, so no grow counts for both and `J_t` and
 `J_v` move apart. The ladder bound reads
-`max(5 x J_t, 2.1 x J_v x 81 / 65)`, a `Vec` factor of 2.6169. The share
+`max(5 x J_t, 2.1 x J_v x 81 / 65)`, a `Vec` factor of 2.6169. Its table
+term is now the derived one (see the derived table term amendment below);
+every figure below is set by the `Vec` term, the share bound or the size
+bound and reads the same under it. The share
 bound's `Vec` term is `(S + 192) x 2 x 81 / 146 = 81/73 x (S + 192)`, about
 `1.1096 x (S + 192)`, and its table term
 `16/7 x 17 x (2S / 97 + 12) + 16`, about `0.8012 x S + 482`, is the smaller
@@ -1917,7 +1925,8 @@ holds while one batch adds fewer than
 (`8,388,608 x 16 / 9,216`, rounded down). The six-step stream of that
 amendment, `14 x 2^19, 56 x 2^19, ..., 14 x 2^21, 56 x 2^21`, asks
 256,901,120 bytes and ends at an envelope of 289,013,976, the share bound,
-under the ladder bound `5 x 117,440,512`.
+under the ladder bound `5 x 117,440,512` (557,056,224 under the derived
+table term amendment below).
 
 `the_q33_layout_with_coinciding_ladders_takes_the_capacity_share_bound` in
 `crates/ravel-sql/src/memory.rs` now runs on q33's layout and asserts its
@@ -1925,3 +1934,132 @@ under the ladder bound `5 x 117,440,512`.
 `a_65_wide_layout_keeps_its_ladders_apart_and_takes_the_smaller_bound` over
 a synthetic layout. `the_aggregate_profile_of_the_six_measured_statements`
 in `crates/ravel-sql/src/executor.rs` pins q33's layout at 16, 56, 16.
+
+## Amendment (2026-11-09, #4014): a derived table term and a distinct-set term
+
+<!-- amendment-applies: sections="1. `MemoryBudget`, a process-wide accountant|Amendment (2026-10-24, #3181): the aggregate envelope is sized from the plan's layout and on by default|Amendment (2026-11-05, #3838): q33's aggregate width is 65|Amendment (2026-11-06, #3845): q33's aggregate width is 56 again" pointer="derived table term amendment" -->
+
+ClickBench statement 9, `SELECT "RegionID", COUNT(DISTINCT "UserID") AS u
+FROM hits GROUP BY "RegionID" ORDER BY u DESC LIMIT 10`, was refused by the
+process budget on a 4 GB host in two of three runs (issue #4014). Issue
+#4014 gives its charged peak as about 1.262 GB and its envelope as
+293,601,280 bytes, `5 x 58,720,256`, against a process remainder of
+1,589,784,025 bytes. That leaves about 34 MB on the issue's figures
+(1,589,784,025 less 1.262 GB less 293,601,280).
+
+The issue took the 293,601,280 for the unknown layout's `5 x J_max`. It is
+not: DataFusion's `SingleDistinctToGroupBy` rewrites the statement into a
+group-only aggregate by `(RegionID, UserID)` under a `COUNT` by `RegionID`,
+and both classify as the layout `(16, 16, 8)`, capacity accounted, as
+`statement_9_plans_as_group_only_aggregates_of_a_known_layout` in
+`crates/ravel-sql/src/memory.rs` asserts. The envelope was the layout
+envelope amendment's table term `5 x J_t`, `J_t` the table step
+`14 x 2^22 = 58,720,256`. With a `COUNT(*)` beside the distinct count the
+rewrite does not apply, and one aggregate keeps an integer
+`COUNT(DISTINCT)` hash set of `(group, value)` pairs; the same test asserts
+that plan's profile is the new `AggregateProfile::DistinctSets` with one
+set, where it was Unknown.
+
+The derived table term. For a capacity-accounted table of 16-byte entries
+(`GroupValuesPrimitive` or `GroupValuesColumn`) the table term is now the
+bytes its next doubling can allocate above the charge, not a multiple of
+`J_t`:
+
+- A hashbrown table of `B` buckets with 16-byte entries allocates
+  `17B + 16` bytes: `16B` of entries, `B` control bytes and a 16-byte tail.
+- `GroupValuesPrimitive` reports its capacity of `7/8 x B` entries and
+  `GroupValuesColumn` that capacity less 12 entries, so the reservation
+  counts at least `14B - 192` bytes and the table holds at most `3B + 208`
+  bytes the stream has not asked for.
+- The grow that doubled the table to `B` buckets asked for `14B - 7B = 7B`,
+  so `B = J_t / 7`; a table-ladder grow that also carried other growth only
+  makes `J_t` larger.
+- The next doubling allocates `34B + 16` bytes while the old block is live.
+- Every other `Vec` such a stream grows is reported by capacity. One input
+  batch is assumed to hold at most `X` bytes outside its reservation: `X`
+  is 64 bytes a row over DataFusion's default `batch_size` of 8,192 rows,
+  524,288 bytes, of which `GroupValuesColumn`'s comparison buffers take 32
+  bytes and a bit a row and the rest is left for the arrays a batch
+  evaluates. `X` is a margin, not a derived bound; the
+  `aggregate_envelope_alloc` test checks it against measured allocation.
+
+Live bytes during the doubling are therefore at most
+`S + 3B + 208 + 34B + 16 + X` against the `f x S` charged, `f` the
+undercount factor 1.25, and the table term is
+`37/7 x J_t + 224 + 524,288 - (f - 1) x S`, at least 0. It takes one
+doubling per input batch, which holds once the table has more entries than
+a batch has rows, and a batch of at most 8,192 rows; a larger `batch_size`
+is outside it. The next step is still the larger of the table term and the
+`Vec` term, capped by the share bound. A table of 32-byte entries and a
+table not reported by capacity keep `m_t x J_t`, and
+`unknown_layout_multiplier`, the size bound and the share bound are
+unchanged.
+
+The distinct-set term. DataFusion's integer `COUNT(DISTINCT)` groups
+accumulator keeps a `HashSet<(usize, T)>` of 16-byte entries, which
+allocates `17B + 16` bytes for `B` buckets and reports 24 bytes for each of
+its `7/8 x B` slots, `21B`. The grow that doubled it to `B` buckets asked
+for at least `10.5B`, and everything else a building stream reports only
+grows, so `B <= J_max / 10.5`. Its next doubling allocates `34B + 16` bytes
+beside the old block, so each set adds `34/10.5 x J_max + 16` to the next
+step. The set term is added outside the share bound, which does not count
+the sets' blocks. The profile is `DistinctSets` only beside a
+capacity-accounted table of 16-byte entries; a set beside any other layout
+is Unknown. Until the stream shows a table or `Vec` step, a `DistinctSets`
+stream keeps the `5 x J_max` fallback with no set term and no share bound,
+the envelope it had as Unknown, so a distinct count whose group table and
+`Vec`s never show a grow of their own on a ladder step gains nothing.
+
+`crates/ravel-sql/tests/aggregate_envelope_alloc.rs` measures each class
+with an instrumented allocator over one partition of 8,192-row batches. Its
+excess is the upper bound on one batch's peak live bytes less the bytes
+charged at that batch's start. These figures are from its run on a 16 vCPU
+amd64 host on 2026-11-09, each printed by that run:
+
+| Class | Profile | Grows from 8 MiB asked | Worst excess / `J_max` | Worst excess / envelope |
+|---|---|---|---|---|
+| (a) group-only, `Int64` keys | `(16, 16, 8)`, accounted | 9 | 3.761 | 0.9987 |
+| (a) group-only, `Utf8View` `RegionID` | `(32, 24, 16)`, not accounted | 10 | 3.021 | 0.6850 |
+| (b) with `COUNT(*)`, `Int64` keys | `DistinctSets`, one set | 6 | 2.434 | 0.7437 |
+
+The test asserts that the excess is at most the envelope on every batch from
+8 MiB asked, over at least 6 grows and a largest grow of at least 32 MiB
+per class. Class (a) with `Int64` keys sits at 0.9987 of its envelope
+because the derived term counts the allocation itself; its smallest margin
+in that run was about 0.16 MiB (118.31 MiB of excess against 118.47 MiB,
+as the run printed them). Under 8 MiB asked the envelope stays `2.43 x S`,
+and a stream's first batch allocates before anything is charged, so the
+test does not check below 8 MiB.
+
+Statement 9's envelope, before and after. For its largest consumer as
+issue #4014 reports it, asked 1,219,764,624 bytes with a largest grow of
+58,720,256, the derived term is
+`37/7 x 58,720,256 + 224 + 524,288 - 0.25 x 1,219,764,624 = 5,961,852`,
+against 293,601,280 before, which frees 287,639,428 bytes, as
+`statement_9s_state_takes_the_derived_table_term` in
+`crates/ravel-sql/src/memory.rs` asserts. On the issue's figures the
+headroom rises from about 34 MB to about 322 MB, the 34 MB plus the
+287,639,428 bytes freed.
+
+In the same file, `a_group_only_stream_takes_the_derived_table_term_at_every_step`
+asserts the envelope of a `(16, 16, 8)` stream grown from 224 bytes at each
+of its 10 steps from 8 MiB, at most the envelope with the `5 x J_t` term at
+each, and 247,988,568 against 293,601,280 at its end.
+`a_distinct_set_adds_its_next_doubling_to_the_layout_terms` asserts
+142,675,165 for a one-set stream that read 214,222,560 as Unknown, and that
+a stream of set doublings alone keeps the Unknown envelope.
+`distinct_sets_merge_with_layouts_beside_a_capacity_accounted_16_byte_table`
+pins how a plan's profiles merge. The derived term also reaches q33's
+layout and the synthetic 65-wide one: q33's six-step stream still ends at
+its share bound 289,013,976, under a derived term of 557,056,224, as
+`the_q33_layout_with_coinciding_ladders_takes_the_capacity_share_bound`
+asserts, and `a_65_wide_layout_keeps_its_ladders_apart_and_takes_the_smaller_bound`
+still asserts every figure of the q33 width amendment.
+
+`statement_9_count_distinct_answers_under_a_budget_the_old_envelope_refused`
+in `crates/ravel-sql/tests/first_groups.rs` runs the statement over
+604,800 log records in one partition under a 73 MiB process budget and
+compares the answer with an unlimited run. Bisecting that budget on
+2026-11-09, on the host above, put the smallest budget that answers at
+71,496,448 bytes with the derived term and at 81,971,968 bytes with the
+`5 x J_max` table term.

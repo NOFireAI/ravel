@@ -73,12 +73,26 @@
 //! (a grow can count for both), and one off both is per-batch growth that
 //! moves neither. Largest, not last: the groups only grow while a stream
 //! builds, so a per-batch grow that lands on a low rung is not its next step.
-//! The next step is then the larger of
-//! `table_multiplier x J_t` (5.0 for 16-byte entries, 4.9 for 32-byte
-//! entries) and `vec_multiplier x J_v x (1 + w_max / W)` (2.1), `w_max` the
-//! widest `Vec`'s per-group bytes. Under [`AggregateProfile::Unknown`], with
-//! no profile, or before the stream has shown a step of either ladder, it is
-//! `unknown_layout_multiplier x J_max` (5.0), `J_max` its largest grow.
+//! The next step is then the larger of a table term and
+//! `vec_multiplier x J_v x (1 + w_max / W)` (2.1), `w_max` the widest
+//! `Vec`'s per-group bytes. The table term of a capacity-accounted table of
+//! 16-byte entries is derived from what its next doubling allocates (issue
+//! #4014): `37/7 x J_t + 224 + 512 KiB - (f - 1) x S`, at least 0, `f` the
+//! undercount factor (see `AggregateReserveAhead::accounted_table_next`).
+//! Any other table's is `table_multiplier x J_t` (5.0 for 16-byte entries,
+//! 4.9 for 32-byte entries). Under [`AggregateProfile::Unknown`], with no
+//! profile, or before the stream has shown a step of either ladder, the next
+//! step is `unknown_layout_multiplier x J_max` (5.0), `J_max` its largest
+//! grow.
+//!
+//! An integer `COUNT(DISTINCT)` that DataFusion does not rewrite into a
+//! group-by keeps a hash set of `(group, value)` pairs per accumulator
+//! ([`AggregateProfile::DistinctSets`]). Once the stream has shown a table or
+//! `Vec` step, each set adds `34 / 10.5 x J_max + 16` to the next step, the
+//! most its next doubling can allocate (see `distinct_sets_next`); before
+//! that its next step is the `unknown_layout_multiplier x J_max` fallback
+//! alone, with no share bound, as when such a statement's layout was
+//! unknown.
 //!
 //! A layout whose group table and `Vec`s are all reported by capacity
 //! ([`AggregateLayout::capacity_accounted`]) also bounds the next step by the
@@ -86,12 +100,13 @@
 //! live groups, so the next table block is at most
 //! `16/7 x (s + 1) x (2S / (W + 2s) + 12) + 16` and the next `Vec` transient
 //! at most `(S + 12s) x 2(W + w_max) / (2W + s)`, `s` the entry size. The
-//! envelope is the smallest of the size bound, the next step and that share
-//! bound. When the two ladders coincide (16-byte entries and a `W` of 56:
-//! `14 x 2^k` and `56 x 2^j`), every grow counts for both and the next step
-//! reads `5 x J_max`; the share bound reads `1.125 x (S + 192)`. q33 is that
-//! case. A `W` of 65 keeps its ladders apart: its next step is
-//! `max(5 x J_t, 2.1 x J_v x 81 / 65)` and its share bound
+//! envelope is the smaller of the size bound and the next step capped by
+//! that share bound, plus the set term, which the share bound does not cap.
+//! When the two ladders coincide (16-byte entries and a `W` of 56:
+//! `14 x 2^k` and `56 x 2^j`), every grow counts for both, `J_t` and `J_v`
+//! both read `J_max`, and the share bound reads `1.125 x (S + 192)`. q33 is
+//! that case. A `W` of 65 keeps its ladders apart: its next step is
+//! `max(table term, 2.1 x J_v x 81 / 65)` and its share bound
 //! `81/73 x (S + 192)`.
 //!
 //! [`AggregateReserveAhead::DEFAULT`] charges the factor and carries the
@@ -446,7 +461,9 @@ pub struct AggregateReserveAhead {
     /// applied on the query, tenant and process ledgers.
     pub undercount_factor: f64,
     /// Multiplier on the largest group-table step of a stream whose table has
-    /// 16-byte entries: its next table step, once it has asked for 8 MiB.
+    /// 16-byte entries and is not capacity accounted: its next table step,
+    /// once it has asked for 8 MiB. A capacity-accounted 16-byte-entry table
+    /// takes a derived term instead (see the module documentation).
     pub table_multiplier_16_byte_entries: f64,
     /// The same for a stream whose table has 32-byte entries.
     pub table_multiplier_32_byte_entries: f64,
@@ -542,32 +559,132 @@ impl AggregateReserveAhead {
         if state.asked < ENVELOPE_STEP_BOUND_FROM {
             return by_size;
         }
-        let next = match profile {
-            Some(AggregateProfile::Layout(layout))
-                if state.table_step > 0 || state.vec_step > 0 =>
-            {
-                let table_multiplier = if layout.entry_size >= 32 {
-                    self.table_multiplier_32_byte_entries
+        let (layout, sets) = match profile {
+            Some(AggregateProfile::Layout(layout)) => (Some(layout), 0),
+            Some(AggregateProfile::DistinctSets { layout, sets }) => (Some(layout), sets),
+            Some(AggregateProfile::Unknown) | None => (None, 0),
+        };
+        let share = layout.and_then(|layout| layout.share_bound(state.asked));
+        let (next, sets, share) = match layout {
+            Some(layout) if state.table_step > 0 || state.vec_step > 0 => {
+                let next_table = if layout.capacity_accounted && layout.entry_size == 16 {
+                    self.accounted_table_next(state)
+                } else if layout.entry_size >= 32 {
+                    scale(state.table_step, self.table_multiplier_32_byte_entries)
                 } else {
-                    self.table_multiplier_16_byte_entries
+                    scale(state.table_step, self.table_multiplier_16_byte_entries)
                 };
-                let next_table = scale(state.table_step, table_multiplier);
                 let next_vec = scale(
                     state.vec_step,
                     self.vec_multiplier * (layout.vec_width_total + layout.vec_width_max) as f64
                         / layout.vec_width_total as f64,
                 );
-                next_table.max(next_vec)
+                (next_table.max(next_vec), sets, share)
             }
-            _ => scale(state.largest_step, self.unknown_layout_multiplier),
+            // Before a classified step a stream with sets keeps the fallback
+            // it had as an unknown layout: no set term and no share bound,
+            // since the share bound does not count the sets' blocks.
+            _ => (
+                scale(state.largest_step, self.unknown_layout_multiplier),
+                0,
+                share.filter(|_| sets == 0),
+            ),
         };
-        let share = match profile {
-            Some(AggregateProfile::Layout(layout)) => layout.share_bound(state.asked),
-            _ => None,
-        };
-        next.min(by_size).min(share.unwrap_or(usize::MAX))
+        next.min(share.unwrap_or(usize::MAX))
+            .saturating_add(distinct_sets_next(state.largest_step, sets))
+            .min(by_size)
+    }
+
+    /// The next group-table transient above its charge of a building stream
+    /// whose layout has a capacity-accounted table of 16-byte entries
+    /// (`GroupValuesPrimitive` or `GroupValuesColumn`), from its last table
+    /// step `J_t`, its asked size `S` and the undercount factor `f`.
+    ///
+    /// A hashbrown table of `B` buckets with 16-byte entries allocates
+    /// `17B + 16` bytes: `16B` of entries, `B` control bytes and a 16-byte
+    /// control tail ([`TABLE_CONTROL_TAIL_BYTES`]). Its reservation counts it
+    /// as at least `16 x (7/8 x B - 12) = 14B - 192`: `GroupValuesPrimitive`
+    /// reports its capacity of `7/8 x B` entries, `GroupValuesColumn`'s
+    /// `insert_accounted` that capacity less [`TABLE_UNACCOUNTED_ENTRIES`].
+    /// So the table holds at most `3B + 208` bytes the stream has not asked
+    /// for, and the grow that doubled it to `B` buckets asked for
+    /// `14B - 7B = 7B`, so `B = J_t / 7`. Its next doubling allocates `2B`
+    /// buckets, `34B + 16` bytes, while the old block is still live. Every
+    /// other `Vec` it grows is reported by capacity, and one input batch is
+    /// assumed to hold at most [`BATCH_SCRATCH_BYTES`] outside the
+    /// reservation, a margin the `aggregate_envelope_alloc` test checks. Live
+    /// bytes during the doubling are therefore at most
+    /// `S + 3B + 208 + 34B + 16 + X`, against the `f x S` charged:
+    ///
+    /// `next_table = 37/7 x J_t + 224 + X - (f - 1) x S`, at least 0.
+    ///
+    /// A grow on the table ladder that also carried other growth is a larger
+    /// `J_t` than `7B`, which only raises the bound. The bound takes one
+    /// doubling per input batch, true once the table holds more entries than
+    /// a batch has rows ([`BATCH_ROWS`]).
+    fn accounted_table_next(&self, state: &AggregateState) -> usize {
+        let blocks = ACCOUNTED_TABLE_NEXT_PER_STEP * state.table_step as f64
+            + ACCOUNTED_TABLE_NEXT_CONSTANT_BYTES
+            + BATCH_SCRATCH_BYTES as f64
+            - (self.undercount_factor - 1.0) * state.asked as f64;
+        // A float-to-integer `as` saturates, and a negative value reads 0.
+        blocks.ceil() as usize
     }
 }
+
+/// Bytes the next doubling of a capacity-accounted 16-byte-entry table and its
+/// uncounted bytes reach per byte of its last table step:
+/// `(34B + 3B) / 7B`. See [`AggregateReserveAhead::accounted_table_next`].
+const ACCOUNTED_TABLE_NEXT_PER_STEP: f64 = 37.0 / 7.0;
+
+/// The constant part of the same: the new block's control tail, plus the
+/// table's own tail and its [`TABLE_UNACCOUNTED_ENTRIES`] uncounted entries,
+/// `16 + 16 + 12 x 16 = 224`.
+const ACCOUNTED_TABLE_NEXT_CONSTANT_BYTES: f64 =
+    2.0 * TABLE_CONTROL_TAIL_BYTES + TABLE_UNACCOUNTED_ENTRIES * 16.0;
+
+/// The rows of one input batch the bound assumes: DataFusion's default
+/// `batch_size`, which the logs, metrics, spans, audit and alerts scans also
+/// use as their batch limit. A larger input batch is outside the bound.
+const BATCH_ROWS: usize = 8192;
+
+/// The bytes the bound allows one input batch to hold in an aggregate stream
+/// outside its reservation: 64 a row. This is an assumed margin, not a derived
+/// bound. `GroupValuesColumn`'s comparison buffers take 32 bytes and a bit a
+/// row (four `usize` index `Vec`s and a bit mask, outside its `size()`); the
+/// rest is left for the arrays a batch evaluates. The
+/// `aggregate_envelope_alloc` test checks the envelope built on it against
+/// what the streams allocate.
+const BATCH_SCRATCH_BYTES: usize = 64 * BATCH_ROWS;
+
+/// The next transient of `sets` `COUNT(DISTINCT)` hash sets above their
+/// charge, from the stream's largest grow `J_max`.
+///
+/// DataFusion's integer `COUNT(DISTINCT)` groups accumulator keeps a
+/// `HashSet<(usize, T)>` of 16-byte entries, which allocates `17B + 16` bytes
+/// for `B` buckets and reports `24` bytes for each of its `7/8 x B` slots,
+/// `21B`, so from 8 buckets on it holds no more than it reports. The grow
+/// that doubled it to
+/// `B` buckets asked for at least `21B - 21B/2 = 10.5B`, and everything else
+/// a stream reports only grows while it builds, so `B <= J_max / 10.5`. Its
+/// next doubling allocates `34B + 16` bytes beside the old block:
+///
+/// `next_sets = sets x (34 / 10.5 x J_max + 16)`.
+///
+/// This is added to the table and `Vec` term rather than compared with it,
+/// so a set doubling in the same batch as the group table is covered.
+fn distinct_sets_next(largest_step: usize, sets: usize) -> usize {
+    if sets == 0 {
+        return 0;
+    }
+    let per_set = DISTINCT_SET_NEXT_PER_STEP * largest_step as f64 + TABLE_CONTROL_TAIL_BYTES;
+    // A float-to-integer `as` saturates.
+    (per_set.ceil() as usize).saturating_mul(sets)
+}
+
+/// The next block of a `COUNT(DISTINCT)` set per byte of the grow that last
+/// doubled it: `34B / 10.5B`. See [`distinct_sets_next`].
+const DISTINCT_SET_NEXT_PER_STEP: f64 = 34.0 / 10.5;
 
 impl Default for AggregateReserveAhead {
     fn default() -> Self {
@@ -594,6 +711,17 @@ pub enum AggregateProfile {
     /// Every grouped aggregate's group values and accumulators were
     /// classified; the layout the envelope is sized from.
     Layout(AggregateLayout),
+    /// As [`Self::Layout`], and some grouped aggregate also runs up to `sets`
+    /// integer `COUNT(DISTINCT)` accumulators, each a hash set of its
+    /// `(group, value)` pairs that grows beside the group table. `layout`
+    /// holds each one's `i64` count `Vec`; the sets add their own term to the
+    /// envelope.
+    DistinctSets {
+        /// The layout the table and `Vec` terms are sized from.
+        layout: AggregateLayout,
+        /// The most `COUNT(DISTINCT)` sets any one grouped aggregate keeps.
+        sets: usize,
+    },
     /// Some grouped aggregate's layout is not one this module knows how the
     /// streams grow; its envelope falls back to
     /// [`AggregateReserveAhead::unknown_layout_multiplier`].
@@ -730,7 +858,11 @@ impl PhysicalOptimizerRule for AggregateProfileRule {
 /// unclassified, and `None` when it has none. Of several known layouts the
 /// one whose widest `Vec` is the largest share of its total wins, since its
 /// next `Vec` step is the largest multiple of the last one; a tie keeps the
-/// earlier node.
+/// earlier node. When any node keeps `COUNT(DISTINCT)` sets the profile is
+/// [`AggregateProfile::DistinctSets`] with the most sets of any node, unless
+/// the winning layout is not a capacity-accounted table of 16-byte entries,
+/// the only table the set term is derived beside, when it is
+/// [`AggregateProfile::Unknown`].
 pub fn plan_aggregate_profile(plan: &Arc<dyn ExecutionPlan>) -> Option<AggregateProfile> {
     let mut profile = None;
     collect_aggregate_profile(plan, &mut profile);
@@ -744,25 +876,10 @@ fn collect_aggregate_profile(
     if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
         && !aggregate.group_expr().expr().is_empty()
     {
-        let next = match aggregate_layout(aggregate) {
-            Some(layout) => AggregateProfile::Layout(layout),
-            None => AggregateProfile::Unknown,
-        };
-        *profile = Some(match (*profile, next) {
-            (None, next) => next,
-            (Some(AggregateProfile::Unknown), _) | (_, AggregateProfile::Unknown) => {
-                AggregateProfile::Unknown
-            }
-            (Some(AggregateProfile::Layout(held)), AggregateProfile::Layout(layout)) => {
-                // w_max / W compared by cross-multiplication.
-                if layout.vec_width_max * held.vec_width_total
-                    > held.vec_width_max * layout.vec_width_total
-                {
-                    AggregateProfile::Layout(layout)
-                } else {
-                    AggregateProfile::Layout(held)
-                }
-            }
+        let next = aggregate_profile(aggregate);
+        *profile = Some(match *profile {
+            None => next,
+            Some(held) => merge_aggregate_profiles(held, next),
         });
     }
     for child in plan.children() {
@@ -770,10 +887,93 @@ fn collect_aggregate_profile(
     }
 }
 
-/// The layout of one grouped `AggregateExec`, following DataFusion 55.2's
-/// `new_group_values` and the accumulators Ravel's session runs. `None` for
-/// anything this does not classify.
-fn aggregate_layout(aggregate: &AggregateExec) -> Option<AggregateLayout> {
+/// The profile of a plan holding nodes of profiles `held` (met first) and
+/// `next`. See [`plan_aggregate_profile`].
+fn merge_aggregate_profiles(held: AggregateProfile, next: AggregateProfile) -> AggregateProfile {
+    let parts = |profile| match profile {
+        AggregateProfile::Layout(layout) => Some((layout, 0)),
+        AggregateProfile::DistinctSets { layout, sets } => Some((layout, sets)),
+        AggregateProfile::Unknown => None,
+    };
+    let (Some((held, held_sets)), Some((layout, sets))) = (parts(held), parts(next)) else {
+        return AggregateProfile::Unknown;
+    };
+    // w_max / W compared by cross-multiplication.
+    let layout = if layout.vec_width_max * held.vec_width_total
+        > held.vec_width_max * layout.vec_width_total
+    {
+        layout
+    } else {
+        held
+    };
+    distinct_sets_profile(layout, held_sets.max(sets))
+}
+
+/// [`AggregateProfile::Layout`] with no sets, else
+/// [`AggregateProfile::DistinctSets`] beside a capacity-accounted table of
+/// 16-byte entries, else [`AggregateProfile::Unknown`].
+fn distinct_sets_profile(layout: AggregateLayout, sets: usize) -> AggregateProfile {
+    if sets == 0 {
+        AggregateProfile::Layout(layout)
+    } else if layout.capacity_accounted && layout.entry_size == 16 {
+        AggregateProfile::DistinctSets { layout, sets }
+    } else {
+        AggregateProfile::Unknown
+    }
+}
+
+/// The profile of one grouped `AggregateExec`: its [`aggregate_group_layout`], with
+/// every integer `COUNT(DISTINCT)` it runs counted as one set beside its
+/// `i64` count `Vec` ([`distinct_count_set`]). Unknown when any part is
+/// unclassified.
+fn aggregate_profile(aggregate: &AggregateExec) -> AggregateProfile {
+    let Some((mut layout, mut widths)) = aggregate_group_layout(aggregate) else {
+        return AggregateProfile::Unknown;
+    };
+    let mut sets = 0usize;
+    for expr in aggregate.aggr_expr() {
+        if distinct_count_set(expr) {
+            sets += 1;
+            widths.push(DISTINCT_COUNT_GROUP_WIDTH);
+        } else if let Some(more) = accumulator_widths(expr) {
+            widths.extend(more);
+        } else {
+            return AggregateProfile::Unknown;
+        }
+    }
+    match vec_widths(&widths) {
+        Some((vec_width_total, vec_width_max)) => {
+            layout.vec_width_total = vec_width_total;
+            layout.vec_width_max = vec_width_max;
+            distinct_sets_profile(layout, sets)
+        }
+        None => AggregateProfile::Unknown,
+    }
+}
+
+/// The per-group width of a `COUNT(DISTINCT)` accumulator's count `Vec`.
+const DISTINCT_COUNT_GROUP_WIDTH: usize = 8;
+
+/// Whether `expr` is a `COUNT(DISTINCT x)` DataFusion 55.2 runs as its groups
+/// accumulator over a primitive integer `x`
+/// (`PrimitiveDistinctCountGroupsAccumulator`, 8- to 64-bit integers only):
+/// one `HashSet<(usize, T)>` of 16-byte entries, and an `i64` count per group.
+fn distinct_count_set(expr: &AggregateFunctionExpr) -> bool {
+    expr.is_distinct() && expr.fun().name() == "count" && expr.groups_accumulator_supported()
+}
+
+/// The sum and the largest of `widths`, `None` when the sum is 0.
+fn vec_widths(widths: &[usize]) -> Option<(usize, usize)> {
+    let total = widths.iter().sum::<usize>();
+    let max = widths.iter().copied().max()?;
+    (total > 0).then_some((total, max))
+}
+
+/// The group table of one grouped `AggregateExec` and the per-group widths of
+/// its group values' own `Vec`s, following DataFusion 55.2's
+/// `new_group_values`; `None` for keys this does not classify. The returned
+/// layout's `Vec` widths are 0 until the caller adds the accumulators'.
+fn aggregate_group_layout(aggregate: &AggregateExec) -> Option<(AggregateLayout, Vec<usize>)> {
     let group_by = aggregate.group_expr();
     if !group_by.is_single() {
         return None;
@@ -787,7 +987,7 @@ fn aggregate_layout(aggregate: &AggregateExec) -> Option<AggregateLayout> {
         .iter()
         .map(|field| field.data_type())
         .collect();
-    let (entry_size, capacity_accounted, mut widths) = match key_types.as_slice() {
+    let (entry_size, capacity_accounted, widths) = match key_types.as_slice() {
         // `GroupValuesPrimitive`: a `(usize, u64)` map and one values `Vec`,
         // both sized by capacity.
         [key] if key.primitive_width().is_some() => (16, true, vec![key.primitive_width()?]),
@@ -810,17 +1010,13 @@ fn aggregate_layout(aggregate: &AggregateExec) -> Option<AggregateLayout> {
                 .collect::<Option<Vec<usize>>>()?,
         ),
     };
-    for expr in aggregate.aggr_expr() {
-        widths.extend(accumulator_widths(expr)?);
-    }
-    let vec_width_total = widths.iter().sum::<usize>();
-    let vec_width_max = widths.iter().copied().max()?;
-    (vec_width_total > 0).then_some(AggregateLayout {
+    let layout = AggregateLayout {
         entry_size,
-        vec_width_total,
-        vec_width_max,
+        vec_width_total: 0,
+        vec_width_max: 0,
         capacity_accounted,
-    })
+    };
+    Some((layout, widths))
 }
 
 /// The per-group widths of the `Vec`s `expr`'s groups accumulator grows. Every
@@ -1139,7 +1335,10 @@ impl AggregateState {
             largest_step: self.largest_step.max(additional),
             ..self
         };
-        if let Some(AggregateProfile::Layout(layout)) = profile {
+        if let Some(
+            AggregateProfile::Layout(layout) | AggregateProfile::DistinctSets { layout, .. },
+        ) = profile
+        {
             if matches_ladder(additional, layout.table_step(0), |k| layout.table_step(k)) {
                 next.table_step = next.table_step.max(additional);
             }
@@ -3353,6 +3552,34 @@ pub(crate) mod tests {
         (state.table_step, state.vec_step)
     }
 
+    /// The table term of a capacity-accounted table of 16-byte entries under
+    /// the default factor 1.25, worked here from its formula:
+    /// `37/7 x J_t + 224 + 512 KiB - 0.25 x S`, at least 0.
+    fn derived_table_term(j_t: usize, asked: usize) -> usize {
+        let bytes = 37.0 / 7.0 * j_t as f64 + 224.0 + 524_288.0 - 0.25 * asked as f64;
+        bytes.max(0.0).ceil() as usize
+    }
+
+    /// Statement 9's layout (#4014): DataFusion rewrites its
+    /// `COUNT(DISTINCT "UserID")` into a group-by of `(RegionID, UserID)`, a
+    /// `GroupValuesColumn` of two `i64` columns, with no accumulator.
+    const STATEMENT_9_LAYOUT: AggregateLayout = AggregateLayout {
+        entry_size: 16,
+        vec_width_total: 16,
+        vec_width_max: 8,
+        capacity_accounted: true,
+    };
+
+    /// The same statement with a `COUNT(*)` beside the `COUNT(DISTINCT)`,
+    /// which DataFusion does not rewrite: one `i64` key, the set's `i64` count
+    /// and the `COUNT(*)`'s.
+    const DISTINCT_SET_LAYOUT: AggregateLayout = AggregateLayout {
+        entry_size: 16,
+        vec_width_total: 24,
+        vec_width_max: 8,
+        capacity_accounted: true,
+    };
+
     /// FLIP: the starting branch's `min(2.43 x S, 5 x J_max)` reads
     /// 545,259,520 at the end; sizing the `Vec` family as one `Vec`
     /// (`1 + w_max / W` = 2) reads 458,017,997.
@@ -3481,8 +3708,8 @@ pub(crate) mod tests {
 
     /// q33 ([`Q33_ACCOUNTED_LAYOUT`], `W` 56): its table ladder `14 x 2^k`
     /// and `Vec` ladder `56 x 2^j` are one set, so every step is both chains'
-    /// step and the ladder bound is `5 x J_max`. The capacity share of the
-    /// asked size bounds it instead. One batch keeps the share bound's `Vec`
+    /// step and the ladder bound reads both terms from `J_max`. The capacity
+    /// share of the asked size bounds it instead. One batch keeps the share bound's `Vec`
     /// term while it adds under `S x 16 / (128 x 72) = S / 576` groups,
     /// 14,563 at 8 MiB.
     /// FLIP: the PR head's `min(2.43 x S, ladder)` reads 587,202,560 at the
@@ -3529,9 +3756,10 @@ pub(crate) mod tests {
             last <= (1.125 * (asked + 12 * 16) as f64).ceil() as u64,
             "the capacity share bound: {last}"
         );
+        assert_eq!(derived_table_term(117_440_512, asked), 557_056_224);
         assert!(
-            last < 5 * 117_440_512,
-            "under the ladder bound 5 x J_max: {last}"
+            last < 557_056_224,
+            "under the ladder bound, the derived table term: {last}"
         );
         let vec_bytes: u64 = 29_360_128 + 58_720_256 + 117_440_512;
         assert!(
@@ -3544,7 +3772,7 @@ pub(crate) mod tests {
 
     /// A `W` of 65 ([`W65_ACCOUNTED_LAYOUT`]) is no `14 x 2^m`: its `Vec` steps `65 x 2^j` sit 16%
     /// off the nearest table steps `14 x 2^k`, so no grow counts for both, and
-    /// its next step is `max(5 x J_t, 2.1 x J_v x 81 / 65)`. Its share bound
+    /// its next step is `max(table term, 2.1 x J_v x 81 / 65)`. Its share bound
     /// is `(S + 192) x 2 x 81 / 146 = 81/73 x (S + 192)`, under the 56-wide
     /// `1.125 x (S + 192)`. Neither bound always binds: a stream whose first
     /// step is the table step at 8 MiB takes the share bound, and one grown
@@ -3638,7 +3866,7 @@ pub(crate) mod tests {
             if asked < ENVELOPE_STEP_BOUND_FROM {
                 continue;
             }
-            let ladder = scale(j_t, 5.0).max(scale(j_v, vec_factor));
+            let ladder = derived_table_term(j_t, asked).max(scale(j_v, vec_factor));
             let share = layout.share_bound(asked).expect("capacity accounted");
             assert!(ladder < share, "step {index}: {ladder} against {share}");
             assert_eq!(envelopes[index], ladder as u64, "step {index}");
@@ -3650,6 +3878,224 @@ pub(crate) mod tests {
         assert_eq!(layout.share_bound(asked), Some(367_661_158));
         drop(res);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Statement 9's largest consumer on a 4 GB host (#4014): asked
+    /// 1,219,764,624 bytes, largest grow 58,720,256 (`14 x 2^22`, a table
+    /// step of [`STATEMENT_9_LAYOUT`] and no `Vec` step), here as twenty such
+    /// grows and one of 45,359,504 on neither ladder. Its envelope was
+    /// `5 x J_t`, 293,601,280. The derived table term is
+    /// `37/7 x 58,720,256 + 224 + 524,288 - 0.25 x 1,219,764,624`, that is
+    /// 310,903,008 - 304,941,156 = 5,961,852, which frees 287,639,428 bytes of
+    /// the process budget. The same grows under an unknown layout keep
+    /// `5 x J_max`.
+    /// FLIP: routing the table term back to `unknown_layout_multiplier x J_max`
+    /// reads 293,601,280.
+    #[test]
+    fn statement_9s_state_takes_the_derived_table_term() {
+        let _serial = envelope_tests();
+        let mut steps = vec![58_720_256; 20];
+        steps.push(45_359_504);
+        let asked: usize = steps.iter().sum();
+        assert_eq!(asked, 1_219_764_624);
+        let last = |profile: AggregateProfile| {
+            let budget = Arc::new(MemoryBudget::new(1 << 40));
+            let (_tenant, pool) = ahead_pool(
+                &budget,
+                1,
+                AggregateReserveAhead::DEFAULT,
+                QueryAccounting::new(),
+            );
+            pool.set_aggregate_profile(profile);
+            let res = register_on(&pool, PARTIAL);
+            let envelopes = envelopes_after(&budget, &pool, &res, &steps);
+            let chains = chain_steps(&pool, &res);
+            drop(res);
+            assert_eq!(budget.reserved(), 0);
+            (envelopes[20], chains)
+        };
+
+        let (envelope, chains) = last(AggregateProfile::Layout(STATEMENT_9_LAYOUT));
+        assert_eq!(chains, (58_720_256, 0));
+        assert_eq!(derived_table_term(58_720_256, asked), 5_961_852);
+        assert_eq!(envelope, 5_961_852);
+        assert!(STATEMENT_9_LAYOUT.share_bound(asked) > Some(293_601_280));
+
+        let (unknown, chains) = last(AggregateProfile::Unknown);
+        assert_eq!(chains, (0, 0));
+        assert_eq!(unknown, 5 * 58_720_256);
+        assert_eq!(unknown, 293_601_280);
+        assert_eq!(unknown - envelope, 287_639_428, "headroom freed");
+    }
+
+    /// A group-only stream of [`STATEMENT_9_LAYOUT`] grown as one builds: the
+    /// table step `14 x 2^k`, then the `Vec` step `16 x 2^k`, for k = 4 to
+    /// 22. From 8 MiB its envelope is the larger of the derived table term
+    /// and `2.1 x J_v x 24 / 16`, under the share bound, and at most the
+    /// `max(5 x J_t, 2.1 x J_v x 24 / 16)` it replaces. At the end `S` is
+    /// 251,657,760, `J_t` 58,720,256 and `J_v` 67,108,864: the table term
+    /// 247,988,568 against 293,601,280, 45,612,712 bytes freed.
+    /// FLIP: routing the table term back to `unknown_layout_multiplier x J_max`
+    /// reads 335,544,320 at the end.
+    #[test]
+    fn a_group_only_stream_takes_the_derived_table_term_at_every_step() {
+        let _serial = envelope_tests();
+        let layout = STATEMENT_9_LAYOUT;
+        let vec_factor: f64 = 2.1 * 24.0 / 16.0;
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        pool.set_aggregate_profile(AggregateProfile::Layout(layout));
+        let res = register_on(&pool, PARTIAL);
+        let steps: Vec<usize> = (4..=22).flat_map(|k| [14 << k, 16 << k]).collect();
+        let envelopes = envelopes_after(&budget, &pool, &res, &steps);
+        assert_eq!(chain_steps(&pool, &res), (58_720_256, 67_108_864));
+        let (mut asked, mut j_t, mut j_v, mut checked) = (0, 0, 0, 0);
+        for (index, step) in steps.iter().enumerate() {
+            asked += step;
+            if index % 2 == 0 {
+                j_t = *step;
+            } else {
+                j_v = *step;
+            }
+            if asked < ENVELOPE_STEP_BOUND_FROM {
+                continue;
+            }
+            let share = layout.share_bound(asked).expect("capacity accounted");
+            let next = derived_table_term(j_t, asked).max(scale(j_v, vec_factor));
+            assert_eq!(envelopes[index], next.min(share) as u64, "step {index}");
+            let replaced = scale(j_t, 5.0).max(scale(j_v, vec_factor)).min(share);
+            assert!(
+                envelopes[index] <= replaced as u64,
+                "step {index}: {} against {replaced}",
+                envelopes[index]
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 10, "steps 28 to 37 are at or over 8 MiB");
+        assert_eq!(asked, 251_657_760);
+        assert_eq!(envelopes[37], 247_988_568);
+        assert_eq!(derived_table_term(58_720_256, asked), 247_988_568);
+        assert_eq!(scale(67_108_864, vec_factor), 211_392_922);
+        assert_eq!(293_601_280 - envelopes[37], 45_612_712, "headroom freed");
+        drop(res);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The `COUNT(*)` variant ([`DISTINCT_SET_LAYOUT`], one set): table and
+    /// `Vec` steps `14 x 2^k` and `24 x 2^k` for k = 4 to 10, then the set's
+    /// doublings `10.5 x 2^k` for k = 4 to 22, on neither ladder. At the end
+    /// `S` is 88,157,432 and `J_max` 44,040,192. The table term is 0, since
+    /// `0.25 x S` is more than `37/7 x 14,336 + 524,512`, and the `Vec` term
+    /// is `2.1 x 24,576 x 32 / 24` = 68,813. The set term is
+    /// `34/10.5 x 44,040,192 + 16` = 142,606,352, so the envelope is
+    /// 142,675,165, against the 214,222,560 (`2.43 x S`, under
+    /// `5 x J_max`) it had as an unknown layout. A stream that has shown only
+    /// set doublings keeps that fallback, with no share bound: 214,034,925
+    /// (`2.43 x S`) where the share bound of [`DISTINCT_SET_LAYOUT`] would
+    /// read 122,234,252.
+    /// FLIP: dropping the set term reads 68,813 at the end.
+    #[test]
+    fn a_distinct_set_adds_its_next_doubling_to_the_layout_terms() {
+        let _serial = envelope_tests();
+        let profile = AggregateProfile::DistinctSets {
+            layout: DISTINCT_SET_LAYOUT,
+            sets: 1,
+        };
+        let set_steps = (4..=22).map(|k| 21usize << (k - 1));
+        let run = |profile: AggregateProfile, steps: &[usize]| {
+            let budget = Arc::new(MemoryBudget::new(1 << 40));
+            let (_tenant, pool) = ahead_pool(
+                &budget,
+                1,
+                AggregateReserveAhead::DEFAULT,
+                QueryAccounting::new(),
+            );
+            pool.set_aggregate_profile(profile);
+            let res = register_on(&pool, PARTIAL);
+            let envelopes = envelopes_after(&budget, &pool, &res, steps);
+            let chains = chain_steps(&pool, &res);
+            drop(res);
+            assert_eq!(budget.reserved(), 0);
+            (envelopes[steps.len() - 1], chains)
+        };
+
+        let steps: Vec<usize> = (4..=10)
+            .flat_map(|k| [14 << k, 24 << k])
+            .chain(set_steps.clone())
+            .collect();
+        let asked: usize = steps.iter().sum();
+        assert_eq!(asked, 88_157_432);
+        let (envelope, chains) = run(profile, &steps);
+        assert_eq!(chains, (14_336, 24_576));
+        assert_eq!(derived_table_term(14_336, asked), 0);
+        assert_eq!(scale(24_576, 2.1 * 32.0 / 24.0), 68_813);
+        assert_eq!(distinct_sets_next(44_040_192, 1), 142_606_352);
+        assert_eq!(envelope, 68_813 + 142_606_352);
+        assert_eq!(envelope, 142_675_165);
+
+        let (unknown, _) = run(AggregateProfile::Unknown, &steps);
+        assert_eq!(unknown, scale(asked, 2.43) as u64);
+        assert_eq!(unknown, 214_222_560);
+        assert!(unknown < 5 * 44_040_192);
+        assert_eq!(unknown - envelope, 71_547_395, "headroom freed");
+
+        let steps: Vec<usize> = set_steps.collect();
+        let asked: usize = steps.iter().sum();
+        let (envelope, chains) = run(profile, &steps);
+        assert_eq!(chains, (0, 0));
+        assert_eq!(envelope, run(AggregateProfile::Unknown, &steps).0);
+        assert_eq!(envelope, 214_034_925);
+        assert_eq!(DISTINCT_SET_LAYOUT.share_bound(asked), Some(122_234_252));
+    }
+
+    /// A plan's profile keeps the most sets of any node beside the layout
+    /// whose widest `Vec` is the largest share of its total, and is unknown
+    /// when that layout is not a capacity-accounted table of 16-byte entries
+    /// or any node is unknown.
+    #[test]
+    fn distinct_sets_merge_with_layouts_beside_a_capacity_accounted_16_byte_table() {
+        let view = AggregateLayout {
+            entry_size: 32,
+            vec_width_total: 24,
+            vec_width_max: 16,
+            capacity_accounted: false,
+        };
+        let sets = |sets| AggregateProfile::DistinctSets {
+            layout: DISTINCT_SET_LAYOUT,
+            sets,
+        };
+        assert_eq!(
+            merge_aggregate_profiles(AggregateProfile::Layout(STATEMENT_9_LAYOUT), sets(1)),
+            AggregateProfile::DistinctSets {
+                layout: STATEMENT_9_LAYOUT,
+                sets: 1
+            }
+        );
+        assert_eq!(merge_aggregate_profiles(sets(1), sets(2)), sets(2));
+        assert_eq!(merge_aggregate_profiles(sets(2), sets(1)), sets(2));
+        assert_eq!(
+            merge_aggregate_profiles(sets(1), AggregateProfile::Layout(view)),
+            AggregateProfile::Unknown
+        );
+        assert_eq!(
+            merge_aggregate_profiles(AggregateProfile::Unknown, sets(1)),
+            AggregateProfile::Unknown
+        );
+        assert_eq!(
+            merge_aggregate_profiles(sets(1), AggregateProfile::Unknown),
+            AggregateProfile::Unknown
+        );
+        assert_eq!(
+            distinct_sets_profile(view, 0),
+            AggregateProfile::Layout(view)
+        );
+        assert_eq!(distinct_sets_profile(view, 1), AggregateProfile::Unknown);
+        assert_eq!(distinct_sets_profile(DISTINCT_SET_LAYOUT, 1), sets(1));
     }
 
     /// A single view key map reports its views by length, so the share of
@@ -5379,5 +5825,158 @@ pub(crate) mod tests {
         assert_eq!(spill_mode_headroom(640 << 20), 64 << 20);
         assert_eq!(spill_mode_headroom(1000 << 20), 100 << 20);
         assert_eq!(spill_mode_headroom(usize::MAX), usize::MAX / 10);
+    }
+
+    /// Every grouped `AggregateExec` of `statement` over an 8-partition
+    /// `hits` table of `Int64` columns, top down, as (mode, group by,
+    /// aggregates, layout), and the plan's profile.
+    async fn statement_aggregates(
+        statement: &str,
+    ) -> (
+        Vec<(String, Vec<String>, Vec<String>, AggregateProfile)>,
+        Option<AggregateProfile>,
+    ) {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+
+        use crate::session::{SessionTable, SpillDecision, build_session};
+
+        let config = crate::SqlConfig::default();
+        let (pool, _) =
+            config.query_pool(TenantMemoryAccountant::new(1 << 30), QueryAccounting::new());
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let logs = crate::LogsTableProvider::new(
+            ravel_catalog::Snapshot {
+                segments: Vec::new(),
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            },
+            ravel_types::TenantHash([0u8; 16]),
+            ravel_query::LogSegmentFetcher::new(store),
+            ravel_query::PhaseAccounting::new(),
+        );
+        let ctx = build_session(
+            &config,
+            pool,
+            SessionTable::Logs(Arc::new(logs)),
+            false,
+            SpillDecision::Disabled,
+            &crate::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
+        )
+        .expect("session builds");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, false),
+            Field::new("UserID", DataType::Int64, false),
+            Field::new("CounterID", DataType::Int64, false),
+        ]));
+        let partitions = (0..8i64)
+            .map(|partition| {
+                let column = |offset: i64| {
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..64).map(move |row| partition * 64 + row + offset),
+                    )) as datafusion::arrow::array::ArrayRef
+                };
+                vec![
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![column(0), column(1), column(2)],
+                    )
+                    .expect("batch"),
+                ]
+            })
+            .collect();
+        ctx.register_table(
+            "hits",
+            Arc::new(MemTable::try_new(schema, partitions).expect("table")),
+        )
+        .expect("table registers");
+        let plan = ctx
+            .sql(statement)
+            .await
+            .expect("plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+
+        fn walk(
+            plan: &Arc<dyn ExecutionPlan>,
+            out: &mut Vec<(String, Vec<String>, Vec<String>, AggregateProfile)>,
+        ) {
+            if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+                && !aggregate.group_expr().expr().is_empty()
+            {
+                out.push((
+                    format!("{:?}", aggregate.mode()),
+                    aggregate
+                        .group_expr()
+                        .expr()
+                        .iter()
+                        .map(|(_, name)| name.clone())
+                        .collect(),
+                    aggregate
+                        .aggr_expr()
+                        .iter()
+                        .map(|expr| expr.name().to_string())
+                        .collect(),
+                    aggregate_profile(aggregate),
+                ));
+            }
+            for child in plan.children() {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&plan, &mut out);
+        (out, plan_aggregate_profile(&plan))
+    }
+
+    /// Statement 9 alone runs as two group-only aggregates (DataFusion's
+    /// single-distinct rewrite groups by the distinct column too), each a
+    /// capacity-accounted table of 16-byte entries, so it takes the derived
+    /// table term rather than the unknown layout's multiplier. With a
+    /// `COUNT(*)` beside it the rewrite does not apply and the distinct
+    /// count keeps one set per group.
+    #[tokio::test]
+    async fn statement_9_plans_as_group_only_aggregates_of_a_known_layout() {
+        let group_only = AggregateProfile::Layout(STATEMENT_9_LAYOUT);
+        let (aggregates, profile) = statement_aggregates(
+            r#"SELECT "RegionID", COUNT(DISTINCT "UserID") AS u FROM hits GROUP BY "RegionID" ORDER BY u DESC LIMIT 10"#,
+        )
+        .await;
+        assert_eq!(profile, Some(group_only));
+        let inner: Vec<_> = aggregates
+            .iter()
+            .filter(|(_, group_by, _, _)| group_by.len() == 2)
+            .collect();
+        assert_eq!(inner.len(), 2, "{aggregates:?}");
+        for (_, group_by, aggregate, layout) in &inner {
+            assert_eq!(group_by[0], "RegionID");
+            assert!(aggregate.is_empty(), "{aggregates:?}");
+            assert_eq!(*layout, group_only);
+        }
+        assert!(
+            aggregates
+                .iter()
+                .all(|(_, _, _, layout)| *layout == group_only)
+        );
+
+        let with_count = AggregateProfile::DistinctSets {
+            layout: DISTINCT_SET_LAYOUT,
+            sets: 1,
+        };
+        let (aggregates, profile) = statement_aggregates(
+            r#"SELECT "RegionID", COUNT(DISTINCT "UserID") AS u, COUNT(*) AS c FROM hits GROUP BY "RegionID" ORDER BY u DESC LIMIT 10"#,
+        )
+        .await;
+        assert_eq!(profile, Some(with_count));
+        assert_eq!(aggregates.len(), 2, "{aggregates:?}");
+        for (_, group_by, aggregate, layout) in &aggregates {
+            assert_eq!(group_by, &["RegionID".to_string()]);
+            assert_eq!(aggregate.len(), 2, "{aggregates:?}");
+            assert_eq!(*layout, with_count);
+        }
     }
 }

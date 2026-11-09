@@ -5,8 +5,9 @@
 //! result tests run statements on that session over in-memory tables, so the
 //! input partitioning, key types and memory pool are each fixed by the test,
 //! and compare every returned group with the figure computed from the input.
-//! The last test runs ClickBench row 18's statement through the `logs` table
-//! end to end.
+//! ClickBench row 18's statement then runs through the `logs` table end to
+//! end, and the last test runs statement 9 there under a process budget
+//! (issue #4014).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -39,10 +40,10 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
-    DeclaredColumn, DeclaredType, FirstGroupsExec, LogsTableProvider, SessionPrincipal,
-    SessionTable, SpanSegmentFetcher, SpillDecision, SqlConfig, SqlExecutor, SqlRequest,
-    StaticDeclaredColumns, TenantDelegatingPool, TenantMemoryAccountant, build_session,
-    plan_aggregate_profile,
+    AggregateLayout, AggregateProfile, DeclaredColumn, DeclaredType, FirstGroupsExec,
+    LogsTableProvider, SessionPrincipal, SessionTable, SpanSegmentFetcher, SpillDecision,
+    SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns, TenantDelegatingPool,
+    TenantMemoryAccountant, build_session, plan_aggregate_profile,
 };
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::AttrValue;
@@ -837,4 +838,133 @@ async fn clickbench_row_18_returns_exact_counts_through_the_logs_table() {
         }
     }
     assert_eq!(seen.len(), 10);
+}
+
+const REGION_COL: &str = "RegionID";
+
+/// Row `i`'s region: slot `i mod 36` falls in region `r` for `r + 1` of the
+/// 36 slots.
+fn region_of(i: i64) -> i64 {
+    let slot = i % 36;
+    (0..8).find(|r| slot < (r + 1) * (r + 2) / 2).unwrap_or(7)
+}
+
+/// Row `i`: user `i`, every user distinct, in region [`region_of`].
+fn distinct_record(i: i64) -> LogRecord {
+    let mut record = clickbench_record(0, i);
+    record.attrs = vec![
+        (REGION_COL.to_string(), AttrValue::I64(region_of(i))),
+        (USER_COL.to_string(), AttrValue::I64(i)),
+    ];
+    record
+}
+
+/// A store holding rows `0..rows` of [`distinct_record`] in one object.
+async fn distinct_store(rows: i64) -> Arc<dyn ObjectStoreBackend> {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let records: Vec<LogRecord> = (0..rows).map(distinct_record).collect();
+    publish_object(store.as_ref(), 1, &records).await;
+    store
+}
+
+/// An executor over `store` with one SQL partition, charging `budget`.
+fn distinct_executor(
+    store: &Arc<dyn ObjectStoreBackend>,
+    budget: Arc<MemoryBudget>,
+) -> SqlExecutor {
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(store), CatalogConfig::default()).expect("catalog"));
+    SqlExecutor::new(
+        catalog,
+        SegmentFetcher::new(Arc::clone(store)),
+        LogSegmentFetcher::new(Arc::clone(store)),
+        SpanSegmentFetcher::new(Arc::clone(store)),
+        {
+            let mut config = SqlConfig::default();
+            config.engine.sql_partition_count = Some(1);
+            config
+        },
+        1 << 40,
+    )
+    .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(vec![
+        DeclaredColumn::new(REGION_COL, DeclaredType::I64),
+        DeclaredColumn::new(USER_COL, DeclaredType::I64),
+    ])))
+    .with_process_memory_budget(budget)
+}
+
+/// The `(RegionID, u)` rows of a statement-9 answer, in the order returned.
+fn region_counts(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let region = int64(batch.column(0));
+        let users = int64(batch.column(1));
+        for row in 0..batch.num_rows() {
+            rows.push((region.value(row), users.value(row)));
+        }
+    }
+    rows
+}
+
+/// ClickBench statement 9 over the `logs` table, end to end (issue #4014):
+/// 604,800 rows in one object, every `UserID` distinct, region `r` holding
+/// `16,800 x (r + 1)` of them. DataFusion rewrites the `COUNT(DISTINCT)`
+/// into a group-by of `(RegionID, UserID)` under a `COUNT` by region, so the
+/// inner aggregate builds a 604,800-group table of 16-byte entries. One SQL
+/// partition makes the run one stream whatever the host's parallelism. Under
+/// a 73 MiB process budget the derived table term answers, and the answer is
+/// the unlimited run's: the eight regions by their exact distinct counts.
+///
+/// FLIP: the table term of a capacity-accounted 16-byte-entry table routed
+/// back to `unknown_layout_multiplier x J_max` refuses the bounded run, as
+/// the envelope it replaced did.
+#[tokio::test]
+async fn statement_9_count_distinct_answers_under_a_budget_the_old_envelope_refused() {
+    let store = distinct_store(604_800).await;
+    let sql = "SELECT \"RegionID\", COUNT(DISTINCT \"UserID\") AS u FROM logs \
+               GROUP BY \"RegionID\" ORDER BY u DESC LIMIT 10";
+    let request = logs_request(sql);
+
+    let unlimited = distinct_executor(&store, Arc::new(MemoryBudget::unlimited()));
+    let accounting = QueryAccounting::new();
+    let declared = unlimited
+        .resolve_declared_columns(logs_tenant().hash(), request.now_ns)
+        .await;
+    let (snapshot, _) = unlimited
+        .resolve_snapshot(logs_tenant().hash(), &request, &accounting)
+        .await
+        .expect("snapshot resolves");
+    let plan = unlimited
+        .plan_pinned(logs_tenant().hash(), snapshot, sql, &accounting, &declared)
+        .await
+        .expect("query plans")
+        .create_physical_plan()
+        .await
+        .expect("physical plan builds");
+    assert_eq!(
+        plan_aggregate_profile(&plan),
+        Some(AggregateProfile::Layout(AggregateLayout {
+            entry_size: 16,
+            vec_width_total: 16,
+            vec_width_max: 8,
+            capacity_accounted: true,
+        })),
+        "{}",
+        render(&plan)
+    );
+
+    let want: Vec<(i64, i64)> = (0..8).rev().map(|r| (r, 16_800 * (r + 1))).collect();
+    let answer = unlimited
+        .execute(logs_tenant().hash(), &request)
+        .await
+        .expect("the unlimited run answers");
+    assert_eq!(region_counts(answer.output.batches()), want);
+
+    let budget = Arc::new(MemoryBudget::new(73 << 20));
+    let bounded = distinct_executor(&store, Arc::clone(&budget))
+        .execute(logs_tenant().hash(), &request)
+        .await
+        .expect("statement 9 answers under a 73 MiB budget");
+    assert_eq!(region_counts(bounded.output.batches()), want);
+    assert_eq!(budget.accounted_refusals(), 0);
 }
