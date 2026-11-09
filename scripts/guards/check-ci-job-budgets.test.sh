@@ -356,6 +356,58 @@ test_five_minute_job_growth_is_a_finding() {
   fi
 }
 
+test_never_started_cancelled_job_is_skipped() {
+  local name="never_started_cancelled_job_is_skipped"
+  local repo; repo="$(new_repo CI_YML_TESTJOB)"
+  export STUB_PUSH_CURRENT_IDS="101 102"
+  export STUB_MG_CURRENT_IDS="103 104"
+  export STUB_PUSH_OLDER_IDS="201"
+  export STUB_MG_OLDER_IDS="202"
+  export STUB_JOBS_101; STUB_JOBS_101="$(job_row testjob success 0 10)"
+  export STUB_JOBS_102; STUB_JOBS_102="$(job_row testjob success 0 20)"
+  export STUB_JOBS_103; STUB_JOBS_103="$(job_row testjob success 0 30)"
+  # The REST endpoint gives a never-started job null timestamps. The stub
+  # ignores --jq, so this serves the text a plain "\(.started_at)" would
+  # interpolate them to.
+  export STUB_JOBS_104; STUB_JOBS_104="$(job_row testjob success 0 69)"$'\n'"testjob	cancelled	null	null"
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 69)"
+  export STUB_JOBS_202=""
+  run_live_case "${name}" "${repo}"
+  unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
+    STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_103 STUB_JOBS_104 STUB_JOBS_201 STUB_JOBS_202
+  rm -rf "${repo}"
+  # FLIP: treat the empty timestamps as unreadable, and this exits 2.
+  if [[ "${LAST_RC}" -eq 0 ]] && grep -q "^testjob	.*n=4$" <<<"${LAST_OUT}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
+  fi
+}
+
+test_too_few_rows_are_not_judged() {
+  local name="too_few_rows_are_not_judged"
+  local repo; repo="$(new_repo CI_YML_TESTJOB)"
+  export STUB_PUSH_CURRENT_IDS="101"
+  export STUB_MG_CURRENT_IDS="102"
+  export STUB_PUSH_OLDER_IDS="201"
+  export STUB_MG_OLDER_IDS="202"
+  export STUB_JOBS_101; STUB_JOBS_101="$(job_row testjob success 0 90)"
+  export STUB_JOBS_102=""
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 10)"
+  export STUB_JOBS_202=""
+  run_live_case "${name}" "${repo}"
+  unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
+    STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_201 STUB_JOBS_202
+  rm -rf "${repo}"
+  # One run at 0.9 of the cap and 9x its older p90. FLIP: judge any n, and
+  # both rules fire.
+  if [[ "${LAST_RC}" -eq 0 ]] && grep -q "^testjob	.*ratio=0.9000	.*n=1	not judged (n<3)$" <<<"${LAST_OUT}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
+  fi
+}
+
 test_growth_24_percent_passes() {
   local name="growth_24_percent_passes"
   local repo; repo="$(new_repo CI_YML_TESTJOB_BIGCAP)"
@@ -730,6 +782,8 @@ test_growth_25_percent_is_a_finding
 test_growth_24_percent_passes
 test_short_job_growth_is_not_a_finding
 test_five_minute_job_growth_is_a_finding
+test_never_started_cancelled_job_is_skipped
+test_too_few_rows_are_not_judged
 test_failed_query_exits_2
 test_transient_502_is_retried
 test_persistent_502_exits_2
