@@ -31,9 +31,11 @@
 #
 # The TLC jar is resolved once and checksum-pinned. Set RAVEL_TLA_TOOLS_JAR to
 # an operator-supplied jar (verified against the pin, never downloaded); else it
-# is fetched once into .cache/tla (gitignored). A checksum mismatch refuses to
-# run. Java is taken from RAVEL_TLA_JAVA if set, else the `java` on PATH;
-# version 17 or newer is required.
+# is fetched into .cache/tla (gitignored), retrying up to three times with a
+# 15 s backoff (RAVEL_TLA_FETCH_RETRY_DELAY_S overrides the delay) before
+# giving up. A checksum mismatch refuses to run, on the cached jar and on a
+# freshly downloaded one alike. Java is taken from RAVEL_TLA_JAVA if set, else
+# the `java` on PATH; version 17 or newer is required.
 #
 # TLC's worker count and JVM heap cap come from RAVEL_TLA_WORKERS (default 2)
 # and RAVEL_TLA_XMX (default 2g). Both are validated (workers: `auto` or a
@@ -196,15 +198,28 @@ ensure_jar() {
         fi
         die "cached $JAR has sha256 $got, expected $TLA_JAR_SHA256; refusing to run (delete it to re-fetch)"
     fi
-    note "fetching tla2tools $TLA_VERSION"
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
+        || die "neither curl nor wget available to fetch the TLC jar"
+
     local tmp="$JAR.download"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$TLA_JAR_URL" -o "$tmp" || die "download failed from $TLA_JAR_URL"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q "$TLA_JAR_URL" -O "$tmp" || die "download failed from $TLA_JAR_URL"
-    else
-        die "neither curl nor wget available to fetch the TLC jar"
-    fi
+    local delay="${RAVEL_TLA_FETCH_RETRY_DELAY_S:-15}"
+    local attempt fetched=0
+    for attempt in 1 2 3; do
+        note "fetching tla2tools $TLA_VERSION (attempt $attempt/3)"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$TLA_JAR_URL" -o "$tmp" && fetched=1
+        else
+            wget -q "$TLA_JAR_URL" -O "$tmp" && fetched=1
+        fi
+        [ "$fetched" -eq 1 ] && break
+        rm -f "$tmp"
+        if [ "$attempt" -lt 3 ]; then
+            note "download failed from $TLA_JAR_URL (attempt $attempt/3); retrying in ${delay}s"
+            sleep "$delay"
+        fi
+    done
+    [ "$fetched" -eq 1 ] || die "download failed from $TLA_JAR_URL after 3 attempts"
+
     local got
     got="$(sha256_of "$tmp")"
     if [ "$got" != "$TLA_JAR_SHA256" ]; then

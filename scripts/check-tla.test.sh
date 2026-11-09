@@ -1145,6 +1145,120 @@ LAST_RUN="$orig_last_run6"
 JAVA="$orig_java6"
 JAR="$orig_jar6"
 
+# --- (af)-(ah) issue #4038: ensure_jar's no-cache download path retries three
+# times with a backoff before giving up, and still verifies sha256 after a
+# retried download succeeds (D3, ADR-4034) -----------------------------------
+# A stub curl on PATH counts its own invocations (via af_counter) and either
+# fails (no output written) or copies known-good bytes to the -o destination,
+# depending on how many times it has already been called. RAVEL_TLA_FETCH_RETRY_DELAY_S=0
+# keeps the retrying case from actually sleeping.
+afdir="$(mktemp -d)"
+af_bin="$afdir/bin"
+mkdir -p "$af_bin"
+af_counter="$afdir/count"
+af_content="$afdir/good.bin"
+printf 'the-real-jar-bytes' > "$af_content"
+af_good_sha="$(sha256_of "$af_content")"
+
+make_counting_curl_stub() {
+    # make_counting_curl_stub <fail-count> -> (re)writes a curl stub at
+    # $af_bin/curl that fails its first <fail-count> invocations (counted via
+    # af_counter, reset by the caller) with no file written at -o, then on
+    # every later invocation copies af_content to -o and exits 0. A FLIP that
+    # makes ensure_jar try only once would call this stub at most once and
+    # never reach the "copy and succeed" branch for fail-count >= 1.
+    local fail_count="$1"
+    cat > "$af_bin/curl" <<EOF
+#!/usr/bin/env bash
+n=0
+[ -f "$af_counter" ] && n="\$(cat "$af_counter")"
+n=\$((n + 1))
+printf '%s' "\$n" > "$af_counter"
+out=""
+prev=""
+for a in "\$@"; do
+    [ "\$prev" = "-o" ] && out="\$a"
+    prev="\$a"
+done
+if [ "\$n" -le "$fail_count" ]; then
+    exit 1
+fi
+cp "$af_content" "\$out"
+exit 0
+EOF
+    chmod +x "$af_bin/curl"
+}
+
+orig_cache_dir_af="$CACHE_DIR"
+orig_jar_af="${JAR:-}"
+orig_sha_af="$TLA_JAR_SHA256"
+orig_path_af="$PATH"
+
+echo "--- (af) ensure_jar: fails twice then succeeds -> succeeds, exactly 3 curl calls"
+af1dir="$afdir/case1"
+mkdir -p "$af1dir"
+: > "$af_counter"
+make_counting_curl_stub 2
+CACHE_DIR="$af1dir"
+JAR="$CACHE_DIR/jar"
+TLA_JAR_SHA256="$af_good_sha"
+PATH="$af_bin:$orig_path_af"
+af1out="$(RAVEL_TLA_FETCH_RETRY_DELAY_S=0 ensure_jar 2>&1)"; af1code=$?
+af1count="$(cat "$af_counter" 2>/dev/null || echo 0)"
+echo "    measured: exit=$af1code curl_calls=$af1count"
+if [ "$af1code" -eq 0 ]; then ok; else bad "af1: expected ensure_jar to succeed after 2 failures, got $af1code; output: $af1out"; fi
+# FLIP: an implementation that tries only once would call curl once (and
+# fail), never three times.
+if [ "$af1count" -eq 3 ]; then ok; else bad "af1: expected exactly 3 curl invocations (2 failures + 1 success), got $af1count"; fi
+if [ -f "$JAR" ]; then ok; else bad "af1: expected $JAR to exist after a successful retried download"; fi
+
+echo "--- (ag) ensure_jar: fails all 3 attempts -> exit 1 naming the URL, no file left behind"
+af2dir="$afdir/case2"
+mkdir -p "$af2dir"
+: > "$af_counter"
+make_counting_curl_stub 99
+CACHE_DIR="$af2dir"
+JAR="$CACHE_DIR/jar"
+TLA_JAR_SHA256="$af_good_sha"
+PATH="$af_bin:$orig_path_af"
+agout="$(RAVEL_TLA_FETCH_RETRY_DELAY_S=0 ensure_jar 2>&1)"; agcode=$?
+agcount="$(cat "$af_counter" 2>/dev/null || echo 0)"
+echo "    measured: exit=$agcode curl_calls=$agcount"
+if [ "$agcode" -eq 1 ]; then ok; else bad "ag: expected exit 1 after 3 failed attempts, got $agcode; output: $agout"; fi
+if [ "$agcount" -eq 3 ]; then ok; else bad "ag: expected exactly 3 curl calls, got $agcount"; fi
+if printf '%s' "$agout" | grep -qF "$TLA_JAR_URL"; then
+    ok
+else
+    bad "ag: expected the failure message to name $TLA_JAR_URL; output: $agout"
+fi
+if [ -f "$JAR" ]; then bad "ag: expected no jar to be left behind after 3 failed attempts"; else ok; fi
+
+echo "--- (ah) ensure_jar: a retried download that succeeds but has the wrong sha256 is still rejected"
+af3dir="$afdir/case3"
+mkdir -p "$af3dir"
+: > "$af_counter"
+make_counting_curl_stub 2
+CACHE_DIR="$af3dir"
+JAR="$CACHE_DIR/jar"
+# 64 hex chars, deliberately not af_good_sha: a FLIP that skips the sha check
+# on a retried download would let this pass with the wrong bytes in place.
+TLA_JAR_SHA256="$(printf '0%.0s' $(seq 1 64))"
+PATH="$af_bin:$orig_path_af"
+ahout="$(RAVEL_TLA_FETCH_RETRY_DELAY_S=0 ensure_jar 2>&1)"; ahcode=$?
+echo "    measured: exit=$ahcode"
+if [ "$ahcode" -ne 0 ]; then ok; else bad "ah: expected ensure_jar to reject a retried download with the wrong sha256, got 0; output: $ahout"; fi
+if printf '%s' "$ahout" | grep -qF "sha256"; then
+    ok
+else
+    bad "ah: expected a sha256-mismatch message; output: $ahout"
+fi
+if [ -f "$JAR" ]; then bad "ah: expected no jar left behind after a sha256 mismatch on the retried download"; else ok; fi
+
+CACHE_DIR="$orig_cache_dir_af"
+JAR="$orig_jar_af"
+TLA_JAR_SHA256="$orig_sha_af"
+PATH="$orig_path_af"
+rm -rf "$afdir"
 
 rm -f "$LIB_SRC"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
