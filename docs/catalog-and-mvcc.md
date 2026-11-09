@@ -981,8 +981,12 @@ leaf ref for a field the tenant's key-index set names at fold time (the
 declared logs fields, spans `trace_id`, metrics `label_value` under
 `metrics_label_index`, whether or not an erasure request is pending). It
 is zero with the switch off and on a no-op fold, and a nonzero count logs
-one warning per fold naming the tenant, signal, count and missing fields
-and pointing at `--rebuild-key-index`. In
+one warning per fold naming the tenant, signal, count and missing fields.
+The warning names `--rebuild-key-index` for the two cases it repairs, a
+day sealed under the erasure gate and a field declared after the day
+sealed. A part whose field ends with no ref in the repair too (a metrics
+leaf over the byte cap, or no indexable entries) stays counted, and the
+warning repeats on every fold for it. In
 `a_sealed_day_missing_a_declared_fields_leaf_is_carried_unchanged_and_counted`
 two folds carry day d's ref byte for byte, with no section GET, leaf GET
 or leaf PUT for the day, and count 1; after the repair the next fold

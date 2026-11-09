@@ -4803,7 +4803,7 @@ impl Catalog {
                             signal = ?signal,
                             parts = key_index_parts_missing_declared_leaves,
                             fields = ?key_index_missing_fields,
-                            "parts carried by reference lack a key-index leaf for a declared field; the fold builds no leaf for a part it carries, so run ravel-cli catalog fold --rebuild-key-index to attach them"
+                            "parts carried by reference lack a key-index leaf for a declared field; the fold builds no leaf for a part it carries. ravel-cli catalog fold --rebuild-key-index attaches the leaves of a day sealed under the metrics erasure gate or before the field was declared; a field over the metrics byte cap, or with no indexable entries, stays without a leaf after the repair and keeps this count nonzero"
                         );
                     }
                     return Ok(FoldReport {
