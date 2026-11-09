@@ -16,7 +16,9 @@
 //! - **HEAD, or a covering snapshot part, present but unreadable**: blocked
 //!   fail-closed. Non-reachability cannot be proven from data that cannot be
 //!   read, and a wrongly-permitted delete is unrecoverable while a delayed one
-//!   is not.
+//!   is not. A part whose header names another tenant (ADR-0050 §2) is one
+//!   more cause: refused before its entries are read, the same fail-closed
+//!   answer as a part that will not decode at all.
 //! - **A decoded snapshot entry names the object**: blocked. The ordinary
 //!   lagging-fold case.
 //!
@@ -29,7 +31,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ravel_catalog::{DecodedPart, PartLimits, decode_head, decode_part};
+use ravel_catalog::{
+    DecodedPart, PartLimits, PartTenantError, decode_head, decode_part_for_tenant,
+};
 use ravel_commit::keys;
 use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef};
@@ -80,8 +84,9 @@ pub enum SnapshotBlock {
     Named,
     /// HEAD, or a snapshot part covering the relevant hour, was present but
     /// could not be read (undecodable, checksum/hash mismatch, unsupported
-    /// version, an entry whose identity fields do not fit the shape a fold
-    /// writes, or a HEAD-named part that is missing). Blocked fail-closed:
+    /// version, a header naming another tenant (ADR-0050 §2), an entry whose
+    /// identity fields do not fit the shape a fold writes, or a HEAD-named
+    /// part that is missing). Blocked fail-closed:
     /// non-reachability cannot be proven from data that cannot be read, and a
     /// wrongly-permitted delete is unrecoverable while a delayed one is not.
     /// Also the answer for any doubt about the candidate's unnamed-since
@@ -700,7 +705,10 @@ impl SnapshotReachability {
         };
 
         for part_ref in &covering {
-            match self.ensure_part(store, part_ref).await? {
+            match self
+                .ensure_part(store, &bucket.tenant_hash, part_ref)
+                .await?
+            {
                 // A covering part could not be read: cannot prove
                 // non-reachability, fail closed.
                 None => return Ok(SnapshotGate::Blocked(SnapshotBlock::Unreadable)),
@@ -717,7 +725,8 @@ impl SnapshotReachability {
                 }
             }
         }
-        self.clear_or_block_on_skipped(store, &skipped).await
+        self.clear_or_block_on_skipped(store, &bucket.tenant_hash, &skipped)
+            .await
     }
 
     /// Whether the live HEAD snapshot still names any of `objects`, all of
@@ -757,7 +766,7 @@ impl SnapshotReachability {
         };
 
         for part_ref in &covering {
-            let Some(part) = self.ensure_part(store, part_ref).await? else {
+            let Some(part) = self.ensure_part(store, tenant, part_ref).await? else {
                 return Ok(SnapshotGate::Blocked(SnapshotBlock::Unreadable));
             };
             for entry in &part.entries {
@@ -771,7 +780,8 @@ impl SnapshotReachability {
                 }
             }
         }
-        self.clear_or_block_on_skipped(store, &skipped).await
+        self.clear_or_block_on_skipped(store, tenant, &skipped)
+            .await
     }
 
     /// The last step of both gates, reached only when every covering part came
@@ -791,10 +801,11 @@ impl SnapshotReachability {
     async fn clear_or_block_on_skipped(
         &mut self,
         store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
         skipped: &[SnapshotPartRef],
     ) -> Result<SnapshotGate> {
         for part_ref in skipped {
-            if self.ensure_part(store, part_ref).await?.is_none() {
+            if self.ensure_part(store, tenant, part_ref).await?.is_none() {
                 return Ok(SnapshotGate::Blocked(SnapshotBlock::Unreadable));
             }
         }
@@ -885,10 +896,11 @@ impl SnapshotReachability {
         })
     }
 
-    /// Load, verify (blake3 against the HEAD ref, and the ref's hour range
-    /// against the decoded header's), and decode one snapshot part once per
-    /// pass, caching the result. `Ok(None)` is the fail-closed "present but
-    /// unreadable" case (a missing HEAD-named part, a hash mismatch, a bounds
+    /// Load, verify (blake3 against the HEAD ref, the header's tenant against
+    /// `tenant` (ADR-0050 §2), and the ref's hour range against the decoded
+    /// header's), and decode one snapshot part once per pass, caching the
+    /// result. `Ok(None)` is the fail-closed "present but unreadable" case (a
+    /// missing HEAD-named part, a hash mismatch, a foreign tenant, a bounds
     /// mismatch, or a decode failure); a transient store fault propagates.
     ///
     /// The bounds check is what makes [`Self::covering_parts`]' range filter
@@ -901,6 +913,7 @@ impl SnapshotReachability {
     async fn ensure_part(
         &mut self,
         store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
         part_ref: &SnapshotPartRef,
     ) -> Result<Option<Arc<DecodedPart>>> {
         if let Some(cached) = self.parts.get(&part_ref.key) {
@@ -911,6 +924,7 @@ impl SnapshotReachability {
                 let data = got.data;
                 let size = data.len() as u64;
                 let expected = part_ref.blake3.clone();
+                let tenant = *tenant;
                 // The hash check and the decode run as one job on the read
                 // gate (ADR-1702); `None` is a hash mismatch.
                 let decoded = self
@@ -922,7 +936,7 @@ impl SnapshotReachability {
                         let limits = PartLimits {
                             max_snapshot_part_bytes: ravel_catalog::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
                         };
-                        Some(decode_part(data.as_ref(), &limits))
+                        Some(decode_part_for_tenant(&tenant, data.as_ref(), &limits))
                     })
                     .await?;
                 if let Some(decoded) = decoded {
@@ -943,7 +957,17 @@ impl SnapshotReachability {
                             None
                         }
                         Ok(part) => Some(Arc::new(part)),
-                        Err(err) => {
+                        Err(PartTenantError::ForeignTenant { expected, actual }) => {
+                            tracing::error!(
+                                key = %part_ref.key,
+                                expected_tenant = %expected,
+                                actual_tenant = %actual,
+                                "maintain sweep: snapshot part names another tenant; blocking \
+                                 deletes fail-closed"
+                            );
+                            None
+                        }
+                        Err(PartTenantError::Corrupt(err)) => {
                             tracing::warn!(
                                 error = %err,
                                 key = %part_ref.key,
@@ -1018,10 +1042,257 @@ pub(crate) fn catalog_head_key(tenant: &TenantHash, signal: Signal) -> String {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{
+        Capabilities, DelimitedList, GetOutcome, ListPage, MultipartUpload, ObjectMeta, PageToken,
+        PutOptions, PutOutcome,
+    };
+
     use super::*;
     use crate::clock::FixedClock;
     use crate::unnamed_marker::MarkerKind;
-    use ravel_object_store::memory::MemoryStore;
+
+    /// A behavior-preserving decorator that counts GETs per key, so a test can
+    /// prove a part is read at most once per pass (the
+    /// `SnapshotReachability::parts` cache) rather than once per gate call.
+    struct CountingStore {
+        inner: MemoryStore,
+        gets: Mutex<HashMap<String, u64>>,
+    }
+
+    impl CountingStore {
+        fn new() -> Self {
+            CountingStore {
+                inner: MemoryStore::new(),
+                gets: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn get_count(&self, key: &str) -> u64 {
+            *self.gets.lock().expect("lock").get(key).unwrap_or(&0)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for CountingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> std::result::Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> std::result::Result<GetOutcome, StoreError> {
+            *self
+                .gets
+                .lock()
+                .expect("lock")
+                .entry(key.to_string())
+                .or_insert(0) += 1;
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> std::result::Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> std::result::Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    const TEST_TENANT: TenantHash = TenantHash([0xAA; 16]);
+    const FOREIGN_TENANT: TenantHash = TenantHash([0xBB; 16]);
+    const TEST_SHARD: u32 = 0;
+    const TEST_HOUR: u32 = 5;
+    const PART_KEY: &str = "t/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/catalog/m/snap/foreign.csnap";
+
+    fn candidate_entry() -> SnapshotEntry {
+        SnapshotEntry {
+            level: 0,
+            shard: TEST_SHARD,
+            ingest_hour_bucket: TEST_HOUR,
+            writer_id: vec![0xCC; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+            content_hash: vec![1; 32],
+            object_size: 100,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            sample_count: 0,
+            series_count: 0,
+            segment_format_version: 0,
+            created_unix_ns: 0,
+            declared_column_stats: Vec::new(),
+        }
+    }
+
+    /// Plants a HEAD for `TEST_TENANT` naming one covering part, whose bytes
+    /// are encoded for `FOREIGN_TENANT` instead: the HEAD-level reference
+    /// (blake3, size, hour range) is correct for the bytes actually stored, so
+    /// only the part's own header names a different tenant, exactly the state
+    /// `ensure_part`'s blake3 check cannot catch and the tenant check must.
+    /// `entries` controls whether the foreign part's own entries name the
+    /// candidate bucket (fixture a) or not (fixture b).
+    async fn plant_foreign_tenant_part(
+        store: &dyn ObjectStoreBackend,
+        entries: Vec<SnapshotEntry>,
+    ) {
+        let part_bytes = ravel_catalog::encode_part(
+            FOREIGN_TENANT.0,
+            ravel_commit::signal::to_proto(Signal::Metrics) as u32,
+            TEST_SHARD + 1,
+            TEST_HOUR,
+            &entries,
+        )
+        .expect("encode part for the foreign tenant");
+        store
+            .put(
+                PART_KEY,
+                bytes::Bytes::from(part_bytes.clone()),
+                ravel_object_store::PutOptions::default(),
+            )
+            .await
+            .expect("put foreign-tenant part");
+        let head = SnapshotHead {
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            tenant_hash: TEST_TENANT.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as u32,
+            shard_count: TEST_SHARD + 1,
+            watermark_hour: TEST_HOUR,
+            parts: vec![SnapshotPartRef {
+                key: PART_KEY.to_string(),
+                blake3: blake3::hash(&part_bytes).as_bytes().to_vec(),
+                size: part_bytes.len() as u64,
+                entry_count: entries.len() as u64,
+                watermark_hour: TEST_HOUR,
+                min_hour: 0,
+                column_stats: None,
+                key_index: Vec::new(),
+            }],
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 1,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        let head_bytes = ravel_catalog::encode_head(&head).expect("encode HEAD");
+        store
+            .put(
+                &catalog_head_key(&TEST_TENANT, Signal::Metrics),
+                bytes::Bytes::from(head_bytes),
+                ravel_object_store::PutOptions::default(),
+            )
+            .await
+            .expect("put HEAD");
+    }
+
+    fn candidate_bucket() -> Bucket {
+        Bucket {
+            tenant_hash: TEST_TENANT,
+            signal: Signal::Metrics,
+            shard: TEST_SHARD,
+            ingest_hour_bucket: TEST_HOUR,
+        }
+    }
+
+    /// A HEAD-named part whose header names another tenant blocks fail-closed
+    /// as `Unreadable`, not as `Named`, even though the foreign part's own
+    /// entries name the candidate bucket. The part is read once per pass.
+    ///
+    /// FLIP (W1): have `ensure_part` call `decode_part` directly instead of
+    /// `decode_part_for_tenant` (skip the tenant check entirely). The foreign
+    /// part's entry still matches the candidate's shard and hour, so the gate
+    /// returns `Blocked(Named)` instead of `Blocked(Unreadable)`, and this
+    /// assertion fails.
+    #[tokio::test]
+    async fn foreign_tenant_part_naming_the_candidate_blocks_unreadable() {
+        let store = CountingStore::new();
+        plant_foreign_tenant_part(&store, vec![candidate_entry()]).await;
+        let mut reach = SnapshotReachability::new();
+        let gate = reach
+            .bucket_gate(&store, &candidate_bucket())
+            .await
+            .expect("gate");
+        assert_eq!(gate, SnapshotGate::Blocked(SnapshotBlock::Unreadable));
+
+        // Same pass, a second candidate in the same bucket: the part is
+        // cached, not re-read.
+        let gate2 = reach
+            .bucket_gate(&store, &candidate_bucket())
+            .await
+            .expect("gate");
+        assert_eq!(gate2, SnapshotGate::Blocked(SnapshotBlock::Unreadable));
+        assert_eq!(
+            store.get_count(PART_KEY),
+            1,
+            "the foreign-tenant part is read once per pass, then cached"
+        );
+        assert_eq!(
+            store.get_count(&catalog_head_key(&TEST_TENANT, Signal::Metrics)),
+            1,
+            "HEAD is read once per pass, then cached"
+        );
+    }
+
+    /// The dangerous case: a HEAD-named part whose header names another
+    /// tenant, and whose entries do NOT name the candidate bucket at all,
+    /// still blocks fail-closed as `Unreadable`. Without the tenant check, the
+    /// gate would decode the part, find no entry naming the candidate, and
+    /// answer `Clear`, permitting the delete.
+    ///
+    /// FLIP (W1, the dangerous direction): same change as above. With no
+    /// entry matching the candidate, the gate now answers `Clear` instead of
+    /// `Blocked(Unreadable)`, and this assertion fails.
+    #[tokio::test]
+    async fn foreign_tenant_part_naming_nothing_still_blocks_unreadable() {
+        let store = CountingStore::new();
+        plant_foreign_tenant_part(&store, Vec::new()).await;
+        let mut reach = SnapshotReachability::new();
+        let gate = reach
+            .bucket_gate(&store, &candidate_bucket())
+            .await
+            .expect("gate");
+        assert_eq!(
+            gate,
+            SnapshotGate::Blocked(SnapshotBlock::Unreadable),
+            "a foreign-tenant part blocks fail-closed even when its own entries name nothing here"
+        );
+    }
 
     /// No marker for the alerts signal (ADR-1133 decision 6): a clear HEAD
     /// answer stays clear and the gate issues no marker request, while the same

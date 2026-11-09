@@ -153,3 +153,6 @@ pub use tenant_config::{
     read_config_values, resolve_declared_columns, resolve_retention_window, set_tenant_config,
     validate_stored_typed_attr_columns, validate_typed_attr_columns,
 };
+pub use tenant_part::{
+    PartTenantError, TenantPartError, check_part_tenant, decode_part_for_tenant,
+};

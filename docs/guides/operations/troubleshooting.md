@@ -1441,11 +1441,18 @@ Coverage is not complete, so a zero reading is not proof of isolation:
   fold, the key-index rebuild, the scrub's covering-postings load and
   seal-divergence check, `ravel-cli catalog verify` and the coverage check of
   `ravel-cli load`. Each checks before it charges the decode to the memory
-  budget, so a budget refusal does not hide a foreign part. Four readers
-  decode a part without that check, so a foreign part they read increments
-  nothing: the on-demand fold's read of a part's entry ids, the format-window
-  audit, the GC reachability sweep and `ravel-cli catalog inspect`. The
-  scrub's covering-postings load does not count a
+  budget, so a budget refusal does not hide a foreign part. The GC
+  reachability sweep also checks, but holds no `Catalog`, so it does not
+  increment this counter: it refuses the part, blocks the candidate's delete
+  fail-closed as an unreadable part (counted on the retention pass report's
+  `blocked_by_unreadable_head`), and logs one `error`-level line,
+  `maintain sweep: snapshot part names another tenant; blocking deletes
+  fail-closed`, with the part `key`, `expected_tenant` and `actual_tenant`.
+  Escalate on that line as on an increment.
+  Three readers decode a part without any tenant-hash check, so a foreign
+  part they read increments nothing: the on-demand fold's
+  read of a part's entry ids, the format-window audit, and `ravel-cli catalog
+  inspect`. The scrub's covering-postings load does not count a
   tenant-hash mismatch on the postings object itself: it logs it at `error`
   and skips the postings check for the tick.
 
