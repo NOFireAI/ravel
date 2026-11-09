@@ -16353,12 +16353,7 @@ pub(crate) mod tests {
         );
         assert_eq!(report.parts_reused, 1, "{report:?}");
         assert!(
-            !store
-                .puts
-                .lock()
-                .expect("lock")
-                .iter()
-                .any(|key| *key == sealed.key),
+            !store.puts.lock().expect("lock").contains(&sealed.key),
             "no PUT of day d's part object"
         );
         assert_eq!(
@@ -16586,12 +16581,7 @@ pub(crate) mod tests {
         assert_eq!(report.metrics_label_index_parts_erasure_gated, 0);
         assert_eq!(store.leaf_puts_for_part_watermark(DAY_D + 22), 1);
         assert!(
-            !store
-                .puts
-                .lock()
-                .expect("lock")
-                .iter()
-                .any(|key| *key == sealed.key),
+            !store.puts.lock().expect("lock").contains(&sealed.key),
             "no PUT of day d's part object"
         );
     }
