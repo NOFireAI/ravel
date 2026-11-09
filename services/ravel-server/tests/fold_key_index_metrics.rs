@@ -322,12 +322,12 @@ async fn a_leaf_building_fold_renders_the_key_index_build_families() {
     for (name, help, value) in [
         (
             "ravel_catalog_fold_key_index_sections_read_total",
-            "KEY_IDX sections the fold's key-index leaf build read, one per entry per build pass. An entry carried from the previous tail's leaf reads none.",
+            "KEY_IDX sections the fold's key-index leaf build read, one per entry per build pass. An entry carried from a previous part's leaves reads none.",
             5,
         ),
         (
             "ravel_catalog_fold_key_index_entries_carried_total",
-            "Entries whose key-index pairs the fold carried from the previous tail's leaves, matched by data object key, instead of reading their sections.",
+            "Entries whose key-index pairs the fold carried from the leaves of the previous parts their part overlaps, matched by data object key, instead of reading their sections.",
             3,
         ),
         (
@@ -337,7 +337,7 @@ async fn a_leaf_building_fold_renders_the_key_index_build_families() {
         ),
         (
             "ravel_catalog_fold_key_index_leaf_gets_total",
-            "GETs of the previous tail's key-index leaves the fold issued to carry their pairs forward, one per leaf.",
+            "GETs of previous parts' key-index leaves the fold issued to carry their pairs forward, one per leaf.",
             1,
         ),
     ] {
