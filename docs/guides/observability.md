@@ -2456,7 +2456,7 @@ refuses counts under `outcome="reservation_refused"`.
 
 | Metric | Labels | HELP text |
 |---|---|---|
-| `ravel_query_key_index_parts_total` | `mode`, `signal`, `outcome` (`covered`, `uncovered`, `beyond_ceiling`, `rejected`, `reservation_refused`, `skipped_by_budget`) | Catalog parts the key-index router settled for an exact-key lookup or a PromQL equality value, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object probe. |
+| `ravel_query_key_index_parts_total` | `mode`, `signal`, `outcome` (`covered`, `uncovered`, `over_tier_one`, `beyond_ceiling`, `rejected`, `reservation_refused`, `skipped_by_budget`) | Catalog parts the key-index router settled for an exact-key lookup or a PromQL equality value, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object probe. |
 | `ravel_query_key_index_leaf_gets_total` | `mode`, `signal` | Key-index leaf GETs the router issued for exact-key lookups and PromQL equality values, by signal, including those of a routing pass dropped before it finished. |
 
 A single lookup's figures come back in the response's `stats.keyIndex`

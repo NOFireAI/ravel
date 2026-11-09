@@ -170,6 +170,7 @@ pub fn key_index_json(figures: &KeyIndexStats) -> Json {
     json!({
         "partsCovered": figures.parts_covered,
         "partsUncovered": figures.parts_uncovered,
+        "partsOverTierOne": figures.parts_over_tier_one,
         "partsBeyondCeiling": figures.parts_beyond_ceiling,
         "leavesRejected": figures.leaves_rejected,
         "reservationsRefused": figures.reservations_refused,
@@ -526,7 +527,7 @@ mod tests {
         assert_eq!(entries[1]["phases"][3]["s3GetRequests"], 1);
     }
 
-    /// `key_index_json`'s key set is exactly the ten figures below, each
+    /// `key_index_json`'s key set is exactly the eleven figures below, each
     /// carrying its own field's value (distinct values, so a crossed wire
     /// fails).
     #[test]
@@ -542,6 +543,7 @@ mod tests {
             keys_probed: 8,
             skipped_by_budget: 9,
             skip_idx_dropped: 10,
+            parts_over_tier_one: 11,
         };
         let rendered = key_index_json(&figures);
         let object = rendered.as_object().expect("keyIndex renders an object");
@@ -556,6 +558,7 @@ mod tests {
             ("keysProbed", 8),
             ("skippedByBudget", 9),
             ("skipIdxDropped", 10),
+            ("partsOverTierOne", 11),
         ];
         let keys: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
         let names: std::collections::BTreeSet<&str> =

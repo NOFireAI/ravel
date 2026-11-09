@@ -1558,7 +1558,7 @@ struct BlockMetrics {
     /// [`crate::spans_scan::METRIC_KEY_INDEX_FIGURES`], registered only for a
     /// scan carrying a declared-key equality so their presence is what tells
     /// the stats renderer one was pushed down. Published once by partition 0.
-    key_index_figures: Option<[Count; 10]>,
+    key_index_figures: Option<[Count; 11]>,
     /// Whole-segment fast-path segments this partition opened with one
     /// whole-object GET, and the ones it opened by column chunk instead (issue
     /// #862). Which way the request-cost model routed a statement is otherwise
@@ -1668,6 +1668,7 @@ impl BlockMetrics {
             r.leaf_wire_bytes,
             r.keys_probed,
             r.skipped_by_budget,
+            r.parts_over_tier_one,
             f.skip_idx_dropped,
         ];
         for (count, v) in counts.iter().zip(values) {
