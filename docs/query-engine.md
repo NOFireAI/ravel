@@ -6279,6 +6279,90 @@ by `count` or `sum` (`ORDER BY count(*) DESC LIMIT k`) is not bounded by this
 rule or by `BoundedTopKAggregate`, still builds every group, and keeps the
 ADR-0954 refusal-retry.
 
+#### Bounded keys for GROUP BY ... ORDER BY group key LIMIT (ADR-4002)
+
+`TopKeysAggregateLimit` is a physical optimizer rule (installed by
+`build_session` right after `FirstGroupsLimit` when
+`SqlConfig::bounded_top_keys_max_limit` is above 0; the default is 1024 and
+ravel-server has no flag for it) that stops a `GROUP BY ... ORDER BY <group
+key> LIMIT n` from building every group in its final aggregate to return `n`
+rows. It replaces a final-stage `AggregateExec` (`FinalPartitioned`, `Final`,
+`Single` or `SinglePartitioned`) with a `TopKeysAggregateExec`, shown by
+`EXPLAIN` as `TopKeysAggregateExec: n=<bound>`, when every one of these
+holds:
+
+- a `SortExec` with a fetch and no preserved partitioning reads the aggregate
+  through nothing but projections, cooperative wrappers and coalesces, none of
+  them with a fetch of its own. A subquery's `LIMIT` or `OFFSET` between them
+  refuses, since its skip could drop kept keys, and so does a `HAVING`
+  filter;
+- the bound, `n + s` for `OFFSET s LIMIT n`, is between 1 and the configured
+  ceiling;
+- every sort expression is deterministic, is not a float, and reads only
+  group-key columns that are not floats. Columns are resolved through each
+  projection by position, not by name, so an aggregate output aliased to a
+  key's name does not pass for the key. A key, several keys, a prefix of the
+  keys and a function of keys such as `date_trunc('hour', m)` qualify, and so
+  do the two-term sort and the `__ravel_tiebreak_*` projection of the
+  tie-order rewrite;
+- the aggregate has one grouping set with no null mask or grouping id, no
+  limit of its own, unordered input, and at least one aggregate expression,
+  each with a `GroupsAccumulator`, no `ORDER BY`, no `FILTER` and no float
+  state field, and its input is not a `FirstGroupsExec`.
+
+An `ORDER BY` on an aggregate stays with `BoundedTopKAggregate`, an
+aggregate with float state such as a float `sum` keeps the stock plan, and
+any refused statement keeps the ADR-0954 refusal-retry.
+
+Per output partition the exec interns each input batch's group keys in a
+DataFusion `GroupValues` built over the aggregate's own group schema and
+merges the partial states (or, in the single modes, updates from the rows)
+into one `GroupsAccumulator` per aggregate expression. It encodes each key's
+sort value as an arrow row with the sort's own options. Once the table holds
+`2n` groups or more it ranks them by sort row and then by group index,
+keeps the first `n`, rebuilds the table and fresh accumulators from them
+with the kept keys at indexes 0 to `n - 1` in rank order, and from then on
+drops input rows whose sort row comes after the worst kept key's. Rows tied
+with that key pass. At end of input it evaluates every group, applies the
+same cut once and emits at most `n` rows. `EXPLAIN ANALYZE` reports
+`rebuilds`, `evictions`, `dropped_rows` and `interned_at_threshold`, the
+groups interned after a rebuild whose sort row equals the threshold; every
+evicted key that is seen again is among them, since its rows pass only on a
+tie. The table, the accumulators and each rebuild's transient
+copies are charged to the query pool under the exec's own `TopKeys[<partition>]`
+consumer, one to one; a refused grow fails the query with
+`ResourcesExhausted`, and nothing spills.
+
+The answer is exact because a group's sort value depends only on its key and
+the final stage's distribution gives each partition every partial state of
+the keys it owns: a key the exec evicts already has `n` kept keys ranked
+ahead of it, and if it is seen again it re-enters with a group index above
+every kept key's, so it stays behind them at every later cut and is absent
+from the output rather than partial. `crates/ravel-sql/tests/top_keys.rs`
+pins every returned group against the rule-off plan, under ascending,
+descending and shuffled arrival, with ties at the `n`-th key, an evicted key
+seen again, NULL keys first and last, and `OFFSET`, in all four modes. The
+aggregates it covers are `count(*)`, `count`, `sum`, `avg`, `min` and `max`
+over integer columns, with non-float keys. Among keys tied on the sort, which
+ones are returned follows arrival order, which SQL leaves unspecified, and
+under the tie-order rewrite the sort is total on the keys. Float keys are
+refused because `GroupValues` folds -0.0 into +0.0 while the row encoding
+orders them apart; float states are refused because a rebuild merges each
+state into a fresh accumulator, and `0.0 + -0.0` is +0.0.
+
+On its fixture of 1,000,000 distinct `Int64` keys over 8 partitions with
+`ORDER BY k LIMIT 10`, keys arriving in the worst order or shuffled, the
+query pool's charged peak measured 4.1 to 8.9 MB with the rule and 60 to 71
+MB with `bounded_top_keys_max_limit = 0`. The test asserts below 32 MiB with
+the rule, about twice the largest figure because the hash exchange's buffers
+vary with scheduling, and above 32 MiB without it. The memory envelope
+measured 4.7 to 6.2 MB with the rule and 107 to 134 MB without it, asserted
+below 16 MiB and above 32 MiB. Each `TopKeys[`
+consumer's own peak measured 0.9 to 1.0 MB, and the test asserts it below
+`(2n + batch size) × 256` bytes, 2,102,272 at the default batch of 8192:
+the exec holds at most `2n` groups plus one batch's keys. The partial stage
+and the exchange still carry every group.
+
 #### Bucketed final aggregation (ADR-3565)
 
 `SqlConfig::bucketed_final_aggregation` (`--sql-bucketed-final-aggregation` on
