@@ -63,6 +63,10 @@ PHASE_FIELDS = ("s3GetRequests", "s3GetWireBytes", "s3ListRequests", "segmentsOp
 ORACLE_STATES = ("compaction_in_flight", "compaction_done", "erasure_in_flight")
 # States run.sh enters as a step of another one: live exactly when it is.
 DERIVED = {"fold_advance": "mixed", "compaction_done": "compaction_in_flight"}
+# ADR-3939's multi-day states (its harness-state amendment): day parts over 7
+# and 30 days, and a tombstoned hour in a sealed day. box/run.sh does not
+# build them yet (task H1b, #4048), so every row on them reads not-run.
+MULTI_DAY_STATES = ("day_parts_7", "day_parts_30", "retired_hour")
 INFLIGHT_STATES = ("compaction_in_flight",)
 SIGNALS = ("spans", "logs")
 
@@ -76,7 +80,11 @@ KEY_INDEX_METRICS = {
     "leaves_rejected": "leavesRejected",
     "reservations_refused": "reservationsRefused",
     "keys_probed": "keysProbed",
+    "leaf_round_trips": "leafRoundTrips",
 }
+# Other stats fields a build may not report, under (section, field).
+STATS_ALLOWLIST = {"skip_idx_dropped": ("pruning", "skipIdxDropped"),
+                   "slow_downs": ("io", "s3SlowDownResponses")}
 # Rows 11 and 18: a part in one of these router outcomes was left to tier 1,
 # so a lookup cell's time is not the leaves'.
 NOT_MEASURED = "not-measured"
@@ -108,7 +116,14 @@ G_INPUTS = ("key_index_pair_budget", "key_index_field_pairs")
 PASSED_ON = ("not-run", UNSUPPORTED, GUARD, NOT_COMPUTABLE, INCOMPLETE)
 # Fold report fields this build does not write.
 FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_index_sections_read",
-                  "key_index_leaf_gets")
+                  "key_index_leaf_gets", "sealed_day_leaf_puts", "sealed_day_previous_leaf_gets", "head_digest",
+                  "switch_off_partition_changed", "key_index_unchanged_section_gets", "key_index_part_puts",
+                  "retired_hours")
+# Stamps of ADR-3939's multi-day states that box/run.sh does not write yet
+# (task H1b, #4048): stamp.<what>.<label> reads stamps/STATE.LABEL.<kind>.json,
+# and its absence is unsupported-on-this-build, not missing.
+H1B_STAMPS = {"fold_binary_pre_r2": "fold_binary", "tombstoned_hour": "tombstone",
+              "retired_hour_segments": "retired_resolve"}
 
 # Fold report fields under their names in a `catalog fold --json` report and
 # in a `--rebuild-key-index` report.
@@ -404,10 +419,11 @@ def call_metrics(c):
 def allowlisted(c, name):
     """(value, None) or (None, unsupported reason) for an allowlisted metric."""
     stats = c["stats"]
-    if name == "skip_idx_dropped":
-        if "skipIdxDropped" in stats["pruning"]:
-            return stats["pruning"]["skipIdxDropped"], None
-        return None, "stats carry no pruning.skipIdxDropped on this build"
+    if name in STATS_ALLOWLIST:
+        section, field = STATS_ALLOWLIST[name]
+        if field in (stats.get(section) or {}):
+            return stats[section][field], None
+        return None, f"stats carry no {section}.{field} on this build"
     field = KEY_INDEX_METRICS[name]
     ki = stats.get("keyIndex")
     if isinstance(ki, dict) and field in ki:
@@ -764,7 +780,7 @@ def statement_figure(calls, cfg, statement, state, metric, candidates=None, over
     vals = []
     for c in lines:
         m = call_metrics(c)
-        if name in KEY_INDEX_METRICS or name == "skip_idx_dropped":
+        if name in KEY_INDEX_METRICS or name in STATS_ALLOWLIST:
             v, why = allowlisted(c, name)
             if why:
                 return UNSUPPORTED, None, why
@@ -1192,6 +1208,21 @@ def stamp_figure(stamps, census, cfg, state, metric):
         if not isinstance(doc.get("footer_len"), int):
             return "missing", None, f"stamps/{state}.{label}.object.json carries no footer length"
         return "value", doc["footer_len"], ""
+    if what in H1B_STAMPS:
+        name = f"stamps/{state}.{label}.{H1B_STAMPS[what]}.json"
+        doc = stamps.doc(state, label, H1B_STAMPS[what])
+        if doc is None:
+            return UNSUPPORTED, None, f"no {name} on this build (task H1b, #4048, writes it)"
+        if what == "fold_binary_pre_r2":
+            # W2's binary: the fold binary's SHA, carrying C1 and not R2.
+            if not isinstance(doc.get("sha"), str) or not all(
+                    isinstance(doc.get(k), bool) for k in ("carries_c1", "carries_r2")):
+                return "missing", None, f"{name} carries no sha, carries_c1 and carries_r2"
+            return "value", int(doc["carries_c1"] and not doc["carries_r2"]), ""
+        field = {"tombstoned_hour": "hour", "retired_hour_segments": "segments"}[what]
+        if not isinstance(doc.get(field), int) or isinstance(doc.get(field), bool):
+            return "missing", None, f"{name} carries no {field}"
+        return "value", doc[field], ""
     if what == "buckets":
         doc = stamps.doc(state, label, "kidx")
         if doc is None or not doc.get("buckets"):
@@ -1327,16 +1358,27 @@ def not_requested(bands, cfg, live, figures):
     for row in bands["row"]:
         why = row_unrequested(row, cfg, live)
         if why:
-            out.append({"row": row["adr_row"], "key": row["key"], "reason": why})
+            out.append({"row": row["adr_row"], "key": row["key"], "reason": why} | adr_of(row))
     listed = {r["key"] for r in out}
     groups = {}
+    rows = {row["key"]: row for row in bands["row"]}
     for f in figures:
         key = f["id"].split(".", 1)[0]
         if f.get("gated") and f.get("not_requested") and key not in listed:
             groups.setdefault((f["row"], key, f["not_requested"]), []).append(f["id"].split(".", 1)[1])
     for (row, key, why), names in groups.items():
-        out.append({"row": row, "key": key, "figures": names, "reason": why})
-    return sorted(out, key=lambda r: r["row"])
+        out.append({"row": row, "key": key, "figures": names, "reason": why} | adr_of(rows[key]))
+    order = {key: n for n, key in enumerate(rows)}
+    return sorted(out, key=lambda r: order[r["key"]])
+
+
+def adr_of(row):
+    """{"adr": ...} for a row of an ADR other than ADR-3692, else {}."""
+    return {"adr": row["adr"]} if row.get("adr") else {}
+
+
+def row_label(r):
+    return (f"{r['adr']} " if r.get("adr") else "") + f"row {r['row']}"
 
 
 def figure_not_run(fig, live):
@@ -1349,15 +1391,29 @@ def figure_not_run(fig, live):
     return None
 
 
+def day_part_bound(s, factor=1):
+    """ADR-3939's leaf GETs per day part for 100 keys over S slices,
+    T(S) + 100 with T(S) = S x (1 - (1 - 1/S)^100), T rounded to one decimal
+    and the sum rounded half up, then times factor rounded half up: the
+    rounding that gives the ADR's 126 (S 26), 176 (S 175), 194 (S 750) and
+    F3's 139 (1.1 x 126)."""
+    t = s * (1 - (1 - 1 / s) ** 100)
+    base = math.floor(math.floor(t * 10 + 0.5) / 10 + 100 + 0.5)
+    return math.floor(factor * base + 0.5)
+
+
+EXPR_BUILTINS = {"min": min, "max": max, "day_part_bound": day_part_bound}
+
+
 def evaluate_expr(expr, v, m):
-    return bool(eval(expr, {"__builtins__": {"min": min, "max": max}}, {"v": v, "m": m}))  # noqa: S307 - bands.toml is repo-controlled
+    return bool(eval(expr, {"__builtins__": EXPR_BUILTINS}, {"v": v, "m": m}))  # noqa: S307 - bands.toml is repo-controlled
 
 
 def derived_value(expr, figures_by_id):
     """(status, value, reason) of a derived figure's expression."""
     values = {k: e["value"] for k, e in figures_by_id.items() if e["status"] == "value"}
     try:
-        v = eval(expr, {"__builtins__": {"min": min, "max": max}}, {"m": values})  # noqa: S307
+        v = eval(expr, {"__builtins__": EXPR_BUILTINS}, {"m": values})  # noqa: S307
     except KeyError as e:
         ref = figures_by_id.get(e.args[0])
         if ref is None:
@@ -1366,6 +1422,25 @@ def derived_value(expr, figures_by_id):
             return ref["status"], None, f"{e.args[0]} is {ref['status']}: {ref['reason']}"
         return "missing", None, f"{e.args[0]} has no value ({ref['status']})"
     return "value", rnd(v), ""
+
+
+def figure_gate(fig, figures_by_id):
+    """None, or the reason a figure is not-run because its not_run_unless
+    expression over the figures before it is false or cannot be judged."""
+    expr = fig.get("not_run_unless")
+    if not expr:
+        return None
+    values = {k: e["value"] for k, e in figures_by_id.items() if e["status"] == "value"}
+    try:
+        if eval(expr, {"__builtins__": EXPR_BUILTINS}, {"m": values}):  # noqa: S307
+            return None
+    except KeyError as e:
+        ref = figures_by_id.get(e.args[0])
+        if ref is None:
+            return f"{fig['not_run_reason']}: {e.args[0]} is not defined before it"
+        return f"{fig['not_run_reason']}: {e.args[0]} is {ref['status']}: {ref['reason']}"
+    refs = ", ".join(f"{r} {values[r]}" for r in dict.fromkeys(re.findall(r"m\['([^']+)'\]", expr)))
+    return f"{fig['not_run_reason']} ({refs})"
 
 
 def truth_figure(truth, metric):
@@ -1387,10 +1462,13 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
         for fig in row["figure"]:
             fid = f"{row['key']}.{fig['name']}"
             entry = {"id": fid, "row": row["adr_row"], "statement": fig["statement"], "state": fig["state"],
-                     "metric": fig["metric"], "lane": fig["lane"]}
+                     "metric": fig["metric"], "lane": fig["lane"]} | adr_of(row)
             metric = fig["metric"]
             why_not = reason or figure_not_run(fig, live)
-            if why_not:
+            gate = None if why_not else figure_gate(fig, by_id)
+            if gate:
+                status, value, why = "not-run", None, gate
+            elif why_not:
                 status, value, why = "not-run", None, why_not
                 entry["gated"] = True
                 gap = row_unrequested(row, cfg, live, fig)
@@ -1676,7 +1754,7 @@ def summary_text(res):
     out = [f"selective investigations, lane {res['lane']}: {res['verdict']}"]
     if res["not_requested"]:
         out.append("not requested: " + "; ".join(
-            f"row {r['row']}" + (f" figures {', '.join(r['figures'])}" if r.get("figures") else "")
+            row_label(r) + (f" figures {', '.join(r['figures'])}" if r.get("figures") else "")
             + f" ({r['reason']})" for r in res["not_requested"]))
     k = res["refusal_classes"]
     out.append(f"refusal classes: {GUARD} {k[GUARD]['figures']} figure(s), {k[GUARD]['calls']} call(s); "
@@ -1784,7 +1862,7 @@ def main(argv):
     for state, line in failed.items():
         not_run[state] = failed_reason(line)
     query_states = sorted({s for st in statements.values() for s in st.get("states", [])})
-    all_states = sorted(set(query_states) | set(DERIVED) | set(cfg["states"]))
+    all_states = sorted(set(query_states) | set(DERIVED) | set(MULTI_DAY_STATES) | set(cfg["states"]))
     live = live_states(cfg, not_run, all_states)
 
     calls = Calls(calls_raw, problems, statements)

@@ -1,6 +1,7 @@
 # ADR-3692 Acceptance rows 1 to 18, transcribed from
 # docs/adrs/3692-selective-investigations-logs-traces.md ("Acceptance
-# (pre-registered ...)"). The text of `check`, `target`, `miss` and `source`
+# (pre-registered ...)"), then ADR-3939's rows (see the block above
+# adr3939_a1). The text of `check`, `target`, `miss` and `source`
 # is the ADR's own cells, verbatim; the target_if and miss_if expressions are
 # transcriptions of that text into figures this harness can extract, and
 # where a transcription had to choose, the comment above the figure says
@@ -19,12 +20,18 @@
 #               state's --rebuild-key-index step)
 #   metric      what evaluate.py extracts (README.md "Evaluation"):
 #                 <temp>.max|min.<name>       a statement's call counters
+#                 (temp cold or warm, or prefold: the cold calls a
+#                 multi-day state sends before its own fold)
 #                 <temp>.rows_exact, <temp>.rows_match_state.<state>,
 #                 <temp>.wall_p50_s, <temp>.wall_iqr_s,
 #                 <temp>.leaf_wall_p50_s, <temp>.control_1025
 #                 stamp.<what>.<label>        stamps/STATE.LABEL.*.json
 #                 stamp.slices.<label>.<field> the most leaves one part
 #                                             carries for the field
+#                 stamp.fold_binary_pre_r2|tombstoned_hour|
+#                   retired_hour_segments.<label>  the stamps task H1b
+#                                             (#4048) writes; unsupported
+#                                             while absent
 #                 leaf_share.<label>.<field>  that field's leaf bytes over the
 #                                             label's census data bytes, in %
 #                 census.<tenant>.<signal>.objects|bytes|objects_over_512k
@@ -43,6 +50,14 @@
 #               is a miss whether or not miss_if holds (the ADR: "a figure
 #               outside its band is a miss").
 #   miss_reason optional: the reason a miss carries when miss_if holds
+#   not_run_unless  optional: a Python expression over m (the figures defined
+#               above it); false makes the figure not-run with not_run_reason
+#               and the values it read, which leaves the run incomplete, never
+#               a pass. ADR-3939's reduced-rate figures use it for the S floor
+#               and W2's for its fold binary
+#
+# Expressions may call min, max and day_part_bound(S, factor=1), ADR-3939's
+# T(S) + 100 leaf GETs per day part (evaluate.py says how it rounds).
 #
 # A figure id is "<row key>.<name>". evaluate.py requires every figure of a
 # row the run covers to be present exactly once: absent is `missing`, two
@@ -1940,3 +1955,1124 @@ state = "advanced_leaves"
 metric = "stamp.slices.spans.trace_id"
 lane = "counter"
 target_if = "v >= 1"
+
+# ADR-3939 Acceptance rows A1 to A7 and the added rows W1 to W8 and F1 to F3,
+# transcribed from docs/adrs/3939-key-index-day-seal.md ("Acceptance
+# (pre-registered ...)" and "Acceptance (added rows ...)"), cells verbatim as
+# above. Each carries adr = "ADR-3939" and its ADR row label in adr_row. They
+# run on the multi-day states of the harness-state amendment, day_parts_7,
+# day_parts_30 and retired_hour, which box/run.sh does not build yet (task
+# H1b, #4048), so a run without them reports each row not-run, naming the
+# state.
+
+[[row]]
+key = "adr3939_a1"
+adr = "ADR-3939"
+adr_row = "A1"
+check = "A1. advance at a full-day tail, logs, switch on"
+target = "at most 26 build passes, at most 1.4 GB leaf bytes written, fold peak RSS at most 2.0 GB"
+miss = "more than 26 passes, over 1.4 GB, or over 2.0 GB RSS (predicted peak about 1.93 GB). An RSS miss with the passes and bytes in band is not fixed inside this decision: it opens a follow-up on a 6-hour seal span (costed above) or on the held previous-leaf rule"
+source = "predicted; box D rates, comment 6700944105"
+# The advance rows run on a tail loaded through the server after the
+# 7-day state's fold (the harness-state amendment): the fold report of that
+# advance, transition day_parts_7_advance on the day-part tenant. The
+# passes are the report's key_index_build_passes, the bytes its leaf bytes
+# written, the RSS the fold stamp's measured peak.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "build_passes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.inv.logs.key_index_build_passes"
+lane = "counter"
+target_if = "v <= 26"
+miss_if = "v > 26"
+
+[[row.figure]]
+name = "leaf_bytes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.inv.logs.leaf_bytes"
+lane = "counter"
+target_if = "v <= 1_400_000_000"
+miss_if = "v > 1_400_000_000"
+
+[[row.figure]]
+name = "peak_rss_bytes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.inv.logs.peak_rss_bytes"
+lane = "counter"
+target_if = "v <= 2_000_000_000"
+miss_if = "v > 2_000_000_000"
+
+[[row]]
+key = "adr3939_a2"
+adr = "ADR-3939"
+adr_row = "A2"
+check = "A2. advance at a full-day tail, spans"
+target = "at most 3 passes, at most 0.25 GB leaf bytes"
+miss = "more than 3 passes or over 0.25 GB"
+source = "predicted; box D rates, comment 6700944105"
+# The spans half of A1's advance fold.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "build_passes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.inv.spans.key_index_build_passes"
+lane = "counter"
+target_if = "v <= 3"
+miss_if = "v > 3"
+
+[[row.figure]]
+name = "leaf_bytes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.inv.spans.leaf_bytes"
+lane = "counter"
+target_if = "v <= 250_000_000"
+miss_if = "v > 250_000_000"
+
+[[row]]
+key = "adr3939_a3"
+adr = "ADR-3939"
+adr_row = "A3"
+check = "A3. sealed days keep their leaves"
+target = "from the second fold after day d seals, an advance issues 0 leaf PUTs and 0 previous-leaf GETs for day d's part"
+miss = "any leaf PUT or GET for a sealed day it did not change, after its sealing fold"
+source = "predicted"
+# The advance fold runs after the 7-day state's fold sealed every day, so
+# it is at least the second fold after each day sealed. The fold report
+# carries no per-part leaf PUT or previous-leaf GET count on this build, so
+# both figures read unsupported until it does.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "sealed_day_leaf_puts"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.inv.logs.sealed_day_leaf_puts"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "sealed_day_previous_leaf_gets"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.inv.logs.sealed_day_previous_leaf_gets"
+lane = "counter"
+target_if = "v == 0"
+
+[[row]]
+key = "adr3939_a4"
+adr = "ADR-3939"
+adr_row = "A4"
+check = "A4. partition determinism"
+target = "two folds of the same entry set produce byte-identical HEADs; the switch-off partition is unchanged"
+miss = "any difference"
+source = "predicted"
+# Two folds of the same entry set: the 7-day state's own fold and a second
+# fold of the same tenant from the same commits (transition
+# day_parts_7_refold), each reporting a digest of the HEAD it wrote. The
+# switch-off partition figure is the fold report's own comparison against the
+# partition the switch-off build writes. The fold report carries neither on
+# this build, so all three read unsupported until it does.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "head_digest"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7"
+metric = "fold.inv.logs.head_digest"
+lane = "counter"
+target_if = "v is not None"
+
+[[row.figure]]
+name = "refold_head_digest"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_refold"
+metric = "fold.inv.logs.head_digest"
+lane = "counter"
+target_if = "v is not None"
+
+[[row.figure]]
+name = "heads_differ"
+statement = "derived"
+state = "day_parts_7"
+metric = "derived"
+expr = "1 if m['adr3939_a4.head_digest'] != m['adr3939_a4.refold_head_digest'] else 0"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "switch_off_partition_changed"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7"
+metric = "fold.inv.logs.switch_off_partition_changed"
+lane = "counter"
+target_if = "v == 0"
+
+[[row]]
+key = "adr3939_a5"
+adr = "ADR-3939"
+adr_row = "A5"
+check = "A5. no-range lookup, 7 days of day parts, logs request_id IN 100"
+target = "every day covered; GETs at most 7 x 126"
+miss = "any day uncovered"
+source = "predicted"
+# Every day covered: each cold call covers every logs part the state's
+# catalog stamp holds and leaves none uncovered.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "parts_held"
+statement = "stamp"
+state = "day_parts_7"
+metric = "stamp.covering_parts.logs"
+lane = "counter"
+target_if = "v >= 7"
+
+[[row.figure]]
+name = "parts_covered"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.min.parts_covered"
+lane = "counter"
+target_if = "v == m['adr3939_a5.parts_held']"
+
+[[row.figure]]
+name = "parts_uncovered"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.parts_uncovered"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v <= 7 * 126"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "adr3939_a6"
+adr = "ADR-3939"
+adr_row = "A6"
+check = "A6. ADR-3692 row 18 (key-set lookup time) on the day-sealed tail"
+target = "as row 18"
+miss = "as row 18"
+source = "predicted; issue #3918"
+# Row 18's cells on the day-sealed tail: the same six statements, cold, in
+# the 7-day state, against the same statements unfolded on the same data. The
+# unfolded reference is the prefold temperature: the statement's cold calls
+# sent on the state's tenant before its fold, which task H1b (#4048) plans.
+# A cell any of whose cold calls left a part to tier 1 is not-measured, as in
+# row 18.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "logs_request_id_10_unfolded_p50_s"
+statement = "logs_request_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_10_unfolded_iqr_s"
+statement = "logs_request_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_10_p50_s"
+statement = "logs_request_in_10"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.logs_request_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_request_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_request_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.logs_request_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_request_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_request_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_request_id_100_unfolded_p50_s"
+statement = "logs_request_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_100_unfolded_iqr_s"
+statement = "logs_request_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_request_id_100_p50_s"
+statement = "logs_request_in_100"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.logs_request_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_request_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_request_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.logs_request_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_request_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_request_id_100_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_trace_id_10_unfolded_p50_s"
+statement = "logs_trace_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_10_unfolded_iqr_s"
+statement = "logs_trace_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_10_p50_s"
+statement = "logs_trace_in_10"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_trace_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.logs_trace_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_trace_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_trace_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "logs_trace_id_100_unfolded_p50_s"
+statement = "logs_trace_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_100_unfolded_iqr_s"
+statement = "logs_trace_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "logs_trace_id_100_p50_s"
+statement = "logs_trace_in_100"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_trace_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.logs_trace_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.logs_trace_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.logs_trace_id_100_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "spans_trace_id_10_unfolded_p50_s"
+statement = "spans_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_10_unfolded_iqr_s"
+statement = "spans_in_10"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_10_p50_s"
+statement = "spans_in_10"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.spans_trace_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.spans_trace_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.spans_trace_id_10_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.spans_trace_id_10_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.spans_trace_id_10_unfolded_p50_s'], 0.5 * m['adr3939_a6.spans_trace_id_10_unfolded_iqr_s'])"
+
+[[row.figure]]
+name = "spans_trace_id_100_unfolded_p50_s"
+statement = "spans_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_100_unfolded_iqr_s"
+statement = "spans_in_100"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "spans_trace_id_100_p50_s"
+statement = "spans_in_100"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_a6.spans_trace_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.spans_trace_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.spans_trace_id_100_unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_a6.spans_trace_id_100_unfolded_p50_s'] + max(0.05 * m['adr3939_a6.spans_trace_id_100_unfolded_p50_s'], 0.5 * m['adr3939_a6.spans_trace_id_100_unfolded_iqr_s'])"
+
+[[row]]
+key = "adr3939_a7"
+adr = "ADR-3939"
+adr_row = "A7"
+check = "A7. no-range lookup over every day part the run holds, logs request_id IN 100"
+target = "at most 126 GETs per day part; days covered equal to min(days held, floor(2,048 / GETs per day))"
+miss = "over 126 GETs per day part, or fewer days covered than that"
+source = "predicted from box D rates"
+# At the reduced rate (the harness-state amendment): with S the most slices
+# one day part carries for request_id, the target per day part is
+# T(S) + 100 leaf GETs (evaluate.py day_part_bound), so the total is at most
+# that per part the state holds, and every day held is covered while
+# 30 x (T(S) + 100) is at most the key-set ceiling's 66,560. A run whose S is
+# under 3 is not-run for every figure that depends on it, not a pass. The
+# stats carry no per-part leaf GET breakdown on this build, so the per-part
+# figure reads unsupported and the total is judged instead.
+requires_tenant = "inv"
+requires_states = ["day_parts_30"]
+
+[[row.figure]]
+name = "slices"
+statement = "stamp"
+state = "day_parts_30"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "per_day_bound"
+statement = "derived"
+state = "day_parts_30"
+metric = "derived"
+expr = "day_part_bound(m['adr3939_a7.slices'])"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v >= 100"
+
+[[row.figure]]
+name = "leaf_gets_per_part"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= m['adr3939_a7.per_day_bound']"
+
+[[row.figure]]
+name = "parts_held"
+statement = "stamp"
+state = "day_parts_30"
+metric = "stamp.covering_parts.logs"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= m['adr3939_a7.parts_held'] * m['adr3939_a7.per_day_bound']"
+
+[[row.figure]]
+name = "ceiling_gets"
+statement = "derived"
+state = "day_parts_30"
+metric = "derived"
+expr = "30 * m['adr3939_a7.per_day_bound']"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= 66_560"
+
+[[row.figure]]
+name = "parts_covered"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.min.parts_covered"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == m['adr3939_a7.parts_held']"
+
+[[row.figure]]
+name = "parts_uncovered"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.parts_uncovered"
+lane = "counter"
+not_run_unless = "m['adr3939_a7.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "adr3939_w1"
+adr = "ADR-3939"
+adr_row = "W1"
+check = "W1 advance at a full-day tail, logs, decision 5 landed"
+target = "at most 26 passes, at most 1.4 GB leaf bytes, fold peak RSS at most 1.2 GB"
+miss = "more than 26 passes, over 1.4 GB, or RSS over 1.2 GB"
+source = "predicted; comment 6700944105 (1.99 GB less 1.31 GB held plus 0.17 GB)"
+# A1's advance fold, on the build that carries decision 5.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "build_passes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.inv.logs.key_index_build_passes"
+lane = "counter"
+target_if = "v <= 26"
+miss_if = "v > 26"
+
+[[row.figure]]
+name = "leaf_bytes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.inv.logs.leaf_bytes"
+lane = "counter"
+target_if = "v <= 1_400_000_000"
+miss_if = "v > 1_400_000_000"
+
+[[row.figure]]
+name = "peak_rss_bytes"
+statement = "fold"
+state = "day_parts_7"
+transition = "day_parts_7_advance"
+metric = "fold.inv.logs.peak_rss_bytes"
+lane = "counter"
+target_if = "v <= 1_200_000_000"
+miss_if = "v > 1_200_000_000"
+
+[[row]]
+key = "adr3939_w2"
+adr = "ADR-3939"
+adr_row = "W2"
+check = "W2 one tombstoned hour in a sealed logs day, decision 5 alone"
+target = "31 previous-leaf GETs, 0 section GETs for unchanged entries, at most 1.31 GB written"
+miss = "any section GET for an unchanged entry"
+source = "predicted; fold.rs `PreviousTail::from_head` and `feed_carried_key_index`"
+# W2 is measured on the main SHA that carries C1 and not R2 (the
+# harness-state amendment): after R2 a tombstoned hour in a sealed day takes
+# the retired_hours path and is not re-encoded. The retired_hour state's fold
+# (transition retired_hour) is the fold after the tombstone, and
+# stamps/retired_hour.logs.fold_binary.json names its binary: sha,
+# carries_c1, carries_r2. No build writes that stamp yet (task H1b, #4048),
+# so the binary figure is unsupported and every other figure is not-run until
+# it says C1 without R2.
+requires_tenant = "inv"
+requires_states = ["retired_hour"]
+
+[[row.figure]]
+name = "fold_binary_pre_r2"
+statement = "stamp"
+state = "retired_hour"
+metric = "stamp.fold_binary_pre_r2.logs"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "previous_leaf_gets"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.inv.logs.key_index_leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 1"
+not_run_reason = "W2 runs only on a fold binary that carries C1 and not R2 (the harness-state amendment), and the run stamps that binary's SHA"
+target_if = "v == 31"
+
+[[row.figure]]
+name = "unchanged_section_gets"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.inv.logs.key_index_unchanged_section_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 1"
+not_run_reason = "W2 runs only on a fold binary that carries C1 and not R2 (the harness-state amendment), and the run stamps that binary's SHA"
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "leaf_bytes"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.inv.logs.leaf_bytes"
+lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 1"
+not_run_reason = "W2 runs only on a fold binary that carries C1 and not R2 (the harness-state amendment), and the run stamps that binary's SHA"
+target_if = "v <= 1_310_000_000"
+
+[[row]]
+key = "adr3939_w3"
+adr = "ADR-3939"
+adr_row = "W3"
+check = "W3 one tombstoned hour in a sealed logs day, decision 6"
+target = "0 part PUTs, 0 leaf PUTs, `retired_hours = [h]`; a resolve over h yields 0 segments on either tier from that fold; the part leaves HEAD with 0 PUTs at the day's last tombstone"
+miss = "any PUT before the drop, any segment of hour h"
+source = "predicted"
+# The retired_hour state's fold after the tombstone (transition
+# retired_hour), then the fold at the day's last tombstone (transition
+# retired_hour_drop). The tombstoned hour and a resolve over it after the
+# fold are stamps task H1b (#4048) writes (stamps/retired_hour.logs.tombstone.json
+# hour, stamps/retired_hour.logs.retired_resolve.json segments, both tiers);
+# the part PUTs and retired_hours are fold report fields this build does not
+# write. Each reads unsupported until its source exists.
+requires_tenant = "inv"
+requires_states = ["retired_hour"]
+
+[[row.figure]]
+name = "part_puts"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.inv.logs.key_index_part_puts"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "leaf_puts"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.inv.logs.leaves_written"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "tombstoned_hour"
+statement = "stamp"
+state = "retired_hour"
+metric = "stamp.tombstoned_hour.logs"
+lane = "counter"
+target_if = "v >= 0"
+
+[[row.figure]]
+name = "retired_hours"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.inv.logs.retired_hours"
+lane = "counter"
+target_if = "v == [m['adr3939_w3.tombstoned_hour']]"
+
+[[row.figure]]
+name = "retired_hour_segments"
+statement = "stamp"
+state = "retired_hour"
+metric = "stamp.retired_hour_segments.logs"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "drop_part_puts"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour_drop"
+metric = "fold.inv.logs.key_index_part_puts"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "drop_leaf_puts"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour_drop"
+metric = "fold.inv.logs.leaves_written"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row]]
+key = "adr3939_w4"
+adr = "ADR-3939"
+adr_row = "W4"
+check = "W4 7 days, 100 keys, logs request_id, day parts"
+target = "at most 882 leaf GETs, 7 of 7 days covered, p50 within ADR-3692 row 18's bound"
+miss = "over 882, a day uncovered, or over the bound"
+source = "predicted; comment 6700944105"
+# Row 18's bound on the no-range 100-key lookup over the 7-day state: the
+# cold p50 against the same statement's prefold p50 (A6) plus the larger of
+# 5 % of it and half its interquartile range.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "parts_held"
+statement = "stamp"
+state = "day_parts_7"
+metric = "stamp.covering_parts.logs"
+lane = "counter"
+target_if = "v >= 7"
+
+[[row.figure]]
+name = "parts_covered"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.min.parts_covered"
+lane = "counter"
+target_if = "v == m['adr3939_w4.parts_held']"
+
+[[row.figure]]
+name = "parts_uncovered"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.parts_uncovered"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v <= 882"
+miss_if = "v > 882"
+
+[[row.figure]]
+name = "days_covered"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.min.parts_covered"
+lane = "counter"
+target_if = "v >= 7"
+miss_if = "v < 7"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "unfolded_p50_s"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "unfolded_iqr_s"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "prefold.wall_iqr_s"
+lane = "timing"
+
+[[row.figure]]
+name = "p50_s"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_w4.unfolded_p50_s'] + max(0.05 * m['adr3939_w4.unfolded_p50_s'], 0.5 * m['adr3939_w4.unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_w4.unfolded_p50_s'] + max(0.05 * m['adr3939_w4.unfolded_p50_s'], 0.5 * m['adr3939_w4.unfolded_iqr_s'])"
+
+[[row]]
+key = "adr3939_w5"
+adr = "ADR-3939"
+adr_row = "W5"
+check = "W5 30 days, no range, 100 keys"
+target = "3,780 leaf GETs, 30 of 30 covered, 0 tier-1 probes on those days, `parts_beyond_ceiling` 0"
+miss = "any day uncovered"
+source = "predicted"
+# At the reduced rate: 3,780 is the box D instance of 30 x (T(S) + 100),
+# with S the most slices one day part carries for request_id, and a run whose
+# S is under 3 is not-run for every figure that depends on it (the
+# harness-state amendment). The tier-1 probes are the calls' probe-phase
+# GETs.
+requires_tenant = "inv"
+requires_states = ["day_parts_30"]
+
+[[row.figure]]
+name = "slices"
+statement = "stamp"
+state = "day_parts_30"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "per_day_bound"
+statement = "derived"
+state = "day_parts_30"
+metric = "derived"
+expr = "day_part_bound(m['adr3939_w5.slices'])"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v >= 100"
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= 30 * m['adr3939_w5.per_day_bound']"
+
+[[row.figure]]
+name = "days_covered"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.min.parts_covered"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v >= 30"
+miss_if = "v < 30"
+
+[[row.figure]]
+name = "parts_uncovered"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.parts_uncovered"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == 0"
+miss_if = "v > 0"
+
+[[row.figure]]
+name = "tier1_probe_gets"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.probe_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "parts_beyond_ceiling"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.parts_beyond_ceiling"
+lane = "counter"
+not_run_unless = "m['adr3939_w5.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "adr3939_w6"
+adr = "ADR-3939"
+adr_row = "W6"
+check = "W6 7 days, 1 key"
+target = "14 leaf GETs, 2 round trips"
+miss = "over 14, or 3 or more round trips"
+source = "predicted"
+# The stats carry no count of the key index's leaf round trips on this
+# build (dependencyDepth counts segment stages, not leaf waves), so the round
+# trips read unsupported until keyIndex.leafRoundTrips exists.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_1_7d"
+state = "day_parts_7"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v <= 14"
+miss_if = "v > 14"
+
+[[row.figure]]
+name = "leaf_round_trips"
+statement = "logs_request_in_1_7d"
+state = "day_parts_7"
+metric = "cold.max.leaf_round_trips"
+lane = "counter"
+target_if = "v <= 2"
+miss_if = "v >= 3"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_1_7d"
+state = "day_parts_7"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "adr3939_w7"
+adr = "ADR-3939"
+adr_row = "W7"
+check = "W7 1 hour across midnight"
+target = "4 leaf GETs"
+miss = "over 4"
+source = "predicted"
+# One key over the hour centred on a UTC midnight of the 7-day state.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "leaf_gets"
+statement = "logs_request_in_1_midnight"
+state = "day_parts_7"
+metric = "cold.max.leaf_gets"
+lane = "counter"
+target_if = "v <= 4"
+miss_if = "v > 4"
+
+[[row.figure]]
+name = "rows_exact"
+statement = "logs_request_in_1_midnight"
+state = "day_parts_7"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row]]
+key = "adr3939_w8"
+adr = "ADR-3939"
+adr_row = "W8"
+check = "W8 determinism"
+target = "as A4, and `retired_hours` identical across two folds observing the same tombstones"
+miss = "any difference"
+source = "predicted"
+# As A4 on the retired_hour state: its fold and a second fold observing the
+# same tombstones (transition retired_hour_refold), each reporting its HEAD
+# digest and retired_hours. The fold report carries neither on this build.
+requires_tenant = "inv"
+requires_states = ["retired_hour"]
+
+[[row.figure]]
+name = "head_digest"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.inv.logs.head_digest"
+lane = "counter"
+target_if = "v is not None"
+
+[[row.figure]]
+name = "refold_head_digest"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour_refold"
+metric = "fold.inv.logs.head_digest"
+lane = "counter"
+target_if = "v is not None"
+
+[[row.figure]]
+name = "heads_differ"
+statement = "derived"
+state = "retired_hour"
+metric = "derived"
+expr = "1 if m['adr3939_w8.head_digest'] != m['adr3939_w8.refold_head_digest'] else 0"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "retired_hours"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour"
+metric = "fold.inv.logs.retired_hours"
+lane = "counter"
+target_if = "v is not None"
+
+[[row.figure]]
+name = "refold_retired_hours"
+statement = "fold"
+state = "retired_hour"
+transition = "retired_hour_refold"
+metric = "fold.inv.logs.retired_hours"
+lane = "counter"
+target_if = "v is not None"
+
+[[row.figure]]
+name = "retired_hours_differ"
+statement = "derived"
+state = "retired_hour"
+metric = "derived"
+expr = "1 if m['adr3939_w8.retired_hours'] != m['adr3939_w8.refold_retired_hours'] else 0"
+lane = "counter"
+target_if = "v == 0"
+
+[[row]]
+key = "adr3939_f1"
+adr = "ADR-3939"
+adr_row = "F1"
+check = "F1 (flip row) W4's p50"
+target = "within row 18's bound"
+miss = "over it: ship the week merge"
+source = "predicted"
+# W4's p50 against W4's bound, judged again as the flip.
+requires_tenant = "inv"
+requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "p50_s"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= m['adr3939_w4.unfolded_p50_s'] + max(0.05 * m['adr3939_w4.unfolded_p50_s'], 0.5 * m['adr3939_w4.unfolded_iqr_s'])"
+miss_if = "v > m['adr3939_w4.unfolded_p50_s'] + max(0.05 * m['adr3939_w4.unfolded_p50_s'], 0.5 * m['adr3939_w4.unfolded_iqr_s'])"
+miss_reason = "over row 18's bound: ship the week merge"
+
+[[row]]
+key = "adr3939_f2"
+adr = "ADR-3939"
+adr_row = "F2"
+check = "F2 (flip row) W5's p50"
+target = "at most 2 x the same statement's unfolded p50"
+miss = "over it: ship the week merge"
+source = "predicted"
+# W5's statement against its own prefold p50, the 30-day state's statement
+# before the state's fold.
+requires_tenant = "inv"
+requires_states = ["day_parts_30"]
+
+[[row.figure]]
+name = "unfolded_p50_s"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "prefold.wall_p50_s"
+lane = "timing"
+
+[[row.figure]]
+name = "p50_s"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.leaf_wall_p50_s"
+lane = "timing"
+target_if = "v <= 2 * m['adr3939_f2.unfolded_p50_s']"
+miss_if = "v > 2 * m['adr3939_f2.unfolded_p50_s']"
+miss_reason = "over 2 x the unfolded p50: ship the week merge"
+
+[[row]]
+key = "adr3939_f3"
+adr = "ADR-3939"
+adr_row = "F3"
+check = "F3 (flip row) leaf GETs per day part on W4 and W5, and S3 throttling"
+target = "at most 139 (126 + 10%), no `SlowDown`"
+miss = "over 139, or any `SlowDown`: re-derive before deciding"
+source = "predicted"
+# On W4 at box D's rate the bound is 139; on W5 at the reduced rate it is
+# 1.1 x (T(S) + 100) (evaluate.py day_part_bound with factor 1.1), not-run
+# under 3 slices. The stats carry no per-part leaf GET breakdown and no count
+# of SlowDown responses on this build, so those figures read unsupported. The
+# row runs on whichever of the two states the run holds.
+requires_tenant = "inv"
+
+[[row.figure]]
+name = "w4_leaf_gets_per_part"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+target_if = "v <= 139"
+miss_if = "v > 139"
+miss_reason = "over 139: re-derive before deciding"
+
+[[row.figure]]
+name = "w4_slow_downs"
+statement = "logs_request_in_100_7d"
+state = "day_parts_7"
+metric = "cold.max.slow_downs"
+lane = "counter"
+target_if = "v == 0"
+miss_if = "v > 0"
+miss_reason = "a SlowDown: re-derive before deciding"
+
+[[row.figure]]
+name = "slices"
+statement = "stamp"
+state = "day_parts_30"
+metric = "stamp.slices.logs.request_id"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "w5_per_day_bound"
+statement = "derived"
+state = "day_parts_30"
+metric = "derived"
+expr = "day_part_bound(m['adr3939_f3.slices'], 1.1)"
+lane = "counter"
+not_run_unless = "m['adr3939_f3.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v >= 110"
+
+[[row.figure]]
+name = "w5_leaf_gets_per_part"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.per_part.leaf_gets"
+lane = "counter"
+not_run_unless = "m['adr3939_f3.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v <= m['adr3939_f3.w5_per_day_bound']"
+miss_reason = "over the bound: re-derive before deciding"
+
+[[row.figure]]
+name = "w5_slow_downs"
+statement = "logs_request_in_100_30d"
+state = "day_parts_30"
+metric = "cold.max.slow_downs"
+lane = "counter"
+not_run_unless = "m['adr3939_f3.slices'] >= 3"
+not_run_reason = "the harness-state amendment needs S of at least 3 slices per day part on the 30-day state, so the multi-slice term is exercised"
+target_if = "v == 0"
+miss_if = "v > 0"
+miss_reason = "a SlowDown: re-derive before deciding"
