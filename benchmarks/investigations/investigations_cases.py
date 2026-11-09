@@ -44,6 +44,7 @@ IN_LIST_LITERAL = r"'(?:[^']|'')*'|[Xx]'[0-9A-Fa-f]*'|[-+]?[0-9]+(?:\.[0-9]+)?"
 FLAT_IN_LIST = re.compile(r"[ \t\n\r]*\((?:[ \t\n\r]*(?:%s)[ \t\n\r]*,)*[ \t\n\r]*(?:%s)[ \t\n\r]*\)"
                           % (IN_LIST_LITERAL, IN_LIST_LITERAL))
 ADR = os.path.join(HERE, "..", "..", "docs", "adrs", "3692-selective-investigations-logs-traces.md")
+ADR3939 = os.path.join(HERE, "..", "..", "docs", "adrs", "3939-key-index-day-seal.md")
 HITS_TRUTH = os.path.join(HERE, "hits.truth.json")
 SMOKE = os.path.join(HERE, "fixtures", "local-smoke")
 BOX = os.path.join(HERE, "box")
@@ -53,7 +54,31 @@ PY = sys.executable
 BASH = os.environ.get("INV_BASH", "bash")
 HOUR_NS = 3600 * 1_000_000_000
 STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves", "compaction_in_flight",
-          "compaction_done", "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160")
+          "compaction_done", "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160",
+          "day_parts_7", "day_parts_30", "retired_hour")
+# ADR-3939's multi-day states (the harness-state amendment): registered, and
+# built by no box/run.sh yet (task H1b, #4048).
+MULTI_DAY_STATES = ("day_parts_7", "day_parts_30", "retired_hour")
+# The state each ADR-3939 row runs on (task H1a's decision, README.md): F3
+# runs on both, its W4 half on day_parts_7 and its W5 half on day_parts_30.
+ADR3939_STATES = {**{f"A{n}": "day_parts_7" for n in range(1, 7)}, "A7": "day_parts_30", "W1": "day_parts_7",
+                  "W2": "retired_hour", "W3": "retired_hour", "W4": "day_parts_7", "W5": "day_parts_30",
+                  "W6": "day_parts_7", "W7": "day_parts_7", "W8": "retired_hour", "F1": "day_parts_7",
+                  "F2": "day_parts_30"}
+# A run that lists none of the multi-day states: ADR-3939's not_requested
+# entries, as (row, key, figures or None, reason).
+ADR3939_NOT_REQUESTED = [(label, f"adr3939_{label.lower()}", None, f"run.toml states lacks ['{state}']")
+                         for label, state in ADR3939_STATES.items()] + [
+    ("F3", "adr3939_f3", ["w4_leaf_gets_per_part", "w4_slow_downs"], "run.toml states lacks ['day_parts_7']"),
+    ("F3", "adr3939_f3", ["slices", "w5_per_day_bound", "w5_leaf_gets_per_part", "w5_slow_downs"],
+     "run.toml states lacks ['day_parts_30']"),
+]
+
+
+def adr3939_not_requested():
+    """ADR3939_NOT_REQUESTED as results.json lists it."""
+    return [{"row": row, "key": key, **({"figures": names} if names else {}), "reason": why, "adr": "ADR-3939"}
+            for row, key, names, why in ADR3939_NOT_REQUESTED]
 SMOKE_STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
                 "erasure_in_flight", "many_parts_24")
 UNSUPPORTED = "unsupported-on-this-build"
@@ -730,7 +755,7 @@ class Statements(unittest.TestCase):
             self.assertIn(s["tenant"], ("inv", "hits"), s["id"])
             self.assertIn(s["kind"], ("trace_get", "sql"), s["id"])
             self.assertTrue(set(s["states"]) <= set(STATES), s["id"])
-            self.assertIn(s.get("window", "none"), ("none", "1h", "narrow", "wide"), s["id"])
+            self.assertIn(s.get("window", "none"), ("none", "1h", "narrow", "wide", "midnight"), s["id"])
             if s["kind"] == "sql" and not s.get("corpus_id") and not s.get("control"):
                 self.assertTrue(s.get("sql"), s["id"])
 
@@ -897,8 +922,9 @@ class Statements(unittest.TestCase):
             self.assertIsNone(re.search(r"\bstatus\s*=", sql), s["id"])
 
     def test_three_statements_run_warm(self):
-        """docs/internal/bench-reports.md: 43 of the 46 statements are cold_only."""
-        self.assertEqual(len(self.st), 46)
+        """docs/internal/bench-reports.md: three statements run warm (its count of 46 predates ADR-3939's
+        four multi-day statements)."""
+        self.assertEqual(len(self.st), 50)
         self.assertEqual([s["id"] for s in self.st if not s.get("cold_only")],
                          ["spans_lookup_norange", "spans_lookup_1h", "logs_trace_1h"])
 
@@ -1058,7 +1084,7 @@ class Statements(unittest.TestCase):
         # Acceptance table's cell, the check without its "N. " number.
         _, adr = self.adr_band_rows()
         self.assertEqual(len(adr), 18)
-        rows = self.bands["row"]
+        rows = [r for r in self.bands["row"] if not r.get("adr")]
         for n, (r, cells) in enumerate(zip(rows, adr), 1):
             num, _, check = cells[0].partition(". ")
             self.assertEqual(num, str(n))
@@ -1068,8 +1094,10 @@ class Statements(unittest.TestCase):
 
     def test_bands_rows_1_to_18(self):
         rows = self.bands["row"]
-        self.assertEqual([r["adr_row"] for r in rows], list(range(1, 19)))
-        self.assertEqual([r["key"] for r in rows], [f"row_{n:02d}" for n in range(1, 19)])
+        ours = [r for r in rows if not r.get("adr")]
+        self.assertEqual([r["adr_row"] for r in ours], list(range(1, 19)))
+        self.assertEqual([r["key"] for r in ours], [f"row_{n:02d}" for n in range(1, 19)])
+        self.assertEqual(rows[:18], ours)
         ids = {s["id"] for s in self.st} | {"fold", "all", "control", "stamp", "derived", "truth"}
         for r in rows:
             for k in ("check", "target", "miss", "source"):
@@ -1089,8 +1117,10 @@ class Statements(unittest.TestCase):
             self.assertEqual({f["statement"] for f in r["figure"]}, {"q20_hits", "stamp"})
         timed = sorted({r["key"] for r in rows for f in r["figure"] if f["lane"] == "timing"})
         # Rows 2, 5, 15 and 18 time statements; row 16's slowdown is a timing
-        # figure of a control run this harness does not perform.
-        self.assertEqual(timed, ["row_02", "row_05", "row_15", "row_16", "row_18"])
+        # figure of a control run this harness does not perform. ADR-3939's A6,
+        # W4, F1 and F2 time theirs against the same statements' prefold calls.
+        self.assertEqual(timed, ["adr3939_a6", "adr3939_f1", "adr3939_f2", "adr3939_w4", "row_02", "row_05",
+                                 "row_15", "row_16", "row_18"])
         r16 = next(r for r in rows if r["key"] == "row_16")
         self.assertEqual({f["statement"] for f in r16["figure"] if f["lane"] == "timing"}, {"control"})
         for r in rows:
@@ -1163,7 +1193,8 @@ class LocalSmoke(Workdir):
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         got = {s["state"]: (s["status"], s.get("reason")) for s in res["states"]}
         want = {s: ("run", None) for s in SMOKE_STATES + ("fold_advance", "compaction_done")}
-        want.update({s: ("not-run", "not in run.toml states") for s in ("advanced_leaves", "many_parts_744", "many_parts_2160")})
+        want.update({s: ("not-run", "not in run.toml states")
+                     for s in ("advanced_leaves", "many_parts_744", "many_parts_2160") + MULTI_DAY_STATES})
         self.assertEqual(got, want)
 
     def test_in_1000_is_sent_and_refused_by_the_complexity_guard(self):
@@ -1204,14 +1235,16 @@ class LocalSmoke(Workdir):
             {"row": 12, "key": "row_12", "reason": "run.toml scales lacks [10, 100]"},
             {"row": 16, "key": "row_16", "reason": "run.toml hits = false, baseline = false"},
             {"row": 18, "key": "row_18", "reason": "run.toml states lacks ['advanced_leaves']"},
-        ])
+        ] + adr3939_not_requested())
         self.assertEqual(text.splitlines()[:3], [
             "selective investigations, lane local: fail",
             "not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 9 figures "
             "covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact (run.toml states lacks "
             "['many_parts_744']); row 10 (run.toml "
             "states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml "
-            "hits = false, baseline = false); row 18 (run.toml states lacks ['advanced_leaves'])",
+            "hits = false, baseline = false); row 18 (run.toml states lacks ['advanced_leaves']); "
+            + "; ".join(f"ADR-3939 row {row}" + (f" figures {', '.join(names)}" if names else "") + f" ({why})"
+                        for row, _, names, why in ADR3939_NOT_REQUESTED),
             "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29 figure(s), "
             "0 call(s)",
         ])
@@ -2667,12 +2700,7 @@ class Evaluate(Workdir):
         listed the same way."""
         self.set_advanced_leaves({"spans_in_100": ((2.8, 3.2), (3.1, 3.1), {"keysProbed": 100})})
         # Row 18 alone, so no other row's miss on this fixture decides the verdict.
-        with open(bands) as f:
-            text = f.read()
-        start = text.index('[[row]]\nkey = "row_18"')
-        if "[[row]]\n" in text[start + 1:]:
-            return ["row_18 is no longer the last row of the bands; slice it to its end"]
-        code, res, _ = self.go(self.pass_bands(text[start:]), evaluate_py)
+        code, res, _ = self.go(self.row_bands("row_18", bands), evaluate_py)
         f = self.row_18(res)["spans_trace_id_100_p50_s"]
         out = []
         if (f["status"], f["verdict"]) != (UNSUPPORTED, UNSUPPORTED):
@@ -3215,6 +3243,7 @@ class Evaluate(Workdir):
         want = [(5, "run.toml hits = false"), (6, "run.toml hits = false"),
                 (9, "run.toml states lacks ['many_parts_744']"), (10, "run.toml states lacks ['many_parts_2160']"), (12, "run.toml scales lacks [10, 100]"),
                 (16, "run.toml hits = false, baseline = false"), (18, "run.toml states lacks ['advanced_leaves']")]
+        want += [(row, why) for row, _, _, why in ADR3939_NOT_REQUESTED]
         out = [] if got == want else [f"not_requested {got}"]
         if "not requested: row 5 (run.toml hits = false); row 6 " not in text:
             out.append("summary carries no not-requested line")
@@ -3712,7 +3741,7 @@ FLIPS = {
         "check_not_requested",
     ),
     "a gated figure of an unlisted state left out of not_requested": (
-        "        out.append({\"row\": row, \"key\": key, \"figures\": names, \"reason\": why})\n",
+        "        out.append({\"row\": row, \"key\": key, \"figures\": names, \"reason\": why} | adr_of(rows[key]))\n",
         "        pass\n",
         "check_gated_unrequested",
     ),
