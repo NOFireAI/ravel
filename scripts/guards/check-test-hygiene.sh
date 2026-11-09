@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Test-hygiene guard: the three defect shapes CLAUDE.md names under "Testing
-# patterns" as ones that bit twice and therefore become a check rather than
-# another paragraph.
+# Test-hygiene guard: five defect shapes. CLAUDE.md's "Testing patterns"
+# names the first three (wall-clock, unseeded-rng, proptest-seed) as ones
+# that bit twice and therefore became a check rather than another paragraph;
+# ignore-flaky and clock-compared are two later additions this guard also
+# tracks.
 #
 #   wall-clock    an assertion whose subject is elapsed real time. Flaky on a
 #                 loaded box, vacuous on a fast one. Library logic takes a
@@ -13,6 +15,16 @@
 #                 tracked by git. proptest writes one when it catches a case;
 #                 uncommitted, the default test command never replays it and
 #                 the same defect is found again at gate time by someone else.
+#   ignore-flaky  an #[ignore] whose reason (the `= "..."` string, a trailing
+#                 `//` comment, or the comment block directly above it) names
+#                 "flaky" but cites no issue. A flaky test that is silenced
+#                 with no ticket is a defect nobody is tracking.
+#   clock-compared a test that calls a fixture-building helper twice, where
+#                 the helper reads the wall clock itself (`now_ns()` /
+#                 `SystemTime::now()`, not a clock passed in), and both calls'
+#                 results feed one assertion. Flaky across an hour or minute
+#                 boundary (#4000): build both fixtures from one reading
+#                 instead, passed in rather than read by the helper.
 #
 # Usage:
 #   scripts/guards/check-test-hygiene.sh [path ...]   # default: crates services
@@ -29,7 +41,9 @@
 # The reason is for the next reader; the guard only looks for the marker. Use
 # it for a case that genuinely cannot be converted (an #[ignore]d measurement
 # probe whose whole subject is wall time), not to quiet a test that could take
-# an injected clock.
+# an injected clock. ignore-flaky and clock-compared take no escape hatch: an
+# ignore naming "flaky" always needs an issue, and a helper that reads the
+# clock itself always needs to take one instead.
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -39,7 +53,7 @@ roots=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
-      sed -n '2,32p' "$0"
+      sed -n '2,44p' "$0"
       exit 0
       ;;
     -*)
@@ -196,6 +210,13 @@ function balance(s,   i, n, c, b) {
 function has_word(s, w) {
   return s ~ ("(^|[^A-Za-z0-9_])" w "([^A-Za-z0-9_]|$)")
 }
+# Call syntax, not a bare reference: the name immediately followed by "(". A
+# plain word match on now_ns or clock would also hit a RHS that merely passes
+# an already-injected now_ns parameter along, e.g. bucket.peek(amount, now_ns),
+# which reads nothing from the clock itself.
+function is_call(s, w) {
+  return s ~ ("(^|[^A-Za-z0-9_])" w "\\(")
+}
 function allowed(rule, line,   i) {
   # The marker sits on the flagged line, or anywhere in the contiguous comment
   # block immediately above it. Walking the block rather than a fixed number of
@@ -215,6 +236,167 @@ function in_test(line) {
   # anything below the first #[cfg(test)] in a source file (test modules sit at
   # the bottom by convention here).
   return is_test_file || (cfg_test_line > 0 && line >= cfg_test_line)
+}
+# A function signature names an injected clock: a parameter called exactly
+# `now`/`clock`, or ending/starting with `_now`/`now_`/`_clock`/`clock_`. This
+# is narrower than the #4000 fix itself: post-fix `serve(setup: Setup)`
+# escapes find_clock_fns because its body reads
+# `setup.now.unwrap_or_else(now_ns)`, which the unconditional-call pattern
+# below never matches -- not because its signature carries a now/clock
+# parameter (it carries none; `setup: Setup` matches nothing here). This
+# check exists for the shape that pattern alone would miss: a helper whose
+# signature takes the clock directly (`fn fixture(now: i64)`) but whose body
+# still has a literal `let fallback = now_ns();` as a default for when the
+# caller passes nothing. Without this exemption that body shape alone would
+# mark the helper a clock-reader even though the caller already controls the
+# time.
+function fn_sig_has_now_param(sigbuf,   lb) {
+  lb = tolower(sigbuf)
+  return (lb ~ /[(,][ \t]*(mut[ \t]+)?now[ \t]*:/) \
+      || (lb ~ /[(,][ \t]*(mut[ \t]+)?clock[ \t]*:/) \
+      || (lb ~ /[(,][ \t]*(mut[ \t]+)?[a-z0-9_]*_now[ \t]*:/) \
+      || (lb ~ /[(,][ \t]*(mut[ \t]+)?now_[a-z0-9_]*[ \t]*:/) \
+      || (lb ~ /[(,][ \t]*(mut[ \t]+)?[a-z0-9_]*_clock[ \t]*:/) \
+      || (lb ~ /[(,][ \t]*(mut[ \t]+)?clock_[a-z0-9_]*[ \t]*:/)
+}
+# A clock-reading helper: any function (anywhere in the file -- a test-only
+# fixture builder in tests/, or a production constructor; whichever is called
+# twice and compared is the one that matters) whose own body binds a `let` to
+# an unconditional, direct `now_ns()` or `SystemTime::now()` call, and whose
+# signature takes no now/clock parameter. The bare functions themselves are
+# not registered here: a test reading the live clock straight, with no helper
+# hiding the read, is a deliberate live-clock check (confirming a default
+# resolves to real time, say), not the #4000 shape this rule targets.
+function find_clock_fns(   i, k, name, sig, depth, started, seg, bi, nb, bc) {
+  for (i = 1; i <= nlines; i++) {
+    if (!match(clean[i], /(^|[ \t])fn[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) continue
+    name = substr(clean[i], RSTART, RLENGTH)
+    sub(/^[ \t]*fn[ \t]+/, "", name)
+    if (index(clean[i], "(") == 0) continue
+    sig = substr(clean[i], index(clean[i], "("))
+    k = i
+    while (balance(sig) > 0 && k < nlines) { k++; sig = sig " " clean[k] }
+    if (fn_sig_has_now_param(sig)) continue
+    depth = 0; started = 0
+    for (k = i; k <= nlines && k <= i + 2000; k++) {
+      seg = clean[k]
+      nb = length(seg)
+      for (bi = 1; bi <= nb; bi++) {
+        bc = substr(seg, bi, 1)
+        if (bc == "{") { depth++; started = 1 }
+        else if (bc == "}") depth--
+      }
+      if (started && seg ~ /^[ \t]*let[ \t]+(mut[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*(now_ns\(\)|SystemTime::now\()/) {
+        clockfn[name] = 1
+      }
+      if (started && depth <= 0) break
+    }
+  }
+}
+# Within one #[test]/#[tokio::test] function body, tag an identifier bound
+# (directly or through a chain of `let`s, in source order -- a test function
+# runs top to bottom, so this needs no fixpoint the way Pass A2 does) to a
+# a clock-reading helper call. Two differently-tagged identifiers meeting in
+# one assertion is two independent clock readings compared: the #4000 shape.
+function scan_clock(   i, j, k, cj, cap, name, attr_ok, depth, started, seg, bi, nb, bc,
+                        buf, b, lhs, rhs, parts, ntok, tok, ident, call, cnt, tagkey, seen, tagctr) {
+  for (i = 1; i <= nlines; i++) {
+    if (clean[i] !~ /fn[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(/) continue
+    attr_ok = 0
+    for (j = i - 1; j >= 1; j--) {
+      if (raw[j] ~ /^[ \t]*$/) continue
+      if (raw[j] ~ /^[ \t]*\/\//) continue
+      if (raw[j] ~ /^[ \t]*#\[/) {
+        if (raw[j] ~ /#\[[ \t]*(tokio::)?test([ \t]*\(|[ \t]*\])/) attr_ok = 1
+        continue
+      }
+      break
+    }
+    if (!attr_ok) continue
+    depth = 0; started = 0; tagctr = 0
+    delete clocktag
+    for (k = i; k <= nlines && k <= i + 4000; k++) {
+      seg = clean[k]
+      nb = length(seg)
+      for (bi = 1; bi <= nb; bi++) {
+        bc = substr(seg, bi, 1)
+        if (bc == "{") { depth++; started = 1 }
+        else if (bc == "}") depth--
+      }
+      if (started && k > i && seg ~ /^[ \t]*let[ \t]/ && index(seg, "=") > 0) {
+        lhs = substr(seg, 1, index(seg, "=") - 1)
+        rhs = substr(seg, index(seg, "=") + 1)
+        if (lhs !~ /[!<>=]$/) {
+          gsub(/[^A-Za-z0-9_]+/, " ", lhs)
+          ntok = split(lhs, parts, " ")
+          ident = ""
+          for (tok = 2; tok <= ntok; tok++) {
+            if (parts[tok] == "mut") continue
+            ident = parts[tok]; break
+          }
+          if (ident != "") {
+            call = ""
+            for (name in clockfn) {
+              if (is_call(rhs, name)) { call = name; break }
+            }
+            if (call != "") {
+              tagctr++
+              clocktag[ident] = "t" tagctr
+            } else {
+              for (tagkey in clocktag) {
+                if (has_word(rhs, tagkey)) { clocktag[ident] = clocktag[tagkey]; break }
+              }
+            }
+          }
+        }
+      }
+      if (started && k > i && seg ~ /assert[a-z_]*!/ && index(seg, "(") > 0) {
+        buf = substr(seg, index(seg, "assert"))
+        b = balance(buf)
+        cap = 0; cj = k
+        while (b > 0 && cap < 40 && cj < nlines) {
+          cj++; cap++
+          buf = buf " " clean[cj]
+          b = balance(buf)
+        }
+        if (b == 0) {
+          delete seen
+          cnt = 0
+          for (tagkey in clocktag) {
+            if (has_word(buf, tagkey) && !(clocktag[tagkey] in seen)) {
+              seen[clocktag[tagkey]] = 1
+              cnt++
+            }
+          }
+          if (cnt >= 2) {
+            report("clock-compared", k, "two independently-read clock values compared in one assertion: build both fixtures from one reading, passed in rather than read by the helper")
+          }
+        }
+      }
+      if (started && depth <= 0) break
+    }
+  }
+}
+# An #[ignore] whose reason names "flaky" but cites no issue (#<digits>). Raw
+# lines, not the stripped skeleton: the reason lives inside a string literal
+# or a comment, both of which strip_line removes from clean[]. The walk
+# upward passes over other attribute lines (`#[test]` can sit between the
+# comment and `#[ignore]`, in either order) without stopping, so a reason
+# commented above the whole attribute block is read regardless of where
+# `#[ignore]` falls within it.
+function scan_ignore_flaky(   i, j, combined) {
+  for (i = 1; i <= nlines; i++) {
+    if (raw[i] !~ /#\[[ \t]*ignore([ \t]*=|[ \t]*\])/) continue
+    combined = raw[i]
+    for (j = i - 1; j >= 1; j--) {
+      if (raw[j] ~ /^[ \t]*\/\//) { combined = combined " " raw[j]; continue }
+      if (raw[j] ~ /^[ \t]*#\[/) continue
+      break
+    }
+    if (tolower(combined) !~ /flaky/) continue
+    if (combined ~ /#[0-9]+/) continue
+    report("ignore-flaky", i, "#[ignore] names flaky but cites no issue: file one, or cite #<the one that already exists>")
+  }
 }
 function scan(   i, j, buf, rawbuf, start, b, id, lhs, rhs, k, parts, ntok, cap, hit, changed, rounds, src) {
   # Pass A: identifiers holding a wall-clock measurement. Test regions only:
@@ -311,11 +493,17 @@ function scan(   i, j, buf, rawbuf, start, b, id, lhs, rhs, k, parts, ntok, cap,
     if (allowed("unseeded-rng", i)) continue
     report("unseeded-rng", i, "test draws from OS entropy: seed it (StdRng::seed_from_u64) so a failure replays")
   }
+  # Rule: ignore-flaky. No file-scope state to build first.
+  scan_ignore_flaky()
+  # Rule: clock-compared. find_clock_fns() must run first: scan_clock() reads
+  # the clockfn set it builds.
+  find_clock_fns()
+  scan_clock()
 }
 BEGIN { SQ = sprintf("%c", 39) }   # a single quote, unwriteable in this quoting
 FNR == 1 {
   if (nlines > 0) scan()
-  delete raw; delete clean; delete timing
+  delete raw; delete clean; delete timing; delete clockfn
   nlines = 0; cfg_test_line = 0
   sstate = 0; shashes = 0; sesc = 0; bdepth = 0
   curfile = FILENAME
