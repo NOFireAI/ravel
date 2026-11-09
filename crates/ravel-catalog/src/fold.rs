@@ -416,8 +416,8 @@ pub struct FoldReport {
     /// whether or not a metrics erasure request is pending. The fold never
     /// builds leaves for a part it carries (ADR-3939 decision 2), so such a
     /// part keeps its refs until `ravel-cli catalog fold --rebuild-key-index`
-    /// attaches the missing ones; a field no entry of the part indexes stays
-    /// missing after that too. Nonzero logs one warning per fold naming the
+    /// attaches the missing ones; a metrics field over the byte cap, or a
+    /// field no entry of the part indexes, stays missing after that too. Nonzero logs one warning per fold naming the
     /// tenant, signal and the missing fields. Zero with the leaf switch off
     /// and on a no-op fold.
     pub key_index_parts_missing_declared_leaves: u64,
