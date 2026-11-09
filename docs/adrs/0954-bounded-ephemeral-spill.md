@@ -845,6 +845,7 @@ answered, but three properties of the decision above cost the rest:
    the spill configuration, not only the scratch reservation: the plan, the
    session, the column-statistics decision and the pool are those of a
    server with spill unconfigured.
+   Its partition count is floored by ADR-1195's first-attempt floor amendment.
 
    When that attempt fails with a memory-budget refusal, the statement
    retries once with spill allowed, but only if all of these hold:

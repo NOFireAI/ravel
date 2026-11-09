@@ -621,7 +621,10 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 /// The executor this builds reads no Parquet table: a name that is not a
 /// signal table resolves as it did before Parquet tables existed.
 /// [`build_sql_state_with_parquet`] is the same state with Parquet sources
-/// installed, which is what [`crate::start`] builds.
+/// installed, which is what [`crate::start`] builds. This one keeps
+/// `SqlConfig`'s default in-memory partition floor (issue #4014) whatever
+/// `engine_config.sql_partition_count` says; [`crate::start`] resolves it
+/// with [`resolve_sql_first_attempt_partitions`].
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state(
@@ -661,6 +664,7 @@ pub fn build_sql_state(
         &SqlSpillInputs::default(),
         ravel_sql::IpcryptDeployment::default(),
         None,
+        ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
     )
 }
 
@@ -761,6 +765,76 @@ impl ResolvedBulkScanMinBytes {
                 "performance default resolved"
             ),
         }
+    }
+}
+
+/// `source` of a `sql_first_attempt_partitions` line whose derived partition
+/// count is below the floor, so the in-memory attempt plans the floor.
+pub const FIRST_ATTEMPT_SOURCE_DERIVED_FLOOR: &str = "derived-floor";
+/// `source` of a `sql_first_attempt_partitions` line whose derived partition
+/// count is already at or above the floor, so the attempt plans that count.
+pub const FIRST_ATTEMPT_SOURCE_DERIVED: &str = "derived";
+/// `source` of a `sql_first_attempt_partitions` line whose partition count was
+/// set by `--sql-partition-count` or the legacy `--fetch-concurrency`, which
+/// turns the floor off.
+pub const FIRST_ATTEMPT_SOURCE_FLAG: &str = "flag";
+
+/// The partition count an executed SQL statement's in-memory first attempt
+/// plans (issue #4014), and the floor that produced it.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedFirstAttemptPartitions {
+    /// `SqlConfig::first_attempt_min_partitions`: the default floor for a
+    /// derived count, `0` (off) for an explicit one.
+    pub min_partitions: usize,
+    /// What the in-memory attempt plans: `max(sql_partition_count,
+    /// min_partitions)`.
+    pub value: usize,
+    /// One of the `FIRST_ATTEMPT_SOURCE_*` constants.
+    pub source: &'static str,
+}
+
+/// Resolve the in-memory attempt's floor from the resolved
+/// `sql_partition_count` and its `PERF_SOURCE_*` source. A derived count keeps
+/// `SqlConfig`'s default floor; a count the operator set, through
+/// `--sql-partition-count` or `--fetch-concurrency`, is planned as given. The
+/// spill retry plans `sql_partition_count` either way.
+#[cfg(feature = "sql")]
+pub fn resolve_sql_first_attempt_partitions(
+    sql_partition_count: usize,
+    sql_partition_count_source: &str,
+) -> ResolvedFirstAttemptPartitions {
+    if sql_partition_count_source != crate::config::PERF_SOURCE_DERIVED {
+        return ResolvedFirstAttemptPartitions {
+            min_partitions: 0,
+            value: sql_partition_count,
+            source: FIRST_ATTEMPT_SOURCE_FLAG,
+        };
+    }
+    let min_partitions = ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS;
+    let source = if sql_partition_count < min_partitions {
+        FIRST_ATTEMPT_SOURCE_DERIVED_FLOOR
+    } else {
+        FIRST_ATTEMPT_SOURCE_DERIVED
+    };
+    ResolvedFirstAttemptPartitions {
+        min_partitions,
+        value: sql_partition_count.max(min_partitions),
+        source,
+    }
+}
+
+#[cfg(feature = "sql")]
+impl ResolvedFirstAttemptPartitions {
+    /// The `sql_first_attempt_partitions` startup line, in the
+    /// `performance default resolved` layout.
+    pub fn emit(&self) {
+        tracing::info!(
+            setting = "sql_first_attempt_partitions",
+            value = self.value,
+            source = self.source,
+            "performance default resolved"
+        );
     }
 }
 
@@ -1596,6 +1670,7 @@ pub fn build_sql_state_with_parquet(
     scan_decode_inline: bool,
     ipcrypt: ravel_sql::IpcryptDeployment,
     cache_bulk_scan_min_bytes: Option<u64>,
+    first_attempt_min_partitions: usize,
 ) -> anyhow::Result<crate::sql::SqlState> {
     let external = parquet_profiles.map(|config| {
         let stores = ravel_sql::ProfileStores::new(config.profiles);
@@ -1645,6 +1720,7 @@ pub fn build_sql_state_with_parquet(
         spill,
         ipcrypt,
         cache_bulk_scan_min_bytes,
+        first_attempt_min_partitions,
     )
 }
 
@@ -1672,6 +1748,7 @@ fn build_sql_state_inner(
     spill: &SqlSpillInputs,
     ipcrypt: ravel_sql::IpcryptDeployment,
     cache_bulk_scan_min_bytes: Option<u64>,
+    first_attempt_min_partitions: usize,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -1707,6 +1784,9 @@ fn build_sql_state_inner(
         // The top-keys bound under `GROUP BY ... ORDER BY <group key> LIMIT`
         // (ADR-4002): the shipped default, with no flag, for the same reason.
         bounded_top_keys_max_limit: SqlConfig::default().bounded_top_keys_max_limit,
+        // Issue #4014: the in-memory attempt's partition floor, from
+        // `resolve_sql_first_attempt_partitions`; no flag of its own.
+        first_attempt_min_partitions,
         // The per-partition TopK's limit ceiling: the shipped default, with
         // no flag, for the same reason as the line above.
         partition_topk_max_limit: SqlConfig::default().partition_topk_max_limit,
@@ -3160,6 +3240,7 @@ mod tests {
             false,
             ravel_sql::IpcryptDeployment::default(),
             None,
+            ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), 7_000);
@@ -3218,6 +3299,7 @@ mod tests {
             false,
             ravel_sql::IpcryptDeployment::default(),
             None,
+            ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), expected_ms);
@@ -3351,6 +3433,7 @@ mod tests {
                 false,
                 ravel_sql::IpcryptDeployment::default(),
                 None,
+                ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
             )
             .expect("sql state builds")
         };
@@ -3585,6 +3668,8 @@ mod tests {
                 false,
                 ravel_sql::IpcryptDeployment::default(),
                 None,
+                // An explicit count, so the floor is off as `start` sets it.
+                0,
             )
             .expect("sql state builds");
             let request = ravel_sql::SqlRequest {
@@ -3895,6 +3980,193 @@ mod tests {
             let resolved_line = resolved_line(&lines, "cache_bulk_scan_min_bytes");
             assert!(resolved_line.contains(line), "{label}: {resolved_line}");
         }
+    }
+
+    /// The query budgets `start` resolves from `argv` on a host of `cores`
+    /// cores and the reference host's 30 GB.
+    fn budgets_from_cli(argv: &[&str], cores: usize) -> crate::config::QueryBudgets {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(argv).expect("flags parse");
+        let resolved = cli
+            .resolve_performance(crate::config::HostProfile::new(
+                cores,
+                Some(32_212_254_720),
+                Some(32_212_254_720),
+                None,
+                None,
+                None,
+            ))
+            .expect("performance defaults resolve");
+        cli.query_budgets(&resolved).expect("budgets resolve")
+    }
+
+    /// Issue #4014: the `sql_first_attempt_partitions` startup line names the
+    /// in-memory attempt's partition count and why. The derived count is
+    /// `max(8, 2 x cores)`: its 8 on 2 or 4 cores is floored to 16,
+    /// `derived-floor`; its 16 on 8 cores or 32 on 16 cores stands, `derived`;
+    /// `--sql-partition-count 8` or the legacy `--fetch-concurrency 8` turns
+    /// the floor off, 8 with source `flag`.
+    ///
+    /// FLIP: resolving an explicit count like a derived one reads the two
+    /// flag cases as 16 with source `derived-floor`.
+    #[test]
+    fn the_first_attempt_partition_line_names_each_source() {
+        for (label, argv, cores, min_partitions, value, source, line) in [
+            (
+                "derived 8 on 2 cores",
+                &["ravel-server"][..],
+                2,
+                16,
+                16,
+                FIRST_ATTEMPT_SOURCE_DERIVED_FLOOR,
+                " setting=\"sql_first_attempt_partitions\" value=16 source=\"derived-floor\"",
+            ),
+            (
+                "derived 8 on 4 cores",
+                &["ravel-server"][..],
+                4,
+                16,
+                16,
+                FIRST_ATTEMPT_SOURCE_DERIVED_FLOOR,
+                " setting=\"sql_first_attempt_partitions\" value=16 source=\"derived-floor\"",
+            ),
+            (
+                "derived 16 on 8 cores",
+                &["ravel-server"][..],
+                8,
+                16,
+                16,
+                FIRST_ATTEMPT_SOURCE_DERIVED,
+                " setting=\"sql_first_attempt_partitions\" value=16 source=\"derived\"",
+            ),
+            (
+                "derived 32 on 16 cores",
+                &["ravel-server"][..],
+                16,
+                16,
+                32,
+                FIRST_ATTEMPT_SOURCE_DERIVED,
+                " setting=\"sql_first_attempt_partitions\" value=32 source=\"derived\"",
+            ),
+            (
+                "--sql-partition-count 8",
+                &["ravel-server", "--sql-partition-count", "8"][..],
+                2,
+                0,
+                8,
+                FIRST_ATTEMPT_SOURCE_FLAG,
+                " setting=\"sql_first_attempt_partitions\" value=8 source=\"flag\"",
+            ),
+            (
+                "--fetch-concurrency 8",
+                &["ravel-server", "--fetch-concurrency", "8"][..],
+                2,
+                0,
+                8,
+                FIRST_ATTEMPT_SOURCE_FLAG,
+                " setting=\"sql_first_attempt_partitions\" value=8 source=\"flag\"",
+            ),
+        ] {
+            let budgets = budgets_from_cli(argv, cores);
+            let resolved = resolve_sql_first_attempt_partitions(
+                budgets.sql_partition_count,
+                budgets.sql_partition_count_source,
+            );
+            assert_eq!(
+                resolved,
+                ResolvedFirstAttemptPartitions {
+                    min_partitions,
+                    value,
+                    source
+                },
+                "{label}"
+            );
+            let (capture, guard) = capture_info();
+            resolved.emit();
+            drop(guard);
+            let lines = capture.0.lock().clone();
+            let resolved_line = resolved_line(&lines, "sql_first_attempt_partitions");
+            assert!(resolved_line.contains(line), "{label}: {resolved_line}");
+        }
+    }
+
+    /// Issue #4014, through the builder `start` calls: on a 2-core host the
+    /// executor's in-memory attempt plans 16 partitions and its spill attempt
+    /// the derived 8, while `--sql-partition-count 8` plans 8 for both.
+    ///
+    /// FLIP: resolving an explicit count like a derived one plans the
+    /// flag's in-memory attempt at 16.
+    #[test]
+    fn an_explicit_sql_partition_count_leaves_the_in_memory_attempt_unfloored() {
+        let planned = |argv: &[&str]| {
+            let budgets = budgets_from_cli(argv, 2);
+            let first_attempt = resolve_sql_first_attempt_partitions(
+                budgets.sql_partition_count,
+                budgets.sql_partition_count_source,
+            );
+            let engine = budgets
+                .apply_to_engine(EngineConfig::default())
+                .expect("engine config");
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let catalog = build_catalog(
+                store.clone(),
+                1,
+                false,
+                ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+                None,
+                None,
+                None,
+                Duration::from_secs(2),
+            )
+            .expect("catalog");
+            let state = build_sql_state_with_parquet(
+                catalog,
+                store,
+                Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+                None,
+                engine,
+                Arc::new(GetLimiter::new(1).expect("nonzero permits")),
+                budgets.sql_max_query_bytes,
+                budgets.sql_tenant_max_bytes,
+                budgets.sql_parallel_final_aggregation,
+                budgets.sql_bucketed_final_aggregation,
+                Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                    std::collections::HashSet::new(),
+                )),
+                QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+                None,
+                Arc::new(ravel_memory::MemoryBudget::unlimited()),
+                None,
+                ravel_sql::DEFAULT_MIN_GRACE_MS,
+                &SqlSpillInputs::default(),
+                crate::cpu_gates::CpuGates::new(Default::default()).read,
+                false,
+                ravel_sql::IpcryptDeployment::default(),
+                None,
+                first_attempt.min_partitions,
+            )
+            .expect("sql state builds");
+            let dir = std::path::PathBuf::from("/tmp/does-not-need-to-exist");
+            let target_partitions = |spill| {
+                ravel_sql::session_config(state.executor.config(), true, spill)
+                    .options()
+                    .execution
+                    .target_partitions
+            };
+            (
+                target_partitions(ravel_sql::SpillDecision::Disabled),
+                target_partitions(ravel_sql::SpillDecision::Enabled {
+                    dir: dir.as_path(),
+                    max_bytes: 1 << 20,
+                }),
+            )
+        };
+        assert_eq!(planned(&["ravel-server"]), (16, 8), "derived 8");
+        assert_eq!(
+            planned(&["ravel-server", "--sql-partition-count", "8"]),
+            (8, 8),
+            "--sql-partition-count 8"
+        );
     }
 
     /// `--cache-dir` alone derives the ceiling from the free bytes measured at
@@ -4450,6 +4722,7 @@ mod tests {
             false,
             ravel_sql::IpcryptDeployment::default(),
             None,
+            ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         )
         .expect("sql state builds");
         state.executor.config().clone()

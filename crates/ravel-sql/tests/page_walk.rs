@@ -1876,6 +1876,7 @@ fn checked_sum_context(
 ) -> SessionContext {
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(target_partitions);
+    config.first_attempt_min_partitions = 0;
     let pool = Arc::new(TenantDelegatingPool::new(
         1 << 30,
         TenantMemoryAccountant::new(1 << 30),

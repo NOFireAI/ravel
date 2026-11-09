@@ -440,6 +440,7 @@ fn read_cache() -> Arc<Cache<CacheFetchError>> {
 fn session(provider: LogsTableProvider, setup: Setup) -> SessionContext {
     let mut config = SqlConfig::default();
     config.engine.fetch_concurrency = setup.partitions;
+    config.first_attempt_min_partitions = 0;
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let pool = Arc::new(TenantDelegatingPool::new(
         1 << 30,

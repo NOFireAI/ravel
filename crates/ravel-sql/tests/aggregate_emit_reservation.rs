@@ -241,6 +241,7 @@ async fn an_emitted_aggregate_batch_stays_reserved_while_it_is_held() {
 async fn a_legacy_aggregate_batch_stays_reserved_through_the_hold() {
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(1);
+    config.first_attempt_min_partitions = 0;
     let reading = read_while_first_batch_is_held(DISTINCT_LIMIT, config).await;
     assert!(
         reading.plan.contains("AggregateExec: mode=Single,") && reading.plan.contains(", lim=["),

@@ -2836,18 +2836,24 @@ impl SqlExecutor {
             );
             // Whether a logs scan probes KEY_IDX is known only once the plan
             // has pushed its filters down, so both shapes are taken here and
-            // the attempt's plan picks one.
+            // the attempt's plan picks one. A retry plans with spill and the
+            // engine count, a first attempt in memory at the floored count.
+            let attempt_partitions = self
+                .config
+                .partition_count_for(spill_attempt == SpillAttempt::Retry);
             let io_shape = self.sql_io_shape(
                 &lane_refs,
                 &phase_accounting,
                 unfolded_segments_resolved,
                 false,
+                attempt_partitions,
             );
             let keyed_io_shape = self.sql_io_shape(
                 &lane_refs,
                 &phase_accounting,
                 unfolded_segments_resolved,
                 true,
+                attempt_partitions,
             );
 
             let (result, emitted, blocks, spill, spill_by_operator, caps) = self
@@ -4627,7 +4633,7 @@ impl SqlExecutor {
     /// the way the PromQL engine's selector fan-out does. There is therefore
     /// no `distinct_plans`/`service_fetch_multiplier` concept to sum waves
     /// over here: per lane this is the single-plan reduction `service_batches_over_plan_waves`'s own doc
-    /// comment names, `service_batches(segments, min(sql_partition_count,
+    /// comment names, `service_batches(segments, min(partitions,
     /// shared_get_permits))` -- the same reduction `ravel_query::engine`
     /// computes for a single-plan PromQL query, both reading the same
     /// process-wide `GetLimiter` (ADR-1195; `services/ravel-server/src/
@@ -4642,15 +4648,18 @@ impl SqlExecutor {
     ///
     /// `keyed` is whether a logs scan of the statement carries KEY_IDX
     /// equalities (ADR-2707 decision 5); see [`Self::io_shape_bounds`].
+    /// `partitions` is the attempt's `target_partitions`
+    /// ([`SqlConfig::partition_count_for`]), the fan-out its scans read.
     fn sql_io_shape(
         &self,
         lanes: &[(TargetSignal, &Snapshot)],
         phase_accounting: &StatementAccounting,
         unfolded_segments_resolved: u64,
         keyed: bool,
+        partitions: usize,
     ) -> QueryIoShape {
         let mut counts = IoShapeCounts::default();
-        let concurrency = self.config.engine.sql_partition_count().max(1) as u64;
+        let concurrency = partitions.max(1) as u64;
         let mut depth = 0;
         let mut service_batches = 0u32;
         for (target, snapshot) in lanes {
@@ -4673,8 +4682,8 @@ impl SqlExecutor {
                 .fold(depth, u32::max);
             // The two bounds `service_batches` divides by, mirroring
             // `ravel_query::engine::io_shape_for_resolve`: the fan-out this
-            // crate's own scan partitions the segments into
-            // (`sql_partition_count`) and `target`'s own fetcher's permit
+            // crate's own scan partitions the segments into (the attempt's
+            // `partitions`) and `target`'s own fetcher's permit
             // count. The three fetchers this executor holds are not guaranteed
             // to share one `GetLimiter` (ADR-1195 lets a caller wire each to
             // its own private limiter, which
@@ -12224,6 +12233,7 @@ pub(crate) mod tests {
             &StatementAccounting::new(),
             0,
             false,
+            8,
         );
         assert_eq!(shape.dependency_depth, 1);
     }
@@ -12244,6 +12254,7 @@ pub(crate) mod tests {
             &StatementAccounting::new(),
             0,
             true,
+            8,
         );
         assert_eq!(shape.dependency_depth, 6);
 
@@ -12253,6 +12264,7 @@ pub(crate) mod tests {
             &StatementAccounting::new(),
             0,
             true,
+            8,
         );
         assert_eq!(shape.dependency_depth, 1);
     }

@@ -54,9 +54,10 @@ pub trait SuiteEngine: Send + Sync {
 /// reference would follow the host's available parallelism. It does not fix
 /// the order the final aggregate merges those partials in, which follows
 /// stream arrival, so a float result can still move in its last bits between
-/// runs and the comparator's ULP tolerance has to cover that. 8 is what `SqlConfig::default()` already
-/// resolves to (`ravel_query::DEFAULT_FETCH_CONCURRENCY`), so pinning it
-/// leaves Ravel's plan the shape its default configuration produces.
+/// runs and the comparator's ULP tolerance has to cover that. 8 is the count
+/// `SqlConfig::default()` resolves to (`ravel_query::DEFAULT_FETCH_CONCURRENCY`).
+/// [`InProcessEngine`] turns the first-attempt floor off, which would
+/// otherwise plan its in-memory attempt at 16 while the reference plans 8.
 pub const PLAN_PARTITIONS: usize = 8;
 
 /// In-process `SqlExecutor`, wired to a second "lake" `MemoryStore` the way
@@ -168,6 +169,7 @@ mod in_process {
                             sql_partition_count: Some(PLAN_PARTITIONS),
                             ..EngineConfig::default()
                         },
+                        first_attempt_min_partitions: 0,
                         ..SqlConfig::default()
                     },
                     1 << 30,

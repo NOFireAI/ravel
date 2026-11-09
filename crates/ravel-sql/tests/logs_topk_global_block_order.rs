@@ -387,6 +387,7 @@ async fn setup(fixture: Fixture, skip: bool) -> Setup {
 
     let mut config = SqlConfig::default();
     config.engine.fetch_concurrency = PARTITIONS;
+    config.first_attempt_min_partitions = 0;
     let pool = Arc::new(TenantDelegatingPool::new(
         1 << 30,
         TenantMemoryAccountant::new(1 << 30),
