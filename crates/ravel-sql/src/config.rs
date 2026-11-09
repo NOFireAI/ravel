@@ -583,7 +583,8 @@ pub struct SqlConfig {
     /// partitions; a [`SpillDecision::Enabled`] session, which on the execute
     /// path is the ADR-0954 spill retry, targets the engine count unchanged.
     /// 0 turns the floor off, which is the "before" side of
-    /// `tests/first_attempt_partitions.rs`.
+    /// `the_partition_floor_answers_in_memory_where_the_engine_count_retries`
+    /// in `tests/spill.rs`.
     /// [`SqlConfig::attempt_partition_count`] is the one place it is read.
     ///
     /// Default [`DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS`]. Set once at server

@@ -92,7 +92,9 @@ so that the three can diverge later, deliberately, rather than by accident here.
 No default moves. The SQL partition default in particular stays where it is:
 `crates/ravel-sql/src/session.rs:540-544` sets `target_partitions` immediately
 above `with_repartition_aggregations`, which ADR-0094 and ADR-0954 depend on, and
-moving it silently would put those in scope.
+moving it silently would put those in scope. (A derived count no longer sets the
+in-memory attempt's partitions alone: see the first-attempt floor amendment
+below.)
 
 **GET concurrency becomes one process-owned limiter**, an `Arc` constructed once
 and shared by every query-side fetcher, replacing the per-fetcher semaphore. The
@@ -167,3 +169,72 @@ changing that default pulls ADR-0094's aggregation gate into scope.
   the derived-defaults table both change.
 - No performance claim. If a benchmark moves on this change alone, that is a
   finding to investigate, not the expected outcome.
+
+## Amendment (2026-11-09): the in-memory attempt plans at least 16 partitions (issue #4014)
+
+<!-- amendment-applies: sections="Decision" pointer="first-attempt floor amendment" -->
+
+This is the first-attempt floor amendment. The derived `--sql-partition-count`
+default does not move. What changes is that, when the count is derived, a
+statement's in-memory attempt plans at least 16 DataFusion partitions.
+
+### First-attempt floor context
+
+ClickBench statement 9 on c6a.large (2 vCPU, 4 GB) runs at the derived count
+of 8, `max(8, 2 x cores)`. Its final aggregate builds 8 hash tables of about
+165 MB, and the aggregate reserve-ahead holds about 288 MB of the process
+budget for the next doubling. The statement answered in memory only at a
+process budget of about 2.40 GB or more. A c6a.large derives 2.30 to 2.41 GB,
+so about half of server lifetimes took ADR-0954's spill retry: 31 s against
+12 s in memory (#4014 comment 6734808033).
+
+At 16 partitions each table is half the size, and so is the reserve held for
+the next doubling of the widest tables. The in-memory threshold fell to 2.10
+to 2.20 GB: at 2.20 GB, 9 of 9 tries answered in memory against 0 of 9 at 8
+partitions. Across the 43 ClickBench statements the in-memory times stayed
+flat at 16. The 7 statements that took the retry ran 3 to 14 percent slower
+when the retry also planned 16 partitions, because it wrote about twice the
+spill files and needed one more merge pass at fan-in 2 (#4014 comment
+6741262204).
+
+### First-attempt floor decision
+
+1. **A session planned without spill uses at least 16 partitions.**
+   `SqlConfig::first_attempt_min_partitions` (default
+   `DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS`, 16) floors `target_partitions`
+   for a `SpillDecision::Disabled` session at
+   `max(sql_partition_count, floor)`, through
+   `SqlConfig::attempt_partition_count`. On the execute path that is every
+   first attempt, and any statement that plans without spill. A floor of 0
+   turns it off.
+2. **The spill retry keeps the derived count.** Its session is
+   `SpillDecision::Enabled`, so it plans `sql_partition_count` unchanged,
+   because more partitions on the retry cost spill files and a merge pass. A
+   plan-time statement (Flight SQL, pinned plans) that plans with spill keeps
+   the count for the same reason.
+3. **An explicit count turns the floor off.** ravel-server passes the floor
+   of 16 only when `sql_partition_count` was derived.
+   `--sql-partition-count`, or the legacy `--fetch-concurrency`, sets the
+   floor to 0, and every attempt plans the given count. An operator who set
+   a count chose it, and raising it would override that choice without
+   saying so. No flag sets the floor.
+4. **Startup says which.** ravel-server logs
+   `setting="sql_first_attempt_partitions"` with the in-memory attempt's
+   `value` and a `source`: `derived-floor` (a derived count under 16, raised
+   to 16), `derived` (a derived count of 16 or more, unchanged) or `flag` (an
+   explicit count, unchanged).
+5. **The other reads of the count.** The SQL I/O shape takes the attempt's
+   partition count as its scan fan-out. The aggregate reserve-ahead
+   envelope width (`process_envelope_width`) keeps reading the engine count,
+   because one width is shared by every pool on a process budget. A derived
+   count is at least the core count, so that width is the core count either
+   way.
+
+### First-attempt floor consequences
+
+- On a host with fewer than 8 cores and a derived count, the in-memory
+  attempt plans 16 partitions where it planned the derived 8 to 14. On 8 or
+  more cores the derived count is already at least 16 and nothing changes.
+- A retry that falls back to planning without spill (its plan is not
+  spill-eligible, or it has no spill share) is planned at the floored count,
+  while its I/O shape was computed with the engine count as its fan-out.

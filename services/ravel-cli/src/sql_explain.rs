@@ -169,6 +169,9 @@ fn sql_config(opts: &ExplainOptions) -> anyhow::Result<SqlConfig> {
     let mut config = SqlConfig::default();
     if let Some(partitions) = opts.sql_partitions {
         config.engine.sql_partition_count = Some(partitions);
+        // The server's `--sql-partition-count` turns the first-attempt floor
+        // off, so the same count here has to as well to plan the same shape.
+        config.first_attempt_min_partitions = 0;
     }
     config
         .engine
