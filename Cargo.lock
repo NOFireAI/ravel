@@ -945,6 +945,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-oid"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
 name = "const-random"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1985,6 +1991,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
+ "const-oid",
  "crypto-common 0.2.2",
 ]
 
@@ -5699,9 +5706,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.2.0"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42b6914fac0be956fe704a38239c3f44a9f841d1b06a5713d2f638065593f5b5"
+checksum = "d24a7e92f4bcaa36b97fa93c4fa7ca8f3e669eced949345b3462dba333c7f909"
 dependencies = [
  "async-trait",
  "base64 0.23.0",
@@ -5712,6 +5719,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "indexmap",
+ "libc",
  "pastey",
  "pin-project-lite",
  "rand 0.10.2",
@@ -5720,6 +5728,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "sse-stream",
  "thiserror",
  "tokio",
@@ -5732,9 +5741,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.2.0"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdf1c49bd4d52014b94db0877410db273c2008f01628b0252a2e9460ad9b7fda"
+checksum = "b3140f24a766f80f9ec1607bde85680959a69b83d46fa9ce87dadab7e67ab029"
 dependencies = [
  "darling 0.24.1",
  "proc-macro2",
@@ -6104,6 +6113,17 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "sha2"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest 0.11.3",
 ]
 
 [[package]]
