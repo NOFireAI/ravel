@@ -1202,10 +1202,7 @@ fn int_values(array: &ArrayRef) -> Vec<Option<i64>> {
 
 /// The aggregate expression `avg` of `sql`'s `TopKeysAggregateExec`, which
 /// must be present: the statement is admitted.
-async fn admitted_avg(
-    parts: Vec<Vec<RecordBatch>>,
-    sql: &str,
-) -> Arc<AggregateFunctionExpr> {
+async fn admitted_avg(parts: Vec<Vec<RecordBatch>>, sql: &str) -> Arc<AggregateFunctionExpr> {
     let (pool, _breach) = SqlConfig::default()
         .query_pool(TenantMemoryAccountant::new(1 << 30), QueryAccounting::new());
     let ctx = session(&SqlConfig::default(), pool, parts, &[]);
@@ -1336,19 +1333,25 @@ async fn the_identity_merge_is_bit_exact_for_admitted_float_states() {
         };
         let state = updated().state(EmitTo::All).expect("state");
         assert_eq!(float_bits(&state[0]), want_sums, "{sql}: the source sums");
-        assert_eq!(int_values(&state[1]), want_counts, "{sql}: the source counts");
+        assert_eq!(
+            int_values(&state[1]),
+            want_counts,
+            "{sql}: the source counts"
+        );
         let evaluated = updated().evaluate(EmitTo::All).expect("evaluate");
 
         let merged = || {
             let mut fresh = aggr.create_groups_accumulator().expect("accumulator");
-            fresh
-                .merge_batch(&state, &indexes, GROUPS)
-                .expect("merge");
+            fresh.merge_batch(&state, &indexes, GROUPS).expect("merge");
             fresh
         };
         let rebuilt = merged().state(EmitTo::All).expect("state");
         assert_eq!(float_bits(&rebuilt[0]), want_sums, "{sql}: rebuilt sums");
-        assert_eq!(int_values(&rebuilt[1]), want_counts, "{sql}: rebuilt counts");
+        assert_eq!(
+            int_values(&rebuilt[1]),
+            want_counts,
+            "{sql}: rebuilt counts"
+        );
         let rebuilt_evaluated = merged().evaluate(EmitTo::All).expect("evaluate");
         assert_eq!(
             float_bits(&rebuilt_evaluated),
@@ -1371,7 +1374,13 @@ async fn the_identity_merge_is_bit_exact_for_admitted_float_states() {
         ];
         empty.merge_batch(&none, &[], 0).expect("merge");
         let emptied = empty.state(EmitTo::All).expect("state");
-        assert_eq!(emptied.iter().map(|column| column.len()).collect::<Vec<_>>(), [0, 0]);
+        assert_eq!(
+            emptied
+                .iter()
+                .map(|column| column.len())
+                .collect::<Vec<_>>(),
+            [0, 0]
+        );
     }
 }
 
@@ -1485,7 +1494,8 @@ async fn an_admitted_float_aggregate_is_exact_through_rebuilds() {
     ];
     let (on, off) = on_and_off(float_minute_parts, &options, sql).await;
     assert_eq!(on.bounds, vec![60], "{}", on.plan);
-    assert!(on.rebuilds > 0, "rebuilds {}\n{}", on.rebuilds, on.plan);    let got = minute_averages(on.result.as_ref().expect("query runs"));
+    assert!(on.rebuilds > 0, "rebuilds {}\n{}", on.rebuilds, on.plan);
+    let got = minute_averages(on.result.as_ref().expect("query runs"));
     let want: Vec<(i64, Option<u64>)> = (FLOAT_MINUTES - 60..FLOAT_MINUTES)
         .rev()
         .map(|minute| (minute, minute_class_average(minute)))

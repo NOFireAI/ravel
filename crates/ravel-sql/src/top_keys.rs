@@ -222,10 +222,9 @@ impl TopKeysAggregateLimit {
             && aggregate.aggr_expr().iter().all(|aggr| {
                 aggr.groups_accumulator_supported()
                     && aggr.order_bys().is_empty()
-                    && (aggr
-                        .state_fields()
-                        .is_ok_and(|fields| fields.iter().all(|field| !is_float(field.data_type())))
-                        || float_state_is_identity(aggr, &input_schema))
+                    && (aggr.state_fields().is_ok_and(|fields| {
+                        fields.iter().all(|field| !is_float(field.data_type()))
+                    }) || float_state_is_identity(aggr, &input_schema))
             })
     }
 
