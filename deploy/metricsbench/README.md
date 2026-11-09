@@ -1633,8 +1633,7 @@ against a band file and is the pass/fail for a Stage 1 run.
 `stage1-bands.ci.json` is the `ci` profile's, and
 `stage1-bands.cardinality.json` is the `cardinality` profile's, the bands
 pre-registered for issue #3868's measured run (ADR-3694's Stage 1 rows; the
-rows it cannot check are read by hand at the readout; it expects a run with
-every arm on):
+rows it cannot check are read by hand at the readout):
 
 ```json
 {"schema": "metricsbench-stage1-bands/1", "profile": "ci",
