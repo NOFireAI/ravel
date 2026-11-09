@@ -201,6 +201,7 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
+        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill: Some(SpillConfig {
@@ -870,6 +871,7 @@ fn parallel_config(spill: Option<SpillConfig>) -> SqlConfig {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
+        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill,
@@ -1031,6 +1033,7 @@ async fn spill_off_reproduces_todays_refusal() {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
+        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill: None,
