@@ -1630,7 +1630,10 @@ does not qualify).
 
 **Checking a run.** `stage1-check.sh BANDS OUT-DIR` checks a run's figures
 against a band file and is the pass/fail for a Stage 1 run.
-`stage1-bands.ci.json` is the `ci` profile's:
+`stage1-bands.ci.json` is the `ci` profile's, and
+`stage1-bands.cardinality.json` is the `cardinality` profile's, the bands
+pre-registered for issue #3868's measured run (ADR-3694's Stage 1 rows; the
+rows it cannot check are read by hand at the readout):
 
 ```json
 {"schema": "metricsbench-stage1-bands/1", "profile": "ci",
