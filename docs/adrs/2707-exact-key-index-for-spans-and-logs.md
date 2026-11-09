@@ -1465,7 +1465,8 @@ changes here:
   `stats.signals[].keyIndex` carry `partsCovered`, `partsUncovered`,
   `partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
   `leafGetRequests`, `leafWireBytes`, `keysProbed`, `skippedByBudget` and
-  `skipIdxDropped` whenever a spans scan carried a pushed `trace_id`, and
+  `skipIdxDropped` (and `partsOverTierOne`, since ADR-3692's key-set ceiling
+  amendment) whenever a spans scan carried a pushed `trace_id`, and
   are absent otherwise; the process exports
   `ravel_query_key_index_parts_total{signal,outcome}` and
   `ravel_query_key_index_leaf_gets_total{signal}`. A tier-2 prune counts in
