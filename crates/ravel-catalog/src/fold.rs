@@ -431,7 +431,9 @@ pub struct FoldReport {
     /// The most previous-leaf bytes the incremental leaf build's carry held
     /// at once while building any one part in this fold, every source and
     /// field together: a slice is held from its GET until a pass starts past
-    /// its `key8_hi`. Zero with the leaf switch off and when no part carried.
+    /// its `key8_hi`. Zero with the leaf switch off and when no previous slice
+    /// was fetched; a slice fetched by a source's load that then failed on
+    /// another field counts.
     pub key_index_carry_peak_held_bytes: u64,
     /// Re-encoded metrics parts the publishing attempt left with no
     /// `label_value` leaf because its leaves would have totalled more than
@@ -16929,6 +16931,19 @@ pub(crate) mod tests {
             )
             .await
         );
+    }
+
+    /// A source's load that fetched one field's lowest slice and then fails
+    /// on another releases the slice's bytes, but the peak keeps them: they
+    /// were held.
+    #[test]
+    fn a_slice_released_by_a_failed_load_stays_in_the_peak() {
+        let mut hold = CarryHold::default();
+        hold.take(100);
+        hold.release(100);
+        assert_eq!((hold.held, hold.peak), (0, 100));
+        hold.take(40);
+        assert_eq!((hold.held, hold.peak), (40, 100));
     }
 
     /// A carry source's data object keys are derived only for a source a
