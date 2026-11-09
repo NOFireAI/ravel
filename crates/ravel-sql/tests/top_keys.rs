@@ -707,6 +707,37 @@ async fn integer_avg_is_admitted_and_exact_through_rebuilds() {
     }
 }
 
+/// The `Single` modes update from rows instead of merging states. One input
+/// partition on one target partition plans a `Single` aggregate over the
+/// source; a `GROUP BY k` over a subquery already grouped and hash
+/// partitioned on `k` plans a `SinglePartitioned` one. Both run through
+/// rebuilds over [`tied_parts`] and equal the complete figures row for row.
+#[tokio::test]
+async fn the_single_modes_are_admitted_and_exact() {
+    let batch = [("datafusion.execution.batch_size", "512")];
+    let one = [ONE_PARTITION, &batch[..]].concat();
+    let sql = "SELECT g, k, count(*), sum(v) FROM t GROUP BY g, k ORDER BY g, k LIMIT 100";
+    let (on, off) = on_and_off(|| vec![tied_parts().concat()], &one, sql).await;
+    assert_eq!(on.modes, vec![AggregateMode::Single], "{}", on.plan);
+    assert!(on.rebuilds > 0, "Single: no rebuild ran");
+    let want: Vec<Vec<String>> = (0..100)
+        .map(|k| tied_group(k)[..4].iter().map(i64::to_string).collect())
+        .collect();
+    assert_eq!(on.rows(), want, "Single");
+    assert_eq!(off.rows(), want, "Single: rule off");
+
+    let sql = "SELECT k, count(*), sum(s) FROM (SELECT k, sum(v) AS s FROM t GROUP BY k) \
+               GROUP BY k ORDER BY k LIMIT 100";
+    let (on, off) = on_and_off(tied_parts, &batch, sql).await;
+    assert_eq!(on.modes, vec![AggregateMode::SinglePartitioned], "{}", on.plan);
+    assert!(on.rebuilds > 0, "SinglePartitioned: no rebuild ran");
+    let want: Vec<Vec<String>> = (0..100)
+        .map(|k| vec![k.to_string(), "1".to_string(), tied_group(k)[3].to_string()])
+        .collect();
+    assert_eq!(on.rows(), want, "SinglePartitioned");
+    assert_eq!(off.rows(), want, "SinglePartitioned: rule off");
+}
+
 /// `ORDER BY g LIMIT 40` over [`tied_parts`] cuts through the 64 keys that
 /// tie on `g = 0`. The session runs without the executor's tie-order
 /// rewrite, so the sort stays on `g` alone and the ties are real. Every group
@@ -1592,7 +1623,9 @@ async fn the_tie_order_rewrites_two_term_and_project_through_shapes_are_admitted
 /// executor: two objects, 40,000 rows over 1,500 minutes, each minute
 /// visited once per pass of 1,500 rows. Some passes carry another counter, a
 /// refresh or a third day, which the `WHERE` drops. The page is minutes
-/// 1,000 to 1,009 with their exact counts, as with the rule off.
+/// 1,000 to 1,009 with their exact counts, as with the rule off. The rule-off
+/// plan has a `CompactSlicesExec` between the sort and the final aggregate;
+/// with the rule on, none stands between the sort and the exec.
 #[tokio::test]
 async fn clickbench_row_43_returns_exact_counts_through_the_logs_table() {
     let tenant = TenantId::new("top-keys-4004-q43".to_string());
@@ -1638,11 +1671,25 @@ async fn clickbench_row_43_returns_exact_counts_through_the_logs_table() {
                LIMIT 10 OFFSET 1000";
     let (plan, rows) = plan_and_run(&on, &tenant, sql).await;
     assert_eq!(top_keys_bounds(&plan), vec![1010], "{}", render(&plan));
+    let text = render(&plan);
+    let sort = text.find("SortExec").expect("a sort");
+    let exec = text.find("TopKeysAggregateExec").expect("the exec");
+    assert!(
+        sort < exec && !text[sort..exec].contains("CompactSlicesExec"),
+        "{text}"
+    );
     let (plan_off, rows_off) = plan_and_run(&off, &tenant, sql).await;
     assert!(
         top_keys_bounds(&plan_off).is_empty(),
         "{}",
         render(&plan_off)
+    );
+    let text_off = render(&plan_off);
+    let sort = text_off.find("SortExec").expect("a sort");
+    let aggregate = text_off.find("AggregateExec").expect("the final aggregate");
+    assert!(
+        sort < aggregate && text_off[sort..aggregate].contains("CompactSlicesExec"),
+        "{text_off}"
     );
 
     let minute_text = |minute: i64| {
