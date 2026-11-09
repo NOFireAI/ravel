@@ -516,11 +516,13 @@ is a defect of the task that owns it.
   reads, so the phase's total minus it is the tier-1 share),
   `keysProbed` (the key set's size). Per signal, the same object appears
   under `stats.signals[].keyIndex`. As shipped the object carries ten
-  fields, not these seven (see the #3702 amendment).
+  fields, not these seven (see the #3702 amendment), and eleven since the
+  key-set ceiling amendment added `partsOverTierOne`.
 - Metrics: `ravel_query_key_index_parts_total{signal, outcome}` with
   `outcome` in `covered | uncovered | beyond_ceiling | rejected |
   reservation_refused`, and `ravel_query_key_index_leaf_gets_total{signal}`.
-  As shipped `outcome` has a sixth value (see the #3702 amendment).
+  As shipped `outcome` has a sixth value (see the #3702 amendment), and a
+  seventh, `over_tier_one`, since the key-set ceiling amendment.
 - The fold report and `/metrics` gain `key_index_sections_read`,
   `key_index_entries_carried`, `key_index_build_passes` and
   `key_index_leaf_gets` per fold, beside the existing
@@ -831,7 +833,7 @@ found the decisions above describing a smaller surface than the one that
 shipped, and one figure stated without the fixture it holds for. What
 changes:
 
-- **Six outcomes, not five (decision 7).**
+- **Six outcomes, not five (decision 7; seven since the key-set ceiling amendment).**
   `ravel_query_key_index_parts_total{signal, outcome}` has `outcome` in
   `covered | uncovered | beyond_ceiling | rejected | reservation_refused |
   skipped_by_budget`. `skipped_by_budget` is a part whose key set's bridged
@@ -839,7 +841,7 @@ changes:
   declined by the leaf reader and left to tier 1. Both families render for
   `signal` `spans` and `logs` and every outcome, zeros included, in every
   mode; docs/guides/observability.md lists them with their HELP text.
-- **Ten statistics fields, not seven (decision 7).** `stats.keyIndex` and
+- **Ten statistics fields, not seven (decision 7; eleven since the key-set ceiling amendment).** `stats.keyIndex` and
   the spans entry of `stats.signals[].keyIndex` carry, in render order,
   `partsCovered`, `partsUncovered`, `partsBeyondCeiling`, `leavesRejected`,
   `reservationsRefused`, `leafGetRequests`, `leafWireBytes`, `keysProbed`,
@@ -1494,7 +1496,9 @@ Refs: #3918, #3692
 
 ## Amendment (issue #3939, key-set ceiling): the leaf GET ceiling scales with the key set, and a part is admitted against its own tier-1 cost
 
-<!-- amendment-applies: sections="2. One tier-2 router in ravel-query, shared by spans and logs|Consequences|Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)" pointer="key-set ceiling amendment" -->
+<!-- amendment-applies: sections="2. One tier-2 router in ravel-query, shared by spans and logs|7. What the statistics say, and what the harness asserts|Consequences|Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)" pointer="key-set ceiling amendment" -->
+<!-- amendment-supersedes: phrase="Six outcomes, not five" pointer="key-set ceiling amendment" -->
+<!-- amendment-supersedes: phrase="Ten statistics fields, not seven" pointer="key-set ceiling amendment" -->
 <!-- amendment-supersedes: phrase="`L_max` = 2,048 leaf GETs for the statement" pointer="key-set ceiling amendment" -->
 
 Date: 2026-11-08. Owner decision of the same day, under ADR-3939's
@@ -1550,6 +1554,14 @@ A ceiling meant to bound cost was inverting it.
   becomes the k = 1 value and the router computes the statement's ceiling
   from `k`; `key_index_root_shape` returns the pair unchanged, since no root
   lint consumes it yet.
+
+**Statistics and outcomes.** A part left to tier 1 by this test is its own
+outcome. `stats.keyIndex` and the spans entry of `stats.signals[].keyIndex`
+carry eleven fields: the ten the #3702 amendment lists, with
+`partsOverTierOne` rendered third, after `partsUncovered`.
+`ravel_query_key_index_parts_total{signal, outcome}` takes seven `outcome`
+values, the six the #3702 amendment lists and `over_tier_one`.
+`partsUncovered` keeps meaning a part with no leaf for the field.
 
 **Cost.** No persistent format changes. Bytes stay bounded by the per-part
 test: at about 11 KB a leaf GET a statement admitted up to its tier-1 cost
