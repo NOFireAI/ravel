@@ -918,10 +918,13 @@ report lacks them, and `sealed_day_leaf_puts`,
 `stats.keyIndex.leafRoundTrips` (W6); `io.s3SlowDownResponses` (F3); and
 the four H1b stamps above.
 
-A timing figure of A6, W4, F1 or F2 (`AS_ROW_18` in evaluate.py) is
-judged as row 18's are, so like row 18's it leaves the run incomplete when
+Every ADR-3939 figure, counter or timing, leaves the run incomplete when
 it has no value to judge (`unsupported-on-this-build`, `refused-by-guard`,
-`refused` or `missing`), rather than letting the run pass without its p50.
+`refused` or `missing`), as row 18's do, rather than letting the run pass
+without it: a fold report that lacks a field these rows read, or a
+per-part figure evaluate.py does not read, shows as incomplete, never as
+a pass. Until H1b supplies those figures, a run holding a multi-day state
+is therefore incomplete.
 
 ## Unsupported on this build
 
@@ -1166,8 +1169,9 @@ passes, empty A4 and W8 digests miss; fails with the refold's band reading
 `test_w7_reads_two_day_parts` (1 covered part, a third part or an uncovered
 one each miss at 4 leaf GETs; fails with `parts_covered_max` reading
 `v >= 2`) and `test_row_18_timing_rows_leave_run_incomplete` (A6's six p50
-cells, W4's, F1's and F2's unsupported each leave the run incomplete; fails
-with `AS_ROW_18` not consulted). `test_adr3939_rows_run_on_their_states`
+cells, W4's, F1's and F2's unsupported, and W4's unsupported leaf GETs, a
+counter, each leave the run incomplete; fails with ADR-3939 figures left off
+the incomplete list). `test_adr3939_rows_run_on_their_states`
 pins each row's state (fails with A5 moved off `day_parts_7`).
 
 The box scripts target bash 3.2 as well as 5: run

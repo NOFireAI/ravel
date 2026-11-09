@@ -114,9 +114,6 @@ G_INPUTS = ("key_index_pair_budget", "key_index_field_pairs")
 # Statuses a figure computed from, or judged against, another figure takes
 # over from it, reason and all.
 PASSED_ON = ("not-run", UNSUPPORTED, GUARD, NOT_COMPUTABLE, INCOMPLETE)
-# ADR-3939's rows whose timing figures are judged as row 18's are: a timing
-# figure of one of them with no value leaves the run incomplete, as row 18's.
-AS_ROW_18 = ("A6", "W4", "F1", "F2")
 # Fold report fields a build may not write: absent, they read unsupported.
 FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_index_sections_read",
                   "key_index_leaf_gets", "sealed_day_leaf_puts", "sealed_day_previous_leaf_gets", "head_digest",
@@ -1779,10 +1776,10 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     never asked for, or W2 on a fold binary it is not measured on (a gated
     figure is either not_requested or listed here), a figure not-measured
     (a row 18 cell whose covering part was left to tier 1), a figure
-    not-computable or incomplete or judged against one, a row 18 figure, or
-    a timing figure of an ADR-3939 row judged as row 18 (AS_ROW_18), with
-    no value to judge (unsupported, refused or missing), or a needle band a
-    partial inspection could not judge."""
+    not-computable or incomplete or judged against one, a row 18 figure or
+    any ADR-3939 figure with no value to judge (unsupported, refused or
+    missing), whatever its lane, or a needle band a partial inspection could
+    not judge."""
     out = []
     for s in cfg["states"]:
         if live.get(s) is not None:
@@ -1801,7 +1798,7 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
             out.append(f"figure {f['id']} not measured: {f['reason']}")
         elif f.get("verdict") in (NOT_COMPUTABLE, INCOMPLETE):
             out.append(f"figure {f['id']} {f['verdict']}: {f['reason']}")
-        elif ((f["row"] == 18 or (f.get("adr") == "ADR-3939" and f["row"] in AS_ROW_18 and f["lane"] == "timing"))
+        elif ((f["row"] == 18 or f.get("adr") == "ADR-3939")
               and f.get("verdict") in (UNSUPPORTED, GUARD, "refused", "missing")):
             out.append(f"figure {f['id']} {f['verdict']}: {f['reason']}")
     out.extend((needles or {}).get("incomplete", []))
