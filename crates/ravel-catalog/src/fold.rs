@@ -2190,10 +2190,11 @@ impl CarryHold {
     }
 }
 
-/// One slice of a source field's leaf set, planned from its ref. Its bytes
-/// are fetched when a pass first reaches its `key8_lo` and dropped once a
-/// pass starts past its `key8_hi`; each pass that overlaps it decodes them
-/// again, one frame at a time.
+/// One slice of a source field's leaf set, planned from its ref. The lowest
+/// slice's bytes are fetched when the source is loaded and a later slice's
+/// when a pass's feed walks to it; either is dropped once a pass starts past
+/// its `key8_hi`, and each pass that overlaps it decodes the bytes again, one
+/// frame at a time.
 struct CarriedSlice {
     leaf: SnapshotKeyIndexLeafRef,
     bytes: Option<Bytes>,
@@ -2575,8 +2576,11 @@ fn release_carried_slices(
 /// and stopping at the first slice past the range the budget has cut so
 /// far. A slice the field's build attempt has not fetched yet is fetched
 /// and verified here ([`fetch_carried_leaf`], and its uncovered list against
-/// the lowest slice's), then kept until a pass starts past it. `Err` when a
-/// slice's GET fails, it does not verify, or a kept slice no longer decodes.
+/// the lowest slice's), then kept until a pass starts past it. A rebuilt
+/// field starts again from key8 0, so a slice dropped in its earlier attempt
+/// is fetched again, while one still kept from that attempt stays held until
+/// a pass starts past it. `Err` when a slice's GET fails, it does not
+/// verify, or a kept slice no longer decodes.
 #[allow(clippy::too_many_arguments)]
 async fn feed_carried_key_index(
     store: &dyn ObjectStoreBackend,
@@ -2828,10 +2832,11 @@ pub(crate) struct BuiltPartKeyIndex {
 /// cover for every declared field is taken from them without reading its
 /// section. Entries they list as uncovered and entries new to the part are
 /// read. Per source and field only the lowest slice is fetched up front; a
-/// pass fetches each later slice when its range first reaches the slice's
-/// `key8_lo` and drops it once a pass starts past its `key8_hi`, so every
-/// slice is fetched once per field build attempt. A source whose refs or
-/// lowest slices do not check out is not carried and its entries are read.
+/// pass fetches each later slice its feed walks to before the end cut by the
+/// carried pairs fed so far, and drops it once a pass starts past its
+/// `key8_hi`, so every slice is fetched once per field build attempt. A
+/// source whose refs or lowest slices do not check out is not carried and
+/// its entries are read.
 /// A data object mapped from two sources drops the whole carry, and so
 /// does a later slice that cannot be read or verified (the build restarts
 /// with no carry) or a section naming a field the tenant does not declare,
@@ -3040,7 +3045,7 @@ pub(crate) async fn build_part_key_index(
                     tracing::warn!(
                         tenant = %tenant.to_hex(),
                         reason = %reason,
-                        "a previous tail leaf no longer decodes; the leaf build drops the carry and reads every entry's section"
+                        "a previous part's leaf slice cannot be read, does not verify or no longer decodes; the leaf build drops the carry and reads every entry's section"
                     );
                     continue 'build;
                 }
@@ -16871,6 +16876,229 @@ pub(crate) mod tests {
             user_id_leaves_at(store.as_ref(), &second.parts[0], 2).await,
             "the two-source carry writes the one-call build's leaves"
         );
+    }
+
+    /// ADR-3939 decision 5: a source whose lowest slice fails drops only its
+    /// own entries from the carry. In the fixture of
+    /// [`a_part_carries_from_two_previous_parts`] the re-encoded part holds
+    /// writer 2 from A and writer 3 from B, and the GET of A's lowest slice
+    /// is refused. A is not carried, with one warning, and A's later slice is
+    /// never fetched; writer 2's section is read in both of the part's 2
+    /// passes (2 ranged GETs each), while B's entries, writers 3 and 4, have
+    /// no section read and are carried. The leaves equal those a fold of
+    /// writers 2 to 5 into a fresh store writes at the same budget, byte for
+    /// byte. Dropping the whole carry when one source fails reads writers 3
+    /// and 4 too.
+    #[tokio::test]
+    async fn a_failing_source_drops_only_its_own_entries_from_the_carry() {
+        let config = CatalogConfig {
+            key_index_build_max_pairs: 2,
+            snapshot_part_max_entries: 2,
+            ..kidx_config()
+        };
+        let writer_ids = [(1u64, [1i64, 2]), (2, [3, 4]), (3, [5, 6]), (4, [7, 8])];
+        let inner = OpLogStore::empty();
+        declare_user_id_key_index(inner.as_ref()).await;
+        let mut writers = Vec::new();
+        for (seq, ids) in writer_ids {
+            let (record, _) =
+                publish_user_id_logs(inner.as_ref(), seq, DAY_D + seq as u32, &ids, 2, 0, true)
+                    .await;
+            writers.push(record);
+        }
+        let catalog = Catalog::new(inner.clone(), config).expect("catalog");
+        fold_through(&catalog, Signal::Logs, DAY_D + 4).await;
+        let first = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        assert_eq!(first.parts.len(), 2);
+        let mut a = first.parts[0].key_index.clone();
+        a.sort_by_key(|leaf| leaf.key8_lo);
+        assert_eq!(a.len(), 2);
+
+        publish_logs_tombstone(inner.as_ref(), DAY_D + 1).await;
+        publish_user_id_logs(inner.as_ref(), 5, DAY_D + 5, &[9], 2, 0, true).await;
+        inner.clear();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("lowest slice GET refused".into()),
+            )
+            .with_key_contains(a[0].key.as_str())
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(Arc::clone(&inner), plan));
+        let faulted = Catalog::new(store.clone(), config).expect("catalog");
+        let (report, warnings) = fold_capturing_warnings(&faulted, Signal::Logs, DAY_D + 5).await;
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "A's lowest slice GET was refused"
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|line| line.contains("previous part leaves not carried"))
+                .count(),
+            1,
+            "{warnings:?}"
+        );
+        assert_eq!(
+            inner.gets_of_leaves(&a),
+            0,
+            "A's later slice is not fetched"
+        );
+        assert_eq!(
+            inner.section_gets_of(&[&writers[2], &writers[3]]),
+            0,
+            "B's entries are carried"
+        );
+        assert_eq!(
+            inner.section_gets_of(&[&writers[1]]),
+            2 * 2,
+            "2 ranged GETs x 2 passes for A's surviving entry"
+        );
+        assert_eq!(report.key_index_entries_carried, 2, "{report:?}");
+        let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            second
+                .parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour, p.entry_count))
+                .collect::<Vec<_>>(),
+            vec![(DAY_D + 2, DAY_D + 3, 2), (DAY_D + 4, DAY_D + 5, 2)]
+        );
+
+        let fresh = OpLogStore::empty();
+        declare_user_id_key_index(fresh.as_ref()).await;
+        for (seq, ids) in [
+            (2u64, &[3i64, 4][..]),
+            (3, &[5, 6]),
+            (4, &[7, 8]),
+            (5, &[9]),
+        ] {
+            publish_user_id_logs(fresh.as_ref(), seq, DAY_D + seq as u32, ids, 2, 0, true).await;
+        }
+        let scratch_catalog = Catalog::new(fresh.clone(), config).expect("catalog");
+        fold_through(&scratch_catalog, Signal::Logs, DAY_D + 5).await;
+        let scratch = read_signal_head(fresh.as_ref(), Signal::Logs).await;
+        assert_eq!(scratch.parts.len(), second.parts.len());
+        for (scratch_part, part) in scratch.parts.iter().zip(&second.parts) {
+            assert_eq!(scratch_part.blake3, part.blake3, "the same part");
+            assert_eq!(
+                stored_leaves(inner.as_ref(), part).await,
+                stored_leaves(fresh.as_ref(), scratch_part).await,
+                "the partly carried leaves are the from-scratch leaves, byte for byte"
+            );
+        }
+    }
+
+    /// ADR-3939 decision 5: a later slice is fed only when its
+    /// `uncovered_entry_ordinals` equal its set's lowest slice's. A slice ref
+    /// binds only `uncovered_count`, so a later slice listing entry 3 where
+    /// the lowest lists entry 2 matches its own ref and verifies. The feed
+    /// fetches it, refuses it, holds only the lowest slice's pair and keeps
+    /// none of its bytes; that `Err` is what restarts the build with no
+    /// carry (`a_later_slice_whose_get_fails_restarts_the_build_without_the_carry`).
+    /// The same slice listing entry 2 is fed and its pair held.
+    #[tokio::test]
+    async fn a_later_slice_listing_other_uncovered_entries_is_refused() {
+        let limits = key_index_leaf_limits();
+        let part_blake3 = [7u8; 32];
+        let leaf = |key8_lo: u64, key8_hi: u64, ordinal: u64, key8: u64, uncovered: &[u64]| {
+            encode_key_index_leaf(
+                &KeyIndexLeafInput {
+                    tenant_hash: tenant(),
+                    signal: Signal::Logs,
+                    part_blake3,
+                    part_entry_count: 4,
+                    field: USER_ID,
+                    key_type: KeyType::I64,
+                    key8_lo,
+                    key8_hi,
+                    uncovered_entry_ordinals: uncovered,
+                    entries: &[KeyIndexLeafEntry {
+                        key8: key8.to_be_bytes(),
+                        entry_ordinal: ordinal,
+                        blocks: vec![0],
+                    }],
+                },
+                &limits,
+            )
+            .expect("the leaf encodes")
+        };
+        for (later_uncovered, accepted) in [([3u64], false), ([2], true)] {
+            let store = MemoryStore::new();
+            let lowest = leaf(0, 99, 0, 10, &[2]);
+            let lowest_bytes = Bytes::from(lowest.bytes.clone());
+            let lowest_ref = put_key_index_leaf(&store, &tenant(), Signal::Logs, KIDX_HOUR, lowest)
+                .await
+                .expect("put");
+            let later = leaf(100, u64::MAX, 1, 200, &later_uncovered);
+            assert_eq!(later.leaf_ref.uncovered_count, lowest_ref.uncovered_count);
+            let later_ref = put_key_index_leaf(&store, &tenant(), Signal::Logs, KIDX_HOUR, later)
+                .await
+                .expect("put");
+            let mut source = CarriedSource {
+                part_blake3: part_blake3.to_vec(),
+                part_entry_count: 4,
+                fields: BTreeMap::from([(
+                    USER_ID.to_string(),
+                    CarriedField {
+                        slices: vec![
+                            CarriedSlice {
+                                leaf: lowest_ref,
+                                bytes: Some(lowest_bytes.clone()),
+                                fetched_in: Some(0),
+                            },
+                            CarriedSlice {
+                                leaf: later_ref,
+                                bytes: None,
+                                fetched_in: None,
+                            },
+                        ],
+                        uncovered: vec![2],
+                        covered: vec![true, true, false, true],
+                    },
+                )]),
+                onto: vec![Some(0), Some(1), Some(2), Some(3)],
+            };
+            let mut field = FieldBuild::new(KeyType::I64, BTreeSet::from([2]));
+            let mut hold = CarryHold::default();
+            hold.take(lowest_bytes.len() as u64);
+            let mut counters = RequestCounters::default();
+            let fed = feed_carried_key_index(
+                &store,
+                &tenant(),
+                Signal::Logs,
+                &mut field,
+                &mut source,
+                USER_ID,
+                &[true, true, false, true],
+                &limits,
+                u64::MAX,
+                &mut hold,
+                &mut counters,
+            )
+            .await;
+            assert_eq!(
+                counters.key_index_leaf_gets, 1,
+                "the later slice is fetched"
+            );
+            let later_slice = &source.fields[USER_ID].slices[1];
+            if accepted {
+                assert_eq!(fed, Ok(()));
+                assert_eq!(field.held.len(), 2, "both slices' pairs held");
+                assert!(later_slice.bytes.is_some());
+            } else {
+                let reason = fed.expect_err("the later slice is refused");
+                assert!(
+                    reason.contains("other uncovered_entry_ordinals"),
+                    "{reason}"
+                );
+                assert_eq!(field.held.len(), 1, "only the lowest slice's pair");
+                assert!(later_slice.bytes.is_none(), "no byte of it kept");
+                assert_eq!(hold.held, lowest_bytes.len() as u64);
+            }
+        }
     }
 
     /// ADR-3939 decision 5: a previous part is a carry source only when it

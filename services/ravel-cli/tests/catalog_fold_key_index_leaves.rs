@@ -361,6 +361,8 @@ async fn the_json_report_carries_the_pair_budget_and_the_field_pairs() {
 /// text and `true` under `--json`; the switch-on fold before it reports
 /// `false`. Both print `key_index_parts_missing_declared_leaves: 0`: the
 /// first fold carries no part, and the count is zero with the switch off.
+/// The switch-off fold, over a HEAD whose part has a leaf, reports and
+/// prints `key_index_carry_peak_held_bytes` 0: it loads no carry.
 #[tokio::test]
 async fn a_switch_off_fold_over_leaves_is_reported() {
     let now = yesterday_noon_ns();
@@ -416,5 +418,11 @@ async fn a_switch_off_fold_over_leaves_is_reported() {
         value["key_index_parts_missing_declared_leaves"],
         serde_json::json!(0),
         "the leaf switch is off: {printed}"
+    );
+    assert_eq!(off.key_index_carry_peak_held_bytes, 0, "{off:?}");
+    assert_eq!(
+        value["key_index_carry_peak_held_bytes"],
+        serde_json::json!(0),
+        "the leaf switch is off, so nothing is carried: {printed}"
     );
 }

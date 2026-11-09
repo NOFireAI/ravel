@@ -683,7 +683,7 @@ pub struct CatalogConfig {
     /// (docs/catalog-and-mvcc.md, "Rollout of the day seal"). Default `false`.
     pub build_key_index_leaves: bool,
     /// Most (entry, key8) pairs the leaf build holds at once for one part,
-    /// read from KEY_IDX sections and carried from the previous tail's leaves
+    /// read from KEY_IDX sections and carried from previous parts' leaves
     /// together (ADR-3692 decision 5, the #3704 amendments). Every field the
     /// build indexes gets a share, `max(1, max_pairs / F)` with `F` the
     /// number of those fields, whether or not it is still building. The
@@ -735,11 +735,18 @@ pub struct CatalogConfig {
     /// `held_label_dict_pairs_stay_within_key_index_build_max_pairs` and
     /// `a_reconciled_metrics_fold_holds_no_pairs_for_reused_parts`).
     ///
-    /// Outside both: the previous tail's leaf bytes as stored, read once per
-    /// fold and kept for the whole build; one decoded frame of one previous
-    /// leaf at a time; the KEY_IDX or LABEL_DICT sections in flight, up to
-    /// `fold_bucket_concurrency`; the pass's encoded leaves until their PUTs;
-    /// and per-entry bookkeeping. Default
+    /// Outside both: the leaf bytes as stored of every previous part with
+    /// leaves that overlaps the part, held per pass, not for the whole
+    /// build: per source and field the lowest slice from the load before the
+    /// first pass and each later slice from the pass that fetches it, until
+    /// a pass starts past it. That is at most two slices per field per source
+    /// when the previous slices were cut under the same budget from the same
+    /// pairs and each previous pass wrote one slice, and up to a source's
+    /// whole previous leaf set when its entries in the part are few
+    /// (docs/catalog-and-mvcc.md, "Incremental tail build"); one decoded
+    /// frame of one previous leaf at a time; the KEY_IDX or LABEL_DICT
+    /// sections in flight, up to `fold_bucket_concurrency`; the pass's
+    /// encoded leaves until their PUTs; and per-entry bookkeeping. Default
     /// [`DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`]; 0 is read as 1.
     pub key_index_build_max_pairs: u64,
     /// ADR-3694 decision 2's switch: whether the fold also builds the metrics
@@ -747,8 +754,8 @@ pub struct CatalogConfig {
     /// (label names and values) of each metrics object, read by range (a
     /// footer GET or two, then one GET of that section), from the object
     /// bytes the fold holds from its postings build (see
-    /// [`Self::key_index_build_max_pairs`]), or carried from the previous
-    /// tail's leaf.
+    /// [`Self::key_index_build_max_pairs`]), or carried from the leaves of
+    /// the previous parts it overlaps.
     /// Takes effect only together with [`Self::build_key_index_leaves`]; with
     /// either off the fold reads no LABEL_DICT and writes no metrics leaf.
     /// While the tenant has a pending metrics erasure request the fold
