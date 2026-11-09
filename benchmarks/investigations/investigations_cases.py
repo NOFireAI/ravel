@@ -44,6 +44,7 @@ IN_LIST_LITERAL = r"'(?:[^']|'')*'|[Xx]'[0-9A-Fa-f]*'|[-+]?[0-9]+(?:\.[0-9]+)?"
 FLAT_IN_LIST = re.compile(r"[ \t\n\r]*\((?:[ \t\n\r]*(?:%s)[ \t\n\r]*,)*[ \t\n\r]*(?:%s)[ \t\n\r]*\)"
                           % (IN_LIST_LITERAL, IN_LIST_LITERAL))
 ADR = os.path.join(HERE, "..", "..", "docs", "adrs", "3692-selective-investigations-logs-traces.md")
+ADR3939 = os.path.join(HERE, "..", "..", "docs", "adrs", "3939-key-index-day-seal.md")
 HITS_TRUTH = os.path.join(HERE, "hits.truth.json")
 SMOKE = os.path.join(HERE, "fixtures", "local-smoke")
 BOX = os.path.join(HERE, "box")
@@ -53,7 +54,58 @@ PY = sys.executable
 BASH = os.environ.get("INV_BASH", "bash")
 HOUR_NS = 3600 * 1_000_000_000
 STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves", "compaction_in_flight",
-          "compaction_done", "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160")
+          "compaction_done", "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160",
+          "day_parts_7", "day_parts_30", "retired_hour")
+# ADR-3939's multi-day states (the harness-state amendment): registered, and
+# built by no box/run.sh yet (task H1b, #4048).
+MULTI_DAY_STATES = ("day_parts_7", "day_parts_30", "retired_hour")
+# The state each ADR-3939 row runs on (task H1a's decision, README.md): F3
+# runs on both, its W4 half on day_parts_7 and its W5 half on day_parts_30.
+ADR3939_STATES = {**{f"A{n}": "day_parts_7" for n in range(1, 7)}, "A7": "day_parts_30", "W1": "day_parts_7",
+                  "W2": "retired_hour", "W3": "retired_hour", "W4": "day_parts_7", "W5": "day_parts_30",
+                  "W6": "day_parts_7", "W7": "day_parts_7", "W8": "retired_hour", "F1": "day_parts_7",
+                  "F2": "day_parts_30"}
+# A run that lists none of the multi-day states: ADR-3939's not_requested
+# entries, as (row, key, figures or None, reason).
+ADR3939_NOT_REQUESTED = [(label, f"adr3939_{label.lower()}", None, f"run.toml states lacks ['{state}']")
+                         for label, state in ADR3939_STATES.items()] + [
+    ("F3", "adr3939_f3", ["w4_leaf_gets_per_part", "w4_slow_downs"], "run.toml states lacks ['day_parts_7']"),
+    ("F3", "adr3939_f3", ["slices", "w5_per_day_bound", "w5_leaf_gets_per_part", "w5_slow_downs"],
+     "run.toml states lacks ['day_parts_30']"),
+]
+
+
+def adr3939_tables(path):
+    """({label: [check, target, miss, source]}, problems) of ADR-3939's two acceptance tables: the one
+    under "## Acceptance (pre-registered" (A1 to A7) and the one under "### Acceptance (added rows" (W1 to
+    W8, F1 to F3), cells split on " | " and stripped of the table's own padding only."""
+    with open(path) as f:
+        lines = f.read().splitlines()
+    header = "| check | target | miss | source |"
+    heads = [i for i, x in enumerate(lines) if x == header]
+    out, problems = {}, []
+    if len(heads) != 2:
+        return out, [f"{len(heads)} acceptance tables, want 2"]
+    for head, want in zip(heads, ("## Acceptance (pre-registered", "### Acceptance (added rows")):
+        above = next(x for x in reversed(lines[:head]) if x.startswith("#"))
+        if not above.startswith(want) or lines[head + 1] != "|---|---|---|---|":
+            problems.append(f"table at line {head + 1} is under {above!r}")
+        for line in lines[head + 2:]:
+            if not line.startswith("|"):
+                break
+            cells = [c.strip() for c in line.strip().strip("|").split(" | ")]
+            label = re.match(r"([AWF]\d+)\.? ", cells[0])
+            if len(cells) != 4 or not label or label.group(1) in out:
+                problems.append(f"row {line[:40]!r}")
+                continue
+            out[label.group(1)] = cells
+    return out, problems
+
+
+def adr3939_not_requested():
+    """ADR3939_NOT_REQUESTED as results.json lists it."""
+    return [{"row": row, "key": key, **({"figures": names} if names else {}), "reason": why, "adr": "ADR-3939"}
+            for row, key, names, why in ADR3939_NOT_REQUESTED]
 SMOKE_STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
                 "erasure_in_flight", "many_parts_24")
 UNSUPPORTED = "unsupported-on-this-build"
@@ -730,7 +782,7 @@ class Statements(unittest.TestCase):
             self.assertIn(s["tenant"], ("inv", "hits"), s["id"])
             self.assertIn(s["kind"], ("trace_get", "sql"), s["id"])
             self.assertTrue(set(s["states"]) <= set(STATES), s["id"])
-            self.assertIn(s.get("window", "none"), ("none", "1h", "narrow", "wide"), s["id"])
+            self.assertIn(s.get("window", "none"), ("none", "1h", "narrow", "wide", "midnight"), s["id"])
             if s["kind"] == "sql" and not s.get("corpus_id") and not s.get("control"):
                 self.assertTrue(s.get("sql"), s["id"])
 
@@ -897,8 +949,9 @@ class Statements(unittest.TestCase):
             self.assertIsNone(re.search(r"\bstatus\s*=", sql), s["id"])
 
     def test_three_statements_run_warm(self):
-        """docs/internal/bench-reports.md: 43 of the 46 statements are cold_only."""
-        self.assertEqual(len(self.st), 46)
+        """docs/internal/bench-reports.md: three statements run warm (its count of 46 predates ADR-3939's
+        four multi-day statements)."""
+        self.assertEqual(len(self.st), 50)
         self.assertEqual([s["id"] for s in self.st if not s.get("cold_only")],
                          ["spans_lookup_norange", "spans_lookup_1h", "logs_trace_1h"])
 
@@ -1058,7 +1111,7 @@ class Statements(unittest.TestCase):
         # Acceptance table's cell, the check without its "N. " number.
         _, adr = self.adr_band_rows()
         self.assertEqual(len(adr), 18)
-        rows = self.bands["row"]
+        rows = [r for r in self.bands["row"] if not r.get("adr")]
         for n, (r, cells) in enumerate(zip(rows, adr), 1):
             num, _, check = cells[0].partition(". ")
             self.assertEqual(num, str(n))
@@ -1068,8 +1121,10 @@ class Statements(unittest.TestCase):
 
     def test_bands_rows_1_to_18(self):
         rows = self.bands["row"]
-        self.assertEqual([r["adr_row"] for r in rows], list(range(1, 19)))
-        self.assertEqual([r["key"] for r in rows], [f"row_{n:02d}" for n in range(1, 19)])
+        ours = [r for r in rows if not r.get("adr")]
+        self.assertEqual([r["adr_row"] for r in ours], list(range(1, 19)))
+        self.assertEqual([r["key"] for r in ours], [f"row_{n:02d}" for n in range(1, 19)])
+        self.assertEqual(rows[:18], ours)
         ids = {s["id"] for s in self.st} | {"fold", "all", "control", "stamp", "derived", "truth"}
         for r in rows:
             for k in ("check", "target", "miss", "source"):
@@ -1089,8 +1144,10 @@ class Statements(unittest.TestCase):
             self.assertEqual({f["statement"] for f in r["figure"]}, {"q20_hits", "stamp"})
         timed = sorted({r["key"] for r in rows for f in r["figure"] if f["lane"] == "timing"})
         # Rows 2, 5, 15 and 18 time statements; row 16's slowdown is a timing
-        # figure of a control run this harness does not perform.
-        self.assertEqual(timed, ["row_02", "row_05", "row_15", "row_16", "row_18"])
+        # figure of a control run this harness does not perform. ADR-3939's A6,
+        # W4, F1 and F2 time theirs against the same statements' prefold calls.
+        self.assertEqual(timed, ["adr3939_a6", "adr3939_f1", "adr3939_f2", "adr3939_w4", "row_02", "row_05",
+                                 "row_15", "row_16", "row_18"])
         r16 = next(r for r in rows if r["key"] == "row_16")
         self.assertEqual({f["statement"] for f in r16["figure"] if f["lane"] == "timing"}, {"control"})
         for r in rows:
@@ -1124,9 +1181,9 @@ class LocalSmoke(Workdir):
             f = figure(res, f"row_11.{name}")
             self.assertEqual((f["status"], f["verdict"]), (GUARD, GUARD), name)
 
-    def test_fixture_is_under_300_kb(self):
+    def test_fixture_is_under_320_kb(self):
         total = sum(os.path.getsize(os.path.join(d, n)) for d, _, names in os.walk(SMOKE) for n in names)
-        self.assertLess(total, 300_000)
+        self.assertLess(total, 320_000)
 
     def test_problems_are_exactly_these(self):
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
@@ -1163,7 +1220,8 @@ class LocalSmoke(Workdir):
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         got = {s["state"]: (s["status"], s.get("reason")) for s in res["states"]}
         want = {s: ("run", None) for s in SMOKE_STATES + ("fold_advance", "compaction_done")}
-        want.update({s: ("not-run", "not in run.toml states") for s in ("advanced_leaves", "many_parts_744", "many_parts_2160")})
+        want.update({s: ("not-run", "not in run.toml states")
+                     for s in ("advanced_leaves", "many_parts_744", "many_parts_2160") + MULTI_DAY_STATES})
         self.assertEqual(got, want)
 
     def test_in_1000_is_sent_and_refused_by_the_complexity_guard(self):
@@ -1204,14 +1262,16 @@ class LocalSmoke(Workdir):
             {"row": 12, "key": "row_12", "reason": "run.toml scales lacks [10, 100]"},
             {"row": 16, "key": "row_16", "reason": "run.toml hits = false, baseline = false"},
             {"row": 18, "key": "row_18", "reason": "run.toml states lacks ['advanced_leaves']"},
-        ])
+        ] + adr3939_not_requested())
         self.assertEqual(text.splitlines()[:3], [
             "selective investigations, lane local: fail",
             "not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 9 figures "
             "covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact (run.toml states lacks "
             "['many_parts_744']); row 10 (run.toml "
             "states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml "
-            "hits = false, baseline = false); row 18 (run.toml states lacks ['advanced_leaves'])",
+            "hits = false, baseline = false); row 18 (run.toml states lacks ['advanced_leaves']); "
+            + "; ".join(f"ADR-3939 row {row}" + (f" figures {', '.join(names)}" if names else "") + f" ({why})"
+                        for row, _, names, why in ADR3939_NOT_REQUESTED),
             "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 29 figure(s), "
             "0 call(s)",
         ])
@@ -2667,12 +2727,7 @@ class Evaluate(Workdir):
         listed the same way."""
         self.set_advanced_leaves({"spans_in_100": ((2.8, 3.2), (3.1, 3.1), {"keysProbed": 100})})
         # Row 18 alone, so no other row's miss on this fixture decides the verdict.
-        with open(bands) as f:
-            text = f.read()
-        start = text.index('[[row]]\nkey = "row_18"')
-        if "[[row]]\n" in text[start + 1:]:
-            return ["row_18 is no longer the last row of the bands; slice it to its end"]
-        code, res, _ = self.go(self.pass_bands(text[start:]), evaluate_py)
+        code, res, _ = self.go(self.row_bands("row_18", bands), evaluate_py)
         f = self.row_18(res)["spans_trace_id_100_p50_s"]
         out = []
         if (f["status"], f["verdict"]) != (UNSUPPORTED, UNSUPPORTED):
@@ -3215,6 +3270,7 @@ class Evaluate(Workdir):
         want = [(5, "run.toml hits = false"), (6, "run.toml hits = false"),
                 (9, "run.toml states lacks ['many_parts_744']"), (10, "run.toml states lacks ['many_parts_2160']"), (12, "run.toml scales lacks [10, 100]"),
                 (16, "run.toml hits = false, baseline = false"), (18, "run.toml states lacks ['advanced_leaves']")]
+        want += [(row, why) for row, _, _, why in ADR3939_NOT_REQUESTED]
         out = [] if got == want else [f"not_requested {got}"]
         if "not requested: row 5 (run.toml hits = false); row 6 " not in text:
             out.append("summary carries no not-requested line")
@@ -3222,6 +3278,194 @@ class Evaluate(Workdir):
 
     def test_not_requested(self):
         self.assertEqual(self.check_not_requested(), [])
+
+    # --- ADR-3939's rows (task H1a, #4047) ---
+
+    def check_adr3939_band_text_verbatim(self, evaluate_py=EVALUATE, bands=BANDS):
+        """ADR-3939's rows in bands.toml are its two acceptance tables, in order (A1 to A7 under "##
+        Acceptance", W1 to W8 and F1 to F3 under "### Acceptance (added rows"), each keyed adr3939_<label>
+        with adr "ADR-3939", its check, target, miss and source the table's cells character for
+        character."""
+        tables, out = adr3939_tables(ADR3939)
+        with open(bands, "rb") as f:
+            rows = [r for r in tomllib.load(f)["row"] if r.get("adr")]
+        if [r["adr_row"] for r in rows] != list(tables):
+            out.append(f"labels {[r['adr_row'] for r in rows]}, want {list(tables)}")
+        for r in rows:
+            label = r["adr_row"]
+            if (r["key"], r["adr"]) != (f"adr3939_{str(label).lower()}", "ADR-3939"):
+                out.append(f"{label}: key {r['key']} adr {r['adr']}")
+            for k, cell in zip(("check", "target", "miss", "source"), tables.get(label, ("",) * 4)):
+                if r[k] != cell:
+                    out.append(f"{r['key']}.{k} is not the ADR cell")
+        return out
+
+    def test_adr3939_band_text_is_the_adr_tables_verbatim(self):
+        self.assertEqual(self.check_adr3939_band_text_verbatim(), [])
+
+    def check_multi_day_rows_report_not_run_without_their_state(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A run whose run.toml lists none of ADR-3939's multi-day states reports every ADR-3939 figure
+        not-run, its reason naming the state the row needs, lists each row (F3 by its two halves) under
+        not_requested, puts none of them on the incomplete list, and lists the three states not-run."""
+        _, res, text = self.go(bands, evaluate_py)
+        out = []
+        figs = [f for f in res["figures"] if f.get("adr") == "ADR-3939"]
+        if len(figs) < 18:
+            out.append(f"{len(figs)} ADR-3939 figures")
+        for f in figs:
+            state = ADR3939_STATES.get(f["row"], f["state"])
+            want = (f"{state}: not in run.toml states" if f["row"] == "F3"
+                    else f"states ['{state}'] not run: {state}: not in run.toml states")
+            if (f["status"], f["verdict"], f["reason"]) != ("not-run", "not-run", want):
+                out.append(f"{f['id']} {f['status']} {f['verdict']} {f['reason']}")
+        got = [r for r in res["not_requested"] if r.get("adr")]
+        if got != adr3939_not_requested():
+            out.append(f"not_requested {got}")
+        stray = [line for line in res["incomplete"] if "adr3939_" in line or "day_parts" in line
+                 or "retired_hour" in line]
+        if stray:
+            out.append(f"incomplete {stray}")
+        states = {s["state"]: (s["status"], s.get("reason")) for s in res["states"]}
+        for s in MULTI_DAY_STATES:
+            if states.get(s) != ("not-run", "not in run.toml states"):
+                out.append(f"state {s} {states.get(s)}")
+        if "ADR-3939 row A1 (run.toml states lacks ['day_parts_7'])" not in text:
+            out.append("summary names no ADR-3939 row")
+        return out
+
+    def test_multi_day_rows_report_not_run_without_their_state(self):
+        self.assertEqual(self.check_multi_day_rows_report_not_run_without_their_state(), [])
+
+    def adr3939_rows_now(self, mod, bands, keys, live, docs, values, folds=None):
+        """{id: figure} of bands.toml's rows `keys` evaluated by run_rows on stamps `docs` ({(state,
+        label, kind): doc}) and statement figures `values` ({(statement, metric): value}), any other
+        statement figure unsupported."""
+        with open(bands, "rb") as f:
+            rows = {"row": [r for r in tomllib.load(f)["row"] if r["key"] in keys]}
+
+        class Docs:
+            def doc(self, state, label, kind):
+                return docs.get((state, label, kind))
+
+        def statement_figure(calls, cfg, statement, state, metric, *_):
+            if (statement, metric) in values:
+                return "value", values[(statement, metric)], ""
+            return UNSUPPORTED, None, f"no {metric} in this case"
+
+        mod.statement_figure = statement_figure
+        cfg = {"lane": "local", "hits": False, "tenant": "inv", "scales": [1], "baseline": False,
+               "states": sorted(live), "cold_runs": 1, "warm_runs": 0}
+        figs = mod.run_rows(rows, cfg, live, None, Docs(), folds or {}, {}, None, {}, {})
+        return {f["id"]: f for f in figs}
+
+    @staticmethod
+    def day_part_catalog(parts, slices):
+        return {"part_count": parts, "parts": [{"leaves": [{"field": "request_id"}] * slices}] * parts}
+
+    def check_w5_a7_targets_follow_stamped_slices(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A7's and W5's per-day bound is T(S) + 100 for the S the 30-day state's catalog stamp gives:
+        126 at S 26 (W5's 3,780 total holds, 3,781 misses) and 176 at S 175 (5,280 holds, 5,281 misses),
+        so a bound fixed at 126 fails; at S 2 every figure that depends on S is not-run with the
+        amendment's reason, and on the incomplete list, while rows_exact is still judged."""
+        mod = load_module(evaluate_py, "evaluate_w5_a7")
+        live = {"day_parts_30": None}
+        out = []
+        for s, bound, total in ((26, 126, 3780), (175, 176, 5280), (2, None, 3060)):
+            for gets, want in ((total, "pass"), (total + 1, "miss")):
+                docs = {("day_parts_30", "logs", "catalog"): self.day_part_catalog(30, s)}
+                values = {(sid, m): v for sid in ("logs_request_in_100_30d",) for m, v in (
+                    ("cold.max.leaf_gets", gets), ("cold.min.parts_covered", 30), ("cold.max.parts_uncovered", 0),
+                    ("cold.max.probe_gets", 0), ("cold.max.parts_beyond_ceiling", 0), ("cold.rows_exact", 1))}
+                figs = self.adr3939_rows_now(mod, bands, ("adr3939_a7", "adr3939_w5"), live, docs, values)
+                for key in ("adr3939_a7", "adr3939_w5"):
+                    slices = figs[f"{key}.slices"]
+                    if (slices["value"], slices["verdict"]) != (s, "pass"):
+                        out.append(f"S {s}: {key}.slices {slices['value']} {slices['verdict']}")
+                    b = figs[f"{key}.per_day_bound"]
+                    if bound is not None and (b["value"], b["verdict"]) != (bound, "pass"):
+                        out.append(f"S {s}: {key}.per_day_bound {b['value']} {b['verdict']}, want {bound}")
+                    rows_exact = figs[f"{key}.rows_exact"]
+                    if rows_exact["verdict"] != "pass":
+                        out.append(f"S {s}: {key}.rows_exact {rows_exact['verdict']}")
+                    gated = [f for i, f in figs.items() if i.startswith(f"{key}.")
+                             and i.rsplit(".", 1)[1] not in ("slices", "parts_held", "rows_exact")]
+                    if bound is None:
+                        for f in gated:
+                            if (f["status"], f["verdict"]) != ("not-run", "not-run") or not all(
+                                    x in f["reason"] for x in ("S of at least 3", f"{key}.slices 2")):
+                                out.append(f"S 2: {f['id']} {f['status']} {f['verdict']} {f['reason']}")
+                        listed = mod.incomplete_reasons({"states": []}, {}, mod.Calls([], mod.Problems()), gated)
+                        if len(listed) != len(gated):
+                            out.append(f"S 2: {key} incomplete {listed}")
+                w5 = figs["adr3939_w5.leaf_gets"]
+                if bound is not None and (w5["value"], w5["verdict"]) != (gets, want):
+                    out.append(f"S {s}: W5 {gets} leaf GETs {w5['value']} {w5['verdict']}, want {want}")
+                a7 = figs["adr3939_a7.leaf_gets"]
+                if bound is not None and (a7["value"], a7["verdict"]) != (gets, want):
+                    out.append(f"S {s}: A7 {gets} leaf GETs over 30 parts {a7['value']} {a7['verdict']}, want {want}")
+        return out
+
+    def test_w5_a7_targets_follow_stamped_slices(self):
+        self.assertEqual(self.check_w5_a7_targets_follow_stamped_slices(), [])
+
+    def check_w2_requires_pre_r2_binary_stamp(self, evaluate_py=EVALUATE, bands=BANDS):
+        """W2 is judged only on a fold binary that carries C1 and not R2. With no fold-binary stamp (this
+        build: task H1b writes it) the binary figure is unsupported, naming the stamp, and every other W2
+        figure not-run with the amendment's reason; a binary carrying R2 misses and leaves the rest
+        not-run; a stamp with no sha is missing; C1 without R2 judges the fold, 31 previous-leaf GETs
+        passing."""
+        mod = load_module(evaluate_py, "evaluate_w2")
+        live = {"retired_hour": None}
+        report = {"key_index_leaf_gets": 31, "key_index_unchanged_section_gets": 0,
+                  "key_index_leaf_bytes_written": 1_300_000_000}
+        folds = {("retired_hour", "inv", "logs"): {"report": report}}
+        name = "stamps/retired_hour.logs.fold_binary.json"
+        out = []
+        for case, stamp, binary, rest in (
+                ("no stamp", None, (UNSUPPORTED, None, UNSUPPORTED), "not-run"),
+                ("C1 and R2", {"sha": "c1r2", "carries_c1": True, "carries_r2": True}, ("value", 0, "miss"),
+                 "not-run"),
+                ("no sha", {"carries_c1": True, "carries_r2": False}, ("missing", None, "missing"), "not-run"),
+                ("C1 without R2", {"sha": "c1", "carries_c1": True, "carries_r2": False}, ("value", 1, "pass"),
+                 "pass")):
+            docs = {("retired_hour", "logs", "fold_binary"): stamp} if stamp else {}
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2",), live, docs, {}, folds)
+            b = figs["adr3939_w2.fold_binary_pre_r2"]
+            if (b["status"], b["value"], b["verdict"]) != binary:
+                out.append(f"{case}: binary {b['status']} {b['value']} {b['verdict']} {b['reason']}")
+            if stamp is None and name not in b["reason"]:
+                out.append(f"{case}: binary reason {b['reason']}")
+            for i, f in figs.items():
+                if i == "adr3939_w2.fold_binary_pre_r2":
+                    continue
+                if f["verdict"] != rest or (rest == "not-run" and "carries C1 and not R2" not in f["reason"]):
+                    out.append(f"{case}: {i} {f['status']} {f['value']} {f['verdict']} {f['reason']}")
+        return out
+
+    def test_w2_requires_pre_r2_binary_stamp(self):
+        self.assertEqual(self.check_w2_requires_pre_r2_binary_stamp(), [])
+
+    def check_adr3939_rows_run_on_their_states(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Each ADR-3939 row needs its multi-day state (F3 each half its own), and every statement it
+        names lists that state in statements.toml."""
+        with open(bands, "rb") as f:
+            rows = [r for r in tomllib.load(f)["row"] if r.get("adr")]
+        with open(STATEMENTS, "rb") as f:
+            st = {s["id"]: s for s in tomllib.load(f)["statement"]}
+        out = []
+        for r in rows:
+            label = r["adr_row"]
+            want = {"day_parts_7", "day_parts_30"} if label == "F3" else {ADR3939_STATES.get(label)}
+            got = {f["state"] for f in r["figure"]}
+            if got != want or r.get("requires_states", []) != ([] if label == "F3" else list(want)):
+                out.append(f"{label}: states {got} requires {r.get('requires_states')}")
+            for f in r["figure"]:
+                if f["statement"] in st and f["state"] not in st[f["statement"]]["states"]:
+                    out.append(f"{label}: {f['statement']} lists no {f['state']}")
+        return out
+
+    def test_adr3939_rows_run_on_their_states(self):
+        self.assertEqual(self.check_adr3939_rows_run_on_their_states(), [])
 
     @staticmethod
     def gated_placement(res):
@@ -3712,7 +3956,7 @@ FLIPS = {
         "check_not_requested",
     ),
     "a gated figure of an unlisted state left out of not_requested": (
-        "        out.append({\"row\": row, \"key\": key, \"figures\": names, \"reason\": why})\n",
+        "        out.append({\"row\": row, \"key\": key, \"figures\": names, \"reason\": why} | adr_of(rows[key]))\n",
         "        pass\n",
         "check_gated_unrequested",
     ),
@@ -3853,6 +4097,26 @@ FLIPS = {
         '                        if outcome == "server_died":\n',
         '                        if False:\n',
         "check_server_died_everywhere",
+    ),
+    "ADR-3939's multi-day states not registered": (
+        "set(DERIVED) | set(MULTI_DAY_STATES) | set(cfg[\"states\"])",
+        "set(DERIVED) | set(cfg[\"states\"])",
+        "check_multi_day_rows_report_not_run_without_their_state",
+    ),
+    "a figure's not_run_unless never consulted, so S under 3 is judged": (
+        "    if not expr:\n        return None\n",
+        "    if True:\n        return None\n",
+        "check_w5_a7_targets_follow_stamped_slices",
+    ),
+    "the per-day bound fixed at 126 whatever the stamped slices": (
+        "    return math.floor(factor * base + 0.5)\n",
+        "    return math.floor(factor * 126 + 0.5)\n",
+        "check_w5_a7_targets_follow_stamped_slices",
+    ),
+    "W2's binary read off C1 alone, so an R2 binary passes": (
+        'int(doc["carries_c1"] and not doc["carries_r2"])',
+        'int(doc["carries_c1"])',
+        "check_w2_requires_pre_r2_binary_stamp",
     ),
 }
 
@@ -4010,6 +4274,43 @@ BAND_FLIPS = {
         "target_if = \"v == m['row_07.logs_previous_leaves']\"\n",
         "target_if = \"v >= 0\"\n",
         "check_row_7_extra_leaf_gets",
+    ),
+    "W5's per-day bound hardcoded at 126": (
+        "expr = \"day_part_bound(m['adr3939_w5.slices'])\"\n",
+        "expr = \"126\"\n",
+        "check_w5_a7_targets_follow_stamped_slices",
+    ),
+    "A7's per-day bound hardcoded at 126": (
+        "expr = \"day_part_bound(m['adr3939_a7.slices'])\"\n",
+        "expr = \"126\"\n",
+        "check_w5_a7_targets_follow_stamped_slices",
+    ),
+    "W5's per-day bound computed with no S floor": (
+        "expr = \"day_part_bound(m['adr3939_w5.slices'])\"\nlane = \"counter\"\n"
+        "not_run_unless = \"m['adr3939_w5.slices'] >= 3\"\n",
+        "expr = \"day_part_bound(m['adr3939_w5.slices'])\"\nlane = \"counter\"\n",
+        "check_w5_a7_targets_follow_stamped_slices",
+    ),
+    "W2's previous-leaf GETs judged on any fold binary": (
+        "metric = \"fold.inv.logs.key_index_leaf_gets\"\nlane = \"counter\"\n"
+        "not_run_unless = \"m['adr3939_w2.fold_binary_pre_r2'] == 1\"\n",
+        "metric = \"fold.inv.logs.key_index_leaf_gets\"\nlane = \"counter\"\n",
+        "check_w2_requires_pre_r2_binary_stamp",
+    ),
+    "a one-character drift in W4's target cell": (
+        'target = "at most 882 leaf GETs, 7 of 7 days covered',
+        'target = "at most 883 leaf GETs, 7 of 7 days covered',
+        "check_adr3939_band_text_verbatim",
+    ),
+    "a one-character drift in A1's check cell": (
+        'check = "A1. advance at a full-day tail',
+        'check = "A1. advance at a full day tail',
+        "check_adr3939_band_text_verbatim",
+    ),
+    "A5 moved off the 7-day state": (
+        "state = \"day_parts_7\"\nmetric = \"cold.max.leaf_gets\"\nlane = \"counter\"\ntarget_if = \"v <= 7 * 126\"\n",
+        "state = \"day_parts_30\"\nmetric = \"cold.max.leaf_gets\"\nlane = \"counter\"\ntarget_if = \"v <= 7 * 126\"\n",
+        "check_adr3939_rows_run_on_their_states",
     ),
 }
 

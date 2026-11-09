@@ -7,7 +7,7 @@ narrow joins of the investigation journeys. It runs them against a seeded
 spans and logs corpus in each state of the key-index matrix (see "States"),
 judges every answer against the generator's oracle, and judges every figure
 against `bands.toml`, which transcribes the 18 rows of ADR-3692's Acceptance
-table.
+table and ADR-3939's rows (see "ADR-3939's rows").
 
 This is not a `ravel-bench` report: it drives the real binaries, `ravel-cli
 load`, `ravel-cli catalog fold`, `ravel-cli maintain compact-tenant`,
@@ -496,8 +496,10 @@ Only an allowlist of fields this build does not report may read as
 `leafGetRequests`, `keysProbed`), `pruning.skipIdxDropped`, the per-object
 and per-part breakdowns, and the fold report's `key_index_build_passes`,
 `key_index_sections_read`, `key_index_leaf_gets` and
-`head_bytes_per_part_field`. Any other absent field (`phases`, `pruning`,
-`signals`, `io`, `server_cpu_s`, `server_rss_peak`, `rows`, the duration)
+`head_bytes_per_part_field`, plus, for ADR-3939's rows,
+`stats.keyIndex.leafRoundTrips`, `io.s3SlowDownResponses`, the fold
+report's fields and the H1b stamps listed under "ADR-3939's rows". Any
+other absent field (`phases`, `pruning`, `signals`, `io`, `server_cpu_s`, `server_rss_peak`, `rows`, the duration)
 is `missing`, and no figure defaults to 0. A figure read from
 `segmentsOpened` (rows 5, 6 and 14, "objects opened") whose value is 0
 while the same call's scan phase issued a GET is `dead_counter
@@ -782,6 +784,90 @@ maintenance per part-month over `lookups_per_part_month`, the frequency
 named in `maintenance_per_lookup_basis`); the break-even itself is
 unchanged.
 
+## ADR-3939's rows
+
+`bands.toml` also transcribes ADR-3939's two Acceptance tables
+(`docs/adrs/3939-key-index-day-seal.md`): rows A1 to A7 of the
+pre-registered table and W1 to W8 and F1 to F3 of the added rows, keyed
+`adr3939_a1` to `adr3939_f3`. Each row carries `adr = "ADR-3939"` and its
+ADR label in `adr_row`, and its `check`, `target`, `miss` and `source`
+cells are the ADR's cells verbatim. The summary names these rows by their
+ADR label (`ADR-3939 row W5`), and `not requested` lists them after
+ADR-3692's rows. Every row runs on the run's tenant (`inv`) and on one of
+three states the harness-state amendment adds:
+
+| State | Rows |
+|---|---|
+| `day_parts_7` | A1 to A6, W1, W4, W6, W7, F1, and F3's W4 figures |
+| `day_parts_30` | A7, W5, F2, and F3's W5 figures |
+| `retired_hour` | W2, W3, W8 |
+
+The amendment names A5, W4, W6, W7, F1 and F3 for the 7-day state and A7,
+W5, F2 and F3 for the 30-day one. A1 to A4, A6 and W1 measure an advance
+or a fold at a full-day tail, which the 7-day state is the first to hold,
+so they run there too.
+
+The three states are registered, not built: `box/run.sh` has no step for
+them yet (task H1b, #4048). A run without them reports every figure of
+these rows `not-run` with `states ['day_parts_7'] not run: day_parts_7:
+not in run.toml states` (or the state it lacks), and the states section
+lists each as `not-run (not in run.toml states)`; the rows are not
+requested, so they leave no run incomplete. H1b sends each multi-day
+state's calls before its fold under temp `prefold` (the unfolded
+baselines of A6, W4 and F2) and after it cold; evaluate.py counts a
+`prefold` call as cold.
+
+New statements, cold only, on the states their rows need:
+`logs_request_in_100_7d` (A5, W4) and `logs_request_in_100_30d` (A7, W5),
+the 100-key `request_id` list over the 7 and 30 days; `logs_request_in_1_7d`
+(W6), one key; and `logs_request_in_1_midnight` (W7), one key from the hour
+that starts at UTC midnight, with window `midnight` and truth key
+`midnight.request_id.1`. The run records the midnight call `not-run` until
+`truth.json` carries that key (H1b). The six row-18 lookups also run on
+`day_parts_7`, for A6.
+
+### The reduced-rate rule
+
+The 30-day state is loaded at a reduced rate: S slices per day part, read
+off the catalog stamp (`stamp.slices.logs.request_id`) as figure `slices`.
+A day part's bound for 100 keys is T(S) + 100, with T(S) = S × (1 − (1 −
+1/S)^100), computed by `day_part_bound(S, factor=1)` in a band expression:
+126 at S = 26, 176 at S = 175, 194 at S = 750. W5 and A7 judge each day
+part against that bound and the 30 days against 30 × (T(S) + 100); A7's
+ceiling figure also checks 30 × (T(S) + 100) ≤ 66,560, the clause under
+which every day held is covered. F3's W5 figures use 1.1 × (T(S) + 100),
+`day_part_bound(S, 1.1)` (139 at S = 26). No bound is hardcoded: each
+follows the stamped S. Below S = 3 the multi-slice term is not exercised,
+so every figure that reads S carries `not_run_unless = "m['...slices'] >=
+3"` and reports `not-run` with that reason, never a pass. A figure with
+`not_run_unless` whose expression is false is `not-run`, not judged, and
+leaves the run incomplete.
+
+### W2's fold binary
+
+After R2 a tombstoned hour in a sealed day takes the `retired_hours` path
+and is not re-encoded, so W2 means something only on a fold binary that
+carries C1 and not R2. Its first figure, `fold_binary_pre_r2`, reads
+`stamps/retired_hour.logs.fold_binary.json` (`sha`, `carries_c1`,
+`carries_r2`) and is 1 only for C1 without R2; a stamp missing any of the
+three fields is `missing`. Its other figures are `not-run` unless that
+figure is 1. No build writes the stamp yet, so the binary figure is
+`unsupported-on-this-build` ("no stamps/retired_hour.logs.fold_binary.json
+on this build (task H1b, #4048, writes it)"). W3's tombstoned hour and
+retired-hour resolve read `stamps/retired_hour.logs.tombstone.json` and
+`stamps/retired_hour.logs.retired_resolve.json` the same way.
+
+### Unsupported figures in these rows
+
+These figures name fields no build reports yet, so they read
+`unsupported-on-this-build` once their state runs: the fold report's
+`key_index_build_passes`, `key_index_leaf_gets`,
+`sealed_day_leaf_puts`, `sealed_day_previous_leaf_gets`,
+`key_index_unchanged_section_gets`, `key_index_part_puts`, `head_digest`,
+`switch_off_partition_changed` and `retired_hours` (A1 to A4, W1 to W3,
+W8); the per-part leaf GETs (A7, F3); `stats.keyIndex.leafRoundTrips` (W6);
+`io.s3SlowDownResponses` (F3); and the three H1b stamps above.
+
 ## Unsupported on this build
 
 - Row 7's G bounds (`build_passes_low`, `build_passes_high`) are not in
@@ -792,7 +878,8 @@ unchanged.
 - Key-index stats (`stats.keyIndex` and its members),
   `pruning.skipIdxDropped`, the per-object and per-part breakdowns, and the
   fold report's `key_index_build_passes`, `key_index_sections_read`,
-  `key_index_leaf_gets` and `head_bytes_per_part_field`:
+  `key_index_leaf_gets` and `head_bytes_per_part_field` (ADR-3939's rows
+  add the fields listed under "ADR-3939's rows"):
   absent from this build's output, so their figures are unsupported with
   that reason (the allowlist above). The many_parts leaf-GET figures are
   among them: main has no tier-2 reader.
@@ -898,7 +985,7 @@ log rows fill 14 store blocks. It took 23 minutes, 13 of them the mixed
 state's wait for the next ingest hour. Imported
 with `investigations_cases.py --import-local-smoke DIR`. Its `calls.jsonl`,
 `truth.json`, `results.local.json` and every stamp are gzipped, which keeps
-the fixture under 300 KB; `summary.local.txt` and `run.toml` are plain.
+the fixture under 320 KB; `summary.local.txt` and `run.toml` are plain.
 
 Its verdict is `fail`. The problem list, pinned by the suite:
 
@@ -993,6 +1080,21 @@ a stub `ravel-cli` that fails (its log copied to `out/logs/`, the next
 state still run), `launch.sh` (with an `aws` stub that
 fails if called) and `fetch.sh` (including an `aws` stub that exits 255,
 which must exit 69).
+
+ADR-3939's rows have four cases of their own, each with the wrong versions
+it must reject: `test_adr3939_band_text_is_the_adr_tables_verbatim` (every
+row's cells against both of the ADR's tables, exact to the character; a
+one-character drift in W4's target or A1's check fails it),
+`test_multi_day_rows_report_not_run_without_their_state` (every row
+`not-run` naming its missing state; fails with the three states
+unregistered), `test_w5_a7_targets_follow_stamped_slices` (W5's and A7's
+bounds at S = 26, 175 and 2: 126 and 3,780, 176 and 5,280, and `not-run`
+at 2; fails with the bound hardcoded at 126 in evaluate.py or in either
+row, with no S floor in W5, or with `not_run_unless` never consulted) and
+`test_w2_requires_pre_r2_binary_stamp` (no stamp, C1 with R2, no SHA, and C1
+without R2; fails with W2 judged on any binary or the binary read off C1
+alone). `test_adr3939_rows_run_on_their_states` pins each row's state
+(fails with A5 moved off `day_parts_7`).
 
 The box scripts target bash 3.2 as well as 5: run
 `/path/to/bash-3.2 benchmarks/investigations/investigations.test.sh` and
