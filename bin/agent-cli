@@ -1135,6 +1135,21 @@ def cmd_authorship(a):
     return rc
 
 
+def cmd_ci_budgets(a):
+    o = Out(a.json)
+    tree = caller_tree()
+    cmd = ["scripts/guards/check-ci-job-budgets.sh"]
+    if a.repo:
+        cmd += ["--repo", a.repo]
+    if a.runs is not None:
+        cmd += ["--runs", str(a.runs)]
+    rc, out, err = run(cmd, cwd=tree)
+    o.data = {"rc": rc, "detail": last_line(out + "\n" + err)}
+    o.text(f"ci-budgets {'ok' if rc == 0 else 'FAIL'} rc={rc} {o.data['detail']}")
+    o.emit()
+    return rc
+
+
 def du_kib(path):
     rc, out, _ = run(["du", "-sk", str(path)], cwd="/")
     try:
@@ -1475,6 +1490,12 @@ def build_parser():
 
     sp = add("box", cmd_box, "free disk, load, build processes, running executor tasks; --du sizes the caches")
     sp.add_argument("--du", action="store_true")
+
+    sp = add("ci-budgets", cmd_ci_budgets, "CI job runtime budget guard (check-ci-job-budgets.sh); exit code passes through",
+             "Lists p50/p90 job runtimes against timeout-minutes caps and a growth check; rc 1 is a "
+             "finding, 2 is a failed gh query, 64 usage.")
+    sp.add_argument("--repo")
+    sp.add_argument("--runs", type=int)
 
     sp = add("usage", cmd_usage, "agent-cli calls against the raw commands it replaces, from this machine's transcripts",
              "Reads this repository's Claude Code transcripts (~/.claude/projects/<primary path>) and counts "
