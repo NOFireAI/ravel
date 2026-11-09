@@ -61,6 +61,7 @@ pub mod otlp_grpc_logs;
 pub mod otlp_grpc_traces;
 pub mod otlp_http;
 pub mod postings_config;
+mod pressure_evictor;
 pub mod provisioning;
 pub mod qualification;
 pub mod query;
@@ -3223,12 +3224,13 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // resolving task. ADR-1170 (issue #3244 amendment): those decodes and the
     // fold's postings decode reserve against the same process budget the
     // query engine and SQL executor hold, so a refusal there is a refusal of
-    // the one shared number rather than of a private copy. SQL cannot make
-    // the catalog's decoded caches give memory back, so a finite budget also
-    // bounds what those caches may hold of it; an unlimited one leaves the
-    // catalog's default. A fallback budget (host memory unknown) is `u64::MAX`
-    // less the cache carves, unlimited in practice, so it sets no bound
-    // either.
+    // the one shared number rather than of a private copy. A finite budget
+    // also bounds what the catalog's decoded caches may hold of it, and
+    // registers the pressure evictor that makes them give memory back to any
+    // consumer's refused reservation (ADR-3326 decision 4, pressure-evictor
+    // amendment); an unlimited one leaves the catalog's default. A fallback
+    // budget (host memory unknown) is `u64::MAX` less the cache carves,
+    // unlimited in practice, so it sets no bound either.
     let catalog = Arc::into_inner(catalog)
         .ok_or_else(|| anyhow::anyhow!("the freshly built catalog is already shared"))?
         .with_read_gate(cpu_gates.read.clone())
@@ -3242,6 +3244,15 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             process_memory_budget.limit() / CATALOG_DECODED_CACHE_BUDGET_DIVISOR,
         )
     });
+    #[cfg_attr(not(feature = "sql"), allow(unused_variables))]
+    let pressure_evictor = if unlimited {
+        None
+    } else {
+        Some(pressure_evictor::PressureEvictor::install(
+            &process_memory_budget,
+            Arc::downgrade(&catalog),
+        )?)
+    };
 
     // Built in every mode, `Some` only in Mode::Maintain (the one mode that
     // spawns `maintain::spawn` below and therefore has discovery counters to
@@ -3844,25 +3855,22 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                     );
                 }
                 // A refused reservation from any other consumer evicts unheld
-                // entries first (ADR-3326 decision 4). Weak, because the cache
-                // already holds the budget. The evictor is asked for the
-                // shortfall plus the admission margin, so reservations other
-                // streams make before the refused caller retries do not take
-                // the bytes it was freed.
-                let evictee = Arc::downgrade(&cache);
-                if process_memory_budget
-                    .register_evictor(
-                        Box::new(move |want, cause| {
-                            evictee
-                                .upgrade()
-                                .map_or(0, |cache| cache.evict_for_pressure(want, margin, cause))
-                        }),
-                        margin,
-                    )
-                    .is_err()
-                {
-                    anyhow::bail!("process memory budget already has an evictor");
-                }
+                // entries first, ahead of the catalog's decoded caches
+                // (ADR-3326 decision 4, pressure-evictor amendment). The cache
+                // is asked for the shortfall plus the admission margin, so
+                // reservations other streams make before the refused caller
+                // retries do not take the bytes it was freed. An unlimited
+                // budget registered no evictor above; the cache installs one
+                // here, so its entries still give way when that budget
+                // refuses.
+                let evictor = match &pressure_evictor {
+                    Some(evictor) => Arc::clone(evictor),
+                    None => pressure_evictor::PressureEvictor::install(
+                        &process_memory_budget,
+                        Arc::downgrade(&catalog),
+                    )?,
+                };
+                evictor.attach_decoded_cache(&cache, margin)?;
                 let Some(executor) = Arc::get_mut(&mut state.executor) else {
                     anyhow::bail!("SQL executor shared before the decoded cache was installed");
                 };

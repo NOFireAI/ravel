@@ -301,10 +301,13 @@ it after its revert, so admission stays CLOCK and the intent rule).
   (`docs/adrs/1702-cpu-gate-and-isolated-liveness.md:629-633`). Here a
   referenced entry's bytes stay resident after eviction, so counting them
   would admit a reservation the host has no room for. This needs a
-  registered-evictor hook on `MemoryBudget`, which does not exist today.
+  registered-evictor hook on `MemoryBudget`, which does not exist today
+  (it does now; see the pressure-evictor amendment below).
   The catalog's `DecodedCaches::evict_until_fits`
   (`crates/ravel-catalog/src/cache.rs:1173-1240`) is crate-private and is
-  not wired in the server (`services/ravel-server/src/lib.rs:2930`).
+  not wired in the server (`services/ravel-server/src/lib.rs:2930`); the
+  pressure-evictor amendment below wires the catalog's decoded caches into
+  the one evictor the server registers.
   The hook alone does not keep a query admitted, so admission also keeps
   a headroom margin (see the admission-headroom amendment below), and the
   pass frees the shortfall plus that margin, not the shortfall alone (see
@@ -2437,3 +2440,53 @@ SearchPhrase, a gather on narrowed batches that costs what the cast it replaces 
 removed cast CPU reappearing in the aggregate's hash probe, so no budget, lifetime or fill timing
 of this mechanism reaches the bands. A wall-time lever on q17 to q19 has to act on the probe, which
 is 5 to 10 times the cast. The code is in git history at 0468e647f for reference.
+
+## Amendment (2026-11-09): one pressure evictor covers the decoded cache and the catalog's decoded caches (issue #4015)
+
+<!-- amendment-applies: sections="4. Entries are charged to the shared memory budget and give way to queries" pointer="pressure-evictor amendment" -->
+<!-- amendment-supersedes: phrase="which does not exist today" pointer="pressure-evictor amendment" -->
+<!-- amendment-supersedes: phrase="is not wired in the server" pointer="pressure-evictor amendment" -->
+
+Decision 4 registered the decoded column-block cache as the process
+budget's only evictor, and only when the cache was on. The catalog's part
+and postings caches gave memory back only to the catalog's own refused
+decode, through `DecodedCaches::evict_until_fits`. A SQL scan, a fetcher or
+a live reader refused by the budget therefore failed while the catalog's
+caches still held memory that eviction could have returned.
+
+`MemoryBudget` takes one evictor. The server now registers one pressure
+evictor (`services/ravel-server/src/pressure_evictor.rs`) whenever the
+process budget is bounded, in every mode, whether or not the decoded cache
+is on. When the decoded cache is on with an unlimited budget, the cache
+block registers the same evictor, so its entries keep giving way as they
+did before.
+
+- **Order.** On a refusal the evictor asks the decoded cache first, for
+  the shortfall plus the admission margin, exactly as decision 4 and the
+  evictor-slack amendment describe. It then asks the catalog's decoded
+  caches for whatever the decoded cache did not free, least-recently-used
+  across every tenant of both caches (`Catalog::evict_decoded_for_pressure`).
+  The evictor is registered with slack 0 and adds the margin inside its
+  call to the decoded cache, so the catalog is asked for the shortfall
+  alone, never the margin. With no decoded cache attached, the catalog is
+  asked for the whole shortfall.
+- **Causes.** Both exhaustion causes run it: an accounted refusal and a
+  host-memory gate refusal (ADR-2633). The decoded cache keeps its own rule
+  for each cause.
+- **The catalog's own retry stays.** A refused catalog decode still runs
+  `evict_until_fits` and retries once, in addition to the budget's evictor.
+  Its eviction-skip test is unchanged.
+- **What the catalog counts.** An entry dropped by the pressure evictor is
+  counted in `Catalog::decoded_cache_memory_evictions`, and its reservation
+  bytes count as freed. A resolve that still holds the entry returns those
+  bytes to the budget only when it drops the entry, so the budget's retry
+  can still be refused. That is the ordinary typed refusal.
+
+No metric family is added. The tests that pin this are, in
+`services/ravel-server/src/pressure_evictor.rs`,
+`with_no_decoded_cache_a_refused_reservation_evicts_the_catalog_cache`,
+`a_host_memory_refusal_evicts_the_catalog_cache`,
+`an_attached_decoded_cache_is_asked_before_the_catalog` and
+`a_second_install_on_one_budget_is_refused`, and in
+`crates/ravel-catalog/src/catalog.rs`,
+`evict_for_pressure_frees_lru_entries_until_want_is_covered`.

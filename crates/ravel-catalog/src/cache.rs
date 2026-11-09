@@ -1129,23 +1129,22 @@ impl<V> DecodedCache<V> {
             .min()
     }
 
-    /// Drop the least-recently-used entry across every tenant, returning
-    /// whether one was dropped. The evicted value is dropped after the map
-    /// lock is released: dropping it frees a whole decoded part or postings
-    /// object, and running a deallocation that size under the mutex would
-    /// hold off every concurrent `get` and `insert` on this cache for its
-    /// duration. It is not what returns the memory to the budget -- the
+    /// Drop the least-recently-used entry across every tenant, returning its
+    /// [`DecodedEntry::reserved_bytes`], or `None` when nothing is cached.
+    /// The evicted value is dropped after the map lock is released: dropping
+    /// it frees a whole decoded part or postings object, and running a
+    /// deallocation that size under the mutex would hold off every
+    /// concurrent `get` and `insert` on this cache for its duration. The
+    /// returned bytes are not what returns the memory to the budget -- the
     /// reservation goes back only when the last `Arc` to the value drops,
     /// which is here when no reader holds it and later when one does.
-    fn evict_lru(&self) -> bool {
+    fn evict_lru_bytes(&self) -> Option<u64> {
         let mut tenants = self.tenants.lock();
         let oldest = tenants
             .iter()
             .filter_map(|(tenant, cache)| cache.lru_tick().map(|tick| (tick, *tenant)))
             .min();
-        let Some((_, tenant)) = oldest else {
-            return false;
-        };
+        let (_, tenant) = oldest?;
         let evicted = tenants.get_mut(&tenant).and_then(|c| c.remove_lru());
         // A tenant whose last entry just went leaves no empty shell behind,
         // so a later scan does not walk it.
@@ -1156,7 +1155,7 @@ impl<V> DecodedCache<V> {
             tenants.remove(&tenant);
         }
         drop(tenants);
-        evicted.is_some()
+        evicted.map(|entry| entry.reserved_bytes)
     }
 
     /// Number of entries currently resident for `tenant`.
@@ -1398,27 +1397,61 @@ impl DecodedCaches {
         dropped
     }
 
+    /// Give memory back to another consumer's refused reservation
+    /// (ADR-3326 decision 4, pressure-evictor amendment): drop entries
+    /// least-recently-used first, across every tenant of both caches, until
+    /// the evicted entries' [`DecodedEntry::reserved_bytes`] reach `want` or
+    /// no entry remains, and return their sum. An entry a resolve still holds
+    /// returns its reservation to the budget only when that holder drops it.
+    /// Unlike [`Self::evict_until_fits`] this does not consult the budget's
+    /// `reserved()`: the caller is a different consumer's refusal, not this
+    /// catalog's own decode. Each evicted entry is counted on
+    /// [`Self::memory_evictions`].
+    pub(crate) fn evict_for_pressure(&self, want: u64) -> u64 {
+        let mut freed = 0u64;
+        let mut dropped = 0u64;
+        while freed < want {
+            match self.evict_one_lru_bytes() {
+                Some(bytes) => {
+                    freed = freed.saturating_add(bytes);
+                    dropped += 1;
+                }
+                None => break,
+            }
+        }
+        self.memory_evictions.fetch_add(dropped, Ordering::Relaxed);
+        freed
+    }
+
     /// Drop the older of the two caches' least-recently-used entries.
     ///
     /// The two peeks take their caches' locks separately, so a concurrent
     /// resolve can make the comparison stale between them; evicting a slightly
     /// newer entry costs a re-fetch and re-decode, never correctness.
     fn evict_one_lru(&self) -> bool {
+        self.evict_one_lru_bytes().is_some()
+    }
+
+    /// [`Self::evict_one_lru`], returning the evicted entry's reservation
+    /// bytes instead of a presence flag.
+    fn evict_one_lru_bytes(&self) -> Option<u64> {
         let parts_first = match (self.parts.lru_tick(), self.postings.lru_tick()) {
             (Some(parts), Some(postings)) => parts <= postings,
             (Some(_), None) => true,
             (None, _) => false,
         };
         if parts_first {
-            if self.parts.evict_lru() {
-                return true;
+            if let Some(bytes) = self.parts.evict_lru_bytes() {
+                return Some(bytes);
             }
-        } else if self.postings.evict_lru() {
-            return true;
+        } else if let Some(bytes) = self.postings.evict_lru_bytes() {
+            return Some(bytes);
         }
         // The chosen cache was emptied between the peek and the eviction, so
         // try the other rather than reporting both empty.
-        self.parts.evict_lru() || self.postings.evict_lru()
+        self.parts
+            .evict_lru_bytes()
+            .or_else(|| self.postings.evict_lru_bytes())
     }
 
     /// Bytes the reservations of every entry in both caches carry
