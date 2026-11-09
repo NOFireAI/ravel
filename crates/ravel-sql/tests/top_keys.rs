@@ -22,7 +22,7 @@ use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, TimestampNano
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
-use datafusion::common::Result as DFResult;
+use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::datasource::MemTable;
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
@@ -631,6 +631,7 @@ async fn eviction_drops_the_groups_state() {
     assert_eq!(on.rows(), keyed_rows(0..10, 2));
     assert!(on.evictions > 0, "no group was evicted");
     assert!(on.rebuilds > 0, "no rebuild ran");
+    assert!(on.dropped > 0, "no row was dropped at the threshold");
     assert!(on.charged < MIB as u64, "charged peak {}", on.charged);
 
     let off = probed(&rule_off(&config), parts(), TIGHT, sql).await;
@@ -643,6 +644,67 @@ async fn eviction_drops_the_groups_state() {
         err.to_string().contains("Resources exhausted"),
         "rule off: {err}"
     );
+}
+
+/// A pool too small for the exec's own table refuses its consumer, and the
+/// query fails with `ResourcesExhausted` naming it rather than panicking. On
+/// one partition the plan is a `Single` aggregate over the source, so the
+/// exec is the first consumer to reserve.
+#[tokio::test]
+async fn a_refused_reservation_fails_the_query_with_the_consumer_named() {
+    let sql = "SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k LIMIT 1000";
+    let config = SqlConfig {
+        max_query_bytes: 64 * 1024,
+        ..SqlConfig::default()
+    };
+    let on = probed(
+        &config,
+        keyed_parts(100_000, 1, 1, Arrival::Descending),
+        ONE_PARTITION,
+        sql,
+    )
+    .await;
+    assert_eq!(on.bounds, vec![1000], "{}", on.plan);
+    assert_eq!(on.modes, vec![AggregateMode::Single], "{}", on.plan);
+    let err = on.result.expect_err("the exec's table exceeds 64 KiB");
+    let message = err.to_string();
+    assert!(
+        matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+        "{err:?}"
+    );
+    assert!(
+        message.contains(&format!("{TOP_KEYS_CONSUMER_PREFIX}0] refused")),
+        "{message}"
+    );
+    assert!(!message.to_lowercase().contains("panic"), "{message}");
+}
+
+/// The integer `avg` keeps an exact `Decimal128` sum and an `Int64` count,
+/// no float state, so it is admitted. Over [`tied_parts`] with `ORDER BY g,
+/// k` the answer is determined, through at least one rebuild, and equals the
+/// rule-off run row for row with every count complete.
+#[tokio::test]
+async fn integer_avg_is_admitted_and_exact_through_rebuilds() {
+    let sql = "SELECT g, k, avg(v), count(*) FROM t GROUP BY g, k ORDER BY g, k LIMIT 100";
+    for options in [&[][..], ONE_PARTITION] {
+        let options: Vec<_> = options
+            .iter()
+            .copied()
+            .chain([("datafusion.execution.batch_size", "512")])
+            .collect();
+        let (on, off) = on_and_off(tied_parts, &options, sql).await;
+        assert_eq!(on.bounds, vec![100], "{options:?}\n{}", on.plan);
+        assert!(on.rebuilds > 0, "{options:?}: no rebuild ran");
+        let rows = on.rows();
+        assert_eq!(rows, off.rows(), "{options:?}");
+        for (k, row) in rows.iter().enumerate() {
+            let [g, k, count, sum, _] = tied_group(k as i64);
+            assert_eq!(row[0], g.to_string());
+            assert_eq!(row[1], k.to_string());
+            assert_eq!(row[2], format!("{:?}", sum as f64 / count as f64), "avg of {k}");
+            assert_eq!(row[3], count.to_string());
+        }
+    }
 }
 
 /// `ORDER BY g LIMIT 40` over [`tied_parts`] cuts through the 64 keys that
@@ -867,6 +929,141 @@ async fn an_aggregate_filter_leaves_the_plan_unchanged() {
         .collect();
     assert_eq!(on.rows(), want);
     assert_eq!(off.rows(), want);
+}
+
+/// `(k, v)` over four partitions in descending order: keys 0 to 1,999, `v =
+/// k`, keys below 100 with one row and the rest with two.
+fn having_parts() -> Vec<Vec<RecordBatch>> {
+    let schema = int64_schema(&["k", "v"], false);
+    let mut rows: Vec<Vec<Vec<Option<i64>>>> = vec![Vec::new(); 4];
+    for k in 0..2_000 {
+        for j in 0..if k < 100 { 1 } else { 2 } {
+            rows[((k + j) % 4) as usize].push(vec![Some(k), Some(k)]);
+        }
+    }
+    rows.into_iter()
+        .map(|mut part| {
+            part.reverse();
+            int64_batches(&schema, &part, 1024)
+        })
+        .collect()
+}
+
+/// `HAVING` puts a `FilterExec` between the sort and the aggregate, and the
+/// walk refuses it: the filter drops groups after the aggregate, so the n
+/// best groups the exec would keep are not the n best that survive it. Over
+/// [`having_parts`] the answer is keys 100 to 109.
+///
+/// FLIP (the walk passes through a `FilterExec`): each final partition keeps
+/// its ten smallest keys, all below 100, the filter drops every one, and the
+/// query returns no rows.
+#[tokio::test]
+async fn having_leaves_the_plan_unchanged() {
+    let sql = "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 1 ORDER BY k LIMIT 10";
+    let want: Vec<Vec<String>> = (100..110)
+        .map(|k| vec![k.to_string(), "2".to_string()])
+        .collect();
+    for options in [&[][..], ONE_PARTITION] {
+        let (on, off) = on_and_off(having_parts, options, sql).await;
+        assert_eq!(on.rows(), want, "{options:?}");
+        assert_eq!(off.rows(), want, "{options:?}: rule off");
+        assert!(on.bounds.is_empty(), "{options:?}\n{}", on.plan);
+        assert!(on.plan.contains("FilterExec"), "{}", on.plan);
+    }
+}
+
+/// An aggregate with its own `ORDER BY` is refused: the exec merges states
+/// without the ordering they carry. `first_value` is the one ordered
+/// aggregate the session registers, for the `DISTINCT ON` rewrite, which is
+/// the spelling that reaches it through the executor.
+#[tokio::test]
+async fn an_aggregate_order_by_leaves_the_plan_unchanged() {
+    for sql in [
+        "SELECT k, first_value(v ORDER BY v) FROM t GROUP BY k ORDER BY k LIMIT 10",
+        "SELECT DISTINCT ON (k) k, v FROM t ORDER BY k, v LIMIT 10",
+    ] {
+        let (on, off) =
+            on_and_off(|| keyed_parts(1_000, 4, 2, Arrival::Descending), &[], sql).await;
+        assert!(on.bounds.is_empty(), "{sql}\n{}", on.plan);
+        assert_eq!(on.rows().len(), 10, "{sql}");
+        assert_eq!(on.rows(), off.rows(), "{sql}");
+    }
+}
+
+/// A fetch above `bounded_top_keys_max_limit` is refused: 1,025 under the
+/// default ceiling of 1,024, and 10 under a ceiling of 5. The fetch at each
+/// ceiling is admitted.
+#[tokio::test]
+async fn a_limit_above_the_ceiling_leaves_the_plan_unchanged() {
+    let parts = || keyed_parts(3_000, 4, 2, Arrival::Descending);
+    let low = SqlConfig {
+        bounded_top_keys_max_limit: 5,
+        ..SqlConfig::default()
+    };
+    for (config, limit, bounds) in [
+        (SqlConfig::default(), 1_025, vec![]),
+        (SqlConfig::default(), 1_024, vec![1_024]),
+        (low.clone(), 10, vec![]),
+        (low, 5, vec![5]),
+    ] {
+        let sql = format!("SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k LIMIT {limit}");
+        let (on, off) = on_and_off_with(&config, parts, &[], &sql).await;
+        assert_eq!(on.bounds, bounds, "{sql}\n{}", on.plan);
+        assert_eq!(on.rows(), keyed_rows(0..limit, 2), "{sql}");
+        assert_eq!(off.rows(), keyed_rows(0..limit, 2), "{sql}: rule off");
+    }
+}
+
+/// `(k, f)` over four partitions in descending order: keys 0 to 1,999, two
+/// rows each. Key 0 holds three `-0.0` rows and nothing else; key `k` holds
+/// `f = k + 0.25`.
+fn float_state_parts() -> Vec<Vec<RecordBatch>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("f", DataType::Float64, false),
+    ]));
+    let mut rows: Vec<Vec<(i64, f64)>> = vec![Vec::new(); 4];
+    for k in 0..2_000i64 {
+        let copies = if k == 0 { 3 } else { 2 };
+        let f = if k == 0 { -0.0 } else { k as f64 + 0.25 };
+        for j in 0..copies {
+            rows[((k + j) % 4) as usize].push((k, f));
+        }
+    }
+    rows.into_iter()
+        .map(|mut part| {
+            part.reverse();
+            part.chunks(1024)
+                .map(|chunk| {
+                    let k = Int64Array::from_iter_values(chunk.iter().map(|row| row.0));
+                    let f = Float64Array::from_iter_values(chunk.iter().map(|row| row.1));
+                    RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(k), Arc::new(f)])
+                        .expect("batch builds")
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// A float state is refused even when the key is an integer: a rebuild
+/// merges each kept state into a fresh accumulator, and `0.0 + -0.0` is
+/// `+0.0`, so the `-0.0` group of [`float_state_parts`] could change sign.
+#[tokio::test]
+async fn a_float_state_leaves_the_plan_unchanged() {
+    for sql in [
+        "SELECT k, sum(f) FROM t GROUP BY k ORDER BY k LIMIT 10",
+        "SELECT k, avg(f) FROM t GROUP BY k ORDER BY k LIMIT 10",
+        "SELECT k, sum(f), avg(f), count(*) FROM t GROUP BY k ORDER BY k LIMIT 10",
+    ] {
+        for options in [&[][..], ONE_PARTITION] {
+            let (on, off) = on_and_off(float_state_parts, options, sql).await;
+            assert!(on.bounds.is_empty(), "{sql}\n{}", on.plan);
+            let rows = on.rows();
+            assert_eq!(rows.len(), 10, "{sql}");
+            assert_eq!(rows[0][0], "0", "{sql}");
+            assert_eq!(rows, off.rows(), "{sql}");
+        }
+    }
 }
 
 /// `(f, k)` in one partition: a `+0.0` row and a `-5.0` row, then two `-0.0`
