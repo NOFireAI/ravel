@@ -120,6 +120,12 @@
 //! amendment). `CompactionClaim::owner_clock_ns`
 //! exists for operator forensics and is never read here.
 //!
+//! A claim whose payload this reader cannot read (it does not decode,
+//! advertises a newer format, carries the `UNSPECIFIED` state, or has
+//! malformed owner ids) declares no lease it can honor, so its lease is
+//! [`MAX_OBSERVED_LEASE_MS`]. Past that expiry it is stolen under CAS exactly
+//! like a readable claim (ADR-1029, the 2026-11-09 amendment).
+//!
 //! # Time and randomness are injected
 //!
 //! No `SystemTime::now()` and no RNG. Time enters only as explicit
@@ -142,8 +148,8 @@ pub const WORK_ID_DOMAIN_TAG: &str = "ravel-compaction-claim-v1";
 
 /// Format floor for [`CompactionClaim`] (the guard every `sys/` message uses).
 /// A stored claim advertising a higher floor is one this reader does not
-/// understand: it is observed and rescheduled around, but never stolen and
-/// never overwritten.
+/// understand: it is judged by [`MAX_OBSERVED_LEASE_MS`] rather than by any
+/// lease it declares, and stolen only once older than that ceiling.
 pub const CLAIM_FORMAT_VERSION: u32 = 1;
 
 /// Ceiling on EVERY lease an observer honors when computing expiry: the
@@ -155,6 +161,12 @@ pub const CLAIM_FORMAT_VERSION: u32 = 1;
 /// still decodes) would suppress claimed compaction of its bucket
 /// indefinitely; the clamp bounds the outage to one day per incident on the
 /// advisory layer.
+///
+/// No claim object holds its work past its store `last_modified` plus this
+/// ceiling plus one contender's jitter without a write to the object: a claim
+/// whose payload cannot be read is given exactly this lease, since its own is
+/// unknown and a live owner renews well inside any lease up to it, and is then
+/// stolen under CAS like any expired claim.
 pub const MAX_OBSERVED_LEASE_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// The prefix every compaction claim lives under: a new additive advisory
@@ -353,16 +365,18 @@ pub struct ClaimObservation {
     /// base expiry is judged against.
     pub last_modified_unix_ms: i64,
     /// `last_modified_unix_ms + lease_duration`, where the lease is the one the
-    /// holder declared when readable, else this reader's configured default.
+    /// holder declared when readable (or this reader's configured default when
+    /// it declared none), and [`MAX_OBSERVED_LEASE_MS`] when the payload is
+    /// unreadable.
     pub expiry_unix_ms: i64,
     /// When to retry this unit: strictly after `expiry_unix_ms`, offset by this
     /// contender's deterministic [`jitter_ms`] so N contenders do not stampede
     /// the instant a claim expires.
     pub reschedule_after_unix_ms: i64,
     /// `None` when the stored payload does not decode, or advertises a format
-    /// floor above [`CLAIM_FORMAT_VERSION`]. Such a claim is rescheduled around
-    /// but never stolen: a reader that cannot read a claim cannot know it is
-    /// safe to take.
+    /// floor above [`CLAIM_FORMAT_VERSION`]. Such a claim's expiry is judged by
+    /// [`MAX_OBSERVED_LEASE_MS`], since the lease its writer declared cannot be
+    /// read, and past it the claim is stolen like any other.
     pub holder: Option<ClaimHolder>,
 }
 
@@ -424,9 +438,6 @@ pub enum StealRefused {
     /// The claim is still live. Stealing an unexpired claim would defeat the
     /// whole mechanism, so it is refused here rather than attempted and lost.
     NotExpired { expiry_unix_ms: i64 },
-    /// The observed payload did not decode, or advertises a format floor this
-    /// reader does not understand. Never overwrite what you cannot read.
-    UnreadableClaim,
 }
 
 /// The result of a [`steal`].
@@ -675,16 +686,27 @@ async fn observe(
     // renewal, and its pre-publish re-list catches a steal after that, apart
     // from the short window before its record PUT (ADR-1029, the 2026-10-03
     // amendment).
-    let lease_ms = holder
-        .as_ref()
-        .map(|h| h.lease_duration_ns)
-        .filter(|ns| *ns > 0)
-        .map(|ns| ns / 1_000_000)
-        .filter(|ms| *ms > 0)
-        .unwrap_or_else(|| cfg.lease_ms())
-        .min(MAX_OBSERVED_LEASE_MS);
+    let observer_lease_ms = cfg.lease_ms().min(MAX_OBSERVED_LEASE_MS);
+    let lease_ms = match holder.as_ref() {
+        Some(h) => Some(h.lease_duration_ns)
+            .filter(|ns| *ns > 0)
+            .map(|ns| ns / 1_000_000)
+            .filter(|ms| *ms > 0)
+            .unwrap_or(observer_lease_ms)
+            .min(MAX_OBSERVED_LEASE_MS),
+        // The writer's lease is unreadable, and a live writer of any lease up
+        // to the ceiling renews inside it, so the ceiling is the expiry.
+        None => MAX_OBSERVED_LEASE_MS,
+    };
     let expiry_unix_ms = meta.last_modified_unix_ms.saturating_add(lease_ms);
-    let jitter = jitter_ms(&work_id, observer_process_id, lease_ms, cfg);
+    // An unreadable claim's jitter is drawn from this observer's own lease,
+    // not the ceiling, so the hold past the ceiling stays under one lease.
+    let jitter_lease_ms = if holder.is_some() {
+        lease_ms
+    } else {
+        observer_lease_ms
+    };
+    let jitter = jitter_ms(&work_id, observer_process_id, jitter_lease_ms, cfg);
     // Strictly after expiry even when the jitter draw is 0: retrying in the
     // same millisecond expiry lands on would race the boundary for nothing.
     let reschedule_after_unix_ms = expiry_unix_ms.saturating_add(jitter).saturating_add(1);
@@ -703,14 +725,14 @@ async fn observe(
 /// Decode an observed claim's forensic fields, or `None` when the bytes are not
 /// a `CompactionClaim`, advertise a format floor above
 /// [`CLAIM_FORMAT_VERSION`], or carry the never-written `UNSPECIFIED` state.
-/// All three are treated identically by the protocol: observe and reschedule,
-/// never steal.
+/// All three are treated identically by the protocol: expiry is judged by
+/// [`MAX_OBSERVED_LEASE_MS`], and past it the claim is stolen under CAS.
 fn decode_holder(bytes: &[u8]) -> Option<ClaimHolder> {
     let claim = CompactionClaim::decode(bytes).ok()?;
     if claim.format_version > CLAIM_FORMAT_VERSION {
         tracing::debug!(
             version = claim.format_version,
-            "claim: observing a future-version claim; it will not be stolen"
+            "claim: observing a future-version claim; it expires at the lease ceiling"
         );
         return None;
     }
@@ -719,9 +741,9 @@ fn decode_holder(bytes: &[u8]) -> Option<ClaimHolder> {
         return None;
     }
     // A claim whose ownership identifiers do not parse is unreadable as a
-    // whole: treating it as held-with-unknown-owner would let steal overwrite
-    // state whose ownership it cannot attribute. Unreadable means the observer
-    // falls back to its own lease for expiry and never steals.
+    // whole: treating it as held-with-unknown-owner would trust a lease from a
+    // writer it cannot attribute. Unreadable means the observer judges expiry
+    // by MAX_OBSERVED_LEASE_MS instead.
     let process_id = uuid_from(&claim.owner_process_id)?;
     let attempt_id = uuid_from(&claim.attempt_id)?;
     Some(ClaimHolder {
@@ -783,8 +805,8 @@ pub async fn renew(
 ///
 /// Legal only once `now_unix_ms >= observed.expiry_unix_ms`; an earlier attempt
 /// is [`StealRefused::NotExpired`] and issues no store request at all. A claim
-/// whose payload could not be read is [`StealRefused::UnreadableClaim`] and is
-/// likewise never overwritten.
+/// whose payload could not be read is stolen the same way once past its
+/// expiry, which [`MAX_OBSERVED_LEASE_MS`] sets for it.
 ///
 /// CASing against the **observed** version is what makes the race safe in both
 /// directions: of N thieves observing the same version exactly one write lands,
@@ -797,9 +819,6 @@ pub async fn steal(
     cfg: &ClaimConfig,
     now_unix_ms: i64,
 ) -> Result<Steal, StoreError> {
-    if observed.holder.is_none() {
-        return Ok(Steal::Refused(StealRefused::UnreadableClaim));
-    }
     if !observed.is_expired(now_unix_ms) {
         return Ok(Steal::Refused(StealRefused::NotExpired {
             expiry_unix_ms: observed.expiry_unix_ms,
@@ -1604,11 +1623,12 @@ mod tests {
 
     /// A claim that decodes as protobuf but carries malformed UUID identity
     /// bytes is unreadable as a whole: ownership cannot be attributed, so the
-    /// holder is None, expiry falls back to the observer's lease, and steal
-    /// refuses it. Without the gate in decode_holder, this claim would be
-    /// stolen despite its ownership being undecodable.
+    /// holder is None, expiry is the lease ceiling rather than the 300 s lease
+    /// the payload declares, and a steal past that declared lease is refused.
+    /// Without the gate in decode_holder, the declared lease would be trusted
+    /// and this claim stolen after 300 s.
     #[tokio::test]
-    async fn a_claim_with_malformed_uuid_identity_is_never_stolen() {
+    async fn a_claim_with_malformed_uuid_identity_is_judged_by_the_lease_ceiling() {
         let store = instrumented();
         store.inner().set_clock_ms(1_700_000_000_000);
         let cfg = ClaimConfig::default();
@@ -1644,26 +1664,34 @@ mod tests {
             observed.holder.is_none(),
             "unattributable ownership makes the whole claim unreadable"
         );
+        assert_eq!(
+            observed.expiry_unix_ms,
+            1_700_000_000_000 + MAX_OBSERVED_LEASE_MS
+        );
         let refused = steal(
             &store,
             &observed,
             &owner_at(2),
             &cfg,
-            observed.expiry_unix_ms + 1,
+            1_700_000_000_000 + LEASE_MS + 1,
         )
         .await
         .expect("steal");
-        assert_eq!(refused_reason(refused), StealRefused::UnreadableClaim);
+        assert_eq!(
+            refused_reason(refused),
+            StealRefused::NotExpired {
+                expiry_unix_ms: 1_700_000_000_000 + MAX_OBSERVED_LEASE_MS
+            },
+            "the declared 300 s lease is not trusted"
+        );
     }
 
     /// A claim whose payload is raw garbage (not protobuf at all) degrades
     /// gracefully: acquire returns Held rather than panicking or erroring, the
-    /// observation falls back to the observer's configured lease for expiry,
-    /// and steal refuses it as unreadable. The operator repair for a wedged
-    /// malformed claim is a manual delete, once no compaction or erasure of
-    /// that bucket is running (docs/catalog-and-mvcc.md states the path).
+    /// observation takes the lease ceiling for expiry, and a steal before that
+    /// is refused locally.
     #[tokio::test]
-    async fn a_corrupt_claim_payload_is_observed_and_never_stolen() {
+    async fn a_corrupt_claim_payload_is_observed_and_judged_by_the_lease_ceiling() {
         let store = instrumented();
         store.inner().set_clock_ms(1_700_000_000_000);
         let cfg = ClaimConfig::default();
@@ -1688,26 +1716,31 @@ mod tests {
         assert!(observed.holder.is_none(), "the payload must not decode");
         assert_eq!(
             observed.expiry_unix_ms,
-            1_700_000_000_000 + i64::try_from(cfg.lease_duration.as_millis()).expect("fits"),
-            "an undecodable payload falls back to the observer's own lease"
+            1_700_000_000_000 + MAX_OBSERVED_LEASE_MS,
+            "an undecodable payload is judged by the lease ceiling"
         );
         let refused = steal(
             &store,
             &observed,
             &owner_at(2),
             &cfg,
-            observed.expiry_unix_ms + 1,
+            observed.expiry_unix_ms - 1,
         )
         .await
         .expect("steal");
-        assert_eq!(refused_reason(refused), StealRefused::UnreadableClaim);
+        assert_eq!(
+            refused_reason(refused),
+            StealRefused::NotExpired {
+                expiry_unix_ms: observed.expiry_unix_ms
+            }
+        );
     }
 
     /// A claim this reader cannot understand is observed and rescheduled
-    /// around, never stolen: taking over a claim whose payload you cannot read
-    /// means overwriting state whose meaning you do not know.
+    /// around, and is not stolen while younger than the lease ceiling: its
+    /// writer may be a live newer build on any lease up to it.
     #[tokio::test]
-    async fn a_future_version_claim_is_never_stolen() {
+    async fn a_future_version_claim_is_not_stolen_before_the_lease_ceiling() {
         let store = MemoryStore::new();
         let cfg = ClaimConfig::default();
         let contender = owner_at(1);
@@ -1733,26 +1766,136 @@ mod tests {
         assert!(observed.holder.is_none(), "the payload is not understood");
         assert_eq!(
             observed.expiry_unix_ms,
-            observed.last_modified_unix_ms + LEASE_MS,
-            "expiry falls back to this reader's configured lease"
+            observed.last_modified_unix_ms + MAX_OBSERVED_LEASE_MS,
+            "expiry is the lease ceiling, not the lease the payload declares"
         );
 
-        // Even long past expiry, the steal is refused locally.
+        // Long past this reader's own lease, the steal is still refused locally.
         let refused = steal(
             &store,
             &observed,
             &contender,
             &cfg,
-            observed.expiry_unix_ms + 1_000_000,
+            observed.last_modified_unix_ms + LEASE_MS + 1_000_000,
         )
         .await
         .expect("steal");
-        assert_eq!(refused_reason(refused), StealRefused::UnreadableClaim);
+        assert_eq!(
+            refused_reason(refused),
+            StealRefused::NotExpired {
+                expiry_unix_ms: observed.expiry_unix_ms
+            }
+        );
         assert_eq!(
             stored_claim(&store, &key).await,
             future,
             "the future-version claim is untouched"
         );
+    }
+
+    /// An unreadable claim, garbage bytes or a future format version, holds
+    /// its work until its store `last_modified` plus [`MAX_OBSERVED_LEASE_MS`]
+    /// and no longer: before that a steal is refused with no store request, at
+    /// it the steal lands under CAS, and a write to the object after the
+    /// observation defeats the steal and is left as written.
+    ///
+    /// Shown failing against an unreadable claim given the configured lease or
+    /// a zero lease (the expiry reads one lease, or `last_modified`), and
+    /// against a steal written with `PutMode::Overwrite` (the rewritten claim
+    /// is taken over instead of defeating the steal).
+    #[tokio::test]
+    async fn an_unreadable_claim_is_stolen_once_older_than_the_lease_ceiling() {
+        let cfg = ClaimConfig::default();
+        let written_ms: i64 = 1_700_000_000_000;
+        let key = compaction_claim_key(&identity().work_id());
+        let future = CompactionClaim {
+            format_version: CLAIM_FORMAT_VERSION + 1,
+            ..owner_at(0).payload(&cfg)
+        };
+        let cases: [(&str, Vec<u8>); 2] = [
+            ("garbage", b"\xff\xfenot a protobuf".to_vec()),
+            ("future format", future.encode_to_vec()),
+        ];
+        for (case, bytes) in cases {
+            let store = instrumented();
+            store.inner().set_clock_ms(written_ms as u64);
+            store
+                .put(&key, bytes.clone().into(), PutOptions::create_if_absent())
+                .await
+                .expect("seed the unreadable claim");
+
+            let thief = owner_at(1);
+            let observed = held(
+                acquire(&store, &identity(), &thief, &cfg)
+                    .await
+                    .expect("acquire"),
+            );
+            assert!(observed.holder.is_none(), "{case}: unreadable");
+            assert_eq!(
+                observed.expiry_unix_ms,
+                written_ms + MAX_OBSERVED_LEASE_MS,
+                "{case}: expiry is last_modified plus the ceiling"
+            );
+
+            let before = counts(&store);
+            let early = steal(&store, &observed, &thief, &cfg, written_ms + LEASE_MS)
+                .await
+                .expect("steal");
+            assert_eq!(
+                refused_reason(early),
+                StealRefused::NotExpired {
+                    expiry_unix_ms: written_ms + MAX_OBSERVED_LEASE_MS
+                },
+                "{case}: one configured lease is not enough"
+            );
+            assert_eq!(counts(&store), before, "{case}: no store request");
+
+            let taken = steal(&store, &observed, &thief, &cfg, observed.expiry_unix_ms)
+                .await
+                .expect("steal");
+            let (taken_key, version) = match taken {
+                Steal::Acquired { key, version, .. } => (key, version),
+                other => panic!("{case}: expected Acquired at the ceiling, got {other:?}"),
+            };
+            assert_eq!(taken_key, key);
+            assert_ne!(version, observed.version, "{case}: the version moved");
+            let stored = stored_claim(&store, &key).await;
+            assert_eq!(stored, thief.payload(&cfg), "{case}: the thief's payload");
+
+            // The CAS: a write after the observation defeats the steal.
+            let store = instrumented();
+            store.inner().set_clock_ms(written_ms as u64);
+            store
+                .put(&key, bytes.clone().into(), PutOptions::create_if_absent())
+                .await
+                .expect("seed the unreadable claim");
+            let observed = held(
+                acquire(&store, &identity(), &thief, &cfg)
+                    .await
+                    .expect("acquire"),
+            );
+            let rewritten = store
+                .put(
+                    &key,
+                    bytes.clone().into(),
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        checksum: None,
+                    },
+                )
+                .await
+                .expect("re-put the unreadable claim");
+            let lost = steal(&store, &observed, &thief, &cfg, observed.expiry_unix_ms)
+                .await
+                .expect("steal");
+            assert!(
+                matches!(lost, Steal::Lost),
+                "{case}: a moved version defeats the steal: {lost:?}"
+            );
+            let after = store.get(&key, GetRange::Full).await.expect("claim read");
+            assert_eq!(after.data.as_ref(), bytes.as_slice(), "{case}: untouched");
+            assert_eq!(after.version, rewritten.version, "{case}: version kept");
+        }
     }
 
     /// Two divergent input-set views of one bucket collide on ONE claim. This

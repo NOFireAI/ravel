@@ -546,26 +546,39 @@ the bucket as already compacted. The four reasons are:
   another contender's steal won the compare-and-swap first. The printed expiry
   is the one already in the past. The winner has just written a fresh lease,
   so the retry point is a full lease from the moment of the loss.
-- `unreadable_claim`: the claim object does not decode. See below.
+- `unreadable_claim`: the claim object does not decode, and it is not yet
+  older than the 24 h lease ceiling plus this process's jitter. See below.
 - `vanished_twice`: the claim key disappeared between the create and the read
   that followed it, twice in a row. Nothing is held, so the printed expiry is
   `0` and the retry point is immediate.
 
 An `unreadable_claim` holds the bucket, for compaction and for erasure alike,
-until an operator removes the claim object:
+for at most 24 hours after the claim object was last written, plus a jitter of
+at most 10% of the configured claim lease (30 s at the 300 s default). The
+printed expiry is the object's last write plus 24 h, and the retry point is one
+millisecond past that expiry plus the jitter. A run at or after the retry point
+takes the claim over with a compare-and-swap on the version it read, logs a
+warning that names the claim's key, and then compacts or erases holding the
+claim. If anything writes the claim object between the read and the
+takeover, the takeover fails and the bucket is retried later. Ravel never
+deletes a claim object.
+
+A run never continues without the claim. Such a run could publish a compaction
+built from data that an erasure of the same bucket already removed. A claim
+written by a newer release in a format that this release cannot read looks the
+same, so a rollback across such a release holds every bucket that the newer
+release claimed for up to 24 hours.
+
+A claim object that something rewrites more often than once every 24 hours
+holds its bucket for as long as the rewrites continue. Find and stop the
+writer: only principals with write access to `sys/maintain/` can do this.
+
+To end a hold sooner than 24 hours:
 
 1. Confirm the reason. The holder prints as `unknown`, and the reason stays
-   `unreadable_claim` on every retry. Once the object is older than one lease,
-   the run logs a warning that names the claim's key.
+   `unreadable_claim` on every retry.
 2. Make sure that no compaction, migration or erasure of that bucket runs.
 3. Remove that one key by hand.
-
-Ravel never steals an unreadable claim and never deletes it programmatically.
-A run that continues without the claim can publish a compaction built from
-data that an erasure of the same bucket already removed. A claim written
-by a newer release in a format that this release cannot read looks the same.
-A rollback across such a release therefore leaves every bucket that the newer
-release claimed held this way.
 
 `--dry-run` and `--no-claim` take no claims. `--no-claim` is for repair work
 when a claim is in the way:

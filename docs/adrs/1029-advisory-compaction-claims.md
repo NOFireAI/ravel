@@ -123,7 +123,9 @@ Protocol, using only contract-mandatory operations:
    attempt holds the claim: read it once (one GET), `head()` it for
    `last_modified`, compute expiry as
    `last_modified + lease_duration`, and reschedule this bucket to after
-   expiry plus deterministic jitter. Never poll an active claim.
+   expiry plus deterministic jitter. Never poll an active claim. A claim
+   whose payload cannot be read is given the 24 h lease ceiling as its
+   lease (the 2026-11-09 amendment).
 3. Renew with `PutMode::CasVersion(v)` where `v` is the `Version` from
    the owner's last successful PUT (returned in `PutOutcome`; no extra
    read). Renewal cadence is one-third of the lease duration, evaluated
@@ -495,7 +497,8 @@ retry waits out the jitter before its steal instead of before its create. A
 contender that loses a steal reschedules one full lease from the moment it
 lost, because the winner has just written a claim with a fresh lease. An
 unreadable claim's skip reschedules to one millisecond past one lease plus
-the contender's jitter, the instant the claim stops holding the bucket back,
+the contender's jitter (the 2026-11-09 amendment moves it past the lease
+ceiling plus the jitter), the instant the claim stops holding the bucket back,
 because that retry steals nothing and so waits nothing.
 The claim guard's tests `an_uncontended_claim_requests_no_jitter_wait`,
 `a_refused_then_retried_create_requests_the_jitter_once` and
@@ -684,11 +687,13 @@ publishes, and neither pass may skip it. Concretely:
    erasure rewrite, which took no claim, now takes it. A stale unreadable
    claim, which `Acquire::Unclaimed` let the compaction run past, now holds
    the bucket for both passes (`ClaimSkipReason::UnreadableClaim`, retried one
-   lease later) until an operator removes the object: running past it would
+   lease later) until an operator removes the object (until it is older than
+   the lease ceiling, since the 2026-11-09 amendment): running past it would
    publish unfenced. A claim written in a newer claim format reads as
    unreadable too, and claims are never deleted, so a future claim format
    bump followed by a rollback would hold every bucket the newer build
-   claimed, erasures included, until each claim key is removed by hand; a
+   claimed, erasures included, until each claim key is removed by hand (for
+   at most the lease ceiling, since the 2026-11-09 amendment); a
    claim format bump must say how a rollback clears them.
 3. **A pass that cannot take the claim backs off.** It builds nothing,
    publishes nothing, and a later pass retries; it never publishes unfenced. A
@@ -791,3 +796,83 @@ and `the_migration_relist_aborts_when_an_erasure_rewrite_published`. In
 `a_bucket_below_the_retired_cost_gate_is_claimed` replaces the cost-gate test
 and `a_stale_unreadable_claim_holds_the_bucket` replaces the test that ran such
 a bucket unclaimed.
+
+## Amendment (2026-11-09): an unreadable claim is stolen once older than the lease ceiling (issue #3209)
+
+<!-- amendment-applies: sections="1. A reusable claim primitive in ravel-fleet|Amendment (2026-09-28): jitter on the contended path only|Amendment (2026-10-03): the claim fences the compaction and erasure rewrite publishes (issue #2199)" pointer="2026-11-09 amendment" -->
+<!-- amendment-supersedes: phrase="until an operator removes the object" pointer="2026-11-09 amendment" -->
+<!-- amendment-supersedes: phrase="until each claim key is removed by hand" pointer="2026-11-09 amendment" -->
+<!-- amendment-supersedes: phrase="skip reschedules to one millisecond past one lease plus" pointer="2026-11-09 amendment" -->
+
+**The problem.** Since the 2026-10-03 amendment a claim whose payload does not
+decode holds its bucket against both the compaction and the erasure rewrite,
+and nothing in Ravel ever removed it. Any principal with write access to
+`sys/maintain/claims/` could therefore stall an erasure indefinitely with one
+PUT of garbage, and a claim format bump followed by a rollback did the same to
+every bucket the newer build had claimed. An erasure is a deadline obligation;
+a hold with no bound is a liveness failure of it.
+
+**Decision.** An unreadable claim (bytes that do not decode, a
+`format_version` above this build's, an unspecified state, or an id that is
+not 16 bytes) is given `MAX_OBSERVED_LEASE_MS` (24 h,
+`crates/ravel-fleet/src/claim.rs`) as its lease. Its expiry is the store's
+`last_modified` plus 24 h, and past that it is stolen under
+`PutMode::CasVersion` on the version the contender observed, exactly as any
+expired claim is (decision 1 step 4). The steal is never an unconditional PUT
+and never a DELETE: a write to the object between the observation and the
+steal moves its version and defeats the steal, which reports `Steal::Lost`.
+`StealRefused::UnreadableClaim` and the claim guard's refusal to steal are
+removed.
+
+**The invariant.** No claim object holds its bucket past its `last_modified`
+plus 24 h plus one contender's jitter without a write to the object. A
+readable claim's lease is already capped at the same ceiling; an unreadable
+one now gets exactly the ceiling. The jitter for an unreadable claim is drawn
+from the contender's configured lease (capped at the ceiling), not from the
+ceiling, so it is at most `jitter_span_fraction` of that lease: 30 s at the
+300 s default.
+
+**Why 24 h and not the configured lease.** The claim's own lease is unknown
+because its payload is. A live writer of any lease up to the ceiling renews
+well inside it, so judging the claim by the ceiling never steals from a live
+owner whose lease is legal, whatever build wrote it; judging it by the
+observer's lease would steal from a newer build running a longer lease. The
+ceiling is also the bound a readable claim's declared lease is already held
+to, so one number bounds both.
+
+**No second jitter.** The claim guard's skip for an unreadable claim already
+reschedules to one millisecond past the ceiling plus the contender's jitter,
+so contenders' thresholds differ by that jitter. A retry at or after that
+point steals without waiting it out again, which keeps the stall at the
+ceiling plus one jitter rather than two. Below that point the guard skips with
+`ClaimSkipReason::UnreadableClaim` and writes nothing; the steal is logged at
+warn with the claim's `last_modified`.
+
+**The fence still holds.** A pass that steals the claim holds it, so it
+publishes fenced, as the 2026-10-03 amendment requires. Nothing runs
+unclaimed past an unreadable claim.
+
+**Residual.** A writer that re-PUTs the claim object more often than every
+24 h moves its `last_modified` each time and keeps the bucket held. Closing
+that needs authenticated claims (a keyed MAC over the payload, as ADR-3130
+does for its own objects), which is a proto field and a claim format version
+bump. It is not decided here; the write grant on `sys/maintain/` remains the
+control on it.
+
+**Operator removal.** Deleting a stuck claim key by hand is still allowed and
+still ends the hold at once, with the caution the operations guide gives. It
+is no longer the only way out.
+
+Tests, each shown failing against the code before this amendment:
+`an_unreadable_claim_is_stolen_once_older_than_the_lease_ceiling` in
+`crates/ravel-fleet/src/claim.rs` (garbage and future-format payloads, the
+CAS steal, and a rewrite between observation and steal reporting `Lost`);
+`an_unreadable_claim_defers_until_the_lease_ceiling_plus_jitter_then_steals`
+in `crates/ravel-maintain/src/claim_guard.rs`;
+`a_stale_unreadable_claim_holds_both_passes_until_the_lease_ceiling` in
+`crates/ravel-maintain/tests/erasure_compaction_fence.rs` and
+`a_stale_unreadable_claim_holds_the_bucket_until_the_lease_ceiling` in
+`crates/ravel-maintain/tests/compaction_claims.rs`, which replace the two
+tests of the same prefix the 2026-10-03 amendment names; and
+`a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling` in
+`services/ravel-server/src/maintain.rs`.
