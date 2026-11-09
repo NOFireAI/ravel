@@ -680,12 +680,14 @@ async fn a_refused_reservation_fails_the_query_with_the_consumer_named() {
 }
 
 /// The integer `avg` keeps an exact `Decimal128` sum and an `Int64` count,
-/// no float state, so it is admitted. Over [`tied_parts`] with `ORDER BY g,
-/// k` the answer is determined, through at least one rebuild, and equals the
-/// rule-off run row for row with every count complete.
+/// no float state, so it is admitted, beside the other integer aggregates the
+/// session registers. Over [`tied_parts`] with `ORDER BY g, k` the answer is
+/// determined, through at least one rebuild, and equals the rule-off run row
+/// for row with every aggregate complete.
 #[tokio::test]
 async fn integer_avg_is_admitted_and_exact_through_rebuilds() {
-    let sql = "SELECT g, k, avg(v), count(*) FROM t GROUP BY g, k ORDER BY g, k LIMIT 100";
+    let sql = "SELECT g, k, avg(v), count(*), count(v), sum(v), min(v), max(v) \
+               FROM t GROUP BY g, k ORDER BY g, k LIMIT 100";
     for options in [&[][..], ONE_PARTITION] {
         let options: Vec<_> = options
             .iter()
@@ -698,11 +700,15 @@ async fn integer_avg_is_admitted_and_exact_through_rebuilds() {
         let rows = on.rows();
         assert_eq!(rows, off.rows(), "{options:?}");
         for (k, row) in rows.iter().enumerate() {
-            let [g, k, count, sum, _] = tied_group(k as i64);
+            let [g, k, count, sum, max] = tied_group(k as i64);
             assert_eq!(row[0], g.to_string());
             assert_eq!(row[1], k.to_string());
             assert_eq!(row[2], format!("{:?}", sum as f64 / count as f64), "avg of {k}");
             assert_eq!(row[3], count.to_string());
+            assert_eq!(row[4], count.to_string());
+            assert_eq!(row[5], sum.to_string());
+            assert_eq!(row[6], (10 * k).to_string(), "min of {k}");
+            assert_eq!(row[7], max.to_string());
         }
     }
 }
