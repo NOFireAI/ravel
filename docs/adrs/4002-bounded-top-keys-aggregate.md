@@ -31,6 +31,22 @@ Stage 0 (#4002, comment 6728794535) measured the charged peak, the aggregate env
 
 Every ordered statement built the full group table, linear in the number of keys, as the out-of-scope `ORDER BY count(*)` control does. Only the unordered control, bounded by `FirstGroupsExec`, stayed flat. At the default 256 MiB query limit, every statement but that control would be refused at 10,000,000 keys.
 
+T5 (#4005; pre-registered in comment 6730613003 on #4002, report and band judgments in comment 6733600310) re-measured the same statements on main at a94cf83, with `TopKeysAggregateExec` in place, using Stage 0's setup: `sql_partition_count = 8`, a MemTable of 8 partitions in 8,192-row batches, 8 tokio worker threads, 3 rows per key with keys permuted as `k * 7919 mod n`, and `max_query_bytes` at 4 GiB. Each statement ran with `SqlConfig::default()` and with `bounded_top_keys_max_limit = 0` in the same process, interleaved, 3 times each. The host was a 4-core aarch64 executor with 8 GB of memory (Raspberry Pi 5 class). The release profile was overridden on the command line: `lto = false` for every crate, and for ravel-sql `codegen-units = 16`, `opt-level = 1` and `debug = 0`; the memory figures do not depend on it. At 1M and 10M keys the rule-off figures of every ordered statement reproduced Stage 0's charged peak within 4 percent and its envelope within 0.2 percent. At 100k keys, where fixed costs dominate, they differed by up to 6 percent charged and 19 percent envelope. With the rule on, medians of 3 runs, charged and envelope in MiB, the `TopKeys[` figure the largest one consumer's own peak in bytes:
+
+| statement | 100k charged / envelope | 1M charged / envelope | 10M charged / envelope | 10M wall, on / off | 10M `TopKeys[` peak |
+|---|---|---|---|---|---|
+| `ORDER BY k LIMIT 10`, Int64 key | 2.51 / 0.00 | 4.87 / 0.00 | 7.09 / 0.13 | 0.56 s / 2.45 s | 697,016 |
+| the same, Utf8View key of 8 to 40 bytes | 18.19 / 0.00 | 37.33 / 0.00 | 43.22 / 0.00 | 2.30 s / 5.33 s | 2,052,023 |
+| `ORDER BY k DESC` | 3.17 / 0.00 | 5.19 / 0.00 | 5.36 / 0.00 | 0.57 s / 2.37 s | 697,016 |
+| `count`, `sum`, `avg` | 9.35 / 0.00 | 11.99 / 0.00 | 15.99 / 0.02 | 2.02 s / 4.85 s | 1,289,176 |
+| two keys, ordered by both | 4.10 / 0.00 | 7.17 / 0.00 | 8.68 / 0.00 | 1.06 s / 3.17 s | 967,288 |
+| `date_trunc('minute')`, `DESC LIMIT 60` | 2.84 / 0.00 | 5.11 / 0.00 | 6.24 / 0.13 | 0.63 s / 2.46 s | 697,016 |
+| `min(v)`, ordered by key | 3.64 / 0.00 | 4.45 / 0.00 | 7.76 / 0.13 | 0.64 s / 2.42 s | 697,016 |
+| control: unordered `GROUP BY k LIMIT 10` | 2.17 / 0.05 | 4.39 / 0.04 | 5.21 / 0.04 | 1.43 s / 1.43 s | none |
+| control: `ORDER BY count(*) DESC` | 6.40 / 5.16 | 59.26 / 54.07 | 610.51 / 280.00 | 2.40 s / 2.37 s | none |
+
+Every ordered statement planned `TopKeysAggregateExec` in place of the `FinalPartitioned` aggregate, at every size, and the `CompactSlicesExec` above it left the plan. Its rows equalled the rule-off rows exactly in every run. Both controls kept their plans: `FirstGroupsExec` under the final aggregate for the unordered one, and `CompactSlicesExec` over a full `FinalPartitioned` aggregate for `ORDER BY count(*)`.
+
 Neither existing bound applies:
 
 - **DataFusion's `TopKAggregation`.** It admits ordering by the group key only with no aggregate or with a single `min`/`max`, on a single key (`datafusion-physical-optimizer-55.2.0/src/topk_aggregation.rs:52-54, 98-106`). Ravel turns it off for every session (`crates/ravel-sql/src/session.rs:694`, comment at 684-693, #1402). Its stream (`aggregates/mod.rs:211`, `mod grouped_topk_stream`) and `PriorityMap` (`mod topk`, 219) are private to DataFusion.
@@ -159,6 +175,29 @@ T1's peak test, `the_exec_bounds_the_final_stages_charged_peak` in `crates/ravel
 - each `TopKeys[` consumer's own peak: 895,768 to 1,027,547 bytes. The test bounds it by `(2n + batch size) × 256` bytes, 2,102,272 at the default batch of 8192.
 
 The test asserts the charged peak below 32 MiB with the rule, about twice the largest figure because the hash exchange's buffers vary with scheduling, and above 32 MiB without it. T5's re-measurement on the Stage 0 statement set adds the after-figures for the table in Context.
+
+T5 (#4005) measured the Stage 0 statement set on the 4-core aarch64 executor and the setup the Context section describes, rule off and rule on in the same process. At 10,000,000 distinct keys, the query pool's charged peak before and after, the wall time with the rule as a fraction of the wall time without it, and the largest `TopKeys[` consumer's own peak:
+
+- `ORDER BY k LIMIT 10`, Int64 key: 611.52 to 7.09 MiB; wall 0.23 (0.56 s against 2.45 s); 697,016 bytes.
+- The same, Utf8View key: 1,224.97 to 43.22 MiB; wall 0.43 (2.30 s against 5.33 s); 2,052,023 bytes.
+- `ORDER BY k DESC`: 612.89 to 5.36 MiB; wall 0.24; 697,016 bytes.
+- `count`, `sum`, `avg`: 1,256.26 to 15.99 MiB; wall 0.42; 1,289,176 bytes.
+- Two keys, ordered by both: 770.45 to 8.68 MiB; wall 0.33; 967,288 bytes.
+- `date_trunc('minute')`, `DESC LIMIT 60`: 607.38 to 6.24 MiB; wall 0.25; 697,016 bytes.
+- `min(v)`, ordered by key: 607.89 to 7.76 MiB; wall 0.26; 697,016 bytes.
+- Control, unordered `GROUP BY k LIMIT 10`: 5.09 and 5.21 MiB; wall 1.00; no `TopKeys[` consumer, as planned.
+- Control, `ORDER BY count(*) DESC`: 614.14 and 610.51 MiB; wall 1.01; no `TopKeys[` consumer, as planned.
+
+Against the bounds this ADR states:
+
+- Each `TopKeys[` consumer's peak stayed inside `(2n + batch size) × 256` bytes for every statement and size: 2,102,272 bytes for n = 10, 2,127,872 for n = 60. The Utf8View key came closest, at 2,052,023 bytes, 97.6 percent of its bound.
+- The aggregate envelope with the rule was at most 0.13 MiB at any size, against 280 to 551 MiB without it at 10M keys.
+- The charged peak with the rule stayed below T1's 32 MiB for every Int64, timestamp and two-key statement at every size, at most 15.99 MiB. The Utf8View key exceeded 32 MiB at 1M keys (37.33 MiB) and at 10M (43.22 MiB). T1's assertion covers Int64 keys only, so this is not a failure of that test. But the Utf8View figure still grows with the number of keys, 18.19, 37.33 and 43.22 MiB at 100k, 1M and 10M, while each consumer's peak moved only from 1,904,599 to 2,052,023 bytes. The eight consumers together hold at most 16.4 MB; the rest, and all of the growth, is in the stages below the exec.
+- Every ordered statement now fits the default 256 MiB query limit at 10,000,000 keys. The `ORDER BY count(*)` control, out of scope, still does not.
+
+Against the pre-registration (comment 6730613003 on #4002), every band held but one:
+- The plan, the Int64-type charged peaks (2 to 16 MiB), the per-consumer bound, the rule-off reproduction of Stage 0, the unchanged controls, the wall time and the row-for-row answers all held.
+- The miss is the Utf8View key's charged peak with the rule, pre-registered under 32 MiB and measured at 37.33 MiB at 1M keys and 43.22 MiB at 10M. Its growth is in the partial stage and the exchange, which T3 (#4007) bounds, so that statement is T3's measured case.
 
 ## Rejected alternatives
 
