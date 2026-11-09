@@ -3,8 +3,10 @@
 #
 # Live mode (default): reads the last --runs completed `push` runs of ci.yml
 # on main and the last --runs `merge_group` runs, computes each job's p50 and
-# p90 runtime in minutes over jobs that completed (success or failure), reads
-# each job's `timeout-minutes` cap from .github/workflows/ci.yml, and prints
+# p90 runtime in minutes over jobs that completed (success or failure, plus
+# cancelled or timed_out jobs that ran to within a minute of their cap: a job
+# killed at its timeout-minutes is reported as cancelled), reads each job's
+# `timeout-minutes` cap from .github/workflows/ci.yml, and prints
 # one line per job: name, p50, p90, cap, ratio. Two rules can fail it:
 #
 #   cap     a job's p90 exceeds 0.7 of its cap -- 30 percent of run-to-run
@@ -28,10 +30,12 @@
 #   check-ci-job-budgets.sh [--repo OWNER/REPO] [--runs N]
 #   check-ci-job-budgets.sh --raise-check BASE_REF
 #
-# Exit codes (live mode): 0 clean, 1 a cap or growth finding, 2 a gh call
-# failed or returned no runs (could not ask is not clean), 64 bad usage.
+# Exit codes (live mode): 0 clean, 1 a cap or growth finding, 2 could not
+# ask (a gh call failed or returned no runs, a job row's timestamps did not
+# parse, or the current or older window held no job rows), 64 bad usage, 70
+# ci.yml missing or no timeout-minutes cap parsed from it.
 # Exit codes (--raise-check): 0 no un-budgeted raise, 1 a raise with no
-# budget comment, 64 bad usage.
+# budget comment, 64 bad usage, 70 ci.yml unreadable or no cap parsed.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -44,7 +48,7 @@ OLD_WINDOW_DAYS=14
 GITHUB_DEFAULT_TIMEOUT_MINUTES=360
 
 usage() {
-  sed -n '2,33p' "$0" >&2
+  sed -n '2,37p' "$0" >&2
 }
 
 repo="${DEFAULT_REPO}"
@@ -213,6 +217,10 @@ if [[ "${mode}" == "raise-check" ]]; then
 
   parse_job_timeouts "${CI_YML}" | sort >"${cur_caps}"
   parse_job_timeouts "${base_yaml}" | sort >"${base_caps}"
+  if [[ ! -s "${cur_caps}" || ! -s "${base_caps}" ]]; then
+    echo "check-ci-job-budgets.sh: no timeout-minutes cap parsed from ci.yml (working tree or ${raise_base}); cannot compare caps" >&2
+    exit 70
+  fi
 
   # The line directly above a job's timeout-minutes line, checked against the
   # required comment. A dedicated small awk pass per job (cheap: one job per
@@ -277,6 +285,10 @@ caps_tsv="${tmpdir}/caps.tsv"
 names_tsv="${tmpdir}/names.tsv"
 parse_job_timeouts "${CI_YML}" >"${caps_tsv}"
 parse_job_names "${CI_YML}" >"${names_tsv}"
+if [[ ! -s "${caps_tsv}" ]]; then
+  echo "check-ci-job-budgets.sh: no timeout-minutes cap parsed from ${CI_YML}; every job would read as the ${GITHUB_DEFAULT_TIMEOUT_MINUTES}-minute default" >&2
+  exit 70
+fi
 
 cap_for_key() {
   local key="$1" v
@@ -321,10 +333,11 @@ if [[ -z "${cutoff}" ]]; then
   exit 2
 fi
 
-push_current_path="repos/${repo}/actions/runs?branch=main&event=push&status=completed&per_page=${runs}"
-mg_current_path="repos/${repo}/actions/runs?event=merge_group&status=completed&per_page=${runs}"
-push_older_path="repos/${repo}/actions/runs?branch=main&event=push&status=completed&per_page=${runs}&created=%3C${cutoff}"
-mg_older_path="repos/${repo}/actions/runs?event=merge_group&status=completed&per_page=${runs}&created=%3C${cutoff}"
+runs_base="repos/${repo}/actions/workflows/ci.yml/runs"
+push_current_path="${runs_base}?branch=main&event=push&status=completed&per_page=${runs}"
+mg_current_path="${runs_base}?event=merge_group&status=completed&per_page=${runs}"
+push_older_path="${runs_base}?branch=main&event=push&status=completed&per_page=${runs}&created=%3C${cutoff}"
+mg_older_path="${runs_base}?event=merge_group&status=completed&per_page=${runs}&created=%3C${cutoff}"
 
 query_failed=0
 
@@ -389,12 +402,34 @@ build_pool() {
       [[ -z "${jobs_text}" ]] && continue
       while IFS=$'\t' read -r jname jconclusion jstarted jcompleted; do
         [[ -z "${jname}" ]] && continue
-        [[ "${jconclusion}" != "success" && "${jconclusion}" != "failure" ]] && continue
-        dur="$(duration_minutes "${jstarted}" "${jcompleted}")" || continue
-        [[ -z "${dur}" ]] && continue
+        case "${jconclusion}" in
+          success | failure) killed=0 ;;
+          cancelled | timed_out) killed=1 ;;
+          *) continue ;;
+        esac
+        # A cancelled job that never started has no runtime to measure.
+        if ((killed == 1)) && [[ -z "${jstarted}" || "${jstarted}" == "0001-01-01T00:00:00Z" ]]; then
+          continue
+        fi
+        dur="$(duration_minutes "${jstarted}" "${jcompleted}")"
+        if [[ -z "${dur}" ]]; then
+          echo "check-ci-job-budgets.sh: cannot read the duration of job '${jname}' in run ${run_id}: started_at='${jstarted}' completed_at='${jcompleted}'" >&2
+          query_failed=1
+          continue
+        fi
         key="$(map_job_key "${jname}")"
+        mapped=1
         if [[ -z "${key}" ]]; then
           key="${jname%% \(*}"
+          mapped=0
+        fi
+        if ((killed == 1)); then
+          # Only a cancellation at the cap is a timeout; an earlier one is a
+          # superseded run and says nothing about the job's runtime.
+          at_cap="$(awk -v d="${dur}" -v c="$(cap_for_key "${key}")" 'BEGIN{print (d >= c - 1) ? 1 : 0}')"
+          [[ "${at_cap}" == "1" ]] || continue
+        fi
+        if ((mapped == 0)); then
           printf '%s\n' "${key}" >>"${unmapped}"
         fi
         printf '%s\t%s\n' "${key}" "${dur}" >>"${rows_file}"
@@ -408,6 +443,15 @@ build_pool "${older_rows}" "${push_older_ids}" "${mg_older_ids}"
 
 if ((query_failed == 1)); then
   echo "check-ci-job-budgets.sh: could not read every job's timings; exiting 2" >&2
+  exit 2
+fi
+
+if [[ ! -s "${current_rows}" ]]; then
+  echo "check-ci-job-budgets.sh: no job rows in the current window; exiting 2" >&2
+  exit 2
+fi
+if [[ ! -s "${older_rows}" ]]; then
+  echo "check-ci-job-budgets.sh: no job rows in the window older than ${OLD_WINDOW_DAYS} days, so the growth rule cannot be asked; exiting 2" >&2
   exit 2
 fi
 

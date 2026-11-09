@@ -22,9 +22,19 @@ not_ok() {
 }
 
 ts() {
-  # ts <offset_minutes> -> ISO-8601 timestamp that many minutes after BASE_EPOCH.
-  date -u -d "@$((BASE_EPOCH + $1 * 60))" +%Y-%m-%dT%H:%M:%SZ
+  # ts <offset_minutes> -> ISO-8601 timestamp that many minutes after
+  # BASE_EPOCH. GNU date first, then BSD/macOS date.
+  local e=$((BASE_EPOCH + $1 * 60))
+  date -u -d "@${e}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null && return 0
+  date -u -r "${e}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
 }
+
+# Every fixture row is built from ts(); a date that cannot format an epoch
+# would leave every timestamp blank and every case asking about nothing.
+if [[ -z "$(ts 0)" ]]; then
+  echo "check-ci-job-budgets.test.sh: ts 0 printed nothing; this date(1) can format an epoch neither as GNU nor as BSD date" >&2
+  exit 70
+fi
 
 new_repo() {
   # new_repo <ci_yml_content_varname> -> prints the repo path. Writes,
@@ -73,7 +83,7 @@ case "${path}" in
     [[ -n "${val}" ]] && printf '%s' "${val}"
     exit 0
     ;;
-  *"actions/runs?"*)
+  *"/actions/workflows/ci.yml/runs?"*)
     key=""
     case "${path}" in
       *event=push*created=*) key="PUSH_OLDER" ;;
@@ -137,12 +147,11 @@ CI_YML_SQL='jobs:
       - run: echo hi
 '
 
-# Base fixture used by the four cap/growth live-mode cases below: current
-# pool gets its points from push_current (2 runs) and mg_current (2 runs);
-# older pool, when used, from push_older/mg_older the same way. A case that
-# does not need the older pool still points it at one run with no matching
-# job, so the run-list query itself succeeds (empty is a hard failure here,
-# a run with no relevant job in it is not).
+# Base fixture used by the cap/growth live-mode cases below: current pool
+# gets its points from push_current (2 runs) and mg_current (2 runs); older
+# pool from push_older/mg_older the same way. Both pools need at least one
+# job row: an empty pool is "could not ask" (exit 2), not clean. A run whose
+# jobs response is empty is fine as long as another run fills the pool.
 run_live_case() {
   # run_live_case <name> <repo_dir> <extra exported STUB_* already set by caller>
   local case_name="$1" repo_dir="$2" bindir out rc
@@ -165,7 +174,7 @@ test_p90_at_071_of_cap_is_a_finding() {
   export STUB_JOBS_102; STUB_JOBS_102="$(job_row testjob success 0 20)"
   export STUB_JOBS_103; STUB_JOBS_103="$(job_row testjob success 0 30)"
   export STUB_JOBS_104; STUB_JOBS_104="$(job_row testjob success 0 71)"
-  export STUB_JOBS_201=""
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 71)"
   export STUB_JOBS_202=""
   run_live_case "${name}" "${repo}"
   unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
@@ -191,13 +200,15 @@ test_p90_at_069_of_cap_passes() {
   export STUB_JOBS_102; STUB_JOBS_102="$(job_row testjob success 0 20)"
   export STUB_JOBS_103; STUB_JOBS_103="$(job_row testjob success 0 30)"
   export STUB_JOBS_104; STUB_JOBS_104="$(job_row testjob success 0 69)"
-  export STUB_JOBS_201=""
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 69)"
   export STUB_JOBS_202=""
   run_live_case "${name}" "${repo}"
   unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
     STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_103 STUB_JOBS_104 STUB_JOBS_201 STUB_JOBS_202
   rm -rf "${repo}"
-  if [[ "${LAST_RC}" -eq 0 ]]; then
+  # The row and its ratio are asserted, not only rc 0: a guard that read no
+  # rows at all also exits 0 with nothing to say.
+  if [[ "${LAST_RC}" -eq 0 ]] && grep -q "^testjob	.*p90=69.0000m	cap=100	ratio=0.6900	" <<<"${LAST_OUT}"; then
     ok "${name}"
   else
     not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
@@ -253,7 +264,8 @@ test_growth_24_percent_passes() {
     STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_103 STUB_JOBS_104 \
     STUB_JOBS_201 STUB_JOBS_202 STUB_JOBS_203 STUB_JOBS_204
   rm -rf "${repo}"
-  if [[ "${LAST_RC}" -eq 0 ]]; then
+  # The row and its growth figure are asserted, not only rc 0.
+  if [[ "${LAST_RC}" -eq 0 ]] && grep -q "^testjob	.*p90=124.0000m	.*growth=1.2400	n=4$" <<<"${LAST_OUT}"; then
     ok "${name}"
   else
     not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
@@ -316,7 +328,7 @@ test_matrix_leg_maps_to_its_job() {
   export STUB_MG_OLDER_IDS="202"
   export STUB_JOBS_101; STUB_JOBS_101="$(job_row "sql (shard 1)" success 0 5)"
   export STUB_JOBS_102=""
-  export STUB_JOBS_201=""
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row "sql (shard 1)" success 0 5)"
   export STUB_JOBS_202=""
   run_live_case "${name}" "${repo}"
   unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
@@ -326,6 +338,141 @@ test_matrix_leg_maps_to_its_job() {
   # "sql (shard 1)" would not match the ci.yml key "sql", printing
   # cap=unmapped instead of the job's real 30m cap.
   if [[ "${LAST_RC}" -eq 0 ]] && grep -q "^sql	.*cap=30	" <<<"${LAST_OUT}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
+  fi
+}
+
+CI_YML_NOCAPS='jobs:
+  testjob:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+'
+
+test_unparseable_timestamp_exits_2() {
+  local name="unparseable_timestamp_exits_2"
+  local repo; repo="$(new_repo CI_YML_TESTJOB)"
+  export STUB_PUSH_CURRENT_IDS="101 102"
+  export STUB_MG_CURRENT_IDS="103"
+  export STUB_PUSH_OLDER_IDS="201"
+  export STUB_MG_OLDER_IDS="202"
+  export STUB_JOBS_101; STUB_JOBS_101="$(printf 'testjob\tsuccess\tnot-a-time\t%s' "$(ts 90)")"
+  export STUB_JOBS_102; STUB_JOBS_102="$(job_row testjob success 0 10)"
+  export STUB_JOBS_103; STUB_JOBS_103="$(job_row testjob success 0 20)"
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 20)"
+  export STUB_JOBS_202=""
+  run_live_case "${name}" "${repo}"
+  unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
+    STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_103 STUB_JOBS_201 STUB_JOBS_202
+  rm -rf "${repo}"
+  # FLIP: drop a row whose duration does not parse (`|| continue`) and the
+  # other rows still give a clean exit 0 with the 90-minute run never seen.
+  if [[ "${LAST_RC}" -eq 2 ]] && grep -q "job 'testjob' in run 101: started_at='not-a-time'" <<<"${LAST_OUT}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
+  fi
+}
+
+test_no_current_rows_exits_2() {
+  local name="no_current_rows_exits_2"
+  local repo; repo="$(new_repo CI_YML_TESTJOB)"
+  export STUB_PUSH_CURRENT_IDS="101"
+  export STUB_MG_CURRENT_IDS="102"
+  export STUB_PUSH_OLDER_IDS="201"
+  export STUB_MG_OLDER_IDS="202"
+  export STUB_JOBS_101=""
+  export STUB_JOBS_102; STUB_JOBS_102="$(job_row testjob skipped 0 0)"
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 20)"
+  export STUB_JOBS_202=""
+  run_live_case "${name}" "${repo}"
+  unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
+    STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_201 STUB_JOBS_202
+  rm -rf "${repo}"
+  # FLIP: no empty-pool check and the stats loop runs over an empty file,
+  # prints nothing and exits 0.
+  if [[ "${LAST_RC}" -eq 2 ]] && grep -q "no job rows in the current window" <<<"${LAST_OUT}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
+  fi
+}
+
+test_no_older_rows_exits_2() {
+  local name="no_older_rows_exits_2"
+  local repo; repo="$(new_repo CI_YML_TESTJOB)"
+  export STUB_PUSH_CURRENT_IDS="101"
+  export STUB_MG_CURRENT_IDS="102"
+  export STUB_PUSH_OLDER_IDS="201"
+  export STUB_MG_OLDER_IDS="202"
+  export STUB_JOBS_101; STUB_JOBS_101="$(job_row testjob success 0 10)"
+  export STUB_JOBS_102=""
+  export STUB_JOBS_201=""
+  export STUB_JOBS_202=""
+  run_live_case "${name}" "${repo}"
+  unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
+    STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_201 STUB_JOBS_202
+  rm -rf "${repo}"
+  # FLIP: no older-pool check and the job prints growth=n/a and exits 0,
+  # the growth rule never asked.
+  if [[ "${LAST_RC}" -eq 2 ]] && grep -q "growth rule cannot be asked" <<<"${LAST_OUT}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
+  fi
+}
+
+test_cancelled_at_cap_counts_toward_p90() {
+  local name="cancelled_at_cap_counts_toward_p90"
+  local repo; repo="$(new_repo CI_YML_TESTJOB)"
+  export STUB_PUSH_CURRENT_IDS="101 102 103"
+  export STUB_MG_CURRENT_IDS="104 105 106"
+  export STUB_PUSH_OLDER_IDS="201"
+  export STUB_MG_OLDER_IDS="202"
+  export STUB_JOBS_101; STUB_JOBS_101="$(job_row testjob success 0 10)"
+  export STUB_JOBS_102; STUB_JOBS_102="$(job_row testjob success 0 20)"
+  export STUB_JOBS_103; STUB_JOBS_103="$(job_row testjob success 0 30)"
+  export STUB_JOBS_104; STUB_JOBS_104="$(job_row testjob cancelled 0 99)"
+  export STUB_JOBS_105; STUB_JOBS_105="$(job_row testjob timed_out 0 100)"
+  export STUB_JOBS_106; STUB_JOBS_106="$(job_row testjob cancelled 0 50)"
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 100)"
+  export STUB_JOBS_202=""
+  run_live_case "${name}" "${repo}"
+  unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
+    STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_103 STUB_JOBS_104 STUB_JOBS_105 \
+    STUB_JOBS_106 STUB_JOBS_201 STUB_JOBS_202
+  rm -rf "${repo}"
+  # FLIP: keep only success and failure and p90 of {10,20,30} is 30, ratio
+  # 0.3, clean. n=5 also rules out keeping every cancelled job: the one
+  # cancelled at 50 minutes was superseded, not killed at its cap.
+  if [[ "${LAST_RC}" -eq 1 ]] && grep -q "^testjob	.*p90=100.0000m	cap=100	ratio=1.0000	.*n=5$" <<<"${LAST_OUT}" \
+    && grep -q "FINDING cap job=testjob" <<<"${LAST_OUT}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
+  fi
+}
+
+test_empty_caps_file_exits_70() {
+  local name="empty_caps_file_exits_70"
+  local repo; repo="$(new_repo CI_YML_NOCAPS)"
+  export STUB_PUSH_CURRENT_IDS="101"
+  export STUB_MG_CURRENT_IDS="102"
+  export STUB_PUSH_OLDER_IDS="201"
+  export STUB_MG_OLDER_IDS="202"
+  export STUB_JOBS_101; STUB_JOBS_101="$(job_row testjob success 0 10)"
+  export STUB_JOBS_102=""
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 10)"
+  export STUB_JOBS_202=""
+  run_live_case "${name}" "${repo}"
+  unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
+    STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_201 STUB_JOBS_202
+  rm -rf "${repo}"
+  # FLIP: no empty-caps check and testjob reads as the 360-minute default,
+  # ratio 0.0278, clean.
+  if [[ "${LAST_RC}" -eq 70 ]] && grep -q "no timeout-minutes cap parsed" <<<"${LAST_OUT}"; then
     ok "${name}"
   else
     not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
@@ -447,6 +594,24 @@ test_lowered_cap_passes() {
   fi
 }
 
+test_raise_check_empty_caps_exits_70() {
+  local name="raise_check_empty_caps_exits_70"
+  local repo_and_sha repo base_sha out rc
+  repo_and_sha="$(new_raise_repo CI_YML_RAISE_BASE CI_YML_NOCAPS)"
+  repo="${repo_and_sha% *}"
+  base_sha="${repo_and_sha##* }"
+  out="$(cd "${repo}" && "${GUARD}" --raise-check "${base_sha}" 2>&1)"
+  rc=$?
+  rm -rf "${repo}"
+  # FLIP: no empty-caps check and the loop over an empty caps file prints
+  # "raise-check clean" and exits 0.
+  if [[ "${rc}" -eq 70 ]] && grep -q "no timeout-minutes cap parsed" <<<"${out}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "rc=${rc} out=${out}"
+  fi
+}
+
 test_p90_at_071_of_cap_is_a_finding
 test_p90_at_069_of_cap_passes
 test_growth_25_percent_is_a_finding
@@ -454,9 +619,15 @@ test_growth_24_percent_passes
 test_failed_query_exits_2
 test_empty_run_list_exits_2
 test_matrix_leg_maps_to_its_job
+test_unparseable_timestamp_exits_2
+test_no_current_rows_exits_2
+test_no_older_rows_exits_2
+test_cancelled_at_cap_counts_toward_p90
+test_empty_caps_file_exits_70
 test_raise_without_budget_comment_is_a_finding
 test_raise_with_budget_comment_passes
 test_lowered_cap_passes
+test_raise_check_empty_caps_exits_70
 
 echo "check-ci-job-budgets.test.sh: ${pass} passed, ${fail} failed"
 if [[ "${fail}" -ne 0 ]]; then

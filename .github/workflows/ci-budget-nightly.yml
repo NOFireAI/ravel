@@ -21,7 +21,8 @@ name: ci-budget-nightly
 #                 job, the only one with `issues: write`, deduped by a
 #                 deterministic marker in the issue title).
 #
-# Top-level permissions floor is `contents: read`; `issues: write` lives only
+# Top-level permissions floor is `contents: read`; `budgets` adds
+# `actions: read` for the run and job queries, and `issues: write` lives only
 # on `report`, which runs no third-party code and no checkout.
 
 on:
@@ -77,8 +78,12 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # actions: read for the guard's workflow-run and job queries.
     permissions:
       contents: read
+      actions: read
+    outputs:
+      rc: ${{ steps.guard.outputs.rc }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -95,6 +100,7 @@ jobs:
           scripts/guards/check-ci-job-budgets.sh > ci-budgets-output.txt 2>&1
           rc=$?
           cat ci-budgets-output.txt
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
           if [ "$rc" -ne 0 ]; then
             echo "finding=true" >> "$GITHUB_OUTPUT"
           else
@@ -141,8 +147,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           MARKER: "Nightly CI job runtime budget guard is red"
+          GUARD_RC: ${{ needs.budgets.outputs.rc }}
         run: |
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          case "$GUARD_RC" in
+            1) summary="The nightly \`ci-budget-nightly\` lane found a job runtime budget finding." ;;
+            2) summary="The nightly \`ci-budget-nightly\` lane could not ask: a GitHub API query failed or returned no usable job rows. This is not a finding, and it is not a clean run either." ;;
+            "") summary="The nightly \`ci-budget-nightly\` guard step did not finish (no exit code recorded); nothing was asked." ;;
+            *) summary="The nightly \`ci-budget-nightly\` guard could not run (exit $GUARD_RC); nothing was asked." ;;
+          esac
           output="$(cat ci-budgets-output.txt 2>/dev/null || echo '(no report uploaded)')"
           gh label create "$ISSUE_LABEL" \
             --color BFD4F2 \
@@ -153,7 +166,7 @@ jobs:
             --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty') || existing=""
           body_file="$(mktemp)"
           {
-            echo "The nightly \`ci-budget-nightly\` lane found a job runtime budget finding."
+            echo "$summary"
             echo
             echo "- Run: $run_url"
             echo
