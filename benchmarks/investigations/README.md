@@ -490,8 +490,10 @@ survivors, below). A figure computed from, or judged against, a
 `not-computable` or `incomplete` figure takes that status and its reason.
 
 Only an allowlist of fields a build may not report may read as
-`unsupported-on-this-build`, only when the field is absent, and only when
-the call itself succeeded:
+`unsupported-on-this-build`, and only when the call itself succeeded; a
+field read from the call is unsupported only when it is absent, while the
+per-object and per-part breakdowns are unsupported on every run, since
+evaluate.py does not read them from the stats at all:
 `stats.keyIndex` and its members (`partsCovered`, `partsUncovered`,
 `partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
 `leafGetRequests`, `keysProbed`), `pruning.skipIdxDropped`, the per-object
@@ -847,9 +849,10 @@ A day part's bound for 100 keys is T(S) + 100, with T(S) = S × (1 − (1 −
 two leaf GET figures of `logs_request_in_100_30d`: `leaf_gets_per_part`,
 the largest per-part leaf GET count of any cold call, at most T(S) + 100,
 and `leaf_gets`, the largest total of any cold call, at most 30 × (T(S) +
-100). The stats carry no per-part breakdown on this build, so
+100). evaluate.py reads no per-part breakdown from the stats, so
 `leaf_gets_per_part` reads `unsupported-on-this-build` ("stats carry no
-per-part breakdown") in both rows until they do. A7's total is 30 times
+per-part breakdown") in both rows on every run, whatever the build reports;
+judging it needs evaluate.py to read the breakdown first. A7's total is 30 times
 the bound, not the parts held times it: the 30-day state holds 30 day
 parts, and a state holding any other number is not that state, so A7's
 `leaf_gets` is `not-run` there (it carries `parts_held == 30` in its
