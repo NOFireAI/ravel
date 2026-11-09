@@ -4001,10 +4001,11 @@ mod tests {
     }
 
     /// Issue #4014: the `sql_first_attempt_partitions` startup line names the
-    /// in-memory attempt's partition count and why. A derived count of 8 (2
-    /// cores) is floored to 16, `derived-floor`; a derived 16 (4 cores) or 32
-    /// (8 cores) stands, `derived`; `--sql-partition-count 8` or the legacy
-    /// `--fetch-concurrency 8` turns the floor off, 8 with source `flag`.
+    /// in-memory attempt's partition count and why. The derived count is
+    /// `max(8, 2 x cores)`: its 8 on 2 or 4 cores is floored to 16,
+    /// `derived-floor`; its 16 on 8 cores or 32 on 16 cores stands, `derived`;
+    /// `--sql-partition-count 8` or the legacy `--fetch-concurrency 8` turns
+    /// the floor off, 8 with source `flag`.
     ///
     /// FLIP: resolving an explicit count like a derived one reads the two
     /// flag cases as 16 with source `derived-floor`.
@@ -4021,18 +4022,27 @@ mod tests {
                 " setting=\"sql_first_attempt_partitions\" value=16 source=\"derived-floor\"",
             ),
             (
-                "derived 16 on 4 cores",
+                "derived 8 on 4 cores",
                 &["ravel-server"][..],
                 4,
+                16,
+                16,
+                FIRST_ATTEMPT_SOURCE_DERIVED_FLOOR,
+                " setting=\"sql_first_attempt_partitions\" value=16 source=\"derived-floor\"",
+            ),
+            (
+                "derived 16 on 8 cores",
+                &["ravel-server"][..],
+                8,
                 16,
                 16,
                 FIRST_ATTEMPT_SOURCE_DERIVED,
                 " setting=\"sql_first_attempt_partitions\" value=16 source=\"derived\"",
             ),
             (
-                "derived 32 on 8 cores",
+                "derived 32 on 16 cores",
                 &["ravel-server"][..],
-                8,
+                16,
                 16,
                 32,
                 FIRST_ATTEMPT_SOURCE_DERIVED,
