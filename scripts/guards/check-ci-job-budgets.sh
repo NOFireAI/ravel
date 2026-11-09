@@ -229,7 +229,7 @@ if [[ "${mode}" == "raise-check" ]]; then
       }
       /^    timeout-minutes:[[:space:]]*[0-9]+/ {
         if (job == want) {
-          if (prev ~ /^[[:space:]]*#[[:space:]]*budget:[[:space:]]*p90[[:space:]]+[0-9]+[[:space:]]+min[[:space:]]+on[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]*$/) {
+          if (prev ~ /^[[:space:]]*#[[:space:]]*budget:[[:space:]]*p90[[:space:]]+[0-9]+[[:space:]]+min[[:space:]]+on[[:space:]]+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]]*$/) {
             print "yes"
           } else {
             print "no"
