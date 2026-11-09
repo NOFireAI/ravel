@@ -682,11 +682,12 @@ fn key_index(value: &Value, field: &str) -> u64 {
         .unwrap_or_else(|| panic!("stats.keyIndex.{field} is a u64 in {value}"))
 }
 
-/// The ten `stats.keyIndex` fields.
-const KEY_INDEX_FIELDS: [&str; 10] = [
+/// The eleven `stats.keyIndex` fields.
+const KEY_INDEX_FIELDS: [&str; 11] = [
     "keysProbed",
     "partsCovered",
     "partsUncovered",
+    "partsOverTierOne",
     "partsBeyondCeiling",
     "leavesRejected",
     "reservationsRefused",
@@ -697,7 +698,7 @@ const KEY_INDEX_FIELDS: [&str; 10] = [
 ];
 
 /// `stats.keyIndex` is the logs entry's `keyIndex` in `stats.signals`, the
-/// statement's only signal, with exactly the ten fields.
+/// statement's only signal, with exactly the eleven fields.
 fn assert_signal_key_index_matches(value: &Value) {
     let signals = value["stats"]["signals"].as_array().expect("signals");
     assert_eq!(signals.len(), 1, "{value}");
@@ -719,7 +720,7 @@ fn assert_signal_key_index_matches(value: &Value) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct Totals {
     /// Per [`KeyIndexPartOutcome::ALL`], in that order.
-    parts: [u64; 6],
+    parts: [u64; KeyIndexPartOutcome::ALL.len()],
     leaf_gets: u64,
 }
 

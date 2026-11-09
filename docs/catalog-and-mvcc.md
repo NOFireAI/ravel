@@ -1184,10 +1184,13 @@ the statement's cap before GET 1, is `1 + min(k_s, 2^bucket_bits, B_run)`
 per touched slice, `k_s` the slice's own key count, with `B_run` =
 `KEY_INDEX_SET_PROBE_MAX_RUNS` (64), so a set of `k` keys costs at most
 `S + k` over a part's `S` touched slices. A part whose worst case exceeds
-`2 x entry_count`, the tier-1 probe's two ranged GETs for each of its
-segments, is not admitted: it reads as uncovered after no leaf GET and is
-counted in `parts_uncovered`. A logs day part (26 slices, 552 entries) at
-k = 1,024 costs at most 1,050 against 1,104 and is admitted; once the probe
+two GETs for each of the part's segments in the routed snapshot (the
+statement's window), the tier-1 probe's two ranged GETs per segment, is not
+admitted: it reads as uncovered after no leaf GET and is counted in
+`parts_over_tier_one`, not `parts_uncovered`. A logs day part (26 slices,
+552 entries) with all 552 segments in the window at k = 1,024 costs at most
+1,050 against 1,104 and is admitted; the same part with 23 segments in the
+window is compared against 46 and left to tier 1; once the probe
 has run, the GETs it did not issue go back to the budget and the first
 part that did not fit is evaluated again, so the admitted set is the one
 sequential evaluation would give. When the set touches at most `B_run`

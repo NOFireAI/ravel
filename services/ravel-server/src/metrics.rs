@@ -516,7 +516,7 @@ pub enum Label {
     /// `refused`. Shares the `outcome` key with `AlertOutcome`.
     HeadHoldOutcome(crate::ingest_hold::HoldOutcome),
     /// How the key-index router settled one part (ADR-3692 decision 7):
-    /// `covered`, `uncovered`, `beyond_ceiling`, `rejected`,
+    /// `covered`, `uncovered`, `over_tier_one`, `beyond_ceiling`, `rejected`,
     /// `reservation_refused` or `skipped_by_budget`. A closed enum owned by
     /// `ravel_query`, which also owns the spelling. Shares the `outcome` key
     /// with `AlertOutcome`.
