@@ -1655,13 +1655,24 @@ impl TenantDelegatingPool {
         self.refused.store(true, Ordering::Release);
         // The process envelope spans every tenant, so it goes to the operator
         // log and never into the client-visible message.
+        let attribution = self.attribution(consumer, asked);
+        let budget = &self.tenant.budget;
         tracing::debug!(
             consumer = consumer.name(),
             asked,
-            process_aggregate_envelope_bytes = envelope_on_budget(&self.tenant.budget),
+            refusal = ?kind,
+            process_aggregate_envelope_bytes = envelope_on_budget(budget),
+            budget_limit = budget.limit(),
+            budget_reserved = budget.reserved(),
+            budget_fetch_reserved = budget.fetch_reserved(),
+            budget_sql_reserved = budget.sql_reserved(),
+            budget_handoff_overlap = budget.handoff_overlap(),
+            query_used = self.query_used.load(Ordering::Acquire),
+            query_limit = self.query_limit,
+            attribution = %attribution,
             "SQL query memory grow refused"
         );
-        self.attribution(consumer, asked)
+        attribution
     }
 
     fn attribution(&self, consumer: &MemoryConsumer, asked: usize) -> String {
