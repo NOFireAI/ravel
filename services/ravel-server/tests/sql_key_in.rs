@@ -45,6 +45,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions};
 use ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef;
 use ravel_query::http::StaticBearerTokenResolver;
+use ravel_query::key_index_route::{KeyIndexPartOutcome, key_index_parts_total};
 use ravel_query::{EngineConfig, LogSegmentFetcher, SegmentFetcher};
 use ravel_server::sql::{SqlState, router};
 use ravel_sql::{
@@ -591,12 +592,17 @@ async fn swap_in_a_13_bit_leaf(store: &Arc<dyn ObjectStoreBackend>, lane: Lane) 
         .expect("swap the ref");
 }
 
-/// For each lane: the rows of an `IN` list of 1, 10, 100 and 1,000 keys
-/// equal the union of the per-key equality answers, and `keysProbed` is the
-/// list's size. On a 13-bit leaf the 1,000-key list leaves the part
-/// uncovered after the leaf's prefix, with no further leaf read, and the
-/// rows are still exact. A 1,025-key list carries no key and returns exact
-/// rows; on logs, a list beside a second key equality stays on tier 1.
+/// For each lane, on a part of `WIDE_OBJECTS` entries whose tier-1 cost
+/// admits every list size at tier 2: the rows of an `IN` list of 1, 10, 100
+/// and 1,000 keys equal the union of the per-key equality answers,
+/// `keysProbed` is the list's size, no list is over the part's tier-1 cost,
+/// and the part is covered by its leaves with at least one leaf GET. The one
+/// exception is the spans 1,000-key list: its bridged bucket read exceeds the
+/// part's byte allowance, so it counts in `skippedByBudget` after the
+/// prefix GET and tier 1 answers. On a 13-bit leaf the 1,000-key list leaves
+/// the part uncovered after the leaf's prefix, with no further leaf read,
+/// and the rows are still exact. A 1,025-key list carries no key and returns
+/// exact rows; on logs, a list beside a second key equality stays on tier 1.
 ///
 /// Flip to watch it fail: route only the first key of the set (in
 /// `route_segments` and `SpansTableProvider::scan`, build the key set from
@@ -604,7 +610,7 @@ async fn swap_in_a_13_bit_leaf(store: &Arc<dyn ObjectStoreBackend>, lane: Lane) 
 /// later keys, and the 10-key rows miss nine of the ten union rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn in_list_rows_equal_the_union_of_equalities() {
-    let store = fixture().await;
+    let store = fixture_of(WIDE_OBJECTS).await;
     let app = serve(Arc::clone(&store));
     for lane in [Lane::Logs, Lane::Spans] {
         // Every per-key equality answer, once.
@@ -628,6 +634,26 @@ async fn in_list_rows_equal_the_union_of_equalities() {
             assert_eq!(
                 key_index(&v, "keysProbed"),
                 n as u64,
+                "{lane:?}: {n} keys: {v}"
+            );
+            let over_bytes = u64::from(lane == Lane::Spans && n == SIZES[3]);
+            assert_eq!(
+                key_index(&v, "partsCovered"),
+                1 - over_bytes,
+                "{lane:?}: {n} keys: {v}"
+            );
+            assert_eq!(
+                key_index(&v, "skippedByBudget"),
+                over_bytes,
+                "{lane:?}: {n} keys: {v}"
+            );
+            assert_eq!(
+                key_index(&v, "partsOverTierOne"),
+                0,
+                "{lane:?}: {n} keys: {v}"
+            );
+            assert!(
+                key_index(&v, "leafGetRequests") > 0,
                 "{lane:?}: {n} keys: {v}"
             );
         }
@@ -660,7 +686,6 @@ async fn in_list_rows_equal_the_union_of_equalities() {
     // allowance: the part is uncovered after GET 1, and tier 1 answers. The
     // part needs `WIDE_OBJECTS` entries for its worst case of 65 leaf GETs to
     // be admitted at all.
-    let store = fixture_of(WIDE_OBJECTS).await;
     for lane in [Lane::Logs, Lane::Spans] {
         swap_in_a_13_bit_leaf(&store, lane).await;
         let v = sql(&serve(Arc::clone(&store)), &lane.in_list(1_000)).await;
@@ -793,16 +818,21 @@ async fn a_logs_set_absent_from_an_object_prunes_it() {
 
 /// A part whose leaf route would cost more than its tier-1 probe is left to
 /// tier 1 (ADR-3692's key-set ceiling amendment): ten keys of object 0 touch
-/// one slice for a worst case of 1 + 10 = 11 leaf GETs against the 4-entry
-/// part's tier-1 cost of 2 x 4 = 8. The part counts in `partsUncovered`, no
-/// leaf is read, each object's own KEY_IDX prunes objects 1 to 3, and the
-/// rows equal those of the same keys padded past k = 1,024 with absent ids,
-/// a list that carries no key set and is not routed.
+/// one slice for a worst case of 1 + 10 = 11 leaf GETs against the tier-1
+/// cost of the part's 4 segments in the snapshot, 2 x 4 = 8. The part counts
+/// in `partsOverTierOne`, not `partsUncovered`, and under
+/// `outcome="over_tier_one"` of `ravel_query_key_index_parts_total` for logs;
+/// no leaf is read, each object's own KEY_IDX prunes objects 1 to 3, and the
+/// rows equal those of the same keys padded past k = 1,024 with absent ids, a
+/// list that carries no key set and is not routed. No other logs statement
+/// of this binary is over its tier-1 cost, so the logs total moves by
+/// exactly 1.
 ///
 /// Flip to watch it fail: in ravel-query's `route_parts`, drop the arm that
-/// counts a part whose `worst_gets` exceeds `entry_count x gets_per_entry` as
-/// uncovered. The part is then probed and covered: `partsUncovered` reads 0
-/// and `leafGetRequests` is non-zero.
+/// counts a part whose `worst_gets` exceeds its snapshot segments x
+/// `gets_per_entry`. The part is then probed and covered: `partsOverTierOne`
+/// reads 0 and `leafGetRequests` is non-zero. Counting the arm in
+/// `parts_uncovered` instead fails on `partsUncovered` reading 1.
 #[tokio::test]
 async fn a_part_dearer_to_route_than_to_probe_is_left_to_tier_one() {
     let store = fixture().await;
@@ -810,10 +840,14 @@ async fn a_part_dearer_to_route_than_to_probe_is_left_to_tier_one() {
     let lane = Lane::Logs;
     let one_object: Vec<usize> = (0..10).map(|n| n * OBJECTS).collect();
 
+    let before = key_index_parts_total(Signal::Logs, KeyIndexPartOutcome::OverTierOne);
     let v = sql(&app, &lane.in_keys(&one_object)).await;
+    let moved = key_index_parts_total(Signal::Logs, KeyIndexPartOutcome::OverTierOne) - before;
     assert_eq!(rows(&v), oracle_of(&one_object), "{v}");
     assert_eq!(key_index(&v, "keysProbed"), 10, "{v}");
-    assert_eq!(key_index(&v, "partsUncovered"), 1, "{v}");
+    assert_eq!(key_index(&v, "partsOverTierOne"), 1, "{v}");
+    assert_eq!(moved, 1, "{v}");
+    assert_eq!(key_index(&v, "partsUncovered"), 0, "{v}");
     assert_eq!(key_index(&v, "partsCovered"), 0, "{v}");
     assert_eq!(key_index(&v, "skippedByBudget"), 0, "{v}");
     assert_eq!(key_index(&v, "leafGetRequests"), 0, "{v}");
@@ -833,4 +867,45 @@ async fn a_part_dearer_to_route_than_to_probe_is_left_to_tier_one() {
     assert_eq!(key_index(&unrouted, "keysProbed"), 0, "{unrouted}");
     assert_eq!(key_index(&unrouted, "leafGetRequests"), 0, "{unrouted}");
     assert_eq!(rows(&v), rows(&unrouted), "{v}\n{unrouted}");
+}
+
+/// A spans `trace_id IN` list of 10 and of 100 trace ids is covered at tier
+/// 2 on a part wide enough for its leaf route to be no dearer than tier 1:
+/// the 36-entry part's tier-1 cost is 2 x 36 = 72 GETs, and the lists charge
+/// at most 1 + 10 and 1 + 64 per touched slice. `partsCovered` is 1,
+/// `partsOverTierOne` 0, `leafGetRequests` above 0, and the rows equal the
+/// fixture's oracle and those of the same ids padded past k = 1,024 with
+/// absent ids, a list that carries no key set and is not routed.
+///
+/// Flip to watch it fail: run it on [`fixture`]'s 4-entry part, whose tier-1
+/// cost of 8 is below both lists' worst case. `partsCovered` then reads 0
+/// and `partsOverTierOne` 1.
+#[tokio::test]
+async fn a_spans_trace_id_list_is_covered_at_tier_two() {
+    let store = fixture_of(WIDE_OBJECTS).await;
+    let app = serve(store);
+    let lane = Lane::Spans;
+    for n in [10, 100] {
+        let v = sql(&app, &lane.in_list(n)).await;
+        assert_eq!(rows(&v), oracle(n), "{n} keys: {v}");
+        assert_eq!(key_index(&v, "keysProbed"), n as u64, "{n} keys: {v}");
+        assert_eq!(key_index(&v, "partsCovered"), 1, "{n} keys: {v}");
+        assert_eq!(key_index(&v, "partsOverTierOne"), 0, "{n} keys: {v}");
+        assert_eq!(key_index(&v, "partsUncovered"), 0, "{n} keys: {v}");
+        assert!(key_index(&v, "leafGetRequests") > 0, "{n} keys: {v}");
+
+        let padded: Vec<String> = (0..n)
+            .map(|j| lane.literal(j))
+            .chain((0..1_025 - n).map(|i| format!("X'{}'", hex(&trace_id(10_000, i)))))
+            .collect();
+        assert_eq!(padded.len(), 1_025);
+        let unrouted = sql(
+            &app,
+            &lane.select(&format!("trace_id IN ({})", padded.join(", "))),
+        )
+        .await;
+        assert_eq!(key_index(&unrouted, "keysProbed"), 0, "{unrouted}");
+        assert_eq!(key_index(&unrouted, "leafGetRequests"), 0, "{unrouted}");
+        assert_eq!(rows(&v), rows(&unrouted), "{n} keys: {v}\n{unrouted}");
+    }
 }
