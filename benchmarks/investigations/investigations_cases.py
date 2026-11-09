@@ -4052,8 +4052,8 @@ FLIPS = {
         "check_row_18_covered_nothing",
     ),
     "row 18's unsupported or missing cell left off the incomplete list": (
-        '        elif f["row"] == 18 and f.get("verdict") in (UNSUPPORTED, GUARD, "refused", "missing"):\n',
-        '        elif False:\n',
+        '        elif ((f["row"] == 18 or (',
+        '        elif ((False or (',
         "check_row_18_unsupported_is_incomplete",
     ),
     "row 18's p50 taken without the Uncovered check": (
@@ -4300,9 +4300,29 @@ FLIPS = {
         "check_w5_a7_targets_follow_stamped_slices",
     ),
     "W2's binary read off C1 alone, so an R2 binary passes": (
-        'int(doc["carries_c1"] and not doc["carries_r2"])',
-        'int(doc["carries_c1"])',
+        'if doc["carries_c1"] and not doc["carries_r2"]:\n',
+        'if doc["carries_c1"]:\n',
         "check_w2_requires_pre_r2_binary_stamp",
+    ),
+    "an R2 binary scored as a W2 miss": (
+        'return "not-run", None, (f"the retired_hour fold binary',
+        'return "value", 0, (f"the retired_hour fold binary',
+        "check_w2_requires_pre_r2_binary_stamp",
+    ),
+    "a stamp figure not-run for its build left incomplete, not unrequested": (
+        '                    entry["gated"] = True\n                    entry["not_requested"] = why\n',
+        '                    pass\n',
+        "check_w2_requires_pre_r2_binary_stamp",
+    ),
+    "W3's drop counted as leaving no part that holds the hour": (
+        "sum(1 for lo, hi in spans if lo <= hour <= hi)",
+        "0",
+        "check_w3_drop_leaves_head",
+    ),
+    "only row 18's own timing figures leave the run incomplete": (
+        'f["row"] in AS_ROW_18 and f["lane"] == "timing"',
+        'f["row"] in () and f["lane"] == "timing"',
+        "check_row_18_timing_rows_leave_run_incomplete",
     ),
 }
 
@@ -4482,6 +4502,41 @@ BAND_FLIPS = {
         "not_run_unless = \"m['adr3939_w2.fold_binary_pre_r2'] == 1\"\n",
         "metric = \"fold.inv.logs.key_index_leaf_gets\"\nlane = \"counter\"\n",
         "check_w2_requires_pre_r2_binary_stamp",
+    ),
+    "W5's per-part leaf GETs held to the 30-day total": (
+        "target_if = \"v <= m['adr3939_w5.per_day_bound']\"\n",
+        "target_if = \"v <= 30 * m['adr3939_w5.per_day_bound']\"\n",
+        "check_w5_a7_per_part_and_thirty_parts",
+    ),
+    "A7's total judged on a state holding other than 30 parts": (
+        "not_run_unless = \"m['adr3939_a7.slices'] >= 3 and m['adr3939_a7.parts_held'] == 30\"\n",
+        "not_run_unless = \"m['adr3939_a7.slices'] >= 3\"\n",
+        "check_w5_a7_per_part_and_thirty_parts",
+    ),
+    "W7's midnight call passing over a third day part": (
+        "metric = \"cold.max.parts_covered\"\nlane = \"counter\"\ntarget_if = \"v == 2\"\n",
+        "metric = \"cold.max.parts_covered\"\nlane = \"counter\"\ntarget_if = \"v >= 2\"\n",
+        "check_w7_reads_two_day_parts",
+    ),
+    "W8's refold passing with no hour retired": (
+        "transition = \"retired_hour_refold\"\nmetric = \"fold.inv.logs.retired_hours\"\nlane = \"counter\"\n"
+        "target_if = \"v == [m['adr3939_w3.tombstoned_hour']]\"\n",
+        "transition = \"retired_hour_refold\"\nmetric = \"fold.inv.logs.retired_hours\"\nlane = \"counter\"\n"
+        "target_if = \"v == v\"\n",
+        "check_w8_retired_hours_are_the_tombstoned_hour",
+    ),
+    "A4's refold digest passing whenever present": (
+        "transition = \"day_parts_7_refold\"\nmetric = \"fold.inv.logs.head_digest\"\nlane = \"counter\"\n"
+        "target_if = \"isinstance(v, str) and len(v) > 0\"\n",
+        "transition = \"day_parts_7_refold\"\nmetric = \"fold.inv.logs.head_digest\"\nlane = \"counter\"\n"
+        "target_if = \"v is not None\"\n",
+        "check_w8_retired_hours_are_the_tombstoned_hour",
+    ),
+    "W3's drop judged with HEAD still holding the hour": (
+        "metric = \"stamp.drop_parts_holding_hour.logs\"\nlane = \"counter\"\ntarget_if = \"v == 0\"\n"
+        "miss_if = \"v > 0\"\n",
+        "metric = \"stamp.drop_parts_holding_hour.logs\"\nlane = \"counter\"\ntarget_if = \"v >= 0\"\n",
+        "check_w3_drop_leaves_head",
     ),
     "a one-character drift in W4's target cell": (
         'target = "at most 882 leaf GETs, 7 of 7 days covered',

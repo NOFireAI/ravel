@@ -1134,7 +1134,7 @@ state still run), `launch.sh` (with an `aws` stub that
 fails if called) and `fetch.sh` (including an `aws` stub that exits 255,
 which must exit 69).
 
-ADR-3939's rows have four cases of their own, each with the wrong versions
+ADR-3939's rows have these cases of their own, each with the wrong versions
 it must reject: `test_adr3939_band_text_is_the_adr_tables_verbatim` (every
 row's cells against both of the ADR's tables, exact to the character; a
 one-character drift in W4's target or A1's check fails it),
@@ -1143,11 +1143,29 @@ one-character drift in W4's target or A1's check fails it),
 unregistered), `test_w5_a7_targets_follow_stamped_slices` (W5's and A7's
 bounds at S = 26, 175 and 2: 126 and 3,780, 176 and 5,280, and `not-run`
 at 2; fails with the bound hardcoded at 126 in evaluate.py or in either
-row, with no S floor in W5, or with `not_run_unless` never consulted) and
-`test_w2_requires_pre_r2_binary_stamp` (no stamp, C1 with R2, no SHA, and C1
-without R2; fails with W2 judged on any binary or the binary read off C1
-alone). `test_adr3939_rows_run_on_their_states` pins each row's state
-(fails with A5 moved off `day_parts_7`).
+row, with no S floor in W5, or with `not_run_unless` never consulted),
+`test_w5_a7_per_part_and_thirty_parts` (a 127-GET part misses in W5 and A7
+at S 26 while the total holds, a missing breakdown is unsupported, and A7's
+total is `not-run` at 29 parts; fails with W5's per-part figure held to
+the 30-day total or A7 judged on 29 parts),
+`test_w2_requires_pre_r2_binary_stamp` (no stamp, C1 with R2, no C1, no
+SHA, and C1 without R2; an R2 or no-C1 binary is `not-run`, not requested,
+with no W2 miss and nothing incomplete; fails with W2 judged on any binary,
+the binary read off C1 alone, an R2 binary scored a miss, or a stamp
+figure's `not-run` left off `not_requested`),
+`test_w3_drop_leaves_head` (a part `96..=119` left after the drop misses
+for tombstoned hour 100, its removal passes, an absent drop stamp is
+unsupported, a stamp with no HEAD or a short part list missing; fails with
+the count fixed at 0 or the band reading `v >= 0`),
+`test_w8_retired_hours_are_the_tombstoned_hour` (both folds `[]` miss, `[h]`
+passes, empty A4 and W8 digests miss; fails with the refold's band reading
+`v == v` or A4's refold digest `v is not None`),
+`test_w7_reads_two_day_parts` (1 covered part, a third part or an uncovered
+one each miss at 4 leaf GETs; fails with `parts_covered_max` reading
+`v >= 2`) and `test_row_18_timing_rows_leave_run_incomplete` (A6's six p50
+cells, W4's, F1's and F2's unsupported each leave the run incomplete; fails
+with `AS_ROW_18` not consulted). `test_adr3939_rows_run_on_their_states`
+pins each row's state (fails with A5 moved off `day_parts_7`).
 
 The box scripts target bash 3.2 as well as 5: run
 `/path/to/bash-3.2 benchmarks/investigations/investigations.test.sh` and
