@@ -104,11 +104,6 @@ jobs:
           rc=$?
           cat ci-budgets-output.txt
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          if [ "$rc" -ne 0 ]; then
-            echo "finding=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "finding=false" >> "$GITHUB_OUTPUT"
-          fi
           exit "$rc"
       - name: Upload budget report
         if: always()

@@ -1144,8 +1144,10 @@ def cmd_ci_budgets(a):
     if a.runs is not None:
         cmd += ["--runs", str(a.runs)]
     rc, out, err = run(cmd, cwd=tree)
-    o.data = {"rc": rc, "detail": last_line(out + "\n" + err)}
-    o.text(f"ci-budgets {'ok' if rc == 0 else 'FAIL'} rc={rc} {o.data['detail']}")
+    findings = [l.strip() for l in (out + "\n" + err).splitlines() if l.startswith("FINDING")]
+    detail = "; ".join(findings) if findings else last_line(out + "\n" + err)
+    o.data = {"rc": rc, "findings": findings, "detail": detail}
+    o.text(f"ci-budgets {'ok' if rc == 0 else 'FAIL'} rc={rc} {detail}")
     o.emit()
     return rc
 
