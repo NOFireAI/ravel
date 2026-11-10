@@ -607,11 +607,13 @@ Stage 2 figure.
 No commit on main carries C1 without R2 and also has `ravel-cli catalog
 fold --retention-default` (#4085), which the retired_hour state's fold
 needs: C1 (#4051) landed before R2 (#4077), and the flag after it. W2 is
-therefore measured on the branch `measure/3939-w2` at 90e5f43f8: C1's
-last commit on main, 131ab993c, with #4085's commit cherry-picked onto it
-(`cherry picked from commit 9572fbe88`). The branch is never merged. The
-run stamps the binary's SHA, and its `carries_c1` and `carries_r2`, as the
-harness does for every fold binary.
+therefore measured on the branch `measure/3939-w2`, which is never merged.
+Before H1c it is at 90e5f43f8: C1's last commit on main, 131ab993c, with
+#4085's commit cherry-picked onto it (`cherry picked from commit
+9572fbe88`). H1c's fold-report commit is then cherry-picked onto it, so
+the binary run C measures is the branch's tip at launch, not 90e5f43f8.
+Run C's run.toml names that tip, and the run stamps it, with its
+`carries_c1` and `carries_r2`, as the harness does for every fold binary.
 
 D3' is three self-terminating runs, each with one binary:
 - Run A: main at launch (R2 and #4085), with day_parts_7 and retired_hour,
