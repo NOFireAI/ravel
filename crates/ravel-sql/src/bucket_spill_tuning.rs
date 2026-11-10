@@ -119,12 +119,21 @@ pub fn spill_slots(spill_max_bytes: u64) -> u64 {
     (spill_max_bytes / SPILL_SHARE_UNIT_BYTES).clamp(1, MAX_SPILL_SHARES)
 }
 
-/// The bytes one routed chunk of `rows` rows is charged: each column's
-/// values buffer at its 64-byte-rounded capacity plus its validity bitmap.
+/// The capacities `OpenChunk::allocate` gives one routed column of `width`
+/// bytes per value for `rows` rows: its values buffer and its validity
+/// bitmap, each rounded up to 64 bytes.
+pub(crate) fn routed_column_capacities(width: usize, rows: usize) -> Option<(usize, usize)> {
+    let values = rows.checked_mul(width)?.checked_next_multiple_of(64)?;
+    let validity = rows.div_ceil(8).checked_next_multiple_of(64)?;
+    Some((values, validity))
+}
+
+/// The bytes one routed chunk of `rows` rows is charged: the sum over its
+/// columns of [`routed_column_capacities`].
 pub fn routed_chunk_charge(column_widths: &[usize], rows: usize) -> Option<usize> {
     column_widths.iter().try_fold(0usize, |acc, width| {
-        let values = rows.checked_mul(*width)?.checked_next_multiple_of(64)?;
-        acc.checked_add(values)?.checked_add(rows.div_ceil(8))
+        let (values, validity) = routed_column_capacities(*width, rows)?;
+        acc.checked_add(values)?.checked_add(validity)
     })
 }
 
@@ -449,13 +458,14 @@ mod tests {
             tuning,
             BucketSpillTuning {
                 bits: 6,
-                routed_chunk_rows: 2372,
+                routed_chunk_rows: 2368,
                 descriptor_need: 2064,
             }
         );
         let budget = 32_585_819 / 4 / 65;
-        assert!(routed_chunk_charge(&Q33_WIDTHS, 2372).expect("fits") <= budget);
-        assert!(routed_chunk_charge(&Q33_WIDTHS, 2373).expect("fits") > budget);
+        assert_eq!(routed_chunk_charge(&Q33_WIDTHS, 2368), Some(125_056));
+        assert!(125_056 <= budget);
+        assert!(routed_chunk_charge(&Q33_WIDTHS, 2369).expect("fits") > budget);
     }
 
     /// `C` divides the share: dividing by `P` (16) instead of `C` (48) on
@@ -511,8 +521,8 @@ mod tests {
             refused(&|i| i.consumed_rows = Some(1)),
             NoTuning::TooManyBits
         );
-        // At bits 6 on c6a.large `S / 4 / 65` holds 2,372 rows of q33; at 7
-        // it holds 1,192, and at 8 it holds under 600, below the 1024 floor.
+        // At bits 6 on c6a.large `S / 4 / 65` holds 2,368 rows of q33; at 7
+        // it holds 1,188, and at 8 it holds under 600, below the 1024 floor.
         assert_eq!(
             refused(&|i| {
                 i.query_limit = LARGE.query_limit;
