@@ -6147,6 +6147,27 @@ echo "STATE-RC=$rc"
                         '  [ "$n" = 7 ] || budget=()\n', "run.sh", self.check_dp30_budget,
                         "the 30-day folds at the default budget", "test_day_parts_30_folds_at_a_reduced_build_budget")
 
+    def check_dp_tail_one_commit(self, script):
+        code, text = self.new_states_dry_run(script)
+        if code:
+            return [f"dry run exit {code}"]
+        loads = [x for x in text.splitlines() if "day_parts_7_tail" in x and "--tenant dp7" in x]
+        out = [] if loads else ["no day_parts_7 tail load"]
+        for x in loads:
+            if "--target-bytes 1 " not in x + " " or "--batch-rows" not in x:
+                out.append(f"tail load not one batch flushed at once: {x}")
+        return out
+
+    def test_day_parts_tail_loads_one_commit_per_bucket(self):
+        # The retired_hour maintain pass compacts any bucket holding two
+        # level-0 commits, and a compaction record in dp7 fails the state,
+        # so the advance tail loads as one batch flushed at once.
+        self.assertEqual(self.check_dp_tail_one_commit(os.path.join(BOX, "run.sh")), [])
+        self.flip_check('    load_signal "${st}_tail" "$sig" "$WORK/corpus-tail" "$t" --batch-rows "$rows" --target-bytes 1 \\\n',
+                        '    load_signal "${st}_tail" "$sig" "$WORK/corpus-tail" "$t" \\\n', "run.sh",
+                        self.check_dp_tail_one_commit, "the advance tail loaded with the default flush",
+                        "test_day_parts_tail_loads_one_commit_per_bucket")
+
     def test_stride_check_that_cannot_run_is_not_a_refusal(self):
         # run.sh records exit 1 as the state not-run with the refusal on
         # stdout, and any other non-zero exit as a failed state with the

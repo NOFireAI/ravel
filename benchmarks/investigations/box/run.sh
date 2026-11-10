@@ -1318,8 +1318,13 @@ state_day_parts() {
   wait_next_hour
   fits "${st}_advance" load "$est" || { TRIPLES="$saved"; return 0; }
   stop_server
+  # The whole tail in one batch flushed at once, so each (shard, hour) bucket
+  # gets one commit and the retired_hour maintain pass has no level-0 pair
+  # to compact here: a compaction record in dp7 fails that state.
   for sig in $sigs; do
-    load_signal "${st}_tail" "$sig" "$WORK/corpus-tail" "$t" || { TRIPLES="$saved"; return 1; }
+    rows="$(batch_rows "$(corpus_rows "$WORK/corpus-tail" "$sig")" 1)"
+    load_signal "${st}_tail" "$sig" "$WORK/corpus-tail" "$t" --batch-rows "$rows" --target-bytes 1 \
+      || { TRIPLES="$saved"; return 1; }
   done
   fits "${st}_advance" fold "$est" || { TRIPLES="$saved"; return 0; }
   fold "${st}_advance" --key-index-leaves ${budget[@]+"${budget[@]}"} || { TRIPLES="$saved"; return 1; }
