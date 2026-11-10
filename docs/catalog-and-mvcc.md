@@ -1787,16 +1787,18 @@ the largest total the passes held in
 `fold_human_report_prints_every_fold_report_field`, which checks every
 serialized field against the text report).
 
-Seven more fields are the figures the ADR-3939 investigation harness
+Six more fields are the figures the ADR-3939 investigation harness
 reads, none of them a `/metrics` counter; `ravel-cli catalog fold`
 prints each in text and `--json` (test
 `fold_report_renders_the_adr_3939_figures_in_text_and_json`):
 
-- `snapshot_part_puts`: snapshot part object PUTs, one per part an attempt
-  re-encoded, summed over every attempt and also counted in
-  `put_requests`; a part carried by reference issues none (2, 1 and 0 for
-  a sealing fold, an advance and a no-op refold in
-  `fold_report_counts_snapshot_part_puts`).
+- `sealed_part_puts`: snapshot part object PUTs of parts other than the
+  tail, one per such part an attempt re-encoded, summed over every attempt
+  and also counted in `put_requests`. The tail's PUT, which every
+  publishing fold issues, is not counted, and a part carried by reference
+  issues none (1 of 2 part PUTs for a sealing fold, 0 of 1 for an advance
+  and 0 of 0 for a no-op refold in
+  `fold_report_counts_sealed_part_puts_and_not_the_tail`).
 - `sealed_day_leaf_puts` and `sealed_day_previous_leaf_gets`: the leaf
   PUTs and previous-leaf GETs of re-encoded parts that are not the tail,
   lie within one UTC day, and whose day the previous HEAD already held as
@@ -1808,19 +1810,25 @@ prints each in text and `--json` (test
 - `key_index_unchanged_section_gets`: the GETs of KEY_IDX section reads
   for entries a previous part's leaves already held for every declared
   field, also counted in `key_index_ranged_gets`; nonzero only when a
-  carry was lost (8 when a slice GET fails mid-build in
-  `fold_report_counts_section_gets_for_entries_a_previous_leaf_held`).
-- `switch_off_partition_changed`: with the switch on, the count of UTC
-  days whose parts differ from the switch-off rule applied to that day's
-  entries alone, so a nonzero value means the day seal changed more than
-  the midnight cuts; 0 with the switch off (tests
-  `day_seal_departures_counts_days_not_partitioned_by_the_switch_off_rule`
-  and `a_day_sealed_fold_reports_no_switch_off_partition_change`).
+  carry was lost, and an entry no previous part held is never counted (12
+  of the 18 section GETs when a slice GET fails mid-build in
+  `fold_report_counts_section_gets_for_entries_a_previous_leaf_held`, the
+  other 6 being a new entry's).
 - `head_digest`: lowercase hex blake3 of the HEAD in effect after the
-  call, the one published or, on a no-op, the one read; empty when there
-  is no HEAD (`fold_report_head_digest_is_the_blake3_of_the_head_in_effect`).
-  A HEAD records its folder id and creation time, so two folds that both
-  publish never share a digest; equal digests mean the second was a no-op.
+  call, the one published or, on a no-op, the one read, re-encoded with
+  `folder_id` set to sixteen zero bytes and `created_unix_ns` to zero;
+  empty when there is no valid HEAD
+  (`fold_report_head_digest_ignores_the_folder_id_and_clock`). The digest
+  names the parts, postings, watermark and shard generations, not the
+  process or clock that wrote them, so two folds that publish the same
+  HEAD content share it while their HEAD bytes differ.
+  No fold path re-encodes an unchanged entry set into a second HEAD: a
+  refold at the same watermark is a no-op that reports the HEAD it read,
+  and a later fold moves the watermark. A run therefore cannot measure
+  HEAD determinism with this field, and the harness reports ADR-3939's
+  A4 and W8 determinism figures as unsupported. The switch-off
+  partition's equality (A4) is likewise not reported: it holds by
+  construction of the partition and is pinned by its unit tests.
 - `retired_hours`: the sorted union of every HEAD part's `retired_hours`
   (under "Retired hours"), read from the HEAD on a no-op
   (`fold_report_retired_hours_is_the_heads_union`).
