@@ -93,6 +93,7 @@ case "${path}" in
     var="STUB_JOBS_${run_id}"
     val="${!var:-}"
     [[ -n "${val}" ]] && printf '%s' "${val}"
+    [[ -n "${STUB_WARN:-}" ]] && printf '%s\n' "${STUB_WARN}" >&2
     exit 0
     ;;
   *"/actions/workflows/ci.yml/runs?"*)
@@ -118,6 +119,7 @@ case "${path}" in
     if [[ -n "${val}" ]]; then
       for id in ${val}; do printf '%s\n' "${id}"; done
     fi
+    [[ -n "${STUB_WARN:-}" ]] && printf '%s\n' "${STUB_WARN}" >&2
     exit 0
     ;;
   *)
@@ -278,6 +280,42 @@ test_persistent_502_exits_2() {
     ok "${name}"
   else
     not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
+  fi
+}
+
+test_gh_warning_on_success_leaves_rows_unchanged() {
+  local name="gh_warning_on_success_leaves_rows_unchanged"
+  local repo bindir clean_out warned_out warned_err clean_rc warned_rc
+  repo="$(new_repo CI_YML_TESTJOB)"
+  bindir="$(mktemp -d)"
+  write_stub_gh "${bindir}"
+  export STUB_PUSH_CURRENT_IDS="101 102"
+  export STUB_MG_CURRENT_IDS="103 104"
+  export STUB_PUSH_OLDER_IDS="201"
+  export STUB_MG_OLDER_IDS="202"
+  export STUB_JOBS_101; STUB_JOBS_101="$(job_row testjob success 0 10)"
+  export STUB_JOBS_102; STUB_JOBS_102="$(job_row testjob success 0 20)"
+  export STUB_JOBS_103; STUB_JOBS_103="$(job_row testjob success 0 30)"
+  export STUB_JOBS_104; STUB_JOBS_104="$(job_row testjob success 0 69)"
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 69)"
+  export STUB_JOBS_202=""
+  clean_out="$(cd "${repo}" && STUB_STATE_DIR="${bindir}" CI_BUDGET_RETRY_DELAY_S=0 PATH="${bindir}:${PATH}" "${GUARD}" --repo acme/widgets --runs 4 2>/dev/null)"
+  clean_rc=$?
+  warned_out="$(cd "${repo}" && STUB_WARN="gh: warning: a newer release of gh is available" STUB_STATE_DIR="${bindir}" CI_BUDGET_RETRY_DELAY_S=0 PATH="${bindir}:${PATH}" "${GUARD}" --repo acme/widgets --runs 4 2>"${bindir}/stderr")"
+  warned_rc=$?
+  warned_err="$(cat "${bindir}/stderr")"
+  unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
+    STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_103 STUB_JOBS_104 STUB_JOBS_201 STUB_JOBS_202
+  rm -rf "${repo}" "${bindir}"
+  # FLIP: capture gh with 2>&1 on success and the warning lands in the data:
+  # it joins the last job row's completed_at, which no longer parses, and the
+  # guard exits 2 with no rows.
+  if [[ "${clean_rc}" -eq 0 && "${warned_rc}" -eq 0 && "${warned_out}" == "${clean_out}" ]] &&
+    grep -q "^testjob	.*p90=69.0000m	cap=100	ratio=0.6900	" <<<"${warned_out}" &&
+    grep -q "a newer release of gh is available" <<<"${warned_err}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "clean_rc=${clean_rc} warned_rc=${warned_rc} clean_out=${clean_out} warned_out=${warned_out} warned_err=${warned_err}"
   fi
 }
 
@@ -859,6 +897,7 @@ test_too_few_rows_are_not_judged
 test_failed_query_exits_2
 test_transient_502_is_retried
 test_persistent_502_exits_2
+test_gh_warning_on_success_leaves_rows_unchanged
 test_empty_run_list_exits_2
 test_matrix_leg_maps_to_its_job
 test_no_mapped_job_exits_2

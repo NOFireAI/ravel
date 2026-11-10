@@ -6,13 +6,11 @@ name: ci-budget-nightly
 # budget read), so this is its own workflow, on the supply-chain-nightly.yml
 # pattern.
 #
-# Three jobs beyond `cases`:
-#   raise-check   pull_request only, git-only (no gh api call): refuses a
-#                 `timeout-minutes` increase in this PR's ci.yml that carries
-#                 no `# budget: p90 <N> min on <YYYY-MM-DD>` comment. Wiring
-#                 this into the required `doc-scripts` job in ci.yml itself is
-#                 the epic's T7, in the next wave; this job is this task's own
-#                 CI coverage for the same script surface in the meantime.
+# The guard's --raise-check (a `timeout-minutes` increase in a pull
+# request's ci.yml with no `# budget: p90 <N> min on <YYYY-MM-DD>` comment)
+# runs in ci.yml's required `doc-scripts` job, not here (issue #4041).
+#
+# Two jobs beyond `cases`:
 #   budgets       schedule and workflow_dispatch only: the live p50/p90/growth
 #                 read against the real run history, uploaded as an artifact
 #                 so `report` can quote it without re-running the gh queries.
@@ -60,22 +58,6 @@ jobs:
           persist-credentials: false
       - name: CI job runtime budget guard cases (issue #4037)
         run: bash scripts/guards/check-ci-job-budgets.test.sh
-
-  # git-only: no gh api call, so no GH_TOKEN is needed here at all. Needs
-  # full history to read ci.yml at the PR's base commit via `git show`.
-  raise-check:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: CI job runtime budget guard --raise-check (issue #4037)
-        run: scripts/guards/check-ci-job-budgets.sh --raise-check "${{ github.event.pull_request.base.sha }}"
 
   budgets:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
