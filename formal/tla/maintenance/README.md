@@ -251,7 +251,7 @@ stealing is advisory and safe, merely wasteful.
 | claim content `<<"c", owner, state>>` | the claim payload `{owner_process_id, state, ...}` |
 | `heldVer[w][u]` | the `Version` token from a worker's last successful claim PUT |
 | `obsVer[w][u]` | the version a worker read via one GET plus one HEAD |
-| `Corrupt` | an unreadable claim payload (never stolen) |
+| `Corrupt` | an unreadable claim payload (stolen once older than the lease ceiling) |
 | `versionCounter` (via `TimePass`) | logical time in the `last_modified` domain |
 | guarded / ungated publish | the ClaimGuard checkpoint path / the `--no-claim` CLI path |
 

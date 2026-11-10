@@ -578,10 +578,19 @@ pub enum Completion {
 /// The multiply-and-shift maps a full-width `u64` into `[0, span_ms)` without
 /// the modulo bias a `%` would introduce, in u128 so nothing overflows.
 ///
-/// `lease_ms` is the EFFECTIVE lease the caller computed for this expiry --
-/// clamped by [`MAX_OBSERVED_LEASE_MS`] on the observation path -- not the raw
-/// configured one, so a misconfigured observer cannot draw a jitter that
-/// outlives the documented suppression bound.
+/// `lease_ms` is the lease the spread is relative to, already clamped by
+/// [`MAX_OBSERVED_LEASE_MS`], never a raw configured or declared value, so a
+/// misconfigured lease cannot draw a jitter that outlives the documented
+/// suppression bound. Which lease that is depends on the claim:
+///
+/// - A readable claim: the effective lease its expiry was computed from (the
+///   holder's declared lease, or the observer's own when it declared none,
+///   clamped by the ceiling).
+/// - An unreadable claim: the observer's own configured lease, clamped by the
+///   ceiling, and NOT the ceiling its expiry uses. Drawn from the ceiling the
+///   jitter would scale with 24 h (2.4 h at the default span fraction); drawn
+///   from the observer's lease the hold past the ceiling stays under one
+///   lease.
 pub fn jitter_ms(work_id: &WorkId, process_id: &Uuid, lease_ms: i64, cfg: &ClaimConfig) -> i64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&work_id.0);

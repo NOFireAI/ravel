@@ -876,3 +876,10 @@ in `crates/ravel-maintain/src/claim_guard.rs`;
 tests of the same prefix the 2026-10-03 amendment names; and
 `a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling` in
 `services/ravel-server/src/maintain.rs`.
+
+The TLA+ model checks the same rule: `Steal` in
+`formal/tla/maintenance/CompactionClaims.tla` is gated on expiry alone, and an
+unreadable claim's expiry uses the ceiling (`ObservedLease`), so the publish
+fence and the other claim safety invariants are checked over behaviours that
+steal a corrupt claim (`formal/tla/maintenance/results.md`, "Unreadable-claim
+steal").
