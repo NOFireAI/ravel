@@ -13453,6 +13453,11 @@ mod tests {
         assert_eq!(budget.reserved(), 0, "a refused decode charges nothing");
     }
 
+    /// Covers the query path's inline tenant comparison in
+    /// `snapshot_resolve::load_one_part` (header peeked, tenant compared and
+    /// counted, then `reserve_decoded`), not `Catalog::decode_tenant_part`,
+    /// whose ordering the `tenant_part` tests pin.
+    ///
     /// ADR-0050 §2 against ADR-1702 decision 6: a snapshot part whose own
     /// header names another tenant is an isolation breach, and it stays one
     /// under a budget with no room to decode that part. `load_one_part` reads

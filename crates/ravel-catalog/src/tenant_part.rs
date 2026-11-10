@@ -119,9 +119,14 @@ impl Catalog {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::sync::Arc;
+
+    use ravel_memory::MemoryBudget;
+    use ravel_object_store::memory::MemoryStore;
     use ravel_proto::catalog::v1::SnapshotEntry;
 
     use super::*;
+    use crate::config::CatalogConfig;
     use crate::snapshot_format::encode_part;
 
     const TENANT_A: TenantHash = TenantHash([0xAA; 16]);
@@ -219,5 +224,111 @@ mod tests {
             matches!(err, PartTenantError::Corrupt(_)),
             "expected Corrupt, got {err:?}"
         );
+    }
+
+    fn catalog_with_budget(limit: u64) -> (Catalog, Arc<MemoryBudget>) {
+        let budget = Arc::new(MemoryBudget::new(limit));
+        let catalog = Catalog::new(
+            Arc::new(MemoryStore::new()),
+            CatalogConfig {
+                shard_count: 1,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog")
+        .with_memory_budget(budget.clone());
+        (catalog, budget)
+    }
+
+    /// The part's declared decoded size, the figure
+    /// [`Catalog::decode_tenant_part`] charges to the budget.
+    fn declared_len(bytes: &[u8]) -> u64 {
+        snapshot_format::decode_part_header(bytes)
+            .expect("header")
+            .entries_uncompressed_len
+    }
+
+    /// Through [`Catalog::decode_tenant_part`], a foreign part under a budget
+    /// one byte short of its declared size is refused as `ForeignTenant` and
+    /// counted as a breach, and the budget is never asked: the tenant check
+    /// runs before the budget charge.
+    ///
+    /// FLIP: make the comparison in [`check_part_tenant`] `if false`, or
+    /// move the `reserve_decoded` call above the `check_part_tenant` call,
+    /// and this returns `MemoryExhausted`, so the match panics with
+    /// "expected ForeignTenant before any budget charge". Delete the
+    /// `record_isolation_breach` call and "the breach is counted" fails.
+    #[test]
+    fn a_foreign_part_is_a_breach_before_the_budget_is_charged() {
+        let bytes = part_for(TENANT_B);
+        let declared = declared_len(&bytes);
+        assert!(declared > 1, "declared {declared} leaves no room below it");
+        let (catalog, budget) = catalog_with_budget(declared - 1);
+        let err = catalog
+            .decode_tenant_part(&TENANT_A, &bytes)
+            .expect_err("a foreign part is refused");
+        match err {
+            TenantPartError::ForeignTenant { expected, actual } => {
+                assert_eq!(expected, TENANT_A.to_hex());
+                assert_eq!(actual, TENANT_B.to_hex());
+            }
+            other => panic!("expected ForeignTenant before any budget charge, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1, "the breach is counted");
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "nothing was reserved for a foreign part"
+        );
+        assert_eq!(
+            budget.accounted_refusals(),
+            0,
+            "the budget was never asked: the tenant check refused first"
+        );
+    }
+
+    /// The control for the test above: the same budget, one byte short of
+    /// the declared size, refuses a same-tenant part, so that budget really
+    /// is too small for the part.
+    #[test]
+    fn a_same_tenant_part_under_a_budget_too_small_is_refused_by_the_budget() {
+        let bytes = part_for(TENANT_A);
+        let declared = declared_len(&bytes);
+        assert!(declared > 1, "declared {declared} leaves no room below it");
+        let (catalog, budget) = catalog_with_budget(declared - 1);
+        let err = catalog
+            .decode_tenant_part(&TENANT_A, &bytes)
+            .expect_err("the budget refuses the part");
+        assert!(
+            matches!(err, TenantPartError::MemoryExhausted(_)),
+            "expected MemoryExhausted, got {err:?}"
+        );
+        assert_eq!(catalog.isolation_breaches(), 0, "no breach is counted");
+        assert_eq!(budget.reserved(), 0, "a refused charge reserves nothing");
+        assert_eq!(budget.accounted_refusals(), 1, "the budget refused once");
+    }
+
+    /// A same-tenant part under a budget of exactly its declared size
+    /// decodes, and the returned reservation holds that declared size until
+    /// it is dropped.
+    #[test]
+    fn a_same_tenant_part_decodes_and_holds_its_declared_charge() {
+        let bytes = part_for(TENANT_A);
+        let declared = declared_len(&bytes);
+        assert!(declared > 1, "declared {declared} leaves no room below it");
+        let (catalog, budget) = catalog_with_budget(declared);
+        let (decoded, reservation) = catalog
+            .decode_tenant_part(&TENANT_A, &bytes)
+            .expect("a same-tenant part decodes");
+        assert_eq!(decoded.entries.len(), 2);
+        assert_eq!(reservation.size(), declared);
+        assert_eq!(
+            budget.reserved(),
+            declared,
+            "the declared size is held while the reservation is alive"
+        );
+        drop(reservation);
+        assert_eq!(budget.reserved(), 0, "dropping the reservation releases it");
+        assert_eq!(catalog.isolation_breaches(), 0, "no breach is counted");
     }
 }
