@@ -330,8 +330,9 @@ atomics:
    The catalog decode charge answers an accounted refusal today with an
    eviction pass and one retry; a resident-cause refusal skips both, since
    eviction frees no `resident` before the next sample and the retry would
-   meet the same closed gate, and `decode_reserve_retries` keeps counting
-   eviction passes only.
+   meet the same closed gate (the pressure-evictor amendment below changes
+   this where the process budget has an evictor registered), and
+   `decode_reserve_retries` keeps counting eviction passes only.
 3. **`TenantDelegatingPool::grow`.** The infallible path cannot refuse, so a
    closed gate trips its `CeilingBreach`, and the query fails with the 422 on
    its next poll and releases what it holds. A gate-caused breach carries the
@@ -1056,3 +1057,37 @@ re-run on this change, by ravel-perf: paired fresh c6a.4xlarge boxes, this
 change's head against a main control, three concurrent phases each plus the
 stock run. The pooled error ratio is at most 0.058, no phase is over 0.08,
 and QPS is not below the control. Criteria (b), (c) and (d) are unchanged.
+
+## Amendment (2026-11-10, issue #4066): the pressure evictor answers a host-memory refusal
+
+<!-- amendment-applies: sections="3. Where the check sits, and what it costs" pointer="pressure-evictor amendment" -->
+<!-- amendment-supersedes: phrase="eviction frees no `resident` before the next sample" pointer="pressure-evictor amendment" -->
+
+This is the pressure-evictor amendment. Section 3, item 2, says the catalog
+decode charge skips its eviction pass and retry for a resident-cause
+refusal, because eviction frees no `resident` before the next sample and
+the retry would meet the same closed gate. Since issue #4015 that reason no
+longer describes the whole path wherever the process budget has a pressure
+evictor registered: whenever the budget is bounded, and under an unlimited
+budget whenever the decoded column-block cache is on (ADR-3326, the
+pressure-evictor amendment of 2026-11-09).
+
+There, every refusal `MemoryBudget::try_reserve` makes, from any consumer
+and for either cause, first asks the evictor to free the shortfall plus a
+fixed slack. The
+evictor asks the decoded column-block cache and then the catalog's decoded
+part and postings caches. For a host-memory refusal (the cause this
+section calls resident, which the host-memory amendment above moved to
+host available memory) the shortfall is the gate's floor minus the
+available reading, plus the request, and at least the ledger's shortfall.
+When the evictor reports at least that much freed, the budget admits the
+reservation on the ledger alone (`evict_and_retry` in
+`crates/ravel-memory/src/lib.rs`), so the retry does not meet the closed
+gate. Otherwise the refusal stands as before.
+
+What does not change: the catalog's own eviction pass and retry are still
+skipped for a host-memory refusal, so `decode_reserve_retries` still counts
+the catalog's own passes only and does not move on one. ADR-1170's
+pressure-evictor counter amendment (2026-11-10, issue #4015) records the
+counters this moves, and which entries the catalog's pressure pass may
+take.
