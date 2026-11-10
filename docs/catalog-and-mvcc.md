@@ -1808,12 +1808,19 @@ prints each in text and `--json` (test
   nonzero (2 and 3 for the dirty-day re-encode in
   `fold_report_counts_a_sealed_days_leaf_puts_and_gets`).
 - `key_index_unchanged_section_gets`: the GETs of KEY_IDX section reads
-  for entries a previous part's leaves already held for every declared
-  field, also counted in `key_index_ranged_gets`; nonzero only when a
-  carry was lost, and an entry no previous part held is never counted (12
-  of the 18 section GETs when a slice GET fails mid-build in
+  for entries a previous part's leaves covered, also counted in
+  `key_index_ranged_gets`: an entry whose data object a previous part held
+  and whose leaves covered it for every declared field, or, when that
+  part's leaves could not be loaded or the carry was abandoned for a data
+  object listed twice, any entry whose object that part held, with no
+  per-field check. It is nonzero only when a carry was lost, whatever made
+  it fail, and an entry whose object no previous part held is never
+  counted (12 of the 18 section GETs when a slice GET fails mid-build in
   `fold_report_counts_section_gets_for_entries_a_previous_leaf_held`, the
-  other 6 being a new entry's).
+  other 6 being a new entry's; 6 of 10 when the previous part lacks a
+  newly declared field's leaf in
+  `fold_report_counts_section_gets_of_a_refused_previous_part`, the other
+  4 being the late entries').
 - `head_digest`: lowercase hex blake3 of the HEAD in effect after the
   call, the one published or, on a no-op, the one read, re-encoded with
   `folder_id` set to sixteen zero bytes and `created_unix_ns` to zero;

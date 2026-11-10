@@ -1171,7 +1171,10 @@ commit record. The resolve covers all time and is filtered by ingest hour
 afterwards, so it costs a footer GET per resolved segment and is not an
 event-time resolve. A stamp counting another hour than the tombstone
 stamp's, or one whose resolve returned no segment at all, is `missing`
-rather than a pass on 0, and so is an absent stamp. `retired_hour_drop`
+rather than a pass on 0, and so is an absent stamp. A resolve that does
+not fit the run deadline (`retired_hour_resolve` recorded not-run) or
+fails (a `STEP-FAILED` line, its log kept under `out/logs/`) leaves the
+stamp unwritten and the state goes on, so only this figure is lost. `retired_hour_drop`
 writes the same stamp, which no figure reads.
 
 ### W3's drop and W8's retired hours

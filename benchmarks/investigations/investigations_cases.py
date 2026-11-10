@@ -5894,9 +5894,10 @@ FINISHED=1
             ('"erasure_in_flight", "many_parts_744", "many_parts_2160"]', f'"erasure_in_flight", {states}]'),
             ('c1_sha = ""', f"c1_sha = {c1}"))
 
-    def new_states_dry_run(self, script=None, toml=None, out="out-h1b"):
+    def new_states_dry_run(self, script=None, toml=None, out="out-h1b", env=None):
         p = subprocess.run([BASH, script or os.path.join(BOX, "run.sh"), "--dry-run", "--lane", "s3", "--run-toml",
-                            toml or self.new_states_toml(), "--out", self.path(out)], capture_output=True, text=True)
+                            toml or self.new_states_toml(), "--out", self.path(out)], capture_output=True, text=True,
+                           env=dict(os.environ, **(env or {})))
         return p.returncode, p.stdout + p.stderr
 
     def flip_check(self, old, new, script, check, label, test):
@@ -6345,16 +6346,16 @@ FINISHED=1
                           "fold-retired_hour-logs.measure.json", "--key-index-leaves --retention-default RETENTION_Ss",
                           "fold-retired_hour_refold-logs.measure.json",
                           "--key-index-leaves --retention-default RETENTION_Ss",
-                          "listing-retired_hour-resolved.json", "STAMP stamps/retired_hour.logs.retired_resolve.json",
-                          "rlog footprint --tenant dp7", "hour-segments --footprint",
+                          "listing-retired_hour-resolved.json", "rlog footprint --tenant dp7",
+                          "hour-segments --footprint", "STAMP stamps/retired_hour.logs.retired_resolve.json",
                           "STAMP stamps/transitions.jsonl", "STAMP stamps/census.jsonl", "--batch 23",
                           "tombstone-check --first D0_7 --last D0_7+23",
                           "STAMP stamps/retired_hour_drop.logs.tombstone.json",
                           "STAMP stamps/retired_hour_drop.logs.maint_records.json",
                           "fold-retired_hour_drop-logs.measure.json", "fold-retired_hour_drop_refold-logs.measure.json",
-                          "listing-retired_hour_drop-resolved.json",
-                          "STAMP stamps/retired_hour_drop.logs.retired_resolve.json", "rlog footprint --tenant dp7",
-                          "hour-segments --footprint", "STAMP stamps/transitions.jsonl")),
+                          "listing-retired_hour_drop-resolved.json", "rlog footprint --tenant dp7",
+                          "hour-segments --footprint", "STAMP stamps/retired_hour_drop.logs.retired_resolve.json",
+                          "STAMP stamps/transitions.jsonl")),
     )
 
     def check_new_states_plan(self, script):
@@ -6395,6 +6396,39 @@ FINISHED=1
         self.flip_check('  run "$PY" "$LIB" hour-segments', '  : "$PY" "$LIB" hour-segments', "run.sh",
                         self.check_new_states_plan, "W3's retired-hour resolve never counted",
                         "test_new_states_dry_run_plan")
+
+    def check_failed_resolve_continues(self, script):
+        # Every rlog footprint exits 3: each state's resolve is STEP-FAILED
+        # with its log kept and no retired_resolve stamp, and both states
+        # still reach their transition and census.
+        code, text = self.new_states_dry_run(script, out="out-resolve", env={"INV_DRY_RUN_FAIL": "rlog footprint"})
+        if code:
+            return [f"dry run exit {code}"]
+        out = []
+        if "STATE-FAILED" in text:
+            out.append("a state failed: " + next(x for x in text.splitlines() if "STATE-FAILED" in x))
+        b = "\n".join(self.blocks(text).get("state:retired_hour", []))
+        for state in ("retired_hour", "retired_hour_drop"):
+            failed = (f"STEP-FAILED {state}: rlog footprint {state} exit 3 (log out/logs/resolve-{state}.out); "
+                      f"stamps/{state}.logs.retired_resolve.json not written, the state goes on")
+            if failed not in b:
+                out.append(f"{state}: no {failed!r}")
+            if f"STAMP stamps/{state}.logs.retired_resolve.json" in b:
+                out.append(f"{state}: retired_resolve stamped")
+        if b.count("STAMP stamps/transitions.jsonl") != 2 or b.count("STAMP stamps/census.jsonl") != 2:
+            out.append("the states did not both reach their transition and census")
+        if "hour-segments --footprint" in b:
+            out.append("hour-segments ran after a failed footprint")
+        return out
+
+    def test_failed_resolve_leaves_the_stamp_unwritten(self):
+        # Only W3's segments figure reads the retired_resolve stamp, so a
+        # failed resolve loses that figure and not the retired_hour states.
+        self.assertEqual(self.check_failed_resolve_continues(None), [])
+        self.flip_check('--json >"$fp" 2>"$flog" || code=$?\n',
+                        '--json >"$fp" 2>"$flog" || { failed_at "rlog footprint $state" "$?" "$flog"; return 1; }\n',
+                        "run.sh", self.check_failed_resolve_continues, "a failed resolve fails the state",
+                        "test_failed_resolve_leaves_the_stamp_unwritten")
 
     def run_sourced(self, script, toml, body, name):
         """run.sh (SCRIPT, or the run.sh beside a flipped lib/inv.py)
