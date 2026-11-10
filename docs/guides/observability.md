@@ -402,7 +402,7 @@ Labels: `mode`.
 |---|---|
 | `ravel_catalog_interlock_violations_total` | Unlisted L0 commit records observed postdating a compaction record in their bucket. |
 | `ravel_catalog_compaction_input_set_conflicts_total` | Buckets observed holding two compaction records with different input_set_hash. |
-| `ravel_catalog_isolation_breach_total` | Hard-failed queries, fold ticks and scrub checks from a HEAD, snapshot part or postings tenant_hash mismatch or an out-of-prefix listing result. |
+| `ravel_catalog_isolation_breach_total` | Hard-failed queries, fold ticks and scrub checks from a HEAD, snapshot part or postings tenant_hash mismatch or an out-of-prefix listing result, plus on-demand fold entry comparisons that refused a foreign snapshot part (these fail nothing: the route treats the snapshot as changed). |
 | `ravel_catalog_column_stats_decode_refusals_total` | Column-statistics objects the HEAD referenced that the reader refused to decode: an oversized declared body, corruption, or a checksum or header failure. Counted on every load, not once per object. |
 | `ravel_catalog_column_stats_budget_skips_total` | Column-statistics part loads the process memory budget refused. The part is left uncovered and the query scans it, with the same answer. Counted on every load: nothing remembers the refusal, so while the budget stays short each query fetches that part's statistics object again and discards it. |
 | `ravel_catalog_column_stats_decode_panics_total` | Column-statistics decode jobs that panicked on the read CPU gate. Counted on every load. A job the gate cancelled at shutdown is not counted. |
@@ -420,7 +420,9 @@ Labels: `mode`.
 
 The first two counters count an anomaly that the query resolves past. Each
 `ravel_catalog_isolation_breach_total` increment is a query, a fold tick or a
-scrub check that failed with an explicit isolation-fault error. The scrub
+scrub check that failed with an explicit isolation-fault error, or an
+on-demand fold entry comparison that refused a foreign snapshot part and
+treated the snapshot as changed instead of failing. The scrub
 reads a foreign snapshot part in its covering-postings load and in its
 seal-divergence check, so each scrub tick counts it twice until it is fixed,
 or once while the HEAD carries no postings reference.

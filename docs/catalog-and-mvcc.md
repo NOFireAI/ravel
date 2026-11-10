@@ -2921,33 +2921,53 @@ object in `load_covering_postings` (`LoadPostingsError::TenantHashMismatch`)
 is not counted.
 
 The GC reachability sweep (`crates/ravel-maintain/src/reachability.rs`) also
-checks, the HEAD and each part, but holds no `Catalog` to count a breach on.
-It compares the HEAD's tenant_hash with the swept tenant right after decoding
-it, before reading any part the HEAD names, and it calls the same
+checks the HEAD's tenant and signal and each part's tenant, but holds no
+`Catalog` to count a breach on. It compares the HEAD's tenant_hash with the
+swept tenant, and the HEAD's signal with the swept signal, right after
+decoding it, before reading any part the HEAD names, and it calls the same
 tenant-checked decode (`ravel_catalog::check_part_tenant` /
 `decode_part_for_tenant`, the public primitives `Catalog::decode_tenant_part`
 itself calls) directly on a HEAD-named part before reading its entries. A
-foreign tenant_hash on either refuses it and takes the fail-closed path the
-sweep already uses for an undecodable HEAD or part: the refusal is cached for
-the rest of the pass, the delete gate answers `SnapshotBlock::Unreadable`, the
-candidate is not deleted (the retention sweep counts it on the pass report's
-`blocked_by_unreadable_head`, the superseded-input sweep on
-`held_by_unreadable_head`), and the sweep logs one error-level line (`key`,
-`expected_tenant`, `actual_tenant`). It does not increment
-`ravel_catalog_isolation_breach_total`, because it holds no `Catalog`.
+foreign tenant_hash on either, or another signal on the HEAD, refuses it and
+takes the fail-closed path the sweep already uses for an undecodable HEAD or
+part: the refusal is cached for the rest of the pass, the delete gate answers
+`SnapshotBlock::Unreadable`, the candidate is not deleted (the retention
+sweep counts it on the pass report's `blocked_by_unreadable_head`, the
+superseded-input sweep on `held_by_unreadable_head`), and the sweep logs one
+error-level line (`key`, `expected_tenant`, `actual_tenant` for a tenant;
+`key`, `expected_signal`, `actual_signal` for a signal). It does not
+increment `ravel_catalog_isolation_breach_total`, because it holds no
+`Catalog`.
 
-Three readers still decode a part with no tenant_hash check, so a foreign
-part they read is neither refused nor counted: the on-demand fold's
-`read_entry_ids` (`services/ravel-server/src/fold_on_demand.rs`), the
-format-window audit (`services/ravel-server/src/format_window.rs`), and
-`ravel-cli catalog inspect` (`services/ravel-cli/src/catalog.rs`).
+Three more snapshot-part readers check the part's tenant_hash before decoding
+its entries, each with its own answer to a foreign part:
+
+- The on-demand fold's outcome classification (`read_entry_ids` in
+  `services/ravel-server/src/fold_on_demand.rs`) decodes through
+  `Catalog::decode_tenant_part` on the server's `Catalog`, so a foreign part
+  is counted on `ravel_catalog_isolation_breach_total` before the memory
+  budget is charged. The classification then declines to compare entry sets,
+  logs a warning naming the part and both tenants, and the route answers
+  `published` with the fold's report, as it does for a part that will not
+  decode.
+- The startup format-window audit (`services/ravel-server/src/format_window.rs`)
+  calls `ravel_catalog::decode_part_for_tenant`. A foreign part fails that
+  (tenant, signal) pair's read, none of its entries is counted as out of
+  window, and the pair is reported as a check that could not run, so
+  `--format-window-check refuse` fails startup on it and `warn` logs it. No
+  `Catalog` exists at that point in startup, so it counts nothing.
+- `ravel-cli catalog inspect` (`services/ravel-cli/src/catalog.rs`) calls
+  `decode_part_for_tenant`. A foreign part fails the command after printing
+  everything rendered before it, and counts nothing: no server is involved.
+
 The counter is rendered at `/metrics` beside the
 existing `ravel_catalog_interlock_violations_total` and
 `ravel_catalog_compaction_input_set_conflicts_total` anomaly counters
 (default alert rule: docs/guides/operations.md). Unlike those two, which
 tally a harmless-overlap anomaly the query still resolves past, every
 increment of the isolation-breach counter corresponds to a failed query, a
-failed fold tick, or a scrub tick that skipped the check reading the part.
+failed fold tick, a scrub tick that skipped the check reading the part, or an
+on-demand fold whose outcome classification declined to compare entry sets.
 
 The fold's own liveness is exported beside those counters, from the same
 `Catalog`: `ravel_catalog_fold_cycles_total`,

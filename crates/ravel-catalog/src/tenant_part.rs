@@ -4,13 +4,16 @@
 //! [`check_part_tenant`] and [`decode_part_for_tenant`] are the public,
 //! counter-free primitives (no [`Catalog`] held, so nothing to charge a
 //! budget against or count a breach on): the GC reachability sweep
-//! (`ravel-maintain`'s `reachability.rs`) uses them directly. Readers that
-//! hold a `Catalog` instead go through [`Catalog::decode_tenant_part`], which
-//! calls [`check_part_tenant`] for its header step and additionally charges
-//! the catalog's memory budget and counts the refusal on
-//! `ravel_catalog_isolation_breach_total`: `seal_divergence` (the scrub's
-//! seal-divergence check, `catalog verify`, and the load's coverage check)
-//! and `covering_postings` (the scrub's covering-postings load). The fold
+//! (`ravel-maintain`'s `reachability.rs`), the server's startup
+//! format-window audit and `ravel-cli catalog inspect` use them directly.
+//! Readers that hold a `Catalog` instead go through
+//! [`Catalog::decode_tenant_part`], which calls [`check_part_tenant`] for its
+//! header step and additionally charges the catalog's memory budget and
+//! counts the refusal on `ravel_catalog_isolation_breach_total`:
+//! `seal_divergence` (the scrub's seal-divergence check, `catalog verify`,
+//! and the load's coverage check), `covering_postings` (the scrub's
+//! covering-postings load) and the server's on-demand fold entry
+//! comparison. The fold
 //! (`fold.rs`) and the query path's part load (`snapshot_resolve.rs`) keep
 //! their own inline tenant comparisons and do not call these functions.
 

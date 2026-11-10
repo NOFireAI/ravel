@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
-use ravel_catalog::{PartLimits, decode_head, decode_part};
+use ravel_catalog::{PartLimits, PartTenantError, decode_head, decode_part_for_tenant};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::{Signal, TenantHash};
 
@@ -318,7 +318,10 @@ async fn check_pair(
 const NEWER_BUILD: &str = "written by a newer build than this process reads; upgrade this process";
 
 /// One read of the HEAD and every part it names, counting out-of-window
-/// entries into `found`.
+/// entries into `found`. A part whose header names another tenant is refused
+/// before its entries are decoded (ADR-0050 §2), so none of them is counted;
+/// no `Catalog` exists yet at startup, so the refusal is not counted on the
+/// isolation-breach counter either.
 async fn read_catalog(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -365,11 +368,19 @@ async fn read_catalog(
                 part.key
             )));
         }
-        let decoded = decode_part(&bytes, &limits).map_err(|err| {
-            ReadError::Other(if err.is_newer_format_version() {
-                format!("snapshot part {} was {NEWER_BUILD}: {err}", part.key)
-            } else {
-                format!("snapshot part {} is corrupt: {err}", part.key)
+        let decoded = decode_part_for_tenant(tenant, &bytes, &limits).map_err(|err| {
+            ReadError::Other(match err {
+                PartTenantError::ForeignTenant { expected, actual } => format!(
+                    "snapshot part {} names tenant {actual}, expected {expected}: refusing to \
+                     read a foreign part (isolation fault)",
+                    part.key
+                ),
+                PartTenantError::Corrupt(err) if err.is_newer_format_version() => {
+                    format!("snapshot part {} was {NEWER_BUILD}: {err}", part.key)
+                }
+                PartTenantError::Corrupt(err) => {
+                    format!("snapshot part {} is corrupt: {err}", part.key)
+                }
             })
         })?;
         for entry in decoded.entries {
@@ -546,6 +557,20 @@ mod tests {
         signal: Signal,
         parts: &[&[u32]],
     ) {
+        seed_parts_for(store, tenant, tenant, signal, parts).await;
+    }
+
+    /// [`seed`], with every part's bytes encoded for `part_tenant` while the
+    /// HEAD, its key and the part keys stay `tenant`'s. Each HEAD-level
+    /// reference (blake3, size, hour range) is correct for the stored bytes,
+    /// so only the part's own header names the other tenant.
+    async fn seed_parts_for(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        part_tenant: &TenantHash,
+        signal: Signal,
+        parts: &[&[u32]],
+    ) {
         let signal_code = ravel_commit::signal::to_proto(signal) as u32;
         let mut refs = Vec::new();
         let mut seq = 0u64;
@@ -561,7 +586,8 @@ mod tests {
                     }
                 })
                 .collect();
-            let bytes = encode_part(tenant.0, signal_code, 1, hour, &entries).expect("encode part");
+            let bytes =
+                encode_part(part_tenant.0, signal_code, 1, hour, &entries).expect("encode part");
             let key = format!(
                 "t/{}/catalog/{}/snap/{hour}.{index:016x}.csnap",
                 tenant.to_hex(),
@@ -764,6 +790,41 @@ mod tests {
         assert!(report.unchecked[0].reason.contains("corrupt"), "{report:?}");
         assert!(report.unchecked[1].reason.contains("blake3"), "{report:?}");
         assert!(enforce(FormatWindowCheck::Refuse, &report).is_err());
+    }
+
+    /// A HEAD of tenant A naming a part encoded for tenant B is a pair the
+    /// check could not read: its reason names both tenant hashes, refuse mode
+    /// fails startup on it, and none of the foreign part's entries is
+    /// counted, although every one of them is outside the reader window.
+    ///
+    /// FLIP: decode with `decode_part` and no tenant check, and the pair reads
+    /// `Ok` with the foreign entries in `out_of_window`. Count the entries
+    /// before refusing, and `out_of_window` is non-empty.
+    #[tokio::test]
+    async fn a_foreign_part_is_refused_and_none_of_its_entries_counted() {
+        let store = MemoryStore::new();
+        let a = tenant("acme");
+        let b = tenant("globex");
+        let old = below_window(Signal::Logs);
+        seed_parts_for(&store, &a, &b, Signal::Logs, &[&[old, old]]).await;
+
+        let report = check(&store, &[a], NO_DEADLINE).await;
+        assert!(
+            report.out_of_window.is_empty(),
+            "a foreign part's entries are never counted: {report:?}"
+        );
+        assert_eq!(report.unchecked.len(), 1, "{report:?}");
+        assert_eq!(report.unchecked[0].tenant, a);
+        assert_eq!(report.unchecked[0].signal, Signal::Logs);
+        let reason = &report.unchecked[0].reason;
+        assert!(reason.contains(&a.to_hex()), "{reason}");
+        assert!(reason.contains(&b.to_hex()), "{reason}");
+        assert!(reason.contains("isolation fault"), "{reason}");
+
+        let err = enforce(FormatWindowCheck::Refuse, &report)
+            .expect_err("refuse fails startup on a foreign part");
+        assert!(err.to_string().contains(&b.to_hex()), "{err}");
+        enforce(FormatWindowCheck::Warn, &report).expect("warn logs and starts");
     }
 
     async fn read_head(

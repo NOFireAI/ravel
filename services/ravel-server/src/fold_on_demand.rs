@@ -112,7 +112,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use ravel_cache::{Role, SingleFlight, SingleFlightError};
 use ravel_catalog::{
-    Catalog, CatalogError, FoldReport, PartLimits, SnapshotFormatError, decode_head, decode_part,
+    Catalog, CatalogError, FoldReport, SnapshotFormatError, TenantPartError, decode_head,
 };
 use ravel_cpu_gate::{JobSize, ReadGate, ReadSite};
 use ravel_ingest::Clock;
@@ -355,7 +355,7 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
         .in_flight
         .run((tenant_hash, signal), || async {
             fold_once_on_gate(
-                state.catalog.as_ref(),
+                &state.catalog,
                 state.store.as_ref(),
                 &tenant_hash,
                 signal,
@@ -473,7 +473,7 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
 ///   the snapshot's content (see [`snapshot_content_changed`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn fold_once(
-    catalog: &Catalog,
+    catalog: &Arc<Catalog>,
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
@@ -501,7 +501,7 @@ pub async fn fold_once(
 /// sized by its length that owns the fetched bytes.
 #[allow(clippy::too_many_arguments)]
 pub async fn fold_once_on_gate(
-    catalog: &Catalog,
+    catalog: &Arc<Catalog>,
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
@@ -570,6 +570,7 @@ pub async fn fold_once_on_gate(
                 }
             };
             let changed = snapshot_content_changed(
+                catalog,
                 store,
                 tenant,
                 signal,
@@ -672,7 +673,9 @@ const MAX_COMPARED_PARTS: usize = 8;
 /// addressed, so a part carrying the same `blake3` on both sides holds the
 /// same entries by construction and needs no read; only the remainder on each
 /// side is fetched and decoded.
+#[allow(clippy::too_many_arguments)]
 async fn snapshot_content_changed(
+    catalog: &Arc<Catalog>,
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
@@ -734,8 +737,17 @@ async fn snapshot_content_changed(
         return true;
     }
     let (Some(before_entries), Some(after_entries)) = (
-        read_entry_ids(store, tenant, signal, &before_only, gets, read_gate).await,
-        read_entry_ids(store, tenant, signal, &after_only, gets, read_gate).await,
+        read_entry_ids(
+            catalog,
+            store,
+            tenant,
+            signal,
+            &before_only,
+            gets,
+            read_gate,
+        )
+        .await,
+        read_entry_ids(catalog, store, tenant, signal, &after_only, gets, read_gate).await,
     ) else {
         return true;
     };
@@ -770,7 +782,13 @@ type EntryId = (u32, u32, u32, Vec<u8>, u64, u64, Vec<u8>);
 
 /// Every entry identity across `parts`, or `None` if any part could not be
 /// read or decoded (the caller then declines to claim the sets are equal).
+///
+/// Each part is decoded through [`Catalog::decode_tenant_part`], so a part
+/// whose header names another tenant is refused before its entries are read
+/// and counted on `catalog`'s isolation-breach counter, and the decode is
+/// charged to `catalog`'s memory budget for as long as its entries are held.
 async fn read_entry_ids(
+    catalog: &Arc<Catalog>,
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
@@ -797,21 +815,49 @@ async fn read_entry_ids(
         let size = bytes.len() as u64;
         #[cfg(test)]
         let inject_panic = tests::part_decode_panics(&part.key);
+        let job_catalog = Arc::clone(catalog);
+        let job_tenant = *tenant;
         let decode = move || {
             #[cfg(test)]
             assert!(!inject_panic, "injected snapshot part decode panic");
-            decode_part(&bytes, &PartLimits::default())
+            job_catalog.decode_tenant_part(&job_tenant, &bytes)
         };
         let decoded = match read_gate {
             Some(gate) => gate
                 .run(ReadSite::Fold, JobSize::Bytes(size), decode)
                 .await
-                .unwrap_or_else(|err| Err(SnapshotFormatError::DecodeJob(err))),
+                .unwrap_or_else(|err| {
+                    Err(TenantPartError::Corrupt(SnapshotFormatError::DecodeJob(
+                        err,
+                    )))
+                }),
             None => decode(),
         };
-        let decoded = match decoded {
+        let (decoded, _reservation) = match decoded {
             Ok(decoded) => decoded,
-            Err(err) => {
+            Err(TenantPartError::ForeignTenant { expected, actual }) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    key = %part.key,
+                    expected = %expected,
+                    actual = %actual,
+                    "on-demand catalog fold: a snapshot part named by HEAD names another \
+                     tenant; refusing to read it (isolation fault)"
+                );
+                return None;
+            }
+            Err(TenantPartError::MemoryExhausted(err)) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    key = %part.key,
+                    error = %err,
+                    "on-demand catalog fold: the memory budget refused a snapshot part's decode"
+                );
+                return None;
+            }
+            Err(TenantPartError::Corrupt(err)) => {
                 tracing::warn!(
                     tenant = %tenant.to_hex(),
                     signal = ?signal,
@@ -1042,7 +1088,7 @@ mod tests {
 
         let catalog = catalog(store.clone());
         let result = fold_once(
-            catalog.as_ref(),
+            &catalog,
             store.as_ref(),
             &tenant_hash,
             Signal::Logs,
@@ -1103,7 +1149,7 @@ mod tests {
 
         let catalog = catalog(store.clone());
         let result = fold_once(
-            catalog.as_ref(),
+            &catalog,
             store.as_ref(),
             &tenant_hash,
             Signal::Logs,
@@ -1133,7 +1179,7 @@ mod tests {
         // Second call, same clock: the watermark is already where the sealing
         // rule allows, so this one is a true no-op and leaves HEAD alone.
         let again = fold_once(
-            catalog.as_ref(),
+            &catalog,
             store.as_ref(),
             &tenant_hash,
             Signal::Logs,
@@ -1212,7 +1258,7 @@ mod tests {
 
         let catalog = catalog(store.clone());
         let first = fold_once(
-            catalog.as_ref(),
+            &catalog,
             store.as_ref(),
             &tenant_hash,
             Signal::Logs,
@@ -1235,7 +1281,7 @@ mod tests {
         publish_retention_tombstone(store.as_ref(), &tenant_hash, 0, retired_hour).await;
 
         let second = fold_once(
-            catalog.as_ref(),
+            &catalog,
             store.as_ref(),
             &tenant_hash,
             Signal::Logs,
@@ -1282,7 +1328,8 @@ mod tests {
                 .await
                 .expect("part present");
             let decoded =
-                ravel_catalog::decode_part(&bytes.data, &PartLimits::default()).expect("part");
+                ravel_catalog::decode_part(&bytes.data, &ravel_catalog::PartLimits::default())
+                    .expect("part");
             hours.extend(decoded.entries.iter().map(|e| e.ingest_hour_bucket));
         }
         hours.sort_unstable();
@@ -1321,7 +1368,7 @@ mod tests {
         seed_log_commit(store.as_ref(), &tenant, (base_hour - 4) as u32, 1).await;
         let catalog = catalog(store.clone());
         fold_once(
-            catalog.as_ref(),
+            &catalog,
             store.as_ref(),
             &tenant_hash,
             Signal::Logs,
@@ -1349,7 +1396,7 @@ mod tests {
             Arc::new(ravel_cpu_gate::InstantClock::new()),
         ));
         let second = fold_once_on_gate(
-            catalog.as_ref(),
+            &catalog,
             store.as_ref(),
             &tenant_hash,
             Signal::Logs,
@@ -1411,7 +1458,7 @@ mod tests {
         seed_log_commit(store.as_ref(), &tenant, (base_hour - 4) as u32, 1).await;
         let catalog = catalog(store.clone());
         fold_once(
-            catalog.as_ref(),
+            &catalog,
             store.as_ref(),
             &tenant_hash,
             Signal::Logs,
@@ -1437,7 +1484,7 @@ mod tests {
             Arc::new(ravel_cpu_gate::InstantClock::new()),
         ));
         let second = fold_once_on_gate(
-            catalog.as_ref(),
+            &catalog,
             store.as_ref(),
             &tenant_hash,
             Signal::Logs,
@@ -1461,6 +1508,209 @@ mod tests {
         assert!(
             fold_site.jobs >= 1,
             "the injected panic ran on the gate, not inline"
+        );
+    }
+
+    fn snapshot_entry(seq: u64, hour: u32) -> ravel_proto::catalog::v1::SnapshotEntry {
+        ravel_proto::catalog::v1::SnapshotEntry {
+            level: 0,
+            shard: 0,
+            ingest_hour_bucket: hour,
+            writer_id: vec![0x07; 16],
+            writer_epoch: 1,
+            writer_seq: seq,
+            content_hash: vec![seq as u8; 32],
+            object_size: 100,
+            ..Default::default()
+        }
+    }
+
+    /// Plants a logs HEAD for `head_tenant` naming one part at a key under
+    /// `head_tenant`'s prefix, whose bytes are encoded for `part_tenant`. The
+    /// HEAD-level reference (blake3, size, hour range) is correct for the
+    /// stored bytes, so only the part's own header can tell the tenants
+    /// apart. Returns the parts read back from the stored HEAD.
+    async fn plant_head_with_part(
+        store: &dyn ObjectStoreBackend,
+        head_tenant: &TenantHash,
+        part_tenant: &TenantHash,
+        entries: &[ravel_proto::catalog::v1::SnapshotEntry],
+    ) -> Vec<SnapshotPartRef> {
+        let hour = 10u32;
+        let signal_code = ravel_commit::signal::to_proto(Signal::Logs) as u32;
+        let bytes = ravel_catalog::encode_part(part_tenant.0, signal_code, 1, hour, entries)
+            .expect("encode part");
+        let key = format!(
+            "t/{}/catalog/{}/snap/{hour}.{}.csnap",
+            head_tenant.to_hex(),
+            Signal::Logs.key_prefix(),
+            part_tenant.to_hex()
+        );
+        let part = SnapshotPartRef {
+            key: key.clone(),
+            blake3: blake3::hash(&bytes).as_bytes().to_vec(),
+            size: bytes.len() as u64,
+            entry_count: entries.len() as u64,
+            watermark_hour: hour,
+            min_hour: hour,
+            column_stats: None,
+            key_index: Vec::new(),
+        };
+        store
+            .put(&key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put part");
+        let head = SnapshotHead {
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            tenant_hash: head_tenant.0.to_vec(),
+            signal: signal_code,
+            shard_count: 1,
+            watermark_hour: hour,
+            parts: vec![part],
+            postings: None,
+            folder_id: vec![0x33; 16],
+            created_unix_ns: 0,
+            shard_generation_count: 1,
+        };
+        let head_key = crate::fold::head_key(head_tenant, Signal::Logs);
+        store
+            .put(
+                &head_key,
+                Bytes::from(ravel_catalog::encode_head(&head).expect("encode HEAD")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put HEAD");
+        let stored = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD present");
+        decode_head(&stored.data).expect("decode HEAD").parts
+    }
+
+    /// `read_entry_ids` over a part tenant A's HEAD names: a foreign part is
+    /// refused (the caller declines to compare entry sets) and counted once on
+    /// the catalog's isolation-breach counter, while the tenant's own part
+    /// yields its ids and counts nothing.
+    ///
+    /// FLIP: decode with `decode_part` and no tenant check, and the foreign
+    /// case returns `Some` with the foreign part's ids. Keep the check but
+    /// drop the counting, and `isolation_breaches()` reads 0.
+    #[tokio::test]
+    async fn read_entry_ids_refuses_and_counts_a_foreign_part() {
+        let tenant_a = TenantId::new("fold-on-demand-foreign-a").hash();
+        let tenant_b = TenantId::new("fold-on-demand-foreign-b").hash();
+        let entries = [snapshot_entry(1, 10), snapshot_entry(2, 10)];
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let parts = plant_head_with_part(store.as_ref(), &tenant_a, &tenant_b, &entries).await;
+        let foreign_catalog = catalog(store.clone());
+        let mut gets = 0;
+        let ids = read_entry_ids(
+            &foreign_catalog,
+            store.as_ref(),
+            &tenant_a,
+            Signal::Logs,
+            &parts.iter().collect::<Vec<_>>(),
+            &mut gets,
+            None,
+        )
+        .await;
+        assert_eq!(ids, None, "a foreign part's entries are never read");
+        assert_eq!(foreign_catalog.isolation_breaches(), 1);
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let parts = plant_head_with_part(store.as_ref(), &tenant_a, &tenant_a, &entries).await;
+        let own_catalog = catalog(store.clone());
+        let ids = read_entry_ids(
+            &own_catalog,
+            store.as_ref(),
+            &tenant_a,
+            Signal::Logs,
+            &parts.iter().collect::<Vec<_>>(),
+            &mut gets,
+            None,
+        )
+        .await
+        .expect("the tenant's own part decodes");
+        let expected: BTreeSet<EntryId> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.level,
+                    entry.shard,
+                    entry.ingest_hour_bucket,
+                    entry.writer_id.clone(),
+                    entry.writer_epoch,
+                    entry.writer_seq,
+                    entry.content_hash.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(ids, expected);
+        assert_eq!(own_catalog.isolation_breaches(), 0);
+    }
+
+    /// A foreign part whose declared decoded size is above the catalog's
+    /// memory budget is still refused as foreign and counted: the tenant is
+    /// checked before the budget is charged.
+    ///
+    /// FLIP: charge the budget before the tenant check, and the part is
+    /// refused as `MemoryExhausted` with the count left at 0.
+    #[tokio::test]
+    async fn an_oversize_foreign_part_is_counted_before_the_budget_refuses_it() {
+        const BUDGET: u64 = 16;
+        let tenant_a = TenantId::new("fold-on-demand-oversize-a").hash();
+        let tenant_b = TenantId::new("fold-on-demand-oversize-b").hash();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let parts = plant_head_with_part(
+            store.as_ref(),
+            &tenant_a,
+            &tenant_b,
+            &[snapshot_entry(1, 10), snapshot_entry(2, 10)],
+        )
+        .await;
+        let stored = store
+            .get(&parts[0].key, GetRange::Full)
+            .await
+            .expect("part present");
+        let declared =
+            ravel_catalog::decode_part(&stored.data, &ravel_catalog::PartLimits::default())
+                .expect("decode part")
+                .header
+                .entries_uncompressed_len;
+        assert!(
+            declared > BUDGET,
+            "declared {declared} must exceed the budget"
+        );
+
+        let catalog = Arc::new(
+            Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    shard_count: 1,
+                    ..CatalogConfig::default()
+                },
+            )
+            .expect("build catalog")
+            .with_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(BUDGET))),
+        );
+        let mut gets = 0;
+        let ids = read_entry_ids(
+            &catalog,
+            store.as_ref(),
+            &tenant_a,
+            Signal::Logs,
+            &parts.iter().collect::<Vec<_>>(),
+            &mut gets,
+            None,
+        )
+        .await;
+        assert_eq!(ids, None);
+        assert_eq!(
+            catalog.isolation_breaches(),
+            1,
+            "the foreign tenant is counted before the budget charge can refuse"
         );
     }
 
@@ -1492,7 +1742,7 @@ mod tests {
         let store_a = store.clone();
         let racer_a = tokio::spawn(async move {
             fold_once(
-                catalog_a.as_ref(),
+                &catalog_a,
                 store_a.as_ref(),
                 &tenant_hash,
                 Signal::Logs,
@@ -1515,7 +1765,7 @@ mod tests {
 
         let catalog_b = catalog(store.clone());
         let result_b = fold_once(
-            catalog_b.as_ref(),
+            &catalog_b,
             store.as_ref(),
             &tenant_hash,
             Signal::Logs,
@@ -1597,7 +1847,7 @@ mod tests {
         let mut total_list_requests = 0u64;
         for _ in 0..N {
             let result = fold_once(
-                catalog.as_ref(),
+                &catalog,
                 store.as_ref(),
                 &tenant_hash,
                 Signal::Logs,

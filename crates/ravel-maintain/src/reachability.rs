@@ -17,9 +17,10 @@
 //!   fail-closed. Non-reachability cannot be proven from data that cannot be
 //!   read, and a wrongly-permitted delete is unrecoverable while a delayed one
 //!   is not. A HEAD or a part whose header names another tenant (ADR-0050
-//!   §2) is one more cause: a foreign HEAD is refused before any of its parts
-//!   is read, a foreign part before its entries are read, the same fail-closed
-//!   answer as one that will not decode at all.
+//!   §2), or a HEAD whose header names a signal other than the one swept, is
+//!   one more cause: such a HEAD is refused before any of its parts is read,
+//!   a foreign part before its entries are read, the same fail-closed answer
+//!   as one that will not decode at all.
 //! - **A decoded snapshot entry names the object**: blocked. The ordinary
 //!   lagging-fold case.
 //!
@@ -85,7 +86,8 @@ pub enum SnapshotBlock {
     Named,
     /// HEAD, or a snapshot part covering the relevant hour, was present but
     /// could not be read (undecodable, checksum/hash mismatch, unsupported
-    /// version, a header naming another tenant (ADR-0050 §2), an entry whose
+    /// version, a header naming another tenant (ADR-0050 §2) or a HEAD
+    /// header naming another signal, an entry whose
     /// identity fields do not fit the shape a fold writes, or a HEAD-named
     /// part that is missing). Blocked fail-closed:
     /// non-reachability cannot be proven from data that cannot be read, and a
@@ -880,6 +882,21 @@ impl SnapshotReachability {
                             );
                             HeadLoad::Unreadable
                         }
+                        // A HEAD at this signal's key naming another signal
+                        // describes some other catalog's objects, not these.
+                        Ok(head)
+                            if ravel_commit::signal::from_proto(head.signal as i32)
+                                != Ok(signal) =>
+                        {
+                            tracing::error!(
+                                key = %head_key,
+                                expected_signal = ?signal,
+                                actual_signal = head.signal,
+                                "maintain sweep: snapshot HEAD names another signal; blocking \
+                                 deletes fail-closed"
+                            );
+                            HeadLoad::Unreadable
+                        }
                         Ok(head) => {
                             self.head_version = version;
                             HeadLoad::Present(Box::new(head))
@@ -1208,6 +1225,19 @@ mod tests {
         part_tenant: TenantHash,
         entries: Vec<SnapshotEntry>,
     ) {
+        plant_head_and_part_for_signal(store, head_tenant, Signal::Metrics, part_tenant, entries)
+            .await;
+    }
+
+    /// [`plant_head_and_part`], with the HEAD's header naming `head_signal`
+    /// while it is stored at the metrics HEAD key.
+    async fn plant_head_and_part_for_signal(
+        store: &dyn ObjectStoreBackend,
+        head_tenant: TenantHash,
+        head_signal: Signal,
+        part_tenant: TenantHash,
+        entries: Vec<SnapshotEntry>,
+    ) {
         let part_bytes = ravel_catalog::encode_part(
             part_tenant.0,
             ravel_commit::signal::to_proto(Signal::Metrics) as u32,
@@ -1227,7 +1257,7 @@ mod tests {
         let head = SnapshotHead {
             format_version: ravel_catalog::HEAD_FORMAT_VERSION,
             tenant_hash: head_tenant.0.to_vec(),
-            signal: ravel_commit::signal::to_proto(Signal::Metrics) as u32,
+            signal: ravel_commit::signal::to_proto(head_signal) as u32,
             shard_count: TEST_SHARD + 1,
             watermark_hour: TEST_HOUR,
             parts: vec![SnapshotPartRef {
@@ -1368,6 +1398,37 @@ mod tests {
             store.get_count(&catalog_head_key(&TEST_TENANT, Signal::Metrics)),
             1,
             "the refused HEAD is read once per pass, then cached"
+        );
+        assert_eq!(store.delete_count(), 0, "nothing is deleted");
+    }
+
+    /// A HEAD at this tenant's metrics key whose header names the logs signal
+    /// blocks fail-closed as `Unreadable` before any of its parts is read,
+    /// although the part it names is this tenant's own and names nothing
+    /// here (the answer that, read from that part, would clear the delete).
+    ///
+    /// FLIP: drop the `head.signal` comparison in `ensure_head`. The HEAD is
+    /// then trusted, its part is read, no entry names the candidate, and the
+    /// gate answers `Clear` instead of `Blocked(Unreadable)`.
+    #[tokio::test]
+    async fn other_signal_head_blocks_unreadable_without_reading_parts() {
+        let store = CountingStore::new();
+        plant_head_and_part_for_signal(&store, TEST_TENANT, Signal::Logs, TEST_TENANT, Vec::new())
+            .await;
+        let mut reach = SnapshotReachability::new();
+        let gate = reach
+            .bucket_gate(&store, &candidate_bucket())
+            .await
+            .expect("gate");
+        assert_eq!(
+            gate,
+            SnapshotGate::Blocked(SnapshotBlock::Unreadable),
+            "a HEAD naming another signal blocks fail-closed"
+        );
+        assert_eq!(
+            store.get_count(PART_KEY),
+            0,
+            "no part of an other-signal HEAD is read"
         );
         assert_eq!(store.delete_count(), 0, "nothing is deleted");
     }

@@ -1420,18 +1420,18 @@ requesting tenant.
 
 **Confirm.** The counter, labeled by mode, on `/metrics`. Every increment
 corresponds to a query, a fold tick or a scrub tick that already failed with
-an explicit isolation-fault error. A failed query reached the client; a failed
-fold tick left that tenant's HEAD where it was; a failed scrub tick logged the
-part at `error` and skipped that check for the tick, so a foreign part counts
-again on every scrub tick until it is fixed. The command-line readers,
+an explicit isolation-fault error, or to an on-demand fold whose outcome
+classification refused a foreign part (logged at `warn`). A failed query
+reached the client; a failed fold tick left that tenant's HEAD where it was; a
+failed scrub tick logged the part at `error` and skipped that check for the
+tick, so a foreign part counts again on every scrub tick until it is fixed. The command-line readers,
 `ravel-cli catalog verify`, `ravel-cli catalog fold --rebuild-key-index` and
 the coverage check of `ravel-cli load`, fail with the same error and a
 non-zero exit; they count in their own process, which serves no `/metrics`.
 
-**Action.** Escalate immediately. Every increment is a failed query, fold
-tick or scrub tick and a real isolation fault. The two anomaly counters
-rendered beside it are different: they tally an overlap that the query
-resolves past.
+**Action.** Escalate immediately. Every increment is a real isolation fault.
+The two anomaly counters rendered beside it are different: they tally an
+overlap that the query resolves past.
 
 Coverage is not complete, so a zero reading is not proof of isolation:
 
@@ -1441,22 +1441,29 @@ Coverage is not complete, so a zero reading is not proof of isolation:
   fold, the key-index rebuild, the scrub's covering-postings load and
   seal-divergence check, `ravel-cli catalog verify` and the coverage check of
   `ravel-cli load`. Each checks before it charges the decode to the memory
-  budget, so a budget refusal does not hide a foreign part. The GC
-  reachability sweep also checks, the HEAD and each part, but holds no
-  `Catalog`, so it does not increment this counter: it refuses the HEAD or
-  part, blocks the candidate's delete fail-closed as unreadable (counted on
-  the retention pass report's `blocked_by_unreadable_head`), and logs one
-  `error`-level line, `maintain sweep: snapshot HEAD names another tenant;
-  blocking deletes fail-closed` or `maintain sweep: snapshot part names
-  another tenant; blocking deletes fail-closed`, with the object's `key`,
-  `expected_tenant` and `actual_tenant`. Escalate on either line as on an
-  increment.
-  Three readers decode a part without any tenant-hash check, so a foreign
-  part they read increments nothing: the on-demand fold's
-  read of a part's entry ids, the format-window audit, and `ravel-cli catalog
-  inspect`. The scrub's covering-postings load does not count a
-  tenant-hash mismatch on the postings object itself: it logs it at `error`
-  and skips the postings check for the tick.
+  budget, so a budget refusal does not hide a foreign part. The on-demand
+  fold's read of a part's entry ids also checks and counts here; it then
+  declines to compare entry sets and the route answers `published`, so that
+  increment matches no failed request. The GC reachability sweep checks the
+  HEAD's tenant and signal and each part's tenant, but holds no `Catalog`,
+  so it does not increment this counter: it refuses the HEAD or part, blocks
+  the candidate's delete fail-closed as unreadable (counted on the retention
+  pass report's `blocked_by_unreadable_head`), and logs one `error`-level
+  line, `maintain sweep: snapshot HEAD names another tenant; blocking deletes
+  fail-closed` or `maintain sweep: snapshot part names another tenant;
+  blocking deletes fail-closed` with the object's `key`, `expected_tenant`
+  and `actual_tenant`, or `maintain sweep: snapshot HEAD names another
+  signal; blocking deletes fail-closed` with `key`, `expected_signal` and
+  `actual_signal`. Escalate on any of these lines as on an increment.
+  Two more readers check a part's tenant hash and count nothing, because no
+  `Catalog` exists where they run. The startup format-window audit reports
+  the (tenant, signal) pair as a check that could not run, with a reason
+  naming both tenant hashes and `isolation fault`; under
+  `--format-window-check refuse` startup fails on it, and under `warn` it is
+  logged. `ravel-cli catalog inspect` fails with `refusing to decode a
+  foreign part` and a non-zero exit. The scrub's covering-postings load does
+  not count a tenant-hash mismatch on the postings object itself: it logs it
+  at `error` and skips the postings check for the tick.
 
 ### Shutdown lost acknowledged rows
 

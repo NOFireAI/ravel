@@ -838,6 +838,11 @@ pub async fn inspect(
 /// (docs/catalog-and-mvcc.md, ADR-0063). The report lists every part with its
 /// range and the total part count; a single-part HEAD is the special case of
 /// one part whose range starts at hour 0.
+///
+/// A part whose header names a tenant other than `tenant` fails the command
+/// before its entries are decoded (ADR-0050 §2). Nothing counts it: the
+/// isolation-breach counter lives on a server's `Catalog`, and this command
+/// holds none.
 pub async fn render_inspect(
     store: Arc<dyn ObjectStoreBackend>,
     selection: StoreSelection,
@@ -919,8 +924,19 @@ pub async fn render_inspect(
             .get(&part_ref.key, GetRange::Full)
             .await
             .map_err(|err| anyhow::anyhow!("failed to fetch part {}: {err}", part_ref.key))?;
-        let decoded = ravel_catalog::decode_part(&got.data, &limits)
-            .map_err(|err| anyhow::anyhow!("part {} is corrupt: {err}", part_ref.key))?;
+        let decoded = ravel_catalog::decode_part_for_tenant(&tenant_hash, &got.data, &limits)
+            .map_err(|err| match err {
+                ravel_catalog::PartTenantError::ForeignTenant { expected, actual } => {
+                    anyhow::anyhow!(
+                        "part {} names tenant {actual}, expected {expected}: refusing to decode \
+                         a foreign part",
+                        part_ref.key
+                    )
+                }
+                ravel_catalog::PartTenantError::Corrupt(err) => {
+                    anyhow::anyhow!("part {} is corrupt: {err}", part_ref.key)
+                }
+            })?;
         out.push_str(&format!(
             "    header: format_version={} min_hour={} watermark_hour={} shard_count={} entry_count={} entries_uncompressed_len={}\n",
             decoded.header.format_version,
@@ -1437,6 +1453,98 @@ mod tests {
                  \x20     field=user_id slice=0x0000000000008000..=0xffffffffffffffff entry_count=4 uncovered_count=2 key=t/x/catalog/m/idx/leaf8000.kidx\n"
             ),
             "part 1's two slices, got:\n{report}"
+        );
+    }
+
+    /// A HEAD naming a part encoded for another tenant fails `inspect` with
+    /// both tenant hashes in the error, after rendering the parts before it,
+    /// and decodes none of the foreign part's entries.
+    ///
+    /// FLIP: decode with `decode_part` and no tenant check, and the command
+    /// succeeds with an `entries (decoded)` line for the foreign part.
+    #[tokio::test]
+    async fn inspect_refuses_a_foreign_part() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-inspect-foreign";
+        let tenant_hash = TenantId::new(tenant).hash();
+        let foreign_hash = TenantId::new("cli-inspect-foreign-other").hash();
+
+        let mut parts = Vec::new();
+        for (index, (part_tenant, min_hour, watermark_hour)) in
+            [(tenant_hash, 0u32, 5u32), (foreign_hash, 6, 11)]
+                .into_iter()
+                .enumerate()
+        {
+            let part_bytes = ravel_catalog::encode_part(part_tenant.0, 0, 1, watermark_hour, &[])
+                .expect("encode part");
+            let key = format!("t/{}/catalog/m/snap/part{index}.rcs", tenant_hash.to_hex());
+            store
+                .put(
+                    &key,
+                    part_bytes.clone().into(),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("put part");
+            parts.push(SnapshotPartRef {
+                key,
+                blake3: blake3::hash(&part_bytes).as_bytes().to_vec(),
+                size: part_bytes.len() as u64,
+                entry_count: 0,
+                watermark_hour,
+                min_hour,
+                column_stats: None,
+                key_index: Vec::new(),
+            });
+        }
+        let head = SnapshotHead {
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour: 11,
+            parts,
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        store
+            .put(
+                &head_key(&tenant_hash, Signal::Metrics),
+                ravel_catalog::encode_head(&head)
+                    .expect("encode head")
+                    .into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let mut report = String::new();
+        let err = render_inspect(
+            store.clone(),
+            StoreSelection::explicit(crate::store::StoreKind::Memory),
+            tenant,
+            SignalArg::Metrics,
+            &mut report,
+        )
+        .await
+        .expect_err("a foreign part fails the command");
+        let message = err.to_string();
+        assert!(message.contains(&tenant_hash.to_hex()), "{message}");
+        assert!(message.contains(&foreign_hash.to_hex()), "{message}");
+        assert!(
+            message.contains("refusing to decode a foreign part"),
+            "{message}"
+        );
+        assert!(
+            report.contains("part[1] range=6..=11"),
+            "the foreign part's HEAD ref is still rendered, got:\n{report}"
+        );
+        assert_eq!(
+            report.matches("entries (decoded)").count(),
+            1,
+            "only the tenant's own part is decoded, got:\n{report}"
         );
     }
 
