@@ -42,13 +42,14 @@ Subcommands:
                             day-parts corpus's truth.json (pyarrow)
   retention-cutoff          the retention window that expires one strided
                             batch's ingest bucket and not the next (pyarrow)
-  tombstone-check           the hours a census lists retire.tmb keys for
+  tombstone-check           whether every bucket of an hour range that holds
+                            a commit record holds its retire.tmb
+  maint-records             compaction and rewrite records a maintain pass
+                            added to one tenant and signal
   fold-binary               the retired_hour fold binary's SHA and whether it
                             carries run.toml's c1_sha and r2_sha
   day-parts-stamp           entries and slices per day part from a state's
                             catalog stamp
-  admin-fold                POST /api/v1/admin/fold, retrying a throttled
-                            answer
 
 Every failure exits non-zero with one line on stderr.
 """
@@ -1454,32 +1455,91 @@ def hour_index(stamp):
     return int(t.timestamp()) // 3600
 
 
-def tombstoned_hours(keys_lines, tenant_hash, signal_code):
-    """Hours (unix hours) of every retire.tmb key the census lists for one
-    tenant and signal: t/<hash>/<signal>/c/<shard>/<YYYYMMDDTHH>/retire.tmb."""
-    hours = set()
+def bucket_files(keys_lines, tenant_hash, signal_code):
+    """{(shard, hour): {filename}} of every key the census lists under one
+    tenant and signal's commit prefix,
+    t/<hash>/<signal>/c/<shard>/<YYYYMMDDTHH>/<filename> (hour in unix hours)."""
+    buckets = {}
     for line in keys_lines:
         key = line.rstrip("\n").split("\t")[-1]
         parts = key.split("/")
         if (len(parts) == 7 and parts[0] == "t" and parts[1] == tenant_hash and parts[2] == signal_code
-                and parts[3] == "c" and parts[6] == "retire.tmb"):
-            hours.add(hour_index(parts[5]))
-    return hours
+                and parts[3] == "c"):
+            buckets.setdefault((parts[4], hour_index(parts[5])), set()).add(parts[6])
+    return buckets
+
+
+def tombstone_gaps(buckets, first, last):
+    """(missing, extra, bare_hours) for a retirement of hours [first, last]:
+    the (shard, hour) buckets in the range that hold a commit record (any
+    .cmt) and no retire.tmb; the buckets outside it that hold one; and the
+    hours in it with no commit-holding bucket at all, where no tombstone
+    can be checked."""
+    missing, extra, held = [], [], set()
+    for (shard, hour), files in sorted(buckets.items()):
+        inside = first <= hour <= last
+        if inside and any(f.endswith(".cmt") for f in files):
+            held.add(hour)
+            if "retire.tmb" not in files:
+                missing.append((shard, hour))
+        if not inside and "retire.tmb" in files:
+            extra.append((shard, hour))
+    return missing, extra, [h for h in range(first, last + 1) if h not in held]
 
 
 def cmd_tombstone_check(args):
-    """Exit 0 printing the tombstoned hours when the census lists retirement
-    tombstones for exactly hours [--first, --last] of the tenant's signal;
-    exit 1 naming the difference otherwise (none yet, or more than asked)."""
+    """Exit 0 when every (shard, hour) bucket of hours [--first, --last]
+    that holds a commit record also holds its retire.tmb, and no bucket
+    outside them does; exit 1 naming the buckets otherwise (not yet, or
+    more than asked); exit 65 when an hour in the range holds no commit
+    record in any shard, which no wait changes."""
     try:
         with open(args.keys) as f:
-            got = tombstoned_hours(f, args.tenant_hash, args.signal_code)
+            buckets = bucket_files(f, args.tenant_hash, args.signal_code)
     except (OSError, ValueError) as e:
         die(f"tombstone-check: {args.keys}: {e}", 70)
-    want = set(range(args.first, args.last + 1))
-    print(json.dumps({"hours": sorted(got), "want_first": args.first, "want_last": args.last}))
-    if got != want:
-        die(f"tombstone-check: tombstoned hours {sorted(got)} are not exactly {args.first}..={args.last}")
+    missing, extra, bare = tombstone_gaps(buckets, args.first, args.last)
+    tombstoned = sorted(b for b, files in buckets.items() if "retire.tmb" in files)
+    print(json.dumps({"tombstoned": [list(b) for b in tombstoned], "missing": [list(b) for b in missing],
+                      "extra": [list(b) for b in extra], "want_first": args.first, "want_last": args.last}))
+    if bare:
+        die(f"tombstone-check: hours {bare} hold no commit record in any shard", 65)
+    if missing or extra:
+        die(f"tombstone-check: buckets (shard, hour) {missing} hold commit records and no retire.tmb, "
+            f"{extra} outside {args.first}..={args.last} hold one")
+
+
+def maint_records(keys_lines, tenant_hash, signal_code):
+    """Every compaction record (l1.<hash16>.cmt) and rewrite record
+    (rw.<hash16>.cmt) the census lists for one tenant and signal, as
+    {key: (shard, hour)}."""
+    out = {}
+    for (shard, hour), files in bucket_files(keys_lines, tenant_hash, signal_code).items():
+        for f in files:
+            if f.endswith(".cmt") and f.startswith(("l1.", "rw.")):
+                out[f"{shard}/{hour}/{f}"] = (shard, hour)
+    return out
+
+
+def cmd_maint_records(args):
+    """The compaction and rewrite records of one tenant and signal before
+    and after a maintain pass, written to --out; exit 1 naming any record
+    the pass added, since every such bucket is reconciled and its day part
+    re-encoded by the next fold."""
+    try:
+        with open(args.before) as f:
+            before = maint_records(f, args.tenant_hash, args.signal_code)
+        with open(args.after) as f:
+            after = maint_records(f, args.tenant_hash, args.signal_code)
+    except (OSError, ValueError) as e:
+        die(f"maint-records: {e}", 70)
+    new = sorted(k for k in after if k not in before)
+    write_json(args.out, {"tenant_hash": args.tenant_hash, "signal_code": args.signal_code,
+                          "before": sorted(before), "after": sorted(after), "new": new,
+                          "new_hours": sorted({after[k][1] for k in new})})
+    if new:
+        die(f"maint-records: the maintain pass wrote {len(new)} compaction or rewrite records "
+            f"(shard/hour/file): {new[:10]}")
 
 
 def git_commit(repo, ref):
@@ -1562,40 +1622,6 @@ def cmd_day_parts_stamp(args):
                 "watermark_hour": (doc.get("head") or {}).get("watermark_hour"),
                 "days": sorted({p["day"] for p in parts if p["day"] is not None}),
                 "parts": parts, "part_count": len(parts)})
-
-
-# Statuses of POST /api/v1/admin/fold (FoldOutcome,
-# services/ravel-server/src/fold_on_demand.rs). Throttled is retried.
-ADMIN_FOLD_DONE = ("published", "nothing_eligible")
-
-
-def cmd_admin_fold(args):
-    """POST /api/v1/admin/fold for the tenant the auth file names, retrying
-    a throttled answer every --retry-s up to --tries times. Writes the last
-    response body (JSON) to --out; exit 0 on published or nothing_eligible,
-    1 on any other status, HTTP error or exhausted retries."""
-    with open(os.path.join(args.auth_dir, f"{args.tenant}.auth")) as f:
-        name, _, value = f.read().strip().partition(": ")
-    body = json.dumps({"signal": args.signal}).encode()
-    doc = None
-    for attempt in range(args.tries):
-        req = urllib.request.Request(args.server.rstrip("/") + "/api/v1/admin/fold", data=body, method="POST",
-                                     headers={name: value, "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=args.timeout) as r:
-                doc = json.loads(r.read().decode())
-        except urllib.error.HTTPError as e:
-            write_json(args.out, {"http_status": e.code, "body": e.read().decode(errors="replace")})
-            die(f"admin-fold: HTTP {e.code}")
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            die(f"admin-fold: {e}")
-        doc["attempts"] = attempt + 1
-        if doc.get("status") != "throttled":
-            break
-        time.sleep(args.retry_s)
-    write_json(args.out, doc)
-    if doc.get("status") not in ADMIN_FOLD_DONE:
-        die(f"admin-fold: status {doc.get('status')!r} after {doc.get('attempts')} attempts")
 
 
 def cmd_kv_report(args):
@@ -1839,6 +1865,14 @@ def main():
     tc.add_argument("--last", type=int, required=True)
     tc.set_defaults(fn=cmd_tombstone_check)
 
+    mr = sub.add_parser("maint-records")
+    mr.add_argument("--before", required=True, help="census keys file before the maintain pass")
+    mr.add_argument("--after", required=True, help="census keys file after it")
+    mr.add_argument("--tenant-hash", required=True)
+    mr.add_argument("--signal-code", default="l")
+    mr.add_argument("--out", required=True)
+    mr.set_defaults(fn=cmd_maint_records)
+
     fb = sub.add_parser("fold-binary")
     fb.add_argument("--repo", required=True)
     fb.add_argument("--sha", required=True)
@@ -1852,17 +1886,6 @@ def main():
     dps.add_argument("--state", required=True)
     dps.add_argument("--label", required=True)
     dps.set_defaults(fn=cmd_day_parts_stamp)
-
-    af = sub.add_parser("admin-fold")
-    af.add_argument("--server", required=True)
-    af.add_argument("--auth-dir", required=True)
-    af.add_argument("--tenant", required=True)
-    af.add_argument("--signal", default="logs")
-    af.add_argument("--tries", type=int, default=20)
-    af.add_argument("--retry-s", type=float, default=30)
-    af.add_argument("--timeout", type=float, default=3600)
-    af.add_argument("--out", required=True)
-    af.set_defaults(fn=cmd_admin_fold)
 
     kv = sub.add_parser("kv-report")
     kv.add_argument("--log", required=True)
