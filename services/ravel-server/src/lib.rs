@@ -53,6 +53,8 @@ pub mod mem_stats;
 pub mod memory_gate;
 pub mod metadata_sink_task;
 pub mod metrics;
+#[cfg(feature = "sql")]
+pub mod nofile;
 pub mod normalize_reject_metrics;
 #[cfg(feature = "otap")]
 pub mod otap_grpc;

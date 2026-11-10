@@ -54,6 +54,7 @@ mod audit_scan;
 mod audit_schema;
 mod avg;
 mod bounded_topk;
+mod bucket_spill_tuning;
 mod bucketed_final_aggregate;
 mod clock;
 mod compact_slices;
@@ -143,9 +144,15 @@ pub use audit_schema::{
     AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
 };
 pub use bounded_topk::{BOUNDED_TOPK_AGGREGATE_RULE, BoundedTopKAggregate};
+pub use bucket_spill_tuning::{
+    BUCKET_SPILL_MAX_CHUNK_ROWS, BUCKET_SPILL_MIN_CHUNK_ROWS, BucketSpillInputs,
+    BucketSpillPlanShape, BucketSpillTuning, NoTuning, derive_bucket_spill_tuning,
+    routed_chunk_charge, spill_consumers, spill_slots,
+};
 pub use bucketed_final_aggregate::{
-    BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX, BUCKETED_FINAL_AGGREGATE_MAX_BITS,
-    BUCKETED_FINAL_AGGREGATE_RULE, BucketedFinalAggregateExec, BucketedFinalAggregateRule,
+    BUCKET_SPILL_BYTES_READ, BUCKET_SPILL_UNDERSHOOT, BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX,
+    BUCKETED_FINAL_AGGREGATE_MAX_BITS, BUCKETED_FINAL_AGGREGATE_RULE, BucketedFinalAggregateExec,
+    BucketedFinalAggregateRule,
 };
 pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};

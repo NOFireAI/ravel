@@ -1655,3 +1655,471 @@ async fn per_bucket_topk_releases_the_pending_bucket_output() {
     drop(started_cut);
     drop(started_uncut);
 }
+
+// ---------------------------------------------------------------------------
+// Bucket spill (ADR-3565 amendment 2)
+// ---------------------------------------------------------------------------
+
+/// `plan` with every bucketed exec rebuilt to spill.
+fn spilling(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    if let Some(exec) = plan.downcast_ref::<BucketedFinalAggregateExec>() {
+        return Arc::new(
+            BucketedFinalAggregateExec::new(Arc::clone(exec.aggregate()), exec.config())
+                .with_topk(exec.topk().cloned())
+                .with_spill(true),
+        );
+    }
+    let children: Vec<Arc<dyn ExecutionPlan>> = plan.children().into_iter().map(spilling).collect();
+    if children.is_empty() {
+        return Arc::clone(plan);
+    }
+    Arc::clone(plan)
+        .replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .expect("rewired")
+}
+
+/// A task context over `pool` whose disk manager writes into `dir`, up to
+/// `quota` bytes.
+fn spill_task_ctx(
+    planned: &Planned,
+    pool: Arc<dyn MemoryPool>,
+    dir: &std::path::Path,
+    quota: u64,
+) -> Arc<TaskContext> {
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(pool)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default()
+                .with_mode(DiskManagerMode::Directories(vec![dir.to_path_buf()]))
+                .with_max_temp_directory_size(quota),
+        )
+        .build_arc()
+        .expect("runtime");
+    let ctx = Arc::try_unwrap(planned.ctx.task_ctx()).unwrap_or_else(|_| panic!("unshared"));
+    Arc::new(ctx.with_runtime(runtime))
+}
+
+/// What a spilled run of a plan's bucketed exec reported.
+#[derive(Debug)]
+struct SpillRun {
+    rows: Vec<String>,
+    routed_rows: usize,
+    spilled_rows: usize,
+    spilled_bytes: usize,
+    spill_files: usize,
+    bytes_read: usize,
+    /// The largest charge a bucketed consumer held.
+    peak: usize,
+    refusals: usize,
+}
+
+/// A pool that refuses a bucketed consumer's grow past `cap` bytes, as the
+/// spill-mode pool refuses one past its fair share, and counts that
+/// consumer's grows and peak.
+#[derive(Debug)]
+struct CappedPool {
+    inner: datafusion::execution::memory_pool::UnboundedMemoryPool,
+    cap: usize,
+    bucket_grows: AtomicUsize,
+    refusals: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl CappedPool {
+    fn new(cap: usize) -> Self {
+        CappedPool {
+            inner: Default::default(),
+            cap,
+            bucket_grows: AtomicUsize::new(0),
+            refusals: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl fmt::Display for CappedPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "capped({})", self.cap)
+    }
+}
+
+impl MemoryPool for CappedPool {
+    fn name(&self) -> &str {
+        "capped"
+    }
+
+    fn grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) {
+        if reservation
+            .consumer()
+            .name()
+            .starts_with(BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX)
+        {
+            self.bucket_grows.fetch_add(1, Ordering::SeqCst);
+            self.peak
+                .fetch_max(reservation.size() + additional, Ordering::SeqCst);
+        }
+        self.inner.grow(reservation, additional);
+    }
+
+    fn shrink(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        shrink: usize,
+    ) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) -> DFResult<()> {
+        if reservation
+            .consumer()
+            .name()
+            .starts_with(BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX)
+        {
+            let after = reservation.size() + additional;
+            if after > self.cap {
+                self.refusals.fetch_add(1, Ordering::SeqCst);
+                return Err(datafusion::error::DataFusionError::ResourcesExhausted(
+                    format!(
+                        "{} over its fair share: {after} > {}",
+                        reservation.consumer().name(),
+                        self.cap
+                    ),
+                ));
+            }
+            self.bucket_grows.fetch_add(1, Ordering::SeqCst);
+            self.peak.fetch_max(after, Ordering::SeqCst);
+        }
+        self.inner.try_grow(reservation, additional)
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+}
+
+async fn run_spilled(planned: &Planned, partitions: usize, cap: usize) -> DFResult<SpillRun> {
+    run_spilled_within(planned, partitions, cap, 1 << 30).await
+}
+
+/// Run `planned` with spill on, under a pool that caps the bucketed
+/// consumers at `cap` and a scratch quota of `quota` bytes, asserting the
+/// pool and the scratch directory are back at zero whatever the outcome.
+async fn run_spilled_within(
+    planned: &Planned,
+    partitions: usize,
+    cap: usize,
+    quota: u64,
+) -> DFResult<SpillRun> {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let capped = Arc::new(CappedPool::new(cap));
+    let pool: Arc<dyn MemoryPool> = Arc::clone(&capped) as Arc<dyn MemoryPool>;
+    let plan = spilling(&planned.physical);
+    let task_ctx = spill_task_ctx(planned, Arc::clone(&pool), dir.path(), quota);
+    let result = collect(Arc::clone(&plan), task_ctx).await;
+    let exec = find_bucketed(&plan).expect("a bucketed exec");
+    // After a failure the other partitions' tasks release the runtime, and
+    // with it the disk manager's directory, as the runtime cancels them.
+    let left = || std::fs::read_dir(dir.path()).expect("reads").count();
+    for _ in 0..500 {
+        if pool.reserved() == 0 && left() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(pool.reserved(), 0, "bytes left reserved");
+    let left = left();
+    assert_eq!(left, 0, "scratch files left under the scratch directory");
+    let batches = result?;
+    let metrics = exec.metrics().expect("metrics");
+    Ok(SpillRun {
+        rows: render_sorted(&batches),
+        routed_rows: counter_by_partition(&exec, "routed_rows", partitions)
+            .iter()
+            .sum(),
+        spilled_rows: metrics.spilled_rows().unwrap_or(0),
+        spilled_bytes: metrics.spilled_bytes().unwrap_or(0),
+        spill_files: metrics.spill_count().unwrap_or(0),
+        bytes_read: counter_by_partition(&exec, ravel_sql::BUCKET_SPILL_BYTES_READ, partitions)
+            .iter()
+            .sum(),
+        peak: capped.peak.load(Ordering::SeqCst),
+        refusals: capped.refusals.load(Ordering::SeqCst),
+    })
+}
+
+/// Where a spilling run's trigger fires, with the tuning and the bucketed
+/// consumers' cap that make it fire there on `SAMPLES_SQL` at 2 partitions.
+#[derive(Debug, Clone, Copy)]
+struct Trigger {
+    name: &'static str,
+    engage_groups: usize,
+    bits: u8,
+    cap_at_two: usize,
+    /// Whether the cap follows the rows a stream holds. The phase 2 cap must
+    /// hold one bucket's table, whose hash allocation grows in steps, so it
+    /// stays put.
+    scales: bool,
+}
+
+/// The table engages at 64 groups; a refusal after that writes the retained
+/// chunks of the buckets not yet aggregated.
+const PHASE_2: Trigger = Trigger {
+    name: "phase 2",
+    engage_groups: ENGAGE_GROUPS,
+    bits: 5,
+    cap_at_two: 512 << 10,
+    scales: false,
+};
+
+/// The table never reaches its engage threshold; the refusal routes the stock
+/// table to the bucket files.
+const PHASE_1: Trigger = Trigger {
+    name: "phase 1",
+    engage_groups: 1 << 20,
+    bits: 2,
+    cap_at_two: 1 << 20,
+    scales: true,
+};
+
+const SPILL_CHUNK_ROWS: usize = 1024;
+
+impl Trigger {
+    fn tuning(self) -> BucketedFinalAggregation {
+        BucketedFinalAggregation {
+            engage_groups: self.engage_groups,
+            bits: self.bits,
+            routed_chunk_rows: SPILL_CHUNK_ROWS,
+        }
+    }
+
+    /// The cap at `partitions` streams, each holding `2 / partitions` of the
+    /// rows a stream holds at 2.
+    fn cap(self, partitions: usize) -> usize {
+        if self.scales {
+            self.cap_at_two * 2 / partitions
+        } else {
+            self.cap_at_two
+        }
+    }
+}
+
+/// Unique keys, and keys NULL on every seventh row.
+const NULL_KEYED_SQL: &str = "SELECT CASE WHEN arrow_cast(ts, 'Int64') % 7 = 0 THEN NULL \
+                              ELSE arrow_cast(ts, 'Int64') END AS k, count(*) AS c \
+                              FROM samples GROUP BY k";
+
+/// The answer of `sql` with the bucketed final aggregate off.
+async fn unspilled_rows(sql: &str, partitions: usize) -> Vec<String> {
+    let off = Planned::new(sql, sql_config(partitions, None, None)).await;
+    let batches = collect(Arc::clone(&off.physical), off.ctx.task_ctx())
+        .await
+        .expect("unspilled run");
+    render_sorted(&batches)
+}
+
+/// A spilled run of `sql` that the trigger makes spill.
+async fn spilled(sql: &str, partitions: usize, trigger: Trigger) -> SpillRun {
+    let planned = Planned::new(sql, sql_config(partitions, Some(trigger.tuning()), None)).await;
+    let run = run_spilled(&planned, partitions, trigger.cap(partitions))
+        .await
+        .unwrap_or_else(|e| panic!("{} at {partitions} partitions: {e}", trigger.name));
+    assert!(
+        run.spilled_rows > 0,
+        "{} at {partitions} partitions spilled nothing: {run:?}",
+        trigger.name
+    );
+    run
+}
+
+#[tokio::test]
+async fn bucket_spill_matches_in_memory_answer() {
+    // The NULL-keyed fixture's stock table holds 6/7 of the unique fixture's
+    // groups, so the phase 1 share is scaled to match.
+    for (sql, share) in [(SAMPLES_SQL, (1, 1)), (NULL_KEYED_SQL, (6, 7))] {
+        for partitions in [2, 4] {
+            let expected = unspilled_rows(sql, partitions).await;
+            for trigger in [PHASE_2, PHASE_1] {
+                let trigger = Trigger {
+                    cap_at_two: if trigger.scales {
+                        trigger.cap_at_two * share.0 / share.1
+                    } else {
+                        trigger.cap_at_two
+                    },
+                    ..trigger
+                };
+                let run = spilled(sql, partitions, trigger).await;
+                assert_eq!(
+                    run.rows, expected,
+                    "{sql}: {} at {partitions} partitions",
+                    trigger.name
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bucket_spill_writes_each_routed_row_once() {
+    for trigger in [PHASE_2, PHASE_1] {
+        let run = spilled(SAMPLES_SQL, 2, trigger).await;
+        assert_eq!(run.rows.len(), SAMPLES as usize, "{}", trigger.name);
+        assert_eq!(
+            run.routed_rows, SAMPLES as usize,
+            "{}: every unique key reaches the files",
+            trigger.name
+        );
+        assert_eq!(
+            run.spilled_rows, run.routed_rows,
+            "{}: rows written against rows routed",
+            trigger.name
+        );
+    }
+}
+
+/// `R x w + 2^bits x c x w` per stream: the routed rows once plus one chunk
+/// per bucket, plus each message's framing. `w` is 16 here, a timestamp key
+/// and an `Int64` count.
+#[tokio::test]
+async fn bucket_spill_disk_within_write_once_bound() {
+    const PARTITIONS: usize = 2;
+    const ROW_BYTES: usize = 16;
+    const FRAMING_PER_MESSAGE: usize = 512;
+    for trigger in [PHASE_2, PHASE_1] {
+        let run = spilled(SAMPLES_SQL, PARTITIONS, trigger).await;
+        let buckets = PARTITIONS << trigger.bits;
+        let messages = run.routed_rows.div_ceil(SPILL_CHUNK_ROWS) + buckets;
+        let bound = run.routed_rows * ROW_BYTES
+            + buckets * SPILL_CHUNK_ROWS * ROW_BYTES
+            + messages * FRAMING_PER_MESSAGE;
+        assert!(
+            run.spilled_bytes <= bound,
+            "{}: {} bytes written over the {bound}-byte bound",
+            trigger.name,
+            run.spilled_bytes
+        );
+        assert_eq!(
+            run.bytes_read, run.spilled_bytes,
+            "{}: each file read once, whole",
+            trigger.name
+        );
+        assert!(
+            run.spill_files <= buckets,
+            "{}: {} files for {buckets} buckets",
+            trigger.name,
+            run.spill_files
+        );
+    }
+}
+
+#[tokio::test]
+async fn bucket_spill_peak_within_share() {
+    for trigger in [PHASE_2, PHASE_1] {
+        let run = spilled(SAMPLES_SQL, 2, trigger).await;
+        assert!(
+            run.refusals > 0,
+            "{}: the share never refused",
+            trigger.name
+        );
+        assert!(
+            run.peak <= trigger.cap(2),
+            "{}: peak charge {} over the {}-byte share",
+            trigger.name,
+            run.peak,
+            trigger.cap(2)
+        );
+    }
+}
+
+/// At a quarter of the phase 2 share the stream runs out of routed state to
+/// write while its groups keep arriving.
+#[tokio::test]
+async fn bucket_spill_late_groups_fail_typed() {
+    let planned = Planned::new(SAMPLES_SQL, sql_config(2, Some(PHASE_2.tuning()), None)).await;
+    let err = run_spilled(&planned, 2, PHASE_2.cap(2) / 4)
+        .await
+        .expect_err("the under-shoot fails the stream");
+    let root = err.find_root();
+    assert!(
+        matches!(
+            root,
+            datafusion::error::DataFusionError::ResourcesExhausted(_)
+        ),
+        "not ResourcesExhausted: {err}"
+    );
+    assert!(
+        err.to_string().contains(ravel_sql::BUCKET_SPILL_UNDERSHOOT),
+        "untyped under-shoot: {err}"
+    );
+}
+
+#[tokio::test]
+async fn bucket_spill_quota_is_typed() {
+    let planned = Planned::new(SAMPLES_SQL, sql_config(2, Some(PHASE_2.tuning()), None)).await;
+    let err = run_spilled_within(&planned, 2, PHASE_2.cap(2), 64 << 10)
+        .await
+        .expect_err("the quota refuses a write");
+    assert!(
+        err.to_string().contains("exceeded the allowable limit"),
+        "not the disk manager's quota refusal: {err}"
+    );
+}
+
+/// Dropping the streams with bucket files on disk returns the pool, the
+/// disk manager's count and the scratch directory to zero.
+#[tokio::test]
+async fn bucket_spill_cancel_releases_share_and_scratch() {
+    const PARTITIONS: usize = 2;
+    let planned = Planned::new(
+        SAMPLES_SQL,
+        sql_config(PARTITIONS, Some(PHASE_2.tuning()), None),
+    )
+    .await;
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let pool: Arc<dyn MemoryPool> = Arc::new(CappedPool::new(PHASE_2.cap(PARTITIONS)));
+    let plan = spilling(&planned.physical);
+    let task_ctx = spill_task_ctx(&planned, Arc::clone(&pool), dir.path(), 1 << 30);
+    let exec = find_bucketed(&plan).expect("a bucketed exec");
+    let firsts = (0..PARTITIONS).map(|partition| {
+        let exec = Arc::clone(&exec);
+        let task_ctx = Arc::clone(&task_ctx);
+        async move {
+            let mut stream = exec.execute(partition, task_ctx).expect("executes");
+            let first = stream.next().await.expect("a first batch").expect("batch");
+            (stream, first.num_rows())
+        }
+    });
+    let started = futures::future::join_all(firsts).await;
+    let disk = Arc::clone(&task_ctx.runtime_env().disk_manager);
+    assert!(
+        disk.used_disk_space() > 0,
+        "no bucket file on disk mid-drain"
+    );
+    assert!(pool.reserved() > 0, "nothing reserved mid-drain");
+
+    drop(started);
+    for _ in 0..500 {
+        if pool.reserved() == 0 && disk.used_disk_space() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(pool.reserved(), 0, "bytes left reserved after the drop");
+    assert_eq!(disk.used_disk_space(), 0, "scratch bytes left counted");
+    for scratch in disk.temp_dir_paths() {
+        let left = std::fs::read_dir(&scratch).map_or(0, |entries| entries.count());
+        assert_eq!(left, 0, "files left under {}", scratch.display());
+    }
+}
