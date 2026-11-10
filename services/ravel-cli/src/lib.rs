@@ -75,7 +75,9 @@ pub fn parse_retention_default_ns(s: &str) -> Result<i64, String> {
     let dur = humantime::parse_duration(s)
         .map_err(|e| format!("invalid --retention-default '{s}': {e}"))?;
     match i64::try_from(dur.as_nanos()) {
-        Ok(0) => Err(format!("--retention-default '{s}' must be greater than zero")),
+        Ok(0) => Err(format!(
+            "--retention-default '{s}' must be greater than zero"
+        )),
         Ok(ns) => Ok(ns),
         Err(_) => Err(format!("--retention-default '{s}' is too large")),
     }

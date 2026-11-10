@@ -152,12 +152,11 @@ async fn second_fold_after_out_of_window_tombstone(
 /// the frontier reconcile lists hour 5, applies its tombstone, and hour 5's
 /// entry leaves HEAD. The same fold without the flag has no retention window,
 /// lists no frontier hour, and HEAD keeps naming hour 5. Passing `None` in
-/// place of the flag's value in `fold_with_retention_default` (the flag
-/// ignored) fails the first half's assertions.
+/// place of `default_retention_ns` at the `fold_with_seal_through` call in
+/// `catalog::fold_core` (the flag ignored) fails the first half's assertions.
 #[tokio::test]
 async fn a_cli_fold_with_retention_default_reconciles_a_frontier_tombstone() {
-    let retention_default_ns =
-        ravel_cli::parse_retention_default_ns("200h").expect("200h parses");
+    let retention_default_ns = ravel_cli::parse_retention_default_ns("200h").expect("200h parses");
     assert_eq!(retention_default_ns, 200 * NS_PER_HOUR);
 
     let with_flag = second_fold_after_out_of_window_tombstone(
