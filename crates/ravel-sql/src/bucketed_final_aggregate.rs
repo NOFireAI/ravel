@@ -80,10 +80,30 @@
 //! their `size()` after each batch. One transient is not charged: under a
 //! TopK, the evaluated bucket batch and the sort's index vector are held
 //! uncharged while `cut_to_topk` runs, at most one bucket's evaluated output
-//! per partition, and only the cut result is charged as pending output. A
-//! refused grow fails the stream with the pool's `ResourcesExhausted`,
-//! prefixed with the consumer's name. Nothing spills. Every byte is released
-//! as its bucket is emitted, and all of it when the stream drops.
+//! per partition, and only the cut result is charged as pending output.
+//! Without spill, a refused grow fails the stream with the pool's
+//! `ResourcesExhausted`, prefixed with the consumer's name. Every byte is
+//! released as its bucket is emitted, and all of it when the stream drops.
+//!
+//! # Bucket spill (ADR-3565 amendment 2)
+//!
+//! [`BucketedFinalAggregateExec::with_spill`] is the refusal retry's mode: the
+//! consumer registers `with_can_spill(true)` and a refused charge is a spill
+//! trigger instead of an error. The stream writes every chunk it retains, for
+//! every bucket it has not started aggregating, to that bucket's scratch
+//! file, releases their charge and asks again; from then on each chunk is
+//! written when it fills and each bucket's last chunk when input ends. A
+//! refusal while the stream still holds its stock table first routes that
+//! table's state straight to the files in slices of `routed_chunk_rows`
+//! rows, under the table's own charge and with no grow, then asks again.
+//! When input ends each bucket is read back from its file, aggregated alone,
+//! emitted, and its file deleted before the next bucket starts, so every
+//! routed row is written at most once and nothing is merged. A refusal with
+//! nothing left to write fails the stream with `ResourcesExhausted` naming
+//! [`BUCKET_SPILL_UNDERSHOOT`], unless the pool refused over its spill-mode
+//! hard bound, whose message passes through unchanged. Scratch files come
+//! from the session's disk manager, so its quota and its typed failures
+//! apply, and a dropped stream deletes them.
 //!
 //! # Yielding and output
 //!
@@ -101,10 +121,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
-use datafusion::arrow::array::{Array, ArrayData, ArrayRef, MutableArrayData, make_array};
+use datafusion::arrow::array::{
+    Array, ArrayData, ArrayRef, MutableArrayData, UInt32Array, make_array,
+};
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer};
-use datafusion::arrow::compute::{lexsort_to_indices, take_record_batch};
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::compute::{lexsort_to_indices, take, take_record_batch};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::arrow::util::bit_util;
 use datafusion::common::Result as DFResult;
@@ -113,6 +135,7 @@ use datafusion::common::hash_utils::{RandomState, create_hashes};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::spill_file::SpillFile;
 use datafusion::execution::{RecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Aggregate, EmitTo, GroupsAccumulator};
 use datafusion::physical_expr::PhysicalExpr;
@@ -125,12 +148,13 @@ use datafusion::physical_plan::aggregates::{
 };
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
+    SpillMetrics,
 };
 use datafusion::physical_plan::{
     ChildStats, ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
     InputDistributionRequirements, InputOrderMode, PlanProperties, ReplaceChildrenOptions,
-    SendableRecordBatchStream, Statistics, StatisticsArgs,
+    SendableRecordBatchStream, SpillManager, Statistics, StatisticsArgs,
 };
 use futures::{Stream, StreamExt};
 
@@ -152,6 +176,18 @@ pub const BUCKETED_FINAL_AGGREGATE_MAX_BITS: u8 = 16;
 /// The seed of the bucket hash. Any value but the repartition exchange's 0
 /// (`REPARTITION_RANDOM_STATE`) decorrelates the bucket from the partition.
 const BUCKET_HASH_SEED: u64 = 0x5241_5645_4c42_4b54;
+
+/// The phrase a bucket spill's terminal refusal carries in its
+/// `ResourcesExhausted` message: the stream had nothing left to write and a
+/// bucket still did not fit (ADR-3565 amendment 2 item 5).
+pub const BUCKET_SPILL_UNDERSHOOT: &str = "bucket spill under-shoot";
+
+/// The phrase of the spill-mode pool's refusal over its hard bound
+/// (`memory.rs`), which is not an under-shoot whatever the stream held.
+const SPILL_MODE_HARD_BOUND: &str = "over the spill-mode hard bound";
+
+/// The name of the exec's counter of bytes read back from its scratch files.
+pub const BUCKET_SPILL_BYTES_READ: &str = "bucket_spill_bytes_read";
 
 /// Replaces every qualifying `FinalPartitioned` [`AggregateExec`] with a
 /// [`BucketedFinalAggregateExec`]. See the module docs.
@@ -298,6 +334,7 @@ pub struct BucketedFinalAggregateExec {
     aggregate: Arc<AggregateExec>,
     config: BucketedFinalAggregation,
     topk: Option<TopKPrefilter>,
+    spill: bool,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -312,8 +349,22 @@ impl BucketedFinalAggregateExec {
             aggregate,
             config,
             topk: None,
+            spill: false,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Spill routed state to the session's disk manager on a refused charge
+    /// (the module docs' bucket spill), the refusal retry's mode. Without a
+    /// disk manager that can create files the exec runs as without spill.
+    pub fn with_spill(mut self, spill: bool) -> Self {
+        self.spill = spill;
+        self
+    }
+
+    /// Whether the exec spills on a refused charge.
+    pub fn spill(&self) -> bool {
+        self.spill
     }
 
     /// Cut each routed bucket's output to its own top `topk.fetch()` rows
@@ -339,6 +390,56 @@ impl BucketedFinalAggregateExec {
     /// The tuning this exec runs with.
     pub fn config(&self) -> BucketedFinalAggregation {
         self.config
+    }
+}
+
+/// The tuning and the bytes read back of the spilling bucketed execs in a
+/// plan, which the spill retry's report carries as its bucket phase beside
+/// the typed spill metrics `accumulate_spill_counts` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BucketSpillFigures {
+    pub(crate) bits: u8,
+    pub(crate) routed_chunk_rows: usize,
+    pub(crate) bytes_read: u64,
+}
+
+/// [`BucketSpillFigures`] of `plan`, or `None` when no bucketed exec in it
+/// runs with spill on.
+pub(crate) fn bucket_spill_figures(plan: &Arc<dyn ExecutionPlan>) -> Option<BucketSpillFigures> {
+    let mut found = None;
+    collect_bucket_spill_figures(plan, &mut found);
+    found
+}
+
+fn collect_bucket_spill_figures(
+    plan: &Arc<dyn ExecutionPlan>,
+    found: &mut Option<BucketSpillFigures>,
+) {
+    if let Some(exec) = plan.downcast_ref::<BucketedFinalAggregateExec>()
+        && exec.spill()
+    {
+        let bytes_read = plan.metrics().map_or(0, |metrics| {
+            metrics
+                .iter()
+                .filter_map(|metric| match metric.value() {
+                    MetricValue::Count { name, count }
+                        if name.as_ref() == BUCKET_SPILL_BYTES_READ =>
+                    {
+                        Some(count.value() as u64)
+                    }
+                    _ => None,
+                })
+                .sum()
+        });
+        let figures = found.get_or_insert(BucketSpillFigures {
+            bits: exec.config.bits,
+            routed_chunk_rows: exec.config.routed_chunk_rows,
+            bytes_read: 0,
+        });
+        figures.bytes_read += bytes_read;
+    }
+    for child in plan.children() {
+        collect_bucket_spill_figures(child, found);
     }
 }
 
@@ -377,6 +478,9 @@ impl DisplayAs for BucketedFinalAggregateExec {
                 )?;
                 if let Some(topk) = &self.topk {
                     write!(f, ", topk=[{}], k={}", topk.ordering(), topk.fetch())?;
+                }
+                if self.spill {
+                    write!(f, ", spill=true")?;
                 }
                 Ok(())
             }
@@ -433,7 +537,8 @@ impl ExecutionPlan for BucketedFinalAggregateExec {
         };
         Ok(Arc::new(
             BucketedFinalAggregateExec::new(Arc::new(aggregate.clone()), self.config)
-                .with_topk(self.topk.clone()),
+                .with_topk(self.topk.clone())
+                .with_spill(self.spill),
         ))
     }
 
@@ -446,6 +551,14 @@ impl ExecutionPlan for BucketedFinalAggregateExec {
             .aggregate
             .input()
             .execute(partition, Arc::clone(&context))?;
+        let spill =
+            (self.spill && context.runtime_env().disk_manager.tmp_files_enabled()).then(|| {
+                SpillCounters {
+                    spill: SpillMetrics::new(&self.metrics, partition),
+                    bytes_read: MetricBuilder::new(&self.metrics)
+                        .counter(BUCKET_SPILL_BYTES_READ, partition),
+                }
+            });
         let stream = BucketedStream::try_new(
             &self.aggregate,
             self.config,
@@ -454,6 +567,7 @@ impl ExecutionPlan for BucketedFinalAggregateExec {
             partition,
             &context,
             BucketMetrics::new(&self.metrics, partition),
+            spill,
         )?;
         Ok(Box::pin(stream))
     }
@@ -667,11 +781,14 @@ impl Router {
 
     /// Route `columns` (keys, then every accumulator's state, in the router's
     /// order) into the buckets, charging each new chunk to `reservation`
-    /// before a row is written to it.
+    /// before a row is written to it. With `spill`, a refused chunk is a
+    /// spill trigger, and once one has fired every chunk is written when it
+    /// fills.
     fn route(
         &mut self,
         columns: &[ArrayRef],
         reservation: &mut MemoryReservation,
+        mut spill: Option<&mut BucketSpill>,
     ) -> DFResult<usize> {
         if columns.len() != self.types.len() {
             return Err(DataFusionError::Internal(format!(
@@ -709,16 +826,66 @@ impl Router {
             });
         }
 
+        self.sort_by_bucket(columns, rows)?;
+
+        let bucket_count = self.buckets.len();
+        for bucket in 0..bucket_count {
+            let (start, end) = (self.offsets[bucket], self.offsets[bucket + 1]);
+            let mut done = start;
+            while done < end {
+                if self.buckets[bucket]
+                    .open
+                    .as_ref()
+                    .is_none_or(|open| open.len == self.chunk_rows)
+                {
+                    if let Some(full) = self.buckets[bucket].open.take() {
+                        let sealed = full.seal()?;
+                        match spill.as_deref_mut() {
+                            Some(spill) if spill.triggered => {
+                                spill.write(bucket, sealed.columns)?;
+                                reservation.shrink(sealed.charged);
+                            }
+                            _ => self.buckets[bucket].sealed.push(sealed),
+                        }
+                    }
+                    let chunk = OpenChunk::allocate(&self.types, self.chunk_rows);
+                    if let Err(err) = try_grow_named(reservation, chunk.charged) {
+                        let Some(spill) = spill.as_deref_mut() else {
+                            return Err(err);
+                        };
+                        if !is_refusal(&err) {
+                            return Err(err);
+                        }
+                        self.spill_retained(0, reservation, spill)?;
+                        try_grow_named(reservation, chunk.charged).map_err(undershoot)?;
+                    }
+                    self.buckets[bucket].open = Some(chunk);
+                }
+                let target = &mut self.buckets[bucket];
+                let Some(open) = target.open.as_mut() else {
+                    return Err(DataFusionError::Internal(
+                        "BucketedFinalAggregateExec: a bucket has no open chunk".to_string(),
+                    ));
+                };
+                let take = (end - done).min(self.chunk_rows - open.len);
+                open.append(&sources, &self.order[done..done + take]);
+                target.rows += take;
+                done += take;
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Hash `rows` rows of `columns`' keys and counting-sort the row indices
+    /// by bucket into `order`, bucket `b`'s at `offsets[b]..offsets[b + 1]`.
+    fn sort_by_bucket(&mut self, columns: &[ArrayRef], rows: usize) -> DFResult<()> {
         self.hashes.clear();
         self.hashes.resize(rows, 0);
         create_hashes(
-            &columns[..self.key_count],
+            &columns[..self.key_count.min(columns.len())],
             &self.random_state,
             &mut self.hashes,
         )?;
-
-        // Counting sort of the rows by bucket, so each bucket's rows are
-        // appended column by column.
         let bucket_count = self.buckets.len();
         self.offsets.clear();
         self.offsets.resize(bucket_count + 1, 0);
@@ -738,50 +905,176 @@ impl Router {
             self.order[self.next[bucket]] = index as u32;
             self.next[bucket] += 1;
         }
-
-        for bucket in 0..bucket_count {
-            let (start, end) = (self.offsets[bucket], self.offsets[bucket + 1]);
-            let mut done = start;
-            while done < end {
-                let target = &mut self.buckets[bucket];
-                if target
-                    .open
-                    .as_ref()
-                    .is_none_or(|open| open.len == self.chunk_rows)
-                {
-                    if let Some(full) = target.open.take() {
-                        target.sealed.push(full.seal()?);
-                    }
-                    let chunk = OpenChunk::allocate(&self.types, self.chunk_rows);
-                    try_grow_named(reservation, chunk.charged)?;
-                    target.open = Some(chunk);
-                }
-                let Some(open) = target.open.as_mut() else {
-                    return Err(DataFusionError::Internal(
-                        "BucketedFinalAggregateExec: a bucket has no open chunk".to_string(),
-                    ));
-                };
-                let take = (end - done).min(self.chunk_rows - open.len);
-                open.append(&sources, &self.order[done..done + take]);
-                target.rows += take;
-                done += take;
-            }
-        }
-        Ok(rows)
+        Ok(())
     }
 
-    /// Every chunk of `bucket`, the open one sealed, leaving the bucket
-    /// empty.
-    fn take_bucket(&mut self, bucket: usize) -> DFResult<Vec<SealedChunk>> {
-        let Some(target) = self.buckets.get_mut(bucket) else {
-            return Ok(Vec::new());
-        };
-        let mut chunks = std::mem::take(&mut target.sealed);
-        if let Some(open) = target.open.take() {
-            chunks.push(open.seal()?);
+    /// Split `columns` (at most one slice of the stock table's state) by
+    /// bucket and write each bucket's rows to its file as one piece, with no
+    /// chunk and no charge: the phase 1 trigger's forced route.
+    fn write_slice(&mut self, columns: &[ArrayRef], spill: &mut BucketSpill) -> DFResult<()> {
+        let rows = columns.first().map_or(0, |column| column.len());
+        if rows == 0 {
+            return Ok(());
         }
-        target.rows = 0;
-        Ok(chunks)
+        self.sort_by_bucket(columns, rows)?;
+        for bucket in 0..self.buckets.len() {
+            let (start, end) = (self.offsets[bucket], self.offsets[bucket + 1]);
+            if start == end {
+                continue;
+            }
+            let indices = UInt32Array::from(self.order[start..end].to_vec());
+            let piece = columns
+                .iter()
+                .map(|column| take(column, &indices, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            spill.write(bucket, piece)?;
+            self.buckets[bucket].rows += end - start;
+        }
+        Ok(())
+    }
+
+    /// Whether any bucket from `from` on still holds a chunk in memory.
+    fn retains(&self, from: usize) -> bool {
+        self.buckets
+            .iter()
+            .skip(from)
+            .any(|bucket| !bucket.sealed.is_empty() || bucket.open.is_some())
+    }
+
+    /// Write every chunk held by the buckets from `from` on to their files
+    /// and release their charge; from here on each chunk is written when it
+    /// fills.
+    fn spill_retained(
+        &mut self,
+        from: usize,
+        reservation: &mut MemoryReservation,
+        spill: &mut BucketSpill,
+    ) -> DFResult<()> {
+        spill.triggered = true;
+        for (bucket, target) in self.buckets.iter_mut().enumerate().skip(from) {
+            let mut chunks = std::mem::take(&mut target.sealed);
+            if let Some(open) = target.open.take() {
+                chunks.push(open.seal()?);
+            }
+            for chunk in chunks {
+                spill.write(bucket, chunk.columns)?;
+                reservation.shrink(chunk.charged);
+            }
+        }
+        Ok(())
+    }
+
+    /// One chunk of `bucket` still in memory, the open one sealed last, or
+    /// `None` once it holds none.
+    fn pop_chunk(&mut self, bucket: usize) -> DFResult<Option<SealedChunk>> {
+        let Some(target) = self.buckets.get_mut(bucket) else {
+            return Ok(None);
+        };
+        if let Some(chunk) = target.sealed.pop() {
+            return Ok(Some(chunk));
+        }
+        target.open.take().map(OpenChunk::seal).transpose()
+    }
+}
+
+/// One bucket's scratch file while it is written: `Some(batch)` appends,
+/// `None` finishes the file and hands it over (`None` again when nothing was
+/// written). DataFusion's in-progress spill file is not nameable outside its
+/// crate, so the closure holds it.
+type BucketWriter =
+    Box<dyn FnMut(Option<&RecordBatch>) -> DFResult<Option<Arc<dyn SpillFile>>> + Send>;
+
+/// The spill counters of one partition: DataFusion's typed spill metrics,
+/// which `accumulate_spill_counts` reads, and the bytes read back.
+struct SpillCounters {
+    spill: SpillMetrics,
+    bytes_read: Count,
+}
+
+/// A stream's bucket spill: the spill manager and each bucket's file.
+struct BucketSpill {
+    manager: SpillManager,
+    schema: SchemaRef,
+    writers: Vec<Option<BucketWriter>>,
+    /// Set once a trigger has fired: every chunk is written when it fills.
+    triggered: bool,
+    bytes_read: Count,
+}
+
+impl BucketSpill {
+    /// Append `columns`, one piece of `bucket`'s rows, to its file, creating
+    /// the file on its first write.
+    fn write(&mut self, bucket: usize, columns: Vec<ArrayRef>) -> DFResult<()> {
+        let rows = columns.first().map_or(0, |column| column.len());
+        if rows == 0 {
+            return Ok(());
+        }
+        let batch = RecordBatch::try_new_with_options(
+            Arc::clone(&self.schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )?;
+        let Some(slot) = self.writers.get_mut(bucket) else {
+            return Err(DataFusionError::Internal(format!(
+                "BucketedFinalAggregateExec: no scratch file slot for bucket {bucket}"
+            )));
+        };
+        let writer = match slot {
+            Some(writer) => writer,
+            None => {
+                let mut file = self
+                    .manager
+                    .create_in_progress_file("BucketedFinalAggregate bucket spill")?;
+                slot.insert(Box::new(move |batch: Option<&RecordBatch>| match batch {
+                    Some(batch) => file.append_batch(batch).map(|_| None),
+                    None => file.finish(),
+                }))
+            }
+        };
+        writer(Some(&batch))?;
+        Ok(())
+    }
+
+    /// Finish `bucket`'s file and hand it over; `None` when it has none.
+    fn finish(&mut self, bucket: usize) -> DFResult<Option<Arc<dyn SpillFile>>> {
+        match self.writers.get_mut(bucket).and_then(Option::take) {
+            Some(mut writer) => writer(None),
+            None => Ok(None),
+        }
+    }
+}
+
+/// A bucket's file being read back, kept until its last batch is merged and
+/// dropped, which deletes it, before the next bucket starts.
+struct ReadBack {
+    bucket: usize,
+    stream: SendableRecordBatchStream,
+    bytes: usize,
+    _file: Arc<dyn SpillFile>,
+}
+
+/// Whether `err` is a pool refusal, the only error a spill answers.
+fn is_refusal(err: &DataFusionError) -> bool {
+    matches!(err, DataFusionError::ResourcesExhausted(_))
+}
+
+/// A refusal with nothing left to write, typed as the bucket spill's
+/// under-shoot with its predicate; a refusal over the spill-mode hard bound
+/// is not one and passes through unchanged.
+fn undershoot(err: DataFusionError) -> DataFusionError {
+    match err {
+        DataFusionError::ResourcesExhausted(message)
+            if !message.contains(SPILL_MODE_HARD_BOUND) =>
+        {
+            DataFusionError::ResourcesExhausted(format!(
+                "{message}; {BUCKET_SPILL_UNDERSHOOT}: the stream had no routed state left to \
+                 write and a bucket's table did not fit its share, which the derived tuning \
+                 allows only when r x s > 2 (r: the table bytes all buckets needed over the \
+                 projected T; s: the largest bucket's table bytes over its even part, \
+                 T / (P x 2^bits))"
+            ))
+        }
+        other => other,
     }
 }
 
@@ -834,9 +1127,16 @@ struct BucketedStream {
     /// pending output. The rest is bucket chunks, charged at capacity.
     table_bytes: usize,
     metrics: BucketMetrics,
+    /// The bucket spill, in spill mode only.
+    spill: Option<BucketSpill>,
+    /// The bucket file being read back in phase 2, if any.
+    reading: Option<ReadBack>,
+    /// The size of the read-back batch being merged, charged with the table.
+    read_back_bytes: usize,
 }
 
 impl BucketedStream {
+    #[allow(clippy::too_many_arguments)]
     fn try_new(
         aggregate: &AggregateExec,
         config: BucketedFinalAggregation,
@@ -845,6 +1145,7 @@ impl BucketedStream {
         partition: usize,
         context: &Arc<TaskContext>,
         metrics: BucketMetrics,
+        spill: Option<SpillCounters>,
     ) -> DFResult<Self> {
         let input_schema = aggregate.input().schema();
         let group_by = aggregate.group_expr().clone();
@@ -881,9 +1182,34 @@ impl BucketedStream {
             routed_types.push((data_type, width));
         }
         let group_values = new_group_values(group_schema, &GroupOrdering::None)?;
+        let spill = spill.map(|counters| {
+            let schema = Arc::new(Schema::new(
+                routed_types
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (data_type, _))| {
+                        Field::new(format!("routed_{index}"), data_type.clone(), true)
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            let bits = config.bits.min(BUCKETED_FINAL_AGGREGATE_MAX_BITS);
+            BucketSpill {
+                manager: SpillManager::new(
+                    context.runtime_env(),
+                    counters.spill,
+                    Arc::clone(&schema),
+                )
+                .with_compression_type(context.session_config().spill_compression()),
+                schema,
+                writers: (0..1usize << bits).map(|_| None).collect(),
+                triggered: false,
+                bytes_read: counters.bytes_read,
+            }
+        });
         let reservation = MemoryConsumer::new(format!(
             "{BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX}{partition}]"
         ))
+        .with_can_spill(spill.is_some())
         .register(context.memory_pool());
         Ok(BucketedStream {
             schema: aggregate.schema(),
@@ -904,6 +1230,9 @@ impl BucketedStream {
             reservation,
             table_bytes: 0,
             metrics,
+            spill,
+            reading: None,
+            read_back_bytes: 0,
         })
     }
 
@@ -942,7 +1271,7 @@ impl BucketedStream {
         let _timer = elapsed.timer();
         let columns = self.routed_columns(batch)?;
         if let Some(router) = self.router.as_mut() {
-            let routed = router.route(&columns, &mut self.reservation)?;
+            let routed = router.route(&columns, &mut self.reservation, self.spill.as_mut())?;
             self.metrics.routed_rows.add(routed);
         } else {
             self.merge(&columns)?;
@@ -969,11 +1298,78 @@ impl BucketedStream {
         }
         self.group_values.clear_shrink(0);
         self.group_indices = Vec::new();
-        let routed = router.route(&state, &mut self.reservation)?;
+        let routed = router.route(&state, &mut self.reservation, self.spill.as_mut())?;
         self.metrics.routed_rows.add(routed);
         self.metrics.engaged.add(1);
         self.router = Some(router);
         Ok(())
+    }
+
+    /// The phase 1 trigger: take the stock table's state, as the engage
+    /// does, and write it to the bucket files in slices of at most
+    /// `routed_chunk_rows` rows, under the table's existing charge. Nothing
+    /// is asked of the pool here; the caller asks again once the table's
+    /// charge is recomputed.
+    fn force_route(&mut self) -> DFResult<()> {
+        let Some(spill) = self.spill.as_mut() else {
+            return Err(DataFusionError::Internal(
+                "BucketedFinalAggregateExec: a forced route without spill".to_string(),
+            ));
+        };
+        let bits = self.config.bits.min(BUCKETED_FINAL_AGGREGATE_MAX_BITS);
+        let slice_rows = self.config.routed_chunk_rows.max(1);
+        let mut router = Router::new(self.routed_types.clone(), self.key_count, bits, slice_rows);
+        let mut state = self.group_values.emit(EmitTo::All)?;
+        for accumulator in &mut self.accumulators {
+            state.extend(accumulator.state(EmitTo::All)?);
+        }
+        let rows = state.first().map_or(0, |column| column.len());
+        let mut start = 0;
+        while start < rows {
+            let len = slice_rows.min(rows - start);
+            let slice: Vec<ArrayRef> = state
+                .iter()
+                .map(|column| column.slice(start, len))
+                .collect();
+            router.write_slice(&slice, spill)?;
+            start += len;
+        }
+        drop(state);
+        self.group_values.clear_shrink(0);
+        self.group_indices = Vec::new();
+        spill.triggered = true;
+        self.metrics.routed_rows.add(rows);
+        self.metrics.engaged.add(1);
+        self.router = Some(router);
+        Ok(())
+    }
+
+    /// Answer a refused charge: in spill mode, write what the stream retains
+    /// for the buckets it has not started aggregating (or route the stock
+    /// table to the files), so the caller can ask again; otherwise, or when
+    /// nothing is left to write, the refusal is the stream's error.
+    fn relieve(&mut self, err: DataFusionError) -> DFResult<()> {
+        if self.spill.is_none() || !is_refusal(&err) {
+            return Err(err);
+        }
+        if self.router.is_none() {
+            if self.group_values.is_empty() {
+                return Err(undershoot(err));
+            }
+            return self.force_route();
+        }
+        let from = match self.phase {
+            Phase::Ingest => 0,
+            Phase::Drain { next_bucket } => next_bucket,
+            Phase::Done => usize::MAX,
+        };
+        let (Some(router), Some(spill)) = (self.router.as_mut(), self.spill.as_mut()) else {
+            return Err(err);
+        };
+        if !router.retains(from) {
+            return Err(undershoot(err));
+        }
+        router.spill_retained(from, &mut self.reservation, spill)
     }
 
     /// Bytes charged by `size()`: the tables, the per-batch scratch and the
@@ -991,17 +1387,61 @@ impl BucketedStream {
                 .pending
                 .as_ref()
                 .map_or(0, |pending| pending.batch.get_array_memory_size())
+            + self.read_back_bytes
     }
 
     fn charge_table(&mut self) -> DFResult<()> {
-        let size = self.table_size();
-        if size > self.table_bytes {
-            try_grow_named(&mut self.reservation, size - self.table_bytes)?;
-        } else {
-            self.reservation.shrink(self.table_bytes - size);
+        loop {
+            let size = self.table_size();
+            if size <= self.table_bytes {
+                self.reservation.shrink(self.table_bytes - size);
+                self.table_bytes = size;
+                return Ok(());
+            }
+            match try_grow_named(&mut self.reservation, size - self.table_bytes) {
+                Ok(()) => {
+                    self.table_bytes = size;
+                    return Ok(());
+                }
+                Err(err) => self.relieve(err)?,
+            }
         }
-        self.table_bytes = size;
-        Ok(())
+    }
+
+    /// Start reading `bucket`'s file back, if it has one.
+    fn start_read_back(&mut self, bucket: usize) -> DFResult<bool> {
+        let Some(spill) = self.spill.as_mut() else {
+            return Ok(false);
+        };
+        let Some(file) = spill.finish(bucket)? else {
+            return Ok(false);
+        };
+        let bytes = file
+            .size()
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(0);
+        let stream = spill
+            .manager
+            .read_spill_as_stream_unbuffered(Arc::clone(&file), None)?;
+        self.reading = Some(ReadBack {
+            bucket,
+            stream,
+            bytes,
+            _file: file,
+        });
+        Ok(true)
+    }
+
+    /// Merge one batch read back from the current bucket's file, charged
+    /// while it is merged.
+    fn merge_read_back(&mut self, batch: &RecordBatch) -> DFResult<()> {
+        let elapsed = self.metrics.baseline.elapsed_compute().clone();
+        let _timer = elapsed.timer();
+        self.read_back_bytes = batch.get_array_memory_size();
+        self.charge_table()?;
+        self.merge(batch.columns())?;
+        self.read_back_bytes = 0;
+        self.charge_table()
     }
 
     /// Evaluate the reused table into the pending output and clear it,
@@ -1030,18 +1470,22 @@ impl BucketedStream {
         Ok(())
     }
 
-    /// Merge one bucket, release its chunks as they are merged, and evaluate
-    /// it into the pending output, cut to the TopK when one is set. The
-    /// bucket's groups are complete here: every input row was routed before
-    /// phase 2 began.
+    /// Merge the chunks one bucket still holds in memory, after its file if
+    /// it had one, release each as it is merged, and evaluate the bucket into
+    /// the pending output, cut to the TopK when one is set. The bucket's
+    /// groups are complete here: every input row was routed before phase 2
+    /// began.
     fn aggregate_bucket(&mut self, bucket: usize) -> DFResult<()> {
         let elapsed = self.metrics.baseline.elapsed_compute().clone();
         let _timer = elapsed.timer();
-        let chunks = match self.router.as_mut() {
-            Some(router) => router.take_bucket(bucket)?,
-            None => Vec::new(),
-        };
-        for chunk in chunks {
+        loop {
+            let chunk = match self.router.as_mut() {
+                Some(router) => router.pop_chunk(bucket)?,
+                None => None,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             self.merge(&chunk.columns)?;
             drop(chunk.columns);
             self.reservation.shrink(chunk.charged);
@@ -1072,7 +1516,7 @@ impl BucketedStream {
 
     fn finish_input(&mut self) -> DFResult<()> {
         self.input = None;
-        match self.router.as_ref() {
+        match self.router.as_mut() {
             Some(router) => {
                 let non_empty = router
                     .buckets
@@ -1080,7 +1524,14 @@ impl BucketedStream {
                     .filter(|bucket| bucket.rows > 0)
                     .count();
                 self.metrics.buckets_non_empty.add(non_empty);
-                Ok(())
+                // After a trigger each bucket's last, partly filled chunk
+                // goes to its file, so every bucket is read back whole.
+                match self.spill.as_mut() {
+                    Some(spill) if spill.triggered => {
+                        router.spill_retained(0, &mut self.reservation, spill)
+                    }
+                    _ => Ok(()),
+                }
             }
             None => {
                 self.evaluate_table(0, false)?;
@@ -1094,6 +1545,9 @@ impl BucketedStream {
         self.input = None;
         self.router = None;
         self.pending = None;
+        self.reading = None;
+        self.spill = None;
+        self.read_back_bytes = 0;
         self.group_values.clear_shrink(0);
         self.accumulators.clear();
         self.group_indices = Vec::new();
@@ -1186,6 +1640,36 @@ impl Stream for BucketedStream {
                         Ok(None) => {}
                         Err(err) => return this.fail(err),
                     }
+                    if let Some(reading) = this.reading.as_mut() {
+                        let bucket = reading.bucket;
+                        match ready!(reading.stream.poll_next_unpin(cx)) {
+                            Some(Ok(batch)) => {
+                                if let Err(err) = this.merge_read_back(&batch) {
+                                    return this.fail(err);
+                                }
+                                cx.waker().wake_by_ref();
+                                return Poll::Pending;
+                            }
+                            Some(Err(err)) => return this.fail(err),
+                            None => {
+                                // Dropping the read-back deletes the file
+                                // before the next bucket starts.
+                                if let Some(done) = this.reading.take()
+                                    && let Some(spill) = this.spill.as_ref()
+                                {
+                                    spill.bytes_read.add(done.bytes);
+                                }
+                                if let Err(err) = this.aggregate_bucket(bucket) {
+                                    return this.fail(err);
+                                }
+                                if this.pending.is_none() {
+                                    cx.waker().wake_by_ref();
+                                    return Poll::Pending;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let bucket_count = this
                         .router
                         .as_ref()
@@ -1197,6 +1681,11 @@ impl Stream for BucketedStream {
                     this.phase = Phase::Drain {
                         next_bucket: next_bucket + 1,
                     };
+                    match this.start_read_back(next_bucket) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(err) => return this.fail(err),
+                    }
                     if let Err(err) = this.aggregate_bucket(next_bucket) {
                         return this.fail(err);
                     }

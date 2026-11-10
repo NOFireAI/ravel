@@ -182,8 +182,9 @@ humantime = "2"
 # volume's free bytes: `rustix::fs::statvfs` is a safe wrapper over the
 # syscall, which `unsafe_code = "forbid"` keeps out of this workspace's own
 # code. rustix is already in the lockfile through tempfile. The spill root's
-# owner lock is std's `File::try_lock` and needs no dependency.
-rustix = { version = "1", features = ["fs"] }
+# owner lock is std's `File::try_lock` and needs no dependency. ravel-server
+# raises its soft open-file limit with `rustix::process::setrlimit`.
+rustix = { version = "1", features = ["fs", "process"] }
 
 # observability
 tracing = "0.1"

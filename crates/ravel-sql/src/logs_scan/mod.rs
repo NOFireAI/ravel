@@ -1835,6 +1835,15 @@ impl BlockMetrics {
 }
 
 impl LogsScanExec {
+    /// The checked sum of [`SegmentRef::sample_count`] over the segments this
+    /// scan touches: its input rows before any filter, or `None` on
+    /// overflow.
+    pub fn sample_count_total(&self) -> Option<u64> {
+        self.segments
+            .iter()
+            .try_fold(0u64, |acc, seg| acc.checked_add(seg.sample_count))
+    }
+
     /// Build a scan over `segments`, whose partitions take its units of work
     /// (row groups or whole segments, see [`PlanCounts::units`]) from one
     /// shared queue: `target_partitions` partitions when `fetcher` carries
