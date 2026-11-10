@@ -1442,13 +1442,15 @@ Coverage is not complete, so a zero reading is not proof of isolation:
   seal-divergence check, `ravel-cli catalog verify` and the coverage check of
   `ravel-cli load`. Each checks before it charges the decode to the memory
   budget, so a budget refusal does not hide a foreign part. The GC
-  reachability sweep also checks, but holds no `Catalog`, so it does not
-  increment this counter: it refuses the part, blocks the candidate's delete
-  fail-closed as an unreadable part (counted on the retention pass report's
-  `blocked_by_unreadable_head`), and logs one `error`-level line,
-  `maintain sweep: snapshot part names another tenant; blocking deletes
-  fail-closed`, with the part `key`, `expected_tenant` and `actual_tenant`.
-  Escalate on that line as on an increment.
+  reachability sweep also checks, the HEAD and each part, but holds no
+  `Catalog`, so it does not increment this counter: it refuses the HEAD or
+  part, blocks the candidate's delete fail-closed as unreadable (counted on
+  the retention pass report's `blocked_by_unreadable_head`), and logs one
+  `error`-level line, `maintain sweep: snapshot HEAD names another tenant;
+  blocking deletes fail-closed` or `maintain sweep: snapshot part names
+  another tenant; blocking deletes fail-closed`, with the object's `key`,
+  `expected_tenant` and `actual_tenant`. Escalate on either line as on an
+  increment.
   Three readers decode a part without any tenant-hash check, so a foreign
   part they read increments nothing: the on-demand fold's
   read of a part's entry ids, the format-window audit, and `ravel-cli catalog

@@ -16,9 +16,10 @@
 //! - **HEAD, or a covering snapshot part, present but unreadable**: blocked
 //!   fail-closed. Non-reachability cannot be proven from data that cannot be
 //!   read, and a wrongly-permitted delete is unrecoverable while a delayed one
-//!   is not. A part whose header names another tenant (ADR-0050 §2) is one
-//!   more cause: refused before its entries are read, the same fail-closed
-//!   answer as a part that will not decode at all.
+//!   is not. A HEAD or a part whose header names another tenant (ADR-0050
+//!   §2) is one more cause: a foreign HEAD is refused before any of its parts
+//!   is read, a foreign part before its entries are read, the same fail-closed
+//!   answer as one that will not decode at all.
 //! - **A decoded snapshot entry names the object**: blocked. The ordinary
 //!   lagging-fold case.
 //!
@@ -844,7 +845,9 @@ impl SnapshotReachability {
 
     /// Load HEAD once for the pass, caching the result. Returns a lightweight
     /// status; the decoded HEAD itself stays in `self.head` for the covering
-    /// part-ref extraction in [`Self::covering_parts`].
+    /// part-ref extraction in [`Self::covering_parts`]. A HEAD whose header
+    /// names a tenant other than `tenant` is `Unreadable`, and none of its
+    /// parts is read.
     async fn ensure_head(
         &mut self,
         store: &dyn ObjectStoreBackend,
@@ -865,6 +868,18 @@ impl SnapshotReachability {
                         })
                         .await?;
                     match decoded {
+                        // A HEAD naming another tenant (ADR-0050 §2) cannot
+                        // prove anything about this tenant's objects.
+                        Ok(head) if head.tenant_hash.as_slice() != tenant.0.as_slice() => {
+                            tracing::error!(
+                                key = %head_key,
+                                expected_tenant = %tenant.to_hex(),
+                                actual_tenant = %hex::encode(&head.tenant_hash),
+                                "maintain sweep: snapshot HEAD names another tenant; blocking \
+                                 deletes fail-closed"
+                            );
+                            HeadLoad::Unreadable
+                        }
                         Ok(head) => {
                             self.head_version = version;
                             HeadLoad::Present(Box::new(head))
@@ -1061,6 +1076,7 @@ mod tests {
     struct CountingStore {
         inner: MemoryStore,
         gets: Mutex<HashMap<String, u64>>,
+        deletes: Mutex<u64>,
     }
 
     impl CountingStore {
@@ -1068,11 +1084,16 @@ mod tests {
             CountingStore {
                 inner: MemoryStore::new(),
                 gets: Mutex::new(HashMap::new()),
+                deletes: Mutex::new(0),
             }
         }
 
         fn get_count(&self, key: &str) -> u64 {
             *self.gets.lock().expect("lock").get(key).unwrap_or(&0)
+        }
+
+        fn delete_count(&self) -> u64 {
+            *self.deletes.lock().expect("lock")
         }
     }
 
@@ -1128,6 +1149,7 @@ mod tests {
         }
 
         async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+            *self.deletes.lock().expect("lock") += 1;
             self.inner.delete(key).await
         }
 
@@ -1173,8 +1195,21 @@ mod tests {
         store: &dyn ObjectStoreBackend,
         entries: Vec<SnapshotEntry>,
     ) {
+        plant_head_and_part(store, TEST_TENANT, FOREIGN_TENANT, entries).await;
+    }
+
+    /// Plants a HEAD at `TEST_TENANT`'s HEAD key whose header names
+    /// `head_tenant`, naming one covering part at `PART_KEY` encoded for
+    /// `part_tenant`, with a HEAD-level reference correct for the stored
+    /// bytes.
+    async fn plant_head_and_part(
+        store: &dyn ObjectStoreBackend,
+        head_tenant: TenantHash,
+        part_tenant: TenantHash,
+        entries: Vec<SnapshotEntry>,
+    ) {
         let part_bytes = ravel_catalog::encode_part(
-            FOREIGN_TENANT.0,
+            part_tenant.0,
             ravel_commit::signal::to_proto(Signal::Metrics) as u32,
             TEST_SHARD + 1,
             TEST_HOUR,
@@ -1188,10 +1223,10 @@ mod tests {
                 ravel_object_store::PutOptions::default(),
             )
             .await
-            .expect("put foreign-tenant part");
+            .expect("put part");
         let head = SnapshotHead {
             format_version: ravel_catalog::HEAD_FORMAT_VERSION,
-            tenant_hash: TEST_TENANT.0.to_vec(),
+            tenant_hash: head_tenant.0.to_vec(),
             signal: ravel_commit::signal::to_proto(Signal::Metrics) as u32,
             shard_count: TEST_SHARD + 1,
             watermark_hour: TEST_HOUR,
@@ -1292,6 +1327,49 @@ mod tests {
             SnapshotGate::Blocked(SnapshotBlock::Unreadable),
             "a foreign-tenant part blocks fail-closed even when its own entries name nothing here"
         );
+    }
+
+    /// A HEAD at this tenant's key whose header names another tenant blocks
+    /// fail-closed as `Unreadable` before any of its parts is read, even
+    /// though the part it names is a valid part of this tenant whose entries
+    /// name nothing here (the answer that, read from that part, would clear
+    /// the delete).
+    ///
+    /// FLIP: drop the `head.tenant_hash` comparison in `ensure_head`. The
+    /// HEAD is then trusted, its part is read and passes the part check, no
+    /// entry names the candidate, and the gate answers `Clear` instead of
+    /// `Blocked(Unreadable)`, so the first assertion fails.
+    #[tokio::test]
+    async fn foreign_tenant_head_blocks_unreadable_without_reading_parts() {
+        let store = CountingStore::new();
+        plant_head_and_part(&store, FOREIGN_TENANT, TEST_TENANT, Vec::new()).await;
+        let mut reach = SnapshotReachability::new();
+        let gate = reach
+            .bucket_gate(&store, &candidate_bucket())
+            .await
+            .expect("gate");
+        assert_eq!(
+            gate,
+            SnapshotGate::Blocked(SnapshotBlock::Unreadable),
+            "a HEAD naming another tenant blocks fail-closed"
+        );
+        let objects = [snapshot_object(&candidate_entry()).expect("candidate identity")];
+        let gate2 = reach
+            .object_gate(&store, &TEST_TENANT, Signal::Metrics, TEST_HOUR, &objects)
+            .await
+            .expect("object gate");
+        assert_eq!(gate2, SnapshotGate::Blocked(SnapshotBlock::Unreadable));
+        assert_eq!(
+            store.get_count(PART_KEY),
+            0,
+            "no part of a foreign-tenant HEAD is read"
+        );
+        assert_eq!(
+            store.get_count(&catalog_head_key(&TEST_TENANT, Signal::Metrics)),
+            1,
+            "the refused HEAD is read once per pass, then cached"
+        );
+        assert_eq!(store.delete_count(), 0, "nothing is deleted");
     }
 
     /// No marker for the alerts signal (ADR-1133 decision 6): a clear HEAD

@@ -2921,14 +2921,16 @@ object in `load_covering_postings` (`LoadPostingsError::TenantHashMismatch`)
 is not counted.
 
 The GC reachability sweep (`crates/ravel-maintain/src/reachability.rs`) also
-checks, but holds no `Catalog` to count a breach on: it calls the same
+checks, the HEAD and each part, but holds no `Catalog` to count a breach on.
+It compares the HEAD's tenant_hash with the swept tenant right after decoding
+it, before reading any part the HEAD names, and it calls the same
 tenant-checked decode (`ravel_catalog::check_part_tenant` /
 `decode_part_for_tenant`, the public primitives `Catalog::decode_tenant_part`
 itself calls) directly on a HEAD-named part before reading its entries. A
-foreign tenant_hash refuses the part and takes the fail-closed path the sweep
-already uses for an undecodable part: the refusal is cached for the rest of
-the pass, the delete gate answers `SnapshotBlock::Unreadable`, the candidate
-is not deleted (the retention sweep counts it on the pass report's
+foreign tenant_hash on either refuses it and takes the fail-closed path the
+sweep already uses for an undecodable HEAD or part: the refusal is cached for
+the rest of the pass, the delete gate answers `SnapshotBlock::Unreadable`, the
+candidate is not deleted (the retention sweep counts it on the pass report's
 `blocked_by_unreadable_head`, the superseded-input sweep on
 `held_by_unreadable_head`), and the sweep logs one error-level line (`key`,
 `expected_tenant`, `actual_tenant`). It does not increment

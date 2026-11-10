@@ -1,4 +1,5 @@
-//! The tenant-checked part decode shared by every snapshot-part reader.
+//! The tenant-checked part decode for snapshot-part readers that hold no
+//! [`Catalog`].
 //!
 //! [`check_part_tenant`] and [`decode_part_for_tenant`] are the public,
 //! counter-free primitives (no [`Catalog`] held, so nothing to charge a
@@ -9,7 +10,9 @@
 //! the catalog's memory budget and counts the refusal on
 //! `ravel_catalog_isolation_breach_total`: `seal_divergence` (the scrub's
 //! seal-divergence check, `catalog verify`, and the load's coverage check)
-//! and `covering_postings` (the scrub's covering-postings load).
+//! and `covering_postings` (the scrub's covering-postings load). The fold
+//! (`fold.rs`) and the query path's part load (`snapshot_resolve.rs`) keep
+//! their own inline tenant comparisons and do not call these functions.
 
 use ravel_proto::catalog::v1::SnapshotPartHeader;
 use ravel_types::TenantHash;
