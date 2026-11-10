@@ -1441,7 +1441,10 @@ maint_records() {
 # carries R into the fold and reconciles the retirement frontier, is
 # stamped as STATE's fold, and a second one as STATE_refold; then the
 # segments a catalog resolve returns for the tombstone stamp's hour, as
-# STATE.logs.retired_resolve.json. Non-zero (failed_at set) on failure.
+# STATE.logs.retired_resolve.json, unless that step does not fit the deadline
+# (STATE_resolve recorded not-run) or fails (STEP-FAILED, its log kept): the
+# stamp is then not written and the state goes on. Non-zero (failed_at set)
+# on any other failure.
 retire_through() {
   local state="$1" k="$2" d0="$DP_START_7" cut="$WORK/retention-$1.json" r rows tokens key hash
   local tlog="$WORK/tombstone-check-$1.out" deadline code=0 f rflag
@@ -1496,16 +1499,34 @@ retire_through() {
   done
   # Row W3's resolve over hour d0: `rlog footprint --tenant` measures every
   # segment a catalog resolve returns, which skips the parts' retired_hours,
-  # and hour-segments counts those of ingest hour d0 on either tier.
-  local fp="$WORK/resolve-$state.json" flog="$WORK/resolve-$state.out"
+  # and hour-segments counts those of ingest hour d0 on either tier. Only
+  # W3's segments figure reads this stamp, so a step that does not fit the
+  # deadline or fails leaves it unwritten (the figure reads missing) and the
+  # state goes on.
+  local fp="$WORK/resolve-$state.json" flog="$WORK/resolve-$state.out" est step kept
+  est="$(estimate_s retired_hour)" || fail "run.toml step_estimate_minutes.retired_hour"
+  fits "${state}_resolve" "rlog footprint" "$est" || return 0
   list_store "$state-resolved"
+  code=0
+  step="rlog footprint $state"
+  run "${CLI[@]}" rlog footprint --tenant dp7 --shards "$SHARDS" --json >"$fp" 2>"$flog" || code=$?
+  if [ "$code" = 0 ]; then
+    step="hour-segments $state"
+    run "$PY" "$LIB" hour-segments --footprint "$fp" --keys "$WORK/keys-$state-resolved.tsv" \
+      --tenant-hash "${hash:-DP7_HASH}" --signal-code l --hour "$d0" \
+      --out "$STAMPS/$state.logs.retired_resolve.json" >"$flog" 2>&1 || code=$?
+  fi
+  if [ "$code" != 0 ]; then
+    [ "$DRY_RUN" = 1 ] || rm -f "$STAMPS/$state.logs.retired_resolve.json"
+    kept="$(keep_log "$flog")"
+    printf 'STEP-FAILED %s: %s exit %s (log %s); stamps/%s.logs.retired_resolve.json not written, the state goes on\n' \
+      "$state" "$step" "$code" "$kept" "$state"
+    say "state $state: $step failed (exit $code), log $kept; its retired_resolve stamp is not written"
+    [ "$DRY_RUN" = 1 ] || printf '%s STEP-FAILED %s at %s exit %s\n' "$(utc_now)" "$state" "$step" \
+      "$code" >>"$PROGRESS"
+    return 0
+  fi
   printf 'STAMP stamps/%s.logs.retired_resolve.json\n' "$state"
-  run "${CLI[@]}" rlog footprint --tenant dp7 --shards "$SHARDS" --json >"$fp" 2>"$flog" \
-    || { failed_at "rlog footprint $state" "$?" "$flog"; return 1; }
-  run "$PY" "$LIB" hour-segments --footprint "$fp" --keys "$WORK/keys-$state-resolved.tsv" \
-    --tenant-hash "${hash:-DP7_HASH}" --signal-code l --hour "$d0" \
-    --out "$STAMPS/$state.logs.retired_resolve.json" >"$flog" 2>&1 \
-    || { failed_at "hour-segments $state" "$?" "$flog"; return 1; }
   return 0
 }
 

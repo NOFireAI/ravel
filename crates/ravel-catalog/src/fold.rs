@@ -16741,6 +16741,59 @@ pub(crate) mod tests {
         );
     }
 
+    /// `key_index_unchanged_section_gets` counts, for a previous part whose
+    /// leaves the carry refuses, the section GETs of every entry whose data
+    /// object that part held, with no per-field check. `session` is declared
+    /// after the first fold, so its part has no `session` leaf: the GETs of
+    /// writers 10, 20 and 30 are counted, and those of late writers 15 and
+    /// 35, whose objects no previous part held, are not.
+    #[tokio::test]
+    async fn fold_report_counts_section_gets_of_a_refused_previous_part() {
+        use crate::tenant_config::DeclaredColumnType;
+        let inner = recording_store();
+        declare_key_index_columns(inner.as_ref(), &[(USER_ID, DeclaredColumnType::I64)], 1).await;
+        let mut held = Vec::new();
+        for seq in [10u64, 20, 30] {
+            let own = seq as i64;
+            let (record, _) =
+                publish_user_id_logs(inner.as_ref(), seq, KIDX_HOUR, &[7, own], 2, 0, true).await;
+            held.push(keys::reconstruct_data_key(&record).expect("data key"));
+        }
+        let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
+        fold_logs_sealing(&catalog, now_inside(KIDX_HOUR), Some(KIDX_HOUR)).await;
+        let fields = [(USER_ID, KeyType::I64), (SESSION, KeyType::I64)];
+        let mut late = Vec::new();
+        for seq in [15u64, 35] {
+            let own = seq as i64;
+            let (record, _) =
+                publish_keyed_logs(inner.as_ref(), seq, KIDX_HOUR, &[7, own], 2, 0, &fields).await;
+            late.push(keys::reconstruct_data_key(&record).expect("data key"));
+        }
+        declare_key_index_columns(
+            inner.as_ref(),
+            &[
+                (USER_ID, DeclaredColumnType::I64),
+                (SESSION, DeclaredColumnType::I64),
+            ],
+            2,
+        )
+        .await;
+        inner.gets.lock().expect("lock").clear();
+        let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
+        let report = advancing_fold(&catalog).await;
+        assert_eq!(report.key_index_leaf_gets, 0, "{report:?}");
+        let gets = data_object_ranged_gets(&inner);
+        let gets_of = |objects: &[String]| {
+            gets.iter().filter(|(key, _)| objects.contains(key)).count() as u64
+        };
+        let (held_gets, late_gets) = (gets_of(&held), gets_of(&late));
+        assert_eq!((held_gets, late_gets), (3 * 2, 2 * 2));
+        assert_eq!(
+            report.key_index_unchanged_section_gets, held_gets,
+            "the held entries' section GETs and not the late entries': {report:?}"
+        );
+    }
+
     /// A field retyped between two folds (`user_id` I64, then Str) does not
     /// carry an old-type pair: the previous leaf's key type is not the
     /// declared one, so the fold GETs no previous leaf, reads every section,
