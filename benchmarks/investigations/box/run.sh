@@ -313,16 +313,25 @@ free_port() {
   "$HOST_PY" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
 }
 
+# start_server [MODE TOKEN_FILE FLAG...]: the server, in --mode query with
+# the run's token file unless the retired_hour state names another mode
+# (maintain, which writes its retention tombstones), token file and flags.
 start_server() {
+  local mode="${1:-query}" tokens="${2:-$TOKEN_FILE}"
+  [ "$#" -lt 2 ] || shift 2
   SERVER_N=$((SERVER_N + 1))
   SERVER_LOG="$WORK/server-$SERVER_N.log"
   STATE_SERVER_LOG="$SERVER_LOG"
+  if [ "$DRY_RUN" = 1 ]; then
+    run "$SERVER_BIN" --mode "$mode" --tenant-token-file "$tokens" ${1+"$@"}
+    return 0
+  fi
   # --mode query: --mode all runs a scheduled fold and compaction that would
   # change the state under measurement.
-  "$SERVER_BIN" --mode query --store s3 --shards "$SHARDS" --tenant-hash-unkeyed \
-    --tenant-token-file "$TOKEN_FILE" --listen-http "127.0.0.1:$HTTP_PORT" \
+  "$SERVER_BIN" --mode "$mode" --store s3 --shards "$SHARDS" --tenant-hash-unkeyed \
+    --tenant-token-file "$tokens" --listen-http "127.0.0.1:$HTTP_PORT" \
     --listen-health "127.0.0.1:$HEALTH_PORT" --listen-grpc "127.0.0.1:$GRPC_PORT" \
-    --audit-mode off ${SERVER_EXTRA[@]+"${SERVER_EXTRA[@]}"} </dev/null >"$SERVER_LOG" 2>&1 &
+    --audit-mode off ${SERVER_EXTRA[@]+"${SERVER_EXTRA[@]}"} ${1+"$@"} </dev/null >"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
   local i
   for ((i = 1; i <= 600; i++)); do
