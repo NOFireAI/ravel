@@ -912,7 +912,11 @@ async fn rows_consumed_reaches_every_input_row_under_the_skip() {
     let attrs = "SELECT ts, body, attrs FROM logs ORDER BY ts LIMIT 4";
     for (name, sql, setup) in [
         ("filtered", filtered, Setup::new()),
-        ("filtered, 3 partitions", filtered, Setup::new().partitions(3)),
+        (
+            "filtered, 3 partitions",
+            filtered,
+            Setup::new().partitions(3),
+        ),
         ("striped", ts_bound, Setup::new().cached().partitions(3)),
         ("block predicate", word, Setup::new()),
         ("unplanned", word, Setup::new().unplanned()),

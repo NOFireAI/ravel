@@ -1131,10 +1131,9 @@ impl PlanCounts {
                             .filter_map(|&pos| planned.group_rows.get(pos))
                             .sum(),
                     ),
-                    UnitBlocks::Unplanned | UnitBlocks::All => (
-                        planned.groups.concat(),
-                        planned.group_rows.iter().sum(),
-                    ),
+                    UnitBlocks::Unplanned | UnitBlocks::All => {
+                        (planned.groups.concat(), planned.group_rows.iter().sum())
+                    }
                 };
                 let Carry { dirs, whole_object } = planned.carried.take();
                 Some(OwnedSeg {

@@ -741,8 +741,8 @@ impl OpenChunk {
         let columns: Vec<ColumnChunk> = types
             .iter()
             .map(|(data_type, width)| {
-                let (values, validity) = routed_column_capacities(*width, rows)
-                    .unwrap_or((usize::MAX, usize::MAX));
+                let (values, validity) =
+                    routed_column_capacities(*width, rows).unwrap_or((usize::MAX, usize::MAX));
                 ColumnChunk {
                     data_type: data_type.clone(),
                     width: *width,

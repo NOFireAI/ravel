@@ -33,7 +33,6 @@ use datafusion::common::Result as DFResult;
 use datafusion::common::config::SpillCompression;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::execution::memory_pool::MemoryPool;
-use datafusion::prelude::SessionConfig;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
@@ -42,6 +41,7 @@ use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
     ReplaceChildrenOptions, collect, displayable,
 };
+use datafusion::prelude::SessionConfig;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
@@ -2521,13 +2521,7 @@ async fn bucket_spill_deletes_each_file_after_reading_it() {
     let dir = tempfile::tempdir().expect("scratch dir");
     let pool: Arc<dyn MemoryPool> = Arc::new(CappedPool::new(PHASE_2.cap(PARTITIONS)));
     let plan = spilling(&planned.physical);
-    let task_ctx = spill_task_ctx(
-        &planned,
-        Arc::clone(&pool),
-        dir.path(),
-        1 << 30,
-        |_| {},
-    );
+    let task_ctx = spill_task_ctx(&planned, Arc::clone(&pool), dir.path(), 1 << 30, |_| {});
     let disk = Arc::clone(&task_ctx.runtime_env().disk_manager);
     let exec = find_bucketed(&plan).expect("a bucketed exec");
     // Every stream past its input, so nothing is written from here on.
@@ -2623,13 +2617,7 @@ async fn bucket_spill_cancel_releases_share_and_scratch() {
     let dir = tempfile::tempdir().expect("scratch dir");
     let pool: Arc<dyn MemoryPool> = Arc::new(CappedPool::new(PHASE_2.cap(PARTITIONS)));
     let plan = spilling(&planned.physical);
-    let task_ctx = spill_task_ctx(
-        &planned,
-        Arc::clone(&pool),
-        dir.path(),
-        1 << 30,
-        |_| {},
-    );
+    let task_ctx = spill_task_ctx(&planned, Arc::clone(&pool), dir.path(), 1 << 30, |_| {});
     let exec = find_bucketed(&plan).expect("a bucketed exec");
     let firsts = (0..PARTITIONS).map(|partition| {
         let exec = Arc::clone(&exec);

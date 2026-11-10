@@ -2020,9 +2020,10 @@ impl LogScanStream {
                     // at its turn and in owned order; every prefetch is a
                     // ranged open.
                     if let Some(Prefetch {
-                        owned: OwnedSeg {
-                            seg, ordinal, rows, ..
-                        },
+                        owned:
+                            OwnedSeg {
+                                seg, ordinal, rows, ..
+                            },
                         issued,
                         open,
                     }) = prefetch
