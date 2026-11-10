@@ -1359,6 +1359,18 @@ fn drop_entries(
     dirty_hours.extend(hours.iter().copied());
 }
 
+// Test-only: parts `apply_retirements` dropped because every hour holding
+// entries was retired.
+#[cfg(test)]
+thread_local! {
+    static RETIRED_PART_DROPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_retired_part_drops_for_test() -> u64 {
+    RETIRED_PART_DROPS.with(|drops| drops.replace(0))
+}
+
 /// Settles the retired hours of every previous part (ADR-3939 decision 6),
 /// after the reconcile passes and before the entries are partitioned.
 /// Returns the new retired-hours list of each part carried by reference
@@ -1457,6 +1469,8 @@ fn apply_retirements(
             continue;
         }
         if shards_by_hour.keys().all(|hour| retired.contains(hour)) {
+            #[cfg(test)]
+            RETIRED_PART_DROPS.with(|drops| drops.set(drops.get() + 1));
             let hours: Vec<u32> = shards_by_hour.keys().copied().collect();
             drop_entries(
                 entries,
@@ -17480,7 +17494,9 @@ pub(crate) mod tests {
 
     /// ADR-3939 decision 6: once every hour of day d holding entries is
     /// tombstoned, day d's part leaves HEAD with no part PUT, and HEAD goes
-    /// back to version 1 since no other part has retired hours.
+    /// back to version 1 since no other part has retired hours. The part
+    /// leaves through the whole-day retirement, not the re-encode path, whose
+    /// output for a part with no entry left is the same.
     #[tokio::test]
     async fn a_fully_tombstoned_day_part_is_dropped_without_a_put() {
         let store = OpLogStore::empty();
@@ -17490,7 +17506,13 @@ pub(crate) mod tests {
         publish_logs_tombstone(store.as_ref(), DAY_D + 21).await;
         publish_user_id_logs(store.as_ref(), 6, DAY_D + 27, &[70], 2, 0, true).await;
         store.clear();
+        take_retired_part_drops_for_test();
         fold_through(&catalog, Signal::Logs, DAY_D + 27).await;
+        assert_eq!(
+            take_retired_part_drops_for_test(),
+            1,
+            "day d left HEAD by whole-day retirement"
+        );
         let third = read_signal_head(store.as_ref(), Signal::Logs).await;
         assert_eq!(
             third
@@ -17539,6 +17561,171 @@ pub(crate) mod tests {
             .map(|e| e.writer_seq)
             .collect();
         assert_eq!(writers, vec![2]);
+    }
+
+    /// Writer `seq` of every entry `head` names, ascending.
+    async fn head_writers(store: &dyn ObjectStoreBackend, head: &SnapshotHead) -> Vec<u64> {
+        let mut writers: Vec<u64> = head_entries(store, head)
+            .await
+            .iter()
+            .map(|e| e.writer_seq)
+            .collect();
+        writers.sort_unstable();
+        writers
+    }
+
+    /// ADR-3939 decision 6 and ADR-0064's delete bound: an erasure rewrite
+    /// record in retired hour 20 itself, whose bucket also lists hour 20's
+    /// tombstone, is classified before the tombstone sets the bucket aside.
+    /// Day d re-encodes in the same fold over writers 2 and 3, its ref
+    /// carries no retired hours, no entry of erased writer 1 remains in
+    /// HEAD, and HEAD is version 1.
+    #[tokio::test]
+    async fn a_rewrite_record_in_the_retired_hour_itself_re_encodes_now() {
+        let store = OpLogStore::empty();
+        let (catalog, _, second, _, records) = retire_hour_twenty(&store, kidx_config()).await;
+        assert_eq!(second.parts[0].retired_hours, vec![DAY_D + 20]);
+        publish_logs_erasure(store.as_ref(), DAY_D + 20, &[&records[0]]).await;
+        publish_user_id_logs(store.as_ref(), 6, DAY_D + 27, &[70], 2, 0, true).await;
+        store.clear();
+        fold_through(&catalog, Signal::Logs, DAY_D + 27).await;
+        let third = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let day_d = &third.parts[0];
+        assert_eq!(
+            (day_d.min_hour, day_d.watermark_hour, day_d.entry_count),
+            (DAY_D + 21, DAY_D + 21, 2),
+            "day d is re-encoded over writers 2 and 3"
+        );
+        assert!(day_d.retired_hours.is_empty(), "{day_d:?}");
+        assert_ne!(day_d.key, second.parts[0].key);
+        assert_eq!(store.part_puts().first(), Some(&day_d.key));
+        assert_eq!(third.format_version, HEAD_FORMAT_VERSION_1);
+        assert_eq!(
+            head_writers(store.as_ref(), &third).await,
+            vec![2, 3, 4, 5, 6],
+            "no entry of erased writer 1"
+        );
+    }
+
+    async fn fold_logs_with_retention(
+        catalog: &Catalog,
+        hour: u32,
+        retention_ns: i64,
+    ) -> FoldReport {
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(hour),
+                &[],
+                Some(retention_ns),
+            )
+            .await
+            .expect("fold")
+    }
+
+    /// The retire fixture under a 2-hour reconcile window and a retention
+    /// that puts the frontier band's top at hour 22 at the hour-26 fold,
+    /// one hour higher per later fold, while the window starts at hour 23,
+    /// 24 and 25 at the hour-26, 27 and 28 folds. So only the band lists
+    /// hours 20 and 21. The hour-26 fold retires hour 20 through the band.
+    /// Returns the catalog, the retention and the HEAD after it.
+    async fn retire_hour_twenty_through_the_band(
+        store: &Arc<OpLogStore>,
+        frontier_reconcile_max_hours: u32,
+    ) -> (Catalog, i64, SnapshotHead, Vec<CommitRecord>) {
+        declare_user_id_key_index(store.as_ref()).await;
+        let records = publish_retire_fixture(store.as_ref()).await;
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                fold_reconcile_window_hours: 2,
+                frontier_reconcile_max_hours,
+                ..kidx_config()
+            },
+        )
+        .expect("catalog");
+        let retention_ns = now_at_seal(DAY_D + 26) - i64::from(DAY_D + 22) * NS_PER_HOUR
+            + catalog.config().protection_horizon_ns;
+        fold_logs_with_retention(&catalog, DAY_D + 25, retention_ns).await;
+        publish_logs_tombstone(store.as_ref(), DAY_D + 20).await;
+        publish_user_id_logs(store.as_ref(), 5, DAY_D + 26, &[60], 2, 0, true).await;
+        let report = fold_logs_with_retention(&catalog, DAY_D + 26, retention_ns).await;
+        assert_eq!(
+            report.frontier_hours_reconciled,
+            u64::from(frontier_reconcile_max_hours.min(2)),
+            "{report:?}"
+        );
+        let second = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            second.parts[0].retired_hours,
+            vec![DAY_D + 20],
+            "the band retired hour 20"
+        );
+        (catalog, retention_ns, second, records)
+    }
+
+    /// ADR-3939 decision 6: the frontier band keeps listing an already
+    /// retired hour, so a rewrite record into it below the fixed reconcile
+    /// window is found. The hour-27 fold lists hours 21 and 20 and carries
+    /// day d unchanged; the hour-28 fold finds the rewrite record that
+    /// erases writer 1 in hour 20 and re-encodes day d without it.
+    #[tokio::test]
+    async fn the_frontier_band_finds_a_rewrite_record_in_a_retired_hour() {
+        let store = OpLogStore::empty();
+        let (catalog, retention_ns, second, records) =
+            retire_hour_twenty_through_the_band(&store, 168).await;
+        publish_user_id_logs(store.as_ref(), 6, DAY_D + 27, &[70], 2, 0, true).await;
+        let carried = fold_logs_with_retention(&catalog, DAY_D + 27, retention_ns).await;
+        assert_eq!(carried.frontier_hours_reconciled, 2, "{carried:?}");
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(head.parts[0], second.parts[0], "day d is carried unchanged");
+
+        publish_logs_erasure(store.as_ref(), DAY_D + 20, &[&records[0]]).await;
+        publish_user_id_logs(store.as_ref(), 7, DAY_D + 28, &[80], 2, 0, true).await;
+        store.clear();
+        let erased = fold_logs_with_retention(&catalog, DAY_D + 28, retention_ns).await;
+        assert_eq!(erased.frontier_hours_reconciled, 2, "{erased:?}");
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let day_d = &head.parts[0];
+        assert_eq!(
+            (day_d.min_hour, day_d.watermark_hour, day_d.entry_count),
+            (DAY_D + 21, DAY_D + 21, 2),
+            "day d is re-encoded over writers 2 and 3"
+        );
+        assert!(day_d.retired_hours.is_empty(), "{day_d:?}");
+        assert_eq!(store.part_puts().first(), Some(&day_d.key));
+        assert_eq!(head.format_version, HEAD_FORMAT_VERSION_1);
+        assert_eq!(
+            head_writers(store.as_ref(), &head).await,
+            vec![2, 3, 4, 5, 6, 7],
+            "no entry of erased writer 1"
+        );
+    }
+
+    /// ADR-3939 decision 6: a retired hour cannot hold the frontier band in
+    /// place. Under a cap of 1, the hour-27 fold lists open hour 21 ahead of
+    /// the older, retired hour 20, finds hour 21's tombstone, and day d,
+    /// every hour of it now retired, leaves HEAD.
+    #[tokio::test]
+    async fn a_retired_hour_is_listed_after_every_other_frontier_hour() {
+        let store = OpLogStore::empty();
+        let (catalog, retention_ns, _, _) = retire_hour_twenty_through_the_band(&store, 1).await;
+        publish_logs_tombstone(store.as_ref(), DAY_D + 21).await;
+        publish_user_id_logs(store.as_ref(), 6, DAY_D + 27, &[70], 2, 0, true).await;
+        let report = fold_logs_with_retention(&catalog, DAY_D + 27, retention_ns).await;
+        assert_eq!(
+            (
+                report.frontier_hours_reconciled,
+                report.frontier_hours_deferred
+            ),
+            (1, 1),
+            "{report:?}"
+        );
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(head.parts.len(), 1, "day d left HEAD: {head:?}");
+        assert_eq!(head_writers(store.as_ref(), &head).await, vec![4, 5, 6]);
     }
 
     /// ADR-3939 decision 6: a part carried by reference keeps its retired
