@@ -525,6 +525,22 @@ check allow "--workspace after the -- separator, fleet" \
   "$(bash_in 'cargo clippy -p ravel-sql -- --workspace' "$fleet")"
 check allow "workspace check, fleet"                    "$(bash_in 'cargo check --workspace' "$fleet")"
 check allow "scoped gates.sh, fleet"                    "$(bash_in 'scripts/gates.sh -p ravel-types' "$fleet")"
+check allow "executor-tier gates.sh, fleet" \
+  "$(bash_in 'scripts/gates.sh --tier executor -p ravel-types' "$fleet")"
+
+# refusal_names_tier_executor: the refusal names the executor tier as the
+# replacement (ADR-4034 D1). FLIP: the message before the tier,
+# "Run `scripts/gates.sh -p <crate> [-p <crate2>]` instead", names the
+# merge tier's scoped form, which runs every dependent's tests and lane
+# suites on the executor; it fails both greps below.
+out=$(printf '%s' "$(bash_in "$ws_clippy" "$fleet")" | node "$GUARD" 2>&1) || true
+if printf '%s' "$out" | grep -qF 'scripts/gates.sh --tier executor -p <crate>' &&
+  ! printf '%s' "$out" | grep -qF 'scripts/gates.sh -p <crate>'; then
+  pass=$((pass + 1))
+else
+  printf 'FAIL  %-52s refusal does not name --tier executor: %s\n' "refusal_names_tier_executor" "$out"
+  fail=$((fail + 1))
+fi
 rm -rf "$cliproot"
 
 # --- agent-cli nudge ------------------------------------------------------
