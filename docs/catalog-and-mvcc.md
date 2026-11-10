@@ -1993,19 +1993,64 @@ carrying a retired hour and a 2 carrying none
 `UnsupportedHeadVersion`, which counts as a newer format only above 2.
 The version is a function of the content, so a HEAD whose retired hours
 empty, or whose retired part re-encodes, is written at 1 again, and two
-folds of the same input write the same bytes. A reader that knows only
-version 1 refuses a version 2 HEAD rather than ignore field 9 and serve a
-retired hour; ADR-3939 decision 6 describes how each older component
-fails. `ravel-cli catalog inspect` prints the HEAD's `format_version` and
-each part's `retired_hours (field 9)` line, and the same two fields under
-`--json` (`inspect_prints_the_head_version_and_each_parts_retired_hours`).
+folds of the same input write the same bytes. `ravel-cli catalog inspect`
+prints the HEAD's `format_version` and each part's `retired_hours (field
+9)` line, and the same two fields under `--json`
+(`inspect_prints_the_head_version_and_each_parts_retired_hours`).
+
+**Mixed versions.** A build that predates field 9 accepts only HEAD
+version 1, so `decode_head` refuses a version 2 HEAD as
+`UnsupportedHeadVersion(2)` rather than ignore field 9 and serve a retired
+hour. What each older component does with that refusal, while the HEAD of
+a tenant and signal stays at version 2:
+
+- Snapshot resolve treats an undecodable HEAD as no snapshot and falls
+  back to the listing resolve (`read_head` in
+  `crates/ravel-catalog/src/snapshot_resolve.rs`,
+  `corrupt_head_falls_back_to_full_listing`). Listing honours retention
+  tombstones (`tombstoned_bucket_is_excluded_from_resolution`), so the
+  answer is right and slower.
+- A SQL node resolving the logs table also loads per-part column
+  statistics when the statement is eligible for a metadata-only path
+  (`logs_column_stats_eligible` in `crates/ravel-sql/src/executor.rs`).
+  That loader decodes HEAD itself and has no listing fallback: the refusal
+  surfaces as `LoadColumnStatsError::HeadCorrupt`, which
+  `crates/ravel-sql/src/error.rs` classes as a newer format, a retryable
+  503 (`newer_version_head_through_column_stats_is_unavailable`). An
+  eligible logs statement on that node fails with a 503 until the node is
+  upgraded or the HEAD returns to version 1; a statement that is not
+  eligible takes the listing path above.
+- Maintain cannot prove an object unreachable from a HEAD it cannot read.
+  The retention sweep's reachability gate blocks every delete for that
+  tenant and signal (`ensure_head` in
+  `crates/ravel-maintain/src/reachability.rs`,
+  `sweep_blocked_fail_closed_when_head_undecodable`), and the catalog
+  sweep deletes nothing (`read_head_reference` in
+  `crates/ravel-maintain/src/sweep.rs`,
+  `catalog_sweep_corrupt_head_deletes_nothing`).
+- A folder fails closed: a HEAD above its supported version is
+  `HeadState::UnsupportedVersion`, the fold returns
+  `CatalogError::UnsupportedHeadVersion` and never rebuilds over it
+  (ADR-0066 decision 2, `newer_format_head_fails_loudly_and_never_clobbers`).
+  An older `--rebuild-key-index` refuses at the same decode.
+
+The HEAD returns to version 1 when the part with retired hours re-encodes
+or leaves HEAD, and every older component then reads it again.
 
 **The fold.** With `build_key_index_leaves` on, every part of the previous
 HEAD but the last that carries `key_index` refs is retirable; a rebuilt
 fold has none. A reconcile pass (the fixed window, the frontier band or a
 targeted re-fold) that lists a retention tombstone in a bucket inside a
-retirable part sets the bucket aside instead of dropping its entries.
-Once every pass has listed, each such part is settled in HEAD order:
+retirable part sets the bucket aside instead of dropping its entries,
+unless the bucket also lists a compaction or erasure rewrite record. Such a
+bucket's records are classified without the tombstone first, and unless
+the result is the entry set the snapshot already names, the bucket is not
+set aside: it takes the ordinary path, its hour is dropped and its part
+re-encodes this fold, so an erased input leaves HEAD at the fold that
+lists the record (ADR-0064;
+`a_rewrite_record_in_the_retired_hour_itself_re_encodes_now`). Once every
+pass has listed, each part with a set-aside bucket is settled in HEAD
+order:
 
 - If one of its hours was dirtied this fold (a compaction record, an
   erasure rewrite record, or a late commit into a held-open hour), or a
@@ -2025,7 +2070,12 @@ A part carried by reference in a later fold keeps its list
 (`a_part_carried_by_reference_keeps_its_retired_hours`). A switch-off fold
 over a part with retired hours re-encodes it without them and writes no
 field 9 (`a_switch_off_fold_over_retired_hours_re_encodes_the_part`). The
-frontier band does not list an hour that is already retired. When the
+frontier band lists a retired hour after every hour that is not retired,
+so a retired hour cannot hold the band in place, and lists it while
+`frontier_reconcile_max_hours` allows, so a rewrite record later published
+into it is found
+(`a_retired_hour_is_listed_after_every_other_frontier_hour`,
+`the_frontier_band_finds_a_rewrite_record_in_a_retired_hour`). When the
 partition gives a retired hour's entries to a span that is not carried by
 reference (a late commit into a held-open hour of the previous UTC day,
 which re-encodes that sealed day part, is one way), those entries are
