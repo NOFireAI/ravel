@@ -446,7 +446,8 @@ SHA_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 SHA_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 # A filled copy of the rlog lane's band file: 43 statements at 0.5 s sum to
-# 21.5 s hot and cold, under 30; at 2.0 s they miss.
+# 21.5 s hot and cold, under 30; at 2.0 s they miss. The [published] rows are
+# left as checked in.
 BANDS="$TMP/rlog.toml"
 sed -e 's/^hot_sum_s_max = .*/hot_sum_s_max = 30/' \
   -e 's/^cold_sum_s_max = .*/cold_sum_s_max = 30/' \
@@ -454,7 +455,7 @@ sed -e 's/^hot_sum_s_max = .*/hot_sum_s_max = 30/' \
   -e 's/^concurrent_qps_min = .*/concurrent_qps_min = 1.0/' \
   -e 's/^concurrent_error_pooled_max = .*/concurrent_error_pooled_max = 0.1/' \
   -e 's/^q29_probe_s_max = .*/q29_probe_s_max = 1.0/' \
-  -e 's/^\(q[0-9][0-9]\) = .*/\1 = 1.0/' \
+  -e '/^\[absolute\.hot_s_max\]$/,/^\[/s/^\(q[0-9][0-9]\) = .*/\1 = 1.0/' \
   "$REPO_ROOT/benchmarks/clickbench/bands/rlog.toml" >"$BANDS"
 DATASET_SHA=1111111111111111111111111111111111111111111111111111111111111111
 
@@ -617,6 +618,19 @@ band_case "lone box_speed_min_ratio" '/^box_speed_max_ratio = /d' \
   'set both of relative.box_speed_min_ratio and relative.box_speed_max_ratio or neither'
 band_case "box_speed_min_ratio above 1" 's/^box_speed_min_ratio = .*/box_speed_min_ratio = 1.1/' \
   'relative.box_speed_min_ratio must be above 0 and at most 1, and relative.box_speed_max_ratio at least 1, got 1.1 and 1.05'
+# Catches: a published machine table judged with a statement row misspelt,
+# missing, or holding a figure that is neither a number nor "null", or with a
+# source that does not name a file and a commit.
+band_case "published unknown" '/^\[published\.c6a\.large\]$/a\
+q44 = [1.0, 1.0]' 'unknown key(s) published.c6a.large.q44 for lane rlog'
+band_case "published missing" '/^q09 = \[13.433, 14.736\]$/d' \
+  'missing required key(s) published.c6a.large.q09'
+band_case "published malformed" 's/^q09 = \[13.433, 14.736\]$/q09 = [13.433, "none"]/' \
+  "published.c6a.large.q09 must be [hot, cold], each a number of at least 0 or 'null', got [13.433, 'none']"
+band_case "published source" 's/^\(source = ".*c6a.large.json\)@[0-9a-f]*"$/\1"/' \
+  "published.c6a.large.source must be <file>.json@<40-hex commit>"
+band_case "published ratio" '/^concurrent_qps_min_ratio = /d' \
+  'missing required key(s) published.concurrent_qps_min_ratio'
 
 # run_case NAME SED WANT: kit.py check-run on a copy of the run.toml edited by
 # SED must exit 2 with WANT in its message.
@@ -2096,6 +2110,46 @@ if [ "$code" = 1 ] && grep -q '^MISS  *A  *hot_sum_s <= hot_sum_s_max' "$TMP/fet
   pass "an absolute band miss on either arm makes fetch exit 1"
 else
   fail "absolute miss in fetch" "exit $code: $(grep MISS "$TMP/fetch-abs.out" | head -n 3)"
+fi
+
+# published_miss_fails_fetch. Catches: fetch ignoring the published verdict:
+# both arms alike and inside every relative and absolute band, but q01 hot
+# 0.5 s is over 1.1 x c6a.large's published 0.048 s. Also catches the kit
+# format's hot taken as anything but the best of tries 2 and 3: q01's tries
+# 0.4, 0.7, 0.5 s give hot 0.5 (not try 1, try 2, the mean of tries 2 and 3,
+# or the best of all three, 0.4), and q02's 0.9, 0.7, 0.5 s give hot 0.5 (not
+# the median, 0.7); cold is try 1, 0.4 s and 0.9 s.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-pub-a" 'r["provenance"]["band_sections"].append("published")
+rd = {"round": 1, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
+      "ok": 100, "err": 0, "wrong_answer": 0, "qps": 1.0, "error_ratio": 0.0}
+r["concurrent"] = {"rounds": [rd], "pooled": {"rounds": 1, "calls": 100, "ok": 100, "err": 0,
+                   "wrong_answer": 0, "error_ratio_weighted": 0.0,
+                   "error_ratio_mean_of_rounds": 0.0, "qps_pooled": 1.0}}
+for e in r["entries"]:
+    tries = {"q01": [400.0, 700.0, 500.0], "q02": [900.0, 700.0, 500.0]}.get(e["id"][:3])
+    if tries:
+        e.update(tries_ms=tries, min_ms=500.0, cold_ms=tries[0], median_ms=sorted(tries)[1],
+                 max_ms=max(tries))'
+as_arm_b "$TMP/fixture-pub-a" "$TMP/fixture-pub-b"
+fixture run-pub "$TMP/fixture-pub-a" "$TMP/fixture-pub-b"
+PUB_IN="$FAKE_S3/kit-test-bucket/clickbench-kit/runs/run-pub/in"
+sed -e 's/^instance_type = .*/instance_type = "c6a.large"/' \
+  -e 's/^band_sections = .*/band_sections = ["relative", "absolute", "published"]/' \
+  -e 's/^phases = .*/phases = ["benchmark", "concurrent"]\nhealthz_phases = ["benchmark"]/' \
+  "$IN_SAVED/run.toml" >"$PUB_IN/run.toml.new"
+mv "$PUB_IN/run.toml.new" "$PUB_IN/run.toml"
+fetch pub run-pub --timeout 30
+if [ "$code" = 1 ] \
+  && grep -q '^MISS  *A  *q01 hot_s <= 1.1 x published .*statement 1 hot: measured 0.500 s, published 0.048 s, ratio 10.4167$' "$TMP/fetch-pub.out" \
+  && grep -q '^MISS  *B  *q01 hot_s <= 1.1 x published .*statement 1 hot: measured 0.500 s, published 0.048 s, ratio 10.4167$' "$TMP/fetch-pub.out" \
+  && grep -q '^MISS  *A  *q01 cold_s <= 1.1 x published .*statement 1 cold: measured 0.400 s, published 0.113 s, ratio 3.5398$' "$TMP/fetch-pub.out" \
+  && grep -q '^PASS  *A  *q02 hot_s <= 1.1 x published .*statement 2 hot: measured 0.500 s, published 1.004 s, ratio 0.4980$' "$TMP/fetch-pub.out" \
+  && grep -q '^PASS  *A  *q02 cold_s <= 1.1 x published .*statement 2 cold: measured 0.900 s, published 6.705 s, ratio 0.1342$' "$TMP/fetch-pub.out" \
+  && grep -q '^PASS  *A  *concurrent qps >= 0.9 x published .*concurrent qps: measured 1.000, published 0.137, ratio 7.2993$' "$TMP/fetch-pub.out" \
+  && ! grep -q '^MISS  *B vs A' "$TMP/fetch-pub.out" && ! grep -q '^MISS  *[AB]  *[^ ]* <= hot_s_max' "$TMP/fetch-pub.out"; then
+  pass "a published band miss on either arm makes fetch exit 1"
+else
+  fail "published miss in fetch" "exit $code: $(grep MISS "$TMP/fetch-pub.out" | head -n 3) $(tail -n 3 "$TMP/fetch-pub.err")"
 fi
 
 # Catches: wrong answers not counted as errors in the relative error band, or
@@ -4228,6 +4282,259 @@ if [ -z "$left" ]; then
   pass "the suite leaves no healthz sampler running"
 else
   fail "leftover samplers" "pids $left"
+fi
+
+# --- published bands --------------------------------------------------------
+
+PUB_FIX="$HERE/testdata/published/v0.31.1"
+PUB_BANDS="$REPO_ROOT/benchmarks/clickbench/bands/rlog.toml"
+
+# published NAME MACHINE FILE: kit.py's published judgment of FILE against
+# MACHINE's [published] rows; sets $code and writes $TMP/pub-NAME.out/.err.
+published() {
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" published v0.31.1 "$PUB_BANDS" "$2" "$3" \
+    >"$TMP/pub-$1.out" 2>"$TMP/pub-$1.err" || code=$?
+}
+
+# pub_notes NAME VERDICT: the notes of NAME's VERDICT rows, one per line.
+pub_notes() {
+  sed -n "s/^$2  .*  \(statement [0-9]* [a-z]*: .*\)\$/\1/p; s/^$2  .*  \(concurrent qps: .*\)\$/\1/p" "$TMP/pub-$1.out"
+}
+
+# published_v0311_reproduces_preregistered_misses. Catches: hot taken as the
+# mean of tries 2 and 3 rather than the faster one, and concurrent QPS judged
+# with the statement factor 1.10 rather than 0.90, either of which changes the
+# set of misses pre-registered for v0.31.1 against v0.28.0's published rows.
+pub_ok=1
+pub_why=""
+for m in c6a.large c6a.xlarge c6a.2xlarge; do
+  published "$m" "$m" "$PUB_FIX/$m.json"
+  case "$m" in
+    c6a.large) want='statement 9 hot: measured 29.383 s, published 13.433 s, ratio 2.1874
+statement 31 hot: measured 14.619 s, published 13.052 s, ratio 1.1201
+statement 31 cold: measured 15.444 s, published 13.989 s, ratio 1.1040
+concurrent qps: measured 0.098, published 0.137, ratio 0.7153' ;;
+    c6a.xlarge) want='statement 24 hot: measured 5.401 s, published 3.727 s, ratio 1.4492' ;;
+    c6a.2xlarge) want='concurrent qps: measured 0.362, published 0.478, ratio 0.7573' ;;
+  esac
+  got="$(pub_notes "$m" MISS)"
+  if [ "$code" != 1 ] || [ "$got" != "$want" ] || grep -q '^INCONCLUSIVE' "$TMP/pub-$m.out"; then
+    pub_ok=0
+    pub_why="$pub_why $m exit $code, misses: $(printf '%s' "$got" | tr '\n' ';')"
+  fi
+done
+if [ "$pub_ok" = 1 ] \
+  && [ "$(pub_notes c6a.xlarge PASS | grep '^concurrent qps')" = 'concurrent qps: measured 0.212, published 0.232, ratio 0.9138' ]; then
+  pass "v0.31.1 against v0.28.0's published rows misses exactly the pre-registered statements and QPS"
+else
+  fail "published v0.31.1" "$pub_why $(pub_notes c6a.xlarge PASS | grep '^concurrent' | head -n 1)"
+fi
+
+# published_null_measured_is_a_miss. Catches: a statement the published row
+# answered and the run did not skipped as if neither had answered it.
+python3 - "$PUB_FIX/c6a.large.json" "$TMP/pub-null-measured.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+r["result"][8] = [None, None, None]
+json.dump(r, open(sys.argv[2], "w"))
+PY
+published null-measured c6a.large "$TMP/pub-null-measured.json"
+if [ "$code" = 1 ] \
+  && [ "$(pub_notes null-measured MISS | grep '^statement 9 ')" = 'statement 9 hot: not answered, published 13.433 s
+statement 9 cold: not answered, published 14.736 s' ]; then
+  pass "a statement the published row answered and the run did not is a published miss"
+else
+  fail "published null measured" "exit $code: $(grep ' q09 ' "$TMP/pub-null-measured.out" | head -n 2) $(head -c 300 "$TMP/pub-null-measured.err")"
+fi
+
+# published_null_published_has_no_band. Catches: a figure ClickBench published
+# as null judged anyway, as zero or as unanswered: c6a.large's q14 has no
+# published figure, c6a.xlarge's q17 a hot one and no cold one.
+if [ "$(grep -c '  q14 ' "$TMP/pub-c6a.large.out")" = 0 ] \
+  && [ "$(grep -c '  q17 hot_s ' "$TMP/pub-c6a.xlarge.out")" = 1 ] \
+  && [ "$(grep -c '  q17 cold_s ' "$TMP/pub-c6a.xlarge.out")" = 0 ] \
+  && [ "$(grep -c '  q14 hot_s ' "$TMP/pub-c6a.xlarge.out")" = 1 ]; then
+  pass "a null published figure has no band"
+else
+  fail "published null published" "$(grep -h '  q1[47] ' "$TMP/pub-c6a.large.out" "$TMP/pub-c6a.xlarge.out" | head -n 4)"
+fi
+
+# run_toml_selecting_published_without_section_refused. Catches: a run.toml
+# selecting published for a machine with no [published] table accepted, so
+# the run would be judged against nothing; c6a.large, which has one, passes.
+write_run_toml "$TMP/run-pub-none.toml" "$BANDS" '["relative", "absolute", "published"]'
+sed 's/^phases = .*/phases = ["benchmark", "concurrent"]/' "$TMP/run-pub-none.toml" >"$TMP/run-pub-none.toml.new"
+mv "$TMP/run-pub-none.toml.new" "$TMP/run-pub-none.toml"
+code=0
+python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-pub-none.toml" >/dev/null 2>"$TMP/run-pub-none.err" || code=$?
+lcode=0
+bash "$KIT_SRC/launch.sh" --dry-run "$TMP/run-pub-none.toml" >/dev/null 2>"$TMP/run-pub-none-launch.err" || lcode=$?
+sed 's/^instance_type = .*/instance_type = "c6a.large"/' "$TMP/run-pub-none.toml" >"$TMP/run-pub-large.toml"
+ycode=0
+python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-pub-large.toml" >/dev/null 2>"$TMP/run-pub-large.err" || ycode=$?
+if [ "$code" = 2 ] && [ "$lcode" = 64 ] && [ "$ycode" = 0 ] \
+  && grep -qF 'band_sections selects published and there is no [published.c6a.4xlarge] table' "$TMP/run-pub-none.err" \
+  && grep -qF 'there is no [published.c6a.4xlarge] table' "$TMP/run-pub-none-launch.err"; then
+  pass "a run.toml selecting published without a [published] table for its machine is refused"
+else
+  fail "run.toml published without section" "check-run $code, launch $lcode, c6a.large $ycode: $(head -c 300 "$TMP/run-pub-none.err") $(head -c 300 "$TMP/run-pub-large.err")"
+fi
+
+# pub_edit SRC NAME EDIT: SRC with a python edit applied to its report r,
+# written to $TMP/pub-NAME.json.
+pub_edit() {
+  python3 - "$1" "$TMP/pub-$2.json" "$3" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+exec(sys.argv[3])
+json.dump(r, open(sys.argv[2], "w"))
+PY
+}
+
+# published_row_count_per_machine. Catches: a statement dropped from the
+# judgment (statement 43, say): each machine's table holds one row per
+# non-null published figure in its band file, plus one for QPS.
+rc_ok=1
+rc_why=""
+for m in c6a.large c6a.xlarge c6a.2xlarge; do
+  want="$(awk -v t="[published.$m]" '
+    $0 == t { on = 1; next }
+    /^\[/ { on = 0 }
+    on && /^q[0-9][0-9] = \[/ { n += 2 - gsub(/"null"/, "") }
+    END { print n + 1 }' "$PUB_BANDS")"
+  got="$(grep -cE '^(PASS|MISS)  ' "$TMP/pub-$m.out")"
+  if [ "$want" != "$got" ] || [ "$want" -lt 60 ] || ! grep -q '  q43 hot_s ' "$TMP/pub-$m.out"; then
+    rc_ok=0
+    rc_why="$rc_why $m: want $want rows, got $got;"
+  fi
+done
+if [ "$rc_ok" = 1 ]; then
+  pass "each machine is judged on every non-null published figure and QPS"
+else
+  fail "published row count" "$rc_why"
+fi
+
+# published_boundary_inclusive. Catches: either bound made exclusive, or
+# compared with any slack: c6a.large statement 7's published hot is 0.05 s,
+# so 0.055 s (exactly 1.10 x) passes and 0.056 s misses; c6a.2xlarge's
+# published QPS is 0.478, so 0.4302 (exactly 0.90 x) passes and 0.4301 misses.
+pub_edit "$PUB_FIX/c6a.large.json" b55 'r["result"][6] = [0.1, 0.055, 0.06]'
+pub_edit "$PUB_FIX/c6a.large.json" b56 'r["result"][6] = [0.1, 0.056, 0.06]'
+pub_edit "$PUB_FIX/c6a.2xlarge.json" q4302 'r["concurrent_qps"] = 0.4302'
+pub_edit "$PUB_FIX/c6a.2xlarge.json" q4301 'r["concurrent_qps"] = 0.4301'
+published b55 c6a.large "$TMP/pub-b55.json"
+b55="$code $(pub_notes b55 PASS | grep '^statement 7 hot')"
+published b56 c6a.large "$TMP/pub-b56.json"
+b56="$code $(pub_notes b56 MISS | grep '^statement 7 hot')"
+published q4302 c6a.2xlarge "$TMP/pub-q4302.json"
+q4302="$code $(pub_notes q4302 PASS | grep '^concurrent qps')"
+published q4301 c6a.2xlarge "$TMP/pub-q4301.json"
+q4301="$code $(pub_notes q4301 MISS | grep '^concurrent qps')"
+if [ "$b55" = '1 statement 7 hot: measured 0.055 s, published 0.050 s, ratio 1.1000' ] \
+  && [ "$b56" = '1 statement 7 hot: measured 0.056 s, published 0.050 s, ratio 1.1200' ] \
+  && [ "$q4302" = '0 concurrent qps: measured 0.430, published 0.478, ratio 0.9000' ] \
+  && [ "$q4301" = '1 concurrent qps: measured 0.430, published 0.478, ratio 0.8998' ]; then
+  pass "a figure at exactly the published factor passes and one step past it misses"
+else
+  fail "published boundary" "b55 [$b55] b56 [$b56] q4302 [$q4302] q4301 [$q4301]"
+fi
+
+# published_partial_null_clickbench_format. Catches: a ClickBench-format
+# statement with one failed try judged as not answered, or hot taken from the
+# failed try: [0.1, null, 0.04] judges hot 0.04 s and cold 0.1 s.
+pub_edit "$PUB_FIX/c6a.large.json" partial-cb 'r["result"][6] = [0.1, None, 0.04]'
+published partial-cb c6a.large "$TMP/pub-partial-cb.json"
+if [ "$code" = 1 ] && [ "$(pub_notes partial-cb PASS | grep '^statement 7 ')" = 'statement 7 hot: measured 0.040 s, published 0.050 s, ratio 0.8000
+statement 7 cold: measured 0.100 s, published 0.106 s, ratio 0.9434' ]; then
+  pass "a ClickBench-format statement with one failed try is judged on the tries that answered"
+else
+  fail "published partial null clickbench" "exit $code: $(grep '  q07 ' "$TMP/pub-partial-cb.out") $(head -c 300 "$TMP/pub-partial-cb.err")"
+fi
+
+# published_partial_null_kit_format. Catches: a kit statement with one failed
+# try judged as not answered, the box writing a failed statement without its
+# answered tries, or hot taken from the failed try: tries 0.1 s, a 503, and
+# 0.04 s judge hot 0.04 s and cold 0.1 s, as in ClickBench's format.
+pub_edit "$TMP/fixture-pass/results.json" partial-kit '
+sys.path.insert(0, "'"$KIT_SRC/lib"'")
+import kit
+calls = [{"try": 1, "outcome": "ok", "duration_s": 0.1, "rows": 1},
+         {"try": 2, "outcome": "http_error", "http_status": 503, "refusal_class": None,
+          "error": "unavailable", "duration_s": 0.02},
+         {"try": 3, "outcome": "ok", "duration_s": 0.04, "rows": 1}]
+sid = [e["id"] for e in r["entries"] if e["id"].startswith("q07")][0]
+entry, failed = kit.statement_report(sid, None, calls)
+assert entry is None and failed["tries_ms"] == [100.0, None, 40.0], failed
+r["entries"] = [e for e in r["entries"] if e["id"] != sid]
+r["failed"].append(failed)
+r["provenance"]["band_sections"].append("published")
+rd = {"round": 1, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
+      "ok": 100, "err": 0, "wrong_answer": 0, "qps": 1.0, "error_ratio": 0.0}
+r["concurrent"] = {"rounds": [rd], "pooled": {"rounds": 1, "calls": 100, "ok": 100, "err": 0,
+                   "wrong_answer": 0, "error_ratio_weighted": 0.0,
+                   "error_ratio_mean_of_rounds": 0.0, "qps_pooled": 1.0}}' 2>"$TMP/pub-partial-kit.edit.err"
+published partial-kit c6a.large "$TMP/pub-partial-kit.json"
+if [ "$code" = 1 ] && [ "$(pub_notes partial-kit PASS | grep '^statement 7 ')" = 'statement 7 hot: measured 0.040 s, published 0.050 s, ratio 0.8000
+statement 7 cold: measured 0.100 s, published 0.106 s, ratio 0.9434' ]; then
+  pass "a kit statement with one failed try is judged on the tries that answered"
+else
+  fail "published partial null kit" "exit $code: $(grep '  q07 ' "$TMP/pub-partial-kit.out") $(head -c 300 "$TMP/pub-partial-kit.err") $(tail -n 2 "$TMP/pub-partial-kit.edit.err")"
+fi
+
+# published_missing_qps_refuses. Catches: a ClickBench-format file whose
+# concurrent_qps is absent or not a number reported INCONCLUSIVE with exit 0,
+# when c6a.2xlarge's file really misses on QPS at 0.757.
+pub_edit "$PUB_FIX/c6a.2xlarge.json" noqps 'del r["concurrent_qps"]'
+pub_edit "$PUB_FIX/c6a.2xlarge.json" strqps 'r["concurrent_qps"] = "0.362"'
+published noqps c6a.2xlarge "$TMP/pub-noqps.json"
+ncode="$code"
+published strqps c6a.2xlarge "$TMP/pub-strqps.json"
+if [ "$ncode" = 2 ] && [ "$code" = 2 ] \
+  && grep -qF "pub-noqps.json has no concurrent_qps field; [published.c6a.2xlarge] has concurrent_qps 0.478 to judge it against" "$TMP/pub-noqps.err" \
+  && grep -qF "pub-strqps.json: concurrent_qps must be a number of at least 0, got '0.362'" "$TMP/pub-strqps.err"; then
+  pass "a ClickBench-format file with no readable concurrent_qps is refused"
+else
+  fail "published missing qps" "absent $ncode, string $code: $(head -c 300 "$TMP/pub-noqps.err") $(head -c 300 "$TMP/pub-strqps.err")"
+fi
+
+# published_machine_mismatch_refuses. Catches: a ClickBench-format file judged
+# against another machine's published rows: c6a.2xlarge's file passes 69 of
+# c6a.large's bands.
+published mismatch c6a.large "$PUB_FIX/c6a.2xlarge.json"
+if [ "$code" = 2 ] && [ ! -s "$TMP/pub-mismatch.out" ] \
+  && grep -qF "c6a.2xlarge.json: machine is 'c6a.2xlarge', not c6a.large" "$TMP/pub-mismatch.err"; then
+  pass "a ClickBench-format file for another machine is refused"
+else
+  fail "published machine mismatch" "exit $code: $(head -c 300 "$TMP/pub-mismatch.err")"
+fi
+
+# published_not_selected_refuses. Catches: a kit results.json whose
+# band_sections did not select published judged silently as nothing, exit 0.
+published notsel c6a.large "$TMP/fixture-pass/results.json"
+if [ "$code" = 2 ] && [ ! -s "$TMP/pub-notsel.out" ] \
+  && grep -qF "results.json: published not selected: its band_sections are relative, absolute" "$TMP/pub-notsel.err"; then
+  pass "a kit results.json that did not select published is refused"
+else
+  fail "published not selected" "exit $code: $(head -c 300 "$TMP/pub-notsel.err")"
+fi
+
+# run_toml_published_without_concurrent_refused. Catches: a run.toml selecting
+# published without the concurrent phase accepted, so its QPS band could
+# never be judged; the same file with concurrent added passes.
+write_run_toml "$TMP/run-pub-noconc.toml" "$BANDS" '["relative", "absolute", "published"]'
+sed 's/^instance_type = .*/instance_type = "c6a.large"/' "$TMP/run-pub-noconc.toml" >"$TMP/run-pub-noconc.toml.new"
+mv "$TMP/run-pub-noconc.toml.new" "$TMP/run-pub-noconc.toml"
+sed 's/^phases = .*/phases = ["benchmark", "concurrent"]/' "$TMP/run-pub-noconc.toml" >"$TMP/run-pub-conc.toml"
+code=0
+python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-pub-noconc.toml" >/dev/null 2>"$TMP/run-pub-noconc.err" || code=$?
+ccode=0
+python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-pub-conc.toml" >/dev/null 2>"$TMP/run-pub-conc.err" || ccode=$?
+if [ "$code" = 2 ] && [ "$ccode" = 0 ] \
+  && grep -qF 'band_sections selects published, which judges concurrent QPS, and phases does not include concurrent' "$TMP/run-pub-noconc.err"; then
+  pass "a run.toml selecting published without the concurrent phase is refused"
+else
+  fail "run.toml published without concurrent" "check-run $code, with concurrent $ccode: $(head -c 300 "$TMP/run-pub-noconc.err") $(head -c 300 "$TMP/run-pub-conc.err")"
 fi
 
 # --- syntax -----------------------------------------------------------------
