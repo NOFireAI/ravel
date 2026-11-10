@@ -1301,10 +1301,25 @@ Rules that make a pass trustworthy:
 
 **With the kit.** The bands are pre-registered in the lane's band file under
 `benchmarks/clickbench/bands/`, and the box asserts the absolute ones itself:
-a miss writes `DONE` with `bands=miss`. `benchmarks/clickbench/kit/fetch.sh
+a miss writes `DONE` with `bands=miss`. The issue comment that pre-registers
+the run (ADR-2867 change 6) links the band file and its commit, and carries a
+required line naming the published baseline: `published baseline:
+rlog.toml@<ravel sha>`, the band file at the Ravel commit whose
+`[published.<machine>]` table covers the run's `instance_type`, or `none
+exists for <lane>` when it has none; the table's `source` row keeps the
+upstream ClickBench file and commit. A run.toml whose `band_sections`
+includes `published` judges each arm against that table. Hot is the best of
+tries 2 and 3 that answered, missing only when both failed; cold is try 1.
+Statement hot or cold above 1.10 times the published seconds, a statement
+the published row answered and the arm did not, or concurrent QPS below 0.90
+times the published QPS is a miss. Launch refuses one whose machine has no
+table, or whose `phases` leave out `concurrent`, since the table judges
+concurrent QPS; an arm with no readable QPS is refused with exit 2, not
+judged. `benchmarks/clickbench/kit/fetch.sh
 --run-toml run.toml <run-id>` polls both arms' `out/` prefixes every 60 s (no
 single aws call over 90 s), downloads `results.json` and `evidence.tgz`, prints
-each arm's absolute bands and then arm B's relative bands against arm A, and
+each arm's absolute bands, then arm B's relative bands against arm A, then
+each arm's published bands when the run selected them, and
 exits 0 on a pass, 1 on a miss, 2 on `FAILED` or a malformed `results.json`,
 3 on timeout, 4 when S3 is unreachable or a download fails with anything
 but a missing key (a 403 and a missing bucket included), and 5 when the box

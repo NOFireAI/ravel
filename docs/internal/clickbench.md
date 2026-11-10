@@ -1091,6 +1091,38 @@ kit (`benchmarks/clickbench/kit/`) does not read this file: it runs only the
 RLOG lane, whose relative and absolute bands are in
 `benchmarks/clickbench/bands/rlog.toml`.
 
+That file also holds the RLOG lane's published baseline (ADR-4034 D6):
+`[published]` sets the two factors, and one `[published.<machine>]` table
+per machine (`c6a.large`, `c6a.xlarge`, `c6a.2xlarge`) holds the hot and
+cold seconds ClickBench published for each statement and the published
+concurrent QPS, with `source` naming the upstream results file and commit
+it was copied from. A run whose `run.toml` `band_sections` includes
+`published` is judged against its `instance_type`'s table. In both a kit
+`results.json` and ClickBench's own results format, hot is the best of
+tries 2 and 3 that answered, missing only when both failed; cold is try 1. A
+statement misses when its measured hot or cold exceeds 1.10 times the
+published figure, or when the published row answered it and the run did
+not, and concurrent QPS misses below 0.90 times the published figure. Both
+bounds are inclusive, and ratios print to four decimals. A figure published
+as `"null"` has no band. The kit refuses a `run.toml` that selects
+`published` for a machine with no table, or whose `phases` leave out
+`concurrent`: the published table judges concurrent QPS, and a run without
+that phase has none to judge. `kit.py published LABEL BAND_FILE MACHINE
+RESULTS` judges one results file, a kit `results.json` or a results file in
+ClickBench's own format, and exits 2 rather than judge when the file has no
+readable concurrent QPS and the machine's table has one, when a ClickBench
+format file's `machine` is not `MACHINE`, or when a kit `results.json` did
+not select `published`. `fetch.sh` judges only a run that selected
+`published`, and exits 1 on a published miss on either arm.
+
+The issue comment that pre-registers a run (ADR-2867 change 6) carries one
+required line naming the published baseline the run is judged against:
+`published baseline: rlog.toml@<ravel sha>`, the band file at the Ravel
+commit that holds its `[published.<machine>]` table, or `none exists for
+<lane>` when the lane or machine has no published rows. The upstream
+ClickBench file and commit each table was copied from stay in that table's
+`source` row. A pre-registration without that line is incomplete.
+
 - `memory_cap_bytes` is the per-query memory cap the pre-registered failures
   are stated against. Start the server once (step 5) and copy the
   `sql_max_query_bytes` value its startup log names; every report's server
