@@ -4695,6 +4695,27 @@ else
   fail "same-box malformed windows" "$mw_why"
 fi
 
+# new_arm_old_is_refused. FLIP: without the refusal, --new-arm old compares
+# the v0.28.0 windows with themselves, ratio 1.0, and the M7 c6a.2xlarge log
+# that misses at 0.7677 passes with exit 0.
+printf 'window=1 arm=old qps=0.488 err_ratio=0.191\nwindow=2 arm=new qps=0.380 err_ratio=0.106\nwindow=3 arm=new qps=0.380 err_ratio=0.073\nwindow=4 arm=old qps=0.502 err_ratio=0.164\n' >"$TMP/sb-self.log"
+published sb-self c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$TMP/sb-self.log" --new-arm old
+if [ "$code" = 2 ] && grep -qF 'names the v0.28.0 arm itself' "$TMP/pub-sb-self.err"; then
+  pass "--new-arm old is refused"
+else
+  fail "same-box new arm old" "exit $code: $(head -c 300 "$TMP/pub-sb-self.out") $(head -c 300 "$TMP/pub-sb-self.err")"
+fi
+
+# zero_old_qps_is_refused. FLIP: without the refusal, an old arm that measured
+# zero QPS in every window leaves no baseline, and the 0 >= 0.95 x 0 test passes.
+printf 'window=1 arm=old qps=0 err_ratio=1.0\nwindow=2 arm=new qps=0 err_ratio=1.0\nwindow=3 arm=new qps=0 err_ratio=1.0\nwindow=4 arm=old qps=0 err_ratio=1.0\n' >"$TMP/sb-zero.log"
+published sb-zero c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$TMP/sb-zero.log"
+if [ "$code" = 2 ] && grep -qF 'measured zero QPS in every window' "$TMP/pub-sb-zero.err"; then
+  pass "an old arm with zero QPS is refused"
+else
+  fail "same-box zero old qps" "exit $code: $(head -c 300 "$TMP/pub-sb-zero.out") $(head -c 300 "$TMP/pub-sb-zero.err")"
+fi
+
 # m7_2xlarge_figures_fail. FLIP: the same-box ratio taken old over new (1.3026,
 # a pass): M7's c6a.2xlarge figures, new 0.380 and 0.380 over old 0.488 and
 # 0.502, are 0.7677 and miss.
