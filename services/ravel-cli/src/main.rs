@@ -5,8 +5,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::{
-    catalog, hold, idem, maintain, now_ns, parse_max_flush_lifetime_ns, rlog_footprint, store,
-    tenancy, tenant_token,
+    catalog, hold, idem, maintain, now_ns, parse_max_flush_lifetime_ns, parse_retention_default_ns,
+    rlog_footprint, store, tenancy, tenant_token,
 };
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
@@ -2649,6 +2649,19 @@ enum CatalogCommand {
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
+        /// The deployment-default retention window for this fold (humantime
+        /// duration, e.g. `30d`, `720h`; the same grammar as ravel-server's
+        /// `--retention-default`), used when the tenant's durable config record
+        /// carries no `retention_ns` of its own, which wins when set. With a
+        /// window, the fold's frontier reconcile also lists the snapshot-named
+        /// hours at or approaching the retention frontier (now minus the window,
+        /// plus the protection horizon), so it observes retention tombstones in
+        /// hours outside its fixed reconcile window and drops their entries from
+        /// HEAD. Unset, a tenant with no `retention_ns` gets no frontier
+        /// reconcile. Must be greater than zero.
+        #[arg(long, value_name = "DURATION", conflicts_with = "rebuild_key_index",
+              value_parser = parse_retention_default_ns)]
+        retention_default: Option<i64>,
         /// Override the most entries one snapshot part this fold writes may
         /// hold (default 250,000, `ravel_catalog::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`),
         /// for this invocation only. Parts still split at hour boundaries, so a
@@ -3269,11 +3282,12 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     key_index_build_max_pairs,
                     metrics_label_index,
                     snapshot_part_max_entries,
+                    retention_default,
                     json,
                     tenant_kms,
                     ..
                 },
-        } => catalog::fold_with_metrics_label_index(
+        } => catalog::fold_with_retention_default(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
@@ -3289,6 +3303,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 .map(usize::try_from)
                 .transpose()
                 .map_err(|_| anyhow::anyhow!("--snapshot-part-max-entries does not fit usize"))?,
+            retention_default,
             now_ns()?,
             json,
         )
