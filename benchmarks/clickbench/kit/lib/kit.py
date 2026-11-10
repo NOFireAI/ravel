@@ -1126,6 +1126,9 @@ def same_box_qps_bands(path, new_arm, published_qps, q):
     decimal. Mean new QPS against Q x PUBLISHED_QPS is a REPORTED row, not a
     gate."""
     arms = qps_windows(path)
+    if new_arm == QPS_OLD_ARM:
+        raise Refusal("--new-arm %s names the v0.28.0 arm itself; the gate would compare "
+                      "it with itself" % new_arm)
     for arm in (QPS_OLD_ARM, new_arm):
         if arm not in arms:
             raise Refusal("%s: no window of arm %s (arms: %s)"
@@ -1137,6 +1140,9 @@ def same_box_qps_bands(path, new_arm, published_qps, q):
     n_new, n_old = decimal.Decimal(len(new)), decimal.Decimal(len(old))
     q_new = sum(decimal.Decimal(w[0]) for w in new)
     q_old = sum(decimal.Decimal(w[0]) for w in old)
+    if q_old == 0:
+        raise Refusal("%s: the old arm measured zero QPS in every window, so there is no "
+                      "baseline to judge against" % path)
     e_new = sum(decimal.Decimal(w[1]) for w in new)
     e_old = sum(decimal.Decimal(w[1]) for w in old)
     mq_new, mq_old = float(q_new / n_new), float(q_old / n_old)
@@ -2767,8 +2773,10 @@ def main(argv):
                 return 1
             unjudged = [r["statement"] for r in rows if r["verdict"] == "unjudged"]
             if unjudged:
-                print("kit: run incomplete: %s unjudged (unstable published reference); "
-                      "give --arm-o to judge them" % ", ".join(unjudged), file=sys.stderr)
+                hint = ("arm O holds no hot figure for them" if arm_o is not None
+                        else "give --arm-o to judge them")
+                print("kit: run incomplete: %s unjudged (unstable published reference); %s"
+                      % (", ".join(unjudged), hint), file=sys.stderr)
                 return EXIT_INCOMPLETE
             return 0
         elif cmd == "relative" and len(args) in (3, 4):
