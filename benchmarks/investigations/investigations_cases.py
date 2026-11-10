@@ -3590,6 +3590,42 @@ class Evaluate(Workdir):
     def test_w8_retired_hours_are_the_tombstoned_hour(self):
         self.assertEqual(self.check_w8_retired_hours_are_the_tombstoned_hour(), [])
 
+    def check_on_demand_fold_figures_unsupported(self, evaluate_py=EVALUATE, bands=BANDS):
+        """The retired_hour folds are on-demand folds (source admin_fold), whose response carries none of
+        the fields W2, W3 and W8 read from them: each such figure is unsupported naming that response,
+        never missing and never judged; the stamp figures beside them still read their values."""
+        mod = load_module(evaluate_py, "evaluate_on_demand_fold")
+        live = {"retired_hour": None, "retired_hour_drop": None}
+        response = {"source": "admin_fold", "report": {"status": "published", "put_requests": 3, "entry_count": 5}}
+        folds = {(t, "dp7", "logs"): response for t in ("retired_hour", "retired_hour_refold", "retired_hour_drop",
+                                                        "retired_hour_drop_refold")}
+        docs = {("retired_hour", "logs", "fold_binary"): {"sha": "a" * 40, "carries_c1": True, "carries_r2": False},
+                ("retired_hour", "logs", "tombstone"): {"hour": 100},
+                ("retired_hour_drop", "logs", "catalog"): self.drop_catalog("120..=143")}
+        figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2", "adr3939_w3", "adr3939_w8"), live, docs, {}, folds)
+        out = []
+        with open(bands, "rb") as fh:
+            rows = [r for r in tomllib.load(fh)["row"] if r["key"] in ("adr3939_w2", "adr3939_w3", "adr3939_w8")]
+        read = 0
+        for r in rows:
+            for fig in r["figure"]:
+                if not fig["metric"].startswith("fold."):
+                    continue
+                read += 1
+                f = figs[f"{r['key']}.{fig['name']}"]
+                if f["verdict"] != mod.UNSUPPORTED or "fold_on_demand.rs" not in (f["reason"] or ""):
+                    out.append(f"{r['adr_row']} {fig['name']}: {f['verdict']} ({f['reason']})")
+        if read == 0:
+            out.append("no fold figure in W2, W3 or W8")
+        for name, want in (("adr3939_w2.fold_binary_pre_r2", 1), ("adr3939_w3.tombstoned_hour", 100),
+                           ("adr3939_w3.drop_parts_holding_hour", 0)):
+            if figs[name]["value"] != want:
+                out.append(f"{name}: {figs[name]['verdict']} {figs[name]['value']}, want {want}")
+        return out
+
+    def test_on_demand_fold_figures_unsupported(self):
+        self.assertEqual(self.check_on_demand_fold_figures_unsupported(), [])
+
     def check_w7_reads_two_day_parts(self, evaluate_py=EVALUATE, bands=BANDS):
         """W7's midnight call passes only when every try covered exactly 2 day parts and left none
         uncovered: 4 leaf GETs over 1 covered part (a window inside one day) misses, as does a third part
@@ -4334,6 +4370,11 @@ FLIPS = {
         'f["row"] == 18 or f.get("adr") == "ADR-3939")',
         'f["row"] == 18 or f.get("adr") == "none")',
         "check_row_18_timing_rows_leave_run_incomplete",
+    ),
+    "an on-demand fold's absent field read as the CLI fold's": (
+        '        if line.get("source") == "admin_fold" and (field in FOLD_ALLOWLIST or field in ADMIN_FOLD_ABSENT):\n',
+        '        if False:\n',
+        "check_on_demand_fold_figures_unsupported",
     ),
 }
 
