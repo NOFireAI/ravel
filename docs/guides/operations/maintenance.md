@@ -554,7 +554,9 @@ the bucket as already compacted. The four reasons are:
 
 An `unreadable_claim` holds the bucket, for compaction and for erasure alike,
 for at most 24 hours after the claim object was last written, plus a jitter of
-at most 10% of the configured claim lease (30 s at the 300 s default). The
+at most 10% of the configured claim lease (30 s at the 300 s default). A lease
+configured longer than 24 h counts as 24 h here, so the jitter is at most 10%
+of 24 h. The
 printed expiry is the object's last write plus 24 h, and the retry point is one
 millisecond past that expiry plus the jitter. A run at or after the retry point
 takes the claim over with a compare-and-swap on the version it read, logs a
@@ -565,8 +567,12 @@ deletes a claim object.
 
 A running maintenance process does not wait for the retry point before it looks
 again. It re-checks a bucket held by an unreadable claim about once per
-configured claim lease plus the jitter: one GET and one HEAD of the claim key
-each time. If the key is gone, it claims the bucket and compacts. If the key is
+configured claim lease plus the jitter. Each re-check costs one rejected
+CreateIfAbsent PUT, one GET and one HEAD of the claim key, the same as any
+contended claim request. At the 300 s default lease one process re-checks a
+stuck bucket at most 288 times a day (24 h / 300 s; the jitter and the extra
+millisecond make it slightly fewer), so at most 288 rejected PUTs per stuck
+bucket per day. If the key is gone, it claims the bucket and compacts. If the key is
 still there and younger than the 24 h ceiling, it skips the bucket again. Past
 the ceiling, it takes the claim over as described above.
 
