@@ -1,0 +1,95 @@
+name: ci-flake-sweep
+
+# Repository-wide flake ledger (ADR-4034, issue #4044). Reads the failed
+# ci.yml runs of the last 24 h on merge_group and on push to main, files or
+# updates one `flaky-test` issue per failing test identifier, adds
+# `flake-quarantine-due` on a second failure within 14 days, and fails this
+# run when a due issue has gone more than one working day with no open pull
+# request referencing it. See scripts/guards/ci-flake-sweep.sh.
+#
+# Two jobs:
+#   cases   the sweep's case suite, against a stubbed gh. Runs on every
+#           trigger, including pull requests that touch the sweep or the
+#           assert-green-head.sh grep it reads.
+#   sweep   the live sweep. Not on pull_request. The only job with
+#           `issues: write`; it runs nothing but a checkout and the repo's
+#           own shell script.
+#
+# Top-level permissions floor is `contents: read`.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every 6 h at :47 (01:47, 07:47, 13:47, 19:47 UTC). Off the :00/:30
+    # marks and on a minute no other scheduled lane uses (metricsbench-nightly
+    # 02:13, k8s-nightly 03:00, sim-nightly 03:17, bench-s3 weekly 04:17,
+    # tla-nightly 04:37, fuzz-nightly 05:21, supply-chain-nightly 05:43,
+    # interop-nightly 06:09, ci-budget-nightly 06:11, quickstart-published
+    # weekly 06:29, dr-rehearsal weekly 07:19).
+    - cron: "47 1,7,13,19 * * *"
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  pull_request:
+    paths:
+      - ".github/workflows/ci-flake-sweep.yml"
+      - "scripts/guards/assert-green-head.sh"
+      - "scripts/guards/ci-flake-sweep.sh"
+      - "scripts/guards/ci-flake-sweep.test.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  cases:
+    # A workflow_run for a ci.yml run that did not fail on merge_group runs
+    # nothing here either.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'failure' &&
+       github.event.workflow_run.event == 'merge_group')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: ci-flake-sweep cases (issue #4044)
+        run: bash scripts/guards/ci-flake-sweep.test.sh
+
+  sweep:
+    needs: cases
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'failure' &&
+       github.event.workflow_run.event == 'merge_group')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # actions: read for the run, job and log queries; issues: write to file,
+    # edit and label the flake issues; pull-requests: read for the open pull
+    # requests that reference a due issue.
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: read
+    # Serialize the read-then-create across runs, so a scheduled sweep and a
+    # workflow_run sweep cannot both see no issue and both file one. The
+    # per-identifier title marker and the run ids in each issue's ledger make
+    # whichever run goes second a no-op for what the first already filed.
+    concurrency:
+      group: ci-flake-sweep
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Sweep failed ci.yml runs into flake issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: scripts/guards/ci-flake-sweep.sh
