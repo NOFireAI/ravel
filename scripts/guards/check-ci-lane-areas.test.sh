@@ -251,7 +251,7 @@ check_map() {
 
 # FLIP: compute lanes from direct dependants only (not the fixed-point
 # closure) and ravel-types, two hops from ravel-server, reaches nothing:
-# exit 1 with four findings on the ravel-types row.
+# exit 1 with five findings on the ravel-types row.
 check_map "a map matching the closure passes" "${GOOD}" 0 "clean (7 crates"
 
 # FLIP: walk the map's rows instead of the workspace's crates and a crate with
