@@ -491,17 +491,89 @@ EOF
 check_refs "a YAML anchor is refused, not skipped" "${d}" 2 \
   "could not read .github/workflows/ci.yml"
 
+# A run: script is block scalar text, so a `---` line (a heredoc writing a
+# second manifest) or a tab-indented line inside it is not structure. FLIP: a
+# reader that refuses those lines before it knows they are scalar content
+# exits 2 here.
+d="$(fixture block-scalar-separator-and-tab)"
+printf '%s\n' \
+  'name: ci' \
+  'on: push' \
+  'jobs:' \
+  '  build:' \
+  '    runs-on: ubuntu-latest' \
+  '    steps:' \
+  "      - uses: ${PIN_A}" \
+  '      - name: Manifests' \
+  '        run: |' \
+  '          cat <<YAML' \
+  '          kind: A' \
+  '          ---' \
+  '          kind: B' \
+  '          YAML' \
+  "          	echo tab-indented" \
+  >"${d}/.github/workflows/ci.yml"
+check_refs "a --- or tab line inside a run: block is read as text" "${d}" 0 \
+  "external action references: 1 by line grep, 1 by YAML structure"
+
+# The same two lines read as structure are still refused. FLIP: a reader
+# that dropped the refusals to fix the case above passes these.
+d="$(fixture second-document)"
+printf '%s\n' 'name: ci' 'on: push' 'jobs:' '  build:' \
+  '    runs-on: ubuntu-latest' '    steps:' "      - uses: ${PIN_A}" '---' \
+  'name: other' >"${d}/.github/workflows/ci.yml"
+check_refs "a second YAML document is refused" "${d}" 2 \
+  "more than one document or a directive"
+d="$(fixture tab-structure)"
+printf '%s\n' 'name: ci' 'on: push' 'jobs:' '  build:' \
+  '    runs-on: ubuntu-latest' '    steps:' "	- uses: ${PIN_A}" \
+  >"${d}/.github/workflows/ci.yml"
+check_refs "a tab-indented structural line is refused" "${d}" 2 \
+  "tab indentation"
+
+# A quoted local action is skipped by both readers. FLIP: a grep side that
+# tests `./` before removing the quotes lists it as external and the counts
+# disagree.
+d="$(fixture quoted-local-action)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+      - uses: './.github/actions/local'
+      - uses: "./.github/actions/other"
+EOF
+check_refs "a quoted local action is skipped by both readers" "${d}" 0 \
+  "external action references: 1 by line grep, 1 by YAML structure"
+
+# replace_first <file> <ere> <text>: replaces the first match of ERE on any
+# line with TEXT (awk -v turns \n into a newline). awk because `0,/re/` is a
+# GNU-only sed address.
+replace_first() {
+  local file="$1" re="$2" text="$3" tmp
+  tmp="$(mktemp)"
+  awk -v re="${re}" -v text="${text}" \
+    '!done && match($0, re) { $0 = substr($0, 1, RSTART - 1) text substr($0, RSTART + RLENGTH); done = 1 } { print }' \
+    "${file}" >"${tmp}" && mv "${tmp}" "${file}"
+}
+
 # Through the full check: a flow-mapping step added to a real workflow fails
 # the run, and an unpinned reference still fails the pin check.
 d="$(new_tree workflow-flow-mapping-step)"
-mutate "${d}/.github/workflows/k8s-nightly.yml" \
-  "0,/^      - name: Install sccache/s##      - {name: Flow step, uses: ${PIN_B}}\n      - name: Install sccache#"
+replace_first "${d}/.github/workflows/k8s-nightly.yml" \
+  '^      - name: Install sccache' \
+  "      - {name: Flow step, uses: ${PIN_B}}\n      - name: Install sccache"
 check "a flow-mapping uses: in a real workflow fails the full check" "${d}" 1 \
   "references only the YAML structure found"
 
 d="$(new_tree workflow-unpinned-action)"
-mutate "${d}/.github/workflows/k8s-nightly.yml" \
-  '0,/actions\/checkout@[0-9a-f]\{40\}/s##actions/checkout@v4#'
+hex40="$(printf '[0-9a-f]%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+  21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40)"
+replace_first "${d}/.github/workflows/k8s-nightly.yml" \
+  "actions/checkout@${hex40}" 'actions/checkout@v4'
 check "an action pinned by tag still fails the pin check" "${d}" 1 \
   "1 workflow action reference(s) lack a full 40-character commit SHA"
 
