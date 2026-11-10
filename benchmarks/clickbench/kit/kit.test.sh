@@ -4674,8 +4674,8 @@ mw_ok=1
 mw_why=""
 for c in nonnum missing arm; do
   case "$c" in
-    nonnum) printf 'window=1 arm=old qps=0.5 err_ratio=0.02\nwindow=2 arm=new qps=fast err_ratio=0.02\n' ;;
-    missing) printf 'window=1 arm=old qps=0.5 err_ratio=0.02\nwindow=2 arm=new qps=0.5\n' ;;
+    nonnum) printf 'window=1 arm=old qps=0.5 err_ratio=0.02\nwindow=2 arm=new qps=fast err_ratio=0.02\nwindow=3 arm=new qps=0.5 err_ratio=0.02\nwindow=4 arm=old qps=0.5 err_ratio=0.02\n' ;;
+    missing) printf 'window=1 arm=old qps=0.5 err_ratio=0.02\nwindow=2 arm=new qps=0.5\nwindow=3 arm=new qps=0.5 err_ratio=0.02\nwindow=4 arm=old qps=0.5 err_ratio=0.02\n' ;;
     arm) cat "$SB_FIX/qps-ab-095.log" ;;
   esac >"$TMP/sb-mw-$c.log"
   case "$c" in
@@ -4695,9 +4695,9 @@ else
   fail "same-box malformed windows" "$mw_why"
 fi
 
-# m7_2xlarge_figures_fail. FLIP: same-box QPS judged per window or on the
-# best window rather than mean over mean: M7's c6a.2xlarge figures, new 0.380
-# and 0.380 over old 0.488 and 0.502, are 0.7677 and miss.
+# m7_2xlarge_figures_fail. FLIP: the same-box ratio taken old over new (1.3026,
+# a pass): M7's c6a.2xlarge figures, new 0.380 and 0.380 over old 0.488 and
+# 0.502, are 0.7677 and miss.
 published sb-m7 c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-m7-2xlarge.log"
 if [ "$code" = 1 ] \
   && [ "$(sb_note sb-m7 MISS 'same-box')" = 'same-box qps: new (2 windows) over old v0.28.0 (2 windows), mean 0.3800 over 0.4950, ratio 0.7677' ] \
