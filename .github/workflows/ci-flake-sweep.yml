@@ -2,10 +2,13 @@ name: ci-flake-sweep
 
 # Repository-wide flake ledger (ADR-4034, issue #4044). Reads the failed
 # ci.yml runs of the last 24 h on merge_group and on push to main, files or
-# updates one `flaky-test` issue per failing test identifier, adds
+# updates one `flaky-test` issue per failing test (keyed on nextest's binary
+# id and test name, else the failed job's name and libtest's test path), adds
 # `flake-quarantine-due` on a second failure within 14 days, and fails this
 # run when a due issue has gone more than one working day with no open pull
-# request referencing it. See scripts/guards/ci-flake-sweep.sh.
+# request referencing it. A failed job whose log names no test is printed
+# and counted in the sweep's summary line. See
+# scripts/guards/ci-flake-sweep.sh.
 #
 # Two jobs:
 #   cases   the sweep's case suite, against a stubbed gh. Runs on every
