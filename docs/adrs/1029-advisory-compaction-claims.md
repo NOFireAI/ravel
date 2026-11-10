@@ -859,9 +859,21 @@ does for its own objects), which is a proto field and a claim format version
 bump. It is not decided here; the write grant on `sys/maintain/` remains the
 control on it.
 
+**The recheck is once per lease, not once per ceiling.** The skip carries two
+instants. `reschedule_after_unix_ms` is the steal threshold above.
+`recheck_after_unix_ms` is when the caller looks at the bucket again: for an
+unreadable claim, the earlier of that threshold and one configured lease plus
+the contender's jitter plus one millisecond past the observation; for every
+other skip reason, the reschedule point itself. The compaction scan's
+in-memory hold reads the recheck point, so a worker re-observes an unreadable
+claim about once per lease: if the key is gone it claims the bucket normally,
+if it is still there and young it skips again, and past the threshold it
+steals. Each look costs the rejected `CreateIfAbsent` plus one GET and one
+HEAD of the claim key, the same as any contended observation.
+
 **Operator removal.** Deleting a stuck claim key by hand is still allowed and
-still ends the hold at once, with the caution the operations guide gives. It
-is no longer the only way out.
+ends the hold within one lease plus jitter (the next recheck), with the
+caution the operations guide gives. It is no longer the only way out.
 
 Tests, each shown failing against the code before this amendment:
 `an_unreadable_claim_is_stolen_once_older_than_the_lease_ceiling` in
@@ -875,6 +887,11 @@ in `crates/ravel-maintain/src/claim_guard.rs`;
 `crates/ravel-maintain/tests/compaction_claims.rs`, which replace the two
 tests of the same prefix the 2026-10-03 amendment names; and
 `a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling` in
+`services/ravel-server/src/maintain.rs`. The recheck point is pinned by
+`an_unreadable_claim_is_rechecked_once_per_lease_before_its_steal` in
+`crates/ravel-maintain/src/claim_guard.rs`, and through the compaction scan by
+`a_hand_deleted_unreadable_claim_releases_its_bucket_within_one_lease` and
+`a_present_unreadable_claim_is_rechecked_once_per_lease_and_skipped` in
 `services/ravel-server/src/maintain.rs`.
 
 The TLA+ model checks the same rule: `Steal` in

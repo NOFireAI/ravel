@@ -563,6 +563,13 @@ claim. If anything writes the claim object between the read and the
 takeover, the takeover fails and the bucket is retried later. Ravel never
 deletes a claim object.
 
+A running maintenance process does not wait for the retry point before it looks
+again. It re-checks a bucket held by an unreadable claim about once per
+configured claim lease plus the jitter: one GET and one HEAD of the claim key
+each time. If the key is gone, it claims the bucket and compacts. If the key is
+still there and younger than the 24 h ceiling, it skips the bucket again. Past
+the ceiling, it takes the claim over as described above.
+
 A run never continues without the claim. Such a run could publish a compaction
 built from data that an erasure of the same bucket already removed. A claim
 written by a newer release in a format that this release cannot read looks the
@@ -578,7 +585,8 @@ To end a hold sooner than 24 hours:
 1. Confirm the reason. The holder prints as `unknown`, and the reason stays
    `unreadable_claim` on every retry.
 2. Make sure that no compaction, migration or erasure of that bucket runs.
-3. Remove that one key by hand.
+3. Remove that one key by hand. A running maintenance process picks the
+   bucket up at its next re-check, within one claim lease plus the jitter.
 
 `--dry-run` and `--no-claim` take no claims. `--no-claim` is for repair work
 when a claim is in the way:
