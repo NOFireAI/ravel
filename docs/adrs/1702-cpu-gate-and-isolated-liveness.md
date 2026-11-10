@@ -1053,7 +1053,8 @@ name-postings cache are bounded per tenant by entry count only, and the
 number of tenants they hold entries for is not bounded. Once the catalog
 shares the process budget with SQL, cached decodes from many tenants can
 hold a large share of it: SQL's reservations cannot
-make these caches give memory back, and decision 6's eviction pass runs only
+make these caches give memory back (see the pressure-evictor amendment
+below), and decision 6's eviction pass runs only
 for a refused catalog decode, and is skipped when the bytes are held outside
 the caches.
 
@@ -1080,7 +1081,9 @@ caches combined, across every tenant:
   largest parts can fall in that case.
 - Evictions made by the bound are counted in
   `Catalog::decoded_cache_byte_bound_evictions`, apart from decision 6's
-  memory-pressure pass (`Catalog::decoded_cache_memory_evictions`). An
+  memory-pressure pass (`Catalog::decoded_cache_memory_evictions`, which
+  also counts the process pressure evictor's drops; see the
+  pressure-evictor amendment below). An
   entry refused for being larger than the bound is counted in neither, but
   in `Catalog::decoded_cache_byte_bound_refusals`, so a cache that refuses
   every insert can be told apart from one that is cold.
@@ -1113,3 +1116,32 @@ per block on the read path. A logs flush block has one page per column, tens
 rather than thousands, and the measured reason to split it is the ack
 latency of a flush holding 7.5k lines (ADR-3492, "What strict acks can
 reach"). Every other caller keeps decision 4 as written.
+
+## Amendment (2026-11-10, issue #4066): the pressure-evictor amendment
+
+<!-- amendment-applies: sections="Amendment (2026-10-27): the decoded-cache byte bound amendment (issue #3244)" pointer="pressure-evictor amendment" -->
+<!-- amendment-supersedes: phrase="SQL's reservations cannot" pointer="pressure-evictor amendment" -->
+
+The decoded-cache byte bound amendment says SQL's reservations cannot make
+the catalog's decoded caches give memory back, and that decision 6's
+eviction pass runs only for a refused catalog decode. It names
+`Catalog::decoded_cache_memory_evictions` as that pass's counter. Since
+issue #4015 neither holds wherever the process budget has a pressure
+evictor registered: whenever the budget is bounded, and under an unlimited
+budget whenever the decoded column-block cache is on (ADR-3326, the
+pressure-evictor amendment of 2026-11-09).
+
+There, a reservation the budget refuses, from any consumer (a SQL scan, a
+fetcher, a live reader or a catalog decode) and for either exhaustion
+cause, first asks the decoded column-block cache and then the catalog's
+decoded part and postings caches (`Catalog::evict_decoded_for_pressure`)
+to give memory back, and the budget then retries it.
+`Catalog::decoded_cache_memory_evictions` counts the entries that evictor
+drops as well as those decision 6's own pass drops. The evictor takes only
+entries no reader holds.
+
+Decision 6 itself is unchanged: a refused catalog decode still runs the
+catalog's own eviction pass and retry under the rules the earlier
+amendments give. The byte bound and its two counters are unchanged.
+ADR-1170's pressure-evictor counter amendment (2026-11-10, issue #4015)
+gives the counter rules in full and names the tests that pin them.
