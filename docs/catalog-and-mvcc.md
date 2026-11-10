@@ -1817,16 +1817,21 @@ prints each in text and `--json` (test
 - `head_digest`: lowercase hex blake3 of the HEAD in effect after the
   call, the one published or, on a no-op, the one read, re-encoded with
   `folder_id` set to sixteen zero bytes and `created_unix_ns` to zero;
-  empty when there is no valid HEAD
+  empty when there is no valid HEAD, and a HEAD that fails to re-encode
+  fails the fold rather than reporting an empty digest
   (`fold_report_head_digest_ignores_the_folder_id_and_clock`). The digest
-  names the parts, postings, watermark and shard generations, not the
-  process or clock that wrote them, so two folds that publish the same
-  HEAD content share it while their HEAD bytes differ.
-  No fold path re-encodes an unchanged entry set into a second HEAD: a
-  refold at the same watermark is a no-op that reports the HEAD it read,
-  and a later fold moves the watermark. A run therefore cannot measure
-  HEAD determinism with this field, and the harness reports ADR-3939's
-  A4 and W8 determinism figures as unsupported. The switch-off
+  covers every other HEAD field: `format_version`, `tenant_hash`,
+  `signal`, `shard_count`, `watermark_hour`, `parts`, `postings` and
+  `shard_generation_count`, not the process or clock that wrote them, so
+  two folds that publish the same HEAD content share it while their HEAD
+  bytes differ.
+  A re-encode of the same entries within a run would need the HEAD
+  deleted (a refold at the same watermark is a no-op that reports the
+  HEAD it read, and a later fold moves the watermark), and leaf
+  boundaries can differ between builds (the header comment of
+  `crates/ravel-catalog/src/key_index_rebuild.rs`), so ADR-3939's A4 and
+  W8 determinism is pinned by unit tests rather than measured: the
+  harness reports those figures as unsupported. The switch-off
   partition's equality (A4) is likewise not reported: it holds by
   construction of the partition and is pinned by its unit tests.
 - `retired_hours`: the sorted union of every HEAD part's `retired_hours`

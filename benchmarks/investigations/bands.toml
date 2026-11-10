@@ -35,6 +35,11 @@
 #                                             fold_binary_pre_r2 is 1 on a
 #                                             binary carrying C1 and not
 #                                             R2, 0 on one carrying R2
+#                 stamp.fold_binary_carries_r2.<label>  1 when the
+#                                             state's fold binary stamp
+#                                             carries R2, else 0 (A3, A4,
+#                                             on day_parts_7); missing
+#                                             while absent
 #                 leaf_share.<label>.<field>  that field's leaf bytes over the
 #                                             label's census data bytes, in %
 #                 census.<tenant>.<signal>.objects|bytes|objects_over_512k
@@ -2075,12 +2080,27 @@ source = "predicted"
 # sealed_day_previous_leaf_gets: the leaf PUTs and previous-leaf GETs the
 # fold issued for a part whose single UTC day the previous HEAD already held
 # sealed (a day's own sealing fold counts 0), so a sealed day it re-encoded
-# shows here. Both are gated on W2's binary figure being 0 (a binary carrying
-# R2), as W3's and W8's are: on a C1-not-R2 binary they are not-run and not
-# requested, and on a run that does not list retired_hour they are not
-# requested with it.
+# shows here. Both are gated on the row's binary figure being 1: the
+# day_parts_7 state's fold binary stamp
+# (stamps/day_parts_7.logs.fold_binary.json, which box/run.sh
+# state_day_parts writes whenever the state runs) saying the binary carries
+# R2. On an older binary the figure reads 0 and is listed not requested, and
+# so are both fold figures; with no stamp the binary figure is missing and
+# both fold figures are not-run naming it, so the run is incomplete, never
+# not requested. retired_hour does not enter: a run that lists day_parts_7
+# alone judges A3.
 requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "fold_binary_carries_r2"
+statement = "stamp"
+state = "day_parts_7"
+metric = "stamp.fold_binary_carries_r2.logs"
+lane = "counter"
+not_requested_if = "v == 0"
+not_requested_reason = "A3 is measured only on a fold binary that carries R2 (the harness-state amendment)"
+target_if = "v in (0, 1)"
 
 [[row.figure]]
 name = "sealed_day_leaf_puts"
@@ -2089,7 +2109,7 @@ state = "day_parts_7"
 transition = "day_parts_7_advance"
 metric = "fold.dp7.logs.sealed_day_leaf_puts"
 lane = "counter"
-not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_unless = "m['adr3939_a3.fold_binary_carries_r2'] == 1"
 not_run_reason = "A3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
 gate_not_requested = true
 target_if = "v == 0"
@@ -2101,7 +2121,7 @@ state = "day_parts_7"
 transition = "day_parts_7_advance"
 metric = "fold.dp7.logs.sealed_day_previous_leaf_gets"
 lane = "counter"
-not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_unless = "m['adr3939_a3.fold_binary_carries_r2'] == 1"
 not_run_reason = "A3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
 gate_not_requested = true
 target_if = "v == 0"
@@ -2115,21 +2135,34 @@ target = "two folds of the same entry set produce byte-identical HEADs; the swit
 miss = "any difference"
 source = "predicted"
 # Two folds of the same entry set: the 7-day state's own fold and a second
-# fold of the same tenant from the same commits (transition
-# day_parts_7_refold), each reporting head_digest, the blake3 of the HEAD in
-# effect after it (written, or read back on a no-op) re-encoded with its
-# folder id and creation time cleared, so the digest does not depend on which
-# folder wrote the HEAD or when. No fold path re-encodes an unchanged entry
-# set: a refold of the same hours is a no-op that returns the HEAD it read, a
-# later fold moves the watermark, --rebuild-key-index writes no part, and a
-# second tenant changes every hash. The refold's digest matches the first by
-# reading the same HEAD back, which says nothing about determinism, so
-# heads_differ is unsupported. That the switch-off partition is unchanged is
-# pinned by D1's partition unit tests in crates/ravel-catalog/src/fold.rs and
-# is not measurable in a run, so that figure is unsupported too. Every figure
-# is gated on W2's binary figure being 0, as A3's are.
+# fold of the same tenant over the HEAD the first wrote (transition
+# day_parts_7_refold), a no-op that reads that HEAD back. Each reports
+# head_digest, the blake3 of the HEAD in effect after it (written, or read
+# back on a no-op) re-encoded with its folder id and creation time cleared,
+# so the digest does not depend on which folder wrote the HEAD or when. A
+# re-encode of the same entries within a run would need the HEAD deleted (a
+# fold over a missing or corrupt HEAD rebuilds from the commit layout at the
+# same watermark), and leaf boundaries can differ between builds
+# (crates/ravel-catalog/src/key_index_rebuild.rs, its header comment), so
+# A4's determinism is pinned by unit tests rather than measured: the
+# refold's digest matches the first by reading the same HEAD back, which
+# says nothing about determinism, and heads_differ is unsupported. That the
+# switch-off partition is unchanged is pinned by D1's partition unit tests
+# in crates/ravel-catalog/src/fold.rs and is not measurable in a run, so
+# that figure is unsupported too. Every figure is gated on the row's binary
+# figure being 1, read from the same day_parts_7 stamp as A3's.
 requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
+
+[[row.figure]]
+name = "fold_binary_carries_r2"
+statement = "stamp"
+state = "day_parts_7"
+metric = "stamp.fold_binary_carries_r2.logs"
+lane = "counter"
+not_requested_if = "v == 0"
+not_requested_reason = "A4 is measured only on a fold binary that carries R2 (the harness-state amendment)"
+target_if = "v in (0, 1)"
 
 [[row.figure]]
 name = "head_digest"
@@ -2138,7 +2171,7 @@ state = "day_parts_7"
 transition = "day_parts_7"
 metric = "fold.dp7.logs.head_digest"
 lane = "counter"
-not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_unless = "m['adr3939_a4.fold_binary_carries_r2'] == 1"
 not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
 gate_not_requested = true
 target_if = "isinstance(v, str) and len(v) > 0"
@@ -2150,7 +2183,7 @@ state = "day_parts_7"
 transition = "day_parts_7_refold"
 metric = "fold.dp7.logs.head_digest"
 lane = "counter"
-not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_unless = "m['adr3939_a4.fold_binary_carries_r2'] == 1"
 not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
 gate_not_requested = true
 target_if = "isinstance(v, str) and len(v) > 0"
@@ -2162,10 +2195,10 @@ state = "day_parts_7"
 metric = "derived"
 expr = "1 if m['adr3939_a4.head_digest'] != m['adr3939_a4.refold_head_digest'] else 0"
 lane = "counter"
-not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_unless = "m['adr3939_a4.fold_binary_carries_r2'] == 1"
 not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
 gate_not_requested = true
-unsupported = "no fold path re-encodes an unchanged entry set: a same-hours refold returns the HEAD it read, so equal digests do not show determinism"
+unsupported = "a re-encode of the same entries in a run would need the HEAD deleted, and leaf boundaries can differ between builds, so determinism is pinned by unit tests rather than measured: the refold returns the HEAD it read"
 target_if = "v == 0"
 
 [[row.figure]]
@@ -2175,7 +2208,7 @@ state = "day_parts_7"
 transition = "day_parts_7"
 metric = "fold.dp7.logs.switch_off_partition_changed"
 lane = "counter"
-not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_unless = "m['adr3939_a4.fold_binary_carries_r2'] == 1"
 not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
 gate_not_requested = true
 unsupported = "the switch-off partition is pinned by D1's unit tests and is not measurable in a run"
@@ -3055,9 +3088,11 @@ source = "predicted"
 # miss rather than agree. Both are read from the CLI fold's --json report:
 # head_digest is A4's digest of the HEAD in effect after the fold, its folder
 # id and creation time cleared, and retired_hours the HEAD's union of every
-# part's retired_hours. heads_differ is unsupported for A4's reason: the
-# refold observing the same tombstones is a no-op that reads the same HEAD
-# back. Every figure is gated on W2's binary
+# part's retired_hours. heads_differ is unsupported for A4's reason: a
+# re-encode of the same entries would need the HEAD deleted and leaf
+# boundaries can differ between builds, so W8's determinism is pinned by
+# unit tests, and the refold observing the same tombstones is a no-op that
+# reads the same HEAD back. Every figure is gated on W2's binary
 # figure being 0 (a binary carrying R2); on a C1-not-R2 binary they are
 # not-run and not requested while W2 is judged.
 requires_tenant = "dp7"
@@ -3097,7 +3132,7 @@ lane = "counter"
 not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
 not_run_reason = "W8 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
 gate_not_requested = true
-unsupported = "no fold path re-encodes an unchanged entry set: a refold observing the same tombstones returns the HEAD it read, so equal digests do not show determinism"
+unsupported = "a re-encode of the same entries in a run would need the HEAD deleted, and leaf boundaries can differ between builds, so determinism is pinned by unit tests rather than measured: a refold observing the same tombstones returns the HEAD it read"
 target_if = "v == 0"
 
 [[row.figure]]

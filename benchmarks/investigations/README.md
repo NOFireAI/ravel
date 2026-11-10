@@ -439,6 +439,8 @@ does not hold that.
 
 **`day_parts_N`** runs these steps in order:
 
+0. `inv.py fold-binary` writes `stamps/day_parts_N.logs.fold_binary.json`,
+   which A3 and A4 read. See "W2's fold binary".
 1. `inv.py stride-check` checks each signal over all 24N batches. A
    refusal records the state `not-run`; a check that cannot run fails it.
 2. One `ravel-cli load` per signal, with these flags:
@@ -631,8 +633,11 @@ fifth of that rate, rounded the same way. The amendment calls for a reduced
 rate there but names no figure, so the fifth is this harness's choice. Its
 reason for reducing: 30 days at box D's rate cost about 4 hours of fold and
 about 20 hours of corpus generation.
-`[retired_hour]` is read only when `run.states` lists `retired_hour`.
-`c1_sha` is required. An empty `r2_sha` means R2 has not landed.
+`[retired_hour]`'s `c1_sha` and `r2_sha` are read by every state that
+writes a fold binary stamp (`retired_hour` and each `day_parts_N`), the
+other two keys only when `run.states` lists `retired_hour`. `c1_sha` is
+required when it does. An empty `r2_sha` means R2 has not landed, and an
+empty `c1_sha` reads as not carried.
 
 `[server] extra_flags` is a list of extra `ravel-server` command-line
 flags, appended verbatim after `--memory-budget-bytes` on every server
@@ -682,7 +687,7 @@ reports `missing stamps/<name>` for any it needs and does not find;
 | `STATE.SIG.tenant.txt` | `typed-attr-column show` at that state |
 | `STATE.server.json` | the server binary's sha256 and its flags |
 | `STATE.SIG.day_parts.json` | `day_parts_N` and its advance: the catalog stamp per part (`min_hour`, `max_hour`, UTC `day`, `one_day`, `entry_count`, `slices` per field), the HEAD `watermark_hour`, the `days` held and `part_count` |
-| `retired_hour.logs.fold_binary.json` | the fold binary's `sha`, run.toml's `c1_sha` and `r2_sha` resolved, and `carries_c1` and `carries_r2` by git ancestry |
+| `STATE.logs.fold_binary.json` | `retired_hour` and each `day_parts_N`: the fold binary's `sha`, run.toml's `c1_sha` and `r2_sha` resolved, and `carries_c1` and `carries_r2` by git ancestry |
 | `STATE.logs.tombstone.json` | `retired_hour` and `retired_hour_drop`: the tombstoned `hour` (D0) and `first_hour` to `last_hour` in unix hours, the retention window and the tombstone-check output |
 | `needle_blocks.json` | the logs needles' block counts as `rlog inspect` reads them, beside the generator's |
 | `compaction.jsonl`, `erasure.jsonl`, `not_run.jsonl` | the compaction child's reports, the erase submit and status, and each state recorded not-run |
@@ -1109,33 +1114,50 @@ carries C1 and not R2. Its first figure, `fold_binary_pre_r2`, reads
 carrying R2, which its `not_requested_if = "v == 0"` lists under `not
 requested` rather than judging, so no W2 figure passes on the R2 build; a
 stamp missing any of the three fields is `missing`. W2's other figures are
-`not-run` unless that figure is 1, and every A3, A4, W3 and W8 figure is
-`not-run` unless it is 0: the harness-state amendment measures W2 on the
-pre-R2 binary and the rest on the R2 build. A3 and A4 sit above W2 in
-bands.toml, in the ADR's order, so evaluate.py builds a figure whose gate or
-expression reads a figure defined below it once that figure is built. A
-figure carrying `gate_not_requested = true` whose `not_run_unless` read
-every figure it names and came out false is listed under `not requested`
-with the gate's reason and the value it read
-(`adr3939_w2.fold_binary_pre_r2 1`), so a pre-R2 run is judged on W2 alone
-and neither fails nor goes incomplete on A3, A4, W3 or W8, and an R2 run
-the same way round. A run that does not list `retired_hour` leaves the
-binary figure, and so A3 and A4 with it, not requested. A binary carrying
-no C1 is one no row is measured on: the binary figure is `not-run` with the
-binary's SHA and what it carries, and every A3, A4, W2, W3 and W8 figure is
-`not-run` naming it, all listed under `not requested`. With no stamp at all
-the binary figure is `missing`, and every gated figure is `not-run` naming
-it and left on the incomplete list.
+`not-run` unless that figure is 1, and every W3 and W8 figure is `not-run`
+unless it is 0: the harness-state amendment measures W2 on the pre-R2
+binary and the rest on the R2 build. A figure carrying
+`gate_not_requested = true` whose `not_run_unless` read every figure it
+names and came out false is listed under `not requested` with the gate's
+reason and the value it read (`adr3939_w2.fold_binary_pre_r2 1`), so a
+pre-R2 run is judged on W2 alone and neither fails nor goes incomplete on
+W3 or W8, and an R2 run the same way round. A binary carrying no C1 is one
+no W row is measured on: the binary figure is `not-run` with the binary's
+SHA and what it carries, and every W2, W3 and W8 figure is `not-run`
+naming it, all listed under `not requested`. With no stamp at all the
+binary figure is `missing`, and every gated figure is `not-run` naming it
+and left on the incomplete list.
 
-`state_retired_hour` writes the stamp with `inv.py fold-binary` before its
-first tombstone, and fails the state when the stamp cannot be written. The
-stamp records the binary's SHA (run.toml `box.sha`, or the checkout's
-HEAD), with `c1_sha` and `r2_sha` resolved in the checkout that built it.
-`carries_c1` is true when `git merge-base --is-ancestor c1_sha sha` holds,
-and `carries_r2` the same for `r2_sha`. An empty `r2_sha` gives `false`. A
-SHA that names no commit (the binary's, `c1_sha`, or a non-empty `r2_sha`)
-fails the state. In a run where `retired_hour` is live, an absent stamp is
-`missing`.
+A3 and A4 do not read W2's figure, since a run can list `day_parts_7`
+without `retired_hour`. Each row's first figure, `fold_binary_carries_r2`,
+reads the day_parts_7 state's own stamp,
+`stamps/day_parts_7.logs.fold_binary.json`: 1 when the binary carries R2,
+passing, and 0 otherwise, listed under `not requested` by its
+`not_requested_if = "v == 0"`. Every other A3 and A4 figure is `not-run`
+unless it is 1 and carries `gate_not_requested`, so on a binary predating
+R2 the whole of A3 and A4 is not requested (`adr3939_a3.fold_binary_carries_r2
+0`), and on an R2 binary they are judged whether or not `retired_hour` ran:
+5 sealed-day leaf PUTs miss (`test_a3_a4_without_retired_hour`). With no
+stamp although `day_parts_7` ran, the binary figure is `missing` naming the
+stamp, and every other A3 and A4 figure is `not-run` naming it and left on
+the incomplete list, never not requested. evaluate.py builds a figure
+whose gate or expression reads a figure bands.toml defines below it once
+that figure is built; a reference cycle builds its first figure anyway,
+whose reason names the cycle.
+
+`state_retired_hour` writes its stamp with `inv.py fold-binary` before its
+first tombstone, and fails the state when the stamp cannot be written; a
+local-lane checkout with modified tracked files records the state
+`not-run`. `state_day_parts` writes `stamps/day_parts_N.logs.fold_binary.json`
+the same way before its load; a dirty checkout there prints a `NOTE` and
+writes no stamp, so A3 and A4 go incomplete while the state's other rows
+are measured. The stamp records the binary's SHA (run.toml `box.sha`, or
+the checkout's HEAD), with `c1_sha` and `r2_sha` resolved in the checkout
+that built it. `carries_c1` is true when `git merge-base --is-ancestor
+c1_sha sha` holds, and `carries_r2` the same for `r2_sha`. An empty
+`c1_sha` or `r2_sha` gives `false`. A SHA that names no commit (the
+binary's, or a non-empty `c1_sha` or `r2_sha`) fails the state. In a run
+where the stamping state is live, an absent stamp is `missing`.
 
 W3's tombstoned hour reads `stamps/retired_hour.logs.tombstone.json` the
 same way. W3's retired-hour resolve (`retired_hour_segments`) reads
@@ -1173,11 +1195,15 @@ equal `[h]` for W3's tombstoned hour `h`, besides being identical: two
 folds that observed no tombstone report `[]` alike and miss. A4's and W8's
 `head_digest` is the blake3 (hex) of that HEAD re-encoded with its folder id
 and creation time cleared, and must be a non-empty string. Their
-`heads_differ` is unsupported: no fold path re-encodes an unchanged entry
-set (a same-hours refold is a no-op that returns the HEAD it read, a later
-fold moves the watermark, `--rebuild-key-index` writes no part, and a second
-tenant changes every hash), so two equal digests show the refold read the
-same HEAD back, not that the fold is deterministic.
+`heads_differ` is unsupported. A re-encode of the same entries within a
+run would need the HEAD deleted (a fold over a missing or corrupt HEAD
+rebuilds from the commit layout at the same watermark), and leaf
+boundaries can differ between builds
+(`crates/ravel-catalog/src/key_index_rebuild.rs`, its header comment), so
+A4's and W8's determinism is pinned by unit tests rather than measured.
+The refold the harness runs is a no-op that returns the HEAD it read, so
+two equal digests show it read the same HEAD back, not that the fold is
+deterministic.
 
 ### Where these rows' fold figures come from
 
@@ -1473,9 +1499,10 @@ as the R2 build, a stamp figure's `not-run` left off `not_requested`, or the
 binary's `not_requested_if` dropped from bands.toml or ignored by
 evaluate.py),
 `test_w3_w8_gated_on_r2_binary` (C1 without R2: W2 passes and all twenty
-A3, A4, W3 and W8 figures are `not-run`, not requested, naming
-`fold_binary_pre_r2 1`, and nothing is incomplete; R2: every A3, A4, W3 and
-W8 figure but the three declared unsupported passes, those three read
+A3, A4, W3 and W8 figures are `not-run`, not requested, W3's and W8's
+naming `fold_binary_pre_r2 1` and A3's and A4's their own
+`fold_binary_carries_r2 0`, and nothing is incomplete; R2: every A3, A4, W3
+and W8 figure but the three declared unsupported passes, those three read
 unsupported with their reasons and are exactly the incomplete list, and all
 four W2 figures are not requested, none passing; no stamp: every A3, A4, W3
 and W8 figure `not-run` and incomplete; fails with the gate's not requested
@@ -1565,11 +1592,30 @@ the file and line it changes):
   30-day folds at the default budget").
 - `test_retired_hour_stamps_fold_binary_sha`: `inv.py fold-binary` writes
   `{sha, carries_c1, carries_r2}` by git ancestry on a scratch repository,
-  an empty `r2_sha` reads false, an unresolvable SHA writes no stamp, the
-  stamp precedes the first tombstone in the dry run, and run.sh refuses a
+  an empty `r2_sha` or `c1_sha` reads false, an unresolvable SHA writes no
+  stamp, the stamp precedes the first tombstone and each day_parts state's
+  stride check in the dry run, a day_parts_7-only run stamps with an empty
+  `--c1`, and run.sh refuses a
   retired_hour with no `c1_sha` or no day_parts_7 before it. Wrong version:
   `carries_r2` falling back to C1 when `r2_sha` is empty ("an empty r2_sha
   read as carried").
+- `test_a3_a4_without_retired_hour`: a run listing `day_parts_7` and not
+  `retired_hour`. On an R2 binary 5 sealed-day leaf PUTs miss; on a binary
+  predating R2 every A3 and A4 figure is not requested naming
+  `fold_binary_carries_r2 0`, none incomplete; with no stamp the binary
+  figures are missing naming `stamps/day_parts_7.logs.fold_binary.json` and
+  the rest are `not-run` and incomplete, never not requested. Wrong
+  versions: A3 gated on W2's binary figure ("A3's sealed-day leaf PUTs gated
+  on W2's binary figure, which a run without retired_hour never has"), the
+  binary's `not_requested_if` dropped ("A4's binary figure judged rather
+  than listed not requested on a binary predating R2"), the stamp's
+  `carries_r2` inverted ("a day_parts_7 binary predating R2 read as carrying
+  it"), the stamp read under another kind ("a day_parts_7 binary stamp read
+  under a kind run.sh never writes").
+- `test_reference_cycle_named`: two derived figures that read each other are
+  built, the first's reason naming the cycle. Wrong version: the fallback
+  naming no figure ("a reference cycle reported as a figure bands.toml does
+  not define").
 - `test_new_states_dry_run_plan`: the s3 lane's dry run with all three
   states listed, every step pinned in order. Wrong version: the drop
   retiring through hour 22 ("the drop leaving the day's last hour").
