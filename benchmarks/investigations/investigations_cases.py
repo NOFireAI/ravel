@@ -49,6 +49,8 @@ ADR3939 = os.path.join(HERE, "..", "..", "docs", "adrs", "3939-key-index-day-sea
 HITS_TRUTH = os.path.join(HERE, "hits.truth.json")
 SMOKE = os.path.join(HERE, "fixtures", "local-smoke")
 BOX = os.path.join(HERE, "box")
+FOLD_RS = os.path.join(HERE, "..", "..", "crates", "ravel-catalog", "src", "fold.rs")
+STATS_RS = os.path.join(HERE, "..", "..", "crates", "ravel-sql", "src", "stats_json.rs")
 PY = sys.executable
 # investigations.test.sh passes the bash running it, so a run under bash 3.2
 # runs every box/ script under 3.2 too.
@@ -3419,10 +3421,11 @@ class Evaluate(Workdir):
     def check_w2_requires_pre_r2_binary_stamp(self, evaluate_py=EVALUATE, bands=BANDS):
         """W2 is judged only on a fold binary that carries C1 and not R2. With no fold-binary stamp
         (box/run.sh state_retired_hour writes it) the binary figure is missing, naming the stamp, and every other W2
-        figure not-run with the amendment's reason; a binary carrying R2, or no C1, is not-run with its SHA,
-        never a miss, and every W2 figure is listed not requested and none incomplete, so the R2 build's
-        run holding retired_hour is free of a W2 miss; a stamp with no sha is missing; C1 without R2 judges
-        the fold, 31 previous-leaf GETs passing."""
+        figure not-run with the amendment's reason; a binary carrying R2 reads 0, passing, and its three
+        fold figures are not-run and listed not requested naming the 0; a binary carrying no C1 is not-run
+        with its SHA; neither is ever a miss or incomplete, so the R2 build's run holding retired_hour is
+        free of a W2 miss; a stamp with no sha is missing; C1 without R2 reads 1 and judges the fold, 31
+        previous-leaf GETs passing."""
         mod = load_module(evaluate_py, "evaluate_w2")
         live = {"retired_hour": None}
         report = {"key_index_leaf_gets": 31, "key_index_unchanged_section_gets": 0,
@@ -3430,15 +3433,15 @@ class Evaluate(Workdir):
         folds = {("retired_hour", "dp7", "logs"): {"report": report}}
         name = "stamps/retired_hour.logs.fold_binary.json"
         out = []
-        for case, stamp, binary, rest in (
-                ("no stamp", None, ("missing", None, "missing"), "not-run"),
+        for case, stamp, binary, rest, unasked in (
+                ("no stamp", None, ("missing", None, "missing"), "not-run", None),
                 ("C1 and R2", {"sha": "c1r2", "carries_c1": True, "carries_r2": True},
-                 ("not-run", None, "not-run"), "not-run"),
+                 ("value", 0, "pass"), "not-run", "adr3939_w2.fold_binary_pre_r2 0"),
                 ("no C1", {"sha": "c0", "carries_c1": False, "carries_r2": False},
-                 ("not-run", None, "not-run"), "not-run"),
-                ("no sha", {"carries_c1": True, "carries_r2": False}, ("missing", None, "missing"), "not-run"),
+                 ("not-run", None, "not-run"), "not-run", "c0"),
+                ("no sha", {"carries_c1": True, "carries_r2": False}, ("missing", None, "missing"), "not-run", None),
                 ("C1 without R2", {"sha": "c1", "carries_c1": True, "carries_r2": False}, ("value", 1, "pass"),
-                 "pass")):
+                 "pass", None)):
             docs = {("retired_hour", "logs", "fold_binary"): stamp} if stamp else {}
             figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2",), live, docs, {}, folds)
             b = figs["adr3939_w2.fold_binary_pre_r2"]
@@ -3451,13 +3454,14 @@ class Evaluate(Workdir):
                     continue
                 if f["verdict"] != rest or (rest == "not-run" and "carries C1 and not R2" not in f["reason"]):
                     out.append(f"{case}: {i} {f['status']} {f['value']} {f['verdict']} {f['reason']}")
-            if binary[0] == "not-run":
-                sha = stamp["sha"]
+            if unasked is not None:
                 misses = [i for i, f in figs.items() if f.get("verdict") == "miss"]
                 if misses:
                     out.append(f"{case}: W2 misses {misses}")
                 for i, f in figs.items():
-                    if sha not in (f.get("not_requested") or "") or not f.get("gated"):
+                    if i == "adr3939_w2.fold_binary_pre_r2" and binary[0] == "value":
+                        continue
+                    if unasked not in (f.get("not_requested") or "") or not f.get("gated"):
                         out.append(f"{case}: {i} not listed not requested ({f.get('not_requested')})")
                 listed = mod.incomplete_reasons({"states": []}, {}, mod.Calls([], mod.Problems()), list(figs.values()))
                 if listed:
@@ -3511,13 +3515,16 @@ class Evaluate(Workdir):
 
     @staticmethod
     def retired_hour_folds(retired, refold_retired, digests=("d1", "d1")):
-        report = {"key_index_part_puts": 0, "key_index_leaves_written": 0, "retired_hours": retired,
+        report = {"snapshot_part_puts": 0, "key_index_leaves_written": 0, "retired_hours": retired,
                   "head_digest": digests[0]}
         refold = {"retired_hours": refold_retired, "head_digest": digests[1]}
         return {("retired_hour", "dp7", "logs"): {"report": report},
-                ("retired_hour_drop", "dp7", "logs"): {"report": {"key_index_part_puts": 0,
+                ("retired_hour_drop", "dp7", "logs"): {"report": {"snapshot_part_puts": 0,
                                                                   "key_index_leaves_written": 0}},
                 ("retired_hour_refold", "dp7", "logs"): {"report": refold}}
+
+    # The fold binary W3 and W8 are measured on: one carrying R2.
+    R2_BINARY = {("retired_hour", "logs", "fold_binary"): {"sha": "r2", "carries_c1": True, "carries_r2": True}}
 
     @staticmethod
     def drop_catalog(*ranges, declared=None):
@@ -3539,10 +3546,11 @@ class Evaluate(Workdir):
                 ("no drop stamp", None, ("missing", None, "missing")),
                 ("no HEAD", {"head": None, "parts": []}, ("missing", None, "missing")),
                 ("parts disagree", self.drop_catalog("72..=95", declared=2), ("missing", None, "missing"))):
-            docs = {("retired_hour", "logs", "tombstone"): {"hour": 100}}
+            docs = {("retired_hour", "logs", "tombstone"): {"hour": 100}} | self.R2_BINARY
             if head is not None:
                 docs[("retired_hour_drop", "logs", "catalog")] = head
-            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w3",), live, docs, {}, self.retired_hour_folds([100], [100]))
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2", "adr3939_w3"), live, docs, {},
+                                         self.retired_hour_folds([100], [100]))
             f = figs.get("adr3939_w3.drop_parts_holding_hour")
             if f is None:
                 verdicts = {i: g["verdict"] for i, g in figs.items() if i.startswith("adr3939_w3.drop_")}
@@ -3563,13 +3571,14 @@ class Evaluate(Workdir):
         non-empty strings, so two empty digests miss though equal."""
         mod = load_module(evaluate_py, "evaluate_w8")
         live = {"retired_hour": None, "day_parts_7": None}
-        docs = {("retired_hour", "logs", "tombstone"): {"hour": 100}}
+        docs = {("retired_hour", "logs", "tombstone"): {"hour": 100}} | self.R2_BINARY
         out = []
         for case, retired, digests, want in (("both []", ([], []), ("d1", "d1"), ("miss", "pass")),
                                              ("both [h]", ([100], [100]), ("d1", "d1"), ("pass", "pass")),
                                              ("empty digests", ([100], [100]), ("", ""), ("pass", "miss"))):
             folds = self.retired_hour_folds(*retired, digests)
-            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w3", "adr3939_w8"), live, docs, {}, folds)
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2", "adr3939_w3", "adr3939_w8"), live, docs, {},
+                                         folds)
             for name in ("retired_hours", "refold_retired_hours"):
                 f = figs[f"adr3939_w8.{name}"]
                 if f["verdict"] != want[0]:
@@ -3589,6 +3598,160 @@ class Evaluate(Workdir):
 
     def test_w8_retired_hours_are_the_tombstoned_hour(self):
         self.assertEqual(self.check_w8_retired_hours_are_the_tombstoned_hour(), [])
+
+    def check_w3_w8_gated_on_r2_binary(self, evaluate_py=EVALUATE, bands=BANDS):
+        """W3 and W8 are judged only on a fold binary carrying R2, read off W2's binary figure being 0. On
+        a binary carrying C1 and not R2 W2 is judged and passes, and every W3 and W8 figure is not-run,
+        gated and listed not requested naming the figure's 1, none a miss and none incomplete; on an R2
+        binary every W3 and W8 figure is judged and passes on a run meeting their targets while W2's fold
+        figures are listed not requested; with no fold-binary stamp every W3 and W8 figure is not-run
+        naming the missing binary figure, not requested by none, and on the incomplete list."""
+        mod = load_module(evaluate_py, "evaluate_w3_w8_gate")
+        live = {"retired_hour": None}
+        folds = self.retired_hour_folds([100], [100])
+        folds[("retired_hour", "dp7", "logs")]["report"] |= {
+            "key_index_leaf_gets": 31, "key_index_unchanged_section_gets": 0,
+            "key_index_leaf_bytes_written": 1_300_000_000}
+        base = {("retired_hour", "logs", "tombstone"): {"hour": 100},
+                ("retired_hour", "logs", "retired_resolve"): {"hour": 100, "segments": 0, "l0": 0, "l1": 0,
+                                                              "resolved": 12},
+                ("retired_hour_drop", "logs", "catalog"): self.drop_catalog("72..=95", "120..=143")}
+        out = []
+        for case, binary, gate in (("C1 without R2", {"sha": "c1", "carries_c1": True, "carries_r2": False},
+                                    "adr3939_w2.fold_binary_pre_r2 1"),
+                                   ("R2", {"sha": "r2", "carries_c1": True, "carries_r2": True},
+                                    "adr3939_w2.fold_binary_pre_r2 0"),
+                                   ("no stamp", None, "adr3939_w2.fold_binary_pre_r2 is missing")):
+            docs = dict(base)
+            if binary is not None:
+                docs[("retired_hour", "logs", "fold_binary")] = binary
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2", "adr3939_w3", "adr3939_w8"), live, docs, {},
+                                         folds)
+            w3_w8 = {i: f for i, f in figs.items() if i.startswith(("adr3939_w3.", "adr3939_w8."))}
+            w2 = {i: f for i, f in figs.items() if i.startswith("adr3939_w2.") and not i.endswith(".fold_binary_pre_r2")}
+            if (len(w3_w8), len(w2)) != (14, 3):
+                out.append(f"{case}: {len(w3_w8)} W3 and W8 figures, {len(w2)} W2 fold figures")
+            listed = mod.incomplete_reasons({"states": []}, {}, mod.Calls([], mod.Problems()), list(figs.values()))
+            if binary is None:
+                for i, f in w3_w8.items():
+                    if f["status"] != "not-run" or f.get("not_requested") or gate not in f["reason"]:
+                        out.append(f"{case}: {i} {f['status']} {f.get('not_requested')} {f['reason']}")
+                    if not any(line.startswith(f"figure {i} not run") for line in listed):
+                        out.append(f"{case}: {i} not on the incomplete list")
+                continue
+            judged, unasked = (w2, w3_w8) if binary["carries_r2"] is False else (w3_w8, w2)
+            for i, f in judged.items():
+                if f["verdict"] != "pass":
+                    out.append(f"{case}: {i} {f['status']} {f['value']} {f['verdict']} {f['reason']}")
+            for i, f in unasked.items():
+                if f["status"] != "not-run" or not f.get("gated") or gate not in (f.get("not_requested") or ""):
+                    out.append(f"{case}: {i} {f['status']} {f['verdict']} not requested {f.get('not_requested')}")
+            if listed:
+                out.append(f"{case}: incomplete {listed}")
+        return out
+
+    def test_w3_w8_gated_on_r2_binary(self):
+        self.assertEqual(self.check_w3_w8_gated_on_r2_binary(), [])
+
+    def check_w3_retired_hour_segments_reads_resolve_stamp(self, evaluate_py=EVALUATE, bands=BANDS):
+        """W3's segments of the tombstoned hour are stamps/retired_hour.logs.retired_resolve.json
+        segments: 0 of 12 resolved passes, 2 misses; a stamp counting another hour than the tombstone
+        stamp's, or one whose resolve returned no segment, is missing, and so is an absent stamp, naming
+        it; none reads unsupported."""
+        mod = load_module(evaluate_py, "evaluate_w3_resolve")
+        live = {"retired_hour": None}
+        name = "stamps/retired_hour.logs.retired_resolve.json"
+        out = []
+        for case, stamp, want, says in (
+                ("none of the hour", {"hour": 100, "segments": 0, "resolved": 12}, ("value", 0, "pass"), ""),
+                ("two of the hour", {"hour": 100, "segments": 2, "resolved": 12}, ("value", 2, "miss"), ""),
+                ("another hour", {"hour": 99, "segments": 0, "resolved": 12}, ("missing", None, "missing"),
+                 "tombstoned 100"),
+                ("nothing resolved", {"hour": 100, "segments": 0, "resolved": 0}, ("missing", None, "missing"),
+                 "the resolve returned no segment"),
+                ("no stamp", None, ("missing", None, "missing"), name)):
+            docs = {("retired_hour", "logs", "tombstone"): {"hour": 100}} | self.R2_BINARY
+            if stamp is not None:
+                docs[("retired_hour", "logs", "retired_resolve")] = stamp
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2", "adr3939_w3"), live, docs, {},
+                                         self.retired_hour_folds([100], [100]))
+            f = figs["adr3939_w3.retired_hour_segments"]
+            if (f["status"], f["value"], f["verdict"]) != want or says not in f["reason"]:
+                out.append(f"{case}: {f['status']} {f['value']} {f['verdict']} {f['reason']}, want {want}")
+        return out
+
+    def test_w3_retired_hour_segments_reads_resolve_stamp(self):
+        self.assertEqual(self.check_w3_retired_hour_segments_reads_resolve_stamp(), [])
+
+    # ADR-3939 figures no build supplies, with why: the per-day-part leaf
+    # GETs (A7, W5 and F3's), F3's SlowDown responses, and W6's leaf round
+    # trips.
+    ADR3939_UNSUPPORTED = {
+        "A7.leaf_gets_per_part": "keyIndex.perPart", "W5.leaf_gets_per_part": "keyIndex.perPart",
+        "F3.w4_leaf_gets_per_part": "keyIndex.perPart", "F3.w5_leaf_gets_per_part": "keyIndex.perPart",
+        "F3.w4_slow_downs": "io.s3SlowDownResponses", "F3.w5_slow_downs": "io.s3SlowDownResponses",
+        "W6.leaf_round_trips": "keyIndex.leafRoundTrips",
+    }
+
+    @staticmethod
+    def adr3939_unsupported(evaluate_py, bands, fold_rs, stats_rs, run_sh):
+        """{ADR row.figure: the field no source writes} over bands.toml's ADR-3939 figures: a fold field
+        FoldReport (FOLD_RS) has under none of its names, a stats field (KEY_INDEX_METRICS,
+        STATS_ALLOWLIST) or per-part breakdown (ALLOWLIST_BREAKDOWNS) stats_json.rs (STATS_RS) never
+        writes, or an H1B stamp box/run.sh (RUN_SH) never writes; plus each such figure's
+        evaluate.py allowlist, None when it has none and so would read missing rather than unsupported."""
+        mod = load_module(evaluate_py, "evaluate_adr3939_sources")
+        with open(fold_rs) as f:
+            body = re.search(r"pub struct FoldReport \{(.*?)\n\}", f.read(), re.S)
+        fields = set(re.findall(r"^\s*pub (\w+):", body.group(1), re.M)) if body else set()
+        with open(stats_rs) as f:
+            stats = f.read()
+        with open(run_sh) as f:
+            run = f.read()
+        with open(bands, "rb") as f:
+            rows = [r for r in tomllib.load(f)["row"] if r.get("adr") == "ADR-3939"]
+        out = {}
+        for row in rows:
+            for fig in row["figure"]:
+                fid, metric = f"{row['adr_row']}.{fig['name']}", fig["metric"]
+                if fig["statement"] == "fold":
+                    field = metric.split(".", 3)[3]
+                    if field in ("peak_rss_bytes", "key_index_g_low", "key_index_g_high"):
+                        continue
+                    if not any(n in fields for n in mod.FOLD_FIELDS.get(field, (field,))):
+                        out[fid] = (f"FoldReport.{field}", field in mod.FOLD_ALLOWLIST or None)
+                elif fig["statement"] == "stamp":
+                    kind = mod.H1B_STAMPS.get(metric.split(".")[1])
+                    if kind and f".logs.{kind}.json" not in run:
+                        out[fid] = (f"stamps/STATE.logs.{kind}.json", None)
+                elif fig["statement"] != "derived" and metric.count(".") >= 2:
+                    name = metric.split(".", 2)[2]
+                    head = name.split(".", 1)[0]
+                    if head in mod.ALLOWLIST_BREAKDOWNS:
+                        camel = "per" + "".join(w.title() for w in head.split("_")[1:])
+                        if f'"{camel}"' not in stats:
+                            out[fid] = (f"keyIndex.{camel}", mod.ALLOWLIST_BREAKDOWNS[head])
+                    elif name in mod.KEY_INDEX_METRICS and f'"{mod.KEY_INDEX_METRICS[name]}"' not in stats:
+                        out[fid] = (f"keyIndex.{mod.KEY_INDEX_METRICS[name]}", name)
+                    elif name in mod.STATS_ALLOWLIST and f'"{mod.STATS_ALLOWLIST[name][1]}"' not in stats:
+                        out[fid] = (".".join(mod.STATS_ALLOWLIST[name]), name)
+        return out
+
+    def check_adr3939_unsupported_figures_are_these(self, evaluate_py=EVALUATE, bands=BANDS, fold_rs=FOLD_RS):
+        """The only ADR-3939 figures no source writes are ADR3939_UNSUPPORTED's, each for the field named
+        there and each allowlisted, so it reads unsupported rather than missing: every other fold figure
+        is a FoldReport field, every H1B stamp is one box/run.sh writes, and every other statement figure
+        a stats field stats_json.rs writes."""
+        got = self.adr3939_unsupported(evaluate_py, bands, fold_rs, STATS_RS, os.path.join(BOX, "run.sh"))
+        out = []
+        if {i: why for i, (why, _) in got.items()} != self.ADR3939_UNSUPPORTED:
+            out.append(f"unsupported {sorted(got.items())}, want {sorted(self.ADR3939_UNSUPPORTED.items())}")
+        out.extend(f"{i} reads missing, not unsupported: {why} is on no allowlist"
+                   for i, (why, allowed) in sorted(got.items()) if not allowed)
+        return out
+
+    def test_adr3939_unsupported_figures_are_these(self):
+        self.assertEqual(self.check_adr3939_unsupported_figures_are_these(), [])
 
     def check_w7_reads_two_day_parts(self, evaluate_py=EVALUATE, bands=BANDS):
         """W7's midnight call passes only when every try covered exactly 2 day parts and left none
@@ -4310,15 +4473,35 @@ FLIPS = {
         "    return math.floor(factor * 126 + 0.5)\n",
         "check_w5_a7_targets_follow_stamped_slices",
     ),
-    "W2's binary read off C1 alone, so an R2 binary passes": (
-        'if doc["carries_c1"] and not doc["carries_r2"]:\n',
-        'if doc["carries_c1"]:\n',
+    "an R2 binary read as W2's": (
+        'if doc["carries_r2"]:\n                return "value", 0, ""\n',
+        'if False:\n                return "value", 0, ""\n',
         "check_w2_requires_pre_r2_binary_stamp",
     ),
-    "an R2 binary scored as a W2 miss": (
+    "a binary carrying no C1 read as the R2 build": (
         'return "not-run", None, (f"the retired_hour fold binary',
         'return "value", 0, (f"the retired_hour fold binary',
         "check_w2_requires_pre_r2_binary_stamp",
+    ),
+    "the gate's not-measured-here figures left incomplete": (
+        'if not gap and fig.get("gate_not_requested") and all(r.get("status") == "value" for r in refs):\n',
+        "if False:\n",
+        "check_w3_w8_gated_on_r2_binary",
+    ),
+    "W3's segments read off a resolve of another hour": (
+        'or isinstance(hour, bool) or hour != tomb.get("hour"):\n',
+        "or isinstance(hour, bool):\n",
+        "check_w3_retired_hour_segments_reads_resolve_stamp",
+    ),
+    "W3's segments read off a resolve that returned nothing": (
+        'if not isinstance(doc.get("resolved"), int) or doc["resolved"] < 1:\n',
+        'if not isinstance(doc.get("resolved"), int):\n',
+        "check_w3_retired_hour_segments_reads_resolve_stamp",
+    ),
+    "W3's segments stamp read under a kind run.sh never writes": (
+        '"retired_hour_segments": "retired_resolve"}',
+        '"retired_hour_segments": "retired_segments"}',
+        "check_adr3939_unsupported_figures_are_these",
     ),
     "a stamp figure not-run for its build left incomplete, not unrequested": (
         '                    entry["gated"] = True\n                    entry["not_requested"] = why\n',
@@ -4366,6 +4549,10 @@ class Flips(Workdir):
 # Wrong bands the cases rule out: the same shape as FLIPS, with the anchor in
 # bands.toml and the case run against the real evaluate.py and the flipped
 # bands.
+R2_GATE = ("not_run_unless = \"m['adr3939_w2.fold_binary_pre_r2'] == 0\"\n"
+           "not_run_reason = \"{} runs only on a fold binary that carries R2 (the harness-state amendment), "
+           "and the run stamps that binary's SHA\"\ngate_not_requested = true\n")
+W3_GATE, W8_GATE = R2_GATE.format("W3"), R2_GATE.format("W8")
 BAND_FLIPS = {
     "row 7's logs section GETs missed against 2 x tail entries, not per pass": (
         "miss_if = \"v >= 2 * m['row_07.logs_tail_entries'] * m['row_07.logs_build_passes']\"\n",
@@ -4531,9 +4718,9 @@ BAND_FLIPS = {
     ),
     "W8's refold passing with no hour retired": (
         "transition = \"retired_hour_refold\"\nmetric = \"fold.dp7.logs.retired_hours\"\nlane = \"counter\"\n"
-        "target_if = \"v == [m['adr3939_w3.tombstoned_hour']]\"\n",
+        + W8_GATE + "target_if = \"v == [m['adr3939_w3.tombstoned_hour']]\"\n",
         "transition = \"retired_hour_refold\"\nmetric = \"fold.dp7.logs.retired_hours\"\nlane = \"counter\"\n"
-        "target_if = \"v == v\"\n",
+        + W8_GATE + "target_if = \"v == v\"\n",
         "check_w8_retired_hours_are_the_tombstoned_hour",
     ),
     "A4's refold digest passing whenever present": (
@@ -4544,10 +4731,31 @@ BAND_FLIPS = {
         "check_w8_retired_hours_are_the_tombstoned_hour",
     ),
     "W3's drop judged with HEAD still holding the hour": (
-        "metric = \"stamp.drop_parts_holding_hour.logs\"\nlane = \"counter\"\ntarget_if = \"v == 0\"\n"
-        "miss_if = \"v > 0\"\n",
-        "metric = \"stamp.drop_parts_holding_hour.logs\"\nlane = \"counter\"\ntarget_if = \"v >= 0\"\n",
+        "metric = \"stamp.drop_parts_holding_hour.logs\"\nlane = \"counter\"\n" + W3_GATE
+        + "target_if = \"v == 0\"\nmiss_if = \"v > 0\"\n",
+        "metric = \"stamp.drop_parts_holding_hour.logs\"\nlane = \"counter\"\n" + W3_GATE + "target_if = \"v >= 0\"\n",
         "check_w3_drop_leaves_head",
+    ),
+    "W3's part PUTs judged on a binary carrying no R2": (
+        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.snapshot_part_puts\"\nlane = \"counter\"\n" + W3_GATE,
+        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.snapshot_part_puts\"\nlane = \"counter\"\n",
+        "check_w3_w8_gated_on_r2_binary",
+    ),
+    "W3's part PUTs read off the unwritten key_index_part_puts": (
+        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.snapshot_part_puts\"\n",
+        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.key_index_part_puts\"\n",
+        "check_w3_w8_gated_on_r2_binary",
+    ),
+    "W8's digest judged on a binary carrying no R2": (
+        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.head_digest\"\nlane = \"counter\"\n" + W8_GATE,
+        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.head_digest\"\nlane = \"counter\"\n",
+        "check_w3_w8_gated_on_r2_binary",
+    ),
+    "W3's segments left incomplete on a binary carrying no R2": (
+        "metric = \"stamp.retired_hour_segments.logs\"\nlane = \"counter\"\n" + W3_GATE,
+        "metric = \"stamp.retired_hour_segments.logs\"\nlane = \"counter\"\n"
+        + W3_GATE.replace("gate_not_requested = true\n", ""),
+        "check_w3_w8_gated_on_r2_binary",
     ),
     "a one-character drift in W4's target cell": (
         'target = "at most 882 leaf GETs, 7 of 7 days covered',
@@ -5727,6 +5935,65 @@ FINISHED=1
                         self.check_tombstones_per_shard, "one shard's tombstone read as the hour's",
                         "test_tombstone_check_is_per_shard")
 
+    def check_hour_segments(self, inv_path):
+        """hour-segments over a resolve of hours h and h + 1: an L1 key's hour
+        is its path's, an L0 key's its commit record's bucket, so hour h counts
+        one segment per tier, and a resolve holding only hour h + 1 counts
+        none of h; a key of another tenant, an L0 key with no commit record,
+        or a key of neither tier is refused, through the CLI with exit 70."""
+        inv = load_module(inv_path, "inv_hour_segments")
+        out = []
+        h = 20_400 * 24
+        stamp = {x: datetime.datetime.fromtimestamp(x * 3600, datetime.timezone.utc).strftime("%Y%m%dT%H")
+                 for x in (h, h + 1)}
+        keys = [f"10\tt/abc/l/c/0000/{stamp[h + i]}/w1.1.{i + 1:020}.cmt\n" for i in (0, 1)]
+        l0 = {x: f"t/abc/l/l0/0000/w1.1.{x - h + 1:020}.0123456789abcdef.rseg" for x in (h, h + 1)}
+        l1 = {x: f"t/abc/l/l1/0000/{stamp[x]}/x.rseg" for x in (h, h + 1)}
+        for case, resolved, want in (("both hours", [l0[h], l1[h], l0[h + 1], l1[h + 1]], (2, 1, 1, 4)),
+                                     ("the next hour only", [l0[h + 1], l1[h + 1]], (0, 0, 0, 2))):
+            try:
+                doc = inv.hour_segments(resolved, keys, "abc", "l", h)
+            except ValueError as e:
+                out.append(f"{case}: refused ({e})")
+                continue
+            if (doc["segments"], doc["l0"], doc["l1"], doc["resolved"]) != want or doc["hour"] != h:
+                out.append(f"{case}: {doc}, want segments, l0, l1, resolved {want}")
+        for case, key in (("another tenant", f"t/abd/l/l1/0000/{stamp[h]}/x.rseg"),
+                          ("no commit record", "t/abc/l/l0/0000/w1.1.00000000000000000009.0123456789abcdef.rseg"),
+                          ("neither tier", "t/abc/l/l2/0000/x.rseg")):
+            try:
+                doc = inv.hour_segments([key], keys, "abc", "l", h)
+                out.append(f"{case}: {key} accepted: {doc}")
+            except ValueError:
+                pass
+        keys_path, fp, doc_path = self.path("keys-hours.tsv"), self.path("footprint.json"), self.path("hours.json")
+        with open(keys_path, "w") as f:
+            f.writelines(keys)
+        for resolved, want in (([l0[h], l1[h + 1]], 0), ([l0[h], "t/abc/l/l2/0000/x.rseg"], 70)):
+            with open(fp, "w") as f:
+                json.dump({"objects": [{"key": k} for k in resolved]}, f)
+            p = subprocess.run([sys.executable, inv_path, "hour-segments", "--footprint", fp, "--keys", keys_path,
+                                "--tenant-hash", "abc", "--hour", str(h), "--out", doc_path],
+                               capture_output=True, text=True)
+            if p.returncode != want:
+                out.append(f"CLI over {resolved}: exit {p.returncode}, want {want}: {p.stderr.strip()}")
+            elif want == 0:
+                with open(doc_path) as f:
+                    got = json.load(f)
+                if (got["segments"], got["l0"], got["l1"]) != (1, 1, 0):
+                    out.append(f"CLI over {resolved}: {got}")
+        return out
+
+    def test_hour_segments_counts_the_hours_segments_on_both_tiers(self):
+        inv_path = os.path.join(BOX, "lib", "inv.py")
+        self.assertEqual(self.check_hour_segments(inv_path), [])
+        for old, new, label in (
+                ("        if h == hour:\n", "        if True:\n", "every resolved segment counted as the hour's"),
+                ("h = commits.get((parts[4], ident))", "h = commits.get((parts[4], parts[5]))",
+                 "an L0 key matched to its commit record by file name")):
+            self.flip_check(old, new, "lib/inv.py", self.check_hour_segments, label,
+                            "test_hour_segments_counts_the_hours_segments_on_both_tiers")
+
     def test_retired_hour_tombstones_hour_zero_only(self):
         # retired_hour retires ingest hour D0 (hour 0 of dp7's oldest day,
         # the strided load's batch 0) and nothing later: retention-cutoff
@@ -5856,12 +6123,16 @@ FINISHED=1
                           "fold-retired_hour-logs.measure.json", "--key-index-leaves --retention-default RETENTION_Ss",
                           "fold-retired_hour_refold-logs.measure.json",
                           "--key-index-leaves --retention-default RETENTION_Ss",
+                          "listing-retired_hour-resolved.json", "STAMP stamps/retired_hour.logs.retired_resolve.json",
+                          "rlog footprint --tenant dp7", "hour-segments --footprint",
                           "STAMP stamps/transitions.jsonl", "STAMP stamps/census.jsonl", "--batch 23",
                           "tombstone-check --first D0_7 --last D0_7+23",
                           "STAMP stamps/retired_hour_drop.logs.tombstone.json",
                           "STAMP stamps/retired_hour_drop.logs.maint_records.json",
                           "fold-retired_hour_drop-logs.measure.json", "fold-retired_hour_drop_refold-logs.measure.json",
-                          "STAMP stamps/transitions.jsonl")),
+                          "listing-retired_hour_drop-resolved.json",
+                          "STAMP stamps/retired_hour_drop.logs.retired_resolve.json", "rlog footprint --tenant dp7",
+                          "hour-segments --footprint", "STAMP stamps/transitions.jsonl")),
     )
 
     def check_new_states_plan(self, script):
@@ -5898,6 +6169,9 @@ FINISHED=1
         self.flip_check('  retire_through retired_hour_drop 23 || { TRIPLES="$saved"; return 1; }\n',
                         '  retire_through retired_hour_drop 22 || { TRIPLES="$saved"; return 1; }\n', "run.sh",
                         self.check_new_states_plan, "the drop leaving the day's last hour",
+                        "test_new_states_dry_run_plan")
+        self.flip_check('  run "$PY" "$LIB" hour-segments', '  : "$PY" "$LIB" hour-segments', "run.sh",
+                        self.check_new_states_plan, "W3's retired-hour resolve never counted",
                         "test_new_states_dry_run_plan")
 
     def run_sourced(self, script, toml, body, name):

@@ -1399,8 +1399,9 @@ maint_records() {
 # retired_hour.wait_minutes. maint_records then checks the pass compacted
 # nothing of dp7's logs. Then `catalog fold --retention-default Rs`, which
 # carries R into the fold and reconciles the retirement frontier, is
-# stamped as STATE's fold, and a second one as STATE_refold. Non-zero
-# (failed_at set) on failure.
+# stamped as STATE's fold, and a second one as STATE_refold; then the
+# segments a catalog resolve returns for the tombstone stamp's hour, as
+# STATE.logs.retired_resolve.json. Non-zero (failed_at set) on failure.
 retire_through() {
   local state="$1" k="$2" d0="$DP_START_7" cut="$WORK/retention-$1.json" r rows tokens key hash
   local tlog="$WORK/tombstone-check-$1.out" deadline code=0 f rflag
@@ -1453,6 +1454,18 @@ retire_through() {
   for f in "$state" "${state}_refold"; do
     fold "$f" --key-index-leaves --retention-default "${r}s" || return 1
   done
+  # Row W3's resolve over hour d0: `rlog footprint --tenant` measures every
+  # segment a catalog resolve returns, which skips the parts' retired_hours,
+  # and hour-segments counts those of ingest hour d0 on either tier.
+  local fp="$WORK/resolve-$state.json" flog="$WORK/resolve-$state.out"
+  list_store "$state-resolved"
+  printf 'STAMP stamps/%s.logs.retired_resolve.json\n' "$state"
+  run "${CLI[@]}" rlog footprint --tenant dp7 --shards "$SHARDS" --json >"$fp" 2>"$flog" \
+    || { failed_at "rlog footprint $state" "$?" "$flog"; return 1; }
+  run "$PY" "$LIB" hour-segments --footprint "$fp" --keys "$WORK/keys-$state-resolved.tsv" \
+    --tenant-hash "${hash:-DP7_HASH}" --signal-code l --hour "$d0" \
+    --out "$STAMPS/$state.logs.retired_resolve.json" >"$flog" 2>&1 \
+    || { failed_at "hour-segments $state" "$?" "$flog"; return 1; }
   return 0
 }
 

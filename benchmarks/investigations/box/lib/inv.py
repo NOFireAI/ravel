@@ -1587,6 +1587,54 @@ def cmd_fold_binary(args):
     write_json(args.out, doc)
 
 
+def hour_segments(resolved, keys_lines, tenant_hash, signal_code, hour):
+    """{hour, segments, l0, l1, resolved} of the data keys a catalog resolve
+    returned (`rlog footprint --tenant --json` objects[].key) that belong to
+    ingest hour `hour` (unix hours). An L1 key carries its hour in its path,
+    t/<hash>/<signal>/l1/<shard>/<YYYYMMDDTHH>/...; an L0 key's hour is the
+    bucket of its commit record, t/<hash>/<signal>/c/<shard>/<YYYYMMDDTHH>/
+    <writer>.<epoch>.<seq>.cmt, in the census keys. Raises on a resolved key
+    of another tenant or signal, of neither tier, or an L0 key with no commit
+    record, since its hour is then unknown."""
+    commits = {}
+    for (shard, h), files in bucket_files(keys_lines, tenant_hash, signal_code).items():
+        for f in files:
+            if f.endswith(".cmt") and not f.startswith(("l1.", "rw.")):
+                commits[(shard, f[:-len(".cmt")])] = h
+    counts = {"l0": 0, "l1": 0}
+    for key in resolved:
+        parts = key.split("/")
+        if len(parts) < 6 or parts[:3] != ["t", tenant_hash, signal_code] or not key.endswith(DATA_SUFFIX):
+            raise ValueError(f"resolved key {key!r} is no {tenant_hash}/{signal_code} data key")
+        if parts[3] == "l1" and len(parts) == 7:
+            h = hour_index(parts[5])
+        elif parts[3] == "l0" and len(parts) == 6:
+            ident = parts[5][:-len(DATA_SUFFIX)].rsplit(".", 1)[0]
+            h = commits.get((parts[4], ident))
+            if h is None:
+                raise ValueError(f"resolved L0 key {key!r} has no commit record in the census keys")
+        else:
+            raise ValueError(f"resolved key {key!r} is neither an L0 nor an L1 data key")
+        if h == hour:
+            counts[parts[3]] += 1
+    return {"hour": hour, "segments": counts["l0"] + counts["l1"], "l0": counts["l0"], "l1": counts["l1"],
+            "resolved": len(resolved)}
+
+
+def cmd_hour_segments(args):
+    """Writes --out: how many of the segments a catalog resolve returned
+    belong to ingest hour --hour, on either tier (row W3's retired-hour
+    resolve)."""
+    try:
+        with open(args.footprint) as f:
+            resolved = [o["key"] for o in json.load(f)["objects"]]
+        with open(args.keys) as f:
+            doc = hour_segments(resolved, f, args.tenant_hash, args.signal_code, args.hour)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        die(f"hour-segments: {e}", 70)
+    write_json(args.out, doc)
+
+
 def day_parts(doc):
     """Per catalog part of a catalog stamp: its first and last hour (unix
     hours), its UTC day, entry count and leaves (slices) per field."""
@@ -1880,6 +1928,15 @@ def main():
     fb.add_argument("--r2", default="")
     fb.add_argument("--out", required=True)
     fb.set_defaults(fn=cmd_fold_binary)
+
+    hs = sub.add_parser("hour-segments")
+    hs.add_argument("--footprint", required=True, help="`ravel-cli rlog footprint --tenant --json` output")
+    hs.add_argument("--keys", required=True, help="census keys file (size<TAB>key per line)")
+    hs.add_argument("--tenant-hash", required=True)
+    hs.add_argument("--signal-code", default="l")
+    hs.add_argument("--hour", type=int, required=True, help="ingest hour, unix hours")
+    hs.add_argument("--out", required=True)
+    hs.set_defaults(fn=cmd_hour_segments)
 
     dps = sub.add_parser("day-parts-stamp")
     dps.add_argument("--stamps", required=True)

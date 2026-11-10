@@ -126,19 +126,20 @@ G_INPUTS = ("key_index_pair_budget", "key_index_field_pairs")
 # over from it, reason and all.
 PASSED_ON = ("not-run", UNSUPPORTED, GUARD, NOT_COMPUTABLE, INCOMPLETE)
 # Fold report fields a build may not write: absent, they read unsupported.
+# ADR-3939's fold figures (snapshot_part_puts, sealed_day_leaf_puts,
+# sealed_day_previous_leaf_gets, key_index_unchanged_section_gets,
+# switch_off_partition_changed, head_digest, retired_hours) are not here:
+# every build the harness measures them on writes them, so a report without
+# one is missing.
 FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_index_sections_read",
-                  "key_index_leaf_gets", "sealed_day_leaf_puts", "sealed_day_previous_leaf_gets", "head_digest",
-                  "switch_off_partition_changed", "key_index_unchanged_section_gets", "key_index_part_puts",
-                  "retired_hours")
+                  "key_index_leaf_gets")
 # Stamps of ADR-3939's multi-day states: stamp.<what>.<label> reads
 # stamps/STATE.LABEL.<kind>.json. box/run.sh state_retired_hour writes the
-# fold_binary and tombstone stamps, so in a run where that state is live
-# their absence is missing. No command resolves an ingest hour's segments,
-# so no run writes retired_resolve: that figure is unsupported.
+# fold_binary, tombstone and retired_resolve stamps (the last from `rlog
+# footprint --tenant`, which lists what a catalog resolve returns), so in a
+# run where that state is live their absence is missing.
 H1B_STAMPS = {"fold_binary_pre_r2": "fold_binary", "tombstoned_hour": "tombstone",
               "retired_hour_segments": "retired_resolve"}
-H1B_UNWRITTEN = {"retired_resolve": "no harness command resolves an ingest hour's segments (neither ravel-cli "
-                                    "nor the server lists the segments one hour holds after a fold)"}
 
 # Fold report fields under their names in a `catalog fold --json` report and
 # in a `--rebuild-key-index` report.
@@ -1267,28 +1268,37 @@ def stamp_figure(stamps, census, cfg, state, metric):
         return drop_parts_holding_hour(stamps, state, label)
     if what in H1B_STAMPS:
         name = f"stamps/{state}.{label}.{H1B_STAMPS[what]}.json"
-        if H1B_STAMPS[what] in H1B_UNWRITTEN:
-            return UNSUPPORTED, None, f"no {name}: {H1B_UNWRITTEN[H1B_STAMPS[what]]}"
         doc = stamps.doc(state, label, H1B_STAMPS[what])
         if doc is None:
             return "missing", None, f"no {name} (box/run.sh state_retired_hour writes it)"
         if what == "fold_binary_pre_r2":
-            # W2's binary: the fold binary's SHA, carrying C1 and not R2. Any
-            # other binary is one W2 is not measured on (the harness-state
-            # amendment runs the other rows on the R2 build), so W2 is
-            # not-run there, never a miss.
+            # 1 on W2's binary (C1 and not R2), 0 on the R2 build W3 and W8
+            # are measured on (the harness-state amendment): each row's
+            # not_run_unless reads it. A binary with neither is one no row is
+            # measured on, so all three are not-run there, never a miss.
             if not isinstance(doc.get("sha"), str) or not all(
                     isinstance(doc.get(k), bool) for k in ("carries_c1", "carries_r2")):
                 return "missing", None, f"{name} carries no sha, carries_c1 and carries_r2"
-            if doc["carries_c1"] and not doc["carries_r2"]:
+            if doc["carries_r2"]:
+                return "value", 0, ""
+            if doc["carries_c1"]:
                 return "value", 1, ""
-            carries = "R2" if doc["carries_r2"] else "no C1"
-            return "not-run", None, (f"the retired_hour fold binary {doc['sha']} carries {carries}, and W2 is "
-                                     "measured only on a binary carrying C1 and not R2 (the harness-state "
-                                     "amendment)")
+            return "not-run", None, (f"the retired_hour fold binary {doc['sha']} carries no C1, and W2 is "
+                                     "measured only on a binary carrying C1 and not R2, W3 and W8 on one "
+                                     "carrying R2 (the harness-state amendment)")
         field = {"tombstoned_hour": "hour", "retired_hour_segments": "segments"}[what]
         if not isinstance(doc.get(field), int) or isinstance(doc.get(field), bool):
             return "missing", None, f"{name} carries no {field}"
+        if what == "retired_hour_segments":
+            # A resolve of another hour, or one that returned nothing at all,
+            # would read 0 segments of the tombstoned hour without proving it.
+            tomb = stamps.doc(state, label, "tombstone") or {}
+            hour = doc.get("hour")
+            if not isinstance(hour, int) or isinstance(hour, bool) or hour != tomb.get("hour"):
+                return "missing", None, (f"{name} counts hour {doc.get('hour')}, and "
+                                         f"stamps/{state}.{label}.tombstone.json tombstoned {tomb.get('hour')}")
+            if not isinstance(doc.get("resolved"), int) or doc["resolved"] < 1:
+                return "missing", None, f"{name}: the resolve returned no segment ({doc.get('resolved')})"
         return "value", doc[field], ""
     if what == "buckets":
         doc = stamps.doc(state, label, "kidx")
@@ -1570,6 +1580,10 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
                 status, value, why = "not-run", None, gate
                 refs = [by_id.get(r, {}) for r in re.findall(r"m\['([^']+)'\]", fig["not_run_unless"])]
                 gap = next((r["not_requested"] for r in refs if r.get("not_requested")), None)
+                if not gap and fig.get("gate_not_requested") and all(r.get("status") == "value" for r in refs):
+                    # The gate read every figure it names and said no: a
+                    # build the figure is not measured on.
+                    gap = gate
                 if gap:
                     entry["gated"] = True
                     entry["not_requested"] = gap
@@ -1830,7 +1844,8 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     state run.toml asks for that did not run, a planned call that was not
     sent in a state that did, or a figure not-run for any reason other than
     its row or figure lacking a state, tenant, scale or baseline the run
-    never asked for, or W2 on a fold binary it is not measured on (a gated
+    never asked for, or W2, W3 or W8 on a fold binary it is not measured on
+    (a gate_not_requested figure whose gate read values and said no; a gated
     figure is either not_requested or listed here), a figure not-measured
     (a row 18 cell whose covering part was left to tier 1), a figure
     not-computable or incomplete or judged against one, a row 18 figure or
