@@ -1461,10 +1461,17 @@ box from M7's startup lines: `L` 1.45, 3.38 and 8.19 GB, `slots` 1, 2 and
 1,040 and 528 and a soft `nofile` limit of at least 4,128, 4,160 and 4,224
 for `F = floor(nofile_soft / (2 x slots))` to cover it (items 1 and 4).
 One more bit doubles the need: at the top of each box's `bits` band the
-limit is 8,224, 8,256 and 8,320. The ClickBench entry's start script
-raises the soft limit to the hard limit (`ulimit -n` set to `ulimit -Hn`)
-before the server starts; M7 did not record the hard limit on these Ubuntu
-24.04 boxes. T3 stamps each box's soft limit beside its run and requires
+limit is 8,224, 8,256 and 8,320. Two things raise it. M7 and M8 run the
+upstream ClickBench entry, whose start script raises the soft limit to the
+hard one before it launches the server (`ulimit -n "$(ulimit -Hn)"`,
+ClickHouse/ClickBench `ravel/start:65` at commit 6ba54cd1da84). This
+repository's kit does not (`benchmarks/clickbench/kit/box/run.sh`
+`launch_server` execs the binary unchanged), and neither does a service
+unit with the common soft limit of 1,024. So T2 (#4074) makes ravel-server
+raise its own soft `nofile` limit to the hard limit at startup and log
+both values, which is what makes the bucketed retry reachable outside the
+entry. M7 did not record the hard limit on these Ubuntu 24.04 boxes. T3
+stamps each box's soft limit, from that startup line, beside its run and requires
 at least 8,320 on every box. A box stamped below that has failed a
 precondition: its row 33 rows and its concurrent QPS row are reported and
 not judged, and the box is rerun with the limit raised. On a box stamped
