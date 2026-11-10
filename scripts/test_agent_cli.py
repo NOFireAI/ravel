@@ -219,6 +219,54 @@ class SpecLint(unittest.TestCase):
         self.assertIn("line 3", out)
         self.assertIn("<disk_floor_gb>", out)
 
+    def test_the_real_template_filled_in_passes(self):
+        # FLIP: scanning every line for the placeholder refuses this, since
+        # the template names it in prose and in the executor's below-floor
+        # report format, which a filled spec keeps.
+        skill = pathlib.Path(__file__).resolve().parent.parent / ".claude/skills/fleet-task-spec/SKILL.md"
+        text = skill.read_text()
+        start = text.index("## Template")
+        body = text[text.index("```\n", start) + 4:]
+        body = body[:body.index("\n```\n")]
+        body = body.replace("gate_tier: <executor|merge|script-only>", "gate_tier: executor")
+        body = body.replace("disk_floor_gb: <N>", "disk_floor_gb: 60")
+        body = body.replace(".gate-logs <disk_floor_gb>", ".gate-logs 60")
+        self.assertIn("<disk_floor_gb>", body, "the template no longer mentions the placeholder; "
+                      "this case would no longer test the prose exemption")
+        self.assertEqual(cli.spec_head_values(body), ("executor", 60))
+
+    def test_headroom_floor_parsing(self):
+        head = "gate_tier: executor\ndisk_floor_gb: 60\n"
+        run = "    mkdir -p .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs {} && df -h\n"
+        refused = {
+            # FLIP: a leading-digit match accepts 60x and 60.5, which the
+            # guard's integer test rejects on every host.
+            "60x": "is not an integer", "60.5": "is not an integer",
+            # FLIP: a digit-first match skips a quoted floor, which the shell
+            # unquotes and runs as 5.
+            '"5"': "floor 5 differs",
+            "<N>": "is not an integer", "sixty": "is not an integer",
+        }
+        for arg, why in refused.items():
+            with self.assertRaises(cli.CliError, msg=arg) as ctx:
+                cli.spec_head_values(head + run.format(arg))
+            self.assertIn(why, str(ctx.exception), arg)
+        # FLIP: a per-line scan misses a floor moved to the next line.
+        with self.assertRaises(cli.CliError) as ctx:
+            cli.spec_head_values(head + "    scripts/guards/check-disk-headroom.sh .gate-logs \\\n      5\n")
+        self.assertIn("floor 5 differs", str(ctx.exception))
+        # FLIP: treating the guard's default floor as acceptable passes this.
+        with self.assertRaises(cli.CliError) as ctx:
+            cli.spec_head_values(head + "    scripts/guards/check-disk-headroom.sh .gate-logs\n")
+        self.assertIn("without a floor argument", str(ctx.exception))
+        # Prose and comments that name the script are not invocations.
+        # FLIP: matching any line holding the script name refuses both.
+        ok = head + ("If scripts/guards/check-disk-headroom.sh exits 1, stop.\n"
+                     "# scripts/guards/check-disk-headroom.sh .gate-logs 5  (old floor)\n")
+        self.assertEqual(cli.spec_head_values(ok), ("executor", 60))
+        self.assertEqual(cli.spec_head_values(head + run.format("60")), ("executor", 60))
+        self.assertEqual(cli.spec_head_values(head + run.format("060")), ("executor", 60))
+
 
 class AdrSections(unittest.TestCase):
     TEXT = ("# ADR-1\n\n## Decision\nbody\n```\n## not a heading\n```\n### Sub\nx\n"
