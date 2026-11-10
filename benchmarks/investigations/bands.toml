@@ -1961,8 +1961,10 @@ target_if = "v >= 1"
 # (pre-registered ...)" and "Acceptance (added rows ...)"), cells verbatim as
 # above. Each carries adr = "ADR-3939" and its ADR row label in adr_row. They
 # run on the multi-day states of the harness-state amendment, day_parts_7,
-# day_parts_30 and retired_hour, which box/run.sh does not build yet (task
-# H1b, #4048), so a run without them reports each row not-run, naming the
+# day_parts_30 and retired_hour, which box/run.sh builds (state_day_parts and
+# state_retired_hour) on their own tenants: day_parts_7 and retired_hour on
+# dp7, day_parts_30 on dp30, so their fold metrics read fold.dp7 and
+# fold.dp30. A run.toml without them reports each row not-run, naming the
 # state.
 
 [[row]]
@@ -1978,7 +1980,7 @@ source = "predicted; box D rates, comment 6700944105"
 # advance, transition day_parts_7_advance on the day-part tenant. The
 # passes are the report's key_index_build_passes, the bytes its leaf bytes
 # written, the RSS the fold stamp's measured peak.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -1986,7 +1988,7 @@ name = "build_passes"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_advance"
-metric = "fold.inv.logs.key_index_build_passes"
+metric = "fold.dp7.logs.key_index_build_passes"
 lane = "counter"
 target_if = "v <= 26"
 miss_if = "v > 26"
@@ -1996,7 +1998,7 @@ name = "leaf_bytes"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_advance"
-metric = "fold.inv.logs.leaf_bytes"
+metric = "fold.dp7.logs.leaf_bytes"
 lane = "counter"
 target_if = "v <= 1_400_000_000"
 miss_if = "v > 1_400_000_000"
@@ -2006,7 +2008,7 @@ name = "peak_rss_bytes"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_advance"
-metric = "fold.inv.logs.peak_rss_bytes"
+metric = "fold.dp7.logs.peak_rss_bytes"
 lane = "counter"
 target_if = "v <= 2_000_000_000"
 miss_if = "v > 2_000_000_000"
@@ -2020,7 +2022,7 @@ target = "at most 3 passes, at most 0.25 GB leaf bytes"
 miss = "more than 3 passes or over 0.25 GB"
 source = "predicted; box D rates, comment 6700944105"
 # The spans half of A1's advance fold.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -2028,7 +2030,7 @@ name = "build_passes"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_advance"
-metric = "fold.inv.spans.key_index_build_passes"
+metric = "fold.dp7.spans.key_index_build_passes"
 lane = "counter"
 target_if = "v <= 3"
 miss_if = "v > 3"
@@ -2038,7 +2040,7 @@ name = "leaf_bytes"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_advance"
-metric = "fold.inv.spans.leaf_bytes"
+metric = "fold.dp7.spans.leaf_bytes"
 lane = "counter"
 target_if = "v <= 250_000_000"
 miss_if = "v > 250_000_000"
@@ -2055,7 +2057,7 @@ source = "predicted"
 # it is at least the second fold after each day sealed. The fold report
 # carries no per-part leaf PUT or previous-leaf GET count on this build, so
 # both figures read unsupported until it does.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -2063,7 +2065,7 @@ name = "sealed_day_leaf_puts"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_advance"
-metric = "fold.inv.logs.sealed_day_leaf_puts"
+metric = "fold.dp7.logs.sealed_day_leaf_puts"
 lane = "counter"
 target_if = "v == 0"
 
@@ -2072,7 +2074,7 @@ name = "sealed_day_previous_leaf_gets"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_advance"
-metric = "fold.inv.logs.sealed_day_previous_leaf_gets"
+metric = "fold.dp7.logs.sealed_day_previous_leaf_gets"
 lane = "counter"
 target_if = "v == 0"
 
@@ -2090,7 +2092,7 @@ source = "predicted"
 # switch-off partition figure is the fold report's own comparison against the
 # partition the switch-off build writes. The fold report carries neither on
 # this build, so all three read unsupported until it does.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -2098,7 +2100,7 @@ name = "head_digest"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7"
-metric = "fold.inv.logs.head_digest"
+metric = "fold.dp7.logs.head_digest"
 lane = "counter"
 target_if = "isinstance(v, str) and len(v) > 0"
 
@@ -2107,7 +2109,7 @@ name = "refold_head_digest"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_refold"
-metric = "fold.inv.logs.head_digest"
+metric = "fold.dp7.logs.head_digest"
 lane = "counter"
 target_if = "isinstance(v, str) and len(v) > 0"
 
@@ -2125,7 +2127,7 @@ name = "switch_off_partition_changed"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7"
-metric = "fold.inv.logs.switch_off_partition_changed"
+metric = "fold.dp7.logs.switch_off_partition_changed"
 lane = "counter"
 target_if = "v == 0"
 
@@ -2139,7 +2141,7 @@ miss = "any day uncovered"
 source = "predicted"
 # Every day covered: each cold call covers every logs part the state's
 # catalog stamp holds and leaves none uncovered.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -2193,10 +2195,10 @@ source = "predicted; issue #3918"
 # Row 18's cells on the day-sealed tail: the same six statements, cold, in
 # the 7-day state, against the same statements unfolded on the same data. The
 # unfolded reference is the prefold temperature: the statement's cold calls
-# sent on the state's tenant before its fold, which task H1b (#4048) plans.
+# sent on the state's tenant before its fold (box/run.sh state_day_parts).
 # A cell any of whose cold calls left a part to tier 1 is not-measured, as in
 # row 18.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -2353,10 +2355,10 @@ source = "predicted from box D rates"
 # under 3 is not-run for every figure that depends on it, not a pass. The
 # total is judged against 30 x (T(S) + 100), the 30-day state's 30 day parts;
 # a state holding other than 30 parts is not that state, so the total is
-# not-run there rather than rescaled. evaluate.py reads no per-part leaf GET
-# breakdown from the stats, so the per-part figure reads unsupported on every
-# run until evaluate.py reads one.
-requires_tenant = "inv"
+# not-run there rather than rescaled. The stats carry no per-part leaf GET
+# breakdown (no keyIndex.perPart), so the per-part figure reads unsupported
+# until they do.
+requires_tenant = "dp30"
 requires_states = ["day_parts_30"]
 
 [[row.figure]]
@@ -2454,7 +2456,7 @@ target = "at most 26 passes, at most 1.4 GB leaf bytes, fold peak RSS at most 1.
 miss = "more than 26 passes, over 1.4 GB, or RSS over 1.2 GB"
 source = "predicted; comment 6700944105 (1.99 GB less 1.31 GB held plus 0.17 GB)"
 # A1's advance fold, on the build that carries decision 5.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -2462,7 +2464,7 @@ name = "build_passes"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_advance"
-metric = "fold.inv.logs.key_index_build_passes"
+metric = "fold.dp7.logs.key_index_build_passes"
 lane = "counter"
 target_if = "v <= 26"
 miss_if = "v > 26"
@@ -2472,7 +2474,7 @@ name = "leaf_bytes"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_advance"
-metric = "fold.inv.logs.leaf_bytes"
+metric = "fold.dp7.logs.leaf_bytes"
 lane = "counter"
 target_if = "v <= 1_400_000_000"
 miss_if = "v > 1_400_000_000"
@@ -2482,7 +2484,7 @@ name = "peak_rss_bytes"
 statement = "fold"
 state = "day_parts_7"
 transition = "day_parts_7_advance"
-metric = "fold.inv.logs.peak_rss_bytes"
+metric = "fold.dp7.logs.peak_rss_bytes"
 lane = "counter"
 target_if = "v <= 1_200_000_000"
 miss_if = "v > 1_200_000_000"
@@ -2500,13 +2502,16 @@ source = "predicted; fold.rs `PreviousTail::from_head` and `feed_carried_key_ind
 # the retired_hours path and is not re-encoded. The retired_hour state's fold
 # (transition retired_hour) is the fold after the tombstone, and
 # stamps/retired_hour.logs.fold_binary.json names its binary: sha,
-# carries_c1, carries_r2. No build writes that stamp yet (task H1b, #4048),
-# so the binary figure is unsupported and every other figure is not-run until
-# it says C1 without R2. A binary carrying R2 (or no C1) is one W2 is not
+# carries_c1, carries_r2 (box/run.sh state_retired_hour writes it from git
+# ancestry against run.toml's [retired_hour] c1_sha and r2_sha). Without the
+# stamp the binary figure is missing and every other figure is not-run until
+# it says C1 without R2. The fold is the server's on-demand fold, whose
+# response carries none of the three fold fields, so on this build they read
+# unsupported. A binary carrying R2 (or no C1) is one W2 is not
 # measured on: the binary figure and the rest are not-run and listed not
 # requested with the binary's SHA, never a miss, so a run on the R2 build
 # that holds retired_hour for W3 and W8 is not failed by W2.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["retired_hour"]
 
 [[row.figure]]
@@ -2522,7 +2527,7 @@ name = "previous_leaf_gets"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour"
-metric = "fold.inv.logs.key_index_leaf_gets"
+metric = "fold.dp7.logs.key_index_leaf_gets"
 lane = "counter"
 not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 1"
 not_run_reason = "W2 runs only on a fold binary that carries C1 and not R2 (the harness-state amendment), and the run stamps that binary's SHA"
@@ -2533,7 +2538,7 @@ name = "unchanged_section_gets"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour"
-metric = "fold.inv.logs.key_index_unchanged_section_gets"
+metric = "fold.dp7.logs.key_index_unchanged_section_gets"
 lane = "counter"
 not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 1"
 not_run_reason = "W2 runs only on a fold binary that carries C1 and not R2 (the harness-state amendment), and the run stamps that binary's SHA"
@@ -2545,7 +2550,7 @@ name = "leaf_bytes"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour"
-metric = "fold.inv.logs.leaf_bytes"
+metric = "fold.dp7.logs.leaf_bytes"
 lane = "counter"
 not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 1"
 not_run_reason = "W2 runs only on a fold binary that carries C1 and not R2 (the harness-state amendment), and the run stamps that binary's SHA"
@@ -2561,16 +2566,16 @@ miss = "any PUT before the drop, any segment of hour h"
 source = "predicted"
 # The retired_hour state's fold after the tombstone (transition
 # retired_hour), then the fold at the day's last tombstone (transition
-# retired_hour_drop). The tombstoned hour and a resolve over it after the
-# fold are stamps task H1b (#4048) writes (stamps/retired_hour.logs.tombstone.json
-# hour, stamps/retired_hour.logs.retired_resolve.json segments, both tiers);
-# the part PUTs and retired_hours are fold report fields this build does not
-# write. The part leaving HEAD is the count of parts in the catalog stamp
-# taken after the drop fold (stamps/retired_hour_drop.logs.catalog.json, H1b)
+# retired_hour_drop). box/run.sh state_retired_hour stamps the tombstoned
+# hour (stamps/retired_hour.logs.tombstone.json hour). No harness command
+# resolves one ingest hour's segments after a fold, so retired_hour_segments
+# reads unsupported; the part PUTs, leaves written and retired_hours are
+# fields the on-demand fold response does not carry, so they read unsupported
+# too. The part leaving HEAD is the count of parts in the catalog stamp
+# taken after the drop fold (stamps/retired_hour_drop.logs.catalog.json)
 # whose hour range holds the tombstoned hour, so a drop fold that drops
-# nothing misses rather than passing on its 0 PUTs. Each reads unsupported
-# until its source exists.
-requires_tenant = "inv"
+# nothing misses rather than passing on its 0 PUTs.
+requires_tenant = "dp7"
 requires_states = ["retired_hour"]
 
 [[row.figure]]
@@ -2578,7 +2583,7 @@ name = "part_puts"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour"
-metric = "fold.inv.logs.key_index_part_puts"
+metric = "fold.dp7.logs.key_index_part_puts"
 lane = "counter"
 target_if = "v == 0"
 miss_if = "v > 0"
@@ -2588,7 +2593,7 @@ name = "leaf_puts"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour"
-metric = "fold.inv.logs.leaves_written"
+metric = "fold.dp7.logs.leaves_written"
 lane = "counter"
 target_if = "v == 0"
 miss_if = "v > 0"
@@ -2606,7 +2611,7 @@ name = "retired_hours"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour"
-metric = "fold.inv.logs.retired_hours"
+metric = "fold.dp7.logs.retired_hours"
 lane = "counter"
 target_if = "v == [m['adr3939_w3.tombstoned_hour']]"
 
@@ -2624,7 +2629,7 @@ name = "drop_part_puts"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour_drop"
-metric = "fold.inv.logs.key_index_part_puts"
+metric = "fold.dp7.logs.key_index_part_puts"
 lane = "counter"
 target_if = "v == 0"
 miss_if = "v > 0"
@@ -2634,7 +2639,7 @@ name = "drop_leaf_puts"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour_drop"
-metric = "fold.inv.logs.leaves_written"
+metric = "fold.dp7.logs.leaves_written"
 lane = "counter"
 target_if = "v == 0"
 miss_if = "v > 0"
@@ -2660,7 +2665,7 @@ source = "predicted; comment 6700944105"
 # cold p50 against the same statement's prefold p50 (W4's own
 # unfolded_p50_s) plus the larger of
 # 5 % of it and half its interquartile range.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -2749,10 +2754,10 @@ source = "predicted"
 # S is under 3 is not-run for every figure that depends on it (the
 # harness-state amendment). Each day part is held to T(S) + 100 leaf GETs as
 # A7's is, besides the 30-day total, so one part over the bound cannot hide
-# under the total; evaluate.py reads no per-part breakdown from the stats, so
-# that figure reads unsupported on every run until evaluate.py reads one. The tier-1 probes are the
+# under the total; the stats carry no per-part breakdown (no
+# keyIndex.perPart), so that figure reads unsupported until they do. The tier-1 probes are the
 # calls' probe-phase GETs.
-requires_tenant = "inv"
+requires_tenant = "dp30"
 requires_states = ["day_parts_30"]
 
 [[row.figure]]
@@ -2855,7 +2860,7 @@ source = "predicted"
 # The stats carry no count of the key index's leaf round trips on this
 # build (dependencyDepth counts segment stages, not leaf waves), so the round
 # trips read unsupported until keyIndex.leafRoundTrips exists.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -2896,7 +2901,7 @@ source = "predicted"
 # to 00:30), so it reads the two day parts either side of it. 4 leaf GETs
 # alone would also hold for a window reading one part, so the calls must
 # cover exactly 2 parts and leave none uncovered.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -2952,8 +2957,9 @@ source = "predicted"
 # same tombstones (transition retired_hour_refold), each reporting its HEAD
 # digest and retired_hours. Each fold's retired_hours must be exactly [h] for
 # W3's tombstoned hour h, so two folds that observed no tombstone (both [])
-# miss rather than agree. The fold report carries neither on this build.
-requires_tenant = "inv"
+# miss rather than agree. The on-demand fold response carries neither on
+# this build, so all four read unsupported.
+requires_tenant = "dp7"
 requires_states = ["retired_hour"]
 
 [[row.figure]]
@@ -2961,7 +2967,7 @@ name = "head_digest"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour"
-metric = "fold.inv.logs.head_digest"
+metric = "fold.dp7.logs.head_digest"
 lane = "counter"
 target_if = "isinstance(v, str) and len(v) > 0"
 
@@ -2970,7 +2976,7 @@ name = "refold_head_digest"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour_refold"
-metric = "fold.inv.logs.head_digest"
+metric = "fold.dp7.logs.head_digest"
 lane = "counter"
 target_if = "isinstance(v, str) and len(v) > 0"
 
@@ -2988,7 +2994,7 @@ name = "retired_hours"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour"
-metric = "fold.inv.logs.retired_hours"
+metric = "fold.dp7.logs.retired_hours"
 lane = "counter"
 target_if = "v == [m['adr3939_w3.tombstoned_hour']]"
 
@@ -2997,7 +3003,7 @@ name = "refold_retired_hours"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour_refold"
-metric = "fold.inv.logs.retired_hours"
+metric = "fold.dp7.logs.retired_hours"
 lane = "counter"
 target_if = "v == [m['adr3939_w3.tombstoned_hour']]"
 
@@ -3019,7 +3025,7 @@ target = "within row 18's bound"
 miss = "over it: ship the week merge"
 source = "predicted"
 # W4's p50 against W4's bound, judged again as the flip.
-requires_tenant = "inv"
+requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
 [[row.figure]]
@@ -3042,7 +3048,7 @@ miss = "over it: ship the week merge"
 source = "predicted"
 # W5's statement against its own prefold p50, the 30-day state's statement
 # before the state's fold.
-requires_tenant = "inv"
+requires_tenant = "dp30"
 requires_states = ["day_parts_30"]
 
 [[row.figure]]
@@ -3074,8 +3080,8 @@ source = "predicted"
 # 1.1 x (T(S) + 100) (evaluate.py day_part_bound with factor 1.1), not-run
 # under 3 slices. The stats carry no per-part leaf GET breakdown and no count
 # of SlowDown responses on this build, so those figures read unsupported. The
-# row runs on whichever of the two states the run holds.
-requires_tenant = "inv"
+# row runs on whichever of the two states the run holds, so it names no
+# tenant: its W4 figures read dp7 and its W5 figures read dp30.
 
 [[row.figure]]
 name = "w4_leaf_gets_per_part"
