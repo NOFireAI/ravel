@@ -62,7 +62,8 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                shape below requires
   absolute LABEL FILE          print a results.json's absolute band table,
                                exit 1 on a miss
-  published LABEL BANDS MACHINE FILE
+  published LABEL BANDS MACHINE FILE [--published-tries PUB] [--arm-o ARM_O]
+            [--qps-windows LOG [--new-arm NAME]]
                                judge FILE against BANDS' [published.MACHINE]
                                rows (ClickBench's published figures), print
                                the table, exit 1 on a miss; FILE is a kit
@@ -72,7 +73,33 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                `concurrent_qps`) whose machine is MACHINE;
                                refuses a kit results.json that did not
                                select published, and a FILE with no
-                               readable QPS when MACHINE's row has one
+                               readable QPS when MACHINE's row has one.
+                               --published-tries PUB: the published results
+                               file itself (ClickBench format, MACHINE, its
+                               hot and cold equal to BANDS' rows); a
+                               statement whose published tries 2 and 3
+                               differ by more than statement_max_ratio has
+                               no published hot reference, and its hot is
+                               judged against ARM_O's instead
+                               (ADR-0954 M8). --arm-o ARM_O: published
+                               v0.28.0 through the same 43 x 3 cycle on the
+                               same box and data, in either format FILE
+                               takes; needs --published-tries. Without
+                               ARM_O such a statement is UNJUDGED and the
+                               run incomplete: exit 4 when nothing missed.
+                               --qps-windows LOG: same-box concurrent
+                               windows, one line each, `window=N arm=A
+                               qps=Q err_ratio=R [key=value...]`; arm old
+                               is v0.28.0 and --new-arm (default new) names
+                               the other. Replaces the published QPS gate:
+                               mean new QPS over mean old QPS must be at
+                               least 0.95 and mean new error ratio no
+                               higher than mean old; mean new QPS against
+                               concurrent_qps_min_ratio x published is
+                               printed, REPORTED and not gated. Refuses a
+                               LOG with fewer than two windows of either
+                               arm, a missing or non-numeric figure, or an
+                               arm name it never holds
   comparable RUN_TOML A.json B.json
                                refuse two arms that are not comparable, with
                                RUN_TOML's server_flags_a and server_flags_b
@@ -164,6 +191,15 @@ PUBLISHED_KEYS = ("statement_max_ratio", "concurrent_qps_min_ratio")
 PUBLISHED_MACHINE_KEYS = ("source", "concurrent_qps") + STATEMENT_KEYS
 PUBLISHED_NULL = "null"
 PUBLISHED_SOURCE_RE = re.compile(r"^\S+\.json@[0-9a-f]{40}$")
+# Same-box concurrent QPS (ADR-0954 M8): the v0.28.0 arm's name in a windows
+# log, the default name of the arm judged against it, the bar on mean new
+# QPS over mean old QPS, and the fewest windows each arm needs.
+QPS_OLD_ARM = "old"
+QPS_NEW_ARM = "new"
+SAME_BOX_QPS_MIN_RATIO = "0.95"
+QPS_MIN_WINDOWS = 2
+# published's exit when nothing missed and a statement could not be judged.
+EXIT_INCOMPLETE = 4
 MACHINE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 # The kit's own directory: on the box the staged kit, whose bands/ holds the
 # band files launch.sh copied in.
@@ -992,7 +1028,147 @@ def _ratio(m, p):
     return "%.4f" % (m / p) if p else "n/a"
 
 
-def published_bands(path, machine, report, report_path):
+def _check_machine(report, report_path, machine, published_selected=True):
+    """Refuse REPORT when it names a machine other than MACHINE, and a kit
+    results.json that did not select published when PUBLISHED_SELECTED."""
+    if "result" in report:
+        if report.get("machine") != machine:
+            raise Refusal("%s: machine is %r, not %s; judge it against its own machine's "
+                          "published rows" % (report_path, report.get("machine"), machine))
+        return
+    if published_selected and "published" not in report["provenance"]["band_sections"]:
+        raise Refusal("%s: published not selected: its band_sections are %s"
+                      % (report_path, ", ".join(report["provenance"]["band_sections"])))
+    # box/run.sh records "unknown" when the instance metadata call fails,
+    # which says nothing about the machine, so only a named one refuses.
+    ran_on = report["provenance"].get("hardware", {}).get("instance_type", "unknown")
+    if ran_on not in (machine, "unknown"):
+        raise Refusal("%s: ran on %r, not %s; judge it against its own machine's "
+                      "published rows" % (report_path, ran_on, machine))
+
+
+def published_unstable(tries_path, tries_report, machine, pub, r):
+    """The statements of the published results file TRIES_REPORT whose tries
+    2 and 3 differ by more than R, as {number: (try 2, try 3)}. The file must
+    be ClickBench's format for MACHINE and reproduce every [hot, cold] of the
+    band table PUB, so the tries read are the ones the table was copied
+    from."""
+    if "result" not in tries_report:
+        raise Refusal("%s: --published-tries takes a file in ClickBench's results format "
+                      "(`result` rows of three tries)" % tries_path)
+    _check_machine(tries_report, tries_path, machine)
+    figures, _, _ = _published_measured(tries_path, tries_report)
+    unstable = {}
+    for n, key in enumerate(STATEMENT_KEYS, 1):
+        want = tuple(None if v == PUBLISHED_NULL else v for v in pub[key])
+        if figures[n] != want:
+            raise Refusal("%s: statement %d is [hot, cold] %r, and the band table holds %r; "
+                          "it is not the file the table was copied from"
+                          % (tries_path, n, list(figures[n]), list(pub[key])))
+        t2, t3 = tries_report["result"][n - 1][1:3]
+        if _num(t2) and _num(t3):
+            lo, hi = sorted((t2, t3))
+            if _dec(hi) > _dec(r) * _dec(lo):
+                unstable[n] = (t2, t3)
+    return unstable
+
+
+def _window_figure(path, lineno, fields, key, convert):
+    if key not in fields:
+        raise Refusal("%s:%d: no %s figure" % (path, lineno, key))
+    try:
+        v = convert(fields[key])
+    except ValueError:
+        raise Refusal("%s:%d: %s=%s is not a number" % (path, lineno, key, fields[key]))
+    if not math.isfinite(v) or v < 0:
+        raise Refusal("%s:%d: %s=%s is not a finite number of at least 0"
+                      % (path, lineno, key, fields[key]))
+    return v
+
+
+def qps_windows(path):
+    """A same-box windows log as {arm: [(qps, err_ratio), ...]}: one line per
+    window, `window=N arm=A qps=Q err_ratio=R` and any further key=value
+    fields; blank lines and # comments are skipped. Refuses a line that is
+    not key=value fields, a missing or non-numeric figure, and a window
+    number seen twice."""
+    try:
+        lines = open(path).read().splitlines()
+    except OSError as e:
+        raise Refusal("%s: not readable: %s" % (path, e))
+    arms, seen = {}, set()
+    for lineno, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = {}
+        for token in line.split():
+            k, eq, v = token.partition("=")
+            if not eq or not k or k in fields:
+                raise Refusal("%s:%d: %r is not one key=value field per key" % (path, lineno, token))
+            fields[k] = v
+        window = _window_figure(path, lineno, fields, "window", int)
+        if window in seen:
+            raise Refusal("%s:%d: window %d appears twice" % (path, lineno, window))
+        seen.add(window)
+        if not fields.get("arm"):
+            raise Refusal("%s:%d: no arm" % (path, lineno))
+        qps = _window_figure(path, lineno, fields, "qps", float)
+        err = _window_figure(path, lineno, fields, "err_ratio", float)
+        arms.setdefault(fields["arm"], []).append((fields["qps"], fields["err_ratio"], qps, err))
+    return arms
+
+
+def same_box_qps_bands(path, new_arm, published_qps, q):
+    """The windows log PATH judged as ADR-0954 M8's concurrent QPS rows: mean
+    NEW_ARM QPS over mean old QPS at least SAME_BOX_QPS_MIN_RATIO, and mean
+    NEW_ARM error ratio no higher than mean old, both compared exactly in
+    decimal. Mean new QPS against Q x PUBLISHED_QPS is a REPORTED row, not a
+    gate."""
+    arms = qps_windows(path)
+    for arm in (QPS_OLD_ARM, new_arm):
+        if arm not in arms:
+            raise Refusal("%s: no window of arm %s (arms: %s)"
+                          % (path, arm, ", ".join(sorted(arms)) or "none"))
+        if len(arms[arm]) < QPS_MIN_WINDOWS:
+            raise Refusal("%s: arm %s has %d window(s), and the gate needs at least %d"
+                          % (path, arm, len(arms[arm]), QPS_MIN_WINDOWS))
+    new, old = arms[new_arm], arms[QPS_OLD_ARM]
+    n_new, n_old = decimal.Decimal(len(new)), decimal.Decimal(len(old))
+    q_new = sum(decimal.Decimal(w[0]) for w in new)
+    q_old = sum(decimal.Decimal(w[0]) for w in old)
+    e_new = sum(decimal.Decimal(w[1]) for w in new)
+    e_old = sum(decimal.Decimal(w[1]) for w in old)
+    mq_new, mq_old = float(q_new / n_new), float(q_old / n_old)
+    me_new, me_old = float(e_new / n_new), float(e_old / n_old)
+    bar = decimal.Decimal(SAME_BOX_QPS_MIN_RATIO)
+    names = "%s (%d windows) over old v0.28.0 (%d windows)" % (new_arm, len(new), len(old))
+    out = [
+        _row("same-box", "concurrent qps mean %s / mean old >= %s" % (new_arm, bar),
+             mq_new / mq_old if mq_old else None, float(bar),
+             "pass" if q_new * n_old >= bar * q_old * n_new else "miss",
+             "same-box qps: %s, mean %.4f over %.4f, ratio %s"
+             % (names, mq_new, mq_old, _ratio(mq_new, mq_old))),
+        _row("same-box", "concurrent err_ratio mean %s <= mean old" % new_arm,
+             me_new, me_old, "pass" if e_new * n_old <= e_old * n_new else "miss",
+             "same-box error ratio: %s, mean %.4f over %.4f, ratio %s"
+             % (names, me_new, me_old, _ratio(me_new, me_old))),
+    ]
+    label = "concurrent qps >= %g x published (reported)" % q
+    if published_qps == PUBLISHED_NULL:
+        out.append(_row("published", label, mq_new, None, "reported",
+                        "concurrent qps: mean %s %.3f, no published figure; not gated"
+                        % (new_arm, mq_new)))
+    else:
+        out.append(_row("published", label, mq_new, float(_dec(q) * _dec(published_qps)),
+                        "reported",
+                        "concurrent qps: mean %s %.3f, published %.3f, ratio %s; not gated"
+                        % (new_arm, mq_new, published_qps, _ratio(mq_new, published_qps))))
+    return out
+
+
+def published_bands(path, machine, report, report_path, tries=None, arm_o=None,
+                    windows=None):
     """One run judged against ClickBench's published figures for MACHINE in
     the band file PATH's [published] section (ADR-4034 D6). REPORT, read from
     REPORT_PATH, is a kit results.json whose band_sections selected
@@ -1003,24 +1179,23 @@ def published_bands(path, machine, report, report_path):
     misses below concurrent_qps_min_ratio times the published QPS. Both
     bounds are inclusive and compared in decimal, so a figure at exactly the
     factor passes. A run with no QPS to judge against a published one is
-    refused, not judged."""
-    if "result" in report:
-        if report.get("machine") != machine:
-            raise Refusal("%s: machine is %r, not %s; judge it against its own machine's "
-                          "published rows" % (report_path, report.get("machine"), machine))
-    else:
-        if "published" not in report["provenance"]["band_sections"]:
-            raise Refusal("%s: published not selected: its band_sections are %s"
-                          % (report_path, ", ".join(report["provenance"]["band_sections"])))
-        # box/run.sh records "unknown" when the instance metadata call fails,
-        # which says nothing about the machine, so only a named one refuses.
-        ran_on = report["provenance"].get("hardware", {}).get("instance_type", "unknown")
-        if ran_on not in (machine, "unknown"):
-            raise Refusal("%s: ran on %r, not %s; judge it against its own machine's "
-                          "published rows" % (report_path, ran_on, machine))
+    refused, not judged.
+
+    TRIES, a (path, report) pair, is the published results file; a statement
+    whose published tries 2 and 3 differ by more than statement_max_ratio
+    has its hot judged against ARM_O's hot (a (path, report) pair, v0.28.0
+    on the same box and data) by the same factor, and is UNJUDGED without
+    ARM_O (ADR-0954 M8). WINDOWS, a (path, new arm) pair, replaces the
+    published QPS gate with same_box_qps_bands."""
+    _check_machine(report, report_path, machine)
     top, pub = published_table(lane_of(path), path, machine)
     figures, qps, qps_note = _published_measured(report_path, report)
     r, q = top["statement_max_ratio"], top["concurrent_qps_min_ratio"]
+    unstable = published_unstable(tries[0], tries[1], machine, pub, r) if tries else {}
+    arm_o_figures = None
+    if arm_o:
+        _check_machine(arm_o[1], arm_o[0], machine, published_selected=False)
+        arm_o_figures, _, _ = _published_measured(arm_o[0], arm_o[1])
     out = []
     for n, key in enumerate(STATEMENT_KEYS, 1):
         for i, figure in enumerate(("hot", "cold")):
@@ -1028,6 +1203,9 @@ def published_bands(path, machine, report, report_path):
             if p == PUBLISHED_NULL:
                 continue
             m = figures.get(n, (None, None))[i]
+            if figure == "hot" and n in unstable:
+                out.append(_arm_o_row(key, n, r, m, unstable[n], arm_o_figures))
+                continue
             bound = _dec(r) * _dec(p)
             label = "%s %s_s <= %g x published" % (key, figure, r)
             if m is None:
@@ -1040,6 +1218,8 @@ def published_bands(path, machine, report, report_path):
                             "statement %d %s: measured %.3f s, published %.3f s, ratio %s"
                             % (n, figure, m, p, _ratio(m, p)), key))
     p = pub["concurrent_qps"]
+    if windows:
+        return out + same_box_qps_bands(windows[0], windows[1], p, q)
     label = "concurrent qps >= %g x published" % q
     if p == PUBLISHED_NULL:
         return out
@@ -1051,6 +1231,28 @@ def published_bands(path, machine, report, report_path):
     out.append(_row("published", label, qps, float(bound), "miss" if _dec(qps) < bound else "pass",
                     "; ".join(s for s in (note, qps_note) if s)))
     return out
+
+
+def _arm_o_row(key, n, r, m, tries, arm_o_figures):
+    """Statement N's hot judged against arm O, its published tries 2 and 3
+    (TRIES) differing by more than R; UNJUDGED when there is no arm O or arm
+    O did not answer it."""
+    why = ("published tries 2 and 3 %.3f s and %.3f s differ by more than %gx"
+           % (tries[0], tries[1], r))
+    label = "%s hot_s <= %g x arm O" % (key, r)
+    if m is None:
+        return _row("arm-o", label, None, None, "miss",
+                    "statement %d hot: not answered; %s" % (n, why), key)
+    o = arm_o_figures.get(n, (None, None))[0] if arm_o_figures is not None else None
+    if o is None:
+        reason = "no arm O" if arm_o_figures is None else "arm O did not answer it"
+        return _row("arm-o", label, m, None, "unjudged",
+                    "statement %d hot: unstable published reference, %s; %s"
+                    % (n, why, reason), key)
+    bound = _dec(r) * _dec(o)
+    return _row("arm-o", label, m, float(bound), "miss" if _dec(m) > bound else "pass",
+                "statement %d hot: measured %.3f s, arm O %.3f s, ratio %s; %s"
+                % (n, m, o, _ratio(m, o), why), key)
 
 
 def _differs(field, va, vb):
@@ -2457,6 +2659,46 @@ def validate(path):
     return r
 
 
+PUBLISHED_OPTIONS = ("--published-tries", "--arm-o", "--qps-windows", "--new-arm")
+
+
+def published_args(args):
+    """published's four positional arguments and its options, each given at
+    most once with a value; None on bad usage, including --arm-o without
+    --published-tries and --new-arm without --qps-windows, each of which
+    would otherwise be read by nothing."""
+    pos, opts = [], {}
+    i = 0
+    while i < len(args):
+        if args[i].startswith("--"):
+            if args[i] not in PUBLISHED_OPTIONS or args[i] in opts or i + 1 >= len(args):
+                return None
+            opts[args[i]] = args[i + 1]
+            i += 2
+        else:
+            pos.append(args[i])
+            i += 1
+    if len(pos) != 4:
+        return None
+    if "--arm-o" in opts and "--published-tries" not in opts:
+        return None
+    if "--new-arm" in opts and "--qps-windows" not in opts:
+        return None
+    return pos, opts
+
+
+def _results(path):
+    """A results file in ClickBench's format, or a validated kit
+    results.json."""
+    try:
+        report = json.load(open(path))
+    except (OSError, ValueError) as e:
+        raise Refusal("%s: not readable JSON: %s" % (path, e))
+    if not isinstance(report, dict) or "result" not in report:
+        report = validate(path)
+    return report
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
@@ -2510,17 +2752,25 @@ def main(argv):
             rows = validate(args[1])["bands"]
             print_table(rows, args[0])
             return 1 if any(r["verdict"] == "miss" for r in rows) else 0
-        elif cmd == "published" and len(args) == 4:
-            label, bands, machine, path = args
-            try:
-                report = json.load(open(path))
-            except (OSError, ValueError) as e:
-                raise Refusal("%s: not readable JSON: %s" % (path, e))
-            if not isinstance(report, dict) or "result" not in report:
-                report = validate(path)
-            rows = published_bands(bands, machine, report, path)
+        elif cmd == "published" and published_args(args) is not None:
+            (label, bands, machine, path), opts = published_args(args)
+            tries = arm_o = windows = None
+            if "--published-tries" in opts:
+                tries = (opts["--published-tries"], _results(opts["--published-tries"]))
+            if "--arm-o" in opts:
+                arm_o = (opts["--arm-o"], _results(opts["--arm-o"]))
+            if "--qps-windows" in opts:
+                windows = (opts["--qps-windows"], opts.get("--new-arm", QPS_NEW_ARM))
+            rows = published_bands(bands, machine, _results(path), path, tries, arm_o, windows)
             print_table(rows, label)
-            return 1 if any(r["verdict"] == "miss" for r in rows) else 0
+            if any(r["verdict"] == "miss" for r in rows):
+                return 1
+            unjudged = [r["statement"] for r in rows if r["verdict"] == "unjudged"]
+            if unjudged:
+                print("kit: run incomplete: %s unjudged (unstable published reference); "
+                      "give --arm-o to judge them" % ", ".join(unjudged), file=sys.stderr)
+                return EXIT_INCOMPLETE
+            return 0
         elif cmd == "relative" and len(args) in (3, 4):
             a, b = validate(args[1]), validate(args[2])
             run_toml = args[3] if len(args) == 4 else None
