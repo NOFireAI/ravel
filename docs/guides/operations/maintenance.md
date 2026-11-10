@@ -527,8 +527,10 @@ exits zero.
   The line has the reason, the claim's `work_id` (the last segment of its key,
   `sys/maintain/claims/compaction/<work_id>`), the holder's process id
   (`unknown` when there is no readable claim to name one), the claim's expiry
-  as `claim_expiry_unix_ms` and the earliest useful retry point as
-  `retry_after_unix_ms`. The bucket is counted in `claim_skipped`.
+  as `claim_expiry_unix_ms`, the earliest useful retry point as
+  `retry_after_unix_ms`, and the next time a running maintenance process looks
+  at the bucket as `recheck_after_unix_ms`. The bucket is counted in
+  `claim_skipped`.
 - `outcome=ClaimCancelled`: the bucket lost its claim mid-merge, because
   another process took the claim over or the claim object is gone. The run
   stops without publishing and prints the checkpoint that it stopped at. The
@@ -538,7 +540,12 @@ exits zero.
 To compact a skipped bucket yourself, rerun at `retry_after_unix_ms`, not at
 `claim_expiry_unix_ms`. The retry point tracks the printed expiry only for
 `held_by_another`. If the holder finished its merge by then, the rerun reports
-the bucket as already compacted. The four reasons are:
+the bucket as already compacted. For `unreadable_claim` the two later instants
+can differ: `recheck_after_unix_ms` is at most one claim lease plus the jitter
+past the observation, and `retry_after_unix_ms` is the 24 h steal threshold.
+For every other reason they are equal. A one-off rerun by hand should use
+`retry_after_unix_ms`, since a rerun at `recheck_after_unix_ms` against a
+still-present unreadable claim skips the bucket again. The four reasons are:
 
 - `held_by_another`: a live claim, held by the process id printed. The retry
   point is one millisecond past the printed expiry.
