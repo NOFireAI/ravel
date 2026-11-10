@@ -1115,6 +1115,27 @@ format file's `machine` is not `MACHINE`, or when a kit `results.json` did
 not select `published`. `fetch.sh` judges only a run that selected
 `published`, and exits 1 on a published miss on either arm.
 
+ADR-0954's M8 gate judges a run against v0.28.0 on the same box, with three
+options to `kit.py published`; without them the command behaves as above.
+`--published-tries FILE` names the published results file itself
+(ClickBench's format, for `MACHINE`, whose hot and cold must equal the band
+table's rows). A statement whose published tries 2 and 3 differ by more
+than `statement_max_ratio` has no published hot reference: its hot is judged
+against arm O's hot by the same factor, arm O being `--arm-o FILE`, the
+published v0.28.0 binary through the bot's 43 x 3 cycle on the same box and
+data, in either results format. Statement 24 on c6a.xlarge (tries 10.474,
+9.644, 3.727 s) is that case. Without `--arm-o` such a statement is
+`UNJUDGED` and the run incomplete: exit 4 when nothing missed, never 0.
+`--qps-windows LOG` replaces the published QPS gate with the same-box
+windows, one line each, `window=N arm=A qps=Q err_ratio=R` and any further
+`key=value` fields. Arm `old` is v0.28.0 and `--new-arm NAME` (default
+`new`; `qps-arms.log` calls it `stock`) the arm judged: mean new QPS over
+mean old QPS must be at least 0.95 and the mean new error ratio no higher
+than the mean old one, both compared exactly. Mean new QPS against 0.90
+times the published QPS is printed as `REPORTED` and not gated. A log with
+fewer than two windows of either arm, a missing or non-numeric figure, or
+no window of a named arm is refused with exit 2.
+
 The issue comment that pre-registers a run (ADR-2867 change 6) carries one
 required line naming the published baseline the run is judged against:
 `published baseline: rlog.toml@<ravel sha>`, the band file at the Ravel

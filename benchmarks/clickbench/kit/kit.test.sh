@@ -4290,11 +4290,12 @@ fi
 PUB_FIX="$HERE/testdata/published/v0.31.1"
 PUB_BANDS="$REPO_ROOT/benchmarks/clickbench/bands/rlog.toml"
 
-# published NAME MACHINE FILE: kit.py's published judgment of FILE against
-# MACHINE's [published] rows; sets $code and writes $TMP/pub-NAME.out/.err.
+# published NAME MACHINE FILE [OPTION...]: kit.py's published judgment of FILE
+# against MACHINE's [published] rows; sets $code and writes
+# $TMP/pub-NAME.out/.err.
 published() {
   code=0
-  python3 "$KIT_SRC/lib/kit.py" published v0.31.1 "$PUB_BANDS" "$2" "$3" \
+  python3 "$KIT_SRC/lib/kit.py" published v0.31.1 "$PUB_BANDS" "$2" "$3" "${@:4}" \
     >"$TMP/pub-$1.out" 2>"$TMP/pub-$1.err" || code=$?
 }
 
@@ -4559,6 +4560,166 @@ if [ "$code" = 2 ] && [ "$ccode" = 0 ] \
   pass "a run.toml selecting published without the concurrent phase is refused"
 else
   fail "run.toml published without concurrent" "check-run $code, with concurrent $ccode: $(head -c 300 "$TMP/run-pub-noconc.err") $(head -c 300 "$TMP/run-pub-conc.err")"
+fi
+
+# --- same box: arm O and concurrent windows (ADR-0954 M8) -------------------
+
+SB_FIX="$HERE/testdata/same-box"
+PUB_TRIES="$HERE/testdata/published/v0.28.0"
+
+# sb_note NAME VERDICT PREFIX: the notes of NAME's VERDICT rows that start
+# with PREFIX, one per line.
+sb_note() {
+  sed -n "s/^$2  .*  \($3.*\)\$/\1/p" "$TMP/pub-$1.out"
+}
+
+# unstable_reference_judged_against_arm_o. FLIP: statement 24's hot judged
+# against the published 3.727 s although its published tries 2 and 3 (9.644,
+# 3.727) differ by more than 1.10x (a MISS at 1.4492, exit 1), or arm O's hot
+# read as its try 1 or a mean rather than the best of tries 2 and 3 (9.600 s).
+# Its cold is still judged against the published cold.
+published sb-armo c6a.xlarge "$PUB_FIX/c6a.xlarge.json" \
+  --published-tries "$PUB_TRIES/c6a.xlarge.json" --arm-o "$SB_FIX/arm-o-c6a.xlarge.json"
+if [ "$code" = 0 ] \
+  && [ "$(sb_note sb-armo PASS 'statement 24 hot')" = 'statement 24 hot: measured 5.401 s, arm O 9.600 s, ratio 0.5626; published tries 2 and 3 9.644 s and 3.727 s differ by more than 1.1x' ] \
+  && [ "$(grep -c '  q24 hot_s <= 1.1 x published ' "$TMP/pub-sb-armo.out")" = 0 ] \
+  && [ "$(sb_note sb-armo PASS 'statement 24 cold')" = 'statement 24 cold: measured 7.905 s, published 10.474 s, ratio 0.7547' ]; then
+  pass "an unstable published hot is judged against arm O"
+else
+  fail "unstable reference arm O" "exit $code: $(grep '  q24 ' "$TMP/pub-sb-armo.out") $(head -c 300 "$TMP/pub-sb-armo.err")"
+fi
+
+# unstable_reference_without_arm_o_is_incomplete. FLIP: an unstable statement
+# with no arm O skipped or passed (exit 0), or judged against the published
+# hot anyway (exit 1): it is UNJUDGED and the run exits 4, incomplete.
+published sb-noarmo c6a.xlarge "$PUB_FIX/c6a.xlarge.json" \
+  --published-tries "$PUB_TRIES/c6a.xlarge.json"
+if [ "$code" = 4 ] \
+  && [ "$(sb_note sb-noarmo UNJUDGED 'statement 24 hot')" = 'statement 24 hot: unstable published reference, published tries 2 and 3 9.644 s and 3.727 s differ by more than 1.1x; no arm O' ] \
+  && ! grep -q '^MISS' "$TMP/pub-sb-noarmo.out" \
+  && ! grep -q '^PASS .*  q24 hot_s ' "$TMP/pub-sb-noarmo.out" \
+  && grep -qF 'run incomplete: q17, q21, q24, q25, q27, q28, q31, q38, q41, q42, q43 unjudged' "$TMP/pub-sb-noarmo.err"; then
+  pass "an unstable published hot without arm O is unjudged and the run incomplete"
+else
+  fail "unstable reference without arm O" "exit $code: $(grep '  q24 ' "$TMP/pub-sb-noarmo.out") $(head -c 300 "$TMP/pub-sb-noarmo.err")"
+fi
+
+# stable_statement_still_judged_against_published. FLIP: every statement
+# judged against arm O once --arm-o is given: statement 9's published tries
+# (3.52, 3.524) agree, so its 4.0 s hot misses 1.10 x the published 3.52 s
+# even though arm O's 5.0 s would pass it.
+pub_edit "$PUB_FIX/c6a.xlarge.json" sb-stable 'r["result"][8] = [11.0, 4.0, 4.1]'
+published sb-stable c6a.xlarge "$TMP/pub-sb-stable.json" \
+  --published-tries "$PUB_TRIES/c6a.xlarge.json" --arm-o "$SB_FIX/arm-o-c6a.xlarge.json"
+if [ "$code" = 1 ] \
+  && [ "$(sb_note sb-stable MISS 'statement')" = 'statement 9 hot: measured 4.000 s, published 3.520 s, ratio 1.1364' ] \
+  && [ "$(grep -c '  q09 hot_s <= 1.1 x arm O ' "$TMP/pub-sb-stable.out")" = 0 ]; then
+  pass "a stable statement is judged against published even with a slower arm O"
+else
+  fail "stable statement published" "exit $code: $(grep '  q09 ' "$TMP/pub-sb-stable.out") $(head -c 300 "$TMP/pub-sb-stable.err")"
+fi
+
+# same_box_qps_passes_at_095. FLIP: the same-box bar made exclusive, or the
+# published QPS gate still applied beside it (c6a.2xlarge's 0.362 misses 0.90
+# x 0.478): mean new 0.475 over mean old 0.500 is exactly 0.95 and passes,
+# and the published comparison is REPORTED, not gated.
+published sb-095 c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-095.log"
+if [ "$code" = 0 ] \
+  && [ "$(sb_note sb-095 PASS 'same-box qps')" = 'same-box qps: new (2 windows) over old v0.28.0 (2 windows), mean 0.4750 over 0.5000, ratio 0.9500' ] \
+  && [ "$(sb_note sb-095 PASS 'same-box error ratio')" = 'same-box error ratio: new (2 windows) over old v0.28.0 (2 windows), mean 0.0200 over 0.0200, ratio 1.0000' ] \
+  && [ "$(sb_note sb-095 REPORTED 'concurrent qps')" = 'concurrent qps: mean new 0.475, published 0.478, ratio 0.9937; not gated' ] \
+  && [ "$(grep -c 'concurrent qps: measured' "$TMP/pub-sb-095.out")" = 0 ]; then
+  pass "same-box QPS at exactly 0.95 passes and replaces the published QPS gate"
+else
+  fail "same-box qps 0.95" "exit $code: $(grep -i 'concurrent' "$TMP/pub-sb-095.out") $(head -c 300 "$TMP/pub-sb-095.err")"
+fi
+
+# same_box_qps_fails_at_094. FLIP: the same-box bar taken as the published
+# factor 0.90 rather than 0.95: mean new 0.470 over mean old 0.500 is 0.94.
+published sb-094 c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-094.log"
+if [ "$code" = 1 ] \
+  && [ "$(sb_note sb-094 MISS 'same-box')" = 'same-box qps: new (2 windows) over old v0.28.0 (2 windows), mean 0.4700 over 0.5000, ratio 0.9400' ]; then
+  pass "same-box QPS at 0.94 misses"
+else
+  fail "same-box qps 0.94" "exit $code: $(grep 'same-box' "$TMP/pub-sb-094.out") $(head -c 300 "$TMP/pub-sb-094.err")"
+fi
+
+# higher_error_ratio_fails. FLIP: the error ratio printed and not gated:
+# QPS is level (ratio 1.0000) and mean new error ratio 0.0410 is above old's
+# 0.0400, so the run misses on that row alone.
+published sb-err c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-higher-err.log"
+if [ "$code" = 1 ] \
+  && [ "$(sb_note sb-err PASS 'same-box')" = 'same-box qps: new (2 windows) over old v0.28.0 (2 windows), mean 0.5000 over 0.5000, ratio 1.0000' ] \
+  && [ "$(sb_note sb-err MISS '')" = 'same-box error ratio: new (2 windows) over old v0.28.0 (2 windows), mean 0.0410 over 0.0400, ratio 1.0250' ]; then
+  pass "a higher same-box error ratio misses"
+else
+  fail "same-box error ratio" "exit $code: $(grep 'same-box' "$TMP/pub-sb-err.out") $(head -c 300 "$TMP/pub-sb-err.err")"
+fi
+
+# one_window_per_arm_is_refused. FLIP: the minimum window count dropped, so
+# one window per arm (new 0.600 over old 0.500, ratio 1.2) is judged a pass
+# instead of refused with exit 2.
+published sb-one c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-one-window.log"
+if [ "$code" = 2 ] && [ ! -s "$TMP/pub-sb-one.out" ] \
+  && grep -qF 'qps-ab-one-window.log: arm old has 1 window(s), and the gate needs at least 2' "$TMP/pub-sb-one.err"; then
+  pass "one window per arm is refused"
+else
+  fail "same-box one window" "exit $code: $(head -c 300 "$TMP/pub-sb-one.out") $(head -c 300 "$TMP/pub-sb-one.err")"
+fi
+
+# malformed_windows_are_refused. FLIP: a non-numeric or missing figure read
+# as zero or skipped, or an arm name the log never holds judged as empty;
+# each exits 2 naming the problem.
+mw_ok=1
+mw_why=""
+for c in nonnum missing arm; do
+  case "$c" in
+    nonnum) printf 'window=1 arm=old qps=0.5 err_ratio=0.02\nwindow=2 arm=new qps=fast err_ratio=0.02\nwindow=3 arm=new qps=0.5 err_ratio=0.02\nwindow=4 arm=old qps=0.5 err_ratio=0.02\n' ;;
+    missing) printf 'window=1 arm=old qps=0.5 err_ratio=0.02\nwindow=2 arm=new qps=0.5\nwindow=3 arm=new qps=0.5 err_ratio=0.02\nwindow=4 arm=old qps=0.5 err_ratio=0.02\n' ;;
+    arm) cat "$SB_FIX/qps-ab-095.log" ;;
+  esac >"$TMP/sb-mw-$c.log"
+  case "$c" in
+    nonnum) want='sb-mw-nonnum.log:2: qps=fast is not a number'; extra=() ;;
+    missing) want='sb-mw-missing.log:2: no err_ratio figure'; extra=() ;;
+    arm) want='sb-mw-arm.log: no window of arm stock (arms: new, old)'; extra=(--new-arm stock) ;;
+  esac
+  published "sb-mw-$c" c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$TMP/sb-mw-$c.log" ${extra[@]+"${extra[@]}"}
+  if [ "$code" != 2 ] || [ -s "$TMP/pub-sb-mw-$c.out" ] || ! grep -qF "$want" "$TMP/pub-sb-mw-$c.err"; then
+    mw_ok=0
+    mw_why="$mw_why $c: exit $code $(head -c 200 "$TMP/pub-sb-mw-$c.err");"
+  fi
+done
+if [ "$mw_ok" = 1 ]; then
+  pass "a windows log with a non-numeric or missing figure or an unseen arm is refused"
+else
+  fail "same-box malformed windows" "$mw_why"
+fi
+
+# m7_2xlarge_figures_fail. FLIP: the same-box ratio taken old over new (1.3026,
+# a pass): M7's c6a.2xlarge figures, new 0.380 and 0.380 over old 0.488 and
+# 0.502, are 0.7677 and miss.
+published sb-m7 c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" --qps-windows "$SB_FIX/qps-ab-m7-2xlarge.log"
+if [ "$code" = 1 ] \
+  && [ "$(sb_note sb-m7 MISS 'same-box')" = 'same-box qps: new (2 windows) over old v0.28.0 (2 windows), mean 0.3800 over 0.4950, ratio 0.7677' ] \
+  && [ -n "$(sb_note sb-m7 PASS 'same-box error ratio')" ]; then
+  pass "M7's c6a.2xlarge same-box figures miss at 0.7677"
+else
+  fail "same-box m7" "exit $code: $(grep 'same-box' "$TMP/pub-sb-m7.out") $(head -c 300 "$TMP/pub-sb-m7.err")"
+fi
+
+# m8a_off_arm_passes_as_new. FLIP: --new-arm ignored, or the log's other arm
+# (stock) pooled into the judged one: arm off, 0.462 and 0.453 over old 0.450
+# and 0.440, passes QPS at 1.0281, and its error ratio 0.1515 over 0.1395
+# misses, so the run exits 1 on that row alone.
+published sb-m8a c6a.2xlarge "$PUB_FIX/c6a.2xlarge.json" \
+  --qps-windows "$SB_FIX/qps-arms-m8a.log" --new-arm off
+if [ "$code" = 1 ] \
+  && [ "$(sb_note sb-m8a PASS 'same-box')" = 'same-box qps: off (2 windows) over old v0.28.0 (2 windows), mean 0.4575 over 0.4450, ratio 1.0281' ] \
+  && [ "$(sb_note sb-m8a MISS '')" = 'same-box error ratio: off (2 windows) over old v0.28.0 (2 windows), mean 0.1515 over 0.1395, ratio 1.0860' ] \
+  && [ "$(sb_note sb-m8a REPORTED 'concurrent qps')" = 'concurrent qps: mean off 0.458, published 0.478, ratio 0.9571; not gated' ]; then
+  pass "arm off judged as the new arm passes QPS and misses the error ratio"
+else
+  fail "same-box m8a off" "exit $code: $(grep -i 'same-box\|REPORTED' "$TMP/pub-sb-m8a.out") $(head -c 300 "$TMP/pub-sb-m8a.err")"
 fi
 
 # --- syntax -----------------------------------------------------------------
