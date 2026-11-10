@@ -36,6 +36,9 @@ on:
   pull_request:
     paths:
       - ".github/workflows/ci.yml"
+      - ".github/workflows/ci-budget-nightly.yml"
+      # The guard evals its timeout-minutes parser out of this script.
+      - "scripts/ci-sweep-cancelled.sh"
       - "scripts/guards/check-ci-job-budgets.sh"
       - "scripts/guards/check-ci-job-budgets.test.sh"
 
