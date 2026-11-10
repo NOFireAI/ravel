@@ -1787,6 +1787,44 @@ the largest total the passes held in
 `fold_human_report_prints_every_fold_report_field`, which checks every
 serialized field against the text report).
 
+Seven more fields are the figures the ADR-3939 investigation harness
+reads, none of them a `/metrics` counter; `ravel-cli catalog fold`
+prints each in text and `--json` (test
+`fold_report_renders_the_adr_3939_figures_in_text_and_json`):
+
+- `snapshot_part_puts`: snapshot part object PUTs, one per part an attempt
+  re-encoded, summed over every attempt and also counted in
+  `put_requests`; a part carried by reference issues none (2, 1 and 0 for
+  a sealing fold, an advance and a no-op refold in
+  `fold_report_counts_snapshot_part_puts`).
+- `sealed_day_leaf_puts` and `sealed_day_previous_leaf_gets`: the leaf
+  PUTs and previous-leaf GETs of re-encoded parts that are not the tail,
+  lie within one UTC day, and whose day the previous HEAD already held as
+  a sealed part (one that was not its last), so the fold that first seals
+  a day counts nothing for it. Acceptance A3 expects both to be 0 once a
+  day is sealed; a late commit or rewrite into a sealed day makes them
+  nonzero (2 and 3 for the dirty-day re-encode in
+  `fold_report_counts_a_sealed_days_leaf_puts_and_gets`).
+- `key_index_unchanged_section_gets`: the GETs of KEY_IDX section reads
+  for entries a previous part's leaves already held for every declared
+  field, also counted in `key_index_ranged_gets`; nonzero only when a
+  carry was lost (8 when a slice GET fails mid-build in
+  `fold_report_counts_section_gets_for_entries_a_previous_leaf_held`).
+- `switch_off_partition_changed`: with the switch on, the count of UTC
+  days whose parts differ from the switch-off rule applied to that day's
+  entries alone, so a nonzero value means the day seal changed more than
+  the midnight cuts; 0 with the switch off (tests
+  `day_seal_departures_counts_days_not_partitioned_by_the_switch_off_rule`
+  and `a_day_sealed_fold_reports_no_switch_off_partition_change`).
+- `head_digest`: lowercase hex blake3 of the HEAD in effect after the
+  call, the one published or, on a no-op, the one read; empty when there
+  is no HEAD (`fold_report_head_digest_is_the_blake3_of_the_head_in_effect`).
+  A HEAD records its folder id and creation time, so two folds that both
+  publish never share a digest; equal digests mean the second was a no-op.
+- `retired_hours`: the sorted union of every HEAD part's `retired_hours`
+  (under "Retired hours"), read from the HEAD on a no-op
+  (`fold_report_retired_hours_is_the_heads_union`).
+
 When a compaction or erasure rewrite record lands, the fold re-encodes the
 part and rebuilds its leaves from the new entry set. An erasure rewrite
 therefore removes the subject's `key8` from the next leaf; the stale leaf is
