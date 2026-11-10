@@ -724,6 +724,13 @@ with no `maintain` process deletes no durable data. Its one delete is the
 admission reconcile's reap of dead ingest processes' admission snapshots,
 which are mutable per-process state, not published data.
 
+A retention tombstone in a sealed part that carries key-index leaves is
+excluded logically by listing its hour in the part's `retired_hours`
+(docs/catalog-and-mvcc.md "Retired hours"): no snapshot resolved from the
+HEAD of the fold that observed it yields a segment of that hour, on either
+key-index tier. That HEAD still names the hour's objects until the part
+re-encodes or leaves HEAD, so their physical removal waits for it.
+
 The guarantee this document is normative for: **no object a referenced
 snapshot still names is ever deleted by retention or by the superseded-input
 sweep.** Three gates hold it together. The protection-horizon interlock (a

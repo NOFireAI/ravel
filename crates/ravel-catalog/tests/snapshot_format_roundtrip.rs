@@ -3,8 +3,8 @@
 
 #![allow(clippy::expect_used)]
 
-use prost::Message;
 use proptest::prelude::*;
+use prost::Message;
 use ravel_catalog::{
     HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2, NamePostings, PartLimits, PostingsLimits,
     SnapshotFormatError, decode_head, decode_part, decode_postings, encode_head, encode_part,
@@ -198,28 +198,30 @@ fn arb_head() -> impl Strategy<Value = SnapshotHead> {
             let mut cursor = 0u32;
             let parts: Vec<SnapshotPartRef> = raw_parts
                 .into_iter()
-                .map(|(gap, span, key, blake3, size, entry_count, retired_mask)| {
-                    let min_hour = cursor + gap;
-                    let watermark_hour = min_hour + span;
-                    cursor = watermark_hour + 1;
-                    // Bit `i` of the mask retires hour `min_hour + i`, so the
-                    // retired hours are ascending and inside the part's range.
-                    let retired_hours = (0..=span)
-                        .filter(|i| retired_mask & (1 << i) != 0)
-                        .map(|i| min_hour + i)
-                        .collect();
-                    SnapshotPartRef {
-                        key,
-                        blake3,
-                        size,
-                        entry_count,
-                        watermark_hour,
-                        min_hour,
-                        column_stats: None,
-                        key_index: Vec::new(),
-                        retired_hours,
-                    }
-                })
+                .map(
+                    |(gap, span, key, blake3, size, entry_count, retired_mask)| {
+                        let min_hour = cursor + gap;
+                        let watermark_hour = min_hour + span;
+                        cursor = watermark_hour + 1;
+                        // Bit `i` of the mask retires hour `min_hour + i`, so the
+                        // retired hours are ascending and inside the part's range.
+                        let retired_hours = (0..=span)
+                            .filter(|i| retired_mask & (1 << i) != 0)
+                            .map(|i| min_hour + i)
+                            .collect();
+                        SnapshotPartRef {
+                            key,
+                            blake3,
+                            size,
+                            entry_count,
+                            watermark_hour,
+                            min_hour,
+                            column_stats: None,
+                            key_index: Vec::new(),
+                            retired_hours,
+                        }
+                    },
+                )
                 .collect();
             arb_postings_ref(&parts).prop_map(move |postings| {
                 let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
