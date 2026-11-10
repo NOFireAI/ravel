@@ -1036,13 +1036,14 @@ the KEY_IDX section inside every data object (docs/log-segment-format.md
 "KEY_IDX", docs/span-segment-format.md "KEY_IDX"). Field 8 is absent (proto3
 default) for a part with no leaves; absence means uncovered and is never an
 error, and the field does not bump the HEAD `format_version`, by the field
-6 and field 7 precedent: an older reader ignores the field and scans. The ref carries
-`key` (the object key), `blake3` (32, of the leaf's full bytes), `size`,
-`field`, `key_type`, `key8_lo` and `key8_hi` (the inclusive key slice this
-leaf covers), `prefix_len` (the bytes through the directory crc, so the
-first GET needs no probe), `bucket_bits`, `entry_count`, `uncovered_count`
-(the length of the header's `uncovered_entry_ordinals`, identical on every
-slice of the pair) and `part_blake3` (32, the one covered part).
+6 and field 7 precedent: an older reader ignores the field and scans. The
+ref carries `key` (the object key), `blake3` (32, of the leaf's full
+bytes), `size`, `field`, `key_type`, `key8_lo` and `key8_hi` (the
+inclusive key slice this leaf covers), `prefix_len` (the bytes through the
+directory crc, so the first GET needs no probe), `bucket_bits`,
+`entry_count`, `uncovered_count` (the length of the header's
+`uncovered_entry_ordinals`, identical on every slice of the pair) and
+`part_blake3` (32, the one covered part).
 
 **Object layout (RKI1 envelope).**
 
