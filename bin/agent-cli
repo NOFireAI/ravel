@@ -695,6 +695,36 @@ def result_diff(task):
             "files": files.strip().splitlines()}
 
 
+BELOW_FLOOR = re.compile(r"^EXECUTOR BELOW FLOOR:", re.M)
+CLAIMS_AUDIT = re.compile(r"^(?:#{1,6}[ \t]+)?CLAIMS AUDIT", re.M | re.I)
+
+
+def task_class(status, report):
+    """done, failed or below-floor for a terminal task, else its status.
+
+    An executor stopped by the spec's disk-headroom check ends its task with
+    the fixed EXECUTOR BELOW FLOOR report, whatever status the control plane
+    gives it, so the report decides first."""
+    if status not in TERMINAL_TASK:
+        return status
+    if BELOW_FLOOR.search(report or ""):
+        return "below-floor"
+    return "done" if status == "done" else "failed"
+
+
+def claims_audit_missing(cls, report, spec=None):
+    """A done task whose report has no CLAIMS AUDIT section.
+
+    The spec counts only when it is given: GET /v1/tasks/ID is not known to
+    return the spec text, so without one every done report is held to the
+    CLAIMS AUDIT paragraph of the fleet-task-spec template."""
+    if cls != "done":
+        return False
+    if spec is not None and not re.search(r"claims audit", spec, re.I):
+        return False
+    return not CLAIMS_AUDIT.search(report or "")
+
+
 def cmd_task(a):
     deadline = time.monotonic() + a.wait
     while True:
@@ -712,11 +742,15 @@ def cmd_task(a):
             results = {}
     commit = (results or {}).get("commit") if isinstance(results, dict) else None
     report = t.get("result") or ""
+    cls = task_class(status, report)
+    spec = t.get("spec") if isinstance(t.get("spec"), str) else None
+    no_audit = claims_audit_missing(cls, report, spec)
     o = Out(a.json)
-    o.data = {"task": a.task, "status": status, "result_ref": t.get("result_ref") or "",
+    o.data = {"task": a.task, "status": status, "class": cls, "claims_audit_missing": no_audit,
+              "result_ref": t.get("result_ref") or "",
               "commit": commit, "report": report if a.full else report[: a.chars]}
-    o.text(f"task {a.task[:8]} {status} ref={'yes' if t.get('result_ref') else 'no'}"
-           f"{' commit=' + commit[:9] if commit else ''}")
+    o.text(f"task {a.task[:8]} {status} class={cls} ref={'yes' if t.get('result_ref') else 'no'}"
+           f"{' commit=' + commit[:9] if commit else ''}{' claims-audit-missing' if no_audit else ''}")
     if a.diff and t.get("result_ref"):
         d = result_diff(a.task)
         o.data["diff"] = d
@@ -729,7 +763,7 @@ def cmd_task(a):
     o.emit()
     if status not in TERMINAL_TASK:
         return 75 if a.wait else 0
-    return 0 if status == "done" else 1
+    return 0 if cls == "done" else 1
 
 
 # The dispatch service refuses a spec carrying a command substitution, which
@@ -890,8 +924,43 @@ def fresh_main():
     return sha.strip()
 
 
+GATE_TIERS = ("executor", "merge", "script-only")
+SPEC_HEAD = {"gate_tier": lambda v: v in GATE_TIERS,
+             "disk_floor_gb": lambda v: re.fullmatch(r"[1-9][0-9]*", v) is not None}
+
+
+def spec_head_values(spec):
+    """gate_tier and disk_floor_gb from their own lines in the spec.
+
+    Each line is the key, a colon and the value as its first word; anything
+    after the value is commentary. Raises CliError (2) naming each key that
+    is missing, malformed or given two different values."""
+    found = {k: set() for k in SPEC_HEAD}
+    for line in spec.splitlines():
+        m = re.match(r"\s*(gate_tier|disk_floor_gb):[ \t]*(\S*)", line)
+        if m:
+            found[m.group(1)].add(m.group(2))
+    problems = []
+    for key, ok in SPEC_HEAD.items():
+        values = found[key]
+        if not values:
+            problems.append(f"no {key} line")
+        elif any(not ok(v) for v in values):
+            problems.append(f"{key} {', '.join(sorted(v or '(empty)' for v in values))} is not "
+                            + ("one of " + "|".join(GATE_TIERS) if key == "gate_tier"
+                               else "a positive integer"))
+        elif len(values) > 1:
+            problems.append(f"{key} given twice: {', '.join(sorted(values))}")
+    if problems:
+        raise CliError("spec head refused, nothing dispatched: " + "; ".join(problems)
+                       + " (each on its own line: gate_tier: <" + "|".join(GATE_TIERS)
+                       + ">, disk_floor_gb: <N>)", 2)
+    return found["gate_tier"].pop(), int(found["disk_floor_gb"].pop())
+
+
 def cmd_dispatch(a):
     spec = Path(a.spec).read_text()
+    tier, floor = spec_head_values(spec)
     blocking = [h for h in lint_spec_text(spec) if h["blocking"]]
     if blocking and not a.allow_lint:
         raise CliError(f"spec has {len(blocking)} character(s) the dispatch service refuses (first: line "
@@ -960,10 +1029,15 @@ def cmd_dispatch(a):
         except (OSError, CliError) as e:
             watch_error = str(e)
     rec_rc, _, rec_err = run(["scripts/fleet-dispatch-intent.sh", "record", str(a.epic), nonce, task])
+    # The orchestrator writes the body ledger line as "- #T task=U <status>",
+    # so the tier and floor ride in the status value to reach that line.
     orch_rc, _, orch_err = run(["scripts/epic-orchestrator.sh", "record", str(a.epic), "task-dispatched",
-                                f"ticket={a.ticket}", f"task={task}", f"ref={ref_sha}"])
+                                f"ticket={a.ticket}", f"task={task}", f"ref={ref_sha}",
+                                f"status=dispatched tier={tier} floor={floor}",
+                                f"tier={tier}", f"floor={floor}"])
     o = Out(a.json)
-    o.data = {"task": task, "ref": ref_sha, "watch_file": watch_file, "nonce": nonce,
+    o.data = {"task": task, "ref": ref_sha, "tier": tier, "floor": floor,
+              "watch_file": watch_file, "nonce": nonce,
               "record_rc": rec_rc, "orchestrator_rc": orch_rc, "watch_error": watch_error}
     o.text(f"task={task} ref={ref_sha[:9]} watch={watch_file or '-'}")
     if rec_rc or orch_rc:
@@ -1453,7 +1527,9 @@ def build_parser():
     sp = add("task", cmd_task, "fleet task status and its full final report from the control plane",
              "Reads GET /v1/tasks/ID (no transcript needed). --diff fetches the result ref and lists "
              "its commits and shortstat against origin/main. --wait S polls until terminal (exit 75 "
-             "if it is still running). Exit 1 for a terminal state other than done.")
+             "if it is still running). class is done, failed or below-floor (a report line starting "
+             "EXECUTOR BELOW FLOOR:); a done report with no CLAIMS AUDIT section is flagged "
+             "claims-audit-missing. Exit 1 for a terminal class other than done.")
     sp.add_argument("task")
     sp.add_argument("--full", action="store_true", help="print the whole report")
     sp.add_argument("--chars", type=int, default=1500, help="report characters to print without --full")
@@ -1462,9 +1538,10 @@ def build_parser():
     sp.add_argument("--interval", type=int, default=60)
 
     sp = add("dispatch", cmd_dispatch, "fleet dispatch with the intent, record and ledger steps in one call",
-             "Lints the spec, runs fleet-dispatch-intent.sh intent against a fresh origin/main, calls "
+             "Refuses (exit 2) a spec without its own gate_tier: <executor|merge|script-only> and "
+             "disk_floor_gb: <N> lines, then lints the spec, runs fleet-dispatch-intent.sh intent against a fresh origin/main, calls "
              "the fleet_dispatch MCP tool, then records the task in the intent comments and the epic "
-             "body. The watch URL (it carries a token) is written to a 0600 file whose path is printed; "
+             "body, whose ledger line carries tier=<t> floor=<n>. The watch URL (it carries a token) is written to a 0600 file whose path is printed; "
              "use it with scripts/fleet-watch-loop.sh \"$(cat FILE)\".")
     sp.add_argument("--epic", type=int, required=True)
     sp.add_argument("--ticket", type=int, required=True)
