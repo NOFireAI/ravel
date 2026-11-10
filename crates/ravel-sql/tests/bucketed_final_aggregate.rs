@@ -52,9 +52,9 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
     BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX, BucketSpillPlanShape, BucketedFinalAggregateExec,
-    BucketedFinalAggregation, DeclaredColumn, NoTuning, DeclaredType, RavelTableProvider, SessionTable, SpanSegmentFetcher,
-    SpillDecision, SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns, TenantDelegatingPool,
-    TenantMemoryAccountant, build_session,
+    BucketedFinalAggregation, DeclaredColumn, DeclaredType, NoTuning, RavelTableProvider,
+    SessionTable, SpanSegmentFetcher, SpillDecision, SqlConfig, SqlExecutor, SqlRequest,
+    StaticDeclaredColumns, TenantDelegatingPool, TenantMemoryAccountant, build_session,
 };
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::AttrValue;
@@ -2360,7 +2360,10 @@ async fn bucket_spill_drain_refusal_spills_later_buckets() {
     });
     eprintln!("drain refusal at cap {cap}: {run:?}");
     assert!(run.refusals > 0, "never refused: {run:?}");
-    assert_eq!(run.rows_read, run.spilled_rows, "rows decoded against written");
+    assert_eq!(
+        run.rows_read, run.spilled_rows,
+        "rows decoded against written"
+    );
     assert_eq!(run.rows, expected, "at cap {cap}");
 }
 
@@ -2630,7 +2633,12 @@ async fn logs_scan_counts_rows_consumed_before_its_filter() {
     }
     let mut consumed = Vec::new();
     scans(&plan, &mut consumed);
-    assert_eq!(consumed, vec![ROWS as usize], "{}", displayable(plan.as_ref()).indent(false));
+    assert_eq!(
+        consumed,
+        vec![ROWS as usize],
+        "{}",
+        displayable(plan.as_ref()).indent(false)
+    );
 }
 
 /// One random key shape: a fixed-width key of `key_type`, NULL on every

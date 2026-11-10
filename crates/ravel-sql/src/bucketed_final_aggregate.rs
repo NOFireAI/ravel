@@ -1377,7 +1377,10 @@ impl BucketedStream {
                 let slice: Vec<ArrayRef> = if len == rows {
                     columns.clone()
                 } else {
-                    columns.iter().map(|column| column.slice(start, len)).collect()
+                    columns
+                        .iter()
+                        .map(|column| column.slice(start, len))
+                        .collect()
                 };
                 let routed = router.route(&slice, &mut self.reservation, self.spill.as_mut())?;
                 self.metrics.routed_rows.add(routed);
