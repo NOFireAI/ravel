@@ -4304,7 +4304,7 @@ impl Catalog {
                             0,
                             key_index_switch_off_over_leaves,
                             &head_state,
-                        ));
+                        )?);
                     }
                     (head.watermark_hour, Some(listings))
                 }
@@ -4316,7 +4316,7 @@ impl Catalog {
                         0,
                         key_index_switch_off_over_leaves,
                         &head_state,
-                    ));
+                    )?);
                 }
             };
 
@@ -4791,7 +4791,7 @@ impl Catalog {
                     refold_hours_reconciled,
                     key_index_switch_off_over_leaves,
                     &head_state,
-                ));
+                )?);
             }
             entries.sort_by(|a, b| {
                 (
@@ -7032,18 +7032,18 @@ fn no_op_report(
     refold_hours_reconciled: u64,
     key_index_switch_off_over_leaves: bool,
     head_state: &HeadState,
-) -> FoldReport {
+) -> Result<FoldReport, SnapshotFormatError> {
     // The work an attempt lost to a HEAD CAS did is real work even when the
     // fold ends in a no-op, so it reaches `/metrics` too.
     observe_fold_key_index(&counters);
     let (retired_hours, head_digest) = match head_state {
         HeadState::Valid { head, .. } => (
             parts_retired_hours(&head.parts),
-            canonical_head_digest(head).unwrap_or_default(),
+            canonical_head_digest(head)?,
         ),
         _ => (Vec::new(), String::new()),
     };
-    FoldReport {
+    Ok(FoldReport {
         watermark_hour,
         previous_watermark_hour: watermark_hour,
         no_op: true,
@@ -7101,7 +7101,7 @@ fn no_op_report(
         key_index_unchanged_section_gets: counters.key_index_unchanged_section_gets,
         head_digest,
         retired_hours,
-    }
+    })
 }
 
 /// Lowercase hex blake3 of `head` encoded with `folder_id` set to sixteen
