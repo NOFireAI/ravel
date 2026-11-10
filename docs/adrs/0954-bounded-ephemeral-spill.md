@@ -1132,7 +1132,9 @@ plan back to every eligible statement on every default deployment.
   spill sorting and registers as spill-capable, which ends the
   last-release hold. A statement that fits today could be refused, or
   spill. This remains the path to parallel spill, once the exchange spill
-  is classified and the bucketed final aggregate can spill.
+  is classified and the bucketed final aggregate can spill. The parallel
+  bucket spill amendment below (2026-11-10) takes that path for the
+  retry, for the shapes ADR-3565's bucketed rule admits.
 - **Grant spill per operator at run time.** This is exact, but DataFusion
   reads the permission from the session's runtime environment per stream.
   It needs a wrapper that hands classified operators a different task
@@ -1184,6 +1186,9 @@ it is measured on the statement it moves.
   longer builds every group in its final aggregate and so no longer reaches
   this retry on that table; see the unordered GROUP BY LIMIT amendment
   below.
+- 2026-11-10: the retry of a statement ADR-3565's bucketed rule admits
+  keeps its hash exchange and spills each routed row once; see the
+  parallel bucket spill amendment below.
 
 ### Refusal-retry diagram
 
@@ -1221,3 +1226,230 @@ shape no longer reaches the retry through its group table. Nothing in the
 refusal-retry design changes: an ordered top-k by `count` or `sum`, such as
 row 17, and an unordered limit over a `HAVING` filter still build every
 group and keep the retry.
+
+## Amendment (2026-11-10): parallel bucket spill for the refusal retry (issue #4073)
+
+<!-- amendment-applies: sections="Amendment (2026-11-07): spill only after a refusal, shared scratch, and spill on by default (issue #3899)" pointer="parallel bucket spill amendment" -->
+
+Status of this amendment: Accepted as a plan. Refs: #4073, epic #4072.
+The code is T2 (#4074); the measurement is T3 (#4075). ADR-3565's bucket
+spill amendment is the other half of this decision: this one decides what
+the retry plans, that one decides how the bucketed final aggregate spills.
+
+### Parallel bucket spill context
+
+This is the parallel bucket spill amendment. The figures are from epic
+#4072.
+
+- On c6a.2xlarge (8 vCPU, 16 GB; memory budget 13.50 GB,
+  `sql_max_query_bytes` 8.19 GB, spill ceiling 54.0 GB, 4 slots of 13.5 GB,
+  merge fan-in 2, 16 partitions) ClickBench row 33,
+  `SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM logs GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10`,
+  about 100M groups, is refused on its first attempt and answers through
+  the refusal retry in 80.8 to 82.3 s, writing 8.5 GB of spill per try.
+  v0.28.0 refused it outright.
+- The epic puts that write rate at about 240 MB/s, the gp2 volume's
+  ceiling, so the retry is bound by the disk. The retry is planned without
+  repartitioning (refusal-retry context item 1), so it is one final
+  aggregate stream whose sort spill is merged at fan-in 2, and each merge
+  pass writes the spilled bytes again. The bytes written are the lever.
+- In the concurrent test (10 workers, 600 s) v0.28.0 ran 0.488 and 0.502
+  QPS and this build 0.380 and 0.380. The two windows ran 8 and 10 spill
+  retries and wrote 51 and 58 GB to the volume that also holds the local
+  object store. On c6a.xlarge the figures are 0.245 and 0.215 against
+  0.222 and 0.180, with 3 and 5 retries writing 9.9 and 15.6 GB.
+- Rows 19, 34 and 35 fit alone but spill under concurrency, because row
+  33's first attempt holds up to 8 GB while it runs to its refusal. This
+  amendment does not change the first attempt, so it does not address
+  that part of the loss.
+- ADR-3565's `BucketedFinalAggregateExec` is exact and off by default. On
+  row 33 it lowered peak asked bytes from 9.48 GB to 5.91 GB at equal CPU
+  (ADR-3565 amendment 1). It replaces only a `FinalPartitioned` aggregate,
+  and the retry as planned today has none, so it cannot reach the retry.
+
+### Parallel bucket spill decision
+
+1. **The retry keeps the hash exchange for a shape the bucketed rule
+   admits, and only for that shape.** The retry's session is first planned
+   with the first attempt's repartition settings (`session.rs:658`,
+   `with_repartition_aggregations`, and `session.rs:698`, round-robin
+   repartition), with `BucketedFinalAggregateRule` installed whatever
+   `SqlConfig::bucketed_final_aggregation` says, and with the tuning
+   ADR-3565's bucket spill amendment derives. That plan is kept when all of
+   these hold:
+   - every `AggregateExec` in it with mode `FinalPartitioned` was replaced
+     by a `BucketedFinalAggregateExec`, which is to say
+     `BucketedFinalAggregateRule::admits` (`bucketed_final_aggregate.rs:171`)
+     accepted each one;
+   - every `RepartitionExec` in it has `preserve_order` false;
+   - the bucket spill amendment's derivation returns a tuning.
+
+   Otherwise the retry is planned as today, repartition-free
+   (`repartition_free`, `session.rs:737`), and spills through the sort
+   merge at fan-in 2. Statements outside the fixed-width set (rows 17 to
+   19, 34 and 35, among others) keep today's retry. The first attempt is
+   unchanged in every case: with the switch off its plan has no bucketed
+   exec, as before.
+
+   Exactness of the kept plan. ADR-3565 decision 2 covers the final. The
+   exchange stays exact when it spills: a batch refused memory is written
+   to a spill file as Arrow IPC and read back whole, and a non-preserve-order
+   exchange's output is an unordered multiset of its input batches
+   (`repartition/mod.rs:526-532` in datafusion-physical-plan 55.2.0).
+   Spill can change the order of batches within that multiset; nothing
+   above a non-preserve-order exchange may rely on that order, spilled or
+   not, because the in-memory channel already interleaves its inputs in
+   arbitrary order. That classifies the exchange spill the 2026-11-07
+   rejected alternative left open, for this plan shape only. Pinned by T2
+   #4074 (`retry_plans_bucketed_exchange_for_admitted_shape`,
+   `retry_keeps_sort_merge_for_unadmitted_shape`, and the differential
+   test `bucket_spill_retry_matches_unspilled_answer` at 1, 4 and 16
+   partitions).
+
+2. **How the exchange's memory is bounded under the spill-mode pool.**
+   Cited to DataFusion 55.2.0, `datafusion-physical-plan`
+   `src/repartition/mod.rs` unless named otherwise:
+   - Each output partition registers its own consumer,
+     `RepartitionExec[p]`, with `with_can_spill(true)` (lines 495-499). In
+     the retry's pool that makes it subject to `spill_cap_admit`
+     (`crates/ravel-sql/src/memory.rs:1703-1725`): a grow is admitted only
+     while the consumer stays within its fair share `(L - H) / n`, `n` the
+     spill-capable consumers registered, and the spill-capable total stays
+     within the hard bound `L - H/2`.
+   - `OutputChannel::send` calls `try_grow` for a batch before it is held
+     (lines 223-244). On success the batch is sent as
+     `RepartitionBatch::Memory`; on refusal it is written to the output
+     partition's spill writer and a `RepartitionBatch::Spilled` marker is
+     sent instead (lines 230-236). A memory refusal of the exchange
+     therefore spills rather than failing the statement.
+   - The reservation shrinks when the consumer receives a memory batch, and
+     a `Spilled` marker switches the stream to reading the spill file
+     (lines 2377-2386).
+   - Without `preserve_order` the spill channel is one multi-producer pool
+     per output partition (`spill_pool::mpsc_channel`, lines 528-532),
+     whose files rotate at `max_spill_file_size_bytes`, 128 MiB by default
+     (`datafusion-common` 55.2.0 `src/config.rs:946`).
+   - Exchange spill files are written through the session's disk manager,
+     so they count against the same `max_temp_directory_size` as every other
+     spill file (`datafusion-execution` 55.2.0 `src/disk_manager.rs:478-500`;
+     Ravel sets that quota from the reserved share at `session.rs:626-629`).
+     A quota trip is the typed `spill_budget_exhausted` (`executor.rs:6393`).
+   - Uncharged: the `SharedCoalescer` on each output partition holds fewer
+     than `batch_size` rows before `send` (lines 269-300, created at
+     537-545), and the reader holds the one batch it read back. So the
+     exchange's memory is its charged share plus about one batch per output
+     partition.
+   - Backpressure: the distributor's gate holds senders only when no
+     output channel is empty (`src/repartition/distributor_channels.rs:226`).
+     Under evenly hashed keys a lagging consumer stalls the producers; under
+     skew one empty channel keeps the gate open while another channel
+     grows, and that growth is charged and then spilled. The exchange's
+     spill bytes therefore depend on skew and on how fast the finals
+     drain, and they are reported as their own phase (item 4), not assumed
+     to be zero.
+
+   Pinned by T2 #4074 (`exchange_spill_within_share_under_skew`: the
+   90%-one-key fixture at a share small enough to make the exchange spill,
+   asserting a nonzero exchange spill count, a peak charge within the
+   share, and the answer of the unspilled run).
+
+3. **No third attempt.** The kept plan runs as the statement's one spill
+   retry. Its failure is terminal: `spill_retry_decision` returns no retry
+   once `spill_retried` is set (`executor.rs:6627-6640`), and this
+   amendment adds no fallback to the sort-merge plan after a bucketed
+   retry fails. A bucketed retry fails with one of the typed errors
+   ADR-3565's bucket spill amendment lists. Pinned by T2 #4074
+   (`bucket_spill_retry_failure_is_terminal`).
+
+4. **Counters, per phase.** `SpillRetryReport` (`executor.rs`) and its
+   INFO line gain:
+   - the retry plan, `bucket` or `sort_merge`, and for `bucket` the
+     derived `bits` and `routed_chunk_rows`;
+   - `exchange_spill_bytes_written` and `exchange_spill_files`: the spill
+     metrics of every `RepartitionExec` in the plan, read through
+     `accumulate_spill_counts` (`spill.rs:816`) as today's per-operator
+     figures are;
+   - `bucket_spill_bytes_written`, `bucket_spill_bytes_read` and
+     `bucket_spill_rows_written`: the bucketed exec's own counters
+     (ADR-3565 bucket spill amendment, item 7).
+
+   Every byte figure here counts bytes in spill files on local scratch:
+   Arrow IPC after lz4_frame, framing included, which is what
+   `SpillCounts::bytes_written` counts today (`spill.rs:758`). They are
+   local file bytes; no object-store request is counted in them.
+   DataFusion 55.2 records no bytes read for an exchange spill, so there is
+   no exchange read figure (`None`), and it is not reported as zero; the
+   bucketed exec reads its own files and counts what it reads. The
+   existing `spill_bytes_written` stays the total over every operator, so
+   a sort-merge retry's line reads as before. Pinned by T2 #4074
+   (`spill_retry_report_splits_exchange_and_bucket_bytes`, which asserts
+   each phase's figure exactly on a fixture and that they sum to the
+   total).
+
+5. **The ADR-1195 partition floor.** The kept plan is built by the same
+   physical optimizer rules in the same order as the first attempt, so
+   `FinalExchangeFloor` (`exchange_floor.rs:59`, installed at
+   `session.rs:900`) raises its derived hash exchange to
+   `first_attempt_min_partitions`, 16 by default, as on the first attempt.
+   The retry's final partition count `P` is therefore the first attempt's.
+   `P` does not change the bucket spill's disk bytes: each routed row is
+   written once whichever stream it is in. It changes the number of
+   spill-capable consumers and so the per-stream share the bucket spill
+   derivation divides by; ADR-3565's bucket spill amendment counts them.
+   ADR-1195's floor amendment, item 2, states that the retry is
+   repartition-free and has no exchange to widen. For the shapes item 1
+   admits that stops being true once T2 lands; ADR-1195's item 2 carries
+   the correction.
+
+### Parallel bucket spill rejected alternatives
+
+- **Plan the exchange for every eligible statement.** A string-keyed or
+  float final stays on DataFusion's `FinalPartitioned` aggregate, whose
+  spill is a sort merge per partition. That spreads the merge over `P`
+  streams but keeps each merge pass's rewrite, and the 2026-11-07
+  objection to the repartitioned spill session holds for it unchanged.
+- **Fall back to the sort-merge retry when a bucketed retry fails.** That
+  is a third attempt. Its refusal time adds to the statement's latency and
+  its share stays reserved through two failures. The M8 gate measures
+  whether the bucketed retry needs one before one is added.
+- **Raise the merge fan-in instead.** The 2026-11-08 fan-in choice note
+  swept fan-ins up to 16 and kept 2 for its peak. A wider merge writes
+  fewer passes but raises the live peak the scratch quota bounds, and it
+  stays one stream.
+
+### Parallel bucket spill gate (M8)
+
+T3 (#4075) runs the M8 gate on the three ClickBench boxes. Every row is a
+prediction made before the code exists; T3 pre-registers it on #4072 with
+these bands before it runs.
+
+| figure | band | miss | basis |
+|---|---|---|---|
+| null answers, 43 statements x 3 tries, on each of c6a.large, c6a.xlarge and c6a.2xlarge | 0 | 1 or more | predicted: every statement today's retry answers still answers; the residual risk is the under-shoot of ADR-3565's bucket spill item 5, which fails typed and would show here as a null |
+| hot time per statement v0.28.0 answered, against published v0.28.0 | at most 1.10x | above 1.10x on any statement | predicted: the first attempt is unchanged, and every statement outside item 1 keeps today's retry |
+| concurrent QPS, c6a.large | at least 0.123 (0.90 x 0.137) | below 0.123 | predicted: the floor allows for the first attempt being unchanged |
+| concurrent QPS, c6a.xlarge | at least 0.209 (0.90 x 0.232) | below 0.209 | predicted: 3 and 5 retries wrote 9.9 and 15.6 GB, and row 33's part of that falls to its write-once bytes |
+| concurrent QPS, c6a.2xlarge | at least 0.430 (0.90 x 0.478) | below 0.430 | predicted: 8 and 10 retries wrote 51 and 58 GB on the volume the local object store shares; the first attempt's 8 GB hold on rows 19, 34 and 35 is unchanged, so this row can miss for a cause this amendment does not address |
+| row 33 hot time, c6a.2xlarge | at most 40 s | above 40 s | predicted: about 5.2 GB of routed state before compression (100M rows x 52 B, ADR-3565 amendment 1) at the 3.76 lz4_frame ratio measured on the integer-keyed row 33 fixture (refusal-retry decision item 2) is about 1.4 GB, written once and read once, about 12 s at 240 MB/s, against 8.5 GB written per try today; the first attempt's time to refusal is added unchanged |
+| row 33 `bucket_spill_bytes_written`, c6a.2xlarge | 1.0 to 2.0 GB | above 5.3 GB, the bound of ADR-3565's bucket spill item 2 | predicted: as the row above; between 2.0 and 5.3 GB the compression assumption missed and the bound held |
+| row 33 `exchange_spill_bytes_written`, c6a.2xlarge | at most 1% of `bucket_spill_bytes_written` | above 10% | predicted: unique keys hash evenly, so the distributor gate (item 2) stalls the producers before a channel outgrows its share |
+
+### Parallel bucket spill consequences
+
+- A statement the bucketed rule admits, refused on its first attempt,
+  retries as `P` bucketed final streams under a hash exchange instead of
+  one sort-merge stream. Its spill is written once (ADR-3565 bucket spill
+  amendment), so its retry writes the routed state's bytes instead of the
+  merge's repeated passes.
+- Every other statement's retry is today's.
+- The exchange can spill too, under skew. It counts against the same
+  scratch quota and is reported on its own counter.
+- Production: the store is S3 and the spill root sits under `--cache-dir`
+  when one is set (`<cache_dir>/sql-spill/<instance_id>`,
+  `crates/ravel-sql/src/config.rs:195`, per the cache-dir spill default
+  amendment), so spill shares a volume with the read-cache tier. The
+  write-once bound limits the write bandwidth a retry takes from that tier
+  the same way it limits what row 33 takes from the local object store's
+  volume in the benchmark.
+- ADR-1195's first-attempt floor amendment, item 2, now says the retry
+  keeps the hash exchange for the admitted shapes (item 5).

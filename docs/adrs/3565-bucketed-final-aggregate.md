@@ -107,6 +107,8 @@ Charging:
 
 Nothing spills. A query with spill configured never reaches `FinalPartitioned` (`session.rs:618`), so the rule never fires there (ADR-0013 unchanged).
 
+*The bucket spill amendment below (2026-11-10) changes this for ADR-0954's refusal retry: the retry of an admitted shape keeps its `FinalPartitioned` final, converted to this exec, and the exec spills its routed chunks once. It also corrects the sentence above for the first attempt.*
+
 Peak per partition = retained bucket input + one bucket's table and accumulators.
 - For unique keys (q33), the retained state rows are about the size of the groups. Bucketing therefore lowers the peak: the table's 0.5-0.875 load factor and doubling slack are gone, and one bucket's table is about 1/64 of a partition's.
 - For repeated keys, retained input is up to R times the group state (R = rows per group). This is why string keys are refused: their rows also carry the string bytes.
@@ -182,7 +184,7 @@ Two more guards:
 
 *Amendment 1 below records what the implementation and the A/B measured against this section; read it with this one.*
 
-- Off by default. With the switch off, no plan changes, and a test pins plan equality.
+- Off by default. With the switch off, no plan changes, and a test pins plan equality. The bucket spill amendment below makes one exception: ADR-0954's refusal retry installs the rule whatever the switch says.
 - With it on, eligible fixed-width finals lose overlap with the scan: phase 2 starts only when input ends. That is the cost #25724 measured on its Q12.
 - Ravel carries one aggregate exec of its own until DataFusion ships an equivalent. The DataFusion surfaces it uses (`GroupValues`, `GroupsAccumulator`, `create_hashes`, the `AggregateExec` accessors) are named in a test that fails to compile if any becomes private.
 - The new consumer name is outside the reserve-ahead set of ADR-1170's reserve-ahead amendment (`docs/adrs/1170-process-memory-budget.md:1429-1448`, `reserves_ahead` at `memory.rs:1312-1318`), by design: the bucket buffers are charged at capacity before they are written, which is what the factor approximates for the stock tables.
@@ -237,3 +239,79 @@ Status of this amendment: Accepted. Refs: #3565, #3607, #3608, #3609, #3639. The
 ### Decision
 
 On q33, the statement this ADR was written for, bucketing moves the memory and not the time: the latency saving the counters bounded at 0.14 of cycles is spent again on the router copy, the second hash and the chunk writes, within the run's resolution. The CPU wins land on the small fixed-width statements (q05, q09, q16, q36, 0.67 s of the 50 s hot sum) and cost them 1.1-3.3x in asked bytes. Per the pre-registered outcome rule (CPU miss with the memory gate in band), **the switch stays off by default**. The exec, the rule, the stat and the tests stay in the tree behind `SqlConfig::bucketed_final_aggregation` as a measured, reviewed option for an operator who wants q33's peak memory halved at equal CPU. No PR turns it on. Decision 5 is recorded as the only lever left on q33's CPU and is not scheduled. #3639 carries the follow-ups.
+
+## Amendment 2 (2026-11-10): bucket spill for the refusal retry
+
+<!-- amendment-applies: sections="3. Memory|Consequences" pointer="bucket spill amendment" -->
+
+Status of this amendment: Accepted as a plan. Refs: #4073, epic #4072. The code is T2 (#4074); the measurement is T3 (#4075). The switch stays off by default for the first attempt.
+
+### Bucket spill context
+
+This is the bucket spill amendment. ADR-0954's parallel bucket spill amendment (2026-11-10) keeps the hash exchange in the refusal retry of a shape this exec's rule admits, and converts its finals to this exec. On c6a.2xlarge q33's retry today writes 8.5 GB of sort-merge spill per try at about 240 MB/s, the volume's ceiling (ADR-0954, that amendment's context). Decision 3 above has no spill: a refused grow fails the statement. This amendment decides how the exec spills, so that its routed state goes to disk once.
+
+Two corrections to decision 3 first:
+- "A query with spill configured never reaches `FinalPartitioned`" has not held since ADR-0954's refusal-retry amendment (2026-11-07): a server with spill configured runs every first attempt as if spill were unconfigured, so with the switch on the rule fires on first attempts there. The cited line has also moved; `with_repartition_aggregations` is at `session.rs:658` and the spill-enabled session's repartition-free planning at `session.rs:737`.
+- The exec's consumer is registered without `with_can_spill` (`bucketed_final_aggregate.rs:884-887`), so ADR-0954's spill-mode cap (`spill_cap_admit`, `memory.rs:1703-1725`) does not apply to it today.
+
+### Bucket spill decision
+
+1. **When the exec spills.** In the refusal retry the exec's consumer registers `with_can_spill(true)`; on a first attempt it registers as today. In the retry a refused charge on that consumer (a routed chunk, `bucketed_final_aggregate.rs:756`, or a table, `charge_table` at line 996) is a spill trigger, not an error:
+   - the stream writes every chunk it retains, for every bucket it has not yet aggregated, to that bucket's scratch file, once, releases their charge, and asks for the charge again;
+   - from then on each chunk is written when it fills, and each bucket's last, partly filled chunk is written when input ends;
+   - a refusal before the stream has engaged engages it then;
+   - when input ends, each bucket is read back from its file and aggregated alone, as decision 1's phase 2 aggregates it, then emitted, and its file is deleted before the next bucket starts.
+
+   Scratch files are created through the session's disk manager (`DiskManager::create_tmp_file`, `datafusion-execution` 55.2.0 `src/disk_manager.rs:342`), so they count against the share ADR-0954 reserves for the retry, together with the exchange's spill files. Pinned by T2 #4074 (`bucket_spill_writes_each_routed_row_once`, which counts rows written against rows routed on a fixture where the trigger fires in phase 1, and again where it fires in phase 2).
+
+2. **Disk bound.** Every routed row is written at most once, in whole chunks except each bucket's last. A stream with `R` routed rows of width `w` bytes, `2^bits` buckets and `routed_chunk_rows = c` therefore writes at most `R x w + 2^bits x c x w` bytes of column data before lz4_frame: the routed state once, plus at most one chunk per bucket. Arrow IPC adds its per-chunk message framing. Arrow IPC writes a buffer the codec does not shrink uncompressed (ADR-0954, refusal-retry decision item 2), so compression does not raise the bytes on disk above that. Nothing is merged, so nothing is rewritten. A bucket's file is deleted after its read-back, so live scratch falls through phase 2. The quota bounds the total in every case. Pinned by T2 #4074 (`bucket_spill_disk_within_write_once_bound`, which asserts the bound exactly on the q33 shape and on random keys).
+
+3. **Memory bound.** Per stream, after the trigger: one bucket's table and accumulators, one open chunk per bucket per column (`2^bits x c x w` plus validity), the one chunk being read back, the router's scratch (charged with the table, `bucketed_final_aggregate.rs:989`), and before the engage the phase 1 table decision 3 bounds. Each is charged to `BucketedFinalAggregate[p]` as decision 3 charges it, and the phase 1 table's undercount stays under the 7 MiB decision 3 bounds it at. ADR-0954's spill-mode pool caps that consumer at its fair share. Pinned by T2 #4074 (`bucket_spill_peak_within_share`, which asserts the consumer's peak charge against the share on the q33 shape).
+
+4. **How `bits` and `routed_chunk_rows` are derived.** The retry derives them from the refused first attempt; they replace decision 1's defaults (`bits` 6, `routed_chunk_rows` 8192) for that retry only. With:
+   - `A`, the first attempt's peak asked intermediate bytes at its refusal (decision 3's figure, all consumers);
+   - `n`, the rows the aggregate's scan had produced at the refusal, and `N`, the scan's total input rows, both exact in Ravel;
+   - `P`, the retry's final partition count (ADR-0954 parallel bucket spill item 5);
+   - `C`, the spill-capable consumers the retry plan registers, counted from the plan: one per partial aggregate stream (DataFusion 55.2 registers a partial stream as spill-capable, `aggregates/grouped_hash_stream.rs:494` and `:518`), one per exchange output partition, and one per bucketed stream;
+   - `L` and `H`, the per-query limit and the spill-mode headroom of ADR-0954's refusal-retry decision; `S = (L - H) / C`, the per-stream share;
+   - `w`, the routed row width in bytes, fixed by the schema because keys and state are fixed width;
+
+   the projected table bytes are `T = A x N / n`, and
+   - `bits = max(0, ceil(log2(2 x T / (P x 0.75 x S))))`: the tables projected for one stream, times a margin of 2, fit in three quarters of its share one bucket at a time;
+   - `routed_chunk_rows = min(8192, floor(0.25 x S / ((2^bits + 1) x w)))`: the open chunks and the read-back chunk fit in the remaining quarter.
+
+   The derivation returns no tuning, and ADR-0954's retry keeps its sort-merge plan, when `n` is zero, when the aggregate's input holds other than one scan, when `bits` would exceed `BUCKETED_FINAL_AGGREGATE_MAX_BITS` (16, `bucketed_final_aggregate.rs:151`), or when `routed_chunk_rows` would fall below 1024. `C` is an upper bound on the consumers registered at any one time, because unregistering a spill-capable consumer lowers the pool's count (`memory.rs:2391-2394`), so the live share is at least `S`. Amendment 1's 0.885 GB of up-front chunk slack at 32 partitions and 64 buckets is what the second formula removes: the slack is at most a quarter of each stream's share.
+
+   q33 on c6a.2xlarge: `L` 8.19 GB, `H` 0.819 GB, `P` 16, `C` 48 (16 partial streams, 16 exchange outputs, 16 bucketed streams), so `S` is 0.154 GB. If `T` projects to about the 9.48 GB the stock final asked (amendment 1), `T / P` is 0.59 GB, `bits` is 4 (16 buckets, about 37 MB of table each against a 0.115 GB budget), and `routed_chunk_rows` is 8192, with 6.8 MB of open chunks per stream (16 x 8192 x 52 B). `bits` stays 4 for any `T` from 7.4 to 14.8 GB. Pinned by T2 #4074 (`bucket_spill_derivation_q33_c6a_2xlarge`, which asserts `bits` 4 and `routed_chunk_rows` 8192 from these inputs, and `bucket_spill_derivation_refusals`, one case per no-tuning condition).
+
+5. **Under-shoot: a conservative derivation, and a typed error past it.** The projection can under-shoot. A prefix's group rate holds for the rest of the scan only when groups arrive evenly, and one bucket can hold more than its even part of a stream's groups. The derivation is conservative three ways: `A` counts every consumer's asked bytes, not only the tables; the margin is 2; and `S` is computed at the planning count `C`. A bucket whose table still cannot be charged when the stream retains nothing left to write fails the statement with the pool's typed `ResourcesExhausted`. That needs the rows after the refusal to bring new groups at more than about twice the scanned prefix's rate, or one bucket to receive more than about twice its even part. No partial result is returned, no group is dropped, and there is no third attempt (ADR-0954 parallel bucket spill item 3).
+
+   A recursive split was the alternative: re-route a bucket that does not fit into sub-buckets by the next bits of the same hash, which stays exact. It was not chosen because it writes the bucket it splits again. Its disk bound would then depend on how far the projection missed, which cannot be pre-registered, and the bytes written are the lever the retry is disk-bound on. If the M8 gate shows a null from an under-shoot, the split is the follow-up, with its own amendment and measurement. Pinned by T2 #4074 (`bucket_spill_late_groups_fail_typed`: a fixture whose groups arrive after the refusal point at four times the prefix's rate fails with `ResourcesExhausted`, returns no rows, and leaves no scratch file).
+
+6. **Exactness.** Decision 2 is unchanged. The bucket is a function of the key alone (the top `bits` bits of a hash on `BUCKET_HASH_SEED`, `bucketed_final_aggregate.rs:653`), so all of a key's state rows land in one bucket's file. Arrow IPC with lz4_frame is lossless, so the rows read back are the rows written. A bucket's `merge_batch` sees the same state rows as in memory, in file order rather than arrival order; decision 2 already holds for any order, because no float state is admitted. Decision 4's per-bucket top-k is unchanged: a bucket's groups are complete once its file is read. Pinned by T2 #4074 (`bucket_spill_matches_in_memory_answer`: the decision 2 fixtures, NULL and all-NULL keys, a single group, 90%-one-key skew and unique keys, at 1, 4 and 16 partitions, spilled against unspilled, identical sorted answers).
+
+7. **Counters.** The exec reports, per operator, DataFusion's typed spill metrics (`spill_count`, `spilled_bytes`, `spilled_rows`), so `accumulate_spill_counts` (`spill.rs:816`) reads it as it reads every other operator, plus `bucket_spill_bytes_read`. Bytes written and read are the bytes of its scratch files on local disk, Arrow IPC after lz4_frame, framing included; the read figure counts whole files read once, with no range reads. ADR-0954's parallel bucket spill item 4 carries them into `SpillRetryReport` as the bucket phase. Pinned by T2 #4074 (`spill_retry_report_splits_exchange_and_bucket_bytes`).
+
+8. **Typed errors and cleanup.**
+   - The scratch quota exceeded: DataFusion's spill writer refuses the write (`disk_manager.rs:478-500`), and Ravel types it `spill_budget_exhausted` (`executor.rs:6393`). Pinned by T2 #4074 (`bucket_spill_quota_is_typed`).
+   - A scratch write or read fault: surfaced as an IO error, which Ravel types `SpillUnavailable` (`spill_error`, `executor.rs:6385-6400`). Pinned by T2 #4074 (`bucket_spill_write_fault_is_typed`, with an injected write failure).
+   - Cancellation: dropping the stream drops its scratch files, whose `RefCountedTempFile` returns their bytes to the disk manager's count (`disk_manager.rs:437-452`), and its reservation; the query's `SpillScratch` removes the scratch directory on drop, best effort (`spill.rs:366-372`), and the share is released. Pinned by T2 #4074 (`bucket_spill_cancel_releases_share_and_scratch`, asserting no file left under the scratch directory and the pool and the spill budget back at zero).
+
+### Bucket spill bands
+
+These are T3's (#4075) bucket-specific rows. The M8 gate is ADR-0954's parallel bucket spill gate table; every row here is a prediction made before the code exists.
+
+| figure | band | miss | basis |
+|---|---|---|---|
+| q33 derived `bits`, c6a.2xlarge | 4 | below 3 or above 5 | predicted: item 4's worked example; 4 for `T` from 7.4 to 14.8 GB |
+| q33 `bucket_spill_rows_written`, c6a.2xlarge | 99,997,493 | any other count | predicted: every row reaching the final is routed and written once (item 2); the Context's 99,997,493 rows each carry a distinct group, so the partial aggregate merges none |
+| q33 `bucket_spill_bytes_written`, c6a.2xlarge | 1.0 to 2.0 GB | above 5.3 GB, item 2's bound | predicted: 99,997,493 x 52 B = 5.2 GB before compression, at the 3.76 lz4_frame ratio of ADR-0954's integer-keyed row 33 fixture |
+| q33 `bucket_spill_bytes_read` against bytes written | equal | any difference | predicted: each file is read once, whole, before it is deleted (item 1) |
+| q33 retry peak asked bytes, c6a.2xlarge | 0.5 to 2.0 GB | above 7.78 GB, the spill-mode hard bound `L - H/2` | predicted: 16 streams x (37 MB of table + 6.8 MB of open chunks + under 7 MiB of phase 1 table), plus the exchange's and the partial streams' buffers |
+
+### Bucket spill consequences
+
+- With the switch off, a first attempt plans as before. A refusal retry of an admitted shape runs this exec whatever the switch says, with its own derived tuning.
+- Its spill writes the routed state once and has no merge pass.
+- An under-shoot beyond the margin fails the statement typed where today's sort-merge retry could answer it. The M8 gate's null row is where that shows.
+- The exec's consumer is spill-capable in the retry only, so on a first attempt it is still outside ADR-0954's spill-mode cap.

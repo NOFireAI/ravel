@@ -231,7 +231,11 @@ process budget at the floor and from 32,445,360 at 8 partitions.
    `SpillDecision::Enabled`, which ADR-0954 plans repartition-free, so it has
    no hash exchange to widen. More partitions on the retry would cost spill
    files and a merge pass. A plan-time statement (Flight SQL, pinned plans)
-   planned with spill is the same.
+   planned with spill is the same. Corrected 2026-11-10: ADR-0954's
+   amendment "parallel bucket spill for the refusal retry" (issue #4073)
+   keeps the hash exchange on the retry for the shapes ADR-3565's rule
+   admits, and this floor then widens it as it does on the first attempt
+   (that amendment, item 5). Every other shape is still repartition-free.
 3. **An explicit count turns the floor off.** ravel-server passes the floor
    of 16 only when `sql_partition_count` was derived.
    `--sql-partition-count`, or the legacy `--fetch-concurrency`, sets the
