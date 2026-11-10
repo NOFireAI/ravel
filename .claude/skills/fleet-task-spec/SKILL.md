@@ -129,9 +129,9 @@ Gates: format and lint IN PLACE before the commit you will gate -- run
 `cargo fmt --all` (not just --check) and, where it applies, scoped
 `cargo clippy --fix -p <crate>` -- then verify with `cargo fmt --all
 --check`; scripts/gates.sh --tier executor -p <crate> [-p <crate2>]. (The
-tier flag follows the spec's declared gate_tier: `--tier merge` for a
-`gate_tier: merge` spec, and no cargo gate at all for `gate_tier:
-script-only`, whose gate is the case suites and guards it names.) That
+tier flag follows the tier the spec's head declares: `--tier merge` for
+a merge-tier spec, and no cargo gate at all for a script-only spec, whose
+gate is the case suites and guards it names.) That
 one script is the gate: it runs fmt and the source guards; clippy, tests
 and doctests for the named crates only; one `cargo check --all-targets` of
 every other crate in their reverse-dependency closure, with the lane
