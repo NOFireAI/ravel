@@ -62,11 +62,21 @@ PHASE_FIELDS = ("s3GetRequests", "s3GetWireBytes", "s3ListRequests", "segmentsOp
 # statement and try: their data is the unfolded data mid-rewrite.
 ORACLE_STATES = ("compaction_in_flight", "compaction_done", "erasure_in_flight")
 # States run.sh enters as a step of another one: live exactly when it is.
-DERIVED = {"fold_advance": "mixed", "compaction_done": "compaction_in_flight"}
+DERIVED = {"fold_advance": "mixed", "compaction_done": "compaction_in_flight",
+           "day_parts_7_advance": "day_parts_7", "day_parts_30_advance": "day_parts_30",
+           "retired_hour_drop": "retired_hour"}
+# Second folds run.sh stamps right after a state's own fold, with no census
+# of their own: {fold transition: the state it belongs to}.
+REFOLDS = {"day_parts_7_refold": "day_parts_7", "retired_hour_refold": "retired_hour",
+           "retired_hour_drop_refold": "retired_hour_drop"}
 # ADR-3939's multi-day states (its harness-state amendment): day parts over 7
-# and 30 days, and a tombstoned hour in a sealed day. box/run.sh does not
-# build them yet (task H1b, #4048), so every row on them reads not-run.
+# and 30 days on their own tenants (dp7, dp30), and a tombstoned hour in
+# dp7's oldest sealed day (box/run.sh state_day_parts, state_retired_hour).
 MULTI_DAY_STATES = ("day_parts_7", "day_parts_30", "retired_hour")
+DAY_PARTS_TENANTS = {"day_parts_7": "dp7", "day_parts_30": "dp30"}
+# The states run.sh plans --temp prefold calls in: each statement sent
+# against the loaded tenant before its fold.
+PREFOLD_STATES = ("day_parts_7", "day_parts_30")
 INFLIGHT_STATES = ("compaction_in_flight",)
 SIGNALS = ("spans", "logs")
 
@@ -94,7 +104,8 @@ UNCOVERED_OUTCOMES = ("partsUncovered", "skippedByBudget", "partsBeyondCeiling",
 # part to tier 1 by cost, so its absence reads as 0, not as unsupported.
 OPTIONAL_OUTCOMES = ("partsOverTierOne",)
 ALLOWLIST_BREAKDOWNS = {"per_object": "stats carry no per-object breakdown",
-                        "per_part": "stats carry no per-part breakdown"}
+                        "per_part": "stats carry no keyIndex.perPart breakdown (key_index_json, "
+                                    "crates/ravel-sql/src/stats_json.rs, writes none)"}
 # A figure no build can supply because its inputs exist in no report: it
 # proves nothing either way, so it, and every figure judged against it,
 # leaves the run incomplete.
@@ -119,11 +130,19 @@ FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_in
                   "key_index_leaf_gets", "sealed_day_leaf_puts", "sealed_day_previous_leaf_gets", "head_digest",
                   "switch_off_partition_changed", "key_index_unchanged_section_gets", "key_index_part_puts",
                   "retired_hours")
-# Stamps of ADR-3939's multi-day states that box/run.sh does not write yet
-# (task H1b, #4048): stamp.<what>.<label> reads stamps/STATE.LABEL.<kind>.json,
-# and its absence is unsupported-on-this-build, not missing.
+# Stamps of ADR-3939's multi-day states: stamp.<what>.<label> reads
+# stamps/STATE.LABEL.<kind>.json. box/run.sh state_retired_hour writes the
+# fold_binary and tombstone stamps, so in a run where that state is live
+# their absence is missing. No command resolves an ingest hour's segments,
+# so no run writes retired_resolve: that figure is unsupported.
 H1B_STAMPS = {"fold_binary_pre_r2": "fold_binary", "tombstoned_hour": "tombstone",
               "retired_hour_segments": "retired_resolve"}
+H1B_UNWRITTEN = {"retired_resolve": "no harness command resolves an ingest hour's segments (neither ravel-cli "
+                                    "nor the server lists the segments one hour holds after a fold)"}
+# Fold stamps run.sh takes from the on-demand fold (POST /api/v1/admin/fold),
+# whose response (services/ravel-server/src/fold_on_demand.rs) carries none of
+# FOLD_ALLOWLIST's fields nor these.
+ADMIN_FOLD_ABSENT = ("leaves_written", "leaf_bytes", "key_index_ranged_gets")
 
 # Fold report fields under their names in a `catalog fold --json` report and
 # in a `--rebuild-key-index` report.
@@ -278,15 +297,32 @@ def live_states(cfg, not_run, all_states):
     return out
 
 
+def base_state(state):
+    """The state run.sh builds STATE as a step of, through REFOLDS and DERIVED."""
+    while state in REFOLDS or state in DERIVED:
+        state = REFOLDS.get(state) or DERIVED[state]
+    return state
+
+
 def tenant_of(state, label, cfg):
     if state.startswith("many_parts_"):
         return "mp" + state[len("many_parts_"):]
+    base = base_state(state)
+    if base == "retired_hour":
+        return "dp7"
+    if base in DAY_PARTS_TENANTS:
+        return DAY_PARTS_TENANTS[base]
     return "hits" if label == "hits" else cfg["tenant"]
 
 
 def labels_of(state, cfg):
     if state.startswith("many_parts_"):
         return ["spans"]
+    base = base_state(state)
+    if base == "day_parts_7":
+        return list(SIGNALS)
+    if base in ("day_parts_30", "retired_hour"):
+        return ["logs"]
     return list(SIGNALS) + (["hits"] if cfg["hits"] else [])
 
 
@@ -301,7 +337,8 @@ def truth_key_of(call, statements, cold_runs):
     """The truth key statements.toml gives this call, or None for an unknown
     statement. A saved-trace statement's cold (or in-flight) try i reads saved
     trace i and its warm repeat the last cold try's; a many-parts state reads
-    its own corpus's answers (box/lib/inv.py plan)."""
+    its own corpus's answers (box/lib/inv.py plan), and so does a day-parts
+    state (run.sh plans it with --sub STATE)."""
     sid = call.get("statement") or ""
     if sid.startswith("control_"):
         return "hits.control"
@@ -309,7 +346,8 @@ def truth_key_of(call, statements, cold_runs):
     if st is None:
         return None
     state = call.get("state") or ""
-    sub = state if state.startswith("many_parts_") else st.get("truth_sub")
+    own = state.startswith("many_parts_") or state in DAY_PARTS_TENANTS
+    sub = state if own else st.get("truth_sub")
     run = 0
     if st.get("per_run") == "saved_trace":
         run = (cold_runs or 1) - 1 if call.get("temp", "cold") == "warm" else call.get("try", 0)
@@ -511,7 +549,7 @@ class Calls:
     def judge_against_unfolded(self, c, tk, problems):
         if c.get("truth_key") != tk:
             return "wrong_answer", f"call names truth key {c.get('truth_key')!r}, statements.toml gives {tk!r}"
-        temp = "warm" if c.get("temp") == "warm" else "cold"
+        temp = c.get("temp") if c.get("temp") in ("warm", "prefold") else "cold"
         twin = self.tries(c["statement"], "unfolded", temp).get(c.get("try", 0), [])
         if len(twin) != 1 or twin[0].get("outcome") != "ok":
             problems.add("missing", f"oracle call {c['statement']}/unfolded/{temp} try {c.get('try', 0)} "
@@ -552,6 +590,8 @@ def expected_temps(st, state, cfg):
     temps = ["cold"]
     if not st.get("cold_only", True) and cfg["warm_runs"]:
         temps.append("warm")
+    if state in PREFOLD_STATES:
+        temps.append("prefold")
     return temps
 
 
@@ -909,6 +949,8 @@ def census_over_512k(census, statements, cfg, c):
     gives its statement's tenant and signal, or (None, reason)."""
     st = statements.get(c.get("statement")) or {}
     tenant = st.get("tenant") or cfg["tenant"]
+    # run.sh sends a day-parts state's statements to that state's own tenant.
+    tenant = DAY_PARTS_TENANTS.get(base_state(c.get("state") or ""), tenant)
     signal = signal_of(st.get("table", "spans"))
     line = census.get((c.get("state"),), "absent")
     if line == "absent" or line is None:
@@ -940,7 +982,11 @@ def required_stamps(run_dir, cfg, live, problems):
     loads = jsonl("loads.jsonl", ("hour", "tenant", "signal"))
     folds = jsonl("folds.jsonl", ("transition", "tenant", "signal"))
     census = jsonl("census.jsonl", ("state",))
-    restarts = jsonl("restarts.jsonl", ("statement", "state", "try"))
+    # A cold and a prefold call of one try each restart the server; a line
+    # naming no temp is a cold call's.
+    restarts = index_lines([dict(line, temp=line.get("temp", "cold")) for line in load_jsonl(
+        os.path.join(stamps, "restarts.jsonl"), problems, "stamps/restarts.jsonl")],
+        ("statement", "state", "temp", "try"), "stamps/restarts.jsonl", problems)
     transitions = jsonl("transitions.jsonl", ("state",))
     compaction = (jsonl("compaction.jsonl", ("signal",))
                   if live.get("compaction_in_flight") is None else {})
@@ -954,6 +1000,11 @@ def required_stamps(run_dir, cfg, live, problems):
     if cfg["hits"]:
         want_loads.append(("base", "hits", "hits"))
     want_loads += [(s, tenant_of(s, "spans", cfg), "spans") for s in on if s.startswith("many_parts_")]
+    for s in DAY_PARTS_TENANTS:
+        if s in on:
+            want_loads += [(s, tenant_of(s, lab, cfg), lab) for lab in labels_of(s, cfg)]
+        if f"{s}_advance" in on:
+            want_loads += [(f"{s}_tail", tenant_of(s, lab, cfg), lab) for lab in labels_of(s, cfg)]
     for k in want_loads:
         line = loads.get(k, "absent")
         if line == "absent":
@@ -977,6 +1028,13 @@ def required_stamps(run_dir, cfg, live, problems):
         if s.startswith("many_parts_"):
             t = tenant_of(s, "spans", cfg)
             want_folds += [(s, t, "spans"), (f"{s}_leaf_rebuild", t, "spans")]
+    # The multi-day states' folds, each wanted when the state it belongs to
+    # is live (live_states resolves the derived ones through DERIVED).
+    for transition in ("day_parts_7", "day_parts_7_refold", "day_parts_7_advance", "day_parts_30",
+                       "day_parts_30_advance", "retired_hour", "retired_hour_refold", "retired_hour_drop",
+                       "retired_hour_drop_refold"):
+        if REFOLDS.get(transition, transition) in on:
+            want_folds += [(transition, tenant_of(transition, lab, cfg), lab) for lab in labels_of(transition, cfg)]
     for k in want_folds:
         line = folds.get(k, "absent")
         if line == "absent":
@@ -1125,12 +1183,13 @@ def check_inflight(calls, statements, compaction, problems, live):
 
 def check_restarts(calls, restarts, problems):
     for (statement, state, temp), tries in sorted(calls.groups.items()):
-        if temp != "cold":
+        if temp not in ("cold", "prefold"):
             continue
         for t, lines in sorted(tries.items()):
             sent = any(c.get("outcome") in ("ok", "refused", GUARD) for c in lines)
-            if sent and (statement, state, t) not in restarts:
-                problems.add("missing", f"stamps/restarts.jsonl {statement}/{state}/{t}")
+            if sent and (statement, state, temp, t) not in restarts:
+                at = f"{statement}/{state}/{t}" if temp == "cold" else f"{statement}/{state}/{temp}/{t}"
+                problems.add("missing", f"stamps/restarts.jsonl {at}")
 
 
 # A stamp field the inspector did not print is missing, never 0: each helper
@@ -1212,9 +1271,11 @@ def stamp_figure(stamps, census, cfg, state, metric):
         return drop_parts_holding_hour(stamps, state, label)
     if what in H1B_STAMPS:
         name = f"stamps/{state}.{label}.{H1B_STAMPS[what]}.json"
+        if H1B_STAMPS[what] in H1B_UNWRITTEN:
+            return UNSUPPORTED, None, f"no {name}: {H1B_UNWRITTEN[H1B_STAMPS[what]]}"
         doc = stamps.doc(state, label, H1B_STAMPS[what])
         if doc is None:
-            return UNSUPPORTED, None, f"no {name} on this build (task H1b, #4048, writes it)"
+            return "missing", None, f"no {name} (box/run.sh state_retired_hour writes it)"
         if what == "fold_binary_pre_r2":
             # W2's binary: the fold binary's SHA, carrying C1 and not R2. Any
             # other binary is one W2 is not measured on (the harness-state
@@ -1278,7 +1339,7 @@ def drop_parts_holding_hour(stamps, state, label):
     head = stamps.doc(f"{state}_drop", label, "catalog")
     for name, doc in ((tomb_name, tomb), (head_name, head)):
         if doc is None:
-            return UNSUPPORTED, None, f"no {name} on this build (task H1b, #4048, writes it)"
+            return "missing", None, f"no {name} (box/run.sh state_retired_hour writes it)"
     hour = tomb.get("hour")
     if not isinstance(hour, int) or isinstance(hour, bool):
         return "missing", None, f"{tomb_name} carries no hour"
@@ -1343,6 +1404,9 @@ def fold_figure(folds, transition, tenant, label, field):
         return ("value", v, "") if v is not None else ("missing", None, "fold stamp has no measure")
     v = fold_field(line.get("report") or {}, field)
     if v is None:
+        if line.get("source") == "admin_fold" and (field in FOLD_ALLOWLIST or field in ADMIN_FOLD_ABSENT):
+            return UNSUPPORTED, None, ("the on-demand fold response (services/ravel-server/src/fold_on_demand.rs) "
+                                       f"carries no {field}")
         if field in FOLD_ALLOWLIST:
             return UNSUPPORTED, None, f"fold report carries no {field} on this build"
         return "missing", None, f"fold report {transition}/{tenant}/{label} has no {field}"

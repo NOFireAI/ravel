@@ -309,9 +309,14 @@ its keyIndex GETs at 2 x that count.
   ["unfolded", "many_parts_744"]` at 1,000 traces and `traces_per_hour = 1`
   loaded 744 objects into ingest hours 497525 to 498268 and measured row
   9 (744 covering parts, 747 resolve GETs, exact rows).
+- `day_parts_7`, `day_parts_30` and `retired_hour`: ADR-3939's multi-day
+  states, listed only by a run that measures that ADR ("day_parts_N and
+  retired_hour" below).
 
-`mixed` is followed by `fold_advance` and `compaction_in_flight` by
-`compaction_done`; each derived state is live exactly when its parent is. A
+`mixed` is followed by `fold_advance`, `compaction_in_flight` by
+`compaction_done`, `day_parts_N` by `day_parts_N_advance` and
+`retired_hour` by `retired_hour_drop`; each derived state is live exactly
+when its parent is. A
 state the run lists and does not reach is `not-run` with the reason, and a
 state absent from both the results and the not-run list is a missing figure.
 
@@ -373,6 +378,148 @@ or compaction (`--mode all` would move the state under the measurement, and
 ravel-server refuses `--disable-fold` in query mode, so the flag is not
 passed); run.sh stops the server before every transition.
 
+### day_parts_N and retired_hour
+
+ADR-3939's harness-state amendment ("Two states",
+`docs/adrs/3939-key-index-day-seal.md`) adds these states. `box/run.sh`
+builds them in `state_day_parts` and `state_retired_hour`. Each multi-day
+state has its own tenant, so the base tenant's states are not changed:
+
+- `dp7` holds spans and logs. `day_parts_7` and `retired_hour` run on it.
+- `dp30` holds logs only. `day_parts_30` runs on it.
+
+`retired_hour` runs on `dp7` because ADR-3939 measures the retirement of a
+day part's hour 0 in a sealed day. `dp7`'s oldest day is such a day, and it
+is already folded with leaves. A fresh tenant would need a second week-long
+load. `bands.toml` therefore reads every ADR-3939 fold figure as
+`fold.dp7.*`.
+
+**The window.** `inv.py day-parts-window` picks N whole UTC days whose last
+hour is before the current ingest hour. It refuses a window that would
+reach the current hour, since the strided load refuses one too
+(`day_parts_window`, `box/lib/inv.py`). The window is computed once, at
+corpus time, so it stays in the past.
+
+**The corpus.** `gen_corpus.py --even-hours` generates the corpus:
+
+- `--hours 24N` and `--start-hour` at the window's first hour.
+- `--traces` is `day_parts.traces_per_day_N` times N.
+- `--seed` is `corpus.seed + 100 + N`.
+
+For `dp7`, `inv.py midnight-truth` then adds the midnight lookup's answer
+(`midnight.request_id.1`) to `truth.json`. That answer is the request id of
+the row nearest the first UTC midnight of the window, within 30 minutes of
+it. It must occur once and be no planted id. With no such row the
+statement is recorded `not-run`.
+
+**`day_parts_N`** runs these steps in order:
+
+1. `inv.py stride-check` checks each signal over all 24N batches. A
+   refusal records the state `not-run`; a check that cannot run fails it.
+2. One `ravel-cli load` per signal, with these flags:
+   - `--ingest-hour-stride 1`
+   - `--ingest-hour-start` at the window's first hour
+   - `--batch-rows` = rows / 24N, so batch k is event hour k, in ingest
+     hour start + k
+   - `--target-bytes 1`
+3. The statement set under temp `prefold`, before any fold.
+4. One `catalog fold --writers-stopped --json --key-index-leaves` per
+   signal (transition `day_parts_N`). It builds every day's leaves in one
+   pass (ADR-3939 decision 4, corrected).
+5. For N = 7 only, a second fold with the same flags
+   (`day_parts_7_refold`, A4's second HEAD).
+6. The transition, then the census, catalog, object, kidx and tenant stamps.
+7. `inv.py day-parts-stamp` writes `stamps/day_parts_N.SIG.day_parts.json`.
+   It splits the catalog stamp per part: `min_hour`, `max_hour`, UTC `day`,
+   `one_day` (false for a part that spans two days), `entry_count`, and
+   `slices` per field. It also records the HEAD `watermark_hour`, the
+   `days` held and `part_count`.
+8. The statement set, cold.
+
+**`day_parts_N_advance`** follows:
+
+1. Wait for the next ingest hour, at most `run.mixed_wait_max_minutes`.
+2. Load the mixed state's tail corpus into the tenant with `ravel-cli load`,
+   as `mixed` does.
+3. Fold with `--key-index-leaves` (transition `day_parts_N_advance`).
+4. Take the census and the day-parts stamps again.
+
+**`retired_hour`** requires `day_parts_7` listed before it and `[retired_hour]
+c1_sha` set. run.sh refuses a run.toml that lacks either before any step.
+If `day_parts_7` did not build `dp7`, the state is recorded `not-run`.
+
+1. `inv.py fold-binary` writes `stamps/retired_hour.logs.fold_binary.json`.
+   See "W2's fold binary".
+2. `retire_through retired_hour 0` tombstones ingest hour D0, the first
+   hour of `dp7`'s oldest day, and nothing later. "How the tombstone is
+   produced" below explains how.
+3. It stamps `stamps/retired_hour.logs.tombstone.json`. `hour`,
+   `first_hour` and `last_hour` are in unix hours, the unit catalog part
+   ranges count in.
+4. Two on-demand folds follow. They are stamped in `folds.jsonl` as
+   `retired_hour` and `retired_hour_refold`, with `source = "admin_fold"`.
+5. The transition, the census and the catalog stamp.
+
+The state sends no statement: its rows read fold and stamp figures only.
+
+**`retired_hour_drop`** (W3) repeats those steps with
+`retire_through retired_hour_drop 23`, which tombstones every hour of that
+day, D0 to D0 + 23. Its catalog stamp is
+`stamps/retired_hour_drop.logs.catalog.json`.
+
+**How the tombstone is produced.**
+
+1. ravel-maintain's retention pass writes a bucket's tombstone,
+   `t/<hash>/<signal>/c/<shard>/<YYYYMMDDTHH>/retire.tmb`
+   (`retention_tombstone_key`, `crates/ravel-commit/src/keys.rs`). It does
+   this once the bucket's latest event time is before now minus the
+   tenant's retention window R (`is_expired` and `write_tombstone`,
+   `crates/ravel-maintain/src/retention.rs`).
+2. `inv.py retention-cutoff` chooses R from the corpus. It reads the
+   latest event time in batch K and in batch K + 1 of the strided load. The
+   cutoff is the first whole second past batch K's latest event, and R is
+   now minus that cutoff. It refuses when batch K + 1's latest event is
+   before that cutoff, since the same R would expire it too. It also
+   refuses a cutoff that is not in the past.
+3. run.sh starts `ravel-server --mode maintain --disable-fold
+   --retention-tenant dp7=Rs --maintain-interval-secs
+   retired_hour.maintain_interval_secs`. Its token file names `dp7` alone,
+   so retention applies to no other tenant.
+4. Every interval, run.sh lists the store and runs `inv.py
+   tombstone-check`. It continues once the store holds `retire.tmb` keys
+   for exactly hours D0 to D0 + K of `dp7`'s logs. If that has not happened
+   after `retired_hour.wait_minutes`, the state fails.
+
+**How the fold reconciles it.** A `catalog fold` from ravel-cli passes no
+retention window (`fold_core` is called with `None`,
+`services/ravel-cli/src/catalog.rs`). The on-demand fold does pass one:
+`POST /api/v1/admin/fold` (`services/ravel-server/src/fold_on_demand.rs`)
+uses the server's retention for the tenant. So run.sh starts a
+`--mode query` server with the same `--retention-tenant` and
+`--fold-key-index-leaves`, and `inv.py admin-fold` folds through it. That
+fold's retention-frontier reconcile re-lists the hours R behind the
+watermark, where the tombstones are (`crates/ravel-catalog/src/fold.rs`,
+"Retention-frontier reconcile").
+
+The on-demand fold's response includes these fields: status, watermark
+hours, buckets folded, entry count, parts total, LIST, GET and PUT counts.
+It carries no key-index field, no `head_digest` and no `retired_hours`. The
+figures those fields would feed read `unsupported-on-this-build`, naming
+that response ("Unsupported figures in these rows").
+
+**Why the local smoke lists none of them.** These states are pinned on the
+s3 lane's dry run instead (`test_new_states_dry_run_plan` and the four
+cases under "Tests"), for three reasons:
+
+- The committed fixture is a real run, and adding a state to it means
+  re-running the smoke with release binaries and pyarrow. This change was
+  made on a machine without either. `--refresh-local-smoke` re-evaluates the
+  existing run; it does not re-run it.
+- Each advance waits up to `run.mixed_wait_max_minutes` (70) for the next
+  ingest hour, once per state, on top of the smoke's own wait.
+- `retired_hour` waits for maintain retention: up to
+  `retired_hour.wait_minutes` (20) per step, twice.
+
 ### Placeholders
 
 A statement's SQL names planted keys as `{placeholders}`, filled from
@@ -409,7 +556,21 @@ records what the warmup loaded.
 `max_minutes`), `[corpus]` (gen_corpus.py's `traces`, `hours`, `seed`,
 `spans_per_trace`, `logs_per_trace`), `[server]` (`tenant`, `shards`,
 `memory_budget_bytes`, `extra_flags`), `[hits]`, `[many_parts]`
-(`traces_per_hour`, `snapshot_part_max_entries`), `[prices]` and `[cost]`.
+(`traces_per_hour`, `snapshot_part_max_entries`), `[day_parts]`
+(`traces_per_day_7`, `traces_per_day_30`), `[retired_hour]` (`c1_sha`,
+`r2_sha`, `maintain_interval_secs`, `wait_minutes`), `[prices]` and
+`[cost]`.
+
+`[day_parts]` is read only when `run.states` lists a `day_parts_N` state.
+The 7-day rate defaults to 19,999,992 traces a day, which is 24 x 833,333:
+box D's 20,000,000 a day rounded to a multiple of 24 so every hour holds
+the same count. The 30-day rate is 4,000,008, which is 24 x 166,667: a
+fifth of that rate, rounded the same way. The amendment calls for a reduced
+rate there but names no figure, so the fifth is this harness's choice. Its
+reason for reducing: 30 days at box D's rate cost about 4 hours of fold and
+about 20 hours of corpus generation.
+`[retired_hour]` is read only when `run.states` lists `retired_hour`.
+`c1_sha` is required. An empty `r2_sha` means R2 has not landed.
 
 `[server] extra_flags` is a list of extra `ravel-server` command-line
 flags, appended verbatim after `--memory-budget-bytes` on every server
@@ -449,7 +610,7 @@ reports `missing stamps/<name>` for any it needs and does not find;
 | `declare.json` | each tenant's declared columns and key index, as `typed-attr-column show` printed them |
 | `tenants.json` | the tenants the run loaded and their store prefixes |
 | `loads.jsonl` | one line per load (hour, tenant, signal): exit code, ingest hour and the load report |
-| `folds.jsonl` | one line per fold (transition, tenant, signal): exit code, the `--json` report, wall time, CPU seconds and peak RSS |
+| `folds.jsonl` | one line per fold (transition, tenant, signal): exit code, the `--json` report, wall time, CPU seconds and peak RSS; an on-demand fold's line carries `source = "admin_fold"` and the response as its report |
 | `census.jsonl` | one line per state: object count and bytes per tenant, signal and key class, listed from the store |
 | `transitions.jsonl` | one line per state entered: when, and in which ingest hour |
 | `restarts.jsonl` | one line per cold call: the server pid, the cache-drop result and the warmup |
@@ -458,6 +619,9 @@ reports `missing stamps/<name>` for any it needs and does not find;
 | `STATE.SIG.kidx.json` | `inspect kidx` of one leaf, when the state has leaves |
 | `STATE.SIG.tenant.txt` | `typed-attr-column show` at that state |
 | `STATE.server.json` | the server binary's sha256 and its flags |
+| `STATE.SIG.day_parts.json` | `day_parts_N` and its advance: the catalog stamp per part (`min_hour`, `max_hour`, UTC `day`, `one_day`, `entry_count`, `slices` per field), the HEAD `watermark_hour`, the `days` held and `part_count` |
+| `retired_hour.logs.fold_binary.json` | the fold binary's `sha`, run.toml's `c1_sha` and `r2_sha` resolved, and `carries_c1` and `carries_r2` by git ancestry |
+| `STATE.logs.tombstone.json` | `retired_hour` and `retired_hour_drop`: the tombstoned `hour` (D0) and `first_hour` to `last_hour` in unix hours, the retention window and the tombstone-check output |
 | `needle_blocks.json` | the logs needles' block counts as `rlog inspect` reads them, beside the generator's |
 | `compaction.jsonl`, `erasure.jsonl`, `not_run.jsonl` | the compaction child's reports, the erase submit and status, and each state recorded not-run |
 | `failed_states.jsonl` | each state a failed command stopped: the step, the command's exit code and the `out/logs/` path of its log |
@@ -798,8 +962,9 @@ pre-registered table and W1 to W8 and F1 to F3 of the added rows, keyed
 ADR label in `adr_row`, and its `check`, `target`, `miss` and `source`
 cells are the ADR's cells verbatim. The summary names these rows by their
 ADR label (`ADR-3939 row W5`), and `not requested` lists them after
-ADR-3692's rows. Every row runs on the run's tenant (`inv`) and on one of
-three states the harness-state amendment adds:
+ADR-3692's rows. Each row runs on one of the three states the
+harness-state amendment adds, and on that state's tenant (`dp7` or `dp30`,
+"day_parts_N and retired_hour"):
 
 | State | Rows |
 |---|---|
@@ -812,18 +977,20 @@ W5, F2 and F3 for the 30-day one. A1 to A4, A6 and W1 measure an advance
 or a fold at a full-day tail, which the 7-day state is the first to hold,
 so they run there too.
 
-The three states are registered, not built: `box/run.sh` has no step for
-them yet (task H1b, #4048). A run without them reports every figure of
-these rows `not-run` with `states ['day_parts_7'] not run: day_parts_7:
-not in run.toml states` (or the state it lacks), and the states section
-lists each as `not-run (not in run.toml states)`; the rows are not
-requested, so they leave no run incomplete. H1b sends each multi-day
-state's calls before its fold under temp `prefold` (the unfolded
-baselines of A6, W4 and F2) and after it cold. evaluate.py has no rule
-that names `prefold`: the try count and the oracle test a call's temp for
-`warm` (and the in-flight checks for `inflight`), so a `prefold` call is
-held to `cold_runs` tries and judged as a cold one by falling through
-those tests, and a `prefold.*` figure reads the `prefold` group only.
+`box/run.sh` builds the three states only when `run.states` lists them,
+and `run.example.toml` lists none of them. A run without them reports every
+figure of these rows `not-run` with `states ['day_parts_7'] not run:
+day_parts_7: not in run.toml states` (or the state it lacks), and the
+states section lists each as `not-run (not in run.toml states)`. The rows
+are not requested, so they leave no run incomplete.
+
+Each `day_parts_N` state sends its calls under temp `prefold` before its
+fold (the unfolded baselines of A6, W4 and F2), and cold after it. A
+`prefold` call is a cold call in every respect but its group. It follows a
+server restart, which `restarts.jsonl` stamps with `temp = "prefold"`. It
+is held to `cold_runs` tries. Like the cold calls, it is judged against
+`truth.json`'s answers for the state's own corpus (planned with `--sub
+day_parts_N`). A `prefold.*` figure reads the `prefold` group only.
 
 New statements, cold only, on the states their rows need:
 `logs_request_in_100_7d` (A5, W4) and `logs_request_in_100_30d` (A7, W5),
@@ -831,9 +998,10 @@ the 100-key `request_id` list over the 7 and 30 days; `logs_request_in_1_7d`
 (W6), one key; and `logs_request_in_1_midnight` (W7), one key from the hour
 that spans a UTC midnight (23:30 to 00:30, so it reads the two day parts
 either side of it), with window `midnight` and truth key
-`midnight.request_id.1`. The run records the midnight call `not-run` until
-`truth.json` carries that key (H1b): `box/lib/inv.py plan` checks
-`requires = "midnight"` before it computes a window. 4 leaf GETs alone
+`midnight.request_id.1`. `inv.py midnight-truth` writes that key for
+`dp7`'s corpus ("day_parts_N and retired_hour"). When no row qualifies, the
+key is left out, and the run records the midnight call `not-run`: `box/lib/inv.py
+plan` checks `requires = "midnight"` before it computes a window. 4 leaf GETs alone
 would also hold for a window that read one day part, so W7 also pins the
 calls' `keyIndex.partsCovered` to exactly 2 (lowest and highest across the
 tries) and `partsUncovered` to 0. The six row-18 lookups also run on
@@ -849,10 +1017,12 @@ A day part's bound for 100 keys is T(S) + 100, with T(S) = S × (1 − (1 −
 two leaf GET figures of `logs_request_in_100_30d`: `leaf_gets_per_part`,
 the largest per-part leaf GET count of any cold call, at most T(S) + 100,
 and `leaf_gets`, the largest total of any cold call, at most 30 × (T(S) +
-100). evaluate.py reads no per-part breakdown from the stats, so
-`leaf_gets_per_part` reads `unsupported-on-this-build` ("stats carry no
-per-part breakdown") in both rows on every run, whatever the build reports;
-judging it needs evaluate.py to read the breakdown first. A7's total is 30 times
+100). The stats carry no per-part breakdown. `key_index_json`
+(`crates/ravel-sql/src/stats_json.rs`) writes `keyIndex` totals and no
+`keyIndex.perPart`. So `leaf_gets_per_part` reads
+`unsupported-on-this-build` ("stats carry no keyIndex.perPart breakdown")
+in both rows on every run. Judging it needs a server that writes the field
+and an evaluate.py that reads it. A7's total is 30 times
 the bound, not the parts held times it: the 30-day state holds 30 day
 parts, and a state holding any other number is not that state, so A7's
 `leaf_gets` is `not-run` there (it carries `parts_held == 30` in its
@@ -881,11 +1051,23 @@ a miss: the binary figure is `not-run` with the binary's SHA and what it
 carries, the other W2 figures are `not-run` naming it, and all of them are
 listed under `not requested` with that reason, so a run on the R2 build
 holding `retired_hour` for W3 and W8 is neither failed nor left incomplete
-by W2. No build writes the stamp yet, so the binary figure is
-`unsupported-on-this-build` ("no stamps/retired_hour.logs.fold_binary.json
-on this build (task H1b, #4048, writes it)"). W3's tombstoned hour and
-retired-hour resolve read `stamps/retired_hour.logs.tombstone.json` and
-`stamps/retired_hour.logs.retired_resolve.json` the same way.
+by W2.
+
+`state_retired_hour` writes the stamp with `inv.py fold-binary` before its
+first tombstone, and fails the state when the stamp cannot be written. The
+stamp records the binary's SHA (run.toml `box.sha`, or the checkout's
+HEAD), with `c1_sha` and `r2_sha` resolved in the checkout that built it.
+`carries_c1` is true when `git merge-base --is-ancestor c1_sha sha` holds,
+and `carries_r2` the same for `r2_sha`. An empty `r2_sha` gives `false`. A
+SHA that names no commit (the binary's, `c1_sha`, or a non-empty `r2_sha`)
+fails the state. In a run where `retired_hour` is live, an absent stamp is
+`missing`.
+
+W3's tombstoned hour reads `stamps/retired_hour.logs.tombstone.json` the
+same way. W3's retired-hour resolve (`retired_hour_segments`) reads
+`unsupported-on-this-build` on every run: no harness command lists the
+segments one ingest hour resolves to after a fold. Neither ravel-cli nor
+the server has one.
 
 ### W3's drop and W8's retired hours
 
@@ -895,9 +1077,9 @@ report (transition `retired_hour_drop`), and `drop_parts_holding_hour`, the
 number of parts in the catalog stamp taken after that fold
 (`stamps/retired_hour_drop.logs.catalog.json`) whose hour range holds the
 tombstoned hour, which must be 0. A drop fold that drops nothing writes no
-PUT either, and misses on that count. No build writes either stamp yet, so
-it reads `unsupported-on-this-build`, naming the absent stamp; a stamp
-with no HEAD, a part count that disagrees with the parts listed, or a part
+PUT either, and misses on that count. `state_retired_hour` writes both
+stamps, so an absent one is `missing`, naming it. So is a stamp with no
+HEAD, a part count that disagrees with the parts listed, or a part
 without a `LO..=HI` range is `missing`.
 
 W8's two folds each report `retired_hours`, and each must equal `[h]` for
@@ -916,15 +1098,33 @@ report lacks them, and `sealed_day_leaf_puts`,
 `key_index_part_puts`, `head_digest`, `switch_off_partition_changed` and
 `retired_hours` (A1 to A4, W1 to W3, W8), which no build writes yet; the per-part leaf GETs (A7, W5, F3);
 `stats.keyIndex.leafRoundTrips` (W6); `io.s3SlowDownResponses` (F3); and
-the four H1b stamps above.
+W3's `retired_hour_segments` (above).
+
+The `retired_hour` and `retired_hour_drop` folds are on-demand folds. Their
+response (`services/ravel-server/src/fold_on_demand.rs`) carries none of
+the fold fields above, nor `leaves_written`, `leaf_bytes` or
+`key_index_ranged_gets`. So every W2, W3 and W8 figure read from those
+folds is `unsupported-on-this-build` on every run, with the reason "the
+on-demand fold response ... carries no FIELD":
+
+- W2's `previous_leaf_gets`, `unchanged_section_gets` and `leaf_bytes`
+- W3's part PUTs and leaf PUTs (the `retired_hour` fold and the drop fold)
+  and `retired_hours`
+- W8's two HEAD digests and two `retired_hours`, and the derived figures
+  that compare them
+
+Only W2's binary figure, W3's tombstoned hour and W3's
+`drop_parts_holding_hour` read real values. Those come from stamps. Each
+unsupported field needs the on-demand fold response to carry the
+`FoldReport` field of the same name.
 
 Every ADR-3939 figure, counter or timing, leaves the run incomplete when
 it has no value to judge (`unsupported-on-this-build`, `refused-by-guard`,
 `refused` or `missing`), as row 18's do, rather than letting the run pass
 without it: a fold report that lacks a field these rows read, or a
 per-part figure evaluate.py does not read, shows as incomplete, never as
-a pass. Until H1b supplies those figures, a run holding a multi-day state
-is therefore incomplete.
+a pass. A run holding a multi-day state is therefore incomplete until the
+server and the fold report carry those fields.
 
 ## Unsupported on this build
 
@@ -1154,18 +1354,24 @@ row, with no S floor in W5, or with `not_run_unless` never consulted),
 at S 26 while the total holds, a missing breakdown is unsupported, and A7's
 total is `not-run` at 29 parts; fails with W5's per-part figure held to
 the 30-day total or A7 judged on 29 parts),
-`test_w2_requires_pre_r2_binary_stamp` (no stamp, C1 with R2, no C1, no
-SHA, and C1 without R2; an R2 or no-C1 binary is `not-run`, not requested,
-with no W2 miss and nothing incomplete; fails with W2 judged on any binary,
-the binary read off C1 alone, an R2 binary scored a miss, or a stamp
-figure's `not-run` left off `not_requested`),
+`test_w2_requires_pre_r2_binary_stamp` (no stamp or no SHA: the binary
+figure missing and the rest `not-run`; C1 with R2 and no C1: `not-run`, not
+requested, with no W2 miss and nothing incomplete; C1 without R2 passes;
+fails with W2 judged on any binary, the binary read off C1 alone, an R2
+binary scored a miss, or a stamp figure's `not-run` left off
+`not_requested`),
 `test_w3_drop_leaves_head` (a part `96..=119` left after the drop misses
 for tombstoned hour 100, its removal passes, an absent drop stamp is
-unsupported, a stamp with no HEAD or a short part list missing; fails with
-the count fixed at 0 or the band reading `v >= 0`),
+missing naming it, a stamp with no HEAD or a short part list missing;
+fails with the count fixed at 0 or the band reading `v >= 0`),
 `test_w8_retired_hours_are_the_tombstoned_hour` (both folds `[]` miss, `[h]`
 passes, empty A4 and W8 digests miss; fails with the refold's band reading
 `v == v` or A4's refold digest `v is not None`),
+`test_on_demand_fold_figures_unsupported` (every `fold.` figure of W2, W3
+and W8 read from an on-demand fold response is unsupported naming
+`fold_on_demand.rs`, while the binary, tombstone and drop stamps beside
+them keep their values; fails with the on-demand response read as the CLI
+fold's report, where the absent fields read missing),
 `test_w7_reads_two_day_parts` (1 covered part, a third part or an uncovered
 one each miss at 4 leaf GETs; fails with `parts_covered_max` reading
 `v >= 2`) and `test_row_18_timing_rows_leave_run_incomplete` (A6's six p50
@@ -1173,6 +1379,43 @@ cells, W4's, F1's and F2's unsupported, and W4's unsupported leaf GETs, a
 counter, each leave the run incomplete; fails with ADR-3939 figures left off
 the incomplete list). `test_adr3939_rows_run_on_their_states`
 pins each row's state (fails with A5 moved off `day_parts_7`).
+
+The three harness states have box cases of their own, each run against the
+wrong version named after it and shown failing (the flip is printed with
+the file and line it changes):
+
+- `test_day_parts_state_ends_before_the_current_hour`: `inv.py
+  day-parts-window` returns N whole UTC days ending before the current hour
+  at hours 0, 1 and 23 of a day and at the next midnight, for N 7 and 30,
+  and refuses an end day that reaches the current hour. Wrong
+  versions: the refusal reading `end > now_hour` ("a window ending at the
+  current hour accepted"), and the default last day computed as
+  `now_hour // 24 - 1` ("the default last day reaching the current hour at
+  midnight").
+- `test_day_parts_fold_builds_every_day_once`: one stride check over all
+  24N batches per signal, prefold calls before the fold, one `catalog fold --writers-stopped --key-index-leaves` per
+  signal, a second fold for day_parts_7 only, one fold per advance, and
+  `inv.py day-parts` splitting the catalog stamp one entry per day. Wrong
+  version: the state's fold without `--key-index-leaves` ("the state's fold
+  without the leaf switch").
+- `test_retired_hour_tombstones_hour_zero_only`: retired_hour retires
+  ingest hour D0 and nothing later, `retention-cutoff` expires batch 0 and
+  not batch 1, and `tombstone-check` accepts exactly the hours asked. Wrong
+  versions: `retire_through retired_hour 1` ("hours 0 and 1 retired"),
+  `tombstone-check` reading `not want <= got` ("more tombstoned hours than
+  asked accepted"), and `retention_window`'s refusal of a cutoff past
+  batch 1's latest event removed ("a cutoff that expires the next batch
+  too").
+- `test_retired_hour_stamps_fold_binary_sha`: `inv.py fold-binary` writes
+  `{sha, carries_c1, carries_r2}` by git ancestry on a scratch repository,
+  an empty `r2_sha` reads false, an unresolvable SHA writes no stamp, the
+  stamp precedes the first tombstone in the dry run, and run.sh refuses a
+  retired_hour with no `c1_sha` or no day_parts_7 before it. Wrong version:
+  `carries_r2` falling back to C1 when `r2_sha` is empty ("an empty r2_sha
+  read as carried").
+- `test_new_states_dry_run_plan`: the s3 lane's dry run with all three
+  states listed, every step pinned in order. Wrong version: the drop
+  retiring through hour 22 ("the drop leaving the day's last hour").
 
 The box scripts target bash 3.2 as well as 5: run
 `/path/to/bash-3.2 benchmarks/investigations/investigations.test.sh` and

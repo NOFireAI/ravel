@@ -35,6 +35,20 @@ Subcommands:
                             before the load (reads it through pyarrow, the
                             corpus generator's own dependency; every other
                             subcommand is stdlib only)
+  day-parts-window          a day_parts_N state's N whole UTC days, ending
+                            before the current hour
+  midnight-truth            add the midnight lookup (one request_id within
+                            30 minutes of the window's first midnight) to a
+                            day-parts corpus's truth.json (pyarrow)
+  retention-cutoff          the retention window that expires one strided
+                            batch's ingest bucket and not the next (pyarrow)
+  tombstone-check           the hours a census lists retire.tmb keys for
+  fold-binary               the retired_hour fold binary's SHA and whether it
+                            carries run.toml's c1_sha and r2_sha
+  day-parts-stamp           entries and slices per day part from a state's
+                            catalog stamp
+  admin-fold                POST /api/v1/admin/fold, retrying a throttled
+                            answer
 
 Every failure exits non-zero with one line on stderr.
 """
@@ -687,6 +701,8 @@ def placeholders(truth, run):
         p[f"jc_cut_ns_{k}"] = str(jc["cut_ns"])
     if truth.get("erasure_victim"):
         p["erasure_victim_rid"] = truth["erasure_victim"]["request_id"]
+    if truth.get("midnight"):
+        p["midnight_request_ids_1"] = f"'{truth['midnight']['request_id']}'"
     return p
 
 
@@ -708,6 +724,9 @@ def window_bounds(st, truth, run, ingest_shift_ns):
     w = st.get("window", "none")
     if w == "none":
         return None, None
+    if w == "midnight":
+        mid = truth["midnight"]
+        return (mid["window_start_ns"] + ingest_shift_ns) / 1e9, (mid["window_end_ns"] + ingest_shift_ns) / 1e9
     gen = truth["generator"]
     if st.get("anchor", "trace") == "cell":
         cell = truth["failing_cell"]
@@ -746,7 +765,9 @@ def cmd_plan(args):
     with no restart between. A state this build cannot reach
     (--unsupported-reason) plans one unsupported line per statement. --temp
     inflight plans every try as an in-flight call: no restart, no warm
-    repeat (the compaction_in_flight state)."""
+    repeat (the compaction_in_flight state). --temp prefold plans every try
+    as a prefold call: a cold call (restart first) sent before the state's
+    fold, with no warm repeat (the day_parts_N states' unfolded reference)."""
     doc = load_toml(args.statements)
     truth = json.load(open(args.truth)) if args.truth else None
     hits = load_corpus(args.hits_corpus) if args.hits_corpus else {}
@@ -779,6 +800,8 @@ def cmd_plan(args):
             continue
         if args.temp == "inflight":
             temps = [("inflight", i) for i in range(args.runs)]
+        elif args.temp == "prefold":
+            temps = [("prefold", i) for i in range(args.runs)]
         else:
             temps = [("cold", i) for i in range(args.runs)]
             if not st.get("cold_only", True):
@@ -1218,12 +1241,18 @@ def stride_refusal(ends_ns, batch_rows, start_hour, stride, lag_ns, batches):
     its latest event time is not before that hour's end plus the lag. Also
     refuses a file that deals other than `batches` batches, since each batch
     is one of the state's hours."""
-    dealt = -(-len(ends_ns) // batch_rows)
+    maxima = [max(ends_ns[i * batch_rows:(i + 1) * batch_rows]) for i in range(-(-len(ends_ns) // batch_rows))]
+    return stride_refusal_maxima(maxima, len(ends_ns), batch_rows, start_hour, stride, lag_ns, batches)
+
+
+def stride_refusal_maxima(maxima, rows, batch_rows, start_hour, stride, lag_ns, batches):
+    """stride_refusal over each batch's latest event time, so a file too large
+    to hold as a list is checked from its streamed per-batch maxima."""
+    dealt = len(maxima)
     if dealt != batches:
-        return (f"the corpus deals {dealt} batches of {batch_rows} rows ({len(ends_ns)} rows), not the "
+        return (f"the corpus deals {dealt} batches of {batch_rows} rows ({rows} rows), not the "
                 f"{batches} strided ingest hours the state loads")
-    for i in range(dealt):
-        top = max(ends_ns[i * batch_rows:(i + 1) * batch_rows])
+    for i, top in enumerate(maxima):
         hour = start_hour + i * stride
         bound = (hour + 1) * HOUR_NS + lag_ns
         if top >= bound:
@@ -1241,21 +1270,332 @@ def cmd_stride_check(args):
     file, a null event time), which run.sh records as a failed state, and
     64 on a bad argument. Exit 1 means refused and nothing else."""
     try:
-        import pyarrow.parquet as pq
+        import pyarrow.compute  # noqa: F401
+        import pyarrow.parquet  # noqa: F401
     except ImportError as e:
         die(f"stride-check: {e}", 70)
     if args.batch_rows < 1:
         die("stride-check: --batch-rows must be at least 1", 64)
     try:
-        col = pq.read_table(args.parquet, columns=[args.event_column]).column(0)
-        ends = [int(v) for v in col.cast("int64").to_pylist()]
-    except Exception as e:  # pyarrow raises its own error types; None fails int()
+        maxima, rows = batch_maxima(args.parquet, args.event_column, args.batch_rows)
+    except Exception as e:  # pyarrow raises its own error types
         die(f"stride-check: {args.parquet}: {e}", 70)
-    why = stride_refusal(ends, args.batch_rows, args.ingest_hour_start, args.stride, args.lag_ns, args.batches)
+    why = stride_refusal_maxima(maxima, rows, args.batch_rows, args.ingest_hour_start, args.stride, args.lag_ns,
+                                args.batches)
     if why:
         print(why)
         sys.exit(1)
-    print(json.dumps({"batches": args.batches, "batch_rows": args.batch_rows, "rows": len(ends)}))
+    print(json.dumps({"batches": args.batches, "batch_rows": args.batch_rows, "rows": rows}))
+
+
+def batch_maxima(parquet, column, batch_rows):
+    """([latest event time of each batch_rows-row batch, in file order], rows),
+    streamed record batch by record batch: a multi-day corpus has more rows
+    than a Python list holds comfortably. A null event time raises."""
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    maxima, rows = [], 0
+    for rb in pq.ParquetFile(parquet).iter_batches(columns=[column], batch_size=1 << 16):
+        arr = rb.column(0).cast("int64")
+        if arr.null_count:
+            raise ValueError(f"column {column} holds a null event time")
+        off = 0
+        while off < len(arr):
+            i = rows // batch_rows
+            take = min(len(arr) - off, (i + 1) * batch_rows - rows)
+            top = pc.max(arr.slice(off, take)).as_py()
+            if i == len(maxima):
+                maxima.append(top)
+            else:
+                maxima[i] = max(maxima[i], top)
+            off += take
+            rows += take
+    return maxima, rows
+
+
+# --- ADR-3939's multi-day states (task H1b, #4048) ---------------------------
+
+
+def day_parts_window(days, now_hour, end_day=None):
+    """The hour-stride window of a day_parts_N state: N whole UTC days, the
+    last ending before the current hour. Hours are unix hours, the index
+    part ranges and ingest_hour_bucket count in. The loader refuses a
+    window whose start plus its batches reaches the current ingest hour
+    (services/ravel-cli/src/load/hour_stride.rs, "is not below the current
+    ingest hour"), so this refuses the same window first. end_day (the last
+    day, in unix days) defaults to the latest whole day that passes."""
+    if days < 1:
+        raise ValueError(f"--days {days} is not a positive day count")
+    if end_day is None:
+        end_day = (now_hour - 1) // 24 - 1
+    start = (end_day - days + 1) * 24
+    end = start + 24 * days
+    if end >= now_hour:
+        raise ValueError(f"{days} days ending with day {end_day} run to hour {end}, which is not below the "
+                         f"current ingest hour {now_hour}: the strided load would refuse it")
+    return {"days": days, "start_hour": start, "hours": 24 * days, "end_hour": end, "last_day": end_day,
+            "now_hour": now_hour}
+
+
+def cmd_day_parts_window(args):
+    """Print a day_parts_N state's window as JSON; exit 1 with the reason when
+    the window is not strictly before the current hour."""
+    now = args.now_hour if args.now_hour is not None else int(time.time()) // 3600
+    try:
+        print(json.dumps(day_parts_window(args.days, now, args.end_day), sort_keys=True))
+    except ValueError as e:
+        die(f"day-parts-window: {e}")
+
+
+MIDNIGHT_HALF_NS = HOUR_NS // 2
+
+
+def cmd_midnight_truth(args):
+    """Add the midnight lookup to a day-parts corpus's truth.json: the
+    request_id of the logs row nearest the first UTC midnight of the window
+    (start_hour + 24) within 30 minutes of it, that is no planted id (the
+    present and absent ids, every in_lists request_id), and that occurs
+    exactly once. Writes truth.midnight and the answer midnight.request_id.1
+    in place; with no such row, midnight is null and the plan records the
+    statement not-run through requires = "midnight"."""
+    try:
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+    except ImportError as e:
+        die(f"midnight-truth: {e}", 70)
+    with open(args.truth) as f:
+        truth = json.load(f)
+    gen = truth["generator"]
+    hour = gen["start_hour"] + 24
+    m = hour * HOUR_NS
+    planted = {truth["request_id"]["present"], truth["request_id"]["absent"]}
+    for ids in truth["in_lists"]["request_id"].values():
+        planted.update(ids)
+    path = os.path.join(args.corpus, "logs.parquet")
+    best = None
+    try:
+        for rb in pq.ParquetFile(path).iter_batches(columns=["ts", "request_id"], batch_size=1 << 16):
+            ts = rb.column(0).cast("int64")
+            near = pc.and_(pc.greater_equal(ts, m - MIDNIGHT_HALF_NS), pc.less(ts, m + MIDNIGHT_HALF_NS))
+            if not pc.any(near).as_py():
+                continue
+            for t, rid in zip(ts.filter(near).to_pylist(), rb.column(1).filter(near).to_pylist()):
+                if rid is None or rid in planted:
+                    continue
+                key = (abs(t - m), rid)
+                if best is None or key < best[0]:
+                    best = (key, t, rid)
+        count = 0
+        if best is not None:
+            for rb in pq.ParquetFile(path).iter_batches(columns=["request_id"], batch_size=1 << 16):
+                count += pc.sum(pc.equal(rb.column(0), best[2])).as_py() or 0
+    except Exception as e:  # pyarrow raises its own error types
+        die(f"midnight-truth: {path}: {e}", 70)
+    if best is None:
+        truth["midnight"] = None
+    else:
+        if count != 1:
+            die(f"midnight-truth: request_id {best[2]} occurs {count} times, not once", 70)
+        truth["midnight"] = {"hour": hour, "request_id": best[2], "ts_ns": best[1],
+                             "window_start_ns": m - MIDNIGHT_HALF_NS, "window_end_ns": m + MIDNIGHT_HALF_NS}
+        truth["answers"]["midnight.request_id.1"] = {"rows": 1, "row_set": [best[2]]}
+    write_json(args.truth, truth)
+    print(json.dumps(truth["midnight"], sort_keys=True))
+
+
+def max_event_of_batch(parquet, column, batch_rows, k):
+    maxima, _ = batch_maxima(parquet, column, batch_rows)
+    if k + 1 >= len(maxima):
+        raise ValueError(f"the corpus deals {len(maxima)} batches; batch {k + 1} does not exist")
+    return maxima[k], maxima[k + 1]
+
+
+def retention_window(max_k_ns, max_next_ns, now_s):
+    """(cutoff_s, R_s) for a retention window that expires the bucket holding
+    batch k and not the one holding batch k+1. ravel-maintain tombstones a
+    bucket once its latest event time is before now - R (is_expired,
+    crates/ravel-maintain/src/retention.rs), so the cutoff is the first
+    whole second past batch k's latest event. Refused when batch k+1's latest
+    event is before that cutoff: the same window would expire it too."""
+    cutoff_s = -(-(max_k_ns + 1) // 1_000_000_000)
+    if max_next_ns < cutoff_s * 1_000_000_000:
+        raise ValueError(f"the next batch's latest event {max_next_ns} ns is before the cutoff {cutoff_s} s, so "
+                         "a window expiring this batch would expire the next one too")
+    if cutoff_s >= now_s:
+        raise ValueError(f"the cutoff {cutoff_s} s is not in the past (now {now_s} s)")
+    return cutoff_s, now_s - cutoff_s
+
+
+def cmd_retention_cutoff(args):
+    """Print {cutoff_s, retention_s, max_event_ns, next_max_event_ns} for the
+    retention window that tombstones ingest bucket K of a strided load (the
+    file's batch K) and no later one; exit 1 with the reason when none
+    exists, 70 when the file could not be read."""
+    try:
+        top, nxt = max_event_of_batch(args.parquet, args.event_column, args.batch_rows, args.batch)
+    except ValueError as e:
+        die(f"retention-cutoff: {e}")
+    except Exception as e:  # pyarrow raises its own error types
+        die(f"retention-cutoff: {args.parquet}: {e}", 70)
+    now = args.now_s if args.now_s is not None else int(time.time())
+    try:
+        cutoff, r = retention_window(top, nxt, now)
+    except ValueError as e:
+        die(f"retention-cutoff: {e}")
+    print(json.dumps({"batch": args.batch, "cutoff_s": cutoff, "retention_s": r, "max_event_ns": top,
+                      "next_max_event_ns": nxt, "now_s": now}, sort_keys=True))
+
+
+def hour_index(stamp):
+    """Unix hours of a YYYYMMDDTHH key segment (ingest_hour_string,
+    crates/ravel-commit/src/keys.rs), the index part ranges count in."""
+    t = datetime.datetime.strptime(stamp, "%Y%m%dT%H").replace(tzinfo=datetime.timezone.utc)
+    return int(t.timestamp()) // 3600
+
+
+def tombstoned_hours(keys_lines, tenant_hash, signal_code):
+    """Hours (unix hours) of every retire.tmb key the census lists for one
+    tenant and signal: t/<hash>/<signal>/c/<shard>/<YYYYMMDDTHH>/retire.tmb."""
+    hours = set()
+    for line in keys_lines:
+        key = line.rstrip("\n").split("\t")[-1]
+        parts = key.split("/")
+        if (len(parts) == 7 and parts[0] == "t" and parts[1] == tenant_hash and parts[2] == signal_code
+                and parts[3] == "c" and parts[6] == "retire.tmb"):
+            hours.add(hour_index(parts[5]))
+    return hours
+
+
+def cmd_tombstone_check(args):
+    """Exit 0 printing the tombstoned hours when the census lists retirement
+    tombstones for exactly hours [--first, --last] of the tenant's signal;
+    exit 1 naming the difference otherwise (none yet, or more than asked)."""
+    try:
+        with open(args.keys) as f:
+            got = tombstoned_hours(f, args.tenant_hash, args.signal_code)
+    except (OSError, ValueError) as e:
+        die(f"tombstone-check: {args.keys}: {e}", 70)
+    want = set(range(args.first, args.last + 1))
+    print(json.dumps({"hours": sorted(got), "want_first": args.first, "want_last": args.last}))
+    if got != want:
+        die(f"tombstone-check: tombstoned hours {sorted(got)} are not exactly {args.first}..={args.last}")
+
+
+def git_commit(repo, ref):
+    """The full SHA ref names in repo, or None when it names no commit."""
+    if not ref:
+        return None
+    r = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def git_is_ancestor(repo, ancestor, sha):
+    r = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", ancestor, sha], capture_output=True)
+    if r.returncode not in (0, 1):
+        raise ValueError(f"git merge-base --is-ancestor {ancestor} {sha} exited {r.returncode}")
+    return r.returncode == 0
+
+
+def fold_binary(repo, sha, c1, r2):
+    """{sha, carries_c1, carries_r2} of the retired_hour fold binary: whether
+    its SHA descends from run.toml's c1_sha and r2_sha. An empty r2_sha is
+    a fix not landed yet, so false. Raises when the binary's SHA or c1_sha
+    names no commit, or r2_sha is set and names none."""
+    full = git_commit(repo, sha)
+    if full is None:
+        raise ValueError(f"the fold binary's SHA {sha!r} names no commit in {repo}")
+    c1_full = git_commit(repo, c1)
+    if c1_full is None:
+        raise ValueError(f"retired_hour.c1_sha {c1!r} names no commit in {repo}")
+    r2_full = None
+    if r2:
+        r2_full = git_commit(repo, r2)
+        if r2_full is None:
+            raise ValueError(f"retired_hour.r2_sha {r2!r} names no commit in {repo}")
+    return {"sha": full, "c1_sha": c1_full, "r2_sha": r2_full or "",
+            "carries_c1": git_is_ancestor(repo, c1_full, full),
+            "carries_r2": bool(r2_full) and git_is_ancestor(repo, r2_full, full)}
+
+
+def cmd_fold_binary(args):
+    try:
+        doc = fold_binary(args.repo, args.sha, args.c1, args.r2)
+    except ValueError as e:
+        die(f"fold-binary: {e}")
+    write_json(args.out, doc)
+
+
+def day_parts(doc):
+    """Per catalog part of a catalog stamp: its first and last hour (unix
+    hours), its UTC day, entry count and leaves (slices) per field."""
+    out = []
+    for p in doc.get("parts", []):
+        lo = hi = None
+        a, sep, b = str(p.get("range")).partition("..=")
+        if sep and a.isdigit() and b.isdigit():
+            lo, hi = int(a), int(b)
+        slices = {}
+        for leaf in p.get("leaves", []):
+            slices[leaf.get("field")] = slices.get(leaf.get("field"), 0) + 1
+        out.append({"index": p.get("index"), "min_hour": lo, "max_hour": hi,
+                    "day": lo // 24 if lo is not None else None,
+                    "one_day": lo is not None and lo // 24 == hi // 24,
+                    "entry_count": p.get("entry_count"), "slices": slices})
+    return out
+
+
+def cmd_day_parts_stamp(args):
+    """stamps/STATE.LABEL.day_parts.json from the state's catalog stamp: the
+    HEAD watermark hour and, per part, min_hour, max_hour, day, entry_count
+    and slices per field."""
+    src = os.path.join(args.stamps, f"{args.state}.{args.label}.catalog.json")
+    try:
+        with open(src) as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        die(f"day-parts-stamp: {src}: {e}")
+    parts = day_parts(doc)
+    write_json(os.path.join(args.stamps, f"{args.state}.{args.label}.day_parts.json"),
+               {"state": args.state, "label": args.label,
+                "watermark_hour": (doc.get("head") or {}).get("watermark_hour"),
+                "days": sorted({p["day"] for p in parts if p["day"] is not None}),
+                "parts": parts, "part_count": len(parts)})
+
+
+# Statuses of POST /api/v1/admin/fold (FoldOutcome,
+# services/ravel-server/src/fold_on_demand.rs). Throttled is retried.
+ADMIN_FOLD_DONE = ("published", "nothing_eligible")
+
+
+def cmd_admin_fold(args):
+    """POST /api/v1/admin/fold for the tenant the auth file names, retrying
+    a throttled answer every --retry-s up to --tries times. Writes the last
+    response body (JSON) to --out; exit 0 on published or nothing_eligible,
+    1 on any other status, HTTP error or exhausted retries."""
+    with open(os.path.join(args.auth_dir, f"{args.tenant}.auth")) as f:
+        name, _, value = f.read().strip().partition(": ")
+    body = json.dumps({"signal": args.signal}).encode()
+    doc = None
+    for attempt in range(args.tries):
+        req = urllib.request.Request(args.server.rstrip("/") + "/api/v1/admin/fold", data=body, method="POST",
+                                     headers={name: value, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=args.timeout) as r:
+                doc = json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            write_json(args.out, {"http_status": e.code, "body": e.read().decode(errors="replace")})
+            die(f"admin-fold: HTTP {e.code}")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            die(f"admin-fold: {e}")
+        doc["attempts"] = attempt + 1
+        if doc.get("status") != "throttled":
+            break
+        time.sleep(args.retry_s)
+    write_json(args.out, doc)
+    if doc.get("status") not in ADMIN_FOLD_DONE:
+        die(f"admin-fold: status {doc.get('status')!r} after {doc.get('attempts')} attempts")
 
 
 def cmd_kv_report(args):
@@ -1430,7 +1770,7 @@ def main():
     p.add_argument("--ingest-shift-ns", type=int, default=0)
     p.add_argument("--sub", help="read placeholders and truth keys from truth.json sub.<SUB>")
     p.add_argument("--tenant", help="run every statement against this tenant (many_parts_N)")
-    p.add_argument("--temp", choices=["cold", "inflight"], default="cold")
+    p.add_argument("--temp", choices=["cold", "inflight", "prefold"], default="cold")
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_plan)
 
@@ -1471,6 +1811,58 @@ def main():
     sc.add_argument("--stride", type=int, default=1)
     sc.add_argument("--lag-ns", type=int, default=MAX_INGEST_LAG_NS)
     sc.set_defaults(fn=cmd_stride_check)
+
+    dw = sub.add_parser("day-parts-window")
+    dw.add_argument("--days", type=int, required=True)
+    dw.add_argument("--now-hour", type=int, help="default: the current unix hour")
+    dw.add_argument("--end-day", type=int, help="the last day, in unix days (default: the latest that passes)")
+    dw.set_defaults(fn=cmd_day_parts_window)
+
+    mn = sub.add_parser("midnight-truth")
+    mn.add_argument("--corpus", required=True, help="the gen_corpus output directory (logs.parquet)")
+    mn.add_argument("--truth", required=True, help="that corpus's truth.json, rewritten in place")
+    mn.set_defaults(fn=cmd_midnight_truth)
+
+    rc = sub.add_parser("retention-cutoff")
+    rc.add_argument("--parquet", required=True)
+    rc.add_argument("--event-column", default="ts")
+    rc.add_argument("--batch-rows", type=int, required=True)
+    rc.add_argument("--batch", type=int, required=True, help="K: the strided load's batch (ingest bucket) to expire")
+    rc.add_argument("--now-s", type=int, help="default: the current unix second")
+    rc.set_defaults(fn=cmd_retention_cutoff)
+
+    tc = sub.add_parser("tombstone-check")
+    tc.add_argument("--keys", required=True, help="census keys file (size<TAB>key per line)")
+    tc.add_argument("--tenant-hash", required=True)
+    tc.add_argument("--signal-code", default="l")
+    tc.add_argument("--first", type=int, required=True, help="first tombstoned hour wanted, unix hours")
+    tc.add_argument("--last", type=int, required=True)
+    tc.set_defaults(fn=cmd_tombstone_check)
+
+    fb = sub.add_parser("fold-binary")
+    fb.add_argument("--repo", required=True)
+    fb.add_argument("--sha", required=True)
+    fb.add_argument("--c1", required=True)
+    fb.add_argument("--r2", default="")
+    fb.add_argument("--out", required=True)
+    fb.set_defaults(fn=cmd_fold_binary)
+
+    dps = sub.add_parser("day-parts-stamp")
+    dps.add_argument("--stamps", required=True)
+    dps.add_argument("--state", required=True)
+    dps.add_argument("--label", required=True)
+    dps.set_defaults(fn=cmd_day_parts_stamp)
+
+    af = sub.add_parser("admin-fold")
+    af.add_argument("--server", required=True)
+    af.add_argument("--auth-dir", required=True)
+    af.add_argument("--tenant", required=True)
+    af.add_argument("--signal", default="logs")
+    af.add_argument("--tries", type=int, default=20)
+    af.add_argument("--retry-s", type=float, default=30)
+    af.add_argument("--timeout", type=float, default=3600)
+    af.add_argument("--out", required=True)
+    af.set_defaults(fn=cmd_admin_fold)
 
     kv = sub.add_parser("kv-report")
     kv.add_argument("--log", required=True)
