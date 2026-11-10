@@ -1274,15 +1274,25 @@ This is the parallel bucket spill amendment. The figures are from epic
    with the first attempt's repartition settings (`session.rs:658`,
    `with_repartition_aggregations`, and `session.rs:698`, round-robin
    repartition), with `BucketedFinalAggregateRule` installed whatever
-   `SqlConfig::bucketed_final_aggregation` says, and with the tuning
-   ADR-3565's bucket spill amendment derives. That plan is kept when all of
-   these hold:
+   `SqlConfig::bucketed_final_aggregation` says. The rule is installed at a
+   placeholder tuning, ADR-3565 decision 1's defaults, because the tuning
+   ADR-3565's bucket spill amendment derives needs `P` (item 5) and the
+   spill-capable consumer count `C`, and both are read from this plan. The
+   order is: plan at the placeholder, read `P` and `C` from the plan,
+   derive, then set the derived tuning on each `BucketedFinalAggregateExec`
+   by a plan transform that rebuilds only those nodes. A transform rather
+   than a re-plan, so the plan that runs is the plan `P` and `C` were read
+   from; the placeholder plan never executes. ADR-3565's bucket spill
+   amendment, item 4, states the steps, and T3 #4075 pins the order. That
+   plan is kept when all of these hold:
    - every `AggregateExec` in it with mode `FinalPartitioned` was replaced
      by a `BucketedFinalAggregateExec`, which is to say
      `BucketedFinalAggregateRule::admits` (`bucketed_final_aggregate.rs:171`)
      accepted each one;
    - every `RepartitionExec` in it has `preserve_order` false;
-   - the bucket spill amendment's derivation returns a tuning.
+   - the bucket spill amendment's derivation returns a tuning, which
+     includes its descriptor budget on bucket files (that amendment,
+     item 1).
 
    Otherwise the retry is planned as today, repartition-free
    (`repartition_free`, `session.rs:737`), and spills through the sort
@@ -1421,18 +1431,27 @@ This is the parallel bucket spill amendment. The figures are from epic
 
 T3 (#4075) runs the M8 gate on the three ClickBench boxes. Every row is a
 prediction made before the code exists; T3 pre-registers it on #4072 with
-these bands before it runs.
+these bands before it runs. Each figure must be present exactly once and
+inside its band; anything else is a miss, so no row leaves a gap between
+its band and its miss. The null rows compare against the M7 build,
+c752b054a, run on the same machine (run
+`m7-main-c752b054a-20261110T0800Z`). The row 33 rows assume the bucketed
+retry runs, which on c6a.2xlarge needs a soft `nofile` limit of at least
+4,096 at 4 slots (ADR-3565 bucket spill amendment, items 1 and 4); T3
+stamps each box's limit beside its run.
 
 | figure | band | miss | basis |
 |---|---|---|---|
-| null answers, 43 statements x 3 tries, on each of c6a.large, c6a.xlarge and c6a.2xlarge | 0 | 1 or more | predicted: every statement today's retry answers still answers; the residual risk is the under-shoot of ADR-3565's bucket spill item 5, which fails typed and would show here as a null |
+| statements newly null against build c752b054a's M7 run on the same box, 43 statements x 3 tries, on each of c6a.xlarge and c6a.2xlarge | 0 | 1 or more | measured 2026-11-10 (run `m7-main-c752b054a-20261110T0800Z`): both boxes answered all 43 statements x 3 tries in every arm, so on them every null is a new one |
+| statements newly null against build c752b054a's M7 run on the same box, 43 statements x 3 tries, c6a.large | 0 | 1 or more | predicted; M7 basis pending: build c752b054a's c6a.large run has not reported, and T3 judges this row only against that run once it has |
+| null answers, absolute count, 43 statements x 3 tries, on each of c6a.large, c6a.xlarge and c6a.2xlarge | 0 | 1 or more | predicted: every statement today's retry answers still answers; the residual risk is the under-shoot of ADR-3565's bucket spill item 5 (rate miss times skew above 2), which fails typed and would show here as a null |
 | hot time per statement v0.28.0 answered, against published v0.28.0 | at most 1.10x | above 1.10x on any statement | predicted: the first attempt is unchanged, and every statement outside item 1 keeps today's retry |
 | concurrent QPS, c6a.large | at least 0.123 (0.90 x 0.137) | below 0.123 | predicted: the floor allows for the first attempt being unchanged |
 | concurrent QPS, c6a.xlarge | at least 0.209 (0.90 x 0.232) | below 0.209 | predicted: 3 and 5 retries wrote 9.9 and 15.6 GB, and row 33's part of that falls to its write-once bytes |
 | concurrent QPS, c6a.2xlarge | at least 0.430 (0.90 x 0.478) | below 0.430 | predicted: 8 and 10 retries wrote 51 and 58 GB on the volume the local object store shares; the first attempt's 8 GB hold on rows 19, 34 and 35 is unchanged, so this row can miss for a cause this amendment does not address |
-| row 33 hot time, c6a.2xlarge | at most 40 s | above 40 s | predicted: about 5.2 GB of routed state before compression (100M rows x 52 B, ADR-3565 amendment 1) at the 3.76 lz4_frame ratio measured on the integer-keyed row 33 fixture (refusal-retry decision item 2) is about 1.4 GB, written once and read once, about 12 s at 240 MB/s, against 8.5 GB written per try today; the first attempt's time to refusal is added unchanged |
-| row 33 `bucket_spill_bytes_written`, c6a.2xlarge | 1.0 to 2.0 GB | above 5.3 GB, the bound of ADR-3565's bucket spill item 2 | predicted: as the row above; between 2.0 and 5.3 GB the compression assumption missed and the bound held |
-| row 33 `exchange_spill_bytes_written`, c6a.2xlarge | at most 1% of `bucket_spill_bytes_written` | above 10% | predicted: unique keys hash evenly, so the distributor gate (item 2) stalls the producers before a channel outgrows its share |
+| row 33 hot time, c6a.2xlarge | at most 40 s | above 40 s | predicted, from today's run measured 2026-11-10 in M7 (run `m7-main-c752b054a-20261110T0800Z`, statement fingerprint da3d31a73eb29b30): the first attempt is refused after 2.6 to 4.0 s (`first_refusal_after_ms` 2588 to 4013 over 9 tries), then the sort-merge retry runs to a total of 80.8 to 82.3 s, writing 8.51 to 8.55 GB per try; at 240 MB/s writing 8.53 GB takes 35.5 s and reading it back about as long, which with the first attempt accounts for most of that total. The bar is first attempt + scan + spill. First attempt, unchanged: at most 4.0 s. The bucketed exec's scan and aggregation: q33's hot time on c6a.4xlarge is 3.133 s (ADR-3565 decision 6, min of tries 2 and 3 on `fullmain-20261031T1700Z`) and the bucketed exec's wall was 1.004 of it (ADR-3565 amendment 1), so at half the vCPUs about 2 x 3.133 x 1.004 = 6.3 s. Spill, written once: 5.2 GB of routed state before compression (100M rows x 52 B, ADR-3565 amendment 1) at the 3.76 lz4_frame ratio measured on the integer-keyed row 33 fixture (refusal-retry decision item 2) is 1.38 GB, 1.38 / 0.24 = 5.8 s to write, and at most 5.8 s more to read back when the page cache does not hold it. Sum: 2.6 + 6.3 + 5.8 + 0 = 14.7 s to 4.0 + 6.3 + 5.8 + 5.8 = 21.9 s. The 40 s bar is about 1.8 x the upper sum, which leaves room for the scan scaling worse than linearly with vCPUs and for phase 2 losing its overlap with the scan, and is still under half of today's 80.8 s |
+| row 33 `bucket_spill_bytes_written`, c6a.2xlarge | 1.0 to 2.0 GB | below 1.0 GB or above 2.0 GB; above 5.3 GB is also a breach of the bound of ADR-3565's bucket spill item 2 | predicted: as the row above; the gap up to 5.3 GB is made a miss rather than widened, because a figure there means the compression prediction failed even though the bound held |
+| row 33 `exchange_spill_bytes_written`, c6a.2xlarge | at most 1% of `bucket_spill_bytes_written` | above 1% | predicted: unique keys hash evenly, so the distributor gate (item 2) stalls the producers before a channel outgrows its share; the gap up to the earlier 10% miss line is made a miss rather than widened, because the prediction is that the exchange barely spills, and a figure above 1% means the gate did not hold the producers back |
 
 ### Parallel bucket spill consequences
 
