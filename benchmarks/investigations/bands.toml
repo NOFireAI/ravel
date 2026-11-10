@@ -29,8 +29,13 @@
 #                 stamp.slices.<label>.<field> the most leaves one part
 #                                             carries for the field
 #                 stamp.fold_binary_pre_r2|tombstoned_hour|
-#                   retired_hour_segments.<label>  the stamps task H1b
-#                                             (#4048) writes; unsupported
+#                   retired_hour_segments.<label>  the stamps the
+#                                             retired_hour state writes;
+#                                             fold_binary_pre_r2 and
+#                                             tombstoned_hour read missing
+#                                             while absent, and
+#                                             retired_hour_segments reads
+#                                             unsupported
 #                                             while absent
 #                 leaf_share.<label>.<field>  that field's leaf bytes over the
 #                                             label's census data bytes, in %
