@@ -120,11 +120,12 @@ else
   not_ok "changes step: edit under crates/ravel-ingest/ sets all four areas" "got '${got}'"
 fi
 
-# FLIP: drop the step's `promql) promql_area=true ;;` arm, or the promql
-# lane from the guard's lanes_for_closure, and an edit confined to
-# crates/ravel-ingest/ leaves promql_area false: no path rule sets it there,
-# though ravel-promql-difftest depends on ravel-ingest and its required check
-# would be skipped.
+# FLIP: drop the step's `promql) promql_area=true ;;` arm and the step exits
+# 1 on the map's promql lane as an unknown lane; drop promql from the map's
+# ingest row and promql_area reads false, since no path rule sets it for an
+# edit confined to crates/ravel-ingest/ though ravel-promql-difftest depends
+# on ravel-ingest. The guard's own promql arm is pinned by the check cases
+# below, whose stubbed workspace holds ravel-promql-difftest.
 promql_for() {
   local out="${TMP}/github-output-promql" rc=0
   : >"${out}"
@@ -203,6 +204,8 @@ pkg() {
   printf ','
   pkg ravel-agents-sim crates/ravel-agents-sim
   printf ','
+  pkg ravel-promql-difftest crates/ravel-promql-difftest ravel-ingest
+  printf ','
   pkg ravel-server services/ravel-server ravel-sql ravel-ingest
   printf ']}\n'
 } >"${TMP}/metadata.json"
@@ -221,9 +224,10 @@ chmod +x "${TMP}/bin/cargo"
 GOOD="$(printf '%s\t%s\n' \
   crates/lone - \
   crates/ravel-agents-sim agents \
-  crates/ravel-ingest sql,flight-sql,agents,mcp \
+  crates/ravel-ingest sql,flight-sql,agents,mcp,promql \
+  crates/ravel-promql-difftest promql \
   crates/ravel-sql sql,flight-sql,agents,mcp \
-  crates/ravel-types sql,flight-sql,agents,mcp \
+  crates/ravel-types sql,flight-sql,agents,mcp,promql \
   services/ravel-server sql,flight-sql,agents,mcp)"
 
 # check_map <name> <map-text> <want-exit> <want-substring...>
@@ -248,7 +252,7 @@ check_map() {
 # FLIP: compute lanes from direct dependants only (not the fixed-point
 # closure) and ravel-types, two hops from ravel-server, reaches nothing:
 # exit 1 with four findings on the ravel-types row.
-check_map "a map matching the closure passes" "${GOOD}" 0 "clean (6 crates"
+check_map "a map matching the closure passes" "${GOOD}" 0 "clean (7 crates"
 
 # FLIP: walk the map's rows instead of the workspace's crates and a crate with
 # no row is never asked about: exit 0.

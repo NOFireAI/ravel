@@ -200,13 +200,15 @@ jobs:
           # agents module and seam test, the server manifest that declares the
           # `agents` feature, the two scripts that define the lane, and this
           # workflow. Only ^crates/ravel-agents- is also an area_paths entry
-          # below, so a change confined to the agents crates runs no
-          # object-store-contract, bench-smoke or promql-difftest: those lanes
-          # do not build the agents crates (ravel-server links them only under
-          # `agents`). Whether it runs sql, flight-sql and features-mcp is the
-          # lane-area map's call below: most agents crates are in
-          # ravel-server's dependency tree, ravel-agents-sim and
-          # ravel-agents-client are not. The
+          # below, so no path rule here runs object-store-contract or
+          # bench-smoke for a change confined to the agents crates: those lanes
+          # do not build them (ravel-server links them only under `agents`).
+          # Whether it runs sql, flight-sql, features-mcp and promql-difftest
+          # is the lane-area map's call below, from each crate's
+          # reverse-dependency closure: ravel-agents-core reaches all four,
+          # ravel-agents-runtime and ravel-agents-store all but
+          # promql-difftest, ravel-agents-sim and ravel-agents-client none
+          # of them. The
           # other paths here set server_or_operator, take the workspace-level
           # branch, or are the catch-all on purpose (a gate script change must
           # run everything).
