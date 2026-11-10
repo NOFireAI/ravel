@@ -2713,9 +2713,7 @@ async fn check_key_case(case: KeyCase) {
         let groups = (case.modulus as usize).min(SAMPLES as usize);
         let scaled = scaled(PHASE_1, (2 * groups, SAMPLES as usize));
         Trigger {
-            cap_at_two: scaled
-                .cap_at_two
-                .max(STREAM_FLOOR * case.partitions / 2),
+            cap_at_two: scaled.cap_at_two.max(STREAM_FLOOR * case.partitions / 2),
             ..scaled
         }
     } else {
