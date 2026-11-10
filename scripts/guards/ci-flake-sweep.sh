@@ -8,9 +8,21 @@
 #
 #   1. Lists the failed ci.yml runs of the last 24 h on merge_group and on
 #      push to main.
-#   2. Fetches each failed job's log and extracts test identifiers with the
-#      grep assert-green-head.sh uses (read out of that script at run time,
-#      so the two cannot diverge).
+#   2. Fetches each failed job's log and extracts test identifiers. The
+#      ledger is repository-wide, so an identifier names the crate as well
+#      as the test: two crates often define a test of the same path.
+#      - nextest's result line `FAIL [ time] (n/m) <binary-id> <test>` (also
+#        TIMEOUT, ABORT and SIG*) gives `<binary-id> <test>`, for example
+#        `ravel-codec::fuzz_mutation arbitrary_bytes_never_panic`.
+#      - libtest's lines, matched with the grep assert-green-head.sh uses
+#        (read out of that script at run time, so the two cannot diverge),
+#        carry no crate. A test path a nextest line in the same job already
+#        names is dropped; any other is qualified with the failed job's name
+#        as `[<job name>] <test>`.
+#      A failed job whose non-empty log yields no identifier (a compile
+#      error, a step that is not a test runner, an output format this does
+#      not read) prints one line naming the run, job id and job name, and is
+#      counted in the summary line: the ejection is in no issue's ledger.
 #   3. Files or updates ONE issue per identifier, labelled flaky-test, found
 #      by the deterministic title "flaky-test: <identifier>". The issue body
 #      carries one ledger line per failed run that named the identifier; a
@@ -35,11 +47,18 @@
 #   CI_FLAKE_SWEEP_RETRY_DELAY_S  seconds between gh read retries (default 5)
 #
 # Exit codes:
-#   0   swept; no overdue flake-quarantine-due issue
+#   0   swept; no overdue flake-quarantine-due issue (the summary line still
+#       counts failed jobs no identifier was read from)
 #   1   an open flake-quarantine-due issue is overdue with no pull request
 #   2   a gh call failed; nothing can be said (this is not a clean run)
 #   64  usage
-#   70  assert-green-head.sh's identifier grep could not be located
+#   70  could not run, and the message says which of three causes:
+#       - jq is not installed;
+#       - assert-green-head.sh, or its one identifier grep, could not be
+#         located (the anchor moved);
+#       - the decision for one identifier failed, most likely an issue body
+#         whose hand-edited "- failure run=... at=..." line does not parse
+#         as a date.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -126,8 +145,10 @@ gh_retry() {
   done
 }
 
-# Writes are tried once: a create that failed after the server stored it would
-# be duplicated by a retry, and the next sweep re-reads the list anyway.
+# Writes are tried once, through gh_once: a create that failed after the
+# server stored it would be duplicated by a retry, and the next sweep re-reads
+# the list anyway. The exception is `issue edit`, which goes through gh_retry:
+# it replaces the whole body and adds a label, so a repeat changes nothing.
 gh_once() {
   local rc=0
   gh "$@" </dev/null >"${tmpdir}/gh.out" 2>"${tmpdir}/gh.err" || rc=$?
@@ -143,15 +164,22 @@ could_not_ask() {
   exit 2
 }
 
-# Turns the grep's matches into test identifiers. `error[E...]` and a bare
-# `assertion failed` name no test, and a thread name outside [A-Za-z0-9_:]
-# (a runtime worker) or `main` is not one either.
+# Turns the grep's matches into libtest test paths. `error[E...]` and a bare
+# `assertion failed` name no test, a thread name outside [A-Za-z0-9_:] (a
+# runtime worker) or `main` is not one either, and the `FAILED [...]`
+# alternative matches no nextest output (nextest prints `FAIL [`).
 normalize_ids() {
   LC_ALL=C sed -n \
     -e 's/^test \([A-Za-z0-9_:]*\) \.\.\. FAILED$/\1/p' \
-    -e "s/^thread '\{0,1\}\([A-Za-z0-9_:]*\)'\{0,1\}\( ([0-9]*)\)\{0,1\} panicked\$/\1/p" \
-    -e 's/^FAILED \[[^]]*\] \([A-Za-z0-9_:]*::[A-Za-z0-9_:]*\)$/\1/p' |
+    -e "s/^thread '\{0,1\}\([A-Za-z0-9_:]*\)'\{0,1\}\( ([0-9]*)\)\{0,1\} panicked\$/\1/p" |
     awk 'NF && $0 != "main"' | LC_ALL=C sort -u
+}
+
+# nextest's per-test result line, the one line that names the binary (crate)
+# as well as the test. A `TRY n` prefix or a `LEAK-` one leaves the match as is.
+NEXTEST_PATTERN='(FAIL|TIMEOUT|ABORT|SIG[A-Z0-9]+) \[[^]]*\]( \([0-9]+/[0-9]+\))? [A-Za-z0-9_:/.-]+ [A-Za-z0-9_:]+'
+nextest_ids() {
+  LC_ALL=C sed -E 's/^[^]]*\]( \([0-9]+\/[0-9]+\))? ([^ ]+) ([^ ]+)$/\2 \3/' | LC_ALL=C sort -u
 }
 
 esc="$(printf '\033')"
@@ -182,25 +210,45 @@ for event in merge_group push; do
   }
 done
 
+run_count=0
+empty_logs=0
+unread_jobs=0
 while IFS=$'\t' read -r run_id created event url; do
   [[ -z "${run_id}" ]] && continue
+  run_count=$((run_count + 1))
   gh_retry run view "${run_id}" --json jobs >"${tmpdir}/jobs.json" || could_not_ask
-  job_ids="$(jq -r '.jobs[]? | select(.conclusion == "failure") | .databaseId' "${tmpdir}/jobs.json" 2>/dev/null)" || {
+  failed_jobs="$(jq -r '.jobs[]? | select(.conclusion == "failure") | [.databaseId, (.name // "")] | @tsv' "${tmpdir}/jobs.json" 2>/dev/null)" || {
     echo "ci-flake-sweep.sh: gh run view ${run_id} returned unreadable JSON" >&2
     could_not_ask
   }
   : >"${tmpdir}/run-ids.txt"
-  for job_id in ${job_ids}; do
+  while IFS=$'\t' read -r job_id job_name; do
+    [[ -z "${job_id}" ]] && continue
     gh_retry run view --job "${job_id}" --log-failed >"${tmpdir}/job.log" || could_not_ask
     if [[ ! -s "${tmpdir}/job.log" ]]; then
       echo "ci-flake-sweep.sh: run ${run_id} job ${job_id}: empty failed log; no identifier read from it" >&2
+      empty_logs=$((empty_logs + 1))
       continue
     fi
     # Colour codes first, as assert-green-head.sh does: the SGR sequence ends
     # in a letter and would otherwise glue itself to the token.
-    LC_ALL=C sed "s/${esc}\\[[0-9;]*[A-Za-z]//g" "${tmpdir}/job.log" |
-      { grep -aoE "${ID_PATTERN}" || true; } | normalize_ids >>"${tmpdir}/run-ids.txt"
-  done
+    LC_ALL=C sed "s/${esc}\\[[0-9;]*[A-Za-z]//g" "${tmpdir}/job.log" >"${tmpdir}/job.clean"
+    { grep -aoE "${NEXTEST_PATTERN}" "${tmpdir}/job.clean" || true; } | nextest_ids >"${tmpdir}/job-nextest.txt"
+    { grep -aoE "${ID_PATTERN}" "${tmpdir}/job.clean" || true; } | normalize_ids >"${tmpdir}/job-libtest.txt"
+    {
+      cat "${tmpdir}/job-nextest.txt"
+      JOB_NAME="${job_name}" awk '
+        FILENAME == ARGV[1] { sub(/^[^ ]* /, ""); named[$0] = 1; next }
+        !($0 in named) { print "[" ENVIRON["JOB_NAME"] "] " $0 }
+      ' "${tmpdir}/job-nextest.txt" "${tmpdir}/job-libtest.txt"
+    } >"${tmpdir}/job-ids.txt"
+    if [[ ! -s "${tmpdir}/job-ids.txt" ]]; then
+      echo "ci-flake-sweep.sh: run ${run_id} job ${job_id} (${job_name}): no identifier read from a non-empty failed log; this failure is in no issue's ledger"
+      unread_jobs=$((unread_jobs + 1))
+      continue
+    fi
+    cat "${tmpdir}/job-ids.txt" >>"${tmpdir}/run-ids.txt"
+  done <<<"${failed_jobs}"
   LC_ALL=C sort -u "${tmpdir}/run-ids.txt" | while IFS= read -r id; do
     printf '%s\t%s\t%s\t%s\t%s\n' "${id}" "${run_id}" "${created}" "${event}" "${url}"
   done >>"${occurrences}"
@@ -252,6 +300,8 @@ def ledger: (. // "") | gsub("\r"; "") | split("\n")
   elif $issue == null then
     {action: "create", title: $title, add_due: $add_due,
      body: ("Test `\($id)` failed in a ci.yml run on merge_group or on push to main.\n\n"
+       + "The identifier is the nextest binary id and test name, or, for a job whose log had only libtest output, "
+       + "the name of the failed job in brackets and the test path.\n\n"
        + "Filed by `scripts/guards/ci-flake-sweep.sh` (ADR-4034). A second failure within 14 days adds `\($due)`; "
        + "a due issue needs an open pull request that references it (a fix, or an `#[ignore]` whose reason names flaky and cites this issue) "
        + "within one working day, or the sweep run fails.\n\n"
@@ -263,15 +313,18 @@ def ledger: (. // "") | gsub("\r"; "") | split("\n")
   end
 '
 
-for id in ${ids}; do
-  awk -F'\t' -v id="${id}" '$1 == id { print $2 "\t" $3 "\t" $4 "\t" $5 }' "${occurrences}" |
+# An identifier holds a space, so the loop reads lines, on fd 3 so that no
+# command in the body can consume the list.
+while IFS= read -r id <&3; do
+  [[ -z "${id}" ]] && continue
+  ID="${id}" awk -F'\t' '$1 == ENVIRON["ID"] { print $2 "\t" $3 "\t" $4 "\t" $5 }' "${occurrences}" |
     jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {run: (.[0] | tonumber), at: .[1], event: .[2], url: .[3]})' \
       >"${tmpdir}/occ.json"
   jq -n --arg id "${id}" --arg prefix "${TITLE_PREFIX}" --arg due "${LABEL_DUE}" \
     --argjson now "${now}" --argjson repeat "${REPEAT_WINDOW_S}" \
     --slurpfile issues "${tmpdir}/issues.json" --slurpfile occs "${tmpdir}/occ.json" \
-    '$occs[0] as $occ | '"${decide_filter}" >"${tmpdir}/decision.json" || {
-    echo "ci-flake-sweep.sh: could not decide for ${id}" >&2
+    '$occs[0] as $occ | '"${decide_filter}" >"${tmpdir}/decision.json" 2>"${tmpdir}/jq.err" || {
+    echo "ci-flake-sweep.sh: could not decide for ${id} (check its issue body's ledger lines): $(head -n 1 "${tmpdir}/jq.err")" >&2
     exit 70
   }
   action="$(jq -r .action "${tmpdir}/decision.json")"
@@ -303,7 +356,12 @@ for id in ${ids}; do
       echo "${id}: updated #${number}$([[ "${add_due}" == "true" ]] && echo " (now ${LABEL_DUE})")"
       ;;
   esac
-done
+done 3<<<"${ids}"
+
+summary() {
+  echo "ci-flake-sweep.sh: ${run_count} failed runs swept, $(grep -c . <<<"${ids}") test identifiers," \
+    "${unread_jobs} failed jobs with no identifier read from a non-empty log, ${empty_logs} with an empty failed log"
+}
 
 # --- 5. overdue quarantines ---------------------------------------------
 
@@ -333,6 +391,7 @@ def weekday_seconds($a; $b):
 
 if [[ -z "${overdue}" ]]; then
   echo "ci-flake-sweep.sh: no ${LABEL_DUE} issue is overdue"
+  summary
   exit 0
 fi
 
@@ -356,4 +415,5 @@ while IFS=$'\t' read -r number title; do
   fi
 done <<<"${overdue}"
 
+summary
 exit "${found}"
