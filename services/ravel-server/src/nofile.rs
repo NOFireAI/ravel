@@ -6,9 +6,12 @@
 //! the soft `RLIMIT_NOFILE`. Service managers and container runtimes commonly
 //! leave the soft limit at 1,024 under a far higher hard limit, so the server
 //! raises its soft limit to the hard limit before anything reads it, and logs
-//! both. After the raise the soft limit is 1,024 only where the hard limit is
-//! too.
+//! both. After a raise the soft limit equals the hard limit. It stays at the
+//! inherited value in two cases: the hard limit is unbounded (Linux refuses an
+//! unbounded soft limit past `fs.nr_open`), or the kernel refuses the raise,
+//! whose errno is kept and logged.
 
+use rustix::io::Errno;
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
 /// The soft and hard `RLIMIT_NOFILE` after the startup raise. `None` is
@@ -21,6 +24,8 @@ pub struct NofileLimit {
     /// already at the hard limit or the hard limit is unbounded, and
     /// `raise-refused` when the kernel refused the raise.
     pub source: &'static str,
+    /// The errno of a refused raise, `None` otherwise.
+    pub refusal: Option<Errno>,
 }
 
 /// The soft limit to ask for: the hard limit when it is finite and above the
@@ -43,6 +48,7 @@ pub fn raise_nofile_soft_limit() -> NofileLimit {
             soft: before.current,
             hard: before.maximum,
             source: "inherited",
+            refusal: None,
         };
     };
     let raised = Rlimit {
@@ -54,11 +60,13 @@ pub fn raise_nofile_soft_limit() -> NofileLimit {
             soft: Some(target),
             hard: before.maximum,
             source: "raised",
+            refusal: None,
         },
-        Err(_) => NofileLimit {
+        Err(errno) => NofileLimit {
             soft: before.current,
             hard: before.maximum,
             source: "raise-refused",
+            refusal: Some(errno),
         },
     }
 }
@@ -81,10 +89,19 @@ impl NofileLimit {
         ]
     }
 
-    /// Log both limits, one line each, in the startup resolution form.
+    /// Log both limits, one line each, in the startup resolution form, and
+    /// the errno of a refused raise.
     pub fn emit(&self) {
         for (setting, value, source) in self.lines() {
             tracing::info!(setting, value, source, "open file limit resolved");
+        }
+        if let Some(errno) = self.refusal {
+            tracing::warn!(
+                setting = "nofile_soft",
+                errno = errno.raw_os_error(),
+                error = %errno,
+                "the kernel refused the open file limit raise"
+            );
         }
     }
 }
@@ -103,19 +120,33 @@ mod tests {
     }
 
     /// The raise leaves this process at its hard limit whenever that limit is
-    /// finite, and reports what it did.
+    /// finite and the kernel accepts the raise, and reports what it did. A
+    /// host that refuses the raise leaves the soft limit where it was and the
+    /// errno in the result.
     #[test]
     fn startup_raises_the_soft_nofile_limit_to_the_hard_limit() {
+        let before = getrlimit(Resource::Nofile);
         let limit = raise_nofile_soft_limit();
         let now = getrlimit(Resource::Nofile);
         assert_eq!(limit.soft, now.current, "{limit:?}");
         assert_eq!(limit.hard, now.maximum, "{limit:?}");
-        if now.maximum.is_some() {
-            assert_eq!(now.current, now.maximum, "{limit:?}");
+        match limit.source {
+            "raise-refused" => {
+                assert!(limit.refusal.is_some(), "{limit:?}");
+                assert_eq!(now.current, before.current, "{limit:?}");
+                let again = raise_nofile_soft_limit();
+                assert_eq!(again.source, "raise-refused", "{again:?}");
+            }
+            "raised" | "inherited" => {
+                assert_eq!(limit.refusal, None, "{limit:?}");
+                if now.maximum.is_some() {
+                    assert_eq!(now.current, now.maximum, "{limit:?}");
+                }
+                let again = raise_nofile_soft_limit();
+                assert_eq!(again.source, "inherited", "a second raise moved {again:?}");
+            }
+            other => panic!("unknown source {other}: {limit:?}"),
         }
-        assert!(["raised", "inherited"].contains(&limit.source), "{limit:?}");
-        let again = raise_nofile_soft_limit();
-        assert_eq!(again.source, "inherited", "a second raise moved {again:?}");
     }
 
     #[test]
@@ -124,6 +155,7 @@ mod tests {
             soft: Some(524_288),
             hard: Some(524_288),
             source: "raised",
+            refusal: None,
         };
         assert_eq!(
             limit.lines(),
@@ -136,6 +168,7 @@ mod tests {
             soft: Some(1024),
             hard: None,
             source: "inherited",
+            refusal: None,
         };
         assert_eq!(unbounded.lines()[1].1, "unlimited");
         assert_eq!(unbounded.soft_or_max(), 1024);

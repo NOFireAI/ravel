@@ -218,7 +218,7 @@ pub use late_materialization::{
 };
 pub use logs_provider::LogsTableProvider;
 pub use logs_pushdown::{LogsPushdown, extract_logs};
-pub use logs_scan::LogsScanExec;
+pub use logs_scan::{LogsScanExec, METRIC_ROWS_CONSUMED};
 #[doc(hidden)]
 pub use logs_scan::values_memo_build;
 pub use logs_schema::{

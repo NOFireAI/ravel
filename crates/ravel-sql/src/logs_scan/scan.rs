@@ -918,6 +918,9 @@ struct ColumnarBlockJob {
     /// [`BlockMetrics::rows_dropped_by_row_filter`], which it adds to.
     row_filters: Option<Arc<BoundRowFilters>>,
     rows_dropped_by_row_filter: Count,
+    /// [`BlockMetrics::rows_consumed`], which the job adds the decoded
+    /// block's rows to.
+    rows_consumed: Count,
     declared: Arc<Vec<DeclaredColumn>>,
     attr_keys: Arc<Vec<String>>,
     full_len: usize,
@@ -965,6 +968,7 @@ impl ColumnarBlockJob {
                 if view.has_attrs_raw_page() {
                     return ColumnarStep::Fallback;
                 }
+                self.rows_consumed.add(view.record_count());
                 let built = self.block.and_then(|block| {
                     build_columnar_batches(
                         &view,
@@ -1584,6 +1588,7 @@ impl LogScanStream {
                 }),
             )?;
             *pos = end;
+            self.blocks.rows_consumed.add(built.num_rows());
             let Some(filters) = &self.row_filters else {
                 break built;
             };
@@ -2316,6 +2321,7 @@ impl LogScanStream {
                                     .blocks
                                     .rows_dropped_by_row_filter
                                     .clone(),
+                                rows_consumed: this.blocks.rows_consumed.clone(),
                                 declared: Arc::clone(&this.declared),
                                 attr_keys: Arc::clone(&this.attr_keys),
                                 full_len: this.full_len,
