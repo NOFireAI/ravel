@@ -356,14 +356,17 @@ drop_page_cache() {
 }
 
 # restart_for LINE: the server restart and page-cache drop before one cold
-# call, then the startup cache warmup's end, stamped with the call's key.
+# or prefold call, then the startup cache warmup's end, stamped with the
+# call's key (and its temp, when the line names one).
 restart_for() {
-  local line="$1" statement state try warm
+  local line="$1" statement state try temp="" warm
   # Regexes with groups live in variables: bash 3.2 cannot parse them inline.
   local re_statement='"statement": "([^"]+)"' re_state='"state": "([^"]+)"' re_try='"try": ([0-9]+)'
+  local re_temp='"temp": "([^"]+)"'
   [[ "$line" =~ $re_statement ]] && statement="${BASH_REMATCH[1]}"
   [[ "$line" =~ $re_state ]] && state="${BASH_REMATCH[1]}"
   [[ "$line" =~ $re_try ]] && try="${BASH_REMATCH[1]}"
+  [[ "$line" =~ $re_temp ]] && temp="${BASH_REMATCH[1]}"
   if [ "$DRY_RUN" = 1 ]; then
     printf 'DRY-RUN: restart the server for %s/%s, drop the page cache, wait for the warmup\n' "$statement" "$state"
     return 0
@@ -375,7 +378,7 @@ restart_for() {
   start_server || fail "server start before $statement/$state/$try"
   warm="$("$PY" "$LIB" warmup --log "$SERVER_LOG" --timeout 300)" || fail "warmup of server $SERVER_N"
   "$PY" "$LIB" stamp --file "$STAMPS/restarts.jsonl" --append statement="$statement" state="$state" \
-    try:="$try" server_n:="$SERVER_N" pid:="$SERVER_PID" cache_drop="$CACHE_DROP" \
+    try:="$try" ${temp:+temp="$temp"} server_n:="$SERVER_N" pid:="$SERVER_PID" cache_drop="$CACHE_DROP" \
     warmup:="$warm" restart_s:="$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.3f", b - a }')" \
     at="$(utc_now)" || fail "stamp restarts.jsonl"
 }
@@ -405,6 +408,18 @@ load_config() {
   SPLIT_BASE="$(cfg run.split_base_load --default false)"
   MP_TPH="$(cfg many_parts.traces_per_hour --default 10)"
   MP_MAX_ENTRIES="$(cfg many_parts.snapshot_part_max_entries --default 1)"
+  # ADR-3939's harness-state amendment ("Two states"): the 7-day state at box
+  # D's logs rate, the 30-day state at a reduced one (README "day_parts_N").
+  DP7_TPD="$(cfg day_parts.traces_per_day_7 --default 19999992)"
+  DP30_TPD="$(cfg day_parts.traces_per_day_30 --default 4000008)"
+  RH_C1="$(cfg retired_hour.c1_sha --default "")"
+  RH_R2="$(cfg retired_hour.r2_sha --default "")"
+  RH_INTERVAL="$(cfg retired_hour.maintain_interval_secs --default 30)"
+  RH_WAIT="$(cfg retired_hour.wait_minutes --default 20)"
+  # The day_parts_N states listed, as "7 30"; DP7_OK is set once day_parts_7
+  # built its tenant, which retired_hour runs on.
+  DP_DAYS=""
+  DP7_OK=0
   TRACES="$(cfg corpus.traces)" || fail "run.toml corpus.traces"
   HOURS="$(cfg corpus.hours)" || fail "run.toml corpus.hours"
   SEED="$(cfg corpus.seed)" || fail "run.toml corpus.seed"
@@ -464,6 +479,23 @@ EOF
         [[ "${s#many_parts_}" =~ ^[1-9][0-9]*$ ]] || fail "run.toml state $s: N must be a positive integer"
         MP_SIZES="$MP_SIZES ${s#many_parts_}"
         TENANTS="$TENANTS mp${s#many_parts_}" ;;
+      day_parts_7 | day_parts_30)
+        local tpd="$DP7_TPD"
+        [ "$s" = day_parts_7 ] || tpd="$DP30_TPD"
+        # --even-hours deals traces / hours to every hour: a whole number only
+        # when the per-day count is a multiple of 24.
+        [[ "$tpd" =~ ^[1-9][0-9]*$ ]] && [ $((tpd % 24)) = 0 ] \
+          || fail "run.toml day_parts.traces_per_day_${s#day_parts_} = $tpd: not a positive multiple of 24"
+        DP_DAYS="$DP_DAYS ${s#day_parts_}"
+        TENANTS="$TENANTS dp${s#day_parts_}" ;;
+      retired_hour)
+        case " $DP_DAYS " in
+          *" 7 "*) ;;
+          *) fail "run.toml run.states: retired_hour runs on the day_parts_7 tenant, so day_parts_7 must come before it" ;;
+        esac
+        [ -n "$RH_C1" ] || fail "run.toml retired_hour.c1_sha is empty: the fold binary stamp needs it"
+        [[ "$RH_INTERVAL" =~ ^[1-9][0-9]*$ ]] || fail "run.toml retired_hour.maintain_interval_secs = $RH_INTERVAL: not a positive whole number"
+        [[ "$RH_WAIT" =~ ^[1-9][0-9]*$ ]] || fail "run.toml retired_hour.wait_minutes = $RH_WAIT: not a positive whole number" ;;
       unfolded | folded_no_leaves | folded_leaves | mixed | advanced_leaves | compaction_in_flight | erasure_in_flight) ;;
       *) fail "run.toml run.states: unknown state $s" ;;
     esac
@@ -651,7 +683,7 @@ mem_total_kb() {
 
 step_corpus() {
   step corpus
-  local h0 extra_traces n subs=() mp="{}"
+  local h0 extra_traces n subs=() mp="{}" dp="{}"
   h0="$(now_hour)"
   CORPUS_H0="$h0"
   extra_traces=$((TRACES / HOURS))
@@ -684,10 +716,43 @@ step_corpus() {
     mp="$("$HOST_PY" -c 'import json, sys; d = json.loads(sys.argv[1]); d[sys.argv[2]] = {"traces": int(sys.argv[3]), "hours": int(sys.argv[2]), "seed": int(sys.argv[4]), "start_hour": int(sys.argv[5]), "ingest_hour_start": int(sys.argv[5]) + 1, "even_hours": True}; print(json.dumps(d))' \
       "$mp" "$n" $((n * MP_TPH)) $((SEED + n)) $((h0 - n - 4)))" || fail "many_parts corpus record"
   done
+  # Each day_parts_N tenant's corpus: N whole UTC days ending before the
+  # current hour (inv.py day-parts-window), traces_per_day_N a day dealt
+  # evenly over its hours, so batch k of the strided load (rows / 24N rows)
+  # holds event hour k alone. The window is computed here, once, and the
+  # state loads it: time only moves forward, so it stays before the hour.
+  local tpd start win
+  for n in $DP_DAYS; do
+    tpd="$DP7_TPD"
+    [ "$n" = 7 ] || tpd="$DP30_TPD"
+    win="$WORK/day-parts-window-$n.json"
+    if [ "$DRY_RUN" = 1 ]; then
+      run "$PY" "$LIB" day-parts-window --days "$n"
+      start="D0_$n"
+    else
+      "$PY" "$LIB" day-parts-window --days "$n" >"$win" 2>&1 || fail_log "day-parts-window $n" "$win"
+      start="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["start_hour"])' "$win")" \
+        || fail "day_parts_$n window start"
+    fi
+    printf -v "DP_START_$n" '%s' "$start"
+    run "$PY" "$INV_DIR/gen_corpus.py" --traces $((tpd * n)) --hours $((24 * n)) --seed $((SEED + 100 + n)) \
+      --even-hours --spans-per-trace "$SPANS_PER" --logs-per-trace "$LOGS_PER" --start-hour "$start" \
+      --format parquet --out "$WORK/corpus-dp$n" >"$WORK/corpus-dp$n.out" 2>&1 \
+      || fail_log "gen_corpus day_parts_$n" "$WORK/corpus-dp$n.out"
+    # The midnight lookup (statements.toml window "midnight") runs in
+    # day_parts_7 only.
+    if [ "$n" = 7 ]; then
+      run "$PY" "$LIB" midnight-truth --corpus "$WORK/corpus-dp$n" --truth "$WORK/corpus-dp$n/truth.json" \
+        >"$WORK/midnight-dp$n.out" 2>&1 || fail_log "midnight-truth day_parts_$n" "$WORK/midnight-dp$n.out"
+    fi
+    subs+=(--sub "day_parts_$n=$WORK/corpus-dp$n/truth.json")
+    dp="$("$HOST_PY" -c 'import json, sys; d = json.loads(sys.argv[1]); d[sys.argv[2]] = {"days": int(sys.argv[2]), "traces_per_day": int(sys.argv[3]), "traces": int(sys.argv[3]) * int(sys.argv[2]), "hours": 24 * int(sys.argv[2]), "seed": int(sys.argv[4]), "start_hour": sys.argv[5] if not sys.argv[5].isdigit() else int(sys.argv[5]), "even_hours": True}; print(json.dumps(d))' \
+      "$dp" "$n" "$tpd" $((SEED + 100 + n)) "$start")" || fail "day_parts corpus record"
+  done
   run "$PY" "$LIB" merge-truth --base "$WORK/corpus/truth.json" ${subs[@]+"${subs[@]}"} --out "$OUT/truth.json" \
     || fail "merge-truth"
   stamp corpus.json traces:="$TRACES" hours:="$HOURS" seed:="$SEED" start_hour:=$((h0 - HOURS)) \
-    tail_traces:="$extra_traces" tail_seed:=$((SEED + 1)) tail_start_hour:="$h0" many_parts:="$mp" \
+    tail_traces:="$extra_traces" tail_seed:=$((SEED + 1)) tail_start_hour:="$h0" many_parts:="$mp" day_parts:="$dp" \
     truth_sha256="$(sha256 "$OUT/truth.json")"
 }
 
@@ -711,6 +776,15 @@ step_declare() {
     || fail_log "typed-attr-column set $TENANT" "$WORK/declare.out"
   run "${CLI[@]}" typed-attr-column show "$TENANT" >"$WORK/declare-show.out" 2>&1 \
     || fail_log "typed-attr-column show" "$WORK/declare-show.out"
+  # Each day_parts_N tenant declares the same key index as the shared one,
+  # before its load, so its fold can build leaves.
+  local n dp_tenants=""
+  for n in $DP_DAYS; do
+    run "${CLI[@]}" typed-attr-column set "dp$n" --from-mapping "$WORK/corpus-dp$n/logs.mapping.toml" \
+      --key-index request_id --index-trace-id true --readers-rolled-out >>"$WORK/declare.out" 2>&1 \
+      || fail_log "typed-attr-column set dp$n" "$WORK/declare.out"
+    dp_tenants="${dp_tenants:+$dp_tenants }dp$n"
+  done
   local hits_show=""
   if [ "$HITS" = true ]; then
     run "${CLI[@]}" typed-attr-column set hits --from-mapping "$HITS_MAPPING" --key-index UserID \
@@ -721,7 +795,7 @@ step_declare() {
   fi
   stamp declare.json tenant="$TENANT" key_index=request_id index_trace_id:=true \
     from_mapping=logs.mapping.toml show="$( [ "$DRY_RUN" = 1 ] || cat "$WORK/declare-show.out")" \
-    hits_key_index="$([ "$HITS" = true ] && echo UserID)" hits_show="$hits_show"
+    hits_key_index="$([ "$HITS" = true ] && echo UserID)" hits_show="$hits_show" day_parts_tenants="$dp_tenants"
 }
 
 # load_signal LABEL SIGNAL CORPUS_DIR TENANT [LOAD_FLAG...]: one measured
@@ -812,20 +886,28 @@ rebuild_leaves() {
   done
 }
 
+# list_store NAME: the store's census into work/census-NAME.json and its keys
+# into work/keys-NAME.tsv, unstamped (census stamps it; retired_hour polls
+# with it).
+list_store() {
+  local name="$1" f="$WORK/census-$1.json"
+  local tenants=(--tenants "$STAMPS/tenants.json" --keys-out "$WORK/keys-$1.tsv")
+  if [ "$LANE" = local ]; then
+    run "$PY" "$LIB" s3 census "${tenants[@]}" --out "$f" || fail "census $name"
+  else
+    run aws s3api list-objects-v2 --region "$REGION" --bucket "$STORE_BUCKET" --output json \
+      >"$WORK/listing-$name.json" || fail_log "list store_bucket for census $name" "$WORK/listing-$name.json"
+    run "$PY" "$LIB" census-listing --listing "$WORK/listing-$name.json" --bucket "$STORE_BUCKET" \
+      "${tenants[@]}" --out "$f" || fail "census $name"
+  fi
+}
+
 # census STATE: the store's census (classes, and per tenant and signal) and,
 # for every $TRIPLES entry, the state's inspect stamps; then the binaries and
 # server flags the state's calls run against.
 census() {
   local state="$1" f="$WORK/census-$1.json" keys="$WORK/keys-$1.tsv" triple tenant sig label ranges
-  local tenants=(--tenants "$STAMPS/tenants.json" --keys-out "$keys")
-  if [ "$LANE" = local ]; then
-    run "$PY" "$LIB" s3 census "${tenants[@]}" --out "$f" || fail "census $state"
-  else
-    run aws s3api list-objects-v2 --region "$REGION" --bucket "$STORE_BUCKET" --output json \
-      >"$WORK/listing-$state.json" || fail_log "list store_bucket for census $state" "$WORK/listing-$state.json"
-    run "$PY" "$LIB" census-listing --listing "$WORK/listing-$state.json" --bucket "$STORE_BUCKET" \
-      "${tenants[@]}" --out "$f" || fail "census $state"
-  fi
+  list_store "$state"
   stamp census.jsonl state="$state" census@="$f"
   for triple in $TRIPLES; do
     IFS=: read -r tenant sig label <<<"$triple"
@@ -877,8 +959,8 @@ record_server_death() {
     || fail "stamp calls.jsonl server_died"
 }
 
-# statements STATE [PLAN_FLAG...]: every planned call of STATE. A cold call
-# follows a server restart; an inflight call (--temp inflight) does not. Past
+# statements STATE [PLAN_FLAG...]: every planned call of STATE. A cold or
+# prefold (--temp prefold) call follows a server restart; an inflight call (--temp inflight) does not. Past
 # the run deadline every remaining call is recorded not-run, unsent. A call
 # whose server died (inv.py call exit 75, and the process is actually gone)
 # is recorded server_died and the loop moves on to the next planned call;
@@ -915,7 +997,7 @@ statements() {
     else
       case "$line" in
         *'"unsupported_reason"'* | *'"not_run_reason"'*) ;;
-        *'"temp": "cold"'*)
+        *'"temp": "cold"'* | *'"temp": "prefold"'*)
           if [ "$(date +%s)" -lt "$deadline" ]; then
             restart_for "$line"
             server_down=0
@@ -1157,6 +1239,200 @@ state_many_parts() {
   return 0
 }
 
+# state_day_parts N: a fresh tenant dpN (spans and logs for 7, logs only for
+# 30) over the N whole UTC days step_corpus chose, one strided ingest hour
+# per batch; its unfolded (prefold) reference calls; one catalog fold
+# --writers-stopped --key-index-leaves, stamped as the state's fold (for 7, a
+# second fold over the same HEAD, row A4); the state's calls; then the
+# advance as the mixed state makes it, a tail hour loaded into the next
+# ingest hour and folded (day_parts_N_advance), stamped.
+state_day_parts() {
+  local n="$1" t="dp$1" st="day_parts_$1" dir="$WORK/corpus-dp$1" saved="$TRIPLES" start_var="DP_START_$1"
+  local start="${!start_var}" sigs="spans logs" sig col rows est why code stride_log label
+  [ "$n" = 7 ] || sigs=logs
+  est="$(estimate_s "$st")" || fail "run.toml step_estimate_minutes.$st"
+  fits "$st" load "$est" || return 0
+  # The loader's own refusal, checked over the whole file first (as
+  # many_parts_N does): exit 1 records the state not-run with it.
+  for sig in $sigs; do
+    col=ts
+    [ "$sig" = logs ] || col=end_ts
+    rows="$(batch_rows "$(corpus_rows "$dir" "$sig")" $((24 * n)))"
+    stride_log="$WORK/stride-check-dp$n-$sig.out"
+    code=0
+    why="$(run "$PY" "$LIB" stride-check --parquet "$dir/$sig.parquet" --event-column "$col" --batch-rows "$rows" \
+      --batches $((24 * n)) --ingest-hour-start "$start" 2>"$stride_log")" || code=$?
+    case "$code" in
+      0) ;;
+      1) not_run "$st" "$sig: $why"; return 0 ;;
+      *) failed_at "stride-check $st/$sig" "$code" "$stride_log"; return 1 ;;
+    esac
+  done
+  stop_server
+  for sig in $sigs; do
+    rows="$(batch_rows "$(corpus_rows "$dir" "$sig")" $((24 * n)))"
+    load_signal "$st" "$sig" "$dir" "$t" --ingest-hour-stride 1 --ingest-hour-start "$start" \
+      --batch-rows "$rows" --target-bytes 1 || return 1
+  done
+  TRIPLES=""
+  for sig in $sigs; do
+    TRIPLES="${TRIPLES:+$TRIPLES }$t:$sig:$sig"
+  done
+  statements "$st" --temp prefold --tenant "$t" --sub "$st"
+  fits "$st" fold "$est" || { TRIPLES="$saved"; return 0; }
+  fold "$st" --key-index-leaves || { TRIPLES="$saved"; return 1; }
+  if [ "$n" = 7 ]; then
+    fits "$st" refold "$est" || { TRIPLES="$saved"; return 0; }
+    fold "${st}_refold" --key-index-leaves || { TRIPLES="$saved"; return 1; }
+  fi
+  transition "$st" "tenant $t: $n days from hour $start, one strided ingest hour per batch, catalog fold --writers-stopped --key-index-leaves"
+  census "$st"
+  for sig in $sigs; do
+    printf 'STAMP stamps/%s.%s.day_parts.json\n' "$st" "$sig"
+    run "$PY" "$LIB" day-parts-stamp --stamps "$STAMPS" --state "$st" --label "$sig" || fail "day-parts-stamp $st/$sig"
+  done
+  statements "$st" --tenant "$t" --sub "$st"
+  [ "$n" != 7 ] || DP7_OK=1
+  # The advance: the state above already measured, so a failure from here on
+  # is the derived state's (as mixed records fold_advance's).
+  STATE="${st}_advance"
+  fits "${st}_advance" "the wait for the next ingest hour" "$((MIXED_WAIT * 60))" || { TRIPLES="$saved"; return 0; }
+  wait_next_hour
+  fits "${st}_advance" load "$est" || { TRIPLES="$saved"; return 0; }
+  stop_server
+  for sig in $sigs; do
+    load_signal "${st}_tail" "$sig" "$WORK/corpus-tail" "$t" || { TRIPLES="$saved"; return 1; }
+  done
+  fits "${st}_advance" fold "$est" || { TRIPLES="$saved"; return 0; }
+  fold "${st}_advance" --key-index-leaves || { TRIPLES="$saved"; return 1; }
+  transition "${st}_advance" "tenant $t: one tail hour loaded into the next ingest hour, then folded with --key-index-leaves"
+  census "${st}_advance"
+  for label in $sigs; do
+    printf 'STAMP stamps/%s_advance.%s.day_parts.json\n' "$st" "$label"
+    run "$PY" "$LIB" day-parts-stamp --stamps "$STAMPS" --state "${st}_advance" --label "$label" \
+      || fail "day-parts-stamp ${st}_advance/$label"
+  done
+  TRIPLES="$saved"
+  return 0
+}
+
+# retired_hour_tokens: a token file naming dp7 alone, so the maintain server
+# below applies retention to no other tenant.
+retired_hour_tokens() {
+  local f="$AUTH_DIR/tokens-dp7"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'DRY-RUN: write %s, the dp7 line of %s\n' "$f" "$TOKEN_FILE" >&3
+  else
+    (umask 077 && grep '=dp7$' "$TOKEN_FILE" >"$f") || return 1
+  fi
+  printf '%s\n' "$f"
+}
+
+# retire_through STATE K: tombstone ingest hours D0..D0+K of dp7's logs (the
+# day_parts_7 load's batches 0..K, D0 the first hour of its oldest day) and
+# nothing later. retention-cutoff picks a retention window that expires
+# batch K and not K+1; a maintain-mode server with that window, its own
+# fold off, writes the tombstones (ravel-maintain retention.rs); the store
+# is listed until it holds exactly those hours' tombstones, at most
+# retired_hour.wait_minutes. Then a query server with the same window runs
+# the on-demand fold (POST /api/v1/admin/fold), which carries that retention
+# into the fold and reconciles the retirement frontier, stamped as STATE's
+# fold, and a second one, STATE_refold. Non-zero (failed_at set) on failure.
+retire_through() {
+  local state="$1" k="$2" d0="$DP_START_7" cut="$WORK/retention-$1.json" r rows tokens hash
+  local tlog="$WORK/tombstone-check-$1.out" deadline code=0 f rflag url="http://127.0.0.1:$HTTP_PORT"
+  rows="$(batch_rows "$(corpus_rows "$WORK/corpus-dp7" logs)" 168)"
+  if [ "$DRY_RUN" = 1 ]; then
+    run "$PY" "$LIB" retention-cutoff --parquet "$WORK/corpus-dp7/logs.parquet" --event-column ts \
+      --batch-rows "$rows" --batch "$k"
+    r=RETENTION_S
+    rflag="dp7=RETENTION_S"
+    url="http://127.0.0.1:HTTP_PORT"
+  else
+    "$PY" "$LIB" retention-cutoff --parquet "$WORK/corpus-dp7/logs.parquet" --event-column ts \
+      --batch-rows "$rows" --batch "$k" >"$cut" 2>&1 || { failed_at "retention-cutoff $state" "$?" "$cut"; return 1; }
+    r="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["retention_s"])' "$cut")" \
+      || { failed_at "retention-cutoff $state" 1 "$cut"; return 1; }
+    rflag="dp7=${r}s"
+  fi
+  tokens="$(retired_hour_tokens)" || { failed_at "dp7 token file $state" 1; return 1; }
+  stop_server
+  start_server maintain "$tokens" --disable-fold --retention-tenant "$rflag" \
+    --maintain-interval-secs "$RH_INTERVAL" || { failed_at "maintain server $state" 1 "$SERVER_LOG"; return 1; }
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'DRY-RUN: census and tombstone-check --first %s --last %s+%s every %s s until it passes, at most %s minutes\n' \
+      "$d0" "$d0" "$k" "$RH_INTERVAL" "$RH_WAIT"
+  else
+    hash="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["dp7"])' "$STAMPS/tenants.json")" \
+      || fail "dp7 hash from tenants.json"
+    deadline=$(($(date +%s) + RH_WAIT * 60))
+    while :; do
+      list_store "$state-poll"
+      code=0
+      "$PY" "$LIB" tombstone-check --keys "$WORK/keys-$state-poll.tsv" --tenant-hash "$hash" --signal-code l \
+        --first "$d0" --last $((d0 + k)) >"$tlog" 2>&1 || code=$?
+      [ "$code" = 0 ] && break
+      [ "$code" = 1 ] || { failed_at "tombstone-check $state" "$code" "$tlog"; return 1; }
+      [ "$(date +%s)" -lt "$deadline" ] || { failed_at "tombstone-check $state (after $RH_WAIT minutes)" 1 "$tlog"; return 1; }
+      sleep "$RH_INTERVAL"
+    done
+  fi
+  stop_server
+  stamp "$state.logs.tombstone.json" state="$state" tenant=dp7 signal=logs hour:="$d0" first_hour:="$d0" \
+    last_hour:="$([ "$DRY_RUN" = 1 ] && echo null || echo $((d0 + k)))" batches:=$((k + 1)) retention_s="$r" \
+    unit="unix hours, the unit catalog part ranges count in" check@="$tlog" cutoff@="$cut"
+  start_server query "$TOKEN_FILE" --retention-tenant "$rflag" --fold-key-index-leaves \
+    || { failed_at "query server $state" 1 "$SERVER_LOG"; return 1; }
+  local report
+  for f in "$state" "${state}_refold"; do
+    code=0
+    rm -f "$WORK/admin-fold-$f.json"
+    run "$PY" "$LIB" admin-fold --server "$url" --auth-dir "$AUTH_DIR" --tenant dp7 \
+      --signal logs --out "$WORK/admin-fold-$f.json" >"$WORK/admin-fold-$f.out" 2>&1 || code=$?
+    # A connection failure writes no response body: the report is null.
+    report="report@=$WORK/admin-fold-$f.json"
+    [ "$DRY_RUN" = 1 ] || [ -f "$WORK/admin-fold-$f.json" ] || report="report:=null"
+    stamp folds.jsonl transition="$f" tenant=dp7 signal=logs kind="admin fold (POST /api/v1/admin/fold)" \
+      source=admin_fold exit:="$code" hour:="$(now_hour)" "$report"
+    [ "$code" = 0 ] || { failed_at "admin fold $f" "$code" "$WORK/admin-fold-$f.out"; return 1; }
+  done
+  stop_server
+  return 0
+}
+
+# state_retired_hour: on the day_parts_7 tenant (dp7: the 7-day state holds
+# the oldest day and the hour-0 part whose retirement the rows measure), the
+# first hour of the oldest day tombstoned and reconciled by a fold
+# (retired_hour); then the rest of that day (retired_hour_drop, row W3).
+# Before either, the fold binary stamp: whether the binary's SHA carries
+# run.toml's c1_sha and r2_sha.
+state_retired_hour() {
+  local saved="$TRIPLES" repo="$INV_DIR" sha est code=0 log="$WORK/fold-binary.out"
+  if [ "$DP7_OK" != 1 ]; then
+    not_run retired_hour "the day_parts_7 state did not build its tenant dp7, which this state runs on"
+    return 0
+  fi
+  est="$(estimate_s retired_hour)" || fail "run.toml step_estimate_minutes.retired_hour"
+  [ "$LANE" != s3 ] || repo="$BOX_ROOT/ravel"
+  sha="${SHA:-$(git -C "$INV_DIR" rev-parse HEAD 2>/dev/null)}"
+  printf 'STAMP stamps/retired_hour.logs.fold_binary.json\n'
+  run "$PY" "$LIB" fold-binary --repo "$repo" --sha "$sha" --c1 "$RH_C1" --r2 "$RH_R2" \
+    --out "$STAMPS/retired_hour.logs.fold_binary.json" >"$log" 2>&1 \
+    || { failed_at "fold-binary retired_hour" 1 "$log"; return 1; }
+  fits retired_hour "maintain retention and fold" "$((RH_WAIT * 60 + est))" || return 0
+  TRIPLES="dp7:logs:logs"
+  retire_through retired_hour 0 || { TRIPLES="$saved"; return 1; }
+  transition retired_hour "tenant dp7: ingest hour $DP_START_7 (hour 0 of the oldest day) tombstoned by maintain retention, then an on-demand fold"
+  census retired_hour
+  STATE=retired_hour_drop
+  fits retired_hour_drop "maintain retention and fold" "$((RH_WAIT * 60 + est))" || { TRIPLES="$saved"; return 0; }
+  retire_through retired_hour_drop 23 || { TRIPLES="$saved"; return 1; }
+  transition retired_hour_drop "tenant dp7: every hour of the oldest day tombstoned by maintain retention, then an on-demand fold"
+  census retired_hour_drop
+  TRIPLES="$saved"
+  return 0
+}
+
 state_unfolded() {
   transition unfolded "base hours loaded, no fold"
   census unfolded
@@ -1245,6 +1521,8 @@ run_state() {
     compaction_in_flight) state_compaction ;;
     erasure_in_flight) state_erasure ;;
     many_parts_*) state_many_parts "${state#many_parts_}" ;;
+    day_parts_7 | day_parts_30) state_day_parts "${state#day_parts_}" ;;
+    retired_hour) state_retired_hour ;;
     *) fail "unknown state $state" ;;
   esac || code=$?
   keep_state_log "$state"
