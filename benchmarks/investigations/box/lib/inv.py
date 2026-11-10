@@ -46,8 +46,8 @@ Subcommands:
                             a commit record holds its retire.tmb
   maint-records             compaction and rewrite records a maintain pass
                             added to one tenant and signal
-  fold-binary               the retired_hour fold binary's SHA and whether it
-                            carries run.toml's c1_sha and r2_sha
+  fold-binary               a state's fold binary SHA and whether it carries
+                            run.toml's c1_sha and r2_sha
   day-parts-stamp           entries and slices per day part from a state's
                             catalog stamp
 
@@ -1559,23 +1559,27 @@ def git_is_ancestor(repo, ancestor, sha):
 
 
 def fold_binary(repo, sha, c1, r2):
-    """{sha, carries_c1, carries_r2} of the retired_hour fold binary: whether
-    its SHA descends from run.toml's c1_sha and r2_sha. An empty r2_sha is
-    a fix not landed yet, so false. Raises when the binary's SHA or c1_sha
-    names no commit, or r2_sha is set and names none."""
+    """{sha, carries_c1, carries_r2} of a state's fold binary: whether its
+    SHA descends from run.toml's c1_sha and r2_sha. An empty c1_sha or
+    r2_sha is a commit not named, so false (run.sh refuses a retired_hour
+    run with no c1_sha; a day_parts_N state reads only carries_r2). Raises
+    when the binary's SHA names no commit, or c1_sha or r2_sha is set and
+    names none."""
     full = git_commit(repo, sha)
     if full is None:
         raise ValueError(f"the fold binary's SHA {sha!r} names no commit in {repo}")
-    c1_full = git_commit(repo, c1)
-    if c1_full is None:
-        raise ValueError(f"retired_hour.c1_sha {c1!r} names no commit in {repo}")
+    c1_full = None
+    if c1:
+        c1_full = git_commit(repo, c1)
+        if c1_full is None:
+            raise ValueError(f"retired_hour.c1_sha {c1!r} names no commit in {repo}")
     r2_full = None
     if r2:
         r2_full = git_commit(repo, r2)
         if r2_full is None:
             raise ValueError(f"retired_hour.r2_sha {r2!r} names no commit in {repo}")
-    return {"sha": full, "c1_sha": c1_full, "r2_sha": r2_full or "",
-            "carries_c1": git_is_ancestor(repo, c1_full, full),
+    return {"sha": full, "c1_sha": c1_full or "", "r2_sha": r2_full or "",
+            "carries_c1": bool(c1_full) and git_is_ancestor(repo, c1_full, full),
             "carries_r2": bool(r2_full) and git_is_ancestor(repo, r2_full, full)}
 
 
@@ -1584,6 +1588,54 @@ def cmd_fold_binary(args):
         doc = fold_binary(args.repo, args.sha, args.c1, args.r2)
     except ValueError as e:
         die(f"fold-binary: {e}")
+    write_json(args.out, doc)
+
+
+def hour_segments(resolved, keys_lines, tenant_hash, signal_code, hour):
+    """{hour, segments, l0, l1, resolved} of the data keys a catalog resolve
+    returned (`rlog footprint --tenant --json` objects[].key) that belong to
+    ingest hour `hour` (unix hours). An L1 key carries its hour in its path,
+    t/<hash>/<signal>/l1/<shard>/<YYYYMMDDTHH>/...; an L0 key's hour is the
+    bucket of its commit record, t/<hash>/<signal>/c/<shard>/<YYYYMMDDTHH>/
+    <writer>.<epoch>.<seq>.cmt, in the census keys. Raises on a resolved key
+    of another tenant or signal, of neither tier, or an L0 key with no commit
+    record, since its hour is then unknown."""
+    commits = {}
+    for (shard, h), files in bucket_files(keys_lines, tenant_hash, signal_code).items():
+        for f in files:
+            if f.endswith(".cmt") and not f.startswith(("l1.", "rw.")):
+                commits[(shard, f[:-len(".cmt")])] = h
+    counts = {"l0": 0, "l1": 0}
+    for key in resolved:
+        parts = key.split("/")
+        if len(parts) < 6 or parts[:3] != ["t", tenant_hash, signal_code] or not key.endswith(DATA_SUFFIX):
+            raise ValueError(f"resolved key {key!r} is no {tenant_hash}/{signal_code} data key")
+        if parts[3] == "l1" and len(parts) == 7:
+            h = hour_index(parts[5])
+        elif parts[3] == "l0" and len(parts) == 6:
+            ident = parts[5][:-len(DATA_SUFFIX)].rsplit(".", 1)[0]
+            h = commits.get((parts[4], ident))
+            if h is None:
+                raise ValueError(f"resolved L0 key {key!r} has no commit record in the census keys")
+        else:
+            raise ValueError(f"resolved key {key!r} is neither an L0 nor an L1 data key")
+        if h == hour:
+            counts[parts[3]] += 1
+    return {"hour": hour, "segments": counts["l0"] + counts["l1"], "l0": counts["l0"], "l1": counts["l1"],
+            "resolved": len(resolved)}
+
+
+def cmd_hour_segments(args):
+    """Writes --out: how many of the segments a catalog resolve returned
+    belong to ingest hour --hour, on either tier (row W3's retired-hour
+    resolve)."""
+    try:
+        with open(args.footprint) as f:
+            resolved = [o["key"] for o in json.load(f)["objects"]]
+        with open(args.keys) as f:
+            doc = hour_segments(resolved, f, args.tenant_hash, args.signal_code, args.hour)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        die(f"hour-segments: {e}", 70)
     write_json(args.out, doc)
 
 
@@ -1876,10 +1928,19 @@ def main():
     fb = sub.add_parser("fold-binary")
     fb.add_argument("--repo", required=True)
     fb.add_argument("--sha", required=True)
-    fb.add_argument("--c1", required=True)
+    fb.add_argument("--c1", default="")
     fb.add_argument("--r2", default="")
     fb.add_argument("--out", required=True)
     fb.set_defaults(fn=cmd_fold_binary)
+
+    hs = sub.add_parser("hour-segments")
+    hs.add_argument("--footprint", required=True, help="`ravel-cli rlog footprint --tenant --json` output")
+    hs.add_argument("--keys", required=True, help="census keys file (size<TAB>key per line)")
+    hs.add_argument("--tenant-hash", required=True)
+    hs.add_argument("--signal-code", default="l")
+    hs.add_argument("--hour", type=int, required=True, help="ingest hour, unix hours")
+    hs.add_argument("--out", required=True)
+    hs.set_defaults(fn=cmd_hour_segments)
 
     dps = sub.add_parser("day-parts-stamp")
     dps.add_argument("--stamps", required=True)
