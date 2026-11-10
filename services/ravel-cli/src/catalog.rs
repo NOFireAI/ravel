@@ -666,8 +666,8 @@ fn render_fold_report(
         report.metrics_label_index_erasure_list_requests
     ));
     out.push_str(&format!(
-        "snapshot_part_puts: {}\n",
-        report.snapshot_part_puts
+        "sealed_part_puts: {}\n",
+        report.sealed_part_puts
     ));
     out.push_str(&format!(
         "sealed_day_leaf_puts: {}\n",
@@ -680,10 +680,6 @@ fn render_fold_report(
     out.push_str(&format!(
         "key_index_unchanged_section_gets: {}\n",
         report.key_index_unchanged_section_gets
-    ));
-    out.push_str(&format!(
-        "switch_off_partition_changed: {}\n",
-        report.switch_off_partition_changed
     ));
     out.push_str(&format!("head_digest: {}\n", report.head_digest));
     // The same array `--json` carries.
@@ -1789,11 +1785,10 @@ mod tests {
             )
             .await
             .expect("fold");
-        report.snapshot_part_puts = 3;
+        report.sealed_part_puts = 3;
         report.sealed_day_leaf_puts = 5;
         report.sealed_day_previous_leaf_gets = 7;
         report.key_index_unchanged_section_gets = 11;
-        report.switch_off_partition_changed = 13;
         report.head_digest = "ab".repeat(32);
         report.retired_hours = vec![17, 19];
         let render = |json| {
@@ -1810,11 +1805,10 @@ mod tests {
 
         let value: serde_json::Value = serde_json::from_str(&render(true)).expect("one JSON doc");
         for (field, want) in [
-            ("snapshot_part_puts", serde_json::json!(3)),
+            ("sealed_part_puts", serde_json::json!(3)),
             ("sealed_day_leaf_puts", serde_json::json!(5)),
             ("sealed_day_previous_leaf_gets", serde_json::json!(7)),
             ("key_index_unchanged_section_gets", serde_json::json!(11)),
-            ("switch_off_partition_changed", serde_json::json!(13)),
             ("head_digest", serde_json::json!("ab".repeat(32))),
             ("retired_hours", serde_json::json!([17, 19])),
         ] {
@@ -1823,11 +1817,10 @@ mod tests {
 
         let text = render(false);
         for line in [
-            "snapshot_part_puts: 3".to_string(),
+            "sealed_part_puts: 3".to_string(),
             "sealed_day_leaf_puts: 5".to_string(),
             "sealed_day_previous_leaf_gets: 7".to_string(),
             "key_index_unchanged_section_gets: 11".to_string(),
-            "switch_off_partition_changed: 13".to_string(),
             format!("head_digest: {}", "ab".repeat(32)),
             "retired_hours: [17,19]".to_string(),
         ] {
