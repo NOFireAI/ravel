@@ -19,6 +19,8 @@
 #   flight-sql  ravel-server, ravel-sql
 #   agents      ravel-server, ravel-agents-runtime, ravel-agents-sim
 #   mcp         ravel-server
+#   promql      ravel-promql-difftest  (CI's `promql-difftest`, a required
+#               check gated on paths like the four above)
 #
 # Modes:
 #   check-ci-lane-areas.sh [--map FILE]
@@ -51,7 +53,7 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SELF_DIR}/../.." && pwd)"
 AFFECTED_TESTS="${RAVEL_AFFECTED_TESTS:-${REPO_ROOT}/scripts/affected-tests.sh}"
-LANES="sql flight-sql agents mcp"
+LANES="sql flight-sql agents mcp promql"
 
 usage() {
   echo "usage: $0 [--map FILE] | --generate | --lanes-for-paths [--map FILE]" >&2
@@ -94,6 +96,9 @@ lanes_for_closure() {
   esac
   case "${closure}" in
     *" ravel-server "*) out="${out},mcp" ;;
+  esac
+  case "${closure}" in
+    *" ravel-promql-difftest "*) out="${out},promql" ;;
   esac
   if [[ -z "${out}" ]]; then
     printf '%s' "-"

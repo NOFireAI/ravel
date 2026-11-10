@@ -239,6 +239,7 @@ jobs:
               flight-sql) flight_sql_area=true ;;
               agents) agents_area=true ;;
               mcp) mcp_area=true ;;
+              promql) promql_area=true ;;
               *)
                 echo "::error::scripts/ci-lane-areas.tsv names unknown lane $lane"
                 exit 1
