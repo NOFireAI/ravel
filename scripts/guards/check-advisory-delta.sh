@@ -12,11 +12,14 @@
 #    "advisory":{"id":"RUSTSEC-...","package":...}}}
 # and exactly one closing
 #   {"type":"summary","fields":{"advisories":{"errors":N,...}}}
-# Log lines are {"type":"log",...}. A finding is an error-severity
-# diagnostic, the ones that fail `cargo deny check` today. Its key is the
-# advisory id; an error with no advisory attached (a yanked crate, an
-# index failure) is keyed as `<code>: <first label span or message>` so it
-# takes part in the comparison instead of being dropped.
+# Log lines are {"type":"log","fields":{"level":...,"message":...}}. A
+# finding is an error-severity diagnostic, the ones that fail `cargo deny
+# check` today. Its key is the advisory id plus the affected crate's name and
+# version (fields.graphs[0].Krate), so a change that adds a second affected
+# version under an id the base already carries has a finding of its own; an
+# error with no advisory attached (a yanked crate, an index failure) is keyed
+# as `<code>: <first label span or message>` so it takes part in the
+# comparison instead of being dropped.
 #
 # An input is usable only when every non-blank line parses as a JSON object
 # with a string "type", and it holds exactly one summary carrying an
@@ -24,13 +27,21 @@
 # ran to the end, so a run that died early (exit 1 with no diagnostics) is
 # never read as "no advisories".
 #
+# One unusable base is not refused: a base whose deny.toml the head's
+# cargo-deny rejects (no summary, and the ERROR log cargo-deny prints when it
+# fails to parse, deserialize or validate its config). There is nothing to
+# compare against, so every head finding is judged new, which is the full
+# check this guard replaced, and a warning names the reason. The same output
+# at the head still exits 2.
+#
 # Usage:
 #   check-advisory-delta.sh HEAD_JSON BASE_JSON BASE_SHA
 #
 # Exit 0 nothing new (prints one ::warning:: per finding present on both
 # sides, and "0 new advisories vs base" when nothing is new), 1 a finding new
 # at the head (prints one ::error:: per finding), 2 an input missing, empty
-# or not cargo-deny JSON, 64 bad usage, 70 jq missing.
+# or not cargo-deny JSON (a config-rejected base aside), 64 bad usage, 70 jq
+# missing.
 set -uo pipefail
 
 if [[ $# -ne 3 || -z "${3}" ]]; then
@@ -49,8 +60,13 @@ fi
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "${tmpdir}"' EXIT
 
+# The ERROR log cargo-deny's main prints when ValidConfig::load bails.
+config_rejected_re='^failed to (parse config from|deserialize config from|validate configuration file) '
+
 # finding_keys <label> <file> <out>: writes the sorted unique finding keys of
-# one cargo-deny JSON output to <out>; returns 2 when the file is unusable.
+# one cargo-deny JSON output to <out>; returns 2 when the file is unusable,
+# and 3 when it is unusable because cargo-deny rejected its config (the
+# rejection message is then in ${tmpdir}/config_rejected).
 finding_keys() {
   local label="$1" file="$2" out="$3" summaries
   if [[ ! -f "${file}" ]]; then
@@ -77,6 +93,15 @@ finding_keys() {
     echo "check-advisory-delta.sh: ${label} JSON ${file}: could not count summaries" >&2
     return 2
   fi
+  if [[ "${summaries}" == "0" ]] &&
+    jq -R -r --arg re "${config_rejected_re}" 'select(test("\\S")) | fromjson
+      | select(.type == "log" and .fields.level == "ERROR"
+          and (.fields.message | type) == "string" and (.fields.message | test($re)))
+      | .fields.message' "${file}" >"${tmpdir}/config_rejected" &&
+    [[ -s "${tmpdir}/config_rejected" ]]; then
+    echo "check-advisory-delta.sh: ${label} JSON ${file} holds no summary: cargo-deny rejected its config" >&2
+    return 3
+  fi
   if [[ "${summaries}" != "1" ]]; then
     echo "check-advisory-delta.sh: ${label} JSON ${file} holds ${summaries} advisories summaries, wanted exactly 1 (the check did not run to the end)" >&2
     return 2
@@ -84,7 +109,12 @@ finding_keys() {
   if ! jq -R -r 'select(test("\\S")) | fromjson
       | select(.type == "diagnostic" and .fields.severity == "error")
       | .fields
-      | (.advisory.id // ((.code // "unknown") + ": " + (.labels[0].span // .message // "")))' \
+      | if .advisory.id != null then
+          .advisory.id + " "
+            + (if (.graphs[0].Krate | type) == "object"
+               then "\(.graphs[0].Krate.name) \(.graphs[0].Krate.version)"
+               else (.labels[0].span // "(no crate)") end)
+        else (.code // "unknown") + ": " + (.labels[0].span // .message // "") end' \
     "${file}" >"${tmpdir}/raw_keys"; then
     echo "check-advisory-delta.sh: ${label} JSON ${file}: could not read diagnostics" >&2
     return 2
@@ -96,7 +126,12 @@ rc=0
 finding_keys head "${head_json}" "${tmpdir}/head_keys" || rc=$?
 if ((rc != 0)); then exit 2; fi
 finding_keys base "${base_json}" "${tmpdir}/base_keys" || rc=$?
-if ((rc != 0)); then exit 2; fi
+if ((rc == 3)); then
+  echo "::warning title=base advisories not compared::cargo-deny rejected the config at the base ${base_sha} ($(head -n1 "${tmpdir}/config_rejected")), so every advisory at the head is judged new"
+  : >"${tmpdir}/base_keys"
+elif ((rc != 0)); then
+  exit 2
+fi
 
 LC_ALL=C comm -23 "${tmpdir}/head_keys" "${tmpdir}/base_keys" >"${tmpdir}/new"
 LC_ALL=C comm -12 "${tmpdir}/head_keys" "${tmpdir}/base_keys" >"${tmpdir}/both"

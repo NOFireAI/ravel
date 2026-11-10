@@ -37,11 +37,16 @@ name: supply-chain-nightly
 # job fails only on an advisory new against the pull request's base, so an
 # advisory published against main's lockfile no longer blocks the queue; it
 # is red here and on main's push run instead. That makes this lane the
-# advisory's route to a fix, so it runs every six hours rather than nightly,
-# and the `fix` job after `report` tries `cargo update -p <crate> --precise
-# <fixed>` for each advisory that names a fixed version and opens the pull
-# request when the lockfile then passes. When no fixed version resolves, the
-# tracking issue is the only output, as before.
+# advisory's route to a fix, so it runs every six hours rather than nightly.
+# After `report`, the `fix-candidates` job (read-only) tries `cargo update -p
+# <crate>@<locked> --precise <fixed>` for each advisory that names a fixed
+# version and uploads each passing Cargo.lock diff as an artifact, and the
+# `fix-pr` job (the only one with write scopes, running nothing but git and
+# gh) opens one pull request per distinct diff. When no fixed version
+# resolves, the tracking issue is the only output, as before.
+#
+# The tracking issue is closed by hand: `report` runs only on a red run and
+# does not close or update the issue when a later run is green.
 
 on:
   workflow_dispatch:
@@ -117,7 +122,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       issues: write
-    # The tracking issue's number, for the `fix` job's `Fixes:` line.
+    # The tracking issue's number, for the fix pull requests' `Refs:` line.
     outputs:
       issue: ${{ steps.file.outputs.issue }}
     # Serialize THIS job only, across runs, so the read-then-create below
@@ -201,34 +206,31 @@ jobs:
           esac
           echo "issue=$issue" >> "$GITHUB_OUTPUT"
 
-  # Opens the fix pull request when a fixed version resolves (ADR-4034 D4).
-  # Runs after `report`, and only when it filed or found the tracking issue,
-  # whose number goes on the pull request's `Fixes:` line.
+  # Finds the lockfile fixes (ADR-4034 D4). Runs after `report`, and only
+  # when it filed or found the tracking issue, whose number goes on each fix
+  # pull request's `Refs:` line.
   #
-  # This job alone holds write scopes: `contents: write` to push the
-  # deps/rustsec-<id> branch and `pull-requests: write` to open the pull
-  # request. What it runs with them is bounded: cargo-deny (a static binary
-  # that reads the lockfile and manifests and executes no dependency code)
-  # and `cargo update`, which rewrites Cargo.lock and runs no build script.
-  # Nothing here builds, tests or runs the workspace. The checkout still
-  # drops its credentials; the token reaches git only in the push command.
+  # Read-only, like `supply-chain-nightly`: it installs and runs cargo-deny
+  # and `cargo update`, so it holds `contents: read` and no token reaches any
+  # step. Its output is an artifact, one directory per distinct Cargo.lock
+  # diff: the diff, the advisory ids it clears, the updates it made and the
+  # tracking issue. `fix-pr` turns each into a pull request.
   #
-  # A pull request opened with the workflow token starts no `pull_request`
-  # workflow run, so its CI does not begin on its own; the body says how to
-  # start it.
-  fix:
+  # Candidates are tried per advisory id: every locked version the id is
+  # reported on is updated in turn (smallest fixed version that keeps bans,
+  # licenses and sources passing and adds no advisory against the pre-update
+  # output), and the id counts as cleared only when no locked version of it
+  # is reported afterwards. Ids whose updates produce the same diff share one
+  # pull request.
+  fix-candidates:
     needs: [supply-chain-nightly, report]
     if: ${{ always() && needs.report.result == 'success' && needs.report.outputs.issue != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # workflow-permissions-allow does not cover a job-level grant (the guard
-    # checks the top-level floor only); the reason is the paragraph above.
     permissions:
-      contents: write
-      pull-requests: write
-    concurrency:
-      group: supply-chain-nightly-fix
-      cancel-in-progress: false
+      contents: read
+    outputs:
+      count: ${{ steps.try.outputs.count }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -239,14 +241,14 @@ jobs:
           tool: cargo-deny
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Try a precise update per advisory
+      - name: Try precise updates per advisory
+        id: try
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           ISSUE: ${{ needs.report.outputs.issue }}
         run: |
           work="$RUNNER_TEMP/supply-chain-fix"
-          mkdir -p "$work"
+          fixes="$RUNNER_TEMP/supply-chain-fixes"
+          mkdir -p "$work" "$fixes"
           rc=0
           cargo deny --format json check advisories 2>"$work/before.json" || rc=$?
           echo "cargo deny check advisories exited $rc"
@@ -271,80 +273,239 @@ jobs:
             | @tsv' "$work/before.json" | LC_ALL=C sort -u >"$work/candidates.tsv"
           if [ ! -s "$work/candidates.tsv" ]; then
             echo "no failing advisory names a fixed version; the tracking issue #$ISSUE is the only output"
+            echo "count=0" >>"$GITHUB_OUTPUT"
             exit 0
           fi
-          error_ids() {
+          # advisory_rows <json>: id, crate, version of every error advisory.
+          advisory_rows() {
             jq -R -r 'select(test("\\S")) | fromjson
-              | select(.type == "diagnostic" and .fields.severity == "error")
-              | .fields.advisory.id // empty' "$1"
+              | select(.type == "diagnostic" and .fields.severity == "error" and .fields.advisory.id != null)
+              | .fields
+              | [.advisory.id, (.graphs[0].Krate.name // .advisory.package), (.graphs[0].Krate.version // "-")]
+              | @tsv' "$1" | LC_ALL=C sort -u
           }
+          advisory_rows "$work/before.json" | cut -f1 | LC_ALL=C sort -u >"$work/before.ids"
+          cut -f1 "$work/candidates.tsv" | LC_ALL=C sort -u >"$work/candidate.ids"
+          # Both loops read from their own descriptor, so nothing cargo or
+          # rustup reads from stdin can consume a row.
+          while read -r id <&3; do
+            git checkout -q -- Cargo.lock
+            cp "$work/before.json" "$work/state.json"
+            : >"$work/updates.tsv"
+            while IFS=$'\t' read -r row_id krate locked reqs <&4; do
+              [ "$row_id" = "$id" ] || continue
+              # An earlier update for this id may already have moved this
+              # locked version. (Rows go through a file: the step runs under
+              # pipefail, where grep -q closing a pipe early reads as a miss.)
+              advisory_rows "$work/state.json" >"$work/state.rows"
+              if ! grep -qxF "$id"$'\t'"$krate"$'\t'"$locked" "$work/state.rows"; then
+                continue
+              fi
+              spec="$krate"
+              # An empty field would collapse under the tab IFS, so jq writes
+              # "-" for an unknown version.
+              if [ "$locked" != "-" ]; then
+                spec="$krate@$locked"
+              fi
+              # The lower bound of each patched requirement, smallest first.
+              fixed_list=$(printf '%s\n' "$reqs" | sed 's/ OR /\n/g' \
+                | sed -n 's/^[^0-9]*\([0-9][0-9A-Za-z.+-]*\).*/\1/p' | sort -V -u)
+              fixed=""
+              for candidate in $fixed_list; do
+                cp Cargo.lock "$work/Cargo.lock.prev"
+                echo "$id: trying cargo update -p $spec --precise $candidate"
+                rc=0
+                if cargo update -p "$spec" --precise "$candidate" \
+                  && cargo deny check bans licenses sources; then
+                  cargo deny --format json check advisories 2>"$work/after.json" || rc=$?
+                  advisory_rows "$work/after.json" >"$work/after.rows" || : >"$work/after.rows"
+                  # The update must add no advisory against the pre-update
+                  # output and take this locked version out of the report.
+                  if scripts/guards/check-advisory-delta.sh "$work/after.json" "$work/before.json" "$GITHUB_SHA" \
+                    && ! grep -qxF "$id"$'\t'"$krate"$'\t'"$locked" "$work/after.rows"; then
+                    fixed="$candidate"
+                    cp "$work/after.json" "$work/state.json"
+                    printf '%s\t%s\t%s\n' "$krate" "$locked" "$fixed" >>"$work/updates.tsv"
+                    break
+                  fi
+                fi
+                cp "$work/Cargo.lock.prev" Cargo.lock
+              done
+              if [ -z "$fixed" ]; then
+                echo "$id: no fixed version of $spec resolves"
+              fi
+            done 4<"$work/candidates.tsv"
+            # Cleared means no locked version of the id is reported any more.
+            advisory_rows "$work/state.json" | cut -f1 | LC_ALL=C sort -u >"$work/after.ids"
+            LC_ALL=C comm -23 "$work/before.ids" "$work/after.ids" >"$work/cleared"
+            if ! grep -qxF "$id" "$work/cleared"; then
+              echo "$id: still reported on a locked version after every update; the tracking issue #$ISSUE is the only output"
+              continue
+            fi
+            git diff -- Cargo.lock >"$work/Cargo.lock.patch"
+            key=$(sha256sum <"$work/Cargo.lock.patch" | cut -c1-16)
+            dir="$fixes/$key"
+            if [ -d "$dir" ]; then
+              echo "$id: same Cargo.lock change as an earlier id; one pull request for both"
+            else
+              mkdir "$dir"
+              cp "$work/Cargo.lock.patch" "$dir/Cargo.lock.patch"
+              printf '%s\n' "$ISSUE" >"$dir/issue"
+            fi
+            cat "$work/cleared" >>"$dir/ids"
+            LC_ALL=C sort -u -o "$dir/ids" "$dir/ids"
+            cat "$work/updates.tsv" >>"$dir/updates.tsv"
+            LC_ALL=C sort -u -o "$dir/updates.tsv" "$dir/updates.tsv"
+          done 3<"$work/candidate.ids"
+          git checkout -q -- Cargo.lock
+          count=$(find "$fixes" -mindepth 1 -maxdepth 1 -type d | wc -l)
+          echo "$count distinct Cargo.lock fix(es)"
+          echo "count=$count" >>"$GITHUB_OUTPUT"
+      - name: Upload the fixes
+        if: steps.try.outputs.count != '0'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: supply-chain-fixes
+          path: ${{ runner.temp }}/supply-chain-fixes
+          if-no-files-found: error
+          retention-days: 3
+
+  # Opens one pull request per distinct fix from `fix-candidates`.
+  #
+  # This job alone holds write scopes: `contents: write` to push the
+  # deps/rustsec-<ids> branch and `pull-requests: write` to open the pull
+  # request. It installs nothing and runs no cargo or cargo-deny: it checks
+  # out the repository, downloads the artifact, refuses any fix whose diff
+  # touches a file other than Cargo.lock or whose metadata is malformed, and
+  # runs git and gh. The token is read into an unexported shell variable and
+  # handed only to `git push` and `gh`.
+  #
+  # Each pull request carries `Refs:` the tracking issue, not `Fixes:`:
+  # merging one fix must not close the issue while another advisory or a ban
+  # failure remains. A pull request opened with the workflow token starts no
+  # `pull_request` workflow run, so its CI does not begin on its own; the
+  # body says how to start it.
+  fix-pr:
+    needs: [report, fix-candidates]
+    if: ${{ always() && needs.fix-candidates.result == 'success' && needs.fix-candidates.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # workflow-permissions-allow does not cover a job-level grant (the guard
+    # checks the top-level floor only); the reason is the paragraph above.
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: supply-chain-nightly-fix
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: supply-chain-fixes
+          path: ${{ runner.temp }}/supply-chain-fixes
+      - name: Open a pull request per fix
+        env:
+          WRITE_TOKEN: ${{ github.token }}
+          ISSUE: ${{ needs.report.outputs.issue }}
+        run: |
+          token="$WRITE_TOKEN"
+          unset WRITE_TOKEN
+          export GH_REPO="$GITHUB_REPOSITORY"
+          work="$RUNNER_TEMP/supply-chain-fix-pr"
+          mkdir -p "$work"
+          tab=$'\t'
+          version_re='[0-9][0-9A-Za-z.+-]*'
           opened=0
-          while IFS=$'\t' read -r id krate locked reqs; do
-            slug=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
-            branch="deps/rustsec-${slug#rustsec-}"
-            if ! open_pr=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty'); then
+          for dir in "$RUNNER_TEMP"/supply-chain-fixes/*/; do
+            dir="${dir%/}"
+            patch="$dir/Cargo.lock.patch"
+            if [ "$(cat "$dir/issue")" != "$ISSUE" ]; then
+              echo "::error::$dir names tracking issue $(cat "$dir/issue"), not #$ISSUE"
+              exit 1
+            fi
+            if [ ! -s "$dir/ids" ] || grep -qvxE 'RUSTSEC-[0-9]{4}-[0-9]{4}' "$dir/ids"; then
+              echo "::error::$dir/ids is not a list of RUSTSEC ids"
+              exit 1
+            fi
+            if [ ! -s "$dir/updates.tsv" ] \
+              || grep -qvxE "[A-Za-z0-9_-]+${tab}(${version_re}|-)${tab}${version_re}" "$dir/updates.tsv"; then
+              echo "::error::$dir/updates.tsv is not a list of crate, locked and fixed versions"
+              exit 1
+            fi
+            if ! git apply --numstat "$patch" >"$work/numstat"; then
+              echo "::error::$patch is not a patch"
+              exit 1
+            fi
+            cut -f3 "$work/numstat" >"$work/touched"
+            if [ ! -s "$work/touched" ] || grep -qvxF Cargo.lock "$work/touched"; then
+              echo "::error::$patch touches a file other than Cargo.lock"
+              exit 1
+            fi
+            ids=$(paste -sd' ' "$dir/ids")
+            branch="deps/rustsec-$(sed 's/^RUSTSEC-//' "$dir/ids" | paste -sd-)"
+            # Two different diffs clearing the same ids would share a branch;
+            # the first one wins.
+            if grep -qxF "$branch" "$work/branches" 2>/dev/null; then
+              echo "$ids: another fix in this run already uses $branch"
+              continue
+            fi
+            echo "$branch" >>"$work/branches"
+            if ! open_pr=$(GH_TOKEN="$token" gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty'); then
               echo "::error::could not ask whether $branch already has an open pull request"
               exit 1
             fi
             if [ -n "$open_pr" ]; then
-              echo "$id: pull request #$open_pr is already open on $branch"
+              echo "$ids: pull request #$open_pr is already open on $branch"
               continue
             fi
-            spec="$krate"
-            # An empty field would collapse under the tab IFS, so jq writes
-            # "-" for an unknown version.
-            [ "$locked" != "-" ] && spec="$krate@$locked"
-            # The lower bound of each patched requirement, smallest first.
-            fixed_list=$(printf '%s\n' "$reqs" | sed 's/ OR /\n/g' \
-              | sed -n 's/^[^0-9]*\([0-9][0-9A-Za-z.+-]*\).*/\1/p' | sort -V -u)
-            fixed=""
-            for candidate in $fixed_list; do
-              git checkout -q --detach "$GITHUB_SHA"
-              git checkout -q -- Cargo.lock
-              echo "$id: trying cargo update -p $spec --precise $candidate"
-              cargo update -p "$spec" --precise "$candidate" || continue
-              cargo deny check bans licenses sources || continue
-              rc=0
-              cargo deny --format json check advisories 2>"$work/after.json" || rc=$?
-              # Passes when the id is gone and the update introduced no
-              # advisory main did not already have.
-              scripts/guards/check-advisory-delta.sh "$work/after.json" "$work/before.json" "$GITHUB_SHA" || continue
-              if error_ids "$work/after.json" | grep -qxF "$id"; then
-                echo "$id: still reported after the update to $candidate"
-                continue
-              fi
-              fixed="$candidate"
-              break
-            done
-            if [ -z "$fixed" ]; then
-              echo "$id: no fixed version of $krate resolves; the tracking issue #$ISSUE is the only output"
-              git checkout -q -- Cargo.lock
-              continue
+            git checkout -q --detach "$GITHUB_SHA"
+            if ! git apply "$patch"; then
+              echo "::error::$patch does not apply to $GITHUB_SHA"
+              exit 1
             fi
-            msg="$work/msg-$slug"
+            crates=$(cut -f1 "$dir/updates.tsv" | sort -u | paste -sd' ')
+            title="fix(deps): update $crates for $(head -n1 "$dir/ids")"
+            if [ "$(wc -l <"$dir/ids")" -gt 1 ]; then
+              title="$title and others"
+            fi
+            msg="$work/msg"
             {
-              echo "fix(deps): update $krate to $fixed for $id"
+              echo "$title"
               echo
-              echo "cargo update -p $spec --precise $fixed, opened by supply-chain-nightly"
-              echo "run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
-              echo "cargo deny check passes for $id with this lockfile."
+              echo "Lockfile update opened by supply-chain-nightly run"
+              echo "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}:"
               echo
-              echo "Fixes: #$ISSUE"
+              while IFS=$'\t' read -r krate locked fixed; do
+                spec="$krate"
+                if [ "$locked" != "-" ]; then
+                  spec="$krate@$locked"
+                fi
+                echo "    cargo update -p $spec --precise $fixed"
+              done <"$dir/updates.tsv"
+              echo
+              echo "With it cargo deny reports none of $ids on any locked version,"
+              echo "bans, licenses and sources pass, and no advisory is new against"
+              echo "the pre-update lockfile."
+              echo
+              echo "Refs: #$ISSUE"
             } >"$msg"
             git add Cargo.lock
             git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -q -s -F "$msg"
-            git push --force "https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$branch"
-            body="$work/body-$slug"
+            git push --force "https://x-access-token:${token}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$branch"
+            body="$work/body"
             {
               tail -n +3 "$msg"
               echo
+              echo "Merging this does not close #$ISSUE; close it once the nightly run is green."
               echo "Opened with the workflow token, which starts no pull_request run:"
               echo "close and reopen this pull request to start CI."
             } >"$body"
-            gh pr create --base main --head "$branch" --title "$(head -n1 "$msg")" --body-file "$body"
+            GH_TOKEN="$token" gh pr create --base main --head "$branch" --title "$(head -n1 "$msg")" --body-file "$body"
             opened=$((opened + 1))
-            git checkout -q --detach "$GITHUB_SHA"
-          done <"$work/candidates.tsv"
+          done
           echo "opened $opened fix pull request(s)"

@@ -1868,6 +1868,12 @@ jobs:
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: cargo-deny
+      # `cargo deny` goes through rustup's cargo proxy, which needs the
+      # pinned toolchain installed before the JSON run below, or rustup's
+      # install messages land in the output the delta script reads. `cargo
+      # tree -i` in the quick-xml guard needs it too.
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
       # On push to main (and any scheduled run) the full check, as before: an
       # advisory already on main's lockfile is red here, once, where the fix
       # belongs (ADR-4034 D4).
@@ -1882,22 +1888,42 @@ jobs:
         run: cargo deny check bans licenses sources
       # Advisories fail only when new against the base (ADR-4034 D4): the
       # check runs at the head and in a worktree of the base, and
-      # check-advisory-delta.sh fails on an id the head has and the base does
-      # not. cargo deny reads the lockfile and manifests and builds nothing.
-      # Its exit code is not the verdict (1 means findings or a crash alike);
-      # the delta script refuses an output with no closing summary instead.
+      # check-advisory-delta.sh fails on an advisory id and affected crate
+      # version the head has and the base does not. cargo deny reads the
+      # lockfile and manifests and builds nothing. Its exit code is not the
+      # verdict (1 means findings or a crash alike); the delta script refuses
+      # an output with no closing summary instead.
+      #
+      # The base on pull_request is HEAD^1 of the checked-out merge commit
+      # (refs/pull/N/merge), the exact base this run tests; the payload's
+      # base.sha can lag it.
       - name: cargo deny check advisories, new against the base
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if ! BASE_SHA=$(git rev-parse --verify HEAD^1); then
+              echo "::error::could not resolve HEAD^1 of the pull request's merge commit"
+              exit 1
+            fi
+          else
+            BASE_SHA="$MERGE_GROUP_BASE_SHA"
+          fi
           if [ -z "$BASE_SHA" ]; then
-            echo "::error::no base sha in the ${GITHUB_EVENT_NAME} event payload"
+            echo "::error::no base sha for the ${GITHUB_EVENT_NAME} event"
             exit 1
           fi
           base_dir="$RUNNER_TEMP/supply-chain-base"
           if ! git worktree add --detach "$base_dir" "$BASE_SHA"; then
             echo "::error::git worktree add could not find base commit $BASE_SHA; refusing to pass without a comparison"
+            exit 1
+          fi
+          # The base's rust-toolchain.toml may pin another toolchain or other
+          # components; install it here, outside the JSON capture, so the
+          # cargo proxy below finds it installed and prints nothing.
+          if ! (cd "$base_dir" && rustup toolchain install); then
+            echo "::error::could not install the toolchain rust-toolchain.toml pins at the base $BASE_SHA"
             exit 1
           fi
           # --format is a top-level cargo-deny option, so it goes before the
@@ -1911,10 +1937,7 @@ jobs:
           scripts/guards/check-advisory-delta.sh "$RUNNER_TEMP/advisories-head.json" "$RUNNER_TEMP/advisories-base.json" "$BASE_SHA"
       # deny.toml ignores RUSTSEC-2026-0194/-0195 on the premise that no
       # shipped binary's feature set reaches an affected quick-xml version
-      # (issue #1718). `cargo tree -i` needs the pinned toolchain, which
-      # cargo-deny (a static binary from the action above) does not.
-      - name: Install toolchain from rust-toolchain.toml
-        run: rustup show
+      # (issue #1718). `cargo tree -i` uses the toolchain installed above.
       - name: quick-xml shipped-reachability guard (issue #1718)
         run: scripts/guards/check-quick-xml-shipped-reachability.sh
 
