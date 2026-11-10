@@ -29,11 +29,11 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use ravel_catalog::{
     Catalog, CatalogConfig, CatalogError, DeclaredColumnType, DeclaredTypedColumn,
-    KEY_INDEX_LEAF_FORMAT_VERSION, KEY_INDEX_LEAF_FORMAT_VERSION_1, KeyIndexLeafInput,
-    KeyIndexLeafLimits, KeyIndexLeafRequest, KeyIndexRebuildOptions, RefoldRequest, Snapshot,
-    SnapshotParts, StorageLayoutWrite, TenantConfig, TenantLifecycleState, decode_head,
-    encode_head, encode_key_index_leaf, restamp_key_index_leaf_version, set_tenant_config,
-    verify_key_index_leaf,
+    HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2, KEY_INDEX_LEAF_FORMAT_VERSION,
+    KEY_INDEX_LEAF_FORMAT_VERSION_1, KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafRequest,
+    KeyIndexRebuildOptions, RefoldRequest, Snapshot, SnapshotParts, StorageLayoutWrite,
+    TenantConfig, TenantLifecycleState, decode_head, encode_head, encode_key_index_leaf,
+    restamp_key_index_leaf_version, set_tenant_config, verify_key_index_leaf,
 };
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -403,6 +403,39 @@ impl Fixture {
         key
     }
 
+    /// Lists `hour` in the one part's `retired_hours` and stamps the HEAD
+    /// version 2, as a fold that records a retention tombstone in a sealed
+    /// leaf-bearing part writes it (ADR-3939 decision 6).
+    async fn retire_hour(&self, hour: u32) {
+        let head_key = format!(
+            "t/{}/catalog/{}/HEAD",
+            tenant().hash().to_hex(),
+            Signal::Logs.key_prefix()
+        );
+        let current = self
+            .base
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD");
+        let mut head = decode_head(&current.data).expect("decode HEAD");
+        assert_eq!(head.format_version, HEAD_FORMAT_VERSION_1);
+        assert_eq!(head.parts.len(), 1, "one part");
+        assert_eq!(head.parts[0].key_index.len(), 1, "one user_id leaf");
+        head.parts[0].retired_hours = vec![hour];
+        head.format_version = HEAD_FORMAT_VERSION_2;
+        self.base
+            .put(
+                &head_key,
+                Bytes::from(encode_head(&head).expect("encode HEAD")),
+                PutOptions {
+                    mode: PutMode::CasVersion(current.version),
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("retire the hour");
+    }
+
     /// The catalog's own resolve with its parts.
     async fn resolve(&self) -> (Snapshot, SnapshotParts) {
         let (snapshot, _, parts) = leaf_catalog(Arc::clone(&self.base))
@@ -480,6 +513,18 @@ async fn publish_objects(
     version_one: &[usize],
     seqs: Range<usize>,
 ) -> Vec<Published> {
+    publish_objects_at(base, holders, version_one, seqs, 0).await
+}
+
+/// [`publish_objects`] into ingest hour `hour`.
+async fn publish_objects_at(
+    base: &Arc<dyn ObjectStoreBackend>,
+    holders: &[usize],
+    version_one: &[usize],
+    seqs: Range<usize>,
+    hour: u32,
+) -> Vec<Published> {
+    let hour_ns = i64::from(hour) * NS_PER_HOUR;
     let tenant_hash = tenant().hash();
     let mut objects = Vec::new();
     for seq in seqs {
@@ -530,11 +575,11 @@ async fn publish_objects(
             series_count: 1,
             min_event_ts_ns: min,
             max_event_ts_ns: max,
-            min_ingest_ts_ns: min,
-            max_ingest_ts_ns: max,
+            min_ingest_ts_ns: hour_ns + min,
+            max_ingest_ts_ns: hour_ns + max,
             segment_format_version: u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
-            created_unix_ns: 10 + seq as i64,
-            ingest_hour_bucket: 0,
+            created_unix_ns: hour_ns + 10 + seq as i64,
+            ingest_hour_bucket: hour,
         })
         .expect("record");
         let key = keys::reconstruct_data_key(&rec).expect("key");
@@ -1079,6 +1124,92 @@ async fn an_advancing_fold_does_not_carry_a_logs_version_one_leaf() {
     );
     assert_eq!(report.key_index_entries_carried, 0, "{report:?}");
     assert_eq!(report.key_index_sections_read, OBJECTS as u64, "{report:?}");
+}
+
+/// Objects 0 to 11 in ingest hour 0 and 12 to 23 in hour 1, `holders`
+/// holding `TARGET`, folded sealed through hour 1 into one part with a
+/// `user_id` leaf, and hour 1 then retired in that part's ref.
+async fn retired_hour_one(holders: &[usize]) -> Fixture {
+    let base: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let mut objects = publish_objects(&base, holders, &[], 0..12).await;
+    objects.extend(publish_objects_at(&base, holders, &[], 12..OBJECTS, 1).await);
+    let fx = Fixture { base, objects };
+    fx.declare().await;
+    let report = leaf_catalog(Arc::clone(&fx.base))
+        .fold_with_seal_through(
+            &tenant().hash(),
+            Signal::Logs,
+            Uuid::from_u128(1),
+            NOW_NS,
+            &[],
+            None,
+            &RefoldRequest::new(),
+            Some(1),
+        )
+        .await
+        .expect("fold");
+    assert_eq!(report.entry_count, OBJECTS as u64, "{report:?}");
+    let unretired = sql(&serve(Arc::clone(&fx.base), &Serve::default())).await;
+    let mut want: Vec<String> = holders.iter().map(|&n| format!("o{n}r050")).collect();
+    for row in &mut want {
+        row.truncate(6);
+    }
+    want.sort();
+    assert_eq!(rows(&unretired), want, "both hours answer before retiring");
+    fx.retire_hour(1).await;
+    fx
+}
+
+/// ADR-3939 decision 6: a retired hour's segments leave the resolve, so
+/// neither tier reads them. A window covering hour 1 resolves only hour 0's
+/// 12 objects. `TARGET` only in hour 1 (object 12) returns no row, with the
+/// part covered and none of hour 1's objects read, KEY_IDX included; held in
+/// hour 0 too (object 0), it returns hour 0's row alone.
+///
+/// FLIP: applying the retired-hours check in `extract_into` after
+/// `maybe_insert` inserts hour 1's segments: the resolve assertion fails with
+/// all 24 objects resolved, hour 1's 12 included.
+#[tokio::test]
+async fn a_retired_hour_yields_no_segment_on_either_tier() {
+    let _serial = SERIAL.lock().await;
+    let only_hour_one = retired_hour_one(&[12]).await;
+    let (snapshot, parts) = only_hour_one.resolve().await;
+    assert_eq!(parts.parts.len(), 1, "one part");
+    let resolved: BTreeSet<&str> = snapshot
+        .segments
+        .iter()
+        .map(|s| s.data_object_key.as_str())
+        .collect();
+    let hour_zero: BTreeSet<&str> = only_hour_one.objects[..12]
+        .iter()
+        .map(|o| o.key.as_str())
+        .collect();
+    assert_eq!(resolved, hour_zero, "no segment of hour 1 resolves");
+
+    let recorder = RecordingStore::new(Arc::clone(&only_hour_one.base));
+    let v = sql(&serve(recorder.clone(), &Serve::default())).await;
+    assert_eq!(rows(&v), Vec::<String>::new(), "{v}");
+    assert_eq!(key_index(&v, "partsCovered"), 1, "{v}");
+    for (n, object) in only_hour_one.objects.iter().enumerate().skip(12) {
+        assert_eq!(
+            recorder.of(&object.key),
+            Vec::new(),
+            "object {n}: a retired hour's object is never read"
+        );
+    }
+
+    let both_hours = retired_hour_one(&[0, 12]).await;
+    let recorder = RecordingStore::new(Arc::clone(&both_hours.base));
+    let v = sql(&serve(recorder.clone(), &Serve::default())).await;
+    assert_eq!(rows(&v), ["o0r050"], "{v}");
+    assert_eq!(key_index(&v, "partsCovered"), 1, "{v}");
+    for (n, object) in both_hours.objects.iter().enumerate().skip(12) {
+        assert_eq!(
+            recorder.of(&object.key),
+            Vec::new(),
+            "object {n}: a retired hour's object is never read"
+        );
+    }
 }
 
 /// The tier-1 answer every leaf-path failure must fall back to: the 16 small

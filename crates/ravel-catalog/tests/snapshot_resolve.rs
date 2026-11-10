@@ -1219,7 +1219,7 @@ async fn undecodable_head_is_not_cached_and_warns_on_every_resolve() {
 #[tokio::test]
 async fn signal_mismatched_head_is_not_cached_and_warns_on_every_resolve() {
     let logs_head = ravel_proto::catalog::v1::SnapshotHead {
-        format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+        format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
         tenant_hash: tenant().0.to_vec(),
         signal: ravel_proto::commit::v1::Signal::Logs as u32,
         shard_count: 1,
@@ -1233,6 +1233,7 @@ async fn signal_mismatched_head_is_not_cached_and_warns_on_every_resolve() {
             min_hour: 0,
             column_stats: None,
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),
         created_unix_ns: 0,

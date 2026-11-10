@@ -8486,7 +8486,7 @@ mod tests {
         // A HEAD that knew only generation 0 (shard_generation_count 1,
         // shard_count 4) at watermark 10 -- well past gen1's activation at 5.
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant().0.to_vec(),
             signal: signal::to_proto(Signal::Metrics) as u32,
             shard_count: 4,
@@ -8500,6 +8500,7 @@ mod tests {
                 min_hour: 0,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
@@ -8585,7 +8586,7 @@ mod tests {
             .await
             .expect("put part");
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant().0.to_vec(),
             signal: signal_num,
             shard_count: 8,
@@ -8599,6 +8600,7 @@ mod tests {
                 min_hour: 0,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
@@ -10393,7 +10395,7 @@ mod tests {
             .expect("put stats");
 
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant.0.to_vec(),
             signal: signal_num,
             shard_count: 8,
@@ -10413,6 +10415,7 @@ mod tests {
                     part_blake3: vec![part_hash.to_vec()],
                 }),
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
@@ -10570,6 +10573,7 @@ mod tests {
                     part_blake3: vec![part_hash.to_vec()],
                 }),
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             });
             let body_len = crate::snapshot_format::decode_column_stats_header(&stats_bytes)
                 .expect("the object just written has a readable header")
@@ -10578,7 +10582,7 @@ mod tests {
             segments.push(InstalledPart { segment, body_len });
         }
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant.0.to_vec(),
             signal: signal_num,
             shard_count: 8,
@@ -10818,7 +10822,7 @@ mod tests {
             .expect("put oversized stats");
 
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant.0.to_vec(),
             signal: signal_num,
             shard_count: 8,
@@ -10838,6 +10842,7 @@ mod tests {
                     part_blake3: vec![part_hash.to_vec()],
                 }),
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
@@ -12328,7 +12333,7 @@ mod tests {
             .expect("put v2 poison");
 
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant().0.to_vec(),
             signal: signal_num,
             shard_count: 8,
@@ -12343,6 +12348,7 @@ mod tests {
                     min_hour: 0,
                     column_stats: None,
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
                 ravel_proto::catalog::v1::SnapshotPartRef {
                     key: "unused-b".to_string(),
@@ -12353,6 +12359,7 @@ mod tests {
                     min_hour: 10,
                     column_stats: Some(b_ref),
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
                 ravel_proto::catalog::v1::SnapshotPartRef {
                     key: "unused-c".to_string(),
@@ -12363,6 +12370,7 @@ mod tests {
                     min_hour: 20,
                     column_stats: Some(c_ref),
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
             ],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
@@ -12549,7 +12557,7 @@ mod tests {
             .expect("put v1 stats");
 
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant().0.to_vec(),
             signal: signal_num,
             shard_count: 8,
@@ -12572,6 +12580,7 @@ mod tests {
                     part_blake3: vec![part_hash.to_vec()],
                 }),
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
@@ -12691,7 +12700,7 @@ mod tests {
             .expect("put v2");
 
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant().0.to_vec(),
             signal: signal_num,
             shard_count: 8,
@@ -12706,6 +12715,7 @@ mod tests {
                     min_hour: 0,
                     column_stats: Some(x_ref),
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
                 ravel_proto::catalog::v1::SnapshotPartRef {
                     key: "unused-y".to_string(),
@@ -12716,6 +12726,7 @@ mod tests {
                     min_hour: 10,
                     column_stats: None,
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
             ],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
@@ -12851,7 +12862,7 @@ mod tests {
         .await;
 
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant().0.to_vec(),
             signal: signal_num,
             shard_count: 8,
@@ -12872,6 +12883,7 @@ mod tests {
                         part_blake3: vec![part_p_hash.to_vec()],
                     }),
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
                 ravel_proto::catalog::v1::SnapshotPartRef {
                     key: "unused-q".to_string(),
@@ -12882,6 +12894,7 @@ mod tests {
                     min_hour: 10,
                     column_stats: Some(q_ref),
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
             ],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
@@ -13053,7 +13066,7 @@ mod tests {
             .expect("put v2");
 
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant().0.to_vec(),
             signal: signal_num,
             shard_count: 8,
@@ -13068,6 +13081,7 @@ mod tests {
                     min_hour: 0,
                     column_stats: None,
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
                 ravel_proto::catalog::v1::SnapshotPartRef {
                     key: "unused-2".to_string(),
@@ -13078,6 +13092,7 @@ mod tests {
                     min_hour: 10,
                     column_stats: None,
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
             ],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
@@ -13244,7 +13259,7 @@ mod tests {
             .expect("put v1");
 
         let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant().0.to_vec(),
             signal: signal_num,
             shard_count: 8,
@@ -13259,6 +13274,7 @@ mod tests {
                     min_hour: 0,
                     column_stats: None,
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
                 ravel_proto::catalog::v1::SnapshotPartRef {
                     key: "unused-2".to_string(),
@@ -13269,6 +13285,7 @@ mod tests {
                     min_hour: 10,
                     column_stats: None,
                     key_index: Vec::new(),
+                    retired_hours: Vec::new(),
                 },
             ],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),

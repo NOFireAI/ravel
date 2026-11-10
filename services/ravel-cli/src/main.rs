@@ -2779,6 +2779,10 @@ enum CatalogCommand {
         /// Which signal's HEAD to decode. Defaults to metrics.
         #[arg(long, value_enum, default_value = "metrics")]
         signal: SignalArg,
+        /// Print HEAD and every part ref as one JSON document, from HEAD
+        /// alone: no part object is fetched.
+        #[arg(long)]
+        json: bool,
     },
     /// Re-list sealed commit records for one (tenant, signal) and diff against
     /// that signal's snapshot; exits nonzero if the snapshot mismatches sealed
@@ -3307,13 +3311,19 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             catalog::inspect_kidx(&leaves, entries)
         }
         Command::Catalog {
-            command: CatalogCommand::Inspect { tenant, signal },
+            command:
+                CatalogCommand::Inspect {
+                    tenant,
+                    signal,
+                    json,
+                },
         } => {
             catalog::inspect(
                 store::build_store(&cli.store)?,
                 cli.store.selection(),
                 &tenant,
                 signal,
+                json,
             )
             .await
         }

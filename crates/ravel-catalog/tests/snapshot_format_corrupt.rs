@@ -510,6 +510,7 @@ fn base_head() -> SnapshotHead {
             min_hour: 0,
             column_stats: None,
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }],
         postings: None,
         folder_id: vec![0x33; 16],
@@ -530,6 +531,53 @@ fn head_with_postings() -> SnapshotHead {
     head
 }
 
+/// A version 2 HEAD: `base_head` with hour 2 of its part retired.
+fn retired_head() -> SnapshotHead {
+    let mut head = base_head();
+    head.format_version = 2;
+    head.parts[0].retired_hours = vec![2];
+    head
+}
+
+#[test]
+fn truncating_a_head_of_either_version_never_panics() {
+    for head in [base_head(), retired_head()] {
+        let bytes = head.encode_to_vec();
+        assert_eq!(decode_head(&bytes).expect("whole HEAD decodes"), head);
+        for len in 0..bytes.len() {
+            let _ = decode_head(&bytes[..len]);
+        }
+    }
+}
+
+#[test]
+fn head_v1_carrying_a_retired_hour_is_a_version_mismatch() {
+    let mut head = retired_head();
+    head.format_version = 1;
+    let err = decode_head(&head.encode_to_vec()).expect_err("decode must fail");
+    assert_eq!(
+        err,
+        SnapshotFormatError::HeadVersionContentMismatch {
+            format_version: 1,
+            required: 2
+        }
+    );
+}
+
+#[test]
+fn head_v2_without_a_retired_hour_is_a_version_mismatch() {
+    let mut head = base_head();
+    head.format_version = 2;
+    let err = decode_head(&head.encode_to_vec()).expect_err("decode must fail");
+    assert_eq!(
+        err,
+        SnapshotFormatError::HeadVersionContentMismatch {
+            format_version: 2,
+            required: 1
+        }
+    );
+}
+
 #[test]
 fn head_decode_error() {
     let err = decode_head(&[0xFFu8; 8]).expect_err("decode must fail");
@@ -539,10 +587,10 @@ fn head_decode_error() {
 #[test]
 fn head_unsupported_version() {
     let mut head = base_head();
-    head.format_version = 2;
+    head.format_version = 3;
     let bytes = head.encode_to_vec();
     let err = decode_head(&bytes).expect_err("decode must fail");
-    assert_eq!(err, SnapshotFormatError::UnsupportedHeadVersion(2));
+    assert_eq!(err, SnapshotFormatError::UnsupportedHeadVersion(3));
 }
 
 #[test]
