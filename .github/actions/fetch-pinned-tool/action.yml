@@ -3,12 +3,14 @@ description: >
   Restores a sha256-pinned tool download from actions/cache, keyed on name,
   version and sha256 so a version bump or a pin change never serves a stale
   file. On a cache miss, downloads `url` through
-  scripts/fetch-pinned-tool-download.sh: five attempts with exponential
-  backoff between them (10, 20, 40, 80 s by default, about 2.5 min total;
-  overridable with FETCH_PINNED_TOOL_RETRY_DELAY_S, for callers that need a
-  faster test), long enough to ride out a short upstream outage on the
-  release-asset host (issue #4093) rather than failing a job whose tool
-  cache was evicted. Verifies the download's sha256 against `sha256`, and
+  scripts/fetch-pinned-tool-download.sh: up to five attempts with
+  exponential backoff between them (10, 20, 40, 80 s by default), all inside
+  a 240 s wall-clock budget (FETCH_PINNED_TOOL_RETRY_DELAY_S and
+  FETCH_PINNED_TOOL_BUDGET_S override the two), long enough to ride out a
+  short upstream outage on the release-asset host (issue #4093) rather than
+  failing a job whose tool cache was evicted. The caller must have checked
+  the repository out at GITHUB_WORKSPACE first, since the script lives
+  there. Verifies the download's sha256 against `sha256`, and
   refuses with no file left at `dest` on a mismatch. Saves to the cache only
   on a push to `main` (ADR-4034 D3): a cache written on a PR or queue ref is
   readable by nothing else and dies with the ref, same as the `save-if` rule
@@ -49,10 +51,11 @@ runs:
         TOOL_DEST: ${{ inputs.dest }}
       run: |
         set -u
-        # Five attempts, exponential backoff (issue #4093). The verify step
-        # below checks the sha256 on this path and on a cache hit alike.
-        "${GITHUB_WORKSPACE}/scripts/fetch-pinned-tool-download.sh" \
-          "$TOOL_NAME" "$TOOL_URL" "$TOOL_DEST"
+        # Up to five attempts inside a 240 s budget (issue #4093). The verify
+        # step below checks the sha256 on this path and on a cache hit alike.
+        script="${GITHUB_WORKSPACE}/scripts/fetch-pinned-tool-download.sh"
+        [ -x "$script" ] || { echo "::error::fetch-pinned-tool needs the repository checked out at GITHUB_WORKSPACE ($script not found)"; exit 1; }
+        "$script" "$TOOL_NAME" "$TOOL_URL" "$TOOL_DEST"
     - name: Verify ${{ inputs.name }} sha256
       # Unconditional: a cache hit skips the download step above, and the
       # sha256 pin is the trust anchor on a hit as much as on a miss (the
