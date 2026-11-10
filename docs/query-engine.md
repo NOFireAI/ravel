@@ -1843,7 +1843,8 @@ share this one budget (see
 split its reserved total without double-counting. `component="fetch"` is
 `MemoryBudget::fetch_reserved()`, the bytes held by live `Reservation` guards
 (the RAII `reserve` API: fetched buffers, plus the decoded catalog output
-described under "Decoded output" above). `component="sql"` is
+described under "Decoded output" above, plus the entry id sets the on-demand
+fold's outcome comparison holds until it answers). `component="sql"` is
 `MemoryBudget::sql_reserved()`, the reserved total minus the fetch share,
 which is what the SQL executor's per-tenant accountants hold through the raw
 `try_reserve`/`reserve_unchecked`/`release` API. The two counters are separate

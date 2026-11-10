@@ -3205,10 +3205,12 @@ its entries, each with its own answer to a foreign part:
   logs a warning naming the part and both tenants, and the route answers
   `published` with the fold's report, as it does for a part that will not
   decode. The entry id sets the comparison accumulates are charged to the
-  same budget before any part is read, 256 bytes per compared entry from the
+  same budget before any part is read, 288 bytes per compared entry from the
   entry counts HEAD declares, and the charge is held until the comparison
   ends. A budget that cannot admit them declines the comparison the same way,
-  and the route answers `published`.
+  and the route answers `published`. So does a part whose decoded entry count
+  differs from the count HEAD declares for it, since the charge is sized from
+  the declared counts.
 - The startup format-window audit (`services/ravel-server/src/format_window.rs`)
   calls `ravel_catalog::decode_part_for_tenant`. A foreign part fails that
   (tenant, signal) pair's read, none of its entries is counted as out of
