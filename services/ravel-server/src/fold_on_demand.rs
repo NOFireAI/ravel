@@ -664,7 +664,8 @@ const MAX_COMPARED_PARTS: usize = 8;
 ///
 /// This never errors: it answers the classification question, and the fold it
 /// classifies has already published. When the comparison cannot be completed
-/// (an undecodable `HEAD`, a part that has since been swept, a remainder past
+/// (an undecodable `HEAD`, a part that has since been swept, a part whose
+/// entries do not match the count `HEAD` declares for it, a remainder past
 /// [`MAX_COMPARED_PARTS`], a memory budget that cannot admit the entry id
 /// sets) it answers `true` and logs, because
 /// `nothing_eligible` asserts that no commit entered or left the snapshot and
@@ -837,20 +838,34 @@ fn parts_absent_from<'a>(
 /// rewritten entry for one identity counts as a change.
 type EntryId = (u32, u32, u32, Vec<u8>, u64, u64, Vec<u8>);
 
+/// The largest `writer_id` a snapshot part admits: `decode_part` validates it
+/// at 16 bytes for a level-0 entry and 32 bytes for a level-1 entry, whose
+/// slot carries the compaction record's `input_set_hash`.
+const MAX_WRITER_ID_LEN: u64 = 32;
+/// The `content_hash` length `decode_part` validates for every entry.
+const CONTENT_HASH_LEN: u64 = 32;
+
 /// Bytes charged to the memory budget per entry an id set will hold. An
 /// [`EntryId`] is 80 bytes inline on a 64-bit target (two 24-byte `Vec`
-/// headers, two `u64`, three `u32` padded to 32), and its two `Vec`s hold
-/// 16 + 32 = 48 heap bytes (`writer_id` and `content_hash` as
-/// `proto/ravel/catalog.proto` sizes them). A `BTreeSet` keeps its nodes at
-/// least half full, so its key storage is at most twice the keys' size:
-/// 2 x (80 + 48) = 256. This bounds the set's own storage, not the transient
-/// memory of a part's decode, which [`Catalog::decode_tenant_part`] charges
-/// separately.
-const ID_SET_BYTES_PER_ENTRY: u64 = 256;
-const _: () = assert!(ID_SET_BYTES_PER_ENTRY >= 2 * (std::mem::size_of::<EntryId>() as u64 + 48));
+/// headers, two `u64`, three `u32` padded to 32), and its two `Vec`s hold at
+/// most [`MAX_WRITER_ID_LEN`] + [`CONTENT_HASH_LEN`] = 64 heap bytes, a
+/// level-1 entry's. A `BTreeSet` keeps its nodes at least half full, so its
+/// key storage is at most twice the keys' size: 2 x (80 + 64) = 288. This
+/// bounds the set's own storage, not the transient memory of a part's decode,
+/// which [`Catalog::decode_tenant_part`] charges separately.
+const ID_SET_BYTES_PER_ENTRY: u64 =
+    2 * (std::mem::size_of::<EntryId>() as u64 + MAX_WRITER_ID_LEN + CONTENT_HASH_LEN);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    ID_SET_BYTES_PER_ENTRY == 288,
+    "sized for an 80-byte EntryId holding a 32-byte writer_id and a 32-byte content_hash"
+);
 
 /// Every entry identity across `parts`, or `None` if any part could not be
-/// read or decoded (the caller then declines to claim the sets are equal).
+/// read or decoded, or holds a different number of entries than its
+/// `entry_count` in `HEAD` (the caller then declines to claim the sets are
+/// equal). The id-set charge is sized from those declared counts, so a part
+/// holding more would grow the set past it.
 ///
 /// Each part is decoded through [`Catalog::decode_tenant_part`], so a part
 /// whose header names another tenant is refused before its entries are read
@@ -940,6 +955,18 @@ async fn read_entry_ids(
                 return None;
             }
         };
+        if decoded.entries.len() as u64 != part.entry_count {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                key = %part.key,
+                declared = part.entry_count,
+                decoded = decoded.entries.len(),
+                "on-demand catalog fold: a snapshot part holds a different entry count \
+                 than HEAD declares for it"
+            );
+            return None;
+        }
         for entry in decoded.entries {
             ids.insert((
                 entry.level,
@@ -1813,6 +1840,20 @@ mod tests {
         entries: &[ravel_proto::catalog::v1::SnapshotEntry],
         hour: u32,
     ) -> (Vec<u8>, Vec<SnapshotPartRef>) {
+        let declared = entries.len() as u64;
+        plant_head_declaring(store, head_tenant, part_tenant, entries, hour, declared).await
+    }
+
+    /// As [`plant_head_with_part_for`], with the part's `entry_count` in
+    /// `HEAD` set to `declared` whatever the part holds.
+    async fn plant_head_declaring(
+        store: &dyn ObjectStoreBackend,
+        head_tenant: &TenantHash,
+        part_tenant: &TenantHash,
+        entries: &[ravel_proto::catalog::v1::SnapshotEntry],
+        hour: u32,
+        declared: u64,
+    ) -> (Vec<u8>, Vec<SnapshotPartRef>) {
         let signal_code = ravel_commit::signal::to_proto(Signal::Logs) as u32;
         let bytes = ravel_catalog::encode_part(part_tenant.0, signal_code, 1, hour, entries)
             .expect("encode part");
@@ -1826,7 +1867,7 @@ mod tests {
             key: key.clone(),
             blake3: blake3::hash(&bytes).as_bytes().to_vec(),
             size: bytes.len() as u64,
-            entry_count: entries.len() as u64,
+            entry_count: declared,
             watermark_hour: hour,
             min_hour: hour,
             column_stats: None,
@@ -1948,7 +1989,7 @@ mod tests {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let (before_head, after_head, wanted, declared) =
             plant_equal_entry_heads(store.as_ref(), &tenant).await;
-        assert_eq!(wanted, 1024);
+        assert_eq!(wanted, 1152);
 
         let budget = Arc::new(ravel_memory::MemoryBudget::new(wanted - 1));
         let catalog = budgeted_catalog(store.clone(), &budget);
@@ -1992,6 +2033,79 @@ mod tests {
         );
         assert_eq!(gets, 2);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A part holding more entries than `HEAD` declares for it declines the
+    /// comparison, even when both sides hold the same entries, and releases
+    /// every reservation. Both `HEAD`s declare one entry fewer than their
+    /// part holds, so the declared totals match and both parts are read.
+    ///
+    /// FLIP: drop the declared-count check in `read_entry_ids`, or compare
+    /// against the part header's own count, and the equal sets compare
+    /// equal (`changed` is false).
+    #[tokio::test]
+    async fn a_part_holding_more_entries_than_head_declares_declines_the_comparison() {
+        let tenant = TenantId::new("fold-on-demand-declared-count").hash();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let entries = [
+            snapshot_entry(1, 10),
+            snapshot_entry(2, 10),
+            snapshot_entry(3, 10),
+        ];
+        let short = entries.len() as u64 - 1;
+        let (before_head, before_parts) =
+            plant_head_declaring(store.as_ref(), &tenant, &tenant, &entries, 10, short).await;
+        let (after_head, after_parts) =
+            plant_head_declaring(store.as_ref(), &tenant, &tenant, &entries, 11, short).await;
+        assert_ne!(before_parts[0].blake3, after_parts[0].blake3);
+        assert_eq!(before_parts[0].entry_count, 2);
+        assert_eq!(after_parts[0].entry_count, 2);
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let catalog = budgeted_catalog(store.clone(), &budget);
+        let mut gets = 0;
+        let changed = snapshot_content_changed(
+            &catalog,
+            store.as_ref(),
+            &tenant,
+            Signal::Logs,
+            Some(&before_head),
+            Some(&after_head),
+            &mut gets,
+            None,
+        )
+        .await;
+        assert!(
+            changed,
+            "a part holding more entries than HEAD declares answers changed"
+        );
+        assert!(gets >= 1, "the mismatch is found by reading a part");
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(catalog.isolation_breaches(), 0);
+    }
+
+    /// The part format admits no `writer_id` longer than
+    /// [`MAX_WRITER_ID_LEN`], the length [`ID_SET_BYTES_PER_ENTRY`] is sized
+    /// from, and no entry level other than 0 and 1.
+    #[test]
+    fn the_id_set_charge_covers_the_longest_writer_id_a_part_admits() {
+        let signal_code = ravel_commit::signal::to_proto(Signal::Logs) as u32;
+        let tenant = TenantId::new("fold-on-demand-writer-id-len").hash();
+        let level_1 = |writer_id_len: u64, level: u32| ravel_proto::catalog::v1::SnapshotEntry {
+            level,
+            writer_id: vec![0x09; writer_id_len as usize],
+            ..snapshot_entry(1, 10)
+        };
+        let encode = |entry| ravel_catalog::encode_part(tenant.0, signal_code, 1, 10, &[entry]);
+        assert!(encode(level_1(MAX_WRITER_ID_LEN, 1)).is_ok());
+        assert!(encode(level_1(MAX_WRITER_ID_LEN + 1, 1)).is_err());
+        assert!(encode(level_1(MAX_WRITER_ID_LEN, 2)).is_err());
+        assert!(encode(level_1(16, 0)).is_ok());
+        assert!(encode(level_1(MAX_WRITER_ID_LEN, 0)).is_err());
+        assert_eq!(
+            snapshot_entry(1, 10).content_hash.len() as u64,
+            CONTENT_HASH_LEN
+        );
     }
 
     /// Records the budget's reserved bytes at every snapshot part GET.

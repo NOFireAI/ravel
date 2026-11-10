@@ -287,6 +287,10 @@ impl MemoryBudget {
     /// - `ravel-catalog`'s snapshot-part, postings and column-statistics
     ///   decodes, through [`reserve`] (`Catalog::with_memory_budget`); a
     ///   decoded part or postings entry keeps its reservation while cached;
+    /// - `ravel-server`'s on-demand fold (`fold_on_demand`), one reservation
+    ///   per entry-set comparison for its entry id sets, sized from the entry
+    ///   counts `HEAD` declares for the differing parts, through
+    ///   [`reserve_best_effort`], held until the comparison answers;
     /// - `ravel-logseg`'s decoded column-block cache, one reservation per
     ///   admitted entry, through [`reserve_best_effort_keeping`], held while
     ///   the entry is resident or a scan still holds it. Its size is set by
