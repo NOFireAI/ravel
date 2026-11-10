@@ -329,5 +329,6 @@ These are T3's (#4075) bucket-specific rows. The M8 gate is ADR-0954's parallel 
 
 - With the switch off, a first attempt plans as before. A refusal retry of an admitted shape runs this exec whatever the switch says, with its own derived tuning.
 - Its spill writes the routed state once and has no merge pass.
+- It holds two descriptors per bucket file, so a process left at the common 1,024 soft `nofile` limit keeps the sort-merge retry for q33 (item 1's descriptor budget); the bucketed retry needs the limit raised where the service runs.
 - An under-shoot beyond the margin fails the statement typed where today's sort-merge retry could answer it. The M8 gate's null row is where that shows.
 - The exec's consumer is spill-capable in the retry only, so on a first attempt it is still outside ADR-0954's spill-mode cap.
