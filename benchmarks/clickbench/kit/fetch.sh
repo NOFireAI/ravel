@@ -59,8 +59,13 @@
 # statement's hot and cold time at most published.statement_max_ratio x the
 # published one, a statement the published row answered and the arm did not
 # a miss, and concurrent QPS at least published.concurrent_qps_min_ratio x
-# the published QPS. A miss names the statement, the figure, both values and
-# their ratio, and counts as any other miss.
+# the published QPS. Hot is the best of tries 2 and 3 that answered (missing
+# only when both failed) and cold is try 1, so a statement with one failed
+# try is still judged. A miss names the statement, the figure, both values
+# and their ratio, and counts as any other miss. An arm whose results.json
+# did not select published, or has no concurrent block to judge QPS by,
+# exits 2. A run whose run.toml does not select published is not judged
+# against it.
 #
 # A band that cannot be judged (a concurrent or q29_probe band on a run where
 # that phase did not run on both arms, a statement arm A failed) is printed
@@ -285,6 +290,17 @@ download in/run.toml "$OUT_DIR/run.toml" || code=$?
 kit_py comparable "$OUT_DIR/run.toml" "$OUT_DIR/A/results.json" "$OUT_DIR/B/results.json" || exit 2
 MACHINE="$(kit_py get "$OUT_DIR/run.toml" instance_type)" \
   || { echo "fetch: the run's run.toml has no instance_type" >&2; exit 2; }
+code=0
+SECTIONS="$(kit_py get "$OUT_DIR/run.toml" band_sections)" || code=$?
+case "$code" in
+  0) ;;
+  3) SECTIONS="" ;;
+  *) echo "fetch: the run's run.toml band_sections is unreadable" >&2; exit 2 ;;
+esac
+JUDGE_PUBLISHED=0
+if printf '%s\n' "$SECTIONS" | grep -qx published; then
+  JUDGE_PUBLISHED=1
+fi
 
 miss=0
 invalid=0
@@ -310,6 +326,7 @@ for band in "$OUT_DIR"/kit/bands/*.toml; do
     *) exit 2 ;;
   esac
   for arm in A B; do
+    [ "$JUDGE_PUBLISHED" = 1 ] || continue
     code=0
     kit_py published "$arm" "$band" "$MACHINE" "$OUT_DIR/$arm/results.json" || code=$?
     case "$code" in

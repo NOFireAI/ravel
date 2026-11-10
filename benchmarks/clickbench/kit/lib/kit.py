@@ -66,10 +66,13 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                judge FILE against BANDS' [published.MACHINE]
                                rows (ClickBench's published figures), print
                                the table, exit 1 on a miss; FILE is a kit
-                               results.json, judged only when its
-                               band_sections selected published, or one in
-                               ClickBench's results format (`result` rows of
-                               three tries, `concurrent_qps`)
+                               results.json whose band_sections selected
+                               published, or one in ClickBench's results
+                               format (`result` rows of three tries,
+                               `concurrent_qps`) whose machine is MACHINE;
+                               refuses a kit results.json that did not
+                               select published, and a FILE with no
+                               readable QPS when MACHINE's row has one
   comparable RUN_TOML A.json B.json
                                refuse two arms that are not comparable, with
                                RUN_TOML's server_flags_a and server_flags_b
@@ -104,7 +107,9 @@ results.json carries SqlLatencyReport's statement shape
 `entries` holds one EntryReport per answered statement (id, min_ms, median_ms,
 max_ms, cold_ms, rows_returned, per_run_accounting) and `failed` one
 FailedEntry per statement that did not answer (id, run, error). Both carry the
-kit's `answer` check and entries carry `"error": null`. per_run_accounting is
+kit's `answer` check and `tries_ms`, each try's milliseconds in try order
+(null for a try that did not answer, in failed), and entries carry
+`"error": null`. per_run_accounting is
 null: an HTTP answer carries no executor accounting, as on the Flight lane.
 min_ms (hot) is the best of tries 2 and 3 and cold_ms is try 1; median_ms and
 max_ms run over all three tries. The report says so in its own
@@ -115,6 +120,7 @@ three. The kit's own blocks sit beside them: provenance, totals, error_pooled
 latency per port and heartbeat age; optional), phases and bands.
 """
 
+import decimal
 import hashlib
 import json
 import math
@@ -499,6 +505,9 @@ def check_run(path):
     try:
         sections = band_sections(data)
         if "published" in sections:
+            if "concurrent" not in data["phases"]:
+                raise Refusal("band_sections selects published, which judges concurrent QPS, "
+                              "and phases does not include concurrent")
             for lane in data["lanes"]:
                 published_table(lane, run_band_file(bands[lane], lane),
                                 str(data["instance_type"]))
@@ -919,19 +928,33 @@ def published_table(lane, path, machine):
 
 
 def _hot_cold(tries):
-    """Hot and cold seconds from one upstream result row: hot the best of
-    tries 2 and 3 that answered, cold try 1; None for a figure with no
-    answer."""
+    """Hot and cold seconds from one statement's three tries, in either
+    format: hot the best of tries 2 and 3 that answered, None only when both
+    failed; cold try 1, None when it failed."""
     hot = [t for t in tries[1:3] if _num(t)]
     return (min(hot) if hot else None, tries[0] if _num(tries[0]) else None)
+
+
+def _kit_tries(path, row):
+    """A kit results.json row's tries_ms as seconds, None for a try that did
+    not answer."""
+    tries = row.get("tries_ms")
+    if not isinstance(tries, list) or len(tries) != 3 or not all(
+            t is None or (_num(t) and t >= 0) for t in tries):
+        raise Refusal("%s: statement %s has tries_ms %r, not three tries each a number of "
+                      "at least 0 or null" % (path, row["id"], tries))
+    return [None if t is None else t / 1000.0 for t in tries]
 
 
 def _published_measured(path, report):
     """REPORT's figures as published_bands compares them: per statement
     number, (hot_s, cold_s) with None for a figure not answered, then the
-    concurrent QPS (None when not measured) and a note saying why. REPORT is
-    a kit results.json or one in ClickBench's results format (`result`, one
-    row of three tries per statement, and `concurrent_qps`)."""
+    concurrent QPS, None when REPORT holds none, and a note saying why.
+    REPORT is a kit results.json or one in ClickBench's results format
+    (`result`, one row of three tries per statement, and `concurrent_qps`).
+    Both formats take hot and cold from the three tries the same way
+    (_hot_cold), so a statement with one failed try is judged on the tries
+    that answered in both."""
     if "result" in report:
         rows = report["result"]
         if not isinstance(rows, list) or len(rows) != len(STATEMENT_KEYS) or not all(
@@ -940,39 +963,56 @@ def _published_measured(path, report):
             raise Refusal("%s: result must hold %d rows of three tries, each a number of "
                           "at least 0 or null" % (path, len(STATEMENT_KEYS)))
         figures = dict((n, _hot_cold(r)) for n, r in enumerate(rows, 1))
-        qps = report.get("concurrent_qps")
-        if not _num(qps):
-            return figures, None, "no concurrent_qps in the results"
+        if "concurrent_qps" not in report:
+            return figures, None, "%s has no concurrent_qps field" % path
+        qps = report["concurrent_qps"]
+        if not _num(qps) or qps < 0:
+            raise Refusal("%s: concurrent_qps must be a number of at least 0, got %r"
+                          % (path, qps))
         return figures, qps, ""
     figures = {}
-    for e in report["entries"]:
+    for e in report["entries"] + report["failed"]:
         m = re.match(r"^q(\d\d)", e["id"])
         if not m:
             raise Refusal("%s: statement id %r has no qNN prefix" % (path, e["id"]))
-        figures[int(m.group(1))] = (e["min_ms"] / 1000.0, e["cold_ms"] / 1000.0)
+        figures[int(m.group(1))] = _hot_cold(_kit_tries(path, e))
     conc = report["concurrent"]
     if conc is None:
-        return figures, None, "no concurrent phase ran"
+        return figures, None, ("%s has no concurrent block: no concurrent phase ran, and "
+                               "band_sections published needs one" % path)
     qps, note = _qps(conc["pooled"])
     return figures, qps, note
 
 
+def _dec(v):
+    return decimal.Decimal(repr(v))
+
+
 def _ratio(m, p):
-    return "%.3f" % (m / p) if p else "n/a"
+    return "%.4f" % (m / p) if p else "n/a"
 
 
-def published_bands(path, machine, report):
+def published_bands(path, machine, report, report_path):
     """One run judged against ClickBench's published figures for MACHINE in
-    the band file's [published] section (ADR-4034 D6). A kit results.json is
-    judged only when its band_sections selected published; one in
-    ClickBench's results format always is. Each statement figure the
-    published row answered misses above statement_max_ratio times the
+    the band file PATH's [published] section (ADR-4034 D6). REPORT, read from
+    REPORT_PATH, is a kit results.json whose band_sections selected
+    published, or one in ClickBench's results format for MACHINE. Each
+    statement figure the published row answered misses above
+    statement_max_ratio times the
     published seconds, or when the run did not answer it; concurrent QPS
-    misses below concurrent_qps_min_ratio times the published QPS."""
-    if "result" not in report and "published" not in report["provenance"]["band_sections"]:
-        return []
+    misses below concurrent_qps_min_ratio times the published QPS. Both
+    bounds are inclusive and compared in decimal, so a figure at exactly the
+    factor passes. A run with no QPS to judge against a published one is
+    refused, not judged."""
+    if "result" in report:
+        if report.get("machine") != machine:
+            raise Refusal("%s: machine is %r, not %s; judge it against its own machine's "
+                          "published rows" % (report_path, report.get("machine"), machine))
+    elif "published" not in report["provenance"]["band_sections"]:
+        raise Refusal("%s: published not selected: its band_sections are %s"
+                      % (report_path, ", ".join(report["provenance"]["band_sections"])))
     top, pub = published_table(lane_of(path), path, machine)
-    figures, qps, qps_note = _published_measured(path, report)
+    figures, qps, qps_note = _published_measured(report_path, report)
     r, q = top["statement_max_ratio"], top["concurrent_qps_min_ratio"]
     out = []
     for n, key in enumerate(STATEMENT_KEYS, 1):
@@ -981,13 +1021,15 @@ def published_bands(path, machine, report):
             if p == PUBLISHED_NULL:
                 continue
             m = figures.get(n, (None, None))[i]
+            bound = _dec(r) * _dec(p)
             label = "%s %s_s <= %g x published" % (key, figure, r)
             if m is None:
-                out.append(_row("published", label, None, r * p, "miss",
+                out.append(_row("published", label, None, float(bound), "miss",
                                 "statement %d %s: not answered, published %.3f s"
                                 % (n, figure, p), key))
                 continue
-            out.append(_row("published", label, m, r * p, "miss" if m > r * p else "pass",
+            out.append(_row("published", label, m, float(bound),
+                            "miss" if _dec(m) > bound else "pass",
                             "statement %d %s: measured %.3f s, published %.3f s, ratio %s"
                             % (n, figure, m, p, _ratio(m, p)), key))
     p = pub["concurrent_qps"]
@@ -995,11 +1037,12 @@ def published_bands(path, machine, report):
     if p == PUBLISHED_NULL:
         return out
     if qps is None:
-        out.append(_row("published", label, None, q * p, "inconclusive", qps_note))
-    else:
-        note = "concurrent qps: measured %.3f, published %.3f, ratio %s" % (qps, p, _ratio(qps, p))
-        out.append(_row("published", label, qps, q * p, "miss" if qps < q * p else "pass",
-                        "; ".join(s for s in (note, qps_note) if s)))
+        raise Refusal("%s; [published.%s] has concurrent_qps %s to judge it against"
+                      % (qps_note, machine, p))
+    bound = _dec(q) * _dec(p)
+    note = "concurrent qps: measured %.3f, published %.3f, ratio %s" % (qps, p, _ratio(qps, p))
+    out.append(_row("published", label, qps, float(bound), "miss" if _dec(qps) < bound else "pass",
+                    "; ".join(s for s in (note, qps_note) if s)))
     return out
 
 
@@ -2182,6 +2225,8 @@ def statement_report(sid, expected, calls):
     if expected is not None:
         answer["match"] = bool(rows) and all(r == expected for r in rows)
     bad = [c for c in calls if c.get("outcome") != "ok"]
+    answered = dict((int(c["try"]), float(c["duration_s"]) * 1000.0) for c in calls
+                    if c.get("outcome") == "ok")
     if len(calls) != 3 or bad:
         first = bad[0] if bad else None
         if first:
@@ -2190,7 +2235,8 @@ def statement_report(sid, expected, calls):
             run = int(first["try"]) - 1
         else:
             error, run = "%d of 3 tries recorded" % len(calls), len(calls)
-        return None, {"id": sid, "run": run, "error": error, "answer": answer}
+        return None, {"id": sid, "run": run, "error": error, "answer": answer,
+                      "tries_ms": [answered.get(t) for t in (1, 2, 3)]}
     answer["answered"] = True
     ms = [float(c["duration_s"]) * 1000.0 for c in calls]
     return {"id": sid, "min_ms": min(ms[1:]), "median_ms": _median(ms), "max_ms": max(ms),
@@ -2465,7 +2511,7 @@ def main(argv):
                 raise Refusal("%s: not readable JSON: %s" % (path, e))
             if not isinstance(report, dict) or "result" not in report:
                 report = validate(path)
-            rows = published_bands(bands, machine, report)
+            rows = published_bands(bands, machine, report, path)
             print_table(rows, label)
             return 1 if any(r["verdict"] == "miss" for r in rows) else 0
         elif cmd == "relative" and len(args) in (3, 4):

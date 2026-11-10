@@ -187,14 +187,20 @@ q43 = "FILL-IN-ON-REFERENCE-MACHINE"
 # One arm judged against ClickBench's published Ravel figures for the machine
 # the run used (ADR-4034 D6; kit.py published_bands). Select "published" in
 # run.toml's band_sections; the kit then refuses a run.toml whose
-# instance_type has no [published.<instance_type>] table below. fetch.sh
-# judges both arms and exits 1 on a miss.
+# instance_type has no [published.<instance_type>] table below, or whose
+# phases leave out concurrent. fetch.sh judges both arms and exits 1 on a
+# miss.
 #
-# A statement misses when its measured hot or cold time exceeds
+# In both a kit results.json and ClickBench's own results format, hot is the
+# best of tries 2 and 3 that answered, missing only when both failed; cold is
+# try 1. A statement misses when its measured hot or cold time exceeds
 # statement_max_ratio times the published one, or when the published row
 # answered it and the measured one did not. Concurrent QPS misses below
-# concurrent_qps_min_ratio times the published figure; it is inconclusive
-# when the run had no concurrent phase. Basis: ADR-4034 D6. Two v0.31 runs on
+# concurrent_qps_min_ratio times the published figure; a results file with no
+# readable concurrent QPS, judged against a table that has one, is refused
+# with exit 2, not judged. Both bounds are inclusive. A file in ClickBench's
+# format whose machine is not the one named is refused with exit 2.
+# Basis: ADR-4034 D6. Two v0.31 runs on
 # c6a.large read 0.098 and 0.112 QPS, 13 percent apart, so a QPS factor
 # closer to 1 would miss on run-to-run noise.
 [published]
@@ -202,11 +208,10 @@ statement_max_ratio = 1.10
 concurrent_qps_min_ratio = 0.90
 
 # One table per machine. source is the upstream results file and the
-# ClickBench commit it was read at, as <file>@<commit>, the form the
-# pre-registration's published baseline line quotes. Each qNN row is
-# [hot, cold] in seconds, read from that file's result row: hot is the best of
-# its second and third tries, cold its first, the definitions this file's
-# header gives. "null" is a figure the published run did not answer; it has no
+# ClickBench commit it was read at, as <file>@<commit>. The pre-registration's
+# published baseline line names this band file at a Ravel commit instead, as
+# rlog.toml@<ravel sha>. Each qNN row is [hot, cold] in seconds, read from
+# that file's result row by the hot and cold rule above. "null" is a figure the published run did not answer; it has no
 # band. concurrent_qps is the file's concurrent_qps. The kit's copies of these
 # files are benchmarks/clickbench/kit/testdata/published/v0.28.0/.
 
