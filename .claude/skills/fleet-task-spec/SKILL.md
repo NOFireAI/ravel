@@ -32,6 +32,9 @@ just the unattended one.
 ```
 EXPECTS_REF: yes
 
+gate_tier: <executor|merge|script-only>
+disk_floor_gb: <N>
+
 HARNESS REQUIREMENT (overrides CLAUDE.md's workspace-isolation section for
 you specifically -- you are a fleet executor, not a local subagent sharing
 someone else's session tree): commit directly on this dispatched checkout's
@@ -705,6 +708,16 @@ the declaration:
 - `EXPECTS_REF: yes` and no ref = the agent never committed and the
   workdir is gone. Re-dispatch; do not try to recover.
 - `EXPECTS_REF: no` and no ref = expected. The deliverable is the report.
+
+**Every spec also declares its gate tier and disk floor** (ADR-4034 D2),
+each on its own line: `gate_tier:` one of `executor`, `merge` or
+`script-only`, and `disk_floor_gb:` a positive integer, the free space
+the gate needs. `bin/agent-cli dispatch` refuses a spec without both
+(exit 2, nothing dispatched) and records them in the ledger line, and
+`bin/agent-cli spec-lint` reports the same refusal. A script-only task
+that builds nothing uses a small floor (10); a cargo gate uses the
+measured band in CLAUDE.md for its closure. Use the same number in the
+spec's headroom guard.
 
 Do not trust `fleet_status`'s text at face value: it has printed a
 `result at refs/heads/task/<id>/result` line even when that ref was never

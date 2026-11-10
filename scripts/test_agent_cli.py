@@ -187,6 +187,26 @@ class SpecLint(unittest.TestCase):
     def test_a_clean_spec_has_no_hits(self):
         self.assertEqual(cli.lint_spec_text("plain text with $HOME and 'quotes'\n"), [])
 
+    def _spec_lint(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "spec.txt"
+            p.write_text(text)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.main(["spec-lint", str(p)])
+        return rc, buf.getvalue()
+
+    def test_spec_lint_refuses_what_dispatch_refuses(self):
+        # FLIP: spec-lint checking characters only reports this spec clean
+        # (rc 0), while dispatch refuses it for the missing head lines.
+        rc, out = self._spec_lint("plain spec\ndisk_floor_gb: 10\n")
+        self.assertEqual(rc, 1)
+        self.assertIn("no gate_tier line", out)
+
+    def test_spec_lint_passes_a_spec_with_both_head_lines(self):
+        rc, _ = self._spec_lint("gate_tier: script-only\ndisk_floor_gb: 10\nplain spec\n")
+        self.assertEqual(rc, 0)
+
 
 class AdrSections(unittest.TestCase):
     TEXT = ("# ADR-1\n\n## Decision\nbody\n```\n## not a heading\n```\n### Sub\nx\n"

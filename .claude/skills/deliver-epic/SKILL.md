@@ -155,7 +155,9 @@ the first ledger entry.
    Read its exit code: 0 dispatched and recorded; 1 dispatched but a
    ledger record failed, so fix the ledger and never redispatch; 2 not
    dispatched, or the outcome is unknown and the intent is left open,
-   and the message says which. The intent script's own refusals pass
+   and the message says which. A spec without its `gate_tier:` and
+   `disk_floor_gb:` lines is one such exit 2, refused before anything is
+   called (the fleet-task-spec template carries both). The intent script's own refusals pass
    through: 65 means a pull request already addresses the ticket, 66
    that one is already touching those files, 69 that GitHub could not be
    asked, which is not the same as a clean answer. Resolve the named pull
@@ -169,7 +171,7 @@ the first ledger entry.
    Both records matter, which is why the command runs both. The intent
    script writes COMMENTS, which close out the dangling-intent check;
    `epic-orchestrator.sh record` writes the `- #<ticket> task=<uuid>
-   dispatched` line into the issue BODY and reads it back to prove it
+   dispatched tier=<t> floor=<n>` line into the issue BODY and reads it back to prove it
    arrived (exit 70 if not: `gh` exits 0 on an edit another session
    overwrote), and indexes it locally. `bin/agent-cli epic <epic>` reads
    the body and nothing else, so a task recorded only in comments is
