@@ -2476,17 +2476,36 @@ did before.
 - **The catalog's own retry stays.** A refused catalog decode still runs
   `evict_until_fits` and retries once, in addition to the budget's evictor.
   Its eviction-skip test is unchanged.
-- **What the catalog counts.** An entry dropped by the pressure evictor is
-  counted in `Catalog::decoded_cache_memory_evictions`, and its reservation
-  bytes count as freed. A resolve that still holds the entry returns those
-  bytes to the budget only when it drops the entry, so the budget's retry
-  can still be refused. That is the ordinary typed refusal.
+- **What the catalog counts.** The catalog's pressure pass takes only
+  entries no reader holds, as the decoded cache's does. An entry a resolve
+  still holds an `Arc` to stays cached and its bytes count for nothing,
+  because removing it would not release its reservation. Each entry the
+  pass drops is released at once, its reservation bytes count as freed,
+  and it is counted in `Catalog::decoded_cache_memory_evictions`; a held
+  entry it skips is not counted. This matters most for a host-memory gate
+  refusal, which the budget admits on the ledger alone once the evictor
+  reports the gate's shortfall freed: counting a held entry's bytes would
+  admit it with no byte returned and the host still below the floor. The
+  catalog's own `evict_until_fits` retry keeps dropping held entries, as
+  ADR-1702 decision 6 describes.
+- **The counter.** `ravel_catalog_decoded_cache_memory_evictions_total`
+  now moves for the pressure evictor's refusals of either cause and from
+  any consumer, as well as for the catalog's own retry. Its HELP text says
+  so, and ADR-1170's pressure-evictor counter amendment supersedes the
+  sentences there that said it moves only for a catalog decode and never
+  on a host-memory gate refusal.
 
 No metric family is added. The tests that pin this are, in
 `services/ravel-server/src/pressure_evictor.rs`,
 `with_no_decoded_cache_a_refused_reservation_evicts_the_catalog_cache`,
 `a_host_memory_refusal_evicts_the_catalog_cache`,
 `an_attached_decoded_cache_is_asked_before_the_catalog` and
-`a_second_install_on_one_budget_is_refused`, and in
+`a_second_install_on_one_budget_is_refused`; in
 `crates/ravel-catalog/src/catalog.rs`,
-`evict_for_pressure_frees_lru_entries_until_want_is_covered`.
+`evict_for_pressure_frees_lru_entries_until_want_is_covered`,
+`a_held_entry_frees_nothing_for_a_host_memory_refusal`,
+`a_held_entry_frees_nothing_for_an_accounted_refusal` and
+`a_pressure_pass_skips_a_held_entry_and_takes_the_next_unheld_one`; and in
+`services/ravel-server/tests/catalog_memory_budget_e2e.rs`,
+`the_fetch_gauge_counts_the_catalogs_held_decodes`, which pins the
+counter's HELP text.

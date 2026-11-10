@@ -1019,6 +1019,28 @@ impl<V> DecodedTenantCache<V> {
         self.reserved_bytes = self.reserved_bytes.saturating_sub(entry.reserved_bytes);
         Some(entry)
     }
+
+    /// The stamp of this tenant's least-recently-used entry that no reader
+    /// holds: the cache's `Arc` is the value's only strong handle.
+    fn lru_unheld_tick(&self) -> Option<u64> {
+        self.by_use
+            .iter()
+            .find(|(_, key)| {
+                self.entries
+                    .get(key.as_str())
+                    .is_some_and(|entry| Arc::strong_count(&entry.value) == 1)
+            })
+            .map(|(tick, _)| *tick)
+    }
+
+    /// Remove the entry stamped `tick` and return it, or `None` when no entry
+    /// carries that stamp.
+    fn remove_at(&mut self, tick: u64) -> Option<DecodedEntry<V>> {
+        let key = self.by_use.remove(&tick)?;
+        let entry = self.entries.remove(&key)?;
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(entry.reserved_bytes);
+        Some(entry)
+    }
 }
 
 /// A cache of decoded objects that each carry their own memory reservation
@@ -1042,7 +1064,9 @@ impl<V> DecodedTenantCache<V> {
 ///   locks, so concurrent inserts can leave them briefly above the bound.
 /// - Across every tenant of BOTH caches, on memory pressure:
 ///   [`DecodedCaches::evict_until_fits`] drops entries least-recently-used
-///   first until the refused reservation would fit. Without it, a finite
+///   first until the catalog's own refused decode would fit, and
+///   [`DecodedCaches::evict_for_pressure`] drops entries no reader holds,
+///   least-recently-used first, for another consumer's refused reservation. Without it, a finite
 ///   [`ravel_memory::MemoryBudget`] wired into the catalog could be held
 ///   entirely by other tenants' cached entries, and every later decode would
 ///   be refused with nothing able to give the memory back. A reservation
@@ -1050,7 +1074,8 @@ impl<V> DecodedTenantCache<V> {
 ///   [`crate::Catalog::reserve_decoded`].
 ///
 /// An entry evicted by any of these bounds releases its reservation only when the
-/// last `Arc` to it drops. A resolve that is still holding the value keeps it
+/// last `Arc` to it drops; [`DecodedCaches::evict_for_pressure`] alone skips
+/// an entry a reader holds, so every entry it drops is released at once. A resolve that is still holding the value keeps it
 /// charged to the budget after the cache has forgotten it, so an eviction
 /// pass can free less than the entries it dropped were charged; the pass
 /// bounds itself by the number of entries it removes rather than by the bytes
@@ -1158,6 +1183,45 @@ impl<V> DecodedCache<V> {
         evicted.map(|entry| entry.reserved_bytes)
     }
 
+    /// The stamp of the least-recently-used entry no reader holds, across
+    /// every tenant, or `None` when every cached entry is held or nothing is
+    /// cached.
+    fn lru_unheld_tick(&self) -> Option<u64> {
+        self.tenants
+            .lock()
+            .values()
+            .filter_map(|cache| cache.lru_unheld_tick())
+            .min()
+    }
+
+    /// Drop the least-recently-used entry no reader holds, across every
+    /// tenant, and return its [`DecodedEntry::reserved_bytes`]; `None` when
+    /// every cached entry is held or nothing is cached. A held entry stays
+    /// cached. Every new handle to a cached value is cloned by [`Self::get`]
+    /// under the map lock, so an entry whose `Arc` the cache alone holds
+    /// when it is removed under that lock stays unshared, and dropping it
+    /// here, after the lock is released, releases its reservation: the bytes
+    /// returned are bytes the budget got back.
+    fn evict_lru_unheld_bytes(&self) -> Option<u64> {
+        let mut tenants = self.tenants.lock();
+        let (tick, tenant) = tenants
+            .iter()
+            .filter_map(|(tenant, cache)| cache.lru_unheld_tick().map(|tick| (tick, *tenant)))
+            .min()?;
+        let evicted = tenants.get_mut(&tenant).and_then(|c| c.remove_at(tick));
+        if tenants
+            .get(&tenant)
+            .is_some_and(|cache| cache.entries.is_empty())
+        {
+            tenants.remove(&tenant);
+        }
+        drop(tenants);
+        let entry = evicted?;
+        let bytes = entry.reserved_bytes;
+        drop(entry);
+        Some(bytes)
+    }
+
     /// Number of entries currently resident for `tenant`.
     #[cfg(test)]
     pub(crate) fn entry_count(&self, tenant: &TenantHash) -> usize {
@@ -1230,14 +1294,15 @@ pub(crate) type PostingsCache = DecodedCache<ChargedPostings>;
 pub(crate) struct DecodedCaches {
     parts: PartCache,
     postings: PostingsCache,
-    /// Entries dropped by [`Self::evict_until_fits`], cumulative.
+    /// Entries dropped by [`Self::evict_until_fits`] and
+    /// [`Self::evict_for_pressure`], cumulative.
     memory_evictions: AtomicU64,
     /// The byte bound on [`Self::reserved_bytes`] applied after each insert
     /// (`CatalogConfig::decoded_cache_max_bytes`); `u64::MAX` when unset.
     max_bytes: AtomicU64,
     /// Entries dropped by the byte bound, cumulative. Kept apart from
     /// [`Self::memory_evictions`], which counts only evictions made for a
-    /// refused decode.
+    /// refused reservation.
     byte_bound_evictions: AtomicU64,
     /// Values not cached because their own reservation exceeds the byte
     /// bound, cumulative. Each one is decoded again on its next use.
@@ -1398,20 +1463,30 @@ impl DecodedCaches {
     }
 
     /// Give memory back to another consumer's refused reservation
-    /// (ADR-3326 decision 4, pressure-evictor amendment): drop entries
-    /// least-recently-used first, across every tenant of both caches, until
-    /// the evicted entries' [`DecodedEntry::reserved_bytes`] reach `want` or
-    /// no entry remains, and return their sum. An entry a resolve still holds
-    /// returns its reservation to the budget only when that holder drops it.
+    /// (ADR-3326 decision 4, pressure-evictor amendment): drop entries no
+    /// reader holds, least-recently-used first across every tenant of both
+    /// caches, until the dropped entries' [`DecodedEntry::reserved_bytes`]
+    /// reach `want` or no unheld entry remains, and return their sum. Every
+    /// byte returned was released to the budget by the time this returns.
+    ///
+    /// An entry a resolve still holds an `Arc` to is skipped: it stays cached
+    /// and its bytes count for nothing, since removing it would not release
+    /// its reservation. This is the decoded column-block cache's rule
+    /// (`DecodedColumnCache::evict_for_pressure`), and it is what keeps a
+    /// host-memory gate refusal, which the budget admits when the evictor
+    /// reports the shortfall freed, from being admitted on bytes that never
+    /// came back. [`Self::evict_until_fits`], the catalog's own decode retry,
+    /// keeps dropping held entries.
+    ///
     /// Unlike [`Self::evict_until_fits`] this does not consult the budget's
     /// `reserved()`: the caller is a different consumer's refusal, not this
-    /// catalog's own decode. Each evicted entry is counted on
-    /// [`Self::memory_evictions`].
+    /// catalog's own decode. Each dropped entry is counted on
+    /// [`Self::memory_evictions`]; a skipped held entry is not.
     pub(crate) fn evict_for_pressure(&self, want: u64) -> u64 {
         let mut freed = 0u64;
         let mut dropped = 0u64;
         while freed < want {
-            match self.evict_one_lru_bytes() {
+            match self.evict_one_unheld_lru_bytes() {
                 Some(bytes) => {
                     freed = freed.saturating_add(bytes);
                     dropped += 1;
@@ -1452,6 +1527,30 @@ impl DecodedCaches {
         self.parts
             .evict_lru_bytes()
             .or_else(|| self.postings.evict_lru_bytes())
+    }
+
+    /// [`Self::evict_one_lru_bytes`] over the entries no reader holds
+    /// ([`DecodedCache::evict_lru_unheld_bytes`]), with the same stale-peek
+    /// caveat.
+    fn evict_one_unheld_lru_bytes(&self) -> Option<u64> {
+        let parts_first = match (
+            self.parts.lru_unheld_tick(),
+            self.postings.lru_unheld_tick(),
+        ) {
+            (Some(parts), Some(postings)) => parts <= postings,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if parts_first {
+            if let Some(bytes) = self.parts.evict_lru_unheld_bytes() {
+                return Some(bytes);
+            }
+        } else if let Some(bytes) = self.postings.evict_lru_unheld_bytes() {
+            return Some(bytes);
+        }
+        self.parts
+            .evict_lru_unheld_bytes()
+            .or_else(|| self.postings.evict_lru_unheld_bytes())
     }
 
     /// Bytes the reservations of every entry in both caches carry

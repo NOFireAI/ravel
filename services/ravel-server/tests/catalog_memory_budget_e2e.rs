@@ -548,15 +548,29 @@ async fn the_fetch_gauge_counts_the_catalogs_held_decodes() {
             .contains("the catalog's snapshot-part and name-postings decodes"),
         "{after}"
     );
-    for counter in [RETRIES, EVICTIONS] {
-        assert!(
-            help(&after, counter).contains(
-                "moves only when the shared ADR-1170 process memory budget refuses a catalog \
-                 decode reservation that dropping cached entries could admit"
-            ),
-            "{after}"
-        );
-    }
+    assert!(
+        help(&after, RETRIES).contains(
+            "moves only when the shared ADR-1170 process memory budget refuses a catalog \
+             decode reservation that dropping cached entries could admit"
+        ),
+        "{after}"
+    );
+    let evictions_help = help(&after, EVICTIONS);
+    assert!(
+        evictions_help.contains(
+            "by the budget's pressure evictor, for a refusal from any consumer (a SQL scan, a \
+             fetcher, a live reader or a catalog decode) by the ledger limit or the host-memory \
+             gate"
+        ) && evictions_help.contains(
+            "The pressure evictor drops only entries no query holds and does not count a held \
+             entry it skips."
+        ),
+        "{after}"
+    );
+    assert!(
+        !evictions_help.contains("never moves on a refusal the host-memory gate made"),
+        "{after}"
+    );
     eprintln!(
         "pinned figures: part {} bytes, postings {} bytes, probe segment {} bytes",
         folded.part_bytes, folded.postings_bytes, folded.probe_segment_bytes
