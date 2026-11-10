@@ -22,6 +22,17 @@
 //! `FinalPartitioned` aggregate merges the partial states of each group it
 //! receives whatever the partition count. The operators above the aggregate
 //! read its output partitioning from the rebuilt node.
+//!
+//! A plan that holds an operator needing co-partitioned inputs is left
+//! whole: an `InterleaveExec` (a `UNION` of equally hash-partitioned
+//! children), a `HashJoinExec` or `SymmetricHashJoinExec` in `Partitioned`
+//! mode, or a `SortMergeJoinExec`. Each pairs partition `i` of one input with
+//! partition `i` of another, so widening the exchange under only one of them
+//! would pair different hash buckets, and DataFusion reports that as an
+//! error rather than a wrong answer. Ravel's sessions keep
+//! `repartition_joins`, `repartition_windows` and `repartition_sorts` off, so
+//! today every hash exchange comes from an aggregate and none of these
+//! operators plans over one; the skip keeps the rule correct if that changes.
 
 use std::sync::Arc;
 
@@ -30,7 +41,11 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::Result as DFResult;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::joins::{
+    HashJoinExec, PartitionMode, SortMergeJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
+};
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::union::InterleaveExec;
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, Partitioning, ReplaceChildrenOptions,
 };
@@ -88,13 +103,30 @@ impl FinalExchangeFloor {
     }
 }
 
+/// Whether `node` pairs partition `i` of one input with partition `i` of
+/// another. See the module docs.
+fn co_partitions_its_inputs(node: &Arc<dyn ExecutionPlan>) -> bool {
+    if node.downcast_ref::<InterleaveExec>().is_some()
+        || node.downcast_ref::<SortMergeJoinExec>().is_some()
+    {
+        return true;
+    }
+    if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+        return *join.partition_mode() == PartitionMode::Partitioned;
+    }
+    if let Some(join) = node.downcast_ref::<SymmetricHashJoinExec>() {
+        return join.partition_mode() == StreamJoinPartitionMode::Partitioned;
+    }
+    false
+}
+
 impl PhysicalOptimizerRule for FinalExchangeFloor {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if self.floor == 0 {
+        if self.floor == 0 || plan.exists(|node| Ok(co_partitions_its_inputs(node)))? {
             return Ok(plan);
         }
         plan.transform_up(|node| self.rewrite(node)).data()
@@ -115,6 +147,7 @@ mod tests {
     use super::*;
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::common::{JoinType, NullEquality};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::functions_aggregate::count::count_udaf;
@@ -291,20 +324,107 @@ mod tests {
         }
     }
 
-    /// A floor of 0, and an exchange already at or above the floor, leave the
-    /// plan as it is.
+    /// An exchange already at or above the floor is left as it is.
     ///
-    /// FLIP: drop the floor-0 return and the `n >= floor` check, so `n` is
-    /// always set to the floor, and the 0 case no longer reads 8 and the 32
-    /// case narrows to 16.
+    /// FLIP: drop the `n >= floor` check, so `n` is always set to the floor,
+    /// and the 32 case narrows to 16.
     #[test]
-    fn the_rule_is_a_no_op_at_floor_zero_and_above_the_floor() {
-        for (floor, n) in [(0, 8), (16, 32), (16, 16)] {
+    fn the_rule_is_a_no_op_at_and_above_the_floor() {
+        for n in [32, 16] {
             let plan = final_over_hash(n, false);
             let before = plan_text(&plan);
-            let after = optimize(floor, plan);
-            assert_eq!(plan_text(&after), before, "floor {floor}, n {n}");
+            let after = optimize(16, plan);
+            assert_eq!(plan_text(&after), before, "n {n}");
             assert_eq!(child_exchange(&after).partitioning().partition_count(), n);
         }
+    }
+
+    /// A `UNION` of a grouped statement and another `Hash([k], 8)` input,
+    /// interleaved, and a partitioned hash join of the same two inputs, are
+    /// left unrewritten: widening only the aggregate's exchange would leave
+    /// the two inputs at 16 and 8 partitions.
+    ///
+    /// FLIP: drop the `co_partitions_its_inputs` skip in `optimize`, and the
+    /// join's left input reads `Hash([k@0], 16)` against the right's 8, while
+    /// the interleave's rebuild fails ("Can not create InterleaveExec: new
+    /// children can not be interleaved").
+    #[test]
+    fn a_plan_that_co_partitions_its_inputs_is_left_unrewritten() {
+        let interleaved: Arc<dyn ExecutionPlan> = Arc::new(
+            InterleaveExec::try_new(vec![
+                final_over_hash(8, false),
+                exchange(scan(4, false), 8, false),
+            ])
+            .expect("both inputs are Hash([k], 8)"),
+        );
+
+        let left = final_over_hash(8, false);
+        let right = exchange(scan(4, false), 8, false);
+        let on = vec![(
+            col("k", &left.schema()).expect("k"),
+            col("k", &right.schema()).expect("k"),
+        )];
+        let joined: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("join"),
+        );
+
+        for plan in [joined, interleaved] {
+            let before = plan_text(&plan);
+            let after = FinalExchangeFloor::new(16)
+                .optimize(plan, &ConfigOptions::default())
+                .unwrap_or_else(|e| panic!("rule runs: {e}\n{before}"));
+            assert_eq!(plan_text(&after), before);
+        }
+    }
+
+    /// Without a co-partitioning operator the same grouped input under a
+    /// `CollectLeft` join is still widened, so the skip is scoped to the
+    /// operators that need it.
+    ///
+    /// FLIP: return true from `co_partitions_its_inputs` for every
+    /// `HashJoinExec` and the exchange stays at 8.
+    #[test]
+    fn a_collect_left_join_does_not_stop_the_rewrite() {
+        let left = scan(1, false);
+        let right = final_over_hash(8, false);
+        let on = vec![(
+            col("k", &left.schema()).expect("k"),
+            col("k", &right.schema()).expect("k"),
+        )];
+        let joined: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("join"),
+        );
+        let after = optimize(16, joined);
+        let final_aggregate = &after.children()[1];
+        assert_eq!(
+            child_exchange(final_aggregate)
+                .partitioning()
+                .partition_count(),
+            16,
+            "{}",
+            plan_text(&after)
+        );
     }
 }

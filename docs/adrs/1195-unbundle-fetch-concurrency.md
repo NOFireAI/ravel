@@ -242,10 +242,19 @@ same statement with an 8-partition exchange takes the spill retry.
    `derived-floor` (a derived count under 16, raised to 16), `derived` (a
    derived count of 16 or more, unchanged) or `flag` (an explicit count,
    unchanged).
-5. **Every other read of the count keeps the engine count.** The scan
-   providers, the SQL I/O shape's scan fan-out (`SqlExecutor::sql_io_shape`)
-   and the aggregate reserve-ahead envelope width (`process_envelope_width`)
-   read `sql_partition_count`.
+5. **Every other read of the count keeps the engine count, except the
+   envelope width.** The scan providers and the SQL I/O shape's scan fan-out
+   (`SqlExecutor::sql_io_shape`) read `sql_partition_count`. The aggregate
+   reserve-ahead envelope width (`process_envelope_width`) bounds how many
+   aggregate streams run at once, and the floored final aggregate runs at the
+   floor, so it reads `max(sql_partition_count, floor)` while the floor is on
+   and `sql_partition_count` when it is 0 (`SqlConfig::aggregate_stream_count`).
+6. **A plan that co-partitions its inputs is left as it is.** An
+   `InterleaveExec`, a `Partitioned` `HashJoinExec` or `SymmetricHashJoinExec`,
+   or a `SortMergeJoinExec` pairs partition `i` of one input with partition
+   `i` of another, so widening one input's exchange alone breaks that
+   pairing. The rule skips any plan holding one of them rather than widen
+   every exchange the pairing covers.
 
 ### First-attempt floor consequences
 
@@ -260,8 +269,8 @@ same statement with an 8-partition exchange takes the spill retry.
   `bucketed_final_aggregate`), where 16 streams exhaust a 256 MiB pool that
   their 4 or 8 fit. Under a bounded top-k aggregate the 16 streams' fixed
   cost puts the peak at 2,100,224 bytes at both 20,000 and 200,000 keys
-  (`bounded_topk_aggregate`). Those tests, and `first_groups`' 1 MiB pool
-  test, set the floor to 0.
+  (`bounded_topk_aggregate`). Those tests set the floor to 0;
+  `first_groups`' pool test runs at the floor under a 4 MiB pool.
 - The operators above a widened final aggregate, up to the next exchange or
   merge, run at 16 streams. In a `COUNT(DISTINCT)` plan that includes the
   outer partial aggregate, which sits on the inner final aggregate: ClickBench

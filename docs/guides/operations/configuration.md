@@ -2209,10 +2209,11 @@ While the SQL partition count is derived, the hash exchange that feeds a
 final grouped aggregate has at least 16 partitions. A high-cardinality
 `GROUP BY` then builds smaller final hash tables and fits in less memory, so
 on a small host it answers in memory more often instead of taking the spill
-retry. Scans and partial aggregation keep the derived count, and so does
-everything else in the plan below that exchange. A statement with no such
+retry. Scans and the first partial aggregation keep the derived count, and so
+does everything else in the plan below that exchange. A statement with no such
 exchange is unchanged: one whose aggregates are not exact-typed, and the spill
-retry, which plans without exchanges. `--sql-partition-count` or
+retry, which plans without exchanges. So is a statement whose plan pairs the
+partitions of two inputs, such as a `UNION` that DataFusion interleaves. `--sql-partition-count` or
 `--fetch-concurrency` turns the floor off, so the exchange has the count you
 set. There is no flag for the floor itself. Startup logs the exchange's count:
 
