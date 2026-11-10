@@ -37,7 +37,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
 use crate::bucketed_final_aggregate::{
-    BUCKETED_FINAL_AGGREGATE_MAX_BITS, BucketedFinalAggregateExec,
+    BUCKETED_FINAL_AGGREGATE_MAX_BITS, BucketedFinalAggregateExec, routed_types,
 };
 use crate::logs_scan::LogsScanExec;
 use crate::memory::spill_mode_headroom;
@@ -156,10 +156,22 @@ pub fn derive_bucket_spill_tuning(
 
     // 2 x T / (P x 0.75 x S) = 8 x A x N / (3 x n x P x S), in exact
     // integers: bits is the least b with 8 x A x N <= 2^b x 3 x n x P x S.
-    let numerator = 8u128 * u128::from(inputs.asked_bytes) * u128::from(total);
-    let unit = 3u128 * u128::from(consumed) * inputs.partitions as u128 * share as u128;
+    let numerator = 8u128
+        .checked_mul(u128::from(inputs.asked_bytes))
+        .and_then(|product| product.checked_mul(u128::from(total)))
+        .ok_or(NoTuning::Degenerate)?;
+    let unit = 3u128
+        .checked_mul(u128::from(consumed))
+        .and_then(|product| product.checked_mul(inputs.partitions as u128))
+        .and_then(|product| product.checked_mul(share as u128))
+        .ok_or(NoTuning::Degenerate)?;
     let mut bits: u8 = 0;
-    while numerator > unit << bits {
+    loop {
+        // A `2^b x unit` past u128 exceeds every u128 numerator: b fits.
+        match unit.checked_mul(1u128 << bits) {
+            Some(scaled) if numerator > scaled => {}
+            _ => break,
+        }
         if bits >= BUCKETED_FINAL_AGGREGATE_MAX_BITS {
             return Err(NoTuning::TooManyBits);
         }
@@ -184,8 +196,16 @@ pub fn derive_bucket_spill_tuning(
     }
 
     let partitions = inputs.partitions as u64;
-    let descriptor_need = 2 * partitions * (1u64 << bits) + partitions;
-    let budget = inputs.nofile_soft / (2 * inputs.slots.max(1));
+    let descriptor_need = partitions
+        .checked_mul(2u64 << bits)
+        .and_then(|need| need.checked_add(partitions))
+        .ok_or(NoTuning::Degenerate)?;
+    let budget = inputs.nofile_soft
+        / inputs
+            .slots
+            .max(1)
+            .checked_mul(2)
+            .ok_or(NoTuning::Degenerate)?;
     if descriptor_need > budget {
         return Err(NoTuning::DescriptorBudget);
     }
@@ -222,13 +242,14 @@ impl BucketSpillPlanShape {
         };
         let partitions = exec.properties().partitioning.partition_count();
         let input = exec.aggregate().input();
-        let column_widths = input
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| field.data_type().primitive_width())
-            .collect::<Option<Vec<_>>>()
-            .ok_or(NoTuning::NotFixedWidth)?;
+        // A routed type that does not resolve has no width either.
+        let column_widths = routed_types(exec.aggregate())
+            .ok()
+            .and_then(Result::ok)
+            .ok_or(NoTuning::NotFixedWidth)?
+            .into_iter()
+            .map(|(_, width)| width)
+            .collect();
         let mut leaves = Vec::new();
         collect_leaves(input, &mut leaves);
         let [leaf] = leaves.as_slice() else {
@@ -507,6 +528,58 @@ mod tests {
         assert_eq!(refused(&|i| i.partitions = 0), NoTuning::Degenerate);
         assert_eq!(refused(&|i| i.spill_consumers = 0), NoTuning::Degenerate);
         assert_eq!(refused(&|i| i.column_widths.clear()), NoTuning::Degenerate);
+    }
+
+    /// Every product the derivation forms is checked: inputs at their type
+    /// maxima return `Degenerate` instead of wrapping or panicking.
+    #[test]
+    fn bucket_spill_derivation_overflow_is_degenerate() {
+        let max = BucketSpillInputs {
+            asked_bytes: u64::MAX,
+            total_rows: Some(u64::MAX),
+            consumed_rows: Some(u64::MAX),
+            partitions: usize::MAX,
+            spill_consumers: 1,
+            query_limit: usize::MAX,
+            column_widths: vec![usize::MAX],
+            nofile_soft: u64::MAX,
+            slots: u64::MAX,
+        };
+        assert_eq!(derive_bucket_spill_tuning(&max), Err(NoTuning::Degenerate));
+        let base = q33(&XXLARGE, u64::MAX);
+        let refused = |edit: &dyn Fn(&mut BucketSpillInputs)| {
+            let mut inputs = base.clone();
+            edit(&mut inputs);
+            derive_bucket_spill_tuning(&inputs)
+        };
+        // 8 x A x N past u128.
+        assert_eq!(
+            refused(&|i| {
+                i.asked_bytes = u64::MAX;
+                i.total_rows = Some(u64::MAX);
+            }),
+            Err(NoTuning::Degenerate)
+        );
+        // 3 x n x P x S past u128.
+        assert_eq!(
+            refused(&|i| {
+                i.consumed_rows = Some(u64::MAX);
+                i.partitions = usize::MAX;
+            }),
+            Err(NoTuning::Degenerate)
+        );
+        // `2 x P x 2^bits + P` past u64 at bits 0.
+        assert_eq!(
+            refused(&|i| i.partitions = 1 << 63),
+            Err(NoTuning::Degenerate)
+        );
+        // `2 x slots` past u64.
+        assert_eq!(refused(&|i| i.slots = u64::MAX), Err(NoTuning::Degenerate));
+        // The largest `slots` that doubles exactly leaves a budget of one.
+        assert_eq!(
+            refused(&|i| i.slots = u64::MAX / 2),
+            Err(NoTuning::DescriptorBudget)
+        );
     }
 
     #[test]
