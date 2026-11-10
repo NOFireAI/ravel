@@ -16,8 +16,13 @@
 (*  * expiry read from the store's advisory last_modified via                    *)
 (*    ClaimExpiryReadLastModifiedAdvisory, plus the holder's declared lease      *)
 (*    capped at MAX_OBSERVED_LEASE (claim.rs::observe, MAX_OBSERVED_LEASE_MS);   *)
-(*  * an unreadable (corrupt) or future-version claim is never stolen            *)
-(*    (StealRefused::UnreadableClaim, NotExpired);                              *)
+(*  * an unreadable (corrupt) or future-version claim is judged by the lease     *)
+(*    ceiling instead, since its declared lease cannot be read, and past that    *)
+(*    expiry it is stolen under CasVersion like any expired claim; before it a   *)
+(*    steal is refused (StealRefused::NotExpired) (ADR-1029, the 2026-11-09      *)
+(*    amendment). The ceiling is its own term (ObservedLease), not folded into   *)
+(*    the abstract expiry, because the model already distinguishes the declared  *)
+(*    lease from MaxObservedLease;                                               *)
 (*  * the cancellation-checkpoint guarded publish, which abandons when the       *)
 (*    claim is lost, AND the ungated publish (the --no-claim CLI path and a      *)
 (*    paused stale worker that ignores checkpoints) which publishes anyway;      *)
@@ -129,11 +134,19 @@ ClaimVer(u)       == VersionOf(ClaimKey(u))
 ClaimContentOf(u) == ContentOf(ClaimKey(u))
 ClaimReadable(u)  == ClaimContentOf(u) # Corrupt
 
-\* Expiry from the advisory last_modified plus the effective lease, compared to
+\* The lease an observer judges a claim by: the declared lease capped at the
+\* ceiling when the payload is readable, and the ceiling itself when it is not,
+\* since an unreadable claim's declared lease is unknown (claim.rs::observe).
+\* The ceiling is modeled separately rather than folded into the abstract
+\* expiry: with DeclaredLease below MaxObservedLease an unreadable claim expires
+\* later than a readable one written at the same time, as it does in Rust.
+ObservedLease(u) == IF ClaimReadable(u) THEN EffLease ELSE MaxObservedLease
+
+\* Expiry from the advisory last_modified plus the observed lease, compared to
 \* the current logical time (the version counter). ADR-1029 decision 1.
 Expired(u) ==
     /\ ClaimPresent(u)
-    /\ ClaimExpiryReadLastModifiedAdvisory(ClaimKey(u)) + EffLease < versionCounter
+    /\ ClaimExpiryReadLastModifiedAdvisory(ClaimKey(u)) + ObservedLease(u) < versionCounter
 
 HoldsClaim(w, u) ==
     /\ ClaimPresent(u)
@@ -224,15 +237,16 @@ Renew(w, u) ==
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, lastGuarded,
                    stolen, partTomb, recVer, lastPub, vanishedOnce>>
 
-\* claim.rs::steal -- CasVersion on the observed version, gated on expiry and a
-\* readable payload. StealRefused (NotExpired/UnreadableClaim) issues no store
-\* request; a losing CAS (someone moved first) changes nothing.
+\* claim.rs::steal -- CasVersion on the observed version, gated on expiry alone.
+\* A readable and an unreadable claim are stolen alike once expired; only the
+\* lease their expiry is judged by differs (ObservedLease). StealRefused
+\* (NotExpired) issues no store request; a losing CAS (someone moved first)
+\* changes nothing.
 Steal(w, u) ==
     /\ CanWrite
     /\ (~LivenessMode \/ w = LThief)
     /\ ClaimPresent(u)
     /\ Expired(u)
-    /\ ClaimReadable(u)
     /\ obsVer[w][u] # 0
     /\ LET v == obsVer[w][u] ok == (ClaimVer(u) = v) IN
         /\ PutCasVersion(ClaimKey(u), v, <<"c", w, "run">>)
@@ -264,8 +278,10 @@ MarkCompleted(w, u) ==
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, lastGuarded,
                    stolen, partTomb, recVer, lastPub, vanishedOnce>>
 
-\* A claim payload becomes unreadable (corruption). Treated as absent by readers
-\* and never stolen. No metadata changes (raw corruption, not a store write).
+\* A claim payload becomes unreadable (corruption). Readers cannot attribute it,
+\* so its expiry is judged by the lease ceiling (ObservedLease), and past that it
+\* is stolen under CasVersion like any expired claim. No metadata changes (raw
+\* corruption, not a store write).
 CorruptClaim(u) ==
     /\ ~LivenessMode
     /\ ClaimPresent(u)

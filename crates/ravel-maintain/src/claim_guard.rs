@@ -585,8 +585,12 @@ impl ClaimGuard {
         }
 
         if unreadable {
-            // Each contender's threshold above already carries its own jitter,
-            // so contenders do not arrive here together and none is waited.
+            // No jitter wait: the only spread between contenders is the one
+            // their skip's reschedule point gave them, and that is at most one
+            // jitter span, so contenders on their periodic pass can still
+            // arrive together. The CAS on the observed version makes that
+            // harmless: one steal lands, the rest get StealLost and a
+            // full-lease reschedule.
             tracing::warn!(
                 key = %observed.key,
                 work_id = %observed.work_id.hex(),

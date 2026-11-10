@@ -40,6 +40,8 @@ This verifies the protocol designs; implementation conformance is argued in
 | MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 136617032 | 13183990 | 19 | 4285 | GitHub hosted ubuntu-24.04, workers auto, Xmx2g | PASS under the 5400 s per-config budget (run 34246991138) |
 | MCCompactionClaims.smoke.cfg | 1.7.4 | 65454526 | 11155721 | 17 | 161 | fleet executor | PASS |
 | MCCompactionClaims.exhaustive.cfg | 1.7.4 | 1972 | 543 | 11 | 2 | fleet executor | PASS |
+| MCCompactionClaims.smoke.cfg | 1.7.4 | 67569662 | 11528777 | 17 | 307 | fleet executor (x86_64, 16 cores), workers 2, Xmx2g, 2026-11-10 | PASS; see "Unreadable-claim steal" below |
+| MCCompactionClaims.exhaustive.cfg | 1.7.4 | 1972 | 543 | 10 | 0 | fleet executor (x86_64, 16 cores), workers 2, Xmx2g, 2026-11-10 | PASS; see "Unreadable-claim steal" below |
 | negative/ownership-as-publication-authority.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
 | negative/heartbeat-memo-cas.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
 | negative/memo-overstamp.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
@@ -69,6 +71,37 @@ model. Only the invariant name and the exit code are stable facts for a VIOLATED
 row (exit 12: an `INVARIANT` failed; exit 13: a `PROPERTY` failed), so that is
 all this table records for one; see "Per-invariant audit" below for which
 invariant each negative control targets.
+
+## Unreadable-claim steal (issue #3209, 2026-11-10)
+
+ADR-1029's 2026-11-09 amendment makes an unreadable claim stealable once its
+store `last_modified` plus `MAX_OBSERVED_LEASE_MS` has passed. `Steal` no
+longer conjoins `ClaimReadable(u)`, and `Expired(u)` judges an unreadable claim
+by `MaxObservedLease` through `ObservedLease(u)` rather than by `EffLease`.
+The two configurations were re-measured with TLC 1.7.4 on Java 21, 2 workers,
+`-Xmx2g`, on an x86_64 fleet executor:
+
+| cfg | before (distinct, depth) | after (distinct, depth) | band |
+|---|---|---|---|
+| MCCompactionClaims.smoke.cfg | 11155721, 17 (65454526 states) | 11528777, 17 (67569662 states) | unchanged, inside 11100000-11700000 |
+| MCCompactionClaims.exhaustive.cfg | 543, 10 | 543, 10 | unchanged, inside 500-580 |
+
+The "before" smoke figure is a 2026-11-10 rerun of the parent commit through
+`scripts/check-tla.sh smoke` and matches the Configurations table. The "after"
+smoke run took 307 s at 2 workers, past the script's fixed 300 s smoke budget,
+so `check-tla.sh smoke` reports TIMEOUT at that worker count; the figure above
+is from TLC run directly with the same arguments and no budget. CI runs with
+`-workers auto` and the earlier 8-worker run took 161 s for a similar count.
+The exhaustive configuration runs under `LivenessMode = TRUE`, where
+`CorruptClaim` is disabled, so its state space cannot change.
+
+The new behaviour is explored: a throwaway invariant asserting that no steal
+of a `Corrupt` payload succeeds is violated in the smoke configuration at depth
+8 (Acquire at version 1, Observe, CorruptClaim, two TimePass, PutPart, Steal),
+and only once the version counter reaches 4, past `last_modified` 1 plus the
+ceiling 2; with `EffLease = 0` a readable claim would already be stealable at
+version 2. Every safety invariant passes over the enlarged state space, and
+every negative control still fires (`scripts/check-tla.sh ci -a maintenance`).
 
 ## Hosted-runner exhaustive budget (issue #1358)
 
@@ -283,5 +316,14 @@ exit code are what a violated row asserts, and both are reproducible.
   one terminal record; the conservation count arithmetic and the RLOG merge
   memory bound are out of scope. The model follows the code's CreateIfAbsent
   and content-addressing, which is what the correctness invariants need.
+- `Renew` and `MarkCompleted` conjoin `ClaimReadable(u)`, but
+  `claim.rs::renew` and `claim.rs::mark_completed` are a CasVersion on the held
+  version and never read the payload. `CorruptClaim` keeps the stored version,
+  so in Rust the holder of an in-place corrupted claim could still renew or
+  complete it, rewriting a readable payload. The model omits those behaviours,
+  so it under-approximates the code there and the invariants are not checked
+  over them. A write that corrupts the claim through the store moves its
+  version, which defeats both CAS operations in the code, so the omitted
+  behaviours arise only from in-place corruption at an unchanged version.
 - No disagreement between the normative docs (ADR-0065, ADR-1029, ADR-0048,
   ADR-0979) and the code was found within this task's scope.
