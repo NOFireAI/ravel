@@ -665,6 +665,24 @@ fn render_fold_report(
         "metrics_label_index_erasure_list_requests: {}\n",
         report.metrics_label_index_erasure_list_requests
     ));
+    out.push_str(&format!("sealed_part_puts: {}\n", report.sealed_part_puts));
+    out.push_str(&format!(
+        "sealed_day_leaf_puts: {}\n",
+        report.sealed_day_leaf_puts
+    ));
+    out.push_str(&format!(
+        "sealed_day_previous_leaf_gets: {}\n",
+        report.sealed_day_previous_leaf_gets
+    ));
+    out.push_str(&format!(
+        "key_index_unchanged_section_gets: {}\n",
+        report.key_index_unchanged_section_gets
+    ));
+    out.push_str(&format!("head_digest: {}\n", report.head_digest));
+    // The same array `--json` carries.
+    let retired_hours = serde_json::to_string(&report.retired_hours)
+        .map_err(|err| anyhow::anyhow!("failed to serialize retired_hours: {err}"))?;
+    out.push_str(&format!("retired_hours: {retired_hours}\n"));
     Ok(out)
 }
 
@@ -1744,5 +1762,70 @@ mod tests {
             "an enforcing CLI fold reads the real generation history (sgc 2), not \
              the implicit generation 0 (sgc 1)"
         );
+    }
+
+    /// The fold report's ADR-3939 harness figures reach both the text form
+    /// and the `--json` document, each under its field name.
+    #[tokio::test]
+    async fn fold_report_renders_the_adr_3939_figures_in_text_and_json() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog =
+            ravel_catalog::Catalog::new(store, CatalogConfig::default()).expect("catalog");
+        let mut report = catalog
+            .fold(
+                &TenantId::new("cli-fold-figures").hash(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                0,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        report.sealed_part_puts = 3;
+        report.sealed_day_leaf_puts = 5;
+        report.sealed_day_previous_leaf_gets = 7;
+        report.key_index_unchanged_section_gets = 11;
+        report.head_digest = "ab".repeat(32);
+        report.retired_hours = vec![17, 19];
+        let render = |json| {
+            render_fold_report(
+                &report,
+                StoreSelection::explicit(crate::store::StoreKind::Memory),
+                SignalArg::Logs,
+                0,
+                1,
+                json,
+            )
+            .expect("render")
+        };
+
+        let value: serde_json::Value = serde_json::from_str(&render(true)).expect("one JSON doc");
+        for (field, want) in [
+            ("sealed_part_puts", serde_json::json!(3)),
+            ("sealed_day_leaf_puts", serde_json::json!(5)),
+            ("sealed_day_previous_leaf_gets", serde_json::json!(7)),
+            ("key_index_unchanged_section_gets", serde_json::json!(11)),
+            ("head_digest", serde_json::json!("ab".repeat(32))),
+            ("retired_hours", serde_json::json!([17, 19])),
+        ] {
+            assert_eq!(value[field], want, "{field}");
+        }
+
+        let text = render(false);
+        for line in [
+            "sealed_part_puts: 3".to_string(),
+            "sealed_day_leaf_puts: 5".to_string(),
+            "sealed_day_previous_leaf_gets: 7".to_string(),
+            "key_index_unchanged_section_gets: 11".to_string(),
+            format!("head_digest: {}", "ab".repeat(32)),
+            "retired_hours: [17,19]".to_string(),
+        ] {
+            assert_eq!(
+                text.lines().filter(|got| *got == line).count(),
+                1,
+                "{line}\n{text}"
+            );
+        }
     }
 }
