@@ -4986,7 +4986,11 @@ mod tests {
             .filter(|line| line.contains("SQL statement retried with spill"))
             .collect();
         assert_eq!(info.len(), 1, "{lines:?}");
-        let report = retried.stats.spill_retry.as_ref().expect("the retry reports");
+        let report = retried
+            .stats
+            .spill_retry
+            .as_ref()
+            .expect("the retry reports");
         let bits = report.bits.expect("a bucket retry derives bits");
         let chunk_rows = report
             .routed_chunk_rows
@@ -5237,7 +5241,10 @@ mod tests {
             drop(startup);
             let lines = capture.0.lock().clone();
             let budget_line = resolved_line(&lines, "sql_spill_retry_descriptor_budget");
-            assert!(budget_line.contains(budget_fields), "{label}: {budget_line}");
+            assert!(
+                budget_line.contains(budget_fields),
+                "{label}: {budget_line}"
+            );
             let modes_line = resolved_line(&lines, "sql_spill_retry_modes");
             assert!(
                 modes_line.contains(&format!(" value={modes:?} source=\"descriptor_budget\"")),
