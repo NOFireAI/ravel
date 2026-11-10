@@ -16896,6 +16896,69 @@ pub(crate) mod tests {
         );
     }
 
+    /// ADR-3939 decision 6 with acceptance A4: two runs of the same folds
+    /// into two fresh stores, under the same clock, folder id and config,
+    /// write byte-identical version 2 HEADs once two hours of day d are
+    /// retired in one fold, and day d's ref lists them ascending.
+    #[tokio::test]
+    async fn folds_that_retire_hours_write_identical_heads() {
+        let folder = Uuid::from_u128(7);
+        let fold_into = || async move {
+            let store = Arc::new(MemoryStore::new());
+            declare_user_id_key_index(store.as_ref()).await;
+            for (seq, hour) in [
+                (1u64, DAY_D + 3),
+                (2, DAY_D + 10),
+                (3, DAY_D + 23),
+                (4, DAY_D + 24),
+            ] {
+                publish_user_id_logs(store.as_ref(), seq, hour, &[seq as i64], 2, 0, true).await;
+            }
+            let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+            let fold_at = |hour: u32| {
+                let catalog = &catalog;
+                async move {
+                    catalog
+                        .fold(
+                            &tenant(),
+                            Signal::Logs,
+                            folder,
+                            now_at_seal(hour),
+                            &[],
+                            None,
+                        )
+                        .await
+                        .expect("fold")
+                }
+            };
+            fold_at(DAY_D + 24).await;
+            publish_logs_tombstone(store.as_ref(), DAY_D + 10).await;
+            publish_logs_tombstone(store.as_ref(), DAY_D + 3).await;
+            publish_user_id_logs(store.as_ref(), 5, DAY_D + 25, &[5], 2, 0, true).await;
+            fold_at(DAY_D + 25).await;
+            store
+                .get(&head_object_key(&tenant(), Signal::Logs), GetRange::Full)
+                .await
+                .expect("head present")
+                .data
+        };
+        let one = fold_into().await;
+        let two = fold_into().await;
+        assert_eq!(one, two, "byte-identical HEADs");
+        let head = snapshot_format::decode_head(&one).expect("head decodes");
+        assert_eq!(
+            head.parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour, p.retired_hours.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (DAY_D + 3, DAY_D + 23, vec![DAY_D + 3, DAY_D + 10]),
+                (DAY_D + 24, DAY_D + 25, Vec::new())
+            ]
+        );
+        assert_eq!(head.format_version, HEAD_FORMAT_VERSION_2);
+    }
+
     /// ADR-3939 decision 4: a switch-off fold over a HEAD a switch-on fold
     /// wrote reports `key_index_switch_off_over_leaves` and warns once,
     /// naming the tenant and signal, and still folds. A switch-off fold over
