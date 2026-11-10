@@ -129,6 +129,20 @@ snapshot_part_max_entries = 1
 # not fit one run's deadline.
 traces_per_day_7 = 19999992
 traces_per_day_30 = 4000008
+# The 30-day state's `catalog fold --key-index-build-max-pairs`, on both its
+# folds (stamped in stamps/day_parts_30.logs.build_budget.json and in each
+# folds.jsonl kind). The amendment needs S, the most request_id slices one day
+# part carries, at 3 or more. From ADR-3939's figures: a box D logs day holds
+# 100,000,000 request_id pairs (4,166,667 an hour) at 20,000,000 traces, 5
+# per trace, and A1 takes 26 passes over it at the default 8,000,000 pairs,
+# a share of 4,000,000 for each of the two indexed fields (request_id and
+# trace_id). At 4,000,008 traces a day the request_id pairs are 20,000,040,
+# so the default gives ceil(20,000,040 / 4,000,000) = 6 passes (A1's 26
+# scaled by the rate, 5.2): S about 5, two above the floor. 1,600,000, the
+# default scaled by the same fifth, gives a share of 800,000 and
+# ceil(20,000,040 / 800,000) = 26 passes, A1's 26 again, so S is about 26
+# and the 30-day state's bounds read at box D's instance (T(26) + 100 = 126).
+key_index_build_max_pairs_30 = 1600000
 
 [retired_hour]
 # Read only when run.states lists retired_hour. The fold binary stamp

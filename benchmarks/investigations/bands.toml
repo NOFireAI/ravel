@@ -2505,9 +2505,10 @@ source = "predicted; fold.rs `PreviousTail::from_head` and `feed_carried_key_ind
 # carries_c1, carries_r2 (box/run.sh state_retired_hour writes it from git
 # ancestry against run.toml's [retired_hour] c1_sha and r2_sha). Without the
 # stamp the binary figure is missing and every other figure is not-run until
-# it says C1 without R2. The fold is the server's on-demand fold, whose
-# response carries none of the three fold fields, so on this build they read
-# unsupported. A binary carrying R2 (or no C1) is one W2 is not
+# it says C1 without R2. The fold is `ravel-cli catalog fold
+# --key-index-leaves --retention-default <R>`, whose --json report the three
+# fold fields are read from; a field the report lacks reads unsupported on
+# that build. A binary carrying R2 (or no C1) is one W2 is not
 # measured on: the binary figure and the rest are not-run and listed not
 # requested with the binary's SHA, never a miss, so a run on the R2 build
 # that holds retired_hour for W3 and W8 is not failed by W2.
@@ -2569,9 +2570,9 @@ source = "predicted"
 # retired_hour_drop). box/run.sh state_retired_hour stamps the tombstoned
 # hour (stamps/retired_hour.logs.tombstone.json hour). No harness command
 # resolves one ingest hour's segments after a fold, so retired_hour_segments
-# reads unsupported; the part PUTs, leaves written and retired_hours are
-# fields the on-demand fold response does not carry, so they read unsupported
-# too. The part leaving HEAD is the count of parts in the catalog stamp
+# reads unsupported; the part PUTs, leaves written and retired_hours come
+# from the CLI fold's --json report and read unsupported on a build whose
+# report lacks them. The part leaving HEAD is the count of parts in the catalog stamp
 # taken after the drop fold (stamps/retired_hour_drop.logs.catalog.json)
 # whose hour range holds the tombstoned hour, so a drop fold that drops
 # nothing misses rather than passing on its 0 PUTs.
@@ -2957,8 +2958,8 @@ source = "predicted"
 # same tombstones (transition retired_hour_refold), each reporting its HEAD
 # digest and retired_hours. Each fold's retired_hours must be exactly [h] for
 # W3's tombstoned hour h, so two folds that observed no tombstone (both [])
-# miss rather than agree. The on-demand fold response carries neither on
-# this build, so all four read unsupported.
+# miss rather than agree. Both are read from the CLI fold's --json report;
+# a build whose report lacks one reads it unsupported.
 requires_tenant = "dp7"
 requires_states = ["retired_hour"]
 
