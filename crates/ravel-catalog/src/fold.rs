@@ -17030,14 +17030,15 @@ pub(crate) mod tests {
         (two, three)
     }
 
-    /// ADR-3939 decision 5 (task C1), acceptance W2 in miniature: a retention
-    /// tombstone in one hour of a sealed day re-encodes that day's part, and
+    /// ADR-3939 decision 5 (task C1), acceptance W2 in miniature: an erasure
+    /// rewrite record in one hour of a sealed day re-encodes that day's part
+    /// (a retention tombstone there retires the hour instead), and
     /// the build carries the surviving entries from the day's own previous
     /// leaves, a previous part that is not the HEAD's last. Day d holds
     /// writers 1 (hour 20, ids 1 and 2) and 2 and 3 (hour 21, ids 10, 20 and
     /// 30, 40): 6 pairs, which the first fold cuts into 3 passes of 2 under a
-    /// budget of 2, one leaf each. Hour 20 is tombstoned, so 2 entries
-    /// survive. The re-encode GETs each of the 3 previous leaves once, reads
+    /// budget of 2, one leaf each. A rewrite record erases writer 1 at hour
+    /// 20, so 2 entries survive. The re-encode GETs each of the 3 previous leaves once, reads
     /// no section of the surviving entries, and writes the 2 leaves a fold of
     /// the surviving entries into a fresh store writes, byte for byte. With
     /// the carry source the previous HEAD's last part, day d's previous
@@ -17084,7 +17085,7 @@ pub(crate) mod tests {
                 second.parts[0].entry_count
             ),
             (DAY_D + 21, DAY_D + 21, 2),
-            "day d is re-encoded without the tombstoned hour"
+            "day d is re-encoded without the erased writer"
         );
         assert_eq!(
             second.parts[0].key_index.len(),
@@ -17908,7 +17909,8 @@ pub(crate) mod tests {
     /// ADR-3939 decision 5: a part carries from every previous part it shares
     /// objects with. Under a 2-entry part threshold, day d's writers at hours
     /// 1 to 4 fold into parts A (hours 1 and 2) and B (hours 3 and 4), each
-    /// with 2 leaves under a budget of 2. Hour 1 is tombstoned and a writer
+    /// with 2 leaves under a budget of 2. A rewrite record erases writer 1
+    /// at hour 1 and a writer
     /// lands at hour 5, so the next fold's first part holds hours 2 and 3:
     /// writer 2 from A and writer 3 from B. It reads neither entry's section,
     /// carries both, and writes the one-call build's leaves. A's two slices
