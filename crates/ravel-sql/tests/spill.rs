@@ -1291,6 +1291,27 @@ async fn q33_executor_with_store(
     parquet_table_executor(config, &[(file.clone(), Q33_ROWS)], process, ravel, "q33").await
 }
 
+/// [`q33_executor_in`] sizing its reserve-ahead envelopes as on a host of
+/// `parallelism` cores (`SqlExecutor::with_envelope_parallelism`).
+async fn q33_executor_at_parallelism(
+    config: SqlConfig,
+    file: &bytes::Bytes,
+    process: Arc<ravel_memory::MemoryBudget>,
+    parallelism: std::num::NonZeroUsize,
+) -> Arc<ravel_sql::SqlExecutor> {
+    Arc::new(
+        build_parquet_table_executor(
+            config,
+            &[(file.clone(), Q33_ROWS)],
+            process,
+            Arc::new(MemoryStore::new()),
+            "q33",
+        )
+        .await
+        .with_envelope_parallelism(parallelism),
+    )
+}
+
 /// [`q33_executor_with_store`] for a Parquet table named `table` made of
 /// `files`, each given with its row count. A spill-enabled plan does not
 /// split a file across partitions, so each file is at most one partition.
@@ -1301,6 +1322,17 @@ async fn parquet_table_executor(
     ravel: Arc<dyn ravel_object_store::ObjectStoreBackend>,
     table: &str,
 ) -> Arc<ravel_sql::SqlExecutor> {
+    Arc::new(build_parquet_table_executor(config, files, process, ravel, table).await)
+}
+
+/// [`parquet_table_executor`] before it is shared.
+async fn build_parquet_table_executor(
+    config: SqlConfig,
+    files: &[(bytes::Bytes, u64)],
+    process: Arc<ravel_memory::MemoryBudget>,
+    ravel: Arc<dyn ravel_object_store::ObjectStoreBackend>,
+    table: &str,
+) -> ravel_sql::SqlExecutor {
     use std::collections::{BTreeMap, HashMap};
 
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
@@ -1381,18 +1413,16 @@ async fn parquet_table_executor(
         ravel_catalog::Catalog::new(Arc::clone(&ravel), ravel_catalog::CatalogConfig::default())
             .expect("catalog"),
     );
-    Arc::new(
-        SqlExecutor::new(
-            catalog,
-            SegmentFetcher::new(Arc::clone(&ravel)),
-            LogSegmentFetcher::new(Arc::clone(&ravel)),
-            SpanSegmentFetcher::new(Arc::clone(&ravel)),
-            config,
-            1 << 40,
-        )
-        .with_parquet_sources(sources)
-        .with_process_memory_budget(process),
+    SqlExecutor::new(
+        catalog,
+        SegmentFetcher::new(Arc::clone(&ravel)),
+        LogSegmentFetcher::new(Arc::clone(&ravel)),
+        SpanSegmentFetcher::new(Arc::clone(&ravel)),
+        config,
+        1 << 40,
     )
+    .with_parquet_sources(sources)
+    .with_process_memory_budget(process)
 }
 
 fn q33_tenant() -> ravel_types::TenantHash {
@@ -2096,26 +2126,21 @@ async fn a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry() 
 /// tries, in tenths of the engine count's unlimited peak.
 const FLOOR_BUDGET_TENTHS: std::ops::RangeInclusive<u64> = 10..=30;
 
-/// Issue #4014: at an engine count of 8, the q33 grouping's first attempt,
-/// with the hash exchange under its final aggregate widened to the
-/// 16-partition floor, answers in memory under a process budget on which the
-/// same attempt with an 8-partition exchange is refused and takes the spill
-/// retry. Twice the final-aggregate partitions halve each hash table, and with
-/// it the reserve-ahead envelope of the next doubling the process ledger holds
-/// for the widest tables.
-///
-/// The budget is the smallest of [`FLOOR_BUDGET_TENTHS`] the floored attempt
-/// fits, because the ledger's width is the host's parallelism capped at the
-/// engine count, so the envelope total moves with the host. On a 4-core aarch64
-/// host the unlimited peaks were 20,317,760 bytes at 16 partitions and
-/// 21,630,240 at 8; the floored attempt fit from 14 tenths (30,282,336 bytes)
-/// and the 8-partition attempt from 19 (41,097,456).
-///
-/// Prove-the-test: return `Transformed::no` at the top of
-/// `FinalExchangeFloor::rewrite` and the floored run takes the spill retry on
-/// every budget of the ladder, so no budget is found.
-#[tokio::test]
-async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() {
+/// The host parallelism [`the_partition_floor_answers_in_memory_where_the_engine_count_retries`]
+/// sizes its reserve-ahead envelopes for: a 2-vCPU host. The floor applies in
+/// production only on a host of 7 cores or fewer, where the envelope width is
+/// the core count with and without it.
+const FLOOR_HOST_PARALLELISM: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(2).expect("two is not zero");
+
+/// The q33 statement of the floor test, its unlimited run at the engine
+/// count, and the first rung of [`FLOOR_BUDGET_TENTHS`] that separates the
+/// floored run (answered on its first attempt) from the engine-count run
+/// (spill retry), both on a host of `parallelism` cores. `Err` lists every
+/// rung tried with both runs' outcomes.
+async fn floor_ladder(
+    parallelism: std::num::NonZeroUsize,
+) -> (TopTen, Result<(u64, TopTen, TopTen), String>) {
     let sql = "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10";
     let file = q33_parquet();
     let scratch = tempfile::tempdir().expect("scratch root");
@@ -2130,30 +2155,71 @@ async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() 
         config.first_attempt_min_partitions = floor;
         config
     };
-    let run_under = async |floor, budget| {
-        let process = Arc::new(ravel_memory::MemoryBudget::new(budget));
-        run_top_ten(&*q33_executor_in(config(floor), &file, process).await, sql).await
+    let run_in = async |floor, process| {
+        let executor = q33_executor_at_parallelism(config(floor), &file, process, parallelism);
+        run_top_ten(&*executor.await, sql).await
     };
 
-    let unlimited = run_top_ten(&*q33_executor(config(0), &file).await, sql).await;
+    let unlimited = run_in(0, Arc::new(ravel_memory::MemoryBudget::unlimited())).await;
+    let mut rungs = Vec::new();
+    for tenths in FLOOR_BUDGET_TENTHS {
+        let budget = unlimited.peak_pool_bytes * tenths / 10;
+        let floored = run_in(16, Arc::new(ravel_memory::MemoryBudget::new(budget))).await;
+        let engine = run_in(0, Arc::new(ravel_memory::MemoryBudget::new(budget))).await;
+        rungs.push(format!(
+            "{tenths} tenths, {budget} bytes: floored retries {} ({:?}), \
+             engine count retries {} ({:?})",
+            floored.spill_retries,
+            floored.first_refusal,
+            engine.spill_retries,
+            engine.first_refusal
+        ));
+        if floored.spill_retries == 0 && engine.spill_retries == 1 {
+            return (unlimited, Ok((budget, floored, engine)));
+        }
+    }
+    (unlimited, Err(rungs.join("\n")))
+}
+
+/// Issue #4014: at an engine count of 8, the q33 grouping's first attempt,
+/// with the hash exchange under its final aggregate widened to the
+/// 16-partition floor, answers in memory under a process budget on which the
+/// same attempt with an 8-partition exchange is refused and takes the spill
+/// retry. Twice the final-aggregate partitions halve each hash table, and with
+/// it the reserve-ahead envelope of the next doubling the process ledger holds
+/// for the widest tables.
+///
+/// The ledger's width is the host's parallelism capped at each run's
+/// aggregate stream count, so the envelope total moves with the host: the
+/// test pins the parallelism at [`FLOOR_HOST_PARALLELISM`] and searches
+/// [`FLOOR_BUDGET_TENTHS`] for the first budget the floored run fits and the
+/// engine-count run does not. At width 2 the unlimited peaks were 20,317,760
+/// bytes floored and 21,630,240 at 8 partitions; the floored run fit from 12
+/// tenths (25,956,288 bytes) and the 8-partition run from 15 (32,445,360), so
+/// the separating budget is 12 tenths. At width 16, the floored run's width
+/// on a 16-core host, both runs fit first at 28 tenths (60,564,672 bytes) and
+/// no budget separates them.
+///
+/// Prove-the-test: return `Transformed::no` at the top of
+/// `FinalExchangeFloor::rewrite` and the floored run takes the spill retry on
+/// every budget the engine-count run does, so no budget separates them.
+#[tokio::test]
+async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() {
+    let (unlimited, ladder) = floor_ladder(FLOOR_HOST_PARALLELISM).await;
     assert_eq!(
         (unlimited.spill_retries, unlimited.spill_files),
         (0, 0),
         "with an unlimited process budget the statement answers on its first attempt"
     );
     assert_eq!(unlimited.rows.len(), 10);
+    let (budget, floored, engine) = ladder.unwrap_or_else(|rungs| {
+        panic!(
+            "no budget separates the floored run from the engine-count run at width \
+             {FLOOR_HOST_PARALLELISM}, unlimited peak {} bytes:\n{rungs}",
+            unlimited.peak_pool_bytes
+        )
+    });
 
-    let mut fit = None;
-    for tenths in FLOOR_BUDGET_TENTHS {
-        let budget = unlimited.peak_pool_bytes * tenths / 10;
-        if run_under(16, budget).await.spill_retries == 0 {
-            fit = Some(budget);
-            break;
-        }
-    }
-    let budget = fit.expect("the floored first attempt fits some budget of the ladder");
-
-    let floored = run_under(16, budget).await;
     assert_eq!(
         (
             floored.spill_retries,
@@ -2165,7 +2231,6 @@ async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() 
     );
     assert_eq!(floored.rows, unlimited.rows, "row for row");
 
-    let engine = run_under(0, budget).await;
     assert_eq!(
         engine.spill_retries, 1,
         "at the engine count the statement takes the spill retry under {budget} bytes"

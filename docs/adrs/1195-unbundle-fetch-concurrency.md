@@ -207,9 +207,11 @@ small-object plan skip, the plan-pass directory reads and the metrics scan's
 memory. The decision below floors only the final aggregate's exchange, and it
 has not been measured again on c6a.large. The effect at the exchange alone is
 pinned by `the_partition_floor_answers_in_memory_where_the_engine_count_retries`
-(`crates/ravel-sql/tests/spill.rs`): on an 8-partition session, a two-key
-`GROUP BY` with a top-10 answers in memory under a process budget on which the
-same statement with an 8-partition exchange takes the spill retry.
+(`crates/ravel-sql/tests/spill.rs`): on an 8-partition session, with the
+envelope width of a 2-core host, a two-key `GROUP BY` with a top-10 answers
+in memory under a process budget on which the same statement with an
+8-partition exchange takes the spill retry. It fit from 25,956,288 bytes of
+process budget at the floor and from 32,445,360 at 8 partitions.
 
 ### First-attempt floor decision
 
@@ -249,6 +251,12 @@ same statement with an 8-partition exchange takes the spill retry.
    aggregate streams run at once, and the floored final aggregate runs at the
    floor, so it reads `max(sql_partition_count, floor)` while the floor is on
    and `sql_partition_count` when it is 0 (`SqlConfig::aggregate_stream_count`).
+   The width is that count capped at the host's `available_parallelism`, so
+   for a derived count the floor leaves it as it was: the floor applies only
+   below 8 cores, where both counts exceed the core count. A test sets the
+   host side of the cap with `SqlExecutor::with_envelope_parallelism`, a
+   test seam production never calls, so a figure that moves with the width
+   does not move with the test host's cores.
 6. **A plan that co-partitions its inputs is left as it is.** An
    `InterleaveExec`, a `Partitioned` `HashJoinExec` or `SymmetricHashJoinExec`,
    or a `SortMergeJoinExec` pairs partition `i` of one input with partition
@@ -270,7 +278,13 @@ same statement with an 8-partition exchange takes the spill retry.
   their 4 or 8 fit. Under a bounded top-k aggregate the 16 streams' fixed
   cost puts the peak at 2,100,224 bytes at both 20,000 and 200,000 keys
   (`bounded_topk_aggregate`). Those tests set the floor to 0;
-  `first_groups`' pool test runs at the floor under a 4 MiB pool.
+  `first_groups`' pool test runs at the floor under a 4 MiB pool, and so do
+  `top_keys`' rule-on and rule-off comparisons, whose rule-off envelope is the
+  widest of 16 streams of about 7 MB.
+- Bucketed final aggregation (opt-in) with a derived count on a host under 8
+  cores runs 16 bucketed streams of about 17 to 19 MB each, about 290 MB,
+  against about 150 MB at 8. A deployment that turns it on sizes its query
+  pool for that, or sets `--sql-partition-count`.
 - The operators above a widened final aggregate, up to the next exchange or
   merge, run at 16 streams. In a `COUNT(DISTINCT)` plan that includes the
   outer partial aggregate, which sits on the inner final aggregate: ClickBench
