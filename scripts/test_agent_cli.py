@@ -279,7 +279,7 @@ class Usage(unittest.TestCase):
 
 
 class CiBudgets(unittest.TestCase):
-    def _fixture(self, d, exit_code):
+    def _fixture(self, d, exit_code, body='echo "args: $*"'):
         # A stub check-ci-job-budgets.sh standing in for the real guard
         # (issue #4037): echoes the argv it was called with, so the
         # assertions below can pin exactly what cmd_ci_budgets forwarded.
@@ -287,7 +287,7 @@ class CiBudgets(unittest.TestCase):
         guard_dir = root / "scripts" / "guards"
         guard_dir.mkdir(parents=True)
         guard = guard_dir / "check-ci-job-budgets.sh"
-        guard.write_text(f"#!/usr/bin/env bash\necho \"args: $*\"\nexit {exit_code}\n")
+        guard.write_text(f"#!/usr/bin/env bash\n{body}\nexit {exit_code}\n")
         guard.chmod(0o755)
         env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
@@ -334,6 +334,21 @@ class CiBudgets(unittest.TestCase):
         detail = json.loads(out)["detail"]
         self.assertNotIn("--repo", detail)
         self.assertNotIn("--runs", detail)
+
+    def test_reports_the_finding_lines_not_the_last_job_row(self):
+        body = ("printf 'doc-scripts\\tp90=8m\\tcap=10\\n'\n"
+                "printf 'FINDING cap job=sql p90=40m cap=45m ratio=0.89 (threshold 0.7)\\n'\n"
+                "printf 'lint\\tp90=3m\\tcap=20\\n'")
+        with tempfile.TemporaryDirectory() as d:
+            root = self._fixture(d, 1, body)
+            rc, out = self._run_ci_budgets(root, ["--json", "ci-budgets"])
+        # FLIP: reporting the guard's last output line, as the command first
+        # did, would surface the clean lint row here and drop the finding.
+        self.assertEqual(rc, 1)
+        data = json.loads(out)
+        self.assertIn("FINDING cap job=sql", data["detail"])
+        self.assertNotIn("lint", data["detail"])
+        self.assertEqual(len(data["findings"]), 1)
 
 
 class Parser(unittest.TestCase):

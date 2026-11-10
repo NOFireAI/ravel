@@ -508,6 +508,78 @@ test_matrix_leg_maps_to_its_job() {
   fi
 }
 
+CI_YML_OTHER='jobs:
+  other:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - run: echo hi
+'
+
+test_no_mapped_job_exits_2() {
+  local name="no_mapped_job_exits_2"
+  local repo; repo="$(new_repo CI_YML_OTHER)"
+  export STUB_PUSH_CURRENT_IDS="101 102"
+  export STUB_MG_CURRENT_IDS="103"
+  export STUB_PUSH_OLDER_IDS="201"
+  export STUB_MG_OLDER_IDS="202"
+  export STUB_JOBS_101; STUB_JOBS_101="$(job_row testjob success 0 90)"
+  export STUB_JOBS_102; STUB_JOBS_102="$(job_row testjob success 0 90)"
+  export STUB_JOBS_103; STUB_JOBS_103="$(job_row testjob success 0 90)"
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 90)"
+  export STUB_JOBS_202=""
+  run_live_case "${name}" "${repo}"
+  unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
+    STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_103 STUB_JOBS_201 STUB_JOBS_202
+  rm -rf "${repo}"
+  # FLIP: without the mapped-row check every row prints cap=unmapped, the cap
+  # rule is skipped, and the guard exits 0 having judged nothing.
+  if [[ "${LAST_RC}" -eq 2 ]] && grep -q "no job in the current window mapped" <<<"${LAST_OUT}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
+  fi
+}
+
+CI_YML_TESTJOB_AND_OTHER='jobs:
+  testjob:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - run: echo hi
+  other:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - run: echo hi
+'
+
+test_one_unmapped_job_leaves_the_others_judged() {
+  local name="one_unmapped_job_leaves_the_others_judged"
+  local repo; repo="$(new_repo CI_YML_TESTJOB_AND_OTHER)"
+  export STUB_PUSH_CURRENT_IDS="101 102"
+  export STUB_MG_CURRENT_IDS="103"
+  export STUB_PUSH_OLDER_IDS="201"
+  export STUB_MG_OLDER_IDS="202"
+  export STUB_JOBS_101; STUB_JOBS_101="$(printf '%s\n%s' "$(job_row testjob success 0 90)" "$(job_row stray success 0 5)")"
+  export STUB_JOBS_102; STUB_JOBS_102="$(job_row testjob success 0 90)"
+  export STUB_JOBS_103; STUB_JOBS_103="$(job_row testjob success 0 90)"
+  export STUB_JOBS_201; STUB_JOBS_201="$(job_row testjob success 0 90)"
+  export STUB_JOBS_202=""
+  run_live_case "${name}" "${repo}"
+  unset STUB_PUSH_CURRENT_IDS STUB_MG_CURRENT_IDS STUB_PUSH_OLDER_IDS STUB_MG_OLDER_IDS \
+    STUB_JOBS_101 STUB_JOBS_102 STUB_JOBS_103 STUB_JOBS_201 STUB_JOBS_202
+  rm -rf "${repo}"
+  # FLIP: a check that refused on any unmapped job, rather than on none
+  # mapped, exits 2 here; one that skipped the mapped jobs too finds nothing.
+  if [[ "${LAST_RC}" -eq 1 ]] && grep -q "^stray	.*cap=unmapped" <<<"${LAST_OUT}" \
+    && grep -q "FINDING cap job=testjob" <<<"${LAST_OUT}"; then
+    ok "${name}"
+  else
+    not_ok "${name}" "rc=${LAST_RC} out=${LAST_OUT}"
+  fi
+}
+
 CI_YML_NOCAPS='jobs:
   testjob:
     runs-on: ubuntu-latest
@@ -789,6 +861,8 @@ test_transient_502_is_retried
 test_persistent_502_exits_2
 test_empty_run_list_exits_2
 test_matrix_leg_maps_to_its_job
+test_no_mapped_job_exits_2
+test_one_unmapped_job_leaves_the_others_judged
 test_unparseable_timestamp_exits_2
 test_no_current_rows_exits_2
 test_no_older_rows_exits_2

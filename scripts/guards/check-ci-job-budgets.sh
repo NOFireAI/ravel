@@ -39,8 +39,9 @@
 #
 # Exit codes (live mode): 0 clean, 1 a cap or growth finding, 2 could not
 # ask (a gh call failed or returned no runs, a job row's timestamps did not
-# parse, or the current or older window held no job rows), 64 bad usage, 70
-# ci.yml missing or no timeout-minutes cap parsed from it.
+# parse, the current or older window held no job rows, or no job in the
+# current window mapped to a ci.yml key), 64 bad usage, 70 ci.yml missing or
+# no timeout-minutes cap parsed from it.
 # Exit codes (--raise-check): 0 no un-budgeted raise, 1 a raise with no
 # budget comment, 64 bad usage, 70 ci.yml unreadable or no cap parsed.
 set -uo pipefail
@@ -57,7 +58,8 @@ OLD_WINDOW_DAYS=14
 GITHUB_DEFAULT_TIMEOUT_MINUTES=360
 
 usage() {
-  sed -n '2,37p' "$0" >&2
+  # The header comment, up to the first line that is not a comment.
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0" >&2
 }
 
 repo="${DEFAULT_REPO}"
@@ -481,6 +483,16 @@ if [[ ! -s "${older_rows}" ]]; then
 fi
 
 sort -u "${unmapped}" -o "${unmapped}"
+
+# An unmapped job is printed but its cap rule is skipped, so a break in the
+# display-name mapping would otherwise judge nothing and exit 0.
+if ! awk -F'\t' -v uf="${unmapped}" '
+    BEGIN { while ((getline l < uf) > 0) u[l] = 1 }
+    !($1 in u) { found = 1; exit }
+    END { exit !found }' "${current_rows}"; then
+  echo "check-ci-job-budgets.sh: no job in the current window mapped to a ci.yml job key, so no cap could be judged; exiting 2" >&2
+  exit 2
+fi
 
 current_stats="${tmpdir}/current_stats.tsv"
 older_stats="${tmpdir}/older_stats.tsv"
