@@ -786,7 +786,12 @@ def cmd_spec_lint(a):
     o = Out(a.json)
     report = {}
     for f in a.files:
-        report[f] = lint_spec_text(Path(f).read_text())
+        text = Path(f).read_text()
+        report[f] = lint_spec_text(text)
+        try:
+            spec_head_values(text)
+        except CliError as e:
+            report[f].append({"line": 0, "col": 0, "kind": str(e), "blocking": True})
     o.data = report
     for f, hits in report.items():
         blocking = sum(1 for h in hits if h["blocking"])
