@@ -5,8 +5,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::{
-    catalog, hold, idem, maintain, now_ns, parse_max_flush_lifetime_ns, rlog_footprint, store,
-    tenancy, tenant_token,
+    catalog, hold, idem, maintain, now_ns, parse_max_flush_lifetime_ns, parse_retention_default_ns,
+    rlog_footprint, store, tenancy, tenant_token,
 };
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
@@ -2649,6 +2649,19 @@ enum CatalogCommand {
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
+        /// The deployment-default retention window for this fold (humantime
+        /// duration, e.g. `30d`, `720h`; the same grammar as ravel-server's
+        /// `--retention-default`), used when the tenant's durable config record
+        /// carries no `retention_ns` of its own, which wins when set. With a
+        /// window, the fold's frontier reconcile also lists the snapshot-named
+        /// hours at or approaching the retention frontier (now minus the window,
+        /// plus the protection horizon), so it observes retention tombstones in
+        /// hours outside its fixed reconcile window and drops their entries from
+        /// HEAD. Unset, a tenant with no `retention_ns` gets no frontier
+        /// reconcile. Must be greater than zero.
+        #[arg(long, value_name = "DURATION", conflicts_with = "rebuild_key_index",
+              value_parser = parse_retention_default_ns)]
+        retention_default: Option<i64>,
         /// Override the most entries one snapshot part this fold writes may
         /// hold (default 250,000, `ravel_catalog::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`),
         /// for this invocation only. Parts still split at hour boundaries, so a
@@ -3265,11 +3278,12 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     key_index_build_max_pairs,
                     metrics_label_index,
                     snapshot_part_max_entries,
+                    retention_default,
                     json,
                     tenant_kms,
                     ..
                 },
-        } => catalog::fold_with_metrics_label_index(
+        } => catalog::fold_with_retention_default(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
@@ -3285,6 +3299,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 .map(usize::try_from)
                 .transpose()
                 .map_err(|_| anyhow::anyhow!("--snapshot-part-max-entries does not fit usize"))?,
+            retention_default,
             now_ns()?,
             json,
         )
@@ -5602,6 +5617,57 @@ mod tests {
         assert!(
             try_parse(&["--key-index-build-max-pairs", "1000"]).is_err(),
             "the budget is refused without --key-index-leaves"
+        );
+    }
+
+    /// `catalog fold --retention-default` is unset by default, parses a
+    /// humantime duration into nanoseconds, and is refused at 0, on a value
+    /// that does not parse, and past i64 nanoseconds, each with a message
+    /// naming the flag.
+    #[test]
+    fn catalog_fold_retention_default_flag() {
+        let try_parse = |extra: &[&str]| {
+            let argv = ["ravel", "catalog", "fold", "--tenant", "acme"]
+                .iter()
+                .chain(extra)
+                .copied()
+                .collect::<Vec<_>>();
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Command::Catalog {
+                    command:
+                        super::CatalogCommand::Fold {
+                            retention_default, ..
+                        },
+                } => retention_default,
+                _ => panic!("expected the catalog fold subcommand"),
+            })
+        };
+        assert_eq!(try_parse(&[]).expect("a plain fold parses"), None);
+        assert_eq!(
+            try_parse(&["--retention-default", "30d"]).expect("30d parses"),
+            Some(30 * 24 * 3_600 * 1_000_000_000)
+        );
+        assert_eq!(
+            try_parse(&["--retention-default", "720h"]).expect("720h parses"),
+            Some(720 * 3_600 * 1_000_000_000)
+        );
+        for (value, expected) in [
+            ("0s", "--retention-default '0s' must be greater than zero"),
+            ("0", "--retention-default '0' must be greater than zero"),
+            ("soon", "invalid --retention-default 'soon'"),
+            ("300years", "--retention-default '300years' is too large"),
+        ] {
+            let err = try_parse(&["--retention-default", value])
+                .expect_err("the value is refused")
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "{value}: expected {expected:?} in {err:?}"
+            );
+        }
+        assert!(
+            try_parse(&["--rebuild-key-index", "--retention-default", "30d"]).is_err(),
+            "a rebuild folds nothing, so the window is refused beside it"
         );
     }
 

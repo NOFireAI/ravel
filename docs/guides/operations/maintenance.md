@@ -233,6 +233,25 @@ natural seal margin passes the next hour, or on another `--writers-stopped`
 fold (or `--fold-after-load` load) run in a later hour. See
 [Sealed hours](../../catalog-and-mvcc.md#sealed-hours).
 
+### Fold with a retention window
+
+A fold by hand applies a retention window only when the tenant's durable
+config record carries one. To give it the deployment default that the
+maintain pods run with, pass the same value as their `--retention-default`:
+
+```sh
+ravel-cli catalog fold --tenant <name> --shards <n> --signal <signal> \
+  --retention-default 30d
+```
+
+The tenant's own window still wins when its record sets one. With a window,
+the fold's frontier reconcile also re-lists the snapshot-named hours at or
+approaching the retention frontier, so it observes retention tombstones in
+hours far outside the fixed reconcile window and drops their entries from
+HEAD. The report's `frontier_hours_reconciled` line counts those hours.
+Without a window, a tenant whose record sets none gets no frontier reconcile.
+The flag takes a humantime duration and refuses `0`.
+
 ### Routine verification
 
 ```sh
