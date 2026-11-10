@@ -203,6 +203,7 @@ Failure playbook (in order of check):
 |---|---|
 | done, but `git ls-remote origin refs/heads/task/<id>/result` empty | Work lost. Re-dispatch same spec once. |
 | rate limit / auth / transient executor error | Retry once as-is. Second failure: re-dispatch with `label_selector` naming a different executor. |
+| `bin/agent-cli task` reports class `below-floor` (`EXECUTOR BELOW FLOOR:` report) | The host had less free disk than the spec's `disk_floor_gb`. Re-dispatch once with `--label host=<a named amd64 executor with room>`. A second `below-floor` stops the wave: ledger `blocked`, report to user. |
 | runtime ceiling (~4h kill) | Fleet recovers committed work. Fetch the recovered ref, re-dispatch as a CONTINUATION from that ref (`ref:` param, spec says what remains). Never restart from scratch. |
 | second re-dispatch also fails | Stop the wave, ledger `blocked`, report to user. Do not silently drop the task from the epic. |
 
