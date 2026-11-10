@@ -450,6 +450,37 @@ pub struct FoldReport {
     /// and `build_key_index_leaves` are both on, zero otherwise. Also counted
     /// in `list_requests`.
     pub metrics_label_index_erasure_list_requests: u64,
+    /// Snapshot part object PUTs of parts other than the tail, one per such
+    /// part an attempt re-encoded, summed over every attempt. The tail's PUT
+    /// is not counted, and a part carried by reference issues none. Also
+    /// counted in `put_requests`.
+    pub sealed_part_puts: u64,
+    /// Key-index leaf PUTs issued while building a part of a sealed UTC day
+    /// (ADR-3939 acceptance row A3): a re-encoded part, not the tail, whose
+    /// hour range lies in one UTC day that a part of the HEAD this fold read,
+    /// other than its last, already covered on its own. A day this fold
+    /// seals for the first time is not counted, and neither is the tail. A
+    /// sealed day a late commit changed is counted. Also counted in
+    /// `put_requests`.
+    pub sealed_day_leaf_puts: u64,
+    /// Previous-leaf GETs issued while building the parts
+    /// `sealed_day_leaf_puts` counts. Also counted in `key_index_leaf_gets`.
+    pub sealed_day_previous_leaf_gets: u64,
+    /// KEY_IDX section GETs the leaf build issued for entries the previous
+    /// leaves covered: an entry whose data object a previous part held and
+    /// whose leaves covered it for every field the build indexes, or, when
+    /// that part's leaves could not be loaded or the carry was abandoned for
+    /// a data object listed twice, any entry whose object it held. Zero when
+    /// the carry serves every such entry. Also counted in
+    /// `key_index_ranged_gets`.
+    pub key_index_unchanged_section_gets: u64,
+    /// Lowercase hex blake3 of the HEAD in effect when the fold returned (the
+    /// one it published, or on a no-op the one it read and left in place),
+    /// re-encoded with `folder_id` set to sixteen zero bytes and
+    /// `created_unix_ns` to zero, so the digest names the parts, postings and
+    /// watermark rather than the process and clock that wrote them. Empty
+    /// when there is no valid HEAD.
+    pub head_digest: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -466,6 +497,10 @@ pub(crate) struct RequestCounters {
     /// A maximum over the fold's part builds, not a sum.
     key_index_carry_peak_held_bytes: u64,
     metrics_label_index_erasure_list_requests: u64,
+    sealed_part_puts: u64,
+    sealed_day_leaf_puts: u64,
+    sealed_day_previous_leaf_gets: u64,
+    key_index_unchanged_section_gets: u64,
 }
 
 /// HEAD as read at the top of one fold attempt.
@@ -3025,7 +3060,20 @@ pub(crate) async fn build_part_key_index(
     });
     let mut carry = None;
     let mut peak_held = 0u64;
+    // Per new ordinal: whether a previous part's leaves covered it, for
+    // `key_index_unchanged_section_gets`.
+    let mut previously_covered = vec![false; n];
+    let mark_held = |source: &CarrySource, covered: &mut [bool]| {
+        for key in source.object_keys().iter().flatten() {
+            if let Some(&ordinal) = ordinal_by_key.get(key.as_str()) {
+                covered[ordinal as usize] = true;
+            }
+        }
+    };
     if let Some(key) = duplicate {
+        for source in &sharing {
+            mark_held(source, &mut previously_covered);
+        }
         tracing::warn!(
             tenant = %tenant.to_hex(),
             object_key = %key,
@@ -3051,8 +3099,24 @@ pub(crate) async fn build_part_key_index(
             )
             .await
             {
-                Ok(loaded) => carried.sources.push(loaded),
+                Ok(loaded) => {
+                    for new in loaded.onto.iter().flatten() {
+                        let new = *new as usize;
+                        if new < n
+                            && declared_types.keys().all(|name| {
+                                loaded
+                                    .fields
+                                    .get(*name)
+                                    .is_some_and(|field| field.covered[new])
+                            })
+                        {
+                            previously_covered[new] = true;
+                        }
+                    }
+                    carried.sources.push(loaded);
+                }
                 Err(reason) => {
+                    mark_held(source, &mut previously_covered);
                     tracing::warn!(
                         tenant = %tenant.to_hex(),
                         part = %source.part.key,
@@ -3204,6 +3268,9 @@ pub(crate) async fn build_part_key_index(
                     counters.key_index_ranged_gets += read.gets;
                     counters.key_index_bytes_read += read.bytes;
                     counters.key_index_sections_read += 1;
+                    if previously_covered[ordinal as usize] {
+                        counters.key_index_unchanged_section_gets += read.gets;
+                    }
                     let sections = match &read.fields {
                         Ok(sections) => sections,
                         Err(reason) => {
@@ -3958,7 +4025,8 @@ impl Catalog {
                             counters,
                             0,
                             key_index_switch_off_over_leaves,
-                        ));
+                            &head_state,
+                        )?);
                     }
                     (head.watermark_hour, Some(listings))
                 }
@@ -3969,7 +4037,8 @@ impl Catalog {
                         counters,
                         0,
                         key_index_switch_off_over_leaves,
-                    ));
+                        &head_state,
+                    )?);
                 }
             };
 
@@ -4398,7 +4467,8 @@ impl Catalog {
                     counters,
                     refold_hours_reconciled,
                     key_index_switch_off_over_leaves,
-                ));
+                    &head_state,
+                )?);
             }
             // A reconcile that changed any hour invalidates the append-only,
             // stable-ordinal assumption the forward postings merge relies on
@@ -4675,7 +4745,24 @@ impl Catalog {
             let mut key_index_leaves_written: u64 = 0;
             let mut key_index_leaf_bytes_written: u64 = 0;
             let mut key_index_field_pairs: BTreeMap<String, u64> = BTreeMap::new();
-            for (span, encoding) in spans.iter().zip(span_encodings) {
+            // The UTC days a part of the previous HEAD other than its last
+            // covered on its own: days sealed before this fold.
+            let previously_sealed_days: BTreeSet<u32> = match &head_state {
+                HeadState::Valid { head, .. } => head
+                    .parts
+                    .split_last()
+                    .map(|(_, sealed)| sealed)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|part| {
+                        utc_day_of_hour(part.min_hour) == utc_day_of_hour(part.watermark_hour)
+                    })
+                    .map(|part| utc_day_of_hour(part.min_hour))
+                    .collect(),
+                _ => BTreeSet::new(),
+            };
+            let tail_index = spans.len().saturating_sub(1);
+            for (span_index, (span, encoding)) in spans.iter().zip(span_encodings).enumerate() {
                 // Single-part fold keeps exact v1 semantics: min_hour 0 (the
                 // epoch floor) and the fold watermark, byte-identical to the
                 // legacy encode so existing single-part objects and their
@@ -4990,6 +5077,12 @@ impl Catalog {
                                             .is_some()
                                 })
                                 .collect();
+                            let sealed_day = span_index != tail_index
+                                && utc_day_of_hour(part_min_hour)
+                                    == utc_day_of_hour(part_watermark)
+                                && previously_sealed_days.contains(&utc_day_of_hour(part_min_hour));
+                            let puts_before = counters.put_requests;
+                            let leaf_gets_before = counters.key_index_leaf_gets;
                             let built = build_part_key_index(
                                 self.store(),
                                 tenant,
@@ -5010,6 +5103,12 @@ impl Catalog {
                             )
                             .await
                             .map_err(CatalogError::Store)?;
+                            if sealed_day {
+                                counters.sealed_day_leaf_puts +=
+                                    counters.put_requests - puts_before;
+                                counters.sealed_day_previous_leaf_gets +=
+                                    counters.key_index_leaf_gets - leaf_gets_before;
+                            }
                             held_label_dicts.release(span.start..span.end);
                             key_index_built.insert(*part_hash.as_bytes(), built.clone());
                             built
@@ -5041,6 +5140,9 @@ impl Catalog {
                 // is a request-issued counter, not a request-succeeded one
                 // (#1598).
                 counters.put_requests += 1;
+                if span_index != tail_index {
+                    counters.sealed_part_puts += 1;
+                }
                 match put_result {
                     Ok(_) => {}
                     // Content-addressed key: bytes are identical by
@@ -5192,6 +5294,7 @@ impl Catalog {
             };
             let head_bytes = snapshot_format::encode_head(&new_head)?;
             let head_crc = crc32c::crc32c(&head_bytes);
+            let head_digest = canonical_head_digest(&new_head)?;
             let put_mode = match &head_state {
                 HeadState::Valid { version, .. } | HeadState::Corrupt { version } => {
                     PutMode::CasVersion(version.clone())
@@ -5286,6 +5389,11 @@ impl Catalog {
                         metrics_label_index_parts_erasure_gated,
                         metrics_label_index_erasure_list_requests: counters
                             .metrics_label_index_erasure_list_requests,
+                        sealed_part_puts: counters.sealed_part_puts,
+                        sealed_day_leaf_puts: counters.sealed_day_leaf_puts,
+                        sealed_day_previous_leaf_gets: counters.sealed_day_previous_leaf_gets,
+                        key_index_unchanged_section_gets: counters.key_index_unchanged_section_gets,
+                        head_digest,
                     });
                 }
                 // Another folder's HEAD CAS won first. Re-GET HEAD next
@@ -6475,11 +6583,16 @@ fn no_op_report(
     counters: RequestCounters,
     refold_hours_reconciled: u64,
     key_index_switch_off_over_leaves: bool,
-) -> FoldReport {
+    head_state: &HeadState,
+) -> Result<FoldReport, SnapshotFormatError> {
     // The work an attempt lost to a HEAD CAS did is real work even when the
     // fold ends in a no-op, so it reaches `/metrics` too.
     observe_fold_key_index(&counters);
-    FoldReport {
+    let head_digest = match head_state {
+        HeadState::Valid { head, .. } => canonical_head_digest(head)?,
+        _ => String::new(),
+    };
+    Ok(FoldReport {
         watermark_hour,
         previous_watermark_hour: watermark_hour,
         no_op: true,
@@ -6531,7 +6644,26 @@ fn no_op_report(
         metrics_label_index_parts_erasure_gated: 0,
         metrics_label_index_erasure_list_requests: counters
             .metrics_label_index_erasure_list_requests,
-    }
+        sealed_part_puts: counters.sealed_part_puts,
+        sealed_day_leaf_puts: counters.sealed_day_leaf_puts,
+        sealed_day_previous_leaf_gets: counters.sealed_day_previous_leaf_gets,
+        key_index_unchanged_section_gets: counters.key_index_unchanged_section_gets,
+        head_digest,
+    })
+}
+
+/// Lowercase hex blake3 of `head` encoded with `folder_id` set to sixteen
+/// zero bytes and `created_unix_ns` to zero: two folds that publish the same
+/// parts, postings and watermark give the same digest whichever process ran
+/// them and when.
+fn canonical_head_digest(head: &SnapshotHead) -> Result<String, SnapshotFormatError> {
+    let canonical = SnapshotHead {
+        folder_id: vec![0; 16],
+        created_unix_ns: 0,
+        ..head.clone()
+    };
+    let bytes = snapshot_format::encode_head(&canonical)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 #[cfg(test)]
@@ -16395,6 +16527,329 @@ pub(crate) mod tests {
             )
             .await
             .expect("put tombstone");
+    }
+
+    /// `FoldReport::sealed_part_puts` counts the snapshot part PUTs of parts
+    /// other than the tail. With the leaf switch on, the fold that seals day
+    /// d PUTs day d and the new tail (2 parts, 1 counted), an advance carries
+    /// day d and PUTs only the tail (none counted), and a refold at the same
+    /// watermark is a no-op (none).
+    #[tokio::test]
+    async fn fold_report_counts_sealed_part_puts_and_not_the_tail() {
+        let store = OpLogStore::empty();
+        declare_user_id_key_index(store.as_ref()).await;
+        publish_user_id_logs(store.as_ref(), 1, DAY_D + 20, &[10], 2, 0, true).await;
+        let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        fold_through(&catalog, Signal::Logs, DAY_D + 20).await;
+
+        publish_user_id_logs(store.as_ref(), 2, DAY_D + 25, &[20], 2, 0, true).await;
+        let sealing = fold_through(&catalog, Signal::Logs, DAY_D + 25).await;
+        assert_eq!(
+            (
+                sealing.sealed_part_puts,
+                sealing.parts_total,
+                sealing.parts_reused
+            ),
+            (1, 2, 0),
+            "{sealing:?}"
+        );
+
+        publish_user_id_logs(store.as_ref(), 3, DAY_D + 26, &[30], 2, 0, true).await;
+        let advance = fold_through(&catalog, Signal::Logs, DAY_D + 26).await;
+        assert_eq!(
+            (
+                advance.sealed_part_puts,
+                advance.parts_total,
+                advance.parts_reused
+            ),
+            (0, 2, 1),
+            "{advance:?}"
+        );
+
+        let refold = fold_through(&catalog, Signal::Logs, DAY_D + 26).await;
+        assert!(refold.no_op, "{refold:?}");
+        assert_eq!(refold.sealed_part_puts, 0, "{refold:?}");
+    }
+
+    /// `sealed_day_leaf_puts` and `sealed_day_previous_leaf_gets` count the
+    /// leaf PUTs and previous-leaf GETs of a day part the previous HEAD
+    /// already held sealed (ADR-3939 acceptance A3). In the dirty-day
+    /// fixture day d sealed on the first fold, so the tombstone's re-encode
+    /// of day d counts its 2 leaf PUTs and its 3 previous-leaf GETs, and the
+    /// tail's own carry GET is not counted. On the fold that seals day d,
+    /// day d was the previous tail: its 1 leaf PUT and 1 leaf GET count 0,
+    /// and so does the advance that carries it.
+    #[tokio::test]
+    async fn fold_report_counts_a_sealed_days_leaf_puts_and_gets() {
+        let budget = CatalogConfig {
+            key_index_build_max_pairs: 2,
+            ..kidx_config()
+        };
+        let store = OpLogStore::empty();
+        declare_user_id_key_index(store.as_ref()).await;
+        publish_user_id_logs(store.as_ref(), 1, DAY_D + 20, &[1, 2], 2, 0, true).await;
+        publish_user_id_logs(store.as_ref(), 2, DAY_D + 21, &[10, 20], 2, 0, true).await;
+        publish_user_id_logs(store.as_ref(), 3, DAY_D + 21, &[30, 40], 2, 0, true).await;
+        publish_user_id_logs(store.as_ref(), 4, DAY_D + 25, &[50], 2, 0, true).await;
+        let catalog = Catalog::new(store.clone(), budget).expect("catalog");
+        let first = fold_through(&catalog, Signal::Logs, DAY_D + 25).await;
+        assert_eq!(
+            (
+                first.sealed_day_leaf_puts,
+                first.sealed_day_previous_leaf_gets
+            ),
+            (0, 0),
+            "{first:?}"
+        );
+        let first_head = read_signal_head(store.as_ref(), Signal::Logs).await;
+
+        publish_logs_tombstone(store.as_ref(), DAY_D + 20).await;
+        publish_user_id_logs(store.as_ref(), 5, DAY_D + 26, &[60], 2, 0, true).await;
+        store.clear();
+        let report = fold_through(&catalog, Signal::Logs, DAY_D + 26).await;
+        assert_eq!(
+            (
+                store.leaf_puts_for_part_watermark(DAY_D + 21),
+                store.gets_of_leaves(&first_head.parts[0].key_index),
+            ),
+            (2, 3)
+        );
+        assert_eq!(
+            (
+                report.sealed_day_leaf_puts,
+                report.sealed_day_previous_leaf_gets
+            ),
+            (2, 3),
+            "{report:?}"
+        );
+        assert_eq!(report.key_index_leaf_gets, 4, "{report:?}");
+
+        let store = OpLogStore::empty();
+        declare_user_id_key_index(store.as_ref()).await;
+        publish_user_id_logs(store.as_ref(), 1, DAY_D + 20, &[10, 20], 2, 0, true).await;
+        let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        fold_through(&catalog, Signal::Logs, DAY_D + 20).await;
+        publish_user_id_logs(store.as_ref(), 2, DAY_D + 25, &[50], 2, 0, true).await;
+        store.clear();
+        let sealing = fold_through(&catalog, Signal::Logs, DAY_D + 25).await;
+        assert_eq!(store.leaf_puts_for_part_watermark(DAY_D + 20), 1);
+        assert_eq!(sealing.key_index_leaf_gets, 1, "{sealing:?}");
+        assert_eq!(
+            (
+                sealing.sealed_day_leaf_puts,
+                sealing.sealed_day_previous_leaf_gets
+            ),
+            (0, 0),
+            "{sealing:?}"
+        );
+        publish_user_id_logs(store.as_ref(), 3, DAY_D + 26, &[60], 2, 0, true).await;
+        let advance = fold_through(&catalog, Signal::Logs, DAY_D + 26).await;
+        assert_eq!(advance.parts_reused, 1, "{advance:?}");
+        assert_eq!(
+            (
+                advance.sealed_day_leaf_puts,
+                advance.sealed_day_previous_leaf_gets
+            ),
+            (0, 0),
+            "{advance:?}"
+        );
+    }
+
+    /// `key_index_unchanged_section_gets` counts section GETs for entries a
+    /// previous leaf already held. Day d is the first fold's tail; the next
+    /// fold tombstones hour 20, adds a day-d entry at hour 22 that no
+    /// previous part held, and seals day d. When a later slice's GET fails
+    /// the build restarts without the carry and, in each of its 3 passes,
+    /// reads the sections of the two surviving entries the previous leaves
+    /// held (12 GETs, counted) and of the new entry (6, not counted). The
+    /// same re-encode with every slice served carries the held entries and
+    /// reads only the new entry's sections, none counted; a first fold reads
+    /// every section, none of an entry a previous leaf held.
+    #[tokio::test]
+    async fn fold_report_counts_section_gets_for_entries_a_previous_leaf_held() {
+        let budget = CatalogConfig {
+            key_index_build_max_pairs: 2,
+            ..kidx_config()
+        };
+        let dirty_day = |faulted: bool| async move {
+            let inner = OpLogStore::empty();
+            declare_user_id_key_index(inner.as_ref()).await;
+            publish_user_id_logs(inner.as_ref(), 1, DAY_D + 20, &[1, 2], 2, 0, true).await;
+            let (two, _) =
+                publish_user_id_logs(inner.as_ref(), 2, DAY_D + 21, &[10, 20], 2, 0, true).await;
+            let (three, _) =
+                publish_user_id_logs(inner.as_ref(), 3, DAY_D + 21, &[30, 40], 2, 0, true).await;
+            let catalog = Catalog::new(inner.clone(), budget).expect("catalog");
+            let first = fold_through(&catalog, Signal::Logs, DAY_D + 21).await;
+            let head = read_signal_head(inner.as_ref(), Signal::Logs).await;
+            let mut day_d = head.parts[0].key_index.clone();
+            day_d.sort_by_key(|leaf| leaf.key8_lo);
+            assert_eq!(day_d.len(), 3);
+
+            publish_logs_tombstone(inner.as_ref(), DAY_D + 20).await;
+            let (late, _) =
+                publish_user_id_logs(inner.as_ref(), 4, DAY_D + 22, &[70], 2, 0, true).await;
+            publish_user_id_logs(inner.as_ref(), 5, DAY_D + 25, &[50], 2, 0, true).await;
+            publish_user_id_logs(inner.as_ref(), 6, DAY_D + 26, &[60], 2, 0, true).await;
+            inner.clear();
+            let mut plan = FaultPlan::empty();
+            if faulted {
+                plan = plan.with_rule(
+                    Rule::new(
+                        Op::Get,
+                        ScriptedFault::Permanent("slice GET refused".into()),
+                    )
+                    .with_key_contains(day_d[1].key.as_str())
+                    .with_occurrence(Occurrence::Nth(1)),
+                );
+            }
+            let store = Arc::new(FaultStore::new(Arc::clone(&inner), plan));
+            let catalog = Catalog::new(store.clone(), budget).expect("catalog");
+            let second = fold_through(&catalog, Signal::Logs, DAY_D + 26).await;
+            assert_eq!(
+                store.fault_count(Op::Get, FaultKind::Permanent),
+                u64::from(faulted)
+            );
+            let held_gets = inner.section_gets_of(&[&two, &three]);
+            let late_gets = inner.section_gets_of(&[&late]);
+            (first, second, held_gets, late_gets)
+        };
+
+        let (first, restarted, held_gets, late_gets) = dirty_day(true).await;
+        assert!(first.key_index_sections_read > 0, "{first:?}");
+        assert_eq!(first.key_index_unchanged_section_gets, 0, "{first:?}");
+        assert_eq!(
+            (held_gets, late_gets),
+            (2 * 2 * 3, 2 * 3),
+            "2 ranged GETs per entry per pass, 3 passes"
+        );
+        assert_eq!(
+            restarted.key_index_unchanged_section_gets, 12,
+            "the held entries' section GETs and not the late entry's: {restarted:?}"
+        );
+
+        let (_, carried, held_gets, late_gets) = dirty_day(false).await;
+        assert_eq!((held_gets, late_gets > 0), (0, true));
+        assert_eq!(carried.key_index_unchanged_section_gets, 0, "{carried:?}");
+    }
+
+    /// ADR-3939 row W2 in miniature: a retention tombstone in one hour of a
+    /// day the previous HEAD already held sealed (not its tail) re-encodes
+    /// that day's part, and the unchanged entries cost no section GET: the
+    /// build reads each of the day's 3 previous leaves once instead.
+    /// `key_index_leaf_gets` is those 3 plus the 1 GET of the previous
+    /// tail's leaf the new tail carries from, and
+    /// `sealed_day_previous_leaf_gets` is the 3 alone.
+    #[tokio::test]
+    async fn a_tombstone_dirtied_sealed_day_reads_no_unchanged_section() {
+        let budget = CatalogConfig {
+            key_index_build_max_pairs: 2,
+            ..kidx_config()
+        };
+        let store = OpLogStore::empty();
+        declare_user_id_key_index(store.as_ref()).await;
+        publish_user_id_logs(store.as_ref(), 1, DAY_D + 20, &[1, 2], 2, 0, true).await;
+        let (two, _) =
+            publish_user_id_logs(store.as_ref(), 2, DAY_D + 21, &[10, 20], 2, 0, true).await;
+        let (three, _) =
+            publish_user_id_logs(store.as_ref(), 3, DAY_D + 21, &[30, 40], 2, 0, true).await;
+        publish_user_id_logs(store.as_ref(), 4, DAY_D + 25, &[50], 2, 0, true).await;
+        let catalog = Catalog::new(store.clone(), budget).expect("catalog");
+        fold_through(&catalog, Signal::Logs, DAY_D + 25).await;
+        let first = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            first
+                .parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour, p.key_index.len()))
+                .collect::<Vec<_>>(),
+            vec![(DAY_D + 20, DAY_D + 21, 3), (DAY_D + 25, DAY_D + 25, 1)],
+            "day d is sealed and is not the tail"
+        );
+        let day_leaves = first.parts[0].key_index.len() as u64;
+
+        publish_logs_tombstone(store.as_ref(), DAY_D + 20).await;
+        publish_user_id_logs(store.as_ref(), 5, DAY_D + 26, &[60], 2, 0, true).await;
+        store.clear();
+        let report = fold_through(&catalog, Signal::Logs, DAY_D + 26).await;
+        let second = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            (second.parts[0].min_hour, second.parts[0].entry_count),
+            (DAY_D + 21, 2),
+            "the tombstone re-encodes day d without hour 20"
+        );
+        assert_eq!(store.section_gets_of(&[&two, &three]), 0);
+        assert_eq!(report.key_index_unchanged_section_gets, 0, "{report:?}");
+        assert_eq!(
+            store.gets_of_leaves(&first.parts[0].key_index) as u64,
+            day_leaves
+        );
+        assert_eq!(
+            report.sealed_day_previous_leaf_gets, day_leaves,
+            "{report:?}"
+        );
+        assert_eq!(
+            store.gets_of_leaves(&first.parts[1].key_index),
+            1,
+            "the new tail carries from the previous tail's one leaf"
+        );
+        assert_eq!(report.key_index_leaf_gets, day_leaves + 1, "{report:?}");
+    }
+
+    /// `head_digest` is the canonical digest of the HEAD in effect: the one
+    /// a fold publishes and the one a no-op fold read, each re-encoded with
+    /// `folder_id` and `created_unix_ns` zeroed, and empty when there is
+    /// none. A HEAD rewritten with another folder id and clock and nothing
+    /// else changed keeps the digest while its bytes change.
+    #[tokio::test]
+    async fn fold_report_head_digest_ignores_the_folder_id_and_clock() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        let absent = catalog
+            .fold(&tenant(), Signal::Logs, Uuid::new_v4(), 0, &[], None)
+            .await
+            .expect("fold");
+        assert!(absent.no_op);
+        assert_eq!(absent.head_digest, "");
+
+        declare_user_id_key_index(store.as_ref()).await;
+        publish_user_id_logs(store.as_ref(), 1, DAY_D + 20, &[10], 2, 0, true).await;
+        let report = fold_through(&catalog, Signal::Logs, DAY_D + 20).await;
+        let head_key = head_object_key(&tenant(), Signal::Logs);
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("head present")
+            .data;
+        let head = snapshot_format::decode_head(&head_bytes).expect("head decodes");
+        let canonical = SnapshotHead {
+            folder_id: vec![0; 16],
+            created_unix_ns: 0,
+            ..head.clone()
+        };
+        let digest = blake3::hash(&snapshot_format::encode_head(&canonical).expect("encode"))
+            .to_hex()
+            .to_string();
+        assert_eq!(report.head_digest, digest);
+
+        let rewritten = SnapshotHead {
+            folder_id: vec![0x5a; 16],
+            created_unix_ns: head.created_unix_ns + 1,
+            ..head
+        };
+        let rewritten_bytes = snapshot_format::encode_head(&rewritten).expect("encode");
+        assert_ne!(rewritten_bytes.as_slice(), head_bytes.as_ref());
+        store
+            .put(
+                &head_key,
+                Bytes::from(rewritten_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("rewrite head");
+        let refold = fold_through(&catalog, Signal::Logs, DAY_D + 20).await;
+        assert!(refold.no_op, "{refold:?}");
+        assert_eq!(refold.head_digest, digest);
     }
 
     /// ADR-3939 acceptance A3 through `Catalog::fold`: with the leaf switch
