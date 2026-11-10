@@ -4817,13 +4817,14 @@ mod tests {
         );
     }
 
-    /// Counts the GETs and HEADs that reach one key, passing every request
-    /// through to `inner`.
+    /// Counts the GETs, HEADs and PUTs that reach one key, passing every
+    /// request through to `inner`.
     struct KeyReadCounter<S> {
         inner: S,
         key: String,
         gets: std::sync::atomic::AtomicUsize,
         heads: std::sync::atomic::AtomicUsize,
+        puts: std::sync::atomic::AtomicUsize,
     }
 
     impl<S> KeyReadCounter<S> {
@@ -4833,15 +4834,17 @@ mod tests {
                 key,
                 gets: std::sync::atomic::AtomicUsize::new(0),
                 heads: std::sync::atomic::AtomicUsize::new(0),
+                puts: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
-        /// The `(GET, HEAD)` counts on the key since the last call, resetting
-        /// both.
-        fn take(&self) -> (usize, usize) {
+        /// The `(GET, HEAD, PUT)` counts on the key since the last call,
+        /// resetting all three.
+        fn take(&self) -> (usize, usize, usize) {
             (
                 self.gets.swap(0, Ordering::SeqCst),
                 self.heads.swap(0, Ordering::SeqCst),
+                self.puts.swap(0, Ordering::SeqCst),
             )
         }
     }
@@ -4854,6 +4857,9 @@ mod tests {
             data: bytes::Bytes,
             opts: PutOptions,
         ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            if key == self.key {
+                self.puts.fetch_add(1, Ordering::SeqCst);
+            }
             self.inner.put(key, data, opts).await
         }
         async fn get(
@@ -4898,14 +4904,14 @@ mod tests {
     /// one configured lease plus the widest jitter plus 1 ms after the first,
     /// far inside the 24 h steal threshold. `delete_between` deletes the claim
     /// key between them, as an operator clearing a stuck claim by hand would.
-    /// Returns the two reports, the claim key's `(GET, HEAD)` counts in the
-    /// second tick, and the store.
+    /// Returns the two reports, the claim key's `(GET, HEAD, PUT)` counts in
+    /// the second tick, and the store.
     async fn two_ticks_over_an_unreadable_claim(
         delete_between: bool,
     ) -> (
         MaintainReport,
         MaintainReport,
-        (usize, usize),
+        (usize, usize, usize),
         KeyReadCounter<MemoryStore>,
     ) {
         const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
@@ -5023,12 +5029,14 @@ mod tests {
     }
 
     /// While the unreadable claim is still present and young, the recheck one
-    /// lease later skips the bucket again, and that look costs exactly one GET
-    /// and one HEAD of the claim key: no steal, no write.
+    /// lease later skips the bucket again, and that look costs exactly one
+    /// rejected `CreateIfAbsent` PUT, one GET and one HEAD of the claim key: no
+    /// steal, and the claim bytes are unchanged.
     ///
     /// Shown failing against the scan that deferred the bucket to the skip's
-    /// steal threshold: the second tick issues no claim request, so "one GET
-    /// and one HEAD" reads left (0, 0), right (1, 1).
+    /// steal threshold: the second tick issues no claim request, so "one
+    /// rejected CreateIfAbsent PUT, one GET and one HEAD" reads left
+    /// (0, 0, 0), right (1, 1, 1).
     #[tokio::test]
     async fn a_present_unreadable_claim_is_rechecked_once_per_lease_and_skipped() {
         let (first, second, reads, store) = two_ticks_over_an_unreadable_claim(false).await;
@@ -5038,7 +5046,11 @@ mod tests {
             (0, 1),
             "a young unreadable claim is skipped again"
         );
-        assert_eq!(reads, (1, 1), "one GET and one HEAD of the claim key");
+        assert_eq!(
+            reads,
+            (1, 1, 1),
+            "one rejected CreateIfAbsent PUT, one GET and one HEAD of the claim key"
+        );
         let claim_key = ravel_fleet::claim::compaction_claim_key(
             &ravel_fleet::claim::WorkIdentity::new(
                 TenantId::new("acme").hash(),

@@ -73,9 +73,10 @@
 //! holds the claim and is fenced like any other (ADR-1029, the 2026-10-03 and
 //! 2026-11-09 amendments). The reschedule point already carries the jitter,
 //! so that steal waits none. The skip's [`ClaimSkip::recheck_after_unix_ms`]
-//! is capped at one configured lease plus the jitter past the observation, so
-//! a caller looks again about once per lease and a claim deleted by hand
-//! releases the bucket within that, not at the steal threshold.
+//! is capped at one configured lease (capped at the 24 h ceiling) plus the
+//! jitter past the observation, so a caller looks again about once per lease
+//! and a claim deleted by hand releases the bucket within that, not at the
+//! steal threshold.
 //!
 //! # The claim fences compaction against the erasure rewrite
 //!
@@ -244,7 +245,8 @@ pub struct ClaimSkip {
     /// When a caller should next look at this bucket. Equal to
     /// `reschedule_after_unix_ms` for every reason except
     /// [`ClaimSkipReason::UnreadableClaim`], where it is capped at one
-    /// configured lease plus this contender's jitter plus one millisecond past
+    /// configured lease (capped at the 24 h ceiling) plus this contender's
+    /// jitter plus one millisecond past
     /// the observation, so a claim deleted by hand stops holding the bucket
     /// within about one lease rather than at the 24 h steal threshold. Each
     /// such look costs the rejected PUT plus one GET and one HEAD.
@@ -504,9 +506,8 @@ impl ClaimGuard {
     }
 
     /// This contender's deterministic jitter, in milliseconds. The jitter span
-    /// is a fraction of the lease, so it is priced from the lease this guard
-    /// was configured with (the same arithmetic `ClaimConfig` uses
-    /// internally: whole milliseconds, floored at 1).
+    /// is a fraction of the lease, so it is priced from [`Self::lease_ms`],
+    /// the configured lease clamped at the 24 h ceiling.
     fn jitter_ms(&self) -> i64 {
         let inner = &self.inner;
         jitter_ms(
@@ -517,11 +518,18 @@ impl ClaimGuard {
         )
     }
 
-    /// This guard's configured lease, in whole milliseconds, floored at 1.
+    /// This guard's configured lease, in whole milliseconds, floored at 1 and
+    /// capped at [`claim::MAX_OBSERVED_LEASE_MS`]. The observation applies the
+    /// same clamp before it prices a jitter, so the jitter this guard waits
+    /// out before a steal is the figure the observation computes from the
+    /// same lease, and a lease configured above 24 h cannot widen that wait
+    /// past `jitter_span_fraction` of 24 h. In the unreadable-claim recheck cap the
+    /// clamp changes nothing: for a lease at or above the ceiling the steal
+    /// threshold is always the earlier of the two points.
     fn lease_ms(&self) -> i64 {
         i64::try_from(self.inner.cfg.lease_duration.as_millis())
             .unwrap_or(i64::MAX)
-            .max(1)
+            .clamp(1, claim::MAX_OBSERVED_LEASE_MS)
     }
 
     /// The contention path: steal an expired claim (an unreadable one once
@@ -1372,6 +1380,98 @@ mod tests {
             retry.requests().await,
             4,
             "rejected PUT, GET, HEAD, and the steal CAS"
+        );
+    }
+
+    /// A lease configured above the 24 h ceiling prices the contender's jitter
+    /// from the clamped lease, on both sides: the wait before a steal and the
+    /// jitter the observation folds into an unreadable claim's reschedule
+    /// point are the same figure.
+    #[tokio::test]
+    async fn a_lease_above_the_ceiling_prices_the_jitter_from_the_clamped_lease() {
+        const T0: i64 = 1_700_000_000_000;
+        const LONG_MS: i64 = 48 * 60 * 60 * 1000;
+        let long = ClaimConfig {
+            lease_duration: Duration::from_secs(48 * 60 * 60),
+            ..ClaimConfig::default()
+        };
+        let work_id = bucket_identity().work_id();
+        let clamped = jitter_ms(&work_id, &Uuid::from_u128(2), MAX_OBSERVED_LEASE_MS, &long);
+        let raw = jitter_ms(&work_id, &Uuid::from_u128(2), LONG_MS, &long);
+        assert!(clamped > 0, "a zero draw would make this test vacuous");
+        assert_ne!(
+            raw, clamped,
+            "an equal draw would make this test vacuous (the raw span is twice the clamped one)"
+        );
+
+        // Steal path: the wait before the steal.
+        let store = MemoryStore::new();
+        store.set_clock_ms(T0 as u64);
+        let clock = FixedClock::new(T0 * 1_000_000);
+        let holder = ClaimGuard::new(&bucket(), &participant(1, &clock), long, None);
+        assert!(matches!(
+            holder.acquire(&store).await.expect("holder acquires"),
+            Acquire::Acquired
+        ));
+        let (contender, sleeper) = recording_participant(2, &clock);
+        let first = ClaimGuard::new(&bucket(), &contender, long, None);
+        let skip = match first.acquire(&store).await.expect("contender observes") {
+            Acquire::Skipped(skip) => skip,
+            other => panic!("expected a skip, got {other:?}"),
+        };
+        assert_eq!(skip.reason, ClaimSkipReason::HeldByAnother);
+        assert_eq!(
+            skip.expiry_unix_ms,
+            T0 + MAX_OBSERVED_LEASE_MS,
+            "the observation clamps the holder's 48 h lease at the ceiling"
+        );
+        assert_eq!(skip.reschedule_after_unix_ms, skip.expiry_unix_ms + 1);
+        assert_eq!(sleeper.waits(), Vec::<Duration>::new());
+
+        let reschedule = skip.reschedule_after_unix_ms;
+        store.set_clock_ms(reschedule as u64);
+        clock.set(reschedule * 1_000_000);
+        let retry = ClaimGuard::new(&bucket(), &contender, long, None);
+        assert!(matches!(
+            retry.acquire(&store).await.expect("retry steals"),
+            Acquire::Acquired
+        ));
+        assert!(retry.stolen().await, "the retry steals the expired claim");
+        let waits = sleeper.waits();
+        assert_eq!(
+            waits,
+            vec![Duration::from_millis(clamped as u64)],
+            "the steal waits the jitter drawn from the clamped lease, the figure the observation used"
+        );
+        let bound = Duration::from_millis(
+            (MAX_OBSERVED_LEASE_MS as f64 * long.jitter_span_fraction) as u64,
+        );
+        assert!(waits[0] <= bound, "bounded by the clamped lease");
+
+        // Observation side: an unreadable claim's reschedule point carries the
+        // jitter observe priced.
+        let store2 = MemoryStore::new();
+        store2.set_clock_ms(T0 as u64);
+        store2
+            .put(
+                &claim::compaction_claim_key(&work_id),
+                bytes::Bytes::from_static(b"\xffnot a claim"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed an unreadable claim");
+        clock.set((T0 + 1_000) * 1_000_000);
+        let guard = ClaimGuard::new(&bucket(), &contender, long, None);
+        let skip = match guard.acquire(&store2).await.expect("contender observes") {
+            Acquire::Skipped(skip) => skip,
+            other => panic!("expected a skip, got {other:?}"),
+        };
+        assert_eq!(skip.reason, ClaimSkipReason::UnreadableClaim);
+        assert_eq!(
+            skip.reschedule_after_unix_ms - skip.expiry_unix_ms - 1,
+            clamped,
+            "observe prices the unreadable claim's jitter from the clamped lease; \
+             the steal above waited the same figure"
         );
     }
 
