@@ -2225,6 +2225,12 @@ INFO performance default resolved setting="sql_first_attempt_partitions" value=1
 `derived` when the derived count was already 16 or more, and `flag` when you
 set the count.
 
+`--sql-bucketed-final-aggregation` (off by default) runs one bucketed stream
+per partition of that exchange, and each holds about 17 to 19 MB. On a host
+under 8 cores with the count derived, that is 16 streams and about 290 MB per
+statement, against about 150 MB at 8. If you turn it on there, size
+`--sql-max-query-bytes` for that, or set `--sql-partition-count`.
+
 ### SQL ceilings
 
 The two SQL ceilings derive to the same 50% share of `MemTotal`. The

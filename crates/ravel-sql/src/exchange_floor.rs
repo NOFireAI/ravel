@@ -105,6 +105,13 @@ impl FinalExchangeFloor {
 
 /// Whether `node` pairs partition `i` of one input with partition `i` of
 /// another. See the module docs.
+///
+/// Checked against DataFusion 55.2: there `InputDistributionRequirements::
+/// co_partitioned` is declared by HashJoinExec in Partitioned mode,
+/// SortMergeJoinExec and SymmetricHashJoinExec, InterleaveExec requires
+/// identically hash-partitioned inputs without it, and every other
+/// multi-input plan requires a single partition. A DataFusion upgrade
+/// re-checks this list.
 fn co_partitions_its_inputs(node: &Arc<dyn ExecutionPlan>) -> bool {
     if node.downcast_ref::<InterleaveExec>().is_some()
         || node.downcast_ref::<SortMergeJoinExec>().is_some()

@@ -429,20 +429,13 @@ async fn probed_typed(
     }
 }
 
-/// `sql` with the rule on and off, on a 1 GiB pool, at the engine's default
-/// 8 partitions the peak bounds below were measured at. With 16 final
-/// streams the rule-off envelope falls to about 27 MB, under the 32 MiB
-/// bound that separates it from the rule-on figure.
+/// `sql` with the rule on and off, on a 1 GiB pool, under the default config.
 async fn on_and_off(
     parts: impl Fn() -> Vec<Vec<RecordBatch>>,
     options: &[(&str, &str)],
     sql: &str,
 ) -> (Probed, Probed) {
-    let config = SqlConfig {
-        first_attempt_min_partitions: 0,
-        ..SqlConfig::default()
-    };
-    on_and_off_with(&config, parts, options, sql).await
+    on_and_off_with(&SqlConfig::default(), parts, options, sql).await
 }
 
 /// `sql` under `config`, and under `config` with the rule off.
@@ -2234,8 +2227,12 @@ async fn the_exec_bounds_the_final_stages_charged_peak() {
                 "{direction} {arrival:?}: charged peak {} with the rule off",
                 off.charged
             );
+            // The 16 floored final streams' envelopes, about 7 MB each, of
+            // which the ledger holds the widest `min(cores, 16)`: 54 to 57 MB
+            // measured on 8 cores, about 27 MB on 4. The rule-on bound above
+            // is what this one separates from.
             assert!(
-                off.envelope > 32 * MIB as i64,
+                off.envelope > 16 * MIB as i64,
                 "{direction} {arrival:?}: envelope {} with the rule off",
                 off.envelope
             );
