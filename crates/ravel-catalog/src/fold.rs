@@ -1464,6 +1464,42 @@ fn apply_retirements(
     grown
 }
 
+/// The retired hours of `previous`'s parts, as [`apply_retirements`] left
+/// them in `grown`, that hold an entry of a span this fold does not carry by
+/// reference. A late commit through a held-open hour, a change of the entry
+/// threshold, or any other change that moves a span off its previous part's
+/// bytes lands here.
+fn stranded_retired_hours(
+    previous: Option<&SnapshotHead>,
+    grown: &HashMap<Vec<u8>, Vec<u32>>,
+    spans: &[PartSpan],
+    encodings: &[Result<SpanEncoding, SnapshotFormatError>],
+    carried: &HashMap<Vec<u8>, SnapshotPartRef>,
+    entries: &[SnapshotEntry],
+) -> BTreeSet<u32> {
+    let retired: HashSet<u32> = previous
+        .into_iter()
+        .flat_map(|head| &head.parts)
+        .flat_map(|part| grown.get(&part.blake3).unwrap_or(&part.retired_hours))
+        .copied()
+        .collect();
+    if retired.is_empty() {
+        return BTreeSet::new();
+    }
+    spans
+        .iter()
+        .zip(encodings)
+        .filter(|(_, encoding)| {
+            encoding
+                .as_ref()
+                .is_ok_and(|encoding| !carried.contains_key(encoding.hash.as_bytes().as_slice()))
+        })
+        .flat_map(|(span, _)| &entries[span.start..span.end])
+        .map(|entry| entry.ingest_hour_bucket)
+        .filter(|hour| retired.contains(hour))
+        .collect()
+}
+
 /// Bytes of a data object's tail the key-index leaf build reads to open its
 /// footer. A footer longer than this costs one more ranged GET.
 pub(crate) const KEY_INDEX_FOOTER_SUFFIX_LEN: u64 = 8 * 1024;
@@ -4643,13 +4679,6 @@ impl Catalog {
                     key_index_switch_off_over_leaves,
                 ));
             }
-            // A reconcile that changed any hour invalidates the append-only,
-            // stable-ordinal assumption the forward postings merge relies on
-            // (a superseded or removed entry shifts every later ordinal), so
-            // postings must be rebuilt from scratch this fold, exactly as on
-            // the rebuild path.
-            let reconciled = !dirty_hours.is_empty();
-
             entries.sort_by(|a, b| {
                 (
                     a.ingest_hour_bucket,
@@ -4682,92 +4711,126 @@ impl Catalog {
             // postings ordinals still index that concatenation and global
             // duplicate-freedom follows from per-part validation plus range
             // disjointness (no cross-part entry pass is needed).
-            let spans = partition_parts(
-                &entries,
-                SealPolicy {
-                    max_entries: self.config().snapshot_part_max_entries,
-                    seal_utc_days: self.config().build_key_index_leaves,
-                },
-            );
+            //
+            // A retired hour is hidden only through the ref of the part that
+            // holds it, so a span that re-encodes may not hold one: its
+            // entries are dropped for good and the entries partitioned again.
+            let (spans, existing_by_blake3, span_encodings) = loop {
+                let spans = partition_parts(
+                    &entries,
+                    SealPolicy {
+                        max_entries: self.config().snapshot_part_max_entries,
+                        seal_utc_days: self.config().build_key_index_leaves,
+                    },
+                );
 
-            // Sealed parts unchanged since the previous HEAD are carried by
-            // reference, never re-encoded or re-PUT (ADR-0063 section 3). The
-            // "unchanged" signal is content addressing: a part recomputed from
-            // the same entries over the same [min_hour, watermark] range
-            // encodes to byte-identical output and therefore the same blake3,
-            // so a hash already present in the previous HEAD names an object
-            // already in the store under the same content-addressed key. Only
-            // a part whose covering hours actually changed produces a new hash
-            // and is PUT.
-            //
-            // `!rebuilt` is load-bearing: when `load_previous_entries` failed
-            // above and this fold rebuilt from the commit layout instead
-            // (missing or corrupt sealed part object), reusing the old HEAD's
-            // refs here would recompute a byte-identical hash for a part that
-            // does NOT exist in the store, skip its PUT, and leave the new
-            // HEAD permanently naming a dead object -- defeating the
-            // PUT-and-get-AlreadyExists self-heal ADR-0063 section 5
-            // describes, which only works if the object actually exists.
-            //
-            // A part the reconcile pass marked dirty (its covering hours'
-            // contribution changed) is excluded from this reuse map, so it can
-            // never be carried forward even if its recomputed hash somehow
-            // still matched the old ref: a dirty part always takes the normal
-            // re-encode-and-PUT path (ADR-0063 section 4). In practice the
-            // changed content already yields a different hash, so this is a
-            // fail-safe, not the primary mechanism.
-            let existing_by_blake3: HashMap<Vec<u8>, SnapshotPartRef> = match &head_state {
-                HeadState::Valid { head, .. } if !rebuilt => head
-                    .parts
+                // Sealed parts unchanged since the previous HEAD are carried by
+                // reference, never re-encoded or re-PUT (ADR-0063 section 3). The
+                // "unchanged" signal is content addressing: a part recomputed from
+                // the same entries over the same [min_hour, watermark] range
+                // encodes to byte-identical output and therefore the same blake3,
+                // so a hash already present in the previous HEAD names an object
+                // already in the store under the same content-addressed key. Only
+                // a part whose covering hours actually changed produces a new hash
+                // and is PUT.
+                //
+                // `!rebuilt` is load-bearing: when `load_previous_entries` failed
+                // above and this fold rebuilt from the commit layout instead
+                // (missing or corrupt sealed part object), reusing the old HEAD's
+                // refs here would recompute a byte-identical hash for a part that
+                // does NOT exist in the store, skip its PUT, and leave the new
+                // HEAD permanently naming a dead object -- defeating the
+                // PUT-and-get-AlreadyExists self-heal ADR-0063 section 5
+                // describes, which only works if the object actually exists.
+                //
+                // A part the reconcile pass marked dirty (its covering hours'
+                // contribution changed) is excluded from this reuse map, so it can
+                // never be carried forward even if its recomputed hash somehow
+                // still matched the old ref: a dirty part always takes the normal
+                // re-encode-and-PUT path (ADR-0063 section 4). In practice the
+                // changed content already yields a different hash, so this is a
+                // fail-safe, not the primary mechanism.
+                let existing_by_blake3: HashMap<Vec<u8>, SnapshotPartRef> = match &head_state {
+                    HeadState::Valid { head, .. } if !rebuilt => head
+                        .parts
+                        .iter()
+                        .filter(|p| !part_covers_dirty_hour(p, &dirty_hours))
+                        .map(|p| (p.blake3.clone(), p.clone()))
+                        .collect(),
+                    _ => HashMap::new(),
+                };
+
+                // An old part carried forward by reference below
+                // (`existing_by_blake3`) never touches `v3_content_baseline`: the
+                // per-span loop skips the v3 block for it. Only an old part this
+                // fold re-derives can use its prior per-segment statistics as a
+                // baseline, so precompute which old part hashes the spans
+                // reproduce byte-for-byte and fetch baselines for the rest only.
+                //
+                // Encoded once per span (kept in `span_encodings`, not discarded):
+                // the per-span build loop below consumes the same bytes and hash
+                // rather than re-running `encode_part_ranged` and `blake3::hash`
+                // a second time over identical input.
+                let single_part = spans.len() == 1;
+                let span_encodings: Vec<Result<SpanEncoding, SnapshotFormatError>> = spans
                     .iter()
-                    .filter(|p| !part_covers_dirty_hour(p, &dirty_hours))
-                    .map(|p| (p.blake3.clone(), p.clone()))
-                    .collect(),
-                _ => HashMap::new(),
-            };
-
-            // An old part carried forward by reference below
-            // (`existing_by_blake3`) never touches `v3_content_baseline`: the
-            // per-span loop skips the v3 block for it. Only an old part this
-            // fold re-derives can use its prior per-segment statistics as a
-            // baseline, so precompute which old part hashes the spans
-            // reproduce byte-for-byte and fetch baselines for the rest only.
-            //
-            // Encoded once per span (kept in `span_encodings`, not discarded):
-            // the per-span build loop below consumes the same bytes and hash
-            // rather than re-running `encode_part_ranged` and `blake3::hash`
-            // a second time over identical input.
-            let single_part = spans.len() == 1;
-            let span_encodings: Vec<Result<SpanEncoding, SnapshotFormatError>> = spans
-                .iter()
-                .enumerate()
-                .map(|(span_index, span)| {
-                    let is_tail = span_index + 1 == spans.len();
-                    let (min_hour, watermark) = if single_part {
-                        (0, watermark_hour)
-                    } else if is_tail {
-                        (span.min_hour, watermark_hour)
-                    } else {
-                        (span.min_hour, span.watermark_hour)
-                    };
-                    let part_entries = &entries[span.start..span.end];
-                    let bytes = snapshot_format::encode_part_ranged(
-                        tenant.0,
-                        signal_num,
-                        shard_ceiling,
-                        min_hour,
-                        watermark,
-                        part_entries,
-                    )?;
-                    let hash = blake3::hash(&bytes);
-                    Ok(SpanEncoding {
-                        min_hour,
-                        watermark,
-                        bytes,
-                        hash,
+                    .enumerate()
+                    .map(|(span_index, span)| {
+                        let is_tail = span_index + 1 == spans.len();
+                        let (min_hour, watermark) = if single_part {
+                            (0, watermark_hour)
+                        } else if is_tail {
+                            (span.min_hour, watermark_hour)
+                        } else {
+                            (span.min_hour, span.watermark_hour)
+                        };
+                        let part_entries = &entries[span.start..span.end];
+                        let bytes = snapshot_format::encode_part_ranged(
+                            tenant.0,
+                            signal_num,
+                            shard_ceiling,
+                            min_hour,
+                            watermark,
+                            part_entries,
+                        )?;
+                        let hash = blake3::hash(&bytes);
+                        Ok(SpanEncoding {
+                            min_hour,
+                            watermark,
+                            bytes,
+                            hash,
+                        })
                     })
-                })
-                .collect();
+                    .collect();
+                let stranded = stranded_retired_hours(
+                    retire_head,
+                    &retired_grown,
+                    &spans,
+                    &span_encodings,
+                    &existing_by_blake3,
+                    &entries,
+                );
+                if stranded.is_empty() {
+                    break (spans, existing_by_blake3, span_encodings);
+                }
+                let hours: Vec<u32> = stranded.iter().copied().collect();
+                drop_entries(
+                    &mut entries,
+                    &mut seen,
+                    &mut dirty_hours,
+                    &carry_sources,
+                    tenant,
+                    signal,
+                    &hours,
+                    |entry| stranded.contains(&entry.ingest_hour_bucket),
+                );
+            };
+            // A reconcile that changed any hour invalidates the append-only,
+            // stable-ordinal assumption the forward postings merge relies on
+            // (a superseded or removed entry shifts every later ordinal), so
+            // postings must be rebuilt from scratch this fold, exactly as on
+            // the rebuild path.
+            let reconciled = !dirty_hours.is_empty();
             let reused_old_part_hashes: HashSet<[u8; 32]> = span_encodings
                 .iter()
                 .filter_map(|encoding| encoding.as_ref().ok())
@@ -6817,7 +6880,9 @@ pub(crate) mod tests {
         DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
         DEFAULT_MAX_FLUSH_LIFETIME_NS,
     };
-    use crate::snapshot_format::check_key_index_leaf_set;
+    use crate::snapshot_format::{
+        HEAD_FORMAT_VERSION_2, check_key_index_leaf_set, head_format_version_for,
+    };
 
     const DEFAULT_MARGIN_NS: i64 = DEFAULT_MAX_FLUSH_LIFETIME_NS
         + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
@@ -16539,6 +16604,27 @@ pub(crate) mod tests {
                 .count()
         }
 
+        /// Keys of every snapshot part PUT, in order.
+        fn part_puts(&self) -> Vec<String> {
+            self.puts
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|key| key.ends_with(".csnap"))
+                .cloned()
+                .collect()
+        }
+
+        /// Full GETs of `key`.
+        fn full_gets_of(&self, key: &str) -> usize {
+            self.gets
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(got, range)| got == key && matches!(range, GetRange::Full))
+                .count()
+        }
+
         /// `.kidx` GETs of the leaves of the part whose watermark is `hour`.
         fn leaf_gets_for_part_watermark(&self, hour: u32) -> usize {
             let needle = format!("/idx/{}.", keys::ingest_hour_string(hour));
@@ -16902,7 +16988,8 @@ pub(crate) mod tests {
         };
         let store = OpLogStore::empty();
         declare_user_id_key_index(store.as_ref()).await;
-        publish_user_id_logs(store.as_ref(), 1, DAY_D + 20, &[1, 2], 2, 0, true).await;
+        let (one, _) =
+            publish_user_id_logs(store.as_ref(), 1, DAY_D + 20, &[1, 2], 2, 0, true).await;
         let (two, _) =
             publish_user_id_logs(store.as_ref(), 2, DAY_D + 21, &[10, 20], 2, 0, true).await;
         let (three, _) =
@@ -16919,7 +17006,7 @@ pub(crate) mod tests {
             "one leaf per pass: 6 pairs under a share of 2"
         );
 
-        publish_logs_tombstone(store.as_ref(), DAY_D + 20).await;
+        publish_logs_erasure(store.as_ref(), DAY_D + 20, &[&one]).await;
         publish_user_id_logs(store.as_ref(), 5, DAY_D + 26, &[60], 2, 0, true).await;
         store.clear();
         take_key_index_carry_log_for_test();
@@ -16999,7 +17086,8 @@ pub(crate) mod tests {
         };
         let inner = OpLogStore::empty();
         declare_user_id_key_index(inner.as_ref()).await;
-        publish_user_id_logs(inner.as_ref(), 1, DAY_D + 20, &[1, 2], 2, 0, true).await;
+        let (one, _) =
+            publish_user_id_logs(inner.as_ref(), 1, DAY_D + 20, &[1, 2], 2, 0, true).await;
         let (two, _) =
             publish_user_id_logs(inner.as_ref(), 2, DAY_D + 21, &[10, 20], 2, 0, true).await;
         let (three, _) =
@@ -17012,7 +17100,7 @@ pub(crate) mod tests {
         day_d.sort_by_key(|leaf| leaf.key8_lo);
         assert_eq!(day_d.len(), 3);
 
-        publish_logs_tombstone(inner.as_ref(), DAY_D + 20).await;
+        publish_logs_erasure(inner.as_ref(), DAY_D + 20, &[&one]).await;
         publish_user_id_logs(inner.as_ref(), 5, DAY_D + 26, &[60], 2, 0, true).await;
         inner.clear();
         let plan = FaultPlan::empty().with_rule(
@@ -17074,6 +17162,488 @@ pub(crate) mod tests {
             stored_leaves(inner.as_ref(), &second.parts[0]).await,
             stored_leaves(fresh.as_ref(), &scratch.parts[0]).await,
             "the restarted build writes the from-scratch leaves"
+        );
+    }
+
+    /// Publishes a logs selective-erasure rewrite record into `(0, hour)`
+    /// that supersedes `inputs` and contributes no part: every row of the
+    /// inputs was erased.
+    async fn publish_logs_erasure(
+        store: &dyn ObjectStoreBackend,
+        hour: u32,
+        inputs: &[&CommitRecord],
+    ) {
+        let mut input_ids: Vec<CompactionInputIdentity> = inputs
+            .iter()
+            .map(|r| CompactionInputIdentity {
+                writer_id: r.writer_id.clone(),
+                writer_epoch: r.writer_epoch,
+                writer_seq: r.writer_seq,
+            })
+            .collect();
+        input_ids.sort_by(|a, b| {
+            (a.writer_id.as_str(), a.writer_epoch, a.writer_seq).cmp(&(
+                b.writer_id.as_str(),
+                b.writer_epoch,
+                b.writer_seq,
+            ))
+        });
+        let request_ids = vec![Uuid::from_u128(u128::from(hour)).to_string()];
+        let input_set_hash =
+            erasure::compute_rewrite_input_set_hash(&input_ids, None, &request_ids).to_vec();
+        let record = RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Logs) as i32,
+            shard: 0,
+            ingest_hour_bucket: hour,
+            inputs: input_ids,
+            input_set_hash,
+            parts: Vec::new(),
+            drops: request_ids
+                .iter()
+                .map(|request_id| RewriteDrop {
+                    request_id: request_id.clone(),
+                    dropped_count: 1,
+                })
+                .collect(),
+            created_unix_ns: i64::from(hour + 1) * NS_PER_HOUR,
+            superseded_record_key: String::new(),
+        };
+        let key = keys::rewrite_record_key_for(&record).expect("rewrite key");
+        store
+            .put(
+                &key,
+                erasure::encode_rewrite(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put rewrite record");
+    }
+
+    /// Day d holds writer 1 (hour 20, ids 1 and 2) and writers 2 and 3
+    /// (hour 21, ids 10, 20 and 30, 40); day d + 1 holds writer 4 (hour 25,
+    /// id 50). Returns the four records in writer order.
+    async fn publish_retire_fixture(store: &dyn ObjectStoreBackend) -> Vec<CommitRecord> {
+        let mut records = Vec::new();
+        for (seq, hour, ids) in [
+            (1u64, DAY_D + 20, &[1i64, 2][..]),
+            (2, DAY_D + 21, &[10, 20]),
+            (3, DAY_D + 21, &[30, 40]),
+            (4, DAY_D + 25, &[50]),
+        ] {
+            let (record, _) = publish_user_id_logs(store, seq, hour, ids, 2, 0, true).await;
+            records.push(record);
+        }
+        records
+    }
+
+    /// Every entry of every part `head` names, read off the part objects.
+    async fn head_entries(
+        store: &dyn ObjectStoreBackend,
+        head: &SnapshotHead,
+    ) -> Vec<SnapshotEntry> {
+        let mut entries = Vec::new();
+        for part in &head.parts {
+            let got = store
+                .get(&part.key, GetRange::Full)
+                .await
+                .expect("part present");
+            entries.extend(
+                snapshot_format::decode_part(&got.data, &PartLimits::default())
+                    .expect("part decodes")
+                    .entries,
+            );
+        }
+        entries
+    }
+
+    /// Folds the retire fixture through hour 25 with the leaf switch on,
+    /// tombstones hour 20, and folds once more through hour 26, where
+    /// writer 5 lands. Returns the catalog and the HEADs before and after.
+    async fn retire_hour_twenty(
+        store: &Arc<OpLogStore>,
+        config: CatalogConfig,
+    ) -> (
+        Catalog,
+        SnapshotHead,
+        SnapshotHead,
+        FoldReport,
+        Vec<CommitRecord>,
+    ) {
+        declare_user_id_key_index(store.as_ref()).await;
+        let records = publish_retire_fixture(store.as_ref()).await;
+        let catalog = Catalog::new(store.clone(), config).expect("catalog");
+        fold_through(&catalog, Signal::Logs, DAY_D + 25).await;
+        let first = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(first.parts.len(), 2);
+        assert!(!first.parts[0].key_index.is_empty(), "day d has leaves");
+        assert_eq!(first.format_version, HEAD_FORMAT_VERSION_1);
+
+        publish_logs_tombstone(store.as_ref(), DAY_D + 20).await;
+        publish_user_id_logs(store.as_ref(), 5, DAY_D + 26, &[60], 2, 0, true).await;
+        store.clear();
+        let report = fold_through(&catalog, Signal::Logs, DAY_D + 26).await;
+        let second = read_signal_head(store.as_ref(), Signal::Logs).await;
+        (catalog, first, second, report, records)
+    }
+
+    /// ADR-3939 decision 6: a retention tombstone for hour 20 of sealed,
+    /// leaf-bearing day d is recorded in day d's ref as a retired hour. The
+    /// fold PUTs no part and no leaf for day d (its one part PUT is the
+    /// tail's), carries day d's ref unchanged but for `retired_hours`, and
+    /// writes a version 2 HEAD.
+    #[tokio::test]
+    async fn a_tombstoned_hour_in_a_leaf_bearing_sealed_day_is_recorded_not_reencoded() {
+        let store = OpLogStore::empty();
+        let (_, first, second, report, _) = retire_hour_twenty(&store, kidx_config()).await;
+        let mut expected = first.parts[0].clone();
+        expected.retired_hours = vec![DAY_D + 20];
+        assert_eq!(
+            second.parts[0], expected,
+            "day d's ref is the previous one but for its retired hour"
+        );
+        assert_eq!(report.parts_reused, 1, "{report:?}");
+        assert_eq!(
+            store.part_puts(),
+            vec![second.parts[1].key.clone()],
+            "the one part PUT is the tail's"
+        );
+        assert_eq!(store.leaf_puts_for_part_watermark(DAY_D + 21), 0);
+        assert_eq!(second.format_version, HEAD_FORMAT_VERSION_2);
+        assert_eq!(head_format_version_for(&second), HEAD_FORMAT_VERSION_2);
+    }
+
+    /// ADR-3939 decision 6: once every hour of day d holding entries is
+    /// tombstoned, day d's part leaves HEAD with no part PUT, and HEAD goes
+    /// back to version 1 since no other part has retired hours.
+    #[tokio::test]
+    async fn a_fully_tombstoned_day_part_is_dropped_without_a_put() {
+        let store = OpLogStore::empty();
+        let (catalog, _, second, _, _) = retire_hour_twenty(&store, kidx_config()).await;
+        assert_eq!(second.format_version, HEAD_FORMAT_VERSION_2);
+
+        publish_logs_tombstone(store.as_ref(), DAY_D + 21).await;
+        publish_user_id_logs(store.as_ref(), 6, DAY_D + 27, &[70], 2, 0, true).await;
+        store.clear();
+        fold_through(&catalog, Signal::Logs, DAY_D + 27).await;
+        let third = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            third
+                .parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour, p.entry_count))
+                .collect::<Vec<_>>(),
+            vec![(0, DAY_D + 27, 3)],
+            "day d's part left HEAD, and the one part left starts at 0"
+        );
+        assert_eq!(
+            store.part_puts(),
+            vec![third.parts[0].key.clone()],
+            "no part PUT for day d"
+        );
+        assert_eq!(third.format_version, HEAD_FORMAT_VERSION_1);
+    }
+
+    /// ADR-3939 decision 6: an erasure rewrite record in hour 21 of a day
+    /// with retired hour 20 re-encodes day d in the same fold. The new part
+    /// holds writer 2 alone (writer 3 erased, hour 20's entries dropped for
+    /// good), its ref carries no retired hours, and HEAD is version 1.
+    #[tokio::test]
+    async fn a_rewrite_record_in_a_retired_sealed_day_re_encodes_now() {
+        let store = OpLogStore::empty();
+        let (catalog, _, second, _, records) = retire_hour_twenty(&store, kidx_config()).await;
+        publish_logs_erasure(store.as_ref(), DAY_D + 21, &[&records[2]]).await;
+        publish_user_id_logs(store.as_ref(), 6, DAY_D + 27, &[70], 2, 0, true).await;
+        store.clear();
+        fold_through(&catalog, Signal::Logs, DAY_D + 27).await;
+        let third = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let day_d = &third.parts[0];
+        assert_eq!(
+            (day_d.min_hour, day_d.watermark_hour, day_d.entry_count),
+            (DAY_D + 21, DAY_D + 21, 1),
+            "day d is re-encoded without hour 20 and without writer 3"
+        );
+        assert!(day_d.retired_hours.is_empty(), "{day_d:?}");
+        assert_ne!(day_d.key, second.parts[0].key);
+        assert_eq!(store.part_puts().first(), Some(&day_d.key));
+        assert_eq!(third.format_version, HEAD_FORMAT_VERSION_1);
+        let writers: Vec<u64> = head_entries(store.as_ref(), &third)
+            .await
+            .iter()
+            .filter(|e| e.ingest_hour_bucket < DAY_D + 24)
+            .map(|e| e.writer_seq)
+            .collect();
+        assert_eq!(writers, vec![2]);
+    }
+
+    /// ADR-3939 decision 6: a part carried by reference keeps its retired
+    /// hours. The fourth fold no longer lists hour 20 (its reconcile window
+    /// starts at hour 34), yet day d's ref still carries it.
+    #[tokio::test]
+    async fn a_part_carried_by_reference_keeps_its_retired_hours() {
+        let store = OpLogStore::empty();
+        let (catalog, _, second, _, _) = retire_hour_twenty(&store, kidx_config()).await;
+        for (seq, hour) in [(6u64, DAY_D + 60), (7, DAY_D + 61)] {
+            publish_user_id_logs(store.as_ref(), seq, hour, &[seq as i64], 2, 0, true).await;
+            store.clear();
+            let report = fold_through(&catalog, Signal::Logs, hour).await;
+            let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+            assert_eq!(head.parts[0], second.parts[0], "{hour}");
+            assert_eq!(head.parts[0].retired_hours, vec![DAY_D + 20], "{hour}");
+            assert!(report.parts_reused >= 1, "{hour}: {report:?}");
+            assert!(
+                !store.part_puts().contains(&second.parts[0].key),
+                "{hour}: no PUT of day d"
+            );
+            assert_eq!(head.format_version, HEAD_FORMAT_VERSION_2, "{hour}");
+        }
+    }
+
+    /// ADR-3939 decision 6: a switch-off fold over a HEAD with retired hours
+    /// drops their entries and re-encodes the part, so the field is never
+    /// written with the switch off, even where the entry threshold alone
+    /// would reproduce day d's part. Under a threshold of 2, day d is the
+    /// first part either way; the switch-off fold runs with a 2-hour
+    /// reconcile window, so it never lists hour 20's tombstone and only the
+    /// retired-hours field tells it the hour is gone.
+    #[tokio::test]
+    async fn a_switch_off_fold_over_retired_hours_re_encodes_the_part() {
+        let store = OpLogStore::empty();
+        declare_user_id_key_index(store.as_ref()).await;
+        for (seq, hour) in [(1u64, DAY_D + 20), (2, DAY_D + 21), (3, DAY_D + 25)] {
+            publish_user_id_logs(store.as_ref(), seq, hour, &[seq as i64], 2, 0, true).await;
+        }
+        let on = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                snapshot_part_max_entries: 2,
+                ..kidx_config()
+            },
+        )
+        .expect("catalog");
+        fold_through(&on, Signal::Logs, DAY_D + 25).await;
+        publish_logs_tombstone(store.as_ref(), DAY_D + 20).await;
+        publish_user_id_logs(store.as_ref(), 4, DAY_D + 26, &[4], 2, 0, true).await;
+        fold_through(&on, Signal::Logs, DAY_D + 26).await;
+        let retired = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            (
+                retired.parts[0].min_hour,
+                retired.parts[0].watermark_hour,
+                retired.parts[0].retired_hours.clone()
+            ),
+            (DAY_D + 20, DAY_D + 21, vec![DAY_D + 20])
+        );
+
+        let off = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                snapshot_part_max_entries: 2,
+                fold_reconcile_window_hours: 2,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        publish_user_id_logs(store.as_ref(), 5, DAY_D + 28, &[5], 2, 0, true).await;
+        fold_through(&off, Signal::Logs, DAY_D + 28).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert!(
+            head.parts.iter().all(|p| p.retired_hours.is_empty()),
+            "{head:?}"
+        );
+        assert_eq!(head.format_version, HEAD_FORMAT_VERSION_1);
+        assert!(!head.parts.contains(&retired.parts[0]));
+        let mut writers: Vec<u64> = head_entries(store.as_ref(), &head)
+            .await
+            .iter()
+            .map(|e| e.writer_seq)
+            .collect();
+        writers.sort_unstable();
+        assert_eq!(writers, vec![2, 3, 4, 5], "hour 20's writer 1 is gone");
+    }
+
+    /// A monotonic clock a test steps past the HEAD cache's TTL, so a
+    /// reader's next resolve reads the current HEAD.
+    #[derive(Default)]
+    struct StepMono(std::sync::atomic::AtomicU64);
+
+    impl StepMono {
+        fn advance_past(&self, ttl_ns: i64) {
+            let step = u64::try_from(ttl_ns).expect("a positive TTL") + 1;
+            self.0.fetch_add(step, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl ravel_cpu_gate::MonotonicClock for StepMono {
+        fn now_nanos(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// ADR-3939 decision 6: the resolve filter reads the retired hours from
+    /// the HEAD it pinned, not from the decoded part. A reader that decoded
+    /// day d's part before the tombstone serves the part from its cache
+    /// after it (no GET of the part), and still resolves no segment of
+    /// hour 20.
+    #[tokio::test]
+    async fn a_decoded_part_cached_before_the_tombstone_hides_the_hour_after_it() {
+        let store = OpLogStore::empty();
+        declare_user_id_key_index(store.as_ref()).await;
+        publish_retire_fixture(store.as_ref()).await;
+        let writer = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        fold_through(&writer, Signal::Logs, DAY_D + 25).await;
+        let first = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let mono = Arc::new(StepMono::default());
+        let reader = Catalog::new(store.clone(), kidx_config())
+            .expect("catalog")
+            .with_monotonic_clock(mono.clone());
+        let window = ravel_types::TimeRange {
+            start_ns: i64::from(DAY_D) * NS_PER_HOUR,
+            end_ns: i64::from(DAY_D + 48) * NS_PER_HOUR,
+        };
+        let hours_of = |snapshot: &crate::Snapshot| {
+            let mut hours: Vec<(u32, u64)> = snapshot
+                .segments
+                .iter()
+                .map(|s| (s.ingest_hour_bucket, s.writer_seq))
+                .collect();
+            hours.sort_unstable();
+            hours
+        };
+        let before = reader
+            .resolve(
+                &tenant(),
+                Signal::Logs,
+                window,
+                &[],
+                now_at_seal(DAY_D + 25),
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(
+            hours_of(&before),
+            vec![
+                (DAY_D + 20, 1),
+                (DAY_D + 21, 2),
+                (DAY_D + 21, 3),
+                (DAY_D + 25, 4)
+            ]
+        );
+        assert_eq!(store.full_gets_of(&first.parts[0].key), 1);
+
+        publish_logs_tombstone(store.as_ref(), DAY_D + 20).await;
+        publish_user_id_logs(store.as_ref(), 5, DAY_D + 26, &[60], 2, 0, true).await;
+        fold_through(&writer, Signal::Logs, DAY_D + 26).await;
+        let second = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(second.parts[0].key, first.parts[0].key);
+        assert_eq!(second.parts[0].retired_hours, vec![DAY_D + 20]);
+
+        store.clear();
+        mono.advance_past(reader.config().head_cache_ttl_ns);
+        let after = reader
+            .resolve(
+                &tenant(),
+                Signal::Logs,
+                window,
+                &[],
+                now_at_seal(DAY_D + 26),
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(
+            store.full_gets_of(&first.parts[0].key),
+            0,
+            "day d's part is served from the reader's decoded cache"
+        );
+        assert_eq!(
+            hours_of(&after),
+            vec![
+                (DAY_D + 21, 2),
+                (DAY_D + 21, 3),
+                (DAY_D + 25, 4),
+                (DAY_D + 26, 5)
+            ],
+            "no segment of retired hour 20"
+        );
+    }
+
+    /// ADR-3939 decision 6: a late commit through a held-open hour of the
+    /// previous UTC day re-encodes that sealed day's part without its
+    /// retired hours. Day d holds writers 1 (hour 20) and 2 (hour 21), day
+    /// d + 1 writer 3 (hour 24). A seal-through fold at hour 25 holds hours
+    /// 23 to 25 open (margin hour 22) and retires hour 20 of day d. Writer 6
+    /// then lands in hour 23, the last hour of day d, and the fold that
+    /// folds it re-encodes day d over hours 21 to 23: hour 20's entries are
+    /// dropped for good and the new ref carries no retired hours.
+    #[tokio::test]
+    async fn a_late_commit_through_a_held_open_hour_re_encodes_the_previous_day() {
+        let store = OpLogStore::empty();
+        declare_user_id_key_index(store.as_ref()).await;
+        for (seq, hour, ids) in [
+            (1u64, DAY_D + 20, &[1i64, 2][..]),
+            (2, DAY_D + 21, &[10, 20]),
+            (3, DAY_D + 24, &[30]),
+        ] {
+            publish_user_id_logs(store.as_ref(), seq, hour, ids, 2, 0, true).await;
+        }
+        let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        let fold_sealing_logs = |now_ns: i64, seal_through_hour: Option<u32>| {
+            let catalog = &catalog;
+            async move {
+                catalog
+                    .fold_with_seal_through(
+                        &tenant(),
+                        Signal::Logs,
+                        Uuid::new_v4(),
+                        now_ns,
+                        &[],
+                        None,
+                        &RefoldRequest::new(),
+                        seal_through_hour,
+                    )
+                    .await
+                    .expect("fold")
+            }
+        };
+        let ten_minutes = 10 * 60 * 1_000_000_000;
+        let inside = |hour: u32| i64::from(hour) * NS_PER_HOUR + ten_minutes;
+        fold_sealing_logs(inside(DAY_D + 24), Some(DAY_D + 24)).await;
+        publish_logs_tombstone(store.as_ref(), DAY_D + 20).await;
+        publish_user_id_logs(store.as_ref(), 5, DAY_D + 25, &[60], 2, 0, true).await;
+        let sealed = fold_sealing_logs(inside(DAY_D + 25), Some(DAY_D + 25)).await;
+        assert_eq!(sealed.watermark_hour, Some(DAY_D + 25), "{sealed:?}");
+        let retired = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            (
+                retired.parts[0].min_hour,
+                retired.parts[0].watermark_hour,
+                retired.parts[0].retired_hours.clone()
+            ),
+            (DAY_D + 20, DAY_D + 21, vec![DAY_D + 20])
+        );
+
+        publish_user_id_logs(store.as_ref(), 6, DAY_D + 23, &[70], 2, 0, true).await;
+        store.clear();
+        let later = inside(DAY_D + 25) + 5 * 60 * 1_000_000_000;
+        assert_eq!(catalog.margin_watermark_hour(later), Some(DAY_D + 22));
+        let late = fold_sealing_logs(later, None).await;
+        assert!(!late.no_op, "{late:?}");
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let day_d = &head.parts[0];
+        assert_eq!(
+            (day_d.min_hour, day_d.watermark_hour, day_d.entry_count),
+            (DAY_D + 21, DAY_D + 23, 2),
+            "day d re-encoded over writers 2 and 6, without hour 20"
+        );
+        assert!(day_d.retired_hours.is_empty(), "{day_d:?}");
+        assert_eq!(store.part_puts().first(), Some(&day_d.key));
+        assert_eq!(head.format_version, HEAD_FORMAT_VERSION_1);
+        assert!(
+            head_entries(store.as_ref(), &head)
+                .await
+                .iter()
+                .all(|e| e.ingest_hour_bucket != DAY_D + 20)
         );
     }
 
@@ -17313,7 +17883,7 @@ pub(crate) mod tests {
             vec![(DAY_D + 1, DAY_D + 2, 2), (DAY_D + 3, DAY_D + 4, 2)]
         );
 
-        publish_logs_tombstone(store.as_ref(), DAY_D + 1).await;
+        publish_logs_erasure(store.as_ref(), DAY_D + 1, &[&writers[0]]).await;
         publish_user_id_logs(store.as_ref(), 5, DAY_D + 5, &[9], 2, 0, true).await;
         store.clear();
         let report = fold_through(&catalog, Signal::Logs, DAY_D + 5).await;
@@ -17382,7 +17952,7 @@ pub(crate) mod tests {
         a.sort_by_key(|leaf| leaf.key8_lo);
         assert_eq!(a.len(), 2);
 
-        publish_logs_tombstone(inner.as_ref(), DAY_D + 1).await;
+        publish_logs_erasure(inner.as_ref(), DAY_D + 1, &[&writers[0]]).await;
         publish_user_id_logs(inner.as_ref(), 5, DAY_D + 5, &[9], 2, 0, true).await;
         inner.clear();
         let plan = FaultPlan::empty().with_rule(
