@@ -243,6 +243,50 @@ pub async fn fold_with_metrics_label_index(
     now_ns: i64,
     json: bool,
 ) -> anyhow::Result<(FoldReport, String)> {
+    fold_with_retention_default(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        max_flush_lifetime_ns,
+        writers_stopped,
+        build_key_index_leaves,
+        key_index_build_max_pairs,
+        metrics_label_index,
+        snapshot_part_max_entries,
+        None,
+        now_ns,
+        json,
+    )
+    .await
+}
+
+/// [`fold_with_metrics_label_index`], plus `--retention-default`: the
+/// deployment-default retention window passed to the fold as
+/// `default_retention_ns`. A tenant whose durable config record carries its
+/// own `retention_ns` keeps that window; any other tenant gets this one, and
+/// with it the fold's retention-frontier reconcile.
+#[allow(clippy::too_many_arguments)]
+pub async fn fold_with_retention_default(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    max_flush_lifetime_ns: Option<i64>,
+    writers_stopped: bool,
+    build_key_index_leaves: bool,
+    key_index_build_max_pairs: u64,
+    metrics_label_index: bool,
+    snapshot_part_max_entries: Option<usize>,
+    default_retention_ns: Option<i64>,
+    now_ns: i64,
+    json: bool,
+) -> anyhow::Result<(FoldReport, String)> {
+    if default_retention_ns.is_some_and(|ns| ns <= 0) {
+        anyhow::bail!("--retention-default must be greater than zero");
+    }
     if metrics_label_index && !build_key_index_leaves {
         anyhow::bail!(
             "--metrics-label-index needs --key-index-leaves (or --rebuild-key-index); \
@@ -272,6 +316,7 @@ pub async fn fold_with_metrics_label_index(
         key_index_build_max_pairs,
         metrics_label_index,
         snapshot_part_max_entries,
+        default_retention_ns,
         now_ns,
         json,
         None,
@@ -332,6 +377,7 @@ pub async fn fold_inner(
         ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
         false,
         None,
+        None,
         now_ns,
         json,
         column_stats_ceiling_override,
@@ -352,6 +398,7 @@ async fn fold_core(
     key_index_build_max_pairs: u64,
     metrics_label_index: bool,
     snapshot_part_max_entries: Option<usize>,
+    default_retention_ns: Option<i64>,
     now_ns: i64,
     json: bool,
     column_stats_ceiling_override: Option<u64>,
@@ -394,7 +441,7 @@ async fn fold_core(
             folder_id,
             now_ns,
             &[],
-            None,
+            default_retention_ns,
             &RefoldRequest::new(),
             seal_through_hour,
         )
