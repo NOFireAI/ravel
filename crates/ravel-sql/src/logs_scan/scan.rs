@@ -1754,6 +1754,14 @@ impl LogScanStream {
     /// This partition is done with the current segment: drop its handle on the
     /// segment's directories and move to the next owned segment.
     fn finish_segment(&mut self) {
+        let counted = self
+            .blocks
+            .rows_consumed
+            .value()
+            .saturating_sub(self.unit_rows_base);
+        self.blocks
+            .rows_consumed
+            .add(rows_usize(std::mem::take(&mut self.unit_rows)).saturating_sub(counted));
         self.current_dirs = None;
         // The segment's scan, and with it the open's fetch reservations, is
         // dropped before the turn is given back.
@@ -1949,6 +1957,13 @@ impl LogScanStream {
                                 .blocks_pruned_by_key_index
                                 .add(counts.key_index.blocks_pruned as usize);
                             this.blocks.record_key_index_figures(counts.route_figures);
+                            // The fast path's verdict pass publishes no unit;
+                            // its partitions own every relevant segment whole.
+                            if !this.fast_whole_segment {
+                                this.blocks
+                                    .rows_consumed
+                                    .add(rows_usize(counts.unpublished_rows(&this.segments)));
+                            }
                         }
                         this.queue = this.round.as_ref().map(|round| {
                             round.queue(|| {
@@ -2005,11 +2020,15 @@ impl LogScanStream {
                     // at its turn and in owned order; every prefetch is a
                     // ranged open.
                     if let Some(Prefetch {
-                        owned: OwnedSeg { seg, ordinal, .. },
+                        owned: OwnedSeg {
+                            seg, ordinal, rows, ..
+                        },
                         issued,
                         open,
                     }) = prefetch
                     {
+                        this.unit_rows = rows;
+                        this.unit_rows_base = this.blocks.rows_consumed.value();
                         this.current_seg = Some(seg);
                         this.current_seg_ordinal = ordinal;
                         this.current_indices = Vec::new();
@@ -2074,6 +2093,7 @@ impl LogScanStream {
                         Some(OwnedSeg {
                             seg,
                             ordinal,
+                            rows,
                             indices,
                             survivors,
                             footer,
@@ -2089,8 +2109,11 @@ impl LogScanStream {
                                 above_ceiling(seg.min_event_ts_ns, seg.max_event_ts_ns, ceiling)
                             }) {
                                 this.blocks.segments_skipped_by_threshold.add(1);
+                                this.blocks.rows_consumed.add(rows_usize(rows));
                                 continue;
                             }
+                            this.unit_rows = rows;
+                            this.unit_rows_base = this.blocks.rows_consumed.value();
                             this.current_seg = Some(seg.clone());
                             this.current_seg_ordinal = ordinal;
                             this.current_indices = indices.clone();
