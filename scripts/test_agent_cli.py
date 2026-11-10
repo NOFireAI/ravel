@@ -353,6 +353,188 @@ class CiBudgets(unittest.TestCase):
         self.assertEqual(len(data["findings"]), 1)
 
 
+TASK_ID = "0123abcd-4567-89ab-cdef-0123456789ab"
+SPEC_HEAD = "gate_tier: script-only (no cargo build)\ndisk_floor_gb: 10\n"
+
+
+def capture_main(argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = cli.main(argv)
+    return rc, out.getvalue(), err.getvalue()
+
+
+class Dispatch(unittest.TestCase):
+    """cmd_dispatch with every remote step stubbed: the MCP call and fresh_main
+    in-process, the intent script through run, and gh as a stub on PATH that
+    serves the epic body from a file, so the real epic-orchestrator.sh writes
+    the ledger line and nothing reaches GitHub or the fleet."""
+
+    GH_STUB = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "${STUB_DIR}/gh.log"
+case "$1 $2" in
+  "issue view") cat "${STUB_DIR}/body.txt" ;;
+  "issue edit")
+    while [[ $# -gt 0 ]]; do
+      [[ "$1" == "--body-file" ]] && cp "$2" "${STUB_DIR}/body.txt"
+      shift
+    done ;;
+  *) echo "gh stub: unexpected call $*" >&2; exit 1 ;;
+esac
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name)
+        (self.dir / "bin").mkdir()
+        gh = self.dir / "bin" / "gh"
+        gh.write_text(self.GH_STUB)
+        gh.chmod(0o755)
+        (self.dir / "body.txt").write_text("Epic body\n")
+        self.calls, self.mcp_calls = [], []
+        real_run = cli.run
+
+        def fake_run(cmd, cwd=None, env=None, stdin=None, check=False):
+            self.calls.append(list(cmd))
+            if cmd[0] == "scripts/epic-orchestrator.sh":
+                return real_run(cmd, cwd=cwd, env=env, stdin=stdin, check=check)
+            if cmd[:2] == ["scripts/fleet-dispatch-intent.sh", "intent"]:
+                return 0, "nonce-1\n", ""
+            return 0, "", ""
+
+        def fake_mcp(tool, arguments, timeout=300):
+            self.mcp_calls.append((tool, arguments))
+            return f"Dispatched task {TASK_ID}"
+
+        saved = {"run": cli.run, "mcp_call": cli.mcp_call, "fresh_main": cli.fresh_main}
+        cli.run, cli.mcp_call, cli.fresh_main = fake_run, fake_mcp, lambda: "a" * 40
+        env = {"PATH": f"{self.dir / 'bin'}{os.pathsep}{os.environ['PATH']}",
+               "STUB_DIR": str(self.dir), "RAVEL_EPIC_STATE_DIR": str(self.dir / "state")}
+        saved_env = {k: os.environ.get(k) for k in list(env) + ["RAVEL_EPIC_NO_REMOTE"]}
+        os.environ.update(env)
+        os.environ.pop("RAVEL_EPIC_NO_REMOTE", None)
+
+        def restore():
+            for k, v in saved.items():
+                setattr(cli, k, v)
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            self.tmp.cleanup()
+
+        self.addCleanup(restore)
+
+    def dispatch(self, spec):
+        path = self.dir / "spec.txt"
+        path.write_text(spec)
+        return capture_main(["dispatch", "--epic", "4034", "--ticket", "4043", "--spec", str(path)])
+
+    def test_dispatch_refuses_spec_without_gate_tier(self):
+        rc, _, err = self.dispatch("Do the thing.\ndisk_floor_gb: 10\n")
+        # FLIP: a cmd_dispatch that lints and dispatches without reading the
+        # head (the check removed, or run after the intent step) exits 0 here,
+        # or 2 only after the intent script and the MCP stub were called.
+        self.assertEqual(rc, 2)
+        self.assertIn("no gate_tier line", err)
+        self.assertNotIn("disk_floor_gb", err.split("(each")[0])
+        self.assertEqual((self.calls, self.mcp_calls), ([], []))
+
+    def test_dispatch_refuses_spec_without_disk_floor(self):
+        rc, _, err = self.dispatch("Do the thing.\ngate_tier: executor\n")
+        # FLIP: a check that requires gate_tier alone dispatches this spec.
+        self.assertEqual(rc, 2)
+        self.assertIn("no disk_floor_gb line", err)
+        self.assertEqual((self.calls, self.mcp_calls), ([], []))
+
+    def test_dispatch_refuses_a_value_outside_the_forms(self):
+        for head, what in (("gate_tier: fast\ndisk_floor_gb: 10\n", "gate_tier fast"),
+                           ("gate_tier: merge\ndisk_floor_gb: 0\n", "disk_floor_gb 0"),
+                           ("gate_tier: merge\ndisk_floor_gb: 40GB\n", "disk_floor_gb 40GB"),
+                           ("gate_tier: merge\ngate_tier: executor\ndisk_floor_gb: 4\n",
+                            "gate_tier given twice")):
+            rc, _, err = self.dispatch("Do the thing.\n" + head)
+            # FLIP: a check for the key's presence alone accepts each of these.
+            self.assertEqual(rc, 2, head)
+            self.assertIn(what, err, head)
+        self.assertEqual((self.calls, self.mcp_calls), ([], []))
+
+    def test_dispatch_records_tier_and_floor_in_the_ledger_line(self):
+        rc, out, err = self.dispatch("Do the thing.\n" + SPEC_HEAD)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(len(self.mcp_calls), 1)
+        body = (self.dir / "body.txt").read_text()
+        # FLIP: the record call without the tier and floor in its status value
+        # writes "- #4043 task=<uuid> dispatched" and nothing after it.
+        self.assertIn(f"- #4043 task={TASK_ID} dispatched tier=script-only floor=10\n", body)
+        state = json.loads((self.dir / "state" / "4034.json").read_text())
+        self.assertEqual((state["tasks"][TASK_ID]["tier"], state["tasks"][TASK_ID]["floor"]),
+                         ("script-only", "10"))
+
+
+class Task(unittest.TestCase):
+    """cmd_task against a stubbed cp_task: no control plane is reached."""
+
+    def task(self, status, report, spec=None):
+        t = {"status": status, "result": report, "result_ref": "", "results": {}}
+        if spec is not None:
+            t["spec"] = spec
+        saved = cli.cp_task
+        cli.cp_task = lambda task: t
+        try:
+            rc, out, _ = capture_main(["--json", "task", TASK_ID, "--full"])
+            _, text, _ = capture_main(["task", TASK_ID])
+        finally:
+            cli.cp_task = saved
+        return rc, json.loads(out), text
+
+    def test_task_classifies_below_floor_report(self):
+        report = ("Stopped at the headroom check.\n"
+                  "EXECUTOR BELOW FLOOR: 12 GB of 40\nLinux x 7.0 x86_64\n16\n")
+        for status in ("done", "failed"):
+            rc, data, text = self.task(status, report)
+            # FLIP: classifying by the control-plane status alone reports done
+            # (and exit 0) or failed here.
+            self.assertEqual(data["class"], "below-floor", status)
+            self.assertIn("class=below-floor", text.splitlines()[0])
+            self.assertEqual(rc, 1)
+            self.assertFalse(data["claims_audit_missing"])
+        rc, data, _ = self.task("done", "Quoted: the fixed EXECUTOR BELOW FLOOR: report.\n"
+                                        "CLAIMS AUDIT: none\n")
+        # FLIP: a substring match anywhere in the report, not at a line start,
+        # calls this done task below-floor.
+        self.assertEqual((data["class"], rc), ("done", 0))
+
+    def test_task_flags_missing_claims_audit(self):
+        report = "Implemented it. I ran the claims audit in my head.\nEXIT=0\n"
+        rc, data, text = self.task("done", report)
+        # FLIP: never flagging, or a case-insensitive substring search that
+        # finds "claims audit" mid-line, leaves this false.
+        self.assertTrue(data["claims_audit_missing"])
+        self.assertIn("claims-audit-missing", text.splitlines()[0])
+        self.assertEqual((data["class"], rc), ("done", 0))
+        _, data, _ = self.task("done", report, spec="Steps.\nCLAIMS AUDIT, before the commit...\n")
+        self.assertTrue(data["claims_audit_missing"])
+        _, data, text = self.task("done", report, spec="Steps with no audit asked for.\n")
+        # FLIP: ignoring a spec that is present flags this task, whose spec
+        # never asked for an audit.
+        self.assertFalse(data["claims_audit_missing"])
+        self.assertNotIn("claims-audit-missing", text)
+        _, data, _ = self.task("failed", report)
+        self.assertFalse(data["claims_audit_missing"])
+
+    def test_task_does_not_flag_a_report_with_claims_audit(self):
+        for section in ("CLAIMS AUDIT: none written.", "## Claims audit", "claims audit:",
+                        "### CLAIMS AUDIT"):
+            _, data, text = self.task("done", f"Implemented it.\n{section}\n- a claim: a test\n")
+            # FLIP: a match on the exact upper-case spelling, or one that
+            # rejects a markdown heading, flags these.
+            self.assertFalse(data["claims_audit_missing"], section)
+            self.assertNotIn("claims-audit-missing", text)
+            self.assertEqual(data["class"], "done")
+
+
 class Parser(unittest.TestCase):
     def test_json_before_or_after_the_subcommand_is_honoured(self):
         parser = cli.build_parser()
