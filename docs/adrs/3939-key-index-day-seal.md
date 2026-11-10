@@ -315,12 +315,14 @@ covering part is sealed, carries leaf refs, and whose UTC day is not yet
 fully tombstoned, it adds `h` to that part's `retired_hours` in the ref it
 carries forward (same key, blake3 and leaf refs; no part or leaf PUT) and
 publishes under the one HEAD CAS. When every hour of a UTC day that the
-part holds is tombstoned, a day part leaves HEAD with no PUT; a longer part
+part holds is tombstoned, a day part leaves HEAD with no PUT; a longer part (narrowed by the R2 implementation amendment)
 is re-encoded without that day through decision 5's carry and keeps only
-other days' hours in `retired_hours`. A compaction record, an erasure
+other days' hours in `retired_hours`; under that amendment a longer part
+records no retired hours. A compaction record, an erasure
 rewrite record or a late commit still dirties the part (a late commit only
 into a held-open hour; see the harness-state amendment) and re-encodes it in
-the same fold, so an erasure never lags; a re-encoded part drops its
+the same fold, so an erasure never lags (within the frontier band's
+hour cap; see the R2 implementation amendment); a re-encoded part drops its
 retired hours' entries for good and its new ref carries none.
 
 The reader: in `SnapshotWindow::extract_into`
@@ -562,3 +564,34 @@ investigations harness's bands, each reporting not-run until its state
 exists; it touches benchmarks/investigations only. H1b adds the 7-day,
 30-day and retired-hour states to the box scripts. D3' runs W2 on the C1
 SHA.
+
+## Amendment (issue #4069, R2 implementation): retired hours only in day parts, and the erasure bound
+
+<!-- amendment-supersedes: phrase="is re-encoded without that day through decision 5's carry" pointer="R2 implementation amendment" -->
+<!-- amendment-supersedes: phrase="so an erasure never lags" pointer="R2 implementation amendment" -->
+
+Date: 2026-11-10. Records two places where R2 (#4077) implements decision
+6 more narrowly than its text.
+
+**A longer part records no retired hours.** Decision 6 has a part longer
+than one UTC day re-encoded without a fully retired day and keep its other
+days' retired hours. The fold instead treats only a part within one UTC
+day as retirable (crates/ravel-catalog/src/fold.rs, `RetireTracker::of_head`):
+a tombstone in a longer part takes the reconcile's ordinary path, and the
+part re-encodes in that fold through decision 5's carry with every
+tombstoned hour's entries dropped, so its new ref carries no
+`retired_hours`. That is stricter than decision 6 and correct, since every
+dropped entry is tombstoned. With the leaf switch on, a fold writes only
+day parts (decision 1), so a longer leaf-bearing part exists only when a
+switch-off fold wrote it and `--rebuild-key-index` attached its leaves; the
+first switch-on fold re-partitions it at the day seal anyway. The deletion
+bound is unchanged for a day part (until it leaves HEAD) and is the next
+fold for a longer part.
+
+**The erasure bound.** A compaction or erasure rewrite record the snapshot
+does not yet reflect dirties a retired day part and re-encodes it in the
+fold that lists the record's bucket. Retired hours are listed after every
+other hour in the frontier band, so under `frontier_reconcile_max_hours`
+pressure the bucket can wait one or more folds before it is listed. The
+retired hour's entries are hidden from both tiers meanwhile; only the
+physical delete waits. "An erasure never lags" holds within that cap.
