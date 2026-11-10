@@ -905,6 +905,14 @@ impl Catalog {
         self
     }
 
+    /// The budget this catalog's decodes are charged to. For a caller that
+    /// holds decoded entries beyond the reservation
+    /// [`Catalog::decode_tenant_part`] returned and must charge them to the
+    /// same ledger.
+    pub fn memory_budget(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
     /// Bound the reservation bytes the decoded snapshot-part and name-postings
     /// caches hold together, across every tenant, to `max`
     /// ([`CatalogConfig::decoded_cache_max_bytes`]). For a caller that derives
