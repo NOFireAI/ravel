@@ -15,6 +15,7 @@
 //! sample cap cannot stand in for a byte cap.
 
 use std::ffi::OsStr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use ravel_types::accounting::QueryAccounting;
 
 use crate::memory::{
     AggregateReserveAhead, CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant,
-    process_envelope_width,
+    envelope_width, process_envelope_width,
 };
 
 /// Default per-query RecordBatch byte budget: 256 MiB. This is the shipped
@@ -766,6 +767,16 @@ impl SqlConfig {
         tenant: Arc<TenantMemoryAccountant>,
         accounting: QueryAccounting,
     ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
+        self.query_pool_at(tenant, accounting, self.envelope_width(None))
+    }
+
+    /// [`SqlConfig::query_pool`] with the reserve-ahead envelope width given.
+    pub(crate) fn query_pool_at(
+        &self,
+        tenant: Arc<TenantMemoryAccountant>,
+        accounting: QueryAccounting,
+        envelope_width: NonZeroUsize,
+    ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
         let breach = CeilingBreach::new();
         let pool = Arc::new(
             TenantDelegatingPool::new(
@@ -774,12 +785,19 @@ impl SqlConfig {
                 Arc::clone(&breach),
                 accounting,
             )
-            .with_aggregate_reserve_ahead(
-                self.aggregate_reserve_ahead,
-                process_envelope_width(self.aggregate_stream_count()),
-            ),
+            .with_aggregate_reserve_ahead(self.aggregate_reserve_ahead, envelope_width),
         );
         (pool, breach)
+    }
+
+    /// The reserve-ahead envelope width of this config's pools: the host's
+    /// parallelism, or `parallelism` when given, capped at
+    /// [`SqlConfig::aggregate_stream_count`].
+    pub(crate) fn envelope_width(&self, parallelism: Option<NonZeroUsize>) -> NonZeroUsize {
+        match parallelism {
+            Some(parallelism) => envelope_width(parallelism.get(), self.aggregate_stream_count()),
+            None => process_envelope_width(self.aggregate_stream_count()),
+        }
     }
 
     /// [`SqlConfig::query_pool`] in spill mode: the same pool, except that a
@@ -793,6 +811,17 @@ impl SqlConfig {
         tenant: Arc<TenantMemoryAccountant>,
         accounting: QueryAccounting,
     ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
+        self.query_pool_spill_mode_at(tenant, accounting, self.envelope_width(None))
+    }
+
+    /// [`SqlConfig::query_pool_spill_mode`] with the reserve-ahead envelope
+    /// width given.
+    pub(crate) fn query_pool_spill_mode_at(
+        &self,
+        tenant: Arc<TenantMemoryAccountant>,
+        accounting: QueryAccounting,
+        envelope_width: NonZeroUsize,
+    ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
         let breach = CeilingBreach::new();
         let pool = Arc::new(
             TenantDelegatingPool::new(
@@ -801,10 +830,7 @@ impl SqlConfig {
                 Arc::clone(&breach),
                 accounting,
             )
-            .with_aggregate_reserve_ahead(
-                self.aggregate_reserve_ahead,
-                process_envelope_width(self.aggregate_stream_count()),
-            )
+            .with_aggregate_reserve_ahead(self.aggregate_reserve_ahead, envelope_width)
             .with_spill_headroom(crate::memory::spill_mode_headroom(self.max_query_bytes)),
         );
         (pool, breach)

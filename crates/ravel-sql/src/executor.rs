@@ -100,6 +100,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -2051,6 +2052,11 @@ pub struct SqlExecutor {
     /// key, which registers them for nobody; the server installs its own with
     /// [`Self::with_ipcrypt_deployment`].
     ipcrypt: IpcryptDeployment,
+    /// The host parallelism the reserve-ahead envelope width is capped at in
+    /// place of the process's own. `None` (the [`SqlExecutor::new`] default)
+    /// reads `available_parallelism`; a test sets it with
+    /// [`Self::with_envelope_parallelism`].
+    envelope_parallelism: Option<NonZeroUsize>,
     /// Replaces the plan a pinned statement executes after the tie-order
     /// rewrite, so a test can make it diverge from the classification plan.
     #[cfg(test)]
@@ -2111,6 +2117,7 @@ impl SqlExecutor {
             statement_read_bytes: StatementReadBytes::new(),
             scan_executions: Arc::new(ScanExecutions::new()),
             ipcrypt: IpcryptDeployment::default(),
+            envelope_parallelism: None,
             #[cfg(test)]
             executed_plan_tamper: None,
             #[cfg(test)]
@@ -2134,6 +2141,19 @@ impl SqlExecutor {
     /// The Parquet sources [`Self::with_parquet_sources`] installed.
     pub fn parquet_sources(&self) -> Option<&ParquetSources> {
         self.parquet.as_ref()
+    }
+
+    /// Size this executor's reserve-ahead envelopes as on a host of
+    /// `parallelism` cores: the envelope width becomes `parallelism` capped
+    /// at [`SqlConfig::aggregate_stream_count`], in place of the process's
+    /// `available_parallelism` ([`crate::process_envelope_width`]). A test
+    /// seam (ADR-1195, issue #4014 amendment, decision 5), so a figure that
+    /// moves with the envelope width does not move with the test host's
+    /// cores; production never calls it.
+    #[doc(hidden)]
+    pub fn with_envelope_parallelism(mut self, parallelism: NonZeroUsize) -> Self {
+        self.envelope_parallelism = Some(parallelism);
+        self
     }
 
     /// Install the deployment's ipcrypt setting (ADR-2993 decision 6): the
@@ -3911,6 +3931,7 @@ impl SqlExecutor {
             decision,
             self.tenant_budget(tenant_hash),
             phase_accounting.statement().scan().clone(),
+            self.envelope_parallelism,
         );
         let providers = session_tables
             .iter()
@@ -3972,6 +3993,7 @@ impl SqlExecutor {
                 SpillDecision::Disabled,
                 self.tenant_budget(tenant_hash),
                 phase_accounting.statement().scan().clone(),
+                self.envelope_parallelism,
             );
             ctx = build_session_with_tables(
                 config,
@@ -4133,9 +4155,11 @@ impl SqlExecutor {
         snapshot: Snapshot,
         accounting: &QueryAccounting,
     ) -> Result<PinnedStream, SqlError> {
-        let (pool, breach) = self
-            .config
-            .query_pool(self.tenant_budget(tenant_hash), accounting.clone());
+        let (pool, breach) = self.config.query_pool_at(
+            self.tenant_budget(tenant_hash),
+            accounting.clone(),
+            self.config.envelope_width(self.envelope_parallelism),
+        );
         let segments = snapshot.segments.clone();
         let target_partitions = segments.len().max(1);
         // Worker fragments keep the pre-#1367 pooled `&QueryAccounting` API
@@ -5764,18 +5788,20 @@ fn attempt_pool(
     decision: SpillDecision<'_>,
     tenant: Arc<TenantMemoryAccountant>,
     accounting: QueryAccounting,
+    envelope_parallelism: Option<NonZeroUsize>,
 ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
     let spill_mode_cap = config
         .max_query_bytes
         .saturating_sub(crate::memory::spill_mode_headroom(config.max_query_bytes));
+    let envelope_width = config.envelope_width(envelope_parallelism);
     match spill {
         SpillAttempt::Retry
             if matches!(decision, SpillDecision::Enabled { .. }) && spill_mode_cap > 0 =>
         {
-            config.query_pool_spill_mode(tenant, accounting)
+            config.query_pool_spill_mode_at(tenant, accounting, envelope_width)
         }
         SpillAttempt::Retry | SpillAttempt::PlanTime | SpillAttempt::First => {
-            config.query_pool(tenant, accounting)
+            config.query_pool_at(tenant, accounting, envelope_width)
         }
     }
 }
@@ -9499,6 +9525,7 @@ pub(crate) mod tests {
                 decision,
                 TenantMemoryAccountant::new(usize::MAX),
                 QueryAccounting::new(),
+                None,
             );
             let sorter = MemoryConsumer::new("ExternalSorter[0]")
                 .with_can_spill(true)
