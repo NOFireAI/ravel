@@ -448,14 +448,18 @@ fn writes_rlog(bucket: &Bucket) -> bool {
     }
 }
 
-/// Refuse an out-of-range [`CompactorConfig::rlog_zstd_level`] for a run over
-/// `bucket` that writes `.rlog` parts. Every entry point that can reach
+/// Refuse an out-of-range [`CompactorConfig::rlog_zstd_level`] or a zero
+/// [`CompactorConfig::rlog_run_block_target_records`] for a run over `bucket`
+/// that writes `.rlog` parts. Every entry point that can reach
 /// [`merge_catalogs`] (compaction, format migration, the shared rewrite
 /// primitive, and the erasure rewrite) calls this before its first store
 /// request; a bucket of another signal is not checked.
-pub(crate) fn check_rlog_zstd_level(config: &CompactorConfig, bucket: &Bucket) -> Result<()> {
+pub(crate) fn check_rlog_writer_config(config: &CompactorConfig, bucket: &Bucket) -> Result<()> {
     if writes_rlog(bucket) {
         crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
+        crate::config::validate_rlog_run_block_target_records(
+            config.rlog_run_block_target_records,
+        )?;
     }
     Ok(())
 }
@@ -1072,6 +1076,7 @@ struct PartWriterSettings {
     clustering_generation: u64,
     bloom_scope: BloomScope,
     group_target_blocks: usize,
+    block_target_records: usize,
 }
 
 /// The zstd level a two-level merge's scratch runs are written with
@@ -1085,6 +1090,10 @@ const RUN_PAGE_CHOICE: PageChoice = PageChoice::Estimated;
 /// Blocks per row group of a scratch run (ADR-3853 D1): one, so level 2 can
 /// read a run block by block and price each read as one block.
 const RUN_GROUP_TARGET_BLOCKS: usize = 1;
+
+/// Default records per block of a scratch run (ADR-3853 D2): runs are
+/// transient and read once, and this never reaches a published part.
+pub const RUN_BLOCK_TARGET_RECORDS: usize = 1024;
 
 /// Bytes of the four-byte little-endian `covered_count` and `covered_crc32c`
 /// fields that frame a BLOOM covered-column list.
@@ -1334,9 +1343,11 @@ async fn merge_catalogs_with_geometry(
     geometry: GeometryCheck<'_>,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
 ) -> Result<MergeOutput> {
-    // The entry points refuse a bad level before their first store request
-    // ([`check_rlog_zstd_level`]); this covers a direct `build_parts` caller.
+    // The entry points refuse a bad level or run block target before their
+    // first store request ([`check_rlog_writer_config`]); this covers a direct
+    // `build_parts` caller.
     let zstd_level = crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
+    crate::config::validate_rlog_run_block_target_records(config.rlog_run_block_target_records)?;
     let key_index_fields = merged_key_index_fields(catalogs);
     // Global stream_ref remap + cross-object stream-identity check. The
     // merged set is the sorted union of every input's STREAM_DIR; the dense
@@ -1389,6 +1400,7 @@ async fn merge_catalogs_with_geometry(
         clustering_generation: clustering.clustering_generation,
         bloom_scope,
         group_target_blocks: RlogConfig::default().group_target_blocks,
+        block_target_records: RlogConfig::default().block_target_records,
     });
     let output = OutputSpec {
         identity: compactor_identity(bucket, config),
@@ -3293,6 +3305,7 @@ async fn merge_in_unit(
         clustering_generation: output.writer.clustering_generation,
         bloom_scope: output.writer.bloom_scope.clone(),
         group_target_blocks: RUN_GROUP_TARGET_BLOCKS,
+        block_target_records: config.rlog_run_block_target_records,
     });
     let run_declared = Arc::new(DeclaredSchema::build(&[], &BTreeMap::new()));
     let group_len = usize::try_from(layout.group_size).unwrap_or(usize::MAX);
@@ -5524,10 +5537,12 @@ impl PartBuilder {
     }
 
     /// Build a fresh writer over `records`. The writer configuration is the L0
-    /// write path's `RlogConfig::default()` except for the zstd level, which is
-    /// the compaction level (ADR-2135 decision 4), and the page choice, which
-    /// is [`L1_PAGE_CHOICE`]; the writer sorts the part by the merge's output
-    /// descriptor and limits BLOOM to its bloom scope.
+    /// write path's `RlogConfig::default()` except for the zstd level, page
+    /// choice, blocks per row group and records per block, which come from
+    /// `writer`: for a published part the compaction level (ADR-2135 decision
+    /// 4), [`L1_PAGE_CHOICE`] and the two defaults, for a scratch run the
+    /// ADR-3853 D2 run settings. The writer sorts the part by the merge's
+    /// output descriptor and limits BLOOM to its bloom scope.
     fn build_writer(
         identity: &ObjectIdentity,
         indexed_fields: &[String],
@@ -5539,6 +5554,7 @@ impl PartBuilder {
             zstd_level: writer.zstd_level,
             page_choice: writer.page_choice,
             group_target_blocks: writer.group_target_blocks,
+            block_target_records: writer.block_target_records,
             ..RlogConfig::default()
         };
         let mut w = RlogWriter::new(cfg, *identity)
