@@ -89,9 +89,11 @@ const MASKING_FILTER = /^\s*(tail|head|grep|rg|sed)\b/;
 const MASKING_ECHO = /&&\s*echo\b/;
 
 // Workspace clippy in a fleet clone. It is not the executor's gate:
-// `scripts/gates.sh -p` runs clippy and tests over the changed crates'
-// reverse-dependency closure plus the `sql` and `flight-sql` lanes, and a
-// hand-run workspace clippy compiles neither lane. cargo's global flags may
+// `scripts/gates.sh --tier executor -p` tests the edited crates, compiles
+// the rest of their reverse-dependency closure with every lane feature it
+// reaches, and runs the clippy of each lane covering an edited crate, and a
+// hand-run workspace clippy compiles neither the `sql` nor the `flight-sql`
+// lane. cargo's global flags may
 // precede the subcommand, as in GATE_HEAD, including the four that take a
 // separate value (`--color never`, `--config k=v`, `-C dir`, `-Z flag`);
 // `--all` is clippy's older spelling of `--workspace`. Only the arguments
@@ -561,10 +563,12 @@ function checkWorkspaceClippy(stmt) {
     deny(
       "`cargo clippy --workspace` (or a bare `cargo clippy`, which is " +
         "workspace-wide here) is not a fleet executor's gate. Run " +
-        "`scripts/gates.sh -p <crate> [-p <crate2>]` instead: it runs clippy " +
-        "and tests over the named crates and every crate that depends on " +
-        "them, plus the `sql` lane when ravel-server is in that closure and " +
-        "the `flight-sql` lane when ravel-sql or ravel-server is. A hand-run " +
+        "`scripts/gates.sh --tier executor -p <crate> [-p <crate2>]` instead, " +
+        "naming every crate you edited: it runs clippy, tests and doctests " +
+        "for those crates, one `cargo check` of every crate that depends on " +
+        "them with the lane features that closure reaches, and the clippy " +
+        "and tests of each feature lane that covers an edited crate; CI runs " +
+        "the dependents' tests and the lane suites. A hand-run " +
         "workspace clippy compiles neither lane, which is how a sql-gated " +
         "break reached CI on #2833. A deliberate unscoped run spells " +
         "RAVEL_GATES_ALLOW_UNSCOPED=1 inline at the front of the command.",
