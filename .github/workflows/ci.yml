@@ -598,6 +598,10 @@ jobs:
         run: bash scripts/tests/fleet-result-merge-squash.test.sh
       - name: Fresh-box launcher cases
         run: bash scripts/bench/fresh-box.test.sh
+      # fetch-pinned-tool/action.yml's download retry logic (issue #4093): a
+      # stubbed curl, no network and no cache action needed.
+      - name: Fetch-pinned-tool download retry cases (issue #4093)
+        run: bash scripts/fetch-pinned-tool-download.test.sh
       - name: ClickBench kit cases
         run: bash benchmarks/clickbench/kit/kit.test.sh
       - name: Investigations harness cases (issue #3699)
