@@ -7,7 +7,9 @@ states:
   compaction_done          run
   compaction_in_flight     run
   day_parts_30             not-run  (not in run.toml states)
+  day_parts_30_advance     not-run  (not in run.toml states)
   day_parts_7              not-run  (not in run.toml states)
+  day_parts_7_advance      not-run  (not in run.toml states)
   erasure_in_flight        run
   fold_advance             run
   folded_leaves            run
@@ -17,6 +19,7 @@ states:
   many_parts_744           not-run  (not in run.toml states)
   mixed                    run
   retired_hour             not-run  (not in run.toml states)
+  retired_hour_drop        not-run  (not in run.toml states)
   unfolded                 run
 
 needle blocks, planted / storage, over 4 of 4 logs object(s):

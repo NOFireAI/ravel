@@ -15,7 +15,13 @@ lane = "s3"
 # unless fold_advance ran with the leaf switch on and added logs request_id
 # slices, so it belongs right after mixed. many_parts_N loads a fresh spans
 # tenant mpN over N strided ingest hours. erasure_in_flight is recorded
-# not-run when the corpus has no erasure victim.
+# not-run when the corpus has no erasure victim. ADR-3939's multi-day states
+# (README.md "day_parts_N and retired_hour") are listed only by a run that
+# measures that ADR: day_parts_7 (tenant dp7, spans and logs) and
+# day_parts_30 (tenant dp30, logs) load N whole UTC days ending before the
+# current hour, each followed by its _advance transition; retired_hour runs
+# on dp7, so it needs day_parts_7 listed before it and [retired_hour] c1_sha
+# set, and is followed by retired_hour_drop.
 states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves", "compaction_in_flight",
           "erasure_in_flight", "many_parts_744", "many_parts_2160"]
 # The run's own deadline, below box.max_minutes: a state that would start
@@ -111,6 +117,32 @@ rows_expected = 99997497
 # --snapshot-part-max-entries below, so every hour is its own part.
 traces_per_hour = 10
 snapshot_part_max_entries = 1
+
+[day_parts]
+# Read only when run.states lists day_parts_7 or day_parts_30. Traces per UTC
+# day of each state's even-hours corpus, a multiple of 24 so every hour holds
+# the same count. ADR-3939's harness-state amendment ("Two states",
+# docs/adrs/3939-key-index-day-seal.md): the 7-day state at box D's logs rate
+# (corpus.traces above per day, 20,000,000, at the nearest multiple of 24)
+# and the 30-day state at a reduced rate (a fifth of that, 4,000,000, at the
+# nearest multiple of 24), since 30 days at box D's rate do
+# not fit one run's deadline.
+traces_per_day_7 = 19999992
+traces_per_day_30 = 4000008
+
+[retired_hour]
+# Read only when run.states lists retired_hour. The fold binary stamp
+# (stamps/retired_hour.logs.fold_binary.json) records whether the binary's
+# SHA descends from c1_sha and r2_sha (ADR-3939 tasks C1 and R2; W2 is judged
+# only on a binary carrying C1 and not R2). c1_sha is required; an empty
+# r2_sha means R2 has not landed, so carries_r2 is false. A SHA that names no
+# commit fails the state.
+c1_sha = ""
+r2_sha = ""
+# The maintain-mode server's pass interval, and the most minutes run.sh lists
+# the store for the expected tombstones before failing the state.
+maintain_interval_secs = 30
+wait_minutes = 20
 
 # Before each load, fold, leaf rebuild and compaction run.sh checks that the
 # run deadline (run.max_minutes) leaves this many minutes for it, and records

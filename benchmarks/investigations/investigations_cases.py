@@ -18,6 +18,7 @@ fixture is written by hand.
 """
 
 import copy
+import datetime
 import gzip
 import importlib.util
 import json
@@ -56,9 +57,11 @@ HOUR_NS = 3600 * 1_000_000_000
 STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves", "compaction_in_flight",
           "compaction_done", "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160",
           "day_parts_7", "day_parts_30", "retired_hour")
-# ADR-3939's multi-day states (the harness-state amendment): registered, and
-# built by no box/run.sh yet (task H1b, #4048).
+# ADR-3939's multi-day states (the harness-state amendment), built by
+# box/run.sh state_day_parts and state_retired_hour, and the transitions each
+# derives (its advance, or retired_hour's drop of the rest of the day).
 MULTI_DAY_STATES = ("day_parts_7", "day_parts_30", "retired_hour")
+MULTI_DAY_DERIVED = ("day_parts_7_advance", "day_parts_30_advance", "retired_hour_drop")
 # The state each ADR-3939 row runs on (task H1a's decision, README.md): F3
 # runs on both, its W4 half on day_parts_7 and its W5 half on day_parts_30.
 ADR3939_STATES = {**{f"A{n}": "day_parts_7" for n in range(1, 7)}, "A7": "day_parts_30", "W1": "day_parts_7",
@@ -1225,7 +1228,8 @@ class LocalSmoke(Workdir):
         got = {s["state"]: (s["status"], s.get("reason")) for s in res["states"]}
         want = {s: ("run", None) for s in SMOKE_STATES + ("fold_advance", "compaction_done")}
         want.update({s: ("not-run", "not in run.toml states")
-                     for s in ("advanced_leaves", "many_parts_744", "many_parts_2160") + MULTI_DAY_STATES})
+                     for s in ("advanced_leaves", "many_parts_744", "many_parts_2160") + MULTI_DAY_STATES
+                     + MULTI_DAY_DERIVED})
         self.assertEqual(got, want)
 
     def test_in_1000_is_sent_and_refused_by_the_complexity_guard(self):
@@ -3413,8 +3417,8 @@ class Evaluate(Workdir):
         self.assertEqual(self.check_w5_a7_targets_follow_stamped_slices(), [])
 
     def check_w2_requires_pre_r2_binary_stamp(self, evaluate_py=EVALUATE, bands=BANDS):
-        """W2 is judged only on a fold binary that carries C1 and not R2. With no fold-binary stamp (this
-        build: task H1b writes it) the binary figure is unsupported, naming the stamp, and every other W2
+        """W2 is judged only on a fold binary that carries C1 and not R2. With no fold-binary stamp
+        (box/run.sh state_retired_hour writes it) the binary figure is missing, naming the stamp, and every other W2
         figure not-run with the amendment's reason; a binary carrying R2, or no C1, is not-run with its SHA,
         never a miss, and every W2 figure is listed not requested and none incomplete, so the R2 build's
         run holding retired_hour is free of a W2 miss; a stamp with no sha is missing; C1 without R2 judges
@@ -3423,11 +3427,11 @@ class Evaluate(Workdir):
         live = {"retired_hour": None}
         report = {"key_index_leaf_gets": 31, "key_index_unchanged_section_gets": 0,
                   "key_index_leaf_bytes_written": 1_300_000_000}
-        folds = {("retired_hour", "inv", "logs"): {"report": report}}
+        folds = {("retired_hour", "dp7", "logs"): {"report": report}}
         name = "stamps/retired_hour.logs.fold_binary.json"
         out = []
         for case, stamp, binary, rest in (
-                ("no stamp", None, (UNSUPPORTED, None, UNSUPPORTED), "not-run"),
+                ("no stamp", None, ("missing", None, "missing"), "not-run"),
                 ("C1 and R2", {"sha": "c1r2", "carries_c1": True, "carries_r2": True},
                  ("not-run", None, "not-run"), "not-run"),
                 ("no C1", {"sha": "c0", "carries_c1": False, "carries_r2": False},
@@ -3471,7 +3475,7 @@ class Evaluate(Workdir):
         mod = load_module(evaluate_py, "evaluate_w5_a7_parts")
         live = {"day_parts_30": None}
         out = []
-        if mod.ALLOWLIST_BREAKDOWNS.get("per_part") != "stats carry no per-part breakdown":
+        if "no keyIndex.perPart breakdown" not in (mod.ALLOWLIST_BREAKDOWNS.get("per_part") or ""):
             out.append(f"per_part breakdown reason {mod.ALLOWLIST_BREAKDOWNS.get('per_part')}")
         for case, parts, per_part, want in (("127 in one part", 30, 127, "miss"), ("126 per part", 30, 126, "pass"),
                                             ("no breakdown", 30, None, UNSUPPORTED)):
@@ -3510,10 +3514,10 @@ class Evaluate(Workdir):
         report = {"key_index_part_puts": 0, "key_index_leaves_written": 0, "retired_hours": retired,
                   "head_digest": digests[0]}
         refold = {"retired_hours": refold_retired, "head_digest": digests[1]}
-        return {("retired_hour", "inv", "logs"): {"report": report},
-                ("retired_hour_drop", "inv", "logs"): {"report": {"key_index_part_puts": 0,
+        return {("retired_hour", "dp7", "logs"): {"report": report},
+                ("retired_hour_drop", "dp7", "logs"): {"report": {"key_index_part_puts": 0,
                                                                   "key_index_leaves_written": 0}},
-                ("retired_hour_refold", "inv", "logs"): {"report": refold}}
+                ("retired_hour_refold", "dp7", "logs"): {"report": refold}}
 
     @staticmethod
     def drop_catalog(*ranges, declared=None):
@@ -3523,7 +3527,7 @@ class Evaluate(Workdir):
     def check_w3_drop_leaves_head(self, evaluate_py=EVALUATE, bands=BANDS):
         """W3's drop fold with 0 part and 0 leaf PUTs passes only when the catalog stamp after it holds no
         part whose hour range holds the tombstoned hour: a part 96..=119 still holding hour 100 misses,
-        parts 72..=95 and 120..=143 pass, an absent drop stamp is unsupported naming it, and a stamp with no
+        parts 72..=95 and 120..=143 pass, an absent drop stamp is missing naming it, and a stamp with no
         HEAD or a part count that disagrees with its parts is missing."""
         mod = load_module(evaluate_py, "evaluate_w3_drop")
         live = {"retired_hour": None}
@@ -3532,7 +3536,7 @@ class Evaluate(Workdir):
         for case, head, want in (
                 ("part still in HEAD", self.drop_catalog("72..=95", "96..=119", "120..=143"), ("value", 1, "miss")),
                 ("part gone", self.drop_catalog("72..=95", "120..=143"), ("value", 0, "pass")),
-                ("no drop stamp", None, (UNSUPPORTED, None, UNSUPPORTED)),
+                ("no drop stamp", None, ("missing", None, "missing")),
                 ("no HEAD", {"head": None, "parts": []}, ("missing", None, "missing")),
                 ("parts disagree", self.drop_catalog("72..=95", declared=2), ("missing", None, "missing"))):
             docs = {("retired_hour", "logs", "tombstone"): {"hour": 100}}
@@ -3575,8 +3579,8 @@ class Evaluate(Workdir):
                 if f["verdict"] != want[1]:
                     out.append(f"{case}: W8 {name} {f['value']!r} {f['verdict']}, want {want[1]}")
             if case == "empty digests":
-                a4_folds = {("day_parts_7", "inv", "logs"): {"report": {"head_digest": ""}},
-                            ("day_parts_7_refold", "inv", "logs"): {"report": {"head_digest": ""}}}
+                a4_folds = {("day_parts_7", "dp7", "logs"): {"report": {"head_digest": ""}},
+                            ("day_parts_7_refold", "dp7", "logs"): {"report": {"head_digest": ""}}}
                 a4 = self.adr3939_rows_now(mod, bands, ("adr3939_a4",), live, {}, {}, a4_folds)
                 for name in ("head_digest", "refold_head_digest"):
                     if a4[f"adr3939_a4.{name}"]["verdict"] != "miss":
@@ -3585,6 +3589,42 @@ class Evaluate(Workdir):
 
     def test_w8_retired_hours_are_the_tombstoned_hour(self):
         self.assertEqual(self.check_w8_retired_hours_are_the_tombstoned_hour(), [])
+
+    def check_on_demand_fold_figures_unsupported(self, evaluate_py=EVALUATE, bands=BANDS):
+        """The retired_hour folds are on-demand folds (source admin_fold), whose response carries none of
+        the fields W2, W3 and W8 read from them: each such figure is unsupported naming that response,
+        never missing and never judged; the stamp figures beside them still read their values."""
+        mod = load_module(evaluate_py, "evaluate_on_demand_fold")
+        live = {"retired_hour": None, "retired_hour_drop": None}
+        response = {"source": "admin_fold", "report": {"status": "published", "put_requests": 3, "entry_count": 5}}
+        folds = {(t, "dp7", "logs"): response for t in ("retired_hour", "retired_hour_refold", "retired_hour_drop",
+                                                        "retired_hour_drop_refold")}
+        docs = {("retired_hour", "logs", "fold_binary"): {"sha": "a" * 40, "carries_c1": True, "carries_r2": False},
+                ("retired_hour", "logs", "tombstone"): {"hour": 100},
+                ("retired_hour_drop", "logs", "catalog"): self.drop_catalog("120..=143")}
+        figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2", "adr3939_w3", "adr3939_w8"), live, docs, {}, folds)
+        out = []
+        with open(bands, "rb") as fh:
+            rows = [r for r in tomllib.load(fh)["row"] if r["key"] in ("adr3939_w2", "adr3939_w3", "adr3939_w8")]
+        read = 0
+        for r in rows:
+            for fig in r["figure"]:
+                if not fig["metric"].startswith("fold."):
+                    continue
+                read += 1
+                f = figs[f"{r['key']}.{fig['name']}"]
+                if f["verdict"] != mod.UNSUPPORTED or "fold_on_demand.rs" not in (f["reason"] or ""):
+                    out.append(f"{r['adr_row']} {fig['name']}: {f['verdict']} ({f['reason']})")
+        if read == 0:
+            out.append("no fold figure in W2, W3 or W8")
+        for name, want in (("adr3939_w2.fold_binary_pre_r2", 1), ("adr3939_w3.tombstoned_hour", 100),
+                           ("adr3939_w3.drop_parts_holding_hour", 0)):
+            if figs[name]["value"] != want:
+                out.append(f"{name}: {figs[name]['verdict']} {figs[name]['value']}, want {want}")
+        return out
+
+    def test_on_demand_fold_figures_unsupported(self):
+        self.assertEqual(self.check_on_demand_fold_figures_unsupported(), [])
 
     def check_w7_reads_two_day_parts(self, evaluate_py=EVALUATE, bands=BANDS):
         """W7's midnight call passes only when every try covered exactly 2 day parts and left none
@@ -4331,6 +4371,11 @@ FLIPS = {
         'f["row"] == 18 or f.get("adr") == "none")',
         "check_row_18_timing_rows_leave_run_incomplete",
     ),
+    "an on-demand fold's absent field read as the CLI fold's": (
+        '        if line.get("source") == "admin_fold" and (field in FOLD_ALLOWLIST or field in ADMIN_FOLD_ABSENT):\n',
+        '        if False:\n',
+        "check_on_demand_fold_figures_unsupported",
+    ),
 }
 
 
@@ -4505,9 +4550,9 @@ BAND_FLIPS = {
         "check_w5_a7_targets_follow_stamped_slices",
     ),
     "W2's previous-leaf GETs judged on any fold binary": (
-        "metric = \"fold.inv.logs.key_index_leaf_gets\"\nlane = \"counter\"\n"
+        "metric = \"fold.dp7.logs.key_index_leaf_gets\"\nlane = \"counter\"\n"
         "not_run_unless = \"m['adr3939_w2.fold_binary_pre_r2'] == 1\"\n",
-        "metric = \"fold.inv.logs.key_index_leaf_gets\"\nlane = \"counter\"\n",
+        "metric = \"fold.dp7.logs.key_index_leaf_gets\"\nlane = \"counter\"\n",
         "check_w2_requires_pre_r2_binary_stamp",
     ),
     "W5's per-part leaf GETs held to the 30-day total": (
@@ -4526,16 +4571,16 @@ BAND_FLIPS = {
         "check_w7_reads_two_day_parts",
     ),
     "W8's refold passing with no hour retired": (
-        "transition = \"retired_hour_refold\"\nmetric = \"fold.inv.logs.retired_hours\"\nlane = \"counter\"\n"
+        "transition = \"retired_hour_refold\"\nmetric = \"fold.dp7.logs.retired_hours\"\nlane = \"counter\"\n"
         "target_if = \"v == [m['adr3939_w3.tombstoned_hour']]\"\n",
-        "transition = \"retired_hour_refold\"\nmetric = \"fold.inv.logs.retired_hours\"\nlane = \"counter\"\n"
+        "transition = \"retired_hour_refold\"\nmetric = \"fold.dp7.logs.retired_hours\"\nlane = \"counter\"\n"
         "target_if = \"v == v\"\n",
         "check_w8_retired_hours_are_the_tombstoned_hour",
     ),
     "A4's refold digest passing whenever present": (
-        "transition = \"day_parts_7_refold\"\nmetric = \"fold.inv.logs.head_digest\"\nlane = \"counter\"\n"
+        "transition = \"day_parts_7_refold\"\nmetric = \"fold.dp7.logs.head_digest\"\nlane = \"counter\"\n"
         "target_if = \"isinstance(v, str) and len(v) > 0\"\n",
-        "transition = \"day_parts_7_refold\"\nmetric = \"fold.inv.logs.head_digest\"\nlane = \"counter\"\n"
+        "transition = \"day_parts_7_refold\"\nmetric = \"fold.dp7.logs.head_digest\"\nlane = \"counter\"\n"
         "target_if = \"v is not None\"\n",
         "check_w8_retired_hours_are_the_tombstoned_hour",
     ),
@@ -5473,6 +5518,377 @@ FINISHED=1
         print(f"flip 'a random hour per trace' at gen_corpus.py:{src[: src.index(old)].count(chr(10)) + 1} fails "
               f"test_many_parts_744_strided_load_check: {why}", file=sys.stderr)
 
+    # --- ADR-3939's multi-day states (task H1b, #4048) ------------------------
+
+    def new_states_toml(self, states='"day_parts_7", "day_parts_30", "retired_hour"', c1='"HEAD"'):
+        return self.example_toml(
+            ('"erasure_in_flight", "many_parts_744", "many_parts_2160"]', f'"erasure_in_flight", {states}]'),
+            ('c1_sha = ""', f"c1_sha = {c1}"))
+
+    def new_states_dry_run(self, script=None, toml=None, out="out-h1b"):
+        p = subprocess.run([BASH, script or os.path.join(BOX, "run.sh"), "--dry-run", "--lane", "s3", "--run-toml",
+                            toml or self.new_states_toml(), "--out", self.path(out)], capture_output=True, text=True)
+        return p.returncode, p.stdout + p.stderr
+
+    def flip_check(self, old, new, script, check, label, test):
+        """Run CHECK (a function of the flipped script's path returning its
+        problems) against a copy with OLD replaced by NEW, assert it finds
+        some, and print the flip."""
+        flipped, line = self.flipped_box(old, new, script)
+        try:
+            problems = check(flipped)
+        finally:
+            shutil.rmtree(self.path("inv-flipped"))
+        self.assertTrue(problems, label)
+        print(f"flip '{label}' at box/{script}:{line} fails {test}: {problems[0]}", file=sys.stderr)
+
+    @staticmethod
+    def check_day_parts_window(inv_path):
+        inv = load_module(inv_path, "inv_day_parts_window")
+        out = []
+        day = 20_400
+        for now in (day * 24, day * 24 + 1, day * 24 + 23, (day + 1) * 24):
+            for n in (7, 30):
+                try:
+                    w = inv.day_parts_window(n, now)
+                except ValueError as e:
+                    out.append(f"now {now}, {n} days: refused ({e})")
+                    continue
+                if not (w["end_hour"] < now and w["start_hour"] % 24 == 0 and w["hours"] == 24 * n
+                        and w["end_hour"] == w["start_hour"] + 24 * n):
+                    out.append(f"now {now}, {n} days: window {w}")
+        # A window that ends exactly at the current hour reaches it: refused.
+        try:
+            w = inv.day_parts_window(7, (day + 1) * 24, end_day=day)
+            out.append(f"7 days ending at the current hour {(day + 1) * 24} accepted: {w}")
+        except ValueError as e:
+            if "is not below the current ingest hour" not in str(e):
+                out.append(f"refusal reads {e}")
+        try:
+            inv.day_parts_window(7, (day + 1) * 24 + 1, end_day=day)
+        except ValueError as e:
+            out.append(f"7 days ending one hour before the current hour refused: {e}")
+        return out
+
+    def test_day_parts_state_ends_before_the_current_hour(self):
+        # The strided load refuses a window reaching the current ingest hour,
+        # so every day_parts_N window is N whole UTC days ending before it,
+        # at every hour of the day, and run.sh loads and generates exactly
+        # that window (D0_N in a dry run, from inv.py day-parts-window).
+        inv_path = os.path.join(BOX, "lib", "inv.py")
+        self.assertEqual(self.check_day_parts_window(inv_path), [])
+        now = int(time.time()) // 3600
+        p = subprocess.run([sys.executable, inv_path, "day-parts-window", "--days", "7", "--now-hour", str(now)],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertLess(json.loads(p.stdout)["end_hour"], now)
+        p = subprocess.run([sys.executable, inv_path, "day-parts-window", "--days", "7", "--now-hour", str(now),
+                            "--end-day", str(now // 24)], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        code, text = self.new_states_dry_run()
+        self.assertEqual(code, 0, text)
+        b = self.blocks(text)
+        for n in (7, 30):
+            self.assertIn(f"day-parts-window --days {n}", "\n".join(b["corpus"]))
+            gen = [x for x in b["corpus"] if "gen_corpus.py" in x and x.endswith(f"/corpus-dp{n}")]
+            self.assertEqual(len(gen), 1, gen)
+            for frag in (f" --hours {24 * n} ", " --even-hours ", f" --start-hour D0_{n} "):
+                self.assertIn(frag, gen[0])
+            loads = [x for x in b[f"state:day_parts_{n}"] if f"load-day_parts_{n}-" in x and "load --signal" in x]
+            self.assertEqual(len(loads), 2 if n == 7 else 1, loads)
+            for x in loads:
+                self.assertIn(f"--ingest-hour-stride 1 --ingest-hour-start D0_{n} ", x)
+        for old, new, label in (
+                ("    if end >= now_hour:\n", "    if end > now_hour:\n",
+                 "a window ending at the current hour accepted"),
+                ("        end_day = (now_hour - 1) // 24 - 1\n", "        end_day = now_hour // 24 - 1\n",
+                 "the default last day reaching the current hour at midnight")):
+            self.flip_check(old, new, "lib/inv.py", self.check_day_parts_window, label,
+                            "test_day_parts_state_ends_before_the_current_hour")
+
+    def check_day_parts_fold(self, script):
+        code, text = self.new_states_dry_run(script)
+        if code:
+            return [f"dry run exit {code}"]
+        b = self.blocks(text)
+        out = []
+        for n, sigs in ((7, ("spans", "logs")), (30, ("logs",))):
+            st = f"day_parts_{n}"
+            lines = b.get(f"state:{st}", [])
+            j = "\n".join(lines)
+            for sig in sigs:
+                checks = [x for x in lines if f"stride-check --parquet {self.path('out-h1b')}/work/corpus-dp{n}/{sig}"
+                          in x]
+                if len(checks) != 1 or f"--batches {24 * n} " not in checks[0]:
+                    out.append(f"{st}/{sig}: stride-check {checks}")
+                for fold, want in ((st, 1), (f"{st}_refold", 1 if n == 7 else 0), (f"{st}_advance", 1)):
+                    got = [x for x in lines if f"/fold-{fold}-{sig}.measure.json" in x]
+                    if len(got) != want or not all("--writers-stopped --json --key-index-leaves" in x for x in got):
+                        out.append(f"{fold}/{sig}: {len(got)} folds, want {want}, every one with "
+                                   f"--key-index-leaves: {got}")
+            for sig in ("spans", "logs"):
+                if sig not in sigs and f"-{sig}.measure.json" in j:
+                    out.append(f"{st}: touches {sig}")
+            for a, z in ((f"--state {st} ", f"/fold-{st}-logs."), (f"/fold-{st}-logs.", "STAMP stamps/transitions.jsonl"),
+                         ("STAMP stamps/transitions.jsonl", f"day-parts-stamp --stamps {self.path('out-h1b')}/stamps "
+                          f"--state {st} --label logs"),
+                         ("wait until the ingest hour", f"/fold-{st}_advance-logs.")):
+                if a not in j or z not in j or j.index(a) > j.index(z):
+                    out.append(f"{st}: {a!r} not before {z!r}")
+            if "--temp prefold" not in j.split(f"/fold-{st}-logs.")[0]:
+                out.append(f"{st}: no prefold calls before the fold")
+        return out
+
+    def test_day_parts_fold_builds_every_day_once(self):
+        # One catalog fold --writers-stopped --key-index-leaves per signal
+        # builds every day's leaves (ADR-3939 decision 4, corrected), after
+        # one strided load over all 24N hours and the prefold calls; the 7-day
+        # state folds once more over the same HEAD (A4); each advance folds
+        # once. The day-parts stamp splits the catalog stamp into one entry
+        # per UTC day, and flags a part that spans two.
+        self.assertEqual(self.check_day_parts_fold(None), [])
+        inv = load_module(os.path.join(BOX, "lib", "inv.py"), "inv_day_parts")
+        d0 = 20_400 * 24
+        doc = {"head": {"watermark_hour": d0 + 168}, "parts": [
+            {"index": i, "range": f"{d0 + 24 * i}..={d0 + 24 * i + 23}", "entry_count": 192,
+             "leaves": [{"field": "request_id"}] * 3 + [{"field": "trace_id"}]} for i in range(7)]}
+        parts = inv.day_parts(doc)
+        self.assertEqual([p["day"] for p in parts], [20_400 + i for i in range(7)])
+        self.assertTrue(all(p["one_day"] and p["slices"] == {"request_id": 3, "trace_id": 1}
+                            and p["entry_count"] == 192 for p in parts))
+        self.assertFalse(inv.day_parts({"parts": [{"range": f"{d0 + 23}..={d0 + 24}"}]})[0]["one_day"])
+        os.mkdir(self.path("stamps"))
+        with open(self.path("stamps", "day_parts_7.logs.catalog.json"), "w") as f:
+            json.dump(doc, f)
+        p = subprocess.run([sys.executable, os.path.join(BOX, "lib", "inv.py"), "day-parts-stamp", "--stamps",
+                            self.path("stamps"), "--state", "day_parts_7", "--label", "logs"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(self.path("stamps", "day_parts_7.logs.day_parts.json")) as f:
+            stamp = json.load(f)
+        self.assertEqual((stamp["part_count"], stamp["days"], stamp["watermark_hour"]),
+                         (7, [20_400 + i for i in range(7)], d0 + 168))
+        self.flip_check('  fold "$st" --key-index-leaves || { TRIPLES="$saved"; return 1; }\n',
+                        '  fold "$st" || { TRIPLES="$saved"; return 1; }\n', "run.sh", self.check_day_parts_fold,
+                        "the state's fold without the leaf switch", "test_day_parts_fold_builds_every_day_once")
+
+    def check_retired_hour_plan(self, script):
+        code, text = self.new_states_dry_run(script)
+        if code:
+            return [f"dry run exit {code}"]
+        lines = self.blocks(text).get("state:retired_hour", [])
+        j = "\n".join(lines)
+        out = []
+        cuts = re.findall(r"retention-cutoff --parquet \S+/corpus-dp7/logs\.parquet --event-column ts "
+                          r"--batch-rows \S+ --batch (\d+)", j)
+        if cuts != ["0", "23"]:
+            out.append(f"retention-cutoff batches {cuts}, want ['0', '23']")
+        checks = re.findall(r"tombstone-check --first (\S+) --last (\S+) ", j)
+        if checks != [("D0_7", "D0_7+0"), ("D0_7", "D0_7+23")]:
+            out.append(f"tombstone-check ranges {checks}")
+        for stamp in ("retired_hour.logs.tombstone.json", "retired_hour_drop.logs.tombstone.json"):
+            if f"STAMP stamps/{stamp}" not in lines:
+                out.append(f"no {stamp}")
+        return out
+
+    def check_tombstoned_hours(self, inv_path):
+        inv = load_module(inv_path, "inv_tombstones")
+        out = []
+        h = 20_400 * 24
+        stamp = datetime.datetime.fromtimestamp(h * 3600, datetime.timezone.utc).strftime("%Y%m%dT%H")
+        nxt = datetime.datetime.fromtimestamp((h + 1) * 3600, datetime.timezone.utc).strftime("%Y%m%dT%H")
+        keys = [f"10\tt/abc/l/c/0/{stamp}/retire.tmb", f"10\tt/abc/l/c/1/{stamp}/retire.tmb",
+                f"10\tt/abc/s/c/0/{nxt}/retire.tmb", f"10\tt/other/l/c/0/{nxt}/retire.tmb",
+                f"10\tt/abc/l/c/0/{nxt}/seg.rseg"]
+        if inv.tombstoned_hours(keys, "abc", "l") != {h}:
+            out.append(f"hours {inv.tombstoned_hours(keys, 'abc', 'l')}, want {{{h}}}")
+        cut, r = inv.retention_window(h * HOUR_NS + 5, (h + 1) * HOUR_NS + 5, (h + 10) * 3600)
+        if (cut, r) != (h * 3600 + 1, (h + 10) * 3600 - (h * 3600 + 1)):
+            out.append(f"retention window {(cut, r)}")
+        try:
+            inv.retention_window(h * HOUR_NS + 5, h * HOUR_NS + 6, (h + 10) * 3600)
+            out.append("a window expiring the next batch too accepted")
+        except ValueError:
+            pass
+        for got, want in (({h}, 0), ({h, h + 1}, 1), (set(), 1)):
+            with open(self.path("keys.tsv"), "w") as f:
+                for hour in sorted(got):
+                    s = datetime.datetime.fromtimestamp(hour * 3600, datetime.timezone.utc).strftime("%Y%m%dT%H")
+                    f.write(f"10\tt/abc/l/c/0/{s}/retire.tmb\n")
+            p = subprocess.run([sys.executable, inv_path, "tombstone-check", "--keys", self.path("keys.tsv"),
+                                "--tenant-hash", "abc", "--first", str(h), "--last", str(h)],
+                               capture_output=True, text=True)
+            if p.returncode != want:
+                out.append(f"tombstone-check over {sorted(got)} exit {p.returncode}, want {want}")
+        return out
+
+    def test_retired_hour_tombstones_hour_zero_only(self):
+        # retired_hour retires ingest hour D0 (hour 0 of dp7's oldest day,
+        # the strided load's batch 0) and nothing later: retention-cutoff
+        # picks a window that expires batch 0's bucket and not batch 1's,
+        # and the store must list retire.tmb keys for exactly that hour
+        # before the fold. retired_hour_drop then retires D0..=D0+23.
+        self.assertEqual(self.check_retired_hour_plan(None), [])
+        inv_path = os.path.join(BOX, "lib", "inv.py")
+        self.assertEqual(self.check_tombstoned_hours(inv_path), [])
+        self.flip_check('  retire_through retired_hour 0 || { TRIPLES="$saved"; return 1; }\n',
+                        '  retire_through retired_hour 1 || { TRIPLES="$saved"; return 1; }\n', "run.sh",
+                        self.check_retired_hour_plan, "hours 0 and 1 retired",
+                        "test_retired_hour_tombstones_hour_zero_only")
+        for old, new, label in (
+                ("    if got != want:\n", "    if not want <= got:\n", "more tombstoned hours than asked accepted"),
+                ("    if max_next_ns < cutoff_s * 1_000_000_000:\n", "    if False:\n",
+                 "a cutoff that expires the next batch too")):
+            self.flip_check(old, new, "lib/inv.py", self.check_tombstoned_hours, label,
+                            "test_retired_hour_tombstones_hour_zero_only")
+
+    def fold_binary_repo(self):
+        """A git repository c0 -> c1 -> r2 with a side branch side off c0;
+        returns {name: sha}."""
+        repo = self.path("repo")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@t")
+        git = lambda *a: subprocess.run(["git", "-C", repo, *a], check=True, capture_output=True, text=True,
+                                        env=env).stdout.strip()
+        os.mkdir(repo)
+        git("init", "-q")
+        shas = {}
+        for name in ("c0", "c1", "r2"):
+            git("commit", "-q", "--allow-empty", "-m", name)
+            shas[name] = git("rev-parse", "HEAD")
+        git("checkout", "-q", "-b", "side", shas["c0"])
+        git("commit", "-q", "--allow-empty", "-m", "side")
+        shas["side"] = git("rev-parse", "HEAD")
+        return repo, shas
+
+    def check_fold_binary(self, inv_path):
+        inv = load_module(inv_path, "inv_fold_binary")
+        repo, s = self.fold_binary_repo()
+        out = []
+        for sha, r2, want in (("c1", "", (True, False)), ("c1", "r2", (True, False)), ("r2", "r2", (True, True)),
+                              ("r2", "", (True, False)), ("side", "r2", (False, False)), ("c0", "", (False, False))):
+            doc = inv.fold_binary(repo, s[sha][:12], s["c1"], s[r2] if r2 else "")
+            if (doc["carries_c1"], doc["carries_r2"]) != want or doc["sha"] != s[sha]:
+                out.append(f"binary {sha}, r2 {r2 or 'empty'}: {doc}, want {want}")
+        for sha, c1, r2, what in (("0" * 12, s["c1"], "", "the fold binary's SHA"),
+                                  (s["c1"], "1" * 12, "", "retired_hour.c1_sha"),
+                                  (s["c1"], s["c1"], "2" * 12, "retired_hour.r2_sha")):
+            try:
+                doc = inv.fold_binary(repo, sha, c1, r2)
+                out.append(f"unresolvable {what} accepted: {doc}")
+            except ValueError as e:
+                if what not in str(e) or "names no commit" not in str(e):
+                    out.append(f"unresolvable {what}: {e}")
+        p = subprocess.run([sys.executable, inv_path, "fold-binary", "--repo", repo, "--sha", s["c1"], "--c1",
+                            s["c1"], "--r2", "", "--out", self.path("fold_binary.json")], capture_output=True,
+                           text=True)
+        if p.returncode:
+            out.append(f"fold-binary exit {p.returncode}: {p.stderr}")
+        else:
+            with open(self.path("fold_binary.json")) as f:
+                doc = json.load(f)
+            if {k: doc.get(k) for k in ("sha", "carries_c1", "carries_r2")} != {
+                    "sha": s["c1"], "carries_c1": True, "carries_r2": False}:
+                out.append(f"stamp {doc}")
+        p = subprocess.run([sys.executable, inv_path, "fold-binary", "--repo", repo, "--sha", "f" * 12, "--c1",
+                            s["c1"], "--out", self.path("fold_binary_bad.json")], capture_output=True, text=True)
+        if p.returncode != 1 or os.path.exists(self.path("fold_binary_bad.json")):
+            out.append(f"fold-binary over an unresolvable SHA exit {p.returncode}")
+        shutil.rmtree(repo)
+        return out
+
+    def test_retired_hour_stamps_fold_binary_sha(self):
+        # stamps/retired_hour.logs.fold_binary.json is {sha, carries_c1,
+        # carries_r2} by git ancestry against run.toml's c1_sha and r2_sha;
+        # an empty r2_sha is false; an unresolvable SHA refuses and writes
+        # no stamp. run.sh writes it before the state's first tombstone,
+        # and refuses a retired_hour run with no c1_sha, or with no
+        # day_parts_7 before it.
+        self.assertEqual(self.check_fold_binary(os.path.join(BOX, "lib", "inv.py")), [])
+        code, text = self.new_states_dry_run()
+        self.assertEqual(code, 0, text)
+        rh = "\n".join(self.blocks(text)["state:retired_hour"])
+        self.assertLess(rh.index("STAMP stamps/retired_hour.logs.fold_binary.json"), rh.index("retention-cutoff"))
+        self.assertRegex(rh, r"fold-binary --repo /root/inv/ravel --sha FILL-IN-COMMIT --c1 HEAD --r2 '' --out "
+                             r"\S+/stamps/retired_hour\.logs\.fold_binary\.json")
+        code, text = self.new_states_dry_run(toml=self.new_states_toml(c1='""'), out="out-no-c1")
+        self.assertNotEqual(code, 0)
+        self.assertIn("run.toml retired_hour.c1_sha is empty", text)
+        os.remove(self.path("run.toml"))
+        code, text = self.new_states_dry_run(toml=self.new_states_toml(states='"retired_hour", "day_parts_7"'),
+                                             out="out-order")
+        self.assertNotEqual(code, 0)
+        self.assertIn("retired_hour runs on the day_parts_7 tenant", text)
+        self.flip_check('"carries_r2": bool(r2_full) and git_is_ancestor(repo, r2_full, full)}',
+                        '"carries_r2": git_is_ancestor(repo, r2_full or c1_full, full)}', "lib/inv.py",
+                        self.check_fold_binary, "an empty r2_sha read as carried",
+                        "test_retired_hour_stamps_fold_binary_sha")
+
+    # The new states' dry-run plan, step by step: (state, the ordered
+    # fragments its block holds). The local smoke lists none of them
+    # (README.md "day_parts_N and retired_hour"), so this is their pin.
+    NEW_STATES_PLAN = (
+        ("day_parts_7", ("stride-check --parquet", "load-day_parts_7-spans", "load-day_parts_7-logs",
+                         "--temp prefold --tenant dp7 --sub day_parts_7", "fold-day_parts_7-spans",
+                         "fold-day_parts_7-logs", "fold-day_parts_7_refold-spans", "fold-day_parts_7_refold-logs",
+                         "STAMP stamps/transitions.jsonl", "STAMP stamps/census.jsonl",
+                         "STAMP stamps/day_parts_7.logs.day_parts.json", "--tenant dp7 --sub day_parts_7",
+                         "wait until the ingest hour", "load-day_parts_7_tail-spans", "load-day_parts_7_tail-logs",
+                         "fold-day_parts_7_advance-spans", "fold-day_parts_7_advance-logs",
+                         "STAMP stamps/transitions.jsonl", "STAMP stamps/day_parts_7_advance.logs.day_parts.json")),
+        ("day_parts_30", ("stride-check --parquet", "load-day_parts_30-logs",
+                          "--temp prefold --tenant dp30 --sub day_parts_30", "fold-day_parts_30-logs",
+                          "STAMP stamps/transitions.jsonl", "STAMP stamps/day_parts_30.logs.day_parts.json",
+                          "--tenant dp30 --sub day_parts_30", "wait until the ingest hour",
+                          "load-day_parts_30_tail-logs", "fold-day_parts_30_advance-logs",
+                          "STAMP stamps/transitions.jsonl", "STAMP stamps/day_parts_30_advance.logs.day_parts.json")),
+        ("retired_hour", ("STAMP stamps/retired_hour.logs.fold_binary.json", "--batch 0",
+                          "--mode maintain --tenant-token-file", "--disable-fold --retention-tenant dp7=RETENTION_S",
+                          "tombstone-check --first D0_7 --last D0_7+0", "STAMP stamps/retired_hour.logs.tombstone.json",
+                          "--mode query", "--retention-tenant dp7=RETENTION_S --fold-key-index-leaves",
+                          "admin-fold-retired_hour.json", "admin-fold-retired_hour_refold.json",
+                          "STAMP stamps/transitions.jsonl", "STAMP stamps/census.jsonl", "--batch 23",
+                          "tombstone-check --first D0_7 --last D0_7+23",
+                          "STAMP stamps/retired_hour_drop.logs.tombstone.json", "admin-fold-retired_hour_drop.json",
+                          "admin-fold-retired_hour_drop_refold.json", "STAMP stamps/transitions.jsonl")),
+    )
+
+    def check_new_states_plan(self, script):
+        code, text = self.new_states_dry_run(script)
+        if code:
+            return [f"dry run exit {code}"]
+        out = []
+        steps = self.steps(text)
+        want = [f"state:{s}" for s in ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves",
+                                       "compaction_in_flight", "erasure_in_flight", "day_parts_7", "day_parts_30",
+                                       "retired_hour")]
+        if [s for s in steps if s.startswith("state:")] != want:
+            out.append(f"states {steps}")
+        if "NOT-RUN" in text or "STATE-FAILED" in text:
+            out.append("a state not run or failed in the dry run")
+        b = self.blocks(text)
+        for state, frags in self.NEW_STATES_PLAN:
+            j, at = "\n".join(b.get(f"state:{state}", [])), 0
+            for frag in frags:
+                i = j.find(frag, at)
+                if i < 0:
+                    out.append(f"{state}: {frag!r} missing after offset {at}")
+                    break
+                at = i + len(frag)
+        if "--tenant mp" in text:
+            out.append("a many_parts tenant in a run that lists none")
+        return out
+
+    def test_new_states_dry_run_plan(self):
+        # The s3 lane's dry run with all three states listed, pinned in
+        # order; the local smoke cannot run them (README.md), so this plan
+        # is what the tests hold run.sh to.
+        self.assertEqual(self.check_new_states_plan(None), [])
+        self.flip_check('  retire_through retired_hour_drop 23 || { TRIPLES="$saved"; return 1; }\n',
+                        '  retire_through retired_hour_drop 22 || { TRIPLES="$saved"; return 1; }\n', "run.sh",
+                        self.check_new_states_plan, "the drop leaving the day's last hour",
+                        "test_new_states_dry_run_plan")
+
     def test_stride_check_that_cannot_run_is_not_a_refusal(self):
         # run.sh records exit 1 as the state not-run with the refusal on
         # stdout, and any other non-zero exit as a failed state with the
@@ -5862,7 +6278,8 @@ FINISHED=1
         for argv in argvs:
             i = argv.index("--memory-budget-bytes")
             self.assertEqual(argv[i + 2:i + 4], ["--sql-max-query-bytes=1048576", "--x=*"], argv)
-        flipped, line = self.flipped_box(' ${SERVER_EXTRA[@]+"${SERVER_EXTRA[@]}"} </dev/null', " </dev/null")
+        flipped, line = self.flipped_box(' ${SERVER_EXTRA[@]+"${SERVER_EXTRA[@]}"} ${1+"$@"} </dev/null',
+                                         ' ${1+"$@"} </dev/null')
         code2, text2, _, argv2 = self.died_run(1, "", flipped, tag="-flip", warm_runs=0, toml=toml)
         with open(argv2) as f:
             self.assertNotIn("--sql-max-query-bytes=1048576", f.read())
