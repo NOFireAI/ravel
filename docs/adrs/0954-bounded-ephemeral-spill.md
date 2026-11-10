@@ -1429,26 +1429,59 @@ This is the parallel bucket spill amendment. The figures are from epic
 
 ### Parallel bucket spill gate (M8)
 
-T3 (#4075) runs the M8 gate on the three ClickBench boxes. Every row is a
-prediction made before the code exists; T3 pre-registers it on #4072 with
-these bands before it runs. Each figure must be present exactly once and
-inside its band; anything else is a miss, so no row leaves a gap between
-its band and its miss. The null rows compare against the M7 build,
-c752b054a, run on the same machine (run
-`m7-main-c752b054a-20261110T0800Z`). The row 33 rows assume the bucketed
-retry runs, which on c6a.2xlarge needs a soft `nofile` limit of at least
-4,096 at 4 slots (ADR-3565 bucket spill amendment, items 1 and 4); T3
-stamps each box's limit beside its run.
+T3 (#4075) runs the M8 gate on the three ClickBench boxes, c6a.large,
+c6a.xlarge and c6a.2xlarge. Every row is a prediction made before the code
+exists; T3 pre-registers it on #4072 with these bands before it runs. Each
+figure must be present exactly once and inside its band; anything else is
+a miss, so no row leaves a gap between its band and its miss.
+
+M8's arms are runs still to be produced. Each machine gets one box. On it
+the build is the main SHA carrying T2 #4074 and T3 #4075, and the data is
+loaded by that build. The arms run in this order, and all are
+pre-registered on #4072 before the first one launches:
+
+1. Arm N: the ClickBench entry's own run of that build at stock flags.
+2. Arm O: the published v0.28.0 ravel-server, its binary checked against
+   the release's SHA256SUMS, through the bot's 43 x 3 cycle (for each
+   statement: stop the server, drop caches, start it, 3 tries) on the same
+   box and data.
+3. Four concurrent windows, interleaved v0.28.0, new, new, v0.28.0: 10
+   connections, 600 s each, seed `clickbench`.
+
+The null rows compare arm N against the M7 build, c752b054a, run on the
+same machine (run `m7-main-c752b054a-20261110T0800Z`). The hot-time row
+reads arm N, and arm O where that row says so. The concurrent QPS rows
+read the four windows.
+
+The row 33 rows, and the part of each concurrent QPS row that this
+amendment predicts, assume the bucketed retry is selected on that box.
+ADR-3565's bucket spill amendment, item 4, derives the selection for each
+box from M7's startup lines: `L` 1.45, 3.38 and 8.19 GB, `slots` 1, 2 and
+4, `bits` 6, 5 and 4, so a descriptor need `2 x P x 2^bits + P` of 2,064,
+1,040 and 528 and a soft `nofile` limit of at least 4,128, 4,160 and 4,224
+for `F = floor(nofile_soft / (2 x slots))` to cover it (items 1 and 4).
+One more bit doubles the need: at the top of each box's `bits` band the
+limit is 8,224, 8,256 and 8,320. The ClickBench entry's start script
+raises the soft limit to the hard limit (`ulimit -n` set to `ulimit -Hn`)
+before the server starts; M7 did not record the hard limit on these Ubuntu
+24.04 boxes. T3 stamps each box's soft limit beside its run and requires
+at least 8,320 on every box. A box stamped below that has failed a
+precondition: its row 33 rows and its concurrent QPS row are reported and
+not judged, and the box is rerun with the limit raised. On a box stamped
+at or above it, a sort-merge retry plan for row 33 (no tuning) is a miss
+of that box's `bits` row in ADR-3565's bucket spill bands, and the rows
+here are judged as measured, so a QPS miss that follows is the design's
+miss, not a precondition's.
 
 | figure | band | miss | basis |
 |---|---|---|---|
 | statements newly null against build c752b054a's M7 run on the same box, 43 statements x 3 tries, on each of c6a.xlarge and c6a.2xlarge | 0 | 1 or more | measured 2026-11-10 (run `m7-main-c752b054a-20261110T0800Z`): both boxes answered all 43 statements x 3 tries in every arm, so on them every null is a new one |
 | statements newly null against build c752b054a's M7 run on the same box, 43 statements x 3 tries, c6a.large | 0 | 1 or more | measured 2026-11-10 (run `m7-main-c752b054a-20261110T0800Z`, issue #4014 comment 6766780090): the box answered all 43 statements x 3 tries in every arm, so every null is a new one |
 | null answers, absolute count, 43 statements x 3 tries, on each of c6a.large, c6a.xlarge and c6a.2xlarge | 0 | 1 or more | predicted: every statement today's retry answers still answers; the residual risk is the under-shoot of ADR-3565's bucket spill item 5 (rate miss times skew above 2), which fails typed and would show here as a null |
-| hot time per statement v0.28.0 answered, against published v0.28.0 | at most 1.10x | above 1.10x on any statement | predicted: the first attempt is unchanged, and every statement outside item 1 keeps today's retry. Where a published statement's tries 2 and 3 differ by more than 1.10x, the published hot is not a reference and the statement is judged against v0.28.0 run through the same 43 x 3 cycle on the same box and data (M8 arm O) instead; statement 24 on c6a.xlarge is that case (published tries 10.474, 9.644, 3.727 s) |
-| concurrent QPS, c6a.large: mean of two new windows over mean of two v0.28.0 windows, interleaved on the same box and data | at least 0.95, with the new error ratio no higher than v0.28.0's | below 0.95, or a higher error ratio | predicted: M7 measured 0.87 (0.0915 over 0.105) with 2 and 3 retries writing 8.6 and 4.0 GB, and v0.28.0 itself scored 0.77x its published 0.137 on that box, so published x 0.90 is reported beside this row and not gated |
-| concurrent QPS, c6a.xlarge, same rule | at least 0.95, error ratio no higher | below 0.95, or a higher error ratio | predicted: M7 measured 0.87 (0.201 over 0.230) with 3 and 5 retries writing 9.9 and 15.6 GB, and row 33's part of that falls to its write-once bytes |
-| concurrent QPS, c6a.2xlarge, same rule | at least 0.95, error ratio no higher | below 0.95, or a higher error ratio | predicted: M7 measured 0.77 (0.380 over 0.495) with 8 and 10 retries writing 51 and 58 GB on the volume the local object store shares; the first attempt's 8 GB hold on rows 19, 34 and 35 is unchanged, so this row can miss for a cause this amendment does not address |
+| hot time per statement v0.28.0 answered, against published v0.28.0 | at most 1.10x | above 1.10x on any statement | predicted: the first attempt is unchanged, and every statement outside item 1 keeps today's retry. Where a published statement's tries 2 and 3 differ by more than 1.10x, the published hot is not a reference and the statement is judged against arm O instead (v0.28.0 through the same 43 x 3 cycle on the same box and data, defined in this section's introduction); statement 24 on c6a.xlarge is that case (published tries 10.474, 9.644, 3.727 s) |
+| concurrent QPS, c6a.large: mean of two new windows over mean of two v0.28.0 windows, interleaved on the same box and data | at least 0.95, with the new error ratio no higher than v0.28.0's | below 0.95, or a higher error ratio | predicted: M7 measured 0.87 (0.0915 over 0.105) with 2 and 3 retries writing 8.6 and 4.0 GB, and v0.28.0 itself scored 0.77x its published 0.137 on that box, so published x 0.90 is reported beside this row and not gated; row 33's part of the loss falls to its write-once bytes once the bucketed retry is selected there (`bits` 6, at a stamped soft `nofile` limit of at least 8,320, this section's introduction) |
+| concurrent QPS, c6a.xlarge, same rule | at least 0.95, error ratio no higher | below 0.95, or a higher error ratio | predicted: M7 measured 0.87 (0.201 over 0.230) with 3 and 5 retries writing 9.9 and 15.6 GB, and row 33's part of that falls to its write-once bytes once the bucketed retry is selected there (`bits` 5, at a stamped soft `nofile` limit of at least 8,320, this section's introduction) |
+| concurrent QPS, c6a.2xlarge, same rule | at least 0.95, error ratio no higher | below 0.95, or a higher error ratio | predicted: M7 measured 0.77 (0.380 over 0.495) with 8 and 10 retries writing 51 and 58 GB on the volume the local object store shares; the first attempt's 8 GB hold on rows 19, 34 and 35 is unchanged, so this row can miss for a cause this amendment does not address; row 33's part assumes the bucketed retry is selected (`bits` 4, at a stamped soft `nofile` limit of at least 8,320, this section's introduction) |
 | row 33 hot time, c6a.2xlarge | at most 40 s | above 40 s | predicted, from today's run measured 2026-11-10 in M7 (run `m7-main-c752b054a-20261110T0800Z`, statement fingerprint da3d31a73eb29b30): the first attempt is refused after 2.6 to 4.0 s (`first_refusal_after_ms` 2588 to 4013 over 9 tries), then the sort-merge retry runs to a total of 80.8 to 82.3 s, writing 8.51 to 8.55 GB per try; at 240 MB/s writing 8.53 GB takes 35.5 s and reading it back about as long, which with the first attempt accounts for most of that total. The bar is first attempt + scan + spill. First attempt, unchanged: at most 4.0 s. The bucketed exec's scan and aggregation: q33's hot time on c6a.4xlarge is 3.133 s (ADR-3565 decision 6, min of tries 2 and 3 on `fullmain-20261031T1700Z`) and the bucketed exec's wall was 1.004 of it (ADR-3565 amendment 1), so at half the vCPUs about 2 x 3.133 x 1.004 = 6.3 s. Spill, written once: 5.2 GB of routed state before compression (100M rows x 52 B, ADR-3565 amendment 1) at the 3.76 lz4_frame ratio measured on the integer-keyed row 33 fixture (refusal-retry decision item 2) is 1.38 GB, 1.38 / 0.24 = 5.8 s to write, and at most 5.8 s more to read back when the page cache does not hold it. Sum: 2.6 + 6.3 + 5.8 + 0 = 14.7 s to 4.0 + 6.3 + 5.8 + 5.8 = 21.9 s. The 40 s bar is about 1.8 x the upper sum, which leaves room for the scan scaling worse than linearly with vCPUs and for phase 2 losing its overlap with the scan, and is still under half of today's 80.8 s |
 | row 33 `bucket_spill_bytes_written`, c6a.2xlarge | 1.0 to 2.0 GB | below 1.0 GB or above 2.0 GB; above 5.3 GB is also a breach of the bound of ADR-3565's bucket spill item 2 | predicted: as the row above; the gap up to 5.3 GB is made a miss rather than widened, because a figure there means the compression prediction failed even though the bound held |
 | row 33 `exchange_spill_bytes_written`, c6a.2xlarge | at most 1% of `bucket_spill_bytes_written` | above 1% | predicted: unique keys hash evenly, so the distributor gate (item 2) stalls the producers before a channel outgrows its share; the gap up to the earlier 10% miss line is made a miss rather than widened, because the prediction is that the exchange barely spills, and a figure above 1% means the gate did not hold the producers back |
