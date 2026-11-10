@@ -40,7 +40,7 @@
 #                 census.<tenant>.<signal>.objects|bytes|objects_over_512k
 #                 truth.<path>                an integer truth.json holds
 #                 fold.<tenant>.<label>.<field>
-#                 derived (with expr, over m: the figures defined above it)
+#                 derived (with expr, over m: the run's figures)
 #   expr        derived figures only: a Python expression over m
 #   lane        "counter": judged on every lane; "timing": judged on the s3
 #               lane only (decision 8: the local lane is counter-only), and
@@ -53,16 +53,24 @@
 #               is a miss whether or not miss_if holds (the ADR: "a figure
 #               outside its band is a miss").
 #   miss_reason optional: the reason a miss carries when miss_if holds
-#   not_run_unless  optional: a Python expression over m (the figures defined
-#               above it); false makes the figure not-run with not_run_reason
-#               and the values it read, which leaves the run incomplete, never
-#               a pass. ADR-3939's reduced-rate figures use it for the S floor
-#               and W2's, W3's and W8's for their fold binary
+#   not_run_unless  optional: a Python expression over m (the run's figures;
+#               one defined below it is read once evaluate.py has built it);
+#               false makes the figure not-run with not_run_reason and the
+#               values it read, which leaves the run incomplete, never a pass.
+#               ADR-3939's reduced-rate figures use it for the S floor and
+#               A3's, A4's, W2's, W3's and W8's for their fold binary
 #   gate_not_requested  optional, with not_run_unless: true lists the figure
 #               not requested rather than incomplete when its expression read
 #               every figure it names and was false (a build the figure is
 #               not measured on); one it could not read leaves the run
 #               incomplete unless that figure is itself not requested
+#   not_requested_if  optional: a Python expression over v and m; true lists
+#               the figure not requested with not_requested_reason and its
+#               value, judged neither pass nor miss (W2's binary figure on a
+#               binary W2 is not measured on)
+#   unsupported optional: the reason no run can measure the figure; it reads
+#               unsupported-on-this-build with that reason once its state ran
+#               and its gate held, which leaves the run incomplete
 #
 # Expressions may call min, max and day_part_bound(S, factor=1), ADR-3939's
 # T(S) + 100 leaf GETs per day part (evaluate.py says how it rounds).
@@ -2067,7 +2075,10 @@ source = "predicted"
 # sealed_day_previous_leaf_gets: the leaf PUTs and previous-leaf GETs the
 # fold issued for a part whose single UTC day the previous HEAD already held
 # sealed (a day's own sealing fold counts 0), so a sealed day it re-encoded
-# shows here.
+# shows here. Both are gated on W2's binary figure being 0 (a binary carrying
+# R2), as W3's and W8's are: on a C1-not-R2 binary they are not-run and not
+# requested, and on a run that does not list retired_hour they are not
+# requested with it.
 requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
@@ -2078,6 +2089,9 @@ state = "day_parts_7"
 transition = "day_parts_7_advance"
 metric = "fold.dp7.logs.sealed_day_leaf_puts"
 lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "A3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
 target_if = "v == 0"
 
 [[row.figure]]
@@ -2087,6 +2101,9 @@ state = "day_parts_7"
 transition = "day_parts_7_advance"
 metric = "fold.dp7.logs.sealed_day_previous_leaf_gets"
 lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "A3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
 target_if = "v == 0"
 
 [[row]]
@@ -2099,16 +2116,18 @@ miss = "any difference"
 source = "predicted"
 # Two folds of the same entry set: the 7-day state's own fold and a second
 # fold of the same tenant from the same commits (transition
-# day_parts_7_refold), each reporting head_digest, the blake3 of the HEAD
-# bytes in effect after it (written, or read back on a no-op). HEAD bytes
-# carry the folder's id and clock, so two folds that each publish never share
-# a digest: the refold matches only by finding nothing to fold. The
-# switch-off partition figure is the fold report's
-# switch_off_partition_changed: the UTC days whose published spans differ
-# from the switch-off partition (entry-count cuts only) of that day's entries
-# alone, counted on a leaf-building fold. That the
-# switch-off build's own partition is unchanged is a code property the
-# partition tests pin, not a figure a run can read.
+# day_parts_7_refold), each reporting head_digest, the blake3 of the HEAD in
+# effect after it (written, or read back on a no-op) re-encoded with its
+# folder id and creation time cleared, so the digest does not depend on which
+# folder wrote the HEAD or when. No fold path re-encodes an unchanged entry
+# set: a refold of the same hours is a no-op that returns the HEAD it read, a
+# later fold moves the watermark, --rebuild-key-index writes no part, and a
+# second tenant changes every hash. The refold's digest matches the first by
+# reading the same HEAD back, which says nothing about determinism, so
+# heads_differ is unsupported. That the switch-off partition is unchanged is
+# pinned by D1's partition unit tests in crates/ravel-catalog/src/fold.rs and
+# is not measurable in a run, so that figure is unsupported too. Every figure
+# is gated on W2's binary figure being 0, as A3's are.
 requires_tenant = "dp7"
 requires_states = ["day_parts_7"]
 
@@ -2119,6 +2138,9 @@ state = "day_parts_7"
 transition = "day_parts_7"
 metric = "fold.dp7.logs.head_digest"
 lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
 target_if = "isinstance(v, str) and len(v) > 0"
 
 [[row.figure]]
@@ -2128,6 +2150,9 @@ state = "day_parts_7"
 transition = "day_parts_7_refold"
 metric = "fold.dp7.logs.head_digest"
 lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
 target_if = "isinstance(v, str) and len(v) > 0"
 
 [[row.figure]]
@@ -2137,6 +2162,10 @@ state = "day_parts_7"
 metric = "derived"
 expr = "1 if m['adr3939_a4.head_digest'] != m['adr3939_a4.refold_head_digest'] else 0"
 lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+unsupported = "no fold path re-encodes an unchanged entry set: a same-hours refold returns the HEAD it read, so equal digests do not show determinism"
 target_if = "v == 0"
 
 [[row.figure]]
@@ -2146,6 +2175,10 @@ state = "day_parts_7"
 transition = "day_parts_7"
 metric = "fold.dp7.logs.switch_off_partition_changed"
 lane = "counter"
+not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
+not_run_reason = "A4 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
+gate_not_requested = true
+unsupported = "the switch-off partition is pinned by D1's unit tests and is not measurable in a run"
 target_if = "v == 0"
 
 [[row]]
@@ -2527,12 +2560,13 @@ source = "predicted; fold.rs `PreviousTail::from_head` and `feed_carried_key_ind
 # fold fields are read from: key_index_leaf_gets, the report's
 # key_index_unchanged_section_gets (section GETs for entries a previous
 # leaf already held) and key_index_leaf_bytes_written. The binary figure is
-# 1 on a binary carrying C1 and not R2 and 0 on one carrying R2, both
-# passing: it is the gate, not the measurement, and W3 and W8 read the same
-# figure for `== 0`. On a 0 the three fold figures are not-run and listed
-# not requested (gate_not_requested), never a miss, so a run on the R2
-# build that holds retired_hour for W3 and W8 is not failed by W2; a binary
-# carrying no C1 leaves every figure not-run and not requested with its SHA.
+# 1 on a binary carrying C1 and not R2, passing, and 0 on one carrying R2,
+# listed not requested (not_requested_if): it is the gate, not the
+# measurement, and A3, A4, W3 and W8 read the same figure for `== 0`. On a 0
+# the three fold figures are not-run and listed not requested
+# (gate_not_requested), so no W2 figure passes or misses on the R2 build that
+# holds retired_hour for W3 and W8; a binary carrying no C1 leaves every
+# figure not-run and not requested with its SHA.
 requires_tenant = "dp7"
 requires_states = ["retired_hour"]
 
@@ -2542,6 +2576,8 @@ statement = "stamp"
 state = "retired_hour"
 metric = "stamp.fold_binary_pre_r2.logs"
 lane = "counter"
+not_requested_if = "v == 0"
+not_requested_reason = "W2 is measured only on a fold binary that carries C1 and not R2 (the harness-state amendment)"
 target_if = "v in (0, 1)"
 
 [[row.figure]]
@@ -2593,9 +2629,10 @@ source = "predicted"
 # retired_hour), then the fold at the day's last tombstone (transition
 # retired_hour_drop). box/run.sh state_retired_hour stamps the tombstoned
 # hour (stamps/retired_hour.logs.tombstone.json hour). The part PUTs are
-# the fold report's snapshot_part_puts, which counts every part the fold
-# wrote, the open tail's included: a retired_hour fold that re-encodes the
-# tail reads a miss, which is the decision-6 claim. The leaves written and
+# the fold report's sealed_part_puts, the snapshot part PUTs of every part
+# but the open tail: the tail is re-encoded by every fold that publishes, so
+# counting it would read a miss on any such fold whatever decision 6 does
+# for the tombstoned hour's sealed part. The leaves written and
 # retired_hours come from the same --json report. retired_hour_segments is
 # stamps/retired_hour.logs.retired_resolve.json segments: after the fold,
 # box/run.sh resolves the tenant with `ravel-cli rlog footprint --tenant`
@@ -2617,7 +2654,7 @@ name = "part_puts"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour"
-metric = "fold.dp7.logs.snapshot_part_puts"
+metric = "fold.dp7.logs.sealed_part_puts"
 lane = "counter"
 not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
 not_run_reason = "W3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
@@ -2678,7 +2715,7 @@ name = "drop_part_puts"
 statement = "fold"
 state = "retired_hour"
 transition = "retired_hour_drop"
-metric = "fold.dp7.logs.snapshot_part_puts"
+metric = "fold.dp7.logs.sealed_part_puts"
 lane = "counter"
 not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
 not_run_reason = "W3 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
@@ -3016,10 +3053,11 @@ source = "predicted"
 # digest and retired_hours. Each fold's retired_hours must be exactly [h] for
 # W3's tombstoned hour h, so two folds that observed no tombstone (both [])
 # miss rather than agree. Both are read from the CLI fold's --json report:
-# head_digest is the blake3 of the HEAD object in effect after the fold
-# (its bytes carry the folder id and clock, so two folds that each write a
-# HEAD differ and only a no-op refold matches), retired_hours the HEAD's
-# union of every part's retired_hours. Every figure is gated on W2's binary
+# head_digest is A4's digest of the HEAD in effect after the fold, its folder
+# id and creation time cleared, and retired_hours the HEAD's union of every
+# part's retired_hours. heads_differ is unsupported for A4's reason: the
+# refold observing the same tombstones is a no-op that reads the same HEAD
+# back. Every figure is gated on W2's binary
 # figure being 0 (a binary carrying R2); on a C1-not-R2 binary they are
 # not-run and not requested while W2 is judged.
 requires_tenant = "dp7"
@@ -3059,6 +3097,7 @@ lane = "counter"
 not_run_unless = "m['adr3939_w2.fold_binary_pre_r2'] == 0"
 not_run_reason = "W8 runs only on a fold binary that carries R2 (the harness-state amendment), and the run stamps that binary's SHA"
 gate_not_requested = true
+unsupported = "no fold path re-encodes an unchanged entry set: a refold observing the same tombstones returns the HEAD it read, so equal digests do not show determinism"
 target_if = "v == 0"
 
 [[row.figure]]

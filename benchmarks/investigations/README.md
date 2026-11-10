@@ -1105,21 +1105,27 @@ After R2 a tombstoned hour in a sealed day takes the `retired_hours` path
 and is not re-encoded, so W2 means something only on a fold binary that
 carries C1 and not R2. Its first figure, `fold_binary_pre_r2`, reads
 `stamps/retired_hour.logs.fold_binary.json` (`sha`, `carries_c1`,
-`carries_r2`) and is 1 for C1 without R2 and 0 for a binary carrying R2;
-a stamp missing any of the three fields is `missing`. W2's other figures
-are `not-run` unless that figure is 1, and every W3 and W8 figure is
+`carries_r2`) and is 1 for C1 without R2, passing, and 0 for a binary
+carrying R2, which its `not_requested_if = "v == 0"` lists under `not
+requested` rather than judging, so no W2 figure passes on the R2 build; a
+stamp missing any of the three fields is `missing`. W2's other figures are
+`not-run` unless that figure is 1, and every A3, A4, W3 and W8 figure is
 `not-run` unless it is 0: the harness-state amendment measures W2 on the
-pre-R2 binary and W3 and W8 on the R2 build. A figure carrying
-`gate_not_requested = true` whose `not_run_unless` read every figure it
-names and came out false is listed under `not requested` with the gate's
-reason and the value it read (`adr3939_w2.fold_binary_pre_r2 1`), so a
-pre-R2 run is judged on W2 alone and neither fails nor goes incomplete on
-W3 or W8, and an R2 run the same way round. A binary carrying no C1 is one
-no row is measured on: the binary figure is `not-run` with the binary's SHA
-and what it carries, and every W2, W3 and W8 figure is `not-run` naming it,
-all listed under `not requested`. With no stamp at all the binary figure is
-`missing`, and every gated figure is `not-run` naming it and left on the
-incomplete list.
+pre-R2 binary and the rest on the R2 build. A3 and A4 sit above W2 in
+bands.toml, in the ADR's order, so evaluate.py builds a figure whose gate or
+expression reads a figure defined below it once that figure is built. A
+figure carrying `gate_not_requested = true` whose `not_run_unless` read
+every figure it names and came out false is listed under `not requested`
+with the gate's reason and the value it read
+(`adr3939_w2.fold_binary_pre_r2 1`), so a pre-R2 run is judged on W2 alone
+and neither fails nor goes incomplete on A3, A4, W3 or W8, and an R2 run
+the same way round. A run that does not list `retired_hour` leaves the
+binary figure, and so A3 and A4 with it, not requested. A binary carrying
+no C1 is one no row is measured on: the binary figure is `not-run` with the
+binary's SHA and what it carries, and every A3, A4, W2, W3 and W8 figure is
+`not-run` naming it, all listed under `not requested`. With no stamp at all
+the binary figure is `missing`, and every gated figure is `not-run` naming
+it and left on the incomplete list.
 
 `state_retired_hour` writes the stamp with `inv.py fold-binary` before its
 first tombstone, and fails the state when the stamp cannot be written. The
@@ -1149,8 +1155,9 @@ writes the same stamp, which no figure reads.
 ### W3's drop and W8's retired hours
 
 W3's "the part leaves HEAD with 0 PUTs at the day's last tombstone" is
-three figures, not two: 0 part PUTs (`snapshot_part_puts`, every part
-the fold wrote, a day part or the tail) and 0 leaf PUTs in the drop fold's
+three figures, not two: 0 part PUTs (`sealed_part_puts`, every part the
+fold wrote but the open tail, which every publishing fold re-encodes) and 0
+leaf PUTs in the drop fold's
 report (transition `retired_hour_drop`), and `drop_parts_holding_hour`, the
 number of parts in the catalog stamp taken after that fold
 (`stamps/retired_hour_drop.logs.catalog.json`) whose hour range holds the
@@ -1164,25 +1171,27 @@ W8's two folds each report `retired_hours`, the union of the hours the
 HEAD in effect after the fold retires across its parts, and each must
 equal `[h]` for W3's tombstoned hour `h`, besides being identical: two
 folds that observed no tombstone report `[]` alike and miss. A4's and W8's
-`head_digest` is the blake3 of that HEAD object's bytes (hex), and must be
-a non-empty string, so two empty digests do not read as identical HEADs.
+`head_digest` is the blake3 (hex) of that HEAD re-encoded with its folder id
+and creation time cleared, and must be a non-empty string. Their
+`heads_differ` is unsupported: no fold path re-encodes an unchanged entry
+set (a same-hours refold is a no-op that returns the HEAD it read, a later
+fold moves the watermark, `--rebuild-key-index` writes no part, and a second
+tenant changes every hash), so two equal digests show the refold read the
+same HEAD back, not that the fold is deterministic.
 
 ### Where these rows' fold figures come from
 
 `ravel-cli catalog fold --json` writes these `FoldReport` fields, counted
 where the fold issues the request, and the text report prints them:
 
-- `snapshot_part_puts`: snapshot part PUTs, one per part re-encoded, a day
-  part or the tail, summed over attempts (W3's part PUTs).
+- `sealed_part_puts`: snapshot part PUTs of parts other than the open
+  tail, summed over attempts (W3's part PUTs).
 - `sealed_day_leaf_puts` and `sealed_day_previous_leaf_gets`: the leaf
   PUTs, and the previous-leaf GETs, of re-encoded parts of a UTC day the
   HEAD the fold read had already sealed (A3); a day sealed for the first
   time, and the tail, count in neither.
 - `key_index_unchanged_section_gets`: KEY_IDX section GETs for entries the
   previous leaves already covered (W2).
-- `switch_off_partition_changed`: UTC days whose published parts differ
-  from the parts the switch-off rule alone gives them, so 0 when the day
-  seal only added midnight boundaries (A4).
 - `head_digest` and `retired_hours` (A4, W8, W3), as above.
 
 A report without one of them is `missing`: they are on no allowlist,
@@ -1200,9 +1209,14 @@ no source writes their field: the per-day-part leaf GETs of A7, W5 and F3
 `crates/ravel-sql/src/stats_json.rs` does not write), F3's SlowDown
 responses (`io.s3SlowDownResponses`, which nothing counts), and W6's leaf
 round trips (`stats.keyIndex.leafRoundTrips`, likewise unwritten).
-`test_adr3939_unsupported_figures_are_these` derives that set from
-`FoldReport`, `stats_json.rs`, `box/run.sh` and evaluate.py's tables and
-pins it.
+Three more carry `unsupported = "<reason>"` in bands.toml, because no run
+can measure them: A4's and W8's `heads_differ`, for the reason above, and
+A4's `switch_off_partition_changed`, since the switch-off partition is
+pinned by D1's unit tests in `crates/ravel-catalog/src/fold.rs` and is not
+measurable in a run. Each reads unsupported with its reason once its state
+ran and its gate held. `test_adr3939_unsupported_figures_are_these` derives
+those ten from `FoldReport`, `stats_json.rs`, `box/run.sh`, bands.toml and
+evaluate.py's tables and pins the set.
 
 The `retired_hour` and `retired_hour_drop` folds are `ravel-cli catalog
 fold --json` runs, like every other fold, so W2, W3 and W8 read their
@@ -1216,8 +1230,9 @@ it has no value to judge (`unsupported-on-this-build`, `refused-by-guard`,
 `refused` or `missing`), as row 18's do, rather than letting the run pass
 without it: a fold report that lacks a field these rows read, or a
 per-part figure evaluate.py does not read, shows as incomplete, never as
-a pass. A run holding a multi-day state is therefore incomplete until the
-server carries the seven fields above.
+a pass. A run holding a multi-day state is therefore incomplete: until the
+server carries the seven fields above, and always on the three declared
+figures.
 
 ## Unsupported on this build
 
@@ -1230,7 +1245,8 @@ server carries the seven fields above.
   `pruning.skipIdxDropped`, the per-object and per-part breakdowns, and the
   fold report's `key_index_build_passes`, `key_index_sections_read`,
   `key_index_leaf_gets` and `head_bytes_per_part_field` (ADR-3939's rows
-  add the seven listed under "Unsupported figures in these rows"): when one
+  add the ten listed under "Unsupported figures in these rows", three of
+  them declared unsupported in bands.toml on every build): when one
   is absent from
   a build's output its figures are unsupported with that reason (the
   allowlist above). Main's fold report writes the first three; a build
@@ -1449,23 +1465,31 @@ at S 26 while the total holds, a missing breakdown is unsupported, and A7's
 total is `not-run` at 29 parts; fails with W5's per-part figure held to
 the 30-day total or A7 judged on 29 parts),
 `test_w2_requires_pre_r2_binary_stamp` (no stamp or no SHA: the binary
-figure missing and the rest `not-run`; C1 with R2: the binary 0 and the
-rest `not-run`, not requested; no C1: `not-run`, not requested; no W2 miss
-and nothing incomplete; C1 without R2 passes; fails with an R2 binary read
-as W2's, a binary carrying no C1 read as the R2 build, or a stamp figure's
-`not-run` left off `not_requested`),
-`test_w3_w8_gated_on_r2_binary` (C1 without R2: W2 passes and all fourteen
-W3 and W8 figures are `not-run`, not requested, naming
-`fold_binary_pre_r2 1`; R2: every W3 and W8 figure passes and W2's are not
-requested; neither run misses or is incomplete; no stamp: every W3 and W8
-figure `not-run` and incomplete; fails with the gate's not requested
-dropped, W3's part PUTs or W8's digest ungated, W3's segments without
-`gate_not_requested`, or W3's part PUTs read off `key_index_part_puts`),
+figure missing and the rest `not-run`; C1 with R2: the binary 0, judged
+neither pass nor miss, and it and the rest not requested; no C1: `not-run`,
+not requested; no W2 figure judged and nothing incomplete; C1 without R2
+passes; fails with an R2 binary read as W2's, a binary carrying no C1 read
+as the R2 build, a stamp figure's `not-run` left off `not_requested`, or the
+binary's `not_requested_if` dropped from bands.toml or ignored by
+evaluate.py),
+`test_w3_w8_gated_on_r2_binary` (C1 without R2: W2 passes and all twenty
+A3, A4, W3 and W8 figures are `not-run`, not requested, naming
+`fold_binary_pre_r2 1`, and nothing is incomplete; R2: every A3, A4, W3 and
+W8 figure but the three declared unsupported passes, those three read
+unsupported with their reasons and are exactly the incomplete list, and all
+four W2 figures are not requested, none passing; no stamp: every A3, A4, W3
+and W8 figure `not-run` and incomplete; fails with the gate's not requested
+dropped, A3's leaf PUTs, A4's digest, W3's part PUTs or W8's digest
+ungated, W3's segments without `gate_not_requested`, W3's part PUTs read
+off `key_index_part_puts`, a declared `unsupported` dropped from A4's or
+W8's `heads_differ` or A4's switch-off figure, evaluate.py ignoring
+`unsupported`, or a gate on a figure defined below it read before that
+figure is built),
 `test_w3_retired_hour_segments_reads_resolve_stamp` (0 of 12 passes, 2
 misses, another hour, an empty resolve or no stamp each missing; fails
 with either check dropped),
-`test_adr3939_unsupported_figures_are_these` (the seven figures above,
-each allowlisted; fails on main's `FoldReport` and `run.sh`, and with the
+`test_adr3939_unsupported_figures_are_these` (the ten figures above, each
+allowlisted or declared; fails on main's `FoldReport` and `run.sh`, and with the
 segments stamp read under a kind run.sh never writes),
 `test_w3_drop_leaves_head` (a part `96..=119` left after the drop misses
 for tombstoned hour 100, its removal passes, an absent drop stamp is
