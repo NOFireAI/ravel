@@ -620,11 +620,17 @@ D3' is three self-terminating runs, each with one binary:
   on W5.
 - Run C: `measure/3939-w2`, with day_parts_7 and retired_hour, for W2 only.
 
-Run C's verdict is read for W2 alone. Its binary predates R2, so its fold
-report has no `retired_hours` field. W3's and W8's `retired_hours` figures,
-which the retired_hour state makes live, therefore read
-`unsupported-on-this-build` there. The harness lists them as incomplete,
-so run C ends `incomplete`. That outcome is expected, and it counts only
-when the incomplete list names no figure other than W3's and W8's
-retired-hours figures. Every other row run C would judge is judged in run
-A on the R2 build.
+Run C judges W2 alone. Its binary predates R2. On such a binary the
+retired_hour state's tombstone re-encodes the sealed day, which is what
+W2 measures. That same re-encode would miss W3's and W8's figures, and
+their `retired_hours` fields would read unsupported. So task H1c (#4098)
+gates W3's and W8's figures on the fold binary carrying R2. The gate is
+the mirror of W2's, with the same not_requested placement: on run C they
+are not requested rather than judged.
+
+H1c also gives a source to every fold-report figure the harness reads
+that no build writes yet. Run C's branch takes H1c's fold-report commit
+by cherry-pick, since W2's figures read it. D3' launches only after H1c
+lands. Then each run's verdict is judged as the harness reports it, and
+the only figures still unsupported are `SlowDown` and the per-day-part
+leaf GETs, each with its reason.
