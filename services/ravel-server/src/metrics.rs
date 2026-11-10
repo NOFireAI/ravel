@@ -3215,7 +3215,7 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     write_header(
         out,
         "ravel_catalog_isolation_breach_total",
-        "Hard-failed queries from a HEAD/postings tenant_hash mismatch or an out-of-prefix listing result (ADR-0050 section 2).",
+        "Isolation faults from a HEAD, snapshot part or postings tenant_hash mismatch or an out-of-prefix listing result (ADR-0050 section 2): each fails its query, fold tick or scrub check, except an on-demand fold entry comparison, which treats the snapshot as changed.",
         "counter",
     );
     write_sample(
