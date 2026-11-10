@@ -3664,7 +3664,7 @@ const FOLD_KEY_INDEX_FAMILIES: [(&str, &str); 4] = [
     ),
     (
         "ravel_catalog_fold_key_index_leaf_gets_total",
-        "GETs of previous parts' key-index leaves the fold issued to carry their pairs forward, one per leaf.",
+        "GETs of previous parts' key-index leaves the fold issued to carry their pairs forward, one per (field, slice) a build fetches, and another when a field's rebuild fetches a released slice again.",
     ),
 ];
 

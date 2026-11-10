@@ -337,7 +337,7 @@ async fn a_leaf_building_fold_renders_the_key_index_build_families() {
         ),
         (
             "ravel_catalog_fold_key_index_leaf_gets_total",
-            "GETs of previous parts' key-index leaves the fold issued to carry their pairs forward, one per leaf.",
+            "GETs of previous parts' key-index leaves the fold issued to carry their pairs forward, one per (field, slice) a build fetches, and another when a field's rebuild fetches a released slice again.",
             1,
         ),
     ] {

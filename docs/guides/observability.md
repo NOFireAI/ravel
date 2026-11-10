@@ -947,7 +947,7 @@ either route. All four stay at zero with the switch off.
 | `ravel_catalog_fold_key_index_sections_read_total` | `mode` | KEY_IDX sections the build read, one per entry per build pass. An entry carried from a previous part's leaves reads none. |
 | `ravel_catalog_fold_key_index_entries_carried_total` | `mode` | Entries whose pairs the build carried from the leaves of the previous parts their part overlaps, matched by data object key, instead of reading their sections. |
 | `ravel_catalog_fold_key_index_build_passes_total` | `mode` | Build passes over disjoint key8 ranges: one per re-encoded part whose every field fits its share (`--fold-key-index-build-max-pairs` divided by the fields the build indexes), one per key8 range above it, and the ranges of a field rebuilt after a pass found a new uncovered entry. |
-| `ravel_catalog_fold_key_index_leaf_gets_total` | `mode` | GETs of previous parts' leaves issued to carry their pairs, one per leaf. |
+| `ravel_catalog_fold_key_index_leaf_gets_total` | `mode` | GETs of previous parts' leaves issued to carry their pairs, one per (field, slice) a build fetches, and another when a field's rebuild fetches a released slice again. |
 
 On a tenant whose tail advances every fold, sections read should track the
 new entries per fold plus the entries that stay uncovered, not the tail's
