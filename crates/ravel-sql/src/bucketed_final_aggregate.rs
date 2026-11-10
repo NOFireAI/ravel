@@ -87,9 +87,11 @@
 //!
 //! # Bucket spill (ADR-3565 amendment 2)
 //!
-//! [`BucketedFinalAggregateExec::with_spill`] is the refusal retry's mode: the
-//! consumer registers `with_can_spill(true)` and a refused charge is a spill
-//! trigger instead of an error. The stream writes every chunk it retains, for
+//! [`BucketedFinalAggregateExec::with_spill`] is the mode the refusal retry is
+//! to run the exec in; nothing outside tests sets it until T3 #4075 wires it.
+//! With it, and a disk manager that allows temp files, the consumer
+//! registers `with_can_spill(true)` and a refused charge is a spill trigger
+//! instead of an error. The stream writes every chunk it retains, for
 //! every bucket it has not started aggregating, to that bucket's scratch
 //! file, releases their charge and asks again; from then on each chunk is
 //! written when it fills and each bucket's last chunk when input ends. A

@@ -2057,13 +2057,15 @@ fn scaled(trigger: Trigger, share: (usize, usize)) -> Trigger {
 
 /// The write-once disk bound of ADR-3565 amendment 2, item 2, checked on a
 /// run whose routed rows are `row_bytes` wide over `columns` columns, at
-/// `buckets` buckets over all streams: every routed row written exactly once,
+/// `buckets` buckets over all streams: every routed row written at most once
 /// (a refusal while phase 2 drains writes only the later buckets' chunks),
-/// read back exactly once, the column bytes exactly `spilled_rows x w` plus
-/// validity, and the framing at most `FRAMING_PER_MESSAGE` per IPC message,
-/// whose count is itself bounded by the routed chunks, the partly filled
-/// chunks each refusal and each stream's end write, and, after a phase 1
-/// trigger, the forced slices' pieces.
+/// every written row read back once, the bytes written at most
+/// `spilled_rows x w` plus validity plus `FRAMING_PER_MESSAGE` per IPC
+/// message and per file, and, uncompressed, at least `spilled_rows x w`; the
+/// message count at least the file count and at most the routed chunks, the
+/// partly filled chunks each refusal and each stream's end write, and, after
+/// a phase 1 trigger, the forced slices' pieces; and from 1 to `buckets`
+/// files.
 fn assert_within_write_once_bound(
     what: &str,
     run: &SpillRun,
