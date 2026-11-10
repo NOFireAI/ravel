@@ -2705,15 +2705,24 @@ async fn check_key_case(case: KeyCase) {
     // The phase 1 cap follows the case's groups at twice the unique
     // fixture's bytes per group, so a bucket's table always fits it: a cap
     // under one bucket's table is the typed under-shoot, not a spill case.
+    // Each stream's cap is also kept above one batch's table working set,
+    // about 390 KB at 8192 rows whatever the groups or the partitions, plus
+    // what the stream retains beside it.
+    const STREAM_FLOOR: usize = 768 << 10;
     let trigger = if case.phase_1 {
         let groups = (case.modulus as usize).min(SAMPLES as usize);
         let scaled = scaled(PHASE_1, (2 * groups, SAMPLES as usize));
         Trigger {
-            cap_at_two: scaled.cap_at_two.max(128 << 10),
+            cap_at_two: scaled
+                .cap_at_two
+                .max(STREAM_FLOOR * case.partitions / 2),
             ..scaled
         }
     } else {
-        PHASE_2
+        Trigger {
+            cap_at_two: PHASE_2.cap_at_two.max(STREAM_FLOOR),
+            ..PHASE_2
+        }
     };
     let planned = Planned::new(
         &sql,
