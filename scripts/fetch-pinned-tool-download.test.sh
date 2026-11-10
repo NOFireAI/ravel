@@ -42,6 +42,26 @@ while [ "$i" -lt "${#args[@]}" ]; do
     fi
     i=$((i + 1))
 done
+max_time=""
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+    if [ "${args[$i]}" = "--max-time" ]; then
+        max_time="${args[$((i + 1))]}"
+    fi
+    i=$((i + 1))
+done
+if [ -n "${STUB_CURL_MAXTIME_LOG_FILE:-}" ]; then
+    echo "$max_time" >>"$STUB_CURL_MAXTIME_LOG_FILE"
+fi
+# A slow attempt advances the fake clock by STUB_CURL_SECONDS, cut at
+# --max-time as the real curl would cut it.
+if [ -n "${STUB_CLOCK_FILE:-}" ]; then
+    spent="${STUB_CURL_SECONDS:-0}"
+    if [ -n "$max_time" ] && [ "$spent" -gt "$max_time" ]; then
+        spent="$max_time"
+    fi
+    echo $(($(cat "$STUB_CLOCK_FILE") + spent)) >"$STUB_CLOCK_FILE"
+fi
 count_file="${STUB_CURL_COUNT_FILE:?STUB_CURL_COUNT_FILE unset}"
 count=0
 [ -f "$count_file" ] && count="$(cat "$count_file")"
@@ -65,18 +85,33 @@ set -u
 if [ -n "${STUB_SLEEP_LOG_FILE:-}" ]; then
     echo "$1" >>"$STUB_SLEEP_LOG_FILE"
 fi
+if [ -n "${STUB_CLOCK_FILE:-}" ]; then
+    echo $(($(cat "$STUB_CLOCK_FILE") + $1)) >"$STUB_CLOCK_FILE"
+fi
 exit 0
 STUB
 chmod +x "$FAKEBIN/sleep"
+
+# A fake `date +%s`: the seconds in STUB_CLOCK_FILE, or a clock stopped at 0
+# when a case does not set one, so only the budget case sees time pass.
+cat >"$FAKEBIN/date" <<'STUB'
+#!/usr/bin/env bash
+if [ -n "${STUB_CLOCK_FILE:-}" ]; then
+    cat "$STUB_CLOCK_FILE"
+else
+    echo 0
+fi
+STUB
+chmod +x "$FAKEBIN/date"
 
 # --- case 1: fails four times and succeeds on the fifth --------------------
 # FLIP: STUB_CURL_FAIL_COUNT=4 means the fifth curl call is the first success.
 # Lowering it to 3 (success on the fourth call) would let this case pass with
 # only four calls recorded -- the opposite of what it is meant to pin, that
 # the script actually drives all five attempts before giving up on four
-# failures. Asserting call_count -eq 5 is what catches that flip. The tmp-file
-# assertion pins that a successful run leaves no partial-download file beside
-# the real one.
+# failures. Asserting call_count -eq 5 is what catches that flip. Partial-file
+# cleanup is case 2's to pin: here the final mv consumes the tmp file whether
+# or not failed attempts removed theirs.
 dest1="$TMP/case1/dest"
 mkdir -p "$(dirname "$dest1")"
 count_file1="$TMP/case1/count"
@@ -88,12 +123,11 @@ out1="$(PATH="$FAKEBIN:$PATH" \
 rc1=$?
 call_count1="$(cat "$count_file1" 2>/dev/null || echo 0)"
 if [ "$rc1" -eq 0 ] && [ "$call_count1" -eq 5 ] \
-    && [ -f "$dest1" ] && [ "$(cat "$dest1")" = "pinned-tool-bytes" ] \
-    && [ ! -e "$dest1.download" ]; then
-    pass "fails four times, succeeds on the fifth, no tmp file left behind"
+    && [ -f "$dest1" ] && [ "$(cat "$dest1")" = "pinned-tool-bytes" ]; then
+    pass "fails four times, succeeds on the fifth"
 else
-    fail "fails four times, succeeds on the fifth, no tmp file left behind" \
-        "rc=$rc1 calls=$call_count1 dest-present=$([ -f "$dest1" ] && echo yes || echo no) tmp-present=$([ -e "$dest1.download" ] && echo yes || echo no)"
+    fail "fails four times, succeeds on the fifth" \
+        "rc=$rc1 calls=$call_count1 dest-present=$([ -f "$dest1" ] && echo yes || echo no)"
     printf '%s\n' "$out1" | sed 's/^/    /'
 fi
 
@@ -203,6 +237,63 @@ if [ "$rc4" -ne 0 ] && [ "$sleeps4" = "1 2 4 8" ]; then
 else
     fail "backoff doubles 1 2 4 8 across five attempts" "rc=$rc4 sleeps=[$sleeps4]"
     printf '%s\n' "$out4" | sed 's/^/    /'
+fi
+
+# --- case 5: the default schedule is 10 20 40 80 ----------------------------
+# FLIP: a default base delay other than 10 (the variable unset here, as in
+# every real caller) changes this log; cases 1-4 all set the override and
+# never see the default.
+dest5="$TMP/case5/dest"
+mkdir -p "$(dirname "$dest5")"
+sleep_log5="$TMP/case5/sleep.log"
+: >"$sleep_log5"
+out5="$(PATH="$FAKEBIN:$PATH" \
+    STUB_CURL_COUNT_FILE="$TMP/case5/count" STUB_CURL_FAIL_COUNT=5 \
+    STUB_SLEEP_LOG_FILE="$sleep_log5" \
+    env -u FETCH_PINNED_TOOL_RETRY_DELAY_S -u FETCH_PINNED_TOOL_BUDGET_S \
+    bash "$SCRIPT" demo-tool http://example.invalid/always-down.tar.gz "$dest5" 2>&1)"
+rc5=$?
+sleeps5="$(tr '\n' ' ' <"$sleep_log5" | sed 's/[[:space:]]*$//')"
+if [ "$rc5" -ne 0 ] && [ "$sleeps5" = "10 20 40 80" ]; then
+    pass "default backoff is 10 20 40 80"
+else
+    fail "default backoff is 10 20 40 80" "rc=$rc5 sleeps=[$sleeps5]"
+    printf '%s\n' "$out5" | sed 's/^/    /'
+fi
+
+# --- case 6: slow failures stop at the default 240 s budget ------------------
+# Every attempt hangs until --max-time. On the fake clock: attempt 1 is cut at
+# 120 s, the 10 s backoff runs, attempt 2 is cut at the 110 s left, and the
+# 20 s backoff would pass the deadline, so the script stops at 240 s after two
+# attempts. FLIP: the attempt-count loop alone runs five 120 s attempts and
+# 150 s of backoff, 750 s; a loop that checks the budget only before sleeping
+# still starts attempt 2 with a 120 s cap and ends at 250 s; a loop that
+# checks it only before each attempt sleeps the 20 s first. Each one moves the
+# clock, the curl count or the cap log off the values asserted here.
+dest6="$TMP/case6/dest"
+mkdir -p "$(dirname "$dest6")"
+clock6="$TMP/case6/clock"
+echo 1000 >"$clock6"
+maxtime_log6="$TMP/case6/maxtime.log"
+: >"$maxtime_log6"
+out6="$(PATH="$FAKEBIN:$PATH" \
+    STUB_CURL_COUNT_FILE="$TMP/case6/count" STUB_CURL_FAIL_COUNT=5 \
+    STUB_CURL_SECONDS=1000 STUB_CLOCK_FILE="$clock6" \
+    STUB_CURL_MAXTIME_LOG_FILE="$maxtime_log6" \
+    env -u FETCH_PINNED_TOOL_RETRY_DELAY_S -u FETCH_PINNED_TOOL_BUDGET_S \
+    bash "$SCRIPT" demo-tool http://example.invalid/slow.tar.gz "$dest6" 2>&1)"
+rc6=$?
+elapsed6=$(($(cat "$clock6") - 1000))
+calls6="$(cat "$TMP/case6/count" 2>/dev/null || echo 0)"
+caps6="$(tr '\n' ' ' <"$maxtime_log6" | sed 's/[[:space:]]*$//')"
+if [ "$rc6" -ne 0 ] && [ "$elapsed6" -eq 240 ] && [ "$calls6" -eq 2 ] \
+    && [ "$caps6" = "120 110" ] && [ ! -e "$dest6" ] \
+    && contains "$out6" "after 2 attempts within a 240s budget"; then
+    pass "slow failures stop at the 240 s budget"
+else
+    fail "slow failures stop at the 240 s budget" \
+        "rc=$rc6 elapsed=$elapsed6 calls=$calls6 caps=[$caps6]"
+    printf '%s\n' "$out6" | sed 's/^/    /'
 fi
 
 echo
