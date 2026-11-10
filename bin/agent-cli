@@ -969,8 +969,10 @@ def headroom_invocations(lines):
             continue
         if text.lstrip().startswith("#"):
             continue
-        # A lone & is a separator unless it is part of a redirection (2>&1).
-        spaced = re.sub(r"(&&|\|\||;|\||(?<![<>])&(?![\d-])|\(|\)|\{|\})", r" \1 ", text)
+        # A lone & is a separator unless it is part of a redirection (2>&1);
+        # braces are separators unless they belong to a ${VAR} expansion.
+        spaced = re.sub(r"(\$\{[^{}]*\})|(&&|\|\||;|\||(?<![<>])&(?![\d-])|\(|\)|\{|\})",
+                        lambda m: m.group(1) or " " + m.group(2) + " ", text)
         try:
             words = shlex.split(spaced, comments=False, posix=True)
         except ValueError:
@@ -1031,12 +1033,14 @@ def spec_head_values(spec):
     # position, and neither is a report echoed on the same line.
     unfilled = re.compile(re.escape(HEADROOM_SCRIPT) + r"\s+\S+\s+[\"']?"
                           + re.escape(DISK_FLOOR_PLACEHOLDER))
+    named = set()
     for i, line in enumerate(lines, 1):
         if unfilled.search(line):
+            named.add(i)
             problems.append(f"line {i} still has the unfilled {DISK_FLOOR_PLACEHOLDER} "
                             f"placeholder beside {HEADROOM_SCRIPT}")
     for i, floor_arg in headroom_invocations(lines):
-        if floor_arg is not None and DISK_FLOOR_PLACEHOLDER in floor_arg:
+        if i in named:
             continue
         if floor_arg is None:
             problems.append(f"line {i} runs {HEADROOM_SCRIPT} without a floor argument")
