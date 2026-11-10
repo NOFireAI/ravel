@@ -195,7 +195,9 @@ pub const BUCKET_SPILL_UNDERSHOOT: &str = "bucket spill under-shoot";
 const SPILL_MODE_SHARE_PHRASES: [&str; 2] = ["over the spill-mode cap", "over its fair share"];
 
 /// The name of the exec's counter of the Arrow bytes decoded from its scratch
-/// files on read-back.
+/// files on read-back: buffer lengths after decompression, which the
+/// lz4_frame-compressed file bytes DataFusion's `spilled_bytes` counts do not
+/// equal.
 pub const BUCKET_SPILL_BYTES_READ: &str = "bucket_spill_bytes_read";
 
 /// The name of the exec's counter of the rows decoded from its scratch files
@@ -384,6 +386,16 @@ impl BucketedFinalAggregateExec {
         self.spill
     }
 
+    /// Whether a partition of this exec has executed with spill on and a
+    /// disk manager that allows temp files: `execute` registers the spill
+    /// counters only then. False before the first `execute`.
+    pub fn spill_available(&self) -> bool {
+        self.metrics
+            .clone_inner()
+            .iter()
+            .any(|metric| metric.value().name() == BUCKET_SPILL_BYTES_READ)
+    }
+
     /// Cut each routed bucket's output to its own top `topk.fetch()` rows
     /// under `topk.ordering()` (see the module docs). A TopK whose sort keys
     /// are not all bare columns of this exec's output, by index and name, is
@@ -418,6 +430,9 @@ pub(crate) struct BucketSpillFigures {
     pub(crate) bits: u8,
     pub(crate) routed_chunk_rows: usize,
     pub(crate) bytes_read: u64,
+    /// Whether any of them executed with a disk manager that allows temp
+    /// files ([`BucketedFinalAggregateExec::spill_available`]).
+    pub(crate) disk: bool,
 }
 
 /// [`BucketSpillFigures`] of `plan`, or `None` when no bucketed exec in it
@@ -452,8 +467,10 @@ fn collect_bucket_spill_figures(
             bits: exec.config.bits,
             routed_chunk_rows: exec.config.routed_chunk_rows,
             bytes_read: 0,
+            disk: false,
         });
         figures.bytes_read += bytes_read;
+        figures.disk |= exec.spill_available();
     }
     for child in plan.children() {
         collect_bucket_spill_figures(child, found);
@@ -1167,6 +1184,22 @@ struct ReadBack {
     _file: Arc<dyn SpillFile>,
 }
 
+/// The Arrow bytes `batch` decodes to: each buffer's length and `ceil(n/8)`
+/// per validity bitmap, not the capacity of the allocation a buffer shares,
+/// and not the compressed bytes in the file.
+fn decoded_bytes(batch: &RecordBatch) -> usize {
+    fn data_bytes(data: &ArrayData) -> usize {
+        data.buffers().iter().map(Buffer::len).sum::<usize>()
+            + data.nulls().map_or(0, |nulls| nulls.len().div_ceil(8))
+            + data.child_data().iter().map(data_bytes).sum::<usize>()
+    }
+    batch
+        .columns()
+        .iter()
+        .map(|column| data_bytes(&column.to_data()))
+        .sum()
+}
+
 /// Whether `err` is a pool refusal, the only error a spill answers.
 fn is_refusal(err: &DataFusionError) -> bool {
     matches!(err, DataFusionError::ResourcesExhausted(_))
@@ -1562,7 +1595,7 @@ impl BucketedStream {
         let _timer = elapsed.timer();
         self.read_back_bytes = batch.get_array_memory_size();
         if let Some(spill) = self.spill.as_ref() {
-            spill.bytes_read.add(self.read_back_bytes);
+            spill.bytes_read.add(decoded_bytes(batch));
             spill.rows_read.add(batch.num_rows());
         }
         self.charge_table()?;

@@ -5911,10 +5911,10 @@ impl FirstRefusal {
         SpillRetryReport {
             first_refusal: self.class,
             first_refusal_after: self.after,
-            retry_plan: if bucket.is_some() {
-                "bucket"
-            } else {
-                "sort_merge"
+            retry_plan: match bucket {
+                Some(bucket) if bucket.disk => "bucket",
+                Some(_) => "bucket_without_disk",
+                None => "sort_merge",
             },
             bits: bucket.map(|bucket| bucket.bits),
             routed_chunk_rows: bucket.map(|bucket| bucket.routed_chunk_rows),
@@ -5945,7 +5945,9 @@ pub struct SpillRetryReport {
     /// resolve included.
     pub first_refusal_after: Duration,
     /// The retry's plan: `bucket` when a bucketed final aggregate ran in it
-    /// with spill on, `sort_merge` otherwise.
+    /// with spill on and a disk manager that allows temp files,
+    /// `bucket_without_disk` when it ran with spill on and no such disk
+    /// manager, so it could not spill, `sort_merge` otherwise.
     pub retry_plan: &'static str,
     /// The bucketed retry's `bits`; `None` for `sort_merge`.
     pub bits: Option<u8>,
@@ -5963,10 +5965,13 @@ pub struct SpillRetryReport {
     pub exchange_spill_bytes_written: u64,
     /// Spill files the retry's `RepartitionExec`s created.
     pub exchange_spill_files: u64,
-    /// Scratch-file bytes the bucketed exec wrote: Arrow IPC after
-    /// lz4_frame, framing included.
+    /// Scratch-file bytes the bucketed exec wrote: Arrow IPC after the
+    /// session's spill compression (lz4_frame on the retry), framing
+    /// included.
     pub bucket_spill_bytes_written: u64,
-    /// Scratch-file bytes the bucketed exec read back, whole files once.
+    /// Arrow bytes the bucketed exec decoded from its scratch files, each
+    /// file once: buffer lengths after decompression, so not comparable
+    /// with `bucket_spill_bytes_written`'s compressed file bytes.
     pub bucket_spill_bytes_read: u64,
     /// State rows the bucketed exec wrote.
     pub bucket_spill_rows_written: u64,
@@ -9706,6 +9711,7 @@ pub(crate) mod tests {
                 bits: 4,
                 routed_chunk_rows: 8192,
                 bytes_read: 3072,
+                disk: true,
             }),
             PoolReport {
                 peak_unspillable_bytes: 2_200_000,
@@ -9790,6 +9796,7 @@ pub(crate) mod tests {
             bits: 4,
             routed_chunk_rows: 8192,
             bytes_read: 9_000,
+            disk: true,
         };
         let report = first.report(
             totals,
@@ -9827,6 +9834,24 @@ pub(crate) mod tests {
                 sort_merge.bucket_spill_rows_written
             ),
             (0, 0, 0)
+        );
+
+        let no_disk = BucketSpillFigures {
+            disk: false,
+            bytes_read: 0,
+            ..bucket
+        };
+        let without_disk = first.report(
+            totals,
+            &operators[..2],
+            Some(no_disk),
+            PoolReport::default(),
+            None,
+        );
+        assert_eq!(without_disk.retry_plan, "bucket_without_disk");
+        assert_eq!(
+            (without_disk.bits, without_disk.bucket_spill_bytes_written),
+            (Some(4), 0)
         );
     }
 
