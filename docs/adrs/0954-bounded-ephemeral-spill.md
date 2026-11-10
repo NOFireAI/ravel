@@ -1468,11 +1468,12 @@ ClickHouse/ClickBench `ravel/start:65` at commit 6ba54cd1da84). This
 repository's kit does not (`benchmarks/clickbench/kit/box/run.sh`
 `launch_server` execs the binary unchanged), and neither does a service
 unit with the common soft limit of 1,024. So T2 (#4074) makes ravel-server
-raise its own soft `nofile` limit to the hard limit at startup and log
-both values, which is what makes the bucketed retry reachable outside the
-entry. M7 did not record the hard limit on these Ubuntu 24.04 boxes. T3
-stamps each box's soft limit, from that startup line, beside its run and requires
-at least 8,320 on every box. A box stamped below that has failed a
+raise its own soft `nofile` limit to the hard limit at startup, before
+the descriptor budget reads it, and log both values, which is what makes
+the bucketed retry reachable outside the entry. M7 did not record the
+hard limit on these Ubuntu 24.04 boxes. T3 stamps each box's soft limit,
+from that startup line, beside its run and requires at least 8,320 on
+every box. A box stamped below that has failed a
 precondition: its row 33 rows and its concurrent QPS row are reported and
 not judged, and the box is rerun with the limit raised. On a box stamped
 at or above it, a sort-merge retry plan for row 33 (no tuning) is a miss
