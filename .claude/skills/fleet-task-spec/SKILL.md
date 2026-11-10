@@ -207,7 +207,9 @@ Where that file goes is itself a rule, because both wrong answers have
 already cost a task. Run this first, as ONE command, substituting
 nothing:
 
-    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 70 && df -h /tmp . "$HOME"
+    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs <disk_floor_gb> && df -h /tmp . "$HOME"
+
+(write the spec's disk_floor_gb value in place of <disk_floor_gb>).
 
 Every step is joined with `&&` so a failure anywhere fails the command:
 `git check-ignore -q .gate-logs` proves the tracked `.gitignore` covers
@@ -216,8 +218,17 @@ text rather than built from `$HOME` or the checkout's basename because
 each tool call is its own shell and a variable set in one call is empty
 in the next.
 
-If the guard exits non-zero, say so in your report and stop rather than
-picking another directory: a cold gate writes 54 to 70 GB of target
+If the guard exits non-zero, end the task with this fixed report as the
+first lines of your final message, and stop rather than picking another
+directory:
+
+    EXECUTOR BELOW FLOOR: <free> GB of <disk_floor_gb>
+    <the output of `uname -a`>
+    <the output of `nproc`>
+
+`bin/agent-cli task` classifies that report as `below-floor`, which the
+orchestrator redispatches to a larger host instead of reading it as a
+failure. The reason for the floor: a cold gate writes 54 to 70 GB of target
 when its closure runs no feature lane, and from about 93 GB to more than
 188 GB when it reaches the sql, flight-sql, esql and ravel-bench lanes
 (CLAUDE.md's measured band), since the main suite and every lane share one
