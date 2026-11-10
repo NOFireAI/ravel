@@ -65,6 +65,24 @@ pub fn parse_max_flush_lifetime_ns(s: &str) -> Result<i64, String> {
     i64::try_from(dur.as_nanos()).map_err(|_| format!("--max-flush-lifetime '{s}' is too large"))
 }
 
+/// Parse a `catalog fold --retention-default` value into nanoseconds.
+///
+/// Same humantime grammar as ravel-server's `--retention-default` (`30d`,
+/// `720h`). Zero is refused: a zero window would put every sealed hour at the
+/// retention frontier, which no deployment default means. A value too large
+/// for `i64` nanoseconds is refused too.
+pub fn parse_retention_default_ns(s: &str) -> Result<i64, String> {
+    let dur = humantime::parse_duration(s)
+        .map_err(|e| format!("invalid --retention-default '{s}': {e}"))?;
+    match i64::try_from(dur.as_nanos()) {
+        Ok(0) => Err(format!(
+            "--retention-default '{s}' must be greater than zero"
+        )),
+        Ok(ns) => Ok(ns),
+        Err(_) => Err(format!("--retention-default '{s}' is too large")),
+    }
+}
+
 /// Parse a `load --max-flush-delay` value into a [`std::time::Duration`].
 ///
 /// Same humantime grammar as [`parse_max_flush_lifetime_ns`] (`2s`, `10m`,
