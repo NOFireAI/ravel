@@ -949,11 +949,15 @@ class Statements(unittest.TestCase):
             self.assertIsNone(re.search(r"\bstatus\s*=", sql), s["id"])
 
     def test_three_statements_run_warm(self):
-        """docs/internal/bench-reports.md: three statements run warm (its count of 46 predates ADR-3939's
-        four multi-day statements)."""
+        """docs/internal/bench-reports.md: of the 50 statements, 47 are cold_only and three run warm."""
         self.assertEqual(len(self.st), 50)
         self.assertEqual([s["id"] for s in self.st if not s.get("cold_only")],
                          ["spans_lookup_norange", "spans_lookup_1h", "logs_trace_1h"])
+        doc = os.path.join(HERE, "..", "..", "docs", "internal", "bench-reports.md")
+        with open(doc, encoding="utf-8") as f:
+            text = " ".join(f.read().split())
+        n, warm = len(self.st), sum(1 for s in self.st if not s.get("cold_only"))
+        self.assertIn(f"Of the {n} statements, {n - warm} are `cold_only`", text)
 
     def test_required_statements(self):
         by = {s["id"]: s for s in self.st}

@@ -2657,7 +2657,8 @@ target = "at most 882 leaf GETs, 7 of 7 days covered, p50 within ADR-3692 row 18
 miss = "over 882, a day uncovered, or over the bound"
 source = "predicted; comment 6700944105"
 # Row 18's bound on the no-range 100-key lookup over the 7-day state: the
-# cold p50 against the same statement's prefold p50 (A6) plus the larger of
+# cold p50 against the same statement's prefold p50 (W4's own
+# unfolded_p50_s) plus the larger of
 # 5 % of it and half its interquartile range.
 requires_tenant = "inv"
 requires_states = ["day_parts_7"]

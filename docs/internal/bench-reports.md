@@ -802,7 +802,7 @@ load`, folds it through the key-index state matrix (unfolded, folded
 without leaves, folded with leaves, mixed, compaction in flight, erasure in
 flight, and many parts over N ingest hours), and runs the statements of
 `statements.toml` cold, each cold call after a `ravel-server` restart and
-a page-cache drop (required on the S3 lane). Of the 46 statements, 43 are
+a page-cache drop (required on the S3 lane). Of the 50 statements, 47 are
 `cold_only`; the other three (`spans_lookup_norange`, `spans_lookup_1h`,
 `logs_trace_1h`) also run warm, repeated against the running server with no
 restart.
