@@ -1297,26 +1297,37 @@ impl RetireTracker {
         }
     }
 
-    /// Records a tombstoned bucket and returns true when `hour` lies in a
-    /// retirable part; false leaves the bucket to the normal reconcile.
-    fn defer(&mut self, shard: u32, hour: u32, listing: &[ObjectMeta]) -> bool {
-        let in_part = self
-            .ranges
+    /// True when `listing` holds a tombstone and `hour` lies in a retirable
+    /// part, so the bucket is a candidate for [`Self::defer`].
+    fn retires(&self, hour: u32, listing: &[ObjectMeta]) -> bool {
+        self.ranges
             .iter()
-            .any(|&(min_hour, watermark)| min_hour <= hour && hour <= watermark);
-        if !in_part || !lists_a_tombstone(listing) {
-            return false;
-        }
+            .any(|&(min_hour, watermark)| min_hour <= hour && hour <= watermark)
+            && lists_a_tombstone(listing)
+    }
+
+    /// Sets a tombstoned bucket aside for [`apply_retirements`].
+    fn defer(&mut self, shard: u32, hour: u32) {
         self.deferred.insert((hour, shard));
-        true
     }
 }
 
+fn is_tombstone(meta: &ObjectMeta) -> bool {
+    matches!(
+        keys::partition_bucket_entry(&meta.key),
+        Ok(BucketEntry::Tombstone(_))
+    )
+}
+
 fn lists_a_tombstone(listing: &[ObjectMeta]) -> bool {
+    listing.iter().any(is_tombstone)
+}
+
+fn lists_a_rewrite_or_compaction(listing: &[ObjectMeta]) -> bool {
     listing.iter().any(|meta| {
         matches!(
             keys::partition_bucket_entry(&meta.key),
-            Ok(BucketEntry::Tombstone(_))
+            Ok(BucketEntry::CompactionRecord(_)) | Ok(BucketEntry::RewriteRecord(_))
         )
     })
 }
@@ -4316,7 +4327,7 @@ impl Catalog {
             };
             let leaf_switch_on = self.config().build_key_index_leaves;
             let mut retire = RetireTracker::of_head(retire_head, leaf_switch_on);
-            // Hours already retired are not listed again by the frontier band.
+            // Hours already retired, which the frontier band lists last.
             let already_retired: HashSet<u32> = retire_head
                 .iter()
                 .flat_map(|head| &head.parts)
@@ -4561,20 +4572,27 @@ impl Catalog {
                     // Cap the band's top strictly below the fixed window so no
                     // bucket is listed by both passes.
                     let frontier_hi = frontier_hi_raw.min(lo.saturating_sub(1));
-                    let mut candidate_hours: Vec<u32> = {
+                    let candidate_hours: Vec<u32> = {
                         let mut hs: HashSet<u32> = HashSet::new();
                         for entry in entries.iter() {
-                            if entry.ingest_hour_bucket <= frontier_hi
-                                && !already_retired.contains(&entry.ingest_hour_bucket)
-                            {
+                            if entry.ingest_hour_bucket <= frontier_hi {
                                 hs.insert(entry.ingest_hour_bucket);
                             }
                         }
-                        hs.into_iter().collect()
+                        // Oldest-first: the hours closest to physical deletion
+                        // are reconciled before the cap is spent. A retired
+                        // hour stays named until its part re-encodes, so it
+                        // comes after every other hour, where it cannot hold
+                        // the band in place, and is listed while the cap
+                        // allows, so a rewrite record into it is found.
+                        let (mut open, mut retired): (Vec<u32>, Vec<u32>) = hs
+                            .into_iter()
+                            .partition(|hour| !already_retired.contains(hour));
+                        open.sort_unstable();
+                        retired.sort_unstable();
+                        open.extend(retired);
+                        open
                     };
-                    // Oldest-first: the hours closest to physical deletion are
-                    // reconciled before the cap is spent.
-                    candidate_hours.sort_unstable();
                     let cap = self.config().frontier_reconcile_max_hours as usize;
                     let take = candidate_hours.len().min(cap);
                     frontier_hours_deferred = (candidate_hours.len() - take) as u64;
@@ -6215,6 +6233,69 @@ impl Catalog {
         Ok(buckets)
     }
 
+    /// True when every compaction and rewrite record in `listing` is already
+    /// reflected by `entries` for `(shard, hour)`: the bucket classified as if
+    /// it held no tombstone contributes exactly what the snapshot names. A
+    /// listing with neither kind of record is trivially folded. A
+    /// classification that fails answers false, which re-encodes the part
+    /// without the hour, the tombstone's own outcome.
+    #[allow(clippy::too_many_arguments)]
+    async fn bucket_records_folded(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        hour: u32,
+        listing: &[ObjectMeta],
+        accounting: &QueryAccounting,
+        entries: &[SnapshotEntry],
+        counters: &mut RequestCounters,
+        layout_drift_count: &mut u64,
+        coverage: &mut declared_stats::StampCoverage,
+    ) -> bool {
+        if !lists_a_rewrite_or_compaction(listing) {
+            return true;
+        }
+        let records: Vec<ObjectMeta> = listing
+            .iter()
+            .filter(|meta| !is_tombstone(meta))
+            .cloned()
+            .collect();
+        let contribution = match self
+            .classify_bucket(
+                tenant,
+                signal,
+                shard,
+                hour,
+                &records,
+                accounting,
+                counters,
+                layout_drift_count,
+                coverage,
+            )
+            .await
+        {
+            Ok(contribution) => contribution,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    shard,
+                    hour,
+                    error = %err,
+                    "tombstoned bucket's records did not classify, re-encoding its part"
+                );
+                return false;
+            }
+        };
+        let mut desired = dedup_contribution(contribution);
+        let mut current: Vec<SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.shard == shard && e.ingest_hour_bucket == hour)
+            .cloned()
+            .collect();
+        same_entry_set(&mut current, &mut desired)
+    }
+
     /// Reconcile one already-sealed, already-folded bucket against its current
     /// on-store state, replacing exactly this bucket's entries in the
     /// in-progress `entries` set when its contribution changed and marking the
@@ -6252,8 +6333,27 @@ impl Catalog {
             return Ok(());
         }
         // A tombstone in a sealed leaf-bearing part is settled once every
-        // pass has listed, by `apply_retirements`.
-        if retire.defer(shard, hour, listing) {
+        // pass has listed, by `apply_retirements`. A compaction or rewrite
+        // record the snapshot does not reflect yet is not set aside: the
+        // normal path below drops the hour and its part re-encodes now, so an
+        // erased input leaves HEAD this fold (ADR-0064).
+        if retire.retires(hour, listing)
+            && self
+                .bucket_records_folded(
+                    tenant,
+                    signal,
+                    shard,
+                    hour,
+                    listing,
+                    accounting,
+                    entries,
+                    counters,
+                    layout_drift_count,
+                    coverage,
+                )
+                .await
+        {
+            retire.defer(shard, hour);
             return Ok(());
         }
         let contribution = self
