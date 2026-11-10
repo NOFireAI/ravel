@@ -916,6 +916,11 @@ pub fn process_envelope_width(partitions: usize) -> NonZeroUsize {
     static PARALLELISM: OnceLock<usize> = OnceLock::new();
     let parallelism = *PARALLELISM
         .get_or_init(|| std::thread::available_parallelism().map_or(1, NonZeroUsize::get));
+    envelope_width(parallelism, partitions)
+}
+
+/// [`process_envelope_width`] for a host of `parallelism` cores.
+pub(crate) fn envelope_width(parallelism: usize, partitions: usize) -> NonZeroUsize {
     NonZeroUsize::new(parallelism.min(partitions)).unwrap_or(NonZeroUsize::MIN)
 }
 
