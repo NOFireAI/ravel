@@ -2120,7 +2120,8 @@ fi
 # or the best of all three, 0.4), and q02's 0.9, 0.7, 0.5 s give hot 0.5 (not
 # the median, 0.7); cold is try 1, 0.4 s and 0.9 s.
 edit_arm "$TMP/fixture-pass" "$TMP/fixture-pub-a" 'r["provenance"]["band_sections"].append("published")
-rd = {"round": 1, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
+r["provenance"].setdefault("hardware", {})["instance_type"] = "c6a.large"
+rd ={"round": 1, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
       "ok": 100, "err": 0, "wrong_answer": 0, "qps": 1.0, "error_ratio": 0.0}
 r["concurrent"] = {"rounds": [rd], "pooled": {"rounds": 1, "calls": 100, "ok": 100, "err": 0,
                    "wrong_answer": 0, "error_ratio_weighted": 0.0,
@@ -4469,7 +4470,8 @@ assert entry is None and failed["tries_ms"] == [100.0, None, 40.0], failed
 r["entries"] = [e for e in r["entries"] if e["id"] != sid]
 r["failed"].append(failed)
 r["provenance"]["band_sections"].append("published")
-rd = {"round": 1, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
+r["provenance"].setdefault("hardware", {})["instance_type"] = "c6a.large"
+rd ={"round": 1, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
       "ok": 100, "err": 0, "wrong_answer": 0, "qps": 1.0, "error_ratio": 0.0}
 r["concurrent"] = {"rounds": [rd], "pooled": {"rounds": 1, "calls": 100, "ok": 100, "err": 0,
                    "wrong_answer": 0, "error_ratio_weighted": 0.0,
@@ -4517,6 +4519,28 @@ if [ "$code" = 2 ] && [ ! -s "$TMP/pub-notsel.out" ] \
   pass "a kit results.json that did not select published is refused"
 else
   fail "published not selected" "exit $code: $(head -c 300 "$TMP/pub-notsel.err")"
+fi
+
+# published_kit_machine_mismatch_refuses. Catches: a kit results.json from one
+# machine judged against another machine's published rows; the fixture ran on
+# c6a.4xlarge. A run whose instance type is "unknown" is not refused for it.
+python3 - "$TMP/fixture-pass/results.json" "$TMP/pub-kitmm.json" "$TMP/pub-kitunk.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+r["provenance"]["band_sections"] = list(r["provenance"]["band_sections"]) + ["published"]
+json.dump(r, open(sys.argv[2], "w"))
+r["provenance"].setdefault("hardware", {})["instance_type"] = "unknown"
+json.dump(r, open(sys.argv[3], "w"))
+PY
+published kitmm c6a.large "$TMP/pub-kitmm.json"
+mm_code=$code
+published kitunk c6a.large "$TMP/pub-kitunk.json"
+if [ "$mm_code" = 2 ] && [ ! -s "$TMP/pub-kitmm.out" ] \
+  && grep -qF "pub-kitmm.json: ran on 'c6a.4xlarge', not c6a.large" "$TMP/pub-kitmm.err" \
+  && ! grep -qF "ran on" "$TMP/pub-kitunk.err"; then
+  pass "a kit results.json from another machine is refused, and an unknown one is not"
+else
+  fail "published kit machine mismatch" "exit $mm_code: $(head -c 300 "$TMP/pub-kitmm.err") | unknown: $(head -c 300 "$TMP/pub-kitunk.err")"
 fi
 
 # run_toml_published_without_concurrent_refused. Catches: a run.toml selecting

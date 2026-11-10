@@ -1008,9 +1008,16 @@ def published_bands(path, machine, report, report_path):
         if report.get("machine") != machine:
             raise Refusal("%s: machine is %r, not %s; judge it against its own machine's "
                           "published rows" % (report_path, report.get("machine"), machine))
-    elif "published" not in report["provenance"]["band_sections"]:
-        raise Refusal("%s: published not selected: its band_sections are %s"
-                      % (report_path, ", ".join(report["provenance"]["band_sections"])))
+    else:
+        if "published" not in report["provenance"]["band_sections"]:
+            raise Refusal("%s: published not selected: its band_sections are %s"
+                          % (report_path, ", ".join(report["provenance"]["band_sections"])))
+        # box/run.sh records "unknown" when the instance metadata call fails,
+        # which says nothing about the machine, so only a named one refuses.
+        ran_on = report["provenance"].get("hardware", {}).get("instance_type", "unknown")
+        if ran_on not in (machine, "unknown"):
+            raise Refusal("%s: ran on %r, not %s; judge it against its own machine's "
+                          "published rows" % (report_path, ran_on, machine))
     top, pub = published_table(lane_of(path), path, machine)
     figures, qps, qps_note = _published_measured(report_path, report)
     r, q = top["statement_max_ratio"], top["concurrent_qps_min_ratio"]
