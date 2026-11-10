@@ -33,6 +33,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DEPLOY_DIR="$(cd "${HERE}/.." && pwd)"
 REPO_ROOT="$(cd "${DEPLOY_DIR}/../.." && pwd)"
 SCRIPT="${HERE}/every_comparator_pins_an_image_digest.sh"
+REFS="${HERE}/workflow_uses_refs.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/pin-check-test.XXXXXX")"
 trap 'rm -rf "${TMP}"' EXIT
 
@@ -71,6 +72,7 @@ new_tree() {
   cp -r "${REPO_ROOT}/deploy/k8s/." "${dir}/deploy/k8s/"
   cp "${SCRIPT}" \
     "${dir}/deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh"
+  cp "${REFS}" "${dir}/deploy/metricsbench/tests/workflow_uses_refs.sh"
   chmod +x "${dir}/deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh"
   printf '%s\n' "${dir}"
 }
@@ -303,6 +305,205 @@ mutate "${d}/.github/actions/free-disk-space/action.yml" \
   's#^      run: |#      run: |\n        docker run redis:latest true#'
 check "docker_run_in_a_composite_action_is_scanned" "${d}" 1 \
   "redis:latest"
+
+# --- third category: the two uses: extractions must agree (issue #4099) ----
+
+# workflow_uses_refs.sh runs on fixture roots holding only .github, so each
+# case controls exactly which references exist.
+PIN_A="actions/checkout@0123456789abcdef0123456789abcdef01234567"
+PIN_B="actions/cache@89abcdef0123456789abcdef0123456789abcdef"
+
+# fixture <name>: an empty root with the two directories the helper scans.
+fixture() {
+  local dir="${TMP}/refs-$1"
+  mkdir -p "${dir}/.github/workflows" "${dir}/.github/actions"
+  printf '%s\n' "${dir}"
+}
+
+# check_refs <name> <root> <want-exit> <want-substring-or-empty>
+check_refs() {
+  local name="$1" dir="$2" want_rc="$3" want_sub="${4:-}"
+  local out rc=0
+  out="$(sh "${REFS}" "${dir}" "${dir}/refs.out" 2>&1)" || rc=$?
+  if [[ "${rc}" != "${want_rc}" ]]; then
+    printf 'FAIL  %s: exit %s, wanted %s\n' "${name}" "${rc}" "${want_rc}"
+    printf '%s\n' "${out}" | sed 's/^/      /'
+    fails=$((fails + 1))
+    return
+  fi
+  if [[ -n "${want_sub}" && "${out}" != *"${want_sub}"* ]]; then
+    printf 'FAIL  %s: output missing "%s"\n' "${name}" "${want_sub}"
+    printf '%s\n' "${out}" | sed 's/^/      /'
+    fails=$((fails + 1))
+    return
+  fi
+  printf 'ok    %s\n' "${name}"
+  passes=$((passes + 1))
+}
+
+# Matching extractions pass, and the count printed is both readers'. The
+# fixture holds every shape the YAML reader must take: a named step, a
+# no-name `- uses:` step, a job-level reusable workflow, the same reference
+# twice, a local action both readers skip, and a composite action's
+# runs.steps.
+# FLIP: a YAML reader that skips jobs.<job>.uses, or runs.steps in a
+# composite action, or collapses the repeated reference, disagrees with the
+# grep here and fails this case.
+d="$(fixture matching)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: {push: {branches: [main]}}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: ${PIN_A} # v4
+      - uses: ${PIN_A}
+      - uses: ./.github/actions/local
+      - name: Build
+        run: |
+          echo "uses: is only text here" # not a key
+  call:
+    uses: octo/repo/.github/workflows/w.yml@0123456789abcdef0123456789abcdef01234567
+EOF
+mkdir -p "${d}/.github/actions/cached"
+cat >"${d}/.github/actions/cached/action.yml" <<EOF
+name: cached
+runs:
+  using: composite
+  steps:
+    - uses: '${PIN_B}'
+EOF
+check_refs "matching uses: extractions pass" "${d}" 0 \
+  "external action references: 4 by line grep, 4 by YAML structure"
+
+# A step written as a flow mapping is a real `uses:` the line grep cannot
+# see. FLIP: a cross-check whose second side is derived from the grep's own
+# lines (or the old hand-pinned count, which nothing re-derives) passes this
+# fixture; only an independent structural read names the missed reference.
+d="$(fixture grep-misses-flow-mapping)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+      - {name: Cache, uses: ${PIN_B}}
+EOF
+check_refs "a flow-mapping uses: the grep misses fails" "${d}" 1 \
+  "only the YAML structure found (the line grep missed them):
+    .github/workflows/ci.yml: ${PIN_B}"
+
+# The same miss with a quoted key, at a deeper indentation than any other
+# step. FLIP: a structural reader that matches only the literal text
+# `uses:` at the steps' column passes this fixture, as the grep does.
+d="$(fixture grep-misses-quoted-key)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+      -   name: Cache
+          "uses": ${PIN_B}
+EOF
+check_refs "a quoted uses: key the grep misses fails" "${d}" 1 \
+  ".github/workflows/ci.yml: ${PIN_B}"
+
+# A `uses:` line inside a run: block scalar is text, not a step, so only the
+# grep finds it. It repeats a reference a real step already carries, so the
+# two readers' reference SETS are equal and only the multiset differs.
+# FLIP: a one-directional check (every YAML reference is in the grep's
+# list), or a set comparison, passes this fixture; it must fail.
+d="$(fixture only-grep-finds)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+      - name: Notes
+        run: |
+          uses: ${PIN_A}
+EOF
+check_refs "a uses: line only the grep finds fails" "${d}" 1 \
+  "only the line grep found (not a jobs/steps uses: in the YAML):
+    .github/workflows/ci.yml: ${PIN_A}"
+
+# One reference only the grep finds and a different one only the YAML finds:
+# both readers count two. FLIP: comparing counts instead of references
+# passes this fixture; it must fail, naming both.
+d="$(fixture equal-counts-different-refs)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+      - {uses: ${PIN_B}}
+      - run: |
+          uses: actions/setup-node@0123456789abcdef0123456789abcdef01234567
+EOF
+check_refs "equal counts with different references fail" "${d}" 1 \
+  "    .github/workflows/ci.yml: actions/setup-node@0123456789abcdef0123456789abcdef01234567"
+check_refs "equal counts with different references name the YAML-only one" \
+  "${d}" 1 "    .github/workflows/ci.yml: ${PIN_B}"
+
+# Zero references on both sides: the readers agree, and must still fail.
+# FLIP: treating two empty extractions as agreement (the refusal dropped
+# with the hand-pinned count) passes this fixture.
+d="$(fixture zero-references)"
+cat >"${d}/.github/workflows/ci.yml" <<'EOF'
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/local
+      - run: echo no external action
+EOF
+check_refs "zero uses: references fail" "${d}" 1 \
+  "neither reader found a workflow action reference"
+
+# A construct outside the subset the structural reader takes is refused,
+# not guessed at. FLIP: a reader that skips what it cannot parse would find
+# nothing under the anchor and still agree with the grep on the other file.
+d="$(fixture unreadable-anchor)"
+cat >"${d}/.github/workflows/ci.yml" <<EOF
+name: ci
+on: push
+jobs:
+  build: &base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${PIN_A}
+EOF
+check_refs "a YAML anchor is refused, not skipped" "${d}" 2 \
+  "could not read .github/workflows/ci.yml"
+
+# Through the full check: a flow-mapping step added to a real workflow fails
+# the run, and an unpinned reference still fails the pin check.
+d="$(new_tree workflow-flow-mapping-step)"
+mutate "${d}/.github/workflows/k8s-nightly.yml" \
+  "0,/^      - name: Install sccache/s##      - {name: Flow step, uses: ${PIN_B}}\n      - name: Install sccache#"
+check "a flow-mapping uses: in a real workflow fails the full check" "${d}" 1 \
+  "references only the YAML structure found"
+
+d="$(new_tree workflow-unpinned-action)"
+mutate "${d}/.github/workflows/k8s-nightly.yml" \
+  '0,/actions\/checkout@[0-9a-f]\{40\}/s##actions/checkout@v4#'
+check "an action pinned by tag still fails the pin check" "${d}" 1 \
+  "1 workflow action reference(s) lack a full 40-character commit SHA"
 
 # --- sixth category: deploy/k8s manifest image pins (issue #1720 residual) --
 
