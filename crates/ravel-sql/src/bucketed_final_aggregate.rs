@@ -87,9 +87,11 @@
 //!
 //! # Bucket spill (ADR-3565 amendment 2)
 //!
-//! [`BucketedFinalAggregateExec::with_spill`] is the refusal retry's mode: the
-//! consumer registers `with_can_spill(true)` and a refused charge is a spill
-//! trigger instead of an error. The stream writes every chunk it retains, for
+//! [`BucketedFinalAggregateExec::with_spill`] is the mode the refusal retry is
+//! to run the exec in; nothing outside tests sets it until T3 #4075 wires it.
+//! With it, and a disk manager that allows temp files, the consumer
+//! registers `with_can_spill(true)` and a refused charge is a spill trigger
+//! instead of an error. The stream writes every chunk it retains, for
 //! every bucket it has not started aggregating, to that bucket's scratch
 //! file, releases their charge and asks again; from then on each chunk is
 //! written when it fills and each bucket's last chunk when input ends. A
@@ -162,6 +164,7 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 
+use crate::bucket_spill_tuning::routed_column_capacities;
 use crate::compact_slices::TopKPrefilter;
 use crate::config::BucketedFinalAggregation;
 
@@ -194,7 +197,9 @@ pub const BUCKET_SPILL_UNDERSHOOT: &str = "bucket spill under-shoot";
 const SPILL_MODE_SHARE_PHRASES: [&str; 2] = ["over the spill-mode cap", "over its fair share"];
 
 /// The name of the exec's counter of the Arrow bytes decoded from its scratch
-/// files on read-back.
+/// files on read-back: buffer lengths after decompression, which the
+/// lz4_frame-compressed file bytes DataFusion's `spilled_bytes` counts do not
+/// equal.
 pub const BUCKET_SPILL_BYTES_READ: &str = "bucket_spill_bytes_read";
 
 /// The name of the exec's counter of the rows decoded from its scratch files
@@ -383,6 +388,16 @@ impl BucketedFinalAggregateExec {
         self.spill
     }
 
+    /// Whether a partition of this exec has executed with spill on and a
+    /// disk manager that allows temp files: `execute` registers the spill
+    /// counters only then. False before the first `execute`.
+    pub fn spill_available(&self) -> bool {
+        self.metrics
+            .clone_inner()
+            .iter()
+            .any(|metric| metric.value().name() == BUCKET_SPILL_BYTES_READ)
+    }
+
     /// Cut each routed bucket's output to its own top `topk.fetch()` rows
     /// under `topk.ordering()` (see the module docs). A TopK whose sort keys
     /// are not all bare columns of this exec's output, by index and name, is
@@ -417,6 +432,9 @@ pub(crate) struct BucketSpillFigures {
     pub(crate) bits: u8,
     pub(crate) routed_chunk_rows: usize,
     pub(crate) bytes_read: u64,
+    /// Whether any of them executed with a disk manager that allows temp
+    /// files ([`BucketedFinalAggregateExec::spill_available`]).
+    pub(crate) disk: bool,
 }
 
 /// [`BucketSpillFigures`] of `plan`, or `None` when no bucketed exec in it
@@ -451,8 +469,10 @@ fn collect_bucket_spill_figures(
             bits: exec.config.bits,
             routed_chunk_rows: exec.config.routed_chunk_rows,
             bytes_read: 0,
+            disk: false,
         });
         figures.bytes_read += bytes_read;
+        figures.disk |= exec.spill_available();
     }
     for child in plan.children() {
         collect_bucket_spill_figures(child, found);
@@ -720,12 +740,16 @@ impl OpenChunk {
     fn allocate(types: &[(DataType, usize)], rows: usize) -> Self {
         let columns: Vec<ColumnChunk> = types
             .iter()
-            .map(|(data_type, width)| ColumnChunk {
-                data_type: data_type.clone(),
-                width: *width,
-                values: MutableBuffer::with_capacity(rows * width),
-                validity: MutableBuffer::from_len_zeroed(bit_util::ceil(rows, 8)),
-                null_count: 0,
+            .map(|(data_type, width)| {
+                let (values, validity) =
+                    routed_column_capacities(*width, rows).unwrap_or((usize::MAX, usize::MAX));
+                ColumnChunk {
+                    data_type: data_type.clone(),
+                    width: *width,
+                    values: MutableBuffer::with_capacity(values),
+                    validity: MutableBuffer::from_len_zeroed(validity),
+                    null_count: 0,
+                }
             })
             .collect();
         let charged = columns
@@ -1162,6 +1186,22 @@ struct ReadBack {
     _file: Arc<dyn SpillFile>,
 }
 
+/// The Arrow bytes `batch` decodes to: each buffer's length and `ceil(n/8)`
+/// per validity bitmap, not the capacity of the allocation a buffer shares,
+/// and not the compressed bytes in the file.
+fn decoded_bytes(batch: &RecordBatch) -> usize {
+    fn data_bytes(data: &ArrayData) -> usize {
+        data.buffers().iter().map(Buffer::len).sum::<usize>()
+            + data.nulls().map_or(0, |nulls| nulls.len().div_ceil(8))
+            + data.child_data().iter().map(data_bytes).sum::<usize>()
+    }
+    batch
+        .columns()
+        .iter()
+        .map(|column| data_bytes(&column.to_data()))
+        .sum()
+}
+
 /// Whether `err` is a pool refusal, the only error a spill answers.
 fn is_refusal(err: &DataFusionError) -> bool {
     matches!(err, DataFusionError::ResourcesExhausted(_))
@@ -1452,7 +1492,9 @@ impl BucketedStream {
         self.group_indices = Vec::new();
         spill.triggered = true;
         // The router's per-row scratch is sized once, inside what the table
-        // held, so routing later batches never asks the pool for it.
+        // held, so routing later batches never asks the pool for it. A table
+        // that held under `ROUTER_ROW_SCRATCH` spare bytes routes one row per
+        // call: accepted, since a floor would be a grow the pool just refused.
         router.fix_scratch(0);
         let held = self
             .table_bytes
@@ -1555,7 +1597,7 @@ impl BucketedStream {
         let _timer = elapsed.timer();
         self.read_back_bytes = batch.get_array_memory_size();
         if let Some(spill) = self.spill.as_ref() {
-            spill.bytes_read.add(self.read_back_bytes);
+            spill.bytes_read.add(decoded_bytes(batch));
             spill.rows_read.add(batch.num_rows());
         }
         self.charge_table()?;
@@ -1893,7 +1935,7 @@ mod tests {
         for (data_type, width) in &types {
             assert_eq!(data_type.primitive_width(), Some(*width), "{data_type}");
         }
-        for rows in [1, 7, 8, 9, 63, 64, 65, 1023, 1024, 2372, 8192] {
+        for rows in [1, 7, 8, 9, 63, 64, 65, 1023, 1024, 2368, 8192] {
             for set in [&types[..], &types[3..4], &types[1..3], &types[4..]] {
                 let widths: Vec<usize> = set.iter().map(|(_, width)| *width).collect();
                 assert_eq!(

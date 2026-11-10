@@ -30,6 +30,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::common::Result as DFResult;
+use datafusion::common::config::SpillCompression;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
@@ -40,6 +41,7 @@ use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
     ReplaceChildrenOptions, collect, displayable,
 };
+use datafusion::prelude::SessionConfig;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
@@ -1682,12 +1684,13 @@ fn spilling(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
 }
 
 /// A task context over `pool` whose disk manager writes into `dir`, up to
-/// `quota` bytes.
+/// `quota` bytes, with the planned session's config as `configure` leaves it.
 fn spill_task_ctx(
     planned: &Planned,
     pool: Arc<dyn MemoryPool>,
     dir: &std::path::Path,
     quota: u64,
+    configure: impl FnOnce(&mut SessionConfig),
 ) -> Arc<TaskContext> {
     use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -1701,11 +1704,14 @@ fn spill_task_ctx(
         .build_arc()
         .expect("runtime");
     let ctx = Arc::try_unwrap(planned.ctx.task_ctx()).unwrap_or_else(|_| panic!("unshared"));
-    Arc::new(ctx.with_runtime(runtime))
+    let mut config = ctx.session_config().clone();
+    configure(&mut config);
+    Arc::new(ctx.with_runtime(runtime).with_session_config(config))
 }
 
 /// What a spilled run of a plan's bucketed exec reported.
 struct SpillRun {
+    compression: SpillCompression,
     rows: Vec<String>,
     routed_rows: usize,
     spilled_rows: usize,
@@ -1722,6 +1728,7 @@ struct SpillRun {
 impl fmt::Debug for SpillRun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpillRun")
+            .field("compression", &self.compression)
             .field("rows", &self.rows.len())
             .field("routed_rows", &self.routed_rows)
             .field("spilled_rows", &self.spilled_rows)
@@ -1739,10 +1746,10 @@ impl fmt::Debug for SpillRun {
 /// One pool call by a bucketed consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolEvent {
-    /// A `try_grow` the pool admitted.
-    Grown,
-    /// A `try_grow` the pool refused.
-    Refused,
+    /// A `try_grow` of this many bytes the pool admitted.
+    Grown(usize),
+    /// A `try_grow` of this many bytes the pool refused.
+    Refused(usize),
     /// An infallible `grow`.
     Forced,
     Shrunk,
@@ -1833,7 +1840,7 @@ impl MemoryPool for CappedPool {
             .name()
             .starts_with(BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX);
         if bucketed && after > self.cap {
-            self.record(reservation, PoolEvent::Refused);
+            self.record(reservation, PoolEvent::Refused(additional));
             self.refusals.fetch_add(1, Ordering::SeqCst);
             return Err(datafusion::error::DataFusionError::ResourcesExhausted(
                 format!(
@@ -1844,7 +1851,7 @@ impl MemoryPool for CappedPool {
                 ),
             ));
         }
-        self.record(reservation, PoolEvent::Grown);
+        self.record(reservation, PoolEvent::Grown(additional));
         self.inner.try_grow(reservation, additional)
     }
 
@@ -1878,11 +1885,24 @@ async fn run_spilled_on(
     quota: u64,
     prepare: impl FnOnce(&TaskContext),
 ) -> DFResult<SpillRun> {
+    run_spilled_with(planned, partitions, capped, quota, |_| {}, prepare).await
+}
+
+/// [`run_spilled_on`] with the session config as `configure` leaves it.
+async fn run_spilled_with(
+    planned: &Planned,
+    partitions: usize,
+    capped: CappedPool,
+    quota: u64,
+    configure: impl FnOnce(&mut SessionConfig),
+    prepare: impl FnOnce(&TaskContext),
+) -> DFResult<SpillRun> {
     let dir = tempfile::tempdir().expect("scratch dir");
     let capped = Arc::new(capped);
     let pool: Arc<dyn MemoryPool> = Arc::clone(&capped) as Arc<dyn MemoryPool>;
     let plan = spilling(&planned.physical);
-    let task_ctx = spill_task_ctx(planned, Arc::clone(&pool), dir.path(), quota);
+    let task_ctx = spill_task_ctx(planned, Arc::clone(&pool), dir.path(), quota, configure);
+    let compression = task_ctx.session_config().spill_compression();
     prepare(&task_ctx);
     let result = collect(Arc::clone(&plan), task_ctx).await;
     let exec = find_bucketed(&plan).expect("a bucketed exec");
@@ -1901,6 +1921,7 @@ async fn run_spilled_on(
     let batches = result?;
     let metrics = exec.metrics().expect("metrics");
     Ok(SpillRun {
+        compression,
         rows: render_sorted(&batches),
         routed_rows: counter_by_partition(&exec, "routed_rows", partitions)
             .iter()
@@ -2036,13 +2057,15 @@ fn scaled(trigger: Trigger, share: (usize, usize)) -> Trigger {
 
 /// The write-once disk bound of ADR-3565 amendment 2, item 2, checked on a
 /// run whose routed rows are `row_bytes` wide over `columns` columns, at
-/// `buckets` buckets over all streams: every routed row written exactly once,
+/// `buckets` buckets over all streams: every routed row written at most once
 /// (a refusal while phase 2 drains writes only the later buckets' chunks),
-/// read back exactly once, the column bytes exactly `spilled_rows x w` plus
-/// validity, and the framing at most `FRAMING_PER_MESSAGE` per IPC message,
-/// whose count is itself bounded by the routed chunks, the partly filled
-/// chunks each refusal and each stream's end write, and, after a phase 1
-/// trigger, the forced slices' pieces.
+/// every written row read back once, the bytes written at most
+/// `spilled_rows x w` plus validity plus `FRAMING_PER_MESSAGE` per IPC
+/// message and per file, and, uncompressed, at least `spilled_rows x w`; the
+/// message count at least the file count and at most the routed chunks, the
+/// partly filled chunks each refusal and each stream's end write, and, after
+/// a phase 1 trigger, the forced slices' pieces; and from 1 to `buckets`
+/// files.
 fn assert_within_write_once_bound(
     what: &str,
     run: &SpillRun,
@@ -2087,15 +2110,26 @@ fn assert_within_write_once_bound(
         "{what}: {} bytes written over the {bound}-byte bound",
         run.spilled_bytes
     );
+    // lz4_frame shrinks a buffer below its column bytes; uncompressed IPC
+    // cannot.
+    if run.compression == SpillCompression::Uncompressed {
+        assert!(
+            run.spilled_bytes >= run.spilled_rows * row_bytes,
+            "{what}: {} bytes written under the {} column bytes",
+            run.spilled_bytes,
+            run.spilled_rows * row_bytes
+        );
+    }
     assert!(
-        run.spilled_bytes >= run.spilled_rows * row_bytes,
-        "{what}: {} bytes written under the {} column bytes",
-        run.spilled_bytes,
-        run.spilled_rows * row_bytes
-    );
-    assert!(
-        run.spill_files <= buckets,
+        (1..=buckets).contains(&run.spill_files),
         "{what}: {} files for {buckets} buckets, over 2^bits per stream",
+        run.spill_files
+    );
+    // A file is created by its first message.
+    assert!(
+        run.batches_written >= run.spill_files,
+        "{what}: {} messages for {} files",
+        run.batches_written,
         run.spill_files
     );
 }
@@ -2138,55 +2172,161 @@ async fn bucket_spill_writes_each_routed_row_once() {
     }
 }
 
-/// `w` is 16 here, a timestamp key and an `Int64` count.
+/// `w` is 16 here, a timestamp key and an `Int64` count, neither ever NULL,
+/// so the rows decoded on read-back are exactly 16 bytes each, under the
+/// lz4_frame compression the spill retry sets as under none, while the file
+/// bytes written under lz4_frame are not.
 #[tokio::test]
 async fn bucket_spill_disk_within_write_once_bound() {
     const PARTITIONS: usize = 2;
-    for trigger in [PHASE_2, PHASE_1] {
-        let run = spilled(SAMPLES_SQL, PARTITIONS, trigger).await;
-        assert_eq!(run.spilled_rows, run.routed_rows, "{}", trigger.name);
-        assert_within_write_once_bound(
-            trigger.name,
-            &run,
-            16,
-            2,
-            PARTITIONS << trigger.bits,
-            trigger.scales,
-        );
-        assert!(
-            run.bytes_read >= run.rows_read * 16,
-            "{}: {} decoded bytes for {} rows",
-            trigger.name,
-            run.bytes_read,
-            run.rows_read
-        );
+    for compression in [
+        SpillCompression::Uncompressed,
+        SpillDecision::SPILL_COMPRESSION,
+    ] {
+        for trigger in [PHASE_2, PHASE_1] {
+            let what = format!("{} {compression:?}", trigger.name);
+            let planned = Planned::new(
+                SAMPLES_SQL,
+                sql_config(PARTITIONS, Some(trigger.tuning()), None),
+            )
+            .await;
+            let run = run_spilled_with(
+                &planned,
+                PARTITIONS,
+                CappedPool::new(trigger.cap(PARTITIONS)),
+                1 << 30,
+                |config| config.options_mut().execution.spill_compression = compression,
+                |_| {},
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(run.spilled_rows > 0, "{what} spilled nothing: {run:?}");
+            assert_eq!(run.spilled_rows, run.routed_rows, "{what}");
+            assert_within_write_once_bound(
+                &what,
+                &run,
+                16,
+                2,
+                PARTITIONS << trigger.bits,
+                trigger.scales,
+            );
+            assert_eq!(
+                run.bytes_read,
+                run.rows_read * 16,
+                "{what}: decoded bytes against rows decoded"
+            );
+            if compression == SpillDecision::SPILL_COMPRESSION {
+                assert!(
+                    run.spilled_bytes < run.bytes_read,
+                    "{what}: {} file bytes for {} decoded",
+                    run.spilled_bytes,
+                    run.bytes_read
+                );
+            }
+        }
+    }
+}
+
+/// A spill-on exec records at execute time whether its disk manager allows
+/// temp files, which is what the spill retry's report reads: with the disk
+/// manager disabled it ran without spill and says so.
+#[tokio::test]
+async fn bucket_spill_records_a_disabled_disk_manager() {
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    let expected = unspilled_rows(SAMPLES_SQL, 2).await;
+    for (mode, available) in [
+        (DiskManagerMode::Disabled, false),
+        (DiskManagerMode::OsTmpDirectory, true),
+    ] {
+        let planned = Planned::new(SAMPLES_SQL, sql_config(2, Some(PHASE_2.tuning()), None)).await;
+        let plan = spilling(&planned.physical);
+        let exec = find_bucketed(&plan).expect("a bucketed exec");
+        let bucketed = exec
+            .downcast_ref::<BucketedFinalAggregateExec>()
+            .expect("bucketed");
+        assert!(bucketed.spill());
+        assert!(!bucketed.spill_available(), "before execute");
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(mode))
+            .build_arc()
+            .expect("runtime");
+        let ctx = Arc::try_unwrap(planned.ctx.task_ctx()).unwrap_or_else(|_| panic!("unshared"));
+        let batches = collect(Arc::clone(&plan), Arc::new(ctx.with_runtime(runtime)))
+            .await
+            .expect("answers");
+        assert_eq!(render_sorted(&batches), expected);
+        assert_eq!(bucketed.spill_available(), available, "{available}");
     }
 }
 
 /// The phase 1 trigger routes the stock table under the charge it already
-/// holds: each bucketed consumer's first refusal is followed by the
-/// recomputed charge's shrink, never by another grow.
+/// holds, and sizes the router's scratch once inside it. At a cap that
+/// refuses each stream's table with more than a batch of its input still to
+/// come, every bucketed consumer's first refusal is
+/// followed by the recomputed charge's shrink, and from there to the end of
+/// its input the stream asks the pool for routed chunks and nothing else (a
+/// scratch sized per batch would be a grow of another size), over more
+/// chunks than one batch of the session's `batch_size` rows can open.
 #[tokio::test]
 async fn bucket_spill_forced_route_asks_nothing() {
-    let run = spilled(SAMPLES_SQL, 2, PHASE_1).await;
+    const BATCH_ROWS: usize = 8192;
+    const CAP: usize = 640 << 10;
+    const SAMPLES_HERE: i64 = 4 * SAMPLES;
+    let tuning = BucketedFinalAggregation {
+        bits: 5,
+        ..PHASE_1.tuning()
+    };
+    let planned =
+        Planned::with_samples(SAMPLES_SQL, sql_config(2, Some(tuning), None), SAMPLES_HERE).await;
+    let run = run_spilled(&planned, 2, CAP)
+        .await
+        .expect("spills and answers");
+    assert!(run.spilled_rows > 0, "nothing spilled: {run:?}");
+    assert_eq!(
+        run.rows,
+        unspilled_rows_of(SAMPLES_SQL, 2, SAMPLES_HERE).await
+    );
+    let chunk = ravel_sql::routed_chunk_charge(&[8, 8], SPILL_CHUNK_ROWS).expect("fits");
+    let one_batch = BATCH_ROWS.div_ceil(SPILL_CHUNK_ROWS) + (1 << tuning.bits);
     let mut by_consumer: std::collections::BTreeMap<&str, Vec<PoolEvent>> = Default::default();
     for (name, event) in &run.events {
         by_consumer.entry(name).or_default().push(*event);
     }
-    let mut forced = 0;
+    assert_eq!(by_consumer.len(), 2, "{run:?}");
     for (name, events) in &by_consumer {
-        let Some(at) = events.iter().position(|e| *e == PoolEvent::Refused) else {
-            continue;
-        };
-        forced += 1;
+        let at = events
+            .iter()
+            .position(|e| matches!(e, PoolEvent::Refused(_)))
+            .unwrap_or_else(|| panic!("{name} was never refused: {events:?}"));
         assert_eq!(
             events.get(at + 1),
             Some(&PoolEvent::Shrunk),
             "{name}: the forced route asked the pool: {:?}",
             &events[at..(at + 4).min(events.len())]
         );
+        // The drain's tables and read-back batches follow the last chunk.
+        let asks: Vec<usize> = events[at + 1..]
+            .iter()
+            .filter_map(|e| match e {
+                PoolEvent::Grown(bytes) | PoolEvent::Refused(bytes) => Some(*bytes),
+                _ => None,
+            })
+            .collect();
+        let routed = asks
+            .iter()
+            .rposition(|bytes| *bytes == chunk)
+            .map_or(&asks[..0], |last| &asks[..=last]);
+        assert!(
+            routed.iter().all(|bytes| *bytes == chunk),
+            "{name} asked for more than {chunk}-byte chunks after its forced route: {routed:?}"
+        );
+        assert!(
+            routed.len() > one_batch,
+            "{name}: {} chunk asks after the forced route, one batch opens up to {one_batch}",
+            routed.len()
+        );
     }
-    assert!(forced > 0, "no consumer was refused: {run:?}");
 }
 
 /// At a quarter of the phase 2 share the stream runs out of routed state to
@@ -2381,7 +2521,7 @@ async fn bucket_spill_deletes_each_file_after_reading_it() {
     let dir = tempfile::tempdir().expect("scratch dir");
     let pool: Arc<dyn MemoryPool> = Arc::new(CappedPool::new(PHASE_2.cap(PARTITIONS)));
     let plan = spilling(&planned.physical);
-    let task_ctx = spill_task_ctx(&planned, Arc::clone(&pool), dir.path(), 1 << 30);
+    let task_ctx = spill_task_ctx(&planned, Arc::clone(&pool), dir.path(), 1 << 30, |_| {});
     let disk = Arc::clone(&task_ctx.runtime_env().disk_manager);
     let exec = find_bucketed(&plan).expect("a bucketed exec");
     // Every stream past its input, so nothing is written from here on.
@@ -2477,7 +2617,7 @@ async fn bucket_spill_cancel_releases_share_and_scratch() {
     let dir = tempfile::tempdir().expect("scratch dir");
     let pool: Arc<dyn MemoryPool> = Arc::new(CappedPool::new(PHASE_2.cap(PARTITIONS)));
     let plan = spilling(&planned.physical);
-    let task_ctx = spill_task_ctx(&planned, Arc::clone(&pool), dir.path(), 1 << 30);
+    let task_ctx = spill_task_ctx(&planned, Arc::clone(&pool), dir.path(), 1 << 30, |_| {});
     let exec = find_bucketed(&plan).expect("a bucketed exec");
     let firsts = (0..PARTITIONS).map(|partition| {
         let exec = Arc::clone(&exec);
@@ -2653,7 +2793,6 @@ struct KeyCase {
     mult: i64,
     modulus: i64,
     partitions: usize,
-    phase_1: bool,
 }
 
 impl KeyCase {
@@ -2681,10 +2820,9 @@ fn arb_key_case() -> impl proptest::strategy::Strategy<Value = KeyCase> {
         1i64..10,
         2_000i64..30_000,
         prop_oneof![Just(2usize), Just(4)],
-        any::<bool>(),
     )
         .prop_map(
-            |(key_type, null_every, skew, hot, mult, modulus, partitions, phase_1)| KeyCase {
+            |(key_type, null_every, skew, hot, mult, modulus, partitions)| KeyCase {
                 key_type,
                 null_every,
                 skew,
@@ -2692,61 +2830,66 @@ fn arb_key_case() -> impl proptest::strategy::Strategy<Value = KeyCase> {
                 mult,
                 modulus,
                 partitions,
-                phase_1,
             },
         )
 }
 
-/// The spilled answer for `case` is the in-memory answer, within the
-/// write-once disk bound.
+/// Batches of this many rows keep a batch's table working set small beside
+/// the drain's share.
+const KEY_CASE_BATCH_ROWS: usize = 1024;
+
+/// The phase 2 cap of every key case: it holds one bucket's table while the
+/// stream drains, and is under the charge of one open
+/// `KEY_CASE_CHUNK_ROWS`-row chunk per bucket (32 x 41,984 bytes for an
+/// `Int16` key), so routing alone is refused whatever the case's groups.
+const KEY_CASE_CAP: usize = 1 << 20;
+const KEY_CASE_CHUNK_ROWS: usize = 4 * SPILL_CHUNK_ROWS;
+
+/// The phase 2 spilled answer for `case` is the in-memory answer, within the
+/// write-once disk bound, and the case spilled.
 async fn check_key_case(case: KeyCase) {
     let sql = case.sql();
     let expected = unspilled_rows(&sql, case.partitions).await;
-    // The phase 1 cap follows the case's groups at twice the unique
-    // fixture's bytes per group, so a bucket's table always fits it: a cap
-    // under one bucket's table is the typed under-shoot, not a spill case.
-    // Each stream's cap is also kept above one batch's table working set,
-    // about 390 KB at 8192 rows whatever the groups or the partitions, plus
-    // what the stream retains beside it.
-    const STREAM_FLOOR: usize = 768 << 10;
-    let trigger = if case.phase_1 {
-        let groups = (case.modulus as usize).min(SAMPLES as usize);
-        let scaled = scaled(PHASE_1, (2 * groups, SAMPLES as usize));
-        Trigger {
-            cap_at_two: scaled.cap_at_two.max(STREAM_FLOOR * case.partitions / 2),
-            ..scaled
-        }
-    } else {
-        Trigger {
-            cap_at_two: PHASE_2.cap_at_two.max(STREAM_FLOOR),
-            ..PHASE_2
-        }
+    let tuning = BucketedFinalAggregation {
+        routed_chunk_rows: KEY_CASE_CHUNK_ROWS,
+        ..PHASE_2.tuning()
     };
-    let planned = Planned::new(
-        &sql,
-        sql_config(case.partitions, Some(trigger.tuning()), None),
+    let open_chunks = ravel_sql::routed_chunk_charge(&[case.key_type.1, 8], KEY_CASE_CHUNK_ROWS)
+        .expect("fits")
+        << tuning.bits;
+    assert!(open_chunks > KEY_CASE_CAP, "{open_chunks}");
+    let planned = Planned::new(&sql, sql_config(case.partitions, Some(tuning), None)).await;
+    let run = run_spilled_with(
+        &planned,
+        case.partitions,
+        CappedPool::new(KEY_CASE_CAP),
+        1 << 30,
+        |config| *config = std::mem::take(config).with_batch_size(KEY_CASE_BATCH_ROWS),
+        |_| {},
     )
-    .await;
-    let run = run_spilled(&planned, case.partitions, trigger.cap(case.partitions))
-        .await
-        .unwrap_or_else(|e| panic!("{sql} ({case:?}): {e}"));
+    .await
+    .unwrap_or_else(|e| panic!("{sql} ({case:?}): {e}"));
     assert_eq!(run.rows, expected, "{sql} ({case:?})");
+    assert!(
+        run.spilled_rows > 0,
+        "{sql} ({case:?}) spilled nothing: {run:?}"
+    );
     assert_within_write_once_bound(
         &sql,
         &run,
         case.key_type.1 + 8,
         2,
-        case.partitions << trigger.bits,
-        trigger.scales,
+        case.partitions << tuning.bits,
+        false,
     );
 }
 
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
 
-    /// Random fixed-width keys, NULL placement, skew and partition counts:
-    /// the spilled answer is the in-memory answer and the disk stays within
-    /// the write-once bound.
+    /// Random fixed-width keys, NULL placement, skew and partition counts,
+    /// each spilled through phase 2: the spilled answer is the in-memory
+    /// answer and the disk stays within the write-once bound.
     #[test]
     fn bucket_spill_random_keys_match_in_memory_answer(case in arb_key_case()) {
         tokio::runtime::Builder::new_current_thread()

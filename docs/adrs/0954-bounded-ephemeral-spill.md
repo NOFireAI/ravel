@@ -1287,7 +1287,7 @@ This is the parallel bucket spill amendment. The figures are from epic
    plan is kept when all of these hold:
    - every `AggregateExec` in it with mode `FinalPartitioned` was replaced
      by a `BucketedFinalAggregateExec`, which is to say
-     `BucketedFinalAggregateRule::admits` (`bucketed_final_aggregate.rs:223`)
+     `BucketedFinalAggregateRule::admits` (`bucketed_final_aggregate.rs:228`)
      accepted each one;
    - every `RepartitionExec` in it has `preserve_order` false;
    - the bucket spill amendment's derivation returns a tuning, which
@@ -1310,11 +1310,17 @@ This is the parallel bucket spill amendment. The figures are from epic
    above a non-preserve-order exchange may rely on that order, spilled or
    not, because the in-memory channel already interleaves its inputs in
    arbitrary order. That classifies the exchange spill the 2026-11-07
-   rejected alternative left open, for this plan shape only. Pinned by T2
-   #4074 (`retry_plans_bucketed_exchange_for_admitted_shape`,
-   `retry_keeps_sort_merge_for_unadmitted_shape`, and the differential
-   test `bucket_spill_retry_matches_unspilled_answer` at 2, 4 and 16
-   partitions; at 1 partition the rule plans no bucketed exec).
+   rejected alternative left open, for this plan shape only. None of this
+   item is in the retry yet: T2 #4074 ships the exec's spill, the
+   derivation and its inputs, and nothing in the retry plans with them.
+   The retry planning above, and its tests, are T3 #4075 deliverables: a
+   test that the retry of an admitted shape plans the bucketed exchange, a
+   test that an unadmitted shape keeps the sort-merge retry, and a
+   differential test of the retry's answer against the unspilled run at
+   2, 4 and 16 partitions (at 1 partition the rule plans no bucketed
+   exec). What T2 pins is the exec's half: ADR-3565's bucket spill
+   amendment, item 6, runs the exec built with spill on against the
+   unspilled answer at those partition counts.
 
 2. **How the exchange's memory is bounded under the spill-mode pool.**
    Cited to DataFusion 55.2.0, `datafusion-physical-plan`
@@ -1343,7 +1349,8 @@ This is the parallel bucket spill amendment. The figures are from epic
      so they count against the same `max_temp_directory_size` as every other
      spill file (`datafusion-execution` 55.2.0 `src/disk_manager.rs:478-500`;
      Ravel sets that quota from the reserved share at `session.rs:626-629`).
-     A quota trip is the typed `spill_budget_exhausted` (`executor.rs:6482`).
+     A quota trip is the typed `spill_budget_exhausted` (`spill_error`,
+     `executor.rs:6478-6499`).
    - Uncharged: the `SharedCoalescer` on each output partition holds fewer
      than `batch_size` rows before `send` (lines 269-300, created at
      537-545), and the reader holds the one batch it read back. So the
@@ -1358,23 +1365,27 @@ This is the parallel bucket spill amendment. The figures are from epic
      drain, and they are reported as their own phase (item 4), not assumed
      to be zero.
 
-   Pinned by T2 #4074 (`exchange_spill_within_share_under_skew`: the
+   No test pins this item yet, because no retry plans the exchange under
+   the spill-mode pool until T3. Its test is a T3 #4075 deliverable: the
    90%-one-key fixture at a share small enough to make the exchange spill,
    asserting a nonzero exchange spill count, a peak charge within the
-   share, and the answer of the unspilled run).
+   share, and the answer of the unspilled run.
 
 3. **No third attempt.** The kept plan runs as the statement's one spill
    retry. Its failure is terminal: `spill_retry_decision` returns no retry
-   once `spill_retried` is set (`executor.rs:6716-6729`), and this
+   once `spill_retried` is set (`executor.rs:6721-6738`), and this
    amendment adds no fallback to the sort-merge plan after a bucketed
    retry fails. A bucketed retry fails with one of the typed errors
-   ADR-3565's bucket spill amendment lists. Pinned by T2 #4074
-   (`bucket_spill_retry_failure_is_terminal`).
+   ADR-3565's bucket spill amendment lists. Its test, that a failed
+   bucketed retry is the statement's error with no third attempt, is a
+   T3 #4075 deliverable, since no retry is bucketed before T3.
 
 4. **Counters, per phase.** `SpillRetryReport` (`executor.rs`) and its
    INFO line gain:
-   - the retry plan, `bucket` or `sort_merge`, and for `bucket` the
-     derived `bits` and `routed_chunk_rows`;
+   - the retry plan, `bucket`, `bucket_without_disk` (a bucketed exec
+     ran with spill on and a disk manager that allows no temp files, so
+     it could not spill) or `sort_merge`, and for both bucketed values
+     the derived `bits` and `routed_chunk_rows`;
    - `exchange_spill_bytes_written` and `exchange_spill_files`: the spill
      metrics of every `RepartitionExec` in the plan, read through
      `accumulate_spill_counts` (`spill.rs:815`) as today's per-operator
@@ -1397,7 +1408,12 @@ This is the parallel bucket spill amendment. The figures are from epic
    a sort-merge retry's line reads as before. Pinned by T2 #4074
    (`spill_retry_report_splits_exchange_and_bucket_bytes`, which asserts
    each phase's figure exactly on a fixture and that they sum to the
-   total).
+   total, and that a bucketed exec without a temp-file disk manager
+   reports `bucket_without_disk`). A production report carries no bucketed
+   figures until T3 #4075 runs the bucketed retry:
+   `bucket_spill_figures` reads only an exec built with spill on
+   (`bucketed_final_aggregate.rs:452-453`), and nothing outside tests
+   builds one.
 
 5. **The ADR-1195 partition floor.** The kept plan is built by the same
    physical optimizer rules in the same order as the first attempt, so
@@ -1411,8 +1427,8 @@ This is the parallel bucket spill amendment. The figures are from epic
    derivation divides by; ADR-3565's bucket spill amendment counts them.
    ADR-1195's floor amendment, item 2, states that the retry is
    repartition-free and has no exchange to widen. For the shapes item 1
-   admits that stops being true once T2 lands; ADR-1195's item 2 carries
-   the correction.
+   admits that stops being true once T3 #4075 plans the bucketed
+   exchange in the retry; ADR-1195's item 2 carries the correction.
 
 ### Parallel bucket spill rejected alternatives
 
@@ -1471,8 +1487,9 @@ ClickHouse/ClickBench `ravel/start:65` at commit 6ba54cd1da84). This
 repository's kit does not (`benchmarks/clickbench/kit/box/run.sh`
 `launch_server` execs the binary unchanged), and neither does a service
 unit with the common soft limit of 1,024. So T2 (#4074) makes ravel-server
-raise its own soft `nofile` limit to the hard limit at startup, before
-the descriptor budget reads it, and log both values, which is what makes
+raise its own soft `nofile` limit to the hard limit at startup and log
+both values. Nothing reads the raised limit yet: passing it into the
+descriptor budget is a T3 #4075 deliverable, and that is what will make
 the bucketed retry reachable outside the entry. M7 did not record the
 hard limit on these Ubuntu 24.04 boxes. T3 stamps each box's soft limit,
 from that startup line, beside its run and requires at least 8,320 on
@@ -1499,8 +1516,8 @@ miss, not a precondition's.
 
 ### Parallel bucket spill consequences
 
-- A statement the bucketed rule admits, refused on its first attempt,
-  retries as `P` bucketed final streams under a hash exchange instead of
+- Once T3 #4075 wires the retry, a statement the bucketed rule admits,
+  refused on its first attempt, retries as `P` bucketed final streams under a hash exchange instead of
   one sort-merge stream. Its spill is written once (ADR-3565 bucket spill
   amendment), so its retry writes the routed state's bytes instead of the
   merge's repeated passes.

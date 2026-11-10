@@ -2,14 +2,16 @@
 //! item 1).
 //!
 //! A bucketed spill retry holds two descriptors per bucket file, and the
-//! bucket spill derivation returns no tuning when that need exceeds a share of
-//! the soft `RLIMIT_NOFILE`. Service managers and container runtimes commonly
-//! leave the soft limit at 1,024 under a far higher hard limit, so the server
-//! raises its soft limit to the hard limit before anything reads it, and logs
-//! both. After a raise the soft limit equals the hard limit. It stays at the
-//! inherited value in two cases: the hard limit is unbounded (Linux refuses an
-//! unbounded soft limit past `fs.nr_open`), or the kernel refuses the raise,
-//! whose errno is kept and logged.
+//! bucket spill derivation (`ravel_sql::derive_bucket_spill_tuning`) returns
+//! no tuning when that need exceeds a share of the soft `RLIMIT_NOFILE` it is
+//! given. Nothing in the server passes it this limit yet: wiring the
+//! derivation into the spill retry is T3 #4075. Service managers and
+//! container runtimes commonly leave the soft limit at 1,024 under a far
+//! higher hard limit, so the server raises its soft limit to the hard limit
+//! at startup and logs both. After a raise the soft limit equals the hard
+//! limit. It stays at the inherited value in two cases: the hard limit is
+//! unbounded (Linux refuses an unbounded soft limit past `fs.nr_open`), or
+//! the kernel refuses the raise, whose errno is kept and logged.
 
 use rustix::io::Errno;
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
@@ -42,7 +44,15 @@ fn raised_soft(soft: Option<u64>, hard: Option<u64>) -> Option<u64> {
 /// force afterwards. Called once, at startup, before anything reads the
 /// limit.
 pub fn raise_nofile_soft_limit() -> NofileLimit {
-    let before = getrlimit(Resource::Nofile);
+    resolve(getrlimit(Resource::Nofile), |raised| {
+        setrlimit(Resource::Nofile, raised)
+    })
+}
+
+/// The limits in force after asking `set` to raise `before`'s soft limit:
+/// [`raise_nofile_soft_limit`] with the two system calls taken apart, so a
+/// refused raise can be fed in.
+fn resolve(before: Rlimit, set: impl FnOnce(Rlimit) -> Result<(), Errno>) -> NofileLimit {
     let Some(target) = raised_soft(before.current, before.maximum) else {
         return NofileLimit {
             soft: before.current,
@@ -55,7 +65,7 @@ pub fn raise_nofile_soft_limit() -> NofileLimit {
         current: Some(target),
         maximum: before.maximum,
     };
-    match setrlimit(Resource::Nofile, raised) {
+    match set(raised) {
         Ok(()) => NofileLimit {
             soft: Some(target),
             hard: before.maximum,
@@ -72,8 +82,8 @@ pub fn raise_nofile_soft_limit() -> NofileLimit {
 }
 
 impl NofileLimit {
-    /// The soft limit as the bucket spill derivation reads it, `u64::MAX`
-    /// for unbounded.
+    /// The soft limit in the form the bucket spill derivation's `nofile_soft`
+    /// takes, `u64::MAX` for unbounded. It has no caller yet (T3 #4075).
     pub fn soft_or_max(&self) -> u64 {
         self.soft.unwrap_or(u64::MAX)
     }
@@ -147,6 +157,42 @@ mod tests {
             }
             other => panic!("unknown source {other}: {limit:?}"),
         }
+    }
+
+    /// A raise the kernel refuses keeps the inherited soft limit and the
+    /// errno, and is reported as refused; an accepted one moves the soft limit
+    /// to the hard limit.
+    #[test]
+    fn a_refused_raise_keeps_the_soft_limit_and_its_errno() {
+        let before = Rlimit {
+            current: Some(1024),
+            maximum: Some(524_288),
+        };
+        let mut asked = None;
+        let refused = resolve(before, |raised| {
+            asked = raised.current;
+            Err(Errno::PERM)
+        });
+        assert_eq!(asked, Some(524_288));
+        assert_eq!(
+            refused,
+            NofileLimit {
+                soft: Some(1024),
+                hard: Some(524_288),
+                source: "raise-refused",
+                refusal: Some(Errno::PERM),
+            }
+        );
+        let raised = resolve(before, |_| Ok(()));
+        assert_eq!(
+            raised,
+            NofileLimit {
+                soft: Some(524_288),
+                hard: Some(524_288),
+                source: "raised",
+                refusal: None,
+            }
+        );
     }
 
     #[test]

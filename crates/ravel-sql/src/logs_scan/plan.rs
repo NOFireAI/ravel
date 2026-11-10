@@ -119,6 +119,10 @@ struct PlannedBlocks {
     /// Per entry of `groups`, its [`group_key`]: the order [`global_order`]
     /// sorts the group in.
     group_min_ts: Vec<i64>,
+    /// Per entry of `groups`, the sum of its blocks' skip-index
+    /// `record_count`: the rows a unit holding that group stands for
+    /// ([`OwnedSeg::rows`]).
+    group_rows: Vec<u64>,
     /// This segment's directories and carried whole object, one handle per
     /// published [`OwnedSeg`] of it.
     carried: CarrySlot,
@@ -152,10 +156,21 @@ impl PlannedBlocks {
             .iter()
             .map(|group| group_key(group, |block| l0.get(block).map(|e| (e.min_ts, e.max_ts))))
             .collect();
+        let group_rows = groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .filter_map(|&block| l0.get(block))
+                    .map(|e| u64::from(e.record_count))
+                    .sum()
+            })
+            .collect();
         PlannedBlocks {
             indices: Arc::new(indices),
             groups,
             group_min_ts,
+            group_rows,
             carried: CarrySlot::new(
                 CarriedDirs {
                     dirs,
@@ -989,6 +1004,29 @@ impl PlanCounts {
         self.unplanned.get(seg_idx).copied().unwrap_or(false)
     }
 
+    /// The rows of `segments` no published unit stands for: every segment the
+    /// plan left neither planned nor unplanned (out of the ts range, pruned by
+    /// a KEY_IDX route or probe, no surviving block) and every block of a
+    /// planned segment it did not publish (the skip index's prune, the KEY_IDX
+    /// block prune). The scan's rows-consumed counter
+    /// ([`super::METRIC_ROWS_CONSUMED`]) takes these once, from partition 0,
+    /// and each unit's own [`OwnedSeg::rows`] when its partition finishes it.
+    pub(super) fn unpublished_rows(&self, segments: &[SegmentRef]) -> u64 {
+        segments
+            .iter()
+            .enumerate()
+            .map(|(seg_idx, seg)| {
+                let published = if self.is_unplanned(seg_idx) {
+                    seg.sample_count
+                } else {
+                    self.planned(seg_idx)
+                        .map_or(0, |planned| planned.group_rows.iter().sum())
+                };
+                seg.sample_count.saturating_sub(published)
+            })
+            .sum()
+    }
+
     /// The units this plan publishes for `partitions` partitions, in
     /// publication order, as `(snapshot segment index, blocks)` (ADR-0102
     /// decision 1):
@@ -1068,6 +1106,7 @@ impl PlanCounts {
                 let seg = segments.get(seg_idx)?.clone();
                 if blocks == UnitBlocks::Unplanned {
                     return Some(OwnedSeg {
+                        rows: seg.sample_count,
                         seg,
                         ordinal: seg_idx,
                         indices: Vec::new(),
@@ -1081,19 +1120,26 @@ impl PlanCounts {
                 }
                 let unit = self.segs.get(seg_idx)?.as_ref()?;
                 let planned = unit.planned.as_ref()?;
-                let indices = match blocks {
-                    UnitBlocks::Groups(run) => run
-                        .iter()
-                        .filter_map(|&pos| planned.groups.get(pos))
-                        .flatten()
-                        .copied()
-                        .collect(),
-                    UnitBlocks::Unplanned | UnitBlocks::All => planned.groups.concat(),
+                let (indices, rows) = match blocks {
+                    UnitBlocks::Groups(run) => (
+                        run.iter()
+                            .filter_map(|&pos| planned.groups.get(pos))
+                            .flatten()
+                            .copied()
+                            .collect(),
+                        run.iter()
+                            .filter_map(|&pos| planned.group_rows.get(pos))
+                            .sum(),
+                    ),
+                    UnitBlocks::Unplanned | UnitBlocks::All => {
+                        (planned.groups.concat(), planned.group_rows.iter().sum())
+                    }
                 };
                 let Carry { dirs, whole_object } = planned.carried.take();
                 Some(OwnedSeg {
                     seg,
                     ordinal: seg_idx,
+                    rows,
                     indices,
                     survivors: Some(Arc::clone(&planned.indices)),
                     footer: unit.footer.clone(),
@@ -1362,6 +1408,11 @@ pub(super) struct OwnedSeg {
     /// This segment's position in the snapshot's segment list, i.e. the
     /// segment field of every row-ref built from it (ADR-0774).
     pub(super) ordinal: usize,
+    /// The rows this unit stands for: the segment's `sample_count` for a
+    /// whole-segment unit, the skip-index `record_count` of `indices`
+    /// otherwise. Its partition counts them as consumed once it finishes the
+    /// unit, however many of them it decoded.
+    pub(super) rows: u64,
     pub(super) indices: Vec<usize>,
     /// The segment's whole surviving-block list this query's plan produced
     /// (ascending whole-object block indices), of which `indices` is this
@@ -1451,6 +1502,7 @@ pub(super) fn owned_whole_segments(
             work.push_back(OwnedSeg {
                 seg: seg.clone(),
                 ordinal: seg_idx,
+                rows: seg.sample_count,
                 indices: Vec::new(),
                 survivors: None,
                 footer: None,
@@ -3598,6 +3650,18 @@ mod carried_directory_reservation_tests {
             (0..BLOCKS).collect::<Vec<_>>()
         );
         assert!(!counts.is_unplanned(1) && !counts.is_unplanned(2));
+        // Rows consumed: the KEY_IDX-pruned segment's 12 rows and the 10
+        // blocks segment 1's route dropped count up front; the published
+        // units stand for the other 14, so the two sum to the scan's input.
+        assert_eq!(counts.unpublished_rows(&segments), 12 + 10);
+        let unit_rows = |counts: &PlanCounts| -> u64 {
+            counts
+                .publish(&segments, &[0, 1, 2], true, 2)
+                .iter()
+                .map(|unit| unit.rows)
+                .sum()
+        };
+        assert_eq!(unit_rows(&counts), 2 + 12);
 
         let sub_bound = ctx(LogSegmentFetcher::new(store.clone()));
         assert!(segments.iter().all(|s| !sub_bound.fetcher.plans_segment(s)));
@@ -3608,6 +3672,8 @@ mod carried_directory_reservation_tests {
         assert_eq!(counts.key_index.segments_pruned, 1);
         assert!(counts.is_unplanned(1) && counts.is_unplanned(2));
         assert!(counts.segs[1].is_none() && counts.segs[2].is_none());
+        assert_eq!(counts.unpublished_rows(&segments), 12);
+        assert_eq!(unit_rows(&counts), 12 + 12);
     }
 
     /// A plan pass that fails after routing, then succeeds on the retry a

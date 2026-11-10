@@ -7,3 +7,4 @@
 cc b16429a99987f4ed2d58dd2962827aa980816e625356bbfbd8b2b9175aed9eb9 # shrinks to case = KeyCase { key_type: ("Int32", 4), null_every: None, skew: 0, hot: 0, mult: 1, modulus: 7009, partitions: 2, phase_1: true }
 cc a520eeedbed0c172a14d2f7153a83bc63d59dc77f5771e21eec6928bc8592464 # shrinks to case = KeyCase { key_type: ("Int16", 2), null_every: Some(2), skew: 0, hot: 0, mult: 1, modulus: 2000, partitions: 4, phase_1: true }
 cc e7e442b1a7a79c66b0cd1513433a760cdd085c3b2309a0deaf0dd97755482803 # shrinks to case = KeyCase { key_type: ("Int16", 2), null_every: Some(2), skew: 0, hot: 0, mult: 1, modulus: 10107, partitions: 2, phase_1: false }
+cc 7167b9b31f56d206f6dbb491e4ed35831b6d0efad26d6bb09b4c5bb6f9a5586f # shrinks to case = KeyCase { key_type: ("Int16", 2), null_every: Some(2), skew: 0, hot: 0, mult: 3, modulus: 7132, partitions: 2 }
