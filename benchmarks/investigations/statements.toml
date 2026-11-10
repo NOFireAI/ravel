@@ -33,11 +33,10 @@
 #              "wide" (the corpus span plus one hour), each centred on the
 #              anchor below, or "midnight" (the hour that spans a UTC
 #              midnight the state's corpus holds, 23:30 to 00:30, so it reads
-#              the day parts either side of it). Task H1b, #4048, adds it with
-#              the day_parts_7 state: until then truth.json has no midnight
-#              field, so box/lib/inv.py plan records the call not-run through
-#              requires = "midnight" before it computes any window (its
-#              window_bounds has no midnight arm yet and would exit 64)
+#              the day parts either side of it). The day_parts_7 state writes
+#              truth.json's midnight field (box/lib/inv.py midnight-truth) and
+#              window_bounds computes the window; a truth.json without that
+#              field records the call not-run through requires = "midnight"
 #   anchor     "trace" (the run's saved trace start) or "cell" (the middle of
 #              the failing hour); unused for window = "none"
 #   per_run    "saved_trace": cold run i reads saved trace i, so every cold
@@ -53,8 +52,8 @@
 #              own and holds a base list's key only through an id collision,
 #              which would read as a wrong answer (README "States").
 #              day_parts_7, day_parts_30 and retired_hour are ADR-3939's
-#              multi-day states, which box/run.sh does not build yet (task
-#              H1b, #4048); row 18's six key-set statements also run in
+#              multi-day states, which box/run.sh builds (state_day_parts and
+#              state_retired_hour); row 18's six key-set statements also run in
 #              day_parts_7 for ADR-3939 row A6
 #   cold_only  true: no warm repeat
 #   control    true: one of the 43 ClickBench statements of the
@@ -691,10 +690,10 @@ states = ["day_parts_7"]
 cold_only = true
 
 # The key is one request_id inside the hour spanning midnight, so the answer
-# is that key's row. gen_corpus.py writes no midnight truth yet (task H1b,
-# #4048): until it does, truth.json carries no midnight field and box/lib/
-# inv.py plan records the call not-run, as for any statement whose requires
-# field is null.
+# is that key's row. The day_parts_7 state writes it into truth.json
+# (box/lib/inv.py midnight-truth: truth["midnight"] and the answer
+# midnight.request_id.1); a truth.json without it makes box/lib/inv.py plan
+# record the call not-run, as for any statement whose requires field is null.
 [[statement]]
 id = "logs_request_in_1_midnight"
 tenant = "inv"
