@@ -207,6 +207,18 @@ class SpecLint(unittest.TestCase):
         rc, _ = self._spec_lint("gate_tier: script-only\ndisk_floor_gb: 10\nplain spec\n")
         self.assertEqual(rc, 0)
 
+    def test_spec_lint_reports_the_placeholder(self):
+        # FLIP: a spec-lint that only checks the two head lines' own presence
+        # and syntax reports this spec clean (rc 0), since gate_tier and
+        # disk_floor_gb are both present and valid; only scanning the body for
+        # the unfilled headroom placeholder catches the stale template line.
+        rc, out = self._spec_lint(
+            "gate_tier: script-only\ndisk_floor_gb: 10\n"
+            "    scripts/guards/check-disk-headroom.sh .gate-logs <disk_floor_gb>\n")
+        self.assertEqual(rc, 1)
+        self.assertIn("line 3", out)
+        self.assertIn("<disk_floor_gb>", out)
+
 
 class AdrSections(unittest.TestCase):
     TEXT = ("# ADR-1\n\n## Decision\nbody\n```\n## not a heading\n```\n### Sub\nx\n"
@@ -491,6 +503,48 @@ esac
         state = json.loads((self.dir / "state" / "4034.json").read_text())
         self.assertEqual((state["tasks"][TASK_ID]["tier"], state["tasks"][TASK_ID]["floor"]),
                          ("script-only", "10"))
+
+    def test_dispatch_refuses_spec_with_unfilled_floor_placeholder(self):
+        spec = ("Do the thing.\n" + SPEC_HEAD
+                + "    mkdir -p .gate-logs && git check-ignore -q .gate-logs "
+                  "&& scripts/guards/check-disk-headroom.sh .gate-logs <disk_floor_gb>\n")
+        rc, _, err = self.dispatch(spec)
+        # FLIP: a check that only reads the two head lines' own presence and
+        # syntax dispatches this spec unchanged, since gate_tier and
+        # disk_floor_gb are both present and valid; on the executor the
+        # placeholder is shell redirection and the first command is a parse
+        # error, which reads as below-floor instead of as this template bug.
+        self.assertEqual(rc, 2)
+        self.assertIn("<disk_floor_gb>", err)
+        self.assertIn("placeholder", err)
+        self.assertEqual((self.calls, self.mcp_calls), ([], []))
+
+    def test_dispatch_refuses_headroom_floor_that_differs_from_declared(self):
+        spec = ("Do the thing.\n" + SPEC_HEAD
+                + "    mkdir -p .gate-logs && git check-ignore -q .gate-logs "
+                  "&& scripts/guards/check-disk-headroom.sh .gate-logs 5\n")
+        rc, _, err = self.dispatch(spec)
+        # FLIP: a check that validates the headroom argument only as "a
+        # positive integer" (the same rule disk_floor_gb's own line gets)
+        # accepts this, since 5 passes that rule on its own; only comparing
+        # it against the spec's declared disk_floor_gb (10) catches the
+        # mismatch an author who edited one line and not the other leaves.
+        self.assertEqual(rc, 2)
+        self.assertIn("floor 5", err)
+        self.assertIn("declared disk_floor_gb 10", err)
+        self.assertEqual((self.calls, self.mcp_calls), ([], []))
+
+    def test_dispatch_passes_headroom_floor_that_matches_declared(self):
+        spec = ("Do the thing.\n" + SPEC_HEAD
+                + "    mkdir -p .gate-logs && git check-ignore -q .gate-logs "
+                  "&& scripts/guards/check-disk-headroom.sh .gate-logs 10\n")
+        rc, out, err = self.dispatch(spec)
+        # FLIP: a check that refuses any check-disk-headroom.sh invocation
+        # outright, rather than only one whose floor argument differs from
+        # the declared disk_floor_gb, would also refuse this filled-in,
+        # matching spec.
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(len(self.mcp_calls), 1)
 
 
 class Task(unittest.TestCase):
