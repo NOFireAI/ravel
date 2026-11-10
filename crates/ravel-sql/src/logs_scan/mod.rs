@@ -458,15 +458,28 @@ pub(crate) use partition_topk::LogsPartitionTopK;
 pub(crate) use threshold::ConfirmTopKThreshold;
 
 /// The per-partition counter of the scan's input rows consumed, before the
-/// row filter and any operator above the scan: the rows of every block the
-/// columnar path decoded ([`ColumnarBlockView::record_count`], before the
-/// pushed exact predicate), and the rows the row path built before its row
-/// filter (the reader's exact predicate has already run there, so on that
-/// path the figure is a lower bound). This is the `n` of the bucket spill
-/// derivation (ADR-3565 amendment 2), on the basis of
-/// [`LogsScanExec::sample_count_total`]; [`LogsScanExec::rows_consumed`]
-/// sums it.
+/// row filter and any operator above the scan. While a unit is open it moves
+/// with the rows of every block the columnar path decoded
+/// ([`ColumnarBlockView::record_count`], before the pushed exact predicate)
+/// and the rows the row path built before its row filter (after the reader's
+/// exact predicate). When the partition finishes a unit it is topped up to
+/// the unit's whole row count, so a block skipped under the TopK threshold or
+/// a row the reader's predicate dropped counts then; a segment skipped
+/// unopened under the threshold counts whole; and partition 0 counts the
+/// rows no unit stands for (the plan's `unpublished_rows`, or the segments
+/// outside the ts range on the whole-segment fast path) once. Summed over
+/// partitions it equals [`LogsScanExec::sample_count_total`] when every
+/// partition ran to its end; a partition stopped by a pushed `fetch`, an
+/// error or a cancel leaves it below. This is the `n` of the bucket spill
+/// derivation (ADR-3565 amendment 2); [`LogsScanExec::rows_consumed`] sums
+/// it.
 pub const METRIC_ROWS_CONSUMED: &str = "rows_consumed";
+
+/// `rows` as a counter increment, saturating on a target where `usize` is
+/// narrower.
+fn rows_usize(rows: u64) -> usize {
+    usize::try_from(rows).unwrap_or(usize::MAX)
+}
 
 /// Rows accumulated into one output batch before it is emitted.
 ///
@@ -3517,6 +3530,19 @@ impl ExecutionPlan for LogsScanExec {
                         partition,
                         n,
                     );
+                    // No partition owns a segment outside the ts range, so
+                    // partition 0 counts its rows consumed up front.
+                    if partition == 0 {
+                        let outside: u64 = self
+                            .segments
+                            .iter()
+                            .filter(|seg| {
+                                !LogSegmentFetcher::ts_range_relevant(seg, self.ts_min, self.ts_max)
+                            })
+                            .map(|seg| seg.sample_count)
+                            .sum();
+                        blocks.rows_consumed.add(rows_usize(outside));
+                    }
                     // ADR-3326, serve-if-fits amendment: a `Contains` scan with
                     // a decoded cache awaits the one shared verdict before its
                     // first open, unless it carries a limit hint and no
@@ -3649,6 +3675,8 @@ impl ExecutionPlan for LogsScanExec {
             current_whole_object: None,
             current_dirs: None,
             current_unplanned: false,
+            unit_rows: 0,
+            unit_rows_base: 0,
             count_current_open: false,
             plan_counts: None,
             state,
@@ -3887,6 +3915,11 @@ struct LogScanStream {
     /// recorded by this owner at exhaustion as on the fast path, since the
     /// plan produced none for partition 0 to publish.
     current_unplanned: bool,
+    /// [`OwnedSeg::rows`] for [`Self::current_seg`], and this partition's
+    /// [`METRIC_ROWS_CONSUMED`] when it took that unit: finishing the unit
+    /// ([`Self::finish_segment`]) tops the counter up to the unit's rows.
+    unit_rows: u64,
+    unit_rows_base: usize,
     /// The current segment's open still owes this query its one
     /// `segments_opened` record ([`PartitionCtx::record_segment_opened`]):
     /// set when the segment is taken unless the plan pass already recorded

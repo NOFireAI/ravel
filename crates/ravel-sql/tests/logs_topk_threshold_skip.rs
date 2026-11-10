@@ -896,6 +896,45 @@ async fn block_predicate_planned_path_matches_and_skips() {
     assert_eq!(run.first_gets.len(), SEGMENTS, "skipped segments planned");
 }
 
+/// The scan's rows-consumed counter (the bucket spill's `n`, ADR-3565
+/// amendment 2) reaches the fixture's every record by the scan's end, on
+/// every route, while the threshold skips blocks and whole segments under
+/// it: a skipped block or segment counts its rows as consumed, and so does
+/// a row the reader's predicate or the row filter dropped.
+#[tokio::test]
+async fn rows_consumed_reaches_every_input_row_under_the_skip() {
+    let filtered = "SELECT ts, body FROM logs WHERE severity_text <> 'DEBUG' \
+                    ORDER BY ts LIMIT 10";
+    let ts_bound = "SELECT ts, body FROM logs WHERE ts > TIMESTAMP '2023-11-14 22:13:20' \
+                    ORDER BY ts LIMIT 10";
+    let word = "SELECT ts, body FROM logs WHERE has_word(severity_text, 'INFO') \
+                ORDER BY ts LIMIT 10";
+    let attrs = "SELECT ts, body, attrs FROM logs ORDER BY ts LIMIT 4";
+    for (name, sql, setup) in [
+        ("filtered", filtered, Setup::new()),
+        (
+            "filtered, 3 partitions",
+            filtered,
+            Setup::new().partitions(3),
+        ),
+        ("striped", ts_bound, Setup::new().cached().partitions(3)),
+        ("block predicate", word, Setup::new()),
+        ("unplanned", word, Setup::new().unplanned()),
+        ("row path", attrs, Setup::new()),
+    ] {
+        let run = run(sql, setup).await;
+        assert!(
+            run.blocks_skipped + run.segments_skipped > 0,
+            "{name}: the skip fired"
+        );
+        assert_eq!(
+            run.scan_metric("rows_consumed"),
+            TOTAL_RECORDS,
+            "{name}: every input row counted"
+        );
+    }
+}
+
 /// Projecting the `attrs` map puts the scan on the row path (`Rows`), which
 /// checks the threshold before each block decode instead of inline.
 #[tokio::test]
