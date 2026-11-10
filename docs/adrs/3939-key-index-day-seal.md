@@ -542,7 +542,8 @@ unfolded p50 and needs no restatement.
 **W2 runs on the C1 binary.** W2's trigger is a tombstoned hour, and after
 R2 a tombstoned hour in a sealed day takes the `retired_hours` path and is
 not re-encoded. So W2, as written, is measured on the main SHA that carries
-C1 and not R2, and the D3' run stamps the fold binary's SHA beside it.
+C1 and not R2 (a branch instead, by the W2-binary amendment), and the D3'
+run stamps the fold binary's SHA beside it.
 Every other row runs on the R2 build. The mechanism W2 measures, a dirtied
 sealed day carried from its own previous leaves, stays reachable on the R2
 build through the other dirtying events below; a variant measured that way
@@ -595,3 +596,26 @@ other hour in the frontier band, so under `frontier_reconcile_max_hours`
 pressure the bucket can wait one or more folds before it is listed. The
 retired hour's entries are hidden from both tiers meanwhile; only the
 physical delete waits. "An erasure never lags" holds within that cap.
+
+## Amendment (issue #3939, W2-binary): W2's fold binary is a measurement branch
+
+<!-- amendment-supersedes: phrase="is measured on the main SHA that carries" pointer="W2-binary amendment" -->
+
+Date: 2026-11-10. Owner decision of the same day; recorded before any
+Stage 2 figure.
+
+No commit on main carries C1 without R2 and also has `ravel-cli catalog
+fold --retention-default` (#4085), which the retired_hour state's fold
+needs: C1 (#4051) landed before R2 (#4077), and the flag after it. W2 is
+therefore measured on the branch `measure/3939-w2` at 90e5f43f8: C1's
+merge commit 131ab993c with #4085's commit cherry-picked onto it
+(`cherry picked from commit 9572fbe88`). The branch is never merged. The
+run stamps the binary's SHA, and its `carries_c1` and `carries_r2`, as the
+harness does for every fold binary.
+
+D3' is three self-terminating runs, each with one binary:
+- Run A: main at launch (R2 and #4085), with day_parts_7 and retired_hour,
+  for A1 to A6, W1, W3, W4, W6, W7, W8, F1, and F3 on W4.
+- Run B: the same SHA as run A, with day_parts_30, for A7, W5, F2, and F3
+  on W5.
+- Run C: `measure/3939-w2`, with day_parts_7 and retired_hour, for W2 only.
