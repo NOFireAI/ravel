@@ -16169,6 +16169,11 @@ mod tests {
         /// The run memory target of the block target fixture.
         const BLOCK_TARGET_RUN_TARGET: u64 = 128 << 10;
 
+        /// The final part memory target of the block target fixture, the same
+        /// on both sides: large enough that a published part holds more than
+        /// 16 records, so a run block target reaching it shows in its bytes.
+        const BLOCK_TARGET_PART: u64 = 64 << 10;
+
         /// Seeds the block target fixture on a fresh store and compacts it
         /// under `config`; returns the outcome, the run, the published parts
         /// and the record count of each run part level 2 read.
@@ -16192,7 +16197,15 @@ mod tests {
         /// level 2's per-run price, and never reaches a published part.
         #[tokio::test]
         async fn run_block_target_is_transient_and_cuts_run_blocks() {
-            let resident = two_level_config(64 << 20, crate::RLOG_RUN_MEMORY_TARGET_BYTES, None);
+            let parts = |config: CompactorConfig| CompactorConfig {
+                rlog_l1_part_memory_target_bytes: Some(BLOCK_TARGET_PART),
+                ..config
+            };
+            let resident = parts(two_level_config(
+                64 << 20,
+                crate::RLOG_RUN_MEMORY_TARGET_BYTES,
+                None,
+            ));
             let (outcome, single, oracle, _) = compact_block_target(&resident).await;
             outcome.expect("single-level compact");
             assert!(single.mode_line().contains("mode=\"resident\""));
@@ -16207,7 +16220,11 @@ mod tests {
                 let dir = fresh_scratch(&format!("block-target-{target}"));
                 let config = CompactorConfig {
                     rlog_run_block_target_records: target,
-                    ..two_level_config(ceiling, BLOCK_TARGET_RUN_TARGET, Some(dir.clone()))
+                    ..parts(two_level_config(
+                        ceiling,
+                        BLOCK_TARGET_RUN_TARGET,
+                        Some(dir.clone()),
+                    ))
                 };
                 let (outcome, run, got, runs) = compact_block_target(&config).await;
                 outcome.unwrap_or_else(|e| panic!("target {target}: {e}"));
