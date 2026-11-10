@@ -520,14 +520,15 @@ impl ClaimGuard {
 
     /// This guard's configured lease, in whole milliseconds, floored at 1 and
     /// capped at [`claim::MAX_OBSERVED_LEASE_MS`]. The observation applies
-    /// the same clamp before it prices a jitter, so the jitter this guard
-    /// waits out before a steal is the figure the observation computes from
-    /// the same lease, and a lease configured above 24 h cannot widen that
-    /// wait past `jitter_span_fraction` of 24 h. A lost steal reschedules
-    /// one clamped lease from now, so it waits at most the 24 h ceiling. In
-    /// the unreadable-claim recheck cap the clamp changes nothing: for a
-    /// lease at or above the ceiling the steal threshold is always the
-    /// earlier of the two points.
+    /// the same clamp before it prices a jitter, so for an unreadable claim,
+    /// and for a readable one whose holder declared this guard's lease, the
+    /// jitter this guard waits out before a steal equals the one the
+    /// observation computed. Either way a lease configured above 24 h cannot
+    /// widen that wait past `jitter_span_fraction` of 24 h. A lost steal
+    /// reschedules one clamped lease from now, so it waits at most the 24 h
+    /// ceiling. In the unreadable-claim recheck cap the clamp changes
+    /// nothing: for a lease at or above the ceiling the steal threshold is
+    /// always the earlier of the two points.
     fn lease_ms(&self) -> i64 {
         i64::try_from(self.inner.cfg.lease_duration.as_millis())
             .unwrap_or(i64::MAX)

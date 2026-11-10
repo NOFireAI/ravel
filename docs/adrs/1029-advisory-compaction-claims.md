@@ -494,7 +494,8 @@ The moment a steal lands shifts only by the latency of the refused create
 and its two reads. Decision 1 step 2 reschedules a contender to after expiry
 plus its jitter; the skip now reports one millisecond past expiry, and the
 retry waits out the jitter before its steal instead of before its create. A
-contender that loses a steal reschedules one full lease from the moment it
+contender that loses a steal reschedules one full lease (capped at the 24 h
+ceiling by the lease-ceiling guard amendment below) from the moment it
 lost, because the winner has just written a claim with a fresh lease. An
 unreadable claim's skip reschedules to one millisecond past one lease plus
 the contender's jitter (the 2026-11-09 amendment moves it past the lease
@@ -900,3 +901,27 @@ unreadable claim's expiry uses the ceiling (`ObservedLease`), so the publish
 fence and the other claim safety invariants are checked over behaviours that
 steal a corrupt claim (`formal/tla/maintenance/results.md`, "Unreadable-claim
 steal").
+
+## Amendment (2026-11-10): the claim guard caps its own lease at the ceiling (issue #4065)
+
+<!-- amendment-applies: sections="Amendment (2026-09-28): jitter on the contended path only" pointer="lease-ceiling guard amendment" -->
+
+This is the lease-ceiling guard amendment. The claim guard read its
+configured lease raw in two places, while the claim observation caps a lease
+at `MAX_OBSERVED_LEASE_MS` (24 h) before it uses it. With a lease configured
+above 24 h, the jitter the guard waited out before a steal was priced from
+the raw lease and could reach `jitter_span_fraction` of it, and a contender
+that lost a steal rescheduled one raw lease from the moment it lost, which
+could be longer than any lease an observer trusts.
+
+`ClaimGuard::lease_ms` now floors the configured lease at 1 ms and caps it at
+the ceiling, and the guard's jitter, its unreadable-claim recheck cap and its
+lost-steal reschedule all read that value. A lost steal therefore waits at
+most 24 h before the contender looks again. At the 300 s default lease none
+of these figures changes. The holder still renews its own claim against the
+lease it wrote, uncapped, since renewal is not an observation.
+
+Tests, each shown failing against the code before this amendment:
+`a_lease_above_the_ceiling_prices_the_jitter_from_the_clamped_lease` and
+`a_lost_steal_reschedules_within_the_lease_ceiling` in
+`crates/ravel-maintain/src/claim_guard.rs`.

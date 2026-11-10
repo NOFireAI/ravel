@@ -582,14 +582,13 @@ An `unreadable_claim` holds the bucket, for compaction and for erasure alike,
 for at most 24 hours after the claim object was last written, plus a jitter of
 at most 10% of the configured claim lease (30 s at the 300 s default). A lease
 configured longer than 24 h counts as 24 h here, so the jitter is at most 10%
-of 24 h. The
-printed expiry is the object's last write plus 24 h, and the retry point is one
-millisecond past that expiry plus the jitter. A run at or after the retry point
-takes the claim over with a compare-and-swap on the version it read, logs a
-warning that names the claim's key, and then compacts or erases holding the
-claim. If anything writes the claim object between the read and the
-takeover, the takeover fails and the bucket is retried later. Ravel never
-deletes a claim object.
+of 24 h. The printed expiry is the object's last write plus 24 h, and the
+retry point is one millisecond past that expiry plus the jitter. A run at or
+after the retry point takes the claim over with a compare-and-swap on the
+version it read, logs a warning that names the claim's key, and then compacts
+or erases holding the claim. If anything writes the claim object between the
+read and the takeover, the takeover fails and the bucket is retried later.
+Ravel never deletes a claim object.
 
 A running maintenance process does not wait for the retry point before it looks
 again. It re-checks a bucket held by an unreadable claim about once per
