@@ -472,7 +472,7 @@ pub enum ClaimedCompaction {
     /// Another attempt holds a live claim on this bucket (a compaction or an
     /// erasure rewrite), or the claim object is unreadable. Nothing was read
     /// beyond the bucket listing and the input commit records, nothing was
-    /// merged, and nothing was published. [`ClaimSkip::reschedule_after_unix_ms`]
+    /// merged, and nothing was published. [`ClaimSkip::recheck_after_unix_ms`]
     /// is the earliest this bucket should be tried again; polling before it is
     /// exactly what the claim protocol exists to avoid.
     SkippedClaimed(ClaimSkip),

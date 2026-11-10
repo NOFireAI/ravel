@@ -39,7 +39,7 @@ This verifies the protocol designs; implementation conformance is argued in
 | MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 116707410 | 12448134 | 17 | 3600 | GitHub hosted ubuntu-24.04, workers auto, Xmx2g | TIMEOUT at 3600 s, 12,448,134 distinct, 1,450,354 queued, projected 4,000 to 4,200 s |
 | MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 136617032 | 13183990 | 19 | 4285 | GitHub hosted ubuntu-24.04, workers auto, Xmx2g | PASS under the 5400 s per-config budget (run 34246991138) |
 | MCCompactionClaims.smoke.cfg | 1.7.4 | 65454526 | 11155721 | 17 | 161 | fleet executor | PASS |
-| MCCompactionClaims.exhaustive.cfg | 1.7.4 | 1972 | 543 | 11 | 2 | fleet executor | PASS |
+| MCCompactionClaims.exhaustive.cfg | 1.7.4 | 1972 | 543 | 10 | 2 | fleet executor | PASS (depth corrected from 11 on 2026-11-10; see "Unreadable-claim steal" below) |
 | MCCompactionClaims.smoke.cfg | 1.7.4 | 67569662 | 11528777 | 17 | 307 | fleet executor (x86_64, 16 cores), workers 2, Xmx2g, 2026-11-10 | PASS; see "Unreadable-claim steal" below |
 | MCCompactionClaims.exhaustive.cfg | 1.7.4 | 1972 | 543 | 10 | 0 | fleet executor (x86_64, 16 cores), workers 2, Xmx2g, 2026-11-10 | PASS; see "Unreadable-claim steal" below |
 | negative/ownership-as-publication-authority.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
@@ -93,7 +93,13 @@ so `check-tla.sh smoke` reports TIMEOUT at that worker count; the figure above
 is from TLC run directly with the same arguments and no budget. CI runs with
 `-workers auto` and the earlier 8-worker run took 161 s for a similar count.
 The exhaustive configuration runs under `LivenessMode = TRUE`, where
-`CorruptClaim` is disabled, so its state space cannot change.
+`CorruptClaim` is disabled, so its state space cannot change. Its depth is 10,
+not the 11 the standing Configurations row and the `ExpiredClaimEventuallyStolen`
+audit row used to record: rerun on 2026-11-10 at 1, 2, 8 and 16 workers, every
+run ends with `1972 states generated, 543 distinct states found, 0 states left
+on queue.` and `The depth of the complete state graph search is 10.` A
+one-worker breadth-first search reports its depth exactly, so both rows now
+read 10.
 
 The new behaviour is explored: a throwaway invariant asserting that no steal
 of a `Corrupt` payload succeeds is violated in the smoke configuration at depth
@@ -305,7 +311,7 @@ exit code are what a violated row asserts, and both are reproducible.
 | LostClaimNeverPublishesThroughGuardedPath | Claims | witness-derived (`lastGuarded.fired`/`held`) | the guarded (checkpoint) publish path never fires while the claim is lost | `GuardIgnoresClaim = TRUE` | `guarded-publish-ignores-claim`: VIOLATED, exit 12 |
 | MergeAttemptsConverge | Claims | store-derived (`lastPub.winnerPartPresent`, read from the store) | a loser reports `Converged` only when the winner part is observed present | `MissingPartReportsConverged = TRUE` | `missing-part-reports-converged`: VIOLATED, exit 12 |
 | DivergentInputSetNeverMutates | Claims | store-derived (record version delta) | a loser with a divergent input-set hash never advances the record's stored version | `DivergeOverwritesRecord = TRUE` | `diverge-overwrites-record`: VIOLATED, exit 12 |
-| ExpiredClaimEventuallyStolen | Claims | witness-derived (`stolen`) | an expired claim is eventually stolen under a fair thief and a fair store | none; this is a reachability witness, not a hazard a mutant demonstrates | `MCCompactionClaims.exhaustive.cfg`: PASS, 543 distinct, depth 11; see Configurations table |
+| ExpiredClaimEventuallyStolen | Claims | witness-derived (`stolen`) | an expired claim is eventually stolen under a fair thief and a fair store | none; this is a reachability witness, not a hazard a mutant demonstrates | `MCCompactionClaims.exhaustive.cfg`: PASS, 543 distinct, depth 10; see Configurations table |
 
 ## Where the model and the code differ
 

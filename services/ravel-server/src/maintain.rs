@@ -4817,6 +4817,249 @@ mod tests {
         );
     }
 
+    /// Counts the GETs and HEADs that reach one key, passing every request
+    /// through to `inner`.
+    struct KeyReadCounter<S> {
+        inner: S,
+        key: String,
+        gets: std::sync::atomic::AtomicUsize,
+        heads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<S> KeyReadCounter<S> {
+        fn new(inner: S, key: String) -> Self {
+            KeyReadCounter {
+                inner,
+                key,
+                gets: std::sync::atomic::AtomicUsize::new(0),
+                heads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// The `(GET, HEAD)` counts on the key since the last call, resetting
+        /// both.
+        fn take(&self) -> (usize, usize) {
+            (
+                self.gets.swap(0, Ordering::SeqCst),
+                self.heads.swap(0, Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for KeyReadCounter<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            if key == self.key {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            if key == self.key {
+                self.heads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Two compaction ticks over a bucket whose claim object is unreadable
+    /// and young: the first at one second past the claim's write, the second
+    /// one configured lease plus the widest jitter plus 1 ms after the first,
+    /// far inside the 24 h steal threshold. `delete_between` deletes the claim
+    /// key between them, as an operator clearing a stuck claim by hand would.
+    /// Returns the two reports, the claim key's `(GET, HEAD)` counts in the
+    /// second tick, and the store.
+    async fn two_ticks_over_an_unreadable_claim(
+        delete_between: bool,
+    ) -> (
+        MaintainReport,
+        MaintainReport,
+        (usize, usize),
+        KeyReadCounter<MemoryStore>,
+    ) {
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
+        let written_ns: i64 = 1_700_000_000 * 1_000_000_000;
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let claim_key = ravel_fleet::claim::compaction_claim_key(
+            &ravel_fleet::claim::WorkIdentity::new(tenant, Signal::Metrics, 0, 0).work_id(),
+        );
+        let store = KeyReadCounter::new(MemoryStore::new(), claim_key.clone());
+        store.inner.set_clock_ms((written_ns / 1_000_000) as u64);
+        for seq in 1..=2 {
+            publish_compactable_input(&store, &tenant_id, 0, seq).await;
+        }
+        store
+            .put(
+                &claim_key,
+                bytes::Bytes::from_static(b"\xffnot a claim"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("plant an unreadable claim");
+
+        let worker = WorkerSet::with_defaults(written_ns).with_process_id(PINNED_WORKER_ID);
+        let live = worker.solo_live_set();
+        let config = CompactorConfig {
+            coordination: Coordination::On,
+            claim_min_input_bytes: 1,
+            claim_lease_duration: LEASE,
+            ..CompactorConfig::default()
+        };
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+
+        let first_ns = written_ns + 1_000_000_000;
+        let clock = FixedClock::new(first_ns);
+        let first = run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        if delete_between {
+            store
+                .delete(&claim_key)
+                .await
+                .expect("delete the claim by hand");
+        }
+
+        // The widest jitter any contender can draw at this lease.
+        let max_jitter_ms = (LEASE.as_millis() as f64
+            * ravel_fleet::claim::ClaimConfig::default().jitter_span_fraction)
+            as i64;
+        let second_ns = first_ns + LEASE.as_nanos() as i64 + (max_jitter_ms + 1) * 1_000_000;
+        assert!(
+            second_ns - written_ns < ravel_fleet::claim::MAX_OBSERVED_LEASE_MS * 1_000_000,
+            "the second tick is far inside the steal threshold"
+        );
+        store.take();
+        clock.set(second_ns);
+        let second = run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        let reads = store.take();
+        (first, second, reads, store)
+    }
+
+    /// A worker that skipped a bucket over an unreadable claim looks at it
+    /// again about once per lease, not at the 24 h steal threshold, so a claim
+    /// deleted by hand releases the bucket within one lease plus jitter
+    /// (ADR-1029, the 2026-11-09 amendment).
+    ///
+    /// Shown failing against the scan that deferred the bucket to the skip's
+    /// steal threshold (`reschedule_ns` reading `reschedule_after_unix_ms`):
+    /// "a deleted claim releases the bucket within one lease" reads left
+    /// (0, 1), right (1, 0).
+    #[tokio::test]
+    async fn a_hand_deleted_unreadable_claim_releases_its_bucket_within_one_lease() {
+        let (first, second, _, store) = two_ticks_over_an_unreadable_claim(true).await;
+        assert_eq!(
+            (first.compacted, first.claim_skipped),
+            (0, 1),
+            "a young unreadable claim holds the bucket"
+        );
+        assert_eq!(
+            (second.compacted, second.claim_skipped),
+            (1, 0),
+            "a deleted claim releases the bucket within one lease"
+        );
+        let claim_key = ravel_fleet::claim::compaction_claim_key(
+            &ravel_fleet::claim::WorkIdentity::new(
+                TenantId::new("acme").hash(),
+                Signal::Metrics,
+                0,
+                0,
+            )
+            .work_id(),
+        );
+        let after = store
+            .inner
+            .get(&claim_key, GetRange::Full)
+            .await
+            .expect("the compaction's own claim");
+        let claim =
+            <ravel_proto::sys::v1::CompactionClaim as prost::Message>::decode(after.data.as_ref())
+                .expect("the claim is this worker's, not the planted bytes");
+        assert_eq!(
+            claim.owner_process_id,
+            PINNED_WORKER_ID.as_bytes().to_vec(),
+            "the tick created the claim afresh"
+        );
+    }
+
+    /// While the unreadable claim is still present and young, the recheck one
+    /// lease later skips the bucket again, and that look costs exactly one GET
+    /// and one HEAD of the claim key: no steal, no write.
+    ///
+    /// Shown failing against the scan that deferred the bucket to the skip's
+    /// steal threshold: the second tick issues no claim request, so "one GET
+    /// and one HEAD" reads left (0, 0), right (1, 1).
+    #[tokio::test]
+    async fn a_present_unreadable_claim_is_rechecked_once_per_lease_and_skipped() {
+        let (first, second, reads, store) = two_ticks_over_an_unreadable_claim(false).await;
+        assert_eq!((first.compacted, first.claim_skipped), (0, 1));
+        assert_eq!(
+            (second.compacted, second.claim_skipped),
+            (0, 1),
+            "a young unreadable claim is skipped again"
+        );
+        assert_eq!(reads, (1, 1), "one GET and one HEAD of the claim key");
+        let claim_key = ravel_fleet::claim::compaction_claim_key(
+            &ravel_fleet::claim::WorkIdentity::new(
+                TenantId::new("acme").hash(),
+                Signal::Metrics,
+                0,
+                0,
+            )
+            .work_id(),
+        );
+        let after = store
+            .inner
+            .get(&claim_key, GetRange::Full)
+            .await
+            .expect("the claim is still there");
+        assert_eq!(
+            after.data.as_ref(),
+            b"\xffnot a claim",
+            "the recheck wrote nothing to the claim"
+        );
+    }
+
     /// A store that advances a shared [`FixedClock`] past the claim's
     /// renewal threshold the instant the first L1 part is written, so the
     /// [`crate::claim_guard::Checkpoint::PartBoundary`] check right after

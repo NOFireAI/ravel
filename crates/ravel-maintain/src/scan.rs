@@ -291,12 +291,15 @@ pub struct MaintainReport {
 }
 
 /// The claim hold a skipped bucket earns, as the injected clock reads it: the
-/// skip's reschedule point (one millisecond past the holder's expiry; the
-/// retry's own acquisition waits out this contender's jitter) converted from
-/// unix milliseconds to nanoseconds.
-/// Saturating, so an absurd observed expiry cannot wrap into the past.
+/// skip's recheck point converted from unix milliseconds to nanoseconds. For a
+/// held claim that is one millisecond past the holder's expiry (the retry's
+/// own acquisition waits out this contender's jitter); for an unreadable one
+/// it is at most one lease plus jitter away, so a claim deleted by hand
+/// releases the bucket within about one lease rather than at the steal
+/// threshold. Saturating, so an absurd observed expiry cannot wrap into the
+/// past.
 fn reschedule_ns(skip: &ClaimSkip) -> i64 {
-    skip.reschedule_after_unix_ms.saturating_mul(1_000_000)
+    skip.recheck_after_unix_ms.saturating_mul(1_000_000)
 }
 
 /// Retention lag, in nanoseconds, of a bucket that is expired yet still present:
