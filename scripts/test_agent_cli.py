@@ -266,6 +266,26 @@ class SpecLint(unittest.TestCase):
         self.assertEqual(cli.spec_head_values(ok), ("executor", 60))
         self.assertEqual(cli.spec_head_values(head + run.format("60")), ("executor", 60))
         self.assertEqual(cli.spec_head_values(head + run.format("060")), ("executor", 60))
+        # FLIP: counting only the first word or a word after && as a command
+        # position lets these through with the placeholder or a wrong floor.
+        for line, why in (
+                ("    if ! scripts/guards/check-disk-headroom.sh .gate-logs <disk_floor_gb>; then exit 0; fi",
+                 "unfilled <disk_floor_gb>"),
+                ("    LC_ALL=C scripts/guards/check-disk-headroom.sh .gate-logs <disk_floor_gb>",
+                 "unfilled <disk_floor_gb>"),
+                ("    time scripts/guards/check-disk-headroom.sh .gate-logs 5", "floor 5 differs"),
+                ("    { scripts/guards/check-disk-headroom.sh .gate-logs 5; }", "floor 5 differs")):
+            with self.assertRaises(cli.CliError, msg=line) as ctx:
+                cli.spec_head_values(head + line + "\n")
+            self.assertIn(why, str(ctx.exception), line)
+        # FLIP: parsing unindented prose as a command refuses wrapped prose
+        # that starts with the script path; not splitting ) and skipping
+        # redirections refuses a subshell or a 2>&1 before the arguments.
+        ok = head + ("Before the build, run the guard below. The script\n"
+                     "scripts/guards/check-disk-headroom.sh exits 1 when the volume is below the floor.\n"
+                     "    (scripts/guards/check-disk-headroom.sh .gate-logs 60)\n"
+                     "    scripts/guards/check-disk-headroom.sh 2>&1 .gate-logs 60\n")
+        self.assertEqual(cli.spec_head_values(ok), ("executor", 60))
 
 
 class AdrSections(unittest.TestCase):

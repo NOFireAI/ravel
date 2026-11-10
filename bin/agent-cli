@@ -942,18 +942,20 @@ SPEC_HEAD = {"gate_tier": lambda v: v in GATE_TIERS,
 # than as the template defect it is.
 DISK_FLOOR_PLACEHOLDER = "<disk_floor_gb>"
 HEADROOM_SCRIPT = "check-disk-headroom.sh"
-# A command separator: what may precede the script for it to be an
-# invocation rather than prose that names it ("If ...headroom.sh exits 1").
-SHELL_SEPARATORS = ("&&", "||", ";", "|")
+# Words that end one command's arguments.
+SHELL_SEPARATORS = ("&&", "||", ";", "|", "&", "(", ")", "{", "}")
+REDIRECTION = re.compile(r"[0-9]*[<>]{1,2}&?\S*")
 
 
 def headroom_invocations(lines):
-    """(line number, floor argument or None) for each line that runs
-    check-disk-headroom.sh as a command: the script is the line's first word
-    or follows a command separator. A trailing backslash joins the next line.
-    Comment lines and prose that merely names the script are skipped. The
-    floor is the second argument after the script with shell quoting and a
-    trailing separator removed, or None when there is no second argument."""
+    """(line number, floor argument or None) for each code line that runs
+    check-disk-headroom.sh. A code line is indented by a tab or at least four
+    spaces, as the template's command blocks are; unindented prose that names
+    the script is never parsed as a command. A trailing backslash joins the
+    next line. The script may sit anywhere on a code line (after if, !, time,
+    an assignment, a subshell). The floor is the second argument after the
+    script with shell quoting removed and redirections skipped, or None when
+    there is no second argument."""
     out = []
     i = 0
     while i < len(lines):
@@ -963,9 +965,12 @@ def headroom_invocations(lines):
             i += 1
             text = text.rstrip()[:-1] + " " + lines[i]
         i += 1
-        if HEADROOM_SCRIPT not in text or text.lstrip().startswith("#"):
+        if HEADROOM_SCRIPT not in text or not re.match(r"(\t| {4})", text):
             continue
-        spaced = re.sub(r"(&&|\|\||;|\|)", r" \1 ", text)
+        if text.lstrip().startswith("#"):
+            continue
+        # A lone & is a separator unless it is part of a redirection (2>&1).
+        spaced = re.sub(r"(&&|\|\||;|\||(?<![<>])&(?![\d-])|\(|\)|\{|\})", r" \1 ", text)
         try:
             words = shlex.split(spaced, comments=False, posix=True)
         except ValueError:
@@ -973,12 +978,14 @@ def headroom_invocations(lines):
         for k, w in enumerate(words):
             if not (w.endswith("/" + HEADROOM_SCRIPT) or w == HEADROOM_SCRIPT):
                 continue
-            if k > 0 and words[k - 1] not in SHELL_SEPARATORS:
-                continue
             args = []
             for a in words[k + 1:]:
                 if a in SHELL_SEPARATORS:
                     break
+                # A placeholder such as <N> parses like a redirection; keep it
+                # as the argument it was meant to be, so it reads as unfilled.
+                if REDIRECTION.fullmatch(a) and not re.fullmatch(r"<[^<>\s]+>", a):
+                    continue
                 args.append(a)
             out.append((start + 1, args[1] if len(args) >= 2 else None))
     return out
@@ -990,11 +997,11 @@ def spec_head_values(spec):
     Each line is the key, a colon and the value as its first word; anything
     after the value is commentary. Raises CliError (2) naming each key that
     is missing, malformed or given two different values, naming a line that
-    still carries the template's unfilled disk_floor_gb placeholder, or
-    naming a check-disk-headroom.sh invocation whose floor argument
-    disagrees with the declared disk_floor_gb. A spec with no
-    check-disk-headroom.sh invocation at all is not refused by the last
-    check."""
+    names check-disk-headroom.sh and still carries the template's unfilled
+    disk_floor_gb placeholder, or naming a code line whose
+    check-disk-headroom.sh floor argument is missing, not an integer, or
+    different from the declared disk_floor_gb. A spec with no such line is
+    not refused by the last two checks."""
     found = {k: set() for k in SPEC_HEAD}
     lines = spec.splitlines()
     for line in lines:
@@ -1017,10 +1024,20 @@ def spec_head_values(spec):
     declared_floor = (int(next(iter(declared)))
                       if len(declared) == 1 and SPEC_HEAD["disk_floor_gb"](next(iter(declared)))
                       else None)
-    # Only the headroom command itself is checked: the template also names
-    # the placeholder in prose and in the executor's below-floor report
-    # format, and a filled spec keeps both.
+    # The placeholder as the script's floor argument is refused on any line,
+    # indented or not and wherever the script sits (after if, !, an
+    # assignment). The template's other two mentions of the placeholder, the
+    # filling instruction and the below-floor report format, are not in that
+    # position, and neither is a report echoed on the same line.
+    unfilled = re.compile(re.escape(HEADROOM_SCRIPT) + r"\s+\S+\s+[\"']?"
+                          + re.escape(DISK_FLOOR_PLACEHOLDER))
+    for i, line in enumerate(lines, 1):
+        if unfilled.search(line):
+            problems.append(f"line {i} still has the unfilled {DISK_FLOOR_PLACEHOLDER} "
+                            f"placeholder beside {HEADROOM_SCRIPT}")
     for i, floor_arg in headroom_invocations(lines):
+        if floor_arg is not None and DISK_FLOOR_PLACEHOLDER in floor_arg:
+            continue
         if floor_arg is None:
             problems.append(f"line {i} runs {HEADROOM_SCRIPT} without a floor argument")
         elif DISK_FLOOR_PLACEHOLDER in floor_arg or not re.fullmatch(r"[0-9]+", floor_arg):
