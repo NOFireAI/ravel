@@ -2488,6 +2488,21 @@ did before.
   admit it with no byte returned and the host still below the floor. The
   catalog's own `evict_until_fits` retry keeps dropping held entries, as
   ADR-1702 decision 6 describes.
+- **The catalog's pass has a ceiling.** Before it drops anything, the
+  catalog's pressure pass sums the reservation bytes of every entry no
+  reader holds, under both caches' locks, and when the shortfall it is
+  asked for exceeds that sum it drops nothing and reports 0. A host-memory
+  gate shortfall is `floor - available + n`, which can be gigabytes while
+  the caches hold megabytes; without the ceiling every refusal in a
+  gate-closed window would empty every tenant's decoded parts and postings
+  for a refusal that stands anyway. This is the same rule
+  `Catalog::reserve_decoded` applies to its own pass, which it skips for a
+  decode that could not fit with the caches empty. The ceiling is
+  inclusive: a shortfall equal to the sum drops every unheld entry. The
+  pass holds both caches' locks throughout and walks only the unheld
+  entries present when it started, least-recently-used first, each at most
+  once, so a resolve inserting concurrently cannot lengthen it; the dropped
+  values are released after the locks are.
 - **The counter.** `ravel_catalog_decoded_cache_memory_evictions_total`
   now moves for the pressure evictor's refusals of either cause and from
   any consumer, as well as for the catalog's own retry. Its HELP text says
@@ -2505,7 +2520,11 @@ No metric family is added. The tests that pin this are, in
 `evict_for_pressure_frees_lru_entries_until_want_is_covered`,
 `a_held_entry_frees_nothing_for_a_host_memory_refusal`,
 `a_held_entry_frees_nothing_for_an_accounted_refusal` and
-`a_pressure_pass_skips_a_held_entry_and_takes_the_next_unheld_one`; and in
+`a_pressure_pass_skips_a_held_entry_and_takes_the_next_unheld_one`; in
+`crates/ravel-catalog/src/cache.rs`,
+`a_pressure_shortfall_beyond_every_unheld_entry_evicts_nothing`,
+`a_pressure_shortfall_equal_to_the_unheld_entries_evicts_them_all` and
+`a_pressure_pass_evicts_only_the_entries_present_when_it_starts`; and in
 `services/ravel-server/tests/catalog_memory_budget_e2e.rs`,
 `the_fetch_gauge_counts_the_catalogs_held_decodes`, which pins the
 counter's HELP text.

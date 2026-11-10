@@ -1035,7 +1035,13 @@ impl Catalog {
     /// pressure-evictor amendment): drop this catalog's decoded parts and
     /// postings cache entries that no reader holds, least-recently-used
     /// first across every tenant, until the dropped entries' reservation
-    /// bytes reach `want` or no unheld entry remains, and return their sum.
+    /// bytes reach `want`, and return their sum. When `want` exceeds the
+    /// reservation bytes of every unheld entry together, no eviction could
+    /// cover it: this drops nothing and returns 0, leaving every tenant's
+    /// entries cached, as `Catalog::reserve_decoded` declines its own pass
+    /// for a decode that could not fit with the caches empty. The pass walks
+    /// only the entries present when it starts; a resolve inserting
+    /// concurrently cannot lengthen it.
     /// Every byte returned is back in the budget when this returns. An entry
     /// a live resolve still holds an `Arc` to stays cached and counts for
     /// nothing, as the decoded column-block cache treats a held entry:
@@ -14132,9 +14138,10 @@ mod tests {
     /// ADR-3326 decision 4, pressure-evictor amendment (issue #4015):
     /// `Catalog::evict_decoded_for_pressure` gives memory back to ANOTHER
     /// consumer's refused reservation, not this catalog's own. It evicts
-    /// least-recently-used across every tenant until `want` bytes are freed
-    /// or nothing remains, on a catalog whose own budget has room (the
-    /// default, unlimited one) and with no decoded-cache byte bound set.
+    /// least-recently-used across every tenant until `want` bytes are freed,
+    /// and evicts nothing when `want` exceeds every cached entry's bytes
+    /// together, on a catalog whose own budget has room (the default,
+    /// unlimited one) and with no decoded-cache byte bound set.
     ///
     /// An implementation that evicts until the budget's reservation fits,
     /// as `evict_until_fits` does, evicts nothing here and returns 0. One
@@ -14197,10 +14204,14 @@ mod tests {
             "the most-recently-used entry stays"
         );
 
-        // A want above everything held empties the caches and returns the
-        // total held, not more.
+        // A want above everything held cannot be covered, so the pass
+        // leaves the caches intact; a want of exactly what is held empties
+        // them and returns that total.
         let remaining = sizes[2];
-        let freed_rest = catalog.evict_decoded_for_pressure(remaining + 1_000_000);
+        assert_eq!(catalog.evict_decoded_for_pressure(remaining + 1), 0);
+        assert_eq!(catalog.decoded_part_cache_reserved_bytes(), remaining);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 2);
+        let freed_rest = catalog.evict_decoded_for_pressure(remaining);
         assert_eq!(freed_rest, remaining);
         assert_eq!(catalog.decoded_part_cache_reserved_bytes(), 0);
         assert_eq!(catalog.part_cache().total_entries(), 0);
@@ -14289,11 +14300,11 @@ mod tests {
     /// the entry stays cached, and the refusal stands. Once the reader lets
     /// go, the same refusal frees exactly that entry's bytes and is admitted.
     ///
-    /// FLIP: in `DecodedCaches::evict_for_pressure` (cache.rs), call
-    /// `self.evict_one_lru_bytes()` instead of
-    /// `self.evict_one_unheld_lru_bytes()`. The held entry is dropped and its
-    /// bytes reported, so `try_reserve(1)` is admitted and the `expect_err`
-    /// below panics.
+    /// FLIP: in `DecodedTenantCache::unheld_by_use` (cache.rs), drop the
+    /// `Arc::strong_count(&entry.value) == 1` filter so the pressure pass
+    /// takes held entries too. The held entry is dropped and its bytes
+    /// reported, so `try_reserve(1)` is admitted and the `expect_err` below
+    /// panics.
     #[tokio::test]
     async fn a_held_entry_frees_nothing_for_a_host_memory_refusal() {
         let (store, part) = held_part_fixture().await;
@@ -14374,11 +14385,10 @@ mod tests {
     /// next one no reader holds, drops that one, and leaves the held entry
     /// cached.
     ///
-    /// FLIP: in `DecodedCache::evict_lru_unheld_bytes` (cache.rs), drop the
-    /// least-recently-used entry whether held or not (`lru_tick()` in place
-    /// of `lru_unheld_tick()`) and report 0 bytes for a held one. The pass
-    /// then drops the held entry, so `entry_count(&tenants[0])` reads 0, not
-    /// 1.
+    /// FLIP: in `DecodedTenantCache::unheld_by_use` (cache.rs), yield every
+    /// entry whether held or not, with 0 reserved bytes for a held one. The
+    /// pass then drops the held least-recently-used entry first, so
+    /// `entry_count(&tenants[0])` reads 0, not 1.
     #[tokio::test]
     async fn a_pressure_pass_skips_a_held_entry_and_takes_the_next_unheld_one() {
         let store = Arc::new(MemoryStore::new());
