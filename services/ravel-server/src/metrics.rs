@@ -13943,7 +13943,7 @@ mod tests {
             .expect("put stats object");
         let part_hash = *blake3::hash(b"decode-counter-part").as_bytes();
         let head = SnapshotHead {
-            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant.0.to_vec(),
             signal: ravel_commit::signal::to_proto(signal) as u32,
             shard_count: 1,
@@ -13963,6 +13963,7 @@ mod tests {
                     part_blake3: vec![part_hash.to_vec()],
                 }),
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
             shard_generation_count: 1,
@@ -14144,7 +14145,7 @@ mod tests {
             .await
             .expect("put stats object");
         let head = SnapshotHead {
-            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant.0.to_vec(),
             signal: signal_num,
             shard_count: 1,
@@ -14164,6 +14165,7 @@ mod tests {
                     part_blake3: vec![part_hash.to_vec()],
                 }),
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
             shard_generation_count: 1,

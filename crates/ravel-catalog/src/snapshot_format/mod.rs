@@ -20,7 +20,10 @@ pub(crate) use column_stats::{SegmentMeter, decode_column_stats_streamed};
 #[cfg(test)]
 pub use column_stats::{encode_column_stats, encode_column_stats_v2};
 pub use error::SnapshotFormatError;
-pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
+pub use head::{
+    HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2, HEAD_FORMAT_VERSIONS, decode_head, encode_head,
+    head_format_version_for, head_format_version_is_newer,
+};
 pub use kidx::{
     DEFAULT_MAX_KEY_INDEX_LEAF_BODY_BYTES, EncodedKeyIndexLeaf, KEY_INDEX_LEAF_FORMAT_VERSION,
     KEY_INDEX_LEAF_FORMAT_VERSION_1, KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN,
@@ -197,13 +200,14 @@ mod tests {
             min_hour,
             column_stats: None,
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }
     }
 
     fn head_with_parts(parts: Vec<SnapshotPartRef>) -> SnapshotHead {
         let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
         SnapshotHead {
-            format_version: HEAD_FORMAT_VERSION,
+            format_version: HEAD_FORMAT_VERSION_1,
             tenant_hash: vec![0x11; 16],
             signal: 1,
             shard_count: 8,
@@ -338,6 +342,88 @@ mod tests {
         assert_eq!(decoded.entries, vec![entry]);
     }
 
+    /// A day part `[24, 47]` sealed ahead of a tail `[48, 50]`, retiring
+    /// `retired_hours`, in a HEAD stamped `format_version`.
+    fn retired_head(format_version: u32, retired_hours: Vec<u32>) -> SnapshotHead {
+        let mut sealed = part_ref("day", 24, 47);
+        sealed.retired_hours = retired_hours;
+        let mut head = head_with_parts(vec![sealed, part_ref("tail", 48, 50)]);
+        head.format_version = format_version;
+        head
+    }
+
+    /// ADR-3939 decision 6, the four version cases: version 1 with no
+    /// retired hour and version 2 with one are accepted, and agree with
+    /// `head_format_version_for`; version 1 with a retired hour and version 2
+    /// with none are each rejected by both encode and decode. A version above
+    /// 2 is newer and fails closed.
+    #[test]
+    fn head_version_follows_retired_hours() {
+        let v1_none = retired_head(1, Vec::new());
+        assert_eq!(head_format_version_for(&v1_none), 1);
+        let bytes = encode_head(&v1_none).expect("v1 with no retired hour encodes");
+        assert_eq!(decode_head(&bytes).expect("decodes"), v1_none);
+
+        let v2_some = retired_head(2, vec![30]);
+        assert_eq!(head_format_version_for(&v2_some), 2);
+        let bytes = encode_head(&v2_some).expect("v2 with a retired hour encodes");
+        assert_eq!(decode_head(&bytes).expect("decodes"), v2_some);
+
+        for (head, required) in [
+            (retired_head(1, vec![30]), 2),
+            (retired_head(2, Vec::new()), 1),
+        ] {
+            let expected = SnapshotFormatError::HeadVersionContentMismatch {
+                format_version: head.format_version,
+                required,
+            };
+            assert_eq!(encode_head(&head).expect_err("encode rejects"), expected);
+            assert_eq!(
+                decode_head(&head.encode_to_vec()).expect_err("decode rejects"),
+                expected
+            );
+        }
+
+        let newer = retired_head(3, vec![30]);
+        let err = decode_head(&newer.encode_to_vec()).expect_err("v3 rejected");
+        assert_eq!(err, SnapshotFormatError::UnsupportedHeadVersion(3));
+        assert!(err.is_newer_format_version());
+        assert!(!SnapshotFormatError::UnsupportedHeadVersion(0).is_newer_format_version());
+    }
+
+    /// ADR-3939 decision 6: a retired hour outside its part's
+    /// `[min_hour, watermark_hour]` fails HEAD validation, below and above,
+    /// as does a list that is unsorted or repeats an hour. Both bounds are
+    /// inclusive.
+    #[test]
+    fn retired_hours_outside_the_part_range_fail_head_validation() {
+        for hour in [24, 47] {
+            encode_head(&retired_head(2, vec![hour])).expect("a bound is inside the part");
+        }
+        for hour in [23, 48] {
+            assert_eq!(
+                decode_head(&retired_head(2, vec![hour]).encode_to_vec())
+                    .expect_err("outside rejected"),
+                SnapshotFormatError::RetiredHourOutsidePart {
+                    index: 0,
+                    hour,
+                    min_hour: 24,
+                    watermark: 47,
+                }
+            );
+        }
+        for (hours, previous, next) in [(vec![30, 26], 30, 26), (vec![26, 30, 30], 30, 30)] {
+            assert_eq!(
+                decode_head(&retired_head(2, hours).encode_to_vec()).expect_err("rejected"),
+                SnapshotFormatError::RetiredHoursNotAscending {
+                    index: 0,
+                    previous,
+                    next,
+                }
+            );
+        }
+    }
+
     /// The per-level writer_id width is the identity contract every producer
     /// of a snapshot entry must honour: a level-0 L0 entry carries the 16-byte
     /// flush writer uuid, a level-1 compaction or rewrite part carries the
@@ -418,7 +504,7 @@ mod tests {
         assert_eq!(MAGIC, *b"RCS1");
         assert_eq!(VERSION, 1);
         assert_eq!(RESERVED, [0, 0, 0]);
-        assert_eq!(HEAD_FORMAT_VERSION, 1);
+        assert_eq!(HEAD_FORMAT_VERSIONS, [1, 2]);
         assert_eq!(DEFAULT_MAX_SNAPSHOT_PART_BYTES, 256 << 20);
         assert_eq!(POSTINGS_MAGIC, *b"RNP1");
         assert_eq!(POSTINGS_VERSION, 1);

@@ -86,6 +86,25 @@ pub enum SnapshotFormatError {
     },
     #[error("head part[{index}] has an empty key")]
     EmptyPartKey { index: usize },
+    #[error("head part[{index}] retired_hours not strictly ascending: {previous} then {next}")]
+    RetiredHoursNotAscending {
+        index: usize,
+        previous: u32,
+        next: u32,
+    },
+    #[error(
+        "head part[{index}] retired hour {hour} lies outside its range [{min_hour}, {watermark}]"
+    )]
+    RetiredHourOutsidePart {
+        index: usize,
+        hour: u32,
+        min_hour: u32,
+        watermark: u32,
+    },
+    #[error(
+        "head format_version {format_version} does not match its content, which requires {required}"
+    )]
+    HeadVersionContentMismatch { format_version: u32, required: u32 },
     #[error("head part[{index}] min_hour {min_hour} exceeds its watermark_hour {watermark}")]
     PartRefRangeInverted {
         index: usize,
@@ -321,12 +340,15 @@ impl SnapshotFormatError {
     /// classified here.
     pub fn is_newer_format_version(&self) -> bool {
         use super::{
-            COLUMN_STATS_ACCEPTED_READ_VERSIONS, HEAD_FORMAT_VERSION, POSTINGS_VERSION, VERSION,
+            COLUMN_STATS_ACCEPTED_READ_VERSIONS, POSTINGS_VERSION, VERSION,
+            head_format_version_is_newer,
         };
         match self {
             SnapshotFormatError::UnsupportedVersion(version) => *version > VERSION,
             SnapshotFormatError::UnsupportedLevel(level) => *level > MAX_ENTRY_LEVEL,
-            SnapshotFormatError::UnsupportedHeadVersion(version) => *version > HEAD_FORMAT_VERSION,
+            SnapshotFormatError::UnsupportedHeadVersion(version) => {
+                head_format_version_is_newer(*version)
+            }
             SnapshotFormatError::PostingsUnsupportedVersion(version) => *version > POSTINGS_VERSION,
             SnapshotFormatError::ColumnStatsUnsupportedVersion(version) => {
                 COLUMN_STATS_ACCEPTED_READ_VERSIONS
@@ -367,6 +389,9 @@ impl SnapshotFormatError {
             | SnapshotFormatError::HeadWatermarkMismatch { .. }
             | SnapshotFormatError::BadPartRefFieldLen { .. }
             | SnapshotFormatError::EmptyPartKey { .. }
+            | SnapshotFormatError::RetiredHoursNotAscending { .. }
+            | SnapshotFormatError::RetiredHourOutsidePart { .. }
+            | SnapshotFormatError::HeadVersionContentMismatch { .. }
             | SnapshotFormatError::PartRefRangeInverted { .. }
             | SnapshotFormatError::PartsNotSortedByMinHour { .. }
             | SnapshotFormatError::PartRangesOverlap { .. }
@@ -428,9 +453,7 @@ impl SnapshotFormatError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::snapshot_format::{
-        COLUMN_STATS_ACCEPTED_READ_VERSIONS, HEAD_FORMAT_VERSION, POSTINGS_VERSION, VERSION,
-    };
+    use crate::snapshot_format::{COLUMN_STATS_ACCEPTED_READ_VERSIONS, POSTINGS_VERSION, VERSION};
 
     /// Each version kind is newer exactly above the highest version this build
     /// reads; one below the floor (a record stamped 0) is not.
@@ -444,7 +467,7 @@ mod tests {
         let newer = [
             SnapshotFormatError::UnsupportedVersion(VERSION + 1),
             SnapshotFormatError::UnsupportedLevel(MAX_ENTRY_LEVEL + 1),
-            SnapshotFormatError::UnsupportedHeadVersion(HEAD_FORMAT_VERSION + 1),
+            SnapshotFormatError::UnsupportedHeadVersion(3),
             SnapshotFormatError::PostingsUnsupportedVersion(POSTINGS_VERSION + 1),
             SnapshotFormatError::ColumnStatsUnsupportedVersion(column_stats_max + 1),
             SnapshotFormatError::ColumnStatsUnknownDeclaredType {

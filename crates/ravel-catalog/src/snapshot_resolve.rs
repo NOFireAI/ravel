@@ -119,6 +119,9 @@ impl SnapshotWindow {
     /// into `out` the part (index into this window's parts) and part-local
     /// entry ordinal it came from (ADR-3692 decision 1). A key already in
     /// `out` keeps the segment and origin it had.
+    ///
+    /// An entry whose `ingest_hour_bucket` its part's HEAD ref lists in
+    /// `retired_hours` (ADR-3939 decision 6) is skipped before either.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn extract_into(
         &self,
@@ -144,7 +147,19 @@ impl SnapshotWindow {
             let entries = &part.entries;
             let start = entries.partition_point(|e| e.ingest_hour_bucket < lower_hour);
             let end = entries.partition_point(|e| e.ingest_hour_bucket <= upper_hour);
+            // Read from the pinned HEAD's ref, never from the decoded part,
+            // which a cache may have held since before the hour was retired.
+            let retired: &[u32] = self
+                .part_refs
+                .get(part_index)
+                .map_or(&[], |part_ref| part_ref.retired_hours.as_slice());
             let mut insert = |local: usize| {
+                if retired
+                    .binary_search(&entries[local].ingest_hour_bucket)
+                    .is_ok()
+                {
+                    return Ok(());
+                }
                 let origin = match (u32::try_from(part_index), u32::try_from(local)) {
                     (Ok(part), Ok(ordinal)) => part_origins
                         .as_deref_mut()
@@ -1230,7 +1245,7 @@ mod tests {
 
     use super::*;
     use crate::config::CatalogConfig;
-    use crate::snapshot_format::HEAD_FORMAT_VERSION;
+    use crate::snapshot_format::HEAD_FORMAT_VERSION_1;
 
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
@@ -1332,7 +1347,7 @@ mod tests {
     /// part is loaded.
     fn head_with_tenant(tenant_hash: [u8; 16]) -> SnapshotHead {
         SnapshotHead {
-            format_version: HEAD_FORMAT_VERSION,
+            format_version: HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant_hash.to_vec(),
             signal: signal::to_proto(Signal::Metrics) as u32,
             shard_count: 1,
@@ -1346,6 +1361,7 @@ mod tests {
                 min_hour: 0,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
@@ -1478,7 +1494,7 @@ mod tests {
         // blake3: the existing HEAD tenant_hash and part blake3 checks both
         // pass, so only the part header betrays the foreign tenant.
         let head = SnapshotHead {
-            format_version: HEAD_FORMAT_VERSION,
+            format_version: HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant.0.to_vec(),
             signal: signal::to_proto(Signal::Metrics) as u32,
             shard_count: 1,
@@ -1492,6 +1508,7 @@ mod tests {
                 min_hour: 0,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,

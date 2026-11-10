@@ -1035,14 +1035,15 @@ the exact-key index over exactly this part's segments. Each points at a
 the KEY_IDX section inside every data object (docs/log-segment-format.md
 "KEY_IDX", docs/span-segment-format.md "KEY_IDX"). Field 8 is absent (proto3
 default) for a part with no leaves; absence means uncovered and is never an
-error, and `HEAD_FORMAT_VERSION` (1) is not bumped, by the field 6 and field
-7 precedent: an older reader ignores the field and scans. The ref carries
-`key` (the object key), `blake3` (32, of the leaf's full bytes), `size`,
-`field`, `key_type`, `key8_lo` and `key8_hi` (the inclusive key slice this
-leaf covers), `prefix_len` (the bytes through the directory crc, so the
-first GET needs no probe), `bucket_bits`, `entry_count`, `uncovered_count`
-(the length of the header's `uncovered_entry_ordinals`, identical on every
-slice of the pair) and `part_blake3` (32, the one covered part).
+error, and the field does not bump the HEAD `format_version`, by the field
+6 and field 7 precedent: an older reader ignores the field and scans. The
+ref carries `key` (the object key), `blake3` (32, of the leaf's full
+bytes), `size`, `field`, `key_type`, `key8_lo` and `key8_hi` (the
+inclusive key slice this leaf covers), `prefix_len` (the bytes through the
+directory crc, so the first GET needs no probe), `bucket_bits`,
+`entry_count`, `uncovered_count` (the length of the header's
+`uncovered_entry_ordinals`, identical on every slice of the pair) and
+`part_blake3` (32, the one covered part).
 
 **Object layout (RKI1 envelope).**
 
@@ -1971,6 +1972,87 @@ refused and its output does not change, because turning the switch off on
 purpose looks the same (tests
 `key_index_switch_off_over_leaves_is_reported_and_warned` and
 `a_switch_off_fold_over_leaves_is_reported`).
+
+### Retired hours
+
+ADR-3939 decision 6. `SnapshotPartRef` field 9, `repeated uint32
+retired_hours`, lists the ingest hours inside the part's `[min_hour,
+watermark_hour]` whose retention tombstone a fold has observed while the
+part still holds their entries. Absent means none. `validate_head`, which
+runs on encode and on decode, rejects a list that is not strictly
+ascending (`RetiredHoursNotAscending`, so a repeated hour fails too) and an
+hour outside the part's range (`RetiredHourOutsidePart`), both bounds
+inclusive (`retired_hours_outside_the_part_range_fail_head_validation`).
+
+**HEAD version.** A HEAD is written with `format_version` 2 exactly when
+some part ref carries a retired hour, and with 1 otherwise
+(`head_format_version_for`, stamped by every HEAD writer).
+`HEAD_FORMAT_VERSIONS` is `[1, 2]`: the reader accepts both, refuses a 1
+carrying a retired hour and a 2 carrying none
+(`HeadVersionContentMismatch`), and refuses any other version as
+`UnsupportedHeadVersion`, which counts as a newer format only above 2.
+The version is a function of the content, so a HEAD whose retired hours
+empty, or whose retired part re-encodes, is written at 1 again, and two
+folds of the same input write the same bytes. A reader that knows only
+version 1 refuses a version 2 HEAD rather than ignore field 9 and serve a
+retired hour; ADR-3939 decision 6 describes how each older component
+fails. `ravel-cli catalog inspect` prints the HEAD's `format_version` and
+each part's `retired_hours (field 9)` line, and the same two fields under
+`--json` (`inspect_prints_the_head_version_and_each_parts_retired_hours`).
+
+**The fold.** With `build_key_index_leaves` on, every part of the previous
+HEAD but the last that carries `key_index` refs is retirable; a rebuilt
+fold has none. A reconcile pass (the fixed window, the frontier band or a
+targeted re-fold) that lists a retention tombstone in a bucket inside a
+retirable part sets the bucket aside instead of dropping its entries.
+Once every pass has listed, each such part is settled in HEAD order:
+
+- If one of its hours was dirtied this fold (a compaction record, an
+  erasure rewrite record, or a late commit into a held-open hour), or a
+  set-aside hour was not tombstoned in every shard holding entries there,
+  the part re-encodes now. The entries of its retired and set-aside hours
+  are dropped for good and the new ref carries no retired hours
+  (`a_rewrite_record_in_a_retired_sealed_day_re_encodes_now`).
+- Otherwise each set-aside hour that holds entries joins the part's
+  retired hours, and the ref is carried with the same key, blake3 and leaf
+  refs: no part PUT and no leaf PUT
+  (`a_tombstoned_hour_in_a_leaf_bearing_sealed_day_is_recorded_not_reencoded`).
+- If that leaves every hour holding entries in the part retired, the part
+  leaves HEAD with its entries and no PUT
+  (`a_fully_tombstoned_day_part_is_dropped_without_a_put`).
+
+A part carried by reference in a later fold keeps its list
+(`a_part_carried_by_reference_keeps_its_retired_hours`). A switch-off fold
+over a part with retired hours re-encodes it without them and writes no
+field 9 (`a_switch_off_fold_over_retired_hours_re_encodes_the_part`). The
+frontier band does not list an hour that is already retired. When the
+partition gives a retired hour's entries to a span that is not carried by
+reference (a late commit into a held-open hour of the previous UTC day,
+which re-encodes that sealed day part, is one way), those entries are
+dropped and the partition is recomputed, so a re-encoded part never holds
+a retired hour
+(`a_late_commit_through_a_held_open_hour_re_encodes_the_previous_day`). Two
+folds that observe the same tombstones write byte-identical HEADs
+(`folds_that_retire_hours_write_identical_heads`).
+
+**The reader.** `SnapshotWindow::extract_into` skips an entry whose
+`ingest_hour_bucket` its part ref lists in `retired_hours` before it makes
+a `SegmentRef` or a `SegmentPartOrigin`. Both tiers read that output, so
+the tier-1 probe never opens a retired hour's object and the key-index
+router never routes it
+(`a_retired_hour_yields_no_segment_on_either_tier` in
+`services/ravel-server/tests/sql_logs_key_index_tier2.rs`). Entry ordinals
+do not shift, so leaves, postings and per-part statistics stay bound. The
+list is read from the pinned HEAD's ref, never from the decoded part, so a
+part decoded and cached before the tombstone hides the hour once a HEAD
+naming it is resolved
+(`a_decoded_part_cached_before_the_tombstone_hides_the_hour_after_it`).
+
+**Deletion.** Visibility changes at the fold that observes the tombstone.
+The sweep's HEAD-reachability gate reads the part's entries, so HEAD keeps
+a retired hour's objects named until the part re-encodes or leaves HEAD,
+and the physical delete waits for that; ADR-3939 decision 6 accepts the
+lag, up to a day for a day part.
 
 ### Idempotency marker body layout
 

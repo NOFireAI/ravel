@@ -4,9 +4,11 @@
 #![allow(clippy::expect_used)]
 
 use proptest::prelude::*;
+use prost::Message;
 use ravel_catalog::{
-    NamePostings, PartLimits, PostingsLimits, decode_head, decode_part, decode_postings,
-    encode_head, encode_part, encode_postings,
+    HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2, NamePostings, PartLimits, PostingsLimits,
+    SnapshotFormatError, decode_head, decode_part, decode_postings, encode_head, encode_part,
+    encode_postings, head_format_version_for,
 };
 use ravel_proto::catalog::v1::{
     DeclaredColumnMinMax, DeclaredColumnStatValue, SnapshotEntry, SnapshotHead, SnapshotPartRef,
@@ -185,6 +187,7 @@ fn arb_head() -> impl Strategy<Value = SnapshotHead> {
                 prop::collection::vec(any::<u8>(), 32),
                 any::<u64>(),
                 any::<u64>(),
+                any::<u16>(),
             ),
             1..5,
         ),
@@ -195,26 +198,35 @@ fn arb_head() -> impl Strategy<Value = SnapshotHead> {
             let mut cursor = 0u32;
             let parts: Vec<SnapshotPartRef> = raw_parts
                 .into_iter()
-                .map(|(gap, span, key, blake3, size, entry_count)| {
-                    let min_hour = cursor + gap;
-                    let watermark_hour = min_hour + span;
-                    cursor = watermark_hour + 1;
-                    SnapshotPartRef {
-                        key,
-                        blake3,
-                        size,
-                        entry_count,
-                        watermark_hour,
-                        min_hour,
-                        column_stats: None,
-                        key_index: Vec::new(),
-                    }
-                })
+                .map(
+                    |(gap, span, key, blake3, size, entry_count, retired_mask)| {
+                        let min_hour = cursor + gap;
+                        let watermark_hour = min_hour + span;
+                        cursor = watermark_hour + 1;
+                        // Bit `i` of the mask retires hour `min_hour + i`, so the
+                        // retired hours are ascending and inside the part's range.
+                        let retired_hours = (0..=span)
+                            .filter(|i| retired_mask & (1 << i) != 0)
+                            .map(|i| min_hour + i)
+                            .collect();
+                        SnapshotPartRef {
+                            key,
+                            blake3,
+                            size,
+                            entry_count,
+                            watermark_hour,
+                            min_hour,
+                            column_stats: None,
+                            key_index: Vec::new(),
+                            retired_hours,
+                        }
+                    },
+                )
                 .collect();
             arb_postings_ref(&parts).prop_map(move |postings| {
                 let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
-                SnapshotHead {
-                    format_version: 1,
+                let mut head = SnapshotHead {
+                    format_version: 0,
                     tenant_hash: vec![0x33u8; 16],
                     signal: 1,
                     shard_count: 8,
@@ -224,7 +236,9 @@ fn arb_head() -> impl Strategy<Value = SnapshotHead> {
                     folder_id: folder_id.clone(),
                     created_unix_ns,
                     shard_generation_count: 1,
-                }
+                };
+                head.format_version = head_format_version_for(&head);
+                head
             })
         })
 }
@@ -235,6 +249,55 @@ proptest! {
         let encoded = encode_head(&head).expect("encode");
         let decoded = decode_head(&encoded).expect("decode");
         prop_assert_eq!(decoded, head);
+    }
+
+    /// Both HEAD versions round-trip, and the stamped version is the one the
+    /// content requires: 2 exactly when a part carries a retired hour.
+    #[test]
+    fn head_version_round_trips_with_its_content(head in arb_head()) {
+        let retired = head.parts.iter().any(|p| !p.retired_hours.is_empty());
+        let decoded = decode_head(&encode_head(&head).expect("encode")).expect("decode");
+        let expected = if retired { HEAD_FORMAT_VERSION_2 } else { HEAD_FORMAT_VERSION_1 };
+        prop_assert_eq!(decoded.format_version, expected);
+        prop_assert_eq!(head_format_version_for(&decoded), expected);
+    }
+
+    /// A HEAD stamped with the other known version than its content requires
+    /// is refused on both encode and decode.
+    #[test]
+    fn head_with_the_other_version_is_refused(head in arb_head()) {
+        let mut wrong = head.clone();
+        wrong.format_version = if head.format_version == HEAD_FORMAT_VERSION_1 {
+            HEAD_FORMAT_VERSION_2
+        } else {
+            HEAD_FORMAT_VERSION_1
+        };
+        let expected = || SnapshotFormatError::HeadVersionContentMismatch {
+            format_version: wrong.format_version,
+            required: head.format_version,
+        };
+        prop_assert_eq!(encode_head(&wrong).expect_err("encode refuses"), expected());
+        prop_assert_eq!(
+            decode_head(&wrong.encode_to_vec()).expect_err("decode refuses"),
+            expected()
+        );
+    }
+
+    /// A HEAD of either version with one bit flipped decodes to a typed
+    /// error or to a HEAD whose version still matches its content: no flip
+    /// yields a version 1 HEAD that carries a retired hour.
+    #[test]
+    fn a_flipped_head_bit_never_hides_a_version_mismatch(
+        head in arb_head(),
+        at in any::<prop::sample::Index>(),
+        bit in 0u8..8,
+    ) {
+        let mut bytes = encode_head(&head).expect("encode");
+        let i = at.index(bytes.len());
+        bytes[i] ^= 1 << bit;
+        if let Ok(decoded) = decode_head(&bytes) {
+            prop_assert_eq!(decoded.format_version, head_format_version_for(&decoded));
+        }
     }
 
     #[test]

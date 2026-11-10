@@ -32,7 +32,9 @@
 //! errors (which carry only counts and limits an operator needs).
 
 use datafusion::error::DataFusionError;
-use ravel_catalog::{CatalogError, HEAD_FORMAT_VERSION, LoadColumnStatsError, SnapshotFormatError};
+use ravel_catalog::{
+    CatalogError, LoadColumnStatsError, SnapshotFormatError, head_format_version_is_newer,
+};
 use ravel_commit::erasure::ErasureError;
 use ravel_commit::record::RecordError;
 use ravel_cpu_gate::CpuGateError;
@@ -931,7 +933,7 @@ fn lane_suffix(table: &Option<&'static str>) -> String {
 /// - A version or enum value above the highest this build reads is retryable
 ///   ([`MSG_UNAVAILABLE`], `ErrorClass::Unavailable`, 503): during a rolling
 ///   upgrade a peer on a newer build can read it. That is an
-///   `UnsupportedHeadVersion` above [`HEAD_FORMAT_VERSION`], every case
+///   `UnsupportedHeadVersion` that [`head_format_version_is_newer`] reports, every case
 ///   [`SnapshotFormatError::is_newer_format_version`] reports, the
 ///   above-maximum unsupported-version case of the record inside `Record` and
 ///   `CompactionRecordDecode`, and the above-maximum format version
@@ -979,7 +981,7 @@ fn redact_catalog(err: &CatalogError) -> &'static str {
         // newer build can during a rolling upgrade, so it is retryable. 503.
         // A HEAD below the floor is corrupt. 500.
         CatalogError::UnsupportedHeadVersion { format_version } => {
-            if *format_version > HEAD_FORMAT_VERSION {
+            if head_format_version_is_newer(*format_version) {
                 MSG_UNAVAILABLE
             } else {
                 MSG_CORRUPT
@@ -1399,7 +1401,7 @@ mod tests {
         // Newer-format-version cases, including the unsupported-version case each
         // decode fault carries in its source: retryable, 503.
         let unavailable = [
-            SqlError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 2 }),
+            SqlError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 3 }),
             SqlError::Catalog(CatalogError::SnapshotFormat(
                 SnapshotFormatError::UnsupportedVersion(2),
             )),
@@ -1465,7 +1467,7 @@ mod tests {
 
         let unavailable = [
             SnapshotFormatError::UnsupportedVersion(2),
-            SnapshotFormatError::UnsupportedHeadVersion(2),
+            SnapshotFormatError::UnsupportedHeadVersion(3),
             SnapshotFormatError::PostingsUnsupportedVersion(2),
             SnapshotFormatError::ColumnStatsUnsupportedVersion(4),
             SnapshotFormatError::UnsupportedLevel(2),
@@ -1684,13 +1686,13 @@ mod tests {
     fn newer_version_head_through_column_stats_is_unavailable() {
         let loader = SqlError::ColumnStats(LoadColumnStatsError::HeadCorrupt {
             key: LEAKY_KEY.to_string(),
-            source: SnapshotFormatError::UnsupportedHeadVersion(2),
+            source: SnapshotFormatError::UnsupportedHeadVersion(3),
         });
         assert_eq!(loader.client_message(), MSG_UNAVAILABLE);
         assert_eq!(loader.class(), ErrorClass::Unavailable);
         assert_redacted(&loader.client_message());
         let catalog = SqlError::Catalog(CatalogError::SnapshotFormat(
-            SnapshotFormatError::UnsupportedHeadVersion(2),
+            SnapshotFormatError::UnsupportedHeadVersion(3),
         ));
         assert_eq!(loader.client_message(), catalog.client_message());
 

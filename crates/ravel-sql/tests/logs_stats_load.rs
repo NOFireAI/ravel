@@ -29,7 +29,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::displayable;
 use futures::StreamExt;
 use ravel_catalog::{
-    Catalog, CatalogConfig, DEFAULT_MAX_COLUMN_STATS_BYTES, HEAD_FORMAT_VERSION, SegmentLevel,
+    Catalog, CatalogConfig, DEFAULT_MAX_COLUMN_STATS_BYTES, HEAD_FORMAT_VERSION_1, SegmentLevel,
     SegmentRef, Snapshot, encode_column_stats_v3, encode_head,
 };
 use ravel_object_store::memory::MemoryStore;
@@ -192,7 +192,7 @@ async fn install_head_and_stats(store: &dyn ObjectStoreBackend, segments: &[Colu
         .expect("put stats");
 
     let head = SnapshotHead {
-        format_version: HEAD_FORMAT_VERSION,
+        format_version: HEAD_FORMAT_VERSION_1,
         tenant_hash: TENANT.0.to_vec(),
         signal: signal_num,
         shard_count: 1,
@@ -212,6 +212,7 @@ async fn install_head_and_stats(store: &dyn ObjectStoreBackend, segments: &[Colu
                 part_blake3: vec![part_hash.to_vec()],
             }),
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),
         created_unix_ns: 0,
@@ -551,7 +552,7 @@ async fn plan_pinned_loads_stats_when_ingest_hour_diverges_from_event_time() {
     // segment's event hour and ingest hour both at 0, which is exactly why
     // it cannot tell the two clocks apart.
     let head = SnapshotHead {
-        format_version: HEAD_FORMAT_VERSION,
+        format_version: HEAD_FORMAT_VERSION_1,
         tenant_hash: TENANT.0.to_vec(),
         signal: signal_num,
         shard_count: 1,
@@ -571,6 +572,7 @@ async fn plan_pinned_loads_stats_when_ingest_hour_diverges_from_event_time() {
                 part_blake3: vec![part_hash.to_vec()],
             }),
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),
         created_unix_ns: 0,
