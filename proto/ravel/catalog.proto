@@ -158,8 +158,17 @@ message SnapshotPartRef {
   // the exact-key index over exactly this part's segments (`.kidx` leaves,
   // docs/catalog-and-mvcc.md "Per-part key-index leaves"). Absent means the
   // part is uncovered for every field and is scanned; absence is never an
-  // error. No HEAD_FORMAT_VERSION bump, by the field 6 and 7 precedent.
+  // error. No HEAD format version bump, by the field 6 and 7 precedent.
   repeated SnapshotKeyIndexLeafRef key_index = 8;
+  // Additive, ADR-3939 decision 6. Ingest hours of this part a retention
+  // tombstone has retired without re-encoding it: the part bytes and leaves
+  // still hold their entries, and resolve skips every entry whose
+  // ingest_hour_bucket is listed here. Strictly ascending, each inside
+  // [min_hour, watermark_hour]. Written only on a sealed part that carries
+  // key_index leaves; a HEAD with any part carrying a non-empty list is
+  // format_version 2, one with none is 1 (docs/catalog-and-mvcc.md
+  // "Retired hours").
+  repeated uint32 retired_hours = 9;
 }
 
 // Reference to a name-postings object (RNP1 envelope), phase P5a.

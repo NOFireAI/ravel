@@ -1230,7 +1230,7 @@ mod tests {
 
     use super::*;
     use crate::config::CatalogConfig;
-    use crate::snapshot_format::HEAD_FORMAT_VERSION;
+    use crate::snapshot_format::HEAD_FORMAT_VERSION_1;
 
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
@@ -1332,7 +1332,7 @@ mod tests {
     /// part is loaded.
     fn head_with_tenant(tenant_hash: [u8; 16]) -> SnapshotHead {
         SnapshotHead {
-            format_version: HEAD_FORMAT_VERSION,
+            format_version: HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant_hash.to_vec(),
             signal: signal::to_proto(Signal::Metrics) as u32,
             shard_count: 1,
@@ -1346,6 +1346,7 @@ mod tests {
                 min_hour: 0,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
@@ -1478,7 +1479,7 @@ mod tests {
         // blake3: the existing HEAD tenant_hash and part blake3 checks both
         // pass, so only the part header betrays the foreign tenant.
         let head = SnapshotHead {
-            format_version: HEAD_FORMAT_VERSION,
+            format_version: HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant.0.to_vec(),
             signal: signal::to_proto(Signal::Metrics) as u32,
             shard_count: 1,
@@ -1492,6 +1493,7 @@ mod tests {
                 min_hour: 0,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,

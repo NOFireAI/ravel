@@ -425,6 +425,7 @@ async fn put_head_with(store: &dyn ObjectStoreBackend, entries: Vec<SnapshotEntr
             min_hour: 0,
             column_stats: None,
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }],
         folder_id: vec![0u8; 16],
         created_unix_ns: 0,

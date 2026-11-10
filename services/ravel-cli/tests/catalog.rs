@@ -292,7 +292,7 @@ async fn inspect_preserves_partial_output_when_a_part_fetch_fails() {
     );
 
     let head = SnapshotHead {
-        format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+        format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
         tenant_hash: tenant_hash.0.to_vec(),
         signal: Signal::Metrics as u32,
         shard_count: 1,
@@ -307,6 +307,7 @@ async fn inspect_preserves_partial_output_when_a_part_fetch_fails() {
                 min_hour: 0,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             },
             SnapshotPartRef {
                 key: missing_key.clone(),
@@ -317,6 +318,7 @@ async fn inspect_preserves_partial_output_when_a_part_fetch_fails() {
                 min_hour: 1,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             },
         ],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),
@@ -413,7 +415,7 @@ async fn inspect_prints_column_stats_ref_when_present() {
     let field7_key = "t/acme/catalog/metrics/idx/present-v3.cstat".to_string();
 
     let head = SnapshotHead {
-        format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+        format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
         tenant_hash: tenant_hash.0.to_vec(),
         signal: Signal::Metrics as u32,
         shard_count: 1,
@@ -433,6 +435,7 @@ async fn inspect_prints_column_stats_ref_when_present() {
                 part_blake3: vec![],
             }),
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),
         created_unix_ns: now_ns(),
@@ -493,7 +496,7 @@ async fn inspect_prints_absent_marker_for_unset_column_stats_ref() {
         .expect("seed the part");
 
     let head = SnapshotHead {
-        format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+        format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
         tenant_hash: tenant_hash.0.to_vec(),
         signal: Signal::Metrics as u32,
         shard_count: 1,
@@ -507,6 +510,7 @@ async fn inspect_prints_absent_marker_for_unset_column_stats_ref() {
             min_hour: 0,
             column_stats: None,
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),
         created_unix_ns: now_ns(),

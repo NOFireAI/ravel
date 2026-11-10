@@ -42,7 +42,8 @@ use crate::declared_stats;
 use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
-    self, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION, KeyIndexLeafEncodeError, KeyIndexLeafEntry,
+    self, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSIONS,
+    KeyIndexLeafEncodeError, KeyIndexLeafEntry,
     KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafSummary, KeyIndexSlice, NamePostings,
     PartLimits, SnapshotFormatError, column_stats_segments_concat, encode_key_index_leaf,
     encoded_entry_len, key_index_leaf_version_accepted, select_key_index_slice,
@@ -484,9 +485,9 @@ pub(crate) enum HeadState {
     Corrupt {
         version: Version,
     },
-    /// HEAD decoded far enough to see a `format_version` above
-    /// [`HEAD_FORMAT_VERSION`] (ADR-0066 decision 2, "fail-closed-on-newer");
-    /// a version below it is [`HeadState::Corrupt`]. Unlike
+    /// HEAD decoded far enough to see a `format_version` above every one of
+    /// [`HEAD_FORMAT_VERSIONS`] (ADR-0066 decision 2, "fail-closed-on-newer");
+    /// a version below them is [`HeadState::Corrupt`]. Unlike
     /// [`HeadState::Corrupt`], this HEAD is NOT rebuildable: a newer-format
     /// HEAD (e.g. an EH multi-part HEAD written by an already-upgraded peer)
     /// carries state this older process cannot see, so rebuilding a
@@ -5061,6 +5062,7 @@ impl Catalog {
                     min_hour: part_min_hour,
                     column_stats,
                     key_index,
+                    retired_hours: Vec::new(),
                 });
             }
 
@@ -5173,8 +5175,8 @@ impl Catalog {
                 None => None,
             };
 
-            let new_head = SnapshotHead {
-                format_version: HEAD_FORMAT_VERSION,
+            let mut new_head = SnapshotHead {
+                format_version: HEAD_FORMAT_VERSION_1,
                 tenant_hash: tenant.0.to_vec(),
                 signal: signal_num,
                 shard_count: shard_ceiling,
@@ -5190,6 +5192,7 @@ impl Catalog {
                 created_unix_ns: now_ns,
                 shard_generation_count,
             };
+            new_head.format_version = snapshot_format::head_format_version_for(&new_head);
             let head_bytes = snapshot_format::encode_head(&new_head)?;
             let head_crc = crc32c::crc32c(&head_bytes);
             let put_mode = match &head_state {
@@ -5325,7 +5328,7 @@ impl Catalog {
                     // newer HEAD written by an upgraded peer. Keep it a
                     // distinct state so the fold fails loudly.
                     Err(SnapshotFormatError::UnsupportedHeadVersion(format_version))
-                        if format_version > HEAD_FORMAT_VERSION =>
+                        if snapshot_format::head_format_version_is_newer(format_version) =>
                     {
                         tracing::error!(
                             key = %head_key,
@@ -5335,8 +5338,8 @@ impl Catalog {
                         Ok(HeadState::UnsupportedVersion { format_version })
                     }
                     // Below the supported floor (`decode_head` accepts only
-                    // `HEAD_FORMAT_VERSION`, so the floor is that constant
-                    // today): corrupt, or written by an older peer during a
+                    // `HEAD_FORMAT_VERSIONS`, so the floor is the lowest of
+                    // them): corrupt, or written by an older peer during a
                     // rolling upgrade. Either way it is rebuilt like any
                     // undecodable HEAD: the CAS on `got.version` only moves
                     // a HEAD forward, and an older peer refuses the result.
@@ -5344,7 +5347,7 @@ impl Catalog {
                         tracing::warn!(
                             key = %head_key,
                             format_version,
-                            supported = HEAD_FORMAT_VERSION,
+                            supported = ?HEAD_FORMAT_VERSIONS,
                             "HEAD format_version is below the supported version, rebuilding"
                         );
                         Ok(HeadState::Corrupt {
@@ -10134,7 +10137,7 @@ pub(crate) mod tests {
         // first and returns `UnsupportedHeadVersion`.
         let head_key = head_object_key(&tenant(), Signal::Metrics);
         let newer_head = SnapshotHead {
-            format_version: HEAD_FORMAT_VERSION + 1,
+            format_version: 3,
             ..Default::default()
         };
         let newer_bytes = newer_head.encode_to_vec();
@@ -10157,7 +10160,7 @@ pub(crate) mod tests {
             matches!(
                 err,
                 CatalogError::UnsupportedHeadVersion { format_version }
-                    if format_version == HEAD_FORMAT_VERSION + 1
+                    if format_version == 3
             ),
             "expected UnsupportedHeadVersion, got {err:?}"
         );
@@ -10201,7 +10204,7 @@ pub(crate) mod tests {
 
         let head_key = head_object_key(&tenant(), Signal::Metrics);
         let corrupt_head = SnapshotHead {
-            format_version: HEAD_FORMAT_VERSION,
+            format_version: HEAD_FORMAT_VERSION_1,
             tenant_hash: vec![0u8; 4],
             ..Default::default()
         };
@@ -10275,7 +10278,7 @@ pub(crate) mod tests {
             .await
             .expect("rebuilt head present");
         let head = snapshot_format::decode_head(&got.data).expect("rebuilt head decodes");
-        assert_eq!(head.format_version, HEAD_FORMAT_VERSION);
+        assert_eq!(head.format_version, HEAD_FORMAT_VERSION_1);
         assert_eq!(head.watermark_hour, 12);
     }
 
@@ -10294,7 +10297,7 @@ pub(crate) mod tests {
 
         let head_key = head_object_key(&tenant(), Signal::Metrics);
         let newer_bytes = SnapshotHead {
-            format_version: HEAD_FORMAT_VERSION + 1,
+            format_version: 3,
             watermark_hour: 10,
             ..Default::default()
         }
@@ -10318,7 +10321,7 @@ pub(crate) mod tests {
             matches!(
                 err,
                 CatalogError::UnsupportedHeadVersion { format_version }
-                    if format_version == HEAD_FORMAT_VERSION + 1
+                    if format_version == 3
             ),
             "expected UnsupportedHeadVersion, got {err:?}"
         );

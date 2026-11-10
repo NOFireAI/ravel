@@ -1389,11 +1389,12 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                retired_hours: Vec::new(),
             });
         }
 
         let head = SnapshotHead {
-            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant_hash.0.to_vec(),
             signal: 0,
             shard_count: 1,
@@ -1499,10 +1500,11 @@ mod tests {
                 min_hour,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             });
         }
         let head = SnapshotHead {
-            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant_hash.0.to_vec(),
             signal: 0,
             shard_count: 1,

@@ -296,6 +296,9 @@ fn attach(head: &SnapshotHead, built: &[BuiltPart]) -> (SnapshotHead, u64) {
         );
         attached += 1;
     }
+    // Every part keeps its `retired_hours`, so the version is the one the
+    // carried content requires.
+    next.format_version = snapshot_format::head_format_version_for(&next);
     (next, attached)
 }
 

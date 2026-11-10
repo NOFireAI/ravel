@@ -13,7 +13,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use ravel_catalog::{CatalogError, HEAD_FORMAT_VERSION, SnapshotFormatError};
+use ravel_catalog::{CatalogError, SnapshotFormatError, head_format_version_is_newer};
 use ravel_commit::erasure::ErasureError;
 use ravel_commit::record::RecordError;
 use ravel_cpu_gate::CpuGateError;
@@ -286,7 +286,7 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
             // retryable: a peer on a newer build can read it during a rolling
             // upgrade. 503. A HEAD below the floor is corrupt. 500.
             CatalogError::UnsupportedHeadVersion { format_version } => {
-                if *format_version > HEAD_FORMAT_VERSION {
+                if head_format_version_is_newer(*format_version) {
                     MSG_UNAVAILABLE
                 } else {
                     MSG_CORRUPT
@@ -654,7 +654,7 @@ mod tests {
         // Newer-format-version cases, including the unsupported-version case each
         // decode fault carries in its source: retryable 503 unavailable.
         let unavailable: Vec<fn() -> QueryError> = vec![
-            || QueryError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 2 }),
+            || QueryError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 3 }),
             || {
                 QueryError::Catalog(CatalogError::SnapshotFormat(
                     SnapshotFormatError::UnsupportedVersion(2),
@@ -730,7 +730,7 @@ mod tests {
 
         let unavailable: Vec<fn() -> SnapshotFormatError> = vec![
             || SnapshotFormatError::UnsupportedVersion(2),
-            || SnapshotFormatError::UnsupportedHeadVersion(2),
+            || SnapshotFormatError::UnsupportedHeadVersion(3),
             || SnapshotFormatError::PostingsUnsupportedVersion(2),
             || SnapshotFormatError::ColumnStatsUnsupportedVersion(4),
             || SnapshotFormatError::UnsupportedLevel(2),

@@ -510,6 +510,7 @@ fn base_head() -> SnapshotHead {
             min_hour: 0,
             column_stats: None,
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }],
         postings: None,
         folder_id: vec![0x33; 16],
@@ -539,10 +540,10 @@ fn head_decode_error() {
 #[test]
 fn head_unsupported_version() {
     let mut head = base_head();
-    head.format_version = 2;
+    head.format_version = 3;
     let bytes = head.encode_to_vec();
     let err = decode_head(&bytes).expect_err("decode must fail");
-    assert_eq!(err, SnapshotFormatError::UnsupportedHeadVersion(2));
+    assert_eq!(err, SnapshotFormatError::UnsupportedHeadVersion(3));
 }
 
 #[test]

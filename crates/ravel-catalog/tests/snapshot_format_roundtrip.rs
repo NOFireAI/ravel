@@ -208,6 +208,7 @@ fn arb_head() -> impl Strategy<Value = SnapshotHead> {
                         min_hour,
                         column_stats: None,
                         key_index: Vec::new(),
+                        retired_hours: Vec::new(),
                     }
                 })
                 .collect();
