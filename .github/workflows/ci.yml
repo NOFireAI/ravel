@@ -78,6 +78,15 @@ jobs:
       # outside sdk/ and scripts/gates-sdk.sh changes what the sdk job runs.
       agents_area: ${{ steps.check.outputs.agents_area }}
       sdk_area: ${{ steps.check.outputs.sdk_area }}
+      # flight_sql_area gates flight-sql and mcp_area, with server_or_operator,
+      # gates features-mcp (ADR-4034 D1). Each is true wherever the lane ran
+      # before (sql_area's paths for flight-sql; server_or_operator for
+      # features-mcp, which stays on that job's condition), and also when an
+      # edited path is under a crate whose reverse-dependency closure reaches
+      # the lane, per scripts/ci-lane-areas.tsv. That map adds sql_area and
+      # agents_area the same way.
+      flight_sql_area: ${{ steps.check.outputs.flight_sql_area }}
+      mcp_area: ${{ steps.check.outputs.mcp_area }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -85,10 +94,11 @@ jobs:
           persist-credentials: false
       - id: check
         run: |
-          # Emit all eight outputs from a single point so no code path forgets
+          # Emit all ten outputs from a single point so no code path forgets
           # one. $1 is docs_only; $2..$5 are the four Rust area flags in output
           # order (server_or_operator, sql_area, promql_area, object_store_area);
-          # $6 is formal_area; $7 is agents_area; $8 is sdk_area.
+          # $6 is formal_area; $7 is agents_area; $8 is sdk_area; $9 is
+          # flight_sql_area; $10 is mcp_area.
           emit() {
             {
               echo "docs_only=$1"
@@ -99,6 +109,8 @@ jobs:
               echo "formal_area=$6"
               echo "agents_area=$7"
               echo "sdk_area=$8"
+              echo "flight_sql_area=$9"
+              echo "mcp_area=${10}"
             } >> "$GITHUB_OUTPUT"
           }
           # merge_group events (the GitHub merge queue, ADR-0053 D1) carry no
@@ -110,7 +122,7 @@ jobs:
           # if it were docs-only or a narrow single-area change.
           if [ "${{ github.event_name }}" = "merge_group" ]; then
             echo "::notice::merge_group event, running full CI"
-            emit false true true true true true true true
+            emit false true true true true true true true true true
             exit 0
           fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -120,7 +132,7 @@ jobs:
           fi
           if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
             echo "::notice::no usable base commit, running full CI"
-            emit false true true true true true true true
+            emit false true true true true true true true true true
             exit 0
           fi
           merge_base=$(git merge-base "$base" "${{ github.sha }}")
@@ -131,7 +143,7 @@ jobs:
             # irrelevant, so run everything, matching the pre-D4 docs_only=false
             # default.
             echo "::notice::no changed files, running full CI"
-            emit false true true true true true true true
+            emit false true true true true true true true true true
             exit 0
           fi
           # formal_area (ADR-1113 D10): the TLA+ models, their harness, the
@@ -151,7 +163,7 @@ jobs:
           # runs; the tla lane still runs when formal_area is true.
           if ! echo "$changed" | grep -qvE '\.(md|svg)$|^formal/|^scripts/check-tla\.sh$'; then
             echo "::notice::docs/formal-only change, skipping compiling jobs"
-            emit true false false false false "$formal_area" false false
+            emit true false false false false "$formal_area" false false false false
             exit 0
           fi
           # Workspace-level paths change the build for every crate, so they
@@ -160,7 +172,7 @@ jobs:
           # under proto/ (regenerates types every crate can depend on).
           if echo "$changed" | grep -qE '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml)$|^\.github/|^proto/'; then
             echo "::notice::workspace-level change, running every area"
-            emit false true true true true true true true
+            emit false true true true true true true true true true
             exit 0
           fi
           # Per-area path lists (conservative supersets; ravel-server and
@@ -188,11 +200,13 @@ jobs:
           # agents module and seam test, the server manifest that declares the
           # `agents` feature, the two scripts that define the lane, and this
           # workflow. Only ^crates/ravel-agents- is also an area_paths entry
-          # below, so a change confined to the agents crates runs
-          # features-agents, the docs_only jobs and, when formal_area says so,
-          # the tla lane, and not sql, flight-sql, object-store-contract,
-          # bench-smoke or promql-difftest: those lanes do not build the
-          # agents crates (ravel-server links them only under `agents`). The
+          # below, so a change confined to the agents crates runs no
+          # object-store-contract, bench-smoke or promql-difftest: those lanes
+          # do not build the agents crates (ravel-server links them only under
+          # `agents`). Whether it runs sql, flight-sql and features-mcp is the
+          # lane-area map's call below: most agents crates are in
+          # ravel-server's dependency tree, ravel-agents-sim and
+          # ravel-agents-client are not. The
           # other paths here set server_or_operator, take the workspace-level
           # branch, or are the catch-all on purpose (a gate script change must
           # run everything).
@@ -203,6 +217,34 @@ jobs:
           if echo "$changed" | grep -qE '^sdk/|^scripts/gates-sdk\.sh$'; then
             sdk_area=true
           fi
+          # flight-sql ran on sql_area's paths and still does; features-mcp
+          # keeps its server_or_operator condition beside mcp_area.
+          flight_sql_area=$sql_area
+          mcp_area=false
+          # Closure-aware lanes (ADR-4034 D1): an edit under a crate whose
+          # reverse-dependency closure reaches a lane's crates sets that lane's
+          # area, so a change to crates/ravel-ingest/ runs sql, flight-sql,
+          # features-agents and features-mcp on the pull request, not first in
+          # the merge queue. scripts/ci-lane-areas.tsv holds the closures,
+          # generated from scripts/affected-tests.sh -n; this job has no Rust
+          # toolchain to compute them, and the lint job's guard fails when the
+          # map and the closure differ.
+          if ! map_lanes=$(printf '%s\n' "$changed" | scripts/guards/check-ci-lane-areas.sh --lanes-for-paths); then
+            echo "::error::scripts/guards/check-ci-lane-areas.sh --lanes-for-paths failed"
+            exit 1
+          fi
+          for lane in $map_lanes; do
+            case "$lane" in
+              sql) sql_area=true ;;
+              flight-sql) flight_sql_area=true ;;
+              agents) agents_area=true ;;
+              mcp) mcp_area=true ;;
+              *)
+                echo "::error::scripts/ci-lane-areas.tsv names unknown lane $lane"
+                exit 1
+                ;;
+            esac
+          done
           # Catch-all: the four lists above are conservative allowlists, not a
           # conservative superset of every workspace member -- a crate that
           # matches none of them (ravel-types, ravel-segment, ravel-logseg,
@@ -241,9 +283,11 @@ jobs:
             promql_area=true
             object_store_area=true
             agents_area=true
+            flight_sql_area=true
+            mcp_area=true
           fi
-          echo "::notice::areas server_or_operator=$server_or_operator sql=$sql_area promql=$promql_area object_store=$object_store_area formal=$formal_area agents=$agents_area sdk=$sdk_area"
-          emit false "$server_or_operator" "$sql_area" "$promql_area" "$object_store_area" "$formal_area" "$agents_area" "$sdk_area"
+          echo "::notice::areas server_or_operator=$server_or_operator sql=$sql_area promql=$promql_area object_store=$object_store_area formal=$formal_area agents=$agents_area sdk=$sdk_area flight_sql=$flight_sql_area mcp=$mcp_area"
+          emit false "$server_or_operator" "$sql_area" "$promql_area" "$object_store_area" "$formal_area" "$agents_area" "$sdk_area" "$flight_sql_area" "$mcp_area"
 
   # Cheap, build-free guards wired in from ADR-0053 D6:
   #   - scripts/check-doc-drift.sh recomputes the derived counts in
@@ -969,6 +1013,16 @@ jobs:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
+      # The `changes` job reads scripts/ci-lane-areas.tsv to run each lane for
+      # every crate whose closure reaches it (ADR-4034 D1). The map is checked
+      # here rather than in doc-scripts because the check runs `cargo
+      # metadata` through scripts/affected-tests.sh -n, which needs this
+      # job's toolchain; it builds nothing. Cases first, against a stubbed
+      # cargo, so a guard broken into always-passing fails here.
+      - name: Lane-area map cases (issue #4050)
+        run: bash scripts/guards/check-ci-lane-areas.test.sh
+      - name: Lane-area map matches the closure (ADR-4034 D1)
+        run: scripts/guards/check-ci-lane-areas.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -1267,8 +1321,9 @@ jobs:
   # `collect2: fatal error: ld terminated with signal 7 [Bus error]`. Same
   # reason the `features` lane carries its own 30-minute budget.
   #
-  # Gated on sql_area like `sql`, and required like `sql`. When renaming the
-  # `flight-sql` job below, update main's required status checks in the same
+  # Gated on flight_sql_area, which is true wherever sql_area is and also for
+  # an edit to ravel-sql's or ravel-server's dependencies, and required like
+  # `sql`. When renaming the `flight-sql` job below, update main's required status checks in the same
   # change, or the tests silently stop blocking again.
   #
   # Four legs, split by nextest's hash partition (ADR-4034 D3, issue #4050),
@@ -1278,7 +1333,7 @@ jobs:
   # job below.
   flight-sql-shard:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.flight_sql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -1339,7 +1394,7 @@ jobs:
       - name: Decide the Flight SQL lane
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
-          LANE_APPLIES: ${{ needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true' }}
+          LANE_APPLIES: ${{ needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.flight_sql_area == 'true' }}
           SHARDS_RESULT: ${{ needs.flight-sql-shard.result }}
         run: |
           echo "lane_applies=$LANE_APPLIES changes=$CHANGES_RESULT flight-sql-shard=$SHARDS_RESULT"
@@ -1802,12 +1857,13 @@ jobs:
   # test binaries that lane lists, the lib tests whole, and
   # under `--features mcp,agents` clippy and the mcp_agents_e2e binary. Gated on
   # server_or_operator, since the feature lives entirely in ravel-server and
-  # ravel-mcp, and any unlisted path forces server_or_operator true.
+  # ravel-mcp, and any unlisted path forces server_or_operator true; and on
+  # mcp_area, for an edit to a crate in ravel-server's dependency tree.
   #
   # NOTE: not a required check.
   features-mcp:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.server_or_operator == 'true'
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.mcp_area == 'true' || needs.changes.outputs.server_or_operator == 'true')
     runs-on: ubuntu-latest
     # 25m (provisional): copied from `features-otap` for the same reason as
     # `features-agents` above; not a measurement of this job.

@@ -84,6 +84,68 @@ else
   not_ok "a path matches a row only under the row's directory" "got '${got}'"
 fi
 
+# --- the changes job's own step, run on a given list of edited paths ---------
+
+# The `changes` job's `check` step from ci.yml, with its GitHub expressions
+# replaced so it reads a pull request whose diff is $CHANGED. Runs from the
+# repository root, where the step finds the guard and the map.
+STEP="${TMP}/changes-step.sh"
+sed -n '/^      - id: check$/,/^$/p' "${REPO}/.github/workflows/ci.yml" \
+  | sed '1,2d; s/^          //' \
+  | sed 's/\${{ github\.event_name }}/pull_request/; s/\${{ github\.event\.pull_request\.base\.sha }}/HEAD/; s/\${{ github\.event\.before }}/HEAD/; s/\${{ github\.sha }}/HEAD/g' \
+  | sed 's/^changed=\$(git diff .*/changed="$CHANGED"/' >"${STEP}"
+
+# areas_for <path...>: the step's four lane outputs, as name=value words.
+areas_for() {
+  local out="${TMP}/github-output" rc=0
+  : >"${out}"
+  (cd "${REPO}" && CHANGED="$(printf '%s\n' "$@")" GITHUB_OUTPUT="${out}" bash -e "${STEP}" >/dev/null 2>&1) || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    printf 'exit=%s' "${rc}"
+    return
+  fi
+  grep -E '^(sql_area|flight_sql_area|agents_area|mcp_area)=' "${out}" | tr '\n' ' ' | sed 's/ $//'
+}
+
+ALL="sql_area=true agents_area=true flight_sql_area=true mcp_area=true"
+NONE="sql_area=false agents_area=false flight_sql_area=false mcp_area=false"
+
+# FLIP: turn the step's `mcp) mcp_area=true ;;` arm into `mcp) ;;` and
+# mcp_area stays false.
+got="$(areas_for crates/ravel-ingest/src/lib.rs)"
+if [[ "${got}" == "${ALL}" ]]; then
+  ok "changes step: edit under crates/ravel-ingest/ sets all four areas"
+else
+  not_ok "changes step: edit under crates/ravel-ingest/ sets all four areas" "got '${got}'"
+fi
+
+# FLIP: emit every area true on the docs/formal-only branch and this reads
+# all four true.
+got="$(areas_for docs/ingest.md)"
+if [[ "${got}" == "${NONE}" ]]; then
+  ok "changes step: edit under docs/ sets none of the four areas"
+else
+  not_ok "changes step: edit under docs/ sets none of the four areas" "got '${got}'"
+fi
+
+# FLIP: delete services/ravel-server's row from the map and agents_area and
+# mcp_area read false: no path rule sets either for src/main.rs.
+got="$(areas_for services/ravel-server/src/main.rs)"
+if [[ "${got}" == "${ALL}" ]]; then
+  ok "changes step: edit under services/ravel-server/ sets all four areas"
+else
+  not_ok "changes step: edit under services/ravel-server/ sets all four areas" "got '${got}'"
+fi
+
+# FLIP: set all four areas whenever the map names any lane for a path and
+# this reads all four true: ravel-agents-sim's closure reaches agents alone.
+got="$(areas_for crates/ravel-agents-sim/src/lib.rs)"
+if [[ "${got}" == "sql_area=false agents_area=true flight_sql_area=false mcp_area=false" ]]; then
+  ok "changes step: edit under crates/ravel-agents-sim/ sets agents alone"
+else
+  not_ok "changes step: edit under crates/ravel-agents-sim/ sets agents alone" "got '${got}'"
+fi
+
 # --- the check, against a stubbed workspace ----------------------------------
 
 WS="${TMP}/ws"
