@@ -51,8 +51,8 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
-    BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX, BucketedFinalAggregateExec, BucketedFinalAggregation,
-    DeclaredColumn, DeclaredType, RavelTableProvider, SessionTable, SpanSegmentFetcher,
+    BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX, BucketSpillPlanShape, BucketedFinalAggregateExec,
+    BucketedFinalAggregation, DeclaredColumn, NoTuning, DeclaredType, RavelTableProvider, SessionTable, SpanSegmentFetcher,
     SpillDecision, SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns, TenantDelegatingPool,
     TenantMemoryAccountant, build_session,
 };
@@ -2418,6 +2418,46 @@ async fn bucket_spill_deletes_each_file_after_reading_it() {
         used.last(),
         Some(&0),
         "bucket files left at the last batch: {used:?}"
+    );
+}
+
+/// The derivation's plan inputs come from the planned statement: `P`, `C`,
+/// the routed widths, and the logs scan's exact `N`. A plan with no bucketed
+/// exec has no one scan to read, and a bucketed exec over a metrics scan has
+/// no `LogsScanExec` to count `N` and `n` on.
+#[tokio::test]
+async fn bucket_spill_plan_shape_reads_the_planned_statement() {
+    const PARTITIONS: usize = 2;
+    const SQL: &str = "SELECT ts, count(*) FROM logs GROUP BY ts";
+    let on = executor(ROWS, sql_config(PARTITIONS, Some(PHASE_2.tuning()), None)).await;
+    let plan = physical_plan_tree(&on, SQL).await;
+    let shape = BucketSpillPlanShape::read(&plan).expect("a shape");
+    assert_eq!(
+        shape,
+        BucketSpillPlanShape {
+            partitions: PARTITIONS,
+            // Two bucketed streams, two exchange outputs, one partial stream
+            // over the one scan partition.
+            spill_consumers: 5,
+            column_widths: vec![8, 8],
+            total_rows: Some(ROWS as u64),
+        },
+        "{}",
+        displayable(plan.as_ref()).indent(true)
+    );
+    let off = executor(ROWS, sql_config(PARTITIONS, None, None)).await;
+    assert_eq!(
+        BucketSpillPlanShape::read(&physical_plan_tree(&off, SQL).await),
+        Err(NoTuning::NotOneScan)
+    );
+    let samples = Planned::new(
+        SAMPLES_SQL,
+        sql_config(PARTITIONS, Some(PHASE_2.tuning()), None),
+    )
+    .await;
+    assert_eq!(
+        BucketSpillPlanShape::read(&samples.physical),
+        Err(NoTuning::NotLogsScan)
     );
 }
 
