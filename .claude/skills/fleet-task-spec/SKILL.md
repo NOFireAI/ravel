@@ -128,7 +128,10 @@ Tests: <the specific behaviors to prove, including failure paths>.
 Gates: format and lint IN PLACE before the commit you will gate -- run
 `cargo fmt --all` (not just --check) and, where it applies, scoped
 `cargo clippy --fix -p <crate>` -- then verify with `cargo fmt --all
---check`; scripts/gates.sh --tier executor -p <crate> [-p <crate2>]. That
+--check`; scripts/gates.sh --tier executor -p <crate> [-p <crate2>]. (The
+tier flag follows the spec's declared gate_tier: `--tier merge` for a
+`gate_tier: merge` spec, and no cargo gate at all for `gate_tier:
+script-only`, whose gate is the case suites and guards it names.) That
 one script is the gate: it runs fmt and the source guards; clippy, tests
 and doctests for the named crates only; one `cargo check --all-targets` of
 every other crate in their reverse-dependency closure, with the lane
@@ -250,7 +253,7 @@ target. The executor tier builds less: it tests only the named crates and
 only compiles their dependents. Derive the spec's `disk_floor_gb` from the
 tier's `--dry-run` (ADR-4034 D2): 40 when it lists no feature-lane command
 (no `cargo clippy` or test of a named crate with `--features`), 60 when it
-lists one, and 10 for a `gate_tier: script-only` task whose gate builds
+lists one or more, and 10 for a `gate_tier: script-only` task whose gate builds
 nothing. The 40 and 60 are the ADR's predicted floors, not a measurement.
 The floor is the hard stop because the spec does
 not choose the host, and a higher floor would turn a smaller healthy host
@@ -768,7 +771,7 @@ the gate needs. `bin/agent-cli dispatch` refuses a spec without both
 `bin/agent-cli spec-lint` reports the same refusal. Derive the floor from
 the tier's `--dry-run` (`scripts/gates.sh --tier executor -p <crate>
 --dry-run`): 40 when it lists no feature-lane command, 60 when it lists
-one, and 10 for a script-only task that builds nothing. Use the same
+one or more, and 10 for a script-only task that builds nothing. Use the same
 number in the spec's headroom guard.
 
 Do not trust `fleet_status`'s text at face value: it has printed a

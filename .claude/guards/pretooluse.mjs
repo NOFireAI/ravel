@@ -569,7 +569,8 @@ function checkWorkspaceClippy(stmt) {
         "them with the lane features that closure reaches, and the clippy " +
         "and tests of each feature lane that covers an edited crate; CI runs " +
         "the dependents' tests and the lane suites. A hand-run " +
-        "workspace clippy compiles neither lane, which is how a sql-gated " +
+        "workspace clippy compiles neither the sql nor the flight-sql lane, " +
+        "which is how a sql-gated " +
         "break reached CI on #2833. A deliberate unscoped run spells " +
         "RAVEL_GATES_ALLOW_UNSCOPED=1 inline at the front of the command.",
     );
