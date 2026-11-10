@@ -1313,8 +1313,8 @@ This is the parallel bucket spill amendment. The figures are from epic
    rejected alternative left open, for this plan shape only. Pinned by T2
    #4074 (`retry_plans_bucketed_exchange_for_admitted_shape`,
    `retry_keeps_sort_merge_for_unadmitted_shape`, and the differential
-   test `bucket_spill_retry_matches_unspilled_answer` at 1, 4 and 16
-   partitions).
+   test `bucket_spill_retry_matches_unspilled_answer` at 2, 4 and 16
+   partitions; at 1 partition the rule plans no bucketed exec).
 
 2. **How the exchange's memory is bounded under the spill-mode pool.**
    Cited to DataFusion 55.2.0, `datafusion-physical-plan`
@@ -1383,13 +1383,16 @@ This is the parallel bucket spill amendment. The figures are from epic
      `bucket_spill_rows_written`: the bucketed exec's own counters
      (ADR-3565 bucket spill amendment, item 7).
 
-   Every byte figure here counts bytes in spill files on local scratch:
-   Arrow IPC after lz4_frame, framing included, which is what
+   Every written-bytes figure here counts bytes in spill files on local
+   scratch: Arrow IPC after lz4_frame, framing included, which is what
    `SpillCounts::bytes_written` counts today (`spill.rs:758`). They are
    local file bytes; no object-store request is counted in them.
    DataFusion 55.2 records no bytes read for an exchange spill, so there is
    no exchange read figure (`None`), and it is not reported as zero; the
-   bucketed exec reads its own files and counts what it reads. The
+   bucketed exec reads its own files and counts what it decodes:
+   `bucket_spill_bytes_read` is the Arrow bytes of the batches read back,
+   after decompression, so it is not comparable with the file bytes
+   written (ADR-3565 bucket spill amendment, item 7). The
    existing `spill_bytes_written` stays the total over every operator, so
    a sort-merge retry's line reads as before. Pinned by T2 #4074
    (`spill_retry_report_splits_exchange_and_bucket_bytes`, which asserts

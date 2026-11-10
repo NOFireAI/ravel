@@ -457,6 +457,17 @@ pub(crate) use limit_hint::LogsLimitHint;
 pub(crate) use partition_topk::LogsPartitionTopK;
 pub(crate) use threshold::ConfirmTopKThreshold;
 
+/// The per-partition counter of the scan's input rows consumed, before the
+/// row filter and any operator above the scan: the rows of every block the
+/// columnar path decoded ([`ColumnarBlockView::record_count`], before the
+/// pushed exact predicate), and the rows the row path built before its row
+/// filter (the reader's exact predicate has already run there, so on that
+/// path the figure is a lower bound). This is the `n` of the bucket spill
+/// derivation (ADR-3565 amendment 2), on the basis of
+/// [`LogsScanExec::sample_count_total`]; [`LogsScanExec::rows_consumed`]
+/// sums it.
+pub const METRIC_ROWS_CONSUMED: &str = "rows_consumed";
+
 /// Rows accumulated into one output batch before it is emitted.
 ///
 /// A block usually decodes to fewer rows than this (RLOG's default block target
@@ -1506,6 +1517,8 @@ struct BlockMetrics {
     /// either path, before any of them was emitted or charged
     /// (`answers_match_the_residual_on_every_value_shape`).
     rows_dropped_by_row_filter: Count,
+    /// The scan's input rows this partition consumed ([`METRIC_ROWS_CONSUMED`]).
+    rows_consumed: Count,
     /// String cells this partition UTF-8 validated: the reader's dictionary
     /// entries on either path (undeclared columns included when `attrs` is
     /// projected) and the cells of the all-UTF-8 plain `Str` pages its
@@ -1730,6 +1743,7 @@ impl BlockMetrics {
                 .counter("contains_cells_tested", partition),
             rows_dropped_by_row_filter: MetricBuilder::new(metrics)
                 .counter("rows_dropped_by_row_filter", partition),
+            rows_consumed: MetricBuilder::new(metrics).counter(METRIC_ROWS_CONSUMED, partition),
             str_cells_validated: MetricBuilder::new(metrics)
                 .counter("str_cells_validated", partition),
             str_dict_values_built: MetricBuilder::new(metrics)
@@ -1842,6 +1856,16 @@ impl LogsScanExec {
         self.segments
             .iter()
             .try_fold(0u64, |acc, seg| acc.checked_add(seg.sample_count))
+    }
+
+    /// The scan's input rows consumed so far, summed over its partitions
+    /// ([`METRIC_ROWS_CONSUMED`]): readable at any point of an execution,
+    /// including at a refusal above the scan.
+    pub fn rows_consumed(&self) -> usize {
+        self.metrics
+            .clone_inner()
+            .sum_by_name(METRIC_ROWS_CONSUMED)
+            .map_or(0, |value| value.as_usize())
     }
 
     /// Build a scan over `segments`, whose partitions take its units of work
