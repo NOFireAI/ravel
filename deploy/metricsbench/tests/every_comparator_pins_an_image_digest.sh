@@ -20,8 +20,9 @@
 # deploy/k8s manifests that category 4's own scope note originally deferred.
 # ADR-0927 amendment 2026-10-29 added a seventh, for the s3s-fs binary the
 # MetricsBench stack runs from a release asset rather than an image.
-# It now scans seven categories, each with its own exact-count assertion so a
-# scan that finds nothing in a category fails rather than passing silently:
+# It now scans seven categories, each with its own exact-count assertion (or,
+# for category 3, a second independent extraction) so a scan that finds
+# nothing in a category fails rather than passing silently:
 #
 #   1. every `image:` reference in deploy/metricsbench/docker-compose.yml
 #      and its Ravel overlay deploy/metricsbench/ravel.yml -- excluding
@@ -36,7 +37,10 @@
 #      arg, whose own default is what carries the pin, checked separately);
 #   3. every `uses:` action reference in .github/workflows/*.yml and
 #      .github/actions/*/*.yml -- excluding a local action (`uses: ./...`),
-#      which is repo-tracked code, not a fetched external action;
+#      which is repo-tracked code, not a fetched external action. Instead of
+#      an exact count, workflow_uses_refs.sh beside this script extracts the
+#      references twice, by line grep and by YAML structure, and fails when
+#      the two disagree (issue #4099);
 #   4. every `image:` reference in the two quickstart compose files,
 #      deploy/docker-compose/ravel.yml and deploy/docker-compose/rustfs.yml
 #      (ravel.yml documents rustfs.yml as its RustFS-and-bucket mirror, so both
@@ -89,9 +93,11 @@
 # 5, and 6) or a full 40-character commit SHA (category 3): a tag alone, a
 # branch, or a short SHA is a moving or ambiguous reference and fails the
 # same as a bare tag. Exit 0 only when every category is fully pinned and
-# every category's reference count equals its expected total.
+# every category's reference count equals its expected total (category 3:
+# both extractions agree).
 #
-# POSIX sh, no external dependencies beyond grep/sed. Fails closed.
+# POSIX sh, no external dependencies beyond grep/sed, plus python3 (standard
+# library only) for category 3's structural read. Fails closed.
 
 set -u
 
@@ -149,62 +155,6 @@ METRICSBENCH_RAVEL_IMAGE_REF='${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server
 # default. Update deliberately if a stage is added, removed, or repointed at a
 # build-arg.
 DOCKERFILE_EXPECTED_IMAGE_COUNT=5
-
-# Exact number of external `uses:` action references across every workflow and
-# composite action file. Update deliberately whenever a workflow gains,
-# loses, or repoints a `uses:` step. Last raised 92->94 when the ci `features`
-# job was split into `features` and `features-otap` (issue #1590): the new job
-# adds a checkout and a rust-cache `uses:` (its other two steps, free-disk-space
-# and `rustup show`, are a local `./...` action and a plain `run:` step; neither
-# is an external `uses:` this scan counts, and the job has no setup-sccache step
-# at all). Raised 97->98 when the bench-compare workflow was added (issue
-# #533): it carries exactly one external `uses:`, its checkout. Raised 98->101
-# when the k8s-nightly chaos job was added (issue #534): it adds a checkout, an
-# sccache-action, and a rust-cache. That job's free-disk-space step is a local
-# `./.github/actions/...` action, which this scan does not count. Raised
-# 101->104 when the dr-rehearsal workflow was added (issue #814): it adds a
-# checkout, a rust-cache, and an upload-artifact. Its free-disk-space step is
-# a local `./.github/actions/...` action, which this scan does not count, and
-# its four matrix cases are one job definition, so the three `uses:` are
-# counted once each rather than per case. Raised 104->107 when the
-# interop-nightly workflow was added (issue #1716): its `interop` job adds a
-# checkout, a nextest install (taiki-e/install-action), and a rust-cache; its
-# free-disk-space step is the same local `./.github/actions/...` action this
-# scan does not count, and its `report` job uses no action at all. Raised
-# 107->108 when ci.yml's `tla` job gained a second download-artifact step
-# that retries the marker download. Raised 108->110 when ci.yml gained the
-# `all-features` job (issue #1925): a checkout and a rust-cache. Raised 110->111
-# when ci.yml's `features` job became the `features-lane` matrix (issue #1793):
-# the matrix job adds a nextest install (taiki-e/install-action), and the
-# `features` job that reports on it uses no action at all. Raised 111->112
-# when k8s-nightly.yml's `chaos` job gained an upload-artifact step for the
-# scenarios' process logs on failure (issue #2666). Lowered 112->110 when
-# ci.yml's per-PR `quickstart` job was removed (ADR-0081 A6): a checkout and a
-# rust-cache. Lowered 110->109 when k8s-nightly.yml's `k8s-build` job moved its
-# cargo build into the builder image and dropped its sccache-action step,
-# which no longer reached the build (#3146). Raised 109->115 when ci.yml
-# gained the features-agents and features-mcp jobs (a checkout and a
-# rust-cache each) and the sdk job (a checkout and a setup-node), epic
-# #3331 task T2. Raised 115->118 when sim-nightly.yml gained the agents-sim
-# job (a checkout, a rust-cache and an upload-artifact), epic #3331 task T22.
-# Raised 118->122 when k8s-nightly.yml gained the agents-chaos job (a
-# checkout, an sccache-action, a rust-cache and an upload-artifact), epic
-# #3331 task T29. Raised 122->124 when the fetch-pinned-tool composite action
-# was added (an actions/cache restore and save), epic #4034 task T6. Raised
-# 124->129 when ci-budget-nightly.yml was added (three checkouts, an
-# upload-artifact and a download-artifact), epic #4034 task T5. Raised
-# 129->130 when supply-chain-nightly.yml gained the `fix` job (a checkout and
-# a taiki-e/install-action) and ci-budget-nightly.yml lost its `raise-check`
-# job (a checkout) to ci.yml's doc-scripts, epic #4034 issue #4041. Raised
-# 130->133 when supply-chain-nightly.yml split `fix` into `fix-candidates` (a
-# checkout, a taiki-e/install-action and an upload-artifact) and `fix-pr` (a
-# checkout and a download-artifact), issue #4041. Raised 133->135 when
-# ci-flake-sweep.yml was added (two checkouts), epic #4034 task T8a. Raised
-# 135->138 when ci.yml's `coverage` job became the `coverage-shard` matrix
-# and a `coverage` job that collects it (an upload-artifact in the matrix; a
-# checkout and a download-artifact in the collector, which took over the
-# Codecov upload), issue #4050.
-WORKFLOW_EXPECTED_ACTION_COUNT=138
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,
@@ -482,26 +432,17 @@ fi
 echo
 echo "== GitHub Actions 'uses:' pins =="
 
-# shellcheck disable=SC2044
-for wf in $(find "$REPO_ROOT/.github/workflows" -maxdepth 1 -name '*.yml' -type f | sort) \
-          $(find "$REPO_ROOT/.github/actions" -mindepth 2 -maxdepth 2 -name '*.yml' -type f 2>/dev/null | sort); do
-  # A step's `uses:` key appears either on its own line (following a separate
-  # `- name:` line) or inline after the list-item dash (`- uses: ...`, for a
-  # step with no `name:`). Both forms must match, or every no-name step (most
-  # of the `- uses: ./.github/actions/...` and bare `- uses: actions/...`
-  # steps in this repo) is silently skipped.
-  grep -nE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*' "$wf" | while IFS= read -r line; do
-    lineno=$(printf '%s\n' "$line" | cut -d: -f1)
-    ref=$(printf '%s\n' "$line" | sed -E 's/^[0-9]+:[[:space:]]*-?[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
-    case "$ref" in
-      ./*) continue ;; # local action: repo-tracked code, not a fetched external action
-    esac
-    echo "$wf:$lineno:$ref" >>"$WORKFLOW_REFS_FILE"
-  done
-done
+# The helper writes the line grep's references to WORKFLOW_REFS_FILE and fails
+# unless a structural YAML read of the same files finds the same multiset.
+if [ -f "$SCRIPT_DIR/workflow_uses_refs.sh" ]; then
+  sh "$SCRIPT_DIR/workflow_uses_refs.sh" "$REPO_ROOT" "$WORKFLOW_REFS_FILE" || fail=1
+else
+  echo "FAIL: workflow_uses_refs.sh not found beside this script"
+  fail=1
+fi
 
 workflow_count=$(wc -l <"$WORKFLOW_REFS_FILE" | tr -d '[:space:]')
-echo "  external action references found: $workflow_count (expected $WORKFLOW_EXPECTED_ACTION_COUNT)"
+echo "  external action references found: $workflow_count"
 
 if [ "$workflow_count" -eq 0 ]; then
   echo "FAIL: no workflow action references found; the check must never scan zero actions"
@@ -530,11 +471,6 @@ else
 
   if [ "$unpinned" -ne 0 ]; then
     echo "FAIL: $unpinned workflow action reference(s) lack a full 40-character commit SHA"
-    fail=1
-  fi
-
-  if [ "$workflow_count" -ne "$WORKFLOW_EXPECTED_ACTION_COUNT" ]; then
-    echo "FAIL: found $workflow_count workflow action references, expected exactly $WORKFLOW_EXPECTED_ACTION_COUNT"
     fail=1
   fi
 fi
