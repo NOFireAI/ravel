@@ -100,7 +100,7 @@
 //!   no eligibility claim -- it is deliberately not folded into
 //!   `nothing_eligible`, which asserts a negative the throttle never checked.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -671,8 +671,10 @@ const MAX_COMPARED_PARTS: usize = 8;
 ///
 /// The comparison is cheap in every ordinary case. Parts are content
 /// addressed, so a part carrying the same `blake3` on both sides holds the
-/// same entries by construction and needs no read; only the remainder on each
-/// side is fetched and decoded.
+/// same entries by construction and needs no read; its retired hours, which
+/// take entries out of the snapshot without changing those bytes, are
+/// compared from the two refs. Only the remainder on each side is fetched and
+/// decoded.
 #[allow(clippy::too_many_arguments)]
 async fn snapshot_content_changed(
     catalog: &Arc<Catalog>,
@@ -717,6 +719,9 @@ async fn snapshot_content_changed(
     };
     let before_parts: &[SnapshotPartRef] = before.as_ref().map_or(&[], |head| &head.parts);
 
+    if retired_hours_changed(before_parts, &after.parts) {
+        return true;
+    }
     if entry_total(before_parts) != entry_total(&after.parts) {
         return true;
     }
@@ -759,9 +764,26 @@ fn entry_total(parts: &[SnapshotPartRef]) -> u64 {
     parts.iter().map(|part| part.entry_count).sum()
 }
 
+/// Whether a part both sides name by `blake3` carries different retired hours
+/// on each: retiring an hour drops its entries from the snapshot while the
+/// part's bytes, and so its `entry_count`, stay the same (ADR-3939 decision
+/// 6).
+fn retired_hours_changed(before: &[SnapshotPartRef], after: &[SnapshotPartRef]) -> bool {
+    let retired: BTreeMap<&[u8], &[u32]> = before
+        .iter()
+        .map(|part| (part.blake3.as_slice(), part.retired_hours.as_slice()))
+        .collect();
+    after.iter().any(|part| {
+        retired
+            .get(part.blake3.as_slice())
+            .is_some_and(|hours| *hours != part.retired_hours.as_slice())
+    })
+}
+
 /// The parts of `parts` whose bytes no part of `other` also names. Matching is
 /// on `blake3` alone: it is the hash of the part's full bytes, and the part
-/// key embeds a prefix of it, so equal hashes mean equal entries.
+/// key embeds a prefix of it, so equal hashes mean equal entries. A matched
+/// pair's retired hours are [`retired_hours_changed`]'s question.
 fn parts_absent_from<'a>(
     parts: &'a [SnapshotPartRef],
     other: &[SnapshotPartRef],
@@ -1338,6 +1360,185 @@ mod tests {
             vec![kept_hour, added_hour],
             "the retired hour left the snapshot and the newly sealed one entered it"
         );
+    }
+
+    /// Declares `user_id` as an I64 key-index column, so a fold with
+    /// `build_key_index_leaves` writes leaves for it.
+    async fn declare_user_id_key_index(store: &dyn ObjectStoreBackend, tenant: &TenantHash) {
+        let mut config = ravel_catalog::TenantConfig {
+            typed_attr_columns: Some(vec![ravel_catalog::DeclaredTypedColumn {
+                key: "user_id".to_string(),
+                ty: ravel_catalog::DeclaredColumnType::I64,
+            }]),
+            ..ravel_catalog::TenantConfig::new(ravel_catalog::TenantLifecycleState::Active)
+        };
+        config
+            .set_key_index_columns(
+                vec!["user_id".to_string()],
+                ravel_catalog::StorageLayoutWrite::ReadersRolledOut,
+            )
+            .expect("declare the key index");
+        ravel_catalog::set_tenant_config(store, tenant, &config, 1)
+            .await
+            .expect("write tenant config");
+    }
+
+    /// Seeds one durable log flush at `ingest_hour` whose RLOG object carries
+    /// a KEY_IDX section for `user_id`.
+    async fn seed_keyed_log_commit(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        ingest_hour: u32,
+        seq: u64,
+        user_id: i64,
+    ) {
+        let writer_id = Uuid::from_u128(u128::from(seq) + 1);
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("checkout".to_string()),
+        )];
+        let ts = i64::from(ingest_hour) * NS_PER_HOUR + 60_000_000_000;
+        let mut writer = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant.0,
+                shard: 0,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: 1,
+                writer_seq: seq,
+            },
+        )
+        .with_key_index_fields(vec![(
+            "user_id".to_string(),
+            ravel_logseg::key_index::KeyType::I64,
+        )]);
+        writer
+            .push(LogRecord {
+                stream_id: log_stream_id(&resource, "", "", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "", "", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".to_string(),
+                body: "checkout completed".to_string(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![("user_id".to_string(), AttrValue::I64(user_id))],
+            })
+            .expect("push log record");
+        let bytes = Bytes::from(writer.finish().expect("finish RLOG object"));
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: *tenant,
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: ts,
+            max_event_ts_ns: ts,
+            min_ingest_ts_ns: ts,
+            max_ingest_ts_ns: ts,
+            segment_format_version: u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
+            created_unix_ns: ts,
+            ingest_hour_bucket: ingest_hour,
+        })
+        .expect("build commit record");
+        let data_key = ravel_commit::keys::reconstruct_data_key(&commit).expect("data key");
+        publish::put_data_object(store, &data_key, bytes)
+            .await
+            .expect("put RLOG object");
+        publish::publish(store, &commit, &RetryPolicy::default())
+            .await
+            .expect("publish commit record");
+    }
+
+    /// ADR-3939 decision 6: a retention tombstone on a leaf-bearing sealed
+    /// day retires its hour in the part's ref and leaves the part's bytes,
+    /// `blake3` and `entry_count` as they were. A fold that does only that,
+    /// with no new commit, still takes the hour's entries out of the snapshot,
+    /// so it published.
+    ///
+    /// FLIP: drop the `retired_hours_changed` check from
+    /// `snapshot_content_changed`, and the outcome reads `NothingEligible`.
+    #[tokio::test]
+    async fn a_fold_that_only_retires_an_hour_reports_published() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("fold-on-demand-retired-hour").hash();
+        // Hours 21 and 22 of the UTC day before the one NOW_NS falls in, and
+        // a commit on NOW_NS's own day, so the first fold seals the earlier
+        // day into a part of its own.
+        let day_start = NOW_NS / NS_PER_HOUR / 24 * 24 - 24;
+        let retired_hour = (day_start + 21) as u32;
+        let kept_hour = (day_start + 22) as u32;
+        let tail_hour = (day_start + 25) as u32;
+        declare_user_id_key_index(store.as_ref(), &tenant_hash).await;
+        seed_keyed_log_commit(store.as_ref(), &tenant_hash, retired_hour, 0, 1).await;
+        seed_keyed_log_commit(store.as_ref(), &tenant_hash, kept_hour, 1, 2).await;
+        seed_keyed_log_commit(store.as_ref(), &tenant_hash, tail_hour, 2, 3).await;
+
+        let catalog = Arc::new(
+            Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    shard_count: 1,
+                    build_key_index_leaves: true,
+                    ..CatalogConfig::default()
+                },
+            )
+            .expect("build catalog"),
+        );
+        let fold_at = |now_ns| {
+            fold_once(
+                &catalog,
+                store.as_ref(),
+                &tenant_hash,
+                Signal::Logs,
+                Uuid::from_u128(1),
+                now_ns,
+                None,
+                Duration::ZERO,
+            )
+        };
+        let read_parts = || async {
+            let bytes = store
+                .get(
+                    &crate::fold::head_key(&tenant_hash, Signal::Logs),
+                    GetRange::Full,
+                )
+                .await
+                .expect("HEAD present");
+            decode_head(&bytes.data).expect("decode HEAD").parts
+        };
+
+        let first = fold_at(NOW_NS).await.expect("first fold");
+        assert_eq!(first.outcome, FoldOutcome::Published);
+        let before = read_parts().await;
+        assert_eq!(before.len(), 2, "{before:?}");
+        assert_eq!(before[0].entry_count, 2, "{before:?}");
+        assert!(!before[0].key_index.is_empty(), "the sealed day has leaves");
+
+        publish_retention_tombstone(store.as_ref(), &tenant_hash, 0, retired_hour).await;
+        let second = fold_at(NOW_NS + NS_PER_HOUR).await.expect("second fold");
+        let after = read_parts().await;
+        // Non-vacuity: the retirement must leave the sealed part's bytes and
+        // the entry total alone, or the comparison would see a change without
+        // reading retired hours.
+        let mut expected = before[0].clone();
+        expected.retired_hours = vec![retired_hour];
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert_eq!(after[0], expected, "only the retired hours changed");
+        assert_eq!(after[1].entry_count, before[1].entry_count, "{after:?}");
+        assert_eq!(
+            second.outcome,
+            FoldOutcome::Published,
+            "the retired hour's entry left the snapshot"
+        );
+        assert!(second.head_advanced);
     }
 
     /// The parts of `head` (raw HEAD bytes) as their blake3 set.
