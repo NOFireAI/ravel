@@ -249,7 +249,9 @@ store-96 and ravel-perf (splits).
 In ravel:
 
 1. The fleet-task-spec template replaces workspace clippy with
-   `scripts/gates.sh -p <crates>`, and `gates.sh` scoped mode gains the
+   `scripts/gates.sh -p <crates>` (since replaced by `scripts/gates.sh
+   --tier executor -p <crates>`; see the executor-tier amendment below),
+   and `gates.sh` scoped mode gains the
    reverse-dependency closure that `affected-tests.sh` computes, runs the
    `sql` and `flight-sql` lanes when `ravel-query` is in scope (the
    documented promise), and `affected-tests.sh` runs the `sql`-gated
@@ -491,3 +493,22 @@ other shows only on the removed side: two byte-identical copies of
 `retry_after_seconds`, in `otlp_http.rs` and `remote_write.rs`, became
 one in `ingest_admission.rs`. Blame did not show that change; the
 removed-side residue does.
+
+## Amendment: the executor gate is a tier (ADR-4034 D1, issue #4042)
+
+<!-- amendment-applies: sections="5. Executors run CI's gate, scoped; shape guards before the PR; flakes fixed" pointer="executor-tier amendment" -->
+
+Change 5 item 1 made the executor's gate `scripts/gates.sh -p <crates>`,
+which tests every crate in the reverse-dependency closure and runs every
+feature lane that closure reaches. ADR-4034 D1 replaces it with
+`scripts/gates.sh --tier executor -p <crates>`: clippy, tests and
+doctests for the named (edited) crates only, one `cargo check` of the
+rest of the closure with the lane features it reaches, and each lane's
+clippy and tests only for a named crate the lane covers. Dependents'
+tests and the lane suites move to CI. `--tier merge` is the default and is
+the gate this change described, unchanged; `verify-dispatch-gates.sh`
+and `fleet-result-merge.sh` run it. The rest of change 5 stands: the
+hook still refuses `cargo clippy --workspace` in a fleet clone, its
+message now naming `--tier executor` as the replacement, and `gates.sh`
+still refuses an unscoped run there. ADR-4034 D2 adds the spec's
+`gate_tier:` and `disk_floor_gb:` lines.
