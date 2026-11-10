@@ -3590,42 +3590,6 @@ class Evaluate(Workdir):
     def test_w8_retired_hours_are_the_tombstoned_hour(self):
         self.assertEqual(self.check_w8_retired_hours_are_the_tombstoned_hour(), [])
 
-    def check_on_demand_fold_figures_unsupported(self, evaluate_py=EVALUATE, bands=BANDS):
-        """The retired_hour folds are on-demand folds (source admin_fold), whose response carries none of
-        the fields W2, W3 and W8 read from them: each such figure is unsupported naming that response,
-        never missing and never judged; the stamp figures beside them still read their values."""
-        mod = load_module(evaluate_py, "evaluate_on_demand_fold")
-        live = {"retired_hour": None, "retired_hour_drop": None}
-        response = {"source": "admin_fold", "report": {"status": "published", "put_requests": 3, "entry_count": 5}}
-        folds = {(t, "dp7", "logs"): response for t in ("retired_hour", "retired_hour_refold", "retired_hour_drop",
-                                                        "retired_hour_drop_refold")}
-        docs = {("retired_hour", "logs", "fold_binary"): {"sha": "a" * 40, "carries_c1": True, "carries_r2": False},
-                ("retired_hour", "logs", "tombstone"): {"hour": 100},
-                ("retired_hour_drop", "logs", "catalog"): self.drop_catalog("120..=143")}
-        figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2", "adr3939_w3", "adr3939_w8"), live, docs, {}, folds)
-        out = []
-        with open(bands, "rb") as fh:
-            rows = [r for r in tomllib.load(fh)["row"] if r["key"] in ("adr3939_w2", "adr3939_w3", "adr3939_w8")]
-        read = 0
-        for r in rows:
-            for fig in r["figure"]:
-                if not fig["metric"].startswith("fold."):
-                    continue
-                read += 1
-                f = figs[f"{r['key']}.{fig['name']}"]
-                if f["verdict"] != mod.UNSUPPORTED or "fold_on_demand.rs" not in (f["reason"] or ""):
-                    out.append(f"{r['adr_row']} {fig['name']}: {f['verdict']} ({f['reason']})")
-        if read == 0:
-            out.append("no fold figure in W2, W3 or W8")
-        for name, want in (("adr3939_w2.fold_binary_pre_r2", 1), ("adr3939_w3.tombstoned_hour", 100),
-                           ("adr3939_w3.drop_parts_holding_hour", 0)):
-            if figs[name]["value"] != want:
-                out.append(f"{name}: {figs[name]['verdict']} {figs[name]['value']}, want {want}")
-        return out
-
-    def test_on_demand_fold_figures_unsupported(self):
-        self.assertEqual(self.check_on_demand_fold_figures_unsupported(), [])
-
     def check_w7_reads_two_day_parts(self, evaluate_py=EVALUATE, bands=BANDS):
         """W7's midnight call passes only when every try covered exactly 2 day parts and left none
         uncovered: 4 leaf GETs over 1 covered part (a window inside one day) misses, as does a third part
@@ -4370,11 +4334,6 @@ FLIPS = {
         'f["row"] == 18 or f.get("adr") == "ADR-3939")',
         'f["row"] == 18 or f.get("adr") == "none")',
         "check_row_18_timing_rows_leave_run_incomplete",
-    ),
-    "an on-demand fold's absent field read as the CLI fold's": (
-        '        if line.get("source") == "admin_fold" and (field in FOLD_ALLOWLIST or field in ADMIN_FOLD_ABSENT):\n',
-        '        if False:\n',
-        "check_on_demand_fold_figures_unsupported",
     ),
 }
 
@@ -5668,8 +5627,9 @@ FINISHED=1
             stamp = json.load(f)
         self.assertEqual((stamp["part_count"], stamp["days"], stamp["watermark_hour"]),
                          (7, [20_400 + i for i in range(7)], d0 + 168))
-        self.flip_check('  fold "$st" --key-index-leaves || { TRIPLES="$saved"; return 1; }\n',
-                        '  fold "$st" || { TRIPLES="$saved"; return 1; }\n', "run.sh", self.check_day_parts_fold,
+        self.flip_check('  fold "$st" --key-index-leaves ${budget[@]+"${budget[@]}"} || { TRIPLES="$saved"; return 1; }\n',
+                        '  fold "$st" ${budget[@]+"${budget[@]}"} || { TRIPLES="$saved"; return 1; }\n', "run.sh",
+                        self.check_day_parts_fold,
                         "the state's fold without the leaf switch", "test_day_parts_fold_builds_every_day_once")
 
     def check_retired_hour_plan(self, script):
@@ -5697,11 +5657,13 @@ FINISHED=1
         h = 20_400 * 24
         stamp = datetime.datetime.fromtimestamp(h * 3600, datetime.timezone.utc).strftime("%Y%m%dT%H")
         nxt = datetime.datetime.fromtimestamp((h + 1) * 3600, datetime.timezone.utc).strftime("%Y%m%dT%H")
-        keys = [f"10\tt/abc/l/c/0/{stamp}/retire.tmb", f"10\tt/abc/l/c/1/{stamp}/retire.tmb",
+        keys = [f"10\tt/abc/l/c/0/{stamp}/0001.cmt", f"10\tt/abc/l/c/0/{stamp}/retire.tmb",
+                f"10\tt/abc/l/c/1/{stamp}/0001.cmt", f"10\tt/abc/l/c/1/{stamp}/retire.tmb",
                 f"10\tt/abc/s/c/0/{nxt}/retire.tmb", f"10\tt/other/l/c/0/{nxt}/retire.tmb",
-                f"10\tt/abc/l/c/0/{nxt}/seg.rseg"]
-        if inv.tombstoned_hours(keys, "abc", "l") != {h}:
-            out.append(f"hours {inv.tombstoned_hours(keys, 'abc', 'l')}, want {{{h}}}")
+                f"10\tt/abc/l/c/0/{nxt}/0001.cmt"]
+        gaps = inv.tombstone_gaps(inv.bucket_files(keys, "abc", "l"), h, h)
+        if gaps != ([], [], []):
+            out.append(f"gaps {gaps}, want none")
         cut, r = inv.retention_window(h * HOUR_NS + 5, (h + 1) * HOUR_NS + 5, (h + 10) * 3600)
         if (cut, r) != (h * 3600 + 1, (h + 10) * 3600 - (h * 3600 + 1)):
             out.append(f"retention window {(cut, r)}")
@@ -5710,17 +5672,60 @@ FINISHED=1
             out.append("a window expiring the next batch too accepted")
         except ValueError:
             pass
+        # Hours h and h + 1 each hold a commit record in shard 0; the
+        # tombstones listed are the second element.
         for got, want in (({h}, 0), ({h, h + 1}, 1), (set(), 1)):
             with open(self.path("keys.tsv"), "w") as f:
-                for hour in sorted(got):
+                for hour in (h, h + 1):
                     s = datetime.datetime.fromtimestamp(hour * 3600, datetime.timezone.utc).strftime("%Y%m%dT%H")
-                    f.write(f"10\tt/abc/l/c/0/{s}/retire.tmb\n")
+                    f.write(f"10\tt/abc/l/c/0/{s}/0001.cmt\n")
+                    if hour in got:
+                        f.write(f"10\tt/abc/l/c/0/{s}/retire.tmb\n")
             p = subprocess.run([sys.executable, inv_path, "tombstone-check", "--keys", self.path("keys.tsv"),
                                 "--tenant-hash", "abc", "--first", str(h), "--last", str(h)],
                                capture_output=True, text=True)
             if p.returncode != want:
                 out.append(f"tombstone-check over {sorted(got)} exit {p.returncode}, want {want}")
         return out
+
+    def check_tombstones_per_shard(self, inv_path):
+        """tombstone-check over a listing where hour h holds commit records
+        in shards 0, 1 and 2 and only some of them hold retire.tmb."""
+        out = []
+        h = 20_400 * 24
+        s = datetime.datetime.fromtimestamp(h * 3600, datetime.timezone.utc).strftime("%Y%m%dT%H")
+        for tombstoned, want in (((0, 1, 2), 0), ((0,), 1), ((0, 2), 1), ((), 1)):
+            keys = self.path("keys-shards.tsv")
+            with open(keys, "w") as f:
+                for shard in (0, 1, 2):
+                    f.write(f"10\tt/abc/l/c/{shard}/{s}/0001.cmt\n")
+                    if shard in tombstoned:
+                        f.write(f"10\tt/abc/l/c/{shard}/{s}/retire.tmb\n")
+            p = subprocess.run([sys.executable, inv_path, "tombstone-check", "--keys", keys, "--tenant-hash", "abc",
+                                "--first", str(h), "--last", str(h)], capture_output=True, text=True)
+            if p.returncode != want:
+                out.append(f"shards {list(tombstoned)} of 0..2 tombstoned: exit {p.returncode}, want {want}")
+            elif want and "('1', " not in p.stderr:
+                out.append(f"shards {list(tombstoned)}: refusal names no missing bucket: {p.stderr.strip()}")
+        # An hour with no commit record in any shard cannot be checked by
+        # waiting: exit 65, not 1.
+        with open(keys, "w") as f:
+            f.write(f"10\tt/abc/l/c/0/{s}/0001.cmt\n10\tt/abc/l/c/0/{s}/retire.tmb\n")
+        p = subprocess.run([sys.executable, inv_path, "tombstone-check", "--keys", keys, "--tenant-hash", "abc",
+                            "--first", str(h), "--last", str(h + 1)], capture_output=True, text=True)
+        if p.returncode != 65:
+            out.append(f"hour {h + 1} with no commit record: exit {p.returncode}, want 65")
+        return out
+
+    def test_tombstone_check_is_per_shard(self):
+        # Retention tombstones each (shard, hour) bucket on its own, so one
+        # shard's retire.tmb does not stand for the hour: the check passes
+        # only once every commit-holding bucket of the range holds one.
+        inv_path = os.path.join(BOX, "lib", "inv.py")
+        self.assertEqual(self.check_tombstones_per_shard(inv_path), [])
+        self.flip_check("    if missing or extra:\n", "    if extra:\n", "lib/inv.py",
+                        self.check_tombstones_per_shard, "one shard's tombstone read as the hour's",
+                        "test_tombstone_check_is_per_shard")
 
     def test_retired_hour_tombstones_hour_zero_only(self):
         # retired_hour retires ingest hour D0 (hour 0 of dp7's oldest day,
@@ -5736,7 +5741,7 @@ FINISHED=1
                         self.check_retired_hour_plan, "hours 0 and 1 retired",
                         "test_retired_hour_tombstones_hour_zero_only")
         for old, new, label in (
-                ("    if got != want:\n", "    if not want <= got:\n", "more tombstoned hours than asked accepted"),
+                ("    if missing or extra:\n", "    if missing:\n", "more tombstoned hours than asked accepted"),
                 ("    if max_next_ns < cutoff_s * 1_000_000_000:\n", "    if False:\n",
                  "a cutoff that expires the next batch too")):
             self.flip_check(old, new, "lib/inv.py", self.check_tombstoned_hours, label,
@@ -5842,15 +5847,21 @@ FINISHED=1
                           "--tenant dp30 --sub day_parts_30", "wait until the ingest hour",
                           "load-day_parts_30_tail-logs", "fold-day_parts_30_advance-logs",
                           "STAMP stamps/transitions.jsonl", "STAMP stamps/day_parts_30_advance.logs.day_parts.json")),
-        ("retired_hour", ("STAMP stamps/retired_hour.logs.fold_binary.json", "--batch 0",
-                          "--mode maintain --tenant-token-file", "--disable-fold --retention-tenant dp7=RETENTION_S",
+        ("retired_hour", ("catalog fold --help lists --retention-default",
+                          "STAMP stamps/retired_hour.logs.fold_binary.json", "--batch 0",
+                          "listing-retired_hour-before.json", "--mode maintain --tenant-token-file",
+                          "--maintain-key-file", "--disable-fold --retention-tenant dp7=RETENTION_S",
                           "tombstone-check --first D0_7 --last D0_7+0", "STAMP stamps/retired_hour.logs.tombstone.json",
-                          "--mode query", "--retention-tenant dp7=RETENTION_S --fold-key-index-leaves",
-                          "admin-fold-retired_hour.json", "admin-fold-retired_hour_refold.json",
+                          "listing-retired_hour-after.json", "STAMP stamps/retired_hour.logs.maint_records.json",
+                          "fold-retired_hour-logs.measure.json", "--key-index-leaves --retention-default RETENTION_Ss",
+                          "fold-retired_hour_refold-logs.measure.json",
+                          "--key-index-leaves --retention-default RETENTION_Ss",
                           "STAMP stamps/transitions.jsonl", "STAMP stamps/census.jsonl", "--batch 23",
                           "tombstone-check --first D0_7 --last D0_7+23",
-                          "STAMP stamps/retired_hour_drop.logs.tombstone.json", "admin-fold-retired_hour_drop.json",
-                          "admin-fold-retired_hour_drop_refold.json", "STAMP stamps/transitions.jsonl")),
+                          "STAMP stamps/retired_hour_drop.logs.tombstone.json",
+                          "STAMP stamps/retired_hour_drop.logs.maint_records.json",
+                          "fold-retired_hour_drop-logs.measure.json", "fold-retired_hour_drop_refold-logs.measure.json",
+                          "STAMP stamps/transitions.jsonl")),
     )
 
     def check_new_states_plan(self, script):
@@ -5888,6 +5899,253 @@ FINISHED=1
                         '  retire_through retired_hour_drop 22 || { TRIPLES="$saved"; return 1; }\n', "run.sh",
                         self.check_new_states_plan, "the drop leaving the day's last hour",
                         "test_new_states_dry_run_plan")
+
+    def run_sourced(self, script, toml, body, name):
+        """run.sh (SCRIPT, or the run.sh beside a flipped lib/inv.py)
+        sourced under --dry-run --lane local, then load_config for real
+        (DRY_RUN=0) and BODY. Returns (exit, output, out dir)."""
+        box = os.path.dirname(script) if script.endswith("run.sh") else os.path.dirname(os.path.dirname(script))
+        scratch = tempfile.mkdtemp(prefix=f"{name}-", dir=self.tmp)
+        out = os.path.join(scratch, "out")
+        driver = os.path.join(scratch, "driver.sh")
+        with open(driver, "w") as f:
+            f.write(f"set -u\nsource {os.path.join(box, 'run.sh')} --dry-run --lane local --run-toml {toml} "
+                    f"--out {out}\nDRY_RUN=0\nload_config\n{body}\nFINISHED=1\n")
+        p = subprocess.run([BASH, driver], capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout + p.stderr, out
+
+    def check_maintain_key(self, script):
+        out = []
+        code, text = self.new_states_dry_run(script)
+        if code:
+            return [f"dry run exit {code}"]
+        key = self.path("out-h1b", "work", "auth", "maintain.key")
+        starts = [x for x in text.splitlines() if "--mode maintain" in x]
+        if len(starts) != 2 or not all(f" --maintain-key-file {key} " in x for x in starts):
+            out.append(f"maintain server starts without --maintain-key-file {key}: {starts}")
+        code, text, _ = self.run_sourced(script, os.path.join(BOX, "run.local-smoke.toml"),
+                                         'k="$(maintain_key_file)" || exit 9\necho "KEY=$k"\n'
+                                         'sum1="$(cksum <"$k")"\nmaintain_key_file >/dev/null\n'
+                                         '[ "$sum1" = "$(cksum <"$k")" ] || echo REWRITTEN', "key")
+        m = re.search(r"^KEY=(.+)$", text, re.M)
+        if code or not m:
+            return out + [f"maintain_key_file exit {code}: {text[-300:]}"]
+        with open(m.group(1)) as f:
+            lines = [x.strip() for x in f if x.strip() and not x.lstrip().startswith("#")]
+        # parse_fragment_keys (services/ravel-server/src/config.rs): one
+        # 64-hex-digit key per line, comments and blank lines ignored.
+        if len(lines) != 1 or not re.fullmatch(r"[0-9a-f]{64}", lines[0]):
+            out.append(f"key file lines {lines}, want one 64-hex key")
+        if os.stat(m.group(1)).st_mode & 0o777 != 0o600:
+            out.append(f"key file mode {oct(os.stat(m.group(1)).st_mode & 0o777)}, want 0o600")
+        if "REWRITTEN" in text:
+            out.append("a second call rewrote the key")
+        return out
+
+    def test_maintain_server_gets_a_key_file(self):
+        # ravel-server --mode maintain refuses to start without
+        # --maintain-key-file, so both retired_hour maintain starts carry
+        # one, and the file holds one key in parse_fragment_keys' format.
+        self.assertEqual(self.check_maintain_key(os.path.join(BOX, "run.sh")), [])
+        for old, new, label in (
+                ('  start_server maintain "$tokens" --maintain-key-file "$key" --disable-fold',
+                 '  start_server maintain "$tokens" --disable-fold', "the maintain server started with no key file"),
+                ("print(secrets.token_hex(32))", "print(secrets.token_hex(16))", "a 32-hex-digit key")):
+            self.flip_check(old, new, "run.sh", self.check_maintain_key, label, "test_maintain_server_gets_a_key_file")
+
+    def check_retired_hour_last(self, script):
+        out = []
+        toml = self.new_states_toml(states='"day_parts_7", "retired_hour", "day_parts_30"')
+        code, text = self.new_states_dry_run(script, toml=toml, out="out-after-rh")
+        want = "run.toml run.states: day_parts_30 is listed after retired_hour"
+        if code == 0 or want not in text:
+            out.append(f"day_parts_30 after retired_hour: exit {code}, {want!r} not in the output")
+        code, text = self.new_states_dry_run(script, toml=self.new_states_toml(), out="out-rh-last")
+        if code:
+            out.append(f"retired_hour last: exit {code}")
+        return out
+
+    def test_no_state_runs_after_retired_hour(self):
+        # The maintain pass compacts every tenant's buckets, so a state
+        # listed after retired_hour would be measured on a moved store.
+        self.assertEqual(self.check_retired_hour_last(os.path.join(BOX, "run.sh")), [])
+        self.flip_check('    [ "$rh_seen" = 0 ] || fail ', '    [ "$rh_seen" = 0 ] || true ', "run.sh",
+                        self.check_retired_hour_last, "a state listed after retired_hour accepted",
+                        "test_no_state_runs_after_retired_hour")
+
+    def check_maint_records_fail_the_state(self, script):
+        out = []
+        h = 20_400 * 24
+        s = datetime.datetime.fromtimestamp(h * 3600, datetime.timezone.utc).strftime("%Y%m%dT%H")
+        s2 = datetime.datetime.fromtimestamp((h + 5) * 3600, datetime.timezone.utc).strftime("%Y%m%dT%H")
+        before = [f"t/abc/l/c/0/{s}/0001.cmt", f"t/abc/l/c/0/{s}/l1.00000000000000aa.cmt",
+                  f"t/abc/l/c/1/{s2}/0001.cmt"]
+        cases = (
+            ("a compaction record in a dp7 logs day part", f"t/abc/l/c/1/{s}/l1.0123456789abcdef.cmt",
+             [f"1/{h}/l1.0123456789abcdef.cmt"]),
+            ("a rewrite record in a dp7 logs day part", f"t/abc/l/c/1/{s2}/rw.0123456789abcdef.cmt",
+             [f"1/{h + 5}/rw.0123456789abcdef.cmt"]),
+            ("a compaction record in another tenant", f"t/other/l/c/0/{s}/l1.0123456789abcdef.cmt", []),
+            ("a compaction record in dp7's spans", f"t/abc/s/c/0/{s}/l1.0123456789abcdef.cmt", []),
+            ("a new commit record", f"t/abc/l/c/0/{s2}/0002.cmt", []))
+        for i, (label, extra, want) in enumerate(cases):
+            listings = tempfile.mkdtemp(prefix=f"listings-{i}-", dir=self.tmp)
+            for name, keys in (("before", before), ("after", before + [extra])):
+                with open(os.path.join(listings, f"keys-retired_hour-{name}.tsv"), "w") as f:
+                    f.write("".join(f"10\t{k}\n" for k in keys))
+            code, text, o = self.run_sourced(
+                script, os.path.join(BOX, "run.local-smoke.toml"),
+                f'mkdir -p "$WORK" "$STAMPS"\ncp {listings}/*.tsv "$WORK/"\n'
+                'printf \'{"dp7": "abc"}\\n\' >"$STAMPS/tenants.json"\nrc=0\nmaint_records retired_hour || rc=$?\n'
+                'echo "MAINT-RC=$rc STEP=${FAIL_STEP:-}"', f"mr{i}")
+            rc = re.search(r"^MAINT-RC=(\d+) STEP=(.*)$", text, re.M)
+            if code or not rc:
+                out.append(f"{label}: driver exit {code}: {text[-300:]}")
+                continue
+            failed = rc.group(1) != "0"
+            if failed != bool(want) or (want and rc.group(2) != "maint-records retired_hour"):
+                out.append(f"{label}: maint_records rc {rc.group(1)} step {rc.group(2)!r}, want "
+                           f"{'a failed state' if want else 'pass'}")
+            try:
+                with open(os.path.join(o, "stamps", "retired_hour.logs.maint_records.json")) as f:
+                    got = json.load(f)["new"]
+            except (OSError, ValueError, KeyError) as e:
+                out.append(f"{label}: no maint_records stamp ({e})")
+                continue
+            if got != want:
+                out.append(f"{label}: stamp new {got}, want {want}")
+        return out
+
+    def test_maintain_compaction_fails_retired_hour(self):
+        # W2's and W3's counters are fold-wide: a compaction or rewrite
+        # record the maintain pass wrote into a dp7 logs bucket would be
+        # reconciled by the fold under measurement, so it fails the state.
+        self.assertEqual(self.check_maint_records_fail_the_state(os.path.join(BOX, "run.sh")), [])
+        self.flip_check("    if new:\n", "    if False:\n", "lib/inv.py", self.check_maint_records_fail_the_state,
+                        "a compaction record the maintain pass wrote accepted",
+                        "test_maintain_compaction_fails_retired_hour")
+
+    def retired_hour_driver(self, script, help_text, dirty, name):
+        """state_retired_hour for real against a stub ravel-cli printing
+        HELP_TEXT for catalog fold --help, with the local lane's checkout a
+        scratch repository (modified when DIRTY); retire_through is stubbed
+        to print RETIRE-THROUGH and stop the state."""
+        scratch = tempfile.mkdtemp(prefix=f"repo-{name}-", dir=self.tmp)
+        repo = os.path.join(scratch, "repo")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@t")
+        os.mkdir(repo)
+        with open(os.path.join(repo, "f.txt"), "w") as f:
+            f.write("a\n")
+        for args in (("init", "-q"), ("add", "f.txt"), ("commit", "-q", "-m", "c1")):
+            subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True, env=env)
+        if dirty:
+            with open(os.path.join(repo, "f.txt"), "w") as f:
+                f.write("b\n")
+        stub = os.path.join(scratch, "ravel-cli")
+        with open(stub, "w") as f:
+            f.write(f"#!/bin/sh\ncat <<'EOF'\n{help_text}\nEOF\n")
+        os.chmod(stub, 0o755)
+        toml = self.example_toml(('lane = "s3"', 'lane = "local"'),
+                                 ('"erasure_in_flight", "many_parts_744", "many_parts_2160"]',
+                                  '"erasure_in_flight", "day_parts_7", "retired_hour"]'), ('c1_sha = ""', 'c1_sha = "HEAD"'))
+        code, text, _ = self.run_sourced(script, toml, f"""BIN={stub}
+INV_DIR={repo}
+DP7_OK=1
+fits() {{ return 0; }}
+retire_through() {{ echo "RETIRE-THROUGH $*"; return 1; }}
+rc=0
+state_retired_hour || rc=$?
+echo "STATE-RC=$rc"
+""", name)
+        return code, text
+
+    FOLD_HELP = "Usage: ravel-cli catalog fold [OPTIONS]\n      --key-index-leaves\n      --writers-stopped"
+
+    def check_fold_help(self, script):
+        out = []
+        code, text = self.retired_hour_driver(script, self.FOLD_HELP, False, "help-without")
+        want = ("NOT-RUN retired_hour: this ravel-cli's catalog fold --help lists no --retention-default, so its "
+                "fold carries no retention window and reconciles no tombstone")
+        if code or want not in text or "RETIRE-THROUGH" in text:
+            out.append(f"fold help without --retention-default: exit {code}: {text[-300:]}")
+        code, text = self.retired_hour_driver(script, self.FOLD_HELP + "\n      --retention-default <DURATION>",
+                                              False, "help-with")
+        if code or "RETIRE-THROUGH retired_hour 0" not in text or "NOT-RUN" in text:
+            out.append(f"fold help with --retention-default: exit {code}: {text[-300:]}")
+        return out
+
+    def test_retired_hour_needs_a_fold_with_retention_default(self):
+        # A CLI fold without --retention-default has no retention window and
+        # skips the retention-frontier reconcile, so it would fold as if no
+        # tombstone existed: the state is not-run on such a binary.
+        self.assertEqual(self.check_fold_help(os.path.join(BOX, "run.sh")), [])
+        self.flip_check("    if ! grep -q -e '--retention-default' \"$WORK/fold-help.out\"; then\n",
+                        "    if false; then\n", "run.sh", self.check_fold_help,
+                        "a fold binary without --retention-default accepted",
+                        "test_retired_hour_needs_a_fold_with_retention_default")
+
+    def check_dirty_tree(self, script):
+        out = []
+        help_text = self.FOLD_HELP + "\n      --retention-default <DURATION>"
+        code, text = self.retired_hour_driver(script, help_text, True, "dirty")
+        want = ("NOT-RUN retired_hour: run.toml box.sha is empty and the checkout has 1 modified tracked paths, so "
+                "its HEAD does not name the fold binary W2 is judged on")
+        if code or want not in text or "RETIRE-THROUGH" in text:
+            out.append(f"dirty checkout: exit {code}: {text[-300:]}")
+        code, text = self.retired_hour_driver(script, help_text, False, "clean")
+        if code or "RETIRE-THROUGH retired_hour 0" not in text:
+            out.append(f"clean checkout: exit {code}: {text[-300:]}")
+        return out
+
+    def test_retired_hour_refuses_a_dirty_local_checkout(self):
+        # On the local lane the fold binary's SHA is the checkout's HEAD,
+        # which names what was built only when no tracked file differs.
+        self.assertEqual(self.check_dirty_tree(os.path.join(BOX, "run.sh")), [])
+        self.flip_check('    if [ -n "$dirty" ]; then\n', "    if false; then\n", "run.sh", self.check_dirty_tree,
+                        "a modified checkout's HEAD stamped as the fold binary",
+                        "test_retired_hour_refuses_a_dirty_local_checkout")
+
+    def check_dp30_budget(self, script):
+        out = []
+        code, text = self.new_states_dry_run(script)
+        if code:
+            return [f"dry run exit {code}"]
+        b = self.blocks(text)
+        for n, want in ((7, None), (30, "--key-index-build-max-pairs 1600000")):
+            folds = [x for x in b.get(f"state:day_parts_{n}", []) if re.search(r"/fold-day_parts_\d+\S*\.measure", x)]
+            if not folds:
+                out.append(f"day_parts_{n}: no folds")
+            for x in folds:
+                if want and want not in x:
+                    out.append(f"day_parts_{n}: fold without {want}: {x}")
+                if not want and "--key-index-build-max-pairs" in x:
+                    out.append(f"day_parts_{n}: fold with a build budget: {x}")
+        if "STAMP stamps/day_parts_30.logs.build_budget.json" not in b.get("state:day_parts_30", []):
+            out.append("no day_parts_30.logs.build_budget.json stamp")
+        return out
+
+    def test_day_parts_30_folds_at_a_reduced_build_budget(self):
+        # At a fifth of box D's rate the default 8,000,000-pair budget
+        # leaves S (request_id slices per day part) about 5; the 30-day
+        # state's folds pass 1,600,000, which puts S back at A1's 26.
+        self.assertEqual(self.check_dp30_budget(os.path.join(BOX, "run.sh")), [])
+        with open(os.path.join(BOX, "run.example.toml"), "rb") as f:
+            dp = tomllib.load(f)["day_parts"]
+        pairs_per_day = dp["traces_per_day_30"] * 5
+        self.assertEqual(pairs_per_day, 20_000_040)
+        self.assertEqual(-(-pairs_per_day // (dp["key_index_build_max_pairs_30"] // 2)), 26)
+        self.assertEqual(-(-pairs_per_day // (8_000_000 // 2)), 6)
+        toml = self.example_toml(('lane = "s3"', 'lane = "local"'),
+                                 ('"erasure_in_flight", "many_parts_744", "many_parts_2160"]',
+                                  '"erasure_in_flight", "day_parts_30"]'),
+                                 ("key_index_build_max_pairs_30 = 1600000", "key_index_build_max_pairs_30 = 0"))
+        code, text = self.sourced_load_config(toml)
+        self.assertNotEqual(code, 0)
+        self.assertIn("run.toml day_parts.key_index_build_max_pairs_30 = 0: not a positive whole number", text)
+        self.flip_check('  [ "$n" = 7 ] || budget=(--key-index-build-max-pairs "$DP30_MAX_PAIRS")\n',
+                        '  [ "$n" = 7 ] || budget=()\n', "run.sh", self.check_dp30_budget,
+                        "the 30-day folds at the default budget", "test_day_parts_30_folds_at_a_reduced_build_budget")
 
     def test_stride_check_that_cannot_run_is_not_a_refusal(self):
         # run.sh records exit 1 as the state not-run with the refusal on
