@@ -250,11 +250,16 @@ when its closure runs no feature lane, and from about 93 GB to more than
 188 GB when it reaches the sql, flight-sql, esql and ravel-bench lanes
 (CLAUDE.md's measured band), since the main suite and every lane share one
 target. The executor tier builds less: it tests only the named crates and
-only compiles their dependents. Derive the spec's `disk_floor_gb` from the
-tier's `--dry-run` (ADR-4034 D2): 40 when it lists no feature-lane command
-(no `cargo clippy` or test of a named crate with `--features`), 60 when it
-lists one or more, and 10 for a `gate_tier: script-only` task whose gate builds
-nothing. The 40 and 60 are the ADR's predicted floors, not a measurement.
+only compiles their dependents. Derive the spec's `disk_floor_gb` from its
+declared tier (ADR-4034 D2). For the executor tier, from that tier's
+`--dry-run`: 40 when it lists no lane run, 60 when it lists one or more.
+A lane run is any command gates.sh emits for a feature lane, whether it
+carries `--features` (the lane clippies and tests) or not (the agents
+lane's page-size-2 run). For the merge tier, from the measured band above
+for the closure: 70 when the merge `--dry-run` reaches no feature lane,
+200 when it reaches the sql, flight-sql, esql or ravel-bench lanes. For a
+script-only task whose gate builds nothing, 10. The executor's 40 and 60
+are the ADR's predicted floors, not a measurement.
 The floor is the hard stop because the spec does
 not choose the host, and a higher floor would turn a smaller healthy host
 into a lost dispatch. So the floor does not prove a feature-lane gate will fit,
@@ -769,10 +774,12 @@ each on its own line: `gate_tier:` one of `executor`, `merge` or
 the gate needs. `bin/agent-cli dispatch` refuses a spec without both
 (exit 2, nothing dispatched) and records them in the ledger line, and
 `bin/agent-cli spec-lint` reports the same refusal. Derive the floor from
-the tier's `--dry-run` (`scripts/gates.sh --tier executor -p <crate>
---dry-run`): 40 when it lists no feature-lane command, 60 when it lists
-one or more, and 10 for a script-only task that builds nothing. Use the same
-number in the spec's headroom guard.
+the declared tier, as the Gates paragraph of the template says: executor,
+from `scripts/gates.sh --tier executor -p <crate> --dry-run` (40 with no
+lane run, 60 with one or more); merge, from CLAUDE.md's measured band for
+the closure (70 with no feature lane, 200 with the sql, flight-sql, esql or
+ravel-bench lanes); script-only, 10. Use the same number in the spec's
+headroom guard.
 
 Do not trust `fleet_status`'s text at face value: it has printed a
 `result at refs/heads/task/<id>/result` line even when that ref was never
