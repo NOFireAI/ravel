@@ -933,15 +933,30 @@ GATE_TIERS = ("executor", "merge", "script-only")
 SPEC_HEAD = {"gate_tier": lambda v: v in GATE_TIERS,
              "disk_floor_gb": lambda v: re.fullmatch(r"[1-9][0-9]*", v) is not None}
 
+# The fleet-task-spec template's headroom line carries this literal
+# placeholder for the author to replace with the spec's own disk_floor_gb
+# before dispatch (issue #4084, from PR #4087's review): an author who fills
+# the two head lines but misses this one gets a spec whose first command is
+# a shell parse error on the executor, which reads as below-floor rather
+# than as the template defect it is.
+DISK_FLOOR_PLACEHOLDER = "<disk_floor_gb>"
+HEADROOM_INVOCATION = re.compile(r"check-disk-headroom\.sh\s+\S+\s+(\d+)")
+
 
 def spec_head_values(spec):
     """gate_tier and disk_floor_gb from their own lines in the spec.
 
     Each line is the key, a colon and the value as its first word; anything
     after the value is commentary. Raises CliError (2) naming each key that
-    is missing, malformed or given two different values."""
+    is missing, malformed or given two different values, naming a line that
+    still carries the template's unfilled disk_floor_gb placeholder, or
+    naming a check-disk-headroom.sh invocation whose floor argument
+    disagrees with the declared disk_floor_gb. A spec with no
+    check-disk-headroom.sh invocation at all is not refused by the last
+    check."""
     found = {k: set() for k in SPEC_HEAD}
-    for line in spec.splitlines():
+    lines = spec.splitlines()
+    for line in lines:
         m = re.match(r"\s*(gate_tier|disk_floor_gb):[ \t]*(\S*)", line)
         if m:
             found[m.group(1)].add(m.group(2))
@@ -956,6 +971,17 @@ def spec_head_values(spec):
                                else "a positive integer"))
         elif len(values) > 1:
             problems.append(f"{key} given twice: {', '.join(sorted(values))}")
+    for i, line in enumerate(lines, 1):
+        if DISK_FLOOR_PLACEHOLDER in line:
+            problems.append(f"line {i} still has the unfilled {DISK_FLOOR_PLACEHOLDER} template placeholder")
+    declared = found["disk_floor_gb"]
+    if len(declared) == 1 and SPEC_HEAD["disk_floor_gb"](next(iter(declared))):
+        declared_floor = int(next(iter(declared)))
+        for i, line in enumerate(lines, 1):
+            m = HEADROOM_INVOCATION.search(line)
+            if m and int(m.group(1)) != declared_floor:
+                problems.append(f"line {i} check-disk-headroom.sh floor {m.group(1)} differs from "
+                                f"declared disk_floor_gb {declared_floor}")
     if problems:
         raise CliError("spec head refused, nothing dispatched: " + "; ".join(problems)
                        + " (each on its own line: gate_tier: <" + "|".join(GATE_TIERS)
