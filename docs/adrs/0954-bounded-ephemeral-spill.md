@@ -1377,7 +1377,7 @@ This is the parallel bucket spill amendment. The figures are from epic
      derived `bits` and `routed_chunk_rows`;
    - `exchange_spill_bytes_written` and `exchange_spill_files`: the spill
      metrics of every `RepartitionExec` in the plan, read through
-     `accumulate_spill_counts` (`spill.rs:816`) as today's per-operator
+     `accumulate_spill_counts` (`spill.rs:815`) as today's per-operator
      figures are;
    - `bucket_spill_bytes_written`, `bucket_spill_bytes_read` and
      `bucket_spill_rows_written`: the bucketed exec's own counters

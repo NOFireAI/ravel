@@ -56,6 +56,11 @@ async fn main() -> anyhow::Result<()> {
 
     ravel_server::warn_dev_insecure_tenant_header(cli.tenancy.dev_insecure_tenant_header);
 
+    // ADR-3565 bucket spill item 1: the soft open-file limit, raised to the
+    // hard limit before anything reads it.
+    #[cfg(feature = "sql")]
+    ravel_server::nofile::raise_nofile_soft_limit().emit();
+
     // Host-derived performance defaults (ADR-0088 as amended by issue #1141).
     // The host is read exactly once, here, and the six settings are resolved
     // from it once; every consumer below takes the resolved value, so no later

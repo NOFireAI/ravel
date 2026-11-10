@@ -156,6 +156,7 @@ use crate::access_intent::{
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
 use crate::bounded_topk;
+use crate::bucketed_final_aggregate::{BucketSpillFigures, bucket_spill_figures};
 use crate::clock::SystemClock;
 use crate::config::SqlConfig;
 use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
@@ -2947,7 +2948,13 @@ impl SqlExecutor {
                             .record(key, trigger_read_bytes(&accounting));
                     }
                     if let Some(first) = spill_retry {
-                        let report = first.report(spill, caps.pool, caps.spill_share);
+                        let report = first.report(
+                            spill,
+                            &spill_by_operator,
+                            caps.bucket_spill,
+                            caps.pool,
+                            caps.spill_share,
+                        );
                         report.emit(&statement_fingerprint(statement), "answered");
                         stats.spill_retry = Some(report);
                     }
@@ -3080,7 +3087,13 @@ impl SqlExecutor {
                     };
                     if let Some(first) = spill_retry {
                         first
-                            .report(spill, caps.pool, caps.spill_share)
+                            .report(
+                                spill,
+                                &spill_by_operator,
+                                caps.bucket_spill,
+                                caps.pool,
+                                caps.spill_share,
+                            )
                             .emit(&statement_fingerprint(statement), "failed");
                     }
                     return Err(err);
@@ -5646,6 +5659,7 @@ impl SqlExecutor {
                         pool: PoolReport::of(&pool),
                         spill_probe,
                         spill_share,
+                        bucket_spill: None,
                     },
                 );
             }
@@ -5686,6 +5700,7 @@ impl SqlExecutor {
                             pool: PoolReport::of(&pool),
                             spill_probe,
                             spill_share,
+                            bucket_spill: stream.bucket_spill(),
                         },
                     );
                 }
@@ -5711,6 +5726,7 @@ impl SqlExecutor {
                 pool: PoolReport::of(&pool),
                 spill_probe,
                 spill_share,
+                bucket_spill: stream.bucket_spill(),
             },
         )
     }
@@ -5856,6 +5872,9 @@ struct AttemptCaps {
     spill_probe: Option<SpillProbe>,
     /// [`PinnedQuery::spill_share`].
     spill_share: Option<u64>,
+    /// The plan's spilling bucketed execs, read on both paths like the
+    /// spill counters.
+    bucket_spill: Option<BucketSpillFigures>,
 }
 
 /// The refusal that earned a statement its spill retry.
@@ -5867,13 +5886,46 @@ struct FirstRefusal {
 
 impl FirstRefusal {
     /// This refusal beside what the retry it earned did.
-    fn report(self, spill: SpillCounts, pool: PoolReport, share: Option<u64>) -> SpillRetryReport {
+    fn report(
+        self,
+        spill: SpillCounts,
+        by_operator: &[OperatorSpill],
+        bucket: Option<BucketSpillFigures>,
+        pool: PoolReport,
+        share: Option<u64>,
+    ) -> SpillRetryReport {
+        let of = |operator: &str| {
+            by_operator
+                .iter()
+                .filter(|spill| spill.operator == operator)
+                .fold((0u64, 0u64, 0u64), |(files, bytes, rows), spill| {
+                    (
+                        files + spill.files,
+                        bytes + spill.bytes_written,
+                        rows + spill.rows_written,
+                    )
+                })
+        };
+        let (exchange_files, exchange_bytes, _) = of("RepartitionExec");
+        let (_, bucket_bytes, bucket_rows) = of("BucketedFinalAggregateExec");
         SpillRetryReport {
             first_refusal: self.class,
             first_refusal_after: self.after,
+            retry_plan: if bucket.is_some() {
+                "bucket"
+            } else {
+                "sort_merge"
+            },
+            bits: bucket.map(|bucket| bucket.bits),
+            routed_chunk_rows: bucket.map(|bucket| bucket.routed_chunk_rows),
             spill_bytes_written: spill.bytes_written,
             spill_bytes_read: spill.bytes_read,
             spill_files: spill.files,
+            exchange_spill_bytes_written: exchange_bytes,
+            exchange_spill_files: exchange_files,
+            bucket_spill_bytes_written: bucket_bytes,
+            bucket_spill_bytes_read: bucket.map_or(0, |bucket| bucket.bytes_read),
+            bucket_spill_rows_written: bucket_rows,
             peak_unspillable_bytes: pool.peak_unspillable_bytes,
             share_bytes: share,
         }
@@ -5892,13 +5944,32 @@ pub struct SpillRetryReport {
     /// Wall time from the start of the refused attempt to its refusal,
     /// resolve included.
     pub first_refusal_after: Duration,
-    /// [`SpillCounts::bytes_written`] of the retry.
+    /// The retry's plan: `bucket` when a bucketed final aggregate ran in it
+    /// with spill on, `sort_merge` otherwise.
+    pub retry_plan: &'static str,
+    /// The bucketed retry's `bits`; `None` for `sort_merge`.
+    pub bits: Option<u8>,
+    /// The bucketed retry's `routed_chunk_rows`; `None` for `sort_merge`.
+    pub routed_chunk_rows: Option<usize>,
+    /// [`SpillCounts::bytes_written`] of the retry, over every operator.
     pub spill_bytes_written: u64,
     /// [`SpillCounts::bytes_read`] of the retry: `None` on DataFusion 55,
     /// which does not measure it.
     pub spill_bytes_read: Option<u64>,
     /// [`SpillCounts::files`] of the retry.
     pub spill_files: u64,
+    /// Spill-file bytes the retry's `RepartitionExec`s wrote. DataFusion 55
+    /// records none read back, so the exchange has no read figure.
+    pub exchange_spill_bytes_written: u64,
+    /// Spill files the retry's `RepartitionExec`s created.
+    pub exchange_spill_files: u64,
+    /// Scratch-file bytes the bucketed exec wrote: Arrow IPC after
+    /// lz4_frame, framing included.
+    pub bucket_spill_bytes_written: u64,
+    /// Scratch-file bytes the bucketed exec read back, whole files once.
+    pub bucket_spill_bytes_read: u64,
+    /// State rows the bucketed exec wrote.
+    pub bucket_spill_rows_written: u64,
     /// The retry pool's largest reservation by consumers that cannot spill.
     pub peak_unspillable_bytes: u64,
     /// The spill-budget share the retry reserved, or `None` when less than
@@ -5921,6 +5992,18 @@ impl SpillRetryReport {
                 .spill_bytes_read
                 .map_or_else(|| "unmeasured".to_string(), |bytes| bytes.to_string()),
             spill_files = self.spill_files,
+            retry_plan = self.retry_plan,
+            bits = self
+                .bits
+                .map_or_else(|| "none".to_string(), |bits| bits.to_string()),
+            routed_chunk_rows = self
+                .routed_chunk_rows
+                .map_or_else(|| "none".to_string(), |rows| rows.to_string()),
+            exchange_spill_bytes_written = self.exchange_spill_bytes_written,
+            exchange_spill_files = self.exchange_spill_files,
+            bucket_spill_bytes_written = self.bucket_spill_bytes_written,
+            bucket_spill_bytes_read = self.bucket_spill_bytes_read,
+            bucket_spill_rows_written = self.bucket_spill_rows_written,
             peak_unspillable_bytes = self.peak_unspillable_bytes,
             share_bytes = self.share_bytes.unwrap_or(0),
             "SQL statement retried with spill after a memory refusal"
@@ -6311,6 +6394,12 @@ impl PinnedStream {
             .as_ref()
             .map_or(Duration::ZERO, SpillState::window);
         (totals, by_operator)
+    }
+
+    /// The spilling bucketed execs' tuning and bytes read back, `None` when
+    /// the plan has none.
+    fn bucket_spill(&self) -> Option<BucketSpillFigures> {
+        bucket_spill_figures(&self.plan)
     }
 
     /// Sample the disk manager's open-spill-file gauge and fold the interval
@@ -9599,6 +9688,25 @@ pub(crate) mod tests {
                 bytes_read: None,
                 duration: Duration::from_millis(7),
             },
+            &[
+                OperatorSpill {
+                    operator: "RepartitionExec".to_string(),
+                    files: 1,
+                    bytes_written: 1024,
+                    rows_written: 4,
+                },
+                OperatorSpill {
+                    operator: "BucketedFinalAggregateExec".to_string(),
+                    files: 2,
+                    bytes_written: 3072,
+                    rows_written: 6,
+                },
+            ],
+            Some(BucketSpillFigures {
+                bits: 4,
+                routed_chunk_rows: 8192,
+                bytes_read: 3072,
+            }),
             PoolReport {
                 peak_unspillable_bytes: 2_200_000,
                 ..PoolReport::default()
@@ -9625,6 +9733,14 @@ pub(crate) mod tests {
             ("spill_bytes_written", "4096"),
             ("spill_bytes_read", "unmeasured"),
             ("spill_files", "3"),
+            ("retry_plan", "bucket"),
+            ("bits", "4"),
+            ("routed_chunk_rows", "8192"),
+            ("exchange_spill_bytes_written", "1024"),
+            ("exchange_spill_files", "1"),
+            ("bucket_spill_bytes_written", "3072"),
+            ("bucket_spill_bytes_read", "3072"),
+            ("bucket_spill_rows_written", "6"),
             ("peak_unspillable_bytes", "2200000"),
             ("share_bytes", "17179869184"),
         ]
@@ -9632,6 +9748,86 @@ pub(crate) mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         assert_eq!(lines, vec![expected]);
+    }
+
+    /// ADR-0954's parallel bucket spill item 4: the exchange's and the
+    /// bucketed exec's figures come from their own operators, they sum to
+    /// the total, and a retry with no spilling bucketed exec reports
+    /// `sort_merge` with no bucket figures.
+    #[test]
+    fn spill_retry_report_splits_exchange_and_bucket_bytes() {
+        let first = FirstRefusal {
+            class: "query_pool",
+            after: Duration::from_millis(5),
+        };
+        let operators = [
+            OperatorSpill {
+                operator: "RepartitionExec".to_string(),
+                files: 2,
+                bytes_written: 700,
+                rows_written: 30,
+            },
+            OperatorSpill {
+                operator: "RepartitionExec".to_string(),
+                files: 1,
+                bytes_written: 300,
+                rows_written: 10,
+            },
+            OperatorSpill {
+                operator: "BucketedFinalAggregateExec".to_string(),
+                files: 16,
+                bytes_written: 9_000,
+                rows_written: 400,
+            },
+        ];
+        let mut totals = SpillCounts::default();
+        for operator in &operators {
+            totals.files += operator.files;
+            totals.bytes_written += operator.bytes_written;
+            totals.rows_written += operator.rows_written;
+        }
+        let bucket = BucketSpillFigures {
+            bits: 4,
+            routed_chunk_rows: 8192,
+            bytes_read: 9_000,
+        };
+        let report = first.report(
+            totals,
+            &operators,
+            Some(bucket),
+            PoolReport::default(),
+            None,
+        );
+        assert_eq!(report.retry_plan, "bucket");
+        assert_eq!(
+            (report.bits, report.routed_chunk_rows),
+            (Some(4), Some(8192))
+        );
+        assert_eq!(report.exchange_spill_bytes_written, 1_000);
+        assert_eq!(report.exchange_spill_files, 3);
+        assert_eq!(report.bucket_spill_bytes_written, 9_000);
+        assert_eq!(report.bucket_spill_bytes_read, 9_000);
+        assert_eq!(report.bucket_spill_rows_written, 400);
+        assert_eq!(
+            report.exchange_spill_bytes_written + report.bucket_spill_bytes_written,
+            report.spill_bytes_written
+        );
+
+        let sort_merge = first.report(totals, &operators[..2], None, PoolReport::default(), None);
+        assert_eq!(sort_merge.retry_plan, "sort_merge");
+        assert_eq!(
+            (sort_merge.bits, sort_merge.routed_chunk_rows),
+            (None, None)
+        );
+        assert_eq!(sort_merge.exchange_spill_bytes_written, 1_000);
+        assert_eq!(
+            (
+                sort_merge.bucket_spill_bytes_written,
+                sort_merge.bucket_spill_bytes_read,
+                sort_merge.bucket_spill_rows_written
+            ),
+            (0, 0, 0)
+        );
     }
 
     /// The fingerprint is a stable hash of the SQL text, and a lowered
