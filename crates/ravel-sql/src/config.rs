@@ -728,10 +728,14 @@ impl SqlConfig {
         Ok(self)
     }
 
-    /// How many aggregate streams a query can run at once, which bounds the
-    /// reserve-ahead envelope width: `engine.sql_partition_count()`, or the
-    /// floored final aggregate's [`SqlConfig::first_attempt_min_partitions`]
-    /// when that is wider (ADR-1195, issue #4014 amendment).
+    /// How many aggregate streams a query can run at once:
+    /// `engine.sql_partition_count()`, or the floored final aggregate's
+    /// [`SqlConfig::first_attempt_min_partitions`] when that is wider
+    /// (ADR-1195, issue #4014 amendment). The reserve-ahead envelope width is
+    /// this capped at the host's parallelism, so the floor only moves the
+    /// width for an embedder that sets a count below both the floor and its
+    /// core count. A derived count, `max(8, 2 x cores)`, already meets that
+    /// cap.
     pub fn aggregate_stream_count(&self) -> usize {
         self.engine
             .sql_partition_count()
