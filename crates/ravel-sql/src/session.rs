@@ -648,7 +648,12 @@ pub fn session_config(
     exact_typed_aggregates: bool,
     spill: SpillDecision<'_>,
 ) -> SessionConfig {
-    session_config_with(config, exact_typed_aggregates, spill, repartition_free(spill))
+    session_config_with(
+        config,
+        exact_typed_aggregates,
+        spill,
+        repartition_free(spill),
+    )
 }
 
 /// [`session_config`] with the repartition-free choice made by the caller:

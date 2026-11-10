@@ -1046,6 +1046,10 @@ pub struct SqlStats {
     pub spill_retries: u32,
     /// What the spill retry saw and did, present when one ran and answered.
     pub spill_retry: Option<SpillRetryReport>,
+    /// The plan the answering spill retry drained, rendered as `EXPLAIN`
+    /// renders it, beside [`Self::spill_retry`]: the exchange and every
+    /// bucketed exec with the tuning it ran at.
+    pub spill_retry_plan: Option<String>,
     /// The row filter [`SqlRequest::row_window`] applied above each scan, as
     /// the display of the [`Expr`] that was actually planted
     /// ([`window_filter_expr`]) rather than a separately formatted description
@@ -3010,6 +3014,7 @@ impl SqlExecutor {
                         );
                         report.emit(&statement_fingerprint(statement), "answered");
                         stats.spill_retry = Some(report);
+                        stats.spill_retry_plan = caps.retry_plan_text;
                     }
                     return Ok(SqlOutcome {
                         output,
@@ -5775,6 +5780,7 @@ impl SqlExecutor {
                         bucket_spill: None,
                         rows_consumed: None,
                         retry_plan,
+                        retry_plan_text: None,
                     },
                 );
             }
@@ -5818,6 +5824,7 @@ impl SqlExecutor {
                             bucket_spill: stream.bucket_spill(),
                             rows_consumed: stream.rows_consumed(),
                             retry_plan,
+                            retry_plan_text: None,
                         },
                     );
                 }
@@ -5846,6 +5853,7 @@ impl SqlExecutor {
                 bucket_spill: stream.bucket_spill(),
                 rows_consumed: stream.rows_consumed(),
                 retry_plan,
+                retry_plan_text: retry_plan.map(|_| stream.plan_text()),
             },
         )
     }
@@ -6051,6 +6059,8 @@ struct AttemptCaps {
     rows_consumed: Option<u64>,
     /// [`PinnedQuery::retry_plan`].
     retry_plan: Option<RetryPlan>,
+    /// The plan a spill retry drained, for [`SqlStats::spill_retry_plan`].
+    retry_plan_text: Option<String>,
 }
 
 /// The refusal that earned a statement its spill retry.
@@ -6608,6 +6618,13 @@ impl PinnedStream {
     /// the plan has none.
     fn bucket_spill(&self) -> Option<BucketSpillFigures> {
         bucket_spill_figures(&self.plan)
+    }
+
+    /// The executed plan rendered as `EXPLAIN` renders it.
+    fn plan_text(&self) -> String {
+        datafusion::physical_plan::displayable(self.plan.as_ref())
+            .indent(false)
+            .to_string()
     }
 
     /// The input rows the plan's logs scans have consumed so far, the bucket

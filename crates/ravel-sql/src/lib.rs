@@ -195,8 +195,9 @@ pub use error::{
 pub use executor::{
     AnalyzedRun, DecodedCacheStats, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, KeyIndexStats,
     LiveAccounting, ParquetPlan, PhaseWallTiming, PinnedLanes, PinnedPlanInputs, PinnedQuery,
-    PinnedResolve, PinnedStream, ScanTiming, SegmentTiming, SignalStats, SqlExecutor, SqlOutcome,
-    SqlRequest, SqlStats, TargetSignal, refuse_several_tables, segment_set_keys,
+    PinnedResolve, PinnedStream, ScanTiming, SegmentTiming, SignalStats, SpillRetryReport,
+    SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal, refuse_several_tables,
+    segment_set_keys,
 };
 pub use first_groups::{
     FIRST_GROUPS_CONSUMER_PREFIX, FIRST_GROUPS_RULE, FirstGroupsExec, FirstGroupsLimit,
