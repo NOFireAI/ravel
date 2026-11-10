@@ -453,24 +453,36 @@ jobs:
               continue
             fi
             echo "$branch" >>"$work/branches"
-            if ! open_pr=$(GH_TOKEN="$token" gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty'); then
-              echo "::error::could not ask whether $branch already has an open pull request"
+            # The branch's most recent pull request, in any state. An open one
+            # is already the fix; one a reviewer closed unmerged is a declined
+            # fix, and reopening it every six hours would leave no way to say
+            # no. A declined fix is re-proposed only once its branch is deleted.
+            if ! last_pr=$(GH_TOKEN="$token" gh pr list --head "$branch" --state all --limit 1 --json number,state --jq '.[0] | select(. != null) | "\(.number) \(.state)"'); then
+              echo "::error::could not ask whether $branch already has a pull request"
               exit 1
             fi
-            if [ -n "$open_pr" ]; then
-              echo "$ids: pull request #$open_pr is already open on $branch"
-              continue
-            fi
+            case "$last_pr" in
+              *" OPEN")
+                echo "$ids: pull request #${last_pr%% *} is already open on $branch"
+                continue ;;
+              *" CLOSED")
+                echo "$ids: pull request #${last_pr%% *} on $branch was closed unmerged; not reopening (delete the branch to re-propose)"
+                continue ;;
+            esac
             git checkout -q --detach "$GITHUB_SHA"
             if ! git apply "$patch"; then
               echo "::error::$patch does not apply to $GITHUB_SHA"
               exit 1
             fi
-            crates=$(cut -f1 "$dir/updates.tsv" | sort -u | paste -sd' ')
-            title="fix(deps): update $crates for $(head -n1 "$dir/ids")"
-            if [ "$(wc -l <"$dir/ids")" -gt 1 ]; then
-              title="$title and others"
-            fi
+            # Header within 72 characters: the first crate and id, then counts.
+            first_crate=$(cut -f1 "$dir/updates.tsv" | sort -u | head -n1)
+            n_crates=$(cut -f1 "$dir/updates.tsv" | sort -u | wc -l | tr -d ' ')
+            n_ids=$(wc -l <"$dir/ids" | tr -d ' ')
+            title="fix(deps): update $first_crate"
+            [ "$n_crates" -gt 1 ] && title="$title and $((n_crates - 1)) more"
+            title="$title for $(head -n1 "$dir/ids")"
+            [ "$n_ids" -gt 1 ] && title="$title (+$((n_ids - 1)))"
+            title=$(printf '%s' "$title" | cut -c1-72)
             msg="$work/msg"
             {
               echo "$title"

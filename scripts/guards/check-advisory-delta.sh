@@ -14,9 +14,14 @@
 #   {"type":"summary","fields":{"advisories":{"errors":N,...}}}
 # Log lines are {"type":"log","fields":{"level":...,"message":...}}. A
 # finding is an error-severity diagnostic, the ones that fail `cargo deny
-# check` today. Its key is the advisory id plus the affected crate's name and
-# version (fields.graphs[0].Krate), so a change that adds a second affected
-# version under an id the base already carries has a finding of its own; an
+# check` today. Its key is the advisory id plus the affected crate's name
+# (fields.graphs[0].Krate.name), not its version: a pull request that bumps an
+# unrelated dependency can re-resolve an already-affected crate to another
+# version inside the advisory's range, and keying on the version would fail
+# it for an advisory it did not introduce, the blocked-queue case this check
+# exists to remove. A second affected version under an id the base already
+# carries is therefore a warning, not a failure; main's own full check still
+# reports it. An
 # error with no advisory attached (a yanked crate, an index failure) is keyed
 # as `<code>: <first label span or message>` so it takes part in the
 # comparison instead of being dropped.
@@ -112,7 +117,7 @@ finding_keys() {
       | if .advisory.id != null then
           .advisory.id + " "
             + (if (.graphs[0].Krate | type) == "object"
-               then "\(.graphs[0].Krate.name) \(.graphs[0].Krate.version)"
+               then .graphs[0].Krate.name
                else (.labels[0].span // "(no crate)") end)
         else (.code // "unknown") + ": " + (.labels[0].span // .message // "") end' \
     "${file}" >"${tmpdir}/raw_keys"; then

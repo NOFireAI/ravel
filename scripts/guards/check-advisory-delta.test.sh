@@ -64,7 +64,7 @@ test_new_id_at_head_only_exits_1() {
   run_guard "${TMP}/${name}.head" "${TMP}/${name}.base"
   # FLIP: compare the two inputs' error counts instead of their ids, or
   # read only the base, and this exits 0 without naming the id.
-  if [[ "${RC}" -eq 1 && "${OUT}" == *"::error title=new advisory::RUSTSEC-2026-0001 rmcp 0.8.0 is present at the head and absent at the base ${BASE_SHA}"* ]]; then
+  if [[ "${RC}" -eq 1 && "${OUT}" == *"::error title=new advisory::RUSTSEC-2026-0001 rmcp is present at the head and absent at the base ${BASE_SHA}"* ]]; then
     pass "${name}"
   else
     fail "${name}" "rc=${RC}, wanted 1 naming RUSTSEC-2026-0001"
@@ -85,7 +85,7 @@ test_id_on_both_exits_0_with_warning() {
   # FLIP: fail on every error at the head (today's full check), and this
   # exits 1 on an advisory main already carries; drop the annotation loop,
   # and the warning naming the base is missing.
-  if [[ "${RC}" -eq 0 && "${OUT}" == *"::warning title=pre-existing advisory::RUSTSEC-2026-0002 rmcp 0.8.0 is also present at the base ${BASE_SHA}"* ]]; then
+  if [[ "${RC}" -eq 0 && "${OUT}" == *"::warning title=pre-existing advisory::RUSTSEC-2026-0002 rmcp is also present at the base ${BASE_SHA}"* ]]; then
     pass "${name}"
   else
     fail "${name}" "rc=${RC}, wanted 0 with a warning naming the base"
@@ -197,8 +197,8 @@ test_two_new_ids_both_named() {
   # FLIP: stop at the first new id (exit on the first hit), and the second
   # is never named; count lines rather than unique keys, and the count says 3.
   if [[ "${RC}" -eq 1 &&
-    "${OUT}" == *"::error title=new advisory::RUSTSEC-2026-0007 rmcp 0.8.0 "* &&
-    "${OUT}" == *"::error title=new advisory::RUSTSEC-2026-0008 quick-xml 0.39.4 "* &&
+    "${OUT}" == *"::error title=new advisory::RUSTSEC-2026-0007 rmcp "* &&
+    "${OUT}" == *"::error title=new advisory::RUSTSEC-2026-0008 quick-xml "* &&
     "${OUT}" != *"::error title=new advisory::RUSTSEC-2026-0009"* &&
     "${OUT}" == *"2 new advisories vs base ${BASE_SHA}"* ]]; then
     pass "${name}"
@@ -207,27 +207,25 @@ test_two_new_ids_both_named() {
   fi
 }
 
-test_new_version_under_existing_id_exits_1() {
-  local name="new_version_under_existing_id_exits_1"
+test_version_move_within_range_is_not_new() {
+  local name="version_move_within_range_is_not_new"
   {
-    vuln_line RUSTSEC-2026-0194 quick-xml 0.39.4
-    vuln_line RUSTSEC-2026-0194 quick-xml 0.26.0
-    summary_line 2
+    vuln_line RUSTSEC-2026-0461 rmcp 0.9.1
+    summary_line 1
   } >"${TMP}/${name}.head"
   {
-    vuln_line RUSTSEC-2026-0194 quick-xml 0.39.4
+    vuln_line RUSTSEC-2026-0461 rmcp 0.9.0
     summary_line 1
   } >"${TMP}/${name}.base"
   run_guard "${TMP}/${name}.head" "${TMP}/${name}.base"
-  # FLIP: key on the advisory id alone (drop the graphs[0].Krate part of the
-  # key), and the second affected version reads as pre-existing, exit 0.
-  if [[ "${RC}" -eq 1 &&
-    "${OUT}" == *"::error title=new advisory::RUSTSEC-2026-0194 quick-xml 0.26.0 is present at the head and absent at the base ${BASE_SHA}"* &&
-    "${OUT}" == *"::warning title=pre-existing advisory::RUSTSEC-2026-0194 quick-xml 0.39.4 "* &&
-    "${OUT}" == *"1 new advisories vs base ${BASE_SHA}"* ]]; then
+  # FLIP: put the crate version back in the key, and an unrelated bump that
+  # re-resolves rmcp inside the advisory's range reads as a new finding, exit 1.
+  if [[ "${RC}" -eq 0 &&
+    "${OUT}" == *"::warning title=pre-existing advisory::RUSTSEC-2026-0461 rmcp is also present at the base ${BASE_SHA}"* &&
+    "${OUT}" == *"0 new advisories vs base"* ]]; then
     pass "${name}"
   else
-    fail "${name}" "rc=${RC}, wanted 1 naming quick-xml 0.26.0 as new and 0.39.4 as pre-existing"
+    fail "${name}" "rc=${RC}, wanted 0 with rmcp's advisory as pre-existing"
   fi
 }
 
@@ -292,7 +290,7 @@ test_base_config_rejected_judges_every_head_finding_new() {
   # as well, and the fourth exits 0.
   if [[ "${rc_new}" -eq 1 &&
     "${out_new}" == *"::warning title=base advisories not compared::cargo-deny rejected the config at the base ${BASE_SHA} (failed to validate configuration file /tmp/base/deny.toml)"* &&
-    "${out_new}" == *"::error title=new advisory::RUSTSEC-2026-0011 rmcp 0.8.0 is present at the head"* &&
+    "${out_new}" == *"::error title=new advisory::RUSTSEC-2026-0011 rmcp is present at the head"* &&
     "${rc_clean}" -eq 0 && "${out_clean}" == *"0 new advisories vs base"* &&
     "${rc_other}" -eq 2 && "${rc_head}" -eq 2 ]]; then
     pass "${name}"
@@ -308,7 +306,7 @@ test_nothing_new_prints_zero_line
 test_missing_or_empty_base_json_exits_2
 test_malformed_json_exits_2
 test_two_new_ids_both_named
-test_new_version_under_existing_id_exits_1
+test_version_move_within_range_is_not_new
 test_summary_without_advisories_exits_2
 test_base_config_rejected_judges_every_head_finding_new
 
