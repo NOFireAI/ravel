@@ -83,8 +83,8 @@ jobs:
       # before (sql_area's paths for flight-sql; server_or_operator for
       # features-mcp, which stays on that job's condition), and also when an
       # edited path is under a crate whose reverse-dependency closure reaches
-      # the lane, per scripts/ci-lane-areas.tsv. That map adds sql_area and
-      # agents_area the same way.
+      # the lane, per scripts/ci-lane-areas.tsv. That map adds sql_area,
+      # agents_area, mcp_area and promql_area the same way.
       flight_sql_area: ${{ steps.check.outputs.flight_sql_area }}
       mcp_area: ${{ steps.check.outputs.mcp_area }}
     steps:
@@ -226,8 +226,8 @@ jobs:
           # Closure-aware lanes (ADR-4034 D1): an edit under a crate whose
           # reverse-dependency closure reaches a lane's crates sets that lane's
           # area, so a change to crates/ravel-ingest/ runs sql, flight-sql,
-          # features-agents and features-mcp on the pull request, not first in
-          # the merge queue. scripts/ci-lane-areas.tsv holds the closures,
+          # features-agents, features-mcp and promql-difftest on the pull
+          # request, not first in the merge queue. scripts/ci-lane-areas.tsv holds the closures,
           # generated from scripts/affected-tests.sh -n; this job has no Rust
           # toolchain to compute them, and the lint job's guard fails when the
           # map and the closure differ.
