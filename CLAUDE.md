@@ -133,9 +133,16 @@ run also runs `scripts/gates-sdk.sh` (npm ci, lint, typecheck and test
 under sdk/typescript), which needs node 22 and refuses with exit 64
 without it; `RAVEL_GATES_SKIP_SDK=1` skips that step and leaves CI's
 `sdk` job as the gate for the SDK. A fleet
-executor's gate is `scripts/gates.sh -p <crate> [-p <crate2>]`, not a
-hand-listed workspace clippy, and the PreToolUse hook refuses `cargo
-clippy --workspace` in a fleet clone. gates.sh also runs a
+executor's gate is `scripts/gates.sh --tier executor -p <crate> [-p
+<crate2>]` (ADR-4034 D1), not a hand-listed workspace clippy, and the
+PreToolUse hook refuses `cargo clippy --workspace` in a fleet clone. That
+tier tests only the named crates, compiles the rest of their closure with
+one `cargo check`, and runs a lane's clippy and tests only for a named
+crate the lane covers; CI runs the dependents' tests and the lane suites.
+The merge gate is `--tier merge`, the default, which runs every lane
+this section names. A fleet spec declares `gate_tier:` and `disk_floor_gb:` lines
+in its head; `bin/agent-cli dispatch` refuses a spec without them and
+`bin/agent-cli spec-lint` checks the same. gates.sh also runs a
 ravel-bench lane (`--features sql-latency,profiling,flight-lane` clippy and
 tests, plus `--features stage-timing`) whenever ravel-bench, ravel-sql,
 ravel-query, or ravel-ingest is in scope, and a `-p ravel-logseg -p
@@ -274,8 +281,13 @@ connection, a pushed-but-broken main).
   `ravel-sql` or `ravel-server` is; the agents lane's page-size-2 run
   follows `ravel-agents-runtime` or `ravel-agents-sim`. In workspace mode it also runs
   `scripts/gates-sdk.sh` (node 22; `RAVEL_GATES_SKIP_SDK=1` skips it).
-  This is the executor's gate in fleet specs. A scoped run writes no
-  gates-pass receipt. `--dry-run` prints the closure and every cargo
+  That is `--tier merge`, the default and the merge gate.
+  `--tier executor -p CRATE` is the executor's gate in fleet specs: fmt
+  and the source guards, clippy, tests and doctests for the named crates,
+  one `cargo check` of the rest of the closure with the lane features it
+  reaches, and the clippy and tests of each lane covering a named crate.
+  A scoped run writes no
+  gates-pass receipt in either tier. `--dry-run` prints the closure and every cargo
   command the same arguments would run, then exits 0 without building;
   `scripts/gates.test.sh` pins that selection. In a dispatched fleet clone (a checkout under
   the fleet work root) an unscoped run is refused with exit 64: the
@@ -443,7 +455,7 @@ connection, a pushed-but-broken main).
   ravel-sql --features flight-sql`, on the same profile. Full-workspace tests still run at merge time
   (verify-dispatch-gates.sh and PR CI), so executors only pay for the
   blast radius of their change; fleet specs gate with `scripts/gates.sh
-  -p`, which reads its closure from this script's `-n`. Doctests included
+  --tier executor -p`, which reads its closure from this script's `-n`. Doctests included
   (nextest skips them, the script runs them separately).
 
 ### Guard scripts (mechanical preconditions)
@@ -477,7 +489,7 @@ a remote ref, `filter-branch`, and a force-push naming `main`; and, in a
 checkout under the fleet work root only (a dispatched fleet clone, or an
 orchestrator checkout that lives there), `cargo clippy --workspace` or a
 bare `cargo clippy` with no `-p`, whose replacement is `scripts/gates.sh
--p`. The gate
+--tier executor -p`. The gate
 patterns match cargo's global flags
 too (`cargo --locked test | tail -1` was allowed until they did). It
 fails open on any internal error, and it exempts a dispatched fleet clone
