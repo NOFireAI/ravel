@@ -1020,17 +1020,16 @@ impl<V> DecodedTenantCache<V> {
         Some(entry)
     }
 
-    /// The stamp of this tenant's least-recently-used entry that no reader
-    /// holds: the cache's `Arc` is the value's only strong handle.
-    fn lru_unheld_tick(&self) -> Option<u64> {
-        self.by_use
-            .iter()
-            .find(|(_, key)| {
-                self.entries
-                    .get(key.as_str())
-                    .is_some_and(|entry| Arc::strong_count(&entry.value) == 1)
-            })
-            .map(|(tick, _)| *tick)
+    /// This tenant's entries no reader holds (the cache's `Arc` is the
+    /// value's only strong handle), least-recently-used first, as
+    /// `(use_tick, reserved_bytes)`.
+    fn unheld_by_use(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.by_use.iter().filter_map(|(tick, key)| {
+            self.entries
+                .get(key.as_str())
+                .filter(|entry| Arc::strong_count(&entry.value) == 1)
+                .map(|entry| (*tick, entry.reserved_bytes))
+        })
     }
 
     /// Remove the entry stamped `tick` and return it, or `None` when no entry
@@ -1041,6 +1040,58 @@ impl<V> DecodedTenantCache<V> {
         self.reserved_bytes = self.reserved_bytes.saturating_sub(entry.reserved_bytes);
         Some(entry)
     }
+}
+
+/// Which of [`DecodedCaches`]' two caches a [`PressureCandidate`] sits in.
+#[derive(Clone, Copy)]
+enum PressureSide {
+    Parts,
+    Postings,
+}
+
+/// An entry no reader holds, as [`DecodedCaches::evict_for_pressure`] found
+/// it at the start of its pass.
+#[derive(Clone, Copy)]
+struct PressureCandidate {
+    use_tick: u64,
+    side: PressureSide,
+    tenant: TenantHash,
+    reserved_bytes: u64,
+}
+
+/// Append every entry of `tenants` no reader holds to `out`.
+fn collect_unheld<V>(
+    tenants: &HashMap<TenantHash, DecodedTenantCache<V>>,
+    side: PressureSide,
+    out: &mut Vec<PressureCandidate>,
+) {
+    for (tenant, cache) in tenants {
+        out.extend(
+            cache
+                .unheld_by_use()
+                .map(|(use_tick, reserved_bytes)| PressureCandidate {
+                    use_tick,
+                    side,
+                    tenant: *tenant,
+                    reserved_bytes,
+                }),
+        );
+    }
+}
+
+/// Remove `tenant`'s entry stamped `tick`, and the tenant's map entry with
+/// it when that was its last, so a later scan does not walk an empty shell.
+fn remove_tenant_entry<V>(
+    tenants: &mut HashMap<TenantHash, DecodedTenantCache<V>>,
+    tenant: &TenantHash,
+    tick: u64,
+) -> Option<DecodedEntry<V>> {
+    let cache = tenants.get_mut(tenant)?;
+    let entry = cache.remove_at(tick);
+    if cache.entries.is_empty() {
+        tenants.remove(tenant);
+    }
+    entry
 }
 
 /// A cache of decoded objects that each carry their own memory reservation
@@ -1071,7 +1122,9 @@ impl<V> DecodedTenantCache<V> {
 ///   entirely by other tenants' cached entries, and every later decode would
 ///   be refused with nothing able to give the memory back. A reservation
 ///   that would not fit even with both caches empty takes no such pass: see
-///   [`crate::Catalog::reserve_decoded`].
+///   [`crate::Catalog::reserve_decoded`]. Nor does a pressure shortfall
+///   larger than the unheld entries' summed reservations: see
+///   [`DecodedCaches::evict_for_pressure`].
 ///
 /// An entry evicted by any of these bounds releases its reservation only when the
 /// last `Arc` to it drops; [`DecodedCaches::evict_for_pressure`] alone skips
@@ -1181,45 +1234,6 @@ impl<V> DecodedCache<V> {
         }
         drop(tenants);
         evicted.map(|entry| entry.reserved_bytes)
-    }
-
-    /// The stamp of the least-recently-used entry no reader holds, across
-    /// every tenant, or `None` when every cached entry is held or nothing is
-    /// cached.
-    fn lru_unheld_tick(&self) -> Option<u64> {
-        self.tenants
-            .lock()
-            .values()
-            .filter_map(|cache| cache.lru_unheld_tick())
-            .min()
-    }
-
-    /// Drop the least-recently-used entry no reader holds, across every
-    /// tenant, and return its [`DecodedEntry::reserved_bytes`]; `None` when
-    /// every cached entry is held or nothing is cached. A held entry stays
-    /// cached. Every new handle to a cached value is cloned by [`Self::get`]
-    /// under the map lock, so an entry whose `Arc` the cache alone holds
-    /// when it is removed under that lock stays unshared, and dropping it
-    /// here, after the lock is released, releases its reservation: the bytes
-    /// returned are bytes the budget got back.
-    fn evict_lru_unheld_bytes(&self) -> Option<u64> {
-        let mut tenants = self.tenants.lock();
-        let (tick, tenant) = tenants
-            .iter()
-            .filter_map(|(tenant, cache)| cache.lru_unheld_tick().map(|tick| (tick, *tenant)))
-            .min()?;
-        let evicted = tenants.get_mut(&tenant).and_then(|c| c.remove_at(tick));
-        if tenants
-            .get(&tenant)
-            .is_some_and(|cache| cache.entries.is_empty())
-        {
-            tenants.remove(&tenant);
-        }
-        drop(tenants);
-        let entry = evicted?;
-        let bytes = entry.reserved_bytes;
-        drop(entry);
-        Some(bytes)
     }
 
     /// Number of entries currently resident for `tenant`.
@@ -1466,8 +1480,8 @@ impl DecodedCaches {
     /// (ADR-3326 decision 4, pressure-evictor amendment): drop entries no
     /// reader holds, least-recently-used first across every tenant of both
     /// caches, until the dropped entries' [`DecodedEntry::reserved_bytes`]
-    /// reach `want` or no unheld entry remains, and return their sum. Every
-    /// byte returned was released to the budget by the time this returns.
+    /// reach `want`, and return their sum. Every byte returned was released
+    /// to the budget by the time this returns.
     ///
     /// An entry a resolve still holds an `Arc` to is skipped: it stays cached
     /// and its bytes count for nothing, since removing it would not release
@@ -1478,22 +1492,74 @@ impl DecodedCaches {
     /// came back. [`Self::evict_until_fits`], the catalog's own decode retry,
     /// keeps dropping held entries.
     ///
+    /// A shortfall no eviction can cover leaves the caches intact: when
+    /// `want` exceeds the summed reservation bytes of every unheld entry,
+    /// this drops nothing and returns 0, as
+    /// [`crate::Catalog::reserve_decoded`] declines its own pass for a decode
+    /// that could not fit with both caches empty. Emptying every tenant's
+    /// entries would not admit the refused reservation, so it would only
+    /// cost them a re-fetch and re-decode. A `want` exactly equal to that sum
+    /// drops every unheld entry.
+    ///
+    /// The whole pass runs under both caches' map locks, parts then postings
+    /// (no other path holds both). Every new handle to a cached value is
+    /// cloned by [`DecodedCache::get`] under its map lock, so the set of
+    /// unheld entries, and so the reclaimable sum, cannot change while the
+    /// pass holds them, and no concurrent resolve can insert an entry for the
+    /// pass to take: it walks only the unheld entries present when it
+    /// started, at most once each. The dropped values are released after
+    /// both locks are, so their deallocation holds off no `get` or `insert`.
+    ///
     /// Unlike [`Self::evict_until_fits`] this does not consult the budget's
     /// `reserved()`: the caller is a different consumer's refusal, not this
     /// catalog's own decode. Each dropped entry is counted on
     /// [`Self::memory_evictions`]; a skipped held entry is not.
     pub(crate) fn evict_for_pressure(&self, want: u64) -> u64 {
+        let mut parts = self.parts.tenants.lock();
+        let mut postings = self.postings.tenants.lock();
+        let mut candidates = Vec::new();
+        collect_unheld(&parts, PressureSide::Parts, &mut candidates);
+        collect_unheld(&postings, PressureSide::Postings, &mut candidates);
+        let reclaimable = candidates
+            .iter()
+            .fold(0u64, |sum, c| sum.saturating_add(c.reserved_bytes));
+        if want > reclaimable {
+            return 0;
+        }
+        candidates.sort_unstable_by_key(|c| c.use_tick);
+
         let mut freed = 0u64;
-        let mut dropped = 0u64;
-        while freed < want {
-            match self.evict_one_unheld_lru_bytes() {
-                Some(bytes) => {
-                    freed = freed.saturating_add(bytes);
-                    dropped += 1;
+        let mut dropped_parts = Vec::new();
+        let mut dropped_postings = Vec::new();
+        for candidate in candidates {
+            if freed >= want {
+                break;
+            }
+            let removed = match candidate.side {
+                PressureSide::Parts => {
+                    let entry =
+                        remove_tenant_entry(&mut parts, &candidate.tenant, candidate.use_tick);
+                    let found = entry.is_some();
+                    dropped_parts.extend(entry);
+                    found
                 }
-                None => break,
+                PressureSide::Postings => {
+                    let entry =
+                        remove_tenant_entry(&mut postings, &candidate.tenant, candidate.use_tick);
+                    let found = entry.is_some();
+                    dropped_postings.extend(entry);
+                    found
+                }
+            };
+            if removed {
+                freed = freed.saturating_add(candidate.reserved_bytes);
             }
         }
+        drop(postings);
+        drop(parts);
+        let dropped = (dropped_parts.len() + dropped_postings.len()) as u64;
+        drop(dropped_parts);
+        drop(dropped_postings);
         self.memory_evictions.fetch_add(dropped, Ordering::Relaxed);
         freed
     }
@@ -1527,30 +1593,6 @@ impl DecodedCaches {
         self.parts
             .evict_lru_bytes()
             .or_else(|| self.postings.evict_lru_bytes())
-    }
-
-    /// [`Self::evict_one_lru_bytes`] over the entries no reader holds
-    /// ([`DecodedCache::evict_lru_unheld_bytes`]), with the same stale-peek
-    /// caveat.
-    fn evict_one_unheld_lru_bytes(&self) -> Option<u64> {
-        let parts_first = match (
-            self.parts.lru_unheld_tick(),
-            self.postings.lru_unheld_tick(),
-        ) {
-            (Some(parts), Some(postings)) => parts <= postings,
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-        if parts_first {
-            if let Some(bytes) = self.parts.evict_lru_unheld_bytes() {
-                return Some(bytes);
-            }
-        } else if let Some(bytes) = self.postings.evict_lru_unheld_bytes() {
-            return Some(bytes);
-        }
-        self.parts
-            .evict_lru_unheld_bytes()
-            .or_else(|| self.postings.evict_lru_unheld_bytes())
     }
 
     /// Bytes the reservations of every entry in both caches carry
@@ -3538,6 +3580,154 @@ mod tests {
         assert_eq!(caches.reserved_bytes(), 9 << 40);
         assert_eq!(caches.byte_bound_evictions(), 0);
         assert_eq!(caches.byte_bound_refusals(), 0);
+    }
+
+    const PRESSURE_A: TenantHash = TenantHash([0x51; 16]);
+    const PRESSURE_B: TenantHash = TenantHash([0x52; 16]);
+
+    /// Both caches over two tenants, least-recently-used first: tenant a's
+    /// part "a1" (30 reserved bytes), tenant b's postings "b1" (20), tenant
+    /// a's postings "a2" (5), tenant b's part "b2" (100). The returned handle
+    /// to "b2" stands in for a resolve holding it, so the unheld entries hold
+    /// 55 bytes together and the caches 155.
+    fn pressure_fixture(
+        budget: &Arc<ravel_memory::MemoryBudget>,
+    ) -> (DecodedCaches, Arc<ChargedPart>) {
+        let caches = DecodedCaches::default();
+        caches.insert_part(
+            PRESSURE_A,
+            "a1".to_string(),
+            reserved_part(budget, 30),
+            1,
+            10,
+        );
+        caches.insert_postings(
+            PRESSURE_B,
+            "b1".to_string(),
+            reserved_postings(budget, 20),
+            1,
+            10,
+        );
+        caches.insert_postings(
+            PRESSURE_A,
+            "a2".to_string(),
+            reserved_postings(budget, 5),
+            1,
+            10,
+        );
+        caches.insert_part(
+            PRESSURE_B,
+            "b2".to_string(),
+            reserved_part(budget, 100),
+            1,
+            10,
+        );
+        let live = caches
+            .parts()
+            .get(&PRESSURE_B, "b2", &QueryAccounting::new())
+            .expect("b2 is cached");
+        assert_eq!(caches.reserved_bytes(), 155);
+        assert_eq!(budget.reserved(), 155);
+        (caches, live)
+    }
+
+    /// Issue #4015 review: a pressure shortfall larger than every unheld
+    /// entry's reservation bytes together cannot be covered by eviction, so
+    /// the pass leaves every entry of both caches cached, returns 0 and
+    /// counts nothing, rather than emptying every tenant for a refusal that
+    /// stands anyway.
+    ///
+    /// FLIP: delete the `if want > reclaimable { return 0; }` early return in
+    /// `DecodedCaches::evict_for_pressure`. The pass then drops all three
+    /// unheld entries and the first assertion reads 55, not 0.
+    #[test]
+    fn a_pressure_shortfall_beyond_every_unheld_entry_evicts_nothing() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let (caches, live) = pressure_fixture(&budget);
+
+        assert_eq!(caches.evict_for_pressure(56), 0);
+        assert_eq!(caches.parts().total_entries(), 2);
+        assert_eq!(caches.postings().total_entries(), 2);
+        assert_eq!(caches.reserved_bytes(), 155);
+        assert_eq!(budget.reserved(), 155);
+        assert_eq!(caches.memory_evictions(), 0);
+
+        assert_eq!(
+            caches.evict_for_pressure(u64::MAX),
+            0,
+            "a host-memory shortfall far above the caches frees nothing"
+        );
+        assert_eq!(caches.reserved_bytes(), 155);
+        assert_eq!(caches.memory_evictions(), 0);
+        drop(live);
+    }
+
+    /// The ceiling is inclusive: a shortfall exactly equal to the unheld
+    /// entries' reservation bytes drops every unheld entry, across both
+    /// caches and both tenants, and returns exactly that sum. The held entry
+    /// stays.
+    ///
+    /// FLIP: compare `want >= reclaimable` in place of `want > reclaimable`
+    /// in `DecodedCaches::evict_for_pressure`. The pass then evicts nothing
+    /// and the first assertion reads 0, not 55.
+    #[test]
+    fn a_pressure_shortfall_equal_to_the_unheld_entries_evicts_them_all() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let (caches, live) = pressure_fixture(&budget);
+
+        assert_eq!(caches.evict_for_pressure(55), 55);
+        assert!(!caches.parts().contains(&PRESSURE_A, "a1"));
+        assert!(!caches.postings().contains(&PRESSURE_B, "b1"));
+        assert!(!caches.postings().contains(&PRESSURE_A, "a2"));
+        assert!(caches.parts().contains(&PRESSURE_B, "b2"), "held, so kept");
+        assert_eq!(caches.parts().total_entries(), 1);
+        assert_eq!(caches.postings().total_entries(), 0);
+        assert_eq!(caches.memory_evictions(), 3);
+        assert_eq!(caches.reserved_bytes(), 100);
+        assert_eq!(budget.reserved(), 100, "the dropped entries came back");
+        drop(live);
+    }
+
+    /// A pressure pass takes only the entries present when it starts. A
+    /// concurrent insert cannot be placed inside the pass deterministically,
+    /// so this pins the bound through the eviction counter: asked for exactly
+    /// the starting entries' bytes while another thread inserts, the pass
+    /// counts exactly the starting entry count, and every entry the other
+    /// thread inserted is still cached, whichever side of the pass each
+    /// insert lands on. An insert landing before the pass is newer than every
+    /// starting entry, so the least-recently-used walk reaches `want` first.
+    #[test]
+    fn a_pressure_pass_evicts_only_the_entries_present_when_it_starts() {
+        const LATE: u64 = 64;
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let (caches, live) = pressure_fixture(&budget);
+        drop(live);
+        let starting_entries = caches.parts().total_entries() + caches.postings().total_entries();
+        assert_eq!(starting_entries, 4);
+
+        let late = TenantHash([0x53; 16]);
+        let freed = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 0..LATE {
+                    caches.insert_postings(
+                        late,
+                        format!("late-{i}"),
+                        reserved_postings(&budget, 1),
+                        1,
+                        1_000,
+                    );
+                }
+            });
+            caches.evict_for_pressure(155)
+        });
+
+        assert_eq!(freed, 155);
+        assert_eq!(caches.memory_evictions(), starting_entries as u64);
+        assert_eq!(caches.parts().total_entries(), 0);
+        assert_eq!(caches.postings().entry_count(&late), LATE as usize);
+        assert_eq!(caches.postings().total_entries(), LATE as usize);
+        assert_eq!(caches.reserved_bytes(), LATE);
+        assert_eq!(budget.reserved(), LATE);
     }
 
     // -----------------------------------------------------------------
