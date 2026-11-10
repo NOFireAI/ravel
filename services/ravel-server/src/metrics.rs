@@ -3392,7 +3392,7 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     write_header(
         out,
         "ravel_catalog_decoded_cache_memory_evictions_total",
-        "Decoded snapshot-part and name-postings cache entries the catalog dropped to make room for a refused decode reservation; moves only when the shared ADR-1170 process memory budget refuses a catalog decode reservation that dropping cached entries could admit, so it reads 0 where that budget is unlimited (gateway mode, or an unknown host memory size with no --memory-budget-bytes) and never moves on a refusal the host-memory gate made.",
+        "Decoded snapshot-part and name-postings cache entries the catalog dropped for a reservation the shared ADR-1170 process memory budget refused: by the budget's pressure evictor, for a refusal from any consumer (a SQL scan, a fetcher, a live reader or a catalog decode) by the ledger limit or the host-memory gate, and by the catalog's own retry of a decode the ledger limit refused. The pressure evictor drops only entries no query holds and does not count a held entry it skips. Reads 0 where that budget is unlimited (gateway mode, or an unknown host memory size with no --memory-budget-bytes) unless the decoded column-block cache is on there and the host-memory gate refuses a reservation while unheld entries are cached.",
         "counter",
     );
     write_sample(

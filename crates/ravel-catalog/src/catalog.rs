@@ -942,6 +942,14 @@ impl Catalog {
     /// though the cache has dropped it: eviction only ends a cache's claim on
     /// a value, never a reader's.
     ///
+    /// The rules below govern this method's own pass. An evictor registered
+    /// on the budget itself (the server's pressure evictor, which calls
+    /// [`Catalog::evict_decoded_for_pressure`]) runs inside the first
+    /// refusal, before any of them is reached, and for either exhaustion
+    /// cause; the unheld entries it drops are counted in
+    /// [`Catalog::decoded_cache_memory_evictions`] whatever this method then
+    /// does.
+    ///
     /// A decode that could not fit even if the caches gave back every byte
     /// they hold skips the pass entirely and keeps its first refusal: the
     /// test is `reserved - held + want > limit`, with `held` the caches'
@@ -1012,8 +1020,12 @@ impl Catalog {
         }
     }
 
-    /// Decoded-output cache entries dropped to make room for a refused decode
-    /// reservation, cumulative (ADR-1702 decision 6).
+    /// Decoded-output cache entries dropped for a refused reservation on this
+    /// catalog's budget, cumulative: by this catalog's own decode retry
+    /// (`Catalog::reserve_decoded`, ADR-1702 decision 6), which drops held
+    /// entries too, and by [`Catalog::evict_decoded_for_pressure`] for any
+    /// consumer's refusal of either exhaustion cause, which drops only
+    /// entries no reader holds (ADR-3326, pressure-evictor amendment).
     pub fn decoded_cache_memory_evictions(&self) -> u64 {
         self.decoded.memory_evictions()
     }
@@ -1021,11 +1033,18 @@ impl Catalog {
     /// Give memory back to another consumer's refused reservation on the
     /// shared [`ravel_memory::MemoryBudget`] (ADR-3326 decision 4,
     /// pressure-evictor amendment): drop this catalog's decoded parts and
-    /// postings cache entries, least-recently-used first across every
-    /// tenant, until the evicted entries' reservation bytes reach `want` or
-    /// no entry remains, and return their sum. This evicts whether or not a
-    /// decoded-cache byte bound is configured. Each entry dropped this way is
-    /// counted in [`Catalog::decoded_cache_memory_evictions`].
+    /// postings cache entries that no reader holds, least-recently-used
+    /// first across every tenant, until the dropped entries' reservation
+    /// bytes reach `want` or no unheld entry remains, and return their sum.
+    /// Every byte returned is back in the budget when this returns. An entry
+    /// a live resolve still holds an `Arc` to stays cached and counts for
+    /// nothing, as the decoded column-block cache treats a held entry:
+    /// dropping it would not release its reservation, and a host-memory gate
+    /// refusal is admitted when the evictor reports the shortfall freed. This
+    /// evicts whether or not a decoded-cache byte bound is configured. Each
+    /// entry dropped this way is counted in
+    /// [`Catalog::decoded_cache_memory_evictions`]; a held entry it skips is
+    /// not.
     pub fn evict_decoded_for_pressure(&self, want: u64) -> u64 {
         self.decoded.evict_for_pressure(want)
     }
@@ -14191,6 +14210,228 @@ mod tests {
         // nothing more.
         assert_eq!(catalog.evict_decoded_for_pressure(1), 0);
         assert_eq!(catalog.decoded_cache_memory_evictions(), 3);
+    }
+
+    /// Registers on `budget` what the server's pressure evictor reduces to
+    /// with no decoded column-block cache attached: slack 0, and
+    /// `Catalog::evict_decoded_for_pressure` asked for the whole `want`.
+    /// Returns the freed bytes each call reported, in call order.
+    fn register_catalog_pressure_evictor(
+        budget: &ravel_memory::MemoryBudget,
+        catalog: &Arc<Catalog>,
+    ) -> Arc<parking_lot::Mutex<Vec<u64>>> {
+        let reported = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = Arc::clone(&reported);
+        let weak = Arc::downgrade(catalog);
+        let registered = budget.register_evictor(
+            Box::new(move |want, _cause| {
+                let freed = weak
+                    .upgrade()
+                    .map_or(0, |catalog| catalog.evict_decoded_for_pressure(want));
+                log.lock().push(freed);
+                freed
+            }),
+            0,
+        );
+        assert!(registered.is_ok(), "the budget had no evictor yet");
+        reported
+    }
+
+    const HELD_FIXTURE_HOUR: u32 = 500_000;
+    const HELD_FIXTURE_TENANT: TenantHash = TenantHash([0x91; 16]);
+
+    /// One folded part for [`HELD_FIXTURE_TENANT`]; returns the store and
+    /// the part's declared length, which is its reservation bytes.
+    async fn held_part_fixture() -> (Arc<MemoryStore>, u64) {
+        let store = Arc::new(MemoryStore::new());
+        let part = fold_one_part_for(&store, HELD_FIXTURE_TENANT, HELD_FIXTURE_HOUR, 2).await;
+        (store, part)
+    }
+
+    /// A catalog charging `budget` whose part cache holds the fixture's one
+    /// part, `part` bytes, and a live handle to that cached part standing in
+    /// for a resolve still holding it.
+    async fn catalog_with_a_held_part(
+        store: &Arc<MemoryStore>,
+        budget: &Arc<ravel_memory::MemoryBudget>,
+        part: u64,
+    ) -> (Arc<Catalog>, Arc<crate::charged::ChargedPart>) {
+        let catalog = Arc::new(
+            Catalog::new(store.clone(), config(1))
+                .expect("catalog")
+                .with_memory_budget(budget.clone()),
+        );
+        catalog
+            .resolve(
+                &HELD_FIXTURE_TENANT,
+                Signal::Metrics,
+                sealed_hour_range(HELD_FIXTURE_HOUR),
+                &[],
+                fold_now_ns(HELD_FIXTURE_HOUR),
+            )
+            .await
+            .expect("the fixture tenant resolves within the budget");
+        assert_eq!(budget.reserved(), part);
+        assert_eq!(catalog.part_cache().total_entries(), 1);
+        let part_key = fixture_part_key(store, HELD_FIXTURE_TENANT).await;
+        let live = catalog
+            .part_cache()
+            .get(&HELD_FIXTURE_TENANT, &part_key, &QueryAccounting::new())
+            .expect("the fixture's part is cached");
+        (catalog, live)
+    }
+
+    /// Issue #4015 review: a host-memory gate refusal is admitted by the
+    /// budget when the evictor reports at least the gate's shortfall freed,
+    /// so `Catalog::evict_decoded_for_pressure` must not report the bytes of
+    /// an entry a reader still holds. Here the only cached entry is held and
+    /// its bytes would exactly cover the shortfall: the evictor reports 0,
+    /// the entry stays cached, and the refusal stands. Once the reader lets
+    /// go, the same refusal frees exactly that entry's bytes and is admitted.
+    ///
+    /// FLIP: in `DecodedCaches::evict_for_pressure` (cache.rs), call
+    /// `self.evict_one_lru_bytes()` instead of
+    /// `self.evict_one_unheld_lru_bytes()`. The held entry is dropped and its
+    /// bytes reported, so `try_reserve(1)` is admitted and the `expect_err`
+    /// below panics.
+    #[tokio::test]
+    async fn a_held_entry_frees_nothing_for_a_host_memory_refusal() {
+        let (store, part) = held_part_fixture().await;
+        assert!(part > 1, "the shortfall below must be above one byte");
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let (catalog, live) = catalog_with_a_held_part(&store, &budget, part).await;
+        let reported = register_catalog_pressure_evictor(&budget, &catalog);
+
+        // A refused `try_reserve(1)` under this gate has a shortfall of
+        // `floor - available + 1`, which is `part`.
+        budget.set_host_memory_gate(false, 0, part - 1);
+        let refusal = budget
+            .try_reserve(1)
+            .expect_err("a held entry frees no host memory, so the gate's refusal stands");
+        assert_eq!(
+            refusal.cause,
+            ravel_memory::ExhaustionCause::HostMemory {
+                available: 0,
+                floor: part - 1,
+            }
+        );
+        assert_eq!(
+            *reported.lock(),
+            vec![0],
+            "the held entry counts as nothing"
+        );
+        assert_eq!(
+            catalog.part_cache().total_entries(),
+            1,
+            "a held entry stays cached"
+        );
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
+        assert_eq!(budget.reserved(), part);
+
+        drop(live);
+        budget
+            .try_reserve(1)
+            .expect("the unheld entry frees the gate's whole shortfall");
+        assert_eq!(*reported.lock(), vec![0, part], "exactly the entry's bytes");
+        assert_eq!(catalog.part_cache().total_entries(), 0);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 1);
+        assert_eq!(budget.reserved(), 1, "the entry's reservation came back");
+        budget.release(1);
+    }
+
+    /// The same held entry under an accounted refusal: the evictor reports 0,
+    /// leaves the entry cached and counts nothing, and the refusal stands
+    /// with the ledger unchanged.
+    ///
+    /// FLIP: the one in
+    /// `a_held_entry_frees_nothing_for_a_host_memory_refusal`. The refusal
+    /// still stands (the held reservation is still on the ledger), but the
+    /// evictor reports `part` and the `reported` assertion fails.
+    #[tokio::test]
+    async fn a_held_entry_frees_nothing_for_an_accounted_refusal() {
+        let (store, part) = held_part_fixture().await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(part));
+        let (catalog, live) = catalog_with_a_held_part(&store, &budget, part).await;
+        let reported = register_catalog_pressure_evictor(&budget, &catalog);
+
+        let refusal = budget
+            .try_reserve(1)
+            .expect_err("the held entry keeps the whole limit reserved");
+        assert_eq!(refusal.cause, ravel_memory::ExhaustionCause::Accounted);
+        assert_eq!(refusal.reserved, part);
+        assert_eq!(
+            *reported.lock(),
+            vec![0],
+            "the held entry counts as nothing"
+        );
+        assert_eq!(budget.reserved(), part, "the ledger is unchanged");
+        assert_eq!(catalog.part_cache().total_entries(), 1);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
+        drop(live);
+    }
+
+    /// A pressure pass walks past a held least-recently-used entry to the
+    /// next one no reader holds, drops that one, and leaves the held entry
+    /// cached.
+    ///
+    /// FLIP: in `DecodedCache::evict_lru_unheld_bytes` (cache.rs), drop the
+    /// least-recently-used entry whether held or not (`lru_tick()` in place
+    /// of `lru_unheld_tick()`) and report 0 bytes for a held one. The pass
+    /// then drops the held entry, so `entry_count(&tenants[0])` reads 0, not
+    /// 1.
+    #[tokio::test]
+    async fn a_pressure_pass_skips_a_held_entry_and_takes_the_next_unheld_one() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        let tenants = [TenantHash([0xa1; 16]), TenantHash([0xa2; 16])];
+        let mut sizes = Vec::new();
+        for (i, tenant_hash) in tenants.iter().enumerate() {
+            sizes.push(fold_one_part_for(&store, *tenant_hash, sealed_hour, i as u64 + 1).await);
+        }
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        for tenant_hash in &tenants {
+            catalog
+                .resolve(tenant_hash, Signal::Metrics, range, &[], now_ns)
+                .await
+                .expect("resolve fills the part cache");
+        }
+        assert_eq!(budget.reserved(), sizes[0] + sizes[1]);
+        // `get` refreshes recency, so tenant 1's entry is touched after the
+        // handle to tenant 0's is taken: tenant 0's stays the
+        // least-recently-used entry, and it is the held one.
+        let coldest_key = fixture_part_key(&store, tenants[0]).await;
+        let live = catalog
+            .part_cache()
+            .get(&tenants[0], &coldest_key, &QueryAccounting::new())
+            .expect("tenant 0's part is cached");
+        let warm_key = fixture_part_key(&store, tenants[1]).await;
+        let touched = catalog
+            .part_cache()
+            .get(&tenants[1], &warm_key, &QueryAccounting::new())
+            .expect("tenant 1's part is cached");
+        drop(touched);
+
+        assert_eq!(catalog.evict_decoded_for_pressure(1), sizes[1]);
+        assert_eq!(
+            catalog.part_cache().entry_count(&tenants[0]),
+            1,
+            "the held entry stays cached"
+        );
+        assert_eq!(catalog.part_cache().entry_count(&tenants[1]), 0);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 1);
+        assert_eq!(budget.reserved(), sizes[0], "the unheld entry came back");
+        assert_eq!(
+            catalog.evict_decoded_for_pressure(1),
+            0,
+            "only a held entry remains"
+        );
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 1);
+        drop(live);
     }
 
     /// A decode no budget could ever admit fails on its FIRST refusal, with no

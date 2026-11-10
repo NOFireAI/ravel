@@ -1799,7 +1799,8 @@ The host-memory gate amendment's gate sits in front of the same budget, so
 the catalog inherits it. A catalog decode the gate refuses (the
 `HostMemory` cause) skips the eviction pass and fails at once as a budget
 refusal: dropping cached entries frees bytes the ledger counts, not the host
-memory the gate measured. Such a refusal moves neither
+memory the gate measured (this sentence and the next are superseded by the
+pressure-evictor counter amendment below). Such a refusal moves neither
 `ravel_catalog_decode_reserve_retries_total` nor
 `ravel_catalog_decoded_cache_memory_evictions_total`.
 
@@ -1820,7 +1821,8 @@ the remainder starts from `u64::MAX`; there the catalog's behaviour is
 unchanged, no decoded-cache byte bound is set, and
 `ravel_catalog_decode_reserve_retries_total`,
 `ravel_catalog_decoded_cache_memory_evictions_total` and the two byte-bound
-counters read 0.
+counters read 0 (the pressure-evictor counter amendment below names the one
+case where the evictions counter moves there).
 
 `a_part_decode_over_the_process_budget_answers_422`,
 `the_catalog_charges_the_servers_own_budget` and
@@ -1925,3 +1927,55 @@ under the ladder bound `5 x 117,440,512`.
 `a_65_wide_layout_keeps_its_ladders_apart_and_takes_the_smaller_bound` over
 a synthetic layout. `the_aggregate_profile_of_the_six_measured_statements`
 in `crates/ravel-sql/src/executor.rs` pins q33's layout at 16, 56, 16.
+
+## Amendment (2026-11-10, issue #4015): the pressure evictor moves the catalog's evictions counter
+
+<!-- amendment-applies: sections="Amendment (2026-10-26, issue #3244): catalog decodes are charged to the shared budget" pointer="pressure-evictor counter amendment" -->
+<!-- amendment-supersedes: phrase="Such a refusal moves neither" pointer="pressure-evictor counter amendment" -->
+<!-- amendment-supersedes: phrase="and the two byte-bound counters read 0" pointer="pressure-evictor counter amendment" -->
+
+This is the pressure-evictor counter amendment. ADR-3326's pressure-evictor
+amendment (issue #4015) registers one evictor on the process budget,
+whenever the budget is bounded and, under an unlimited budget, whenever the
+decoded column-block cache is on. A reservation the budget refuses, from
+any consumer and for either exhaustion cause, asks the decoded column-block
+cache and then the catalog's decoded part and postings caches
+(`Catalog::evict_decoded_for_pressure`) to give memory back before the
+budget retries it. The catalog decode charge amendment above described the
+catalog's caches answering only the catalog's own refused decode, and three
+of its statements no longer hold:
+
+- Where the evictor is registered, a catalog decode the host-memory gate
+  refuses no longer fails at once. The evictor runs inside that refusal
+  like any other, and the
+  budget admits the reservation on the ledger alone when the evictor reports
+  at least the gate's shortfall freed. The catalog's own eviction pass and
+  retry are still skipped for that cause, so
+  `ravel_catalog_decode_reserve_retries_total` still does not move.
+- `ravel_catalog_decoded_cache_memory_evictions_total` counts the entries
+  the pressure evictor drops as well as those the catalog's own retry
+  drops. It moves on a SQL scan's, a fetcher's or a live reader's refusal,
+  and on a host-memory gate refusal.
+- Under an unlimited budget it still reads 0 unless the decoded
+  column-block cache is on: that cache installs the evictor there, and the
+  host-memory gate's refusals reach it. The retries counter and the two
+  byte-bound counters still read 0 there.
+
+The catalog's pressure pass takes only entries no reader holds. An entry a
+resolve still holds an `Arc` to stays cached and counts neither as freed
+bytes nor on the evictions counter, because removing it would not release
+its reservation. Without that rule a host-memory refusal would be admitted
+on the bytes of an entry nothing had released, while the host stayed below
+the gate's floor. The catalog's own retry keeps dropping held entries, and
+counts them, as before.
+
+The counter's HELP text in `services/ravel-server/src/metrics.rs` states
+all of this, and `the_fetch_gauge_counts_the_catalogs_held_decodes` in
+`services/ravel-server/tests/catalog_memory_budget_e2e.rs` pins it.
+`a_held_entry_frees_nothing_for_a_host_memory_refusal`,
+`a_held_entry_frees_nothing_for_an_accounted_refusal` and
+`a_pressure_pass_skips_a_held_entry_and_takes_the_next_unheld_one` in
+`crates/ravel-catalog/src/catalog.rs` pin the held-entry rule, and
+`a_host_memory_refusal_evicts_the_catalog_cache` in
+`services/ravel-server/src/pressure_evictor.rs` pins the counter moving on
+a host-memory gate refusal.
