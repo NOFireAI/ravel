@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b16429a99987f4ed2d58dd2962827aa980816e625356bbfbd8b2b9175aed9eb9 # shrinks to case = KeyCase { key_type: ("Int32", 4), null_every: None, skew: 0, hot: 0, mult: 1, modulus: 7009, partitions: 2, phase_1: true }
