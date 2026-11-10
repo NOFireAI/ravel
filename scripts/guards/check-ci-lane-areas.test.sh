@@ -51,10 +51,10 @@ lanes_for() {
 # FLIP: give crates/ravel-ingest's row `-` in a copy of the map (what today's
 # path rules say for it, object_store_area only) and this prints nothing.
 got="$(lanes_for crates/ravel-ingest/src/lib.rs)"
-if [[ "${got}" == "sql flight-sql agents mcp" ]]; then
-  ok "edit under crates/ravel-ingest/ sets sql, flight-sql, agents and mcp"
+if [[ "${got}" == "sql flight-sql agents mcp promql" ]]; then
+  ok "edit under crates/ravel-ingest/ sets sql, flight-sql, agents, mcp and promql"
 else
-  not_ok "edit under crates/ravel-ingest/ sets sql, flight-sql, agents and mcp" "got '${got}'"
+  not_ok "edit under crates/ravel-ingest/ sets sql, flight-sql, agents, mcp and promql" "got '${got}'"
 fi
 
 # FLIP: make the lookup fall back to every lane when no row holds a path (a
@@ -118,6 +118,34 @@ if [[ "${got}" == "${ALL}" ]]; then
   ok "changes step: edit under crates/ravel-ingest/ sets all four areas"
 else
   not_ok "changes step: edit under crates/ravel-ingest/ sets all four areas" "got '${got}'"
+fi
+
+# FLIP: drop the step's `promql) promql_area=true ;;` arm, or the promql
+# lane from the guard's lanes_for_closure, and an edit confined to
+# crates/ravel-ingest/ leaves promql_area false: no path rule sets it there,
+# though ravel-promql-difftest depends on ravel-ingest and its required check
+# would be skipped.
+promql_for() {
+  local out="${TMP}/github-output-promql" rc=0
+  : >"${out}"
+  (cd "${REPO}" && CHANGED="$(printf '%s\n' "$@")" GITHUB_OUTPUT="${out}" bash -e "${STEP}" >/dev/null 2>&1) || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    printf 'exit=%s' "${rc}"
+    return
+  fi
+  grep -E '^promql_area=' "${out}"
+}
+got="$(promql_for crates/ravel-ingest/src/lib.rs)"
+if [[ "${got}" == "promql_area=true" ]]; then
+  ok "changes step: edit under crates/ravel-ingest/ sets promql_area"
+else
+  not_ok "changes step: edit under crates/ravel-ingest/ sets promql_area" "got '${got}'"
+fi
+got="$(promql_for docs/ingest.md)"
+if [[ "${got}" == "promql_area=false" ]]; then
+  ok "changes step: edit under docs/ leaves promql_area false"
+else
+  not_ok "changes step: edit under docs/ leaves promql_area false" "got '${got}'"
 fi
 
 # FLIP: emit every area true on the docs/formal-only branch and this reads
