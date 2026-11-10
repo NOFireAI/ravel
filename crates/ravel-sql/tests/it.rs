@@ -50,6 +50,8 @@ mod execute_analyzed;
 mod expr_planner_surface;
 #[path = "extract_field.rs"]
 mod extract_field;
+#[path = "final_exchange_floor.rs"]
+mod final_exchange_floor;
 #[path = "first_groups.rs"]
 mod first_groups;
 #[path = "flight.rs"]

@@ -38,7 +38,10 @@
 //! - spill is a retry after a memory refusal (issue #3899): a reserve-ahead
 //!   refusal of the aggregate makes it spill on the retry, and a refused
 //!   ineligible statement is not retried. `spill_retry.rs` pins the first
-//!   attempt of a statement that fits.
+//!   attempt of a statement that fits;
+//! - the first attempt's 16-partition floor on the final aggregate's hash
+//!   exchange answers in memory under a process budget on which the engine
+//!   count of 8 takes the spill retry (issue #4014).
 //!
 //! # Where each test drives the spill from
 //!
@@ -201,6 +204,7 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
+        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill: Some(SpillConfig {
@@ -870,6 +874,7 @@ fn parallel_config(spill: Option<SpillConfig>) -> SqlConfig {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
+        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill,
@@ -945,6 +950,12 @@ async fn a_spill_enabled_query_gets_no_unclassified_repartition_exec() {
     assert!(
         control_plan.contains("AggregateExec: mode=FinalPartitioned"),
         "the control's final aggregate must be the fanned-out one; got:\n{control_plan}"
+    );
+    // Issue #4014: the default floor widened the control's exchange from the
+    // session's 8 to 16; the subject below has no exchange for it to widen.
+    assert!(
+        control_plan.contains(", 16), input_partitions=8"),
+        "the control's exchange is at the first-attempt floor; got:\n{control_plan}"
     );
 
     // Subject: the identical statement with spill configured. Eligible, so the
@@ -1031,6 +1042,7 @@ async fn spill_off_reproduces_todays_refusal() {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         bounded_groups_max_limit: ravel_sql::DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
         bounded_top_keys_max_limit: ravel_sql::DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
+        first_attempt_min_partitions: ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
         partition_topk_max_limit: Some(ravel_sql::DEFAULT_PARTITION_TOPK_MAX_LIMIT),
         bucketed_final_aggregation: None,
         spill: None,
@@ -2078,6 +2090,95 @@ async fn a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry() 
         msg.contains("aggregate reserve-ahead refused"),
         "the refusal names the reserve-ahead envelope; got {msg:?}"
     );
+}
+
+/// The process budgets [`the_partition_floor_answers_in_memory_where_the_engine_count_retries`]
+/// tries, in tenths of the engine count's unlimited peak.
+const FLOOR_BUDGET_TENTHS: std::ops::RangeInclusive<u64> = 10..=30;
+
+/// Issue #4014: at an engine count of 8, the q33 grouping's first attempt,
+/// with the hash exchange under its final aggregate widened to the
+/// 16-partition floor, answers in memory under a process budget on which the
+/// same attempt with an 8-partition exchange is refused and takes the spill
+/// retry. Twice the final-aggregate partitions halve each hash table, and with
+/// it the reserve-ahead envelope of the next doubling the process ledger holds
+/// for the widest tables.
+///
+/// The budget is the smallest of [`FLOOR_BUDGET_TENTHS`] the floored attempt
+/// fits, because the ledger's width is the host's parallelism capped at the
+/// engine count, so the envelope total moves with the host. On a 4-core aarch64
+/// host the unlimited peaks were 20,317,760 bytes at 16 partitions and
+/// 21,630,240 at 8; the floored attempt fit from 14 tenths (30,282,336 bytes)
+/// and the 8-partition attempt from 19 (41,097,456).
+///
+/// Prove-the-test: return `Transformed::no` at the top of
+/// `FinalExchangeFloor::rewrite` and the floored run takes the spill retry on
+/// every budget of the ladder, so no budget is found.
+#[tokio::test]
+async fn the_partition_floor_answers_in_memory_where_the_engine_count_retries() {
+    let sql = "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10";
+    let file = q33_parquet();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |floor: usize| {
+        let mut config = spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            RESERVE_AHEAD_QUERY_BYTES,
+        );
+        config.engine.sql_partition_count = Some(8);
+        config.parallel_final_aggregation = true;
+        config.first_attempt_min_partitions = floor;
+        config
+    };
+    let run_under = async |floor, budget| {
+        let process = Arc::new(ravel_memory::MemoryBudget::new(budget));
+        run_top_ten(&*q33_executor_in(config(floor), &file, process).await, sql).await
+    };
+
+    let unlimited = run_top_ten(&*q33_executor(config(0), &file).await, sql).await;
+    assert_eq!(
+        (unlimited.spill_retries, unlimited.spill_files),
+        (0, 0),
+        "with an unlimited process budget the statement answers on its first attempt"
+    );
+    assert_eq!(unlimited.rows.len(), 10);
+
+    let mut fit = None;
+    for tenths in FLOOR_BUDGET_TENTHS {
+        let budget = unlimited.peak_pool_bytes * tenths / 10;
+        if run_under(16, budget).await.spill_retries == 0 {
+            fit = Some(budget);
+            break;
+        }
+    }
+    let budget = fit.expect("the floored first attempt fits some budget of the ladder");
+
+    let floored = run_under(16, budget).await;
+    assert_eq!(
+        (
+            floored.spill_retries,
+            floored.first_refusal,
+            floored.spill_files
+        ),
+        (0, None, 0),
+        "at the floor the statement answers on its first attempt under {budget} bytes"
+    );
+    assert_eq!(floored.rows, unlimited.rows, "row for row");
+
+    let engine = run_under(0, budget).await;
+    assert_eq!(
+        engine.spill_retries, 1,
+        "at the engine count the statement takes the spill retry under {budget} bytes"
+    );
+    assert!(
+        matches!(
+            engine.first_refusal,
+            Some("aggregate_reserve_ahead" | "process_budget")
+        ),
+        "the first attempt was refused by the process budget; got {:?}",
+        engine.first_refusal
+    );
+    assert_eq!(engine.rows, unlimited.rows, "row for row");
 }
 
 /// Issue #3899: a statement refused for memory that is not spill-eligible

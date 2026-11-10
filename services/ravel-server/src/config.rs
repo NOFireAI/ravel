@@ -4477,6 +4477,12 @@ pub struct QueryBudgets {
     /// shape as [`Self::store_get_concurrency`]. Reaches
     /// `EngineConfig::sql_partition_count`.
     pub sql_partition_count: usize,
+    /// Where [`Self::sql_partition_count`] came from, one of the
+    /// `PERF_SOURCE_*` constants [`resolve_performance_defaults`] gave it.
+    /// `query::resolve_sql_first_attempt_partitions` reads it to keep the
+    /// final-exchange partition floor (issue #4014) off an operator's explicit
+    /// count.
+    pub sql_partition_count_source: &'static str,
     /// The resolved PromQL fetch fan-out width (ADR-1195), same resolution
     /// shape as [`Self::store_get_concurrency`]. Reaches
     /// `EngineConfig::promql_fetch_fanout`.
@@ -4590,6 +4596,7 @@ impl Default for QueryBudgets {
             fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
             store_get_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
             sql_partition_count: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            sql_partition_count_source: PERF_SOURCE_DERIVED,
             promql_fetch_fanout: ravel_query::DEFAULT_FETCH_CONCURRENCY,
             max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
             max_series: ravel_query::DEFAULT_MAX_SERIES,
@@ -8370,6 +8377,7 @@ impl Cli {
             fetch_concurrency: resolved.fetch_concurrency,
             store_get_concurrency: resolved.store_get_concurrency,
             sql_partition_count: resolved.sql_partition_count,
+            sql_partition_count_source: resolved.sources.sql_partition_count,
             promql_fetch_fanout: resolved.promql_fetch_fanout,
             max_segments: resolved.max_segments,
             max_series: resolved.max_series,
