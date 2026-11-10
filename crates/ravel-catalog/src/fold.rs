@@ -1277,8 +1277,14 @@ struct RetireTracker {
 
 impl RetireTracker {
     /// The retirable parts of `previous`: every part but the last that
-    /// carries key-index leaves. `leaf_switch_on` false leaves it empty, so
-    /// every tombstone takes the re-encode path.
+    /// carries key-index leaves and lies within one UTC day. `leaf_switch_on`
+    /// false leaves it empty, so every tombstone takes the re-encode path.
+    ///
+    /// A longer part (a switch-off fold wrote it, and the key-index rebuild
+    /// attached its leaves) is never retirable: the switch-on partition seals
+    /// at every UTC day, so no span reproduces its bytes and it can never be
+    /// carried by reference. Its tombstoned buckets take the re-encode path,
+    /// and the part re-encodes this fold without them.
     fn of_head(previous: Option<&SnapshotHead>, leaf_switch_on: bool) -> Self {
         let ranges = match previous {
             Some(head) if leaf_switch_on => {
@@ -1286,6 +1292,9 @@ impl RetireTracker {
                 head.parts[..sealed]
                     .iter()
                     .filter(|part| !part.key_index.is_empty())
+                    .filter(|part| {
+                        utc_day_of_hour(part.min_hour) == utc_day_of_hour(part.watermark_hour)
+                    })
                     .map(|part| (part.min_hour, part.watermark_hour))
                     .collect()
             }
@@ -17812,6 +17821,189 @@ pub(crate) mod tests {
             .collect();
         writers.sort_unstable();
         assert_eq!(writers, vec![2, 3, 4, 5], "hour 20's writer 1 is gone");
+    }
+
+    /// Writers 1 (hour 22) and 2 (hour 23) on day d, 3 (hour 24) and 4
+    /// (hour 26) on day d + 1. A switch-off fold under a threshold of 3
+    /// seals hours 22 to 24 into one part spanning both days, and the
+    /// key-index rebuild attaches leaves to it and to the tail. Returns that
+    /// HEAD and the four records in writer order.
+    async fn multi_day_leaf_part(
+        store: &Arc<OpLogStore>,
+        folder: Uuid,
+    ) -> (SnapshotHead, Vec<CommitRecord>) {
+        declare_user_id_key_index(store.as_ref()).await;
+        let mut records = Vec::new();
+        for (seq, hour) in [
+            (1u64, DAY_D + 22),
+            (2, DAY_D + 23),
+            (3, DAY_D + 24),
+            (4, DAY_D + 26),
+        ] {
+            let (record, _) =
+                publish_user_id_logs(store.as_ref(), seq, hour, &[seq as i64], 2, 0, true).await;
+            records.push(record);
+        }
+        let off = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                snapshot_part_max_entries: 3,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        off.fold(
+            &tenant(),
+            Signal::Logs,
+            folder,
+            now_at_seal(DAY_D + 26),
+            &[],
+            None,
+        )
+        .await
+        .expect("fold");
+        off.rebuild_key_index(&tenant(), Signal::Logs, &Default::default())
+            .await
+            .expect("repair");
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            head.parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour, p.entry_count))
+                .collect::<Vec<_>>(),
+            vec![(DAY_D + 22, DAY_D + 24, 3), (DAY_D + 26, DAY_D + 26, 1)],
+            "the first part spans days d and d + 1"
+        );
+        assert!(head.parts.iter().all(|p| !p.key_index.is_empty()));
+        (head, records)
+    }
+
+    /// Tombstones `hours` over [`multi_day_leaf_part`]'s HEAD, publishes
+    /// writer 5 (hour 27), clears the op log and folds through hour 27 with
+    /// the leaf switch on under the same threshold.
+    async fn retire_in_multi_day_part(store: &Arc<OpLogStore>, folder: Uuid, hours: &[u32]) {
+        for &hour in hours {
+            publish_logs_tombstone(store.as_ref(), hour).await;
+        }
+        publish_user_id_logs(store.as_ref(), 5, DAY_D + 27, &[5], 2, 0, true).await;
+        store.clear();
+        let on = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                snapshot_part_max_entries: 3,
+                ..kidx_config()
+            },
+        )
+        .expect("catalog");
+        on.fold(
+            &tenant(),
+            Signal::Logs,
+            folder,
+            now_at_seal(DAY_D + 27),
+            &[],
+            None,
+        )
+        .await
+        .expect("fold");
+    }
+
+    /// ADR-3939 decision 6: once every hour of day d that a part spanning
+    /// days d and d + 1 holds is tombstoned, the part re-encodes in the same
+    /// fold without day d. No entry of day d remains in HEAD, day d + 1's
+    /// entries are carried from the previous leaves with no section GET, no
+    /// ref carries retired hours, and HEAD is version 1. The part is not
+    /// retirable at all, so its tombstoned buckets take the re-encode path.
+    #[tokio::test]
+    async fn a_fully_retired_day_in_a_multi_day_part_re_encodes_the_part() {
+        let store = OpLogStore::empty();
+        let folder = Uuid::from_u128(11);
+        let (first, records) = multi_day_leaf_part(&store, folder).await;
+        retire_in_multi_day_part(&store, folder, &[DAY_D + 22, DAY_D + 23]).await;
+        let second = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            second
+                .parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour, p.entry_count))
+                .collect::<Vec<_>>(),
+            vec![(0, DAY_D + 27, 3)],
+            "day d left HEAD; day d + 1 is the one part"
+        );
+        assert!(!second.parts.iter().any(|p| p.key == first.parts[0].key));
+        assert_eq!(head_writers(store.as_ref(), &second).await, vec![3, 4, 5]);
+        assert!(
+            second.parts.iter().all(|p| p.retired_hours.is_empty()),
+            "{second:?}"
+        );
+        assert_eq!(second.format_version, HEAD_FORMAT_VERSION_1);
+        assert_eq!(
+            store.section_gets_of(&[&records[2], &records[3]]),
+            0,
+            "day d + 1's previous entries are carried from their leaves"
+        );
+        assert!(
+            RetireTracker::of_head(Some(&first), true).ranges.is_empty(),
+            "a part spanning two UTC days is not retirable"
+        );
+    }
+
+    /// ADR-3939 decision 6: a tombstone in one hour of day d in the same
+    /// multi-day part is not recorded as a retired hour, since the part can
+    /// never be carried by reference with the leaf switch on. The fold
+    /// splits it at the day boundary in the same fold, drops hour 22's
+    /// entries, PUTs day d's new part over hour 23 alone, and writes a
+    /// version 1 HEAD with no retired hours.
+    #[tokio::test]
+    async fn a_partly_retired_day_in_a_multi_day_part_re_encodes_the_part() {
+        let store = OpLogStore::empty();
+        let folder = Uuid::from_u128(12);
+        let (first, _) = multi_day_leaf_part(&store, folder).await;
+        retire_in_multi_day_part(&store, folder, &[DAY_D + 22]).await;
+        let second = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            second
+                .parts
+                .iter()
+                .map(|p| (p.min_hour, p.watermark_hour, p.entry_count))
+                .collect::<Vec<_>>(),
+            vec![(DAY_D + 23, DAY_D + 23, 1), (DAY_D + 24, DAY_D + 27, 3)],
+            "the part is split at the day boundary without hour 22"
+        );
+        assert_eq!(store.part_puts().first(), Some(&second.parts[0].key));
+        assert_eq!(head_writers(store.as_ref(), &second).await, vec![2, 3, 4, 5]);
+        assert!(
+            second.parts.iter().all(|p| p.retired_hours.is_empty()),
+            "{second:?}"
+        );
+        assert_eq!(second.format_version, HEAD_FORMAT_VERSION_1);
+        assert!(
+            RetireTracker::of_head(Some(&first), true).ranges.is_empty(),
+            "a part spanning two UTC days is not retirable"
+        );
+    }
+
+    /// ADR-3939 decision 6 with acceptance A4: two runs of
+    /// [`a_fully_retired_day_in_a_multi_day_part_re_encodes_the_part`] into
+    /// two fresh stores, under the same clock, folder id and config, write
+    /// byte-identical HEADs.
+    #[tokio::test]
+    async fn folds_that_re_encode_a_multi_day_part_write_identical_heads() {
+        let fold_into = || async move {
+            let store = OpLogStore::empty();
+            let folder = Uuid::from_u128(13);
+            multi_day_leaf_part(&store, folder).await;
+            retire_in_multi_day_part(&store, folder, &[DAY_D + 22, DAY_D + 23]).await;
+            store
+                .get(&head_object_key(&tenant(), Signal::Logs), GetRange::Full)
+                .await
+                .expect("head present")
+                .data
+        };
+        let one = fold_into().await;
+        let two = fold_into().await;
+        assert_eq!(one, two, "byte-identical HEADs");
+        let head = snapshot_format::decode_head(&one).expect("head decodes");
+        assert_eq!(head.parts.len(), 1, "{head:?}");
     }
 
     /// A monotonic clock a test steps past the HEAD cache's TTL, so a
