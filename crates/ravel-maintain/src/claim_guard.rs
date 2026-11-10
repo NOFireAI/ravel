@@ -519,13 +519,15 @@ impl ClaimGuard {
     }
 
     /// This guard's configured lease, in whole milliseconds, floored at 1 and
-    /// capped at [`claim::MAX_OBSERVED_LEASE_MS`]. The observation applies the
-    /// same clamp before it prices a jitter, so the jitter this guard waits
-    /// out before a steal is the figure the observation computes from the
-    /// same lease, and a lease configured above 24 h cannot widen that wait
-    /// past `jitter_span_fraction` of 24 h. In the unreadable-claim recheck cap the
-    /// clamp changes nothing: for a lease at or above the ceiling the steal
-    /// threshold is always the earlier of the two points.
+    /// capped at [`claim::MAX_OBSERVED_LEASE_MS`]. The observation applies
+    /// the same clamp before it prices a jitter, so the jitter this guard
+    /// waits out before a steal is the figure the observation computes from
+    /// the same lease, and a lease configured above 24 h cannot widen that
+    /// wait past `jitter_span_fraction` of 24 h. A lost steal reschedules
+    /// one clamped lease from now, so it waits at most the 24 h ceiling. In
+    /// the unreadable-claim recheck cap the clamp changes nothing: for a
+    /// lease at or above the ceiling the steal threshold is always the
+    /// earlier of the two points.
     fn lease_ms(&self) -> i64 {
         i64::try_from(self.inner.cfg.lease_duration.as_millis())
             .unwrap_or(i64::MAX)
@@ -548,16 +550,13 @@ impl ClaimGuard {
             // so its reschedule point is the bare expiry. An unreadable claim
             // is rescheduled to the observation's own point, which adds the
             // jitter, and its retry steals with no further wait. A lost steal
-            // or reclaim means another
-            // write just gave the claim a fresh lease, so the observed expiry
-            // no longer bounds it and the retry waits one full lease from now.
+            // or reclaim means another write just gave the claim a fresh
+            // lease, so the observed expiry no longer bounds it and the retry
+            // waits one lease from now, capped at the 24 h ceiling an observer
+            // applies to any claim's lease.
             let reschedule_after_unix_ms = match reason {
                 ClaimSkipReason::UnreadableClaim => observed.reschedule_after_unix_ms,
-                ClaimSkipReason::StealLost => {
-                    let lease_ms =
-                        i64::try_from(inner.cfg.lease_duration.as_millis()).unwrap_or(i64::MAX);
-                    now_ms.saturating_add(lease_ms)
-                }
+                ClaimSkipReason::StealLost => now_ms.saturating_add(self.lease_ms()),
                 _ => observed.expiry_unix_ms.saturating_add(1),
             };
             // An unreadable claim is looked at again about once per lease, so
@@ -1815,6 +1814,55 @@ mod tests {
             thief.requests().await,
             4,
             "rejected PUT, GET, HEAD, and the steal CAS"
+        );
+    }
+
+    /// A lost steal reschedules one lease from now, capped at the 24 h
+    /// ceiling: a 48 h lease reschedules at now plus
+    /// [`MAX_OBSERVED_LEASE_MS`], and the 300 s default at now plus 300 s.
+    #[tokio::test]
+    async fn a_lost_steal_reschedules_within_the_lease_ceiling() {
+        const T0: i64 = 1_700_000_000_000;
+        async fn lost_steal(lease: Duration) -> (i64, ClaimSkip) {
+            let lease_cfg = ClaimConfig {
+                lease_duration: lease,
+                ..ClaimConfig::default()
+            };
+            let store = NotFoundOnCas(MemoryStore::new());
+            store.0.set_clock_ms(T0 as u64);
+            let clock = FixedClock::new(T0 * 1_000_000);
+            let holder = ClaimGuard::new(&bucket(), &participant(1, &clock), lease_cfg, None);
+            assert!(matches!(
+                holder.acquire(&store).await.expect("holder acquires"),
+                Acquire::Acquired
+            ));
+
+            let observed_lease_ms = (lease.as_millis() as i64).min(MAX_OBSERVED_LEASE_MS);
+            let now = T0 + observed_lease_ms + 1;
+            store.0.set_clock_ms(now as u64);
+            clock.set(now * 1_000_000);
+            let thief = ClaimGuard::new(&bucket(), &participant(2, &clock), lease_cfg, None);
+            let skip = match thief.acquire(&store).await.expect("a lost steal is a skip") {
+                Acquire::Skipped(skip) => skip,
+                other => panic!("expected a skip, got {other:?}"),
+            };
+            assert_eq!(skip.reason, ClaimSkipReason::StealLost);
+            (now, skip)
+        }
+
+        let (now, skip) = lost_steal(Duration::from_secs(48 * 60 * 60)).await;
+        assert_eq!(
+            skip.reschedule_after_unix_ms,
+            now + MAX_OBSERVED_LEASE_MS,
+            "a 48 h lease reschedules a lost steal at the 24 h ceiling"
+        );
+        assert_eq!(skip.recheck_after_unix_ms, skip.reschedule_after_unix_ms);
+
+        let (now, skip) = lost_steal(Duration::from_secs(300)).await;
+        assert_eq!(
+            skip.reschedule_after_unix_ms,
+            now + 300_000,
+            "the 300 s default reschedules a lost steal one lease from now"
         );
     }
 
