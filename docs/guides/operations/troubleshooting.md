@@ -1444,7 +1444,9 @@ Coverage is not complete, so a zero reading is not proof of isolation:
   budget, so a budget refusal does not hide a foreign part. The on-demand
   fold's read of a part's entry ids also checks and counts here; it then
   declines to compare entry sets and the route answers `published`, so that
-  increment matches no failed request. The GC reachability sweep checks the
+  increment matches no failed request. A budget refusal of the comparison's
+  entry id sets also makes the route answer `published`, with no breach
+  counted. The GC reachability sweep checks the
   HEAD's tenant and signal and each part's tenant, but holds no `Catalog`,
   so it does not increment this counter: it refuses the HEAD or part, blocks
   the candidate's delete fail-closed as unreadable (counted on the retention

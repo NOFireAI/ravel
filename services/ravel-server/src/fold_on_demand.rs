@@ -665,7 +665,8 @@ const MAX_COMPARED_PARTS: usize = 8;
 /// This never errors: it answers the classification question, and the fold it
 /// classifies has already published. When the comparison cannot be completed
 /// (an undecodable `HEAD`, a part that has since been swept, a remainder past
-/// [`MAX_COMPARED_PARTS`]) it answers `true` and logs, because
+/// [`MAX_COMPARED_PARTS`], a memory budget that cannot admit the entry id
+/// sets) it answers `true` and logs, because
 /// `nothing_eligible` asserts that no commit entered or left the snapshot and
 /// that is not something an incomplete comparison has shown.
 ///
@@ -675,6 +676,11 @@ const MAX_COMPARED_PARTS: usize = 8;
 /// take entries out of the snapshot without changing those bytes, are
 /// compared from the two refs. Only the remainder on each side is fetched and
 /// decoded.
+///
+/// The id sets the comparison accumulates are charged to `catalog`'s memory
+/// budget before any part is read, [`ID_SET_BYTES_PER_ENTRY`] per compared
+/// entry from the `entry_count` each differing part declares in `HEAD`, and
+/// the charge is held until the comparison has its answer.
 #[allow(clippy::too_many_arguments)]
 async fn snapshot_content_changed(
     catalog: &Arc<Catalog>,
@@ -741,6 +747,28 @@ async fn snapshot_content_changed(
         );
         return true;
     }
+    let compared_entries =
+        compared_entry_total(&before_only).saturating_add(compared_entry_total(&after_only));
+    let wanted = compared_entries.saturating_mul(ID_SET_BYTES_PER_ENTRY);
+    // Held until the comparison ends, after both id sets drop; sized from
+    // HEAD's entry counts so a refusal costs no read.
+    let _id_sets = match catalog.memory_budget().reserve_best_effort(wanted) {
+        Ok(reservation) => reservation,
+        Err(err) => {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                before_only = before_only.len(),
+                after_only = after_only.len(),
+                compared_entries,
+                wanted_bytes = wanted,
+                error = %err,
+                "on-demand catalog fold: the memory budget refused the entry-set comparison; \
+                 reporting published"
+            );
+            return true;
+        }
+    };
     let (Some(before_entries), Some(after_entries)) = (
         read_entry_ids(
             catalog,
@@ -780,6 +808,13 @@ fn retired_hours_changed(before: &[SnapshotPartRef], after: &[SnapshotPartRef]) 
     })
 }
 
+/// Entries named across the parts a comparison reads.
+fn compared_entry_total(parts: &[&SnapshotPartRef]) -> u64 {
+    parts
+        .iter()
+        .fold(0, |total, part| total.saturating_add(part.entry_count))
+}
+
 /// The parts of `parts` whose bytes no part of `other` also names. Matching is
 /// on `blake3` alone: it is the hash of the part's full bytes, and the part
 /// key embeds a prefix of it, so equal hashes mean equal entries. A matched
@@ -802,13 +837,28 @@ fn parts_absent_from<'a>(
 /// rewritten entry for one identity counts as a change.
 type EntryId = (u32, u32, u32, Vec<u8>, u64, u64, Vec<u8>);
 
+/// Bytes charged to the memory budget per entry an id set will hold. An
+/// [`EntryId`] is 80 bytes inline on a 64-bit target (two 24-byte `Vec`
+/// headers, two `u64`, three `u32` padded to 32), and its two `Vec`s hold
+/// 16 + 32 = 48 heap bytes (`writer_id` and `content_hash` as
+/// `proto/ravel/catalog.proto` sizes them). A `BTreeSet` keeps its nodes at
+/// least half full, so its key storage is at most twice the keys' size:
+/// 2 x (80 + 48) = 256. This bounds the set's own storage, not the transient
+/// memory of a part's decode, which [`Catalog::decode_tenant_part`] charges
+/// separately.
+const ID_SET_BYTES_PER_ENTRY: u64 = 256;
+const _: () = assert!(ID_SET_BYTES_PER_ENTRY >= 2 * (std::mem::size_of::<EntryId>() as u64 + 48));
+
 /// Every entry identity across `parts`, or `None` if any part could not be
 /// read or decoded (the caller then declines to claim the sets are equal).
 ///
 /// Each part is decoded through [`Catalog::decode_tenant_part`], so a part
 /// whose header names another tenant is refused before its entries are read
-/// and counted on `catalog`'s isolation-breach counter, and the decode is
-/// charged to `catalog`'s memory budget for as long as its entries are held.
+/// and counted on `catalog`'s isolation-breach counter. The reservation
+/// `decode_tenant_part` returns covers the decoded part and is released once
+/// that part's entries have been moved into the id set; the id set itself is
+/// charged by the reservation [`snapshot_content_changed`] takes before
+/// calling this, sized from the parts' `entry_count`.
 async fn read_entry_ids(
     catalog: &Arc<Catalog>,
     store: &dyn ObjectStoreBackend,
@@ -855,7 +905,7 @@ async fn read_entry_ids(
                 }),
             None => decode(),
         };
-        let (decoded, _reservation) = match decoded {
+        let (decoded, _decode_charge) = match decoded {
             Ok(decoded) => decoded,
             Err(TenantPartError::ForeignTenant { expected, actual }) => {
                 tracing::warn!(
@@ -1737,7 +1787,32 @@ mod tests {
         part_tenant: &TenantHash,
         entries: &[ravel_proto::catalog::v1::SnapshotEntry],
     ) -> Vec<SnapshotPartRef> {
-        let hour = 10u32;
+        plant_head_with_part_for(store, head_tenant, part_tenant, entries, 10)
+            .await
+            .1
+    }
+
+    /// Plants a logs HEAD for `tenant` naming one part of its own at `hour`.
+    /// The hour is in the part's header and key, so two plants of the same
+    /// entries at different hours give two parts with different `blake3`
+    /// that hold the same entries. Returns the HEAD bytes written and the
+    /// parts read back from them.
+    async fn plant_head_with_part_at_hour(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        entries: &[ravel_proto::catalog::v1::SnapshotEntry],
+        hour: u32,
+    ) -> (Vec<u8>, Vec<SnapshotPartRef>) {
+        plant_head_with_part_for(store, tenant, tenant, entries, hour).await
+    }
+
+    async fn plant_head_with_part_for(
+        store: &dyn ObjectStoreBackend,
+        head_tenant: &TenantHash,
+        part_tenant: &TenantHash,
+        entries: &[ravel_proto::catalog::v1::SnapshotEntry],
+        hour: u32,
+    ) -> (Vec<u8>, Vec<SnapshotPartRef>) {
         let signal_code = ravel_commit::signal::to_proto(Signal::Logs) as u32;
         let bytes = ravel_catalog::encode_part(part_tenant.0, signal_code, 1, hour, entries)
             .expect("encode part");
@@ -1787,7 +1862,231 @@ mod tests {
             .get(&head_key, GetRange::Full)
             .await
             .expect("HEAD present");
-        decode_head(&stored.data).expect("decode HEAD").parts
+        let parts = decode_head(&stored.data).expect("decode HEAD").parts;
+        (stored.data.to_vec(), parts)
+    }
+
+    /// The larger declared decoded size among `parts`, as the part headers
+    /// state it: what one part's decode charges the budget.
+    async fn largest_declared_decode(
+        store: &dyn ObjectStoreBackend,
+        parts: &[&SnapshotPartRef],
+    ) -> u64 {
+        let mut largest = 0;
+        for part in parts {
+            let stored = store
+                .get(&part.key, GetRange::Full)
+                .await
+                .expect("part present");
+            let declared =
+                ravel_catalog::decode_part(&stored.data, &ravel_catalog::PartLimits::default())
+                    .expect("decode part")
+                    .header
+                    .entries_uncompressed_len;
+            largest = largest.max(declared);
+        }
+        largest
+    }
+
+    fn budgeted_catalog(
+        store: Arc<dyn ObjectStoreBackend>,
+        budget: &Arc<ravel_memory::MemoryBudget>,
+    ) -> Arc<Catalog> {
+        Arc::new(
+            Catalog::new(
+                store,
+                CatalogConfig {
+                    shard_count: 1,
+                    ..CatalogConfig::default()
+                },
+            )
+            .expect("build catalog")
+            .with_memory_budget(budget.clone()),
+        )
+    }
+
+    /// Two HEADs naming one different part each, both holding the same two
+    /// entries: the before side at hour 10, the after side at hour 11.
+    /// Returns both HEADs' bytes and the id-set charge the comparison needs,
+    /// computed from the parts' declared `entry_count`.
+    async fn plant_equal_entry_heads(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+    ) -> (Vec<u8>, Vec<u8>, u64, u64) {
+        let entries = [snapshot_entry(1, 10), snapshot_entry(2, 10)];
+        let (before_head, before_parts) =
+            plant_head_with_part_at_hour(store, tenant, &entries, 10).await;
+        let (after_head, after_parts) =
+            plant_head_with_part_at_hour(store, tenant, &entries, 11).await;
+        assert_ne!(before_parts[0].blake3, after_parts[0].blake3);
+        let compared: u64 = before_parts
+            .iter()
+            .chain(&after_parts)
+            .map(|part| part.entry_count)
+            .sum();
+        assert_eq!(compared, 4, "two entries per side");
+        let wanted = compared * ID_SET_BYTES_PER_ENTRY;
+        let declared = largest_declared_decode(
+            store,
+            &before_parts.iter().chain(&after_parts).collect::<Vec<_>>(),
+        )
+        .await;
+        (before_head, after_head, wanted, declared)
+    }
+
+    /// A budget one byte short of the id sets' charge declines the
+    /// comparison before any part is read, and answers changed; a budget
+    /// that admits the sets and one part's decode compares them and finds
+    /// them equal.
+    ///
+    /// FLIP: take no id-set reservation, size it from one side's entries, or
+    /// reserve 0 bytes, and the short budget compares (`changed` is false,
+    /// two GETs).
+    #[tokio::test]
+    async fn the_entry_set_comparison_declines_under_a_budget_too_small_for_its_id_sets() {
+        let tenant = TenantId::new("fold-on-demand-id-set-budget").hash();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let (before_head, after_head, wanted, declared) =
+            plant_equal_entry_heads(store.as_ref(), &tenant).await;
+        assert_eq!(wanted, 1024);
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(wanted - 1));
+        let catalog = budgeted_catalog(store.clone(), &budget);
+        let mut gets = 0;
+        let changed = snapshot_content_changed(
+            &catalog,
+            store.as_ref(),
+            &tenant,
+            Signal::Logs,
+            Some(&before_head),
+            Some(&after_head),
+            &mut gets,
+            None,
+        )
+        .await;
+        assert!(
+            changed,
+            "a comparison the budget cannot admit answers changed"
+        );
+        assert_eq!(gets, 0, "refused before any part is read");
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(catalog.isolation_breaches(), 0);
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(wanted + declared));
+        let catalog = budgeted_catalog(store.clone(), &budget);
+        let mut gets = 0;
+        let changed = snapshot_content_changed(
+            &catalog,
+            store.as_ref(),
+            &tenant,
+            Signal::Logs,
+            Some(&before_head),
+            Some(&after_head),
+            &mut gets,
+            None,
+        )
+        .await;
+        assert!(
+            !changed,
+            "equal entry sets compare equal when the budget admits the sets"
+        );
+        assert_eq!(gets, 2);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Records the budget's reserved bytes at every snapshot part GET.
+    struct ReservedAtPartGet {
+        inner: Arc<dyn ObjectStoreBackend>,
+        budget: Arc<ravel_memory::MemoryBudget>,
+        readings: parking_lot::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for ReservedAtPartGet {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            if key.ends_with(".csnap") {
+                self.readings.lock().push(self.budget.reserved());
+            }
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The id-set reservation is in place while each side's part is read and
+    /// released once the comparison has its answer.
+    ///
+    /// FLIP: drop the reservation as soon as it is taken, and both readings
+    /// fall below the id sets' charge; take it per side inside
+    /// `read_entry_ids`, and the after side's reading is half of it.
+    #[tokio::test]
+    async fn the_id_set_reservation_is_held_while_every_part_is_read() {
+        let tenant = TenantId::new("fold-on-demand-id-set-held").hash();
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let (before_head, after_head, wanted, declared) =
+            plant_equal_entry_heads(memory.as_ref(), &tenant).await;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(wanted + 2 * declared));
+        let recorder = Arc::new(ReservedAtPartGet {
+            inner: memory,
+            budget: budget.clone(),
+            readings: parking_lot::Mutex::new(Vec::new()),
+        });
+        let store: Arc<dyn ObjectStoreBackend> = recorder.clone();
+        let catalog = budgeted_catalog(store.clone(), &budget);
+        let mut gets = 0;
+        let changed = snapshot_content_changed(
+            &catalog,
+            store.as_ref(),
+            &tenant,
+            Signal::Logs,
+            Some(&before_head),
+            Some(&after_head),
+            &mut gets,
+            None,
+        )
+        .await;
+        assert!(!changed);
+        let readings = recorder.readings.lock().clone();
+        assert_eq!(readings.len(), 2, "both parts were read");
+        assert!(
+            readings.iter().all(|&reserved| reserved >= wanted),
+            "the id set charge is held while each part is read, the second side \
+             included: {readings:?} against {wanted}"
+        );
+        assert_eq!(budget.reserved(), 0, "released once the comparison ends");
     }
 
     /// `read_entry_ids` over a part tenant A's HEAD names: a foreign part is
