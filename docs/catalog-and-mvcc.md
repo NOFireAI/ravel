@@ -2038,8 +2038,11 @@ The HEAD returns to version 1 when the part with retired hours re-encodes
 or leaves HEAD, and every older component then reads it again.
 
 **The fold.** With `build_key_index_leaves` on, every part of the previous
-HEAD but the last that carries `key_index` refs is retirable; a rebuilt
-fold has none. A reconcile pass (the fixed window, the frontier band or a
+HEAD but the last that carries `key_index` refs and lies within one UTC
+day is retirable; a rebuilt fold has none. A part spanning more than one
+UTC day (a switch-off fold wrote it and `--rebuild-key-index` attached its
+leaves) is not: the switch-on partition seals at every UTC day, so no span
+reproduces its bytes and it is never carried by reference. A reconcile pass (the fixed window, the frontier band or a
 targeted re-fold) that lists a retention tombstone in a bucket inside a
 retirable part sets the bucket aside instead of dropping its entries,
 unless the bucket also lists a compaction or erasure rewrite record. Such a
@@ -2101,8 +2104,25 @@ naming it is resolved
 **Deletion.** Visibility changes at the fold that observes the tombstone.
 The sweep's HEAD-reachability gate reads the part's entries, so HEAD keeps
 a retired hour's objects named until the part re-encodes or leaves HEAD,
-and the physical delete waits for that; ADR-3939 decision 6 accepts the
-lag, up to a day for a day part.
+and the physical delete waits for that. The bound differs by part:
+
+- A day part keeps a retired hour's entries until a record dirties the part
+  or every hour of the day holding entries is retired, when the part leaves
+  HEAD with no PUT. That is up to 24 h beyond today on top of the
+  protection horizon, the lag ADR-3939 decision 6 accepts.
+- A part spanning more than one UTC day is not retirable, so the fold that
+  lists a tombstone inside it drops that hour's entries and re-encodes the
+  part in the same fold, carrying the other entries' pairs from its
+  previous leaves (decision 5's carry). The partition splits it at each UTC
+  day boundary, and no new ref carries retired hours
+  (`a_fully_retired_day_in_a_multi_day_part_re_encodes_the_part`,
+  `a_partly_retired_day_in_a_multi_day_part_re_encodes_the_part`,
+  `folds_that_re_encode_a_multi_day_part_write_identical_heads`). Its
+  objects are released at the fold that observes the tombstone, as before
+  ADR-3939. This is stricter than decision 6, which re-encodes a longer part
+  only once a whole UTC day of it is retired and keeps other days' hours in
+  `retired_hours`: such a part could never be carried by reference to keep
+  them, and the tombstoned hours' entries are no longer visible anyway.
 
 ### Idempotency marker body layout
 
