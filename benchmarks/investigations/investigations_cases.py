@@ -3523,6 +3523,8 @@ class Evaluate(Workdir):
 
     # The fold binary W3 and W8 are measured on: one carrying R2.
     R2_BINARY = {("retired_hour", "logs", "fold_binary"): {"sha": "r2", "carries_c1": True, "carries_r2": True}}
+    # The same binary, stamped by the day_parts_7 state A3 and A4 read.
+    DP7_R2_BINARY = {("day_parts_7", "logs", "fold_binary"): {"sha": "r2", "carries_c1": True, "carries_r2": True}}
 
     @staticmethod
     def drop_catalog(*ranges, declared=None):
@@ -3588,8 +3590,7 @@ class Evaluate(Workdir):
             if case == "empty digests":
                 a4_folds = {("day_parts_7", "dp7", "logs"): {"report": {"head_digest": ""}},
                             ("day_parts_7_refold", "dp7", "logs"): {"report": {"head_digest": ""}}}
-                a4 = self.adr3939_rows_now(mod, bands, ("adr3939_a4", "adr3939_w2"), live, self.R2_BINARY, {},
-                                           a4_folds)
+                a4 = self.adr3939_rows_now(mod, bands, ("adr3939_a4",), live, self.DP7_R2_BINARY, {}, a4_folds)
                 for name in ("head_digest", "refold_head_digest"):
                     if a4[f"adr3939_a4.{name}"]["verdict"] != "miss":
                         out.append(f"{case}: A4 {name} {a4[f'adr3939_a4.{name}']['verdict']}, want miss")
@@ -3599,14 +3600,15 @@ class Evaluate(Workdir):
         self.assertEqual(self.check_w8_retired_hours_are_the_tombstoned_hour(), [])
 
     def check_w3_w8_gated_on_r2_binary(self, evaluate_py=EVALUATE, bands=BANDS):
-        """A3, A4, W3 and W8 are judged only on a fold binary carrying R2, read off W2's binary figure being
-        0, which bands.toml defines after A3 and A4. On a binary carrying C1 and not R2 W2 is judged and
-        passes, and every A3, A4, W3 and W8 figure is not-run, gated and listed not requested naming the
-        figure's 1, none a miss and none incomplete; on an R2 binary every A3, A4, W3 and W8 figure but the
+        """A3, A4, W3 and W8 are judged only on a fold binary carrying R2: W3 and W8 read W2's binary figure
+        being 0, A3 and A4 their own binary figure, from the day_parts_7 state's stamp, being 1. On a binary
+        carrying C1 and not R2 W2 is judged and passes, and every A3, A4, W3 and W8 figure, A3's and A4's
+        binary figures included, is not-run, gated and listed not requested naming the binary figure's
+        value, none a miss and none incomplete; on an R2 binary every A3, A4, W3 and W8 figure but the
         three declared unsupported is judged and passes on a run meeting their targets, those three read
         unsupported with their reasons and are exactly the incomplete list, and every W2 figure, the binary
         figure included, is listed not requested and none passes; with no fold-binary stamp every A3, A4,
-        W3 and W8 figure is not-run naming the missing binary figure, not requested by none, and on the
+        W3 and W8 figure is not-run naming its missing binary figure, not requested by none, and on the
         incomplete list."""
         mod = load_module(evaluate_py, "evaluate_w3_w8_gate")
         live = {"retired_hour": None, "day_parts_7": None}
@@ -3625,33 +3627,46 @@ class Evaluate(Workdir):
         declared = {f"adr3939_{k.split('.')[0].lower()}.{k.split('.', 1)[1]}": why
                     for k, why in self.ADR3939_DECLARED_UNSUPPORTED.items()}
         keys = ("adr3939_a3", "adr3939_a4", "adr3939_w2", "adr3939_w3", "adr3939_w8")
+        binaries = ("adr3939_a3.fold_binary_carries_r2", "adr3939_a4.fold_binary_carries_r2")
         out = []
-        for case, binary, gate in (("C1 without R2", {"sha": "c1", "carries_c1": True, "carries_r2": False},
-                                    "adr3939_w2.fold_binary_pre_r2 1"),
-                                   ("R2", {"sha": "r2", "carries_c1": True, "carries_r2": True},
-                                    "adr3939_w2.fold_binary_pre_r2 0"),
-                                   ("no stamp", None, "adr3939_w2.fold_binary_pre_r2 is missing")):
+        for case, binary, w_gate, a_gate in (
+                ("C1 without R2", {"sha": "c1", "carries_c1": True, "carries_r2": False},
+                 "adr3939_w2.fold_binary_pre_r2 1", "fold_binary_carries_r2 0"),
+                ("R2", {"sha": "r2", "carries_c1": True, "carries_r2": True},
+                 "adr3939_w2.fold_binary_pre_r2 0", None),
+                ("no stamp", None, "adr3939_w2.fold_binary_pre_r2 is missing", "fold_binary_carries_r2 is missing")):
             docs = dict(base)
             if binary is not None:
                 docs[("retired_hour", "logs", "fold_binary")] = binary
+                docs[("day_parts_7", "logs", "fold_binary")] = binary
             figs = self.adr3939_rows_now(mod, bands, keys, live, docs, {}, folds)
             gated = {i: f for i, f in figs.items()
-                     if i.startswith(("adr3939_a3.", "adr3939_a4.", "adr3939_w3.", "adr3939_w8."))}
+                     if i.startswith(("adr3939_a3.", "adr3939_a4.", "adr3939_w3.", "adr3939_w8."))
+                     and i not in binaries}
             w2 = {i: f for i, f in figs.items() if i.startswith("adr3939_w2.") and not i.endswith(".fold_binary_pre_r2")}
             if (len(gated), len(w2)) != (20, 3):
                 out.append(f"{case}: {len(gated)} A3, A4, W3 and W8 figures, {len(w2)} W2 fold figures")
+
+            def gate(i):
+                return w_gate if i.startswith(("adr3939_w3.", "adr3939_w8.")) else f"{i.split('.')[0]}.{a_gate}"
+
             listed = mod.incomplete_reasons({"states": []}, {}, mod.Calls([], mod.Problems()), list(figs.values()))
             if binary is None:
                 for i, f in gated.items():
-                    if f["status"] != "not-run" or f.get("not_requested") or gate not in f["reason"]:
+                    if f["status"] != "not-run" or f.get("not_requested") or gate(i) not in f["reason"]:
                         out.append(f"{case}: {i} {f['status']} {f.get('not_requested')} {f['reason']}")
                     if not any(line.startswith(f"figure {i} not run") for line in listed):
                         out.append(f"{case}: {i} not on the incomplete list")
+                for i in binaries:
+                    if not any(line.startswith(f"figure {i} missing") for line in listed):
+                        out.append(f"{case}: {i} not on the incomplete list")
                 continue
             if binary["carries_r2"] is False:
-                judged, unasked, want = w2, gated, []
+                judged = w2
+                unasked = gated | {i: figs[i] for i in binaries}
+                want = []
             else:
-                judged = {i: f for i, f in gated.items() if i not in declared}
+                judged = {i: f for i, f in gated.items() if i not in declared} | {i: figs[i] for i in binaries}
                 unasked = w2 | {"adr3939_w2.fold_binary_pre_r2": figs["adr3939_w2.fold_binary_pre_r2"]}
                 want = sorted(f"figure {i} {UNSUPPORTED}: {gated[i]['reason']}" for i in declared if i in gated)
                 for i, why in declared.items():
@@ -3666,7 +3681,8 @@ class Evaluate(Workdir):
                 if f["verdict"] != "pass":
                     out.append(f"{case}: {i} {f['status']} {f['value']} {f['verdict']} {f['reason']}")
             for i, f in unasked.items():
-                if f["verdict"] != "not-run" or not f.get("gated") or gate not in (f.get("not_requested") or ""):
+                g = "adr3939_w2.fold_binary_pre_r2 0" if i.startswith("adr3939_w2.") else gate(i)
+                if f["verdict"] != "not-run" or not f.get("gated") or g not in (f.get("not_requested") or ""):
                     out.append(f"{case}: {i} {f['status']} {f['verdict']} not requested {f.get('not_requested')}")
             if sorted(listed) != want:
                 out.append(f"{case}: incomplete {listed}, want {want}")
@@ -3674,6 +3690,81 @@ class Evaluate(Workdir):
 
     def test_w3_w8_gated_on_r2_binary(self):
         self.assertEqual(self.check_w3_w8_gated_on_r2_binary(), [])
+
+    def check_a3_a4_without_retired_hour(self, evaluate_py=EVALUATE, bands=BANDS):
+        """A run whose run.toml lists day_parts_7 and not retired_hour judges A3 and A4 off the day_parts_7
+        state's own fold binary stamp: on an R2 binary 5 sealed-day leaf PUTs miss and nothing is listed
+        not requested; on a binary predating R2 every A3 and A4 figure is listed not requested naming the
+        binary figure's 0 and none is incomplete; with no stamp the binary figures are missing naming
+        stamps/day_parts_7.logs.fold_binary.json, and every other A3 and A4 figure is not-run naming the
+        missing binary figure, not requested by none, and on the incomplete list."""
+        mod = load_module(evaluate_py, "evaluate_a3_a4_alone")
+        live = {"day_parts_7": None, "retired_hour": "not in run.toml states"}
+        cfg = {"states": ["day_parts_7"]}
+        folds = {("day_parts_7_advance", "dp7", "logs"): {"report": {"sealed_day_leaf_puts": 5,
+                                                                     "sealed_day_previous_leaf_gets": 0}},
+                 ("day_parts_7", "dp7", "logs"): {"report": {"head_digest": "d7"}},
+                 ("day_parts_7_refold", "dp7", "logs"): {"report": {"head_digest": "d7"}}}
+        binaries = ("adr3939_a3.fold_binary_carries_r2", "adr3939_a4.fold_binary_carries_r2")
+        out = []
+        for case, binary in (("R2", {"sha": "r2", "carries_c1": True, "carries_r2": True}),
+                             ("pre-R2", {"sha": "c1", "carries_c1": True, "carries_r2": False}),
+                             ("no stamp", None)):
+            docs = {("day_parts_7", "logs", "fold_binary"): binary} if binary else {}
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_a3", "adr3939_a4", "adr3939_w2"), live, docs, {},
+                                         folds)
+            a = {i: f for i, f in figs.items() if i.startswith(("adr3939_a3.", "adr3939_a4."))}
+            listed = mod.incomplete_reasons(cfg, live, mod.Calls([], mod.Problems()), list(figs.values()))
+            unasked = {i: f["not_requested"] for i, f in a.items() if f.get("not_requested")}
+            if case == "R2":
+                f = a["adr3939_a3.sealed_day_leaf_puts"]
+                if (f["value"], f["verdict"]) != (5, "miss"):
+                    out.append(f"{case}: A3 sealed_day_leaf_puts {f['status']} {f['value']} {f['verdict']} "
+                               f"{f.get('not_requested')} {f['reason']}, want 5 miss")
+                if unasked:
+                    out.append(f"{case}: not requested {unasked}")
+            elif case == "pre-R2":
+                for i, f in a.items():
+                    want = f"{i.split('.')[0]}.fold_binary_carries_r2 0"
+                    if f["verdict"] != "not-run" or want not in (f.get("not_requested") or ""):
+                        out.append(f"{case}: {i} {f['verdict']} not requested {f.get('not_requested')}")
+                if listed:
+                    out.append(f"{case}: incomplete {listed}")
+            else:
+                for i, f in a.items():
+                    if i in binaries:
+                        if (f["status"], f["verdict"]) != ("missing", "missing") or \
+                                "stamps/day_parts_7.logs.fold_binary.json" not in f["reason"]:
+                            out.append(f"{case}: {i} {f['status']} {f['verdict']} {f['reason']}")
+                        continue
+                    want = f"{i.split('.')[0]}.fold_binary_carries_r2 is missing"
+                    if f["status"] != "not-run" or f.get("not_requested") or want not in f["reason"]:
+                        out.append(f"{case}: {i} {f['status']} {f.get('not_requested')} {f['reason']}")
+                    if not any(line.startswith(f"figure {i} not run") for line in listed):
+                        out.append(f"{case}: {i} not on the incomplete list")
+                if unasked:
+                    out.append(f"{case}: not requested {unasked}")
+        return out
+
+    def test_a3_a4_without_retired_hour(self):
+        self.assertEqual(self.check_a3_a4_without_retired_hour(), [])
+
+    def check_reference_cycle_named(self, evaluate_py=EVALUATE, bands=BANDS):
+        """Two derived figures that read each other are built anyway, the first naming the cycle by its
+        figures, never as a figure bands.toml does not define."""
+        mod = load_module(evaluate_py, "evaluate_cycle")
+        fig = {"statement": "derived", "state": "all", "metric": "derived", "lane": "counter"}
+        rows = {"row": [{"key": "x", "adr_row": "X", "check": "x", "figure": [
+            fig | {"name": "a", "expr": "m['x.b']"}, fig | {"name": "b", "expr": "m['x.a']"}]}]}
+        cfg = {"lane": "local", "hits": False, "scales": [1], "baseline": False, "states": []}
+        figs = {f["id"]: f for f in mod.run_rows(rows, cfg, {}, None, None, {}, {}, None, {}, {})}
+        a = figs.get("x.a", {})
+        if "a reference cycle among x.a, x.b" not in a.get("reason", "") or "does not define" in a.get("reason", ""):
+            return [f"x.a {a.get('status')} {a.get('reason')}"]
+        return []
+
+    def test_reference_cycle_named(self):
+        self.assertEqual(self.check_reference_cycle_named(), [])
 
     def check_w3_retired_hour_segments_reads_resolve_stamp(self, evaluate_py=EVALUATE, bands=BANDS):
         """W3's segments of the tombstoned hour are stamps/retired_hour.logs.retired_resolve.json
@@ -3708,9 +3799,9 @@ class Evaluate(Workdir):
     # ADR-3939 figures bands.toml declares no run can measure, with a phrase
     # of the reason each carries.
     ADR3939_DECLARED_UNSUPPORTED = {
-        "A4.heads_differ": "no fold path re-encodes an unchanged entry set",
+        "A4.heads_differ": "a re-encode of the same entries in a run would need the HEAD deleted",
         "A4.switch_off_partition_changed": "pinned by D1's unit tests",
-        "W8.heads_differ": "no fold path re-encodes an unchanged entry set",
+        "W8.heads_differ": "a re-encode of the same entries in a run would need the HEAD deleted",
     }
     # ADR-3939 figures no build supplies, with why: the per-day-part leaf
     # GETs (A7, W5 and F3's), F3's SlowDown responses, and W6's leaf round
@@ -4534,7 +4625,22 @@ FLIPS = {
     "a gate on a figure defined below it read before that figure is built": (
         "if any(order.get(r, -1) > order[fid] or r in waiting for r in figure_refs(fig)):",
         "if any(r in waiting for r in figure_refs(fig)):",
-        "check_w3_w8_gated_on_r2_binary",
+        "check_reference_cycle_named",
+    ),
+    "a day_parts_7 binary predating R2 read as carrying it": (
+        'return "value", int(doc["carries_r2"]), ""',
+        'return "value", 1, ""',
+        "check_a3_a4_without_retired_hour",
+    ),
+    "a day_parts_7 binary stamp read under a kind run.sh never writes": (
+        '"fold_binary_carries_r2": "fold_binary",',
+        '"fold_binary_carries_r2": "day_parts_binary",',
+        "check_a3_a4_without_retired_hour",
+    ),
+    "a reference cycle reported as a figure bands.toml does not define": (
+        "        if not ready:\n            cycle[:] =",
+        "        if False:\n            cycle[:] =",
+        "check_reference_cycle_named",
     ),
     "W3's segments read off a resolve of another hour": (
         'or isinstance(hour, bool) or hour != tomb.get("hour"):\n',
@@ -4601,7 +4707,10 @@ R2_GATE = ("not_run_unless = \"m['adr3939_w2.fold_binary_pre_r2'] == 0\"\n"
            "not_run_reason = \"{} runs only on a fold binary that carries R2 (the harness-state amendment), "
            "and the run stamps that binary's SHA\"\ngate_not_requested = true\n")
 W3_GATE, W8_GATE = R2_GATE.format("W3"), R2_GATE.format("W8")
-A3_GATE, A4_GATE = R2_GATE.format("A3"), R2_GATE.format("A4")
+DP7_R2_GATE = ("not_run_unless = \"m['adr3939_{0}.fold_binary_carries_r2'] == 1\"\n"
+               "not_run_reason = \"{1} runs only on a fold binary that carries R2 (the harness-state amendment), "
+               "and the run stamps that binary's SHA\"\ngate_not_requested = true\n")
+A3_GATE, A4_GATE = DP7_R2_GATE.format("a3", "A3"), DP7_R2_GATE.format("a4", "A4")
 BAND_FLIPS = {
     "row 7's logs section GETs missed against 2 x tail entries, not per pass": (
         "miss_if = \"v >= 2 * m['row_07.logs_tail_entries'] * m['row_07.logs_build_passes']\"\n",
@@ -4811,20 +4920,32 @@ BAND_FLIPS = {
         "metric = \"fold.dp7.logs.sealed_day_leaf_puts\"\nlane = \"counter\"\n",
         "check_w3_w8_gated_on_r2_binary",
     ),
+    "A3's sealed-day leaf PUTs gated on W2's binary figure, which a run without retired_hour never has": (
+        "metric = \"fold.dp7.logs.sealed_day_leaf_puts\"\nlane = \"counter\"\n" + A3_GATE,
+        "metric = \"fold.dp7.logs.sealed_day_leaf_puts\"\nlane = \"counter\"\n" + R2_GATE.format("A3"),
+        "check_a3_a4_without_retired_hour",
+    ),
+    "A4's binary figure judged rather than listed not requested on a binary predating R2": (
+        "not_requested_if = \"v == 0\"\nnot_requested_reason = \"A4 is measured",
+        "not_requested_reason = \"A4 is measured",
+        "check_a3_a4_without_retired_hour",
+    ),
     "A4's digest judged on a binary carrying no R2": (
         "transition = \"day_parts_7\"\nmetric = \"fold.dp7.logs.head_digest\"\nlane = \"counter\"\n" + A4_GATE,
         "transition = \"day_parts_7\"\nmetric = \"fold.dp7.logs.head_digest\"\nlane = \"counter\"\n",
         "check_w3_w8_gated_on_r2_binary",
     ),
     "A4's heads judged equal off a refold that reads the same HEAD back": (
-        "unsupported = \"no fold path re-encodes an unchanged entry set: a same-hours refold returns the HEAD it "
-        "read, so equal digests do not show determinism\"\n",
+        "unsupported = \"a re-encode of the same entries in a run would need the HEAD deleted, and leaf boundaries "
+        "can differ between builds, so determinism is pinned by unit tests rather than measured: the refold "
+        "returns the HEAD it read\"\n",
         "",
         "check_w3_w8_gated_on_r2_binary",
     ),
     "W8's heads judged equal off a refold that reads the same HEAD back": (
-        "unsupported = \"no fold path re-encodes an unchanged entry set: a refold observing the same tombstones "
-        "returns the HEAD it read, so equal digests do not show determinism\"\n",
+        "unsupported = \"a re-encode of the same entries in a run would need the HEAD deleted, and leaf boundaries "
+        "can differ between builds, so determinism is pinned by unit tests rather than measured: a refold "
+        "observing the same tombstones returns the HEAD it read\"\n",
         "",
         "check_w3_w8_gated_on_r2_binary",
     ),
@@ -4834,8 +4955,8 @@ BAND_FLIPS = {
         "check_w3_w8_gated_on_r2_binary",
     ),
     "W2's binary figure passing on an R2 binary": (
-        "not_requested_if = \"v == 0\"\n",
-        "",
+        "not_requested_if = \"v == 0\"\nnot_requested_reason = \"W2 is measured",
+        "not_requested_reason = \"W2 is measured",
         "check_w2_requires_pre_r2_binary_stamp",
     ),
     "a one-character drift in W4's target cell": (
@@ -6123,6 +6244,12 @@ FINISHED=1
             doc = inv.fold_binary(repo, s[sha][:12], s["c1"], s[r2] if r2 else "")
             if (doc["carries_c1"], doc["carries_r2"]) != want or doc["sha"] != s[sha]:
                 out.append(f"binary {sha}, r2 {r2 or 'empty'}: {doc}, want {want}")
+        # An empty c1_sha (a run listing day_parts_N and not retired_hour)
+        # reads as not carried; carries_r2 is still read off r2_sha.
+        for sha, r2, want in (("r2", "r2", (False, True)), ("c1", "r2", (False, False))):
+            doc = inv.fold_binary(repo, s[sha], "", s[r2])
+            if (doc["carries_c1"], doc["carries_r2"], doc["c1_sha"]) != (*want, ""):
+                out.append(f"binary {sha}, empty c1: {doc}, want {want}")
         for sha, c1, r2, what in (("0" * 12, s["c1"], "", "the fold binary's SHA"),
                                   (s["c1"], "1" * 12, "", "retired_hour.c1_sha"),
                                   (s["c1"], s["c1"], "2" * 12, "retired_hour.r2_sha")):
@@ -6164,6 +6291,20 @@ FINISHED=1
         self.assertLess(rh.index("STAMP stamps/retired_hour.logs.fold_binary.json"), rh.index("retention-cutoff"))
         self.assertRegex(rh, r"fold-binary --repo /root/inv/ravel --sha FILL-IN-COMMIT --c1 HEAD --r2 '' --out "
                              r"\S+/stamps/retired_hour\.logs\.fold_binary\.json")
+        # Every day_parts_N state stamps its own fold binary before its load,
+        # whether or not run.toml lists retired_hour or sets c1_sha.
+        for n in (7, 30):
+            dp = "\n".join(self.blocks(text)[f"state:day_parts_{n}"])
+            self.assertLess(dp.index(f"STAMP stamps/day_parts_{n}.logs.fold_binary.json"), dp.index("stride-check"))
+            self.assertRegex(dp, r"fold-binary --repo /root/inv/ravel --sha FILL-IN-COMMIT --c1 HEAD --r2 '' "
+                                 rf"--out \S+/stamps/day_parts_{n}\.logs\.fold_binary\.json")
+        code, text = self.new_states_dry_run(toml=self.new_states_toml(states='"day_parts_7"', c1='""'),
+                                             out="out-dp7-alone")
+        self.assertEqual(code, 0, text)
+        os.remove(self.path("run.toml"))
+        self.assertRegex("\n".join(self.blocks(text)["state:day_parts_7"]),
+                         r"fold-binary --repo /root/inv/ravel --sha FILL-IN-COMMIT --c1 '' --r2 '' "
+                         r"--out \S+/stamps/day_parts_7\.logs\.fold_binary\.json")
         code, text = self.new_states_dry_run(toml=self.new_states_toml(c1='""'), out="out-no-c1")
         self.assertNotEqual(code, 0)
         self.assertIn("run.toml retired_hour.c1_sha is empty", text)
@@ -6181,7 +6322,7 @@ FINISHED=1
     # fragments its block holds). The local smoke lists none of them
     # (README.md "day_parts_N and retired_hour"), so this is their pin.
     NEW_STATES_PLAN = (
-        ("day_parts_7", ("stride-check --parquet", "load-day_parts_7-spans", "load-day_parts_7-logs",
+        ("day_parts_7", ("STAMP stamps/day_parts_7.logs.fold_binary.json", "stride-check --parquet", "load-day_parts_7-spans", "load-day_parts_7-logs",
                          "--temp prefold --tenant dp7 --sub day_parts_7", "fold-day_parts_7-spans",
                          "fold-day_parts_7-logs", "fold-day_parts_7_refold-spans", "fold-day_parts_7_refold-logs",
                          "STAMP stamps/transitions.jsonl", "STAMP stamps/census.jsonl",
@@ -6189,7 +6330,7 @@ FINISHED=1
                          "wait until the ingest hour", "load-day_parts_7_tail-spans", "load-day_parts_7_tail-logs",
                          "fold-day_parts_7_advance-spans", "fold-day_parts_7_advance-logs",
                          "STAMP stamps/transitions.jsonl", "STAMP stamps/day_parts_7_advance.logs.day_parts.json")),
-        ("day_parts_30", ("stride-check --parquet", "load-day_parts_30-logs",
+        ("day_parts_30", ("STAMP stamps/day_parts_30.logs.fold_binary.json", "stride-check --parquet", "load-day_parts_30-logs",
                           "--temp prefold --tenant dp30 --sub day_parts_30", "fold-day_parts_30-logs",
                           "STAMP stamps/transitions.jsonl", "STAMP stamps/day_parts_30.logs.day_parts.json",
                           "--tenant dp30 --sub day_parts_30", "wait until the ingest hour",
@@ -6445,7 +6586,7 @@ echo "STATE-RC=$rc"
         help_text = self.FOLD_HELP + "\n      --retention-default <DURATION>"
         code, text = self.retired_hour_driver(script, help_text, True, "dirty")
         want = ("NOT-RUN retired_hour: run.toml box.sha is empty and the checkout has 1 modified tracked paths, so "
-                "its HEAD does not name the fold binary W2 is judged on")
+                "its HEAD does not name the fold binary retired_hour's figures are judged on")
         if code or want not in text or "RETIRE-THROUGH" in text:
             out.append(f"dirty checkout: exit {code}: {text[-300:]}")
         code, text = self.retired_hour_driver(script, help_text, False, "clean")

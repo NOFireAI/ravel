@@ -46,8 +46,8 @@ Subcommands:
                             a commit record holds its retire.tmb
   maint-records             compaction and rewrite records a maintain pass
                             added to one tenant and signal
-  fold-binary               the retired_hour fold binary's SHA and whether it
-                            carries run.toml's c1_sha and r2_sha
+  fold-binary               a state's fold binary SHA and whether it carries
+                            run.toml's c1_sha and r2_sha
   day-parts-stamp           entries and slices per day part from a state's
                             catalog stamp
 
@@ -1559,23 +1559,27 @@ def git_is_ancestor(repo, ancestor, sha):
 
 
 def fold_binary(repo, sha, c1, r2):
-    """{sha, carries_c1, carries_r2} of the retired_hour fold binary: whether
-    its SHA descends from run.toml's c1_sha and r2_sha. An empty r2_sha is
-    a fix not landed yet, so false. Raises when the binary's SHA or c1_sha
-    names no commit, or r2_sha is set and names none."""
+    """{sha, carries_c1, carries_r2} of a state's fold binary: whether its
+    SHA descends from run.toml's c1_sha and r2_sha. An empty c1_sha or
+    r2_sha is a commit not named, so false (run.sh refuses a retired_hour
+    run with no c1_sha; a day_parts_N state reads only carries_r2). Raises
+    when the binary's SHA names no commit, or c1_sha or r2_sha is set and
+    names none."""
     full = git_commit(repo, sha)
     if full is None:
         raise ValueError(f"the fold binary's SHA {sha!r} names no commit in {repo}")
-    c1_full = git_commit(repo, c1)
-    if c1_full is None:
-        raise ValueError(f"retired_hour.c1_sha {c1!r} names no commit in {repo}")
+    c1_full = None
+    if c1:
+        c1_full = git_commit(repo, c1)
+        if c1_full is None:
+            raise ValueError(f"retired_hour.c1_sha {c1!r} names no commit in {repo}")
     r2_full = None
     if r2:
         r2_full = git_commit(repo, r2)
         if r2_full is None:
             raise ValueError(f"retired_hour.r2_sha {r2!r} names no commit in {repo}")
-    return {"sha": full, "c1_sha": c1_full, "r2_sha": r2_full or "",
-            "carries_c1": git_is_ancestor(repo, c1_full, full),
+    return {"sha": full, "c1_sha": c1_full or "", "r2_sha": r2_full or "",
+            "carries_c1": bool(c1_full) and git_is_ancestor(repo, c1_full, full),
             "carries_r2": bool(r2_full) and git_is_ancestor(repo, r2_full, full)}
 
 
@@ -1924,7 +1928,7 @@ def main():
     fb = sub.add_parser("fold-binary")
     fb.add_argument("--repo", required=True)
     fb.add_argument("--sha", required=True)
-    fb.add_argument("--c1", required=True)
+    fb.add_argument("--c1", default="")
     fb.add_argument("--r2", default="")
     fb.add_argument("--out", required=True)
     fb.set_defaults(fn=cmd_fold_binary)

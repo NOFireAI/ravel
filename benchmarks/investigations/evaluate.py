@@ -136,10 +136,11 @@ FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_in
 # Stamps of ADR-3939's multi-day states: stamp.<what>.<label> reads
 # stamps/STATE.LABEL.<kind>.json. box/run.sh state_retired_hour writes the
 # fold_binary, tombstone and retired_resolve stamps (the last from `rlog
-# footprint --tenant`, which lists what a catalog resolve returns), so in a
-# run where that state is live their absence is missing.
-H1B_STAMPS = {"fold_binary_pre_r2": "fold_binary", "tombstoned_hour": "tombstone",
-              "retired_hour_segments": "retired_resolve"}
+# footprint --tenant`, which lists what a catalog resolve returns), and
+# state_day_parts writes its own fold_binary stamp, so in a run where the
+# state is live their absence is missing.
+H1B_STAMPS = {"fold_binary_pre_r2": "fold_binary", "fold_binary_carries_r2": "fold_binary",
+              "tombstoned_hour": "tombstone", "retired_hour_segments": "retired_resolve"}
 
 # Fold report fields under their names in a `catalog fold --json` report and
 # in a `--rebuild-key-index` report.
@@ -1270,7 +1271,15 @@ def stamp_figure(stamps, census, cfg, state, metric):
         name = f"stamps/{state}.{label}.{H1B_STAMPS[what]}.json"
         doc = stamps.doc(state, label, H1B_STAMPS[what])
         if doc is None:
-            return "missing", None, f"no {name} (box/run.sh state_retired_hour writes it)"
+            writer = "state_day_parts" if state.startswith("day_parts_") else "state_retired_hour"
+            return "missing", None, f"no {name} (box/run.sh {writer} writes it)"
+        if what == "fold_binary_carries_r2":
+            # 1 on a binary carrying R2, the build A3 and A4 are measured on;
+            # 0 on an older one, which their figures' gates read as not
+            # requested. C1 does not enter: A3 and A4 do not read it.
+            if not isinstance(doc.get("sha"), str) or not isinstance(doc.get("carries_r2"), bool):
+                return "missing", None, f"{name} carries no sha and carries_r2"
+            return "value", int(doc["carries_r2"]), ""
         if what == "fold_binary_pre_r2":
             # 1 on W2's binary (C1 and not R2), 0 on the R2 build W3 and W8
             # are measured on (the harness-state amendment): each row's
@@ -1519,13 +1528,20 @@ def evaluate_expr(expr, v, m):
     return bool(eval(expr, {"__builtins__": EXPR_BUILTINS}, {"v": v, "m": m}))  # noqa: S307 - bands.toml is repo-controlled
 
 
-def derived_value(expr, figures_by_id):
-    """(status, value, reason) of a derived figure's expression."""
+def cycle_text(cycle):
+    return "a reference cycle among " + ", ".join(cycle)
+
+
+def derived_value(expr, figures_by_id, cycle=()):
+    """(status, value, reason) of a derived figure's expression; `cycle` as
+    figure_gate's."""
     values = {k: e["value"] for k, e in figures_by_id.items() if e["status"] == "value"}
     try:
         v = eval(expr, {"__builtins__": EXPR_BUILTINS}, {"m": values})  # noqa: S307
     except KeyError as e:
         ref = figures_by_id.get(e.args[0])
+        if ref is None and e.args[0] in cycle:
+            return "missing", None, f"{e.args[0]} is not built yet: {cycle_text(cycle)}"
         if ref is None:
             return "missing", None, f"refers to figure {e.args[0]} that bands.toml does not define"
         if ref["status"] in PASSED_ON:
@@ -1534,9 +1550,10 @@ def derived_value(expr, figures_by_id):
     return "value", rnd(v), ""
 
 
-def figure_gate(fig, figures_by_id):
+def figure_gate(fig, figures_by_id, cycle=()):
     """None, or the reason a figure is not-run because its not_run_unless
-    expression over the figures built so far is false or cannot be judged."""
+    expression over the figures built so far is false or cannot be judged.
+    `cycle` is the figures built in a reference cycle, none of them first."""
     expr = fig.get("not_run_unless")
     if not expr:
         return None
@@ -1546,6 +1563,8 @@ def figure_gate(fig, figures_by_id):
             return None
     except KeyError as e:
         ref = figures_by_id.get(e.args[0])
+        if ref is None and e.args[0] in cycle:
+            return f"{fig['not_run_reason']}: {e.args[0]} is not built yet: {cycle_text(cycle)}"
         if ref is None:
             return f"{fig['not_run_reason']}: {e.args[0]} is not defined"
         return f"{fig['not_run_reason']}: {e.args[0]} is {ref['status']}: {ref['reason']}"
@@ -1572,6 +1591,7 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
              over_512k=None):
     figures = []
     by_id = {}
+    cycle = []
     order = {f"{row['key']}.{fig['name']}": n
              for n, (row, fig) in enumerate((r, f) for r in bands["row"] for f in r["figure"])}
 
@@ -1581,7 +1601,7 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
                  "metric": fig["metric"], "lane": fig["lane"]} | adr_of(row)
         metric = fig["metric"]
         why_not = reason or figure_not_run(fig, live)
-        gate = None if why_not else figure_gate(fig, by_id)
+        gate = None if why_not else figure_gate(fig, by_id, cycle)
         if gate:
             status, value, why = "not-run", None, gate
             refs = [by_id.get(r, {}) for r in re.findall(r"m\['([^']+)'\]", fig["not_run_unless"])]
@@ -1602,7 +1622,7 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
         elif fig.get("unsupported"):
             status, value, why = UNSUPPORTED, None, fig["unsupported"]
         elif metric == "derived":
-            status, value, why = derived_value(fig["expr"], by_id)
+            status, value, why = derived_value(fig["expr"], by_id, cycle)
             refs = [by_id.get(r, {}) for r in re.findall(r"m\['([^']+)'\]", fig["expr"])]
             if status == "not-run" and any(r.get("gated") for r in refs):
                 entry["gated"] = True
@@ -1634,8 +1654,9 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
         by_id[fid] = entry
 
     # A figure whose gate or expression reads a figure bands.toml defines
-    # after it (A3's and A4's gate on W2's binary figure) is built once that
-    # figure is; the output keeps bands.toml's order.
+    # after it is built once that figure is; the output keeps bands.toml's
+    # order. In a reference cycle the first waiting figure is built anyway,
+    # and a reference it cannot read names the cycle.
     pending = []
     for row in bands["row"]:
         reason = row_not_run(row, cfg, live)
@@ -1648,6 +1669,8 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
                 build(row, fig, reason)
     while pending:
         ready = [p for p in pending if all(r in by_id or r not in order for r in figure_refs(p[1]))]
+        if not ready:
+            cycle[:] = [f"{r['key']}.{f['name']}" for r, f, _ in pending]
         for p in ready or pending[:1]:
             pending.remove(p)
             build(*p)
@@ -1880,7 +1903,7 @@ def incomplete_reasons(cfg, live, calls, figures, needles=None):
     its row or figure lacking a state, tenant, scale or baseline the run
     never asked for, or A3, A4, W2, W3 or W8 on a fold binary it is not
     measured on (a gate_not_requested figure whose gate read values and said
-    no, or W2's binary figure naming that binary; a gated figure is either
+    no, or a binary figure naming that binary; a gated figure is either
     not_requested or listed here), a figure not-measured
     (a row 18 cell whose covering part was left to tier 1), a figure
     not-computable or incomplete or judged against one, a row 18 figure or

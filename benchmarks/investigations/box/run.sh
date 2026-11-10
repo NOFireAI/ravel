@@ -1249,6 +1249,38 @@ state_many_parts() {
   return 0
 }
 
+# fold_binary_stamp STATE: stamps/STATE.logs.fold_binary.json, the fold
+# binary's SHA and whether it carries run.toml's [retired_hour] c1_sha and
+# r2_sha (inv.py fold-binary; an empty c1_sha or r2_sha reads as not
+# carried). Every state whose figures are gated on the binary writes it:
+# retired_hour (W2, W3, W8) and day_parts_N (A3, A4). 0 written; 2 when no
+# SHA names the binary, the reason in FB_WHY; 1 (failed_at set) on failure.
+fold_binary_stamp() {
+  local state="$1" repo="$INV_DIR" sha dirty log="$WORK/fold-binary-$1.out"
+  FB_WHY=""
+  [ "$LANE" != s3 ] || repo="$BOX_ROOT/ravel"
+  if [ -n "${SHA:-}" ]; then
+    sha="$SHA"
+  else
+    # The local lane's binaries carry no SHA of their own: the checkout's
+    # HEAD names them only when no tracked file differs from it.
+    if ! dirty="$(git -C "$INV_DIR" status --porcelain --untracked-files=no 2>&1)"; then
+      FB_WHY="git status failed in the checkout, so its HEAD cannot name the fold binary: $dirty"
+      return 2
+    fi
+    if [ -n "$dirty" ]; then
+      FB_WHY="run.toml box.sha is empty and the checkout has $(printf '%s\n' "$dirty" | wc -l | tr -d ' ') modified tracked paths, so its HEAD does not name the fold binary $state's figures are judged on; commit them or set box.sha"
+      return 2
+    fi
+    sha="$(git -C "$INV_DIR" rev-parse HEAD 2>/dev/null)"
+  fi
+  printf 'STAMP stamps/%s.logs.fold_binary.json\n' "$state"
+  run "$PY" "$LIB" fold-binary --repo "$repo" --sha "$sha" --c1 "$RH_C1" --r2 "$RH_R2" \
+    --out "$STAMPS/$state.logs.fold_binary.json" >"$log" 2>&1 \
+    || { failed_at "fold-binary $state" 1 "$log"; return 1; }
+  return 0
+}
+
 # state_day_parts N: a fresh tenant dpN (spans and logs for 7, logs only for
 # 30) over the N whole UTC days step_corpus chose, one strided ingest hour
 # per batch; its unfolded (prefold) reference calls; one catalog fold
@@ -1258,7 +1290,7 @@ state_many_parts() {
 # ingest hour and folded (day_parts_N_advance), stamped.
 state_day_parts() {
   local n="$1" t="dp$1" st="day_parts_$1" dir="$WORK/corpus-dp$1" saved="$TRIPLES" start_var="DP_START_$1"
-  local start="${!start_var}" sigs="spans logs" sig col rows est why code stride_log label budget=()
+  local start="${!start_var}" sigs="spans logs" sig col rows est why code=0 stride_log label budget=()
   [ "$n" = 7 ] || sigs=logs
   # The 30-day state's reduced rate needs a smaller leaf build budget for S
   # of at least 3 (run.example.toml [day_parts]); both its folds use it, so
@@ -1266,6 +1298,14 @@ state_day_parts() {
   [ "$n" = 7 ] || budget=(--key-index-build-max-pairs "$DP30_MAX_PAIRS")
   est="$(estimate_s "$st")" || fail "run.toml step_estimate_minutes.$st"
   fits "$st" load "$est" || return 0
+  # A3 and A4 are judged only on a binary carrying R2: without the stamp
+  # they are incomplete, so a binary no SHA names leaves the state running.
+  fold_binary_stamp "$st" || code=$?
+  case "$code" in
+    0) ;;
+    2) printf 'NOTE %s: no fold binary stamp: %s\n' "$st" "$FB_WHY" ;;
+    *) return 1 ;;
+  esac
   # The loader's own refusal, checked over the whole file first (as
   # many_parts_N does): exit 1 records the state not-run with it.
   for sig in $sigs; do
@@ -1476,7 +1516,7 @@ retire_through() {
 # Before either, the fold binary stamp: whether the binary's SHA carries
 # run.toml's c1_sha and r2_sha.
 state_retired_hour() {
-  local saved="$TRIPLES" repo="$INV_DIR" sha est code=0 log="$WORK/fold-binary.out"
+  local saved="$TRIPLES" est code=0
   if [ "$DP7_OK" != 1 ]; then
     not_run retired_hour "the day_parts_7 state did not build its tenant dp7, which this state runs on"
     return 0
@@ -1495,27 +1535,12 @@ state_retired_hour() {
       return 0
     fi
   fi
-  [ "$LANE" != s3 ] || repo="$BOX_ROOT/ravel"
-  if [ -n "${SHA:-}" ]; then
-    sha="$SHA"
-  else
-    # The local lane's binaries carry no SHA of their own: the checkout's
-    # HEAD names them only when no tracked file differs from it.
-    local dirty
-    if ! dirty="$(git -C "$INV_DIR" status --porcelain --untracked-files=no 2>&1)"; then
-      not_run retired_hour "git status failed in the checkout, so its HEAD cannot name the fold binary: $dirty"
-      return 0
-    fi
-    if [ -n "$dirty" ]; then
-      not_run retired_hour "run.toml box.sha is empty and the checkout has $(printf '%s\n' "$dirty" | wc -l | tr -d ' ') modified tracked paths, so its HEAD does not name the fold binary W2 is judged on; commit them or set box.sha"
-      return 0
-    fi
-    sha="$(git -C "$INV_DIR" rev-parse HEAD 2>/dev/null)"
-  fi
-  printf 'STAMP stamps/retired_hour.logs.fold_binary.json\n'
-  run "$PY" "$LIB" fold-binary --repo "$repo" --sha "$sha" --c1 "$RH_C1" --r2 "$RH_R2" \
-    --out "$STAMPS/retired_hour.logs.fold_binary.json" >"$log" 2>&1 \
-    || { failed_at "fold-binary retired_hour" 1 "$log"; return 1; }
+  fold_binary_stamp retired_hour || code=$?
+  case "$code" in
+    0) ;;
+    2) not_run retired_hour "$FB_WHY"; return 0 ;;
+    *) return 1 ;;
+  esac
   fits retired_hour "maintain retention and fold" "$((RH_WAIT * 60 + est))" || return 0
   TRIPLES="dp7:logs:logs"
   retire_through retired_hour 0 || { TRIPLES="$saved"; return 1; }
