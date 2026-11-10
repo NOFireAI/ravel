@@ -192,8 +192,10 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # #3331 task T29. Raised 122->124 when the fetch-pinned-tool composite action
 # was added (an actions/cache restore and save), epic #4034 task T6. Raised
 # 124->129 when ci-budget-nightly.yml was added (three checkouts, an
-# upload-artifact and a download-artifact), epic #4034 task T5.
-WORKFLOW_EXPECTED_ACTION_COUNT=129
+# upload-artifact and a download-artifact), epic #4034 task T5. Raised
+# 129->131 when ci-flake-sweep.yml was added (two checkouts), epic #4034
+# task T8a.
+WORKFLOW_EXPECTED_ACTION_COUNT=131
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,
