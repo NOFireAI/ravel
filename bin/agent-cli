@@ -1144,7 +1144,9 @@ def cmd_ci_budgets(a):
     if a.runs is not None:
         cmd += ["--runs", str(a.runs)]
     rc, out, err = run(cmd, cwd=tree)
-    findings = [l.strip() for l in (out + "\n" + err).splitlines() if l.startswith("FINDING")]
+    # The guard prints "check-ci-job-budgets.sh: FINDING <rule> job=...".
+    findings = [l.strip() for l in (out + "\n" + err).splitlines()
+                if re.match(r"(?:\S+: )?FINDING ", l)]
     detail = "; ".join(findings) if findings else last_line(out + "\n" + err)
     o.data = {"rc": rc, "findings": findings, "detail": detail}
     o.text(f"ci-budgets {'ok' if rc == 0 else 'FAIL'} rc={rc} {detail}")

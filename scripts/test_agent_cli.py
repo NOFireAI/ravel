@@ -337,7 +337,9 @@ class CiBudgets(unittest.TestCase):
 
     def test_reports_the_finding_lines_not_the_last_job_row(self):
         body = ("printf 'doc-scripts\\tp90=8m\\tcap=10\\n'\n"
-                "printf 'FINDING cap job=sql p90=40m cap=45m ratio=0.89 (threshold 0.7)\\n'\n"
+                # The real guard's spelling (check-ci-job-budgets.sh, the cap
+                # rule's echo), prefix included.
+                "printf 'check-ci-job-budgets.sh: FINDING cap job=sql p90=40m cap=45m ratio=0.89 (threshold 0.7)\\n'\n"
                 "printf 'lint\\tp90=3m\\tcap=20\\n'")
         with tempfile.TemporaryDirectory() as d:
             root = self._fixture(d, 1, body)
