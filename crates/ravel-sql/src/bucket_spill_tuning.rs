@@ -19,9 +19,11 @@
 
 use std::sync::Arc;
 
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::buffer::BufferExec;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
@@ -39,6 +41,7 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use crate::bucketed_final_aggregate::{
     BUCKETED_FINAL_AGGREGATE_MAX_BITS, BucketedFinalAggregateExec, routed_types,
 };
+use crate::config::BucketedFinalAggregation;
 use crate::logs_scan::LogsScanExec;
 use crate::memory::spill_mode_headroom;
 use crate::spill::{MAX_SPILL_SHARES, SPILL_SHARE_UNIT_BYTES};
@@ -111,6 +114,39 @@ pub enum NoTuning {
     ChunkTooSmall,
     /// `2 x P x 2^bits + P` exceeds `floor(nofile_soft / (2 x slots))`.
     DescriptorBudget,
+}
+
+impl NoTuning {
+    /// The condition's name in the retry's INFO line.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            NoTuning::NoConsumedRows => "no_consumed_rows",
+            NoTuning::NotOneScan => "not_one_scan",
+            NoTuning::NotLogsScan => "not_logs_scan",
+            NoTuning::NoExactTotal => "no_exact_total",
+            NoTuning::UnlistedNode(_) => "unlisted_node",
+            NoTuning::NotFixedWidth => "not_fixed_width",
+            NoTuning::Degenerate => "degenerate",
+            NoTuning::TooManyBits => "too_many_bits",
+            NoTuning::ChunkTooSmall => "chunk_too_small",
+            NoTuning::DescriptorBudget => "descriptor_budget",
+        }
+    }
+}
+
+/// The soft `RLIMIT_NOFILE` an executor assumes until its server installs
+/// the one it read at start (`SqlExecutor::with_nofile_soft`): Linux's
+/// default soft limit.
+pub const DEFAULT_NOFILE_SOFT: u64 = 1024;
+
+/// The smallest `2 x P x 2^bits + P` any tuning needs (`P = 1`, `bits = 0`):
+/// a descriptor budget below it leaves the retry sort-merge only.
+pub const BUCKET_SPILL_MIN_DESCRIPTOR_NEED: u64 = 3;
+
+/// `F = floor(nofile_soft / (2 x slots))`, the descriptors one bucket retry
+/// may hold open.
+pub fn bucket_spill_descriptor_budget(nofile_soft: u64, slots: u64) -> u64 {
+    nofile_soft / slots.max(1).saturating_mul(2)
 }
 
 /// `clamp(floor(spill_max_bytes / 8 GiB), 1, 4)`, as `SpillBudget::slots`
@@ -265,6 +301,104 @@ impl BucketSpillPlanShape {
             total_rows: scan.sample_count_total(),
         })
     }
+}
+
+/// The retry's reason when its candidate plan keeps a `FinalPartitioned`
+/// aggregate the bucketed rule does not admit, or holds no bucketed exec.
+pub const RETRY_NOT_ADMITTED: &str = "not_admitted";
+
+/// The retry's reason when its candidate plan holds an order-preserving
+/// `RepartitionExec`.
+pub const RETRY_ORDER_PRESERVING_EXCHANGE: &str = "order_preserving_exchange";
+
+/// What the refused first attempt and the process give the bucket retry's
+/// derivation, beside what [`BucketSpillPlanShape::read`] takes from the
+/// plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketRetryFigures {
+    /// `A`, [`BucketSpillInputs::asked_bytes`].
+    pub asked_bytes: u64,
+    /// `n`, [`BucketSpillInputs::consumed_rows`].
+    pub consumed_rows: Option<u64>,
+    /// `L`, [`BucketSpillInputs::query_limit`].
+    pub query_limit: usize,
+    /// [`BucketSpillInputs::nofile_soft`].
+    pub nofile_soft: u64,
+    /// [`BucketSpillInputs::slots`].
+    pub slots: u64,
+}
+
+/// Whether the refusal retry keeps `plan`, its candidate planned at the
+/// placeholder tuning, and at which tuning (ADR-0954, parallel bucket spill
+/// item 1): every `FinalPartitioned` aggregate was replaced by a
+/// [`BucketedFinalAggregateExec`], no `RepartitionExec` preserves order, and
+/// the derivation returns a tuning. The error is the condition that keeps
+/// the sort-merge retry, as the retry's INFO line names it.
+pub fn bucket_retry_tuning(
+    plan: &Arc<dyn ExecutionPlan>,
+    figures: BucketRetryFigures,
+) -> Result<BucketSpillTuning, &'static str> {
+    fn walk(plan: &Arc<dyn ExecutionPlan>, bucketed: &mut usize) -> Result<(), &'static str> {
+        if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+            && *aggregate.mode() == AggregateMode::FinalPartitioned
+        {
+            return Err(RETRY_NOT_ADMITTED);
+        }
+        if plan
+            .downcast_ref::<RepartitionExec>()
+            .is_some_and(RepartitionExec::preserve_order)
+        {
+            return Err(RETRY_ORDER_PRESERVING_EXCHANGE);
+        }
+        if plan.downcast_ref::<BucketedFinalAggregateExec>().is_some() {
+            *bucketed += 1;
+        }
+        plan.children()
+            .into_iter()
+            .try_for_each(|child| walk(child, bucketed))
+    }
+    let mut bucketed = 0;
+    walk(plan, &mut bucketed)?;
+    if bucketed == 0 {
+        return Err(RETRY_NOT_ADMITTED);
+    }
+    let shape = BucketSpillPlanShape::read(plan).map_err(|why| why.reason())?;
+    derive_bucket_spill_tuning(&BucketSpillInputs {
+        asked_bytes: figures.asked_bytes,
+        total_rows: shape.total_rows,
+        consumed_rows: figures.consumed_rows,
+        partitions: shape.partitions,
+        spill_consumers: shape.spill_consumers,
+        query_limit: figures.query_limit,
+        column_widths: shape.column_widths,
+        nofile_soft: figures.nofile_soft,
+        slots: figures.slots,
+    })
+    .map_err(|why| why.reason())
+}
+
+/// `plan` with every [`BucketedFinalAggregateExec`] rebuilt at `tuning`'s
+/// `bits` and `routed_chunk_rows`, with spill on, keeping its
+/// `engage_groups` and per-bucket top-k.
+pub fn with_bucket_spill_tuning(
+    plan: Arc<dyn ExecutionPlan>,
+    tuning: BucketSpillTuning,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    plan.transform_up(|node| {
+        let Some(exec) = node.downcast_ref::<BucketedFinalAggregateExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let config = BucketedFinalAggregation {
+            bits: tuning.bits,
+            routed_chunk_rows: tuning.routed_chunk_rows,
+            ..exec.config()
+        };
+        let tuned = BucketedFinalAggregateExec::new(Arc::clone(exec.aggregate()), config)
+            .with_topk(exec.topk().cloned())
+            .with_spill(true);
+        Ok(Transformed::yes(Arc::new(tuned) as Arc<dyn ExecutionPlan>))
+    })
+    .map(|transformed| transformed.data)
 }
 
 fn collect_bucketed<'a>(
