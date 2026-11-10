@@ -598,9 +598,11 @@ CreateIfAbsent PUT, one GET and one HEAD of the claim key, the same as any
 contended claim request. At the 300 s default lease one process re-checks a
 stuck bucket at most 288 times a day (24 h / 300 s; the jitter and the extra
 millisecond make it slightly fewer), so at most 288 rejected PUTs per stuck
-bucket per day. If the key is gone, it claims the bucket and compacts. If the key is
-still there and younger than the 24 h ceiling, it skips the bucket again. Past
-the ceiling, it takes the claim over as described above.
+bucket per day for each running process: every maintenance process that holds
+the bucket in its schedule pays it. If the key is gone, it claims the bucket
+and compacts. If the key is still there and younger than the 24 h ceiling, it
+skips the bucket again. Past the ceiling, it takes the claim over as described
+above.
 
 A run never continues without the claim. Such a run could publish a compaction
 built from data that an erasure of the same bucket already removed. A claim
