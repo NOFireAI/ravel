@@ -2,14 +2,18 @@ name: Fetch pinned tool through a cache with retries
 description: >
   Restores a sha256-pinned tool download from actions/cache, keyed on name,
   version and sha256 so a version bump or a pin change never serves a stale
-  file. On a cache miss, downloads `url` with three attempts and a 15 s
-  backoff between them (overridable with FETCH_PINNED_TOOL_RETRY_DELAY_S, for
-  callers that need a faster test), verifies the download's sha256 against
-  `sha256`, and refuses with no file left at `dest` on a mismatch. Saves to
-  the cache only on a push to `main` (ADR-4034 D3): a cache written on a PR
-  or queue ref is readable by nothing else and dies with the ref, same as the
-  `save-if` rule every Swatinem/rust-cache step in this repo's ci.yml already
-  follows. `sha256` stays the trust anchor; the cache is only a transport.
+  file. On a cache miss, downloads `url` through
+  scripts/fetch-pinned-tool-download.sh: five attempts with exponential
+  backoff between them (10, 20, 40, 80 s by default, about 2.5 min total;
+  overridable with FETCH_PINNED_TOOL_RETRY_DELAY_S, for callers that need a
+  faster test), long enough to ride out a short upstream outage on the
+  release-asset host (issue #4093) rather than failing a job whose tool
+  cache was evicted. Verifies the download's sha256 against `sha256`, and
+  refuses with no file left at `dest` on a mismatch. Saves to the cache only
+  on a push to `main` (ADR-4034 D3): a cache written on a PR or queue ref is
+  readable by nothing else and dies with the ref, same as the `save-if` rule
+  every Swatinem/rust-cache step in this repo's ci.yml already follows.
+  `sha256` stays the trust anchor; the cache is only a transport.
 inputs:
   name:
     description: Short tool name used in the cache key, e.g. actionlint.
@@ -45,28 +49,10 @@ runs:
         TOOL_DEST: ${{ inputs.dest }}
       run: |
         set -u
-        mkdir -p "$(dirname "$TOOL_DEST")"
-        tmp="${TOOL_DEST}.download"
-        delay="${FETCH_PINNED_TOOL_RETRY_DELAY_S:-15}"
-        ok=0
-        for attempt in 1 2 3; do
-          echo "fetch-pinned-tool: downloading $TOOL_NAME from $TOOL_URL (attempt $attempt/3)"
-          if curl -fsSL "$TOOL_URL" -o "$tmp"; then
-            ok=1
-            break
-          fi
-          rm -f "$tmp"
-          if [ "$attempt" -lt 3 ]; then
-            echo "fetch-pinned-tool: download failed, retrying in ${delay}s"
-            sleep "$delay"
-          fi
-        done
-        if [ "$ok" -ne 1 ]; then
-          echo "::error::fetch-pinned-tool: download of $TOOL_NAME failed from $TOOL_URL after 3 attempts"
-          exit 1
-        fi
-        # The verify step below checks the sha256 on this path and on a hit.
-        mv "$tmp" "$TOOL_DEST"
+        # Five attempts, exponential backoff (issue #4093). The verify step
+        # below checks the sha256 on this path and on a cache hit alike.
+        "${GITHUB_WORKSPACE}/scripts/fetch-pinned-tool-download.sh" \
+          "$TOOL_NAME" "$TOOL_URL" "$TOOL_DEST"
     - name: Verify ${{ inputs.name }} sha256
       # Unconditional: a cache hit skips the download step above, and the
       # sha256 pin is the trust anchor on a hit as much as on a miss (the
