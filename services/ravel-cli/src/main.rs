@@ -5630,6 +5630,57 @@ mod tests {
         );
     }
 
+    /// `catalog fold --retention-default` is unset by default, parses a
+    /// humantime duration into nanoseconds, and is refused at 0, on a value
+    /// that does not parse, and past i64 nanoseconds, each with a message
+    /// naming the flag.
+    #[test]
+    fn catalog_fold_retention_default_flag() {
+        let try_parse = |extra: &[&str]| {
+            let argv = ["ravel", "catalog", "fold", "--tenant", "acme"]
+                .iter()
+                .chain(extra)
+                .copied()
+                .collect::<Vec<_>>();
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Command::Catalog {
+                    command:
+                        super::CatalogCommand::Fold {
+                            retention_default, ..
+                        },
+                } => retention_default,
+                _ => panic!("expected the catalog fold subcommand"),
+            })
+        };
+        assert_eq!(try_parse(&[]).expect("a plain fold parses"), None);
+        assert_eq!(
+            try_parse(&["--retention-default", "30d"]).expect("30d parses"),
+            Some(30 * 24 * 3_600 * 1_000_000_000)
+        );
+        assert_eq!(
+            try_parse(&["--retention-default", "720h"]).expect("720h parses"),
+            Some(720 * 3_600 * 1_000_000_000)
+        );
+        for (value, expected) in [
+            ("0s", "--retention-default '0s' must be greater than zero"),
+            ("0", "--retention-default '0' must be greater than zero"),
+            ("soon", "invalid --retention-default 'soon'"),
+            ("300years", "--retention-default '300years' is too large"),
+        ] {
+            let err = try_parse(&["--retention-default", value])
+                .expect_err("the value is refused")
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "{value}: expected {expected:?} in {err:?}"
+            );
+        }
+        assert!(
+            try_parse(&["--rebuild-key-index", "--retention-default", "30d"]).is_err(),
+            "a rebuild folds nothing, so the window is refused beside it"
+        );
+    }
+
     /// `catalog fold --metrics-label-index` (ADR-3694 decision 2) is off by
     /// default and parses beside `--key-index-leaves` and beside
     /// `--rebuild-key-index`. Without either, the fold refuses it at run time
