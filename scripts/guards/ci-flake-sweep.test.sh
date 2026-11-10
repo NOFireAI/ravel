@@ -111,7 +111,7 @@ one_failed_run() {
 # flaky_issue <number> <labels-json> <body> -> the flaky-test issue list.
 flaky_issue() {
   jq -n --argjson n "$1" --argjson l "$2" --arg b "$3" \
-    '[{number: $n, title: "flaky-test: ravel_sql::tests::alpha", state: "OPEN", body: $b, labels: ($l | map({name: .}))}]' \
+    '[{number: $n, title: "flaky-test: ravel-sql tests::alpha", state: "OPEN", body: $b, labels: ($l | map({name: .}))}]' \
     >"${case_dir}/issues-flaky-test.json"
 }
 
@@ -123,21 +123,36 @@ run_sweep() {
 
 count_calls() { grep -c "^$1" "${case_dir}/calls.log"; }
 
-LOG_ALPHA='2026-11-10T01:00:00.0000000Z \033[0;31mtest ravel_sql::tests::alpha ... FAILED\033[0m\n'
-LOG_ALPHA+="2026-11-10T01:00:00.0000000Z thread 'ravel_sql::tests::alpha' panicked at crates/ravel-sql/src/lib.rs:10:5:\n"
-LOG_ALPHA+='2026-11-10T01:00:00.0000000Z error[E0308]: mismatched types\n'
+# nextest_log <binary-id> <test> -> a coloured nextest failure as a job log
+# carries it: the result line, libtest's own lines inside the captured
+# output, a compile-error line, and the final summary repeating the result.
+nextest_log() {
+  local t='2026-11-10T01:00:00.0000000Z'
+  printf '%s' "${t}         \\033[1;31mFAIL\\033[0m [   0.004s] (1/1) \\033[1;35m$1\\033[0m \\033[1;36m$2\\033[0m\\n"
+  printf '%s' "${t} \\033[1;31m--- STDOUT: $1 $2 ---\\033[0m\\n${t} running 1 test\\n"
+  printf '%s' "${t} test $2 ... \\033[0;31mFAILED\\033[0m\\n"
+  printf '%s' "${t} thread '$2' panicked at crates/x/src/lib.rs:10:5:\\n"
+  printf '%s' "${t} error[E0308]: mismatched types\\n"
+  printf '%s' "${t}      Summary [   0.010s] 1 test run: 0 passed, 1 failed, 0 skipped\\n"
+  printf '%s' "${t}         \\033[1;31mFAIL\\033[0m [   0.004s] (1/1) \\033[1;35m$1\\033[0m \\033[1;36m$2\\033[0m\\n"
+}
+
+LOG_ALPHA="$(nextest_log ravel-sql tests::alpha)"
+ALPHA="ravel-sql tests::alpha"
 
 # --- first_ejection_files_one_issue ---------------------------------------
 # FLIP: keying the issue on the grep's raw match instead of the normalised
 # identifier (normalize_ids reduced to a `sort -u` pass-through) files three
-# issues here, one for the `test ... FAILED` line, one for the `thread ...
-# panicked` line, one for `error[E0308]`; shown failing with that change.
+# more issues here, for the `test ... FAILED`, `thread ... panicked` and
+# `error[E0308]` lines; and keeping a libtest path that the nextest line
+# already names (the `named` lookup in the awk removed) files a second issue,
+# `[test (1)] tests::alpha`. Both shown failing.
 new_case first_ejection
 one_failed_run 501 7001 "$(at "${NOW}" -3600)" "${LOG_ALPHA}"
 run_sweep
 creates="$(count_calls 'issue create')"
 if [[ "${rc}" == "0" && "${creates}" == "1" ]] &&
-  grep -q -- "--title flaky-test: ravel_sql::tests::alpha --label flaky-test --body-file" "${case_dir}/calls.log" &&
+  grep -q -- "--title flaky-test: ${ALPHA} --label flaky-test --body-file" "${case_dir}/calls.log" &&
   ! grep -q -- "flake-quarantine-due --body-file" "${case_dir}/calls.log" &&
   grep -q '^- failure run=501 at=' "${case_dir}/created-1.md"; then
   ok first_ejection_files_one_issue
@@ -223,7 +238,7 @@ fi
 # #77 whose ledger marks it due at <due-since-iso>, and no failed runs.
 due_issue() {
   jq -n --arg since "$1" \
-    '[{number: 77, title: "flaky-test: ravel_sql::tests::alpha", createdAt: "2026-10-01T00:00:00Z",
+    '[{number: 77, title: "flaky-test: ravel-sql tests::alpha", createdAt: "2026-10-01T00:00:00Z",
        body: ("intro\n- failure run=401 at=\($since) event=merge_group u\n- quarantine-due at=\($since)\n")}]' \
     >"${case_dir}/issues-flake-quarantine-due.json"
 }
