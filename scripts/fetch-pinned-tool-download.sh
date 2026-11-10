@@ -27,13 +27,14 @@ mkdir -p "$(dirname "$dest")"
 rm -f "$tmp"
 
 last_status="unknown"
+last_rc=0
 attempt=1
 ok=0
 while [ "$attempt" -le "$max_attempts" ]; do
     echo "fetch-pinned-tool: downloading $name from $url (attempt $attempt/$max_attempts)"
-    last_status="$(curl -fsSL -o "$tmp" -w '%{http_code}' "$url")"
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
+    last_status="$(curl -fsSL --connect-timeout 20 --max-time 120 -o "$tmp" -w '%{http_code}' "$url")"
+    last_rc=$?
+    if [ "$last_rc" -eq 0 ]; then
         ok=1
         break
     fi
@@ -47,7 +48,7 @@ while [ "$attempt" -le "$max_attempts" ]; do
 done
 
 if [ "$ok" -ne 1 ]; then
-    echo "::error::fetch-pinned-tool: download of $name from $url failed after $max_attempts attempts (last http status: ${last_status:-unknown})" >&2
+    echo "::error::fetch-pinned-tool: download of $name from $url failed after $max_attempts attempts (last http status: ${last_status:-unknown}, curl exit ${last_rc})" >&2
     exit 1
 fi
 
