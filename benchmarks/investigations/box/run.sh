@@ -412,6 +412,9 @@ load_config() {
   # D's logs rate, the 30-day state at a reduced one (README "day_parts_N").
   DP7_TPD="$(cfg day_parts.traces_per_day_7 --default 19999992)"
   DP30_TPD="$(cfg day_parts.traces_per_day_30 --default 4000008)"
+  # The 30-day state's leaf build budget: run.example.toml [day_parts] gives
+  # the arithmetic that puts S (slices per day part) at 3 or more.
+  DP30_MAX_PAIRS="$(cfg day_parts.key_index_build_max_pairs_30 --default 1600000)"
   RH_C1="$(cfg retired_hour.c1_sha --default "")"
   RH_R2="$(cfg retired_hour.r2_sha --default "")"
   RH_INTERVAL="$(cfg retired_hour.maintain_interval_secs --default 30)"
@@ -472,8 +475,12 @@ EOF
   TENANTS="$TENANT"
   [ "$HITS" != true ] || TENANTS="$TENANTS hits"
   MP_SIZES=""
-  local s
+  local s rh_seen=0
   for s in $STATES; do
+    # retired_hour's maintain server compacts every tenant with a durable
+    # config record (services/ravel-server/src/maintain.rs), whatever its
+    # token file names, so no state may measure a tenant after it.
+    [ "$rh_seen" = 0 ] || fail "run.toml run.states: $s is listed after retired_hour, whose maintain pass can compact every tenant's buckets; list retired_hour last"
     case "$s" in
       many_parts_*)
         [[ "${s#many_parts_}" =~ ^[1-9][0-9]*$ ]] || fail "run.toml state $s: N must be a positive integer"
@@ -486,6 +493,8 @@ EOF
         # when the per-day count is a multiple of 24.
         [[ "$tpd" =~ ^[1-9][0-9]*$ ]] && [ $((tpd % 24)) = 0 ] \
           || fail "run.toml day_parts.traces_per_day_${s#day_parts_} = $tpd: not a positive multiple of 24"
+        [ "$s" = day_parts_7 ] || [[ "$DP30_MAX_PAIRS" =~ ^[1-9][0-9]*$ ]] \
+          || fail "run.toml day_parts.key_index_build_max_pairs_30 = $DP30_MAX_PAIRS: not a positive whole number"
         DP_DAYS="$DP_DAYS ${s#day_parts_}"
         TENANTS="$TENANTS dp${s#day_parts_}" ;;
       retired_hour)
@@ -495,7 +504,8 @@ EOF
         esac
         [ -n "$RH_C1" ] || fail "run.toml retired_hour.c1_sha is empty: the fold binary stamp needs it"
         [[ "$RH_INTERVAL" =~ ^[1-9][0-9]*$ ]] || fail "run.toml retired_hour.maintain_interval_secs = $RH_INTERVAL: not a positive whole number"
-        [[ "$RH_WAIT" =~ ^[1-9][0-9]*$ ]] || fail "run.toml retired_hour.wait_minutes = $RH_WAIT: not a positive whole number" ;;
+        [[ "$RH_WAIT" =~ ^[1-9][0-9]*$ ]] || fail "run.toml retired_hour.wait_minutes = $RH_WAIT: not a positive whole number"
+        rh_seen=1 ;;
       unfolded | folded_no_leaves | folded_leaves | mixed | advanced_leaves | compaction_in_flight | erasure_in_flight) ;;
       *) fail "run.toml run.states: unknown state $s" ;;
     esac
@@ -1248,8 +1258,12 @@ state_many_parts() {
 # ingest hour and folded (day_parts_N_advance), stamped.
 state_day_parts() {
   local n="$1" t="dp$1" st="day_parts_$1" dir="$WORK/corpus-dp$1" saved="$TRIPLES" start_var="DP_START_$1"
-  local start="${!start_var}" sigs="spans logs" sig col rows est why code stride_log label
+  local start="${!start_var}" sigs="spans logs" sig col rows est why code stride_log label budget=()
   [ "$n" = 7 ] || sigs=logs
+  # The 30-day state's reduced rate needs a smaller leaf build budget for S
+  # of at least 3 (run.example.toml [day_parts]); both its folds use it, so
+  # the advance rebuilds today's leaves at the budget the state built with.
+  [ "$n" = 7 ] || budget=(--key-index-build-max-pairs "$DP30_MAX_PAIRS")
   est="$(estimate_s "$st")" || fail "run.toml step_estimate_minutes.$st"
   fits "$st" load "$est" || return 0
   # The loader's own refusal, checked over the whole file first (as
@@ -1280,7 +1294,11 @@ state_day_parts() {
   done
   statements "$st" --temp prefold --tenant "$t" --sub "$st"
   fits "$st" fold "$est" || { TRIPLES="$saved"; return 0; }
-  fold "$st" --key-index-leaves || { TRIPLES="$saved"; return 1; }
+  fold "$st" --key-index-leaves ${budget[@]+"${budget[@]}"} || { TRIPLES="$saved"; return 1; }
+  if [ "${#budget[@]}" != 0 ]; then
+    stamp "$st.logs.build_budget.json" state="$st" tenant="$t" key_index_build_max_pairs:="$DP30_MAX_PAIRS" \
+      traces_per_day:="$DP30_TPD" source="run.toml day_parts.key_index_build_max_pairs_30"
+  fi
   if [ "$n" = 7 ]; then
     fits "$st" refold "$est" || { TRIPLES="$saved"; return 0; }
     fold "${st}_refold" --key-index-leaves || { TRIPLES="$saved"; return 1; }
@@ -1304,7 +1322,7 @@ state_day_parts() {
     load_signal "${st}_tail" "$sig" "$WORK/corpus-tail" "$t" || { TRIPLES="$saved"; return 1; }
   done
   fits "${st}_advance" fold "$est" || { TRIPLES="$saved"; return 0; }
-  fold "${st}_advance" --key-index-leaves || { TRIPLES="$saved"; return 1; }
+  fold "${st}_advance" --key-index-leaves ${budget[@]+"${budget[@]}"} || { TRIPLES="$saved"; return 1; }
   transition "${st}_advance" "tenant $t: one tail hour loaded into the next ingest hour, then folded with --key-index-leaves"
   census "${st}_advance"
   for label in $sigs; do
@@ -1316,8 +1334,10 @@ state_day_parts() {
   return 0
 }
 
-# retired_hour_tokens: a token file naming dp7 alone, so the maintain server
-# below applies retention to no other tenant.
+# retired_hour_tokens: a token file naming dp7 alone. It limits which tenant
+# the server authenticates, not which tenants the maintain pass compacts:
+# that is every tenant with a durable config record, which is why
+# retired_hour runs last (load_config) and maint_records checks dp7.
 retired_hour_tokens() {
   local f="$AUTH_DIR/tokens-dp7"
   if [ "$DRY_RUN" = 1 ]; then
@@ -1328,26 +1348,63 @@ retired_hour_tokens() {
   printf '%s\n' "$f"
 }
 
+# maintain_key_file: the --maintain-key-file --mode maintain requires
+# (ADR-3130; parse_fragment_keys, services/ravel-server/src/config.rs): one
+# 32-byte key as 64 hex characters on its own line, from Python's
+# secrets.token_hex(32), written once per run with umask 077. Only this
+# run's one maintain process reads it, so no other process has to share it.
+maintain_key_file() {
+  local f="$AUTH_DIR/maintain.key"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'DRY-RUN: write %s, one secrets.token_hex(32) line\n' "$f" >&3
+  elif [ ! -s "$f" ]; then
+    (umask 077 && "$PY" -c 'import secrets; print("# ravel-server --maintain-key-file, one key per line"); print(secrets.token_hex(32))' >"$f") \
+      || return 1
+  fi
+  printf '%s\n' "$f"
+}
+
+# maint_records STATE: the compaction and rewrite records the maintain pass
+# added to dp7's logs buckets, from the census before it (keys-STATE-before)
+# and after it (keys-STATE-after), stamped as STATE.logs.maint_records.json.
+# The fold that follows reconciles any such bucket and re-encodes its day
+# part, and W2's and W3's counters are fold-wide, so any added record fails
+# the state. Non-zero (failed_at set) on failure.
+maint_records() {
+  local state="$1" hash code=0 log="$WORK/maint-records-$1.out"
+  if [ "$DRY_RUN" = 1 ]; then
+    hash=DP7_HASH
+  else
+    hash="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["dp7"])' "$STAMPS/tenants.json")" \
+      || { failed_at "dp7 hash from tenants.json" 1; return 1; }
+  fi
+  printf 'STAMP stamps/%s.logs.maint_records.json\n' "$state"
+  run "$PY" "$LIB" maint-records --before "$WORK/keys-$state-before.tsv" --after "$WORK/keys-$state-after.tsv" \
+    --tenant-hash "$hash" --signal-code l --out "$STAMPS/$state.logs.maint_records.json" >"$log" 2>&1 || code=$?
+  [ "$code" = 0 ] || { failed_at "maint-records $state" "$code" "$log"; return 1; }
+}
+
 # retire_through STATE K: tombstone ingest hours D0..D0+K of dp7's logs (the
 # day_parts_7 load's batches 0..K, D0 the first hour of its oldest day) and
-# nothing later. retention-cutoff picks a retention window that expires
+# nothing later. retention-cutoff picks a retention window R that expires
 # batch K and not K+1; a maintain-mode server with that window, its own
 # fold off, writes the tombstones (ravel-maintain retention.rs); the store
-# is listed until it holds exactly those hours' tombstones, at most
-# retired_hour.wait_minutes. Then a query server with the same window runs
-# the on-demand fold (POST /api/v1/admin/fold), which carries that retention
-# into the fold and reconciles the retirement frontier, stamped as STATE's
-# fold, and a second one, STATE_refold. Non-zero (failed_at set) on failure.
+# is listed until every (shard, hour) bucket of those hours that holds a
+# commit record holds its tombstone and no other bucket does, at most
+# retired_hour.wait_minutes. maint_records then checks the pass compacted
+# nothing of dp7's logs. Then `catalog fold --retention-default Rs`, which
+# carries R into the fold and reconciles the retirement frontier, is
+# stamped as STATE's fold, and a second one as STATE_refold. Non-zero
+# (failed_at set) on failure.
 retire_through() {
-  local state="$1" k="$2" d0="$DP_START_7" cut="$WORK/retention-$1.json" r rows tokens hash
-  local tlog="$WORK/tombstone-check-$1.out" deadline code=0 f rflag url="http://127.0.0.1:$HTTP_PORT"
+  local state="$1" k="$2" d0="$DP_START_7" cut="$WORK/retention-$1.json" r rows tokens key hash
+  local tlog="$WORK/tombstone-check-$1.out" deadline code=0 f rflag
   rows="$(batch_rows "$(corpus_rows "$WORK/corpus-dp7" logs)" 168)"
   if [ "$DRY_RUN" = 1 ]; then
     run "$PY" "$LIB" retention-cutoff --parquet "$WORK/corpus-dp7/logs.parquet" --event-column ts \
       --batch-rows "$rows" --batch "$k"
     r=RETENTION_S
     rflag="dp7=RETENTION_S"
-    url="http://127.0.0.1:HTTP_PORT"
   else
     "$PY" "$LIB" retention-cutoff --parquet "$WORK/corpus-dp7/logs.parquet" --event-column ts \
       --batch-rows "$rows" --batch "$k" >"$cut" 2>&1 || { failed_at "retention-cutoff $state" "$?" "$cut"; return 1; }
@@ -1356,11 +1413,13 @@ retire_through() {
     rflag="dp7=${r}s"
   fi
   tokens="$(retired_hour_tokens)" || { failed_at "dp7 token file $state" 1; return 1; }
+  key="$(maintain_key_file)" || { failed_at "maintain key file $state" 1; return 1; }
   stop_server
-  start_server maintain "$tokens" --disable-fold --retention-tenant "$rflag" \
+  list_store "$state-before"
+  start_server maintain "$tokens" --maintain-key-file "$key" --disable-fold --retention-tenant "$rflag" \
     --maintain-interval-secs "$RH_INTERVAL" || { failed_at "maintain server $state" 1 "$SERVER_LOG"; return 1; }
   if [ "$DRY_RUN" = 1 ]; then
-    printf 'DRY-RUN: census and tombstone-check --first %s --last %s+%s every %s s until it passes, at most %s minutes\n' \
+    printf 'DRY-RUN: census and per-bucket tombstone-check --first %s --last %s+%s every %s s until it passes, at most %s minutes\n' \
       "$d0" "$d0" "$k" "$RH_INTERVAL" "$RH_WAIT"
   else
     hash="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["dp7"])' "$STAMPS/tenants.json")" \
@@ -1381,22 +1440,14 @@ retire_through() {
   stamp "$state.logs.tombstone.json" state="$state" tenant=dp7 signal=logs hour:="$d0" first_hour:="$d0" \
     last_hour:="$([ "$DRY_RUN" = 1 ] && echo null || echo $((d0 + k)))" batches:=$((k + 1)) retention_s="$r" \
     unit="unix hours, the unit catalog part ranges count in" check@="$tlog" cutoff@="$cut"
-  start_server query "$TOKEN_FILE" --retention-tenant "$rflag" --fold-key-index-leaves \
-    || { failed_at "query server $state" 1 "$SERVER_LOG"; return 1; }
-  local report
+  list_store "$state-after"
+  maint_records "$state" || return 1
+  # The fold reads the tenant's retention from --retention-default when the
+  # tenant's config record sets none, as dp7's does not; R is the same
+  # window the maintain server tombstoned with.
   for f in "$state" "${state}_refold"; do
-    code=0
-    rm -f "$WORK/admin-fold-$f.json"
-    run "$PY" "$LIB" admin-fold --server "$url" --auth-dir "$AUTH_DIR" --tenant dp7 \
-      --signal logs --out "$WORK/admin-fold-$f.json" >"$WORK/admin-fold-$f.out" 2>&1 || code=$?
-    # A connection failure writes no response body: the report is null.
-    report="report@=$WORK/admin-fold-$f.json"
-    [ "$DRY_RUN" = 1 ] || [ -f "$WORK/admin-fold-$f.json" ] || report="report:=null"
-    stamp folds.jsonl transition="$f" tenant=dp7 signal=logs kind="admin fold (POST /api/v1/admin/fold)" \
-      source=admin_fold exit:="$code" hour:="$(now_hour)" "$report"
-    [ "$code" = 0 ] || { failed_at "admin fold $f" "$code" "$WORK/admin-fold-$f.out"; return 1; }
+    fold "$f" --key-index-leaves --retention-default "${r}s" || return 1
   done
-  stop_server
   return 0
 }
 
@@ -1413,8 +1464,36 @@ state_retired_hour() {
     return 0
   fi
   est="$(estimate_s retired_hour)" || fail "run.toml step_estimate_minutes.retired_hour"
+  # Without --retention-default a CLI fold has no retention window, skips
+  # the retention-frontier reconcile and never sees the tombstones: every
+  # figure would read a fold that retired nothing.
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'DRY-RUN: %q catalog fold --help lists --retention-default\n' "$BIN"
+  else
+    "$BIN" catalog fold --help >"$WORK/fold-help.out" 2>&1 \
+      || { failed_at "catalog fold --help" "$?" "$WORK/fold-help.out"; return 1; }
+    if ! grep -q -e '--retention-default' "$WORK/fold-help.out"; then
+      not_run retired_hour "this ravel-cli's catalog fold --help lists no --retention-default, so its fold carries no retention window and reconciles no tombstone"
+      return 0
+    fi
+  fi
   [ "$LANE" != s3 ] || repo="$BOX_ROOT/ravel"
-  sha="${SHA:-$(git -C "$INV_DIR" rev-parse HEAD 2>/dev/null)}"
+  if [ -n "${SHA:-}" ]; then
+    sha="$SHA"
+  else
+    # The local lane's binaries carry no SHA of their own: the checkout's
+    # HEAD names them only when no tracked file differs from it.
+    local dirty
+    if ! dirty="$(git -C "$INV_DIR" status --porcelain --untracked-files=no 2>&1)"; then
+      not_run retired_hour "git status failed in the checkout, so its HEAD cannot name the fold binary: $dirty"
+      return 0
+    fi
+    if [ -n "$dirty" ]; then
+      not_run retired_hour "run.toml box.sha is empty and the checkout has $(printf '%s\n' "$dirty" | wc -l | tr -d ' ') modified tracked paths, so its HEAD does not name the fold binary W2 is judged on; commit them or set box.sha"
+      return 0
+    fi
+    sha="$(git -C "$INV_DIR" rev-parse HEAD 2>/dev/null)"
+  fi
   printf 'STAMP stamps/retired_hour.logs.fold_binary.json\n'
   run "$PY" "$LIB" fold-binary --repo "$repo" --sha "$sha" --c1 "$RH_C1" --r2 "$RH_R2" \
     --out "$STAMPS/retired_hour.logs.fold_binary.json" >"$log" 2>&1 \
@@ -1422,12 +1501,12 @@ state_retired_hour() {
   fits retired_hour "maintain retention and fold" "$((RH_WAIT * 60 + est))" || return 0
   TRIPLES="dp7:logs:logs"
   retire_through retired_hour 0 || { TRIPLES="$saved"; return 1; }
-  transition retired_hour "tenant dp7: ingest hour $DP_START_7 (hour 0 of the oldest day) tombstoned by maintain retention, then an on-demand fold"
+  transition retired_hour "tenant dp7: ingest hour $DP_START_7 (hour 0 of the oldest day) tombstoned by maintain retention, then catalog fold --retention-default"
   census retired_hour
   STATE=retired_hour_drop
   fits retired_hour_drop "maintain retention and fold" "$((RH_WAIT * 60 + est))" || { TRIPLES="$saved"; return 0; }
   retire_through retired_hour_drop 23 || { TRIPLES="$saved"; return 1; }
-  transition retired_hour_drop "tenant dp7: every hour of the oldest day tombstoned by maintain retention, then an on-demand fold"
+  transition retired_hour_drop "tenant dp7: every hour of the oldest day tombstoned by maintain retention, then catalog fold --retention-default"
   census retired_hour_drop
   TRIPLES="$saved"
   return 0

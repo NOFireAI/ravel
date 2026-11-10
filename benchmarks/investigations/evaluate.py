@@ -139,10 +139,6 @@ H1B_STAMPS = {"fold_binary_pre_r2": "fold_binary", "tombstoned_hour": "tombstone
               "retired_hour_segments": "retired_resolve"}
 H1B_UNWRITTEN = {"retired_resolve": "no harness command resolves an ingest hour's segments (neither ravel-cli "
                                     "nor the server lists the segments one hour holds after a fold)"}
-# Fold stamps run.sh takes from the on-demand fold (POST /api/v1/admin/fold),
-# whose response (services/ravel-server/src/fold_on_demand.rs) carries none of
-# FOLD_ALLOWLIST's fields nor these.
-ADMIN_FOLD_ABSENT = ("leaves_written", "leaf_bytes", "key_index_ranged_gets")
 
 # Fold report fields under their names in a `catalog fold --json` report and
 # in a `--rebuild-key-index` report.
@@ -1404,9 +1400,6 @@ def fold_figure(folds, transition, tenant, label, field):
         return ("value", v, "") if v is not None else ("missing", None, "fold stamp has no measure")
     v = fold_field(line.get("report") or {}, field)
     if v is None:
-        if line.get("source") == "admin_fold" and (field in FOLD_ALLOWLIST or field in ADMIN_FOLD_ABSENT):
-            return UNSUPPORTED, None, ("the on-demand fold response (services/ravel-server/src/fold_on_demand.rs) "
-                                       f"carries no {field}")
         if field in FOLD_ALLOWLIST:
             return UNSUPPORTED, None, f"fold report carries no {field} on this build"
         return "missing", None, f"fold report {transition}/{tenant}/{label} has no {field}"
