@@ -199,8 +199,12 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # 130->133 when supply-chain-nightly.yml split `fix` into `fix-candidates` (a
 # checkout, a taiki-e/install-action and an upload-artifact) and `fix-pr` (a
 # checkout and a download-artifact), issue #4041. Raised 133->135 when
-# ci-flake-sweep.yml was added (two checkouts), epic #4034 task T8a.
-WORKFLOW_EXPECTED_ACTION_COUNT=135
+# ci-flake-sweep.yml was added (two checkouts), epic #4034 task T8a. Raised
+# 135->138 when ci.yml's `coverage` job became the `coverage-shard` matrix
+# and a `coverage` job that collects it (an upload-artifact in the matrix; a
+# checkout and a download-artifact in the collector, which took over the
+# Codecov upload), issue #4050.
+WORKFLOW_EXPECTED_ACTION_COUNT=138
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,

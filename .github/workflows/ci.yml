@@ -1140,7 +1140,13 @@ jobs:
   # required test in ravel-sql CI and to re-run on every DataFusion version
   # bump; the golden cases in that file pin DataFusion's min/max NaN and
   # signed-zero semantics, so a bump that changes them fails here.
-  sql:
+  #
+  # Three legs (ADR-4034 D3, issue #4050): the endpoint suite split in two by
+  # nextest's hash partition, and the differential gate on its own. The two
+  # steps used to run back to back on one runner, and the differential gate
+  # selects ravel-sql alone, a second compile configuration after the
+  # endpoint suite's. The required check is the `sql` job below.
+  sql-shard:
     needs: changes
     # docs_only skips it entirely; the sql_area gate (ADR-0053 D4) further
     # skips it when no ravel-sql / ravel-server / ravel-query / ravel-esql path
@@ -1149,6 +1155,18 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # The partition denominator is written out rather than taken from
+        # strategy.job-total, which counts the differential leg too.
+        include:
+          - suite: endpoints
+            partition: 1/2
+          - suite: endpoints
+            partition: 2/2
+          - suite: differential
+            partition: 1/1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -1178,11 +1196,16 @@ jobs:
           # to the `ci` profile the old entry, which holds the default
           # profile's target subtree, kept being restored and the job built
           # its dependencies cold on every run (issue #2519). Change this
-          # with the profile.
-          key: ci-profile
-      - name: SQL and ES|QL endpoint tests
-        run: cargo nextest run --locked --cargo-profile ci -p ravel-server --features esql
+          # with the profile. The suite is part of the key because the two
+          # suites build different selections: rust-cache leaves the matrix
+          # out of its key, and under one shared entry whichever leg saved
+          # first would leave the other building its dependencies cold.
+          key: ci-profile-${{ matrix.suite }}
+      - name: SQL and ES|QL endpoint tests (partition ${{ matrix.partition }})
+        if: matrix.suite == 'endpoints'
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-server --features esql --partition hash:${{ matrix.partition }}
       - name: Differential correctness gate
+        if: matrix.suite == 'differential'
         env:
           # Well above the in-file default so CI explores far more of the
           # float edge-case and multi-segment-overlap space than a local run.
@@ -1193,6 +1216,42 @@ jobs:
         uses: ./.github/actions/disk-usage
         with:
           phase: report
+
+  # The required check for the matrix above, under the name main's
+  # protect-main ruleset lists. Same shape as `check`: it runs whatever the
+  # matrix did, because a skipped required check passes.
+  sql:
+    needs: [changes, sql-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Decide the SQL lane
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          LANE_APPLIES: ${{ needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true' }}
+          SHARDS_RESULT: ${{ needs.sql-shard.result }}
+        run: |
+          echo "lane_applies=$LANE_APPLIES changes=$CHANGES_RESULT sql-shard=$SHARDS_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::the changes job did not succeed ($CHANGES_RESULT); the SQL lane cannot be judged"
+            exit 1
+          fi
+          if [ "$LANE_APPLIES" != "true" ]; then
+            # The matrix is expected to have skipped; any other result means
+            # the gating itself is wrong.
+            if [ "$SHARDS_RESULT" != "skipped" ]; then
+              echo "::error::the SQL lane does not apply but sql-shard reported $SHARDS_RESULT"
+              exit 1
+            fi
+            echo "the SQL lane does not apply to this change"
+            exit 0
+          fi
+          if [ "$SHARDS_RESULT" != "success" ]; then
+            echo "::error::sql-shard reported $SHARDS_RESULT; the SQL lane is not green"
+            exit 1
+          fi
+          echo "every SQL leg passed"
 
   # The Flight SQL surface. Until this job existed, every test
   # behind ravel-server's `flight-sql` feature was compiled and discarded: the
@@ -1208,14 +1267,24 @@ jobs:
   # `collect2: fatal error: ld terminated with signal 7 [Bus error]`. Same
   # reason the `features` lane carries its own 30-minute budget.
   #
-  # Gated on sql_area like `sql`, and required like `sql`. When renaming this
-  # job, update main's required status checks in the same change, or the
-  # tests silently stop blocking again.
-  flight-sql:
+  # Gated on sql_area like `sql`, and required like `sql`. When renaming the
+  # `flight-sql` job below, update main's required status checks in the same
+  # change, or the tests silently stop blocking again.
+  #
+  # Four legs, split by nextest's hash partition (ADR-4034 D3, issue #4050),
+  # the shape of `check-shard`: every leg builds the same selection and runs
+  # the tests the partition assigns it, so the legs are disjoint and together
+  # run every test the single job ran. The required check is the `flight-sql`
+  # job below.
+  flight-sql-shard:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -1240,21 +1309,59 @@ jobs:
           # charging the budget that holds the main-scoped entries every run
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          # Names the cargo profile, as in `sql` above.
+          # Names the cargo profile, as in `sql-shard` above. Every leg builds
+          # the same selection, so the legs share one entry.
           key: ci-profile
-      - name: Flight SQL tests
+      - name: Flight SQL tests (partition ${{ matrix.shard }}/${{ strategy.job-total }})
         # The `ci` profile (issue #2519): it is dev without debug info.
         # `check-shard` runs `ci-opt`, which adds optimised dependencies; this
         # lane does not. On the default profile this lane wrote about 76 GiB and
         # linked that debug info into 159 test binaries. Every cargo command
-        # in the `sql`, `features-lane` and `features-otap` jobs uses it too,
-        # so each job builds in one target subtree.
-        run: cargo nextest run --locked --cargo-profile ci -p ravel-server -p ravel-sql --features flight-sql
+        # in the `sql-shard`, `features-lane` and `features-otap` jobs uses it
+        # too, so each job builds in one target subtree. The denominator
+        # follows the shard list while `shard` is the matrix's one dimension,
+        # as in `check-shard`.
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-server -p ravel-sql --features flight-sql --partition hash:${{ matrix.shard }}/${{ strategy.job-total }}
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
         with:
           phase: report
+
+  # The required check for the matrix above, under the name main's
+  # protect-main ruleset lists. Same shape as `sql`.
+  flight-sql:
+    needs: [changes, flight-sql-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Decide the Flight SQL lane
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          LANE_APPLIES: ${{ needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true' }}
+          SHARDS_RESULT: ${{ needs.flight-sql-shard.result }}
+        run: |
+          echo "lane_applies=$LANE_APPLIES changes=$CHANGES_RESULT flight-sql-shard=$SHARDS_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::the changes job did not succeed ($CHANGES_RESULT); the Flight SQL lane cannot be judged"
+            exit 1
+          fi
+          if [ "$LANE_APPLIES" != "true" ]; then
+            # The matrix is expected to have skipped; any other result means
+            # the gating itself is wrong.
+            if [ "$SHARDS_RESULT" != "skipped" ]; then
+              echo "::error::the Flight SQL lane does not apply but flight-sql-shard reported $SHARDS_RESULT"
+              exit 1
+            fi
+            echo "the Flight SQL lane does not apply to this change"
+            exit 0
+          fi
+          if [ "$SHARDS_RESULT" != "success" ]; then
+            echo "::error::flight-sql-shard reported $SHARDS_RESULT; the Flight SQL lane is not green"
+            exit 1
+          fi
+          echo "every Flight SQL leg passed"
 
   # Never-compiled ravel-bench feature combinations (ADR-0053 D6), plus one
   # ravel-cli leg. Seven ravel-bench cargo features are off by default and no
@@ -1339,7 +1446,7 @@ jobs:
           # The automatic key names the job, not the matrix entry, so without
           # this every leg would restore whichever leg saved first and build
           # the rest of its own dependencies cold.
-          # The suffix names the cargo profile, as in `sql` above.
+          # The suffix names the cargo profile, as in `sql-shard` above.
           key: ${{ matrix.lane }}-ci-profile
           # Restore everywhere, save only on main: a cache written on a PR ref
           # is readable only by that same pull request's later runs, one on a
@@ -1564,7 +1671,7 @@ jobs:
     runs-on: ubuntu-latest
     # 25m (provisional): this lane compiles, lints (--all-targets), and
     # lib-tests a single ravel-server feature, the same shape and crate as the
-    # `sql` job, which carries a 25m budget, and is used as a starting point
+    # `sql-shard` job, which carries a 25m budget, and is used as a starting point
     # here rather than a measured figure. The "~10-13m own share" this cap was
     # previously derived from was itself a subtraction of the same
     # combined-job samples used (and rejected) as the `features` job's
@@ -1593,7 +1700,7 @@ jobs:
           # charging the budget that holds the main-scoped entries every run
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          # Names the cargo profile, as in `sql` above.
+          # Names the cargo profile, as in `sql-shard` above.
           key: ci-profile
       - name: Clippy ravel-server --features otap
         run: cargo clippy --locked --profile ci -p ravel-server --features otap --all-targets -- -D warnings
@@ -1656,7 +1763,7 @@ jobs:
           # Restore everywhere, save only on main, as in `features-otap`
           # (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          # Names the cargo profile, as in `sql` above.
+          # Names the cargo profile, as in `sql-shard` above.
           key: ci-profile
       - name: Clippy ravel-server --features agents
         run: cargo clippy --locked --profile ci -p ravel-server --features agents --all-targets -- -D warnings
@@ -1722,7 +1829,7 @@ jobs:
           # Restore everywhere, save only on main, as in `features-otap`
           # (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          # Names the cargo profile, as in `sql` above.
+          # Names the cargo profile, as in `sql-shard` above.
           key: ci-profile
       - name: Clippy ravel-server --features mcp
         run: cargo clippy --locked --profile ci -p ravel-server --features mcp --all-targets -- -D warnings
@@ -2829,7 +2936,17 @@ jobs:
   # run-coverage label amendment). Gating the whole job on the event, rather
   # than dropping a trigger, keeps that choice in the job-level `if`, since
   # `on:` carries push, pull_request, and merge_group.
-  coverage:
+  #
+  # Four legs, split by nextest's hash partition (ADR-4034 D3, issue #4050).
+  # Every leg builds the same instrumented workspace and runs the tests the
+  # partition assigns it, then renders lcov from its own share of the raw
+  # data. Each leg's lcov lists every instrumented line of every binary it
+  # built, not only the ones its tests reached, so the four together carry
+  # every line the single run measured, with the single run's hit counts
+  # split among them. The `coverage` job below uploads all four to Codecov
+  # in one upload, which merges them per file and line into one report, the
+  # figure the badge shows.
+  coverage-shard:
     # needs lint too (ADR-0053 D3) so a fmt/clippy failure kills it before it
     # burns ~25m. lint runs on every context coverage does, under the same
     # docs_only gate, so the dependency never skips a coverage run.
@@ -2849,12 +2966,11 @@ jobs:
     # A run cut off by its timeout never saves the cache, so the next run
     # starts cold too. 75 lets a cold run finish and save the cache.
     timeout-minutes: 75
-    # id-token:write is the Codecov upload's tokenless-OIDC grant (public
-    # repo, no CODECOV_TOKEN secret); contents:read matches the job's only
-    # other need, checking out the tree.
-    permissions:
-      contents: read
-      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in step with EXPECTED_SHARDS in the `coverage` job below.
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -2879,29 +2995,121 @@ jobs:
           # rewritten under a key that already exists, so moving to the `ci`
           # profile under the old key would keep restoring the `dev` profile's
           # target subtree and never save a `ci` one (issue #2519). Change this
-          # with the profile.
+          # with the profile. Every leg builds the same thing, so the legs
+          # share one entry.
           key: ci-profile
-      - name: Install cargo-llvm-cov
+      - name: Install cargo-llvm-cov and nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: cargo-llvm-cov
-      # Run the workspace suite once and keep the raw coverage data
-      # (`--no-report`), then render it from that same data in every format a
-      # consumer needs: the text summary for the step summary, and lcov for
-      # Codecov. This replaces separate `cargo llvm-cov` invocations that
-      # would each re-run the entire test suite (ADR-0053 D2).
+          tool: cargo-llvm-cov,nextest
+      # Run this leg's share of the workspace suite once and keep the raw
+      # coverage data (`--no-report`), then render lcov from that data. The
+      # suite runs under nextest, as `check-shard` runs it, which is what
+      # makes the hash partition possible; `cargo llvm-cov` alone runs
+      # `cargo test`, and neither form runs doctests.
       #
       # Built under the `ci` profile (no debug info): the instrumented
       # workspace under `dev`'s line tables outgrew the runner's disk (#3674).
       # Coverage mapping lives in its own sections, so dropping debug info
       # does not change what is measured. `report` needs the same profile to
-      # find the binaries.
-      - name: Measure coverage
+      # find the binaries; `nextest` takes it as `--cargo-profile`, since its
+      # own `--profile` names a nextest profile. The denominator follows the
+      # shard list while `shard` is the matrix's one dimension.
+      - name: Measure coverage (partition ${{ matrix.shard }}/${{ strategy.job-total }})
         run: |
-          set -o pipefail
-          cargo llvm-cov --locked --no-report --workspace --profile ci
-          cargo llvm-cov report --locked --profile ci | tee -a "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov report --locked --profile ci --lcov --output-path lcov.info
+          cargo llvm-cov nextest --locked --no-report --workspace --cargo-profile ci --partition hash:${{ matrix.shard }}/${{ strategy.job-total }}
+          cargo llvm-cov report --locked --profile ci --lcov --output-path lcov-${{ matrix.shard }}.info
+      - name: Upload this leg's lcov
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-lcov-${{ matrix.shard }}
+          path: lcov-${{ matrix.shard }}.info
+          retention-days: 1
+          if-no-files-found: error
+      - name: Report the lowest free space the job reached
+        if: always()
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
+
+  # Collects the legs above into the one upload Codecov renders, under the
+  # job name coverage has always had. Not a required check, as before; it
+  # runs on the same contexts as the legs and fails if any leg failed, so a
+  # partial upload never replaces the badge's figure.
+  coverage:
+    needs: [changes, coverage-shard]
+    if: >-
+      always()
+      && needs.changes.outputs.docs_only != 'true'
+      && ((github.event_name == 'push' && github.ref == 'refs/heads/main')
+          || (github.event_name == 'pull_request'
+              && contains(github.event.pull_request.labels.*.name, 'run-coverage')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # id-token:write is the Codecov upload's tokenless-OIDC grant (public
+    # repo, no CODECOV_TOKEN secret); contents:read matches the job's only
+    # other need, checking out the tree.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # The number of legs in coverage-shard's shard list.
+      EXPECTED_SHARDS: 4
+    steps:
+      - name: Require every leg
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SHARDS_RESULT: ${{ needs.coverage-shard.result }}
+        run: |
+          echo "changes=$CHANGES_RESULT coverage-shard=$SHARDS_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ] || [ "$SHARDS_RESULT" != "success" ]; then
+            echo "::error::coverage-shard reported $SHARDS_RESULT (changes: $CHANGES_RESULT); not uploading a partial report"
+            exit 1
+          fi
+      # The checkout gives the Codecov uploader the tree it maps report paths
+      # onto, as the single job had.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Download every leg's lcov
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: coverage-lcov-*
+          path: coverage-lcov
+          merge-multiple: true
+      # Exactly one lcov per leg, each naming at least one line, and the line
+      # figure of their union (a line counts as covered when any leg hit it)
+      # for the step summary. Codecov computes the published figure itself
+      # from the same files.
+      - name: Merge the line figure
+        id: merge
+        run: |
+          shopt -s nullglob
+          files=(coverage-lcov/lcov-*.info)
+          if [ "${#files[@]}" -ne "$EXPECTED_SHARDS" ]; then
+            echo "::error::expected $EXPECTED_SHARDS lcov files, found ${#files[@]}: ${files[*]}"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            if ! grep -q '^DA:' "$f"; then
+              echo "::error::$f names no line"
+              exit 1
+            fi
+          done
+          awk '
+            /^SF:/ { file = substr($0, 4); next }
+            /^DA:/ {
+              split(substr($0, 4), field, ",")
+              key = file SUBSEP field[1]
+              if (!(key in hit)) hit[key] = 0
+              if (field[2] + 0 > 0) hit[key] = 1
+            }
+            END {
+              for (key in hit) { total++; covered += hit[key] }
+              printf "Line coverage over %d legs: %d of %d lines (%.2f%%)\n", ARGC - 1, covered, total, 100 * covered / total
+            }
+          ' "${files[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "files=$(IFS=,; echo "${files[*]}")" >> "$GITHUB_OUTPUT"
       # CODECOV_TOKEN authenticates the upload; id-token: write (job
       # permissions above) is kept as a fallback path. Renders the README
       # badge and per-file/diff coverage on codecov.io; never fails the job
@@ -2910,10 +3118,5 @@ jobs:
         uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
+          files: ${{ steps.merge.outputs.files }}
           fail_ci_if_error: false
-      - name: Report the lowest free space the job reached
-        if: always()
-        uses: ./.github/actions/disk-usage
-        with:
-          phase: report
