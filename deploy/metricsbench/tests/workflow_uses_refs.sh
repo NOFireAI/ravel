@@ -68,7 +68,7 @@ for wf in $FILES; do
     lineno=$(printf '%s\n' "$line" | cut -d: -f1)
     ref=$(printf '%s\n' "$line" | sed -E 's/^[0-9]+:[[:space:]]*-?[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
     case "$ref" in
-      ./*) continue ;; # local action: repo-tracked code, not a fetched external action
+      ./* | \"./* | \'./*) continue ;; # local action, quoted or not: repo-tracked code, not a fetched external action
     esac
     echo "$wf:$lineno:$ref" >>"$REFS_OUT"
   done
@@ -127,10 +127,11 @@ def strip_comment(text):
 
 
 class Line:
-    def __init__(self, number, indent, text):
+    def __init__(self, number, indent, text, refusal=None):
         self.number = number
         self.indent = indent
         self.text = text
+        self.refusal = refusal
 
 
 KEY_RE = re.compile(r"""^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"\-?:,\[\]{}&*!|>%@`][^#]*?|-[^\s#][^#]*?)\s*:(?:\s+(.*))?$""")
@@ -166,20 +167,28 @@ class Parser:
         for n, text in enumerate(raw, 1):
             body = text.rstrip("\n")
             stripped = body.lstrip(" ")
-            if stripped.startswith("\t"):
-                raise Refusal("line %d: tab indentation" % n)
             content = strip_comment(stripped)
-            if not content:
+            if not content.strip():
                 continue
             if n == 1 and content == "---":
                 continue
-            if content in ("---", "...") or content.startswith("%"):
-                raise Refusal("line %d: more than one document or a directive" % n)
-            self.lines.append(Line(n, len(body) - len(stripped), content))
+            # Refused only when read as structure: block_scalar consumes a
+            # run: script's lines without peeking at them.
+            refusal = None
+            if stripped.startswith("\t"):
+                refusal = "line %d: tab indentation" % n
+            elif content in ("---", "...") or content.startswith("%"):
+                refusal = "line %d: more than one document or a directive" % n
+            self.lines.append(Line(n, len(body) - len(stripped), content, refusal))
         self.pos = 0
 
     def peek(self):
-        return self.lines[self.pos] if self.pos < len(self.lines) else None
+        if self.pos >= len(self.lines):
+            return None
+        ln = self.lines[self.pos]
+        if ln.refusal is not None:
+            raise Refusal(ln.refusal)
+        return ln
 
     def document(self):
         value = self.node(0)
