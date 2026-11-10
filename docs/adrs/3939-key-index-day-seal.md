@@ -564,7 +564,7 @@ record anywhere in it.
 investigations harness's bands, each reporting not-run until its state
 exists; it touches benchmarks/investigations only. H1b adds the 7-day,
 30-day and retired-hour states to the box scripts. D3' runs W2 on the C1
-SHA.
+SHA (a branch instead, by the W2-binary amendment).
 
 ## Amendment (issue #4069, R2 implementation): retired hours only in day parts, and the erasure bound
 
@@ -608,7 +608,7 @@ No commit on main carries C1 without R2 and also has `ravel-cli catalog
 fold --retention-default` (#4085), which the retired_hour state's fold
 needs: C1 (#4051) landed before R2 (#4077), and the flag after it. W2 is
 therefore measured on the branch `measure/3939-w2` at 90e5f43f8: C1's
-merge commit 131ab993c with #4085's commit cherry-picked onto it
+last commit on main, 131ab993c, with #4085's commit cherry-picked onto it
 (`cherry picked from commit 9572fbe88`). The branch is never merged. The
 run stamps the binary's SHA, and its `carries_c1` and `carries_r2`, as the
 harness does for every fold binary.
@@ -619,3 +619,12 @@ D3' is three self-terminating runs, each with one binary:
 - Run B: the same SHA as run A, with day_parts_30, for A7, W5, F2, and F3
   on W5.
 - Run C: `measure/3939-w2`, with day_parts_7 and retired_hour, for W2 only.
+
+Run C's verdict is read for W2 alone. Its binary predates R2, so its fold
+report has no `retired_hours` field. W3's and W8's `retired_hours` figures,
+which the retired_hour state makes live, therefore read
+`unsupported-on-this-build` there. The harness lists them as incomplete,
+so run C ends `incomplete`. That outcome is expected, and it counts only
+when the incomplete list names no figure other than W3's and W8's
+retired-hours figures. Every other row run C would judge is judged in run
+A on the R2 build.
