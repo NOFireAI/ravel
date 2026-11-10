@@ -1787,6 +1787,57 @@ the largest total the passes held in
 `fold_human_report_prints_every_fold_report_field`, which checks every
 serialized field against the text report).
 
+Six more fields are the figures the ADR-3939 investigation harness
+reads, none of them a `/metrics` counter; `ravel-cli catalog fold`
+prints each in text and `--json` (test
+`fold_report_renders_the_adr_3939_figures_in_text_and_json`):
+
+- `sealed_part_puts`: snapshot part object PUTs of parts other than the
+  tail, one per such part an attempt re-encoded, summed over every attempt
+  and also counted in `put_requests`. The tail's PUT, which every
+  publishing fold issues, is not counted, and a part carried by reference
+  issues none (1 of 2 part PUTs for a sealing fold, 0 of 1 for an advance
+  and 0 of 0 for a no-op refold in
+  `fold_report_counts_sealed_part_puts_and_not_the_tail`).
+- `sealed_day_leaf_puts` and `sealed_day_previous_leaf_gets`: the leaf
+  PUTs and previous-leaf GETs of re-encoded parts that are not the tail,
+  lie within one UTC day, and whose day the previous HEAD already held as
+  a sealed part (one that was not its last), so the fold that first seals
+  a day counts nothing for it. Acceptance A3 expects both to be 0 once a
+  day is sealed; a late commit or rewrite into a sealed day makes them
+  nonzero (2 and 3 for the dirty-day re-encode in
+  `fold_report_counts_a_sealed_days_leaf_puts_and_gets`).
+- `key_index_unchanged_section_gets`: the GETs of KEY_IDX section reads
+  for entries a previous part's leaves already held for every declared
+  field, also counted in `key_index_ranged_gets`; nonzero only when a
+  carry was lost, and an entry no previous part held is never counted (12
+  of the 18 section GETs when a slice GET fails mid-build in
+  `fold_report_counts_section_gets_for_entries_a_previous_leaf_held`, the
+  other 6 being a new entry's).
+- `head_digest`: lowercase hex blake3 of the HEAD in effect after the
+  call, the one published or, on a no-op, the one read, re-encoded with
+  `folder_id` set to sixteen zero bytes and `created_unix_ns` to zero;
+  empty when there is no valid HEAD, and a HEAD that fails to re-encode
+  fails the fold rather than reporting an empty digest
+  (`fold_report_head_digest_ignores_the_folder_id_and_clock`). The digest
+  covers every other HEAD field: `format_version`, `tenant_hash`,
+  `signal`, `shard_count`, `watermark_hour`, `parts`, `postings` and
+  `shard_generation_count`, not the process or clock that wrote them, so
+  two folds that publish the same HEAD content share it while their HEAD
+  bytes differ.
+  A re-encode of the same entries within a run would need the HEAD
+  deleted (a refold at the same watermark is a no-op that reports the
+  HEAD it read, and a later fold moves the watermark), and leaf
+  boundaries can differ between builds (the header comment of
+  `crates/ravel-catalog/src/key_index_rebuild.rs`), so ADR-3939's A4 and
+  W8 determinism is pinned by unit tests rather than measured: the
+  harness reports those figures as unsupported. The switch-off
+  partition's equality (A4) is likewise not reported: it holds by
+  construction of the partition and is pinned by its unit tests.
+- `retired_hours`: the sorted union of every HEAD part's `retired_hours`
+  (under "Retired hours"), read from the HEAD on a no-op
+  (`fold_report_retired_hours_is_the_heads_union`).
+
 When a compaction or erasure rewrite record lands, the fold re-encodes the
 part and rebuilds its leaves from the new entry set. An erasure rewrite
 therefore removes the subject's `key8` from the next leaf; the stale leaf is
