@@ -1287,7 +1287,7 @@ This is the parallel bucket spill amendment. The figures are from epic
    plan is kept when all of these hold:
    - every `AggregateExec` in it with mode `FinalPartitioned` was replaced
      by a `BucketedFinalAggregateExec`, which is to say
-     `BucketedFinalAggregateRule::admits` (`bucketed_final_aggregate.rs:171`)
+     `BucketedFinalAggregateRule::admits` (`bucketed_final_aggregate.rs:223`)
      accepted each one;
    - every `RepartitionExec` in it has `preserve_order` false;
    - the bucket spill amendment's derivation returns a tuning, which
@@ -1343,7 +1343,7 @@ This is the parallel bucket spill amendment. The figures are from epic
      so they count against the same `max_temp_directory_size` as every other
      spill file (`datafusion-execution` 55.2.0 `src/disk_manager.rs:478-500`;
      Ravel sets that quota from the reserved share at `session.rs:626-629`).
-     A quota trip is the typed `spill_budget_exhausted` (`executor.rs:6393`).
+     A quota trip is the typed `spill_budget_exhausted` (`executor.rs:6482`).
    - Uncharged: the `SharedCoalescer` on each output partition holds fewer
      than `batch_size` rows before `send` (lines 269-300, created at
      537-545), and the reader holds the one batch it read back. So the
@@ -1365,7 +1365,7 @@ This is the parallel bucket spill amendment. The figures are from epic
 
 3. **No third attempt.** The kept plan runs as the statement's one spill
    retry. Its failure is terminal: `spill_retry_decision` returns no retry
-   once `spill_retried` is set (`executor.rs:6627-6640`), and this
+   once `spill_retried` is set (`executor.rs:6716-6729`), and this
    amendment adds no fallback to the sort-merge plan after a bucketed
    retry fails. A bucketed retry fails with one of the typed errors
    ADR-3565's bucket spill amendment lists. Pinned by T2 #4074
