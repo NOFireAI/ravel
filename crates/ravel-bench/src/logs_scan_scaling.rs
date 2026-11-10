@@ -683,6 +683,9 @@ async fn run_combo(
     };
     let sql_config = SqlConfig {
         engine,
+        // The sweep sets the partition count; the floor would widen a final
+        // aggregate's exchange to 16 at every point under 16.
+        first_attempt_min_partitions: 0,
         ..SqlConfig::default()
     };
 

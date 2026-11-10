@@ -195,14 +195,18 @@ fn declared() -> Vec<DeclaredColumn> {
 /// `max_limit` is [`SqlConfig::bounded_topk_max_limit`]: `None` is the rule-off
 /// side of every comparison here.
 async fn executor_with_records(records: Vec<LogRecord>, max_limit: Option<usize>) -> SqlExecutor {
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    publish_logs(store.as_ref(), &tenant(), &records).await;
-    let catalog =
-        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let config = SqlConfig {
         bounded_topk_max_limit: max_limit,
         ..SqlConfig::default()
     };
+    executor_with_config(records, config).await
+}
+
+async fn executor_with_config(records: Vec<LogRecord>, config: SqlConfig) -> SqlExecutor {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_logs(store.as_ref(), &tenant(), &records).await;
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     SqlExecutor::new(
         catalog,
         SegmentFetcher::new(Arc::clone(&store)),
@@ -217,6 +221,19 @@ async fn executor_with_records(records: Vec<LogRecord>, max_limit: Option<usize>
 /// An executor over a fresh tenant holding [`records`]`(keys)`.
 async fn executor(keys: i64, max_limit: Option<usize>) -> SqlExecutor {
     executor_with_records(records(keys), max_limit).await
+}
+
+/// [`executor`] with the final aggregate's exchange at the engine's 8
+/// partitions. With the floor's 16 final streams their fixed cost sets every
+/// peak but the rule-off large one at 2,100,224 bytes, so the rule-off side
+/// grows 5.3x for ten times the keys and the scaling cannot be read.
+async fn unfloored_executor(keys: i64, max_limit: Option<usize>) -> SqlExecutor {
+    let config = SqlConfig {
+        bounded_topk_max_limit: max_limit,
+        first_attempt_min_partitions: 0,
+        ..SqlConfig::default()
+    };
+    executor_with_config(records(keys), config).await
 }
 
 fn request(sql: &str) -> SqlRequest {
@@ -725,10 +742,13 @@ const PEAK_OFF_LARGE: u64 = 11_535_872;
 #[tokio::test]
 async fn peak_intermediate_bytes_stops_scaling_with_the_key_count() {
     let sql = topk_sql(TOP_K);
-    let on_small = peak_intermediate_bytes(&executor(SMALL_KEYS, Some(TOP_K)).await, &sql).await;
-    let on_large = peak_intermediate_bytes(&executor(KEYS, Some(TOP_K)).await, &sql).await;
-    let off_small = peak_intermediate_bytes(&executor(SMALL_KEYS, None).await, &sql).await;
-    let off_large = peak_intermediate_bytes(&executor(KEYS, None).await, &sql).await;
+    let on_small =
+        peak_intermediate_bytes(&unfloored_executor(SMALL_KEYS, Some(TOP_K)).await, &sql).await;
+    let on_large =
+        peak_intermediate_bytes(&unfloored_executor(KEYS, Some(TOP_K)).await, &sql).await;
+    let off_small =
+        peak_intermediate_bytes(&unfloored_executor(SMALL_KEYS, None).await, &sql).await;
+    let off_large = peak_intermediate_bytes(&unfloored_executor(KEYS, None).await, &sql).await;
 
     assert_eq!(on_large, PEAK_ON_LARGE, "rule on, {KEYS} keys");
     assert_eq!(on_small, PEAK_ON_SMALL, "rule on, {SMALL_KEYS} keys");

@@ -153,6 +153,7 @@ use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
 use crate::compact_slices::CompactSlices;
 use crate::config::{DEFAULT_SPILL_MERGE_FAN_IN, SqlConfig};
+use crate::exchange_floor::FinalExchangeFloor;
 use crate::first_groups::FirstGroupsLimit;
 use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::ipcrypt_udf::SessionPrincipal;
@@ -889,6 +890,16 @@ pub fn build_session_with_tables(
         // `trace_id IN ('<32-hex>', ...)` against the native trace id column,
         // rewritten before `type_coercion`; see `crate::trace_id_planner`.
         .with_analyzer_rules(crate::trace_id_planner::analyzer_rules())
+        // Issue #4014 (ADR-1195 amendment of 2026-11-09): widen the hash
+        // exchange under a `FinalPartitioned` aggregate to the floor. First of
+        // the appended rules, so every rule below matches the final aggregate
+        // over the exchange it will run with, and before
+        // `DictionaryGroupKeysAsViews`, which can put a cast between the two.
+        // A spill-enabled session has no exchange to widen. See
+        // `crate::exchange_floor`.
+        .with_physical_optimizer_rule(Arc::new(FinalExchangeFloor::new(
+            config.first_attempt_min_partitions,
+        )))
         .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
         // ADR-0850 item 2: answer `COUNT(*) WHERE <declared column> <>
         // <literal>` and `GROUP BY <declared column>, COUNT(*)` from exact
@@ -2395,6 +2406,42 @@ mod tests {
             .last()
             .expect("the session has physical optimizer rules");
         assert_eq!(last.name(), crate::memory::AGGREGATE_PROFILE_RULE);
+    }
+
+    /// Issue #4014: the exchange floor runs after every DataFusion default
+    /// rule, `SanityCheckPlan` last among them, so it sees the exchange
+    /// `EnforceDistribution` placed, and it is the first of Ravel's appended
+    /// rules, directly before `DictionaryGroupKeysAsViews`.
+    ///
+    /// FLIP: install the floor after `DictionaryGroupKeysAsViews` and the pair
+    /// after the defaults reads reversed.
+    #[test]
+    fn the_exchange_floor_runs_after_the_default_rules_and_first_of_ravels() {
+        let ctx = samples_and_logs();
+        let state = ctx.state();
+        let names: Vec<&str> = state
+            .physical_optimizers()
+            .iter()
+            .map(|rule| rule.name())
+            .collect();
+        let defaults = datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new();
+        let default_names: Vec<&str> = defaults.rules.iter().map(|rule| rule.name()).collect();
+        assert_eq!(default_names.last(), Some(&"SanityCheckPlan"));
+        assert_eq!(
+            names.get(..default_names.len()),
+            Some(default_names.as_slice()),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.get(default_names.len()..default_names.len() + 2),
+            Some(
+                &[
+                    crate::exchange_floor::FINAL_EXCHANGE_FLOOR_RULE,
+                    crate::group_keys::DICTIONARY_GROUP_KEYS_RULE,
+                ][..]
+            ),
+            "{names:?}"
+        );
     }
 
     fn session_with(tables: Vec<SessionTable>) -> SessionContext {

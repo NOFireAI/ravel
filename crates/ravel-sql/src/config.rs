@@ -87,6 +87,18 @@ pub const DEFAULT_BOUNDED_GROUPS_MAX_LIMIT: usize = 1024;
 /// `LIMIT 10 OFFSET 1000`, a fetch of 1010.
 pub const DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT: usize = 1024;
 
+/// Default [`SqlConfig::first_attempt_min_partitions`] (issue #4014): the hash
+/// exchange under a final grouped aggregate has at least 16 partitions.
+///
+/// A high-cardinality grouped aggregate builds one final hash table per
+/// partition, and the process budget holds the next doubling of the widest of
+/// them in reserve. On a 2-vCPU, 4 GB host ClickBench statement 9 built eight
+/// tables of about 165 MB at 8 partitions and fit in memory only at a process
+/// budget of about 2.40 GB or more; with the whole session at 16 partitions,
+/// and so 16 final tables, the threshold fell to between 2.10 and 2.20 GB. A
+/// spill retry has no exchange to widen.
+pub const DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS: usize = 16;
+
 /// Default for [`SqlConfig::partition_topk_max_limit`].
 ///
 /// The per-partition TopK holds a `k`-row heap in every scan partition on top
@@ -563,6 +575,24 @@ pub struct SqlConfig {
     /// `crate::top_keys` module docs for why). Among keys whose sort values
     /// tie at the n-th, which come back is unspecified, as SQL leaves it.
     pub bounded_top_keys_max_limit: usize,
+    /// Partition floor for the hash exchange under a final grouped aggregate
+    /// (issue #4014). `crate::exchange_floor::FinalExchangeFloor` widens a
+    /// `Hash(keys, n)` exchange whose parent is a `FinalPartitioned`
+    /// aggregate to `Hash(keys, first_attempt_min_partitions)` when `n` is
+    /// below it; the session's `target_partitions`, and with it every scan and
+    /// partial aggregate, stay at `engine.sql_partition_count()`. Only an
+    /// in-memory attempt has such an exchange: a spill-enabled session, which
+    /// on the execute path is the ADR-0954 spill retry, plans none. 0 turns
+    /// the floor off, which is the "before" side of
+    /// `the_partition_floor_answers_in_memory_where_the_engine_count_retries`
+    /// in `tests/spill.rs`.
+    ///
+    /// Default [`DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS`]. Set once at server
+    /// startup, like every other field here; ravel-server keeps the default
+    /// when it derived the partition count and sets 0 when the operator set
+    /// one with `--sql-partition-count` or `--fetch-concurrency`, and has no
+    /// flag for it.
+    pub first_attempt_min_partitions: usize,
     /// `LIMIT` ceiling for the per-partition TopK under a row-filtered `logs`
     /// scan (ADR-0093, exact not-equal amendment). `Some(k)` installs
     /// `crate::logs_scan::LogsPartitionTopK` and lets it fire on a global
@@ -646,6 +676,7 @@ impl Default for SqlConfig {
             bounded_topk_max_limit: Some(DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
             bounded_groups_max_limit: DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
             bounded_top_keys_max_limit: DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT,
+            first_attempt_min_partitions: DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS,
             partition_topk_max_limit: Some(DEFAULT_PARTITION_TOPK_MAX_LIMIT),
             bucketed_final_aggregation: None,
             // Spill off. See the field doc: this is requirement 9 of #954 (a
@@ -696,6 +727,16 @@ impl SqlConfig {
         Ok(self)
     }
 
+    /// How many aggregate streams a query can run at once, which bounds the
+    /// reserve-ahead envelope width: `engine.sql_partition_count()`, or the
+    /// floored final aggregate's [`SqlConfig::first_attempt_min_partitions`]
+    /// when that is wider (ADR-1195, issue #4014 amendment).
+    pub fn aggregate_stream_count(&self) -> usize {
+        self.engine
+            .sql_partition_count()
+            .max(self.first_attempt_min_partitions)
+    }
+
     /// Build the query's DataFusion memory pool: a [`TenantDelegatingPool`]
     /// capped at `max_query_bytes` that forwards every grow/shrink to
     /// `tenant`. Install it on the query's `RuntimeEnv` via
@@ -735,7 +776,7 @@ impl SqlConfig {
             )
             .with_aggregate_reserve_ahead(
                 self.aggregate_reserve_ahead,
-                process_envelope_width(self.engine.sql_partition_count()),
+                process_envelope_width(self.aggregate_stream_count()),
             ),
         );
         (pool, breach)
@@ -762,7 +803,7 @@ impl SqlConfig {
             )
             .with_aggregate_reserve_ahead(
                 self.aggregate_reserve_ahead,
-                process_envelope_width(self.engine.sql_partition_count()),
+                process_envelope_width(self.aggregate_stream_count()),
             )
             .with_spill_headroom(crate::memory::spill_mode_headroom(self.max_query_bytes)),
         );
@@ -853,6 +894,32 @@ mod tests {
     fn bounded_groups_defaults_to_a_limit_of_1024() {
         assert_eq!(SqlConfig::default().bounded_groups_max_limit, 1024);
         assert_eq!(DEFAULT_BOUNDED_GROUPS_MAX_LIMIT, 1024);
+    }
+
+    /// Issue #4014: the in-memory attempt's partition floor ships on, at 16.
+    #[test]
+    fn first_attempt_min_partitions_defaults_to_16() {
+        assert_eq!(SqlConfig::default().first_attempt_min_partitions, 16);
+        assert_eq!(DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS, 16);
+    }
+
+    /// Issue #4014: the envelope width counts the floored final aggregate's
+    /// streams while the floor is on, and the engine count when it is off or
+    /// lower. FLIP: return `engine.sql_partition_count()` alone and the first
+    /// case reads 4.
+    #[test]
+    fn aggregate_stream_count_is_the_wider_of_the_count_and_the_floor() {
+        let cases = [(4, 16, 16), (4, 0, 4), (32, 16, 32)];
+        for (partitions, floor, streams) in cases {
+            let mut config = SqlConfig::default();
+            config.engine.sql_partition_count = Some(partitions);
+            config.first_attempt_min_partitions = floor;
+            assert_eq!(
+                config.aggregate_stream_count(),
+                streams,
+                "count {partitions}, floor {floor}"
+            );
+        }
     }
 
     /// Issue #4004: the top-keys bound ships on, with a ceiling of 1024 rows.
