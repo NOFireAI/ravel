@@ -3026,6 +3026,8 @@ jobs:
           path: lcov-${{ matrix.shard }}.info
           retention-days: 1
           if-no-files-found: error
+          # A re-run attempt reuses the run, and with it this name.
+          overwrite: true
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
@@ -3036,14 +3038,14 @@ jobs:
   # job name coverage has always had. Not a required check, as before; it
   # runs on the same contexts as the legs and fails if any leg failed, so a
   # partial upload never replaces the badge's figure.
+  # Like the check, sql and flight-sql collectors, it runs always and decides
+  # in its first step whether the legs should have run, so a matrix that
+  # correctly skipped and one that failed are told apart, and the gate below
+  # is the only copy of coverage-shard's condition that can drift: a mismatch
+  # between it and the matrix result is a named error.
   coverage:
-    needs: [changes, coverage-shard]
-    if: >-
-      always()
-      && needs.changes.outputs.docs_only != 'true'
-      && ((github.event_name == 'push' && github.ref == 'refs/heads/main')
-          || (github.event_name == 'pull_request'
-              && contains(github.event.pull_request.labels.*.name, 'run-coverage')))
+    needs: [changes, lint, coverage-shard]
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # id-token:write is the Codecov upload's tokenless-OIDC grant (public
@@ -3056,22 +3058,58 @@ jobs:
       # The number of legs in coverage-shard's shard list.
       EXPECTED_SHARDS: 4
     steps:
-      - name: Require every leg
+      - name: Decide the coverage lane
+        id: gate
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
           SHARDS_RESULT: ${{ needs.coverage-shard.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          LABELLED: ${{ contains(github.event.pull_request.labels.*.name, 'run-coverage') }}
         run: |
-          echo "changes=$CHANGES_RESULT coverage-shard=$SHARDS_RESULT"
-          if [ "$CHANGES_RESULT" != "success" ] || [ "$SHARDS_RESULT" != "success" ]; then
-            echo "::error::coverage-shard reported $SHARDS_RESULT (changes: $CHANGES_RESULT); not uploading a partial report"
+          # The same condition coverage-shard's if: states.
+          applies=false
+          if [ "$DOCS_ONLY" != "true" ]; then
+            if { [ "$EVENT" = push ] && [ "$REF" = refs/heads/main ]; } \
+              || { [ "$EVENT" = pull_request ] && [ "$LABELLED" = true ]; }; then
+              applies=true
+            fi
+          fi
+          echo "applies=$applies changes=$CHANGES_RESULT lint=$LINT_RESULT coverage-shard=$SHARDS_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::the changes job did not succeed ($CHANGES_RESULT); the coverage lane cannot be judged"
             exit 1
           fi
+          if [ "$applies" != true ]; then
+            if [ "$SHARDS_RESULT" != "skipped" ]; then
+              echo "::error::the coverage lane does not apply but coverage-shard reported $SHARDS_RESULT"
+              exit 1
+            fi
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$LINT_RESULT" != "success" ]; then
+            # lint's own check is the signal; coverage-shard needs lint and
+            # did not run.
+            echo "lint reported $LINT_RESULT; coverage not judged"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$SHARDS_RESULT" != "success" ]; then
+            echo "::error::coverage-shard reported $SHARDS_RESULT; not uploading a partial report"
+            exit 1
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
       # The checkout gives the Codecov uploader the tree it maps report paths
       # onto, as the single job had.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: steps.gate.outputs.run == 'true'
         with:
           persist-credentials: false
       - name: Download every leg's lcov
+        if: steps.gate.outputs.run == 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: coverage-lcov-*
@@ -3083,7 +3121,9 @@ jobs:
       # from the same files.
       - name: Merge the line figure
         id: merge
+        if: steps.gate.outputs.run == 'true'
         run: |
+          set -o pipefail
           shopt -s nullglob
           files=(coverage-lcov/lcov-*.info)
           if [ "${#files[@]}" -ne "$EXPECTED_SHARDS" ]; then
@@ -3115,6 +3155,7 @@ jobs:
       # badge and per-file/diff coverage on codecov.io; never fails the job
       # on an upload hiccup.
       - name: Upload coverage reports to Codecov
+        if: steps.gate.outputs.run == 'true'
         uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
