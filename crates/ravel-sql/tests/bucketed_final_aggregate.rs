@@ -1739,10 +1739,10 @@ impl fmt::Debug for SpillRun {
 /// One pool call by a bucketed consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolEvent {
-    /// A `try_grow` the pool admitted.
-    Grown,
-    /// A `try_grow` the pool refused.
-    Refused,
+    /// A `try_grow` of this many bytes the pool admitted.
+    Grown(usize),
+    /// A `try_grow` of this many bytes the pool refused.
+    Refused(usize),
     /// An infallible `grow`.
     Forced,
     Shrunk,
@@ -1833,7 +1833,7 @@ impl MemoryPool for CappedPool {
             .name()
             .starts_with(BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX);
         if bucketed && after > self.cap {
-            self.record(reservation, PoolEvent::Refused);
+            self.record(reservation, PoolEvent::Refused(additional));
             self.refusals.fetch_add(1, Ordering::SeqCst);
             return Err(datafusion::error::DataFusionError::ResourcesExhausted(
                 format!(
@@ -1844,7 +1844,7 @@ impl MemoryPool for CappedPool {
                 ),
             ));
         }
-        self.record(reservation, PoolEvent::Grown);
+        self.record(reservation, PoolEvent::Grown(additional));
         self.inner.try_grow(reservation, additional)
     }
 
@@ -2164,29 +2164,72 @@ async fn bucket_spill_disk_within_write_once_bound() {
 }
 
 /// The phase 1 trigger routes the stock table under the charge it already
-/// holds: each bucketed consumer's first refusal is followed by the
-/// recomputed charge's shrink, never by another grow.
+/// holds, and sizes the router's scratch once inside it. At a cap that
+/// refuses each stream's table with more than a batch of its input still to
+/// come, every bucketed consumer's first refusal is
+/// followed by the recomputed charge's shrink, and from there to the end of
+/// its input the stream asks the pool for routed chunks and nothing else (a
+/// scratch sized per batch would be a grow of another size), over more
+/// chunks than one batch of the session's `batch_size` rows can open.
 #[tokio::test]
 async fn bucket_spill_forced_route_asks_nothing() {
-    let run = spilled(SAMPLES_SQL, 2, PHASE_1).await;
+    const BATCH_ROWS: usize = 8192;
+    const CAP: usize = 640 << 10;
+    const SAMPLES_HERE: i64 = 4 * SAMPLES;
+    let tuning = BucketedFinalAggregation {
+        bits: 5,
+        ..PHASE_1.tuning()
+    };
+    let planned =
+        Planned::with_samples(SAMPLES_SQL, sql_config(2, Some(tuning), None), SAMPLES_HERE).await;
+    let run = run_spilled(&planned, 2, CAP)
+        .await
+        .expect("spills and answers");
+    assert!(run.spilled_rows > 0, "nothing spilled: {run:?}");
+    assert_eq!(
+        run.rows,
+        unspilled_rows_of(SAMPLES_SQL, 2, SAMPLES_HERE).await
+    );
+    let chunk = ravel_sql::routed_chunk_charge(&[8, 8], SPILL_CHUNK_ROWS).expect("fits");
+    let one_batch = BATCH_ROWS.div_ceil(SPILL_CHUNK_ROWS) + (1 << tuning.bits);
     let mut by_consumer: std::collections::BTreeMap<&str, Vec<PoolEvent>> = Default::default();
     for (name, event) in &run.events {
         by_consumer.entry(name).or_default().push(*event);
     }
-    let mut forced = 0;
+    assert_eq!(by_consumer.len(), 2, "{run:?}");
     for (name, events) in &by_consumer {
-        let Some(at) = events.iter().position(|e| *e == PoolEvent::Refused) else {
-            continue;
-        };
-        forced += 1;
+        let at = events
+            .iter()
+            .position(|e| matches!(e, PoolEvent::Refused(_)))
+            .unwrap_or_else(|| panic!("{name} was never refused: {events:?}"));
         assert_eq!(
             events.get(at + 1),
             Some(&PoolEvent::Shrunk),
             "{name}: the forced route asked the pool: {:?}",
             &events[at..(at + 4).min(events.len())]
         );
+        // The drain's tables and read-back batches follow the last chunk.
+        let asks: Vec<usize> = events[at + 1..]
+            .iter()
+            .filter_map(|e| match e {
+                PoolEvent::Grown(bytes) | PoolEvent::Refused(bytes) => Some(*bytes),
+                _ => None,
+            })
+            .collect();
+        let routed = asks
+            .iter()
+            .rposition(|bytes| *bytes == chunk)
+            .map_or(&asks[..0], |last| &asks[..=last]);
+        assert!(
+            routed.iter().all(|bytes| *bytes == chunk),
+            "{name} asked for more than {chunk}-byte chunks after its forced route: {routed:?}"
+        );
+        assert!(
+            routed.len() > one_batch,
+            "{name}: {} chunk asks after the forced route, one batch opens up to {one_batch}",
+            routed.len()
+        );
     }
-    assert!(forced > 0, "no consumer was refused: {run:?}");
 }
 
 /// At a quarter of the phase 2 share the stream runs out of routed state to

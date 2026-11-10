@@ -162,6 +162,7 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 
+use crate::bucket_spill_tuning::routed_column_capacities;
 use crate::compact_slices::TopKPrefilter;
 use crate::config::BucketedFinalAggregation;
 
@@ -720,12 +721,16 @@ impl OpenChunk {
     fn allocate(types: &[(DataType, usize)], rows: usize) -> Self {
         let columns: Vec<ColumnChunk> = types
             .iter()
-            .map(|(data_type, width)| ColumnChunk {
-                data_type: data_type.clone(),
-                width: *width,
-                values: MutableBuffer::with_capacity(rows * width),
-                validity: MutableBuffer::from_len_zeroed(bit_util::ceil(rows, 8)),
-                null_count: 0,
+            .map(|(data_type, width)| {
+                let (values, validity) = routed_column_capacities(*width, rows)
+                    .unwrap_or((usize::MAX, usize::MAX));
+                ColumnChunk {
+                    data_type: data_type.clone(),
+                    width: *width,
+                    values: MutableBuffer::with_capacity(values),
+                    validity: MutableBuffer::from_len_zeroed(validity),
+                    null_count: 0,
+                }
             })
             .collect();
         let charged = columns
@@ -1452,7 +1457,9 @@ impl BucketedStream {
         self.group_indices = Vec::new();
         spill.triggered = true;
         // The router's per-row scratch is sized once, inside what the table
-        // held, so routing later batches never asks the pool for it.
+        // held, so routing later batches never asks the pool for it. A table
+        // that held under `ROUTER_ROW_SCRATCH` spare bytes routes one row per
+        // call: accepted, since a floor would be a grow the pool just refused.
         router.fix_scratch(0);
         let held = self
             .table_bytes
@@ -1893,7 +1900,7 @@ mod tests {
         for (data_type, width) in &types {
             assert_eq!(data_type.primitive_width(), Some(*width), "{data_type}");
         }
-        for rows in [1, 7, 8, 9, 63, 64, 65, 1023, 1024, 2372, 8192] {
+        for rows in [1, 7, 8, 9, 63, 64, 65, 1023, 1024, 2368, 8192] {
             for set in [&types[..], &types[3..4], &types[1..3], &types[4..]] {
                 let widths: Vec<usize> = set.iter().map(|(_, width)| *width).collect();
                 assert_eq!(
