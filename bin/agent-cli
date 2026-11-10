@@ -26,6 +26,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import select
 import stat
 import subprocess
@@ -940,7 +941,47 @@ SPEC_HEAD = {"gate_tier": lambda v: v in GATE_TIERS,
 # a shell parse error on the executor, which reads as below-floor rather
 # than as the template defect it is.
 DISK_FLOOR_PLACEHOLDER = "<disk_floor_gb>"
-HEADROOM_INVOCATION = re.compile(r"check-disk-headroom\.sh\s+\S+\s+(\d+)")
+HEADROOM_SCRIPT = "check-disk-headroom.sh"
+# A command separator: what may precede the script for it to be an
+# invocation rather than prose that names it ("If ...headroom.sh exits 1").
+SHELL_SEPARATORS = ("&&", "||", ";", "|")
+
+
+def headroom_invocations(lines):
+    """(line number, floor argument or None) for each line that runs
+    check-disk-headroom.sh as a command: the script is the line's first word
+    or follows a command separator. A trailing backslash joins the next line.
+    Comment lines and prose that merely names the script are skipped. The
+    floor is the second argument after the script with shell quoting and a
+    trailing separator removed, or None when there is no second argument."""
+    out = []
+    i = 0
+    while i < len(lines):
+        start = i
+        text = lines[i]
+        while text.rstrip().endswith("\\") and i + 1 < len(lines):
+            i += 1
+            text = text.rstrip()[:-1] + " " + lines[i]
+        i += 1
+        if HEADROOM_SCRIPT not in text or text.lstrip().startswith("#"):
+            continue
+        spaced = re.sub(r"(&&|\|\||;|\|)", r" \1 ", text)
+        try:
+            words = shlex.split(spaced, comments=False, posix=True)
+        except ValueError:
+            words = spaced.split()
+        for k, w in enumerate(words):
+            if not (w.endswith("/" + HEADROOM_SCRIPT) or w == HEADROOM_SCRIPT):
+                continue
+            if k > 0 and words[k - 1] not in SHELL_SEPARATORS:
+                continue
+            args = []
+            for a in words[k + 1:]:
+                if a in SHELL_SEPARATORS:
+                    break
+                args.append(a)
+            out.append((start + 1, args[1] if len(args) >= 2 else None))
+    return out
 
 
 def spec_head_values(spec):
@@ -971,21 +1012,27 @@ def spec_head_values(spec):
                                else "a positive integer"))
         elif len(values) > 1:
             problems.append(f"{key} given twice: {', '.join(sorted(values))}")
-    for i, line in enumerate(lines, 1):
-        if DISK_FLOOR_PLACEHOLDER in line:
-            problems.append(f"line {i} still has the unfilled {DISK_FLOOR_PLACEHOLDER} template placeholder")
+    head_problems = list(problems)
     declared = found["disk_floor_gb"]
-    if len(declared) == 1 and SPEC_HEAD["disk_floor_gb"](next(iter(declared))):
-        declared_floor = int(next(iter(declared)))
-        for i, line in enumerate(lines, 1):
-            m = HEADROOM_INVOCATION.search(line)
-            if m and int(m.group(1)) != declared_floor:
-                problems.append(f"line {i} check-disk-headroom.sh floor {m.group(1)} differs from "
-                                f"declared disk_floor_gb {declared_floor}")
+    declared_floor = (int(next(iter(declared)))
+                      if len(declared) == 1 and SPEC_HEAD["disk_floor_gb"](next(iter(declared)))
+                      else None)
+    # Only the headroom command itself is checked: the template also names
+    # the placeholder in prose and in the executor's below-floor report
+    # format, and a filled spec keeps both.
+    for i, floor_arg in headroom_invocations(lines):
+        if floor_arg is None:
+            problems.append(f"line {i} runs {HEADROOM_SCRIPT} without a floor argument")
+        elif DISK_FLOOR_PLACEHOLDER in floor_arg or not re.fullmatch(r"[0-9]+", floor_arg):
+            problems.append(f"line {i} {HEADROOM_SCRIPT} floor {floor_arg!r} is not an integer "
+                            f"(an unfilled {DISK_FLOOR_PLACEHOLDER} placeholder?)")
+        elif declared_floor is not None and int(floor_arg) != declared_floor:
+            problems.append(f"line {i} {HEADROOM_SCRIPT} floor {int(floor_arg)} differs from "
+                            f"declared disk_floor_gb {declared_floor}")
     if problems:
-        raise CliError("spec head refused, nothing dispatched: " + "; ".join(problems)
-                       + " (each on its own line: gate_tier: <" + "|".join(GATE_TIERS)
-                       + ">, disk_floor_gb: <N>)", 2)
+        hint = (" (each on its own line: gate_tier: <" + "|".join(GATE_TIERS)
+                + ">, disk_floor_gb: <N>)") if head_problems else ""
+        raise CliError("spec refused, nothing dispatched: " + "; ".join(problems) + hint, 2)
     return found["gate_tier"].pop(), int(found["disk_floor_gb"].pop())
 
 
