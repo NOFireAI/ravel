@@ -255,6 +255,16 @@ class SpecLint(unittest.TestCase):
         with self.assertRaises(cli.CliError) as ctx:
             cli.spec_head_values(head + "    scripts/guards/check-disk-headroom.sh .gate-logs \\\n      5\n")
         self.assertIn("floor 5 differs", str(ctx.exception))
+        # FLIP: skipping every placeholder floor as already reported by the
+        # one-line scan lets a wrapped one through.
+        with self.assertRaises(cli.CliError) as ctx:
+            cli.spec_head_values(head + "    scripts/guards/check-disk-headroom.sh .gate-logs \\\n"
+                                 "      <disk_floor_gb>\n")
+        self.assertIn("'<disk_floor_gb>' is not an integer", str(ctx.exception))
+        # FLIP: splitting ${FLOOR} at its braces reports the floor as '$'.
+        with self.assertRaises(cli.CliError) as ctx:
+            cli.spec_head_values(head + run.format("${FLOOR}"))
+        self.assertIn("'${FLOOR}' is not an integer", str(ctx.exception))
         # FLIP: treating the guard's default floor as acceptable passes this.
         with self.assertRaises(cli.CliError) as ctx:
             cli.spec_head_values(head + "    scripts/guards/check-disk-headroom.sh .gate-logs\n")
