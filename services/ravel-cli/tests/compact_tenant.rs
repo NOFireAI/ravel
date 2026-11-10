@@ -1706,13 +1706,16 @@ async fn compact_tenant_skips_a_bucket_a_foreign_process_has_claimed() {
     assert_eq!(lines.len(), 4, "one line per bucket: {text}");
     // The foreign claim's expiry is the store's `last_modified` (the clock set
     // above) plus the 300 s default lease, and the retry point one ms past it.
+    // For held_by_another the recheck point equals the retry point.
     assert_eq!(
         lines[2],
         format!(
             "shard={CLAIMED_SHARD} hour={HOUR_OLD} outcome=ClaimSkipped reason=held_by_another \
-             work_id={} holder={foreign} claim_expiry_unix_ms={} retry_after_unix_ms={}",
+             work_id={} holder={foreign} claim_expiry_unix_ms={} retry_after_unix_ms={} \
+             recheck_after_unix_ms={}",
             work_id_hex(CLAIMED_SHARD, HOUR_OLD),
             wall_ms + 300_000,
+            wall_ms + 300_001,
             wall_ms + 300_001
         ),
         "the skipped bucket's line: {text}"
@@ -1767,6 +1770,84 @@ async fn compact_tenant_skips_a_bucket_a_foreign_process_has_claimed() {
         3,
         "no bucket merged twice, none skipped merged"
     );
+}
+
+/// An unreadable claim prints two different instants: `retry_after_unix_ms`,
+/// the 24 h steal threshold plus this contender's jitter, and
+/// `recheck_after_unix_ms`, one 300 s default lease plus the same jitter past
+/// the observation, which is when a running process looks at the bucket again.
+///
+/// Distinguishing: printing `reschedule_after_unix_ms` for both fields fails
+/// the line comparison (the recheck figure reads
+/// `wall_ms + 86_400_000 + jitter + 1`); dropping the field fails it on the
+/// missing `recheck_after_unix_ms=` text.
+#[tokio::test]
+async fn an_unreadable_claim_prints_its_recheck_point_beside_the_steal_threshold() {
+    let (mem, wall_ms) = claim_fixture().await;
+    let key = claim_key(CLAIMED_SHARD, HOUR_OLD);
+    // The store clock is `wall_ms`, so the claim's `last_modified` is too.
+    mem.put(
+        &key,
+        Bytes::from_static(b"\xffnot a claim"),
+        PutOptions::create_if_absent(),
+    )
+    .await
+    .expect("plant an unreadable claim");
+    // The contender observes at exactly `wall_ms`.
+    let claims = ClaimOptions {
+        clock: Some(
+            Arc::new(FixedClock::new(wall_ms * 1_000_000)) as Arc<dyn ravel_maintain::Clock>
+        ),
+        ..claiming()
+    };
+    let jitter = ravel_fleet::claim::jitter_ms(
+        &WorkIdentity::new(tenant_hash(), Signal::Logs, CLAIMED_SHARD, HOUR_OLD).work_id(),
+        &claims.process_id,
+        300_000,
+        &ClaimConfig::default(),
+    );
+    // A draw of 0 is allowed: the two figures still differ by 86_100_000 ms.
+    assert!(jitter >= 0, "jitter is never negative: {jitter}");
+
+    let (result, text) =
+        run_claim_walk(mem as Arc<dyn ObjectStoreBackend>, false, 1, &claims).await;
+    let report = result.expect("a claim-skipped bucket is not a failure");
+    assert_eq!(
+        report.claim_skipped, 1,
+        "the planted claim holds one bucket: {text}"
+    );
+
+    let prefix = format!("shard={CLAIMED_SHARD} hour={HOUR_OLD} outcome=ClaimSkipped");
+    let skipped: Vec<&str> = text.lines().filter(|l| l.starts_with(&prefix)).collect();
+    assert_eq!(skipped.len(), 1, "one skip line: {text}");
+    let retry = wall_ms + 86_400_000 + jitter + 1;
+    let recheck = wall_ms + 300_000 + jitter + 1;
+    assert_eq!(
+        skipped[0],
+        format!(
+            "{prefix} reason=unreadable_claim work_id={} holder=unknown \
+             claim_expiry_unix_ms={} retry_after_unix_ms={retry} \
+             recheck_after_unix_ms={recheck}",
+            work_id_hex(CLAIMED_SHARD, HOUR_OLD),
+            wall_ms + 86_400_000,
+        ),
+        "the skipped bucket's line: {text}"
+    );
+    assert!(
+        recheck < retry,
+        "a running process looks again within one lease, long before the steal threshold"
+    );
+    let others: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("shard=") && !l.starts_with(&prefix))
+        .collect();
+    assert_eq!(others.len(), 3, "one line per other bucket: {text}");
+    for line in others {
+        assert!(
+            line.ends_with("outcome=Compacted parts=1 publish=Published"),
+            "the other buckets compact: {line}"
+        );
+    }
 }
 
 /// `--no-claim` over the same store: the claimed bucket is compacted too, and
@@ -2146,13 +2227,16 @@ async fn compact_bucket_skips_a_claimed_bucket_and_no_claim_compacts_it() {
     };
 
     let text = run(false, claiming()).await;
+    // For held_by_another the recheck point equals the retry point, one ms
+    // past the expiry.
     assert!(
         text.contains(&format!(
             "\noutcome: ClaimSkipped (this bucket's compaction claim was not taken; \
              nothing was merged) reason=held_by_another work_id={} holder={foreign} \
-             claim_expiry_unix_ms={} retry_after_unix_ms={}\n",
+             claim_expiry_unix_ms={} retry_after_unix_ms={} recheck_after_unix_ms={}\n",
             work_id_hex(CLAIMED_SHARD, HOUR_OLD),
             wall_ms + 300_000,
+            wall_ms + 300_001,
             wall_ms + 300_001
         )),
         "skip line: {text}"

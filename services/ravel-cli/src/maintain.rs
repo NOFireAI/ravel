@@ -177,16 +177,24 @@ fn install_claims(config: &mut CompactorConfig, dry_run: bool, claims: &ClaimOpt
 }
 
 /// The report fields of a bucket refused its claim, shared by both commands.
+///
+/// `retry_after_unix_ms` is the earliest point a rerun can take the claim and
+/// `recheck_after_unix_ms` the point a running maintenance process looks at
+/// the bucket again. They can differ only for an unreadable claim, where the
+/// retry point is the 24 h steal threshold and the recheck comes at most one
+/// claim lease plus jitter after the observation.
 fn claim_skip_fields(skip: &ClaimSkip) -> String {
     let holder = skip
         .holder_process_id
         .map_or_else(|| "unknown".to_string(), |id| id.to_string());
     format!(
-        "reason={} work_id={} holder={holder} claim_expiry_unix_ms={} retry_after_unix_ms={}",
+        "reason={} work_id={} holder={holder} claim_expiry_unix_ms={} retry_after_unix_ms={} \
+         recheck_after_unix_ms={}",
         skip.reason.name(),
         skip.work_id_hex,
         skip.expiry_unix_ms,
-        skip.reschedule_after_unix_ms
+        skip.reschedule_after_unix_ms,
+        skip.recheck_after_unix_ms
     )
 }
 
