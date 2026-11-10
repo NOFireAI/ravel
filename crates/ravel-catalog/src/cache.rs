@@ -1059,24 +1059,33 @@ struct PressureCandidate {
     reserved_bytes: u64,
 }
 
-/// Append every entry of `tenants` no reader holds to `out`.
+/// Append every entry of `tenants` no reader holds to `out`, and return
+/// their summed reservation bytes.
 fn collect_unheld<V>(
     tenants: &HashMap<TenantHash, DecodedTenantCache<V>>,
     side: PressureSide,
     out: &mut Vec<PressureCandidate>,
-) {
+) -> u64 {
+    let mut sum = 0u64;
     for (tenant, cache) in tenants {
-        out.extend(
-            cache
-                .unheld_by_use()
-                .map(|(use_tick, reserved_bytes)| PressureCandidate {
-                    use_tick,
-                    side,
-                    tenant: *tenant,
-                    reserved_bytes,
-                }),
-        );
+        out.extend(cache.unheld_by_use().map(|(use_tick, reserved_bytes)| {
+            sum = sum.saturating_add(reserved_bytes);
+            PressureCandidate {
+                use_tick,
+                side,
+                tenant: *tenant,
+                reserved_bytes,
+            }
+        }));
     }
+    sum
+}
+
+/// The summed [`DecodedEntry::reserved_bytes`] of `entries`.
+fn summed_reserved_bytes<V>(entries: &[DecodedEntry<V>]) -> u64 {
+    entries
+        .iter()
+        .fold(0u64, |sum, entry| sum.saturating_add(entry.reserved_bytes))
 }
 
 /// Remove `tenant`'s entry stamped `tick`, and the tenant's map entry with
@@ -1135,6 +1144,10 @@ fn remove_tenant_entry<V>(
 /// it frees, and so always terminates.
 pub(crate) struct DecodedCache<V> {
     tenants: Mutex<HashMap<TenantHash, DecodedTenantCache<V>>>,
+    /// Summed [`DecodedTenantCache::reserved_bytes`] across `tenants`,
+    /// changed only under that lock, so [`Self::reserved_bytes_unlocked`]
+    /// can read it without taking the lock.
+    reserved_total: AtomicU64,
     clock: Arc<RecencyClock>,
 }
 
@@ -1148,8 +1161,23 @@ impl<V> DecodedCache<V> {
     fn with_clock(clock: Arc<RecencyClock>) -> Self {
         Self {
             tenants: Mutex::new(HashMap::new()),
+            reserved_total: AtomicU64::new(0),
             clock,
         }
+    }
+
+    /// Move [`Self::reserved_total`] from a tenant's `before` to its `after`.
+    /// Call only while holding the map lock.
+    fn track_reserved(&self, before: u64, after: u64) {
+        let _ = self
+            .reserved_total
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                Some(if after >= before {
+                    total.saturating_add(after - before)
+                } else {
+                    total.saturating_sub(before - after)
+                })
+            });
     }
 
     pub(crate) fn get(
@@ -1189,12 +1217,26 @@ impl<V> DecodedCache<V> {
             .fold(0u64, |sum, cache| sum.saturating_add(cache.reserved_bytes))
     }
 
+    /// [`Self::reserved_bytes`] without taking the map lock: the total is
+    /// kept in step under it, so a read racing an insert or an eviction sees
+    /// the value from one side of it.
+    fn reserved_bytes_unlocked(&self) -> u64 {
+        self.reserved_total.load(Ordering::Relaxed)
+    }
+
     /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
     /// decision 2). Returns whether an entry was present. These objects are
     /// content-addressed and immutable, so a later miss re-fetches and
     /// re-decodes.
     pub(crate) fn evict_tenant(&self, tenant: &TenantHash) -> bool {
-        self.tenants.lock().remove(tenant).is_some()
+        let mut tenants = self.tenants.lock();
+        let Some(removed) = tenants.remove(tenant) else {
+            return false;
+        };
+        self.track_reserved(removed.reserved_bytes, 0);
+        drop(tenants);
+        drop(removed);
+        true
     }
 
     /// The stamp of the least-recently-used entry across every tenant, or
@@ -1231,6 +1273,9 @@ impl<V> DecodedCache<V> {
             .is_some_and(|cache| cache.entries.is_empty())
         {
             tenants.remove(&tenant);
+        }
+        if let Some(entry) = &evicted {
+            self.track_reserved(entry.reserved_bytes, 0);
         }
         drop(tenants);
         evicted.map(|entry| entry.reserved_bytes)
@@ -1278,14 +1323,12 @@ impl<T> DecodedCache<Charged<T>> {
     ) {
         let tick = self.clock.next();
         let reserved_bytes = value.reserved_bytes();
-        self.tenants.lock().entry(tenant).or_default().insert(
-            key,
-            value,
-            bytes,
-            reserved_bytes,
-            capacity,
-            tick,
-        );
+        let mut tenants = self.tenants.lock();
+        let cache = tenants.entry(tenant).or_default();
+        let before = cache.reserved_bytes;
+        cache.insert(key, value, bytes, reserved_bytes, capacity, tick);
+        let after = cache.reserved_bytes;
+        self.track_reserved(before, after);
     }
 }
 
@@ -1499,7 +1542,13 @@ impl DecodedCaches {
     /// that could not fit with both caches empty. Emptying every tenant's
     /// entries would not admit the refused reservation, so it would only
     /// cost them a re-fetch and re-decode. A `want` exactly equal to that sum
-    /// drops every unheld entry.
+    /// drops every unheld entry. A `want` above every entry's reservation
+    /// bytes, held ones included, is refused before either lock is taken,
+    /// from the totals each cache keeps under its lock: a closed host-memory
+    /// gate asks for far more than the caches hold on every refusal, and
+    /// that refusal then costs no `get` or `insert` a wait. The exact sum
+    /// over unheld entries is still taken under the locks for any other
+    /// `want`, and the candidates are sorted only once it passes.
     ///
     /// The whole pass runs under both caches' map locks, parts then postings
     /// (no other path holds both). Every new handle to a cached value is
@@ -1515,14 +1564,15 @@ impl DecodedCaches {
     /// catalog's own decode. Each dropped entry is counted on
     /// [`Self::memory_evictions`]; a skipped held entry is not.
     pub(crate) fn evict_for_pressure(&self, want: u64) -> u64 {
+        if want > self.reserved_bytes_unlocked() {
+            return 0;
+        }
         let mut parts = self.parts.tenants.lock();
         let mut postings = self.postings.tenants.lock();
         let mut candidates = Vec::new();
-        collect_unheld(&parts, PressureSide::Parts, &mut candidates);
-        collect_unheld(&postings, PressureSide::Postings, &mut candidates);
-        let reclaimable = candidates
-            .iter()
-            .fold(0u64, |sum, c| sum.saturating_add(c.reserved_bytes));
+        let in_parts = collect_unheld(&parts, PressureSide::Parts, &mut candidates);
+        let in_postings = collect_unheld(&postings, PressureSide::Postings, &mut candidates);
+        let reclaimable = in_parts.saturating_add(in_postings);
         if want > reclaimable {
             return 0;
         }
@@ -1555,6 +1605,10 @@ impl DecodedCaches {
                 freed = freed.saturating_add(candidate.reserved_bytes);
             }
         }
+        self.parts
+            .track_reserved(summed_reserved_bytes(&dropped_parts), 0);
+        self.postings
+            .track_reserved(summed_reserved_bytes(&dropped_postings), 0);
         drop(postings);
         drop(parts);
         let dropped = (dropped_parts.len() + dropped_postings.len()) as u64;
@@ -1603,6 +1657,13 @@ impl DecodedCaches {
         self.parts
             .reserved_bytes()
             .saturating_add(self.postings.reserved_bytes())
+    }
+
+    /// [`Self::reserved_bytes`] without taking either cache's lock.
+    fn reserved_bytes_unlocked(&self) -> u64 {
+        self.parts
+            .reserved_bytes_unlocked()
+            .saturating_add(self.postings.reserved_bytes_unlocked())
     }
 
     /// Entries dropped under memory pressure since this catalog was built.
@@ -3277,7 +3338,8 @@ mod tests {
     /// Issue #2108: the decoded caches' held figure is the bytes their
     /// entries' reservations carry, exact through an insert, a replacement
     /// offered for a key already held, a capacity eviction, a memory eviction,
-    /// and a tenant eviction.
+    /// and a tenant eviction. The total kept beside the map lock reads the
+    /// same at every step.
     ///
     /// FLIP: drop the `reserved_bytes` subtraction in
     /// `DecodedTenantCache::remove_lru` (cache.rs) and the figure after the
@@ -3299,6 +3361,7 @@ mod tests {
         let other = TenantHash([0x25; 16]);
         let caches = DecodedCaches::default();
         assert_eq!(caches.reserved_bytes(), 0);
+        assert_eq!(caches.reserved_bytes_unlocked(), 0);
 
         caches
             .parts()
@@ -3307,6 +3370,7 @@ mod tests {
             .parts()
             .insert(tenant, "b".to_string(), charged_part(20), 1, 2);
         assert_eq!(caches.reserved_bytes(), 30);
+        assert_eq!(caches.reserved_bytes_unlocked(), 30);
 
         // A replacement for a held key is not stored, so it adds nothing, and
         // its reservation goes back once the caller drops it. It also marks
@@ -3316,6 +3380,7 @@ mod tests {
             .parts()
             .insert(tenant, "a".to_string(), Arc::clone(&replacement), 1, 2);
         assert_eq!(caches.reserved_bytes(), 30);
+        assert_eq!(caches.reserved_bytes_unlocked(), 30);
         assert_eq!(budget.reserved(), 37);
         drop(replacement);
         assert_eq!(budget.reserved(), 30);
@@ -3326,6 +3391,7 @@ mod tests {
             .insert(tenant, "c".to_string(), charged_part(40), 1, 2);
         assert_eq!(caches.parts().total_entries(), 2);
         assert_eq!(caches.reserved_bytes(), 50);
+        assert_eq!(caches.reserved_bytes_unlocked(), 50);
         assert_eq!(budget.reserved(), 50);
 
         caches.postings().insert(
@@ -3339,16 +3405,20 @@ mod tests {
             2,
         );
         assert_eq!(caches.reserved_bytes(), 55);
+        assert_eq!(caches.reserved_bytes_unlocked(), 55);
 
         // The memory eviction takes the oldest entry, "a".
         assert!(caches.evict_one_lru());
         assert_eq!(caches.reserved_bytes(), 45);
+        assert_eq!(caches.reserved_bytes_unlocked(), 45);
         assert_eq!(budget.reserved(), 45);
 
         caches.evict_tenant(&tenant);
         assert_eq!(caches.reserved_bytes(), 5);
+        assert_eq!(caches.reserved_bytes_unlocked(), 5);
         caches.evict_tenant(&other);
         assert_eq!(caches.reserved_bytes(), 0);
+        assert_eq!(caches.reserved_bytes_unlocked(), 0);
         assert_eq!(budget.reserved(), 0);
     }
 
@@ -3627,6 +3697,7 @@ mod tests {
             .get(&PRESSURE_B, "b2", &QueryAccounting::new())
             .expect("b2 is cached");
         assert_eq!(caches.reserved_bytes(), 155);
+        assert_eq!(caches.reserved_bytes_unlocked(), 155);
         assert_eq!(budget.reserved(), 155);
         (caches, live)
     }
@@ -3684,6 +3755,7 @@ mod tests {
         assert_eq!(caches.postings().total_entries(), 0);
         assert_eq!(caches.memory_evictions(), 3);
         assert_eq!(caches.reserved_bytes(), 100);
+        assert_eq!(caches.reserved_bytes_unlocked(), 100);
         assert_eq!(budget.reserved(), 100, "the dropped entries came back");
         drop(live);
     }
@@ -3727,7 +3799,44 @@ mod tests {
         assert_eq!(caches.postings().entry_count(&late), LATE as usize);
         assert_eq!(caches.postings().total_entries(), LATE as usize);
         assert_eq!(caches.reserved_bytes(), LATE);
+        assert_eq!(caches.reserved_bytes_unlocked(), LATE);
         assert_eq!(budget.reserved(), LATE);
+    }
+
+    /// Issue #4015 review: a pressure shortfall above every cached entry's
+    /// reservation bytes, held entries included, is refused before the pass
+    /// takes either cache's map lock, so a closed host-memory gate refusing
+    /// every reservation does not hold off each `get` and `insert` behind a
+    /// walk that frees nothing. This test holds the parts cache's lock while
+    /// another thread asks for one byte more than the caches hold.
+    ///
+    /// FLIP: delete the `if want > self.reserved_bytes_unlocked() { return
+    /// 0; }` pre-check at the top of `DecodedCaches::evict_for_pressure`. The
+    /// pass then blocks on the held lock and `recv_timeout` reads
+    /// `Err(Timeout)`, not `Ok(0)`.
+    #[test]
+    fn a_pressure_shortfall_beyond_every_cached_entry_takes_no_lock() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let (caches, live) = pressure_fixture(&budget);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let outcome = std::thread::scope(|scope| {
+            let held = caches.parts().tenants.lock();
+            let caches = &caches;
+            scope.spawn(move || {
+                let _ = sender.send(caches.evict_for_pressure(156));
+            });
+            let outcome = receiver.recv_timeout(std::time::Duration::from_secs(5));
+            drop(held);
+            outcome
+        });
+
+        assert_eq!(outcome, Ok(0), "refused without waiting on the lock");
+        assert_eq!(caches.parts().total_entries(), 2);
+        assert_eq!(caches.postings().total_entries(), 2);
+        assert_eq!(caches.reserved_bytes(), 155);
+        assert_eq!(caches.memory_evictions(), 0);
+        drop(live);
     }
 
     // -----------------------------------------------------------------
