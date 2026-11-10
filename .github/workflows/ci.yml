@@ -22,7 +22,8 @@ env:
 # Every checkout below carries `persist-credentials: false` for the same
 # reason from the other side: no job here runs git against the remote after
 # checking out (the merge-base filters in `changes` and `docker-build`,
-# and the changelog guard in `doc-scripts` read only what
+# the changelog guard and budget raise-check in `doc-scripts`, and the
+# base worktree in `supply-chain` read only what
 # fetch-depth: 0 already fetched), so the token must not sit in .git/config
 # where that build-script code could read it.
 permissions:
@@ -412,6 +413,17 @@ jobs:
         # reachable from it and the guard attributes a neighbour's feat commit
         # to this pull request. head.sha is the branch tip itself.
         run: scripts/guards/check-changelog-touched.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+      # A `timeout-minutes` raise in ci.yml must carry a `# budget: p90 <N>
+      # min on <YYYY-MM-DD>` comment (ADR-4034 D3). Git only, against the
+      # same base sha as the changelog guard, which fetch-depth: 0 already
+      # fetched. Its cases run in ci-budget-nightly.yml's `cases` job.
+      - name: CI budget raise-check (issue #4037)
+        if: github.event_name == 'pull_request'
+        run: scripts/guards/check-ci-job-budgets.sh --raise-check "${{ github.event.pull_request.base.sha }}"
+      # The supply-chain job's advisory delta (ADR-4034 D4) runs only where
+      # cargo-deny is installed; its cases need jq alone and run here.
+      - name: Advisory delta guard cases (issue #4041)
+        run: bash scripts/guards/check-advisory-delta.test.sh
       # A change to an RLOG, RSPAN or RSEG reader version must ship a
       # changelog fragment naming every signal that format carries (issue
       # #2725, ADR-2708 D5d). Same base..head shape and head.sha reasoning as
@@ -1847,13 +1859,56 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # Full history so the pull request's or merge group's base commit
+          # is already present for the base worktree below: with
+          # persist-credentials off, a later `git fetch` has no token.
+          fetch-depth: 0
           persist-credentials: false
       - name: Install cargo-deny
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: cargo-deny
+      # On push to main (and any scheduled run) the full check, as before: an
+      # advisory already on main's lockfile is red here, once, where the fix
+      # belongs (ADR-4034 D4).
       - name: cargo deny check
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         run: cargo deny check
+      # On a pull request or merge group the non-advisory checks still run
+      # at the head and fail as before; a ban, license or source finding is
+      # always the change's own.
+      - name: cargo deny check bans licenses sources
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        run: cargo deny check bans licenses sources
+      # Advisories fail only when new against the base (ADR-4034 D4): the
+      # check runs at the head and in a worktree of the base, and
+      # check-advisory-delta.sh fails on an id the head has and the base does
+      # not. cargo deny reads the lockfile and manifests and builds nothing.
+      # Its exit code is not the verdict (1 means findings or a crash alike);
+      # the delta script refuses an output with no closing summary instead.
+      - name: cargo deny check advisories, new against the base
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          if [ -z "$BASE_SHA" ]; then
+            echo "::error::no base sha in the ${GITHUB_EVENT_NAME} event payload"
+            exit 1
+          fi
+          base_dir="$RUNNER_TEMP/supply-chain-base"
+          if ! git worktree add --detach "$base_dir" "$BASE_SHA"; then
+            echo "::error::git worktree add could not find base commit $BASE_SHA; refusing to pass without a comparison"
+            exit 1
+          fi
+          # --format is a top-level cargo-deny option, so it goes before the
+          # subcommand; the JSON lines go to stderr.
+          rc=0
+          cargo deny --format json check advisories 2>"$RUNNER_TEMP/advisories-head.json" || rc=$?
+          echo "cargo deny check advisories at the head exited $rc"
+          rc=0
+          (cd "$base_dir" && cargo deny --format json check advisories) 2>"$RUNNER_TEMP/advisories-base.json" || rc=$?
+          echo "cargo deny check advisories at the base $BASE_SHA exited $rc"
+          scripts/guards/check-advisory-delta.sh "$RUNNER_TEMP/advisories-head.json" "$RUNNER_TEMP/advisories-base.json" "$BASE_SHA"
       # deny.toml ignores RUSTSEC-2026-0194/-0195 on the premise that no
       # shipped binary's feature set reaches an affected quick-xml version
       # (issue #1718). `cargo tree -i` needs the pinned toolchain, which

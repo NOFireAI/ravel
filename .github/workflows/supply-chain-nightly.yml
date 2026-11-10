@@ -32,15 +32,28 @@ name: supply-chain-nightly
 # there: it lives only on the `report` job, which runs no third-party code (no
 # checkout, no cargo-deny install) so the write-capable token is never in the
 # environment of a dependency build script.
+#
+# Since ADR-4034 D4 (issue #4041) the per-PR and merge-queue `supply-chain`
+# job fails only on an advisory new against the pull request's base, so an
+# advisory published against main's lockfile no longer blocks the queue; it
+# is red here and on main's push run instead. That makes this lane the
+# advisory's route to a fix, so it runs every six hours rather than nightly,
+# and the `fix` job after `report` tries `cargo update -p <crate> --precise
+# <fixed>` for each advisory that names a fixed version and opens the pull
+# request when the lockfile then passes. When no fixed version resolves, the
+# tracking issue is the only output, as before.
 
 on:
   workflow_dispatch:
   schedule:
-    # Nightly, 05:43 UTC. Off-peak and off the :00/:30 marks, and distinct from
-    # every other scheduled lane in this repo (sim-nightly 03:17, k8s-nightly
-    # 03:00, tla-nightly 04:37, bench-s3 weekly 04:17, quickstart-published
-    # weekly 06:29) so none of the scheduled runs contend.
-    - cron: "43 5 * * *"
+    # Every six hours, at 05:43, 11:43, 17:43 and 23:43 UTC. Off the :00/:30
+    # marks, and distinct from every other scheduled lane in this repo
+    # (metricsbench-nightly 02:13, k8s-nightly 03:00, sim-nightly 03:17,
+    # bench-s3 weekly 04:17, tla-nightly 04:37, fuzz-nightly 05:21,
+    # interop-nightly 06:09, ci-budget-nightly 06:11, quickstart-published
+    # weekly 06:29, dr-rehearsal weekly 07:19) so none of the scheduled runs
+    # contend.
+    - cron: "43 5,11,17,23 * * *"
 
 permissions:
   contents: read
@@ -104,6 +117,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       issues: write
+    # The tracking issue's number, for the `fix` job's `Fixes:` line.
+    outputs:
+      issue: ${{ steps.file.outputs.issue }}
     # Serialize THIS job only, across runs, so the read-then-create below
     # cannot race: a scheduled run and a workflow_dispatch run failing close
     # together would otherwise both see an empty issue list and both create
@@ -126,6 +142,7 @@ jobs:
       # both the issue title and the dedup key, so a recurring failure maps to
       # one open issue.
       - name: File or update the tracking issue
+        id: file
         env:
           GH_TOKEN: ${{ github.token }}
           # No checkout in this job, so gh has no git remote to infer the
@@ -170,6 +187,164 @@ jobs:
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$body"
             echo "commented on existing issue #$existing"
+            issue="$existing"
           else
-            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
+            url=$(gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body")
+            echo "$url"
+            issue="${url##*/}"
           fi
+          case "$issue" in
+            '' | *[!0-9]*)
+              echo "::error::could not read the tracking issue number (got '$issue')"
+              exit 1
+              ;;
+          esac
+          echo "issue=$issue" >> "$GITHUB_OUTPUT"
+
+  # Opens the fix pull request when a fixed version resolves (ADR-4034 D4).
+  # Runs after `report`, and only when it filed or found the tracking issue,
+  # whose number goes on the pull request's `Fixes:` line.
+  #
+  # This job alone holds write scopes: `contents: write` to push the
+  # deps/rustsec-<id> branch and `pull-requests: write` to open the pull
+  # request. What it runs with them is bounded: cargo-deny (a static binary
+  # that reads the lockfile and manifests and executes no dependency code)
+  # and `cargo update`, which rewrites Cargo.lock and runs no build script.
+  # Nothing here builds, tests or runs the workspace. The checkout still
+  # drops its credentials; the token reaches git only in the push command.
+  #
+  # A pull request opened with the workflow token starts no `pull_request`
+  # workflow run, so its CI does not begin on its own; the body says how to
+  # start it.
+  fix:
+    needs: [supply-chain-nightly, report]
+    if: ${{ always() && needs.report.result == 'success' && needs.report.outputs.issue != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # workflow-permissions-allow does not cover a job-level grant (the guard
+    # checks the top-level floor only); the reason is the paragraph above.
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: supply-chain-nightly-fix
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-deny
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Try a precise update per advisory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE: ${{ needs.report.outputs.issue }}
+        run: |
+          work="$RUNNER_TEMP/supply-chain-fix"
+          mkdir -p "$work"
+          rc=0
+          cargo deny --format json check advisories 2>"$work/before.json" || rc=$?
+          echo "cargo deny check advisories exited $rc"
+          # Comparing the output with itself finds nothing new, so this exits
+          # 0 for a usable output and 2 for an unusable one.
+          if ! scripts/guards/check-advisory-delta.sh "$work/before.json" "$work/before.json" "$GITHUB_SHA" >/dev/null; then
+            echo "::error::cargo deny's advisories output is unusable; nothing to fix from"
+            exit 1
+          fi
+          # One row per error advisory whose notes carry cargo-deny's
+          # "Solution: Upgrade to <req> OR <req> (try ...)" line: id, crate,
+          # locked version, patched requirements.
+          jq -R -r 'select(test("\\S")) | fromjson
+            | select(.type == "diagnostic" and .fields.severity == "error" and .fields.advisory.id != null)
+            | .fields as $f
+            | ([$f.notes // [] | .[] | select(startswith("Solution: Upgrade to "))] | .[0]) as $sol
+            | select($sol != null)
+            | [$f.advisory.id,
+               ($f.graphs[0].Krate.name // $f.advisory.package),
+               ($f.graphs[0].Krate.version // "-"),
+               ($sol | sub("^Solution: Upgrade to "; "") | sub(" \\(try .*$"; ""))]
+            | @tsv' "$work/before.json" | LC_ALL=C sort -u >"$work/candidates.tsv"
+          if [ ! -s "$work/candidates.tsv" ]; then
+            echo "no failing advisory names a fixed version; the tracking issue #$ISSUE is the only output"
+            exit 0
+          fi
+          error_ids() {
+            jq -R -r 'select(test("\\S")) | fromjson
+              | select(.type == "diagnostic" and .fields.severity == "error")
+              | .fields.advisory.id // empty' "$1"
+          }
+          opened=0
+          while IFS=$'\t' read -r id krate locked reqs; do
+            slug=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
+            branch="deps/rustsec-${slug#rustsec-}"
+            if ! open_pr=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty'); then
+              echo "::error::could not ask whether $branch already has an open pull request"
+              exit 1
+            fi
+            if [ -n "$open_pr" ]; then
+              echo "$id: pull request #$open_pr is already open on $branch"
+              continue
+            fi
+            spec="$krate"
+            # An empty field would collapse under the tab IFS, so jq writes
+            # "-" for an unknown version.
+            [ "$locked" != "-" ] && spec="$krate@$locked"
+            # The lower bound of each patched requirement, smallest first.
+            fixed_list=$(printf '%s\n' "$reqs" | sed 's/ OR /\n/g' \
+              | sed -n 's/^[^0-9]*\([0-9][0-9A-Za-z.+-]*\).*/\1/p' | sort -V -u)
+            fixed=""
+            for candidate in $fixed_list; do
+              git checkout -q --detach "$GITHUB_SHA"
+              git checkout -q -- Cargo.lock
+              echo "$id: trying cargo update -p $spec --precise $candidate"
+              cargo update -p "$spec" --precise "$candidate" || continue
+              cargo deny check bans licenses sources || continue
+              rc=0
+              cargo deny --format json check advisories 2>"$work/after.json" || rc=$?
+              # Passes when the id is gone and the update introduced no
+              # advisory main did not already have.
+              scripts/guards/check-advisory-delta.sh "$work/after.json" "$work/before.json" "$GITHUB_SHA" || continue
+              if error_ids "$work/after.json" | grep -qxF "$id"; then
+                echo "$id: still reported after the update to $candidate"
+                continue
+              fi
+              fixed="$candidate"
+              break
+            done
+            if [ -z "$fixed" ]; then
+              echo "$id: no fixed version of $krate resolves; the tracking issue #$ISSUE is the only output"
+              git checkout -q -- Cargo.lock
+              continue
+            fi
+            msg="$work/msg-$slug"
+            {
+              echo "fix(deps): update $krate to $fixed for $id"
+              echo
+              echo "cargo update -p $spec --precise $fixed, opened by supply-chain-nightly"
+              echo "run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+              echo "cargo deny check passes for $id with this lockfile."
+              echo
+              echo "Fixes: #$ISSUE"
+            } >"$msg"
+            git add Cargo.lock
+            git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -s -F "$msg"
+            git push --force "https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$branch"
+            body="$work/body-$slug"
+            {
+              tail -n +3 "$msg"
+              echo
+              echo "Opened with the workflow token, which starts no pull_request run:"
+              echo "close and reopen this pull request to start CI."
+            } >"$body"
+            gh pr create --base main --head "$branch" --title "$(head -n1 "$msg")" --body-file "$body"
+            opened=$((opened + 1))
+            git checkout -q --detach "$GITHUB_SHA"
+          done <"$work/candidates.tsv"
+          echo "opened $opened fix pull request(s)"

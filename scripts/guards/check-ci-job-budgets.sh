@@ -353,13 +353,24 @@ mg_older_path="${runs_base}?event=merge_group&status=completed&per_page=${runs}&
 query_failed=0
 
 # The Actions API answers a few of the ~60 calls per run with a 502, so each
-# call gets three attempts before it counts as could-not-ask.
+# call gets three attempts before it counts as could-not-ask. gh's stderr
+# stays out of the data on success (a warning there would parse as a job
+# row) and is passed through to stderr; on the final failure it is appended
+# to the output so the caller can quote the error.
 gh_api_retry() {
   local attempt=1 out rc delay="${CI_BUDGET_RETRY_DELAY_S:-5}"
+  local err_file="${tmpdir}/gh_api_stderr"
   while :; do
     rc=0
-    out="$(gh api "$@" 2>&1)" || rc=$?
-    if ((rc == 0 || attempt >= 3)); then
+    out="$(gh api "$@" 2>"${err_file}")" || rc=$?
+    if ((rc == 0)); then
+      [[ -s "${err_file}" ]] && cat "${err_file}" >&2
+      printf '%s' "${out}"
+      return 0
+    fi
+    if ((attempt >= 3)); then
+      [[ -n "${out}" && -s "${err_file}" ]] && out+=$'\n'
+      out+="$(cat "${err_file}")"
       printf '%s' "${out}"
       return "${rc}"
     fi
