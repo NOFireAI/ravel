@@ -86,9 +86,7 @@ pub enum SnapshotFormatError {
     },
     #[error("head part[{index}] has an empty key")]
     EmptyPartKey { index: usize },
-    #[error(
-        "head part[{index}] retired_hours not strictly ascending: {previous} then {next}"
-    )]
+    #[error("head part[{index}] retired_hours not strictly ascending: {previous} then {next}")]
     RetiredHoursNotAscending {
         index: usize,
         previous: u32,
@@ -103,7 +101,9 @@ pub enum SnapshotFormatError {
         min_hour: u32,
         watermark: u32,
     },
-    #[error("head format_version {format_version} does not match its content, which requires {required}")]
+    #[error(
+        "head format_version {format_version} does not match its content, which requires {required}"
+    )]
     HeadVersionContentMismatch { format_version: u32, required: u32 },
     #[error("head part[{index}] min_hour {min_hour} exceeds its watermark_hour {watermark}")]
     PartRefRangeInverted {
@@ -453,9 +453,7 @@ impl SnapshotFormatError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::snapshot_format::{
-        COLUMN_STATS_ACCEPTED_READ_VERSIONS, POSTINGS_VERSION, VERSION,
-    };
+    use crate::snapshot_format::{COLUMN_STATS_ACCEPTED_READ_VERSIONS, POSTINGS_VERSION, VERSION};
 
     /// Each version kind is newer exactly above the highest version this build
     /// reads; one below the floor (a record stamped 0) is not.

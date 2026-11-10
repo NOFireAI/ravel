@@ -43,11 +43,11 @@ use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
     self, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSIONS,
-    KeyIndexLeafEncodeError, KeyIndexLeafEntry,
-    KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafSummary, KeyIndexSlice, NamePostings,
-    PartLimits, SnapshotFormatError, column_stats_segments_concat, encode_key_index_leaf,
-    encoded_entry_len, key_index_leaf_version_accepted, select_key_index_slice,
-    split_key_index_entries, verify_key_index_leaf_frames,
+    KeyIndexLeafEncodeError, KeyIndexLeafEntry, KeyIndexLeafInput, KeyIndexLeafLimits,
+    KeyIndexLeafSummary, KeyIndexSlice, NamePostings, PartLimits, SnapshotFormatError,
+    column_stats_segments_concat, encode_key_index_leaf, encoded_entry_len,
+    key_index_leaf_version_accepted, select_key_index_slice, split_key_index_entries,
+    verify_key_index_leaf_frames,
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
@@ -1258,6 +1258,210 @@ fn part_covers_dirty_hour(part: &SnapshotPartRef, dirty_hours: &HashSet<u32>) ->
     dirty_hours
         .iter()
         .any(|&h| part.min_hour <= h && h <= part.watermark_hour)
+}
+
+/// Retention tombstones the reconcile passes found in a previous HEAD's
+/// sealed, leaf-bearing parts (ADR-3939 decision 6). Such a bucket is set
+/// aside instead of being dropped from `entries` on the spot, and
+/// [`apply_retirements`] decides after every pass has listed whether its
+/// hour is recorded as a retired hour of the carried part, drops the whole
+/// part, or takes the re-encode path.
+#[derive(Default)]
+struct RetireTracker {
+    /// `[min_hour, watermark_hour]` of each retirable previous part. Empty
+    /// with the leaf switch off and on a rebuilt fold.
+    ranges: Vec<(u32, u32)>,
+    /// Tombstoned `(hour, shard)` buckets inside a retirable part.
+    deferred: BTreeSet<(u32, u32)>,
+}
+
+impl RetireTracker {
+    /// The retirable parts of `previous`: every part but the last that
+    /// carries key-index leaves. `leaf_switch_on` false leaves it empty, so
+    /// every tombstone takes the re-encode path.
+    fn of_head(previous: Option<&SnapshotHead>, leaf_switch_on: bool) -> Self {
+        let ranges = match previous {
+            Some(head) if leaf_switch_on => {
+                let sealed = head.parts.len().saturating_sub(1);
+                head.parts[..sealed]
+                    .iter()
+                    .filter(|part| !part.key_index.is_empty())
+                    .map(|part| (part.min_hour, part.watermark_hour))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        Self {
+            ranges,
+            deferred: BTreeSet::new(),
+        }
+    }
+
+    /// Records a tombstoned bucket and returns true when `hour` lies in a
+    /// retirable part; false leaves the bucket to the normal reconcile.
+    fn defer(&mut self, shard: u32, hour: u32, listing: &[ObjectMeta]) -> bool {
+        let in_part = self
+            .ranges
+            .iter()
+            .any(|&(min_hour, watermark)| min_hour <= hour && hour <= watermark);
+        if !in_part || !lists_a_tombstone(listing) {
+            return false;
+        }
+        self.deferred.insert((hour, shard));
+        true
+    }
+}
+
+fn lists_a_tombstone(listing: &[ObjectMeta]) -> bool {
+    listing.iter().any(|meta| {
+        matches!(
+            keys::partition_bucket_entry(&meta.key),
+            Ok(BucketEntry::Tombstone(_))
+        )
+    })
+}
+
+/// Removes every entry `drop` selects from `entries`, rebuilding `seen` and
+/// marking `hours` dirty when anything was removed. The carry keys of the
+/// parts holding those hours are derived first, as for any reconcile change.
+#[allow(clippy::too_many_arguments)]
+fn drop_entries(
+    entries: &mut Vec<SnapshotEntry>,
+    seen: &mut HashMap<EntryIdentity, (usize, bool)>,
+    dirty_hours: &mut HashSet<u32>,
+    carry_sources: &[CarrySource],
+    tenant: &TenantHash,
+    signal: Signal,
+    hours: &[u32],
+    drop: impl Fn(&SnapshotEntry) -> bool,
+) {
+    if !entries.iter().any(&drop) {
+        return;
+    }
+    derive_carry_keys_before_change(carry_sources, tenant, signal, entries, hours);
+    entries.retain(|entry| !drop(entry));
+    *seen = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry_identity(entry), (index, true)))
+        .collect();
+    dirty_hours.extend(hours.iter().copied());
+}
+
+/// Settles the retired hours of every previous part (ADR-3939 decision 6),
+/// after the reconcile passes and before the entries are partitioned.
+/// Returns the new retired-hours list of each part carried by reference
+/// whose list grew, keyed by its blake3; every other carried part keeps its
+/// own list.
+///
+/// For each part, in HEAD order:
+/// - With the leaf switch off, a part's retired hours lose their entries
+///   now, so it re-encodes without them and the field is never written.
+/// - A part that re-encodes this fold anyway (a reconcile changed one of its
+///   hours) drops its retired hours and every set-aside bucket for good.
+/// - So does a part with a set-aside hour that some shard holding entries
+///   in it was not tombstoned in: retirement is per hour.
+/// - Otherwise each fully tombstoned hour is added to the part's retired
+///   hours, and a part all of whose hours are retired drops out of HEAD with
+///   its entries, no PUT.
+#[allow(clippy::too_many_arguments)]
+fn apply_retirements(
+    previous: Option<&SnapshotHead>,
+    leaf_switch_on: bool,
+    tracker: &RetireTracker,
+    entries: &mut Vec<SnapshotEntry>,
+    seen: &mut HashMap<EntryIdentity, (usize, bool)>,
+    dirty_hours: &mut HashSet<u32>,
+    carry_sources: &[CarrySource],
+    tenant: &TenantHash,
+    signal: Signal,
+) -> HashMap<Vec<u8>, Vec<u32>> {
+    let mut grown: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+    let Some(head) = previous else {
+        return grown;
+    };
+    for part in &head.parts {
+        let range = part.min_hour..=part.watermark_hour;
+        let deferred: BTreeMap<u32, BTreeSet<u32>> = tracker
+            .deferred
+            .iter()
+            .filter(|(hour, _)| range.contains(hour))
+            .fold(BTreeMap::new(), |mut by_hour, &(hour, shard)| {
+                by_hour
+                    .entry(hour)
+                    .or_insert_with(BTreeSet::new)
+                    .insert(shard);
+                by_hour
+            });
+        if part.retired_hours.is_empty() && deferred.is_empty() {
+            continue;
+        }
+        let mut shards_by_hour: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        for entry in entries.iter() {
+            if range.contains(&entry.ingest_hour_bucket) {
+                shards_by_hour
+                    .entry(entry.ingest_hour_bucket)
+                    .or_default()
+                    .insert(entry.shard);
+            }
+        }
+        let fully_tombstoned = |hour: &u32, shards: &BTreeSet<u32>| {
+            shards_by_hour
+                .get(hour)
+                .is_none_or(|held| held.is_subset(shards))
+        };
+        let re_encodes = !leaf_switch_on
+            || part_covers_dirty_hour(part, dirty_hours)
+            || !deferred
+                .iter()
+                .all(|(hour, shards)| fully_tombstoned(hour, shards));
+        if re_encodes {
+            let retired: BTreeSet<u32> = part.retired_hours.iter().copied().collect();
+            let hours: Vec<u32> = retired.iter().chain(deferred.keys()).copied().collect();
+            drop_entries(
+                entries,
+                seen,
+                dirty_hours,
+                carry_sources,
+                tenant,
+                signal,
+                &hours,
+                |entry| {
+                    retired.contains(&entry.ingest_hour_bucket)
+                        || deferred
+                            .get(&entry.ingest_hour_bucket)
+                            .is_some_and(|shards| shards.contains(&entry.shard))
+                },
+            );
+            continue;
+        }
+        let mut retired: BTreeSet<u32> = part.retired_hours.iter().copied().collect();
+        retired.extend(
+            deferred
+                .keys()
+                .copied()
+                .filter(|hour| shards_by_hour.contains_key(hour)),
+        );
+        if retired.len() == part.retired_hours.len() {
+            continue;
+        }
+        if shards_by_hour.keys().all(|hour| retired.contains(hour)) {
+            let hours: Vec<u32> = shards_by_hour.keys().copied().collect();
+            drop_entries(
+                entries,
+                seen,
+                dirty_hours,
+                carry_sources,
+                tenant,
+                signal,
+                &hours,
+                |entry| range.contains(&entry.ingest_hour_bucket),
+            );
+            continue;
+        }
+        grown.insert(part.blake3.clone(), retired.into_iter().collect());
+    }
+    grown
 }
 
 /// Bytes of a data object's tail the key-index leaf build reads to open its
@@ -4067,6 +4271,22 @@ impl Catalog {
                 _ => Vec::new(),
             };
 
+            // The previous HEAD whose parts' retired hours this fold settles
+            // (ADR-3939 decision 6). None on a rebuild, whose entries come
+            // from the listing, where a tombstoned hour contributes nothing.
+            let retire_head: Option<&SnapshotHead> = match &head_state {
+                HeadState::Valid { head, .. } if !rebuilt => Some(head),
+                _ => None,
+            };
+            let leaf_switch_on = self.config().build_key_index_leaves;
+            let mut retire = RetireTracker::of_head(retire_head, leaf_switch_on);
+            // Hours already retired are not listed again by the frontier band.
+            let already_retired: HashSet<u32> = retire_head
+                .iter()
+                .flat_map(|head| &head.parts)
+                .flat_map(|part| part.retired_hours.iter().copied())
+                .collect();
+
             // The old watermark the reconcile pass anchors its window to,
             // present ONLY for an incremental fold from a trusted HEAD. Absent
             // (`None`) on the first fold (no previous watermark) and on any
@@ -4192,6 +4412,7 @@ impl Catalog {
                         &carry_sources,
                         &mut seen,
                         &mut dirty_hours,
+                        &mut retire,
                         &mut counters,
                         &mut layout_drift_count,
                         &mut coverage,
@@ -4213,6 +4434,7 @@ impl Catalog {
                         &carry_sources,
                         &mut seen,
                         &mut dirty_hours,
+                        &mut retire,
                         &mut counters,
                         &mut layout_drift_count,
                         &mut coverage,
@@ -4247,6 +4469,7 @@ impl Catalog {
                         &carry_sources,
                         &mut seen,
                         &mut dirty_hours,
+                        &mut retire,
                         &mut counters,
                         &mut layout_drift_count,
                         &mut coverage,
@@ -4305,7 +4528,9 @@ impl Catalog {
                     let mut candidate_hours: Vec<u32> = {
                         let mut hs: HashSet<u32> = HashSet::new();
                         for entry in entries.iter() {
-                            if entry.ingest_hour_bucket <= frontier_hi {
+                            if entry.ingest_hour_bucket <= frontier_hi
+                                && !already_retired.contains(&entry.ingest_hour_bucket)
+                            {
                                 hs.insert(entry.ingest_hour_bucket);
                             }
                         }
@@ -4338,6 +4563,7 @@ impl Catalog {
                                 &carry_sources,
                                 &mut seen,
                                 &mut dirty_hours,
+                                &mut retire,
                                 &mut counters,
                                 &mut layout_drift_count,
                                 &mut coverage,
@@ -4376,6 +4602,7 @@ impl Catalog {
                         &carry_sources,
                         &mut seen,
                         &mut dirty_hours,
+                        &mut retire,
                         &mut counters,
                         &mut layout_drift_count,
                         &mut coverage,
@@ -4389,10 +4616,25 @@ impl Catalog {
                     "fold reconciled the ingest hours a re-fold request named"
                 );
             }
+            let retired_grown = apply_retirements(
+                retire_head,
+                leaf_switch_on,
+                &retire,
+                &mut entries,
+                &mut seen,
+                &mut dirty_hours,
+                &carry_sources,
+                tenant,
+                signal,
+            );
             // A fold run only for the held-open hours whose reconcile found
             // every listed commit already folded writes nothing. The report
             // still carries the hours the targeted pass re-listed.
-            if held_listings.is_some() && !rebuilt && dirty_hours.is_empty() {
+            if held_listings.is_some()
+                && !rebuilt
+                && dirty_hours.is_empty()
+                && retired_grown.is_empty()
+            {
                 return Ok(no_op_report(
                     Some(watermark_hour),
                     applied_seal_through,
@@ -4697,10 +4939,15 @@ impl Catalog {
                     // Carried by reference: the previous HEAD already names an
                     // object with these exact bytes, so no PUT is issued and
                     // the existing ref (same key/size/entry_count/range) is
-                    // forwarded unchanged.
+                    // forwarded unchanged, but for the hours a tombstone
+                    // retired this fold.
                     total_part_bytes += existing.size;
                     part_hashes.push(*part_hash.as_bytes());
-                    part_refs.push(existing.clone());
+                    let mut carried = existing.clone();
+                    if let Some(retired) = retired_grown.get(&existing.blake3) {
+                        carried.retired_hours.clone_from(retired);
+                    }
+                    part_refs.push(carried);
                     parts_reused += 1;
                     if existing.entry_count > 0 {
                         let mut missing = key_index_declared
@@ -5924,6 +6171,7 @@ impl Catalog {
         carry_sources: &[CarrySource],
         seen: &mut HashMap<EntryIdentity, (usize, bool)>,
         dirty_hours: &mut HashSet<u32>,
+        retire: &mut RetireTracker,
         counters: &mut RequestCounters,
         layout_drift_count: &mut u64,
         coverage: &mut declared_stats::StampCoverage,
@@ -5938,6 +6186,11 @@ impl Catalog {
         if !bucket_needs_reconcile(listing)
             && !(held_open && lists_an_unfolded_commit(listing, |id| seen.contains_key(id)))
         {
+            return Ok(());
+        }
+        // A tombstone in a sealed leaf-bearing part is settled once every
+        // pass has listed, by `apply_retirements`.
+        if retire.defer(shard, hour, listing) {
             return Ok(());
         }
         let contribution = self
@@ -6021,6 +6274,7 @@ impl Catalog {
         carry_sources: &[CarrySource],
         seen: &mut HashMap<EntryIdentity, (usize, bool)>,
         dirty_hours: &mut HashSet<u32>,
+        retire: &mut RetireTracker,
         counters: &mut RequestCounters,
         layout_drift_count: &mut u64,
         coverage: &mut declared_stats::StampCoverage,
@@ -6068,6 +6322,7 @@ impl Catalog {
                 carry_sources,
                 seen,
                 dirty_hours,
+                retire,
                 counters,
                 layout_drift_count,
                 coverage,

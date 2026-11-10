@@ -107,6 +107,7 @@ async fn fold_then_inspect_then_verify_round_trips_cleanly() {
         MEMORY,
         tenant,
         SignalArg::Metrics,
+        false,
     )
     .await
     .expect("inspect succeeds against a freshly folded HEAD");
@@ -164,9 +165,13 @@ async fn inspect_and_verify_report_cleanly_with_no_head_yet() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = "acme";
 
-    catalog::inspect(store.clone(), MEMORY, tenant, SignalArg::Metrics)
+    catalog::inspect(store.clone(), MEMORY, tenant, SignalArg::Metrics, false)
         .await
         .expect("inspect on an absent HEAD reports rather than errors");
+    let json = catalog::render_inspect_json(store.clone(), MEMORY, tenant, SignalArg::Metrics)
+        .await
+        .expect("inspect --json on an absent HEAD reports rather than errors");
+    assert_eq!(json["head"], serde_json::Value::Null);
     catalog::verify(store.clone(), MEMORY, tenant, SignalArg::Metrics)
         .await
         .expect("verify on an absent HEAD reports rather than errors");
@@ -245,6 +250,7 @@ async fn inspect_rejects_a_corrupt_head() {
         MEMORY,
         "acme",
         SignalArg::Metrics,
+        false,
     )
     .await
     .expect_err("corrupt HEAD must be a typed error, not a panic or silent success");
@@ -536,6 +542,103 @@ async fn inspect_prints_absent_marker_for_unset_column_stats_ref() {
     assert!(
         out.contains("column_stats (field 7): ABSENT"),
         "per-part field 7 must print an explicit ABSENT marker: {out}"
+    );
+}
+
+/// ADR-3939 decision 6: `catalog inspect` prints the HEAD format version and
+/// each part's retired hours, in the text report and under `--json`.
+#[tokio::test]
+async fn inspect_prints_the_head_version_and_each_parts_retired_hours() {
+    let store = Arc::new(MemoryStore::new());
+    let tenant_hash = TenantId::new("acme").hash();
+    let head_key = format!(
+        "t/{}/catalog/{}/HEAD",
+        tenant_hash.to_hex(),
+        Signal::Logs.key_prefix()
+    );
+    let mut parts = Vec::new();
+    for (name, min_hour, watermark_hour, retired_hours) in
+        [("day", 24, 47, vec![30, 31]), ("tail", 48, 50, Vec::new())]
+    {
+        let key = format!(
+            "t/{}/catalog/{}/part/{name}",
+            tenant_hash.to_hex(),
+            Signal::Logs.key_prefix()
+        );
+        let bytes =
+            ravel_catalog::encode_part(tenant_hash.0, Signal::Logs as u32, 1, watermark_hour, &[])
+                .expect("encode a valid empty part");
+        store
+            .put(&key, Bytes::from(bytes.clone()), PutOptions::default())
+            .await
+            .expect("seed the part");
+        parts.push(SnapshotPartRef {
+            key,
+            blake3: blake3::hash(&bytes).as_bytes().to_vec(),
+            size: bytes.len() as u64,
+            entry_count: 0,
+            watermark_hour,
+            min_hour,
+            column_stats: None,
+            key_index: Vec::new(),
+            retired_hours,
+        });
+    }
+    let mut head = SnapshotHead {
+        format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
+        tenant_hash: tenant_hash.0.to_vec(),
+        signal: Signal::Logs as u32,
+        shard_count: 1,
+        watermark_hour: 50,
+        parts,
+        folder_id: Uuid::new_v4().into_bytes().to_vec(),
+        created_unix_ns: now_ns(),
+        ..Default::default()
+    };
+    head.format_version = ravel_catalog::head_format_version_for(&head);
+    let head_bytes = ravel_catalog::encode_head(&head).expect("encode a version 2 head");
+    store
+        .put(&head_key, Bytes::from(head_bytes), PutOptions::default())
+        .await
+        .expect("seed the head");
+
+    let mut out = String::new();
+    catalog::render_inspect(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        "acme",
+        SignalArg::Logs,
+        &mut out,
+    )
+    .await
+    .expect("inspect succeeds");
+    assert!(out.contains("format_version: 2\n"), "{out}");
+    assert_eq!(
+        out.matches("retired_hours (field 9): ")
+            .collect::<Vec<_>>()
+            .len(),
+        2,
+        "{out}"
+    );
+    assert!(out.contains("retired_hours (field 9): 30,31\n"), "{out}");
+    assert!(out.contains("retired_hours (field 9): NONE\n"), "{out}");
+
+    let json = catalog::render_inspect_json(
+        store as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        "acme",
+        SignalArg::Logs,
+    )
+    .await
+    .expect("inspect --json succeeds");
+    assert_eq!(json["head"]["format_version"], 2);
+    assert_eq!(
+        json["head"]["parts"][0]["retired_hours"],
+        serde_json::json!([30, 31])
+    );
+    assert_eq!(
+        json["head"]["parts"][1]["retired_hours"],
+        serde_json::json!([])
     );
 }
 
