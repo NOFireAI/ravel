@@ -1255,7 +1255,7 @@ mod tests {
             .await
             .expect("put part");
         let head = SnapshotHead {
-            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
             tenant_hash: head_tenant.0.to_vec(),
             signal: ravel_commit::signal::to_proto(head_signal) as u32,
             shard_count: TEST_SHARD + 1,
@@ -1269,6 +1269,7 @@ mod tests {
                 min_hour: 0,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             }],
             folder_id: vec![0u8; 16],
             created_unix_ns: 1,

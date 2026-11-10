@@ -491,7 +491,7 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use ravel_catalog::{HEAD_FORMAT_VERSION, encode_head, encode_part};
+    use ravel_catalog::{HEAD_FORMAT_VERSION_1, encode_head, encode_part};
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{InstrumentedStore, PutOptions};
@@ -602,6 +602,7 @@ mod tests {
                 min_hour: hour,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             });
             store
                 .put(&key, Bytes::from(bytes), PutOptions::default())
@@ -609,7 +610,7 @@ mod tests {
                 .expect("put part");
         }
         let head = SnapshotHead {
-            format_version: HEAD_FORMAT_VERSION,
+            format_version: HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant.0.to_vec(),
             signal: signal_code,
             shard_count: 1,
@@ -863,7 +864,7 @@ mod tests {
         let t = tenant("acme");
         seed(&store, &t, Signal::Metrics, &[&[current(Signal::Metrics)]]).await;
         let mut head = read_head(&store, &t, Signal::Metrics).await;
-        head.format_version = HEAD_FORMAT_VERSION + 1;
+        head.format_version = 3;
         store
             .put(
                 &crate::fold::head_key(&t, Signal::Metrics),

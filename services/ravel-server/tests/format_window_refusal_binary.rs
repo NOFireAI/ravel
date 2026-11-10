@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use clap::Parser;
-use ravel_catalog::{HEAD_FORMAT_VERSION, encode_head, encode_part};
+use ravel_catalog::{HEAD_FORMAT_VERSION_1, encode_head, encode_part};
 use ravel_object_store::conformance::{
     CONFORMANCE_SUITE_VERSION, QUALIFICATION_KEY, QualificationRecord, s3_backend_identity,
 };
@@ -122,7 +122,7 @@ async fn seeded_bucket() -> (String, Arc<fake_s3::FakeS3>) {
         signal.key_prefix()
     );
     let head = SnapshotHead {
-        format_version: HEAD_FORMAT_VERSION,
+        format_version: HEAD_FORMAT_VERSION_1,
         tenant_hash: tenant.0.to_vec(),
         signal: signal_code,
         shard_count: 1,
@@ -136,6 +136,7 @@ async fn seeded_bucket() -> (String, Arc<fake_s3::FakeS3>) {
             min_hour: 0,
             column_stats: None,
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }],
         postings: None,
         folder_id: vec![0x33; 16],

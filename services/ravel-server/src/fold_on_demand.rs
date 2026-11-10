@@ -1555,13 +1555,14 @@ mod tests {
             min_hour: hour,
             column_stats: None,
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         };
         store
             .put(&key, Bytes::from(bytes), PutOptions::default())
             .await
             .expect("put part");
         let head = SnapshotHead {
-            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
             tenant_hash: head_tenant.0.to_vec(),
             signal: signal_code,
             shard_count: 1,

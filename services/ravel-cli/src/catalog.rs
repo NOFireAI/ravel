@@ -818,7 +818,15 @@ pub async fn inspect(
     selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
+    json: bool,
 ) -> anyhow::Result<()> {
+    if json {
+        let value = render_inspect_json(store, selection, tenant, signal).await?;
+        let body = serde_json::to_string_pretty(&value)
+            .map_err(|err| anyhow::anyhow!("failed to serialize the HEAD report: {err}"))?;
+        println!("{body}");
+        return Ok(());
+    }
     let mut out = String::new();
     let result = render_inspect(store, selection, tenant, signal, &mut out).await;
     // Print whatever was rendered even on error: a part fetch/decode failure
@@ -924,6 +932,10 @@ pub async fn render_inspect(
             format_column_stats_part_ref(part_ref.column_stats.as_ref())
         ));
         format_key_index_refs(&part_ref.key_index, out);
+        out.push_str(&format!(
+            "    retired_hours (field 9): {}\n",
+            format_retired_hours(&part_ref.retired_hours)
+        ));
         let got = store
             .get(&part_ref.key, GetRange::Full)
             .await
@@ -956,6 +968,78 @@ pub async fn render_inspect(
         ));
     }
     Ok(())
+}
+
+/// The JSON form of `catalog inspect --json`: the HEAD fields and every part
+/// ref, each with its `retired_hours` (field 9, ADR-3939 decision 6), read
+/// from HEAD alone. An absent HEAD is `"head": null`; a corrupt one fails.
+pub async fn render_inspect_json(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+) -> anyhow::Result<serde_json::Value> {
+    let tenant_hash = TenantId::new(tenant).hash();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "catalog inspect",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
+    let key = head_key(&tenant_hash, signal.to_signal());
+    let head_bytes = match store.get(&key, GetRange::Full).await {
+        Ok(outcome) => outcome.data,
+        Err(ravel_object_store::StoreError::NotFound) => {
+            return Ok(serde_json::json!({ "head_key": key, "head": null }));
+        }
+        Err(err) => return Err(anyhow::anyhow!("HEAD at {key} is unreadable: {err}")),
+    };
+    let head = ravel_catalog::decode_head(&head_bytes)
+        .map_err(|err| anyhow::anyhow!("HEAD at {key} is corrupt: {err}"))?;
+    let parts: Vec<serde_json::Value> = head
+        .parts
+        .iter()
+        .map(|part_ref| {
+            serde_json::json!({
+                "min_hour": part_ref.min_hour,
+                "watermark_hour": part_ref.watermark_hour,
+                "key": part_ref.key,
+                "blake3": hex::encode(&part_ref.blake3),
+                "size": part_ref.size,
+                "entry_count": part_ref.entry_count,
+                "key_index_leaves": part_ref.key_index.len(),
+                "retired_hours": part_ref.retired_hours,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "head_key": key,
+        "head": {
+            "format_version": head.format_version,
+            "tenant_hash": hex::encode(&head.tenant_hash),
+            "signal": head_signal_word(head.signal),
+            "shard_count": head.shard_count,
+            "watermark_hour": head.watermark_hour,
+            "folder_id": format_uuid_bytes(&head.folder_id),
+            "created_unix_ns": head.created_unix_ns,
+            "parts": parts,
+        },
+    }))
+}
+
+/// A part's retired hours (field 9, ADR-3939 decision 6), comma-separated,
+/// or `NONE` when the list is empty.
+fn format_retired_hours(hours: &[u32]) -> String {
+    if hours.is_empty() {
+        return "NONE".to_string();
+    }
+    hours
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Formats a `SnapshotColumnStatsPartRef` (per-part field 7, ADR-1413) as a
@@ -1389,11 +1473,12 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                retired_hours: Vec::new(),
             });
         }
 
         let head = SnapshotHead {
-            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant_hash.0.to_vec(),
             signal: 0,
             shard_count: 1,
@@ -1499,10 +1584,11 @@ mod tests {
                 min_hour,
                 column_stats: None,
                 key_index: Vec::new(),
+                retired_hours: Vec::new(),
             });
         }
         let head = SnapshotHead {
-            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
             tenant_hash: tenant_hash.0.to_vec(),
             signal: 0,
             shard_count: 1,

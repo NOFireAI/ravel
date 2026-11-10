@@ -162,6 +162,7 @@ Decode and print HEAD and every referenced snapshot part for one (tenant, signal
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
+| `--json` |  |  | Print HEAD and every part ref as one JSON document, from HEAD alone: no part object is fetched |
 | `--signal` |  | `metrics` | Which signal's HEAD to decode. Defaults to metrics |
 | `--tenant` |  |  |  |
 

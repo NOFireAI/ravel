@@ -402,6 +402,7 @@ async fn head_ahead_of_reader_fails_closed() {
             min_hour: 0,
             column_stats: None,
             key_index: Vec::new(),
+            retired_hours: Vec::new(),
         }],
         postings: None,
         folder_id: vec![0x22; 16],

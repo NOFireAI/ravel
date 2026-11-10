@@ -6,8 +6,37 @@ use ravel_proto::catalog::v1::SnapshotHead;
 
 use super::error::SnapshotFormatError;
 
-/// HEAD's `format_version`. This is the v1 layout.
-pub const HEAD_FORMAT_VERSION: u32 = 1;
+/// HEAD `format_version` 1: no part ref carries `retired_hours`.
+pub const HEAD_FORMAT_VERSION_1: u32 = 1;
+
+/// HEAD `format_version` 2: at least one part ref carries a non-empty
+/// `retired_hours` (ADR-3939 decision 6). A reader that knows only 1 rejects
+/// it, so it never serves a retired hour's entries.
+pub const HEAD_FORMAT_VERSION_2: u32 = 2;
+
+/// Every HEAD `format_version` this build reads. Which one a HEAD carries is
+/// a function of its content, [`head_format_version_for`]; a version above
+/// all of these is newer ([`head_format_version_is_newer`]).
+pub const HEAD_FORMAT_VERSIONS: [u32; 2] = [HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2];
+
+/// The `format_version` `head`'s content requires: 2 exactly when some part
+/// ref carries a retired hour, else 1. Every HEAD writer stamps this, and
+/// `validate_head` rejects a HEAD stamped otherwise.
+pub fn head_format_version_for(head: &SnapshotHead) -> u32 {
+    if head.parts.iter().any(|part| !part.retired_hours.is_empty()) {
+        HEAD_FORMAT_VERSION_2
+    } else {
+        HEAD_FORMAT_VERSION_1
+    }
+}
+
+/// Whether a rejected HEAD `format_version` is above every version this build
+/// reads, so the HEAD was written by a newer build (ADR-0066 decision 2).
+pub fn head_format_version_is_newer(format_version: u32) -> bool {
+    HEAD_FORMAT_VERSIONS
+        .iter()
+        .all(|known| format_version > *known)
+}
 
 /// Encodes a HEAD record. Validates the same fields `decode_head` enforces,
 /// so a HEAD this function writes can never fail its own decode.
@@ -26,7 +55,7 @@ pub fn decode_head(bytes: &[u8]) -> Result<SnapshotHead, SnapshotFormatError> {
 }
 
 fn validate_head(head: &SnapshotHead) -> Result<(), SnapshotFormatError> {
-    if head.format_version != HEAD_FORMAT_VERSION {
+    if !HEAD_FORMAT_VERSIONS.contains(&head.format_version) {
         return Err(SnapshotFormatError::UnsupportedHeadVersion(
             head.format_version,
         ));
@@ -55,6 +84,29 @@ fn validate_head(head: &SnapshotHead) -> Result<(), SnapshotFormatError> {
         }
         if part.key.is_empty() {
             return Err(SnapshotFormatError::EmptyPartKey { index });
+        }
+        if let Some(pair) = part
+            .retired_hours
+            .windows(2)
+            .find(|pair| pair[0] >= pair[1])
+        {
+            return Err(SnapshotFormatError::RetiredHoursNotAscending {
+                index,
+                previous: pair[0],
+                next: pair[1],
+            });
+        }
+        if let Some(&hour) = part
+            .retired_hours
+            .iter()
+            .find(|&&hour| hour < part.min_hour || hour > part.watermark_hour)
+        {
+            return Err(SnapshotFormatError::RetiredHourOutsidePart {
+                index,
+                hour,
+                min_hour: part.min_hour,
+                watermark: part.watermark_hour,
+            });
         }
         max_watermark = max_watermark.max(part.watermark_hour);
     }
@@ -94,6 +146,13 @@ fn validate_head(head: &SnapshotHead) -> Result<(), SnapshotFormatError> {
                 });
             }
         }
+    }
+    let required = head_format_version_for(head);
+    if head.format_version != required {
+        return Err(SnapshotFormatError::HeadVersionContentMismatch {
+            format_version: head.format_version,
+            required,
+        });
     }
     if head.watermark_hour != max_watermark {
         return Err(SnapshotFormatError::HeadWatermarkMismatch {
