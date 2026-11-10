@@ -391,6 +391,11 @@ pub struct SqlSpillSettings {
     pub merge_fan_in: usize,
     /// `--sql-spill-merge-fan-in` was passed, whatever its value.
     pub merge_fan_in_passed: bool,
+    /// The process's soft open-file limit as `main` raised it
+    /// (`crate::nofile::NofileLimit::soft_or_max`), `u64::MAX` for
+    /// unbounded: the input the spill retry's descriptor budget
+    /// `floor(nofile_soft / (2 x slots))` is read from (issue #4075).
+    pub nofile_soft: u64,
 }
 
 impl Default for SqlSpillSettings {
@@ -401,6 +406,7 @@ impl Default for SqlSpillSettings {
             read_cache_bytes: 0,
             merge_fan_in: DEFAULT_SQL_SPILL_MERGE_FAN_IN,
             merge_fan_in_passed: false,
+            nofile_soft: DEFAULT_SQL_NOFILE_SOFT,
         }
     }
 }
@@ -481,6 +487,13 @@ fn parse_ingest_hold_queued_flushes(value: &str) -> Result<u64, String> {
 /// Mirrored here (ravel-sql is an optional dependency) and pinned equal to it
 /// by `sql_spill_merge_fan_in_default_matches_ravel_sql`.
 pub const DEFAULT_SQL_SPILL_MERGE_FAN_IN: usize = 2;
+
+/// [`SqlSpillSettings::nofile_soft`] until `main` installs the limit it read
+/// at start: Linux's default soft `RLIMIT_NOFILE`, the compiled-in
+/// `ravel_sql::DEFAULT_NOFILE_SOFT`. Mirrored here (ravel-sql is an optional
+/// dependency) and pinned equal to it by
+/// `sql_nofile_soft_default_matches_ravel_sql`.
+pub const DEFAULT_SQL_NOFILE_SOFT: u64 = 1024;
 
 /// Parses `--sql-spill-merge-fan-in`: `0` (DataFusion's unbounded fan-in) or
 /// at least 2. DataFusion would silently raise 1 to 2, so 1 is refused rather
@@ -8444,6 +8457,7 @@ impl Cli {
                 },
                 merge_fan_in: self.sql.sql_spill_merge.sql_spill_merge_fan_in,
                 merge_fan_in_passed: self.sql.sql_spill_merge.sql_spill_merge_fan_in_passed,
+                nofile_soft: DEFAULT_SQL_NOFILE_SOFT,
             },
             decoded_cache_max_bytes: self.cache.decoded_cache_max_bytes,
         })
@@ -17610,6 +17624,7 @@ mod tests {
                     read_cache_bytes,
                     merge_fan_in: DEFAULT_SQL_SPILL_MERGE_FAN_IN,
                     merge_fan_in_passed: false,
+                    nofile_soft: DEFAULT_SQL_NOFILE_SOFT,
                 },
                 "{args:?}"
             );
@@ -17676,6 +17691,14 @@ mod tests {
             DEFAULT_SQL_SPILL_MERGE_FAN_IN,
             ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN
         );
+    }
+
+    /// The soft open-file limit the spill settings assume before `main`
+    /// installs the one it read is ravel-sql's own assumption.
+    #[cfg(feature = "sql")]
+    #[test]
+    fn sql_nofile_soft_default_matches_ravel_sql() {
+        assert_eq!(DEFAULT_SQL_NOFILE_SOFT, ravel_sql::DEFAULT_NOFILE_SOFT);
     }
 
     /// `--alert-retention` defaults to 90 days, accepts `0` as the opt-out,

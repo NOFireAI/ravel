@@ -800,9 +800,10 @@ pub struct ResolvedFirstAttemptPartitions {
 /// Resolve the in-memory attempt's floor from the resolved
 /// `sql_partition_count` and its `PERF_SOURCE_*` source. A derived count keeps
 /// `SqlConfig`'s default floor; a count the operator set, through
-/// `--sql-partition-count` or `--fetch-concurrency`, is planned as given. The
-/// spill retry has no hash exchange to widen, so it plans
-/// `sql_partition_count` either way.
+/// `--sql-partition-count` or `--fetch-concurrency`, is planned as given. A
+/// sort-merge spill retry has no hash exchange to widen, so it plans
+/// `sql_partition_count` either way; a bucketed spill retry plans its hash
+/// exchange with the first attempt's repartition settings (issue #4075).
 #[cfg(feature = "sql")]
 pub fn resolve_sql_first_attempt_partitions(
     sql_partition_count: usize,
@@ -889,6 +890,26 @@ pub const SQL_SPILL_SOURCE_BUILT_IN: &str = "built-in";
 /// whatever its value. With spill off, that line reads
 /// `value="none"` under the `sql_spill_dir` line's source instead.
 pub const SQL_SPILL_SOURCE_DEFAULT: &str = "default";
+/// `source` of the `sql_spill_retry_descriptor_budget` line when spill is on:
+/// `F = floor(nofile_soft / (2 x slots))`, from the soft open-file limit
+/// startup raised and the spill ceiling's share count.
+pub const SQL_SPILL_SOURCE_NOFILE_SOFT: &str = "nofile_soft";
+/// `source` of the `sql_spill_retry_modes` line when spill is on: which
+/// retry plans that descriptor budget leaves available.
+pub const SQL_SPILL_SOURCE_DESCRIPTOR_BUDGET: &str = "descriptor_budget";
+
+/// The `sql_spill_retry_modes` value for a descriptor budget of `budget`:
+/// the bucketed retry and the sort-merge fallback when the budget holds the
+/// smallest tuning's descriptors, the sort-merge retry alone otherwise
+/// (issue #4075).
+#[cfg(feature = "sql")]
+pub fn sql_spill_retry_modes(budget: u64) -> &'static str {
+    if budget >= ravel_sql::BUCKET_SPILL_MIN_DESCRIPTOR_NEED {
+        "bucket,sort_merge"
+    } else {
+        "sort_merge"
+    }
+}
 
 /// The owned form of [`ravel_sql::CacheDirSpill`]: what a `--cache-dir`
 /// deployment resolves its SQL spill root and ceiling from (ADR-0954, amended
@@ -960,6 +981,9 @@ pub struct SqlSpillInputs {
     pub merge_fan_in: usize,
     /// `--sql-spill-merge-fan-in` was passed, whatever its value.
     pub merge_fan_in_passed: bool,
+    /// [`crate::config::SqlSpillSettings::nofile_soft`], installed on the
+    /// executor with `SqlExecutor::with_nofile_soft`.
+    pub nofile_soft: u64,
 }
 
 #[cfg(feature = "sql")]
@@ -971,6 +995,7 @@ impl Default for SqlSpillInputs {
             cwd_default: false,
             merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
             merge_fan_in_passed: false,
+            nofile_soft: crate::config::DEFAULT_SQL_NOFILE_SOFT,
         }
     }
 }
@@ -992,10 +1017,11 @@ pub struct ResolvedSqlSpill {
 
 #[cfg(feature = "sql")]
 impl ResolvedSqlSpill {
-    /// The `sql_spill_dir`, `sql_spill_max_bytes`, `sql_spill_compression`
-    /// and `sql_spill_merge_fan_in` startup lines, in the `performance default
+    /// The `sql_spill_dir`, `sql_spill_max_bytes`, `sql_spill_compression`,
+    /// `sql_spill_merge_fan_in`, `sql_spill_retry_descriptor_budget` and
+    /// `sql_spill_retry_modes` startup lines, in the `performance default
     /// resolved` layout [`crate::config::ResolvedPerformanceDefaults::emit`]
-    /// uses. All four lines are written whether or not spill is enabled; a
+    /// uses. All six lines are written whether or not spill is enabled; a
     /// disabled spill reads `value="none"` with the reason as its source. The
     /// fan-in line's source is `flag` when `inputs`, the inputs this was
     /// resolved from, say `--sql-spill-merge-fan-in` was passed, whatever its
@@ -1040,6 +1066,22 @@ impl ResolvedSqlSpill {
                     },
                     "performance default resolved"
                 );
+                let slots = ravel_sql::spill_slots(config.max_bytes);
+                let budget = ravel_sql::bucket_spill_descriptor_budget(inputs.nofile_soft, slots);
+                tracing::info!(
+                    setting = "sql_spill_retry_descriptor_budget",
+                    value = budget,
+                    source = SQL_SPILL_SOURCE_NOFILE_SOFT,
+                    nofile_soft = inputs.nofile_soft,
+                    slots,
+                    "performance default resolved"
+                );
+                tracing::info!(
+                    setting = "sql_spill_retry_modes",
+                    value = sql_spill_retry_modes(budget),
+                    source = SQL_SPILL_SOURCE_DESCRIPTOR_BUDGET,
+                    "performance default resolved"
+                );
             }
             None => {
                 tracing::info!(
@@ -1064,6 +1106,18 @@ impl ResolvedSqlSpill {
                 );
                 tracing::info!(
                     setting = "sql_spill_merge_fan_in",
+                    value = "none",
+                    source = self.dir_source,
+                    "performance default resolved"
+                );
+                tracing::info!(
+                    setting = "sql_spill_retry_descriptor_budget",
+                    value = "none",
+                    source = self.dir_source,
+                    "performance default resolved"
+                );
+                tracing::info!(
+                    setting = "sql_spill_retry_modes",
                     value = "none",
                     source = self.dir_source,
                     "performance default resolved"
@@ -1359,6 +1413,7 @@ fn prepare_sql_spill_with(
         cwd_default: false,
         merge_fan_in: settings.merge_fan_in,
         merge_fan_in_passed: settings.merge_fan_in_passed,
+        nofile_soft: settings.nofile_soft,
     };
     let resolved = resolve_sql_spill(&inputs, env_dir, env_quota)?;
     resolved.emit(&inputs);
@@ -1490,6 +1545,7 @@ fn prepare_cwd_spill(
         cwd_default: true,
         merge_fan_in: settings.merge_fan_in,
         merge_fan_in_passed: settings.merge_fan_in_passed,
+        nofile_soft: settings.nofile_soft,
     };
     let resolved = match resolve_sql_spill(&inputs, None, None) {
         Ok(resolved) => resolved,
@@ -1626,7 +1682,9 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 ///
 /// `spill` is what [`prepare_sql_spill`] settled: the executor's
 /// `SqlConfig::spill` comes from `SqlConfig::with_spill_resolved(spill.off,
-/// spill.cache_dir)`, with `spill.merge_fan_in` set on it.
+/// spill.cache_dir)`, with `spill.merge_fan_in` set on it, and
+/// `spill.nofile_soft` is the soft open-file limit the spill retry's
+/// descriptor budget is read from (`SqlExecutor::with_nofile_soft`).
 ///
 /// `read_gate` is the process's ADR-1702 read CPU gate, attached to the logs
 /// and spans fetchers so the `logs` and `spans` scans decode their blocks on
@@ -1912,7 +1970,9 @@ fn build_sql_state_inner(
         Some(source) => executor.with_declared_column_source(source),
         None => executor,
     };
-    let executor = executor.with_process_memory_budget(process_memory_budget);
+    let executor = executor
+        .with_process_memory_budget(process_memory_budget)
+        .with_nofile_soft(spill.nofile_soft);
     let executor = match parquet {
         Some(sources) => executor.with_parquet_sources(sources),
         None => executor,
@@ -3756,6 +3816,7 @@ mod tests {
             read_cache_bytes: 0,
             merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
             merge_fan_in_passed: false,
+            nofile_soft: crate::config::DEFAULT_SQL_NOFILE_SOFT,
         }
     }
 
@@ -4609,6 +4670,7 @@ mod tests {
                 cwd_default: false,
                 merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
                 merge_fan_in_passed: false,
+                nofile_soft: crate::config::DEFAULT_SQL_NOFILE_SOFT,
             }),
             None,
             "off in the inputs wins over a cache dir in the same inputs"
@@ -4768,6 +4830,207 @@ mod tests {
         state.executor.config().clone()
     }
 
+    /// The executor `build_sql_state_with_parquet` builds over `store` from
+    /// spill `inputs`, at two final-aggregate partitions, with a process
+    /// memory budget of `process_bytes` and `a` declared `I64`.
+    fn retry_executor(
+        store: &Arc<dyn ObjectStoreBackend>,
+        inputs: &SqlSpillInputs,
+        process_bytes: u64,
+    ) -> Arc<ravel_sql::SqlExecutor> {
+        let catalog = build_catalog(
+            Arc::clone(store),
+            1,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("catalog");
+        let declared: Arc<dyn ravel_sql::DeclaredColumnSource> =
+            Arc::new(ravel_sql::StaticDeclaredColumns::new(vec![
+                ravel_sql::DeclaredColumn::new("a", ravel_sql::DeclaredType::I64),
+            ]));
+        let state = build_sql_state_with_parquet(
+            catalog,
+            Arc::clone(store),
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            None,
+            EngineConfig {
+                sql_partition_count: Some(2),
+                ..EngineConfig::default()
+            },
+            Arc::new(GetLimiter::new(4).expect("nonzero permits")),
+            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+            DEFAULT_MAX_TENANT_BYTES,
+            true,
+            false,
+            Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+            QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            Some(declared),
+            Arc::new(ravel_memory::MemoryBudget::new(process_bytes)),
+            None,
+            ravel_sql::DEFAULT_MIN_GRACE_MS,
+            inputs,
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
+            false,
+            ravel_sql::IpcryptDeployment::default(),
+            None,
+            0,
+        )
+        .expect("sql state builds");
+        state.executor
+    }
+
+    /// Issue #4075: a statement the process memory budget refuses at seven
+    /// tenths of its unlimited peak, on the server-built executor, retries
+    /// through the bucketed final aggregate, with the `--cache-dir` spill
+    /// area and the default soft open-file limit `start` installs, and its
+    /// retry INFO line reads `retry_plan="bucket"` with the derived tuning.
+    /// The bucketed rule itself stays off (`bucketed_final_aggregation`
+    /// false), so the buckets come from the retry alone. The same statement
+    /// on inputs carrying a soft limit of 1 keeps the sort-merge retry for
+    /// its descriptor budget.
+    ///
+    /// Prove-the-test: drop `.with_nofile_soft(spill.nofile_soft)` from
+    /// `build_sql_state_inner` and the soft-limit-1 run still reads
+    /// `retry_plan="bucket"`.
+    #[tokio::test]
+    async fn the_server_built_executor_retries_through_buckets() {
+        use clap::Parser;
+
+        assert_spill_env_unset();
+        let cache = tempfile::tempdir().expect("cache dir");
+        let cache_arg = cache.path().to_str().expect("utf-8 temp path");
+        let cli = crate::Cli::try_parse_from(["ravel-server", "--cache-dir", cache_arg])
+            .expect("flags parse");
+        let resolved = cli
+            .resolve_performance(crate::config::HostProfile::new(
+                16,
+                Some(32_212_254_720),
+                Some(32_212_254_720),
+                None,
+                None,
+                None,
+            ))
+            .expect("performance defaults resolve");
+        let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
+        let startup = prepare(Some(cache.path()), budgets.sql_spill, None, None, 300 * GIB)
+            .expect("spill resolves");
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("acme".to_string());
+        let records: Vec<_> = (0..6_000i64)
+            .map(|i| {
+                let mut record = crate::tests::sql_log_record(i + 1, "retry");
+                record
+                    .attrs
+                    .push(("a".to_string(), ravel_logseg::AttrValue::I64(i)));
+                record
+            })
+            .collect();
+        crate::tests::publish_small_log_segment(store.as_ref(), &tenant, &records).await;
+
+        let request = ravel_sql::SqlRequest {
+            sql: "SELECT a, count(*) AS c FROM logs GROUP BY a".to_string(),
+            window: ravel_types::TimeRange {
+                start_ns: 0,
+                end_ns: i64::MAX,
+            },
+            min_tokens: Vec::new(),
+            now_ns: 1_000_000,
+            deadline: Duration::from_secs(120),
+            row_window: false,
+            max_rows: None,
+            budgets: None,
+        };
+        let rows = |outcome: &ravel_sql::SqlOutcome| {
+            let mut rows = Vec::new();
+            for batch in outcome.output.batches() {
+                for row in 0..batch.num_rows() {
+                    let cells: Vec<String> = batch
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            arrow::util::display::array_value_to_string(column, row)
+                                .expect("renders")
+                        })
+                        .collect();
+                    rows.push(cells.join("|"));
+                }
+            }
+            rows.sort();
+            rows
+        };
+
+        let unlimited = retry_executor(&store, &startup.inputs, u64::MAX)
+            .execute(tenant.hash(), &request)
+            .await
+            .expect("the unlimited run answers");
+        assert_eq!(unlimited.stats.spill_retries, 0);
+        let peak = unlimited.accounting.peak_intermediate_bytes;
+
+        let refused = retry_executor(&store, &startup.inputs, peak * 7 / 10);
+        let (capture, guard) = capture_info();
+        let retried = refused.execute(tenant.hash(), &request).await;
+        drop(guard);
+        let lines = capture.0.lock().clone();
+        let retried = retried.unwrap_or_else(|e| panic!("the retry answers: {e}\n{lines:?}"));
+        assert_eq!(retried.stats.spill_retries, 1, "{lines:?}");
+        let info: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("SQL statement retried with spill"))
+            .collect();
+        assert_eq!(info.len(), 1, "{lines:?}");
+        let report = retried.stats.spill_retry.as_ref().expect("the retry reports");
+        let bits = report.bits.expect("a bucket retry derives bits");
+        let chunk_rows = report
+            .routed_chunk_rows
+            .expect("a bucket retry derives routed_chunk_rows");
+        for field in [
+            " retry_plan=\"bucket\"".to_string(),
+            " retry_plan_reason=\"none\"".to_string(),
+            format!(" bits=\"{bits}\""),
+            format!(" routed_chunk_rows=\"{chunk_rows}\""),
+        ] {
+            assert!(info[0].contains(&field), "{field} on {}", info[0]);
+        }
+        let plan = retried
+            .stats
+            .spill_retry_plan
+            .as_deref()
+            .expect("the retry plan is kept");
+        assert!(plan.contains("BucketedFinalAggregateExec:"), "{plan}");
+        assert_eq!(rows(&retried), rows(&unlimited));
+        assert_eq!(rows(&unlimited).len(), 6_000);
+
+        // The soft limit the inputs carry is the one the retry divides.
+        let short = SqlSpillInputs {
+            nofile_soft: 1,
+            ..startup.inputs.clone()
+        };
+        let refused = retry_executor(&store, &short, peak * 7 / 10);
+        let (capture, guard) = capture_info();
+        let _ = refused.execute(tenant.hash(), &request).await;
+        drop(guard);
+        let lines = capture.0.lock().clone();
+        let info: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("SQL statement retried with spill"))
+            .collect();
+        assert_eq!(info.len(), 1, "{lines:?}");
+        assert!(
+            info[0].contains(" retry_plan=\"sort_merge\"")
+                && info[0].contains(" retry_plan_reason=\"descriptor_budget\""),
+            "{}",
+            info[0]
+        );
+    }
+
     /// The startup lines: `sql_spill_dir`, `sql_spill_max_bytes`,
     /// `sql_spill_compression` and `sql_spill_merge_fan_in` each appear
     /// exactly once, on the `performance default resolved` layout, with the
@@ -4896,7 +5159,7 @@ mod tests {
             let max_line = resolved_line(&lines, "sql_spill_max_bytes");
             assert!(max_line.contains(&max_fields), "{label}: {max_line}");
             let compression_fields = if dir_fields.starts_with(" value=\"none\"") {
-                dir_fields
+                dir_fields.clone()
             } else {
                 " value=\"lz4_frame\" source=\"built-in\"".to_string()
             };
@@ -4909,6 +5172,76 @@ mod tests {
             assert!(
                 fan_in_line.contains(&fan_in_fields),
                 "{label}: {fan_in_line}"
+            );
+            // Every enabled row's ceiling is one share, so F = 1024 / 2.
+            let (budget_fields, modes_fields) = if dir_fields.starts_with(" value=\"none\"") {
+                (dir_fields.clone(), dir_fields)
+            } else {
+                (
+                    " value=512 source=\"nofile_soft\" nofile_soft=1024 slots=1".to_string(),
+                    " value=\"bucket,sort_merge\" source=\"descriptor_budget\"".to_string(),
+                )
+            };
+            let budget_line = resolved_line(&lines, "sql_spill_retry_descriptor_budget");
+            assert!(
+                budget_line.contains(&budget_fields),
+                "{label}: {budget_line}"
+            );
+            let modes_line = resolved_line(&lines, "sql_spill_retry_modes");
+            assert!(modes_line.contains(&modes_fields), "{label}: {modes_line}");
+        }
+    }
+
+    /// `sql_spill_retry_modes` names the bucketed retry only while the
+    /// descriptor budget holds the smallest tuning's need, and the budget
+    /// line divides the soft limit by twice the share count: 1024 over four
+    /// shares is 128, and a soft limit of 11 over two shares is 2, below the
+    /// need of 3, which leaves the sort-merge retry alone.
+    ///
+    /// Prove-the-test: compare against 1 instead of
+    /// `BUCKET_SPILL_MIN_DESCRIPTOR_NEED` and the 11-descriptor row reads
+    /// `bucket,sort_merge`.
+    #[test]
+    fn the_retry_modes_line_follows_the_descriptor_budget() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        for (label, nofile_soft, quota, budget_fields, modes) in [
+            (
+                "four shares",
+                1024,
+                "34359738368",
+                " value=128 source=\"nofile_soft\" nofile_soft=1024 slots=4",
+                "bucket,sort_merge",
+            ),
+            (
+                "short soft limit",
+                11,
+                "17179869184",
+                " value=2 source=\"nofile_soft\" nofile_soft=11 slots=2",
+                "sort_merge",
+            ),
+        ] {
+            let (capture, guard) = capture_info();
+            let explicit = cache.path().join(label.replace(' ', "-"));
+            let startup = prepare(
+                Some(cache.path()),
+                crate::config::SqlSpillSettings {
+                    nofile_soft,
+                    ..settings(false, 2 * GIB)
+                },
+                os(explicit.to_str().expect("utf-8 temp path")),
+                os(quota),
+                100 * GIB,
+            )
+            .expect("spill resolves");
+            drop(guard);
+            drop(startup);
+            let lines = capture.0.lock().clone();
+            let budget_line = resolved_line(&lines, "sql_spill_retry_descriptor_budget");
+            assert!(budget_line.contains(budget_fields), "{label}: {budget_line}");
+            let modes_line = resolved_line(&lines, "sql_spill_retry_modes");
+            assert!(
+                modes_line.contains(&format!(" value={modes:?} source=\"descriptor_budget\"")),
+                "{label}: {modes_line}"
             );
         }
     }
@@ -4964,6 +5297,7 @@ mod tests {
                     read_cache_bytes: BOUND,
                     merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
                     merge_fan_in_passed: false,
+                    nofile_soft: crate::config::DEFAULT_SQL_NOFILE_SOFT,
                 },
                 env_dir,
                 env_dir.map(|_| std::ffi::OsStr::new("4096")),
@@ -5311,6 +5645,7 @@ mod tests {
             read_cache_bytes,
             merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
             merge_fan_in_passed: false,
+            nofile_soft: crate::config::DEFAULT_SQL_NOFILE_SOFT,
         }
     }
 

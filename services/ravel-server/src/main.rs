@@ -59,7 +59,9 @@ async fn main() -> anyhow::Result<()> {
     // ADR-3565 bucket spill item 1: the soft open-file limit, raised to the
     // hard limit before anything reads it.
     #[cfg(feature = "sql")]
-    ravel_server::nofile::raise_nofile_soft_limit().emit();
+    let nofile = ravel_server::nofile::raise_nofile_soft_limit();
+    #[cfg(feature = "sql")]
+    nofile.emit();
 
     // Host-derived performance defaults (ADR-0088 as amended by issue #1141).
     // The host is read exactly once, here, and the six settings are resolved
@@ -672,9 +674,17 @@ async fn main() -> anyhow::Result<()> {
             .parse_query_concurrency_limit()
             .context("failed to parse --max-concurrent-queries")?,
         max_s3_requests,
-        query_budgets: cli
-            .query_budgets(&performance)
-            .context("failed to resolve the query budgets and logs fetch policy")?,
+        query_budgets: {
+            #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
+            let mut budgets = cli
+                .query_budgets(&performance)
+                .context("failed to resolve the query budgets and logs fetch policy")?;
+            #[cfg(feature = "sql")]
+            {
+                budgets.sql_spill.nofile_soft = nofile.soft_or_max();
+            }
+            budgets
+        },
         scrub_period: cli
             .parse_scrub_period()
             .context("failed to parse --scrub-period")?,
