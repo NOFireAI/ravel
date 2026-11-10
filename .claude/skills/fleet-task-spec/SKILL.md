@@ -204,12 +204,11 @@ while a test actually failed. The LONG COMMANDS form solves both at once:
 the redirect keeps the output out of the tool result, and the marker at the
 end of the same log carries the gate's own exit code.
 Where that file goes is itself a rule, because both wrong answers have
-already cost a task. Run this first, as ONE command, substituting
-nothing:
+already cost a task. Run this first, as ONE command. The author writes the
+spec's `disk_floor_gb` in place of `<disk_floor_gb>` before dispatch;
+nothing else is substituted:
 
     mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs <disk_floor_gb> && df -h /tmp . "$HOME"
-
-(write the spec's disk_floor_gb value in place of <disk_floor_gb>).
 
 Every step is joined with `&&` so a failure anywhere fails the command:
 `git check-ignore -q .gate-logs` proves the tracked `.gitignore` covers
@@ -232,9 +231,9 @@ failure. The reason for the floor: a cold gate writes 54 to 70 GB of target
 when its closure runs no feature lane, and from about 93 GB to more than
 188 GB when it reaches the sql, flight-sql, esql and ravel-bench lanes
 (CLAUDE.md's measured band), since the main suite and every lane share one
-target. The template's 70 is the hard stop because the spec does not
-choose the host, and a higher floor would turn a smaller healthy host into
-a lost dispatch. So the 70 does not prove a feature-lane gate will fit,
+target. The spec's `disk_floor_gb` is the hard stop because the spec does
+not choose the host, and a higher floor would turn a smaller healthy host
+into a lost dispatch. So the floor does not prove a feature-lane gate will fit,
 and short of the headroom the run needs, it dies mid-link with a fake
 compiler error. A spec whose `--dry-run` lists those lanes therefore tells
 the executor to run `df -h .` right after any link failure, before
