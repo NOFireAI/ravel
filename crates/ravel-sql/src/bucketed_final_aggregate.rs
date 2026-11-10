@@ -672,6 +672,42 @@ impl ColumnChunk {
     }
 }
 
+/// The type and width of every column a final `aggregate`'s stream routes:
+/// its keys, then every accumulator's state, or the first type that is not
+/// fixed width. The bucket spill derivation reads the widths through this
+/// same function.
+pub(crate) fn routed_types(
+    aggregate: &AggregateExec,
+) -> DFResult<Result<Vec<(DataType, usize)>, DataType>> {
+    let input_schema = aggregate.input().schema();
+    let group_by = aggregate.group_expr();
+    let state_args = aggregate_expressions(
+        aggregate.aggr_expr(),
+        aggregate.mode(),
+        group_by.num_group_exprs(),
+    )?;
+    let group_schema = group_by.group_schema(&input_schema)?;
+    let mut types = Vec::new();
+    for data_type in group_schema
+        .fields()
+        .iter()
+        .map(|field| field.data_type().clone())
+        .chain(
+            state_args
+                .iter()
+                .flatten()
+                .map(|expr| expr.data_type(&input_schema))
+                .collect::<DFResult<Vec<_>>>()?,
+        )
+    {
+        let Some(width) = data_type.primitive_width() else {
+            return Ok(Err(data_type));
+        };
+        types.push((data_type, width));
+    }
+    Ok(Ok(types))
+}
+
 /// A bucket's chunk still taking rows.
 struct OpenChunk {
     columns: Vec<ColumnChunk>,
@@ -1236,26 +1272,11 @@ impl BucketedStream {
             .collect::<DFResult<Vec<_>>>()?;
         let group_schema = group_by.group_schema(&input_schema)?;
         let key_count = group_schema.fields().len();
-        let mut routed_types = Vec::new();
-        for data_type in group_schema
-            .fields()
-            .iter()
-            .map(|field| field.data_type().clone())
-            .chain(
-                state_args
-                    .iter()
-                    .flatten()
-                    .map(|expr| expr.data_type(&input_schema))
-                    .collect::<DFResult<Vec<_>>>()?,
-            )
-        {
-            let Some(width) = data_type.primitive_width() else {
-                return Err(DataFusionError::Internal(format!(
-                    "BucketedFinalAggregateExec: routed column type {data_type} is not fixed width"
-                )));
-            };
-            routed_types.push((data_type, width));
-        }
+        let routed_types = routed_types(aggregate)?.map_err(|data_type| {
+            DataFusionError::Internal(format!(
+                "BucketedFinalAggregateExec: routed column type {data_type} is not fixed width"
+            ))
+        })?;
         let group_values = new_group_values(group_schema, &GroupOrdering::None)?;
         let spill = spill.map(|counters| {
             let schema = Arc::new(Schema::new(
@@ -1798,5 +1819,86 @@ impl Stream for BucketedStream {
 impl RecordBatchStream for BucketedStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::bucket_spill_tuning::routed_chunk_charge;
+
+    const POOL: &str = "query memory pool spill threshold reached: ";
+
+    fn refused(rest: &str) -> DataFusionError {
+        DataFusionError::ResourcesExhausted(format!("{POOL}{rest}"))
+    }
+
+    fn labelled(err: &DataFusionError) -> bool {
+        err.to_string().contains(BUCKET_SPILL_UNDERSHOOT)
+    }
+
+    /// Only the spill-mode pool's cap and fair-share refusals are labelled;
+    /// the hard bound, the query pool and the gates keep their own message.
+    #[test]
+    fn undershoot_labels_cap_and_share_refusals_only() {
+        let cap = refused(
+            "spill-capable consumers would hold 901 bytes charged and enveloped, over the \
+             spill-mode cap 900 (per-query limit 1000 less headroom 100)",
+        );
+        let share = refused(
+            "BucketedFinalAggregate[0] would hold 701 bytes charged and enveloped, over its \
+             fair share 450 of the spill-mode cap 900 (2 spill-capable consumers; per-query \
+             limit 1000 less headroom 100)",
+        );
+        assert!(labelled(&undershoot(cap)));
+        assert!(labelled(&undershoot(share)));
+
+        let hard = refused(
+            "spill-capable consumers would hold 951 bytes charged and enveloped, over the \
+             spill-mode hard bound 950 (per-query limit 1000 less half the headroom 50)",
+        );
+        let passes = [
+            hard,
+            DataFusionError::ResourcesExhausted(
+                "query memory pool exhausted: 2048 bytes asked".to_string(),
+            ),
+            refused("process memory budget exhausted for this aggregate's reserve-ahead envelope"),
+            DataFusionError::Internal("over its fair share".to_string()),
+        ];
+        for err in passes {
+            let before = err.to_string();
+            let after = undershoot(err);
+            assert!(!labelled(&after), "{after}");
+            assert_eq!(after.to_string(), before);
+        }
+    }
+
+    /// The derivation charges a routed chunk as `OpenChunk::allocate`
+    /// charges it, for every width the routed types take and row counts on
+    /// and off the 64-byte and 8-row boundaries.
+    #[test]
+    fn routed_chunk_charge_is_the_allocated_charge() {
+        let types = [
+            (DataType::Int8, 1),
+            (DataType::Int16, 2),
+            (DataType::UInt32, 4),
+            (DataType::Int64, 8),
+            (DataType::Decimal128(38, 4), 16),
+            (DataType::Decimal256(76, 4), 32),
+        ];
+        for (data_type, width) in &types {
+            assert_eq!(data_type.primitive_width(), Some(*width), "{data_type}");
+        }
+        for rows in [1, 7, 8, 9, 63, 64, 65, 1023, 1024, 2372, 8192] {
+            for set in [&types[..], &types[3..4], &types[1..3], &types[4..]] {
+                let widths: Vec<usize> = set.iter().map(|(_, width)| *width).collect();
+                assert_eq!(
+                    Some(OpenChunk::allocate(set, rows).charged),
+                    routed_chunk_charge(&widths, rows),
+                    "{rows} rows of {widths:?}"
+                );
+            }
+        }
     }
 }
