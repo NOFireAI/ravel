@@ -98,20 +98,21 @@ new_case() {
   : >"${case_dir}/calls.log"
 }
 
-# one_failed_run <run> <job> <created-iso> <log-text> -> a merge_group run
-# with one failed job whose log is <log-text>.
+# one_failed_run <run> <job> <created-iso> <log-text> [<job-name>] -> a
+# merge_group run with one failed job (named "test (1)" by default) whose log
+# is <log-text>.
 one_failed_run() {
   printf '[{"databaseId":%s,"createdAt":"%s","event":"merge_group","url":"https://github.com/o/r/actions/runs/%s"}]\n' \
     "$1" "$3" "$1" >"${case_dir}/runs-merge_group.json"
-  printf '{"jobs":[{"databaseId":%s,"name":"test (1)","conclusion":"failure"},{"databaseId":1,"name":"lint","conclusion":"success"}]}\n' \
-    "$2" >"${case_dir}/jobs-$1.json"
+  printf '{"jobs":[{"databaseId":%s,"name":"%s","conclusion":"failure"},{"databaseId":1,"name":"lint","conclusion":"success"}]}\n' \
+    "$2" "${5:-test (1)}" >"${case_dir}/jobs-$1.json"
   printf '%b' "$4" >"${case_dir}/log-$2.txt"
 }
 
 # flaky_issue <number> <labels-json> <body> -> the flaky-test issue list.
 flaky_issue() {
   jq -n --argjson n "$1" --argjson l "$2" --arg b "$3" \
-    '[{number: $n, title: "flaky-test: ravel_sql::tests::alpha", state: "OPEN", body: $b, labels: ($l | map({name: .}))}]' \
+    '[{number: $n, title: "flaky-test: ravel-sql tests::alpha", state: "OPEN", body: $b, labels: ($l | map({name: .}))}]' \
     >"${case_dir}/issues-flaky-test.json"
 }
 
@@ -123,21 +124,36 @@ run_sweep() {
 
 count_calls() { grep -c "^$1" "${case_dir}/calls.log"; }
 
-LOG_ALPHA='2026-11-10T01:00:00.0000000Z \033[0;31mtest ravel_sql::tests::alpha ... FAILED\033[0m\n'
-LOG_ALPHA+="2026-11-10T01:00:00.0000000Z thread 'ravel_sql::tests::alpha' panicked at crates/ravel-sql/src/lib.rs:10:5:\n"
-LOG_ALPHA+='2026-11-10T01:00:00.0000000Z error[E0308]: mismatched types\n'
+# nextest_log <binary-id> <test> -> a coloured nextest failure as a job log
+# carries it: the result line, libtest's own lines inside the captured
+# output, a compile-error line, and the final summary repeating the result.
+nextest_log() {
+  local t='2026-11-10T01:00:00.0000000Z'
+  printf '%s' "${t}         \\033[1;31mFAIL\\033[0m [   0.004s] (1/1) \\033[1;35m$1\\033[0m \\033[1;36m$2\\033[0m\\n"
+  printf '%s' "${t} \\033[1;31m--- STDOUT: $1 $2 ---\\033[0m\\n${t} running 1 test\\n"
+  printf '%s' "${t} test $2 ... \\033[0;31mFAILED\\033[0m\\n"
+  printf '%s' "${t} thread '$2' panicked at crates/x/src/lib.rs:10:5:\\n"
+  printf '%s' "${t} error[E0308]: mismatched types\\n"
+  printf '%s' "${t}      Summary [   0.010s] 1 test run: 0 passed, 1 failed, 0 skipped\\n"
+  printf '%s' "${t}         \\033[1;31mFAIL\\033[0m [   0.004s] (1/1) \\033[1;35m$1\\033[0m \\033[1;36m$2\\033[0m\\n"
+}
+
+LOG_ALPHA="$(nextest_log ravel-sql tests::alpha)"
+ALPHA="ravel-sql tests::alpha"
 
 # --- first_ejection_files_one_issue ---------------------------------------
 # FLIP: keying the issue on the grep's raw match instead of the normalised
 # identifier (normalize_ids reduced to a `sort -u` pass-through) files three
-# issues here, one for the `test ... FAILED` line, one for the `thread ...
-# panicked` line, one for `error[E0308]`; shown failing with that change.
+# more issues here, for the `test ... FAILED`, `thread ... panicked` and
+# `error[E0308]` lines; and keeping a libtest path that the nextest line
+# already names (the `named` lookup in the awk removed) files a second issue,
+# `[test (1)] tests::alpha`. Both shown failing.
 new_case first_ejection
 one_failed_run 501 7001 "$(at "${NOW}" -3600)" "${LOG_ALPHA}"
 run_sweep
 creates="$(count_calls 'issue create')"
 if [[ "${rc}" == "0" && "${creates}" == "1" ]] &&
-  grep -q -- "--title flaky-test: ravel_sql::tests::alpha --label flaky-test --body-file" "${case_dir}/calls.log" &&
+  grep -q -- "--title flaky-test: ${ALPHA} --label flaky-test --body-file" "${case_dir}/calls.log" &&
   ! grep -q -- "flake-quarantine-due --body-file" "${case_dir}/calls.log" &&
   grep -q '^- failure run=501 at=' "${case_dir}/created-1.md"; then
   ok first_ejection_files_one_issue
@@ -219,11 +235,81 @@ else
   not_ok second_after_14_days_does_not_add_label "rc=${rc}; $(cat "${case_dir}/calls.log" "${case_dir}/out.txt")"
 fi
 
+# --- two_crates_same_test_path_get_two_issues -----------------------------
+# ravel-codec and ravel-segment both define a top-level
+# `arbitrary_bytes_never_panic` in tests/fuzz_mutation.rs. One failure of each,
+# in two runs within the window, is two tests failing once, not one test
+# failing twice.
+# FLIP: dropping the binary id from the nextest identifier (nextest_ids
+# printing `\3` alone) files one issue for both, with flake-quarantine-due;
+# shown failing with that change.
+new_case two_crates
+printf '[%s,%s]\n' \
+  "{\"databaseId\":601,\"createdAt\":\"$(at "${NOW}" -7200)\",\"event\":\"merge_group\",\"url\":\"https://x/601\"}" \
+  "{\"databaseId\":602,\"createdAt\":\"$(at "${NOW}" -3600)\",\"event\":\"merge_group\",\"url\":\"https://x/602\"}" \
+  >"${case_dir}/runs-merge_group.json"
+printf '{"jobs":[{"databaseId":8001,"name":"fuzz","conclusion":"failure"}]}\n' >"${case_dir}/jobs-601.json"
+printf '{"jobs":[{"databaseId":8002,"name":"fuzz","conclusion":"failure"}]}\n' >"${case_dir}/jobs-602.json"
+printf '%b' "$(nextest_log ravel-codec::fuzz_mutation arbitrary_bytes_never_panic)" >"${case_dir}/log-8001.txt"
+printf '%b' "$(nextest_log ravel-segment::fuzz_mutation arbitrary_bytes_never_panic)" >"${case_dir}/log-8002.txt"
+run_sweep
+if [[ "${rc}" == "0" && "$(count_calls 'issue create')" == "2" ]] &&
+  grep -q -- "--title flaky-test: ravel-codec::fuzz_mutation arbitrary_bytes_never_panic --label flaky-test --body-file" "${case_dir}/calls.log" &&
+  grep -q -- "--title flaky-test: ravel-segment::fuzz_mutation arbitrary_bytes_never_panic --label flaky-test --body-file" "${case_dir}/calls.log" &&
+  ! grep -q -- "flake-quarantine-due --body-file" "${case_dir}/calls.log"; then
+  ok two_crates_same_test_path_get_two_issues
+else
+  not_ok two_crates_same_test_path_get_two_issues "rc=${rc}; $(cat "${case_dir}/calls.log" "${case_dir}/out.txt")"
+fi
+
+# --- libtest_only_log_keys_on_job_name ------------------------------------
+# A `cargo test` job prints libtest's lines and no nextest line, so no crate:
+# the failed job's name stands in for it.
+# FLIP: printing the libtest path without the job name (the awk's
+# `"[" ENVIRON["JOB_NAME"] "] "` removed) files `flaky-test: tests::alpha`;
+# shown failing with that change.
+new_case libtest_only
+one_failed_run 506 7006 "$(at "${NOW}" -3600)" \
+  "2026-11-10T01:00:00.0000000Z test tests::alpha ... \\033[0;31mFAILED\\033[0m\\n2026-11-10T01:00:00.0000000Z thread 'tests::alpha' panicked at src/lib.rs:1:1:\\n" \
+  "features-agents"
+run_sweep
+if [[ "${rc}" == "0" && "$(count_calls 'issue create')" == "1" ]] &&
+  grep -q -- "--title flaky-test: \\[features-agents\\] tests::alpha --label flaky-test --body-file" "${case_dir}/calls.log"; then
+  ok libtest_only_log_keys_on_job_name
+else
+  not_ok libtest_only_log_keys_on_job_name "rc=${rc}; $(cat "${case_dir}/calls.log" "${case_dir}/out.txt")"
+fi
+
+# --- unread_failed_job_is_reported ----------------------------------------
+# Run 507 has two failed jobs: one a nextest failure, one a compile error,
+# which names no test. The first files its issue; the second is in no ledger
+# and has to say so, by run, job id and job name, and in the summary count.
+# FLIP: dropping the empty-identifier check (the `! -s job-ids.txt` block
+# removed) prints neither the line nor a nonzero count; shown failing with
+# that change.
+new_case unread
+printf '[{"databaseId":507,"createdAt":"%s","event":"merge_group","url":"https://x/507"}]\n' \
+  "$(at "${NOW}" -3600)" >"${case_dir}/runs-merge_group.json"
+printf '{"jobs":[{"databaseId":7007,"name":"check-shard (2)","conclusion":"failure"},{"databaseId":7008,"name":"test (1)","conclusion":"failure"}]}\n' \
+  >"${case_dir}/jobs-507.json"
+printf '%b' '2026-11-10T01:00:00.0000000Z \033[1;31merror[E0308]\033[0m: mismatched types\n2026-11-10T01:00:00.0000000Z error: could not compile `ravel-sql` (lib)\n' \
+  >"${case_dir}/log-7007.txt"
+printf '%b' "${LOG_ALPHA}" >"${case_dir}/log-7008.txt"
+run_sweep
+if [[ "${rc}" == "0" && "$(count_calls 'issue create')" == "1" ]] &&
+  grep -qF "run 507 job 7007 (check-shard (2)): no identifier read from a non-empty failed log" "${case_dir}/out.txt" &&
+  ! grep -q "job 7008.*no identifier" "${case_dir}/out.txt" &&
+  [[ "$(tail -n 1 "${case_dir}/out.txt")" == *" 1 failed runs swept, 1 test identifiers, 1 failed jobs with no identifier read from a non-empty log, 0 with an empty failed log" ]]; then
+  ok unread_failed_job_is_reported
+else
+  not_ok unread_failed_job_is_reported "rc=${rc}; $(cat "${case_dir}/calls.log" "${case_dir}/out.txt")"
+fi
+
 # due_issue <case> <due-since-iso> writes an open flake-quarantine-due issue
 # #77 whose ledger marks it due at <due-since-iso>, and no failed runs.
 due_issue() {
   jq -n --arg since "$1" \
-    '[{number: 77, title: "flaky-test: ravel_sql::tests::alpha", createdAt: "2026-10-01T00:00:00Z",
+    '[{number: 77, title: "flaky-test: ravel-sql tests::alpha", createdAt: "2026-10-01T00:00:00Z",
        body: ("intro\n- failure run=401 at=\($since) event=merge_group u\n- quarantine-due at=\($since)\n")}]' \
     >"${case_dir}/issues-flake-quarantine-due.json"
 }
