@@ -9,16 +9,20 @@ ENV
 . /mb/env
 # Also to the serial console, so a box that shuts itself down here leaves its
 # reason in get-console-output.
-exec > >(tee -a /mb/userdata.log >/dev/console) 2>&1
+if : >/dev/console 2>/dev/null; then
+  exec > >(tee -a /mb/userdata.log >/dev/console) 2>&1
+else
+  exec >>/mb/userdata.log 2>&1
+fi
 # The snap store is not always reachable from the benchmark subnet (it timed
 # out on 2026-11-11 while apt and awscli.amazonaws.com answered), so fall back
 # to the official AWS CLI v2 bundle, installed under /usr/local/bin.
 install_awscli_bundle() {
   apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q unzip curl &&
-    curl -sSfL --retry 3 -o /tmp/awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip &&
+    curl -sSfL --retry 3 --connect-timeout 20 --max-time 120 -o /tmp/awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip &&
     unzip -q -o /tmp/awscliv2.zip -d /tmp && /tmp/aws/install --update
 }
-timeout 300 snap install aws-cli --classic || { echo "aws-cli snap install failed, trying the AWS CLI bundle"; install_awscli_bundle; } ||
+timeout 300 snap install aws-cli --classic || { echo "aws-cli snap install failed, trying the AWS CLI bundle"; export -f install_awscli_bundle; timeout 600 bash -c install_awscli_bundle; } ||
   { echo "aws-cli install failed"; shutdown -h now; }
 export PATH=/snap/bin:/usr/local/bin:$PATH
 command -v aws || { echo "aws-cli not on PATH"; shutdown -h now; }
