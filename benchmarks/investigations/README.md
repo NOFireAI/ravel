@@ -1411,6 +1411,15 @@ tier within 20 % of its target (issue #3699's spec, not the ADR, allows the
 20 %). `truth.json` records the exact counts every answer is judged
 against.
 
+Journey C's cut for tier k is the k-th root span start of the failing
+hour, which is exact only when no two of that hour's traces start on the
+same nanosecond. A draw that ties there (about one day in ten at the ADR's
+833,333 traces an hour, about one in 250 at `dp30`'s 166,667) has the later
+trace of each tie, in trace id order, moved one nanosecond on before any
+row is written (`separate_starts`). A draw with no tie is written exactly
+as drawn, so every corpus that generated before the move existed is
+byte-identical.
+
 The plant counts are blocks of the generator's row order, not of storage:
 the writer sorts each object's records by `(stream_ref, ts_ns)`
 (`docs/log-segment-format.md`, "BLOCKS"), per shard and ingest hour, so a

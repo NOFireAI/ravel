@@ -728,6 +728,85 @@ class Corpus(unittest.TestCase):
         self.assertTrue(self.truth["journey_c"]["10240"]["capped"])
         self.assertFalse(self.truth["journey_c"]["1"]["capped"])
 
+    def load_gen(self):
+        spec = importlib.util.spec_from_file_location("gen_corpus_under_test", GEN)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_failing_hour_start_ties_at_the_journey_cuts_generate_exactly(self):
+        # Starts drawn on a 10 s grid tie throughout the failing hour,
+        # including at the k = 1 and k = 102 cuts.
+        mod = self.load_gen()
+        draw = mod.draw_traces
+        grid = 10 * 1_000_000_000
+        drawn = []
+
+        def coarse(*a, **kw):
+            traces = draw(*a, **kw)
+            for t in traces:
+                t.start_ns -= t.start_ns % grid
+            traces.sort(key=lambda t: (t.start_ns, t.trace_id))
+            drawn.append(sorted(t.start_ns for t in traces if mod.hour_of(t.start_ns, 498248) == 1))
+            return traces
+
+        mod.draw_traces = coarse
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.devnull, "w") as null:
+                stdout, sys.stdout = sys.stdout, null
+                try:
+                    self.assertEqual(mod.main(["--traces", "1000", "--hours", "2", "--seed", "7", "--start-hour",
+                                               "498248", "--format", "jsonl", "--out", d]), 0)
+                finally:
+                    sys.stdout = stdout
+            with open(os.path.join(d, "truth.json")) as f:
+                truth = json.load(f)
+            rows = {}
+            for sig in ("spans", "logs"):
+                with open(os.path.join(d, f"{sig}.jsonl")) as f:
+                    rows[sig] = [json.loads(line) for line in f]
+        starts = drawn[0]
+        for k in (1, 102):
+            self.assertEqual(starts[k - 1], starts[k], k)
+        roots = self.roots(rows)
+        hour_roots = sorted(r["start_ts"] for r in roots.values() if self.hour(truth, r["start_ts"]) == 1)
+        self.assertEqual(len(hour_roots), len(starts))
+        self.assertEqual(len(set(hour_roots)), len(hour_roots))
+        self.assertTrue(all(s <= h < s + len(starts) for s, h in zip(starts, hour_roots)))
+        for k, jc in truth["journey_c"].items():
+            build = {tid for tid, r in roots.items() if jc["start_ns"] <= r["start_ts"] < jc["cut_ns"]}
+            self.assertEqual(jc["build"], min(int(k), len(hour_roots)), k)
+            self.assertEqual(len(build), jc["build"], k)
+            n = sum(1 for r in rows["logs"] if r["trace_id"] in build)
+            self.assertEqual(truth["answers"][f"journey_c.{k}"]["value"], n, k)
+
+    def test_separate_starts_leaves_an_untied_hour_alone_and_keeps_order(self):
+        mod = self.load_gen()
+        h0 = 498248 * HOUR_NS + HOUR_NS
+        tr = mod.Trace
+        traces = [tr(5, h0 + 7, 0, False), tr(3, h0 + 7, 0, False), tr(9, h0 + 7, 0, False), tr(1, h0 + 8, 0, False),
+                  tr(2, h0 + 20, 0, False), tr(4, h0 - 1, 0, False), tr(6, h0 - 1, 0, False)]
+        self.assertEqual(mod.separate_starts(traces, 1, 498248), 3)
+        self.assertEqual({t.trace_id: t.start_ns - h0 for t in traces},
+                         {3: 7, 5: 8, 9: 9, 1: 10, 2: 20, 4: -1, 6: -1})
+        untied = [tr(i, h0 + 10 * i, 0, False) for i in range(1, 6)]
+        self.assertEqual(mod.separate_starts(untied, 1, 498248), 0)
+        self.assertEqual([t.start_ns - h0 for t in untied], [10, 20, 30, 40, 50])
+
+    def test_separate_starts_breaks_the_day_parts_30_first_day_tie(self):
+        # The day that stopped D3' run B: dp30 day 0 (seed (3692 + 130) * 1000,
+        # 4,000,008 traces over 24 even hours) draws one tie in its failing hour.
+        mod = self.load_gen()
+        start_hour = 498248
+        base = mod.draw_traces(random.Random(3822000), 4_000_008, 24, start_hour, set(), True)
+        hour = [t.start_ns for t in base if mod.hour_of(t.start_ns, start_hour) == 12]
+        self.assertEqual(len(hour), 166_667)
+        self.assertEqual(len(hour) - len(set(hour)), 1)
+        self.assertEqual(mod.separate_starts(base, 12, start_hour), 1)
+        hour = [t.start_ns for t in base if mod.hour_of(t.start_ns, start_hour) == 12]
+        self.assertEqual(len(set(hour)), 166_667)
+        self.assertEqual([(t.start_ns, t.trace_id) for t in base], sorted((t.start_ns, t.trace_id) for t in base))
+
     def test_capped_is_real(self):
         with tempfile.TemporaryDirectory() as d:
             truth, _ = gen(d, 60, 2, 7)
