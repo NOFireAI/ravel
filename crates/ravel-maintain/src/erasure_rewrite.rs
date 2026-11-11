@@ -1588,6 +1588,7 @@ pub async fn build_rewrite_logs(
     input_set_hash: &[u8; 32],
 ) -> Result<RewriteBuild> {
     crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
+    crate::config::validate_rlog_run_block_target_records(config.rlog_run_block_target_records)?;
     // `false`: this pass writes its parts with no indexed fields, so recovering
     // each input's POSTINGS field list would cost a ranged GET per input and be
     // discarded.
