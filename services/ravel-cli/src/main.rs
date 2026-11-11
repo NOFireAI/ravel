@@ -2242,14 +2242,36 @@ struct ScratchArgs {
     scratch_max_bytes: Option<u64>,
     /// The level-1 worker count of a two-level RLOG merge (ADR-3853 D4): how
     /// many level-1 groups of one bucket merge at once, each under its share
-    /// of the unit's memory ceiling. Omitted, it is derived per bucket from
-    /// the bucket's share of the usable cores and the largest count whose
-    /// groups still fit. compact-bucket's share is all usable cores;
+    /// of the unit's memory ceiling. Omitted, it is derived per bucket, jointly
+    /// with --level2-workers, from the bucket's share of the usable cores
+    /// (ADR-3853 D5 amendment). compact-bucket's share is all usable cores;
     /// compact-tenant's is the usable cores divided by --bucket-concurrency,
     /// at least 1. Zero, or a value without --scratch-dir,
     /// is refused before any store call.
     #[arg(long = "level1-workers", value_name = "N")]
     level1_workers: Option<usize>,
+    /// The level-2 worker count of a two-level RLOG merge (ADR-3853 D5): how
+    /// many of one bucket's level-2 ranges merge at once, each under its share
+    /// of the unit's memory ceiling. Omitted, it is derived jointly with the
+    /// level-1 count from the same core share. Never more workers run than
+    /// the bucket has ranges, and a count whose level-2 read side does not fit
+    /// the ceiling is refused. Zero, or a value without --scratch-dir, is
+    /// refused before any store call.
+    #[arg(long = "level2-workers", value_name = "N")]
+    level2_workers: Option<usize>,
+    /// The records per block a level-1 run is written at (ADR-3853 D2), 1,024
+    /// by default. It changes the runs' blocks, and so what level 2 reads and
+    /// holds per run. Zero, or a value without --scratch-dir, is
+    /// refused before any store call.
+    #[arg(long = "run-block-records", value_name = "N")]
+    run_block_records: Option<usize>,
+    /// Part-split setting for tests and benchmarks: the record quantum the
+    /// published RLOG parts are cut into ranges at (ADR-3853 D5), 2,500,000
+    /// by default. It changes where parts are cut and which part indexes they
+    /// take, on the single-level and two-level routes alike. Zero is refused
+    /// before any store call.
+    #[arg(long = "range-records", value_name = "N", hide = true)]
+    range_records: Option<u64>,
 }
 
 impl ScratchArgs {
@@ -2260,6 +2282,9 @@ impl ScratchArgs {
             scratch_dir: self.scratch_dir.clone(),
             scratch_max_bytes: self.scratch_max_bytes,
             level1_workers: self.level1_workers,
+            level2_workers: self.level2_workers,
+            run_block_records: self.run_block_records,
+            range_records: self.range_records,
             merge_resident_ceiling_bytes: None,
             geometry_floor_decoded_rows: None,
         };
