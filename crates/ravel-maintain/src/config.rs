@@ -1783,8 +1783,8 @@ pub fn validate_rlog_run_block_target_records(
 }
 
 /// A level-2 range setting of zero was configured (ADR-3853 D5): no worker,
-/// an empty range quantum, or no part-index slot per range. Each is refused
-/// as a misconfiguration before the first store request.
+/// or an empty range quantum. Each is refused as a misconfiguration before
+/// the first store request.
 #[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
 #[error("{field} must be at least 1, got 0")]
 pub struct RlogLevel2SettingError {
@@ -1792,13 +1792,11 @@ pub struct RlogLevel2SettingError {
     pub field: &'static str,
 }
 
-/// Validate [`CompactorConfig::level2_workers`],
-/// [`CompactorConfig::rlog_level2_range_records`] and
-/// [`CompactorConfig::rlog_level2_range_slots`].
+/// Validate [`CompactorConfig::level2_workers`] and
+/// [`CompactorConfig::rlog_level2_range_records`].
 pub fn validate_rlog_level2_settings(
     level2_workers: Option<usize>,
     range_records: u64,
-    range_slots: u32,
 ) -> Result<(), RlogLevel2SettingError> {
     if level2_workers == Some(0) {
         return Err(RlogLevel2SettingError {
@@ -1808,11 +1806,6 @@ pub fn validate_rlog_level2_settings(
     if range_records == 0 {
         return Err(RlogLevel2SettingError {
             field: "rlog_level2_range_records",
-        });
-    }
-    if range_slots == 0 {
-        return Err(RlogLevel2SettingError {
-            field: "rlog_level2_range_slots",
         });
     }
     Ok(())
@@ -2371,17 +2364,15 @@ pub struct CompactorConfig {
     /// [`crate::error::MaintainError::InvalidRlogLevel2Setting`].
     pub level2_workers: Option<usize>,
     /// The record quantum level 2's stream key space is cut at (ADR-3853 D5):
-    /// a range closes after the stream at which the distinct candidate run
-    /// blocks it covers reach this many records. Independent of `W2`, so
-    /// every worker count publishes the same parts. Zero is refused like
-    /// [`Self::level2_workers`]. Default
+    /// a range closes after the stream at which its streams' exact record
+    /// totals reach this many records. Each range numbers its parts in a
+    /// window of the part key's 10,000 indexes proportional to the quantum's
+    /// share of the unit's records, so a two-level merge of more than 10,000
+    /// times the quantum records is refused before level 2 encodes a part. Independent of the
+    /// worker counts, so every worker count publishes the same parts. Zero is
+    /// refused like [`Self::level2_workers`]. Default
     /// [`crate::rlog::LEVEL2_RANGE_RECORDS`].
     pub rlog_level2_range_records: u64,
-    /// `K`, the part-index slots each level-2 range owns (ADR-3853 D5): range
-    /// `r` writes parts `r x K .. r x K + K - 1`, and a range needing one more
-    /// is refused before that part is encoded. Zero is refused like
-    /// [`Self::level2_workers`]. Default [`crate::rlog::LEVEL2_RANGE_SLOTS`].
-    pub rlog_level2_range_slots: u32,
     /// The predicted decoded rows at or below which a cursor plan always runs
     /// as a cursor merge, neither refused nor routed to two levels under
     /// ADR-3853 D0, whatever its amplification. Default
@@ -2643,7 +2634,6 @@ impl Default for CompactorConfig {
             level1_workers: None,
             level2_workers: None,
             rlog_level2_range_records: crate::rlog::LEVEL2_RANGE_RECORDS,
-            rlog_level2_range_slots: crate::rlog::LEVEL2_RANGE_SLOTS,
             geometry_floor_decoded_rows: crate::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS,
             merge_admission: AdmissionMode::Overlap,
             rlog_zstd_level: DEFAULT_RLOG_ZSTD_LEVEL,

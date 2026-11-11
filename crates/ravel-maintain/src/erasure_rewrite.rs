@@ -1592,7 +1592,6 @@ pub async fn build_rewrite_logs(
     crate::config::validate_rlog_level2_settings(
         config.level2_workers,
         config.rlog_level2_range_records,
-        config.rlog_level2_range_slots,
     )?;
     // `false`: this pass writes its parts with no indexed fields, so recovering
     // each input's POSTINGS field list would cost a ranged GET per input and be
