@@ -492,7 +492,7 @@ pub async fn maintain_bucket_with_reach(
     Option<ClaimedCompaction>,
     Option<ClaimAcquisition>,
 )> {
-    let (outcome, _expiry, compaction, acquisition) = maintain_bucket_observed(
+    let (outcome, _expiry, compaction, acquisition, refused) = maintain_bucket_observed(
         reach,
         store,
         clock,
@@ -503,12 +503,18 @@ pub async fn maintain_bucket_with_reach(
         RewriteBound::Unread,
     )
     .await?;
+    if let Some(refused) = refused {
+        return Err(refused);
+    }
     Ok((outcome, compaction, acquisition))
 }
 
 /// [`maintain_bucket_with_reach`], also returning the retention evaluation's
 /// [`ObservedExpiry`] (see [`retention_sweep_bucket_observed`], which takes
-/// `rewrite_bound`).
+/// `rewrite_bound`). A compaction refused for its part-index windows
+/// ([`MaintainError::is_part_index_refusal`]) is returned in the last
+/// element, not as the call's error, so the caller's pass goes on to the
+/// shard's other buckets; the compaction element is `None` then.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn maintain_bucket_observed(
     reach: &mut SnapshotReachability,
@@ -524,6 +530,7 @@ pub(crate) async fn maintain_bucket_observed(
     Option<ObservedExpiry>,
     Option<ClaimedCompaction>,
     Option<ClaimAcquisition>,
+    Option<MaintainError>,
 )> {
     let (outcome, expiry) = retention_sweep_bucket_observed(
         reach,
@@ -536,26 +543,30 @@ pub(crate) async fn maintain_bucket_observed(
         rewrite_bound,
     )
     .await?;
-    let (compaction, acquisition) = match outcome {
+    let (compaction, acquisition, refused) = match outcome {
         // The bucket is (or is being) retired, or its delete is blocked by a
         // still-reaching snapshot: never compact it.
         RetentionOutcome::Tombstoned
         | RetentionOutcome::Swept
         | RetentionOutcome::SweptPartial
-        | RetentionOutcome::BlockedBySnapshot(_) => (None, None),
+        | RetentionOutcome::BlockedBySnapshot(_) => (None, None, None),
         RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
             match compact_bucket_claimed_with_acquisition(store, clock, config, bucket).await {
-                Ok((compaction, acquisition)) => (Some(compaction), acquisition),
+                Ok((compaction, acquisition)) => (Some(compaction), acquisition, None),
                 // A compaction refused below the format floor took no claim
                 // and wrote nothing, and is already logged and counted. It
                 // must not stop the pass: retention of the shard's other
                 // buckets runs as normal (ADR-1746 decision 4).
-                Err(MaintainError::BelowFormatFloor(_)) => (None, None),
+                Err(MaintainError::BelowFormatFloor(_)) => (None, None, None),
+                // Refused for its part-index windows (ADR-3853): nothing
+                // published, the same build refuses it again, and the pass
+                // goes on.
+                Err(err) if err.is_part_index_refusal() => (None, None, Some(err)),
                 Err(err) => return Err(err),
             }
         }
     };
-    Ok((outcome, expiry, compaction, acquisition))
+    Ok((outcome, expiry, compaction, acquisition, refused))
 }
 
 /// The maximum `max_event_ts_ns` across a bucket's L0 commit records,

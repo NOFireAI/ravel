@@ -370,7 +370,9 @@ the candidate blocks' `record_count` over the range; each stream's exact
 record count instead, see the range workers amendment), never by the worker
 count, and consumed from a queue by `W2` workers (assigned in contiguous
 blocks instead, see the range workers amendment), so two nodes with
-different core counts produce the same parts. Each range starts a fresh
+different core counts produce the same parts (the same cuts and windows,
+and the same bytes outside the keyed batch-major exception, see the range
+workers amendment). Each range starts a fresh
 part and owns `K` part-index slots (a window proportional to its records
 instead, see the range workers amendment): range `r` writes parts
 `r x K .. r x K + K - 1`, `K` 16 by default, and a range that would need a
@@ -1001,16 +1003,35 @@ run settings. Worker `w` of
 contiguous block, in place of D5's shared queue. Within a worker a decoded
 block whose rows run past a pass's last stream is not released: its
 unexhausted view is carried into the worker's next pass, across a range
-boundary too, so each such block is decoded once per worker. The carried
-view keeps the charge it was decoded under, and the next pass's cut counts
-it, so it adds no memory term. A block straddling two workers' streams is
-decoded by each, predicted at most `W2 x R` extra decodes per unit.
+boundary too, so each such block is decoded once per worker unless it is
+released first. The carried view keeps the charge it was decoded under, and
+the next pass's cut counts it, so it adds no memory term. When the carried
+charges and the first stream's other blocks together exceed the pass
+budget, the cut releases every carried view that stream does not read
+before the pass decodes, and counts only the views it keeps: the pass then
+starts from at most the stream's own estimate, which is within the budget,
+exceeded only by a kept view whose heap estimate came in over its decode
+ceiling (`pass_cut_releases_carried_views_the_first_stream_does_not_use`,
+`a_carried_view_never_takes_a_pass_over_its_budget`). Before a hot stream's
+cursor merge, whose charge is priced without carried views, the worker
+releases them all. A released view's block is decoded again by the pass
+that next reads it, and a block straddling two workers' streams is decoded
+by each, so level 2 decodes at most `run_blocks + W2 x R + R x hot_streams`
+blocks plus the released views per unit; with no hot stream and no release
+that is `run_blocks + W2 x R`.
 
-A unit's parts are a function of its input set and its part-split
-settings, the range quantum among them: the single-level route and the
-two-level route at every `W1` and `W2` publish the same keys and bytes, on
-any host that resolves the same settings. Every range start closes the part
-in progress, and each range numbers its parts in its own window (below).
+A unit's cut positions and part-index windows are a function of its input
+set and its part-split settings, the range quantum among them: the
+single-level route and the two-level route at every `W1` and `W2` cut at
+the same records and number each range in the same window, on any host
+that resolves the same settings. Every range start closes the part in
+progress, and each range numbers its parts in its own window (below). The
+routes and worker counts also publish the same keys and bytes, with one
+exception, D3's: a keyed bucket's batch-major streams (ADR-2135 decision
+2), where batches cut over level-1 runs differ from batches cut over the
+inputs and level 1 batches under `merge_cursor_budget_bytes / W1`, so such
+a stream may cut its parts differently by route and by `W1`; its range
+starts and windows still match.
 `every_route_and_worker_count_publishes_the_same_parts` pins that on the
 2,400-record fixture at a quantum of 600: the single-level route resident
 and fetch per pass, and the two-level route at `(W1, W2)` of (1, 1),
@@ -1020,6 +1041,14 @@ ranges. Every input block of that fixture carries all 40 streams, so no
 ceiling plans fetch per pass in more than one pass; the cutter sees stream
 ends only, and `range_cutter_closes_at_stream_ends_and_numbers_from_the_record_share`
 pins it on stream totals alone.
+`every_route_numbers_a_range_past_the_quantum_alike` pins the same claim
+where each range holds more records than the quantum and the single-level
+route runs in two passes: 60 inputs of 40 one-record streams in blocks of
+20 streams, a quantum of 10 and a part key of 240 indexes, so each of the
+40 ranges holds 60 records against a window of 1 index at its open, and the
+single-level route resident in one pass and in two and the two-level route
+at (1, 1), (1, 2) and (4, 2) each publish part indexes `6r` and `6r + 1`
+for range `r`, with equal keys and bytes.
 `range_workers_emit_the_same_parts_at_every_worker_count` pins `W2` 1, 2
 and 4 against the single-level merge at the same quantum, and
 `range_cuts_do_not_depend_on_level1_workers_or_run_settings` level 1's
@@ -1038,43 +1067,79 @@ rewrite, which drops records, and the force-2 rewrite, whose parts make no
 identity claim with a compaction's, do not cut.
 
 **Part-index windows.** A unit of `T` records numbers each range's parts
-in a window of the part key's 10,000 indexes proportional to the quantum's
-share of `T`. A range starting after `before` records numbers its parts
-from `floor(10,000 x before / T)`, and the part it would open at its limit,
-`floor(10,000 x (before + Q) / T)`, or 10,000 when fewer than `Q` records
-remain after `before`, is refused with `PartRangeWindow` before its builder
-opens, so its records are never encoded and it is never PUT. Both routes
-know `before` exactly when a range starts. A range closes only at or past
-`Q` records, so the next window starts at or past this one's limit: the
-windows are disjoint and every index is under 10,000. A range that
-overshoots `Q` with a large stream keeps `Q`'s share of the indexes, and
-the overshoot's share is left as a gap. Every window holds at least one
-index while `T <= 10,000 x Q`, 25 billion records at the default quantum;
-a unit past that is refused with `PartKeySpace` from the inputs' footer sum
-before either route reads a block or encodes a part. Both refusals are
-errors of the run on both routes, not `TwoLevelUnsupported`, since no route
-could publish the unit. Phase A failed a unit of more than 10,000 parts
-with `PartIndexOutOfRange` at the PUT of part 10,000, after encoding it.
-The windows are disjoint within the same 10,000 indexes, so such a unit has
-a range needing more parts than its window holds, and it is refused here
-before that part is encoded. The refusals phase A did not make are units of
-at most 10,000 parts with one range denser in parts than its window
-allows: on hour 498273 (97 ranges, about 560 parts, about 242M records) a
-window holds 103 indexes and a range needs about 6 parts, so a range would
-need about 18 times the unit's average part density to be refused.
+in a window of the part key's 10,000 indexes that grows with the records
+the range has emitted. With `index(x) = floor(10,000 x x / T)`, computed in
+128 bits, a range starting after `before` records numbers its parts from
+`index(before)`, and a part it would open after `emitted` of the unit's
+records must sit under `max(index(before + Q), index(emitted))`, or under
+10,000 when fewer than `Q` records remain after `before`; a part at or past
+that limit is refused with `PartRangeWindow` before its builder opens, so
+its records are never encoded and it is never PUT. Both routes know
+`before` and `emitted` exactly when a part opens. The windows are disjoint:
+a range other than the last closes after some `e >= before + Q` records,
+since it closes only once its records reach `Q`, and the next range starts
+at `index(e)`; every part the range opened did so after at most `e - 1`
+records, so its index is under `max(index(before + Q), index(e - 1))`,
+which is at most `index(e)` because `index` does not decrease. The last
+range's limit is at most 10,000, so every index is under 10,000. A range
+that overshoots `Q` with a large stream gets the overshoot's share of the
+indexes as it emits it, instead of being refused once its parts pass `Q`'s
+share. Every window holds at least one index at its open while
+`T <= 10,000 x Q`, 25 billion records at the default quantum; a unit past
+that is refused with `PartKeySpace` from the inputs' footer sum before
+either route reads a block or encodes a part. Phase A failed a unit of more
+than 10,000 parts with `PartIndexOutOfRange` at the PUT of part 10,000,
+after encoding it. The windows are disjoint within the same 10,000
+indexes, so such a unit has a range needing more parts than its window
+holds, and it is refused here before that part is encoded.
+
+A range's `k`th part opens at index `index(before) + k` after the records
+of its first `k` parts, so past the `index(before + Q) - index(before)`
+indexes its window holds at its open, a part is refused only when the
+range's earlier parts average under about `T / 10,000` records. Parts of at
+least `2T / 10,000` records are never refused, which
+`range_parts_are_disjoint_and_dense_enough_parts_are_never_refused`
+checks over random stream shapes, quanta, key spaces and part sizes. On
+hour 498273 (97 ranges, about 560 parts, about 242M records) a window holds
+103 indexes at its open and a range needs about 6 parts; past the 103, a
+part is refused only when its range's parts average under about 24,200
+records, against about 432,000 for the unit's average part, about 18 times
+denser.
 
 | hour 498273, shard 0 | figure | source |
 |---|---|---|
-| indexes per window, `floor(10,000 x 2,500,000 / T)` | 103 | predicted; `T` about 242M, D6's bands for hour 498273 |
+| indexes per window at its open, `floor(10,000 x 2,500,000 / T)` | 103 | predicted; `T` about 242M, D6's bands for hour 498273 |
+| records per index, `T / 10,000` | about 24,200 | predicted; `T` about 242M, D6's bands for hour 498273 |
 | parts per range, about 560 parts over 97 ranges | about 6 | predicted; parts from the #3853 run 2 comment 6710864023 |
+| records per part, `T` over about 560 parts | about 432,000, about 18x the records per index | predicted; parts from the #3853 run 2 comment 6710864023 |
 | parts after the forced cuts, at most one per range | at most about 657, band 560 to 660 | predicted; owner decision C on #3961, comment 6792081807 |
+
+Both refusals end the unit with nothing published and no compaction record
+written, on both routes, and neither is `TwoLevelUnsupported`, since no
+route could publish the unit. Neither aborts the pass that met it: the same
+build refuses the unit again, so `scan_and_compact` counts it in
+`geometry_unsupported` and holds its hour as the cursor's first held hour,
+and the maintain pass counts it there too, still runs the bucket's
+retention, and holds the bucket as `TerminalState::GeometryUnsupported` in
+its memo, in memory only like every geometry refusal, while the shard's
+later hours compact. The run releases its claim as a refused outcome does.
+`a_part_key_space_refusal_is_terminal_and_the_next_hour_compacts` pins
+that for `PartKeySpace` on both passes, with the next tick reading nothing
+for the held bucket, and
+`a_range_window_refusal_is_terminal_and_the_next_hour_compacts` for
+`PartRangeWindow` on the maintain pass. The migrate walk is not covered:
+it still returns either refusal as its error.
 
 `a_range_needing_more_parts_than_its_window_is_refused_before_encoding`
 pins the per-part refusal on the two-level route with a part key of 4
 indexes, windows [0, 2) and [2, 4);
-`level2_workers_are_capped_at_the_ranges_and_slots_at_the_key` pins the
-key-space refusal on the two-level route at 3 indexes, together with a
-configured `W2` of 8 capped at 4 ranges, and
+`a_range_past_the_quantum_widens_its_window_with_its_records` pins the
+widening on the cutter, a range of 500 records against a quantum of 300
+numbering parts 0 to 45 past its opening window [0, 30), and the refusal
+it still makes at part 30 when its parts hold 5 records;
+`level2_workers_are_capped_at_the_ranges_and_a_unit_past_the_key_space_is_refused`
+pins the key-space refusal on the two-level route at 3 indexes, together
+with a configured `W2` of 8 capped at 4 ranges, and
 `the_single_level_route_refuses_a_unit_past_the_key_space_before_a_put`
 pins it on the single-level route. A unit under the quantum is one range
 with the window [0, 10,000): its parts and bytes are unchanged, and its one

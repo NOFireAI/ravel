@@ -623,22 +623,31 @@ Level 2 of a two-level merge now runs `W2` range workers (ADR-3853's range
 workers amendment). Level 2 cuts the runs' merged stream order into ranges
 by a fixed record quantum and gives each worker a contiguous block of them;
 each worker plans its passes under `U / W2` as its resident ceiling and
-charges its own `MergeMemoryTracker`, so decision 4's bound holds per
-level-2 worker as it does per level-1 worker, and the unit's tracker raises
-each of its high-water marks to at least the workers' sum. `W1` and `W2`
+charges its own `MergeMemoryTracker`, so decision 4's bound holds for each
+level-2 worker's pass plans as it does for each level-1 worker's, and the
+unit's tracker raises each of its high-water marks to at least the workers'
+sum. The bound is on what the plans charge, not on the unit's peak: at
+`W2 = 1` the D3 encode pipeline's closed parts waiting on their encodes are
+not in the pass plan, and the unit can peak above `U` (#4123). `W1` and `W2`
 are derived together: `W2` is the core share or the number of workers whose
 read sides, `R x 2 x price(one run block) + reads in flight + final part
 target` each, fit `U`, whichever is smaller, and the pair kept has the
 smallest `1/W1 + 1/W2`. One level-2 worker keeps ADR-3853 D3's encode
-pipeline, and the unit is still cut into ranges, so its parts are the
-single-level merge's: every RLOG compaction, single-level too, cuts a part
-at each range start and numbers each range's parts in its own window of the
-part key's indexes.
+pipeline, and the unit is still cut into ranges, so its cut positions and
+part-index windows are the single-level merge's: every RLOG compaction,
+single-level too, cuts a part at each range start and numbers each range's
+parts in its own window of the part key's indexes. Its keys and bytes are
+the single-level merge's too, except for a keyed bucket's batch-major
+streams (ADR-2135 decision 2): batches cut over level-1 runs differ from
+batches cut over the inputs, and level 1 batches under
+`merge_cursor_budget_bytes / W1`, so such a stream may cut its parts
+differently by route and by `W1` (ADR-3853 D3).
 
 The level-2 workers share the unit's claim guard and their own stop token,
 checked before each range and each part PUT, so the first error any of
 them returns stops the others before their next part PUT. Parts already
 PUT become content-addressed orphans the unreferenced-part sweep ages out,
 and the compaction record is still written once, by the unit, under
-`CreateIfAbsent`. The range cut does not depend on `W2`, so every worker
-count publishes the same parts.
+`CreateIfAbsent`. The range cut and the windows do not depend on `W2`, so
+every worker count cuts and numbers the same parts, and publishes the same
+keys and bytes outside the batch-major exception above.
