@@ -2613,13 +2613,16 @@ impl ObjectStoreBackend for ScratchMeter {
 /// key. The scratch headroom (D2) is checked before the first block GET, and
 /// the unit's scratch is removed however the merge ends.
 ///
-/// Level 1 runs its groups on `W1` workers ([`derive_level1_workers`], or
-/// [`CompactorConfig::level1_workers`]), each under `U / W1` of the ceiling
-/// and the cursor budget with its own tracker, and every worker stops at its
-/// next group or run-part PUT once any of them fails (ADR-3853 D4). Level 2
-/// keeps up to `E` part builders in flight ([`level2_encode_builders`]) and
-/// PUTs the parts in part-index order (D3). Only compaction reaches this, and
-/// it keeps every record.
+/// Level 1 runs its groups on `W1` workers and level 2 its ranges on `W2`
+/// ([`derive_level_workers`], or [`CompactorConfig::level1_workers`] and
+/// [`CompactorConfig::level2_workers`]), each under `U / W1` or `U / W2` of
+/// the ceiling with its own tracker, and every worker of a level stops at its
+/// next group, range or part PUT once any of them fails (ADR-3853 D4, D5
+/// amendment). Level 2 cuts the stream key space into ranges of a fixed
+/// record quantum and numbers range `r`'s parts from `r x K`, so every `W2`
+/// publishes the same parts. One range worker keeps up to `E` part builders
+/// in flight ([`level2_encode_builders`]); several encode inline (D3). Only
+/// compaction reaches this, and it keeps every record.
 async fn two_level_merge(
     target: &TwoLevelTarget<'_>,
     catalogs: &Arc<[RlogInputCatalog]>,

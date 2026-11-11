@@ -112,7 +112,9 @@ pub enum TwoLevelCheck {
     /// one of its parts, or in two when a cut falls inside it (ADR-3853,
     /// #3943 correction). The block term is the larger of
     /// `runs x blocks_per_run x run_block_bytes` and the largest stream's
-    /// level-2 estimate, which prices a larger stream.
+    /// level-2 estimate, which prices a larger stream. With several level-2
+    /// workers the ceiling is one worker's share, `U / W2` (ADR-3853 D5
+    /// amendment).
     LevelTwoFit {
         /// Runs merged at level 2, one per level-1 group, however many parts
         /// each was cut into.
@@ -128,7 +130,8 @@ pub enum TwoLevelCheck {
         in_flight_bytes: u64,
         /// The final parts' memory split target.
         part_target_bytes: u64,
-        /// The resident ceiling `U`.
+        /// The ceiling one level-2 worker plans under: `U / W2`, `U` itself
+        /// at one worker.
         ceiling_bytes: u64,
     },
     /// Constraint (b) priced before level 1 reads a block (ADR-3853 D4, D5):
