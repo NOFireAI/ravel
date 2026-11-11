@@ -272,6 +272,8 @@ order, a run stores equal-key ties in push order, and the level-2 tie-break
 `(ts bucket, run index)` therefore orders two records the way
 `(ts bucket, input index)` orders them today. Part cuts run on that sequence
 unchanged, so every L1 part keeps its bytes and its content-addressed key.
+The cut at each record range start is one of those part cuts, and both
+routes split the sequence at it identically (the range workers amendment).
 One exception is stated rather than hidden: a keyed bucket whose per-bucket
 reservation sum exceeds `merge_cursor_budget_bytes` is emitted batch-major
 today (ADR-2135 decision 2, `reservation_batches`,
@@ -364,16 +366,19 @@ measurement shows the serial level-2 merge below the objective:
 | level-2 records/s with pipelined encode, one unit, hour 498273 | below 134k | predicted; measured after phase A |
 
 Ranges are cut by a data-derived quantum from the run catalogs (the sum of
-the candidate blocks' `record_count` over the range), never by the worker
+the candidate blocks' `record_count` over the range; each stream's exact
+record count instead, see the range workers amendment), never by the worker
 count, and consumed from a queue by `W2` workers (assigned in contiguous
 blocks instead, see the range workers amendment), so two nodes with
 different core counts produce the same parts. Each range starts a fresh
-part and owns `K` part-index slots: range `r` writes parts
+part and owns `K` part-index slots (a window proportional to its records
+instead, see the range workers amendment): range `r` writes parts
 `r x K .. r x K + K - 1`, `K` 16 by default, and a range that would need a
 seventeenth part fails with a typed error before encoding it. The key
 format caps `part_index` at 9,999 (`crates/ravel-commit/src/keys.rs:108-112`),
-so a unit of more than 625 ranges fails the same way; hour 498273 at today's
-part size needs about 100 ranges. Whether anything reads part indexes as
+so a unit of more than 625 ranges fails the same way (a unit of more than
+10,000 x the quantum records instead, see the range workers amendment); hour
+498273 at today's part size needs about 100 ranges. Whether anything reads part indexes as
 contiguous (the record, the fold, the sweep) is checked in the phase B
 ticket before the rule is fixed; the range workers amendment records the
 readers it checked.
@@ -875,6 +880,9 @@ the derivation. D4's figures, 8 workers at the server defaults on the
 <!-- amendment-supersedes: phrase="takes the largest `W1` at or under that share" pointer="range workers amendment" -->
 <!-- amendment-supersedes: phrase="`W1` is the largest count at or under the unit's" pointer="range workers amendment" -->
 <!-- amendment-supersedes: phrase="Its run-block term is therefore about 8x high" pointer="range workers amendment" -->
+<!-- amendment-supersedes: phrase="the candidate blocks' `record_count` over the range" pointer="range workers amendment" -->
+<!-- amendment-supersedes: phrase="owns `K` part-index slots" pointer="range workers amendment" -->
+<!-- amendment-supersedes: phrase="a unit of more than 625 ranges" pointer="range workers amendment" -->
 
 Phase B ships in issue #4108: level 2 runs on `W2` range workers, each
 merging its own contiguous share of the unit's stream ranges into its own
@@ -895,7 +903,19 @@ need = R x 2 x price(one run block) + reads in flight + final part target
 and `W2` workers fit `U` when `W2 x need <= U`. Each worker plans its
 passes under `U / W2` with its own `MergeMemoryTracker`, and the unit's
 tracker raises each of its high-water marks to at least the workers' sum,
-as level 1's does, so the workers' plans together stay within `U`.
+as level 1's does, so the sum of what the workers' plans admit, each
+worker's read side and its one builder, stays within `U`. That bounds the
+plans, not the unit's peak: at `W2 = 1` level 2 keeps D3's pipeline, whose
+`E` is sized from the room beside the resident side and reads in flight
+without the pass budget, so the writer term and the pass rows share one
+room; on the padded range fixture that peaks at 2,770,910 bytes against `U`
+= 2,139,680 with `E` = 16 (issue #4123, present at 059209f). At `W2 > 1`
+each worker encodes inline with one builder, counted in `need`. Level-2
+workers keep the full `merge_cursor_budget_bytes`, not a `W2`th of it:
+`reservation_batches` cuts a keyed bucket's batch-major batches by it
+(ADR-2135), so dividing it would move the emitted sequence with `W2`. Each
+worker's plan is still drawn under `U / W2`, and level 2 runs no worker
+whose plan is a cursor merge.
 `each_range_worker_plans_under_its_share_of_the_ceiling` pins the share
 on a unit whose last ranges hold most of the bytes, and the parts test
 below pins the unit's mark at or above the workers' sum. Before
@@ -924,7 +944,7 @@ reads a block, as before. `level1_workers` still names `W1` outright, wins
 over the derivation and skips the prediction; level 2 then takes the core
 share, capped by what the measured `need` fits. `level2_workers` names
 `W2`: the derivation keeps only the `W1` at which that many workers fit
-`U`, and `Some(0)` is refused, like a zero range quantum or a zero `K`,
+`U`, and `Some(0)` is refused, like a zero range quantum,
 with `InvalidRlogLevel2Setting` before the run's first store request.
 After level 1 a derived `W2` is capped at the range count and at what the
 measured `need` fits, then lowered one worker at a time until every
@@ -946,7 +966,7 @@ run block of 3.74 MB, 18 MB in flight, final parts of 1,573 MB, run target
 | 21,474 MB, 32 | 4 (kept) | 47 | 409 | 4,650 | 4 | 0.500 | predicted |
 | 21,474 MB, 32 | 5 | 37 | 519 | 5,473 | 3 | 0.533 | predicted |
 | 21,474 MB, 32 | 6 | 30 | 640 | 6,378 | 3 | 0.500 | predicted |
-| 21,474 MB, 32 | 7 | 25 | 768 | 7,336 | 2 | 0.642 | predicted |
+| 21,474 MB, 32 | 7 | 25 | 768 | 7,335 | 2 | 0.642 | predicted |
 | 5,368 MB, 8 (server defaults) | 1 (kept) | 47 | 409 | 4,650 | 1 | 2.000 | predicted |
 | 5,368 MB, 8 | 2 | 22 | 872 | 8,113 | 0 | none | predicted |
 
@@ -961,13 +981,22 @@ re-pins D4's shapes under the joint rule, at run blocks of 1,024 records:
 measured-ratio pricing gives (4, 5) at a share of 8 and (17, 11) at 32,
 ceiling pricing (1, 1) and (3, 4).
 
-**Ranges, contiguous assignment and carried views.** Level 2 cuts the
-merged stream order into ranges by a record quantum,
-`rlog_level2_range_records` (2,500,000 by default, predicted: about 97
-ranges for hour 498273's 242 million records). Walking the streams in
-order, each stream adds the records of the candidate run blocks it is the
-first to reach, and a range closes after the stream at which they reach the
-quantum. The cut reads the run catalogs alone, never `W2`. Worker `w` of
+**Ranges, contiguous assignment and carried views.** Every RLOG compaction
+cuts its merged stream order into ranges by a record quantum,
+`rlog_range_records` (2,500,000 by default, predicted: about 97 ranges for
+hour 498273's 242 million records), on the single-level route as on the
+two-level one. Walking the streams in order, each stream adds its exact
+record count, and a range closes after the stream at which the range's
+records reach the quantum; a stream at or over the quantum closes a range
+of its own, and the last range may be short. On the two-level route level 1
+tallies each stream's records, the tally must sum to `T`, the inputs'
+footer `record_count` total, or the unit fails with `Invariant`, and level
+2 cuts the ranges from the tally to assign them. On both routes the part
+sink counts each stream's records as it emits them and cuts at the same
+stream ends; a range worker whose sink cut a different number of ranges
+than it was assigned fails with `Invariant`. The cut reads the stream
+counts and the quantum alone, never `W1`, `W2`, the level-1 groups or the
+run settings. Worker `w` of
 `W2` takes ranges `[w x n / W2, (w + 1) x n / W2)` of the `n` ranges, a
 contiguous block, in place of D5's shared queue. Within a worker a decoded
 block whose rows run past a pass's last stream is not released: its
@@ -975,25 +1004,82 @@ unexhausted view is carried into the worker's next pass, across a range
 boundary too, so each such block is decoded once per worker. The carried
 view keeps the charge it was decoded under, and the next pass's cut counts
 it, so it adds no memory term. A block straddling two workers' streams is
-decoded by each, predicted at most `W2 x R` extra decodes per unit. Parts
-depend on the cuts, not on the assignment, so every `W2` publishes the same
-keys and bytes; `range_workers_emit_the_same_parts_at_every_worker_count`
-pins that at `W2` 1, 2 and 4. A unit of one range publishes what the
-single-level merge does, which `two_level_merge_matches_single_level_bytes_and_keys`
-pins; a unit of several ranges cuts a part at each range start and differs
-from it. No ravel-maintain test pins a golden content-hash vector of a
-two-level unit's parts, so none was re-pinned.
+decoded by each, predicted at most `W2 x R` extra decodes per unit.
 
-**Part-index slots.** Range `r` numbers its parts from `r x K`, `K` being
-`rlog_level2_range_slots` (16 by default), and the part it would open past
-`r x K + K - 1`, or past the part key's 9,999, is refused with
-`TwoLevelCheck::RangeSlots` before its builder opens, so its records are
-never encoded and it is never PUT. A unit whose ranges times `K` exceeds
-10,000 is refused the same way before level 2 opens a part.
-`a_range_needing_more_than_k_parts_is_refused_before_encoding` pins it at
-`K` 2, and `level2_workers_are_capped_at_the_ranges_and_slots_at_the_key`
-pins the unit-wide refusal at 4 ranges of `K` 2,501, together with a
-configured `W2` of 8 capped at those 4 ranges. The readers of `part_index` were checked for contiguity: the key's
+A unit's parts are a function of its input set and its part-split
+settings, the range quantum among them: the single-level route and the
+two-level route at every `W1` and `W2` publish the same keys and bytes, on
+any host that resolves the same settings. Every range start closes the part
+in progress, and each range numbers its parts in its own window (below).
+`every_route_and_worker_count_publishes_the_same_parts` pins that on the
+2,400-record fixture at a quantum of 600: the single-level route resident
+and fetch per pass, and the two-level route at `(W1, W2)` of (1, 1),
+(1, 2), (4, 1) and (4, 2), each publish part indexes 0, 1, 2, 2500, 2501,
+2502, 5000, 5001, 5002, 7500, 7501 and 7502, three parts in each of the 4
+ranges. Every input block of that fixture carries all 40 streams, so no
+ceiling plans fetch per pass in more than one pass; the cutter sees stream
+ends only, and `range_cutter_closes_at_stream_ends_and_numbers_from_the_record_share`
+pins it on stream totals alone.
+`range_workers_emit_the_same_parts_at_every_worker_count` pins `W2` 1, 2
+and 4 against the single-level merge at the same quantum, and
+`range_cuts_do_not_depend_on_level1_workers_or_run_settings` level 1's
+workers, run blocks and run target. A unit under the quantum is one range
+numbered `0, 1, 2, ...`, as before, which
+`two_level_merge_matches_single_level_bytes_and_keys` pins against the
+single-level merge at the default quantum. No ravel-maintain test pins a
+golden content-hash vector of a unit over the quantum, and no
+ravel-maintain compaction fixture holds 2,500,000 records, so none was
+re-pinned. The cut costs at most one extra part per range on every route,
+since a range start splits at most one part in two: predicted, hour
+498273's about 560 parts become at most about 657, and M1's parts band is
+560 to 660 (#3961). Compaction cuts through `RlogCodec::build_parts`, so a
+format migration of a unit over the quantum cuts the same way. The erasure
+rewrite, which drops records, and the force-2 rewrite, whose parts make no
+identity claim with a compaction's, do not cut.
+
+**Part-index windows.** A unit of `T` records numbers each range's parts
+in a window of the part key's 10,000 indexes proportional to the quantum's
+share of `T`. A range starting after `before` records numbers its parts
+from `floor(10,000 x before / T)`, and the part it would open at its limit,
+`floor(10,000 x (before + Q) / T)`, or 10,000 when fewer than `Q` records
+remain after `before`, is refused with `PartRangeWindow` before its builder
+opens, so its records are never encoded and it is never PUT. Both routes
+know `before` exactly when a range starts. A range closes only at or past
+`Q` records, so the next window starts at or past this one's limit: the
+windows are disjoint and every index is under 10,000. A range that
+overshoots `Q` with a large stream keeps `Q`'s share of the indexes, and
+the overshoot's share is left as a gap. Every window holds at least one
+index while `T <= 10,000 x Q`, 25 billion records at the default quantum;
+a unit past that is refused with `PartKeySpace` from the inputs' footer sum
+before either route reads a block or encodes a part. Both refusals are
+errors of the run on both routes, not `TwoLevelUnsupported`, since no route
+could publish the unit. Phase A failed a unit of more than 10,000 parts
+with `PartIndexOutOfRange` at the PUT of part 10,000, after encoding it.
+The windows are disjoint within the same 10,000 indexes, so such a unit has
+a range needing more parts than its window holds, and it is refused here
+before that part is encoded. The refusals phase A did not make are units of
+at most 10,000 parts with one range denser in parts than its window
+allows: on hour 498273 (97 ranges, about 560 parts, about 242M records) a
+window holds 103 indexes and a range needs about 6 parts, so a range would
+need about 18 times the unit's average part density to be refused.
+
+| hour 498273, shard 0 | figure | source |
+|---|---|---|
+| indexes per window, `floor(10,000 x 2,500,000 / T)` | 103 | predicted; `T` about 242M, D6's bands for hour 498273 |
+| parts per range, about 560 parts over 97 ranges | about 6 | predicted; parts from the #3853 run 2 comment 6710864023 |
+| parts after the forced cuts, at most one per range | at most about 657, band 560 to 660 | predicted; owner decision C on #3961, comment 6792081807 |
+
+`a_range_needing_more_parts_than_its_window_is_refused_before_encoding`
+pins the per-part refusal on the two-level route with a part key of 4
+indexes, windows [0, 2) and [2, 4);
+`level2_workers_are_capped_at_the_ranges_and_slots_at_the_key` pins the
+key-space refusal on the two-level route at 3 indexes, together with a
+configured `W2` of 8 capped at 4 ranges, and
+`the_single_level_route_refuses_a_unit_past_the_key_space_before_a_put`
+pins it on the single-level route. A unit under the quantum is one range
+with the window [0, 10,000): its parts and bytes are unchanged, and its one
+change is that a part past 9,999 is refused typed before it is encoded
+instead of failing at its PUT. The readers of `part_index` were checked for contiguity: the key's
 `format_part_index` (four digits) and `reconstruct_l1_part_key` in
 ravel-commit, the fold's `writer_epoch` and `snapshot_resolve`'s rebuild of
 it in ravel-catalog, the snapshot order's tiebreak, the sweep and the
