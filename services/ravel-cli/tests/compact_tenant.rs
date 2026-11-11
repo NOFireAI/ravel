@@ -3271,7 +3271,7 @@ async fn two_level_records(
 /// `scratch.level2_workers`, the derived count (1 at a core share of 1) is on
 /// the line and the `ends_with` assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compact_bucket_runs_level_2_on_range_workers() {
+async fn compact_tenant_runs_level_2_on_range_workers() {
     let (mem, line, writers, scratch) = compact_tenant_on_range_workers(2).await;
     assert!(line.contains(" outcome=Compacted "), "{line}");
     assert!(
