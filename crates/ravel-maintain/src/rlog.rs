@@ -16278,6 +16278,184 @@ mod tests {
             );
         }
 
+        /// Records shaped like service log lines for `inputs` inputs of
+        /// `per_input` records each over 40 streams: four line templates (an
+        /// access log, a logfmt line, an nginx error and a JSON line) with
+        /// ids, latencies and addresses drawn from a seeded xorshift, four
+        /// attributes, and a trace and span id on half of them. Input `i`'s
+        /// `k`th record sits at `k * inputs + i` milliseconds, so every group
+        /// interleaves with every other at level 2.
+        fn log_line_inputs(inputs: u32, per_input: u32) -> Vec<L0Input> {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let methods = ["GET", "POST", "PUT", "DELETE"];
+            let routes = ["orders", "users", "carts", "invoices", "sessions"];
+            let loggers = [
+                "com.example.Payment",
+                "com.example.Ledger",
+                "com.example.Auth",
+            ];
+            (0..inputs)
+                .map(|i| {
+                    let records = (0..per_input)
+                        .map(|k| {
+                            let r = next();
+                            let method = methods[(r % 4) as usize];
+                            let route = routes[((r >> 2) % 5) as usize];
+                            let status =
+                                [200i64, 200, 200, 201, 204, 404, 500][((r >> 5) % 7) as usize];
+                            let id = next() % 1_000_000;
+                            let ms = (r >> 8) % 2_000;
+                            let body = match (r >> 20) % 4 {
+                                0 => format!(
+                                    "{method} /api/v1/{route}/{id} status={status} \
+                                     duration_ms={ms} bytes={} user_agent=\"Mozilla/5.0 \
+                                     (X11; Linux x86_64) AppleWebKit/537.36\"",
+                                    (r >> 12) % 65_536
+                                ),
+                                1 => format!(
+                                    "level=info msg=\"cache miss\" key=session:{:016x} \
+                                     shard={} elapsed={}us region=eu-west-1",
+                                    next(),
+                                    id % 64,
+                                    ms * 7
+                                ),
+                                2 => format!(
+                                    "connect() failed (111: Connection refused) while \
+                                     connecting to upstream, client: 10.{}.{}.{}, server: \
+                                     api.example.internal, request: \"{method} /v2/{route} \
+                                     HTTP/1.1\", upstream: \"http://10.0.{}.{}:8080/\"",
+                                    (r >> 24) % 256,
+                                    (r >> 32) % 256,
+                                    (r >> 40) % 256,
+                                    id % 16,
+                                    id % 251
+                                ),
+                                _ => format!(
+                                    "{{\"level\":\"warn\",\"logger\":\"{}\",\"msg\":\
+                                     \"retrying charge\",\"attempt\":{},\"order_id\":\
+                                     \"ord_{:012x}\",\"amount_cents\":{}}}",
+                                    loggers[(id % 3) as usize],
+                                    ms % 5,
+                                    next() & 0xFFFF_FFFF_FFFF,
+                                    id
+                                ),
+                            };
+                            let mut rec = record(
+                                (r >> 48) as u32 % 40,
+                                1_000_000_000
+                                    + (i64::from(k) * i64::from(inputs) + i64::from(i)) * 1_000_000,
+                                &body,
+                                vec![
+                                    ("http.method".to_string(), AttrValue::Str(method.into())),
+                                    ("http.status_code".to_string(), AttrValue::I64(status)),
+                                    (
+                                        "k8s.pod.name".to_string(),
+                                        AttrValue::Str(format!("api-7d9f8-{:05x}", id % 12)),
+                                    ),
+                                    ("duration_ms".to_string(), AttrValue::I64(ms as i64)),
+                                ],
+                            );
+                            if r & 1 == 0 {
+                                let t = next();
+                                let mut trace = [0u8; 16];
+                                trace[..8].copy_from_slice(&t.to_le_bytes());
+                                trace[8..].copy_from_slice(&next().to_le_bytes());
+                                rec.trace_id = Some(trace);
+                                rec.span_id = Some(t.rotate_left(17).to_le_bytes());
+                            }
+                            rec
+                        })
+                        .collect();
+                    L0Input {
+                        records,
+                        cfg: RlogConfig::default(),
+                        clustering: None,
+                    }
+                })
+                .collect()
+        }
+
+        /// ADR-3853 D2: runs written at the 1,024-record block target, and at
+        /// 8,192, stay within the scratch need the merge admits the unit
+        /// under (1.3 times the inputs' object sizes), so the unit is not
+        /// refused for headroom; and the 1,024 runs write at most 1.15 times
+        /// the scratch bytes the 8,192 runs do.
+        ///
+        /// Measured here on 2026-11-11: the inputs are 3,227,563 stored bytes
+        /// and the need 4,195,832; the runs wrote 3,269,638 bytes at 1,024
+        /// (1.013 times the inputs) and 3,092,325 at 8,192 (0.958 times), a
+        /// ratio of 1.057.
+        ///
+        /// The 60 inputs ([`log_line_inputs`]) are written as ingest writes
+        /// them (`RlogConfig::default()`: 8,192-record blocks, zstd 3), and
+        /// every run part holds over 16,384 records, so both targets cut it
+        /// into several blocks. The lines are four templates' fixed text
+        /// around seeded random ids and numbers, so they likely compress
+        /// better than a production tenant's mix of sources (about 38 stored
+        /// bytes a record here). The figures pin the mechanism on this fixture;
+        /// they do not stand for production's ratio, which M1 (#3961)
+        /// measures.
+        #[tokio::test]
+        async fn run_block_target_scratch_writes_stay_within_the_need() {
+            const INPUTS: u32 = 60;
+            const PER_INPUT: u32 = 1_400;
+            // Two-level at G = 24: under the single-level cursor charge, and
+            // over level 2's two 8,192-record blocks for each of three runs.
+            const CEILING: u64 = 50 << 20;
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &log_line_inputs(INPUTS, PER_INPUT)).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let mut stored = 0u64;
+            for key in &keys {
+                stored += probe.head(key).await.expect("head").size;
+            }
+            let run_target = CEILING - 24 * per_input - per_input / 2;
+            assert_eq!(group_ceiling(per_input, run_target, 24), CEILING);
+
+            let mut writes = Vec::new();
+            for target in [1024usize, 8192] {
+                let dir = fresh_scratch(&format!("scratch-need-{target}"));
+                let config = CompactorConfig {
+                    rlog_run_block_target_records: target,
+                    rlog_l1_part_memory_target_bytes: Some(1 << 20),
+                    ..two_level_config(CEILING, run_target, Some(dir.clone()))
+                };
+                let store = ProbeStore::new();
+                seed_inputs(&store, &log_line_inputs(INPUTS, PER_INPUT)).await;
+                LEVEL2_RUN_RECORDS.with(|r| r.borrow_mut().clear());
+                let (outcome, run) = compact_logged(&store, &config).await;
+                let runs = LEVEL2_RUN_RECORDS.with(|r| r.take());
+                outcome.unwrap_or_else(|e| panic!("target {target}: {e}"));
+                let line = run.line("rlog two-level merge");
+                assert_eq!(log_field(&line, "group_size"), 24, "{line}");
+                assert!(
+                    runs.iter().all(|&records| records > 2 * 8192),
+                    "every run part over two 8,192-record blocks: {runs:?}"
+                );
+                let need = log_field(&line, "scratch_need_bytes");
+                let written = run.report.scratch_write_bytes;
+                assert!(
+                    written <= need,
+                    "target {target}: {written} scratch bytes written against an \
+                     admitted need of {need} ({stored} stored)"
+                );
+                assert_eq!(need, scratch_need(&probe, &keys).await, "{line}");
+                writes.push(written);
+                assert!(scratch_entries(&dir).is_empty(), "target {target}");
+            }
+            let (small, default) = (writes[0], writes[1]);
+            assert!(
+                small * 100 <= default * 115,
+                "{small} scratch bytes at 1,024 records against {default} at 8,192"
+            );
+        }
+
         /// A zero run block target fails the run with its typed error before
         /// the first store request. The control compacts the same fixture at
         /// the default target and issues requests, so the zero is the check
@@ -17935,8 +18113,8 @@ mod tests {
             assert!(scratch_entries(&dir).is_empty(), "cancel");
         }
 
-        /// The scratch need of the two-level fixture seeded at `keys`: 1.3
-        /// times its inputs' object sizes (ADR-3853 D2).
+        /// The scratch need of the inputs seeded at `keys`: 1.3
+        /// times their object sizes (ADR-3853 D2).
         async fn scratch_need(store: &dyn ObjectStoreBackend, keys: &[String]) -> u64 {
             let mut stored = 0u64;
             for key in keys {

@@ -212,7 +212,21 @@ nothing else:
   refuses with a typed error naming the need and the free space when the
   directory cannot hold it. It never falls back to cursor mode. (Which of
   these refusals the scan retries, and the error for a free figure that
-  cannot be read, are in the #3873 amendment.)
+  cannot be read, are in the #3873 amendment.) The 1.3 was set for
+  8,192-record runs; 1,024-record runs (above) can cost more scratch per
+  record, since each block gives zstd level 1 8x fewer records to compress
+  and pays its own page directory and stats. Measured in the
+  unit fixture, 2026-11-11
+  (`run_block_target_scratch_writes_stay_within_the_need` in
+  `crates/ravel-maintain/src/rlog.rs`): 60 log-line inputs of 3,227,563
+  stored bytes wrote 3,269,638 bytes of runs at 1,024 records (1.013 times
+  the inputs, 0.78 of the need) and 3,092,325 at 8,192 (0.958 times), a
+  1,024 to 8,192 ratio of 1.057. The test asserts both targets stay within
+  the admitted need and the ratio stays at or under 1.15. So 1.3 still
+  covers 1,024-record runs on the fixture, with about 28% of the inputs'
+  size to spare. The fixture's synthetic lines likely compress better than
+  a production tenant's, so it does not settle production's ratio, which
+  M1 (#3961) measures.
 
 The scratch directory is a new config input: `--scratch-dir` on
 `ravel-cli maintain compact-bucket` and `compact-tenant`, and a field on
@@ -408,7 +422,7 @@ pre-registered on #3853 before that run.
 | bytes read from GCS | 16.7 GiB, within 2% | outside | predicted |
 | `level1_block_decodes` | the inputs' block count, within 5% | outside | predicted |
 | `level2_block_decodes` | the run parts' block count, within 10% (boundary blocks twice) | above 1.3x | predicted |
-| `scratch_write_bytes` | 1.0 to 1.3 x raw | outside | predicted |
+| `scratch_write_bytes` | 1.0 to 1.3 x raw | outside | predicted for this bucket; the unit fixture at 1,024-record runs wrote 1.013 x its inputs' object sizes, measured 2026-11-11 (D2) |
 | `scratch_read_bytes` | 1.2 to 2.0 x `scratch_write_bytes` | outside | predicted |
 | peak working set, one unit, W1 level-1 workers | W1 x (G x (raw per input + 2h) + 256 MiB) plus the unexplained 6 GiB | above U plus 8 GiB | predicted |
 | per-unit wall, one unit on 32 cores | set from phase A's first run; pre-registered on #3853 before it | above the pre-registered band | predicted |
@@ -526,7 +540,8 @@ issue #3878; see the final-part settings amendment at the end of this ADR.)
   volume field, sized at 1.3 times the largest unit's raw bytes times
   `--maintain-unit-concurrency`, about 90 GB for four units of this
   bucket's largest hour. Without it, those units are refused (D0) rather
-  than run as cursor merges.
+  than run as cursor merges. The 1.3 holds for 1,024-record runs on the
+  unit fixture (D2); M1 (#3961) measures it on production data.
 - The merge's memory terms change: per-worker catalogs (G of them, not N),
   per-worker resident raw and pass rows under a per-worker ceiling, `E`
   encoding builders at level 2. ADR-3819's amendment, in this branch, names
