@@ -17,7 +17,11 @@ from (seed, "noise"), so the base rows are byte-identical at every --scale.
 Time: every event-time hour is a function of the timestamp,
 hour = ts // 3600e9 - start_hour. A trace starts at least TRACE_MARGIN_NS
 before its hour ends, and every span and log of it lands before that end, so
-a trace and all of its rows share one hour.
+a trace and all of its rows share one hour. No two traces of the failing hour
+share a start: a tie the draw makes is broken by moving the later trace (in
+trace id order) one nanosecond on, so journey C's cut points are exact
+(separate_starts). A move is a nanosecond per tie, far inside the margin,
+and a draw without a tie is written as drawn.
 
 --even-hours gives every hour exactly traces / hours traces (trace i of the
 draw goes to hour i mod hours) instead of a uniform random hour per trace.
@@ -106,6 +110,23 @@ def draw_traces(rng, n, hours, start_hour, seen_ids, even=False):
         traces.append(Trace(tid, start, rng.randrange(len(SERVICES)), rng.random() < 0.02))
     traces.sort(key=lambda t: (t.start_ns, t.trace_id))
     return traces
+
+
+def separate_starts(traces, hour, start_hour):
+    """Give every trace of `hour` its own start: in (start, trace id) order,
+    a trace whose start is not after the previous one's moves to one
+    nanosecond after it. Journey C's cut for tier k is the k-th start of the
+    failing hour, which is exact only when no two starts tie. The order of
+    every trace list stays as it was, nothing draws from a generator, and a
+    draw with no tie is left untouched. Returns the number moved."""
+    in_hour = sorted((t for t in traces if hour_of(t.start_ns, start_hour) == hour),
+                     key=lambda t: (t.start_ns, t.trace_id))
+    moved = 0
+    for prev, t in zip(in_hour, in_hour[1:]):
+        if t.start_ns <= prev.start_ns:
+            t.start_ns = prev.start_ns + 1
+            moved += 1
+    return moved
 
 
 def needle_block_counts(n_rows):
@@ -434,6 +455,7 @@ def main(argv):
                 t.service = FAILING_SERVICE + 1
     else:
         nrng = None
+    separate_starts(base + noise, failing_hour, args.start_hour)
 
     spans_sink = Sink(args.out, "spans", spans_schema, fmt)
     logs_sink = Sink(args.out, "logs", logs_schema, fmt)
@@ -564,7 +586,8 @@ def main(argv):
     hour_starts += [t.start_ns for t in noise if hour_of(t.start_ns, args.start_hour) == failing_hour]
     hour_starts.sort()
     if len(set(hour_starts)) != len(hour_starts):
-        raise SystemExit("gen_corpus: two failing-hour traces share a start; journey cut points would be inexact")
+        raise SystemExit("gen_corpus: two failing-hour traces share a start after separate_starts; "
+                         "journey cut points would be inexact")
     journey = {}
     for k in JOURNEY_TIERS:
         got = min(k, len(hour_starts))
