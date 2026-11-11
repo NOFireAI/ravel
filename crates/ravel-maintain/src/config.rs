@@ -2368,11 +2368,18 @@ pub struct CompactorConfig {
     /// alike: a range closes at the end of the stream at which its records
     /// reach this many. Each range numbers its parts in a window of the part
     /// key's 10,000 indexes proportional to the quantum's share of the unit's
-    /// records, so a compaction of more than 10,000 times the quantum records
-    /// is refused before it encodes a part. Independent of the route and the
-    /// worker counts, so each publishes the same parts. A unit under the
-    /// quantum is one range, numbered `0, 1, 2, ...`. The erasure and force-2
-    /// rewrites do not cut. Zero is refused like [`Self::level2_workers`].
+    /// records, widened to the share of the records it has emitted once those
+    /// pass the quantum, so a compaction of more than 10,000 times the
+    /// quantum records is refused before it encodes a part. The cut positions
+    /// and the windows do not depend on the route or the worker counts. The
+    /// published keys and bytes do not either, except in a keyed bucket
+    /// whose streams emit batch-major (ADR-2135 decision 2): batches cut over
+    /// level-1 runs differ from batches cut over the inputs, and level 1
+    /// batches under `merge_cursor_budget_bytes / W1`, so such a stream may
+    /// cut its parts differently by route and by `W1` (ADR-3853 D3). A unit
+    /// under the quantum is one range, numbered `0, 1, 2, ...`. The erasure
+    /// and force-2 rewrites do not cut. Zero is refused like
+    /// [`Self::level2_workers`].
     /// Default [`crate::rlog::LEVEL2_RANGE_RECORDS`].
     pub rlog_range_records: u64,
     /// The predicted decoded rows at or below which a cursor plan always runs

@@ -1480,6 +1480,10 @@ struct NoteScratchAtFault {
     /// part PUT when the worker's thread sees its reply, which can be after a
     /// later PUT faulted.
     part_puts: std::sync::atomic::AtomicU64,
+    /// When set, every L1 part PUT but the one whose key holds this text
+    /// waits at the store until the scripted fault has fired.
+    hold_parts_but: Option<&'static str>,
+    released: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1518,6 +1522,16 @@ impl NoteScratchAtFault {
             fault,
             at_fault: std::sync::Mutex::new(None),
             part_puts: std::sync::atomic::AtomicU64::new(0),
+            hold_parts_but: None,
+            released: tokio::sync::watch::Sender::new(false),
+        }
+    }
+
+    /// Hold every L1 part PUT whose key lacks `faulting` until the fault fires.
+    fn holding_parts_but(self, faulting: &'static str) -> Self {
+        Self {
+            hold_parts_but: Some(faulting),
+            ..self
         }
     }
 
@@ -1535,6 +1549,7 @@ impl NoteScratchAtFault {
                     bytes: report.scratch_write_bytes,
                     part_puts: self.part_puts(),
                 });
+                self.released.send_replace(true);
             }
         }
     }
@@ -1549,6 +1564,16 @@ impl ObjectStoreBackend for NoteScratchAtFault {
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
         if key.contains("/l1/") {
+            if self.hold_parts_but.is_some_and(|f| !key.contains(f)) {
+                let mut released = self.released.subscribe();
+                // Bounded so a fault that never fires fails the test's
+                // assertions rather than hanging it.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    released.wait_for(|r| *r),
+                )
+                .await;
+            }
             self.part_puts.fetch_add(1, Ordering::SeqCst);
         }
         let outcome = self.inner.put(key, data, opts).await;
@@ -1736,12 +1761,15 @@ async fn a_failed_level1_worker_stops_every_level1_worker() {
 }
 
 /// ADR-3853 D5 amendment: level 2's range workers share a stop token as
-/// level 1's do. Four range workers over four ranges; the PUT of part 2,500,
-/// the first part of range 1's window, fails for good. Its worker stops the others, and
-/// each other worker is past at most the part PUT it was already issuing: at
-/// most `W2 - 1` part PUTs follow the fault. The unit returns that error,
-/// publishes no record, and the parts already written are orphans for the
-/// sweep.
+/// level 1's do. Four range workers over four ranges of about 36 parts each;
+/// the PUT of part 2,500, the first part of range 1's window, fails for good.
+/// The store holds every other part PUT until that fault fires, so the order
+/// does not depend on scheduling: each other worker is past at most the part
+/// PUT it was already issuing, at most `W2 - 1` part PUTs follow the fault,
+/// and the unit writes at most `W2` parts. Without the check before each part
+/// PUT, every other worker already inside its range writes the rest of it (72
+/// or 108 part PUTs follow the fault). The unit returns that error, publishes
+/// no record, and the parts already written are orphans for the sweep.
 #[tokio::test]
 async fn a_failed_level2_worker_stops_every_level2_worker() {
     let clock = FixedClock::new(sealed_now_ns());
@@ -1761,13 +1789,13 @@ async fn a_failed_level2_worker_stops_every_level2_worker() {
         FaultStore::new(MemoryStore::new(), plan),
         &ledger,
         (Op::Put, FaultKind::Permanent),
-    );
+    )
+    .holding_parts_but(".2500.");
     let b = seed_sixty_rlog_inputs(&store).await;
     let config = CompactorConfig {
         request_ledger: Some(ledger.clone()),
         level2_workers: Some(4),
         rlog_range_records: 600,
-        rlog_l1_part_memory_target_bytes: Some(24 * 4096),
         rlog_run_block_target_records: 40,
         ..two_level(
             CompactorConfig::default(),
@@ -1802,6 +1830,11 @@ async fn a_failed_level2_worker_stops_every_level2_worker() {
         after < report.level2_workers,
         "{after} part PUTs followed the fault with {} workers: {report:?} {at_fault:?}",
         report.level2_workers
+    );
+    assert!(
+        store.part_puts() <= report.level2_workers,
+        "{} part PUTs in all: {report:?}",
+        store.part_puts()
     );
     assert_eq!(report.publish.requests, 0, "{report:?}");
     assert!(record_keys_in(&store, &b).await.is_empty());
