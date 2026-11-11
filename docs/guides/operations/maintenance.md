@@ -53,6 +53,8 @@ writes its level-1 runs, and how quickly a stuck unit is visible:
 | `--maintain-scratch-dir` | unset | The local directory the two-level RLOG merge writes its level-1 runs under. Set it to compact a log bucket whose cursor merge would decode more than 16 rows per input record and more than 10 million rows in all; without it that bucket is refused and counted under `ravel_maintain_compaction_refused_total{reason="geometry"}`. The directory is a cache: each unit's runs are wiped when the unit ends and nothing durable is read from it, so an `emptyDir` serves. Give each process its own directory, because the first two-level merge locks `ravel-scratch.lock` in it for the life of the process; a second process refuses the bucket under `reason="scratch_locked"`. Size it at about 1.3 times the stored input bytes of the largest bucket it merges: a unit is admitted only when that much is free, and is otherwise refused under `reason="scratch_headroom"`. |
 | `--maintain-scratch-max-bytes` | unset | A cap on the bytes the scratch directory may hold, for a directory on a volume larger than its share, such as an `emptyDir` with a size limit on the node's root disk. A unit is admitted against the smaller of the volume's free bytes and this cap less the bytes already under the directory. `0`, or the flag without `--maintain-scratch-dir`, is refused at startup. |
 | `--maintain-level1-workers` | derived | How many level-1 groups of one two-level merge run at once, each under its share of the unit's memory ceiling. Omitted, it is derived per bucket from the unit's share of the usable cores, the usable cores divided by `--maintain-unit-concurrency` and at least 1, and the largest count whose groups still fit. `0`, or the flag without `--maintain-scratch-dir`, is refused at startup. |
+| `--maintain-level2-workers` | derived | How many level-2 range workers one two-level merge runs, each merging its own contiguous share of the bucket's ranges into its own parts. Omitted, it is derived jointly with `--maintain-level1-workers` from the same core share. No more workers run than the bucket has ranges, and a count whose level-2 read side does not fit the unit's memory ceiling is refused. `0`, or the flag without `--maintain-scratch-dir`, is refused at startup. |
+| `--maintain-run-block-records` | `1024` | Records per block of a level-1 run; it changes what level 2 reads and holds per run. Leave it unset outside a measurement. `0`, or the flag without `--maintain-scratch-dir`, is refused at startup. |
 | `--maintain-stalled-after-intervals` | `3` | Consecutive failed ticks a unit must accrue, with no intervening success, before it counts as stalled. Lower it to be paged sooner on a flaky unit at the cost of noise from transient faults; raise it to tolerate a noisier store at the cost of a slower page. A single success resets that unit's counter. |
 | `--maintain-interior-reverify` | `6h` | The slow safety-net cadence for hours that are neither at the head nor the tail of the keyspace this tick. An interior bucket's memoized state is re-verified no less often than this, and the sweeper runs a full-keyspace pass on the same cadence instead of its per-tick head-and-tail pass. Head and tail hours are unaffected and are evaluated every tick. Zero disables the safety net, which makes every interior bucket always due. |
 
@@ -354,8 +356,9 @@ the compaction misses that writer's later-published object.
 ### Two-level merge scratch
 
 A logs bucket with many inputs can need the two-level RLOG merge, which writes level-1 runs to a local scratch directory. Both commands take the
-same three flags as `ravel-server`'s `--maintain-scratch-*` flags, plus two
-level-2 and run settings the server has no flag for. For sizing, see
+same five flags as `ravel-server`'s `--maintain-scratch-dir`,
+`--maintain-scratch-max-bytes`, `--maintain-level1-workers`,
+`--maintain-level2-workers` and `--maintain-run-block-records`. For sizing, see
 [Compaction scratch](configuration.md#compaction-scratch).
 
 | Flag | Meaning |
