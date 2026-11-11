@@ -2648,9 +2648,10 @@ async fn two_level_merge(
             let shape = Level1Shape {
                 per_input,
                 inputs,
-                block_rate: costs.iter().map(|c| c.block_rate).fold((0, 1), |a, b| {
-                    if higher_rate(b, a) { b } else { a }
-                }),
+                block_rate: costs
+                    .iter()
+                    .map(|c| c.block_rate)
+                    .fold((0, 1), |a, b| if higher_rate(b, a) { b } else { a }),
                 run_block_records: config.rlog_run_block_target_records as u64,
                 input_records: catalogs.iter().map(|c| c.record_count).max().unwrap_or(0),
                 in_flight: largest_in_flight(
@@ -3510,14 +3511,7 @@ fn level2_plans(
                 .map(|w| {
                     let streams =
                         level2_streams(ranges, &level2_assignment(ranges.len(), workers, w));
-                    plan_merge_with(
-                        config,
-                        runs,
-                        &stream_ids[streams],
-                        width_ns,
-                        ceiling,
-                        floor,
-                    )
+                    plan_merge_with(config, runs, &stream_ids[streams], width_ns, ceiling, floor)
                 })
                 .collect::<Result<Vec<MergePlan>>>()?;
             Some(plans)
@@ -3680,6 +3674,95 @@ async fn level2_worker_ranges(
     drop(resident);
     drop(resident_charges);
     Ok((sink.finish().await?, counts))
+}
+
+/// What every level-2 range worker of one two-level merge shares, owned so
+/// each worker runs as its own task (ADR-3853 D5 amendment): the runs and
+/// their ranges, the stop token, and the target store and the unit's scratch,
+/// each reached through a [`StoreProxy`] the unit's task serves.
+struct Level2Shared {
+    store: StoreProxy,
+    runs_store: StoreProxy,
+    bucket: Bucket,
+    input_set_hash: [u8; 32],
+    dry_run: bool,
+    retain_bytes: bool,
+    runs: Vec<RlogInputCatalog>,
+    stream_ids: Vec<LogStreamId>,
+    ranges: Vec<std::ops::Range<usize>>,
+    slots: u32,
+    inputs: usize,
+    width_ns: i64,
+    stop: Arc<LevelStop>,
+}
+
+/// One level-2 range worker task: `worker` of `workers`, merging its
+/// contiguous share of the ranges ([`level2_assignment`]) under `config` and
+/// `plan`. An error stops every worker through the shared token and yields
+/// `None`.
+async fn level2_worker(
+    shared: Arc<Level2Shared>,
+    worker: usize,
+    workers: usize,
+    config: CompactorConfig,
+    plan: MergePlan,
+    output: OutputSpec,
+) -> Option<(Vec<BuiltPart>, RecordCounts)> {
+    let work = Level2Work {
+        store: &shared.store,
+        runs_store: &shared.runs_store,
+        bucket: &shared.bucket,
+        input_set_hash: &shared.input_set_hash,
+        dry_run: shared.dry_run,
+        retain_bytes: shared.retain_bytes,
+        runs: &shared.runs,
+        stream_ids: &shared.stream_ids,
+        ranges: &shared.ranges,
+        slots: shared.slots,
+        inputs: shared.inputs,
+        width_ns: shared.width_ns,
+        stop: &shared.stop,
+    };
+    let assigned = level2_assignment(shared.ranges.len(), workers, worker);
+    match level2_worker_ranges(&work, assigned, &config, &plan, output, None).await {
+        Ok(done) => Some(done),
+        Err(e) => {
+            shared.stop.fail(e);
+            None
+        }
+    }
+}
+
+/// The unit's level-2 range worker tasks, aborted if the unit's merge is
+/// dropped before they end.
+struct Level2Tasks(Vec<tokio::task::JoinHandle<Option<(Vec<BuiltPart>, RecordCounts)>>>);
+
+impl Level2Tasks {
+    /// Every worker's result. A worker task that panicked resumes the panic
+    /// here, on the unit's task.
+    async fn join(&mut self, stop: &LevelStop) -> Vec<Option<(Vec<BuiltPart>, RecordCounts)>> {
+        futures::future::join_all(self.0.iter_mut().map(|task| async move {
+            match task.await {
+                Ok(done) => done,
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => {
+                    stop.fail(MaintainError::Invariant(format!(
+                        "level-2 worker task: {e}"
+                    )));
+                    None
+                }
+            }
+        }))
+        .await
+    }
+}
+
+impl Drop for Level2Tasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// Both levels of [`two_level_merge`], with the runs written through the
@@ -3857,7 +3940,7 @@ async fn merge_in_unit(
         Level2Fit {
             need,
             ceiling,
-            predicted: 1,
+            predicted: layout.level2_workers.unwrap_or(layout.share),
         },
         plan,
         |ceiling_bytes| MaintainError::MergeTwoLevelUnsupported {
@@ -3940,17 +4023,82 @@ async fn merge_in_unit(
                 "level 2 planned no range worker".to_string(),
             ));
         };
-        let done =
-            level2_worker_ranges(&work, 0..ranges.len(), worker_config, plan, output, Some(builders))
-                .await;
+        let done = level2_worker_ranges(
+            &work,
+            0..ranges.len(),
+            worker_config,
+            plan,
+            output,
+            Some(builders),
+        )
+        .await;
         if let Some(t) = tracker {
             t.absorb_level2_workers(&level2_trackers);
         }
         vec![done?]
     } else {
-        return Err(MaintainError::Invariant(
-            "level 2 planned more than one range worker".to_string(),
-        ));
+        // Each range worker is its own task, as level 1's are; its part PUTs
+        // and run reads are served here, on the unit's task.
+        let (store, store_calls) = StoreProxy::open(target.store, None);
+        let (runs_store, runs_calls) = StoreProxy::open(meter, None);
+        let shared = Arc::new(Level2Shared {
+            store,
+            runs_store,
+            bucket: *target.bucket,
+            input_set_hash: *target.input_set_hash,
+            dry_run: target.dry_run,
+            retain_bytes: target.retain_bytes,
+            runs,
+            stream_ids: stream_ids.to_vec(),
+            ranges,
+            slots,
+            inputs,
+            width_ns,
+            stop: Arc::clone(&stop),
+        });
+        let mut workers = Level2Tasks(
+            level2_configs
+                .into_iter()
+                .zip(plans)
+                .enumerate()
+                .map(|(worker, (worker_config, plan))| {
+                    let output = OutputSpec {
+                        identity: output.identity,
+                        indexed_fields: output.indexed_fields.clone(),
+                        key_index_fields: output.key_index_fields.clone(),
+                        declared: Arc::clone(&output.declared),
+                        writer: Arc::clone(&output.writer),
+                    };
+                    tokio::spawn(
+                        level2_worker(
+                            Arc::clone(&shared),
+                            worker,
+                            level2_workers,
+                            worker_config,
+                            plan,
+                            output,
+                        )
+                        .with_current_subscriber(),
+                    )
+                })
+                .collect(),
+        );
+        drop(shared);
+        let (done, (), ()) = tokio::join!(
+            workers.join(&stop),
+            serve_store_calls(target.store, store_calls),
+            serve_store_calls(meter, runs_calls),
+        );
+        if let Some(t) = tracker {
+            t.absorb_level2_workers(&level2_trackers);
+        }
+        if let Some(e) = stop.take() {
+            return Err(e);
+        }
+        let done: Option<Vec<_>> = done.into_iter().collect();
+        done.ok_or_else(|| {
+            MaintainError::Invariant("a level-2 worker ended without a result".to_string())
+        })?
     };
     let mut level2 = RecordCounts::default();
     let mut parts: Vec<BuiltPart> = Vec::new();
@@ -4770,8 +4918,7 @@ async fn run_stream_pass<'c>(
                 iw.groups.retain(|(_, blocks)| !blocks.is_empty());
                 if iw.groups.iter().any(|(_, b)| b.iter().any(|b| *b < block)) {
                     return Err(MaintainError::Invariant(
-                        "stream pass would decode a block ahead of the view it carries"
-                            .to_string(),
+                        "stream pass would decode a block ahead of the view it carries".to_string(),
                     ));
                 }
                 kept = Some((block, view));
@@ -4943,7 +5090,8 @@ async fn run_stream_pass<'c>(
                 };
                 // Only the last block may hold rows past the pass.
                 let block = h.last_block.filter(|_| i == tail);
-                let (Some(block), true) = (block, view.rows.peek_stream_ref().is_some_and(|s| s > last))
+                let (Some(block), true) =
+                    (block, view.rows.peek_stream_ref().is_some_and(|s| s > last))
                 else {
                     return Err(MaintainError::Invariant(
                         "stream pass ended with decoded rows it never emitted".to_string(),
@@ -5452,7 +5600,8 @@ impl PartSink<'_> {
         if self.current.as_ref().is_some_and(|p| !p.is_empty()) {
             self.flush(None).await?;
         }
-        self.part_index = u32::try_from(window.first()).map_err(|_| window.refusal(window.first()))?;
+        self.part_index =
+            u32::try_from(window.first()).map_err(|_| window.refusal(window.first()))?;
         self.slots = Some(window);
         Ok(())
     }
@@ -16761,6 +16910,126 @@ mod tests {
             assert_eq!(scratch_entries(&dir), Vec::<std::path::PathBuf>::new());
         }
 
+        /// The range quantum of the range worker fixture: about a quarter of
+        /// the fixture's 2,400 records, so the runs cut into 4 ranges.
+        const RANGE_QUANTUM: u64 = 600;
+
+        /// The final part memory target of the range worker fixture: each of
+        /// its 4 ranges closes in at most 4 parts, some in fewer.
+        const RANGE_PART: u64 = 24 * TWO_LEVEL_PART;
+
+        /// The two-level fixture under a ceiling 4 times the G = 12 one, with
+        /// level 1 on one worker, the range quantum cutting 4 ranges, 4 slots
+        /// per range and `level2_workers` range workers.
+        fn range_worker_config(
+            per_input: u64,
+            level2_workers: usize,
+            dir: std::path::PathBuf,
+        ) -> CompactorConfig {
+            CompactorConfig {
+                level1_workers: Some(1),
+                level2_workers: Some(level2_workers),
+                rlog_level2_range_records: RANGE_QUANTUM,
+                rlog_level2_range_slots: 4,
+                rlog_l1_part_memory_target_bytes: Some(RANGE_PART),
+                ..two_level_config(
+                    4 * group_ceiling(per_input, TWO_LEVEL_RUN_TARGET, 12),
+                    TWO_LEVEL_RUN_TARGET,
+                    Some(dir),
+                )
+            }
+        }
+
+        /// Every record of the published parts, in part order.
+        async fn published_records(store: &dyn ObjectStoreBackend) -> Vec<LogRecord> {
+            let (_, parts) = read_output(store).await;
+            parts.iter().flat_map(|p| decode_all(p)).collect()
+        }
+
+        /// ADR-3853 D5 amendment: the ranges are cut by a record quantum the
+        /// worker count never reaches, and each range numbers its parts from
+        /// its own `r x K` slots, so 1, 2 and 4 range workers publish the
+        /// same keys, bytes and content hashes, with each range's parts in
+        /// its own slots and a gap where a range closed fewer than K. The
+        /// records are the single-level merge's, in its order. A block view
+        /// carried across a pass or range boundary is decoded once, so the
+        /// decodes stay within one per run block plus one per run for each
+        /// worker. Each worker plans under `U / W2` with its own tracker: its
+        /// peak stays under that and the peaks' sum under `U`.
+        #[tokio::test]
+        async fn range_workers_emit_the_same_parts_at_every_worker_count() {
+            let (oracle, _, per_input) = single_level_oracle().await;
+            let oracle_store = ProbeStore::new();
+            seed_inputs(&oracle_store, &two_level_inputs()).await;
+            let oracle_config =
+                two_level_config(64 << 20, crate::RLOG_RUN_MEMORY_TARGET_BYTES, None);
+            compact_logged(&oracle_store, &oracle_config)
+                .await
+                .0
+                .expect("single-level compact");
+            let oracle_records = published_records(&oracle_store).await;
+            assert_eq!(oracle_records.len(), 2400);
+            assert!(!oracle.0.is_empty());
+
+            let mut outputs = Vec::new();
+            for workers in [1usize, 2, 4] {
+                let dir = fresh_scratch(&format!("range-workers-{workers}"));
+                let config = range_worker_config(per_input, workers, dir.clone());
+                let ceiling = config.merge_resident_ceiling();
+                let (outcome, run, store, _) = compact_two_level(&config).await;
+                assert!(
+                    matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                    "{workers} workers: {outcome:?}"
+                );
+                let r = &run.report;
+                assert_eq!(r.level2_workers, workers as u64, "{r:?}");
+                assert_eq!(r.level2_ranges, 4, "{r:?}");
+                let line = run.line("rlog two-level merge");
+                assert_eq!(log_field(&line, "level2_workers"), workers as u64, "{line}");
+                assert_eq!(log_field(&line, "level2_ranges"), 4, "{line}");
+                let runs = log_field(&line, "runs");
+                let run_blocks = log_field(&line, "run_blocks");
+                assert!(
+                    r.level2_block_decodes <= run_blocks + workers as u64 * runs,
+                    "{workers} workers: {} decodes of {run_blocks} run blocks in {runs} runs",
+                    r.level2_block_decodes
+                );
+                let peaks = run.tracker.level2_worker_peak_bytes();
+                assert_eq!(peaks.len(), workers, "{peaks:?}");
+                let worker_ceiling = ceiling / workers as u64;
+                assert!(
+                    peaks.iter().all(|p| *p > 0 && *p <= worker_ceiling),
+                    "{workers} workers: {peaks:?} against {worker_ceiling}"
+                );
+                let summed: u64 = peaks.iter().sum();
+                assert!(summed <= ceiling, "{summed} against {ceiling}");
+                let (rec, _) = read_output(&store).await;
+                let indexes: Vec<u32> = rec.parts.iter().map(|p| p.part_index).collect();
+                assert_eq!(
+                    indexes,
+                    [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13],
+                    "{workers} workers: range r's parts from r x 4, 3, 3, 3 and 2 of them"
+                );
+                assert!(
+                    published_records(&store).await == oracle_records,
+                    "{workers} workers: record sequence"
+                );
+                assert!(scratch_entries(&dir).is_empty(), "{workers} workers");
+                outputs.push(published(&store).await);
+            }
+            for (got, workers) in outputs[1..].iter().zip([2, 4]) {
+                assert_eq!(got.0, outputs[0].0, "{workers} workers: part keys");
+                assert!(
+                    got.1.hashes == outputs[0].1.hashes,
+                    "{workers} workers: content hashes"
+                );
+                assert!(
+                    got.1.parts == outputs[0].1.parts,
+                    "{workers} workers: part bytes"
+                );
+            }
+        }
+
         /// Run settings never reach the published parts: two run targets that
         /// cut the runs into different numbers of parts publish the
         /// single-level bytes and keys. Both run under the fixture's G = 12
@@ -17820,8 +18089,7 @@ mod tests {
 
             let ceiling = group_ceiling(per_input, run_target, 12);
             let dir = fresh_scratch("runs-not-parts");
-            let config =
-                two_level_config(ceiling, run_target, Some(dir.clone()));
+            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
             let (outcome, run, store, _) = compact_two_level(&config).await;
             assert!(
                 matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
@@ -17846,8 +18114,7 @@ mod tests {
 
             let ceiling = group_ceiling(per_input, run_target, 10);
             let dir = fresh_scratch("two-blocks-per-run");
-            let config =
-                two_level_config(ceiling, run_target, Some(dir.clone()));
+            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
             let (outcome, run, store, _) = compact_two_level(&config).await;
             match outcome {
                 Ok(CompactionOutcome::TwoLevelUnsupported {
