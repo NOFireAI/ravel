@@ -3739,7 +3739,10 @@ async fn level2_worker(
 
 /// The unit's level-2 range worker tasks, aborted if the unit's merge is
 /// dropped before they end.
-struct Level2Tasks(Vec<tokio::task::JoinHandle<Option<(Vec<BuiltPart>, RecordCounts)>>>);
+struct Level2Tasks(Vec<tokio::task::JoinHandle<Option<Level2Output>>>);
+
+/// One range worker's parts and the record counts it merged.
+type Level2Output = (Vec<BuiltPart>, RecordCounts);
 
 impl Level2Tasks {
     /// Every worker's result. A worker task that panicked resumes the panic
@@ -5404,10 +5407,10 @@ impl PartSink<'_> {
     /// closing it once a target is reached.
     async fn push(&mut self, r: LogRecord) -> Result<()> {
         if self.current.is_none() {
-            if let Some(window) = &self.slots {
-                if u64::from(self.part_index) >= window.end() {
-                    return Err(window.refusal(u64::from(self.part_index)));
-                }
+            if let Some(window) = &self.slots
+                && u64::from(self.part_index) >= window.end()
+            {
+                return Err(window.refusal(u64::from(self.part_index)));
             }
             self.current = Some(PartBuilder::new(
                 &self.identity,

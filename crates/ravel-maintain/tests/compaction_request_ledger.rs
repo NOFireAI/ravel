@@ -940,7 +940,8 @@ async fn a_zero_rlog_run_block_target_is_refused_before_any_store_request() {
 /// target, with the field it names (ADR-3853 D5 amendment).
 #[tokio::test]
 async fn a_zero_level2_setting_is_refused_before_any_store_request() {
-    let zeroes: [(&str, fn(&mut CompactorConfig)); 3] = [
+    type Zero = fn(&mut CompactorConfig);
+    let zeroes: [(&str, Zero); 3] = [
         ("level2_workers", |c| c.level2_workers = Some(0)),
         ("rlog_level2_range_records", |c| {
             c.rlog_level2_range_records = 0
