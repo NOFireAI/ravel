@@ -1367,10 +1367,7 @@ async fn merge_catalogs_with_geometry(
     // `build_parts` caller.
     let zstd_level = crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
     crate::config::validate_rlog_run_block_target_records(config.rlog_run_block_target_records)?;
-    crate::config::validate_rlog_level2_settings(
-        config.level2_workers,
-        config.rlog_range_records,
-    )?;
+    crate::config::validate_rlog_level2_settings(config.level2_workers, config.rlog_range_records)?;
     let key_index_fields = merged_key_index_fields(catalogs);
     // Global stream_ref remap + cross-object stream-identity check. The
     // merged set is the sorted union of every input's STREAM_DIR; the dense
@@ -17348,7 +17345,11 @@ mod tests {
             let config = two_level_config(ceiling, run_target, Some(dir.clone()));
             // The fixture's 2,400 records are under the default quantum: one
             // range on both routes, its parts numbered from 0 without a gap.
-            assert!(config.rlog_range_records > 2400, "{}", config.rlog_range_records);
+            assert!(
+                config.rlog_range_records > 2400,
+                "{}",
+                config.rlog_range_records
+            );
             let n = u32::try_from(oracle.1.indexes.len()).expect("parts");
             assert_eq!(oracle.1.indexes, (0..n).collect::<Vec<u32>>());
 
@@ -17564,7 +17565,10 @@ mod tests {
                     got.1.hashes == oracle.1.hashes,
                     "{workers} workers: content hashes"
                 );
-                assert!(got.1.parts == oracle.1.parts, "{workers} workers: part bytes");
+                assert!(
+                    got.1.parts == oracle.1.parts,
+                    "{workers} workers: part bytes"
+                );
             }
 
             // A run with no ledger installed, as ravel-server runs, still
@@ -17666,7 +17670,11 @@ mod tests {
                         assert_eq!(r.merge_passes, 1, "{name}: {r:?}");
                         "mode=\"fetch-per-pass\""
                     };
-                    assert!(run.mode_line().contains(mode), "{name}: {}", run.mode_line());
+                    assert!(
+                        run.mode_line().contains(mode),
+                        "{name}: {}",
+                        run.mode_line()
+                    );
                 } else {
                     assert_eq!(r.level2_ranges, 4, "{name}: {r:?}");
                     groups.push(r.level1_groups);
@@ -17711,9 +17719,15 @@ mod tests {
             };
             let legs = [
                 ("baseline", config("baseline", 4, 40, TWO_LEVEL_RUN_TARGET)),
-                ("one-worker", config("one-worker", 1, 40, TWO_LEVEL_RUN_TARGET)),
+                (
+                    "one-worker",
+                    config("one-worker", 1, 40, TWO_LEVEL_RUN_TARGET),
+                ),
                 ("block-8", config("block-8", 1, 8, TWO_LEVEL_RUN_TARGET)),
-                ("run-4096", config("run-4096", 1, 40, TWO_LEVEL_RUN_TARGET / 2)),
+                (
+                    "run-4096",
+                    config("run-4096", 1, 40, TWO_LEVEL_RUN_TARGET / 2),
+                ),
             ];
             let mut outputs = Vec::new();
             let mut shapes = Vec::new();
