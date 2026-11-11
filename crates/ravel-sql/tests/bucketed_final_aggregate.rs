@@ -2899,3 +2899,394 @@ proptest::proptest! {
             .block_on(check_key_case(case));
     }
 }
+
+// ---------------------------------------------------------------------------
+// The refusal retry (issue #4075)
+// ---------------------------------------------------------------------------
+
+/// The final aggregate's partitions on every retry fixture below.
+const RETRY_PARTITIONS: usize = 2;
+
+/// The logs fixture's [`sql_config`] at [`RETRY_PARTITIONS`] with spill on
+/// and the bucketed rule off, so whatever plans buckets on the retry is the
+/// retry's own rule: a per-query limit of `query_bytes`, scratch at
+/// `scratch`.
+fn retry_config(scratch: &std::path::Path, query_bytes: usize) -> SqlConfig {
+    let mut config = sql_config(RETRY_PARTITIONS, None, None);
+    config.max_query_bytes = query_bytes;
+    config.spill = Some(ravel_sql::SpillConfig {
+        dir: scratch.to_path_buf(),
+        max_bytes: 1 << 30,
+        merge_fan_in: ravel_sql::DEFAULT_SPILL_MERGE_FAN_IN,
+    });
+    config
+}
+
+/// What one statement run reported about its spill retry.
+struct RetryRun {
+    /// The result rows in result order.
+    rows: Vec<String>,
+    retries: u32,
+    report: Option<ravel_sql::SpillRetryReport>,
+    plan: Option<String>,
+    peak_pool_bytes: u64,
+}
+
+async fn retry_run(executor: &SqlExecutor, sql: &str) -> Result<RetryRun, String> {
+    let outcome = executor
+        .execute(tenant().hash(), &request(sql))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    for batch in outcome.output.batches() {
+        for row in 0..batch.num_rows() {
+            let cells: Vec<String> = batch
+                .columns()
+                .iter()
+                .map(|column| array_value_to_string(column, row).expect("renders"))
+                .collect();
+            rows.push(cells.join("|"));
+        }
+    }
+    Ok(RetryRun {
+        rows,
+        retries: outcome.stats.spill_retries,
+        report: outcome.stats.spill_retry,
+        plan: outcome.stats.spill_retry_plan,
+        peak_pool_bytes: outcome.accounting.peak_intermediate_bytes,
+    })
+}
+
+/// Every group ties on its count of 1, so which ten rows answer is decided by
+/// the tie order alone.
+const RETRY_TIES_SQL: &str =
+    "SELECT a, count(*) AS c FROM logs GROUP BY a ORDER BY c DESC LIMIT 10";
+
+/// Every group of a unique fixed-width key, the whole answer, compared as a
+/// set: a full sort above the aggregate asks more than this fixture's
+/// budgets hold for its own merge reservation.
+const RETRY_GROUPS_SQL: &str = "SELECT a, count(*) AS c FROM logs GROUP BY a";
+
+/// A string key, which the bucketed rule does not admit.
+const RETRY_STRING_SQL: &str = "SELECT arrow_cast(a, 'Utf8') AS k, count(*) AS c FROM logs \
+                                GROUP BY k ORDER BY c DESC LIMIT 10";
+
+/// How a refused run's first attempt is made to refuse: a process budget of
+/// `tenths` of the unlimited peak, with the executor's descriptor limit at
+/// `nofile_soft` (the default when `None`).
+#[derive(Clone, Copy)]
+struct Refusal {
+    tenths: u64,
+    nofile_soft: Option<u64>,
+}
+
+/// `sql`'s rows in result order through the plan-time ADR-0954 plan, the
+/// repartition-free sort-merge plan the retry falls back to, under a limit
+/// it never reaches. This fixture's sort-merge retry does not answer under
+/// any budget that refuses the first attempt: its single aggregate's
+/// reserve-ahead envelope asks more than the refused two-partition first
+/// attempt needed.
+async fn sort_merge_rows(sql: &str) -> Vec<String> {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let on = executor(
+        ROWS,
+        retry_config(scratch.path(), ravel_sql::DEFAULT_MAX_QUERY_BYTES),
+    )
+    .await;
+    let plan = physical_plan(&on, sql).await;
+    assert!(bucketed_lines(&plan).is_empty(), "{plan}");
+    assert!(!plan.contains("RepartitionExec"), "{plan}");
+    let mut stream = pinned(&on, sql).await.execute().await.expect("executes");
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.expect("a batch");
+        for row in 0..batch.num_rows() {
+            let cells: Vec<String> = batch
+                .columns()
+                .iter()
+                .map(|column| array_value_to_string(column, row).expect("renders"))
+                .collect();
+            rows.push(cells.join("|"));
+        }
+    }
+    rows
+}
+
+/// A statement's unlimited run, the same statement refused as `refusal`
+/// says (its result: the run, or the error it ended with), and the INFO log
+/// the refused run wrote.
+async fn refused_run(sql: &str, refusal: Refusal) -> (RetryRun, Result<RetryRun, String>, String) {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes| retry_config(scratch.path(), query_bytes);
+    let unlimited = retry_run(
+        &executor(ROWS, config(ravel_sql::DEFAULT_MAX_QUERY_BYTES)).await,
+        sql,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    assert_eq!(
+        unlimited.retries, 0,
+        "{sql}: unlimited, the first attempt answers"
+    );
+    let budget = unlimited.peak_pool_bytes * refusal.tenths / 10;
+    let mut refused = executor(ROWS, config(ravel_sql::DEFAULT_MAX_QUERY_BYTES))
+        .await
+        .with_process_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(budget)));
+    if let Some(nofile_soft) = refusal.nofile_soft {
+        refused = refused.with_nofile_soft(nofile_soft);
+    }
+    let log = crate::spill::CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let run = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        retry_run(&refused, sql).await
+    };
+    (unlimited, run, log.text())
+}
+
+/// [`refused_run`], which must answer on its one spill retry.
+async fn answered_retry(sql: &str, refusal: Refusal) -> (RetryRun, RetryRun, String) {
+    let (unlimited, run, log) = refused_run(sql, refusal).await;
+    let run = run.unwrap_or_else(|e| panic!("{sql}: the retry answers: {e}\n{log}"));
+    assert_eq!(run.retries, 1, "{sql}: answered on its spill retry");
+    (unlimited, run, log)
+}
+
+/// The bucket retry's refusal: seven tenths of the unlimited peak.
+const BUCKET_REFUSAL: Refusal = Refusal {
+    tenths: 7,
+    nofile_soft: None,
+};
+
+/// Field `name` of the spill retry's INFO line in `log`, quotes stripped.
+fn retry_info_field(log: &str, name: &str) -> String {
+    let line = log
+        .lines()
+        .find(|line| line.contains("SQL statement retried with spill"))
+        .unwrap_or_else(|| panic!("no spill retry INFO line in:\n{log}"));
+    let key = format!(" {name}=");
+    let start = line
+        .find(&key)
+        .unwrap_or_else(|| panic!("no {name} on the INFO line: {line}"))
+        + key.len();
+    line[start..]
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
+}
+
+/// The `BucketedFinalAggregateExec` lines of a rendered plan.
+fn bucketed_lines(plan: &str) -> Vec<&str> {
+    plan.lines()
+        .filter(|line| line.contains("BucketedFinalAggregateExec:"))
+        .collect()
+}
+
+/// Issue #4075: a refused statement whose final aggregate the bucketed rule
+/// admits retries through the hash exchange and the bucketed final aggregate
+/// although `SqlConfig::bucketed_final_aggregation` is off, and every
+/// bucketed exec it runs carries the derived tuning the INFO line reports,
+/// not the placeholder's 6 bits and 8192 rows.
+///
+/// Prove-the-test: make `with_bucket_spill_tuning` return the plan unchanged
+/// and the exec runs at `bits=6, routed_chunk_rows=8192` while the INFO line
+/// reports `bits=0`.
+#[tokio::test]
+async fn retry_plans_bucketed_exchange_for_admitted_shape() {
+    let (_, bucket, log) = answered_retry(RETRY_TIES_SQL, BUCKET_REFUSAL).await;
+    let report = bucket.report.expect("the retry reports");
+    assert_eq!(
+        (report.retry_plan, report.retry_plan_reason),
+        ("bucket", None)
+    );
+    assert_eq!(retry_info_field(&log, "retry_plan"), "bucket");
+    assert_eq!(retry_info_field(&log, "retry_plan_reason"), "none");
+    let bits = retry_info_field(&log, "bits");
+    let rows = retry_info_field(&log, "routed_chunk_rows");
+    assert_eq!(
+        (bits.clone(), rows.clone()),
+        (
+            report.bits.expect("bits").to_string(),
+            report.routed_chunk_rows.expect("rows").to_string()
+        ),
+        "the INFO line is the report"
+    );
+    assert_ne!(
+        (bits.as_str(), rows.as_str()),
+        ("6", "8192"),
+        "the fixture derives a tuning other than the placeholder's"
+    );
+
+    let plan = bucket.plan.expect("the retry's plan");
+    assert!(
+        plan.contains(&format!(
+            "RepartitionExec: partitioning=Hash([a@0], {RETRY_PARTITIONS})"
+        )),
+        "{plan}"
+    );
+    let execs = bucketed_lines(&plan);
+    assert!(!execs.is_empty(), "{plan}");
+    for exec in execs {
+        assert!(
+            exec.contains(&format!("bits={bits}, routed_chunk_rows={rows},")),
+            "the exec runs at the INFO line's tuning: {exec}"
+        );
+    }
+}
+
+/// The bucketed retry answers what the sort-merge retry answers, row for
+/// row and in order on a top ten decided by ties alone, and as a set over
+/// every group; both answer what the unlimited first attempt does.
+#[tokio::test]
+async fn bucket_spill_retry_matches_unspilled_answer() {
+    for sql in [RETRY_TIES_SQL, RETRY_GROUPS_SQL] {
+        let (unlimited, bucket, _) = answered_retry(sql, BUCKET_REFUSAL).await;
+        assert_eq!(
+            bucket.report.map(|report| report.retry_plan),
+            Some("bucket")
+        );
+        let mut sort_merge = sort_merge_rows(sql).await;
+        let answer = |mut rows: Vec<String>| {
+            if sql == RETRY_GROUPS_SQL {
+                rows.sort();
+            }
+            rows
+        };
+        sort_merge = answer(sort_merge);
+        let (bucket, unlimited) = (answer(bucket.rows), answer(unlimited.rows));
+        assert_eq!(bucket, sort_merge, "{sql}");
+        assert_eq!(bucket, unlimited, "{sql}");
+        let expected = if sql == RETRY_TIES_SQL {
+            10
+        } else {
+            ROWS as usize
+        };
+        assert_eq!(bucket.len(), expected, "{sql}");
+    }
+}
+
+/// A retry whose derived tuning needs more descriptors than
+/// `floor(nofile_soft / (2 x slots))` keeps the repartition-free sort-merge
+/// plan, and its INFO line says why. Refused by the process budget, this
+/// fixture's sort-merge retry does not answer (see
+/// [`sort_merge_rows`]), so the line read is the failed one.
+#[tokio::test]
+async fn retry_keeps_sort_merge_when_the_descriptor_budget_is_short() {
+    let refusal = Refusal {
+        tenths: 7,
+        nofile_soft: Some(1),
+    };
+    let (_, run, log) = refused_run(RETRY_TIES_SQL, refusal).await;
+    if let Ok(run) = run {
+        let report = run.report.expect("the retry reports");
+        assert_eq!(report.retry_plan_reason, Some("descriptor_budget"));
+        let plan = run.plan.expect("the retry's plan");
+        assert!(bucketed_lines(&plan).is_empty(), "{plan}");
+    }
+    assert_eq!(retry_info_field(&log, "retry_plan"), "sort_merge");
+    assert_eq!(
+        retry_info_field(&log, "retry_plan_reason"),
+        "descriptor_budget"
+    );
+    assert_eq!(
+        (
+            retry_info_field(&log, "bits"),
+            retry_info_field(&log, "routed_chunk_rows")
+        ),
+        ("none".to_string(), "none".to_string())
+    );
+}
+
+/// A string-keyed final aggregate, which the bucketed rule does not admit,
+/// keeps today's sort-merge retry, and the INFO line says `not_admitted`.
+#[tokio::test]
+async fn retry_keeps_sort_merge_for_unadmitted_shape() {
+    let refusal = Refusal {
+        tenths: 9,
+        nofile_soft: None,
+    };
+    let (unlimited, run, log) = answered_retry(RETRY_STRING_SQL, refusal).await;
+    let report = run.report.expect("the retry reports");
+    assert_eq!(
+        (report.retry_plan, report.retry_plan_reason),
+        ("sort_merge", Some("not_admitted"))
+    );
+    assert_eq!(retry_info_field(&log, "retry_plan"), "sort_merge");
+    assert_eq!(retry_info_field(&log, "retry_plan_reason"), "not_admitted");
+    let plan = run.plan.expect("the retry's plan");
+    assert!(bucketed_lines(&plan).is_empty(), "{plan}");
+    assert!(!plan.contains("RepartitionExec"), "{plan}");
+    assert_eq!(run.rows, unlimited.rows);
+}
+
+/// A candidate plan whose hash exchange preserves order is not kept: the
+/// bucketed exec's input order is not the one the plan above it was built
+/// on. The same plan with its exchange as planned is kept.
+///
+/// Prove-the-test: drop the `preserve_order` check from
+/// `bucket_retry_tuning` and the tampered plan derives a tuning.
+#[tokio::test]
+async fn retry_refuses_an_order_preserving_exchange() {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
+    use datafusion::physical_plan::Partitioning;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    let on = executor(
+        ROWS,
+        sql_config(RETRY_PARTITIONS, Some(bucketed(ENGAGE_GROUPS)), None),
+    )
+    .await;
+    let plan = physical_plan_tree(&on, "SELECT a, count(*) AS c FROM logs GROUP BY a").await;
+    let figures = ravel_sql::BucketRetryFigures {
+        asked_bytes: 1 << 20,
+        consumed_rows: Some(ROWS as u64),
+        query_limit: ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+        nofile_soft: ravel_sql::DEFAULT_NOFILE_SOFT,
+        slots: 1,
+    };
+    ravel_sql::bucket_retry_tuning(&plan, figures).unwrap_or_else(|reason| {
+        panic!(
+            "the planned exchange is kept, got {reason}:\n{}",
+            displayable(plan.as_ref()).indent(true)
+        )
+    });
+
+    let tampered = Arc::clone(&plan)
+        .transform_up(|node| {
+            let Some(exchange) = node.downcast_ref::<RepartitionExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            let partitioning = exchange.partitioning().clone();
+            if !matches!(partitioning, Partitioning::Hash(..)) {
+                return Ok(Transformed::no(node));
+            }
+            let input = Arc::clone(exchange.input());
+            let ordering =
+                LexOrdering::new([PhysicalSortExpr::new_default(col("a", &input.schema())?)])
+                    .expect("one sort key");
+            let spread = Arc::new(RepartitionExec::try_new(
+                input,
+                Partitioning::RoundRobinBatch(RETRY_PARTITIONS),
+            )?);
+            let sorted = Arc::new(SortExec::new(ordering, spread).with_preserve_partitioning(true));
+            let ordered = RepartitionExec::try_new(sorted, partitioning)?.with_preserve_order();
+            assert!(ordered.preserve_order(), "the exchange preserves order");
+            Ok(Transformed::yes(Arc::new(ordered) as Arc<dyn ExecutionPlan>))
+        })
+        .expect("the plan rewrites")
+        .data;
+    assert_eq!(
+        ravel_sql::bucket_retry_tuning(&tampered, figures),
+        Err(ravel_sql::RETRY_ORDER_PRESERVING_EXCHANGE),
+        "{}",
+        displayable(tampered.as_ref()).indent(true)
+    );
+}

@@ -2335,10 +2335,10 @@ const SHARE_SQL: &str =
 
 /// A `tracing` writer that appends every emitted byte to a shared buffer.
 #[derive(Clone, Default)]
-struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+pub(crate) struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl CapturedLog {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().expect("log buffer lock")).into_owned()
     }
 }
