@@ -354,21 +354,35 @@ the compaction misses that writer's later-published object.
 ### Two-level merge scratch
 
 A logs bucket with many inputs can need the two-level RLOG merge, which writes level-1 runs to a local scratch directory. Both commands take the
-same three flags as `ravel-server`'s `--maintain-scratch-*` flags. For sizing,
-see [Compaction scratch](configuration.md#compaction-scratch).
+same three flags as `ravel-server`'s `--maintain-scratch-*` flags, plus two
+level-2 and run settings the server has no flag for. For sizing, see
+[Compaction scratch](configuration.md#compaction-scratch).
 
 | Flag | Meaning |
 |---|---|
 | `--scratch-dir <path>` | Directory the level-1 runs go under. It is a cache: nothing durable is read from it, and each unit's subdirectory is wiped when the unit ends. The first two-level merge locks `ravel-scratch.lock` in it and removes the unit subdirectories a dead process left; other files are kept and count against `--scratch-max-bytes`. A directory another process holds is refused as `ScratchLocked`; a unit is admitted only when about 1.3 times its input bytes is free, and is otherwise refused as `ScratchHeadroom`. `compact-tenant` merges `--bucket-concurrency` buckets through the one directory at once, so size it there at about 1.3 times the summed input bytes of that many of the largest buckets. Omitted, a bucket whose cursor merge would decode more than 16 rows per input record is refused as `GeometryUnsupported`. |
 | `--scratch-max-bytes <n>` | Cap on the bytes the directory may hold. A unit is admitted against the smaller of the volume's free bytes and the cap less the bytes already there. Omitted, the volume's free bytes alone decide. |
-| `--level1-workers <n>` | Level-1 groups of one bucket merged at once, each under its share of the unit's memory ceiling. Omitted, it is derived per bucket from the bucket's share of the usable cores and the largest count whose groups still fit. The share is the usable cores divided by `compact-tenant`'s `--bucket-concurrency` (1 for `compact-bucket`), at least 1, so 8 buckets at once on 16 cores derive their workers from 2 cores each. |
+| `--level1-workers <n>` | Level-1 groups of one bucket merged at once, each under its share of the unit's memory ceiling. Omitted, it is derived per bucket, jointly with the level-2 count, from the bucket's share of the usable cores. The share is the usable cores divided by `compact-tenant`'s `--bucket-concurrency` (1 for `compact-bucket`), at least 1, so 8 buckets at once on 16 cores derive their workers from 2 cores each. |
+| `--level2-workers <n>` | Level-2 range workers of one bucket: the merged stream order is cut into ranges, each closed at the first stream end at which it holds 2,500,000 records (the last may hold fewer), and each worker merges its own contiguous share of them into its own parts. Omitted, it is derived jointly with `--level1-workers`. Never more workers run than the bucket has ranges, and a count whose level-2 read side does not fit the unit's memory ceiling is refused. The count does not change where parts are cut. |
+| `--run-block-records <n>` | Records per block of a level-1 run, 1,024 by default. It changes the runs' blocks, and so what level 2 reads and holds per run. |
 
-A zero value, or `--scratch-max-bytes` or `--level1-workers` without
-`--scratch-dir`, is refused before any store request. A bucket that went
-through the two-level merge adds a `two_level: level1_groups=<n>
-level1_workers=<n>` line after `outcome: Compacted` in the `compact-bucket`
-report; `compact-tenant` appends the same two figures to that bucket's line.
-A refused bucket's outcome names the reason.
+By default `W1` (level-1 workers) and `W2` (level-2 workers) are derived
+together: of the level-1 counts up to the bucket's core share, the one whose
+pair scores the smallest `1/W1 + 1/W2` is kept, ties to the smaller `W1`.
+Leave both flags unset in normal operation. Set
+`--level1-workers` or `--level2-workers` to pin a count for a measurement or
+to compare runs, and `--run-block-records` only to measure level 2's read
+cost against the run block size.
+
+A zero value, or `--scratch-max-bytes`, `--level1-workers`,
+`--level2-workers` or `--run-block-records` without `--scratch-dir`, is
+refused before any store request. A bucket that went through the two-level
+merge adds a `two_level: level1_groups=<n> level1_workers=<n>
+level2_workers=<n> level2_ranges=<n>` line after `outcome: Compacted` in the
+`compact-bucket` report; `compact-tenant` appends the same four figures to
+that bucket's line. The worker counts are the ones the merge ran with, after
+any cap, not the flags' values, and `level2_ranges` is the number of ranges
+level 2 cut. A refused bucket's outcome names the reason.
 
 ### L1 segment size
 

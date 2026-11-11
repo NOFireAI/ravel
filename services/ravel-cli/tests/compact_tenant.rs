@@ -3082,6 +3082,9 @@ async fn compact_bucket_routes_a_many_input_bucket_through_the_two_level_merge()
             scratch_dir: Some(scratch.path().to_path_buf()),
             scratch_max_bytes: None,
             level1_workers: Some(1),
+            level2_workers: None,
+            run_block_records: None,
+            range_records: None,
             merge_resident_ceiling_bytes: Some(two_level_ceiling()),
             geometry_floor_decoded_rows: Some(0),
         },
@@ -3089,7 +3092,7 @@ async fn compact_bucket_routes_a_many_input_bucket_through_the_two_level_merge()
     .await
     .expect("compact-bucket exits zero");
     assert!(
-        text.contains("\noutcome: Compacted\ntwo_level: level1_groups=5 level1_workers=1\n"),
+        text.contains("\noutcome: Compacted\ntwo_level: level1_groups=5 level1_workers=1 level2_workers=1 level2_ranges=1\n"),
         "{text}"
     );
     assert!(text.contains("\npublish: Published\n"), "{text}");
@@ -3142,6 +3145,9 @@ async fn compact_tenant_with_scratch_dir_compacts_the_two_level_bucket() {
             scratch_dir: Some(scratch.path().to_path_buf()),
             scratch_max_bytes: None,
             level1_workers: Some(1),
+            level2_workers: None,
+            run_block_records: None,
+            range_records: None,
             merge_resident_ceiling_bytes: None,
             geometry_floor_decoded_rows: Some(0),
         },
@@ -3155,7 +3161,7 @@ async fn compact_tenant_with_scratch_dir_compacts_the_two_level_bucket() {
         .expect("the bucket's line");
     assert!(
         line.contains(" outcome=Compacted ")
-            && line.ends_with(" publish=Published level1_groups=5 level1_workers=1"),
+            && line.ends_with(" publish=Published level1_groups=5 level1_workers=1 level2_workers=1 level2_ranges=1"),
         "{text}"
     );
     assert_eq!(report.compacted, 1);
@@ -3166,8 +3172,191 @@ async fn compact_tenant_with_scratch_dir_compacts_the_two_level_bucket() {
     );
 }
 
-/// A zero `--scratch-max-bytes` or `--level1-workers`, and either without
-/// `--scratch-dir`, is refused with the typed error before any store request.
+/// The range quantum the range-worker tests cut the two-level fixture at: its
+/// 20 streams hold 6,000 records each, so a range closes after every fifth
+/// stream and the 120,000 records make 4 ranges.
+const TWO_LEVEL_RANGE_RECORDS: u64 = 30_000;
+const TWO_LEVEL_RANGES: u64 = 4;
+const _: () = assert!(TWO_LEVEL_RANGES > 1);
+
+/// `maintain compact-tenant` over the two-level fixture at `--bucket-concurrency
+/// 60`, one level-1 worker, `--range-records` [`TWO_LEVEL_RANGE_RECORDS`] and
+/// `level2_workers`, on a fresh store. Returns the store, the bucket's line,
+/// the input writer ids and the scratch directory.
+async fn compact_tenant_on_range_workers(
+    level2_workers: usize,
+) -> (
+    Arc<MemoryStore>,
+    String,
+    BTreeSet<String>,
+    tempfile::TempDir,
+) {
+    let mem = Arc::new(MemoryStore::new());
+    let writers = seed_two_level_bucket(mem.as_ref()).await;
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let mut out: Vec<u8> = Vec::new();
+    let report = compact_tenant_to(
+        &mut out,
+        mem.clone(),
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(1),
+        Some(HOUR_OLD),
+        Some(HOUR_OLD),
+        false,
+        None,
+        Some(TWO_LEVEL_PART_TARGET),
+        None,
+        None,
+        TWO_LEVEL_UNITS as usize,
+        None,
+        Some(TWO_LEVEL_HOST_MEMORY),
+        now_ns(),
+        &ClaimOptions::fresh(),
+        &ScratchOptions {
+            scratch_dir: Some(scratch.path().to_path_buf()),
+            level1_workers: Some(1),
+            level2_workers: Some(level2_workers),
+            range_records: Some(TWO_LEVEL_RANGE_RECORDS),
+            geometry_floor_decoded_rows: Some(0),
+            ..ScratchOptions::default()
+        },
+    )
+    .await
+    .expect("compact-tenant exits zero");
+    let text = String::from_utf8(out).expect("utf-8");
+    assert_eq!(report.compacted, 1, "{text}");
+    let line = text
+        .lines()
+        .find(|line| line.starts_with(&format!("shard={TWO_LEVEL_SHARD} hour={HOUR_OLD} ")))
+        .expect("the bucket's line")
+        .to_string();
+    (mem, line, writers, scratch)
+}
+
+/// The two-level bucket's compaction records and their part keys,
+/// reconstructed from each record.
+async fn two_level_records(
+    store: &dyn ObjectStoreBackend,
+) -> Vec<(ravel_proto::commit::v1::CompactionRecord, Vec<String>)> {
+    let bucket =
+        ravel_maintain::Bucket::new(tenant_hash(), Signal::Logs, TWO_LEVEL_SHARD, HOUR_OLD);
+    let listing = ravel_maintain::read::list_bucket(store, &bucket)
+        .await
+        .expect("list bucket");
+    let mut records = Vec::new();
+    for key in listing.compaction_record_keys {
+        let got = store.get(&key, GetRange::Full).await.expect("get record");
+        let rec = record::decode_compaction(&got.data).expect("decode record");
+        let part_keys = rec
+            .parts
+            .iter()
+            .map(|part| keys::reconstruct_l1_part_key(&rec, part).expect("part key"))
+            .collect();
+        records.push((rec, part_keys));
+    }
+    records
+}
+
+/// ADR-3853 phase B through the shipping entry point, `maintain
+/// compact-tenant`: `--level2-workers 2` reaches the merge, level 2 cuts the
+/// fixture into 4 ranges at `--range-records 30000`, and the bucket's line
+/// names the workers and ranges the merge ran with. The one compaction record
+/// names every input, every part it lists is on the store, the part indexes
+/// come from the ranges' proportional windows (not `0, 1, 2, ...`), and the
+/// scratch directory holds no unit subdirectory afterwards.
+///
+/// Distinguishing: with `build_compactor_config` dropping
+/// `scratch.level2_workers`, the derived count (1 at a core share of 1) is on
+/// the line and the `ends_with` assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compact_bucket_runs_level_2_on_range_workers() {
+    let (mem, line, writers, scratch) = compact_tenant_on_range_workers(2).await;
+    assert!(line.contains(" outcome=Compacted "), "{line}");
+    assert!(
+        line.ends_with(&format!(
+            " publish=Published level1_groups=5 level1_workers=1 level2_workers=2 \
+             level2_ranges={TWO_LEVEL_RANGES}"
+        )),
+        "{line}"
+    );
+
+    let records = two_level_records(mem.as_ref()).await;
+    assert_eq!(records.len(), 1);
+    let (rec, part_keys) = &records[0];
+    let inputs: BTreeSet<String> = rec
+        .inputs
+        .iter()
+        .map(|input| input.writer_id.clone())
+        .collect();
+    assert_eq!(inputs, writers);
+    assert!(!part_keys.is_empty());
+    for key in part_keys {
+        mem.head(key)
+            .await
+            .expect("every part the record lists is on the store");
+    }
+    let indexes: Vec<u32> = rec.parts.iter().map(|part| part.part_index).collect();
+    assert!(
+        indexes.windows(2).any(|pair| pair[1] > pair[0] + 1),
+        "part indexes come from the ranges' windows, not a contiguous run: {indexes:?}"
+    );
+    assert_eq!(
+        scratch_entries(scratch.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// The range cut does not depend on the worker count: the fixture at
+/// `--level2-workers 1` publishes the same part keys, so the same bytes, as at
+/// 2.
+///
+/// Distinguishing: with the two runs on different `--range-records` the part
+/// key sets differ and the `assert_eq!` fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compact_tenant_range_workers_publish_the_same_parts_at_any_worker_count() {
+    let (one, line_one, _, _scratch_one) = compact_tenant_on_range_workers(1).await;
+    let (two, line_two, _, _scratch_two) = compact_tenant_on_range_workers(2).await;
+    assert!(
+        line_one.ends_with(&format!(
+            " level2_workers=1 level2_ranges={TWO_LEVEL_RANGES}"
+        )),
+        "{line_one}"
+    );
+    assert!(
+        line_two.ends_with(&format!(
+            " level2_workers=2 level2_ranges={TWO_LEVEL_RANGES}"
+        )),
+        "{line_two}"
+    );
+    let keys_one = two_level_records(one.as_ref()).await;
+    let keys_two = two_level_records(two.as_ref()).await;
+    assert_eq!(keys_one.len(), 1);
+    assert_eq!(keys_one[0].1, keys_two[0].1);
+}
+
+/// The line reports the level-2 workers the merge ran with, not the flag: a
+/// `--level2-workers` above the range count is capped at the range count.
+///
+/// Distinguishing: with `two_level_figures` printing the configured count
+/// instead of the ledger's, the line reads `level2_workers=8` and the
+/// assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compact_tenant_reports_the_capped_level2_worker_count() {
+    let (_, line, _, _scratch) = compact_tenant_on_range_workers(8).await;
+    assert!(
+        line.ends_with(&format!(
+            " level2_workers={TWO_LEVEL_RANGES} level2_ranges={TWO_LEVEL_RANGES}"
+        )),
+        "{line}"
+    );
+}
+
+/// A zero `--scratch-max-bytes`, `--level1-workers`, `--level2-workers`,
+/// `--run-block-records` or `--range-records`, and any of the first four
+/// without `--scratch-dir`, is refused with the typed error before any store
+/// request.
 ///
 /// Distinguishing: without the `ScratchOptions::validate` call in
 /// `build_compactor_config` each case runs on and the `expect_err` fails.
@@ -3204,6 +3393,43 @@ async fn invalid_scratch_options_are_refused_before_any_store_request() {
                 ..ScratchOptions::default()
             },
             CompactorKnobError::ZeroLevel1Workers,
+        ),
+        (
+            ScratchOptions {
+                level2_workers: Some(2),
+                ..ScratchOptions::default()
+            },
+            CompactorKnobError::Level2WorkersWithoutDir,
+        ),
+        (
+            ScratchOptions {
+                run_block_records: Some(1024),
+                ..ScratchOptions::default()
+            },
+            CompactorKnobError::RunBlockRecordsWithoutDir,
+        ),
+        (
+            ScratchOptions {
+                scratch_dir: dir.clone(),
+                level2_workers: Some(0),
+                ..ScratchOptions::default()
+            },
+            CompactorKnobError::ZeroLevel2Workers,
+        ),
+        (
+            ScratchOptions {
+                scratch_dir: dir.clone(),
+                run_block_records: Some(0),
+                ..ScratchOptions::default()
+            },
+            CompactorKnobError::ZeroRunBlockRecords,
+        ),
+        (
+            ScratchOptions {
+                range_records: Some(0),
+                ..ScratchOptions::default()
+            },
+            CompactorKnobError::ZeroRangeRecords,
         ),
     ] {
         let store = CountingStore::new(Arc::new(MemoryStore::new()));
@@ -3254,7 +3480,7 @@ async fn invalid_scratch_options_are_refused_before_any_store_request() {
 /// ravel-server's wording, as a failed run.
 #[test]
 fn compaction_binary_refuses_invalid_scratch_flags() {
-    let cases: [(&[&str], &str); 4] = [
+    let cases: [(&[&str], &str); 9] = [
         (
             &["--scratch-max-bytes", "1073741824"],
             "--scratch-max-bytes has no effect without --scratch-dir",
@@ -3280,6 +3506,36 @@ fn compaction_binary_refuses_invalid_scratch_flags() {
                 "0",
             ],
             "--level1-workers must be greater than 0",
+        ),
+        (
+            &["--level2-workers", "2"],
+            "--level2-workers has no effect without --scratch-dir",
+        ),
+        (
+            &["--run-block-records", "1024"],
+            "--run-block-records has no effect without --scratch-dir",
+        ),
+        (
+            &[
+                "--scratch-dir",
+                "/nonexistent/scratch",
+                "--level2-workers",
+                "0",
+            ],
+            "--level2-workers must be greater than 0",
+        ),
+        (
+            &[
+                "--scratch-dir",
+                "/nonexistent/scratch",
+                "--run-block-records",
+                "0",
+            ],
+            "--run-block-records must be greater than 0",
+        ),
+        (
+            &["--range-records", "0"],
+            "--range-records must be greater than 0",
         ),
     ];
     let commands: [&[&str]; 2] = [
