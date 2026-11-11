@@ -155,7 +155,8 @@ pub enum TwoLevelCheck {
         in_flight_bytes: u64,
         /// The final parts' memory split target.
         part_target_bytes: u64,
-        /// The resident ceiling `U`.
+        /// The ceiling one level-2 worker plans under: the resident ceiling
+        /// `U`, or `U / W2` with the level-2 worker count configured.
         ceiling_bytes: u64,
     },
     /// A level-2 range needs a part index outside its slots (ADR-3853 D5
