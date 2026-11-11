@@ -156,6 +156,10 @@ use crate::access_intent::{
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
 use crate::bounded_topk;
+use crate::bucket_spill_tuning::{
+    BucketRetryFigures, BucketSpillTuning, bucket_retry_tuning, spill_slots,
+    with_bucket_spill_tuning,
+};
 use crate::bucketed_final_aggregate::{BucketSpillFigures, bucket_spill_figures};
 use crate::clock::SystemClock;
 use crate::config::SqlConfig;
@@ -168,6 +172,7 @@ use crate::logs_pushdown::{extract_logs, prune_is_rewrite_neutral};
 use crate::logs_scan::ScanExecutions;
 use crate::memory::{
     BudgetShare, CeilingBreach, MemoryRefusal, TenantDelegatingPool, TenantMemoryAccountant,
+    install_aggregate_profile,
 };
 use crate::min_commit_token::MinCommitToken;
 use crate::output::QueryOutput;
@@ -180,7 +185,7 @@ use crate::pushdown::extract;
 use crate::scan_budget::EnforcedBudgets;
 use crate::session::{
     LOGS_TABLE, REWRITE_ONLY_AGGREGATES, SAMPLES_TABLE, SessionTable, SpillDecision,
-    build_session_with_tables,
+    build_bucket_retry_session, build_session_with_tables,
 };
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_provider::SpansTableProvider;
@@ -733,6 +738,33 @@ struct PlanExtras {
     /// [`SpillAttempt::Retry`]; `None` for every other attempt. A retry
     /// planned without one is an internal error.
     spill_share: Option<SpillReservation>,
+    /// The refused first attempt's figures a [`SpillAttempt::Retry`] derives
+    /// its bucket tuning from; `None` on every other plan, and on a retry
+    /// with no first attempt behind it.
+    retry_figures: Option<RetryFigures>,
+}
+
+/// What a refused first attempt measured that the bucket retry's tuning
+/// reads (ADR-3565 amendment 2, item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryFigures {
+    /// `A`: the pool's peak asked bytes at the refusal.
+    asked_bytes: u64,
+    /// `n`: the logs scans' consumed input rows at the refusal; `None` when
+    /// the plan had no logs scan or the attempt failed before it started.
+    consumed_rows: Option<u64>,
+}
+
+/// The plan a spill retry runs and why (ADR-0954, parallel bucket spill
+/// item 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPlan {
+    /// The hash exchange and a bucketed final aggregate at the derived
+    /// tuning.
+    Bucket(BucketSpillTuning),
+    /// The repartition-free sort-merge retry, with the condition that kept
+    /// it.
+    SortMerge(&'static str),
 }
 
 /// Which spill decision a plan takes (issue #3899).
@@ -1014,6 +1046,10 @@ pub struct SqlStats {
     pub spill_retries: u32,
     /// What the spill retry saw and did, present when one ran and answered.
     pub spill_retry: Option<SpillRetryReport>,
+    /// The plan the answering spill retry drained, rendered as `EXPLAIN`
+    /// renders it, beside [`Self::spill_retry`]: the exchange and every
+    /// bucketed exec with the tuning it ran at.
+    pub spill_retry_plan: Option<String>,
     /// The row filter [`SqlRequest::row_window`] applied above each scan, as
     /// the display of the [`Expr`] that was actually planted
     /// ([`window_filter_expr`]) rather than a separately formatted description
@@ -2058,6 +2094,10 @@ pub struct SqlExecutor {
     /// reads `available_parallelism`; a test sets it with
     /// [`Self::with_envelope_parallelism`].
     envelope_parallelism: Option<NonZeroUsize>,
+    /// The soft `RLIMIT_NOFILE` the bucket retry's descriptor budget is read
+    /// from. [`crate::DEFAULT_NOFILE_SOFT`] until the server installs the one
+    /// it read at start with [`Self::with_nofile_soft`].
+    nofile_soft: u64,
     /// Replaces the plan a pinned statement executes after the tie-order
     /// rewrite, so a test can make it diverge from the classification plan.
     #[cfg(test)]
@@ -2119,6 +2159,7 @@ impl SqlExecutor {
             scan_executions: Arc::new(ScanExecutions::new()),
             ipcrypt: IpcryptDeployment::default(),
             envelope_parallelism: None,
+            nofile_soft: crate::DEFAULT_NOFILE_SOFT,
             #[cfg(test)]
             executed_plan_tamper: None,
             #[cfg(test)]
@@ -2155,6 +2196,19 @@ impl SqlExecutor {
     pub fn with_envelope_parallelism(mut self, parallelism: NonZeroUsize) -> Self {
         self.envelope_parallelism = Some(parallelism);
         self
+    }
+
+    /// Install the soft `RLIMIT_NOFILE` the process read once at start, which
+    /// bounds the descriptors a bucket retry may hold open (ADR-0954, parallel
+    /// bucket spill item 1).
+    pub fn with_nofile_soft(mut self, nofile_soft: u64) -> Self {
+        self.nofile_soft = nofile_soft;
+        self
+    }
+
+    /// The soft `RLIMIT_NOFILE` [`Self::with_nofile_soft`] installed.
+    pub fn nofile_soft(&self) -> u64 {
+        self.nofile_soft
     }
 
     /// Install the deployment's ipcrypt setting (ADR-2993 decision 6): the
@@ -2686,6 +2740,7 @@ impl SqlExecutor {
                     // only after that plan's memory refusal.
                     spill: SpillAttempt::First,
                     spill_share: None,
+                    retry_figures: None,
                 },
             )
             .await?;
@@ -2893,6 +2948,7 @@ impl SqlExecutor {
                     lane_parts,
                     spill_attempt,
                     spill_share,
+                    spill_retry.map(|first| first.figures),
                 )
                 .await;
             stats.batches_emitted += emitted;
@@ -2951,12 +3007,14 @@ impl SqlExecutor {
                         let report = first.report(
                             spill,
                             &spill_by_operator,
+                            caps.retry_plan,
                             caps.bucket_spill,
                             caps.pool,
                             caps.spill_share,
                         );
                         report.emit(&statement_fingerprint(statement), "answered");
                         stats.spill_retry = Some(report);
+                        stats.spill_retry_plan = caps.retry_plan_text;
                     }
                     return Ok(SqlOutcome {
                         output,
@@ -3064,6 +3122,10 @@ impl SqlExecutor {
                                         spill_retry = Some(FirstRefusal {
                                             class: first_refusal_class(&err, caps.pool),
                                             after: pass_started.elapsed(),
+                                            figures: RetryFigures {
+                                                asked_bytes: caps.peak_asked_bytes,
+                                                consumed_rows: caps.rows_consumed,
+                                            },
                                         });
                                         continue;
                                     }
@@ -3090,6 +3152,7 @@ impl SqlExecutor {
                             .report(
                                 spill,
                                 &spill_by_operator,
+                                caps.retry_plan,
                                 caps.bucket_spill,
                                 caps.pool,
                                 caps.spill_share,
@@ -3462,6 +3525,7 @@ impl SqlExecutor {
                 // retry does not apply here (issue #3899 follow-up T6).
                 spill: SpillAttempt::PlanTime,
                 spill_share: None,
+                retry_figures: None,
             },
         )
         .await
@@ -3933,6 +3997,13 @@ impl SqlExecutor {
                 .map(clone_session_table)
                 .collect::<Vec<_>>()
         });
+        // The bucket retry's candidate session registers the same tables.
+        let bucket_tables = (spill_enabled && extras.spill == SpillAttempt::Retry).then(|| {
+            session_tables
+                .iter()
+                .map(clone_session_table)
+                .collect::<Vec<_>>()
+        });
         // The memory pool's peak-reservation report is execution-time
         // aggregate/sort spend, not a store request, so it has no Resolve/
         // Plan/Probe phase home; it is charged to Scan, matching where the
@@ -4057,6 +4128,48 @@ impl SqlExecutor {
         };
         let schema = frame.schema().inner().clone();
         let spill_share = scratch.as_ref().map(|(_, cap)| *cap);
+        // ADR-0954, parallel bucket spill item 1: a spill retry plans the hash
+        // exchange and a bucketed final aggregate when its shape admits one
+        // and the derivation tunes it, and keeps the repartition-free plan
+        // above otherwise. The candidate's placeholder plan never executes.
+        let mut physical = None;
+        let retry_plan = match (extras.spill, bucket_tables, &scratch) {
+            (SpillAttempt::Retry, Some(tables), Some((retry_scratch, cap))) => {
+                let decision = SpillDecision::Enabled {
+                    dir: retry_scratch.dir(),
+                    max_bytes: *cap,
+                };
+                let figures = BucketRetryFigures {
+                    asked_bytes: extras.retry_figures.map_or(0, |first| first.asked_bytes),
+                    consumed_rows: extras.retry_figures.and_then(|first| first.consumed_rows),
+                    query_limit: config.max_query_bytes,
+                    nofile_soft: self.nofile_soft,
+                    slots: spill_slots(spill_config.map_or(0, |spill| spill.max_bytes)),
+                };
+                match bucket_retry_plan(
+                    config,
+                    &pool,
+                    tables,
+                    exact_typed_aggregates,
+                    decision,
+                    &principal,
+                    frame.logical_plan(),
+                    figures,
+                )
+                .await
+                {
+                    Ok((candidate, plan, tuning)) => {
+                        frame = DataFrame::new(candidate.state(), frame.logical_plan().clone());
+                        ctx = candidate;
+                        physical = Some(plan);
+                        Some(RetryPlan::Bucket(tuning))
+                    }
+                    Err(reason) => Some(RetryPlan::SortMerge(reason)),
+                }
+            }
+            (SpillAttempt::Retry, ..) => Some(RetryPlan::SortMerge(RETRY_SPILL_DISABLED)),
+            (SpillAttempt::PlanTime | SpillAttempt::First, ..) => None,
+        };
         Ok(PinnedQuery {
             ctx,
             frame,
@@ -4067,6 +4180,8 @@ impl SqlExecutor {
             window_predicate,
             spill_probe,
             spill_share,
+            physical,
+            retry_plan,
         })
     }
 
@@ -5582,6 +5697,7 @@ impl SqlExecutor {
         lane_parts: LaneParts,
         spill_attempt: SpillAttempt,
         spill_share: Option<SpillReservation>,
+        retry_figures: Option<RetryFigures>,
     ) -> (
         Result<QueryOutput, SqlError>,
         usize,
@@ -5612,6 +5728,7 @@ impl SqlExecutor {
                     lane_parts,
                     spill: spill_attempt,
                     spill_share,
+                    retry_figures,
                 },
             )
             .await
@@ -5637,6 +5754,7 @@ impl SqlExecutor {
         let mut planned = planned;
         let spill_probe = planned.spill_probe.take();
         let spill_share = planned.spill_share;
+        let retry_plan = planned.retry_plan;
         // The spill retry reads the pool's refusal record after a failure,
         // which can come before a stream exists to read it from.
         let pool = Arc::clone(&planned.ctx.runtime_env().memory_pool);
@@ -5660,6 +5778,9 @@ impl SqlExecutor {
                         spill_probe,
                         spill_share,
                         bucket_spill: None,
+                        rows_consumed: None,
+                        retry_plan,
+                        retry_plan_text: None,
                     },
                 );
             }
@@ -5701,6 +5822,9 @@ impl SqlExecutor {
                             spill_probe,
                             spill_share,
                             bucket_spill: stream.bucket_spill(),
+                            rows_consumed: stream.rows_consumed(),
+                            retry_plan,
+                            retry_plan_text: None,
                         },
                     );
                 }
@@ -5727,6 +5851,9 @@ impl SqlExecutor {
                 spill_probe,
                 spill_share,
                 bucket_spill: stream.bucket_spill(),
+                rows_consumed: stream.rows_consumed(),
+                retry_plan,
+                retry_plan_text: retry_plan.map(|_| stream.plan_text()),
             },
         )
     }
@@ -5786,6 +5913,58 @@ fn spill_tie_ordered(plan: LogicalPlan, max_limit: Option<usize>) -> LogicalPlan
     } else {
         plan
     }
+}
+
+/// A sort-merge retry's reason when it runs without a scratch area: no share
+/// remained, or its plan is not spill-eligible.
+const RETRY_SPILL_DISABLED: &str = "spill_disabled";
+
+/// A sort-merge retry's reason when the bucket candidate could not be built.
+const RETRY_BUCKET_PLAN_FAILED: &str = "bucket_plan_failed";
+
+/// A spill retry's reason when it failed before choosing a plan.
+const RETRY_NOT_PLANNED: &str = "not_planned";
+
+/// Plan the bucket retry's candidate over `logical` in a session built by
+/// [`build_bucket_retry_session`], decide whether to keep it
+/// ([`bucket_retry_tuning`]), and set the derived tuning on its bucketed
+/// execs. The error is the reason the retry keeps its sort-merge plan.
+#[allow(clippy::too_many_arguments)]
+async fn bucket_retry_plan(
+    config: &SqlConfig,
+    pool: &Arc<dyn MemoryPool>,
+    tables: Vec<SessionTable>,
+    exact_typed_aggregates: bool,
+    decision: SpillDecision<'_>,
+    principal: &SessionPrincipal,
+    logical: &LogicalPlan,
+    figures: BucketRetryFigures,
+) -> Result<(SessionContext, Arc<dyn ExecutionPlan>, BucketSpillTuning), &'static str> {
+    let failed = |err: DataFusionError| {
+        tracing::warn!(
+            error = %err,
+            "SQL spill retry kept its sort-merge plan: the bucket candidate did not plan"
+        );
+        RETRY_BUCKET_PLAN_FAILED
+    };
+    let candidate = build_bucket_retry_session(
+        config,
+        Arc::clone(pool),
+        tables,
+        exact_typed_aggregates,
+        decision,
+        principal,
+    )
+    .map_err(failed)?;
+    let placeholder = candidate
+        .state()
+        .create_physical_plan(logical)
+        .await
+        .map_err(failed)?;
+    let tuning = bucket_retry_tuning(&placeholder, figures)?;
+    let plan = with_bucket_spill_tuning(placeholder, tuning).map_err(failed)?;
+    install_aggregate_profile(&plan, pool);
+    Ok((candidate, plan, tuning))
 }
 
 /// The memory pool a plan's session gets. A spill retry whose session gets
@@ -5875,6 +6054,13 @@ struct AttemptCaps {
     /// The plan's spilling bucketed execs, read on both paths like the
     /// spill counters.
     bucket_spill: Option<BucketSpillFigures>,
+    /// The plan's logs scans' consumed input rows when the attempt ended,
+    /// `None` when it had no logs scan or no stream.
+    rows_consumed: Option<u64>,
+    /// [`PinnedQuery::retry_plan`].
+    retry_plan: Option<RetryPlan>,
+    /// The plan a spill retry drained, for [`SqlStats::spill_retry_plan`].
+    retry_plan_text: Option<String>,
 }
 
 /// The refusal that earned a statement its spill retry.
@@ -5882,14 +6068,17 @@ struct AttemptCaps {
 struct FirstRefusal {
     class: &'static str,
     after: Duration,
+    figures: RetryFigures,
 }
 
 impl FirstRefusal {
-    /// This refusal beside what the retry it earned did.
+    /// This refusal beside what the retry it earned did. `plan` is the plan
+    /// the retry chose, `None` when it failed before choosing one.
     fn report(
         self,
         spill: SpillCounts,
         by_operator: &[OperatorSpill],
+        plan: Option<RetryPlan>,
         bucket: Option<BucketSpillFigures>,
         pool: PoolReport,
         share: Option<u64>,
@@ -5908,16 +6097,18 @@ impl FirstRefusal {
         };
         let (exchange_files, exchange_bytes, _) = of("RepartitionExec");
         let (_, bucket_bytes, bucket_rows) = of("BucketedFinalAggregateExec");
+        let plan = plan.unwrap_or(RetryPlan::SortMerge(RETRY_NOT_PLANNED));
+        let (retry_plan, retry_plan_reason, tuning) = match plan {
+            RetryPlan::Bucket(tuning) => ("bucket", None, Some(tuning)),
+            RetryPlan::SortMerge(reason) => ("sort_merge", Some(reason), None),
+        };
         SpillRetryReport {
             first_refusal: self.class,
             first_refusal_after: self.after,
-            retry_plan: if bucket.is_some() {
-                "bucket"
-            } else {
-                "sort_merge"
-            },
-            bits: bucket.map(|bucket| bucket.bits),
-            routed_chunk_rows: bucket.map(|bucket| bucket.routed_chunk_rows),
+            retry_plan,
+            retry_plan_reason,
+            bits: tuning.map(|tuning| tuning.bits),
+            routed_chunk_rows: tuning.map(|tuning| tuning.routed_chunk_rows),
             spill_bytes_written: spill.bytes_written,
             spill_bytes_read: spill.bytes_read,
             spill_files: spill.files,
@@ -5944,12 +6135,20 @@ pub struct SpillRetryReport {
     /// Wall time from the start of the refused attempt to its refusal,
     /// resolve included.
     pub first_refusal_after: Duration,
-    /// The retry's plan: `bucket` when a bucketed final aggregate ran in it
-    /// with spill on, `sort_merge` otherwise.
+    /// The retry's plan: `bucket` when it planned the hash exchange and a
+    /// bucketed final aggregate at the derived tuning, `sort_merge` when it
+    /// kept the repartition-free plan.
     pub retry_plan: &'static str,
-    /// The bucketed retry's `bits`; `None` for `sort_merge`.
+    /// Why a `sort_merge` retry did not plan buckets: `not_admitted` (a
+    /// final aggregate the bucketed rule does not admit, or none),
+    /// `order_preserving_exchange`, a [`crate::NoTuning::reason`],
+    /// `bucket_plan_failed`, `spill_disabled` (the retry runs without a
+    /// scratch area) or `not_planned`. `None` for `bucket`.
+    pub retry_plan_reason: Option<&'static str>,
+    /// The bucketed retry's derived `bits`; `None` for `sort_merge`.
     pub bits: Option<u8>,
-    /// The bucketed retry's `routed_chunk_rows`; `None` for `sort_merge`.
+    /// The bucketed retry's derived `routed_chunk_rows`; `None` for
+    /// `sort_merge`.
     pub routed_chunk_rows: Option<usize>,
     /// [`SpillCounts::bytes_written`] of the retry, over every operator.
     pub spill_bytes_written: u64,
@@ -5993,6 +6192,7 @@ impl SpillRetryReport {
                 .map_or_else(|| "unmeasured".to_string(), |bytes| bytes.to_string()),
             spill_files = self.spill_files,
             retry_plan = self.retry_plan,
+            retry_plan_reason = self.retry_plan_reason.unwrap_or("none"),
             bits = self
                 .bits
                 .map_or_else(|| "none".to_string(), |bits| bits.to_string()),
@@ -6043,6 +6243,11 @@ pub struct PinnedQuery {
     /// The scratch bytes this plan reserved from the spill ceiling, `None`
     /// when it runs without spill.
     spill_share: Option<u64>,
+    /// The physical plan to execute in place of one built from `frame`: the
+    /// bucket retry's plan at its derived tuning. `None` on every other plan.
+    physical: Option<Arc<dyn ExecutionPlan>>,
+    /// The plan a spill retry chose; `None` on every other plan.
+    retry_plan: Option<RetryPlan>,
 }
 
 impl PinnedQuery {
@@ -6106,6 +6311,9 @@ impl PinnedQuery {
     /// out). This is the same first step [`Self::execute`] takes, run over the
     /// frame's logical plan by reference so it can be called on a borrow.
     pub async fn create_physical_plan(&self) -> Result<Arc<dyn ExecutionPlan>, SqlError> {
+        if let Some(plan) = &self.physical {
+            return Ok(Arc::clone(plan));
+        }
         self.ctx
             .state()
             .create_physical_plan(self.frame.logical_plan())
@@ -6126,6 +6334,8 @@ impl PinnedQuery {
             window_predicate: _,
             spill_probe: _,
             spill_share: _,
+            physical,
+            retry_plan: _,
         } = self;
         // Build the physical plan explicitly rather than through
         // `frame.execute_stream()` (which does the same two steps internally)
@@ -6133,7 +6343,10 @@ impl PinnedQuery {
         // DataFusion counters can be read after the drain. The two
         // are equivalent: `execute_stream` is `create_physical_plan` then
         // `execute_stream(plan, task_ctx)`.
-        let plan = frame.create_physical_plan().await.map_err(plan_error)?;
+        let plan = match physical {
+            Some(plan) => plan,
+            None => frame.create_physical_plan().await.map_err(plan_error)?,
+        };
         Ok(
             PinnedStream::start_with_scratch(ctx, plan, schema, breach, scratch)?
                 .with_row_cap(row_cap),
@@ -6162,8 +6375,13 @@ impl PinnedQuery {
             window_predicate: _,
             spill_probe: _,
             spill_share: _,
+            physical,
+            retry_plan: _,
         } = self;
-        let plan = frame.create_physical_plan().await.map_err(plan_error)?;
+        let plan = match physical {
+            Some(plan) => plan,
+            None => frame.create_physical_plan().await.map_err(plan_error)?,
+        };
         let mut stream =
             PinnedStream::start_with_scratch(ctx, Arc::clone(&plan), schema, breach, scratch)?
                 .with_row_cap(row_cap);
@@ -6400,6 +6618,30 @@ impl PinnedStream {
     /// the plan has none.
     fn bucket_spill(&self) -> Option<BucketSpillFigures> {
         bucket_spill_figures(&self.plan)
+    }
+
+    /// The executed plan rendered as `EXPLAIN` renders it.
+    fn plan_text(&self) -> String {
+        datafusion::physical_plan::displayable(self.plan.as_ref())
+            .indent(false)
+            .to_string()
+    }
+
+    /// The input rows the plan's logs scans have consumed so far, the bucket
+    /// retry's `n`; `None` when the plan has no logs scan.
+    fn rows_consumed(&self) -> Option<u64> {
+        fn walk(plan: &Arc<dyn ExecutionPlan>, total: &mut Option<u64>) {
+            if let Some(scan) = plan.downcast_ref::<crate::logs_scan::LogsScanExec>() {
+                let rows = u64::try_from(scan.rows_consumed()).unwrap_or(u64::MAX);
+                *total = Some(total.unwrap_or(0).saturating_add(rows));
+            }
+            for child in plan.children() {
+                walk(child, total);
+            }
+        }
+        let mut total = None;
+        walk(&self.plan, &mut total);
+        total
     }
 
     /// Sample the disk manager's open-spill-file gauge and fold the interval
@@ -9679,6 +9921,10 @@ pub(crate) mod tests {
         let report = FirstRefusal {
             class: "query_pool",
             after: Duration::from_millis(1234),
+            figures: RetryFigures {
+                asked_bytes: 0,
+                consumed_rows: None,
+            },
         }
         .report(
             SpillCounts {
@@ -9702,9 +9948,14 @@ pub(crate) mod tests {
                     rows_written: 6,
                 },
             ],
+            Some(RetryPlan::Bucket(BucketSpillTuning {
+                bits: 4,
+                routed_chunk_rows: 2048,
+                descriptor_need: 66,
+            })),
             Some(BucketSpillFigures {
                 bits: 4,
-                routed_chunk_rows: 8192,
+                routed_chunk_rows: 2048,
                 bytes_read: 3072,
             }),
             PoolReport {
@@ -9734,8 +9985,9 @@ pub(crate) mod tests {
             ("spill_bytes_read", "unmeasured"),
             ("spill_files", "3"),
             ("retry_plan", "bucket"),
+            ("retry_plan_reason", "none"),
             ("bits", "4"),
-            ("routed_chunk_rows", "8192"),
+            ("routed_chunk_rows", "2048"),
             ("exchange_spill_bytes_written", "1024"),
             ("exchange_spill_files", "1"),
             ("bucket_spill_bytes_written", "3072"),
@@ -9759,6 +10011,10 @@ pub(crate) mod tests {
         let first = FirstRefusal {
             class: "query_pool",
             after: Duration::from_millis(5),
+            figures: RetryFigures {
+                asked_bytes: 0,
+                consumed_rows: None,
+            },
         };
         let operators = [
             OperatorSpill {
@@ -9791,14 +10047,21 @@ pub(crate) mod tests {
             routed_chunk_rows: 8192,
             bytes_read: 9_000,
         };
+        let tuning = BucketSpillTuning {
+            bits: 4,
+            routed_chunk_rows: 8192,
+            descriptor_need: 66,
+        };
         let report = first.report(
             totals,
             &operators,
+            Some(RetryPlan::Bucket(tuning)),
             Some(bucket),
             PoolReport::default(),
             None,
         );
         assert_eq!(report.retry_plan, "bucket");
+        assert_eq!(report.retry_plan_reason, None);
         assert_eq!(
             (report.bits, report.routed_chunk_rows),
             (Some(4), Some(8192))
@@ -9813,8 +10076,16 @@ pub(crate) mod tests {
             report.spill_bytes_written
         );
 
-        let sort_merge = first.report(totals, &operators[..2], None, PoolReport::default(), None);
+        let sort_merge = first.report(
+            totals,
+            &operators[..2],
+            Some(RetryPlan::SortMerge(crate::RETRY_NOT_ADMITTED)),
+            None,
+            PoolReport::default(),
+            None,
+        );
         assert_eq!(sort_merge.retry_plan, "sort_merge");
+        assert_eq!(sort_merge.retry_plan_reason, Some("not_admitted"));
         assert_eq!(
             (sort_merge.bits, sort_merge.routed_chunk_rows),
             (None, None)
