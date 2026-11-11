@@ -622,7 +622,12 @@ through the library's build-and-publish path, not from any shipped command.
 
 Settings. Part boundaries depend on the memory split target and the
 stored-size target, and part bytes on the RLOG zstd level; none of them is
-part of the compaction record's identity. Since issue #2351 the memory
+part of the compaction record's identity. Since ADR-3853's range workers
+amendment (#4108) the range quantum, `CompactorConfig::rlog_range_records`,
+is one of these part-split settings too: every RLOG compaction cuts a part
+at each range start and numbers each range's parts from the range's record
+share, so a repair must reproduce the quantum as well. No binary sets it;
+it is the 2,500,000-record default. Since issue #2351 the memory
 split target of an RLOG merge is derived from the memory budget of the
 process that runs it, so two processes on one host can cut the same input
 set differently: `ravel-server` on a 30 GiB host at its default unit
