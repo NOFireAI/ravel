@@ -2616,8 +2616,9 @@ impl ObjectStoreBackend for ScratchMeter {
 /// the ceiling with its own tracker, and every worker of a level stops at its
 /// next group, range or part PUT once any of them fails (ADR-3853 D4, D5
 /// amendment). Level 2 cuts the stream key space into ranges of a fixed
-/// record quantum and numbers range `r`'s parts from `r x K`, so every `W2`
-/// publishes the same parts. One range worker keeps up to `E` part builders
+/// record quantum by the per-stream totals level 1 tallied, and numbers each
+/// range's parts from its proportional window of the part key's indexes
+/// ([`RangeWindows`]), so every `W2` publishes the same parts. One range worker keeps up to `E` part builders
 /// in flight ([`level2_encode_builders`]); several encode inline (D3). Only
 /// compaction reaches this, and it keeps every record.
 async fn two_level_merge(
@@ -8551,7 +8552,10 @@ mod tests {
         assert_eq!(level2_ranges(&[3, 3, 3], 10), [0..3]);
         assert_eq!(level2_ranges(&[5, 5], 10), [0..2]);
         assert_eq!(level2_ranges(&[], 10), [0..0]);
-        assert_eq!(level2_ranges(&[60; 40], 600), [0..10, 10..20, 20..30, 30..40]);
+        assert_eq!(
+            level2_ranges(&[60; 40], 600),
+            [0..10, 10..20, 20..30, 30..40]
+        );
     }
 
     /// The windows of the ranges `level2_ranges` cuts from `stream_records`.
@@ -8607,7 +8611,11 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(
-            windows_of(&RangeWindows::new(1_800, 600, 3).expect("fits"), &[600; 3], 600),
+            windows_of(
+                &RangeWindows::new(1_800, 600, 3).expect("fits"),
+                &[600; 3],
+                600
+            ),
             [(0, 1), (1, 2), (2, 3)]
         );
     }
@@ -17272,7 +17280,9 @@ mod tests {
                 let indexes: Vec<u32> = rec.parts.iter().map(|p| p.part_index).collect();
                 assert_eq!(
                     indexes,
-                    [0, 1, 2, 2500, 2501, 2502, 5000, 5001, 5002, 7500, 7501, 7502],
+                    [
+                        0, 1, 2, 2500, 2501, 2502, 5000, 5001, 5002, 7500, 7501, 7502
+                    ],
                     "{workers} workers: range r's parts from r x 2,500, 3 of them in each \
                      range of 600 records"
                 );
