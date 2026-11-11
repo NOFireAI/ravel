@@ -128,7 +128,9 @@ function of the anchor and the seed.
 - `MB_PROFILE`, default `cardinality`;
 - `MB_RSS_BAND`, one `--rss-band` value, default `prometheus:2147483648:6442450944`: the 2 to 6 GiB Prometheus band pre-registered for `cardinality` (#2821 comment 6590940753);
 - `MB_OBJECTS_BAND`, default `14000:16500`: the data-object band pre-registered for `cardinality` (#2821 comment 6611923577);
-- `MB_CAP_MIN`, the self-termination cap, default 2,160 minutes (36 h);
+- `MB_CAP_MIN`, the self-termination cap, default 2,160 minutes (36 h),
+  which covers a full Stage 1 run with every arm (about 32 h, below) with
+  about 4 h to spare; raise it for anything longer;
 - `MB_INSTANCE_TYPE`;
 - `MB_STAGE1`, `1` to run the ADR-3694 Stage 1 steps in both the ci smoke and
   the measured run (`cardinality` or `ci` only; `launch.sh` refuses another
@@ -170,6 +172,12 @@ differ, so `launch.sh` refuses a different `MB_PROFILE` unless both bands
 are set, and chosen in that run's pre-registration.
 
 A `cardinality` run takes 8 to 10 h. R4 took 8.7 h, F4 9.25 h.
+
+With `MB_STAGE1=1` on `cardinality`, one warm Stage 1 pass over the corpus
+takes about 3.4 h, and a full Stage 1 run with every arm in
+`MB_STAGE1_ARMS` takes about 32 h, inside the 36 h default `MB_CAP_MIN`. A
+rerun with `MB_STAGE1_ARMS=erasure` alone takes 22 to 24 h. Any cap you set
+follows from these figures, not from the 8 to 10 h above.
 
 ## 6. Watch
 
@@ -217,7 +225,11 @@ listed in deploy/metricsbench/README.md:
 - `memory-summary.json` and `ravel-objects.json`;
 - `readback-folded.json` and `query.log`;
 - `diagnostics.json`, the largest ULP gap per entry against the oracle;
-- the effective configuration and the step logs.
+- the effective configuration and the step logs;
+- with `MB_STAGE1=1`, a `stage1-*/` directory per pass; a pass whose query
+  exited non-zero or answered no record also holds `ravel-server.inspect.json`
+  and `ravel-server.log` (the server's last 20,000 log lines) beside its
+  `query.log`, uploaded with the rest of `out-run/` whatever the exit code.
 
 Read the run's own verdict before any figure:
 - `stamps.json` `status` is `passed`;
