@@ -70,7 +70,7 @@ Verified against the tree at `4e5c0ea8`.
   catalog cache 5%, SQL per-query 25% (now 50%, see the per-query SQL share
   amendment below), SQL per-tenant 50%, with exact-integer
   tests (`config.rs:4896-4904`). The per-query share nests inside the
-  per-tenant share (`crates/ravel-sql/src/memory.rs:347-362` charges the same
+  per-tenant share (`crates/ravel-sql/src/memory.rs:321-336` charges the same
   bytes to both), so the sum for one tenant is 80%, not 130%. The per-tenant
   share is per `TenantHash` (`crates/ravel-sql/src/executor.rs:459-470`), so N
   active tenants can reserve N x 50%.
@@ -83,8 +83,8 @@ Verified against the tree at `4e5c0ea8`.
   bump (`cache.rs:43-46`), so evicting an entry frees nothing until every
   reader drops it.
 - **The SQL pool has one fallible seam.** `TenantDelegatingPool::try_grow`
-  (`memory.rs:347-374`) charges query then tenant and returns
-  `ResourcesExhausted` on refusal; `grow` (`memory.rs:290-336`) cannot decline,
+  (`memory.rs:321-348`) charges query then tenant and returns
+  `ResourcesExhausted` on refusal; `grow` (`memory.rs:264-310`) cannot decline,
   because DataFusion's `MemoryReservation::resize` and its join operators call
   it with unchecked deltas, so it records a `CeilingBreach` that the query
   stream turns into a typed error on its next poll (`executor.rs:1805-1815`).
@@ -156,7 +156,7 @@ counter, because its two consumers account differently:
   already keeps grow and shrink as separate counter operations
   (`memory.rs:105-130`) and `TenantDelegatingPool` already forwards every
   DataFusion `grow`, `try_grow` and `shrink` to it 1:1 with rollback on
-  refusal (`memory.rs:290-374`; a held aggregate's shrink is the one
+  refusal (`memory.rs:264-348`; a held aggregate's shrink is the one
   exception, see the aggregate hold amendment below, which the DataFusion
   55.2 hold amendment below narrows to the legacy aggregate stream and the
   last-release hold amendment below extends to the migrated final and

@@ -1502,6 +1502,9 @@ before any box was launched. Each figure must be present exactly once and
 inside its band; anything else is a miss, so no row leaves a gap between
 its band and its miss.
 
+What the run measured against each row is in the M8 results amendment
+below.
+
 M8's arms are runs still to be produced. Each machine gets one box. On it
 the build is the tree carrying T2 #4074 and T3 #4075, and the data is
 loaded by that build. The pre-registration lets the measured tree differ
@@ -1588,3 +1591,89 @@ miss, not a precondition's.
   volume in the benchmark.
 - ADR-1195's first-attempt floor amendment, item 2, now says the retry
   keeps the hash exchange for the admitted shapes (item 5).
+
+## Amendment (2026-11-11): M8 results for the parallel bucket spill gate
+
+<!-- amendment-applies: sections="Amendment (2026-11-10): parallel bucket spill for the refusal retry (issue #4073)" pointer="M8 results amendment" -->
+
+This is the M8 results amendment. Refs: #4075, epic #4072. It records what
+run `m8-t3-a7c3d527c-20261111T1124Z` measured against the parallel bucket
+spill gate. It changes no code and no decision. The bucket-specific rows,
+and the corrections to the row width and the retry peak, are in ADR-3565's
+M8 results amendment.
+
+The run used one box per size, all terminated. The server was built from
+`a7c3d527c`; on every box the measured binary's sha256 matched the build's
+`SHA256SUMS` and the v0.28.0 arm's matched the release's. The merged tree
+differs from the measured one in test sources only. Every box returned a
+result row for all 43 statements. The full results are #4072 comment
+6802934028.
+
+**The gate did not pass.** No statement returned a null answer on any box.
+The concurrent QPS rows missed on all three.
+
+### M8 results against the gate rows
+
+| figure | predicted | measured | outcome | source |
+|---|---|---|---|---|
+| statements newly null against the M7 run, each box | 0 | 0 on c6a.large, c6a.xlarge and c6a.2xlarge | inside | measured 2026-11-11, comment 6802934028 |
+| null answers, absolute count, each box | 0 | 0 on all three | inside | measured 2026-11-11, comment 6802934028 |
+| hot time per statement against published v0.28.0 | at most 1.10x | c6a.large: statement 22 at 1.109, statement 31 at 1.125, statement 38 at 1.104; no other judged statement above 1.10x | outside on c6a.large | measured 2026-11-11, comment 6802934028 |
+| concurrent QPS, c6a.large, new over v0.28.0 | at least 0.95, error ratio no higher | 0.847 (0.090 and 0.092 over 0.115 and 0.100) | outside | measured 2026-11-11, comment 6802934028 |
+| concurrent QPS, c6a.xlarge | at least 0.95, error ratio no higher | 0.761 (0.195 and 0.178 over 0.245 and 0.245); error ratio 0.3175 against 0.3160 | outside on both | measured 2026-11-11, comment 6802934028 |
+| concurrent QPS, c6a.2xlarge | at least 0.95, error ratio no higher | 0.744 (0.347 and 0.383 over 0.488 and 0.493); error ratio 0.084 and 0.102 against 0.175 and 0.173 | outside on QPS | measured 2026-11-11, comment 6802934028 |
+| row 33 hot time, c6a.2xlarge | at most 40 s | 9.4 s (80.8 s on the M7 build) | inside | measured 2026-11-11, comment 6802934028 |
+| row 33 `bucket_spill_bytes_written`, c6a.2xlarge | 1.0 to 2.0 GB | 1.72 GB on every try | inside | measured 2026-11-11, comment 6802934028 |
+| row 33 `exchange_spill_bytes_written`, c6a.2xlarge | at most 1% of `bucket_spill_bytes_written` | 0 B on every try | inside | measured 2026-11-11, comment 6802934028 |
+
+Not judged: a statement whose published tries 2 and 3 differ by more than
+1.10x is judged against arm O, which ran on c6a.xlarge only. That leaves
+10 hot-time rows unjudged on c6a.2xlarge and 8 on c6a.large.
+
+The hot-time outcome on c6a.large is against the published figure, on a
+different instance, one run. Statement 31 was already at 1.12x on the
+published v0.31.1 run and 1.11x on M7, so it predates this amendment's
+change. Statements 22 and 38 are 3.9% and 8.4% over M7; whether that is
+the binary is not established.
+
+### Serial passes
+
+Sum of hot time over the 43 statements, M8 over M7 on the same box size:
+
+- c6a.2xlarge: 83.2 s over 154.0 s, 0.54. Row 33: 9.4 s, from 80.8 s.
+- c6a.xlarge: 374.4 s over 461.3 s, 0.81. Row 33: 17.5 s, from 98.4 s.
+- c6a.large: 859.5 s over 863.6 s, 1.00. Row 33 kept the sort-merge
+  retry at about 112 s (ADR-3565's M8 results amendment).
+
+### Why the concurrent QPS rows missed
+
+The c6a.2xlarge row's basis said it could miss for a cause this amendment
+does not address. That is what happened, on all three boxes.
+
+- Row 33's retry is bucketed on c6a.2xlarge and c6a.xlarge. On
+  c6a.2xlarge it writes 1.72 GB per retry, from 8.5 GB on the M7 build.
+- Statements 19, 34 and 35 group by a string key. `BucketedFinalAggregateRule`
+  admits fixed-width keys only, so their retries keep the sort-merge plan
+  (`retry_plan_reason="not_admitted"`) at 3.3 to 6.2 GB of spill each.
+- The two c6a.2xlarge new windows wrote 53.9 and 47.8 GB of spill over 12
+  and 11 retries. The M7 build wrote 51.3 and 58.3 GB. Row 33's saving
+  did not lower the window total.
+
+Not established: whether the c6a.xlarge drop from M7's 0.87 to 0.761 is
+the binary or window noise. The new arm's mean is 0.1865 in M8 and 0.201
+in M7, inside M7's own window spread of 0.180 to 0.222, and the v0.28.0
+arm moved too. Two windows per arm cannot separate them.
+
+Under the concurrent windows some retries ended in the typed refusal, and
+some were skipped because less than 64 MiB of spill share was left under
+the process spill ceiling; a skipped retry returns the first attempt's
+refusal. No serial pass had a failed or skipped retry. The counts per box
+are in comment 6802934028.
+
+### What follows
+
+- Admitting string group keys to the bucketed retry is the change that
+  addresses the concurrent QPS rows. It is not part of T3 #4075.
+- Production: a deployment whose refused statements group by string keys
+  gets no write-once spill from this amendment. Its retries write the
+  sort-merge plan's bytes, as before.
