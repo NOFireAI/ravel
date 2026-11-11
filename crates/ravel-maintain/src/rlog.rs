@@ -17076,6 +17076,44 @@ mod tests {
             assert_eq!(published(&store).await, outputs[0]);
         }
 
+        /// ADR-3853 D5 amendment: each range worker plans its passes under
+        /// `U / W2`, not `U`. The padded tail puts most of the bytes in the
+        /// last range, which the second of two workers takes, so that
+        /// worker's passes are cut by its share of the ceiling: its peak stays
+        /// under `U / 2` while the first worker's stays near its read side.
+        #[tokio::test]
+        async fn each_range_worker_plans_under_its_share_of_the_ceiling() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &padded_tail_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let dir = fresh_scratch("range-worker-share");
+            let config = CompactorConfig {
+                rlog_level2_range_slots: 64,
+                ..range_worker_config(per_input, 2, dir.clone())
+            };
+            let ceiling = config.merge_resident_ceiling();
+            let store = ProbeStore::new();
+            seed_inputs(&store, &padded_tail_inputs()).await;
+            let (outcome, run) = compact_logged(&store, &config).await;
+            assert!(
+                matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                "{outcome:?}"
+            );
+            let r = &run.report;
+            assert_eq!(r.level2_workers, 2, "{r:?}");
+            assert_eq!(r.level2_ranges, 4, "{r:?}");
+            let peaks = run.tracker.level2_worker_peak_bytes();
+            assert_eq!(peaks.len(), 2, "{peaks:?}");
+            let worker_ceiling = ceiling / 2;
+            assert!(
+                peaks.iter().all(|p| *p > 0 && *p <= worker_ceiling),
+                "{peaks:?} against {worker_ceiling}"
+            );
+            assert!(peaks[1] > peaks[0], "the padded ranges' worker: {peaks:?}");
+            assert_eq!(published_records(&store).await.len(), 2400);
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
         /// The part indexes of every L1 part object on `store`, published or
         /// not, ascending.
         async fn l1_part_indexes(store: &dyn ObjectStoreBackend) -> Vec<u32> {
