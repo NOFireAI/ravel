@@ -1414,11 +1414,15 @@ against.
 Journey C's cut for tier k is the k-th root span start of the failing
 hour, which is exact only when no two of that hour's traces start on the
 same nanosecond. A draw that ties there (about one day in ten at the ADR's
-833,333 traces an hour, about one in 250 at `dp30`'s 166,667) has the later
-trace of each tie, in trace id order, moved one nanosecond on before any
-row is written (`separate_starts`). A draw with no tie is written exactly
-as drawn, so every corpus that generated before the move existed is
-byte-identical.
+833,333 traces an hour, about one in 250 at `dp30`'s 166,667) is separated
+before any row is written. Among base traces the later trace of each tie,
+in trace id order, moves one nanosecond on (`separate_starts`). A `--scale`
+noise trace then moves alone, to the next nanosecond that no base trace and
+no earlier noise trace holds (`place_noise_starts`), so a base trace never
+moves for noise and the base rows are the same at every `--scale`. The
+number moved is `generator.starts_moved` in truth.json, and on stdout, only
+when it is nonzero. A draw with no tie is written exactly as drawn, so every
+corpus that generated before the move existed is byte-identical.
 
 The plant counts are blocks of the generator's row order, not of storage:
 the writer sorts each object's records by `(stream_ref, ts_ns)`

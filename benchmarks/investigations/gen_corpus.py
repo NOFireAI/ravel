@@ -18,10 +18,13 @@ Time: every event-time hour is a function of the timestamp,
 hour = ts // 3600e9 - start_hour. A trace starts at least TRACE_MARGIN_NS
 before its hour ends, and every span and log of it lands before that end, so
 a trace and all of its rows share one hour. No two traces of the failing hour
-share a start: a tie the draw makes is broken by moving the later trace (in
-trace id order) one nanosecond on, so journey C's cut points are exact
-(separate_starts). A move is a nanosecond per tie, far inside the margin,
-and a draw without a tie is written as drawn.
+share a start, so journey C's cut points are exact. A tie among base traces
+is broken by moving the later one (in trace id order) one nanosecond on
+(separate_starts); a noise trace then moves alone, to the next nanosecond no
+base trace and no earlier noise trace holds (place_noise_starts), so a base
+trace never moves for noise and the base rows stay the same at every
+--scale. A move is a few nanoseconds, far inside the margin, and a draw
+without a tie is written as drawn.
 
 --even-hours gives every hour exactly traces / hours traces (trace i of the
 draw goes to hour i mod hours) instead of a uniform random hour per trace.
@@ -126,6 +129,25 @@ def separate_starts(traces, hour, start_hour):
         if t.start_ns <= prev.start_ns:
             t.start_ns = prev.start_ns + 1
             moved += 1
+    return moved
+
+
+def place_noise_starts(base, noise, hour, start_hour):
+    """Give every noise trace of `hour` a start that no base trace and no
+    earlier noise trace (in (start, trace id) order) holds, by moving it to
+    the next free nanosecond. Base traces never move, so the base rows are
+    the same with or without noise; `base` must already be separated. The
+    noise list keeps its order. Returns the number moved."""
+    taken = {t.start_ns for t in base if hour_of(t.start_ns, start_hour) == hour}
+    in_hour = sorted((t for t in noise if hour_of(t.start_ns, start_hour) == hour),
+                     key=lambda t: (t.start_ns, t.trace_id))
+    moved = 0
+    for t in in_hour:
+        if t.start_ns in taken:
+            while t.start_ns in taken:
+                t.start_ns += 1
+            moved += 1
+        taken.add(t.start_ns)
     return moved
 
 
@@ -455,7 +477,8 @@ def main(argv):
                 t.service = FAILING_SERVICE + 1
     else:
         nrng = None
-    separate_starts(base + noise, failing_hour, args.start_hour)
+    starts_moved = separate_starts(base, failing_hour, args.start_hour)
+    starts_moved += place_noise_starts(base, noise, failing_hour, args.start_hour)
 
     spans_sink = Sink(args.out, "spans", spans_schema, fmt)
     logs_sink = Sink(args.out, "logs", logs_schema, fmt)
@@ -613,6 +636,8 @@ def main(argv):
             # Only an even-hours corpus carries the key, so every other
             # truth.json stays byte-identical to what it was.
             **({"even_hours": True} if args.even_hours else {}),
+            # Likewise only a corpus whose failing hour drew a start tie.
+            **({"starts_moved": starts_moved} if starts_moved else {}),
         },
         "rows_written": {"spans": spans_sink.count, "logs": logs_sink.count},
         "unplanted_rows": {"spans": len(noise) * spt, "logs": len(noise) * lpt, "noise_traces": len(noise)},
@@ -639,6 +664,8 @@ def main(argv):
     with open(os.path.join(args.out, "truth.json"), "w") as f:
         json.dump(truth, f, indent=1, sort_keys=True)
         f.write("\n")
+    if starts_moved:
+        print(f"moved {starts_moved} failing-hour trace start(s) off a tie")
     print(f"wrote {spans_sink.count} spans, {logs_sink.count} logs ({fmt}) to {args.out}")
     return 0
 
@@ -924,9 +951,15 @@ def merge_truths(args):
         f.write(spans_map)
     with open(os.path.join(args.out, "logs.mapping.toml"), "w") as f:
         f.write(logs_map)
+    generator = dict(g0, seed=args.seed, traces=sum(g["traces"] for g in gens), hours=24 * n, days=n,
+                     traces_per_day=g0["traces"], day_seeds=seeds)
+    # Day 0's count is not the merged corpus's; only a day that moved a start carries one.
+    generator.pop("starts_moved", None)
+    moved = sum(g.get("starts_moved", 0) for g in gens)
+    if moved:
+        generator["starts_moved"] = moved
     return {
-        "generator": dict(g0, seed=args.seed, traces=sum(g["traces"] for g in gens), hours=24 * n, days=n,
-                          traces_per_day=g0["traces"], day_seeds=seeds),
+        "generator": generator,
         "rows_written": rows_written,
         "unplanted_rows": {k: sum(t["unplanted_rows"][k] for t in days) for k in days[0]["unplanted_rows"]},
         "failing_cell": cell,
