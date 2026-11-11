@@ -1736,12 +1736,9 @@ async fn a_failed_level2_worker_stops_every_level2_worker() {
     let per_input = sixty_inputs_per_input_bytes(&dir).await;
 
     let plan = FaultPlan::empty().with_rule(
-        Rule::new(
-            Op::Put,
-            ScriptedFault::Permanent("part 4 lost".to_string()),
-        )
-        .with_key_contains(".0004.")
-        .with_occurrence(Occurrence::Nth(1)),
+        Rule::new(Op::Put, ScriptedFault::Permanent("part 4 lost".to_string()))
+            .with_key_contains(".0004.")
+            .with_occurrence(Occurrence::Nth(1)),
     );
     let ledger = RequestLedger::new();
     let store = NoteScratchAtFault::new(
