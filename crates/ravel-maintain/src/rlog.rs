@@ -1868,8 +1868,8 @@ fn derive_level_workers(
         }
         // 1/a + 1/b = (a + b) / (a * b), compared as cross products.
         let better = best.is_none_or(|(b1, b2)| {
-            let (n, d) = ((w1 + w2) as u128, (w1 * w2) as u128);
-            let (bn, bd) = ((b1 + b2) as u128, (b1 * b2) as u128);
+            let (n, d) = (w1 as u128 + w2 as u128, w1 as u128 * w2 as u128);
+            let (bn, bd) = (b1 as u128 + b2 as u128, b1 as u128 * b2 as u128);
             n * bd < bn * d
         });
         if better {
@@ -17942,6 +17942,42 @@ mod tests {
             assert!(scratch_entries(&dir).is_empty());
         }
 
+        /// ADR-3853 D5 amendment: the single-level route refuses a unit of
+        /// more records than the part key's indexes times the quantum from
+        /// its inputs' record sum, before it encodes or PUTs a part.
+        #[tokio::test]
+        async fn the_single_level_route_refuses_a_unit_past_the_key_space_before_a_put() {
+            let store = ProbeStore::new();
+            seed_inputs(&store, &two_level_inputs()).await;
+            let config = at_range_quantum(two_level_config(
+                64 << 20,
+                crate::RLOG_RUN_MEMORY_TARGET_BYTES,
+                None,
+            ));
+            PART_KEYS_OVERRIDE.with(|o| o.set(Some(3)));
+            let (outcome, run) = compact_logged(&store, &config).await;
+            PART_KEYS_OVERRIDE.with(|o| o.set(None));
+            assert!(
+                matches!(
+                    outcome,
+                    Err(MaintainError::PartKeySpace {
+                        records: 2400,
+                        quantum: 600,
+                        keys: 3,
+                    })
+                ),
+                "{outcome:?}"
+            );
+            assert!(
+                run.mode_line().contains("mode=\"resident\""),
+                "{}",
+                run.mode_line()
+            );
+            assert_eq!(run.report.level1_groups, 0, "{:?}", run.report);
+            assert_eq!(run.report.part_put.requests, 0, "{:?}", run.report);
+            assert!(l1_part_indexes(&store).await.is_empty());
+        }
+
         /// Run settings never reach the published parts: two run targets that
         /// cut the runs into different numbers of parts publish the
         /// single-level bytes and keys. Both run under the fixture's G = 12
@@ -18578,7 +18614,7 @@ mod tests {
         /// flight and 1,573 MB final parts. One unit of 20 GiB with 32 cores
         /// scores every `W1` by `1/W1 + 1/W2` and keeps (4, 4); `W1` = 6 ties
         /// it at 0.5 and loses to the smaller `W1`. At the server defaults, 5
-        /// GiB with 8 cores, `W1` = 2 already leaves level 2 needing 8,114 MB
+        /// GiB with 8 cores, `W1` = 2 already leaves level 2 needing 8,113 MB
         /// for one worker, above `U`, so the pair is (1, 1).
         #[test]
         fn joint_derivation_scores_every_level1_count_by_both_levels() {
@@ -18624,6 +18660,20 @@ mod tests {
             // does not.
             assert_eq!(derive_level_workers(&whole, 32, Some(9)), Some((1, 9)));
             assert_eq!(derive_level_workers(&whole, 32, Some(10)), None);
+            // A huge override is refused or taken without the score's cross
+            // products overflowing.
+            assert_eq!(derive_level_workers(&whole, 32, Some(usize::MAX / 2)), None);
+            let free = Level1Shape {
+                block_rate: (0, 1),
+                in_flight: 0,
+                part_target: 0,
+                ceiling: u64::MAX,
+                ..whole
+            };
+            assert_eq!(
+                derive_level_workers(&free, 3, Some(usize::MAX / 2)),
+                Some((3, usize::MAX / 2))
+            );
 
             let defaults = shape(5 * GIB);
             assert_eq!(defaults.ceiling / 1_000_000, 5_368);

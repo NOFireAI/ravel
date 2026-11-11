@@ -629,8 +629,11 @@ each of its high-water marks to at least the workers' sum. `W1` and `W2`
 are derived together: `W2` is the core share or the number of workers whose
 read sides, `R x 2 x price(one run block) + reads in flight + final part
 target` each, fit `U`, whichever is smaller, and the pair kept has the
-smallest `1/W1 + 1/W2`. At one level-2 worker the merge is the one the
-amendments above describe.
+smallest `1/W1 + 1/W2`. One level-2 worker keeps ADR-3853 D3's encode
+pipeline, and the unit is still cut into ranges, so its parts are the
+single-level merge's: every RLOG compaction, single-level too, cuts a part
+at each range start and numbers each range's parts in its own window of the
+part key's indexes.
 
 The level-2 workers share the unit's claim guard and their own stop token,
 checked before each range and each part PUT, so the first error any of
