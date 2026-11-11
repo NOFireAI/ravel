@@ -17030,6 +17030,113 @@ mod tests {
             }
         }
 
+        /// The part indexes of every L1 part object on `store`, published or
+        /// not, ascending.
+        async fn l1_part_indexes(store: &dyn ObjectStoreBackend) -> Vec<u32> {
+            let mut indexes: Vec<u32> = list_all(store, "t/")
+                .await
+                .expect("list")
+                .into_iter()
+                .filter_map(|m| keys::parse_l1_part_key(&m.key).ok())
+                .map(|p| p.part_index)
+                .collect();
+            indexes.sort_unstable();
+            indexes
+        }
+
+        /// The two-level fixture with the last 10 streams in merged stream
+        /// order carrying bodies padded by 4,000 bytes: the ranges are cut by
+        /// records, so the range holding them carries several times the
+        /// bytes of one holding as many records before them.
+        fn padded_tail_inputs() -> Vec<L0Input> {
+            let mut order: Vec<u32> = (0..40).collect();
+            order.sort_by_key(|s| stream_ident(*s).0);
+            let padded: BTreeSet<u32> = order[30..].iter().copied().collect();
+            let inputs = (0..60u32)
+                .map(|i| {
+                    (0..40u32)
+                        .map(|s| {
+                            let pad = if padded.contains(&s) {
+                                "x".repeat(4_000)
+                            } else {
+                                String::new()
+                            };
+                            record(
+                                s,
+                                1_000 + i64::from(i % 3),
+                                &format!("in{i} s{s} k0{pad}"),
+                                vec![("k".to_string(), AttrValue::I64(0))],
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            blocked(inputs, 40)
+        }
+
+        /// ADR-3853 D5 amendment: a range whose parts outgrow its K slots is
+        /// refused when its K + 1th part would open, before that part is
+        /// encoded, so nothing lands past the range's window. Two ranges of
+        /// 1,200 records on two range workers, each encoding inline: range 0
+        /// closes in 2 parts, range 1's padded records need more than K = 2,
+        /// so its worker puts slots 2 and 3 and refuses at 4 without a PUT
+        /// there or past it.
+        #[tokio::test]
+        async fn a_range_needing_more_than_k_parts_is_refused_before_encoding() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &padded_tail_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let dir = fresh_scratch("range-slots");
+            let config = CompactorConfig {
+                rlog_level2_range_records: 1_200,
+                rlog_level2_range_slots: 2,
+                rlog_l1_part_memory_target_bytes: Some(4 * RANGE_PART),
+                ..range_worker_config(per_input, 2, dir.clone())
+            };
+            let store = ProbeStore::new();
+            seed_inputs(&store, &padded_tail_inputs()).await;
+            let (outcome, run) = compact_logged(&store, &config).await;
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(CompactionOutcome::TwoLevelUnsupported {
+                        check: crate::error::TwoLevelCheck::RangeSlots {
+                            range: 1,
+                            ranges: 2,
+                            slots: 2,
+                            part_index: 4,
+                        },
+                        ..
+                    })
+                ),
+                "{outcome:?}"
+            );
+            let line = run.line("rlog two-level merge");
+            assert_eq!(log_field(&line, "level2_workers"), 2, "{line}");
+            assert_eq!(log_field(&line, "encode_builders"), 1, "inline: {line}");
+            let indexes = l1_part_indexes(&store).await;
+            assert_eq!(
+                indexes.iter().filter(|i| (2..4).contains(*i)).count(),
+                2,
+                "range 1 put its K parts: {indexes:?}"
+            );
+            assert!(
+                indexes.iter().all(|i| *i < 4),
+                "nothing past range 1's slots: {indexes:?}"
+            );
+            assert!(
+                indexes.iter().filter(|i| **i < 2).count() <= 2,
+                "{indexes:?}"
+            );
+            assert_eq!(
+                run.report.part_put.requests,
+                indexes.len() as u64,
+                "every part PUT is one of those: {:?}",
+                run.report
+            );
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
         /// Run settings never reach the published parts: two run targets that
         /// cut the runs into different numbers of parts publish the
         /// single-level bytes and keys. Both run under the fixture's G = 12
