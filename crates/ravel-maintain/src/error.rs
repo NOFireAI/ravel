@@ -455,6 +455,8 @@ pub enum MaintainError {
     },
     #[error("RLOG compaction refused before writing any part: {0}")]
     InvalidRlogZstdLevel(#[from] crate::config::RlogZstdLevelError),
+    #[error("RLOG compaction refused before writing any part: {0}")]
+    InvalidRlogRunBlockTarget(#[from] crate::config::RlogRunBlockTargetError),
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
     /// The ADR-1702 read gate returned no result for a maintenance decode or

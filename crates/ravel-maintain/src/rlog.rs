@@ -448,14 +448,18 @@ fn writes_rlog(bucket: &Bucket) -> bool {
     }
 }
 
-/// Refuse an out-of-range [`CompactorConfig::rlog_zstd_level`] for a run over
-/// `bucket` that writes `.rlog` parts. Every entry point that can reach
+/// Refuse an out-of-range [`CompactorConfig::rlog_zstd_level`] or a zero
+/// [`CompactorConfig::rlog_run_block_target_records`] for a run over `bucket`
+/// that writes `.rlog` parts. Every entry point that can reach
 /// [`merge_catalogs`] (compaction, format migration, the shared rewrite
 /// primitive, and the erasure rewrite) calls this before its first store
 /// request; a bucket of another signal is not checked.
-pub(crate) fn check_rlog_zstd_level(config: &CompactorConfig, bucket: &Bucket) -> Result<()> {
+pub(crate) fn check_rlog_writer_config(config: &CompactorConfig, bucket: &Bucket) -> Result<()> {
     if writes_rlog(bucket) {
         crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
+        crate::config::validate_rlog_run_block_target_records(
+            config.rlog_run_block_target_records,
+        )?;
     }
     Ok(())
 }
@@ -1072,6 +1076,7 @@ struct PartWriterSettings {
     clustering_generation: u64,
     bloom_scope: BloomScope,
     group_target_blocks: usize,
+    block_target_records: usize,
 }
 
 /// The zstd level a two-level merge's scratch runs are written with
@@ -1085,6 +1090,10 @@ const RUN_PAGE_CHOICE: PageChoice = PageChoice::Estimated;
 /// Blocks per row group of a scratch run (ADR-3853 D1): one, so level 2 can
 /// read a run block by block and price each read as one block.
 const RUN_GROUP_TARGET_BLOCKS: usize = 1;
+
+/// Default records per block of a scratch run (ADR-3853 D2): runs are
+/// transient and read once, and this never reaches a published part.
+pub const RUN_BLOCK_TARGET_RECORDS: usize = 1024;
 
 /// Bytes of the four-byte little-endian `covered_count` and `covered_crc32c`
 /// fields that frame a BLOOM covered-column list.
@@ -1334,9 +1343,11 @@ async fn merge_catalogs_with_geometry(
     geometry: GeometryCheck<'_>,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
 ) -> Result<MergeOutput> {
-    // The entry points refuse a bad level before their first store request
-    // ([`check_rlog_zstd_level`]); this covers a direct `build_parts` caller.
+    // The entry points refuse a bad level or run block target before their
+    // first store request ([`check_rlog_writer_config`]); this covers a direct
+    // `build_parts` caller.
     let zstd_level = crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
+    crate::config::validate_rlog_run_block_target_records(config.rlog_run_block_target_records)?;
     let key_index_fields = merged_key_index_fields(catalogs);
     // Global stream_ref remap + cross-object stream-identity check. The
     // merged set is the sorted union of every input's STREAM_DIR; the dense
@@ -1389,6 +1400,7 @@ async fn merge_catalogs_with_geometry(
         clustering_generation: clustering.clustering_generation,
         bloom_scope,
         group_target_blocks: RlogConfig::default().group_target_blocks,
+        block_target_records: RlogConfig::default().block_target_records,
     });
     let output = OutputSpec {
         identity: compactor_identity(bucket, config),
@@ -2767,6 +2779,14 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The record count of each run part level 2 of the last merge unit on
+    /// this thread read.
+    static LEVEL2_RUN_RECORDS: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Holds every level-1 run-part encode before it starts until released, and
 /// counts the encodes that reached it and the ones whose task has since let
 /// go of it, by finishing or by being dropped.
@@ -3293,6 +3313,7 @@ async fn merge_in_unit(
         clustering_generation: output.writer.clustering_generation,
         bloom_scope: output.writer.bloom_scope.clone(),
         group_target_blocks: RUN_GROUP_TARGET_BLOCKS,
+        block_target_records: config.rlog_run_block_target_records,
     });
     let run_declared = Arc::new(DeclaredSchema::build(&[], &BTreeMap::new()));
     let group_len = usize::try_from(layout.group_size).unwrap_or(usize::MAX);
@@ -3386,6 +3407,8 @@ async fn merge_in_unit(
     for key in run_keys {
         runs.push(load_catalog_noted(meter, config, None, key, false).await?);
     }
+    #[cfg(test)]
+    LEVEL2_RUN_RECORDS.with(|r| *r.borrow_mut() = runs.iter().map(|c| c.record_count).collect());
     let mut run_block_bytes = 0u64;
     let mut run_blocks = 0usize;
     let mut lens: Vec<u64> = Vec::new();
@@ -5524,10 +5547,12 @@ impl PartBuilder {
     }
 
     /// Build a fresh writer over `records`. The writer configuration is the L0
-    /// write path's `RlogConfig::default()` except for the zstd level, which is
-    /// the compaction level (ADR-2135 decision 4), and the page choice, which
-    /// is [`L1_PAGE_CHOICE`]; the writer sorts the part by the merge's output
-    /// descriptor and limits BLOOM to its bloom scope.
+    /// write path's `RlogConfig::default()` except for the zstd level, page
+    /// choice, blocks per row group and records per block, which come from
+    /// `writer`: for a published part the compaction level (ADR-2135 decision
+    /// 4), [`L1_PAGE_CHOICE`] and the two defaults, for a scratch run the
+    /// ADR-3853 D2 run settings. The writer sorts the part by the merge's
+    /// output descriptor and limits BLOOM to its bloom scope.
     fn build_writer(
         identity: &ObjectIdentity,
         indexed_fields: &[String],
@@ -5539,6 +5564,7 @@ impl PartBuilder {
             zstd_level: writer.zstd_level,
             page_choice: writer.page_choice,
             group_target_blocks: writer.group_target_blocks,
+            block_target_records: writer.block_target_records,
             ..RlogConfig::default()
         };
         let mut w = RlogWriter::new(cfg, *identity)
@@ -16133,6 +16159,135 @@ mod tests {
             assert!(writes[0].1 != writes[1].1, "{writes:?}");
         }
 
+        /// The run block target fixture: 60 inputs of 40 streams with 10
+        /// records each, one block per input, so a run part cut at
+        /// [`BLOCK_TARGET_RUN_TARGET`] holds several hundred records.
+        fn block_target_inputs() -> Vec<L0Input> {
+            blocked(wide_inputs(60, 40, 10), 400)
+        }
+
+        /// The run memory target of the block target fixture.
+        const BLOCK_TARGET_RUN_TARGET: u64 = 128 << 10;
+
+        /// The final part memory target of the block target fixture, the same
+        /// on both sides: large enough that a published part holds more than
+        /// 16 records, so a run block target reaching it shows in its bytes.
+        const BLOCK_TARGET_PART: u64 = 64 << 10;
+
+        /// Seeds the block target fixture on a fresh store and compacts it
+        /// under `config`; returns the outcome, the run, the published parts
+        /// and the record count of each run part level 2 read.
+        async fn compact_block_target(
+            config: &CompactorConfig,
+        ) -> (
+            Result<CompactionOutcome>,
+            Run,
+            (Vec<String>, Output),
+            Vec<u64>,
+        ) {
+            let store = ProbeStore::new();
+            seed_inputs(&store, &block_target_inputs()).await;
+            LEVEL2_RUN_RECORDS.with(|r| r.borrow_mut().clear());
+            let (outcome, run) = compact_logged(&store, config).await;
+            let runs = LEVEL2_RUN_RECORDS.with(|r| r.take());
+            (outcome, run, published(&store).await, runs)
+        }
+
+        /// ADR-3853 D2: the run block target cuts the runs' blocks, and so
+        /// level 2's per-run price, and never reaches a published part.
+        #[tokio::test]
+        async fn run_block_target_is_transient_and_cuts_run_blocks() {
+            let parts = |config: CompactorConfig| CompactorConfig {
+                rlog_l1_part_memory_target_bytes: Some(BLOCK_TARGET_PART),
+                ..config
+            };
+            let resident = parts(two_level_config(
+                64 << 20,
+                crate::RLOG_RUN_MEMORY_TARGET_BYTES,
+                None,
+            ));
+            let (outcome, single, oracle, _) = compact_block_target(&resident).await;
+            outcome.expect("single-level compact");
+            assert!(single.mode_line().contains("mode=\"resident\""));
+            assert!(!oracle.0.is_empty());
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &block_target_inputs()).await;
+            let per_input = level1_per_input(&store, &keys).await;
+            let ceiling = group_ceiling(per_input, BLOCK_TARGET_RUN_TARGET, 12);
+
+            let mut figures = Vec::new();
+            for target in [16usize, 8192] {
+                let dir = fresh_scratch(&format!("block-target-{target}"));
+                let config = CompactorConfig {
+                    rlog_run_block_target_records: target,
+                    ..parts(two_level_config(
+                        ceiling,
+                        BLOCK_TARGET_RUN_TARGET,
+                        Some(dir.clone()),
+                    ))
+                };
+                let (outcome, run, got, runs) = compact_block_target(&config).await;
+                outcome.unwrap_or_else(|e| panic!("target {target}: {e}"));
+                let line = run.line("rlog two-level merge");
+                assert_eq!(got.0, oracle.0, "target {target}: part keys");
+                assert!(
+                    got.1.hashes == oracle.1.hashes,
+                    "target {target}: content hashes"
+                );
+                assert!(got.1.parts == oracle.1.parts, "target {target}: part bytes");
+                assert_eq!(log_field(&line, "run_parts"), runs.len() as u64, "{line}");
+                assert!(
+                    runs.iter().all(|&records| records > 100),
+                    "every run part well over 16 records: {runs:?}"
+                );
+                let expected: u64 = runs.iter().map(|r| r.div_ceil(target as u64)).sum();
+                assert_eq!(
+                    log_field(&line, "run_blocks"),
+                    expected,
+                    "target {target}: {line}"
+                );
+                figures.push(log_field(&line, "run_block_bytes"));
+                assert!(scratch_entries(&dir).is_empty(), "target {target}");
+            }
+            let (small, default) = (figures[0], figures[1]);
+            assert!(
+                small * 10 < default,
+                "run block bytes {small} at 16 records against {default} at 8,192"
+            );
+        }
+
+        /// A zero run block target fails the run with its typed error before
+        /// the first store request. The control compacts the same fixture at
+        /// the default target and issues requests, so the zero is the check
+        /// firing first.
+        #[tokio::test]
+        async fn a_zero_run_block_target_is_refused_before_any_store_request() {
+            assert_eq!(
+                CompactorConfig::default().rlog_run_block_target_records,
+                1024
+            );
+            for target in [0, RUN_BLOCK_TARGET_RECORDS] {
+                let dir = fresh_scratch(&format!("zero-block-target-{target}"));
+                let config = CompactorConfig {
+                    rlog_run_block_target_records: target,
+                    ..two_level_config(64 << 20, TWO_LEVEL_RUN_TARGET, Some(dir.clone()))
+                };
+                let (outcome, run, _, _) = compact_two_level(&config).await;
+                let requests = run.report.total_requests();
+                if target == 0 {
+                    assert!(
+                        matches!(outcome, Err(MaintainError::InvalidRlogRunBlockTarget(_))),
+                        "{outcome:?}"
+                    );
+                    assert_eq!(requests, 0, "{:?}", run.report);
+                    assert!(!dir.exists(), "no scratch directory was created");
+                } else {
+                    outcome.expect("default target compacts");
+                    assert!(requests > 0, "{:?}", run.report);
+                }
+            }
+        }
+
         /// ADR-3853 D4: level 1 split over 4 workers, each with its own
         /// tracker under `U / 4`, publishes the bytes, keys and content
         /// hashes one worker does, and so the single-level ones. Each
@@ -16789,9 +16944,16 @@ mod tests {
                     + TWO_LEVEL_PART;
             let run_target = TWO_LEVEL_RUN_TARGET;
 
+            // One block per run part, as the docs above state, whatever the
+            // default run block target.
+            let one_block_per_part = |config: CompactorConfig| CompactorConfig {
+                rlog_run_block_target_records: RlogConfig::default().block_target_records,
+                ..config
+            };
             let ceiling = group_ceiling(per_input, run_target, 12);
             let dir = fresh_scratch("runs-not-parts");
-            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            let config =
+                one_block_per_part(two_level_config(ceiling, run_target, Some(dir.clone())));
             let (outcome, run, store, _) = compact_two_level(&config).await;
             assert!(
                 matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
@@ -16815,7 +16977,8 @@ mod tests {
 
             let ceiling = group_ceiling(per_input, run_target, 10);
             let dir = fresh_scratch("two-blocks-per-run");
-            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            let config =
+                one_block_per_part(two_level_config(ceiling, run_target, Some(dir.clone())));
             let (outcome, run, store, _) = compact_two_level(&config).await;
             match outcome {
                 Ok(CompactionOutcome::TwoLevelUnsupported {
