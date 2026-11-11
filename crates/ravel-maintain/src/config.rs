@@ -2368,9 +2368,9 @@ pub struct CompactorConfig {
     /// totals reach this many records. Each range numbers its parts in a
     /// window of the part key's 10,000 indexes proportional to the quantum's
     /// share of the unit's records, so a two-level merge of more than 10,000
-    /// times the quantum records is refused before level 2 encodes a part. Independent of the
-    /// worker counts, so every worker count publishes the same parts. Zero is
-    /// refused like [`Self::level2_workers`]. Default
+    /// times the quantum records is refused before level 2 encodes a part.
+    /// Independent of the worker counts, so every worker count publishes the
+    /// same parts. Zero is refused like [`Self::level2_workers`]. Default
     /// [`crate::rlog::LEVEL2_RANGE_RECORDS`].
     pub rlog_level2_range_records: u64,
     /// The predicted decoded rows at or below which a cursor plan always runs

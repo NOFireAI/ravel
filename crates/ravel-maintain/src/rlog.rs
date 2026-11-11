@@ -2618,8 +2618,9 @@ impl ObjectStoreBackend for ScratchMeter {
 /// amendment). Level 2 cuts the stream key space into ranges of a fixed
 /// record quantum by the per-stream totals level 1 tallied, and numbers each
 /// range's parts from its proportional window of the part key's indexes
-/// ([`RangeWindows`]), so every `W2` publishes the same parts. One range worker keeps up to `E` part builders
-/// in flight ([`level2_encode_builders`]); several encode inline (D3). Only
+/// ([`RangeWindows`]), so every `W2` publishes the same parts. One range
+/// worker keeps up to `E` part builders in flight
+/// ([`level2_encode_builders`]); several encode inline (D3). Only
 /// compaction reaches this, and it keeps every record.
 async fn two_level_merge(
     target: &TwoLevelTarget<'_>,
