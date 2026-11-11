@@ -1723,8 +1723,8 @@ async fn a_failed_level1_worker_stops_every_level1_worker() {
 }
 
 /// ADR-3853 D5 amendment: level 2's range workers share a stop token as
-/// level 1's do. Four range workers over four ranges; the PUT of part 4, the
-/// first part of range 1, fails for good. Its worker stops the others, and
+/// level 1's do. Four range workers over four ranges; the PUT of part 2,500,
+/// the first part of range 1's window, fails for good. Its worker stops the others, and
 /// each other worker is past at most the part PUT it was already issuing: at
 /// most `W2 - 1` part PUTs follow the fault. The unit returns that error,
 /// publishes no record, and the parts already written are orphans for the
@@ -1736,8 +1736,8 @@ async fn a_failed_level2_worker_stops_every_level2_worker() {
     let per_input = sixty_inputs_per_input_bytes(&dir).await;
 
     let plan = FaultPlan::empty().with_rule(
-        Rule::new(Op::Put, ScriptedFault::Permanent("part 4 lost".to_string()))
-            .with_key_contains(".0004.")
+        Rule::new(Op::Put, ScriptedFault::Permanent("part 2500 lost".to_string()))
+            .with_key_contains(".2500.")
             .with_occurrence(Occurrence::Nth(1)),
     );
     let ledger = RequestLedger::new();
@@ -1751,7 +1751,6 @@ async fn a_failed_level2_worker_stops_every_level2_worker() {
         request_ledger: Some(ledger.clone()),
         level2_workers: Some(4),
         rlog_level2_range_records: 600,
-        rlog_level2_range_slots: 4,
         rlog_l1_part_memory_target_bytes: Some(24 * 4096),
         rlog_run_block_target_records: 40,
         ..two_level(
@@ -1769,7 +1768,7 @@ async fn a_failed_level2_worker_stops_every_level2_worker() {
     let err = ravel_maintain::compact_bucket(&store, &clock, &config, &b)
         .await
         .expect_err("a lost part fails the unit");
-    assert!(err.to_string().contains("part 4 lost"), "{err}");
+    assert!(err.to_string().contains("part 2500 lost"), "{err}");
     assert_eq!(
         store.inner.fault_count(Op::Put, FaultKind::Permanent),
         1,

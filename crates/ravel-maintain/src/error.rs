@@ -159,21 +159,6 @@ pub enum TwoLevelCheck {
         /// `U`, or `U / W2` with the level-2 worker count configured.
         ceiling_bytes: u64,
     },
-    /// A level-2 range needs a part index outside its slots (ADR-3853 D5
-    /// amendment): range `r` numbers its parts `r x K .. r x K + K`, and the
-    /// part it would open next is at `part_index`, past them or past the
-    /// part key's four digits. Refused before that part's builder opens, so
-    /// its records are never encoded.
-    RangeSlots {
-        /// The range, `r`, counted from 0 over the unit's ranges.
-        range: u64,
-        /// The unit's level-2 ranges.
-        ranges: u64,
-        /// `K`, the part-index slots each range has.
-        slots: u32,
-        /// The part index the range needed.
-        part_index: u64,
-    },
 }
 
 impl std::fmt::Display for TwoLevelCheck {
@@ -212,16 +197,6 @@ impl std::fmt::Display for TwoLevelCheck {
             } => write!(
                 f,
                 "level 2 over a predicted {runs} runs of group size {group_size} at {per_input_bytes} bytes per input needs {runs} x {blocks_per_run} blocks x {block_bytes} + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes at every level-1 worker count (constraint b, refused before level 1)"
-            ),
-            Self::RangeSlots {
-                range,
-                ranges,
-                slots,
-                part_index,
-            } => write!(
-                f,
-                "level-2 range {range} of {ranges} needs part index {part_index}, outside its {slots} slots from {} or past the part key's 9999 (refused before encoding that part)",
-                range.saturating_mul(u64::from(*slots))
             ),
         }
     }
@@ -441,6 +416,39 @@ pub enum MaintainError {
         inputs: usize,
         /// The check that refused, with its figures.
         check: TwoLevelCheck,
+    },
+    /// A range of an RLOG merge needs a part index outside its window
+    /// (ADR-3853 D5 amendment): the range numbers its parts from `first`, and
+    /// the part it would open next is at `part_index`, at or past `limit`.
+    /// Refused before that part's builder opens, so its records are never
+    /// encoded.
+    #[error(
+        "RLOG compaction refused: range {range} needs part index {part_index}, outside its window [{first}, {limit}) of the part key's indexes (ADR-3853); refused before encoding that part, the L0 inputs stay live"
+    )]
+    PartRangeWindow {
+        /// The range, counted from 0 over the unit's ranges.
+        range: u64,
+        /// The first part index of the range's window.
+        first: u64,
+        /// One past the last part index of the range's window.
+        limit: u64,
+        /// The part index the range needed.
+        part_index: u64,
+    },
+    /// An RLOG merge's records pass `keys` times its range quantum, so a full
+    /// range's part-index window would hold no index (ADR-3853 D5
+    /// amendment). Refused from the inputs' record counts before a part is
+    /// encoded.
+    #[error(
+        "RLOG compaction refused: {records} records cut at a range quantum of {quantum} need more ranges than the part key's {keys} indexes give windows (ADR-3853); nothing published, the L0 inputs stay live"
+    )]
+    PartKeySpace {
+        /// The unit's records, summed from its inputs' footers.
+        records: u64,
+        /// The range quantum, [`crate::CompactorConfig::rlog_level2_range_records`].
+        quantum: u64,
+        /// The part indexes a part key carries.
+        keys: u64,
     },
     /// The filesystem holding the scratch directory has less free space than
     /// the two-level merge's runs need once the units of this process already

@@ -400,6 +400,8 @@ fn merge_end_outcome(
         Err(
             MaintainError::MergeGeometryUnsupported { .. }
             | MaintainError::MergeTwoLevelUnsupported { .. }
+            | MaintainError::PartRangeWindow { .. }
+            | MaintainError::PartKeySpace { .. }
             | MaintainError::ScratchHeadroom { .. }
             | MaintainError::ScratchLocked { .. },
         ) => "refused",
