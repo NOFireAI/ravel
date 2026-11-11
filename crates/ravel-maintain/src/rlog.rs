@@ -3490,13 +3490,21 @@ fn part_keys() -> u64 {
 
 /// The part-index windows of a unit's ranges (ADR-3853 D5 amendment): a
 /// range starting after `before` of the unit's `t` records numbers its parts
-/// from `floor(keys x before / t)`, and may use them up to, not including,
-/// `floor(keys x (before + quantum) / t)`, or `keys` when fewer than
-/// `quantum` records remain after `before`. Each window is proportional to
-/// the records a full range holds, so a range that closes at or past the
-/// quantum starts the next window at or past its own limit: the windows are
-/// disjoint and every index is under `keys`. With `t <= keys x quantum` every
+/// from `index(before)`, `index(x) = floor(keys x x / t)`. A part it opens
+/// after `emitted` records must sit under
+/// `max(index(before + quantum), index(emitted))`, or under `keys` when fewer
+/// than `quantum` records remain after `before`: the window grows with the
+/// records the range has emitted, so a range holding more than `quantum`
+/// records gets their share of the indexes. With `t <= keys x quantum` every
 /// window holds at least one index.
+///
+/// The windows are disjoint. A range that is not the last closes after some
+/// `e` records with `e >= before + quantum`, since it closes only once its
+/// records reach the quantum, and the next range starts at `index(e)`. Every
+/// part this range opened did so after fewer than `e` records, so its index
+/// is under `max(index(before + quantum), index(e - 1)) <= index(e)`, because
+/// `index` does not decrease. The last range's limit is `keys` at most, so
+/// every index is under `keys`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RangeWindows {
     t: u64,
@@ -3534,7 +3542,7 @@ impl RangeWindows {
     }
 
     /// One past the last part index a range starting after `before` records
-    /// may use.
+    /// may use before it has emitted any record past `before + quantum`.
     fn limit(&self, before: u64) -> u64 {
         if self.t.saturating_sub(before) < self.quantum {
             self.keys
@@ -3575,7 +3583,8 @@ struct RangeCutter {
     seed: u64,
     /// The open range's first part index.
     first: u64,
-    /// One past the last part index the open range may use.
+    /// One past the last part index the open range may use at its start;
+    /// [`Self::open_limit`] widens it as the range emits.
     limit: u64,
     /// The records `emitted` must reach by the sink's finish: `t` for a whole
     /// unit, the records before the next worker's first range for a range
@@ -3636,11 +3645,17 @@ impl RangeCutter {
         self.range - self.seed + u64::from(self.range_records > 0)
     }
 
+    /// One past the last part index a part opened now may take:
+    /// `max(index(before + quantum), index(emitted))` ([`RangeWindows`]).
+    fn open_limit(&self) -> u64 {
+        self.limit.max(self.windows.index(self.emitted))
+    }
+
     fn refusal(&self, part_index: u64) -> MaintainError {
         MaintainError::PartRangeWindow {
             range: self.range,
             first: self.first,
-            limit: self.limit,
+            limit: self.open_limit(),
             part_index,
         }
     }
@@ -5747,7 +5762,7 @@ impl PartSink<'_> {
     async fn push(&mut self, r: LogRecord) -> Result<()> {
         if self.current.is_none() {
             if let Some(cutter) = &self.range
-                && u64::from(self.part_index) >= cutter.limit
+                && u64::from(self.part_index) >= cutter.open_limit()
             {
                 return Err(cutter.refusal(u64::from(self.part_index)));
             }
