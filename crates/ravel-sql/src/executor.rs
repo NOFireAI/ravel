@@ -6191,16 +6191,7 @@ impl FirstRefusal {
             }
             RetryPlan::SortMerge(reason) => ("sort_merge", Some(reason), None),
         };
-        let retry_refusal = match error {
-            None => "none",
-            Some(error) if error.to_string().contains(crate::BUCKET_SPILL_UNDERSHOOT) => {
-                "bucket_spill_undershoot"
-            }
-            Some(SqlError::ResourcesExhausted(_)) => {
-                pool.first.map_or("other", MemoryRefusal::as_str)
-            }
-            Some(_) => "other",
-        };
+        let retry_refusal = retry_refusal_class(error);
         let shape = derivation.map(|derivation| derivation.shape);
         SpillRetryReport {
             effective_limit_bytes: derivation.map(|derivation| derivation.effective_limit as u64),
@@ -6231,6 +6222,30 @@ impl FirstRefusal {
             share_bytes: share,
             retry_pool_limit_bytes: pool.query_limit,
         }
+    }
+}
+
+/// What ended a spill retry, read from the error it surfaced and nothing
+/// else: the retry's pool also records refusals the retry absorbed (a
+/// bucketed exec's spill, a partial aggregate's early emit, an exchange's
+/// spill), and the spill-mode cap's refusals record nothing there.
+/// `none` when it answered; `bucket_spill_undershoot` for an error carrying
+/// [`crate::BUCKET_SPILL_UNDERSHOOT`]; else the class the pool's refusal
+/// message names ([`crate::memory::refusal_class_of_message`]); `other` for
+/// any other error.
+fn retry_refusal_class(error: Option<&SqlError>) -> &'static str {
+    let Some(error) = error else {
+        return "none";
+    };
+    let message = error.to_string();
+    if message.contains(crate::BUCKET_SPILL_UNDERSHOOT) {
+        return "bucket_spill_undershoot";
+    }
+    match error {
+        SqlError::ResourcesExhausted(_) => {
+            crate::memory::refusal_class_of_message(&message).unwrap_or("other")
+        }
+        _ => "other",
     }
 }
 
@@ -6314,9 +6329,15 @@ pub struct SpillRetryReport {
     /// State rows the bucketed exec read back from its scratch files.
     pub bucket_spill_rows_read: u64,
     /// The retry pool's peak asked bytes, the figure
-    /// [`SqlOutcome::peak_asked_intermediate_bytes`] reports.
+    /// [`SqlOutcome::peak_asked_intermediate_bytes`] reports. 0 for a
+    /// bucketed retry that failed before its pool granted any reservation,
+    /// one that failed before it asked for anything included.
     pub retry_peak_asked_bytes: u64,
-    /// What failed the retry: a [`MemoryRefusal`] log name,
+    /// What ended the retry, read from the error it surfaced
+    /// ([`retry_refusal_class`]), not from the refusals its pool recorded:
+    /// a [`MemoryRefusal`] log name, `spill_hard_bound` (a spill-mode
+    /// refusal over the hard bound), `spill_cap` (one over the spill-mode
+    /// cap or a fair share of it, without the under-shoot label),
     /// `bucket_spill_undershoot`, or `other`; `none` when it answered.
     pub retry_refusal: &'static str,
     /// The per-query limit of the pool the retry ran under: the effective
@@ -7179,15 +7200,19 @@ fn refusal_is_own(pool: PoolReport) -> bool {
 
 /// The per-query limit a bucketed spill retry derives its tuning at and runs
 /// its pool under: `query_limit` (`L`) on a query-pool refusal or with no
-/// recorded share, else `min(L, B - (R - own))` on the refusing budget's
-/// [`BudgetShare`], where `B` is its limit, `R` its reserved bytes and `own`
-/// the statement's bytes on it. Saturating, so others holding more than `B`
-/// give 0; an unbounded `B` (`u64::MAX`) gives `L`.
+/// recorded share, else `min(L, B - others)` on the refusing budget's
+/// [`BudgetShare`], where `B` is its limit and `others` everything it held
+/// at the refusal that was not this statement's: SQL execution's reserved
+/// bytes less the statement's own (`budget_reserved - own`), plus the bytes
+/// the fetch layer and the caches held ([`BudgetShare::non_sql_reserved`],
+/// 0 on a tenant budget). So the limit is the room that budget had left for
+/// this statement at the refusal, capped at `L`. Saturating throughout, so
+/// others holding more than `B` give 0; an unbounded `B` (`u64::MAX`) gives
+/// `L`.
 ///
-/// On the process budget `R` is SQL execution's reservations only
-/// ([`BudgetShare::budget_reserved`]): the bytes the fetch layer and the
-/// caches hold are not subtracted, so the limit can exceed the room the
-/// process budget has left, and the retry can still be refused there.
+/// The room is read at the first refusal. Memory the budget's other holders
+/// take after it, before or while the retry runs, is not known here, and
+/// the retry can still be refused for it.
 pub(crate) fn retry_effective_limit(
     query_limit: usize,
     first: Option<MemoryRefusal>,
@@ -7198,7 +7223,10 @@ pub(crate) fn retry_effective_limit(
             Some(MemoryRefusal::Tenant | MemoryRefusal::Process | MemoryRefusal::ReserveAhead),
             Some(share),
         ) if share.limit != u64::MAX => {
-            let others = share.budget_reserved.saturating_sub(share.own);
+            let others = share
+                .budget_reserved
+                .saturating_sub(share.own)
+                .saturating_add(share.non_sql_reserved);
             let room = share.limit.saturating_sub(others);
             usize::try_from(room).map_or(query_limit, |room| room.min(query_limit))
         }
@@ -9623,6 +9651,7 @@ pub(crate) mod tests {
                 budget_reserved,
                 own,
                 limit: u64::MAX,
+                non_sql_reserved: 0,
             }),
             ..PoolReport::default()
         };
@@ -9789,6 +9818,7 @@ pub(crate) mod tests {
                         budget_reserved: 1000,
                         own,
                         limit: 1050,
+                        non_sql_reserved: 0,
                     })
                 )
             );
@@ -9839,6 +9869,7 @@ pub(crate) mod tests {
             budget_reserved: 700,
             own: 700,
             limit: 1050,
+            non_sql_reserved: 300,
         });
 
         let (pool, first, second, join) = statement();
@@ -9947,6 +9978,7 @@ pub(crate) mod tests {
             budget_reserved: 400,
             own: 400,
             limit: 1050,
+            non_sql_reserved: 600,
         });
         assert_eq!(
             shares_beside_a_fetch_reservation(600, 0, 100, 200),
@@ -9971,6 +10003,7 @@ pub(crate) mod tests {
             budget_reserved: 1000,
             own: 100,
             limit: 1650,
+            non_sql_reserved: 600,
         });
         assert_eq!(
             shares_beside_a_fetch_reservation(600, 900, 50, 0),
@@ -10000,13 +10033,14 @@ pub(crate) mod tests {
             ..PoolReport::default()
         };
         for (sql_reserved, own, capped) in [(300, 500, 300), (0, 5, 0), (300, 100, 100)] {
-            let share = BudgetShare::of_sql_share(sql_reserved, own, 1000);
+            let share = BudgetShare::of_sql_share(sql_reserved, 0, own, 1000);
             assert_eq!(
                 share,
                 BudgetShare {
                     budget_reserved: sql_reserved,
                     own: capped,
                     limit: 1000,
+                    non_sql_reserved: 0,
                 }
             );
         }
@@ -10018,7 +10052,7 @@ pub(crate) mod tests {
             assert_eq!(
                 spill_retry_decision(
                     &SqlError::ResourcesExhausted("refused".into()),
-                    refused(BudgetShare::of_sql_share(sql_reserved, own, 1000)),
+                    refused(BudgetShare::of_sql_share(sql_reserved, 0, own, 1000)),
                     0,
                     true,
                     true,
@@ -10496,10 +10530,255 @@ pub(crate) mod tests {
         assert_eq!(not_executed.retry_plan, "bucket");
     }
 
+    /// Issue #4114: the retry line's `retry_refusal` names the refusal that
+    /// ended the retry, read from its error, not the first refusal its pool
+    /// recorded. Each error is a real refusal of a spill-mode pool (per-query
+    /// limit 1000, headroom 100: cap 900, fair share 450 for two spill-capable
+    /// consumers, hard bound 950) on a 1200-byte process budget, carried
+    /// through [`FirstRefusal::report`] with the pool's own report and read
+    /// off the emitted INFO line.
+    ///
+    /// - A process budget refusal the retry absorbed (a fetch hold fills the
+    ///   budget, then leaves), then a hard-bound refusal: `spill_hard_bound`.
+    ///   Today's first-recorded read names `process_budget`.
+    /// - A per-query limit refusal absorbed, then a process budget refusal:
+    ///   `process_budget`. The first-recorded read names `query_pool`.
+    /// - A fair-share refusal with nothing recorded before it: `spill_cap`,
+    ///   and the same message with the exec's under-shoot label:
+    ///   `bucket_spill_undershoot`.
+    ///
+    /// Driven at the report rather than through an executor: a retry that
+    /// absorbs one refusal and surfaces another depends on how its streams
+    /// interleave, so no fixture reaches either order deterministically.
+    #[test]
+    fn the_retry_refusal_names_what_ended_the_retry() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("not poisoned")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+        let pool = |budget: &Arc<MemoryBudget>| {
+            let tenant = TenantMemoryAccountant::with_process_budget(1 << 40, Arc::clone(budget));
+            Arc::new(
+                TenantDelegatingPool::new(
+                    1000,
+                    tenant,
+                    CeilingBreach::new(),
+                    ravel_types::accounting::QueryAccounting::new(),
+                )
+                .with_spill_headroom(100),
+            )
+        };
+        let spillable = |pool: &Arc<TenantDelegatingPool>, name: &str| -> MemoryReservation {
+            let pool: Arc<dyn MemoryPool> = Arc::clone(pool) as Arc<dyn MemoryPool>;
+            MemoryConsumer::new(name)
+                .with_can_spill(true)
+                .register(&pool)
+        };
+        let refusal = |result: datafusion::error::Result<()>| match result {
+            Err(DataFusionError::ResourcesExhausted(message)) => {
+                SqlError::ResourcesExhausted(message)
+            }
+            other => panic!("a memory refusal, got {other:?}"),
+        };
+        let line = |pool: PoolReport, error: &SqlError| {
+            let first = FirstRefusal {
+                class: "query_pool",
+                after: Duration::ZERO,
+                figures: RetryFigures {
+                    asked_bytes: 0,
+                    consumed_rows: None,
+                    first: Some(MemoryRefusal::Query),
+                    share: None,
+                },
+            };
+            let report = first.report(
+                SpillCounts::default(),
+                &[],
+                None,
+                None,
+                pool,
+                None,
+                None,
+                0,
+                Some(error),
+            );
+            let lines = Lines::default();
+            let writer = lines.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                report.emit("00000000deadbeef", "failed");
+            });
+            let text = String::from_utf8(lines.0.lock().expect("not poisoned").clone())
+                .expect("utf-8 log");
+            assert_eq!(text.lines().count(), 1, "{text}");
+            let field = text
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("retry_refusal="))
+                .unwrap_or_else(|| panic!("no retry_refusal on the line: {text}"))
+                .trim_matches('"')
+                .to_string();
+            assert_eq!(field, report.retry_refusal, "the line is the report");
+            field
+        };
+
+        let budget = Arc::new(MemoryBudget::new(1200));
+        let absorbed_process = pool(&budget);
+        let exchange = spillable(&absorbed_process, "RepartitionExec[0]");
+        let bucketed = spillable(&absorbed_process, "BucketedFinalAggregate[0]");
+        let fetch = budget.reserve(1000).expect("the fetch hold fits");
+        let absorbed = refusal(exchange.try_grow(300));
+        assert!(
+            absorbed
+                .to_string()
+                .contains("process memory budget exhausted"),
+            "{absorbed}"
+        );
+        drop(fetch);
+        exchange.grow(600);
+        let ended = refusal(bucketed.try_grow(400));
+        assert!(
+            ended.to_string().contains("over the spill-mode hard bound"),
+            "{ended}"
+        );
+        let recorded = report(&absorbed_process);
+        assert_eq!(recorded.first, Some(MemoryRefusal::Process));
+        assert_eq!(line(recorded, &ended), "spill_hard_bound");
+        drop((exchange, bucketed, absorbed_process));
+
+        let absorbed_query = pool(&budget);
+        let unspillable = register(&absorbed_query, "HashJoinInput[0]");
+        let sorter = spillable(&absorbed_query, "ExternalSorter[0]");
+        let _bucketed = spillable(&absorbed_query, "BucketedFinalAggregate[0]");
+        let absorbed = refusal(unspillable.try_grow(1100));
+        assert!(
+            absorbed.to_string().contains("query memory pool exhausted"),
+            "{absorbed}"
+        );
+        let fetch = budget.reserve(1150).expect("the fetch hold fits");
+        let ended = refusal(sorter.try_grow(100));
+        assert!(
+            ended
+                .to_string()
+                .contains("process memory budget exhausted"),
+            "{ended}"
+        );
+        let recorded = report(&absorbed_query);
+        assert_eq!(recorded.first, Some(MemoryRefusal::Query));
+        assert_eq!(line(recorded, &ended), "process_budget");
+        drop((fetch, unspillable, sorter, _bucketed, absorbed_query));
+
+        let share_pool = pool(&budget);
+        let bucketed = spillable(&share_pool, "BucketedFinalAggregate[0]");
+        let _exchange = spillable(&share_pool, "RepartitionExec[0]");
+        let ended = refusal(bucketed.try_grow(500));
+        assert!(ended.to_string().contains("over its fair share"), "{ended}");
+        let recorded = report(&share_pool);
+        assert_eq!(
+            recorded.first, None,
+            "a spill-mode cap refusal records nothing"
+        );
+        assert_eq!(line(recorded, &ended), "spill_cap");
+        let undershoot = SqlError::ResourcesExhausted(format!(
+            "{ended}; {}: the stream had no routed state left to write",
+            crate::BUCKET_SPILL_UNDERSHOOT
+        ));
+        assert_eq!(line(recorded, &undershoot), "bucket_spill_undershoot");
+        drop((bucketed, _exchange, share_pool));
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Every refusal message the pool builds is classified by the phrase it
+    /// was built with, and the more specific phrase wins where a message
+    /// names two: a reserve-ahead refusal names the process budget or the
+    /// host gate as its cause.
+    #[test]
+    fn a_refusal_message_classifies_by_its_phrase() {
+        for (message, class) in [
+            (
+                "query memory pool exhausted: 10 more bytes",
+                Some("query_pool"),
+            ),
+            (
+                "tenant memory budget exhausted: 10 more bytes",
+                Some("tenant_budget"),
+            ),
+            (
+                "process memory budget exhausted: 10 more bytes",
+                Some("process_budget"),
+            ),
+            (
+                "host memory gate refused the reservation: host available memory",
+                Some("host_memory_gate"),
+            ),
+            (
+                "aggregate reserve-ahead refused: process memory budget exhausted for this \
+                 aggregate's reserve-ahead envelope",
+                Some("aggregate_reserve_ahead"),
+            ),
+            (
+                "query memory pool spill threshold reached: process memory budget exhausted \
+                 for this aggregate's reserve-ahead envelope",
+                Some("aggregate_reserve_ahead"),
+            ),
+            (
+                "aggregate reserve-ahead refused: host memory gate refused the reservation \
+                 for this aggregate's reserve-ahead envelope",
+                Some("host_memory_gate"),
+            ),
+            (
+                "query memory pool spill threshold reached: spill-capable consumers would \
+                 hold 1000 bytes charged and enveloped, over the spill-mode hard bound 950",
+                Some("spill_hard_bound"),
+            ),
+            (
+                "query memory pool spill threshold reached: spill-capable consumers would \
+                 hold 931 bytes charged and enveloped, over the spill-mode cap 900",
+                Some("spill_cap"),
+            ),
+            (
+                "query memory pool spill threshold reached: x would hold 500 bytes charged \
+                 and enveloped, over its fair share 450 of the spill-mode cap 900",
+                Some("spill_cap"),
+            ),
+            ("spill budget exhausted", None),
+        ] {
+            assert_eq!(
+                crate::memory::refusal_class_of_message(message),
+                class,
+                "{message}"
+            );
+        }
+    }
+
     /// The bucketed retry's limit follows the budget that refused: the
     /// query limit on a query-pool refusal or with no share, else the room
     /// the refusing budget leaves beside everyone else's reservations,
-    /// never above the query limit.
+    /// the fetch layer's and the caches' among them, never above the query
+    /// limit.
+    ///
+    /// FLIP: drop `non_sql_reserved` from `others` and the first, third and
+    /// fourth rows read 1000, 900 and 900.
     #[test]
     fn the_retry_limit_follows_the_budget_that_refused() {
         const L: usize = 1_000;
@@ -10508,9 +10787,48 @@ pub(crate) mod tests {
                 budget_reserved,
                 own,
                 limit,
+                non_sql_reserved: 0,
             })
         };
-        let cases: [(&str, Option<MemoryRefusal>, Option<BudgetShare>, usize); 9] = [
+        let beside = |budget_reserved: u64, own: u64, limit: u64, non_sql_reserved: u64| {
+            Some(BudgetShare {
+                budget_reserved,
+                own,
+                limit,
+                non_sql_reserved,
+            })
+        };
+        let cases: [(&str, Option<MemoryRefusal>, Option<BudgetShare>, usize); 14] = [
+            (
+                "process, only this statement's SQL, non-SQL 30% of B, B less it below L",
+                Some(MemoryRefusal::Process),
+                beside(500, 500, 1_200, 360),
+                1_200 - 360,
+            ),
+            (
+                "process, only this statement's SQL, non-SQL 30% of B, B less it above L",
+                Some(MemoryRefusal::Process),
+                beside(500, 500, 2_000, 600),
+                L,
+            ),
+            (
+                "process, non-SQL above B",
+                Some(MemoryRefusal::Process),
+                beside(100, 100, 900, 1_000),
+                0,
+            ),
+            (
+                "reserve-ahead, others' SQL and non-SQL both subtracted",
+                Some(MemoryRefusal::ReserveAhead),
+                beside(600, 400, 1_100, 300),
+                1_100 - 200 - 300,
+            ),
+            (
+                "tenant, non-SQL 0, unchanged",
+                Some(MemoryRefusal::Tenant),
+                beside(700, 500, 800, 0),
+                600,
+            ),
             (
                 "query pool",
                 Some(MemoryRefusal::Query),

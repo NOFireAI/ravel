@@ -3019,6 +3019,8 @@ struct RetryRun {
     report: Option<ravel_sql::SpillRetryReport>,
     plan: Option<String>,
     peak_pool_bytes: u64,
+    /// [`ravel_sql::SqlOutcome::peak_asked_intermediate_bytes`].
+    peak_asked: u64,
 }
 
 async fn retry_run(executor: &SqlExecutor, sql: &str) -> Result<RetryRun, String> {
@@ -3043,6 +3045,7 @@ async fn retry_run(executor: &SqlExecutor, sql: &str) -> Result<RetryRun, String
         report: outcome.stats.spill_retry,
         plan: outcome.stats.spill_retry_plan,
         peak_pool_bytes: outcome.accounting.peak_intermediate_bytes,
+        peak_asked: outcome.peak_asked_intermediate_bytes,
     })
 }
 
@@ -3258,6 +3261,191 @@ async fn bucket_spill_retry_answers_at_2_4_and_16_partitions() {
     }
 }
 
+/// Over the [`BIG_ROWS`] fixture, each key of `a % 2900000` below 100,000
+/// occurs twice, 2,900,000 rows apart, so its two rows sit in different
+/// batches and, at two scan partitions of 1.5M rows each, in both
+/// partitions; every other key occurs once. `v` is `a % 1000 - 500` and
+/// 2,900,000 is a multiple of 1000, so a key's `sum(v)` is its count times
+/// `k % 1000 - 500`. Most keys stay single so the groups, and so the
+/// unlimited peak the refusal is sized from, stay near the fixture's 3M.
+const RETRY_MERGE_SQL: &str =
+    "SELECT a % 2900000 AS k, count(*) AS c, sum(v) AS s FROM logs GROUP BY k";
+
+/// [`RETRY_MERGE_SQL`]'s top ten by count, then sum, then key: the 100
+/// keys `k % 1000 = 999` below 100,000 tie at count 2 and sum 998, so the
+/// answer is 999, 1999, ..., 9999, each `|2|998`, and only a merged count
+/// reaches 2.
+const RETRY_MERGE_TOP_SQL: &str = "SELECT a % 2900000 AS k, count(*) AS c, sum(v) AS s \
+                                   FROM logs GROUP BY k ORDER BY c DESC, s DESC, k LIMIT 10";
+
+/// Issue #4114: the bucketed retry merges a key's partial states read back
+/// from its bucket file and its in-memory chunks. Each key of
+/// [`RETRY_MERGE_SQL`] has a partial state from each scan partition, with
+/// different counts, and the retry's count and sum per key, and its exact
+/// top ten, equal the unspilled run's.
+///
+/// Prove-the-test: merge only the first state of each key on read-back and
+/// both statements' answers differ; evaluate and cut each bucket to its top
+/// k after every chunk instead of once after the last, and the top ten
+/// differs.
+#[tokio::test]
+async fn bucket_spill_retry_merges_each_keys_states() {
+    for sql in [RETRY_MERGE_SQL, RETRY_MERGE_TOP_SQL] {
+        let (unlimited, bucket, log) = answered_retry(sql, bucket_refusal(RETRY_PARTITIONS)).await;
+        let report = bucket.report.expect("the retry reports");
+        assert_eq!(
+            (report.retry_plan, report.retry_plan_reason),
+            ("bucket", None),
+            "{sql}: {log}"
+        );
+        assert!(report.bucket_spill_rows_written > 0, "{sql}: {report:?}");
+        assert_eq!(
+            report.bucket_spill_rows_read, report.bucket_spill_rows_written,
+            "{sql}: {report:?}"
+        );
+        let plan = bucket.plan.as_deref().expect("the retry's plan");
+        assert!(!bucketed_lines(plan).is_empty(), "{sql}: {plan}");
+        if sql == RETRY_MERGE_TOP_SQL {
+            assert!(
+                bucketed_lines(plan)
+                    .iter()
+                    .all(|line| line.contains("topk=")),
+                "each bucket is cut to the top k: {plan}"
+            );
+            let want: Vec<String> = (1..=10)
+                .map(|i| format!("{}|2|998", i * 1000 - 1))
+                .collect();
+            assert_eq!(bucket.rows, want, "{sql}");
+            assert_eq!(bucket.rows, unlimited.rows, "{sql}");
+        } else {
+            assert_eq!(bucket.rows.len(), 2_900_000, "{sql}");
+            let (bucket, unlimited) = (sorted(bucket.rows), sorted(unlimited.rows));
+            assert!(bucket == unlimited, "{sql}: the answers differ");
+            assert!(bucket.contains(&"999|2|998".to_string()));
+            assert!(bucket.contains(&"100999|1|499".to_string()));
+        }
+    }
+}
+
+/// Issue #4114: the retry line's figures checked against sources other
+/// than the report. On [`RETRY_GROUPS_SQL`] at two final partitions, refused
+/// at nine tenths of its unlimited peak:
+/// - `bits`: N = 3,000,000 (the fixture's rows); A and n are read off the
+///   first attempt, so `bits` is pinned against the derivation recomputed by
+///   hand from them below, and the literal is the value they give on this
+///   fixture (see the comment at the assertion);
+/// - `descriptor_need` = 2 x P x 2^bits + P with P = 2 written out;
+/// - `final_partitions` = the partition count of the hash exchange in the
+///   retry's plan text;
+/// - `retry_peak_asked_bytes` = the response's
+///   `peak_asked_intermediate_bytes`.
+#[tokio::test]
+async fn the_retry_line_figures_match_sources_outside_the_report() {
+    let (_, run, log) = answered_retry(RETRY_GROUPS_SQL, bucket_refusal(RETRY_PARTITIONS)).await;
+    let report = run.report.expect("the retry reports");
+    let bits = report.bits.expect("a bucketed retry has bits");
+    assert_eq!(report.scan_rows_total, Some(3_000_000));
+    // By hand, from one run of this fixture: A = 49,218,424 and n = 1,056,768
+    // at the first refusal, N = 3,000,000, P = 2, C = 8 (the C table's count
+    // over the retry plan, read off the line and pinned below), and the limit
+    // 137,753,503 (nine tenths of the unlimited peak, all of the process
+    // budget's room). T = A x N / n = 139.7 MB.
+    // H = max(64 MiB, 10% of the limit) = 67,108,864, so
+    // S = floor((137,753,503 - 67,108,864) / 8) = 8,830,579, and
+    // 2 x T / (P x 0.75 x S) = 279.4 MB / 13.25 MB = 21.1, whose ceil(log2) is
+    // 5. `bits` stays 5 for that ratio in (16, 32], so A / n can move by a
+    // quarter either way between runs and keep it.
+    assert_eq!(bits, 5, "{report:?}\n{log}");
+    assert_eq!(report.spillable_consumers, Some(8), "{report:?}");
+    assert_eq!(
+        report.descriptor_need,
+        Some(2 * 2 * (1u64 << bits) + 2),
+        "{report:?}"
+    );
+    let plan = run.plan.as_deref().expect("the retry's plan");
+    let exchange = plan
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("RepartitionExec: partitioning=Hash([")
+        })
+        .unwrap_or_else(|| panic!("no hash exchange in the retry's plan:\n{plan}"));
+    let partitions: usize = exchange
+        .split("], ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("no partition count in {exchange}"));
+    assert_eq!(partitions, RETRY_PARTITIONS);
+    assert_eq!(report.final_partitions, Some(partitions));
+    assert_eq!(
+        retry_info_field(&log, "final_partitions"),
+        partitions.to_string()
+    );
+    assert!(run.peak_asked > 0);
+    assert_eq!(report.retry_peak_asked_bytes, run.peak_asked);
+    assert_eq!(
+        retry_info_field(&log, "retry_peak_asked_bytes"),
+        run.peak_asked.to_string()
+    );
+}
+
+/// A candidate plan with one final aggregate the bucketed rule replaced and
+/// one it did not keeps the sort-merge retry with `not_admitted`, although
+/// the replaced one alone derives a tuning: the union of the planned
+/// bucketed statement and the same statement planned without the rule.
+///
+/// Prove-the-test: drop the `FinalPartitioned` check from
+/// `bucket_retry_derivation` and the union's reason is no longer
+/// `not_admitted`.
+#[tokio::test]
+async fn retry_refuses_a_plan_with_an_unreplaced_final_aggregate() {
+    use datafusion::common::tree_node::TreeNode;
+    use datafusion::physical_plan::union::UnionExec;
+
+    let sql = "SELECT a, count(*) AS c FROM logs GROUP BY a";
+    let on = executor(
+        ROWS,
+        sql_config(RETRY_PARTITIONS, Some(bucketed(ENGAGE_GROUPS)), None),
+    )
+    .await;
+    let replaced = physical_plan_tree(&on, sql).await;
+    let off = executor(ROWS, sql_config(RETRY_PARTITIONS, None, None)).await;
+    let unreplaced = physical_plan_tree(&off, sql).await;
+    let final_partitioned = |plan: &Arc<dyn ExecutionPlan>| {
+        let mut found = 0;
+        plan.apply(|node| {
+            if node
+                .downcast_ref::<AggregateExec>()
+                .is_some_and(|aggregate| *aggregate.mode() == AggregateMode::FinalPartitioned)
+            {
+                found += 1;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("the plan walks");
+        found
+    };
+    assert_eq!(final_partitioned(&replaced), 0);
+    assert_eq!(final_partitioned(&unreplaced), 1);
+    let figures = ravel_sql::BucketRetryFigures {
+        asked_bytes: 1 << 20,
+        consumed_rows: Some(ROWS as u64),
+        query_limit: ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+        nofile_soft: ravel_sql::DEFAULT_NOFILE_SOFT,
+        slots: 1,
+    };
+    ravel_sql::bucket_retry_tuning(&replaced, figures)
+        .unwrap_or_else(|reason| panic!("the replaced plan alone tunes, got {reason}"));
+    let both = UnionExec::try_new(vec![replaced, unreplaced]).expect("the union plans");
+    assert_eq!(
+        ravel_sql::bucket_retry_tuning(&both, figures),
+        Err(ravel_sql::RETRY_NOT_ADMITTED),
+        "{}",
+        displayable(both.as_ref()).indent(true)
+    );
+}
+
 /// The derivation's inputs for `report`'s retry of [`RETRY_GROUPS_SQL`] at
 /// [`RETRY_PARTITIONS`], at a per-query limit of `query_limit`.
 async fn groups_inputs(
@@ -3426,19 +3614,97 @@ async fn retry_keeps_sort_merge_when_the_descriptor_budget_is_short() {
     );
 }
 
-/// A bucketed retry that under-shoots fails the statement with its own
-/// refusal, and nothing runs after it: no sort-merge attempt, no second
-/// retry. The under-shoot comes from a process reservation outside SQL's
-/// basis (a fetch-class hold of `L`), so the effective limit is `L` while
-/// the room actually left is nine tenths of the unlimited peak. The data
-/// object is read once per attempt, so the store's GET count is the number
-/// of attempts.
+/// Issue #4114: a first attempt the process budget refuses while a live
+/// fetch-class reservation holds part of that budget retries through
+/// buckets at the room the budget had left for it, `B` less that
+/// reservation, below `L`. The reservation is 60% of `B`, more than the
+/// statement's own bytes at the refusal, which are all of SQL's.
+///
+/// Prove-the-test: drop `non_sql_reserved` from `retry_effective_limit` and
+/// the line reads `effective_limit_bytes` of `B` capped at `L`; fold
+/// `non_sql_reserved` into `budget_reserved` and the statement's own bytes
+/// are under half of the budget's, so the first attempt's refusal is
+/// returned with no retry.
+#[tokio::test]
+async fn a_process_refusal_beside_a_fetch_hold_retries_at_the_room_left() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = || retry_config(scratch.path(), RETRY_PARTITIONS, BIG_QUERY_BYTES);
+    let unlimited = retry_run(
+        &big_executor(config(), BIG_QUERY_BYTES).await,
+        RETRY_GROUPS_SQL,
+    )
+    .await
+    .expect("the unlimited run answers");
+    assert_eq!(unlimited.retries, 0);
+    let room = unlimited.peak_pool_bytes * 9 / 10;
+    let held = room * 3 / 2;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(room + held));
+    let hold = budget.reserve(held).expect("the fetch-class hold fits");
+    assert_eq!(budget.fetch_reserved(), held);
+    let refused = big_executor(config(), BIG_QUERY_BYTES)
+        .await
+        .with_process_memory_budget(Arc::clone(&budget));
+
+    let log = crate::spill::CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let run = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        retry_run(&refused, RETRY_GROUPS_SQL).await
+    };
+    let log = log.text();
+    let run = run.unwrap_or_else(|e| panic!("the retry answers: {e}\n{log}"));
+    drop(hold);
+    let report = run.report.expect("the retry reports");
+    assert!(
+        matches!(
+            report.first_refusal,
+            "process_budget" | "aggregate_reserve_ahead"
+        ),
+        "the process budget refused the first attempt: {log}"
+    );
+    assert!(room < BIG_QUERY_BYTES as u64, "{room} is below L");
+    assert_eq!(report.effective_limit_bytes, Some(room));
+    assert_eq!(
+        retry_info_field(&log, "effective_limit_bytes"),
+        room.to_string()
+    );
+    assert_eq!(report.retry_pool_limit_bytes, room);
+    assert_bucket_spilled(&run, &log, RETRY_PARTITIONS);
+
+    let at = |limit| async move {
+        ravel_sql::derive_bucket_spill_tuning(&groups_inputs(&report, limit).await)
+            .expect("a tuning derives")
+    };
+    let (at_room, at_l) = (at(room as usize).await, at(BIG_QUERY_BYTES).await);
+    assert_eq!(report.bits, Some(at_room.bits));
+    assert!(
+        at_room.bits > at_l.bits,
+        "{at_room:?} is finer than {at_l:?}"
+    );
+    assert_eq!(sorted(run.rows), sorted(unlimited.rows));
+}
+
+/// A bucketed retry that fails is the statement's error, and the statement
+/// is not planned again for a memory failure: no sort-merge attempt, no
+/// second spill retry. The snapshot retry for a segment that vanished
+/// before any row was emitted is separate and unchanged. Room is taken on the
+/// process budget after the first refusal and before the retry runs: a
+/// hold gate stops the retry's read of the data object, a fetch-class
+/// reservation takes all of the budget's unreserved bytes, then the read
+/// goes on. The effective limit is sized from the room at the first
+/// refusal, so nothing the retry plans can account for room taken after it.
+/// The data object is read once per attempt, so the store's GET count is
+/// the number of attempts.
 ///
 /// Prove-the-test: run the sort-merge plan after a failed bucketed retry and
-/// the statement answers, with three data-object GETs.
+/// the one INFO line, the last attempt's, reads `retry_plan="sort_merge"`.
 #[tokio::test]
 async fn a_failed_bucketed_retry_is_the_statements_error() {
-    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence};
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Sequence};
 
     let scratch = tempfile::tempdir().expect("scratch root");
     let config = || retry_config(scratch.path(), RETRY_PARTITIONS, BIG_QUERY_BYTES);
@@ -3466,13 +3732,9 @@ async fn a_failed_bucketed_retry_is_the_statements_error() {
         (1, BIG_ROWS),
     )
     .await;
-    let outside = BIG_QUERY_BYTES as u64;
-    let budget = Arc::new(ravel_memory::MemoryBudget::new(
-        unlimited.peak_pool_bytes * 3 / 10 + outside,
-    ));
-    let held = budget
-        .reserve(outside)
-        .expect("the outside holder reserves");
+    let retry_read = store.hold(Op::Get, Some("/l/l0/".to_string()), Occurrence::Nth(2));
+    let first_room = unlimited.peak_pool_bytes * 9 / 10;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(first_room));
     let refused = executor_over(
         Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
         config(),
@@ -3487,21 +3749,30 @@ async fn a_failed_bucketed_retry_is_the_statements_error() {
         .with_ansi(false)
         .with_max_level(tracing::Level::INFO)
         .finish();
-    let result = {
-        let _guard = tracing::subscriber::set_default(subscriber);
-        refused
-            .execute(tenant().hash(), &request(RETRY_GROUPS_SQL))
-            .await
+    let take_room = async {
+        retry_read.wait_until_held(1).await;
+        let taken = budget
+            .reserve(budget.unreserved())
+            .expect("the room left is reservable");
+        for id in retry_read.held() {
+            retry_read.release(id);
+        }
+        taken
     };
-    drop(held);
+    let groups = request(RETRY_GROUPS_SQL);
+    let (result, taken) = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tokio::join!(refused.execute(tenant().hash(), &groups), take_room)
+    };
     let log = log.text();
     let err = match result {
         Ok(outcome) => panic!(
-            "the under-shot retry answered: {:?}\n{log}",
+            "the retry answered with no room left: {:?}\n{log}",
             outcome.stats.spill_retry
         ),
         Err(err) => err,
     };
+    assert!(taken.size() > 0, "room was taken before the retry read");
     assert!(
         matches!(&err, ravel_sql::SqlError::ResourcesExhausted(message)
             if message.contains("process memory budget exhausted")),
@@ -3516,14 +3787,21 @@ async fn a_failed_bucketed_retry_is_the_statements_error() {
     assert_eq!(retry_info_field(&log, "retry_plan"), "bucket");
     assert_eq!(retry_info_field(&log, "retry_refusal"), "process_budget");
     assert_eq!(
+        retry_info_field(&log, "retry_peak_asked_bytes"),
+        "0",
+        "with no room left the retry's pool granted nothing"
+    );
+    assert_eq!(
         retry_info_field(&log, "effective_limit_bytes"),
-        BIG_QUERY_BYTES.to_string()
+        first_room.to_string(),
+        "sized by the room at the first refusal"
     );
     assert_eq!(
         store.sequence_progress(0),
         2,
         "the first attempt and the bucketed retry read the object, nothing after"
     );
+    drop(taken);
 }
 
 /// A string-keyed final aggregate, which the bucketed rule does not admit,
