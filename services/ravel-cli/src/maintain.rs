@@ -3701,6 +3701,41 @@ mod tests {
         );
     }
 
+    /// `--run-block-records` reaches the config the merge reads (ADR-3853
+    /// D2): with the flag the run block target is the given count, without
+    /// it the crate default. Dropping the assignment in
+    /// `build_compactor_config` fails the first equality.
+    #[test]
+    fn run_block_records_reaches_the_compactor_config() {
+        let build = |scratch: &ScratchOptions| {
+            build_compactor_config(
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                Duration::from_secs(300),
+                scratch,
+            )
+            .expect("build")
+            .0
+        };
+        let set = build(&ScratchOptions {
+            scratch_dir: Some(std::env::temp_dir()),
+            run_block_records: Some(8192),
+            ..ScratchOptions::default()
+        });
+        assert_eq!(set.rlog_run_block_target_records, 8192);
+        let unset = build(&ScratchOptions::default());
+        assert_eq!(
+            unset.rlog_run_block_target_records,
+            ravel_maintain::rlog::RUN_BLOCK_TARGET_RECORDS
+        );
+    }
+
     /// Both CLI consumers of the supported-version window derive from the one
     /// crate source (ADR-0066 decision 1): `audit-versions`' anomaly predicate
     /// and `migrate`'s default target both read [`signal_supported_versions`],
