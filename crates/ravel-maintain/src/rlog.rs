@@ -1610,7 +1610,7 @@ async fn merge_planned(
             next += 1;
             continue;
         }
-        let len = plan.cut(next, &[]);
+        let len = plan.cut(next, &[]).len;
         run_stream_pass(
             store,
             catalogs,
@@ -3863,6 +3863,8 @@ async fn level2_worker_ranges(
         let mut next = range.start - base;
         while next < end {
             if plan.mode == MergeReadMode::Cursor || plan.hot.get(next).copied().unwrap_or(true) {
+                // A hot stream's cursor charge is priced without carried views.
+                carry.release_all();
                 cursor_merge_one_stream(
                     work.runs_store,
                     work.runs,
@@ -3879,7 +3881,9 @@ async fn level2_worker_ranges(
                 next += 1;
                 continue;
             }
-            let len = plan.cut(next, &carry.held()).min(end - next);
+            let cut = plan.cut(next, &carry.held());
+            carry.release(&cut.release);
+            let len = cut.len.min(end - next);
             run_stream_pass(
                 work.runs_store,
                 work.runs,
@@ -4475,8 +4479,11 @@ impl MergePlan {
     /// `carried` are the `(input, block, charged bytes)` a level-2 worker
     /// carries into the pass ([`PassCarry::held`]): held from the start, so they
     /// count against the budget once and are not counted again for a stream
-    /// that needs them.
-    fn cut(&self, start: usize, carried: &[(usize, usize, u64)]) -> usize {
+    /// that needs them. When the carried charges and the first stream's other
+    /// blocks together exceed the budget, the cut releases every carried view
+    /// the first stream does not read and counts only the rest, so the first
+    /// stream starts from at most its own estimate.
+    fn cut(&self, start: usize, carried: &[(usize, usize, u64)]) -> PassCut {
         let mut held: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); self.block_costs.len()];
         let mut sum = 0u64;
         for &(input, block, charged) in carried {
@@ -4485,39 +4492,90 @@ impl MergePlan {
             }
             sum = sum.saturating_add(charged);
         }
+        let mut release = Vec::new();
+        if self.hot.get(start).is_some_and(|hot| !*hot)
+            && sum.saturating_add(self.added(start, &held)) > self.pass_budget
+        {
+            let first = self
+                .stream_blocks
+                .get(start)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let reads = |input: usize, block: usize| {
+                first
+                    .iter()
+                    .any(|(i, blocks)| *i == input && blocks.contains(&block))
+            };
+            sum = 0;
+            for &(input, block, charged) in carried {
+                if reads(input, block) {
+                    sum = sum.saturating_add(charged);
+                } else {
+                    release.push((input, block));
+                    if let Some(s) = held.get_mut(input) {
+                        s.remove(&block);
+                    }
+                }
+            }
+        }
         let mut len = 0usize;
         for (j, hot) in self.hot.iter().enumerate().skip(start) {
             if *hot {
                 break;
             }
-            let carriers = self.stream_blocks.get(j).map(Vec::as_slice).unwrap_or(&[]);
-            let mut added = 0u64;
-            for (input, blocks) in carriers {
-                let costs = self
-                    .block_costs
-                    .get(*input)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let seen = held.get(*input);
-                for b in blocks {
-                    if !seen.is_some_and(|s| s.contains(b)) {
-                        added = added.saturating_add(costs.get(*b).copied().unwrap_or(0));
-                    }
-                }
-            }
+            let added = self.added(j, &held);
             if len > 0 && sum.saturating_add(added) > self.pass_budget {
                 break;
             }
             sum = sum.saturating_add(added);
-            for (input, blocks) in carriers {
+            for (input, blocks) in self.stream_blocks.get(j).map(Vec::as_slice).unwrap_or(&[]) {
                 if let Some(s) = held.get_mut(*input) {
                     s.extend(blocks.iter().copied());
                 }
             }
             len += 1;
         }
-        len.max(1)
+        PassCut {
+            len: len.max(1),
+            release,
+            charged: sum,
+        }
     }
+
+    /// The [`pass_block_cost`] of stream `j`'s candidate blocks not in `held`
+    /// (per input, its held block indices), summed.
+    fn added(&self, j: usize, held: &[BTreeSet<usize>]) -> u64 {
+        let mut added = 0u64;
+        for (input, blocks) in self.stream_blocks.get(j).map(Vec::as_slice).unwrap_or(&[]) {
+            let costs = self
+                .block_costs
+                .get(*input)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let seen = held.get(*input);
+            for b in blocks {
+                if !seen.is_some_and(|s| s.contains(b)) {
+                    added = added.saturating_add(costs.get(*b).copied().unwrap_or(0));
+                }
+            }
+        }
+        added
+    }
+}
+
+/// What [`MergePlan::cut`] decides for the next pass.
+#[derive(Debug, PartialEq, Eq)]
+struct PassCut {
+    /// How many streams the pass covers, at least one.
+    len: usize,
+    /// The carried `(input, block)` views to release before the pass
+    /// ([`PassCarry::release`]): empty unless keeping every carried view would
+    /// take the first stream over the pass budget, then every one the first
+    /// stream does not read.
+    release: Vec<(usize, usize)>,
+    /// The kept carried views' charges plus the [`pass_block_cost`] of the
+    /// pass's other distinct blocks.
+    charged: u64,
 }
 
 /// Heap bytes a pass's block view holds per retained row on top of the decoded
@@ -4987,7 +5045,9 @@ struct HeldView<'r> {
 /// `stream_ref`-major, so only an input's last decoded block can hold such
 /// rows. A pass that wants those rows takes the view instead of decoding the
 /// block again, so a boundary block is decoded once per worker, across the
-/// worker's contiguous ranges too.
+/// worker's contiguous ranges too, unless it is released first: by a pass whose
+/// cut ([`PassCut::release`]) cannot keep it within the budget, or before a hot
+/// stream's cursor merge.
 struct PassCarry<'r, 't> {
     views: BTreeMap<usize, (usize, HeldView<'r>)>,
     charges: MergeCharges<'t>,
@@ -5008,6 +5068,27 @@ impl<'r, 't> PassCarry<'r, 't> {
             .iter()
             .map(|(input, (block, view))| (*input, *block, view.charged))
             .collect()
+    }
+
+    /// Drop the carried views of `blocks`, `(input, block)` pairs as
+    /// [`PassCut::release`] names them, and release their charges. A block of
+    /// one is decoded again by the pass that next reads it.
+    fn release(&mut self, blocks: &[(usize, usize)]) {
+        for &(input, block) in blocks {
+            if self.views.get(&input).is_some_and(|(b, _)| *b == block)
+                && let Some((_, view)) = self.views.remove(&input)
+            {
+                let charged = view.charged;
+                drop(view);
+                self.charges.release_pass_rows(charged);
+            }
+        }
+    }
+
+    /// Drop every carried view and release its charge.
+    fn release_all(&mut self) {
+        self.views.clear();
+        self.charges.release_all_pass_rows();
     }
 }
 
@@ -17838,6 +17919,202 @@ mod tests {
                 })
                 .collect();
             blocked(inputs, 40)
+        }
+
+        /// A fetch-per-pass plan with no hot stream, a pass budget of
+        /// `budget`, and the given candidate blocks and block costs.
+        fn cut_plan(
+            budget: u64,
+            stream_blocks: Vec<Vec<(usize, Vec<usize>)>>,
+            block_costs: Vec<Vec<u64>>,
+        ) -> MergePlan {
+            let estimates = stream_blocks
+                .iter()
+                .map(|carriers| {
+                    carriers
+                        .iter()
+                        .flat_map(|(i, blocks)| blocks.iter().map(|b| block_costs[*i][*b]))
+                        .sum()
+                })
+                .collect();
+            MergePlan {
+                mode: MergeReadMode::FetchPerPass,
+                pass_budget: budget,
+                hot: vec![false; stream_blocks.len()],
+                estimates,
+                input_blocks: block_costs.iter().map(Vec::len).sum(),
+                stream_blocks,
+                block_costs,
+                raw_bytes: 0,
+                compared_bytes: 0,
+                ceiling_bytes: 0,
+                groups: Vec::new(),
+                renew_every_fetches: 1,
+                renew_every_blocks: 1,
+                predicted_decoded_rows: 0,
+                input_records: 0,
+            }
+        }
+
+        /// ADR-3853, carried views: a cut whose carried views would take its
+        /// first stream over the pass budget releases the ones that stream
+        /// does not read, keeps the ones it reads, and releases nothing when
+        /// every carried view fits.
+        #[test]
+        fn pass_cut_releases_carried_views_the_first_stream_does_not_use() {
+            // Stream 0 reads input 0's block 0 at 50; the view of input 1's
+            // block 0 it does not read takes it to 110.
+            let plan = cut_plan(100, vec![vec![(0, vec![0])]], vec![vec![50], vec![60]]);
+            assert_eq!(
+                plan.cut(0, &[(1, 0, 60)]),
+                PassCut {
+                    len: 1,
+                    release: vec![(1, 0)],
+                    charged: 50
+                }
+            );
+
+            // Stream 0 reads the carried view of input 0's block 0 and the
+            // block after it, not the view of input 2's block 0: 120 in all.
+            // Only the unread view goes, leaving 90 (releasing the read one
+            // too would decode it again, 100), and stream 1's block at 60
+            // stays out of the pass.
+            let plan = cut_plan(
+                100,
+                vec![vec![(0, vec![0, 1])], vec![(1, vec![0])]],
+                vec![vec![50, 50], vec![60], vec![30]],
+            );
+            assert_eq!(
+                plan.cut(0, &[(0, 0, 40), (2, 0, 30)]),
+                PassCut {
+                    len: 1,
+                    release: vec![(2, 0)],
+                    charged: 90
+                }
+            );
+
+            // A view stream 0 does not read stays while the pass fits.
+            let plan = cut_plan(100, vec![vec![(0, vec![0])]], vec![vec![50], vec![20]]);
+            assert_eq!(
+                plan.cut(0, &[(1, 0, 20)]),
+                PassCut {
+                    len: 1,
+                    release: Vec::new(),
+                    charged: 70
+                }
+            );
+        }
+
+        /// The body padding and run target of [`split_stream_inputs`].
+        const SPLIT_PAD: usize = 16_000;
+        const SPLIT_RUN_TARGET: u64 = 650_000;
+
+        /// 60 inputs of 40 records, 2,400 in all, with `SPLIT_PAD`-byte
+        /// bodies: inputs 36 to 59 hold only s_20, the 21st stream in merged
+        /// stream order, and inputs 0 to 35 hold every other stream, s_19
+        /// twice. At G = 12 the three runs of inputs 0 to 35 hold no row of
+        /// s_20, and each has a block running from s_19 into s_21 that a
+        /// level-2 worker carries past s_19's pass; s_20 comes from the two
+        /// runs of inputs 36 to 59 and needs most of the level-2 pass budget.
+        fn split_stream_inputs() -> Vec<L0Input> {
+            let mut order: Vec<u32> = (0..40).collect();
+            order.sort_by_key(|s| stream_ident(*s).0);
+            let (before, split) = (order[19], order[20]);
+            let body = |i: u32, s: u32, k: i64| format!("in{i} s{s} k{k}{}", "x".repeat(SPLIT_PAD));
+            let inputs = (0..60u32)
+                .map(|i| {
+                    let ts = 1_000 + i64::from(i % 3);
+                    let counts: Vec<(u32, i64)> = if i >= 36 {
+                        vec![(split, 40)]
+                    } else {
+                        order
+                            .iter()
+                            .filter(|s| **s != split)
+                            .map(|&s| (s, if s == before { 2 } else { 1 }))
+                            .collect()
+                    };
+                    counts
+                        .into_iter()
+                        .flat_map(|(s, n)| {
+                            (0..n).map(move |k| {
+                                record(
+                                    s,
+                                    ts + 3 * k,
+                                    &body(i, s, k),
+                                    vec![("k".to_string(), AttrValue::I64(0))],
+                                )
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            blocked(inputs, 40)
+        }
+
+        /// ADR-3853, carried views: when the views a level-2 worker carries
+        /// into a pass would take it over the pass budget, the pass releases
+        /// the ones its first stream does not read before it decodes. At the
+        /// smallest ceiling holding G = 12 on two level-1 workers, s_20 fits
+        /// the budget alone but not beside the three run blocks carried past
+        /// s_19, which it never reads; one level-2 worker merges it within
+        /// the unit ceiling and publishes the single-level merge's records,
+        /// decoding each released block once more at most.
+        #[tokio::test]
+        async fn a_carried_view_never_takes_a_pass_over_its_budget() {
+            let oracle_store = ProbeStore::new();
+            let keys = seed_inputs(&oracle_store, &split_stream_inputs()).await;
+            let per_input = level1_per_input(&oracle_store, &keys).await;
+            let single = two_level_config(64 << 20, SPLIT_RUN_TARGET, None);
+            let (outcome, run) = compact_logged(&oracle_store, &single).await;
+            outcome.expect("single-level compact");
+            assert!(
+                run.mode_line().contains("mode=\"resident\""),
+                "{}",
+                run.mode_line()
+            );
+            let oracle = published_records(&oracle_store).await;
+            assert_eq!(oracle.len(), 2400);
+
+            let ceiling = 2 * (SPLIT_RUN_TARGET + 12 * per_input);
+            let dir = fresh_scratch("carried-budget");
+            let config = CompactorConfig {
+                level1_workers: Some(2),
+                level2_workers: Some(1),
+                ..two_level_config(ceiling, SPLIT_RUN_TARGET, Some(dir.clone()))
+            };
+            let store = ProbeStore::new();
+            seed_inputs(&store, &split_stream_inputs()).await;
+            let (outcome, run) = compact_logged(&store, &config).await;
+            assert!(
+                matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                "{outcome:?}"
+            );
+            let line = run.line("rlog two-level merge");
+            assert_eq!(log_field(&line, "group_size"), 12, "{line}");
+            assert_eq!(log_field(&line, "level2_workers"), 1, "{line}");
+            let runs = log_field(&line, "runs");
+            assert_eq!(runs, 5, "{line}");
+            let estimate = log_field(&line, "stream_estimate_bytes");
+            let run_block = log_field(&line, "run_block_bytes");
+            assert!(
+                estimate <= ceiling && estimate + 3 * run_block > ceiling,
+                "s_20 fits alone, not beside three carried run blocks: {line}"
+            );
+
+            let peaks = run.tracker.level2_worker_peak_bytes();
+            assert_eq!(peaks.len(), 1, "{peaks:?}");
+            assert!(
+                peaks.iter().all(|p| *p > 0 && *p <= ceiling),
+                "{peaks:?} against {ceiling}"
+            );
+            assert_eq!(published_records(&store).await, oracle);
+            let run_blocks = log_field(&line, "run_blocks");
+            assert!(
+                run.report.level2_block_decodes <= run_blocks + 2 * runs,
+                "{} decodes of {run_blocks} run blocks in {runs} runs",
+                run.report.level2_block_decodes
+            );
+            assert!(scratch_entries(&dir).is_empty());
         }
 
         /// ADR-3853 D5 amendment: a range whose parts outgrow its window is
