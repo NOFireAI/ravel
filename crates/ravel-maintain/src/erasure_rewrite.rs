@@ -2359,7 +2359,7 @@ pub async fn erasure_rewrite_bucket(
     pending: &[PendingErasureRequest],
     memo: &mut MaintainMemo,
 ) -> Result<ErasureRewriteOutcome> {
-    crate::rlog::check_rlog_zstd_level(config, bucket)?;
+    crate::rlog::check_rlog_writer_config(config, bucket)?;
     let start_ns = clock.now_ns();
     if !bucket.is_sealed(start_ns, config) {
         return Ok(ErasureRewriteOutcome::NotSealed);

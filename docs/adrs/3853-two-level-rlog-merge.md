@@ -176,6 +176,16 @@ and a fetch-per-pass pass at level 2 refetches the group per pass, 32x the
 bytes it uses at the default. A group's run is one or more run parts, cut by
 the run memory target the same way L1 parts are cut.
 
+Runs are also written at a 1,024-record block target (#4107), the existing
+`block_target_records` field, transient like the settings above and set by
+`rlog_run_block_target_records` on the compactor config (zero is refused
+before the run's first store request). Level 2's read side is `R x 2 x
+price(run block)` (D3), and a pass holds at least one block per run, so the
+run block is the unit level 2 pays for. At the writer default of 8,192
+records the measured run block was 29,668,214 bytes (#3853 comment
+6710864023, run 2); at 1,024 records it is predicted to be about 3.7 MB.
+Published parts keep the writer default and are byte-identical either way.
+
 Runs live in a per-process scratch directory behind a scratch
 `ObjectStoreBackend` over that directory, so `load_catalog_from_object` and
 `merge_catalogs` run over runs unmodified. The directory is a cache and

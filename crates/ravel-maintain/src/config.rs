@@ -1735,6 +1735,23 @@ pub fn validate_rlog_zstd_level(level: i32) -> Result<i32, RlogZstdLevelError> {
     }
 }
 
+/// An `rlog_run_block_target_records` of zero was configured: a run writer
+/// cannot cut blocks of zero records.
+#[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
+#[error("rlog run block target records must be at least 1, got 0")]
+pub struct RlogRunBlockTargetError;
+
+/// Validate a run block target, returning it unchanged when accepted.
+pub fn validate_rlog_run_block_target_records(
+    records: usize,
+) -> Result<usize, RlogRunBlockTargetError> {
+    if records == 0 {
+        Err(RlogRunBlockTargetError)
+    } else {
+        Ok(records)
+    }
+}
+
 /// Default `grace`: 24 hours (docs/consistency-model.md "Deletion and GC").
 /// A shared floor for the orphan and unreferenced-part age gates.
 pub const DEFAULT_GRACE_NS: i64 = 24 * NS_PER_HOUR;
@@ -2253,6 +2270,15 @@ pub struct CompactorConfig {
     /// the final parts' bytes, only how the runs between the levels are cut.
     /// Default [`RLOG_RUN_MEMORY_TARGET_BYTES`].
     pub rlog_run_memory_target_bytes: u64,
+    /// The records per block a level-1 run is written at (ADR-3853 D2).
+    /// Transient like the other run settings: it changes the runs' blocks and
+    /// so level 2's per-run read price, never the final parts' bytes. Zero
+    /// fails a run over a logs or query-audit bucket, at the same entry
+    /// points and before the same first store request as
+    /// [`Self::rlog_zstd_level`], with
+    /// [`crate::error::MaintainError::InvalidRlogRunBlockTarget`]. Default
+    /// [`crate::rlog::RUN_BLOCK_TARGET_RECORDS`].
+    pub rlog_run_block_target_records: usize,
     /// The number of merge units that run at once and share the usable cores
     /// (ADR-3853 D4, core share amendment): a unit's core share is the usable
     /// cores divided by it, at least 1. ravel-server sets it to
@@ -2523,6 +2549,7 @@ impl Default for CompactorConfig {
             scratch_dir: None,
             scratch_max_bytes: None,
             rlog_run_memory_target_bytes: RLOG_RUN_MEMORY_TARGET_BYTES,
+            rlog_run_block_target_records: crate::rlog::RUN_BLOCK_TARGET_RECORDS,
             unit_concurrency: 1,
             level1_workers: None,
             geometry_floor_decoded_rows: crate::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS,

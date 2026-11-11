@@ -261,7 +261,7 @@ async fn load_then_rewrite<C: SegmentCodec>(
     start_ns: i64,
     planned: Option<&BucketListing>,
 ) -> Result<FencedRewrite> {
-    crate::rlog::check_rlog_zstd_level(config, bucket)?;
+    crate::rlog::check_rlog_writer_config(config, bucket)?;
     let inputs = load_inputs_with_ledger(
         store,
         bucket,
@@ -792,7 +792,7 @@ async fn migrate_bucket_format_scoped(
     bucket: &Bucket,
     target_version: u32,
 ) -> Result<MigrateOutcome> {
-    crate::rlog::check_rlog_zstd_level(config, bucket)?;
+    crate::rlog::check_rlog_writer_config(config, bucket)?;
     let start_ns = clock.now_ns();
     if !bucket.is_sealed(start_ns, config) {
         return Ok(MigrateOutcome::NotSealed);
@@ -1142,7 +1142,7 @@ async fn reencode_compaction_parts_scoped(
     config: &CompactorConfig,
     bucket: &Bucket,
 ) -> Result<ReencodeOutcome> {
-    crate::rlog::check_rlog_zstd_level(config, bucket)?;
+    crate::rlog::check_rlog_writer_config(config, bucket)?;
     let target_version = current_part_version(bucket.signal)?;
     let start_ns = clock.now_ns();
     let ledger = config.request_ledger.as_ref();
