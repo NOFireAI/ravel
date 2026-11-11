@@ -184,7 +184,15 @@ price(run block)` (D3), and a pass holds at least one block per run, so the
 run block is the unit level 2 pays for. At the writer default of 8,192
 records the measured run block was 29,668,214 bytes (#3853 comment
 6710864023, run 2); at 1,024 records it is predicted to be about 3.7 MB.
-Published parts keep the writer default and are byte-identical either way.
+Published parts keep the writer default. An unkeyed bucket, and a keyed
+stream that does not batch at either target, publishes byte-identical parts
+either way. The exception is ADR-2135 batch-major emission (D3): in a keyed
+bucket (`width_ns > 1`) both level-2 paths cut each stream's run-part
+carriers into batches by reservation, and a carrier's reservation
+(`reservation_of_locs`, twice its largest stored row group plus its largest
+block decode ceiling) shrinks with the run block target, so a keyed stream
+that batches may batch, order and cut its parts differently at another
+target. Either way the output is exact and conserves every record.
 
 Runs live in a per-process scratch directory behind a scratch
 `ObjectStoreBackend` over that directory, so `load_catalog_from_object` and
@@ -237,8 +245,12 @@ beside each row's `R`. A run of 1.2M records has about 148 blocks and about
 17 streams per block, so a pass
 covers about 17 streams, decodes each run block once, and reads about 1.6
 times the run bytes from local disk across the unit (block-aligned groups,
-boundary blocks twice). A level-2 plan that fails (b) is refused (D0), never
-run as a cursor merge over the runs. All predicted.
+boundary blocks twice). The run block cost and the per-block figures here
+describe phase A's 8,192-record runs; D2 now writes runs at 1,024 records,
+so a run block is predicted to be about 8x smaller, and a run to hold about
+8x as many blocks with about 8x fewer streams each. A level-2 plan that
+fails (b) is refused (D0), never run as a cursor merge over the runs. All
+predicted.
 
 The emitted sequence is today's. Groups are contiguous in canonical input
 order, a run stores equal-key ties in push order, and the level-2 tie-break
