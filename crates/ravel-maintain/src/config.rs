@@ -2272,7 +2272,12 @@ pub struct CompactorConfig {
     pub rlog_run_memory_target_bytes: u64,
     /// The records per block a level-1 run is written at (ADR-3853 D2).
     /// Transient like the other run settings: it changes the runs' blocks and
-    /// so level 2's per-run read price, never the final parts' bytes. Zero
+    /// so level 2's per-run read price. An unkeyed bucket, and a keyed stream
+    /// that does not batch at either target, publishes the same parts; under
+    /// ADR-2135 batch-major emission a keyed stream's run-part carriers are
+    /// batched by reservation, which shrinks with this target, so a keyed
+    /// stream that batches may cut its parts differently (exact either way,
+    /// every record conserved). Zero
     /// fails a run over a logs or query-audit bucket, at the same entry
     /// points and before the same first store request as
     /// [`Self::rlog_zstd_level`], with
