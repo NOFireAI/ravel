@@ -462,7 +462,7 @@ pub(crate) fn check_rlog_writer_config(config: &CompactorConfig, bucket: &Bucket
         )?;
         crate::config::validate_rlog_level2_settings(
             config.level2_workers,
-            config.rlog_level2_range_records,
+            config.rlog_range_records,
         )?;
     }
     Ok(())
@@ -547,6 +547,10 @@ impl SegmentCodec for RlogCodec {
             // RAM.
             false,
             GeometryCheck::Refuse(&catalogs),
+            // Compaction keeps every record, so the inputs' footer sum is its
+            // output count and its parts cut into ranges the same on both
+            // routes.
+            RangeCut::On,
             &mut |_| Ok(true),
         )
         .await?;
@@ -1101,8 +1105,8 @@ const RUN_GROUP_TARGET_BLOCKS: usize = 1;
 /// keyed batch-major exception.
 pub const RUN_BLOCK_TARGET_RECORDS: usize = 1024;
 
-/// Default record quantum level 2's stream key space is cut into ranges at
-/// (ADR-3853 D5). Predicted, not measured: hour 498273's 242 million records
+/// Default record quantum a compaction's published parts are cut into ranges
+/// at, on either route (ADR-3853 D5). Predicted, not measured: hour 498273's 242 million records
 /// cut into about 97 ranges. A unit of up to 10,000 times the quantum fits
 /// the part key's index space ([`RangeWindows`]).
 pub const LEVEL2_RANGE_RECORDS: u64 = 2_500_000;
@@ -1274,6 +1278,7 @@ pub(crate) async fn merge_catalogs(
     declared: Vec<(String, DeclaredStatType)>,
     dry_run: bool,
     retain_bytes: bool,
+    range_cut: RangeCut,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
 ) -> Result<MergeOutput> {
     merge_catalogs_with_geometry(
@@ -1287,6 +1292,7 @@ pub(crate) async fn merge_catalogs(
         dry_run,
         retain_bytes,
         GeometryCheck::Off,
+        range_cut,
         keep,
     )
     .await
@@ -1353,6 +1359,7 @@ async fn merge_catalogs_with_geometry(
     dry_run: bool,
     retain_bytes: bool,
     geometry: GeometryCheck<'_>,
+    range_cut: RangeCut,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
 ) -> Result<MergeOutput> {
     // The entry points refuse a bad level or run block target before their
@@ -1360,10 +1367,7 @@ async fn merge_catalogs_with_geometry(
     // `build_parts` caller.
     let zstd_level = crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
     crate::config::validate_rlog_run_block_target_records(config.rlog_run_block_target_records)?;
-    crate::config::validate_rlog_level2_settings(
-        config.level2_workers,
-        config.rlog_level2_range_records,
-    )?;
+    crate::config::validate_rlog_level2_settings(config.level2_workers, config.rlog_range_records)?;
     let key_index_fields = merged_key_index_fields(catalogs);
     // Global stream_ref remap + cross-object stream-identity check. The
     // merged set is the sorted union of every input's STREAM_DIR; the dense
@@ -1464,6 +1468,16 @@ async fn merge_catalogs_with_geometry(
         predicted_decoded_rows = plan.predicted_decoded_rows,
         "rlog merge read mode (compared = the held raw bytes + pass floor + largest hot-stream cursor charge that decided the mode)"
     );
+    // `T` is the inputs' footer sum, refused against the part key space before
+    // either route encodes anything.
+    let range = match range_cut {
+        RangeCut::On => Some(RangeCutter::new(
+            plan.input_records,
+            config.rlog_range_records,
+            part_keys(),
+        )?),
+        RangeCut::Off => None,
+    };
     // Only a bucket the D0 refusal would stop merges in two levels, and only
     // when the process has scratch to hold the runs (ADR-3853 D0, D1); every
     // other plan runs single-level as before. Only compaction asks for the
@@ -1512,7 +1526,7 @@ async fn merge_catalogs_with_geometry(
         pipeline: None,
         memory_target: config.rlog_memory_target_bytes(),
         stored_target: config.rlog_stored_target_bytes(),
-        window: None,
+        range,
         stop: None,
     };
     let mut counts = RecordCounts::default();
@@ -2618,8 +2632,9 @@ impl ObjectStoreBackend for ScratchMeter {
 /// amendment). Level 2 cuts the stream key space into ranges of a fixed
 /// record quantum by the per-stream totals level 1 tallied, and numbers each
 /// range's parts from its proportional window of the part key's indexes
-/// ([`RangeWindows`]), so every `W2` publishes the same parts. One range worker keeps up to `E` part builders
-/// in flight ([`level2_encode_builders`]); several encode inline (D3). Only
+/// ([`RangeWindows`]), so every `W2` publishes the same parts. One range
+/// worker keeps up to `E` part builders in flight
+/// ([`level2_encode_builders`]); several encode inline (D3). Only
 /// compaction reaches this, and it keeps every record.
 async fn two_level_merge(
     target: &TwoLevelTarget<'_>,
@@ -3390,7 +3405,7 @@ async fn level1_worker_groups(
             pipeline: None,
             memory_target: groups.run_target,
             stored_target: u64::MAX,
-            window: None,
+            range: None,
             stop: None,
         };
         let mut counts = RecordCounts::per_stream(group_streams.len());
@@ -3529,6 +3544,108 @@ impl RangeWindows {
     }
 }
 
+/// Whether a merge cuts its published parts into record ranges
+/// ([`RangeCutter`]). Only a merge whose output holds every input record
+/// cuts, since the cut's `T` is the inputs' footer sum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangeCut {
+    /// Cut at [`CompactorConfig::rlog_range_records`], numbering each range's
+    /// parts in its [`RangeWindows`] window.
+    On,
+    /// Number parts `0, 1, 2, ...` with no range.
+    Off,
+}
+
+/// A sink's online cut of its published parts into ranges (ADR-3853 D5
+/// amendment), the same on the single-level and two-level routes: a range
+/// closes at the end of the stream at which its records reach the quantum,
+/// and each range numbers its parts in the [`RangeWindows`] window of the
+/// records emitted before it, which both routes know exactly at the range's
+/// start. A two-level range worker seeds it at its first assigned range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RangeCutter {
+    windows: RangeWindows,
+    /// Records the sink has pushed, counted from the unit's first record.
+    emitted: u64,
+    /// Records pushed since the open range started.
+    range_records: u64,
+    /// The open range, counted from 0 over the unit's ranges.
+    range: u64,
+    /// The range this cutter was seeded at.
+    seed: u64,
+    /// The open range's first part index.
+    first: u64,
+    /// One past the last part index the open range may use.
+    limit: u64,
+    /// The records `emitted` must reach by the sink's finish: `t` for a whole
+    /// unit, the records before the next worker's first range for a range
+    /// worker.
+    end: u64,
+}
+
+impl RangeCutter {
+    /// A cutter for a whole unit of `t` records. Refused, before any part is
+    /// encoded, when `t` passes `keys x quantum`.
+    fn new(t: u64, quantum: u64, keys: u64) -> Result<Self> {
+        Self::seeded(RangeWindows::new(t, quantum, keys)?, 0, 0, t)
+    }
+
+    /// A cutter opening range `range`, which starts after `before` of the
+    /// unit's records, and owing records up to `end`.
+    fn seeded(windows: RangeWindows, before: u64, range: u64, end: u64) -> Result<Self> {
+        if before > end || end > windows.t {
+            return Err(MaintainError::Invariant(format!(
+                "range {range} seeded after {before} records, ending at {end} of {}",
+                windows.t
+            )));
+        }
+        Ok(Self {
+            windows,
+            emitted: before,
+            range_records: 0,
+            range,
+            seed: range,
+            first: windows.first(before),
+            limit: windows.limit(before),
+            end,
+        })
+    }
+
+    fn push(&mut self) {
+        self.emitted = self.emitted.saturating_add(1);
+        self.range_records = self.range_records.saturating_add(1);
+    }
+
+    /// Close the open range if a stream just ended with its records at the
+    /// quantum, opening the next at the records emitted so far. True when it
+    /// closed.
+    fn end_stream(&mut self) -> bool {
+        if self.range_records < self.windows.quantum {
+            return false;
+        }
+        self.range += 1;
+        self.range_records = 0;
+        self.first = self.windows.first(self.emitted);
+        self.limit = self.windows.limit(self.emitted);
+        true
+    }
+
+    /// The ranges this cutter has held records in: every one it closed, and
+    /// the open one when it has any.
+    fn ranges(&self) -> u64 {
+        self.range - self.seed + u64::from(self.range_records > 0)
+    }
+
+    fn refusal(&self, part_index: u64) -> MaintainError {
+        MaintainError::PartRangeWindow {
+            range: self.range,
+            first: self.first,
+            limit: self.limit,
+            part_index,
+        }
+    }
+}
+
 /// The ranges worker `w` of `workers` takes of `ranges` (ADR-3853 D5
 /// amendment): `[w x n / W2, (w + 1) x n / W2)`, so each worker's ranges are
 /// contiguous and a boundary block's view carries across them.
@@ -3634,16 +3751,20 @@ struct Level2Work<'a> {
     runs: &'a [RlogInputCatalog],
     stream_ids: &'a [LogStreamId],
     ranges: &'a [std::ops::Range<usize>],
-    /// Each range's part-index window, aligned with `ranges`.
-    windows: &'a [RangeWindow],
+    /// The unit's part-index windows.
+    windows: RangeWindows,
+    /// The unit's records before each range, aligned with `ranges`, then the
+    /// unit's total.
+    befores: &'a [u64],
     width_ns: i64,
     stop: &'a LevelStop,
 }
 
 /// Merge the `assigned` ranges of `work`, in order, into published parts under
 /// `config`, the worker's share of the unit's, and `plan`, planned over the
-/// ranges' streams. Each range numbers its parts from its own window
-/// ([`PartSink::start_range`]), and a decoded block's view carries from one
+/// ranges' streams. The sink's [`RangeCutter`], seeded at the first assigned
+/// range, closes each range at its last stream and numbers its parts from its
+/// own window, and a decoded block's view carries from one
 /// pass to the next, across the worker's range boundaries too
 /// ([`PassCarry`]). `builders` keeps D3's encode pipeline; `None` encodes
 /// each closed part inline. The stop token is checked before each range and
@@ -3660,6 +3781,17 @@ async fn level2_worker_ranges(
     let base = streams.start;
     let stream_ids = &work.stream_ids[streams];
     let tracker = config.merge_memory_tracker.as_ref();
+    let (Some(&before), Some(&end)) = (
+        work.befores.get(assigned.start),
+        work.befores.get(assigned.end),
+    ) else {
+        return Err(MaintainError::Invariant(format!(
+            "level-2 ranges {assigned:?} pass the {} range starts",
+            work.befores.len()
+        )));
+    };
+    let cutter = RangeCutter::seeded(work.windows, before, assigned.start as u64, end)?;
+    let first = u32::try_from(cutter.first).map_err(|_| cutter.refusal(cutter.first))?;
     let mut sink = PartSink {
         store: work.store,
         bucket: work.bucket,
@@ -3675,7 +3807,7 @@ async fn level2_worker_ranges(
         retain_bytes: work.retain_bytes,
         current: None,
         parts: Vec::new(),
-        part_index: 0,
+        part_index: first,
         read_ledger: None,
         level: Some(LevelCounter {
             ledger: config.request_ledger.clone(),
@@ -3688,7 +3820,7 @@ async fn level2_worker_ranges(
         }),
         memory_target: config.rlog_memory_target_bytes(),
         stored_target: config.rlog_stored_target_bytes(),
-        window: None,
+        range: Some(cutter),
         stop: Some(work.stop),
     };
     let mut counts = RecordCounts::default();
@@ -3710,18 +3842,23 @@ async fn level2_worker_ranges(
         MergeReadMode::FetchPerPass | MergeReadMode::Cursor => None,
     };
     let mut carry = PassCarry::new(tracker);
+    let assigned_count = assigned.len() as u64;
     for r in assigned {
         if work.stop.is_stopped() {
             return Err(work.stop.halted());
         }
-        let (Some(range), Some(window)) = (work.ranges.get(r), work.windows.get(r)) else {
+        let Some(range) = work.ranges.get(r) else {
             return Err(MaintainError::Invariant(format!(
-                "level-2 range {r} has no range or window among {} ranges and {} windows",
-                work.ranges.len(),
-                work.windows.len()
+                "level-2 range {r} is not among {} ranges",
+                work.ranges.len()
             )));
         };
-        sink.start_range(*window).await?;
+        let open = sink.range.map_or(0, |c| c.range);
+        if open != r as u64 {
+            return Err(MaintainError::Invariant(format!(
+                "level-2 range {r} starts while the sink's cut holds range {open} open"
+            )));
+        }
         let end = range.end - base;
         let mut next = range.start - base;
         while next < end {
@@ -3765,6 +3902,14 @@ async fn level2_worker_ranges(
     drop(carry);
     drop(resident);
     drop(resident_charges);
+    // The sink cut its ranges from the records it emitted; they must be the
+    // ranges this worker was assigned from the tally.
+    let cut = sink.range.map_or(0, |c| c.ranges());
+    if cut != assigned_count {
+        return Err(MaintainError::Invariant(format!(
+            "level-2 worker cut {cut} ranges from its records, assigned {assigned_count}"
+        )));
+    }
     Ok((sink.finish().await?, counts))
 }
 
@@ -3782,7 +3927,8 @@ struct Level2Shared {
     runs: Vec<RlogInputCatalog>,
     stream_ids: Vec<LogStreamId>,
     ranges: Vec<std::ops::Range<usize>>,
-    windows: Vec<RangeWindow>,
+    windows: RangeWindows,
+    befores: Vec<u64>,
     width_ns: i64,
     stop: Arc<LevelStop>,
 }
@@ -3809,7 +3955,8 @@ async fn level2_worker(
         runs: &shared.runs,
         stream_ids: &shared.stream_ids,
         ranges: &shared.ranges,
-        windows: &shared.windows,
+        windows: shared.windows,
+        befores: &shared.befores,
         width_ns: shared.width_ns,
         stop: &shared.stop,
     };
@@ -4043,24 +4190,21 @@ async fn merge_in_unit(
         part_target_bytes: part_target,
         ceiling_bytes,
     };
-    let quantum = config.rlog_level2_range_records;
+    let quantum = config.rlog_range_records;
     let ranges = level2_ranges(&stream_records, quantum);
     let range_count = ranges.len() as u64;
     #[cfg(test)]
     LEVEL2_RANGE_STREAMS.with(|r| *r.borrow_mut() = ranges.iter().map(|r| r.len()).collect());
-    let unit_windows = RangeWindows::new(unit_records, quantum, part_keys())?;
-    let mut windows: Vec<RangeWindow> = Vec::with_capacity(ranges.len());
+    let windows = RangeWindows::new(unit_records, quantum, part_keys())?;
+    let mut befores: Vec<u64> = Vec::with_capacity(ranges.len() + 1);
     let mut before = 0u64;
-    for (r, range) in ranges.iter().enumerate() {
-        windows.push(RangeWindow {
-            range: r as u64,
-            first: unit_windows.first(before),
-            limit: unit_windows.limit(before),
-        });
+    for range in &ranges {
+        befores.push(before);
         for n in stream_records.get(range.clone()).unwrap_or_default() {
             before = before.checked_add(*n).ok_or_else(tally_overflow)?;
         }
     }
+    befores.push(before);
     let (level2_workers, plans) = level2_plans(
         config,
         &runs,
@@ -4143,7 +4287,8 @@ async fn merge_in_unit(
             runs: &runs,
             stream_ids,
             ranges: &ranges,
-            windows: &windows,
+            windows,
+            befores: &befores,
             width_ns,
             stop: &stop,
         };
@@ -4181,6 +4326,7 @@ async fn merge_in_unit(
             stream_ids: stream_ids.to_vec(),
             ranges,
             windows,
+            befores,
             width_ns,
             stop: Arc::clone(&stop),
         });
@@ -4816,7 +4962,8 @@ async fn cursor_merge_one_stream(
     merge_stream_into_parts(
         store, catalogs, stream_id, position, width_ns, sink, tracker, keep, counts, resident,
     )
-    .await
+    .await?;
+    sink.end_stream().await
 }
 
 /// One input's share of a stream-range pass: the stream refs the range wants,
@@ -5212,6 +5359,7 @@ async fn run_stream_pass<'c>(
                 }
             }
         }
+        sink.end_stream().await?;
     }
     if let Some(carry) = carry {
         for (iw, h) in work.iter().zip(held.iter_mut()) {
@@ -5405,33 +5553,13 @@ struct PartSink<'a> {
     /// The stored-size target a part closes at; `u64::MAX` for a run, which is
     /// never probed.
     stored_target: u64,
-    /// The part-index window of the level-2 range this sink is writing; `None`
-    /// numbers parts from 0 without bound.
-    window: Option<RangeWindow>,
+    /// The cut of published parts into record ranges, each numbering its parts
+    /// in its own window; `None` numbers parts from 0 without bound (a run, or
+    /// a merge whose output may drop records).
+    range: Option<RangeCutter>,
     /// The level-2 stop token of a range worker, checked before every part
     /// PUT; `None` everywhere else.
     stop: Option<&'a LevelStop>,
-}
-
-/// The part indexes one level-2 range may use (ADR-3853 D5 amendment), from
-/// [`RangeWindows`]: range `range` numbers its parts from `first`, and a part
-/// at `limit` is refused before its builder opens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RangeWindow {
-    range: u64,
-    first: u64,
-    limit: u64,
-}
-
-impl RangeWindow {
-    fn refusal(&self, part_index: u64) -> MaintainError {
-        MaintainError::PartRangeWindow {
-            range: self.range,
-            first: self.first,
-            limit: self.limit,
-            part_index,
-        }
-    }
 }
 
 /// One level of a two-level merge, for the ledger's per-level pass and decode
@@ -5537,10 +5665,10 @@ impl PartSink<'_> {
     /// closing it once a target is reached.
     async fn push(&mut self, r: LogRecord) -> Result<()> {
         if self.current.is_none() {
-            if let Some(window) = &self.window
-                && u64::from(self.part_index) >= window.limit
+            if let Some(cutter) = &self.range
+                && u64::from(self.part_index) >= cutter.limit
             {
-                return Err(window.refusal(u64::from(self.part_index)));
+                return Err(cutter.refusal(u64::from(self.part_index)));
             }
             self.current = Some(PartBuilder::new(
                 &self.identity,
@@ -5556,6 +5684,9 @@ impl PartSink<'_> {
         // encoded once, not re-encoded (the probe already produced the exact
         // bytes for this `part_index` and `input_set_hash`).
         let mut stored_close: Option<(Vec<u8>, WriteStats)> = None;
+        if let Some(cutter) = self.range.as_mut() {
+            cutter.push();
+        }
         if let Some(part) = self.current.as_mut() {
             part.push(r, self.tracker)?;
             // The memory split target sizes compactor peak memory (issue #711)
@@ -5730,15 +5861,28 @@ impl PartSink<'_> {
         Ok(())
     }
 
-    /// Close the part in progress and number the next one from `window`'s
-    /// first index: a level-2 range starts a part of its own, whatever came
-    /// before it.
-    async fn start_range(&mut self, window: RangeWindow) -> Result<()> {
+    /// Mark the end of one stream's records. When that closes the open range
+    /// ([`RangeCutter::end_stream`]), the part in progress closes too and the
+    /// next part is numbered from the new range's first index: a range starts
+    /// a part of its own. A no-op on a sink with no cutter.
+    async fn end_stream(&mut self) -> Result<()> {
+        let Some(cutter) = self.range.as_mut() else {
+            return Ok(());
+        };
+        if !cutter.end_stream() {
+            return Ok(());
+        }
+        let cutter = *cutter;
         if self.current.as_ref().is_some_and(|p| !p.is_empty()) {
             self.flush(None).await?;
         }
-        self.part_index = u32::try_from(window.first).map_err(|_| window.refusal(window.first))?;
-        self.window = Some(window);
+        if cutter.first < u64::from(self.part_index) {
+            return Err(MaintainError::Invariant(format!(
+                "range {} opens at part index {} below the {} already used",
+                cutter.range, cutter.first, self.part_index
+            )));
+        }
+        self.part_index = u32::try_from(cutter.first).map_err(|_| cutter.refusal(cutter.first))?;
         Ok(())
     }
 
@@ -5867,7 +6011,18 @@ impl PartSink<'_> {
     }
 
     /// Close the trailing part and yield every part built, in part-index order.
+    /// A sink cutting ranges must have pushed exactly the records its cutter
+    /// owes: the windows were drawn from that count.
     async fn finish(mut self) -> Result<Vec<BuiltPart>> {
+        if let Some(cutter) = &self.range
+            && cutter.emitted != cutter.end
+        {
+            return Err(MaintainError::Invariant(format!(
+                "a part sink cutting ranges emitted through record {} of the {} its windows \
+                 were drawn for",
+                cutter.emitted, cutter.end
+            )));
+        }
         if self.current.as_ref().is_some_and(|p| !p.is_empty()) {
             self.flush(None).await?;
         }
@@ -8557,6 +8712,78 @@ mod tests {
             level2_ranges(&[60; 40], 600),
             [0..10, 10..20, 20..30, 30..40]
         );
+    }
+
+    /// One range a [`RangeCutter`] cut: the stream it closed after (`None`
+    /// for the range still open at the end), its first index and its limit.
+    type Cut = (Option<usize>, u64, u64);
+
+    /// Pushes `stream_records` through a cutter of `t` records, ending each
+    /// stream, and returns every range it held records in.
+    fn cuts_of(stream_records: &[u64], t: u64, quantum: u64, keys: u64) -> Vec<Cut> {
+        let mut cutter = RangeCutter::new(t, quantum, keys).expect("fits");
+        let mut cuts = Vec::new();
+        let mut open = (cutter.first, cutter.limit);
+        for (s, n) in stream_records.iter().enumerate() {
+            for _ in 0..*n {
+                cutter.push();
+            }
+            if cutter.end_stream() {
+                cuts.push((Some(s), open.0, open.1));
+                open = (cutter.first, cutter.limit);
+            }
+        }
+        if cutter.range_records > 0 {
+            cuts.push((None, open.0, open.1));
+        }
+        assert_eq!(cutter.emitted, t);
+        assert_eq!(cutter.ranges(), cuts.len() as u64);
+        cuts
+    }
+
+    /// The online cut closes a range at the end of the stream that brings
+    /// its records to the quantum, exactly where `level2_ranges` cuts from
+    /// the tally, and numbers each range from the record share before it:
+    /// `keys x before / T`, so a range that overshoots the quantum pushes
+    /// the next one's first index past its own limit. A unit under
+    /// `keys x quantum` is refused before any record is pushed.
+    #[test]
+    fn range_cutter_closes_at_stream_ends_and_numbers_from_the_record_share() {
+        assert_eq!(
+            cuts_of(&[60; 40], 2_400, 600, 10_000),
+            [
+                (Some(9), 0, 2_500),
+                (Some(19), 2_500, 5_000),
+                (Some(29), 5_000, 7_500),
+                (Some(39), 7_500, 10_000),
+            ]
+        );
+        assert_eq!(level2_ranges(&[60; 40], 600).len(), 4);
+
+        assert_eq!(
+            cuts_of(&[100; 10], 1_000, 600, 10_000),
+            [(Some(5), 0, 6_000), (None, 6_000, 10_000)]
+        );
+
+        let mut counts = vec![1_000];
+        counts.extend([100; 14]);
+        let cuts = cuts_of(&counts, 2_400, 600, 10_000);
+        assert_eq!(cuts[0], (Some(0), 0, 2_500), "{cuts:?}");
+        assert_eq!(cuts[1].1, 4_166, "10,000 x 1,000 / 2,400: {cuts:?}");
+        assert_eq!(
+            cuts.len(),
+            level2_ranges(&counts, 600).len(),
+            "the tally's cut: {cuts:?}"
+        );
+
+        assert!(matches!(
+            RangeCutter::new(2_400, 600, 3),
+            Err(MaintainError::PartKeySpace {
+                records: 2_400,
+                quantum: 600,
+                keys: 3,
+            })
+        ));
     }
 
     /// The windows of the ranges `level2_ranges` cuts from `stream_records`.
@@ -16028,9 +16255,10 @@ mod tests {
             (outcome, log)
         }
 
-        /// The output's part content hashes and part bytes.
+        /// The output's part indexes, content hashes and part bytes.
         #[derive(Debug, PartialEq)]
         struct Output {
+            indexes: Vec<u32>,
             hashes: Vec<Vec<u8>>,
             parts: Vec<Bytes>,
         }
@@ -16038,6 +16266,7 @@ mod tests {
         async fn output_of(store: &dyn ObjectStoreBackend) -> Output {
             let (rec, parts) = read_output(store).await;
             Output {
+                indexes: rec.parts.iter().map(|p| p.part_index).collect(),
                 hashes: rec.parts.iter().map(|p| p.content_hash.clone()).collect(),
                 parts,
             }
@@ -17114,6 +17343,15 @@ mod tests {
             let ceiling = group_ceiling(per_input, run_target, 12);
             let dir = fresh_scratch("matches");
             let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            // The fixture's 2,400 records are under the default quantum: one
+            // range on both routes, its parts numbered from 0 without a gap.
+            assert!(
+                config.rlog_range_records > 2400,
+                "{}",
+                config.rlog_range_records
+            );
+            let n = u32::try_from(oracle.1.indexes.len()).expect("parts");
+            assert_eq!(oracle.1.indexes, (0..n).collect::<Vec<u32>>());
 
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
@@ -17184,7 +17422,7 @@ mod tests {
             CompactorConfig {
                 level1_workers: Some(1),
                 level2_workers: Some(level2_workers),
-                rlog_level2_range_records: RANGE_QUANTUM,
+                rlog_range_records: RANGE_QUANTUM,
                 rlog_l1_part_memory_target_bytes: Some(RANGE_PART),
                 ..two_level_config(
                     4 * group_ceiling(per_input, TWO_LEVEL_RUN_TARGET, 12),
@@ -17200,12 +17438,50 @@ mod tests {
             parts.iter().flat_map(|p| decode_all(p)).collect()
         }
 
+        /// The range fixture's quantum and part target on top of `config`.
+        fn at_range_quantum(config: CompactorConfig) -> CompactorConfig {
+            CompactorConfig {
+                rlog_range_records: RANGE_QUANTUM,
+                rlog_l1_part_memory_target_bytes: Some(RANGE_PART),
+                ..config
+            }
+        }
+
+        /// The single-level resident merge of the two-level fixture at the
+        /// range fixture's quantum and part target: its published parts and
+        /// their records.
+        async fn range_oracle() -> ((Vec<String>, Output), Vec<LogRecord>) {
+            let store = ProbeStore::new();
+            seed_inputs(&store, &two_level_inputs()).await;
+            let config = at_range_quantum(two_level_config(
+                64 << 20,
+                crate::RLOG_RUN_MEMORY_TARGET_BYTES,
+                None,
+            ));
+            let (outcome, run) = compact_logged(&store, &config).await;
+            outcome.expect("single-level compact");
+            assert!(
+                run.mode_line().contains("mode=\"resident\""),
+                "{}",
+                run.mode_line()
+            );
+            assert_eq!(run.report.level1_groups, 0, "{:?}", run.report);
+            (published(&store).await, published_records(&store).await)
+        }
+
+        /// The part indexes of the range fixture on every route: range r's
+        /// three parts from `10,000 x 600r / 2,400`.
+        const RANGE_INDEXES: [u32; 12] = [
+            0, 1, 2, 2500, 2501, 2502, 5000, 5001, 5002, 7500, 7501, 7502,
+        ];
+
         /// ADR-3853 D5 amendment: the ranges are cut by the exact per-stream
         /// record totals level 1 tallied against a quantum the worker count
         /// never reaches, here 4 ranges of 10 streams, and each range numbers
         /// its parts from the start of its window, `10,000 x before / T`, so
-        /// 1, 2 and 4 range workers publish the same keys, bytes and content
-        /// hashes, with each range's parts in its own window. The
+        /// 1, 2 and 4 range workers publish the keys, bytes and content
+        /// hashes the single-level merge cut at the same quantum does, with
+        /// each range's parts in its own window. The
         /// records are the single-level merge's, in its order. A block view
         /// carried across a pass or range boundary is decoded once, so the
         /// decodes stay within one per run block plus one per run for each
@@ -17213,16 +17489,8 @@ mod tests {
         /// peak stays under that and the peaks' sum under `U`.
         #[tokio::test]
         async fn range_workers_emit_the_same_parts_at_every_worker_count() {
-            let (oracle, _, per_input) = single_level_oracle().await;
-            let oracle_store = ProbeStore::new();
-            seed_inputs(&oracle_store, &two_level_inputs()).await;
-            let oracle_config =
-                two_level_config(64 << 20, crate::RLOG_RUN_MEMORY_TARGET_BYTES, None);
-            compact_logged(&oracle_store, &oracle_config)
-                .await
-                .0
-                .expect("single-level compact");
-            let oracle_records = published_records(&oracle_store).await;
+            let (_, _, per_input) = single_level_oracle().await;
+            let (oracle, oracle_records) = range_oracle().await;
             assert_eq!(oracle_records.len(), 2400);
             assert!(!oracle.0.is_empty());
 
@@ -17280,10 +17548,7 @@ mod tests {
                 let (rec, _) = read_output(&store).await;
                 let indexes: Vec<u32> = rec.parts.iter().map(|p| p.part_index).collect();
                 assert_eq!(
-                    indexes,
-                    [
-                        0, 1, 2, 2500, 2501, 2502, 5000, 5001, 5002, 7500, 7501, 7502
-                    ],
+                    indexes, RANGE_INDEXES,
                     "{workers} workers: range r's parts from r x 2,500, 3 of them in each \
                      range of 600 records"
                 );
@@ -17294,14 +17559,14 @@ mod tests {
                 assert!(scratch_entries(&dir).is_empty(), "{workers} workers");
                 outputs.push(published(&store).await);
             }
-            for (got, workers) in outputs[1..].iter().zip([2, 4]) {
-                assert_eq!(got.0, outputs[0].0, "{workers} workers: part keys");
+            for (got, workers) in outputs.iter().zip([1, 2, 4]) {
+                assert_eq!(got.0, oracle.0, "{workers} workers: part keys");
                 assert!(
-                    got.1.hashes == outputs[0].1.hashes,
+                    got.1.hashes == oracle.1.hashes,
                     "{workers} workers: content hashes"
                 );
                 assert!(
-                    got.1.parts == outputs[0].1.parts,
+                    got.1.parts == oracle.1.parts,
                     "{workers} workers: part bytes"
                 );
             }
@@ -17328,6 +17593,172 @@ mod tests {
             assert_eq!(log_field(ends[0], "level2_ranges"), 4, "{}", ends[0]);
             assert!(!log.contains("compaction store requests by phase"), "{log}");
             assert_eq!(published(&store).await, outputs[0]);
+        }
+
+        /// ADR-3853 D5 amendment, decision (A): the single-level route cuts
+        /// its parts at the same quantum, into the same proportional windows,
+        /// as the two-level route, so the 2,400-record fixture at a quantum
+        /// of 600 publishes the same keys, content hashes and bytes merged
+        /// single-level resident, single-level fetch per pass, and in two
+        /// levels at every pairing of 1 or 4 level-1 workers with 1 or 2
+        /// range workers. Level 1's grouping differs between the worker
+        /// counts and never reaches the parts. Every input block of this
+        /// fixture carries all 40 streams, so each pass fetches every block
+        /// and no ceiling plans fetch per pass in more than one pass: the
+        /// fetch-per-pass leg merges in one, at the lowest ceiling that
+        /// plans it.
+        #[tokio::test]
+        async fn every_route_and_worker_count_publishes_the_same_parts() {
+            let (_, _, per_input) = single_level_oracle().await;
+            let resident = at_range_quantum(two_level_config(
+                64 << 20,
+                crate::RLOG_RUN_MEMORY_TARGET_BYTES,
+                None,
+            ));
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let (plan, _) = plan_for(&probe, &keys, &resident).await;
+            assert_eq!(plan.mode, MergeReadMode::Resident);
+            // Every input block carries all 40 streams, so fetch per pass fits
+            // only in a narrow band of ceilings: find its lowest.
+            let at = |ceiling: u64| CompactorConfig {
+                merge_resident_ceiling_bytes: Some(ceiling),
+                ..resident.clone()
+            };
+            let (mut low, mut high) = (0u64, 64u64 << 20);
+            while high - low > 1 {
+                let mid = low + (high - low) / 2;
+                let (plan, _) = plan_for(&probe, &keys, &at(mid)).await;
+                if plan.mode == MergeReadMode::Cursor {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            let fetch = at(high);
+            let (plan, _) = plan_for(&probe, &keys, &fetch).await;
+            assert_eq!(plan.mode, MergeReadMode::FetchPerPass, "ceiling {high}");
+
+            let mut legs = vec![
+                ("single-level resident".to_string(), resident),
+                ("single-level fetch-per-pass".to_string(), fetch),
+            ];
+            for (w1, w2) in [(1usize, 1usize), (1, 2), (4, 1), (4, 2)] {
+                let name = format!("two-level W1 {w1} W2 {w2}");
+                let dir = fresh_scratch(&format!("routes-{w1}-{w2}"));
+                let config = CompactorConfig {
+                    level1_workers: Some(w1),
+                    ..range_worker_config(per_input, w2, dir)
+                };
+                legs.push((name, config));
+            }
+
+            let mut outputs = Vec::new();
+            let mut groups = Vec::new();
+            for (name, config) in &legs {
+                let (outcome, run, store, _) = compact_two_level(config).await;
+                assert!(
+                    matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                    "{name}: {outcome:?}"
+                );
+                let r = &run.report;
+                if name.starts_with("single-level") {
+                    assert_eq!(r.level1_groups, 0, "{name}: {r:?}");
+                    let mode = if name.ends_with("resident") {
+                        "mode=\"resident\""
+                    } else {
+                        assert_eq!(r.merge_passes, 1, "{name}: {r:?}");
+                        "mode=\"fetch-per-pass\""
+                    };
+                    assert!(
+                        run.mode_line().contains(mode),
+                        "{name}: {}",
+                        run.mode_line()
+                    );
+                } else {
+                    assert_eq!(r.level2_ranges, 4, "{name}: {r:?}");
+                    groups.push(r.level1_groups);
+                    if let Some(dir) = &config.scratch_dir {
+                        assert!(scratch_entries(dir).is_empty(), "{name}");
+                    }
+                }
+                let got = published(&store).await;
+                assert_eq!(got.1.indexes, RANGE_INDEXES, "{name}");
+                outputs.push((name, got));
+            }
+            assert!(
+                groups[0] == groups[1] && groups[2] == groups[3] && groups[0] != groups[2],
+                "level-1 groups at W1 1 and W1 4: {groups:?}"
+            );
+            let (_, oracle) = &outputs[0];
+            for (name, got) in &outputs[1..] {
+                assert_eq!(got.0, oracle.0, "{name}: part keys");
+                assert!(got.1.hashes == oracle.1.hashes, "{name}: content hashes");
+                assert!(got.1.parts == oracle.1.parts, "{name}: part bytes");
+            }
+        }
+
+        /// ADR-3853 D5 amendment: the two-level cut reads the records each
+        /// stream holds, never how level 1 grouped the inputs or how its runs
+        /// were cut into parts and blocks. Against 4 level-1 workers, run
+        /// blocks of 40 records and an 8,192-byte run target, one level-1
+        /// worker, run blocks of 8 records, and a 4,096-byte run target each
+        /// publish the same keys, content hashes and bytes in the same 4
+        /// ranges, while changing level 1's groups, run blocks and run parts.
+        #[tokio::test]
+        async fn range_cuts_do_not_depend_on_level1_workers_or_run_settings() {
+            let (_, _, per_input) = single_level_oracle().await;
+            let config = |name: &str, w1: usize, block: usize, run_target: u64| {
+                let dir = fresh_scratch(&format!("cut-identity-{name}"));
+                CompactorConfig {
+                    level1_workers: Some(w1),
+                    rlog_run_block_target_records: block,
+                    rlog_run_memory_target_bytes: run_target,
+                    ..range_worker_config(per_input, 2, dir)
+                }
+            };
+            let legs = [
+                ("baseline", config("baseline", 4, 40, TWO_LEVEL_RUN_TARGET)),
+                (
+                    "one-worker",
+                    config("one-worker", 1, 40, TWO_LEVEL_RUN_TARGET),
+                ),
+                ("block-8", config("block-8", 1, 8, TWO_LEVEL_RUN_TARGET)),
+                (
+                    "run-4096",
+                    config("run-4096", 1, 40, TWO_LEVEL_RUN_TARGET / 2),
+                ),
+            ];
+            let mut outputs = Vec::new();
+            let mut shapes = Vec::new();
+            for (name, config) in &legs {
+                let (outcome, run, store, _) = compact_two_level(config).await;
+                assert!(
+                    matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                    "{name}: {outcome:?}"
+                );
+                assert_eq!(run.report.level2_ranges, 4, "{name}: {:?}", run.report);
+                let line = run.line("rlog two-level merge");
+                shapes.push((
+                    run.report.level1_groups,
+                    log_field(&line, "run_blocks"),
+                    log_field(&line, "run_parts"),
+                ));
+                if let Some(dir) = &config.scratch_dir {
+                    assert!(scratch_entries(dir).is_empty(), "{name}");
+                }
+                outputs.push((name, published(&store).await));
+            }
+            assert!(shapes[0].0 != shapes[1].0, "level-1 groups: {shapes:?}");
+            assert!(shapes[2].1 > shapes[1].1, "run blocks: {shapes:?}");
+            assert!(shapes[3].2 > shapes[1].2, "run parts: {shapes:?}");
+            let (_, baseline) = &outputs[0];
+            assert_eq!(baseline.1.indexes, RANGE_INDEXES);
+            for (name, got) in &outputs[1..] {
+                assert_eq!(got.0, baseline.0, "{name}: part keys");
+                assert!(got.1.hashes == baseline.1.hashes, "{name}: content hashes");
+                assert!(got.1.parts == baseline.1.parts, "{name}: part bytes");
+            }
         }
 
         /// ADR-3853 D5 amendment: each range worker plans its passes under
@@ -17424,7 +17855,7 @@ mod tests {
             let per_input = level1_per_input(&probe, &keys).await;
             let dir = fresh_scratch("range-window");
             let config = CompactorConfig {
-                rlog_level2_range_records: 1_200,
+                rlog_range_records: 1_200,
                 rlog_l1_part_memory_target_bytes: Some(4 * RANGE_PART),
                 ..range_worker_config(per_input, 2, dir.clone())
             };
