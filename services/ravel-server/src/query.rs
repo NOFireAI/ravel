@@ -4862,6 +4862,27 @@ mod tests {
         inputs: &SqlSpillInputs,
         process_bytes: u64,
     ) -> Arc<ravel_sql::SqlExecutor> {
+        retry_executor_with(
+            store,
+            inputs,
+            process_bytes,
+            EngineConfig {
+                sql_partition_count: Some(2),
+                ..EngineConfig::default()
+            },
+            0,
+        )
+    }
+
+    /// [`retry_executor`] on the engine config and first-attempt floor
+    /// `start` would hand `build_sql_state_with_parquet`.
+    fn retry_executor_with(
+        store: &Arc<dyn ObjectStoreBackend>,
+        inputs: &SqlSpillInputs,
+        process_bytes: u64,
+        engine: EngineConfig,
+        first_attempt_min_partitions: usize,
+    ) -> Arc<ravel_sql::SqlExecutor> {
         let catalog = build_catalog(
             Arc::clone(store),
             1,
@@ -4882,10 +4903,7 @@ mod tests {
             Arc::clone(store),
             Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
             None,
-            EngineConfig {
-                sql_partition_count: Some(2),
-                ..EngineConfig::default()
-            },
+            engine,
             Arc::new(GetLimiter::new(4).expect("nonzero permits")),
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             DEFAULT_MAX_TENANT_BYTES,
@@ -4904,7 +4922,7 @@ mod tests {
             false,
             ravel_sql::IpcryptDeployment::default(),
             None,
-            0,
+            first_attempt_min_partitions,
         )
         .expect("sql state builds");
         state.executor
@@ -4915,6 +4933,59 @@ mod tests {
     /// far more than the 65,536 groups one bucket answers in memory, while
     /// the unlimited run stays inside the default per-query limit.
     const RETRY_ROWS: i64 = 2_000_000;
+
+    /// Publishes [`RETRY_ROWS`] log records for `tenant`, each with its own
+    /// `a`, and returns the grouped statement the retry tests run over them.
+    async fn publish_retry_fixture(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant: &ravel_types::TenantId,
+    ) -> ravel_sql::SqlRequest {
+        let first = crate::tests::sql_log_record(1, "retry");
+        let records: Vec<_> = (0..RETRY_ROWS)
+            .map(|i| {
+                let mut record = first.clone();
+                record.ts_ns = i + 1;
+                record.observed_ts_ns = i + 1;
+                record
+                    .attrs
+                    .push(("a".to_string(), ravel_logseg::AttrValue::I64(i)));
+                record
+            })
+            .collect();
+        crate::tests::publish_small_log_segment(store.as_ref(), tenant, &records).await;
+        ravel_sql::SqlRequest {
+            sql: "SELECT a, count(*) AS c FROM logs GROUP BY a".to_string(),
+            window: ravel_types::TimeRange {
+                start_ns: 0,
+                end_ns: i64::MAX,
+            },
+            min_tokens: Vec::new(),
+            now_ns: 1_000_000,
+            deadline: Duration::from_secs(120),
+            row_window: false,
+            max_rows: None,
+            budgets: None,
+        }
+    }
+
+    /// `outcome`'s rows, each rendered as `|`-joined cells, sorted.
+    fn sorted_rows(outcome: &ravel_sql::SqlOutcome) -> Vec<String> {
+        let mut rows = Vec::new();
+        for batch in outcome.output.batches() {
+            for row in 0..batch.num_rows() {
+                let cells: Vec<String> = batch
+                    .columns()
+                    .iter()
+                    .map(|column| {
+                        arrow::util::display::array_value_to_string(column, row).expect("renders")
+                    })
+                    .collect();
+                rows.push(cells.join("|"));
+            }
+        }
+        rows.sort();
+        rows
+    }
 
     /// Issue #4075: a statement the process memory budget refuses at nine
     /// tenths of its unlimited peak, on the server-built executor, retries
@@ -4955,51 +5026,8 @@ mod tests {
 
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let tenant = ravel_types::TenantId::new("acme".to_string());
-        let first = crate::tests::sql_log_record(1, "retry");
-        let records: Vec<_> = (0..RETRY_ROWS)
-            .map(|i| {
-                let mut record = first.clone();
-                record.ts_ns = i + 1;
-                record.observed_ts_ns = i + 1;
-                record
-                    .attrs
-                    .push(("a".to_string(), ravel_logseg::AttrValue::I64(i)));
-                record
-            })
-            .collect();
-        crate::tests::publish_small_log_segment(store.as_ref(), &tenant, &records).await;
-
-        let request = ravel_sql::SqlRequest {
-            sql: "SELECT a, count(*) AS c FROM logs GROUP BY a".to_string(),
-            window: ravel_types::TimeRange {
-                start_ns: 0,
-                end_ns: i64::MAX,
-            },
-            min_tokens: Vec::new(),
-            now_ns: 1_000_000,
-            deadline: Duration::from_secs(120),
-            row_window: false,
-            max_rows: None,
-            budgets: None,
-        };
-        let rows = |outcome: &ravel_sql::SqlOutcome| {
-            let mut rows = Vec::new();
-            for batch in outcome.output.batches() {
-                for row in 0..batch.num_rows() {
-                    let cells: Vec<String> = batch
-                        .columns()
-                        .iter()
-                        .map(|column| {
-                            arrow::util::display::array_value_to_string(column, row)
-                                .expect("renders")
-                        })
-                        .collect();
-                    rows.push(cells.join("|"));
-                }
-            }
-            rows.sort();
-            rows
-        };
+        let request = publish_retry_fixture(&store, &tenant).await;
+        let rows = sorted_rows;
 
         let unlimited = retry_executor(&store, &startup.inputs, u64::MAX)
             .execute(tenant.hash(), &request)
@@ -5114,6 +5142,133 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(rows(&retried), expected);
+    }
+
+    /// Issue #4075: `--sql-partition-count 4`, resolved the way `start`
+    /// resolves it, plans the bucketed retry's final exchange at 4
+    /// partitions, the count the `sql_spill_retry_modes` startup line names,
+    /// and the retry still answers through buckets there.
+    ///
+    /// Prove-the-test: give an explicit count the floor of 16 in
+    /// `resolve_sql_first_attempt_partitions` and the INFO line reads
+    /// `final_partitions="16"`; resolve its `value` to 16 and the startup line
+    /// reads `partitions=16`.
+    #[tokio::test]
+    async fn an_operator_partition_count_reaches_the_bucketed_retry() {
+        use clap::Parser;
+
+        assert_spill_env_unset();
+        let cache = tempfile::tempdir().expect("cache dir");
+        let cache_arg = cache.path().to_str().expect("utf-8 temp path");
+        let cli = crate::Cli::try_parse_from([
+            "ravel-server",
+            "--cache-dir",
+            cache_arg,
+            "--sql-partition-count",
+            "4",
+        ])
+        .expect("flags parse");
+        let resolved = cli
+            .resolve_performance(crate::config::HostProfile::new(
+                16,
+                Some(32_212_254_720),
+                Some(32_212_254_720),
+                None,
+                None,
+                None,
+            ))
+            .expect("performance defaults resolve");
+        let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
+        let first_attempt = resolve_sql_first_attempt_partitions(
+            budgets.sql_partition_count,
+            budgets.sql_partition_count_source,
+        );
+        let (capture, guard) = capture_info();
+        let startup = prepare(
+            Some(cache.path()),
+            crate::config::SqlSpillSettings {
+                retry_partitions: first_attempt.value,
+                ..budgets.sql_spill
+            },
+            None,
+            None,
+            300 * GIB,
+        )
+        .expect("spill resolves");
+        drop(guard);
+        let lines = capture.0.lock().clone();
+        let modes_line = resolved_line(&lines, "sql_spill_retry_modes");
+        assert!(
+            modes_line.contains(" partitions=4 least_descriptor_need=12"),
+            "{modes_line}"
+        );
+        let engine = budgets
+            .apply_to_engine(EngineConfig::default())
+            .expect("engine config");
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("acme".to_string());
+        let request = publish_retry_fixture(&store, &tenant).await;
+        let unlimited = retry_executor_with(
+            &store,
+            &startup.inputs,
+            u64::MAX,
+            engine,
+            first_attempt.min_partitions,
+        )
+        .execute(tenant.hash(), &request)
+        .await
+        .expect("the unlimited run answers");
+        assert_eq!(unlimited.stats.spill_retries, 0);
+        let expected = sorted_rows(&unlimited);
+        assert_eq!(expected.len(), RETRY_ROWS as usize);
+        let peak = unlimited.accounting.peak_intermediate_bytes;
+
+        let raised = SqlSpillInputs {
+            nofile_soft: 1 << 16,
+            ..startup.inputs.clone()
+        };
+        let refused = retry_executor_with(
+            &store,
+            &raised,
+            peak * 9 / 10,
+            engine,
+            first_attempt.min_partitions,
+        );
+        let (capture, guard) = capture_info();
+        let retried = refused.execute(tenant.hash(), &request).await;
+        drop(guard);
+        let lines = capture.0.lock().clone();
+        let retried = retried.unwrap_or_else(|e| panic!("the retry answers: {e}\n{lines:?}"));
+        assert_eq!(retried.stats.spill_retries, 1, "{lines:?}");
+        let info: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("SQL statement retried with spill"))
+            .collect();
+        assert_eq!(info.len(), 1, "{lines:?}");
+        for field in [" final_partitions=\"4\"", " retry_plan=\"bucket\""] {
+            assert!(info[0].contains(field), "{field} on {}", info[0]);
+        }
+        let report = retried
+            .stats
+            .spill_retry
+            .as_ref()
+            .expect("the retry reports");
+        assert_eq!(
+            (
+                report.final_partitions,
+                report.retry_plan,
+                report.retry_plan_reason
+            ),
+            (Some(startup.inputs.retry_partitions), "bucket", None),
+            "{report:?}"
+        );
+        assert!(report.bucket_spill_rows_written > 0, "{report:?}");
+        assert_eq!(
+            report.bucket_spill_rows_read, report.bucket_spill_rows_written,
+            "{report:?}"
+        );
+        assert_eq!(sorted_rows(&retried), expected);
     }
 
     /// The startup lines: `sql_spill_dir`, `sql_spill_max_bytes`,
@@ -5275,6 +5430,22 @@ mod tests {
             let modes_line = resolved_line(&lines, "sql_spill_retry_modes");
             assert!(modes_line.contains(&modes_fields), "{label}: {modes_line}");
         }
+    }
+
+    /// At an operator-set 4 partitions the least need is `3 x 4 = 12`: a
+    /// descriptor budget of exactly 12 admits the bucketed retry and 11
+    /// leaves the sort-merge retry alone.
+    ///
+    /// Prove-the-test: compare with `>` in `sql_spill_retry_modes` and the
+    /// budget-of-12 assertion reads `sort_merge`.
+    #[test]
+    fn the_retry_modes_follow_the_need_at_four_partitions() {
+        let need = ravel_sql::bucket_spill_min_descriptor_need(4);
+        assert_eq!(need, 12);
+        assert_eq!(sql_spill_retry_modes(need, 4), "bucket,sort_merge");
+        assert_eq!(sql_spill_retry_modes(12, 4), "bucket,sort_merge");
+        assert_eq!(sql_spill_retry_modes(need - 1, 4), "sort_merge");
+        assert_eq!(sql_spill_retry_modes(11, 4), "sort_merge");
     }
 
     /// `sql_spill_retry_modes` names the bucketed retry only while the
