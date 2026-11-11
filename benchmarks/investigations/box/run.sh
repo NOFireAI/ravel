@@ -779,7 +779,7 @@ step_corpus() {
         >"$WORK/midnight-dp$n.out" 2>&1 || fail_log "midnight-truth day_parts_$n" "$WORK/midnight-dp$n.out"
     fi
     subs+=(--sub "day_parts_$n=$WORK/corpus-dp$n/truth.json")
-    dp="$("$HOST_PY" -c 'import json, sys; d = json.loads(sys.argv[1]); d[sys.argv[2]] = {"days": int(sys.argv[2]), "traces_per_day": int(sys.argv[3]), "traces": int(sys.argv[3]) * int(sys.argv[2]), "hours": 24 * int(sys.argv[2]), "seed": int(sys.argv[4]), "start_hour": sys.argv[5] if not sys.argv[5].isdigit() else int(sys.argv[5]), "even_hours": True}; print(json.dumps(d))' \
+    dp="$("$HOST_PY" -c 'import json, sys; d = json.loads(sys.argv[1]); d[sys.argv[2]] = {"days": int(sys.argv[2]), "traces_per_day": int(sys.argv[3]), "traces": int(sys.argv[3]) * int(sys.argv[2]), "hours": 24 * int(sys.argv[2]), "merge_seed": int(sys.argv[4]), "day_seeds": [int(sys.argv[4]) * 1000 + k for k in range(int(sys.argv[2]))], "start_hour": sys.argv[5] if not sys.argv[5].isdigit() else int(sys.argv[5]), "even_hours": True}; print(json.dumps(d))' \
       "$dp" "$n" "$tpd" $((SEED + 100 + n)) "$start")" || fail "day_parts corpus record"
   done
   run "$PY" "$LIB" merge-truth --base "$WORK/corpus/truth.json" ${subs[@]+"${subs[@]}"} --out "$OUT/truth.json" \
