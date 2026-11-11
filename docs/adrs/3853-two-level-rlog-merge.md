@@ -890,8 +890,9 @@ Phase B ships in issue #4108: level 2 runs on `W2` range workers, each
 merging its own contiguous share of the unit's stream ranges into its own
 parts, and `W1` and `W2` are derived together. `CompactorConfig` carries
 both counts; `ravel-cli maintain compact-tenant` and `compact-bucket` set
-them with `--level1-workers` and `--level2-workers` (#4109), and a
-configured count overrides the derived one. This amendment settles the
+them with `--level1-workers` and `--level2-workers` (#4109), `ravel-server`
+with `--maintain-level1-workers` and `--maintain-level2-workers` (#4110),
+and a configured count overrides the derived one. This amendment settles the
 three points D5 left open or stated wrongly, and records how the rest of D5
 shipped.
 

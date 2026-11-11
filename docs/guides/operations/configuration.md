@@ -1154,14 +1154,16 @@ single-level merge would be a cursor merge that decodes more than 16 rows per
 input record and more than 10 million rows in all. Every other bucket merges
 in one level as before. Level 1
 merges groups of inputs into sorted runs on local disk, and level 2 merges
-the runs into the L1 segments. The runs need a local directory, and three flags configure
-it:
+the runs into the L1 segments. The runs need a local directory. These flags
+configure it, the two levels' worker counts and the runs' block size:
 
 | Flag | Default | Effect |
 |---|---|---|
 | `--maintain-scratch-dir` | unset | The directory the level-1 runs are written under. Without it, a bucket whose cursor merge would decode more than 16 rows per input record and more than 10 million rows in all is refused and counted under `ravel_maintain_compaction_refused_total{reason="geometry"}`. |
 | `--maintain-scratch-max-bytes` | unset | A cap on the bytes the directory may hold. A unit is admitted against the smaller of the volume's free bytes and this cap less the bytes already under the directory. A running unit whose next run write would take the directory past the cap stops before that write and is refused under `reason="scratch_headroom"`. Without it, the volume's free bytes alone decide. |
 | `--maintain-level1-workers` | derived | How many level-1 groups of one bucket merge at once, each under its share of the unit's memory ceiling. Without it, the count is derived per bucket from the unit's share of the usable cores, the usable cores divided by `--maintain-unit-concurrency` and at least 1, and the largest count whose groups still fit. |
+| `--maintain-level2-workers` | derived | How many level-2 range workers one bucket's level 2 runs on. Level 2 cuts the merged stream order into ranges, each closed at the first stream end at which it holds 2,500,000 records (the last may hold fewer), and each worker merges its own contiguous share of them into its own parts. Without it, the count is derived jointly with the level-1 count from the same core share. No more workers run than the bucket has ranges, and a count whose level-2 read side does not fit the unit's memory ceiling is refused. The count does not change where parts are cut. |
+| `--maintain-run-block-records` | `1024` | Records per block of a level-1 run. It changes the runs' blocks, and so what level 2 reads and holds per run. Leave it unset outside a measurement of level 2's read cost. |
 
 The scratch directory is a cache, not storage:
 
@@ -1203,8 +1205,9 @@ Several units of one process merging at once each reserve their own share,
 so a process at `--maintain-unit-concurrency` above 1 needs room for that
 many of its largest buckets at once.
 
-Startup refuses `--maintain-scratch-max-bytes` or `--maintain-level1-workers`
-given without `--maintain-scratch-dir`, and either one set to `0`.
+Startup refuses `--maintain-scratch-max-bytes`, `--maintain-level1-workers`,
+`--maintain-level2-workers` or `--maintain-run-block-records` given without
+`--maintain-scratch-dir`, and any of them set to `0`.
 
 ## Retention and garbage-collection configuration
 

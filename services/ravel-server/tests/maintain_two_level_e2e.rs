@@ -501,3 +501,94 @@ async fn a_maintain_server_with_a_short_scratch_cap_refuses_with_the_scratch_hea
         Vec::<std::path::PathBuf>::new()
     );
 }
+
+/// The range quantum the range-worker test cuts the bucket at: 20 streams of
+/// 6000 records each, so level 2 closes a range every five streams.
+const RANGE_RECORDS: u64 = 30_000;
+/// 120000 records over [`RANGE_RECORDS`].
+const RANGES: u64 = 4;
+/// More level-2 workers than the bucket has ranges, so the count the merge
+/// ran with (capped at [`RANGES`]) differs from the flag.
+const LEVEL2_WORKERS_FLAG: &str = "8";
+
+/// ADR-3853 phase B through `Mode::Maintain`: with `--maintain-scratch-dir`,
+/// `--maintain-level1-workers 1` and `--maintain-level2-workers 8`, the tick
+/// publishes one compaction record and the unit's request ledger shows level
+/// 2 ran on 4 workers over 4 ranges: the flag reached the merge, capped at
+/// the range count. The range quantum has no server flag, so the test sets
+/// it on the resolved config.
+///
+/// Distinguishing: a server that parses `--maintain-level2-workers` but never
+/// sets `CompactorConfig::level2_workers` derives 1 worker at a core share of
+/// 1, and a ledger reporting the configured count reads 8; either fails the
+/// `level2_workers` equality.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_maintain_server_runs_level_2_on_range_workers() {
+    let _serial = SERIAL.lock().await;
+    let tenant = TenantId::new("maintain-two-level-range-workers-e2e");
+    let store = Arc::new(MemoryStore::new());
+    let hour = sealed_hour();
+    publish_inputs(store.as_ref(), &tenant, hour).await;
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let scratch_dir = scratch.path().to_str().expect("utf-8 path");
+    let ledger = ravel_maintain::RequestLedger::new();
+    let config = ravel_maintain::CompactorConfig {
+        rlog_range_records: RANGE_RECORDS,
+        request_ledger: Some(ledger.clone()),
+        ..compactor(&[
+            "--maintain-scratch-dir",
+            scratch_dir,
+            "--maintain-level1-workers",
+            "1",
+            "--maintain-level2-workers",
+            LEVEL2_WORKERS_FLAG,
+        ])
+    };
+    let expected = refused_now_plus(&[]);
+
+    // The ledger is reset when the next tick opens a run on the bucket, so it
+    // is read as soon as the record is published.
+    let mut seen = None;
+    let body = run_until(
+        &store,
+        &tenant,
+        config,
+        "a compaction record or a refusal counter to move",
+        async |store, body| {
+            if !compaction_records(store, &tenant, hour).await.is_empty() {
+                let report = ledger.report();
+                seen = Some((
+                    report.level1_workers,
+                    report.level2_workers,
+                    report.level2_ranges,
+                ));
+                return true;
+            }
+            refused(body) != expected
+        },
+    )
+    .await;
+
+    assert_eq!(
+        compaction_records(store.as_ref(), &tenant, hour)
+            .await
+            .len(),
+        1,
+        "one compaction record: {:?}",
+        refused(&body)
+    );
+    let (level1_workers, level2_workers, level2_ranges) =
+        seen.expect("the ledger was read when the record appeared");
+    println!(
+        "range-worker e2e: level1_workers={level1_workers} level2_workers={level2_workers} \
+         level2_ranges={level2_ranges}"
+    );
+    assert_eq!(level2_ranges, RANGES);
+    assert_eq!(level2_workers, RANGES);
+    assert_eq!(level1_workers, 1);
+    assert_eq!(
+        scratch_entries(scratch.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(refused(&body), expected);
+}

@@ -278,9 +278,10 @@ pub struct ScratchOptions {
 }
 
 impl ScratchOptions {
-    /// Refuse what ravel-server refuses at startup for its `--maintain-*`
-    /// spellings: the cap, either worker count or the run block target
-    /// without a directory, and any of them or the range quantum at zero.
+    /// Refuse the cap, either worker count or the run block target without a
+    /// directory, and any of them or the range quantum at zero. The first
+    /// four are what ravel-server refuses at startup for its `--maintain-*`
+    /// spellings; the range quantum has no server spelling.
     pub fn validate(&self) -> Result<(), CompactorKnobError> {
         if self.scratch_dir.is_none() {
             if self.scratch_max_bytes.is_some() {

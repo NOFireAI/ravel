@@ -1781,6 +1781,23 @@ pub struct MaintenanceArgs {
     #[arg(long = "maintain-level1-workers", value_name = "N")]
     pub maintain_level1_workers: Option<usize>,
 
+    /// The level-2 worker count of a two-level RLOG merge (ADR-3853 D5): how
+    /// many of one bucket's level-2 ranges merge at once, each under its share
+    /// of the unit's memory ceiling. Omitted, it is derived jointly with the
+    /// level-1 count from the unit's share of the usable cores. No more
+    /// workers run than the bucket has ranges, and a count whose level-2 read
+    /// side does not fit the ceiling is refused. Zero, or a value without
+    /// `--maintain-scratch-dir`, is refused at startup.
+    #[arg(long = "maintain-level2-workers", value_name = "N")]
+    pub maintain_level2_workers: Option<usize>,
+
+    /// The records per block a level-1 run is written at (ADR-3853 D2), 1,024
+    /// by default. It changes the runs' blocks, and so what level 2 reads and
+    /// holds per run. Zero, or a value without `--maintain-scratch-dir`, is
+    /// refused at startup.
+    #[arg(long = "maintain-run-block-records", value_name = "N")]
+    pub maintain_run_block_records: Option<usize>,
+
     /// Whether this process takes bucket claims at all (ADR-1029 decision 5's
     /// escape hatch). `off` is the fleet-wide
     /// fallback for a store whose qualification record predates the CAS
@@ -9160,37 +9177,69 @@ impl Cli {
         Ok(config)
     }
 
-    /// Write `--maintain-scratch-dir`, `--maintain-scratch-max-bytes` and
-    /// `--maintain-level1-workers` into `config` (ADR-3853), refusing a zero
-    /// cap or worker count and either of the last two without a directory.
+    /// Write `--maintain-scratch-dir`, `--maintain-scratch-max-bytes`,
+    /// `--maintain-level1-workers`, `--maintain-level2-workers` and
+    /// `--maintain-run-block-records` into `config` (ADR-3853), refusing any of
+    /// the last four at zero or without a directory, the rules `ravel-cli
+    /// maintain` applies to its spellings.
     fn apply_maintain_scratch(
         &self,
         config: &mut ravel_maintain::CompactorConfig,
     ) -> anyhow::Result<()> {
-        if self.maintenance.maintain_scratch_dir.is_none() {
-            if self.maintenance.maintain_scratch_max_bytes.is_some() {
-                anyhow::bail!(
-                    "--maintain-scratch-max-bytes has no effect without --maintain-scratch-dir"
-                );
-            }
-            if self.maintenance.maintain_level1_workers.is_some() {
-                anyhow::bail!(
-                    "--maintain-level1-workers has no effect without --maintain-scratch-dir"
-                );
+        let m = &self.maintenance;
+        if m.maintain_scratch_dir.is_none() {
+            for (set, flag) in [
+                (
+                    m.maintain_scratch_max_bytes.is_some(),
+                    "--maintain-scratch-max-bytes",
+                ),
+                (
+                    m.maintain_level1_workers.is_some(),
+                    "--maintain-level1-workers",
+                ),
+                (
+                    m.maintain_level2_workers.is_some(),
+                    "--maintain-level2-workers",
+                ),
+                (
+                    m.maintain_run_block_records.is_some(),
+                    "--maintain-run-block-records",
+                ),
+            ] {
+                if set {
+                    anyhow::bail!("{flag} has no effect without --maintain-scratch-dir");
+                }
             }
         }
-        if self.maintenance.maintain_scratch_max_bytes == Some(0) {
+        if m.maintain_scratch_max_bytes == Some(0) {
             anyhow::bail!(
                 "--maintain-scratch-max-bytes must be greater than 0: a zero cap refuses \
                  every two-level merge"
             );
         }
-        if self.maintenance.maintain_level1_workers == Some(0) {
+        if m.maintain_level1_workers == Some(0) {
             anyhow::bail!("--maintain-level1-workers must be greater than 0");
         }
-        config.scratch_dir = self.maintenance.maintain_scratch_dir.clone();
-        config.scratch_max_bytes = self.maintenance.maintain_scratch_max_bytes;
-        config.level1_workers = self.maintenance.maintain_level1_workers;
+        ravel_maintain::validate_rlog_level2_settings(
+            m.maintain_level2_workers,
+            config.rlog_range_records,
+        )
+        .map_err(|e| match e.field {
+            "level2_workers" => {
+                anyhow::anyhow!("--maintain-level2-workers must be greater than 0: {e}")
+            }
+            _ => anyhow::anyhow!(e),
+        })?;
+        if let Some(records) = m.maintain_run_block_records {
+            config.rlog_run_block_target_records =
+                ravel_maintain::validate_rlog_run_block_target_records(records).map_err(|e| {
+                    anyhow::anyhow!("--maintain-run-block-records must be greater than 0: {e}")
+                })?;
+        }
+        config.scratch_dir = m.maintain_scratch_dir.clone();
+        config.scratch_max_bytes = m.maintain_scratch_max_bytes;
+        config.level1_workers = m.maintain_level1_workers;
+        config.level2_workers = m.maintain_level2_workers;
         Ok(())
     }
 
@@ -17922,6 +17971,76 @@ mod tests {
                     "0",
                 ][..],
                 "--maintain-level1-workers must be greater than 0",
+            ),
+        ] {
+            let err = compactor(args).expect_err("refused");
+            assert!(err.to_string().contains(needle), "{args:?}: {err:#}");
+        }
+    }
+
+    /// `--maintain-run-block-records` reaches
+    /// `CompactorConfig::rlog_run_block_target_records` and
+    /// `--maintain-level2-workers` reaches `level2_workers`. Omitted, the run
+    /// block target stays at the 1,024-record default and the level-2 count at
+    /// `None`, so ravel-maintain derives it.
+    #[test]
+    fn maintain_level2_flags_reach_the_compactor_config() {
+        let unset = compactor(&["--maintain-scratch-dir", "/scratch"]).expect("resolve");
+        assert_eq!(
+            (unset.rlog_run_block_target_records, unset.level2_workers),
+            (1_024, None)
+        );
+        assert_eq!(
+            unset.rlog_run_block_target_records,
+            ravel_maintain::rlog::RUN_BLOCK_TARGET_RECORDS
+        );
+
+        let set = compactor(&[
+            "--maintain-scratch-dir",
+            "/scratch",
+            "--maintain-run-block-records",
+            "8192",
+            "--maintain-level2-workers",
+            "3",
+        ])
+        .expect("resolve");
+        assert_eq!(
+            (set.rlog_run_block_target_records, set.level2_workers),
+            (8_192, Some(3))
+        );
+    }
+
+    /// `--maintain-level2-workers` and `--maintain-run-block-records` are
+    /// refused at startup at zero and without `--maintain-scratch-dir`, with
+    /// the messages `--maintain-level1-workers` uses.
+    #[test]
+    fn maintain_level2_flags_are_refused_at_zero_or_without_a_scratch_dir() {
+        for (args, needle) in [
+            (
+                &["--maintain-level2-workers", "2"][..],
+                "--maintain-level2-workers has no effect without --maintain-scratch-dir",
+            ),
+            (
+                &["--maintain-run-block-records", "8192"][..],
+                "--maintain-run-block-records has no effect without --maintain-scratch-dir",
+            ),
+            (
+                &[
+                    "--maintain-scratch-dir",
+                    "/scratch",
+                    "--maintain-level2-workers",
+                    "0",
+                ][..],
+                "--maintain-level2-workers must be greater than 0",
+            ),
+            (
+                &[
+                    "--maintain-scratch-dir",
+                    "/scratch",
+                    "--maintain-run-block-records",
+                    "0",
+                ][..],
+                "--maintain-run-block-records must be greater than 0",
             ),
         ] {
             let err = compactor(args).expect_err("refused");
