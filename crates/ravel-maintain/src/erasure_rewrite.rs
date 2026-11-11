@@ -56,6 +56,9 @@
 //! and the stored-size target, `CompactorConfig::rlog_stored_target_bytes`,
 //! issue #872; for spans `l1_part_memory_target_bytes`); only metrics still has the
 //! whole-object, single-part shape described above.
+//! The logs merge numbers its parts 0, 1, 2, ... and does not cut them into
+//! compaction's record ranges, because its keep drops erased records and the
+//! range cut's record count is the inputs' footer sum, not its output.
 //!
 //! ## Exemplars are filtered by the erasure predicate
 //!
@@ -1591,7 +1594,7 @@ pub async fn build_rewrite_logs(
     crate::config::validate_rlog_run_block_target_records(config.rlog_run_block_target_records)?;
     crate::config::validate_rlog_level2_settings(
         config.level2_workers,
-        config.rlog_level2_range_records,
+        config.rlog_range_records,
     )?;
     // `false`: this pass writes its parts with no indexed fields, so recovering
     // each input's POSTINGS field list would cost a ranged GET per input and be
@@ -1645,6 +1648,7 @@ pub async fn build_rewrite_logs(
         // bytes resident because `publish_rewrite_record` is what PUTs them,
         // after the conservation gate passes (ADR-0979 decision 3).
         true,
+        rlog::RangeCut::Off,
         &mut |record| match first_dropping_log_request(requests, &record.attrs, record.ts_ns) {
             Some(i) => {
                 dropped_counts[i] += 1;

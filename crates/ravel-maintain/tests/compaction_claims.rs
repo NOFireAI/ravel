@@ -1766,7 +1766,7 @@ async fn a_failed_level2_worker_stops_every_level2_worker() {
     let config = CompactorConfig {
         request_ledger: Some(ledger.clone()),
         level2_workers: Some(4),
-        rlog_level2_range_records: 600,
+        rlog_range_records: 600,
         rlog_l1_part_memory_target_bytes: Some(24 * 4096),
         rlog_run_block_target_records: 40,
         ..two_level(

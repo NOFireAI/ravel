@@ -64,6 +64,9 @@
 //! Its caller is the `migrate` walk ([`crate::migrate::migrate_family`]), and
 //! `ravel-cli maintain migrate --reencode-compaction-parts` turns the switch on
 //! for one run.
+//! Its logs merge numbers parts 0, 1, 2, ... without compaction's record
+//! ranges: it re-encodes one record's parts at a new version and makes no
+//! claim that its parts match the ones a compaction of the same inputs writes.
 
 use std::collections::BTreeMap;
 
@@ -1359,6 +1362,7 @@ async fn reencode_and_publish(
                 declared_columns_from_parts(&predecessor.parts),
                 config.dry_run,
                 false,
+                crate::rlog::RangeCut::Off,
                 &mut |_| Ok(true),
             )
             .await?
