@@ -5964,9 +5964,9 @@ FINISHED=1
         b = self.blocks(text)
         for n in (7, 30):
             self.assertIn(f"day-parts-window --days {n}", "\n".join(b["corpus"]))
-            gen = [x for x in b["corpus"] if "gen_corpus.py" in x and x.endswith(f"/corpus-dp{n}")]
+            gen = [x for x in b["corpus"] if "gen_corpus.py" in x and x.endswith(f"/corpus-dp{n}/day-0")]
             self.assertEqual(len(gen), 1, gen)
-            for frag in (f" --hours {24 * n} ", " --even-hours ", f" --start-hour D0_{n} "):
+            for frag in (" --hours 24 ", " --even-hours ", f" --start-hour D0_{n}+0 "):
                 self.assertIn(frag, gen[0])
             loads = [x for x in b[f"state:day_parts_{n}"] if f"load-day_parts_{n}-" in x and "load --signal" in x]
             self.assertEqual(len(loads), 2 if n == 7 else 1, loads)
@@ -5979,6 +5979,146 @@ FINISHED=1
                  "the default last day reaching the current hour at midnight")):
             self.flip_check(old, new, "lib/inv.py", self.check_day_parts_window, label,
                             "test_day_parts_state_ends_before_the_current_hour")
+
+    def check_day_parts_corpus_per_day(self, script):
+        """The day_parts_N corpus step's generator calls: one gen_corpus run
+        per UTC day (24 hours, traces_per_day_N traces, seed state_seed * 1000
+        + k, start D0_N + 24k, its own present id, out day-k), then one
+        merge-days over the days in order into corpus-dpN, before the midnight
+        lookup reads it; no call generates more than a day."""
+        code, text = self.new_states_dry_run(script)
+        if code:
+            return [f"dry run exit {code}"]
+        lines = self.blocks(text).get("corpus", [])
+        work = self.path("out-h1b", "work")
+        out = []
+        for n, tpd in ((7, 19_999_992), (30, 4_000_008)):
+            seed = 3692 + 100 + n
+            gens = [x for x in lines if "gen_corpus.py --traces" in x and f"/corpus-dp{n}/" in x]
+            if len(gens) != n:
+                out.append(f"day_parts_{n}: {len(gens)} generator calls, want {n}: {gens[:2]}")
+                continue
+            for k, x in enumerate(gens):
+                want = (f"gen_corpus.py --traces {tpd} --hours 24 --seed {seed * 1000 + k} --even-hours "
+                        f"--spans-per-trace 10 --logs-per-trace 5 --start-hour D0_{n}+{24 * k} "
+                        f"--present-id req-planted-present-d{k:03d} --format parquet --out {work}/corpus-dp{n}/day-{k}")
+                if not x.endswith(want):
+                    out.append(f"day_parts_{n} day {k}: {x!r}, want it to end {want!r}")
+            merges = [x for x in lines if "gen_corpus.py merge-days" in x and x.endswith(f"--out {work}/corpus-dp{n}")]
+            days = "".join(f" --day {work}/corpus-dp{n}/day-{k}" for k in range(n))
+            if len(merges) != 1 or f"merge-days --seed {seed} --remove-day-rows{days} --out" not in merges[0]:
+                out.append(f"day_parts_{n}: merge-days calls {merges}")
+                continue
+            if lines.index(merges[0]) < lines.index(gens[-1]):
+                out.append(f"day_parts_{n}: merge-days before the last day's run")
+            mid = [i for i, x in enumerate(lines) if f"midnight-truth --corpus {work}/corpus-dp{n} " in x]
+            if n == 7 and (len(mid) != 1 or mid[0] < lines.index(merges[0])):
+                out.append(f"day_parts_7: midnight-truth at {mid}, want once after merge-days")
+        return out
+
+    def test_day_parts_corpus_generated_a_day_at_a_time(self):
+        # One gen_corpus run over the whole window holds every trace of it in
+        # memory (#4117: day_parts_7's 139,999,944 traces were killed on the
+        # 32 GB box); a run per UTC day, merged by streaming, holds one day.
+        self.assertEqual(self.check_day_parts_corpus_per_day(None), [])
+        self.flip_check('      run "$PY" "$INV_DIR/gen_corpus.py" --traces "$tpd" --hours 24 --seed',
+                        '      run "$PY" "$INV_DIR/gen_corpus.py" --traces "$tpd" --hours $((24 * n)) --seed',
+                        "run.sh", self.check_day_parts_corpus_per_day, "a day's call generating the whole window",
+                        "test_day_parts_corpus_generated_a_day_at_a_time")
+
+    def merge_two_days(self, out, gen=GEN, present=("req-planted-present-d000", "req-planted-present-d001"),
+                       collide=False):
+        """Two 2,400-trace days as run.sh deals them, merged by GEN's
+        merge-days: (exit code, stderr, merged truth, merged rows, day truths).
+        COLLIDE rewrites one day-1 log row's request_id to day 0's present id
+        before the merge."""
+        start, seed = 498_000, 3_800
+        for k in (0, 1):
+            subprocess.run([PY, gen, "--traces", "2400", "--hours", "24", "--seed", str(seed * 1000 + k),
+                            "--even-hours", "--spans-per-trace", "10", "--logs-per-trace", "5", "--start-hour",
+                            str(start + 24 * k), "--present-id", present[k], "--format", "jsonl",
+                            "--out", os.path.join(out, f"day-{k}")], check=True, capture_output=True)
+        if collide:
+            path = os.path.join(out, "day-1", "logs.jsonl")
+            rows = read_jsonl(path)
+            rows[0]["request_id"] = present[0]
+            write_jsonl(path, rows)
+        days = []
+        for k in (0, 1):
+            with open(os.path.join(out, f"day-{k}", "truth.json")) as f:
+                days.append(json.load(f))
+        p = subprocess.run([PY, gen, "merge-days", "--seed", str(seed), "--day", os.path.join(out, "day-0"),
+                            "--day", os.path.join(out, "day-1"), "--out", out], capture_output=True, text=True)
+        if p.returncode:
+            return p.returncode, p.stderr, None, None, days
+        with open(os.path.join(out, "truth.json")) as f:
+            truth = json.load(f)
+        return 0, p.stderr, truth, {sig: read_jsonl(os.path.join(out, f"{sig}.jsonl")) for sig in ("spans", "logs")}, days
+
+    def check_merged_truth(self, gen):
+        """Problems with a 2-day merge by GEN: rows summed per signal, every
+        planted id unique across days, and a key two days share refused."""
+        out = []
+        code, err, truth, rows, days = self.merge_two_days(self.path("merge-ok"), gen)
+        if code:
+            return [f"merge exit {code}: {err}"]
+        for sig in ("spans", "logs"):
+            want = days[0]["rows_written"][sig] + days[1]["rows_written"][sig]
+            if truth["rows_written"][sig] != want or len(rows[sig]) != want:
+                out.append(f"{sig}: rows_written {truth['rows_written'][sig]}, file {len(rows[sig])}, want {want}")
+        n0 = days[0]["rows_written"]["spans"]
+        for k, part in ((0, rows["spans"][:n0]), (1, rows["spans"][n0:])):
+            hours = {r["start_ts"] // HOUR_NS - 498_000 for r in part}
+            if not hours or min(hours) < 24 * k or max(hours) >= 24 * k + 24:
+                out.append(f"day {k}'s spans in hours {min(hours, default=None)}..{max(hours, default=None)}")
+        saved = [s["trace_id"] for s in truth["saved_traces"]]
+        want = [s["trace_id"] for d in days for s in d["saved_traces"]]
+        if saved != want or len(set(saved)) != 80:
+            out.append(f"saved traces: {len(saved)} ({len(set(saved))} unique), want the days' 80 in day order")
+        logs_by_rid, spans_by_tid = {}, {}
+        for r in rows["logs"]:
+            logs_by_rid[r["request_id"]] = logs_by_rid.get(r["request_id"], 0) + 1
+        for r in rows["spans"]:
+            spans_by_tid[r["trace_id"]] = spans_by_tid.get(r["trace_id"], 0) + 1
+        if truth["request_id"]["planted_present"] != ["req-planted-present-d000", "req-planted-present-d001"] or any(
+                logs_by_rid.get(r) != 1 for r in truth["request_id"]["planted_present"]):
+            out.append(f"planted present ids {truth['request_id']}")
+        for size in ("1", "10", "100", "1000"):
+            for field, per in (("trace_id", spans_by_tid), ("request_id", logs_by_rid)):
+                ids = truth["in_lists"][field][size]
+                want_rows = 10 if field == "trace_id" else 1
+                if len(set(ids)) != int(size) or any(per.get(i) != want_rows for i in ids):
+                    out.append(f"in_lists {field} {size}: {len(set(ids))} unique ids, not each in {want_rows} rows")
+            if truth["answers"][f"in_request_id.{size}"]["rows"] != int(size):
+                out.append(f"in_request_id.{size} answer {truth['answers'][f'in_request_id.{size}']}")
+        if truth["failing_cell"]["hour"] != 36 or truth["generator"]["hours"] != 48:
+            out.append(f"failing cell hour {truth['failing_cell']['hour']} of {truth['generator']['hours']}")
+        code, err, _, _, _ = self.merge_two_days(self.path("merge-same-present"), gen, present=("req-x", "req-x"))
+        if code != 1 or "plant one present request id twice" not in err:
+            out.append(f"a present id two days plant: exit {code}: {err}")
+        code, err, _, _, _ = self.merge_two_days(self.path("merge-collide"), gen, collide=True)
+        if code != 1 or "req-planted-present-d000: 2 rows, want 1" not in err:
+            out.append(f"a planted key two days share: exit {code}: {err}")
+        return out
+
+    def test_merged_day_truth_sums_rows_and_keeps_planted_ids_unique(self):
+        self.assertEqual(self.check_merged_truth(GEN), [])
+        with open(GEN) as f:
+            src = f.read()
+        for n, (old, new, label) in enumerate((
+                ('        "rows_written": rows_written,\n', '        "rows_written": days[-1]["rows_written"],\n',
+                 "rows_written the last day's, not the sum"),
+                ("    if wrong:\n", "    if False:\n", "planted keys not counted in the merged rows"))):
+            self.assertEqual(src.count(old), 1, old)
+            flipped = self.path(f"gen_corpus_merge_flipped_{n}.py")
+            with open(flipped, "w") as f:
+                f.write(src.replace(old, new))
+            for d in ("merge-ok", "merge-same-present", "merge-collide"):
+                shutil.rmtree(self.path(d), ignore_errors=True)
+            problems = self.check_merged_truth(flipped)
+            self.assertTrue(problems, label)
+            print(f"flip '{label}' at gen_corpus.py:{src[: src.index(old)].count(chr(10)) + 1} fails "
+                  f"test_merged_day_truth_sums_rows_and_keeps_planted_ids_unique: {problems[0]}", file=sys.stderr)
 
     def check_day_parts_fold(self, script):
         code, text = self.new_states_dry_run(script)

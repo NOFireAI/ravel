@@ -740,7 +740,11 @@ step_corpus() {
   # evenly over its hours, so batch k of the strided load (rows / 24N rows)
   # holds event hour k alone. The window is computed here, once, and the
   # state loads it: time only moves forward, so it stays before the hour.
-  local tpd start win
+  # One gen_corpus run per UTC day (seed state_seed * 1000 + day, its own
+  # present request id), then gen_corpus.py merge-days streams the days into
+  # one file per signal and one truth.json, so the generator holds one day
+  # in memory whatever N is (README "day_parts_N").
+  local tpd start win k dstart days
   for n in $DP_DAYS; do
     tpd="$DP7_TPD"
     [ "$n" = 7 ] || tpd="$DP30_TPD"
@@ -754,10 +758,20 @@ step_corpus() {
         || fail "day_parts_$n window start"
     fi
     printf -v "DP_START_$n" '%s' "$start"
-    run "$PY" "$INV_DIR/gen_corpus.py" --traces $((tpd * n)) --hours $((24 * n)) --seed $((SEED + 100 + n)) \
-      --even-hours --spans-per-trace "$SPANS_PER" --logs-per-trace "$LOGS_PER" --start-hour "$start" \
-      --format parquet --out "$WORK/corpus-dp$n" >"$WORK/corpus-dp$n.out" 2>&1 \
-      || fail_log "gen_corpus day_parts_$n" "$WORK/corpus-dp$n.out"
+    days=()
+    for ((k = 0; k < n; k++)); do
+      dstart="$start+$((24 * k))"
+      [[ "$start" =~ ^[0-9]+$ ]] && dstart=$((start + 24 * k))
+      run "$PY" "$INV_DIR/gen_corpus.py" --traces "$tpd" --hours 24 --seed $(((SEED + 100 + n) * 1000 + k)) \
+        --even-hours --spans-per-trace "$SPANS_PER" --logs-per-trace "$LOGS_PER" --start-hour "$dstart" \
+        --present-id "$(printf 'req-planted-present-d%03d' "$k")" \
+        --format parquet --out "$WORK/corpus-dp$n/day-$k" >"$WORK/corpus-dp$n-day$k.out" 2>&1 \
+        || fail_log "gen_corpus day_parts_$n day $k" "$WORK/corpus-dp$n-day$k.out"
+      days+=(--day "$WORK/corpus-dp$n/day-$k")
+    done
+    run "$PY" "$INV_DIR/gen_corpus.py" merge-days --seed $((SEED + 100 + n)) --remove-day-rows ${days[@]+"${days[@]}"} \
+      --out "$WORK/corpus-dp$n" >"$WORK/corpus-dp$n.out" 2>&1 \
+      || fail_log "gen_corpus merge-days day_parts_$n" "$WORK/corpus-dp$n.out"
     # The midnight lookup (statements.toml window "midnight") runs in
     # day_parts_7 only.
     if [ "$n" = 7 ]; then

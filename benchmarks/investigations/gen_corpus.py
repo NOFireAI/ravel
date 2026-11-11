@@ -24,6 +24,13 @@ draw goes to hour i mod hours) instead of a uniform random hour per trace.
 Rows are written in trace-start order, so the file's rows then come in equal
 runs, one per hour: a strided load (`ravel-cli load --ingest-hour-stride`) at
 --batch-rows = rows / hours writes hour k's rows, and only those, as batch k.
+
+`gen_corpus.py merge-days --seed S --out DIR --day DIR0 --day DIR1 ...` joins
+per-day runs (each --hours 24 --even-hours, day k's --start-hour 24k after
+day 0's) into one corpus: the rows streamed into one file per signal, the
+truth.json files merged field by field and every planted key counted in the
+merged rows. A run holds its whole window in memory; a multi-day corpus made
+this way holds one day (README "day_parts_N and retired_hour").
 """
 import argparse
 import json
@@ -366,6 +373,11 @@ def main(argv):
         help=f"the mixed state's extra hour: planted like the base corpus, with {REQUEST_ID_TAIL} as its present request id",
     )
     ap.add_argument(
+        "--present-id",
+        help=f"the planted present request id (default {REQUEST_ID_PRESENT}, {REQUEST_ID_TAIL} with --tail); "
+        "each day of a multi-day corpus plants its own, so the merged corpus holds every one once",
+    )
+    ap.add_argument(
         "--even-hours",
         action="store_true",
         help="exactly traces / hours traces in every hour (a many_parts_N strided load's corpus); "
@@ -378,7 +390,7 @@ def main(argv):
         ap.error("--traces, --hours, --spans-per-trace and --logs-per-trace must be positive")
     if args.tail and args.noise_only:
         ap.error("--tail plants keys; --noise-only plants none")
-    present_id = REQUEST_ID_TAIL if args.tail else REQUEST_ID_PRESENT
+    present_id = args.present_id or (REQUEST_ID_TAIL if args.tail else REQUEST_ID_PRESENT)
     fmt = resolve_format(args.format)
     os.makedirs(args.out, exist_ok=True)
 
@@ -608,5 +620,306 @@ def main(argv):
     return 0
 
 
+# --- merge-days: one corpus from per-day runs --------------------------------
+
+# Every truth.json field a day run writes; merge_days refuses a day carrying
+# any other, so a field added to the generator cannot be dropped silently.
+DAY_TRUTH_FIELDS = {"generator", "rows_written", "unplanted_rows", "failing_cell", "saved_traces", "needles",
+                    "needle_blocks", "erasure_victim", "request_id", "in_lists", "control_extra", "journey_c",
+                    "answers"}
+NEEDLE_COLUMNS = {NEEDLE_RARE: "needle_rare", NEEDLE_SPARSE: "needle_sparse", NEEDLE_COMMON: "needle_common"}
+SIGNALS = ("spans", "logs")
+
+
+class MergeError(Exception):
+    pass
+
+
+def spread_across_days(rng, lists, size):
+    """size keys drawn over the days, as a one-run list is drawn over the
+    whole window: day k gives size // N keys of its own size-key list, and
+    size % N days the rng picks give one more. Each day's share is a sample
+    of its list, not its first keys: the lists are sorted, and a key index
+    routes a key by its leading bytes."""
+    extra = set(rng.sample(range(len(lists)), size % len(lists)))
+    out = []
+    for k, ids in enumerate(lists):
+        out += rng.sample(ids, min(len(ids), size // len(lists) + (k in extra)))
+    if len(set(out)) != len(out):
+        raise MergeError(f"the {size}-key list holds one key from two days")
+    return sorted(out)
+
+
+class Tally:
+    """Counts, over the merged rows, every planted key the merged truth names,
+    and the BLOCK_ROWS blocks of the merged logs file each needle tier
+    touches."""
+
+    def __init__(self, trace_ids, request_ids):
+        self.trace_ids = sorted(trace_ids)
+        self.request_ids = sorted(request_ids)
+        self.counts = {("spans", "trace_id"): {}, ("logs", "trace_id"): {}, ("logs", "request_id"): {}}
+        self.blocks = {v: set() for v in NEEDLE_COLUMNS}
+
+    def bump(self, sig, col, values):
+        c = self.counts[(sig, col)]
+        for v in values:
+            c[v] = c.get(v, 0) + 1
+
+    def row(self, sig, row, at):
+        if row["trace_id"] in self._tset:
+            self.bump(sig, "trace_id", [row["trace_id"]])
+        if sig == "logs":
+            if row["request_id"] in self._rset:
+                self.bump(sig, "request_id", [row["request_id"]])
+            for v, col in NEEDLE_COLUMNS.items():
+                if row.get(col) is not None:
+                    self.blocks[v].add(at // BLOCK_ROWS)
+
+    def batch(self, sig, rb, offset):
+        import pyarrow.compute as pc
+
+        cols = [("trace_id", self._tarr)] + ([("request_id", self._rarr)] if sig == "logs" else [])
+        for col, values in cols:
+            data = rb.column(col)
+            hit = pc.is_in(data, value_set=values)
+            if pc.any(hit).as_py():
+                self.bump(sig, col, data.filter(hit).to_pylist())
+        if sig == "logs":
+            for v, col in NEEDLE_COLUMNS.items():
+                data = rb.column(col)
+                if data.null_count < len(data):
+                    rows = pc.indices_nonzero(pc.is_valid(data)).to_pylist()
+                    self.blocks[v].update((offset + r) // BLOCK_ROWS for r in rows)
+
+    def ready(self, fmt):
+        self._tset, self._rset = set(self.trace_ids), set(self.request_ids)
+        if fmt in ("parquet", "both"):
+            import pyarrow as pa
+
+            self._tarr = pa.array(self.trace_ids, pa.string())
+            self._rarr = pa.array(self.request_ids, pa.string())
+
+
+def append_rows(day_dirs, out, sig, fmt, tally, remove):
+    """Stream every day's SIG rows, in day order, into OUT's one file per
+    format, one batch at a time; returns the rows written. With REMOVE each
+    day's file is deleted once appended, so the disk holds one copy of the
+    corpus plus one day."""
+    rows = 0
+    if fmt in ("parquet", "both"):
+        import pyarrow.parquet as pq
+
+        writer = schema = None
+        for d in day_dirs:
+            path = os.path.join(d, f"{sig}.parquet")
+            f = pq.ParquetFile(path)
+            if writer is None:
+                schema = f.schema_arrow
+                writer = pq.ParquetWriter(os.path.join(out, f"{sig}.parquet"), schema)
+            elif not f.schema_arrow.equals(schema):
+                raise MergeError(f"{path}: schema differs from day 0's")
+            for rb in f.iter_batches(batch_size=200_000):
+                writer.write_batch(rb)
+                tally.batch(sig, rb, rows)
+                rows += rb.num_rows
+            if remove:
+                os.remove(path)
+        writer.close()
+    if fmt in ("jsonl", "both"):
+        counted = fmt == "jsonl"
+        n = 0
+        with open(os.path.join(out, f"{sig}.jsonl"), "w") as dst:
+            for d in day_dirs:
+                path = os.path.join(d, f"{sig}.jsonl")
+                with open(path) as src:
+                    for line in src:
+                        dst.write(line)
+                        if counted:
+                            tally.row(sig, json.loads(line), n)
+                        n += 1
+                if remove:
+                    os.remove(path)
+        if fmt == "both" and n != rows:
+            raise MergeError(f"{sig}: {n} jsonl rows, {rows} parquet rows")
+        rows = n
+    return rows
+
+
+def merge_days(argv):
+    """gen_corpus.py merge-days --seed S --out DIR --day DIR0 --day DIR1 ...:
+    one corpus from per-day gen_corpus runs (a multi-day state's window, a
+    UTC day per run), so the generator's memory is one day's whatever the
+    number of days. Rows are streamed, day by day, into one file per signal
+    and format; truth.json is merged field by field (README "day_parts_N")
+    and every planted key it names is counted in the merged rows."""
+    ap = argparse.ArgumentParser(prog="gen_corpus.py merge-days", description=merge_days.__doc__)
+    ap.add_argument("--seed", type=int, required=True, help="the state's seed, which the day seeds derive from")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--day", action="append", required=True, help="a day run's --out, in day order")
+    ap.add_argument("--remove-day-rows", action="store_true", help="delete each day's row files once appended")
+    args = ap.parse_args(argv)
+    try:
+        truth = merge_truths(args)
+    except (MergeError, OSError, KeyError, ValueError) as e:
+        print(f"gen_corpus merge-days: {e}", file=sys.stderr)
+        return 1
+    with open(os.path.join(args.out, "truth.json"), "w") as f:
+        json.dump(truth, f, indent=1, sort_keys=True)
+        f.write("\n")
+    rw = truth["rows_written"]
+    print(f"merged {len(args.day)} days: {rw['spans']} spans, {rw['logs']} logs to {args.out}")
+    return 0
+
+
+def merge_truths(args):
+    days = []
+    for d in args.day:
+        with open(os.path.join(d, "truth.json")) as f:
+            days.append(json.load(f))
+    n = len(days)
+    gens = [t["generator"] for t in days]
+    g0 = gens[0]
+    for k, (t, g) in enumerate(zip(days, gens)):
+        if set(t) != DAY_TRUTH_FIELDS:
+            raise MergeError(f"day {k}: truth.json fields {sorted(set(t) ^ DAY_TRUTH_FIELDS)} are not the ones "
+                             "merge-days merges")
+        if g["hours"] != 24 or not g.get("even_hours") or g["noise_only"] or g["tail"] or g["scale"] != 1:
+            raise MergeError(f"day {k}: not a planted 24-hour even-hours day at scale 1: {g}")
+        if g["start_hour"] != g0["start_hour"] + 24 * k:
+            raise MergeError(f"day {k}: start hour {g['start_hour']}, want {g0['start_hour'] + 24 * k}")
+        for key in ("traces", "spans_per_trace", "logs_per_trace", "block_rows", "format"):
+            if g[key] != g0[key]:
+                raise MergeError(f"day {k}: {key} {g[key]}, day 0 {g0[key]}")
+        if t["request_id"]["absent"] != days[0]["request_id"]["absent"]:
+            raise MergeError(f"day {k}: absent request id differs from day 0's")
+    seeds = [g["seed"] for g in gens]
+    if len(set(seeds)) != n:
+        raise MergeError(f"day seeds repeat: {seeds}")
+    spt, lpt, fmt = g0["spans_per_trace"], g0["logs_per_trace"], g0["format"]
+    # The failing cell, its journey cut points and the erasure victim are one
+    # day's, the middle one: hour 24 * (n // 2) + 12, which for an odd n is
+    # the hour a one-run corpus puts its failing cell in (hours // 2).
+    a = n // 2
+    anchor = days[a]
+    rng = random.Random(f"{args.seed}:merge-days")
+    answers = {}
+
+    saved = []
+    for k, t in enumerate(days):
+        for i, s in enumerate(t["saved_traces"]):
+            j = len(saved)
+            saved.append(dict(s, hour=s["hour"] + 24 * k))
+            answers[f"saved_trace.{j}.spans"] = t["answers"][f"saved_trace.{i}.spans"]
+            answers[f"saved_trace.{j}.logs"] = t["answers"][f"saved_trace.{i}.logs"]
+
+    cell = dict(anchor["failing_cell"], hour=anchor["failing_cell"]["hour"] + 24 * a)
+    for key in ("failing_cell.trace_ids", "failing_cell.logs_count"):
+        answers[key] = anchor["answers"][key]
+    for k in anchor["journey_c"]:
+        answers[f"journey_c.{k}"] = anchor["answers"][f"journey_c.{k}"]
+    victim = anchor["erasure_victim"]
+    if victim is not None:
+        for key in ("erasure_victim.present", "erasure_victim.erased"):
+            answers[key] = anchor["answers"][key]
+
+    in_lists = {"trace_id": {}, "request_id": {}}
+    for field in in_lists:
+        for size in IN_SIZES:
+            in_lists[field][str(size)] = spread_across_days(rng, [t["in_lists"][field][str(size)] for t in days], size)
+    for size in IN_SIZES:
+        got = len(in_lists["trace_id"][str(size)])
+        answers[f"in_trace_id.{size}.spans"] = answer(got * spt, requested=size * spt)
+        answers[f"in_trace_id.{size}.logs"] = answer(got * lpt, requested=size * lpt)
+        ids = in_lists["request_id"][str(size)]
+        answers[f"in_request_id.{size}"] = answer(len(ids), row_set=ids, requested=size)
+    top = IN_SIZES[-1]
+    control_extra = dict(anchor["control_extra"])
+    for field, ex in control_extra.items():
+        if ex is not None and ex in in_lists[field][str(top)]:
+            raise MergeError(f"control_extra {field} {ex} is in the merged {top}-key list")
+    got = len(in_lists["trace_id"][str(top)]) + (control_extra["trace_id"] is not None)
+    answers[f"in_trace_id.{top + 1}.spans"] = answer(got * spt, requested=(top + 1) * spt)
+    answers[f"in_trace_id.{top + 1}.logs"] = answer(got * lpt, requested=(top + 1) * lpt)
+    got = len(in_lists["request_id"][str(top)]) + (control_extra["request_id"] is not None)
+    answers[f"in_request_id.{top + 1}"] = answer(got, requested=top + 1)
+
+    presents = [t["request_id"]["present"] for t in days]
+    if len(set(presents)) != n:
+        raise MergeError(f"the days plant one present request id twice: {presents} (gen_corpus --present-id)")
+    request_id = {"present": anchor["request_id"]["present"], "absent": anchor["request_id"]["absent"],
+                  "planted_present": presents}
+    answers["request_id.present"] = anchor["answers"]["request_id.present"]
+    answers["request_id.absent"] = anchor["answers"]["request_id.absent"]
+    needles = {v: sum(t["needles"][v] for t in days) for v in NEEDLE_COLUMNS}
+    for v, c in needles.items():
+        answers[f"needle.{v}"] = answer(1, value=c)
+
+    for k, t in enumerate(days):
+        left = set(t["answers"]) - {f"saved_trace.{i}.{s}" for i in range(len(t["saved_traces"]))
+                                    for s in ("spans", "logs")}
+        left -= {f"journey_c.{j}" for j in t["journey_c"]}
+        left -= set(answers)
+        if left:
+            raise MergeError(f"day {k}: answers {sorted(left)} have no merge rule")
+
+    # Every key the merged truth names, counted in the merged rows: a listed
+    # trace id has spans_per_trace spans and logs_per_trace logs, a listed
+    # request id one row, the absent id none. A key two days share fails here.
+    trace_keys = {s["trace_id"] for s in saved} | set(cell["trace_ids"])
+    trace_keys |= {i for ids in in_lists["trace_id"].values() for i in ids}
+    request_keys = set(presents) | {i for ids in in_lists["request_id"].values() for i in ids}
+    for field, keys in (("trace_id", trace_keys), ("request_id", request_keys)):
+        if control_extra[field] is not None:
+            keys.add(control_extra[field])
+    if victim is not None:
+        trace_keys.add(victim["trace_id"])
+        request_keys.add(victim["request_id"])
+    tally = Tally(trace_keys, request_keys | {request_id["absent"]})
+    tally.ready(fmt)
+    os.makedirs(args.out, exist_ok=True)
+    rows_written = {sig: append_rows(args.day, args.out, sig, fmt, tally, args.remove_day_rows) for sig in SIGNALS}
+    for sig in SIGNALS:
+        want = sum(t["rows_written"][sig] for t in days)
+        if rows_written[sig] != want:
+            raise MergeError(f"{sig}: merged {rows_written[sig]} rows, the days wrote {want}")
+    wrong = []
+    for (sig, col), keys, per in ((("spans", "trace_id"), trace_keys, spt), (("logs", "trace_id"), trace_keys, lpt),
+                                  (("logs", "request_id"), request_keys, 1)):
+        c = tally.counts[(sig, col)]
+        wrong += [f"{sig}.{col} {key}: {c.get(key, 0)} rows, want {per}" for key in sorted(keys) if c.get(key, 0) != per]
+    absent = tally.counts[("logs", "request_id")].get(request_id["absent"], 0)
+    if absent:
+        wrong.append(f"absent request id {request_id['absent']}: {absent} rows")
+    if wrong:
+        raise MergeError(f"{len(wrong)} planted keys do not occur as truth.json says: " + "; ".join(wrong[:5]))
+    needle_blocks = {v: len(b) for v, b in tally.blocks.items()}
+    needle_blocks["any"] = len(set().union(*tally.blocks.values()))
+
+    spans_map, logs_map = mapping_texts()
+    with open(os.path.join(args.out, "spans.mapping.toml"), "w") as f:
+        f.write(spans_map)
+    with open(os.path.join(args.out, "logs.mapping.toml"), "w") as f:
+        f.write(logs_map)
+    return {
+        "generator": dict(g0, seed=args.seed, traces=sum(g["traces"] for g in gens), hours=24 * n, days=n,
+                          traces_per_day=g0["traces"], day_seeds=seeds),
+        "rows_written": rows_written,
+        "unplanted_rows": {k: sum(t["unplanted_rows"][k] for t in days) for k in days[0]["unplanted_rows"]},
+        "failing_cell": cell,
+        "saved_traces": saved,
+        "needles": needles,
+        "needle_blocks": needle_blocks,
+        "erasure_victim": victim,
+        "request_id": request_id,
+        "in_lists": in_lists,
+        "control_extra": control_extra,
+        "journey_c": anchor["journey_c"],
+        "answers": answers,
+    }
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["merge-days"]:
+        sys.exit(merge_days(sys.argv[2:]))
     sys.exit(main(sys.argv[1:]))
