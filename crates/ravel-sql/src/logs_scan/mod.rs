@@ -3533,14 +3533,14 @@ impl ExecutionPlan for LogsScanExec {
                     // No partition owns a segment outside the ts range, so
                     // partition 0 counts its rows consumed up front.
                     if partition == 0 {
-                        let outside: u64 = self
+                        let outside = self
                             .segments
                             .iter()
                             .filter(|seg| {
                                 !LogSegmentFetcher::ts_range_relevant(seg, self.ts_min, self.ts_max)
                             })
-                            .map(|seg| seg.sample_count)
-                            .sum();
+                            .try_fold(0u64, |acc, seg| acc.checked_add(seg.sample_count))
+                            .unwrap_or(u64::MAX);
                         blocks.rows_consumed.add(rows_usize(outside));
                     }
                     // ADR-3326, serve-if-fits amendment: a `Contains` scan with

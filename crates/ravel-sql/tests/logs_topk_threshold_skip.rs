@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
+use datafusion::physical_plan::{ExecutionPlan, collect, collect_partitioned, displayable};
 use datafusion::prelude::SessionContext;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
@@ -57,8 +57,9 @@ use ravel_object_store::{
 };
 use ravel_query::{CacheFetchError, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
-    CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
-    SqlConfig, TenantDelegatingPool, TenantMemoryAccountant, build_session,
+    CeilingBreach, DeclaredColumn, DeclaredType, LogsScanExec, LogsTableProvider, SessionTable,
+    SpillDecision, SqlConfig, TenantDelegatingPool, TenantMemoryAccountant, build_session,
+    logs_schema_with_declared,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -933,6 +934,138 @@ async fn rows_consumed_reaches_every_input_row_under_the_skip() {
             "{name}: every input row counted"
         );
     }
+}
+
+/// Asserts `plan`'s scan took the whole-segment fast path on every partition:
+/// no partition recorded a rejection, and the fast path routed at least
+/// `routed` segments. Returns the routed count.
+fn assert_whole_segment_fast_path(
+    plan: &Arc<dyn ExecutionPlan>,
+    routed: usize,
+    name: &str,
+) -> usize {
+    for reason in [
+        "fast_path_rejected_pending_erasure",
+        "fast_path_rejected_block_predicate",
+        "fast_path_rejected_segment_not_contained",
+        "fast_path_rejected_fewer_segments_than_partitions",
+    ] {
+        assert_eq!(metric(plan, "LogsScanExec", reason), 0, "{name}: {reason}");
+    }
+    let taken = metric(plan, "LogsScanExec", "fast_path_whole_object_segments")
+        + metric(plan, "LogsScanExec", "fast_path_ranged_segments");
+    assert!(
+        taken >= routed,
+        "{name}: the fast path routed {taken} segments, want at least {routed}"
+    );
+    taken
+}
+
+/// The rows-consumed counter on the whole-segment fast path, on more than one
+/// partition. Under an `ORDER BY ts LIMIT` the threshold skips blocks inside
+/// segments the fast path opened, and those rows reach the counter only
+/// through the per-unit top-up when the partition finishes the segment. The
+/// ClickBench q33 shape (no `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`) runs
+/// there too and consumes every row.
+#[tokio::test]
+async fn rows_consumed_reaches_every_input_row_on_the_fast_path() {
+    let topk = "SELECT ts, body FROM logs ORDER BY ts LIMIT 4";
+    let q33 = "SELECT body, count(*) AS c FROM logs GROUP BY body ORDER BY c DESC, body LIMIT 10";
+    for (name, sql, partitions, skips) in [
+        ("topk, 2 partitions", topk, 2, true),
+        ("topk, 4 partitions", topk, 4, true),
+        ("group by, 4 partitions", q33, 4, false),
+    ] {
+        let run = run(sql, Setup::new().partitions(partitions)).await;
+        assert_whole_segment_fast_path(&run.plan, 1, name);
+        if skips {
+            assert!(
+                run.blocks_skipped > 0,
+                "{name}: a block skipped in an open segment"
+            );
+        } else {
+            assert_eq!(
+                (run.blocks_skipped, run.segments_skipped, run.blocks_scanned),
+                (0, 0, TOTAL_BLOCKS),
+                "{name}: every block read"
+            );
+        }
+        assert_eq!(
+            run.scan_metric("rows_consumed"),
+            TOTAL_RECORDS,
+            "{name}: every input row counted"
+        );
+    }
+}
+
+/// Partition 0's share of the fast path's rows-consumed count: the segments
+/// outside the scan's ts range, which no partition owns. The provider drops
+/// such a segment before it builds the scan, by the same bounds, so no
+/// statement reaches this sum; the scan is built directly instead, over the
+/// eight segments moved to disjoint `ts` spans and a range holding five of
+/// them whole, on three partitions.
+#[tokio::test]
+async fn rows_consumed_counts_segments_outside_the_ts_range_on_the_fast_path() {
+    const SPAN: i64 = 1_000;
+    let (first, last) = (2, 6);
+    let relevant = last - first + 1;
+    let partitions = 3;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let mut segments = Vec::new();
+    for s in 0..SEGMENTS {
+        let recs: Vec<LogRecord> = segment_records(s)
+            .into_iter()
+            .map(|mut r| {
+                r.ts_ns += SPAN * s as i64;
+                r.observed_ts_ns = r.ts_ns;
+                r
+            })
+            .collect();
+        segments.push(write_segment(store.as_ref(), s, &recs, block_config(None)).await);
+    }
+    let declared = declared_columns();
+    let schema = logs_schema_with_declared(&declared);
+    let projection = vec![
+        schema.index_of("ts").expect("ts"),
+        schema.index_of("body").expect("body"),
+    ];
+    let scan = Arc::new(
+        LogsScanExec::new(
+            TenantHash(TENANT),
+            LogSegmentFetcher::new(Arc::clone(&store)),
+            &segments,
+            partitions,
+            TS_BASE + SPAN * first as i64,
+            TS_BASE + SPAN * (last + 1) as i64 - 1,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Some(&projection),
+            PhaseAccounting::new(),
+            schema,
+            Arc::new(declared),
+        )
+        .expect("scan builds"),
+    );
+    let plan: Arc<dyn ExecutionPlan> = Arc::clone(&scan) as Arc<dyn ExecutionPlan>;
+    let ctx = SessionContext::new();
+    let parts = collect_partitioned(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("scan runs");
+    assert_eq!(parts.len(), partitions, "one output per partition");
+    let rows: usize = parts.iter().flatten().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, relevant * PER_SEGMENT, "the in-range segments' rows");
+    assert_eq!(
+        assert_whole_segment_fast_path(&plan, relevant, "outside the ts range"),
+        relevant,
+        "every in-range segment opened on the fast path"
+    );
+    assert_eq!(scan.sample_count_total(), Some(TOTAL_RECORDS as u64));
+    assert_eq!(
+        scan.rows_consumed(),
+        TOTAL_RECORDS,
+        "the out-of-range segments' rows are counted once"
+    );
 }
 
 /// Projecting the `attrs` map puts the scan on the row path (`Rows`), which
