@@ -1104,7 +1104,15 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    ravel-server FLAGS"` with those figures and the server's flags, into
    `stage1-unrouted/` (`report.json`, `diagnostics.json`, and a
    `provenance.json` with `diagnostic_regime=stage1-folded-unrouted` and
-   `comparable=false`). Then the cold pass's selection (as
+   `comparable=false`). When `metricsbench_query` exits non-zero, or its
+   `diagnostics.json` holds no answered (`ok` or `incorrect`) record, the
+   run writes `docker inspect` of the ravel-server container to
+   `ravel-server.inspect.json` and its last 20,000 log lines to
+   `ravel-server.log` beside `query.log`, before the exit 70 in the first
+   case and with a line naming them in the second (cases zf and zf2; every
+   Stage 1 pass does the same into its own directory, and `aws/box-run.sh`
+   uploads the whole `out-run/` tree whatever the exit code). Then the cold
+   pass's selection (as
    `cold_ravel_diagnostic` picks it; none on `ci`, so
    `stage1.unrouted_cold` says `not applicable`, case z1) cold, into
    `stage1-unrouted/cold.json`; a cold failure is stamped, not fatal.
@@ -1155,8 +1163,10 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    answers), `records_answered_null_hash` (an answered record with no
    `result_hash`), `records_status_unexpected` (any other status: `partial`,
    `timeout`, `error`, `unsupported_construct`, `refused` or a failure
-   string), `records_label_index_null` (no whole-number
-   `segmentsPrunedByLabelIndex`, counted apart and never as 0),
+   string), `records_label_index_null` (an answered record with no
+   whole-number `segmentsPrunedByLabelIndex`, counted apart and never as 0;
+   a record that timed out or failed carries no figure to read and is
+   counted under `records_status_unexpected` only, cases z15 and zt),
    `records_pruned_by_label_index` (one above 0) and
    `segments_pruned_by_label_index` (their sum over the records that carry
    one). A difference is recorded and the run still exits 0 (cases z2, z15,
@@ -1211,14 +1221,21 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    the 4 token objects run 42495422937 fetched for its absent metric). A
    statement with no such record, a record with no whole-number
    `segmentsFetched`, or no whole-number expected figure is listed under
-   `window_unchecked` (case z18), each with its count. For each route-bound
+   `window_unchecked` (case z18), each with its count. A statement whose
+   `stage1-unrouted` records all timed out (status `timeout`) is listed
+   under `window_unchecked_timed_out` instead, with its count, so a
+   statement the engine never answered is told apart from one that answered
+   without a figure (cases zt and zt2); only answered records are compared.
+   For each route-bound
    statement, the routed prune check compares the
    `segmentsPrunedByLabelIndex` of every one of its `stage1-routed` records
    with its `expected_routed_prunes`: one that differs is listed under
    `routed_prune_mismatches` with both figures and `value_holders` (case
    z25); no routed record, a record with no whole-number figure, or no
    whole-number expectation is listed under `routed_prune_unchecked` (cases
-   z15 and the `stage1-check` failed-record case). The leaf check counts,
+   z15 and the `stage1-check` failed-record case), and one whose routed
+   records all timed out under `routed_prune_unchecked_timed_out`, each with
+   its count (cases zt and zt2). The leaf check counts,
    for each route-bound statement whose resolved set holds an object, its
    `stage1-routed` records whose `keyIndex` phase shows neither an
    `s3GetRequests` nor a `cacheHits` above 0, or that have no `keyIndex`
@@ -1369,13 +1386,26 @@ own step, as the run records it; a request the run does not count says so.
     `entries_differing_count`, and for the L1 records
     `other_records_status_unexpected` (any status but `ok` or `incorrect`,
     so a refusal of any kind, #3818's included, fails its band at 0) and
-    the label-index counts (case zd). `stage1.l1_not_measured` says row 6's memory, GET and
+    the label-index counts over the answered L1 records (case zd). `stage1.l1_not_measured` says row 6's memory, GET and
     byte figures against the unbatched call are not measured by this arm.
     Cost: every L1 record's `phases`, against the routed pass's.
 17. `stage1-erasure-reference` (row 8): the corpus with
     `instance!="metricsbench-instance-0"` added to every selector, into
     `stage1-erasure-reference.corpus.json` (`stage1.erasure_corpus`), run
-    with the routed flags into `stage1-erasure-reference/`;
+    with the routed flags into `stage1-erasure-reference/`. An entry every
+    selector of which pins `instance="metricsbench-instance-0"` with `=` has
+    no series the reference can return, so the rewritten corpus marks it
+    `expected: {"intended_empty": true, "reason": ...}`, and the step's
+    line and `stage1.erasure_corpus` list it under `intended_empty_ids` (on
+    the cardinality corpus `mb_single_gauge_instant`,
+    `mb_single_counter_rate` and `mb_single_gauge_delta`; cases zn and
+    `erasure corpus pinned`, which also pin that `job="metricsbench-instance-0"`
+    and `instance="metricsbench-instance-01"` are not marked). A selector
+    that matches the subject label with `!=`, `=~` or `!~`, or an entry that
+    pins it on some selectors only, cannot be rewritten to a defined answer:
+    the op exits 3 naming each such entry, and with the erasure arm on the
+    run checks this before anything starts and exits 65 with the same line
+    (cases `erasure corpus refused` and zq);
     `stage1-erasure-subject.json` (`stage1.erasure_subject`) compares it with
     the routed pass, so the entries the subject changes are named; its bands
     want, on every entry both passes answered, the reference's records to
@@ -1735,6 +1765,12 @@ smoke has no use for), launch refuses them without `MB_STAGE1=1` and an
 undigested control image with 64, and the box pulls the control image
 beside the main one. The nightly workflow sets none of them: the arms run
 on an AWS box only.
+
+Timings on `cardinality`: one warm
+Stage 1 pass over the corpus takes about 3.4 h; a full Stage 1 with every
+arm on takes about 32 h, most of it the erasure arm's seal wait and rewrite;
+a rerun with `MB_STAGE1_ARMS=erasure` alone takes 22 to 24 h. Size
+`MB_CAP_MIN` from these (docs/internal/metricsbench-aws-runbook.md).
 
 ### The real-S3 lane
 
