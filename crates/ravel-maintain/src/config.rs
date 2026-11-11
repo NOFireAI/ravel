@@ -1735,8 +1735,8 @@ pub fn validate_rlog_zstd_level(level: i32) -> Result<i32, RlogZstdLevelError> {
     }
 }
 
-/// An `rlog_run_block_target_records` of zero was configured: a run writer
-/// cannot cut blocks of zero records.
+/// An `rlog_run_block_target_records` of zero was configured. The writer
+/// would cut a block at every record; zero is refused as a misconfiguration.
 #[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
 #[error("rlog run block target records must be at least 1, got 0")]
 pub struct RlogRunBlockTargetError;
@@ -2272,12 +2272,8 @@ pub struct CompactorConfig {
     pub rlog_run_memory_target_bytes: u64,
     /// The records per block a level-1 run is written at (ADR-3853 D2).
     /// Transient like the other run settings: it changes the runs' blocks and
-    /// so level 2's per-run read price. An unkeyed bucket, and a keyed stream
-    /// that does not batch at either target, publishes the same parts; under
-    /// ADR-2135 batch-major emission a keyed stream's run-part carriers are
-    /// batched by reservation, which shrinks with this target, so a keyed
-    /// stream that batches may cut its parts differently (exact either way,
-    /// every record conserved). Zero
+    /// so level 2's per-run read price. Its effect on published parts, the
+    /// keyed batch-major exception included, is stated in ADR-3853 D2. Zero
     /// fails a run over a logs or query-audit bucket, at the same entry
     /// points and before the same first store request as
     /// [`Self::rlog_zstd_level`], with

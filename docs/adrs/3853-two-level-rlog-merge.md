@@ -189,10 +189,11 @@ stream that does not batch at either target, publishes byte-identical parts
 either way. The exception is ADR-2135 batch-major emission (D3): in a keyed
 bucket (`width_ns > 1`) both level-2 paths cut each stream's run-part
 carriers into batches by reservation, and a carrier's reservation
-(`reservation_of_locs`, twice its largest stored row group plus its largest
-block decode ceiling) shrinks with the run block target, so a keyed stream
-that batches may batch, order and cut its parts differently at another
-target. Either way the output is exact and conserves every record.
+(`reservation_of_locs`: twice its largest stored row group, plus its largest
+block decode ceiling, plus its locs' metadata) changes with the run block
+target: the first two terms shrink with it and the metadata term grows with
+the block count. So a keyed stream that batches may batch, order and cut its
+parts differently at another target. Either way the output is exact and conserves every record.
 
 Runs live in a per-process scratch directory behind a scratch
 `ObjectStoreBackend` over that directory, so `load_catalog_from_object` and
@@ -768,6 +769,16 @@ with one stream larger than its runs' blocks can pass it, pay for level 1,
 and then be refused by `LevelTwoFit`. That costs one level-1 pass of reads
 and scratch writes, never an overcommitted level 2. The parts level 1 wrote stay on the
 `rlog two-level merge` log line as `run_parts`, beside `runs`.
+
+Since #4107 runs are written at 1,024 records (D2), but this prediction
+still prices a run block at the inputs' largest block, which ingest writes
+at the 8,192-record default. Its run-block term is therefore about 8x high
+(predicted), on the safe side: the price it uses did not change with #4107,
+so it refuses no unit and picks no different `W1` than before #4107, while
+`LevelTwoFit` after level 1 checks the real run blocks. Units that would now
+fit but are refused here stay refused as they were. #4108 (ADR-3853 phase
+B) reprices this term at the run block target in the joint `W1`/`W2`
+derivation.
 
 D4's table, recomputed with `R` in runs and the bound as (b) solved for `R`,
 `(U - reads in flight - final part target) / (2 x price(one run block))`

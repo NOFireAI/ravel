@@ -1091,12 +1091,9 @@ const RUN_PAGE_CHOICE: PageChoice = PageChoice::Estimated;
 /// read a run block by block and price each read as one block.
 const RUN_GROUP_TARGET_BLOCKS: usize = 1;
 
-/// Default records per block of a scratch run (ADR-3853 D2): runs are
-/// transient and read once. Published parts are the same at any target in an
-/// unkeyed bucket and for a keyed stream that does not batch; under ADR-2135
-/// batch-major emission a keyed stream's batches follow its run-part
-/// reservations, which shrink with the target, so a keyed stream that batches
-/// may cut its parts differently (exact either way, every record conserved).
+/// Default records per block of a scratch run: runs are transient and read
+/// once. ADR-3853 D2 states its effect on published parts, including the
+/// keyed batch-major exception.
 pub const RUN_BLOCK_TARGET_RECORDS: usize = 1024;
 
 /// Bytes of the four-byte little-endian `covered_count` and `covered_crc32c`
