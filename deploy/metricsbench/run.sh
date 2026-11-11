@@ -1392,13 +1392,16 @@ elif op == "stage1-compare":
     status_differing = [{"entry": e, "unrouted": sorted(us.get(e, set())), "routed": sorted(rs.get(e, set()))}
                         for e in sorted(set(us) | set(rs), key=str) if us.get(e) != rs.get(e)]
     def tally(rows):
+        # A record that did not answer (a timeout) carries no prune figure,
+        # so records_label_index_null counts answered records only; the
+        # others are records_status_unexpected.
         figures = [pruned(x) for x in rows]
         answered = [x for x in rows if x.get("status") in ANSWERED]
         return {"records": len(rows),
                 "records_answered": len(answered),
                 "records_answered_null_hash": sum(1 for x in answered if not x.get("result_hash")),
                 "records_status_unexpected": len(rows) - len(answered),
-                "records_label_index_null": sum(1 for v in figures if v is None),
+                "records_label_index_null": sum(1 for x in answered if pruned(x) is None),
                 "records_pruned_by_label_index": sum(1 for v in figures if v is not None and v > 0),
                 "segments_pruned_by_label_index": sum(v for v in figures if v is not None)}
     # ADR-3694's per-value routing amendment: each distinct positive equality
@@ -1438,7 +1441,7 @@ elif op == "stage1-compare":
            "entries_multi_hash_count": len(multi), "entries_multi_hash": multi,
            "entries_differing_count": len(differing), "entries_differing": differing,
            "entries_without_hash_count": len(without), "entries_without_hash": without,
-           "status_check": "per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9); records_status_unexpected counts records whose status is neither ok nor incorrect; records_answered_null_hash counts ok or incorrect records with no result_hash",
+           "status_check": "per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9); records_status_unexpected counts records whose status is neither ok nor incorrect; records_answered_null_hash counts ok or incorrect records with no result_hash, and records_label_index_null those with no whole-number segmentsPrunedByLabelIndex",
            "statements_status_differing_count": len(status_differing),
            "statements_status_differing": status_differing,
            "passes": {"unrouted": tally(unrouted), "routed": tally(routed)},
@@ -1613,10 +1616,14 @@ elif op == "stage1-hash-compare":
     def pruned(rec):
         v = rec.get("segmentsPrunedByLabelIndex")
         return v if whole(v) else None
-    figures = [pruned(r) for r in other]
+    # Only an answered record carries a prune figure: a timeout is counted
+    # in other_records_status_unexpected and nowhere below.
+    answered_other = [r for r in other if r.get("status") in ("ok", "incorrect")]
+    figures = [pruned(r) for r in answered_other]
     def prunes(rows, entry):
         # A record with no whole figure sorts as -1, so it never equals one.
-        return sorted(-1 if pruned(r) is None else pruned(r) for r in rows if r.get("entry") == entry)
+        return sorted(-1 if pruned(r) is None else pruned(r) for r in rows
+                      if r.get("entry") == entry and r.get("status") in ("ok", "incorrect"))
     answered = [e for e in sorted(set(a) | set(b), key=str) if a.get(e) and b.get(e)]
     prune_mismatch = [{"entry": e, base_name: prunes(base, e), other_name: prunes(other, e)}
                       for e in answered if prunes(base, e) != prunes(other, e)]
@@ -1629,7 +1636,7 @@ elif op == "stage1-hash-compare":
            "other_records_label_index_null": sum(1 for v in figures if v is None),
            "other_records_pruned_by_label_index": sum(1 for v in figures if v is not None and v > 0),
            "label_index_prune_mismatch_count": len(prune_mismatch), "label_index_prune_mismatch": prune_mismatch,
-           "label_index_prune_basis": "per entry with a result_hash in both passes, the sorted segmentsPrunedByLabelIndex of its records in each pass, a record with no whole figure as -1; an entry whose two lists differ is a mismatch"}
+           "label_index_prune_basis": "per entry with a result_hash in both passes, the sorted segmentsPrunedByLabelIndex of its answered (ok or incorrect) records in each pass, an answered record with no whole figure as -1; an entry whose two lists differ is a mismatch; other_records_label_index_null and other_records_pruned_by_label_index count answered records only"}
     dump(out_path, doc)
     print(json.dumps({**doc, "entries_differing": [d["entry"] for d in differing]}))
 elif op == "stage1-extra-hour":
@@ -1734,15 +1741,59 @@ elif op == "stage1-l1":
 elif op == "stage1-erasure-corpus":
     # The corpus, the output path, a label and a value: every vector
     # selector in each entry's promql gains LABEL!="VALUE", so the pass
-    # answers what the tenant holds without that subject's series. Prints
-    # the rewritten entry ids; exit 3 and why on stdout on text the lexer
-    # cannot follow.
+    # answers what the tenant holds without that subject's series. An entry
+    # whose every selector already carries LABEL="VALUE" can only answer
+    # empty after that, so it is marked expected.intended_empty with a
+    # reason; an entry with any other matcher on LABEL (a negative or regex
+    # one, or the equality on some selectors only) is refused, since the
+    # rewrite would contradict it in a way no mark describes. Prints the
+    # rewritten and intended-empty entry ids; exit 3 and why on stdout on
+    # text the lexer cannot follow or on such an entry.
+    import ast
     corpus_path, out_path, label, value = args
     KEYWORDS = {"by", "without", "on", "ignoring", "group_left", "group_right", "offset", "bool",
                 "and", "or", "unless", "atan2", "inf", "nan", "start", "end"}
     LIST_OPENERS = {"by", "without", "on", "ignoring", "group_left", "group_right"}
     matcher = f'{label}!="{value}"'
+    STRING = r'''"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`[^`]*`'''
+    MATCHER = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*|" + STRING + r")\s*(=~|!~|!=|=)\s*(" + STRING + r")\s*$")
+    def unquote(t):
+        return t[1:-1] if t.startswith("`") else ast.literal_eval(t)
+    def subject_matchers(inner):
+        # The (op, value) of each matcher on LABEL in a selector's braces;
+        # a bare string is a metric name and carries no label.
+        parts, cur, quote, k = [], "", None, 0
+        while k < len(inner):
+            c = inner[k]
+            if quote:
+                cur += c
+                if c == "\\" and quote != "`" and k + 1 < len(inner):
+                    cur += inner[k + 1]
+                    k += 1
+                elif c == quote:
+                    quote = None
+            elif c in "\"'`":
+                quote, cur = c, cur + c
+            elif c == ",":
+                parts, cur = parts + [cur], ""
+            else:
+                cur += c
+            k += 1
+        found = []
+        for part in parts + [cur]:
+            if not part.strip() or re.fullmatch(r"\s*(?:" + STRING + r")\s*", part):
+                continue
+            m = MATCHER.match(part)
+            if not m:
+                raise ValueError(f"matcher {part.strip()!r} cannot be read")
+            name = unquote(m.group(1)) if m.group(1)[0] in "\"'`" else m.group(1)
+            if name == label:
+                found.append((m.group(2), unquote(m.group(3))))
+        return found
     def rewrite(q):
+        # The rewritten text and, per vector selector, the matchers on LABEL
+        # it carried before the rewrite.
+        selectors = []
         out, i, n, list_next = [], 0, len(q), False
         def skip_ws(j):
             while j < n and q[j].isspace():
@@ -1774,6 +1825,7 @@ elif op == "stage1-erasure-corpus":
                 j = skip_ws(i + 1)
                 out.append("{" + matcher + ("" if j < n and q[j] == "}" else ","))
                 i += 1
+                start = i
                 depth_str = None
                 while i < n and (q[i] != "}" or depth_str):
                     if depth_str:
@@ -1789,6 +1841,7 @@ elif op == "stage1-erasure-corpus":
                     i += 1
                 if i >= n:
                     raise ValueError("unterminated selector")
+                selectors.append(subject_matchers(q[start:i]))
                 out.append("}")
                 i += 1
             elif ch.isalpha() or ch in "_:":
@@ -1814,6 +1867,7 @@ elif op == "stage1-erasure-corpus":
                     pass
                 else:
                     out.append("{" + matcher + "}")
+                    selectors.append([])
                 i = j
             elif ch.isdigit() or ch == ".":
                 j = i
@@ -1826,20 +1880,34 @@ elif op == "stage1-erasure-corpus":
                     list_next = False
                 out.append(ch)
                 i += 1
-        return "".join(out)
+        return "".join(out), selectors
+    reason = (f"the erasure reference and pending passes exclude {label}=\"{value}\" from every selector, "
+              f"and every selector of this entry selects {label}=\"{value}\"")
     try:
         doc = load(corpus_path)
-        rewritten = []
+        rewritten, intended_empty, refused = [], [], []
         for e in doc["entries"]:
-            q = rewrite(e["promql"])
+            q, selectors = rewrite(e["promql"])
+            on_label = [m for sel in selectors for m in sel]
+            if any(op != "=" for op, _ in on_label):
+                refused.append(f"{e['id']} ({', '.join(label + op + json.dumps(v) for op, v in on_label)})")
+            elif on_label and all(sel == [("=", value)] for sel in selectors):
+                intended_empty.append(e["id"])
+                e["expected"] = {**(e.get("expected") or {}), "intended_empty": True, "reason": reason}
+            elif ("=", value) in on_label:
+                refused.append(f"{e['id']} ({label}={json.dumps(value)} on some selectors only)")
             if q != e["promql"]:
                 rewritten.append(e["id"])
             e["promql"] = q
-    except (OSError, ValueError, KeyError, TypeError) as e:
+    except (OSError, ValueError, KeyError, TypeError, SyntaxError) as e:
         print(f"the corpus could not be rewritten ({type(e).__name__}: {e})")
         sys.exit(3)
+    if refused:
+        print(f"the rewrite would contradict a matcher on {label} in: {'; '.join(refused)}")
+        sys.exit(3)
     dump(out_path, doc)
-    print(json.dumps({"matcher": matcher, "entries": len(doc["entries"]), "rewritten": rewritten}))
+    print(json.dumps({"matcher": matcher, "entries": len(doc["entries"]), "rewritten": rewritten,
+                      "intended_empty_ids": intended_empty}))
 elif op == "stage1-erasure-status":
     # `erase status` text (services/ravel-cli/src/erase.rs print_state) and
     # the request id: its state, deferral cause and the acknowledgement and
@@ -1977,10 +2045,18 @@ elif op == "stage1-holders":
             if isinstance(phases, list) else []
         return any((whole(p.get("s3GetRequests")) and p["s3GetRequests"] > 0)
                    or (whole(p.get("cacheHits")) and p["cacheHits"] > 0) for p in key_index)
-    fetched = by_entry(rows, "segmentsFetched")
-    routed_pruned = by_entry(routed_rows, "segmentsPrunedByLabelIndex")
-    mismatches, unchecked, per, unbound = [], [], [], []
-    prune_mismatches, prune_unchecked, leaf_unread = [], [], []
+    # Only an answered (ok or incorrect) record carries the figures checked
+    # below. A statement whose every record of a pass timed out is counted
+    # apart from one whose answered record lacks a figure.
+    def answered(records):
+        return [r for r in records if r.get("status") in ("ok", "incorrect")]
+    def timed_out(records, sid):
+        mine = [r for r in records if r.get("entry") == sid]
+        return bool(mine) and all(r.get("status") == "timeout" for r in mine)
+    fetched = by_entry(answered(rows), "segmentsFetched")
+    routed_pruned = by_entry(answered(routed_rows), "segmentsPrunedByLabelIndex")
+    mismatches, unchecked, unchecked_timed_out, per, unbound = [], [], [], [], []
+    prune_mismatches, prune_unchecked, prune_unchecked_timed_out, leaf_unread = [], [], [], []
     for s in statements:
         sid, want = s.get("id"), s.get("unrouted_fetched_expected")
         resolved = s.get("named_in_window") if s.get("name_pruned") else s.get("segments_in_window")
@@ -1994,7 +2070,9 @@ elif op == "stage1-holders":
         if s.get("route_bound") is not True:
             unbound.append({"id": sid, "reason": s.get("route_bound_reason")})
         seen = fetched.get(sid, [])
-        if not seen or None in seen or not whole(want):
+        if not seen and whole(want) and timed_out(rows, sid):
+            unchecked_timed_out.append(sid)
+        elif not seen or None in seen or not whole(want):
             unchecked.append(sid)
         elif any(v != want for v in seen):
             mismatches.append({"id": sid, "unrouted_fetched_expected": want,
@@ -2005,14 +2083,16 @@ elif op == "stage1-holders":
         if s.get("route_bound") is not True:
             continue
         expected_prunes = s.get("expected_routed_prunes")
-        if not seen_pruned or None in seen_pruned or not whole(expected_prunes):
+        if not seen_pruned and whole(expected_prunes) and timed_out(routed_rows, sid):
+            prune_unchecked_timed_out.append(sid)
+        elif not seen_pruned or None in seen_pruned or not whole(expected_prunes):
             prune_unchecked.append(sid)
         elif any(v != expected_prunes for v in seen_pruned):
             prune_mismatches.append({"id": sid, "expected_routed_prunes": expected_prunes,
                                      "value_holders": s.get("value_holders"),
                                      "routed_pruned_by_label_index": sorted(set(seen_pruned))})
         if whole(resolved) and resolved > 0:
-            unread = sum(1 for r in routed_rows if r.get("entry") == sid and not leaf_read(r))
+            unread = sum(1 for r in answered(routed_rows) if r.get("entry") == sid and not leaf_read(r))
             if unread:
                 leaf_unread.append({"id": sid, "records": unread})
     print(json.dumps({"file": "holders.json", "bucket": bucket, "method": doc.get("method"),
@@ -2024,16 +2104,20 @@ elif op == "stage1-holders":
                       "token_objects": len(doc.get("token_objects") or []),
                       "tokens_unmatched": doc.get("tokens_unmatched"),
                       "statements": per, "skipped": len(doc.get("skipped") or []),
-                      "window_check": "segmentsFetched of every stage1-unrouted record of the statement == unrouted_fetched_expected, which is the resolved set plus token_only_fetched: the resolved set is named_in_window (the objects in the window holding a series of the statement's metric) when every selector names one metric, since the unrouted resolve prunes by that name's postings, and segments_in_window (every object in the window) when the selectors name different metrics, which the resolve does not prune by name; token_only_fetched is the listed L0 objects outside that set that a min_commit_token the query lane passed names, which the resolve adds whatever their metrics and event time; a statement with no unrouted record, a record with no whole-number segmentsFetched, or a null unrouted_fetched_expected (a token naming no listed object) is counted as unchecked instead",
+                      "window_check": "segmentsFetched of every stage1-unrouted record of the statement == unrouted_fetched_expected, which is the resolved set plus token_only_fetched: the resolved set is named_in_window (the objects in the window holding a series of the statement's metric) when every selector names one metric, since the unrouted resolve prunes by that name's postings, and segments_in_window (every object in the window) when the selectors name different metrics, which the resolve does not prune by name; token_only_fetched is the listed L0 objects outside that set that a min_commit_token the query lane passed names, which the resolve adds whatever their metrics and event time; only answered (ok or incorrect) records are compared; a statement whose every unrouted record timed out is counted as window_unchecked_timed_out, and one with no answered record otherwise, an answered record with no whole-number segmentsFetched, or a null unrouted_fetched_expected (a token naming no listed object) as window_unchecked",
                       "window_mismatches_count": len(mismatches), "window_mismatches": mismatches,
                       "window_unchecked_count": len(unchecked), "window_unchecked": unchecked,
+                      "window_unchecked_timed_out_count": len(unchecked_timed_out),
+                      "window_unchecked_timed_out": unchecked_timed_out,
                       "bound_check": "holders (objects in the window with a series matching a qualifying selector in full) is the bound a series-level index could reach, not the label-value router's; value_holders (objects of the resolved set whose LABEL_DICT holds, for at least one selector, its metric name and every label=\"value\" value) is the router's bound, and expected_routed_prunes is the resolved set less value_holders",
-                      "routed_prune_check": "for each route_bound statement, segmentsPrunedByLabelIndex of every stage1-routed record of the statement == expected_routed_prunes; a route_bound statement with no routed record, a record with no whole-number segmentsPrunedByLabelIndex, or a null expected_routed_prunes is counted as unchecked instead; statements that are not route_bound are not compared",
+                      "routed_prune_check": "for each route_bound statement, segmentsPrunedByLabelIndex of every answered (ok or incorrect) stage1-routed record of the statement == expected_routed_prunes; a route_bound statement whose every routed record timed out is counted as routed_prune_unchecked_timed_out, and one with no answered routed record otherwise, an answered record with no whole-number segmentsPrunedByLabelIndex, or a null expected_routed_prunes as routed_prune_unchecked; statements that are not route_bound are not compared",
                       "routed_prune_mismatches_count": len(prune_mismatches),
                       "routed_prune_mismatches": prune_mismatches,
                       "routed_prune_unchecked_count": len(prune_unchecked),
                       "routed_prune_unchecked": prune_unchecked,
-                      "routed_leaf_check": "for each route_bound statement whose resolved set holds at least one object, the stage1-routed records whose keyIndex phase shows no leaf read (no s3GetRequests and no cacheHits, or no keyIndex phase at all); a statement whose resolved set is empty is not counted, since its snapshot holds only token objects, which carry no part and so no leaf to read",
+                      "routed_prune_unchecked_timed_out_count": len(prune_unchecked_timed_out),
+                      "routed_prune_unchecked_timed_out": prune_unchecked_timed_out,
+                      "routed_leaf_check": "for each route_bound statement whose resolved set holds at least one object, the answered (ok or incorrect) stage1-routed records whose keyIndex phase shows no leaf read (no s3GetRequests and no cacheHits, or no keyIndex phase at all); a statement whose resolved set is empty is not counted, since its snapshot holds only token objects, which carry no part and so no leaf to read",
                       "routed_leaf_unread_count": sum(u["records"] for u in leaf_unread),
                       "routed_leaf_unread": leaf_unread,
                       "route_bound_check": "a statement whose selectors each carry a label=\"value\" matcher with a non-empty value is route_bound; for any other the router probes only that selector's metric name and keeps every object holding it, so it carries no value_holders and is left out of every comparison with the routed pass",
