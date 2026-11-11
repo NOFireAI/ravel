@@ -1610,7 +1610,7 @@ async fn merge_planned(
             next += 1;
             continue;
         }
-        let len = plan.cut(next, &[]);
+        let len = plan.cut(next, &[]).len;
         run_stream_pass(
             store,
             catalogs,
@@ -3490,13 +3490,21 @@ fn part_keys() -> u64 {
 
 /// The part-index windows of a unit's ranges (ADR-3853 D5 amendment): a
 /// range starting after `before` of the unit's `t` records numbers its parts
-/// from `floor(keys x before / t)`, and may use them up to, not including,
-/// `floor(keys x (before + quantum) / t)`, or `keys` when fewer than
-/// `quantum` records remain after `before`. Each window is proportional to
-/// the records a full range holds, so a range that closes at or past the
-/// quantum starts the next window at or past its own limit: the windows are
-/// disjoint and every index is under `keys`. With `t <= keys x quantum` every
+/// from `index(before)`, `index(x) = floor(keys x x / t)`. A part it opens
+/// after `emitted` records must sit under
+/// `max(index(before + quantum), index(emitted))`, or under `keys` when fewer
+/// than `quantum` records remain after `before`: the window grows with the
+/// records the range has emitted, so a range holding more than `quantum`
+/// records gets their share of the indexes. With `t <= keys x quantum` every
 /// window holds at least one index.
+///
+/// The windows are disjoint. A range that is not the last closes after some
+/// `e` records with `e >= before + quantum`, since it closes only once its
+/// records reach the quantum, and the next range starts at `index(e)`. Every
+/// part this range opened did so after fewer than `e` records, so its index
+/// is under `max(index(before + quantum), index(e - 1)) <= index(e)`, because
+/// `index` does not decrease. The last range's limit is `keys` at most, so
+/// every index is under `keys`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RangeWindows {
     t: u64,
@@ -3534,7 +3542,7 @@ impl RangeWindows {
     }
 
     /// One past the last part index a range starting after `before` records
-    /// may use.
+    /// may use before it has emitted any record past `before + quantum`.
     fn limit(&self, before: u64) -> u64 {
         if self.t.saturating_sub(before) < self.quantum {
             self.keys
@@ -3575,7 +3583,8 @@ struct RangeCutter {
     seed: u64,
     /// The open range's first part index.
     first: u64,
-    /// One past the last part index the open range may use.
+    /// One past the last part index the open range may use at its start;
+    /// [`Self::open_limit`] widens it as the range emits.
     limit: u64,
     /// The records `emitted` must reach by the sink's finish: `t` for a whole
     /// unit, the records before the next worker's first range for a range
@@ -3636,11 +3645,17 @@ impl RangeCutter {
         self.range - self.seed + u64::from(self.range_records > 0)
     }
 
+    /// One past the last part index a part opened now may take:
+    /// `max(index(before + quantum), index(emitted))` ([`RangeWindows`]).
+    fn open_limit(&self) -> u64 {
+        self.limit.max(self.windows.index(self.emitted))
+    }
+
     fn refusal(&self, part_index: u64) -> MaintainError {
         MaintainError::PartRangeWindow {
             range: self.range,
             first: self.first,
-            limit: self.limit,
+            limit: self.open_limit(),
             part_index,
         }
     }
@@ -3863,6 +3878,8 @@ async fn level2_worker_ranges(
         let mut next = range.start - base;
         while next < end {
             if plan.mode == MergeReadMode::Cursor || plan.hot.get(next).copied().unwrap_or(true) {
+                // A hot stream's cursor charge is priced without carried views.
+                carry.release_all();
                 cursor_merge_one_stream(
                     work.runs_store,
                     work.runs,
@@ -3879,7 +3896,9 @@ async fn level2_worker_ranges(
                 next += 1;
                 continue;
             }
-            let len = plan.cut(next, &carry.held()).min(end - next);
+            let cut = plan.cut(next, &carry.held());
+            carry.release(&cut.release);
+            let len = cut.len.min(end - next);
             run_stream_pass(
                 work.runs_store,
                 work.runs,
@@ -4475,8 +4494,11 @@ impl MergePlan {
     /// `carried` are the `(input, block, charged bytes)` a level-2 worker
     /// carries into the pass ([`PassCarry::held`]): held from the start, so they
     /// count against the budget once and are not counted again for a stream
-    /// that needs them.
-    fn cut(&self, start: usize, carried: &[(usize, usize, u64)]) -> usize {
+    /// that needs them. When the carried charges and the first stream's other
+    /// blocks together exceed the budget, the cut releases every carried view
+    /// the first stream does not read and counts only the rest, so the first
+    /// stream starts from at most its own estimate.
+    fn cut(&self, start: usize, carried: &[(usize, usize, u64)]) -> PassCut {
         let mut held: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); self.block_costs.len()];
         let mut sum = 0u64;
         for &(input, block, charged) in carried {
@@ -4485,39 +4507,90 @@ impl MergePlan {
             }
             sum = sum.saturating_add(charged);
         }
+        let mut release = Vec::new();
+        if self.hot.get(start).is_some_and(|hot| !*hot)
+            && sum.saturating_add(self.added(start, &held)) > self.pass_budget
+        {
+            let first = self
+                .stream_blocks
+                .get(start)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let reads = |input: usize, block: usize| {
+                first
+                    .iter()
+                    .any(|(i, blocks)| *i == input && blocks.contains(&block))
+            };
+            sum = 0;
+            for &(input, block, charged) in carried {
+                if reads(input, block) {
+                    sum = sum.saturating_add(charged);
+                } else {
+                    release.push((input, block));
+                    if let Some(s) = held.get_mut(input) {
+                        s.remove(&block);
+                    }
+                }
+            }
+        }
         let mut len = 0usize;
         for (j, hot) in self.hot.iter().enumerate().skip(start) {
             if *hot {
                 break;
             }
-            let carriers = self.stream_blocks.get(j).map(Vec::as_slice).unwrap_or(&[]);
-            let mut added = 0u64;
-            for (input, blocks) in carriers {
-                let costs = self
-                    .block_costs
-                    .get(*input)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let seen = held.get(*input);
-                for b in blocks {
-                    if !seen.is_some_and(|s| s.contains(b)) {
-                        added = added.saturating_add(costs.get(*b).copied().unwrap_or(0));
-                    }
-                }
-            }
+            let added = self.added(j, &held);
             if len > 0 && sum.saturating_add(added) > self.pass_budget {
                 break;
             }
             sum = sum.saturating_add(added);
-            for (input, blocks) in carriers {
+            for (input, blocks) in self.stream_blocks.get(j).map(Vec::as_slice).unwrap_or(&[]) {
                 if let Some(s) = held.get_mut(*input) {
                     s.extend(blocks.iter().copied());
                 }
             }
             len += 1;
         }
-        len.max(1)
+        PassCut {
+            len: len.max(1),
+            release,
+            charged: sum,
+        }
     }
+
+    /// The [`pass_block_cost`] of stream `j`'s candidate blocks not in `held`
+    /// (per input, its held block indices), summed.
+    fn added(&self, j: usize, held: &[BTreeSet<usize>]) -> u64 {
+        let mut added = 0u64;
+        for (input, blocks) in self.stream_blocks.get(j).map(Vec::as_slice).unwrap_or(&[]) {
+            let costs = self
+                .block_costs
+                .get(*input)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let seen = held.get(*input);
+            for b in blocks {
+                if !seen.is_some_and(|s| s.contains(b)) {
+                    added = added.saturating_add(costs.get(*b).copied().unwrap_or(0));
+                }
+            }
+        }
+        added
+    }
+}
+
+/// What [`MergePlan::cut`] decides for the next pass.
+#[derive(Debug, PartialEq, Eq)]
+struct PassCut {
+    /// How many streams the pass covers, at least one.
+    len: usize,
+    /// The carried `(input, block)` views to release before the pass
+    /// ([`PassCarry::release`]): empty unless keeping every carried view would
+    /// take the first stream over the pass budget, then every one the first
+    /// stream does not read.
+    release: Vec<(usize, usize)>,
+    /// The kept carried views' charges plus the [`pass_block_cost`] of the
+    /// pass's other distinct blocks.
+    charged: u64,
 }
 
 /// Heap bytes a pass's block view holds per retained row on top of the decoded
@@ -4987,7 +5060,9 @@ struct HeldView<'r> {
 /// `stream_ref`-major, so only an input's last decoded block can hold such
 /// rows. A pass that wants those rows takes the view instead of decoding the
 /// block again, so a boundary block is decoded once per worker, across the
-/// worker's contiguous ranges too.
+/// worker's contiguous ranges too, unless it is released first: by a pass whose
+/// cut ([`PassCut::release`]) cannot keep it within the budget, or before a hot
+/// stream's cursor merge.
 struct PassCarry<'r, 't> {
     views: BTreeMap<usize, (usize, HeldView<'r>)>,
     charges: MergeCharges<'t>,
@@ -5008,6 +5083,27 @@ impl<'r, 't> PassCarry<'r, 't> {
             .iter()
             .map(|(input, (block, view))| (*input, *block, view.charged))
             .collect()
+    }
+
+    /// Drop the carried views of `blocks`, `(input, block)` pairs as
+    /// [`PassCut::release`] names them, and release their charges. A block of
+    /// one is decoded again by the pass that next reads it.
+    fn release(&mut self, blocks: &[(usize, usize)]) {
+        for &(input, block) in blocks {
+            if self.views.get(&input).is_some_and(|(b, _)| *b == block)
+                && let Some((_, view)) = self.views.remove(&input)
+            {
+                let charged = view.charged;
+                drop(view);
+                self.charges.release_pass_rows(charged);
+            }
+        }
+    }
+
+    /// Drop every carried view and release its charge.
+    fn release_all(&mut self) {
+        self.views.clear();
+        self.charges.release_all_pass_rows();
     }
 }
 
@@ -5666,7 +5762,7 @@ impl PartSink<'_> {
     async fn push(&mut self, r: LogRecord) -> Result<()> {
         if self.current.is_none() {
             if let Some(cutter) = &self.range
-                && u64::from(self.part_index) >= cutter.limit
+                && u64::from(self.part_index) >= cutter.open_limit()
             {
                 return Err(cutter.refusal(u64::from(self.part_index)));
             }
@@ -8846,6 +8942,147 @@ mod tests {
             ),
             [(0, 1), (1, 2), (2, 3)]
         );
+    }
+
+    /// The part indexes a [`PartSink`] with a cutter opens over
+    /// `stream_records`, closing a part at `part_records` records or when a
+    /// stream end closes its range, one list per range. A part opens only
+    /// under [`RangeCutter::open_limit`], checked before its first record is
+    /// pushed, as `PartSink::push` checks it.
+    fn parts_of(
+        stream_records: &[u64],
+        part_records: u64,
+        t: u64,
+        quantum: u64,
+        keys: u64,
+    ) -> Result<Vec<Vec<u64>>> {
+        let mut cutter = RangeCutter::new(t, quantum, keys)?;
+        let mut ranges = vec![Vec::new()];
+        let mut part_index = 0u64;
+        let mut in_part = 0u64;
+        for n in stream_records {
+            for _ in 0..*n {
+                if in_part == 0 {
+                    if part_index >= cutter.open_limit() {
+                        return Err(cutter.refusal(part_index));
+                    }
+                    ranges.last_mut().expect("a range").push(part_index);
+                }
+                cutter.push();
+                in_part += 1;
+                if in_part == part_records {
+                    in_part = 0;
+                    part_index += 1;
+                }
+            }
+            if cutter.end_stream() {
+                if in_part > 0 {
+                    in_part = 0;
+                    part_index += 1;
+                }
+                if cutter.first < part_index {
+                    return Err(MaintainError::Invariant(format!(
+                        "range {} opens at {} below {part_index}",
+                        cutter.range, cutter.first
+                    )));
+                }
+                part_index = cutter.first;
+                ranges.push(Vec::new());
+            }
+        }
+        if ranges.last().is_some_and(Vec::is_empty) {
+            ranges.pop();
+        }
+        assert_eq!(cutter.emitted, t);
+        assert_eq!(cutter.open_limit(), keys, "the last range reaches keys");
+        Ok(ranges)
+    }
+
+    /// A range holding more records than the quantum takes their share of
+    /// the indexes: at 100 keys over 1,000 records and a quantum of 300,
+    /// streams of 100, 400 and 500 records cut 2 ranges of 500, and parts of
+    /// 11 records open 46 in each. Range 0 starts under
+    /// `index(300) = 30` and range 1 under `index(800) = 80`, but each part
+    /// opens under `index(emitted)` too, 1.1 per part, so range 0 numbers
+    /// 0..=45 and range 1 starts at `index(500) = 50` and numbers 50..=95,
+    /// disjoint, without a refusal. Below that density a range is refused at
+    /// the part whose index reaches both bounds.
+    #[test]
+    fn a_range_past_the_quantum_widens_its_window_with_its_records() {
+        let ranges = parts_of(&[100, 400, 500], 11, 1_000, 300, 100).expect("not refused");
+        assert_eq!(
+            ranges,
+            [(0..=45).collect::<Vec<u64>>(), (50..=95).collect()],
+            "range 0 past index(before + Q) = 30, range 1 from index(500)"
+        );
+
+        let windows = RangeWindows::new(1_000, 300, 100).expect("fits");
+        assert_eq!(
+            windows_of(&windows, &[100, 400, 500], 300),
+            [(0, 30), (50, 80)]
+        );
+
+        // Parts of 5 records cover 0.5 index each: range 0 reaches
+        // index(before + Q) = 30 after 150 records and index(emitted) never
+        // passes the part index again.
+        let refused = parts_of(&[100, 400, 500], 5, 1_000, 300, 100);
+        assert!(
+            matches!(
+                refused,
+                Err(MaintainError::PartRangeWindow {
+                    range: 0,
+                    first: 0,
+                    limit: 30,
+                    part_index: 30,
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    proptest! {
+        /// For any fitting unit and part size, a cut that is not refused
+        /// numbers its parts strictly ascending under `keys`, each range's
+        /// below the next range's first index, and parts of at least
+        /// `2 x T / keys` records are never refused: part `j` of a range
+        /// opens after `before + j x P` records, where `index(emitted)` is at
+        /// least `index(before) + 2j`. Parts are drawn from 0.001 to 8 times
+        /// `T / keys` records, so both sides of that bound are reached, and
+        /// streams often pass the quantum several times over.
+        #[test]
+        fn range_parts_are_disjoint_and_dense_enough_parts_are_never_refused(
+            stream_records in proptest::collection::vec(1u64..2_000, 1..40),
+            quantum in 1u64..4_000,
+            keys in 1u64..10_001,
+            part_per_mille in 1u64..8_000,
+        ) {
+            let t: u64 = stream_records.iter().sum();
+            prop_assume!(u128::from(t) <= u128::from(keys) * u128::from(quantum));
+            let part_records = u64::try_from(
+                u128::from(part_per_mille) * u128::from(t) / (1_000 * u128::from(keys)),
+            )
+            .unwrap_or(u64::MAX)
+            .max(1);
+            match parts_of(&stream_records, part_records, t, quantum, keys) {
+                Ok(ranges) => {
+                    let all: Vec<u64> = ranges.iter().flatten().copied().collect();
+                    prop_assert!(all.windows(2).all(|p| p[0] < p[1]), "{:?}", ranges);
+                    prop_assert!(all.iter().all(|i| *i < keys), "{:?}", ranges);
+                    prop_assert_eq!(
+                        ranges.len(),
+                        level2_ranges(&stream_records, quantum).len()
+                    );
+                }
+                Err(MaintainError::PartRangeWindow { .. }) => {
+                    prop_assert!(
+                        u128::from(part_records) * u128::from(keys) < 2 * u128::from(t),
+                        "parts of {} records refused at T {} keys {}",
+                        part_records, t, keys
+                    );
+                }
+                Err(other) => prop_assert!(false, "{other}"),
+            }
+        }
     }
 
     proptest! {
@@ -17698,6 +17935,114 @@ mod tests {
             }
         }
 
+        /// ADR-3853 D5 amendment: a range holding more records than the
+        /// quantum numbers its parts the same way on every route. Over 60
+        /// inputs of 40 streams, one record per stream and two blocks of 20
+        /// streams per input, a quantum of 10 closes a range at each 60-record
+        /// stream, and a part key of 240 indexes gives each range a window of
+        /// one index at its start, `[6r, index(60r + 10)) = [6r, 6r + 1)`, which
+        /// its 2 parts outgrow: the second opens under `index(emitted)`. The
+        /// single-level resident merge in one pass and in two (a pass per
+        /// block's 20 streams) and the two-level merge, which D0 routes the
+        /// cursor plan to, at 1 or 4 level-1 workers and 1 or 2 range workers
+        /// publish the same keys, content hashes and bytes, range r's parts at
+        /// `6r` and `6r + 1`. A range worker seeded from any record count before
+        /// its first range other than the exact one publishes other keys.
+        #[tokio::test]
+        async fn every_route_numbers_a_range_past_the_quantum_alike() {
+            const QUANTUM: u64 = 10;
+            const KEYS: u64 = 240;
+            let inputs = blocked(wide_inputs(60, 40, 1), 20);
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &inputs).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let part = 4 * TWO_LEVEL_PART;
+            let base = CompactorConfig {
+                rlog_range_records: QUANTUM,
+                rlog_l1_part_memory_target_bytes: Some(part),
+                ..two_level_config(64 << 20, crate::RLOG_RUN_MEMORY_TARGET_BYTES, None)
+            };
+            let (plan, _) = plan_for(&probe, &keys, &base).await;
+            assert_eq!(plan.mode, MergeReadMode::Resident);
+            let largest = plan.estimates.iter().copied().max().unwrap_or(0);
+            let tight = CompactorConfig {
+                merge_resident_ceiling_bytes: Some(plan.raw_bytes + part + largest),
+                ..base.clone()
+            };
+            let (plan, _) = plan_for(&probe, &keys, &tight).await;
+            assert_eq!(plan.mode, MergeReadMode::Resident);
+            assert!(plan.hot.iter().all(|h| !h), "no hot stream");
+            let two_level_ceiling = 2 * group_ceiling(per_input, TWO_LEVEL_RUN_TARGET, 12);
+            let (plan, _) = plan_for(
+                &probe,
+                &keys,
+                &CompactorConfig {
+                    merge_resident_ceiling_bytes: Some(two_level_ceiling),
+                    ..base.clone()
+                },
+            )
+            .await;
+            assert_eq!(
+                plan.mode,
+                MergeReadMode::Cursor,
+                "D0 refuses it: two levels"
+            );
+
+            let mut legs = vec![
+                ("single-level resident in one pass".to_string(), base),
+                ("single-level resident in two passes".to_string(), tight),
+            ];
+            for (w1, w2) in [(1usize, 1usize), (1, 2), (4, 2)] {
+                let dir = fresh_scratch(&format!("past-quantum-{w1}-{w2}"));
+                let config = CompactorConfig {
+                    level1_workers: Some(w1),
+                    level2_workers: Some(w2),
+                    rlog_range_records: QUANTUM,
+                    rlog_l1_part_memory_target_bytes: Some(part),
+                    ..two_level_config(two_level_ceiling, TWO_LEVEL_RUN_TARGET, Some(dir))
+                };
+                legs.push((format!("two-level W1 {w1} W2 {w2}"), config));
+            }
+
+            let indexes: Vec<u32> = (0..40u32).flat_map(|r| [6 * r, 6 * r + 1]).collect();
+            let mut outputs = Vec::new();
+            let mut groups = Vec::new();
+            for (name, config) in &legs {
+                let store = ProbeStore::new();
+                seed_inputs(&store, &inputs).await;
+                PART_KEYS_OVERRIDE.with(|o| o.set(Some(KEYS)));
+                let (outcome, run) = compact_logged(&store, config).await;
+                PART_KEYS_OVERRIDE.with(|o| o.set(None));
+                assert!(
+                    matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                    "{name}: {outcome:?}"
+                );
+                let r = &run.report;
+                if name.starts_with("single-level") {
+                    assert_eq!(r.level1_groups, 0, "{name}: {r:?}");
+                    let passes = if name.ends_with("one pass") { 1 } else { 2 };
+                    assert_eq!(r.merge_passes, passes, "{name}: {r:?}");
+                } else {
+                    assert_eq!(r.level2_ranges, 40, "{name}: {r:?}");
+                    groups.push(r.level1_groups);
+                }
+                let got = published(&store).await;
+                assert_eq!(
+                    got.1.indexes, indexes,
+                    "{name}: range r's 2 parts at 6r and 6r + 1, past its opening window \
+                     [6r, 6r + 1)"
+                );
+                outputs.push((name, got));
+            }
+            assert_eq!(groups, [3, 3, 10], "level 1 grouped differently at W1 4");
+            let (_, oracle) = &outputs[0];
+            for (name, got) in &outputs[1..] {
+                assert_eq!(got.0, oracle.0, "{name}: part keys");
+                assert!(got.1.hashes == oracle.1.hashes, "{name}: content hashes");
+                assert!(got.1.parts == oracle.1.parts, "{name}: part bytes");
+            }
+        }
+
         /// ADR-3853 D5 amendment: the two-level cut reads the records each
         /// stream holds, never how level 1 grouped the inputs or how its runs
         /// were cut into parts and blocks. Against 4 level-1 workers, run
@@ -17840,6 +18185,202 @@ mod tests {
             blocked(inputs, 40)
         }
 
+        /// A fetch-per-pass plan with no hot stream, a pass budget of
+        /// `budget`, and the given candidate blocks and block costs.
+        fn cut_plan(
+            budget: u64,
+            stream_blocks: Vec<Vec<(usize, Vec<usize>)>>,
+            block_costs: Vec<Vec<u64>>,
+        ) -> MergePlan {
+            let estimates = stream_blocks
+                .iter()
+                .map(|carriers| {
+                    carriers
+                        .iter()
+                        .flat_map(|(i, blocks)| blocks.iter().map(|b| block_costs[*i][*b]))
+                        .sum()
+                })
+                .collect();
+            MergePlan {
+                mode: MergeReadMode::FetchPerPass,
+                pass_budget: budget,
+                hot: vec![false; stream_blocks.len()],
+                estimates,
+                input_blocks: block_costs.iter().map(Vec::len).sum(),
+                stream_blocks,
+                block_costs,
+                raw_bytes: 0,
+                compared_bytes: 0,
+                ceiling_bytes: 0,
+                groups: Vec::new(),
+                renew_every_fetches: 1,
+                renew_every_blocks: 1,
+                predicted_decoded_rows: 0,
+                input_records: 0,
+            }
+        }
+
+        /// ADR-3853, carried views: a cut whose carried views would take its
+        /// first stream over the pass budget releases the ones that stream
+        /// does not read, keeps the ones it reads, and releases nothing when
+        /// every carried view fits.
+        #[test]
+        fn pass_cut_releases_carried_views_the_first_stream_does_not_use() {
+            // Stream 0 reads input 0's block 0 at 50; the view of input 1's
+            // block 0 it does not read takes it to 110.
+            let plan = cut_plan(100, vec![vec![(0, vec![0])]], vec![vec![50], vec![60]]);
+            assert_eq!(
+                plan.cut(0, &[(1, 0, 60)]),
+                PassCut {
+                    len: 1,
+                    release: vec![(1, 0)],
+                    charged: 50
+                }
+            );
+
+            // Stream 0 reads the carried view of input 0's block 0 and the
+            // block after it, not the view of input 2's block 0: 120 in all.
+            // Only the unread view goes, leaving 90 (releasing the read one
+            // too would decode it again, 100), and stream 1's block at 60
+            // stays out of the pass.
+            let plan = cut_plan(
+                100,
+                vec![vec![(0, vec![0, 1])], vec![(1, vec![0])]],
+                vec![vec![50, 50], vec![60], vec![30]],
+            );
+            assert_eq!(
+                plan.cut(0, &[(0, 0, 40), (2, 0, 30)]),
+                PassCut {
+                    len: 1,
+                    release: vec![(2, 0)],
+                    charged: 90
+                }
+            );
+
+            // A view stream 0 does not read stays while the pass fits.
+            let plan = cut_plan(100, vec![vec![(0, vec![0])]], vec![vec![50], vec![20]]);
+            assert_eq!(
+                plan.cut(0, &[(1, 0, 20)]),
+                PassCut {
+                    len: 1,
+                    release: Vec::new(),
+                    charged: 70
+                }
+            );
+        }
+
+        /// The body padding and run target of [`split_stream_inputs`].
+        const SPLIT_PAD: usize = 16_000;
+        const SPLIT_RUN_TARGET: u64 = 650_000;
+
+        /// 60 inputs of 40 records, 2,400 in all, with `SPLIT_PAD`-byte
+        /// bodies: inputs 36 to 59 hold only s_20, the 21st stream in merged
+        /// stream order, and inputs 0 to 35 hold every other stream, s_19
+        /// twice. At G = 12 the three runs of inputs 0 to 35 hold no row of
+        /// s_20, and each has a block running from s_19 into s_21 that a
+        /// level-2 worker carries past s_19's pass; s_20 comes from the two
+        /// runs of inputs 36 to 59 and needs most of the level-2 pass budget.
+        fn split_stream_inputs() -> Vec<L0Input> {
+            let mut order: Vec<u32> = (0..40).collect();
+            order.sort_by_key(|s| stream_ident(*s).0);
+            let (before, split) = (order[19], order[20]);
+            let body = |i: u32, s: u32, k: i64| format!("in{i} s{s} k{k}{}", "x".repeat(SPLIT_PAD));
+            let inputs = (0..60u32)
+                .map(|i| {
+                    let ts = 1_000 + i64::from(i % 3);
+                    let counts: Vec<(u32, i64)> = if i >= 36 {
+                        vec![(split, 40)]
+                    } else {
+                        order
+                            .iter()
+                            .filter(|s| **s != split)
+                            .map(|&s| (s, if s == before { 2 } else { 1 }))
+                            .collect()
+                    };
+                    counts
+                        .into_iter()
+                        .flat_map(|(s, n)| {
+                            (0..n).map(move |k| {
+                                record(
+                                    s,
+                                    ts + 3 * k,
+                                    &body(i, s, k),
+                                    vec![("k".to_string(), AttrValue::I64(0))],
+                                )
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            blocked(inputs, 40)
+        }
+
+        /// ADR-3853, carried views: when the views a level-2 worker carries
+        /// into a pass would take it over the pass budget, the pass releases
+        /// the ones its first stream does not read before it decodes. At the
+        /// smallest ceiling holding G = 12 on two level-1 workers, s_20 fits
+        /// the budget alone but not beside the three run blocks carried past
+        /// s_19, which it never reads; one level-2 worker merges it within
+        /// the unit ceiling and publishes the single-level merge's records,
+        /// decoding each released block once more at most.
+        #[tokio::test]
+        async fn a_carried_view_never_takes_a_pass_over_its_budget() {
+            let oracle_store = ProbeStore::new();
+            let keys = seed_inputs(&oracle_store, &split_stream_inputs()).await;
+            let per_input = level1_per_input(&oracle_store, &keys).await;
+            let single = two_level_config(64 << 20, SPLIT_RUN_TARGET, None);
+            let (outcome, run) = compact_logged(&oracle_store, &single).await;
+            outcome.expect("single-level compact");
+            assert!(
+                run.mode_line().contains("mode=\"resident\""),
+                "{}",
+                run.mode_line()
+            );
+            let oracle = published_records(&oracle_store).await;
+            assert_eq!(oracle.len(), 2400);
+
+            let ceiling = 2 * (SPLIT_RUN_TARGET + 12 * per_input);
+            let dir = fresh_scratch("carried-budget");
+            let config = CompactorConfig {
+                level1_workers: Some(2),
+                level2_workers: Some(1),
+                ..two_level_config(ceiling, SPLIT_RUN_TARGET, Some(dir.clone()))
+            };
+            let store = ProbeStore::new();
+            seed_inputs(&store, &split_stream_inputs()).await;
+            let (outcome, run) = compact_logged(&store, &config).await;
+            assert!(
+                matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                "{outcome:?}"
+            );
+            let line = run.line("rlog two-level merge");
+            assert_eq!(log_field(&line, "group_size"), 12, "{line}");
+            assert_eq!(log_field(&line, "level2_workers"), 1, "{line}");
+            let runs = log_field(&line, "runs");
+            assert_eq!(runs, 5, "{line}");
+            let estimate = log_field(&line, "stream_estimate_bytes");
+            let run_block = log_field(&line, "run_block_bytes");
+            assert!(
+                estimate <= ceiling && estimate + 3 * run_block > ceiling,
+                "s_20 fits alone, not beside three carried run blocks: {line}"
+            );
+
+            let peaks = run.tracker.level2_worker_peak_bytes();
+            assert_eq!(peaks.len(), 1, "{peaks:?}");
+            assert!(
+                peaks.iter().all(|p| *p > 0 && *p <= ceiling),
+                "{peaks:?} against {ceiling}"
+            );
+            assert_eq!(published_records(&store).await, oracle);
+            let run_blocks = log_field(&line, "run_blocks");
+            assert!(
+                run.report.level2_block_decodes <= run_blocks + 2 * runs,
+                "{} decodes of {run_blocks} run blocks in {runs} runs",
+                run.report.level2_block_decodes
+            );
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
         /// ADR-3853 D5 amendment: a range whose parts outgrow its window is
         /// refused when the part at its window's limit would open, before
         /// that part is encoded, so nothing lands at or past the limit. With
@@ -17907,7 +18448,8 @@ mod tests {
         /// key's indexes times the quantum is refused, naming all three,
         /// before level 2 runs a pass or opens a part.
         #[tokio::test]
-        async fn level2_workers_are_capped_at_the_ranges_and_slots_at_the_key() {
+        async fn level2_workers_are_capped_at_the_ranges_and_a_unit_past_the_key_space_is_refused()
+        {
             let (_, _, per_input) = single_level_oracle().await;
             let dir = fresh_scratch("range-cap");
             let config = range_worker_config(per_input, 8, dir.clone());
@@ -20233,6 +20775,151 @@ mod tests {
             assert_eq!(second.geometry_unsupported, 0, "{second:?}");
             assert_eq!(second_reads.catalog_read.requests, 0, "{second_reads:?}");
             assert_eq!(second_reads.block_read.requests, 0, "{second_reads:?}");
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// Seeds 4 inputs of 4 streams, one record each, into `hour`: a unit
+        /// of 16 records, which fits any part key the refusal tests set.
+        async fn seed_small_hour(store: &dyn ObjectStoreBackend, hour: u32) {
+            for (i, input) in blocked(wide_inputs(4, 4, 1), 4).into_iter().enumerate() {
+                let writer_id = Uuid::from_u128(1_000 + i as u128);
+                let identity = ObjectIdentity {
+                    tenant_hash: tenant_hash().0,
+                    shard: SHARD,
+                    writer_id: writer_id.into_bytes(),
+                    writer_epoch: EPOCH,
+                    writer_seq: 1,
+                };
+                let mut w = RlogWriter::new(input.cfg, identity);
+                for r in &input.records {
+                    w.push(r.clone()).expect("push");
+                }
+                let bytes = Bytes::from(w.finish().expect("finish L0"));
+                seed_l0_object_at(store, writer_id, 1, &input.records, bytes, hour).await;
+            }
+        }
+
+        /// The L1 part objects on `store` in ingest hour `hour`.
+        async fn l1_parts_at(store: &dyn ObjectStoreBackend, hour: u32) -> usize {
+            list_all(store, "t/")
+                .await
+                .expect("list")
+                .into_iter()
+                .filter_map(|m| keys::parse_l1_part_key(&m.key).ok())
+                .filter(|p| p.ingest_hour_bucket == hour)
+                .count()
+        }
+
+        /// ADR-3853 D5 amendment: a unit past the part key space is refused
+        /// as a terminal outcome of the pass, not an error of the run. With a
+        /// part key of 3 indexes and a quantum of 600, the 2,400-record hour
+        /// is refused before a part PUT and writes no compaction record,
+        /// while the next hour of the same shard, 16 records, compacts in the
+        /// same `scan_and_compact` pass and the same maintain tick. The tick
+        /// holds the refused hour terminal in memory, never persisted, and the
+        /// next tick reads neither hour's inputs again.
+        #[tokio::test]
+        async fn a_part_key_space_refusal_is_terminal_and_the_next_hour_compacts() {
+            let config = at_range_quantum(two_level_config(
+                64 << 20,
+                crate::RLOG_RUN_MEMORY_TARGET_BYTES,
+                None,
+            ));
+            let next_hour = HOUR + 1;
+            let now_ns = sealed_now_ns() + NS_PER_HOUR;
+            let seeded = || async {
+                let store = ProbeStore::new();
+                seed_inputs(&store, &two_level_inputs()).await;
+                seed_small_hour(&store, next_hour).await;
+                store
+            };
+
+            let store = seeded().await;
+            PART_KEYS_OVERRIDE.with(|o| o.set(Some(3)));
+            let scanned = crate::scan::scan_and_compact(
+                &store,
+                &FixedClock::new(now_ns),
+                &config,
+                tenant_hash(),
+                Signal::Logs,
+                SHARD,
+            )
+            .await;
+            PART_KEYS_OVERRIDE.with(|o| o.set(None));
+            let scanned = scanned.expect("a part key space refusal does not abort the scan");
+            assert_eq!(scanned.compacted, 1, "the next hour compacted: {scanned:?}");
+            assert_eq!(scanned.geometry_unsupported, 1, "{scanned:?}");
+            assert_eq!(l1_parts_at(&store, HOUR).await, 0, "no part PUT");
+            assert_eq!(compaction_records(&store).await, 0, "no record");
+            assert_eq!(compaction_records_at(&store, next_hour).await, 1);
+            assert!(l1_parts_at(&store, next_hour).await > 0);
+
+            let store = seeded().await;
+            let mut memo = crate::MaintainMemo::new(crate::scan::DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
+            PART_KEYS_OVERRIDE.with(|o| o.set(Some(3)));
+            let (first, first_reads) = maintain_tick_at(&mut memo, &store, &config, now_ns).await;
+            let (second, second_reads) = maintain_tick_at(&mut memo, &store, &config, now_ns).await;
+            PART_KEYS_OVERRIDE.with(|o| o.set(None));
+            let first = first.expect("a part key space refusal does not abort the tick");
+            assert_eq!(first.compacted, 1, "the next hour compacted: {first:?}");
+            assert_eq!(first.geometry_unsupported, 1, "{first:?}");
+            assert_eq!(l1_parts_at(&store, HOUR).await, 0, "no part PUT");
+            assert_eq!(compaction_records(&store).await, 0, "no record");
+            assert_eq!(compaction_records_at(&store, next_hour).await, 1);
+            assert!(first_reads.block_read.requests > 0, "{first_reads:?}");
+            assert_eq!(
+                memo.terminal_state(tenant_hash(), Signal::Logs, SHARD, HOUR),
+                Some(crate::scan::TerminalState::GeometryUnsupported)
+            );
+            assert_eq!(
+                memo.terminal_state(tenant_hash(), Signal::Logs, SHARD, next_hour),
+                Some(crate::scan::TerminalState::Compacted)
+            );
+            assert_eq!(
+                memo.snapshot_entry_count(),
+                1,
+                "the refusal is never persisted"
+            );
+            let second = second.expect("second tick");
+            assert_eq!(second.compacted, 0, "{second:?}");
+            assert_eq!(second.geometry_unsupported, 0, "{second:?}");
+            assert_eq!(second_reads.catalog_read.requests, 0, "{second_reads:?}");
+            assert_eq!(second_reads.block_read.requests, 0, "{second_reads:?}");
+        }
+
+        /// A range window refusal is terminal the same way: the padded hour's
+        /// range 1 is refused at index 4 of a 4-index part key after its
+        /// worker put indexes 2 and 3, nothing is published and no record is
+        /// written, and the next hour compacts in the same tick.
+        #[tokio::test]
+        async fn a_range_window_refusal_is_terminal_and_the_next_hour_compacts() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &padded_tail_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let dir = fresh_scratch("range-window-terminal");
+            let config = CompactorConfig {
+                rlog_range_records: 1_200,
+                rlog_l1_part_memory_target_bytes: Some(4 * RANGE_PART),
+                ..range_worker_config(per_input, 2, dir.clone())
+            };
+            let next_hour = HOUR + 1;
+            let store = ProbeStore::new();
+            seed_inputs(&store, &padded_tail_inputs()).await;
+            seed_small_hour(&store, next_hour).await;
+            let mut memo = crate::MaintainMemo::new(crate::scan::DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
+            PART_KEYS_OVERRIDE.with(|o| o.set(Some(4)));
+            let (first, _) =
+                maintain_tick_at(&mut memo, &store, &config, sealed_now_ns() + NS_PER_HOUR).await;
+            PART_KEYS_OVERRIDE.with(|o| o.set(None));
+            let first = first.expect("a range window refusal does not abort the tick");
+            assert_eq!(first.compacted, 1, "the next hour compacted: {first:?}");
+            assert_eq!(first.geometry_unsupported, 1, "{first:?}");
+            assert_eq!(compaction_records(&store).await, 0, "no record");
+            assert_eq!(compaction_records_at(&store, next_hour).await, 1);
+            assert_eq!(
+                memo.terminal_state(tenant_hash(), Signal::Logs, SHARD, HOUR),
+                Some(crate::scan::TerminalState::GeometryUnsupported)
+            );
             assert!(scratch_entries(&dir).is_empty());
         }
 
