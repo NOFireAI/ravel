@@ -898,13 +898,26 @@ pub const SQL_SPILL_SOURCE_NOFILE_SOFT: &str = "nofile_soft";
 /// retry plans that descriptor budget leaves available.
 pub const SQL_SPILL_SOURCE_DESCRIPTOR_BUDGET: &str = "descriptor_budget";
 
-/// The `sql_spill_retry_modes` value for a descriptor budget of `budget`:
-/// the bucketed retry and the sort-merge fallback when the budget holds the
-/// smallest tuning's descriptors, the sort-merge retry alone otherwise
-/// (issue #4075).
+/// `nofile_soft` as the `nofile_soft` startup line renders it: `unlimited`
+/// for an unbounded limit, which [`crate::nofile::NofileLimit::soft_or_max`]
+/// passes as `u64::MAX`.
 #[cfg(feature = "sql")]
-pub fn sql_spill_retry_modes(budget: u64) -> &'static str {
-    if budget >= ravel_sql::BUCKET_SPILL_MIN_DESCRIPTOR_NEED {
+pub fn render_nofile_soft(nofile_soft: u64) -> String {
+    if nofile_soft == u64::MAX {
+        "unlimited".to_string()
+    } else {
+        nofile_soft.to_string()
+    }
+}
+
+/// The `sql_spill_retry_modes` value for a descriptor budget of `budget`
+/// and a retry exchange of `partitions`: the bucketed retry and the
+/// sort-merge fallback when the budget holds the smallest tuning's
+/// descriptors at that count, `3 x partitions`, the sort-merge retry alone
+/// otherwise (issue #4075).
+#[cfg(feature = "sql")]
+pub fn sql_spill_retry_modes(budget: u64, partitions: usize) -> &'static str {
+    if budget >= ravel_sql::bucket_spill_min_descriptor_need(partitions) {
         "bucket,sort_merge"
     } else {
         "sort_merge"
@@ -984,6 +997,9 @@ pub struct SqlSpillInputs {
     /// [`crate::config::SqlSpillSettings::nofile_soft`], installed on the
     /// executor with `SqlExecutor::with_nofile_soft`.
     pub nofile_soft: u64,
+    /// [`crate::config::SqlSpillSettings::retry_partitions`], the partition
+    /// count the bucketed retry's exchange has.
+    pub retry_partitions: usize,
 }
 
 #[cfg(feature = "sql")]
@@ -996,6 +1012,7 @@ impl Default for SqlSpillInputs {
             merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
             merge_fan_in_passed: false,
             nofile_soft: crate::config::DEFAULT_SQL_NOFILE_SOFT,
+            retry_partitions: crate::config::DEFAULT_SQL_RETRY_PARTITIONS,
         }
     }
 }
@@ -1072,14 +1089,17 @@ impl ResolvedSqlSpill {
                     setting = "sql_spill_retry_descriptor_budget",
                     value = budget,
                     source = SQL_SPILL_SOURCE_NOFILE_SOFT,
-                    nofile_soft = inputs.nofile_soft,
+                    nofile_soft = %render_nofile_soft(inputs.nofile_soft),
                     slots,
                     "performance default resolved"
                 );
                 tracing::info!(
                     setting = "sql_spill_retry_modes",
-                    value = sql_spill_retry_modes(budget),
+                    value = sql_spill_retry_modes(budget, inputs.retry_partitions),
                     source = SQL_SPILL_SOURCE_DESCRIPTOR_BUDGET,
+                    partitions = inputs.retry_partitions,
+                    least_descriptor_need =
+                        ravel_sql::bucket_spill_min_descriptor_need(inputs.retry_partitions),
                     "performance default resolved"
                 );
             }
@@ -1414,6 +1434,7 @@ fn prepare_sql_spill_with(
         merge_fan_in: settings.merge_fan_in,
         merge_fan_in_passed: settings.merge_fan_in_passed,
         nofile_soft: settings.nofile_soft,
+        retry_partitions: settings.retry_partitions,
     };
     let resolved = resolve_sql_spill(&inputs, env_dir, env_quota)?;
     resolved.emit(&inputs);
@@ -1546,6 +1567,7 @@ fn prepare_cwd_spill(
         merge_fan_in: settings.merge_fan_in,
         merge_fan_in_passed: settings.merge_fan_in_passed,
         nofile_soft: settings.nofile_soft,
+        retry_partitions: settings.retry_partitions,
     };
     let resolved = match resolve_sql_spill(&inputs, None, None) {
         Ok(resolved) => resolved,
@@ -3817,6 +3839,7 @@ mod tests {
             merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
             merge_fan_in_passed: false,
             nofile_soft: crate::config::DEFAULT_SQL_NOFILE_SOFT,
+            retry_partitions: crate::config::DEFAULT_SQL_RETRY_PARTITIONS,
         }
     }
 
@@ -4671,6 +4694,7 @@ mod tests {
                 merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
                 merge_fan_in_passed: false,
                 nofile_soft: crate::config::DEFAULT_SQL_NOFILE_SOFT,
+                retry_partitions: crate::config::DEFAULT_SQL_RETRY_PARTITIONS,
             }),
             None,
             "off in the inputs wins over a cache dir in the same inputs"
@@ -4886,15 +4910,22 @@ mod tests {
         state.executor
     }
 
-    /// Issue #4075: a statement the process memory budget refuses at seven
+    /// Rows in [`the_server_built_executor_retries_through_buckets`]'s
+    /// fixture: one group each, so each of its two final partitions holds
+    /// far more than the 65,536 groups one bucket answers in memory, while
+    /// the unlimited run stays inside the default per-query limit.
+    const RETRY_ROWS: i64 = 2_000_000;
+
+    /// Issue #4075: a statement the process memory budget refuses at nine
     /// tenths of its unlimited peak, on the server-built executor, retries
     /// through the bucketed final aggregate, with the `--cache-dir` spill
-    /// area and the default soft open-file limit `start` installs, and its
-    /// retry INFO line reads `retry_plan="bucket"` with the derived tuning.
-    /// The bucketed rule itself stays off (`bucketed_final_aggregation`
-    /// false), so the buckets come from the retry alone. The same statement
-    /// on inputs carrying a soft limit of 1 keeps the sort-merge retry for
-    /// its descriptor budget.
+    /// area and a raised soft open-file limit on the inputs: at least
+    /// one routing bit, rows spilled to buckets and every one read back, the
+    /// exec at the INFO line's tuning, and the unlimited answer. The bucketed
+    /// rule itself stays off (`bucketed_final_aggregation` false), so the
+    /// buckets come from the retry alone. The same statement on inputs
+    /// carrying a soft limit of 1 keeps the sort-merge retry for its
+    /// descriptor budget and still answers.
     ///
     /// Prove-the-test: drop `.with_nofile_soft(spill.nofile_soft)` from
     /// `build_sql_state_inner` and the soft-limit-1 run still reads
@@ -4924,9 +4955,12 @@ mod tests {
 
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let tenant = ravel_types::TenantId::new("acme".to_string());
-        let records: Vec<_> = (0..6_000i64)
+        let first = crate::tests::sql_log_record(1, "retry");
+        let records: Vec<_> = (0..RETRY_ROWS)
             .map(|i| {
-                let mut record = crate::tests::sql_log_record(i + 1, "retry");
+                let mut record = first.clone();
+                record.ts_ns = i + 1;
+                record.observed_ts_ns = i + 1;
                 record
                     .attrs
                     .push(("a".to_string(), ravel_logseg::AttrValue::I64(i)));
@@ -4972,9 +5006,18 @@ mod tests {
             .await
             .expect("the unlimited run answers");
         assert_eq!(unlimited.stats.spill_retries, 0);
+        let expected = rows(&unlimited);
+        assert_eq!(expected.len(), RETRY_ROWS as usize);
         let peak = unlimited.accounting.peak_intermediate_bytes;
 
-        let refused = retry_executor(&store, &startup.inputs, peak * 7 / 10);
+        // A raised soft limit, as `main` installs on a host that raised it:
+        // Linux's default of 1024 leaves too few descriptors for the bits
+        // this fixture needs.
+        let raised = SqlSpillInputs {
+            nofile_soft: 1 << 16,
+            ..startup.inputs.clone()
+        };
+        let refused = retry_executor(&store, &raised, peak * 9 / 10);
         let (capture, guard) = capture_info();
         let retried = refused.execute(tenant.hash(), &request).await;
         drop(guard);
@@ -4991,10 +5034,17 @@ mod tests {
             .spill_retry
             .as_ref()
             .expect("the retry reports");
+        assert_eq!(
+            (report.retry_plan, report.retry_plan_reason),
+            ("bucket", None),
+            "{report:?}"
+        );
         let bits = report.bits.expect("a bucket retry derives bits");
         let chunk_rows = report
             .routed_chunk_rows
             .expect("a bucket retry derives routed_chunk_rows");
+        assert!(bits >= 1, "{report:?}");
+        assert_ne!((bits, chunk_rows), (6, 8192), "the placeholder's tuning");
         for field in [
             " retry_plan=\"bucket\"".to_string(),
             " retry_plan_reason=\"none\"".to_string(),
@@ -5003,25 +5053,45 @@ mod tests {
         ] {
             assert!(info[0].contains(&field), "{field} on {}", info[0]);
         }
+        assert!(report.bucket_spill_bytes_written > 0, "{report:?}");
+        assert!(report.bucket_spill_rows_written > 0, "{report:?}");
+        assert_eq!(
+            report.bucket_spill_rows_read, report.bucket_spill_rows_written,
+            "{report:?}"
+        );
         let plan = retried
             .stats
             .spill_retry_plan
             .as_deref()
             .expect("the retry plan is kept");
-        assert!(plan.contains("BucketedFinalAggregateExec:"), "{plan}");
-        assert_eq!(rows(&retried), rows(&unlimited));
-        assert_eq!(rows(&unlimited).len(), 6_000);
+        let execs: Vec<&str> = plan
+            .lines()
+            .filter(|line| line.contains("BucketedFinalAggregateExec:"))
+            .collect();
+        assert!(!execs.is_empty(), "{plan}");
+        for exec in execs {
+            assert!(
+                exec.contains(&format!("bits={bits}, routed_chunk_rows={chunk_rows},")),
+                "the exec runs at the INFO line's tuning: {exec}"
+            );
+        }
+        assert_eq!(rows(&retried), expected);
 
         // The soft limit the inputs carry is the one the retry divides.
         let short = SqlSpillInputs {
             nofile_soft: 1,
             ..startup.inputs.clone()
         };
-        let refused = retry_executor(&store, &short, peak * 7 / 10);
+        // Nineteen twentieths: the fetched object's process reservation sits
+        // beside the sort-merge retry's own, and at nine tenths the two
+        // together exceed the budget.
+        let refused = retry_executor(&store, &short, peak * 19 / 20);
         let (capture, guard) = capture_info();
-        let _ = refused.execute(tenant.hash(), &request).await;
+        let retried = refused.execute(tenant.hash(), &request).await;
         drop(guard);
         let lines = capture.0.lock().clone();
+        let retried =
+            retried.unwrap_or_else(|e| panic!("the sort-merge retry answers: {e}\n{lines:?}"));
         let info: Vec<&String> = lines
             .iter()
             .filter(|line| line.contains("SQL statement retried with spill"))
@@ -5033,6 +5103,17 @@ mod tests {
             "{}",
             info[0]
         );
+        let report = retried
+            .stats
+            .spill_retry
+            .as_ref()
+            .expect("the retry reports");
+        assert_eq!(
+            (report.retry_plan, report.retry_plan_reason),
+            ("sort_merge", Some("descriptor_budget")),
+            "{report:?}"
+        );
+        assert_eq!(rows(&retried), expected);
     }
 
     /// The startup lines: `sql_spill_dir`, `sql_spill_max_bytes`,
@@ -5197,13 +5278,16 @@ mod tests {
     }
 
     /// `sql_spill_retry_modes` names the bucketed retry only while the
-    /// descriptor budget holds the smallest tuning's need, and the budget
-    /// line divides the soft limit by twice the share count: 1024 over four
-    /// shares is 128, and a soft limit of 11 over two shares is 2, below the
-    /// need of 3, which leaves the sort-merge retry alone.
+    /// descriptor budget holds the smallest tuning's need at the retry's 16
+    /// exchange partitions, `3 x 16 = 48`, and the budget line divides the
+    /// soft limit by twice the share count: 1024 over four shares is 128, a
+    /// soft limit of 192 over two shares is exactly 48, and 191 over two
+    /// shares is 47, one below the need, which leaves the sort-merge retry
+    /// alone. An unbounded soft limit reads `unlimited`, as the `nofile_soft`
+    /// line does.
     ///
-    /// Prove-the-test: compare against 1 instead of
-    /// `BUCKET_SPILL_MIN_DESCRIPTOR_NEED` and the 11-descriptor row reads
+    /// Prove-the-test: have `sql_spill_retry_modes` compare against one
+    /// partition's need of 3 and the 191-descriptor row reads
     /// `bucket,sort_merge`.
     #[test]
     fn the_retry_modes_line_follows_the_descriptor_budget() {
@@ -5217,10 +5301,24 @@ mod tests {
                 "bucket,sort_merge",
             ),
             (
-                "short soft limit",
-                11,
+                "exactly the need",
+                192,
                 "17179869184",
-                " value=2 source=\"nofile_soft\" nofile_soft=11 slots=2",
+                " value=48 source=\"nofile_soft\" nofile_soft=192 slots=2",
+                "bucket,sort_merge",
+            ),
+            (
+                "unbounded soft limit",
+                u64::MAX,
+                "34359738368",
+                " value=2305843009213693951 source=\"nofile_soft\" nofile_soft=unlimited slots=4",
+                "bucket,sort_merge",
+            ),
+            (
+                "one below the need",
+                191,
+                "17179869184",
+                " value=47 source=\"nofile_soft\" nofile_soft=191 slots=2",
                 "sort_merge",
             ),
         ] {
@@ -5247,7 +5345,10 @@ mod tests {
             );
             let modes_line = resolved_line(&lines, "sql_spill_retry_modes");
             assert!(
-                modes_line.contains(&format!(" value={modes:?} source=\"descriptor_budget\"")),
+                modes_line.contains(&format!(
+                    " value={modes:?} source=\"descriptor_budget\" partitions=16 \
+                     least_descriptor_need=48"
+                )),
                 "{label}: {modes_line}"
             );
         }
@@ -5305,6 +5406,7 @@ mod tests {
                     merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
                     merge_fan_in_passed: false,
                     nofile_soft: crate::config::DEFAULT_SQL_NOFILE_SOFT,
+                    retry_partitions: crate::config::DEFAULT_SQL_RETRY_PARTITIONS,
                 },
                 env_dir,
                 env_dir.map(|_| std::ffi::OsStr::new("4096")),
@@ -5653,6 +5755,7 @@ mod tests {
             merge_fan_in: crate::config::DEFAULT_SQL_SPILL_MERGE_FAN_IN,
             merge_fan_in_passed: false,
             nofile_soft: crate::config::DEFAULT_SQL_NOFILE_SOFT,
+            retry_partitions: crate::config::DEFAULT_SQL_RETRY_PARTITIONS,
         }
     }
 

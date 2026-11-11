@@ -1288,6 +1288,10 @@ pub(crate) struct BudgetShare {
     /// refused without that lock, so they are read just after it. On the
     /// process budget it is at most `budget_reserved`.
     pub(crate) own: u64,
+    /// The refusing budget's limit: the tenant limit on a tenant refusal, the
+    /// process budget's limit on a process or reserve-ahead refusal.
+    /// `u64::MAX` when that budget is unbounded.
+    pub(crate) limit: u64,
 }
 
 impl BudgetShare {
@@ -1295,10 +1299,11 @@ impl BudgetShare {
     /// with `own` capped at `sql_reserved`, since the two are read apart and
     /// a stale read can put `own` above it. A pool whose own bytes reach the
     /// whole SQL share holds all of it.
-    pub(crate) fn of_sql_share(sql_reserved: u64, own: u64) -> Self {
+    pub(crate) fn of_sql_share(sql_reserved: u64, own: u64, limit: u64) -> Self {
         BudgetShare {
             budget_reserved: sql_reserved,
             own: own.min(sql_reserved),
+            limit,
         }
     }
 }
@@ -2006,6 +2011,7 @@ impl TenantDelegatingPool {
                     refused.sql_reserved,
                     (self.query_used.load(Ordering::Acquire) as u64)
                         .saturating_add(refused.pool_on_budget),
+                    refused.exhausted.limit,
                 )
             });
             return Err(DataFusionError::ResourcesExhausted(format!(
@@ -2241,6 +2247,7 @@ impl TenantDelegatingPool {
                     Some(BudgetShare {
                         budget_reserved: *used as u64,
                         own: charged,
+                        limit: self.tenant.limit() as u64,
                     }),
                 ),
                 GrowRefused::Process {
@@ -2258,6 +2265,7 @@ impl TenantDelegatingPool {
                                 &self.tenant.budget,
                                 self.pool_id,
                             )),
+                            exhausted.limit,
                         )
                     });
                     (kind, share)
@@ -4874,6 +4882,7 @@ pub(crate) mod tests {
                 share: Some(BudgetShare {
                     budget_reserved: 900,
                     own: 300,
+                    limit: 1000,
                 }),
             })
         );
@@ -4899,6 +4908,7 @@ pub(crate) mod tests {
                 share: Some(BudgetShare {
                     budget_reserved: 800,
                     own: 600,
+                    limit: 1000,
                 }),
             })
         );
@@ -4948,6 +4958,7 @@ pub(crate) mod tests {
                 share: Some(BudgetShare {
                     budget_reserved: 600,
                     own: 100,
+                    limit: 650,
                 }),
             })
         );

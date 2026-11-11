@@ -87,8 +87,8 @@
 //!
 //! # Bucket spill (ADR-3565 amendment 2)
 //!
-//! [`BucketedFinalAggregateExec::with_spill`] is the mode the refusal retry is
-//! to run the exec in; nothing outside tests sets it until T3 #4075 wires it.
+//! [`BucketedFinalAggregateExec::with_spill`] is the mode a refusal retry
+//! planned as bucketed runs the exec in, at the tuning the retry derived.
 //! With it, and a disk manager that allows temp files, the consumer
 //! registers `with_can_spill(true)` and a refused charge is a spill trigger
 //! instead of an error. The stream writes every chunk it retains, for
@@ -444,9 +444,14 @@ pub(crate) struct BucketSpillFigures {
     pub(crate) bits: u8,
     pub(crate) routed_chunk_rows: usize,
     pub(crate) bytes_read: u64,
+    /// The state rows they read back from their scratch files.
+    pub(crate) rows_read: u64,
     /// Whether any of them executed with a disk manager that allows temp
     /// files ([`BucketedFinalAggregateExec::spill_available`]).
     pub(crate) disk: bool,
+    /// Whether any partition of them executed: `execute` registers their
+    /// metrics.
+    pub(crate) executed: bool,
 }
 
 /// [`BucketSpillFigures`] of `plan`, or `None` when no bucketed exec in it
@@ -464,27 +469,30 @@ fn collect_bucket_spill_figures(
     if let Some(exec) = plan.downcast_ref::<BucketedFinalAggregateExec>()
         && exec.spill()
     {
-        let bytes_read = plan.metrics().map_or(0, |metrics| {
+        let metrics = exec.metrics.clone_inner();
+        let counted = |counter: &str| -> u64 {
             metrics
                 .iter()
                 .filter_map(|metric| match metric.value() {
-                    MetricValue::Count { name, count }
-                        if name.as_ref() == BUCKET_SPILL_BYTES_READ =>
-                    {
+                    MetricValue::Count { name, count } if name.as_ref() == counter => {
                         Some(count.value() as u64)
                     }
                     _ => None,
                 })
                 .sum()
-        });
+        };
         let figures = found.get_or_insert(BucketSpillFigures {
             bits: exec.config.bits,
             routed_chunk_rows: exec.config.routed_chunk_rows,
             bytes_read: 0,
+            rows_read: 0,
             disk: false,
+            executed: false,
         });
-        figures.bytes_read += bytes_read;
+        figures.bytes_read += counted(BUCKET_SPILL_BYTES_READ);
+        figures.rows_read += counted(BUCKET_SPILL_ROWS_READ);
         figures.disk |= exec.spill_available();
+        figures.executed |= metrics.iter().next().is_some();
     }
     for child in plan.children() {
         collect_bucket_spill_figures(child, found);

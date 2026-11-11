@@ -4,8 +4,8 @@
 //! A bucketed spill retry holds two descriptors per bucket file, and the
 //! bucket spill derivation (`ravel_sql::derive_bucket_spill_tuning`) returns
 //! no tuning when that need exceeds a share of the soft `RLIMIT_NOFILE` it is
-//! given. Nothing in the server passes it this limit yet: wiring the
-//! derivation into the spill retry is T3 #4075. Service managers and
+//! given; the SQL executor's spill retry reads it from
+//! [`NofileLimit::soft_or_max`]. Service managers and
 //! container runtimes commonly leave the soft limit at 1,024 under a far
 //! higher hard limit, so the server raises its soft limit to the hard limit
 //! at startup and logs both. After a raise the soft limit equals the hard
@@ -83,7 +83,7 @@ fn resolve(before: Rlimit, set: impl FnOnce(Rlimit) -> Result<(), Errno>) -> Nof
 
 impl NofileLimit {
     /// The soft limit in the form the bucket spill derivation's `nofile_soft`
-    /// takes, `u64::MAX` for unbounded. It has no caller yet (T3 #4075).
+    /// takes, `u64::MAX` for unbounded.
     pub fn soft_or_max(&self) -> u64 {
         self.soft.unwrap_or(u64::MAX)
     }
