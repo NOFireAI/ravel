@@ -1232,9 +1232,11 @@ group and keep the retry.
 <!-- amendment-applies: sections="Amendment (2026-11-07): spill only after a refusal, shared scratch, and spill on by default (issue #3899)" pointer="parallel bucket spill amendment" -->
 
 Status of this amendment: Accepted as a plan. Refs: #4073, epic #4072.
-The code is T2 (#4074); the measurement is T3 (#4075). ADR-3565's bucket
-spill amendment is the other half of this decision: this one decides what
-the retry plans, that one decides how the bucketed final aggregate spills.
+The exec's spill, the derivation and its inputs are T2 (#4074); the retry
+that plans with them, and the M8 measurement, are T3 (#4075). ADR-3565's
+bucket spill amendment is the other half of this decision: this one
+decides what the retry plans, that one decides how the bucketed final
+aggregate spills.
 
 ### Parallel bucket spill context
 
@@ -1271,8 +1273,8 @@ This is the parallel bucket spill amendment. The figures are from epic
 
 1. **The retry keeps the hash exchange for a shape the bucketed rule
    admits, and only for that shape.** The retry's session is first planned
-   with the first attempt's repartition settings (`session.rs:658`,
-   `with_repartition_aggregations`, and `session.rs:698`, round-robin
+   with the first attempt's repartition settings (`session.rs:678`,
+   `with_repartition_aggregations`, and `session.rs:718`, round-robin
    repartition), with `BucketedFinalAggregateRule` installed whatever
    `SqlConfig::bucketed_final_aggregation` says. The rule is installed at a
    placeholder tuning, ADR-3565 decision 1's defaults, because the tuning
@@ -1283,11 +1285,20 @@ This is the parallel bucket spill amendment. The figures are from epic
    by a plan transform that rebuilds only those nodes. A transform rather
    than a re-plan, so the plan that runs is the plan `P` and `C` were read
    from; the placeholder plan never executes. ADR-3565's bucket spill
-   amendment, item 4, states the steps, and T3 #4075 pins the order. That
-   plan is kept when all of these hold:
+   amendment, item 4, states the steps.
+   `bucket_spill_retry_matches_unspilled_answer`
+   (`crates/ravel-sql/tests/bucketed_final_aggregate.rs`) pins that the
+   plan which ran carries the derived tuning: its bucketed execs print the
+   `bits` and `routed_chunk_rows` the INFO line reports, and those are not
+   the placeholder's 6 and 8192. The derivation's
+   limit is the retry's effective limit, sized by the budget that refused
+   the first attempt (that amendment, item 4), and the kept plan runs in a
+   pool whose per-query limit is that effective limit; the sort-merge
+   retry runs at the per-query limit as before. That plan is kept when all
+   of these hold:
    - every `AggregateExec` in it with mode `FinalPartitioned` was replaced
      by a `BucketedFinalAggregateExec`, which is to say
-     `BucketedFinalAggregateRule::admits` (`bucketed_final_aggregate.rs:228`)
+     `BucketedFinalAggregateRule::admits` (`bucketed_final_aggregate.rs:239`)
      accepted each one;
    - every `RepartitionExec` in it has `preserve_order` false;
    - the bucket spill amendment's derivation returns a tuning, which
@@ -1295,7 +1306,7 @@ This is the parallel bucket spill amendment. The figures are from epic
      item 1).
 
    Otherwise the retry is planned as today, repartition-free
-   (`repartition_free`, `session.rs:737`), and spills through the sort
+   (`repartition_free`, `session.rs:757`), and spills through the sort
    merge at fan-in 2. Statements outside the fixed-width set (rows 17 to
    19, 34 and 35, among others) keep today's retry. The first attempt is
    unchanged in every case: with the switch off its plan has no bucketed
@@ -1310,17 +1321,22 @@ This is the parallel bucket spill amendment. The figures are from epic
    above a non-preserve-order exchange may rely on that order, spilled or
    not, because the in-memory channel already interleaves its inputs in
    arbitrary order. That classifies the exchange spill the 2026-11-07
-   rejected alternative left open, for this plan shape only. None of this
-   item is in the retry yet: T2 #4074 ships the exec's spill, the
-   derivation and its inputs, and nothing in the retry plans with them.
-   The retry planning above, and its tests, are T3 #4075 deliverables: a
-   test that the retry of an admitted shape plans the bucketed exchange, a
-   test that an unadmitted shape keeps the sort-merge retry, and a
-   differential test of the retry's answer against the unspilled run at
-   2, 4 and 16 partitions (at 1 partition the rule plans no bucketed
-   exec). What T2 pins is the exec's half: ADR-3565's bucket spill
-   amendment, item 6, runs the exec built with spill on against the
-   unspilled answer at those partition counts.
+   rejected alternative left open, for this plan shape only. T2 #4074
+   shipped the exec's spill, the derivation and its inputs; T3 #4075
+   ships the retry planning above. Its tests are in
+   `crates/ravel-sql/tests/bucketed_final_aggregate.rs`:
+   `bucket_spill_retry_matches_unspilled_answer` (the retry of an admitted
+   shape runs the hash exchange over bucketed execs that spilled, and
+   answers as the unspilled run does),
+   `retry_keeps_sort_merge_for_unadmitted_shape` (a string-keyed aggregate
+   keeps the sort-merge retry, with no exchange and no bucketed exec in
+   its plan), `bucket_spill_retry_answers_at_2_4_and_16_partitions` (the
+   retry's answer against the unspilled run at 2, 4 and 16 partitions; at
+   1 partition the rule plans no bucketed exec) and
+   `retry_refuses_an_order_preserving_exchange` (a candidate whose
+   exchange preserves order derives no tuning). T2 pins the exec's half:
+   ADR-3565's bucket spill amendment, item 6, runs the exec built with
+   spill on against the unspilled answer at those partition counts.
 
 2. **How the exchange's memory is bounded under the spill-mode pool.**
    Cited to DataFusion 55.2.0, `datafusion-physical-plan`
@@ -1328,7 +1344,7 @@ This is the parallel bucket spill amendment. The figures are from epic
    - Each output partition registers its own consumer,
      `RepartitionExec[p]`, with `with_can_spill(true)` (lines 495-499). In
      the retry's pool that makes it subject to `spill_cap_admit`
-     (`crates/ravel-sql/src/memory.rs:1703-1725`): a grow is admitted only
+     (`crates/ravel-sql/src/memory.rs:1708-1730`): a grow is admitted only
      while the consumer stays within its fair share `(L - H) / n`, `n` the
      spill-capable consumers registered, and the spill-capable total stays
      within the hard bound `L - H/2`.
@@ -1348,9 +1364,9 @@ This is the parallel bucket spill amendment. The figures are from epic
    - Exchange spill files are written through the session's disk manager,
      so they count against the same `max_temp_directory_size` as every other
      spill file (`datafusion-execution` 55.2.0 `src/disk_manager.rs:478-500`;
-     Ravel sets that quota from the reserved share at `session.rs:626-629`).
+     Ravel sets that quota from the reserved share at `session.rs:628-631`).
      A quota trip is the typed `spill_budget_exhausted` (`spill_error`,
-     `executor.rs:6478-6499`).
+     `executor.rs:6882-6903`).
    - Uncharged: the `SharedCoalescer` on each output partition holds fewer
      than `batch_size` rows before `send` (lines 269-300, created at
      537-545), and the reader holds the one batch it read back. So the
@@ -1365,20 +1381,24 @@ This is the parallel bucket spill amendment. The figures are from epic
      drain, and they are reported as their own phase (item 4), not assumed
      to be zero.
 
-   No test pins this item yet, because no retry plans the exchange under
-   the spill-mode pool until T3. Its test is a T3 #4075 deliverable: the
-   90%-one-key fixture at a share small enough to make the exchange spill,
-   asserting a nonzero exchange spill count, a peak charge within the
-   share, and the answer of the unspilled run.
+   No test pins this item: none of the retry tests T3 #4075 added
+   asserts on the exchange's spill figures. Issue #4113 tracks the test:
+   the 90%-one-key fixture at a share small enough to make the exchange
+   spill, asserting a nonzero exchange spill count, a peak charge within
+   the share, and the answer of the unspilled run. Until it lands the
+   only check on this path is the M8 gate's exchange row below.
 
 3. **No third attempt.** The kept plan runs as the statement's one spill
    retry. Its failure is terminal: `spill_retry_decision` returns no retry
-   once `spill_retried` is set (`executor.rs:6721-6738`), and this
+   once `spill_retried` is set (`executor.rs:7125-7142`), and this
    amendment adds no fallback to the sort-merge plan after a bucketed
    retry fails. A bucketed retry fails with one of the typed errors
-   ADR-3565's bucket spill amendment lists. Its test, that a failed
-   bucketed retry is the statement's error with no third attempt, is a
-   T3 #4075 deliverable, since no retry is bucketed before T3.
+   ADR-3565's bucket spill amendment lists. Its test is
+   `a_failed_bucketed_retry_is_the_statements_error`
+   (`crates/ravel-sql/tests/bucketed_final_aggregate.rs`): a bucketed
+   retry the process budget refuses returns that refusal, its INFO line
+   reads `outcome="failed"` and `retry_refusal="process_budget"`, and the
+   store's GET count on the data object is two, one per attempt.
 
 4. **Counters, per phase.** `SpillRetryReport` (`executor.rs`) and its
    INFO line gain:
@@ -1390,9 +1410,21 @@ This is the parallel bucket spill amendment. The figures are from epic
      metrics of every `RepartitionExec` in the plan, read through
      `accumulate_spill_counts` (`spill.rs:815`) as today's per-operator
      figures are;
-   - `bucket_spill_bytes_written`, `bucket_spill_bytes_read` and
-     `bucket_spill_rows_written`: the bucketed exec's own counters
-     (ADR-3565 bucket spill amendment, item 7).
+   - `bucket_spill_bytes_written`, `bucket_spill_bytes_read`,
+     `bucket_spill_rows_written` and `bucket_spill_rows_read`: the
+     bucketed exec's own counters (ADR-3565 bucket spill amendment,
+     item 7);
+   - the derivation's inputs, so the tuning can be recomputed from the
+     line: `effective_limit_bytes`, `first_attempt_asked_bytes` (`A`),
+     `first_attempt_consumed_rows` (`n`), `scan_rows_total` (`N`),
+     `spillable_consumers` (`C`), `final_partitions` (`P`) and the derived
+     `descriptor_need`;
+   - `retry_peak_asked_bytes`, the retry pool's peak asked bytes, and
+     `retry_refusal`, what failed the retry: a memory refusal's log name,
+     `bucket_spill_undershoot` or `other`, and `none` when it answered.
+
+   `the_spill_retry_logs_one_info_line_with_its_figures` (`executor.rs`)
+   pins the line's field names and values.
 
    Every written-bytes figure here counts bytes in spill files on local
    scratch: Arrow IPC after lz4_frame, framing included, which is what
@@ -1409,16 +1441,18 @@ This is the parallel bucket spill amendment. The figures are from epic
    (`spill_retry_report_splits_exchange_and_bucket_bytes`, which asserts
    each phase's figure exactly on a fixture and that they sum to the
    total, and that a bucketed exec without a temp-file disk manager
-   reports `bucket_without_disk`). A production report carries no bucketed
-   figures until T3 #4075 runs the bucketed retry:
+   reports `bucket_without_disk`). A production report carries bucketed
+   figures only for a statement whose retry T3 #4075 planned bucketed:
    `bucket_spill_figures` reads only an exec built with spill on
-   (`bucketed_final_aggregate.rs:452-453`), and nothing outside tests
-   builds one.
+   (`bucketed_final_aggregate.rs:469-470`), and outside tests only the
+   retry builds one: its session's rule (`session.rs:1043-1047`) and its
+   plan transform (`with_bucket_spill_tuning`,
+   `bucket_spill_tuning.rs:424-442`).
 
 5. **The ADR-1195 partition floor.** The kept plan is built by the same
    physical optimizer rules in the same order as the first attempt, so
    `FinalExchangeFloor` (`exchange_floor.rs:59`, installed at
-   `session.rs:900`) raises its derived hash exchange to
+   `session.rs:974`) raises its derived hash exchange to
    `first_attempt_min_partitions`, 16 by default, as on the first attempt.
    The retry's final partition count `P` is therefore the first attempt's.
    `P` does not change the bucket spill's disk bytes: each routed row is
@@ -1427,8 +1461,8 @@ This is the parallel bucket spill amendment. The figures are from epic
    derivation divides by; ADR-3565's bucket spill amendment counts them.
    ADR-1195's floor amendment, item 2, states that the retry is
    repartition-free and has no exchange to widen. For the shapes item 1
-   admits that stops being true once T3 #4075 plans the bucketed
-   exchange in the retry; ADR-1195's item 2 carries the correction.
+   admits that is no longer true: T3 #4075 plans the bucketed exchange in
+   the retry, and ADR-1195's item 2 carries the correction.
 
 ### Parallel bucket spill rejected alternatives
 
@@ -1450,22 +1484,29 @@ This is the parallel bucket spill amendment. The figures are from epic
 
 T3 (#4075) runs the M8 gate on the three ClickBench boxes, c6a.large,
 c6a.xlarge and c6a.2xlarge. Every row is a prediction made before the code
-exists; T3 pre-registers it on #4072 with these bands before it runs. Each
-figure must be present exactly once and inside its band; anything else is
-a miss, so no row leaves a gap between its band and its miss.
+exists; T3 pre-registered it on #4072 with these bands (comment
+6781670235, with the effective limit's addendum in comment 6783548535)
+before any box was launched. Each figure must be present exactly once and
+inside its band; anything else is a miss, so no row leaves a gap between
+its band and its miss.
 
 M8's arms are runs still to be produced. Each machine gets one box. On it
-the build is the main SHA carrying T2 #4074 and T3 #4075, and the data is
-loaded by that build. The arms run in this order, and all are
-pre-registered on #4072 before the first one launches:
+the build is the tree carrying T2 #4074 and T3 #4075, and the data is
+loaded by that build. The pre-registration lets the measured tree differ
+from the merged one only in test sources: a difference in any other file
+under `crates/` or `services/` invalidates the run. The arms run in this
+order:
 
-1. Arm N: the ClickBench entry's own run of that build at stock flags.
-2. Arm O: the published v0.28.0 ravel-server, its binary checked against
-   the release's SHA256SUMS, through the bot's 43 x 3 cycle (for each
-   statement: stop the server, drop caches, start it, 3 tries) on the same
-   box and data.
-3. Four concurrent windows, interleaved v0.28.0, new, new, v0.28.0: 10
-   connections, 600 s each, seed `clickbench`.
+1. Arm N, on every box: the ClickBench entry's own run of that build at
+   stock flags.
+2. Arm O, on c6a.xlarge only: the published v0.28.0 ravel-server, its
+   binary checked against the release's SHA256SUMS, through the bot's
+   43 x 3 cycle (for each statement: stop the server, drop caches, start
+   it, 3 tries) on the same box and data. The pre-registration dropped it
+   from the other two boxes (owner decision, 2026-11-10), because the one
+   statement the hot-time row sends to arm O is on c6a.xlarge.
+3. Four concurrent windows, on every box, interleaved v0.28.0, new, new,
+   v0.28.0: 10 connections, 600 s each, seed `clickbench`.
 
 The null rows compare arm N against the M7 build, c752b054a, run on the
 same machine (run `m7-main-c752b054a-20261110T0800Z`). The hot-time row
@@ -1488,9 +1529,10 @@ repository's kit does not (`benchmarks/clickbench/kit/box/run.sh`
 `launch_server` execs the binary unchanged), and neither does a service
 unit with the common soft limit of 1,024. So T2 (#4074) makes ravel-server
 raise its own soft `nofile` limit to the hard limit at startup and log
-both values. Nothing reads the raised limit yet: passing it into the
-descriptor budget is a T3 #4075 deliverable, and that is what will make
-the bucketed retry reachable outside the entry. M7 did not record the
+both values. T3 #4075 passes the raised limit into the descriptor budget
+(`budgets.sql_spill.nofile_soft = nofile.soft_or_max()`,
+`services/ravel-server/src/main.rs:684`), which is what makes the
+bucketed retry reachable outside the entry. M7 did not record the
 hard limit on these Ubuntu 24.04 boxes. T3 stamps each box's soft limit,
 from that startup line, beside its run and requires at least 8,320 on
 every box. A box stamped below that has failed a
@@ -1516,9 +1558,10 @@ miss, not a precondition's.
 
 ### Parallel bucket spill consequences
 
-- Once T3 #4075 wires the retry, a statement the bucketed rule admits,
-  refused on its first attempt, retries as `P` bucketed final streams under a hash exchange instead of
-  one sort-merge stream. Its spill is written once (ADR-3565 bucket spill
+- With T3 #4075's retry, a statement the bucketed rule admits, refused on
+  its first attempt, retries as `P` bucketed final streams under a hash
+  exchange instead of one sort-merge stream, when the derivation returns
+  a tuning. Its spill is written once (ADR-3565 bucket spill
   amendment), so its retry writes the routed state's bytes instead of the
   merge's repeated passes.
 - Every other statement's retry is today's.
@@ -1526,7 +1569,7 @@ miss, not a precondition's.
   scratch quota and is reported on its own counter.
 - Production: the store is S3 and the spill root sits under `--cache-dir`
   when one is set (`<cache_dir>/sql-spill/<instance_id>`,
-  `crates/ravel-sql/src/config.rs:195`, per the cache-dir spill default
+  `crates/ravel-sql/src/config.rs:196`, per the cache-dir spill default
   amendment), so spill shares a volume with the read-cache tier. The
   write-once bound limits the write bandwidth a retry takes from that tier
   the same way it limits what row 33 takes from the local object store's
