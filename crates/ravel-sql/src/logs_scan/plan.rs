@@ -1011,6 +1011,7 @@ impl PlanCounts {
     /// block prune). The scan's rows-consumed counter
     /// ([`super::METRIC_ROWS_CONSUMED`]) takes these once, from partition 0,
     /// and each unit's own [`OwnedSeg::rows`] when its partition finishes it.
+    /// Sums are checked and saturate at `u64::MAX`.
     pub(super) fn unpublished_rows(&self, segments: &[SegmentRef]) -> u64 {
         segments
             .iter()
@@ -1019,12 +1020,18 @@ impl PlanCounts {
                 let published = if self.is_unplanned(seg_idx) {
                     seg.sample_count
                 } else {
-                    self.planned(seg_idx)
-                        .map_or(0, |planned| planned.group_rows.iter().sum())
+                    self.planned(seg_idx).map_or(0, |planned| {
+                        planned
+                            .group_rows
+                            .iter()
+                            .try_fold(0u64, |acc, rows| acc.checked_add(*rows))
+                            .unwrap_or(u64::MAX)
+                    })
                 };
                 seg.sample_count.saturating_sub(published)
             })
-            .sum()
+            .try_fold(0u64, |acc, rows| acc.checked_add(rows))
+            .unwrap_or(u64::MAX)
     }
 
     /// The units this plan publishes for `partitions` partitions, in
