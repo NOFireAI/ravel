@@ -1012,7 +1012,7 @@ The ceiling is one budget for the whole process:
 
 ### Startup log
 
-Startup logs the result on four `performance default resolved` lines, in the
+Startup logs the result on six `performance default resolved` lines, in the
 same `setting=... value=... source=...` layout as `sql_max_query_bytes`:
 
 | `setting` | `value` | `source` |
@@ -1021,11 +1021,15 @@ same `setting=... value=... source=...` layout as `sql_max_query_bytes`:
 | `sql_spill_max_bytes` | the process spill ceiling in bytes, or `none` | `env`, `env-override` (the variable alone over a `--cache-dir` root), `derived`, `cache-dir-insufficient-space`, `cwd-default`, `cwd-tmpfs`, `cwd-unavailable`, `cwd-insufficient-space` or `flag-off` |
 | `sql_spill_compression` | `lz4_frame`, the codec every spill file is written with, or `none` | `built-in` (no flag sets it), or the `sql_spill_dir` line's source when spill is off |
 | `sql_spill_merge_fan_in` | the most spill files one merge pass reads (`--sql-spill-merge-fan-in`, `0` for unbounded), or `none` | `flag` when the flag was passed, whatever its value, `default` otherwise, or the `sql_spill_dir` line's source when spill is off |
+| `sql_spill_retry_descriptor_budget` | the open files one spill retry may hold, the soft open-file limit divided by twice the spill share count and rounded down, or `none` | `nofile_soft`, or the `sql_spill_dir` line's source when spill is off |
+| `sql_spill_retry_modes` | `bucket,sort_merge` when that budget holds the smallest bucketed retry's files, `sort_merge` when it does not, or `none` | `descriptor_budget`, or the `sql_spill_dir` line's source when spill is off |
 
 Under `derived`, `cache-dir-insufficient-space`, `cwd-default` and
 `cwd-insufficient-space`, the `sql_spill_max_bytes` line also carries
 `free_bytes` and `read_cache_bytes`. Under the working-directory default,
-`read_cache_bytes` is always 0.
+`read_cache_bytes` is always 0. With spill on, the
+`sql_spill_retry_descriptor_budget` line also carries `nofile_soft`, the soft
+open-file limit after startup's raise, and `slots`, the spill share count.
 
 ### Spill directory
 

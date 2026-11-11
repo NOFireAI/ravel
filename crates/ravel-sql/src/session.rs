@@ -648,7 +648,23 @@ pub fn session_config(
     exact_typed_aggregates: bool,
     spill: SpillDecision<'_>,
 ) -> SessionConfig {
-    let repartition_free = repartition_free(spill);
+    session_config_with(
+        config,
+        exact_typed_aggregates,
+        spill,
+        repartition_free(spill),
+    )
+}
+
+/// [`session_config`] with the repartition-free choice made by the caller:
+/// the bucket retry keeps the first attempt's exchange under an enabled disk
+/// manager (ADR-0954, parallel bucket spill item 1).
+fn session_config_with(
+    config: &SqlConfig,
+    exact_typed_aggregates: bool,
+    spill: SpillDecision<'_>,
+    repartition_free: bool,
+) -> SessionConfig {
     let mut session = SessionConfig::new()
         .with_information_schema(false)
         .with_target_partitions(config.engine.sql_partition_count())
@@ -840,6 +856,54 @@ pub fn build_session_with_tables(
     spill: SpillDecision<'_>,
     principal: &SessionPrincipal,
 ) -> DFResult<SessionContext> {
+    build_session_inner(
+        config,
+        pool,
+        tables,
+        exact_typed_aggregates,
+        spill,
+        principal,
+        false,
+    )
+}
+
+/// The session the refusal retry plans its bucket candidate in (ADR-0954,
+/// parallel bucket spill item 1): [`build_session_with_tables`] under `spill`,
+/// but with the first attempt's repartition settings, so the hash exchange
+/// stays, and with [`BucketedFinalAggregateRule`] installed at
+/// [`BucketedFinalAggregation::default`] with spill on, whatever
+/// [`SqlConfig::bucketed_final_aggregation`] says. The executor replaces the
+/// placeholder tuning before anything executes.
+///
+/// [`BucketedFinalAggregation::default`]: crate::BucketedFinalAggregation
+pub(crate) fn build_bucket_retry_session(
+    config: &SqlConfig,
+    pool: Arc<dyn MemoryPool>,
+    tables: Vec<SessionTable>,
+    exact_typed_aggregates: bool,
+    spill: SpillDecision<'_>,
+    principal: &SessionPrincipal,
+) -> DFResult<SessionContext> {
+    build_session_inner(
+        config,
+        pool,
+        tables,
+        exact_typed_aggregates,
+        spill,
+        principal,
+        true,
+    )
+}
+
+fn build_session_inner(
+    config: &SqlConfig,
+    pool: Arc<dyn MemoryPool>,
+    tables: Vec<SessionTable>,
+    exact_typed_aggregates: bool,
+    spill: SpillDecision<'_>,
+    principal: &SessionPrincipal,
+    bucket_retry: bool,
+) -> DFResult<SessionContext> {
     check_table_set(&tables)?;
     let parquet_store = tables.iter().find_map(|table| match table {
         SessionTable::Parquet(session) => Some(Arc::clone(&session.store)),
@@ -864,7 +928,12 @@ pub fn build_session_with_tables(
                 .map_or(DEFAULT_SPILL_MERGE_FAN_IN, |spill| spill.merge_fan_in),
         ))
         .build_arc()?;
-    let mut session = session_config(config, exact_typed_aggregates, spill);
+    let mut session = session_config_with(
+        config,
+        exact_typed_aggregates,
+        spill,
+        repartition_free(spill) && !bucket_retry,
+    );
     if parquet_store.is_some() {
         session = parquet_session_config(session, exact_typed_aggregates);
     }
@@ -966,7 +1035,12 @@ pub fn build_session_with_tables(
     // aggregate in hash buckets. After `BoundedTopKAggregate`, which sets the
     // limit this rule refuses on, and before `CompactSlices`, which must see
     // the final plan. `None` does not install it at all.
-    if let Some(bucketed) = config.bucketed_final_aggregation {
+    if bucket_retry {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            BucketedFinalAggregateRule::new(crate::BucketedFinalAggregation::default())
+                .with_spill(true),
+        ));
+    } else if let Some(bucketed) = config.bucketed_final_aggregation {
         builder = builder
             .with_physical_optimizer_rule(Arc::new(BucketedFinalAggregateRule::new(bucketed)));
     }
