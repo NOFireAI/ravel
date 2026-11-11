@@ -835,16 +835,23 @@ fn logs_erasure_request() -> PendingErasureRequest {
 /// return its result with the store requests it issued, as the oracle counts
 /// them and as the ledger attributes them.
 async fn run_rlog_entry_at(entry: RlogEntry, level: i32) -> (Result<(), MaintainError>, u64, u64) {
+    run_rlog_entry_with(entry, |config| config.rlog_zstd_level = level).await
+}
+
+/// [`run_rlog_entry_at`] with `tweak` applied to the ledger-installed default
+/// config instead of a zstd level.
+async fn run_rlog_entry_with(
+    entry: RlogEntry,
+    tweak: impl FnOnce(&mut CompactorConfig),
+) -> (Result<(), MaintainError>, u64, u64) {
     let store = InstrumentedStore::new(MemoryStore::new());
     let bucket = seed_rlog_two_inputs(&store).await;
     let listing = read::list_bucket(&store, &bucket).await.expect("list");
     let metrics = store.metrics();
     let before = metrics.snapshot();
     let ledger = RequestLedger::new();
-    let config = CompactorConfig {
-        rlog_zstd_level: level,
-        ..config_with(&ledger)
-    };
+    let mut config = config_with(&ledger);
+    tweak(&mut config);
     let clock = FixedClock::new(sealed_now_ns());
     let result = match entry {
         RlogEntry::Compact => compact_bucket(&store, &clock, &config, &bucket)
@@ -905,6 +912,70 @@ async fn a_bad_rlog_zstd_level_is_refused_before_any_store_request() {
             }
             assert_eq!(oracle, 0, "{entry:?} at level {level}: store requests");
             assert_eq!(attributed, 0, "{entry:?} at level {level}: ledger requests");
+        }
+    }
+}
+
+/// A zero `rlog_run_block_target_records` is refused by every RLOG-writing
+/// entry point before its first store request, the same way and at the same
+/// place as a bad zstd level. The zstd test's control pins each entry's
+/// nonzero request count over the same fixture at the default target.
+#[tokio::test]
+async fn a_zero_rlog_run_block_target_is_refused_before_any_store_request() {
+    for entry in RLOG_ENTRIES {
+        let (result, oracle, attributed) =
+            run_rlog_entry_with(entry, |config| config.rlog_run_block_target_records = 0).await;
+        assert!(
+            matches!(result, Err(MaintainError::InvalidRlogRunBlockTarget(_))),
+            "{entry:?}: expected a refusal, got {result:?}"
+        );
+        assert_eq!(oracle, 0, "{entry:?}: store requests");
+        assert_eq!(attributed, 0, "{entry:?}: ledger requests");
+    }
+}
+
+/// `build_rewrite_logs` is public and callable without `erasure_rewrite_bucket`
+/// in front of it, so it checks the run block target itself: a zero target
+/// issues no store request, while the same call at the default target reads
+/// the inputs' catalogs.
+#[tokio::test]
+async fn build_rewrite_logs_refuses_a_zero_run_block_target_before_any_store_request() {
+    for target in [0, CompactorConfig::default().rlog_run_block_target_records] {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let bucket = seed_rlog_two_inputs(&store).await;
+        let object_keys: Vec<String> = list_all(&store, "")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|m| m.key)
+            .filter(|k| k.contains("/l0/"))
+            .collect();
+        assert_eq!(object_keys.len(), 2, "the two seeded inputs");
+        let metrics = store.metrics();
+        let before = metrics.snapshot();
+        let config = CompactorConfig {
+            rlog_run_block_target_records: target,
+            ..CompactorConfig::default()
+        };
+        let result = ravel_maintain::erasure_rewrite::build_rewrite_logs(
+            &store,
+            &bucket,
+            &config,
+            &object_keys,
+            &[],
+            &[0u8; 32],
+        )
+        .await;
+        let requests = oracle_requests(&before, &metrics.snapshot());
+        if target == 0 {
+            assert!(
+                matches!(result, Err(MaintainError::InvalidRlogRunBlockTarget(_))),
+                "expected a refusal, got {result:?}"
+            );
+            assert_eq!(requests, 0, "store requests at a zero target");
+        } else {
+            assert!(result.is_ok(), "default target: {result:?}");
+            assert!(requests > 0, "the default target reads the catalogs");
         }
     }
 }
