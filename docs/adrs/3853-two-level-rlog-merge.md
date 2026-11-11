@@ -1001,10 +1001,22 @@ run settings. Worker `w` of
 contiguous block, in place of D5's shared queue. Within a worker a decoded
 block whose rows run past a pass's last stream is not released: its
 unexhausted view is carried into the worker's next pass, across a range
-boundary too, so each such block is decoded once per worker. The carried
-view keeps the charge it was decoded under, and the next pass's cut counts
-it, so it adds no memory term. A block straddling two workers' streams is
-decoded by each, predicted at most `W2 x R` extra decodes per unit.
+boundary too, so each such block is decoded once per worker unless it is
+released first. The carried view keeps the charge it was decoded under, and
+the next pass's cut counts it, so it adds no memory term. When the carried
+charges and the first stream's other blocks together exceed the pass
+budget, the cut releases every carried view that stream does not read
+before the pass decodes, and counts only the views it keeps: the pass then
+starts from at most the stream's own estimate, which is within the budget,
+exceeded only by a kept view whose heap estimate came in over its decode
+ceiling (`pass_cut_releases_carried_views_the_first_stream_does_not_use`,
+`a_carried_view_never_takes_a_pass_over_its_budget`). Before a hot stream's
+cursor merge, whose charge is priced without carried views, the worker
+releases them all. A released view's block is decoded again by the pass
+that next reads it, and a block straddling two workers' streams is decoded
+by each, so level 2 decodes at most `run_blocks + W2 x R + R x hot_streams`
+blocks plus the released views per unit; with no hot stream and no release
+that is `run_blocks + W2 x R`.
 
 A unit's parts are a function of its input set and its part-split
 settings, the range quantum among them: the single-level route and the
