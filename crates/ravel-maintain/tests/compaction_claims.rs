@@ -1469,12 +1469,17 @@ impl Clock for AfterFirstRunPart {
 }
 
 /// A store that notes the ledger's scratch writes issued, and their bytes, at
-/// the moment its one scripted fault, of kind `fault`, fires.
+/// the moment its one scripted fault, of kind `fault`, fires, with the L1 part
+/// PUTs that had reached it by then.
 struct NoteScratchAtFault {
     inner: FaultStore<MemoryStore>,
     ledger: RequestLedger,
     fault: (Op, FaultKind),
     at_fault: std::sync::Mutex<Option<ScratchAtFault>>,
+    /// L1 part PUTs in the order they reach the store: the ledger counts a
+    /// part PUT when the worker's thread sees its reply, which can be after a
+    /// later PUT faulted.
+    part_puts: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1512,7 +1517,12 @@ impl NoteScratchAtFault {
             ledger: ledger.clone(),
             fault,
             at_fault: std::sync::Mutex::new(None),
+            part_puts: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn part_puts(&self) -> u64 {
+        self.part_puts.load(Ordering::SeqCst)
     }
 
     fn note(&self) {
@@ -1523,7 +1533,7 @@ impl NoteScratchAtFault {
                 *at = Some(ScratchAtFault {
                     writes: report.scratch_writes,
                     bytes: report.scratch_write_bytes,
-                    part_puts: report.part_put.requests,
+                    part_puts: self.part_puts(),
                 });
             }
         }
@@ -1538,6 +1548,9 @@ impl ObjectStoreBackend for NoteScratchAtFault {
         data: Bytes,
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
+        if key.contains("/l1/") {
+            self.part_puts.fetch_add(1, Ordering::SeqCst);
+        }
         let outcome = self.inner.put(key, data, opts).await;
         self.note();
         outcome
@@ -1779,9 +1792,9 @@ async fn a_failed_level2_worker_stops_every_level2_worker() {
     assert_eq!(report.level2_workers, 4, "{report:?}");
     assert_eq!(report.level2_ranges, 4, "{report:?}");
     let at_fault = store.at_fault.lock().unwrap().expect("the PUT failed");
-    // The ledger counts a part PUT once it returns, so the failed one is
-    // counted after the fault was noted and is not one that followed it.
-    let after = report.part_put.requests - at_fault.part_puts - 1;
+    // Counted in the order the PUTs reached the store, the failed one among
+    // those before the fault.
+    let after = store.part_puts() - at_fault.part_puts;
     assert!(
         after < report.level2_workers,
         "{after} part PUTs followed the fault with {} workers: {report:?} {at_fault:?}",
