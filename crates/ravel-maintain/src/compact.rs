@@ -341,6 +341,9 @@ struct MergeInFlight {
     bucket: String,
     /// The `outcome=` the end line logs; `dropped` until [`Self::end`] sets it.
     outcome: &'static str,
+    /// The run's ledger, from which the end line reads the two-level merge's
+    /// level-2 worker and range counts (ADR-3853 D6), 0 for any other merge.
+    ledger: crate::request_ledger::RequestLedger,
 }
 
 impl MergeInFlight {
@@ -348,7 +351,7 @@ impl MergeInFlight {
     /// key is that prefix plus its file name, and the end line repeats the
     /// prefix, which is how the chaos oracle (scripts/chaos/lib.sh) pairs a
     /// start with the end and the publish of the same merge.
-    fn start(bucket: &Bucket) -> Result<Self> {
+    fn start(bucket: &Bucket, ledger: crate::request_ledger::RequestLedger) -> Result<Self> {
         let prefix = ravel_commit::keys::commit_shard_hour_prefix(
             &bucket.tenant_hash,
             bucket.signal,
@@ -360,6 +363,7 @@ impl MergeInFlight {
         Ok(MergeInFlight {
             bucket: prefix,
             outcome: "dropped",
+            ledger,
         })
     }
 
@@ -372,9 +376,12 @@ impl MergeInFlight {
 impl Drop for MergeInFlight {
     fn drop(&mut self) {
         COMPACTIONS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        let report = self.ledger.report();
         tracing::info!(
             bucket = %self.bucket,
             outcome = %self.outcome,
+            level2_workers = report.level2_workers,
+            level2_ranges = report.level2_ranges,
             "compaction merge ended"
         );
     }
@@ -393,6 +400,8 @@ fn merge_end_outcome(
         Err(
             MaintainError::MergeGeometryUnsupported { .. }
             | MaintainError::MergeTwoLevelUnsupported { .. }
+            | MaintainError::PartRangeWindow { .. }
+            | MaintainError::PartKeySpace { .. }
             | MaintainError::ScratchHeadroom { .. }
             | MaintainError::ScratchLocked { .. },
         ) => "refused",
@@ -678,15 +687,21 @@ async fn compact_bucket_scoped(
         BucketClaim::NotParticipating => (None, None),
         BucketClaim::Held { guard, stolen } => (Some(guard), Some(ClaimAcquisition { stolen })),
     };
+    // The merge-end line reads the level-2 shape from the run's ledger. A run
+    // the caller installed none for records into one of its own, opened as
+    // the run's scope so no rewrite underneath reports from it.
+    let ledger = config.request_ledger.clone().unwrap_or_else(|| {
+        let ledger = crate::request_ledger::RequestLedger::new();
+        ledger.reset_for_run();
+        ledger
+    });
     // The guard rides on this run's OWN config clone, never on the caller's:
     // two buckets compacted concurrently under one base config each get their
     // own, so a checkpoint can only ever renew its own bucket's claim.
-    let run_config = match guard.as_ref() {
-        Some(guard) => CompactorConfig {
-            claim_guard: Some(guard.clone()),
-            ..config.clone()
-        },
-        None => config.clone(),
+    let run_config = CompactorConfig {
+        claim_guard: guard.clone().or_else(|| config.claim_guard.clone()),
+        request_ledger: Some(ledger.clone()),
+        ..config.clone()
     };
 
     // Everything up to here is signal-generic (seal, tombstone, already-done,
@@ -695,7 +710,7 @@ async fn compact_bucket_scoped(
     // signal and run the identical shared pipeline (canonical ordering,
     // input_set_hash, publish) around it (ADR-0032).
     let planned = &listing;
-    let in_flight = MergeInFlight::start(bucket)?;
+    let in_flight = MergeInFlight::start(bucket, ledger)?;
     let outcome = match bucket.signal {
         Signal::Metrics => {
             run_pipeline::<RsegCodec>(store, clock, &run_config, bucket, inputs, start_ns, planned)

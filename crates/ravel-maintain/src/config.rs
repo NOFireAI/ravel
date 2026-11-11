@@ -162,6 +162,9 @@ struct MergeMemoryInner {
     /// Each level-1 worker's [`Self::peak_resident`], in worker order, once
     /// [`MergeMemoryTracker::absorb_workers`] has folded them in.
     worker_peaks: std::sync::Mutex<Vec<u64>>,
+    /// Each level-2 range worker's [`Self::peak_resident`], in worker order,
+    /// once [`MergeMemoryTracker::absorb_level2_workers`] has folded them in.
+    level2_peaks: std::sync::Mutex<Vec<u64>>,
     /// What an in-flight exact-encode probe holds on top of the writer buffer:
     /// the clone of the part's records plus, once the encode returns, the
     /// encoded object bytes. Zero whenever no probe is running.
@@ -384,6 +387,17 @@ impl MergeMemoryTracker {
     /// [`Self::level1_worker_peak_bytes`]. A sum of high-water marks bounds
     /// the workers' joint peak from above; they need not have coincided.
     pub fn absorb_workers(&self, workers: &[MergeMemoryTracker]) {
+        self.absorb(workers, &self.inner.worker_peaks);
+    }
+
+    /// [`Self::absorb_workers`] for level-2 range workers (ADR-3853 D5
+    /// amendment): each worker's [`Self::peak_resident_bytes`] is kept for
+    /// [`Self::level2_worker_peak_bytes`].
+    pub fn absorb_level2_workers(&self, workers: &[MergeMemoryTracker]) {
+        self.absorb(workers, &self.inner.level2_peaks);
+    }
+
+    fn absorb(&self, workers: &[MergeMemoryTracker], kept: &std::sync::Mutex<Vec<u64>>) {
         let peaks = |field: fn(&MergeMemoryInner) -> &AtomicU64| {
             let summed = workers.iter().fold(0u64, |a, w| {
                 a.saturating_add(field(&w.inner).load(Ordering::Relaxed))
@@ -419,12 +433,20 @@ impl MergeMemoryTracker {
                 Ordering::Relaxed,
             );
         }
-        let mut kept = self
-            .inner
-            .worker_peaks
+        let mut kept = kept
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         kept.extend(workers.iter().map(MergeMemoryTracker::peak_resident_bytes));
+    }
+
+    /// Each level-2 range worker's [`Self::peak_resident_bytes`], in worker
+    /// order; empty unless a two-level merge reached level 2.
+    pub fn level2_worker_peak_bytes(&self) -> Vec<u64> {
+        self.inner
+            .level2_peaks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Each level-1 worker's [`Self::peak_resident_bytes`], in worker order;
@@ -775,11 +797,11 @@ impl MergeMemoryTracker {
         ] {
             field.store(0, Ordering::Relaxed);
         }
-        self.inner
-            .worker_peaks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        for kept in [&self.inner.worker_peaks, &self.inner.level2_peaks] {
+            kept.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
     }
 
     /// The full phase split, each term naming its byte kind. See
@@ -951,6 +973,14 @@ impl<'t> MergeCharges<'t> {
     /// Release this guard's whole pass-rows charge.
     pub(crate) fn release_all_pass_rows(&mut self) {
         self.release_pass_rows(self.pass_rows);
+    }
+
+    /// Move up to `bytes` of this guard's pass-rows charge to `to`, leaving the
+    /// tracker's figure as it is: the rows stay held, under another guard.
+    pub(crate) fn move_pass_rows(&mut self, to: &mut MergeCharges<'_>, bytes: u64) {
+        let bytes = bytes.min(self.pass_rows);
+        self.pass_rows -= bytes;
+        to.pass_rows = to.pass_rows.saturating_add(bytes);
     }
 
     /// Whether a tracker is installed (so an estimate is worth computing).
@@ -1752,6 +1782,35 @@ pub fn validate_rlog_run_block_target_records(
     }
 }
 
+/// A level-2 range setting of zero was configured (ADR-3853 D5): no worker,
+/// or an empty range quantum. Each is refused as a misconfiguration before
+/// the first store request.
+#[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
+#[error("{field} must be at least 1, got 0")]
+pub struct RlogLevel2SettingError {
+    /// The [`CompactorConfig`] field that was zero.
+    pub field: &'static str,
+}
+
+/// Validate [`CompactorConfig::level2_workers`] and
+/// [`CompactorConfig::rlog_level2_range_records`].
+pub fn validate_rlog_level2_settings(
+    level2_workers: Option<usize>,
+    range_records: u64,
+) -> Result<(), RlogLevel2SettingError> {
+    if level2_workers == Some(0) {
+        return Err(RlogLevel2SettingError {
+            field: "level2_workers",
+        });
+    }
+    if range_records == 0 {
+        return Err(RlogLevel2SettingError {
+            field: "rlog_level2_range_records",
+        });
+    }
+    Ok(())
+}
+
 /// Default `grace`: 24 hours (docs/consistency-model.md "Deletion and GC").
 /// A shared floor for the orphan and unreferenced-part age gates.
 pub const DEFAULT_GRACE_NS: i64 = 24 * NS_PER_HOUR;
@@ -2266,9 +2325,10 @@ pub struct CompactorConfig {
     /// `None` (the default) admits against the filesystem's free bytes alone.
     pub scratch_max_bytes: Option<u64>,
     /// The memory split target a level-1 run part closes at (ADR-3853 D2 and
-    /// D4). Fixed rather than derived from host memory, and it never changes
-    /// the final parts' bytes, only how the runs between the levels are cut.
-    /// Default [`RLOG_RUN_MEMORY_TARGET_BYTES`].
+    /// D4). Fixed rather than derived from host memory; it cuts the runs
+    /// between the levels. Its effect on published parts, the keyed
+    /// batch-major exception included, is stated in ADR-3853 D2. Default
+    /// [`RLOG_RUN_MEMORY_TARGET_BYTES`].
     pub rlog_run_memory_target_bytes: u64,
     /// The records per block a level-1 run is written at (ADR-3853 D2).
     /// Transient like the other run settings: it changes the runs' blocks and
@@ -2287,13 +2347,32 @@ pub struct CompactorConfig {
     /// its `--bucket-concurrency`. Default 1; 0 reads as one.
     pub unit_concurrency: usize,
     /// The level-1 worker count `W1` of a two-level RLOG merge (ADR-3853 D4).
-    /// `None` (the default) derives it: the largest count at or under the
-    /// unit's core share ([`Self::unit_concurrency`]) at which constraint (a)
-    /// still leaves groups of two and the predicted level 2 fits constraint
-    /// (b). `Some(n)` overrides the derivation; `Some(0)` reads as one. Each
+    /// `None` (the default) derives it jointly with `W2` (ADR-3853 D5
+    /// amendment): of the counts at or under the unit's core share
+    /// ([`Self::unit_concurrency`]) at which constraint (a) still leaves
+    /// groups of two and the predicted level 2 fits at least one worker, the
+    /// one with the smallest `1/W1 + 1/W2`, ties to the smaller.
+    /// `Some(n)` overrides the derivation; `Some(0)` reads as one. Each
     /// worker merges its groups under `merge_cursor_budget_bytes / W1` and
     /// `merge_resident_ceiling / W1`.
     pub level1_workers: Option<usize>,
+    /// The level-2 worker count `W2` of a two-level RLOG merge (ADR-3853 D5).
+    /// `None` (the default) derives it jointly with `W1`. `Some(n)` overrides
+    /// the derivation and is refused when one worker's level-2 read side does
+    /// not fit `merge_resident_ceiling / n`; never more workers run than there
+    /// are ranges. `Some(0)` fails the run before its first store request with
+    /// [`crate::error::MaintainError::InvalidRlogLevel2Setting`].
+    pub level2_workers: Option<usize>,
+    /// The record quantum level 2's stream key space is cut at (ADR-3853 D5):
+    /// a range closes after the stream at which its streams' exact record
+    /// totals reach this many records. Each range numbers its parts in a
+    /// window of the part key's 10,000 indexes proportional to the quantum's
+    /// share of the unit's records, so a two-level merge of more than 10,000
+    /// times the quantum records is refused before level 2 encodes a part. Independent of the
+    /// worker counts, so every worker count publishes the same parts. Zero is
+    /// refused like [`Self::level2_workers`]. Default
+    /// [`crate::rlog::LEVEL2_RANGE_RECORDS`].
+    pub rlog_level2_range_records: u64,
     /// The predicted decoded rows at or below which a cursor plan always runs
     /// as a cursor merge, neither refused nor routed to two levels under
     /// ADR-3853 D0, whatever its amplification. Default
@@ -2553,6 +2632,8 @@ impl Default for CompactorConfig {
             rlog_run_block_target_records: crate::rlog::RUN_BLOCK_TARGET_RECORDS,
             unit_concurrency: 1,
             level1_workers: None,
+            level2_workers: None,
+            rlog_level2_range_records: crate::rlog::LEVEL2_RANGE_RECORDS,
             geometry_floor_decoded_rows: crate::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS,
             merge_admission: AdmissionMode::Overlap,
             rlog_zstd_level: DEFAULT_RLOG_ZSTD_LEVEL,
