@@ -215,7 +215,7 @@ Status of this amendment: Accepted. Refs: #3565, #3607, #3608, #3609, #3639. The
 
 ### Corrections to the decision text
 
-- **Decision 1, chunk slack.** Decision 6's band row said the slack is "under 0.1 GB over 32 x 64 buckets"; it is about 9x that. The q33 shape routes 6 columns at 52 B per row (8 + 4 B of keys; 8 + 8 + 16 + 8 B of state, the integer `avg` state being `Decimal128` plus `Int64`), so one chunk set per bucket is 8192 x 52 + 6 x 1024 = 432,128 B, 26.4 MiB per partition for 64 buckets and 0.885 GB at 32 partitions. The engage routes about 1,024 state rows per bucket, so every bucket allocates its first chunk at once and the 0.885 GB is charged up front (#3565, checkpoint review of #3608). The smallest shape, one Int64 key plus a count, charges 8 MiB per engaged partition, more than the 256 MiB default query ceiling at 32 partitions. `routed_chunk_rows` (default 8192) is revisited in #3639 before any default changes.
+- **Decision 1, chunk slack.** Decision 6's band row said the slack is "under 0.1 GB over 32 x 64 buckets"; it is about 9x that. The q33 shape routes 6 columns at 52 B per row (8 + 4 B of keys; 8 + 8 + 16 + 8 B of state, the integer `avg` state being `Decimal128` plus `Int64`; on the ClickBench corpus the row is 64 B, see the M8 results amendment below), so one chunk set per bucket is 8192 x 52 + 6 x 1024 = 432,128 B, 26.4 MiB per partition for 64 buckets and 0.885 GB at 32 partitions. The engage routes about 1,024 state rows per bucket, so every bucket allocates its first chunk at once and the 0.885 GB is charged up front (#3565, checkpoint review of #3608). The smallest shape, one Int64 key plus a count, charges 8 MiB per engaged partition, more than the 256 MiB default query ceiling at 32 partitions. `routed_chunk_rows` (default 8192) is revisited in #3639 before any default changes.
 - **Decision 3, the gate figure.** `peakAskedIntermediateBytes` (#3607) is the peak of the bytes live reservations hold before any reserve-ahead factor: a held shrink lowers it while the charge stays held, so it is at most the charged peak and equals it only when no reserve-ahead consumer and no held release took part. Under a TopK the evaluated bucket batch and its sort indices are held uncharged while the cut runs, at most one bucket's evaluated output per partition (#3639 charges it).
 - **Decision 4, what the cut buys.** The per-bucket cut bounds the sort's input to 2^bits x k rows per engaged partition. It does not lower whole-plan peak asked bytes: each bucket's table is charged in full before its output is cut, and buckets run one at a time (measured identical with and without the cut on the q33 shape, #3609). The per-bucket table release belongs to decision 1, not to the cut. The reach rule is `TopKPrefilter::above` as written, so a `preserve_partitioning` sort with a fetch is also cut, which is exact because each partition feeds its own TopK.
 - **Decision 1, `CompactSlices`.** A converted aggregate gets neither half of that rule: the slice compaction, redundant because the exec's output batches own their buffers, and the TopK pre-filter, which decision 4 replaces inside the exec. Between #3628 and #3640 a qualifying `ORDER BY ... LIMIT k` under the switch had no cut at all.
@@ -321,7 +321,7 @@ Two corrections to decision 3 first:
    - `C` is the partial streams plus 16 exchange outputs plus 16 bucketed streams. The `ORDER BY ... LIMIT 10` plans a `SortExec` with a fetch, a `TopK`, and the `SortPreservingMergeExec` above it registers none either, so nothing else in the plan counts.
    - `H = max(64 MiB, floor(L x 10 / 100))` (`spill_mode_headroom`, `memory.rs:1222-1225`), and `slots` is as item 1 gives it.
    - At `P` 16, `2 x T / (P x 0.75 x S)` is `T / (6 x S)`, so `bits` holds for `T` in `(2^(bits-1) x 6 x S, 2^bits x 6 x S]`.
-   - `w` is 52 B (amendment 1).
+   - `w` is 52 B (amendment 1). M8 measured 64 B and a larger `T`, which changes the c6a.large column; see the M8 results amendment below.
 
    | quantity | c6a.large (2 vCPU, 4 GiB) | c6a.xlarge (4 vCPU, 8 GiB) | c6a.2xlarge (8 vCPU, 16 GiB) |
    |---|---|---|---|
@@ -380,6 +380,8 @@ Two corrections to decision 3 first:
 
 These are T3's (#4075) bucket-specific rows. The M8 gate is ADR-0954's parallel bucket spill gate table; every row here is a prediction made before the code exists, pre-registered on #4072 (comment 6781670235, with the effective limit's addendum in comment 6783548535, the rows-written row's in comment 6783962946 and the process budget's in comment 6789982954) before any M8 box was launched. The rows are stated for the serial passes, where `L_eff = L` after a query pool refusal and `L_eff = min(L, B - F)` after a process budget or reserve-ahead refusal (item 4); the `bits` rows hold for both, because the predicted `L_eff` stays above the share where `bits` leaves item 4's table value. Under the gate's concurrent windows other statements can hold part of the refusing budget, so `L_eff` can be below `L` and `bits` can read above the serial value; the bands are not widened for it. Each figure must be present exactly once and inside its band; anything else is a miss, so no row leaves a gap between its band and its miss.
 
+What M8 measured against each row, and the two rows whose basis was wrong (the 52 B row width and the retry peak), is in the M8 results amendment below.
+
 | figure | band | miss | basis |
 |---|---|---|---|
 | q33 derived `bits`, c6a.2xlarge | 3 to 5 | below 3, above 5, or no tuning | predicted: item 4's table gives 4 for `T` from 7.37 to 14.74 GB; the band is widened to the miss threshold because `T` is projected from the first attempt's own refusal, and 3 or 5 is a projection outside that range with the derivation still sound; at `bits` 5 the descriptor need takes a soft `nofile` limit of 8,320 (item 4's table), so no tuning on a box stamped below the 8,320 ADR-0954's M8 gate requires is a miss of the run's preconditions, not of this row, and T3 stamps that limit beside the run |
@@ -399,3 +401,63 @@ These are T3's (#4075) bucket-specific rows. The M8 gate is ADR-0954's parallel 
 - The bucketed retry runs under `L_eff` (item 4), which is below the per-query limit when a tenant budget below it refused the first attempt or other statements held part of the refusing budget. It then derives more buckets than a serial run would, and where the derivation returns no tuning at `L_eff` the statement keeps the sort-merge retry at the per-query limit.
 - An under-shoot beyond the margin fails the statement typed where today's sort-merge retry could answer it. The M8 gate's null row is where that shows.
 - The exec's consumer is spill-capable in the retry only, so on a first attempt it is still outside ADR-0954's spill-mode cap.
+
+## Amendment 3 (2026-11-11): what M8 measured
+
+<!-- amendment-applies: sections="Amendment 1 (2026-11-02): what the implementation and the A/B measured|Amendment 2 (2026-11-10): bucket spill for the refusal retry" pointer="M8 results amendment" -->
+<!-- amendment-supersedes: phrase="`w` is 52 B" pointer="M8 results amendment" -->
+
+This is the M8 results amendment. Refs: #4075, epic #4072. It records what run `m8-t3-a7c3d527c-20261111T1124Z` measured against the bucket spill bands, and corrects two predictions in the bucket spill amendment. It changes no code. The gate's other rows (null answers, hot time, concurrent QPS) are in ADR-0954's M8 results amendment.
+
+The run used one box per size, with the server built from `a7c3d527c`; each box's measured binary matched the build's `SHA256SUMS`. The full results are #4072 comment 6802934028.
+
+### M8 results against the bucket spill rows
+
+Each figure was present exactly once per try, three tries per box.
+
+| figure | predicted | measured | outcome | source |
+|---|---|---|---|---|
+| q33 derived `bits`, c6a.2xlarge | 3 to 5 | 4, 4, 4 | inside | measured 2026-11-11, comment 6802934028 |
+| q33 derived `bits`, c6a.xlarge | 4 to 6 | 5, 5, 5 | inside | measured 2026-11-11, comment 6802934028 |
+| q33 derived `bits`, c6a.large | 5 to 7 | no tuning on all three tries (`retry_plan="sort_merge"`, `retry_plan_reason="chunk_too_small"`) | outside | measured 2026-11-11, comment 6802934028 |
+| q33 `effective_limit_bytes` over `sql_max_query_bytes`, c6a.2xlarge and c6a.xlarge | 0.70 to 1.00 | 1.000 on every try | inside | measured 2026-11-11, comment 6802934028 |
+| q33 `bucket_spill_rows_written`, c6a.2xlarge | 99,997,493 to 99,997,497 | 99,997,497 on every try | inside | measured 2026-11-11, comment 6802934028 |
+| q33 `bucket_spill_bytes_written`, c6a.2xlarge | 1.0 to 2.0 GB | 1,721,447,984, 1,722,073,952 and 1,722,002,160 B | inside | measured 2026-11-11, comment 6802934028 |
+| q33 `bucket_spill_rows_read` against `bucket_spill_rows_written`, c6a.2xlarge and c6a.xlarge | equal | both 99,997,497 on every try | inside | measured 2026-11-11, comment 6802934028 |
+| q33 retry peak asked bytes, c6a.2xlarge | 0.5 to 2.0 GB | 2,434,090,128, 2,418,113,504 and 2,424,455,424 B | outside; the 7.78 GB hard bound held | measured 2026-11-11, comment 6802934028 |
+
+On c6a.large the statement was answered on all three tries through the sort-merge retry, in about 112 s each with 11.6 GB of spill. That is the typed fallback item 4 describes, not an error.
+
+### Correction: the routed row is 64 B on the ClickBench corpus
+
+Amendment 1 and item 4 take q33's routed row as 52 B: 8 + 4 B of keys and 8 + 8 + 16 + 8 B of state. On the corpus M8 runs it is 64 B: 8 + 8 B of keys and 8 + 16 + 16 + 8 B of state.
+
+- `bucket_spill_bytes_read` on c6a.xlarge is 6,399,839,808 B over 99,997,497 rows, which is 64 B per row exactly.
+- The corpus declares `ClientIP` as `i64` (`benchmarks/clickbench/hits.mapping.toml:99`), not a 4 B integer.
+- The checked integer `sum` carries a `Decimal128` state (`crates/ravel-sql/src/sum.rs`), 16 B, not 8 B.
+
+The width is read from the plan's own types at run time (`routed_types`), so the code derives with 64 B. Only the prediction used 52 B. Item 4's table and the test constant `Q33_WIDTHS` (`crates/ravel-sql/src/bucket_spill_tuning.rs`) reproduce that prediction and are left as written; the follow-up that makes row 33 tune on c6a.large replaces both with the measured shape.
+
+### Correction: the projected table bytes on c6a.large
+
+Item 4 projects `T` at 9.48 GB on every box. On c6a.large the first attempt was refused after 8.6 M of 100 M rows, where the bytes asked per consumed row are 126.5 to 127.8 B, so `T = A x N / n` came to 12.65 to 12.78 GB. That puts `T / (6 x S)` at 64.1 to 64.8, just over the step from `bits` 6 to 7.
+
+At `bits` 7 and 64 B the largest chunk that fits is 980 rows, under the 1,024-row floor, so the derivation returned no tuning. Either prediction holding would have tuned: 52 B at `bits` 7 gives 1,200 rows, and 64 B at `bits` 6 gives 1,932.
+
+The projection is taken from the first attempt's own refusal. The smallest box was refused earliest and projected highest, and it has the least share to absorb the difference. Why the rate per consumed row is higher at an earlier refusal is not established. This is the production case to carry into the follow-up: a small host under a tight limit loses the bucketed retry first.
+
+### Correction: the retry peak is a share of the limit
+
+The peak band was predicted from fixed per-stream structures, about 0.82 GB. The measured peak scales with the limit instead:
+
+- on c6a.2xlarge, peak over effective limit is 0.295 to 0.298 on all eight bucketed retries, serial and concurrent, at effective limits from 5.15 to 8.19 GB;
+- on c6a.xlarge it is 0.34 to 0.36 on all nine.
+
+That is each of the 16 final streams filling its spill-mode share `S` before its trigger fires: 16 x 153,493,670 B = 2,455,898,720 B, and the measured peak is 0.991 of it. The rows-written row above already assumes that share per stream, so the peak band contradicted it. No consumer is unaccounted for, and item 3's hard bound held.
+
+The bound to state for the peak is therefore `P x S` plus the exchange's and the partial streams' buffers, not a fixed figure.
+
+### What follows
+
+- Row 33 on a c6a.large-sized host keeps the sort-merge retry until the derivation tunes there. The follow-up ticket owns that, with the 64 B width and the measured `T`.
+- Statements whose group key is a string are not admitted by `BucketedFinalAggregateRule` and keep the sort-merge retry on every box. ADR-0954's M8 results amendment records what that costs under concurrency.
