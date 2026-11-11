@@ -320,7 +320,7 @@ Enforced without being remembered:
   the primary checkout; a bare 40-character hex literal in a Bash command;
   `reset --hard/--soft` onto a remote ref, `filter-branch`, and a
   force-push naming `main`; and, in a fleet clone, `cargo clippy
-  --workspace`. Escape hatches, written inline at the front of the
+  --workspace` or a bare `cargo clippy` with no `-p`. Escape hatches, written inline at the front of the
   command: `RAVEL_GUARD_ALLOW_PRIMARY=1`, `ALLOW_DESTRUCTIVE=1`,
   `ALLOW_LITERAL_SHA=1`, `RAVEL_GATES_ALLOW_UNSCOPED=1`. Keep a SHA copied
   from a check just run (a `--match-head-commit` value); resolve any other
@@ -395,7 +395,8 @@ syntax and exit codes:
   `persist-credentials: false`.
 - `check-changelog-touched.sh <base-ref> [head-ref]`: a `feat`/`fix`
   commit touching `crates/` or `services/` needs a `CHANGELOG.md` change
-  in the range or a `Changelog: none` trailer.
+  in the range or a `Changelog: none` trailer. CI's `doc-scripts` job
+  only; `gates.sh` does not run it.
 - `check-amendment-integrity.sh`, `check-adr-band-sources.sh`: an ADR
   amendment's marker matches the document, and every band table row has a
   source. `docs/adrs/README.md`, "Amending an ADR", has the marker syntax.
