@@ -130,9 +130,9 @@ have gone through the cache.
 
 `TenantMemoryAccountant::try_grow` maps every `MemoryBudget::try_reserve`
 error to `GrowRefused::Process`, which carries the whole `MemoryExhausted`
-with its `cause` (`crates/ravel-sql/src/memory.rs:198-216`); `try_charge` then
+with its `cause` (`crates/ravel-sql/src/memory.rs:224-242`); `try_charge` then
 formats it as an accounted limit breach without reading that cause
-(`memory.rs:566-577`), which is #2990. No
+(`memory.rs:592-603`), which is #2990. No
 test drives `ExhaustionCause::HostMemory` through `try_charge`. On VmRSS
 (#2999), the ledger covers fetch buffers, the SQL pool, decoded blocks and
 dictionaries and the catalog decoded caches, and leaves out by design the
@@ -393,7 +393,7 @@ mixed-size cases are measured. The mechanism inside the region is the
 implementing task's to refine; the tests below are the contract.
 
 3c. `try_grow` already preserves `ExhaustionCause` inside
-`GrowRefused::Process` (`memory.rs:208-211`); the change is in `try_charge`,
+`GrowRefused::Process` (`memory.rs:234-237`); the change is in `try_charge`,
 which formats a `HostMemory` refusal as a host-memory gate closure naming
 `available` and `floor`, the `Display` `MemoryExhausted` already has
 (`crates/ravel-memory/src/lib.rs:521-536`), and leaves the accounted message

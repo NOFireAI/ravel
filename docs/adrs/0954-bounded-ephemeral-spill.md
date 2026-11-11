@@ -1344,7 +1344,7 @@ This is the parallel bucket spill amendment. The figures are from epic
    - Each output partition registers its own consumer,
      `RepartitionExec[p]`, with `with_can_spill(true)` (lines 495-499). In
      the retry's pool that makes it subject to `spill_cap_admit`
-     (`crates/ravel-sql/src/memory.rs:1708-1730`): a grow is admitted only
+     (`crates/ravel-sql/src/memory.rs:1796-1818`): a grow is admitted only
      while the consumer stays within its fair share `(L - H) / n`, `n` the
      spill-capable consumers registered, and the spill-capable total stays
      within the hard bound `L - H/2`.
@@ -1366,7 +1366,7 @@ This is the parallel bucket spill amendment. The figures are from epic
      spill file (`datafusion-execution` 55.2.0 `src/disk_manager.rs:478-500`;
      Ravel sets that quota from the reserved share at `session.rs:628-631`).
      A quota trip is the typed `spill_budget_exhausted` (`spill_error`,
-     `executor.rs:6882-6903`).
+     `executor.rs:6903-6924`).
    - Uncharged: the `SharedCoalescer` on each output partition holds fewer
      than `batch_size` rows before `send` (lines 269-300, created at
      537-545), and the reader holds the one batch it read back. So the
@@ -1389,16 +1389,20 @@ This is the parallel bucket spill amendment. The figures are from epic
    only check on this path is the M8 gate's exchange row below.
 
 3. **No third attempt.** The kept plan runs as the statement's one spill
-   retry. Its failure is terminal: `spill_retry_decision` returns no retry
-   once `spill_retried` is set (`executor.rs:7125-7142`), and this
-   amendment adds no fallback to the sort-merge plan after a bucketed
-   retry fails. A bucketed retry fails with one of the typed errors
-   ADR-3565's bucket spill amendment lists. Its test is
+   retry. Its failure is terminal for a memory failure:
+   `spill_retry_decision` returns no retry once `spill_retried` is set
+   (`executor.rs:7146-7163`), and this amendment adds no fallback to the
+   sort-merge plan after a bucketed retry fails. The snapshot retry for a
+   segment that vanished before any row was emitted is a separate
+   decision and is unchanged. A bucketed retry fails with one of the
+   typed errors ADR-3565's bucket spill amendment lists. Its test is
    `a_failed_bucketed_retry_is_the_statements_error`
-   (`crates/ravel-sql/tests/bucketed_final_aggregate.rs`): a bucketed
-   retry the process budget refuses returns that refusal, its INFO line
-   reads `outcome="failed"` and `retry_refusal="process_budget"`, and the
-   store's GET count on the data object is two, one per attempt.
+   (`crates/ravel-sql/tests/bucketed_final_aggregate.rs`): the room left
+   on the process budget is taken after the first refusal and before the
+   retry's read of the data object, the bucketed retry returns the
+   process budget's refusal, its INFO line reads `outcome="failed"`,
+   `retry_refusal="process_budget"` and `retry_peak_asked_bytes=0`, and
+   the store's GET count on the data object is two, one per attempt.
 
 4. **Counters, per phase.** `SpillRetryReport` (`executor.rs`) and its
    INFO line gain:
@@ -1419,9 +1423,17 @@ This is the parallel bucket spill amendment. The figures are from epic
      `first_attempt_consumed_rows` (`n`), `scan_rows_total` (`N`),
      `spillable_consumers` (`C`), `final_partitions` (`P`) and the derived
      `descriptor_need`;
-   - `retry_peak_asked_bytes`, the retry pool's peak asked bytes, and
-     `retry_refusal`, what failed the retry: a memory refusal's log name,
+   - `retry_peak_asked_bytes`, the retry pool's peak asked bytes, which
+     leaves refused asks out and so reads 0 for a retry whose pool
+     granted nothing before it failed, and `retry_refusal`, what failed the retry, read from the
+     error that ended it: a memory refusal's log name, `spill_hard_bound`
+     for a spill-mode refusal over the hard bound, `spill_cap` for one
+     over the spill-mode cap or a fair share of it,
      `bucket_spill_undershoot` or `other`, and `none` when it answered.
+     The retry's pool also records refusals the retry absorbed by
+     spilling, so its first recorded refusal is not what this field
+     reads (`the_retry_refusal_names_what_ended_the_retry`,
+     `executor.rs`).
 
    `the_spill_retry_logs_one_info_line_with_its_figures` (`executor.rs`)
    pins the line's field names and values.
