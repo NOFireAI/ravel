@@ -292,7 +292,9 @@ closed builder to the gate and continues merging into the next builder,
 with at most `E` builders in flight (`E` is 2 by default; derived per unit
 instead, see the #3873 amendment), each charged to the tracker's writer term, and awaits the oldest only when the next close
 would exceed `E`. Parts are still PUT in `part_index` order. The sequence,
-the cuts and the bytes do not change.
+the cuts and the bytes do not change. This pipeline runs at one level-2
+worker; several range workers each encode inline (see the range workers
+amendment).
 
 ### D4. Parallel groups
 
@@ -302,7 +304,7 @@ unit's core share (the usable cores divided by `--maintain-unit-concurrency`
 in ravel-server, all usable cores for `compact-bucket`: 8 at the server
 defaults on the 32-core reference box, 32 at concurrency 1; how
 `compact-tenant` states it is in the core share amendment), and the plan
-takes the largest `W1` at or under that share for which D1's constraint (a)
+takes the largest `W1` at or under that share (now derived jointly with `W2`, see the range workers amendment) for which D1's constraint (a)
 and D3's constraint (b) both hold, since a larger `W1` lowers `C`, which
 lowers `G`, which raises `R` until level 2 no longer fits. The per-merge
 budgets are divided per worker: `merge_cursor_budget_bytes` and
@@ -363,7 +365,8 @@ measurement shows the serial level-2 merge below the objective:
 
 Ranges are cut by a data-derived quantum from the run catalogs (the sum of
 the candidate blocks' `record_count` over the range), never by the worker
-count, and consumed from a queue by `W2` workers, so two nodes with
+count, and consumed from a queue by `W2` workers (assigned in contiguous
+blocks instead, see the range workers amendment), so two nodes with
 different core counts produce the same parts. Each range starts a fresh
 part and owns `K` part-index slots: range `r` writes parts
 `r x K .. r x K + K - 1`, `K` 16 by default, and a range that would need a
@@ -372,19 +375,23 @@ format caps `part_index` at 9,999 (`crates/ravel-commit/src/keys.rs:108-112`),
 so a unit of more than 625 ranges fails the same way; hour 498273 at today's
 part size needs about 100 ranges. Whether anything reads part indexes as
 contiguous (the record, the fold, the sweep) is checked in the phase B
-ticket before the rule is fixed.
+ticket before the rule is fixed; the range workers amendment records the
+readers it checked.
 
 The final part memory target does not depend on `W2`: it is a part-close
 trigger (`rlog_memory_target_bytes`, `rlog.rs:2201`), so dividing it by a
 worker count would cut parts at different records on nodes with different
 core counts. A range worker encodes its closed parts inline, not through
-D3's pipelining: the parallelism across ranges replaces it, and it keeps
-the builder count at `W2`. `W2` is bounded by memory: the largest value
+D3's pipelining (when there are several, see the range workers amendment):
+the parallelism across ranges replaces it, and it keeps the builder count
+at `W2`. `W2` is bounded by memory (replaced by each worker's read side in
+the range workers amendment): the largest value
 such that `W2 x final part target` is at most half of
 `merge_memory_budget_bytes` (`crates/ravel-maintain/src/config.rs:1115`),
 and at most the unit's cores. On the 30 GB reference box at concurrency 1
 the derived target is 1 GiB and the budget 8 GiB, so `W2 = 4`; at a 256 MiB
-target set by the operator, `W2 = 16` with parts four times smaller.
+target set by the operator, `W2 = 16` with parts four times smaller. These
+two figures follow from the replaced bound.
 Whether phase B at either `W2` beats phase A's pipelined level 2 is what
 phase A's measurement answers; it is not derived here. Both the target and
 `W2`'s bound are part-split settings in the sense of ADR-0979's 2026-10-02
@@ -656,7 +663,7 @@ parts (330 groups of 2 parts and one of 1) against bounds of 1,689 and
 6,789. The core share, `G`, `R` and `W1` of every row are pinned by the unit test
 `level1_workers_and_encode_builders_at_the_production_shape`.
 
-**Level-1 workers (D4).** `W1` is the largest count at or under the unit's
+**Level-1 workers (D4).** (The range workers amendment derives `W1` jointly with `W2` instead.) `W1` is the largest count at or under the unit's
 core share for which constraint (a) at `C = U / W1` leaves a group of at
 least 2 and the predicted run parts keep (b)'s part term,
 `R x price(the inputs' largest block) + reads in flight + final part target`,
@@ -772,7 +779,7 @@ and scratch writes, never an overcommitted level 2. The parts level 1 wrote stay
 
 Since #4107 runs are written at 1,024 records (D2), but this prediction
 still prices a run block at the inputs' largest block, which ingest writes
-at the 8,192-record default. Its run-block term is therefore about 8x high
+at the 8,192-record default (repriced since, see the range workers amendment). Its run-block term is therefore about 8x high
 (predicted), on the safe side: the price it uses did not change with #4107,
 so it refuses no unit and picks no different `W1` than before #4107, while
 `LevelTwoFit` after level 1 checks the real run blocks. Units that would now
@@ -858,3 +865,157 @@ sets it to `--maintain-unit-concurrency` and `compact-tenant` to
 it, at least 1. `level1_workers` still names `W1` outright and wins over
 the derivation. D4's figures, 8 workers at the server defaults on the
 32-core reference box and 32 at concurrency 1, are unchanged.
+
+## Amendment (2026-11-11): the range workers amendment, level 2 on `W2` workers (#4108)
+
+<!-- amendment-applies: sections="D3. Level 2 over runs|D4. Parallel groups|D5. Range workers (gated)|Amendment (2026-11-06): parallel level-1 workers and a derived encode depth (#3873)|Correction (2026-11-07): constraint (b) counts runs at two blocks per run (#3943)" pointer="range workers amendment" -->
+<!-- amendment-supersedes: phrase="consumed from a queue by `W2` workers" pointer="range workers amendment" -->
+<!-- amendment-supersedes: phrase="`W2 x final part target` is at most half of" pointer="range workers amendment" -->
+<!-- amendment-supersedes: phrase="A range worker encodes its closed parts inline, not through" pointer="range workers amendment" -->
+<!-- amendment-supersedes: phrase="takes the largest `W1` at or under that share" pointer="range workers amendment" -->
+<!-- amendment-supersedes: phrase="`W1` is the largest count at or under the unit's" pointer="range workers amendment" -->
+<!-- amendment-supersedes: phrase="Its run-block term is therefore about 8x high" pointer="range workers amendment" -->
+
+Phase B ships in issue #4108: level 2 runs on `W2` range workers, each
+merging its own contiguous share of the unit's stream ranges into its own
+parts, and `W1` and `W2` are derived together. No CLI or server flag sets
+either count; `CompactorConfig` carries them. This amendment settles the
+three points D5 left open or stated wrongly, and records how the rest of D5
+shipped.
+
+**Each worker's read side bounds `W2`.** D5 bounded `W2` by its builders
+alone, `W2 x final part target` at most half of
+`merge_memory_budget_bytes`. A level-2 worker also holds constraint (b)'s
+read side over every run, so one worker needs
+
+```
+need = R x 2 x price(one run block) + reads in flight + final part target
+```
+
+and `W2` workers fit `U` when `W2 x need <= U`. Each worker plans its
+passes under `U / W2` with its own `MergeMemoryTracker`, and the unit's
+tracker raises each of its high-water marks to at least the workers' sum,
+as level 1's does, so the workers' plans together stay within `U`.
+`each_range_worker_plans_under_its_share_of_the_ceiling` pins the share
+on a unit whose last ranges hold most of the bytes, and the parts test
+below pins the unit's mark at or above the workers' sum. Before
+level 1 the run block is priced at the run block target, not at the inputs'
+largest block: the inputs' highest price per record times the records a run
+block holds, `rlog_run_block_target_records` or a whole group's largest
+inputs if fewer. The prediction `PredictedLevelTwoFit` uses that price.
+After level 1, level 2 checks `need` again against the runs it actually
+wrote, with `resident` the larger of the runs' term and the largest
+level-2 stream estimate (the #3943 correction), and `LevelTwoFit` names the
+ceiling one worker plans under, `U / W2`.
+
+**`W1` and `W2` are derived jointly.** More level-1 workers cut smaller
+groups, so more runs, so a larger `need` per level-2 worker. For each `W1`
+from 1 to the unit's core share whose ceiling `U / W1` leaves constraint
+(a) a group of at least 2,
+
+```
+W2(W1) = min(core share, floor(U / need(W1)))
+```
+
+and the pair kept is the one with the smallest `1/W1 + 1/W2`, ties to the
+smaller `W1` (fewer runs, less scratch). When no `W1` admits one level-2
+worker, the unit is refused with `PredictedLevelTwoFit` before level 1
+reads a block, as before. `level1_workers` still names `W1` outright, wins
+over the derivation and skips the prediction; level 2 then takes the core
+share, capped by what the measured `need` fits. `level2_workers` names
+`W2`: the derivation keeps only the `W1` at which that many workers fit
+`U`, and `Some(0)` is refused, like a zero range quantum or a zero `K`,
+with `InvalidRlogLevel2Setting` before the run's first store request.
+After level 1 a derived `W2` is capped at the range count and at what the
+measured `need` fits, then lowered one worker at a time until every
+worker's plan avoids the cursor mode; it is refused only when one worker
+does not fit `U`. A configured `W2` is capped at the range count and
+refused with its worker ceiling, `U / W2`, when it does not fit.
+
+Predicted on the 19,177-input shape the #3961 plan prices (P 107.7 MB, a
+run block of 3.74 MB, 18 MB in flight, final parts of 1,573 MB, run target
+268 MB), every figure in MB (10^6 bytes) and rounded down; the unit test
+`joint_derivation_scores_every_level1_count_by_both_levels` pins `G`, `R`,
+`W2`, the score and the chosen pair:
+
+| U, cores per unit | W1 | G | R | need | W2 | 1/W1 + 1/W2 | source |
+|---|---|---|---|---|---|---|---|
+| 21,474 MB, 32 | 1 | 196 | 98 | 2,324 | 9 | 1.111 | predicted |
+| 21,474 MB, 32 | 2 | 97 | 198 | 3,072 | 6 | 0.666 | predicted |
+| 21,474 MB, 32 | 3 | 63 | 305 | 3,872 | 5 | 0.533 | predicted |
+| 21,474 MB, 32 | 4 (kept) | 47 | 409 | 4,650 | 4 | 0.500 | predicted |
+| 21,474 MB, 32 | 5 | 37 | 519 | 5,473 | 3 | 0.533 | predicted |
+| 21,474 MB, 32 | 6 | 30 | 640 | 6,378 | 3 | 0.500 | predicted |
+| 21,474 MB, 32 | 7 | 25 | 768 | 7,336 | 2 | 0.642 | predicted |
+| 5,368 MB, 8 (server defaults) | 1 (kept) | 47 | 409 | 4,650 | 1 | 2.000 | predicted |
+| 5,368 MB, 8 | 2 | 22 | 872 | 8,113 | 0 | none | predicted |
+
+At 20 GiB, `W1` 6 ties `W1` 4 at 0.5 and loses to the smaller count, and
+every `W1` above 7 has `W2` at most 2 and scores above 0.5. At the server
+defaults `W1 = 2` already leaves `need` above `U`, so the pair is (1, 1):
+phase B gains nothing per unit there, and the server's parallelism stays
+its four units, as D4 says for level 1. The same test pins that a
+configured `W2` of 9 is taken at `W1` 1 and one of 10 fits no `W1`. The
+unit test `level1_workers_and_encode_builders_at_the_production_shape`
+re-pins D4's shapes under the joint rule, at run blocks of 1,024 records:
+measured-ratio pricing gives (4, 5) at a share of 8 and (17, 11) at 32,
+ceiling pricing (1, 1) and (3, 4).
+
+**Ranges, contiguous assignment and carried views.** Level 2 cuts the
+merged stream order into ranges by a record quantum,
+`rlog_level2_range_records` (2,500,000 by default, predicted: about 97
+ranges for hour 498273's 242 million records). Walking the streams in
+order, each stream adds the records of the candidate run blocks it is the
+first to reach, and a range closes after the stream at which they reach the
+quantum. The cut reads the run catalogs alone, never `W2`. Worker `w` of
+`W2` takes ranges `[w x n / W2, (w + 1) x n / W2)` of the `n` ranges, a
+contiguous block, in place of D5's shared queue. Within a worker a decoded
+block whose rows run past a pass's last stream is not released: its
+unexhausted view is carried into the worker's next pass, across a range
+boundary too, so each such block is decoded once per worker. The carried
+view keeps the charge it was decoded under, and the next pass's cut counts
+it, so it adds no memory term. A block straddling two workers' streams is
+decoded by each, predicted at most `W2 x R` extra decodes per unit. Parts
+depend on the cuts, not on the assignment, so every `W2` publishes the same
+keys and bytes; `range_workers_emit_the_same_parts_at_every_worker_count`
+pins that at `W2` 1, 2 and 4. A unit of one range publishes what the
+single-level merge does, which `two_level_merge_matches_single_level_bytes_and_keys`
+pins; a unit of several ranges cuts a part at each range start and differs
+from it. No ravel-maintain test pins a golden content-hash vector of a
+two-level unit's parts, so none was re-pinned.
+
+**Part-index slots.** Range `r` numbers its parts from `r x K`, `K` being
+`rlog_level2_range_slots` (16 by default), and the part it would open past
+`r x K + K - 1`, or past the part key's 9,999, is refused with
+`TwoLevelCheck::RangeSlots` before its builder opens, so its records are
+never encoded and it is never PUT. A unit whose ranges times `K` exceeds
+10,000 is refused the same way before level 2 opens a part.
+`a_range_needing_more_than_k_parts_is_refused_before_encoding` pins it at
+`K` 2, and `level2_workers_are_capped_at_the_ranges_and_slots_at_the_key`
+pins the unit-wide refusal at 4 ranges of `K` 2,501, together with a
+configured `W2` of 8 capped at those 4 ranges. The readers of `part_index` were checked for contiguity: the key's
+`format_part_index` (four digits) and `reconstruct_l1_part_key` in
+ravel-commit, the fold's `writer_epoch` and `snapshot_resolve`'s rebuild of
+it in ravel-catalog, the snapshot order's tiebreak, the sweep and the
+reachability walk in ravel-maintain, and the query's L0 identity guard and
+record lookup in ravel-query. Each reads an index as a value, none as a
+position, so gaps between ranges are allowed.
+
+**`Level2Stop`.** Level 2 shares a stop token like level 1's. The first
+error any range worker returns, a lost claim among them, sets it, and every
+worker checks it before each range and immediately before each part PUT,
+so none issues another part PUT once it is set; a PUT already issued when
+it is set still completes. The unit returns that first error. Parts already
+PUT are content-addressed orphans no record references, and the
+unreferenced-part sweep ages them out. The compaction record is written
+once, by the unit after every worker has returned, under `CreateIfAbsent`,
+as before. `a_failed_level2_worker_stops_every_level2_worker` pins it.
+
+**Encode.** One level-2 worker keeps D3's pipeline with `E` builders, so
+the server defaults encode as before. Several encode each closed part
+inline, one builder per worker, the final part target its fit was checked
+with.
+
+**Counters.** `level2_workers` and `level2_ranges` are in the request
+ledger and on the `rlog two-level merge`, `compaction store requests by
+phase` and `compaction merge ended` log lines.

@@ -1469,18 +1469,24 @@ impl Clock for AfterFirstRunPart {
 }
 
 /// A store that notes the ledger's scratch writes issued, and their bytes, at
-/// the moment its one scripted fault, of kind `fault`, fires.
+/// the moment its one scripted fault, of kind `fault`, fires, with the L1 part
+/// PUTs that had reached it by then.
 struct NoteScratchAtFault {
     inner: FaultStore<MemoryStore>,
     ledger: RequestLedger,
     fault: (Op, FaultKind),
     at_fault: std::sync::Mutex<Option<ScratchAtFault>>,
+    /// L1 part PUTs in the order they reach the store: the ledger counts a
+    /// part PUT when the worker's thread sees its reply, which can be after a
+    /// later PUT faulted.
+    part_puts: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ScratchAtFault {
     writes: u64,
     bytes: u64,
+    part_puts: u64,
 }
 
 /// Level-1 workers run as their own tasks, so between a worker's failing store
@@ -1511,7 +1517,12 @@ impl NoteScratchAtFault {
             ledger: ledger.clone(),
             fault,
             at_fault: std::sync::Mutex::new(None),
+            part_puts: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn part_puts(&self) -> u64 {
+        self.part_puts.load(Ordering::SeqCst)
     }
 
     fn note(&self) {
@@ -1522,6 +1533,7 @@ impl NoteScratchAtFault {
                 *at = Some(ScratchAtFault {
                     writes: report.scratch_writes,
                     bytes: report.scratch_write_bytes,
+                    part_puts: self.part_puts(),
                 });
             }
         }
@@ -1536,6 +1548,9 @@ impl ObjectStoreBackend for NoteScratchAtFault {
         data: Bytes,
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
+        if key.contains("/l1/") {
+            self.part_puts.fetch_add(1, Ordering::SeqCst);
+        }
         let outcome = self.inner.put(key, data, opts).await;
         self.note();
         outcome
@@ -1712,6 +1727,90 @@ async fn a_failed_level1_worker_stops_every_level1_worker() {
     assert_eq!(report.level2_passes, 0, "{report:?}");
     assert_eq!(report.part_put.requests, 0, "{report:?}");
     assert_eq!(report.publish.requests, 0, "{report:?}");
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .expect("scratch dir")
+        .map(|e| e.expect("entry").file_name())
+        .filter(|n| n.to_str().is_some_and(|n| !n.ends_with(".lock")))
+        .collect();
+    assert!(left.is_empty(), "the scratch unit was removed: {left:?}");
+}
+
+/// ADR-3853 D5 amendment: level 2's range workers share a stop token as
+/// level 1's do. Four range workers over four ranges; the PUT of part 2,500,
+/// the first part of range 1's window, fails for good. Its worker stops the others, and
+/// each other worker is past at most the part PUT it was already issuing: at
+/// most `W2 - 1` part PUTs follow the fault. The unit returns that error,
+/// publishes no record, and the parts already written are orphans for the
+/// sweep.
+#[tokio::test]
+async fn a_failed_level2_worker_stops_every_level2_worker() {
+    let clock = FixedClock::new(sealed_now_ns());
+    let dir = fresh_scratch("failed-level2-worker");
+    let per_input = sixty_inputs_per_input_bytes(&dir).await;
+
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("part 2500 lost".to_string()),
+        )
+        .with_key_contains(".2500.")
+        .with_occurrence(Occurrence::Nth(1)),
+    );
+    let ledger = RequestLedger::new();
+    let store = NoteScratchAtFault::new(
+        FaultStore::new(MemoryStore::new(), plan),
+        &ledger,
+        (Op::Put, FaultKind::Permanent),
+    );
+    let b = seed_sixty_rlog_inputs(&store).await;
+    let config = CompactorConfig {
+        request_ledger: Some(ledger.clone()),
+        level2_workers: Some(4),
+        rlog_level2_range_records: 600,
+        rlog_l1_part_memory_target_bytes: Some(24 * 4096),
+        rlog_run_block_target_records: 40,
+        ..two_level(
+            CompactorConfig::default(),
+            4 * (8192 + 12 * per_input + per_input / 2),
+            8192,
+            1,
+            &dir,
+        )
+    };
+    let seeded = list_all(&store, "")
+        .await
+        .expect("list seeded objects")
+        .len();
+    let err = ravel_maintain::compact_bucket(&store, &clock, &config, &b)
+        .await
+        .expect_err("a lost part fails the unit");
+    assert!(err.to_string().contains("part 2500 lost"), "{err}");
+    assert_eq!(
+        store.inner.fault_count(Op::Put, FaultKind::Permanent),
+        1,
+        "the scripted part PUT failure fired exactly once"
+    );
+
+    let report = ledger.report();
+    assert_eq!(report.level2_workers, 4, "{report:?}");
+    assert_eq!(report.level2_ranges, 4, "{report:?}");
+    let at_fault = store.at_fault.lock().unwrap().expect("the PUT failed");
+    // Counted in the order the PUTs reached the store, the failed one among
+    // those before the fault.
+    let after = store.part_puts() - at_fault.part_puts;
+    assert!(
+        after < report.level2_workers,
+        "{after} part PUTs followed the fault with {} workers: {report:?} {at_fault:?}",
+        report.level2_workers
+    );
+    assert_eq!(report.publish.requests, 0, "{report:?}");
+    assert!(record_keys_in(&store, &b).await.is_empty());
+    let orphans = list_all(&store, "").await.expect("list objects").len() - seeded;
+    assert_eq!(
+        orphans as u64,
+        report.part_put.requests - 1,
+        "every accepted part PUT left one unreferenced part: {report:?}"
+    );
     let left: Vec<_> = std::fs::read_dir(&dir)
         .expect("scratch dir")
         .map(|e| e.expect("entry").file_name())

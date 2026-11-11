@@ -112,7 +112,9 @@ pub enum TwoLevelCheck {
     /// one of its parts, or in two when a cut falls inside it (ADR-3853,
     /// #3943 correction). The block term is the larger of
     /// `runs x blocks_per_run x run_block_bytes` and the largest stream's
-    /// level-2 estimate, which prices a larger stream.
+    /// level-2 estimate, which prices a larger stream. With several level-2
+    /// workers the ceiling is one worker's share, `U / W2` (ADR-3853 D5
+    /// amendment).
     LevelTwoFit {
         /// Runs merged at level 2, one per level-1 group, however many parts
         /// each was cut into.
@@ -128,19 +130,22 @@ pub enum TwoLevelCheck {
         in_flight_bytes: u64,
         /// The final parts' memory split target.
         part_target_bytes: u64,
-        /// The resident ceiling `U`.
+        /// The ceiling one level-2 worker plans under: `U / W2`, `U` itself
+        /// at one worker.
         ceiling_bytes: u64,
     },
-    /// Constraint (b) priced before level 1 reads a block (ADR-3853 D4): at
-    /// no level-1 worker count up to the unit's core share do the runs level
-    /// 1 would write fit level 2, so the unit is refused without running
-    /// level 1. Shown at one worker, the count with the fewest runs.
+    /// Constraint (b) priced before level 1 reads a block (ADR-3853 D4, D5):
+    /// at no level-1 worker count up to the unit's core share do the runs
+    /// level 1 would write fit one level-2 worker (or the configured level-2
+    /// worker count), so the unit is refused without running level 1. Shown
+    /// at one worker, the count with the fewest runs.
     PredictedLevelTwoFit {
         /// Runs level 1 would write at one worker, `ceil(N / G)`.
         runs: u64,
         /// The level-2 blocks priced per run, 2.
         blocks_per_run: u64,
-        /// The price of one level-2 block, taken from the inputs' largest.
+        /// The predicted price of one level-2 block: the input blocks' highest
+        /// price per record at the records a run block holds.
         block_bytes: u64,
         /// `P`, the largest per-input term of constraint (a).
         per_input_bytes: u64,
@@ -150,7 +155,8 @@ pub enum TwoLevelCheck {
         in_flight_bytes: u64,
         /// The final parts' memory split target.
         part_target_bytes: u64,
-        /// The resident ceiling `U`.
+        /// The ceiling one level-2 worker plans under: the resident ceiling
+        /// `U`, or `U / W2` with the level-2 worker count configured.
         ceiling_bytes: u64,
     },
 }
@@ -411,6 +417,39 @@ pub enum MaintainError {
         /// The check that refused, with its figures.
         check: TwoLevelCheck,
     },
+    /// A range of an RLOG merge needs a part index outside its window
+    /// (ADR-3853 D5 amendment): the range numbers its parts from `first`, and
+    /// the part it would open next is at `part_index`, at or past `limit`.
+    /// Refused before that part's builder opens, so its records are never
+    /// encoded.
+    #[error(
+        "RLOG compaction refused: range {range} needs part index {part_index}, outside its window [{first}, {limit}) of the part key's indexes (ADR-3853); refused before encoding that part, the L0 inputs stay live"
+    )]
+    PartRangeWindow {
+        /// The range, counted from 0 over the unit's ranges.
+        range: u64,
+        /// The first part index of the range's window.
+        first: u64,
+        /// One past the last part index of the range's window.
+        limit: u64,
+        /// The part index the range needed.
+        part_index: u64,
+    },
+    /// An RLOG merge's records pass `keys` times its range quantum, so a full
+    /// range's part-index window would hold no index (ADR-3853 D5
+    /// amendment). Refused from the inputs' record counts before a part is
+    /// encoded.
+    #[error(
+        "RLOG compaction refused: {records} records cut at a range quantum of {quantum} need more ranges than the part key's {keys} indexes give windows (ADR-3853); nothing published, the L0 inputs stay live"
+    )]
+    PartKeySpace {
+        /// The unit's records, summed from its inputs' footers.
+        records: u64,
+        /// The range quantum, [`crate::CompactorConfig::rlog_level2_range_records`].
+        quantum: u64,
+        /// The part indexes a part key carries.
+        keys: u64,
+    },
     /// The filesystem holding the scratch directory has less free space than
     /// the two-level merge's runs need once the units of this process already
     /// running there have their share set aside (ADR-3853 D2). Raised before
@@ -457,6 +496,8 @@ pub enum MaintainError {
     InvalidRlogZstdLevel(#[from] crate::config::RlogZstdLevelError),
     #[error("RLOG compaction refused before writing any part: {0}")]
     InvalidRlogRunBlockTarget(#[from] crate::config::RlogRunBlockTargetError),
+    #[error("RLOG compaction refused before writing any part: {0}")]
+    InvalidRlogLevel2Setting(#[from] crate::config::RlogLevel2SettingError),
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
     /// The ADR-1702 read gate returned no result for a maintenance decode or
