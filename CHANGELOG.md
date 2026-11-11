@@ -6,6 +6,191 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-11-11
+
+### Added
+
+- **PromQL stats break the label-value route down per value.**
+  `data.stats.labelIndexValues` lists one object per distinct routed value,
+  identified by `valueKey8`, its `key8` in hex, and the `labels` whose
+  equalities carry it, with that pass's leaf GETs, wire bytes,
+  cache hits, part outcomes, and the segments it alone pruned. The leaf GETs
+  of all entries sum to the metrics route's own leaf GETs, which are the
+  `keyIndex` phase's GETs for a statement that reads only metrics. The field
+  is absent when the route did not run.
+- **MetricsBench runs ADR-3694's Stage 1 lanes with `MB_STAGE1=1`** (issue
+  #3968). On the `cardinality` and `ci` profiles, `run.sh` starts
+  ravel-server with `--fold-key-index-leaves`, and after the folded read-back
+  recreates it with `--disable-fold` so no background fold runs from then on,
+  folds, inspects the snapshot and refuses the unrouted pass if any part
+  carries a `label_value` leaf, queries the corpus (`folded-unrouted`),
+  rebuilds the key index with `--metrics-label-index` and stamps each rebuild
+  request by name, recreates the server with `--fold-metrics-label-index`,
+  inspects again and refuses the routed pass if fewer parts carry a
+  `label_value` leaf than the rebuild reported, and queries again
+  (`folded-routed`), each pass stamping its cold record count.
+  `stage1-compare.json` compares the two passes' result hashes and, per
+  ADR-3694 row 9, each entry's set of record statuses, and counts each
+  pass's records with a status other than ok or incorrect, ok or incorrect
+  records with no hash, ok or incorrect records with no label-index figure,
+  and label-index prunes. `holders.json` counts, per selective statement and without the
+  router, the L0 and L1 data objects overlapping its window, those of them
+  holding a series of its metric, and those holding a matching series, and
+  marks a statement whose selectors do not all carry a `label="value"`
+  matcher as not route-bound; the run stamps each statement whose unrouted
+  `segmentsFetched` differs from what the resolve is expected to fetch (the
+  objects holding its metric when every selector names one metric, else
+  every object in the window). Every `ravel_cost` record carries the segment counters,
+  `estimate`, `io`, `pass_label`, `fold_state` and a `result_hash`
+  independent of series order, and the folded read-back records each query's
+  `data.stats`, its per-phase request and byte sums, and the process-wide
+  catalog GET delta. A Stage 1 run marks the main report's provenance
+  `comparable=false` with its reason. `stage1-check.sh BANDS OUT-DIR` checks
+  a run against a band file (`stage1-bands.ci.json` for `ci`,
+  `stage1-bands.cardinality.json` for `cardinality`, which an AWS box takes
+  as `MB_STAGE1_BANDS`); the nightly
+  workflow's manual dispatch takes a `stage1` input, and an AWS box with
+  `MB_STAGE1=1` checks both its runs and ends non-zero on a band failure.
+  Without `MB_STAGE1` the server's command line is unchanged (`run.test.sh`
+  cases a, z0 to z28 (with z2b, z8a, z8b, z26u and z28a to z28f), the
+  `stage1-check` and the `box-run` cases).
+- **MetricsBench runs ADR-3694's remaining Stage 1 arms on an AWS box**
+  (issue #3969). With `MB_STAGE1=1`, `MB_CONTROL_IMAGE` and
+  `MB_CONTROL_SOURCE_COMMIT` (a digest-pinned image and its commit) run the
+  unrouted pass again on that build and compare GETs, wire bytes and latency
+  per statement and phase in `stage1-control-compare.json` (row 12).
+  `MB_STAGE1_ARMS`, a comma list of `extra-hour`, `l1` and `erasure`, adds
+  the arms that change the tenant: one more ingest hour folded with leaves
+  from the routed catalog HEAD and without them from the leafless HEAD,
+  stamping the wall ratio, the leaf bytes over the re-encoded parts' data
+  bytes and any uncovered part (row 7); `maintain compact-tenant` to L1, a
+  leafy fold and a routed pass whose hashes must equal the routed pass's
+  with no refusal (row 6, #3818); and an erasure of
+  `instance=metricsbench-instance-0`, a pending pass compared with a
+  reference that excludes the subject, the rewrite run by a one-off
+  `ravel-server --mode maintain` container once the submit hour seals, and
+  a before and after listing that must show no data-object key surviving
+  and no pre-erasure part or leaf still referenced over an erased hour
+  (row 8). Each arm is stamped under `stage1.arms`, an arm that is off
+  stamps its keys `skipped: arm off`, and 26 of the 62 figures in
+  `stage1-bands.ci.json` are checked only when their arm ran (one of them
+  only on an erasure run without the `extra-hour` and `l1` arms), through a
+  new `when` condition in `stage1-check.sh`. `aws/launch.sh` passes the
+  switches to the measured run only; the nightly sets none.
+- **`--sql-spill-merge-fan-in` sets the SQL spill merge fan-in** (#3899,
+  ADR-0954 item 2). The most spill files a spill-enabled statement's spill
+  merge reads per pass, 2 since 0.31.0, is now a startup setting
+  (`SpillConfig::merge_fan_in`); the default stays 2. `0` leaves the merge
+  unbounded and `1` is refused at startup. The startup log reports the value
+  on a `performance default resolved` line, `sql_spill_merge_fan_in`, with
+  `source=flag` when the flag was passed, whatever its value, and
+  `source=default` otherwise; with spill off it logs `value=none` with the
+  spill directory's source.
+- **A `GROUP BY ... ORDER BY <group key> LIMIT n` holds only its best keys in its final aggregate.** A statement such as ClickBench row 43's per-minute page (`ORDER BY M LIMIT 10 OFFSET 1000`) built every group before the sort picked a page; a new `TopKeysAggregateExec` replaces the final aggregate and cuts each partition back to its best `n + s` keys whenever it holds twice that many, so the charged peak on a 1,000,000-key `ORDER BY k LIMIT 10` fixture falls from 60 to 71 MB to 4.1 to 8.9 MB and every returned group keeps its exact aggregates. Float keys, aggregates with float state other than a non-distinct `avg` (a float `sum`, for one), `FILTER` or `ORDER BY` inside an aggregate, a `HAVING` filter, an order by an aggregate, and a bound above `SqlConfig::bounded_top_keys_max_limit` (default 1024; 0 turns the rule off, and ravel-server has no flag for it) keep the existing plan (ADR-4002).
+- **The bounded top-keys aggregate admits float `avg`.** A grouped
+  `ORDER BY <key> LIMIT n` statement whose aggregates include a non-distinct
+  `avg` over a `Float64` or `Float32` column, such as `avg(latency)` per
+  minute bucket, now plans `TopKeysAggregateExec` instead of the stock
+  aggregate. Its sum and count state survives each rebuild bit for bit,
+  including -0.0, NaN payloads, infinities and subnormals. Float `sum` and any
+  same-named `avg` with another accumulator keep the stock plan.
+- **`ravel-cli catalog fold --retention-default DURATION`.** A fold by hand
+  can now apply the deployment-default retention window (a humantime duration
+  such as `30d`) to a tenant whose config record sets none, so its frontier
+  reconcile observes retention tombstones outside the fixed reconcile window.
+  A tenant's own `retention_ns` still wins, and `0` is refused.
+- **The bucketed final aggregate can spill its routed state.** Under a memory refusal it writes each routed row to its bucket's scratch file once and reads each bucket back once; the spill retry's INFO line now reports the exchange and bucket spill phases separately. ravel-server raises its soft open-file limit to the hard limit at startup and logs both as `nofile_soft` and `nofile_hard`; when the hard limit is unbounded or the kernel refuses the raise, the soft limit stays as inherited and the log says which.
+- **The fold report carries the figures ADR-3939's harness reads.**
+  `ravel-cli catalog fold` prints `sealed_part_puts`,
+  `sealed_day_leaf_puts`, `sealed_day_previous_leaf_gets`,
+  `key_index_unchanged_section_gets`, `head_digest` and `retired_hours` in
+  text and `--json`, each counted by the fold itself rather than derived
+  from store logs. `head_digest` ignores the HEAD's folder id and creation
+  time.
+- **`maintain compact-bucket` and `compact-tenant` take `--level2-workers`
+  and `--run-block-records`.** They set the two-level RLOG merge's level-2
+  range worker count and its level-1 run block size, each refused at 0 or
+  without `--scratch-dir`, and a two-level bucket's report now names the
+  `level2_workers` and `level2_ranges` the merge ran with.
+
+### Fixed
+
+- A compaction claim object that cannot be decoded, including one written by a newer release in a claim format this release cannot read, no longer holds its bucket until an operator deletes it: once older than the 24 h lease ceiling plus jitter, compaction or erasure takes it over with a compare-and-swap and proceeds, so such an object stalls an erasure for at most about a day unless something keeps rewriting it. A running maintenance process looks at the bucket again about once per claim lease, so deleting the key by hand still releases it within one lease. On a `compact-tenant` or `compact-bucket` ClaimSkipped line with `reason=unreadable_claim`, `claim_expiry_unix_ms` and `retry_after_unix_ms` now give the 24 h steal threshold instead of one lease, and a new trailing `recheck_after_unix_ms` gives the instant a running maintenance process next looks; for every other reason it equals `retry_after_unix_ms`.
+- The GC reachability sweep now refuses a HEAD-named snapshot part whose header names another tenant, blocking the delete fail-closed instead of reading it.
+- The on-demand catalog fold's outcome classification, the startup format-window audit and `ravel-cli catalog inspect` now refuse a snapshot part whose header names another tenant instead of decoding it; the on-demand fold counts the refusal on `ravel_catalog_isolation_breach_total`. The GC reachability sweep also refuses a snapshot HEAD whose header names another tenant or signal, blocking deletes fail-closed.
+- An aggregate's reserve-ahead refusal no longer reports other queries' or the process's memory, and still names whether the process memory budget or the host memory gate refused.
+- `ravel-cli maintain compact-tenant` with a bucket concurrency above 1 now
+  gives each bucket its share of the usable cores for level-1 merge workers
+  and level-2 encodes, instead of every bucket deriving them from all of the
+  cores.
+- A SQL scan, fetcher or live reader refused by the process memory budget
+  or the host memory gate now makes the catalog's decoded part and postings
+  caches give back the entries no reader holds, after the decoded
+  column-block cache, when those entries cover the shortfall; a larger
+  shortfall still fails without evicting them.
+  `ravel_catalog_decoded_cache_memory_evictions_total` now counts these
+  evictions too.
+- **A compaction claim lease configured above 24 h no longer widens the
+  contender's jitter.** ClaimGuard priced the jitter it waits before a steal
+  from the raw configured lease while the claim observation priced it from
+  the lease clamped at the 24 h ceiling; both now use the clamped lease. A
+  contender that loses a steal now waits at most the 24 h ceiling before it
+  looks again. The operations guide now says that each recheck of an
+  unreadable claim costs a rejected CreateIfAbsent PUT as well as one GET and
+  one HEAD.
+- **The on-demand fold's entry-set comparison charges its id sets to the
+  memory budget.** The sets it accumulates from up to eight differing parts
+  per side were held unaccounted once each part's decode charge was
+  released. The comparison now reserves 288 bytes per compared entry, from
+  the entry counts HEAD declares, before it reads any part, holds that
+  reservation until the comparison ends, and declines the comparison
+  (answering published) when the budget cannot admit it or when a part holds
+  a different number of entries than HEAD declares for it.
+
+### Changed
+
+- A key `IN` list of two or three values, and the same list written as `=` comparisons on one column joined by `OR`, now uses the key index instead of reading every object in the time window.
+- A key-set IN lookup through the key-index leaves, and each value pass of the PromQL label-value route, now reads a part's leaf bytes concurrently, so planning takes a few round trips per part instead of one per bucket run. Under memory pressure, a part holds the fetch memory of the first leaf read of every slice it goes on to decode until that slice finishes decoding, and up to 16 of its leaf reads ask for more fetch memory at once; a refused one is not waited for, so more parts can fall back to the tier-1 probe than before; the rows the lookup returns do not change. Because every slice's first leaf read is now issued, a key-index leaf bound to another tenant or signal fails the statement wherever in the part it is, including slices a one-at-a-time probe would never have reached.
+- With the key-index leaf switch on, the fold now also seals a snapshot part at every UTC day boundary, so a sealed day keeps its leaves and an advancing fold rebuilds the leaves of the latest UTC day, once those of the day it seals, and those of any sealed day a late record changes, instead of the whole tail; every process folding a tenant must now agree on the switch, and a switch-off fold over a HEAD with leaves reports `key_index_switch_off_over_leaves` and logs a warning. The fold report, and `ravel-cli catalog fold` in text and `--json`, also carries `key_index_pair_budget`, the pair budget the key-index leaf build ran under, and `key_index_field_pairs`, each indexed field's key pairs, a declared field with none included. The report also carries `key_index_parts_missing_declared_leaves`, the count of parts the fold carried by reference that lack a declared field's key-index leaf, and a nonzero count logs a warning: the fold never builds leaves for a carried part, so `ravel-cli catalog fold --rebuild-key-index` repairs a day sealed under the metrics erasure gate or before the field was declared, while a field over the metrics byte cap or with no indexable entries stays counted. The first switch-on fold re-encodes every part that spans more than one UTC day and builds every day's leaves once.
+- The tier-2 key-index router's leaf GET ceiling now scales with the key set, `1,024 x (1 + min(k, 64))` for `k` keys (2,048 for a single key, as before), so a 100-key `IN` list over 30 logs day parts is covered at tier 2 instead of sending 14 days to the tier-1 probe; a part whose worst-case leaf GETs exceed twice its segments in the routed snapshot (the query's window) is left to tier 1 without a leaf GET and counted in the new `stats.keyIndex.partsOverTierOne` and `ravel_query_key_index_parts_total{outcome="over_tier_one"}`, not in `partsUncovered`.
+- **The hash exchange under a SQL statement's final grouped aggregate has at
+  least 16 partitions while the partition count is derived.** A
+  high-cardinality `GROUP BY` on a small host then builds smaller final hash
+  tables and answers without the spill retry more often. Scans and the first
+  partial aggregation keep the derived count, and a statement with no such
+  exchange (aggregates that are not exact-typed, or the sort-merge spill
+  retry) is unchanged, as is one whose plan pairs the partitions of two inputs (a
+  `UNION` that DataFusion interleaves, a partitioned hash join or a
+  sort-merge join).
+  `--sql-partition-count` or `--fetch-concurrency` turns the floor off.
+  Startup logs the exchange's count as `setting="sql_first_attempt_partitions"`.
+  The bucketed spill retry (below) plans its hash exchange at this same
+  count.
+  With `--sql-bucketed-final-aggregation` on (off by default), a host under
+  8 cores now runs 16 bucketed streams, about 290 MB per statement instead
+  of about 150 MB; size `--sql-max-query-bytes` for that or set
+  `--sql-partition-count`.
+- `ravel-server --help` lists its flags in a different order, grouped by
+  area. No flag's name, environment variable, default or help text changed.
+- **MCP results for 2026-07-28 clients carry cache hints.** With rmcp 3.9.0, a client that negotiated protocol 2026-07-28 receives `"ttlMs": 0` and `"cacheScope": "private"` on every `tools/list` result and on the other cacheable list and read results, which rmcp 3.2.0 left out. Clients on 2025-11-25 see no change. A POST to `/mcp` that carries no `Mcp-Session-Id` and is not `initialize` is now answered 400 instead of 422.
+- The key-index leaf build now carries a re-encoded part's entries from every previous part with leaves whose hour range overlaps it, so a sealed day that a late record changes, or a part spanning more than one UTC day that a retention tombstone changes, is rebuilt from its own previous leaves instead of from every entry's sections, and it fetches only each previous part's lowest leaf slice per field before the build starts, fetches each later slice when a build pass reaches it, and drops a slice once a pass starts past it, instead of holding every previous leaf for the whole build. The fold report, and `ravel-cli catalog fold` in text and `--json`, carries `key_index_carry_peak_held_bytes`, the most previous-leaf bytes the carry held at once while building one part.
+- **A retention tombstone in a sealed key-index day no longer re-encodes it.** With the key-index leaf switch on (`--fold-key-index-leaves`, off by default), a fold that finds a retention tombstone in an hour of a sealed snapshot part that carries key-index leaves and lies within one UTC day records the hour in the part's new `retired_hours` (snapshot part ref field 9) instead of re-encoding the part and rebuilding its leaves, and the resolve hides that hour's segments from both key-index tiers; once every hour the part holds is retired, the part leaves HEAD with no PUT. A part spanning more than one UTC day (written with the switch off, its leaves attached by `--rebuild-key-index`) still re-encodes without the tombstoned hour at the fold that finds it. The catalog HEAD format changes for logs, spans and metrics alike: a HEAD is written with `format_version` 2 exactly when some part carries retired hours, and with 1 otherwise. A reader that predates this release refuses a version 2 HEAD instead of serving a retired hour: its resolve falls back to listing, its SQL column-statistics load answers an eligible logs statement with a retryable 503, its maintain deletes nothing for that tenant and signal, its fold fails closed, its `ravel-server` started with `--format-window-check refuse` fails startup when that tenant is one of its fold or alert-rule tenants, and its `ravel-cli catalog inspect` refuses the HEAD (docs/catalog-and-mvcc.md, "Mixed versions"). A compaction or erasure rewrite record in a tombstoned hour that the snapshot does not yet reflect still re-encodes the part at the fold that lists it. A retired hour's objects stay named by HEAD, and so are not deleted by retention, until the part re-encodes or leaves HEAD. `ravel-cli catalog inspect` prints the HEAD's `format_version` and each part's retired hours, and takes `--json`.
+- A SQL statement refused for memory now retries through a hash exchange and the bucketed final aggregate when it reads exactly one `logs` scan, its final aggregate is one the bucketed final aggregate admits (ADR-3565: integer, date, timestamp, time or interval group keys, exactly typed state, no grouping sets and no `ORDER BY` inside an aggregate), and its plan holds only operators the retry knows how to spill. Every other statement keeps the sort-merge retry, and so does one whose derivation returns no tuning, for instance when the plan would not fit the open-file budget or a chunk would fall below its 1,024-row floor; the log line names the reason. The bucket count and chunk size are derived from the process's open-file limit and from a memory limit, and the bucketed retry's memory pool runs at that same limit. When the tenant budget, the process budget or the aggregate reserve-ahead refused the first attempt, that limit is the room the refusing budget had left for this statement at the refusal (its limit less what other statements, and on the process budget the fetch layer and caches, held), capped at the per-query limit; after any other refusal, the host memory gate's included, it is the per-query limit. The retry's log line names `retry_plan` (`bucket`, `bucket_without_disk` when the bucketed plan ran with no disk manager that allows temp files, or `sort_merge`), the reason a statement kept the sort-merge retry, the derived `bits` and `routed_chunk_rows`, the limit the retry was sized by (`effective_limit_bytes`), and `retry_refusal`, the refusal that ended a failed retry, read from its error (`spill_hard_bound` and `spill_cap` name the spill-mode pool's own bounds). Startup logs two more lines, `sql_spill_retry_descriptor_budget` (the soft open-file limit over twice the spill share count) and `sql_spill_retry_modes`, which names the bucketed retry only when that budget is at least three descriptors per exchange partition. Measured on ClickBench before this release (#4072, comment 6802934028): every statement answers on c6a.large, c6a.xlarge and c6a.2xlarge, and statement 33's hot time is 9.4 s on c6a.2xlarge and 17.5 s on c6a.xlarge, against 82.0 s and 91.5 s in the published v0.31.1 results. Known limits: a statement that groups by a string key keeps the sort-merge retry (#4132), and so does statement 33 on c6a.large, where the derivation returns no tuning (#4133). Under ten concurrent connections, successful queries per second are 0.74, 0.76 and 0.85 of v0.28.0's on c6a.2xlarge, c6a.xlarge and c6a.large; the measured cost is the sort-merge spill retries of the string-keyed statements (#4132).
+- A two-level RLOG merge now writes its scratch runs at 1,024 records per block instead of 8,192, so level 2 holds a smaller block per run. The block target alone leaves published parts unchanged in an unkeyed bucket and for a keyed stream that does not batch (the range cut in the next entry does change them); a keyed stream that ADR-2135 batch-major emission batches by reservation may cut its parts differently, since a run's reservation shrinks with its block target (exact either way, every record conserved). The target is the new `rlog_run_block_target_records` field on `CompactorConfig`, and zero is refused. `ravel-cli maintain compact-bucket` and `compact-tenant` set it with `--run-block-records` (above); ravel-server has no flag for it yet (#4110).
+- Every RLOG compaction, single-level too, now cuts a part at each 2,500,000-record range start and numbers each range's parts from its record share of the part key's 10,000 indexes, so the single-level merge and a two-level merge at any worker count cut at the same records and number each range in the same window. They also publish the same keys and bytes, except for a keyed bucket's batch-major streams (ADR-2135 decision 2): batches cut over level-1 runs differ from batches cut over the inputs, and level 1 batches under `merge_cursor_budget_bytes / W1`, so such a stream may cut its parts differently by route and by level-1 worker count (ADR-3853 D3). A unit that stays one range, which every unit under 2,500,000 records does, publishes the same parts as before; a unit cut into two or more ranges publishes different part keys than earlier runs of the same inputs did. A range's window grows with the records it has emitted, so a range holding more than 2,500,000 records gets their share of the indexes. A two-level RLOG compaction now runs its second level on several range workers when its memory allows: each worker merges a contiguous block of ranges under its share of the unit ceiling. The level-1 and level-2 worker counts are derived together, each level-2 worker's read side counted against the ceiling, so the counts depend on the bucket's shape: on the shape of #3961's table at the server defaults the derivation keeps one worker at each level, while on the production shape the tests pin (a core share of 8, a 5 GiB ceiling, a 19,177-input bucket at measured-ratio pricing) it runs 4 level-1 and 5 level-2 workers, and one of each at ceiling pricing. Two new typed refusals stop a unit before the part that cannot be numbered is encoded: `PartRangeWindow` when a range's parts are too small for its window of indexes (under about 1/10,000 of the unit's records each, past the indexes the window holds when the range opens), and `PartKeySpace`, raised before the first part is encoded, when a unit holds more than 10,000 times the range quantum in records. Neither publishes anything nor writes a compaction record, and neither stops the scan or maintain pass: the bucket is counted as refused and held in memory as terminal, its retention still runs, and the shard's later hours still compact. The first failing level-2 worker stops the others before their next part write. The request report, the `rlog two-level merge` line and the `compaction merge ended` line carry `level2_workers` and `level2_ranges`, the last one also for a run without a request report.
+
+### Security
+
+- **rustix moves from 1.1.4 to 1.1.6** (RUSTSEC-2026-0486). ravel-server
+  links it directly when built with SQL, as the published images are, and
+  through `tempfile`.
+- **rmcp moves to 3.9.0.** The MCP endpoint's Streamable HTTP server
+  transport no longer keeps an unbounded tool schema cache
+  (RUSTSEC-2026-0461). The two client-side advisories the same release
+  clears, RUSTSEC-2026-0457 (OAuth client SSRF) and RUSTSEC-2026-0462
+  (client response buffering), do not reach Ravel, which runs no rmcp
+  client.
+
 ## [0.31.1] - 2026-11-09
 
 ### Added
