@@ -895,7 +895,10 @@ need = R x 2 x price(one run block) + reads in flight + final part target
 and `W2` workers fit `U` when `W2 x need <= U`. Each worker plans its
 passes under `U / W2` with its own `MergeMemoryTracker`, and the unit's
 tracker raises each of its high-water marks to at least the workers' sum,
-as level 1's does, so the workers' plans together stay within `U`. Before
+as level 1's does, so the workers' plans together stay within `U`.
+`each_range_worker_plans_under_its_share_of_the_ceiling` pins the share
+on a unit whose last ranges hold most of the bytes, and the parts test
+below pins the unit's mark at or above the workers' sum. Before
 level 1 the run block is priced at the run block target, not at the inputs'
 largest block: the inputs' highest price per record times the records a run
 block holds, `rlog_run_block_target_records` or a whole group's largest
@@ -988,7 +991,9 @@ two-level unit's parts, so none was re-pinned.
 never encoded and it is never PUT. A unit whose ranges times `K` exceeds
 10,000 is refused the same way before level 2 opens a part.
 `a_range_needing_more_than_k_parts_is_refused_before_encoding` pins it at
-`K` 2. The readers of `part_index` were checked for contiguity: the key's
+`K` 2, and `level2_workers_are_capped_at_the_ranges_and_slots_at_the_key`
+pins the unit-wide refusal at 4 ranges of `K` 2,501, together with a
+configured `W2` of 8 capped at those 4 ranges. The readers of `part_index` were checked for contiguity: the key's
 `format_part_index` (four digits) and `reconstruct_l1_part_key` in
 ravel-commit, the fold's `writer_epoch` and `snapshot_resolve`'s rebuild of
 it in ravel-catalog, the snapshot order's tiebreak, the sweep and the
