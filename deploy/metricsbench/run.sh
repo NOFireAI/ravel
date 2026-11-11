@@ -214,8 +214,9 @@
 #               row 9: the entries whose set of statuses differs between the
 #               passes), and per pass the records with a status other than ok
 #               or incorrect, the ok or incorrect records with a null
-#               result_hash, the records with no segmentsPrunedByLabelIndex
-#               figure (counted apart, never as 0) and with one above 0;
+#               result_hash, the ok or incorrect records with no
+#               segmentsPrunedByLabelIndex figure (counted apart, never as 0)
+#               and the records with one above 0;
 #               stamped as stage1.compare. A difference
 #               is recorded, not fatal: stage1-check.sh's band file is the
 #               verdict
@@ -235,7 +236,9 @@
 #               segmentsFetched other than unrouted_fetched_expected, and the
 #               route-bound statements a routed record of which has a
 #               segmentsPrunedByLabelIndex other than expected_routed_prunes
-#               (each with those that could not be checked); the routed
+#               (each with those that could not be checked, and apart from
+#               them those whose every record of the pass timed out); only
+#               ok or incorrect records are compared; the answered routed
 #               records of route-bound statements whose keyIndex phase shows
 #               no leaf read; and the statements that are not route-bound
 #
@@ -302,7 +305,12 @@
 #               and incorrect
 #   stage1-erasure-reference  (row 8) the corpus with
 #               instance!="metricsbench-instance-0" added to every selector,
-#               into <out>/stage1-erasure-reference.corpus.json, run routed;
+#               into <out>/stage1-erasure-reference.corpus.json, an entry
+#               every selector of which pins instance="metricsbench-instance-0"
+#               marked expected intended_empty with the reason and listed as
+#               intended_empty_ids in stage1.erasure_corpus, and a negative
+#               or regex matcher on the subject label refused (exit 3 naming
+#               the entry) before any pass runs; run routed;
 #               <out>/stage1-erasure-subject.json names the statements whose
 #               answer the subject changes; stage1.erasure_reference_snapshot
 #               says routed when no extra-hour or l1 arm changed the snapshot
@@ -1589,6 +1597,17 @@ elif op == "stage1-control-compare":
            "entries": entries}
     dump(out_path, doc)
     print(json.dumps({k: v for k, v in doc.items() if k != "entries"}))
+elif op == "stage1-answered":
+    # A pass's diagnostics file. Prints how many of its ravel_cost records
+    # carry status ok or incorrect; exit 3 and why when it cannot be read.
+    try:
+        rows = load(args[0])["ravel_cost"]
+        if not isinstance(rows, list):
+            raise TypeError("ravel_cost is not a list")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"the stage1 diagnostics could not be read ({type(e).__name__}: {e})")
+        sys.exit(3)
+    print(sum(1 for r in rows if isinstance(r, dict) and r.get("status") in ("ok", "incorrect")))
 elif op == "stage1-hash-compare":
     # A base and an other pass's diagnostics, the output path and the two
     # passes' names. Per entry, the two passes' result_hash sets compared as
@@ -2378,6 +2397,12 @@ if [ "$diagnostic" -eq 1 ]; then
     *" ${profile} "*) ;;
     *) refuse "--diagnostic-prometheus-max-samples sends ${FALSIFICATION_ENTRY}, which the corpus declares for '${entry_profiles}', not '${profile}'; on this profile it cannot reach the limit and falsifies nothing" ;;
   esac
+fi
+# The erasure arm's reference corpus is built hours into the run; a corpus
+# it would refuse is refused here, before anything starts.
+if [ "$arm_erasure" -eq 1 ]; then
+  line="$(py stage1-erasure-corpus "$CORPUS" "${PYLIB_DIR}/erasure-corpus-check.json" "$STAGE1_ERASURE_LABEL" "$STAGE1_ERASURE_VALUE")" ||
+    refuse "MB_STAGE1_ARMS=erasure: $line"
 fi
 interval_secs="${grid%% *}"
 duration_secs="${grid##* }"
@@ -3371,6 +3396,22 @@ stage1_catalog_state() {
   fi
 }
 
+# stage1_server_capture DIR: docker inspect of the ravel-server container
+# and the last 20000 lines of its log into DIR/ravel-server.inspect.json and
+# DIR/ravel-server.log, for a pass that failed or answered nothing. Never
+# fails the run: a missing container is written into both files instead.
+stage1_server_capture() {
+  local id
+  id="$(compose ps -a -q ravel-server 2>/dev/null)" || id=""
+  if [ -z "$id" ]; then
+    echo "no ravel-server container" >"${1}/ravel-server.inspect.json"
+    echo "no ravel-server container" >"${1}/ravel-server.log"
+    return 0
+  fi
+  "$DOCKER" inspect "$id" >"${1}/ravel-server.inspect.json" 2>&1 || true
+  "$DOCKER" logs --tail 20000 "$id" >"${1}/ravel-server.log" 2>&1 || true
+}
+
 # stage1_pass WHICH: the corpus (STAGE1_PASS_CORPUS when set) against
 # Prometheus and Ravel, as the query step runs it, into <out>/stage1-WHICH/
 # (underscores as dashes throughout). For unrouted, routed and control, then
@@ -3379,7 +3420,9 @@ stage1_catalog_state() {
 # repetitions as stage1.WHICH_cold_records (0 of 0 when the cold stamp says
 # not applicable; a string naming why when there is no cold stamp to count).
 # Every ravel_cost record is labelled pass_label folded-WHICH with the fold
-# state stage1_catalog_state read just before it.
+# state stage1_catalog_state read just before it. When metricsbench_query
+# exits non-zero, or the pass answers no record, stage1_server_capture writes
+# ravel-server's inspect and log beside query.log first.
 stage1_pass() {
   local which="$1" name="${1//_/-}" code=0 state flags line corpus="${STAGE1_PASS_CORPUS:-$CORPUS}"
   local label="folded-${name}" step="stage1-${name}" dir="${out_dir}/stage1-${name}"
@@ -3412,9 +3455,16 @@ stage1_pass() {
   "${bin_dir}/metricsbench_query" "${query_args[@]}" >"${dir}/query.log" 2>&1 || code=$?
   if [ "$code" -ne 0 ]; then
     show_log "${dir}/query.log"
+    stage1_server_capture "$dir"
     fail_step "$step" "metricsbench_query exited $code"
   fi
   [ -s "${dir}/diagnostics.json" ] || fail_step "$step" "metricsbench_query exited 0 and wrote no diagnostics.json"
+  code=0
+  line="$(py stage1-answered "${dir}/diagnostics.json")" || code=$?
+  if [ "$code" -ne 0 ] || [ "$line" = 0 ]; then
+    stage1_server_capture "$dir"
+    say "stage1 ${which}: ${line} answered records; ravel-server state in ${dir}/ravel-server.inspect.json and ravel-server.log"
+  fi
   stamp_set "stage1.${which}" "$(python3 -I -c 'import json,sys; print(json.dumps(dict(zip(["pass_label","fold_state","diagnostics","report"], sys.argv[1:]))))' \
     "$label" "$state" "stage1-${name}/diagnostics.json" "stage1-${name}/report.json")"
   case "$which" in

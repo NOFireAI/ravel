@@ -875,9 +875,11 @@ JSON
     printf ']\n'
     ;;
   # docker logs on the maintain container (run.sh stage1_maintain_alive,
-  # "$DOCKER" logs "$name").
+  # "$DOCKER" logs "$name") and on ravel-server (stage1_server_capture,
+  # "$DOCKER" logs --tail 20000 "$id"): the container is the last argument.
   logs)
-    echo "stub maintain log for $2"
+    [ "$2" != --tail ] || echo "stub logs --tail $3"
+    echo "stub maintain log for ${!#}"
     ;;
   image)
     ref="$3"
@@ -1231,6 +1233,14 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   esac
 done
 case "$out" in */cold-ravel-diagnostic/*) [ "${STUB_COLD_QUERY_EXIT:-0}" -eq 0 ] || exit "${STUB_COLD_QUERY_EXIT}" ;; esac
+# STUB_QUERY_FAIL_LABEL: the pass with that --pass-label exits 70 and writes
+# nothing, as a query bin whose engine went away mid-pass.
+case " $* " in
+  *" --pass-label ${STUB_QUERY_FAIL_LABEL:-unset} "*)
+    echo "stub query: ravel request failed: connection refused" >&2
+    exit 70
+    ;;
+esac
 # STUB_CLOCK_AFTER_PENDING: from the erasure-pending pass on, the stubbed
 # date reads that instant, as a clock that crossed an hour boundary while
 # the pass ran.
@@ -2923,7 +2933,7 @@ expect_log "z: metricsbench_holders gets the corpus, ingest report, workload, li
 expect_log "z: metricsbench_holders reads the listing beside the objects" "--objects-list ${OUT}/stage1-objects.jsonl --objects-dir ${OUT}/stage1-objects --out ${OUT}/holders.json"
 expect_no_file z stage1-objects
 expect_file z stage1-objects.jsonl
-check "z: stage1.holders stamps the method, the counts and the window, holder and value-holder figures per statement, every window checked against segmentsFetched and every routed prune against expected_routed_prunes" '{k: v for k, v in j("stamps.json")["stage1"]["holders"].items() if not k.endswith("_check")} == {"file": "holders.json", "bucket": "ravel-metricsbench", "method": "stub method", "listing_state": "routed: listed after stage1-routed, objects_above_watermark against stage1.routed_catalog.watermark_hour", "listing_watermark_hour": 490001, "objects_listed": 300, "objects_above_watermark": 0, "objects_l0": 300, "objects_l1": 0, "series_total": 40, "min_commit_tokens": 1, "token_objects": 1, "tokens_unmatched": [], "statements": [{"id": i, "segments_in_window": 10, "named_in_window": 4, "name_pruned": True, "token_only_fetched": 0, "unrouted_fetched_expected": 4, "holders": 2, "value_holders": 1, "expected_routed_prunes": 3, "route_bound": True, "route_bound_reason": None, "routed_pruned_by_label_index": [3]} for i in '"${CORPUS_IDS}"'], "skipped": 1, "window_mismatches_count": 0, "window_mismatches": [], "window_unchecked_count": 0, "window_unchecked": [], "routed_prune_mismatches_count": 0, "routed_prune_mismatches": [], "routed_prune_unchecked_count": 0, "routed_prune_unchecked": [], "routed_leaf_unread_count": 0, "routed_leaf_unread": [], "route_unbound_count": 0, "route_unbound": []}'
+check "z: stage1.holders stamps the method, the counts and the window, holder and value-holder figures per statement, every window checked against segmentsFetched and every routed prune against expected_routed_prunes" '{k: v for k, v in j("stamps.json")["stage1"]["holders"].items() if not k.endswith("_check")} == {"file": "holders.json", "bucket": "ravel-metricsbench", "method": "stub method", "listing_state": "routed: listed after stage1-routed, objects_above_watermark against stage1.routed_catalog.watermark_hour", "listing_watermark_hour": 490001, "objects_listed": 300, "objects_above_watermark": 0, "objects_l0": 300, "objects_l1": 0, "series_total": 40, "min_commit_tokens": 1, "token_objects": 1, "tokens_unmatched": [], "statements": [{"id": i, "segments_in_window": 10, "named_in_window": 4, "name_pruned": True, "token_only_fetched": 0, "unrouted_fetched_expected": 4, "holders": 2, "value_holders": 1, "expected_routed_prunes": 3, "route_bound": True, "route_bound_reason": None, "routed_pruned_by_label_index": [3]} for i in '"${CORPUS_IDS}"'], "skipped": 1, "window_mismatches_count": 0, "window_mismatches": [], "window_unchecked_count": 0, "window_unchecked": [], "window_unchecked_timed_out_count": 0, "window_unchecked_timed_out": [], "routed_prune_mismatches_count": 0, "routed_prune_mismatches": [], "routed_prune_unchecked_count": 0, "routed_prune_unchecked": [], "routed_prune_unchecked_timed_out_count": 0, "routed_prune_unchecked_timed_out": [], "routed_leaf_unread_count": 0, "routed_leaf_unread": [], "route_unbound_count": 0, "route_unbound": []}'
 check "z: each check sentence names what it compares" 'sorted(k for k in j("stamps.json")["stage1"]["holders"] if k.endswith("_check")) == ["bound_check", "route_bound_check", "routed_leaf_check", "routed_prune_check", "window_check"] and all(w in j("stamps.json")["stage1"]["holders"]["window_check"] for w in ("segmentsFetched of every stage1-unrouted record", "== unrouted_fetched_expected", "token_only_fetched", "min_commit_token", "unchecked")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_prune_check"] for w in ("segmentsPrunedByLabelIndex of every stage1-routed record", "== expected_routed_prunes", "unchecked")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_leaf_check"] for w in ("keyIndex phase", "s3GetRequests", "cacheHits")) and all(w in j("stamps.json")["stage1"]["holders"]["bound_check"] for w in ("series-level index", "not the label-value router", "value_holders", "LABEL_DICT", "the router'"'"'s bound"))'
 check "z: the cold records are counted against the selected entries x repetitions in both passes" 'all(j("stamps.json")["stage1"][f"{w}_cold_records"] == {"applicable": True, "expected_records": 5, "records": 5, "records_short": 0, "basis": f"stage1.{w}_cold: records with a ravel_cost (runs - failed_runs) against entries x repetitions_per_entry"} for w in ("unrouted", "routed"))'
 check "z: the query step's records keep their own label" 'all(r["pass_label"] == "background-folded" for r in j("diagnostics.json")["ravel_cost"])'
@@ -3036,7 +3046,7 @@ expect_no_log "z14: no unrouted pass" "--pass-label folded-unrouted"
 # z15: a routed record that failed is counted, not fatal; the band check catches it.
 MB_STAGE1=1 STUB_ROUTED_FAILED_ENTRY=mb_selective_job_rate_sum run_stage1 z15 ci
 expect_rc z15 0
-check "z15: the failed record is counted in the routed pass, its status differs from the unrouted pass and the entry has no hash" 'j("stage1-compare.json")["passes"]["routed"]["records_status_unexpected"] == 1 and j("stage1-compare.json")["passes"]["routed"]["records_answered_null_hash"] == 0 and j("stage1-compare.json")["passes"]["routed"]["records_label_index_null"] == 1 and j("stage1-compare.json")["passes"]["unrouted"]["records_status_unexpected"] == 0 and j("stage1-compare.json")["statements_status_differing"] == [{"entry": "mb_selective_job_rate_sum", "unrouted": ["ok"], "routed": ["failed: stub"]}] and "mb_selective_job_rate_sum" in j("stage1-compare.json")["entries_without_hash"]'
+check "z15: the failed record is counted in the routed pass, not as a missing segmentsPrunedByLabelIndex, its status differs from the unrouted pass and the entry has no hash" 'j("stage1-compare.json")["passes"]["routed"]["records_status_unexpected"] == 1 and j("stage1-compare.json")["passes"]["routed"]["records_answered_null_hash"] == 0 and j("stage1-compare.json")["passes"]["routed"]["records_label_index_null"] == 0 and j("stage1-compare.json")["passes"]["unrouted"]["records_status_unexpected"] == 0 and j("stage1-compare.json")["statements_status_differing"] == [{"entry": "mb_selective_job_rate_sum", "unrouted": ["ok"], "routed": ["failed: stub"]}] and "mb_selective_job_rate_sum" in j("stage1-compare.json")["entries_without_hash"]'
 
 # z16: an unrouted record the label index pruned is counted.
 MB_STAGE1=1 STUB_UNROUTED_PRUNED_ENTRY=mb_selective_job_rate_sum run_stage1 z16 ci
@@ -3497,6 +3507,7 @@ check "zl: the re-encode outside the erased hours is neither overlapping nor car
 MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 zn ci
 expect_rc zn 0
 check "zn: the reference snapshot stamped routed, no key surviving, both hours erased" 'j("stamps.json")["stage1"]["erasure_reference_snapshot"] == "routed" and {k: j("stamps.json")["stage1"]["erasure_leaves"][k] for k in ("objects_before", "objects_after", "hours_before_count", "keys_surviving_count", "keys_surviving", "erased_hours_count")} == {"objects_before": 300, "objects_after": 4, "hours_before_count": 2, "keys_surviving_count": 0, "keys_surviving": [], "erased_hours_count": 2}'
+check "zn: stage1.erasure_corpus lists the corpus's three pinned entries as intended_empty_ids, and the reference corpus marks each with the reason" 'j("stamps.json")["stage1"]["erasure_corpus"]["intended_empty_ids"] == ["mb_single_gauge_instant", "mb_single_counter_rate", "mb_single_gauge_delta"] and sorted(e["id"] for e in j("stage1-erasure-reference.corpus.json")["entries"] if (e.get("expected") or {}).get("intended_empty") is True) == sorted(j("stamps.json")["stage1"]["erasure_corpus"]["intended_empty_ids"]) and all("selects instance=\"metricsbench-instance-0\"" in e["expected"]["reason"] for e in j("stage1-erasure-reference.corpus.json")["entries"] if e["id"] in j("stamps.json")["stage1"]["erasure_corpus"]["intended_empty_ids"])'
 
 # zo: a rewrite that replaced hour 490000's objects only, leaving hour
 # 490001's listed as they were: the surviving keys are counted and named.
@@ -3563,7 +3574,7 @@ for c in za zn; do
   card_failed="$(sed -n 's/^stage1-check: \([0-9]*\) of [0-9]* figures failed$/\1/p' "${CHECK_ERR}")"
   if { [ "${rc}" -eq 0 ] || [ "${rc}" -eq 1 ]; } && ! grep -qE '^(missing|duplicated) ' "${CHECK_ERR}" &&
     { { [ "${rc}" -eq 0 ] && [ "$(wc -l <"${CHECK_OUT}")" -eq "${CARD_FIGURES}" ]; } || { [ "${rc}" -eq 1 ] && [ -n "${card_failed}" ]; }; } &&
-    [ "${CARD_FIGURES}" -eq 62 ]; then
+    [ "${CARD_FIGURES}" -eq 64 ]; then
     pass "check cardinality ${c}: the pre-registered file resolves every one of its ${CARD_FIGURES} figures (exit ${rc}, ${card_failed:-0} outside the cardinality bounds)"
   else
     fail "check cardinality ${c}: exit ${rc}, stderr $(cat "${CHECK_ERR}")"
@@ -3779,7 +3790,7 @@ expect_check_err "check failed record: the status difference named" "out of band
 expect_check_err "check failed record: the failed status named" "out of band routed_records_status_unexpected = 1 not in [0, 0] (stage1-compare.json passes.routed.records_status_unexpected)"
 expect_check_err "check failed record: the entry without a hash named" "out of band entries_without_hash = 1 not in [0, 0] (stage1-compare.json entries_without_hash_count)"
 expect_check_err "check failed record: its routed prune unchecked" "out of band holders_routed_prune_unchecked = 1 not in [0, 0] (stamps.json stage1.holders.routed_prune_unchecked_count)"
-expect_check_err "check failed record: five failures counted, with its missing segmentsPrunedByLabelIndex in the compare and the holders check" "stage1-check: 5 of ${FIGURES} figures failed"
+expect_check_err "check failed record: four failures counted, its missing segmentsPrunedByLabelIndex in the holders check only" "stage1-check: 4 of ${FIGURES} figures failed"
 run_check incorrect-both "${CI_BANDS}" "${TMP}/z21/out"
 expect_rc "check incorrect in both passes" 0
 run_check routed-status "${CI_BANDS}" "${TMP}/z22/out"
@@ -3970,6 +3981,125 @@ rc=0
 expect_rc "erasure corpus: the rewrite exits 0" 0
 OUT="${EC}"
 check "erasure corpus: a bare group_left or group_right leaves the next call's selectors rewritten; a listed one copies its list" '{e["id"]: e["promql"] for e in j("out.json")["entries"]} == {"bare": "a{instance!=\"metricsbench-instance-0\"} * on (job) group_left max(b{instance!=\"metricsbench-instance-0\"})", "listed": "a{instance!=\"metricsbench-instance-0\"} * on (job) group_left (v) max(b{instance!=\"metricsbench-instance-0\"})", "right": "a{instance!=\"metricsbench-instance-0\"} * ignoring (x) group_right sum by (job) (rate(b{instance!=\"metricsbench-instance-0\"}[5m]))"}'
+
+# stage1-erasure-corpus with entries pinned to the subject: an entry every
+# selector of which carries instance="metricsbench-instance-0" is marked
+# intended_empty with the reason and listed; the same value under another
+# label, or a longer value under instance, is not a pin and is rewritten as
+# any other entry.
+EC="${TMP}/erasure-corpus-pinned"
+mkdir -p "${EC}"
+cp "${TMP}/erasure-corpus/mbpylib.py" "${EC}/mbpylib.py"
+python3 -I -c 'import json, sys; json.dump({"entries": [
+  {"id": "pinned", "promql": "rate(m{job=\"a\",instance=\"metricsbench-instance-0\"}[5m])"},
+  {"id": "pinned_both", "promql": "m{instance=\"metricsbench-instance-0\"} / n{\"instance\"=\"metricsbench-instance-0\"}", "expected": {"note": "kept"}},
+  {"id": "other_label", "promql": "m{job=\"metricsbench-instance-0\"}"},
+  {"id": "longer_value", "promql": "m{instance=\"metricsbench-instance-01\"}"},
+  {"id": "plain", "promql": "sum by (job) (m{job=\"a\"})"}]}, open(sys.argv[1], "w"))' "${EC}/corpus.json"
+rc=0
+(cd "${EC}" && python3 -I -c 'import sys; sys.path.insert(0, "."); import mbpylib' stage1-erasure-corpus corpus.json out.json instance metricsbench-instance-0 >stdout.json 2>stderr.txt) || rc=$?
+expect_rc "erasure corpus pinned: the rewrite exits 0" 0
+OUT="${EC}"
+EC_REASON='the erasure reference and pending passes exclude instance="metricsbench-instance-0" from every selector, and every selector of this entry selects instance="metricsbench-instance-0"'
+check "erasure corpus pinned: the printed line lists the two pinned entries as intended_empty_ids and every entry as rewritten" 'j("stdout.json")["intended_empty_ids"] == ["pinned", "pinned_both"] and j("stdout.json")["rewritten"] == ["pinned", "pinned_both", "other_label", "longer_value", "plain"] and j("stdout.json")["entries"] == 5'
+check "erasure corpus pinned: each pinned entry is expected intended_empty with the reason naming the label and value, an existing expected kept" '{e["id"]: e.get("expected") for e in j("out.json")["entries"]} == {"pinned": {"intended_empty": True, "reason": '"'${EC_REASON}'"'}, "pinned_both": {"note": "kept", "intended_empty": True, "reason": '"'${EC_REASON}'"'}, "other_label": None, "longer_value": None, "plain": None}'
+check "erasure corpus pinned: the value under another label or a longer value is rewritten, not marked" '{e["id"]: e["promql"] for e in j("out.json")["entries"] if e["id"] in ("other_label", "longer_value", "plain")} == {"other_label": "m{instance!=\"metricsbench-instance-0\",job=\"metricsbench-instance-0\"}", "longer_value": "m{instance!=\"metricsbench-instance-0\",instance=\"metricsbench-instance-01\"}", "plain": "sum by (job) (m{instance!=\"metricsbench-instance-0\",job=\"a\"})"}'
+
+# A negative or regex matcher on the subject label, or a pin on some
+# selectors only, cannot be rewritten without contradicting it: the op exits
+# 3 naming each entry, and a run with the erasure arm refuses before any
+# query step.
+EC="${TMP}/erasure-corpus-refused"
+mkdir -p "${EC}"
+cp "${TMP}/erasure-corpus/mbpylib.py" "${EC}/mbpylib.py"
+python3 -I -c 'import json, sys; json.dump({"entries": [
+  {"id": "mb_negative", "promql": "m{instance!=\"metricsbench-instance-0\"}"},
+  {"id": "mb_regex", "promql": "rate(m{instance=~\"metricsbench-instance-.*\"}[5m])"},
+  {"id": "mb_some", "promql": "m{instance=\"metricsbench-instance-0\"} / n"},
+  {"id": "mb_fine", "promql": "m"}]}, open(sys.argv[1], "w"))' "${EC}/corpus.json"
+rc=0
+(cd "${EC}" && python3 -I -c 'import sys; sys.path.insert(0, "."); import mbpylib' stage1-erasure-corpus corpus.json out.json instance metricsbench-instance-0 >stdout.txt 2>&1) || rc=$?
+expect_rc "erasure corpus refused: the op" 3
+if grep -qxF 'the rewrite would contradict a matcher on instance in: mb_negative (instance!="metricsbench-instance-0"); mb_regex (instance=~"metricsbench-instance-.*"); mb_some (instance="metricsbench-instance-0" on some selectors only)' "${EC}/stdout.txt" &&
+  [ ! -e "${EC}/out.json" ]; then
+  pass "erasure corpus refused: each entry named with its matcher, nothing written"
+else
+  fail "erasure corpus refused: stdout $(cat "${EC}/stdout.txt")"
+fi
+METRICSBENCH_CORPUS="${EC}/corpus.json" MB_STAGE1=1 MB_STAGE1_ARMS=erasure run_stage1 zq ci
+expect_rc zq 65
+expect_err "zq: the refusal names the arm and the entries" "refused: MB_STAGE1_ARMS=erasure: the rewrite would contradict a matcher on instance in: mb_negative"
+expect_no_log "zq: no query step ran" "metricsbench_query"
+expect_no_log "zq: no ingest ran" "metricsbench_ingest"
+
+# zt: a statement whose every record of a pass timed out (status timeout, no
+# phases, no figures). The compare and hash-compare count it in
+# records_status_unexpected and not as a missing segmentsPrunedByLabelIndex;
+# holders counts it as window_unchecked_timed_out and
+# routed_prune_unchecked_timed_out, not as unchecked or as an unread leaf.
+cat >"${TMP}/run-timeout.json" <<'JSON'
+{"holders": {"report": {}, "statements": {}},
+ "records": {"folded-unrouted": {"mb_selective_error_ratio": {"status": "timeout", "phases": [], "result_hash": null, "segmentsFetched": null, "segmentsPruned": null, "segmentsPrunedByLabelIndex": null, "labelIndexValues": null}},
+             "folded-routed": {"mb_selective_error_ratio": {"status": "timeout", "phases": [], "result_hash": null, "segmentsFetched": null, "segmentsPruned": null, "segmentsPrunedByLabelIndex": null, "labelIndexValues": null}},
+             "folded-erasure-pending": {"mb_selective_error_ratio": {"status": "timeout", "phases": [], "result_hash": null, "segmentsFetched": null, "segmentsPruned": null, "segmentsPrunedByLabelIndex": null, "labelIndexValues": null}}}}
+JSON
+MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_RUN_FIGURES="${TMP}/run-timeout.json" run_stage1 zt ci
+expect_rc zt 0
+check "zt: tally: the timed-out records are status_unexpected, not label_index_null, in both passes" '[{k: j("stage1-compare.json")["passes"][p][k] for k in ("records_status_unexpected", "records_label_index_null")} for p in ("unrouted", "routed")] == [{"records_status_unexpected": 1, "records_label_index_null": 0}] * 2'
+check "zt: hash-compare: the timed-out pending record is status_unexpected, not label_index_null" 'j("stage1-erasure-compare.json")["other_records_status_unexpected"] == 1 and j("stage1-erasure-compare.json")["other_records_label_index_null"] == 0'
+check "zt: holders: the statement is window_unchecked_timed_out and routed_prune_unchecked_timed_out, not unchecked, and no leaf counted unread" '{k: j("stamps.json")["stage1"]["holders"][k] for k in ("window_unchecked_count", "window_unchecked_timed_out_count", "window_unchecked_timed_out", "routed_prune_unchecked_count", "routed_prune_unchecked_timed_out_count", "routed_prune_unchecked_timed_out", "routed_leaf_unread_count")} == {"window_unchecked_count": 0, "window_unchecked_timed_out_count": 1, "window_unchecked_timed_out": ["mb_selective_error_ratio"], "routed_prune_unchecked_count": 0, "routed_prune_unchecked_timed_out_count": 1, "routed_prune_unchecked_timed_out": ["mb_selective_error_ratio"], "routed_leaf_unread_count": 0}'
+run_check timeout "${CI_BANDS}" "${TMP}/zt/out"
+expect_check_err "check timeout: the ci band catches the timed-out window" "out of band holders_window_unchecked_timed_out = 1 not in [0, 0] (stamps.json stage1.holders.window_unchecked_timed_out_count)"
+expect_check_err "check timeout: the ci band catches the timed-out routed prune" "out of band holders_routed_prune_unchecked_timed_out = 1 not in [0, 0] (stamps.json stage1.holders.routed_prune_unchecked_timed_out_count)"
+
+# zt2: zt's timeouts beside answered records with a null figure, which still
+# count: a routed and a pending record answered with no
+# segmentsPrunedByLabelIndex, and a statement one unrouted record of which
+# timed out and the other answered with no segmentsFetched.
+cat >"${TMP}/run-timeout-null.json" <<'JSON'
+{"holders": {"report": {}, "statements": {}},
+ "records": {"folded-unrouted": {"mb_selective_error_ratio": {"status": "timeout", "phases": [], "result_hash": null, "segmentsFetched": null, "segmentsPruned": null, "segmentsPrunedByLabelIndex": null, "labelIndexValues": null},
+                                 "mb_full_range_avg_over_time": {"status": "timeout", "phases": [], "result_hash": null, "segmentsFetched": null, "segmentsPruned": null, "segmentsPrunedByLabelIndex": null, "labelIndexValues": null}},
+             "folded-routed": {"mb_selective_error_ratio": {"status": "timeout", "phases": [], "result_hash": null, "segmentsFetched": null, "segmentsPruned": null, "segmentsPrunedByLabelIndex": null, "labelIndexValues": null},
+                               "mb_selective_region_avg": {"segmentsPrunedByLabelIndex": null}},
+             "folded-erasure-pending": {"mb_selective_error_ratio": {"status": "timeout", "phases": [], "result_hash": null, "segmentsFetched": null, "segmentsPruned": null, "segmentsPrunedByLabelIndex": null, "labelIndexValues": null},
+                                        "mb_selective_region_avg": {"segmentsPrunedByLabelIndex": null}}},
+ "rep2": {"folded-unrouted": {"mb_full_range_avg_over_time": {"status": "ok", "segmentsFetched": null}}}}
+JSON
+MB_STAGE1=1 MB_STAGE1_ARMS=erasure STUB_RUN_FIGURES="${TMP}/run-timeout-null.json" run_stage1 zt2 ci
+expect_rc zt2 0
+check "zt2: tally: the answered routed record with no segmentsPrunedByLabelIndex still counts 1 beside the timeout" '{k: j("stage1-compare.json")["passes"]["routed"][k] for k in ("records_status_unexpected", "records_label_index_null")} == {"records_status_unexpected": 1, "records_label_index_null": 1}'
+check "zt2: hash-compare: the answered pending record with no segmentsPrunedByLabelIndex still counts 1 beside the timeout" 'j("stage1-erasure-compare.json")["other_records_status_unexpected"] == 1 and j("stage1-erasure-compare.json")["other_records_label_index_null"] == 1'
+check "zt2: holders: a statement with an answered record and no figure is unchecked, not timed out; the routed null is unchecked" '{k: j("stamps.json")["stage1"]["holders"][k] for k in ("window_unchecked", "window_unchecked_timed_out", "routed_prune_unchecked", "routed_prune_unchecked_timed_out")} == {"window_unchecked": ["mb_full_range_avg_over_time"], "window_unchecked_timed_out": ["mb_selective_error_ratio"], "routed_prune_unchecked": ["mb_selective_region_avg"], "routed_prune_unchecked_timed_out": ["mb_selective_error_ratio"]}'
+
+# zf: a stage1 pass whose metricsbench_query exits non-zero: ravel-server's
+# inspect and its bounded log are written beside the pass's query.log before
+# the step fails.
+MB_STAGE1=1 STUB_QUERY_FAIL_LABEL=folded-unrouted run_stage1 zf ci
+expect_rc zf 70
+expect_err "zf: the step named" "step stage1-unrouted failed: metricsbench_query exited 70"
+expect_file zf stage1-unrouted/query.log
+check "zf: ravel-server.inspect.json beside query.log is the container's docker inspect" 'j("stage1-unrouted/ravel-server.inspect.json")[0]["Name"] == "/metricsbench-ravel-server-1"'
+if grep -qxF 'stub logs --tail 20000' "${OUT}/stage1-unrouted/ravel-server.log" &&
+  grep -qxF 'stub maintain log for id-ravel-server' "${OUT}/stage1-unrouted/ravel-server.log"; then
+  pass "zf: ravel-server.log beside query.log is the container's docker logs --tail 20000"
+else
+  fail "zf: ravel-server.log is $(cat "${OUT}/stage1-unrouted/ravel-server.log" 2>&1)"
+fi
+expect_no_log "zf: no routed pass after the failure" "--pass-label folded-routed"
+
+# zf2: a pass that exits 0 and answers no record: the same capture, and the
+# run goes on.
+cat >"${TMP}/run-unanswered.json" <<'JSON'
+{"holders": {"report": {}, "statements": {}},
+ "records": {"folded-unrouted": {"*": {"status": "timeout", "phases": [], "result_hash": null, "segmentsFetched": null, "segmentsPruned": null, "segmentsPrunedByLabelIndex": null, "labelIndexValues": null}}}}
+JSON
+MB_STAGE1=1 STUB_RUN_FIGURES="${TMP}/run-unanswered.json" run_stage1 zf2 ci
+expect_rc zf2 0
+expect_err "zf2: the empty pass said with where the capture is" "stage1 unrouted: 0 answered records; ravel-server state in ${OUT}/stage1-unrouted/ravel-server.inspect.json and ravel-server.log"
+check "zf2: ravel-server.inspect.json beside the empty pass's query.log" 'j("stage1-unrouted/ravel-server.inspect.json")[0]["Name"] == "/metricsbench-ravel-server-1"'
+expect_file zf2 stage1-unrouted/ravel-server.log
+expect_no_file zf2 stage1-routed/ravel-server.inspect.json
 
 echo
 echo "${passes} passed, ${fails} failed"
