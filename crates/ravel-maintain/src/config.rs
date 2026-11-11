@@ -1782,7 +1782,7 @@ pub fn validate_rlog_run_block_target_records(
     }
 }
 
-/// A level-2 range setting of zero was configured (ADR-3853 D5): no worker,
+/// A range setting of zero was configured (ADR-3853 D5): no level-2 worker,
 /// or an empty range quantum. Each is refused as a misconfiguration before
 /// the first store request.
 #[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
@@ -1793,7 +1793,7 @@ pub struct RlogLevel2SettingError {
 }
 
 /// Validate [`CompactorConfig::level2_workers`] and
-/// [`CompactorConfig::rlog_level2_range_records`].
+/// [`CompactorConfig::rlog_range_records`].
 pub fn validate_rlog_level2_settings(
     level2_workers: Option<usize>,
     range_records: u64,
@@ -1805,7 +1805,7 @@ pub fn validate_rlog_level2_settings(
     }
     if range_records == 0 {
         return Err(RlogLevel2SettingError {
-            field: "rlog_level2_range_records",
+            field: "rlog_range_records",
         });
     }
     Ok(())
@@ -2363,16 +2363,18 @@ pub struct CompactorConfig {
     /// are ranges. `Some(0)` fails the run before its first store request with
     /// [`crate::error::MaintainError::InvalidRlogLevel2Setting`].
     pub level2_workers: Option<usize>,
-    /// The record quantum level 2's stream key space is cut at (ADR-3853 D5):
-    /// a range closes after the stream at which its streams' exact record
-    /// totals reach this many records. Each range numbers its parts in a
-    /// window of the part key's 10,000 indexes proportional to the quantum's
-    /// share of the unit's records, so a two-level merge of more than 10,000
-    /// times the quantum records is refused before level 2 encodes a part. Independent of the
-    /// worker counts, so every worker count publishes the same parts. Zero is
-    /// refused like [`Self::level2_workers`]. Default
-    /// [`crate::rlog::LEVEL2_RANGE_RECORDS`].
-    pub rlog_level2_range_records: u64,
+    /// The record quantum a compaction's published RLOG parts are cut into
+    /// ranges at (ADR-3853 D5), on the single-level and two-level routes
+    /// alike: a range closes at the end of the stream at which its records
+    /// reach this many. Each range numbers its parts in a window of the part
+    /// key's 10,000 indexes proportional to the quantum's share of the unit's
+    /// records, so a compaction of more than 10,000 times the quantum records
+    /// is refused before it encodes a part. Independent of the route and the
+    /// worker counts, so each publishes the same parts. A unit under the
+    /// quantum is one range, numbered `0, 1, 2, ...`. The erasure and force-2
+    /// rewrites do not cut. Zero is refused like [`Self::level2_workers`].
+    /// Default [`crate::rlog::LEVEL2_RANGE_RECORDS`].
+    pub rlog_range_records: u64,
     /// The predicted decoded rows at or below which a cursor plan always runs
     /// as a cursor merge, neither refused nor routed to two levels under
     /// ADR-3853 D0, whatever its amplification. Default
@@ -2633,7 +2635,7 @@ impl Default for CompactorConfig {
             unit_concurrency: 1,
             level1_workers: None,
             level2_workers: None,
-            rlog_level2_range_records: crate::rlog::LEVEL2_RANGE_RECORDS,
+            rlog_range_records: crate::rlog::LEVEL2_RANGE_RECORDS,
             geometry_floor_decoded_rows: crate::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS,
             merge_admission: AdmissionMode::Overlap,
             rlog_zstd_level: DEFAULT_RLOG_ZSTD_LEVEL,

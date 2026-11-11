@@ -445,7 +445,7 @@ pub enum MaintainError {
     PartKeySpace {
         /// The unit's records, summed from its inputs' footers.
         records: u64,
-        /// The range quantum, [`crate::CompactorConfig::rlog_level2_range_records`].
+        /// The range quantum, [`crate::CompactorConfig::rlog_range_records`].
         quantum: u64,
         /// The part indexes a part key carries.
         keys: u64,
