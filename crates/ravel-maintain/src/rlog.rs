@@ -16179,8 +16179,9 @@ mod tests {
         const BLOCK_TARGET_PART: u64 = 64 << 10;
 
         /// Seeds the block target fixture on a fresh store and compacts it
-        /// under `config`; returns the outcome, the run, the published parts
-        /// and the record count of each run part level 2 read.
+        /// under `config`; returns the outcome, the run, the published parts,
+        /// the record count of each run part level 2 read, and the record
+        /// count of each published part.
         async fn compact_block_target(
             config: &CompactorConfig,
         ) -> (
@@ -16188,17 +16189,25 @@ mod tests {
             Run,
             (Vec<String>, Output),
             Vec<u64>,
+            Vec<u64>,
         ) {
             let store = ProbeStore::new();
             seed_inputs(&store, &block_target_inputs()).await;
             LEVEL2_RUN_RECORDS.with(|r| r.borrow_mut().clear());
             let (outcome, run) = compact_logged(&store, config).await;
             let runs = LEVEL2_RUN_RECORDS.with(|r| r.take());
-            (outcome, run, published(&store).await, runs)
+            let part_records = if outcome.is_ok() {
+                let (rec, _) = read_output(&store).await;
+                rec.parts.iter().map(|p| p.sample_count).collect()
+            } else {
+                Vec::new()
+            };
+            (outcome, run, published(&store).await, runs, part_records)
         }
 
         /// ADR-3853 D2: the run block target cuts the runs' blocks, and so
-        /// level 2's per-run price, and never reaches a published part.
+        /// level 2's per-run price, and in this unkeyed fixture does not reach
+        /// a published part.
         #[tokio::test]
         async fn run_block_target_is_transient_and_cuts_run_blocks() {
             let parts = |config: CompactorConfig| CompactorConfig {
@@ -16210,10 +16219,18 @@ mod tests {
                 crate::RLOG_RUN_MEMORY_TARGET_BYTES,
                 None,
             ));
-            let (outcome, single, oracle, _) = compact_block_target(&resident).await;
+            let (outcome, single, oracle, _, oracle_records) =
+                compact_block_target(&resident).await;
             outcome.expect("single-level compact");
             assert!(single.mode_line().contains("mode=\"resident\""));
             assert!(!oracle.0.is_empty());
+            assert_eq!(oracle_records.len(), oracle.0.len());
+            assert!(
+                oracle_records.iter().all(|&records| records > 16),
+                "every published part over 16 records: smallest {:?} of {}",
+                oracle_records.iter().min(),
+                oracle_records.len()
+            );
             let store = ProbeStore::new();
             let keys = seed_inputs(&store, &block_target_inputs()).await;
             let per_input = level1_per_input(&store, &keys).await;
@@ -16230,9 +16247,10 @@ mod tests {
                         Some(dir.clone()),
                     ))
                 };
-                let (outcome, run, got, runs) = compact_block_target(&config).await;
+                let (outcome, run, got, runs, records) = compact_block_target(&config).await;
                 outcome.unwrap_or_else(|e| panic!("target {target}: {e}"));
                 let line = run.line("rlog two-level merge");
+                assert_eq!(records, oracle_records, "target {target}: part records");
                 assert_eq!(got.0, oracle.0, "target {target}: part keys");
                 assert!(
                     got.1.hashes == oracle.1.hashes,
