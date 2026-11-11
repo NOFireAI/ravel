@@ -489,7 +489,7 @@ does not hold that.
 4. Take the census and the day-parts stamps again.
 
 **`retired_hour`** requires `day_parts_7` listed before it, no state listed
-after it, and `[retired_hour] c1_sha` set. run.sh refuses a run.toml that
+after it, and `[retired_hour] c1_sha` and `r2_sha` set. run.sh refuses a run.toml that
 breaks any of these before any step. The state is recorded `not-run` when
 `day_parts_7` did not build `dp7`, when `ravel-cli catalog fold --help`
 lists no `--retention-default` (that fold could not reconcile the
@@ -635,9 +635,11 @@ reason for reducing: 30 days at box D's rate cost about 4 hours of fold and
 about 20 hours of corpus generation.
 `[retired_hour]`'s `c1_sha` and `r2_sha` are read by every state that
 writes a fold binary stamp (`retired_hour` and each `day_parts_N`), the
-other two keys only when `run.states` lists `retired_hour`. `c1_sha` is
-required when it does. An empty `r2_sha` means R2 has not landed, and an
-empty `c1_sha` reads as not carried.
+other two keys only when `run.states` lists `retired_hour`. Both are
+required when `run.states` lists any of those states, and run.sh refuses an
+empty one before any step: an empty SHA would read as not carried and turn
+A3, A4, W3 and W8 not requested. `c1_sha` names ADR-3939 task C1's last
+commit on main, `r2_sha` task R2's; run.example.toml sets both.
 
 `[server] extra_flags` is a list of extra `ravel-server` command-line
 flags, appended verbatim after `--memory-budget-bytes` on every server
@@ -1154,8 +1156,9 @@ writes no stamp, so A3 and A4 go incomplete while the state's other rows
 are measured. The stamp records the binary's SHA (run.toml `box.sha`, or
 the checkout's HEAD), with `c1_sha` and `r2_sha` resolved in the checkout
 that built it. `carries_c1` is true when `git merge-base --is-ancestor
-c1_sha sha` holds, and `carries_r2` the same for `r2_sha`. An empty
-`c1_sha` or `r2_sha` gives `false`. A SHA that names no commit (the
+c1_sha sha` holds, and `carries_r2` the same for `r2_sha`. `inv.py
+fold-binary` reads an empty `c1_sha` or `r2_sha` as `false`, which is why
+run.sh refuses an empty one before any step. A SHA that names no commit (the
 binary's, or a non-empty `c1_sha` or `r2_sha`) fails the state. In a run
 where the stamping state is live, an absent stamp is `missing`.
 
@@ -1597,11 +1600,13 @@ the file and line it changes):
   `{sha, carries_c1, carries_r2}` by git ancestry on a scratch repository,
   an empty `r2_sha` or `c1_sha` reads false, an unresolvable SHA writes no
   stamp, the stamp precedes the first tombstone and each day_parts state's
-  stride check in the dry run, a day_parts_7-only run stamps with an empty
-  `--c1`, and run.sh refuses a
-  retired_hour with no `c1_sha` or no day_parts_7 before it. Wrong version:
-  `carries_r2` falling back to C1 when `r2_sha` is empty ("an empty r2_sha
-  read as carried").
+  stride check in the dry run, a day_parts_7-only run stamps with both SHAs,
+  and run.sh refuses an empty `r2_sha` with day_parts_7 or retired_hour
+  listed, an empty `c1_sha` with day_parts_7 listed, and a retired_hour with
+  no day_parts_7 before it. Wrong versions: `carries_r2` falling back to C1
+  when `r2_sha` is empty ("an empty r2_sha read as carried"), and either
+  emptiness check dropped ("an empty r2_sha accepted", "an empty c1_sha
+  accepted").
 - `test_a3_a4_without_retired_hour`: a run listing `day_parts_7` and not
   `retired_hour`. On an R2 binary 5 sealed-day leaf PUTs miss; on a binary
   predating R2 every A3 and A4 figure is not requested naming

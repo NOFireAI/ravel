@@ -495,6 +495,7 @@ EOF
           || fail "run.toml day_parts.traces_per_day_${s#day_parts_} = $tpd: not a positive multiple of 24"
         [ "$s" = day_parts_7 ] || [[ "$DP30_MAX_PAIRS" =~ ^[1-9][0-9]*$ ]] \
           || fail "run.toml day_parts.key_index_build_max_pairs_30 = $DP30_MAX_PAIRS: not a positive whole number"
+        fold_binary_shas_set "$s"
         DP_DAYS="$DP_DAYS ${s#day_parts_}"
         TENANTS="$TENANTS dp${s#day_parts_}" ;;
       retired_hour)
@@ -502,7 +503,7 @@ EOF
           *" 7 "*) ;;
           *) fail "run.toml run.states: retired_hour runs on the day_parts_7 tenant, so day_parts_7 must come before it" ;;
         esac
-        [ -n "$RH_C1" ] || fail "run.toml retired_hour.c1_sha is empty: the fold binary stamp needs it"
+        fold_binary_shas_set "$s"
         [[ "$RH_INTERVAL" =~ ^[1-9][0-9]*$ ]] || fail "run.toml retired_hour.maintain_interval_secs = $RH_INTERVAL: not a positive whole number"
         [[ "$RH_WAIT" =~ ^[1-9][0-9]*$ ]] || fail "run.toml retired_hour.wait_minutes = $RH_WAIT: not a positive whole number"
         rh_seen=1 ;;
@@ -513,6 +514,14 @@ EOF
   done
   SERVER_FLAGS="--mode query --store s3 --shards $SHARDS --tenant-hash-unkeyed --audit-mode off ${SERVER_EXTRA[*]+${SERVER_EXTRA[*]}}"
   RUN_START="$(date +%s)"
+}
+
+# fold_binary_shas_set STATE: refuses an empty [retired_hour] c1_sha or
+# r2_sha for a state that writes a fold binary stamp. An empty SHA reads as
+# not carried, which turns A3, A4, W3 and W8 not requested instead of judged.
+fold_binary_shas_set() {
+  [ -n "$RH_C1" ] || fail "run.toml retired_hour.c1_sha is empty: $1 writes the fold binary stamp, which needs it"
+  [ -n "$RH_R2" ] || fail "run.toml retired_hour.r2_sha is empty: $1 writes the fold binary stamp, which needs it"
 }
 
 # build_pkg NAME CARGO_ARGS...: one release build of the clone from inside
@@ -1251,8 +1260,7 @@ state_many_parts() {
 
 # fold_binary_stamp STATE: stamps/STATE.logs.fold_binary.json, the fold
 # binary's SHA and whether it carries run.toml's [retired_hour] c1_sha and
-# r2_sha (inv.py fold-binary; an empty c1_sha or r2_sha reads as not
-# carried). Every state whose figures are gated on the binary writes it:
+# r2_sha (inv.py fold-binary; load_config refuses an empty one). Every state whose figures are gated on the binary writes it:
 # retired_hour (W2, W3, W8) and day_parts_N (A3, A4). 0 written; 2 when no
 # SHA names the binary, the reason in FB_WHY; 1 (failed_at set) on failure.
 fold_binary_stamp() {

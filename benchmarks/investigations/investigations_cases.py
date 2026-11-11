@@ -5889,10 +5889,14 @@ FINISHED=1
 
     # --- ADR-3939's multi-day states (task H1b, #4048) ------------------------
 
-    def new_states_toml(self, states='"day_parts_7", "day_parts_30", "retired_hour"', c1='"HEAD"'):
+    def new_states_toml(self, states='"day_parts_7", "day_parts_30", "retired_hour"', c1='"HEAD"', r2='"HEAD"'):
         return self.example_toml(
             ('"erasure_in_flight", "many_parts_744", "many_parts_2160"]', f'"erasure_in_flight", {states}]'),
-            ('c1_sha = ""', f"c1_sha = {c1}"))
+            (f'c1_sha = "{self.EXAMPLE_C1}"', f"c1_sha = {c1}"), (f'r2_sha = "{self.EXAMPLE_R2}"', f"r2_sha = {r2}"))
+
+    # run.example.toml's [retired_hour] SHAs: C1's and R2's last commits on main.
+    EXAMPLE_C1 = "131ab993cd209e97597c7508b02f99cd794a6cbd"
+    EXAMPLE_R2 = "e7325ae0f5d7b1864cbfe42a0a8723d245563f4f"
 
     def new_states_dry_run(self, script=None, toml=None, out="out-h1b", env=None):
         p = subprocess.run([BASH, script or os.path.join(BOX, "run.sh"), "--dry-run", "--lane", "s3", "--run-toml",
@@ -6278,42 +6282,60 @@ FINISHED=1
         shutil.rmtree(repo)
         return out
 
+    def check_empty_fold_binary_shas(self, script):
+        """An empty retired_hour.r2_sha with day_parts_7 or retired_hour
+        listed, and an empty c1_sha with day_parts_7 listed, are each refused
+        before any step, naming the key: an empty SHA reads as not carried,
+        which would turn A3, A4, W3 and W8 not requested."""
+        out = []
+        for states, c1, r2, key in (('"day_parts_7"', '"HEAD"', '""', "r2_sha"),
+                                    ('"day_parts_7", "retired_hour"', '"HEAD"', '""', "r2_sha"),
+                                    ('"day_parts_7"', '""', '"HEAD"', "c1_sha")):
+            toml = self.new_states_toml(states=states, c1=c1, r2=r2)
+            code, text = self.new_states_dry_run(script, toml=toml, out=f"out-empty-{key}")
+            os.remove(toml)
+            want = f"run.toml retired_hour.{key} is empty: day_parts_7 writes the fold binary stamp"
+            if code == 0 or want not in text or "STEP state:" in text:
+                out.append(f"states [{states}] with an empty {key}: exit {code}, {want!r} not in the output")
+        return out
+
     def test_retired_hour_stamps_fold_binary_sha(self):
         # stamps/retired_hour.logs.fold_binary.json is {sha, carries_c1,
         # carries_r2} by git ancestry against run.toml's c1_sha and r2_sha;
         # an empty r2_sha is false; an unresolvable SHA refuses and writes
         # no stamp. run.sh writes it before the state's first tombstone,
-        # and refuses a retired_hour run with no c1_sha, or with no
-        # day_parts_7 before it.
+        # refuses an empty c1_sha or r2_sha for any state that stamps the
+        # fold binary, and refuses a retired_hour run with no day_parts_7
+        # before it.
         self.assertEqual(self.check_fold_binary(os.path.join(BOX, "lib", "inv.py")), [])
         code, text = self.new_states_dry_run()
         self.assertEqual(code, 0, text)
         rh = "\n".join(self.blocks(text)["state:retired_hour"])
         self.assertLess(rh.index("STAMP stamps/retired_hour.logs.fold_binary.json"), rh.index("retention-cutoff"))
-        self.assertRegex(rh, r"fold-binary --repo /root/inv/ravel --sha FILL-IN-COMMIT --c1 HEAD --r2 '' --out "
+        self.assertRegex(rh, r"fold-binary --repo /root/inv/ravel --sha FILL-IN-COMMIT --c1 HEAD --r2 HEAD --out "
                              r"\S+/stamps/retired_hour\.logs\.fold_binary\.json")
         # Every day_parts_N state stamps its own fold binary before its load,
-        # whether or not run.toml lists retired_hour or sets c1_sha.
+        # whether or not run.toml lists retired_hour.
         for n in (7, 30):
             dp = "\n".join(self.blocks(text)[f"state:day_parts_{n}"])
             self.assertLess(dp.index(f"STAMP stamps/day_parts_{n}.logs.fold_binary.json"), dp.index("stride-check"))
-            self.assertRegex(dp, r"fold-binary --repo /root/inv/ravel --sha FILL-IN-COMMIT --c1 HEAD --r2 '' "
+            self.assertRegex(dp, r"fold-binary --repo /root/inv/ravel --sha FILL-IN-COMMIT --c1 HEAD --r2 HEAD "
                                  rf"--out \S+/stamps/day_parts_{n}\.logs\.fold_binary\.json")
-        code, text = self.new_states_dry_run(toml=self.new_states_toml(states='"day_parts_7"', c1='""'),
-                                             out="out-dp7-alone")
+        code, text = self.new_states_dry_run(toml=self.new_states_toml(states='"day_parts_7"'), out="out-dp7-alone")
         self.assertEqual(code, 0, text)
         os.remove(self.path("run.toml"))
         self.assertRegex("\n".join(self.blocks(text)["state:day_parts_7"]),
-                         r"fold-binary --repo /root/inv/ravel --sha FILL-IN-COMMIT --c1 '' --r2 '' "
+                         r"fold-binary --repo /root/inv/ravel --sha FILL-IN-COMMIT --c1 HEAD --r2 HEAD "
                          r"--out \S+/stamps/day_parts_7\.logs\.fold_binary\.json")
-        code, text = self.new_states_dry_run(toml=self.new_states_toml(c1='""'), out="out-no-c1")
-        self.assertNotEqual(code, 0)
-        self.assertIn("run.toml retired_hour.c1_sha is empty", text)
-        os.remove(self.path("run.toml"))
+        self.assertEqual(self.check_empty_fold_binary_shas(os.path.join(BOX, "run.sh")), [])
         code, text = self.new_states_dry_run(toml=self.new_states_toml(states='"retired_hour", "day_parts_7"'),
                                              out="out-order")
         self.assertNotEqual(code, 0)
         self.assertIn("retired_hour runs on the day_parts_7 tenant", text)
+        self.flip_check('  [ -n "$RH_R2" ] || fail', '  true || fail', "run.sh", self.check_empty_fold_binary_shas,
+                        "an empty r2_sha accepted", "test_retired_hour_stamps_fold_binary_sha")
+        self.flip_check('  [ -n "$RH_C1" ] || fail', '  true || fail', "run.sh", self.check_empty_fold_binary_shas,
+                        "an empty c1_sha accepted", "test_retired_hour_stamps_fold_binary_sha")
         self.flip_check('"carries_r2": bool(r2_full) and git_is_ancestor(repo, r2_full, full)}',
                         '"carries_r2": git_is_ancestor(repo, r2_full or c1_full, full)}', "lib/inv.py",
                         self.check_fold_binary, "an empty r2_sha read as carried",
@@ -6578,7 +6600,9 @@ FINISHED=1
         os.chmod(stub, 0o755)
         toml = self.example_toml(('lane = "s3"', 'lane = "local"'),
                                  ('"erasure_in_flight", "many_parts_744", "many_parts_2160"]',
-                                  '"erasure_in_flight", "day_parts_7", "retired_hour"]'), ('c1_sha = ""', 'c1_sha = "HEAD"'))
+                                  '"erasure_in_flight", "day_parts_7", "retired_hour"]'),
+                                 (f'c1_sha = "{self.EXAMPLE_C1}"', 'c1_sha = "HEAD"'),
+                                 (f'r2_sha = "{self.EXAMPLE_R2}"', 'r2_sha = "HEAD"'))
         code, text, _ = self.run_sourced(script, toml, f"""BIN={stub}
 INV_DIR={repo}
 DP7_OK=1

@@ -20,8 +20,8 @@ lane = "s3"
 # measures that ADR: day_parts_7 (tenant dp7, spans and logs) and
 # day_parts_30 (tenant dp30, logs) load N whole UTC days ending before the
 # current hour, each followed by its _advance transition; retired_hour runs
-# on dp7, so it needs day_parts_7 listed before it and [retired_hour] c1_sha
-# set, and is followed by retired_hour_drop.
+# on dp7, so it needs day_parts_7 listed before it, and is followed by
+# retired_hour_drop. Each of these needs [retired_hour] c1_sha and r2_sha set.
 states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_leaves", "compaction_in_flight",
           "erasure_in_flight", "many_parts_744", "many_parts_2160"]
 # The run's own deadline, below box.max_minutes: a state that would start
@@ -145,15 +145,16 @@ traces_per_day_30 = 4000008
 key_index_build_max_pairs_30 = 1600000
 
 [retired_hour]
-# Read only when run.states lists retired_hour. The fold binary stamp
-# (stamps/retired_hour.logs.fold_binary.json) records whether the binary's
-# SHA descends from c1_sha and r2_sha (ADR-3939 tasks C1 and R2; W2 is judged
-# only on a binary carrying C1 and not R2). c1_sha is required; an empty
-# r2_sha means R2 has not landed, so carries_r2 is false. A SHA that names no
-# commit fails the state.
-c1_sha = ""
-r2_sha = ""
-# The maintain-mode server's pass interval, and the most minutes run.sh lists
+# c1_sha and r2_sha are read by every state that writes a fold binary stamp
+# (retired_hour and each day_parts_N; stamps/STATE.logs.fold_binary.json),
+# which records whether the binary's SHA descends from each (W2 is judged only
+# on a binary carrying C1 and not R2). Both are required when run.states lists
+# any of those states. A SHA that names no commit fails the state.
+# c1_sha: ADR-3939 task C1, its last commit on main.
+c1_sha = "131ab993cd209e97597c7508b02f99cd794a6cbd"
+# r2_sha: ADR-3939 task R2, its last commit on main.
+r2_sha = "e7325ae0f5d7b1864cbfe42a0a8723d245563f4f"
+# Read only when run.states lists retired_hour. The maintain-mode server's pass interval, and the most minutes run.sh lists
 # the store for the expected tombstones before failing the state.
 maintain_interval_secs = 30
 wait_minutes = 20
