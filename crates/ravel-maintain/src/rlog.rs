@@ -460,6 +460,11 @@ pub(crate) fn check_rlog_writer_config(config: &CompactorConfig, bucket: &Bucket
         crate::config::validate_rlog_run_block_target_records(
             config.rlog_run_block_target_records,
         )?;
+        crate::config::validate_rlog_level2_settings(
+            config.level2_workers,
+            config.rlog_level2_range_records,
+            config.rlog_level2_range_slots,
+        )?;
     }
     Ok(())
 }
@@ -1081,7 +1086,8 @@ struct PartWriterSettings {
 
 /// The zstd level a two-level merge's scratch runs are written with
 /// (ADR-3853 D1). Runs are read once and wiped, so they take the cheapest
-/// encode; nothing about a run reaches a published part's bytes.
+/// encode. Its effect on published parts, the keyed batch-major exception
+/// included, is stated in ADR-3853 D2.
 const RUN_ZSTD_LEVEL: i32 = 1;
 
 /// The page choice of a scratch run (ADR-3853 D1).
@@ -1095,6 +1101,15 @@ const RUN_GROUP_TARGET_BLOCKS: usize = 1;
 /// once. ADR-3853 D2 states its effect on published parts, including the
 /// keyed batch-major exception.
 pub const RUN_BLOCK_TARGET_RECORDS: usize = 1024;
+
+/// Default record quantum level 2's stream key space is cut into ranges at
+/// (ADR-3853 D5). Predicted, not measured: hour 498273's 242 million records
+/// cut into about 97 ranges, under the 625 the key format's part-index cap
+/// leaves at 16 slots a range.
+pub const LEVEL2_RANGE_RECORDS: u64 = 2_500_000;
+
+/// Default part-index slots per level-2 range, `K` (ADR-3853 D5).
+pub const LEVEL2_RANGE_SLOTS: u32 = 16;
 
 /// Bytes of the four-byte little-endian `covered_count` and `covered_crc32c`
 /// fields that frame a BLOOM covered-column list.
@@ -1349,6 +1364,11 @@ async fn merge_catalogs_with_geometry(
     // `build_parts` caller.
     let zstd_level = crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
     crate::config::validate_rlog_run_block_target_records(config.rlog_run_block_target_records)?;
+    crate::config::validate_rlog_level2_settings(
+        config.level2_workers,
+        config.rlog_level2_range_records,
+        config.rlog_level2_range_slots,
+    )?;
     let key_index_fields = merged_key_index_fields(catalogs);
     // Global stream_ref remap + cross-object stream-identity check. The
     // merged set is the sorted union of every input's STREAM_DIR; the dense
@@ -1497,6 +1517,8 @@ async fn merge_catalogs_with_geometry(
         pipeline: None,
         memory_target: config.rlog_memory_target_bytes(),
         stored_target: config.rlog_stored_target_bytes(),
+        slots: None,
+        stop: None,
     };
     let mut counts = RecordCounts::default();
     merge_planned(
@@ -1578,7 +1600,7 @@ async fn merge_planned(
             next += 1;
             continue;
         }
-        let len = plan.cut(next);
+        let len = plan.cut(next, &[]);
         run_stream_pass(
             store,
             catalogs,
@@ -1589,6 +1611,7 @@ async fn merge_planned(
             sink,
             keep,
             counts,
+            None,
         )
         .await?;
         next += len;
@@ -1637,8 +1660,9 @@ struct Level1InputCost {
     /// The [`pass_block_cost`] of each of its blocks, summed: what it adds to
     /// its group's run.
     decoded: u64,
-    /// The largest of those block costs.
-    largest_block: u64,
+    /// The block with the highest of those costs per record, as its
+    /// `(cost, records)`.
+    block_rate: (u64, u64),
     /// Its candidate row groups, as [`candidate_group_extents`] gives them.
     extents: BTreeSet<(u64, u64)>,
 }
@@ -1658,20 +1682,29 @@ fn level1_input_bytes(catalog: &RlogInputCatalog) -> Result<Level1InputCost> {
         .iter()
         .fold(0u64, |a, (s, e)| a.saturating_add(e.saturating_sub(*s)));
     let mut decoded = 0u64;
-    let mut largest_block = 0u64;
+    let mut block_rate = (0u64, 1u64);
     #[cfg(test)]
     LEVEL1_PRICING.with(|c| c.set(c.get().block_walk()));
-    for block in 0..catalog.pricing.block_rows.len() {
+    for (block, &records) in catalog.pricing.block_rows.iter().enumerate() {
         let cost = pass_block_cost(&catalog.pricing, block)?;
         decoded = decoded.saturating_add(cost);
-        largest_block = largest_block.max(cost);
+        let records = u64::from(records);
+        if records > 0 && higher_rate((cost, records), block_rate) {
+            block_rate = (cost, records);
+        }
     }
     Ok(Level1InputCost {
         raw,
         decoded,
-        largest_block,
+        block_rate,
         extents,
     })
+}
+
+/// Whether `a`'s price per record, each a `(price, records)` pair, is above
+/// `b`'s.
+fn higher_rate(a: (u64, u64), b: (u64, u64)) -> bool {
+    u128::from(a.0) * u128::from(b.1) > u128::from(b.0) * u128::from(a.1)
 }
 
 /// Pricing walks a two-level merge made before level 1, for a test that each
@@ -1734,15 +1767,22 @@ fn level1_group_size(per_input: u64, run_target: u64, ceiling: u64, inputs: usiz
 /// A larger stream is priced by its level-2 stream estimate.
 const LEVEL2_BLOCKS_PER_RUN: u64 = 2;
 
-/// The figures [`derive_level1_workers`] prices a worker count with, all known
+/// The figures [`derive_level_workers`] prices a worker pair with, all known
 /// before level 1 reads a block.
 struct Level1Shape {
     /// `P`, the largest per-input cost of constraint (a).
     per_input: u64,
     /// `N`, the inputs level 1 cuts into groups.
     inputs: usize,
-    /// The price of one level-2 block, taken from the inputs' largest block.
-    block_bytes: u64,
+    /// The input block with the highest pass price per record, as its
+    /// `(price, records)`: what a run block costs per record it holds.
+    block_rate: (u64, u64),
+    /// The records a run block closes at,
+    /// [`CompactorConfig::rlog_run_block_target_records`].
+    run_block_records: u64,
+    /// The largest input's record count, which with the group size caps the
+    /// records a run block can hold.
+    input_records: u64,
     /// The bytes `input_read_concurrency` row group GETs hold at once.
     in_flight: u64,
     run_target: u64,
@@ -1757,34 +1797,75 @@ impl Level1Shape {
         (self.inputs as u64).div_ceil(group_size.max(1))
     }
 
-    /// Constraint (b)'s left side over the runs of groups of `group_size`:
-    /// `R x 2 x block + in_flight + part_target`.
+    /// The predicted price of one level-2 block (ADR-3853 D5): the input
+    /// blocks' highest price per record at the records a run block holds, the
+    /// run block target or a whole group's largest inputs if fewer.
+    fn run_block_bytes(&self, group_size: u64) -> u64 {
+        let (price, records) = self.block_rate;
+        let held = self
+            .run_block_records
+            .min(group_size.saturating_mul(self.input_records));
+        let bytes = u128::from(price)
+            .saturating_mul(u128::from(held))
+            .div_ceil(u128::from(records.max(1)));
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+
+    /// Constraint (b)'s left side over the runs of groups of `group_size`, what
+    /// one level-2 worker needs: `R x 2 x block + in_flight + part_target`.
     fn level_two_bytes(&self, group_size: u64) -> u64 {
         self.runs(group_size)
             .saturating_mul(LEVEL2_BLOCKS_PER_RUN)
-            .saturating_mul(self.block_bytes)
+            .saturating_mul(self.run_block_bytes(group_size))
             .saturating_add(self.in_flight)
             .saturating_add(self.part_target)
     }
 }
 
-/// `W1`, the level-1 worker count (ADR-3853 D4): the largest count up to
-/// `share` whose per-worker ceiling `U / W1` leaves constraint (a) a group of
-/// at least 2 and whose runs `R` keep constraint (b),
-/// `R x 2 x block + in_flight + part_target`, under `U`; `None` when none
-/// does, and the unit is refused before level 1 reads a block.
-fn derive_level1_workers(shape: &Level1Shape, share: usize) -> Option<usize> {
-    for workers in (1..=share.max(1)).rev() {
-        let ceiling = shape.ceiling / workers as u64;
+/// `(W1, W2)`, the level-1 and level-2 worker counts, derived together
+/// (ADR-3853 D4, D5 amendment). For each `W1` up to `share` whose per-worker
+/// ceiling `U / W1` leaves constraint (a) a group of at least 2, level 2 runs
+/// `W2 = min(share, floor(U / need))` range workers, `need` being constraint
+/// (b)'s left side over that `W1`'s runs, or `level2`'s count when it is
+/// configured and `level2 x need` fits `U`. The pair kept is the one with the
+/// smallest `1/W1 + 1/W2`, ties to the smaller `W1`. `None` when no `W1`
+/// admits a level-2 worker, and the unit is refused before level 1 reads a
+/// block.
+fn derive_level_workers(
+    shape: &Level1Shape,
+    share: usize,
+    level2: Option<usize>,
+) -> Option<(usize, usize)> {
+    let share = share.max(1);
+    let mut best: Option<(usize, usize)> = None;
+    for w1 in 1..=share {
+        let ceiling = shape.ceiling / w1 as u64;
         let group = level1_group_size(shape.per_input, shape.run_target, ceiling, shape.inputs);
         if group < 2 {
             continue;
         }
-        if shape.level_two_bytes(group) <= shape.ceiling {
-            return Some(workers);
+        let need = shape.level_two_bytes(group).max(1);
+        let w2 = match level2 {
+            Some(w2) if need.saturating_mul(w2 as u64) <= shape.ceiling => w2,
+            Some(_) => 0,
+            None => usize::try_from(shape.ceiling / need)
+                .unwrap_or(usize::MAX)
+                .min(share),
+        };
+        if w2 == 0 {
+            continue;
+        }
+        // 1/a + 1/b = (a + b) / (a * b), compared as cross products.
+        let better = best.is_none_or(|(b1, b2)| {
+            let (n, d) = ((w1 + w2) as u128, (w1 * w2) as u128);
+            let (bn, bd) = ((b1 + b2) as u128, (b1 * b2) as u128);
+            n * bd < bn * d
+        });
+        if better {
+            best = Some((w1, w2));
         }
     }
-    None
+    best
 }
 
 /// `E`, the level-2 builders in flight at once, the open one included
@@ -1803,16 +1884,24 @@ fn level2_encode_builders(
     share.min(fit).max(2)
 }
 
-/// The stop token every level-1 worker of one unit shares (ADR-3853 D4): the
-/// first error any worker returns, a lost claim among them, stops the rest at
-/// their next group or run-part PUT.
-#[derive(Default)]
-struct Level1Stop {
+/// The stop token every worker of one level of a unit shares (ADR-3853 D4,
+/// D5): the first error any worker returns, a lost claim among them, stops the
+/// rest at their next group, range or part PUT.
+struct LevelStop {
+    level: u8,
     stopped: std::sync::atomic::AtomicBool,
     first: std::sync::Mutex<Option<MaintainError>>,
 }
 
-impl Level1Stop {
+impl LevelStop {
+    fn new(level: u8) -> Self {
+        LevelStop {
+            level,
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            first: std::sync::Mutex::new(None),
+        }
+    }
+
     fn is_stopped(&self) -> bool {
         self.stopped.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -1830,8 +1919,11 @@ impl Level1Stop {
 
     /// What a worker that saw the token returns; [`Self::fail`] drops it,
     /// since the token was already set.
-    fn halted() -> MaintainError {
-        MaintainError::Invariant("level-1 worker stopped by another worker".to_string())
+    fn halted(&self) -> MaintainError {
+        MaintainError::Invariant(format!(
+            "level-{} worker stopped by another worker",
+            self.level
+        ))
     }
 
     fn take(&self) -> Option<MaintainError> {
@@ -2550,13 +2642,17 @@ async fn two_level_merge(
     let share = config.unit_core_share(
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
     );
-    let workers = match config.level1_workers {
-        Some(workers) => workers.max(1),
+    let (workers, level2_workers) = match config.level1_workers {
+        Some(workers) => (workers.max(1), None),
         None => {
             let shape = Level1Shape {
                 per_input,
                 inputs,
-                block_bytes: costs.iter().map(|c| c.largest_block).max().unwrap_or(0),
+                block_rate: costs.iter().map(|c| c.block_rate).fold((0, 1), |a, b| {
+                    if higher_rate(b, a) { b } else { a }
+                }),
+                run_block_records: config.rlog_run_block_target_records as u64,
+                input_records: catalogs.iter().map(|c| c.record_count).max().unwrap_or(0),
                 in_flight: largest_in_flight(
                     costs
                         .iter()
@@ -2570,8 +2666,8 @@ async fn two_level_merge(
             };
             #[cfg(test)]
             LEVEL1_PRICING.with(|c| c.set(c.get().shape()));
-            match derive_level1_workers(&shape, share) {
-                Some(workers) => workers,
+            match derive_level_workers(&shape, share, config.level2_workers) {
+                Some((workers, level2)) => (workers, Some(level2)),
                 None => {
                     // One worker gives the largest groups and so the fewest
                     // runs. A group under 2 there is constraint (a)'s
@@ -2586,7 +2682,7 @@ async fn two_level_merge(
                             check: TwoLevelCheck::PredictedLevelTwoFit {
                                 runs: shape.runs(group),
                                 blocks_per_run: LEVEL2_BLOCKS_PER_RUN,
-                                block_bytes: shape.block_bytes,
+                                block_bytes: shape.run_block_bytes(group),
                                 per_input_bytes: per_input,
                                 group_size: group,
                                 in_flight_bytes: shape.in_flight,
@@ -2595,7 +2691,7 @@ async fn two_level_merge(
                             },
                         });
                     }
-                    1
+                    (1, None)
                 }
             }
         }
@@ -2650,6 +2746,7 @@ async fn two_level_merge(
         share,
         workers,
         worker_ceiling,
+        level2_workers,
         need,
         free,
     };
@@ -2736,6 +2833,10 @@ struct TwoLevelLayout {
     workers: usize,
     /// `U / W1`, each worker's resident ceiling.
     worker_ceiling: u64,
+    /// `W2` as [`derive_level_workers`] predicted it; `None` when
+    /// [`CompactorConfig::level1_workers`] is configured and no pair was
+    /// derived.
+    level2_workers: Option<usize>,
     need: u64,
     free: u64,
 }
@@ -2759,7 +2860,7 @@ struct Level1Groups {
     run_target: u64,
     ceiling: u64,
     next: std::sync::atomic::AtomicUsize,
-    stop: Arc<Level1Stop>,
+    stop: Arc<LevelStop>,
     #[cfg(test)]
     probe: Option<Arc<Level1Probe>>,
     #[cfg(test)]
@@ -3155,7 +3256,7 @@ impl Level1Tasks {
     /// Every worker's result. A worker task that panicked resumes the panic
     /// here, on the unit's task, as it did when the workers were futures of
     /// that task.
-    async fn join(&mut self, stop: &Level1Stop) -> Vec<Option<Level1Runs>> {
+    async fn join(&mut self, stop: &LevelStop) -> Vec<Option<Level1Runs>> {
         futures::future::join_all(self.0.iter_mut().map(|task| async move {
             match task.await {
                 Ok(done) => done,
@@ -3209,7 +3310,7 @@ async fn level1_worker_groups(
     let mut keep_all = |_: &LogRecord| -> Result<bool> { Ok(true) };
     loop {
         if groups.stop.is_stopped() {
-            return Err(Level1Stop::halted());
+            return Err(groups.stop.halted());
         }
         let index = groups
             .next
@@ -3274,6 +3375,8 @@ async fn level1_worker_groups(
             pipeline: None,
             memory_target: groups.run_target,
             stored_target: u64::MAX,
+            slots: None,
+            stop: None,
         };
         merge_planned(
             &groups.store,
@@ -3288,6 +3391,295 @@ async fn level1_worker_groups(
         .await?;
         done.runs.push((index, sink.finish_run().await?));
     }
+}
+
+/// Cut level 2's merged stream order into ranges by a record quantum
+/// (ADR-3853 D5 amendment): walking the streams in order, each stream adds the
+/// records of the candidate run blocks it is the first to reach, and a range
+/// closes after the stream at which those records reach `quantum`. The cut
+/// reads the runs' catalogs alone, never the worker count, so every `W2` cuts
+/// the same ranges. At least one range, the last possibly short.
+fn level2_ranges(
+    runs: &[RlogInputCatalog],
+    stream_ids: &[LogStreamId],
+    quantum: u64,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    let mut counted: Vec<Option<usize>> = vec![None; runs.len()];
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut records = 0u64;
+    for (j, stream_id) in stream_ids.iter().enumerate() {
+        for (run, last) in runs.iter().zip(counted.iter_mut()) {
+            let Some(locs) = run.reader.stream_blocks(stream_id)? else {
+                continue;
+            };
+            for &block in locs.iter().flat_map(|loc| loc.block_indices()) {
+                if last.is_some_and(|l| block <= l) {
+                    continue;
+                }
+                *last = Some(block);
+                records = records.saturating_add(u64::from(
+                    run.pricing.block_rows.get(block).copied().unwrap_or(0),
+                ));
+            }
+        }
+        if records >= quantum {
+            ranges.push(start..j + 1);
+            start = j + 1;
+            records = 0;
+        }
+    }
+    if start < stream_ids.len() || ranges.is_empty() {
+        ranges.push(start..stream_ids.len());
+    }
+    Ok(ranges)
+}
+
+/// The ranges worker `w` of `workers` takes of `ranges` (ADR-3853 D5
+/// amendment): `[w x n / W2, (w + 1) x n / W2)`, so each worker's ranges are
+/// contiguous and a boundary block's view carries across them.
+fn level2_assignment(ranges: usize, workers: usize, w: usize) -> std::ops::Range<usize> {
+    let workers = workers.max(1);
+    (w.saturating_mul(ranges) / workers)..(w.saturating_add(1).saturating_mul(ranges) / workers)
+}
+
+/// The streams `assigned` ranges cover, as one index range into the merged
+/// stream order.
+fn level2_streams(
+    ranges: &[std::ops::Range<usize>],
+    assigned: &std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let start = ranges.get(assigned.start).map_or(0, |r| r.start);
+    let end = assigned
+        .end
+        .checked_sub(1)
+        .and_then(|last| ranges.get(last))
+        .map_or(start, |r| r.end);
+    start..end.max(start)
+}
+
+/// What level 2's worker count is checked against (ADR-3853 D5): one worker's
+/// read side, `need`, under the unit's `ceiling`, and the `W2` the joint
+/// derivation predicted before level 1 ran.
+struct Level2Fit {
+    need: u64,
+    ceiling: u64,
+    predicted: usize,
+}
+
+/// `W2` and each range worker's plan, over its own streams under
+/// `ceiling / W2` (ADR-3853 D5 amendment). A configured
+/// [`CompactorConfig::level2_workers`] is taken as it is, capped at the range
+/// count, and refused through `refuse` with the worker ceiling when one
+/// worker's read side or plan does not fit it. A derived one is the predicted
+/// `W2`, capped at what the measured read side fits and at the range count,
+/// and lowered one worker at a time until every plan fits; it is refused only
+/// when one worker does not fit the whole ceiling. `whole` is the plan over
+/// every stream under the whole ceiling, the one worker's plan at `W2 = 1`.
+#[allow(clippy::too_many_arguments)]
+fn level2_plans(
+    config: &CompactorConfig,
+    runs: &[RlogInputCatalog],
+    stream_ids: &[LogStreamId],
+    width_ns: i64,
+    ranges: &[std::ops::Range<usize>],
+    fit: Level2Fit,
+    whole: MergePlan,
+    refuse: impl Fn(u64) -> MaintainError,
+) -> Result<(usize, Vec<MergePlan>)> {
+    let derived = config.level2_workers.is_none();
+    let most = usize::try_from(fit.ceiling / fit.need.max(1)).unwrap_or(usize::MAX);
+    let mut workers = config
+        .level2_workers
+        .unwrap_or_else(|| fit.predicted.min(most))
+        .min(ranges.len())
+        .max(1);
+    let floor = config.rlog_memory_target_bytes();
+    let mut whole = Some(whole);
+    loop {
+        let ceiling = fit.ceiling / workers as u64;
+        let plans = if fit.need > ceiling {
+            None
+        } else if workers == 1 {
+            Some(vec![match whole.take() {
+                Some(plan) => plan,
+                None => plan_merge_with(config, runs, stream_ids, width_ns, ceiling, floor)?,
+            }])
+        } else {
+            let plans = (0..workers)
+                .map(|w| {
+                    let streams =
+                        level2_streams(ranges, &level2_assignment(ranges.len(), workers, w));
+                    plan_merge_with(
+                        config,
+                        runs,
+                        &stream_ids[streams],
+                        width_ns,
+                        ceiling,
+                        floor,
+                    )
+                })
+                .collect::<Result<Vec<MergePlan>>>()?;
+            Some(plans)
+        };
+        match plans {
+            Some(plans) if plans.iter().all(|p| p.mode != MergeReadMode::Cursor) => {
+                return Ok((workers, plans));
+            }
+            _ if derived && workers > 1 => workers -= 1,
+            _ => return Err(refuse(ceiling)),
+        }
+    }
+}
+
+/// What a level-2 range worker reads and where it publishes (ADR-3853 D5
+/// amendment), borrowed so the unit's own task and a spawned worker run the
+/// same [`level2_worker_ranges`].
+struct Level2Work<'a> {
+    /// Where the published parts go and the claim lives.
+    store: &'a dyn ObjectStoreBackend,
+    /// Where the runs are read from: the unit's scratch.
+    runs_store: &'a dyn ObjectStoreBackend,
+    bucket: &'a Bucket,
+    input_set_hash: &'a [u8; 32],
+    dry_run: bool,
+    retain_bytes: bool,
+    runs: &'a [RlogInputCatalog],
+    stream_ids: &'a [LogStreamId],
+    ranges: &'a [std::ops::Range<usize>],
+    slots: u32,
+    /// The L0 inputs of the unit, for a refusal.
+    inputs: usize,
+    width_ns: i64,
+    stop: &'a LevelStop,
+}
+
+/// Merge the `assigned` ranges of `work`, in order, into published parts under
+/// `config`, the worker's share of the unit's, and `plan`, planned over the
+/// ranges' streams. Each range numbers its parts from its own slots
+/// ([`PartSink::start_range`]), and a decoded block's view carries from one
+/// pass to the next, across the worker's range boundaries too
+/// ([`PassCarry`]). `builders` keeps D3's encode pipeline; `None` encodes
+/// each closed part inline. The stop token is checked before each range and
+/// before each part PUT.
+async fn level2_worker_ranges(
+    work: &Level2Work<'_>,
+    assigned: std::ops::Range<usize>,
+    config: &CompactorConfig,
+    plan: &MergePlan,
+    output: OutputSpec,
+    builders: Option<usize>,
+) -> Result<(Vec<BuiltPart>, RecordCounts)> {
+    let streams = level2_streams(work.ranges, &assigned);
+    let base = streams.start;
+    let stream_ids = &work.stream_ids[streams];
+    let tracker = config.merge_memory_tracker.as_ref();
+    let mut sink = PartSink {
+        store: work.store,
+        bucket: work.bucket,
+        config,
+        input_set_hash: work.input_set_hash,
+        identity: output.identity,
+        indexed_fields: output.indexed_fields,
+        key_index_fields: output.key_index_fields,
+        declared: output.declared,
+        writer: output.writer,
+        tracker,
+        dry_run: work.dry_run,
+        retain_bytes: work.retain_bytes,
+        current: None,
+        parts: Vec::new(),
+        part_index: 0,
+        read_ledger: None,
+        level: Some(LevelCounter {
+            ledger: config.request_ledger.clone(),
+            level: 2,
+        }),
+        run: None,
+        pipeline: builders.map(|builders| EncodePipeline {
+            builders,
+            pending: std::collections::VecDeque::new(),
+        }),
+        memory_target: config.rlog_memory_target_bytes(),
+        stored_target: config.rlog_stored_target_bytes(),
+        slots: None,
+        stop: Some(work.stop),
+    };
+    let mut counts = RecordCounts::default();
+    let mut keep_all = |_: &LogRecord| -> Result<bool> { Ok(true) };
+    let mut resident_charges = MergeCharges::new(tracker);
+    let resident = match plan.mode {
+        MergeReadMode::Resident => Some(
+            fetch_resident_groups(
+                work.runs_store,
+                sink.store,
+                config,
+                None,
+                work.runs,
+                plan,
+                &mut resident_charges,
+            )
+            .await?,
+        ),
+        MergeReadMode::FetchPerPass | MergeReadMode::Cursor => None,
+    };
+    let mut carry = PassCarry::new(tracker);
+    for r in assigned {
+        if work.stop.is_stopped() {
+            return Err(work.stop.halted());
+        }
+        let Some(range) = work.ranges.get(r) else {
+            break;
+        };
+        sink.start_range(RangeSlotWindow {
+            range: r as u64,
+            ranges: work.ranges.len() as u64,
+            slots: work.slots,
+            inputs: work.inputs,
+        })
+        .await?;
+        let end = range.end - base;
+        let mut next = range.start - base;
+        while next < end {
+            if plan.mode == MergeReadMode::Cursor || plan.hot.get(next).copied().unwrap_or(true) {
+                cursor_merge_one_stream(
+                    work.runs_store,
+                    work.runs,
+                    &stream_ids[next],
+                    work.width_ns,
+                    &mut sink,
+                    tracker,
+                    &mut keep_all,
+                    &mut counts,
+                    resident.as_deref(),
+                )
+                .await?;
+                next += 1;
+                continue;
+            }
+            let len = plan.cut(next, &carry.held()).min(end - next);
+            run_stream_pass(
+                work.runs_store,
+                work.runs,
+                &stream_ids[next..next + len],
+                work.width_ns,
+                plan,
+                resident.as_deref(),
+                &mut sink,
+                &mut keep_all,
+                &mut counts,
+                Some(&mut carry),
+            )
+            .await?;
+            next += len;
+        }
+    }
+    // What is still carried belongs to the next worker's streams, and the
+    // resident groups are spent: release both before the last part's encode.
+    drop(carry);
+    drop(resident);
+    drop(resident_charges);
+    Ok((sink.finish().await?, counts))
 }
 
 /// Both levels of [`two_level_merge`], with the runs written through the
@@ -3341,7 +3733,7 @@ async fn merge_in_unit(
     // many runtime threads as there are workers. Every store and scratch call
     // they make is served here, on the unit's task, which holds both by
     // reference.
-    let stop = Arc::new(Level1Stop::default());
+    let stop = Arc::new(LevelStop::new(1));
     let (store, store_calls) = StoreProxy::open(target.store, None);
     let (scratch, scratch_calls) = StoreProxy::open(meter, ledger.clone());
     let groups = Arc::new(Level1Groups {
@@ -3428,29 +3820,64 @@ async fn merge_in_unit(
     let part_target = config.rlog_memory_target_bytes();
     let plan = plan_merge(config, &runs, stream_ids, width_ns)?;
     let stream_estimate = plan.estimates.iter().copied().max().unwrap_or(0);
-    let fit = TwoLevelCheck::LevelTwoFit {
+    let resident = (runs_count as u64)
+        .saturating_mul(LEVEL2_BLOCKS_PER_RUN)
+        .saturating_mul(run_block_bytes)
+        .max(stream_estimate);
+    let need = resident
+        .saturating_add(in_flight)
+        .saturating_add(part_target);
+    let fit = |ceiling_bytes: u64| TwoLevelCheck::LevelTwoFit {
         runs: runs_count as u64,
         blocks_per_run: LEVEL2_BLOCKS_PER_RUN,
         run_block_bytes,
         stream_estimate_bytes: stream_estimate,
         in_flight_bytes: in_flight,
         part_target_bytes: part_target,
-        ceiling_bytes: ceiling,
+        ceiling_bytes,
     };
-    let resident = (runs_count as u64)
-        .saturating_mul(LEVEL2_BLOCKS_PER_RUN)
-        .saturating_mul(run_block_bytes)
-        .max(stream_estimate);
-    let compared = resident
-        .saturating_add(in_flight)
-        .saturating_add(part_target);
-    if compared > ceiling || plan.mode == MergeReadMode::Cursor {
-        return Err(MaintainError::MergeTwoLevelUnsupported { inputs, check: fit });
+    let ranges = level2_ranges(&runs, stream_ids, config.rlog_level2_range_records)?;
+    let slots = config.rlog_level2_range_slots;
+    let range_count = ranges.len() as u64;
+    if range_count.saturating_mul(u64::from(slots)) > LEVEL2_PART_INDEX_END {
+        let last = RangeSlotWindow {
+            range: range_count.saturating_sub(1),
+            ranges: range_count,
+            slots,
+            inputs,
+        };
+        return Err(last.refusal(last.first().saturating_add(u64::from(slots)) - 1));
     }
-    let builders = level2_encode_builders(layout.share, ceiling, resident, in_flight, part_target);
+    let (level2_workers, plans) = level2_plans(
+        config,
+        &runs,
+        stream_ids,
+        width_ns,
+        &ranges,
+        Level2Fit {
+            need,
+            ceiling,
+            predicted: 1,
+        },
+        plan,
+        |ceiling_bytes| MaintainError::MergeTwoLevelUnsupported {
+            inputs,
+            check: fit(ceiling_bytes),
+        },
+    )?;
+    let level2_ceiling = ceiling / level2_workers as u64;
+    // One range worker keeps D3's encode pipeline; several encode inline, so
+    // each holds one builder, the `part_target` its fit was checked with.
+    let builders = if level2_workers == 1 {
+        level2_encode_builders(layout.share, ceiling, resident, in_flight, part_target)
+    } else {
+        1
+    };
     if let Some(l) = &ledger {
         l.record_encode_builders(builders as u64);
+        l.record_level2_ranges(level2_workers as u64, range_count);
     }
+    let level2_mode = plans.first().map_or("none", |p| p.mode.name());
     tracing::info!(
         signal = ?target.bucket.signal,
         shard = target.bucket.shard,
@@ -3470,56 +3897,68 @@ async fn merge_in_unit(
         cores_per_unit = layout.share,
         level1_workers = layout.workers,
         level1_ceiling_bytes = layout.worker_ceiling,
+        level2_workers,
+        level2_ranges = range_count,
+        level2_ceiling_bytes = level2_ceiling,
         encode_builders = builders,
         scratch_need_bytes = layout.need,
         scratch_free_bytes = layout.free,
-        level2_mode = plan.mode.name(),
+        level2_mode,
         "rlog two-level merge (ADR-3853)"
     );
 
-    let mut sink = PartSink {
-        store: target.store,
-        bucket: target.bucket,
-        config,
-        input_set_hash: target.input_set_hash,
-        identity: output.identity,
-        indexed_fields: output.indexed_fields,
-        key_index_fields: output.key_index_fields,
-        declared: output.declared,
-        writer: output.writer,
-        tracker,
-        dry_run: target.dry_run,
-        retain_bytes: target.retain_bytes,
-        current: None,
-        parts: Vec::new(),
-        part_index: 0,
-        read_ledger: None,
-        level: Some(LevelCounter {
-            ledger: ledger.clone(),
-            level: 2,
-        }),
-        run: None,
-        pipeline: Some(EncodePipeline {
-            builders,
-            pending: std::collections::VecDeque::new(),
-        }),
-        memory_target: part_target,
-        stored_target: config.rlog_stored_target_bytes(),
+    let level2_trackers: Vec<MergeMemoryTracker> = (0..level2_workers)
+        .map(|_| MergeMemoryTracker::new())
+        .collect();
+    let level2_configs: Vec<CompactorConfig> = level2_trackers
+        .iter()
+        .map(|t| CompactorConfig {
+            merge_resident_ceiling_bytes: Some(level2_ceiling),
+            merge_memory_tracker: tracker.map(|_| t.clone()),
+            ..config.clone()
+        })
+        .collect();
+    let stop = Arc::new(LevelStop::new(2));
+    let done = if level2_workers == 1 {
+        let work = Level2Work {
+            store: target.store,
+            runs_store: meter,
+            bucket: target.bucket,
+            input_set_hash: target.input_set_hash,
+            dry_run: target.dry_run,
+            retain_bytes: target.retain_bytes,
+            runs: &runs,
+            stream_ids,
+            ranges: &ranges,
+            slots,
+            inputs,
+            width_ns,
+            stop: &stop,
+        };
+        let (Some(worker_config), Some(plan)) = (level2_configs.first(), plans.first()) else {
+            return Err(MaintainError::Invariant(
+                "level 2 planned no range worker".to_string(),
+            ));
+        };
+        let done =
+            level2_worker_ranges(&work, 0..ranges.len(), worker_config, plan, output, Some(builders))
+                .await;
+        if let Some(t) = tracker {
+            t.absorb_level2_workers(&level2_trackers);
+        }
+        vec![done?]
+    } else {
+        return Err(MaintainError::Invariant(
+            "level 2 planned more than one range worker".to_string(),
+        ));
     };
     let mut level2 = RecordCounts::default();
-    let mut keep_all = |_: &LogRecord| -> Result<bool> { Ok(true) };
-    merge_planned(
-        meter,
-        &runs,
-        stream_ids,
-        width_ns,
-        &plan,
-        &mut sink,
-        &mut keep_all,
-        &mut level2,
-    )
-    .await?;
-    let parts = sink.finish().await?;
+    let mut parts: Vec<BuiltPart> = Vec::new();
+    for (worker_parts, counts) in done {
+        level2.absorb(&counts)?;
+        parts.extend(worker_parts);
+    }
+    parts.sort_by_key(|p| p.part.part_index);
     if level2.input != level1.output {
         return Err(MaintainError::Invariant(format!(
             "two-level merge read {} records back from its runs after writing {}",
@@ -3610,9 +4049,20 @@ impl MergePlan {
     /// a hot stream, and as many more as keep the [`pass_block_cost`] of the
     /// pass's distinct blocks within the pass budget. A block two streams of
     /// the pass share is decoded and held once, so it is counted once.
-    fn cut(&self, start: usize) -> usize {
+    ///
+    /// `carried` are the `(input, block, charged bytes)` a level-2 worker
+    /// carries into the pass ([`PassCarry::held`]): held from the start, so they
+    /// count against the budget once and are not counted again for a stream
+    /// that needs them.
+    fn cut(&self, start: usize, carried: &[(usize, usize, u64)]) -> usize {
         let mut held: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); self.block_costs.len()];
         let mut sum = 0u64;
+        for &(input, block, charged) in carried {
+            if let Some(s) = held.get_mut(input) {
+                s.insert(block);
+            }
+            sum = sum.saturating_add(charged);
+        }
         let mut len = 0usize;
         for (j, hot) in self.hot.iter().enumerate().skip(start) {
             if *hot {
@@ -4105,6 +4555,36 @@ struct HeldView<'r> {
     charged: u64,
 }
 
+/// The decoded blocks a level-2 range worker carries from one pass to its next
+/// (ADR-3853 D5 amendment): per input, the block index and view whose later
+/// rows belong to a stream after the pass, with its pass-rows charge. Rows are
+/// `stream_ref`-major, so only an input's last decoded block can hold such
+/// rows. A pass that wants those rows takes the view instead of decoding the
+/// block again, so a boundary block is decoded once per worker, across the
+/// worker's contiguous ranges too.
+struct PassCarry<'r, 't> {
+    views: BTreeMap<usize, (usize, HeldView<'r>)>,
+    charges: MergeCharges<'t>,
+}
+
+impl<'r, 't> PassCarry<'r, 't> {
+    fn new(tracker: Option<&'t MergeMemoryTracker>) -> Self {
+        PassCarry {
+            views: BTreeMap::new(),
+            charges: MergeCharges::new(tracker),
+        }
+    }
+
+    /// The carried blocks as [`MergePlan::cut`] counts them: `(input, block,
+    /// charged bytes)`.
+    fn held(&self) -> Vec<(usize, usize, u64)> {
+        self.views
+            .iter()
+            .map(|(input, (block, view))| (*input, *block, view.charged))
+            .collect()
+    }
+}
+
 /// One input's decoded blocks in a pass, in block order, which is the order of
 /// their rows in the object: `stream_ref`-major
 /// (docs/log-segment-format.md, the sort descriptor). `views` is allocated at
@@ -4112,6 +4592,9 @@ struct HeldView<'r> {
 struct HeldBlocks<'r> {
     views: Vec<Option<HeldView<'r>>>,
     front: usize,
+    /// The index of the last block in `views`, which a level-2 range worker's
+    /// pass carries when its rows run past the pass.
+    last_block: Option<usize>,
 }
 
 impl<'r> HeldBlocks<'r> {
@@ -4178,10 +4661,16 @@ impl<'r> HeldBlocks<'r> {
 /// `plan.renew_every_fetches` landed groups and every
 /// `plan.renew_every_blocks` decoded blocks, and before each stream's
 /// emission.
+///
+/// With a `carry` (a level-2 range worker), each block keeps every row from the
+/// pass's first stream on rather than only the pass's streams, a view the
+/// carry holds for an input is taken ahead of that input's decodes and its
+/// block is not decoded again, and the views left with rows of later streams
+/// go back into the carry instead of failing the pass.
 #[allow(clippy::too_many_arguments)]
-async fn run_stream_pass(
+async fn run_stream_pass<'c>(
     store: &dyn ObjectStoreBackend,
-    catalogs: &[RlogInputCatalog],
+    catalogs: &'c [RlogInputCatalog],
     range: &[LogStreamId],
     width_ns: i64,
     plan: &MergePlan,
@@ -4189,6 +4678,7 @@ async fn run_stream_pass(
     sink: &mut PartSink<'_>,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
     counts: &mut RecordCounts,
+    mut carry: Option<&mut PassCarry<'c, '_>>,
 ) -> Result<()> {
     let config = sink.config;
     // Claim checkpoints reach the store the claim lives in, which is not
@@ -4259,13 +4749,52 @@ async fn run_stream_pass(
         }
     }
 
-    let mut held: Vec<HeldBlocks<'_>> = Vec::with_capacity(work.len());
-    for iw in &work {
-        let blocks: usize = iw.groups.iter().map(|(_, b)| b.len()).sum();
-        let views: Vec<Option<HeldView<'_>>> = Vec::with_capacity(blocks);
-        charges.add_pass_rows((views.capacity() as u64).saturating_mul(PASS_SLOT_BYTES));
-        held.push(HeldBlocks { views, front: 0 });
+    let mut carried_in: Vec<Option<(usize, HeldView<'c>)>> = Vec::with_capacity(work.len());
+    for iw in &mut work {
+        let mut kept = None;
+        if let Some(carry) = carry.as_deref_mut()
+            && let Some((block, mut view)) = carry.views.remove(&iw.input_index)
+        {
+            let first = iw.wanted.first().copied().unwrap_or(u32::MAX);
+            // Rows of streams before the pass went through the cursor merge.
+            while view.rows.peek_stream_ref().is_some_and(|s| s < first) {
+                view.rows.next().transpose()?;
+            }
+            if view.rows.is_exhausted() {
+                carry.charges.release_pass_rows(view.charged);
+            } else {
+                carry.charges.move_pass_rows(&mut charges, view.charged);
+                for (_, blocks) in &mut iw.groups {
+                    blocks.retain(|b| *b != block);
+                }
+                iw.groups.retain(|(_, blocks)| !blocks.is_empty());
+                if iw.groups.iter().any(|(_, b)| b.iter().any(|b| *b < block)) {
+                    return Err(MaintainError::Invariant(
+                        "stream pass would decode a block ahead of the view it carries"
+                            .to_string(),
+                    ));
+                }
+                kept = Some((block, view));
+            }
+        }
+        carried_in.push(kept);
     }
+
+    let mut held: Vec<HeldBlocks<'c>> = Vec::with_capacity(work.len());
+    for (iw, kept) in work.iter().zip(carried_in) {
+        let blocks: usize = iw.groups.iter().map(|(_, b)| b.len()).sum();
+        let mut views: Vec<Option<HeldView<'c>>> =
+            Vec::with_capacity(blocks + usize::from(kept.is_some()));
+        charges.add_pass_rows((views.capacity() as u64).saturating_mul(PASS_SLOT_BYTES));
+        let last_block = kept.as_ref().map(|(block, _)| *block);
+        views.extend(kept.map(|(_, view)| Some(view)));
+        held.push(HeldBlocks {
+            views,
+            front: 0,
+            last_block,
+        });
+    }
+    let carrying = carry.is_some();
 
     // Decode in (input, group start) order. Under resident reads the bytes are
     // already held; otherwise the groups are fetched in that same order,
@@ -4311,11 +4840,16 @@ async fn run_stream_pass(
                 None => pass_block_cost(&iw.catalog.pricing, block)?,
             };
             charges.add_pass_rows(cost);
+            let first = iw.wanted.first().copied().unwrap_or(u32::MAX);
             let rows =
                 iw.catalog
                     .reader
                     .block_rows_for_refs(loc, block, data.as_ref(), |sref| {
-                        iw.wanted.contains(&sref)
+                        if carrying {
+                            sref >= first
+                        } else {
+                            iw.wanted.contains(&sref)
+                        }
                     })?;
             decoded_blocks += 1;
             let heap = rows.heap_estimate();
@@ -4331,6 +4865,7 @@ async fn run_stream_pass(
                     rows,
                     charged: heap,
                 }));
+                h.last_block = Some(block);
             }
             block_renewal.tick(config, claim_store).await?;
         }
@@ -4396,6 +4931,28 @@ async fn run_stream_pass(
                     sink.push(rec).await?;
                 }
             }
+        }
+    }
+    if let Some(carry) = carry {
+        for (iw, h) in work.iter().zip(held.iter_mut()) {
+            let last = iw.wanted.last().copied().unwrap_or(0);
+            let tail = h.views.len().saturating_sub(1);
+            for (i, slot) in h.views.iter_mut().enumerate().skip(h.front) {
+                let Some(view) = slot.take() else {
+                    continue;
+                };
+                // Only the last block may hold rows past the pass.
+                let block = h.last_block.filter(|_| i == tail);
+                let (Some(block), true) = (block, view.rows.peek_stream_ref().is_some_and(|s| s > last))
+                else {
+                    return Err(MaintainError::Invariant(
+                        "stream pass ended with decoded rows it never emitted".to_string(),
+                    ));
+                };
+                charges.move_pass_rows(&mut carry.charges, view.charged);
+                carry.views.insert(iw.input_index, (block, view));
+            }
+            h.front = h.views.len();
         }
     }
     if !held.iter().all(HeldBlocks::is_drained) {
@@ -4542,6 +5099,54 @@ struct PartSink<'a> {
     /// The stored-size target a part closes at; `u64::MAX` for a run, which is
     /// never probed.
     stored_target: u64,
+    /// The part-index slots of the level-2 range this sink is writing; `None`
+    /// numbers parts from 0 without bound.
+    slots: Option<RangeSlotWindow>,
+    /// The level-2 stop token of a range worker, checked before every part
+    /// PUT; `None` everywhere else.
+    stop: Option<&'a LevelStop>,
+}
+
+/// One past the largest part index an L1 part key carries (`{part_index:04}`,
+/// ravel-commit's `format_part_index`).
+const LEVEL2_PART_INDEX_END: u64 = 10_000;
+
+/// The part indexes one level-2 range may use (ADR-3853 D5 amendment): range
+/// `r` of `ranges` numbers its parts from `r x K`, and a part at `r x K + K`
+/// is refused before its builder opens.
+#[derive(Clone, Copy)]
+struct RangeSlotWindow {
+    range: u64,
+    ranges: u64,
+    slots: u32,
+    /// The L0 inputs of the unit, for the refusal.
+    inputs: usize,
+}
+
+impl RangeSlotWindow {
+    fn first(&self) -> u64 {
+        self.range.saturating_mul(u64::from(self.slots))
+    }
+
+    /// One past the last index the range may use: its `K` slots, never past
+    /// the part key's four digits.
+    fn end(&self) -> u64 {
+        self.first()
+            .saturating_add(u64::from(self.slots))
+            .min(LEVEL2_PART_INDEX_END)
+    }
+
+    fn refusal(&self, part_index: u64) -> MaintainError {
+        MaintainError::MergeTwoLevelUnsupported {
+            inputs: self.inputs,
+            check: TwoLevelCheck::RangeSlots {
+                range: self.range,
+                ranges: self.ranges,
+                slots: self.slots,
+                part_index,
+            },
+        }
+    }
 }
 
 /// One level of a two-level merge, for the ledger's per-level pass and decode
@@ -4572,7 +5177,7 @@ struct RunTarget<'a> {
     index: usize,
     keys: Vec<String>,
     /// The unit's level-1 stop token, checked before every run-part PUT.
-    stop: &'a Level1Stop,
+    stop: &'a LevelStop,
     /// The closed part encoding now, held here so dropping the sink aborts
     /// it, as [`EncodePipeline::pending`] does at level 2.
     pending: Option<PendingEncode>,
@@ -4647,6 +5252,11 @@ impl PartSink<'_> {
     /// closing it once a target is reached.
     async fn push(&mut self, r: LogRecord) -> Result<()> {
         if self.current.is_none() {
+            if let Some(window) = &self.slots {
+                if u64::from(self.part_index) >= window.end() {
+                    return Err(window.refusal(u64::from(self.part_index)));
+                }
+            }
             self.current = Some(PartBuilder::new(
                 &self.identity,
                 &self.indexed_fields,
@@ -4802,6 +5412,7 @@ impl PartSink<'_> {
                 self.retain_bytes,
                 &declared_accum,
                 self.config.request_ledger.as_ref(),
+                self.stop,
             )
             .await?;
             // Cancellation checkpoint 4 (ADR-1029 decision 3): a part
@@ -4831,6 +5442,18 @@ impl PartSink<'_> {
                 t.set_writer_bytes(0);
             }
         }
+        Ok(())
+    }
+
+    /// Close the part in progress and number the next one from `window`'s
+    /// first slot: a level-2 range starts a part of its own, whatever came
+    /// before it.
+    async fn start_range(&mut self, window: RangeSlotWindow) -> Result<()> {
+        if self.current.as_ref().is_some_and(|p| !p.is_empty()) {
+            self.flush(None).await?;
+        }
+        self.part_index = u32::try_from(window.first()).map_err(|_| window.refusal(window.first()))?;
+        self.slots = Some(window);
         Ok(())
     }
 
@@ -4867,7 +5490,7 @@ impl PartSink<'_> {
         run.pending = Some(encoded);
         let (object, _) = PendingEncode::wait_held(&mut run.pending).await?;
         if run.stop.is_stopped() {
-            return Err(Level1Stop::halted());
+            return Err(run.stop.halted());
         }
         let key = format!("run-{:05}/part-{:05}.rlog", run.index, self.part_index);
         run.scratch
@@ -4953,6 +5576,7 @@ impl PartSink<'_> {
             self.retain_bytes,
             &part.declared_accum,
             self.config.request_ledger.as_ref(),
+            self.stop,
         )
         .await
     }
@@ -6941,6 +7565,7 @@ async fn finalize_part(
     retain_bytes: bool,
     declared_accum: &DeclaredStatAccum,
     ledger: Option<&RequestLedger>,
+    stop: Option<&LevelStop>,
 ) -> Result<BuiltPart> {
     if stats.postings_capped_fields > 0 {
         tracing::warn!(
@@ -7008,6 +7633,11 @@ async fn finalize_part(
         part,
         put_already_existed: false,
     };
+    // Nothing awaits between this check and the PUT: once a range worker
+    // fails, no other worker starts a part PUT (ADR-3853 D5 amendment).
+    if let Some(stop) = stop.filter(|s| s.is_stopped()) {
+        return Err(stop.halted());
+    }
     if !dry_run {
         match put_part_with_ledger(store, &built, ledger).await? {
             crate::build::PartPut::Created => {}
@@ -15942,6 +16572,16 @@ mod tests {
         /// single-level plan needs, so no ceiling routes it to two levels.
         const TWO_LEVEL_RUN_TARGET: u64 = 8192;
 
+        /// The run block target of every two-level comparison: the fixture's
+        /// input block, 40 records. Level 2 prices a run block at this many
+        /// records (ADR-3853 D5 amendment), so a run block is predicted at one
+        /// input block's cost, which the fixture's ceilings are cut against.
+        const TWO_LEVEL_RUN_BLOCK: usize = 40;
+
+        /// The part index slots of every two-level comparison's one range: its
+        /// 4,096-byte final parts number well past the default 16.
+        const TWO_LEVEL_SLOTS: u32 = 1_000;
+
         /// A scratch directory for test `name`, absent on return.
         fn fresh_scratch(name: &str) -> std::path::PathBuf {
             let dir = std::env::temp_dir().join(format!(
@@ -15995,6 +16635,8 @@ mod tests {
                 rlog_l1_part_memory_target_bytes: Some(TWO_LEVEL_PART),
                 merge_resident_ceiling_bytes: Some(ceiling),
                 rlog_run_memory_target_bytes: run_target,
+                rlog_run_block_target_records: TWO_LEVEL_RUN_BLOCK,
+                rlog_level2_range_slots: TWO_LEVEL_SLOTS,
                 scratch_dir,
                 geometry_floor_decoded_rows: 0,
                 ..CompactorConfig::default()
@@ -16058,9 +16700,9 @@ mod tests {
         /// levels of G = 12 instead, and every published part has the bytes,
         /// key and content hash the resident single-level merge gives it.
         /// Level 1 decodes each input block once; level 2 reads the runs
-        /// from scratch only and decodes each run block once, plus once more
-        /// for each later pass boundary it straddles, which is at most one
-        /// block per run.
+        /// from scratch only and decodes each run block once: a block that
+        /// straddles a pass boundary is carried into the next pass, not
+        /// decoded again (ADR-3853 D5 amendment).
         #[tokio::test]
         async fn two_level_merge_matches_single_level_bytes_and_keys() {
             let (oracle, single, per_input) = single_level_oracle().await;
@@ -16109,16 +16751,11 @@ mod tests {
             assert_eq!(r.block_read.requests, single.report.block_read.requests);
             assert!(run_blocks > 0);
             assert_eq!(run_blocks, 100, "{line}");
-            assert_eq!(r.level2_passes, 9, "{r:?}");
-            let straddling = (r.level2_passes - 1) * 5;
-            assert!(
-                r.level2_block_decodes >= run_blocks
-                    && r.level2_block_decodes <= run_blocks + straddling,
-                "level-2 decodes {} against {run_blocks} run blocks and {straddling} \
-                 pass boundaries",
-                r.level2_block_decodes
+            assert_eq!(r.level2_passes, 7, "{r:?}");
+            assert_eq!(
+                r.level2_block_decodes, run_blocks,
+                "each run block decoded once across 7 passes: {r:?}"
             );
-            assert_eq!(r.level2_block_decodes, 136, "{r:?}");
             assert!(r.scratch_write_bytes > 0, "{r:?}");
             assert!(r.scratch_read_bytes >= r.scratch_write_bytes, "{r:?}");
             assert_eq!(scratch_entries(&dir), Vec::<std::path::PathBuf>::new());
@@ -16236,8 +16873,12 @@ mod tests {
             let mut figures = Vec::new();
             for target in [16usize, 8192] {
                 let dir = fresh_scratch(&format!("block-target-{target}"));
+                // One level-1 worker keeps groups of 12 at both targets: the
+                // joint derivation would split 16-record run blocks' cheaper
+                // level 2 across more, smaller groups.
                 let config = CompactorConfig {
                     rlog_run_block_target_records: target,
+                    level1_workers: Some(1),
                     ..parts(two_level_config(
                         ceiling,
                         BLOCK_TARGET_RUN_TARGET,
@@ -16416,6 +17057,7 @@ mod tests {
             assert_eq!(group_ceiling(per_input, run_target, 24), CEILING);
 
             let mut writes = Vec::new();
+            let mut run_blocks = Vec::new();
             for target in [1024usize, 8192] {
                 let dir = fresh_scratch(&format!("scratch-need-{target}"));
                 let config = CompactorConfig {
@@ -16444,8 +17086,13 @@ mod tests {
                 );
                 assert_eq!(need, scratch_need(&probe, &keys).await, "{line}");
                 writes.push(written);
+                run_blocks.push(log_field(&line, "run_blocks"));
                 assert!(scratch_entries(&dir).is_empty(), "target {target}");
             }
+            assert!(
+                run_blocks[0] > run_blocks[1],
+                "{run_blocks:?} run blocks at 1,024 and 8,192 records"
+            );
             let (small, default) = (writes[0], writes[1]);
             assert!(
                 small * 100 <= default * 115,
@@ -16717,25 +17364,28 @@ mod tests {
                 assert_eq!(at(1).unit_core_share(16), 16, "{budget} {ceiling:?}");
                 assert_eq!(at(64).unit_core_share(16), 1, "{budget} {ceiling:?}");
                 assert_eq!(at(0).unit_core_share(16), 16, "{budget} {ceiling:?}");
-                // A shape that fits (a) and (b) at every count up to 16, so
-                // W1 is bounded by the share alone.
+                // A shape that fits (a) at every count up to 16, so W1 is
+                // bounded by the share alone, and W2 by the share or by how
+                // many level-2 workers fit U.
                 let shape = Level1Shape {
                     per_input: 6_900_000,
                     inputs: 19_177,
-                    block_bytes: 3_000_000,
+                    block_rate: (3_000_000, 1_024),
+                    run_block_records: 1_024,
+                    input_records: 1 << 40,
                     in_flight: 32_000_000,
                     run_target: 256 << 20,
                     part_target: GIB,
                     ceiling: 20 * GIB,
                 };
                 assert_eq!(
-                    derive_level1_workers(&shape, at(8).unit_core_share(16)),
-                    Some(2),
+                    derive_level_workers(&shape, at(8).unit_core_share(16), None),
+                    Some((2, 2)),
                     "{budget} {ceiling:?}"
                 );
                 assert_eq!(
-                    derive_level1_workers(&shape, at(1).unit_core_share(16)),
-                    Some(16),
+                    derive_level_workers(&shape, at(1).unit_core_share(16), None),
+                    Some((16, 11)),
                     "{budget} {ceiling:?}"
                 );
             }
@@ -16744,10 +17394,11 @@ mod tests {
 
         /// ADR-3853 D4 and D3 at the production shape: 32 cores, 4 units of
         /// 5 GiB at once or one of 20 GiB, 256 MiB run targets, the
-        /// 19,177-input bucket. Measured pricing gives each unit its whole
-        /// core share, 8 or 32 workers; ceiling pricing keeps constraint (b)
-        /// only at the worker count whose groups leave few enough runs, 1 of
-        /// 8 or 14 of 32.
+        /// 19,177-input bucket. `(W1, W2)` minimise `1/W1 + 1/W2` with each
+        /// of the `W2` level-2 workers needing constraint (b)'s bytes for the
+        /// runs `W1` leaves: measured pricing gives (4, 5) of 8 or (17, 11)
+        /// of 32; ceiling pricing fits a level-2 worker only where groups
+        /// leave few enough runs, (1, 1) of 8 or (3, 4) of 32.
         /// `E` is the core share while final parts fit beside level 2's
         /// resident side, and 2 when they do not.
         #[test]
@@ -16761,7 +17412,9 @@ mod tests {
             let shape = |per_input: u64, block: u64| Level1Shape {
                 per_input,
                 inputs: 19_177,
-                block_bytes: block,
+                block_rate: (block, 1_024),
+                run_block_records: 1_024,
+                input_records: 1 << 40,
                 in_flight: 32_000_000,
                 run_target: TARGET,
                 part_target: TARGET,
@@ -16775,8 +17428,8 @@ mod tests {
             );
             assert_eq!(measured.runs(58), 331);
             assert_eq!(measured.level_two_bytes(58), 2_286_435_456);
-            assert_eq!(derive_level1_workers(&measured, share), Some(8));
-            assert_eq!(derive_level1_workers(&measured, 1), Some(1));
+            assert_eq!(derive_level_workers(&measured, share, None), Some((4, 5)));
+            assert_eq!(derive_level_workers(&measured, 1, None), Some((1, 1)));
 
             let priced = shape(29_900_000, 22_000_000);
             assert_eq!(
@@ -16788,7 +17441,7 @@ mod tests {
             assert_eq!(level1_group_size(29_900_000, TARGET, ceiling, 19_177), 170);
             assert_eq!(priced.runs(170), 113);
             assert_eq!(priced.level_two_bytes(170), 5_272_435_456);
-            assert_eq!(derive_level1_workers(&priced, share), Some(1));
+            assert_eq!(derive_level_workers(&priced, share, None), Some((1, 1)));
 
             // One unit of 20 GiB with all 32 cores and 1 GiB final parts.
             let whole = 20 * GIB;
@@ -16800,7 +17453,7 @@ mod tests {
             };
             let measured = at_whole(6_900_000, 3_000_000);
             assert_eq!(level1_group_size(6_900_000, TARGET, whole / 32, 19_177), 58);
-            assert_eq!(derive_level1_workers(&measured, 32), Some(32));
+            assert_eq!(derive_level_workers(&measured, 32, None), Some((17, 11)));
             let priced = at_whole(29_900_000, 22_000_000);
             assert_eq!(
                 level1_group_size(29_900_000, TARGET, whole / 15, 19_177),
@@ -16814,7 +17467,7 @@ mod tests {
             );
             assert_eq!(priced.runs(42), 457);
             assert_eq!(priced.level_two_bytes(42), 21_213_741_824);
-            assert_eq!(derive_level1_workers(&priced, 32), Some(14));
+            assert_eq!(derive_level_workers(&priced, 32, None), Some((3, 4)));
 
             assert_eq!(
                 level2_encode_builders(share, ceiling, 331 * 2 * 3_000_000, 32_000_000, TARGET),
@@ -16977,6 +17630,9 @@ mod tests {
             let ceiling = group_ceiling(per_input, run_target, 12);
             let config = CompactorConfig {
                 level1_workers: Some(1),
+                // Run blocks of the default target, which two of a run price
+                // over the ceiling.
+                rlog_run_block_target_records: RUN_BLOCK_TARGET_RECORDS,
                 ..two_level_config(ceiling, run_target, Some(dir.clone()))
             };
             let (outcome, run, store, _) = compact_two_level(&config).await;
@@ -17088,9 +17744,10 @@ mod tests {
         /// its parts, or two where a cut falls inside them.
         ///
         /// At the production shape, 19,177 inputs of 50 MB under 20 GiB with
-        /// 32 cores, 6 workers leave groups of 66 and 291 runs, whose term
-        /// fits; 7 workers leave groups of 55 and 349 runs, whose term does
-        /// not.
+        /// 32 cores, 6 level-1 workers leave groups of 66 and 291 runs, whose
+        /// term fits one level-2 worker; 7 leave groups of 55 and 349 runs,
+        /// whose term fits none. The joint derivation keeps 2 level-1 workers
+        /// and 3 level-2 workers, the pair with the smallest `1/W1 + 1/W2`.
         ///
         /// On the fixture, a run target of 8,192 bytes cuts each run into 20
         /// parts. Under groups of 12 the 100 parts at one block each exceed
@@ -17105,7 +17762,9 @@ mod tests {
             let shape = Level1Shape {
                 per_input: 50_000_000,
                 inputs: 19_177,
-                block_bytes: 29_769_629,
+                block_rate: (29_769_629, 1_024),
+                run_block_records: 1_024,
+                input_records: 1 << 40,
                 in_flight: 54_132_381,
                 run_target: 256 << 20,
                 part_target: 1_572_864_000,
@@ -17114,7 +17773,7 @@ mod tests {
             assert_eq!(whole, 21_474_836_480);
             let share = CompactorConfig::default().unit_core_share(32);
             assert_eq!(share, 32);
-            assert_eq!(derive_level1_workers(&shape, share), Some(6));
+            assert_eq!(derive_level_workers(&shape, share, None), Some((2, 3)));
             assert_eq!(whole / 6, 3_579_139_413);
             let group = level1_group_size(shape.per_input, shape.run_target, whole / 6, 19_177);
             assert_eq!(group, 66);
@@ -17129,28 +17788,40 @@ mod tests {
             let (oracle, _, per_input) = single_level_oracle().await;
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
-            let mut block_bytes = 0u64;
+            let mut block_rate = (0u64, 1u64);
+            let mut input_records = 0u64;
             let mut lens = Vec::new();
             for catalog in &catalogs_of(&probe, &keys).await {
                 let cost = level1_input_bytes(catalog).expect("price");
-                block_bytes = block_bytes.max(cost.largest_block);
+                if higher_rate(cost.block_rate, block_rate) {
+                    block_rate = cost.block_rate;
+                }
+                input_records = input_records.max(catalog.record_count);
                 lens.extend(cost.extents.iter().map(|(s, e)| e - s));
             }
-            let predicted_tail =
-                largest_in_flight(lens, CompactorConfig::default().input_read_concurrency)
-                    + TWO_LEVEL_PART;
+            let in_flight =
+                largest_in_flight(lens, CompactorConfig::default().input_read_concurrency);
+            let predicted_tail = in_flight + TWO_LEVEL_PART;
             let run_target = TWO_LEVEL_RUN_TARGET;
-
-            // One block per run part, as the docs above state, whatever the
-            // default run block target.
-            let one_block_per_part = |config: CompactorConfig| CompactorConfig {
-                rlog_run_block_target_records: RlogConfig::default().block_target_records,
-                ..config
+            let priced_at = |group: u64| {
+                Level1Shape {
+                    per_input,
+                    inputs: 60,
+                    block_rate,
+                    run_block_records: TWO_LEVEL_RUN_BLOCK as u64,
+                    input_records,
+                    in_flight,
+                    run_target,
+                    part_target: TWO_LEVEL_PART,
+                    ceiling: 0,
+                }
+                .run_block_bytes(group)
             };
+
             let ceiling = group_ceiling(per_input, run_target, 12);
             let dir = fresh_scratch("runs-not-parts");
             let config =
-                one_block_per_part(two_level_config(ceiling, run_target, Some(dir.clone())));
+                two_level_config(ceiling, run_target, Some(dir.clone()));
             let (outcome, run, store, _) = compact_two_level(&config).await;
             assert!(
                 matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
@@ -17164,6 +17835,7 @@ mod tests {
             let run_block = log_field(&line, "run_block_bytes");
             assert!(parts * run_block + tail > ceiling, "{line}");
             assert!(runs * 2 * run_block + tail <= ceiling, "{line}");
+            let block_bytes = priced_at(12);
             assert!(parts * block_bytes + predicted_tail > ceiling);
             assert!(runs * 2 * block_bytes + predicted_tail <= ceiling);
             assert_eq!(run.report.level1_groups, 5, "{:?}", run.report);
@@ -17175,7 +17847,7 @@ mod tests {
             let ceiling = group_ceiling(per_input, run_target, 10);
             let dir = fresh_scratch("two-blocks-per-run");
             let config =
-                one_block_per_part(two_level_config(ceiling, run_target, Some(dir.clone())));
+                two_level_config(ceiling, run_target, Some(dir.clone()));
             let (outcome, run, store, _) = compact_two_level(&config).await;
             match outcome {
                 Ok(CompactionOutcome::TwoLevelUnsupported {
@@ -17192,7 +17864,7 @@ mod tests {
                         },
                 }) => {
                     assert_eq!((runs, blocks_per_run, group_size), (6, 2, 10));
-                    assert_eq!(priced, block_bytes);
+                    assert_eq!(priced, priced_at(10));
                     let tail = in_flight_bytes + part_target_bytes;
                     assert!(runs * priced + tail <= ceiling, "one block per run fits");
                     assert!(
@@ -17385,6 +18057,9 @@ mod tests {
             let run_target = 2 * per_input;
             let config = CompactorConfig {
                 level1_workers: Some(1),
+                // Run blocks of the default target, which two of a run price
+                // over the ceiling.
+                rlog_run_block_target_records: RUN_BLOCK_TARGET_RECORDS,
                 ..two_level_config(
                     group_ceiling(per_input, run_target, 12),
                     run_target,
@@ -18060,6 +18735,9 @@ mod tests {
             let small_run = 2 * per_input;
             let config = CompactorConfig {
                 level1_workers: Some(1),
+                // Run blocks of the default target, which two of a run price
+                // over the ceiling.
+                rlog_run_block_target_records: RUN_BLOCK_TARGET_RECORDS,
                 ..two_level_config(
                     group_ceiling(per_input, small_run, 12),
                     small_run,

@@ -131,16 +131,18 @@ pub enum TwoLevelCheck {
         /// The resident ceiling `U`.
         ceiling_bytes: u64,
     },
-    /// Constraint (b) priced before level 1 reads a block (ADR-3853 D4): at
-    /// no level-1 worker count up to the unit's core share do the runs level
-    /// 1 would write fit level 2, so the unit is refused without running
-    /// level 1. Shown at one worker, the count with the fewest runs.
+    /// Constraint (b) priced before level 1 reads a block (ADR-3853 D4, D5):
+    /// at no level-1 worker count up to the unit's core share do the runs
+    /// level 1 would write fit one level-2 worker (or the configured level-2
+    /// worker count), so the unit is refused without running level 1. Shown
+    /// at one worker, the count with the fewest runs.
     PredictedLevelTwoFit {
         /// Runs level 1 would write at one worker, `ceil(N / G)`.
         runs: u64,
         /// The level-2 blocks priced per run, 2.
         blocks_per_run: u64,
-        /// The price of one level-2 block, taken from the inputs' largest.
+        /// The predicted price of one level-2 block: the input blocks' highest
+        /// price per record at the records a run block holds.
         block_bytes: u64,
         /// `P`, the largest per-input term of constraint (a).
         per_input_bytes: u64,
@@ -152,6 +154,21 @@ pub enum TwoLevelCheck {
         part_target_bytes: u64,
         /// The resident ceiling `U`.
         ceiling_bytes: u64,
+    },
+    /// A level-2 range needs a part index outside its slots (ADR-3853 D5
+    /// amendment): range `r` numbers its parts `r x K .. r x K + K`, and the
+    /// part it would open next is at `part_index`, past them or past the
+    /// part key's four digits. Refused before that part's builder opens, so
+    /// its records are never encoded.
+    RangeSlots {
+        /// The range, `r`, counted from 0 over the unit's ranges.
+        range: u64,
+        /// The unit's level-2 ranges.
+        ranges: u64,
+        /// `K`, the part-index slots each range has.
+        slots: u32,
+        /// The part index the range needed.
+        part_index: u64,
     },
 }
 
@@ -191,6 +208,16 @@ impl std::fmt::Display for TwoLevelCheck {
             } => write!(
                 f,
                 "level 2 over a predicted {runs} runs of group size {group_size} at {per_input_bytes} bytes per input needs {runs} x {blocks_per_run} blocks x {block_bytes} + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes at every level-1 worker count (constraint b, refused before level 1)"
+            ),
+            Self::RangeSlots {
+                range,
+                ranges,
+                slots,
+                part_index,
+            } => write!(
+                f,
+                "level-2 range {range} of {ranges} needs part index {part_index}, outside its {slots} slots from {} or past the part key's 9999 (refused before encoding that part)",
+                range.saturating_mul(u64::from(*slots))
             ),
         }
     }
@@ -457,6 +484,8 @@ pub enum MaintainError {
     InvalidRlogZstdLevel(#[from] crate::config::RlogZstdLevelError),
     #[error("RLOG compaction refused before writing any part: {0}")]
     InvalidRlogRunBlockTarget(#[from] crate::config::RlogRunBlockTargetError),
+    #[error("RLOG compaction refused before writing any part: {0}")]
+    InvalidRlogLevel2Setting(#[from] crate::config::RlogLevel2SettingError),
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
     /// The ADR-1702 read gate returned no result for a maintenance decode or
