@@ -2091,6 +2091,16 @@ a tenant and signal stays at version 2:
   `CatalogError::UnsupportedHeadVersion` and never rebuilds over it
   (ADR-0066 decision 2, `newer_format_head_fails_loudly_and_never_clobbers`).
   An older `--rebuild-key-index` refuses at the same decode.
+- The startup format-window audit (off by default) covers the tenants the
+  process was started with, its fold and alert-rule tenants
+  (`tenants_to_check`). For one of those it reports that tenant and signal
+  as a check that could not run (`read_catalog` in
+  `services/ravel-server/src/format_window.rs`,
+  `a_head_from_a_newer_build_is_not_reported_corrupt`), so an older
+  `ravel-server` started with `--format-window-check refuse` exits before
+  any listener binds, and one started with `warn` logs it and starts.
+- An older `ravel-cli catalog inspect` fails at the same decode and prints
+  nothing for that HEAD (`services/ravel-cli/src/catalog.rs`).
 
 The HEAD returns to version 1 when the part with retired hours re-encodes
 or leaves HEAD, and every older component then reads it again.
