@@ -15732,6 +15732,22 @@ mod tests {
                 request_ledger: Some(ledger.clone()),
                 ..config.clone()
             };
+            let (outcome, log) = compact_captured(store, &config, claimed).await;
+            let run = Run {
+                report: ledger.report(),
+                tracker,
+                log,
+            };
+            (outcome, run)
+        }
+
+        /// Compacts the bucket on `store` under `config` as it stands, with an
+        /// INFO log capture installed, and returns the log.
+        async fn compact_captured(
+            store: &dyn ObjectStoreBackend,
+            config: &CompactorConfig,
+            claimed: bool,
+        ) -> (Result<CompactionOutcome>, String) {
             let log = Captured::default();
             let writer = log.clone();
             let subscriber = tracing_subscriber::fmt()
@@ -15750,22 +15766,17 @@ mod tests {
             let guard = tracing::subscriber::set_default(subscriber);
             let clock = FixedClock::new(sealed_now_ns());
             let outcome = if claimed {
-                match crate::compact_bucket_claimed(store, &clock, &config, &bucket()).await {
+                match crate::compact_bucket_claimed(store, &clock, config, &bucket()).await {
                     Ok(crate::ClaimedCompaction::Ran(outcome)) => Ok(outcome),
                     Ok(other) => panic!("the claimed run did not run: {other:?}"),
                     Err(e) => Err(e),
                 }
             } else {
-                compact_bucket(store, &clock, &config, &bucket()).await
+                compact_bucket(store, &clock, config, &bucket()).await
             };
             drop(guard);
             let log = String::from_utf8_lossy(&log.0.lock().expect("log lock")).into_owned();
-            let run = Run {
-                report: ledger.report(),
-                tracker,
-                log,
-            };
-            (outcome, run)
+            (outcome, log)
         }
 
         /// The output's part content hashes and part bytes.
@@ -16987,6 +16998,14 @@ mod tests {
                 let line = run.line("rlog two-level merge");
                 assert_eq!(log_field(&line, "level2_workers"), workers as u64, "{line}");
                 assert_eq!(log_field(&line, "level2_ranges"), 4, "{line}");
+                for surface in [
+                    "compaction store requests by phase",
+                    "compaction merge ended",
+                ] {
+                    let line = run.line(surface);
+                    assert_eq!(log_field(&line, "level2_workers"), workers as u64, "{line}");
+                    assert_eq!(log_field(&line, "level2_ranges"), 4, "{line}");
+                }
                 let runs = log_field(&line, "runs");
                 let run_blocks = log_field(&line, "run_blocks");
                 assert!(
@@ -17028,6 +17047,29 @@ mod tests {
                     "{workers} workers: part bytes"
                 );
             }
+
+            // A run with no ledger installed, as ravel-server runs, still
+            // names its level-2 shape on the merge-end line, and reports no
+            // request figures.
+            let dir = fresh_scratch("range-workers-unmetered");
+            let config = range_worker_config(per_input, 2, dir.clone());
+            assert!(config.request_ledger.is_none());
+            let store = ProbeStore::new();
+            seed_inputs(&store, &two_level_inputs()).await;
+            let (outcome, log) = compact_captured(&store, &config, false).await;
+            assert!(
+                matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                "{outcome:?}"
+            );
+            let ends: Vec<&str> = log
+                .lines()
+                .filter(|l| l.contains("compaction merge ended"))
+                .collect();
+            assert_eq!(ends.len(), 1, "{log}");
+            assert_eq!(log_field(ends[0], "level2_workers"), 2, "{}", ends[0]);
+            assert_eq!(log_field(ends[0], "level2_ranges"), 4, "{}", ends[0]);
+            assert!(!log.contains("compaction store requests by phase"), "{log}");
+            assert_eq!(published(&store).await, outputs[0]);
         }
 
         /// The part indexes of every L1 part object on `store`, published or
