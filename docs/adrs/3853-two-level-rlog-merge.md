@@ -888,8 +888,10 @@ the derivation. D4's figures, 8 workers at the server defaults on the
 
 Phase B ships in issue #4108: level 2 runs on `W2` range workers, each
 merging its own contiguous share of the unit's stream ranges into its own
-parts, and `W1` and `W2` are derived together. No CLI or server flag sets
-either count; `CompactorConfig` carries them. This amendment settles the
+parts, and `W1` and `W2` are derived together. `CompactorConfig` carries
+both counts; `ravel-cli maintain compact-tenant` and `compact-bucket` set
+them with `--level1-workers` and `--level2-workers` (#4109), and a
+configured count overrides the derived one. This amendment settles the
 three points D5 left open or stated wrongly, and records how the rest of D5
 shipped.
 
