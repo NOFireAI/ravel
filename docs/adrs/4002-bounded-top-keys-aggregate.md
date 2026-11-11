@@ -56,13 +56,13 @@ Neither existing bound applies:
 **The plan.** Before `CompactSlices` runs, Ravel plans the shape as a global `SortExec TopK(fetch = n + s)` with `preserve_partitioning=false`. It sits over projections and an `AggregateExec` final stage, which takes one of two forms:
 
 - `FinalPartitioned`, over a hash `RepartitionExec` on the keys and a partial aggregate;
-- `Final`, over a `CoalescePartitionsExec` and a partial aggregate. That is the form whenever a key or aggregate is not exact-typed (`executor.rs:7049-7055`, `aggregate_node_is_exact`), which includes every float `sum` and `avg`, under ADR-0094, and on an ADR-0954 spill retry, which plans with no `RepartitionExec` (`session.rs:650-651, 697-706`).
+- `Final`, over a `CoalescePartitionsExec` and a partial aggregate. That is the form whenever a key or aggregate is not exact-typed (`executor.rs:8635`, `aggregate_node_is_exact`), which includes every float `sum` and `avg`, under ADR-0094, and on an ADR-0954 sort-merge spill retry, which plans with no `RepartitionExec` (`session.rs:644-647, 709-719`). The bucketed refusal retry of ADR-3565's bucket spill amendment is the one spill retry that keeps its exchange (`session.rs:939`).
 
 On a logs statement, `CompactSlices` later puts a `CompactSlicesExec` with a TopK pre-filter between the sort and the aggregate (`compact_slices.rs:124-146, 345-400`; pinned by `tests/logs_partition_topk.rs:249-262`). The pre-filter cuts the output rows of each batch, but the group table underneath stays unbounded. DataFusion folds `OFFSET s` into the sort's fetch and keeps a `GlobalLimitExec skip = s` above the sort (`datafusion-physical-optimizer-55.2.0/src/limit_pushdown.rs:232-247`).
 
-**The sort is already total.** Before planning, `rewrite_sort_group_key_tie_order` (`crates/ravel-sql/src/executor.rs:7820`; ADR-0954 cache-dir amendment, requirement 4) appends every group key that is not already a sort term to a `Sort` over an aggregate. The keys go in as trailing terms, ascending with nulls last. The rewrite applies when the aggregate has no float group key, has only spill-family functions (`aggregate_functions_are_spill_families`), and the sort is not a bounded top-k candidate (`is_bounded_topk_candidate`, an order on a lone `min` or `max` output, which this ADR leaves out of scope anyway). It does so in every configuration (`total_tie_order_edit`).
+**The sort is already total.** Before planning, `rewrite_sort_group_key_tie_order` (`crates/ravel-sql/src/executor.rs:8392`; ADR-0954 cache-dir amendment, requirement 4) appends every group key that is not already a sort term to a `Sort` over an aggregate. The keys go in as trailing terms, ascending with nulls last. The rewrite applies when the aggregate has no float group key, has only spill-family functions (`aggregate_functions_are_spill_families`), and the sort is not a bounded top-k candidate (`is_bounded_topk_candidate`, an order on a lone `min` or `max` output, which this ADR leaves out of scope anyway). It does so in every configuration (`total_tie_order_edit`).
 
-So for count, sum and avg over this shape, the sort's order is already a total order on the keys. A key that the projection drops is carried through it under a reserved `__ravel_tiebreak_*` name and removed again by a restore projection above the sort (`TieOrderEdit::ProjectThrough`, `executor.rs:7403, 7786`).
+So for count, sum and avg over this shape, the sort's order is already a total order on the keys. A key that the projection drops is carried through it under a reserved `__ravel_tiebreak_*` name and removed again by a restore projection above the sort (`TieOrderEdit::ProjectThrough`, `executor.rs:7975, 8095`).
 
 ## Decision
 
@@ -102,7 +102,7 @@ The resident state is at most 2n groups plus one batch's new keys. During a rebu
 
 **No spill.** The exec never spills, and needs not: its memory is bounded by the ceiling in section 4, not by the input.
 
-A memory refusal charged to it is a `MemoryRefusal::Query`, which earns an ADR-0954 spill retry (`executor.rs:6612-6628, 6650-6662`). The retry plans a `Final` stage, the rule applies again, and the retry refuses the same way. That can happen only if 2n groups of state do not fit the per-query limit, which the ceiling is chosen to rule out. T1 measures the state per group, so the ceiling's sizing rests on numbers.
+A memory refusal charged to it is a `MemoryRefusal::Query`, which earns an ADR-0954 spill retry (`executor.rs:7146-7163, 7187-7199`). The retry plans a `Final` stage, the rule applies again, and the retry refuses the same way. That can happen only if 2n groups of state do not fit the per-query limit, which the ceiling is chosen to rule out. T1 measures the state per group, so the ceiling's sizing rests on numbers.
 
 ### 2. The rule and its gate
 
@@ -228,7 +228,7 @@ Against the pre-registration (comment 6730613003 on #4002), every band held but 
 - **Unchanged parts of the plan.** The partial stage and the exchange still carry every partial group until T3. ADR-3565's per-bucket top-k (decision 4) never engages for this shape once the final stage is replaced.
 - **One plan change besides the replacement.** `CompactSlices` places a `CompactSlicesExec` directly above every `AggregateExec` and above nothing else (`compact_slices.rs:46-48`). In this shape it places exactly one, above the final stage: the partial stage gets none, since the final aggregate or the hash exchange stops the propagation from the sort (`compact_slices.rs:321-329`; pinned by `the_q29_plan_gets_one_exec_between_the_final_aggregate_and_the_round_robin_repartition`). Once the final stage is replaced, that `CompactSlicesExec` and its TopK pre-filter leave the plan, and none remains. The exec emits at most n rows, so the sort above it has little left to over-charge (#2720). Plans pinned for this shape change in T1.
 - **No threshold reaches the scan, and nothing regresses.** The stock `AggregateExec` forwards parent filters on grouping columns (`aggregates/mod.rs:2155-2169`), and the replacement does not, since a custom exec is a pushdown barrier by default (`execution_plan.rs:851-860`). But on main, `CompactSlicesExec` already blocks that path for this shape. Forwarding the sort's dynamic threshold to the logs scan, for latest-N time buckets, is a separate ADR (T4).
-- **Profiling still works.** `collect_aggregate_profile` reads the layout from every grouped `AggregateExec` in the plan (`memory.rs:743-770`), so the partial stage still supplies it once the final stage is replaced.
+- **Profiling still works.** `collect_aggregate_profile` reads the layout from every grouped `AggregateExec` in the plan (`memory.rs:766-796`), so the partial stage still supplies it once the final stage is replaced.
 - **Distributed queries.** Aggregation never leaves the coordinator (`distributed.rs:28-32`), so the rule sees each final stage exactly once.
 
 ## Diagram

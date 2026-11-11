@@ -224,7 +224,7 @@ process budget at the floor and from 32,445,360 at 8 partitions.
    `Hash(exprs, floor)` over the same input, keeping `preserve_order`. It
    never inserts an exchange, and an `n` at or above the floor, or a floor of
    0, leaves the plan as it is. It is the first of Ravel's appended physical
-   optimizer rules (`crates/ravel-sql/src/session.rs:900`), so every later
+   optimizer rules (`crates/ravel-sql/src/session.rs:974`), so every later
    rule matches the final aggregate over the exchange it runs with. The
    session's `target_partitions` stays at `sql_partition_count`.
 2. **The spill retry is untouched.** Its session is

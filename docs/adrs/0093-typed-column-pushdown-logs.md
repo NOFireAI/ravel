@@ -643,7 +643,7 @@ lanes.
      keeps a direct pin of the Str gate: a case whose filter is not the exact shape, or a
      unit-level call.
    - Before this PR, read `plan_aggregate_profile` (`crates/ravel-sql/src/memory.rs:726`). It is
-     behind the layout pinned for the q14 statement at `crates/ravel-sql/src/executor.rs:10419-10423`,
+     behind the layout pinned for the q14 statement at `crates/ravel-sql/src/executor.rs:10453-10457`,
      and it is not established whether it reads through the FilterExec.
 3. **The paired run.** No code. Pre-register the bands below on #3231 before the run. Run one
    paired `cpuab` run: A is `main` at PR 2's merge base, B is PR 2's merge commit, with an 8 GB
