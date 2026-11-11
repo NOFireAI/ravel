@@ -18113,8 +18113,8 @@ mod tests {
             assert!(scratch_entries(&dir).is_empty(), "cancel");
         }
 
-        /// The scratch need of the two-level fixture seeded at `keys`: 1.3
-        /// times its inputs' object sizes (ADR-3853 D2).
+        /// The scratch need of the inputs seeded at `keys`: 1.3
+        /// times their object sizes (ADR-3853 D2).
         async fn scratch_need(store: &dyn ObjectStoreBackend, keys: &[String]) -> u64 {
             let mut stored = 0u64;
             for key in keys {
