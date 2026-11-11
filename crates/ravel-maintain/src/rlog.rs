@@ -17768,6 +17768,72 @@ mod tests {
             assert_eq!(CompactorConfig::default().unit_concurrency, 1);
         }
 
+        /// ADR-3853 D5 amendment, the joint derivation's predicted table: the
+        /// 19,177-input bucket at P = 107.7 MB, a 3.74 MB run block, 18 MB in
+        /// flight and 1,573 MB final parts. One unit of 20 GiB with 32 cores
+        /// scores every `W1` by `1/W1 + 1/W2` and keeps (4, 4); `W1` = 6 ties
+        /// it at 0.5 and loses to the smaller `W1`. At the server defaults, 5
+        /// GiB with 8 cores, `W1` = 2 already leaves level 2 needing 8,114 MB
+        /// for one worker, above `U`, so the pair is (1, 1).
+        #[test]
+        fn joint_derivation_scores_every_level1_count_by_both_levels() {
+            const GIB: u64 = 1 << 30;
+            let shape = |ceiling: u64| Level1Shape {
+                per_input: 107_700_000,
+                inputs: 19_177,
+                block_rate: (3_740_000, 1),
+                run_block_records: 1,
+                input_records: 1 << 40,
+                in_flight: 18_000_000,
+                run_target: 268_435_456,
+                part_target: 1_573_000_000,
+                ceiling,
+            };
+            let whole = shape(20 * GIB);
+            assert_eq!(whole.ceiling / 1_000_000, 21_474);
+            // (W1, G, R, W2), and the score 1/W1 + 1/W2 in thousandths.
+            let table = [
+                (1, 196, 98, 9, 1_111),
+                (2, 97, 198, 6, 666),
+                (3, 63, 305, 5, 533),
+                (4, 47, 409, 4, 500),
+                (5, 37, 519, 3, 533),
+                (6, 30, 640, 3, 500),
+                (7, 25, 768, 2, 642),
+            ];
+            for (w1, group, runs, w2, score) in table {
+                let g = level1_group_size(
+                    whole.per_input,
+                    whole.run_target,
+                    whole.ceiling / w1,
+                    whole.inputs,
+                );
+                assert_eq!(g, group, "W1 = {w1}");
+                assert_eq!(whole.runs(g), runs, "W1 = {w1}");
+                let fit = (whole.ceiling / whole.level_two_bytes(g)).min(32);
+                assert_eq!(fit, w2, "W1 = {w1}");
+                assert_eq!(1_000 * (w1 + w2) / (w1 * w2), score, "W1 = {w1}");
+            }
+            assert_eq!(derive_level_workers(&whole, 32, None), Some((4, 4)));
+            // An override is taken where it fits U, and refused where it
+            // does not.
+            assert_eq!(derive_level_workers(&whole, 32, Some(9)), Some((1, 9)));
+            assert_eq!(derive_level_workers(&whole, 32, Some(10)), None);
+
+            let defaults = shape(5 * GIB);
+            assert_eq!(defaults.ceiling / 1_000_000, 5_368);
+            let g = level1_group_size(
+                defaults.per_input,
+                defaults.run_target,
+                defaults.ceiling / 2,
+                defaults.inputs,
+            );
+            assert_eq!((g, defaults.runs(g)), (22, 872));
+            assert_eq!(defaults.level_two_bytes(g) / 1_000_000, 8_113);
+            assert!(defaults.level_two_bytes(g) > defaults.ceiling);
+            assert_eq!(derive_level_workers(&defaults, 8, None), Some((1, 1)));
+        }
+
         /// ADR-3853 D4 and D3 at the production shape: 32 cores, 4 units of
         /// 5 GiB at once or one of 20 GiB, 256 MiB run targets, the
         /// 19,177-input bucket. `(W1, W2)` minimise `1/W1 + 1/W2` with each

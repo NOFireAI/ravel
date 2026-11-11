@@ -934,6 +934,35 @@ async fn a_zero_rlog_run_block_target_is_refused_before_any_store_request() {
     }
 }
 
+/// A zero `level2_workers`, `rlog_level2_range_records` or
+/// `rlog_level2_range_slots` is refused by every RLOG-writing entry point
+/// before its first store request, at the same place as a zero run block
+/// target, with the field it names (ADR-3853 D5 amendment).
+#[tokio::test]
+async fn a_zero_level2_setting_is_refused_before_any_store_request() {
+    let zeroes: [(&str, fn(&mut CompactorConfig)); 3] = [
+        ("level2_workers", |c| c.level2_workers = Some(0)),
+        ("rlog_level2_range_records", |c| {
+            c.rlog_level2_range_records = 0
+        }),
+        ("rlog_level2_range_slots", |c| c.rlog_level2_range_slots = 0),
+    ];
+    for entry in RLOG_ENTRIES {
+        for (field, zero) in zeroes {
+            let (result, oracle, attributed) = run_rlog_entry_with(entry, zero).await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(MaintainError::InvalidRlogLevel2Setting(e)) if e.field == field
+                ),
+                "{entry:?} {field}: expected a refusal, got {result:?}"
+            );
+            assert_eq!(oracle, 0, "{entry:?} {field}: store requests");
+            assert_eq!(attributed, 0, "{entry:?} {field}: ledger requests");
+        }
+    }
+}
+
 /// `build_rewrite_logs` is public and callable without `erasure_rewrite_bucket`
 /// in front of it, so it checks the run block target itself: a zero target
 /// issues no store request, while the same call at the default target reads
