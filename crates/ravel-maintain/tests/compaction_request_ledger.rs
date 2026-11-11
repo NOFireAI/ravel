@@ -934,7 +934,7 @@ async fn a_zero_rlog_run_block_target_is_refused_before_any_store_request() {
     }
 }
 
-/// A zero `level2_workers` or `rlog_level2_range_records` is refused by every
+/// A zero `level2_workers` or `rlog_range_records` is refused by every
 /// RLOG-writing entry point before its first store request, at the same place
 /// as a zero run block target, with the field it names (ADR-3853 D5
 /// amendment).
@@ -943,8 +943,8 @@ async fn a_zero_level2_setting_is_refused_before_any_store_request() {
     type Zero = fn(&mut CompactorConfig);
     let zeroes: [(&str, Zero); 2] = [
         ("level2_workers", |c| c.level2_workers = Some(0)),
-        ("rlog_level2_range_records", |c| {
-            c.rlog_level2_range_records = 0
+        ("rlog_range_records", |c| {
+            c.rlog_range_records = 0
         }),
     ];
     for entry in RLOG_ENTRIES {
