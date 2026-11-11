@@ -8544,6 +8544,7 @@ mod tests {
     /// together close one, a stream over it closes one of its own, and the
     /// streams left under it make a last, short range.
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn level2_ranges_cut_at_exact_stream_records() {
         assert_eq!(
             level2_ranges(&[10, 3, 9, 12, 4], 10),
