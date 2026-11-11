@@ -54,7 +54,8 @@ pub struct ScanReport {
     /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
     /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
     /// [`CompactionOutcome::ScratchHeadroom`],
-    /// [`CompactionOutcome::ScratchLocked`]). Later hours still compact; the
+    /// [`CompactionOutcome::ScratchLocked`]) and a refusal for the part-index
+    /// windows ([`MaintainError::is_part_index_refusal`]). Later hours still compact; the
     /// cursor stops before the first refused hour, so a build that can merge
     /// it revisits it.
     pub geometry_unsupported: usize,
@@ -97,7 +98,18 @@ pub async fn scan_and_compact(
             continue;
         }
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
-        match compact_bucket(store, clock, config, &bucket).await? {
+        let outcome = match compact_bucket(store, clock, config, &bucket).await {
+            Ok(outcome) => outcome,
+            // Refused for its part-index windows (ADR-3853): this build refuses
+            // it again, so it is counted and held like a geometry refusal.
+            Err(err) if err.is_part_index_refusal() => {
+                report.geometry_unsupported += 1;
+                first_held.get_or_insert(hour);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        match outcome {
             CompactionOutcome::NotSealed => {
                 // Hours are ascending, so every later bucket is also unsealed.
                 report.not_sealed += 1;
@@ -166,8 +178,9 @@ pub struct MaintainReport {
     /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
     /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
     /// [`CompactionOutcome::ScratchHeadroom`],
-    /// [`CompactionOutcome::ScratchLocked`]). Not counted for a bucket the
-    /// [`MaintainMemo`] already holds as refused.
+    /// [`CompactionOutcome::ScratchLocked`]), and a refusal for the part-index
+    /// windows ([`MaintainError::is_part_index_refusal`]). Not counted for a
+    /// bucket the [`MaintainMemo`] already holds as refused.
     pub geometry_unsupported: usize,
     /// Expired buckets whose physical sweep was blocked because the live
     /// catalog HEAD snapshot still names an object inside the bucket
@@ -770,7 +783,8 @@ pub enum TerminalState {
     /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), or refused
     /// its two-level merge ([`CompactionOutcome::TwoLevelUnsupported`],
     /// [`CompactionOutcome::ScratchHeadroom`],
-    /// [`CompactionOutcome::ScratchLocked`]). Terminal
+    /// [`CompactionOutcome::ScratchLocked`]), or refused it for its part-index
+    /// windows ([`MaintainError::is_part_index_refusal`]). Terminal
     /// for this process's binary only, so it is held in memory and never
     /// written to the durable snapshot: a restart, or a sibling seeded from a
     /// snapshot, evaluates the bucket again.
@@ -2043,7 +2057,7 @@ pub async fn scan_and_maintain_with_memo(
         } else {
             RewriteBound::Read(&mut bound_read)
         };
-        let (retention_outcome, observed_expiry, compaction, acquisition) =
+        let (retention_outcome, observed_expiry, compaction, acquisition, part_index_refused) =
             if claim_deferred || geometry_refused {
                 let (outcome, expiry) = retention_sweep_bucket_observed(
                     &mut reach,
@@ -2056,7 +2070,7 @@ pub async fn scan_and_maintain_with_memo(
                     rewrite_bound,
                 )
                 .await?;
-                (outcome, expiry, None, None)
+                (outcome, expiry, None, None, None)
             } else {
                 maintain_bucket_observed(
                     &mut reach,
@@ -2164,6 +2178,9 @@ pub async fn scan_and_maintain_with_memo(
                 // Retention left a held bucket live, so compaction would have
                 // run here; the hold skipped it without a claim request.
                 None if claim_deferred => report.claim_skipped += 1,
+                // Refused for its part-index windows (ADR-3853): counted as
+                // a refusal and held below like one.
+                None if part_index_refused.is_some() => report.geometry_unsupported += 1,
                 None => {}
             },
         }
@@ -2187,6 +2204,10 @@ pub async fn scan_and_maintain_with_memo(
             // A refusal the memo already held, on a bucket retention left live
             // and compaction did not run on: still refused.
             None if geometry_refused && ran.is_none() && retention_left_live => {
+                Some(TerminalState::GeometryUnsupported)
+            }
+            // A part-index refusal, which this build would repeat.
+            None if part_index_refused.is_some() && retention_left_live => {
                 Some(TerminalState::GeometryUnsupported)
             }
             other => other,

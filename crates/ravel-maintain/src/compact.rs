@@ -837,6 +837,35 @@ async fn compact_bucket_scoped(
             );
             CompactionOutcome::ScratchLocked { path }
         }
+        // No outcome carries a part-index refusal, so the run returns it as an
+        // error after releasing its claim the way a refused outcome does; the
+        // scan and maintain passes hold the bucket as refused and go on.
+        Err(err) if err.is_part_index_refusal() => {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                error = %err,
+                "compaction refused a bucket: its parts need part indexes outside \
+                 their ranges' windows; nothing published, the L0 inputs stay live \
+                 (ADR-3853)"
+            );
+            if let Some(guard) = guard
+                && guard.cancelled_at().await.is_none()
+                && let Err(complete) = guard.complete(store).await
+            {
+                tracing::warn!(
+                    signal = ?bucket.signal,
+                    shard = bucket.shard,
+                    ingest_hour_bucket = bucket.ingest_hour_bucket,
+                    work_id = %guard.work_id_hex(),
+                    error = %complete,
+                    "compaction refused, and marking its claim completed failed; \
+                     the claim ages out under its lease (ADR-1029)"
+                );
+            }
+            return Err(err);
+        }
         other => other?,
     };
 

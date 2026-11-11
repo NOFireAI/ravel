@@ -421,7 +421,9 @@ pub enum MaintainError {
     /// (ADR-3853 D5 amendment): the range numbers its parts from `first`, and
     /// the part it would open next is at `part_index`, at or past `limit`.
     /// Refused before that part's builder opens, so its records are never
-    /// encoded.
+    /// encoded. A refusal, not a failure: the same build refuses the unit
+    /// again, so a scan or maintain pass holds it as refused and goes on
+    /// ([`MaintainError::is_part_index_refusal`]).
     #[error(
         "RLOG compaction refused: range {range} needs part index {part_index}, outside its window [{first}, {limit}) of the part key's indexes (ADR-3853); refused before encoding that part, the L0 inputs stay live"
     )]
@@ -430,7 +432,9 @@ pub enum MaintainError {
         range: u64,
         /// The first part index of the range's window.
         first: u64,
-        /// One past the last part index of the range's window.
+        /// One past the last part index the range's window held when the
+        /// part was to open: `max(index(before + Q), index(emitted))`, which
+        /// grows as the range emits.
         limit: u64,
         /// The part index the range needed.
         part_index: u64,
@@ -438,7 +442,7 @@ pub enum MaintainError {
     /// An RLOG merge's records pass `keys` times its range quantum, so a full
     /// range's part-index window would hold no index (ADR-3853 D5
     /// amendment). Refused from the inputs' record counts before a part is
-    /// encoded.
+    /// encoded; a refusal like [`MaintainError::PartRangeWindow`].
     #[error(
         "RLOG compaction refused: {records} records cut at a range quantum of {quantum} need more ranges than the part key's {keys} indexes give windows (ADR-3853); nothing published, the L0 inputs stay live"
     )]
@@ -604,6 +608,18 @@ impl MaintainError {
             | MaintainError::SpanSeg(SpanSegError::UnsupportedVersion(v)) => Some(*v),
             _ => None,
         }
+    }
+
+    /// Whether this error refuses an RLOG merge for its part-index windows
+    /// ([`MaintainError::PartRangeWindow`], [`MaintainError::PartKeySpace`],
+    /// ADR-3853). The same build refuses the unit again, and nothing was
+    /// published for it, so a pass holds the bucket as refused and goes on to
+    /// its other buckets instead of failing.
+    pub fn is_part_index_refusal(&self) -> bool {
+        matches!(
+            self,
+            MaintainError::PartRangeWindow { .. } | MaintainError::PartKeySpace { .. }
+        )
     }
 
     /// The reader's own error out of [`MaintainError::InputOutOfWindow`]; any
