@@ -117,7 +117,9 @@
 //! after a memory refusal (issue #3899), and for the pinned entry points
 //! (Flight SQL's among them), which still decide spill at plan time.
 //!
-//! A `SpillDecision::Enabled` query is also repartition-free: [`session_config`]
+//! A `SpillDecision::Enabled` query is also repartition-free, except the
+//! refusal retry planned as bucketed, which keeps the first attempt's hash
+//! exchange (`build_bucket_retry_session`): [`session_config`]
 //! forces `repartition_aggregations` off for it, whatever the ADR-0094
 //! classification said, and disables DataFusion's round-robin repartitioning
 //! too. The reason is a scope mismatch, not a determinism one: the spill
@@ -642,7 +644,9 @@ fn disk_manager_builder(spill: SpillDecision<'_>, merge_fan_in: usize) -> DiskMa
 /// `spill` is the other, and it OVERRIDES the first: a
 /// [`SpillDecision::Enabled`] query gets no `RepartitionExec` at all, so
 /// `repartition_aggregations` is forced off and DataFusion's round-robin
-/// repartitioning is disabled with it. See [`repartition_free`] for why.
+/// repartitioning is disabled with it. See [`repartition_free`] for why. The
+/// bucketed refusal retry is the one spill-enabled session that keeps its
+/// exchange; it is built through [`session_config_with`], not this.
 pub fn session_config(
     config: &SqlConfig,
     exact_typed_aggregates: bool,
@@ -964,7 +968,8 @@ fn build_session_inner(
         // the appended rules, so every rule below matches the final aggregate
         // over the exchange it will run with, and before
         // `DictionaryGroupKeysAsViews`, which can put a cast between the two.
-        // A spill-enabled session has no exchange to widen. See
+        // A repartition-free spill session has no exchange to widen; the
+        // bucketed retry's exchange is widened like the first attempt's. See
         // `crate::exchange_floor`.
         .with_physical_optimizer_rule(Arc::new(FinalExchangeFloor::new(
             config.first_attempt_min_partitions,

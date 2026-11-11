@@ -396,6 +396,11 @@ pub struct SqlSpillSettings {
     /// unbounded: the input the spill retry's descriptor budget
     /// `floor(nofile_soft / (2 x slots))` is read from (issue #4075).
     pub nofile_soft: u64,
+    /// The partition count of the bucketed spill retry's hash exchange, the
+    /// in-memory first attempt's (`sql_first_attempt_partitions`): the `P`
+    /// of the least descriptor need `3 x P` the `sql_spill_retry_modes`
+    /// startup line compares the descriptor budget with.
+    pub retry_partitions: usize,
 }
 
 impl Default for SqlSpillSettings {
@@ -407,6 +412,7 @@ impl Default for SqlSpillSettings {
             merge_fan_in: DEFAULT_SQL_SPILL_MERGE_FAN_IN,
             merge_fan_in_passed: false,
             nofile_soft: DEFAULT_SQL_NOFILE_SOFT,
+            retry_partitions: DEFAULT_SQL_RETRY_PARTITIONS,
         }
     }
 }
@@ -494,6 +500,13 @@ pub const DEFAULT_SQL_SPILL_MERGE_FAN_IN: usize = 2;
 /// dependency) and pinned equal to it by
 /// `sql_nofile_soft_default_matches_ravel_sql`.
 pub const DEFAULT_SQL_NOFILE_SOFT: u64 = 1024;
+
+/// [`SqlSpillSettings::retry_partitions`] until `start` installs the first
+/// attempt's resolved partition count: the compiled-in
+/// `ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS` floor. Mirrored here
+/// (ravel-sql is an optional dependency) and pinned equal to it by
+/// `sql_retry_partitions_default_matches_ravel_sql`.
+pub const DEFAULT_SQL_RETRY_PARTITIONS: usize = 16;
 
 /// Parses `--sql-spill-merge-fan-in`: `0` (DataFusion's unbounded fan-in) or
 /// at least 2. DataFusion would silently raise 1 to 2, so 1 is refused rather
@@ -8458,6 +8471,7 @@ impl Cli {
                 merge_fan_in: self.sql.sql_spill_merge.sql_spill_merge_fan_in,
                 merge_fan_in_passed: self.sql.sql_spill_merge.sql_spill_merge_fan_in_passed,
                 nofile_soft: DEFAULT_SQL_NOFILE_SOFT,
+                retry_partitions: DEFAULT_SQL_RETRY_PARTITIONS,
             },
             decoded_cache_max_bytes: self.cache.decoded_cache_max_bytes,
         })
@@ -17625,6 +17639,7 @@ mod tests {
                     merge_fan_in: DEFAULT_SQL_SPILL_MERGE_FAN_IN,
                     merge_fan_in_passed: false,
                     nofile_soft: DEFAULT_SQL_NOFILE_SOFT,
+                    retry_partitions: DEFAULT_SQL_RETRY_PARTITIONS,
                 },
                 "{args:?}"
             );
@@ -17699,6 +17714,17 @@ mod tests {
     #[test]
     fn sql_nofile_soft_default_matches_ravel_sql() {
         assert_eq!(DEFAULT_SQL_NOFILE_SOFT, ravel_sql::DEFAULT_NOFILE_SOFT);
+    }
+
+    /// The retry partition count the spill settings assume before `start`
+    /// installs the resolved one is ravel-sql's first-attempt floor.
+    #[cfg(feature = "sql")]
+    #[test]
+    fn sql_retry_partitions_default_matches_ravel_sql() {
+        assert_eq!(
+            DEFAULT_SQL_RETRY_PARTITIONS,
+            ravel_sql::DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS
+        );
     }
 
     /// `--alert-retention` defaults to 90 days, accepts `0` as the opt-out,
