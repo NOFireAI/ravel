@@ -21,6 +21,7 @@ import copy
 import datetime
 import gzip
 import importlib.util
+import io
 import json
 import os
 import random
@@ -734,9 +735,11 @@ class Corpus(unittest.TestCase):
         spec.loader.exec_module(mod)
         return mod
 
-    def test_failing_hour_start_ties_at_the_journey_cuts_generate_exactly(self):
-        # Starts drawn on a 10 s grid tie throughout the failing hour,
-        # including at the k = 1 and k = 102 cuts.
+    def gen_coarse(self, *extra):
+        """gen_corpus.main at 1000 traces, 2 hours, seed 7 with every drawn
+        start snapped to a 10 s grid, so the failing hour ties throughout.
+        Returns truth, rows, each draw's failing-hour starts as drawn, and
+        stdout."""
         mod = self.load_gen()
         draw = mod.draw_traces
         grid = 10 * 1_000_000_000
@@ -751,21 +754,31 @@ class Corpus(unittest.TestCase):
             return traces
 
         mod.draw_traces = coarse
+        out = io.StringIO()
         with tempfile.TemporaryDirectory() as d:
-            with open(os.devnull, "w") as null:
-                stdout, sys.stdout = sys.stdout, null
-                try:
-                    self.assertEqual(mod.main(["--traces", "1000", "--hours", "2", "--seed", "7", "--start-hour",
-                                               "498248", "--format", "jsonl", "--out", d]), 0)
-                finally:
-                    sys.stdout = stdout
+            stdout, sys.stdout = sys.stdout, out
+            try:
+                self.assertEqual(mod.main(["--traces", "1000", "--hours", "2", "--seed", "7", "--start-hour",
+                                           "498248", "--format", "jsonl", "--out", d, *extra]), 0)
+            finally:
+                sys.stdout = stdout
             with open(os.path.join(d, "truth.json")) as f:
                 truth = json.load(f)
             rows = {}
             for sig in ("spans", "logs"):
                 with open(os.path.join(d, f"{sig}.jsonl")) as f:
                     rows[sig] = [json.loads(line) for line in f]
+        return truth, rows, drawn, out.getvalue()
+
+    def test_failing_hour_start_ties_at_the_journey_cuts_generate_exactly(self):
+        # Starts drawn on a 10 s grid tie throughout the failing hour,
+        # including at the k = 1 and k = 102 cuts.
+        truth, rows, drawn, stdout = self.gen_coarse()
         starts = drawn[0]
+        moved = len(starts) - len(set(starts))
+        self.assertGreater(moved, 0)
+        self.assertEqual(truth["generator"]["starts_moved"], moved)
+        self.assertIn(f"moved {moved} failing-hour trace start(s) off a tie", stdout)
         for k in (1, 102):
             self.assertEqual(starts[k - 1], starts[k], k)
         roots = self.roots(rows)
@@ -779,6 +792,36 @@ class Corpus(unittest.TestCase):
             self.assertEqual(len(build), jc["build"], k)
             n = sum(1 for r in rows["logs"] if r["trace_id"] in build)
             self.assertEqual(truth["answers"][f"journey_c.{k}"]["value"], n, k)
+
+    def test_base_noise_start_ties_move_only_noise_traces(self):
+        # At scale 10 on the 10 s grid nearly every noise trace of the failing
+        # hour ties a base trace; the base rows must still be the scale-1 rows.
+        truth1, rows1, drawn1, _ = self.gen_coarse()
+        truth10, rows10, drawn10, _ = self.gen_coarse("--scale", "10")
+        self.assertEqual(drawn10[0], drawn1[0])
+        self.assertTrue(set(drawn1[0]) & set(drawn10[1]))
+        for sig in ("spans", "logs"):
+            base = {json.dumps(r, sort_keys=True) for r in rows1[sig]}
+            self.assertTrue(base <= {json.dumps(r, sort_keys=True) for r in rows10[sig]}, sig)
+        for key in ("failing_cell", "saved_traces", "needles", "in_lists", "request_id"):
+            self.assertEqual(truth1[key], truth10[key], key)
+        self.assertGreater(truth10["generator"]["starts_moved"], truth1["generator"]["starts_moved"])
+        roots = self.roots(rows10)
+        hour_roots = [r["start_ts"] for r in roots.values() if self.hour(truth10, r["start_ts"]) == 1]
+        self.assertEqual(len(hour_roots), len(drawn10[0]) + len(drawn10[1]))
+        self.assertEqual(len(set(hour_roots)), len(hour_roots))
+
+    def test_place_noise_starts_moves_noise_to_the_next_free_nanosecond(self):
+        mod = self.load_gen()
+        h0 = 498248 * HOUR_NS + HOUR_NS
+        tr = mod.Trace
+        base = [tr(1, h0 + 7, 0, False), tr(2, h0 + 8, 0, False), tr(3, h0 + 20, 0, False), tr(4, h0 - 1, 0, False)]
+        noise = [tr(5, h0 - 1, 0, False), tr(6, h0 + 7, 0, False), tr(7, h0 + 7, 0, False), tr(8, h0 + 9, 0, False),
+                 tr(9, h0 + 30, 0, False)]
+        self.assertEqual(mod.place_noise_starts(base, noise, 1, 498248), 3)
+        self.assertEqual({t.trace_id: t.start_ns - h0 for t in base + noise},
+                         {1: 7, 2: 8, 3: 20, 4: -1, 5: -1, 6: 9, 7: 10, 8: 11, 9: 30})
+        self.assertEqual([t.trace_id for t in noise], [5, 6, 7, 8, 9])
 
     def test_separate_starts_leaves_an_untied_hour_alone_and_keeps_order(self):
         mod = self.load_gen()
