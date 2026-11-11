@@ -17026,6 +17026,11 @@ mod tests {
                 );
                 let summed: u64 = peaks.iter().sum();
                 assert!(summed <= ceiling, "{summed} against {ceiling}");
+                assert!(
+                    run.tracker.peak_resident_bytes() >= summed,
+                    "the unit's mark covers the workers' sum: {} against {summed}",
+                    run.tracker.peak_resident_bytes()
+                );
                 let (rec, _) = read_output(&store).await;
                 let indexes: Vec<u32> = rec.parts.iter().map(|p| p.part_index).collect();
                 assert_eq!(
@@ -17218,6 +17223,51 @@ mod tests {
                 "every part PUT is one of those: {:?}",
                 run.report
             );
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// ADR-3853 D5 amendment: a configured `W2` above the range count runs
+        /// one worker per range, and a unit whose ranges times `K` pass the
+        /// part key's 10,000 indexes is refused, naming its last range's last
+        /// slot, before level 2 opens a part.
+        #[tokio::test]
+        async fn level2_workers_are_capped_at_the_ranges_and_slots_at_the_key() {
+            let (_, _, per_input) = single_level_oracle().await;
+            let dir = fresh_scratch("range-cap");
+            let config = range_worker_config(per_input, 8, dir.clone());
+            let (outcome, run, _, _) = compact_two_level(&config).await;
+            assert!(
+                matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                "{outcome:?}"
+            );
+            assert_eq!(run.report.level2_workers, 4, "{:?}", run.report);
+            assert_eq!(run.report.level2_ranges, 4, "{:?}", run.report);
+            assert_eq!(run.tracker.level2_worker_peak_bytes().len(), 4);
+
+            let dir = fresh_scratch("range-key-cap");
+            let config = CompactorConfig {
+                rlog_level2_range_slots: 2_501,
+                ..range_worker_config(per_input, 2, dir.clone())
+            };
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(CompactionOutcome::TwoLevelUnsupported {
+                        check: crate::error::TwoLevelCheck::RangeSlots {
+                            range: 3,
+                            ranges: 4,
+                            slots: 2_501,
+                            part_index: 10_003,
+                        },
+                        ..
+                    })
+                ),
+                "{outcome:?}"
+            );
+            assert_eq!(run.report.part_put.requests, 0, "{:?}", run.report);
+            assert_eq!(run.report.level2_passes, 0, "{:?}", run.report);
+            assert!(l1_part_indexes(&store).await.is_empty());
             assert!(scratch_entries(&dir).is_empty());
         }
 
