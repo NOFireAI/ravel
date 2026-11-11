@@ -558,7 +558,8 @@ stays loaded across both levels. Level 1 holds one group's resident row
 groups, one pass over them and an in-progress run part bounded by the run
 memory target; level 2 holds the run parts' row groups, one pass over at
 most `2 x R` run blocks per stream (two per run, ADR-3853's #3943
-correction), and the in-progress part. Level 1 runs one group
+correction), and the in-progress part, per level-2 worker (see the range
+workers amendment). Level 1 runs one group
 at a time (`W1 = 1`; see the per-worker budget amendment below for `W1`
 parallel workers), so the per-worker ceiling `C` is the unit ceiling `U`;
 dividing the budgets across parallel workers is ADR-3853 D4's. The runs are
@@ -581,7 +582,7 @@ With no `scratch_dir`, the merge and the D0 refusal are unchanged.
 <!-- amendment-supersedes: phrase="as a terminal outcome the scan memo does not retry" pointer="per-worker budget amendment" -->
 
 A two-level merge's level 1 now runs `W1` workers at once (ADR-3853 D4 and
-its #3873 amendment). `W1` is the largest count at or under the unit's core
+its #3873 amendment; derived jointly with `W2` since the range workers amendment). `W1` is the largest count at or under the unit's core
 share whose groups and predicted run parts fit both of ADR-3853's
 constraints (predicted runs at two blocks each, ADR-3853's #3943
 correction), or the `level1_workers` setting when one is given; when no
@@ -595,6 +596,7 @@ peaks sum under `U`; the unit's tracker raises each of its high-water marks
 to at least that sum and keeps each worker's peak. The run memory target is
 not divided: every worker's in-progress run part is cut at the same fixed
 target, which `C`'s constraint (a) already reserves. Level 2 is one merge
+(see the range workers amendment for `W2` workers under `U / W2` each)
 under `U` and the undivided budget, as before.
 
 The workers share the unit's claim guard and a stop token. A lost claim
@@ -611,3 +613,29 @@ is not held by the scan memo, and the next tick evaluates the bucket again,
 once those merges may have ended. A volume short on its own stays terminal,
 as does a scratch write out of space. A free figure that cannot be read is
 the error `ScratchFreeUnreadable`, never zero free.
+
+## Amendment (2026-11-11): the range workers amendment, level 2 divided per worker (ADR-3853 D5, #4108)
+
+<!-- amendment-applies: sections="Amendment (2026-11-06): many-input buckets merge in two levels (ADR-3853)|Amendment (2026-11-06): the per-worker budget amendment (ADR-3853 D4, #3873)" pointer="range workers amendment" -->
+<!-- amendment-supersedes: phrase="Level 2 is one merge" pointer="range workers amendment" -->
+
+Level 2 of a two-level merge now runs `W2` range workers (ADR-3853's range
+workers amendment). Level 2 cuts the runs' merged stream order into ranges
+by a fixed record quantum and gives each worker a contiguous block of them;
+each worker plans its passes under `U / W2` as its resident ceiling and
+charges its own `MergeMemoryTracker`, so decision 4's bound holds per
+level-2 worker as it does per level-1 worker, and the unit's tracker raises
+each of its high-water marks to at least the workers' sum. `W1` and `W2`
+are derived together: `W2` is the core share or the number of workers whose
+read sides, `R x 2 x price(one run block) + reads in flight + final part
+target` each, fit `U`, whichever is smaller, and the pair kept has the
+smallest `1/W1 + 1/W2`. At one level-2 worker the merge is the one the
+amendments above describe.
+
+The level-2 workers share the unit's claim guard and their own stop token,
+checked before each range and each part PUT, so the first error any of
+them returns stops the others before their next part PUT. Parts already
+PUT become content-addressed orphans the unreferenced-part sweep ages out,
+and the compaction record is still written once, by the unit, under
+`CreateIfAbsent`. The range cut does not depend on `W2`, so every worker
+count publishes the same parts.
