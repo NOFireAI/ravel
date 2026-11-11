@@ -943,9 +943,7 @@ async fn a_zero_level2_setting_is_refused_before_any_store_request() {
     type Zero = fn(&mut CompactorConfig);
     let zeroes: [(&str, Zero); 2] = [
         ("level2_workers", |c| c.level2_workers = Some(0)),
-        ("rlog_range_records", |c| {
-            c.rlog_range_records = 0
-        }),
+        ("rlog_range_records", |c| c.rlog_range_records = 0),
     ];
     for entry in RLOG_ENTRIES {
         for (field, zero) in zeroes {
