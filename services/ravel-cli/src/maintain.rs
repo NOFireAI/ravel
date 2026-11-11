@@ -232,19 +232,39 @@ pub enum CompactorKnobError {
     ZeroScratchMaxBytes,
     #[error("--level1-workers must be greater than 0")]
     ZeroLevel1Workers,
+    #[error("--level2-workers has no effect without --scratch-dir")]
+    Level2WorkersWithoutDir,
+    #[error("--run-block-records has no effect without --scratch-dir")]
+    RunBlockRecordsWithoutDir,
+    #[error("--level2-workers must be greater than 0")]
+    ZeroLevel2Workers,
+    #[error(
+        "--run-block-records must be greater than 0: a level-1 run would cut a block at every record"
+    )]
+    ZeroRunBlockRecords,
+    #[error("--range-records must be greater than 0: a range must hold at least one record")]
+    ZeroRangeRecords,
 }
 
 /// The two-level RLOG merge's local settings (ADR-3853 D2 and D4) one
 /// `compact-bucket` / `compact-tenant` invocation runs with: `--scratch-dir`,
-/// `--scratch-max-bytes` and `--level1-workers`, which
+/// `--scratch-max-bytes`, `--level1-workers`, `--level2-workers`,
+/// `--run-block-records` and `--range-records`, which
 /// [`build_compactor_config`] places in [`CompactorConfig::scratch_dir`],
-/// [`CompactorConfig::scratch_max_bytes`] and
-/// [`CompactorConfig::level1_workers`]. The default sets none of them.
+/// [`CompactorConfig::scratch_max_bytes`],
+/// [`CompactorConfig::level1_workers`], [`CompactorConfig::level2_workers`],
+/// [`CompactorConfig::rlog_run_block_target_records`] and
+/// [`CompactorConfig::rlog_range_records`]. The default sets none of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScratchOptions {
     pub scratch_dir: Option<std::path::PathBuf>,
     pub scratch_max_bytes: Option<u64>,
     pub level1_workers: Option<usize>,
+    pub level2_workers: Option<usize>,
+    pub run_block_records: Option<usize>,
+    /// Applies to the single-level route too (ADR-3853 D5), so it needs no
+    /// scratch directory.
+    pub range_records: Option<u64>,
     /// Replaces [`CompactorConfig::merge_resident_ceiling_bytes`] on the
     /// `compact-bucket` path when set; `compact-tenant` sets each bucket's own
     /// ceiling ([`per_bucket_config`]). No flag sets it; a test does, to route
@@ -259,8 +279,8 @@ pub struct ScratchOptions {
 
 impl ScratchOptions {
     /// Refuse what ravel-server refuses at startup for its `--maintain-*`
-    /// spellings: either of the cap and the worker count without a directory,
-    /// a zero cap, and zero workers.
+    /// spellings: the cap, either worker count or the run block target
+    /// without a directory, and any of them or the range quantum at zero.
     pub fn validate(&self) -> Result<(), CompactorKnobError> {
         if self.scratch_dir.is_none() {
             if self.scratch_max_bytes.is_some() {
@@ -269,6 +289,12 @@ impl ScratchOptions {
             if self.level1_workers.is_some() {
                 return Err(CompactorKnobError::Level1WorkersWithoutDir);
             }
+            if self.level2_workers.is_some() {
+                return Err(CompactorKnobError::Level2WorkersWithoutDir);
+            }
+            if self.run_block_records.is_some() {
+                return Err(CompactorKnobError::RunBlockRecordsWithoutDir);
+            }
         }
         if self.scratch_max_bytes == Some(0) {
             return Err(CompactorKnobError::ZeroScratchMaxBytes);
@@ -276,6 +302,22 @@ impl ScratchOptions {
         if self.level1_workers == Some(0) {
             return Err(CompactorKnobError::ZeroLevel1Workers);
         }
+        if let Some(records) = self.run_block_records {
+            ravel_maintain::validate_rlog_run_block_target_records(records)
+                .map_err(|_| CompactorKnobError::ZeroRunBlockRecords)?;
+        }
+        ravel_maintain::validate_rlog_level2_settings(
+            self.level2_workers,
+            self.range_records
+                .unwrap_or(ravel_maintain::rlog::LEVEL2_RANGE_RECORDS),
+        )
+        .map_err(|e| {
+            if e.field == "level2_workers" {
+                CompactorKnobError::ZeroLevel2Workers
+            } else {
+                CompactorKnobError::ZeroRangeRecords
+            }
+        })?;
         Ok(())
     }
 }
@@ -286,8 +328,11 @@ fn two_level_figures(config: &CompactorConfig) -> Option<String> {
     let report = config.request_ledger.as_ref()?.report();
     (report.level1_groups > 0).then(|| {
         format!(
-            "level1_groups={} level1_workers={}",
-            report.level1_groups, report.level1_workers
+            "level1_groups={} level1_workers={} level2_workers={} level2_ranges={}",
+            report.level1_groups,
+            report.level1_workers,
+            report.level2_workers,
+            report.level2_ranges
         )
     })
 }
@@ -343,8 +388,9 @@ fn two_level_figures(config: &CompactorConfig) -> Option<String> {
 ///
 /// `scratch` is validated by [`ScratchOptions::validate`] before anything else
 /// and placed in the config. With a scratch directory a fresh [`RequestLedger`]
-/// is installed too, so the report can name a two-level unit's level-1 groups
-/// and workers, and `ravel_maintain` logs the run's requests by phase to stderr.
+/// is installed too, so the report can name a two-level unit's level-1 groups,
+/// worker counts and level-2 ranges, and `ravel_maintain` logs the run's
+/// requests by phase to stderr.
 #[allow(clippy::too_many_arguments)]
 pub fn build_compactor_config(
     dry_run: bool,
@@ -366,6 +412,7 @@ pub fn build_compactor_config(
         scratch_dir: scratch.scratch_dir.clone(),
         scratch_max_bytes: scratch.scratch_max_bytes,
         level1_workers: scratch.level1_workers,
+        level2_workers: scratch.level2_workers,
         merge_resident_ceiling_bytes: scratch.merge_resident_ceiling_bytes,
         // ADR-1746 decision 4: refuse to write below a bucket's recorded
         // format floor, the default `migrate_family` also falls back to.
@@ -374,6 +421,12 @@ pub fn build_compactor_config(
     };
     if let Some(ns) = max_flush_lifetime_ns {
         config.max_flush_lifetime_ns = ns;
+    }
+    if let Some(records) = scratch.run_block_records {
+        config.rlog_run_block_target_records = records;
+    }
+    if let Some(records) = scratch.range_records {
+        config.rlog_range_records = records;
     }
     if let Some(rows) = scratch.geometry_floor_decoded_rows {
         config.geometry_floor_decoded_rows = rows;
