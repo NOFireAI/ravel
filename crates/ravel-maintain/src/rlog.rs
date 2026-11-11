@@ -5879,6 +5879,12 @@ impl PartSink<'_> {
         if self.current.as_ref().is_some_and(|p| !p.is_empty()) {
             self.flush(None).await?;
         }
+        if cutter.first < u64::from(self.part_index) {
+            return Err(MaintainError::Invariant(format!(
+                "range {} opens at part index {} below the {} already used",
+                cutter.range, cutter.first, self.part_index
+            )));
+        }
         self.part_index = u32::try_from(cutter.first).map_err(|_| cutter.refusal(cutter.first))?;
         Ok(())
     }
