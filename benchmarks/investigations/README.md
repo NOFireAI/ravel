@@ -78,7 +78,10 @@ anything else, writes `/root/inv/RUN_ID`, and runs `run.sh --lane s3`.
 `run.sh` checks out `box.sha` detached, builds `ravel-cli` and `ravel-server
 --features sql` in separate `cargo build --release --locked` runs with frame
 pointers on, installs pyarrow 17.0.0 (T12's pin; the generator uses only
-`pyarrow.Table` and `pyarrow.parquet.write_table`, and `inv.py
+`pyarrow.Table` and `pyarrow.parquet.write_table`, its `merge-days` only
+`pyarrow.array`, `pyarrow.parquet.ParquetFile.iter_batches`,
+`pyarrow.parquet.ParquetWriter.write_batch` and the `pyarrow.compute`
+functions `is_in`, `any`, `indices_nonzero` and `is_valid`, and `inv.py
 stride-check` only `pyarrow.parquet.read_table` and an int64 cast, which
 17.0.0 has), runs
 the flow against `box.store_bucket` through the instance role, and
@@ -727,7 +730,7 @@ reports `missing stamps/<name>` for any it needs and does not find;
 | `build.json` | the commit and how the binaries were built, with their sha256 |
 | `store.json` | the store bucket was qualified and empty at the start |
 | `host.json` | the machine (arch, nproc, memory, disk), `RQ_STATS=1`, and whether the page cache can be dropped |
-| `corpus.json` | the generator's parameters for every sub-corpus and the sha256 of `truth.json` |
+| `corpus.json` | the generator's parameters for every sub-corpus and the sha256 of `truth.json`; a `day_parts` record names its `day_seeds` and `merge_seed`, and is reproduced by one `gen_corpus.py` run per day (seed `day_seeds[k]`, `--start-hour` `start_hour + 24k`, `--traces` `traces_per_day`, as "day_parts_N and retired_hour" lists) and a `merge-days --seed merge_seed` over them, not by one run with `traces`, `hours` and a seed |
 | `declare.json` | each tenant's declared columns and key index, as `typed-attr-column show` printed them |
 | `tenants.json` | the tenants the run loaded and their store prefixes |
 | `loads.jsonl` | one line per load (hour, tenant, signal): exit code, ingest hour and the load report |

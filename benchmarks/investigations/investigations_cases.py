@@ -6027,16 +6027,17 @@ FINISHED=1
                         "test_day_parts_corpus_generated_a_day_at_a_time")
 
     def merge_two_days(self, out, gen=GEN, present=("req-planted-present-d000", "req-planted-present-d001"),
-                       collide=False):
+                       collide=False, fmt="jsonl", remove=False):
         """Two 2,400-trace days as run.sh deals them, merged by GEN's
         merge-days: (exit code, stderr, merged truth, merged rows, day truths).
         COLLIDE rewrites one day-1 log row's request_id to day 0's present id
-        before the merge."""
+        before the merge. FMT is the days' --format; REMOVE passes
+        --remove-day-rows."""
         start, seed = 498_000, 3_800
         for k in (0, 1):
             subprocess.run([PY, gen, "--traces", "2400", "--hours", "24", "--seed", str(seed * 1000 + k),
                             "--even-hours", "--spans-per-trace", "10", "--logs-per-trace", "5", "--start-hour",
-                            str(start + 24 * k), "--present-id", present[k], "--format", "jsonl",
+                            str(start + 24 * k), "--present-id", present[k], "--format", fmt,
                             "--out", os.path.join(out, f"day-{k}")], check=True, capture_output=True)
         if collide:
             path = os.path.join(out, "day-1", "logs.jsonl")
@@ -6047,8 +6048,9 @@ FINISHED=1
         for k in (0, 1):
             with open(os.path.join(out, f"day-{k}", "truth.json")) as f:
                 days.append(json.load(f))
-        p = subprocess.run([PY, gen, "merge-days", "--seed", str(seed), "--day", os.path.join(out, "day-0"),
-                            "--day", os.path.join(out, "day-1"), "--out", out], capture_output=True, text=True)
+        p = subprocess.run([PY, gen, "merge-days", "--seed", str(seed)] + (["--remove-day-rows"] if remove else []) +
+                           ["--day", os.path.join(out, "day-0"), "--day", os.path.join(out, "day-1"), "--out", out],
+                           capture_output=True, text=True)
         if p.returncode:
             return p.returncode, p.stderr, None, None, days
         with open(os.path.join(out, "truth.json")) as f:
@@ -6119,6 +6121,53 @@ FINISHED=1
             self.assertTrue(problems, label)
             print(f"flip '{label}' at gen_corpus.py:{src[: src.index(old)].count(chr(10)) + 1} fails "
                   f"test_merged_day_truth_sums_rows_and_keeps_planted_ids_unique: {problems[0]}", file=sys.stderr)
+
+    @unittest.skipUnless(importlib.util.find_spec("pyarrow"), "pyarrow is not importable")
+    def test_merged_days_parquet_matches_jsonl_and_truth(self):
+        # run.sh merges with --format parquet and --remove-day-rows; with both
+        # formats the Parquet side is the one Tally counts.
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+
+        out = self.path("merge-both")
+        code, err, truth, rows, days = self.merge_two_days(out, fmt="both", remove=True)
+        self.assertEqual(code, 0, err)
+        tables = {sig: pq.read_table(os.path.join(out, f"{sig}.parquet")) for sig in ("spans", "logs")}
+        for sig in ("spans", "logs"):
+            want = days[0]["rows_written"][sig] + days[1]["rows_written"][sig]
+            self.assertEqual((tables[sig].num_rows, len(rows[sig]), truth["rows_written"][sig]), (want, want, want), sig)
+        for k in (0, 1):
+            left = [f for f in os.listdir(os.path.join(out, f"day-{k}")) if f.endswith((".parquet", ".jsonl"))]
+            self.assertEqual(left, [], f"day-{k} row files left after --remove-day-rows")
+
+        def counts(table, col):
+            c = {}
+            for v in table.column(col).to_pylist():
+                c[v] = c.get(v, 0) + 1
+            return c
+
+        spans_by_tid = counts(tables["spans"], "trace_id")
+        logs_by_tid = counts(tables["logs"], "trace_id")
+        logs_by_rid = counts(tables["logs"], "request_id")
+        tids = {s["trace_id"] for s in truth["saved_traces"]} | set(truth["failing_cell"]["trace_ids"])
+        tids |= {i for ids in truth["in_lists"]["trace_id"].values() for i in ids}
+        rids = set(truth["request_id"]["planted_present"])
+        rids |= {i for ids in truth["in_lists"]["request_id"].values() for i in ids}
+        self.assertEqual({t: (spans_by_tid.get(t), logs_by_tid.get(t)) for t in tids if
+                          (spans_by_tid.get(t), logs_by_tid.get(t)) != (10, 5)}, {})
+        self.assertEqual({r: logs_by_rid.get(r) for r in rids if logs_by_rid.get(r) != 1}, {})
+        self.assertNotIn(truth["request_id"]["absent"], logs_by_rid)
+
+        blocks = {}
+        for v, col in (("needlerare", "needle_rare"), ("needlesparse", "needle_sparse"),
+                       ("needlecommon", "needle_common")):
+            data = tables["logs"].column(col)
+            at = pc.indices_nonzero(pc.is_valid(data)).to_pylist()
+            self.assertEqual(len(at), truth["needles"][v], v)
+            self.assertEqual(len(at), days[0]["needles"][v] + days[1]["needles"][v], v)
+            blocks[v] = {r // 8192 for r in at}
+        blocks["any"] = set().union(*blocks.values())
+        self.assertEqual({v: len(b) for v, b in blocks.items()}, truth["needle_blocks"])
 
     def check_day_parts_fold(self, script):
         code, text = self.new_states_dry_run(script)
