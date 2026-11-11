@@ -97,7 +97,8 @@ pub const DEFAULT_BOUNDED_TOP_KEYS_MAX_LIMIT: usize = 1024;
 /// tables of about 165 MB at 8 partitions and fit in memory only at a process
 /// budget of about 2.40 GB or more; with the whole session at 16 partitions,
 /// and so 16 final tables, the threshold fell to between 2.10 and 2.20 GB. A
-/// spill retry has no exchange to widen.
+/// sort-merge spill retry has no exchange to widen; a bucketed one keeps the
+/// widened exchange, so this floor is also its partition count.
 pub const DEFAULT_FIRST_ATTEMPT_MIN_PARTITIONS: usize = 16;
 
 /// Default for [`SqlConfig::partition_topk_max_limit`].

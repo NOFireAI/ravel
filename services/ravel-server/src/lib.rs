@@ -3746,9 +3746,20 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             // `--cache-dir`, resolve spill, log its two startup lines, and
             // take this process's own spill root before the executor that
             // writes under it exists.
+            // Issue #4014: the in-memory first attempt's final hash exchange
+            // has at least 16 partitions when the count is derived, and the
+            // count as given when an operator set it. The bucketed spill
+            // retry plans the same exchange, so its descriptor need follows.
+            let first_attempt_partitions = query::resolve_sql_first_attempt_partitions(
+                config.query_budgets.sql_partition_count,
+                config.query_budgets.sql_partition_count_source,
+            );
             let sql_spill = query::prepare_sql_spill(
                 config.cache_dir.as_deref(),
-                config.query_budgets.sql_spill,
+                crate::config::SqlSpillSettings {
+                    retry_partitions: first_attempt_partitions.value,
+                    ..config.query_budgets.sql_spill
+                },
                 &maintain_worker.process_id().to_string(),
             )?;
             sql_spill_owner = sql_spill.owner;
@@ -3771,13 +3782,6 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 cache.as_ref().map(|_| config.cache_max_bytes),
             );
             bulk_scan_min_bytes.emit();
-            // Issue #4014: the in-memory first attempt's final hash exchange
-            // has at least 16 partitions when the count is derived, and the
-            // count as given when an operator set it.
-            let first_attempt_partitions = query::resolve_sql_first_attempt_partitions(
-                config.query_budgets.sql_partition_count,
-                config.query_budgets.sql_partition_count_source,
-            );
             first_attempt_partitions.emit();
             let state = query::build_sql_state_with_parquet(
                 catalog.clone(),

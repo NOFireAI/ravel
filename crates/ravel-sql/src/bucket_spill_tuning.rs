@@ -139,9 +139,12 @@ impl NoTuning {
 /// default soft limit.
 pub const DEFAULT_NOFILE_SOFT: u64 = 1024;
 
-/// The smallest `2 x P x 2^bits + P` any tuning needs (`P = 1`, `bits = 0`):
-/// a descriptor budget below it leaves the retry sort-merge only.
-pub const BUCKET_SPILL_MIN_DESCRIPTOR_NEED: u64 = 3;
+/// The smallest `2 x P x 2^bits + P` any tuning needs at `partitions`, the
+/// retry's final exchange partition count: `3 x P` at `bits = 0`. A
+/// descriptor budget below it leaves the retry sort-merge only.
+pub fn bucket_spill_min_descriptor_need(partitions: usize) -> u64 {
+    (partitions.max(1) as u64).saturating_mul(3)
+}
 
 /// `F = floor(nofile_soft / (2 x slots))`, the descriptors one bucket retry
 /// may hold open.
@@ -245,13 +248,7 @@ pub fn derive_bucket_spill_tuning(
         .checked_mul(2u64 << bits)
         .and_then(|need| need.checked_add(partitions))
         .ok_or(NoTuning::Degenerate)?;
-    let budget = inputs.nofile_soft
-        / inputs
-            .slots
-            .max(1)
-            .checked_mul(2)
-            .ok_or(NoTuning::Degenerate)?;
-    if descriptor_need > budget {
+    if descriptor_need > bucket_spill_descriptor_budget(inputs.nofile_soft, inputs.slots) {
         return Err(NoTuning::DescriptorBudget);
     }
     Ok(BucketSpillTuning {
@@ -347,6 +344,28 @@ pub fn bucket_retry_tuning(
     plan: &Arc<dyn ExecutionPlan>,
     figures: BucketRetryFigures,
 ) -> Result<BucketSpillTuning, &'static str> {
+    bucket_retry_derivation(plan, figures).0
+}
+
+/// What [`bucket_retry_derivation`] read from the candidate plan, for the
+/// retry's INFO line; each `None` when the derivation stopped before it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BucketRetryShape {
+    /// `N`, [`BucketSpillPlanShape::total_rows`].
+    pub total_rows: Option<u64>,
+    /// `C`, [`BucketSpillPlanShape::spill_consumers`].
+    pub spill_consumers: Option<usize>,
+    /// `P`, [`BucketSpillPlanShape::partitions`].
+    pub partitions: Option<usize>,
+    /// [`BucketSpillTuning::descriptor_need`], when a tuning was derived.
+    pub descriptor_need: Option<u64>,
+}
+
+/// [`bucket_retry_tuning`], with the figures it read from `plan`.
+pub fn bucket_retry_derivation(
+    plan: &Arc<dyn ExecutionPlan>,
+    figures: BucketRetryFigures,
+) -> (Result<BucketSpillTuning, &'static str>, BucketRetryShape) {
     fn walk(plan: &Arc<dyn ExecutionPlan>, bucketed: &mut usize) -> Result<(), &'static str> {
         if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
             && *aggregate.mode() == AggregateMode::FinalPartitioned
@@ -367,12 +386,23 @@ pub fn bucket_retry_tuning(
             .try_for_each(|child| walk(child, bucketed))
     }
     let mut bucketed = 0;
-    walk(plan, &mut bucketed)?;
-    if bucketed == 0 {
-        return Err(RETRY_NOT_ADMITTED);
+    if let Err(reason) = walk(plan, &mut bucketed) {
+        return (Err(reason), BucketRetryShape::default());
     }
-    let shape = BucketSpillPlanShape::read(plan).map_err(|why| why.reason())?;
-    derive_bucket_spill_tuning(&BucketSpillInputs {
+    if bucketed == 0 {
+        return (Err(RETRY_NOT_ADMITTED), BucketRetryShape::default());
+    }
+    let shape = match BucketSpillPlanShape::read(plan) {
+        Ok(shape) => shape,
+        Err(why) => return (Err(why.reason()), BucketRetryShape::default()),
+    };
+    let mut read = BucketRetryShape {
+        total_rows: shape.total_rows,
+        spill_consumers: Some(shape.spill_consumers),
+        partitions: Some(shape.partitions),
+        descriptor_need: None,
+    };
+    let tuning = derive_bucket_spill_tuning(&BucketSpillInputs {
         asked_bytes: figures.asked_bytes,
         total_rows: shape.total_rows,
         consumed_rows: figures.consumed_rows,
@@ -383,7 +413,9 @@ pub fn bucket_retry_tuning(
         nofile_soft: figures.nofile_soft,
         slots: figures.slots,
     })
-    .map_err(|why| why.reason())
+    .map_err(|why| why.reason());
+    read.descriptor_need = tuning.as_ref().ok().map(|tuning| tuning.descriptor_need);
+    (tuning, read)
 }
 
 /// `plan` with every [`BucketedFinalAggregateExec`] rebuilt at `tuning`'s
@@ -717,8 +749,12 @@ mod tests {
             refused(&|i| i.partitions = 1 << 63),
             Err(NoTuning::Degenerate)
         );
-        // `2 x slots` past u64.
-        assert_eq!(refused(&|i| i.slots = u64::MAX), Err(NoTuning::Degenerate));
+        // `2 x slots` past u64 saturates, leaving a budget of zero, as the
+        // startup line's `bucket_spill_descriptor_budget` computes it.
+        assert_eq!(
+            refused(&|i| i.slots = u64::MAX),
+            Err(NoTuning::DescriptorBudget)
+        );
         // The largest `slots` that doubles exactly leaves a budget of one.
         assert_eq!(
             refused(&|i| i.slots = u64::MAX / 2),
@@ -749,6 +785,28 @@ mod tests {
                 Err(NoTuning::DescriptorBudget)
             );
         }
+    }
+
+    /// The least need is `3 x P` at the inputs' partition count, the need of
+    /// a `bits = 0` tuning: at 16 partitions over four slots a soft limit of
+    /// `2 x 4 x 48` tunes and one below it does not.
+    ///
+    /// Prove-the-test: return 3 whatever the partitions and the minimum reads
+    /// 3 against a tuning that needs 48.
+    #[test]
+    fn the_least_descriptor_need_is_three_per_partition() {
+        assert_eq!(bucket_spill_min_descriptor_need(16), 48);
+        let at = |nofile_soft| {
+            let mut inputs = q33(&XXLARGE, nofile_soft);
+            inputs.asked_bytes = 1;
+            derive_bucket_spill_tuning(&inputs)
+        };
+        let least = 2 * 4 * bucket_spill_min_descriptor_need(16);
+        assert_eq!(
+            at(least).map(|tuning| (tuning.bits, tuning.descriptor_need)),
+            Ok((0, bucket_spill_min_descriptor_need(16)))
+        );
+        assert_eq!(at(least - 1), Err(NoTuning::DescriptorBudget));
     }
 
     #[test]
