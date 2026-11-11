@@ -2354,10 +2354,12 @@ pub struct CompactorConfig {
     /// its `--bucket-concurrency`. Default 1; 0 reads as one.
     pub unit_concurrency: usize,
     /// The level-1 worker count `W1` of a two-level RLOG merge (ADR-3853 D4).
-    /// `None` (the default) derives it: the largest count at or under the
-    /// unit's core share ([`Self::unit_concurrency`]) at which constraint (a)
-    /// still leaves groups of two and the predicted level 2 fits constraint
-    /// (b). `Some(n)` overrides the derivation; `Some(0)` reads as one. Each
+    /// `None` (the default) derives it jointly with `W2` (ADR-3853 D5
+    /// amendment): of the counts at or under the unit's core share
+    /// ([`Self::unit_concurrency`]) at which constraint (a) still leaves
+    /// groups of two and the predicted level 2 fits at least one worker, the
+    /// one with the smallest `1/W1 + 1/W2`, ties to the smaller.
+    /// `Some(n)` overrides the derivation; `Some(0)` reads as one. Each
     /// worker merges its groups under `merge_cursor_budget_bytes / W1` and
     /// `merge_resident_ceiling / W1`.
     pub level1_workers: Option<usize>,
