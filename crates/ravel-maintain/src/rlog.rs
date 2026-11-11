@@ -2691,7 +2691,8 @@ async fn two_level_merge(
                                 group_size: group,
                                 in_flight_bytes: shape.in_flight,
                                 part_target_bytes: shape.part_target,
-                                ceiling_bytes: ceiling,
+                                ceiling_bytes: ceiling
+                                    / config.level2_workers.unwrap_or(1).max(1) as u64,
                             },
                         });
                     }
@@ -18221,6 +18222,58 @@ mod tests {
             assert_eq!(r.level1_groups, 0, "{r:?}");
             assert_eq!(r.level1_passes, 0, "{r:?}");
             assert_eq!(r.scratch_writes, 0, "{r:?}");
+            assert_eq!(compaction_records(&store).await, 0);
+            assert!(!dir.exists(), "no scratch directory was even created");
+        }
+
+        /// ADR-3853 D5 amendment: a configured level-2 worker count whose
+        /// workers' read sides do not fit `U` together is refused before
+        /// level 1, and the refusal names the ceiling one of those workers
+        /// would plan under, `U / W2`, which the read side exceeds, though it
+        /// fits `U` itself.
+        #[tokio::test]
+        async fn an_unfit_level2_worker_count_is_refused_at_its_worker_ceiling() {
+            const WORKERS: usize = 1_000;
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let run_target = 2 * per_input;
+            let ceiling = group_ceiling(per_input, run_target, 30);
+
+            let dir = fresh_scratch("unfit-level2-workers");
+            let config = CompactorConfig {
+                level2_workers: Some(WORKERS),
+                ..two_level_config(ceiling, run_target, Some(dir.clone()))
+            };
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            match outcome {
+                Ok(CompactionOutcome::TwoLevelUnsupported {
+                    inputs: 60,
+                    check:
+                        TwoLevelCheck::PredictedLevelTwoFit {
+                            runs,
+                            blocks_per_run,
+                            block_bytes,
+                            group_size,
+                            in_flight_bytes,
+                            part_target_bytes,
+                            ceiling_bytes,
+                            ..
+                        },
+                }) => {
+                    assert_eq!(group_size, 30, "the one-worker group");
+                    assert_eq!(runs, 2);
+                    assert_eq!(ceiling_bytes, ceiling / WORKERS as u64);
+                    let need =
+                        runs * blocks_per_run * block_bytes + in_flight_bytes + part_target_bytes;
+                    assert!(need > ceiling_bytes, "{need} {ceiling_bytes}");
+                    assert!(need <= ceiling, "one worker fits U: {need} {ceiling}");
+                }
+                other => panic!("{other:?}"),
+            }
+            let r = &run.report;
+            assert_eq!(r.block_read.requests, 0, "no block GET: {r:?}");
+            assert_eq!(r.level1_groups, 0, "{r:?}");
             assert_eq!(compaction_records(&store).await, 0);
             assert!(!dir.exists(), "no scratch directory was even created");
         }
