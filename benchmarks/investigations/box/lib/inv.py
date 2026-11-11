@@ -1356,7 +1356,8 @@ def cmd_midnight_truth(args):
     """Add the midnight lookup to a day-parts corpus's truth.json: the
     request_id of the logs row nearest the first UTC midnight of the window
     (start_hour + 24) within 30 minutes of it, that is no planted id (the
-    present and absent ids, every in_lists request_id), and that occurs
+    present and absent ids, each day's present id, every in_lists
+    request_id), and that occurs
     exactly once. Writes truth.midnight and the answer midnight.request_id.1
     in place; with no such row, midnight is null and the plan records the
     statement not-run through requires = "midnight"."""
@@ -1371,6 +1372,7 @@ def cmd_midnight_truth(args):
     hour = gen["start_hour"] + 24
     m = hour * HOUR_NS
     planted = {truth["request_id"]["present"], truth["request_id"]["absent"]}
+    planted.update(truth["request_id"].get("planted_present", []))
     for ids in truth["in_lists"]["request_id"].values():
         planted.update(ids)
     path = os.path.join(args.corpus, "logs.parquet")

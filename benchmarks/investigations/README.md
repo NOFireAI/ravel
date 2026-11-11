@@ -22,8 +22,9 @@ store, from an empty bucket to `results.<lane>.json`.
   and `truth.json`, the exact answer of every planted key. `--tail` writes
   the mixed state's extra hour, with planted answers of its own.
   `--even-hours` puts exactly traces / hours traces in every hour (the
-  many_parts_N corpora). Its module docstring states the time and
-  determinism rules.
+  many_parts_N corpora). `gen_corpus.py merge-days` joins per-day runs into
+  one multi-day corpus (the day_parts_N corpora, one day in memory at a
+  time). Its module docstring states the time and determinism rules.
 - `statements.toml`: the statements, one `[[statement]]` each: tenant, table,
   SQL or trace GET, the states it runs in, its `truth.json` key, whether it
   runs cold only, and `requires` when it needs a planted key the corpus may
@@ -186,7 +187,8 @@ root)"`. It reports timing figures but never judges them.
 qualify`; the local lane creates a fresh bucket in its own RustFS, the s3
 lane refuses a `store_bucket` that holds any object), `host`, `corpus`
 (gen_corpus.py at `run.toml [corpus]`, the mixed state's tail hour and one
-corpus per many_parts state, merged into one `truth.json`), `declare` (per
+corpus per many_parts state and, a UTC day per run, per day_parts state,
+merged into one `truth.json`), `declare` (per
 tenant: the typed attribute columns from the mappings, `request_id` as key
 index on inv with `--index-trace-id true`, `UserID` on hits, each with
 `--readers-rolled-out`), `load-base`, one step per state, `evaluate`,
@@ -408,11 +410,61 @@ reach the current hour, since the strided load refuses one too
 (`day_parts_window`, `box/lib/inv.py`). The window is computed once, at
 corpus time, so it stays in the past.
 
-**The corpus.** `gen_corpus.py --even-hours` generates the corpus:
+**The corpus.** `gen_corpus.py --even-hours` generates the corpus one
+UTC day at a time, then `gen_corpus.py merge-days` joins the days:
 
-- `--hours 24N` and `--start-hour` at the window's first hour.
-- `--traces` is `day_parts.traces_per_day_N` times N.
-- `--seed` is `corpus.seed + 100 + N`.
+- Day k (0 to N - 1) is its own run: `--hours 24`, `--start-hour` at the
+  window's first hour plus 24k, `--traces` `day_parts.traces_per_day_N`,
+  `--seed` `(corpus.seed + 100 + N) * 1000 + k`, and `--present-id
+  req-planted-present-dKKK`, so each day plants its own present request id
+  and no planted id repeats across days. Day k's rows lie in hours
+  [start + 24k, start + 24k + 24), so the strided load's batch k is still
+  event hour k.
+- `merge-days --seed corpus.seed + 100 + N --remove-day-rows` streams the
+  days, in order and one batch at a time, into the state's one
+  `spans.parquet` and `logs.parquet` (each day's file is deleted once
+  appended), and merges the days' `truth.json` into one. A day carrying a
+  field it has no rule for fails the step.
+
+The merge rules for `truth.json`:
+
+- `rows_written`, `unplanted_rows`, `needles` and the `needle.*` answers are
+  summed over the days. `needle_blocks` is counted over the merged logs
+  file's 8,192-row blocks, since a day's blocks shift once the days before
+  it are appended.
+- `saved_traces` is every day's, in day order, `hour` relative to the
+  window's start, and the `saved_trace.J.*` answers renumbered to match.
+- `failing_cell`, `journey_c`, `erasure_victim` and their answers are the
+  middle day's (day N // 2), `failing_cell.hour` relative to the window's
+  start. Each answer is scoped to that day's failing hour or rows, so the
+  other days do not change it; for N = 7 the cell is hour 84, where a
+  one-run corpus put it (`hours // 2`).
+- `request_id.present` and its answer are the middle day's;
+  `request_id.planted_present` lists every day's, and `midnight-truth`
+  skips them all.
+- Each `in_lists` list of S keys takes S // N keys from each day's own
+  S-key list, plus one more from S mod N days, each share a seeded sample
+  of that day's list, and its answers are recomputed from the merged list.
+  `control_extra` is the middle day's.
+- `generator` is day 0's with `seed` the state's seed, `traces` and
+  `hours` the window's, and `days`, `traces_per_day` and `day_seeds` added.
+
+Every planted key the merged `truth.json` names is then counted in the
+merged rows: a listed trace id must have `spans_per_trace` spans and
+`logs_per_trace` logs, a listed request id one row, the absent id none. A
+key two days share fails the step rather than reaching a statement.
+
+**Generator memory.** A `gen_corpus.py` run holds every trace of its
+window, about 270 bytes a trace on top of the import and write buffers
+(measured: 432 MB peak RSS for one 199,992-trace day; 549 MB for 3 such
+days as one run, 712 MB for 6). By that rate one run over `dp7`'s
+139,999,944 traces needs about 33 GB more than one day's run; D3' run A's
+corpus step, which made it that way, was killed about 30 minutes in on the
+32 GB box. Run a day at a time, the peak is one day's run (431 to 436 MB
+for each of 6 days) or the merge (478 MB for 3 days, 465 MB for 6, one
+200,000-row batch at a time), so it no longer grows with the number of
+days. At `dp7`'s 19,999,992 traces a day, a day's run is the size of the
+base corpus's one run (20,000,000 traces), which has always fit.
 
 For `dp7`, `inv.py midnight-truth` then adds the midnight lookup's answer
 (`midnight.request_id.1`) to `truth.json`. That answer is the request id of
