@@ -8944,6 +8944,147 @@ mod tests {
         );
     }
 
+    /// The part indexes a [`PartSink`] with a cutter opens over
+    /// `stream_records`, closing a part at `part_records` records or when a
+    /// stream end closes its range, one list per range. A part opens only
+    /// under [`RangeCutter::open_limit`], checked before its first record is
+    /// pushed, as `PartSink::push` checks it.
+    fn parts_of(
+        stream_records: &[u64],
+        part_records: u64,
+        t: u64,
+        quantum: u64,
+        keys: u64,
+    ) -> Result<Vec<Vec<u64>>> {
+        let mut cutter = RangeCutter::new(t, quantum, keys)?;
+        let mut ranges = vec![Vec::new()];
+        let mut part_index = 0u64;
+        let mut in_part = 0u64;
+        for n in stream_records {
+            for _ in 0..*n {
+                if in_part == 0 {
+                    if part_index >= cutter.open_limit() {
+                        return Err(cutter.refusal(part_index));
+                    }
+                    ranges.last_mut().expect("a range").push(part_index);
+                }
+                cutter.push();
+                in_part += 1;
+                if in_part == part_records {
+                    in_part = 0;
+                    part_index += 1;
+                }
+            }
+            if cutter.end_stream() {
+                if in_part > 0 {
+                    in_part = 0;
+                    part_index += 1;
+                }
+                if cutter.first < part_index {
+                    return Err(MaintainError::Invariant(format!(
+                        "range {} opens at {} below {part_index}",
+                        cutter.range, cutter.first
+                    )));
+                }
+                part_index = cutter.first;
+                ranges.push(Vec::new());
+            }
+        }
+        if ranges.last().is_some_and(Vec::is_empty) {
+            ranges.pop();
+        }
+        assert_eq!(cutter.emitted, t);
+        assert_eq!(cutter.open_limit(), keys, "the last range reaches keys");
+        Ok(ranges)
+    }
+
+    /// A range holding more records than the quantum takes their share of
+    /// the indexes: at 100 keys over 1,000 records and a quantum of 300,
+    /// streams of 100, 400 and 500 records cut 2 ranges of 500, and parts of
+    /// 11 records open 46 in each. Range 0 starts under
+    /// `index(300) = 30` and range 1 under `index(800) = 80`, but each part
+    /// opens under `index(emitted)` too, 1.1 per part, so range 0 numbers
+    /// 0..=45 and range 1 starts at `index(500) = 50` and numbers 50..=95,
+    /// disjoint, without a refusal. Below that density a range is refused at
+    /// the part whose index reaches both bounds.
+    #[test]
+    fn a_range_past_the_quantum_widens_its_window_with_its_records() {
+        let ranges = parts_of(&[100, 400, 500], 11, 1_000, 300, 100).expect("not refused");
+        assert_eq!(
+            ranges,
+            [(0..=45).collect::<Vec<u64>>(), (50..=95).collect()],
+            "range 0 past index(before + Q) = 30, range 1 from index(500)"
+        );
+
+        let windows = RangeWindows::new(1_000, 300, 100).expect("fits");
+        assert_eq!(
+            windows_of(&windows, &[100, 400, 500], 300),
+            [(0, 30), (50, 80)]
+        );
+
+        // Parts of 5 records cover 0.5 index each: range 0 reaches
+        // index(before + Q) = 30 after 150 records and index(emitted) never
+        // passes the part index again.
+        let refused = parts_of(&[100, 400, 500], 5, 1_000, 300, 100);
+        assert!(
+            matches!(
+                refused,
+                Err(MaintainError::PartRangeWindow {
+                    range: 0,
+                    first: 0,
+                    limit: 30,
+                    part_index: 30,
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    proptest! {
+        /// For any fitting unit and part size, a cut that is not refused
+        /// numbers its parts strictly ascending under `keys`, each range's
+        /// below the next range's first index, and parts of at least
+        /// `2 x T / keys` records are never refused: part `j` of a range
+        /// opens after `before + j x P` records, where `index(emitted)` is at
+        /// least `index(before) + 2j`. Parts are drawn from 0.001 to 8 times
+        /// `T / keys` records, so both sides of that bound are reached, and
+        /// streams often pass the quantum several times over.
+        #[test]
+        fn range_parts_are_disjoint_and_dense_enough_parts_are_never_refused(
+            stream_records in proptest::collection::vec(1u64..2_000, 1..40),
+            quantum in 1u64..4_000,
+            keys in 1u64..10_001,
+            part_per_mille in 1u64..8_000,
+        ) {
+            let t: u64 = stream_records.iter().sum();
+            prop_assume!(u128::from(t) <= u128::from(keys) * u128::from(quantum));
+            let part_records = u64::try_from(
+                u128::from(part_per_mille) * u128::from(t) / (1_000 * u128::from(keys)),
+            )
+            .unwrap_or(u64::MAX)
+            .max(1);
+            match parts_of(&stream_records, part_records, t, quantum, keys) {
+                Ok(ranges) => {
+                    let all: Vec<u64> = ranges.iter().flatten().copied().collect();
+                    prop_assert!(all.windows(2).all(|p| p[0] < p[1]), "{:?}", ranges);
+                    prop_assert!(all.iter().all(|i| *i < keys), "{:?}", ranges);
+                    prop_assert_eq!(
+                        ranges.len(),
+                        level2_ranges(&stream_records, quantum).len()
+                    );
+                }
+                Err(MaintainError::PartRangeWindow { .. }) => {
+                    prop_assert!(
+                        u128::from(part_records) * u128::from(keys) < 2 * u128::from(t),
+                        "parts of {} records refused at T {} keys {}",
+                        part_records, t, keys
+                    );
+                }
+                Err(other) => prop_assert!(false, "{other}"),
+            }
+        }
+    }
+
     proptest! {
         /// Any nonzero stream totals and quantum whose unit fits
         /// `keys x quantum` give windows from 0 that ascend without overlap,
@@ -17794,6 +17935,114 @@ mod tests {
             }
         }
 
+        /// ADR-3853 D5 amendment: a range holding more records than the
+        /// quantum numbers its parts the same way on every route. Over 60
+        /// inputs of 40 streams, one record per stream and two blocks of 20
+        /// streams per input, a quantum of 10 closes a range at each 60-record
+        /// stream, and a part key of 240 indexes gives each range a window of
+        /// one index at its start, `[6r, index(60r + 10)) = [6r, 6r + 1)`, which
+        /// its 2 parts outgrow: the second opens under `index(emitted)`. The
+        /// single-level resident merge in one pass and in two (a pass per
+        /// block's 20 streams) and the two-level merge, which D0 routes the
+        /// cursor plan to, at 1 or 4 level-1 workers and 1 or 2 range workers
+        /// publish the same keys, content hashes and bytes, range r's parts at
+        /// `6r` and `6r + 1`. A range worker seeded from any record count before
+        /// its first range other than the exact one publishes other keys.
+        #[tokio::test]
+        async fn every_route_numbers_a_range_past_the_quantum_alike() {
+            const QUANTUM: u64 = 10;
+            const KEYS: u64 = 240;
+            let inputs = blocked(wide_inputs(60, 40, 1), 20);
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &inputs).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let part = 4 * TWO_LEVEL_PART;
+            let base = CompactorConfig {
+                rlog_range_records: QUANTUM,
+                rlog_l1_part_memory_target_bytes: Some(part),
+                ..two_level_config(64 << 20, crate::RLOG_RUN_MEMORY_TARGET_BYTES, None)
+            };
+            let (plan, _) = plan_for(&probe, &keys, &base).await;
+            assert_eq!(plan.mode, MergeReadMode::Resident);
+            let largest = plan.estimates.iter().copied().max().unwrap_or(0);
+            let tight = CompactorConfig {
+                merge_resident_ceiling_bytes: Some(plan.raw_bytes + part + largest),
+                ..base.clone()
+            };
+            let (plan, _) = plan_for(&probe, &keys, &tight).await;
+            assert_eq!(plan.mode, MergeReadMode::Resident);
+            assert!(plan.hot.iter().all(|h| !h), "no hot stream");
+            let two_level_ceiling = 2 * group_ceiling(per_input, TWO_LEVEL_RUN_TARGET, 12);
+            let (plan, _) = plan_for(
+                &probe,
+                &keys,
+                &CompactorConfig {
+                    merge_resident_ceiling_bytes: Some(two_level_ceiling),
+                    ..base.clone()
+                },
+            )
+            .await;
+            assert_eq!(
+                plan.mode,
+                MergeReadMode::Cursor,
+                "D0 refuses it: two levels"
+            );
+
+            let mut legs = vec![
+                ("single-level resident in one pass".to_string(), base),
+                ("single-level resident in two passes".to_string(), tight),
+            ];
+            for (w1, w2) in [(1usize, 1usize), (1, 2), (4, 2)] {
+                let dir = fresh_scratch(&format!("past-quantum-{w1}-{w2}"));
+                let config = CompactorConfig {
+                    level1_workers: Some(w1),
+                    level2_workers: Some(w2),
+                    rlog_range_records: QUANTUM,
+                    rlog_l1_part_memory_target_bytes: Some(part),
+                    ..two_level_config(two_level_ceiling, TWO_LEVEL_RUN_TARGET, Some(dir))
+                };
+                legs.push((format!("two-level W1 {w1} W2 {w2}"), config));
+            }
+
+            let indexes: Vec<u32> = (0..40u32).flat_map(|r| [6 * r, 6 * r + 1]).collect();
+            let mut outputs = Vec::new();
+            let mut groups = Vec::new();
+            for (name, config) in &legs {
+                let store = ProbeStore::new();
+                seed_inputs(&store, &inputs).await;
+                PART_KEYS_OVERRIDE.with(|o| o.set(Some(KEYS)));
+                let (outcome, run) = compact_logged(&store, config).await;
+                PART_KEYS_OVERRIDE.with(|o| o.set(None));
+                assert!(
+                    matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                    "{name}: {outcome:?}"
+                );
+                let r = &run.report;
+                if name.starts_with("single-level") {
+                    assert_eq!(r.level1_groups, 0, "{name}: {r:?}");
+                    let passes = if name.ends_with("one pass") { 1 } else { 2 };
+                    assert_eq!(r.merge_passes, passes, "{name}: {r:?}");
+                } else {
+                    assert_eq!(r.level2_ranges, 40, "{name}: {r:?}");
+                    groups.push(r.level1_groups);
+                }
+                let got = published(&store).await;
+                assert_eq!(
+                    got.1.indexes, indexes,
+                    "{name}: range r's 2 parts at 6r and 6r + 1, past its opening window \
+                     [6r, 6r + 1)"
+                );
+                outputs.push((name, got));
+            }
+            assert_eq!(groups, [3, 3, 10], "level 1 grouped differently at W1 4");
+            let (_, oracle) = &outputs[0];
+            for (name, got) in &outputs[1..] {
+                assert_eq!(got.0, oracle.0, "{name}: part keys");
+                assert!(got.1.hashes == oracle.1.hashes, "{name}: content hashes");
+                assert!(got.1.parts == oracle.1.parts, "{name}: part bytes");
+            }
+        }
+
         /// ADR-3853 D5 amendment: the two-level cut reads the records each
         /// stream holds, never how level 1 grouped the inputs or how its runs
         /// were cut into parts and blocks. Against 4 level-1 workers, run
@@ -18199,7 +18448,8 @@ mod tests {
         /// key's indexes times the quantum is refused, naming all three,
         /// before level 2 runs a pass or opens a part.
         #[tokio::test]
-        async fn level2_workers_are_capped_at_the_ranges_and_slots_at_the_key() {
+        async fn level2_workers_are_capped_at_the_ranges_and_a_unit_past_the_key_space_is_refused()
+        {
             let (_, _, per_input) = single_level_oracle().await;
             let dir = fresh_scratch("range-cap");
             let config = range_worker_config(per_input, 8, dir.clone());
@@ -20525,6 +20775,151 @@ mod tests {
             assert_eq!(second.geometry_unsupported, 0, "{second:?}");
             assert_eq!(second_reads.catalog_read.requests, 0, "{second_reads:?}");
             assert_eq!(second_reads.block_read.requests, 0, "{second_reads:?}");
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// Seeds 4 inputs of 4 streams, one record each, into `hour`: a unit
+        /// of 16 records, which fits any part key the refusal tests set.
+        async fn seed_small_hour(store: &dyn ObjectStoreBackend, hour: u32) {
+            for (i, input) in blocked(wide_inputs(4, 4, 1), 4).into_iter().enumerate() {
+                let writer_id = Uuid::from_u128(1_000 + i as u128);
+                let identity = ObjectIdentity {
+                    tenant_hash: tenant_hash().0,
+                    shard: SHARD,
+                    writer_id: writer_id.into_bytes(),
+                    writer_epoch: EPOCH,
+                    writer_seq: 1,
+                };
+                let mut w = RlogWriter::new(input.cfg, identity);
+                for r in &input.records {
+                    w.push(r.clone()).expect("push");
+                }
+                let bytes = Bytes::from(w.finish().expect("finish L0"));
+                seed_l0_object_at(store, writer_id, 1, &input.records, bytes, hour).await;
+            }
+        }
+
+        /// The L1 part objects on `store` in ingest hour `hour`.
+        async fn l1_parts_at(store: &dyn ObjectStoreBackend, hour: u32) -> usize {
+            list_all(store, "t/")
+                .await
+                .expect("list")
+                .into_iter()
+                .filter_map(|m| keys::parse_l1_part_key(&m.key).ok())
+                .filter(|p| p.ingest_hour_bucket == hour)
+                .count()
+        }
+
+        /// ADR-3853 D5 amendment: a unit past the part key space is refused
+        /// as a terminal outcome of the pass, not an error of the run. With a
+        /// part key of 3 indexes and a quantum of 600, the 2,400-record hour
+        /// is refused before a part PUT and writes no compaction record,
+        /// while the next hour of the same shard, 16 records, compacts in the
+        /// same `scan_and_compact` pass and the same maintain tick. The tick
+        /// holds the refused hour terminal in memory, never persisted, and the
+        /// next tick reads neither hour's inputs again.
+        #[tokio::test]
+        async fn a_part_key_space_refusal_is_terminal_and_the_next_hour_compacts() {
+            let config = at_range_quantum(two_level_config(
+                64 << 20,
+                crate::RLOG_RUN_MEMORY_TARGET_BYTES,
+                None,
+            ));
+            let next_hour = HOUR + 1;
+            let now_ns = sealed_now_ns() + NS_PER_HOUR;
+            let seeded = || async {
+                let store = ProbeStore::new();
+                seed_inputs(&store, &two_level_inputs()).await;
+                seed_small_hour(&store, next_hour).await;
+                store
+            };
+
+            let store = seeded().await;
+            PART_KEYS_OVERRIDE.with(|o| o.set(Some(3)));
+            let scanned = crate::scan::scan_and_compact(
+                &store,
+                &FixedClock::new(now_ns),
+                &config,
+                tenant_hash(),
+                Signal::Logs,
+                SHARD,
+            )
+            .await;
+            PART_KEYS_OVERRIDE.with(|o| o.set(None));
+            let scanned = scanned.expect("a part key space refusal does not abort the scan");
+            assert_eq!(scanned.compacted, 1, "the next hour compacted: {scanned:?}");
+            assert_eq!(scanned.geometry_unsupported, 1, "{scanned:?}");
+            assert_eq!(l1_parts_at(&store, HOUR).await, 0, "no part PUT");
+            assert_eq!(compaction_records(&store).await, 0, "no record");
+            assert_eq!(compaction_records_at(&store, next_hour).await, 1);
+            assert!(l1_parts_at(&store, next_hour).await > 0);
+
+            let store = seeded().await;
+            let mut memo = crate::MaintainMemo::new(crate::scan::DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
+            PART_KEYS_OVERRIDE.with(|o| o.set(Some(3)));
+            let (first, first_reads) = maintain_tick_at(&mut memo, &store, &config, now_ns).await;
+            let (second, second_reads) = maintain_tick_at(&mut memo, &store, &config, now_ns).await;
+            PART_KEYS_OVERRIDE.with(|o| o.set(None));
+            let first = first.expect("a part key space refusal does not abort the tick");
+            assert_eq!(first.compacted, 1, "the next hour compacted: {first:?}");
+            assert_eq!(first.geometry_unsupported, 1, "{first:?}");
+            assert_eq!(l1_parts_at(&store, HOUR).await, 0, "no part PUT");
+            assert_eq!(compaction_records(&store).await, 0, "no record");
+            assert_eq!(compaction_records_at(&store, next_hour).await, 1);
+            assert!(first_reads.block_read.requests > 0, "{first_reads:?}");
+            assert_eq!(
+                memo.terminal_state(tenant_hash(), Signal::Logs, SHARD, HOUR),
+                Some(crate::scan::TerminalState::GeometryUnsupported)
+            );
+            assert_eq!(
+                memo.terminal_state(tenant_hash(), Signal::Logs, SHARD, next_hour),
+                Some(crate::scan::TerminalState::Compacted)
+            );
+            assert_eq!(
+                memo.snapshot_entry_count(),
+                1,
+                "the refusal is never persisted"
+            );
+            let second = second.expect("second tick");
+            assert_eq!(second.compacted, 0, "{second:?}");
+            assert_eq!(second.geometry_unsupported, 0, "{second:?}");
+            assert_eq!(second_reads.catalog_read.requests, 0, "{second_reads:?}");
+            assert_eq!(second_reads.block_read.requests, 0, "{second_reads:?}");
+        }
+
+        /// A range window refusal is terminal the same way: the padded hour's
+        /// range 1 is refused at index 4 of a 4-index part key after its
+        /// worker put indexes 2 and 3, nothing is published and no record is
+        /// written, and the next hour compacts in the same tick.
+        #[tokio::test]
+        async fn a_range_window_refusal_is_terminal_and_the_next_hour_compacts() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &padded_tail_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let dir = fresh_scratch("range-window-terminal");
+            let config = CompactorConfig {
+                rlog_range_records: 1_200,
+                rlog_l1_part_memory_target_bytes: Some(4 * RANGE_PART),
+                ..range_worker_config(per_input, 2, dir.clone())
+            };
+            let next_hour = HOUR + 1;
+            let store = ProbeStore::new();
+            seed_inputs(&store, &padded_tail_inputs()).await;
+            seed_small_hour(&store, next_hour).await;
+            let mut memo = crate::MaintainMemo::new(crate::scan::DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
+            PART_KEYS_OVERRIDE.with(|o| o.set(Some(4)));
+            let (first, _) =
+                maintain_tick_at(&mut memo, &store, &config, sealed_now_ns() + NS_PER_HOUR).await;
+            PART_KEYS_OVERRIDE.with(|o| o.set(None));
+            let first = first.expect("a range window refusal does not abort the tick");
+            assert_eq!(first.compacted, 1, "the next hour compacted: {first:?}");
+            assert_eq!(first.geometry_unsupported, 1, "{first:?}");
+            assert_eq!(compaction_records(&store).await, 0, "no record");
+            assert_eq!(compaction_records_at(&store, next_hour).await, 1);
+            assert_eq!(
+                memo.terminal_state(tenant_hash(), Signal::Logs, SHARD, HOUR),
+                Some(crate::scan::TerminalState::GeometryUnsupported)
+            );
             assert!(scratch_entries(&dir).is_empty());
         }
 
