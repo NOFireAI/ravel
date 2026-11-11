@@ -145,9 +145,11 @@ pub use audit_schema::{
 };
 pub use bounded_topk::{BOUNDED_TOPK_AGGREGATE_RULE, BoundedTopKAggregate};
 pub use bucket_spill_tuning::{
-    BUCKET_SPILL_MAX_CHUNK_ROWS, BUCKET_SPILL_MIN_CHUNK_ROWS, BucketSpillInputs,
-    BucketSpillPlanShape, BucketSpillTuning, NoTuning, derive_bucket_spill_tuning,
-    routed_chunk_charge, spill_consumers, spill_slots,
+    BUCKET_SPILL_MAX_CHUNK_ROWS, BUCKET_SPILL_MIN_CHUNK_ROWS, BUCKET_SPILL_MIN_DESCRIPTOR_NEED,
+    BucketRetryFigures, BucketSpillInputs, BucketSpillPlanShape, BucketSpillTuning,
+    DEFAULT_NOFILE_SOFT, NoTuning, RETRY_NOT_ADMITTED, RETRY_ORDER_PRESERVING_EXCHANGE,
+    bucket_retry_tuning, bucket_spill_descriptor_budget, derive_bucket_spill_tuning,
+    routed_chunk_charge, spill_consumers, spill_slots, with_bucket_spill_tuning,
 };
 pub use bucketed_final_aggregate::{
     BUCKET_SPILL_BATCHES_WRITTEN, BUCKET_SPILL_BYTES_READ, BUCKET_SPILL_ROWS_READ,
@@ -193,8 +195,9 @@ pub use error::{
 pub use executor::{
     AnalyzedRun, DecodedCacheStats, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, KeyIndexStats,
     LiveAccounting, ParquetPlan, PhaseWallTiming, PinnedLanes, PinnedPlanInputs, PinnedQuery,
-    PinnedResolve, PinnedStream, ScanTiming, SegmentTiming, SignalStats, SqlExecutor, SqlOutcome,
-    SqlRequest, SqlStats, TargetSignal, refuse_several_tables, segment_set_keys,
+    PinnedResolve, PinnedStream, ScanTiming, SegmentTiming, SignalStats, SpillRetryReport,
+    SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal, refuse_several_tables,
+    segment_set_keys,
 };
 pub use first_groups::{
     FIRST_GROUPS_CONSUMER_PREFIX, FIRST_GROUPS_RULE, FirstGroupsExec, FirstGroupsLimit,

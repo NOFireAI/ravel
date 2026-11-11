@@ -215,12 +215,23 @@ pub const BUCKET_SPILL_BATCHES_WRITTEN: &str = "bucket_spill_batches_written";
 #[derive(Debug)]
 pub struct BucketedFinalAggregateRule {
     config: BucketedFinalAggregation,
+    spill: bool,
 }
 
 impl BucketedFinalAggregateRule {
-    /// A rule that builds every exec it plans with `config`.
+    /// A rule that builds every exec it plans with `config`, without spill.
     pub fn new(config: BucketedFinalAggregation) -> Self {
-        BucketedFinalAggregateRule { config }
+        BucketedFinalAggregateRule {
+            config,
+            spill: false,
+        }
+    }
+
+    /// Build every exec with [`BucketedFinalAggregateExec::with_spill`]
+    /// `spill`, the refusal retry's mode.
+    pub fn with_spill(mut self, spill: bool) -> Self {
+        self.spill = spill;
+        self
     }
 
     /// Whether `aggregate` qualifies for the bucketed final (ADR-3565
@@ -293,7 +304,8 @@ impl BucketedFinalAggregateRule {
             return Ok(node);
         }
         let exec = BucketedFinalAggregateExec::new(Arc::new(aggregate.clone()), self.config)
-            .with_topk(topk_above);
+            .with_topk(topk_above)
+            .with_spill(self.spill);
         Ok(Arc::new(exec))
     }
 }
