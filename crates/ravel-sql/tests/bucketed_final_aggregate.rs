@@ -3544,8 +3544,9 @@ async fn the_bucketed_retry_runs_at_the_refusing_tenant_budget() {
 /// An effective limit too small to tune keeps the sort-merge retry with the
 /// derivation's reason, and that retry runs at `L`, not the effective limit,
 /// and answers. A 70 MiB tenant budget leaves 6 MiB above the 64 MiB
-/// headroom, too little for a routed chunk of 1024 rows per bucket, while
-/// the same first attempt tunes at `L`.
+/// headroom: no `bits` up to 16 both fits the table and leaves room beside
+/// it for routed chunks of 1024 rows, so the reason is `too_many_bits`,
+/// while the same first attempt tunes at `L`.
 #[tokio::test]
 async fn a_retry_whose_effective_limit_is_too_small_keeps_sort_merge_at_l() {
     let scratch = tempfile::tempdir().expect("scratch root");
@@ -3566,9 +3567,13 @@ async fn a_retry_whose_effective_limit_is_too_small_keeps_sort_merge_at_l() {
     assert_eq!(report.effective_limit_bytes, Some(tenant_bytes as u64));
     assert_eq!(
         (report.retry_plan, report.retry_plan_reason),
-        ("sort_merge", Some("chunk_too_small"))
+        ("sort_merge", Some("too_many_bits"))
     );
     assert_eq!(report.retry_pool_limit_bytes, BIG_QUERY_BYTES as u64);
+    assert_eq!(
+        ravel_sql::derive_bucket_spill_tuning(&groups_inputs(&report, tenant_bytes).await),
+        Err(ravel_sql::NoTuning::TooManyBits)
+    );
     ravel_sql::derive_bucket_spill_tuning(&groups_inputs(&report, BIG_QUERY_BYTES).await)
         .expect("the same first attempt tunes at L");
     assert!(

@@ -47,10 +47,10 @@ per-stream share `S = (L_eff - H) / C` into fixed parts:
 On c6a.large `S` is 32,585,819 B. The routed row is 64 B, not the 52 B item 4
 predicted (ADR-3565 amendment 3). The first attempt projected `T` at 12.65 to
 12.78 GB, which gives `bits` 7 and a chunk charge that fits 972 rows. That is
-below the floor, so there is no tuning. (ADR-3565 amendment 3 gives 980 rows
-from `w` alone; 972 is what `routed_chunk_charge` allows once it adds each
-column's validity bitmap and the 64-byte rounding of every buffer.) Under the
-fixed quarter, any `T` above 12.51 GB fails on that box.
+below the floor, so there is no tuning. (ADR-3565 amendment 3 gives 980 rows:
+that is `routed_chunk_charge` at the `S` of M8's logged effective limit,
+32,874,379 B, and 972 is the same charge at item 4's `S` of 32,585,819 B.)
+Under the fixed quarter, any `T` above 12.51 GB fails on that box.
 
 Two facts in the code make the fixed quarter unnecessary:
 
@@ -124,7 +124,7 @@ bytes than the sort-merge it replaces.
 The derivation keeps its `bits` rule and drops the fixed quarter for the
 chunks. With `table(b) = ceil(2T / (P x 2^b))`:
 
-- `bits` is the least `b` with `table(b) <= 0.75 x S` **and**
+- `bits` is the least `b` with `2T / (P x 2^b) <= 0.75 x S` **and**
   `table(b) + (2^b + 1) x b(c_min) <= S`, where `c_min` is the chunk floor.
   The second condition takes one more bit only at the top of a `bits` step,
   where the table leaves no room for even floor-sized chunks.
@@ -145,7 +145,7 @@ table still gets at least `2T / (P x 2^b)`. The descriptor rule is unchanged.
 
 The 1,024-row floor stays. On c6a.large it binds past about 24.6 GB at
 `bits` 7 and about 31.8 GB at `bits` 8 (a floor chunk of 64 B rows is
-charged 66,432 B). The test fixture `Q33_WIDTHS` moves from 52 B to the
+charged 66,304 B). The test fixture `Q33_WIDTHS` moves from 52 B to the
 measured 64 B. `bits` 7 needs a soft `nofile` limit of at least 8,224 on
 c6a.large (one slot) and `bits` 8 at least 16,416. The M8 and publication
 boxes were stamped at 8,320 or more, which allows `bits` 7; whether they
