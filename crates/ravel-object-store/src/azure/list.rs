@@ -719,6 +719,9 @@ fn status_error(context: &str, status: u16, code: Option<&str>, subject: Subject
             StoreError::Permanent(format!("{detail}: the container does not exist"))
         }
         404 => StoreError::NotFound,
+        409 | 412 if super::is_lease_code(code) => {
+            StoreError::Permanent(format!("{detail}: the blob is leased"))
+        }
         412 => StoreError::PreconditionFailed,
         416 => StoreError::InvalidRange(detail),
         429 | 503 => StoreError::Throttled {

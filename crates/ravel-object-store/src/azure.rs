@@ -11,7 +11,7 @@
 //!
 //! - `CreateIfAbsent` sends `If-None-Match: *`. A 409 whose error code is
 //!   `BlobAlreadyExists` is [`StoreError::AlreadyExists`]; a 409 with another
-//!   code (a lease, an immutability policy) is [`StoreError::Permanent`]. A
+//!   code (an immutability policy, snapshots) is [`StoreError::Permanent`]. A
 //!   409 whose code `object_store` did not keep is confirmed with one HEAD, as
 //!   on S3: present is `AlreadyExists`, absent is [`StoreError::Transient`].
 //! - `CasVersion(v)` sends `If-Match: v`. A 412 is
@@ -19,6 +19,11 @@
 //!   the token no longer names it), except a 404 `ContainerNotFound`, which
 //!   is `Permanent`.
 //! - `Overwrite` sends no precondition.
+//!
+//! A leased blob answers a write with a 412 (or a 409) whose code starts with
+//! `Lease`. That is `Permanent` in every put mode and on `delete`, never
+//! `AlreadyExists` or `PreconditionFailed`: Ravel takes no leases, so no retry
+//! clears it.
 //!
 //! # Reads
 //!
@@ -713,9 +718,30 @@ fn error_code_of(e: &object_store::Error) -> Option<String> {
     }
 }
 
-/// `ContainerNotFound` is `Permanent` on every operation; a 409 outside a
-/// create is not `AlreadyExists` (ADR-4158 D5). Anything else goes to
-/// `fallback`.
+/// Whether `code` is a lease's: `LeaseIdMissing`, `LeaseAlreadyPresent` and
+/// the rest of that family, sent with a 412 or a 409.
+fn is_lease_code(code: Option<&str>) -> bool {
+    code.is_some_and(|code| code.starts_with("Lease"))
+}
+
+/// A 412 or 409 with a lease's error code: a lease Ravel never takes, so no
+/// retry and no precondition outcome can clear it (ADR-4158 D5).
+fn lease_error(e: &object_store::Error, code: Option<&str>) -> Option<StoreError> {
+    use object_store::Error as E;
+    let status = match e {
+        E::Precondition { .. } => 412,
+        E::AlreadyExists { .. } => 409,
+        _ => return None,
+    };
+    let code = code.filter(|code| is_lease_code(Some(code)))?;
+    Some(StoreError::Permanent(format!(
+        "Azure refused the request: HTTP {status} {code}: the blob is leased"
+    )))
+}
+
+/// `ContainerNotFound` is `Permanent` on every operation, and so is a lease
+/// conflict; a 409 outside a create is not `AlreadyExists` (ADR-4158 D5).
+/// Anything else goes to `fallback`.
 fn map_azure_error(
     e: object_store::Error,
     fallback: fn(object_store::Error) -> StoreError,
@@ -725,6 +751,9 @@ fn map_azure_error(
         return StoreError::Permanent(
             "the Azure container does not exist (ContainerNotFound)".into(),
         );
+    }
+    if let Some(leased) = lease_error(&e, code.as_deref()) {
+        return leased;
     }
     if let object_store::Error::AlreadyExists { .. } = e {
         return StoreError::Permanent(match code {
@@ -745,6 +774,9 @@ enum PutFailure {
 fn map_put_error(e: object_store::Error, mode: &PutMode) -> PutFailure {
     use object_store::Error as E;
     let code = error_code_of(&e);
+    if let Some(leased) = lease_error(&e, code.as_deref()) {
+        return PutFailure::Mapped(leased);
+    }
     if code.as_deref() == Some("ContainerNotFound") {
         return PutFailure::Mapped(map_azure_error(e, map_error_common));
     }
