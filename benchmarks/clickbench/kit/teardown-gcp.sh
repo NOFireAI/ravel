@@ -42,14 +42,20 @@ while read -r name zone; do
   gcloud compute instances delete "$name" --project "$PROJECT" --zone "$zone" --quiet || code=1
 done <<<"$listing"
 
+ERR="$(mktemp "${TMPDIR:-/tmp}/teardown-gcp.XXXXXX")"
+trap 'rm -f "$ERR"' EXIT
 if gcloud storage buckets describe "gs://$STORE_BUCKET" --project "$PROJECT" --format='value(name)' >/dev/null 2>&1; then
   echo "teardown-gcp: deleting gs://$STORE_BUCKET and every object in it"
-  gcloud storage rm --recursive "gs://$STORE_BUCKET" --project "$PROJECT" --quiet >/dev/null || code=1
+  # gcloud names every object it removes on stderr; show that only on failure.
+  gcloud storage rm --recursive "gs://$STORE_BUCKET" --project "$PROJECT" --quiet >/dev/null 2>"$ERR" \
+    || { tail -n 20 "$ERR" >&2; code=1; }
 fi
 
+# gcloud warns on stderr when no instance carries the label at all; only
+# stdout is the listing.
 echo "teardown-gcp: gcloud compute instances list --project $PROJECT --filter $FILTER"
 remaining="$(gcloud compute instances list --project "$PROJECT" --filter "$FILTER" \
-  --format='table(name,zone.basename(),status)' 2>&1)" || { echo "$remaining" >&2; exit 1; }
+  --format='table(name,zone.basename(),status)' 2>"$ERR")" || { cat "$ERR" >&2; exit 1; }
 printf '%s\n' "${remaining:-Listed 0 items.}"
 [ -z "$remaining" ] || { echo "teardown-gcp: instances of $RUN_ID remain" >&2; code=1; }
 if gcloud storage buckets describe "gs://$STORE_BUCKET" --project "$PROJECT" --format='value(name)' >/dev/null 2>&1; then

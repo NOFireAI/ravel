@@ -538,10 +538,14 @@ case "${pos[0]:-} ${pos[1]:-} ${pos[2]:-}" in
   "compute instances add-iam-policy-binding") failing binding; echo etag ;;
   "compute instances delete") failing instance-delete; rm -f "$STUB_DIR/gce/${pos[3]}" ;;
   "compute instances list")
+    n=0
     for f in "$STUB_DIR"/gce/*; do
       [ -f "$f" ] || continue
       printf '%s\t%s\n' "$(basename "$f")" "$(cat "$f")"
-    done ;;
+      n=$((n + 1))
+    done
+    # As gcloud does when no resource carries the filtered label.
+    [ "$n" != 0 ] || echo "WARNING: The following filter keys were not present in any resource : ${filter%%=*}" >&2 ;;
   *) echo "unexpected gcloud call: ${pos[*]}" >&2; exit 99 ;;
 esac
 STUB
@@ -5639,8 +5643,9 @@ else
 fi
 mv "$TMP/gce-saved" "$STUB_DIR/gce/$GCP_INSTANCE"
 
-# Catches: a teardown that leaves the store bucket or a stopped instance, or
-# reports nothing left without asking again.
+# Catches: a teardown that leaves the store bucket or a stopped instance,
+# reports nothing left without asking again, or reads gcloud's stderr warning
+# for a label no instance carries as an instance that remains.
 reset_log
 code=0
 bash "$KIT_SRC/teardown-gcp.sh" "$GCP_TOML" "$GCP_RUN_ID" >"$TMP/gtear.out" 2>&1 || code=$?
