@@ -381,15 +381,39 @@ impl AzureRestClient {
     /// Get Blob Properties for `key`. With a pin, the pin's ETag is sent as
     /// `If-Match` and its version as `versionid`, so a 412 is
     /// [`StoreError::PreconditionFailed`]: the key no longer holds the pinned
-    /// blob.
+    /// blob, or (on Azurite) holds no blob at all.
     pub(crate) async fn head_blob(
         &self,
         key: &str,
         pin: Option<&Pin>,
     ) -> Result<BlobHead, StoreError> {
+        self.head_blob_as(
+            key,
+            pin.and_then(|pin| pin.version.as_deref()),
+            pin.map(|pin| pin.etag.as_str()),
+        )
+        .await
+    }
+
+    /// Get Blob Properties for `key`, selecting `version` when there is one,
+    /// with no precondition.
+    pub(crate) async fn head_version(
+        &self,
+        key: &str,
+        version: Option<&str>,
+    ) -> Result<BlobHead, StoreError> {
+        self.head_blob_as(key, version, None).await
+    }
+
+    async fn head_blob_as(
+        &self,
+        key: &str,
+        version: Option<&str>,
+        if_match: Option<&str>,
+    ) -> Result<BlobHead, StoreError> {
         let path = format!("{}/{}", self.container_path, encode_key(key));
         let mut query: Vec<(&str, String)> = Vec::new();
-        if let Some(version) = pin.and_then(|pin| pin.version.as_deref()) {
+        if let Some(version) = version {
             query.push(("versionid", version.to_string()));
         }
         let context = format!("head {key:?}");
@@ -399,7 +423,7 @@ impl AzureRestClient {
                 Method::HEAD,
                 &path,
                 &query,
-                pin.map(|pin| pin.etag.as_str()),
+                if_match,
                 Subject::Blob,
             )
             .await?;
