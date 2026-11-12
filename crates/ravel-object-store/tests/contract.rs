@@ -3,10 +3,12 @@
 //! oracle at its default page size and at a tiny one to force pagination,
 //! `FaultStore` wrapping the oracle with an empty plan (must be fully
 //! transparent), `ScratchStore` over a temporary directory at both page
-//! sizes, `GcsStore` against the in-process fake GCS endpoint, and --
-//! gated on `RAVEL_RUSTFS_URL` / `RAVEL_FLOCI_URL` / `RAVEL_GCS_TEST_BUCKET`
-//! -- `S3Store` against a real RustFS and against a real floci, and `GcsStore`
-//! against a real bucket.
+//! sizes, `GcsStore` against the in-process fake GCS endpoint, `AzureStore`
+//! against the in-process fake Azure endpoint, and -- gated on
+//! `RAVEL_RUSTFS_URL` / `RAVEL_FLOCI_URL` / `RAVEL_GCS_TEST_BUCKET` /
+//! `RAVEL_AZURITE_URL` / `RAVEL_AZURE_TEST_ACCOUNT` -- `S3Store` against a
+//! real RustFS and against a real floci, `GcsStore` against a real bucket, and
+//! `AzureStore` against the Azurite emulator and against a real container.
 //!
 //! This is an integration-test binary, a crate in its own right, so it
 //! inherits `[lints] workspace = true` (including `clippy::expect_used`
@@ -19,6 +21,8 @@ use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use ravel_object_store::azure::fake::FakeAzure;
+use ravel_object_store::azure::{AzureConfig, AzureStore, TestAccountKey};
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::gcs::fake::FakeGcs;
 use ravel_object_store::gcs::{GcsConfig, GcsStore};
@@ -2003,4 +2007,285 @@ async fn gcs_contract() {
     for meta in leftovers {
         let _ = store.delete(&meta.key).await;
     }
+}
+
+/// What `AzureStore` declares: the mandatory set plus `multipart`, and no
+/// upload checksums (ADR-4158 D1), the same set as [`s3_expected_capabilities`].
+fn azure_expected_capabilities() -> Capabilities {
+    s3_expected_capabilities()
+}
+
+/// `AzureStore` against the in-process fake Azure endpoint, in every run. A
+/// page size of 2 so listing crosses page tokens.
+#[tokio::test]
+async fn azure_store_contract_against_the_fake() {
+    let fake = FakeAzure::start("ravelcontract", "ravel-contract")
+        .await
+        .expect("bind the fake Azure endpoint");
+    let mut config = fake.config();
+    config.list_page_size = 2;
+    let store = AzureStore::new(config)
+        .await
+        .expect("AzureStore against the fake");
+    assert_eq!(store.capabilities(), azure_expected_capabilities());
+
+    run_contract_suite(&store, "azure-fake").await;
+    azure_pinned_read_ordering(&store, "azure-fake").await;
+    azure_suffix_read_races_overwrites(&store, "azure-fake").await;
+
+    let requests = fake.requests();
+    // The multipart cases ran rather than taking the `multipart: false`
+    // refusal branch: the fake saw a Put Block List, and the completed object
+    // is there.
+    let block_lists = requests
+        .iter()
+        .filter(|r| r.method == "PUT" && r.query_param("comp") == Some("blocklist"))
+        .count();
+    assert!(block_lists > 0, "no Put Block List reached the fake");
+    assert_eq!(
+        fake.data_of("azure-fake/multipart/object").map(|d| d.len()),
+        Some(MULTIPART_PART_SIZE + MULTIPART_TAIL_SIZE)
+    );
+    // The suite's suffix reads went out as bounded ranges: the fake answers a
+    // suffix range with the whole blob, as Azure does (ADR-4158 D2).
+    let ranged_gets = requests
+        .iter()
+        .filter(|r| r.method == "GET" && r.header("range").is_some())
+        .count();
+    assert!(ranged_gets > 0, "no ranged GET reached the fake");
+    for request in &requests {
+        for name in ["range", "x-ms-range"] {
+            assert!(
+                request
+                    .header(name)
+                    .is_none_or(|range| !range.starts_with("bytes=-")),
+                "a suffix range reached the fake: {request:?}"
+            );
+        }
+    }
+}
+
+/// Pinned reads on `AzureStore` (docs/object-store-contract.md, "Conditional
+/// reads"). The pin's ETag is the precondition on every request a read sends,
+/// the HEAD of a suffix read included, and the pin carries a version selector
+/// only when the account has blob versioning on. Azure gives every write a new
+/// ETag, so an identical rewrite already makes an ETag-only pin stale.
+async fn azure_pinned_read_ordering(store: &AzureStore, root: &str) {
+    let key = format!("{root}/pinned/k");
+    let bytes = Bytes::from_static(b"pinned");
+    let wrong_etag = "\"0x8DE00000000000F\"";
+
+    let absent = Pin::from_store(wrong_etag, None);
+    for range in [GetRange::Full, GetRange::Suffix(3)] {
+        let read = store
+            .get_pinned(&format!("{root}/pinned/absent"), range, &absent)
+            .await;
+        assert!(
+            matches!(read, Err(StoreError::NotFound)),
+            "absent key with a pin, {range:?}: {read:?}"
+        );
+    }
+
+    store
+        .put(&key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("put");
+    let (meta, live) = store.pin_of(&key).await.expect("pin_of");
+    assert_eq!(meta.etag.0, live.etag, "the pin's ETag is the HEAD's");
+    assert_eq!(meta.version.0, live.etag, "the version token is the ETag");
+
+    let wrong = Pin::from_store(wrong_etag, live.version.clone());
+    for range in [GetRange::Full, GetRange::Suffix(3)] {
+        let read = store.get_pinned(&key, range, &wrong).await;
+        assert!(
+            matches!(read, Err(StoreError::PreconditionFailed)),
+            "live blob, wrong ETag, {range:?}: {read:?}"
+        );
+    }
+    let read = store
+        .get_pinned(&key, GetRange::Full, &live)
+        .await
+        .expect("live blob, its own ETag");
+    assert_eq!(read.outcome.data, bytes);
+    assert_eq!(read.outcome.etag.0, live.etag);
+    let read = store
+        .get_pinned(&key, GetRange::Suffix(3), &live)
+        .await
+        .expect("suffix of the live blob, its own ETag");
+    assert_eq!(read.outcome.data, Bytes::from_static(b"ned"));
+    assert_eq!(read.outcome.total_size, 6);
+
+    // An identical rewrite moves the ETag (ADR-4158, Measured P5).
+    store
+        .put(&key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("identical rewrite");
+    let (_, replaced) = store.pin_of(&key).await.expect("pin_of");
+    assert_ne!(replaced.etag, live.etag, "an identical rewrite keeps its ETag");
+    for range in [GetRange::Full, GetRange::Suffix(3)] {
+        let read = store.get_pinned(&key, range, &live).await;
+        match live.version {
+            // An ETag-only pin of a replaced blob is a failed precondition.
+            None => assert!(
+                matches!(read, Err(StoreError::PreconditionFailed)),
+                "replaced blob, ETag-only pin, {range:?}: {read:?}"
+            ),
+            // With blob versioning on, the pin selects the version it names,
+            // which still holds its own ETag and bytes.
+            Some(_) => {
+                let read = read.expect("the pinned version is still kept");
+                assert_eq!(read.pin.etag, live.etag, "{range:?}");
+            }
+        }
+    }
+    store.delete(&key).await.expect("delete");
+}
+
+/// Suffix reads racing a writer that replaces the blob with contents of other
+/// lengths. Every read that succeeds returns the suffix of one version: its
+/// fill byte names the version, and the length it reports is that version's.
+/// A read the writer outran on every round is `Transient`, never mixed bytes.
+async fn azure_suffix_read_races_overwrites(store: &AzureStore, root: &str) {
+    const VERSIONS: u8 = 20;
+    const SUFFIX: u64 = 16;
+    let key = format!("{root}/suffix-race/k");
+    let version_len = |fill: u8| 64 + usize::from(fill - b'a') * 7;
+    let version = |i: u8| Bytes::from(vec![b'a' + i; version_len(b'a' + i)]);
+    store
+        .put(&key, version(0), PutOptions::default())
+        .await
+        .expect("seed the raced blob");
+
+    let writer = async {
+        for i in 1..VERSIONS {
+            store
+                .put(&key, version(i), PutOptions::default())
+                .await
+                .expect("overwrite");
+            tokio::task::yield_now().await;
+        }
+    };
+    let reader = async {
+        let mut served = 0usize;
+        for _ in 0..usize::from(VERSIONS) * 2 {
+            match store.get(&key, GetRange::Suffix(SUFFIX)).await {
+                Ok(read) => {
+                    let fill = read.data[0];
+                    assert!(
+                        (b'a'..b'a' + VERSIONS).contains(&fill),
+                        "fill byte {fill}"
+                    );
+                    assert!(
+                        read.data.iter().all(|b| *b == fill),
+                        "bytes of two versions in one suffix read: {:?}",
+                        read.data
+                    );
+                    assert_eq!(read.data.len(), 16);
+                    assert_eq!(
+                        read.total_size,
+                        u64::try_from(version_len(fill)).expect("length fits u64"),
+                        "the reported length is the served version's"
+                    );
+                    served += 1;
+                }
+                Err(StoreError::Transient(_)) => {}
+                Err(other) => panic!("suffix read raced by an overwrite: {other:?}"),
+            }
+            tokio::task::yield_now().await;
+        }
+        served
+    };
+    let ((), served) = futures::join!(writer, reader);
+    assert!(served > 0, "every raced suffix read gave up");
+
+    let last = store
+        .get(&key, GetRange::Suffix(SUFFIX))
+        .await
+        .expect("suffix read once the writer stopped");
+    assert_eq!(last.data, version(VERSIONS - 1).slice(..16));
+    store.delete(&key).await.expect("delete");
+}
+
+/// Run-unique key root for a test against a long-lived container.
+fn azure_run_root(lane: &str) -> String {
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the epoch")
+        .as_nanos();
+    format!("contract-{lane}-{run_id}")
+}
+
+async fn azure_contract_cases(store: &AzureStore, root: &str) {
+    assert_eq!(store.capabilities(), azure_expected_capabilities());
+    run_contract_suite(store, root).await;
+    azure_pinned_read_ordering(store, root).await;
+    azure_suffix_read_races_overwrites(store, root).await;
+    assert!(
+        store.observed_store_time_ns().is_some(),
+        "every Azure response carries a Date header"
+    );
+    let leftovers = list_all(store, &format!("{root}/"))
+        .await
+        .expect("list_all for cleanup");
+    for meta in leftovers {
+        let _ = store.delete(&meta.key).await;
+    }
+}
+
+/// `AzureStore` against the Azurite emulator, gated on `RAVEL_AZURITE_URL`,
+/// the emulator's account URL (`http://127.0.0.1:10000/devstoreaccount1`).
+/// `RAVEL_AZURITE_ACCOUNT_KEY` is the account's base64 shared key and is
+/// required once the URL is set. Optional overrides: `RAVEL_AZURITE_ACCOUNT`
+/// (default `devstoreaccount1`) and `RAVEL_AZURITE_CONTAINER` (default
+/// `ravel-object-store-test`, which must already exist: this crate does not
+/// create containers).
+#[tokio::test]
+async fn azurite_contract() {
+    let Ok(url) = env::var("RAVEL_AZURITE_URL") else {
+        println!("skipping Azurite contract test: RAVEL_AZURITE_URL not set");
+        return;
+    };
+    let account =
+        env::var("RAVEL_AZURITE_ACCOUNT").unwrap_or_else(|_| "devstoreaccount1".to_string());
+    let container = env::var("RAVEL_AZURITE_CONTAINER")
+        .unwrap_or_else(|_| "ravel-object-store-test".to_string());
+    let key = env::var("RAVEL_AZURITE_ACCOUNT_KEY")
+        .expect("RAVEL_AZURITE_ACCOUNT_KEY must be set together with RAVEL_AZURITE_URL");
+    let mut config = AzureConfig::new(account, container);
+    config.allow_http = url.starts_with("http://");
+    config.endpoint = Some(url);
+    config.test_account_key = Some(TestAccountKey(key));
+    config.list_page_size = 2;
+    let store = AzureStore::new(config)
+        .await
+        .expect("AzureStore against Azurite");
+
+    azure_contract_cases(&store, &azure_run_root("azurite")).await;
+}
+
+/// `AzureStore` against a real container, gated on `RAVEL_AZURE_TEST_ACCOUNT`
+/// and `RAVEL_AZURE_TEST_CONTAINER`. The container must already exist, on a
+/// flat-namespace account; credentials are the ambient ones `AzureStore`
+/// reads (workload identity, `AZURE_STORAGE_ACCOUNT_KEY`, or the instance
+/// metadata service). Keys go under a run-unique root and are deleted
+/// afterwards.
+#[tokio::test]
+async fn azure_contract() {
+    let (Ok(account), Ok(container)) = (
+        env::var("RAVEL_AZURE_TEST_ACCOUNT"),
+        env::var("RAVEL_AZURE_TEST_CONTAINER"),
+    ) else {
+        println!(
+            "skipping Azure contract test: RAVEL_AZURE_TEST_ACCOUNT and \
+             RAVEL_AZURE_TEST_CONTAINER not both set"
+        );
+        return;
+    };
+    let mut config = AzureConfig::new(account, container);
+    config.list_page_size = 2;
+    let store = AzureStore::new(config)
+        .await
+        .expect("AzureStore with ambient credentials");
+
+    azure_contract_cases(&store, &azure_run_root("azure")).await;
 }
