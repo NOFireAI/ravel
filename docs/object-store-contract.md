@@ -1145,7 +1145,8 @@ The connector counts every request as an attempt; `StoreMetrics` counts one
 Listing is List Blobs (`<container>?restype=container&comp=list`), with
 `prefix`, `maxresults` (`AzureConfig::list_page_size`, the S3 adapter's page
 size by default, for `list` and `list_after`, and a fixed 1000 for
-`list_delimited`), `delimiter=/` for `list_delimited`, and the service's
+`list_delimited`; a configured size of 0 or above 5000, the service's
+maximum, is refused at construction with `Permanent`), `delimiter=/` for `list_delimited`, and the service's
 opaque `marker` to continue within one call. `list_after` sends
 `startFrom=<start_after>`, which is inclusive, and drops every returned name
 that is not greater than `start_after` whether or not the service honoured
@@ -1176,7 +1177,8 @@ once the retries run out, surface as a retryable error.
 
 Both clients send through the S3 adapter's connector, scoped to the store's
 own host (`<account>.blob.core.windows.net`, or the endpoint's host and
-port), so `ravel_store_attempts_total` counts every attempt inside an
+port, with the scheme's default port, 443 or 80, left out as a request URI
+leaves it out), so `ravel_store_attempts_total` counts every attempt inside an
 operation and each response's `Date` feeds `observed_store_time_ns`. A token
 request to Microsoft Entra ID or the instance metadata service goes to
 another host and is neither counted nor dated. As on S3 and GCS, the

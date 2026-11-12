@@ -10,7 +10,8 @@ use super::list::{
     parse_list, parse_xml,
 };
 use super::{
-    AzureConfig, AzureStore, CREDENTIAL_ENV_KEYS, CredentialEnv, SUFFIX_ROUNDS, store_authority,
+    AzureConfig, AzureStore, CREDENTIAL_ENV_KEYS, CredentialEnv, MAX_LIST_PAGE_SIZE, SUFFIX_ROUNDS,
+    store_authority,
 };
 use crate::conformance::{Property, run_conformance_suite_with_seeder};
 use crate::s3::SigningClock;
@@ -1588,9 +1589,11 @@ async fn configuration_is_validated_before_any_request() {
     bad.push(AzureConfig::new("Acct", "box"));
     bad.push(AzureConfig::new("acct", "Box"));
     bad.push(AzureConfig::new("", "box"));
-    let mut config = fake.config();
-    config.list_page_size = 0;
-    bad.push(config);
+    for page_size in [0, MAX_LIST_PAGE_SIZE + 1] {
+        let mut config = fake.config();
+        config.list_page_size = page_size;
+        bad.push(config);
+    }
     let mut config = fake.config();
     config.endpoint = Some(format!(
         "http://user:secret@{}",
@@ -1603,10 +1606,18 @@ async fn configuration_is_validated_before_any_request() {
             Err(StoreError::Permanent(message)) => {
                 assert!(!message.contains("secret"), "{message}");
             }
-            other => panic!("{config:?}: {other:?}"),
+            other => panic!("{config:?}: {:?}", other.map(|_| "built")),
         }
     }
     assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+
+    for page_size in [1, MAX_LIST_PAGE_SIZE] {
+        let mut config = fake.config();
+        config.list_page_size = page_size;
+        AzureStore::new(config)
+            .await
+            .unwrap_or_else(|e| panic!("page size {page_size}: {e:?}"));
+    }
 }
 
 #[test]
@@ -1619,6 +1630,22 @@ fn the_store_authority_is_the_endpoints_host_and_port() {
         store_authority("acct", Some("http://127.0.0.1:10000/acct")).expect("emulator"),
         "127.0.0.1:10000"
     );
+    // A request URI leaves out the scheme's default port.
+    for (endpoint, authority) in [
+        ("https://host.example:443/acct", "host.example"),
+        ("HTTPS://host.example:443", "host.example"),
+        ("http://127.0.0.1:80/acct", "127.0.0.1"),
+        ("http://[::1]:80/acct", "[::1]"),
+        ("https://host.example:80/acct", "host.example:80"),
+        ("http://host.example:443/acct", "host.example:443"),
+        ("http://[::1]/acct", "[::1]"),
+    ] {
+        assert_eq!(
+            store_authority("acct", Some(endpoint)).expect("endpoint"),
+            authority,
+            "{endpoint}"
+        );
+    }
     assert!(store_authority("acct", Some("http:///acct")).is_err());
 }
 
