@@ -151,7 +151,17 @@ c6a.large (one slot) and `bits` 8 at least 16,416. The M8 and publication
 boxes were stamped at 8,320 or more, which allows `bits` 7; whether they
 allow 8 depends on the hard limit ravel-server raised the soft limit to,
 which those runs did not record. Past the descriptor limit the derivation
-returns `too_many_bits` and the statement keeps the sort-merge retry.
+returns `descriptor_budget` and the statement keeps the sort-merge retry.
+
+Under this rule `chunk_too_small` can no longer be returned: `bits` is chosen
+so that a floor-sized chunk fits beside the table, and `routed_chunk_rows`
+is the largest chunk that fits in the same area, so it is never below the
+floor. A route that cannot tune now reports `descriptor_budget` when the
+`bits` it needs exceed the descriptor budget, or `too_many_bits` when no
+`bits` up to `BUCKETED_FINAL_AGGREGATE_MAX_BITS` (16) satisfies both
+conditions. Statement 33 on c6a.large reported `chunk_too_small` in M8; a
+box that still cannot tune it reports one of these two instead, and the M9
+judge reads them as no tuning.
 
 ADR-3565 item 5 says the slack from rounding `bits` up is extra safety
 against an under-shoot. Under this rule the chunks spend that slack in
@@ -245,17 +255,19 @@ LargeUtf8, Utf8View, Binary, LargeBinary or BinaryView.
   refused a grow. For a variable-width route a slice is cut the way a chunk
   seals: it ends when the next row would take it past `B` bytes, or at
   8,192 rows, and a single row larger than `B` is a slice of its own. The
-  uncharged bound per stream is one slice of at most `B` bytes plus its
-  bucket split's take indices (4 B per row), or one oversized row, whose
-  bytes the stock table held under its charge at the refusal. This replaces
-  ADR-3565 item 3's `c x (w + 12)` for these routes.
+  uncharged bound per stream is one slice of at most `B` bytes plus 12 B
+  per row for its hashes and order (8 + 4 B, as in the router's scratch)
+  plus the pieces' validity and per-bucket offsets, or one oversized row,
+  whose bytes the stock table held under its charge at the refusal. The
+  router's fixed scratch for these routes is sized to a slice's 8,192-row
+  cap. This replaces ADR-3565 item 3's `c x (w + 12)` for these routes.
 - **The derivation.** `bits` comes from `T`, as now. The chunk budget is
   `B = floor((S - table(bits)) / (2^bits + 1))`, the same area decision 1
   gives a fixed-width route's chunks. No bytes-per-row input is needed.
 - **The floor.** For a variable-width route the floor is `B_min` = 16 KiB.
   In decision 1's second `bits` condition, `b(c_min)` is `B_min` for these
-  routes, and a `B` below it returns `chunk_too_small`, as for a fixed-width
-  route. 16 KiB is chosen as a number: a 16 KiB chunk still carries about
+  routes, so `B` is never below it; a route whose budget cannot reach it
+  reports `too_many_bits` or `descriptor_budget`, as decision 1 says. 16 KiB is chosen as a number: a 16 KiB chunk still carries about
   118 rows of statement 34's 114.6 B average URL plus its 24 B of view and
   count, and it fits the smallest budget the prediction found on any box at
   `bits` 8 (31,698 B on c6a.large). On
@@ -368,10 +380,12 @@ flowchart TD
 - Fixed-width routing, which M8 and the publication runs validated, changes
   only in its chunk size (decision 1). Nothing is combined before it is
   written (decision 4).
-- This ADR keeps the `retry_plan_reason` strings already shipped
-  (`chunk_too_small`, `not_fixed_width`) unchanged, so dashboards and the M8
-  and M9 judges read the same values; a string-keyed route that cannot tune
-  reports `chunk_too_small` as a fixed-width one does.
+- This ADR keeps the `retry_plan_reason` strings already shipped unchanged,
+  so dashboards and the M8 and M9 judges read the same values.
+  `not_fixed_width` remains for a key type decision 3 does not admit.
+  `chunk_too_small` keeps its string but is no longer returned (decision
+  1); a route that cannot tune reports `descriptor_budget` or
+  `too_many_bits`, whatever its key type.
 - Production cases this leaves exposed, stated for the release notes: a
   string-keyed retry under memory pressure writes out, uncharged, the rows
   the router already holds, which at an engage is the whole engage state; a
