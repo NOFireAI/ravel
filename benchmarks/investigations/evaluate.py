@@ -136,11 +136,13 @@ FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field", "key_in
 # Stamps of ADR-3939's multi-day states: stamp.<what>.<label> reads
 # stamps/STATE.LABEL.<kind>.json. box/run.sh state_retired_hour writes the
 # fold_binary, tombstone and retired_resolve stamps (the last from `rlog
-# footprint --tenant`, which lists what a catalog resolve returns), and
-# state_day_parts writes its own fold_binary stamp, so in a run where the
-# state is live their absence is missing.
+# footprint --tenant`, which lists what a catalog resolve returns) and
+# retired_part_puts stamps (inv.py part-puts, read for STATE and
+# STATE_drop), and state_day_parts writes its own fold_binary stamp, so in
+# a run where the state is live their absence is missing.
 H1B_STAMPS = {"fold_binary_pre_r2": "fold_binary", "fold_binary_carries_r2": "fold_binary",
-              "tombstoned_hour": "tombstone", "retired_hour_segments": "retired_resolve"}
+              "tombstoned_hour": "tombstone", "retired_hour_segments": "retired_resolve",
+              "retired_part_puts": "retired_part_puts", "drop_retired_part_puts": "retired_part_puts"}
 
 # Fold report fields under their names in a `catalog fold --json` report and
 # in a `--rebuild-key-index` report.
@@ -1267,6 +1269,18 @@ def stamp_figure(stamps, census, cfg, state, metric):
         return "value", doc["footer_len"], ""
     if what == "drop_parts_holding_hour":
         return drop_parts_holding_hour(stamps, state, label)
+    if what in ("retired_part_puts", "drop_retired_part_puts"):
+        # W3's part PUTs, of the fold at the tombstone or (drop_) of the one
+        # at the day's last tombstone, which state STATE_drop stamps.
+        st = f"{state}_drop" if what.startswith("drop_") else state
+        name = f"stamps/{st}.{label}.retired_part_puts.json"
+        doc = stamps.doc(st, label, "retired_part_puts")
+        if doc is None:
+            return "missing", None, f"no {name} (box/run.sh state_retired_hour writes it)"
+        v = doc.get("new_in_range")
+        if not isinstance(v, int) or isinstance(v, bool):
+            return "missing", None, f"{name} carries no new_in_range"
+        return "value", v, ""
     if what in H1B_STAMPS:
         name = f"stamps/{state}.{label}.{H1B_STAMPS[what]}.json"
         doc = stamps.doc(state, label, H1B_STAMPS[what])
