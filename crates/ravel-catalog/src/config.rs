@@ -403,8 +403,9 @@ pub const DEFAULT_FOLD_BUCKET_CONCURRENCY: usize = 8;
 /// under it; ADR-3692 decision 5).
 pub const DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS: u64 = 8_000_000;
 /// Default `metrics_label_index_max_ratio_ppm`: 10,000 parts per million, a
-/// ratio of 0.01. Predicted, not measured: ADR-3694 decision 2's
-/// `KEY_INDEX_LEAF_BYTES_CAP` of 1% of a part's data bytes.
+/// ratio of 0.01: ADR-3694 decision 2's `KEY_INDEX_LEAF_BYTES_CAP` of 1% of
+/// a part's data bytes. The ADR-3694 Stage 1 acceptance amendment (row 7)
+/// measured leaf bytes at 0.77% of the re-encoded parts' data bytes.
 pub const DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM: u32 = 10_000;
 /// Default `fold_reconcile_window_hours`: how far back of the previous fold's
 /// watermark the post-fold reconcile pass re-lists commit buckets to catch a
@@ -759,13 +760,14 @@ pub struct CatalogConfig {
     /// Takes effect only together with [`Self::build_key_index_leaves`]; with
     /// either off the fold reads no LABEL_DICT and writes no metrics leaf.
     /// While the tenant has a pending metrics erasure request the fold
-    /// writes no metrics leaf. Default `false`.
+    /// writes no metrics leaf. Default `true` (the ADR-3694 Stage 1
+    /// acceptance amendment), so it follows [`Self::build_key_index_leaves`].
     pub metrics_label_index: bool,
     /// The byte cap on one part's metrics `label_value` leaves, as parts per
     /// million of the summed object sizes of the part's entries: a part whose
     /// leaves would exceed it gets no `label_value` leaf. Default
-    /// [`DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM`] (a ratio of 0.01), a
-    /// predicted figure. Stored as an integer so the config stays `Eq`.
+    /// [`DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM`] (a ratio of 0.01).
+    /// Stored as an integer so the config stays `Eq`.
     pub metrics_label_index_max_ratio_ppm: u32,
     /// How far back of the previous fold's watermark the post-fold reconcile
     /// pass re-lists commit buckets, in hours (ADR-0063 section 4). Each fold
@@ -915,7 +917,7 @@ impl Default for CatalogConfig {
             fold_bucket_concurrency: DEFAULT_FOLD_BUCKET_CONCURRENCY,
             build_key_index_leaves: false,
             key_index_build_max_pairs: DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
-            metrics_label_index: false,
+            metrics_label_index: true,
             metrics_label_index_max_ratio_ppm: DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM,
             fold_reconcile_window_hours: DEFAULT_FOLD_RECONCILE_WINDOW_HOURS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,

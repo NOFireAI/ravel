@@ -2570,9 +2570,8 @@ mod catalog_cache_tests {
         );
     }
 
-    /// `--fold-metrics-label-index` reaches the catalog both the scheduled
-    /// and the on-demand fold run with, and the metrics leaf stays off
-    /// without it.
+    /// The fold's metrics label-index switch reaches the catalog both the
+    /// scheduled and the on-demand fold run with, and is on by default.
     #[test]
     fn build_catalog_for_server_maps_the_metrics_label_index_switch() {
         for enabled in [false, true] {
@@ -2595,8 +2594,8 @@ mod catalog_cache_tests {
             );
         }
         assert!(
-            !crate::FoldTaskConfig::default().metrics_label_index,
-            "the metrics leaf build is off by default"
+            crate::FoldTaskConfig::default().metrics_label_index,
+            "the metrics leaf build is on by default"
         );
     }
 

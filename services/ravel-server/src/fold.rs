@@ -79,10 +79,11 @@ pub struct FoldTaskConfig {
     /// [`ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`].
     pub key_index_build_max_pairs: u64,
     /// Whether those folds also build the metrics `label_value` leaf
-    /// (`--fold-metrics-label-index`, ADR-3694 decision 2), mapped onto
-    /// `CatalogConfig::metrics_label_index` by
+    /// (ADR-3694 decision 2; `--no-fold-metrics-label-index` turns it off),
+    /// mapped onto `CatalogConfig::metrics_label_index` by
     /// [`crate::query::build_catalog_for_server`]. It takes effect only with
-    /// `build_key_index_leaves`. Default `false`.
+    /// `build_key_index_leaves`. Default `true` (the ADR-3694 Stage 1
+    /// acceptance amendment).
     pub metrics_label_index: bool,
 }
 
@@ -115,7 +116,7 @@ impl Default for FoldTaskConfig {
             fold_interval: DEFAULT_FOLD_INTERVAL,
             build_key_index_leaves: false,
             key_index_build_max_pairs: ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
-            metrics_label_index: false,
+            metrics_label_index: true,
         }
     }
 }

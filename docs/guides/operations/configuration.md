@@ -2095,8 +2095,10 @@ uncovered.
 `--fold-key-index-build-max-pairs N` (ravel-server) and
 `--key-index-build-max-pairs N` (`ravel-cli catalog fold`) bound the
 (entry, key8) pairs the build holds for one part at once, the pairs read
-and the pairs carried from previous parts' leaves together. A metrics fold with
-`--metrics-label-index` on also holds up to N more: the LABEL_DICT pairs
+and the pairs carried from previous parts' leaves together. A metrics fold
+building the `label_value` leaf (the default with leaves on, unless
+`--no-metrics-label-index` or `--no-fold-metrics-label-index`) also holds
+up to N more: the LABEL_DICT pairs
 of objects its postings build fetched whole, only for the parts it builds a
 leaf for, each part's pairs released once its leaf is built. Every field the
 build indexes gets a fixed share, `max(1, N / fields)`. Each flag is
@@ -2155,13 +2157,25 @@ section GETs.
 
 ### Metrics label-value leaves
 
-`--fold-metrics-label-index` (ravel-server) makes every fold the process
-runs, scheduled and on-demand, also build the metrics `label_value` leaf
-from each metrics object's LABEL_DICT, the server counterpart of `ravel-cli
-catalog fold --metrics-label-index`. It is off by default, refused without
-`--fold-key-index-leaves`, and refused in `--mode gateway`, which runs no
-fold. While a tenant has a pending metrics erasure the fold writes no
-metrics leaf.
+With `--fold-key-index-leaves` (ravel-server) or `--key-index-leaves`
+(`ravel-cli catalog fold`), every fold, scheduled and on-demand, also
+builds the metrics `label_value` leaf from each metrics object's
+LABEL_DICT by default. `--no-fold-metrics-label-index` (ravel-server) and
+`--no-metrics-label-index` (`ravel-cli catalog fold`) turn it off. Without
+the leaf build flag no leaf is built and the opt-out changes nothing; the
+server refuses the opt-out in `--mode gateway`, which runs no fold. While a
+tenant has a pending metrics erasure the fold writes no metrics leaf.
+
+An operator already running `--fold-key-index-leaves` for logs or spans
+starts building metrics leaves on upgrade. The first fold with the leaf on
+reads each metrics object's footer and LABEL_DICT: the Stage 1 acceptance
+measurement counted 202,931 GETs for 25,401 objects, about 8
+per object, and leaf bytes of 0.77 % of the re-encoded parts' data bytes.
+The per-advance cost after that first fold was not measured. Metrics days
+sealed before the upgrade carry no leaf: each fold counts them in
+`key_index_parts_missing_declared_leaves` and warns until `ravel-cli catalog
+fold --rebuild-key-index --signal metrics` attaches it. Pass the opt-out to
+keep the previous behavior.
 
 Once a part carries the leaf, a PromQL selector's positive equality values
 (`__name__` included) are routed through it before any object is opened,

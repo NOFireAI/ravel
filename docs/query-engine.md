@@ -1163,7 +1163,8 @@ routing pass per value) as its own one-key set: field `label_value`, key
 type `Str`, `key8(v)` (the ADR's per-value routing amendment). A part whose metrics leaf answers "absent"
 proves that no object in it holds the string `v`, so no series in it carries
 `k="v"`. The leaf exists only on parts a fold built with
-`--fold-key-index-leaves` and `--fold-metrics-label-index`.
+`--fold-key-index-leaves` and without `--no-fold-metrics-label-index`
+(the metrics leaf is on by default wherever leaves are built).
 
 - A selector plan (a distinct matcher set) drops a segment when any of its
   values routes it `Pruned`: the values are a conjunction. `Blocks` and

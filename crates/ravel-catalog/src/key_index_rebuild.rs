@@ -2135,7 +2135,26 @@ mod tests {
                 if declared == &vec![ravel_rspan::TRACE_ID_FIELD.to_string()]),
             "{err:?}"
         );
-        let err = catalog
+        // Metrics objects carry no KEY_IDX: the metrics rebuild declares only
+        // `label_value`, which the default config builds, and is refused
+        // with `metrics_label_index` off.
+        let metrics = rebuild(&catalog, Signal::Metrics).await;
+        assert_eq!(
+            metrics,
+            KeyIndexRebuildReport {
+                fields: vec!["label_value".to_string()],
+                ..KeyIndexRebuildReport::default()
+            }
+        );
+        let no_label_index = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                metrics_label_index: false,
+                ..*catalog.config()
+            },
+        )
+        .expect("catalog");
+        let err = no_label_index
             .rebuild_key_index(
                 &tenant(),
                 Signal::Metrics,

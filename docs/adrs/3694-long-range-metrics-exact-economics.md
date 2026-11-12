@@ -282,8 +282,14 @@ ADR-2707 and ADR-3692 already impose on logs and spans leaves.
   rule as `.cstat` and the logs `.kidx` do: while the tenant's `del/`
   listing is non-empty the router prunes nothing on metrics (read: while
   an erasure request is pending, see the erasure rule correction below), an erasure
-  rewrite supersedes the inputs, the next fold re-encodes the part and
-  writes a new leaf, and the stale leaf is swept as unreferenced.
+  rewrite supersedes the inputs, and the stale leaf is swept as
+  unreferenced. The refold that drops the erased inputs runs while the
+  request is still pending, so it re-encodes the part under the erasure
+  gate with no leaf. The tail gets a new leaf from the first fold that
+  re-encodes it once no request is pending. A sealed day re-encoded under
+  the gate stays without a metrics leaf, and label-index routing prunes
+  none of its objects, until `ravel-cli catalog fold --rebuild-key-index`
+  attaches one (T10, #4145; docs/catalog-and-mvcc.md "Rollout").
 - **L1 parts** are indexed like L0 entries; a compaction record re-encodes
   the part and rebuilds its leaf (ADR-2707 decision 6). Nothing in
   `ravel-maintain` changes.
