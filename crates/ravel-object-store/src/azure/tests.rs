@@ -869,6 +869,91 @@ async fn attempts_and_observed_store_time_are_recorded() {
     assert_eq!(metrics.get_unverified(), 1, "the full read only");
 }
 
+/// A stand-in Microsoft Entra ID token endpoint on its own loopback port: it
+/// answers every request with a bearer token that expires at once, so the
+/// store fetches a fresh one inside every operation, and with a `Date` far
+/// from the fake's. The number of requests it served.
+async fn token_endpoint() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let app = axum::Router::new().fallback(move || {
+        let counter = Arc::clone(&counter);
+        async move {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (
+                [
+                    ("content-type", "application/json"),
+                    ("date", "Mon, 01 Jan 2001 00:00:00 GMT"),
+                ],
+                r#"{"access_token":"workload-token","token_type":"Bearer","expires_in":0}"#,
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the token endpoint");
+    let addr = listener.local_addr().expect("token endpoint address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), hits)
+}
+
+#[tokio::test]
+async fn workload_identity_tokens_are_fetched_from_another_host_uncounted() {
+    let fake = fake().await;
+    let (authority_host, token_requests) = token_endpoint().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let token_file = dir.path().join("token");
+    std::fs::write(&token_file, "service-account-jwt").expect("write the token file");
+    let env = CredentialEnv {
+        federated_token_file: Some(token_file.to_string_lossy().into_owned()),
+        client_id: Some("client".into()),
+        tenant_id: Some("tenant".into()),
+        authority_host: Some(authority_host),
+        account_key: None,
+    };
+    let mut config = fake.config();
+    config.skip_signature = false;
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = AzureStore::build(
+        config,
+        Arc::clone(&metrics),
+        env,
+        Arc::new(FixedClock(1_800_000_000)),
+    )
+    .await
+    .expect("a store authenticated by workload identity");
+    let fetched_at_construction = token_requests.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(fetched_at_construction > 0, "no token was fetched");
+
+    store
+        .put("w/k", Bytes::from_static(b"value"), PutOptions::default())
+        .await
+        .expect("put");
+    store.get("w/k", GetRange::Full).await.expect("get");
+    store.list("w/", None).await.expect("list");
+
+    assert!(
+        token_requests.load(std::sync::atomic::Ordering::SeqCst) > fetched_at_construction,
+        "no token was fetched inside an operation, so nothing was excluded"
+    );
+    let snapshot = metrics.snapshot();
+    for op in [StoreOp::Put, StoreOp::Get, StoreOp::List] {
+        assert_eq!(snapshot.op(op).attempts, 1, "{op:?}: the store request only");
+    }
+    assert_eq!(store.observed_store_time_ns(), Some(fake.date_unix_ns()));
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 4, "account information, put, get, list");
+    for request in &requests {
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer workload-token"),
+            "{request:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn shared_key_requests_verify_and_a_wrong_key_is_access_denied() {
     let fake = fake().await;

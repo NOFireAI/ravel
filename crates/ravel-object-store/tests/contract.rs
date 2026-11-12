@@ -529,7 +529,7 @@ async fn assert_mandatory_capabilities(store: &dyn ObjectStoreBackend, prefix: &
     // `required_capabilities(Mode::Maintain)` demands. `upload_checksum` is not
     // part of `Capabilities::mandatory()` (a permanent
     // `object_store` 0.14 client-library limitation, not an endpoint-specific
-    // gap, so requiring it made the only durable backend unstartable
+    // gap, so requiring it made the S3 backend unstartable
     // everywhere). `S3Store::capabilities()` is a constant of the adapter, not
     // a function of the endpoint, so this asserts the same thing for floci as
     // it would for RustFS or real AWS S3. Written as an exact equality rather
