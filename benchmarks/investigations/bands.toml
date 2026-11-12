@@ -2662,7 +2662,7 @@ source = "predicted"
 # retired_hour), then the fold at the day's last tombstone (transition
 # retired_hour_drop). box/run.sh state_retired_hour stamps the tombstoned
 # hour (stamps/retired_hour.logs.tombstone.json hour). Before each fold it
-# loads a tail hour into dp7 so the fold advances, so fold-wide counters
+# loads a tail hour into dp7, so the fold publishes a new tail and fold-wide counters
 # would count the tail's part and leaves, and a part sealed because the
 # tail's UTC day differs from the previous tail's, on either fold, whatever
 # decision 6 does for the tombstoned day. The part PUTs are
