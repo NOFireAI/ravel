@@ -136,9 +136,9 @@ benchmarks/clickbench/kit/fetch-gcp.sh --run-toml benchmarks/clickbench/kit/runs
 ```
 
 It polls `out/A/` for `DONE` or `FAILED`, and exits 6 if the instance is gone
-with neither. A Claude Code session should run it with `--timeout 540` under a
-relaunch loop, since the harness stops a background command after about ten
-minutes; exit 3 means the timeout elapsed and it is safe to start again.
+with neither. Where background commands are stopped after about ten minutes,
+run it with `--timeout 540` under a relaunch loop; exit 3 means the timeout
+elapsed and it is safe to start again.
 
 On `DONE` it downloads the results under `clickbench-runs/<run-id>/`, writes
 `<machine>.json` in ClickBench's results format, and runs `kit.py prereg`
