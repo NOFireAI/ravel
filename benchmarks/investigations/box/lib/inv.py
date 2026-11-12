@@ -1544,6 +1544,28 @@ def cmd_maint_records(args):
             f"(shard/hour/file): {new[:10]}")
 
 
+def cmd_fold_watermark(args):
+    """The watermark a retention fold started and ended at, from its --json
+    report (previous_watermark_hour, watermark_hour), written to --out; exit
+    1 when it did not advance. A fold whose watermark does not advance
+    returns before its retention-frontier reconcile, so it never observes a
+    tombstone and its counters measure nothing."""
+    try:
+        with open(args.report) as f:
+            report = extract_report(f.read())
+    except OSError as e:
+        die(f"fold-watermark: {e}", 70)
+    if report is None:
+        die(f"fold-watermark: {args.report} holds no JSON fold report", 70)
+    before, after = report.get("previous_watermark_hour"), report.get("watermark_hour")
+    advanced = isinstance(before, int) and isinstance(after, int) and after > before
+    write_json(args.out, {"state": args.state, "previous_watermark_hour": before, "watermark_hour": after,
+                          "no_op": report.get("no_op"), "advanced": advanced})
+    if not advanced:
+        die(f"fold-watermark: the {args.state} fold's watermark went from {before} to {after}, not forward: "
+            f"a fold that does not advance skips its retention-frontier reconcile and observes no tombstone")
+
+
 def git_commit(repo, ref):
     """The full SHA ref names in repo, or None when it names no commit."""
     if not ref:
@@ -1926,6 +1948,12 @@ def main():
     mr.add_argument("--signal-code", default="l")
     mr.add_argument("--out", required=True)
     mr.set_defaults(fn=cmd_maint_records)
+
+    fw = sub.add_parser("fold-watermark")
+    fw.add_argument("--report", required=True, help="the fold's `catalog fold --json` output")
+    fw.add_argument("--state", required=True)
+    fw.add_argument("--out", required=True)
+    fw.set_defaults(fn=cmd_fold_watermark)
 
     fb = sub.add_parser("fold-binary")
     fb.add_argument("--repo", required=True)

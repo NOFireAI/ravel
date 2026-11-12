@@ -487,10 +487,28 @@ before it loads anything, which is past the example's `run.max_minutes`
 (540) and leaves nothing of `box.max_minutes` (at most 600). A Stage 2 run
 therefore splits them: one run lists `day_parts_7` and `retired_hour`
 (about 320 minutes of corpus, then the loads, folds and statements, inside
-`run.max_minutes = 540`), and a second run lists `day_parts_30` (about 280
+`run.max_minutes = 590`), and a second run lists `day_parts_30` (about 280
 minutes of corpus). A run that keeps both must raise `run.max_minutes` and
 `box.max_minutes` past the corpus time plus the states' own steps, and 600
 does not hold that.
+
+**Run time with `retired_hour`.** Each of its two steps waits for the
+ingest hour after the last fold before its retention fold, so the state
+holds two ingest-hour waits. In D3' run A, `day_parts_7` and its advance
+finished about 498 minutes into a 540-minute run. The first wait ends at
+the next hour boundary, at most 60 minutes later (minute 558 at worst),
+and the maintain pass, at most `retired_hour.wait_minutes` (20), runs
+inside it. The tail load and the retention fold are budgeted at
+`step_estimate_minutes.retired_hour` (10) each, so `retired_hour` ends by
+minute 578 plus its refold and resolve. The drop's wait ends 60 minutes
+after the first, at minute 618 at worst, and its tail load and fold need
+20 more. So a run listing `day_parts_7` and `retired_hour` sets
+`run.max_minutes = 590`, under `box.max_minutes = 600`, and holds both
+steps when the first wait ends by minute 590 - 60 - 2 x 10 = 510, that
+is, when the advance's tail load, fold and census took at least 48
+minutes of its ingest hour. Otherwise the deadline check records
+`retired_hour_drop` not-run before its maintain pass, and evaluate and
+the upload still run inside the box's 600 minutes.
 
 **`day_parts_N`** runs these steps in order:
 
@@ -560,16 +578,30 @@ checkout's HEAD, which then does not name what was built).
 3. It stamps `stamps/retired_hour.logs.tombstone.json`. `hour`,
    `first_hour` and `last_hour` are in unix hours, the unit catalog part
    ranges count in.
-4. Two `ravel-cli catalog fold --writers-stopped --json --key-index-leaves
-   --retention-default Rs` follow. They are stamped in `folds.jsonl` as
-   `retired_hour` and `retired_hour_refold`.
-5. The transition, the census and the catalog stamp.
+4. It waits for the ingest hour after the last fold, at most
+   `run.mixed_wait_max_minutes`, and loads the tail corpus's logs into
+   `dp7` there in one batch flushed at once (load `retired_hour_tail`), so
+   each bucket gets one commit and nothing is left to compact. A fold
+   whose watermark does not advance, with no unfolded commit in an hour
+   it holds open, returns before its retention-frontier reconcile
+   (`crates/ravel-catalog/src/fold.rs`, the `advance_to`/`held_open`
+   match), so without the tail the fold below observes no tombstone.
+5. `ravel-cli catalog fold --writers-stopped --json --key-index-leaves
+   --retention-default Rs`, stamped in `folds.jsonl` as `retired_hour`.
+   `inv.py fold-watermark` stamps its `previous_watermark_hour` and
+   `watermark_hour` in `stamps/retired_hour.logs.fold_watermark.json` and
+   fails the state unless the watermark advanced, so a no-op fold is never
+   read as a measurement.
+6. A second fold with the same flags, stamped as `retired_hour_refold`.
+7. The transition, the census and the catalog stamp.
 
 The state sends no statement: its rows read fold and stamp figures only.
 
 **`retired_hour_drop`** (W3) repeats those steps with
 `retire_through retired_hour_drop 23`, which tombstones every hour of that
-day, D0 to D0 + 23. Its catalog stamp is
+day, D0 to D0 + 23, waits for the ingest hour after `retired_hour`'s folds
+and loads its own tail there (load `retired_hour_drop_tail`). Its catalog
+stamp is
 `stamps/retired_hour_drop.logs.catalog.json`.
 
 **How the tombstone is produced.**
@@ -636,8 +668,9 @@ cases under "Tests"), for three reasons:
   existing run; it does not re-run it.
 - Each advance waits up to `run.mixed_wait_max_minutes` (70) for the next
   ingest hour, once per state, on top of the smoke's own wait.
-- `retired_hour` waits for maintain retention: up to
-  `retired_hour.wait_minutes` (20) per step, twice.
+- `retired_hour` waits for maintain retention, up to
+  `retired_hour.wait_minutes` (20) per step, and then for the next ingest
+  hour, once per step.
 
 ### Placeholders
 
@@ -745,6 +778,7 @@ reports `missing stamps/<name>` for any it needs and does not find;
 | `STATE.server.json` | the server binary's sha256 and its flags |
 | `STATE.SIG.day_parts.json` | `day_parts_N` and its advance: the catalog stamp per part (`min_hour`, `max_hour`, UTC `day`, `one_day`, `entry_count`, `slices` per field), the HEAD `watermark_hour`, the `days` held and `part_count` |
 | `STATE.logs.fold_binary.json` | `retired_hour` and each `day_parts_N`: the fold binary's `sha`, run.toml's `c1_sha` and `r2_sha` resolved, and `carries_c1` and `carries_r2` by git ancestry |
+| `STATE.logs.fold_watermark.json` | `retired_hour` and `retired_hour_drop`: the retention fold's `previous_watermark_hour` and `watermark_hour` from its `--json` report, `no_op`, and `advanced`; the state fails when it is false |
 | `STATE.logs.tombstone.json` | `retired_hour` and `retired_hour_drop`: the tombstoned `hour` (D0) and `first_hour` to `last_hour` in unix hours, the retention window and the tombstone-check output |
 | `needle_blocks.json` | the logs needles' block counts as `rlog inspect` reads them, beside the generator's |
 | `compaction.jsonl`, `erasure.jsonl`, `not_run.jsonl` | the compaction child's reports, the erase submit and status, and each state recorded not-run |
