@@ -33,7 +33,9 @@
 //!   or past the end, or any range on an empty blob, is 416 `InvalidRange`.
 //!   `If-Match` naming another ETag is 412 `ConditionNotMet`. Any `versionid`
 //!   is 404 `BlobNotFound`: the fake keeps no versions. A missing blob is 404
-//!   `BlobNotFound`.
+//!   `BlobNotFound`, or 412 `ConditionNotMet` when the request carries
+//!   `If-Match` after [`FakeAzure::set_if_match_on_absent_is_412`], as
+//!   Azurite answers it.
 //! - `HEAD` a blob: the GET headers, no body; its errors keep only
 //!   `x-ms-error-code`.
 //! - `DELETE` a blob: 202, or 404 `BlobNotFound`.
@@ -167,6 +169,8 @@ struct Inner {
     hns: Mutex<HnsAnswer>,
     /// Leave `x-ms-is-hns-enabled` off the container URL's answer only.
     hns_on_account_url_only: AtomicBool,
+    /// Answer `If-Match` on an absent blob with 412, not 404.
+    if_match_on_absent_is_412: AtomicBool,
     shared_key: Mutex<Option<AccountKey>>,
 }
 
@@ -202,6 +206,7 @@ impl FakeAzure {
             encode_all_names: AtomicBool::new(false),
             hns: Mutex::new(HnsAnswer::False),
             hns_on_account_url_only: AtomicBool::new(false),
+            if_match_on_absent_is_412: AtomicBool::new(false),
             shared_key: Mutex::new(None),
         });
         let state = Arc::clone(&inner);
@@ -338,6 +343,15 @@ impl FakeAzure {
         self.inner
             .hns_on_account_url_only
             .store(account_url_only, Ordering::Relaxed);
+    }
+
+    /// Whether a GET or HEAD with `If-Match` on an absent blob is 412
+    /// `ConditionNotMet`, as Azurite answers, rather than 404 `BlobNotFound`,
+    /// as Azure does.
+    pub fn set_if_match_on_absent_is_412(&self, on: bool) {
+        self.inner
+            .if_match_on_absent_is_412
+            .store(on, Ordering::Relaxed);
     }
     /// Require a valid `SharedKey` signature with the base64 key `key` on
     /// every later request.
@@ -673,6 +687,9 @@ impl Inner {
 
     fn get_blob(&self, key: &str, range: Option<&str>, if_match: Option<&str>) -> Response {
         let Some(blob) = self.blobs.lock().get(key).cloned() else {
+            if if_match.is_some() && self.if_match_on_absent_is_412.load(Ordering::Relaxed) {
+                return error(StatusCode::PRECONDITION_FAILED, "ConditionNotMet");
+            }
             return error(StatusCode::NOT_FOUND, "BlobNotFound");
         };
         if let Some(expected) = if_match
