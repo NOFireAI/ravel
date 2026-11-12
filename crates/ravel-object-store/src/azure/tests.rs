@@ -1173,13 +1173,13 @@ async fn a_hierarchical_namespace_account_is_refused_at_construction() {
 }
 
 #[test]
-fn credentials_are_read_from_the_five_keys_only() {
+fn credentials_are_read_from_the_four_keys_only() {
     let asked = parking_lot::Mutex::new(Vec::new());
     let environment = [
         ("AZURE_FEDERATED_TOKEN_FILE", "/var/run/token"),
         ("AZURE_CLIENT_ID", "client"),
         ("AZURE_TENANT_ID", "tenant"),
-        ("AZURE_AUTHORITY_HOST", ""),
+        ("AZURE_AUTHORITY_HOST", "http://stray.example"),
         ("AZURE_STORAGE_ACCOUNT_KEY", "a2V5"),
         ("AZURE_STORAGE_SAS_KEY", "sv=stray"),
         ("AZURE_CLIENT_SECRET", "stray"),
@@ -1197,6 +1197,15 @@ fn credentials_are_read_from_the_five_keys_only() {
     })
     .expect("read");
 
+    assert_eq!(
+        CREDENTIAL_ENV_KEYS,
+        [
+            "AZURE_FEDERATED_TOKEN_FILE",
+            "AZURE_CLIENT_ID",
+            "AZURE_TENANT_ID",
+            "AZURE_STORAGE_ACCOUNT_KEY",
+        ]
+    );
     let mut asked = asked.into_inner();
     asked.sort();
     let mut expected: Vec<String> = CREDENTIAL_ENV_KEYS.iter().map(|k| k.to_string()).collect();
@@ -1208,8 +1217,8 @@ fn credentials_are_read_from_the_five_keys_only() {
             federated_token_file: Some("/var/run/token".into()),
             client_id: Some("client".into()),
             tenant_id: Some("tenant".into()),
-            authority_host: None,
             account_key: Some("a2V5".into()),
+            authority_host: None,
         }
     );
     let printed = format!("{env:?}");
@@ -1325,8 +1334,8 @@ async fn workload_identity_tokens_are_fetched_from_another_host_uncounted() {
         federated_token_file: Some(token_file.to_string_lossy().into_owned()),
         client_id: Some("client".into()),
         tenant_id: Some("tenant".into()),
-        authority_host: Some(authority_host),
         account_key: None,
+        authority_host: Some(authority_host),
     };
     let mut config = fake.config();
     config.skip_signature = false;
