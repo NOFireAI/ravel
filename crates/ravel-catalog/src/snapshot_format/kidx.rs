@@ -78,18 +78,26 @@ pub const DEFAULT_MAX_KEY_INDEX_LEAF_BODY_BYTES: u64 = DEFAULT_MAX_COLUMN_STATS_
 /// past it are uncovered and fall to tier 1, never to a whole scan.
 pub const KEY_INDEX_MAX_PROBED_PARTS: usize = 1_024;
 
-/// Most leaf GETs a one-key statement's tier-2 router issues: two GETs
-/// (prefix and one bucket) for each of [`KEY_INDEX_MAX_PROBED_PARTS`] parts,
-/// ADR-2707 decision 5's point-lookup budget. Under ADR-3692's key-set
-/// ceiling amendment the router computes a set of `k` keys' ceiling as
-/// `P_max x (1 + min(k, B_run))` ([`KEY_INDEX_SET_PROBE_MAX_RUNS`]), which
-/// is this value at k = 1 and 66,560 at k >= 64. It is an absolute cap on
-/// the statement, charging each part as if the set sat in one slice;
-/// admission charges each part's real worst case against it and refunds
-/// the GETs a probed part did not issue, so its worst-case division is the
-/// fewest parts it admits. Separately, a part whose worst case exceeds
-/// two GETs for each of its segments in the routed snapshot, its tier-1
-/// probe's cost, is not probed.
+/// Most leaf GETs one routing pass of a one-key set issues in the tier-2
+/// router: two GETs (prefix and one bucket) for each of
+/// [`KEY_INDEX_MAX_PROBED_PARTS`] parts, ADR-2707 decision 5's point-lookup
+/// budget. Under ADR-3692's key-set ceiling amendment the router computes a
+/// set of `k` keys' ceiling as `P_max x (1 + min(k, B_run))`
+/// ([`KEY_INDEX_SET_PROBE_MAX_RUNS`]), which is this value at k = 1 and
+/// 66,560 at k >= 64. It is an absolute cap on one pass, charging each part
+/// as if the set sat in one slice; admission charges each part's real worst
+/// case against it and refunds the GETs a probed part did not issue, so its
+/// worst-case division is the fewest parts it admits. Separately, a part
+/// whose worst case exceeds two GETs for each of its segments in the routed
+/// snapshot, its tier-1 probe's cost, is not probed.
+///
+/// The logs and spans consumers route a key set in one pass. The metrics
+/// label-value route (ADR-3694's per-value routing amendment) routes one
+/// one-key pass per distinct positive equality value, each under this
+/// ceiling, so a statement with `n` values issues at most `n` times it and
+/// at most `2n` GETs per covering part. When the query's read cache serves a slice's prefix GET to
+/// the later passes, a part costs at most its touched slices plus `n`, which
+/// is `1 + n` on a one-slice leaf.
 pub const KEY_INDEX_LEAF_GET_CEILING: u32 = 2_048;
 
 /// Most bucket GETs one set probe issues against one leaf: ADR-3692
