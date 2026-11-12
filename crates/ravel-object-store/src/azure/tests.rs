@@ -5,15 +5,18 @@ use bytes::Bytes;
 use proptest::prelude::*;
 
 use super::fake::{FakeAzure, HnsAnswer, RecordedRequest};
-use super::list::{decode_encoded_name, parse_list, parse_xml};
+use super::list::{
+    ListFetch, ListRequest, ListResponse, decode_encoded_name, list_delimited, list_page,
+    parse_list, parse_xml,
+};
 use super::{
     AzureConfig, AzureStore, CREDENTIAL_ENV_KEYS, CredentialEnv, SUFFIX_ROUNDS, store_authority,
 };
 use crate::conformance::{Property, run_conformance_suite_with_seeder};
 use crate::s3::SigningClock;
 use crate::{
-    GetRange, InstrumentedStore, ObjectStoreBackend, PageToken, Pin, PutMode, PutOptions,
-    StoreError, StoreMetrics, StoreOp, Version, is_addressable_key,
+    Etag, GetRange, InstrumentedStore, ObjectMeta, ObjectStoreBackend, PageToken, Pin, PutMode,
+    PutOptions, StoreError, StoreMetrics, StoreOp, Version, is_addressable_key,
 };
 
 const ACCOUNT: &str = "ravelfake";
@@ -457,6 +460,33 @@ async fn error_rows_follow_the_adr() {
     );
     let list = other.list("e/", None).await;
     assert!(matches!(list, Err(StoreError::Permanent(_))), "{list:?}");
+    let delimited = other.list_delimited("e/").await;
+    assert!(
+        matches!(delimited, Err(StoreError::Permanent(_))),
+        "{delimited:?}"
+    );
+    let pinned = other.pin_of("e/k").await;
+    assert!(
+        matches!(pinned, Err(StoreError::Permanent(_))),
+        "{pinned:?}"
+    );
+
+    // A 404 BlobNotFound on a CasVersion put is PreconditionFailed: the key is
+    // gone, so the token no longer names it.
+    fake.fail_next_with_code(404, "BlobNotFound", 1);
+    fake.clear_requests();
+    let gone = store
+        .put(
+            "e/k",
+            Bytes::from_static(b"x"),
+            cas(&Version("\"0x1\"".into())),
+        )
+        .await;
+    assert!(
+        matches!(gone, Err(StoreError::PreconditionFailed)),
+        "{gone:?}"
+    );
+    assert_eq!(methods(&blob_requests(&fake, "e/k")), ["PUT"]);
 
     // A 409 on a create that is not BlobAlreadyExists is not AlreadyExists.
     fake.fail_next_with_code(409, "LeaseIdMissing", 1);
@@ -761,6 +791,120 @@ async fn list_and_head_report_the_same_etag() {
         }
     }
     assert_eq!(seen, 3);
+}
+
+/// Plays back canned List Blobs responses, then empty final ones, and
+/// records the marker each request carried.
+struct ScriptedFetch {
+    responses: parking_lot::Mutex<std::collections::VecDeque<ListResponse>>,
+    markers: parking_lot::Mutex<Vec<Option<String>>>,
+}
+
+impl ScriptedFetch {
+    fn new(responses: Vec<ListResponse>) -> Self {
+        ScriptedFetch {
+            responses: parking_lot::Mutex::new(responses.into()),
+            markers: parking_lot::Mutex::default(),
+        }
+    }
+
+    fn requests(&self) -> usize {
+        self.markers.lock().len()
+    }
+}
+
+impl ListFetch for ScriptedFetch {
+    async fn fetch(&self, request: &ListRequest<'_>) -> Result<ListResponse, StoreError> {
+        self.markers.lock().push(request.marker.map(str::to_string));
+        Ok(self.responses.lock().pop_front().unwrap_or_default())
+    }
+}
+
+/// A response listing `names`, continued by `next` when it is `Some`.
+fn response(names: &[&str], next: Option<&str>) -> ListResponse {
+    ListResponse {
+        items: names
+            .iter()
+            .map(|name| ObjectMeta {
+                key: (*name).to_string(),
+                size: 1,
+                etag: Etag("\"0x1\"".into()),
+                version: Version("\"0x1\"".into()),
+                last_modified_unix_ms: 0,
+            })
+            .collect(),
+        prefixes: Vec::new(),
+        next_marker: next.map(str::to_string),
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_marker_fails_the_listing() {
+    let script = || {
+        ScriptedFetch::new(vec![
+            response(&["p/a"], Some("m1")),
+            response(&["p/b"], Some("m1")),
+        ])
+    };
+    let fetch = script();
+    let page = list_page(&fetch, "p/", None, 10).await;
+    assert!(
+        matches!(page, Err(StoreError::ListRepeatedToken { .. })),
+        "{page:?}"
+    );
+    assert_eq!(*fetch.markers.lock(), [None, Some("m1".to_string())]);
+
+    let fetch = script();
+    let drained = list_delimited(&fetch, "p/", crate::MAX_LIST_PAGES).await;
+    assert!(
+        matches!(drained, Err(StoreError::ListRepeatedToken { .. })),
+        "{drained:?}"
+    );
+    assert_eq!(fetch.requests(), 2);
+}
+
+#[tokio::test]
+async fn sixteen_empty_continued_responses_fail_the_listing() {
+    let empty: Vec<ListResponse> = (0..32)
+        .map(|i| response(&[], Some(&format!("m{i}"))))
+        .collect();
+    let fetch = ScriptedFetch::new(empty);
+    let page = list_page(&fetch, "p/", None, 10).await;
+    assert!(
+        matches!(page, Err(StoreError::ListPageCeiling { ceiling: 16, .. })),
+        "{page:?}"
+    );
+    assert_eq!(fetch.requests(), 16);
+
+    // A response whose names the resume filter dropped lists something, so it
+    // does not count: a service ignoring startFrom costs requests only.
+    let mut ignored: Vec<ListResponse> = (0..20)
+        .map(|i| response(&["p/a"], Some(&format!("m{i}"))))
+        .collect();
+    ignored.push(response(&["p/z"], None));
+    let fetch = ScriptedFetch::new(ignored);
+    let page = list_page(&fetch, "p/", Some("p/m"), 10)
+        .await
+        .expect("filtered responses are not empty ones");
+    let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(keys, ["p/z"]);
+    assert_eq!(page.next, None);
+    assert_eq!(fetch.requests(), 21);
+}
+
+#[tokio::test]
+async fn a_response_the_filter_trimmed_ends_the_call_without_a_second_request() {
+    let fetch = ScriptedFetch::new(vec![
+        response(&["p/a", "p/b", "p/c"], Some("m1")),
+        response(&["p/d"], None),
+    ]);
+    let page = list_page(&fetch, "p/", Some("p/b"), 10)
+        .await
+        .expect("list");
+    let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(keys, ["p/c"]);
+    assert_eq!(page.next, Some(PageToken("p/c".into())));
+    assert_eq!(fetch.requests(), 1);
 }
 
 #[tokio::test]

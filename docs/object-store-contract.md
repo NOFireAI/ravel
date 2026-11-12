@@ -1487,8 +1487,8 @@ This is a runtime, once-per-bucket check, not a replacement for the
 compile-time contract suite below: `crates/ravel-object-store/tests/contract.rs`
 is a development-time
 proof that each adapter *implementation* honors the trait, run in CI against
-every backend this crate ships (the GCS and Azure ones on their in-process
-fakes) and a real RustFS endpoint. `conformance.rs` is an
+the memory oracle, `ScratchStore`, `GcsStore` and `AzureStore` (the last two
+on their in-process fakes) and a real RustFS endpoint. `conformance.rs` is an
 operator-facing probe of one specific *deployment*, the actual configured
 endpoint and bucket, because the adapter can be correct while the vendor
 serving it is not (a misconfigured storage class, a proxy in front of the
