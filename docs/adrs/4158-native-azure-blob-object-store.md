@@ -25,8 +25,9 @@ lists through `object_store`'s `Path`-based listing, and reports
 
 Azure differs from S3 and GCS in ways that reach the trait. The table is
 from the Azure REST reference (List Blobs, Put Blob, "Specifying the range
-header"), read on 2026-11-12. **Nothing in it is measured yet.** Each row is
-a prediction; D9 says how it is checked before any backend code is written.
+header"), read on 2026-11-12. Each row was written as a prediction before
+any request was sent; D9 says how it is checked, and "Measured" at the end
+of this ADR gives the answers.
 
 | # | Request against a real account | Predicted answer |
 |---|---|---|
@@ -93,7 +94,8 @@ block blobs only.
     2023-05-03 or later, which `startFrom` and the `Encoded` attribute both
     need.
   - A `Name` or `BlobPrefix` element with `Encoded="true"` is
-    percent-decoded. Raw names go to `classify_objects` and
+    percent-decoded as a whole string: Azure encodes every character of
+    such a name, `/` included (Measured). Raw names go to `classify_objects` and
     `classify_prefixes`, so an unaddressable key is reported in
     `ListPage::unaddressable` and never fails the page.
   - `list_after` sends `startFrom=<start_after>`. `startFrom` is inclusive
@@ -127,9 +129,12 @@ block blobs only.
 
 ### D2. Suffix reads without a suffix range
 
-Azure accepts `bytes=a-b` and `bytes=a-` only (P7). `AzureStore` still
-reports `suffix_range: true`, and serves `GetRange::Suffix(n)` in two
-requests:
+Azure accepts `bytes=a-b` and `bytes=a-` only (P7). It does not refuse
+`bytes=-n`: it answers 200 with the whole blob (Measured). So `AzureStore`
+never puts a suffix range on the wire, a test asserts that against the
+fake, and the fake answers one as Azure does, so a regression reads wrong
+bytes in a test instead of in production. `AzureStore` still reports
+`suffix_range: true`, and serves `GetRange::Suffix(n)` in two requests:
 
 1. HEAD the blob for its length `L` and ETag `E`.
 2. GET `bytes=max(L-n, 0)-(L-1)` with `If-Match: E`.
@@ -207,9 +212,10 @@ instrumentation wrapper.
 - The conformance suite runs unchanged: it takes `&dyn ObjectStoreBackend`.
   The server refuses to start on an unqualified container.
 - **Hierarchical-namespace accounts are refused.** On such an account `/`
-  sorts lowest in a recursive listing, directories are objects, and a
-  prefix through a file name is an error, so `LexicographicListingOrder`
-  and the key layout do not hold. `AzureStore` reads
+  sorts lowest in a recursive listing, directories are objects, and a key
+  cannot be written beneath an existing key (with `a` present, `a/b` is
+  refused; Measured). The key layout does not promise that never happens.
+  `AzureStore` reads
   `x-ms-is-hns-enabled` from Get Account Information once at construction
   (P15) and refuses a `true` with an error naming the setting. An answer it
   cannot read is a refusal too, never a pass.
@@ -389,3 +395,39 @@ sequenceDiagram
   the backend, in the same commit as the behaviour.
 - The Azurite lane adds a third emulator container to the
   `object-store-contract` job.
+
+## Measured (2026-11-12)
+
+D9's run, with curl and an Entra ID token at `x-ms-version: 2024-11-04`,
+against two fresh Standard_LRS StorageV2 accounts in swedencentral, one
+flat-namespace and one with hierarchical namespace on. The full table of
+answers is on #4158 (issue comment 6833555806). On the flat-namespace
+account all sixteen predictions hold, so no decision changes:
+
+- P1 to P4: create answers 201 then 409 `BlobAlreadyExists`; eight
+  concurrent creates give one 201 and seven 409; a wrong or stale
+  `If-Match` answers 412 `ConditionNotMet`, on a present key and on an
+  absent one.
+- P5, P6: two writes of the same bytes get different ETags, and five
+  delete-and-recreate rounds of the same bytes gave five new ETags.
+- P7: `Range: bytes=-16` and `x-ms-range: bytes=-16` both answer 200 with
+  the whole blob and no `Content-Range`.
+- P8: a ranged GET with a wrong `If-Match` answers 412.
+- P9: `startFrom` starts at the named key, or at the next key when the
+  named one is absent, and combines with `marker`.
+- P10: seventeen names differing in case, digits, punctuation and `/`
+  came back in byte order.
+- P11: the listing's `Etag` is the HEAD `ETag` without its quotes.
+- P12: a name holding U+FFFE is listed with `Encoded="true"` and the whole
+  name percent-encoded. A name holding U+0001 cannot be created: Put Blob
+  answers 400 `InvalidUri`.
+- P13: a blob with uncommitted blocks answers 404 to HEAD and is not
+  listed; Put Block List makes it visible with one ETag.
+- P14: `x-ms-error-code` is present on a failed HEAD, and tells
+  `BlobNotFound` from `ContainerNotFound`.
+- P15: `x-ms-is-hns-enabled` is `false` on the flat account and `true` on
+  the other, from the account URL and from the container URL.
+- P16: every response carried `Date`.
+
+On the hierarchical-namespace account, two of the seventeen P10 keys could
+not be written, `a/0` and `a/b`, because `a` already existed as a blob.
