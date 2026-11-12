@@ -2121,7 +2121,10 @@ async fn azure_pinned_read_ordering(store: &AzureStore, root: &str) {
         .await
         .expect("identical rewrite");
     let (_, replaced) = store.pin_of(&key).await.expect("pin_of");
-    assert_ne!(replaced.etag, live.etag, "an identical rewrite keeps its ETag");
+    assert_ne!(
+        replaced.etag, live.etag,
+        "an identical rewrite keeps its ETag"
+    );
     for range in [GetRange::Full, GetRange::Suffix(3)] {
         let read = store.get_pinned(&key, range, &live).await;
         match live.version {
@@ -2171,10 +2174,7 @@ async fn azure_suffix_read_races_overwrites(store: &AzureStore, root: &str) {
             match store.get(&key, GetRange::Suffix(SUFFIX)).await {
                 Ok(read) => {
                     let fill = read.data[0];
-                    assert!(
-                        (b'a'..b'a' + VERSIONS).contains(&fill),
-                        "fill byte {fill}"
-                    );
+                    assert!((b'a'..b'a' + VERSIONS).contains(&fill), "fill byte {fill}");
                     assert!(
                         read.data.iter().all(|b| *b == fill),
                         "bytes of two versions in one suffix read: {:?}",

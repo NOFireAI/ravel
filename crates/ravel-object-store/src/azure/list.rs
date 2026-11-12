@@ -550,13 +550,8 @@ impl AzureRestClient {
                     .iter()
                     .map(|(name, value)| ((*name).to_string(), value.clone()))
                     .collect();
-                let to_sign = string_to_sign(
-                    method.as_str(),
-                    &signed,
-                    &self.account,
-                    path,
-                    &decoded,
-                );
+                let to_sign =
+                    string_to_sign(method.as_str(), &signed, &self.account, path, &decoded);
                 format!("SharedKey {}:{}", self.account, key.sign(&to_sign))
             }
             AzureCredential::SASToken(_) => {
@@ -764,13 +759,13 @@ fn hns_answer(account: &str, headers: &HeaderMap) -> Result<(), StoreError> {
         .map(|value| value.to_str().map(str::trim))
     {
         Some(Ok(value)) if value.eq_ignore_ascii_case("false") => Ok(()),
-        Some(Ok(value)) if value.eq_ignore_ascii_case("true") => Err(StoreError::Permanent(
-            format!(
+        Some(Ok(value)) if value.eq_ignore_ascii_case("true") => {
+            Err(StoreError::Permanent(format!(
                 "Azure storage account {account:?} has hierarchical namespace enabled \
                  (x-ms-is-hns-enabled: true); Ravel needs a flat-namespace account, and the \
                  setting is fixed when the account is created"
-            ),
-        )),
+            )))
+        }
         Some(_) => Err(StoreError::Permanent(format!(
             "Azure storage account {account:?}: the hierarchical namespace setting \
              (x-ms-is-hns-enabled) is unreadable, so the account is refused"
@@ -812,18 +807,18 @@ pub(crate) fn parse_xml(body: &[u8]) -> Result<XmlNode, String> {
     let mut buf = Vec::new();
     let mut stack: Vec<XmlNode> = Vec::new();
     let mut root: Option<XmlNode> = None;
-    let attach = |stack: &mut Vec<XmlNode>, root: &mut Option<XmlNode>, node: XmlNode| {
-        match stack.last_mut() {
-            Some(parent) => {
-                parent.children.push(node);
-                Ok(())
-            }
-            None if root.is_none() => {
-                *root = Some(node);
-                Ok(())
-            }
-            None => Err("more than one root element".to_string()),
+    let attach = |stack: &mut Vec<XmlNode>, root: &mut Option<XmlNode>, node: XmlNode| match stack
+        .last_mut()
+    {
+        Some(parent) => {
+            parent.children.push(node);
+            Ok(())
         }
+        None if root.is_none() => {
+            *root = Some(node);
+            Ok(())
+        }
+        None => Err("more than one root element".to_string()),
     };
     loop {
         match reader.read_event_into(&mut buf) {
