@@ -1291,17 +1291,23 @@ and listing requests carry no `Authorization` header. The field exists only
 in the crate's own tests and in builds with the `test-support` feature.
 
 **Azure.** `AzureConfig` carries no credential field (ADR-4158 D3).
-`AzureStore` reads five environment variables and no others
-(`azure::CREDENTIAL_ENV_KEYS`): `AZURE_FEDERATED_TOKEN_FILE`,
-`AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_AUTHORITY_HOST` for AKS
-workload identity, and `AZURE_STORAGE_ACCOUNT_KEY` for a shared key. An
+Four `AZURE_*` variables are the only ones `AzureStore` reads and passes to
+the client builder (`azure::CREDENTIAL_ENV_KEYS`):
+`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID` for
+AKS workload identity, and `AZURE_STORAGE_ACCOUNT_KEY` for a shared key. An
 empty value counts as unset. Each one set is handed to `object_store`'s
 builder through its own setter; the builder is never filled from the whole
-`AZURE_*` namespace, so a stray variable (an endpoint, a SAS token, a CLI
-switch) cannot redirect the store or change its credential. `object_store`
-then picks the shared key when one is set, else workload identity when the
-token file, client id and tenant id are all set, else a managed identity
-through the instance metadata service. A SAS token and the Azure CLI
+`AZURE_*` namespace, so a stray variable (an endpoint, an authority host, a
+SAS token, a CLI switch) cannot redirect the store, its token requests or
+its credential. A workload identity token comes from `object_store`'s
+default authority host. `object_store` then picks the shared key when one
+is set, else workload identity when the token file, client id and tenant id
+are all set, else a managed identity through the instance metadata service.
+That last path reads the platform's own `IDENTITY_HEADER` variable and sends
+it as `x-identity-header`; since the builder is made with
+`MicrosoftAzureBuilder::new` and not `from_env`, `IDENTITY_ENDPOINT` is not
+read and the metadata service address is `object_store`'s default. A SAS
+token and the Azure CLI
 credential are never selected, and the listing client refuses a SAS
 credential if one reaches it. An account key that is not base64 fails
 construction with `Permanent`, naming the variable and not its value. The
