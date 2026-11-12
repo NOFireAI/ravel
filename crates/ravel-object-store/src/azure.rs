@@ -38,7 +38,9 @@
 //!
 //! # Listing
 //!
-//! Through the `list` module's List Blobs client, not `object_store`; that
+//! Through the `list` module's List Blobs client, not `object_store`, as are
+//! `head`, `pin_of` and `delete` (`object_store` deletes through Blob Batch);
+//! that
 //! module's docs give the request shape. `list_after` sends `startFrom`, which
 //! is inclusive and which a service may ignore, so every name not greater
 //! than the resume point is dropped client-side whether or not it was
@@ -851,13 +853,8 @@ impl ObjectStoreBackend for AzureStore {
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         connector::scope(StoreOp::Delete, async move {
-            let path = path_of(key)?;
-            match self
-                .store
-                .delete(&path)
-                .await
-                .map_err(|e| map_azure_error(e, map_error_common))
-            {
+            path_of(key)?;
+            match self.rest.delete_blob(key).await {
                 // Idempotent per the contract: deleting a missing key succeeds.
                 Ok(()) | Err(StoreError::NotFound) => Ok(()),
                 Err(e) => Err(e),
