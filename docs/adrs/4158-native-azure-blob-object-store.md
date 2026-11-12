@@ -145,6 +145,13 @@ store starts again from step 1, at most three times, and then returns
 version of the blob, which is what the capability promises. A zero-length
 blob returns `InvalidRange`, as a suffix of it does on S3.
 
+A pinned suffix read (`get_pinned` with `Suffix`) does not take `E` from
+its own HEAD. `E` is the pin's ETag, sent as `If-Match` on the HEAD and on
+the GET, with the pin's `versionid` on both when it has one. A 412 on
+either request is `PreconditionFailed`, returned at once: the pinned object
+is gone, and retrying against whatever replaced it would serve bytes the
+caller did not pin.
+
 A suffix read on Azure costs two billed requests where S3 and GCS cost one.
 The connector counts both attempts, and `StoreMetrics` counts one `get`
 call, so the per-phase accounting shows the difference instead of hiding
@@ -172,7 +179,10 @@ the whole `AZURE_*` namespace, so a stray variable cannot redirect the
 store.
 
 A hidden `--azure-endpoint` sets the base URL, for the fake and the
-emulator. When it is set, the backend identity records it (D6). Skipping
+emulator. It follows the rule `--gcs-endpoint` follows: an `https://` URL
+to any host, or plain `http://` to a loopback host only, and anything else
+is refused at startup. When it is set, the backend identity records it
+(D6). Skipping
 request authentication is constructible only under the crate's
 `test-support` feature.
 
@@ -189,7 +199,8 @@ instrumentation wrapper.
 
 ### D5. Error classification by status and `x-ms-error-code`
 
-- 404 `BlobNotFound` is `NotFound`; 404 `ContainerNotFound` is `Permanent`.
+- 404 `BlobNotFound` is `NotFound`, except on a `CasVersion` put, where D1
+  maps it to `PreconditionFailed`; 404 `ContainerNotFound` is `Permanent`.
   Azure sends the code as a response header, so a HEAD can tell the two
   apart (P14), which S3 and GCS cannot.
 - 409 and 412 are the precondition outcomes named in D1.
@@ -264,7 +275,7 @@ backend task is dispatched, each row is run with curl and an Entra ID token
 against a fresh flat-namespace storage account, and the answers are posted
 on #4158 beside the predictions. A row that comes back different is
 recorded as a dated section at the end of this ADR before any code depends
-on it. Three rows can change the design and are named here so the change
+on it. Four rows can change the design and are named here so the change
 is not improvised:
 
 - P5 or P6 false (an ETag can repeat for a key): the ETag cannot be the
@@ -276,6 +287,10 @@ is not improvised:
   azure` is not called supported for metrics until it is settled.
 - P10 false (order is not byte order): the backend cannot pass
   `LexicographicListingOrder` and the epic stops.
+- P15 false (the header is absent with an Entra ID token): D6 would refuse
+  every account, so the epic stops until another way to read the setting
+  is found. D6's refusal of an unreadable answer is not relaxed to make
+  the backend start.
 
 The first real qualification, from an image built on main, is recorded on
 #4158 before `--store azure` is called supported.
