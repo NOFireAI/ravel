@@ -406,6 +406,18 @@ impl AzureRestClient {
         blob_head(key, &headers)
     }
 
+    /// Delete Blob for `key`. `object_store` deletes through Blob Batch, which
+    /// the emulator does not serve and which buries a per-blob status in a
+    /// multipart body, so a delete is sent here. A missing blob is
+    /// [`StoreError::NotFound`].
+    pub(crate) async fn delete_blob(&self, key: &str) -> Result<(), StoreError> {
+        let path = format!("{}/{}", self.container_path, encode_key(key));
+        let context = format!("delete {key:?}");
+        self.send(&context, Method::DELETE, &path, &[], None, Subject::Blob)
+            .await
+            .map(|_| ())
+    }
+
     /// Get Account Information through the container URL, and refuse a
     /// hierarchical-namespace account (ADR-4158 D6). A `true`, an absent
     /// header and any other value are all refusals.
