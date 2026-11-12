@@ -5,6 +5,7 @@
 //! [`ObjectStoreBackend`], never against a vendor SDK. [`memory::MemoryStore`]
 //! is the semantics oracle used by tests.
 
+pub mod azure;
 pub mod conformance;
 pub mod external;
 pub mod fault;
@@ -46,7 +47,7 @@ pub use scratch::ScratchStore;
 
 /// Content identity: used only for equality assertions between reads of the
 /// same immutable object. Never used as a CAS precondition (that is
-/// [`Version`]). The two coincide on S3 and differ on GCS/Azure.
+/// [`Version`]). The two coincide on S3 and Azure and differ on GCS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Etag(pub String);
 
@@ -645,7 +646,8 @@ impl Capabilities {
     ///   segments as multipart uploads rather than describing current
     ///   traffic.
     /// - `upload_checksum` is not required by any mode. It cannot be
-    ///   satisfied by S3, the only durable backend Ravel ships: the
+    ///   satisfied by `S3Store` (and `GcsStore` and `AzureStore` report it
+    ///   false too, ADR-3456 D1 and ADR-4158 D1): the
     ///   `object_store` 0.14 `AmazonS3` client has no per-request checksum
     ///   hook and no way to attach a caller-supplied precomputed digest to
     ///   the wire, so [`crate::s3::S3Store`] reports it as unsupported (see
@@ -653,7 +655,7 @@ impl Capabilities {
     ///   client-library limitation, not a per-endpoint or per-mode gap:
     ///   requiring the flag made `--store s3` fail startup against every
     ///   S3-compatible endpoint unconditionally, which blocks
-    ///   the only durable backend instead of catching a real regression.
+    ///   the S3 backend instead of catching a real regression.
     ///   Upload checksums are a CRC32C-class transport-corruption check;
     ///   the actual backstop against corrupted data surviving is the
     ///   read-time footer/section/page crc32c hierarchy
