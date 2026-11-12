@@ -1,5 +1,5 @@
 //! The bucket spill tuning a refusal retry derives from its refused first
-//! attempt (ADR-3565 amendment 2, item 4).
+//! attempt (ADR-3565 amendment 2, item 4, and ADR-4143 decision 1).
 //!
 //! The retry plans with [`BucketedFinalAggregateExec`] at a placeholder
 //! tuning, reads `P`, `C`, the routed column widths and the scan's `N` from
@@ -9,11 +9,15 @@
 //!
 //! - `T = A x N / n`, the projected table bytes;
 //! - `S = (L - H) / C`, the per-stream share, `H` the spill-mode headroom;
-//! - `bits = max(0, ceil(log2(2 x T / (P x 0.75 x S))))`;
-//! - `routed_chunk_rows`, the most rows up to 8192 whose `2^bits + 1`
-//!   chunks, charged as a routed chunk is charged (each column's values
-//!   capacity rounded up to 64 bytes, plus its validity bitmap), fit in
-//!   `floor(0.25 x S)`.
+//! - `table(b) = ceil(2 x T / (P x 2^b))`, one bucket's table with a
+//!   margin of 2;
+//! - `b(c)`, the bytes a routed chunk of `c` rows is charged (each column's
+//!   values capacity rounded up to 64 bytes, plus its validity bitmap);
+//! - `bits`, the least `b` with `2 x T / (P x 2^b) <= 0.75 x S` and
+//!   `table(b) + (2^b + 1) x b(1024) <= S`;
+//! - `routed_chunk_rows`, the most rows `c` up to 8192 with
+//!   `(2^bits + 1) x b(c) <= S - table(bits)`: the open chunks and the
+//!   read-back chunk take what the table leaves.
 //!
 //! Any condition in [`NoTuning`] keeps the retry's sort-merge plan.
 
@@ -110,7 +114,8 @@ pub enum NoTuning {
     Degenerate,
     /// `bits` would exceed [`BUCKETED_FINAL_AGGREGATE_MAX_BITS`].
     TooManyBits,
-    /// `routed_chunk_rows` would fall below [`BUCKET_SPILL_MIN_CHUNK_ROWS`].
+    /// No `bits` up to [`BUCKETED_FINAL_AGGREGATE_MAX_BITS`] whose table fits
+    /// leaves room for chunks of [`BUCKET_SPILL_MIN_CHUNK_ROWS`].
     ChunkTooSmall,
     /// `2 x P x 2^bits + P` exceeds `floor(nofile_soft / (2 x slots))`.
     DescriptorBudget,
@@ -203,7 +208,7 @@ pub fn derive_bucket_spill_tuning(
     }
 
     // 2 x T / (P x 0.75 x S) = 8 x A x N / (3 x n x P x S), in exact
-    // integers: bits is the least b with 8 x A x N <= 2^b x 3 x n x P x S.
+    // integers: the table fits at b when 8 x A x N <= 2^b x 3 x n x P x S.
     let numerator = 8u128
         .checked_mul(u128::from(inputs.asked_bytes))
         .and_then(|product| product.checked_mul(u128::from(total)))
@@ -213,20 +218,39 @@ pub fn derive_bucket_spill_tuning(
         .and_then(|product| product.checked_mul(inputs.partitions as u128))
         .and_then(|product| product.checked_mul(share as u128))
         .ok_or(NoTuning::Degenerate)?;
+    // `table(b) = ceil(2 x T / (P x 2^b)) = ceil(ceil(2 x A x N / (n x P)) / 2^b)`.
+    let tables = u128::from(consumed)
+        .checked_mul(inputs.partitions as u128)
+        .map(|divisor| (numerator / 4).div_ceil(divisor))
+        .ok_or(NoTuning::Degenerate)?;
+    let floor_chunk = routed_chunk_charge(&inputs.column_widths, BUCKET_SPILL_MIN_CHUNK_ROWS)
+        .map(|charge| charge as u128);
     let mut bits: u8 = 0;
-    loop {
-        // A `2^b x unit` past u128 exceeds every u128 numerator: b fits.
-        match unit.checked_mul(1u128 << bits) {
-            Some(scaled) if numerator > scaled => {}
-            _ => break,
+    let table = loop {
+        // A `2^b x unit` past u128 exceeds every u128 numerator: the table fits.
+        let table_fits = unit
+            .checked_mul(1u128 << bits)
+            .is_none_or(|scaled| numerator <= scaled);
+        if table_fits {
+            let table = tables.div_ceil(1u128 << bits);
+            let floor_chunks = floor_chunk
+                .and_then(|charge| charge.checked_mul((1u128 << bits) + 1))
+                .and_then(|chunks| chunks.checked_add(table));
+            if floor_chunks.is_some_and(|need| need <= share as u128) {
+                break table as usize;
+            }
         }
         if bits >= BUCKETED_FINAL_AGGREGATE_MAX_BITS {
-            return Err(NoTuning::TooManyBits);
+            return Err(if table_fits {
+                NoTuning::ChunkTooSmall
+            } else {
+                NoTuning::TooManyBits
+            });
         }
         bits += 1;
-    }
+    };
 
-    let per_chunk = (share / 4) / ((1usize << bits) + 1);
+    let per_chunk = (share - table) / ((1usize << bits) + 1);
     let mut rows = 0;
     let (mut low, mut high) = (1usize, BUCKET_SPILL_MAX_CHUNK_ROWS);
     while low <= high {
@@ -238,9 +262,6 @@ pub fn derive_bucket_spill_tuning(
             }
             _ => high = mid - 1,
         }
-    }
-    if rows < BUCKET_SPILL_MIN_CHUNK_ROWS {
-        return Err(NoTuning::ChunkTooSmall);
     }
 
     let partitions = inputs.partitions as u64;
@@ -539,8 +560,10 @@ fn registers_none_distributed(_any: &dyn ExecutionPlan) -> bool {
 mod tests {
     use super::*;
 
-    /// q33's routed columns: 8 + 4 B of keys, 8 + 8 + 16 + 8 B of state.
-    const Q33_WIDTHS: [usize; 6] = [8, 4, 8, 8, 16, 8];
+    /// q33's routed columns on the ClickBench corpus: 8 + 8 B of keys,
+    /// 8 + 16 + 16 + 8 B of state, the 64 B row M8 measured (ADR-3565
+    /// amendment 3).
+    const Q33_WIDTHS: [usize; 6] = [8, 8, 8, 16, 16, 8];
     /// The stock final's asked bytes, the projection `T` (amendment 1).
     const Q33_ASKED: u64 = 9_480_000_000;
     const Q33_ROWS: u64 = 99_997_497;
@@ -612,9 +635,8 @@ mod tests {
     }
 
     /// The only q33 column whose chunk rows fall below 8192: 65 chunks of
-    /// `routed_chunk_charge(.., rows)` within `floor(0.25 x 32,585,819)`,
-    /// which counts each column's validity and 64-byte rounding, where
-    /// `52 x rows` alone would give 2,410.
+    /// `routed_chunk_charge(.., rows)` within what `table(6)`,
+    /// `ceil(2 x 9.48 GB / (16 x 64))`, leaves of `S`, 32,585,819 B.
     #[test]
     fn bucket_spill_derivation_q33_c6a_large() {
         let inputs = q33(&LARGE, 524_288);
@@ -624,14 +646,87 @@ mod tests {
             tuning,
             BucketSpillTuning {
                 bits: 6,
-                routed_chunk_rows: 2368,
+                routed_chunk_rows: 3336,
                 descriptor_need: 2064,
             }
         );
-        let budget = 32_585_819 / 4 / 65;
-        assert_eq!(routed_chunk_charge(&Q33_WIDTHS, 2368), Some(125_056));
-        assert!(125_056 <= budget);
-        assert!(routed_chunk_charge(&Q33_WIDTHS, 2369).expect("fits") > budget);
+        let budget = (32_585_819 - 18_515_625) / 65;
+        assert_eq!(routed_chunk_charge(&Q33_WIDTHS, 3336), Some(216_192));
+        assert!(216_192 <= budget);
+        assert!(routed_chunk_charge(&Q33_WIDTHS, 3337).expect("fits") > budget);
+    }
+
+    /// The c6a.large inputs M8 logged for q33 (ADR-3565 amendment 3, #4072):
+    /// `T = A x N / n` is 12.65 GB, `S` 32,874,379 B and `table(7)`
+    /// 12,354,622 B, which leaves 2,452 rows to each of 129 chunks. A fixed
+    /// quarter of `S` held 980, under the floor.
+    #[test]
+    fn bucket_spill_derivation_q33_c6a_large_measured_t() {
+        let inputs = BucketSpillInputs {
+            asked_bytes: 1_099_716_576,
+            total_rows: Some(Q33_ROWS),
+            consumed_rows: Some(8_692_416),
+            partitions: 16,
+            spill_consumers: 40,
+            query_limit: 1_461_083_554,
+            column_widths: Q33_WIDTHS.to_vec(),
+            nofile_soft: 8320,
+            slots: 1,
+        };
+        assert_eq!(
+            derive_bucket_spill_tuning(&inputs),
+            Ok(BucketSpillTuning {
+                bits: 7,
+                routed_chunk_rows: 2452,
+                descriptor_need: 4112,
+            })
+        );
+        let budget = (32_874_379 - 12_354_622) / 129;
+        assert!(routed_chunk_charge(&Q33_WIDTHS, 2452).expect("fits") <= budget);
+        assert!(routed_chunk_charge(&Q33_WIDTHS, 2453).expect("fits") > budget);
+        assert!(routed_chunk_charge(&Q33_WIDTHS, 980).expect("fits") <= 32_874_379 / 4 / 129);
+        assert!(routed_chunk_charge(&Q33_WIDTHS, 981).expect("fits") > 32_874_379 / 4 / 129);
+    }
+
+    /// The second `bits` condition: at the M8 c6a.large inputs with `A`
+    /// raised so `T` is 25.09 GB, `table(7)` is 24,500,000 B, within
+    /// `0.75 x S` (24,655,784 B), but 129 chunks of 1,024 rows (66,304 B
+    /// each) need 8,553,216 B and `S - table(7)` is 8,374,379 B. The
+    /// derivation takes `bits` 8, where `table(8)` is 12,250,000 B and 257
+    /// chunks get 1,232 rows each.
+    #[test]
+    fn bucket_spill_derivation_takes_a_bit_for_floor_chunks() {
+        let inputs = BucketSpillInputs {
+            asked_bytes: 2_180_807_911,
+            total_rows: Some(Q33_ROWS),
+            consumed_rows: Some(8_692_416),
+            partitions: 16,
+            spill_consumers: 40,
+            query_limit: 1_461_083_554,
+            column_widths: Q33_WIDTHS.to_vec(),
+            nofile_soft: 524_288,
+            slots: 1,
+        };
+        let share: u128 = 32_874_379;
+        // The inputs sit inside the band: table(7) fits 0.75 x S and leaves
+        // no room for floor-sized chunks.
+        let two_t = 2 * u128::from(inputs.asked_bytes) * u128::from(Q33_ROWS);
+        let consumed_partitions = 8_692_416u128 * 16;
+        let table7 = two_t.div_ceil(consumed_partitions * 128);
+        assert_eq!(table7, 24_500_000);
+        assert!(4 * two_t <= 3 * share * consumed_partitions * 128);
+        assert!(4 * two_t > 3 * share * consumed_partitions * 64);
+        let floor_chunk = routed_chunk_charge(&Q33_WIDTHS, 1024).expect("fits") as u128;
+        assert_eq!(floor_chunk, 66_304);
+        assert!(table7 + 129 * floor_chunk > share);
+        assert_eq!(
+            derive_bucket_spill_tuning(&inputs),
+            Ok(BucketSpillTuning {
+                bits: 8,
+                routed_chunk_rows: 1232,
+                descriptor_need: 8208,
+            })
+        );
     }
 
     /// `C` divides the share: dividing by `P` (16) instead of `C` (48) on
@@ -687,8 +782,8 @@ mod tests {
             refused(&|i| i.consumed_rows = Some(1)),
             NoTuning::TooManyBits
         );
-        // At bits 6 on c6a.large `S / 4 / 65` holds 2,368 rows of q33; at 7
-        // it holds 1,188, and at 8 it holds under 600, below the 1024 floor.
+        // At 37.92 GB on c6a.large the table fits from bits 8, and from
+        // there every bits' table and floor-sized chunks together exceed `S`.
         assert_eq!(
             refused(&|i| {
                 i.query_limit = LARGE.query_limit;
