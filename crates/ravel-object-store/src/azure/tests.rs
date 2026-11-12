@@ -992,30 +992,90 @@ async fn delimited_listing_sends_the_wire_maximum() {
 #[tokio::test]
 async fn a_hierarchical_namespace_account_is_refused_at_construction() {
     let fake = fake().await;
-    for (answer, needle) in [
-        (HnsAnswer::True, "hierarchical namespace enabled"),
-        (HnsAnswer::Absent, "carried no x-ms-is-hns-enabled"),
-        (HnsAnswer::Unreadable, "unreadable"),
-    ] {
+    let container_path = format!("/{ACCOUNT}/{CONTAINER}");
+    let account_path = format!("/{ACCOUNT}/");
+    // (answer, header on the account URL only, refusal text or None for
+    // accepted, paths asked in order)
+    let cases = [
+        (HnsAnswer::False, false, None, vec![&container_path]),
+        (
+            HnsAnswer::True,
+            false,
+            Some("hierarchical namespace enabled"),
+            vec![&container_path],
+        ),
+        (
+            HnsAnswer::Unreadable,
+            false,
+            Some("unreadable"),
+            vec![&container_path],
+        ),
+        (
+            HnsAnswer::Absent,
+            false,
+            Some("carried no x-ms-is-hns-enabled"),
+            vec![&container_path, &account_path],
+        ),
+        (
+            HnsAnswer::False,
+            true,
+            None,
+            vec![&container_path, &account_path],
+        ),
+        (
+            HnsAnswer::True,
+            true,
+            Some("hierarchical namespace enabled"),
+            vec![&container_path, &account_path],
+        ),
+        (
+            HnsAnswer::Unreadable,
+            true,
+            Some("unreadable"),
+            vec![&container_path, &account_path],
+        ),
+        (
+            HnsAnswer::Absent,
+            true,
+            Some("carried no x-ms-is-hns-enabled"),
+            vec![&container_path, &account_path],
+        ),
+    ];
+    for (answer, account_url_only, refusal, paths) in cases {
+        let case = format!("{answer:?}, account URL only: {account_url_only}");
         fake.set_hns(answer);
+        fake.set_hns_on_account_url_only(account_url_only);
         fake.clear_requests();
         let built = AzureStore::new(fake.config()).await;
-        match built {
-            Err(StoreError::Permanent(message)) => {
-                assert!(message.contains(needle), "{answer:?}: {message}");
-                assert!(message.contains(ACCOUNT), "{answer:?}: {message}");
+        match (built, refusal) {
+            (Ok(_), None) => {}
+            (Err(StoreError::Permanent(message)), Some(needle)) => {
+                assert!(message.contains(needle), "{case}: {message}");
+                assert!(message.contains(ACCOUNT), "{case}: {message}");
             }
-            other => panic!("{answer:?}: {other:?}"),
+            (other, _) => panic!("{case}: {:?}", other.map(|_| "built")),
         }
         let requests = fake.requests();
-        assert_eq!(requests.len(), 1, "{answer:?}");
-        assert_eq!(requests[0].query_param("restype"), Some("account"));
-        assert_eq!(requests[0].query_param("comp"), Some("properties"));
+        let sent: Vec<&String> = requests.iter().map(|r| &r.path).collect();
+        assert_eq!(sent, paths, "{case}");
+        for request in &requests {
+            assert_eq!(request.method, "GET", "{case}");
+            assert_eq!(request.query_param("restype"), Some("account"), "{case}");
+            assert_eq!(request.query_param("comp"), Some("properties"), "{case}");
+        }
     }
+
+    // A failed request is a refusal too, and asks nothing further.
     fake.set_hns(HnsAnswer::False);
-    AzureStore::new(fake.config())
-        .await
-        .expect("a flat account is accepted");
+    fake.set_hns_on_account_url_only(true);
+    fake.clear_requests();
+    fake.fail_next(403, 1);
+    let denied = AzureStore::new(fake.config()).await;
+    assert!(
+        matches!(denied, Err(StoreError::AccessDenied(_))),
+        "{denied:?}"
+    );
+    assert_eq!(fake.requests().len(), 1);
 }
 
 #[test]

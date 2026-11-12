@@ -418,26 +418,42 @@ impl AzureRestClient {
             .map(|_| ())
     }
 
-    /// Get Account Information through the container URL, and refuse a
-    /// hierarchical-namespace account (ADR-4158 D6). A `true`, an absent
-    /// header and any other value are all refusals.
+    /// Get Account Information through the container URL, then through the
+    /// account URL when the first answer carried no `x-ms-is-hns-enabled`
+    /// (Azurite sends it on the account URL only), and refuse a
+    /// hierarchical-namespace account (ADR-4158 D6). Only `false` is
+    /// accepted: a `true`, a header absent from both answers, any other
+    /// value and a failed request are all refusals.
     pub(crate) async fn refuse_hierarchical_namespace(&self) -> Result<(), StoreError> {
+        let headers = self.account_information(&self.container_path).await?;
+        if headers.contains_key(HNS_HEADER) {
+            return hns_answer(&self.account, &headers);
+        }
+        let account_path = match self.container_path.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/"),
+            None => "/".to_string(),
+        };
+        let headers = self.account_information(&account_path).await?;
+        hns_answer(&self.account, &headers)
+    }
+
+    async fn account_information(&self, path: &str) -> Result<HeaderMap, StoreError> {
         let query = [
             ("restype", "account".to_string()),
             ("comp", "properties".to_string()),
         ];
-        let context = format!("account information for {:?}", self.account);
+        let context = format!("account information for {:?} at {path:?}", self.account);
         let (headers, _) = self
             .send(
                 &context,
                 Method::GET,
-                &self.container_path,
+                path,
                 &query,
                 None,
                 Subject::Container,
             )
             .await?;
-        hns_answer(&self.account, &headers)
+        Ok(headers)
     }
 
     /// Send one request under the retry rules and return the success
@@ -755,10 +771,12 @@ fn blob_head(key: &str, headers: &HeaderMap) -> Result<BlobHead, StoreError> {
     })
 }
 
+const HNS_HEADER: &str = "x-ms-is-hns-enabled";
+
 /// `Ok` only for an `x-ms-is-hns-enabled: false`.
 fn hns_answer(account: &str, headers: &HeaderMap) -> Result<(), StoreError> {
     match headers
-        .get("x-ms-is-hns-enabled")
+        .get(HNS_HEADER)
         .map(|value| value.to_str().map(str::trim))
     {
         Some(Ok(value)) if value.eq_ignore_ascii_case("false") => Ok(()),
@@ -775,8 +793,8 @@ fn hns_answer(account: &str, headers: &HeaderMap) -> Result<(), StoreError> {
         ))),
         None => Err(StoreError::Permanent(format!(
             "Azure storage account {account:?}: Get Account Information carried no \
-             x-ms-is-hns-enabled header, so whether hierarchical namespace is enabled is \
-             unknown and the account is refused"
+             x-ms-is-hns-enabled header on the container URL or the account URL, so whether \
+             hierarchical namespace is enabled is unknown and the account is refused"
         ))),
     }
 }

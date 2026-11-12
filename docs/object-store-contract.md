@@ -1194,11 +1194,15 @@ by `AzureStore::get_unverified` and on `ravel_store_get_unverified_total`.
 
 **Hierarchical-namespace accounts are refused.** `AzureStore::new` is async:
 before it returns it sends Get Account Information through the container URL
-(`?restype=account&comp=properties`) and fails with `Permanent`, naming
-`x-ms-is-hns-enabled`, unless that header is `false`. A `true`, an absent
-header and an unreadable one are all refusals. On such an account `/` sorts
-lowest in a recursive listing and a key cannot be written beneath an
-existing key (ADR-4158 D6), and the setting is fixed when the account is
+(`?restype=account&comp=properties`) and, when that answer carries no
+`x-ms-is-hns-enabled` header, sends it again through the account URL
+(`<account-url>/?restype=account&comp=properties`), since Azurite sends the
+header on the account URL only (ADR-4158, Correction 2026-11-13). It fails
+with `Permanent`, naming `x-ms-is-hns-enabled`, unless the header it read is
+`false`. A `true` from either request, a header absent from both, an
+unreadable value and a failed request are all refusals. On such an account
+`/` sorts lowest in a recursive listing and a key cannot be written beneath
+an existing key (ADR-4158 D6), and the setting is fixed when the account is
 created.
 
 `crates/ravel-object-store/tests/contract.rs` runs the contract suite, the
