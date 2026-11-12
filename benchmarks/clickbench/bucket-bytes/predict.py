@@ -239,7 +239,7 @@ def read_slice(con, corpus, st, start, end):
         raise SystemExit(f"statement {st.number}: slice {start}..{end} not read in corpus order")
     fixed = {c.name: t.column(c.name).to_numpy().astype(c.arrow.to_pandas_dtype(), copy=False)
              for c in st.fixed}
-    strings = t.column("s").combine_chunks().cast(pa.large_string())
+    strings = t.column("s").cast(pa.large_string()).combine_chunks()
     h = t.column("h").to_numpy().astype(np.uint64, copy=False)
     cost8 = t.column("cost8").to_numpy().astype(np.int32)
     return fixed, strings, h, cost8
@@ -507,13 +507,36 @@ def stage_sample(con, args, st, budget8):
     return out
 
 
+def stage_routed(con, args, st, budget8):
+    """Uncombined bytes of the sample slice as the route writes them: each
+    bucket's rows, in corpus order, cut into its own chunks."""
+    i = args.sample_slice
+    start = i * args.slice_rows
+    end = min(start + args.slice_rows, args.rows)
+    fixed, strings, hs, cs = read_slice(con, args.corpus, st, start, end)
+    n = end - start
+    ones = np.ones(n, dtype=np.int64)
+    out = dict(rows=n, routed={})
+    for bits in BITS:
+        order, gs, ge = route(hs, bits)
+        cost_sorted = cs[order]
+        taken_fixed = {c.name: fixed[c.name][order] for c in st.fixed}
+        taken_strings = strings.take(pa.array(order))
+        for box in args.boxes:
+            starts = greedy_chunks(cost_sorted, gs, ge, budget8[(box, bits)], MAX_CHUNK_ROWS)
+            b, r, w = write_chunks(st, taken_fixed, taken_strings, ones, starts)
+            out["routed"][cfg(box, bits)] = [b, r, int(len(starts)), w]
+        del order, cost_sorted, taken_fixed, taken_strings
+    return out
+
+
 def run_statement(con, args, st, state, deadline):
     """Run every stage state does not hold yet. Returns False when the
     deadline stopped it before the last stage."""
     budget8 = {(box, bits): 8 * (chunk_budget(BOX_SHARE[box], bits) - 64 * st.buffers())
                for box in args.boxes for bits in BITS}
     mine = state["stmt"].setdefault(str(st.number), {})
-    stages = (["head"] + [f"slice{i}" for i in range(-(-args.rows // args.slice_rows))] + ["sample"])
+    stages = (["head"] + [f"slice{i}" for i in range(-(-args.rows // args.slice_rows))] + ["sample", "routed"])
     for stage in stages:
         if stage in mine:
             continue
@@ -525,6 +548,8 @@ def run_statement(con, args, st, state, deadline):
             mine[stage] = stage_head(con, args, st, budget8)
         elif stage == "sample":
             mine[stage] = stage_sample(con, args, st, budget8)
+        elif stage == "routed":
+            mine[stage] = stage_routed(con, args, st, budget8)
         else:
             mine[stage] = stage_slice(con, args, st, budget8, int(stage[5:]))
         mine[stage]["seconds"] = round(time.time() - t, 1)
@@ -537,6 +562,7 @@ def report(args, st, mine, out):
     head = mine["head"]
     slices = [mine[k] for k in sorted(mine) if k.startswith("slice")]
     sample = mine["sample"]
+    routed = mine["routed"]
     sample_slice = mine[f"slice{args.sample_slice}"]
     empty = empty_stream_bytes(st)
     floor = st.floor_charge()
@@ -565,22 +591,30 @@ def report(args, st, mine, out):
             comb_rows, comb_chunks = head["comb"][k]
             sc_b, sc_raw, sc_chunks, sc_rows = sample["comb"][k]
             comb_b = sc_b * comb_rows / sc_rows + (files - 1) * empty
+            r_b, _, r_chunks, r_rows = routed["routed"][k]
+            # The routing penalty: the sample's routed bytes over its corpus-order
+            # bytes, both with one stream per file, applied to the full corpus.
+            routed_penalty = (r_b + (files - 1) * empty) / (s_b + (files - 1) * empty)
+            routed_b = unc_b * routed_penalty
+            unc_pred = max(unc_b, routed_b)
             thr = THRESHOLD[st.number][box]
-            if unc_rows != rows:
+            if unc_rows != rows or r_rows != s_rows:
                 raise SystemExit(f"statement {st.number} {k}: wrote {unc_rows} uncombined rows, not {rows}")
             if not distinct <= comb_rows <= rows:
                 raise SystemExit(f"statement {st.number} {k}: combined rows {comb_rows} outside [{distinct}, {rows}]")
-            results[(box, bits)] = dict(unc=unc_b, comb=comb_b, thr=thr)
+            results[(box, bits)] = dict(unc=unc_pred, comb=comb_b, thr=thr)
             print(f"stmt={st.number} box={box} bits={bits} budget_min_B={budget} budget_max_B={budget_max} "
                   f"floor_fits_min={'yes' if budget >= floor else 'no'} "
                   f"floor_fits_max={'yes' if budget_max >= floor else 'no'} files={files} "
                   f"unc_rows={unc_rows} unc_chunks={unc_chunks} unc_raw_B={unc_raw} unc_ipc_B={unc_b} "
                   f"unc_ratio={unc_raw / unc_b:.3f} unc_sample_scaled_B={unc_scaled:.0f} "
+                  f"sample_routed_chunks={r_chunks} sample_routed_ipc_B={r_b} routed_penalty={routed_penalty:.3f} "
+                  f"routed_unc_ipc_B={routed_b:.0f} unc_pred_B={unc_pred:.0f} "
                   f"comb_rows={comb_rows} comb_chunks={comb_chunks} comb_rows_per_chunk_routed={rows / comb_chunks:.0f} "
                   f"sample_rows={sample['rows']} sample_comb_rows={sc_rows} sample_comb_chunks={sc_chunks} "
                   f"sample_comb_raw_B={sc_raw} sample_comb_ipc_B={sc_b} sample_comb_ratio={sc_raw / sc_b:.3f} "
                   f"comb_ipc_B={comb_b:.0f} threshold_B={thr} "
-                  f"unc_vs_threshold={'below' if unc_b < thr else 'above'} "
+                  f"unc_vs_threshold={'below' if unc_pred < thr else 'above'} "
                   f"comb_vs_threshold={'below' if comb_b < thr else 'above'}", file=out, flush=True)
     return results
 
