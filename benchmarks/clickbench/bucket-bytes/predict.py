@@ -23,13 +23,19 @@ decision 2. Every byte figure is compressed Arrow IPC bytes as the writer
 emits them (no retries, no read-back), unless its name says `raw`.
 
 Usage:
-    python predict.py --corpus .dd-tools/corpus/hits.parquet
-    python predict.py --corpus ... --rows 2000000 --slice-rows 1000000 \
-        --sample-slice 1 --statements 34   # smoke run on a corpus prefix
+    python predict.py --corpus .dd-tools/corpus/hits.parquet \
+        --state .dd-tools/bucket-bytes-state.json [--budget-seconds 540]
+    python predict.py --corpus ... --state ... --rows 2000000 \
+        --slice-rows 1000000 --sample-slice 1   # smoke run on a corpus prefix
+
+A run with --budget-seconds starts no stage past the budget and exits 3;
+the same command resumes from --state. Exit 0 prints the report.
 """
 
 import argparse
 import dataclasses
+import json
+import os
 import sys
 import time
 
@@ -212,7 +218,7 @@ def read_hash_cost(con, corpus, st, rows):
     """Per corpus row, in corpus order: the 64-bit key hash and the charge."""
     q = (f"SELECT file_row_number AS rn, hash({', '.join(st.key_exprs)}) AS h, "
          f"{cost8_expr(st)} AS cost8 FROM {source(corpus)} WHERE file_row_number < {rows}")
-    t = con.execute(q).to_arrow_table()
+    t = con.sql(q).to_arrow_table()
     rn = t.column("rn").to_numpy()
     if len(rn) != rows or not np.array_equal(rn, np.arange(rows, dtype=rn.dtype)):
         raise SystemExit(f"statement {st.number}: rows not read in corpus order or count {len(rn)} != {rows}")
@@ -227,7 +233,7 @@ def read_slice(con, corpus, st, start, end):
     q = (f"SELECT file_row_number AS rn, {', '.join(cols)}, hash({', '.join(st.key_exprs)}) AS h, "
          f"{cost8_expr(st)} AS cost8 FROM {source(corpus)} "
          f"WHERE file_row_number >= {start} AND file_row_number < {end}")
-    t = con.execute(q).to_arrow_table()
+    t = con.sql(q).to_arrow_table()
     rn = t.column("rn").to_numpy()
     if not np.array_equal(rn, np.arange(start, end, dtype=rn.dtype)):
         raise SystemExit(f"statement {st.number}: slice {start}..{end} not read in corpus order")
@@ -351,7 +357,8 @@ def empty_stream_bytes(st):
 
 def write_chunks(st, fixed, strings, counts, starts):
     """Write rows already in chunk order as one IPC stream, one record batch
-    per chunk. Returns (compressed bytes written, raw buffer bytes)."""
+    per chunk. Returns (compressed bytes written, raw buffer bytes, rows
+    written)."""
     n = len(strings)
     views, long_data, cumlong, is_long = view_parts(strings)
     cid = chunk_ids(n, starts)
@@ -362,6 +369,7 @@ def write_chunks(st, fixed, strings, counts, starts):
     bounds = np.append(starts, n)
     sink = pa.MockOutputStream()
     raw = 0
+    written = 0
     with ipc.new_stream(sink, schema, options=ipc_options()) as writer:
         for k in range(len(starts)):
             s, e = int(bounds[k]), int(bounds[k + 1])
@@ -374,8 +382,10 @@ def write_chunks(st, fixed, strings, counts, starts):
                       + [pa.array(fixed[c.name][s:e], type=c.arrow) for c in st.fixed_after]
                       + [pa.array(counts[s:e], type=pa.int64())])
             raw += (e - s) * (sum(c.width for c in st.fixed) + VIEW_BYTES + 8) + (d1 - d0)
-            writer.write_batch(pa.RecordBatch.from_arrays(arrays, schema=schema))
-    return sink.size(), raw
+            batch = pa.RecordBatch.from_arrays(arrays, schema=schema)
+            writer.write_batch(batch)
+            written += batch.num_rows
+    return sink.size(), raw, written
 
 
 def check_views(st, strings):
@@ -408,117 +418,170 @@ def probe_windows(h):
 def exact_distinct(con, corpus, st, rows):
     q = (f"SELECT count(*) FROM (SELECT {', '.join(st.key_exprs)} FROM {source(corpus)} "
          f"WHERE file_row_number < {rows} GROUP BY ALL)")
-    return con.execute(q).fetchone()[0]
+    return con.sql(q).fetchall()[0][0]
 
 
-def run_statement(con, args, st, out):
+def cfg(box, bits):
+    return f"{box}|{bits}"
+
+
+def save(state, path):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def stage_head(con, args, st, budget8):
+    """Distinct keys, the probe check and the combined rows, full corpus."""
     rows = args.rows
-    configs = [(box, bits) for box in args.boxes for bits in BITS]
-    budget = {(box, bits): chunk_budget(BOX_SHARE[box], bits) for box, bits in configs}
-    budget8 = {k: 8 * (v - 64 * st.buffers()) for k, v in budget.items()}
-    files = {bits: P << bits for bits in BITS}
-    empty = empty_stream_bytes(st)
-    floor = st.floor_charge()
-
     log(f"statement {st.number}: distinct keys")
     distinct = exact_distinct(con, args.corpus, st, rows)
-
     log(f"statement {st.number}: hash and charge of {rows} rows")
     h, cost8 = read_hash_cost(con, args.corpus, st, rows)
-    distinct_hashes = int(np.unique(h).size)
     ratios = probe_windows(h)
-    print(f"stmt={st.number} corpus_rows={rows} distinct_keys={distinct} distinct_hashes={distinct_hashes} "
-          f"raw_row_bytes_mean={cost8.mean() / 8:.2f} floor_charge_B={floor} empty_stream_B={empty} "
-          f"probe_windows={len(ratios)} probe_ratio_min={ratios.min():.4f} "
-          f"probe_ratio_median={np.median(ratios):.4f} probe_windows_above_{PROBE_RATIO}="
-          f"{np.count_nonzero(ratios > PROBE_RATIO)}", file=out, flush=True)
-
+    head = dict(distinct=distinct, distinct_hashes=int(np.unique(h).size), hashed_rows=int(len(h)),
+                raw_row_bytes_mean=float(cost8.mean() / 8), probe_windows=int(len(ratios)),
+                probe_ratio_min=float(ratios.min()), probe_ratio_median=float(np.median(ratios)),
+                probe_windows_above=int(np.count_nonzero(ratios > PROBE_RATIO)), comb={})
     log(f"statement {st.number}: combined rows over the full corpus")
-    comb_rows, comb_chunks = {}, {}
     for bits in BITS:
         order, gs, ge = route(h, bits)
         cost_sorted = cost8[order]
         h_sorted = h[order]
+        del order
         for box in args.boxes:
             starts = greedy_chunks(cost_sorted, gs, ge, budget8[(box, bits)], MAX_CHUNK_ROWS)
             cid = chunk_ids(rows, starts)
-            comb_rows[(box, bits)] = combine_count(h_sorted, cid)
-            comb_chunks[(box, bits)] = len(starts)
+            head["comb"][cfg(box, bits)] = [combine_count(h_sorted, cid), int(len(starts))]
             del cid, starts
-        del order, cost_sorted, h_sorted
-    del h, cost8
+        del cost_sorted, h_sorted
+    return head
 
-    log(f"statement {st.number}: uncombined bytes over the full corpus, combined bytes on slice {args.sample_slice}")
-    unc_bytes = {k: 0 for k in configs}
-    unc_raw = {k: 0 for k in configs}
-    unc_chunks = {k: 0 for k in configs}
-    sample = {}
-    slices = list(range(0, rows, args.slice_rows))
-    for i, start in enumerate(slices):
-        end = min(start + args.slice_rows, rows)
-        fixed, strings, hs, cs = read_slice(con, args.corpus, st, start, end)
-        if i == 0:
-            check_views(st, strings)
-        n = end - start
-        ones = np.ones(n, dtype=np.int64)
-        for box, bits in configs:
+
+def stage_slice(con, args, st, budget8, i):
+    """Uncombined bytes of slice i, every config, in corpus order."""
+    start = i * args.slice_rows
+    end = min(start + args.slice_rows, args.rows)
+    fixed, strings, hs, cs = read_slice(con, args.corpus, st, start, end)
+    if i == 0:
+        check_views(st, strings)
+    n = end - start
+    ones = np.ones(n, dtype=np.int64)
+    out = dict(rows=n, raw_row_bytes_mean=float(cs.mean() / 8), unc={})
+    for box in args.boxes:
+        for bits in BITS:
             starts = greedy_chunks(cs, np.array([0]), np.array([n]), budget8[(box, bits)], MAX_CHUNK_ROWS)
-            b, r = write_chunks(st, fixed, strings, ones, starts)
-            unc_bytes[(box, bits)] += b
-            unc_raw[(box, bits)] += r
-            unc_chunks[(box, bits)] += len(starts)
-            if i == args.sample_slice:
-                sample[("unc", box, bits)] = (b, n)
-        if i == args.sample_slice:
-            for bits in BITS:
-                order, gs, ge = route(hs, bits)
-                cost_sorted = cs[order]
-                h_sorted = hs[order]
-                taken_fixed = {c.name: fixed[c.name][order] for c in st.fixed}
-                taken_strings = strings.take(pa.array(order))
-                for box in args.boxes:
-                    starts = greedy_chunks(cost_sorted, gs, ge, budget8[(box, bits)], MAX_CHUNK_ROWS)
-                    cid = chunk_ids(n, starts)
-                    idx, counts = combine_rows(h_sorted, cid)
-                    ccid = cid[idx]
-                    cstarts = np.flatnonzero(np.diff(ccid, prepend=-1) != 0)
-                    cf = {c.name: taken_fixed[c.name][idx] for c in st.fixed}
-                    b, r = write_chunks(st, cf, taken_strings.take(pa.array(idx)), counts, cstarts)
-                    if int(counts.sum()) != n:
-                        raise SystemExit("combined counts do not sum to the slice's rows")
-                    sample[("comb", box, bits)] = (b, len(idx), len(starts), r)
-                del order, cost_sorted, h_sorted, taken_fixed, taken_strings
-        log(f"statement {st.number}: slice {i + 1}/{len(slices)} done")
-        del fixed, strings, hs, cs
+            b, r, w = write_chunks(st, fixed, strings, ones, starts)
+            out["unc"][cfg(box, bits)] = [b, r, int(len(starts)), w]
+    return out
 
+
+def stage_sample(con, args, st, budget8):
+    """Combined bytes of the sample slice: routed, chunked, combined, written."""
+    i = args.sample_slice
+    start = i * args.slice_rows
+    end = min(start + args.slice_rows, args.rows)
+    fixed, strings, hs, cs = read_slice(con, args.corpus, st, start, end)
+    n = end - start
+    out = dict(rows=n, comb={})
+    for bits in BITS:
+        order, gs, ge = route(hs, bits)
+        cost_sorted = cs[order]
+        h_sorted = hs[order]
+        taken_fixed = {c.name: fixed[c.name][order] for c in st.fixed}
+        taken_strings = strings.take(pa.array(order))
+        for box in args.boxes:
+            starts = greedy_chunks(cost_sorted, gs, ge, budget8[(box, bits)], MAX_CHUNK_ROWS)
+            cid = chunk_ids(n, starts)
+            idx, counts = combine_rows(h_sorted, cid)
+            if int(counts.sum()) != n:
+                raise SystemExit("combined counts do not sum to the slice's rows")
+            cstarts = np.flatnonzero(np.diff(cid[idx], prepend=-1) != 0)
+            if len(cstarts) != len(starts):
+                raise SystemExit("a combined chunk is empty or split")
+            cf = {c.name: taken_fixed[c.name][idx] for c in st.fixed}
+            b, r, w = write_chunks(st, cf, taken_strings.take(pa.array(idx)), counts, cstarts)
+            out["comb"][cfg(box, bits)] = [b, r, int(len(starts)), w]
+        del order, cost_sorted, h_sorted, taken_fixed, taken_strings
+    return out
+
+
+def run_statement(con, args, st, state, deadline):
+    """Run every stage state does not hold yet. Returns False when the
+    deadline stopped it before the last stage."""
+    budget8 = {(box, bits): 8 * (chunk_budget(BOX_SHARE[box], bits) - 64 * st.buffers())
+               for box in args.boxes for bits in BITS}
+    mine = state["stmt"].setdefault(str(st.number), {})
+    stages = (["head"] + [f"slice{i}" for i in range(-(-args.rows // args.slice_rows))] + ["sample"])
+    for stage in stages:
+        if stage in mine:
+            continue
+        if time.time() > deadline:
+            return False
+        t = time.time()
+        log(f"statement {st.number}: stage {stage}")
+        if stage == "head":
+            mine[stage] = stage_head(con, args, st, budget8)
+        elif stage == "sample":
+            mine[stage] = stage_sample(con, args, st, budget8)
+        else:
+            mine[stage] = stage_slice(con, args, st, budget8, int(stage[5:]))
+        mine[stage]["seconds"] = round(time.time() - t, 1)
+        save(state, args.state)
+    return True
+
+
+def report(args, st, mine, out):
+    rows = args.rows
+    head = mine["head"]
+    slices = [mine[k] for k in sorted(mine) if k.startswith("slice")]
+    sample = mine["sample"]
+    sample_slice = mine[f"slice{args.sample_slice}"]
+    empty = empty_stream_bytes(st)
+    floor = st.floor_charge()
+    distinct = head["distinct"]
+    print(f"stmt={st.number} corpus_rows={rows} hashed_rows={head['hashed_rows']} distinct_keys={distinct} "
+          f"distinct_hashes={head['distinct_hashes']} raw_row_bytes_mean={head['raw_row_bytes_mean']:.2f} "
+          f"sample_raw_row_bytes_mean={sample_slice['raw_row_bytes_mean']:.2f} "
+          f"floor_charge_B={floor} empty_stream_B={empty} probe_windows={head['probe_windows']} "
+          f"probe_ratio_min={head['probe_ratio_min']:.4f} probe_ratio_median={head['probe_ratio_median']:.4f} "
+          f"probe_windows_above_{PROBE_RATIO}={head['probe_windows_above']}", file=out, flush=True)
+    if head["hashed_rows"] != rows or sum(s["rows"] for s in slices) != rows:
+        raise SystemExit(f"statement {st.number}: rows read differ from {rows}")
     results = {}
-    for box, bits in configs:
-        k = (box, bits)
-        unc = unc_bytes[k] + (files[bits] - len(slices)) * empty
-        s_unc_b, s_n = sample[("unc", box, bits)]
-        s_unc = (s_unc_b + (files[bits] - 1) * empty) * rows / s_n
-        s_comb_b, s_comb_rows, s_chunks, s_comb_raw = sample[("comb", box, bits)]
-        comb = s_comb_b * comb_rows[k] / s_comb_rows + (files[bits] - 1) * empty
-        thr = THRESHOLD[st.number][box]
-        if not distinct <= comb_rows[k] <= rows:
-            raise SystemExit(f"statement {st.number} {k}: combined rows {comb_rows[k]} outside "
-                             f"[{distinct}, {rows}]")
-        results[k] = dict(unc=unc, comb=comb, thr=thr)
-        print(f"stmt={st.number} box={box} bits={bits} budget_min_B={budget[k]} "
-              f"budget_max_B={chunk_budget_max(BOX_SHARE[box], bits)} floor_charge_B={floor} "
-              f"floor_fits_min={'yes' if budget[k] >= floor else 'no'} "
-              f"floor_fits_max={'yes' if chunk_budget_max(BOX_SHARE[box], bits) >= floor else 'no'} "
-              f"files={files[bits]} "
-              f"unc_rows={rows} unc_chunks={unc_chunks[k]} unc_rows_per_chunk={rows / unc_chunks[k]:.0f} "
-              f"unc_raw_B={unc_raw[k]} unc_ipc_B={unc} unc_ratio={unc_raw[k] / unc:.3f} "
-              f"unc_sample_scaled_B={s_unc:.0f} "
-              f"comb_rows={comb_rows[k]} comb_chunks={comb_chunks[k]} "
-              f"comb_rows_per_chunk_before={rows / comb_chunks[k]:.0f} "
-              f"sample_comb_rows={s_comb_rows} sample_comb_ipc_B={s_comb_b} "
-              f"sample_comb_ratio={s_comb_raw / s_comb_b:.3f} "
-              f"comb_ipc_B={comb:.0f} threshold_B={thr} "
-              f"unc_vs_threshold={'below' if unc < thr else 'above'} "
-              f"comb_vs_threshold={'below' if comb < thr else 'above'}", file=out, flush=True)
+    for box in args.boxes:
+        for bits in BITS:
+            k = cfg(box, bits)
+            files = P << bits
+            budget = chunk_budget(BOX_SHARE[box], bits)
+            budget_max = chunk_budget_max(BOX_SHARE[box], bits)
+            unc_b = sum(s["unc"][k][0] for s in slices) + (files - len(slices)) * empty
+            unc_raw = sum(s["unc"][k][1] for s in slices)
+            unc_chunks = sum(s["unc"][k][2] for s in slices)
+            unc_rows = sum(s["unc"][k][3] for s in slices)
+            s_b, _, _, s_rows = sample_slice["unc"][k]
+            unc_scaled = (s_b + (files - 1) * empty) * rows / s_rows
+            comb_rows, comb_chunks = head["comb"][k]
+            sc_b, sc_raw, sc_chunks, sc_rows = sample["comb"][k]
+            comb_b = sc_b * comb_rows / sc_rows + (files - 1) * empty
+            thr = THRESHOLD[st.number][box]
+            if unc_rows != rows:
+                raise SystemExit(f"statement {st.number} {k}: wrote {unc_rows} uncombined rows, not {rows}")
+            if not distinct <= comb_rows <= rows:
+                raise SystemExit(f"statement {st.number} {k}: combined rows {comb_rows} outside [{distinct}, {rows}]")
+            results[(box, bits)] = dict(unc=unc_b, comb=comb_b, thr=thr)
+            print(f"stmt={st.number} box={box} bits={bits} budget_min_B={budget} budget_max_B={budget_max} "
+                  f"floor_fits_min={'yes' if budget >= floor else 'no'} "
+                  f"floor_fits_max={'yes' if budget_max >= floor else 'no'} files={files} "
+                  f"unc_rows={unc_rows} unc_chunks={unc_chunks} unc_raw_B={unc_raw} unc_ipc_B={unc_b} "
+                  f"unc_ratio={unc_raw / unc_b:.3f} unc_sample_scaled_B={unc_scaled:.0f} "
+                  f"comb_rows={comb_rows} comb_chunks={comb_chunks} comb_rows_per_chunk_routed={rows / comb_chunks:.0f} "
+                  f"sample_rows={sample['rows']} sample_comb_rows={sc_rows} sample_comb_chunks={sc_chunks} "
+                  f"sample_comb_raw_B={sc_raw} sample_comb_ipc_B={sc_b} sample_comb_ratio={sc_raw / sc_b:.3f} "
+                  f"comb_ipc_B={comb_b:.0f} threshold_B={thr} "
+                  f"unc_vs_threshold={'below' if unc_b < thr else 'above'} "
+                  f"comb_vs_threshold={'below' if comb_b < thr else 'above'}", file=out, flush=True)
     return results
 
 
@@ -563,26 +626,43 @@ def main():
     ap.add_argument("--boxes", nargs="+", default=list(BOX_SHARE))
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--memory", default="6GB")
+    ap.add_argument("--state", required=True,
+                    help="JSON file holding each finished stage; a rerun resumes from it")
+    ap.add_argument("--budget-seconds", type=float, default=float("inf"),
+                    help="start no new stage after this many seconds; exit 3 if unfinished")
     args = ap.parse_args()
+    deadline = time.time() + args.budget_seconds
     if args.slice_rows < 10_000_000 and args.rows == CORPUS_ROWS:
         raise SystemExit("the sample slice must hold at least 10 million rows")
     if args.sample_slice * args.slice_rows >= args.rows:
         raise SystemExit("the sample slice lies past the corpus")
 
     con = connect(args.threads, args.memory)
-    total = con.execute(f"SELECT count(*) FROM read_parquet('{args.corpus}')").fetchone()[0]
+    total = con.sql(f"SELECT count(*) FROM read_parquet('{args.corpus}')").fetchall()[0][0]
     print(f"corpus_rows_in_file={total} expected={CORPUS_ROWS} rows_used={args.rows} "
           f"slice_rows={args.slice_rows} sample_slice={args.sample_slice} "
           f"sample_rows={args.sample_slice * args.slice_rows}..{min((args.sample_slice + 1) * args.slice_rows, args.rows)}",
           flush=True)
     if total != CORPUS_ROWS:
         raise SystemExit(f"corpus holds {total} rows, expected {CORPUS_ROWS}")
+    run = dict(rows=args.rows, slice_rows=args.slice_rows, sample_slice=args.sample_slice,
+               boxes=args.boxes, corpus_rows_in_file=total)
+    state = dict(run=run, stmt={})
+    if os.path.exists(args.state):
+        with open(args.state) as f:
+            state = json.load(f)
+        if state["run"] != run:
+            raise SystemExit(f"{args.state} was written by a run with other arguments: {state['run']}")
+    for number in args.statements:
+        if not run_statement(con, args, STATEMENTS[number], state, deadline):
+            log("budget spent; rerun the same command to resume")
+            sys.exit(3)
     all_results = {}
     for number in args.statements:
         st = STATEMENTS[number]
         print(f"stmt={number} keys=" + ",".join(f"{c.name}:{c.arrow}" for c in st.routed_columns[:-1])
               + f" state={COUNT.name}:{COUNT.arrow} sql={st.sql!r}", flush=True)
-        all_results[number] = run_statement(con, args, st, sys.stdout)
+        all_results[number] = report(args, st, state["stmt"][str(number)], sys.stdout)
     verdicts(all_results, args.boxes, sys.stdout)
 
 
