@@ -140,7 +140,7 @@ use crate::{
 };
 
 mod bucket_config;
-pub(crate) use bucket_config::parse_iso8601;
+pub(crate) use bucket_config::{SigningClock, SystemSigningClock, parse_iso8601};
 use bucket_config::{BucketControlPlaneClient, ReportNotes};
 
 mod credentials;
@@ -152,7 +152,7 @@ use instance_role::{DEFAULT_IMDS_ENDPOINT, InstanceRoleCredentialProvider};
 mod checksum;
 use checksum::{CHECKSUM_MODE_ENABLED, CHECKSUM_MODE_HEADER, ObservedChecksum};
 
-mod http_date;
+pub(crate) mod http_date;
 
 pub(crate) mod list;
 use list::ListClient;

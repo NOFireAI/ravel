@@ -113,6 +113,19 @@ pub fn gcs_backend_identity(bucket: &str, base_url: Option<&str>) -> String {
     }
 }
 
+/// Canonical `backend_identity` string for an Azure-backed
+/// [`QualificationRecord`] (ADR-4158 decision 6): `az://<account>/<container>`
+/// on Azure's endpoint, and `az://<account>/<container>@<endpoint>` when an
+/// endpoint replaces it, so a qualification run against the fake or the
+/// emulator does not read as one of the real container. Credentials are left
+/// out, as in [`s3_backend_identity`].
+pub fn azure_backend_identity(account: &str, container: &str, endpoint: Option<&str>) -> String {
+    match endpoint {
+        Some(endpoint) => format!("az://{account}/{container}@{endpoint}"),
+        None => format!("az://{account}/{container}"),
+    }
+}
+
 /// One property the object store contract requires, named so a failure
 /// report can point at exactly what a backend cannot do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2475,6 +2488,31 @@ mod tests {
         assert_ne!(
             gcs_backend_identity("ravel-prod", Some("http://minio:9000")),
             s3_backend_identity(Some("ravel-prod"), Some("http://minio:9000")),
+        );
+    }
+
+    #[test]
+    fn azure_backend_identity_is_the_az_url_of_the_container() {
+        assert_eq!(
+            azure_backend_identity("ravelprod", "data", None),
+            "az://ravelprod/data"
+        );
+        assert_eq!(
+            azure_backend_identity(
+                "devstoreaccount1",
+                "data",
+                Some("http://127.0.0.1:10000/devstoreaccount1")
+            ),
+            "az://devstoreaccount1/data@http://127.0.0.1:10000/devstoreaccount1"
+        );
+        assert_ne!(
+            azure_backend_identity("ravelprod", "data", Some("http://127.0.0.1:10000")),
+            azure_backend_identity("ravelprod", "data", None),
+            "an emulator's qualification must not read as the real container's"
+        );
+        assert_ne!(
+            azure_backend_identity("ravelprod", "data", None),
+            gcs_backend_identity("ravelprod", None),
         );
     }
 
