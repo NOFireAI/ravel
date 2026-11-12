@@ -25,7 +25,7 @@ both were measured (#4072 comments 6802934028 and 6818187104):
    5, 16.8 s) and c6a.2xlarge (`bits` 4, 9.6 s, 1.72 GB of spill).
 2. **A string group key (#4132).** `admits` takes fixed-width keys only, so
    statements 19, 34 and 35, which group by `"SearchPhrase"` or `"URL"`, retry
-   on sort-merge on every box at 3.3 to 6.2 GB of spill each. In the two
+   on sort-merge on every box at 3.3 to 8.7 GB of spill each. In the two
    concurrent windows of M8 on c6a.2xlarge, 12 and 11 retries wrote 53.9 and
    47.8 GB. Concurrent QPS was 0.744, 0.761 and 0.847 of v0.28.0's on
    c6a.2xlarge, c6a.xlarge and c6a.large.
@@ -165,11 +165,18 @@ M8 box, the bytes an uncombined write-once route would write:
 - the compression ratio of the scratch format, from writing a sample of those
   rows through the same spill writer.
 
-The threshold, per statement and box, is the sort-merge retry's
-`spill_bytes_written` in M8's serial pass on that box (3.3 to 6.2 GB on
-c6a.2xlarge, read from the M8 server logs). The M8 logs show these three
-statements retrying in serial passes as well as concurrent windows on all
-three boxes.
+The threshold, per statement and box, is the smallest `spill_bytes_written`
+of that statement's sort-merge retries in M8, read from the M8 server logs
+(run `m8-t3-a7c3d527c-20261111T1124Z`). On c6a.large and c6a.xlarge these
+statements retried in the serial pass, three tries each. On c6a.2xlarge they
+did not retry in the serial pass, only in the concurrent windows, so the
+threshold there is read from the window logs.
+
+| statement | c6a.large, serial | c6a.xlarge, serial | c6a.2xlarge, concurrent |
+|---|---|---|---|
+| 19 | 4.65 GB | 3.58 GB | 3.29 GB |
+| 34 | 8.60 GB | 6.83 GB | 6.04 GB |
+| 35 | 8.60 GB | 6.83 GB | 6.04 GB |
 
 - If the prediction is below the threshold for every statement and box,
   decision 3 is built and decision 4 is not.
