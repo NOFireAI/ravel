@@ -269,7 +269,8 @@ ADR-2707 and ADR-3692 already impose on logs and spans leaves.
 - **Build.** Only when `metrics_label_index` (new fold setting, default
   off until the Stage 1 amendment, the same rule as ADR-3692 decision 5;
   the Stage 1 acceptance amendment below decides it defaults on wherever
-  leaves are built, and T10, #4145, flips the default) is on, and under ADR-3692's pair budget and pass accounting. A part whose
+  leaves are built, and T10, #4145, flips the default) is on, and under
+  ADR-3692's pair budget and pass accounting. A part whose
   leaf would exceed `KEY_INDEX_LEAF_BYTES_CAP` (predicted 1 % of the part's
   data bytes; the Stage 1 amendment fixes the figure; the Stage 1
   acceptance amendment below keeps it at 1 %) is left uncovered and
@@ -484,7 +485,8 @@ raw whatever the matrix says.
   selective metrics statement, two new `data.stats` counters, one new
   fold setting (`metrics_label_index`, off until the Stage 1 amendment;
   decided by the Stage 1 acceptance amendment below to default on wherever
-  leaves are built, flipped in T10, #4145), and compaction of high-cardinality metrics tenants becomes queryable at
+  leaves are built, flipped in T10, #4145), and compaction of
+  high-cardinality metrics tenants becomes queryable at
   8 GiB. Semantics, visibility and erasure bounds are unchanged.
 - The fold reads one more frame per newly sealed object and writes one
   leaf per metrics part; leaf bytes are reported and capped.
@@ -754,7 +756,7 @@ amendment.
 | row | target | Stage 1 figure | verdict | source |
 |---|---|---|---|---|
 | 2 | probe bytes at most 2 GB on the one-series `count_over_time` | not run: the statement is not in the `cardinality` corpus | not measured; stays open | comment 6749675340 |
-| 3 | objects opened = holders (predicted about 360); probe wire under 200 MB; leaf GETs at most 2 x covering parts; hash equal to unrouted | 1,601 of 2,908 objects opened (1,597 value holders plus 4 token objects); 1,307 pruned, exactly the value-holder prediction; probe 1,220 GETs and 631.5 MB; plan 1,067 GETs and 69.9 MB; 8.7 s; leaf GETs 3 per record on 1 covering part with n = 5 distinct values; hashes equal; the rerun stamped 1,596 value holders | miss on objects (over 600) and on probe bytes (over 500 MB); leaf GETs over the pre-registered 2 x covering parts (2) and inside the per-value bound below (10); restated below | measured 2026-11-10, comment 6790288400; rerun comment 6822878261 |
+| 3 | objects opened = holders (predicted about 360); probe wire under 200 MB; leaf GETs at most 2 x covering parts; hash equal to unrouted | 1,601 of 2,908 objects opened (1,597 value holders plus 4 token objects); 1,307 pruned, exactly the value-holder prediction; probe 1,220 GETs and 631.5 MB; plan 1,067 GETs and 69.9 MB; 8.7 s; leaf GETs 3 per record on 1 covering part with n = 5 distinct values; hashes equal; the rerun stamped 1,596 value holders | miss on objects (over 600) and on probe bytes (over 500 MB); leaf GETs over the pre-registered 2 x covering parts (2) and inside the judged bound (1 + n) x covering parts (6); restated below | measured 2026-11-10, comment 6790288400; rerun comment 6822878261 |
 | 4 | objects and bytes within 2 % of unrouted plus the probe gate allowance; no statement over 5 % slower; hashes equal | hashes equal on all three statements; `mb_fanout_total_rate` at the 120 s deadline in every regime (118.7 s median); the readout gives no per-statement object, byte or latency comparison for the two `full_range` statements | partial: hashes pass; the 2 % and 5 % checks are not established, and latency cannot be judged on a statement at its deadline | comment 6790288400 |
 | 5 | within 10 % of R6's 81.0 s; `catalog_get_delta` within 125 plus leaf GETs | 82.6 s (+2.0 %); 122 catalog GETs | pass | measured 2026-11-10, comment 6790288400 |
 | 6 | every L1 statement answers; no refusal or kill; hashes equal to L0; peak memory under 8 GiB | compaction worked (36 L1 objects, 4.33 GB from 26.7 GB of L0, 44 min, 0 failed, published); the L1 query pass logged 3 memory-budget reserve refusals in its first 3 minutes, held about 6 to 7.5 GB of the 8 GiB container, then the container was gone; all 315 records `error` (connection refused); `l1_entries_compared` 0; the kill reason was not captured | miss, owned by #4118; peak memory and the scan GET and wire bounds not measured | comment 6790288400 |
@@ -792,7 +794,9 @@ The owner decided on 2026-11-11 (comment 6790537615) to restate row 3 to
 the measured economics, with value holders as the bound. A value holder is
 an object of the resolved set whose LABEL_DICT holds, for at least one
 selector, its metric name and every positive equality value, as the
-harness counts it (`value_holders`, crates/ravel-bench/src/metrics_holders.rs). The 360-object prediction was the series-level figure, and a
+harness counts it (`value_holders`,
+crates/ravel-bench/src/metrics_holders.rs). The 360-object prediction was
+the series-level figure, and a
 value-presence index cannot reach it: `metricsbench-instance-0` sits in the
 dictionary of 55 % of the objects that hold the metric, because every L0
 object is a shard flush across all series, and an index of values cannot
@@ -828,7 +832,8 @@ no probe-bytes-per-object figure; #4149 aligns it with this restated row.
 
 ### Row 8: what covers the rewrite phase
 
-The owner decided on 2026-11-12 (comment 6823307226) to take no further box and to close row 8
+The owner decided on 2026-11-12 (comment 6823307226) to take no further
+box and to close row 8
 on the rerun's pending-phase measurement plus the existing tests. Each link
 of the rule has its own test:
 
@@ -955,6 +960,11 @@ refuse every `ravel-server --mode maintain`, `all` or `query` and every
 
 - Row 2 is not measured.
 - Row 6 misses (#4118).
+- Row 4's 2 % objects-and-bytes and 5 % latency checks on
+  `mb_fanout_total_rate` and the two `full_range` statements are not
+  established (only the hashes are), and latency cannot be judged on a
+  statement at the 120 s deadline; a rerun with a longer deadline or
+  without the deadline statements owns it.
 - Row 12's `mb_join_unless_quiet_instances` latency is not attributed.
 - Row 13 lacks the routed total and the leaf's part-month cost.
 - Row 7's per-advance cost of the metrics leaf is not measured.
