@@ -2145,15 +2145,28 @@ async fn azure_pinned_read_ordering(store: &AzureStore, root: &str) {
 }
 
 /// Suffix reads racing a writer that replaces the blob with contents of other
-/// lengths. Every read that succeeds returns the suffix of one version: its
-/// fill byte names the version, and the length it reports is that version's.
-/// A read the writer outran on every round is `Transient`, never mixed bytes.
+/// lengths. A byte's value depends on its position, and each version's last
+/// byte is its own marker, so the tail of one version matches no range of
+/// another. Every read that succeeds returns exactly the tail of one version
+/// and that version's length; a read the writer outran on every round is
+/// `Transient`, never bytes from two versions or from the wrong offset.
 async fn azure_suffix_read_races_overwrites(store: &AzureStore, root: &str) {
     const VERSIONS: u8 = 20;
     const SUFFIX: u64 = 16;
     let key = format!("{root}/suffix-race/k");
-    let version_len = |fill: u8| 64 + usize::from(fill - b'a') * 7;
-    let version = |i: u8| Bytes::from(vec![b'a' + i; version_len(b'a' + i)]);
+    let version = |i: u8| {
+        let len = 64 + usize::from(i) * 7;
+        let mut bytes: Vec<u8> = (0..len)
+            .map(|position| u8::try_from(position % 251).expect("below 251"))
+            .collect();
+        if let Some(last) = bytes.last_mut() {
+            *last = b'A' + i;
+        }
+        Bytes::from(bytes)
+    };
+    let tail = |bytes: &Bytes| {
+        bytes.slice(bytes.len() - usize::try_from(SUFFIX).expect("suffix fits usize")..)
+    };
     store
         .put(&key, version(0), PutOptions::default())
         .await
@@ -2173,18 +2186,20 @@ async fn azure_suffix_read_races_overwrites(store: &AzureStore, root: &str) {
         for _ in 0..usize::from(VERSIONS) * 2 {
             match store.get(&key, GetRange::Suffix(SUFFIX)).await {
                 Ok(read) => {
-                    let fill = read.data[0];
-                    assert!((b'a'..b'a' + VERSIONS).contains(&fill), "fill byte {fill}");
-                    assert!(
-                        read.data.iter().all(|b| *b == fill),
-                        "bytes of two versions in one suffix read: {:?}",
-                        read.data
-                    );
-                    assert_eq!(read.data.len(), 16);
+                    let matching: Vec<u8> = (0..VERSIONS)
+                        .filter(|i| tail(&version(*i)) == read.data)
+                        .collect();
+                    let [i] = matching[..] else {
+                        panic!(
+                            "a suffix read returned the tail of {} versions: {:?}",
+                            matching.len(),
+                            read.data
+                        );
+                    };
                     assert_eq!(
                         read.total_size,
-                        u64::try_from(version_len(fill)).expect("length fits u64"),
-                        "the reported length is the served version's"
+                        u64::try_from(version(i).len()).expect("length fits u64"),
+                        "the reported length is version {i}'s"
                     );
                     served += 1;
                 }
@@ -2202,7 +2217,7 @@ async fn azure_suffix_read_races_overwrites(store: &AzureStore, root: &str) {
         .get(&key, GetRange::Suffix(SUFFIX))
         .await
         .expect("suffix read once the writer stopped");
-    assert_eq!(last.data, version(VERSIONS - 1).slice(..16));
+    assert_eq!(last.data, tail(&version(VERSIONS - 1)));
     store.delete(&key).await.expect("delete");
 }
 
