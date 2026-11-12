@@ -1059,11 +1059,37 @@ profile exits 65 before anything starts, case z3) and not with
 `ENTRYPOINT` plus one variable, so the command line is the one above when the
 variable is empty, which it is without `MB_STAGE1` (cases a and z0; z0
 renders the file with `docker compose config` where the host has compose).
-With `MB_STAGE1=1`, `up` runs with it set to `--fold-key-index-leaves`, so
-ingest and every step before Stage 1 run with key-index leaves and without
-`--fold-metrics-label-index` (case z). The main `report.json`'s provenance
-then carries `comparable=false` and a `comparability_reason` naming those
-flags (case z; case a pins that a run without `MB_STAGE1` carries neither).
+With `MB_STAGE1=1`, `up` runs with `--fold-key-index-leaves` and the metrics
+label index off, so ingest and every step before Stage 1 run with key-index
+leaves and no `label_value` leaf (case z). The main `report.json`'s
+provenance then carries `comparable=false` and a `comparability_reason`
+naming those flags (case z; case a pins that a run without `MB_STAGE1`
+carries neither).
+
+**Label index flags.** Which flag puts the label index on or off depends on
+the image (issue #4145). An image built before it builds no `label_value`
+leaf unless asked, with `ravel-server --fold-metrics-label-index` and
+`ravel-cli catalog fold --metrics-label-index`; one built after builds it
+by default wherever leaves are built, and takes the opt-outs
+`--no-fold-metrics-label-index` and `--no-metrics-label-index`. Before `up`,
+step `stage1-flags` runs `docker run --rm --network none --entrypoint
+BINARY IMAGE ... --help` for the main image's `ravel-server` and `ravel-cli
+catalog fold`, and for the control image's `ravel-server` when the control
+arm is on, into `stage1-flags.{server,cli,control_server}.help.txt`, and
+reads which spelling each lists as an option. "On" is then the opt-in on an
+old binary and no flag on a new one; "off" is no flag on an old binary and
+the opt-out on a new one. A help text listing neither spelling, or both,
+ends the run with exit 70 at `stage1-flags` before anything is brought up,
+as does a probe that exits non-zero (cases zs3 to zs5).
+`stage1.label_index_flags` stamps each binary's image, command, spelling,
+help file and its on and off flags, and `stage1.server_flags_up`,
+`_unrouted`, `_routed` and `_control` the resolved server flag sets (cases
+zs1 and zs2). On a new image, for example, up runs with
+`--fold-key-index-leaves --no-fold-metrics-label-index`, the unrouted pass
+with `--disable-fold` before those, and the routed pass with
+`--disable-fold --fold-key-index-leaves`; on an old one, up runs with
+`--fold-key-index-leaves` and the routed pass adds
+`--fold-metrics-label-index`.
 
 **Steps.** After `readback-folded` (step 18), and only when it ran, these
 run in this order (case z pins the order and each command's flags); a
@@ -1077,7 +1103,8 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
 `stage1.background_fold` stamps that.
 
 1. `stage1-fold`: ravel-server recreated with `--disable-fold
-   --fold-key-index-leaves` (stamped as `stage1.fold_restart`), then
+   --fold-key-index-leaves` and the label index off (the unrouted flags,
+   stamped as `stage1.fold_restart`), then
    `ravel-cli catalog fold --signal metrics --json` on `ravel-qualify` with
    no leaf flag and no `--writers-stopped`, into `stage1-fold.json`.
    `stage1.fold` stamps its `wall_ms`, `watermark_hour`,
@@ -1123,7 +1150,7 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    cold stamp says `not applicable`; a cold stamp that failed leaves this
    stamp a `failed:` string instead, so its band reads it as missing.
 3. `stage1-leaves`: `ravel-cli catalog fold --rebuild-key-index --signal
-   metrics --metrics-label-index --json`, into `stage1-leaves.json`.
+   metrics --json` with the label index on, into `stage1-leaves.json`.
    `stage1.leaves` stamps `wall_ms` and the report's `leaves_written`,
    `leaf_bytes_written`, `leaf_prefix_bytes_read`, `section_bytes_read`,
    `attempt_count`, its part counts (`parts_unindexed`, `parts_rebuilt`,
@@ -1135,8 +1162,8 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    report's attempts. The report counts no GET of the snapshot HEAD, and
    `requests.not_reported` says so. Exit 70 on a failed rebuild (case z7).
 4. `stage1-restart`: ravel-server recreated with `--disable-fold
-   --fold-key-index-leaves --fold-metrics-label-index` (stamped as
-   `stage1.restart`).
+   --fold-key-index-leaves` and the label index on (the routed flags,
+   stamped as `stage1.restart`).
 5. `stage1-routed`: the inspect again, into `stage1-routed.inspect.txt` and
    `stage1.routed_catalog`, refused when fewer parts carry a `label_value`
    leaf than `stage1-leaves` rebuilt (`parts_rebuilt`, case z13), and
@@ -1273,8 +1300,10 @@ routed pass read. Each arm's cost in requests and bytes is listed under its
 own step, as the run records it; a request the run does not count says so.
 
 8. `stage1-control` (row 12): ravel-server recreated from `MB_CONTROL_IMAGE`
-   with the unrouted flags (`stage1.control_restart`); `docker image inspect`
-   must report the digest (exit 70 naming the step when it does not). Both
+   with the unrouted flags in the control image's spelling
+   (`stage1.server_flags_control`, stamped as `stage1.control_restart`);
+   `docker image inspect` must report the digest (exit 70 naming the step
+   when it does not). Both
    images' digests and source commits are stamped as `stage1.control_image`
    (`main` and `control`). Then the passes as in step 2 with `--pass-label
    folded-control` and the image appended to `--fold-state`, into
@@ -1316,7 +1345,7 @@ own step, as the run records it; a request the run does not count says so.
     `stage1-leaves` (`head-leafless`, the HEAD `stage1-fold` published, which
     no leaf build has touched) and the routed one after it
     (`head-routed`). Then `catalog fold --signal metrics --writers-stopped
-    --key-index-leaves --metrics-label-index` from the routed HEAD, timed
+    --key-index-leaves` with the label index on, from the routed HEAD, timed
     (`stage1.extra_hour_fold_on`), and the HEAD it published saved
     (`head-fold-on`).
     Cost: the fold report's LIST, GET and PUT counts and the key-index
@@ -1374,7 +1403,7 @@ own step, as the run records it; a request the run does not count says so.
     Cost: compact-tenant reports hours and parts, not requests or bytes; the
     L1 bytes it wrote are `stage1.l1_objects.l1_bytes` (step 16).
 15. `stage1-l1-fold`: `catalog fold --signal metrics --writers-stopped
-    --key-index-leaves --metrics-label-index` (`stage1.l1_fold`).
+    --key-index-leaves` with the label index on (`stage1.l1_fold`).
     Cost: the fold report's LIST, GET and PUT counts and leaf bytes,
     stamped.
 16. `stage1-l1`: ravel-server recreated with the routed flags
@@ -1476,7 +1505,7 @@ own step, as the run records it; a request the run does not count says so.
     Cost: the rewrite's requests are not counted; its log is
     `stage1-erasure-maintain.log`.
 21. `stage1-erasure-fold`: ravel-server stopped, `catalog fold --signal
-    metrics --writers-stopped --key-index-leaves --metrics-label-index`
+    metrics --writers-stopped --key-index-leaves` with the label index on
     (`stage1.erasure_fold`).
     Cost: the fold report's LIST, GET and PUT counts and leaf bytes,
     stamped.
@@ -1549,7 +1578,7 @@ example (values illustrative):
  "segmentsFetched": 4, "segmentsPruned": 6, "segmentsPrunedByDictionary": 3,
  "segmentsPrunedByLabelIndex": 3, "estimate": null, "io": null,
  "pass_label": "folded-routed",
- "fold_state": "folded: watermark_hour=490001; parts=4; label_value leaf parts=4; ravel-server --disable-fold --fold-key-index-leaves --fold-metrics-label-index",
+ "fold_state": "folded: watermark_hour=490001; parts=4; label_value leaf parts=4; ravel-server --disable-fold --fold-key-index-leaves",
  "result_hash": "blake3:..."}
 ```
 
