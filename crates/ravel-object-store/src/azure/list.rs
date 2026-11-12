@@ -158,9 +158,9 @@ pub(crate) struct ListRequest<'a> {
 /// One parsed List Blobs response, names decoded.
 #[derive(Debug, Default)]
 pub(crate) struct ListResponse {
-    items: Vec<ObjectMeta>,
-    prefixes: Vec<String>,
-    next_marker: Option<String>,
+    pub(crate) items: Vec<ObjectMeta>,
+    pub(crate) prefixes: Vec<String>,
+    pub(crate) next_marker: Option<String>,
 }
 
 /// Where the paging loops get their responses: [`AzureRestClient`] in
@@ -896,7 +896,10 @@ fn error_code(body: &[u8]) -> Option<String> {
     (!code.is_empty()).then(|| code.to_string())
 }
 
-fn parse_list(prefix: &str, body: &[u8]) -> Result<ListResponse, StoreError> {
+/// One List Blobs response body, names decoded. Anything but an
+/// `<EnumerationResults>` whose every `Blob` carries a name, a length, a
+/// `Last-Modified` and an `Etag` is [`StoreError::Permanent`].
+pub(crate) fn parse_list(prefix: &str, body: &[u8]) -> Result<ListResponse, StoreError> {
     let refuse = |detail: String| StoreError::Permanent(format!("listing {prefix:?}: {detail}"));
     let root = parse_xml(body)
         .map_err(|e| refuse(format!("the response is not a List Blobs result: {e}")))?;

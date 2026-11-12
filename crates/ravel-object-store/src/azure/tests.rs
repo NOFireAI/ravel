@@ -5,7 +5,7 @@ use bytes::Bytes;
 use proptest::prelude::*;
 
 use super::fake::{FakeAzure, HnsAnswer, RecordedRequest};
-use super::list::{decode_encoded_name, parse_xml};
+use super::list::{decode_encoded_name, parse_list, parse_xml};
 use super::{
     AzureConfig, AzureStore, CREDENTIAL_ENV_KEYS, CredentialEnv, SUFFIX_ROUNDS, store_authority,
 };
@@ -1079,6 +1079,15 @@ fn encode_all(name: &str) -> String {
         .collect()
 }
 
+/// `text` with XML's five special characters escaped.
+fn xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 proptest! {
     #[test]
     fn parse_xml_never_panics(body in proptest::collection::vec(any::<u8>(), 0..512)) {
@@ -1088,6 +1097,66 @@ proptest! {
     #[test]
     fn parse_xml_never_panics_on_near_xml(body in "[<>/=\"a-zA-Z &;#x0-9!\\[\\]?-]{0,200}") {
         let _ = parse_xml(body.as_bytes());
+    }
+
+    #[test]
+    fn parse_list_gives_a_page_or_a_typed_error(
+        body in proptest::collection::vec(any::<u8>(), 0..512),
+    ) {
+        match parse_list("p/", &body) {
+            Ok(_) | Err(StoreError::Permanent(_)) => {}
+            Err(other) => prop_assert!(false, "{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_list_gives_a_page_or_a_typed_error_on_near_list_xml(
+        body in "<EnumerationResults>(<Blobs>(<Blob>(<Name( Encoded=\"true\")?>[%0-9A-Fa-z/]{0,12}</Name>)?(<Properties>(<Etag>[0-9xA-F\"]{0,6}</Etag>)?(<Content-Length>[0-9-]{0,4}</Content-Length>)?(<Last-Modified>[A-Za-z0-9 ,:]{0,30}</Last-Modified>)?</Properties>)?</Blob>|<BlobPrefix>(<Name>[a-z/]{0,6}</Name>)?</BlobPrefix>){0,3}</Blobs>)?(<NextMarker>[a-z0-9]{0,4}</NextMarker>)?</EnumerationResults>",
+    ) {
+        match parse_list("p/", body.as_bytes()) {
+            Ok(_) | Err(StoreError::Permanent(_)) => {}
+            Err(other) => prop_assert!(false, "{other:?}"),
+        }
+    }
+
+    /// A well-formed response lists every name exactly as stored, encoded or
+    /// not, with the HEAD-quoted ETag.
+    #[test]
+    fn parse_list_returns_every_listed_name(
+        names in proptest::collection::vec(("\\PC{1,16}", any::<bool>()), 0..6),
+        marker in proptest::option::of("[a-z0-9]{1,8}"),
+    ) {
+        let mut body = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?><EnumerationResults><Blobs>");
+        for (name, encoded) in &names {
+            body.push_str("<Blob>");
+            if *encoded {
+                body.push_str(&format!("<Name Encoded=\"true\">{}</Name>", encode_all(name)));
+            } else {
+                body.push_str(&format!("<Name>{}</Name>", xml_text(name)));
+            }
+            body.push_str(
+                "<Properties><Last-Modified>Thu, 12 Nov 2026 21:50:51 GMT</Last-Modified>\
+                 <Etag>0x8DE0000000000001</Etag><Content-Length>3</Content-Length>\
+                 </Properties></Blob>",
+            );
+        }
+        body.push_str("</Blobs>");
+        match &marker {
+            Some(marker) => body.push_str(&format!("<NextMarker>{marker}</NextMarker>")),
+            None => body.push_str("<NextMarker />"),
+        }
+        body.push_str("</EnumerationResults>");
+
+        let parsed = parse_list("", body.as_bytes()).expect("a well-formed listing");
+        let listed: Vec<&str> = parsed.items.iter().map(|m| m.key.as_str()).collect();
+        let expected: Vec<&str> = names.iter().map(|(name, _)| name.as_str()).collect();
+        prop_assert_eq!(listed, expected);
+        for item in &parsed.items {
+            prop_assert_eq!(item.etag.0.as_str(), "\"0x8DE0000000000001\"");
+            prop_assert_eq!(&item.version.0, &item.etag.0);
+            prop_assert_eq!(item.size, 3);
+        }
+        prop_assert_eq!(parsed.next_marker, marker);
     }
 
     #[test]
