@@ -74,9 +74,14 @@ services:
         condition: service_completed_successfully
     # The image's own ENTRYPOINT, plus RAVEL_SERVER_EXTRA_FLAGS, which is
     # empty by default and leaves the command line unchanged. run.sh sets it
-    # only under MB_STAGE1=1 (ADR-3694 Stage 1, issue #3968): first
-    # --fold-key-index-leaves, then, for the routed pass, that and
-    # --fold-metrics-label-index. Compose splits the string into words; the
+    # only under MB_STAGE1=1 (ADR-3694 Stage 1, issue #3968):
+    # --fold-key-index-leaves with the metrics label index off until the
+    # routed pass, and on for it. The label index flag depends on the image
+    # (issue #4145): one built before takes the opt-in
+    # --fold-metrics-label-index, one built after builds the index by
+    # default and takes the opt-out --no-fold-metrics-label-index. run.sh
+    # reads the image's --help and passes whichever flag, if any, reaches the
+    # state it wants. Compose splits the string into words; the
     # image has no shell. capture-effective-config.sh records the entrypoint
     # beside the command.
     entrypoint: /usr/local/bin/ravel-server ${RAVEL_SERVER_EXTRA_FLAGS:-}
