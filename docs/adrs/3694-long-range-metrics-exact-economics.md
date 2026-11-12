@@ -267,10 +267,12 @@ ADR-2707 and ADR-3692 already impose on logs and spans leaves.
   instead of `None`. No proto field is added, the leaf format version does
   not move, and the key layout gains no prefix.
 - **Build.** Only when `metrics_label_index` (new fold setting, default
-  off until the Stage 1 amendment, the same rule as ADR-3692 decision 5)
-  is on, and under ADR-3692's pair budget and pass accounting. A part whose
+  off until the Stage 1 amendment, the same rule as ADR-3692 decision 5;
+  the Stage 1 acceptance amendment below turns it on wherever leaves are
+  built) is on, and under ADR-3692's pair budget and pass accounting. A part whose
   leaf would exceed `KEY_INDEX_LEAF_BYTES_CAP` (predicted 1 % of the part's
-  data bytes; the Stage 1 amendment fixes the figure) is left uncovered and
+  data bytes; the Stage 1 amendment fixes the figure; the Stage 1
+  acceptance amendment below keeps it at 1 %) is left uncovered and
   the fold reports it. The build reads LABEL_DICT by range on an object the
   fold has not already read whole.
 - **Binding and erasure.** The leaf binds to the part blake3 as every leaf
@@ -480,8 +482,9 @@ raw whatever the matrix says.
 
 - An operator sees fewer objects opened and fewer catalog bytes per
   selective metrics statement, two new `data.stats` counters, one new
-  fold setting (`metrics_label_index`, off until the Stage 1 amendment),
-  and compaction of high-cardinality metrics tenants becomes queryable at
+  fold setting (`metrics_label_index`, off until the Stage 1 amendment;
+  on wherever leaves are built since the Stage 1 acceptance amendment
+  below), and compaction of high-cardinality metrics tenants becomes queryable at
   8 GiB. Semantics, visibility and erasure bounds are unchanged.
 - The fold reads one more frame per newly sealed object and writes one
   leaf per metrics part; leaf bytes are reported and capped.
@@ -504,13 +507,15 @@ repetitions per statement (restart between), the MetricsBench harness and
 corpus at their frozen versions. "Holders" is the stamped number of
 objects that contain the statement's series. Rows 4 and 12 are read with
 the probe gate amendment's extra-GET allowance. Row 6 is read with the
-whole-series batch amendment's GET and wire-byte allowances.
+whole-series batch amendment's GET and wire-byte allowances. The Stage 1
+acceptance amendment below records what Stage 1 measured against each
+row and restates row 3.
 
 | check | target | miss | source |
 |---|---|---|---|
 | 1. `history` baseline on Ravel (wave 0): the three `long_range` statements and `mb_full_range_avg_over_time`, steady-state and cold, with GETs and bytes per phase, parts per covering hour, part fullness, object event-time spread | recorded; `mb_long_range_7d_avg` under 120 s; resolve plus plan plus probe share of GETs recorded as decision 6's trigger input | a timeout, or a missing stamp | predicted |
 | 2. one-series `count_over_time` (`samples.0`), cold, unfolded, after decision 1 | probe GETs = objects qualified (14,000 to 15,300) plus holders; probe wire bytes at most objects x dictionary bytes plus holders x 530 KB, where dictionary bytes is measured first and under 100 KB; `segmentsPrunedByDictionary` = objects minus holders; answer 357 | probe bytes above 2 GB, or any other answer | predicted; E8 measured 7.63 GB, #3511 comment 6565071955 |
-| 3. R6 `mb_single_counter_rate`, folded with leaves | leaf GETs at most 2 x covering parts; objects opened = holders (about 360 of 2,899); probe wire under 200 MB; `segmentsPrunedByLabelIndex` = 2,899 minus holders; result hash equal to the unrouted run | over 600 objects opened or over 500 MB | predicted; R6 measured 2,899 opened and 1,031 MB, release metricsbench-r6-20261105 |
+| 3. R6 `mb_single_counter_rate`, folded with leaves | leaf GETs at most 2 x covering parts; objects opened = holders (about 360 of 2,899) (restated to value holders by the Stage 1 acceptance amendment below); probe wire under 200 MB; `segmentsPrunedByLabelIndex` = 2,899 minus holders; result hash equal to the unrouted run | over 600 objects opened or over 500 MB | predicted; R6 measured 2,899 opened and 1,031 MB, release metricsbench-r6-20261105 |
 | 4. R6 `mb_fanout_total_rate` and the two `full_range` instant statements, folded with leaves | objects opened and bytes within 2 % of the unrouted run (every object holds the name); no statement over 5 % slower; result hashes equal | over 5 % slower or any extra GET | predicted; R6 figures in the Stage 0 table |
 | 5. `series` listing of 1,000,000 series, cold, real S3, folded | within 10 % of R6's 81.0 s and `catalog_get_delta` within 125 plus leaf GETs | over 100 s | measured 2026-11-05, #940 comment 6664968984 |
 | 6. the #3818 arm: the same tenant compacted to its L1 parts, frozen query flags, all 8 statements | every statement answers; no `fetch memory exhausted`; peak container memory under 8 GiB; result hashes equal to the L0 arm; scan GETs at most the unbatched call's plus one per split run and wire bytes at most the unbatched call's; decompressed bytes per statement recorded against the L0 arm as decision 6's run-span input | any refusal, kill, or hash difference, or scan GETs or wire bytes above those bounds | predicted; #3818 measured three failures |
@@ -533,7 +538,7 @@ whole-series batch amendment's GET and wire-byte allowances.
 | T5 router on metrics: `KeySet` from the selector, `prefetch_metric_plans` wiring, `segmentsPrunedByLabelIndex`, the reachability test on `/api/v1/query_range` | 3, 5 | ravel-query (engine, key_index_route), ravel-server (tests) | T3, T4 landed | medium |
 | T6 codec bakeoff: timestamp candidates first, DeXOR and vectorised ALP, stale-marker proptest rows, the report | 7 | ravel-bench (bakeoff binaries, codecs.rs), ravel-segment (proptest rows only) | none; not with T2 (ravel-segment) | low |
 | T7 operator matrix and differential oracle | 8 | ravel-promql (tests), docs | none | medium |
-| T8 Stage 1 run on real S3: rows 2 to 9 and 12, 13; acceptance amendment; `metrics_label_index` default on | all | docs, ravel-catalog (one default) | T2, T4, T5 | low |
+| T8 Stage 1 run on real S3: rows 2 to 9 and 12, 13; acceptance amendment; `metrics_label_index` default on (moved to its own task, T10, by the Stage 1 acceptance amendment below) | all | docs, ravel-catalog (one default; T10 spans ravel-catalog, ravel-server, ravel-cli and docs) | T2, T4, T5 | low |
 | T9 L2 (ADR-0593 follow-ups 1 to 4 plus the version fix and `max_run_span_hours`) | 6 | ravel-maintain, ravel-catalog, ravel-commit, proto (additive), docs | T1's trigger met and the amendment posted; not dispatched otherwise | high |
 | final: docs/query-engine.md, docs/guides/cost-model.md, README cost rows, ADR-0020 and ADR-2707 pointers | all | docs | T8 | low |
 
@@ -716,3 +721,240 @@ prunes nothing on metrics while an erasure request is pending, that is
 while a `.dreq` request is listed under `del/`; `.done` records do not
 count. The PromQL resolve reads this from the pinned snapshot's pending
 erasures, the `.dreq` requests that resolve decoded.
+
+## Amendment (issues #3868 and #3694): Stage 1 acceptance, row 3 restated, and `metrics_label_index` on wherever leaves are built
+
+<!-- amendment-applies: sections="2. The fold builds a label-value index for metrics parts, in the `.kidx` leaf|Consequences|Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)|Plan" pointer="Stage 1 acceptance amendment" -->
+<!-- amendment-supersedes: phrase="off until the Stage 1 amendment" pointer="Stage 1 acceptance amendment" -->
+<!-- amendment-supersedes: phrase="the Stage 1 amendment fixes the figure" pointer="Stage 1 acceptance amendment" -->
+<!-- amendment-supersedes: phrase="objects opened = holders (about 360 of 2,899)" pointer="Stage 1 acceptance amendment" -->
+<!-- amendment-supersedes: phrase="`metrics_label_index` default on" pointer="Stage 1 acceptance amendment" -->
+
+Date: 2026-11-12. T8 (#3868) ran Stage 1 on real S3 in two runs, both on
+one m6a.4xlarge in us-east-1 with the `cardinality` profile and the image
+`manual-b70ac3d` (main b70ac3dbf):
+
+- The first run, `mb-t8s1-20261110a-20261110T073644Z-a091014e4`, ran every
+  arm. It was pre-registered in comment 6749675340 (updated in comments
+  6750169595 and 6750787808) and read out in comment 6790288400. Its state
+  check matched the pre-registration through the routed pass: fold
+  watermark 498423 with 1 part and 6 leaf refs. A warm pass took 3 h 26 min,
+  not the 1.7 h budgeted, because three statements sit at the 120 s
+  deadline.
+- The erasure-only rerun, `mb-t8r-20261111c-20261111T122614Z-c17368f9a`
+  (harness c17368f9a, #4121), repeated ingest and the base passes on the
+  same anchor. It was pre-registered in comment 6794738307 and read out in
+  comment 6822878261.
+
+Rows 1, 10 and 11 belong to T1, T6 and T7 and are not part of this
+amendment.
+
+### What each row measured
+
+| row | target | Stage 1 figure | verdict | source |
+|---|---|---|---|---|
+| 2 | probe bytes at most 2 GB on the one-series `count_over_time` | not run: the statement is not in the `cardinality` corpus | not measured; stays open | comment 6749675340 |
+| 3 | objects opened = holders (predicted about 360); probe wire under 200 MB; leaf GETs at most 2 x covering parts; hash equal to unrouted | 1,601 of 2,908 objects opened (1,597 value holders plus 4 token objects); 1,307 pruned, exactly the value-holder prediction; probe 1,220 GETs and 631.5 MB; plan 1,067 GETs and 69.9 MB; 8.7 s; leaf GETs 3 per record on 1 covering part with n = 5 distinct values; hashes equal; the rerun stamped 1,596 value holders | miss on objects (over 600) and on probe bytes (over 500 MB); leaf GETs over the pre-registered 2 x covering parts (2) and inside the per-value bound below (10); restated below | measured 2026-11-10, comment 6790288400; rerun comment 6822878261 |
+| 4 | objects and bytes within 2 % of unrouted plus the probe gate allowance; no statement over 5 % slower; hashes equal | hashes equal on all three statements; `mb_fanout_total_rate` at the 120 s deadline in every regime (118.7 s median); the readout gives no per-statement object, byte or latency comparison for the two `full_range` statements | partial: hashes pass; the 2 % and 5 % checks are not established, and latency cannot be judged on a statement at its deadline | comment 6790288400 |
+| 5 | within 10 % of R6's 81.0 s; `catalog_get_delta` within 125 plus leaf GETs | 82.6 s (+2.0 %); 122 catalog GETs | pass | measured 2026-11-10, comment 6790288400 |
+| 6 | every L1 statement answers; no refusal or kill; hashes equal to L0; peak memory under 8 GiB | compaction worked (36 L1 objects, 4.33 GB from 26.7 GB of L0, 44 min, 0 failed, published); the L1 query pass logged 3 memory-budget reserve refusals in its first 3 minutes, held about 6 to 7.5 GB of the 8 GiB container, then the container was gone; all 315 records `error` (connection refused); `l1_entries_compared` 0; the kill reason was not captured | miss, owned by #4118; peak memory and the scan GET and wire bounds not measured | comment 6790288400 |
+| 7 | leaf bytes at most 1 % of part data bytes; fold wall with the switch on within 10 % of off; uncovered parts 0 | leaf bytes 0.77 % of the re-encoded parts' data bytes; uncovered tail parts 0; wall ratio 2.42 with `repartitioned_parts` = 1; leaf build 202,931 GETs for 25,401 objects | leaf bytes and coverage pass; wall ratio not judged, by the rule of the second pre-registration update; build GETs recorded below | measured 2026-11-10, comments 6790288400 and 6750787808 |
+| 8 | no label-index prune while an erasure is pending; pending results equal the reference; after the rewrite and fold no surviving key, carried part or stale leaf | first run: arm voided by a harness defect, no erasure submitted; rerun pending phase: 18 entries compared, 18 equal, 0 differing, `other_records_pruned_by_label_index` 0, `label_index_null` 0; rewrite phase: the maintain container (8 GiB, 2 cores, four concurrent merges) logged nothing after its first 14 s and was found exited with the erasure still pending | pending phase pass; rewrite phase not measured, closed on the tests listed below | measured 2026-11-12, comment 6822878261 |
+| 9 | Prometheus-oracle statuses as R6, folded and unfolded, routed and unrouted; no new `incorrect` | no new engine `incorrect`; 19 entries equal between routed and unrouted and no status differs; the one change against R6 is `mb_fanout_topk_instances`, tie order (#3848, a grading issue); the two R6 timeouts persist; `mb_fanout_total_rate` sits at the 120 s deadline (118.7 s median, and timed out in the rerun) | pass | comments 6790288400 and 6822878261 |
+| 12 | no statement over 5 % slower outside the lane's noise; no GET or byte increase beyond the probe gate allowance | GETs and bytes within the allowance on every statement, the largest `mb_single_gauge_delta` at +1,201 GETs against 2,726; the T2 probe prunes 73 to 100 % on the three joins and under 2 % on single-series selectors; `mb_join_cpu_on_build_version` 15 % slower (317 dictionary-probe GETs the control had cached); `mb_join_unless_quiet_instances` 9.5 % slower with identical I/O; the whole pass about 3 % slower | GETs and bytes pass; latency miss on 2 of 21 statements, one explained, one not attributed by the run's files | comment 6790288400 |
+| 13 | dollars per R6 statement before and after, plus the leaf's fold cost per part-month | `mb_single_counter_rate`: R6 $0.0117, unrouted $0.0160, control $0.0135; routed plan and probe $0.0074 (recomputed below); no routed scan figure, no leaf PUT count, no part-month figure | partial: the before figures and a routed plan-plus-probe figure; the routed total and the part-month figure are missing | comment 6790288400 |
+
+### Recomputed figures
+
+- Row 3: the unrouted pass fetches 2,908 objects, the resolved set of
+  2,904 plus 4 token objects; 2,904 - 1,597 = 1,307 pruned, 45.0 % of the
+  resolved set, and 1,597 + 4 = 1,601 opened.
+  Probe wire per opened object is 631.5 MB / 1,601 = 394 KB, against R6's
+  1,031 MB / 2,899 = 356 KB on the older build.
+- Row 5: 82.6 s / 81.0 s = 1.020.
+- Row 7: 202,931 GETs / 25,401 objects = 8.0 GETs per object. The first
+  readout calls this one ranged GET per object, which its own figures do
+  not support; it does not split the GETs by pass or by kind (footer,
+  LABEL_DICT, carried leaf). That fold re-partitioned the whole history
+  part under the day seal, so the figure is the first switch-on fold's
+  cost. The per-advance cost of the metrics leaf on an unchanged tail plus
+  one new hour is not measured. At $0.40 per million GETs the 202,931 GETs
+  cost $0.081.
+- Row 13, R6: 3,440 GETs x $0.40 per million = $0.0014, plus 1.11 GB =
+  1.034 GiB x $0.01 = $0.0103, total $0.0117, which matches the readout.
+  Routed plan plus probe, taking MB as 10^6 bytes: 2,287 GETs ($0.0009)
+  and 701.4 MB = 0.653 GiB ($0.0065), $0.0074 before the scan and leaf
+  phases.
+
+### Row 3, restated to value holders
+
+The owner decided on 2026-11-11 (comment 6790537615) to restate row 3 to
+the measured economics, with value holders as the bound. A value holder is
+an object of the resolved set whose LABEL_DICT holds, for at least one
+selector, its metric name and every positive equality value, as the
+harness counts it (`value_holders`, crates/ravel-bench/src/metrics_holders.rs). The 360-object prediction was the series-level figure, and a
+value-presence index cannot reach it: `metricsbench-instance-0` sits in the
+dictionary of 55 % of the objects that hold the metric, because every L0
+object is a shard flush across all series, and an index of values cannot
+say that `instance-0`, `method` and `status` occur on one series. The
+series-level bound on this tenant is 141 objects. A series-level index aimed
+at that bound is a follow-up, unfiled.
+
+| check | target | miss | source |
+|---|---|---|---|
+| 3 (restated). R6 `mb_single_counter_rate`, folded with leaves | `segmentsPrunedByLabelIndex` = the resolved set minus value holders (`expected_routed_prunes`), exactly (`holders_routed_prune_mismatches` 0), value holders stamped per run; objects opened = value holders plus the objects a `min_commit_token` adds outside the resolved set, which are never routed (`token_only_fetched`, 4 in T8); leaf GETs at most 2 x n x covering parts for n distinct values; probe wire bytes per opened object at most 394 KB, the T8 figure; result hash equal to the unrouted run | a prune count other than that, leaf GETs over the bound, probe wire bytes per opened object over 434 KB (10 % above the T8 figure), or a hash difference | measured 2026-11-10, comment 6790288400; owner decision comment 6790537615; the 10 % miss line is predicted |
+
+The target is read against each run's own value-holder stamp. The two runs
+stamped 1,597 and 1,596 on the same tenant and binary; the rerun
+pre-registration named a different count as a sign the state differs, and
+the rerun readout does not explain the one object.
+
+### The leaf GET bound per value
+
+The per-value routing amendment bounds a statement with `n` distinct values
+at `n` passes of the one-pass budget. Per covering part, one value's pass
+reads GET 1 of the one slice its key falls in and at most one bucket run,
+so a statement costs at most `2n` leaf GETs per covering part, and each
+pass stays under its own `KEY_INDEX_LEAF_GET_CEILING`. When the query's
+read cache serves a slice's GET 1 to the later passes (it hands concurrent
+misses one GET), a part costs at most its touched slices plus `n`, which
+is `1 + n` on a one-slice leaf. The harness band
+`route_values_leaf_gets_over_bound` checks `(1 + n)` x covering parts,
+which assumes that cache and one slice per part; T8 read 3 against both
+bounds (6 and 10). The doc comment on `KEY_INDEX_LEAF_GET_CEILING`
+(`crates/ravel-catalog/src/snapshot_format/kidx.rs`) states this rule.
+
+### Row 8: what covers the rewrite phase
+
+The owner decided on 2026-11-12 to take no further box and to close row 8
+on the rerun's pending-phase measurement plus the existing tests. Each link
+of the rule has its own test:
+
+- No metrics leaf is built while an erasure is pending:
+  `a_pending_erasure_request_builds_no_metrics_leaf`
+  (crates/ravel-catalog/src/fold.rs:20225),
+  `a_metrics_day_sealed_under_the_erasure_gate_is_counted_until_repaired`
+  (crates/ravel-catalog/src/fold.rs:19426), and for the rebuild
+  `a_pending_erasure_request_gates_the_metrics_rebuild`
+  (crates/ravel-catalog/src/key_index_rebuild.rs:2605).
+- Nothing is routed while an erasure is pending: `a_pending_erasure_routes_nothing`
+  (services/ravel-server/tests/metrics_label_index_routing.rs:823) and
+  `a_pending_erasure_routes_no_value`
+  (crates/ravel-query/src/key_index_route/tests.rs:2146).
+- The metrics rewrite publishes, the input holding the subject is swept and
+  the subject is physically absent:
+  `metrics_erasure_reaches_query_cache_rewrite_and_physical_absence`
+  (services/ravel-server/src/erasure_e2e.rs:483). It folds with no leaf.
+- An unreferenced leaf is swept past the protection horizon and a
+  referenced one is kept: `catalog_sweep_reaps_unreferenced_kidx_and_keeps_referenced_leaves`
+  (crates/ravel-maintain/src/sweep.rs:6470), on a logs leaf; the sweep
+  reads field 8 per (tenant, signal).
+
+No test drives one metrics leaf through the whole chain: rewrite, the next
+fold's re-encode with a new leaf that holds no key8 of a value only the
+erased series carried, and the stale leaf's sweep. That end-to-end test, in
+`erasure_e2e.rs` with leaves and the metrics label index on, is a
+follow-up, unfiled. The maintain container's death with four concurrent
+merges at 8 GiB is recorded on #4118 beside the row 6 miss.
+
+### `metrics_label_index` defaults on wherever leaves are built
+
+The owner decided on 2026-11-11 (comment 6790537615) that the metrics label
+index turns on by default. The index is built inside the key-index leaves,
+and the fold builds none unless `build_key_index_leaves` is on
+(`crates/ravel-catalog/src/fold.rs`, the `key_index_fields` gate). So the
+decision is: `metrics_label_index` defaults on, and takes effect wherever
+the fold builds leaves. It follows the leaf switch: an operator who turns
+leaves on gets the metrics leaf with no second flag, and an opt-out flag
+keeps it off.
+
+- Today this changes nothing on a default deployment.
+  `build_key_index_leaves` stays off by default under ADR-3692's Stage 1
+  amendment, #3927 bounds the advancing build first, and epic #3939 owns
+  the preconditions for turning the leaf switch on. Until then a metrics
+  leaf is built only where an operator turns leaves on.
+- The leaf switch is one bool across signals. After this change an
+  operator who runs leaves for logs or spans also builds metrics leaves,
+  at the cost row 7 measured for the first switch-on fold (about 8 GETs
+  per object), unless they pass the opt-out. The per-advance cost of the
+  metrics leaf is not measured, so it is one of the figures the leaf
+  switch's default has to wait on for metrics. This ADR does not turn
+  leaves on.
+- The rebuild (`catalog fold --rebuild-key-index --signal metrics`) runs
+  whatever `build_key_index_leaves` says and today needs
+  `--metrics-label-index`. After the change it builds the metrics leaf by
+  default, and with the opt-out it refuses metrics as
+  `KeyIndexRebuildError::UnsupportedSignal`, as it does today without the
+  flag.
+- The erasure gate, the leaf byte cap and the routing are unchanged.
+
+The leaf byte cap stays at 1 % of a part's data bytes: the setting is
+`metrics_label_index_max_ratio_ppm`, default 10,000 ppm
+(`DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM`,
+crates/ravel-catalog/src/config.rs:405), which decision 2 calls
+`KEY_INDEX_LEAF_BYTES_CAP`. T8 measured 0.77 % on one re-encoded part.
+
+The code change is its own task, T10, because it is not one default. Both
+existing refusals test the flag's value, not whether it was passed
+(`services/ravel-server/src/config.rs:7384`,
+`services/ravel-cli/src/catalog.rs:290`), so flipping a default alone would
+refuse every `ravel-server --mode maintain`, `all` or `query` and every
+`catalog fold` that runs without leaves. T10:
+
+1. `CatalogConfig::default()` sets `metrics_label_index: true`
+   (crates/ravel-catalog/src/config.rs:918), and its doc says so; the doc
+   on `DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM` cites the 0.77 %
+   measurement.
+2. `FoldTaskConfig::default()` sets `metrics_label_index: true`
+   (services/ravel-server/src/fold.rs:118), and its doc says so.
+3. ravel-server: `--fold-metrics-label-index` is replaced by an opt-out,
+   `--no-fold-metrics-label-index`, mapped at
+   services/ravel-server/src/main.rs:637 as its negation. The value-based
+   refusal at services/ravel-server/src/config.rs:7384 is removed; the
+   refusal of a fold flag in `--mode gateway` applies to the opt-out.
+4. ravel-cli: `catalog fold --metrics-label-index` is replaced by
+   `--no-metrics-label-index`, and the refusal at
+   services/ravel-cli/src/catalog.rs:290 is removed.
+5. Tests that change:
+   - `fold_metrics_label_index_is_off_by_default_and_needs_the_leaf_build`
+     (services/ravel-server/src/config.rs:12434) becomes a test that the
+     index is on by default in `maintain`, `all` and `query`, is accepted
+     without `--fold-key-index-leaves`, and that the opt-out parses and is
+     refused in `gateway`;
+   - `build_catalog_for_server_maps_the_metrics_label_index_switch`
+     (services/ravel-server/src/query.rs:2577) asserts the default on;
+   - `the_metrics_leaf_is_off_without_metrics_label_index`
+     (crates/ravel-catalog/src/fold.rs:20163) keeps its explicit `false`
+     and flips its assertion on the default;
+   - `catalog_fold_metrics_label_index_flag`
+     (services/ravel-cli/src/main.rs:5714) parses the opt-out;
+   - `the_metrics_label_index_flag_is_refused_without_key_index_leaves`
+     (services/ravel-cli/tests/catalog_fold_metrics_label_index.rs:189)
+     becomes a test that a default fold without leaves reads no LABEL_DICT
+     and writes no leaf, its GET count asserted, and the rebuild test
+     beside it covers the default and the opt-out;
+   - `LABEL_INDEX_OFF` in services/ravel-server/tests/metrics_label_index_routing.rs
+     gains the opt-out, without which the off arm builds leaves and its
+     control goes vacuous;
+   - every test that sets `build_key_index_leaves: true` over
+     `..CatalogConfig::default()` and folds metrics data now builds a
+     metrics leaf; T10 lists them and re-pins their counts.
+6. Docs: docs/catalog-and-mvcc.md (the metrics leaf paragraph, "With
+   `metrics_label_index` off (the default)", and the rebuild paragraph),
+   docs/guides/operations/configuration.md (the two flag paragraphs),
+   docs/query-engine.md (the routing test's flags), and the generated flag
+   tables under docs/reference/.
+
+| task | decision | crates | depends on | risk |
+|---|---|---|---|---|
+| T10 `metrics_label_index` on by default wherever leaves are built, with an opt-out, the two value-based refusals removed, and the tests and docs above | 2 | ravel-catalog (config), ravel-server (config, fold, main), ravel-cli (main, catalog), docs | none; it changes nothing while `build_key_index_leaves` is off | low |
+
+### Open before the epic closes
+
+- Row 2 is not measured.
+- Row 6 misses (#4118).
+- Row 12's `mb_join_unless_quiet_instances` latency is not attributed.
+- Row 13 lacks the routed total and the leaf's part-month cost.
+- Row 7's per-advance cost of the metrics leaf is not measured.
+- The end-to-end erasure test above, and the series-level index, are
+  unfiled follow-ups.
