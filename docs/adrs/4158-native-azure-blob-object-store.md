@@ -84,7 +84,8 @@ block blobs only.
   pin's version as the `versionid` selector when the pin carries one, the
   same contract `ExternalStore`'s Azure arm already documents. `pin_of`
   reports `x-ms-version-id` when the account has blob versioning on, and an
-  ETag-only pin otherwise.
+  ETag-only pin otherwise. A 412 on a pinned read is settled by one HEAD
+  without `If-Match` before it is reported (see the 2026-11-13 correction).
 - **Listing.** `AzureStore` does not list through `object_store`, for the
   reason ADR-2637 gives: `Path::parse` fails a whole page on a key it
   rejects, and resuming from a re-encoded key re-delivers or skips keys. It
@@ -148,7 +149,8 @@ blob returns `InvalidRange`, as a suffix of it does on S3.
 A pinned suffix read (`get_pinned` with `Suffix`) does not take `E` from
 its own HEAD. `E` is the pin's ETag, sent as `If-Match` on the HEAD and on
 the GET, with the pin's `versionid` on both when it has one. A 412 on
-either request is `PreconditionFailed`, returned at once: the key no longer
+either request is `PreconditionFailed`, returned at once (the 2026-11-13
+correction settles that 412 with one HEAD first): the key no longer
 holds the pinned object, and retrying against whatever replaced it would serve bytes the
 caller did not pin.
 
@@ -209,7 +211,8 @@ instrumentation wrapper.
 - 401 and 403 are `AccessDenied`.
 - 416 is `InvalidRange`.
 - Any other 409 (a lease, an immutability policy, a blob with snapshots) is
-  `Permanent`: it is container state Ravel did not create.
+  `Permanent` (a lease's 412 too, per the 2026-11-13 correction): it is
+  container state Ravel did not create.
 
 ### D6. Selection, identity and qualification
 
@@ -229,7 +232,9 @@ instrumentation wrapper.
   `AzureStore` reads
   `x-ms-is-hns-enabled` from Get Account Information once at construction
   (P15) and refuses a `true` with an error naming the setting. An answer it
-  cannot read is a refusal too, never a pass.
+  cannot read is a refusal too, never a pass. The 2026-11-13 correction
+  adds the account URL as a second source when the container URL's answer
+  lacks the header.
 
 ### D7. Explicit refusals
 
@@ -566,3 +571,42 @@ account all sixteen predictions hold, so no decision changes:
 
 On the hierarchical-namespace account, two of the seventeen P10 keys could
 not be written, `a/0` and `a/b`, because `a` already existed as a blob.
+
+## Correction (2026-11-13): what Azurite and review showed
+
+<!-- amendment-applies: sections="D1. An `AzureStore` backend in ravel-object-store|D2. Suffix reads without a suffix range|D5. Error classification by status and `x-ms-error-code`|D6. Selection, identity and qualification" pointer="2026-11-13 correction" -->
+<!-- amendment-supersedes: phrase="Any other 409 (a lease" pointer="2026-11-13 correction" -->
+<!-- amendment-supersedes: phrase="`PreconditionFailed`, returned at once" pointer="2026-11-13 correction" -->
+
+Running the implementation against Azurite 3.35.0 on 2026-11-13, and the
+review of #4161, showed three places where the decisions above did not
+hold as written.
+
+- **Azurite measurements (2026-11-13).** Get Account Information on the
+  container URL answers without `x-ms-is-hns-enabled`; on the account URL
+  it answers `false`. A GET or HEAD with `If-Match` on an absent key
+  answers 412 `ConditionNotMet`, where Azure answers 404 `BlobNotFound`.
+  `startFrom` is ignored, which D1's listing filter already tolerates. A
+  suffix range (`bytes=-n`) answers 500, which D2 never sends. Azure itself
+  sends the HNS header on both URLs (P15).
+- **D6, hierarchical namespace.** Construction reads `x-ms-is-hns-enabled`
+  from the container URL first and, when that answer carries no header,
+  from the account URL. Only `false` is accepted: `true` from either, a
+  header absent from both, an unreadable value and a failed request are
+  refusals.
+- **D1 Reads and D2, a pinned 412.** On Azurite a 412 on a pinned read
+  cannot tell a deleted key from a replaced one. Any pinned read (`Full`,
+  `Range` or `Suffix`, on its HEAD or its GET) that meets a 412 sends one
+  HEAD that keeps the pin's `versionid` and drops the `If-Match`. A 404
+  there is `NotFound`; any other answer is `PreconditionFailed`. Nothing is
+  retried: the HEAD only names the outcome. Against Azure, which answers
+  404 on an absent key, the extra HEAD is sent only when the blob was
+  replaced, so it costs one request on a path that already fails. An
+  unpinned suffix read keeps D2's three rounds.
+- **D5, leases.** A leased blob refuses a write or a delete with a 412 or
+  a 409 whose `x-ms-error-code` starts with `Lease`. That is `Permanent` in
+  every put mode and on delete, never `AlreadyExists` or
+  `PreconditionFailed`: Ravel takes no leases, so no retry clears one. This
+  replaces D5's wording that only a 409 for a lease is `Permanent`, and
+  narrows "409 and 412 are the precondition outcomes named in D1" to codes
+  that are not lease codes.
