@@ -1115,11 +1115,15 @@ it, on every path (`put`, `get`, `head`, `pin_of` and listing entries), so
 a new ETag, identical bytes included (ADR-4158, Measured P5 and P6), which
 is what lets the ETag be the token. `CreateIfAbsent` sends
 `If-None-Match: *` and maps a 409 `BlobAlreadyExists` to `AlreadyExists`; a
-409 with any other code (a lease, an immutability policy) is `Permanent`,
+409 with any other code (an immutability policy, snapshots) is `Permanent`,
 and a 409 that reaches the store with no code is settled with one HEAD:
 present is `AlreadyExists`, absent is `Transient`. `CasVersion(v)` sends
 `If-Match: v` and maps a 412, and a 404, to `PreconditionFailed`.
-`Overwrite` sends no precondition.
+`Overwrite` sends no precondition. A leased blob answers a write with a 412
+(or a 409) whose error code starts with `Lease` (`LeaseIdMissing` and its
+family); that is `Permanent` in every put mode and on `delete`, never
+`AlreadyExists` or `PreconditionFailed`, since `AzureStore` takes no lease
+that could clear it.
 
 `Full` is one GET and `Range` one ranged GET. **A suffix read costs two
 requests.** Azure answers a suffix range (`bytes=-n`) with 200 and the whole

@@ -489,11 +489,11 @@ async fn error_rows_follow_the_adr() {
     assert_eq!(methods(&blob_requests(&fake, "e/k")), ["PUT"]);
 
     // A 409 on a create that is not BlobAlreadyExists is not AlreadyExists.
-    fake.fail_next_with_code(409, "LeaseIdMissing", 1);
-    let leased = store.put("e/k", Bytes::from_static(b"x"), create()).await;
+    fake.fail_next_with_code(409, "SnapshotsPresent", 1);
+    let snapshots = store.put("e/k", Bytes::from_static(b"x"), create()).await;
     assert!(
-        matches!(leased, Err(StoreError::Permanent(_))),
-        "{leased:?}"
+        matches!(snapshots, Err(StoreError::Permanent(_))),
+        "{snapshots:?}"
     );
     fake.fail_next(409, 1);
     let overwrite = store
@@ -560,6 +560,72 @@ async fn error_rows_follow_the_adr() {
 
     // Deleting a missing blob succeeds.
     store.delete("e/absent").await.expect("idempotent delete");
+}
+
+#[tokio::test]
+async fn a_lease_conflict_is_permanent_on_every_put_mode_and_on_delete() {
+    let fake = fake().await;
+    let store = store(&fake).await;
+    let live = store
+        .put("l/k", Bytes::from_static(b"x"), PutOptions::default())
+        .await
+        .expect("put");
+    let modes = [
+        ("create", create()),
+        ("cas", cas(&live.version)),
+        ("overwrite", PutOptions::default()),
+    ];
+    for (status, code) in [
+        (412, "LeaseIdMissing"),
+        (412, "LeaseIdMismatchWithBlobOperation"),
+        (409, "LeaseAlreadyPresent"),
+    ] {
+        for (name, opts) in &modes {
+            fake.fail_next_with_code(status, code, 1);
+            fake.clear_requests();
+            let put = store
+                .put("l/k", Bytes::from_static(b"y"), opts.clone())
+                .await;
+            match put {
+                Err(StoreError::Permanent(message)) => {
+                    assert!(message.contains(code), "{status} {code} {name}: {message}");
+                }
+                other => panic!("{status} {code} {name}: {other:?}"),
+            }
+            assert_eq!(
+                methods(&blob_requests(&fake, "l/k")),
+                ["PUT"],
+                "{status} {code} {name}: no settle, no retry"
+            );
+        }
+        fake.fail_next_with_code(status, code, 1);
+        fake.clear_requests();
+        let delete = store.delete("l/k").await;
+        match delete {
+            Err(StoreError::Permanent(message)) => {
+                assert!(message.contains(code), "{status} {code} delete: {message}");
+            }
+            other => panic!("{status} {code} delete: {other:?}"),
+        }
+        assert_eq!(methods(&blob_requests(&fake, "l/k")), ["DELETE"]);
+    }
+
+    // A 412 with any other code keeps its meaning.
+    fake.fail_next_with_code(412, "ConditionNotMet", 1);
+    let create_412 = store.put("l/k", Bytes::from_static(b"y"), create()).await;
+    assert!(
+        matches!(create_412, Err(StoreError::AlreadyExists)),
+        "{create_412:?}"
+    );
+    fake.fail_next_with_code(412, "ConditionNotMet", 1);
+    let cas_412 = store
+        .put("l/k", Bytes::from_static(b"y"), cas(&live.version))
+        .await;
+    assert!(
+        matches!(cas_412, Err(StoreError::PreconditionFailed)),
+        "{cas_412:?}"
+    );
+    assert_eq!(fake.data_of("l/k"), Some(Bytes::from_static(b"x")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
