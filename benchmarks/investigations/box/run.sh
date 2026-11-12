@@ -1459,9 +1459,14 @@ maint_records() {
 # is listed until every (shard, hour) bucket of those hours that holds a
 # commit record holds its tombstone and no other bucket does, at most
 # retired_hour.wait_minutes. maint_records then checks the pass compacted
-# nothing of dp7's logs. Then `catalog fold --retention-default Rs`, which
-# carries R into the fold and reconciles the retirement frontier, is
-# stamped as STATE's fold, and a second one as STATE_refold; then the
+# nothing of dp7's logs. It waits for the ingest hour after the last fold
+# and loads the tail corpus's logs into dp7 there (STATE_tail), so the fold
+# that follows advances its watermark. Then `catalog fold
+# --retention-default Rs`, which carries R into the fold and reconciles the
+# retirement frontier, is stamped as STATE's fold; inv.py fold-watermark
+# stamps its watermark before and after as STATE.logs.fold_watermark.json
+# and fails the state unless it advanced. A second fold is stamped as
+# STATE_refold; then the
 # segments a catalog resolve returns for the tombstone stamp's hour, as
 # STATE.logs.retired_resolve.json, unless that step does not fit the deadline
 # (STATE_resolve recorded not-run) or fails (STEP-FAILED, its log kept): the
@@ -1469,7 +1474,7 @@ maint_records() {
 # on any other failure.
 retire_through() {
   local state="$1" k="$2" d0="$DP_START_7" cut="$WORK/retention-$1.json" r rows tokens key hash
-  local tlog="$WORK/tombstone-check-$1.out" deadline code=0 f rflag
+  local tlog="$WORK/tombstone-check-$1.out" wlog="$WORK/fold-watermark-$1.out" deadline code=0 rflag trows
   rows="$(batch_rows "$(corpus_rows "$WORK/corpus-dp7" logs)" 168)"
   if [ "$DRY_RUN" = 1 ]; then
     run "$PY" "$LIB" retention-cutoff --parquet "$WORK/corpus-dp7/logs.parquet" --event-column ts \
@@ -1513,12 +1518,21 @@ retire_through() {
     unit="unix hours, the unit catalog part ranges count in" check@="$tlog" cutoff@="$cut"
   list_store "$state-after"
   maint_records "$state" || return 1
+  # A fold whose watermark does not advance returns before the retention-
+  # frontier reconcile that observes a tombstone, so the retention fold
+  # needs an unsealed ingest hour holding a commit: the tail, in one batch
+  # flushed at once, after the maintain pass so nothing compacts it.
+  wait_next_hour
+  trows="$(batch_rows "$(corpus_rows "$WORK/corpus-tail" logs)" 1)"
+  load_signal "${state}_tail" logs "$WORK/corpus-tail" dp7 --batch-rows "$trows" --target-bytes 1 || return 1
   # The fold reads the tenant's retention from --retention-default when the
   # tenant's config record sets none, as dp7's does not; R is the same
   # window the maintain server tombstoned with.
-  for f in "$state" "${state}_refold"; do
-    fold "$f" --key-index-leaves --retention-default "${r}s" || return 1
-  done
+  fold "$state" --key-index-leaves --retention-default "${r}s" || return 1
+  printf 'STAMP stamps/%s.logs.fold_watermark.json\n' "$state"
+  run "$PY" "$LIB" fold-watermark --report "$WORK/fold-$state-logs.out" --state "$state" \
+    --out "$STAMPS/$state.logs.fold_watermark.json" >"$wlog" 2>&1 || { failed_at "fold-watermark $state" "$?" "$wlog"; return 1; }
+  fold "${state}_refold" --key-index-leaves --retention-default "${r}s" || return 1
   # Row W3's resolve over hour d0: `rlog footprint --tenant` measures every
   # segment a catalog resolve returns, which skips the parts' retired_hours,
   # and hour-segments counts those of ingest hour d0 on either tier. Only
@@ -1550,6 +1564,17 @@ retire_through() {
   fi
   printf 'STAMP stamps/%s.logs.retired_resolve.json\n' "$state"
   return 0
+}
+
+# retire_budget_s EST_S: the seconds one retire_through step needs at most.
+# The maintain pass runs inside the wait for the ingest hour after
+# FOLD_HOUR, so the waits cost whichever of retired_hour.wait_minutes and
+# the time to that hour is longer; the tail load and the retention fold
+# take EST_S each.
+retire_budget_s() {
+  local wait_s=$(((${FOLD_HOUR:-0} + 1) * 3600 + 5 - $(date +%s)))
+  [ "$wait_s" -gt $((RH_WAIT * 60)) ] || wait_s=$((RH_WAIT * 60))
+  printf '%s\n' "$((wait_s + 2 * $1))"
 }
 
 # state_retired_hour: on the day_parts_7 tenant (dp7: the 7-day state holds
@@ -1584,15 +1609,15 @@ state_retired_hour() {
     2) not_run retired_hour "$FB_WHY"; return 0 ;;
     *) return 1 ;;
   esac
-  fits retired_hour "maintain retention and fold" "$((RH_WAIT * 60 + est))" || return 0
+  fits retired_hour "maintain retention, the wait for the next ingest hour, the tail load and the retention fold" "$(retire_budget_s "$est")" || return 0
   TRIPLES="dp7:logs:logs"
   retire_through retired_hour 0 || { TRIPLES="$saved"; return 1; }
-  transition retired_hour "tenant dp7: ingest hour $DP_START_7 (hour 0 of the oldest day) tombstoned by maintain retention, then catalog fold --retention-default"
+  transition retired_hour "tenant dp7: ingest hour $DP_START_7 (hour 0 of the oldest day) tombstoned by maintain retention, a tail hour loaded into the next ingest hour, then catalog fold --retention-default"
   census retired_hour
   STATE=retired_hour_drop
-  fits retired_hour_drop "maintain retention and fold" "$((RH_WAIT * 60 + est))" || { TRIPLES="$saved"; return 0; }
+  fits retired_hour_drop "maintain retention, the wait for the next ingest hour, the tail load and the retention fold" "$(retire_budget_s "$est")" || { TRIPLES="$saved"; return 0; }
   retire_through retired_hour_drop 23 || { TRIPLES="$saved"; return 1; }
-  transition retired_hour_drop "tenant dp7: every hour of the oldest day tombstoned by maintain retention, then catalog fold --retention-default"
+  transition retired_hour_drop "tenant dp7: every hour of the oldest day tombstoned by maintain retention, a tail hour loaded into the next ingest hour, then catalog fold --retention-default"
   census retired_hour_drop
   TRIPLES="$saved"
   return 0
