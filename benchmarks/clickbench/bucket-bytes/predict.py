@@ -9,7 +9,11 @@ value 4 to 8, the script reports:
   hold it (the group keys as routed plus the COUNT state, Int64), written in
   corpus order as Arrow IPC stream messages with lz4_frame compression, one
   record batch per chunk of ADR-4143 decision 3's byte budget. Measured over
-  the full corpus, in contiguous slices.
+  the full corpus, in contiguous slices. The route writes each bucket's rows
+  to its own chunks, so the same slice that measures combining is also
+  written routed and uncombined; the ratio of its routed to its corpus-order
+  bytes (the routing penalty) scales the full-corpus figure, and the
+  prediction is the larger of the two.
 - combined bytes (ADR-4143 decision 4): rows hashed to P x 2^bits buckets in
   corpus order, each bucket's rows cut into chunks of the same budget, and
   each chunk deduplicated by key (counts summed) before it is written. The
@@ -186,6 +190,21 @@ def chunk_budget_max(share, bits):
     """The largest budget at that `bits`: table(bits) just above 0.375 x S,
     the least table for which `bits` - 1 would not do."""
     return (share - (3 * share + 7) // 8) // ((1 << bits) + 1)
+
+
+def tune_limit(share, floor):
+    """The largest T for which ADR-4143 decision 1's two `bits` conditions
+    hold at some `bits`, with `table(b) = ceil(2T / (P x 2^b))`, and that
+    `bits`."""
+    best_t, best_b = 0, None
+    for b in range(21):
+        table_max = min(3 * share // 4, share - ((1 << b) + 1) * floor)
+        if table_max <= 0:
+            continue
+        t = table_max * P * (1 << b) // 2
+        if t > best_t:
+            best_t, best_b = t, b
+    return best_t, best_b
 
 
 # --------------------------------------------------------------------------
@@ -573,6 +592,10 @@ def report(args, st, mine, out):
           f"floor_charge_B={floor} empty_stream_B={empty} probe_windows={head['probe_windows']} "
           f"probe_ratio_min={head['probe_ratio_min']:.4f} probe_ratio_median={head['probe_ratio_median']:.4f} "
           f"probe_windows_above_{PROBE_RATIO}={head['probe_windows_above']}", file=out, flush=True)
+    for box in args.boxes:
+        t_max, b_max = tune_limit(BOX_SHARE[box], floor)
+        print(f"stmt={st.number} box={box} floor_charge_B={floor} tunes_up_to_T_B={t_max} at_bits={b_max}",
+              file=out, flush=True)
     if head["hashed_rows"] != rows or sum(s["rows"] for s in slices) != rows:
         raise SystemExit(f"statement {st.number}: rows read differ from {rows}")
     results = {}
