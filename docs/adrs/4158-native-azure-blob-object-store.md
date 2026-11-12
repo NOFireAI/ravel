@@ -2,8 +2,8 @@
 
 - Status: Accepted (2026-11-12)
 - Date: 2026-11-12
-- Refs: #4158, ADR-0002, ADR-0008, ADR-0050, ADR-1685, ADR-2040, ADR-2637,
-  ADR-3456
+- Refs: #4158, ADR-0002, ADR-0008, ADR-0034, ADR-0050, ADR-0055, ADR-0072,
+  ADR-1685, ADR-2040, ADR-2637, ADR-3456
 
 ## Context
 
@@ -282,7 +282,10 @@ The first real qualification, from an image built on main, is recorded on
 
 ### D10. Out of scope, filed as follow-ups
 
-- **The operator.** Its CRD requires `storage.s3`.
+- **The operator on GCS** (#3483). D11 makes room for it and does not add
+  it.
+- **An operator-rendered cluster in the kind lane on Azure.** It needs an
+  emulator endpoint and a shared key in the CRD, which D11 leaves out.
 - **Upload integrity** (`x-ms-content-crc64` or `Content-MD5`).
 - **Container-protection probes**: versioning, soft delete, immutability
   policies.
@@ -292,6 +295,91 @@ The first real qualification, from an image built on main, is recorded on
 - **An Azure reference cost profile.** `--store-cost-profile` already takes
   a file; the built-in profile stays S3's.
 - **ravel-bench's own store selection.**
+
+### D11. The operator runs a `RavelCluster` on Azure with AKS workload identity
+
+The goal of this epic is Ravel on AKS, and on Kubernetes Ravel is deployed
+by the operator. Its CRD requires `storage.s3`, and `common_store_args`
+renders `--store s3 --require-bucket-protection` for every tier, so
+without this decision `--store azure` would be reachable only by hand.
+
+- **CRD.** `spec.storage` holds exactly one backend. `storage.s3` becomes
+  optional, `storage.azure` is added, and a CEL rule on `storage` requires
+  exactly one of them. `v1alpha1` makes no compatibility promise
+  (ADR-0034), but the rule the Pod Identity change set is kept: a cluster
+  that sets `storage.s3` renders byte for byte as before, and its qualify
+  hash does not move, so no existing cluster re-qualifies on upgrade. The
+  two pinned hash literals are the test. The existing CEL rule that reads
+  `self.storage.s3.auth` gains a `has(self.storage.s3)` guard.
+- **`storage.azure` fields.** `account` and `container` (both required),
+  and `clientId` (required): the client ID of the user-assigned managed
+  identity the pods run as. `roleClientIds` (optional) overrides it per
+  role with `gateway`, `query`, `maintain` and `qualify`, which is how
+  ADR-0055's per-role scoping is expressed on Azure: one managed identity
+  per role, each with its own role assignment on the container. There is
+  no endpoint field and no secret reference.
+- **Identity wiring.** The operator owns the four ServiceAccounts it
+  already owns under Pod Identity (`<name>-gateway`, `-query`, `-maintain`,
+  `-qualify`). Under `storage.azure` each carries the annotation
+  `azure.workload.identity/client-id` with its role's client ID, and each
+  tier's pod template and the qualify Job carry the label
+  `azure.workload.identity/use: "true"` and the tier's
+  `serviceAccountName`. The AKS workload identity webhook then injects the
+  token file and the `AZURE_*` variables D3 reads. There is no sidecar and
+  no credentials file: `object_store` reads the federated token itself.
+  The federated credential on each managed identity (one per
+  ServiceAccount subject) is created outside Ravel, and the guide lists
+  the five subjects.
+- **Rendered arguments.** `--store azure --azure-account --azure-container`
+  on every tier, and `ravel-cli --store azure store qualify` with
+  `RAVEL_AZURE_ACCOUNT` and `RAVEL_AZURE_CONTAINER` on the qualify Job. No
+  `--s3-*` flag and no `RAVEL_S3_*` variable is rendered, since D7 refuses
+  them.
+- **`--require-bucket-protection` is not rendered on Azure**, because D7
+  refuses it: there are no Azure probes to run. ADR-0072 has the operator
+  set it for production, so its absence must not be silent. An Azure
+  cluster carries the status condition `BucketProtectionVerified=False`
+  with reason `NotImplementedForAzure`, and the guide says what to
+  configure by hand (versioning, soft delete, an immutability policy).
+  When the probes exist (D10) the flag is rendered and the condition goes.
+- **The qualify hash** for an Azure cluster covers the account, the
+  container, the image and the `qualify` client ID. A change to any of
+  them re-qualifies.
+- **The operator's own store client.** `build_auth_store` returns `Arc<dyn
+  ObjectStoreBackend>` and builds an `AzureStore` for an Azure cluster,
+  authenticated as the operator's own ServiceAccount through the same
+  workload identity mechanism. Its consumers (`sys/auth` convergence,
+  resharding) already take `&dyn ObjectStoreBackend`. The operator's
+  Deployment and ServiceAccount manifests gain the label and a client-ID
+  annotation placeholder, documented as needed only for Azure clusters.
+- **Proof.** Render and reconcile tests against the fake apiserver pin the
+  arguments, labels, annotations, the one-of rule and the unchanged S3
+  hashes. No test in CI starts an operator-rendered cluster on Azure: the
+  kind lane has no workload identity. The proof that it works is a
+  `RavelCluster` on the AKS staging cluster reaching `StoreQualified=True`
+  and `Available=True` and answering an ingest and query round trip,
+  recorded on #4158 before the epic closes.
+
+```mermaid
+flowchart TB
+  subgraph aks["AKS cluster"]
+    op["ravel-operator\n(own ServiceAccount)"]
+    wh["workload identity webhook"]
+    subgraph rc["RavelCluster, storage.azure"]
+      sa["ServiceAccounts\n-gateway -query -maintain -qualify\nannotation: client-id"]
+      pods["tier pods + qualify Job\nlabel: azure.workload.identity/use\n--store azure"]
+    end
+    op -->|"renders"| sa
+    op -->|"renders"| pods
+    wh -->|"injects token file\nand AZURE_* env"| pods
+  end
+  entra["Microsoft Entra ID\nfederated credential per ServiceAccount"]
+  cont[("Azure container")]
+  pods -->|"exchange ServiceAccount token"| entra
+  op -->|"exchange ServiceAccount token"| entra
+  pods -->|"one managed identity per role\nrole assignment on the container"| cont
+  op -->|"sys/auth, resharding"| cont
+```
 
 ```mermaid
 flowchart LR
@@ -370,7 +458,22 @@ sequenceDiagram
 8. **An S3-compatible gateway in front of Azure.** A stateful process in
    the commit path whose own precondition handling would need qualifying,
    against the rule that every compute process is disposable.
-9. **Only a fake, or only Azurite.** Only a fake leaves nothing in CI that
+9. **Leave the operator for a follow-up, as ADR-3456 did for GCS.** GCS
+    was driven by a benchmark that starts the binaries itself. This epic's
+    goal is AKS, where the operator is the deployment path, so a backend
+    the operator cannot select would not deliver it.
+10. **A `storage.kind` discriminator with one flat set of fields.** The S3
+    fields would have to become conditional on the kind, and every
+    existing manifest would need the new field. A one-of over typed
+    variants leaves `storage.s3` manifests valid unchanged.
+11. **An account key Secret on `storage.azure`, mirroring S3's `static`
+    mode.** It would let the kind lane run on Azurite, at the cost of a
+    long-lived secret mode this ADR declines everywhere else (D3).
+12. **Render `--require-bucket-protection` on Azure and let the server
+    refuse to start.** That makes every Azure cluster unstartable until
+    the probes exist. Dropping it silently is worse; a status condition
+    states what was not verified.
+13. **Only a fake, or only Azurite.** Only a fake leaves nothing in CI that
    Microsoft wrote. Only Azurite puts docker in front of every server and
    CLI end-to-end test, so they would skip in local gates.
 
@@ -393,6 +496,10 @@ sequenceDiagram
   backend, replaces "Azure: etags + leases" with what `AzureStore` does,
   and gains an Azure row in each per-backend table. Those edits land with
   the backend, in the same commit as the behaviour.
+- A `RavelCluster` can name Azure storage. A cluster on Azure starts
+  without verified container protection and says so in its status.
+- `storage.s3` is no longer required by the schema; the one-of rule
+  replaces it. Existing manifests stay valid and render unchanged.
 - The Azurite lane adds a third emulator container to the
   `object-store-contract` job.
 
