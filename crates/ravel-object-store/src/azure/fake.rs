@@ -499,9 +499,8 @@ impl Inner {
                 }
             };
         }
-        let target = match self.target(path) {
-            Ok(target) => target,
-            Err(response) => return response,
+        let Some(target) = self.target(path) else {
+            return error(StatusCode::BAD_REQUEST, "InvalidUri");
         };
         let restype = query_param(query, "restype");
         let comp = query_param(query, "comp");
@@ -529,7 +528,9 @@ impl Inner {
         };
         let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
         match (method, comp) {
-            (&Method::PUT, None) => self.put_blob(&key, header("if-match"), header("if-none-match"), body),
+            (&Method::PUT, None) => {
+                self.put_blob(&key, header("if-match"), header("if-none-match"), body)
+            }
             (&Method::PUT, Some("block")) => match query_param(query, "blockid") {
                 Some(id) => {
                     self.blocks
@@ -565,27 +566,27 @@ impl Inner {
         }
     }
 
-    fn target(&self, path: &str) -> Result<Target, Response> {
+    /// What `path` addresses, or `None` when it names another account or does
+    /// not percent-decode (the service's 400 `InvalidUri`).
+    fn target(&self, path: &str) -> Option<Target> {
         let rest = path.strip_prefix('/').unwrap_or(path);
         let (account, rest) = match rest.split_once('/') {
             Some((account, rest)) => (account, Some(rest)),
             None => (rest, None),
         };
         if percent_decode(account, false).as_deref() != Some(self.account.as_str()) {
-            return Err(error(StatusCode::BAD_REQUEST, "InvalidUri"));
+            return None;
         }
         let Some(rest) = rest.filter(|rest| !rest.is_empty()) else {
-            return Ok(Target::Account);
+            return Some(Target::Account);
         };
-        let decode = |text: &str| {
-            percent_decode(text, false).ok_or_else(|| error(StatusCode::BAD_REQUEST, "InvalidUri"))
-        };
+        let decode = |text: &str| percent_decode(text, false);
         match rest.split_once('/') {
             Some((container, blob)) if !blob.is_empty() => {
-                Ok(Target::Blob(decode(container)?, decode(blob)?))
+                Some(Target::Blob(decode(container)?, decode(blob)?))
             }
-            Some((container, _)) => Ok(Target::Container(decode(container)?)),
-            None => Ok(Target::Container(decode(rest)?)),
+            Some((container, _)) => Some(Target::Container(decode(container)?)),
+            None => Some(Target::Container(decode(rest)?)),
         }
     }
 
@@ -694,7 +695,11 @@ impl Inner {
         set_header(headers, "x-ms-blob-type", "BlockBlob".into());
         set_header(headers, "accept-ranges", "bytes".into());
         if let Some((first, last)) = bounds {
-            set_header(headers, "content-range", format!("bytes {first}-{last}/{size}"));
+            set_header(
+                headers,
+                "content-range",
+                format!("bytes {first}-{last}/{size}"),
+            );
         }
         response
     }
@@ -739,7 +744,10 @@ impl Inner {
                 continue;
             }
             if let Some(after) = &marker
-                && (name <= after || (delimiter.is_some() && name.starts_with(after.as_str()) && after.ends_with('/')))
+                && (name <= after
+                    || (delimiter.is_some()
+                        && name.starts_with(after.as_str())
+                        && after.ends_with('/')))
             {
                 continue;
             }
@@ -750,7 +758,10 @@ impl Inner {
             });
             match rolled {
                 Some(common) => {
-                    if entries.last().is_none_or(|(last, blob)| blob.is_some() || *last != common) {
+                    if entries
+                        .last()
+                        .is_none_or(|(last, blob)| blob.is_some() || *last != common)
+                    {
                         entries.push((common, None));
                     }
                 }
@@ -780,7 +791,11 @@ impl Inner {
                     xml.push_str("<Blob>");
                     push_name(&mut xml, name, encode_all);
                     xml.push_str("<Properties>");
-                    push_element(&mut xml, "Last-Modified", &imf_fixdate(blob.last_modified_secs));
+                    push_element(
+                        &mut xml,
+                        "Last-Modified",
+                        &imf_fixdate(blob.last_modified_secs),
+                    );
                     push_element(&mut xml, "Etag", blob.etag.trim_matches('"'));
                     push_element(&mut xml, "Content-Length", &blob.data.len().to_string());
                     push_element(&mut xml, "BlobType", "BlockBlob");
@@ -800,14 +815,22 @@ impl Inner {
         }
         xml.push_str("</EnumerationResults>");
         let mut response = Response::new(Body::from(xml));
-        set_header(response.headers_mut(), "content-type", "application/xml".into());
+        set_header(
+            response.headers_mut(),
+            "content-type",
+            "application/xml".into(),
+        );
         response
     }
 }
 
 fn blob_headers(headers: &mut HeaderMap, blob: &StoredBlob) {
     set_header(headers, "etag", blob.etag.clone());
-    set_header(headers, "last-modified", imf_fixdate(blob.last_modified_secs));
+    set_header(
+        headers,
+        "last-modified",
+        imf_fixdate(blob.last_modified_secs),
+    );
 }
 
 /// 201, with the written blob's `ETag` and `Last-Modified` when there is one.

@@ -140,8 +140,8 @@ use crate::{
 };
 
 mod bucket_config;
-pub(crate) use bucket_config::{SigningClock, SystemSigningClock, parse_iso8601};
 use bucket_config::{BucketControlPlaneClient, ReportNotes};
+pub(crate) use bucket_config::{SigningClock, SystemSigningClock, parse_iso8601};
 
 mod credentials;
 use credentials::FileCredentialProvider;

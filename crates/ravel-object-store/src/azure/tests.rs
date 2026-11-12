@@ -70,7 +70,10 @@ fn range_header(request: &RecordedRequest) -> Option<&str> {
 }
 
 fn list_requests(fake: &FakeAzure) -> Vec<RecordedRequest> {
-    fake.requests().into_iter().filter(|r| r.is_list()).collect()
+    fake.requests()
+        .into_iter()
+        .filter(|r| r.is_list())
+        .collect()
 }
 
 /// A base64 shared key, as the portal shows one.
@@ -92,8 +95,7 @@ async fn conformance_suite_passes_against_the_fake() {
     let store = paged_store(&fake, 2).await;
 
     let report =
-        run_conformance_suite_with_seeder(&store, "sys/qualify/fake-azure/", 2, Some(&fake))
-            .await;
+        run_conformance_suite_with_seeder(&store, "sys/qualify/fake-azure/", 2, Some(&fake)).await;
 
     assert!(report.not_run.is_empty(), "{:?}", report.not_run);
     let failures: Vec<_> = report
@@ -199,7 +201,11 @@ async fn a_suffix_read_raced_by_an_overwrite_retries_and_returns_the_new_suffix(
     let fake = fake().await;
     let store = store(&fake).await;
     store
-        .put("s/k", Bytes::from_static(b"0123456789"), PutOptions::default())
+        .put(
+            "s/k",
+            Bytes::from_static(b"0123456789"),
+            PutOptions::default(),
+        )
         .await
         .expect("put");
     let old_etag = fake.etag_of("s/k").expect("stored");
@@ -231,7 +237,11 @@ async fn a_suffix_read_replaced_every_round_is_transient_after_three_rounds() {
     let fake = fake().await;
     let store = store(&fake).await;
     store
-        .put("s/k", Bytes::from_static(b"0123456789"), PutOptions::default())
+        .put(
+            "s/k",
+            Bytes::from_static(b"0123456789"),
+            PutOptions::default(),
+        )
         .await
         .expect("put");
     for round in 0..SUFFIX_ROUNDS + 1 {
@@ -254,12 +264,20 @@ async fn a_pinned_suffix_read_after_a_replace_fails_in_one_round() {
     let fake = fake().await;
     let store = store(&fake).await;
     store
-        .put("s/k", Bytes::from_static(b"0123456789"), PutOptions::default())
+        .put(
+            "s/k",
+            Bytes::from_static(b"0123456789"),
+            PutOptions::default(),
+        )
         .await
         .expect("put");
     let (_, pin) = store.pin_of("s/k").await.expect("pin_of");
     store
-        .put("s/k", Bytes::from_static(b"replaced"), PutOptions::default())
+        .put(
+            "s/k",
+            Bytes::from_static(b"replaced"),
+            PutOptions::default(),
+        )
         .await
         .expect("replace");
     fake.clear_requests();
@@ -294,7 +312,11 @@ async fn a_pin_with_a_version_selects_it_on_the_head_and_the_get() {
     let fake = fake().await;
     let store = store(&fake).await;
     store
-        .put("s/k", Bytes::from_static(b"0123456789"), PutOptions::default())
+        .put(
+            "s/k",
+            Bytes::from_static(b"0123456789"),
+            PutOptions::default(),
+        )
         .await
         .expect("put");
     let etag = fake.etag_of("s/k").expect("stored");
@@ -336,7 +358,11 @@ async fn each_put_mode_sends_its_precondition() {
         .await
         .expect("overwrite");
     let swapped = store
-        .put("p/k", Bytes::from_static(b"three"), cas(&overwritten.version))
+        .put(
+            "p/k",
+            Bytes::from_static(b"three"),
+            cas(&overwritten.version),
+        )
         .await
         .expect("cas");
 
@@ -376,7 +402,9 @@ async fn each_put_mode_sends_its_precondition() {
         matches!(stale, Err(StoreError::PreconditionFailed)),
         "{stale:?}"
     );
-    let again = store.put("p/k", Bytes::from_static(b"four"), create()).await;
+    let again = store
+        .put("p/k", Bytes::from_static(b"four"), create())
+        .await;
     assert!(matches!(again, Err(StoreError::AlreadyExists)), "{again:?}");
     let absent = store
         .put("p/absent", Bytes::from_static(b"x"), cas(&created.version))
@@ -403,24 +431,40 @@ async fn error_rows_follow_the_adr() {
     let get = other.get("e/k", GetRange::Full).await;
     assert!(matches!(get, Err(StoreError::Permanent(_))), "{get:?}");
     let suffix = other.get("e/k", GetRange::Suffix(2)).await;
-    assert!(matches!(suffix, Err(StoreError::Permanent(_))), "{suffix:?}");
+    assert!(
+        matches!(suffix, Err(StoreError::Permanent(_))),
+        "{suffix:?}"
+    );
     let put = other
         .put("e/k", Bytes::from_static(b"x"), PutOptions::default())
         .await;
     assert!(matches!(put, Err(StoreError::Permanent(_))), "{put:?}");
     let cas_put = other
-        .put("e/k", Bytes::from_static(b"x"), cas(&Version("\"0x1\"".into())))
+        .put(
+            "e/k",
+            Bytes::from_static(b"x"),
+            cas(&Version("\"0x1\"".into())),
+        )
         .await;
-    assert!(matches!(cas_put, Err(StoreError::Permanent(_))), "{cas_put:?}");
+    assert!(
+        matches!(cas_put, Err(StoreError::Permanent(_))),
+        "{cas_put:?}"
+    );
     let delete = other.delete("e/k").await;
-    assert!(matches!(delete, Err(StoreError::Permanent(_))), "{delete:?}");
+    assert!(
+        matches!(delete, Err(StoreError::Permanent(_))),
+        "{delete:?}"
+    );
     let list = other.list("e/", None).await;
     assert!(matches!(list, Err(StoreError::Permanent(_))), "{list:?}");
 
     // A 409 on a create that is not BlobAlreadyExists is not AlreadyExists.
     fake.fail_next_with_code(409, "LeaseIdMissing", 1);
     let leased = store.put("e/k", Bytes::from_static(b"x"), create()).await;
-    assert!(matches!(leased, Err(StoreError::Permanent(_))), "{leased:?}");
+    assert!(
+        matches!(leased, Err(StoreError::Permanent(_))),
+        "{leased:?}"
+    );
     fake.fail_next(409, 1);
     let overwrite = store
         .put("e/k", Bytes::from_static(b"x"), PutOptions::default())
@@ -590,7 +634,10 @@ async fn a_page_token_is_the_raw_last_key_and_resumes_after_it() {
     let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
     assert_eq!(keys, ["t/c"]);
     assert_eq!(page.next, None);
-    assert_eq!(list_requests(&fake)[0].query_param("startFrom"), Some("t/b"));
+    assert_eq!(
+        list_requests(&fake)[0].query_param("startFrom"),
+        Some("t/b")
+    );
 
     // A token takes precedence over list_after's start key.
     let page = store
@@ -859,7 +906,11 @@ async fn attempts_and_observed_store_time_are_recorded() {
     let calls = |op| snapshot.op(op).calls;
     assert_eq!(attempts(StoreOp::Put), 2, "the 503 and the retry");
     assert_eq!(calls(StoreOp::Put), 1);
-    assert_eq!(attempts(StoreOp::Get), 3, "a full GET, and a HEAD and a GET");
+    assert_eq!(
+        attempts(StoreOp::Get),
+        3,
+        "a full GET, and a HEAD and a GET"
+    );
     assert_eq!(calls(StoreOp::Get), 2);
     assert_eq!(attempts(StoreOp::Head), 1);
     assert_eq!(attempts(StoreOp::List), 1);
@@ -940,7 +991,11 @@ async fn workload_identity_tokens_are_fetched_from_another_host_uncounted() {
     );
     let snapshot = metrics.snapshot();
     for op in [StoreOp::Put, StoreOp::Get, StoreOp::List] {
-        assert_eq!(snapshot.op(op).attempts, 1, "{op:?}: the store request only");
+        assert_eq!(
+            snapshot.op(op).attempts,
+            1,
+            "{op:?}: the store request only"
+        );
     }
     assert_eq!(store.observed_store_time_ns(), Some(fake.date_unix_ns()));
     let requests = fake.requests();
@@ -984,7 +1039,10 @@ async fn shared_key_requests_verify_and_a_wrong_key_is_access_denied() {
         .expect("a signed If-Match HEAD");
     let page = store.list("k/", None).await.expect("signed list");
     assert_eq!(page.objects.len(), 1);
-    store.list_delimited("").await.expect("signed delimited list");
+    store
+        .list_delimited("")
+        .await
+        .expect("signed delimited list");
     let mut upload = store.put_multipart("k/multi").await.expect("open");
     upload
         .put_part(Bytes::from(vec![1u8; crate::MULTIPART_MIN_PART_SIZE]), None)
@@ -998,9 +1056,9 @@ async fn shared_key_requests_verify_and_a_wrong_key_is_access_denied() {
     store.delete("k/a b+c").await.expect("signed delete");
     let signed = fake.requests();
     assert!(
-        signed
-            .iter()
-            .all(|r| r.header("authorization").is_some_and(|a| a.starts_with("SharedKey "))),
+        signed.iter().all(|r| r
+            .header("authorization")
+            .is_some_and(|a| a.starts_with("SharedKey "))),
         "{signed:?}"
     );
 
@@ -1022,7 +1080,10 @@ async fn shared_key_requests_verify_and_a_wrong_key_is_access_denied() {
     from_env.head("k/multi").await.expect("signed head");
 
     let wrong = AzureStore::new(fake.config_with_key(&shared_key(8))).await;
-    assert!(matches!(wrong, Err(StoreError::AccessDenied(_))), "{wrong:?}");
+    assert!(
+        matches!(wrong, Err(StoreError::AccessDenied(_))),
+        "{wrong:?}"
+    );
 
     fake.require_shared_key(&shared_key(9));
     let denied = store
@@ -1065,7 +1126,10 @@ async fn multipart_sends_put_block_and_put_block_list_and_abort_sends_nothing() 
     let comps: Vec<_> = requests.iter().map(|r| r.query_param("comp")).collect();
     assert_eq!(comps, [Some("block"), Some("block"), Some("blocklist")]);
     assert!(requests[2].header("if-match").is_none(), "unconditional");
-    assert!(requests[2].header("if-none-match").is_none(), "unconditional");
+    assert!(
+        requests[2].header("if-none-match").is_none(),
+        "unconditional"
+    );
     let mut expected = first.to_vec();
     expected.extend_from_slice(b"tail");
     assert_eq!(fake.data_of("u/k"), Some(Bytes::from(expected)));

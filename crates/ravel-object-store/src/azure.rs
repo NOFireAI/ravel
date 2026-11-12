@@ -318,9 +318,9 @@ impl CredentialEnv {
             Ok(value) if value.is_empty() => Ok(None),
             Ok(value) => Ok(Some(value)),
             Err(VarError::NotPresent) => Ok(None),
-            Err(VarError::NotUnicode(_)) => Err(StoreError::Permanent(format!(
-                "{name} is not valid UTF-8"
-            ))),
+            Err(VarError::NotUnicode(_)) => {
+                Err(StoreError::Permanent(format!("{name} is not valid UTF-8")))
+            }
         };
         Ok(CredentialEnv {
             federated_token_file: read(ENV_FEDERATED_TOKEN_FILE)?,
@@ -448,7 +448,9 @@ impl AzureStore {
             },
             config.allow_http,
         )
-        .map_err(|e| StoreError::Permanent(format!("failed to build the Azure REST client: {e}")))?;
+        .map_err(|e| {
+            StoreError::Permanent(format!("failed to build the Azure REST client: {e}"))
+        })?;
         let rest = AzureRestClient::new(RestClientParts {
             http: S3HttpConnector::new(Arc::clone(&metrics), Arc::clone(&store_time))
                 .only_for_authority(authority)
@@ -662,7 +664,9 @@ fn store_authority(account: &str, endpoint: Option<&str>) -> Result<String, Stor
     let Some(endpoint) = endpoint else {
         return Ok(format!("{account}.blob.core.windows.net"));
     };
-    let after_scheme = endpoint.split_once("://").map_or(endpoint, |(_, rest)| rest);
+    let after_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
     let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
@@ -718,7 +722,9 @@ fn map_azure_error(
 ) -> StoreError {
     let code = error_code_of(&e);
     if code.as_deref() == Some("ContainerNotFound") {
-        return StoreError::Permanent("the Azure container does not exist (ContainerNotFound)".into());
+        return StoreError::Permanent(
+            "the Azure container does not exist (ContainerNotFound)".into(),
+        );
     }
     if let object_store::Error::AlreadyExists { .. } = e {
         return StoreError::Permanent(match code {
