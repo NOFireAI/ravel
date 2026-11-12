@@ -138,14 +138,20 @@ table still gets at least `2T / (P x 2^b)`. The descriptor rule is unchanged.
 | box | `T` | today | this decision |
 |---|---|---|---|
 | c6a.large | 12.65 to 12.78 GB (measured) | `bits` 7, 972 rows, no tuning | `bits` 7, 2,416 rows at 12.65 GB and 2,400 at 12.78 GB, descriptor need 4,112 |
-| c6a.large | largest that tunes | 12.51 GB | about 31.8 GB |
+| c6a.large | largest that tunes, `bits` 7 | 12.51 GB | about 24.6 GB |
+| c6a.large | largest that tunes, `bits` 8 | none | about 31.8 GB, with a soft `nofile` of at least 16,416 |
 | c6a.xlarge | 9.48 GB (item 4) | `bits` 5, 8,192 rows | unchanged |
 | c6a.2xlarge | 9.48 GB (item 4) | `bits` 4, 8,192 rows | unchanged |
 
-The 1,024-row floor stays. Under this rule it binds only past about 31.8 GB
-on c6a.large. The test fixture `Q33_WIDTHS` moves from 52 B to the measured
-64 B. `bits` 7 needs a soft `nofile` limit of at least 8,224 on c6a.large
-(one slot); the M8 and publication boxes ran at 8,320 or more.
+The 1,024-row floor stays. On c6a.large it binds past about 24.6 GB at
+`bits` 7 and about 31.8 GB at `bits` 8 (a floor chunk of 64 B rows is
+charged 66,432 B). The test fixture `Q33_WIDTHS` moves from 52 B to the
+measured 64 B. `bits` 7 needs a soft `nofile` limit of at least 8,224 on
+c6a.large (one slot) and `bits` 8 at least 16,416. The M8 and publication
+boxes were stamped at 8,320 or more, which allows `bits` 7; whether they
+allow 8 depends on the hard limit ravel-server raised the soft limit to,
+which those runs did not record. Past the descriptor limit the derivation
+returns `too_many_bits` and the statement keeps the sort-merge retry.
 
 ADR-3565 item 5 says the slack from rounding `bits` up is extra safety
 against an under-shoot. Under this rule the chunks spend that slack in
@@ -191,54 +197,73 @@ retry lines.
 - If combining cannot bring it under the threshold either, decisions 3 and 4
   are not built, and the epic records why.
 
+**Result (#4152, comment 6830427408).** The prediction ran on the full
+corpus (`benchmarks/clickbench/bucket-bytes/`). The uncombined route wrote
+27 to 51% of the threshold in all 45 cells (the three statements, the three
+boxes, `bits` 4 to 8), so decision 3 is built and decision 4 is not.
+Combining cut bytes by 2 to 16%: lz4 already absorbs the repeats inside a
+chunk. The same run showed that a 64 KiB data block per column, charged as
+a 90,368 to 102,912 B floor, does not fit the chunk budget on c6a.large at
+`bits` 7, which is why decision 3 states its chunk as one byte budget with
+a 16 KiB floor.
+
 ### 3. String keys are routed in byte-budgeted chunks, in the retry only (#4132)
 
 A routed column is either fixed-width, as today, or variable-width: Utf8,
 LargeUtf8, Utf8View, Binary, LargeBinary or BinaryView.
 
-- **Chunk layout.** Each of a route's `k` variable-width key columns holds
-  offsets for at most `c` rows and its own data block of `D` bytes. All are
-  allocated and charged before any row is written. A chunk seals when its
-  rows fill or when any one of its data blocks fills.
+- **Chunk layout.** A chunk is one byte budget `B`, charged in full before
+  any row is written and never exceeded: its fixed-width columns, its views
+  or offsets (16 B per variable-width column per row), its validity and its
+  copied string bytes all come out of `B`. A chunk seals when the next row
+  would take it past `B`, or at 8,192 rows. The rows a chunk holds and the
+  bytes its strings take are what the data gives; `B` is the only parameter
+  the derivation sets.
 - **Copies, not views.** Strings longer than the 12-byte inline limit are
   copied into the chunk's own data block. A view into the source batch would
   keep that batch's buffers alive without a charge.
-- **One value larger than `D`** gets its own block, charged before it is
-  copied like any chunk. A refused charge is a spill trigger, as for a fixed
+- **One row larger than `B`** is a chunk of its own, charged at its size
+  before it is copied. A refused charge is a spill trigger, as for any
   chunk.
 - **A chunk still refused once the stream retains nothing.** ADR-3565 item
   1 does not fail the stream in this case: that bucket's rows of the batch
   the router was handed are written to its file as one uncharged piece, and
   the next chunk is asked for again. Variable-width routes keep that rule,
-  for an oversized value too, and its bound is restated in bytes: the piece
-  is a copy of at most the rows of one batch the router was handed, so its
-  bytes are at most that batch's routed columns' bytes, a batch already in
-  memory when the router is called. ADR-3565 gives the same bound as
-  `(engage_groups + batch size) x (w + 4)`, which has no variable-width
-  form.
+  for an oversized row too. The piece is that bucket's share of the rows
+  the router was handed in one call, and ADR-3565 bounds those rows, not
+  their bytes: one input batch after an engage, `max(c, batch size)` rows
+  after a forced route, and the whole engage state, up to
+  `engage_groups + batch size` rows, at the engage itself. For a
+  variable-width route the bound is the same row count times the bytes of
+  those rows: the piece copies rows the router already holds, so it is at
+  most the routed bytes of the rows handed in that call, which at an
+  engage is the engage state the table held under its charge. ADR-3565's
+  `(engage_groups + batch size) x (w + 4)` is that bound for a fixed `w`.
 - **The forced route.** When a refusal arrives while a stream still holds its
   phase 1 stock table, ADR-3565 item 1 routes that table's emitted state
   straight to the files in uncharged slices, because the pool has just
-  refused a grow. For a route with `k` variable-width key columns a slice is
-  cut by bytes as well as rows: it ends at `c` rows or when any one key
-  column's values reach `D` bytes, whichever comes first, and a single value
-  larger than `D` is a slice of its own. The uncharged bound per stream is
-  therefore one slice, `c x (w_fixed + 16k + 12) + k x D` bytes, where
-  `w_fixed` is the routed fixed-width columns' bytes per row and 16 is one
-  view per variable-width column, plus at most one value larger than `D` per
-  variable-width column, whose bytes the stock table held under its charge
-  at the refusal. This replaces ADR-3565 item 3's `c x (w + 12)` for these
-  routes.
-- **The derivation.** `bits` comes from `T`, as now. The chunk area,
-  `(S - table(bits)) / (2^bits + 1)`, becomes a byte budget per chunk,
-  split between offsets, validity and data. No bytes-per-row input is needed.
-- **The floor.** For a variable-width route the floor is a chunk of
-  `c_min` = 1,024 rows with a 64 KiB data block per variable-width column.
-  64 KiB is 1,024 rows of 64 B, statement 33's routed row, chosen as a
-  number, not derived from the string columns. `b(c_min)` in decision 1's
-  second `bits` condition is that chunk's charge: the fixed-width columns,
-  offsets or views and validity for 1,024 rows, plus `k x 64 KiB`. A budget
-  below it returns `chunk_too_small`, as for a fixed-width route.
+  refused a grow. For a variable-width route a slice is cut the way a chunk
+  seals: it ends when the next row would take it past `B` bytes, or at
+  8,192 rows, and a single row larger than `B` is a slice of its own. The
+  uncharged bound per stream is one slice of at most `B` bytes plus its
+  bucket split's take indices (4 B per row), or one oversized row, whose
+  bytes the stock table held under its charge at the refusal. This replaces
+  ADR-3565 item 3's `c x (w + 12)` for these routes.
+- **The derivation.** `bits` comes from `T`, as now. The chunk budget is
+  `B = floor((S - table(bits)) / (2^bits + 1))`, the same area decision 1
+  gives a fixed-width route's chunks. No bytes-per-row input is needed.
+- **The floor.** For a variable-width route the floor is `B_min` = 16 KiB.
+  In decision 1's second `bits` condition, `b(c_min)` is `B_min` for these
+  routes, and a `B` below it returns `chunk_too_small`, as for a fixed-width
+  route. 16 KiB is chosen as a number: a 16 KiB chunk still carries about
+  118 rows of statement 34's 114.6 B average URL plus its 24 B of view and
+  count, and it fits the smallest budget the prediction found on any box at
+  `bits` 8 (31,698 B on c6a.large). On
+  c6a.large a string route then tunes up to about 25.0 GB at `bits` 7,
+  where the table's 0.75 condition binds before the floor does. Smaller
+  chunks compress worse: the prediction's bytes at `bits` 8 on c6a.large
+  were 17 to 24% above those at `bits` 4, and all of them were under the
+  threshold.
 - **Admission.** `admits` takes these key types only when the rule is built
   `with_spill(true)`, which is the refusal retry. A first attempt plans as
   today.
@@ -246,17 +271,15 @@ LargeUtf8, Utf8View, Binary, LargeBinary or BinaryView.
   key, so every row of a group lands in one bucket and is aggregated by one
   table.
 
-### 4. A sealed string-keyed chunk is combined before it is written, if decision 2 calls for it
+### 4. Combining a sealed chunk by key: not built
 
-When decision 2's prediction misses, a sealed chunk of a route with a
-variable-width key is merged by key before it is written, with the
-aggregate's own state merge, the same operation the phase 2 table applies
-when the bucket is read back. The result is exact. Its memory is one chunk's
-group table, bounded by the chunk's rows and charged like the phase 2 table.
-
-Fixed-width routing is unchanged. Statement 33, the fixed-width shape M8 and
-the publication runs validated, has about one row per group, so combining
-would cost one hash pass per chunk and save nothing.
+Decision 2's prediction met its threshold without combining, so a sealed
+chunk is written as routed. Combining (merging a sealed chunk's rows by key
+with the aggregate's state merge before it is written, exact, its memory one
+chunk's group table) stays the recorded fallback if M9 finds string-keyed
+bytes above the prediction's band. Fixed-width routing never combines:
+statement 33 has about one row per group, so combining would cost one hash
+pass per chunk and save nothing.
 
 ### 5. The gate (M9)
 
@@ -271,7 +294,7 @@ gate). The bands are written before any box is launched and include:
   c6a.xlarge's bucketed retry took 16.8 to 17.5 s on twice the vCPUs. A
   figure between 35 s and 56 s passes the band and is reported as a miss of
   the prediction;
-- if decision 3 was built: every retry of statements 19, 34 and 35 the run
+- every retry of statements 19, 34 and 35 the run
   logs reports `retry_plan="bucket"`, and each one's
   `bucket_spill_bytes_written` comes in within the band decision 2's
   prediction set and below that statement's M8 sort-merge bytes on the same
@@ -294,10 +317,8 @@ flowchart TD
     D -- "bits; chunks take S minus table, decision 1" --> X[hash exchange to P final streams]
     X --> T1[phase 1 table per stream]
     T1 -- "refused grow = trigger" --> RT[route rows to 2^bits buckets]
-    RT --> CH[open chunk per bucket: rows or bytes fill]
-    CH -- "seal, fixed-width key" --> W[("scratch file per bucket, written once")]
-    CH -- "seal, string key" --> CB["combine by key if decision 2 calls for it (decision 4)"]
-    CB --> W
+    RT --> CH["open chunk per bucket: rows, or one byte budget B for a string key"]
+    CH -- seal --> W[("scratch file per bucket, written once")]
     W --> RB[read each bucket back once]
     RB --> T2[phase 2 table per bucket]
     T2 --> OUT[exact result]
@@ -337,31 +358,31 @@ flowchart TD
 ## Consequences
 
 - c6a.large-sized hosts get the bucketed retry for statement 33 and for any
-  admitted shape whose projected tables fit in three quarters of the share,
-  up to about 2.5 times the `T` they reach today.
-- If decision 3 is built, a refused statement grouping by a string key
-  retries bucketed when its derivation tunes. Its scratch bytes no longer
+  admitted shape whose projected tables fit in three quarters of the share:
+  up to about 24.6 GB at `bits` 7, about twice the 12.5 GB they reach today,
+  and about 31.8 GB where the `nofile` limit allows `bits` 8.
+- A refused statement grouping by a string key retries bucketed when its
+  derivation tunes. Its scratch bytes no longer
   depend on the memory share, so they do not grow when concurrent statements
   shrink it.
 - Fixed-width routing, which M8 and the publication runs validated, changes
-  only in its chunk size (decision 1). Combining, if built, applies to
-  string-keyed routes only.
-- Decisions 3 and 4 are built only on decision 2's prediction. If it says
-  they do not pay, string keys keep the sort-merge retry and the epic says
-  why.
+  only in its chunk size (decision 1). Nothing is combined before it is
+  written (decision 4).
 - This ADR keeps the `retry_plan_reason` strings already shipped
   (`chunk_too_small`, `not_fixed_width`) unchanged, so dashboards and the M8
   and M9 judges read the same values; a string-keyed route that cannot tune
   reports `chunk_too_small` as a fixed-width one does.
 - Production cases this leaves exposed, stated for the release notes: a
-  string-keyed retry under memory pressure can hold, uncharged, one piece of
-  up to one input batch's key bytes per stream while it writes it out; a statement
-  whose `T` exceeds about 31.8 GB on a 4 GiB host still takes sort-merge; and
-  the projection's conservative bias still costs bits on an early refusal.
+  string-keyed retry under memory pressure writes out, uncharged, the rows
+  the router already holds, which at an engage is the whole engage state; a
+  statement whose `T` exceeds about 25 GB on a 4 GiB host with a soft
+  `nofile` under 16,416 still takes sort-merge; and the projection's
+  conservative bias still costs bits on an early refusal.
 - ADR-3565 gets an amendment that points items 1, 3, 4 and 5 and the
   string-key rejection at this ADR. The part for items 3 to 5 lands with
   decision 1's implementation (#4133); the part for item 1's
   still-refused-chunk bound, item 3's forced-route bound and the string-key
-  rejection lands with decision 3 (#4132), if it is built. ADR-0954 gets one for the M9 gate (#4154).
+  rejection lands with decision 3 (#4132). ADR-0954 gets one for the M9
+  gate (#4154).
 - No frozen format changes: RSEG, `proto/`, series identity, commit tokens
   and the object key layout are untouched.
