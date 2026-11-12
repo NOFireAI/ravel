@@ -137,6 +137,9 @@ use list::{AccountKey, AzureRestClient, RestClientParts};
 /// blob that keeps being replaced.
 pub const SUFFIX_ROUNDS: usize = 3;
 
+/// The largest `maxresults` List Blobs accepts.
+pub const MAX_LIST_PAGE_SIZE: usize = 5000;
+
 const ENV_FEDERATED_TOKEN_FILE: &str = "AZURE_FEDERATED_TOKEN_FILE";
 const ENV_CLIENT_ID: &str = "AZURE_CLIENT_ID";
 const ENV_TENANT_ID: &str = "AZURE_TENANT_ID";
@@ -172,7 +175,8 @@ pub struct AzureConfig {
     /// the emulator and the fake. Test builds only.
     #[cfg(any(test, feature = "test-support"))]
     pub test_account_key: Option<TestAccountKey>,
-    /// Keys per [`ObjectStoreBackend::list`] page, sent as `maxresults`.
+    /// Keys per [`ObjectStoreBackend::list`] page, sent as `maxresults`: 1
+    /// to [`MAX_LIST_PAGE_SIZE`].
     pub list_page_size: usize,
     /// Whole-request timeout, the response body included.
     pub request_timeout: Duration,
@@ -257,10 +261,11 @@ impl AzureConfig {
                 "Azure skip_signature is only valid with an endpoint".into(),
             ));
         }
-        if self.list_page_size == 0 {
-            return Err(StoreError::Permanent(
-                "Azure list page size must be at least 1".into(),
-            ));
+        if !(1..=MAX_LIST_PAGE_SIZE).contains(&self.list_page_size) {
+            return Err(StoreError::Permanent(format!(
+                "Azure list page size {} is outside 1 to {MAX_LIST_PAGE_SIZE}",
+                self.list_page_size
+            )));
         }
         Ok(())
     }
@@ -701,24 +706,22 @@ impl AzureStore {
     }
 }
 
-/// The `host[:port]` requests go to: the endpoint's as written, or Azure's
-/// for the account. An endpoint carrying userinfo (`user:pass@`) is refused
+/// The `host[:port]` requests go to: the endpoint's, without the scheme's
+/// default port, or Azure's for the account. An endpoint carrying userinfo (`user:pass@`) is refused
 /// without echoing it.
 fn store_authority(account: &str, endpoint: Option<&str>) -> Result<String, StoreError> {
     let Some(endpoint) = endpoint else {
         return Ok(format!("{account}.blob.core.windows.net"));
     };
-    let after_scheme = endpoint
-        .split_once("://")
-        .map_or(endpoint, |(_, rest)| rest);
+    let (scheme, after_scheme) = endpoint.split_once("://").unwrap_or(("", endpoint));
     let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
         .unwrap_or_default();
     if authority.contains('@') {
         return Err(StoreError::Permanent(
-            "Azure endpoint carries userinfo (user:pass@); credentials come from the \
-             environment only"
+            "Azure endpoint carries userinfo (user:pass@), which is never read as a \
+             credential"
                 .into(),
         ));
     }
@@ -727,6 +730,18 @@ fn store_authority(account: &str, endpoint: Option<&str>) -> Result<String, Stor
             "Azure endpoint {endpoint:?} names no host"
         )));
     }
+    // A request URI drops the scheme's default port, so the authority must too.
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        Some("443")
+    } else if scheme.eq_ignore_ascii_case("http") {
+        Some("80")
+    } else {
+        None
+    };
+    let authority = match (authority.rsplit_once(':'), default_port) {
+        (Some((host, port)), Some(default)) if port == default && !host.is_empty() => host,
+        _ => authority,
+    };
     Ok(authority.to_string())
 }
 
