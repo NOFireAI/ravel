@@ -757,7 +757,7 @@ mod metrics_leaves {
         verify_key_index_leaf,
     };
     use ravel_proto::catalog::v1::SnapshotHead;
-    use ravel_segment::{ReaderLimits, decode_catalog_v5, open_from_full};
+    use ravel_segment::{ReaderLimits, decode_catalog_v5, label_dict_strings, open_from_full};
 
     use crate::fold::RefoldQueue;
 
@@ -897,23 +897,19 @@ mod metrics_leaves {
         }
     }
 
-    /// The catalog a server started with `--fold-key-index-leaves
-    /// --fold-metrics-label-index` folds with: both switches parsed and
-    /// validated by the server's own `Cli`.
+    /// The catalog a server started with `--fold-key-index-leaves` folds
+    /// with: the leaf switch parsed and validated by the server's own `Cli`,
+    /// and the metrics label index on by default.
     fn leaf_catalog(store: Arc<dyn ObjectStoreBackend>) -> Catalog {
-        let cli = Cli::parse_validated_from([
-            "ravel-server",
-            "--fold-key-index-leaves",
-            "--fold-metrics-label-index",
-        ])
-        .expect("flags parse");
-        assert!(cli.fold_key_index_leaves && cli.maintenance.fold_metrics_label_index);
+        let cli = Cli::parse_validated_from(["ravel-server", "--fold-key-index-leaves"])
+            .expect("flags parse");
+        assert!(cli.fold_key_index_leaves && !cli.maintenance.no_fold_metrics_label_index);
         Catalog::new(
             store,
             CatalogConfig {
                 shard_count: SHARD_COUNT,
                 build_key_index_leaves: cli.fold_key_index_leaves,
-                metrics_label_index: cli.maintenance.fold_metrics_label_index,
+                metrics_label_index: !cli.maintenance.no_fold_metrics_label_index,
                 ..crate::query::server_catalog_config_base()
             },
         )
@@ -1156,6 +1152,72 @@ mod metrics_leaves {
         out
     }
 
+    /// Every RSEG data object under the tenant whose decoded LABEL_DICT
+    /// holds `value`. The section is stored compressed, so a scan of the
+    /// object's raw bytes cannot see it.
+    async fn label_dicts_holding(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        value: &str,
+    ) -> Vec<String> {
+        // `section_kind::LABEL_DICT` (docs/segment-format.md).
+        const LABEL_DICT_KIND: u32 = 1;
+        let limits = ReaderLimits::default();
+        let mut out = Vec::new();
+        for meta in list_all(store, &format!("t/{}/", tenant.to_hex()))
+            .await
+            .expect("list tenant")
+        {
+            if !meta.key.ends_with(".rseg") {
+                continue;
+            }
+            let got = store.get(&meta.key, GetRange::Full).await.expect("rseg");
+            let loc = open_from_full(&got.data, limits).expect("open rseg");
+            let section = loc
+                .footer
+                .sections
+                .iter()
+                .find(|s| s.kind == LABEL_DICT_KIND)
+                .expect("LABEL_DICT section");
+            let start = usize::try_from(section.offset).expect("offset");
+            let end = start + usize::try_from(section.len).expect("len");
+            let strings = label_dict_strings(&loc.footer, &got.data[start..end], limits)
+                .expect("decode LABEL_DICT");
+            if strings.iter().any(|s| s == value) {
+                out.push(meta.key);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Every `.kidx` leaf under the tenant, any signal, whose decoded
+    /// buckets hold an entry for `key8`. The bucket frames are stored
+    /// compressed, so a scan of the leaf's raw bytes cannot see it.
+    async fn leaves_holding(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        key8: &[u8; 8],
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        for meta in list_all(store, &format!("t/{}/", tenant.to_hex()))
+            .await
+            .expect("list tenant")
+        {
+            if !meta.key.ends_with(".kidx") {
+                continue;
+            }
+            let got = store.get(&meta.key, GetRange::Full).await.expect("leaf");
+            let summary = verify_key_index_leaf(&got.data, &KeyIndexLeafLimits::default())
+                .expect("valid leaf");
+            if summary.entries.iter().any(|e| &e.key8 == key8) {
+                out.push(meta.key);
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Every object under the tenant whose bytes hold `needle` verbatim.
     async fn objects_holding(
         store: &dyn ObjectStoreBackend,
@@ -1178,7 +1240,7 @@ mod metrics_leaves {
 
     /// Issue #4147, the ADR-3694 Stage 1 erasure acceptance: a metrics
     /// erasure driven through the server's real fold and maintain ticks with
-    /// `--fold-key-index-leaves --fold-metrics-label-index` on.
+    /// `--fold-key-index-leaves` on and the metrics label index on by default.
     ///
     /// The subject (`instance="instance-erased"`) has two series in the
     /// shard-0 object: one that differs from the survivor only in `instance`,
@@ -1250,6 +1312,22 @@ mod metrics_leaves {
             vec![1, 1, 1, 2, 1],
             "the pre-erasure leaf names the shard-0 object for each subject value"
         );
+        // The positive control for the absence scans at the end: before the
+        // erasure the same decoded scans find each erased value in the
+        // shard-0 object's LABEL_DICT and its key8 in the leaf. The raw-byte
+        // scan finds neither, because both sections are stored compressed.
+        for value in [ERASED_INSTANCE, ERASED_ONLY_JOB] {
+            assert_eq!(
+                label_dicts_holding(store.as_ref(), &tenant, value).await,
+                vec![s0.data_key.clone()],
+                "the decoded scan sees {value} before the erasure"
+            );
+            assert_eq!(
+                leaves_holding(store.as_ref(), &tenant, &key8(value)).await,
+                vec![stale_leaf.clone()],
+                "the decoded scan sees the key8 of {value} before the erasure"
+            );
+        }
 
         let erased_only_before = query(&store, &tenant_id, "job", ERASED_ONLY_JOB).await;
         assert_eq!(erased_only_before.series.len(), 1, "{erased_only_before:?}");
@@ -1278,6 +1356,12 @@ mod metrics_leaves {
         .await;
         let done_key =
             keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+        // The raw-byte scan's positive control: it sees the subject value in
+        // the request object, which stores it uncompressed.
+        assert_eq!(
+            objects_holding(store.as_ref(), &tenant, ERASED_INSTANCE.as_bytes()).await,
+            vec![dreq_key.clone()]
+        );
 
         assert_eq!(
             query(&store, &tenant_id, "job", ERASED_ONLY_JOB).await,
@@ -1502,8 +1586,10 @@ mod metrics_leaves {
         );
 
         // No live object holds the subject: the two live RSEG objects carry
-        // the survivors alone, and no object under the tenant holds an erased
-        // value or its key8.
+        // the survivors alone, no decoded LABEL_DICT holds an erased value,
+        // no decoded leaf holds its key8, and no object under the tenant
+        // holds either verbatim. The decoded scans are the ones step 1 shows
+        // seeing both before the erasure.
         let live = live_series(store.as_ref(), &tenant).await;
         assert_eq!(live.len(), 2, "{live:?}");
         let mut live_labels: Vec<LabelSet> =
@@ -1516,6 +1602,16 @@ mod metrics_leaves {
         expected.sort_by_key(|labels| format!("{labels:?}"));
         assert_eq!(live_labels, expected);
         for value in [ERASED_INSTANCE, ERASED_ONLY_JOB] {
+            assert_eq!(
+                label_dicts_holding(store.as_ref(), &tenant, value).await,
+                Vec::<String>::new(),
+                "{value} survives in a LABEL_DICT"
+            );
+            assert_eq!(
+                leaves_holding(store.as_ref(), &tenant, &key8(value)).await,
+                Vec::<String>::new(),
+                "the key8 of {value} survives in a leaf"
+            );
             assert_eq!(
                 objects_holding(store.as_ref(), &tenant, value.as_bytes()).await,
                 Vec::<String>::new(),

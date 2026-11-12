@@ -1,7 +1,10 @@
-//! `ravel-cli catalog fold --metrics-label-index` (ADR-3694 decision 2): the
-//! flag reaches the catalog the fold and the rebuild run with, the fold
-//! refuses it without `--key-index-leaves`, and a metrics rebuild without it
-//! is refused.
+//! `ravel-cli catalog fold --no-metrics-label-index` (ADR-3694 decision 2 and
+//! its Stage 1 acceptance amendment): the metrics label index is on by
+//! default wherever leaves are built, the opt-out reaches the catalog the
+//! fold and the rebuild run with, a default fold without `--key-index-leaves`
+//! is not refused and builds nothing, and a metrics rebuild with the opt-out
+//! is refused. Each case maps the opt-out to the catalog switch as
+//! `catalog fold` does, as its negation.
 //!
 //! Driven in-process against one `MemoryStore` per case, for the reason
 //! `tests/catalog_signal.rs` gives.
@@ -130,10 +133,13 @@ async fn kidx_objects(store: &MemoryStore) -> usize {
         .count()
 }
 
+/// One `catalog fold --signal metrics`, with `--key-index-leaves` when
+/// `key_index_leaves` and `--no-metrics-label-index` when
+/// `no_metrics_label_index`.
 async fn fold_metrics(
     store: Arc<MemoryStore>,
     key_index_leaves: bool,
-    metrics_label_index: bool,
+    no_metrics_label_index: bool,
 ) -> anyhow::Result<(ravel_catalog::FoldReport, String)> {
     catalog::fold_with_metrics_label_index(
         store as Arc<dyn ObjectStoreBackend>,
@@ -145,7 +151,7 @@ async fn fold_metrics(
         false,
         key_index_leaves,
         ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
-        metrics_label_index,
+        !no_metrics_label_index,
         None,
         now_ns(),
         false,
@@ -153,14 +159,16 @@ async fn fold_metrics(
     .await
 }
 
-/// With `--key-index-leaves`, `--metrics-label-index` is what makes a
-/// metrics fold build the `label_value` leaf: on, one leaf is written and the
-/// pending erasure set is listed once; off, no leaf and no listing.
+/// With `--key-index-leaves` and no other flag a metrics fold builds the
+/// `label_value` leaf: one leaf is written and the pending erasure set is
+/// listed once. With `--no-metrics-label-index` there is no leaf and no
+/// listing.
 #[tokio::test]
-async fn the_metrics_label_index_flag_reaches_the_fold() {
+async fn the_metrics_label_index_is_on_by_default_and_the_opt_out_reaches_the_fold() {
+    assert!(ravel_catalog::CatalogConfig::default().metrics_label_index);
     let on = Arc::new(MemoryStore::new());
     publish_fixture(&on).await;
-    let (report, printed) = fold_metrics(on.clone(), true, true)
+    let (report, printed) = fold_metrics(on.clone(), true, false)
         .await
         .expect("fold with the metrics leaf");
     assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
@@ -175,7 +183,7 @@ async fn the_metrics_label_index_flag_reaches_the_fold() {
 
     let off = Arc::new(MemoryStore::new());
     publish_fixture(&off).await;
-    let (report, _) = fold_metrics(off.clone(), true, false)
+    let (report, _) = fold_metrics(off.clone(), true, true)
         .await
         .expect("fold without the metrics leaf");
     assert_eq!(report.key_index_leaves_written, 0, "{report:?}");
@@ -183,34 +191,39 @@ async fn the_metrics_label_index_flag_reaches_the_fold() {
     assert_eq!(kidx_objects(&off).await, 0);
 }
 
-/// `--metrics-label-index` without `--key-index-leaves` would build nothing,
-/// so the fold refuses it before reading or writing anything.
+/// A default `catalog fold`, without `--key-index-leaves`, is not refused for
+/// the metrics label index it has on: it reads no LABEL_DICT, lists no
+/// erasure request and writes no leaf, and issues exactly the GETs of the
+/// same fold with `--no-metrics-label-index`.
 #[tokio::test]
-async fn the_metrics_label_index_flag_is_refused_without_key_index_leaves() {
-    let store = Arc::new(MemoryStore::new());
-    publish_fixture(&store).await;
-    let prefix = format!("t/{}/", TenantId::new(TENANT).hash().to_hex());
-    let before = list_all(store.as_ref(), &prefix).await.expect("list").len();
-    let err = fold_metrics(store.clone(), false, true)
-        .await
-        .expect_err("refused without --key-index-leaves");
-    assert!(
-        err.to_string()
-            .contains("--metrics-label-index needs --key-index-leaves"),
-        "{err}"
-    );
+async fn a_default_fold_without_key_index_leaves_reads_no_label_dict_and_writes_no_leaf() {
+    let mut get_requests = Vec::new();
+    for no_metrics_label_index in [false, true] {
+        let store = Arc::new(MemoryStore::new());
+        publish_fixture(&store).await;
+        let (report, _) = fold_metrics(store.clone(), false, no_metrics_label_index)
+            .await
+            .expect("a fold without leaves is not refused");
+        assert_eq!(report.entry_count, 2, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 0, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 0, "{report:?}");
+        assert_eq!(report.key_index_ranged_gets, 0, "{report:?}");
+        assert_eq!(report.metrics_label_index_erasure_list_requests, 0);
+        assert_eq!(kidx_objects(&store).await, 0);
+        get_requests.push(report.get_requests);
+    }
     assert_eq!(
-        list_all(store.as_ref(), &prefix).await.expect("list").len(),
-        before,
-        "the refused fold wrote nothing"
+        get_requests[0], get_requests[1],
+        "the default fold without leaves issues the opt-out's GETs"
     );
+    assert_eq!(get_requests[0], 7, "{get_requests:?}");
 }
 
 /// `--rebuild-key-index --signal metrics` attaches the `label_value` leaf to
-/// a part folded without it when `--metrics-label-index` is set, and is
-/// refused without it.
+/// a part folded without it by default, and is refused with
+/// `--no-metrics-label-index`.
 #[tokio::test]
-async fn the_metrics_label_index_flag_reaches_the_rebuild() {
+async fn the_metrics_label_index_opt_out_reaches_the_rebuild() {
     let store = Arc::new(MemoryStore::new());
     publish_fixture(&store).await;
     fold_metrics(store.clone(), false, false)
@@ -226,6 +239,7 @@ async fn the_metrics_label_index_flag_reaches_the_rebuild() {
         SignalArg::Metrics,
         None,
         250_000,
+        // `metrics_label_index` under `--no-metrics-label-index`.
         false,
         false,
     )
@@ -250,6 +264,7 @@ async fn the_metrics_label_index_flag_reaches_the_rebuild() {
         SignalArg::Metrics,
         None,
         250_000,
+        // `metrics_label_index` without the opt-out, the default.
         true,
         false,
     )

@@ -634,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
             fold_interval: Duration::from_secs(cli.fold_interval_secs),
             build_key_index_leaves: cli.fold_key_index_leaves,
             key_index_build_max_pairs: cli.fold_key_index_build_max_pairs,
-            metrics_label_index: cli.maintenance.fold_metrics_label_index,
+            metrics_label_index: !cli.maintenance.no_fold_metrics_label_index,
         },
         maintain: MaintenanceTaskConfig {
             enabled: matches!(cli.mode, Mode::Maintain),

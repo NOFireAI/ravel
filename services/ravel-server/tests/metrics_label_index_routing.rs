@@ -5,10 +5,11 @@
 //!
 //! Every fixture tenant holds `OBJECTS` sealed metrics objects in one ingest
 //! hour, folded into one catalog part by a catalog configured from the
-//! server's own `--fold-key-index-leaves` and `--fold-metrics-label-index`
+//! server's own `--fold-key-index-leaves` and `--no-fold-metrics-label-index`
 //! flags. The metric name is in every object; the label value `target` is in
 //! exactly the `HOLDERS`. Each routed run is compared with a run over a
-//! tenant folded without the metrics leaf, which routes nothing.
+//! tenant folded with leaves on and the metrics leaf opted out, which routes
+//! nothing.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -335,7 +336,7 @@ fn catalog_from_flags(store: Arc<dyn ObjectStoreBackend>, flags: &[&str]) -> Arc
             CatalogConfig {
                 shard_count: 1,
                 build_key_index_leaves: cli.fold_key_index_leaves,
-                metrics_label_index: cli.maintenance.fold_metrics_label_index,
+                metrics_label_index: !cli.maintenance.no_fold_metrics_label_index,
                 ..server_catalog_config_base()
             },
         )
@@ -343,8 +344,11 @@ fn catalog_from_flags(store: Arc<dyn ObjectStoreBackend>, flags: &[&str]) -> Arc
     )
 }
 
-const LABEL_INDEX_ON: &[&str] = &["--fold-key-index-leaves", "--fold-metrics-label-index"];
-const LABEL_INDEX_OFF: &[&str] = &["--fold-key-index-leaves"];
+/// The metrics leaf is on by default wherever leaves are built.
+const LABEL_INDEX_ON: &[&str] = &["--fold-key-index-leaves"];
+/// Leaves on with the metrics leaf opted out: without the opt-out this arm
+/// would build the metrics leaf and the unrouted control would route.
+const LABEL_INDEX_OFF: &[&str] = &["--fold-key-index-leaves", "--no-fold-metrics-label-index"];
 
 #[derive(Clone, Copy, Default)]
 struct Setup {
@@ -797,7 +801,7 @@ async fn promql_query_range_prunes_non_holders_by_label_index() {
     );
 }
 
-/// Over a tenant folded without `--fold-metrics-label-index` no part has a
+/// Over a tenant folded with `--no-fold-metrics-label-index` no part has a
 /// metrics leaf, so the route does not run: nothing is pruned, the keyIndex
 /// phase reports zero, and no metrics row of
 /// `ravel_query_key_index_parts_total` or the leaf GET total moves.
