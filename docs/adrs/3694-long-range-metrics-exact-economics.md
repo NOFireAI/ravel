@@ -268,8 +268,8 @@ ADR-2707 and ADR-3692 already impose on logs and spans leaves.
   not move, and the key layout gains no prefix.
 - **Build.** Only when `metrics_label_index` (new fold setting, default
   off until the Stage 1 amendment, the same rule as ADR-3692 decision 5;
-  the Stage 1 acceptance amendment below turns it on wherever leaves are
-  built) is on, and under ADR-3692's pair budget and pass accounting. A part whose
+  the Stage 1 acceptance amendment below decides it defaults on wherever
+  leaves are built, and T10, #4145, flips the default) is on, and under ADR-3692's pair budget and pass accounting. A part whose
   leaf would exceed `KEY_INDEX_LEAF_BYTES_CAP` (predicted 1 % of the part's
   data bytes; the Stage 1 amendment fixes the figure; the Stage 1
   acceptance amendment below keeps it at 1 %) is left uncovered and
@@ -483,8 +483,8 @@ raw whatever the matrix says.
 - An operator sees fewer objects opened and fewer catalog bytes per
   selective metrics statement, two new `data.stats` counters, one new
   fold setting (`metrics_label_index`, off until the Stage 1 amendment;
-  on wherever leaves are built since the Stage 1 acceptance amendment
-  below), and compaction of high-cardinality metrics tenants becomes queryable at
+  decided by the Stage 1 acceptance amendment below to default on wherever
+  leaves are built, flipped in T10, #4145), and compaction of high-cardinality metrics tenants becomes queryable at
   8 GiB. Semantics, visibility and erasure bounds are unchanged.
 - The fold reads one more frame per newly sealed object and writes one
   leaf per metrics part; leaf bytes are reported and capped.
@@ -802,7 +802,7 @@ at that bound is a follow-up, #4146.
 
 | check | target | miss | source |
 |---|---|---|---|
-| 3 (restated). R6 `mb_single_counter_rate`, folded with leaves | `segmentsPrunedByLabelIndex` = the resolved set minus value holders (`expected_routed_prunes`), exactly (`holders_routed_prune_mismatches` 0), value holders stamped per run; objects opened = value holders plus the objects a `min_commit_token` adds outside the resolved set, which are never routed (`token_only_fetched`, 4 in T8); leaf GETs at most 2 x n x covering parts for n distinct values; probe wire bytes per opened object at most 394 KB, the T8 figure; result hash equal to the unrouted run | a prune count other than that, leaf GETs over the bound, probe wire bytes per opened object over 434 KB (10 % above the T8 figure), or a hash difference | measured 2026-11-10, comment 6790288400; owner decision comment 6790537615; the 10 % miss line is predicted |
+| 3 (restated). R6 `mb_single_counter_rate`, folded with leaves | `segmentsPrunedByLabelIndex` = the resolved set minus value holders (`expected_routed_prunes`), exactly (`holders_routed_prune_mismatches` 0), value holders stamped per run; objects opened = value holders plus the objects a `min_commit_token` adds outside the resolved set, which are never routed (`token_only_fetched`, 4 in T8); leaf GETs at most (1 + n) x covering parts for n distinct values, the bound runs are judged on (the warm-repetition harness band; a cold first pass is bounded by 2 x n x covering parts); probe wire bytes per opened object at most 394 KB, the T8 figure; result hash equal to the unrouted run | a prune count other than that, leaf GETs over (1 + n) x covering parts, probe wire bytes per opened object over 434 KB (10 % above the T8 figure), or a hash difference | measured 2026-11-10, comment 6790288400; owner decision comment 6790537615; the 10 % miss line is predicted |
 
 The target is read against each run's own value-holder stamp. The two runs
 stamped 1,597 and 1,596 on the same tenant and binary; the rerun
@@ -823,6 +823,8 @@ is `1 + n` on a one-slice leaf. The harness band
 which assumes that cache and one slice per part; T8 read 3 against both
 bounds (6 and 10). The doc comment on `KEY_INDEX_LEAF_GET_CEILING`
 (`crates/ravel-catalog/src/snapshot_format/kidx.rs`) states this rule.
+The MetricsBench band file still carries row 3's old 600-object line and has
+no probe-bytes-per-object figure; #4149 aligns it with this restated row.
 
 ### Row 8: what covers the rewrite phase
 

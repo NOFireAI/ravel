@@ -95,9 +95,9 @@ pub const KEY_INDEX_MAX_PROBED_PARTS: usize = 1_024;
 /// label-value route (ADR-3694's per-value routing amendment) routes one
 /// one-key pass per distinct positive equality value, each under this
 /// ceiling, so a statement with `n` values issues at most `n` times it and
-/// at most `2n` GETs per covering part. When the query's read cache serves a slice's prefix GET to
-/// the later passes, a part costs at most its touched slices plus `n`, which
-/// is `1 + n` on a one-slice leaf.
+/// at most `2n` GETs per covering part. When the query's read cache serves
+/// a slice's prefix GET to the later passes, a part costs at most its
+/// touched slices plus `n`, which is `1 + n` on a one-slice leaf.
 pub const KEY_INDEX_LEAF_GET_CEILING: u32 = 2_048;
 
 /// Most bucket GETs one set probe issues against one leaf: ADR-3692
