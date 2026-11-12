@@ -1,0 +1,43 @@
+# ClickBench on GCE against a GCS bucket through Ravel's native GCS store
+# (--store gcs), measuring the published v0.32.0 release binaries. One box,
+# one arm. Launch with
+#
+#   benchmarks/clickbench/kit/launch-gcp.sh benchmarks/clickbench/kit/runs/gcp-v0.32.0/run.toml
+#
+# run.gcp.example.toml beside launch-gcp.sh explains every key.
+
+cloud = "gcp"
+store = "gcs"
+
+# The release the box downloads and measures, and the commit its tag names.
+release_tag = "v0.32.0"
+sha_a = "46f530b233e213f5fc1912ea28c5f8a57ed09495"
+ravel_server_sha256 = "f111c0dbf08eba7b1393c6e8139d0fd474f62cb932ba524f5ece5484bef41ea5"
+ravel_cli_sha256 = "850effdae0d8522deacfd3a4f9617ff602ccba7880ef3a4dc47df47f231d5e39"
+
+phases = ["benchmark", "concurrent"]
+
+project = "nofire-production"
+region = "us-central1"
+# us-central1-a had no c2d-highcpu-16 capacity on 2026-11-12 (stockout).
+zone = "us-central1-c"
+instance_type = "c2d-highcpu-16"
+image_family = "rocky-linux-9-optimized-gcp"
+image_project = "rocky-linux-cloud"
+boot_disk_gb = 100
+service_account = "ravel-clickbench@nofire-production.iam.gserviceaccount.com"
+bucket = "nofire-production-ravel-clickbench-kit"
+prefix = "clickbench-kit"
+store_bucket_prefix = "nofire-production-ravel-cb"
+
+tenant = "clickbench-v4"
+shards = 8
+corpus = "benchmarks/clickbench/hits.corpus.json"
+mapping = "benchmarks/clickbench/hits.mapping.toml"
+dataset_url = "https://datasets.clickhouse.com/hits_compatible/hits.parquet"
+dataset_sha256 = "a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f"
+rows_expected = 99997497
+memory_budget_bytes = 25769803776
+audit_mode = "off"
+
+prereg = "benchmarks/clickbench/kit/runs/gcp-v0.32.0/prereg.toml"

@@ -1,0 +1,74 @@
+# One ClickBench kit run on GCP: copy this file, fill it in, and pass it to
+# benchmarks/clickbench/kit/launch-gcp.sh. One box (arm A) measures a
+# published release's binaries against a fresh GCS bucket through Ravel's
+# native GCS store (--store gcs, ADR-3456). Every key without "optional" is
+# required, and any other key or table is refused, naming it: an AWS kit key
+# (sha_b, lanes, [bands], band_sections, instance_profile, rustfs_url) has no
+# meaning here. Arrays sit on one line. No key here is a credential: the box
+# uses the attached service account through the metadata server.
+# runs/gcp-v0.32.0/run.toml is a filled-in example.
+
+cloud = "gcp"
+store = "gcs"
+
+# The release the box downloads and measures, the commit its tag names (the
+# provenance git_sha; launch-gcp.sh checks the tag resolves to it), and the
+# sha256 of the linux-amd64 ravel-server and ravel-cli assets, copied from the
+# release's SHA256SUMS. launch-gcp.sh verifies that SHA256SUMS against its
+# keyless signature (cosign verify-blob, the release workflow's identity for
+# the tag) and that it lists these two digests; the box checks each download
+# against both. Optional: release_url (default
+# https://github.com/NOFireAI/ravel/releases/download).
+release_tag = "FILL-IN-TAG"
+sha_a = "FILL-IN-TAG-COMMIT"
+ravel_server_sha256 = "FILL-IN"
+ravel_cli_sha256 = "FILL-IN"
+
+# Phases box/run.sh runs, in order (see run.example.toml): benchmark is
+# required; the published ClickBench rows carry benchmark and concurrent.
+phases = ["benchmark", "concurrent"]
+
+# Where the box runs. The image must be dnf-based (box/run.sh installs wget,
+# sysstat and time with dnf) with glibc at least the release binaries' (2.34
+# for v0.32.0). Optional: boot_disk_gb (default 100, at least 50: the box
+# holds only the dataset and the binaries).
+project = "FILL-IN-PROJECT"
+region = "us-central1"
+zone = "us-central1-a"
+instance_type = "c2d-highcpu-16"
+image_family = "rocky-linux-9-optimized-gcp"
+image_project = "rocky-linux-cloud"
+
+# The box's identity, and where every run's in/ and out/ live:
+# gs://<bucket>/<prefix>/runs/<run-id>/. setup-gcp.sh creates both and grants
+# the account objectAdmin on the bucket. Each run's store bucket is
+# <store_bucket_prefix>-<run id>, created by launch-gcp.sh in the region and
+# removed by teardown-gcp.sh.
+service_account = "ravel-clickbench@FILL-IN-PROJECT.iam.gserviceaccount.com"
+bucket = "FILL-IN-RESULTS-BUCKET"
+prefix = "clickbench-kit"
+store_bucket_prefix = "FILL-IN-PREFIX"
+
+tenant = "clickbench-v4"
+shards = 8
+# Relative to the repository root. launch-gcp.sh ships the corpus, the mapping
+# and the pre-registration in the kit, and refuses a mapping that differs from
+# the release tag's benchmarks/clickbench/hits.mapping.toml.
+corpus = "benchmarks/clickbench/hits.corpus.json"
+mapping = "benchmarks/clickbench/hits.mapping.toml"
+dataset_url = "https://datasets.clickhouse.com/hits_compatible/hits.parquet"
+dataset_sha256 = "a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f"
+rows_expected = 99997497
+memory_budget_bytes = 25769803776
+audit_mode = "off"
+
+# The pre-registration fetch-gcp.sh judges the run by (kit.py prereg): a
+# [figures] table naming every figure it judges, each an exact value or a
+# [low, high] band. launch-gcp.sh refuses one that leaves a figure out.
+prereg = "benchmarks/clickbench/kit/runs/FILL-IN/prereg.toml"
+
+# Optional, as in run.example.toml: window_hours, audit_text,
+# expected_statements, fold_min_entry_ratio, query_timeout_s, healthz_phases,
+# the concurrent_* and q29_probe_* phase keys, perf_record, and
+# server_flags_a (refused when it repeats a kit-set flag or names an --s3-*
+# flag, which --store gcs refuses).
