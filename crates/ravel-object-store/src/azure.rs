@@ -80,14 +80,18 @@
 //!
 //! # Credentials
 //!
-//! Read from five environment variables only, never the whole `AZURE_*`
-//! namespace ([`CredentialEnv`]): workload identity
-//! (`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
-//! `AZURE_AUTHORITY_HOST`) or a shared key (`AZURE_STORAGE_ACCOUNT_KEY`),
-//! and otherwise `object_store`'s managed-identity fallback through the
-//! instance metadata service. When both a shared key and workload identity
-//! are set, the shared key is used, which is `object_store`'s order. No SAS
-//! token and no Azure CLI credential.
+//! Four `AZURE_*` variables are the only ones Ravel reads and passes to the
+//! client builder, never the whole namespace ([`CredentialEnv`]): workload
+//! identity (`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`,
+//! `AZURE_TENANT_ID`) or a shared key (`AZURE_STORAGE_ACCOUNT_KEY`). A
+//! workload identity token comes from `object_store`'s default authority
+//! host. Otherwise `object_store`'s managed-identity fallback asks the
+//! instance metadata service, and that path reads the platform's own
+//! `IDENTITY_HEADER` variable and sends it as `x-identity-header`. The
+//! builder is made with `MicrosoftAzureBuilder::new`, not `from_env`, so
+//! `IDENTITY_ENDPOINT` and the rest of the namespace are not read. When both
+//! a shared key and workload identity are set, the shared key is used, which
+//! is `object_store`'s order. No SAS token and no Azure CLI credential.
 //!
 //! # Hierarchical namespace
 //!
@@ -136,15 +140,14 @@ pub const SUFFIX_ROUNDS: usize = 3;
 const ENV_FEDERATED_TOKEN_FILE: &str = "AZURE_FEDERATED_TOKEN_FILE";
 const ENV_CLIENT_ID: &str = "AZURE_CLIENT_ID";
 const ENV_TENANT_ID: &str = "AZURE_TENANT_ID";
-const ENV_AUTHORITY_HOST: &str = "AZURE_AUTHORITY_HOST";
 const ENV_ACCOUNT_KEY: &str = "AZURE_STORAGE_ACCOUNT_KEY";
 
-/// The only environment variables [`AzureStore`] reads.
-pub const CREDENTIAL_ENV_KEYS: [&str; 5] = [
+/// The only `AZURE_*` variables [`AzureStore`] reads and passes to the
+/// client builder.
+pub const CREDENTIAL_ENV_KEYS: [&str; 4] = [
     ENV_FEDERATED_TOKEN_FILE,
     ENV_CLIENT_ID,
     ENV_TENANT_ID,
-    ENV_AUTHORITY_HOST,
     ENV_ACCOUNT_KEY,
 ];
 
@@ -291,15 +294,19 @@ impl AzureConfig {
     }
 }
 
-/// The credential settings [`AzureStore`] takes from the environment: these
-/// five variables and no other. An empty value counts as unset.
+/// The credential settings [`AzureStore`] takes from the environment: the
+/// four [`CREDENTIAL_ENV_KEYS`] and no other `AZURE_*` variable. An empty
+/// value counts as unset.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct CredentialEnv {
     pub federated_token_file: Option<String>,
     pub client_id: Option<String>,
     pub tenant_id: Option<String>,
-    pub authority_host: Option<String>,
     pub account_key: Option<String>,
+    /// The token endpoint, for tests only; a store always asks
+    /// `object_store`'s default.
+    #[cfg(test)]
+    pub(crate) authority_host: Option<String>,
 }
 
 impl fmt::Debug for CredentialEnv {
@@ -308,7 +315,6 @@ impl fmt::Debug for CredentialEnv {
             .field("federated_token_file", &self.federated_token_file)
             .field("client_id", &self.client_id)
             .field("tenant_id", &self.tenant_id)
-            .field("authority_host", &self.authority_host)
             .field(
                 "account_key",
                 &self.account_key.as_ref().map(|_| "<redacted>"),
@@ -336,8 +342,9 @@ impl CredentialEnv {
             federated_token_file: read(ENV_FEDERATED_TOKEN_FILE)?,
             client_id: read(ENV_CLIENT_ID)?,
             tenant_id: read(ENV_TENANT_ID)?,
-            authority_host: read(ENV_AUTHORITY_HOST)?,
             account_key: read(ENV_ACCOUNT_KEY)?,
+            #[cfg(test)]
+            authority_host: None,
         })
     }
 
@@ -352,6 +359,7 @@ impl CredentialEnv {
         if let Some(tenant_id) = &self.tenant_id {
             builder = builder.with_tenant_id(tenant_id);
         }
+        #[cfg(test)]
         if let Some(host) = &self.authority_host {
             builder = builder.with_authority_host(host);
         }
