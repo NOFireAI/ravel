@@ -4562,6 +4562,93 @@ else
   fail "run.toml published without concurrent" "check-run $code, with concurrent $ccode: $(head -c 300 "$TMP/run-pub-noconc.err") $(head -c 300 "$TMP/run-pub-conc.err")"
 fi
 
+# published_figures_limits_the_judged_kinds. Catches: --figures ignored (cold
+# misses still judged under hot), a skipped kind dropped silently or reported
+# more than once or with the wrong row count, the exit code still reflecting
+# a figure the option left out, and the default output changing. c6a.xlarge
+# holds 39 hot and 38 cold statement rows (q17 cold is unpublished); its only
+# miss is statement 24 hot. The cold-miss fixture adds statement 3 cold, 20 s
+# against 1.10 x the published 8.073 s, with its hot unchanged, and statement
+# 24's hot is brought under its band so the cold miss is the fixture's only one.
+pub_edit "$PUB_FIX/c6a.xlarge.json" figcold 'r["result"][2] = [20.0, 1.255, 1.239]; r["result"][23] = [7.905, 3.5, 3.5]'
+published fig-default c6a.xlarge "$PUB_FIX/c6a.xlarge.json"
+published fig-both c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures hot,cold
+published fig-both-rev c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures cold,hot
+published fig-dcold c6a.xlarge "$TMP/pub-figcold.json"
+dcold_code=$code
+published fig-hot-c c6a.xlarge "$TMP/pub-figcold.json" --figures hot
+hotc_code=$code
+published fig-cold-c c6a.xlarge "$TMP/pub-figcold.json" --figures cold
+coldc_code=$code
+published fig-hot-h c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures hot
+hoth_code=$code
+published fig-cold-h c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures cold
+coldh_code=$code
+if [ "$(wc -l <"$TMP/pub-fig-default.out" | tr -d ' ')" = 78 ] \
+  && ! grep -q '^SKIPPED' "$TMP/pub-fig-default.out" \
+  && cmp -s "$TMP/pub-fig-default.out" "$TMP/pub-fig-both.out" \
+  && cmp -s "$TMP/pub-fig-default.out" "$TMP/pub-fig-both-rev.out" \
+  && [ "$dcold_code" = 1 ] \
+  && [ "$(pub_notes fig-dcold MISS | grep -c '^statement 3 cold')" = 1 ]; then
+  pass "published judges both figure kinds by default, and --figures hot,cold changes nothing"
+else
+  fail "published figures default" "default lines $(wc -l <"$TMP/pub-fig-default.out"), cold-miss exit $dcold_code"
+fi
+if [ "$hotc_code" = 0 ] \
+  && ! grep -q '^MISS' "$TMP/pub-fig-hot-c.out" \
+  && [ "$(grep -c '  q[0-9][0-9] cold_s ' "$TMP/pub-fig-hot-c.out")" = 0 ] \
+  && [ "$(grep -c '  q[0-9][0-9] hot_s ' "$TMP/pub-fig-hot-c.out")" = 39 ] \
+  && [ "$(grep -c '^SKIPPED' "$TMP/pub-fig-hot-c.out")" = 1 ] \
+  && [ "$(grep '^SKIPPED' "$TMP/pub-fig-hot-c.out")" = 'SKIPPED cold: 38 statements not judged (--figures hot)' ] \
+  && [ "$(grep -c '^PASS .*concurrent qps' "$TMP/pub-fig-hot-c.out")" = 1 ] \
+  && [ "$hoth_code" = 1 ] \
+  && [ "$(pub_notes fig-hot-h MISS)" = 'statement 24 hot: measured 5.401 s, published 3.727 s, ratio 1.4492' ]; then
+  pass "--figures hot does not report a cold miss, exits on hot rows only, and says it skipped 38 cold rows"
+else
+  fail "published --figures hot" "exit $hotc_code/$hoth_code: $(grep -h '^MISS\|^SKIPPED' "$TMP/pub-fig-hot-c.out" "$TMP/pub-fig-hot-h.out")"
+fi
+if [ "$coldh_code" = 0 ] \
+  && ! grep -q '^MISS' "$TMP/pub-fig-cold-h.out" \
+  && [ "$(grep -c '  q[0-9][0-9] hot_s ' "$TMP/pub-fig-cold-h.out")" = 0 ] \
+  && [ "$(grep -c '  q[0-9][0-9] cold_s ' "$TMP/pub-fig-cold-h.out")" = 38 ] \
+  && [ "$(grep -c '^SKIPPED' "$TMP/pub-fig-cold-h.out")" = 1 ] \
+  && [ "$(grep '^SKIPPED' "$TMP/pub-fig-cold-h.out")" = 'SKIPPED hot: 39 statements not judged (--figures cold)' ] \
+  && [ "$(grep -c '^PASS .*concurrent qps' "$TMP/pub-fig-cold-h.out")" = 1 ] \
+  && [ "$coldc_code" = 1 ] \
+  && [ "$(pub_notes fig-cold-c MISS)" = 'statement 3 cold: measured 20.000 s, published 8.073 s, ratio 2.4774' ]; then
+  pass "--figures cold does not report a hot miss, exits on cold rows only, and says it skipped 39 hot rows"
+else
+  fail "published --figures cold" "exit $coldh_code/$coldc_code: $(grep -h '^MISS\|^SKIPPED' "$TMP/pub-fig-cold-h.out" "$TMP/pub-fig-cold-c.out")"
+fi
+
+# published_figures_bad_usage_refused. Catches: an empty, unknown, repeated or
+# twice-given --figures value accepted, or refused with an exit code other
+# than the 64 every other bad published usage gets, or after printing a table.
+figs_ok=1
+figs_why=""
+for bad in "" warm hot,hot hot, ,cold hot,cold,hot "hot cold" HOT; do
+  published fig-bad c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures "$bad"
+  if [ "$code" != 64 ] || [ -s "$TMP/pub-fig-bad.out" ]; then
+    figs_ok=0
+    figs_why="$figs_why [value '$bad' exit $code]"
+  fi
+done
+published fig-bad c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures hot --figures cold
+if [ "$code" != 64 ] || [ -s "$TMP/pub-fig-bad.out" ]; then
+  figs_ok=0
+  figs_why="$figs_why [given twice exit $code]"
+fi
+published fig-bad c6a.xlarge "$PUB_FIX/c6a.xlarge.json" --figures
+if [ "$code" != 64 ] || [ -s "$TMP/pub-fig-bad.out" ]; then
+  figs_ok=0
+  figs_why="$figs_why [no value exit $code]"
+fi
+if [ "$figs_ok" = 1 ]; then
+  pass "a --figures value that is empty, unknown, repeated or given twice is refused with exit 64"
+else
+  fail "published --figures bad usage" "$figs_why"
+fi
+
 # --- same box: arm O and concurrent windows (ADR-0954 M8) -------------------
 
 SB_FIX="$HERE/testdata/same-box"

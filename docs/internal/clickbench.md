@@ -1136,6 +1136,15 @@ times the published QPS is printed as `REPORTED` and not gated. A log with
 fewer than two windows of either arm, a missing or non-numeric figure, or
 no window of a named arm is refused with exit 2.
 
+`--figures KINDS` (`hot`, `cold` or `hot,cold`, the default) limits which
+per-statement figures `kit.py published` judges, for a pre-registration that
+names only one. A kind left out gets no rows and no verdict, so the exit
+code reflects only the kinds judged; the command prints one line per
+skipped kind, for example `SKIPPED cold: 38 statements not judged
+(--figures hot)`, counting the statement rows that kind would have had. The
+concurrent QPS row is judged either way. An empty value, an unknown or
+repeated kind, or the option given twice is bad usage (exit 64).
+
 The issue comment that pre-registers a run (ADR-2867 change 6) carries one
 required line naming the published baseline the run is judged against:
 `published baseline: rlog.toml@<ravel sha>`, the band file at the Ravel
