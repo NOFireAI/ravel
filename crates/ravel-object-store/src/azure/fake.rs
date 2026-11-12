@@ -49,7 +49,9 @@
 //!   unquoted, as Azure lists it.
 //! - `restype=account&comp=properties` on the account or the container path:
 //!   Get Account Information, 200 with `x-ms-sku-name`, `x-ms-account-kind`
-//!   and `x-ms-is-hns-enabled` as [`FakeAzure::set_hns`] sets it.
+//!   and `x-ms-is-hns-enabled` as [`FakeAzure::set_hns`] sets it. After
+//!   [`FakeAzure::set_hns_on_account_url_only`] the container path's answer
+//!   leaves `x-ms-is-hns-enabled` off, as Azurite's does.
 //!
 //! Anything else is 501 `NotImplemented`. [`FakeAzure::fail_next`] and its
 //! variants queue error answers for the next requests, whatever they are.
@@ -163,6 +165,8 @@ struct Inner {
     honour_start_from: AtomicBool,
     encode_all_names: AtomicBool,
     hns: Mutex<HnsAnswer>,
+    /// Leave `x-ms-is-hns-enabled` off the container URL's answer only.
+    hns_on_account_url_only: AtomicBool,
     shared_key: Mutex<Option<AccountKey>>,
 }
 
@@ -197,6 +201,7 @@ impl FakeAzure {
             honour_start_from: AtomicBool::new(true),
             encode_all_names: AtomicBool::new(false),
             hns: Mutex::new(HnsAnswer::False),
+            hns_on_account_url_only: AtomicBool::new(false),
             shared_key: Mutex::new(None),
         });
         let state = Arc::clone(&inner);
@@ -326,6 +331,14 @@ impl FakeAzure {
         *self.inner.hns.lock() = answer;
     }
 
+    /// Whether Get Account Information leaves `x-ms-is-hns-enabled` off its
+    /// answer on the container URL and sends it on the account URL only, as
+    /// Azurite does.
+    pub fn set_hns_on_account_url_only(&self, account_url_only: bool) {
+        self.inner
+            .hns_on_account_url_only
+            .store(account_url_only, Ordering::Relaxed);
+    }
     /// Require a valid `SharedKey` signature with the base64 key `key` on
     /// every later request.
     pub fn require_shared_key(&self, key: &str) {
@@ -506,8 +519,9 @@ impl Inner {
         let comp = query_param(query, "comp");
         if restype == Some("account") && comp == Some("properties") {
             return match (method, &target) {
-                (&Method::GET | &Method::HEAD, Target::Account | Target::Container(_)) => {
-                    self.account_information()
+                (&Method::GET | &Method::HEAD, Target::Account) => self.account_information(true),
+                (&Method::GET | &Method::HEAD, Target::Container(_)) => {
+                    self.account_information(!self.hns_on_account_url_only.load(Ordering::Relaxed))
                 }
                 _ => error(StatusCode::NOT_IMPLEMENTED, "NotImplemented"),
             };
@@ -590,11 +604,14 @@ impl Inner {
         }
     }
 
-    fn account_information(&self) -> Response {
+    fn account_information(&self, with_hns: bool) -> Response {
         let mut response = Response::new(Body::empty());
         let headers = response.headers_mut();
         set_header(headers, "x-ms-sku-name", "Standard_LRS".into());
         set_header(headers, "x-ms-account-kind", "StorageV2".into());
+        if !with_hns {
+            return response;
+        }
         match *self.hns.lock() {
             HnsAnswer::False => set_header(headers, "x-ms-is-hns-enabled", "false".into()),
             HnsAnswer::True => set_header(headers, "x-ms-is-hns-enabled", "true".into()),

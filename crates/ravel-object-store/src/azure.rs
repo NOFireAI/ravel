@@ -88,9 +88,11 @@
 //!
 //! # Hierarchical namespace
 //!
-//! Construction sends Get Account Information through the container URL and
-//! refuses an account whose `x-ms-is-hns-enabled` is not `false`, an absent
-//! or unreadable header included.
+//! Construction sends Get Account Information through the container URL and,
+//! when that answer carries no `x-ms-is-hns-enabled` (Azurite's does not),
+//! again through the account URL. It refuses an account unless the header it
+//! read is `false`: a `true` from either, a header absent from both, an
+//! unreadable value and a failed request are all refusals.
 
 use std::env::VarError;
 use std::fmt;
