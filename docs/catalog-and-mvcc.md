@@ -1385,15 +1385,18 @@ KEY_IDX section; their tier-1 source is LABEL_DICT
 (docs/segment-format.md), read whole by
 `ravel_segment::label_dict_strings`. With `build_key_index_leaves` and
 `CatalogConfig::metrics_label_index` both on (`ravel-cli catalog fold
---key-index-leaves --metrics-label-index`; the CLI refuses the second
-without the first or `--rebuild-key-index`), the metrics fold builds one
+--key-index-leaves`, or `ravel-server --fold-key-index-leaves`: the second
+switch is on by default, ADR-3694's Stage 1 acceptance amendment, and
+`--no-metrics-label-index` or `--no-fold-metrics-label-index` turns it
+off), the metrics fold builds one
 field, `label_value` (`ravel_catalog::METRICS_LABEL_VALUE_FIELD`, key type
 `str`), into the same `.kidx` leaf objects and refs as the other signals.
 Its pairs are `key8_str(s)` for every LABEL_DICT string `s` of the entry's
 object, label names and values alike (`__name__`, its metric names, every
 other label name and every value), each at block ordinal 0, which stands
 for the whole object: a match names the objects holding the string, never
-a block within one. With `metrics_label_index` off (the default) a metrics
+a block within one. With `build_key_index_leaves` off (the default) no
+leaf is built for any signal. With `metrics_label_index` off a metrics
 fold builds no leaf whatever `build_key_index_leaves` says, and the
 rebuild refuses metrics (`KeyIndexRebuildError::UnsupportedSignal`). An
 entry whose object the fold fetched whole for its name postings is read
@@ -1449,16 +1452,16 @@ pending erasures), so no query acts on
 such a leaf until the erasure completes. A part re-encoded while a request was pending is
 published uncovered and stays uncovered while later folds reuse it by
 reference; after the erasure completes, `ravel-cli catalog fold
---rebuild-key-index --signal metrics --metrics-label-index` attaches its
-leaf. `--rebuild-key-index --signal metrics --metrics-label-index` applies
+--rebuild-key-index --signal metrics` attaches its leaf, and is refused
+with `--no-metrics-label-index`. `--rebuild-key-index --signal metrics` applies
 the same cap and the same gate (its report carries `parts_over_cap`,
 `parts_erasure_gated`, `erasure_list_requests` and `erasure_get_requests`,
 the GETs of the pending requests' `.dreq` objects; a gated run reads no part
 and publishes nothing), reads every entry by range, and writes the leaf a
 fold with both switches on writes for the same part, byte for byte
-(`a_rebuilt_metrics_leaf_is_byte_identical_to_the_folds_leaf`). No query
-path reads the metrics leaf yet, and `ravel-server` has no flag for
-`metrics_label_index`.
+(`a_rebuilt_metrics_leaf_is_byte_identical_to_the_folds_leaf`). The PromQL
+resolve routes through the metrics leaf (docs/query-engine.md, "The
+label-value route").
 
 **Incremental tail build (ADR-3692 decision 5, ADR-3939 decision 5).** The
 tail part is re-encoded on every fold that advances the watermark, and a
@@ -1848,7 +1851,16 @@ prints each in text and `--json` (test
 When a compaction or erasure rewrite record lands, the fold re-encodes the
 part and rebuilds its leaves from the new entry set. An erasure rewrite
 therefore removes the subject's `key8` from the next leaf; the stale leaf is
-unreferenced and swept past the protection horizon. A leaf holds key values
+unreferenced and swept past the protection horizon. On metrics the refold
+that drops the erased inputs runs while the request is still pending, so
+it re-encodes the part under the erasure gate with no `label_value` leaf
+(under "Metrics `label_value` leaf"). The tail gets its new leaf from the
+first fold that re-encodes it once no request is pending
+(`metrics_erasure_rewrites_refolds_a_new_leaf_and_sweeps_the_stale_one`).
+A sealed day re-encoded under the gate stays without one, and label-index
+routing prunes none of its objects, until `ravel-cli catalog fold
+--rebuild-key-index` attaches it
+(`a_metrics_day_sealed_under_the_erasure_gate_is_counted_until_repaired`). A leaf holds key values
 (an `I64` subject value verbatim, an 8-byte hash prefix of a string value, a
 trace id), so the catalog family is no longer free of subject values
 (ADR-0064, `.kidx` amendment): the erasure completion rule for stale

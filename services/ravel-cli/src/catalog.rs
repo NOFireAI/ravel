@@ -188,7 +188,8 @@ pub async fn fold_with_part_cap(
 /// [`fold_with_part_cap`], plus `--key-index-build-max-pairs`: sets
 /// [`CatalogConfig::key_index_build_max_pairs`] for this fold, the pair
 /// budget past which the leaf build of one part runs in several
-/// passes over disjoint key8 ranges (ADR-3692 decision 5).
+/// passes over disjoint key8 ranges (ADR-3692 decision 5). The metrics label
+/// index takes its [`CatalogConfig`] default, on.
 #[allow(clippy::too_many_arguments)]
 pub async fn fold_with_key_index_budget(
     store: Arc<dyn ObjectStoreBackend>,
@@ -214,7 +215,7 @@ pub async fn fold_with_key_index_budget(
         writers_stopped,
         build_key_index_leaves,
         key_index_build_max_pairs,
-        false,
+        CatalogConfig::default().metrics_label_index,
         snapshot_part_max_entries,
         now_ns,
         json,
@@ -222,11 +223,11 @@ pub async fn fold_with_key_index_budget(
     .await
 }
 
-/// [`fold_with_key_index_budget`], plus `--metrics-label-index`: sets
-/// [`CatalogConfig::metrics_label_index`] for this fold, so with
-/// `build_key_index_leaves` a metrics fold builds the `label_value` leaf
-/// from each object's LABEL_DICT (ADR-3694 decision 2). Refused without
-/// `build_key_index_leaves`, which it would otherwise silently not apply.
+/// [`fold_with_key_index_budget`], plus `--no-metrics-label-index`: sets
+/// [`CatalogConfig::metrics_label_index`] for this fold (the CLI passes the
+/// opt-out's negation), so with `build_key_index_leaves` a metrics fold
+/// builds the `label_value` leaf from each object's LABEL_DICT (ADR-3694
+/// decision 2). Without `build_key_index_leaves` it changes nothing.
 #[allow(clippy::too_many_arguments)]
 pub async fn fold_with_metrics_label_index(
     store: Arc<dyn ObjectStoreBackend>,
@@ -286,12 +287,6 @@ pub async fn fold_with_retention_default(
 ) -> anyhow::Result<(FoldReport, String)> {
     if default_retention_ns.is_some_and(|ns| ns <= 0) {
         anyhow::bail!("--retention-default must be greater than zero");
-    }
-    if metrics_label_index && !build_key_index_leaves {
-        anyhow::bail!(
-            "--metrics-label-index needs --key-index-leaves (or --rebuild-key-index); \
-             without it the fold builds no leaf"
-        );
     }
     if snapshot_part_max_entries == Some(0) {
         anyhow::bail!(

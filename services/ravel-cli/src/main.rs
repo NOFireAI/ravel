@@ -2725,14 +2725,14 @@ enum CatalogCommand {
         /// its build fetches, and reads again each entry those leaves left
         /// uncovered. Applies to `--signal spans`, to a logs tenant that
         /// declares a key-index column or turns on trace-id indexing, and to
-        /// `--signal metrics` with `--metrics-label-index`; metrics without
-        /// it ignores it.
+        /// `--signal metrics` unless `--no-metrics-label-index` is passed;
+        /// metrics with it ignores it.
         #[arg(long)]
         key_index_leaves: bool,
         /// With `--key-index-leaves`, the most (entry, key8) pairs, read and
         /// carried from previous parts' leaves, one pass of a part's leaf
-        /// build holds (ADR-3692 decision 5). With `--metrics-label-index` the
-        /// fold also holds up to N more: the LABEL_DICT pairs of objects its
+        /// build holds (ADR-3692 decision 5). On `--signal metrics`, unless
+        /// `--no-metrics-label-index` is passed, the fold also holds up to N more: the LABEL_DICT pairs of objects its
         /// name postings fetched whole, only for parts it builds a leaf for,
         /// each part's released once its leaf is built; an object over that
         /// allowance is read by range instead. Each field the build
@@ -2749,9 +2749,11 @@ enum CatalogCommand {
               default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
               value_parser = clap::value_parser!(u64).range(1..))]
         key_index_build_max_pairs: u64,
-        /// With `--key-index-leaves` or `--rebuild-key-index` and `--signal
-        /// metrics`, build the metrics `label_value` leaf (ADR-3694 decision
-        /// 2): every label name and value in each object's LABEL_DICT, keyed
+        /// Turn off the metrics `label_value` leaf. By default, with
+        /// `--key-index-leaves` or `--rebuild-key-index` and `--signal
+        /// metrics`, the fold or rebuild builds that leaf (ADR-3694 decision
+        /// 2 and its Stage 1 acceptance amendment): every label name and
+        /// value in each object's LABEL_DICT, keyed
         /// by key8_str at block 0, so a probe names the objects holding a
         /// string. Each entry read by range costs a footer suffix GET (a
         /// second footer GET when the footer is larger than the 8 KiB suffix)
@@ -2766,10 +2768,11 @@ enum CatalogCommand {
         /// pass 1% of its objects' bytes gets no leaf
         /// (`metrics_label_index_parts_over_cap`).
         /// While any metrics erasure request is pending, no metrics leaf is
-        /// built (`metrics_label_index_parts_erasure_gated`). Off by default;
-        /// refused without `--key-index-leaves` or `--rebuild-key-index`.
+        /// built (`metrics_label_index_parts_erasure_gated`). Without
+        /// `--key-index-leaves` or `--rebuild-key-index` no leaf is built and
+        /// this flag changes nothing. With it a metrics rebuild is refused.
         #[arg(long)]
-        metrics_label_index: bool,
+        no_metrics_label_index: bool,
         /// Instead of folding, attach key-index leaves to the parts already in
         /// HEAD that lack a ref for a declared field (ADR-2707 decision 4,
         /// "Lifecycle"; docs/catalog-and-mvcc.md "Rollout"). Each such part is
@@ -2784,8 +2787,8 @@ enum CatalogCommand {
         /// no hour, so `--writers-stopped` changes nothing here. Applies to
         /// `--signal spans`, to a logs tenant that declares a key-index
         /// field (a logs tenant that declares none is refused), and to
-        /// `--signal metrics` with `--metrics-label-index` (refused without
-        /// it), where the ranged reads are of LABEL_DICT instead of KEY_IDX.
+        /// `--signal metrics` (refused with `--no-metrics-label-index`),
+        /// where the ranged reads are of LABEL_DICT instead of KEY_IDX.
         #[arg(long, conflicts_with_all = ["key_index_leaves", "max_flush_lifetime"])]
         rebuild_key_index: bool,
         /// With `--rebuild-key-index`, rebuild only this field. Refused unless
@@ -3276,7 +3279,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     rebuild_key_index: true,
                     field,
                     batch_entries,
-                    metrics_label_index,
+                    no_metrics_label_index,
                     json,
                     tenant_kms,
                     ..
@@ -3290,7 +3293,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             signal,
             field,
             batch_entries,
-            metrics_label_index,
+            !no_metrics_label_index,
             json,
         )
         .await
@@ -3305,7 +3308,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     writers_stopped,
                     key_index_leaves,
                     key_index_build_max_pairs,
-                    metrics_label_index,
+                    no_metrics_label_index,
                     snapshot_part_max_entries,
                     retention_default,
                     json,
@@ -3323,7 +3326,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             writers_stopped,
             key_index_leaves,
             key_index_build_max_pairs,
-            metrics_label_index,
+            !no_metrics_label_index,
             snapshot_part_max_entries
                 .map(usize::try_from)
                 .transpose()
@@ -5706,10 +5709,11 @@ mod tests {
         );
     }
 
-    /// `catalog fold --metrics-label-index` (ADR-3694 decision 2) is off by
-    /// default and parses beside `--key-index-leaves` and beside
-    /// `--rebuild-key-index`. Without either, the fold refuses it at run time
-    /// (`tests/catalog_fold_metrics_label_index.rs`).
+    /// `catalog fold --no-metrics-label-index` (the ADR-3694 Stage 1
+    /// acceptance amendment) is not passed by default, so the metrics label
+    /// index is on, and the opt-out parses alone, beside `--key-index-leaves`
+    /// and beside `--rebuild-key-index`
+    /// (`tests/catalog_fold_metrics_label_index.rs` runs each).
     #[test]
     fn catalog_fold_metrics_label_index_flag() {
         let parse = |extra: &[&str]| {
@@ -5722,17 +5726,19 @@ mod tests {
                 Command::Catalog {
                     command:
                         super::CatalogCommand::Fold {
-                            metrics_label_index,
+                            no_metrics_label_index,
                             ..
                         },
-                } => metrics_label_index,
+                } => no_metrics_label_index,
                 _ => panic!("expected the catalog fold subcommand"),
             }
         };
-        assert!(!parse(&[]), "the metrics leaf is off by default");
+        assert!(!parse(&[]), "the metrics leaf is on by default");
         assert!(!parse(&["--key-index-leaves"]));
-        assert!(parse(&["--key-index-leaves", "--metrics-label-index"]));
-        assert!(parse(&["--rebuild-key-index", "--metrics-label-index"]));
+        assert!(!parse(&["--rebuild-key-index"]));
+        assert!(parse(&["--no-metrics-label-index"]));
+        assert!(parse(&["--key-index-leaves", "--no-metrics-label-index"]));
+        assert!(parse(&["--rebuild-key-index", "--no-metrics-label-index"]));
     }
 
     /// `catalog fold --rebuild-key-index` (ADR-2707 decision 4): `--field`

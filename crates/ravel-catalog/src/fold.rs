@@ -19543,6 +19543,114 @@ pub(crate) mod tests {
         );
     }
 
+    /// The upgrade to the default-on metrics label index (ADR-3694 Stage 1
+    /// acceptance amendment): a metrics day sealed by a leaf-building fold
+    /// with `metrics_label_index` off has no `label_value` leaf. A fold under
+    /// the new default carries it by reference, counts it in
+    /// `key_index_parts_missing_declared_leaves` and warns naming
+    /// `label_value`, while the tail it re-encodes gets the leaf; the metrics
+    /// rebuild attaches the day's leaf and the next fold counts 0.
+    #[tokio::test]
+    async fn a_metrics_day_sealed_before_the_default_flip_is_counted_until_repaired() {
+        let store = OpLogStore::empty();
+        let before = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                metrics_label_index: false,
+                ..metrics_kidx_config()
+            },
+        )
+        .expect("catalog");
+        for (seq, hour, region) in [
+            (1u64, DAY_D + 20, "east"),
+            (2, DAY_D + 22, "east"),
+            (3, DAY_D + 25, "west"),
+        ] {
+            publish_labeled_metrics(
+                store.as_ref(),
+                seq,
+                hour,
+                &region_series(region),
+                1000,
+                false,
+            )
+            .await;
+        }
+        let sealing = fold_through(&before, Signal::Metrics, DAY_D + 25).await;
+        assert_eq!(sealing.key_index_leaves_written, 0, "{sealing:?}");
+        let sealed = read_signal_head(store.as_ref(), Signal::Metrics)
+            .await
+            .parts[0]
+            .clone();
+        assert_eq!(
+            (sealed.min_hour, sealed.watermark_hour),
+            (DAY_D + 20, DAY_D + 22)
+        );
+        assert!(sealed.key_index.is_empty(), "{sealed:?}");
+
+        let after = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                build_key_index_leaves: true,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        assert!(after.config().metrics_label_index);
+        publish_labeled_metrics(
+            store.as_ref(),
+            4,
+            DAY_D + 26,
+            &region_series("west"),
+            1000,
+            false,
+        )
+        .await;
+        store.clear();
+        let (report, warnings) = fold_capturing_warnings(&after, Signal::Metrics, DAY_D + 26).await;
+        let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+        assert_eq!(head.parts[0], sealed, "day d is carried unchanged");
+        assert_eq!(
+            leaf_fields(&head.parts[1]),
+            vec![METRICS_LABEL_VALUE_FIELD],
+            "the re-encoded tail gets the leaf"
+        );
+        assert_eq!(
+            report.key_index_parts_missing_declared_leaves, 1,
+            "{report:?}"
+        );
+        let warning = missing_leaves_warning(&warnings);
+        assert!(
+            warning.contains("signal=Metrics")
+                && warning.contains(&format!("{{\"{METRICS_LABEL_VALUE_FIELD}\"}}")),
+            "{warning}"
+        );
+
+        after
+            .rebuild_key_index(&tenant(), Signal::Metrics, &Default::default())
+            .await
+            .expect("repair");
+        let repaired = read_signal_head(store.as_ref(), Signal::Metrics)
+            .await
+            .parts[0]
+            .clone();
+        assert_eq!(leaf_fields(&repaired), vec![METRICS_LABEL_VALUE_FIELD]);
+        publish_labeled_metrics(
+            store.as_ref(),
+            5,
+            DAY_D + 27,
+            &region_series("west"),
+            1000,
+            false,
+        )
+        .await;
+        let report = fold_through(&after, Signal::Metrics, DAY_D + 27).await;
+        assert_eq!(
+            report.key_index_parts_missing_declared_leaves, 0,
+            "{report:?}"
+        );
+    }
+
     /// `key_index_parts_missing_declared_leaves` is 0 with the leaf switch
     /// off. Under an entry threshold of 1, a switch-on fold seals day d's
     /// one indexed entry with a `user_id` leaf and leaves day d + 1's
@@ -20168,7 +20276,7 @@ pub(crate) mod tests {
             ..metrics_kidx_config()
         };
         assert!(cfg.build_key_index_leaves);
-        assert!(!CatalogConfig::default().metrics_label_index);
+        assert!(CatalogConfig::default().metrics_label_index);
         let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
         let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
         assert_eq!(report.entry_count, 6, "{report:?}");
