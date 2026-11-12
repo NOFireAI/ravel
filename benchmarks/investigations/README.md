@@ -510,6 +510,19 @@ minutes of its ingest hour. Otherwise the deadline check records
 `retired_hour_drop` not-run before its maintain pass, and evaluate and
 the upload still run inside the box's 600 minutes.
 
+590 leaves 10 minutes of the box's 600, not the hour the run deadline
+otherwise keeps, and three steps can run past the deadline. The refold
+after each retention fold has no deadline check. It is a fold at the
+watermark the retention fold just wrote, so it is a no-op when no new
+ingest hour has opened since. The resolve's check passes at minute 578
+with its 10-minute estimate. And evaluate plus the upload of `out/` run
+after the last state. That last pair is measured: from `STEP evaluate`
+to `DONE` took 1 s in D3' run A (`progress.log` 19:04:57Z, `DONE`
+19:04:58Z, measured 2026-11-11) and 2 s in run C (04:26:51Z to 04:26:53Z,
+measured 2026-11-12), both on a `day_parts_7` and `retired_hour` run. A
+retired_hour step that runs that late can still lose the run: the
+instance stops mid-upload, and `fetch.sh` then needs `--partial`.
+
 **`day_parts_N`** runs these steps in order:
 
 0. `inv.py fold-binary` writes `stamps/day_parts_N.logs.fold_binary.json`,
@@ -1314,7 +1327,10 @@ maintain wait and the drop step run hours apart. So W3 reads neither:
   before the tail load, and counts those whose hour lies in D0 to D0 + 23,
   the tombstoned day, on both folds. The tail and a seal of any other day
   have their hour outside it and do not enter. An absent stamp, or one with
-  no integer `new_in_range`, is `missing`.
+  no integer `new_in_range`, is `missing`. It counts new part objects, not
+  PUTs: a re-encode whose bytes did not change lands on the same
+  content-addressed key and is not counted. Retiring an hour changes the
+  bytes of the part that holds it, so that re-encode is counted.
 
 W8's two folds each report `retired_hours`, the union of the hours the
 HEAD in effect after the fold retires across its parts, and each must
