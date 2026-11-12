@@ -759,7 +759,7 @@ amendment.
 | 5 | within 10 % of R6's 81.0 s; `catalog_get_delta` within 125 plus leaf GETs | 82.6 s (+2.0 %); 122 catalog GETs | pass | measured 2026-11-10, comment 6790288400 |
 | 6 | every L1 statement answers; no refusal or kill; hashes equal to L0; peak memory under 8 GiB | compaction worked (36 L1 objects, 4.33 GB from 26.7 GB of L0, 44 min, 0 failed, published); the L1 query pass logged 3 memory-budget reserve refusals in its first 3 minutes, held about 6 to 7.5 GB of the 8 GiB container, then the container was gone; all 315 records `error` (connection refused); `l1_entries_compared` 0; the kill reason was not captured | miss, owned by #4118; peak memory and the scan GET and wire bounds not measured | comment 6790288400 |
 | 7 | leaf bytes at most 1 % of part data bytes; fold wall with the switch on within 10 % of off; uncovered parts 0 | leaf bytes 0.77 % of the re-encoded parts' data bytes; uncovered tail parts 0; wall ratio 2.42 with `repartitioned_parts` = 1; leaf build 202,931 GETs for 25,401 objects | leaf bytes and coverage pass; wall ratio not judged, by the rule of the second pre-registration update; build GETs recorded below | measured 2026-11-10, comments 6790288400 and 6750787808 |
-| 8 | no label-index prune while an erasure is pending; pending results equal the reference; after the rewrite and fold no surviving key, carried part or stale leaf | first run: arm voided by a harness defect, no erasure submitted; rerun pending phase: 18 entries compared, 18 equal, 0 differing, `other_records_pruned_by_label_index` 0, `label_index_null` 0; rewrite phase: the maintain container (8 GiB, 2 cores, four concurrent merges) logged nothing after its first 14 s and was found exited with the erasure still pending | pending phase pass; rewrite phase not measured, closed on the tests listed below | measured 2026-11-12, comment 6822878261 |
+| 8 | no label-index prune while an erasure is pending; pending results equal the reference; after the rewrite and fold no surviving key, carried part or stale leaf | first run: arm voided by a harness defect, no erasure submitted; rerun pending phase: 18 entries compared, 18 equal, 0 differing, `other_records_pruned_by_label_index` 0, `label_index_null` 0; rewrite phase: the maintain container (8 GiB, 2 cores, four concurrent merges) logged nothing after its first 14 s and was found exited with the erasure still pending | pending phase pass; rewrite phase not measured, closed on the tests listed below | measured 2026-11-12, comment 6822878261; owner decision comment 6823307226 |
 | 9 | Prometheus-oracle statuses as R6, folded and unfolded, routed and unrouted; no new `incorrect` | no new engine `incorrect`; 19 entries equal between routed and unrouted and no status differs; the one change against R6 is `mb_fanout_topk_instances`, tie order (#3848, a grading issue); the two R6 timeouts persist; `mb_fanout_total_rate` sits at the 120 s deadline (118.7 s median, and timed out in the rerun) | pass | comments 6790288400 and 6822878261 |
 | 12 | no statement over 5 % slower outside the lane's noise; no GET or byte increase beyond the probe gate allowance | GETs and bytes within the allowance on every statement, the largest `mb_single_gauge_delta` at +1,201 GETs against 2,726; the T2 probe prunes 73 to 100 % on the three joins and under 2 % on single-series selectors; `mb_join_cpu_on_build_version` 15 % slower (317 dictionary-probe GETs the control had cached); `mb_join_unless_quiet_instances` 9.5 % slower with identical I/O; the whole pass about 3 % slower | GETs and bytes pass; latency miss on 2 of 21 statements, one explained, one not attributed by the run's files | comment 6790288400 |
 | 13 | dollars per R6 statement before and after, plus the leaf's fold cost per part-month | `mb_single_counter_rate`: R6 $0.0117, unrouted $0.0160, control $0.0135; routed plan and probe $0.0074 (recomputed below); no routed scan figure, no leaf PUT count, no part-month figure | partial: the before figures and a routed plan-plus-probe figure; the routed total and the part-month figure are missing | comment 6790288400 |
@@ -798,7 +798,7 @@ dictionary of 55 % of the objects that hold the metric, because every L0
 object is a shard flush across all series, and an index of values cannot
 say that `instance-0`, `method` and `status` occur on one series. The
 series-level bound on this tenant is 141 objects. A series-level index aimed
-at that bound is a follow-up, unfiled.
+at that bound is a follow-up, #4146.
 
 | check | target | miss | source |
 |---|---|---|---|
@@ -826,7 +826,7 @@ bounds (6 and 10). The doc comment on `KEY_INDEX_LEAF_GET_CEILING`
 
 ### Row 8: what covers the rewrite phase
 
-The owner decided on 2026-11-12 to take no further box and to close row 8
+The owner decided on 2026-11-12 (comment 6823307226) to take no further box and to close row 8
 on the rerun's pending-phase measurement plus the existing tests. Each link
 of the rule has its own test:
 
@@ -854,7 +854,7 @@ No test drives one metrics leaf through the whole chain: rewrite, the next
 fold's re-encode with a new leaf that holds no key8 of a value only the
 erased series carried, and the stale leaf's sweep. That end-to-end test, in
 `erasure_e2e.rs` with leaves and the metrics label index on, is a
-follow-up, unfiled. The maintain container's death with four concurrent
+follow-up, #4147. The maintain container's death with four concurrent
 merges at 8 GiB is recorded on #4118 beside the row 6 miss.
 
 ### `metrics_label_index` defaults on wherever leaves are built
@@ -894,7 +894,7 @@ The leaf byte cap stays at 1 % of a part's data bytes: the setting is
 crates/ravel-catalog/src/config.rs:405), which decision 2 calls
 `KEY_INDEX_LEAF_BYTES_CAP`. T8 measured 0.77 % on one re-encoded part.
 
-The code change is its own task, T10, because it is not one default. Both
+The code change is its own task, T10 (#4145), because it is not one default. Both
 existing refusals test the flag's value, not whether it was passed
 (`services/ravel-server/src/config.rs:7384`,
 `services/ravel-cli/src/catalog.rs:290`), so flipping a default alone would
@@ -956,5 +956,5 @@ refuse every `ravel-server --mode maintain`, `all` or `query` and every
 - Row 12's `mb_join_unless_quiet_instances` latency is not attributed.
 - Row 13 lacks the routed total and the leaf's part-month cost.
 - Row 7's per-advance cost of the metrics leaf is not measured.
-- The end-to-end erasure test above, and the series-level index, are
-  unfiled follow-ups.
+- The end-to-end erasure test above (#4147) and the series-level index
+  (#4146) are follow-ups.
