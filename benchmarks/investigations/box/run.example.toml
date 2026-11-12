@@ -26,7 +26,8 @@ states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "advanced_le
           "erasure_in_flight", "many_parts_744", "many_parts_2160"]
 # The run's own deadline, below box.max_minutes: a state that would start
 # past it is recorded not-run (reason deadline), and evaluate and the upload
-# still happen.
+# still happen. A run listing day_parts_7 and retired_hour sets 590: the
+# README's "Run time with retired_hour" has the arithmetic.
 max_minutes = 540
 # Logs objects rlog inspect reads for the needle-block count (0: all).
 needle_blocks_max_objects = 200
@@ -167,6 +168,9 @@ wait_minutes = 20
 # here takes default; default absent is 30.
 [step_estimate_minutes]
 default = 30
+# Each retired_hour step's tail load and retention fold; its two waits
+# (retired_hour.wait_minutes, then the next ingest hour) are bounded apart.
+retired_hour = 10
 
 # Every price evaluate.py multiplies by, with the source it was read from.
 # A price without a source is reported missing.

@@ -6676,7 +6676,9 @@ FINISHED=1
                           "--maintain-key-file", "--disable-fold --retention-tenant dp7=RETENTION_S",
                           "tombstone-check --first D0_7 --last D0_7+0", "STAMP stamps/retired_hour.logs.tombstone.json",
                           "listing-retired_hour-after.json", "STAMP stamps/retired_hour.logs.maint_records.json",
+                          "wait until the ingest hour", "load-retired_hour_tail-logs.measure.json",
                           "fold-retired_hour-logs.measure.json", "--key-index-leaves --retention-default RETENTION_Ss",
+                          "STAMP stamps/retired_hour.logs.fold_watermark.json", "fold-watermark --report",
                           "fold-retired_hour_refold-logs.measure.json",
                           "--key-index-leaves --retention-default RETENTION_Ss",
                           "listing-retired_hour-resolved.json", "rlog footprint --tenant dp7",
@@ -6685,7 +6687,10 @@ FINISHED=1
                           "tombstone-check --first D0_7 --last D0_7+23",
                           "STAMP stamps/retired_hour_drop.logs.tombstone.json",
                           "STAMP stamps/retired_hour_drop.logs.maint_records.json",
-                          "fold-retired_hour_drop-logs.measure.json", "fold-retired_hour_drop_refold-logs.measure.json",
+                          "wait until the ingest hour", "load-retired_hour_drop_tail-logs.measure.json",
+                          "fold-retired_hour_drop-logs.measure.json",
+                          "STAMP stamps/retired_hour_drop.logs.fold_watermark.json", "fold-watermark --report",
+                          "fold-retired_hour_drop_refold-logs.measure.json",
                           "listing-retired_hour_drop-resolved.json", "rlog footprint --tenant dp7",
                           "hour-segments --footprint", "STAMP stamps/retired_hour_drop.logs.retired_resolve.json",
                           "STAMP stamps/transitions.jsonl")),
@@ -6729,6 +6734,102 @@ FINISHED=1
         self.flip_check('  run "$PY" "$LIB" hour-segments', '  : "$PY" "$LIB" hour-segments', "run.sh",
                         self.check_new_states_plan, "W3's retired-hour resolve never counted",
                         "test_new_states_dry_run_plan")
+        self.flip_check("  wait_next_hour\n  trows=", "  trows=", "run.sh", self.check_new_states_plan,
+                        "the retired-hour tail loaded without waiting for the next ingest hour",
+                        "test_new_states_dry_run_plan")
+        self.flip_check('  load_signal "${state}_tail" logs', '  : load_signal "${state}_tail" logs', "run.sh",
+                        self.check_new_states_plan, "the retention fold with no tail hour to advance into",
+                        "test_new_states_dry_run_plan")
+
+    def check_fold_watermark(self, inv_path):
+        # A retention fold report whose watermark advanced passes and stamps
+        # advanced; one that stayed put (a no-op) or carries no watermark
+        # exits 1 with advanced false in the stamp.
+        out = []
+        cases = (("advanced", {"previous_watermark_hour": 490_000, "watermark_hour": 490_001, "no_op": False}, 0, True),
+                 ("held", {"previous_watermark_hour": 490_001, "watermark_hour": 490_001, "no_op": True}, 1, False),
+                 ("absent", {"previous_watermark_hour": None, "watermark_hour": None, "no_op": True}, 1, False))
+        for name, report, want_code, want_adv in cases:
+            rpath, spath = self.path(f"fw-{name}.out"), self.path(f"fw-{name}.json")
+            with open(rpath, "w") as f:
+                f.write("folding\n" + json.dumps(report, indent=2) + "\n")
+            p = subprocess.run([sys.executable, inv_path, "fold-watermark", "--report", rpath, "--state", "retired_hour",
+                                "--out", spath], capture_output=True, text=True)
+            if p.returncode != want_code:
+                out.append(f"{name}: exit {p.returncode}, want {want_code} ({p.stderr.strip()})")
+                continue
+            with open(spath) as f:
+                stamp = json.load(f)
+            if stamp.get("advanced") is not want_adv or stamp.get("watermark_hour") != report["watermark_hour"]:
+                out.append(f"{name}: stamp {stamp}")
+        return out
+
+    def test_fold_watermark_refuses_a_fold_that_did_not_advance(self):
+        self.assertEqual(self.check_fold_watermark(os.path.join(BOX, "lib", "inv.py")), [])
+        self.flip_check("after > before", "after >= before", "lib/inv.py", self.check_fold_watermark,
+                        "a fold that held its watermark read as advanced",
+                        "test_fold_watermark_refuses_a_fold_that_did_not_advance")
+
+    def check_watermark_fails_the_state(self, script):
+        # fold-watermark exits non-zero: each retired_hour step is
+        # STATE-FAILED there, before its refold and its transition.
+        code, text = self.new_states_dry_run(script, out="out-watermark", env={"INV_DRY_RUN_FAIL": "fold-watermark"})
+        if code:
+            return [f"dry run exit {code}"]
+        out = []
+        b = "\n".join(self.blocks(text).get("state:retired_hour", []))
+        if "STATE-FAILED retired_hour: fold-watermark retired_hour exit 3" not in b:
+            out.append("retired_hour not failed at fold-watermark")
+        if "fold-retired_hour_refold" in b or "STAMP stamps/transitions.jsonl" in b:
+            out.append("retired_hour went on past a watermark that did not advance")
+        return out
+
+    def test_unadvanced_watermark_fails_retired_hour(self):
+        self.assertEqual(self.check_watermark_fails_the_state(None), [])
+        self.flip_check('|| { failed_at "fold-watermark $state" "$?" "$wlog"; return 1; }', "|| true", "run.sh",
+                        self.check_watermark_fails_the_state, "a fold that did not advance measured anyway",
+                        "test_unadvanced_watermark_fails_retired_hour")
+
+    RUN_A_ADVANCE_DONE = 498  # minutes into D3' run A when day_parts_7's advance finished
+
+    @classmethod
+    def check_retired_hour_sizing(cls, toml_path, readme_path):
+        # README.md's "Run time with retired_hour" arithmetic, recomputed from
+        # run.example.toml: the step estimate, the maintain wait, the box cap
+        # and the run deadline its comment names for day_parts_7 with
+        # retired_hour.
+        with open(toml_path, "rb") as f:
+            cfg = tomllib.load(f)
+        with open(toml_path) as f:
+            m = re.search(r"A run listing day_parts_7 and retired_hour sets (\d+)", f.read())
+        with open(readme_path) as f:
+            text = " ".join(f.read().split())
+        if not m:
+            return ["run.example.toml names no run.max_minutes for day_parts_7 with retired_hour"]
+        deadline, box = int(m.group(1)), cfg["box"]["max_minutes"]
+        est = cfg["step_estimate_minutes"].get("retired_hour", cfg["step_estimate_minutes"]["default"])
+        wait = cfg["retired_hour"]["wait_minutes"]
+        first = cls.RUN_A_ADVANCE_DONE + 60
+        latest = deadline - 60 - 2 * est
+        claims = [f"finished about {cls.RUN_A_ADVANCE_DONE} minutes into",
+                  f"(minute {first} at worst)", f"`retired_hour.wait_minutes` ({wait})",
+                  f"`step_estimate_minutes.retired_hour` ({est})", f"ends by minute {first + 2 * est}",
+                  f"at minute {first + 60} at worst", f"need {2 * est} more",
+                  f"`run.max_minutes = {deadline}`, under `box.max_minutes = {box}`",
+                  f"by minute {deadline} - 60 - 2 x {est} = {latest}", f"at least {first - latest} minutes"]
+        out = [f"README.md lacks {c!r}" for c in claims if c not in text]
+        if deadline >= box:
+            out.append(f"run deadline {deadline} not under box.max_minutes {box}")
+        return out
+
+    def test_readme_retired_hour_sizing_matches_example_toml(self):
+        readme = os.path.join(HERE, "README.md")
+        self.assertEqual(self.check_retired_hour_sizing(os.path.join(BOX, "run.example.toml"), readme), [])
+        flipped = self.example_toml(("retired_hour = 10\n", "retired_hour = 15\n"))
+        problems = self.check_retired_hour_sizing(flipped, readme)
+        self.assertTrue(problems, "a step estimate the README sizing does not use")
+        print("flip 'retired_hour = 10' to 'retired_hour = 15' in box/run.example.toml fails "
+              f"test_readme_retired_hour_sizing_matches_example_toml: {problems[0]}", file=sys.stderr)
 
     def check_failed_resolve_continues(self, script):
         # Every rlog footprint exits 3: each state's resolve is STEP-FAILED
