@@ -196,37 +196,49 @@ retry lines.
 A routed column is either fixed-width, as today, or variable-width: Utf8,
 LargeUtf8, Utf8View, Binary, LargeBinary or BinaryView.
 
-- **Chunk layout.** A variable-width column holds offsets for at most `c`
-  rows and a data block of `D` bytes. Both are allocated and charged before
-  any row is written. A chunk seals when either its rows or its data block
-  fill.
+- **Chunk layout.** Each of a route's `k` variable-width key columns holds
+  offsets for at most `c` rows and its own data block of `D` bytes. All are
+  allocated and charged before any row is written. A chunk seals when its
+  rows fill or when any one of its data blocks fills.
 - **Copies, not views.** Strings longer than the 12-byte inline limit are
   copied into the chunk's own data block. A view into the source batch would
   keep that batch's buffers alive without a charge.
 - **One value larger than `D`** gets its own block, charged before it is
   copied like any chunk. A refused charge is a spill trigger, as for a fixed
-  chunk. If it is still refused once every retained chunk has been written,
-  the statement fails with the bucketed retry's typed refusal.
+  chunk.
+- **A chunk still refused once the stream retains nothing.** ADR-3565 item
+  1 does not fail the stream in this case: that bucket's rows of the batch
+  the router was handed are written to its file as one uncharged piece, and
+  the next chunk is asked for again. Variable-width routes keep that rule,
+  for an oversized value too, and its bound is restated in bytes: the piece
+  is a copy of at most the rows of one batch the router was handed, so its
+  bytes are at most that batch's routed columns' bytes, a batch already in
+  memory when the router is called. ADR-3565 gives the same bound as
+  `(engage_groups + batch size) x (w + 4)`, which has no variable-width
+  form.
 - **The forced route.** When a refusal arrives while a stream still holds its
   phase 1 stock table, ADR-3565 item 1 routes that table's emitted state
   straight to the files in uncharged slices, because the pool has just
-  refused a grow. For a variable-width key a slice is cut by bytes as well as
-  rows: it ends at `c` rows or when its key values reach `D` bytes, whichever
-  comes first, and a single value larger than `D` is a slice of its own. The
-  uncharged bound per stream is therefore one slice, `c x (w_fixed + 16 + 12)
-  + D` bytes, where `w_fixed` is the routed fixed-width columns' bytes per
-  row and 16 is one view per variable-width column, plus at most one value
-  larger than `D`, whose bytes the stock table held under its charge at the
-  refusal. This replaces ADR-3565 item 3's `c x (w + 12)` for these routes.
+  refused a grow. For a route with `k` variable-width key columns a slice is
+  cut by bytes as well as rows: it ends at `c` rows or when any one key
+  column's values reach `D` bytes, whichever comes first, and a single value
+  larger than `D` is a slice of its own. The uncharged bound per stream is
+  therefore one slice, `c x (w_fixed + 16k + 12) + k x D` bytes, where
+  `w_fixed` is the routed fixed-width columns' bytes per row and 16 is one
+  view per variable-width column, plus at most one value larger than `D` per
+  variable-width column, whose bytes the stock table held under its charge
+  at the refusal. This replaces ADR-3565 item 3's `c x (w + 12)` for these
+  routes.
 - **The derivation.** `bits` comes from `T`, as now. The chunk area,
   `(S - table(bits)) / (2^bits + 1)`, becomes a byte budget per chunk,
   split between offsets, validity and data. No bytes-per-row input is needed.
 - **The floor.** For a variable-width route the floor is a chunk of
-  `c_min` = 1,024 rows whose data block holds 64 KiB of key bytes, the same
-  bytes as today's floor at 64 B per row. `b(c_min)` in decision 1's second
-  `bits` condition is that chunk's charge: the fixed-width columns, offsets
-  or views and validity for 1,024 rows, plus 64 KiB. A budget below it
-  returns `chunk_too_small`, as for a fixed-width route.
+  `c_min` = 1,024 rows with a 64 KiB data block per variable-width column.
+  64 KiB is 1,024 rows of 64 B, statement 33's routed row, chosen as a
+  number, not derived from the string columns. `b(c_min)` in decision 1's
+  second `bits` condition is that chunk's charge: the fixed-width columns,
+  offsets or views and validity for 1,024 rows, plus `k x 64 KiB`. A budget
+  below it returns `chunk_too_small`, as for a fixed-width route.
 - **Admission.** `admits` takes these key types only when the rule is built
   `with_spill(true)`, which is the refusal retry. A first attempt plans as
   today.
@@ -255,8 +267,10 @@ gate). The bands are written before any box is launched and include:
 - statement 33 on c6a.large derives a tuning (`bits` 7 at the measured `T`)
   and answers, with its retry spill at most 2.0 GB, and its hot time is at
   most 56 s, half the 112 s its sort-merge retry took in M8 and in the
-  publication run (predicted: c6a.xlarge's bucketed retry took 16.8 to 17.5
-  s on twice the vCPUs, so about twice that is expected);
+  publication run. The prediction, reported beside the band, is about 35 s:
+  c6a.xlarge's bucketed retry took 16.8 to 17.5 s on twice the vCPUs. A
+  figure between 35 s and 56 s passes the band and is reported as a miss of
+  the prediction;
 - if decision 3 was built: every retry of statements 19, 34 and 35 the run
   logs reports `retry_plan="bucket"`, and each one's
   `bucket_spill_bytes_written` comes in within the band decision 2's
@@ -338,18 +352,16 @@ flowchart TD
 - This ADR keeps the `retry_plan_reason` strings already shipped
   (`chunk_too_small`, `not_fixed_width`) unchanged, so dashboards and the M8
   and M9 judges read the same values; a string-keyed route that cannot tune
-  reports `chunk_too_small` as a fixed-width one does. ADR-0954 requirement 4
-  lists the field on the retry's INFO line.
+  reports `chunk_too_small` as a fixed-width one does.
 - Production cases this leaves exposed, stated for the release notes: a
-  string-keyed retry whose single key value cannot be charged once every
-  retained chunk is written fails the statement with the bucketed retry's
-  typed refusal, where the sort-merge retry might have answered; a statement
+  string-keyed retry under memory pressure can hold, uncharged, one piece of
+  up to one input batch's key bytes per stream while it writes it out; a statement
   whose `T` exceeds about 31.8 GB on a 4 GiB host still takes sort-merge; and
   the projection's conservative bias still costs bits on an early refusal.
-- ADR-3565 gets an amendment that points item 3, item 4, item 5 and the
+- ADR-3565 gets an amendment that points items 1, 3, 4 and 5 and the
   string-key rejection at this ADR. The part for items 3 to 5 lands with
-  decision 1's implementation (#4133); the part for item 3's forced-route
-  bound and the string-key rejection lands with decision 3 (#4132), if it is
-  built. ADR-0954 gets one for the M9 gate (#4154).
+  decision 1's implementation (#4133); the part for item 1's
+  still-refused-chunk bound, item 3's forced-route bound and the string-key
+  rejection lands with decision 3 (#4132), if it is built. ADR-0954 gets one for the M9 gate (#4154).
 - No frozen format changes: RSEG, `proto/`, series identity, commit tokens
   and the object key layout are untouched.
