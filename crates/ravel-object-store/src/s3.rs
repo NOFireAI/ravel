@@ -1987,6 +1987,9 @@ pub struct S3MultipartUpload {
     /// Builds the outcome `complete` returns: [`outcome_of`] for S3 (Version
     /// is the ETag), the generation for GCS.
     outcome: OutcomeOf,
+    /// Classifies a backend error from `put_part`, `complete` and `abort`:
+    /// [`map_error_common`] unless [`Self::with_error_map`] replaced it.
+    map_error: ErrorMapOf,
     sequence: PartSequence,
     /// Set by `complete`/`abort`; every later call on this handle fails
     /// instead of issuing a second request against a dead upload id.
@@ -2003,6 +2006,9 @@ pub struct S3MultipartUpload {
 /// `complete`.
 pub(crate) type OutcomeOf = fn(&str, object_store::PutResult) -> Result<PutOutcome, StoreError>;
 
+/// The error classification a multipart handle applies to a backend failure.
+pub(crate) type ErrorMapOf = fn(object_store::Error) -> StoreError;
+
 impl S3MultipartUpload {
     /// Wraps an already-initiated `object_store` upload for `key`.
     pub(crate) fn new(key: &str, upload: Box<dyn OsMultipartUpload>, outcome: OutcomeOf) -> Self {
@@ -2010,10 +2016,17 @@ impl S3MultipartUpload {
             key: key.to_string(),
             upload,
             outcome,
+            map_error: map_error_common,
             sequence: PartSequence::default(),
             finished: false,
             poison: None,
         }
+    }
+
+    /// Replaces [`map_error_common`] as the classification of backend errors.
+    pub(crate) fn with_error_map(mut self, map_error: ErrorMapOf) -> Self {
+        self.map_error = map_error;
+        self
     }
 }
 
@@ -2048,7 +2061,7 @@ impl MultipartUpload for S3MultipartUpload {
         match self.upload.put_part(PutPayload::from(data)).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                let mapped = map_error_common(e);
+                let mapped = (self.map_error)(e);
                 self.poison = Some(mapped.to_string());
                 Err(mapped)
             }
@@ -2063,7 +2076,7 @@ impl MultipartUpload for S3MultipartUpload {
             return Err(multipart_poisoned(&self.key, cause));
         }
         self.sequence.finish(&self.key)?;
-        let result = self.upload.complete().await.map_err(map_error_common)?;
+        let result = self.upload.complete().await.map_err(self.map_error)?;
         self.finished = true;
         (self.outcome)(&self.key, result)
     }
@@ -2077,7 +2090,7 @@ impl MultipartUpload for S3MultipartUpload {
         // an upload S3 never heard the abort for is orphaned parts (billed
         // until a lifecycle rule reaps them), never a visible object.
         self.finished = true;
-        self.upload.abort().await.map_err(map_error_common)
+        self.upload.abort().await.map_err(self.map_error)
     }
 }
 
