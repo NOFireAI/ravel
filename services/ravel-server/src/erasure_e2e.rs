@@ -1332,16 +1332,20 @@ mod metrics_leaves {
         );
         assert!(!object_exists(store.as_ref(), &done_key).await);
 
-        // A fold while the request is pending builds no metrics leaf: it
-        // re-lists nothing and carries the part with its old ref.
+        // A fold while the request is pending has nothing new to fold, so it
+        // is a no-op and HEAD keeps the pre-erasure leaf. This step shows only
+        // that the pending request leaves HEAD untouched; a no-op fold builds
+        // no leaf by construction, so the erasure gate itself is proven at t5,
+        // on a fold that re-encodes.
         let t2 = t1 + MINUTE_NS;
         set_clock(t2);
         let report = fold_at(&catalog, store.as_ref(), &tenant, &harness, &refold, t2).await;
         assert_eq!(report.refold_hours_reconciled, 0, "{report:?}");
+        assert_eq!(report.no_op, vec![tenant], "{report:?}");
         assert_eq!(
             kidx_objects(store.as_ref(), &tenant).await,
             vec![stale_leaf.clone()],
-            "a fold while the request is pending builds no metrics leaf"
+            "a no-op fold while the request is pending leaves the pre-erasure leaf"
         );
         assert_eq!(
             head_leaves(&read_head(store.as_ref(), &tenant).await),
