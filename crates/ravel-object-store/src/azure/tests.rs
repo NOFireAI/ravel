@@ -292,8 +292,9 @@ async fn a_pinned_suffix_read_after_a_replace_fails_in_one_round() {
         "{read:?}"
     );
     let requests = blob_requests(&fake, "s/k");
-    assert_eq!(methods(&requests), ["HEAD"]);
+    assert_eq!(methods(&requests), ["HEAD", "HEAD"]);
     assert_eq!(requests[0].header("if-match"), Some(pin.etag.as_str()));
+    assert_eq!(requests[1].header("if-match"), None);
 
     // A pinned suffix of the live blob conditions the HEAD and the GET on it.
     let (_, live) = store.pin_of("s/k").await.expect("pin_of");
@@ -307,6 +308,99 @@ async fn a_pinned_suffix_read_after_a_replace_fails_in_one_round() {
     assert_eq!(methods(&requests), ["HEAD", "GET"]);
     for request in &requests {
         assert_eq!(request.header("if-match"), Some(live.etag.as_str()));
+    }
+}
+
+/// What became of the pinned blob before the pinned read.
+#[derive(Clone, Copy, Debug)]
+enum PinnedFate {
+    NeverExisted,
+    Deleted,
+    Replaced,
+}
+
+/// A pinned read that meets a 412 asks once more, with a HEAD that drops the
+/// `If-Match`: Azurite answers `If-Match` on an absent key with 412 where
+/// Azure answers 404, and only that HEAD tells a gone key from a replaced
+/// one. Every case runs with the fake answering as Azure and as Azurite.
+#[tokio::test]
+async fn a_pinned_read_tells_a_gone_key_from_a_replaced_one() {
+    for azurite in [false, true] {
+        for fate in [
+            PinnedFate::NeverExisted,
+            PinnedFate::Deleted,
+            PinnedFate::Replaced,
+        ] {
+            for range in [GetRange::Full, GetRange::Range(1, 4), GetRange::Suffix(3)] {
+                let case = format!("{fate:?}, {range:?}, azurite {azurite}");
+                let fake = fake().await;
+                fake.set_if_match_on_absent_is_412(azurite);
+                let store = store(&fake).await;
+                store
+                    .put(
+                        "s/k",
+                        Bytes::from_static(b"0123456789"),
+                        PutOptions::default(),
+                    )
+                    .await
+                    .expect("put");
+                let (_, pin) = store.pin_of("s/k").await.expect("pin_of");
+                let key = match fate {
+                    PinnedFate::NeverExisted => "s/never",
+                    PinnedFate::Deleted | PinnedFate::Replaced => "s/k",
+                };
+                match fate {
+                    PinnedFate::NeverExisted => {}
+                    PinnedFate::Deleted => store.delete("s/k").await.expect("delete"),
+                    PinnedFate::Replaced => {
+                        store
+                            .put(
+                                "s/k",
+                                Bytes::from_static(b"replaced"),
+                                PutOptions::default(),
+                            )
+                            .await
+                            .expect("replace");
+                    }
+                }
+                fake.clear_requests();
+
+                let read = store.get_pinned(key, range, &pin).await;
+
+                let first = if matches!(range, GetRange::Suffix(_)) {
+                    "HEAD"
+                } else {
+                    "GET"
+                };
+                let (expected_methods, gone): (Vec<&str>, bool) = match (fate, azurite) {
+                    (PinnedFate::Replaced, _) => (vec![first, "HEAD"], false),
+                    (_, false) => (vec![first], true),
+                    (_, true) => (vec![first, "HEAD"], true),
+                };
+                if gone {
+                    assert!(
+                        matches!(read, Err(StoreError::NotFound)),
+                        "{case}: {read:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(read, Err(StoreError::PreconditionFailed)),
+                        "{case}: {read:?}"
+                    );
+                }
+                let requests = blob_requests(&fake, key);
+                assert_eq!(methods(&requests), expected_methods, "{case}");
+                assert_eq!(fake.requests().len(), requests.len(), "{case}");
+                assert_eq!(
+                    requests[0].header("if-match"),
+                    Some(pin.etag.as_str()),
+                    "{case}"
+                );
+                if let Some(settle) = requests.get(1) {
+                    assert_eq!(settle.header("if-match"), None, "{case}");
+                }
+            }
+        }
     }
 }
 

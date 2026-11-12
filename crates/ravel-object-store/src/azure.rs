@@ -38,8 +38,11 @@
 //!
 //! A pinned read sends the pin's ETag as `If-Match` and its version as the
 //! `versionid` selector when it has one. A pinned suffix read sends both on
-//! the HEAD and on the GET, and a 412 on either is
-//! [`StoreError::PreconditionFailed`] at once.
+//! the HEAD and on the GET, and is not retried. A 412 on any pinned request
+//! is settled by one HEAD that keeps the `versionid` and drops the
+//! `If-Match`: a 404 is [`StoreError::NotFound`], any other answer
+//! [`StoreError::PreconditionFailed`]. Azure answers `If-Match` on an absent
+//! key with 404, which needs no settling; Azurite answers 412.
 //!
 //! # Listing
 //!
@@ -494,6 +497,32 @@ impl AzureStore {
     }
 
     async fn get_inner(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: Option<&Pin>,
+    ) -> Result<PinnedRead, StoreError> {
+        let read = self.get_unsettled(key, range, pin).await;
+        match (read, pin) {
+            (Err(StoreError::PreconditionFailed), Some(pin)) => {
+                Err(self.settle_pinned_412(key, pin).await)
+            }
+            (read, _) => read,
+        }
+    }
+
+    /// Azurite answers `If-Match` on an absent key with 412 where Azure
+    /// answers 404, so a pinned 412 is settled by one HEAD without the
+    /// precondition: a 404 means the key is gone, anything else that it was
+    /// replaced.
+    async fn settle_pinned_412(&self, key: &str, pin: &Pin) -> StoreError {
+        match self.rest.head_version(key, pin.version.as_deref()).await {
+            Err(StoreError::NotFound) => StoreError::NotFound,
+            _ => StoreError::PreconditionFailed,
+        }
+    }
+
+    async fn get_unsettled(
         &self,
         key: &str,
         range: GetRange,

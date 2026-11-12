@@ -1134,9 +1134,13 @@ the blob was replaced in between, and the read starts again from the HEAD,
 at most three rounds, then returns `Transient`; the bytes returned are the
 suffix of one version of the blob. A zero-length blob is `InvalidRange`. A
 pinned suffix read sends the pin's ETag, and its `versionid` when it has one,
-on the HEAD and on the GET, and a 412 on either is `PreconditionFailed` with
-no retry. The connector counts both requests as attempts; `StoreMetrics`
-counts one `get` call.
+on the HEAD and on the GET, with no retry. A 412 on any pinned read (`Full`,
+`Range` or `Suffix`) is settled by one more HEAD that keeps the `versionid`
+and drops the `If-Match`: a 404 is `NotFound`, any other answer
+`PreconditionFailed`. Azure answers `If-Match` on an absent key with 404,
+which needs no settling; Azurite 3.35.0 answers 412 (measured 2026-11-13).
+The connector counts every request as an attempt; `StoreMetrics` counts one
+`get` call.
 
 Listing is List Blobs (`<container>?restype=container&comp=list`), with
 `prefix`, `maxresults` (`AzureConfig::list_page_size`, the S3 adapter's page
