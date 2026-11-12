@@ -137,7 +137,7 @@ table still gets at least `2T / (P x 2^b)`. The descriptor rule is unchanged.
 
 | box | `T` | today | this decision |
 |---|---|---|---|
-| c6a.large | 12.65 to 12.78 GB (measured) | `bits` 7, 972 rows, no tuning | `bits` 7, 2,416 rows at 12.65 GB and 2,400 at 12.78 GB, descriptor need 4,112 |
+| c6a.large | 12.65 to 12.78 GB (measured) | `bits` 7, 972 rows at `S` 32,585,819 B (980 at the 1,461,083,554 B effective limit M8 logged, `S` 32,874,379 B), no tuning | `bits` 7, 2,416 rows at 12.65 GB and 2,400 at 12.78 GB at `S` 32,585,819 B; 2,452 rows at M8's logged inputs (`T` 12.65 GB, `S` 32,874,379 B); descriptor need 4,112 |
 | c6a.large | largest that tunes, `bits` 7 | 12.51 GB | about 24.6 GB |
 | c6a.large | largest that tunes, `bits` 8 | none | about 31.8 GB, with a soft `nofile` of at least 16,416 |
 | c6a.xlarge | 9.48 GB (item 4) | `bits` 5, 8,192 rows | unchanged |
