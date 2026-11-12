@@ -871,7 +871,7 @@ fn failure_code(status: u16) -> &'static str {
         401 => "NoAuthenticationInformation",
         403 => "AuthorizationFailure",
         404 => "BlobNotFound",
-        409 => "LeaseIdMissing",
+        409 => "SnapshotsPresent",
         412 => "ConditionNotMet",
         416 => "InvalidRange",
         429 => "TooManyRequests",
