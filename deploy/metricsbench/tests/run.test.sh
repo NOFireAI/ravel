@@ -347,6 +347,22 @@
 #                                       reference snapshot stamped routed;
 #                                       zo: a rewrite that left hour
 #                                       490001's keys listed.
+#                                       Label index flag spelling (issue
+#                                       #4145; the stub's main image takes
+#                                       the opt-outs, its control the
+#                                       opt-in, and refuses the other):
+#                                       zs1: opt-in images, every arm on,
+#                                       the opt-ins only where the index is
+#                                       wanted on; zs2: opt-out images, the
+#                                       opt-out only where it is wanted off,
+#                                       the stage1.label_index_flags stamp
+#                                       and the probes before up; zs3: a
+#                                       help listing neither or both, zs4: a
+#                                       control image listing neither and
+#                                       zs5: a failed probe exit 70 at
+#                                       stage1-flags with nothing up; zs6
+#                                       (z6's run): no probe without
+#                                       MB_STAGE1.
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za
 #                                       (the reference prune band n/a),
@@ -407,13 +423,41 @@ S3S_SHA_AARCH64="92d7bbbb29bd4c5aee00b5f1c280c1402e799ed8a28f497e5ba813f1ebc3eec
 # with STUB_ENGINE_DOWN), compose up/ps/config/down/logs/stop/start (each up
 # and start also logged as a docker-compose-up/-start line), stats,
 # inspect (with --format, the maintain container's State.Status), logs,
-# image inspect and volume ls, with the stack's up/down state in
+# run (a binary's --help), image inspect and volume ls, with the stack's up/down state in
 # $STUB_STATE and ravel-server's stopped/running state in $STUB_STATE.ravel.
 cat >"${BIN}/docker" <<'STUB'
 #!/usr/bin/env bash
 printf 'docker %s\n' "$*" >>"${STUB_LOG}"
 running_services() {
   if [ -f "${STUB_STATE}.services" ]; then cat "${STUB_STATE}.services"; fi
+}
+# help_style IMAGE: the metrics label index's flag spelling of IMAGE's
+# binaries, STUB_CONTROL_HELP_STYLE (default opt-in, an image built before
+# issue #4145) for the control image, STUB_HELP_STYLE (default opt-out) for
+# any other: opt-in, opt-out, neither or both.
+help_style() {
+  case "$1" in
+    *ravel-control*) echo "${STUB_CONTROL_HELP_STYLE:-opt-in}" ;;
+    *) echo "${STUB_HELP_STYLE:-opt-out}" ;;
+  esac
+}
+# reject_flags IMAGE WORDS...: exit 2 as clap does on a label index flag
+# IMAGE's binaries do not take.
+reject_flags() {
+  local style w
+  style="$(help_style "$1")"
+  shift
+  for w in "$@"; do
+    case "${style}:${w}" in
+      opt-out:--fold-metrics-label-index | opt-out:--metrics-label-index | \
+        opt-in:--no-fold-metrics-label-index | opt-in:--no-metrics-label-index | \
+        neither:*-metrics-label-index)
+        printf 'docker-reject %s %s\n' "$1" "$w" >>"${STUB_LOG}"
+        echo "error: unexpected argument '${w}' found" >&2
+        exit 2
+        ;;
+    esac
+  done
 }
 case "$1" in
   version)
@@ -468,6 +512,8 @@ case "$1" in
           *" --force-recreate "*)
             printf 'docker-env recreate RAVEL_SERVER_EXTRA_FLAGS=%s\n' "${RAVEL_SERVER_EXTRA_FLAGS-<unset>}" >>"${STUB_LOG}"
             printf 'docker-image recreate RAVEL_IMAGE=%s\n' "${RAVEL_IMAGE-<unset>}" >>"${STUB_LOG}"
+            # shellcheck disable=SC2086
+            reject_flags "${RAVEL_IMAGE-}" ${RAVEL_SERVER_EXTRA_FLAGS-}
             [ "${STUB_RECREATE_EXIT:-0}" -eq 0 ] || exit "${STUB_RECREATE_EXIT}"
             n=$(($(cat "${STUB_STATE}.recreates" 2>/dev/null || echo 0) + 1))
             echo "$n" >"${STUB_STATE}.recreates"
@@ -480,6 +526,16 @@ case "$1" in
         printf 'docker-env up S3S_FS_BIN=%s\n' "${S3S_FS_BIN-<unset>}" >>"${STUB_LOG}"
         printf 'docker-env up RAVEL_SERVER_EXTRA_FLAGS=%s\n' "${RAVEL_SERVER_EXTRA_FLAGS-<unset>}" >>"${STUB_LOG}"
         printf 'docker-env up S3_PREFIX=%s S3_REGION=%s\n' "${METRICSBENCH_S3_BUCKET_PREFIX-<unset>}" "${METRICSBENCH_S3_REGION-<unset>}" >>"${STUB_LOG}"
+        # shellcheck disable=SC2086
+        reject_flags "${RAVEL_IMAGE-}" ${RAVEL_SERVER_EXTRA_FLAGS-}
+        # The background fold builds key-index leaves under
+        # --fold-key-index-leaves, with a label_value leaf in every part when
+        # the image builds the label index by default and is not told not to;
+        # catalog inspect then reports every part as leafy.
+        case "$(help_style "${RAVEL_IMAGE-}"): ${RAVEL_SERVER_EXTRA_FLAGS-} " in
+          opt-out:*" --no-fold-metrics-label-index "*) ;;
+          opt-out:*" --fold-key-index-leaves "*) : >"${STUB_STATE}.labelled" ;;
+        esac
         echo up >"${STUB_STATE}"
         if [ "$#" -gt 1 ]; then
           shift
@@ -742,6 +798,7 @@ JSON
               printf 'created_unix_ns: 1764000000000000000\n'     # catalog.rs:889
               printf 'parts: %s\n' "${STUB_INSPECT_PARTS_LINE:-$(echo $parts | wc -w)}" # catalog.rs:890
               leaf_parts="${STUB_INSPECT_LEAF_PARTS:-0}"
+              [ ! -e "${STUB_STATE}.labelled" ] || leaf_parts="${STUB_INSPECT_LEAF_PARTS:-3}"
               [ ! -e "${STUB_STATE}.rebuilt" ] || leaf_parts="${STUB_INSPECT_REBUILT_LEAF_PARTS:-3}"
               for i in $parts; do
                 refs=0 lo=490000 hi=490001 unc=0 key="t/h1/m/catalog/part-${i}" b3=$((i + 1)) leaf="t/h1/m/ki/${i}-v"
@@ -798,6 +855,7 @@ JSON
           # every fold with STUB_SWITCH_OFF_OVER_LEAVES.
           *" catalog fold "*)
             printf 'docker-state fold ravel-server=%s\n' "$(cat "${STUB_STATE}.ravel" 2>/dev/null || echo running)" >>"${STUB_LOG}"
+            reject_flags "${RAVEL_IMAGE-}" "$@"
             [ "${STUB_FOLD_EXIT:-0}" -eq 0 ] || exit "${STUB_FOLD_EXIT}"
             case " $* " in
               *" --rebuild-key-index "*)
@@ -837,6 +895,40 @@ JSON
         esac
         ;;
     esac
+    ;;
+  # docker run --rm --network none --entrypoint BINARY IMAGE ARGS (run.sh
+  # step stage1-flags, ARGS ending in --help): BINARY's option lines with the
+  # label index flags help_style gives IMAGE, each option's description on
+  # the lines below it, one of which opens with the other spelling's flag
+  # (only an option line counts); exit STUB_HELP_EXIT.
+  run)
+    shift
+    entry="" image=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --rm) shift ;;
+        --network) shift 2 ;;
+        --entrypoint) entry="$2" && shift 2 ;;
+        *) image="$1" && shift && break ;;
+      esac
+    done
+    if [ "${STUB_HELP_EXIT:-0}" -ne 0 ]; then
+      echo "stub: cannot run ${entry} in ${image}" >&2
+      exit "${STUB_HELP_EXIT}"
+    fi
+    case "$entry" in
+      */ravel-server) leaves=--fold-key-index-leaves in=--fold-metrics-label-index out=--no-fold-metrics-label-index ;;
+      *) leaves=--key-index-leaves in=--metrics-label-index out=--no-metrics-label-index ;;
+    esac
+    printf 'Usage: %s [OPTIONS]\n\nOptions:\n' "${entry##*/}"
+    printf '      %s\n          Build key-index leaves\n' "$leaves"
+    case "$(help_style "$image")" in
+      opt-in | both) printf '      %s\n          Build the metrics label index;\n          %s is the opt-out of later images\n' "$in" "$out" ;;
+    esac
+    case "$(help_style "$image")" in
+      opt-out | both) printf '      %s\n          Skip the metrics label index;\n          %s was the opt-in of earlier images\n' "$out" "$in" ;;
+    esac
+    printf '  -h, --help\n          Print help\n'
     ;;
   stats)
     shift 4
@@ -2800,7 +2892,7 @@ else
 fi
 # Rendered by compose itself where the host has it (not under the stubs).
 if docker compose version >/dev/null 2>&1; then
-  for flags in "" "--fold-key-index-leaves --fold-metrics-label-index"; do
+  for flags in "" "--fold-key-index-leaves --no-fold-metrics-label-index"; do
     if RAVEL_SERVER_EXTRA_FLAGS="${flags}" RAVEL_IMAGE=stub S3S_FS_BIN=/stub \
       docker compose -f "${HERE}/../docker-compose.yml" -f "${RAVEL_YML}" config --format json >"${TMP}/z0-config.json" 2>"${TMP}/z0-config.err" &&
       python3 -I - "${TMP}/z0-config.json" "${flags}" <<'PY'; then
@@ -2817,8 +2909,13 @@ PY
 fi
 
 CORPUS_IDS="$(python3 -I -c 'import json,sys; print(json.dumps([e["id"] for e in json.load(open(sys.argv[1]))["entries"]]))' "${HERE}/../../../benchmarks/metrics/metrics.corpus.json")"
-UNROUTED_STATE="folded: watermark_hour=490001; parts=3; label_value leaf parts=0; ravel-server --disable-fold --fold-key-index-leaves"
-ROUTED_STATE="folded: watermark_hour=490001; parts=3; label_value leaf parts=3; ravel-server --disable-fold --fold-key-index-leaves --fold-metrics-label-index"
+# The stub's main image takes the label index opt-outs (an image built after
+# issue #4145): up and unrouted turn the index off, routed passes nothing.
+UP_FLAGS="--fold-key-index-leaves --no-fold-metrics-label-index"
+UNROUTED_FLAGS="--disable-fold ${UP_FLAGS}"
+ROUTED_FLAGS="--disable-fold --fold-key-index-leaves"
+UNROUTED_STATE="folded: watermark_hour=490001; parts=3; label_value leaf parts=0; ravel-server ${UNROUTED_FLAGS}"
+ROUTED_STATE="folded: watermark_hour=490001; parts=3; label_value leaf parts=3; ravel-server ${ROUTED_FLAGS}"
 INSPECT_SOURCE="ravel-cli catalog inspect --tenant metricsbench --signal metrics: the snapshot HEAD's watermark_hour, parts and per-part key_index (field 8) leaf refs, all fields of the HEAD object itself (the command also GETs every part object, whose figures are not used here)"
 run_stage1() {
   local name="$1" prof="$2"
@@ -2831,14 +2928,14 @@ run_stage1() {
 MB_STAGE1=1 run_stage1 z cardinality
 expect_rc z 0
 check "z: the Stage 1 steps follow readback-folded in order" 'j("stamps.json")["steps_completed"][j("stamps.json")["steps_completed"].index("readback-folded"):] == ["readback-folded","stage1-fold","stage1-unrouted","stage1-leaves","stage1-restart","stage1-routed","stage1-holders"] and j("stamps.json")["status"] == "passed"'
-if grep -qx 'docker-env up RAVEL_SERVER_EXTRA_FLAGS=--fold-key-index-leaves' "${LOG}"; then
-  pass "z: compose up runs ravel-server with --fold-key-index-leaves only"
+if grep -qx "docker-env up RAVEL_SERVER_EXTRA_FLAGS=${UP_FLAGS}" "${LOG}"; then
+  pass "z: compose up runs ravel-server with --fold-key-index-leaves and the label index off"
 else
-  fail "z: compose up's RAVEL_SERVER_EXTRA_FLAGS is not --fold-key-index-leaves: $(grep 'RAVEL_SERVER_EXTRA_FLAGS' "${LOG}")"
+  fail "z: compose up's RAVEL_SERVER_EXTRA_FLAGS is not ${UP_FLAGS}: $(grep 'RAVEL_SERVER_EXTRA_FLAGS' "${LOG}")"
 fi
-if [ "$(grep '^docker-env recreate ' "${LOG}")" = "docker-env recreate RAVEL_SERVER_EXTRA_FLAGS=--disable-fold --fold-key-index-leaves
-docker-env recreate RAVEL_SERVER_EXTRA_FLAGS=--disable-fold --fold-key-index-leaves
-docker-env recreate RAVEL_SERVER_EXTRA_FLAGS=--disable-fold --fold-key-index-leaves --fold-metrics-label-index" ] &&
+if [ "$(grep '^docker-env recreate ' "${LOG}")" = "docker-env recreate RAVEL_SERVER_EXTRA_FLAGS=${UNROUTED_FLAGS}
+docker-env recreate RAVEL_SERVER_EXTRA_FLAGS=${UNROUTED_FLAGS}
+docker-env recreate RAVEL_SERVER_EXTRA_FLAGS=${ROUTED_FLAGS}" ] &&
   [ "$(grep -cE '^docker compose .* up -d --no-deps --force-recreate ravel-server$' "${LOG}")" -eq 3 ]; then
   pass "z: three recreates of ravel-server alone, every one with --disable-fold: stage1-fold's and stage1-unrouted's unrouted, stage1-restart's with the label index"
 else
@@ -2851,9 +2948,9 @@ folds = [re.search(r" catalog fold --tenant \S+ --shards \S+ (.*)$", l).group(1)
          for l in lines if l.startswith("docker compose ") and " catalog fold " in l]
 sys.exit(0 if folds == ["--signal metrics --writers-stopped",
                         "--signal metrics --json",
-                        "--rebuild-key-index --signal metrics --metrics-label-index --json"] else 1)
+                        "--rebuild-key-index --signal metrics --json"] else 1)
 PY
-  pass "z: the three folds pass exactly their listed flags: the folded step's, stage1-fold's, stage1-leaves'"
+  pass "z: the three folds pass exactly their listed flags: the folded step's, stage1-fold's, stage1-leaves' (no label index flag, on by default)"
 else
   fail "z: the catalog fold calls do not carry exactly the listed flags"
 fi
@@ -2910,9 +3007,9 @@ for f in stage1-fold.json stage1-leaves.json stage1-unrouted/report.json stage1-
   stage1-routed/report.json stage1-routed/diagnostics.json stage1-routed/cold.json stage1-compare.json holders.json; do
   expect_file z "$f"
 done
-check "z: stage1 stamped on with every flag set" 'j("stamps.json")["stage1"]["enabled"] is True and j("stamps.json")["stage1"]["server_flags_up"] == "--fold-key-index-leaves" and j("stamps.json")["stage1"]["server_flags_unrouted"] == "--disable-fold --fold-key-index-leaves" and j("stamps.json")["stage1"]["server_flags_routed"] == "--disable-fold --fold-key-index-leaves --fold-metrics-label-index"'
+check "z: stage1 stamped on with every flag set" 'j("stamps.json")["stage1"]["enabled"] is True and j("stamps.json")["stage1"]["server_flags_up"] == "'"${UP_FLAGS}"'" and j("stamps.json")["stage1"]["server_flags_unrouted"] == "'"${UNROUTED_FLAGS}"'" and j("stamps.json")["stage1"]["server_flags_routed"] == "'"${ROUTED_FLAGS}"'" and j("stamps.json")["stage1"]["server_flags_control"].startswith("skipped: arm off")'
 check "z: the background fold is stamped off from stage1-fold onward" 'j("stamps.json")["stage1"]["background_fold"].startswith("off from stage1-fold onward: ravel-server was recreated with --disable-fold before stage1-fold")'
-check "z: stage1-fold's and stage1-unrouted's recreates are stamped with their flags" 'all(j("stamps.json")["stage1"][k] == "recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='"'"'--disable-fold --fold-key-index-leaves'"'"', then ravel answered 200 on /api/v1/status/buildinfo" for k in ("fold_restart", "unrouted_restart"))'
+check "z: stage1-fold's and stage1-unrouted's recreates are stamped with their flags" 'all(j("stamps.json")["stage1"][k] == "recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='"'${UNROUTED_FLAGS}'"', then ravel answered 200 on /api/v1/status/buildinfo" for k in ("fold_restart", "unrouted_restart"))'
 check "z: stage1.unrouted_catalog stamps the HEAD watermark, the part count and no label_value leaf part, naming its source" 'j("stamps.json")["stage1"]["unrouted_catalog"] == {"source": "'"${INSPECT_SOURCE}"'", "file": "stage1-unrouted.inspect.txt", "watermark_hour": 490001, "parts": 3, "label_value_leaf_parts": 0, "label_value_leaf_refs": 0}'
 check "z: stage1.routed_catalog stamps every part carrying a label_value leaf" 'j("stamps.json")["stage1"]["routed_catalog"] == {"source": "'"${INSPECT_SOURCE}"'", "file": "stage1-routed.inspect.txt", "watermark_hour": 490001, "parts": 3, "label_value_leaf_parts": 3, "label_value_leaf_refs": 3}'
 expect_file z stage1-unrouted.inspect.txt
@@ -2921,7 +3018,7 @@ check "z: stage1.fold is the fold report with its wall time" 'j("stamps.json")["
 check "z: stage1.leaves records the rebuild's leaf, part and byte figures and wall time" '{k: j("stamps.json")["stage1"]["leaves"][k] for k in ("leaves_written","leaf_bytes_written","parts_rebuilt","parts_over_cap","uncovered_entries","attempt_count","file")} == {"leaves_written": 12, "leaf_bytes_written": 4096, "parts_rebuilt": 3, "parts_over_cap": 0, "uncovered_entries": 0, "attempt_count": 2, "file": "stage1-leaves.json"} and isinstance(j("stamps.json")["stage1"]["leaves"]["wall_ms"], int)'
 check "z: stage1.leaves records every rebuild request under its own name, the per-batch ones summed over attempts" 'j("stamps.json")["stage1"]["leaves"]["requests"] == {"data_object_ranged_gets": 7, "leaf_prefix_gets": 2, "erasure_list_requests": 1, "erasure_get_requests": 1, "part_object_gets": 5, "leaf_puts": 20, "head_cas_puts": 3, "not_reported": "GETs of the snapshot HEAD (the rebuild report does not count them)"}'
 check "z: stage1.unrouted and stage1.routed name their label, state and files" 'j("stamps.json")["stage1"]["unrouted"] == {"pass_label": "folded-unrouted", "fold_state": "'"${UNROUTED_STATE}"'", "diagnostics": "stage1-unrouted/diagnostics.json", "report": "stage1-unrouted/report.json"} and j("stamps.json")["stage1"]["routed"] == {"pass_label": "folded-routed", "fold_state": "'"${ROUTED_STATE}"'", "diagnostics": "stage1-routed/diagnostics.json", "report": "stage1-routed/report.json"}'
-check "z: stage1.restart says what was recreated" 'j("stamps.json")["stage1"]["restart"].startswith("recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='"'"'--disable-fold --fold-key-index-leaves --fold-metrics-label-index'"'"'")'
+check "z: stage1.restart says what was recreated" 'j("stamps.json")["stage1"]["restart"].startswith("recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='"'${ROUTED_FLAGS}'"'")'
 check "z: every steady record carries its pass label and fold state" 'all(r["pass_label"] == "folded-unrouted" and r["fold_state"] == "'"${UNROUTED_STATE}"'" for r in j("stage1-unrouted/diagnostics.json")["ravel_cost"]) and all(r["pass_label"] == "folded-routed" and r["fold_state"] == "'"${ROUTED_STATE}"'" for r in j("stage1-routed/diagnostics.json")["ravel_cost"])'
 check "z: the cold selection runs in both passes, labelled, in its own regime" 'all(j(f"stage1-{w}/cold.json")["regime"] == f"stage1-folded-{w}-cold" and j(f"stage1-{w}/cold.json")["entries"] == ["mb_full_range_avg_over_time"] and len(j(f"stage1-{w}/cold.json")["runs"]) == 5 and all(r["ravel_cost"]["pass_label"] == f"folded-{w}" for r in j(f"stage1-{w}/cold.json")["runs"]) for w in ("unrouted", "routed")) and j("stamps.json")["stage1"]["routed_cold"]["file"] == "cold.json" and j("stamps.json")["stage1"]["routed_cold"]["failed_runs"] == 0'
 check "z: stage1-compare.json compares every entry's hashes and statuses and counts each pass's records" 'j("stage1-compare.json")["schema"] == "metricsbench-stage1-compare/5" and j("stage1-compare.json")["entries_compared"] == len('"${CORPUS_IDS}"') == j("stage1-compare.json")["entries_equal"] and j("stage1-compare.json")["entries_multi_hash_count"] == 0 and j("stage1-compare.json")["entries_differing_count"] == 0 and j("stage1-compare.json")["entries_without_hash_count"] == 0 and j("stage1-compare.json")["statements_status_differing_count"] == 0 and j("stage1-compare.json")["statements_status_differing"] == [] and j("stage1-compare.json")["status_check"].startswith("per entry, the set of statuses its stage1-unrouted records carry == the set its stage1-routed records carry (ADR-3694 row 9)") and j("stage1-compare.json")["passes"] == {"unrouted": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": 0, "segments_pruned_by_label_index": 0}, "routed": {"records": len('"${CORPUS_IDS}"'), "records_answered": len('"${CORPUS_IDS}"'), "records_answered_null_hash": 0, "records_status_unexpected": 0, "records_label_index_null": 0, "records_pruned_by_label_index": len('"${CORPUS_IDS}"'), "segments_pruned_by_label_index": 3 * len('"${CORPUS_IDS}"')}} and j("stamps.json")["stage1"]["compare"]["entries_differing"] == [] and j("stamps.json")["stage1"]["compare"]["statements_status_differing"] == []'
@@ -2937,7 +3034,7 @@ check "z: stage1.holders stamps the method, the counts and the window, holder an
 check "z: each check sentence names what it compares" 'sorted(k for k in j("stamps.json")["stage1"]["holders"] if k.endswith("_check")) == ["bound_check", "route_bound_check", "routed_leaf_check", "routed_prune_check", "window_check"] and all(w in j("stamps.json")["stage1"]["holders"]["window_check"] for w in ("segmentsFetched of every stage1-unrouted record", "== unrouted_fetched_expected", "token_only_fetched", "min_commit_token", "only answered (ok or incorrect) records are compared", "window_unchecked_timed_out")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_prune_check"] for w in ("segmentsPrunedByLabelIndex of every answered (ok or incorrect) stage1-routed record", "== expected_routed_prunes", "routed_prune_unchecked_timed_out")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_leaf_check"] for w in ("keyIndex phase", "s3GetRequests", "cacheHits")) and all(w in j("stamps.json")["stage1"]["holders"]["bound_check"] for w in ("series-level index", "not the label-value router", "value_holders", "LABEL_DICT", "the router'"'"'s bound"))'
 check "z: the cold records are counted against the selected entries x repetitions in both passes" 'all(j("stamps.json")["stage1"][f"{w}_cold_records"] == {"applicable": True, "expected_records": 5, "records": 5, "records_short": 0, "basis": f"stage1.{w}_cold: records with a ravel_cost (runs - failed_runs) against entries x repetitions_per_entry"} for w in ("unrouted", "routed"))'
 check "z: the query step's records keep their own label" 'all(r["pass_label"] == "background-folded" for r in j("diagnostics.json")["ravel_cost"])'
-expect_log "z: the main report's provenance is marked non-comparable with its reason" "--config comparable=false --config comparability_reason=MB_STAGE1=1: ravel-server ran with --fold-key-index-leaves (not the default command line) through this report's passes"
+expect_log "z: the main report's provenance is marked non-comparable with its reason" "--config comparable=false --config comparability_reason=MB_STAGE1=1: ravel-server ran with ${UP_FLAGS} (not the default command line) through this report's passes"
 if [ "$(grep '^metricsbench_report provenance ' "${LOG}" | grep -vc -- '--config diagnostic_regime=')" -eq 1 ] &&
   [ "$(grep '^metricsbench_report provenance ' "${LOG}" | grep -cE -- '--config diagnostic_regime=stage1-folded-(unrouted|routed) ')" -eq 2 ] &&
   [ "$(grep '^metricsbench_report provenance ' "${LOG}" | grep -vc -- '--config comparable=false')" -eq 0 ]; then
@@ -2987,8 +3084,12 @@ check "z6: MB_STAGE1=0 is off" 'j("stamps.json")["stage1"] == {"enabled": False}
 # z7: a failed leaf rebuild ends the run before the restart.
 MB_STAGE1=1 STUB_STAGE1_LEAVES_EXIT=1 run_stage1 z7 ci
 expect_rc z7 70
-check "z7: stage1-leaves named, its stamp says which fold failed" 'j("stamps.json")["failed_step"] == "stage1-leaves" and j("stamps.json")["stage1"]["leaves"] == "failed: ravel-cli catalog fold --rebuild-key-index --signal metrics --metrics-label-index --json exited 1" and j("stamps.json")["stage1"]["restart"] is None'
-expect_no_log "z7: no recreate with the label index" "docker-env recreate RAVEL_SERVER_EXTRA_FLAGS=--disable-fold --fold-key-index-leaves --fold-metrics-label-index"
+check "z7: stage1-leaves named, its stamp says which fold failed" 'j("stamps.json")["failed_step"] == "stage1-leaves" and j("stamps.json")["stage1"]["leaves"] == "failed: ravel-cli catalog fold --rebuild-key-index --signal metrics --json exited 1" and j("stamps.json")["stage1"]["restart"] is None'
+if [ "$(grep -cx "docker-env recreate RAVEL_SERVER_EXTRA_FLAGS=${ROUTED_FLAGS}" "${LOG}")" -eq 0 ]; then
+  pass "z7: no recreate with the label index"
+else
+  fail "z7: ravel-server was recreated with the routed flags after the failed rebuild"
+fi
 expect_no_log "z7: no routed pass" "--pass-label folded-routed"
 expect_log "z7: torn down" " down -v"
 
@@ -3236,19 +3337,19 @@ expect_rc za 0
 
 check "za: the arm steps follow stage1-holders in order, the control's between stage1-unrouted and stage1-leaves" 'j("stamps.json")["steps_completed"][j("stamps.json")["steps_completed"].index("stage1-fold"):] == ["stage1-fold","stage1-unrouted","stage1-control","stage1-control-restore","stage1-leaves","stage1-restart","stage1-routed","stage1-holders","stage1-extra-hour-ingest","stage1-extra-hour-fold-on","stage1-extra-hour-fold-off","stage1-extra-hour","stage1-l1-compact","stage1-l1-fold","stage1-l1","stage1-erasure-reference","stage1-erasure-submit","stage1-erasure-pending","stage1-erasure-rewrite","stage1-erasure-fold","stage1-erasure"] and j("stamps.json")["status"] == "passed"'
 check "za: every arm stamped on" 'j("stamps.json")["stage1"]["arms"] == {"control": True, "extra_hour": True, "l1": True, "erasure": True}'
-if python3 -I - "${LOG}" "${IMAGE}" "${CONTROL_IMAGE}" <<'PY'; then
+# The stub's control image takes the opt-in (an image built before issue
+# #4145), so its unrouted flags carry no label index flag.
+if python3 -I - "${LOG}" "${IMAGE}" "${CONTROL_IMAGE}" "${UNROUTED_FLAGS}" "${ROUTED_FLAGS}" <<'PY'; then
 import re, sys
 lines = open(sys.argv[1]).read().splitlines()
-main, control = sys.argv[2:4]
-unrouted = "--disable-fold --fold-key-index-leaves"
-routed = unrouted + " --fold-metrics-label-index"
-want = [(unrouted, main), (unrouted, main), (unrouted, control), (unrouted, main),
+main, control, unrouted, routed = sys.argv[2:6]
+want = [(unrouted, main), (unrouted, main), ("--disable-fold --fold-key-index-leaves", control), (unrouted, main),
         (routed, main), (routed, main), (routed, main)]
 flags = [l.split("=", 1)[1] for l in lines if l.startswith("docker-env recreate ")]
 images = [l.split("=", 1)[1] for l in lines if l.startswith("docker-image recreate ")]
 folds = [re.search(r" catalog fold --tenant \S+ --shards \S+ (.*)$", l).group(1)
          for l in lines if l.startswith("docker compose ") and " catalog fold " in l]
-leafy = "--signal metrics --writers-stopped --key-index-leaves --metrics-label-index --json"
+leafy = "--signal metrics --writers-stopped --key-index-leaves --json"
 ok = (list(zip(flags, images)) == want
       and folds[3:] == [leafy, "--signal metrics --writers-stopped --json", leafy, leafy])
 if not ok:
@@ -3526,6 +3627,120 @@ expect_rc z19 0
 OUT="${TMP}/z19/out"
 expect_log "z19: the query step is told the state is unknown" "--pass-label unknown --fold-state unknown: the /metrics scrape before the query step"
 check "z19: every record says unknown" 'all(r["pass_label"] == "unknown" and r["fold_state"].startswith("unknown: the /metrics scrape before the query step") for r in j("diagnostics.json")["ravel_cost"])'
+
+# --- zs: the label index flag spelling (issue #4145) -------------------------------
+# stage1_flags_check CASE LOG WANT_UP WANT_UNROUTED WANT_ROUTED WANT_CONTROL
+# CLI_ON: ravel-server's flags at up and at each recreate, and every Stage 1
+# catalog fold's flags, against the listed sets; CLI_ON is the label index
+# flag a leaf-building fold passes ("" when the image builds it by default).
+# With WANT_CONTROL set the control arm ran, and with arms the extra-hour, l1
+# and erasure folds are checked too.
+stage1_flags_check() {
+  python3 -I - "$@" <<'PY'
+import re, sys
+case, log, up, unrouted, routed, control, cli_on, arms = sys.argv[1:9]
+lines = open(log).read().splitlines()
+ups = [l.split("=", 1)[1] for l in lines if l.startswith("docker-env up RAVEL_SERVER_EXTRA_FLAGS=")]
+recreates = [l.split("=", 1)[1] for l in lines if l.startswith("docker-env recreate ")]
+folds = [re.search(r" catalog fold --tenant \S+ --shards \S+ (.*)$", l).group(1)
+         for l in lines if l.startswith("docker compose ") and " catalog fold " in l]
+on = f" {cli_on}" if cli_on else ""
+want_recreates = [unrouted, unrouted] + ([control, unrouted] if control else []) + [routed]
+want_folds = ["--signal metrics --writers-stopped", "--signal metrics --json",
+              f"--rebuild-key-index --signal metrics{on} --json"]
+if arms == "arms":
+    want_recreates += [routed, routed]
+    leafy = f"--signal metrics --writers-stopped --key-index-leaves{on} --json"
+    want_folds += [leafy, "--signal metrics --writers-stopped --json", leafy, leafy]
+problems = []
+if ups != [up]:
+    problems.append(f"up flags {ups}, want [{up!r}]")
+if recreates != want_recreates:
+    problems.append(f"recreate flags {recreates}, want {want_recreates}")
+if folds != want_folds:
+    problems.append(f"fold flags {folds}, want {want_folds}")
+for p in problems:
+    print(f"{case}: {p}")
+sys.exit(1 if problems else 0)
+PY
+}
+
+# zs1: an image built before #4145 (opt-ins only) for the main image and the
+# control: the label index flag passed only where it is wanted on, every arm
+# on so every flag site runs.
+MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour,l1,erasure MB_CONTROL_IMAGE="${CONTROL_IMAGE}" MB_CONTROL_SOURCE_COMMIT="${CONTROL_COMMIT}" \
+  STUB_HELP_STYLE=opt-in STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 zs1 ci
+expect_rc zs1 0
+if stage1_flags_check zs1 "${LOG}" "--fold-key-index-leaves" "--disable-fold --fold-key-index-leaves" \
+  "--disable-fold --fold-key-index-leaves --fold-metrics-label-index" "--disable-fold --fold-key-index-leaves" \
+  "--metrics-label-index" arms; then
+  pass "zs1: opt-in images: up, unrouted and control pass no label index flag, routed --fold-metrics-label-index, every leaf-building fold --metrics-label-index"
+else
+  fail "zs1: the flags on opt-in images are not the listed ones"
+fi
+check "zs1: the stamps carry the opt-in flags" '{k: j("stamps.json")["stage1"][f"server_flags_{k}"] for k in ("up", "unrouted", "routed", "control")} == {"up": "--fold-key-index-leaves", "unrouted": "--disable-fold --fold-key-index-leaves", "routed": "--disable-fold --fold-key-index-leaves --fold-metrics-label-index", "control": "--disable-fold --fold-key-index-leaves"} and {k: (v["spelling"], v["on"], v["off"]) for k, v in j("stamps.json")["stage1"]["label_index_flags"].items() if k != "method"} == {"server": ("opt-in", "--fold-metrics-label-index", ""), "cli": ("opt-in", "--metrics-label-index", ""), "control_server": ("opt-in", "--fold-metrics-label-index", "")}'
+check "zs1: each pass's fold state names the flags it ran with" 'j("stamps.json")["stage1"]["unrouted"]["fold_state"].endswith("; ravel-server --disable-fold --fold-key-index-leaves") and j("stamps.json")["stage1"]["routed"]["fold_state"].endswith("; ravel-server --disable-fold --fold-key-index-leaves --fold-metrics-label-index") and j("stamps.json")["stage1"]["control"]["fold_state"].endswith("; ravel-server --disable-fold --fold-key-index-leaves; image '"${CONTROL_IMAGE}"'")'
+check "zs1: the unrouted snapshot holds no label_value leaf" 'j("stamps.json")["stage1"]["unrouted_catalog"]["label_value_leaf_parts"] == 0'
+expect_no_log "zs1: no flag refused" "docker-reject "
+
+# zs2: images built after #4145 (opt-outs only) for the main image and the
+# control: the opt-out passed wherever the index is wanted off, nothing where
+# it is wanted on. The probes run before up, without a network. The arms'
+# folds on an opt-out image are case za's.
+MB_STAGE1=1 MB_CONTROL_IMAGE="${CONTROL_IMAGE}" MB_CONTROL_SOURCE_COMMIT="${CONTROL_COMMIT}" \
+  STUB_HELP_STYLE=opt-out STUB_CONTROL_HELP_STYLE=opt-out run_stage1 zs2 ci
+expect_rc zs2 0
+if stage1_flags_check zs2 "${LOG}" "${UP_FLAGS}" "${UNROUTED_FLAGS}" "${ROUTED_FLAGS}" "${UNROUTED_FLAGS}" "" ""; then
+  pass "zs2: opt-out images: up, unrouted and control pass --no-fold-metrics-label-index, routed and the leaf rebuild no label index flag"
+else
+  fail "zs2: the flags on opt-out images are not the listed ones"
+fi
+check "zs2: stage1.label_index_flags names each binary's image, spelling, help file and resolved flags" '{k: v for k, v in j("stamps.json")["stage1"]["label_index_flags"].items() if k != "method"} == {"server": {"image": "'"${IMAGE}"'", "command": "ravel-server --help", "spelling": "opt-out", "on": "", "off": "--no-fold-metrics-label-index", "help": "stage1-flags.server.help.txt"}, "cli": {"image": "'"${IMAGE}"'", "command": "ravel-cli catalog fold --help", "spelling": "opt-out", "on": "", "off": "--no-metrics-label-index", "help": "stage1-flags.cli.help.txt"}, "control_server": {"image": "'"${CONTROL_IMAGE}"'", "command": "ravel-server --help", "spelling": "opt-out", "on": "", "off": "--no-fold-metrics-label-index", "help": "stage1-flags.control_server.help.txt"}} and j("stamps.json")["stage1"]["server_flags_control"] == "'"${UNROUTED_FLAGS}"'" and "stage1-flags" in j("stamps.json")["steps_completed"]'
+check "zs2: the unrouted snapshot holds no label_value leaf (the background fold ran with the opt-out)" 'j("stamps.json")["stage1"]["unrouted_catalog"]["label_value_leaf_parts"] == 0'
+for f in stage1-flags.server.help.txt stage1-flags.cli.help.txt stage1-flags.control_server.help.txt; do
+  expect_file zs2 "$f"
+done
+if python3 -I - "${LOG}" "${IMAGE}" "${CONTROL_IMAGE}" <<'PY'; then
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+main, control = sys.argv[2:4]
+probes = [l for l in lines if l.startswith("docker run ")]
+up = next(i for i, l in enumerate(lines) if l.startswith("docker-env up "))
+want = [f"docker run --rm --network none --entrypoint /usr/local/bin/ravel-server {main} --help",
+        f"docker run --rm --network none --entrypoint /usr/local/bin/ravel-cli {main} catalog fold --help",
+        f"docker run --rm --network none --entrypoint /usr/local/bin/ravel-server {control} --help"]
+sys.exit(0 if probes == want and all(lines.index(p) < up for p in probes) else 1)
+PY
+  pass "zs2: the three probes run before up, each binary's --help with no network"
+else
+  fail "zs2: the probes are not the three listed, before up"
+fi
+
+# zs3: a binary listing neither spelling, or both, fails stage1-flags before
+# anything is brought up: the label index's state on it is unknown.
+for style in neither both; do
+  MB_STAGE1=1 STUB_HELP_STYLE="${style}" run_stage1 "zs3-${style}" ci
+  expect_rc "zs3-${style}" 70
+  check "zs3-${style}: stage1-flags named, the stamp says what the help listed" 'j("stamps.json")["failed_step"] == "stage1-flags" and j("stamps.json")["stage1"]["label_index_flags"].startswith("refused: /usr/local/bin/ravel-server --help in '"${IMAGE}"' lists '"${style}"' --fold-metrics-label-index ") and j("stamps.json")["stage1"]["server_flags_up"] is None'
+  expect_err "zs3-${style}: the refusal names the binary and the spelling" "refused: /usr/local/bin/ravel-server --help in ${IMAGE} lists ${style} --fold-metrics-label-index "
+  expect_no_log "zs3-${style}: nothing brought up" "docker-env up "
+done
+# zs4: the main image probes clean, the control image lists neither.
+MB_STAGE1=1 MB_CONTROL_IMAGE="${CONTROL_IMAGE}" MB_CONTROL_SOURCE_COMMIT="${CONTROL_COMMIT}" STUB_CONTROL_HELP_STYLE=neither run_stage1 zs4 ci
+expect_rc zs4 70
+expect_err "zs4: the refusal names the control image" "refused: /usr/local/bin/ravel-server --help in ${CONTROL_IMAGE} lists neither --fold-metrics-label-index nor --no-fold-metrics-label-index"
+expect_no_log "zs4: nothing brought up" "docker-env up "
+# zs5: the probe itself fails.
+MB_STAGE1=1 STUB_HELP_EXIT=125 run_stage1 zs5 ci
+expect_rc zs5 70
+check "zs5: stage1-flags named, the stamp names the failed docker run" 'j("stamps.json")["failed_step"] == "stage1-flags" and j("stamps.json")["stage1"]["label_index_flags"] == "failed: docker run --rm --network none --entrypoint /usr/local/bin/ravel-server '"${IMAGE}"' --help exited 125"'
+expect_no_log "zs5: nothing brought up" "docker-env up "
+# zs6: without MB_STAGE1 no binary is probed.
+if grep -q '^docker run ' "${TMP}/z6/calls.log"; then
+  fail "zs6 (z6's run): MB_STAGE1=0 probed a binary"
+else
+  pass "zs6 (z6's run): MB_STAGE1=0 probes nothing"
+fi
 
 # --- z: stage1-check.sh ------------------------------------------------------------------
 CHECK="${HERE}/../stage1-check.sh"
