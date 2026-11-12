@@ -1293,6 +1293,41 @@ async fn multipart_sends_put_block_and_put_block_list_and_abort_sends_nothing() 
 }
 
 #[tokio::test]
+async fn container_not_found_during_a_multipart_upload_is_permanent() {
+    let fake = fake().await;
+    let other = AzureStore::new(fake.config_for_container("absent-container"))
+        .await
+        .expect("account information does not need the container");
+    let mut upload = other
+        .put_multipart("u/k")
+        .await
+        .expect("open sends nothing");
+    let part = upload
+        .put_part(Bytes::from(vec![5u8; crate::MULTIPART_MIN_PART_SIZE]), None)
+        .await;
+    assert!(matches!(part, Err(StoreError::Permanent(_))), "{part:?}");
+
+    let store = store(&fake).await;
+    let mut upload = store.put_multipart("u/k").await.expect("open");
+    upload
+        .put_part(Bytes::from_static(b"only"), None)
+        .await
+        .expect("part");
+    fake.fail_next_with_code(404, "ContainerNotFound", 1);
+    let complete = upload.complete().await;
+    assert!(
+        matches!(complete, Err(StoreError::Permanent(_))),
+        "{complete:?}"
+    );
+
+    // A 404 without that code during an upload is still NotFound.
+    let mut upload = store.put_multipart("u/k").await.expect("open");
+    fake.fail_next_with_code(404, "BlobNotFound", 1);
+    let part = upload.put_part(Bytes::from_static(b"only"), None).await;
+    assert!(matches!(part, Err(StoreError::NotFound)), "{part:?}");
+}
+
+#[tokio::test]
 async fn capabilities_and_identity() {
     let fake = fake().await;
     let store = store(&fake).await;

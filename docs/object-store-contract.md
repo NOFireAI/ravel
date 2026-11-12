@@ -112,7 +112,8 @@ container still read `NotFound`: telling the two apart would cost a second
 request. `AzureStore` is the exception: Azure sends the error code as the
 `x-ms-error-code` response header, HEAD included, so a 404
 `ContainerNotFound` is `Permanent` on `AzureStore`'s `get`, `head`,
-`pin_of`, `put`, `delete` and listings.
+`pin_of`, `put`, `delete`, listings, and a multipart upload's `put_part` and
+`complete`.
 `PreconditionFailed`, `Unsupported`, `ReadOnly` and `UnaddressableKey` are
 never retryable: a retry of a pinned read reads the same changed object, and
 neither an unimplemented operation, a read-only store nor a key's encoding
@@ -1160,7 +1161,8 @@ than the S3 lister's cap is `Permanent`.
 
 Errors are classified by status and `x-ms-error-code` (ADR-4158 D5): 404
 `BlobNotFound` is `NotFound` (success on `delete`, `PreconditionFailed` on a
-`CasVersion` put), 404 `ContainerNotFound` is `Permanent`, 401 and 403 are
+`CasVersion` put), 404 `ContainerNotFound` is `Permanent` on every operation,
+multipart `put_part` and `complete` included, 401 and 403 are
 `AccessDenied`, 416 is `InvalidRange`, and 429, 503 and 500 are retried and,
 once the retries run out, surface as a retryable error.
 
