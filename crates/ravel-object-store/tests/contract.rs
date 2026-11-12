@@ -2145,23 +2145,28 @@ async fn azure_pinned_read_ordering(store: &AzureStore, root: &str) {
 }
 
 /// Suffix reads racing a writer that replaces the blob with contents of other
-/// lengths. A byte's value depends on its position, and each version's last
-/// byte is its own marker, so the tail of one version matches no range of
-/// another. Every read that succeeds returns exactly the tail of one version
-/// and that version's length; a read the writer outran on every round is
-/// `Transient`, never bytes from two versions or from the wrong offset.
+/// lengths. Every byte of a version's last `SUFFIX` bytes is that version's
+/// marker, a value no byte before them takes, so a window that mixes two
+/// versions, or reaches before the tail, equals no version's tail. Every read
+/// that succeeds returns exactly the tail of one version and that version's
+/// length; a read the writer outran on every round is `Transient`, never
+/// bytes from two versions or from the wrong offset.
 async fn azure_suffix_read_races_overwrites(store: &AzureStore, root: &str) {
     const VERSIONS: u8 = 20;
     const SUFFIX: u64 = 16;
     let key = format!("{root}/suffix-race/k");
     let version = |i: u8| {
         let len = 64 + usize::from(i) * 7;
-        let mut bytes: Vec<u8> = (0..len)
-            .map(|position| u8::try_from(position % 251).expect("below 251"))
+        let suffix = usize::try_from(SUFFIX).expect("suffix fits usize");
+        let bytes: Vec<u8> = (0..len)
+            .map(|position| {
+                if position >= len - suffix {
+                    0x80 + i
+                } else {
+                    u8::try_from(position % 128).expect("below 128")
+                }
+            })
             .collect();
-        if let Some(last) = bytes.last_mut() {
-            *last = b'A' + i;
-        }
         Bytes::from(bytes)
     };
     let tail = |bytes: &Bytes| {

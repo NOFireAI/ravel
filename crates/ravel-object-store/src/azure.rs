@@ -21,9 +21,11 @@
 //! - `Overwrite` sends no precondition.
 //!
 //! A leased blob answers a write with a 412 (or a 409) whose code starts with
-//! `Lease`. That is `Permanent` in every put mode and on `delete`, never
-//! `AlreadyExists` or `PreconditionFailed`: Ravel takes no leases, so no retry
-//! clears it.
+//! `Lease`. A lease is held only on a blob that exists, so under
+//! `CreateIfAbsent` that is [`StoreError::AlreadyExists`]. Under `CasVersion`
+//! and `Overwrite`, on `delete` and on a multipart upload's parts and
+//! `complete` it is `Permanent`, never `PreconditionFailed`: Ravel takes no
+//! leases, so no retry clears it.
 //!
 //! # Reads
 //!
@@ -40,9 +42,12 @@
 //! `versionid` selector when it has one. A pinned suffix read sends both on
 //! the HEAD and on the GET, and is not retried. A 412 on any pinned request
 //! is settled by one HEAD that keeps the `versionid` and drops the
-//! `If-Match`: a 404 is [`StoreError::NotFound`], any other answer
-//! [`StoreError::PreconditionFailed`]. Azure answers `If-Match` on an absent
-//! key with 404, which needs no settling; Azurite answers 412.
+//! `If-Match`: a 404 `BlobNotFound` is [`StoreError::NotFound`], a success
+//! [`StoreError::PreconditionFailed`], and any other failure of that HEAD is
+//! returned as it is. Azure answered a GET with `If-Match` on an absent key
+//! with 404 `BlobNotFound` (measured 2026-11-12, P8), which needs no
+//! settling; a HEAD with `If-Match` on an absent key was not measured on
+//! Azure. Azurite answers 412.
 //!
 //! # Listing
 //!
@@ -524,14 +529,16 @@ impl AzureStore {
         }
     }
 
-    /// Azurite answers `If-Match` on an absent key with 412 where Azure
-    /// answers 404, so a pinned 412 is settled by one HEAD without the
-    /// precondition: a 404 means the key is gone, anything else that it was
-    /// replaced.
+    /// Azurite answers `If-Match` on an absent key with 412 (Azure answered
+    /// a GET with 404, measured 2026-11-12, P8; a HEAD was not measured), so
+    /// a pinned 412 is settled by one HEAD without the precondition: a 404
+    /// `BlobNotFound` means the key is gone and a success that it was
+    /// replaced. Any other failure of the HEAD determined neither and is
+    /// returned as it is, as in `confirm_create_conflict`.
     async fn settle_pinned_412(&self, key: &str, pin: &Pin) -> StoreError {
         match self.rest.head_version(key, pin.version.as_deref()).await {
-            Err(StoreError::NotFound) => StoreError::NotFound,
-            _ => StoreError::PreconditionFailed,
+            Ok(_) => StoreError::PreconditionFailed,
+            Err(e) => e,
         }
     }
 
@@ -707,7 +714,7 @@ impl AzureStore {
 }
 
 /// The `host[:port]` requests go to: the endpoint's, without the scheme's
-/// default port, or Azure's for the account. An endpoint carrying userinfo (`user:pass@`) is refused
+/// default port (compared as a number, so `080` is 80), or Azure's for the account. An endpoint carrying userinfo (`user:pass@`) is refused
 /// without echoing it.
 fn store_authority(account: &str, endpoint: Option<&str>) -> Result<String, StoreError> {
     let Some(endpoint) = endpoint else {
@@ -731,15 +738,21 @@ fn store_authority(account: &str, endpoint: Option<&str>) -> Result<String, Stor
         )));
     }
     // A request URI drops the scheme's default port, so the authority must too.
-    let default_port = if scheme.eq_ignore_ascii_case("https") {
-        Some("443")
+    let default_port: Option<u16> = if scheme.eq_ignore_ascii_case("https") {
+        Some(443)
     } else if scheme.eq_ignore_ascii_case("http") {
-        Some("80")
+        Some(80)
     } else {
         None
     };
     let authority = match (authority.rsplit_once(':'), default_port) {
-        (Some((host, port)), Some(default)) if port == default && !host.is_empty() => host,
+        (Some((host, port)), Some(default))
+            if port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().ok() == Some(default)
+                && !host.is_empty() =>
+        {
+            host
+        }
         _ => authority,
     };
     Ok(authority.to_string())
@@ -824,12 +837,17 @@ enum PutFailure {
     ConfirmCreate,
 }
 
-/// `put` errors by mode (ADR-4158 D1, D5).
+/// `put` errors by mode (ADR-4158 D1, D5). A lease is held only on a blob
+/// that exists, so a lease conflict answering a create is `AlreadyExists`;
+/// in every other mode it is `Permanent`.
 fn map_put_error(e: object_store::Error, mode: &PutMode) -> PutFailure {
     use object_store::Error as E;
     let code = error_code_of(&e);
     if let Some(leased) = lease_error(&e, code.as_deref()) {
-        return PutFailure::Mapped(leased);
+        return PutFailure::Mapped(match mode {
+            PutMode::CreateIfAbsent => StoreError::AlreadyExists,
+            _ => leased,
+        });
     }
     if code.as_deref() == Some("ContainerNotFound") {
         return PutFailure::Mapped(map_azure_error(e, map_error_common));
@@ -856,8 +874,9 @@ fn multipart_outcome(key: &str, result: object_store::PutResult) -> Result<PutOu
     put_outcome(key, result)
 }
 
-/// Put Block and Put Block List errors, with `ContainerNotFound` `Permanent`
-/// as on every other operation.
+/// Put Block and Put Block List errors: a 404 `ContainerNotFound`, any 409,
+/// and a 412 with a lease's code are `Permanent` (`map_azure_error`), and
+/// anything else maps as an `Overwrite` put's error does.
 fn map_multipart_error(e: object_store::Error) -> StoreError {
     map_azure_error(e, map_error_common)
 }
