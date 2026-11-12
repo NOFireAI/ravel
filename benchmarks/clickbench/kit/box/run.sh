@@ -80,6 +80,24 @@
 # KIT_HEALTH_BASE_4319 (the /healthz sampler's two listeners, default
 # http://127.0.0.1:4318 and http://127.0.0.1:4319).
 #
+# On GCP (launch-gcp.sh writes gcp to /root/kit/CLOUD and the run's store
+# bucket to /root/kit/STORE_BUCKET; run.toml says cloud = "gcp", store =
+# "gcs") the same steps run with these differences, switched in the cloud_*
+# and store_* functions: the box builds nothing (step release downloads
+# run.toml's release_tag binaries and checks each against its pinned digest
+# and the release's SHA256SUMS, replacing toolchain, source and build); the
+# store is the GCS bucket through --store gcs --gcs-bucket, with no RustFS and
+# no S3 variable in any environment (ADR-3456 D6 refuses one); step sql-smoke
+# answers SELECT 1 through the server before the load; steps declared and
+# footprint, after declare, stamp the declared column count and the bucket's
+# objects and bytes by key class; the server runs without an LD_PRELOAD, as
+# the release binary ships; uploads go to gs://<bucket>/<prefix>/runs/<run-id>/
+# out/A/ and the box deletes itself, both through the metadata server's token
+# and the GCS and Compute JSON APIs with curl, so no gcloud is needed. The run
+# has no lanes and the box judges no band; fetch-gcp.sh judges the
+# pre-registration. KIT_GCE_METADATA, KIT_GCS_API and KIT_GCE_API relocate the
+# three endpoints for kit.test.sh.
+#
 # During the benchmark phase and each concurrent round (each phase run.toml's
 # healthz_phases names, default both), one kit.py healthz-sampler process GETs
 # /healthz on both listeners every 250 ms and /metrics on 4318 (the health
@@ -110,6 +128,15 @@ DATASET="$KIT_ROOT/hits.parquet"
 RUSTFS_DATA="$KIT_ROOT/rustfs-data"
 TARGET_DIR="$KIT_ROOT/target-fp"
 IMDS="${KIT_IMDS:-http://169.254.169.254}"
+GCE_METADATA="${KIT_GCE_METADATA:-http://metadata.google.internal/computeMetadata/v1}"
+GCS_API="${KIT_GCS_API:-https://storage.googleapis.com}"
+GCE_API="${KIT_GCE_API:-https://compute.googleapis.com/compute/v1}"
+# The box's cloud, from the file the user-data writes before anything else,
+# so a run that fails before load_config still ends its instance its cloud's
+# way. load_config checks run.toml agrees.
+CLOUD="$(cat "$KIT_ROOT/kit/CLOUD" 2>/dev/null || echo aws)"
+STORE=rustfs
+STORE_ARGS=(--store s3)
 DROP_CACHES_FILE="${KIT_DROP_CACHES_FILE:-/proc/sys/vm/drop_caches}"
 READY_TRIES="${KIT_READY_TRIES:-600}"
 READY_INTERVAL="${KIT_READY_INTERVAL:-1}"
@@ -261,18 +288,35 @@ load_config() {
   esac
   [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { say "arm $ARM has no full commit: '$SHA'"; return 1; }
   [ -n "$RUN_ID" ] || { say "no run id in $KIT/RUN_ID"; return 1; }
+  local cloud
+  cloud="$(toml_or cloud aws)"
+  [ "$cloud" = "$CLOUD" ] || { say "run.toml says cloud $cloud, the box was launched on $CLOUD"; return 1; }
   REGION="$(toml region)" || return 1
   BUCKET="$(toml bucket)" || return 1
   PREFIX="$(toml prefix)" || return 1
-  OUT_URI="s3://$BUCKET/${PREFIX%/}/runs/$RUN_ID/out/$ARM"
-  REPO_URL="$(toml repo_url)" || return 1
   TENANT="$(toml tenant)" || return 1
   SHARDS="$(toml shards)" || return 1
   DATASET_URL="$(toml dataset_url)" || return 1
   DATASET_SHA256="$(toml_or dataset_sha256 '')"
   ROWS_EXPECTED="$(toml rows_expected)" || return 1
-  RUSTFS_URL="$(toml rustfs_url)" || return 1
-  RUSTFS_SHA256="$(toml rustfs_sha256)" || return 1
+  if [ "$CLOUD" = gcp ]; then
+    STORE="$(toml store)" || return 1
+    [ "$STORE" = gcs ] || { say "cloud gcp runs store gcs, run.toml says $STORE"; return 1; }
+    OUT_URI="gs://$BUCKET/${PREFIX%/}/runs/$RUN_ID/out/$ARM"
+    RELEASE_TAG="$(toml release_tag)" || return 1
+    RELEASE_URL="$(toml_or release_url https://github.com/NOFireAI/ravel/releases/download)"
+    SERVER_SHA256="$(toml ravel_server_sha256)" || return 1
+    CLI_SHA256="$(toml ravel_cli_sha256)" || return 1
+    STORE_BUCKET="$(cat "$KIT/STORE_BUCKET" 2>/dev/null)" || STORE_BUCKET=""
+    [[ "$STORE_BUCKET" =~ ^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$ ]] \
+      || { say "no store bucket name in $KIT/STORE_BUCKET: '$STORE_BUCKET'"; return 1; }
+    STORE_ARGS=(--store gcs --gcs-bucket "$STORE_BUCKET")
+  else
+    OUT_URI="s3://$BUCKET/${PREFIX%/}/runs/$RUN_ID/out/$ARM"
+    REPO_URL="$(toml repo_url)" || return 1
+    RUSTFS_URL="$(toml rustfs_url)" || return 1
+    RUSTFS_SHA256="$(toml rustfs_sha256)" || return 1
+  fi
   MEMORY_BUDGET="$(toml memory_budget_bytes)" || return 1
   AUDIT_MODE="$(toml audit_mode)" || return 1
   AUDIT_TEXT="$(toml_or audit_text redacted)"
@@ -289,7 +333,12 @@ load_config() {
   WINDOW_HOURS="$(toml_or window_hours 200000)"
   BAND_SECTIONS="$(toml_or band_sections "$(printf 'relative\nabsolute')" | tr '\n' ' ')"
   PHASES="$(toml phases | tr '\n' ' ')" || return 1
-  LANES="$(toml lanes | tr '\n' ' ')" || return 1
+  if [ "$CLOUD" = gcp ]; then
+    LANES=""
+    BAND_SECTIONS=""
+  else
+    LANES="$(toml lanes | tr '\n' ' ')" || return 1
+  fi
   local code=0
   toml_get_opt healthz_phases "$KIT/healthz-phases" || code=$?
   case "$code" in
@@ -299,26 +348,102 @@ load_config() {
   esac
   rm -f "$KIT/healthz-phases"
   CORPUS="$SRC/corpus.json"
-  MAPPING="$RAVEL_DIR/benchmarks/clickbench/hits.mapping.toml"
+  # No clone on GCP: launch-gcp.sh ships the release tag's mapping in the kit.
+  if [ "$CLOUD" = gcp ]; then
+    MAPPING="$SRC/mapping.toml"
+  else
+    MAPPING="$RAVEL_DIR/benchmarks/clickbench/hits.mapping.toml"
+  fi
 }
 
 # --- terminal handling -----------------------------------------------------
+
+# --- GCP: metadata server, GCS and Compute through curl ----------------------
+
+# gce_metadata PATH: one metadata server value.
+gce_metadata() {
+  curl -sSf --max-time 5 -H 'Metadata-Flavor: Google' "$GCE_METADATA/$1"
+}
+
+# gce_token: the attached service account's access token.
+gce_token() {
+  local body tok
+  body="$(gce_metadata instance/service-accounts/default/token)" || return 1
+  tok="$(printf '%s' "$body" | sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p')"
+  [ -n "$tok" ] || { say "the metadata server returned no access token"; return 1; }
+  printf '%s\n' "$tok"
+}
+
+# gcs_put FILE gs://BUCKET/KEY: one media upload through the JSON API.
+gcs_put() {
+  local tok uri="${2#gs://}" bucket key
+  bucket="${uri%%/*}"
+  key="${uri#*/}"
+  tok="$(gce_token)" || return 1
+  curl -sSf --max-time 600 -o /dev/null -X POST -H "Authorization: Bearer $tok" \
+    -H 'Content-Type: application/octet-stream' --data-binary @"$1" \
+    "$GCS_API/upload/storage/v1/b/$bucket/o?uploadType=media&name=${key//\//%2F}"
+}
+
+# gcs_list DIR: every objects.list page of the store bucket into DIR, as
+# page-N.json, following nextPageToken.
+gcs_list() {
+  local dir="$1" tok n=0 next=""
+  rm -rf "$dir"
+  mkdir -p "$dir" || return 1
+  tok="$(gce_token)" || return 1
+  while :; do
+    curl -sSf --max-time 60 -H "Authorization: Bearer $tok" -o "$dir/page-$n.json" \
+      "$GCS_API/storage/v1/b/$STORE_BUCKET/o?maxResults=1000&fields=items(name,size),nextPageToken${next:+&pageToken=$next}" \
+      || return 1
+    next="$(kit_py gcs-next-page "$dir/page-$n.json")" || return 1
+    [ -n "$next" ] || return 0
+    n=$((n + 1))
+  done
+}
+
+# gce_delete_self: this instance deleted through the Compute API with the
+# instance's own token; launch-gcp.sh granted it instanceAdmin on itself.
+gce_delete_self() {
+  local tok name zone project
+  name="$(gce_metadata instance/name)" || return 1
+  zone="$(gce_metadata instance/zone)" || return 1
+  project="$(gce_metadata project/project-id)" || return 1
+  tok="$(gce_token)" || return 1
+  curl -sSf --max-time 30 -o /dev/null -X DELETE -H "Authorization: Bearer $tok" \
+    "$GCE_API/projects/$project/zones/${zone##*/}/instances/$name" || return 1
+  stamp "terminate instance=$name"
+}
+
+# out_put FILE NAME: FILE uploaded as NAME under the arm's out/ prefix.
+out_put() {
+  if [ "$CLOUD" = gcp ]; then
+    gcs_put "$1" "$OUT_URI/$2"
+  else
+    aws s3 cp --region "$REGION" --only-show-errors "$1" "$OUT_URI/$2"
+  fi
+}
 
 upload_out() {
   local f code=0
   for f in results.json evidence.tgz progress.log; do
     [ -f "$KIT/$f" ] || continue
-    aws s3 cp --region "$REGION" --only-show-errors "$KIT/$f" "$OUT_URI/$f" || code=1
+    out_put "$KIT/$f" "$f" || code=1
   done
   return "$code"
 }
 
 # terminate_self: terminate through the instance role when the region is
 # known, then `shutdown -h now` whatever happened, so a run that failed before
-# load_config set REGION still ends its instance.
+# load_config set REGION still ends its instance. On GCP the instance deletes
+# itself through the metadata server's token, which needs no region; the
+# guest shutdown only stops a GCE instance, and the max run duration
+# launch-gcp.sh set deletes it after that.
 terminate_self() {
   local token id
-  if [ -n "${REGION:-}" ]; then
+  if [ "$CLOUD" = gcp ]; then
+    gce_delete_self || stamp "terminate fallback=shutdown"
+  elif [ -n "${REGION:-}" ]; then
     token="$(curl -sS --max-time 5 -X PUT "$IMDS/latest/api/token" \
       -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')" || token=""
     id="$(curl -sS --max-time 5 -H "X-aws-ec2-metadata-token: $token" \
@@ -370,7 +495,7 @@ fail_run() {
   write_evidence || true
   if [ -n "${OUT_URI:-}" ] && [ -n "${REGION:-}" ]; then
     upload_out || true
-    aws s3 cp --region "$REGION" --only-show-errors "$KIT/FAILED" "$OUT_URI/FAILED" || true
+    out_put "$KIT/FAILED" FAILED || true
   fi
   terminate_self
   exit 1
@@ -384,8 +509,7 @@ finish() {
   arm_shutdown
   FINISHED=1
   printf 'DONE bands=%s at=%s\n' "$BANDS_VERDICT" "$(utc_now)" >"$KIT/DONE"
-  aws s3 cp --region "$REGION" --only-show-errors "$KIT/DONE" "$OUT_URI/DONE" \
-    || fail_run "upload-done"
+  out_put "$KIT/DONE" DONE || fail_run "upload-done"
   stamp "done bands=$BANDS_VERDICT"
   terminate_self
 }
@@ -405,6 +529,13 @@ imds_get() {
 record_burst() {
   local which="$1" id vol vtype value="" reason=""
   mkdir -p "$STAMPS"
+  if [ "$CLOUD" = gcp ]; then
+    printf '{"at": %s, "volume_id": "", "volume_type": "pd-balanced", "value": null, "reason": %s}\n' \
+      "$(json_str "$(utc_now)")" \
+      "$(json_str "a GCE persistent disk has no burst balance: its limits are set by size and machine type")" \
+      >"$KIT/burst-$which.json"
+    return 0
+  fi
   id="$(imds_get instance-id)" || id=""
   vol="$(aws ec2 describe-volumes --region "$REGION" \
     --filters "Name=attachment.instance-id,Values=$id" \
@@ -431,8 +562,57 @@ record_burst() {
 # --- bootstrap (runbook section 6) -----------------------------------------
 
 bootstrap_packages() {
+  if [ "$CLOUD" = gcp ]; then
+    # Nothing to build: the dataset download, /usr/bin/time and the samplers.
+    dnf install -y wget sysstat time
+    return
+  fi
   dnf install -y git gcc gcc-c++ make cmake pkgconfig openssl-devel perl wget jq \
     gperftools gperftools-libs gdb perf sysstat time unzip
+}
+
+# bootstrap_release: the release_tag's ravel-server and ravel-cli for this
+# box's architecture, each checked against run.toml's pinned digest and
+# against the release's own SHA256SUMS, installed under the names a source
+# build would have, and stamped with --version. A mismatch fails the box
+# here. launch-gcp.sh verified SHA256SUMS's signature before launching.
+bootstrap_release() {
+  local dir="$KIT_ROOT/release" arch name want got listed v_server v_cli
+  case "$(uname -m)" in
+    x86_64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) say "no release binary for $(uname -m)"; return 1 ;;
+  esac
+  rm -rf "$dir"
+  mkdir -p "$dir" "$BIN_DIR" "$STAMPS" || return 1
+  curl -sSfL --retry 3 --max-time 120 "$RELEASE_URL/$RELEASE_TAG/SHA256SUMS" -o "$dir/SHA256SUMS" \
+    || { say "cannot download SHA256SUMS of $RELEASE_TAG"; return 1; }
+  for name in ravel-server ravel-cli; do
+    if [ "$name" = ravel-server ]; then want="$SERVER_SHA256"; else want="$CLI_SHA256"; fi
+    curl -sSfL --retry 3 --max-time 900 "$RELEASE_URL/$RELEASE_TAG/$name-linux-$arch" \
+      -o "$dir/$name-linux-$arch" || { say "cannot download $name-linux-$arch of $RELEASE_TAG"; return 1; }
+    got="$(sha256_of "$dir/$name-linux-$arch")"
+    listed="$(awk -v f="$name-linux-$arch" '$2 == f { print $1 }' "$dir/SHA256SUMS")"
+    [ "$got" = "$want" ] \
+      || { say "$name-linux-$arch has sha256 $got, run.toml pins $want"; return 1; }
+    [ "$listed" = "$want" ] \
+      || { say "SHA256SUMS of $RELEASE_TAG lists $name-linux-$arch as '$listed', run.toml pins $want"; return 1; }
+    install -m 0755 "$dir/$name-linux-$arch" "$BIN_DIR/$name-$SHA" || return 1
+  done
+  # --help proves each binary runs on this libc. --version is recorded as it
+  # answers: v0.32.0's binaries declare no version flag, so the digests above
+  # are the identity.
+  for name in ravel-server ravel-cli; do
+    "$BIN_DIR/$name-$SHA" --help >"$dir/$name.help" 2>&1 \
+      || { say "$name --help failed: $(head -c 300 "$dir/$name.help")"; return 1; }
+  done
+  v_server="$("$BIN_DIR/ravel-server-$SHA" --version 2>&1 | head -c 300)" || true
+  v_cli="$("$BIN_DIR/ravel-cli-$SHA" --version 2>&1 | head -c 300)" || true
+  printf 'release %s (published binaries, nothing built on the box)\n' "$RELEASE_TAG" >"$STAMPS/toolchain"
+  printf '{"source": "release", "tag": %s, "url": %s, "arch": %s, "server_sha256": %s, "cli_sha256": %s, "server_version_output": %s, "cli_version_output": %s}\n' \
+    "$(json_str "$RELEASE_TAG")" "$(json_str "$RELEASE_URL/$RELEASE_TAG")" "$(json_str "$arch")" \
+    "$(json_str "$SERVER_SHA256")" "$(json_str "$CLI_SHA256")" "$(json_str "$v_server")" \
+    "$(json_str "$v_cli")" >"$STAMPS/release"
 }
 
 bootstrap_toolchain() {
@@ -502,6 +682,9 @@ make_secrets() {
     printf '%s=%s\n' "$KIT_TENANT_TOKEN" "$TENANT" >"$TOKEN_FILE"
     printf 'Authorization: Bearer %s\n' "$KIT_TENANT_TOKEN" >"$AUTH_HEADER"
   ) || return 1
+  # --store gcs refuses any S3 setting given through the environment
+  # (ADR-3456 D6), so a GCS box exports none.
+  [ "$STORE" != gcs ] || return 0
   export RAVEL_S3_ENDPOINT="$RUSTFS_ENDPOINT" RAVEL_S3_BUCKET="$STORE_BUCKET" \
     RAVEL_S3_REGION=us-east-1 RAVEL_S3_ACCESS_KEY="$RUSTFS_ACCESS_KEY" \
     RAVEL_S3_SECRET_KEY="$RUSTFS_SECRET_KEY"
@@ -545,14 +728,56 @@ bootstrap_rustfs() {
     || return 1
 }
 
+# bootstrap_gcs: the box's secrets (the tenant token and audit key; no store
+# key, since the store is reached with the instance's own credentials) and
+# no store process.
+bootstrap_gcs() {
+  make_secrets
+}
+
+# store_qualify: `store qualify` against the run's store; on GCS its output is
+# also kept as qualify.out for the evidence.
 store_qualify() {
+  if [ "$STORE" = gcs ]; then
+    "$CLI_BIN" "${STORE_ARGS[@]}" --tenant-hash-unkeyed store qualify >"$KIT/qualify.out" 2>&1
+    local code=$?
+    cat "$KIT/qualify.out" >&2
+    return "$code"
+  fi
   "$CLI_BIN" --store s3 --tenant-hash-unkeyed store qualify
 }
 
+# sql_smoke: before the load, a server started from arm.env must answer
+# SELECT 1 on the SQL endpoint, so a binary without the SQL surface fails
+# here and not at statement 1.
+sql_smoke() {
+  local dir="$KIT/sql-smoke" w code=0
+  mkdir -p "$dir" || return 1
+  [ -n "${WINDOW_END:-}" ] || set_query_window
+  printf '{"query": "SELECT 1", "start": %s, "end": %s}\n' "$WINDOW_START" "$WINDOW_END" >"$dir/request.json"
+  start_server || return 1
+  w="$(curl -sS -o "$dir/answer.json" -w '%{http_code}' --max-time 60 -H @"$AUTH_HEADER" \
+    -H 'Content-Type: application/json' --data-binary @"$dir/request.json" "$SQL_URL" 2>"$dir/curl.err")" \
+    || code=$?
+  stop_server
+  [ "$code" = 0 ] && [ "$w" = 200 ] \
+    || { say "SELECT 1 before the load: curl exit $code, HTTP $w: $(head -c 300 "$dir/answer.json" 2>/dev/null)"; return 1; }
+}
+
 # count_objects LABEL: total objects in Ravel's bucket, kept for the evidence.
+# On GCS the listing is the objects.list pages and kit.py footprint's split of
+# them, in object-counts/LABEL.pages/ and object-counts/LABEL.json.
 count_objects() {
   local n
   mkdir -p "$KIT/object-counts"
+  if [ "$STORE" = gcs ]; then
+    gcs_list "$KIT/object-counts/$1.pages" || return 1
+    kit_py footprint "$KIT/object-counts/$1.pages"/page-*.json >"$KIT/object-counts/$1.json" || return 1
+    n="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["objects"])' \
+      "$KIT/object-counts/$1.json")" || return 1
+    printf '%s\n' "$n" >"$KIT/object-counts/$1"
+    return 0
+  fi
   rustfs_aws s3 ls "s3://$STORE_BUCKET/" --recursive --summarize >"$KIT/object-counts/$1.txt" || return 1
   n="$(sed -n 's/^[[:space:]]*Total Objects:[[:space:]]*//p' "$KIT/object-counts/$1.txt")"
   [[ "$n" =~ ^[0-9]+$ ]] || { say "no object total in the $1 listing"; return 1; }
@@ -572,8 +797,10 @@ resolve_arm_env() {
     return 0
   fi
   local preload="" flags extra=() key f code=0
-  preload="$(ls /usr/lib64/libtcmalloc.so.4 /usr/lib64/libtcmalloc.so 2>/dev/null | head -n 1)"
-  flags=(--store s3 --shards "$SHARDS" --tenant-hash-unkeyed
+  # The release binary runs as published, with no LD_PRELOAD.
+  [ "$CLOUD" = gcp ] \
+    || preload="$(ls /usr/lib64/libtcmalloc.so.4 /usr/lib64/libtcmalloc.so 2>/dev/null | head -n 1)"
+  flags=("${STORE_ARGS[@]}" --shards "$SHARDS" --tenant-hash-unkeyed
     --tenant-token-file "$TOKEN_FILE"
     --listen-http 127.0.0.1:4318 --listen-health 127.0.0.1:4319
     --memory-budget-bytes "$MEMORY_BUDGET" --audit-mode "$AUDIT_MODE")
@@ -841,7 +1068,7 @@ out_field() {
 do_load() {
   local rows objects
   timed "$KIT/load.time" 'wall=%e rss_kb=%M user=%U sys=%S' \
-    "$CLI_BIN" --store s3 --tenant-hash-unkeyed load \
+    "$CLI_BIN" "${STORE_ARGS[@]}" --tenant-hash-unkeyed load \
     --parquet "$DATASET" \
     --tenant "$TENANT" \
     --mapping "$MAPPING" \
@@ -858,7 +1085,7 @@ do_load() {
 
 do_compact() {
   timed "$KIT/compact.time" 'wall=%e rss_kb=%M' \
-    "$CLI_BIN" --store s3 --tenant-hash-unkeyed maintain compact-tenant \
+    "$CLI_BIN" "${STORE_ARGS[@]}" --tenant-hash-unkeyed maintain compact-tenant \
     --tenant "$TENANT" --signal logs --shards "$SHARDS"
 }
 
@@ -871,7 +1098,7 @@ fold_field() {
 # "objects written". The bucket's key delta is not that figure: it also
 # counts a commit record per object, so it is stamped beside it only.
 do_fold() {
-  "$CLI_BIN" --store s3 --tenant-hash-unkeyed catalog fold \
+  "$CLI_BIN" "${STORE_ARGS[@]}" --tenant-hash-unkeyed catalog fold \
     --tenant "$TENANT" --shards "$SHARDS" --signal logs --writers-stopped \
     >"$KIT/fold.out" 2>&1 || return 1
   local seal entries watermark buckets part before after written keys ok
@@ -900,8 +1127,40 @@ do_fold() {
 }
 
 do_declare() {
-  "$CLI_BIN" --store s3 --tenant-hash-unkeyed typed-attr-column set "$TENANT" \
+  "$CLI_BIN" "${STORE_ARGS[@]}" --tenant-hash-unkeyed typed-attr-column set "$TENANT" \
     --from-mapping "$MAPPING"
+}
+
+# check_declared (GCS runs): typed-attr-column show must report the tenant's
+# declared columns, as many as the mapping has entries; the count is stamped.
+check_declared() {
+  local n want
+  "$CLI_BIN" "${STORE_ARGS[@]}" --tenant-hash-unkeyed typed-attr-column show "$TENANT" \
+    >"$KIT/declared.out" 2>&1 || { say "typed-attr-column show failed: $(head -c 300 "$KIT/declared.out")"; return 1; }
+  n="$(sed -n 's/^tenant .* declares \([0-9][0-9]*\) typed attribute column(s).*$/\1/p' "$KIT/declared.out")"
+  [[ "$n" =~ ^[0-9]+$ ]] || { say "typed-attr-column show reports no declared column count: $(head -c 300 "$KIT/declared.out")"; return 1; }
+  want="$(grep -c '^\[\[' "$MAPPING")"
+  mkdir -p "$STAMPS"
+  printf '{"tenant": %s, "count": %s, "mapping_entries": %s}\n' "$(json_str "$TENANT")" "$n" \
+    "$(json_num "$want")" >"$STAMPS/declared_columns"
+  [ "$n" = "$want" ] || { say "the tenant declares $n columns, the mapping has $want entries"; return 1; }
+}
+
+# stamp_fetch_policy (GCS runs): the logs fetch policy every benchmark server
+# start resolved, which must be one line per log and the same in each.
+stamp_fetch_policy() {
+  local logs
+  [ -n "${BENCHMARK_SERVER_LOGS:-}" ] || { say "no benchmark server log to read the fetch policy from"; return 1; }
+  IFS=, read -r -a logs <<<"$BENCHMARK_SERVER_LOGS"
+  kit_py fetch-policy "${logs[@]}" >"$STAMPS/fetch_policy"
+}
+
+# store_footprint (GCS runs): the store bucket's objects and bytes by key
+# class at the end of the load window, stamped as store_footprint.
+store_footprint() {
+  count_objects after-declare || return 1
+  mkdir -p "$STAMPS"
+  cp "$KIT/object-counts/after-declare.json" "$STAMPS/store_footprint"
 }
 
 # set_query_window: the window every request body names, set once so the
@@ -1387,7 +1646,12 @@ write_stamps() {
   printf '%s\n' "$RUN_ID" >"$STAMPS/run_id"
   for lane in $LANES; do lanes_json="${lanes_json:+$lanes_json, }$(json_str "$lane")"; done
   printf '[%s]\n' "$lanes_json" >"$STAMPS/lanes"
-  itype="$(imds_get instance-type 2>/dev/null)" || itype="unknown"
+  if [ "$CLOUD" = gcp ]; then
+    itype="$(gce_metadata instance/machine-type 2>/dev/null)" || itype="unknown"
+    itype="${itype##*/}"
+  else
+    itype="$(imds_get instance-type 2>/dev/null)" || itype="unknown"
+  fi
   cores="$(nproc)"
   mem="$(awk '/^MemTotal:/ { print $2 }' "$MEMINFO")"
   cpu="$(awk -F': ' '/^model name/ { print $2; exit }' "$CPUINFO")"
@@ -1398,9 +1662,16 @@ write_stamps() {
     "$(json_str "$cpu")" "$(json_str "$(uname -m)")" >"$STAMPS/hardware"
   tool="$(cat "$STAMPS/toolchain" 2>/dev/null)" || tool=""
   [ -n "$tool" ] || { say "no toolchain stamp"; return 1; }
-  printf '{"store": "rustfs", "endpoint": %s, "url": %s, "sha256": %s, "version": %s}\n' \
-    "$(json_str "$RUSTFS_ENDPOINT")" "$(json_str "$RUSTFS_URL")" "$(json_str "$RUSTFS_SHA256")" \
-    "$(json_str "$(head -n 1 "$KIT/rustfs.version" 2>/dev/null)")" >"$STAMPS/backend"
+  if [ "$STORE" = gcs ]; then
+    printf '{"store": "gcs", "bucket": %s, "identity": %s, "endpoint": %s, "version": "gcs"}\n' \
+      "$(json_str "$STORE_BUCKET")" "$(json_str "gs://$STORE_BUCKET")" "$(json_str "$GCS_API")" \
+      >"$STAMPS/backend"
+    stamp_fetch_policy || return 1
+  else
+    printf '{"store": "rustfs", "endpoint": %s, "url": %s, "sha256": %s, "version": %s}\n' \
+      "$(json_str "$RUSTFS_ENDPOINT")" "$(json_str "$RUSTFS_URL")" "$(json_str "$RUSTFS_SHA256")" \
+      "$(json_str "$(head -n 1 "$KIT/rustfs.version" 2>/dev/null)")" >"$STAMPS/backend"
+  fi
   printf '{"dataset_url": %s, "dataset_sha256": %s, "corpus_sha256": %s, "mapping_sha256": %s, "statements": %s}\n' \
     "$(json_str "$DATASET_URL")" "$(json_str "$(cat "$KIT/dataset.sha256" 2>/dev/null)")" \
     "$(json_str "$(sha256_of "$CORPUS")")" "$(json_str "$(sha256_of "$MAPPING" 2>/dev/null)")" \
@@ -1448,6 +1719,8 @@ write_results() {
     bands="$bands" sections="${sections%,}" provenance="$STAMPS" arm="$ARM" sha="$SHA" \
     binary="$SERVER_BIN" tenant="$TENANT" phases_json="$KIT/phases.json" healthz="$KIT/healthz.json" \
     ${extra[@]+"${extra[@]}"} || return 1
+  # No lanes (cloud gcp): no band is judged here, and DONE says bands=none.
+  [ -n "$LANES" ] || return 0
   kit_py absolute "$ARM" "$KIT/results.json" >/dev/null || code=$?
   case "$code" in
     0) BANDS_VERDICT=pass ;;
@@ -1504,7 +1777,8 @@ write_evidence() {
   fi
   rm -f "$KIT/kernel.err"
   for f in kernel.log server-*.log rustfs.log run.log progress.log arm.env load.out fold.out load.time \
-    compact.time object-counts stamps verify out phases.json burst-start.json burst-end.json; do
+    compact.time object-counts stamps verify out phases.json burst-start.json burst-end.json \
+    $([ "$CLOUD" != gcp ] || echo qualify.out declared.out sql-smoke user-data.log); do
     # shellcheck disable=SC2086 # globs expand here on purpose
     for g in $(cd "$KIT" && ls -d $f 2>/dev/null); do items="$items $g"; done
   done
@@ -1541,21 +1815,33 @@ main() {
   done
   step burst-start record_burst start
   step packages bootstrap_packages
-  step toolchain bootstrap_toolchain
-  step source bootstrap_source
-  step dataset-start start_dataset_download
-  step build bootstrap_build
-  step dataset wait_dataset
-  step rustfs bootstrap_rustfs
+  if [ "$CLOUD" = gcp ]; then
+    step dataset-start start_dataset_download
+    step release bootstrap_release
+    step dataset wait_dataset
+    step store bootstrap_gcs
+  else
+    step toolchain bootstrap_toolchain
+    step source bootstrap_source
+    step dataset-start start_dataset_download
+    step build bootstrap_build
+    step dataset wait_dataset
+    step rustfs bootstrap_rustfs
+  fi
   step arm-env resolve_arm_env
   step arm-env-load load_arm_env
   step qualify store_qualify
+  [ "$STORE" != gcs ] || step sql-smoke sql_smoke
   step objects-before-load count_objects before-load
   step load do_load
   step objects-after-load count_objects after-load
   step compact do_compact
   step fold do_fold
   step declare do_declare
+  if [ "$STORE" = gcs ]; then
+    step declared check_declared
+    step footprint store_footprint
+  fi
   step verify do_verify
   run_phases
   step healthz do_healthz_check

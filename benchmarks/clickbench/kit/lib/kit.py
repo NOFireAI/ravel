@@ -126,6 +126,27 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                the load step's /usr/bin/time output; a
                                missing or unparsable figure is null with a
                                reason
+  fetch-policy LOG...          print the logs fetch policy every server log
+                               resolved, refusing a log without exactly one
+                               such line or two logs that disagree
+  gcp-names RUN_ID STORE_BUCKET_PREFIX
+                               print a GCP run's instance name, store bucket
+                               and label value, one per line
+  gcs-next-page PAGE           print a GCS objects.list page's
+                               nextPageToken, URL-encoded; empty on the last
+  footprint PAGE...            print the store bucket's objects and bytes from
+                               its objects.list pages as JSON, by tenant
+                               prefix and key class
+  load-window PROGRESS_LOG     print the load window's step seconds (load,
+                               compact, fold, declare) and their sum
+  upstream-result RESULTS PROGRESS_LOG
+                               print a GCP run as one ClickBench results file
+  check-prereg PREREG          refuse a pre-registration that does not name
+                               every figure prereg judges exactly once
+  prereg PREREG RESULTS PROGRESS_LOG UPSTREAM STORE_BUCKET
+                               judge a GCP run against its pre-registration;
+                               exit 1 on a miss, 2 when a figure is missing
+                               or emitted twice
   memory-gap BANDS A.json A.tgz B.json B.tgz RUN_TOML
                                judge ADR-1170's memory gap (allocated minus
                                the unique tracked bytes) on arm B's gated ok
@@ -154,6 +175,7 @@ three. The kit's own blocks sit beside them: provenance, totals, error_pooled
 latency per port and heartbeat age; optional), phases and bands.
 """
 
+import calendar
 import decimal
 import hashlib
 import json
@@ -275,14 +297,47 @@ RUN_OPTIONAL = (
     "band_sections", "window_hours", "audit_text", "expected_statements",
     "fold_min_entry_ratio", "query_timeout_s", "ami", "subnet",
     "security_group", "key_name", "server_flags_a", "server_flags_b",
-    "healthz_phases", "box_speed_band",
+    "healthz_phases", "box_speed_band", "cloud", "store",
 ) + tuple(k for k, _ in RUN_DEFAULTS)
+# Where a run's boxes run (`cloud`) and the store Ravel writes to there
+# (`store`). The AWS kit (launch.sh, two arms built from source, loopback
+# RustFS) is the default; the GCP path (launch-gcp.sh) runs one arm of a
+# published release against a GCS bucket.
+CLOUD_STORES = {"aws": "rustfs", "gcp": "gcs"}
+# A GCP run.toml's keys: GCP_REQUIRED must be present, GCP_OPTIONAL may be,
+# and any other key, a table among them, is refused. It has no lanes, [bands]
+# or band_sections: a single arm has no relative bands, and its
+# pre-registered bands live in the file `prereg` names (kit.py prereg).
+GCP_REQUIRED = (
+    "cloud", "store", "release_tag", "sha_a", "ravel_server_sha256", "ravel_cli_sha256",
+    "phases", "project", "region", "zone", "instance_type", "image_family", "image_project",
+    "service_account", "bucket", "prefix", "store_bucket_prefix", "tenant", "shards", "corpus",
+    "mapping", "dataset_url", "dataset_sha256", "rows_expected", "memory_budget_bytes",
+    "audit_mode", "prereg",
+)
+GCP_OPTIONAL = (
+    "boot_disk_gb", "release_url", "window_hours", "audit_text", "expected_statements",
+    "fold_min_entry_ratio", "query_timeout_s", "server_flags_a", "healthz_phases",
+) + tuple(k for k, _ in RUN_DEFAULTS)
+GCP_DEFAULT_BOOT_DISK_GB = 100
+GCP_MIN_BOOT_DISK_GB = 50
+DEFAULT_RELEASE_URL = "https://github.com/NOFireAI/ravel/releases/download"
+RELEASE_TAG_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
+GCP_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*[a-z0-9]$")
+SERVICE_ACCOUNT_RE = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]@([a-z][a-z0-9-]+)"
+                                r"\.iam\.gserviceaccount\.com$")
+# A store bucket is <store_bucket_prefix>-<run id, lowercased, without its
+# "clickbench-" head>, at most 63 characters (gcp-names).
+STORE_BUCKET_PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$")
+BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")
+RUN_ID_RE = re.compile(r"^clickbench-([0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+)$")
 # Extra ravel-server flags per arm, appended by box/run.sh after the flags
 # KIT_SET_FLAGS names; an entry repeating one of those is refused.
 ARM_FLAG_KEYS = {"A": "server_flags_a", "B": "server_flags_b"}
 KIT_SET_FLAGS = (
     "--store", "--shards", "--listen-http", "--listen-health", "--memory-budget-bytes",
     "--audit-mode", "--audit-text", "--tenant-token-file", "--tenant-hash-unkeyed",
+    "--gcs-bucket",
 )
 # For each STAMPED_SETTINGS value, the flag that sets it directly and, for the
 # two SQL pools, the flag on the other pool that resolve_performance_defaults
@@ -482,8 +537,24 @@ def band_sections(data):
     return sections
 
 
+def run_cloud(data, path):
+    """The run's cloud, after refusing a cloud or store the kit does not run
+    or a store that cloud does not run."""
+    cloud = data.get("cloud", "aws")
+    if cloud not in CLOUD_STORES:
+        raise Refusal("run.toml %s: cloud must be one of %s, got %r"
+                      % (path, ", ".join(sorted(CLOUD_STORES)), cloud))
+    store = data.get("store", CLOUD_STORES[cloud])
+    if store != CLOUD_STORES[cloud]:
+        raise Refusal("run.toml %s: cloud %s runs store %s, got store %r"
+                      % (path, cloud, CLOUD_STORES[cloud], store))
+    return cloud
+
+
 def check_run(path):
     data = parse_toml(path)
+    if run_cloud(data, path) == "gcp":
+        return check_run_gcp(path, data)
     tables = sorted(k for k, v in data.items() if isinstance(v, dict))
     unknown = sorted(k for k, v in data.items() if not isinstance(v, dict)
                      and k not in RUN_REQUIRED and k not in RUN_OPTIONAL)
@@ -521,23 +592,7 @@ def check_run(path):
     if "benchmark" not in data["phases"]:
         raise Refusal("run.toml %s: phases must include benchmark: results.json's statements "
                       "come from it" % path)
-    wrong = []
-    for key, default in RUN_DEFAULTS:
-        v = data.get(key, default)
-        if isinstance(default, bool):
-            if not isinstance(v, bool):
-                wrong.append("%s must be true or false, got %r" % (key, v))
-        elif isinstance(default, str):
-            if not isinstance(v, str) or not v:
-                wrong.append("%s must be a non-empty string, got %r" % (key, v))
-        else:
-            least = 0 if key == "q29_probe_warmup" else 1
-            if not isinstance(v, int) or isinstance(v, bool) or v < least:
-                wrong.append("%s must be a whole number of at least %d, got %r" % (key, least, v))
-    if wrong:
-        raise Refusal("run.toml %s: %s" % (path, "; ".join(wrong)))
-    if "perf" in data["phases"] and data.get("perf_record") is not True:
-        raise Refusal("run.toml %s: phase perf needs perf_record = true" % path)
+    _check_run_phase_keys(path, data)
     for lane in data["lanes"]:
         if lane not in LANE_BANDS:
             raise Refusal("run.toml %s: lane %r is not one the kit runs (%s)"
@@ -583,6 +638,123 @@ def check_run(path):
     if not isinstance(data.get("box_speed_band", True), bool):
         raise Refusal("run.toml %s: box_speed_band must be true or false, got %r"
                       % (path, data["box_speed_band"]))
+    sampled = healthz_phases(data)
+    if (not isinstance(sampled, list) or len(set(map(str, sampled))) != len(sampled)
+            or any(p not in HEALTHZ_PHASES for p in sampled)):
+        raise Refusal("run.toml %s: healthz_phases must be an array of distinct phases from "
+                      "%s, got %r" % (path, ", ".join(HEALTHZ_PHASES), sampled))
+    return data
+
+
+def _check_run_phase_keys(path, data):
+    """Refuse a RUN_DEFAULTS key of the wrong type, and phase perf without
+    perf_record = true."""
+    wrong = []
+    for key, default in RUN_DEFAULTS:
+        v = data.get(key, default)
+        if isinstance(default, bool):
+            if not isinstance(v, bool):
+                wrong.append("%s must be true or false, got %r" % (key, v))
+        elif isinstance(default, str):
+            if not isinstance(v, str) or not v:
+                wrong.append("%s must be a non-empty string, got %r" % (key, v))
+        else:
+            least = 0 if key == "q29_probe_warmup" else 1
+            if not isinstance(v, int) or isinstance(v, bool) or v < least:
+                wrong.append("%s must be a whole number of at least %d, got %r" % (key, least, v))
+    if wrong:
+        raise Refusal("run.toml %s: %s" % (path, "; ".join(wrong)))
+    if "perf" in data["phases"] and data.get("perf_record") is not True:
+        raise Refusal("run.toml %s: phase perf needs perf_record = true" % path)
+
+
+def _positive_int(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def check_run_gcp(path, data):
+    """A GCP run.toml (cloud = "gcp"): one arm, the release_tag's published
+    binaries, store gcs. Refuses a key or table outside GCP_REQUIRED and
+    GCP_OPTIONAL by name, so an AWS-only key (sha_b, lanes, [bands],
+    instance_profile, rustfs_url) is never silently ignored."""
+    unknown = sorted(k for k in data if k not in GCP_REQUIRED and k not in GCP_OPTIONAL)
+    if unknown:
+        raise Refusal("run.toml %s: unknown key(s) or table(s) for cloud gcp: %s"
+                      % (path, ", ".join(unknown)))
+    missing = [k for k in GCP_REQUIRED if data.get(k) in (None, "")]
+    if missing:
+        raise Refusal("run.toml %s: missing required key(s): %s" % (path, ", ".join(missing)))
+    if not SHA_RE.match(str(data["sha_a"])):
+        raise Refusal("run.toml %s: sha_a must be a full 40-character commit, got %r"
+                      % (path, data["sha_a"]))
+    for key in ("dataset_sha256", "ravel_server_sha256", "ravel_cli_sha256"):
+        if not SHA256_RE.match(str(data[key])):
+            raise Refusal("run.toml %s: %s must be 64 lowercase hex digits, got %r"
+                          % (path, key, data[key]))
+    if not RELEASE_TAG_RE.match(str(data["release_tag"])):
+        raise Refusal("run.toml %s: release_tag must look like v1.2.3, got %r"
+                      % (path, data["release_tag"]))
+    phases = data["phases"]
+    if not isinstance(phases, list) or not phases:
+        raise Refusal("run.toml %s: phases must be a non-empty array" % path)
+    for phase in phases:
+        if phase not in KNOWN_PHASES:
+            raise Refusal("run.toml %s: phase %r is not one box/run.sh implements (%s)"
+                          % (path, phase, ", ".join(KNOWN_PHASES)))
+    if "benchmark" not in phases:
+        raise Refusal("run.toml %s: phases must include benchmark: results.json's statements "
+                      "come from it" % path)
+    _check_run_phase_keys(path, data)
+    for key in ("project", "region", "zone", "image_family", "image_project", "instance_type"):
+        if not isinstance(data[key], str) or not GCP_NAME_RE.match(data[key]):
+            raise Refusal("run.toml %s: %s %r is not a GCP name" % (path, key, data[key]))
+    if not data["zone"].startswith(data["region"] + "-"):
+        raise Refusal("run.toml %s: zone %s is not in region %s"
+                      % (path, data["zone"], data["region"]))
+    m = SERVICE_ACCOUNT_RE.match(str(data["service_account"]))
+    if not m or m.group(1) != data["project"]:
+        raise Refusal("run.toml %s: service_account %r is not a service account email in "
+                      "project %s" % (path, data["service_account"], data["project"]))
+    if not BUCKET_RE.match(str(data["bucket"])):
+        raise Refusal("run.toml %s: bucket %r is not a bucket name" % (path, data["bucket"]))
+    if not STORE_BUCKET_PREFIX_RE.match(str(data["store_bucket_prefix"])):
+        raise Refusal("run.toml %s: store_bucket_prefix %r must be 3 to 32 lowercase letters, "
+                      "digits and hyphens" % (path, data["store_bucket_prefix"]))
+    if not re.match(r"^[A-Za-z0-9._/-]+$", str(data["prefix"])):
+        raise Refusal("run.toml %s: prefix %r may hold only letters, digits, . _ / -"
+                      % (path, data["prefix"]))
+    for key in ("shards", "memory_budget_bytes", "rows_expected"):
+        if not _positive_int(data[key]):
+            raise Refusal("run.toml %s: %s must be a whole number above 0" % (path, key))
+    disk = data.get("boot_disk_gb", GCP_DEFAULT_BOOT_DISK_GB)
+    if not _positive_int(disk) or disk < GCP_MIN_BOOT_DISK_GB:
+        raise Refusal("run.toml %s: boot_disk_gb must be a whole number of at least %d "
+                      "(the dataset alone is 14.8 GB)" % (path, GCP_MIN_BOOT_DISK_GB))
+    url = data.get("release_url", DEFAULT_RELEASE_URL)
+    if not isinstance(url, str) or not re.match(r"^https://[A-Za-z0-9./_-]+$", url):
+        raise Refusal("run.toml %s: release_url must be an https URL, got %r" % (path, url))
+    hours = data.get("window_hours", DEFAULT_WINDOW_HOURS)
+    if not _positive_int(hours):
+        raise Refusal("run.toml %s: window_hours must be a whole number above 0" % path)
+    if data["audit_mode"] not in ("off", "required"):
+        raise Refusal("run.toml %s: audit_mode must be off or required" % path)
+    if data.get("audit_text", "redacted") not in ("redacted", "plaintext"):
+        raise Refusal("run.toml %s: audit_text must be redacted or plaintext" % path)
+    if data.get("audit_text") == "plaintext" and data["audit_mode"] != "required":
+        raise Refusal("run.toml %s: audit_text plaintext needs audit_mode required "
+                      "(the server refuses it otherwise)" % path)
+    flags = data.get("server_flags_a", [])
+    if not isinstance(flags, list) or not all(isinstance(f, str) and f for f in flags):
+        raise Refusal("run.toml %s: server_flags_a must be an array of non-empty strings, got %r"
+                      % (path, flags))
+    for f in flags:
+        for kit_flag in KIT_SET_FLAGS:
+            if f == kit_flag or f.startswith(kit_flag + "="):
+                raise Refusal("run.toml %s: server_flags_a repeats %s, which the kit sets itself"
+                              % (path, kit_flag))
+        if f.startswith("--s3-"):
+            raise Refusal("run.toml %s: server_flags_a holds %s, which --store gcs refuses"
+                          % (path, f))
     sampled = healthz_phases(data)
     if (not isinstance(sampled, list) or len(set(map(str, sampled))) != len(sampled)
             or any(p not in HEALTHZ_PHASES for p in sampled)):
@@ -2416,6 +2588,33 @@ def parse_settings(log_text):
     return settings, unreadable
 
 
+FETCH_POLICY_RE = re.compile(r' logs fetch policy resolved policy="([^"]*)" '
+                             r'policy_source="([^"]*)" profile=(\S+)')
+
+
+def fetch_policy(logs):
+    """The logs fetch policy, its source and cost profile, from each server
+    log's one `logs fetch policy resolved` line; every log must carry exactly
+    one and all must agree."""
+    ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    first = None
+    for log in logs:
+        found = [m.groups() for m in (FETCH_POLICY_RE.search(ansi.sub("", l))
+                                      for l in open(log, errors="replace")) if m]
+        if len(found) != 1:
+            raise Refusal("server log %s carries the fetch policy line %d times, not once"
+                          % (log, len(found)))
+        if first is None:
+            first = found[0]
+        elif found[0] != first:
+            raise Refusal("server log %s resolved fetch policy %r, the first resolved %r"
+                          % (log, found[0], first))
+    if first is None:
+        raise Refusal("fetch-policy: no server log")
+    return {"policy": first[0], "policy_source": first[1], "profile": first[2],
+            "logs": len(logs)}
+
+
 def server_settings(logs):
     """The settings every benchmark server start resolved. Each start must
     resolve every stamped setting exactly once, and each restart the same
@@ -2488,7 +2687,13 @@ def assemble(args):
                 "arm", "sha", "binary", "tenant", "phases_json"):
         if key not in kv:
             raise Refusal("assemble: missing %s=" % key)
-    sections = band_sections({"band_sections": kv["sections"].split(",")})
+    # An empty bands= and sections= is a run with no lanes (cloud gcp): no
+    # band file is judged on the box, and its pre-registration is judged by
+    # kit.py prereg after fetch.
+    if kv["bands"] == "" and kv["sections"] == "":
+        sections = []
+    else:
+        sections = band_sections({"band_sections": kv["sections"].split(",")})
     index = []
     for line in open(kv["index"]):
         n, sid, expected = line.rstrip("\n").split("\t")
@@ -2511,7 +2716,7 @@ def assemble(args):
         "failed": [f["id"] for f in failed],
     }
     lanes = []
-    for item in kv["bands"].split(","):
+    for item in (kv["bands"].split(",") if sections else []):
         lane, _, path = item.partition(":")
         if not lane or not path:
             raise Refusal("assemble: bands= takes lane:path[,lane:path], got %r" % item)
@@ -2680,6 +2885,360 @@ def validate(path):
     return r
 
 
+# --- GCP path: names, store listing, upstream result, pre-registration -----
+
+def gcp_names(run_id, store_bucket_prefix):
+    """The run's instance name, store bucket and label value, each derived
+    from the run id alone, so launch-gcp.sh and teardown-gcp.sh name the same
+    resources without a record of them."""
+    m = RUN_ID_RE.match(run_id)
+    if not m:
+        raise Refusal("gcp-names: %r is not a kit run id" % run_id)
+    if not STORE_BUCKET_PREFIX_RE.match(store_bucket_prefix):
+        raise Refusal("gcp-names: %r is not a store bucket prefix" % store_bucket_prefix)
+    tail = m.group(1).lower()
+    names = ("ravel-clickbench-" + tail, store_bucket_prefix + "-" + tail, run_id.lower())
+    for n in names:
+        if len(n) > 63:
+            raise Refusal("gcp-names: %s is longer than 63 characters" % n)
+    return names
+
+
+def _strict_json(path):
+    """JSON from PATH, refusing an object that names a key twice: a figure
+    emitted twice must not be read as whichever came last."""
+    def pairs(items):
+        seen = {}
+        for k, v in items:
+            if k in seen:
+                raise Refusal("%s: key %r appears twice in one object" % (path, k))
+            seen[k] = v
+        return seen
+    try:
+        with open(path) as f:
+            return json.load(f, object_pairs_hook=pairs)
+    except (OSError, ValueError) as e:
+        raise Refusal("%s: not readable JSON: %s" % (path, e))
+
+
+def gcs_next_page(path):
+    """The nextPageToken of one GCS JSON API objects.list page, URL-encoded
+    for the next request; empty on the last page."""
+    page = _strict_json(path)
+    if not isinstance(page, dict) or "error" in page:
+        raise Refusal("%s: not an objects.list page: %s" % (path, str(page)[:300]))
+    token = page.get("nextPageToken")
+    if token is None:
+        return ""
+    if not isinstance(token, str) or not token:
+        raise Refusal("%s: nextPageToken %r is not a token" % (path, token))
+    from urllib.parse import quote
+    return quote(token, safe="")
+
+
+def _key_class(name):
+    """(scope, class) of one store key: ("t/<hash>", "<signal>/<kind>") for a
+    tenant key such as t/<hash>/l/l0/..., ("sys", "sys/<x>") for a sys/ key,
+    ("other", <first segment>) for anything else."""
+    parts = name.split("/")
+    if parts[0] == "t" and len(parts) >= 3:
+        return "t/" + parts[1], "/".join(parts[2:4])
+    if parts[0] == "sys":
+        return "sys", "/".join(parts[:2])
+    return "other", parts[0]
+
+
+def footprint(paths):
+    """Objects and bytes in Ravel's store bucket from its objects.list pages,
+    split by key class: every tenant prefix t/<hash>/ (its bytes are the
+    tenant's whole footprint, ClickBench's data_size basis; its l/l0 class is
+    the data objects), sys/ (qualification records and probes) and anything
+    else. A key listed twice is a paging error and refused."""
+    seen = set()
+    out = {"basis": "every key in the store bucket, by objects.list; a tenant's bytes are all "
+                    "of t/<hash>/, its l/l0 class is the data objects",
+           "objects": 0, "bytes": 0, "tenants": {}, "sys": {}, "other": {}}
+    for path in paths:
+        page = _strict_json(path)
+        if not isinstance(page, dict) or "error" in page:
+            raise Refusal("%s: not an objects.list page: %s" % (path, str(page)[:300]))
+        for item in page.get("items", []):
+            name, size = item.get("name"), item.get("size")
+            if not isinstance(name, str) or not re.match(r"^[0-9]+$", str(size)):
+                raise Refusal("%s: item %r has no name and size" % (path, item))
+            if name in seen:
+                raise Refusal("%s: %s is listed twice" % (path, name))
+            seen.add(name)
+            size = int(size)
+            out["objects"] += 1
+            out["bytes"] += size
+            scope, cls = _key_class(name)
+            if scope.startswith("t/"):
+                t = out["tenants"].setdefault(scope[2:], {"objects": 0, "bytes": 0, "classes": {}})
+                t["objects"] += 1
+                t["bytes"] += size
+                bucket = t["classes"].setdefault(cls, {"objects": 0, "bytes": 0})
+            else:
+                bucket = out[scope].setdefault(cls, {"objects": 0, "bytes": 0})
+            bucket["objects"] += 1
+            bucket["bytes"] += size
+    return out
+
+
+def _one_tenant(fp, where):
+    tenants = (fp or {}).get("tenants")
+    if not isinstance(tenants, dict) or len(tenants) != 1:
+        raise Refusal("%s: store_footprint holds %s tenant prefixes, not one (two runs in one "
+                      "bucket, or no load)" % (where, len(tenants) if isinstance(tenants, dict)
+                                               else "no"))
+    return list(tenants.values())[0]
+
+
+LOAD_WINDOW_STEPS = ("load", "compact", "fold", "declare")
+STAMP_RE = re.compile(r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z) (.*)$")
+
+
+def _stamp_seconds(text):
+    return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def progress_stamps(path, line):
+    """The UTC times of every progress.log line whose text is LINE."""
+    found = []
+    try:
+        lines = open(path).read().splitlines()
+    except OSError as e:
+        raise Refusal("cannot read %s: %s" % (path, e))
+    for raw in lines:
+        m = STAMP_RE.match(raw)
+        if m and m.group(2) == line:
+            found.append(m.group(1))
+    return found
+
+
+def _progress_once(path, line):
+    found = progress_stamps(path, line)
+    if len(found) != 1:
+        raise Refusal("%s carries `%s` %d times, not once" % (path, line, len(found)))
+    return found[0]
+
+
+def load_window(path):
+    """Seconds each of the load window's steps took, from progress.log's
+    start and done stamps (each exactly once), and their sum: the figure the
+    upstream result's load_time carries. The window is the ravel-cli load,
+    compaction, fold and declaration, what the ClickBench entry's ./load
+    times; the store listings between them are not in it."""
+    steps = {}
+    for step in LOAD_WINDOW_STEPS:
+        start = _stamp_seconds(_progress_once(path, "step=%s state=start" % step))
+        done = _stamp_seconds(_progress_once(path, "step=%s state=done" % step))
+        if done < start:
+            raise Refusal("%s: step %s is done before it starts" % (path, step))
+        steps[step] = done - start
+    return {"steps": steps, "total_s": sum(steps.values())}
+
+
+def _statement_number(sid):
+    m = re.match(r"^q([0-9]{2})_", str(sid))
+    if not m:
+        raise Refusal("statement id %r carries no qNN_ number" % sid)
+    return int(m.group(1))
+
+
+def _round3(v):
+    return None if v is None else round(float(v), 3)
+
+
+def upstream_result(results_path, progress_path, expected=43):
+    """results.json and progress.log as one ClickBench results file: 43
+    [cold, hot, hot] triples in seconds (null for a try that did not
+    answer), load_time from load_window, data_size the tenant's bytes in the
+    store footprint, and concurrent_qps and concurrent_error_ratio the
+    concurrent phase's pooled figures (the mean of the rounds' QPS and all
+    rounds' failed calls over all their calls)."""
+    _strict_json(results_path)
+    r = validate(results_path)
+    p = r["provenance"]
+    rows = {}
+    for e in r["entries"] + r["failed"]:
+        n = _statement_number(e["id"])
+        if n in rows:
+            raise Refusal("%s: statement %d appears twice" % (results_path, n))
+        tries = e.get("tries_ms")
+        if not isinstance(tries, list) or len(tries) != 3:
+            raise Refusal("%s: statement %s has no three tries_ms" % (results_path, e["id"]))
+        rows[n] = [_round3(t / 1000.0) if t is not None else None for t in tries]
+    if sorted(rows) != list(range(1, expected + 1)):
+        raise Refusal("%s: statements %s, not q01 to q%02d"
+                      % (results_path, sorted(rows), expected))
+    conc = r.get("concurrent")
+    if not isinstance(conc, dict):
+        raise Refusal("%s: no concurrent block: the concurrent phase did not run" % results_path)
+    pooled = conc["pooled"]
+    tenant = _one_tenant(p.get("store_footprint"), results_path)
+    machine = (p.get("hardware") or {}).get("instance_type")
+    if not machine or not MACHINE_RE.match(str(machine)):
+        raise Refusal("%s: hardware.instance_type %r is not a machine" % (results_path, machine))
+    started = _progress_once(progress_path, "step=phase-benchmark state=start")
+    return {
+        "system": "Ravel",
+        "date": started[:10],
+        "machine": machine,
+        "cluster_size": 1,
+        "proprietary": "no",
+        "hardware": "cpu",
+        "tuned": "no",
+        "tags": ["Rust", "column-oriented", "GCS"],
+        "load_time": int(round(load_window(progress_path)["total_s"])),
+        "data_size": tenant["bytes"],
+        "concurrent_qps": _round3(pooled["qps_pooled"]),
+        "concurrent_error_ratio": _round3(pooled["error_ratio_weighted"]),
+        "result": [rows[n] for n in range(1, expected + 1)],
+    }
+
+
+class _Missing(Exception):
+    pass
+
+
+def _dig(d, *keys):
+    for k in keys:
+        if not isinstance(d, dict) or k not in d or d[k] is None:
+            raise _Missing(".".join(str(x) for x in keys))
+        d = d[k]
+    return d
+
+
+def _prereg_figures(r, up, store_bucket):
+    """name -> function giving the measured value; raising _Missing when the
+    run did not produce it."""
+    p = r["provenance"]
+
+    def tenant_class(cls, field):
+        def get():
+            t = _one_tenant(_dig(p, "store_footprint"), "results.json")
+            return _dig(t, "classes", cls, field)
+        return get
+
+    def nulls():
+        return sum(1 for row in _dig(up, "result") for v in row if v is None)
+
+    def minus(a, b):
+        return lambda: a() - b()
+
+    written = lambda: _dig(p, "fold", "objects_written_by_load")
+    return {
+        "rows_written": lambda: _dig(p, "row_count", "load_rows_written"),
+        "count_star": lambda: _dig(p, "row_count", "count_star"),
+        "statements_answered": lambda: _dig(r, "totals", "answered"),
+        "null_tries": nulls,
+        "benchmark_error_ratio": lambda: _dig(r, "error_pooled", "ratio"),
+        "data_size_bytes": lambda: _dig(up, "data_size"),
+        "l0_objects": tenant_class("l/l0", "objects"),
+        "l0_objects_minus_objects_written": minus(tenant_class("l/l0", "objects"), written),
+        "fold_entries_minus_objects_written": minus(lambda: _dig(p, "fold", "entry_count"),
+                                                    written),
+        "declared_columns": lambda: _dig(p, "declared_columns", "count"),
+        "load_time_s": lambda: _dig(up, "load_time"),
+        "cold_sum_s": lambda: _dig(r, "totals", "cold_sum_s"),
+        "hot_sum_s": lambda: _dig(r, "totals", "hot_sum_s"),
+        "concurrent_qps": lambda: _dig(r, "concurrent", "pooled", "qps_pooled"),
+        "concurrent_error_ratio": lambda: _dig(r, "concurrent", "pooled",
+                                               "error_ratio_weighted"),
+        "store": lambda: _dig(p, "backend", "store"),
+        "store_identity": lambda: _dig(p, "backend", "identity"),
+        "fold_precondition": lambda: _dig(p, "fold", "precondition"),
+        "fetch_policy": lambda: _dig(p, "fetch_policy", "policy"),
+        "fetch_policy_source": lambda: _dig(p, "fetch_policy", "policy_source"),
+        "binary_source": lambda: _dig(p, "release", "source"),
+        "release_tag": lambda: _dig(p, "release", "tag"),
+        "ravel_server_sha256": lambda: _dig(p, "release", "server_sha256"),
+        "ravel_cli_sha256": lambda: _dig(p, "release", "cli_sha256"),
+        "machine": lambda: _dig(p, "hardware", "instance_type"),
+    }
+
+
+PREREG_FIGURES = (
+    "rows_written", "count_star", "statements_answered", "null_tries", "benchmark_error_ratio",
+    "data_size_bytes", "l0_objects", "l0_objects_minus_objects_written",
+    "fold_entries_minus_objects_written", "declared_columns", "load_time_s", "cold_sum_s",
+    "hot_sum_s", "concurrent_qps", "concurrent_error_ratio", "store", "store_identity",
+    "fold_precondition", "fetch_policy", "fetch_policy_source", "binary_source", "release_tag",
+    "ravel_server_sha256", "ravel_cli_sha256", "machine",
+)
+
+
+def check_prereg(path):
+    """A pre-registration file: one [figures] table naming each of
+    PREREG_FIGURES once, as an exact value or a [low, high] band."""
+    data = parse_toml(path)
+    unknown = [k for k in data if k != "figures"]
+    if unknown:
+        raise Refusal("%s: unknown key(s) or table(s) %s; every band sits under [figures]"
+                      % (path, ", ".join(sorted(unknown))))
+    bands = data.get("figures")
+    if not isinstance(bands, dict):
+        raise Refusal("%s: no [figures] table" % path)
+    extra = sorted(set(bands) - set(PREREG_FIGURES))
+    absent = [k for k in PREREG_FIGURES if k not in bands]
+    if extra:
+        raise Refusal("%s: unknown figure(s) %s" % (path, ", ".join(extra)))
+    if absent:
+        raise Refusal("%s: not pre-registered: %s" % (path, ", ".join(absent)))
+    for name, band in bands.items():
+        if isinstance(band, list):
+            if len(band) != 2 or not all(_num(b) for b in band) or band[0] > band[1]:
+                raise Refusal("%s: %s band %r is not [low, high]" % (path, name, band))
+        elif isinstance(band, bool) or not isinstance(band, (int, float, str)):
+            raise Refusal("%s: %s is %r, neither a value nor a [low, high] band"
+                          % (path, name, band))
+    return bands
+
+
+def prereg(prereg_path, results_path, progress_path, upstream_path, store_bucket):
+    """Judge a run against its pre-registration. PREREG's [figures] table
+    names every figure _prereg_figures knows, each either an exact value
+    (number or string; a string may say {store_bucket}) or a [low, high]
+    band, both ends inclusive. Returns (rows, unjudged): a figure the run did
+    not produce, or produced twice, is unjudged, never a pass."""
+    bands = check_prereg(prereg_path)
+    up = _strict_json(upstream_path)
+    _strict_json(results_path)
+    r = validate(results_path)
+    figures = _prereg_figures(r, up, store_bucket)
+    if tuple(figures) != PREREG_FIGURES:
+        raise Refusal("prereg: the judge's figures and PREREG_FIGURES differ")
+    # A figure read from a log line, not from a JSON field: each step's start
+    # and done stamps must appear exactly once.
+    window_error = None
+    try:
+        load_window(progress_path)
+    except Refusal as e:
+        window_error = str(e)
+    rows, unjudged = [], []
+    for name in PREREG_FIGURES:
+        band = bands[name]
+        if isinstance(band, str):
+            band = band.replace("{store_bucket}", store_bucket)
+        try:
+            if name == "load_time_s" and window_error:
+                raise _Missing(window_error)
+            value = figures[name]()
+        except (_Missing, Refusal) as e:
+            unjudged.append(name)
+            rows.append(_row("prereg", name, None, band, "unjudged", "missing: %s" % e))
+            continue
+        if isinstance(band, list):
+            ok = _num(value) and band[0] <= value <= band[1]
+            bound = "%s to %s" % tuple(band)
+        else:
+            ok = value == band
+            bound = band
+        rows.append(_row("prereg", name, value, bound, "pass" if ok else "miss"))
+    return rows, unjudged
+
+
 PUBLISHED_OPTIONS = ("--published-tries", "--arm-o", "--qps-windows", "--new-arm",
                      "--figures")
 
@@ -2830,6 +3389,29 @@ def main(argv):
         elif cmd == "memory-gap" and len(args) == 6:
             rows = memory_gap(*args)
             print_table(rows, "B")
+            return 1 if any(r["verdict"] == "miss" for r in rows) else 0
+        elif cmd == "fetch-policy" and args:
+            print(json.dumps(fetch_policy(args), sort_keys=True))
+        elif cmd == "gcp-names" and len(args) == 2:
+            for name in gcp_names(*args):
+                print(name)
+        elif cmd == "gcs-next-page" and len(args) == 1:
+            print(gcs_next_page(args[0]))
+        elif cmd == "footprint" and args:
+            print(json.dumps(footprint(args), indent=2, sort_keys=True))
+        elif cmd == "load-window" and len(args) == 1:
+            print(json.dumps(load_window(args[0]), sort_keys=True))
+        elif cmd == "upstream-result" and len(args) == 2:
+            print(json.dumps(upstream_result(*args), indent=2))
+        elif cmd == "check-prereg" and len(args) == 1:
+            check_prereg(args[0])
+        elif cmd == "prereg" and len(args) == 5:
+            rows, unjudged = prereg(*args)
+            print_table(rows, "A")
+            if unjudged:
+                print("kit: not judged, missing or emitted twice: %s" % ", ".join(unjudged),
+                      file=sys.stderr)
+                return 2
             return 1 if any(r["verdict"] == "miss" for r in rows) else 0
         else:
             print(__doc__, file=sys.stderr)

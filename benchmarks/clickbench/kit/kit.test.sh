@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Cases for the ClickBench kit: launch.sh, the user-data it writes, box/run.sh
-# and fetch.sh. Nothing here reaches AWS or builds anything. Stubs first on
-# PATH stand in for `aws` (S3 is a local directory, $FAKE_S3), `curl` (the
-# instance metadata service and the SQL endpoint), `perf`, `shutdown` and
+# and fetch.sh, and the GCP path (launch-gcp.sh, its startup script, box/run.sh
+# on GCS, fetch-gcp.sh and teardown-gcp.sh). Nothing here reaches AWS or GCP
+# or builds anything. Stubs first on PATH stand in for `aws` (S3 is a local
+# directory, $FAKE_S3), `gcloud` (GCS is $FAKE_GCS), `curl` (the instance
+# metadata services, the GCS and Compute JSON APIs, the release downloads and
+# the SQL endpoint), `cosign`, `systemd-run`, `perf`, `shutdown` and
 # `nohup`; a
 # box is a local directory standing in for /root (KIT_ROOT), with stub
 # ravel-cli and ravel-server binaries. Each case names the mutation it
@@ -157,12 +160,23 @@ cat >"$STUBS/curl" <<'STUB'
 # <number>-<try>.json. A body under a verify/ directory is the box's row-count
 # check: it is logged to verify-bodies and answered with one cell,
 # STUB_COUNT_STAR (default the hits row count).
+#
+# The GCP endpoints (kit.test.sh points KIT_GCE_METADATA, KIT_GCS_API and
+# KIT_GCE_API at them): gce-md.invalid is the metadata server; gcs.invalid
+# is the GCS JSON API over $FAKE_GCS/<bucket>/<key> (a media upload, an
+# alt=media download that fails 404 when the object is absent, and
+# objects.list pages of STUB_GCS_PAGE items, default 1000, with numeric page
+# tokens); gce.invalid logs a DELETE of an instance as "gce delete <name>";
+# release.invalid serves $STUB_DIR/release/<file>. A body under sql-smoke/
+# is the box's pre-load SELECT 1, answered 200, or 422 while STUB_SMOKE_FAIL
+# is set.
 out=""
 body=""
 url=""
 wfmt=""
 fwb=""
 maxtime=""
+method=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2; continue ;;
@@ -170,11 +184,79 @@ while [ $# -gt 0 ]; do
     --data-binary) body="${2#@}"; shift 2; continue ;;
     -w) wfmt="$2"; shift 2; continue ;;
     --fail-with-body) fwb=1 ;;
-    -H|-X) shift 2; continue ;;
+    -X) method="$2"; shift 2; continue ;;
+    -H) shift 2; continue ;;
     http*) url="$1" ;;
   esac
   shift
 done
+case "$url" in
+  http://gce-md.invalid/*)
+    case "${url#http://gce-md.invalid/computeMetadata/v1/}" in
+      instance/service-accounts/default/token) echo '{"access_token":"stub-gce-token","expires_in":3599,"token_type":"Bearer"}' ;;
+      instance/name) echo "${STUB_GCE_NAME:-ravel-clickbench-stub}" ;;
+      instance/zone) echo projects/123456/zones/us-central1-a ;;
+      instance/machine-type) echo projects/123456/machineTypes/c2d-highcpu-16 ;;
+      project/project-id) echo kit-test-project ;;
+      *) echo "curl: (22) The requested URL returned error: 404" >&2; exit 22 ;;
+    esac
+    exit 0 ;;
+  https://gcs.invalid/upload/storage/v1/b/*)
+    rest="${url#https://gcs.invalid/upload/storage/v1/b/}"
+    name="${rest#*name=}"
+    f="$FAKE_GCS/${rest%%/*}/${name//%2F//}"
+    mkdir -p "$(dirname "$f")" && cp "$body" "$f"
+    exit $? ;;
+  https://gcs.invalid/storage/v1/b/*/o\?*)
+    rest="${url#https://gcs.invalid/storage/v1/b/}"
+    python3 - "$FAKE_GCS/${rest%%/*}" "$url" "${STUB_GCS_PAGE:-1000}" >"$out" <<'PY'
+import json, os, re, sys
+root, url, size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+names = []
+for d, _, files in os.walk(root):
+    for f in files:
+        p = os.path.join(d, f)
+        names.append((os.path.relpath(p, root), os.path.getsize(p)))
+names.sort()
+m = re.search(r"pageToken=([0-9]+)", url)
+start = int(m.group(1)) if m else 0
+page = {"items": [{"name": n, "size": str(s)} for n, s in names[start:start + size]]}
+if start + size < len(names):
+    page["nextPageToken"] = str(start + size)
+print(json.dumps(page))
+PY
+    exit $? ;;
+  https://gcs.invalid/storage/v1/b/*)
+    rest="${url#https://gcs.invalid/storage/v1/b/}"
+    key="${rest#*/o/}"
+    f="$FAKE_GCS/${rest%%/*}/${key%%\?*}"
+    f="${f//%2F//}"
+    [ -f "$f" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
+    cp "$f" "$out"
+    exit $? ;;
+  https://gce.invalid/*)
+    [ "$method" = DELETE ] || { echo "curl: (22) unexpected $method $url" >&2; exit 22; }
+    echo "gce delete ${url##*/}" >>"$STUB_LOG"
+    exit 0 ;;
+  https://release.invalid/*)
+    f="$STUB_DIR/release/${url##*/}"
+    [ -f "$f" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
+    cp "$f" "$out"
+    exit $? ;;
+esac
+case "$body" in
+  */sql-smoke/*)
+    if [ ! -f "$STUB_DIR/server-ready" ]; then printf '000'; exit 7; fi
+    echo smoke >>"$STUB_DIR/smoke-calls"
+    if [ -n "${STUB_SMOKE_FAIL:-}" ]; then
+      printf '{"status":"error","errorType":"unsupported","error":"no SQL surface"}' >"$out"
+      printf '422'
+    else
+      printf '{"status":"success","data":{"columns":["1"],"rows":[[1]]},"stats":{}}' >"$out"
+      printf '200'
+    fi
+    exit 0 ;;
+esac
 case "$url" in
   */latest/api/token) echo stub-imds-token ;;
   */meta-data/instance-id) echo i-0b0x00000000000001 ;;
@@ -313,11 +395,21 @@ STUB
 # STUB_FOLD_ENTRIES sets the entry_count it prints (default 100).
 cat >"$BINSTUBS/ravel-server" <<'STUB'
 #!/usr/bin/env bash
+case "${1:-}" in
+  --help) echo "Usage: ravel-server [OPTIONS]"; exit 0 ;;
+  --version) echo "error: unexpected argument '--version' found" >&2; exit 2 ;;
+esac
 echo "$*" >>"$STUB_DIR/server-argv"
 for kv in fetch_concurrency=32 store_get_concurrency=32 cache_max_bytes=7689077760 \
   catalog_cache_max_bytes=1537815552 sql_max_query_bytes=16451897344 sql_tenant_max_bytes=32903794688; do
   printf '2026-10-11T10:00:00.000000Z  INFO ravel_server::config: performance default resolved setting="%s" value=%s source="derived"\n' "${kv%%=*}" "${kv#*=}"
 done
+case " $* " in
+  *" --store gcs "*) policy='policy="cost-based" policy_source="default"' ;;
+  *) policy='policy="latency-first" policy_source="default-loopback"' ;;
+esac
+printf '2026-10-11T10:00:00.000000Z  INFO ravel_server::config: logs fetch policy resolved %s profile=s3-intra-region-2026 request_cost_bytes=1\n' "$policy"
+echo "stub-server: env RAVEL_S3_ENDPOINT=${RAVEL_S3_ENDPOINT:-unset} RAVEL_S3_BUCKET=${RAVEL_S3_BUCKET:-unset} LD_PRELOAD=${LD_PRELOAD:-unset}"
 echo "stub-server: store access_key=${RAVEL_S3_ACCESS_KEY:-} secret_key=${RAVEL_S3_SECRET_KEY:-} audit_key=${RAVEL_AUDIT_TOKEN_KEY:-none}"
 rm -f "$STUB_DIR/check-refuse" "$STUB_DIR/check-hang"
 sleep "$(cat "$STUB_DIR/ready-delay" 2>/dev/null || echo "${STUB_READY_DELAY:-0.05}")"
@@ -336,7 +428,37 @@ wait "$pid"
 STUB
 cat >"$BINSTUBS/ravel-cli" <<'STUB'
 #!/usr/bin/env bash
+case "${1:-}" in
+  --help) echo "Usage: ravel-cli [OPTIONS] <COMMAND>"; exit 0 ;;
+  --version) echo "error: unexpected argument '--version' found" >&2; exit 2 ;;
+esac
 echo "cli $*" >>"$STUB_DIR/cli-argv"
+# Under --store gcs the bucket is $FAKE_GCS/<--gcs-bucket>: qualify writes its
+# record and a probe, the load 100 data objects and their commit records under
+# one tenant prefix, and `typed-attr-column show` reports STUB_DECLARED
+# columns (default 104, hits.mapping.toml's entries).
+gcs=""
+prev=""
+for a in "$@"; do
+  [ "$prev" != --gcs-bucket ] || gcs="$FAKE_GCS/$a"
+  prev="$a"
+done
+if [ -n "$gcs" ]; then
+  case " $* " in
+    *" store qualify "*)
+      mkdir -p "$gcs/sys/qualify/p1" && echo record >"$gcs/sys/qualification" && echo probe >"$gcs/sys/qualify/p1/cas"
+      echo "store qualify: gs://${gcs##*/}: 10 of 10 gating checks PASS" ;;
+    *" load "*)
+      mkdir -p "$gcs/t/0123abcd/l/l0" "$gcs/t/0123abcd/l/c"
+      for ((i = 0; i < 100; i++)); do
+        printf 'data-%03d' "$i" >"$gcs/t/0123abcd/l/l0/obj-$i.rlog"
+        printf 'c%d' "$i" >"$gcs/t/0123abcd/l/c/rec-$i"
+      done ;;
+    *" typed-attr-column show "*)
+      echo "tenant clickbench-v4 declares ${STUB_DECLARED:-104} typed attribute column(s), in schema-append order:"
+      exit 0 ;;
+  esac
+fi
 case " $* " in
   *" load "*)
     echo 210 >"$STUB_DIR/objects"
@@ -350,6 +472,104 @@ case " $* " in
 esac
 exit 0
 STUB
+# The GCP path's laptop side: gcloud over $FAKE_GCS (GCS) and $STUB_DIR/gce/
+# (one file per instance), cosign, and git for launch-gcp.sh's tag and
+# mapping checks. STUB_GCLOUD_FAIL names a step that fails: bucket-create,
+# bucket-iam, create, binding or instance-delete. STUB_NO_SA makes the
+# service account unreadable and STUB_NO_GRANT leaves the results bucket's
+# policy without its objectAdmin binding. STUB_GCS_DOWN fails every storage
+# listing as an unreachable endpoint would.
+export FAKE_GCS="$TMP/gcs"
+mkdir -p "$FAKE_GCS" "$STUB_DIR/gce"
+cat >"$STUBS/gcloud" <<'STUB'
+#!/usr/bin/env bash
+echo "gcloud $*" >>"$STUB_LOG"
+pos=()
+meta=""
+filter=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --metadata-from-file) meta="${2#startup-script=}"; shift 2; continue ;;
+    --filter) filter="$2"; shift 2; continue ;;
+    --project|--zone|--format|--location|--default-storage-class|--soft-delete-duration|--role|--member|--labels|--machine-type|--image-family|--image-project|--boot-disk-size|--boot-disk-type|--service-account|--scopes|--maintenance-policy|--max-run-duration|--instance-termination-action|--display-name)
+      shift 2; continue ;;
+    --*) shift; continue ;;
+  esac
+  pos+=("$1")
+  shift
+done
+gcs() { printf '%s\n' "$FAKE_GCS/${1#gs://}"; }
+failing() { [ "${STUB_GCLOUD_FAIL:-}" = "$1" ] && { echo "ERROR: (gcloud) stub failure: $1" >&2; exit 1; }; return 0; }
+case "${pos[0]:-} ${pos[1]:-}" in
+  "storage cp")
+    src="${pos[2]}"
+    dst="${pos[3]}"
+    case "$src" in
+      gs://*)
+        [ -f "$(gcs "$src")" ] || { echo "ERROR: (gcloud.storage.cp) The following URLs matched no objects or files: $src" >&2; exit 1; }
+        mkdir -p "$(dirname "$dst")" && cp "$(gcs "$src")" "$dst" ;;
+      *) mkdir -p "$(dirname "$(gcs "$dst")")" && cp "$src" "$(gcs "$dst")" ;;
+    esac
+    exit $? ;;
+  "storage ls")
+    [ -z "${STUB_GCS_DOWN:-}" ] || { echo "ERROR: (gcloud.storage.ls) HTTPSConnectionPool: connection refused" >&2; exit 1; }
+    d="$(gcs "${pos[2]}")"
+    [ -d "$d" ] && [ -n "$(ls -A "$d")" ] || { echo "ERROR: (gcloud.storage.ls) One or more URLs matched no objects." >&2; exit 1; }
+    for f in "$d"/*; do printf '%s%s\n' "${pos[2]}" "$(basename "$f")"; done
+    exit 0 ;;
+  "storage rm") rm -rf "$(gcs "${pos[2]}")"; exit 0 ;;
+esac
+case "${pos[0]:-} ${pos[1]:-} ${pos[2]:-}" in
+  "iam service-accounts describe")
+    [ -z "${STUB_NO_SA:-}" ] || { echo "ERROR: NOT_FOUND" >&2; exit 1; }
+    echo "${pos[3]}" ;;
+  "storage buckets get-iam-policy")
+    if [ -n "${STUB_NO_GRANT:-}" ]; then
+      echo '{"bindings": [{"role": "roles/storage.objectViewer", "members": ["serviceAccount:ravel-clickbench@kit-test-project.iam.gserviceaccount.com"]}]}'
+    else
+      echo '{"bindings": [{"role": "roles/storage.objectAdmin", "members": ["serviceAccount:ravel-clickbench@kit-test-project.iam.gserviceaccount.com"]}]}'
+    fi ;;
+  "storage buckets create") failing bucket-create; mkdir -p "$(gcs "${pos[3]}")" ;;
+  "storage buckets add-iam-policy-binding") failing bucket-iam; echo etag ;;
+  "storage buckets describe") [ -d "$(gcs "${pos[3]}")" ] || { echo "ERROR: NotFound" >&2; exit 1; }; echo "${pos[3]#gs://}" ;;
+  "compute instances create")
+    failing create
+    cp "$meta" "$STUB_DIR/startup-${pos[3]}" && echo us-central1-a >"$STUB_DIR/gce/${pos[3]}" ;;
+  "compute instances add-iam-policy-binding") failing binding; echo etag ;;
+  "compute instances delete") failing instance-delete; rm -f "$STUB_DIR/gce/${pos[3]}" ;;
+  "compute instances list")
+    for f in "$STUB_DIR"/gce/*; do
+      [ -f "$f" ] || continue
+      printf '%s\t%s\n' "$(basename "$f")" "$(cat "$f")"
+    done ;;
+  *) echo "unexpected gcloud call: ${pos[*]}" >&2; exit 99 ;;
+esac
+STUB
+cat >"$STUBS/cosign" <<'STUB'
+#!/usr/bin/env bash
+echo "cosign $*" >>"$STUB_LOG"
+[ -z "${STUB_COSIGN_FAIL:-}" ] || { echo "Error: none of the expected identities matched" >&2; exit 1; }
+echo "Verified OK"
+STUB
+cat >"$STUBS/systemd-run" <<'STUB'
+#!/usr/bin/env bash
+echo "systemd-run $*" >>"$STUB_LOG"
+STUB
+# Only on PATH for launch-gcp.sh: the tag resolves to STUB_TAG_SHA, and the
+# commit's mapping is STUB_TAG_MAPPING (default the checked-in one).
+GITSTUBS="$TMP/gitstubs"
+mkdir -p "$GITSTUBS"
+cat >"$GITSTUBS/git" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" = -C ] && shift 2
+case "$1" in
+  rev-parse) [ -n "${STUB_TAG_SHA:-}" ] || exit 1; echo "$STUB_TAG_SHA" ;;
+  show) cat "${STUB_TAG_MAPPING:-$STUB_REPO/benchmarks/clickbench/hits.mapping.toml}" ;;
+  *) echo "unexpected git call: $*" >&2; exit 99 ;;
+esac
+STUB
+chmod +x "$GITSTUBS/git"
+export STUB_REPO="$REPO_ROOT"
 chmod +x "$STUBS"/* "$BINSTUBS"/*
 export PATH="$STUBS:$PATH"
 # macOS assesses a newly written executable on its first exec, which took
@@ -4830,11 +5050,622 @@ else
   fail "same-box m8a off" "exit $code: $(grep -i 'same-box\|REPORTED' "$TMP/pub-sb-m8a.out") $(head -c 300 "$TMP/pub-sb-m8a.err")"
 fi
 
+# --- GCP: check-run, kit.py helpers, launch-gcp.sh, its user-data, ---------
+# --- box/run.sh on GCS, fetch-gcp.sh and teardown-gcp.sh --------------------
+
+GCP_SA=ravel-clickbench@kit-test-project.iam.gserviceaccount.com
+mkdir -p "$STUB_DIR/release"
+for a in amd64 arm64; do
+  cp "$BINSTUBS/ravel-server" "$STUB_DIR/release/ravel-server-linux-$a"
+  cp "$BINSTUBS/ravel-cli" "$STUB_DIR/release/ravel-cli-linux-$a"
+done
+(cd "$STUB_DIR/release" && sha256sum ravel-* >SHA256SUMS && echo sig >SHA256SUMS.sig && echo pem >SHA256SUMS.pem)
+GCP_SERVER_SHA="$(sha256sum "$BINSTUBS/ravel-server" | cut -d' ' -f1)"
+GCP_CLI_SHA="$(sha256sum "$BINSTUBS/ravel-cli" | cut -d' ' -f1)"
+
+# A pre-registration every stub run's figures satisfy.
+GCP_PREREG="$TMP/prereg-gcp.toml"
+cat >"$GCP_PREREG" <<EOF
+[figures]
+rows_written = 99997497
+count_star = 99997497
+statements_answered = 43
+null_tries = 0
+benchmark_error_ratio = 0
+data_size_bytes = [1, 100000]
+l0_objects = 100
+l0_objects_minus_objects_written = 0
+fold_entries_minus_objects_written = 0
+declared_columns = 104
+load_time_s = [0, 120]
+cold_sum_s = [10, 40]
+hot_sum_s = [10, 40]
+concurrent_qps = [0, 100000]
+concurrent_error_ratio = [0, 1]
+store = "gcs"
+store_identity = "gs://{store_bucket}"
+fold_precondition = "met"
+fetch_policy = "cost-based"
+fetch_policy_source = "default"
+binary_source = "release"
+release_tag = "v9.9.9"
+ravel_server_sha256 = "$GCP_SERVER_SHA"
+ravel_cli_sha256 = "$GCP_CLI_SHA"
+machine = "c2d-highcpu-16"
+EOF
+
+# write_gcp_toml FILE: a GCP run.toml for the stubs.
+write_gcp_toml() {
+  cat >"$1" <<EOF
+cloud = "gcp"
+store = "gcs"
+release_tag = "v9.9.9"
+release_url = "https://release.invalid"
+sha_a = "$SHA_A"
+ravel_server_sha256 = "$GCP_SERVER_SHA"
+ravel_cli_sha256 = "$GCP_CLI_SHA"
+phases = ["benchmark", "concurrent"]
+concurrent_rounds = 1
+concurrent_connections = 2
+concurrent_duration_s = 1
+project = "kit-test-project"
+region = "us-central1"
+zone = "us-central1-a"
+instance_type = "c2d-highcpu-16"
+image_family = "rocky-linux-9-optimized-gcp"
+image_project = "rocky-linux-cloud"
+service_account = "$GCP_SA"
+bucket = "kit-test-gcs-bucket"
+prefix = "clickbench-kit"
+store_bucket_prefix = "kit-test-cb"
+tenant = "clickbench-v4"
+shards = 8
+corpus = "benchmarks/clickbench/hits.corpus.json"
+mapping = "benchmarks/clickbench/hits.mapping.toml"
+dataset_url = "https://example.invalid/hits.parquet"
+dataset_sha256 = "$DATASET_SHA"
+rows_expected = 99997497
+memory_budget_bytes = 25769803776
+audit_mode = "off"
+prereg = "$GCP_PREREG"
+EOF
+}
+GCP_TOML="$TMP/run-gcp.toml"
+write_gcp_toml "$GCP_TOML"
+
+# gcp_run_case NAME SED WANT [FILE]: kit.py check-run on a copy of the GCP
+# run.toml (or FILE) edited by SED must exit 2 with WANT in its message.
+gcp_run_case() {
+  local name="$1" edit="$2" want="$3" src="${4:-$GCP_TOML}" code=0
+  sed "$edit" "$src" >"$TMP/gcp-run-case.toml"
+  python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/gcp-run-case.toml" >/dev/null 2>"$TMP/gcp-run-case.err" || code=$?
+  if [ "$code" = 2 ] && grep -qF -- "$want" "$TMP/gcp-run-case.err"; then
+    pass "check-run refuses $name, naming it"
+  else
+    fail "check-run $name" "exit $code: $(head -c 300 "$TMP/gcp-run-case.err")"
+  fi
+}
+# Catches: the GCP run.toml itself refused, so every case below tests nothing.
+if python3 "$KIT_SRC/lib/kit.py" check-run "$GCP_TOML" >/dev/null 2>"$TMP/gcp-check.err"; then
+  pass "check-run accepts a cloud gcp run.toml"
+else
+  fail "check-run gcp" "$(head -c 300 "$TMP/gcp-check.err")"
+fi
+# Catches: an AWS-only key silently ignored on GCP, where one arm runs a
+# release: a second arm, a lane, or RustFS.
+gcp_run_case "sha_b under cloud gcp" '/^sha_a = /a\
+sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' 'unknown key(s) or table(s) for cloud gcp: sha_b'
+gcp_run_case "lanes under cloud gcp" '/^phases = /a\
+lanes = ["rlog"]' 'unknown key(s) or table(s) for cloud gcp: lanes'
+gcp_run_case "store rustfs under cloud gcp" 's/^store = .*/store = "rustfs"/' 'cloud gcp runs store gcs, got store'
+# Catches: an AWS run.toml asking for the GCS store it cannot run.
+gcp_run_case "store gcs under cloud aws" '/^shards = /i\
+store = "gcs"' 'cloud aws runs store rustfs, got store' "$RUN_TOML"
+# Catches: a zone outside the region, which puts the box and the buckets in
+# different regions.
+gcp_run_case "a zone outside the region" 's/^zone = .*/zone = "europe-west1-b"/' 'is not in region us-central1'
+# Catches: an --s3-* flag reaching a --store gcs server, which refuses it at
+# startup after the load.
+gcp_run_case "an S3 flag in server_flags_a" '/^shards = /i\
+server_flags_a = ["--s3-endpoint", "http://x"]' 'which --store gcs refuses'
+gcp_run_case "a 20 GB boot disk" '/^shards = /i\
+boot_disk_gb = 20' 'boot_disk_gb must be a whole number of at least 50'
+gcp_run_case "a missing release digest" '/^ravel_cli_sha256 = /d' 'missing required key(s): ravel_cli_sha256'
+
+# Catches: a page token sent raw (a base64 token holds + / =), the last page
+# read as having another, or a key listed twice counted twice.
+printf '{"items": [], "nextPageToken": "a+b/c="}' >"$TMP/page-a.json"
+printf '{"items": []}' >"$TMP/page-b.json"
+printf '{"items": [{"name": "t/h1/l/l0/x", "size": "10"}, {"name": "sys/qualify/p/1", "size": "2"}]}' >"$TMP/page-c.json"
+printf '{"items": [{"name": "t/h1/l/c/x", "size": "3"}, {"name": "t/h1/l/l0/x", "size": "10"}]}' >"$TMP/page-d.json"
+printf '{"items": [{"name": "t/h1/l/c/x", "size": "3"}, {"name": "t/h1/l/prov", "size": "4"}]}' >"$TMP/page-e.json"
+tok="$(python3 "$KIT_SRC/lib/kit.py" gcs-next-page "$TMP/page-a.json")"
+last="$(python3 "$KIT_SRC/lib/kit.py" gcs-next-page "$TMP/page-b.json")"
+fp="$(python3 "$KIT_SRC/lib/kit.py" footprint "$TMP/page-c.json" "$TMP/page-e.json" | python3 -c 'import json, sys
+d = json.load(sys.stdin); t = d["tenants"]["h1"]
+print(d["objects"], d["bytes"], t["objects"], t["bytes"], t["classes"]["l/l0"]["objects"], t["classes"]["l/c"]["bytes"], t["classes"]["l/prov"]["objects"], d["sys"]["sys/qualify"]["objects"])')"
+code=0
+python3 "$KIT_SRC/lib/kit.py" footprint "$TMP/page-c.json" "$TMP/page-d.json" >/dev/null 2>"$TMP/fp-dup.err" || code=$?
+if [ "$tok" = 'a%2Bb%2Fc%3D' ] && [ -z "$last" ] && [ "$fp" = "4 19 3 17 1 3 1 1" ] \
+  && [ "$code" = 2 ] && grep -q 't/h1/l/l0/x is listed twice' "$TMP/fp-dup.err"; then
+  pass "objects.list paging encodes the token, ends on the last page, and footprint splits keys by tenant and class"
+else
+  fail "gcs listing helpers" "token '$tok', last '$last', footprint '$fp', duplicate exit $code"
+fi
+
+# Catches: a load window read from a progress.log that stamps a step twice,
+# which would time whichever line came last.
+printf '%s\n' '2026-11-12T10:00:00Z step=load state=start' '2026-11-12T10:10:00Z step=load state=done' \
+  '2026-11-12T10:10:01Z step=compact state=start' '2026-11-12T10:10:02Z step=compact state=done' \
+  '2026-11-12T10:10:02Z step=fold state=start' '2026-11-12T10:10:05Z step=fold state=done' \
+  '2026-11-12T10:10:05Z step=declare state=start' '2026-11-12T10:10:06Z step=declare state=done' >"$TMP/lw.log"
+lw="$(python3 "$KIT_SRC/lib/kit.py" load-window "$TMP/lw.log")"
+{ cat "$TMP/lw.log"; echo '2026-11-12T10:20:00Z step=load state=start'; } >"$TMP/lw-dup.log"
+code=0
+python3 "$KIT_SRC/lib/kit.py" load-window "$TMP/lw-dup.log" >/dev/null 2>"$TMP/lw-dup.err" || code=$?
+if [ "$lw" = '{"steps": {"compact": 1, "declare": 1, "fold": 3, "load": 600}, "total_s": 605}' ] \
+  && [ "$code" = 2 ] && grep -q 'carries `step=load state=start` 2 times, not once' "$TMP/lw-dup.err"; then
+  pass "the load window sums the load, compact, fold and declare steps and refuses a step stamped twice"
+else
+  fail "load window" "'$lw', duplicate exit $code: $(head -c 200 "$TMP/lw-dup.err")"
+fi
+
+# launch_gcp ARGS...: launch-gcp.sh with git answering for the tag.
+launch_gcp() {
+  PATH="$GITSTUBS:$PATH" STUB_TAG_SHA="${STUB_TAG_SHA-$SHA_A}" bash "$KIT_SRC/launch-gcp.sh" "$@"
+}
+
+# Catches: a dry run that reaches gcloud, or a create that drops the 590
+# minute DELETE, the service account, the boot disk size or the label; or a
+# user-data without the guest shutdown, the reboot guard, the digest checks,
+# the cloud and store bucket files or the systemd unit.
+reset_log
+code=0
+launch_gcp --dry-run "$GCP_TOML" >"$TMP/gdry.out" 2>"$TMP/gdry.err" || code=$?
+grun="$(sed -n 's/^run id: *//p' "$TMP/gdry.out")"
+create="$(grep '^DRY-RUN: gcloud compute instances create' "$TMP/gdry.err" | tr -d '\\')"
+ud="$(sed -n '/^DRY-RUN user-data A:$/,/^DRY-RUN end user-data A$/p' "$TMP/gdry.err")"
+ok=1
+for want in '--max-run-duration 35400s' '--instance-termination-action DELETE' '--no-restart-on-failure' \
+  "--service-account $GCP_SA" '--scopes cloud-platform' '--boot-disk-size 100GB' '--machine-type c2d-highcpu-16' \
+  "ravel-clickbench-run=$(printf '%s' "$grun" | tr 'A-Z' 'a-z')"; do
+  case "$create" in *"$want"*) ;; *) ok=0; echo "  instances create lacks: $want" ;; esac
+done
+for want in 'shutdown -h +600' '[ ! -e "$KIT/BOOTED" ] || fail "reboot' 'sha256sum -c kit.sha256' \
+  'sha256sum -c SHA256SUMS' "printf '%s\\n' gcp >\"\$KIT/CLOUD\"" "printf '%s\\n' A >\"\$KIT/ARM\"" \
+  'systemd-run --unit=ravel-clickbench-kit' "OUT=kit-test-gcs-bucket/clickbench-kit/runs/$grun/out/A"; do
+  case "$ud" in *"$want"*) ;; *) ok=0; echo "  user-data lacks: $want" ;; esac
+done
+if [ "$code" = 0 ] && [ -n "$grun" ] && [ "$ok" = 1 ] && [ ! -s "$STUB_LOG" ] \
+  && grep -q '^DRY-RUN: gcloud compute instances add-iam-policy-binding .*roles/compute.instanceAdmin.v1' "$TMP/gdry.err" \
+  && grep -q '^DRY-RUN: gcloud storage buckets create gs://kit-test-cb-.*--uniform-bucket-level-access --soft-delete-duration 0' "$TMP/gdry.err"; then
+  pass "launch-gcp dry run prints the bucket, the self-deleting instance and the user-data, and calls nothing"
+else
+  fail "launch-gcp dry run" "exit $code, run id '$grun', calls: $(tr '\n' ';' <"$STUB_LOG" | head -c 300)"
+fi
+GDRY_STAGE="$(sed -n 's/^launch-gcp: staged in\/ files kept in //p' "$TMP/gdry.err")"
+[ -z "$GDRY_STAGE" ] || rm -rf "$GDRY_STAGE"
+
+# gcp_refusal NAME WANT_CODE WANT FILE [ENV=VALUE...]: launch-gcp.sh on FILE
+# must exit WANT_CODE naming WANT, and create no bucket and no instance.
+gcp_refusal() {
+  local name="$1" want_code="$2" want="$3" file="$4" code=0
+  shift 4
+  reset_log
+  env STUB_TAG_SHA="$SHA_A" "$@" PATH="$GITSTUBS:$PATH" bash "$KIT_SRC/launch-gcp.sh" "$file" \
+    >/dev/null 2>"$TMP/grefuse.err" || code=$?
+  if [ "$code" = "$want_code" ] && grep -qF -- "$want" "$TMP/grefuse.err" \
+    && ! grep -q 'buckets create\|instances create\|storage cp' "$STUB_LOG"; then
+    pass "launch-gcp refuses $name with exit $want_code before creating anything"
+  else
+    fail "launch-gcp $name" "exit $code: $(head -c 300 "$TMP/grefuse.err"); calls: $(tr '\n' ';' <"$STUB_LOG" | head -c 300)"
+  fi
+}
+# Catches: a release whose SHA256SUMS signature does not verify launched anyway.
+gcp_refusal "an unverified SHA256SUMS" 64 'does not verify against its signature' "$GCP_TOML" STUB_COSIGN_FAIL=1
+# Catches: a pinned digest the release does not list.
+sed 's/^ravel_cli_sha256 = .*/ravel_cli_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"/' \
+  "$GCP_TOML" >"$TMP/gcp-baddigest.toml"
+gcp_refusal "a pinned digest the release does not list" 64 'lists ravel-cli-linux-amd64 as' "$TMP/gcp-baddigest.toml"
+# Catches: a tag naming another commit than sha_a, so provenance would carry
+# the wrong SHA.
+gcp_refusal "a tag on another commit" 64 'run.toml'"'"'s sha_a is' "$GCP_TOML" \
+  STUB_TAG_SHA=cccccccccccccccccccccccccccccccccccccccc
+# Catches: a mapping that is not the release's, declaring other columns.
+printf '# another mapping\n' >"$TMP/other-mapping.toml"
+gcp_refusal "a mapping other than the tag's" 64 "differs from v9.9.9's" "$GCP_TOML" \
+  STUB_TAG_MAPPING="$TMP/other-mapping.toml"
+# Catches: a box launched with no write access to the results bucket, which
+# could never upload DONE.
+gcp_refusal "a service account without objectAdmin on the results bucket" 65 'lacks roles/storage.objectAdmin' \
+  "$GCP_TOML" STUB_NO_GRANT=1
+gcp_refusal "a missing service account" 65 'does not exist or cannot be read' "$GCP_TOML" STUB_NO_SA=1
+# Catches: a pre-registration missing a figure reaching a launch.
+grep -v '^hot_sum_s = ' "$GCP_PREREG" >"$TMP/prereg-short.toml"
+sed "s#^prereg = .*#prereg = \"$TMP/prereg-short.toml\"#" "$GCP_TOML" >"$TMP/gcp-short.toml"
+gcp_refusal "a pre-registration without hot_sum_s" 64 'not pre-registered: hot_sum_s' "$TMP/gcp-short.toml"
+
+# Catches: a failed instance create leaving the run's store bucket behind.
+reset_log
+code=0
+STUB_GCLOUD_FAIL=create launch_gcp "$GCP_TOML" >/dev/null 2>"$TMP/gcreate.err" || code=$?
+if [ "$code" = 1 ] && grep -q 'gcloud storage rm --recursive gs://kit-test-cb-' "$STUB_LOG" \
+  && [ -z "$(ls "$FAKE_GCS" | grep '^kit-test-cb-')" ] && [ -z "$(ls "$STUB_DIR/gce")" ]; then
+  pass "a failed instance create deletes the store bucket it made"
+else
+  fail "failed create cleanup" "exit $code: $(tail -n 3 "$TMP/gcreate.err")"
+fi
+# Catches: a box left without the binding it deletes itself with, running
+# until the max run duration.
+reset_log
+code=0
+STUB_GCLOUD_FAIL=binding launch_gcp "$GCP_TOML" >/dev/null 2>"$TMP/gbind.err" || code=$?
+if [ "$code" = 1 ] && grep -q 'gcloud compute instances delete ravel-clickbench-' "$STUB_LOG" \
+  && [ -z "$(ls "$STUB_DIR/gce")" ] && [ -z "$(ls "$FAKE_GCS" | grep '^kit-test-cb-')" ]; then
+  pass "a failed self-delete binding deletes the instance and the store bucket"
+else
+  fail "failed binding cleanup" "exit $code: $(tail -n 3 "$TMP/gbind.err")"
+fi
+
+# The real launch every GCP box case below boots from. Catches: in/ missing a
+# file, a kit.tgz without the mapping or the pre-registration, a signature
+# checked against another identity, or a binding with the wrong role.
+reset_log
+code=0
+launch_gcp "$GCP_TOML" >"$TMP/glaunch.out" 2>"$TMP/glaunch.err" || code=$?
+GCP_RUN_ID="$(sed -n 's/^run id: *//p' "$TMP/glaunch.out")"
+GCP_STORE="$(sed -n 's/^store bucket: *gs:\/\///p' "$TMP/glaunch.out")"
+GCP_INSTANCE="$(sed -n 's/^instance: *\([^ ]*\) .*/\1/p' "$TMP/glaunch.out")"
+GCP_RUN_DIR="$FAKE_GCS/kit-test-gcs-bucket/clickbench-kit/runs/$GCP_RUN_ID"
+tar_list="$(tar -tzf "$GCP_RUN_DIR/in/kit.tgz" 2>/dev/null | grep -v '/$' | LC_ALL=C sort | tr '\n' ' ')"
+if [ "$code" = 0 ] && [ -f "$GCP_RUN_DIR/in/kit.sha256" ] && [ -f "$GCP_RUN_DIR/in/run.toml" ] \
+  && [ "$tar_list" = "kit/SHA256SUMS kit/box/run.sh kit/corpus.json kit/lib/kit.py kit/mapping.toml kit/prereg.toml " ] \
+  && [ -d "$FAKE_GCS/$GCP_STORE" ] && [ -f "$STUB_DIR/gce/$GCP_INSTANCE" ] \
+  && grep -q "^cosign verify-blob .*--certificate-identity https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v9.9.9 " "$STUB_LOG" \
+  && grep -q "gcloud storage buckets add-iam-policy-binding gs://$GCP_STORE .*serviceAccount:$GCP_SA --role roles/storage.objectAdmin" "$STUB_LOG" \
+  && grep -q "gcloud compute instances add-iam-policy-binding $GCP_INSTANCE .*serviceAccount:$GCP_SA --role roles/compute.instanceAdmin.v1" "$STUB_LOG"; then
+  pass "launch-gcp uploads in/, makes the store bucket and the instance, and lets the box delete only itself"
+else
+  fail "launch-gcp" "exit $code, run id '$GCP_RUN_ID', kit.tgz holds '$tar_list': $(tail -n 3 "$TMP/glaunch.err")"
+fi
+cp "$STUB_DIR/startup-$GCP_INSTANCE" "$TMP/startup-gcp"
+
+export KIT_GCE_METADATA=http://gce-md.invalid/computeMetadata/v1 KIT_GCS_API=https://gcs.invalid \
+  KIT_GCE_API=https://gce.invalid/compute/v1
+
+# gcp_boot BOX [KEEP]: run the startup script with /root/kit moved to BOX/kit;
+# KEEP=keep boots again on BOX as it is, as a reboot would.
+gcp_boot() {
+  local box="$1"
+  [ "${2:-}" = keep ] || { rm -rf "$box"; mkdir -p "$box"; }
+  sed "s#^KIT=/root/kit\$#KIT=$box/kit#" "$TMP/startup-gcp" >"$box/startup.sh"
+  bash "$box/startup.sh"
+}
+
+# Catches: a startup script that starts run.sh without the kit, run.toml,
+# arm, cloud or store bucket in place, or without arming the guest shutdown.
+reset_log
+GBOX_UD="$TMP/gbox-ud"
+code=0
+gcp_boot "$GBOX_UD" || code=$?
+if [ "$code" = 0 ] && grep -q '^systemd-run --unit=ravel-clickbench-kit' "$STUB_LOG" \
+  && grep -q '^shutdown -h +600$' "$STUB_LOG" && ! grep -q '^shutdown -h now' "$STUB_LOG" \
+  && [ "$(cat "$GBOX_UD/kit/CLOUD")" = gcp ] && [ "$(cat "$GBOX_UD/kit/STORE_BUCKET")" = "$GCP_STORE" ] \
+  && [ "$(cat "$GBOX_UD/kit/ARM")" = A ] && [ "$(cat "$GBOX_UD/kit/RUN_ID")" = "$GCP_RUN_ID" ] \
+  && cmp -s "$GBOX_UD/kit/run.toml" "$GCP_RUN_DIR/in/run.toml" && [ -f "$GBOX_UD/kit/kit/box/run.sh" ]; then
+  pass "the GCP startup script arms shutdown -h +600, verifies the kit and starts run.sh as a systemd unit"
+else
+  fail "gcp user-data" "exit $code; log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400); $(tail -n 3 "$GBOX_UD/kit/user-data.log" 2>/dev/null)"
+fi
+
+# Catches: a reboot running a second measurement on a half-used box.
+reset_log
+gcp_boot "$GBOX_UD" keep || true
+if grep -q 'FAILED step=user-data reboot' "$GCP_RUN_DIR/out/A/FAILED" 2>/dev/null \
+  && grep -q '^gce delete ravel-clickbench-stub$' "$STUB_LOG" && grep -q '^shutdown -h now$' "$STUB_LOG" \
+  && ! grep -q '^systemd-run' "$STUB_LOG"; then
+  pass "a second boot uploads FAILED and deletes the instance instead of running again"
+else
+  fail "gcp reboot" "log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
+fi
+rm -rf "$GCP_RUN_DIR/out"
+
+# Catches: a box trusting a kit.tgz rewritten in GCS.
+reset_log
+cp "$GCP_RUN_DIR/in/kit.tgz" "$TMP/gcp-kit.tgz"
+printf 'x' >>"$GCP_RUN_DIR/in/kit.tgz"
+gcp_boot "$TMP/gbox-tampered" || true
+if grep -q 'FAILED step=user-data sha256 check of kit.tgz and run.toml' "$GCP_RUN_DIR/out/A/FAILED" 2>/dev/null \
+  && grep -q '^gce delete ' "$STUB_LOG" && ! grep -q '^systemd-run' "$STUB_LOG"; then
+  pass "a tampered kit.tgz fails the GCP box and deletes it before any step runs"
+else
+  fail "gcp tampered kit.tgz" "log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
+fi
+cp "$TMP/gcp-kit.tgz" "$GCP_RUN_DIR/in/kit.tgz"
+rm -rf "$GCP_RUN_DIR/out"
+
+# The GCP box driver: run.sh's own main with only the package install, the
+# dataset, the cache drop and GNU time replaced; the release download, the
+# store, qualify and every listing run as run.sh wrote them, against the
+# curl stub.
+cat >"$TMP/gcp-box-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+export KIT_ROOT="$1"
+export KIT_RUN_SH_LIB=1
+export KIT_DROP_CACHES_FILE="$KIT_ROOT/drop_caches"
+export KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
+# shellcheck source=/dev/null
+. "$KIT_ROOT/kit/kit/box/run.sh"
+bootstrap_packages() { :; }
+start_dataset_download() { :; }
+wait_dataset() { echo 1111111111111111111111111111111111111111111111111111111111111111 >"$KIT/dataset.sha256"; }
+drop_caches() { sync; echo 3 >"$DROP_CACHES_FILE"; }
+timed() {
+  local file="$1" code=0
+  shift 2
+  "$@" || code=$?
+  [ "${file##*/}" != load.time ] || echo 'wall=600.50 rss_kb=4000000 user=5000.25 sys=100.50' >"$file"
+  return "$code"
+}
+main
+DRIVER
+
+# run_gcp_box NAME [ENV=VALUE...]: boot a GCP box and run main on it.
+run_gcp_box() {
+  local name="$1" box="$TMP/$1" code=0
+  shift
+  reset_log
+  rm -rf "$GCP_RUN_DIR/out"
+  rm -f "$STUB_DIR/server-argv" "$STUB_DIR/cli-argv" "$STUB_DIR/smoke-calls" "$STUB_DIR/server-ready"
+  gcp_boot "$box" || return 1
+  env "$@" bash "$TMP/gcp-box-driver.sh" "$box" >"$box/kit/run.log" 2>&1 || code=$?
+  return "$code"
+}
+
+GBOX="$TMP/gbox-a"
+code=0
+run_gcp_box gbox-a STUB_SQL_TIME=0.5 || code=$?
+GOUT="$GCP_RUN_DIR/out/A"
+# Catches: a GCP run that does not end in DONE with its files uploaded through
+# the JSON API, or that leaves its instance running.
+del_line="$(grep -n '^gce delete ravel-clickbench-stub$' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+shut_line="$(grep -n '^shutdown -h now$' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+if [ "$code" = 0 ] && grep -q '^DONE bands=none ' "$GOUT/DONE" 2>/dev/null && [ -f "$GOUT/results.json" ] \
+  && [ -f "$GOUT/evidence.tgz" ] && [ -f "$GOUT/progress.log" ] && [ ! -e "$GOUT/FAILED" ] \
+  && [ -n "$del_line" ] && [ -n "$shut_line" ] && [ "$shut_line" -gt "$del_line" ]; then
+  pass "a GCP box uploads results.json, evidence.tgz, progress.log and DONE, then deletes itself"
+else
+  fail "gcp box run" "exit $code; $(head -n 3 "$GOUT/FAILED" 2>/dev/null); run.log: $(tail -n 5 "$GBOX/kit/run.log")"
+fi
+
+# Catches: an S3 setting reaching a --store gcs process (ADR-3456 D6 refuses
+# it, from the command line or the environment), a command run against
+# another store, an LD_PRELOAD the release does not ship, or a build step on
+# a box that measures published binaries.
+steps="$(sed -n 's/^.* step=\([a-z0-9-]*\) state=start$/\1/p' "$GBOX/kit/progress.log" | tr '\n' ' ')"
+if [ -s "$STUB_DIR/cli-argv" ] && ! grep -v -- "--store gcs --gcs-bucket $GCP_STORE " "$STUB_DIR/cli-argv" >/dev/null \
+  && ! grep -q -- '--s3-\|--store s3' "$STUB_DIR/cli-argv" "$STUB_DIR/server-argv" \
+  && ! grep -v -- "^--store gcs --gcs-bucket $GCP_STORE " "$STUB_DIR/server-argv" >/dev/null \
+  && grep -q 'stub-server: env RAVEL_S3_ENDPOINT=unset RAVEL_S3_BUCKET=unset LD_PRELOAD=unset' "$GBOX/kit/server-1.log" \
+  && [[ "$steps" == *"packages dataset-start release dataset store arm-env arm-env-load qualify sql-smoke objects-before-load load objects-after-load compact fold declare declared footprint verify "* ]] \
+  && [[ "$steps" != *toolchain* ]] && [[ "$steps" != *build* ]] && [[ "$steps" != *rustfs* ]]; then
+  pass "every GCP command and server runs --store gcs on the run's bucket, with no S3 setting, no LD_PRELOAD and no build"
+else
+  fail "gcp store args" "steps '$steps'; cli: $(grep -v -- '--store gcs' "$STUB_DIR/cli-argv" | head -n 2)"
+fi
+
+# Catches: results.json losing a GCP stamp the pre-registration reads: the
+# store, the release and its digests, the footprint, the declared columns,
+# the fetch policy, the machine.
+check="$(python3 - "$GOUT/results.json" "$GCP_STORE" "$GCP_SERVER_SHA" "$GCP_CLI_SHA" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+p = r["provenance"]
+bad = []
+def want(cond, what):
+    if not cond:
+        bad.append(what)
+b = sys.argv[2]
+want(p["backend"] == {"store": "gcs", "bucket": b, "identity": "gs://" + b,
+                      "endpoint": "https://gcs.invalid", "version": "gcs"}, "backend %r" % p["backend"])
+rel = p.get("release") or {}
+want(rel.get("source") == "release" and rel.get("tag") == "v9.9.9", "release %r" % rel)
+want(rel.get("server_sha256") == sys.argv[3] and rel.get("cli_sha256") == sys.argv[4], "release digests")
+want("unexpected argument" in rel.get("server_version_output", ""), "server --version output")
+want(p["toolchain"].startswith("release v9.9.9"), "toolchain %r" % p["toolchain"])
+t = p["store_footprint"]["tenants"]
+want(list(t) == ["0123abcd"] and t["0123abcd"]["classes"]["l/l0"]["objects"] == 100
+     and t["0123abcd"]["classes"]["l/c"]["objects"] == 100, "store_footprint %r" % t)
+want(p["store_footprint"]["sys"]["sys/qualify"]["objects"] == 1, "sys/qualify in the footprint")
+want(p["declared_columns"] == {"tenant": "clickbench-v4", "count": 104, "mapping_entries": 104},
+     "declared_columns %r" % p["declared_columns"])
+want(p["fetch_policy"]["policy"] == "cost-based" and p["fetch_policy"]["policy_source"] == "default"
+     and p["fetch_policy"]["logs"] == 43, "fetch_policy %r" % p["fetch_policy"])
+want(p["hardware"]["instance_type"] == "c2d-highcpu-16", "hardware %r" % p["hardware"])
+want(p["burst_balance"]["start"]["value"] is None and "persistent disk" in p["burst_balance"]["start"]["reason"],
+     "burst_balance %r" % p["burst_balance"])
+want(p["server_flags"]["ld_preload"] == "", "ld_preload %r" % p["server_flags"]["ld_preload"])
+want(p["band_sections"] == [] and r["bands"] == [], "bands %r %r" % (p["band_sections"], r["bands"]))
+want(r["totals"]["answered"] == 43, "answered %r" % r["totals"]["answered"])
+print("; ".join(bad))
+PY
+)"
+if [ -z "$check" ] && [ "$(wc -l <"$STUB_DIR/smoke-calls" | tr -d ' ')" = 1 ] \
+  && tar -tzf "$GOUT/evidence.tgz" | grep -q '^qualify.out$' \
+  && tar -tzf "$GOUT/evidence.tgz" | grep -q '^object-counts/after-declare.json$'; then
+  pass "a GCP results.json carries the store, release, footprint, declared-column and fetch-policy stamps"
+else
+  fail "gcp provenance" "$check"
+fi
+
+# Catches: fetch-gcp.sh printing a run instead of judging it, or a ClickBench
+# results file that does not carry the run's own figures.
+code=0
+bash "$KIT_SRC/fetch-gcp.sh" --run-toml "$GCP_TOML" --out "$TMP/gfetch" --interval 1 "$GCP_RUN_ID" \
+  >"$TMP/gfetch.out" 2>"$TMP/gfetch.err" || code=$?
+up="$(python3 - "$TMP/gfetch/c2d-highcpu-16.json" "$GOUT/results.json" <<'PY'
+import json, sys
+u = json.load(open(sys.argv[1]))
+r = json.load(open(sys.argv[2]))
+bad = []
+if [k for k in u] != ["system", "date", "machine", "cluster_size", "proprietary", "hardware", "tuned",
+                      "tags", "load_time", "data_size", "concurrent_qps", "concurrent_error_ratio", "result"]:
+    bad.append("keys %r" % list(u))
+if len(u["result"]) != 43 or any(len(t) != 3 or None in t for t in u["result"]):
+    bad.append("result shape")
+if u["result"][0] != [0.5, 0.5, 0.5]:
+    bad.append("q01 %r" % u["result"][0])
+if u["data_size"] != r["provenance"]["store_footprint"]["tenants"]["0123abcd"]["bytes"]:
+    bad.append("data_size %r" % u["data_size"])
+if u["machine"] != "c2d-highcpu-16" or not isinstance(u["load_time"], int):
+    bad.append("machine or load_time")
+if u["concurrent_qps"] != round(r["concurrent"]["pooled"]["qps_pooled"], 3):
+    bad.append("concurrent_qps")
+print("; ".join(bad))
+PY
+)"
+if [ "$code" = 0 ] && [ -z "$up" ] && [ "$(grep -c '^PASS ' "$TMP/gfetch.out")" = 25 ] \
+  && ! grep -q '^MISS\|^UNJUDGED' "$TMP/gfetch.out"; then
+  pass "fetch-gcp writes the ClickBench results file and passes all 25 pre-registered figures"
+else
+  fail "fetch-gcp" "exit $code, '$up': $(tail -n 3 "$TMP/gfetch.err") $(grep -v '^PASS' "$TMP/gfetch.out" | head -n 3)"
+fi
+
+# prereg_case NAME WANT_CODE WANT PREREG RESULTS PROGRESS: kit.py prereg on
+# the fetched run with one input replaced must exit WANT_CODE printing WANT.
+prereg_case() {
+  local name="$1" want_code="$2" want="$3" code=0
+  python3 "$KIT_SRC/lib/kit.py" prereg "$4" "$5" "$6" "$TMP/gfetch/c2d-highcpu-16.json" "$GCP_STORE" \
+    >"$TMP/prereg-case.out" 2>&1 || code=$?
+  if [ "$code" = "$want_code" ] && grep -qF -- "$want" "$TMP/prereg-case.out"; then
+    pass "the pre-registration judge: $name"
+  else
+    fail "prereg $name" "exit $code: $(grep -v '^PASS' "$TMP/prereg-case.out" | head -c 300)"
+  fi
+}
+GRES="$TMP/gfetch/A/results.json"
+GPROG="$TMP/gfetch/A/progress.log"
+# Catches: a band that cannot miss.
+sed 's/^hot_sum_s = .*/hot_sum_s = [0, 1]/' "$GCP_PREREG" >"$TMP/prereg-hot.toml"
+prereg_case "a hot sum outside its band is a miss, exit 1" 1 'MISS         A        hot_sum_s' \
+  "$TMP/prereg-hot.toml" "$GRES" "$GPROG"
+# Catches: a figure emitted twice read as whichever came last.
+python3 - "$GRES" "$TMP/res-dup.json" <<'PY'
+import sys
+t = open(sys.argv[1]).read()
+open(sys.argv[2], "w").write(t.replace('"answered": 43', '"answered": 43, "answered": 42', 1))
+PY
+prereg_case "a figure emitted twice is refused, exit 2" 2 "key 'answered' appears twice" \
+  "$GCP_PREREG" "$TMP/res-dup.json" "$GPROG"
+# Catches: a log figure stamped twice judged anyway.
+{ cat "$GPROG"; grep ' step=load state=start$' "$GPROG"; } >"$TMP/prog-dup.log"
+prereg_case "a load step stamped twice leaves load_time_s unjudged, exit 2" 2 'UNJUDGED     A        load_time_s' \
+  "$GCP_PREREG" "$GRES" "$TMP/prog-dup.log"
+# Catches: a missing stamp passing for an unremarkable one.
+python3 - "$GRES" "$TMP/res-nodecl.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+del r["provenance"]["declared_columns"]
+json.dump(r, open(sys.argv[2], "w"))
+PY
+prereg_case "a missing stamp is unjudged, exit 2" 2 'UNJUDGED     A        declared_columns' \
+  "$GCP_PREREG" "$TMP/res-nodecl.json" "$GPROG"
+# Catches: a run judged against a bucket other than its own.
+code=0
+python3 "$KIT_SRC/lib/kit.py" prereg "$GCP_PREREG" "$GRES" "$GPROG" "$TMP/gfetch/c2d-highcpu-16.json" \
+  other-bucket >"$TMP/prereg-other.out" 2>&1 || code=$?
+if [ "$code" = 1 ] && grep -q '^MISS .*store_identity' "$TMP/prereg-other.out"; then
+  pass "the pre-registration judge: the store identity must name the run's own bucket"
+else
+  fail "prereg other bucket" "exit $code"
+fi
+
+# gcp_box_fails NAME STEP [ENV=VALUE...]: the box must upload FAILED naming
+# STEP and delete itself.
+gcp_box_fails() {
+  local name="$1" step="$2" code=0
+  shift 2
+  run_gcp_box "$name" "$@" || code=$?
+  if [ "$code" != 0 ] && grep -q "^FAILED step=$step " "$GCP_RUN_DIR/out/A/FAILED" 2>/dev/null \
+    && grep -q '^gce delete ravel-clickbench-stub$' "$STUB_LOG"; then
+    return 0
+  fi
+  echo "  exit $code; FAILED: $(head -n 2 "$GCP_RUN_DIR/out/A/FAILED" 2>/dev/null | tr '\n' ' '); run.log: $(tail -n 3 "$TMP/$name/kit/run.log" | tr '\n' ' ')"
+  return 1
+}
+# Catches: a release binary other than the pinned one measured.
+for a in amd64 arm64; do printf 'x' >>"$STUB_DIR/release/ravel-server-linux-$a"; done
+if gcp_box_fails gbox-digest release && grep -q 'run.toml pins' "$TMP/gbox-digest/kit/run.log" \
+  && [ ! -s "$STUB_DIR/cli-argv" ]; then
+  pass "a release binary with another digest fails the GCP box at step release"
+else
+  fail "gcp release digest" "see above"
+fi
+for a in amd64 arm64; do cp "$BINSTUBS/ravel-server" "$STUB_DIR/release/ravel-server-linux-$a"; done
+# Catches: a binary without the SQL surface reaching the load.
+if gcp_box_fails gbox-smoke sql-smoke STUB_SMOKE_FAIL=1 && ! grep -q ' load ' "$STUB_DIR/cli-argv"; then
+  pass "a server that refuses SELECT 1 fails the GCP box before the load"
+else
+  fail "gcp sql smoke" "see above"
+fi
+# Catches: a tenant whose declaration did not take measured anyway.
+if gcp_box_fails gbox-declared declared STUB_DECLARED=42 \
+  && grep -q 'the tenant declares 42 columns, the mapping has 104 entries' "$TMP/gbox-declared/kit/run.log"; then
+  pass "a declared column count other than the mapping's fails the GCP box at step declared"
+else
+  fail "gcp declared" "see above"
+fi
+
+# Catches: a FAILED box read as a result.
+code=0
+bash "$KIT_SRC/fetch-gcp.sh" --run-toml "$GCP_TOML" --out "$TMP/gfetch-failed" --interval 1 "$GCP_RUN_ID" \
+  >/dev/null 2>"$TMP/gfetch-failed.err" || code=$?
+if [ "$code" = 2 ] && grep -q 'FAILED step=declared' "$TMP/gfetch-failed.err"; then
+  pass "fetch-gcp exits 2 on FAILED and prints it"
+else
+  fail "fetch-gcp FAILED" "exit $code: $(tail -n 2 "$TMP/gfetch-failed.err")"
+fi
+
+# Catches: a watcher that waits eleven hours on a box that is already gone.
+rm -rf "$GCP_RUN_DIR/out"
+mv "$STUB_DIR/gce/$GCP_INSTANCE" "$TMP/gce-saved"
+code=0
+bash "$KIT_SRC/fetch-gcp.sh" --run-toml "$GCP_TOML" --out "$TMP/gfetch-gone" --interval 1 --timeout 30 "$GCP_RUN_ID" \
+  >/dev/null 2>"$TMP/gfetch-gone.err" || code=$?
+if [ "$code" = 6 ] && grep -q 'the box is gone without a word' "$TMP/gfetch-gone.err"; then
+  pass "fetch-gcp exits 6 when the instance is gone and wrote no marker"
+else
+  fail "fetch-gcp gone" "exit $code: $(tail -n 2 "$TMP/gfetch-gone.err")"
+fi
+mv "$TMP/gce-saved" "$STUB_DIR/gce/$GCP_INSTANCE"
+
+# Catches: a teardown that leaves the store bucket or a stopped instance, or
+# reports nothing left without asking again.
+reset_log
+code=0
+bash "$KIT_SRC/teardown-gcp.sh" "$GCP_TOML" "$GCP_RUN_ID" >"$TMP/gtear.out" 2>&1 || code=$?
+if [ "$code" = 0 ] && [ ! -e "$STUB_DIR/gce/$GCP_INSTANCE" ] && [ ! -d "$FAKE_GCS/$GCP_STORE" ] \
+  && grep -q '^Listed 0 items.$' "$TMP/gtear.out" && grep -q "gs://$GCP_STORE does not exist" "$TMP/gtear.out" \
+  && [ -d "$FAKE_GCS/kit-test-gcs-bucket" ]; then
+  pass "teardown deletes the run's instance and store bucket, keeps the results bucket, and says nothing remains"
+else
+  fail "teardown" "exit $code: $(tail -n 4 "$TMP/gtear.out")"
+fi
+echo us-central1-a >"$STUB_DIR/gce/$GCP_INSTANCE"
+code=0
+STUB_GCLOUD_FAIL=instance-delete bash "$KIT_SRC/teardown-gcp.sh" "$GCP_TOML" "$GCP_RUN_ID" >"$TMP/gtear2.out" 2>&1 || code=$?
+if [ "$code" = 1 ] && grep -q "instances of $GCP_RUN_ID remain" "$TMP/gtear2.out"; then
+  pass "teardown exits 1 when an instance of the run remains"
+else
+  fail "teardown remaining" "exit $code: $(tail -n 3 "$TMP/gtear2.out")"
+fi
+rm -f "$STUB_DIR/gce/$GCP_INSTANCE"
+
 # --- syntax -----------------------------------------------------------------
 
 # Catches: a kit script that no longer parses.
 syntax=0
-for f in launch.sh fetch.sh box/run.sh kit.test.sh; do
+for f in launch.sh fetch.sh box/run.sh kit.test.sh launch-gcp.sh fetch-gcp.sh setup-gcp.sh teardown-gcp.sh; do
   bash -n "$KIT_SRC/$f" || syntax=1
 done
 python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$KIT_SRC/lib/kit.py" || syntax=1

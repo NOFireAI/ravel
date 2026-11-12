@@ -217,6 +217,9 @@ rule as every other page.
 - [internal/clickbench-aws-runbook.md](internal/clickbench-aws-runbook.md):
   the same workload end to end on AWS, from an empty account to a measured
   pass.
+- [internal/clickbench-gcp-runbook.md](internal/clickbench-gcp-runbook.md):
+  a published release on one GCE instance against a GCS bucket through the
+  native GCS store, with one command to launch and one to collect.
 - [internal/metricsbench-aws-runbook.md](internal/metricsbench-aws-runbook.md):
   MetricsBench on one EC2 box, on real S3 and on the portable lane, from the
   instance role to a published reference run.
