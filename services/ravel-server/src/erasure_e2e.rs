@@ -173,6 +173,36 @@ impl TickHarness {
         )
         .await;
     }
+
+    /// [`Self::tick`] wired to `refold` as a process whose scheduled fold runs
+    /// wires it: the superseded-input sweep sends the hours a live HEAD still
+    /// names to the queue the fold tick reads.
+    async fn tick_with_refold(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        now_ns: i64,
+        shard_count: u32,
+        refold: &crate::fold::RefoldQueue,
+    ) {
+        let clock = ravel_maintain::FixedClock::new(now_ns);
+        let live_set = self.worker.solo_live_set();
+        crate::maintain::run_tick_with_refold(
+            &clock,
+            store,
+            tenant,
+            &self.compactor,
+            &self.retention,
+            shard_count,
+            &mut self.memo,
+            &self.safety,
+            &self.ownership,
+            &self.worker,
+            &live_set,
+            Some(refold),
+        )
+        .await;
+    }
 }
 
 // --- durable-store erasure oracles ----------------------------------------
@@ -246,6 +276,29 @@ async fn submit_erasure_request(
     subject: &str,
     now_ns: i64,
 ) -> String {
+    submit_erasure_request_on(
+        store,
+        tenant,
+        signal,
+        request_id,
+        SUBJECT_KEY,
+        subject,
+        now_ns,
+    )
+    .await
+}
+
+/// [`submit_erasure_request`] for a predicate on `key` rather than
+/// [`SUBJECT_KEY`].
+async fn submit_erasure_request_on(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    request_id: Uuid,
+    key: &str,
+    subject: &str,
+    now_ns: i64,
+) -> String {
     let request = ravel_proto::commit::v1::ErasureRequest {
         format_version: ravel_commit::erasure::FORMAT_VERSION,
         tenant_hash: tenant.0.to_vec(),
@@ -253,7 +306,7 @@ async fn submit_erasure_request(
         request_id: request_id.to_string(),
         created_unix_ns: now_ns,
         predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
-            key: SUBJECT_KEY.to_string(),
+            key: key.to_string(),
             value: subject.to_string(),
         }],
         window_start_ns: 0,
@@ -686,6 +739,789 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
             SURVIVOR_VALUE.to_bits(),
             "the bystander's sample payload survives the rewrite bit-exact"
         );
+    }
+}
+
+// === Metrics with key-index leaves and the label index on =================
+
+/// The metrics chain again, with the fold building the ADR-3694 decision 2
+/// `label_value` leaf: the erasure gate holds the leaf build while the request
+/// is pending, the refold after the rewrite builds a leaf without the erased
+/// values, and the catalog sweep reaps the stale leaf.
+mod metrics_leaves {
+    use super::*;
+    use std::time::Duration;
+
+    use ravel_catalog::{
+        Catalog, CatalogConfig, KeyIndexLeafLimits, PartLimits, decode_head, decode_part,
+        verify_key_index_leaf,
+    };
+    use ravel_proto::catalog::v1::SnapshotHead;
+    use ravel_segment::{ReaderLimits, decode_catalog_v5, open_from_full};
+
+    use crate::fold::RefoldQueue;
+
+    const SHARD_COUNT: u32 = 2;
+    /// The erasure subject's `instance`, and the one value its second series
+    /// carries that no other series does.
+    const ERASED_INSTANCE: &str = "instance-erased";
+    const ERASED_ONLY_JOB: &str = "job-erased-only";
+    /// The survivor differs from the subject's first series only in
+    /// `instance`.
+    const SURVIVING_INSTANCE: &str = "instance-kept";
+    const SHARED_JOB: &str = "job-shared";
+    /// The one series of the shard-1 object, which no erasure touches.
+    const OTHER_INSTANCE: &str = "instance-other";
+    /// Pseudo-random samples per series, so each object's data bytes keep
+    /// its share of the leaf within the default 1% byte cap.
+    const SAMPLES: usize = 10_000;
+    /// The first sample: one minute into ingest hour 0.
+    const BASE_TS_NS: i64 = 60_000_000_000;
+    /// The instant every query reads at, inside every series' samples.
+    const QUERY_TIME_S: i64 = BASE_TS_NS / 1_000_000_000 + 2;
+
+    /// A published data object: its key and its content hash.
+    struct Published {
+        data_key: String,
+        content_hash: [u8; 32],
+    }
+
+    /// `key8` of a `Str` key-index value (`ravel_codec::key_idx::key8_str`):
+    /// the first 8 bytes of the unkeyed blake3.
+    fn key8(value: &str) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&blake3::hash(value.as_bytes()).as_bytes()[..8]);
+        out
+    }
+
+    fn labels(instance: &str, job: &str) -> LabelSet {
+        LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: METRIC_NAME.to_string(),
+            },
+            Label {
+                name: "instance".to_string(),
+                value: instance.to_string(),
+            },
+            Label {
+                name: "job".to_string(),
+                value: job.to_string(),
+            },
+        ])
+        .expect("valid labels")
+    }
+
+    /// Publishes one sealed RSEG object into ingest hour 0 of `shard`, one
+    /// series per `(instance, job)` pair, each with [`SAMPLES`] pseudo-random
+    /// samples.
+    async fn publish_object(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        shard: u32,
+        series: &[(&str, &str)],
+    ) -> Published {
+        let mut state = (u64::from(shard) + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut inputs: Vec<SeriesInput> = series
+            .iter()
+            .map(|(instance, job)| {
+                let labels = labels(instance, job);
+                let samples = (0..SAMPLES)
+                    .map(|i| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        Sample {
+                            ts_ns: BASE_TS_NS + i as i64 * 1_000_000,
+                            value: (state >> 11) as f64 / (1u64 << 53) as f64,
+                        }
+                    })
+                    .collect();
+                SeriesInput {
+                    series_id: SeriesId::compute(tenant, METRIC_NAME, &labels).expect("series id"),
+                    labels,
+                    samples,
+                }
+            })
+            .collect();
+        inputs.sort_by_key(|s| s.series_id);
+        let tenant_hash = tenant.hash();
+        let writer_id = Uuid::from_u128(0x4147_0000 + u128::from(shard));
+        let max_ts = BASE_TS_NS + SAMPLES as i64 * 1_000_000;
+        let written = SegmentWriter::write(
+            inputs,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: BASE_TS_NS,
+                max_ingest_ts_ns: max_ts,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: BASE_TS_NS,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: BASE_TS_NS,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        Published {
+            data_key,
+            content_hash: written.summary.blake3,
+        }
+    }
+
+    /// The catalog a server started with `--fold-key-index-leaves
+    /// --fold-metrics-label-index` folds with: both switches parsed and
+    /// validated by the server's own `Cli`.
+    fn leaf_catalog(store: Arc<dyn ObjectStoreBackend>) -> Catalog {
+        let cli = Cli::parse_validated_from([
+            "ravel-server",
+            "--fold-key-index-leaves",
+            "--fold-metrics-label-index",
+        ])
+        .expect("flags parse");
+        assert!(cli.fold_key_index_leaves && cli.maintenance.fold_metrics_label_index);
+        Catalog::new(
+            store,
+            CatalogConfig {
+                shard_count: SHARD_COUNT,
+                build_key_index_leaves: cli.fold_key_index_leaves,
+                metrics_label_index: cli.maintenance.fold_metrics_label_index,
+                ..crate::query::server_catalog_config_base()
+            },
+        )
+        .expect("catalog")
+    }
+
+    /// One scheduled fold tick at `now_ns` ([`crate::fold::run_tick`]),
+    /// reading `refold` as the running fold loop does. Asserts no tenant
+    /// failed.
+    async fn fold_at(
+        catalog: &Catalog,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        harness: &TickHarness,
+        refold: &RefoldQueue,
+        now_ns: i64,
+    ) -> crate::fold::FoldTickReport {
+        let live_set = harness.worker.solo_live_set();
+        let report = crate::fold::run_tick(
+            catalog,
+            store,
+            Signal::Metrics,
+            Some(&[*tenant]),
+            Uuid::from_u128(0xF01D),
+            Duration::ZERO,
+            &harness.retention,
+            &harness.worker,
+            &live_set,
+            &ravel_maintain::FixedClock::new(now_ns),
+            refold,
+        )
+        .await
+        .expect("fold tick");
+        assert!(report.failed.is_empty(), "{report:?}");
+        report
+    }
+
+    async fn read_head(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> SnapshotHead {
+        let got = store
+            .get(
+                &crate::fold::head_key(tenant, Signal::Metrics),
+                GetRange::Full,
+            )
+            .await
+            .expect("HEAD");
+        decode_head(&got.data).expect("decode HEAD")
+    }
+
+    /// Every `.kidx` key-index leaf object in the tenant's metrics catalog,
+    /// sorted.
+    async fn kidx_objects(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> Vec<String> {
+        let prefix = format!(
+            "t/{}/catalog/{}/idx/",
+            tenant.to_hex(),
+            Signal::Metrics.key_prefix()
+        );
+        let mut keys: Vec<String> = list_all(store, &prefix)
+            .await
+            .expect("list idx")
+            .into_iter()
+            .map(|meta| meta.key)
+            .filter(|key| key.ends_with(".kidx"))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Every leaf key the HEAD's parts name, sorted.
+    fn head_leaves(head: &SnapshotHead) -> Vec<String> {
+        let mut keys: Vec<String> = head
+            .parts
+            .iter()
+            .flat_map(|part| part.key_index.iter().map(|leaf| leaf.key.clone()))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// How many entries of the leaf at `key` answer each of `values`.
+    async fn leaf_hits(store: &dyn ObjectStoreBackend, key: &str, values: &[&str]) -> Vec<usize> {
+        let got = store.get(key, GetRange::Full).await.expect("get leaf");
+        let summary =
+            verify_key_index_leaf(&got.data, &KeyIndexLeafLimits::default()).expect("valid leaf");
+        values
+            .iter()
+            .map(|value| {
+                let key8 = key8(value);
+                summary.entries.iter().filter(|e| e.key8 == key8).count()
+            })
+            .collect()
+    }
+
+    /// The `(level, shard)` and content hash of every entry the HEAD's parts
+    /// carry, sorted.
+    async fn head_entries(
+        store: &dyn ObjectStoreBackend,
+        head: &SnapshotHead,
+    ) -> Vec<(u32, u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        for part in &head.parts {
+            let got = store.get(&part.key, GetRange::Full).await.expect("part");
+            let decoded = decode_part(&got.data, &PartLimits::default()).expect("decode part");
+            out.extend(
+                decoded
+                    .entries
+                    .into_iter()
+                    .map(|e| (e.level, e.shard, e.content_hash)),
+            );
+        }
+        out.sort();
+        out
+    }
+
+    /// One routed instant query's answer: `(instance, job, value bits)` per
+    /// series, sorted, with the objects the label index pruned and the
+    /// keyIndex phase's GETs, wire bytes and cache-served bytes.
+    #[derive(Debug, PartialEq)]
+    struct Routed {
+        series: Vec<(String, String, u64)>,
+        pruned: u64,
+        key_index: [u64; 3],
+    }
+
+    fn urlencode(raw: &str) -> String {
+        raw.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                other => format!("%{other:02X}"),
+            })
+            .collect()
+    }
+
+    /// `METRIC_NAME{label="value"}` at [`QUERY_TIME_S`] through a fresh
+    /// server's `/api/v1/query`.
+    async fn query(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant: &TenantId,
+        label: &str,
+        value: &str,
+    ) -> Routed {
+        let cache = build_cache(
+            &Cli::try_parse_from(["ravel-server"]).expect("cli"),
+            crate::config::DEFAULT_CACHE_MAX_BYTES,
+        )
+        .expect("cache");
+        let app = build_metrics_app(
+            Arc::clone(store),
+            cache,
+            tenant,
+            SHARD_COUNT,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        );
+        let selector = format!("{METRIC_NAME}{{{label}=\"{value}\"}}");
+        let uri = format!(
+            "/api/v1/query?query={}&time={QUERY_TIME_S}",
+            urlencode(&selector)
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .header("authorization", "Bearer acme-token")
+            .body(Body::empty())
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK, "{selector}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: Value = serde_json::from_slice(&bytes).expect("parse json");
+        assert_eq!(json["status"], "success", "{json}");
+        let mut series: Vec<(String, String, u64)> = json["data"]["result"]
+            .as_array()
+            .expect("result array")
+            .iter()
+            .map(|entry| {
+                let value: f64 = entry["value"][1]
+                    .as_str()
+                    .expect("value string")
+                    .parse()
+                    .expect("f64");
+                (
+                    entry["metric"]["instance"]
+                        .as_str()
+                        .expect("instance")
+                        .to_string(),
+                    entry["metric"]["job"].as_str().expect("job").to_string(),
+                    value.to_bits(),
+                )
+            })
+            .collect();
+        series.sort();
+        let stats = &json["data"]["stats"];
+        let key_index = stats["phases"]
+            .as_array()
+            .expect("phases")
+            .iter()
+            .find(|phase| phase["phase"] == "keyIndex")
+            .unwrap_or_else(|| panic!("no keyIndex phase in {json}"));
+        let figure = |field: &str| key_index[field].as_u64().expect("keyIndex figure");
+        Routed {
+            series,
+            pruned: stats["segmentsPrunedByLabelIndex"]
+                .as_u64()
+                .expect("segmentsPrunedByLabelIndex"),
+            key_index: [
+                figure("s3GetRequests"),
+                figure("s3GetWireBytes"),
+                figure("cacheServedBytes"),
+            ],
+        }
+    }
+
+    /// Every RSEG data object under the tenant: its key and the label sets
+    /// its catalog holds.
+    async fn live_series(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+    ) -> Vec<(String, Vec<LabelSet>)> {
+        let limits = ReaderLimits::default();
+        let mut out = Vec::new();
+        for meta in list_all(store, &format!("t/{}/", tenant.to_hex()))
+            .await
+            .expect("list tenant")
+        {
+            if !meta.key.ends_with(".rseg") {
+                continue;
+            }
+            let got = store.get(&meta.key, GetRange::Full).await.expect("rseg");
+            let loc = open_from_full(&got.data, limits).expect("open rseg");
+            let labels = decode_catalog_v5(&loc.footer, &got.data, limits)
+                .expect("decode catalog")
+                .into_iter()
+                .map(|entry| entry.entry.labels)
+                .collect();
+            out.push((meta.key, labels));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Every object under the tenant whose bytes hold `needle` verbatim.
+    async fn objects_holding(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        needle: &[u8],
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        for meta in list_all(store, &format!("t/{}/", tenant.to_hex()))
+            .await
+            .expect("list tenant")
+        {
+            let got = store.get(&meta.key, GetRange::Full).await.expect("get");
+            if got.data.windows(needle.len()).any(|w| w == needle) {
+                out.push(meta.key);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Issue #4147, the ADR-3694 Stage 1 erasure acceptance: a metrics
+    /// erasure driven through the server's real fold and maintain ticks with
+    /// `--fold-key-index-leaves --fold-metrics-label-index` on.
+    ///
+    /// The subject (`instance="instance-erased"`) has two series in the
+    /// shard-0 object: one that differs from the survivor only in `instance`,
+    /// and one carrying `job="job-erased-only"`, a value nothing else holds.
+    /// The shard-1 object holds one unrelated series. The order is the one the
+    /// shipped chain forces: the `.dreq` is held while a live HEAD names the
+    /// superseded inputs, so the refold that drops them runs while the request
+    /// is still pending, under the erasure gate, and writes no leaf. Every
+    /// entry is in one UTC day, so its part is the tail, which the first fold
+    /// after the `.dreq` sweep re-encodes with the new leaf.
+    #[tokio::test]
+    async fn metrics_erasure_rewrites_refolds_a_new_leaf_and_sweeps_the_stale_one() {
+        let mem = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ObjectStoreBackend> = mem.clone();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        // The store stamps each object's `last_modified` from this clock, so
+        // the catalog sweep's age gate reads when each leaf was written.
+        let set_clock = |now_ns: i64| mem.set_clock_ms(u64::try_from(now_ns / 1_000_000).unwrap());
+        const MINUTE_NS: i64 = NS_PER_HOUR / 60;
+
+        let s0 = publish_object(
+            store.as_ref(),
+            &tenant_id,
+            0,
+            &[
+                (ERASED_INSTANCE, SHARED_JOB),
+                (ERASED_INSTANCE, ERASED_ONLY_JOB),
+                (SURVIVING_INSTANCE, SHARED_JOB),
+            ],
+        )
+        .await;
+        let s1 = publish_object(store.as_ref(), &tenant_id, 1, &[(OTHER_INSTANCE, SHARED_JOB)])
+            .await;
+
+        let catalog = leaf_catalog(Arc::clone(&store));
+        let refold = RefoldQueue::default();
+        let mut harness = TickHarness::new();
+        let values = [
+            ERASED_INSTANCE,
+            ERASED_ONLY_JOB,
+            SURVIVING_INSTANCE,
+            SHARED_JOB,
+            OTHER_INSTANCE,
+        ];
+
+        // 1. The fold builds one metrics leaf for the one part holding both
+        //    objects, and it names each value's holders exactly.
+        let t1 = TEST_NOW_NS;
+        set_clock(t1);
+        let report = fold_at(&catalog, store.as_ref(), &tenant, &harness, &refold, t1).await;
+        assert_eq!(report.folded, vec![tenant], "{report:?}");
+        let head = read_head(store.as_ref(), &tenant).await;
+        assert_eq!(head.parts.len(), 1, "{head:?}");
+        let stale_leaf = head_leaves(&head);
+        assert_eq!(stale_leaf.len(), 1, "one leaf for the one part: {head:?}");
+        let stale_leaf = stale_leaf[0].clone();
+        assert_eq!(
+            kidx_objects(store.as_ref(), &tenant).await,
+            vec![stale_leaf.clone()]
+        );
+        assert_eq!(
+            leaf_hits(store.as_ref(), &stale_leaf, &values).await,
+            vec![1, 1, 1, 2, 1],
+            "the pre-erasure leaf names the shard-0 object for each subject value"
+        );
+
+        let erased_only_before = query(&store, &tenant_id, "job", ERASED_ONLY_JOB).await;
+        assert_eq!(
+            erased_only_before.series.len(),
+            1,
+            "{erased_only_before:?}"
+        );
+        assert_eq!(
+            erased_only_before.pruned, 1,
+            "the leaf routes the erased-only value to the shard-0 object alone"
+        );
+        let survivor_before = query(&store, &tenant_id, "instance", SURVIVING_INSTANCE).await;
+        assert_eq!(survivor_before.series.len(), 1, "{survivor_before:?}");
+        assert_eq!(survivor_before.pruned, 1, "{survivor_before:?}");
+        let other_before = query(&store, &tenant_id, "instance", OTHER_INSTANCE).await;
+        assert_eq!(other_before.series.len(), 1, "{other_before:?}");
+
+        // 2. While the request is pending the router prunes nothing and reads
+        //    no leaf, though HEAD still names one.
+        let request_id = Uuid::from_u128(0x4147);
+        let dreq_key = submit_erasure_request_on(
+            store.as_ref(),
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            "instance",
+            ERASED_INSTANCE,
+            t1,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        assert_eq!(
+            query(&store, &tenant_id, "job", ERASED_ONLY_JOB).await,
+            Routed {
+                series: Vec::new(),
+                pruned: 0,
+                key_index: [0, 0, 0],
+            }
+        );
+        assert_eq!(
+            query(&store, &tenant_id, "instance", SURVIVING_INSTANCE).await,
+            Routed {
+                pruned: 0,
+                key_index: [0, 0, 0],
+                series: survivor_before.series.clone(),
+            }
+        );
+
+        // The rewrite lands at t1. A windowless request rewrites every bucket
+        // it overlaps, the zero-drop shard-1 one included (ADR-0064 §4).
+        harness
+            .tick_with_refold(store.as_ref(), &tenant, t1, SHARD_COUNT, &refold)
+            .await;
+        let records = rewrite_records(store.as_ref(), &tenant, Signal::Metrics, 0, 0).await;
+        assert_eq!(records.len(), 1, "one rewrite in the shard-0 bucket");
+        assert_eq!(
+            records[0]
+                .drops
+                .iter()
+                .map(|d| d.dropped_count)
+                .collect::<Vec<_>>(),
+            vec![2 * SAMPLES as u64],
+            "both subject series' samples are dropped"
+        );
+        assert_eq!(
+            rewritten_metric_labels(store.as_ref(), &records[0]).await,
+            vec![labels(SURVIVING_INSTANCE, SHARED_JOB)]
+        );
+        let other_records = rewrite_records(store.as_ref(), &tenant, Signal::Metrics, 1, 0).await;
+        assert_eq!(other_records.len(), 1);
+        assert_eq!(
+            other_records[0]
+                .drops
+                .iter()
+                .map(|d| d.dropped_count)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(
+            rewritten_metric_labels(store.as_ref(), &other_records[0]).await,
+            vec![labels(OTHER_INSTANCE, SHARED_JOB)]
+        );
+        assert!(!object_exists(store.as_ref(), &done_key).await);
+
+        // A fold while the request is pending builds no metrics leaf: it
+        // re-lists nothing and carries the part with its old ref.
+        let t2 = t1 + MINUTE_NS;
+        set_clock(t2);
+        let report = fold_at(&catalog, store.as_ref(), &tenant, &harness, &refold, t2).await;
+        assert_eq!(report.refold_hours_reconciled, 0, "{report:?}");
+        assert_eq!(
+            kidx_objects(store.as_ref(), &tenant).await,
+            vec![stale_leaf.clone()],
+            "a fold while the request is pending builds no metrics leaf"
+        );
+        assert_eq!(
+            head_leaves(&read_head(store.as_ref(), &tenant).await),
+            vec![stale_leaf.clone()]
+        );
+
+        // 3. Completion. The ack-open hour seals and `.done` lands.
+        let t3 = harness.ack_hour_sealed_ns(t1);
+        set_clock(t3);
+        harness
+            .tick_with_refold(store.as_ref(), &tenant, t3, SHARD_COUNT, &refold)
+            .await;
+        assert!(object_exists(store.as_ref(), &done_key).await);
+        assert!(object_exists(store.as_ref(), &dreq_key).await);
+
+        // Past the horizon the superseded-input sweep is blocked by the HEAD
+        // that still names the inputs: it queues the hour for refold, and the
+        // `.dreq` is held with them.
+        let t4 = t3 + harness.protection_horizon_ns() + 1;
+        set_clock(t4);
+        harness
+            .tick_with_refold(store.as_ref(), &tenant, t4, SHARD_COUNT, &refold)
+            .await;
+        assert!(object_exists(store.as_ref(), &dreq_key).await);
+        assert!(object_exists(store.as_ref(), &s0.data_key).await);
+        assert!(object_exists(store.as_ref(), &s1.data_key).await);
+
+        // The refold drops the inputs from HEAD, re-encoding the part under
+        // the erasure gate: no leaf, and the stale one is unreferenced.
+        let t5 = t4 + MINUTE_NS;
+        set_clock(t5);
+        let report = fold_at(&catalog, store.as_ref(), &tenant, &harness, &refold, t5).await;
+        assert_eq!(report.folded, vec![tenant], "{report:?}");
+        assert_eq!(report.refold_hours_reconciled, 1, "{report:?}");
+        let head = read_head(store.as_ref(), &tenant).await;
+        assert_eq!(head_leaves(&head), Vec::<String>::new());
+        assert_eq!(
+            kidx_objects(store.as_ref(), &tenant).await,
+            vec![stale_leaf.clone()]
+        );
+
+        // The catalog sweep deletes the unreferenced stale leaf, written more
+        // than a horizon ago; the inputs and the `.dreq` wait out a horizon
+        // from the HEAD that dropped them.
+        let t6 = t5 + MINUTE_NS;
+        set_clock(t6);
+        harness
+            .tick_with_refold(store.as_ref(), &tenant, t6, SHARD_COUNT, &refold)
+            .await;
+        assert_eq!(
+            kidx_objects(store.as_ref(), &tenant).await,
+            Vec::<String>::new(),
+            "the stale leaf is swept"
+        );
+        assert!(object_exists(store.as_ref(), &dreq_key).await);
+        assert!(object_exists(store.as_ref(), &s0.data_key).await);
+
+        let t7 = t6 + harness.protection_horizon_ns() + 1;
+        set_clock(t7);
+        harness
+            .tick_with_refold(store.as_ref(), &tenant, t7, SHARD_COUNT, &refold)
+            .await;
+        assert!(!object_exists(store.as_ref(), &dreq_key).await);
+        assert!(object_exists(store.as_ref(), &done_key).await);
+        assert!(!object_exists(store.as_ref(), &s0.data_key).await);
+        assert!(!object_exists(store.as_ref(), &s1.data_key).await);
+
+        // The fold after completion: HEAD names one new leaf with no key8 of
+        // an erased value that still names each survivor's holder.
+        let t8 = t7 + MINUTE_NS;
+        set_clock(t8);
+        let report = fold_at(&catalog, store.as_ref(), &tenant, &harness, &refold, t8).await;
+        assert_eq!(report.folded, vec![tenant], "{report:?}");
+        assert_eq!(report.refold_hours_reconciled, 0, "{report:?}");
+        let head = read_head(store.as_ref(), &tenant).await;
+        let current_leaf = head_leaves(&head);
+        assert_eq!(
+            current_leaf.len(),
+            1,
+            "the fold after the erasure completes names one metrics leaf: {head:?}"
+        );
+        let current_leaf = current_leaf[0].clone();
+        assert_ne!(current_leaf, stale_leaf);
+        assert_eq!(
+            kidx_objects(store.as_ref(), &tenant).await,
+            vec![current_leaf.clone()]
+        );
+        assert_eq!(
+            leaf_hits(store.as_ref(), &current_leaf, &values).await,
+            vec![0, 0, 1, 2, 1],
+            "the new leaf holds no key8 of an erased value and still names each \
+             survivor's holder"
+        );
+
+        let erased_only = query(&store, &tenant_id, "job", ERASED_ONLY_JOB).await;
+        assert!(erased_only.series.is_empty(), "{erased_only:?}");
+        assert_eq!(
+            erased_only.pruned, 2,
+            "the new leaf proves the erased-only value absent from both objects"
+        );
+        let erased = query(&store, &tenant_id, "instance", ERASED_INSTANCE).await;
+        assert!(erased.series.is_empty(), "{erased:?}");
+        assert_eq!(erased.pruned, 2, "{erased:?}");
+        let survivor_after = query(&store, &tenant_id, "instance", SURVIVING_INSTANCE).await;
+        assert_eq!(
+            survivor_after.series, survivor_before.series,
+            "the survivor's samples are unchanged, bit for bit"
+        );
+        assert_eq!(survivor_after.pruned, 1, "{survivor_after:?}");
+        let other_after = query(&store, &tenant_id, "instance", OTHER_INSTANCE).await;
+        assert_eq!(other_after.series, other_before.series);
+
+        // 4. The catalog sweep past the current leaf's horizon keeps it and
+        //    leaves the stale one gone.
+        let t9 = t8 + harness.protection_horizon_ns() + 1;
+        set_clock(t9);
+        harness
+            .tick_with_refold(store.as_ref(), &tenant, t9, SHARD_COUNT, &refold)
+            .await;
+        assert_eq!(
+            kidx_objects(store.as_ref(), &tenant).await,
+            vec![current_leaf.clone()],
+            "the stale leaf stays swept and the current one is kept"
+        );
+        let head = read_head(store.as_ref(), &tenant).await;
+        assert_eq!(head_leaves(&head), vec![current_leaf.clone()]);
+
+        // No part carries an erased-hour input over: HEAD holds the two
+        // rewrite outputs alone.
+        let entries = head_entries(store.as_ref(), &head).await;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(level, shard, _)| (*level, *shard))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (1, 1)],
+            "{entries:?}"
+        );
+        let mut rewrite_hashes: Vec<Vec<u8>> = records[0]
+            .parts
+            .iter()
+            .chain(&other_records[0].parts)
+            .map(|part| part.content_hash.clone())
+            .collect();
+        rewrite_hashes.sort();
+        let mut entry_hashes: Vec<Vec<u8>> =
+            entries.iter().map(|(_, _, hash)| hash.clone()).collect();
+        entry_hashes.sort();
+        assert_eq!(entry_hashes, rewrite_hashes);
+        assert!(
+            entry_hashes
+                .iter()
+                .all(|hash| hash[..] != s0.content_hash[..] && hash[..] != s1.content_hash[..])
+        );
+
+        // No live object holds the subject: the two live RSEG objects carry
+        // the survivors alone, and no object under the tenant holds an erased
+        // value or its key8.
+        let live = live_series(store.as_ref(), &tenant).await;
+        assert_eq!(live.len(), 2, "{live:?}");
+        let mut live_labels: Vec<LabelSet> =
+            live.iter().flat_map(|(_, sets)| sets.clone()).collect();
+        live_labels.sort_by_key(|labels| format!("{labels:?}"));
+        let mut expected = vec![
+            labels(SURVIVING_INSTANCE, SHARED_JOB),
+            labels(OTHER_INSTANCE, SHARED_JOB),
+        ];
+        expected.sort_by_key(|labels| format!("{labels:?}"));
+        assert_eq!(live_labels, expected);
+        for value in [ERASED_INSTANCE, ERASED_ONLY_JOB] {
+            assert_eq!(
+                objects_holding(store.as_ref(), &tenant, value.as_bytes()).await,
+                Vec::<String>::new(),
+                "{value} survives verbatim"
+            );
+            assert_eq!(
+                objects_holding(store.as_ref(), &tenant, &key8(value)).await,
+                Vec::<String>::new(),
+                "the key8 of {value} survives"
+            );
+        }
     }
 }
 
