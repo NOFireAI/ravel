@@ -149,10 +149,10 @@ pub(crate) struct RestClientParts {
 /// One List Blobs request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ListRequest<'a> {
-    prefix: &'a str,
-    start_from: Option<&'a str>,
-    marker: Option<&'a str>,
-    delimited: bool,
+    pub(crate) prefix: &'a str,
+    pub(crate) start_from: Option<&'a str>,
+    pub(crate) marker: Option<&'a str>,
+    pub(crate) delimited: bool,
 }
 
 /// One parsed List Blobs response, names decoded.
@@ -164,7 +164,7 @@ pub(crate) struct ListResponse {
 }
 
 /// Where the paging loops get their responses: [`AzureRestClient`] in
-/// production, a script in this module's tests.
+/// production, a script in the `azure` module's tests.
 pub(crate) trait ListFetch {
     async fn fetch(&self, request: &ListRequest<'_>) -> Result<ListResponse, StoreError>;
 }
