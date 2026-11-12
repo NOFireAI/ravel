@@ -5,6 +5,7 @@
 //! [`ObjectStoreBackend`], never against a vendor SDK. [`memory::MemoryStore`]
 //! is the semantics oracle used by tests.
 
+pub mod azure;
 pub mod conformance;
 pub mod external;
 pub mod fault;
@@ -46,7 +47,7 @@ pub use scratch::ScratchStore;
 
 /// Content identity: used only for equality assertions between reads of the
 /// same immutable object. Never used as a CAS precondition (that is
-/// [`Version`]). The two coincide on S3 and differ on GCS/Azure.
+/// [`Version`]). The two coincide on S3 and Azure and differ on GCS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Etag(pub String);
 
