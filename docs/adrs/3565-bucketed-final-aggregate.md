@@ -464,7 +464,7 @@ The bound to state for the peak is therefore `P x S` plus the exchange's and the
 
 ## Amendment 4 (2026-11-12): the chunks take what the tables leave
 
-<!-- amendment-applies: sections="Bucket spill decision" pointer="tables-leave amendment" -->
+<!-- amendment-applies: sections="Amendment 2 (2026-11-10): bucket spill for the refusal retry" pointer="tables-leave amendment" -->
 <!-- amendment-supersedes: phrase="fit in the remaining quarter" pointer="tables-leave amendment" -->
 
 This is the tables-leave amendment. Refs: #4133, ADR-4143 decision 1, which is the decision; this amendment points the bucket spill amendment's items 3, 4 and 5 at it and records the figures the code now derives. It resolves the first item of the M8 results amendment's "What follows".
