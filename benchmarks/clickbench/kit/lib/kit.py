@@ -63,7 +63,7 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
   absolute LABEL FILE          print a results.json's absolute band table,
                                exit 1 on a miss
   published LABEL BANDS MACHINE FILE [--published-tries PUB] [--arm-o ARM_O]
-            [--qps-windows LOG [--new-arm NAME]]
+            [--qps-windows LOG [--new-arm NAME]] [--figures KINDS]
                                judge FILE against BANDS' [published.MACHINE]
                                rows (ClickBench's published figures), print
                                the table, exit 1 on a miss; FILE is a kit
@@ -100,6 +100,13 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                LOG with fewer than two windows of either
                                arm, a missing or non-numeric figure, or an
                                arm name it never holds
+                               --figures KINDS: hot, cold or hot,cold
+                               (default): which per-statement figures are
+                               judged, for a pre-registration that names
+                               only some. A kind left out is not judged and
+                               one SKIPPED line per kind says how many
+                               statement rows it covers; the concurrent
+                               QPS row is unaffected
   comparable RUN_TOML A.json B.json
                                refuse two arms that are not comparable, with
                                RUN_TOML's server_flags_a and server_flags_b
@@ -189,6 +196,7 @@ STATEMENT_KEYS = tuple("q%02d" % n for n in range(1, 44))
 PUBLISHED_LANES = ("rlog",)
 PUBLISHED_KEYS = ("statement_max_ratio", "concurrent_qps_min_ratio")
 PUBLISHED_MACHINE_KEYS = ("source", "concurrent_qps") + STATEMENT_KEYS
+FIGURE_KINDS = ("hot", "cold")
 PUBLISHED_NULL = "null"
 PUBLISHED_SOURCE_RE = re.compile(r"^\S+\.json@[0-9a-f]{40}$")
 # Same-box concurrent QPS (ADR-0954 M8): the v0.28.0 arm's name in a windows
@@ -1174,7 +1182,7 @@ def same_box_qps_bands(path, new_arm, published_qps, q):
 
 
 def published_bands(path, machine, report, report_path, tries=None, arm_o=None,
-                    windows=None):
+                    windows=None, figures_judged=FIGURE_KINDS, skipped=None):
     """One run judged against ClickBench's published figures for MACHINE in
     the band file PATH's [published] section (ADR-4034 D6). REPORT, read from
     REPORT_PATH, is a kit results.json whose band_sections selected
@@ -1192,7 +1200,10 @@ def published_bands(path, machine, report, report_path, tries=None, arm_o=None,
     has its hot judged against ARM_O's hot (a (path, report) pair, v0.28.0
     on the same box and data) by the same factor, and is UNJUDGED without
     ARM_O (ADR-0954 M8). WINDOWS, a (path, new arm) pair, replaces the
-    published QPS gate with same_box_qps_bands."""
+    published QPS gate with same_box_qps_bands.
+
+    Only the kinds in FIGURES_JUDGED are judged; a kind left out adds the
+    count of its statement rows to SKIPPED (a dict) instead of a row."""
     _check_machine(report, report_path, machine)
     top, pub = published_table(lane_of(path), path, machine)
     figures, qps, qps_note = _published_measured(report_path, report)
@@ -1207,6 +1218,10 @@ def published_bands(path, machine, report, report_path, tries=None, arm_o=None,
         for i, figure in enumerate(("hot", "cold")):
             p = pub[key][i]
             if p == PUBLISHED_NULL:
+                continue
+            if figure not in figures_judged:
+                if skipped is not None:
+                    skipped[figure] = skipped.get(figure, 0) + 1
                 continue
             m = figures.get(n, (None, None))[i]
             if figure == "hot" and n in unstable:
@@ -2665,12 +2680,23 @@ def validate(path):
     return r
 
 
-PUBLISHED_OPTIONS = ("--published-tries", "--arm-o", "--qps-windows", "--new-arm")
+PUBLISHED_OPTIONS = ("--published-tries", "--arm-o", "--qps-windows", "--new-arm",
+                     "--figures")
+
+
+def figures_arg(value):
+    """The kinds named by a --figures VALUE, in FIGURE_KINDS order; None when
+    it is empty, names an unknown kind or names one twice."""
+    kinds = value.split(",")
+    if any(k not in FIGURE_KINDS for k in kinds) or len(set(kinds)) != len(kinds):
+        return None
+    return tuple(k for k in FIGURE_KINDS if k in kinds)
 
 
 def published_args(args):
     """published's four positional arguments and its options, each given at
-    most once with a value; None on bad usage, including --arm-o without
+    most once with a value; None on bad usage, including a --figures value
+    figures_arg refuses, --arm-o without
     --published-tries and --new-arm without --qps-windows, each of which
     would otherwise be read by nothing."""
     pos, opts = [], {}
@@ -2685,6 +2711,8 @@ def published_args(args):
             pos.append(args[i])
             i += 1
     if len(pos) != 4:
+        return None
+    if "--figures" in opts and figures_arg(opts["--figures"]) is None:
         return None
     if "--arm-o" in opts and "--published-tries" not in opts:
         return None
@@ -2767,8 +2795,15 @@ def main(argv):
                 arm_o = (opts["--arm-o"], _results(opts["--arm-o"]))
             if "--qps-windows" in opts:
                 windows = (opts["--qps-windows"], opts.get("--new-arm", QPS_NEW_ARM))
-            rows = published_bands(bands, machine, _results(path), path, tries, arm_o, windows)
+            judged = figures_arg(opts.get("--figures", ",".join(FIGURE_KINDS)))
+            skipped = {}
+            rows = published_bands(bands, machine, _results(path), path, tries, arm_o, windows,
+                                   judged, skipped)
             print_table(rows, label)
+            for kind in FIGURE_KINDS:
+                if kind not in judged:
+                    print("SKIPPED %s: %d statements not judged (--figures %s)"
+                          % (kind, skipped.get(kind, 0), ",".join(judged)))
             if any(r["verdict"] == "miss" for r in rows):
                 return 1
             unjudged = [r["statement"] for r in rows if r["verdict"] == "unjudged"]
