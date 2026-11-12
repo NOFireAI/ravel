@@ -1459,9 +1459,10 @@ maint_records() {
 # is listed until every (shard, hour) bucket of those hours that holds a
 # commit record holds its tombstone and no other bucket does, at most
 # retired_hour.wait_minutes. maint_records then checks the pass compacted
-# nothing of dp7's logs. It waits for the ingest hour after the last fold
-# and loads the tail corpus's logs into dp7 there (STATE_tail), so the fold
-# that follows advances its watermark. Then `catalog fold
+# nothing of dp7's logs. It waits for the ingest hour after the last fold,
+# so the fold that follows advances its watermark, and loads the tail
+# corpus's logs into dp7 there (STATE_tail), so that fold also publishes a
+# new tail as a fold after live ingest does. Then `catalog fold
 # --retention-default Rs`, which carries R into the fold and reconciles the
 # retirement frontier, is stamped as STATE's fold; the store is listed
 # again (keys-STATE-folded) and inv.py part-puts stamps the snapshot parts
@@ -1523,9 +1524,11 @@ retire_through() {
   list_store "$state-after"
   maint_records "$state" || return 1
   # A fold whose watermark does not advance returns before the retention-
-  # frontier reconcile that observes a tombstone, so the retention fold
-  # needs an unsealed ingest hour holding a commit: the tail, in one batch
-  # flushed at once, after the maintain pass so nothing compacts it.
+  # frontier reconcile that observes a tombstone. --writers-stopped seals
+  # through the wall-clock hour, so the wait for the next hour is what
+  # advances it. The tail is not needed for that: it makes the fold publish
+  # a new tail part as a fold after live ingest does, in one batch flushed
+  # at once, after the maintain pass so nothing compacts it.
   wait_next_hour
   trows="$(batch_rows "$(corpus_rows "$WORK/corpus-tail" logs)" 1)"
   load_signal "${state}_tail" logs "$WORK/corpus-tail" dp7 --batch-rows "$trows" --target-bytes 1 || return 1

@@ -598,7 +598,12 @@ checkout's HEAD, which then does not name what was built).
    whose watermark does not advance, with no unfolded commit in an hour
    it holds open, returns before its retention-frontier reconcile
    (`crates/ravel-catalog/src/fold.rs`, the `advance_to`/`held_open`
-   match), so without the tail the fold below observes no tombstone.
+   match). The wait is what prevents that: `--writers-stopped` seals
+   through the current wall-clock hour (`services/ravel-cli/src/catalog.rs`),
+   so a fold in the next hour advances with or without new data. The tail
+   is not needed for the advance. It makes the fold publish a new tail
+   part, as a fold after live ingest does, and W3's figures below leave
+   that part out.
 5. `ravel-cli catalog fold --writers-stopped --json --key-index-leaves
    --retention-default Rs`, stamped in `folds.jsonl` as `retired_hour`.
    `inv.py fold-watermark` stamps its `previous_watermark_hour` and
@@ -1302,8 +1307,8 @@ without a `LO..=HI` range is `missing`.
 
 ### Where W3's PUT figures come from
 
-Each `retire_through` step loads a tail hour into dp7 before its fold, so
-the fold advances (step 4 of `retired_hour` above). That makes the
+Each `retire_through` step loads a tail hour into dp7 before its fold
+(step 4 of `retired_hour` above), so the fold publishes a new tail. That makes the
 fold-wide counters wrong for W3: `key_index_leaves_written` counts the
 tail's leaves, and `sealed_part_puts`, which leaves out only the tail,
 counts 1 when the new tail's UTC day differs from the previous tail's:
