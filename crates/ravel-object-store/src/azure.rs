@@ -770,6 +770,12 @@ fn multipart_outcome(key: &str, result: object_store::PutResult) -> Result<PutOu
     put_outcome(key, result)
 }
 
+/// Put Block and Put Block List errors, with `ContainerNotFound` `Permanent`
+/// as on every other operation.
+fn map_multipart_error(e: object_store::Error) -> StoreError {
+    map_azure_error(e, map_error_common)
+}
+
 #[async_trait::async_trait]
 impl ObjectStoreBackend for AzureStore {
     async fn put(
@@ -792,11 +798,10 @@ impl ObjectStoreBackend for AzureStore {
             .put_multipart(&path_of(key)?)
             .await
             .map_err(|e| map_azure_error(e, map_error_common))?;
-        Ok(Box::new(S3MultipartUpload::new(
-            key,
-            upload,
-            multipart_outcome,
-        )))
+        Ok(Box::new(
+            S3MultipartUpload::new(key, upload, multipart_outcome)
+                .with_error_map(map_multipart_error),
+        ))
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
