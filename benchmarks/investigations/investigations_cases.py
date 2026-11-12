@@ -3633,14 +3633,16 @@ class Evaluate(Workdir):
     def test_w5_a7_per_part_and_thirty_parts(self):
         self.assertEqual(self.check_w5_a7_per_part_and_thirty_parts(), [])
 
-    @staticmethod
-    def retired_hour_folds(retired, refold_retired, digests=("d1", "d1")):
-        report = {"sealed_part_puts": 0, "key_index_leaves_written": 0, "retired_hours": retired,
-                  "head_digest": digests[0]}
+    # W3's folds as the tail makes them: the tail's leaves and a UTC-day seal
+    # in the fold-wide counters, none in sealed_day_leaf_puts.
+    RETIRED_TAIL = {"sealed_part_puts": 1, "key_index_leaves_written": 7, "sealed_day_leaf_puts": 0}
+
+    @classmethod
+    def retired_hour_folds(cls, retired, refold_retired, digests=("d1", "d1")):
+        report = cls.RETIRED_TAIL | {"retired_hours": retired, "head_digest": digests[0]}
         refold = {"retired_hours": refold_retired, "head_digest": digests[1]}
         return {("retired_hour", "dp7", "logs"): {"report": report},
-                ("retired_hour_drop", "dp7", "logs"): {"report": {"sealed_part_puts": 0,
-                                                                  "key_index_leaves_written": 0}},
+                ("retired_hour_drop", "dp7", "logs"): {"report": dict(cls.RETIRED_TAIL)},
                 ("retired_hour_refold", "dp7", "logs"): {"report": refold}}
 
     # The fold binary W3 and W8 are measured on: one carrying R2.
@@ -3686,6 +3688,62 @@ class Evaluate(Workdir):
 
     def test_w3_drop_leaves_head(self):
         self.assertEqual(self.check_w3_drop_leaves_head(), [])
+
+    def check_w3_leaf_puts_exclude_the_tail(self, evaluate_py=EVALUATE, bands=BANDS):
+        """W3's leaf PUTs, on both folds, are the report's sealed_day_leaf_puts: with 7 leaves written (the
+        tail's) and 0 sealed-day leaf PUTs they pass, with 2 sealed-day leaf PUTs they miss."""
+        mod = load_module(evaluate_py, "evaluate_w3_leaves")
+        live = {"retired_hour": None}
+        docs = {("retired_hour", "logs", "tombstone"): {"hour": 100}} | self.R2_BINARY
+        out = []
+        for sealed, want in ((0, "pass"), (2, "miss")):
+            folds = self.retired_hour_folds([100], [100])
+            for st in ("retired_hour", "retired_hour_drop"):
+                folds[(st, "dp7", "logs")]["report"] |= {"key_index_leaves_written": 7,
+                                                         "sealed_day_leaf_puts": sealed}
+            figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2", "adr3939_w3"), live, docs, {}, folds)
+            for name in ("leaf_puts", "drop_leaf_puts"):
+                f = figs.get(f"adr3939_w3.{name}")
+                if f is None or (f["value"], f["verdict"]) != (sealed, want):
+                    out.append(f"7 leaves written, {sealed} sealed-day: W3 {name} "
+                               f"{f and (f['status'], f['value'], f['verdict'], f['reason'])}, want {sealed} {want}")
+        return out
+
+    def test_w3_leaf_puts_exclude_the_tail(self):
+        self.assertEqual(self.check_w3_leaf_puts_exclude_the_tail(), [])
+
+    def check_w3_part_puts_read_tombstoned_day_stamp(self, evaluate_py=EVALUATE, bands=BANDS):
+        """W3's part PUTs are each fold's retired_part_puts stamp's new_in_range, whatever its report's
+        sealed_part_puts (1, a UTC-day seal, in every fold here): 0 passes, 1 misses, an absent stamp is
+        missing naming it and its writer, and a stamp without an integer new_in_range is missing; the same
+        for the drop fold's stamps/retired_hour_drop.logs.retired_part_puts.json."""
+        mod = load_module(evaluate_py, "evaluate_w3_part_puts")
+        live = {"retired_hour": None}
+        out = []
+        for name, st in (("part_puts", "retired_hour"), ("drop_part_puts", "retired_hour_drop")):
+            stamp_name = f"stamps/{st}.logs.retired_part_puts.json"
+            for case, stamp, want, says in (
+                    ("none in the day", {"new_in_range": 0}, ("value", 0, "pass"), ""),
+                    ("one in the day", {"new_in_range": 1}, ("value", 1, "miss"), ""),
+                    ("no stamp", None, ("missing", None, "missing"), f"{stamp_name} (box/run.sh state_retired_hour"),
+                    ("no count", {"new_in_range": "0"}, ("missing", None, "missing"), "carries no new_in_range")):
+                docs = {("retired_hour", "logs", "tombstone"): {"hour": 100}} | self.R2_BINARY
+                for other in ("retired_hour", "retired_hour_drop"):
+                    docs[(other, "logs", "retired_part_puts")] = {"new_in_range": 0}
+                if stamp is None:
+                    del docs[(st, "logs", "retired_part_puts")]
+                else:
+                    docs[(st, "logs", "retired_part_puts")] = stamp
+                figs = self.adr3939_rows_now(mod, bands, ("adr3939_w2", "adr3939_w3"), live, docs, {},
+                                             self.retired_hour_folds([100], [100]))
+                f = figs.get(f"adr3939_w3.{name}")
+                if f is None or (f["status"], f["value"], f["verdict"]) != want or says not in f["reason"]:
+                    out.append(f"{name} {case}: {f and (f['status'], f['value'], f['verdict'], f['reason'])}, "
+                               f"want {want} naming {says!r}")
+        return out
+
+    def test_w3_part_puts_read_tombstoned_day_stamp(self):
+        self.assertEqual(self.check_w3_part_puts_read_tombstoned_day_stamp(), [])
 
     def check_w8_retired_hours_are_the_tombstoned_hour(self, evaluate_py=EVALUATE, bands=BANDS):
         """W8's two folds pass only when each reports retired_hours [h] for W3's tombstoned hour h: both []
@@ -3745,7 +3803,9 @@ class Evaluate(Workdir):
         base = {("retired_hour", "logs", "tombstone"): {"hour": 100},
                 ("retired_hour", "logs", "retired_resolve"): {"hour": 100, "segments": 0, "l0": 0, "l1": 0,
                                                               "resolved": 12},
-                ("retired_hour_drop", "logs", "catalog"): self.drop_catalog("72..=95", "120..=143")}
+                ("retired_hour_drop", "logs", "catalog"): self.drop_catalog("72..=95", "120..=143"),
+                ("retired_hour", "logs", "retired_part_puts"): {"new_in_range": 0},
+                ("retired_hour_drop", "logs", "retired_part_puts"): {"new_in_range": 0}}
         declared = {f"adr3939_{k.split('.')[0].lower()}.{k.split('.', 1)[1]}": why
                     for k, why in self.ADR3939_DECLARED_UNSUPPORTED.items()}
         keys = ("adr3939_a3", "adr3939_a4", "adr3939_w2", "adr3939_w3", "adr3939_w8")
@@ -4775,8 +4835,8 @@ FLIPS = {
         "check_w3_retired_hour_segments_reads_resolve_stamp",
     ),
     "W3's segments stamp read under a kind run.sh never writes": (
-        '"retired_hour_segments": "retired_resolve"}',
-        '"retired_hour_segments": "retired_segments"}',
+        '"retired_hour_segments": "retired_resolve",',
+        '"retired_hour_segments": "retired_segments",',
         "check_adr3939_unsupported_figures_are_these",
     ),
     "a stamp figure not-run for its build left incomplete, not unrequested": (
@@ -5017,14 +5077,31 @@ BAND_FLIPS = {
         "check_w3_drop_leaves_head",
     ),
     "W3's part PUTs judged on a binary carrying no R2": (
-        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.sealed_part_puts\"\nlane = \"counter\"\n" + W3_GATE,
-        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.sealed_part_puts\"\nlane = \"counter\"\n",
+        "metric = \"stamp.retired_part_puts.logs\"\nlane = \"counter\"\n" + W3_GATE,
+        "metric = \"stamp.retired_part_puts.logs\"\nlane = \"counter\"\n",
         "check_w3_w8_gated_on_r2_binary",
     ),
-    "W3's part PUTs read off the unwritten key_index_part_puts": (
-        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.sealed_part_puts\"\n",
-        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.key_index_part_puts\"\n",
-        "check_w3_w8_gated_on_r2_binary",
+    "W3's part PUTs read off the fold-wide sealed_part_puts, which counts any UTC-day seal": (
+        "statement = \"stamp\"\nstate = \"retired_hour\"\nmetric = \"stamp.retired_part_puts.logs\"\n",
+        "statement = \"fold\"\nstate = \"retired_hour\"\ntransition = \"retired_hour\"\n"
+        "metric = \"fold.dp7.logs.sealed_part_puts\"\n",
+        "check_w3_part_puts_read_tombstoned_day_stamp",
+    ),
+    "W3's drop part PUTs read off the fold-wide sealed_part_puts, which counts any UTC-day seal": (
+        "statement = \"stamp\"\nstate = \"retired_hour\"\nmetric = \"stamp.drop_retired_part_puts.logs\"\n",
+        "statement = \"fold\"\nstate = \"retired_hour\"\ntransition = \"retired_hour_drop\"\n"
+        "metric = \"fold.dp7.logs.sealed_part_puts\"\n",
+        "check_w3_part_puts_read_tombstoned_day_stamp",
+    ),
+    "W3's leaf PUTs read off the fold-wide leaves_written, which counts the tail's": (
+        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.sealed_day_leaf_puts\"\n",
+        "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.leaves_written\"\n",
+        "check_w3_leaf_puts_exclude_the_tail",
+    ),
+    "W3's drop leaf PUTs read off the fold-wide leaves_written, which counts the tail's": (
+        "transition = \"retired_hour_drop\"\nmetric = \"fold.dp7.logs.sealed_day_leaf_puts\"\n",
+        "transition = \"retired_hour_drop\"\nmetric = \"fold.dp7.logs.leaves_written\"\n",
+        "check_w3_leaf_puts_exclude_the_tail",
     ),
     "W8's digest judged on a binary carrying no R2": (
         "transition = \"retired_hour\"\nmetric = \"fold.dp7.logs.head_digest\"\nlane = \"counter\"\n" + W8_GATE,
@@ -6678,6 +6755,9 @@ FINISHED=1
                           "listing-retired_hour-after.json", "STAMP stamps/retired_hour.logs.maint_records.json",
                           "wait until the ingest hour", "load-retired_hour_tail-logs.measure.json",
                           "fold-retired_hour-logs.measure.json", "--key-index-leaves --retention-default RETENTION_Ss",
+                          "listing-retired_hour-folded.json", "STAMP stamps/retired_hour.logs.retired_part_puts.json",
+                          "part-puts --before", "keys-retired_hour-after.tsv --after",
+                          "keys-retired_hour-folded.tsv --tenant-hash DP7_HASH --signal-code l --first D0_7 --last D0_7+23",
                           "STAMP stamps/retired_hour.logs.fold_watermark.json", "fold-watermark --report",
                           "fold-retired_hour_refold-logs.measure.json",
                           "--key-index-leaves --retention-default RETENTION_Ss",
@@ -6689,6 +6769,11 @@ FINISHED=1
                           "STAMP stamps/retired_hour_drop.logs.maint_records.json",
                           "wait until the ingest hour", "load-retired_hour_drop_tail-logs.measure.json",
                           "fold-retired_hour_drop-logs.measure.json",
+                          "listing-retired_hour_drop-folded.json",
+                          "STAMP stamps/retired_hour_drop.logs.retired_part_puts.json", "part-puts --before",
+                          "keys-retired_hour_drop-after.tsv --after",
+                          "keys-retired_hour_drop-folded.tsv --tenant-hash DP7_HASH --signal-code l --first D0_7 "
+                          "--last D0_7+23",
                           "STAMP stamps/retired_hour_drop.logs.fold_watermark.json", "fold-watermark --report",
                           "fold-retired_hour_drop_refold-logs.measure.json",
                           "listing-retired_hour_drop-resolved.json", "rlog footprint --tenant dp7",
@@ -6769,6 +6854,90 @@ FINISHED=1
         self.flip_check("after > before", "after >= before", "lib/inv.py", self.check_fold_watermark,
                         "a fold that held its watermark read as advanced",
                         "test_fold_watermark_refuses_a_fold_that_did_not_advance")
+
+    # W3's part figure over two census key files: D0 is 2026-11-05T00, unix
+    # hour 498288, and the tombstoned day is 498288..=498311.
+    PART_PUTS_DAY = (498_288, 498_311)
+    PART_PUTS_BEFORE = ("10\tt/aa11/catalog/l/snap/20261105T23.0000000000000001.csnap",
+                        "10\tt/aa11/catalog/l/snap/20261111T23.0000000000000002.csnap",
+                        "10\tt/aa11/l/c/s00/20261105T00/retire.tmb")
+    # A new tail part, new seals of a later and an earlier UTC day, and
+    # in-range parts of another tenant, another signal and a key that is no
+    # part: none counts.
+    PART_PUTS_ELSEWHERE = ("10\tt/aa11/catalog/l/snap/20261112T08.0000000000000003.csnap",
+                           "10\tt/aa11/catalog/l/snap/20261111T23.0000000000000004.csnap",
+                           "10\tt/aa11/catalog/l/snap/20261104T23.0000000000000009.csnap",
+                           "10\tt/bb22/catalog/l/snap/20261105T23.0000000000000005.csnap",
+                           "10\tt/aa11/catalog/m/snap/20261105T23.0000000000000006.csnap",
+                           "10\tt/aa11/catalog/l/snap/20261105T23.0000000000000007.cpost")
+    PART_PUTS_IN_DAY = "10\tt/aa11/catalog/l/snap/20261105T23.0000000000000008.csnap"
+
+    def check_part_puts(self, inv_path):
+        # inv.py part-puts lists every csnap of the tenant and signal in the
+        # after file and not the before one, and counts those whose hour is
+        # in [first, last]: the tail and another day's seal give 0, a
+        # re-encoded part of the tombstoned day gives 1; an unreadable file
+        # exits 70.
+        out = []
+        first, last = self.PART_PUTS_DAY
+        bpath = self.path("pp-before.tsv")
+        with open(bpath, "w") as f:
+            f.write("\n".join(self.PART_PUTS_BEFORE) + "\n")
+        elsewhere = sorted(line.split("\t")[1] for line in self.PART_PUTS_ELSEWHERE[:3])
+        for name, added, want_new, want_in in (
+                ("tail and another day", self.PART_PUTS_ELSEWHERE, elsewhere, 0),
+                ("the tombstoned day", self.PART_PUTS_ELSEWHERE + (self.PART_PUTS_IN_DAY,),
+                 sorted(elsewhere + [self.PART_PUTS_IN_DAY.split("\t")[1]]), 1)):
+            apath, spath = self.path("pp-after.tsv"), self.path("pp.json")
+            with open(apath, "w") as f:
+                f.write("\n".join(self.PART_PUTS_BEFORE + added) + "\n")
+            p = subprocess.run([sys.executable, inv_path, "part-puts", "--before", bpath, "--after", apath,
+                                "--tenant-hash", "aa11", "--signal-code", "l", "--first", str(first),
+                                "--last", str(last), "--out", spath], capture_output=True, text=True)
+            if p.returncode != 0:
+                out.append(f"{name}: exit {p.returncode} ({p.stderr.strip()})")
+                continue
+            with open(spath) as f:
+                stamp = json.load(f)
+            if stamp.get("new_parts") != want_new or stamp.get("new_in_range") != want_in:
+                out.append(f"{name}: stamp {stamp}, want new_parts {want_new} new_in_range {want_in}")
+            if (stamp.get("first"), stamp.get("last"), stamp.get("tenant_hash")) != (first, last, "aa11"):
+                out.append(f"{name}: stamp {stamp}")
+        p = subprocess.run([sys.executable, inv_path, "part-puts", "--before", self.path("pp-absent.tsv"),
+                            "--after", bpath, "--tenant-hash", "aa11", "--first", str(first), "--last", str(last),
+                            "--out", self.path("pp-absent.json")], capture_output=True, text=True)
+        if p.returncode != 70:
+            out.append(f"unreadable before file: exit {p.returncode}, want 70")
+        return out
+
+    def test_part_puts_counts_new_parts_of_the_tombstoned_day(self):
+        self.assertEqual(self.check_part_puts(os.path.join(BOX, "lib", "inv.py")), [])
+        self.flip_check("if args.first <= after[k] <= args.last", "if after[k] <= args.last", "lib/inv.py",
+                        self.check_part_puts, "a part of an earlier day counted as the tombstoned day's",
+                        "test_part_puts_counts_new_parts_of_the_tombstoned_day")
+        self.flip_check("if args.first <= after[k] <= args.last", "", "lib/inv.py",
+                        self.check_part_puts, "the tail and another day's seal counted as the tombstoned day's",
+                        "test_part_puts_counts_new_parts_of_the_tombstoned_day")
+
+    def check_part_puts_fails_the_state(self, script):
+        # part-puts exits non-zero: each retired_hour step is STATE-FAILED
+        # there, before fold-watermark, its refold and its transition.
+        code, text = self.new_states_dry_run(script, out="out-retired-count", env={"INV_DRY_RUN_FAIL": "part-puts"})
+        if code:
+            return [f"dry run exit {code}"]
+        out = []
+        b = "\n".join(self.blocks(text).get("state:retired_hour", []))
+        if "STATE-FAILED retired_hour: part-puts retired_hour exit 3" not in b:
+            out.append("retired_hour not failed at part-puts")
+        if "fold-watermark --report" in b or "fold-retired_hour_refold" in b or "STAMP stamps/transitions.jsonl" in b:
+            out.append("retired_hour went on past a part count that was not taken")
+        return out
+
+    def test_part_puts_failure_fails_retired_hour(self):
+        self.assertEqual(self.check_part_puts_fails_the_state(None), [])
+        self.flip_check('|| { failed_at "part-puts $state" "$?" "$plog"; return 1; }', "|| true", "run.sh",
+                        self.check_part_puts_fails_the_state, "W3's part figure measured with no part count",
+                        "test_part_puts_failure_fails_retired_hour")
 
     def check_watermark_fails_the_state(self, script):
         # fold-watermark exits non-zero: each retired_hour step is

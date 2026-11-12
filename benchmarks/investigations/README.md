@@ -591,7 +591,11 @@ checkout's HEAD, which then does not name what was built).
    `inv.py fold-watermark` stamps its `previous_watermark_hour` and
    `watermark_hour` in `stamps/retired_hour.logs.fold_watermark.json` and
    fails the state unless the watermark advanced, so a no-op fold is never
-   read as a measurement.
+   read as a measurement. Between the fold and that check run.sh lists the
+   store again (`keys-retired_hour-folded.tsv`) and `inv.py part-puts`
+   stamps the snapshot parts the fold wrote, against `keys-STATE-after.tsv`,
+   in `stamps/retired_hour.logs.retired_part_puts.json` (W3's part PUTs,
+   below); a failure there fails the state.
 6. A second fold with the same flags, stamped as `retired_hour_refold`.
 7. The transition, the census and the catalog stamp.
 
@@ -642,8 +646,8 @@ stamp is
    compaction (`l1.*.cmt`) and rewrite (`rw.*.cmt`) records in `dp7`'s logs
    buckets before and after, writing
    `stamps/STATE.logs.maint_records.json`. Any new one fails the state:
-   W2 and W3 read fold-wide counters, and a bucket the maintain pass
-   compacted would move them.
+   W2's counters and W3's sealed-day leaf PUTs are fold-wide, and a bucket
+   the maintain pass compacted would move them.
 
 **How the fold reconciles it.** The fold passes `--retention-default Rs`,
 which gives a tenant with no durable retention override a window R. The
@@ -1272,10 +1276,9 @@ writes the same stamp, which no figure reads.
 ### W3's drop and W8's retired hours
 
 W3's "the part leaves HEAD with 0 PUTs at the day's last tombstone" is
-three figures, not two: 0 part PUTs (`sealed_part_puts`, every part the
-fold wrote but the open tail, which every publishing fold re-encodes) and 0
-leaf PUTs in the drop fold's
-report (transition `retired_hour_drop`), and `drop_parts_holding_hour`, the
+three figures, not two: 0 part PUTs and 0 leaf PUTs in the drop fold
+(transition `retired_hour_drop`, sourced as below), and
+`drop_parts_holding_hour`, the
 number of parts in the catalog stamp taken after that fold
 (`stamps/retired_hour_drop.logs.catalog.json`) whose hour range holds the
 tombstoned hour, which must be 0. A drop fold that drops nothing writes no
@@ -1283,6 +1286,35 @@ PUT either, and misses on that count. `state_retired_hour` writes both
 stamps, so an absent one is `missing`, naming it. So is a stamp with no
 HEAD, a part count that disagrees with the parts listed, or a part
 without a `LO..=HI` range is `missing`.
+
+### Where W3's PUT figures come from
+
+Each `retire_through` step loads a tail hour into dp7 before its fold, so
+the fold advances (step 4 of `retired_hour` above). That makes the
+fold-wide counters wrong for W3: `key_index_leaves_written` counts the
+tail's leaves, and `sealed_part_puts`, which leaves out only the tail,
+counts 1 when the new tail's UTC day differs from the previous tail's:
+that day is then sealed and its part re-encoded. With the leaf switch on, parts split at UTC days,
+and that crossing can happen on either fold at any start hour, since the
+maintain wait and the drop step run hours apart. So W3 reads neither:
+
+- `leaf_puts` and `drop_leaf_puts` read the fold report's
+  `sealed_day_leaf_puts`, the field A3 reads: leaf PUTs of a re-encoded
+  part, not the tail, whose UTC day a part of the HEAD the fold read, other
+  than its last, already held sealed. The tombstoned hour's day is the
+  oldest dp7 day, always such a part, so decision 6's question for it is
+  counted. The tail's leaves and a day sealed for the first time are not.
+- `part_puts` and `drop_part_puts` read `new_in_range` from
+  `stamps/retired_hour.logs.retired_part_puts.json` and
+  `stamps/retired_hour_drop.logs.retired_part_puts.json`. `inv.py
+  part-puts` takes every snapshot part key of dp7's logs
+  (`t/<hash>/catalog/l/snap/<YYYYMMDDTHH>.<hash16>.csnap`, the hour the
+  part's watermark hour, a sealed part's last hour) in the listing taken
+  right after the fold and not in `keys-STATE-after.tsv`, the listing taken
+  before the tail load, and counts those whose hour lies in D0 to D0 + 23,
+  the tombstoned day, on both folds. The tail and a seal of any other day
+  have their hour outside it and do not enter. An absent stamp, or one with
+  no integer `new_in_range`, is `missing`.
 
 W8's two folds each report `retired_hours`, the union of the hours the
 HEAD in effect after the fold retires across its parts, and each must
@@ -1305,12 +1337,10 @@ deterministic.
 `ravel-cli catalog fold --json` writes these `FoldReport` fields, counted
 where the fold issues the request, and the text report prints them:
 
-- `sealed_part_puts`: snapshot part PUTs of parts other than the open
-  tail, summed over attempts (W3's part PUTs).
 - `sealed_day_leaf_puts` and `sealed_day_previous_leaf_gets`: the leaf
   PUTs, and the previous-leaf GETs, of re-encoded parts of a UTC day the
-  HEAD the fold read had already sealed (A3); a day sealed for the first
-  time, and the tail, count in neither.
+  HEAD the fold read had already sealed (A3; the PUTs also W3's leaf
+  PUTs); a day sealed for the first time, and the tail, count in neither.
 - `key_index_unchanged_section_gets`: KEY_IDX section GETs for entries the
   previous leaves already covered (W2).
 - `head_digest` and `retired_hours` (A4, W8, W3), as above.
@@ -1343,8 +1373,8 @@ The `retired_hour` and `retired_hour_drop` folds are `ravel-cli catalog
 fold --json` runs, like every other fold, so W2, W3 and W8 read their
 figures from the same `--json` report under the same allowlist: a field
 the report lacks reads unsupported on that build, as above. W2's binary
-figure, W3's tombstoned hour and W3's `drop_parts_holding_hour` come from
-stamps.
+figure, W3's tombstoned hour, W3's part PUTs and W3's
+`drop_parts_holding_hour` come from stamps.
 
 Every ADR-3939 figure, counter or timing, leaves the run incomplete when
 it has no value to judge (`unsupported-on-this-build`, `refused-by-guard`,
@@ -1615,8 +1645,7 @@ unsupported with their reasons and are exactly the incomplete list, and all
 four W2 figures are not requested, none passing; no stamp: every A3, A4, W3
 and W8 figure `not-run` and incomplete; fails with the gate's not requested
 dropped, A3's leaf PUTs, A4's digest, W3's part PUTs or W8's digest
-ungated, W3's segments without `gate_not_requested`, W3's part PUTs read
-off `key_index_part_puts`, a declared `unsupported` dropped from A4's or
+ungated, W3's segments without `gate_not_requested`, a declared `unsupported` dropped from A4's or
 W8's `heads_differ` or A4's switch-off figure, evaluate.py ignoring
 `unsupported`, or a gate on a figure defined below it read before that
 figure is built),
@@ -1630,6 +1659,14 @@ segments stamp read under a kind run.sh never writes),
 for tombstoned hour 100, its removal passes, an absent drop stamp is
 missing naming it, a stamp with no HEAD or a short part list missing;
 fails with the count fixed at 0 or the band reading `v >= 0`),
+`test_w3_leaf_puts_exclude_the_tail` (on both folds, 7 leaves written with
+0 sealed-day leaf PUTs passes and 2 sealed-day leaf PUTs miss; fails with
+either figure reading `leaves_written`),
+`test_w3_part_puts_read_tombstoned_day_stamp` (for each fold's
+`retired_part_puts` stamp, with the report's `sealed_part_puts` at 1:
+`new_in_range` 0 passes, 1 misses, an absent stamp is missing naming it and
+its writer, a non-integer count missing; fails with either figure reading
+`sealed_part_puts`),
 `test_w8_retired_hours_are_the_tombstoned_hour` (both folds `[]` miss, `[h]`
 passes, empty A4 and W8 digests miss; fails with the refold's band reading
 `v == v` or A4's refold digest `v is not None`),
@@ -1684,6 +1721,18 @@ the file and line it changes):
   one in another tenant, in dp7's spans, or a new plain commit record.
   Wrong version: `maint-records` never failing ("a compaction record the
   maintain pass wrote accepted").
+- `test_part_puts_counts_new_parts_of_the_tombstoned_day`: `inv.py
+  part-puts` over two key files lists a new tail part and new parts of a
+  later and an earlier day and counts none of them; a new part whose hour
+  is in the tombstoned day counts 1; parts of another tenant or signal and
+  a key that is no part are not listed; an unreadable file exits 70. Wrong
+  versions: the range's lower bound dropped ("a part of an earlier day
+  counted as the tombstoned day's") and the range check dropped ("the tail
+  and another day's seal counted as the tombstoned day's").
+- `test_part_puts_failure_fails_retired_hour`: a failing `part-puts` fails
+  the state before `fold-watermark`, the refold and the transition. Wrong
+  version: the failure turned into `|| true` ("W3's part figure measured
+  with no part count").
 - `test_retired_hour_needs_a_fold_with_retention_default`: against a stub
   ravel-cli, a `catalog fold --help` without `--retention-default` records
   the state not-run and one with it goes on to the tombstone pass. Wrong
