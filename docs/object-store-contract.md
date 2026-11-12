@@ -74,7 +74,7 @@ pub trait MultipartUpload: Send {
 
 `Etag` is content identity (equality checks). `Version` is an opaque
 precondition token for CAS: S3 etag, GCS generation, Azure etag. The two
-coincide on S3 and differ elsewhere; commit-protocol code uses only
+coincide on S3 and Azure and differ on GCS; commit-protocol code uses only
 `Version` for CAS and only `Etag` for content-identity assertions.
 
 `StoreError` variants (exhaustive for callers' retry logic):
@@ -109,7 +109,10 @@ through the XML API, reads `NoSuchBucket` the same way; that store is
 read-only, so it has no delete to cover. A HEAD response has no body on any
 of these backends, so `head` and `pin_of` against a missing bucket or
 container still read `NotFound`: telling the two apart would cost a second
-request.
+request. `AzureStore` is the exception: Azure sends the error code as the
+`x-ms-error-code` response header, HEAD included, so a 404
+`ContainerNotFound` is `Permanent` on `AzureStore`'s `get`, `head`,
+`pin_of`, `put`, `delete` and listings.
 `PreconditionFailed`, `Unsupported`, `ReadOnly` and `UnaddressableKey` are
 never retryable: a retry of a pinned read reads the same changed object, and
 neither an unimplemented operation, a read-only store nor a key's encoding
@@ -446,6 +449,7 @@ Per backend, the same three rules:
 |---|---|---|---|
 | `S3Store` | `versionId` query parameter | `NotFound` | `PreconditionFailed` |
 | `GcsStore` | `generation` query parameter, ETag as `If-Match` | `NotFound` | `PreconditionFailed` |
+| `AzureStore` | `versionid` query parameter, ETag as `If-Match`, on the HEAD and the GET of a suffix read alike | `NotFound` | `PreconditionFailed` |
 | `ExternalStore` GCS | `generation` | `NotFound` | `PreconditionFailed` |
 | `ExternalStore` Azure | `versionid` | `NotFound` | `PreconditionFailed` |
 | `MemoryStore` | keeps only the current object, so any pinned version that is not the current one is gone | `NotFound` | `PreconditionFailed` |
@@ -453,9 +457,10 @@ Per backend, the same three rules:
 A full read (`GetRange::Full`) is bounded differently per backend. `S3Store`,
 and so the S3 kind of `ExternalStore`, splits it into requests of at most
 `max_get_chunk` bytes, so no single response outlives the request timeout.
-`GcsStore` and the GCS and Azure kinds of `ExternalStore` issue one unranged
-request and read its whole body, so on `GcsStore` a full read has to finish
-inside `GcsConfig::request_timeout` (20 s by default). A caller reading a
+`GcsStore`, `AzureStore` and the GCS and Azure kinds of `ExternalStore` issue
+one unranged request and read its whole body, so on `GcsStore` a full read
+has to finish inside `GcsConfig::request_timeout` (20 s by default), and on
+`AzureStore` inside `AzureConfig::request_timeout` (also 20 s). A caller reading a
 large GCS or Azure object in full must bound it with ranged reads itself. ADR-2040's Parquet reader is
 specified to read by range (the footer, then column chunks), so it is not
 meant to take the unsplit path.
@@ -490,8 +495,8 @@ A backend that cannot evaluate preconditions MUST refuse with `Unsupported`,
 which is what the default trait implementation does. It does not fall back
 to an unconditional `get`: silently dropping the precondition serves bytes
 from a replaced file, which is the exact failure the method exists to
-prevent. `MemoryStore`, `S3Store`, `GcsStore` and `ExternalStore` implement
-it.
+prevent. `MemoryStore`, `S3Store`, `GcsStore`, `AzureStore` and
+`ExternalStore` implement it.
 
 #### Learning the version of the bytes you read
 
@@ -593,7 +598,9 @@ can stream large L1/L2 segments as multipart uploads once it is written to
 use them; `MemoryStore`, `S3Store` and `GcsStore` all report `multipart: true`
 and implement the sequence, so `--mode maintain` starts against the memory
 oracle, against any S3-compatible endpoint and against a GCS bucket
-regardless of whether a caller exercises the path. (`S3Store::put` does take an internal multipart
+regardless of whether a caller exercises the path. `AzureStore` reports
+`multipart: true` and implements the sequence too (ADR-4158 D1); no shipped
+binary builds one yet. (`S3Store::put` does take an internal multipart
 path above its threshold, but that is a size-driven implementation detail of
 `put`, not a caller reaching for `put_multipart`; see "When `put()` uses it"
 below.)
@@ -977,8 +984,9 @@ idempotency and identity discriminator, not a transport check.
 
 AWS S3 since Dec 2020 provides strong read-after-write and list
 consistency; S3 conditional writes (If-None-Match/If-Match) provide
-CreateIfAbsent and CAS. GCS: generation preconditions. Azure: etags +
-leases. RustFS supports the full mandatory set. Server-side upload checksums
+CreateIfAbsent and CAS. GCS: generation preconditions. Azure: ETag
+preconditions (`If-None-Match: *` and `If-Match`), no leases; see "Azure"
+below. RustFS supports the full mandatory set. Server-side upload checksums
 are reachable through `object_store`'s whole-client
 `with_checksum_algorithm` (SHA-256 / CRC64-NVME), which
 `S3HttpConfig::upload_integrity` selects; SHA-256 is the broadly supported
@@ -1092,6 +1100,114 @@ for `--store gcs` (`services/ravel-server/src/store.rs`), and
 `maintain_mode_accepts_the_gcs_backend` there pins that maintain mode's
 capability check passes on it.
 
+**Azure (`AzureStore`, ADR-4158).** `AzureStore` sends Put Blob, Get Blob,
+Put Block and Put Block List through `object_store`'s `MicrosoftAzure`
+client, and List Blobs, Get Blob Properties (the HEAD behind `head`, `pin_of`
+and a suffix read), Delete Blob and Get Account Information through a client
+of its own, each asking for `x-ms-version: 2023-11-03`. It reports
+`Capabilities::mandatory()` plus `multipart`. It writes block blobs only and
+takes no leases.
+
+The version token is the blob's ETag, quoted as the `ETag` header carries
+it, on every path (`put`, `get`, `head`, `pin_of` and listing entries), so
+`Etag` and `Version` hold the same string, as on S3. Azure gives every write
+a new ETag, identical bytes included (ADR-4158, Measured P5 and P6), which
+is what lets the ETag be the token. `CreateIfAbsent` sends
+`If-None-Match: *` and maps a 409 `BlobAlreadyExists` to `AlreadyExists`; a
+409 with any other code (a lease, an immutability policy) is `Permanent`,
+and a 409 that reaches the store with no code is settled with one HEAD:
+present is `AlreadyExists`, absent is `Transient`. `CasVersion(v)` sends
+`If-Match: v` and maps a 412, and a 404, to `PreconditionFailed`.
+`Overwrite` sends no precondition.
+
+`Full` is one GET and `Range` one ranged GET. **A suffix read costs two
+requests.** Azure answers a suffix range (`bytes=-n`) with 200 and the whole
+blob (ADR-4158, Measured P7), so `AzureStore` does not send one:
+`GetRange::Suffix(n)` is a HEAD for the length `L` and the ETag `E`, then a
+GET of `bytes=max(L-n,0)-(L-1)` with `If-Match: E`. A 412 on the GET means
+the blob was replaced in between, and the read starts again from the HEAD,
+at most three rounds, then returns `Transient`; the bytes returned are the
+suffix of one version of the blob. A zero-length blob is `InvalidRange`. A
+pinned suffix read sends the pin's ETag, and its `versionid` when it has one,
+on the HEAD and on the GET, and a 412 on either is `PreconditionFailed` with
+no retry. The connector counts both requests as attempts; `StoreMetrics`
+counts one `get` call.
+
+Listing is List Blobs (`<container>?restype=container&comp=list`), with
+`prefix`, `maxresults` (`AzureConfig::list_page_size`, the S3 adapter's page
+size by default, for `list` and `list_after`, and a fixed 1000 for
+`list_delimited`), `delimiter=/` for `list_delimited`, and the service's
+opaque `marker` to continue within one call. `list_after` sends
+`startFrom=<start_after>`, which is inclusive, and drops every returned name
+that is not greater than `start_after` whether or not the service honoured
+`startFrom`: correctness does not depend on it, only the request count does.
+As on `GcsStore`, a response from which a name was dropped and that leaves at
+least one name ends the call, with a `PageToken` when the service has more,
+rather than sending a second request to fill the page.
+The `PageToken` handed back is the raw last name, and the next call resumes
+from it with the same `startFrom` and filter. A `Name` listed with
+`Encoded="true"` is percent-decoded as a whole string, since Azure encodes
+`/` in such a name too. Names go to `classify_objects` and
+`classify_prefixes` as decoded, so a name `AzureStore` cannot address is
+reported in `ListPage::unaddressable` rather than failing the page. The
+listed `Etag` is unquoted on the wire (Measured P11); the store adds the
+quotes, so a listing and a `head` report the same string. A repeated
+`NextMarker` fails the call with `ListRepeatedToken`, 16 responses in a row
+that list nothing fail a `list` or `list_after` call with `ListPageCeiling`
+(a `list_delimited` drain stops at `MAX_LIST_PAGES` responses), and a
+response body larger
+than the S3 lister's cap is `Permanent`.
+
+Errors are classified by status and `x-ms-error-code` (ADR-4158 D5): 404
+`BlobNotFound` is `NotFound` (success on `delete`, `PreconditionFailed` on a
+`CasVersion` put), 404 `ContainerNotFound` is `Permanent`, 401 and 403 are
+`AccessDenied`, 416 is `InvalidRange`, and 429, 503 and 500 are retried and,
+once the retries run out, surface as a retryable error.
+
+Both clients send through the S3 adapter's connector, scoped to the store's
+own host (`<account>.blob.core.windows.net`, or the endpoint's host and
+port), so `ravel_store_attempts_total` counts every attempt inside an
+operation and each response's `Date` feeds `observed_store_time_ns`. A token
+request to Microsoft Entra ID or the instance metadata service goes to
+another host and is neither counted nor dated. As on S3 and GCS, the
+multipart requests are not counted into `StoreMetrics`.
+
+`put_multipart` sends Put Block per part and one Put Block List at
+`complete`, through `object_store`'s client and on `S3Store`'s handle, so the
+part-sequence rules, the checksum pre-flight and poisoning under "Multipart
+upload" hold unchanged; the completed version is the Put Block List
+response's ETag. Nothing is visible before `complete`. `abort` sends
+nothing: Azure has no abort call and discards uncommitted blocks itself
+after seven days (ADR-4158 D1), so no lifecycle rule is needed for them.
+`complete` is unconditional, as on S3.
+
+`AzureStore` has no upload checksums (`upload_checksum: false`; a caller's
+CRC32C is still checked against the buffer before the request, and is not
+sent) and no container-protection probes. Every full-object read is counted
+by `AzureStore::get_unverified` and on `ravel_store_get_unverified_total`.
+
+**Hierarchical-namespace accounts are refused.** `AzureStore::new` is async:
+before it returns it sends Get Account Information through the container URL
+(`?restype=account&comp=properties`) and fails with `Permanent`, naming
+`x-ms-is-hns-enabled`, unless that header is `false`. A `true`, an absent
+header and an unreadable one are all refusals. On such an account `/` sorts
+lowest in a recursive listing and a key cannot be written beneath an
+existing key (ADR-4158 D6), and the setting is fixed when the account is
+created.
+
+`crates/ravel-object-store/tests/contract.rs` runs the contract suite, the
+pinned-read cases and a suffix read raced against overwrites against
+`AzureStore` on the in-process fake Azure endpoint (`azure::fake`, behind the
+`test-support` feature) in every run; against the Azurite emulator when
+`RAVEL_AZURITE_URL` is set (`azurite_contract`, with a shared key from
+`RAVEL_AZURITE_ACCOUNT_KEY`); and against a real container when
+`RAVEL_AZURE_TEST_ACCOUNT` and `RAVEL_AZURE_TEST_CONTAINER` are set
+(`azure_contract`, with ambient credentials). The two gated tests print a
+skip line when unset. The fake answers a suffix range as Azure does, so a
+regression that sends one reads the wrong bytes in a test. No shipped binary
+builds an `AzureStore` yet: `--store azure` in ravel-server, ravel-cli and
+the operator (ADR-4158 D6, D11) is follow-up work.
+
 ### Credentials
 
 `S3Config` selects a credential source explicitly through `auth`
@@ -1159,6 +1275,29 @@ together with a `base_url`, for an emulator or the test fake) looks up no
 credential: object requests carry a fixed placeholder bearer token instead,
 and listing requests carry no `Authorization` header. The field exists only
 in the crate's own tests and in builds with the `test-support` feature.
+
+**Azure.** `AzureConfig` carries no credential field (ADR-4158 D3).
+`AzureStore` reads five environment variables and no others
+(`azure::CREDENTIAL_ENV_KEYS`): `AZURE_FEDERATED_TOKEN_FILE`,
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_AUTHORITY_HOST` for AKS
+workload identity, and `AZURE_STORAGE_ACCOUNT_KEY` for a shared key. An
+empty value counts as unset. Each one set is handed to `object_store`'s
+builder through its own setter; the builder is never filled from the whole
+`AZURE_*` namespace, so a stray variable (an endpoint, a SAS token, a CLI
+switch) cannot redirect the store or change its credential. `object_store`
+then picks the shared key when one is set, else workload identity when the
+token file, client id and tenant id are all set, else a managed identity
+through the instance metadata service. A SAS token and the Azure CLI
+credential are never selected, and the listing client refuses a SAS
+credential if one reaches it. An account key that is not base64 fails
+construction with `Permanent`, naming the variable and not its value. The
+listing client authorizes with the credential the data-plane client
+resolved: a bearer token as `Authorization: Bearer`, or a `SharedKey`
+signature it computes from the account key. `AzureConfig::endpoint` replaces
+`https://<account>.blob.core.windows.net` and refuses userinfo; `allow_http`
+and `skip_signature` are refused without it, and `skip_signature` and
+`test_account_key` exist only in the crate's own tests and in builds with
+the `test-support` feature.
 
 ## Runtime qualification (executable contract)
 
@@ -1348,7 +1487,8 @@ This is a runtime, once-per-bucket check, not a replacement for the
 compile-time contract suite below: `crates/ravel-object-store/tests/contract.rs`
 is a development-time
 proof that each adapter *implementation* honors the trait, run in CI against
-all three backends including a real RustFS endpoint. `conformance.rs` is an
+the memory oracle, `ScratchStore`, `GcsStore` and `AzureStore` (the last two
+on their in-process fakes) and a real RustFS endpoint. `conformance.rs` is an
 operator-facing probe of one specific *deployment*, the actual configured
 endpoint and bucket, because the adapter can be correct while the vendor
 serving it is not (a misconfigured storage class, a proxy in front of the
@@ -1396,7 +1536,10 @@ outage an operator disables. A GCS store's identity is `gs://<bucket>`
 on Google's endpoint and `gs://<bucket>@<base_url>` when `GcsConfig::base_url`
 replaces it (`conformance::gcs_backend_identity`, ADR-3456 decision 5), so a
 qualification earned on an emulator or a test fake does not read as one
-earned on GCS. A mismatch is instead the signal that a
+earned on GCS. An Azure store's identity is `az://<account>/<container>`,
+and `az://<account>/<container>@<endpoint>` when `AzureConfig::endpoint`
+replaces Azure's (`conformance::azure_backend_identity`, ADR-4158 D6). A
+mismatch is instead the signal that a
 replicated, restored, or migrated bucket carries a qualification a different
 backend earned: verify the backend and re-run `store qualify` if it is
 genuinely a different store. The command only ever writes under
@@ -1824,7 +1967,18 @@ ADR-0042 decision 3.
    through the XML API on `S3Store`'s handle, with the generation as the
    completed version; no upload checksums, no bucket-protection probes (see
    "Backend support notes").
-5. `ScratchStore`: process-local, non-durable backend over a local
+5. `AzureStore` (ADR-4158): read-write adapter over `object_store`'s
+   `MicrosoftAzure` (Azure Blob Storage, block blobs), honoring every MUST
+   above with the blob's ETag as the version token. It sends through the S3
+   adapter's HTTP connector, scoped to the store's own host. `list`,
+   `list_after`, `list_delimited`, `head`, `pin_of` and `delete` do not go
+   through `object_store`: they send List Blobs, Get Blob Properties and
+   Delete Blob through the same connector and credentials. A suffix read is a
+   HEAD and an `If-Match` ranged GET, never a suffix range. Multipart is Put
+   Block and Put Block List on `S3Store`'s handle; no upload checksums, no
+   container-protection probes, and hierarchical-namespace accounts refused
+   at construction (see "Backend support notes").
+6. `ScratchStore`: process-local, non-durable backend over a local
    directory, the transient run store of ADR-3853 D2. It is a cache and
    nothing else: `open` removes everything the directory held and `wipe`
    empties it, nothing in it is published or read by another process, and
@@ -1926,7 +2080,9 @@ reported quantile never understates the true one and, below that, overstates
 it by at most 12.5%; `max` is exact.
 
 The contract suite in `crates/ravel-object-store/tests/contract.rs` runs
-against all three, multipart included (`assert_multipart_upload` is part of
+against `MemoryStore`, `FaultStore`, `ScratchStore`, `GcsStore` and
+`AzureStore` (the last two on their in-process fakes) in every run, and
+against `S3Store` on the gated endpoints, multipart included (`assert_multipart_upload` is part of
 `run_contract_suite`, written against the trait so it holds for the oracle, the
 wrappers, and a real endpoint alike). Two multipart assertions are S3-shaped and
 run only against a live endpoint: the composite `"<digest>-<partcount>"` ETag,
@@ -1935,8 +2091,8 @@ one PUT, and `put()`'s own threshold switch. The `S3Store` case is gated on
 `RAVEL_RUSTFS_URL`; the CI
 `object-store-contract` job (`.github/workflows/ci.yml`) stands up RustFS,
 creates the bucket, sets that variable, and asserts the gated test executed
-rather than skipping. This job is required: S3 is the only durable backend,
-so an adapter regression must fail CI.
+rather than skipping. This job is required: S3 is a durable backend Ravel
+ships, so an adapter regression must fail CI.
 
 `crates/ravel-object-store/tests/s3_http_faults.rs` covers what neither the
 contract suite nor `s3.rs`'s classification unit tests can: the retry, backoff,
