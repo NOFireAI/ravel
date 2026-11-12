@@ -148,8 +148,8 @@ blob returns `InvalidRange`, as a suffix of it does on S3.
 A pinned suffix read (`get_pinned` with `Suffix`) does not take `E` from
 its own HEAD. `E` is the pin's ETag, sent as `If-Match` on the HEAD and on
 the GET, with the pin's `versionid` on both when it has one. A 412 on
-either request is `PreconditionFailed`, returned at once: the pinned object
-is gone, and retrying against whatever replaced it would serve bytes the
+either request is `PreconditionFailed`, returned at once: the key no longer
+holds the pinned object, and retrying against whatever replaced it would serve bytes the
 caller did not pin.
 
 A suffix read on Azure costs two billed requests where S3 and GCS cost one.
@@ -253,7 +253,8 @@ variable (`ArgMatches::value_source`), as in ADR-3456 D6.
 
 - **An in-process fake**, `azure::fake::FakeAzure`, behind `test-support`,
   as `gcs::fake::FakeGcs` is. It serves Put Blob with both preconditions,
-  Get Blob with ranges and `If-Match` (and refuses a suffix range), HEAD,
+  Get Blob with ranges and `If-Match` (and answers a suffix range as Azure
+  does, with 200 and the whole blob; D2), HEAD,
   Delete, List Blobs with `startFrom`, `marker`, `delimiter` and encoded
   names, Put Block and Put Block List, and Get Account Information. The
   contract suite, the wire-header assertions and the server and CLI
@@ -321,8 +322,8 @@ without this decision `--store azure` would be reachable only by hand.
 - **CRD.** `spec.storage` holds exactly one backend. `storage.s3` becomes
   optional, `storage.azure` is added, and a CEL rule on `storage` requires
   exactly one of them. `v1alpha1` makes no compatibility promise
-  (ADR-0034), but the rule the Pod Identity change set is kept: a cluster
-  that sets `storage.s3` renders byte for byte as before, and its qualify
+  (ADR-0034), but the rule the Pod Identity change established is kept: a
+  cluster that sets `storage.s3` renders byte for byte as before, and its qualify
   hash does not move, so no existing cluster re-qualifies on upgrade. The
   two pinned hash literals are the test. The existing CEL rule that reads
   `self.storage.s3.auth` gains a `has(self.storage.s3)` guard.
@@ -342,6 +343,17 @@ without this decision `--store azure` would be reachable only by hand.
   `serviceAccountName`. The AKS workload identity webhook then injects the
   token file and the `AZURE_*` variables D3 reads. There is no sidecar and
   no credentials file: `object_store` reads the federated token itself.
+  In the operator's code all of this sits behind `pod_identity(spec)`
+  today, which reads `storage.s3.auth` and is false on an Azure cluster.
+  So the gate is split in two. Rendering the four ServiceAccounts, setting
+  each pod's `serviceAccountName`, and recording and sweeping the
+  `podIdentityServiceAccounts` status marker are gated on "S3 Pod Identity
+  or `storage.azure`". The credentials sidecar, the `aws-credentials`
+  volume and mount, and `--s3-credentials-file` stay gated on S3 Pod
+  Identity alone. A cluster edited from S3 Pod Identity to Azure keeps its
+  four accounts, because the sweep sees them as still desired. A test
+  pins each half: an Azure cluster renders the accounts and no sidecar,
+  and the sweep returns nothing for it.
   The federated credential on each managed identity (one per
   ServiceAccount subject) is created outside Ravel, and the guide lists
   the five subjects.
@@ -541,7 +553,8 @@ account all sixteen predictions hold, so no decision changes:
   came back in byte order.
 - P11: the listing's `Etag` is the HEAD `ETag` without its quotes.
 - P12: a name holding U+FFFE is listed with `Encoded="true"` and the whole
-  name percent-encoded. A name holding U+0001 cannot be created: Put Blob
+  name percent-encoded, slashes too: the key `<run>/enc/a<U+FFFE>b` came
+  back as `<run>%2Fenc%2Fa%EF%BF%BEb`. A name holding U+0001 cannot be created: Put Blob
   answers 400 `InvalidUri`.
 - P13: a blob with uncommitted blocks answers 404 to HEAD and is not
   listed; Put Block List makes it visible with one ETag.
