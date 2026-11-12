@@ -1566,6 +1566,39 @@ def cmd_fold_watermark(args):
             f"a fold that does not advance skips its retention-frontier reconcile and observes no tombstone")
 
 
+def part_keys(keys_lines, tenant_hash, signal_code):
+    """{key: hour} of every snapshot part the census lists for one tenant
+    and signal, t/<hash>/catalog/<signal>/snap/<YYYYMMDDTHH>.<hash16>.csnap
+    (fold.rs part_object_key), the hour the part's watermark hour in unix
+    hours: its last hour for a sealed part."""
+    out = {}
+    for line in keys_lines:
+        key = line.rstrip("\n").split("\t")[-1]
+        parts = key.split("/")
+        if (len(parts) == 6 and parts[0] == "t" and parts[1] == tenant_hash and parts[2] == "catalog"
+                and parts[3] == signal_code and parts[4] == "snap" and parts[5].endswith(".csnap")):
+            out[key] = hour_index(parts[5].split(".", 1)[0])
+    return out
+
+
+def cmd_part_puts(args):
+    """The snapshot parts of one tenant and signal a fold wrote (in --after
+    and not in --before), written to --out with the count of those whose
+    watermark hour lies in [--first, --last]. A measurement: any count
+    exits 0; exit 70 when a keys file could not be read."""
+    try:
+        with open(args.before) as f:
+            before = part_keys(f, args.tenant_hash, args.signal_code)
+        with open(args.after) as f:
+            after = part_keys(f, args.tenant_hash, args.signal_code)
+    except (OSError, ValueError) as e:
+        die(f"part-puts: {e}", 70)
+    new = sorted(k for k in after if k not in before)
+    write_json(args.out, {"tenant_hash": args.tenant_hash, "signal_code": args.signal_code,
+                          "first": args.first, "last": args.last, "new_parts": new,
+                          "new_in_range": sum(1 for k in new if args.first <= after[k] <= args.last)})
+
+
 def git_commit(repo, ref):
     """The full SHA ref names in repo, or None when it names no commit."""
     if not ref:
@@ -1954,6 +1987,16 @@ def main():
     fw.add_argument("--state", required=True)
     fw.add_argument("--out", required=True)
     fw.set_defaults(fn=cmd_fold_watermark)
+
+    pp = sub.add_parser("part-puts")
+    pp.add_argument("--before", required=True, help="census keys file before the fold")
+    pp.add_argument("--after", required=True, help="census keys file after it")
+    pp.add_argument("--tenant-hash", required=True)
+    pp.add_argument("--signal-code", default="l")
+    pp.add_argument("--first", type=int, required=True, help="first hour counted, unix hours")
+    pp.add_argument("--last", type=int, required=True, help="last hour counted, unix hours")
+    pp.add_argument("--out", required=True)
+    pp.set_defaults(fn=cmd_part_puts)
 
     fb = sub.add_parser("fold-binary")
     fb.add_argument("--repo", required=True)

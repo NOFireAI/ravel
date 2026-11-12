@@ -1463,7 +1463,10 @@ maint_records() {
 # and loads the tail corpus's logs into dp7 there (STATE_tail), so the fold
 # that follows advances its watermark. Then `catalog fold
 # --retention-default Rs`, which carries R into the fold and reconciles the
-# retirement frontier, is stamped as STATE's fold; inv.py fold-watermark
+# retirement frontier, is stamped as STATE's fold; the store is listed
+# again (keys-STATE-folded) and inv.py part-puts stamps the snapshot parts
+# that fold wrote since keys-STATE-after, and how many have a watermark
+# hour in D0..D0+23, as STATE.logs.retired_part_puts.json; inv.py fold-watermark
 # stamps its watermark before and after as STATE.logs.fold_watermark.json
 # and fails the state unless it advanced. A second fold is stamped as
 # STATE_refold; then the
@@ -1475,6 +1478,7 @@ maint_records() {
 retire_through() {
   local state="$1" k="$2" d0="$DP_START_7" cut="$WORK/retention-$1.json" r rows tokens key hash
   local tlog="$WORK/tombstone-check-$1.out" wlog="$WORK/fold-watermark-$1.out" deadline code=0 rflag trows
+  local plog="$WORK/part-puts-$1.out"
   rows="$(batch_rows "$(corpus_rows "$WORK/corpus-dp7" logs)" 168)"
   if [ "$DRY_RUN" = 1 ]; then
     run "$PY" "$LIB" retention-cutoff --parquet "$WORK/corpus-dp7/logs.parquet" --event-column ts \
@@ -1529,6 +1533,15 @@ retire_through() {
   # tenant's config record sets none, as dp7's does not; R is the same
   # window the maintain server tombstoned with.
   fold "$state" --key-index-leaves --retention-default "${r}s" || return 1
+  # Row W3's part PUTs: the snapshot parts this fold wrote whose watermark
+  # hour lies in the tombstoned day, so neither the tail nor a seal of
+  # another UTC day enters.
+  list_store "$state-folded"
+  printf 'STAMP stamps/%s.logs.retired_part_puts.json\n' "$state"
+  run "$PY" "$LIB" part-puts --before "$WORK/keys-$state-after.tsv" --after "$WORK/keys-$state-folded.tsv" \
+    --tenant-hash "${hash:-DP7_HASH}" --signal-code l --first "$d0" \
+    --last "$([ "$DRY_RUN" = 1 ] && echo "$d0+23" || echo $((d0 + 23)))" \
+    --out "$STAMPS/$state.logs.retired_part_puts.json" >"$plog" 2>&1 || { failed_at "part-puts $state" "$?" "$plog"; return 1; }
   printf 'STAMP stamps/%s.logs.fold_watermark.json\n' "$state"
   run "$PY" "$LIB" fold-watermark --report "$WORK/fold-$state-logs.out" --state "$state" \
     --out "$STAMPS/$state.logs.fold_watermark.json" >"$wlog" 2>&1 || { failed_at "fold-watermark $state" "$?" "$wlog"; return 1; }
