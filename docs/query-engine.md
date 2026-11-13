@@ -1369,7 +1369,8 @@ tied to the buffer it accounts for:
   splitting them) and, for a run with a per-sample provenance column, its
   `SamplePriority`; per emitted unit the unit and its copy of the series'
   labels (`decoded_units_len`). A histogram value's span and bucket vectors
-  are not in that figure; the fold charges them as it holds them. A page
+  are not in that figure; the fold charges them as it holds them, after the
+  decode has allocated them. A page
   stores a regular counter in well under a byte per sample, so the decoded
   runs are many times the batch's pages. A decode the budget refuses is
   refused after the batch's page GET and before any page is decoded
@@ -1389,7 +1390,14 @@ tied to the buffer it accounts for:
   `batching_keeps_the_gets_and_wire_bytes` pins the tighter case where no
   section boundary is bridged). An L0 segment is never batched,
   so its per-flush GET bound is unchanged
-  (`l0_is_one_batch_whatever_the_fetch_share`).
+  (`l0_is_one_batch_whatever_the_fetch_share`). Its one batch still reserves
+  its decoded runs before decoding, so an L0 read is charged the whole
+  matched selection's decoded size at once, about 16 bytes a sample, where
+  its stored pages hold a regular counter in well under a byte a sample.
+  A statement over L0 objects holding a few million matched samples per
+  object can therefore be refused with fetch memory exhausted under a
+  budget that the page bytes alone fit, and with no batch cut it cannot
+  answer in parts.
 - **RLOG block-range fetch** (`BlockRangeFetcher`): a ranged read holds only
   the regions it placed, with no object-sized buffer. Each GET that places
   bytes reserves its length first; the chunk runs of `fetch_chunk_ranges` and
