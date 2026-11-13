@@ -2098,8 +2098,9 @@ enum StoreCommand {
     /// before anything is read, and so does a report that could not be written
     /// to stdout (a closed pipe excepted). `object-retention` is not checked
     /// by this command: it is printed as not checked and does not affect the
-    /// exit code. Read-only. Under `--store gcs` it refuses and exits 2
-    /// without a request: GCS bucket protection is not checked.
+    /// exit code. Read-only. Under `--store gcs` or `--store azure` it refuses
+    /// and exits 2 without a request: GCS bucket protection and Azure
+    /// container protection are not checked.
     VerifyProtection {
         /// The noncurrent-version expiration, in days, the lifecycle rule
         /// covering `t/` must carry (`E_v`).
@@ -2866,7 +2867,8 @@ async fn main() -> anyhow::Result<()> {
 
 /// Parse `argv` into a [`Cli`] and record which store flags were given rather
 /// than defaulted, which `--store gcs` needs to refuse a given `--s3-*` flag
-/// (ADR-3456 decision 6).
+/// (ADR-3456 decision 6) and the Azure refusals need for theirs (ADR-4158
+/// decision 7).
 fn parse_cli<I, T>(argv: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = T>,
@@ -3118,21 +3120,26 @@ async fn run_agents(
 async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
     // Refused before the store is built, so a refused run sends no request.
     if let Some(tenant_kms) = command_tenant_kms(&cli.command) {
-        store::refuse_tenant_kms_under_gcs(&cli.store, tenant_kms)?;
+        store::refuse_tenant_kms_under_gcs_or_azure(&cli.store, tenant_kms)?;
     }
     if let Some(scratch) = command_scratch(&cli.command) {
         scratch.options()?;
     }
-    if cli.store.store_kind() == store::StoreKind::Gcs
-        && matches!(
-            cli.command,
-            Command::Store {
-                command: StoreCommand::VerifyProtection { .. }
-            }
-        )
-    {
-        eprintln!("error: {}", store::GCS_VERIFY_PROTECTION_REFUSAL);
-        std::process::exit(store::VERIFY_PROTECTION_UNKNOWN);
+    if matches!(
+        cli.command,
+        Command::Store {
+            command: StoreCommand::VerifyProtection { .. }
+        }
+    ) {
+        let refusal = match cli.store.store_kind() {
+            store::StoreKind::Gcs => Some(store::GCS_VERIFY_PROTECTION_REFUSAL),
+            store::StoreKind::Azure => Some(store::AZURE_VERIFY_PROTECTION_REFUSAL),
+            store::StoreKind::Memory | store::StoreKind::S3 => None,
+        };
+        if let Some(refusal) = refusal {
+            eprintln!("error: {refusal}");
+            std::process::exit(store::VERIFY_PROTECTION_UNKNOWN);
+        }
     }
     // Refused before the store is built: an unaudited query must not cost a
     // single request unless the operator acknowledged it.
