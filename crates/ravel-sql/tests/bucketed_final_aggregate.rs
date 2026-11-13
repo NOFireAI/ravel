@@ -770,7 +770,11 @@ async fn spill_rule_admits_string_and_binary_keys_only() {
         sql_config(4, None, None),
     )
     .await;
-    cases.push(("a Float64 key".to_string(), Arc::clone(&float.physical), false));
+    cases.push((
+        "a Float64 key".to_string(),
+        Arc::clone(&float.physical),
+        false,
+    ));
 
     for (what, plan, admitted) in &cases {
         let stock = format!("{}", displayable(plan.as_ref()).indent(false));
@@ -4252,8 +4256,13 @@ async fn bucket_spill_retry_admits_a_declared_str_key() {
     assert_eq!(retry_info_field(&log, "retry_plan"), "bucket");
     let bits = report.bits.expect("bits");
     let rows = report.routed_chunk_rows.expect("rows");
-    let budget = report.routed_chunk_bytes.expect("a string route has a byte budget");
-    assert!(budget >= ravel_sql::BUCKET_SPILL_MIN_CHUNK_BYTES, "{report:?}");
+    let budget = report
+        .routed_chunk_bytes
+        .expect("a string route has a byte budget");
+    assert!(
+        budget >= ravel_sql::BUCKET_SPILL_MIN_CHUNK_BYTES,
+        "{report:?}"
+    );
     assert_eq!(rows, ravel_sql::BUCKET_SPILL_MAX_CHUNK_ROWS, "{report:?}");
     assert_eq!(
         (
@@ -4266,7 +4275,9 @@ async fn bucket_spill_retry_admits_a_declared_str_key() {
     );
     let plan = run.plan.as_deref().expect("the retry's plan");
     assert!(
-        plan.contains(&format!("RepartitionExec: partitioning=Hash([s@0], {RETRY_PARTITIONS})")),
+        plan.contains(&format!(
+            "RepartitionExec: partitioning=Hash([s@0], {RETRY_PARTITIONS})"
+        )),
         "{plan}"
     );
     let execs = bucketed_lines(plan);

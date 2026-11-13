@@ -940,12 +940,12 @@ mod tests {
                 descriptor_need,
             })
         };
-        assert_eq!(derive(100_000, 1_000_000, true), string_route(0, 400_000, 3));
-        assert_eq!(derive(30_000, 100_000, true), string_route(0, 20_000, 3));
         assert_eq!(
-            derive(30_000, 100_000, false),
-            Err(NoTuning::TooManyBits)
+            derive(100_000, 1_000_000, true),
+            string_route(0, 400_000, 3)
         );
+        assert_eq!(derive(30_000, 100_000, true), string_route(0, 20_000, 3));
+        assert_eq!(derive(30_000, 100_000, false), Err(NoTuning::TooManyBits));
         assert_eq!(derive(30_000, 85_000, true), string_route(1, 18_333, 5));
         assert_eq!(derive(1, 30_000, true), Err(NoTuning::TooManyBits));
     }
