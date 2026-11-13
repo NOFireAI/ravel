@@ -1385,8 +1385,8 @@ pub struct RavelClusterStatus {
     /// `-query`, `-maintain`, `-qualify`). The operator deletes those
     /// accounts after a switch to S3 `static` only while this is set, and
     /// clears it once they are gone, so a cluster that never ran under either
-    /// never touches ServiceAccounts with those names. Recorded here because the operator's RBAC cannot read a
-    /// ServiceAccount to check who owns it.
+    /// never touches ServiceAccounts with those names. Recorded here because
+    /// the operator's RBAC cannot read a ServiceAccount to check who owns it.
     ///
     /// Serialized even when absent (as explicit `null`) so the status merge
     /// patch clears it after the sweep.
