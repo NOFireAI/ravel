@@ -141,6 +141,8 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                compact, fold, declare) and their sum
   upstream-result RESULTS PROGRESS_LOG
                                print a GCP run as one ClickBench results file
+  mapping-columns MAPPING      print how many typed columns a load mapping
+                               declares: its entries less any of type f64
   check-prereg PREREG          refuse a pre-registration that does not name
                                every figure prereg judges exactly once
   prereg PREREG RESULTS PROGRESS_LOG UPSTREAM STORE_BUCKET
@@ -704,6 +706,11 @@ def check_run_gcp(path, data):
     if "benchmark" not in phases:
         raise Refusal("run.toml %s: phases must include benchmark: results.json's statements "
                       "come from it" % path)
+    # Refused here, before a box exists: the GCP box installs no perf, and the
+    # phase would fail on it after the load and the benchmark.
+    if "perf" in phases or data.get("perf_record") is True:
+        raise Refusal("run.toml %s: phase perf (and perf_record = true) is not supported on "
+                      "cloud gcp: the box installs no perf" % path)
     _check_run_phase_keys(path, data)
     for key in ("project", "region", "zone", "image_family", "image_project", "instance_type"):
         if not isinstance(data[key], str) or not GCP_NAME_RE.match(data[key]):
@@ -3110,7 +3117,35 @@ def _dig(d, *keys):
     return d
 
 
-def _prereg_figures(r, up, store_bucket):
+MAPPING_ENTRY_TABLES = ("[[attribute]]", "[[resource_attribute]]")
+
+
+def mapping_columns(path):
+    """The typed columns `typed-attr-column set --from-mapping` declares from a
+    load mapping: one per [[attribute]] and [[resource_attribute]] entry,
+    except an entry of type f64, which it skips (no declared f64 type,
+    ADR-0100)."""
+    try:
+        lines = open(path).read().splitlines()
+    except OSError as e:
+        raise Refusal("cannot read %s: %s" % (path, e))
+    types, current = [], None
+    for raw in lines:
+        line = _strip_comment(raw)
+        if line.startswith("["):
+            if current is not None:
+                types.append(current)
+            current = "" if line in MAPPING_ENTRY_TABLES else None
+        elif current is not None and re.match(r"^type\s*=", line):
+            current = _value(line.split("=", 1)[1], path)
+    if current is not None:
+        types.append(current)
+    if not types:
+        raise Refusal("%s: no [[attribute]] or [[resource_attribute]] entry" % path)
+    return sum(1 for t in types if t != "f64")
+
+
+def _prereg_figures(r, up):
     """name -> function giving the measured value; raising _Missing when the
     run did not produce it."""
     p = r["provenance"]
@@ -3206,7 +3241,7 @@ def prereg(prereg_path, results_path, progress_path, upstream_path, store_bucket
     up = _strict_json(upstream_path)
     _strict_json(results_path)
     r = validate(results_path)
-    figures = _prereg_figures(r, up, store_bucket)
+    figures = _prereg_figures(r, up)
     if tuple(figures) != PREREG_FIGURES:
         raise Refusal("prereg: the judge's figures and PREREG_FIGURES differ")
     # A figure read from a log line, not from a JSON field: each step's start
@@ -3403,6 +3438,8 @@ def main(argv):
             print(json.dumps(load_window(args[0]), sort_keys=True))
         elif cmd == "upstream-result" and len(args) == 2:
             print(json.dumps(upstream_result(*args), indent=2))
+        elif cmd == "mapping-columns" and len(args) == 1:
+            print(mapping_columns(args[0]))
         elif cmd == "check-prereg" and len(args) == 1:
             check_prereg(args[0])
         elif cmd == "prereg" and len(args) == 5:
