@@ -254,8 +254,13 @@ part that carries refs for all three fields:
 5. A part that declines, at any step, is handed to the label-value route
    of ADR-3694 for that plan: no series refs, a series leaf rejected (an
    unaccepted version, a binding mismatch, corruption, a failed GET), `S`
-   over `S_max`, a pass over its GET ceiling, or a decode reservation
-   refused. That route keeps its own fallback to tier 1.
+   over `S_max`, a pass over its GET ceiling, a pass B or C over its share
+   of `Q_BC` at or under `B_run` buckets (step 3), or a set probe that
+   declines with either `KeyIndexSetDecline` variant (kidx.rs:1321-1333):
+   `OverBudget`, more than `b_run` distinct buckets whose bridged runs
+   exceed `max_bridged_bytes` (here the pass's share of `Q_BC`), or
+   `ReservationRefused`, a frame's `decoded_bound` refused under ADR-1170.
+   That route keeps its own fallback to tier 1.
 
 Passes are shared across plans as `route_values` shares one pass per
 distinct value today: pass A probes the union of the plans' pairs once,
