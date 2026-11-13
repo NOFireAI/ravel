@@ -28,6 +28,7 @@ use kube::{Api, Client, Resource, ResourceExt};
 use kube_runtime::controller::{Action, Controller};
 use kube_runtime::{WatchStreamExt, predicates, reflector, watcher};
 use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::azure::{AzureConfig, AzureStore};
 use ravel_object_store::s3::{S3Config, S3HttpConfig, S3Store};
 use ravel_types::{Signal, TenantHash, TenantHashScheme, TenantId};
 use serde::Serialize;
@@ -40,7 +41,7 @@ use crate::metrics::{ReconcileMetrics, ReconcileResult};
 
 use crate::crd::{
     AffinityBackend, Condition, LocalSecretRef, MIN_RESHARD_LEAD_HOURS, RavelCluster,
-    RavelClusterSpec, RavelClusterStatus, ShardOverridesSpec,
+    RavelClusterSpec, RavelClusterStatus, S3Spec, ShardOverridesSpec, StorageBackend,
 };
 use crate::pod_identity::{AgentEndpoint, OperatorCredentialCache};
 use crate::reconcile::{
@@ -451,17 +452,18 @@ async fn resolve_credential_resource_versions(
     spec: &crate::crd::RavelClusterSpec,
 ) -> Result<std::collections::BTreeMap<String, String>, Error> {
     let mut versions = std::collections::BTreeMap::new();
-    // Under podIdentity no pod reads a credential Secret, so none is read
-    // here either: a leftover `credentialsSecretRef` naming a deleted Secret
-    // must not hold the cluster.
-    if pod_identity(spec) {
+    // Under podIdentity and on Azure no pod reads a credential Secret, so
+    // none is read here either: a leftover `credentialsSecretRef` naming a
+    // deleted Secret must not hold the cluster.
+    let Some(s3) = spec.storage.s3.as_ref() else {
+        return Ok(versions);
+    };
+    if pod_identity(spec) || spec.storage.azure.is_some() {
         return Ok(versions);
     }
     let refs = [
         (
-            spec.storage
-                .s3
-                .credentials_secret_ref
+            s3.credentials_secret_ref
                 .as_ref()
                 .map(|r| r.name.as_str())
                 .unwrap_or(""),
@@ -517,6 +519,7 @@ fn shared_credentials_rv<'a>(
 ) -> Option<&'a str> {
     spec.storage
         .s3
+        .as_ref()?
         .credentials_secret_ref
         .as_ref()
         .and_then(|secret| versions.get(&secret.name))
@@ -831,12 +834,25 @@ async fn resolve_s3_credentials(
 /// store from them in memory (`auth: Static` with the session token, no
 /// file). Without the webhook variables in the operator's environment this
 /// fails with [`Error::PodIdentityCredentialsUnavailable`] naming them.
+///
+/// Under `storage.azure` it is an [`AzureStore`] authenticated as the
+/// operator's own ServiceAccount through AKS workload identity: the webhook
+/// injects the `AZURE_*` variables it reads, and no Secret is read.
 async fn build_auth_store(
     client: &Client,
     namespace: &str,
     spec: &RavelClusterSpec,
     credentials: &OperatorCredentialCache,
-) -> Result<S3Store, Error> {
+) -> Result<Arc<dyn ObjectStoreBackend>, Error> {
+    let s3 = match spec.storage.backend() {
+        Some(StorageBackend::S3(s3)) => s3,
+        Some(StorageBackend::Azure(azure)) => {
+            let config = AzureConfig::new(azure.account.clone(), azure.container.clone());
+            let store = AzureStore::new(config).await.map_err(Error::Store)?;
+            return Ok(Arc::new(store));
+        }
+        None => return Err(RenderError::StorageBackendNotExactlyOne.into()),
+    };
     let config = if pod_identity(spec) {
         let endpoint = AgentEndpoint::from_env()?;
         let role = credentials.get(&endpoint, SystemTime::now()).await?;
@@ -844,9 +860,7 @@ async fn build_auth_store(
         config.session_token = Some(role.session_token);
         config
     } else {
-        let secret_ref = spec
-            .storage
-            .s3
+        let secret_ref = s3
             .credentials_secret_ref
             .as_ref()
             .ok_or(RenderError::StaticCredentialsSecretRefMissing)?;
@@ -854,16 +868,18 @@ async fn build_auth_store(
             resolve_s3_credentials(client, namespace, secret_ref).await?;
         auth_store_config(spec, access_key_id, secret_access_key)?
     };
-    S3Store::with_http_config(config, auth_store_http_config(spec)).map_err(Error::Store)
+    let store =
+        S3Store::with_http_config(config, auth_store_http_config(s3)).map_err(Error::Store)?;
+    Ok(Arc::new(store))
 }
 
 /// The HTTP client config [`build_auth_store`] connects with: the default
 /// tuning plus `spec.storage.s3.uploadIntegrity` and `requestStoredChecksum`,
 /// so the operator's own writes carry the checksum the server's do.
-fn auth_store_http_config(spec: &RavelClusterSpec) -> S3HttpConfig {
+fn auth_store_http_config(s3: &S3Spec) -> S3HttpConfig {
     S3HttpConfig {
-        upload_integrity: spec.storage.s3.upload_integrity.mode(),
-        request_stored_checksum: spec.storage.s3.request_stored_checksum,
+        upload_integrity: s3.upload_integrity.mode(),
+        request_stored_checksum: s3.request_stored_checksum,
         ..Default::default()
     }
 }
@@ -884,10 +900,15 @@ fn auth_store_config(
     // and the `shardOverrides` reshard, so deriving it from presence let the
     // operator downgrade connections the pods it renders refuse.
     let allow_http = s3_allow_http(spec)?;
-    let endpoint = spec.storage.s3.endpoint.clone();
+    let s3 = spec
+        .storage
+        .s3
+        .as_ref()
+        .ok_or(RenderError::StorageBackendNotExactlyOne)?;
+    let endpoint = s3.endpoint.clone();
     Ok(S3Config {
-        bucket: spec.storage.s3.bucket.clone(),
-        region: spec.storage.s3.region.clone(),
+        bucket: s3.bucket.clone(),
+        region: s3.region.clone(),
         endpoint,
         access_key_id,
         secret_access_key,
@@ -1938,7 +1959,7 @@ async fn reconcile_inner(
         reconcile_sys_auth_best_effort(
             &deployment_key,
             &token_secret.token_values,
-            &store,
+            store.as_ref(),
             now_ns(),
         )
         .await;
@@ -1957,7 +1978,7 @@ async fn reconcile_inner(
             &obj.spec,
             shard_overrides,
             deployment_key_secret.key.as_ref(),
-            &store,
+            store.as_ref(),
             now_ns(),
         )
         .await;
@@ -2727,6 +2748,16 @@ pub(crate) const CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED: &str =
 /// main HTTP port instead of the dedicated health listener (issue #3112).
 pub(crate) const CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT: &str = "HealthProbeOnMainHttpPort";
 
+/// `status.conditions[].type` value saying whether the container's protection
+/// (versioning, soft delete, an immutability policy) was checked. Set only on a
+/// `storage.azure` cluster, always False: `--require-bucket-protection` has no
+/// Azure probes and is not rendered there (ADR-4158 D11).
+pub(crate) const CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED: &str = "BucketProtectionVerified";
+
+/// The `BucketProtectionVerified=False` reason on an Azure cluster.
+pub(crate) const BUCKET_PROTECTION_NOT_IMPLEMENTED_FOR_AZURE_REASON: &str =
+    "NotImplementedForAzure";
+
 /// `status.conditions[].type` value for an apiserver below
 /// [`MIN_KUBERNETES_MINOR_VERSION`] (issue #1714).
 pub(crate) const CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED: &str =
@@ -2746,6 +2777,7 @@ pub(crate) const CONDITION_TYPES: &[&str] = &[
     CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED,
     CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED,
     CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT,
+    CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED,
 ];
 
 /// Build a status Condition, stamping the current time as its transition time.
@@ -2819,6 +2851,11 @@ fn preserve_transition_times(
 /// opted out) still probes the main HTTP port instead of the dedicated
 /// health listener. See [`health_probe_on_main_http_port_condition`].
 ///
+/// `BucketProtectionVerified=False` with reason `NotImplementedForAzure` is
+/// set on every `storage.azure` cluster: the operator renders
+/// `--require-bucket-protection` for S3 (ADR-0072) and has no Azure probes,
+/// so the missing check is reported rather than silent (ADR-4158 D11).
+///
 /// The reconcile pass hands the result to whichever status writer runs; there
 /// is deliberately no read-modify-write against live status, which would race
 /// a concurrent writer.
@@ -2844,6 +2881,20 @@ fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) ->
 
     if let Some(cond) = health_probe_on_main_http_port_condition(spec, observed_generation) {
         conditions.push(cond);
+    }
+
+    if spec.storage.azure.is_some() {
+        conditions.push(condition(
+            CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED,
+            false,
+            observed_generation,
+            BUCKET_PROTECTION_NOT_IMPLEMENTED_FOR_AZURE_REASON,
+            "no container-protection check runs on Azure Blob Storage, so \
+             --require-bucket-protection is not rendered; configure blob \
+             versioning, soft delete and an immutability policy on the \
+             container by hand (see docs/guides/kubernetes.md, \
+             \"Azure Blob Storage with workload identity\")",
+        ));
     }
 
     conditions

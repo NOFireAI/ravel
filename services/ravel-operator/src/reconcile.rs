@@ -41,7 +41,7 @@ use crate::crd::{
     GATEWAY_DEFAULT_MEMORY_REQUEST, GatewayReference, IngestAffinitySpec, LocalSecretRef,
     MAINTAIN_DEFAULT_CPU_REQUEST, MAINTAIN_DEFAULT_MEMORY_REQUEST, MaintainScratchSpec,
     QUERY_DEFAULT_CPU_REQUEST, QUERY_DEFAULT_MEMORY_REQUEST, RavelClusterSpec,
-    ResourceRequirementsSpec, S3AuthSpec, S3UploadIntegrity,
+    ResourceRequirementsSpec, S3AuthSpec, S3Spec, S3UploadIntegrity, StorageBackend, AzureSpec,
 };
 
 /// A spec that cannot be rendered into a valid object set.
@@ -295,6 +295,26 @@ pub enum RenderError {
         /// The tier whose override is set: `gateway`, `query` or `maintain`.
         tier: &'static str,
     },
+
+    /// `spec.storage` sets neither `s3` nor `azure`, or both. The CRD's CEL
+    /// rule refuses this at admission; the render refuses it too, for an
+    /// object admitted before the rule existed.
+    #[error("spec.storage must set exactly one of s3 and azure")]
+    StorageBackendNotExactlyOne,
+
+    /// A per-tier `credentialsSecretRef` is set under `storage.azure`, where
+    /// each tier's identity is the client ID on its ServiceAccount. Refused
+    /// by CEL at admission and here, so an override is never silently
+    /// ignored.
+    #[error(
+        "spec.{tier}.credentialsSecretRef is set but spec.storage is azure, where the {tier} \
+         identity is the client ID on its ServiceAccount (storage.azure.clientId or \
+         roleClientIds); remove the override"
+    )]
+    AzureTierOverride {
+        /// The tier whose override is set: `gateway`, `query` or `maintain`.
+        tier: &'static str,
+    },
 }
 
 /// The [`RenderError::QueryMemoryBudgetExceedsLimit`] message, which differs
@@ -502,11 +522,9 @@ fn tier_credentials_secret_name<'a>(
     spec: &'a RavelClusterSpec,
     tier_override: Option<&'a LocalSecretRef>,
 ) -> Option<&'a str> {
-    if pod_identity(spec) {
-        return None;
-    }
+    let s3 = static_s3(spec)?;
     tier_override
-        .or(spec.storage.s3.credentials_secret_ref.as_ref())
+        .or(s3.credentials_secret_ref.as_ref())
         .map(|r| r.name.as_str())
 }
 
@@ -668,8 +686,8 @@ fn s3_credential_env(
             })
             .collect();
     }
-    // A static spec with no Secret at all is refused by
-    // `validate_storage_auth` before any render runs.
+    // A static spec with no Secret at all, and an Azure spec, are refused by
+    // or render nothing here.
     let Some(secret) = tier_credentials_secret_name(spec, tier_override) else {
         return Vec::new();
     };
@@ -722,36 +740,93 @@ pub const POD_IDENTITY_SIDECAR_PROBE_PERIOD_SECONDS: i32 = 2;
 pub const POD_IDENTITY_SIDECAR_PROBE_FAILURE_THRESHOLD: i32 = 60;
 
 /// Whether the cluster runs on EKS Pod Identity (`storage.s3.auth:
-/// podIdentity`) rather than a static key Secret.
+/// podIdentity`) rather than a static key Secret. False on Azure.
 pub fn pod_identity(spec: &RavelClusterSpec) -> bool {
-    spec.storage.s3.auth == S3AuthSpec::PodIdentity
+    spec.storage
+        .s3
+        .as_ref()
+        .is_some_and(|s3| s3.auth == S3AuthSpec::PodIdentity)
 }
 
-/// Refuse a storage-auth configuration that cannot render: `podIdentity`
-/// with no sidecar image, `podIdentity` with a per-tier override, or `static`
-/// with no credential Secret. The CRD's CEL rules refuse the last two at
-/// admission; this covers objects admitted before those rules existed and the
-/// operator flag the CRD cannot see. Called by [`desired_objects`] and, before
-/// the qualification gate, by the controller.
+/// `storage.s3` under `auth: static`, the only mode that reads a credential
+/// Secret.
+fn static_s3(spec: &RavelClusterSpec) -> Option<&S3Spec> {
+    spec.storage
+        .s3
+        .as_ref()
+        .filter(|s3| s3.auth == S3AuthSpec::Static)
+}
+
+/// Whether the operator owns the four tier ServiceAccounts and runs every
+/// pod as one: under S3 Pod Identity and under `storage.azure` (ADR-4158
+/// D11). The credentials sidecar and its volume are [`pod_identity`] alone.
+pub fn tier_service_accounts_owned(spec: &RavelClusterSpec) -> bool {
+    pod_identity(spec) || spec.storage.azure.is_some()
+}
+
+/// The pod label the AKS workload identity webhook selects on.
+pub const AZURE_WORKLOAD_IDENTITY_USE_LABEL: &str = "azure.workload.identity/use";
+
+/// The ServiceAccount annotation naming the managed identity a pod runs as.
+pub const AZURE_WORKLOAD_IDENTITY_CLIENT_ID_ANNOTATION: &str = "azure.workload.identity/client-id";
+
+/// The labels of a tier or Job pod template: the selector labels, plus the
+/// workload identity label under `storage.azure`. The selector itself never
+/// carries it, so a backend change never edits an immutable selector.
+fn pod_template_labels(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    component: &str,
+) -> BTreeMap<String, String> {
+    let mut template = labels(instance, component);
+    if spec.storage.azure.is_some() {
+        template.insert(
+            AZURE_WORKLOAD_IDENTITY_USE_LABEL.to_string(),
+            "true".to_string(),
+        );
+    }
+    template
+}
+
+/// Refuse a storage configuration that cannot render: not exactly one
+/// backend; under S3, `podIdentity` with no sidecar image, `podIdentity`
+/// with a per-tier override, or `static` with no credential Secret; under
+/// Azure, a per-tier override. The CRD's CEL rules refuse all but the
+/// sidecar image at admission; this covers objects admitted before those
+/// rules existed and the operator flag the CRD cannot see. Called by
+/// [`desired_objects`] and, before the qualification gate, by the
+/// controller.
 pub fn validate_storage_auth(
     spec: &RavelClusterSpec,
     credentials_sidecar_image: Option<&str>,
 ) -> Result<(), RenderError> {
-    match spec.storage.s3.auth {
+    let tier_overrides = [
+        ("gateway", spec.gateway.credentials_secret_ref.is_some()),
+        ("query", spec.query.credentials_secret_ref.is_some()),
+        ("maintain", spec.maintain.credentials_secret_ref.is_some()),
+    ];
+    let overridden = tier_overrides
+        .into_iter()
+        .find_map(|(tier, set)| set.then_some(tier));
+    let s3 = match spec.storage.backend() {
+        None => return Err(RenderError::StorageBackendNotExactlyOne),
+        Some(StorageBackend::Azure(_)) => {
+            return match overridden {
+                Some(tier) => Err(RenderError::AzureTierOverride { tier }),
+                None => Ok(()),
+            };
+        }
+        Some(StorageBackend::S3(s3)) => s3,
+    };
+    match s3.auth {
         S3AuthSpec::Static => {
-            if spec.storage.s3.credentials_secret_ref.is_none() {
+            if s3.credentials_secret_ref.is_none() {
                 return Err(RenderError::StaticCredentialsSecretRefMissing);
             }
         }
         S3AuthSpec::PodIdentity => {
-            for (tier, set) in [
-                ("gateway", spec.gateway.credentials_secret_ref.is_some()),
-                ("query", spec.query.credentials_secret_ref.is_some()),
-                ("maintain", spec.maintain.credentials_secret_ref.is_some()),
-            ] {
-                if set {
-                    return Err(RenderError::PodIdentityTierOverride { tier });
-                }
+            if let Some(tier) = overridden {
+                return Err(RenderError::PodIdentityTierOverride { tier });
             }
             if credentials_sidecar_image.is_none_or(str::is_empty) {
                 return Err(RenderError::CredentialsSidecarImageUnset);
@@ -841,10 +916,12 @@ fn pod_identity_sidecar(image: &str) -> Container {
     }
 }
 
-/// The pod-level additions `podIdentity` makes to a tier or Job pod: the
-/// ServiceAccount, the `aws-credentials` volume, the sidecar, and the
-/// server container's read-only mount. A no-op for a `static` spec, which
-/// therefore renders byte-identical to before the field existed.
+/// The pod-level additions S3 Pod Identity and Azure workload identity make
+/// to a tier or Job pod. Both run the pod as its operator-owned
+/// ServiceAccount. `podIdentity` alone adds the `aws-credentials` volume,
+/// the sidecar, and the server container's read-only mount; on Azure the
+/// webhook injects the token itself. A no-op for an S3 `static` spec, which
+/// therefore renders byte-identical to before either existed.
 fn add_pod_identity(
     spec: &RavelClusterSpec,
     instance: &str,
@@ -852,10 +929,12 @@ fn add_pod_identity(
     credentials_sidecar_image: Option<&str>,
     pod: &mut PodSpec,
 ) {
+    if tier_service_accounts_owned(spec) {
+        pod.service_account_name = Some(child_name(instance, component));
+    }
     if !pod_identity(spec) {
         return;
     }
-    pod.service_account_name = Some(child_name(instance, component));
     pod.volumes
         .get_or_insert_with(Vec::new)
         .push(aws_credentials_volume());
@@ -875,20 +954,22 @@ fn add_pod_identity(
 }
 
 /// The components that run as an operator-owned ServiceAccount under
-/// `podIdentity`, in apply order.
+/// `podIdentity` or `storage.azure`, in apply order.
 const POD_IDENTITY_COMPONENTS: [&str; 4] = ["gateway", "query", "maintain", QUALIFY_COMPONENT];
 
 /// The ServiceAccounts the operator owns under `storage.s3.auth:
-/// podIdentity`: `<name>-gateway`, `<name>-query`, `<name>-maintain` and
-/// `<name>-qualify`, the names the cluster's Pod Identity associations
-/// must use. Empty under `static`. The maintain one is rendered even when
+/// podIdentity` or `storage.azure`: `<name>-gateway`, `<name>-query`,
+/// `<name>-maintain` and `<name>-qualify`, the names the cluster's Pod
+/// Identity associations or federated credentials must use. Under Azure each
+/// carries `azure.workload.identity/client-id` with its role's client ID.
+/// Empty under S3 `static`. The maintain one is rendered even when
 /// `maintain.enabled` is false, so an association never points at a name
 /// that comes and goes with that flag.
 pub fn desired_tier_service_accounts(
     spec: &RavelClusterSpec,
     instance: &str,
 ) -> Vec<ServiceAccount> {
-    if !pod_identity(spec) {
+    if !tier_service_accounts_owned(spec) {
         return Vec::new();
     }
     POD_IDENTITY_COMPONENTS
@@ -897,6 +978,12 @@ pub fn desired_tier_service_accounts(
             metadata: ObjectMeta {
                 name: Some(child_name(instance, component)),
                 labels: Some(labels(instance, component)),
+                annotations: spec.storage.azure.as_ref().map(|azure| {
+                    BTreeMap::from([(
+                        AZURE_WORKLOAD_IDENTITY_CLIENT_ID_ANNOTATION.to_string(),
+                        azure.client_id_for(component).to_string(),
+                    )])
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -913,12 +1000,12 @@ pub fn possible_tier_service_account_names(instance: &str) -> Vec<String> {
         .collect()
 }
 
-/// The podIdentity ServiceAccounts the controller deletes this pass: the
+/// The operator-owned ServiceAccounts the controller deletes this pass: the
 /// ones the render no longer produces, and only when
 /// `status.podIdentityServiceAccounts` (`recorded`) says the operator applied
 /// them. The operator cannot read a ServiceAccount to check its owner, so the
-/// marker is what keeps a cluster that never ran under `podIdentity` from
-/// deleting accounts with these names.
+/// marker is what keeps a cluster that never ran under `podIdentity` or
+/// `storage.azure` from deleting accounts with these names.
 pub fn tier_service_accounts_to_sweep(
     spec: &RavelClusterSpec,
     instance: &str,
@@ -948,7 +1035,7 @@ pub fn pod_identity_service_accounts_marker(
     recorded: bool,
     swept: bool,
 ) -> Option<bool> {
-    (pod_identity(spec) || (recorded && !swept)).then_some(true)
+    (tier_service_accounts_owned(spec) || (recorded && !swept)).then_some(true)
 }
 
 /// An `EnvVarSource` reading `key` from Secret `secret`.
@@ -1098,12 +1185,13 @@ pub fn audit_token_key_missing(spec: &RavelClusterSpec) -> bool {
 /// refuses a spec whose server containers would refuse their own endpoint at
 /// startup, and `controller::auth_store_config`, which builds the operator's
 /// own store handle for `sys/auth` and the `shardOverrides` reshard.
+///
+/// `false` for a spec with no `storage.s3`, which reaches no S3 endpoint.
 pub fn s3_allow_http(spec: &RavelClusterSpec) -> Result<bool, RenderError> {
-    resolve_s3_allow_http(
-        spec.storage.s3.endpoint.as_deref(),
-        spec.storage.s3.allow_http,
-    )
-    .map_err(|refused| match refused {
+    let Some(s3) = spec.storage.s3.as_ref() else {
+        return Ok(false);
+    };
+    resolve_s3_allow_http(s3.endpoint.as_deref(), s3.allow_http).map_err(|refused| match refused {
         S3EndpointRefusal::Plaintext(refused) => RenderError::PlaintextS3Endpoint {
             endpoint: refused.endpoint,
         },
@@ -1135,43 +1223,68 @@ pub fn s3_allow_http(spec: &RavelClusterSpec) -> Result<bool, RenderError> {
 /// make it conditional on. `ravel-server`'s own default stays off for the
 /// dev binary and any other direct invocation; only the operator's rendered
 /// command line turns it on.
+///
+/// Under `storage.azure` the store flags are `--store azure --azure-account
+/// --azure-container` and nothing else: `--store azure` refuses every
+/// `--s3-*` flag and `--require-bucket-protection` (ADR-4158 D7), and the
+/// missing protection check is reported by the `BucketProtectionVerified`
+/// condition instead.
 fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
+    let s3 = match spec.storage.backend() {
+        Some(StorageBackend::S3(s3)) => s3,
+        Some(StorageBackend::Azure(azure)) => {
+            let mut args = vec![
+                "--store".to_string(),
+                "azure".to_string(),
+                "--shards".to_string(),
+                spec.shards.to_string(),
+                "--azure-account".to_string(),
+                azure.account.clone(),
+                "--azure-container".to_string(),
+                azure.container.clone(),
+            ];
+            args.extend(tenant_hash_args(spec));
+            return args;
+        }
+        // `validate_storage_auth` refuses this before any render. A value
+        // the server refuses keeps a render that bypassed it from starting on
+        // the default in-process memory store.
+        None => {
+            return vec![
+                "--store".to_string(),
+                "unconfigured".to_string(),
+            ];
+        }
+    };
     let mut args = vec![
         "--store".to_string(),
         "s3".to_string(),
         "--shards".to_string(),
         spec.shards.to_string(),
         "--s3-bucket".to_string(),
-        spec.storage.s3.bucket.clone(),
+        s3.bucket.clone(),
         "--s3-region".to_string(),
-        spec.storage.s3.region.clone(),
+        s3.region.clone(),
         "--require-bucket-protection".to_string(),
     ];
-    if spec.deployment_key_secret_ref.is_some() {
-        args.push("--tenant-hash-key-file".to_string());
-        args.push(format!(
-            "{DEPLOYMENT_KEY_MOUNT_DIR}/{DEPLOYMENT_KEY_SECRET_KEY}"
-        ));
-    } else {
-        args.push("--tenant-hash-unkeyed".to_string());
-    }
-    if let Some(endpoint) = &spec.storage.s3.endpoint {
+    args.extend(tenant_hash_args(spec));
+    if let Some(endpoint) = &s3.endpoint {
         args.push("--s3-endpoint".to_string());
         args.push(endpoint.clone());
     }
     // A server pod never reaches its object store over loopback, so a
     // plaintext in-cluster endpoint refuses startup without this flag.
-    if spec.storage.s3.allow_http {
+    if s3.allow_http {
         args.push("--s3-allow-http".to_string());
     }
     // Rendered only away from the server's own defaults, so a cluster that
     // sets neither field keeps the command line it had and still runs an
     // image that predates both flags.
-    if spec.storage.s3.upload_integrity != S3UploadIntegrity::default() {
+    if s3.upload_integrity != S3UploadIntegrity::default() {
         args.push("--s3-upload-integrity".to_string());
-        args.push(spec.storage.s3.upload_integrity.flag_value().to_string());
+        args.push(s3.upload_integrity.flag_value().to_string());
     }
-    if !spec.storage.s3.request_stored_checksum {
+    if !s3.request_stored_checksum {
         args.push("--s3-request-stored-checksum=false".to_string());
     }
     // Under podIdentity the sidecar's file is the credential; `--s3-auth`
@@ -1180,6 +1293,20 @@ fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
     if pod_identity(spec) {
         args.push("--s3-credentials-file".to_string());
         args.push(AWS_CREDENTIALS_FILE.to_string());
+    }
+    args
+}
+
+/// The tenant-hash scheme flag (see [`common_store_args`]).
+fn tenant_hash_args(spec: &RavelClusterSpec) -> Vec<String> {
+    let mut args = Vec::new();
+    if spec.deployment_key_secret_ref.is_some() {
+        args.push("--tenant-hash-key-file".to_string());
+        args.push(format!(
+            "{DEPLOYMENT_KEY_MOUNT_DIR}/{DEPLOYMENT_KEY_SECRET_KEY}"
+        ));
+    } else {
+        args.push("--tenant-hash-unkeyed".to_string());
     }
     args
 }
@@ -1721,7 +1848,7 @@ fn deployment(
             }),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
-                    labels: Some(labels),
+                    labels: Some(pod_template_labels(spec, instance, component)),
                     annotations: Some(BTreeMap::from([(
                         SECRETS_CHECKSUM_ANNOTATION.to_string(),
                         secrets_checksum.to_string(),
@@ -3260,10 +3387,11 @@ impl DeploymentTier {
 /// `GetObject` only. One override is enough to put the cluster in that world:
 /// the overriding tier is the one whose grants narrowed.
 ///
-/// `storage.s3.auth: podIdentity` is always per-role: each tier runs as its
-/// own ServiceAccount, whose association names that tier's role.
+/// `storage.s3.auth: podIdentity` and `storage.azure` are always per-role:
+/// each tier runs as its own ServiceAccount, whose association or client ID
+/// names that tier's role.
 pub fn per_role_credentials(spec: &RavelClusterSpec) -> bool {
-    pod_identity(spec)
+    tier_service_accounts_owned(spec)
         || spec.gateway.credentials_secret_ref.is_some()
         || spec.query.credentials_secret_ref.is_some()
         || spec.maintain.credentials_secret_ref.is_some()
@@ -3576,6 +3704,14 @@ pub fn qualify_job_input_hash(
     spec: &RavelClusterSpec,
     credentials_resource_version: Option<&str>,
 ) -> String {
+    let s3 = match spec.storage.backend() {
+        Some(StorageBackend::S3(s3)) => s3,
+        Some(StorageBackend::Azure(azure)) => {
+            return azure_qualify_job_input_hash(spec, azure);
+        }
+        // No Job renders for this spec (`validate_storage_auth`).
+        None => return blake3_hex(&[UNCONFIGURED_QUALIFY_HASH_DOMAIN]),
+    };
     // Endpoint presence is significant (finding 3, issue #36): common_store_args
     // and desired_qualify_job emit the endpoint flag/env only when Some, so
     // endpoint: null and endpoint: "" select different stores, yet
@@ -3584,7 +3720,7 @@ pub fn qualify_job_input_hash(
     // two forms apart, so editing between them re-qualifies: 0x01 then the value
     // for Some, a lone 0x00 for None. The 0xff field separator fixes the field
     // boundary; this byte fixes presence, which the separator alone cannot.
-    let endpoint = match spec.storage.s3.endpoint.as_deref() {
+    let endpoint = match s3.endpoint.as_deref() {
         Some(value) => format!("\u{1}{value}"),
         None => "\u{0}".to_string(),
     };
@@ -3611,7 +3747,7 @@ pub fn qualify_job_input_hash(
     // Job's annotation must move with it. The cost is one re-qualification per
     // existing cluster on the upgrade that adds this field, which is the same
     // cost any other hashed input would carry.
-    let allow_http = if spec.storage.s3.allow_http {
+    let allow_http = if s3.allow_http {
         "true"
     } else {
         "false"
@@ -3623,7 +3759,7 @@ pub fn qualify_job_input_hash(
     // would leave that edit unqualified and the cluster held. Adding them
     // re-qualifies every existing cluster once on the upgrade that adds them,
     // the same cost `allowHttp` accepted.
-    let request_stored_checksum = if spec.storage.s3.request_stored_checksum {
+    let request_stored_checksum = if s3.request_stored_checksum {
         "true"
     } else {
         "false"
@@ -3631,18 +3767,16 @@ pub fn qualify_job_input_hash(
     // The credential Secret's name is absent under `podIdentity` (and for an
     // invalid static spec, which never reaches a Job). A Secret name is never
     // empty and never holds NUL, so the lone 0x00 cannot collide with one.
-    let credentials_name = spec
-        .storage
-        .s3
+    let credentials_name = s3
         .credentials_secret_ref
         .as_ref()
         .map_or("\u{0}", |secret| secret.name.as_str());
     let mut fields = vec![
-        spec.storage.s3.bucket.as_str(),
-        spec.storage.s3.region.as_str(),
+        s3.bucket.as_str(),
+        s3.region.as_str(),
         endpoint.as_str(),
         allow_http,
-        spec.storage.s3.upload_integrity.flag_value(),
+        s3.upload_integrity.flag_value(),
         request_stored_checksum,
         spec.image.as_str(),
         credentials_name,
@@ -3655,9 +3789,99 @@ pub fn qualify_job_input_hash(
     // switch to or from `podIdentity` is a different input (other
     // credentials, a different Job) and re-runs qualification.
     if pod_identity(spec) {
-        fields.push(spec.storage.s3.auth.spelling());
+        fields.push(s3.auth.spelling());
     }
     blake3_hex(&fields)
+}
+
+/// The first field of an Azure cluster's qualify hash. An S3 hash's first
+/// field is a bucket name, which never starts with NUL, and an S3 hash has
+/// nine or ten fields to this one's five, so the two cannot collide.
+const AZURE_QUALIFY_HASH_DOMAIN: &str = "\u{0}azure";
+
+/// The qualify hash of a spec with no single backend, which renders no Job.
+const UNCONFIGURED_QUALIFY_HASH_DOMAIN: &str = "\u{0}unconfigured";
+
+/// The qualify hash of a `storage.azure` cluster (ADR-4158 D11): the
+/// account, the container, the image and the `qualify` role's client ID, the
+/// identity the Job authenticates as. Another role's client ID qualifies
+/// nothing, so it is not hashed.
+fn azure_qualify_job_input_hash(spec: &RavelClusterSpec, azure: &AzureSpec) -> String {
+    blake3_hex(&[
+        AZURE_QUALIFY_HASH_DOMAIN,
+        azure.account.as_str(),
+        azure.container.as_str(),
+        spec.image.as_str(),
+        azure.client_id_for(QUALIFY_COMPONENT),
+    ])
+}
+
+/// The qualify Job's S3 environment: the store flags through the
+/// `RAVEL_S3_*` variables `ravel-cli` reads (clap `env`), and the
+/// credentials (see [`desired_qualify_job`]).
+fn s3_qualify_env(spec: &RavelClusterSpec, s3: &S3Spec) -> Vec<EnvVar> {
+    let mut env = vec![
+        EnvVar {
+            name: "RAVEL_S3_BUCKET".to_string(),
+            value: Some(s3.bucket.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "RAVEL_S3_REGION".to_string(),
+            value: Some(s3.region.clone()),
+            ..Default::default()
+        },
+    ];
+    if let Some(endpoint) = &s3.endpoint {
+        env.push(EnvVar {
+            name: "RAVEL_S3_ENDPOINT".to_string(),
+            value: Some(endpoint.clone()),
+            ..Default::default()
+        });
+    }
+    // `ravel-cli` applies the same plaintext-endpoint rule as the server
+    // (issue #1707), and this pod is never loopback to its object store, so a
+    // cluster whose server pods carry `--s3-allow-http` must hand the Job the
+    // same permission or qualification fails on a cluster configured to run.
+    // `true` is the only truthy spelling clap's `SetTrue` env parser accepts;
+    // rendered only when the field is set, so an https:// or real-AWS cluster
+    // keeps the env block it had.
+    if s3.allow_http {
+        env.push(EnvVar {
+            name: "RAVEL_S3_ALLOW_HTTP".to_string(),
+            value: Some("true".to_string()),
+            ..Default::default()
+        });
+    }
+    // `store qualify` PUTs with the upload checksum and reads back the stored
+    // one, so the Job must carry the servers' settings or it proves a
+    // different client. Always rendered, unlike the server flags: an image
+    // whose `ravel-cli` predates them ignores an unknown env var, and the
+    // explicit value keeps the Job and the servers in agreement even if the
+    // CLI's default were to change.
+    env.push(EnvVar {
+        name: "RAVEL_S3_UPLOAD_INTEGRITY".to_string(),
+        value: Some(s3.upload_integrity.flag_value().to_string()),
+        ..Default::default()
+    });
+    env.push(EnvVar {
+        name: "RAVEL_S3_REQUEST_STORED_CHECKSUM".to_string(),
+        value: Some(s3.request_stored_checksum.to_string()),
+        ..Default::default()
+    });
+    // Credentials mirror the server Deployment exactly: sourced from the shared
+    // credentials Secret via secretKeyRef, never literal values. Under
+    // podIdentity the file is the credential and the two key variables carry
+    // the placeholder, as on the tiers.
+    if pod_identity(spec) {
+        env.push(EnvVar {
+            name: "RAVEL_S3_CREDENTIALS_FILE".to_string(),
+            value: Some(AWS_CREDENTIALS_FILE.to_string()),
+            ..Default::default()
+        });
+    }
+    env.extend(s3_credential_env(spec, None));
+    env
 }
 
 /// The one-shot store-qualification Job for a cluster (issue #36).
@@ -3696,6 +3920,11 @@ pub fn qualify_job_input_hash(
 /// sidecar's file through `RAVEL_S3_CREDENTIALS_FILE`.
 /// `credentials_sidecar_image` is the operator's `--credentials-sidecar-image`
 /// and is ignored under `static`.
+///
+/// Under `storage.azure` it runs `ravel-cli --store azure store qualify`
+/// with `RAVEL_AZURE_ACCOUNT` and `RAVEL_AZURE_CONTAINER`, as `<name>-qualify`
+/// and labelled for the workload identity webhook, which injects the
+/// credentials.
 pub fn desired_qualify_job(
     spec: &RavelClusterSpec,
     instance: &str,
@@ -3703,67 +3932,28 @@ pub fn desired_qualify_job(
     credentials_sidecar_image: Option<&str>,
 ) -> Job {
     let labels = labels(instance, QUALIFY_COMPONENT);
-    let mut env = vec![
-        EnvVar {
-            name: "RAVEL_S3_BUCKET".to_string(),
-            value: Some(spec.storage.s3.bucket.clone()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: "RAVEL_S3_REGION".to_string(),
-            value: Some(spec.storage.s3.region.clone()),
-            ..Default::default()
-        },
-    ];
-    if let Some(endpoint) = &spec.storage.s3.endpoint {
-        env.push(EnvVar {
-            name: "RAVEL_S3_ENDPOINT".to_string(),
-            value: Some(endpoint.clone()),
-            ..Default::default()
-        });
-    }
-    // `ravel-cli` applies the same plaintext-endpoint rule as the server
-    // (issue #1707), and this pod is never loopback to its object store, so a
-    // cluster whose server pods carry `--s3-allow-http` must hand the Job the
-    // same permission or qualification fails on a cluster configured to run.
-    // `true` is the only truthy spelling clap's `SetTrue` env parser accepts;
-    // rendered only when the field is set, so an https:// or real-AWS cluster
-    // keeps the env block it had.
-    if spec.storage.s3.allow_http {
-        env.push(EnvVar {
-            name: "RAVEL_S3_ALLOW_HTTP".to_string(),
-            value: Some("true".to_string()),
-            ..Default::default()
-        });
-    }
-    // `store qualify` PUTs with the upload checksum and reads back the stored
-    // one, so the Job must carry the servers' settings or it proves a
-    // different client. Always rendered, unlike the server flags: an image
-    // whose `ravel-cli` predates them ignores an unknown env var, and the
-    // explicit value keeps the Job and the servers in agreement even if the
-    // CLI's default were to change.
-    env.push(EnvVar {
-        name: "RAVEL_S3_UPLOAD_INTEGRITY".to_string(),
-        value: Some(spec.storage.s3.upload_integrity.flag_value().to_string()),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "RAVEL_S3_REQUEST_STORED_CHECKSUM".to_string(),
-        value: Some(spec.storage.s3.request_stored_checksum.to_string()),
-        ..Default::default()
-    });
-    // Credentials mirror the server Deployment exactly: sourced from the shared
-    // credentials Secret via secretKeyRef, never literal values. Under
-    // podIdentity the file is the credential and the two key variables carry
-    // the placeholder, as on the tiers.
-    if pod_identity(spec) {
-        env.push(EnvVar {
-            name: "RAVEL_S3_CREDENTIALS_FILE".to_string(),
-            value: Some(AWS_CREDENTIALS_FILE.to_string()),
-            ..Default::default()
-        });
-    }
-    env.extend(s3_credential_env(spec, None));
+    let (store, env) = match spec.storage.backend() {
+        Some(StorageBackend::S3(s3)) => ("s3", s3_qualify_env(spec, s3)),
+        // The workload identity webhook injects the credentials.
+        Some(StorageBackend::Azure(azure)) => (
+            "azure",
+            vec![
+                EnvVar {
+                    name: "RAVEL_AZURE_ACCOUNT".to_string(),
+                    value: Some(azure.account.clone()),
+                    ..Default::default()
+                },
+                EnvVar {
+                    name: "RAVEL_AZURE_CONTAINER".to_string(),
+                    value: Some(azure.container.clone()),
+                    ..Default::default()
+                },
+            ],
+        ),
+        // `validate_storage_auth` refuses this before any render; the
+        // value is one `ravel-cli` refuses.
+        None => ("unconfigured", Vec::new()),
+    };
 
     let container = Container {
         name: "qualify".to_string(),
@@ -3772,7 +3962,7 @@ pub fn desired_qualify_job(
         command: Some(vec!["/usr/local/bin/ravel-cli".to_string()]),
         args: Some(vec![
             "--store".to_string(),
-            "s3".to_string(),
+            store.to_string(),
             "store".to_string(),
             "qualify".to_string(),
         ]),
@@ -3798,7 +3988,7 @@ pub fn desired_qualify_job(
     Job {
         metadata: ObjectMeta {
             name: Some(child_name(instance, QUALIFY_COMPONENT)),
-            labels: Some(labels.clone()),
+            labels: Some(labels),
             annotations: Some(BTreeMap::from([(
                 QUALIFY_SPEC_HASH_ANNOTATION.to_string(),
                 qualify_job_input_hash(spec, credentials_resource_version),
@@ -3811,7 +4001,7 @@ pub fn desired_qualify_job(
             ttl_seconds_after_finished: Some(QUALIFY_JOB_TTL_SECONDS),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
-                    labels: Some(labels),
+                    labels: Some(pod_template_labels(spec, instance, QUALIFY_COMPONENT)),
                     ..Default::default()
                 }),
                 spec: Some(pod),
