@@ -3559,6 +3559,49 @@ mod tests {
                 "{ravel_bucket:?}: {refused:?}"
             );
         }
+        // ADR-4158 D7: under `--store azure` an Azure profile on Ravel's
+        // account and container is refused; the same profile is not Ravel's
+        // bucket under `--store s3`.
+        let azure_profiles = ravel_object_store::external::load_profiles(
+            r#"[{"name": "archive", "kind": "azure", "account": "ravelprod",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}}]"#,
+        )
+        .expect("profiles");
+        for (ravel_bucket, refused) in [
+            (
+                crate::config::RavelBucket::Azure {
+                    account: "ravelprod".to_string(),
+                    container: "ravel-data".to_string(),
+                },
+                true,
+            ),
+            (
+                crate::config::RavelBucket::S3 {
+                    bucket: "ravel-data".to_string(),
+                    endpoint: None,
+                    region: "us-east-1".to_string(),
+                },
+                false,
+            ),
+        ] {
+            let configured = build(Some(crate::config::ParquetProfiles {
+                profiles: azure_profiles.clone(),
+                ravel_bucket: Some(ravel_bucket.clone()),
+            }));
+            let sources = configured.executor.parquet_sources().expect("sources");
+            let outcome = sources
+                .external_stores()
+                .expect("profile stores")
+                .store("archive", "ravel-data");
+            assert_eq!(
+                matches!(
+                    outcome,
+                    Err(ravel_sql::ExternalStoreError::RavelBucket { .. })
+                ),
+                refused,
+                "{ravel_bucket:?}"
+            );
+        }
         let unconfigured = build(None);
         assert!(
             !unconfigured

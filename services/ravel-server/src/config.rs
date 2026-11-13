@@ -7510,6 +7510,10 @@ impl Cli {
                 }
             }
         }
+        let running = cli
+            .store
+            .to_possible_value()
+            .map_or_else(|| "memory".to_string(), |v| v.get_name().to_string());
         for (kind, store, flags) in [
             (StoreKind::Gcs, "--store gcs", &GCS_FLAGS[..]),
             (StoreKind::Azure, "--store azure", &AZURE_FLAGS[..]),
@@ -7522,9 +7526,9 @@ impl Cli {
                     return Err(Self::command().error(
                         clap::error::ErrorKind::ArgumentConflict,
                         format!(
-                            "{flag} configures {store}, and this process runs another store. \
-                             Pass {store}, or drop the flag (and unset its environment \
-                             variable)."
+                            "{flag} configures {store}, and this process runs --store \
+                             {running}. Pass {store}, or drop the flag (and unset its \
+                             environment variable)."
                         ),
                     ));
                 }
@@ -18883,6 +18887,33 @@ mod tests {
             gcs_fake.backend_identity().as_deref(),
             Some("gs://ravel-test@http://127.0.0.1:4443")
         );
+
+        // ADR-4158 D6: `az://<account>/<container>`, and
+        // `az://<account>/<container>@<endpoint>` once `--azure-endpoint` is
+        // set.
+        let azure = cli(&[
+            "--store",
+            "azure",
+            "--azure-account",
+            "acct",
+            "--azure-container",
+            "cont",
+        ]);
+        assert_eq!(azure.backend_identity().as_deref(), Some("az://acct/cont"));
+        let azure_fake = cli(&[
+            "--store",
+            "azure",
+            "--azure-account",
+            "acct",
+            "--azure-container",
+            "cont",
+            "--azure-endpoint",
+            "http://127.0.0.1:10000/acct",
+        ]);
+        assert_eq!(
+            azure_fake.backend_identity().as_deref(),
+            Some("az://acct/cont@http://127.0.0.1:10000/acct")
+        );
     }
 
     fn validated(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -19049,6 +19080,171 @@ mod tests {
             assert!(err.to_string().contains("--gcs-endpoint"), "{err}");
         }
         assert!(!cli(&["--store", "gcs", "--gcs-bucket", "b"]).store_is_loopback());
+    }
+
+    const AZURE_STORE: [&str; 6] = [
+        "--store",
+        "azure",
+        "--azure-account",
+        "acct",
+        "--azure-container",
+        "cont",
+    ];
+
+    /// ADR-4158 D7: plain `--store azure` with an account and a container
+    /// parses and validates. Every defaulted S3 flag
+    /// (`--s3-request-stored-checksum` defaults to true,
+    /// `--s3-upload-integrity` to crc64nvme, `--s3-auth` to static) is
+    /// ignored, not refused.
+    #[test]
+    fn plain_azure_store_parses_and_validates() {
+        let cli = validated(&AZURE_STORE).expect("a plain --store azure start is accepted");
+        assert_eq!(cli.store, StoreKind::Azure);
+        assert!(
+            cli.object_store.s3_request_stored_checksum,
+            "the defaulted value is still true, and is not a refusal"
+        );
+        cli.validate()
+            .expect("a plain --store azure start validates");
+        assert!(!cli.store_is_loopback());
+    }
+
+    /// ADR-4158 D7: each `--s3-*` and `--gcs-*` flag, `--s3-kms-key`,
+    /// `--tenant-kms-config` and `--require-bucket-protection`, passed on the
+    /// command line, refuses `--store azure` with an error naming it,
+    /// including a value equal to the flag's default. The environment form is
+    /// pinned against the built binary in
+    /// `tests/azure_flag_refusal_binary.rs`.
+    #[test]
+    fn azure_store_refuses_every_passed_s3_and_gcs_flag() {
+        let cases: [(&str, &[&str]); 18] = [
+            ("--s3-endpoint", &["--s3-endpoint", "http://127.0.0.1:9000"]),
+            ("--s3-allow-http", &["--s3-allow-http"]),
+            ("--s3-bucket", &["--s3-bucket", "b"]),
+            ("--s3-region", &["--s3-region", "us-east-1"]),
+            ("--s3-access-key", &["--s3-access-key", "k"]),
+            ("--s3-secret-key", &["--s3-secret-key", "s"]),
+            ("--s3-auth", &["--s3-auth", "static"]),
+            ("--s3-session-token", &["--s3-session-token", "t"]),
+            ("--s3-credentials-file", &["--s3-credentials-file", "/x"]),
+            (
+                "--s3-instance-metadata-endpoint",
+                &["--s3-instance-metadata-endpoint", "http://169.254.169.254"],
+            ),
+            (
+                "--s3-upload-integrity",
+                &["--s3-upload-integrity", "crc64nvme"],
+            ),
+            (
+                "--s3-request-stored-checksum",
+                &["--s3-request-stored-checksum=true"],
+            ),
+            (
+                "--s3-request-stored-checksum",
+                &["--s3-request-stored-checksum"],
+            ),
+            ("--s3-kms-key", &["--s3-kms-key", "arn:aws:kms:k"]),
+            ("--tenant-kms-config", &["--tenant-kms-config", "/x.toml"]),
+            (
+                "--require-bucket-protection",
+                &["--require-bucket-protection"],
+            ),
+            ("--gcs-bucket", &["--gcs-bucket", "b"]),
+            (
+                "--gcs-endpoint",
+                &["--gcs-endpoint", "http://127.0.0.1:4443"],
+            ),
+        ];
+        for (flag, extra) in cases {
+            let mut args = AZURE_STORE.to_vec();
+            args.extend_from_slice(extra);
+            let err = validated(&args)
+                .err()
+                .unwrap_or_else(|| panic!("{extra:?} must refuse --store azure"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{extra:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains(flag) && message.contains("--store azure"),
+                "the refusal must name {flag} and the store, got: {message}"
+            );
+        }
+    }
+
+    /// ADR-4158 D6/D7: `--azure-account` and `--azure-container` are both
+    /// required under `--store azure`, and every `--azure-*` flag is refused
+    /// under `--store memory`, `s3` and `gcs`.
+    #[test]
+    fn azure_flags_are_required_under_azure_and_refused_elsewhere() {
+        for (args, missing) in [
+            (
+                &["--store", "azure", "--azure-container", "cont"][..],
+                "--azure-account",
+            ),
+            (
+                &["--store", "azure", "--azure-account", "acct"][..],
+                "--azure-container",
+            ),
+            (&["--store", "azure"][..], "--azure-account"),
+        ] {
+            let err = validated(args).expect_err(missing);
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            assert!(err.to_string().contains(missing), "{err}");
+        }
+
+        for store in [
+            &["--store", "memory"][..],
+            &["--store", "s3"][..],
+            &["--store", "gcs", "--gcs-bucket", "b"][..],
+        ] {
+            for extra in [
+                ["--azure-account", "acct"],
+                ["--azure-container", "cont"],
+                ["--azure-endpoint", "http://127.0.0.1:10000/acct"],
+            ] {
+                let mut args = store.to_vec();
+                args.extend_from_slice(&extra);
+                let err = validated(&args)
+                    .err()
+                    .unwrap_or_else(|| panic!("{extra:?} must refuse {store:?}"));
+                assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+                let message = err.to_string();
+                assert!(
+                    message.contains(extra[0]) && message.contains("--store azure"),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// `--azure-endpoint` follows `--gcs-endpoint`'s rule (ADR-4158 D3):
+    /// https and loopback http are accepted, plaintext to another host and a
+    /// schemeless endpoint are refused at validate, naming the flag. A
+    /// loopback endpoint makes the store loopback (ADR-2023 decision 3).
+    #[test]
+    fn azure_endpoint_plaintext_rules_and_loopback() {
+        let azure = |endpoint: &str| {
+            let mut args = AZURE_STORE.to_vec();
+            args.extend_from_slice(&["--azure-endpoint", endpoint]);
+            cli(&args)
+        };
+        let loopback = azure("http://127.0.0.1:10000/acct");
+        loopback.validate().expect("loopback plaintext is accepted");
+        assert!(loopback.store_is_loopback());
+        let tls = azure("https://acct.blob.example.com");
+        tls.validate().expect("https is accepted");
+        assert!(!tls.store_is_loopback());
+        for refused in [
+            "http://acct.blob.example.com",
+            "acct.blob.example.com",
+            "127.0.0.1:10000/acct",
+        ] {
+            let err = azure(refused).validate().expect_err(refused);
+            assert!(err.to_string().contains("--azure-endpoint"), "{err}");
+        }
     }
 
     /// Reachability (ADR-0074): the shipped
@@ -20290,6 +20486,28 @@ mod tests {
             Some(RavelBucket::Gcs {
                 bucket: "ravel-data".to_string(),
                 endpoint: None,
+            })
+        );
+        // ADR-4158 D7: under `--store azure` Ravel's side is the container in
+        // its account.
+        let azure = cli(&[
+            "--parquet-profiles",
+            path,
+            "--store",
+            "azure",
+            "--azure-account",
+            "ravelprod",
+            "--azure-container",
+            "ravel-data",
+        ])
+        .parse_parquet_profiles()
+        .expect("valid file")
+        .expect("profiles");
+        assert_eq!(
+            azure.ravel_bucket,
+            Some(RavelBucket::Azure {
+                account: "ravelprod".to_string(),
+                container: "ravel-data".to_string(),
             })
         );
         let duplicate = tempfile::NamedTempFile::new().expect("temp file");

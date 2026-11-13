@@ -892,6 +892,63 @@ mod tests {
         }
     }
 
+    /// `--mode maintain --store azure` passes the capability gate: `AzureStore`
+    /// declares multipart, and `build_store` builds it against the fake.
+    #[tokio::test]
+    async fn maintain_mode_accepts_the_azure_backend() {
+        use clap::Parser;
+        use ravel_object_store::azure::fake::FakeAzure;
+
+        let fake = FakeAzure::start("ravelmaintain", "data")
+            .await
+            .expect("fake Azure");
+        let azure = AzureStore::new(fake.config()).await.expect("AzureStore");
+        check_capabilities(&azure, Mode::Maintain)
+            .expect("AzureStore's declared capabilities satisfy maintain mode");
+
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--mode",
+            "maintain",
+            "--store",
+            "azure",
+            "--azure-account",
+            fake.account(),
+            "--azure-container",
+            fake.container(),
+            "--azure-endpoint",
+            fake.endpoint(),
+        ])
+        .expect("a maintain-mode Azure command line parses");
+        assert_eq!(cli.mode, Mode::Maintain);
+        assert_eq!(cli.store, StoreKind::Azure);
+        if let Err(err) = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES).await {
+            panic!("maintain mode must start on Azure, got: {err:#}");
+        }
+    }
+
+    /// `--azure-endpoint`'s rule is `--gcs-endpoint`'s, one helper naming
+    /// each flag: https and loopback http are accepted, plaintext to another
+    /// host and a schemeless endpoint are refused.
+    #[test]
+    fn azure_and_gcs_endpoints_share_one_rule() {
+        for (resolve, flag) in [
+            (
+                resolve_azure_allow_http as fn(Option<&str>) -> anyhow::Result<bool>,
+                "--azure-endpoint",
+            ),
+            (resolve_gcs_allow_http, "--gcs-endpoint"),
+        ] {
+            assert!(!resolve(None).expect("no endpoint"));
+            assert!(!resolve(Some("https://blob.example.com")).expect("https"));
+            assert!(resolve(Some("http://127.0.0.1:10000/acct")).expect("loopback http"));
+            for refused in ["http://blob.example.com", "blob.example.com"] {
+                let err = resolve(Some(refused)).expect_err(refused);
+                assert!(err.to_string().contains(flag), "{err}");
+            }
+        }
+    }
+
     #[test]
     fn non_maintain_modes_do_not_require_multipart() {
         // multipart is NOT globally mandatory: the always-mandatory set (no
