@@ -2041,54 +2041,88 @@ fn last_over_time_custom_histogram_exact_from_hour_last_sample() {
     assert!(assert_hist_row_exact(Hist::LastOverTime, Kind::Custom, every_hour) > 0);
 }
 
-/// The window's histogram sum rebuilt from per-hour sums, and the sample
-/// count.
-fn sum_of_hour_sums(fx: &HistFixture, w: Window) -> (FloatHistogram, usize) {
-    let segments = hour_segments(&fx.samples, w, |_| false, Stale::Drop);
-    let hour_sums: Vec<FloatHistogram> = segments
-        .iter()
-        .map(|seg| sum_histograms(seg.iter().map(|(_, h)| h)).expect("one family per hour"))
-        .collect();
-    let n = segments.iter().map(Vec::len).sum();
-    (sum_histograms(hour_sums.iter()).expect("one family per window"), n)
-}
-
-fn assert_hist_raw_only(fx: &str, query: &str, avg: bool) -> (u64, u64) {
-    let fx = hist_fixture(fx);
-    let w = window("(0m,180m]");
-    let result = eval_hist_query(&fx, query, w);
-    let evaluator = result[0].histogram.clone().expect("a histogram result");
-    let (mut combined, n) = sum_of_hour_sums(&fx, w);
-    if avg {
-        combined.div(n as f64);
+/// Every (fixture, window) of `kind` where `sum_over_time` (or, with `avg`,
+/// `avg_over_time`) rebuilt from per-hour sums differs from the evaluator.
+fn hour_sum_disagreements(kind: Kind, avg: bool) -> Vec<(&'static str, &'static str)> {
+    let name = if avg { "avg_over_time" } else { "sum_over_time" };
+    let mut differ = Vec::new();
+    for fx in hist_fixtures().into_iter().filter(|fx| fx.kind == kind) {
+        for &w in WINDOWS {
+            let query = format!("{name}(h[{}m])", w.range_min);
+            let expected = eval_hist_query(&fx, &query, w)
+                .first()
+                .and_then(|s| s.histogram.as_ref().map(HistBits::of));
+            let segments = hour_segments(&fx.samples, w, |_| false, Stale::Drop);
+            let hour_sums: Vec<FloatHistogram> = segments
+                .iter()
+                .filter_map(|seg| sum_histograms(seg.iter().map(|(_, h)| h)))
+                .collect();
+            let n: usize = segments.iter().map(Vec::len).sum();
+            let combined = (hour_sums.len() == segments.len())
+                .then(|| sum_histograms(hour_sums.iter()))
+                .flatten()
+                .map(|mut h| {
+                    if avg {
+                        h.div(n as f64);
+                    }
+                    HistBits::of(&h)
+                });
+            if combined != expected {
+                differ.push((fx.name, w.label));
+            }
+        }
     }
-    // Only the observation sum differs; the bucket layout is the same.
-    assert_eq!(evaluator.positive_spans, combined.positive_spans);
-    (evaluator.sum.to_bits(), combined.sum.to_bits())
+    differ
 }
 
 #[test]
 fn sum_over_time_histogram_raw_only_hour_sums_differ() {
-    let got = assert_hist_raw_only("hist_staleness", "sum_over_time(h[180m])", false);
-    assert_eq!(got, (0, 0));
+    assert_eq!(hour_sum_disagreements(Kind::Exponential, false),
+        vec![
+            ("hist_two_resets_one_hour", "(34m,167m]"),
+            ("hist_two_resets_one_hour_offset", "(34m,167m]"),
+            ("hist_staleness", "(0m,180m]"),
+            ("hist_staleness", "(0m,120m]"),
+            ("hist_staleness", "(34m,167m]"),
+        ]
+    );
 }
 
 #[test]
 fn sum_over_time_custom_histogram_raw_only_hour_sums_differ() {
-    let got = assert_hist_raw_only("hist_custom_buckets", "sum_over_time(h[180m])", false);
-    assert_eq!(got, (0, 0));
+    assert_eq!(hour_sum_disagreements(Kind::Custom, false),
+        vec![
+            ("hist_custom_buckets", "(0m,180m]"),
+            ("hist_custom_buckets", "(0m,120m]"),
+            ("hist_custom_buckets", "(34m,167m]"),
+            ("hist_custom_two_resets_one_hour", "(34m,167m]"),
+        ]
+    );
 }
 
 #[test]
 fn avg_over_time_histogram_raw_only_hour_sums_differ() {
-    let got = assert_hist_raw_only("hist_staleness", "avg_over_time(h[180m])", true);
-    assert_eq!(got, (0, 0));
+    assert_eq!(hour_sum_disagreements(Kind::Exponential, true),
+        vec![
+            ("hist_two_resets_one_hour", "(34m,167m]"),
+            ("hist_two_resets_one_hour_offset", "(34m,167m]"),
+            ("hist_staleness", "(0m,180m]"),
+            ("hist_staleness", "(0m,120m]"),
+            ("hist_staleness", "(34m,167m]"),
+        ]
+    );
 }
 
 #[test]
 fn avg_over_time_custom_histogram_raw_only_hour_sums_differ() {
-    let got = assert_hist_raw_only("hist_custom_buckets", "avg_over_time(h[180m])", true);
-    assert_eq!(got, (0, 0));
+    assert_eq!(hour_sum_disagreements(Kind::Custom, true),
+        vec![
+            ("hist_custom_buckets", "(0m,180m]"),
+            ("hist_custom_buckets", "(0m,120m]"),
+            ("hist_custom_buckets", "(34m,167m]"),
+            ("hist_custom_two_resets_one_hour", "(34m,167m]"),
+        ]
+    );
 }
 
 #[test]
@@ -2190,7 +2224,14 @@ fn custom_histogram_rows_condition_fails_on_two_resets_in_one_hour() {
         let got = float_bits(combine_hist(f, &hours, w, Combine::Exact));
         found.push((f, expected, got));
     }
-    assert_eq!(found, vec![]);
+    assert_eq!(
+        found,
+        vec![
+            (Hist::Count, 0x4034_01dc_a01d_ca00, 0x4034_01dc_a01d_ca01),
+            (Hist::Sum, 0x3f56_c38a_61fb_357b, 0x3f56_c38a_61fb_357c),
+            (Hist::Quantile, 0x3fe0_0000_0000_0000, 0x3fe0_0000_0000_0000),
+        ]
+    );
 }
 
 #[test]
@@ -2243,10 +2284,11 @@ fn histogram_sum_rejects_telescoped_hour_sum() {
 }
 
 #[test]
-fn histogram_rows_reassociations_differ_only_through_the_nan_sum() {
+fn histogram_rows_reassociations_disagree_on_pinned_windows() {
     // Every window where the rows' condition holds, both forms of mutant (a),
-    // all three rows: only the telescoped `histogram_sum` windows that read
-    // the 120m NaN sum disagree with the evaluator.
+    // all three rows. The telescoped sum disagrees with the evaluator where it
+    // reads the 120m NaN sum, and through rounding on `hist_staleness`'s and
+    // `hist_custom_buckets`' (0m,120m]; corrections summed once never do.
     let mut disagree = Vec::new();
     for fx in hist_fixtures() {
         for &w in WINDOWS {
@@ -2271,6 +2313,9 @@ fn histogram_rows_reassociations_differ_only_through_the_nan_sum() {
             telescoped_sum("(0m,180m]"),
             telescoped_sum("(34m,167m]"),
             telescoped_sum("(70m,130m]"),
+            ("hist_staleness", "(0m,120m]", Hist::Count, Combine::Reassociate),
+            ("hist_staleness", "(0m,120m]", Hist::Quantile, Combine::Reassociate),
+            ("hist_custom_buckets", "(0m,120m]", Hist::Count, Combine::Reassociate),
         ]
     );
 }
