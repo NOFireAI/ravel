@@ -694,18 +694,26 @@
                     "properties": {
                       "azure": {
                         "description": "Azure Blob Storage backend, authenticated through AKS workload\nidentity (ADR-4158 D11).",
-                        "nullable": true,
                         "properties": {
                           "account": {
-                            "description": "Storage account (`--azure-account`): lowercase letters and digits.",
+                            "description": "Storage account (`--azure-account`): 3 to 24 lowercase letters and\ndigits.",
+                            "maxLength": 24,
+                            "minLength": 3,
+                            "pattern": "^[a-z0-9]{3,24}$",
                             "type": "string"
                           },
                           "clientId": {
-                            "description": "Client ID of the user-assigned managed identity every pod runs as,\nunless `roleClientIds` names one for its role. Changing the\n`qualify` role's client ID re-runs store qualification.",
+                            "description": "Client ID (a UUID) of the user-assigned managed identity a role's\nServiceAccount is annotated with, unless `roleClientIds` names one for\nthat role. A pod keeps the identity it was admitted with, so changing\na tier's client ID rolls that tier's pods, and changing the `qualify`\nrole's client ID re-runs store qualification.",
+                            "maxLength": 36,
+                            "minLength": 36,
+                            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
                             "type": "string"
                           },
                           "container": {
-                            "description": "Container (`--azure-container`): lowercase letters, digits and `-`.",
+                            "description": "Container (`--azure-container`): 3 to 63 lowercase letters, digits and\nsingle hyphens, starting and ending with a letter or digit.",
+                            "maxLength": 63,
+                            "minLength": 3,
+                            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
                             "type": "string"
                           },
                           "roleClientIds": {
@@ -713,20 +721,32 @@
                             "nullable": true,
                             "properties": {
                               "gateway": {
+                                "maxLength": 36,
+                                "minLength": 36,
                                 "nullable": true,
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
                                 "type": "string"
                               },
                               "maintain": {
+                                "maxLength": 36,
+                                "minLength": 36,
                                 "nullable": true,
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
                                 "type": "string"
                               },
                               "qualify": {
                                 "description": "The store-qualification Job's identity.",
+                                "maxLength": 36,
+                                "minLength": 36,
                                 "nullable": true,
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
                                 "type": "string"
                               },
                               "query": {
+                                "maxLength": 36,
+                                "minLength": 36,
                                 "nullable": true,
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
                                 "type": "string"
                               }
                             },
@@ -742,7 +762,6 @@
                       },
                       "s3": {
                         "description": "S3 (or S3-compatible) backend.",
-                        "nullable": true,
                         "properties": {
                           "allowHttp": {
                             "default": false,

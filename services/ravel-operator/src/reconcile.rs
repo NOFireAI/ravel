@@ -686,8 +686,8 @@ fn s3_credential_env(
             })
             .collect();
     }
-    // A static spec with no Secret at all, and an Azure spec, are refused by
-    // or render nothing here.
+    // A static spec with no Secret is refused before any render, and an Azure
+    // spec reads no Secret, so both render no credential variable here.
     let Some(secret) = tier_credentials_secret_name(spec, tier_override) else {
         return Vec::new();
     };
@@ -769,6 +769,33 @@ pub const AZURE_WORKLOAD_IDENTITY_USE_LABEL: &str = "azure.workload.identity/use
 
 /// The ServiceAccount annotation naming the managed identity a pod runs as.
 pub const AZURE_WORKLOAD_IDENTITY_CLIENT_ID_ANNOTATION: &str = "azure.workload.identity/client-id";
+
+/// Tier pod-template annotation carrying the tier's Azure client ID. The
+/// workload identity webhook writes `AZURE_CLIENT_ID` into a pod at admission,
+/// so a pod keeps the identity it was admitted with; carrying the ID on the
+/// template makes an edit roll the tier. The qualify Job needs none: its
+/// client ID is in its hash.
+pub const AZURE_CLIENT_ID_POD_ANNOTATION: &str = "ravel.nofire.ai/azure-client-id";
+
+/// The annotations of a tier pod template: the secrets checksum, plus the
+/// tier's client ID under `storage.azure`.
+fn tier_pod_template_annotations(
+    spec: &RavelClusterSpec,
+    component: &str,
+    secrets_checksum: &str,
+) -> BTreeMap<String, String> {
+    let mut annotations = BTreeMap::from([(
+        SECRETS_CHECKSUM_ANNOTATION.to_string(),
+        secrets_checksum.to_string(),
+    )]);
+    if let Some(azure) = spec.storage.azure.as_ref() {
+        annotations.insert(
+            AZURE_CLIENT_ID_POD_ANNOTATION.to_string(),
+            azure.client_id_for(component).to_string(),
+        );
+    }
+    annotations
+}
 
 /// The labels of a tier or Job pod template: the selector labels, plus the
 /// workload identity label under `storage.azure`. The selector itself never
@@ -1846,10 +1873,11 @@ fn deployment(
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(pod_template_labels(spec, instance, component)),
-                    annotations: Some(BTreeMap::from([(
-                        SECRETS_CHECKSUM_ANNOTATION.to_string(),
-                        secrets_checksum.to_string(),
-                    )])),
+                    annotations: Some(tier_pod_template_annotations(
+                        spec,
+                        component,
+                        secrets_checksum,
+                    )),
                     ..Default::default()
                 }),
                 spec: Some(pod),
@@ -12224,6 +12252,97 @@ mod tests {
             .collect()
     }
 
+    /// The gateway, query and maintain pod templates of a rendered cluster.
+    fn tier_pod_templates(spec: &RavelClusterSpec, ctx: &RenderCtx) -> [PodTemplateSpec; 3] {
+        let objects = desired_objects(spec, "prod", "ns", ctx).expect("renders");
+        let template = |d: &Deployment| {
+            d.spec
+                .as_ref()
+                .map(|s| s.template.clone())
+                .expect("template")
+        };
+        [
+            template(&objects.gateway_deployment),
+            template(&objects.query_deployment),
+            template(objects.maintain.deployment().expect("maintain renders")),
+        ]
+    }
+
+    fn azure_client_id_annotation(template: &PodTemplateSpec) -> Option<String> {
+        template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.annotations.as_ref())
+            .and_then(|a| a.get(AZURE_CLIENT_ID_POD_ANNOTATION).cloned())
+    }
+
+    /// The webhook sets a pod's `AZURE_CLIENT_ID` at admission, so a client
+    /// ID edit must change exactly the pod templates of the tiers that run
+    /// as it.
+    #[test]
+    fn azure_client_id_edit_rolls_exactly_the_tiers_that_use_it() {
+        let base = tier_pod_templates(&azure_spec(), &azure_ctx());
+        for template in &base {
+            assert_eq!(
+                azure_client_id_annotation(template).as_deref(),
+                Some(AZURE_CLIENT_ID)
+            );
+        }
+
+        let gateway_id = "00000000-0000-0000-0000-0000000000a1";
+        let mut gateway_only = azure_spec();
+        azure_mut(&mut gateway_only).role_client_ids = Some(crate::crd::AzureRoleClientIds {
+            gateway: Some(gateway_id.to_string()),
+            ..Default::default()
+        });
+        let [gateway, query, maintain] = tier_pod_templates(&gateway_only, &azure_ctx());
+        assert_ne!(gateway, base[0], "gateway rolls");
+        assert_eq!(
+            azure_client_id_annotation(&gateway).as_deref(),
+            Some(gateway_id)
+        );
+        assert_eq!(query, base[1], "query untouched");
+        assert_eq!(maintain, base[2], "maintain untouched");
+
+        let shared_id = "00000000-0000-0000-0000-0000000000b2";
+        let mut shared = azure_spec();
+        azure_mut(&mut shared).client_id = shared_id.to_string();
+        let edited = tier_pod_templates(&shared, &azure_ctx());
+        for (tier, (before, after)) in ["gateway", "query", "maintain"]
+            .into_iter()
+            .zip(base.iter().zip(edited.iter()))
+        {
+            assert_ne!(before, after, "{tier} rolls");
+            assert_eq!(
+                azure_client_id_annotation(after).as_deref(),
+                Some(shared_id),
+                "{tier}"
+            );
+        }
+    }
+
+    /// An S3 cluster, static or Pod Identity, carries no client ID
+    /// annotation: its pod templates stay what they were before Azure.
+    #[test]
+    fn s3_tier_pod_templates_carry_no_azure_client_id() {
+        for (mode, spec, ctx) in [
+            ("static", base_spec(), ctx()),
+            ("podIdentity", pod_identity_spec(), pod_identity_ctx()),
+        ] {
+            for template in tier_pod_templates(&spec, &ctx) {
+                let annotations = template
+                    .metadata
+                    .and_then(|m| m.annotations)
+                    .unwrap_or_default();
+                assert_eq!(
+                    annotations.keys().collect::<Vec<_>>(),
+                    [SECRETS_CHECKSUM_ANNOTATION],
+                    "{mode}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn azure_cluster_renders_store_args_and_workload_identity() {
         let spec = azure_spec();
@@ -12573,11 +12692,12 @@ mod tests {
         );
     }
 
-    /// The shipped Azure example deserializes as a RavelCluster, renders, and
-    /// the shipped operator pod template carries the workload identity label
-    /// its own Azure client needs.
+    /// The shipped Azure example deserializes as a RavelCluster and renders,
+    /// and the shipped operator pod template leaves the workload identity
+    /// label commented out: an S3-only install must not depend on the
+    /// webhook to admit the operator pod.
     #[test]
-    fn shipped_azure_example_renders_and_the_operator_pod_is_labelled() {
+    fn shipped_azure_example_renders_and_the_operator_label_is_opt_in() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../deploy/k8s/examples/ravelcluster-azure.yaml");
         let text = std::fs::read_to_string(&path)
@@ -12603,11 +12723,15 @@ mod tests {
             .and_then(|s| s.template.metadata)
             .and_then(|m| m.labels)
             .unwrap_or_default();
-        assert_eq!(
-            labels
-                .get(AZURE_WORKLOAD_IDENTITY_USE_LABEL)
-                .map(String::as_str),
-            Some("true")
+        assert_eq!(labels.get(AZURE_WORKLOAD_IDENTITY_USE_LABEL), None);
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/k8s/operator/operator.yaml"),
+        )
+        .expect("operator.yaml reads");
+        assert!(
+            manifest.contains(&format!("# {AZURE_WORKLOAD_IDENTITY_USE_LABEL}: \"true\"")),
+            "operator.yaml keeps the label as a commented opt-in line"
         );
     }
 

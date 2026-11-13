@@ -80,12 +80,15 @@ metadata:
   labels:
     app.kubernetes.io/name: ravel-operator
     app.kubernetes.io/managed-by: ravel-operator
-  # Matters only for a RavelCluster on storage.azure, together with the
-  # azure.workload.identity/use label on the operator pod template in
-  # operator.yaml: the operator's own Azure client (the sys auth catalog and
-  # shard overrides) runs as this managed identity, which needs a federated
-  # credential for system:serviceaccount:ravel-system:ravel-operator and a
-  # data role on every container it manages.
+  # Opt-in. Needed, with the commented azure.workload.identity/use label on
+  # the operator pod template in operator.yaml, only when the operator
+  # manages a RavelCluster on storage.azure that sets deploymentKeySecretRef
+  # or names a tenant under shardOverrides: those are the only paths on which
+  # the operator itself opens the container (sys/auth convergence and the
+  # reshard). Its Azure client then runs as this managed identity, which
+  # needs a federated credential for
+  # system:serviceaccount:ravel-system:ravel-operator and a data role on
+  # every container it manages. Restart the operator pod after enabling both.
   # annotations:
   #   azure.workload.identity/client-id: <operator managed identity client ID>
 ---

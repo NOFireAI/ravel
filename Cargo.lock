@@ -5049,6 +5049,7 @@ dependencies = [
  "ravel-object-store",
  "ravel-tracing-export",
  "ravel-types",
+ "regex",
  "rustls",
  "schemars",
  "serde",
