@@ -1,11 +1,13 @@
-//! Object store construction, sharing `RAVEL_S3_*` and `RAVEL_GCS_BUCKET` env
-//! vars with `ravel-server`.
+//! Object store construction, sharing `RAVEL_S3_*`, `RAVEL_GCS_BUCKET`,
+//! `RAVEL_AZURE_ACCOUNT` and `RAVEL_AZURE_CONTAINER` env vars with
+//! `ravel-server`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, Parser, ValueEnum};
+use ravel_object_store::azure::{AzureConfig, AzureStore};
 use ravel_object_store::conformance::{
     BucketControlPlane, BucketProtectionParams, BucketProtectionReport, ConditionState,
     ProtectionConditionId, probe_bucket_protection,
@@ -26,6 +28,8 @@ pub enum StoreKind {
     S3,
     #[value(name = "gcs")]
     Gcs,
+    #[value(name = "azure")]
+    Azure,
 }
 
 impl StoreKind {
@@ -36,6 +40,7 @@ impl StoreKind {
             StoreKind::Memory => "memory",
             StoreKind::S3 => "s3",
             StoreKind::Gcs => "gcs",
+            StoreKind::Azure => "azure",
         }
     }
 }
@@ -376,12 +381,45 @@ pub struct StoreArgs {
     #[arg(long, hide = true, value_name = "URL")]
     pub gcs_endpoint: Option<String>,
 
+    /// The storage account `--store azure` runs against (ADR-4158), required
+    /// under it. No flag carries a credential: it comes from the environment,
+    /// as AKS workload identity (`AZURE_FEDERATED_TOKEN_FILE`,
+    /// `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`), a shared key
+    /// (`AZURE_STORAGE_ACCOUNT_KEY`) or a managed identity. Under `--store
+    /// azure` every `--s3-*` and `--gcs-*` flag given on the command line or
+    /// through its environment variable is refused rather than ignored; a
+    /// defaulted one is not. Under any other `--store`, a command that builds
+    /// the store refuses a given `--azure-*` flag.
+    #[arg(long, env = "RAVEL_AZURE_ACCOUNT")]
+    pub azure_account: Option<String>,
+
+    /// The container `--store azure` runs against, required under it. Part of
+    /// the backend identity `store qualify` records.
+    #[arg(long, env = "RAVEL_AZURE_CONTAINER")]
+    pub azure_container: Option<String>,
+
+    /// Replaces `https://<account>.blob.core.windows.net` under `--store
+    /// azure`, for an emulator; the account URL, path included. Plain
+    /// `http://` is accepted only for a loopback host. Part of the backend
+    /// identity `store qualify` records.
+    #[arg(long, hide = true, value_name = "URL")]
+    pub azure_endpoint: Option<String>,
+
     /// The `--s3-*` flags this invocation was given on the command line or
     /// through their environment variables, each as `--flag (ENV)`. `None`
     /// until [`StoreArgs::record_flag_sources`] has read the parse's matches,
-    /// and `--store gcs` refuses to build a store from args in that state.
+    /// and `--store gcs` and `--store azure` refuse to build a store from args
+    /// in that state.
     #[arg(skip)]
     given_s3_flags: Option<Vec<String>>,
+
+    /// The `--gcs-*` flags given, recorded with [`Self::given_s3_flags`].
+    #[arg(skip)]
+    given_gcs_flags: Option<Vec<String>>,
+
+    /// The `--azure-*` flags given, recorded with [`Self::given_s3_flags`].
+    #[arg(skip)]
+    given_azure_flags: Option<Vec<String>>,
 }
 
 impl StoreArgs {
@@ -400,29 +438,35 @@ impl StoreArgs {
 
     /// Record, from the `ArgMatches` these args were parsed from (the
     /// top-level matches when they are flattened into a larger command), each
-    /// `--s3-*` flag whose value came from the command line or its environment
-    /// variable. A defaulted value is not recorded: `--store gcs` refuses a
-    /// given S3 flag and ignores a defaulted one (ADR-3456 decision 6).
+    /// `--s3-*`, `--gcs-*` and `--azure-*` flag whose value came from the
+    /// command line or its environment variable. A defaulted value is not
+    /// recorded: `--store gcs` refuses a given S3 flag and ignores a defaulted
+    /// one (ADR-3456 decision 6), and the Azure refusals follow the same rule
+    /// (ADR-4158 decision 7).
     pub fn record_flag_sources(&mut self, matches: &ArgMatches) {
         let command = Self::command();
-        let given = command
-            .get_arguments()
-            .filter(|arg| arg.get_id().as_str().starts_with("s3_"))
-            .filter(|arg| {
-                matches!(
-                    matches.value_source(arg.get_id().as_str()),
-                    Some(ValueSource::CommandLine | ValueSource::EnvVariable)
-                )
-            })
-            .map(|arg| {
-                let flag = format!("--{}", arg.get_long().unwrap_or(arg.get_id().as_str()));
-                match arg.get_env() {
-                    Some(env) => format!("{flag} ({})", env.to_string_lossy()),
-                    None => flag,
-                }
-            })
-            .collect();
-        self.given_s3_flags = Some(given);
+        let given = |prefix: &str| -> Vec<String> {
+            command
+                .get_arguments()
+                .filter(|arg| arg.get_id().as_str().starts_with(prefix))
+                .filter(|arg| {
+                    matches!(
+                        matches.value_source(arg.get_id().as_str()),
+                        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+                    )
+                })
+                .map(|arg| {
+                    let flag = format!("--{}", arg.get_long().unwrap_or(arg.get_id().as_str()));
+                    match arg.get_env() {
+                        Some(env) => format!("{flag} ({})", env.to_string_lossy()),
+                        None => flag,
+                    }
+                })
+                .collect()
+        };
+        self.given_s3_flags = Some(given("s3_"));
+        self.given_gcs_flags = Some(given("gcs_"));
+        self.given_azure_flags = Some(given("azure_"));
     }
 
     /// The backend this invocation runs against: `--store` when given, memory
@@ -455,6 +499,11 @@ impl StoreArgs {
                 self.gcs_bucket.as_deref().unwrap_or("<unset>"),
                 self.gcs_endpoint.as_deref(),
             ),
+            StoreKind::Azure => ravel_object_store::conformance::azure_backend_identity(
+                self.azure_account.as_deref().unwrap_or("<unset>"),
+                self.azure_container.as_deref().unwrap_or("<unset>"),
+                self.azure_endpoint.as_deref(),
+            ),
         }
     }
 
@@ -464,8 +513,9 @@ impl StoreArgs {
     /// environment variables. One that was set while its variable is unset
     /// came from a flag, so `env_is_set` reporting that adds the placeholder
     /// word `<your S3 credential flags>` where those flags go. Under `--store
-    /// gcs` the words are the GCS bucket and endpoint and no S3 flag; its
-    /// credentials come from the environment.
+    /// gcs` the words are the GCS bucket and endpoint and no S3 flag, and under
+    /// `--store azure` the account, container and endpoint; their credentials
+    /// come from the environment.
     pub fn echo_flags(&self, env_is_set: &dyn Fn(&str) -> bool) -> Vec<String> {
         let Some(kind) = self.store else {
             return Vec::new();
@@ -477,6 +527,19 @@ impl StoreArgs {
                 for (flag, value) in [
                     ("--gcs-bucket", &self.gcs_bucket),
                     ("--gcs-endpoint", &self.gcs_endpoint),
+                ] {
+                    if let Some(value) = value {
+                        words.push(flag.to_string());
+                        words.push(value.clone());
+                    }
+                }
+                return words;
+            }
+            StoreKind::Azure => {
+                for (flag, value) in [
+                    ("--azure-account", &self.azure_account),
+                    ("--azure-container", &self.azure_container),
+                    ("--azure-endpoint", &self.azure_endpoint),
                 ] {
                     if let Some(value) = value {
                         words.push(flag.to_string());
@@ -634,6 +697,7 @@ impl BuiltStore {
 /// the default store is written under the bucket's default encryption, and
 /// only [`build_tenant_data_store`] overrides it, per tenant.
 fn s3_config(args: &StoreArgs) -> anyhow::Result<S3Config> {
+    refuse_given_azure_flags(args, StoreKind::S3)?;
     let bucket = args
         .s3_bucket
         .clone()
@@ -720,16 +784,33 @@ pub const GCS_VERIFY_PROTECTION_REFUSAL: &str = "store verify-protection is refu
      --store gcs: GCS bucket protection (retention policy, object versioning, soft delete) is \
      not checked by this command, so it reports nothing rather than conditions it never probed.";
 
-/// Refuse `--tenant-kms-config` under `--store gcs` before anything is read,
-/// for the commands that take it (ADR-3456 decision 6).
-pub fn refuse_tenant_kms_under_gcs(
+/// The refusal of `--tenant-kms-config` under `--store azure` (ADR-4158
+/// decision 7).
+pub const AZURE_TENANT_KMS_REFUSAL: &str = "--tenant-kms-config is refused under --store \
+     azure: per-tenant SSE-KMS is an S3 feature with no Azure implementation. Customer-managed \
+     keys on Azure are an account or encryption-scope setting made outside Ravel.";
+
+/// The refusal of `store verify-protection` under `--store azure` (ADR-4158
+/// decision 7).
+pub const AZURE_VERIFY_PROTECTION_REFUSAL: &str = "store verify-protection is refused under \
+     --store azure: Azure container protection is not checked by this command, so it reports \
+     nothing rather than conditions it never probed.";
+
+/// Refuse `--tenant-kms-config` under `--store gcs` or `--store azure` before
+/// anything is read, for the commands that take it (ADR-3456 decision 6,
+/// ADR-4158 decision 7).
+pub fn refuse_tenant_kms_under_gcs_or_azure(
     args: &StoreArgs,
     kms_args: &TenantKmsArgs,
 ) -> anyhow::Result<()> {
-    if args.store_kind() == StoreKind::Gcs && kms_args.tenant_kms_config.is_some() {
-        anyhow::bail!(GCS_TENANT_KMS_REFUSAL);
+    if kms_args.tenant_kms_config.is_none() {
+        return Ok(());
     }
-    Ok(())
+    match args.store_kind() {
+        StoreKind::Gcs => anyhow::bail!(GCS_TENANT_KMS_REFUSAL),
+        StoreKind::Azure => anyhow::bail!(AZURE_TENANT_KMS_REFUSAL),
+        StoreKind::Memory | StoreKind::S3 => Ok(()),
+    }
 }
 
 /// Read and validate `--tenant-kms-config`, with ravel-server's refusals and
@@ -741,6 +822,9 @@ fn load_tenant_kms_config(
 ) -> anyhow::Result<ravel_catalog::tenant_kms::TenantKmsConfig> {
     if args.store_kind() == StoreKind::Gcs {
         anyhow::bail!(GCS_TENANT_KMS_REFUSAL);
+    }
+    if args.store_kind() == StoreKind::Azure {
+        anyhow::bail!(AZURE_TENANT_KMS_REFUSAL);
     }
     if args.store_kind() != StoreKind::S3 {
         anyhow::bail!(
@@ -852,10 +936,13 @@ pub fn build_store_handle(
     page_size: Option<usize>,
 ) -> anyhow::Result<BuiltStore> {
     match args.store_kind() {
-        StoreKind::Memory => Ok(BuiltStore::Other(Arc::new(match page_size {
-            Some(n) => MemoryStore::with_page_size(n),
-            None => MemoryStore::new(),
-        }))),
+        StoreKind::Memory => {
+            refuse_given_azure_flags(args, StoreKind::Memory)?;
+            Ok(BuiltStore::Other(Arc::new(match page_size {
+                Some(n) => MemoryStore::with_page_size(n),
+                None => MemoryStore::new(),
+            })))
+        }
         StoreKind::S3 => {
             let config = s3_config(args)?;
             let http = args.s3_http_config();
@@ -875,7 +962,111 @@ pub fn build_store_handle(
                 .map_err(|err| anyhow::anyhow!("failed to build GCS store: {err}"))?;
             Ok(BuiltStore::Other(Arc::new(store)))
         }
+        StoreKind::Azure => {
+            let config = azure_config(args, page_size)?;
+            let store = construct_azure_store(config)?;
+            Ok(BuiltStore::Other(Arc::new(store)))
+        }
     }
+}
+
+/// Runs [`AzureStore::new`], which is async because construction sends Get
+/// Account Information, from this synchronous builder. It blocks the calling
+/// worker of the multi-thread runtime the binary runs on; there is no other
+/// runtime the store's connections could outlive, so any other caller is
+/// refused.
+fn construct_azure_store(config: AzureConfig) -> anyhow::Result<AzureStore> {
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        anyhow::anyhow!("--store azure must be built inside the command's tokio runtime")
+    })?;
+    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+        anyhow::bail!("--store azure cannot be built on a current-thread tokio runtime");
+    }
+    tokio::task::block_in_place(|| handle.block_on(AzureStore::new(config)))
+        .map_err(|err| anyhow::anyhow!("failed to build Azure store: {err}"))
+}
+
+/// Refuse every `--azure-*` flag that was given when `kind` is not Azure
+/// (ADR-4158 decision 7). Args parsed without recording their sources pass:
+/// every binary entry point records them.
+fn refuse_given_azure_flags(args: &StoreArgs, kind: StoreKind) -> anyhow::Result<()> {
+    match args.given_azure_flags.as_deref() {
+        Some(given) if !given.is_empty() => anyhow::bail!(
+            "--store {} refuses Azure flags, which would otherwise be ignored: {} given. Unset \
+             them (command line or environment), or pass --store azure.",
+            kind.flag_value(),
+            given.join(", ")
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a `--<flag>` endpoint may be plain HTTP: `https://` to any host is
+/// `false`, `http://` to a loopback host is `true`, and anything else is
+/// refused, since a plaintext request to the network carries the credential.
+fn endpoint_allows_http(flag: &str, endpoint: &str) -> anyhow::Result<bool> {
+    let lowercased = endpoint.to_ascii_lowercase();
+    if lowercased.starts_with("http://") {
+        if !is_loopback_endpoint(endpoint) {
+            anyhow::bail!(
+                "--{flag} {endpoint:?} is plaintext HTTP to a host that is not loopback; use \
+                 https:// so the credential is not sent in the clear"
+            );
+        }
+        Ok(true)
+    } else if lowercased.starts_with("https://") {
+        Ok(false)
+    } else {
+        anyhow::bail!("--{flag} {endpoint:?} needs an http:// or https:// scheme");
+    }
+}
+
+/// Set to any value in a `test-support` build, makes `--store azure` send
+/// unsigned requests and look up no credentials, so a test can drive the
+/// command against `ravel_object_store::azure::fake`. Not read in any other
+/// build.
+pub const AZURE_SKIP_SIGNATURE_TEST_ENV: &str = "RAVEL_AZURE_TEST_SKIP_SIGNATURE";
+
+/// The `AzureConfig` `--store azure` builds its store from, with `page_size`
+/// replacing the default list page size when given. Refuses every `--s3-*`
+/// and `--gcs-*` flag that was given rather than defaulted, and a plaintext
+/// endpoint that is not loopback.
+fn azure_config(args: &StoreArgs, page_size: Option<usize>) -> anyhow::Result<AzureConfig> {
+    let (Some(s3), Some(gcs)) = (args.given_s3_flags.as_ref(), args.given_gcs_flags.as_ref())
+    else {
+        anyhow::bail!(
+            "--store azure could not tell which --s3-* and --gcs-* flags were given: the store \
+             flags were parsed without recording their sources"
+        );
+    };
+    let given: Vec<&str> = s3.iter().chain(gcs).map(String::as_str).collect();
+    if !given.is_empty() {
+        anyhow::bail!(
+            "--store azure refuses S3 and GCS flags, which have no Azure implementation and \
+             would otherwise be ignored: {} given. Unset them (command line or environment) to \
+             run against Azure.",
+            given.join(", ")
+        );
+    }
+    let account = args.azure_account.clone().ok_or_else(|| {
+        anyhow::anyhow!("--store azure requires --azure-account (RAVEL_AZURE_ACCOUNT)")
+    })?;
+    let container = args.azure_container.clone().ok_or_else(|| {
+        anyhow::anyhow!("--store azure requires --azure-container (RAVEL_AZURE_CONTAINER)")
+    })?;
+    let mut config = AzureConfig::new(account, container);
+    if let Some(n) = page_size {
+        config.list_page_size = n;
+    }
+    if let Some(endpoint) = &args.azure_endpoint {
+        config.allow_http = endpoint_allows_http("azure-endpoint", endpoint)?;
+        config.endpoint = Some(endpoint.clone());
+    }
+    #[cfg(feature = "test-support")]
+    if std::env::var_os(AZURE_SKIP_SIGNATURE_TEST_ENV).is_some() {
+        config.skip_signature = true;
+    }
+    Ok(config)
 }
 
 /// Set to any value in a `test-support` build, makes `--store gcs` send
@@ -902,6 +1093,7 @@ fn gcs_config(args: &StoreArgs, page_size: Option<usize>) -> anyhow::Result<GcsC
             given.join(", ")
         );
     }
+    refuse_given_azure_flags(args, StoreKind::Gcs)?;
     let bucket = args
         .gcs_bucket
         .clone()
@@ -911,18 +1103,7 @@ fn gcs_config(args: &StoreArgs, page_size: Option<usize>) -> anyhow::Result<GcsC
         config.list_page_size = n;
     }
     if let Some(endpoint) = &args.gcs_endpoint {
-        let lowercased = endpoint.to_ascii_lowercase();
-        if lowercased.starts_with("http://") {
-            if !is_loopback_endpoint(endpoint) {
-                anyhow::bail!(
-                    "--gcs-endpoint {endpoint:?} is plaintext HTTP to a host that is not \
-                     loopback; use https:// so the bearer token is not sent in the clear"
-                );
-            }
-            config.allow_http = true;
-        } else if !lowercased.starts_with("https://") {
-            anyhow::bail!("--gcs-endpoint {endpoint:?} needs an http:// or https:// scheme");
-        }
+        config.allow_http = endpoint_allows_http("gcs-endpoint", endpoint)?;
         config.base_url = Some(endpoint.clone());
     }
     #[cfg(feature = "test-support")]
@@ -2546,6 +2727,118 @@ mod tests {
         assert_eq!(
             gcs_args(&["--gcs-bucket", "b"]).backend_identity(),
             "gs://b"
+        );
+    }
+
+    fn azure_args(extra: &[&str]) -> StoreArgs {
+        let mut argv = vec!["ravel-cli", "--store", "azure"];
+        argv.extend_from_slice(extra);
+        StoreArgs::try_parse_recorded(argv).expect("store flags parse")
+    }
+
+    fn azure_config_error(args: &StoreArgs) -> String {
+        match azure_config(args, None) {
+            Ok(config) => panic!("expected a refusal, built {config:?}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// The account, container and page size reach AzureConfig, and the
+    /// defaulted S3 flags are not refused.
+    #[test]
+    fn azure_config_takes_the_flags() {
+        let args = azure_args(&["--azure-account", "acct", "--azure-container", "data"]);
+        let config = azure_config(&args, Some(7)).expect("azure config builds");
+        assert_eq!(config.account, "acct");
+        assert_eq!(config.container, "data");
+        assert_eq!(config.list_page_size, 7);
+        assert_eq!(config.endpoint, None);
+        assert!(!config.allow_http);
+    }
+
+    /// Plain http is accepted only for a loopback endpoint, https for any
+    /// host, and an endpoint with no scheme is refused.
+    #[test]
+    fn azure_endpoint_scheme_rules() {
+        let base = ["--azure-account", "acct", "--azure-container", "data"];
+        let with = |endpoint: &str| {
+            let mut extra = base.to_vec();
+            extra.extend(["--azure-endpoint", endpoint]);
+            azure_args(&extra)
+        };
+        let loopback =
+            azure_config(&with("http://127.0.0.1:10000/acct"), None).expect("loopback http builds");
+        assert!(loopback.allow_http);
+        assert_eq!(
+            loopback.endpoint.as_deref(),
+            Some("http://127.0.0.1:10000/acct")
+        );
+
+        let tls = azure_config(&with("https://blob.example/acct"), None).expect("https builds");
+        assert!(!tls.allow_http);
+
+        let remote = azure_config_error(&with("http://blob.example/acct"));
+        assert!(
+            remote.contains("--azure-endpoint \"http://blob.example/acct\" is plaintext HTTP"),
+            "{remote}"
+        );
+        let schemeless = azure_config_error(&with("blob.example"));
+        assert!(
+            schemeless.contains("needs an http:// or https:// scheme"),
+            "{schemeless}"
+        );
+    }
+
+    /// Args parsed without recording their sources cannot tell a given S3 or
+    /// GCS flag from a defaulted one, so azure refuses rather than guess.
+    #[test]
+    fn azure_refuses_unrecorded_flag_sources() {
+        let args = StoreArgs::try_parse_from([
+            "ravel-cli",
+            "--store",
+            "azure",
+            "--azure-account",
+            "a",
+            "--azure-container",
+            "c",
+        ])
+        .expect("store flags parse");
+        assert!(azure_config_error(&args).contains("could not tell which --s3-* and --gcs-*"));
+    }
+
+    /// Under azure the identity is the `az://` form and the echoed flags name
+    /// the account, container and endpoint, never an S3 or GCS field.
+    #[test]
+    fn azure_identity_and_echo_flags() {
+        let args = azure_args(&[
+            "--azure-account",
+            "acct",
+            "--azure-container",
+            "data",
+            "--azure-endpoint",
+            "http://127.0.0.1:9/acct",
+        ]);
+        assert_eq!(
+            args.backend_identity(),
+            "az://acct/data@http://127.0.0.1:9/acct"
+        );
+        assert_eq!(
+            args.echo_flags(&|_| false),
+            [
+                "--store",
+                "azure",
+                "--azure-account",
+                "acct",
+                "--azure-container",
+                "data",
+                "--azure-endpoint",
+                "http://127.0.0.1:9/acct"
+            ]
+        );
+        assert_eq!(
+            azure_args(&["--azure-account", "acct", "--azure-container", "data"])
+                .backend_identity(),
+            "az://acct/data"
         );
     }
 }
