@@ -787,7 +787,29 @@ verification (step 6), after which the run goes on as a diagnostic:
     not comparable and that each repetition also queries the Prometheus
     oracle, and exactly one record per entry and repetition with its
     `status`, `latency_ms` and `ravel_cost` record (`accounting` and
-    `phases`, the shape `diagnostics.json` carries) (case y). A failed
+    `phases`, the shape `diagnostics.json` carries) (case y). Each record
+    also carries `catalog_state`, the catalog state that run measured:
+    `resolve_s3_get_requests` (the resolve phase's `s3GetRequests` in its
+    `ravel_cost`), `unfolded_segments_resolved` (its
+    `io.unfoldedSegmentsResolved`) and `fold_cycles_since_restart` (the
+    `ravel_catalog_fold_cycles_total{signal="metrics"}` sample of Ravel's
+    `/metrics`, scraped once after the run's query into
+    `cold-ravel-diagnostic/<entry>.<repetition>.ravel-metrics.txt`). A
+    figure that was not measured is null, and `why_null` maps it to the
+    reason: no `ravel_cost` (case y1), no query run or no record (cases
+    y4, y6), or a scrape that failed or does not hold exactly one metrics
+    sample (case y8); `why_null` is `{}` when every figure was measured.
+    The file's `fold_cycles` holds the same counter scraped once before
+    the pass's first restart (`before_pass`) and once after its last query
+    (`after_pass`), each null with `before_pass_why_null` or
+    `after_pass_why_null` when not measured, the metric name, and a note:
+    the counter is process-local and every repetition restarts
+    ravel-server, so each figure counts the folds since the last restart,
+    not since the run began (case y). A runs file that cold-final cannot
+    read stamps `failed: cold-ravel-diagnostic.json not written: runs.json
+    is not readable (...)` (case y10), and a duplicate or unexpected record
+    stamps `failed: ... runs.json holds a duplicate or unexpected record:
+    ...` (case y9); neither writes the file or fails the run. A failed
     restart (case y4), readiness wait (case y5) or query run (case y1) is
     recorded in that run's `status`, counted in the `cold_ravel_diagnostic`
     stamp's `failed_runs`, and does not fail the run. After the first
@@ -1614,6 +1636,33 @@ which count every request the process served in that interval:
 `process_error` saying why when a scrape failed, lacked the family, or a
 counter went down across the query. `run.sh` passes Ravel's `/metrics` URL
 to the folded read-back for this with or without `MB_STAGE1`.
+
+`ingest.json` (each HTTP row's unfolded read-back) and
+`readback-folded.json` also record `readback.query_stats`, the statements'
+own cost (ADR-3694 decision 5), with or without a metrics URL, keyed like
+`query_ms`. Each `samples.N` and `histogram_samples` read is
+`{"stats": "per_call", "calls": [...]}`: one entry per `/api/v1/query`
+call of its windowed count, in query order, never summed. Each entry
+carries `window` (`end_ms` and `range_ms`, the `count_over_time` window
+the call evaluated), `query_ms` (that call's wall time), then, copied from
+the answer's `data.stats` as a `ravel_cost` record copies them, each `null`
+(never 0) when the answer has no such member: `accounting`, `phases`
+(Ravel's PromQL phases `resolve`, `plan`, `probe`, `scan` and `keyIndex`),
+`segmentsFetched`, `segmentsPruned`, `segmentsPrunedByDictionary`,
+`segmentsPrunedByLabelIndex`, `labelIndexValues`, `estimate`, `io`, and
+`unfoldedSegmentsResolved`, copied out of `io`. The `series` and
+`histogram_series` listings record `{"stats": "none", "reason":
+"/api/v1/series answers carry no data.stats"}`. The `stale_marker`
+instant query records none. For example (values illustrative):
+
+```json
+"samples.0": {"stats": "per_call", "calls": [
+  {"window": {"end_ms": 1760086400000, "range_ms": 86400000}, "query_ms": 41,
+   "accounting": {...}, "phases": [{"phase": "resolve", ...}, ...],
+   "segmentsFetched": 4, "segmentsPruned": 6, "segmentsPrunedByDictionary": 3,
+   "segmentsPrunedByLabelIndex": 0, "labelIndexValues": null,
+   "estimate": null, "io": {...}, "unfoldedSegmentsResolved": 2}, ...]}
+```
 
 **holders.json.** How many data objects in each selective statement's fetch
 window hold a series it asks for, counted without the router or the key

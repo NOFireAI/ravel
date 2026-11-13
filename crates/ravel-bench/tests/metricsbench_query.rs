@@ -391,6 +391,7 @@ fn readback(query_url: &str) -> Readback {
         query_ms: Default::default(),
         query_windows: Default::default(),
         query_cost: Default::default(),
+        query_stats: Default::default(),
     }
 }
 
