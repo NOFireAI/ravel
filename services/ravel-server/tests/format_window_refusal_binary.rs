@@ -79,6 +79,7 @@ async fn seeded_bucket() -> (String, Arc<fake_s3::FakeS3>) {
     let cli = Cli::try_parse_from(argv).expect("flags parse");
     let store =
         ravel_server::store::build_store(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("build the S3 store")
             .foreground;
 

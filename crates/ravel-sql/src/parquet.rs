@@ -93,17 +93,20 @@ pub enum ExternalStoreError {
 /// (ADR-3456 decision D7). Under `--store s3`: the S3 endpoint (`None` for
 /// AWS's regional endpoint), the region and the bucket name, addressed
 /// path-style. Under `--store gcs`: the bucket on GCS, or at `--gcs-endpoint`
-/// with `/<bucket>` appended when one is set.
+/// with `/<bucket>` appended when one is set. Under `--store azure`: the
+/// container in the storage account (ADR-4158 decision D7).
 ///
 /// A (profile, bucket) reaches it when their bucket addresses overlap. A
 /// bucket address is where the S3 client sends requests for the bucket: an
 /// explicit endpoint as written when virtual-hosted, the endpoint with
 /// `/<bucket>` appended when path-style, and AWS's regional endpoint for the
-/// region when there is none; a GCS profile's is the bucket on GCS. Two
-/// addresses overlap when they are on the same service (the same AWS
-/// partition, GCS, or the same host and port, a missing port read as the
-/// scheme's default) and one's bucket and path segments begin with the
-/// other's. An AWS or GCS address's bucket is its host's bucket label or, for
+/// region when there is none; a GCS profile's is the bucket on GCS, and an
+/// Azure profile's is the container (the location's bucket, split at `/`) in
+/// its storage account, the account compared case-insensitively as the host
+/// name it becomes. Two addresses overlap when they are on the same service
+/// (the same AWS partition, GCS, the same Azure storage account, or the same
+/// host and port, a missing port read as the scheme's default) and one's
+/// bucket and path segments begin with the other's. An AWS or GCS address's bucket is its host's bucket label or, for
 /// the service host itself, its first path segment, so a virtual-hosted and a
 /// path-style address of one bucket compare equal. The prefix rule matters for
 /// an endpoint that names no bucket: a virtual-hosted profile at Ravel's own
@@ -119,6 +122,10 @@ pub enum RavelBucket {
     Gcs {
         endpoint: Option<String>,
         bucket: String,
+    },
+    Azure {
+        account: String,
+        container: String,
     },
 }
 
@@ -143,6 +150,7 @@ impl RavelBucket {
                 endpoint: Some(endpoint),
                 bucket,
             } => BucketAddress::of_url(&format!("{}/{bucket}", endpoint.trim_end_matches('/'))),
+            RavelBucket::Azure { account, container } => BucketAddress::azure(account, container),
         };
         let theirs = match &profile.kind {
             ExternalKind::S3 {
@@ -155,7 +163,7 @@ impl RavelBucket {
                 service: Service::Gcs,
                 segments: vec![bucket.to_string()],
             },
-            ExternalKind::Azure { .. } => return false,
+            ExternalKind::Azure { account, .. } => BucketAddress::azure(account, bucket),
         };
         ravel.overlaps(&theirs)
     }
@@ -175,6 +183,8 @@ struct BucketAddress {
 enum Service {
     Aws(AwsPartition),
     Gcs,
+    /// An Azure storage account, lowercased.
+    Azure(String),
     /// Any other host, lowercased, with its port.
     Host(String, Option<u16>),
 }
@@ -198,6 +208,18 @@ impl BucketAddress {
             (None, true) => format!("https://s3.{region}.amazonaws.com/{bucket}"),
         };
         Self::of_url(&url)
+    }
+
+    /// The address of `container` in the Azure storage `account`.
+    fn azure(account: &str, container: &str) -> Self {
+        BucketAddress {
+            service: Service::Azure(account.to_ascii_lowercase()),
+            segments: container
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_string)
+                .collect(),
+        }
     }
 
     fn of_url(url: &str) -> Self {
@@ -1656,6 +1678,82 @@ mod tests {
             ),
             "another bucket on GCS is not Ravel's"
         );
+    }
+
+    /// ADR-4158 D7: under `--store azure` Ravel's side is the container in its
+    /// storage account. An Azure profile on that account naming that container
+    /// is refused before anything is opened; the same account's other
+    /// containers, another account's container of the same name, and S3 or
+    /// GCS profiles naming the container are not. The account is compared as
+    /// the host name it becomes, so its case does not matter, and a location
+    /// whose bucket begins with the container still reads it.
+    #[tokio::test]
+    async fn an_azure_profile_on_ravels_azure_container_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let profiles = ravel_object_store::external::load_profiles(
+            r#"[{"name": "z", "kind": "azure", "account": "ravelprod",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}},
+                {"name": "other", "kind": "azure", "account": "customer",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}},
+                {"name": "upper", "kind": "azure", "account": "RavelProd",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}},
+                {"name": "g", "kind": "gcs", "credentials": {"mode": "application_default"}}]"#,
+        )
+        .expect("profiles");
+        let ravel = RavelBucket::Azure {
+            account: "ravelprod".to_string(),
+            container: "data".to_string(),
+        };
+        assert!(ravel.is_reached_by(&profiles[0], "data"));
+        assert!(!ravel.is_reached_by(&profiles[0], "lake"));
+        assert!(!ravel.is_reached_by(&profiles[1], "data"));
+        assert!(ravel.is_reached_by(&profiles[2], "data"));
+        assert!(ravel.is_reached_by(&profiles[0], "data/exports"));
+        assert!(!ravel.is_reached_by(&profiles[3], "data"));
+        let aws = s3_profile("aws", None, dir.path(), true);
+        assert!(!ravel.is_reached_by(&aws, "data"));
+
+        let stores = ProfileStores::new(profiles).refusing(ravel);
+        assert!(
+            matches!(
+                stores.store("z", "data"),
+                Err(ExternalStoreError::RavelBucket { ref profile, ref bucket })
+                    if profile == "z" && bucket == "data"
+            ),
+            "an Azure profile on Ravel's Azure container is refused"
+        );
+        for (profile, bucket) in [("z", "lake"), ("other", "data")] {
+            assert!(
+                !matches!(
+                    stores.store(profile, bucket),
+                    Err(ExternalStoreError::RavelBucket { .. })
+                ),
+                "{profile}/{bucket} is not Ravel's container"
+            );
+        }
+    }
+
+    /// An Azure profile is never Ravel's bucket when Ravel runs on S3 or GCS.
+    #[test]
+    fn an_azure_profile_is_not_ravels_s3_or_gcs_bucket() {
+        let profiles = ravel_object_store::external::load_profiles(
+            r#"[{"name": "z", "kind": "azure", "account": "ravelprod",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}}]"#,
+        )
+        .expect("profiles");
+        for ravel in [
+            RavelBucket::S3 {
+                endpoint: None,
+                region: "us-east-1".to_string(),
+                bucket: "data".to_string(),
+            },
+            RavelBucket::Gcs {
+                endpoint: None,
+                bucket: "data".to_string(),
+            },
+        ] {
+            assert!(!ravel.is_reached_by(&profiles[0], "data"), "{ravel:?}");
+        }
     }
 
     /// `--gcs-endpoint` moves Ravel's bucket to that host: GCS's own host is

@@ -321,6 +321,25 @@ cargo run -p ravel-server --features sql -- \
 [Google Cloud Storage](operations/configuration.md#google-cloud-storage)
 covers GKE Workload Identity and the flags `--store gcs` refuses.
 
+To use an Azure Blob Storage container, unset the `RAVEL_S3_*` and
+`RAVEL_GCS_*` variables (`--store azure` refuses them) and provide a
+credential through the standard `AZURE_*` environment, for example
+`AZURE_STORAGE_ACCOUNT_KEY` for a development account:
+
+```sh
+cargo run -p ravel-cli -- --store azure --azure-account myraveldev \
+  --azure-container ravel-dev store qualify
+
+cargo run -p ravel-server --features sql -- \
+  --store azure --azure-account myraveldev --azure-container ravel-dev \
+  --tenant-hash-unkeyed \
+  --tenant-token devtoken=acme
+```
+
+[Azure Blob Storage](operations/configuration.md#azure-blob-storage) covers
+workload identity, the hierarchical-namespace refusal and the flags
+`--store azure` refuses.
+
 ### Send and read one export
 
 Generate an OTLP metrics export with current timestamps, send it, and keep
