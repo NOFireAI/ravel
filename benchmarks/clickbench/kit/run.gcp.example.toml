@@ -32,8 +32,8 @@ phases = ["benchmark", "concurrent"]
 
 # Where the box runs. instance_type must be an x86_64 machine type:
 # launch-gcp.sh asks GCE for its architecture and refuses an arm64 type (or
-# one it cannot tell), because only the linux-amd64 release digests above are
-# pinned. The image must be dnf-based (box/run.sh installs wget,
+# any other reported architecture, or a failed lookup), because only the
+# linux-amd64 release digests above are pinned. The image must be dnf-based (box/run.sh installs wget,
 # sysstat and time with dnf) with glibc at least the release binaries' (2.34
 # for v0.32.0). Optional: boot_disk_gb (default 100, at least 50: the box
 # holds only the dataset and the binaries).

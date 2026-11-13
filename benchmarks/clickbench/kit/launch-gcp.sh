@@ -13,9 +13,10 @@
 #     (cosign verify-blob, bound to the release workflow's identity for the
 #     tag) and lists ravel_server_sha256 and ravel_cli_sha256 for the
 #     linux-amd64 binaries;
-#   - the machine type is x86_64 (gcloud compute machine-types describe,
+#   - the machine type is x86 (gcloud compute machine-types describe,
 #     architecture): only linux-amd64 release artifacts are pinned, so an
-#     arm64 type, or an answer it cannot read, is refused;
+#     arm64 type, any other reported architecture, or a failed lookup is
+#     refused;
 #   - the service account exists and holds roles/storage.objectAdmin on the
 #     results bucket (setup-gcp.sh grants it).
 # It then stages the kit (box/run.sh, lib/kit.py, the corpus, the mapping and
@@ -235,17 +236,18 @@ if [ "$DRY_RUN" != 1 ]; then
 fi
 
 # The machine type's architecture. The box picks its release binaries by
-# uname -m but run.toml pins the linux-amd64 digests only.
+# uname -m but run.toml pins the linux-amd64 digests only. GCE reports no
+# architecture for x86 machine types and ARM64 for arm ones, so empty output
+# from a lookup that succeeded is accepted.
 if [ "$DRY_RUN" = 1 ]; then
   run gcloud compute machine-types describe "$MACHINE" --project "$PROJECT" --zone "$ZONE" --format='value(architecture)'
 else
   arch="$(gcloud compute machine-types describe "$MACHINE" --project "$PROJECT" --zone "$ZONE" --format='value(architecture)')" \
-    || die64 "cannot look up the architecture of machine type $MACHINE in $ZONE"
+    || die64 "cannot tell the architecture of machine type $MACHINE in $ZONE: the lookup failed"
   arch="$(printf '%s' "$arch" | tr -d '[:space:]')"
   case "$arch" in
-    X86_64) ;;
-    ARM64) die64 "machine type $MACHINE is arm64; only linux-amd64 release artifacts are pinned, so arm64 machine types are refused" ;;
-    *) die64 "cannot tell the architecture of machine type $MACHINE (gcloud answered '$arch'); only linux-amd64 release artifacts are pinned, so a machine type that is not x86_64 is refused" ;;
+    ""|X86_64) ;;
+    *) die64 "machine type $MACHINE reports architecture $arch; only linux-amd64 release artifacts are pinned, so a machine type that is not x86_64 (arm64 included) is refused" ;;
   esac
 fi
 

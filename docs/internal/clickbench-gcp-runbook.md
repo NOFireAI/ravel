@@ -80,9 +80,10 @@ Read every command the dry run prints. The real launch:
    `SHA256SUMS.pem`, verifies the signature with `cosign verify-blob` against
    the release workflow's identity for the tag, and checks that it lists the
    two pinned digests;
-3. asks GCE for the architecture of `instance_type` and refuses anything but
-   `X86_64`, or an answer it cannot read, because only the linux-amd64
-   release artifacts are pinned (arm64 machine types are refused);
+3. asks GCE for the architecture of `instance_type` and refuses a failed
+   lookup and any reported value but `X86_64`, because only the linux-amd64
+   release artifacts are pinned (arm64 machine types are refused). GCE
+   reports no architecture for x86 types, so an empty answer passes;
 4. checks that the service account exists and holds objectAdmin on the
    results bucket;
 5. uploads `kit.tgz`, `kit.sha256` and the resolved `run.toml` to
