@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
+use prost::Message;
 use ravel_commit::keys;
+use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
 use ravel_maintain::claim_guard::ClaimSleeper;
 use ravel_maintain::{
     Bucket, ClaimParticipant, Clock, CompactorConfig, Coordination, FixedClock, MaintainError,
@@ -23,7 +25,8 @@ use ravel_maintain::{
     migrate_family,
 };
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, list_all};
+use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
+use ravel_proto::sys::v1::{ClaimState, CompactionClaim};
 use ravel_types::Signal;
 use uuid::Uuid;
 
@@ -194,27 +197,35 @@ async fn a_part_index_refusal_is_not_migrated_and_the_walk_goes_on() {
     }
 }
 
-/// The refused migration releases its bucket claim, as compaction does for
-/// the same refusal: a second walk by another participant claims the bucket
-/// and is refused by the build again, rather than skipped by a claim still
-/// held under its lease.
+/// The refused migration marks its bucket claim completed, as compaction
+/// does for the same refusal, rather than leaving it running until its lease
+/// expires: the walk's three claims, the refused bucket's among them, are all
+/// completed.
 #[tokio::test]
-async fn a_part_index_refusal_releases_the_bucket_claim() {
+async fn a_part_index_refusal_completes_the_bucket_claim() {
     let store = MemoryStore::new();
     seed(&store, 0x200).await;
     let clock = FixedClock::new(sealed_now_ns());
 
-    let first = walk(&store, &clock, &claiming(&clock, 77))
+    let report = walk(&store, &clock, &claiming(&clock, 77))
         .await
-        .expect("first walk");
-    assert_eq!(first.not_migrated, vec![refused_bucket()], "{first:?}");
-    assert_eq!(first.buckets_migrated, 2, "{first:?}");
+        .expect("the walk finishes past the refused bucket");
+    assert_eq!(report.not_migrated, vec![refused_bucket()], "{report:?}");
+    assert_eq!(report.buckets_migrated, 2, "{report:?}");
 
-    let second = walk(&store, &clock, &claiming(&clock, 78))
+    let mut states = Vec::new();
+    for meta in list_all(&store, COMPACTION_CLAIMS_PREFIX)
         .await
-        .expect("second walk");
-    assert_eq!(second.not_migrated, vec![refused_bucket()], "{second:?}");
-    assert_eq!(second.buckets_migrated, 0, "{second:?}");
+        .expect("list claims")
+    {
+        let got = store
+            .get(&meta.key, GetRange::Full)
+            .await
+            .expect("get claim");
+        let claim = CompactionClaim::decode(got.data.as_ref()).expect("claim decodes");
+        states.push(ClaimState::try_from(claim.state).expect("known state"));
+    }
+    assert_eq!(states, vec![ClaimState::Completed; 3]);
 }
 
 /// Only a part-index refusal is held: the walk's arm leaves every other
