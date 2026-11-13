@@ -234,7 +234,8 @@ instrumentation wrapper.
   (P15) and refuses a `true` with an error naming the setting. An answer it
   cannot read is a refusal too, never a pass. The 2026-11-13 correction
   adds the account URL as a second source when the container URL's answer
-  lacks the header.
+  lacks the header, and the AKS staging correction says which permission
+  the read needs.
 
 ### D7. Explicit refusals
 
@@ -337,8 +338,9 @@ without this decision `--store azure` would be reachable only by hand.
   identity the pods run as. `roleClientIds` (optional) overrides it per
   role with `gateway`, `query`, `maintain` and `qualify`, which is how
   ADR-0055's per-role scoping is expressed on Azure: one managed identity
-  per role, each with its own role assignment on the container. There is
-  no endpoint field and no secret reference. The CRD validates the shape
+  per role, each with its own role assignment on the container (the AKS
+  staging correction below adds a second assignment, on the account). There
+  is no endpoint field and no secret reference. The CRD validates the shape
   of the account, the container and every client ID (the 2026-11-13
   operator correction below).
 - **Identity wiring.** The operator owns the four ServiceAccounts it
@@ -670,3 +672,43 @@ The review of #4165 showed four places where D11 did not hold as written.
   digits and single hyphens starting and ending with a letter or digit,
   and `clientId` and every `roleClientIds` entry a UUID. A cluster that
   breaks any of these is refused at admission.
+
+## Correction (2026-11-13): the account-information permission, from the AKS staging run
+
+<!-- amendment-applies: sections="D6. Selection, identity and qualification|D11. The operator runs a `RavelCluster` on Azure with AKS workload identity" pointer="AKS staging correction" -->
+
+The first run of an operator-rendered cluster on AKS (#4166, images built
+from main c1c153313) showed that the Measured section's P15 answer was
+taken with the wrong principal, and that D11 names one role assignment
+where two are needed.
+
+- **What happened.** Each of the four identities held
+  `Storage Blob Data Contributor` on the container, as D11 and the guide
+  said. The qualify Job failed three times with
+  `access denied: account information ... HTTP 403 AuthorizationPermissionMismatch`:
+  `AzureStore` could not read the hierarchical-namespace flag, and D6
+  makes an unreadable answer a refusal.
+- **Why.** Get Account Information is authorised by the control-plane
+  action `Microsoft.Storage/storageAccounts/blobServices/getInfo/action`.
+  The Storage Blob Data roles hold data actions on blobs and a few
+  container actions, and not this one, at any scope. The P15 measurement
+  of 2026-11-12 ran as a subscription owner, who holds every control-plane
+  action, so it showed that the header exists and not what it takes to
+  read it.
+- **What is needed.** Each identity that builds an `AzureStore` needs, on
+  the storage account, a role holding that action, beside its data role on
+  the container. A custom role with that single action is enough; it reads
+  the account's SKU, kind and namespace flag and grants no access to data.
+  With it assigned, the next qualify attempt passed all ten conformance
+  properties and wrote `az://ravelstg4158/ravel qualified (suite v3)`.
+- **D6 stands.** The refusal of an unreadable answer is not relaxed: a
+  store that skipped the check on a 403 would run on a
+  hierarchical-namespace account whenever the permission was missing,
+  which is the common case. The cost is one more role assignment, and the
+  guide now gives it.
+- **The rest of the run**, recorded on #4166: workload identity
+  authenticated with no secret; `StoreQualified=True` and `Available=True`;
+  gateway, query and maintain each ran as their own identity; an OTLP
+  export through the gateway returned one commit token, and a query
+  through the query tier with that token returned the value written.
+  `azure_contract` has still not run against a real account (#4177).

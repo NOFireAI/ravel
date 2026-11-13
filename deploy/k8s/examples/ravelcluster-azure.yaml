@@ -12,8 +12,11 @@
 #     container below;
 #   - a user-assigned managed identity per role (or one shared one), each
 #     with a federated credential for
-#     system:serviceaccount:ravel-system:prod-<role> and a Storage Blob Data
-#     role on the container;
+#     system:serviceaccount:ravel-system:prod-<role>, a Storage Blob Data
+#     role on the container, and a role holding the action
+#     Microsoft.Storage/storageAccounts/blobServices/getInfo/action on the
+#     storage account (no Storage Blob Data role holds it, and without it
+#     store qualification fails with a 403);
 #   - the operator's own identity, federated for
 #     system:serviceaccount:ravel-system:ravel-operator, only if this cluster
 #     sets deploymentKeySecretRef or shardOverrides (opt-in, see rbac.yaml);
