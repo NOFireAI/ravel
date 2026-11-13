@@ -201,6 +201,25 @@ pub fn routed_chunk_charge(column_widths: &[usize], rows: usize) -> Option<usize
     })
 }
 
+/// The largest row count up to [`BUCKET_SPILL_MAX_CHUNK_ROWS`] whose
+/// [`routed_chunk_charge`] is at most `per_chunk`; 0 when not even one row
+/// fits.
+fn largest_chunk_rows(column_widths: &[usize], per_chunk: usize) -> usize {
+    let mut rows = 0;
+    let (mut low, mut high) = (1usize, BUCKET_SPILL_MAX_CHUNK_ROWS);
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        match routed_chunk_charge(column_widths, mid) {
+            Some(charge) if charge <= per_chunk => {
+                rows = mid;
+                low = mid + 1;
+            }
+            _ => high = mid - 1,
+        }
+    }
+    rows
+}
+
 /// Derive the retry's `bits` and `routed_chunk_rows`, or say why not.
 pub fn derive_bucket_spill_tuning(
     inputs: &BucketSpillInputs,
@@ -271,22 +290,13 @@ pub fn derive_bucket_spill_tuning(
     };
 
     let per_chunk = (share - table) / ((1usize << bits) + 1);
-    let mut rows = 0;
-    let (mut low, mut high) = (1usize, BUCKET_SPILL_MAX_CHUNK_ROWS);
-    if inputs.variable_width {
-        rows = BUCKET_SPILL_MAX_CHUNK_ROWS;
-        high = 0;
-    }
-    while low <= high {
-        let mid = low + (high - low) / 2;
-        match routed_chunk_charge(&inputs.column_widths, mid) {
-            Some(charge) if charge <= per_chunk => {
-                rows = mid;
-                low = mid + 1;
-            }
-            _ => high = mid - 1,
-        }
-    }
+    // A byte-budgeted chunk seals on `per_chunk` bytes, so its row cap is
+    // only the 8,192-row ceiling.
+    let rows = if inputs.variable_width {
+        BUCKET_SPILL_MAX_CHUNK_ROWS
+    } else {
+        largest_chunk_rows(&inputs.column_widths, per_chunk)
+    };
 
     let partitions = inputs.partitions as u64;
     let descriptor_need = partitions
@@ -885,6 +895,59 @@ mod tests {
                 descriptor_need: 15,
             })
         );
+    }
+
+    /// ADR-4143 decision 3: a route with a string or binary column gets
+    /// `B = floor((S - table(bits)) / (2^bits + 1))` and the 8,192-row cap,
+    /// and `B_min` (16,384 B) stands in for `b(1024)` in the `bits` floor
+    /// condition. With `N = n = 1`, `P = 1` and `S` the share, `table(b)` is
+    /// `ceil(2 x A / 2^b)` and the table fits at `b` when `8 x A <= 2^b x 3 x S`.
+    /// The routed widths are an `Int64` and a string's 16, whose `b(1024)` is
+    /// 24,832 B:
+    /// - `A` 100,000, `S` 1,000,000: the table, 200,000 B, fits at `bits` 0
+    ///   beside two floors, and `B` is 800,000 / 2 = 400,000.
+    /// - `A` 30,000, `S` 100,000: the table, 60,000 B, fits at `bits` 0
+    ///   (240,000 <= 300,000) beside two `B_min` floors (92,768 B), and `B`
+    ///   is 40,000 / 2 = 20,000. Two `b(1024)` floors would need 109,664 B,
+    ///   and every later `bits` adds more floor than it takes off the table,
+    ///   so the same widths on a fixed-width route get `too_many_bits`.
+    /// - `A` 30,000, `S` 85,000: two `B_min` floors beside the table need
+    ///   92,768 B, so `bits` is 1: 30,000 B and three floors are 79,152 B,
+    ///   and `B` is 55,000 / 3 = 18,333.
+    /// - `S` 30,000: two `B_min` floors alone pass it, at any `bits`.
+    #[test]
+    fn bucket_spill_derivation_budgets_string_routes_in_bytes() {
+        let derive = |asked_bytes, share: usize, variable_width| {
+            derive_bucket_spill_tuning(&BucketSpillInputs {
+                asked_bytes,
+                total_rows: Some(1),
+                consumed_rows: Some(1),
+                partitions: 1,
+                spill_consumers: 1,
+                query_limit: (64 << 20) + share,
+                column_widths: vec![8, 16],
+                variable_width,
+                nofile_soft: 524_288,
+                slots: 1,
+            })
+        };
+        assert_eq!(routed_chunk_charge(&[8, 16], 1024), Some(24_832));
+        let string_route = |bits, bytes, descriptor_need| {
+            Ok(BucketSpillTuning {
+                bits,
+                routed_chunk_rows: 8192,
+                routed_chunk_bytes: Some(bytes),
+                descriptor_need,
+            })
+        };
+        assert_eq!(derive(100_000, 1_000_000, true), string_route(0, 400_000, 3));
+        assert_eq!(derive(30_000, 100_000, true), string_route(0, 20_000, 3));
+        assert_eq!(
+            derive(30_000, 100_000, false),
+            Err(NoTuning::TooManyBits)
+        );
+        assert_eq!(derive(30_000, 85_000, true), string_route(1, 18_333, 5));
+        assert_eq!(derive(1, 30_000, true), Err(NoTuning::TooManyBits));
     }
 
     /// `C` divides the share: dividing by `P` (16) instead of `C` (48) on

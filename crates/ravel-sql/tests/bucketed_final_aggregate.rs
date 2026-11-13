@@ -3560,6 +3560,8 @@ fn assert_bucket_spilled(run: &RetryRun, log: &str, partitions: usize) {
         (bits.to_string(), rows.to_string()),
         "the INFO line is the report"
     );
+    assert_eq!(report.routed_chunk_bytes, None, "a fixed-width route");
+    assert_eq!(retry_info_field(log, "routed_chunk_bytes"), "none");
     assert!(report.bucket_spill_bytes_written > 0, "{report:?}");
     assert!(report.bucket_spill_rows_written > 0, "{report:?}");
     assert_eq!(
