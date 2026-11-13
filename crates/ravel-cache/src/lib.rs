@@ -159,6 +159,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::single_flight::MAX_CANCELLED_LEADER_REENTRIES;
 
     fn test_key(n: u64) -> CacheKey {
         let mut content_hash = [0u8; 32];
@@ -172,7 +173,7 @@ mod tests {
     /// these tests make follower registration an ordering they enforce rather
     /// than a wall-clock race decided by how promptly the runtime schedules a
     /// spawned task against a leader that holds its slot for a fixed sleep.
-    async fn poll_once<F: Future>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
+    async fn poll_once<F: Future + ?Sized>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
         std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
     }
 
@@ -313,17 +314,23 @@ mod tests {
         assert_eq!(third_call_ran.load(Ordering::SeqCst), 1);
     }
 
+    /// A leader that PANICS keeps the pre-#4174 contract: its follower receives
+    /// [`SingleFlightError::LeaderLost`] and never runs its own fetch, because a
+    /// deterministic panic would otherwise repeat once per follower.
+    ///
+    /// Distinguishing wrong impl (c): if `LeaderGuard::drop` recorded
+    /// `LeaderOutcome::Cancelled` for a panicking leader too (dropping the
+    /// `std::thread::panicking()` branch), the follower would re-enter and run
+    /// its own fetch, so the `follower_ran == 0` assertion fails.
     #[tokio::test]
-    async fn single_flight_panicking_or_cancelled_leader_unblocks_waiters() {
+    async fn single_flight_panicking_leader_gives_follower_leader_lost_no_retry() {
         let flight: Arc<SingleFlight<CacheKey, Bytes, &'static str>> =
             Arc::new(SingleFlight::new());
 
-        // A leader that panics before producing a result must not leave a
-        // concurrent follower waiting forever. The leader parks inside its
-        // fetch until this test releases it, and the follower is registered
-        // (polled once) before that release, so "the follower joined while the
-        // leader was still in flight" is ordered here rather than raced
-        // between a 2 ms and a 10 ms sleep.
+        // The leader parks inside its fetch until this test releases it, and the
+        // follower is registered (polled once) before that release, so "the
+        // follower joined while the leader was still in flight" is ordered here
+        // rather than raced against a sleep.
         let key = test_key(100);
         let (entered_tx, entered_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel::<()>();
@@ -344,7 +351,7 @@ mod tests {
         let follower_ran = Arc::new(AtomicUsize::new(0));
         let mut follower = {
             let ran = follower_ran.clone();
-            Box::pin(flight.run(key, move || async move {
+            Box::pin(flight.run_with_reentries(key, move || async move {
                 ran.fetch_add(1, Ordering::SeqCst);
                 Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
             }))
@@ -359,7 +366,7 @@ mod tests {
             leader.await.is_err(),
             "the leader task itself should have panicked"
         );
-        let (follower_result, follower_role) = timeout(Duration::from_secs(2), follower)
+        let (follower_result, follower_role, reentries) = timeout(Duration::from_secs(2), follower)
             .await
             .expect("a panicking leader must not leave a follower parked forever");
         assert!(matches!(
@@ -368,24 +375,41 @@ mod tests {
         ));
         assert_eq!(follower_role, Role::Follower);
         assert_eq!(
+            reentries, 0,
+            "a follower does not re-enter after a panicking leader"
+        );
+        assert_eq!(
             follower_ran.load(Ordering::SeqCst),
             0,
-            "a follower never runs its own fetch"
+            "a follower of a panicking leader never runs its own fetch"
         );
+    }
 
-        // A leader whose task is cancelled before it produces a result
-        // must not leave a concurrent follower waiting forever either. The
-        // leader parks on a `oneshot` whose sender this test never fires, so
-        // it is still in flight when the abort lands -- no 60 s sleep to
-        // outrun and no 10 ms windows to lose.
-        let key2 = test_key(101);
+    /// A leader that is CANCELLED (its future dropped before producing a result)
+    /// no longer fails its follower (issue #4174): the follower re-enters the
+    /// slot, becomes the new leader, and runs its own fetch exactly once,
+    /// returning its own result.
+    ///
+    /// Distinguishing wrong impl (a) -- the pre-fix code, where
+    /// `LeaderGuard::drop` sent `Err(LeaderLost)` and `wait` returned it
+    /// unconditionally: the follower would see `LeaderLost` instead of its
+    /// bytes, so `result.unwrap()` and the `Role::Leader`/`reentries == 1`
+    /// assertions all fail.
+    #[tokio::test]
+    async fn single_flight_cancelled_leader_follower_runs_its_own_fetch_once() {
+        let flight: Arc<SingleFlight<CacheKey, Bytes, &'static str>> =
+            Arc::new(SingleFlight::new());
+
+        // The leader parks on a `oneshot` this test never fires, so it is still
+        // in flight when the abort lands.
+        let key = test_key(101);
         let (entered_tx, entered_rx) = oneshot::channel();
         let (_never_tx, never_rx) = oneshot::channel::<()>();
-        let leader2 = {
+        let leader = {
             let flight = flight.clone();
             tokio::spawn(async move {
                 flight
-                    .run(key2, move || async move {
+                    .run(key, move || async move {
                         let _ = entered_tx.send(());
                         let _ = never_rx.await;
                         Ok::<Bytes, &'static str>(Bytes::from_static(b"unreachable"))
@@ -395,22 +419,297 @@ mod tests {
         };
         entered_rx.await.unwrap();
 
-        let mut follower2 = Box::pin(flight.run(key2, || async {
-            Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
-        }));
+        let follower_ran = Arc::new(AtomicUsize::new(0));
+        let mut follower = {
+            let ran = follower_ran.clone();
+            Box::pin(flight.run_with_reentries(key, move || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"follower bytes"))
+            }))
+        };
         assert!(
-            poll_once(&mut follower2).await.is_pending(),
+            poll_once(&mut follower).await.is_pending(),
             "the follower parks on the still-in-flight leader"
         );
-        leader2.abort();
 
-        let (follower2_result, _role) = timeout(Duration::from_secs(2), follower2)
+        leader.abort();
+        // Join the aborted task so its `LeaderGuard::drop` has fired (cancelled,
+        // slot removed) before the follower is polled again.
+        let _ = leader.await;
+
+        let (result, role, reentries) = timeout(Duration::from_secs(2), follower)
             .await
-            .expect("a cancelled leader must not leave a follower parked forever");
-        assert!(matches!(
-            follower2_result,
-            Err(SingleFlightError::LeaderLost)
-        ));
+            .expect("a cancelled leader must let its follower finish, not park it");
+        assert_eq!(
+            result
+                .expect("the follower resolves its own fetch")
+                .as_ref(),
+            b"follower bytes".as_slice()
+        );
+        assert_eq!(
+            role,
+            Role::Leader,
+            "the re-entering follower took over as leader and ran its own fetch"
+        );
+        assert_eq!(
+            reentries, 1,
+            "it re-entered once after the one cancellation"
+        );
+        assert_eq!(
+            follower_ran.load(Ordering::SeqCst),
+            1,
+            "the follower ran its own fetch exactly once"
+        );
+    }
+
+    /// Three callers on one key, leader cancelled: exactly one of the two
+    /// followers takes over and runs the fetch; the other follows it and
+    /// receives its bytes. The fetch runs exactly once after the cancellation.
+    ///
+    /// Distinguishing wrong impl (b) -- a retried follower that runs its own
+    /// fetch WITHOUT re-entering the slot: both followers would fetch, so
+    /// `fetches` reads 2 instead of 1 and the single-leader/single-follower
+    /// role split fails.
+    #[tokio::test]
+    async fn single_flight_cancelled_leader_two_followers_fetch_once() {
+        let flight: Arc<SingleFlight<CacheKey, Bytes, &'static str>> =
+            Arc::new(SingleFlight::new());
+        let key = test_key(201);
+        let fetches = Arc::new(AtomicUsize::new(0));
+
+        // The original leader parks and never touches `fetches`.
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (_never_tx, never_rx) = oneshot::channel::<()>();
+        let leader = {
+            let flight = flight.clone();
+            tokio::spawn(async move {
+                flight
+                    .run(key, move || async move {
+                        let _ = entered_tx.send(());
+                        let _ = never_rx.await;
+                        Ok::<Bytes, &'static str>(Bytes::from_static(b"unreachable"))
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.unwrap();
+
+        // Two followers, each of whose fetch counts itself and then parks on the
+        // shared gate, so the follower that takes over as leader stays in flight
+        // long enough for the other to re-enter and follow it rather than
+        // leading a second fetch.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let flight = flight.clone();
+            let fetches = fetches.clone();
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                flight
+                    .run_with_reentries(key, move || async move {
+                        fetches.fetch_add(1, Ordering::SeqCst);
+                        let _ = gate.acquire().await;
+                        Ok::<Bytes, &'static str>(Bytes::from_static(b"took over"))
+                    })
+                    .await
+            }));
+        }
+        // Both followers registered on the original leader. The timeout only
+        // guards against a hang.
+        timeout(Duration::from_secs(10), async {
+            while flight.waiters(&key) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both followers subscribe to the original leader");
+
+        leader.abort();
+        let _ = leader.await;
+
+        // One follower re-enters, becomes the new leader, and parks its fetch;
+        // the other re-enters and follows it. Wait for that steady state: one
+        // fetch started and exactly one caller parked as a follower. The timeout
+        // only guards against a hang -- a wrong impl where both followers lead
+        // (no follower ever parks) never reaches this state, and the assertions
+        // below then catch the doubled fetch count cleanly instead of hanging.
+        let _ = timeout(Duration::from_secs(10), async {
+            while fetches.load(Ordering::SeqCst) < 1 || flight.waiters(&key) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // Release generously so every parked fetch finishes regardless of impl.
+        gate.add_permits(2);
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(
+                timeout(Duration::from_secs(2), handle)
+                    .await
+                    .expect("no caller parks forever")
+                    .expect("the follower task joins"),
+            );
+        }
+
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "the two followers collapse onto one re-fetch after the cancellation"
+        );
+        for (result, _role, reentries) in &results {
+            assert_eq!(
+                result.as_ref().expect("each caller resolves").as_ref(),
+                b"took over".as_slice()
+            );
+            assert_eq!(*reentries, 1, "each re-entered once after the cancellation");
+        }
+        let leaders = results
+            .iter()
+            .filter(|(_, role, _)| *role == Role::Leader)
+            .count();
+        let followers = results
+            .iter()
+            .filter(|(_, role, _)| *role == Role::Follower)
+            .count();
+        assert_eq!(leaders, 1, "exactly one follower took over as leader");
+        assert_eq!(followers, 1, "the other rode its result as a follower");
+    }
+
+    /// Re-entry after a cancelled leader is bounded: a follower that keeps
+    /// finding a fresh (then cancelled) leader re-enters up to
+    /// [`MAX_CANCELLED_LEADER_REENTRIES`] times and, one cancellation past the
+    /// bound, returns [`SingleFlightError::LeaderLost`] without ever running its
+    /// own fetch.
+    ///
+    /// Driven entirely by hand with `poll_once` and `drop`, so the leader chain
+    /// and the follower's re-entries are a fixed order, not a race. Each dropped
+    /// leader parks on `std::future::pending`, so dropping its future cancels an
+    /// in-flight leader exactly as a torn-down query would.
+    #[tokio::test]
+    async fn single_flight_cancelled_leader_reentry_is_bounded() {
+        // The result type of `run_with_reentries`, so the parked leaders (a new
+        // closure type each iteration) and the follower share one reassignable
+        // boxed type.
+        type RunOut = (Result<Bytes, SingleFlightError<&'static str>>, Role, u32);
+        let flight = Arc::new(SingleFlight::<CacheKey, Bytes, &'static str>::new());
+        let key = test_key(202);
+
+        // A parked leader that holds the slot until its future is dropped. Owns
+        // an `Arc` clone so the boxed future is `'static` and reassignable.
+        let park_leader = |flight: Arc<SingleFlight<CacheKey, Bytes, &'static str>>| -> Pin<Box<dyn Future<Output = RunOut>>> {
+            Box::pin(async move {
+                flight
+                    .run_with_reentries(key, || async {
+                        std::future::pending::<Result<Bytes, &'static str>>().await
+                    })
+                    .await
+            })
+        };
+
+        let mut leader = park_leader(flight.clone());
+        assert!(poll_once(&mut leader).await.is_pending());
+
+        let follower_ran = Arc::new(AtomicUsize::new(0));
+        let mut follower: Pin<Box<dyn Future<Output = RunOut>>> = {
+            let flight = flight.clone();
+            let ran = follower_ran.clone();
+            Box::pin(async move {
+                flight
+                    .run_with_reentries(key, move || async move {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+                    })
+                    .await
+            })
+        };
+        assert!(
+            poll_once(&mut follower).await.is_pending(),
+            "the follower parks on the initial leader"
+        );
+
+        // Each iteration cancels the current leader and installs a fresh one
+        // before polling the follower, so the follower re-enters and follows the
+        // replacement instead of leading.
+        for _ in 1..=MAX_CANCELLED_LEADER_REENTRIES {
+            drop(leader);
+            leader = park_leader(flight.clone());
+            assert!(poll_once(&mut leader).await.is_pending());
+            assert!(
+                poll_once(&mut follower).await.is_pending(),
+                "the follower re-enters and follows the fresh leader while under the bound"
+            );
+        }
+
+        // One cancellation past the bound, with no replacement leader: the
+        // follower gives up.
+        drop(leader);
+        match poll_once(&mut follower).await {
+            Poll::Ready((result, role, reentries)) => {
+                assert!(
+                    matches!(result, Err(SingleFlightError::LeaderLost)),
+                    "past the bound the follower returns LeaderLost"
+                );
+                assert_eq!(role, Role::Follower);
+                assert_eq!(reentries, MAX_CANCELLED_LEADER_REENTRIES);
+            }
+            Poll::Pending => panic!("the follower must stop re-entering at the bound"),
+        }
+        assert_eq!(
+            follower_ran.load(Ordering::SeqCst),
+            0,
+            "a bounded-out follower never runs its own fetch"
+        );
+    }
+
+    /// A follower dropped while waiting runs no fetch and leaves no slot behind:
+    /// once the leader it was following is gone too, nothing is in flight.
+    #[tokio::test]
+    async fn single_flight_follower_dropped_while_waiting_leaves_no_slot() {
+        let flight: SingleFlight<CacheKey, Bytes, &'static str> = SingleFlight::new();
+        let key = test_key(203);
+
+        let mut leader = Box::pin(flight.run(key, || async {
+            std::future::pending::<Result<Bytes, &'static str>>().await
+        }));
+        assert!(poll_once(&mut leader).await.is_pending());
+        assert!(flight.is_in_flight(&key), "the leader holds the slot");
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let mut follower = {
+            let ran = ran.clone();
+            Box::pin(flight.run(key, move || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::new())
+            }))
+        };
+        assert!(poll_once(&mut follower).await.is_pending());
+        assert_eq!(flight.waiters(&key), 1, "the follower parked on the leader");
+
+        // Drop the follower while it waits: it never re-enters, so it creates no
+        // slot and never runs its fetch.
+        drop(follower);
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the dropped follower never fetched"
+        );
+        assert_eq!(
+            flight.waiters(&key),
+            0,
+            "the dropped follower left no waiter behind"
+        );
+        assert!(
+            flight.is_in_flight(&key),
+            "only the leader's slot remains, no stray follower slot"
+        );
+
+        // With the leader gone too, nothing is in flight.
+        drop(leader);
+        assert!(
+            !flight.is_in_flight(&key),
+            "no slot is left behind once both callers are gone"
+        );
     }
 
     #[test]
