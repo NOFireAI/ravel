@@ -2070,7 +2070,7 @@ async fn azure_store_contract_against_the_fake() {
 /// the HEAD of a suffix read included, and the pin carries a version selector
 /// only when the account has blob versioning on. Azure gives every write a new
 /// ETag, so an identical rewrite already makes an ETag-only pin stale.
-async fn azure_pinned_read_ordering(store: &AzureStore, root: &str) {
+async fn azure_pinned_read_ordering(store: &dyn ObjectStoreBackend, root: &str) {
     let key = format!("{root}/pinned/k");
     let bytes = Bytes::from_static(b"pinned");
     let wrong_etag = "\"0x8DE00000000000F\"";
@@ -2151,7 +2151,7 @@ async fn azure_pinned_read_ordering(store: &AzureStore, root: &str) {
 /// that succeeds returns exactly the tail of one version and that version's
 /// length; a read the writer outran on every round is `Transient`, never
 /// bytes from two versions or from the wrong offset.
-async fn azure_suffix_read_races_overwrites(store: &AzureStore, root: &str) {
+async fn azure_suffix_read_races_overwrites(store: &dyn ObjectStoreBackend, root: &str) {
     const VERSIONS: u8 = 20;
     const SUFFIX: u64 = 16;
     let key = format!("{root}/suffix-race/k");
@@ -2226,6 +2226,48 @@ async fn azure_suffix_read_races_overwrites(store: &AzureStore, root: &str) {
     store.delete(&key).await.expect("delete");
 }
 
+/// A suffix read's length-probing HEAD (ADR-4158 D2) and its ranged GET are
+/// both billed as `StoreOp::Get` attempts of the one get call, never as
+/// `StoreOp::Head` attempts: `attempts_and_observed_store_time_are_recorded`
+/// pins this against the in-process fake; this is the same assertion against
+/// a live Azurite or Azure connection.
+async fn azure_suffix_read_is_one_get_call_two_get_attempts_zero_head_attempts(
+    store: &dyn ObjectStoreBackend,
+    metrics: &StoreMetrics,
+    root: &str,
+) {
+    let key = format!("{root}/suffix-metrics/k");
+    store
+        .put(&key, Bytes::from_static(b"value"), PutOptions::default())
+        .await
+        .expect("put");
+
+    let before = metrics.snapshot();
+    store
+        .get(&key, GetRange::Suffix(2))
+        .await
+        .expect("suffix get");
+    let after = metrics.snapshot();
+
+    assert_eq!(
+        after.op(StoreOp::Get).calls - before.op(StoreOp::Get).calls,
+        1,
+        "one suffix get is one get call"
+    );
+    assert_eq!(
+        after.op(StoreOp::Get).attempts - before.op(StoreOp::Get).attempts,
+        2,
+        "the length-probing HEAD and the ranged GET are both billed as get attempts"
+    );
+    assert_eq!(
+        after.op(StoreOp::Head).attempts,
+        before.op(StoreOp::Head).attempts,
+        "the suffix read's internal HEAD must not move the Head counters"
+    );
+
+    store.delete(&key).await.expect("delete");
+}
+
 /// Run-unique key root for a test against a long-lived container.
 fn azure_run_root(lane: &str) -> String {
     let run_id = SystemTime::now()
@@ -2235,7 +2277,7 @@ fn azure_run_root(lane: &str) -> String {
     format!("contract-{lane}-{run_id}")
 }
 
-async fn azure_contract_cases(store: &AzureStore, root: &str) {
+async fn azure_contract_cases(store: &dyn ObjectStoreBackend, metrics: &StoreMetrics, root: &str) {
     assert_eq!(store.capabilities(), azure_expected_capabilities());
     run_contract_suite(store, root).await;
     azure_pinned_read_ordering(store, root).await;
@@ -2244,6 +2286,8 @@ async fn azure_contract_cases(store: &AzureStore, root: &str) {
         store.observed_store_time_ns().is_some(),
         "every Azure response carries a Date header"
     );
+    azure_suffix_read_is_one_get_call_two_get_attempts_zero_head_attempts(store, metrics, root)
+        .await;
     let leftovers = list_all(store, &format!("{root}/"))
         .await
         .expect("list_all for cleanup");
@@ -2276,11 +2320,16 @@ async fn azurite_contract() {
     config.endpoint = Some(url);
     config.test_account_key = Some(TestAccountKey(key));
     config.list_page_size = 2;
-    let store = AzureStore::new(config)
-        .await
-        .expect("AzureStore against Azurite");
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = InstrumentedStore::with_metrics(
+        AzureStore::with_metrics(config, Arc::clone(&metrics))
+            .await
+            .expect("AzureStore against Azurite"),
+        Arc::clone(&metrics),
+    );
 
-    azure_contract_cases(&store, &azure_run_root("azurite")).await;
+    let root = azure_run_root("azurite");
+    azure_contract_cases(&store, &metrics, &root).await;
 }
 
 /// `AzureStore` against a real container, gated on `RAVEL_AZURE_TEST_ACCOUNT`
@@ -2303,9 +2352,14 @@ async fn azure_contract() {
     };
     let mut config = AzureConfig::new(account, container);
     config.list_page_size = 2;
-    let store = AzureStore::new(config)
-        .await
-        .expect("AzureStore with ambient credentials");
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = InstrumentedStore::with_metrics(
+        AzureStore::with_metrics(config, Arc::clone(&metrics))
+            .await
+            .expect("AzureStore with ambient credentials"),
+        Arc::clone(&metrics),
+    );
 
-    azure_contract_cases(&store, &azure_run_root("azure")).await;
+    let root = azure_run_root("azure");
+    azure_contract_cases(&store, &metrics, &root).await;
 }
