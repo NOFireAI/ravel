@@ -19029,6 +19029,49 @@ mod tests {
         }
     }
 
+    /// Every long flag clap knows starting with `prefix` is in `list`, and
+    /// every entry of `list` names the argument clap gives that long name.
+    fn assert_flag_list_covers_prefix(list: &[(&str, &str)], prefix: &str) {
+        use clap::CommandFactory;
+        let listed: std::collections::BTreeSet<&str> = list.iter().map(|(_, flag)| *flag).collect();
+        let command = Cli::command();
+        let flags: Vec<String> = command
+            .get_arguments()
+            .filter_map(|arg| arg.get_long())
+            .filter(|long| long.starts_with(prefix))
+            .map(|long| format!("--{long}"))
+            .collect();
+        assert!(!flags.is_empty(), "no flag starts with --{prefix}");
+        for flag in &flags {
+            assert!(listed.contains(flag.as_str()), "{flag} is not listed");
+        }
+        for (id, flag) in list {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == *id)
+                .unwrap_or_else(|| panic!("{id} names no argument"));
+            assert_eq!(
+                arg.get_long().map(|long| format!("--{long}")),
+                Some(flag.to_string())
+            );
+        }
+    }
+
+    /// Every `--gcs-*` flag clap knows is in [`GCS_FLAGS`], so a new GCS flag
+    /// cannot be accepted and ignored under another store by being left off.
+    #[test]
+    fn gcs_flag_list_covers_every_gcs_flag() {
+        assert_flag_list_covers_prefix(&GCS_FLAGS, "gcs-");
+    }
+
+    /// Every `--azure-*` flag clap knows is in [`AZURE_FLAGS`], so a new Azure
+    /// flag cannot be accepted and ignored under another store by being left
+    /// off.
+    #[test]
+    fn azure_flag_list_covers_every_azure_flag() {
+        assert_flag_list_covers_prefix(&AZURE_FLAGS, "azure-");
+    }
+
     /// ADR-3456 D5: `--gcs-bucket` is required under `--store gcs`, and the
     /// two GCS flags are refused under any other store.
     #[test]
