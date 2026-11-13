@@ -1,4 +1,4 @@
-//! Builds the configured `ObjectStoreBackend` (memory, S3 or GCS) and
+//! Builds the configured `ObjectStoreBackend` (memory, S3, GCS or Azure) and
 //! enforces the mandatory-capability contract before the backend is used.
 
 use std::sync::Arc;
@@ -377,11 +377,23 @@ pub fn resolve_azure_allow_http(endpoint: Option<&str>) -> anyhow::Result<bool> 
 /// `https://` endpoint are `false`; a loopback `http://` endpoint, a fake on
 /// this host, is `true`. Every other endpoint is refused: there is no flag
 /// accepting plaintext object storage across the network for these stores,
-/// and an endpoint with no scheme is not a usable URL.
+/// and an endpoint with no scheme is not a usable URL. An endpoint with
+/// userinfo in its authority is refused first, whatever its scheme, and no
+/// refusal prints the userinfo (the rule `ravel-cli` applies to the same
+/// flags).
 fn resolve_hidden_endpoint_allow_http(flag: &str, endpoint: Option<&str>) -> anyhow::Result<bool> {
     let Some(endpoint) = endpoint else {
         return Ok(false);
     };
+    let (start, end) = endpoint_authority(endpoint);
+    if endpoint[start..end].contains('@') {
+        anyhow::bail!(
+            "{flag} carries userinfo (user:password@) in its host part; remove it, the \
+             endpoint takes no credential"
+        );
+    }
+    // Past the check above the endpoint has no userinfo, so the refusal below
+    // may print it whole.
     if endpoint.to_ascii_lowercase().starts_with("https://") {
         return Ok(false);
     }
@@ -392,6 +404,16 @@ fn resolve_hidden_endpoint_allow_http(flag: &str, endpoint: Option<&str>) -> any
         "{flag} {endpoint:?} is refused: it must be an https:// URL, or an http:// URL whose \
          host is loopback (a fake endpoint on this host)"
     )
+}
+
+/// The endpoint's authority as `(start, end)` byte offsets: after `://` when
+/// there is one, else from the start, up to the first `/`, `?` or `#`.
+fn endpoint_authority(endpoint: &str) -> (usize, usize) {
+    let start = endpoint.find("://").map_or(0, |i| i + 3);
+    let end = endpoint[start..]
+        .find(['/', '?', '#'])
+        .map_or(endpoint.len(), |i| start + i);
+    (start, end)
 }
 
 /// The argument error for `--s3-auth instance-role` combined with an inline
@@ -945,6 +967,34 @@ mod tests {
             for refused in ["http://blob.example.com", "blob.example.com"] {
                 let err = resolve(Some(refused)).expect_err(refused);
                 assert!(err.to_string().contains(flag), "{err}");
+                assert!(err.to_string().contains(refused), "{err}");
+            }
+        }
+    }
+
+    /// An endpoint carrying userinfo is refused whatever its scheme, and no
+    /// refusal prints the userinfo, so a credential written into the URL
+    /// never reaches stderr or a pod log.
+    #[test]
+    fn hidden_endpoint_userinfo_is_refused_without_echoing_it() {
+        for (resolve, flag) in [
+            (
+                resolve_azure_allow_http as fn(Option<&str>) -> anyhow::Result<bool>,
+                "--azure-endpoint",
+            ),
+            (resolve_gcs_allow_http, "--gcs-endpoint"),
+        ] {
+            for endpoint in [
+                "http://user:SECRET@blob.example.com",
+                "http://user:SECRET@127.0.0.1:10000/acct",
+                "https://user:SECRET@blob.example.com",
+                "user:SECRET@blob.example.com",
+            ] {
+                let err = resolve(Some(endpoint)).expect_err(endpoint);
+                let message = format!("{err:#}");
+                assert!(message.contains(flag), "{message}");
+                assert!(message.contains("userinfo"), "{message}");
+                assert!(!message.contains("SECRET"), "{message}");
             }
         }
     }
