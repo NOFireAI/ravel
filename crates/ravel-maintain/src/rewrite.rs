@@ -884,9 +884,11 @@ async fn migrate_bucket_format_scoped(
             return Err(err);
         }
         // Refused for its part-index windows (ADR-3853): no record was
-        // published, so release the claim now rather than hold the bucket's
-        // migration off for the lease, as compaction does for the same refusal
-        // (crate::compact's part-index-refusal arm, issue #4127).
+        // published, though a PartRangeWindow refusal can leave parts that
+        // earlier parts of the same merge already PUT, referenced by no
+        // record, as compaction does. Release the claim now rather than hold
+        // the bucket's migration off for the lease, as compaction does for the
+        // same refusal (crate::compact's part-index-refusal arm, issue #4127).
         Err(err) if err.is_part_index_refusal() => {
             if let Some(guard) = guard
                 && guard.cancelled_at().await.is_none()
