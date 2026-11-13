@@ -9246,8 +9246,10 @@ fn to_cache_error(err: LogFetchError) -> crate::fetcher::CacheFetchError {
 }
 
 /// The inverse of [`to_cache_error`], plus the single-flight channel's own
-/// `LeaderLost` (a leader whose future was cancelled or panicked before
-/// producing a result), which is transient and retryable.
+/// `LeaderLost`, which is transient and retryable. Since issue #4174 a merely
+/// cancelled leader no longer reaches here: the follower re-enters and runs the
+/// fetch itself, so `LeaderLost` now means the leader panicked, or a follower
+/// exhausted the re-entry bound without any attempt resolving.
 fn from_cache_error(
     key: &str,
     err: SingleFlightError<crate::fetcher::CacheFetchError>,
@@ -10761,6 +10763,100 @@ mod whole_object_get_limiter_tests {
             .expect("fetch b found the segment relevant");
         assert_eq!(a.records.len(), 1);
         assert_eq!(b.records.len(), 1);
+    }
+
+    /// Issue #4174, at the log fetcher funnel: when a single-flight leader's
+    /// query is torn down mid-flight (its fetch future dropped), a healthy
+    /// follower in another query must run the fetch itself and return the
+    /// object bytes, not inherit the transient `LogFetchError::Store` that the
+    /// bug surfaced to the client as a 503. Two fetches of one object share one
+    /// cache over a store whose GET this test holds open; the leader parks on
+    /// that GET, is cancelled, and the follower -- parked as a single-flight
+    /// follower -- re-enters, takes over, and runs its own GET.
+    ///
+    /// The store sees exactly two GETs: the cancelled leader's (held, never
+    /// released to a result) and the follower's own. The new re-entry counter
+    /// reads exactly 1.
+    #[tokio::test]
+    async fn cancelled_leader_follower_refetches_rather_than_store_error() {
+        let (fault, seg) = small_object_backend().await;
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let cache: Arc<ravel_cache::Cache<crate::fetcher::CacheFetchError>> =
+            Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+                16 * 1024 * 1024,
+                100,
+                16 * 1024 * 1024,
+            )));
+        let cache_key = ravel_cache::CacheKey::new(TENANT.0, seg.content_hash, 0, seg.object_size);
+
+        let leader_fetcher = LogSegmentFetcher::new(backend.clone()).with_cache(cache.clone());
+        let follower_fetcher = LogSegmentFetcher::new(backend).with_cache(cache.clone());
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        // The leader issues its whole-object GET and parks at the gate; it owns
+        // the single-flight slot for the key.
+        let seg_leader = seg.clone();
+        let query_leader = query.clone();
+        let leader = tokio::spawn(async move {
+            leader_fetcher
+                .fetch_accounted_with_tenant(
+                    &seg_leader,
+                    TENANT,
+                    &query_leader,
+                    &QueryAccounting::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("the leader issues its GET within 30s");
+
+        // The follower registers as a single-flight follower on the leader and
+        // issues no GET of its own yet.
+        let seg_follower = seg.clone();
+        let follower = tokio::spawn(async move {
+            follower_fetcher
+                .fetch_accounted_with_tenant(&seg_follower, TENANT, &query, &QueryAccounting::new())
+                .await
+        });
+        while cache.in_flight_waiters(&cache_key) < 1 {
+            tokio::task::yield_now().await;
+        }
+
+        // Tear the leader's query down mid-flight: its fetch future (and the
+        // held GET) is dropped, which is the cancellation issue #4174 is about.
+        leader.abort();
+        let _ = leader.await;
+
+        // The follower re-enters, becomes the new leader, and runs its own GET:
+        // the second GET the store sees. The cancelled leader's held call stays
+        // in the gate (only a release removes it), so two are held now.
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(2))
+            .await
+            .expect("the follower runs its own GET after the leader was cancelled");
+        assert_eq!(
+            gate.held_count(),
+            2,
+            "exactly the cancelled leader's GET and the follower's own"
+        );
+        for id in gate.held() {
+            gate.release(id);
+        }
+
+        let out = tokio::time::timeout(std::time::Duration::from_secs(30), follower)
+            .await
+            .expect("the follower completes within 30s")
+            .expect("the follower task joins")
+            .expect("the follower returns object bytes, not a transient store error")
+            .expect("the segment is ts-relevant");
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(
+            cache.metrics().single_flight_cancelled_leader_reentries(),
+            1,
+            "the follower re-entered exactly once after the cancelled leader"
+        );
     }
 
     /// Deliverable 4 (RLOG whole-object): a budget too small for one object's

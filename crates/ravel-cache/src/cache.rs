@@ -174,6 +174,20 @@ where
         self.inner.metrics.clone()
     }
 
+    /// How many callers are parked as followers on the in-flight fetch for
+    /// `key`; 0 when none is in flight. Mirrors
+    /// [`TieredCache::in_flight_waiters`](crate::TieredCache::in_flight_waiters)
+    /// so a test can wait for a follower to register deterministically rather
+    /// than racing a sleep.
+    pub fn in_flight_waiters(&self, key: &CacheKey) -> usize {
+        self.single_flight.waiters(key)
+    }
+
+    /// Whether a fetch for `key` is in flight, with or without followers.
+    pub fn is_in_flight(&self, key: &CacheKey) -> bool {
+        self.single_flight.is_in_flight(key)
+    }
+
     /// Current number of resident entries.
     pub fn len(&self) -> usize {
         self.inner.fifo.lock().len()
@@ -402,9 +416,9 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<Bytes, E>> + Send,
     {
-        let (result, role) = self
+        let (result, role, reentries) = self
             .single_flight
-            .run(key, move || async move {
+            .run_with_reentries(key, move || async move {
                 if let Some(bytes) = self.inner.lookup(&key, intent) {
                     return Ok((bytes, true));
                 }
@@ -412,6 +426,14 @@ where
                 Ok((bytes, false))
             })
             .await;
+        // Recorded before `result?`: a follower that re-entered and still ended
+        // in `LeaderLost` (the bound was exhausted) did re-enter, so its work
+        // must be counted even on the error path (issue #4174).
+        if reentries > 0 {
+            self.inner
+                .metrics
+                .record_cancelled_leader_reentries(reentries);
+        }
         let (bytes, from_cache) = result?;
         if role == Role::Follower {
             self.inner.metrics.record_collapse();

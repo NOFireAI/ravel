@@ -22,6 +22,7 @@ pub struct CacheMetrics {
     admissions_rejected_size: AtomicU64,
     evictions: AtomicU64,
     single_flight_collapses: AtomicU64,
+    single_flight_cancelled_leader_reentries: AtomicU64,
     disk_errors_degraded_to_misses: AtomicU64,
     disk_entries_expired_max_age: AtomicU64,
     admission_copies: AtomicU64,
@@ -105,6 +106,30 @@ impl CacheMetrics {
         self.single_flight_collapses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A follower whose single-flight leader was cancelled re-entered the slot
+    /// `n` times (issue #4174). Separate from [`Self::record_collapse`]: a
+    /// re-entry is not a collapse, and a re-entering follower that then took
+    /// over leadership and ran its own fetch records re-entries here but no
+    /// collapse. `n` is the whole re-entry count for one `run`, added at once.
+    /// No `/metrics` surface renders this yet, so it names no metric family.
+    pub(crate) fn record_cancelled_leader_reentries(&self, n: u32) {
+        self.single_flight_cancelled_leader_reentries
+            .fetch_add(u64::from(n), Ordering::Relaxed);
+    }
+
+    /// Followers that lost a cancelled single-flight leader and re-entered the
+    /// slot, summed across calls (issue #4174). One increment per re-entry, so
+    /// a follower that took over leadership after one cancellation reads 1 here
+    /// and nothing on [`Self::record_collapse`]'s counter. Read on its own
+    /// rather than through [`Self::snapshot`] -- like [`Self::admission_copies`],
+    /// because [`CacheMetricsSnapshot`] is built field by field outside this
+    /// crate and a new field would break those constructions. Nothing renders a
+    /// metric family for it yet.
+    pub fn single_flight_cancelled_leader_reentries(&self) -> u64 {
+        self.single_flight_cancelled_leader_reentries
+            .load(Ordering::Relaxed)
+    }
+
     /// A disk-tier read found an entry at its canonical path but discarded it
     /// (short read, bad header, key mismatch, oversize, truncated payload, or
     /// a failed crc32c check) rather than a clean "nothing at this path"
@@ -151,8 +176,9 @@ impl CacheMetrics {
         self.admission_copied_bytes.load(Ordering::Relaxed)
     }
 
-    /// Point-in-time copy of every counter but the two admission-copy ones
-    /// and the per-intent ones above. Not atomic across fields:
+    /// Point-in-time copy of every counter but the two admission-copy ones, the
+    /// per-intent ones, and the cancelled-leader re-entry counter above, each of
+    /// which is read through its own accessor. Not atomic across fields:
     /// concurrent calls may land between two loads, so a snapshot can show
     /// `hits` from a hair later than `misses`. It is a scrape, not a
     /// consistent cut, and nothing correctness-bearing reads it.
