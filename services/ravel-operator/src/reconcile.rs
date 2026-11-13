@@ -12567,6 +12567,42 @@ mod tests {
         );
     }
 
+    /// The shipped Azure example deserializes as a RavelCluster, renders, and
+    /// the shipped operator pod template carries the workload identity label
+    /// its own Azure client needs.
+    #[test]
+    fn shipped_azure_example_renders_and_the_operator_pod_is_labelled() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/k8s/examples/ravelcluster-azure.yaml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+        let cluster: crate::crd::RavelCluster =
+            serde_yaml_ng::from_str(&text).expect("the example deserializes");
+        let spec = cluster.spec;
+        assert!(matches!(
+            spec.storage.backend(),
+            Some(StorageBackend::Azure(_))
+        ));
+        let objects = desired_objects(&spec, "prod", "ravel-system", &azure_ctx())
+            .expect("the example renders");
+        assert_eq!(
+            arg_value(&args_of(&objects.gateway_deployment), "--store").as_deref(),
+            Some("azure")
+        );
+        assert_eq!(desired_tier_service_accounts(&spec, "prod").len(), 4);
+
+        let operator = shipped_operator_deployment();
+        let labels = operator
+            .spec
+            .and_then(|s| s.template.metadata)
+            .and_then(|m| m.labels)
+            .unwrap_or_default();
+        assert_eq!(
+            labels.get(AZURE_WORKLOAD_IDENTITY_USE_LABEL).map(String::as_str),
+            Some("true")
+        );
+    }
+
     #[test]
     fn azure_qualify_hash_moves_on_account_container_image_and_qualify_client_id() {
         let base = qualify_job_input_hash(&azure_spec(), None);
