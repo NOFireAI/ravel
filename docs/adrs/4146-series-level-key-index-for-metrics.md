@@ -379,8 +379,10 @@ Index bytes per part, before zstd (the deltas of hashed keys barely
 compress):
 
 - `series_label`: `D x 10 + N_s x L x b_s`. A posting of `p` keys has a
-  mean delta of `2^64 / p`, so `b_s` is about `(64 - log2 p) / 7` rounded
-  up: 7 for `p` from 2^15 to 2^22, 8 to 9 for small postings.
+  mean delta of `2^64 / p`, so `b_s` is about `ceil((64 - log2 p) / 7)`:
+  7 for 2^15 <= `p` < 2^22 (exactly 6 at `p` = 2^22), 8 for 2^8 <= `p` <
+  2^15, 9 for 2 <= `p` < 2^8, and 10 for a posting of one element, whose
+  one delta from -1 can be as large as 2^64 - 1.
 - `series_class`: `N_s x (8 + 1 + 2)`, for `C` under 16,384.
 - `class_objects`: one entry of about 11 B per (class, entry); with
   disjoint shard classes that is `E x 11`.
