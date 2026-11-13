@@ -76,4 +76,8 @@ fi
 
 change gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --project "$PROJECT" \
   --member "serviceAccount:$SA" --role roles/storage.objectAdmin --format='value(etag)' >/dev/null
-echo "setup-gcp: $SA has roles/storage.objectAdmin on gs://$BUCKET"
+if [ "$DRY_RUN" = 1 ]; then
+  echo "setup-gcp: dry run, nothing granted: $SA would get roles/storage.objectAdmin on gs://$BUCKET"
+else
+  echo "setup-gcp: $SA has roles/storage.objectAdmin on gs://$BUCKET"
+fi
