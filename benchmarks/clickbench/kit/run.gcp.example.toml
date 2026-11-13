@@ -26,6 +26,8 @@ ravel_cli_sha256 = "FILL-IN"
 
 # Phases box/run.sh runs, in order (see run.example.toml): benchmark is
 # required; the published ClickBench rows carry benchmark and concurrent.
+# perf is refused on GCP (as is perf_record = true): the box installs no
+# perf.
 phases = ["benchmark", "concurrent"]
 
 # Where the box runs. The image must be dnf-based (box/run.sh installs wget,
@@ -42,8 +44,9 @@ image_project = "rocky-linux-cloud"
 # The box's identity, and where every run's in/ and out/ live:
 # gs://<bucket>/<prefix>/runs/<run-id>/. setup-gcp.sh creates both and grants
 # the account objectAdmin on the bucket. Each run's store bucket is
-# <store_bucket_prefix>-<run id>, created by launch-gcp.sh in the region and
-# removed by teardown-gcp.sh.
+# <store_bucket_prefix>-<run id without its "clickbench-" head, lowercased>,
+# at most 63 characters, created by launch-gcp.sh in the region and removed
+# by teardown-gcp.sh.
 service_account = "ravel-clickbench@FILL-IN-PROJECT.iam.gserviceaccount.com"
 bucket = "FILL-IN-RESULTS-BUCKET"
 prefix = "clickbench-kit"
@@ -69,6 +72,6 @@ prereg = "benchmarks/clickbench/kit/runs/FILL-IN/prereg.toml"
 
 # Optional, as in run.example.toml: window_hours, audit_text,
 # expected_statements, fold_min_entry_ratio, query_timeout_s, healthz_phases,
-# the concurrent_* and q29_probe_* phase keys, perf_record, and
+# the concurrent_* and q29_probe_* phase keys, and
 # server_flags_a (refused when it repeats a kit-set flag or names an --s3-*
 # flag, which --store gcs refuses).

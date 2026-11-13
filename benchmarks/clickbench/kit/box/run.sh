@@ -606,8 +606,11 @@ bootstrap_release() {
     "$BIN_DIR/$name-$SHA" --help >"$dir/$name.help" 2>&1 \
       || { say "$name --help failed: $(head -c 300 "$dir/$name.help")"; return 1; }
   done
-  v_server="$("$BIN_DIR/ravel-server-$SHA" --version 2>&1 | head -c 300)" || true
-  v_cli="$("$BIN_DIR/ravel-cli-$SHA" --version 2>&1 | head -c 300)" || true
+  # To a file first: a pipe into head could end the binary early.
+  "$BIN_DIR/ravel-server-$SHA" --version >"$dir/ravel-server.version" 2>&1 || true
+  "$BIN_DIR/ravel-cli-$SHA" --version >"$dir/ravel-cli.version" 2>&1 || true
+  v_server="$(head -c 300 "$dir/ravel-server.version")"
+  v_cli="$(head -c 300 "$dir/ravel-cli.version")"
   printf 'release %s (published binaries, nothing built on the box)\n' "$RELEASE_TAG" >"$STAMPS/toolchain"
   printf '{"source": "release", "tag": %s, "url": %s, "arch": %s, "server_sha256": %s, "cli_sha256": %s, "server_version_output": %s, "cli_version_output": %s}\n' \
     "$(json_str "$RELEASE_TAG")" "$(json_str "$RELEASE_URL/$RELEASE_TAG")" "$(json_str "$arch")" \
@@ -1132,18 +1135,20 @@ do_declare() {
 }
 
 # check_declared (GCS runs): typed-attr-column show must report the tenant's
-# declared columns, as many as the mapping has entries; the count is stamped.
+# declared columns, as many as the mapping declares (kit.py mapping-columns:
+# every entry but an f64 one, which typed-attr-column set skips); the count
+# is stamped.
 check_declared() {
   local n want
   "$CLI_BIN" "${STORE_ARGS[@]}" --tenant-hash-unkeyed typed-attr-column show "$TENANT" \
     >"$KIT/declared.out" 2>&1 || { say "typed-attr-column show failed: $(head -c 300 "$KIT/declared.out")"; return 1; }
   n="$(sed -n 's/^tenant .* declares \([0-9][0-9]*\) typed attribute column(s).*$/\1/p' "$KIT/declared.out")"
   [[ "$n" =~ ^[0-9]+$ ]] || { say "typed-attr-column show reports no declared column count: $(head -c 300 "$KIT/declared.out")"; return 1; }
-  want="$(grep -c '^\[\[' "$MAPPING")"
+  want="$(kit_py mapping-columns "$MAPPING")" || return 1
   mkdir -p "$STAMPS"
-  printf '{"tenant": %s, "count": %s, "mapping_entries": %s}\n' "$(json_str "$TENANT")" "$n" \
+  printf '{"tenant": %s, "count": %s, "mapping_columns": %s}\n' "$(json_str "$TENANT")" "$n" \
     "$(json_num "$want")" >"$STAMPS/declared_columns"
-  [ "$n" = "$want" ] || { say "the tenant declares $n columns, the mapping has $want entries"; return 1; }
+  [ "$n" = "$want" ] || { say "the tenant declares $n columns, the mapping declares $want"; return 1; }
 }
 
 # stamp_fetch_policy (GCS runs): the logs fetch policy every benchmark server

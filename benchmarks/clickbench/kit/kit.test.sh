@@ -5175,6 +5175,25 @@ server_flags_a = ["--s3-endpoint", "http://x"]' 'which --store gcs refuses'
 gcp_run_case "a 20 GB boot disk" '/^shards = /i\
 boot_disk_gb = 20' 'boot_disk_gb must be a whole number of at least 50'
 gcp_run_case "a missing release digest" '/^ravel_cli_sha256 = /d' 'missing required key(s): ravel_cli_sha256'
+# Catches: a GCP run naming the perf phase accepted at launch and failing on
+# the box, which installs no perf, after the load and the benchmark.
+gcp_run_case "phase perf under cloud gcp" 's/^phases = .*/phases = ["benchmark", "perf"]/;/^shards = /i\
+perf_record = true' 'phase perf (and perf_record = true) is not supported on cloud gcp'
+gcp_run_case "perf_record true under cloud gcp" '/^shards = /i\
+perf_record = true' 'phase perf (and perf_record = true) is not supported on cloud gcp'
+
+# Catches: the declared-column check counting an f64 mapping entry, which
+# typed-attr-column set skips, so a correct declaration fails after the load.
+printf '%s\n' '[ts_column]' 'column = "EventTime"' '[[resource_attribute]]' 'key = "A"' 'type = "i64"' \
+  '[[attribute]]' 'key = "B"' 'type = "f64"  # skipped' '[[attribute]]' 'key = "C"' 'type = "str"' \
+  >"$TMP/mapping-f64.toml"
+mc="$(python3 "$KIT_SRC/lib/kit.py" mapping-columns "$TMP/mapping-f64.toml")"
+mc_hits="$(python3 "$KIT_SRC/lib/kit.py" mapping-columns "$REPO_ROOT/benchmarks/clickbench/hits.mapping.toml")"
+if [ "$mc" = 2 ] && [ "$mc_hits" = 104 ]; then
+  pass "mapping-columns counts every entry but an f64 one"
+else
+  fail "mapping-columns" "fixture '$mc' (want 2), hits.mapping.toml '$mc_hits' (want 104)"
+fi
 
 # Catches: a page token sent raw (a base64 token holds + / =), the last page
 # read as having another, or a key listed twice counted twice.
@@ -5481,7 +5500,7 @@ t = p["store_footprint"]["tenants"]
 want(list(t) == ["0123abcd"] and t["0123abcd"]["classes"]["l/l0"]["objects"] == 100
      and t["0123abcd"]["classes"]["l/c"]["objects"] == 100, "store_footprint %r" % t)
 want(p["store_footprint"]["sys"]["sys/qualify"]["objects"] == 1, "sys/qualify in the footprint")
-want(p["declared_columns"] == {"tenant": "clickbench-v4", "count": 104, "mapping_entries": 104},
+want(p["declared_columns"] == {"tenant": "clickbench-v4", "count": 104, "mapping_columns": 104},
      "declared_columns %r" % p["declared_columns"])
 want(p["fetch_policy"]["policy"] == "cost-based" and p["fetch_policy"]["policy_source"] == "default"
      and p["fetch_policy"]["logs"] == 43, "fetch_policy %r" % p["fetch_policy"])
@@ -5494,12 +5513,17 @@ want(r["totals"]["answered"] == 43, "answered %r" % r["totals"]["answered"])
 print("; ".join(bad))
 PY
 )"
+# The listing goes to a file first: `tar | grep -q` under pipefail fails when
+# grep exits before GNU tar finishes writing (SIGPIPE), whatever the tarball
+# holds.
+tar -tzf "$GOUT/evidence.tgz" >"$TMP/gcp-evidence.list" 2>&1 || echo "tar exit $?" >>"$TMP/gcp-evidence.list"
 if [ -z "$check" ] && [ "$(wc -l <"$STUB_DIR/smoke-calls" | tr -d ' ')" = 1 ] \
-  && tar -tzf "$GOUT/evidence.tgz" | grep -q '^qualify.out$' \
-  && tar -tzf "$GOUT/evidence.tgz" | grep -q '^object-counts/after-declare.json$'; then
+  && grep -qx 'qualify.out' "$TMP/gcp-evidence.list" \
+  && grep -qx 'object-counts/after-declare.json' "$TMP/gcp-evidence.list" \
+  && ! grep -q '^tar exit' "$TMP/gcp-evidence.list"; then
   pass "a GCP results.json carries the store, release, footprint, declared-column and fetch-policy stamps"
 else
-  fail "gcp provenance" "$check"
+  fail "gcp provenance" "${check:-stamps fine}; smoke calls $(cat "$STUB_DIR/smoke-calls" 2>/dev/null | wc -l | tr -d ' '); evidence: $(grep -c . "$TMP/gcp-evidence.list") entries, $(grep '^tar exit' "$TMP/gcp-evidence.list")"
 fi
 
 # Catches: fetch-gcp.sh printing a run instead of judging it, or a ClickBench
@@ -5614,7 +5638,7 @@ else
 fi
 # Catches: a tenant whose declaration did not take measured anyway.
 if gcp_box_fails gbox-declared declared STUB_DECLARED=42 \
-  && grep -q 'the tenant declares 42 columns, the mapping has 104 entries' "$TMP/gbox-declared/kit/run.log"; then
+  && grep -q 'the tenant declares 42 columns, the mapping declares 104' "$TMP/gbox-declared/kit/run.log"; then
   pass "a declared column count other than the mapping's fails the GCP box at step declared"
 else
   fail "gcp declared" "see above"

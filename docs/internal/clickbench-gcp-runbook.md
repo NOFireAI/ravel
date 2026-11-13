@@ -52,7 +52,8 @@ level. Pass `--dry-run` to print the changes first.
 
 Copy `benchmarks/clickbench/kit/run.gcp.example.toml`; every key is described
 there. `runs/gcp-v0.32.0/run.toml` is the file the v0.32.0 run used. Take the
-two digests from the release's `SHA256SUMS`.
+two digests from the release's `SHA256SUMS`. The `perf` phase is refused on
+GCP at `check-run`, before a box exists, because the box installs no perf.
 
 The run file names a `prereg.toml`. It holds one `[figures]` table with every
 figure `kit.py prereg` judges, each an exact value or an inclusive
@@ -83,7 +84,9 @@ Read every command the dry run prints. The real launch:
    results bucket;
 4. uploads `kit.tgz`, `kit.sha256` and the resolved `run.toml` to
    `gs://<bucket>/<prefix>/runs/<run-id>/in/`;
-5. creates the store bucket `<store_bucket_prefix>-<run id>` and grants the
+5. creates the store bucket `<store_bucket_prefix>-<suffix>`, where the
+   suffix is the run id without its `clickbench-` head, lowercased (at most
+   63 characters in all), and grants the
    account objectAdmin on it;
 6. creates the instance and grants the account
    `roles/compute.instanceAdmin.v1` on that one instance, so the box can delete
