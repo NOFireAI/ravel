@@ -12,7 +12,7 @@
 
 use proptest::prelude::*;
 use ravel_bench::codecs::{
-    Alp, AlpRd, AlpVectorized, ByteSplitZstd, Chimp128, GcdDeltaFor, RawF64, ValueCodec,
+    Alp, AlpRd, AlpVectorized, ByteSplitZstd, Chimp128, Dexor, GcdDeltaFor, RawF64, ValueCodec,
 };
 
 fn bits(values: &[f64]) -> Vec<u64> {
@@ -41,6 +41,7 @@ fn assert_roundtrip_all(values: &[f64]) {
     assert_roundtrip(&RawF64, values);
     assert_roundtrip(&AlpVectorized, values);
     assert_roundtrip(&AlpRd, values);
+    assert_roundtrip(&Dexor, values);
 }
 
 /// A grab bag of bit patterns that stress every special case: signed zeros,
@@ -102,6 +103,7 @@ proptest! {
         assert_roundtrip(&RawF64, &values);
         assert_roundtrip(&AlpVectorized, &values);
         assert_roundtrip(&AlpRd, &values);
+        assert_roundtrip(&Dexor, &values);
     }
 
     // Integer- and fixed-decimal streams are the paths ALP and GCD-FOR model
@@ -122,6 +124,7 @@ proptest! {
         assert_roundtrip(&RawF64, &values);
         assert_roundtrip(&AlpVectorized, &values);
         assert_roundtrip(&AlpRd, &values);
+        assert_roundtrip(&Dexor, &values);
     }
 
     // A decimal stream salted with occasional special values (NaN, -0.0, inf):
@@ -150,6 +153,7 @@ proptest! {
         assert_roundtrip(&GcdDeltaFor, &values);
         assert_roundtrip(&AlpVectorized, &values);
         assert_roundtrip(&AlpRd, &values);
+        assert_roundtrip(&Dexor, &values);
     }
 
     // Streams built from a tiny alphabet of close values exercise Chimp's
@@ -170,6 +174,7 @@ proptest! {
         assert_roundtrip(&RawF64, &values);
         assert_roundtrip(&AlpVectorized, &values);
         assert_roundtrip(&AlpRd, &values);
+        assert_roundtrip(&Dexor, &values);
     }
 
     // Corrupt/truncated input must never panic: for arbitrary bytes and an
@@ -186,6 +191,7 @@ proptest! {
         let _ = RawF64.decode(&bytes, count);
         let _ = AlpVectorized.decode(&bytes, count);
         let _ = AlpRd.decode(&bytes, count);
+        let _ = Dexor.decode(&bytes, count);
     }
 
     // Truncating a valid encoding must be caught as a typed error (never a
@@ -196,7 +202,7 @@ proptest! {
         values in proptest::collection::vec(any_f64(), 2..200),
         cut in 1usize..40,
     ) {
-        for codec_kind in 0..7u8 {
+        for codec_kind in 0..8u8 {
             let encoded = match codec_kind {
                 0 => Chimp128.encode(&values),
                 1 => ByteSplitZstd.encode(&values),
@@ -204,7 +210,8 @@ proptest! {
                 3 => Alp.encode(&values),
                 4 => GcdDeltaFor.encode(&values),
                 5 => AlpVectorized.encode(&values),
-                _ => AlpRd.encode(&values),
+                6 => AlpRd.encode(&values),
+                _ => Dexor.encode(&values),
             };
             if cut >= encoded.len() {
                 continue;
@@ -217,7 +224,8 @@ proptest! {
                 3 => Alp.decode(truncated, values.len()),
                 4 => GcdDeltaFor.decode(truncated, values.len()),
                 5 => AlpVectorized.decode(truncated, values.len()),
-                _ => AlpRd.decode(truncated, values.len()),
+                6 => AlpRd.decode(truncated, values.len()),
+                _ => Dexor.decode(truncated, values.len()),
             };
             // RawF64 loses exactly `cut` bytes so the length can never match.
             if codec_kind == 2 {
@@ -228,6 +236,77 @@ proptest! {
             if let Ok(v) = decoded {
                 prop_assert_eq!(v.len(), values.len());
             }
+        }
+    }
+}
+
+// DeXOR's decimal pipeline keys off the previous value's prefix and the
+// previous tail, so these streams walk at a fixed number of decimals and
+// interleave hard floats, which switch it between the main pipeline and
+// the exception path mid-stream.
+fn hard_float() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        Just(f64::NAN),
+        Just(f64::from_bits(0x7FF0_0000_0000_0001)), // signalling NaN
+        Just(f64::from_bits(0x7ff0_0000_0000_0002)), // Prometheus stale marker
+        Just(f64::from_bits(0xFFF8_DEAD_BEEF_CAFE)),
+        Just(-0.0f64),
+        Just(0.0f64),
+        Just(f64::INFINITY),
+        Just(f64::NEG_INFINITY),
+        Just(f64::from_bits(1)),
+        Just(f64::from_bits(0x000F_FFFF_FFFF_FFFF)),
+        Just(f64::MAX),
+        Just(f64::MIN),
+        Just(0.1f64 + 0.2),
+        Just(1.000_000_000_000_000_2f64),
+        any::<u64>().prop_map(f64::from_bits),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn dexor_decimal_walk_with_hard_floats_roundtrip(
+        start in -10_000_000i64..10_000_000,
+        steps in proptest::collection::vec(-500i64..500, 1..400),
+        places in 0u32..7,
+        specials in proptest::collection::vec((any::<proptest::sample::Index>(), hard_float()), 0..10),
+    ) {
+        let scale = 10i64.pow(places) as f64;
+        let mut level = start;
+        let mut values: Vec<f64> = steps
+            .iter()
+            .map(|s| {
+                level += s;
+                level as f64 / scale
+            })
+            .collect();
+        for (idx, v) in specials {
+            let i = idx.index(values.len());
+            values[i] = v;
+        }
+        assert_roundtrip(&Dexor, &values);
+    }
+
+    // A valid DeXOR stream with one bit flipped, then optionally truncated,
+    // decodes to an error or to `count` values, and never panics.
+    #[test]
+    fn dexor_flipped_or_truncated_stream_never_panics(
+        values in proptest::collection::vec(prop_oneof![
+            hard_float(),
+            (-100_000i64..100_000).prop_map(|i| i as f64 / 100.0),
+        ], 1..200),
+        flip in any::<proptest::sample::Index>(),
+        cut in 0usize..16,
+    ) {
+        let mut encoded = Dexor.encode(&values);
+        let bit = flip.index(encoded.len() * 8);
+        encoded[bit / 8] ^= 0x80 >> (bit % 8);
+        let kept = encoded.len().saturating_sub(cut);
+        if let Ok(decoded) = Dexor.decode(&encoded[..kept], values.len()) {
+            prop_assert_eq!(decoded.len(), values.len());
         }
     }
 }
