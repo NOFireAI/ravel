@@ -1146,7 +1146,7 @@ impl ByteChunk {
         let at = self.len;
         for (column, source) in sources.iter().enumerate() {
             let layout = self.types[column].1;
-            if at % 8 == 0 {
+            if at.is_multiple_of(8) {
                 self.reserve(column, VALIDITY, at / 8 + 1);
                 self.buffers[column][VALIDITY].push(0u8);
             }
@@ -2758,8 +2758,10 @@ mod tests {
             .collect()
     }
 
+    type ByteRow = (Option<i64>, Option<i32>, Option<Vec<u8>>);
+
     /// Every row of `columns`, as integers and bytes, sorted.
-    fn rows_of(columns: &[ArrayRef]) -> Vec<(Option<i64>, Option<i32>, Option<Vec<u8>>)> {
+    fn rows_of(columns: &[ArrayRef]) -> Vec<ByteRow> {
         use datafusion::arrow::datatypes::{Int32Type, Int64Type};
 
         let bytes: Vec<Option<Vec<u8>>> = {

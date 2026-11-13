@@ -828,7 +828,7 @@ mod tests {
                 descriptor_need: 3,
             })
         );
-        assert!((120_000 - 88_000) / 2 < BUCKET_SPILL_MIN_CHUNK_BYTES);
+        const { assert!((120_000 - 88_000) / 2 < BUCKET_SPILL_MIN_CHUNK_BYTES) };
         assert_eq!(
             derive(44_000, 120_000),
             Ok(BucketSpillTuning {
