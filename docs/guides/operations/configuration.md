@@ -345,15 +345,18 @@ digits; the container name is lowercase letters, digits and `-`.
 ravel-server --store azure --azure-account ravelprod --azure-container ravel-data ...
 ```
 
-No Ravel flag carries an Azure credential. The store reads only these
-variables of the standard `AZURE_*` environment, and no other:
+No Ravel flag carries an Azure credential. Of the standard `AZURE_*`
+environment the store reads only these variables; the managed-identity path
+also reads the platform's own `IDENTITY_HEADER` variable:
 
 - On AKS, use workload identity. The AKS webhook injects
   `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`. Give
   the identity a role that can read, write, list and delete blobs in the
   container (for example `Storage Blob Data Contributor` on the container).
 - On a VM or node with a managed identity and none of the variables above
-  set, the identity is taken from the instance metadata service.
+  set, the identity is taken from the instance metadata service. This path
+  sends the platform's `IDENTITY_HEADER` variable, when set, as the
+  `x-identity-header` request header.
 - `AZURE_STORAGE_ACCOUNT_KEY` signs with the account's shared key, where you
   choose one.
 
@@ -373,7 +376,8 @@ reports into the same store metrics (`ravel_store_calls_total`,
 Azure answers a suffix range with the whole blob, so a read of the last `n`
 bytes of an object is two requests, a HEAD for the length and ETag and then a
 ranged GET conditional on that ETag. It counts one `get` call and two
-attempts, where S3 and GCS spend one request. The server refuses to start on a
+attempts, more only when the blob is replaced during the read, at most three
+rounds, where S3 and GCS spend one request. The server refuses to start on a
 container that has not been qualified, as on S3: qualify it first (see
 [qualify the store](deployment.md#qualify-the-store)). Its backend identity is
 `az://<account>/<container>`. On Kubernetes the operator runs the server on
@@ -389,8 +393,13 @@ environment variable:
   an account or encryption-scope setting made outside Ravel;
 - `--require-bucket-protection`. Ravel sends no bucket-protection probe to
   Azure, so a server asked to require protection refuses to start rather than
-  start unverified. Configure soft delete, versioning and immutability on the
-  account and container yourself.
+  start unverified. Configure the account and container yourself: blob
+  versioning paired with a lifecycle management rule that deletes previous
+  versions, soft delete with a bounded retention period, and an immutability
+  policy only where it does not refuse the deletes that retention and erasure
+  need. See
+  [Required bucket configuration](../../object-store-contract.md#required-bucket-configuration-adr-0064-7-adr-0072-decision-3)
+  in the store contract.
 
 A flag left at its default is not given: `--s3-request-stored-checksum`
 defaults to on and is ignored under `--store azure`. Unset any `RAVEL_S3_*` or
@@ -398,9 +407,13 @@ defaults to on and is ignored under `--store azure`. Unset any `RAVEL_S3_*` or
 server.
 
 A Parquet credential profile of kind `azure` whose account and container are
-Ravel's own is refused at config time, as one on Ravel's own S3 bucket is
-under `--store s3`. The account is compared without regard to case, since it
-becomes a host name.
+Ravel's own is refused, as one on Ravel's own S3 bucket is under
+`--store s3`. The refusal fires when a statement or DDL opens the profile's
+store for that container, not at startup. The account is compared without
+regard to case, since it becomes a host name. A profile whose account is not
+a valid storage account name (3 to 24 lowercase letters and digits, after
+lowercasing) is refused for every container while Ravel runs on
+`--store azure`, since such a name cannot be compared with Ravel's own.
 
 ## Storage credential roles
 
