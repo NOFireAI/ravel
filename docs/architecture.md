@@ -393,9 +393,11 @@ an account key). Both refuse the S3-only control-plane flags (`--s3-*`,
 than ignoring them, and an Azure server also refuses the `--gcs-*` flags and
 an account with hierarchical namespace enabled.
 
-On Kubernetes the operator makes that run itself. The operator supports
-`--store s3` only; a GCS deployment runs the qualification and the servers
-itself (ADR-3456 decision D8):
+On Kubernetes the operator makes that run itself. The operator renders
+`--store s3` for a `RavelCluster` that sets `storage.s3` and `--store azure`
+for one that sets `storage.azure` (ADR-4158 decision D11). It does not
+support GCS; a GCS deployment runs the qualification and the servers itself
+(ADR-3456 decision D8):
 
 - Before it creates any serving Deployment for a `RavelCluster`, it applies a
   one-shot `<cluster>-qualify` Job that runs `ravel-cli store qualify`
