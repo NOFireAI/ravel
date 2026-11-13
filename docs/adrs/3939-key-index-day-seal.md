@@ -215,7 +215,8 @@ matter, and the week merge is designed and gated on a pre-registered band.
 
 Rows W1 to W8 and F1 to F3 in the multi-day amendment extend this table.
 A5 and A7 run on the multi-day states, and A7 at a reduced rate per day,
-as the harness-state amendment states.
+as the harness-state amendment states. The figures as measured, and the
+rows no run measured, are in the D3' results amendment.
 
 | check | target | miss | source |
 |---|---|---|---|
@@ -463,7 +464,8 @@ pairs for a logs day, over the 2 GB band; #4018 gives it the pair budget.
 
 W2 is measured on the C1 binary, W5 and F2 on the 30-day state at a
 reduced rate per day, and F3 on both the 7-day and the 30-day state, as the
-harness-state amendment states.
+harness-state amendment states. The figures as measured, and the rows no
+run measured, are in the D3' results amendment.
 
 | check | target | miss | source |
 |---|---|---|---|
@@ -636,3 +638,117 @@ by cherry-pick, since W2's figures read it. D3' launches only after H1c
 lands. Then each run's verdict is judged as the harness reports it, and
 the only figures still unsupported are `SlowDown` and the per-day-part
 leaf GETs, each with its reason.
+
+## Amendment (issue #3939, D3' results): Stage 2 figures as measured
+
+<!-- amendment-applies: sections="Acceptance (pre-registered; a figure outside its band is a miss)|Amendment (issue #3939, multi-day lookups): the carry source, retention under leaf-bearing parts, and the week merge gate" pointer="D3' results amendment" -->
+
+Date: 2026-11-13. Records what D3' measured against the two acceptance
+tables, on real S3 (c6a.4xlarge, us-east-1), pre-registered in comment
+6776308661. Five runs, each with one binary:
+
+| run | binary | states | run id | results |
+|---|---|---|---|---|
+| A | main 74e178d44 | day_parts_7, retired_hour | investigations-20261111T104550Z-7433-3466 | comment 6804823490 |
+| B | main 5879b84c5 | day_parts_30 | investigations-20261112T070843Z-93136-8359 | comment 6824402149 |
+| C | `measure/3939-w2` 13d028489 | day_parts_7, retired_hour | investigations-20261111T195349Z-9351-17333 | comment 6815261581 |
+| D | main 2e0b6fc3b | day_parts_7, retired_hour | investigations-20261112T130239Z-15161-30336 | comment 6847040976 |
+| E | main 2e0b6fc3b | day_parts_7 (3 cold runs), retired_hour | investigations-20261113T090412Z-29090-1615 | comment 6861013974 |
+
+**A1/W1 and A2 are read on the sealing fold.** The owner chose to record
+these figures as run A measured them, with no rerun. Runs D and E, on a
+later binary, reproduced every count exactly (run D's peak RSS 0.83 GB).
+In run A the advance's tail hour opened a new UTC day, so the advancing
+fold sealed the previous day and started a tail. That is not the
+pre-registered "advance at a full-day tail". The fold paid one day's build
+plus the tail's, by the pair rule:
+- logs: 104,166,625 `request_id` pairs at a share of 4,000,000, so 25 + 2 =
+  27 passes against a band of 26 (a miss);
+- spans: 20,833,325 pairs at a share of 8,000,000, so 3 + 1 = 4 passes
+  against a band of 3 (a miss).
+Every other build in the run follows the same rule: the 7-day build
+(175 = 7 x 25, 21 = 7 x 3) and the refold (25 and 3). The in-band
+figures stand:
+- leaf bytes: 1.34 GB for logs (band 1.4 GB) and 0.22 GB for spans (band
+  0.25 GB);
+- fold peak RSS: 0.84 GB (A1 band 2.0 GB, W1 band 1.2 GB).
+A same-day advance at a full-day tail would read 26 and 3 by the same
+rule, but no run measured one.
+
+**Rows measured and in band.**
+- A3 (runs A, D and E): 0 sealed-day leaf PUTs, 0 previous-leaf GETs.
+- A5 and W4 (runs A, D and E): 875 leaf GETs, 7 of 7 days covered (band
+  882).
+- A6, and W4 with F1 (runs A and D): every key-set statement's p50 is within
+  ADR-3692 row 18's bound; logs `request_id` IN 100 reads 3.05 s against
+  11.98 s unfolded in run A, and 3.02 s against 11.88 s in run D.
+- W6 (runs A, D and E): 14 leaf GETs (band 14).
+- W7 (runs A, D and E): 4 leaf GETs, 2 parts covered.
+- A7 and W5 (run B, reduced rate, 26 slices per day part, so a per-part
+  bound of 126 by the harness-state amendment): 3,720 leaf GETs (band
+  3,780), 30 of 30 days covered, 0 tier-1 probe GETs,
+  `parts_beyond_ceiling` 0.
+- F2 (run B): p50 4.03 s against 29.07 s unfolded (band 2 x).
+- F3 (run B): per-day bound 139.
+
+**Not measured in any run.**
+- F3's per-part leaf GETs and `SlowDown` count, and W6's round trips: the
+  query stats carry no per-part breakdown and no `SlowDown` count. Run B's
+  3,720 GETs over 30 parts is 124 per part on average; no part's own count
+  was measured.
+- A4's switch-off partition is unit-tested only. The test is D1's
+  `day_sealed_folds_of_one_entry_set_write_identical_heads` in
+  crates/ravel-catalog/src/fold.rs.
+- W2. The owner decided W2 stays unit-tested. Run C's retired_hour folds
+  were no-ops, so W2 was not measured. The cause is in the fold, not in
+  W2: a fold whose watermark does not advance returns before the
+  retention-frontier reconcile, and run C's folds ran in the same ingest
+  hour as the last advance (fold.rs, the `advance_to`/`held_open` match).
+  The unit test is `a_dirty_sealed_day_carries_its_own_previous_leaves`:
+  W2 in miniature, on an erasure trigger, since after R2 a tombstone
+  retires the hour instead.
+
+**A4, read.** A4 says two folds of the same entry set produce
+byte-identical HEADs. That holds for two folds under the same folder id
+and clock, which is what
+`day_sealed_folds_of_one_entry_set_write_identical_heads` and
+`folds_that_retire_hours_write_identical_heads` assert. Two processes in a
+run differ in `folder_id` and `created_unix_ns`. So the harness compares
+`head_digest`, the blake3 of the HEAD with both cleared. A run measures A4
+only when its refold reads the entry set its fold wrote. Run A's refold
+advanced the watermark by two hours (498448 to 498450) and re-encoded the
+last day, so its two digests compare different HEADs and do not measure
+A4. Run D's refold did the same, from 498475 to 498476. A refold that
+does not advance returns the HEAD it read, so a run cannot measure A4
+either way, and A4 rests on the two unit tests.
+
+**W3 (run E), measured and in band.** The tombstoned hour was 498312,
+hour 0 of the oldest day. The retention fold advanced its watermark from
+498496 to 498497, reconciled 27 frontier hours, and wrote 0 part PUTs and
+0 leaf PUTs; `retired_hours` read [498312], and a resolve over that hour
+returned 0 segments on either tier. The drop fold, after every hour of the
+day was tombstoned, advanced from 498497 to 498498, reconciled 50 frontier
+hours, and wrote 0 part PUTs and 0 leaf PUTs; 0 parts held the hour
+afterwards, so the part left HEAD. Run D did not run retired_hour: its
+deadline guard needed up to 6,904 s with 6,526 s left of run.max_minutes
+590, because the wait for the next ingest hour came to nearly a full hour
+and retired_hour had no step estimate of its own (the default is 30
+minutes). Run E cut the statement passes to 3 cold runs and set that
+estimate to 15 minutes, so its statement timings are not cited.
+
+**W8 is unit-tested only.** The refold in the harness's retire step runs
+in the same ingest hour as the retention fold, so it returns the HEAD it
+read and its `retired_hours` matches by construction. In run E each refold
+started 20 and 28 s after its retention fold started, left the watermark
+where it was (498497, then 498498), and returned in under a second with
+the same digest. The tests are
+`folds_that_retire_hours_write_identical_heads` and
+`fold_report_retired_hours_is_the_heads_union` in
+crates/ravel-catalog/src/fold.rs.
+
+**Retention lag.** A retention tombstone is observed by the next fold that
+advances its watermark. A fold that does not advance does not observe it.
+In production a fold advances at least once an hour, so decision 6's
+"first fold that observes the tombstone" can come up to an hour after the
+tombstone. The harness waits for the next ingest hour before its retention
+fold for this reason (#4139).
