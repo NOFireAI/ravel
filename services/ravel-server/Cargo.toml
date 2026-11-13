@@ -299,6 +299,12 @@ heap-profiling = ["tikv-jemallocator/profiling"]
 # production configuration can send unsigned GCS requests.
 gcs-test-endpoint = ["ravel-object-store/test-support"]
 
+# Test-only: `--azure-endpoint` also skips request authentication, which the
+# fake Azure endpoint needs (ADR-4158 decision D3). The dev-dependency on this
+# crate below turns it on for test builds; no published build enables it, so
+# no production configuration can send unsigned Azure requests.
+azure-test-endpoint = ["ravel-object-store/test-support"]
+
 # Test-only: exposes `ingest_hold::IngestHoldGate::force_for_test` to the
 # integration test binaries under `tests/`, which force the congested flag
 # directly (ADR-3718) rather than drive a real flush backlog. The
@@ -376,11 +382,17 @@ stats_alloc = "0.1.10"
 # every stored object, so the scan for a raw address reads section bodies,
 # not their compressed form. Already in the lockfile through ravel-segment.
 zstd = { workspace = true }
-# Test-only: tests/gcs_store_e2e.rs runs the server on the fake GCS endpoint
-# (`ravel_object_store::gcs::fake`), which needs unsigned requests; this crate's
-# own `gcs-test-endpoint` feature is what lets `--gcs-endpoint` skip them.
+# Test-only: tests/gcs_store_e2e.rs and tests/azure_store_e2e.rs run the server
+# on the fake GCS and Azure endpoints (`ravel_object_store::gcs::fake`,
+# `ravel_object_store::azure::fake`), which need unsigned requests; this
+# crate's own `gcs-test-endpoint` and `azure-test-endpoint` features are what
+# let `--gcs-endpoint` and `--azure-endpoint` skip them.
 ravel-object-store = { workspace = true, features = ["test-support"] }
-ravel-server = { path = ".", features = ["gcs-test-endpoint", "ingest-hold-test-support"] }
+ravel-server = { path = ".", features = [
+    "azure-test-endpoint",
+    "gcs-test-endpoint",
+    "ingest-hold-test-support",
+] }
 
 [lints]
 workspace = true

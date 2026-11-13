@@ -1771,6 +1771,9 @@ pub fn build_sql_state_with_parquet(
             Some(crate::config::RavelBucket::Gcs { bucket, endpoint }) => {
                 stores.refusing(ravel_sql::RavelBucket::Gcs { endpoint, bucket })
             }
+            Some(crate::config::RavelBucket::Azure { account, container }) => {
+                stores.refusing(ravel_sql::RavelBucket::Azure { account, container })
+            }
             None => stores,
         };
         Arc::new(stores) as Arc<dyn ravel_sql::ExternalStores>

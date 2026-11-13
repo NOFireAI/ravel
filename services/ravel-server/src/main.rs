@@ -138,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         s3: store_s3,
         classed: _classed,
     } = ravel_server::store::build_store(&cli, performance.cache_max_bytes)
+        .await
         .context("failed to build object store backend")?;
 
     // Store-backend qualification gate (ADR-0050 section 6, EC7). On any

@@ -108,9 +108,10 @@ fn s3_args(endpoint: &str) -> Vec<String> {
     .collect()
 }
 
-fn build(args: Vec<String>) -> (Cli, BuiltStore) {
+async fn build(args: Vec<String>) -> (Cli, BuiltStore) {
     let cli = Cli::try_parse_from(args).expect("flags parse");
     let built = build_store(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
+        .await
         .expect("the store builds without network access");
     (cli, built)
 }
@@ -140,7 +141,7 @@ fn gauges(unknown: u64, conditions_failed: u64, conditions_unknown: u64) -> Buck
 /// exactly the three control-plane GETs, and counts them into the store's
 /// metrics handle.
 async fn assert_compliant_startup(bucket: &FakeBucket, args: Vec<String>) {
-    let (cli, built) = build(args);
+    let (cli, built) = build(args).await;
     let outcome = startup_gate(&cli, &built)
         .await
         .expect("a compliant bucket starts")
@@ -199,7 +200,7 @@ async fn real_startup_path_reads_the_base_bucket_under_tenant_kms_config() {
 async fn real_startup_path_refuses_a_bucket_without_the_abort_rule() {
     let _guard = GAUGE_TEST_LOCK.lock().await;
     let bucket = spawn_fake_bucket(NO_ABORT_LIFECYCLE).await;
-    let (cli, built) = build(s3_args(&bucket.endpoint));
+    let (cli, built) = build(s3_args(&bucket.endpoint)).await;
     let err = startup_gate(&cli, &built)
         .await
         .expect_err("no abort rule must refuse to start");
@@ -230,7 +231,8 @@ async fn real_startup_path_on_memory_warns_and_sets_the_gauges() {
         .iter()
         .map(|arg| arg.to_string())
         .collect(),
-    );
+    )
+    .await;
     assert!(built.s3.is_none());
     let outcome = startup_gate(&cli, &built)
         .await
