@@ -48,8 +48,9 @@ pub struct RavelClusterSpec {
     /// transition rule on this field's schema (see [`ravel_cluster_crd`]).
     pub shards: u32,
 
-    /// Object storage backend. S3 only: a per-process memory store is
-    /// incoherent across pods (ADR-0034 decision 2).
+    /// Object storage backend: exactly one of `s3` and `azure`. A
+    /// per-process memory store is incoherent across pods (ADR-0034
+    /// decision 2).
     pub storage: StorageSpec,
 
     /// Secret whose keys are tenant names and whose values are the bearer
@@ -153,12 +154,103 @@ pub struct LocalSecretRef {
     pub name: String,
 }
 
-/// Object storage configuration.
+/// Object storage configuration: exactly one backend, enforced by a CEL rule
+/// on this object (see [`ravel_cluster_crd`]) and again at render time.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageSpec {
     /// S3 (or S3-compatible) backend.
-    pub s3: S3Spec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<S3Spec>,
+
+    /// Azure Blob Storage backend, authenticated through AKS workload
+    /// identity (ADR-4158 D11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure: Option<AzureSpec>,
+}
+
+/// The one backend a valid [`StorageSpec`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageBackend<'a> {
+    S3(&'a S3Spec),
+    Azure(&'a AzureSpec),
+}
+
+impl StorageSpec {
+    /// The configured backend, or `None` when neither or both are set.
+    pub fn backend(&self) -> Option<StorageBackend<'_>> {
+        match (&self.s3, &self.azure) {
+            (Some(s3), None) => Some(StorageBackend::S3(s3)),
+            (None, Some(azure)) => Some(StorageBackend::Azure(azure)),
+            _ => None,
+        }
+    }
+}
+
+/// Azure Blob Storage backend (ADR-4158 D11). Renders `--store azure
+/// --azure-account --azure-container` on every tier. There is no endpoint
+/// and no secret reference: every pod authenticates through AKS workload
+/// identity. The operator creates the ServiceAccounts `<name>-gateway`,
+/// `<name>-query`, `<name>-maintain` and `<name>-qualify`, each annotated
+/// with `azure.workload.identity/client-id`, and labels every tier pod and
+/// the store-qualification Job `azure.workload.identity/use: "true"`. The
+/// federated credential for each ServiceAccount, and one for the operator's
+/// own, is created outside Ravel. The account must have a flat namespace
+/// (hierarchical namespace off). The per-tier `credentialsSecretRef`
+/// overrides are refused. `--require-bucket-protection` is not rendered:
+/// the status condition `BucketProtectionVerified` is `False` with reason
+/// `NotImplementedForAzure`, and versioning, soft delete and an
+/// immutability policy are configured by hand.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureSpec {
+    /// Storage account (`--azure-account`): lowercase letters and digits.
+    pub account: String,
+
+    /// Container (`--azure-container`): lowercase letters, digits and `-`.
+    pub container: String,
+
+    /// Client ID of the user-assigned managed identity every pod runs as,
+    /// unless `roleClientIds` names one for its role. Changing the
+    /// `qualify` role's client ID re-runs store qualification.
+    pub client_id: String,
+
+    /// Per-role client IDs, one managed identity per role with its own role
+    /// assignment on the container (ADR-0055's per-role scoping on Azure).
+    /// A role left unset uses `clientId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_client_ids: Option<AzureRoleClientIds>,
+}
+
+impl AzureSpec {
+    /// The client ID the `role` ServiceAccount (`gateway`, `query`,
+    /// `maintain` or `qualify`) is annotated with.
+    pub fn client_id_for(&self, role: &str) -> &str {
+        let ids = self.role_client_ids.as_ref();
+        let role_id = match role {
+            "gateway" => ids.and_then(|ids| ids.gateway.as_deref()),
+            "query" => ids.and_then(|ids| ids.query.as_deref()),
+            "maintain" => ids.and_then(|ids| ids.maintain.as_deref()),
+            "qualify" => ids.and_then(|ids| ids.qualify.as_deref()),
+            _ => None,
+        };
+        role_id.unwrap_or(&self.client_id)
+    }
+}
+
+/// `storage.azure.roleClientIds`: a managed identity client ID per role.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureRoleClientIds {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintain: Option<String>,
+    /// The store-qualification Job's identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualify: Option<String>,
 }
 
 /// S3 backend configuration. `bucket`/`region`/`endpoint`/`allowHttp`/
@@ -1220,7 +1312,8 @@ pub struct RavelClusterStatus {
 
     /// The qualify-Job input hash (bucket, region, endpoint, `allowHttp`,
     /// `uploadIntegrity`, `requestStoredChecksum`, image, credentials Secret
-    /// name and that Secret's `resourceVersion`) that store qualification last
+    /// name and that Secret's `resourceVersion`; on Azure the account,
+    /// container, image and `qualify` client ID) that store qualification last
     /// succeeded against (issue #36).
     /// The operator gates serving on `ravel-cli store qualify` before it creates any
     /// Deployment; recording the qualified inputs here makes that gate durable:
@@ -1274,12 +1367,12 @@ pub struct RavelClusterStatus {
     #[serde(default)]
     pub qualify_retry_hash: Option<String>,
 
-    /// `true` once the operator has applied the `storage.s3.auth: podIdentity`
-    /// ServiceAccounts (`<name>-gateway`, `-query`, `-maintain`, `-qualify`).
-    /// The operator deletes those accounts after a switch back to `static`
-    /// only while this is set, and clears it once they are gone, so a cluster
-    /// that never ran under `podIdentity` never touches ServiceAccounts with
-    /// those names. Recorded here because the operator's RBAC cannot read a
+    /// `true` once the operator has applied the ServiceAccounts it owns under
+    /// `storage.s3.auth: podIdentity` or `storage.azure` (`<name>-gateway`,
+    /// `-query`, `-maintain`, `-qualify`). The operator deletes those
+    /// accounts after a switch to S3 `static` only while this is set, and
+    /// clears it once they are gone, so a cluster that never ran under either
+    /// never touches ServiceAccounts with those names. Recorded here because the operator's RBAC cannot read a
     /// ServiceAccount to check who owns it.
     ///
     /// Serialized even when absent (as explicit `null`) so the status merge
@@ -1289,8 +1382,10 @@ pub struct RavelClusterStatus {
 
     /// Status conditions the operator actually sets: `Available`, `Degraded`,
     /// `StoreQualified`, `KubernetesVersionUnsupported`,
-    /// `IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`. The
-    /// operator emits no `Progressing` condition.
+    /// `IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`,
+    /// `BucketProtectionVerified` (on a `storage.azure` cluster only, False
+    /// with reason NotImplementedForAzure: no bucket-protection check runs
+    /// there). The operator emits no `Progressing` condition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
 }
@@ -1929,20 +2024,47 @@ const POD_IDENTITY_TIER_OVERRIDE_MESSAGE: &str = "gateway, query and maintain \
     <name>-query, <name>-maintain)";
 
 /// No per-tier `credentialsSecretRef` under `podIdentity`. Each tier block
-/// carries a serde default and may be omitted, so each is `has()`-guarded.
-const POD_IDENTITY_TIER_OVERRIDE_RULE: &str = "!has(self.storage.s3.auth) || \
+/// carries a serde default and may be omitted, so each is `has()`-guarded,
+/// and `storage.s3` is optional, so it is too: `has()` on a field of an
+/// absent object is an evaluation error, not false.
+const POD_IDENTITY_TIER_OVERRIDE_RULE: &str = "!has(self.storage.s3) || \
+    !has(self.storage.s3.auth) || \
     self.storage.s3.auth != 'podIdentity' || \
     ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && \
     (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
     (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))";
 
-/// Attach the two `storage.s3.auth` rules (ADR-0034, Pod Identity storage
-/// credentials amendment): on `storage.s3`, the shared Secret is required
-/// under `static`; on `spec`, the per-tier overrides are refused under
-/// `podIdentity`. The second rule reads three sibling blocks, so it sits on
+/// Message surfaced when `storage` names neither backend or both.
+const STORAGE_ONE_OF_MESSAGE: &str = "storage must set exactly one of s3 and azure";
+
+/// Exactly one of `storage.s3` and `storage.azure`.
+const STORAGE_ONE_OF_RULE: &str = "has(self.s3) != has(self.azure)";
+
+/// Message surfaced when a per-tier credential override is set under
+/// `storage.azure`.
+const AZURE_TIER_OVERRIDE_MESSAGE: &str = "gateway, query and maintain \
+    credentialsSecretRef overrides are refused under storage.azure; each tier's identity is \
+    the client ID on its ServiceAccount (storage.azure.clientId or roleClientIds)";
+
+/// No per-tier `credentialsSecretRef` under `storage.azure`.
+const AZURE_TIER_OVERRIDE_RULE: &str = "!has(self.storage.azure) || \
+    ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && \
+    (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
+    (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))";
+
+/// Attach the storage rules (ADR-0034, Pod Identity storage credentials
+/// amendment; ADR-4158 D11): on `storage`, exactly one backend; on
+/// `storage.s3`, the shared Secret is required under `static`; on `spec`,
+/// the per-tier overrides are refused under `podIdentity` and under
+/// `azure`. The tier rules read three sibling blocks, so they sit on
 /// `spec`, their common parent. Injected post-hoc and appended to any rules
 /// already there, like the other injectors.
 fn inject_storage_auth_guards(crd: &mut CustomResourceDefinition) {
+    let one_of_rule = ValidationRule {
+        rule: STORAGE_ONE_OF_RULE.to_string(),
+        message: Some(STORAGE_ONE_OF_MESSAGE.to_string()),
+        ..Default::default()
+    };
     let static_rule = ValidationRule {
         rule: STATIC_AUTH_SECRET_RULE.to_string(),
         message: Some(STATIC_AUTH_SECRET_MESSAGE.to_string()),
@@ -1951,6 +2073,11 @@ fn inject_storage_auth_guards(crd: &mut CustomResourceDefinition) {
     let tier_rule = ValidationRule {
         rule: POD_IDENTITY_TIER_OVERRIDE_RULE.to_string(),
         message: Some(POD_IDENTITY_TIER_OVERRIDE_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    let azure_tier_rule = ValidationRule {
+        rule: AZURE_TIER_OVERRIDE_RULE.to_string(),
+        message: Some(AZURE_TIER_OVERRIDE_MESSAGE.to_string()),
         ..Default::default()
     };
     for version in &mut crd.spec.versions {
@@ -1968,12 +2095,21 @@ fn inject_storage_auth_guards(crd: &mut CustomResourceDefinition) {
         };
         let mut spec_rules = spec.x_kubernetes_validations.take().unwrap_or_default();
         spec_rules.push(tier_rule.clone());
+        spec_rules.push(azure_tier_rule.clone());
         spec.x_kubernetes_validations = Some(spec_rules);
-        let Some(s3) = spec
+        let Some(storage) = spec
             .properties
             .as_mut()
             .and_then(|spec_props| spec_props.get_mut("storage"))
-            .and_then(|storage| storage.properties.as_mut())
+        else {
+            continue;
+        };
+        let mut storage_rules = storage.x_kubernetes_validations.take().unwrap_or_default();
+        storage_rules.push(one_of_rule.clone());
+        storage.x_kubernetes_validations = Some(storage_rules);
+        let Some(s3) = storage
+            .properties
+            .as_mut()
             .and_then(|storage_props| storage_props.get_mut("s3"))
         else {
             continue;
@@ -2818,7 +2954,10 @@ mod tests {
             "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
         });
         let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(spec.storage.s3.region, "us-east-1");
+        assert_eq!(
+            spec.storage.s3.as_ref().expect("s3 is set").region,
+            "us-east-1"
+        );
         assert_eq!(spec.gateway.replicas, 1);
         assert_eq!(spec.query.replicas, 1);
         // Maintain replicas is optional and defaults to 1: an existing spec
@@ -3451,7 +3590,10 @@ mod tests {
             "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
         }))
         .expect("a pre-auth manifest still deserializes");
-        assert_eq!(spec.storage.s3.auth, S3AuthSpec::Static);
+        assert_eq!(
+            spec.storage.s3.as_ref().expect("s3 is set").auth,
+            S3AuthSpec::Static
+        );
 
         let spec: RavelClusterSpec = serde_json::from_value(serde_json::json!({
             "image": "ravel:dev",
@@ -3459,8 +3601,9 @@ mod tests {
             "storage": { "s3": { "bucket": "b", "auth": "podIdentity" } }
         }))
         .expect("a podIdentity manifest needs no Secret");
-        assert_eq!(spec.storage.s3.auth, S3AuthSpec::PodIdentity);
-        assert_eq!(spec.storage.s3.credentials_secret_ref, None);
+        let s3 = spec.storage.s3.as_ref().expect("s3 is set");
+        assert_eq!(s3.auth, S3AuthSpec::PodIdentity);
+        assert_eq!(s3.credentials_secret_ref, None);
         assert_eq!(
             serde_json::to_value(S3AuthSpec::PodIdentity).expect("serialize"),
             serde_json::json!("podIdentity")
@@ -3523,7 +3666,8 @@ mod tests {
             .iter()
             .find(|r| {
                 r.rule
-                    == "!has(self.storage.s3.auth) || self.storage.s3.auth != 'podIdentity' || \
+                    == "!has(self.storage.s3) || !has(self.storage.s3.auth) || \
+                        self.storage.s3.auth != 'podIdentity' || \
                         ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && \
                         (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
                         (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))"
@@ -3554,5 +3698,157 @@ mod tests {
         ] {
             assert!(!tier_override_cel_admits(Some("podIdentity"), overrides));
         }
+    }
+
+    /// The `storage` schema node of the generated CRD.
+    fn storage_schema()
+    -> k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps {
+        let (spec, _) = spec_and_s3_schema();
+        spec.properties
+            .as_ref()
+            .and_then(|p| p.get("storage"))
+            .cloned()
+            .expect("storage prop")
+    }
+
+    /// Rust mirror of [`STORAGE_ONE_OF_RULE`].
+    fn storage_one_of_cel_admits(has_s3: bool, has_azure: bool) -> bool {
+        has_s3 != has_azure
+    }
+
+    /// Evaluate [`POD_IDENTITY_TIER_OVERRIDE_RULE`] as CEL does on a spec
+    /// whose `storage.s3` is `s3_auth` (`None`: no `storage.s3` at all).
+    /// Reading a field of an absent object is an evaluation error in CEL, so
+    /// the result is `Err` unless the rule's first clause guards it.
+    fn pod_identity_tier_rule_eval(
+        s3_auth: Option<Option<&str>>,
+        overrides: [bool; 3],
+    ) -> Result<bool, &'static str> {
+        let guarded = POD_IDENTITY_TIER_OVERRIDE_RULE.starts_with("!has(self.storage.s3) || ");
+        match s3_auth {
+            None if guarded => Ok(true),
+            None => Err("no such key: s3"),
+            Some(auth) => Ok(tier_override_cel_admits(auth, overrides)),
+        }
+    }
+
+    #[test]
+    fn storage_one_of_rule_sits_on_storage_and_refuses_neither_and_both() {
+        let storage = storage_schema();
+        let rules = storage
+            .x_kubernetes_validations
+            .expect("storage carries a CEL rule");
+        let rule = rules
+            .iter()
+            .find(|r| r.rule == "has(self.s3) != has(self.azure)")
+            .expect("the exact one-of rule");
+        assert_eq!(
+            rule.message.as_deref(),
+            Some("storage must set exactly one of s3 and azure")
+        );
+        assert!(
+            !storage.required.clone().unwrap_or_default().contains(&"s3".to_string()),
+            "storage.s3 is optional in the schema; the one-of rule requires a backend"
+        );
+
+        assert!(storage_one_of_cel_admits(true, false));
+        assert!(storage_one_of_cel_admits(false, true));
+        assert!(!storage_one_of_cel_admits(false, false), "neither");
+        assert!(!storage_one_of_cel_admits(true, true), "both");
+    }
+
+    #[test]
+    fn pod_identity_tier_rule_does_not_error_without_storage_s3() {
+        assert_eq!(pod_identity_tier_rule_eval(None, [false; 3]), Ok(true));
+        assert_eq!(pod_identity_tier_rule_eval(None, [true; 3]), Ok(true));
+        assert_eq!(
+            pod_identity_tier_rule_eval(Some(Some("podIdentity")), [true, false, false]),
+            Ok(false)
+        );
+        assert_eq!(
+            pod_identity_tier_rule_eval(Some(Some("static")), [true, false, false]),
+            Ok(true)
+        );
+    }
+
+    /// Rust mirror of [`AZURE_TIER_OVERRIDE_RULE`].
+    fn azure_tier_override_cel_admits(has_azure: bool, overrides: [bool; 3]) -> bool {
+        !has_azure || overrides.iter().all(|set| !set)
+    }
+
+    #[test]
+    fn azure_refuses_tier_credential_overrides_on_spec() {
+        let (spec, _) = spec_and_s3_schema();
+        let rules = spec
+            .x_kubernetes_validations
+            .expect("spec carries a CEL rule");
+        let rule = rules
+            .iter()
+            .find(|r| {
+                r.rule
+                    == "!has(self.storage.azure) || \
+                        ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && \
+                        (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
+                        (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))"
+            })
+            .expect("the exact Azure tier-override rule");
+        assert_eq!(rule.message.as_deref(), Some(AZURE_TIER_OVERRIDE_MESSAGE));
+
+        assert!(azure_tier_override_cel_admits(false, [true, true, true]));
+        assert!(azure_tier_override_cel_admits(true, [false, false, false]));
+        for overrides in [
+            [true, false, false],
+            [false, true, false],
+            [false, false, true],
+        ] {
+            assert!(!azure_tier_override_cel_admits(true, overrides));
+        }
+    }
+
+    #[test]
+    fn azure_storage_deserializes_and_resolves_role_client_ids() {
+        let spec: RavelClusterSpec = serde_json::from_value(serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "azure": {
+                "account": "ravelprod",
+                "container": "data",
+                "clientId": "shared-id",
+                "roleClientIds": { "maintain": "maintain-id" },
+            } }
+        }))
+        .expect("an Azure manifest deserializes");
+        assert_eq!(spec.storage.s3, None);
+        let Some(StorageBackend::Azure(azure)) = spec.storage.backend() else {
+            panic!("the backend is Azure");
+        };
+        assert_eq!(azure.account, "ravelprod");
+        assert_eq!(azure.container, "data");
+        assert_eq!(azure.client_id_for("gateway"), "shared-id");
+        assert_eq!(azure.client_id_for("query"), "shared-id");
+        assert_eq!(azure.client_id_for("maintain"), "maintain-id");
+        assert_eq!(azure.client_id_for("qualify"), "shared-id");
+
+        let mut both = spec.storage.clone();
+        both.s3 = Some(S3Spec {
+            bucket: "b".to_string(),
+            region: default_region(),
+            endpoint: None,
+            allow_http: false,
+            upload_integrity: S3UploadIntegrity::default(),
+            request_stored_checksum: true,
+            auth: S3AuthSpec::Static,
+            credentials_secret_ref: None,
+        });
+        assert_eq!(both.backend(), None, "both");
+        assert_eq!(
+            StorageSpec {
+                s3: None,
+                azure: None
+            }
+            .backend(),
+            None,
+            "neither"
+        );
     }
 }
