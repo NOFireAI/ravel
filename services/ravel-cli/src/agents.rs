@@ -89,6 +89,13 @@ pub enum AgentsCliError {
          yourself; the other agents commands take --store gcs"
     )]
     DevRefusesGcsStore,
+    #[error(
+        "agents dev refuses --store azure: it starts, creates and qualifies the compose \
+         RustFS bucket ({DEV_COMPOSE_FILE}), which is an S3 endpoint. Against an Azure \
+         container, qualify it with ravel-cli --store azure store qualify and start \
+         ravel-server on it yourself; the other agents commands take --store azure"
+    )]
+    DevRefusesAzureStore,
     #[error("--{flag} {addr} is not a loopback address; agents dev binds loopback only")]
     ListenNotLoopback {
         flag: &'static str,
@@ -922,6 +929,9 @@ pub fn check_dev(options: &DevOptions) -> Result<(), AgentsCliError> {
     }
     if options.store.kind() == StoreKind::Gcs {
         return Err(AgentsCliError::DevRefusesGcsStore);
+    }
+    if options.store.kind() == StoreKind::Azure {
+        return Err(AgentsCliError::DevRefusesAzureStore);
     }
     for (flag, addr) in [
         ("listen", options.listen_http),
