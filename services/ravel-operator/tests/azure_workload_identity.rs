@@ -67,11 +67,12 @@ fn empty_list(kind: &str, api_version: &str) -> Value {
     })
 }
 
-/// Every write in arrival order (`PATCH <path>`), the applied ServiceAccounts
-/// by path, the applied Job, the last status patch, and every request the
-/// fake did not expect.
+/// Every request and every write in arrival order (`<METHOD> <path>`), the
+/// applied ServiceAccounts by path, the applied Job, the last status patch,
+/// and every request the fake did not expect.
 #[derive(Default)]
 struct Fake {
+    requests: Mutex<Vec<String>>,
     writes: Mutex<Vec<String>>,
     service_accounts: Mutex<BTreeMap<String, Value>>,
     job: Mutex<Option<Value>>,
@@ -110,6 +111,10 @@ async fn apiserver(
         .uri()
         .query()
         .is_some_and(|query| query.split('&').any(|pair| pair == "watch=true"));
+    fake.requests
+        .lock()
+        .expect("lock")
+        .push(format!("{method} {path}"));
     let body = req
         .into_body()
         .collect()
@@ -257,6 +262,19 @@ async fn one_pass() -> (Arc<Fake>, Vec<String>) {
 async fn annotated_service_accounts_are_applied_before_the_qualify_job() {
     let (fake, writes) = one_pass().await;
 
+    let requests = fake.requests.lock().expect("lock").clone();
+    assert!(
+        requests.contains(&status_path()),
+        "the pass reached its status write: {requests:?}"
+    );
+    let secret_requests: Vec<&String> = requests
+        .iter()
+        .filter(|request| request.contains("/secrets"))
+        .collect();
+    assert!(
+        secret_requests.is_empty(),
+        "the Azure pass requested a Secret: {secret_requests:?}"
+    );
     let unexpected = fake.unexpected.lock().expect("lock").clone();
     assert!(
         unexpected.is_empty(),

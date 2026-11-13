@@ -37,7 +37,12 @@ spec:
       labels:
         app.kubernetes.io/name: ravel-operator
         app.kubernetes.io/managed-by: ravel-operator
-        azure.workload.identity/use: "true" # storage.azure only; see rbac.yaml
+        # Opt-in. Needed, with the client-id annotation in rbac.yaml, only
+        # when the operator manages a RavelCluster on storage.azure that sets
+        # deploymentKeySecretRef or names a tenant under shardOverrides: those
+        # are the only paths on which the operator itself opens the container.
+        # Restart the operator pod after enabling both.
+        # azure.workload.identity/use: "true"
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"

@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
-    CustomResourceDefinition, JSONSchemaPropsOrArray, ValidationRule,
+    CustomResourceDefinition, JSONSchemaProps, JSONSchemaPropsOrArray, ValidationRule,
 };
 use kube::CustomResource;
 use kube::CustomResourceExt;
@@ -213,20 +213,25 @@ impl StorageSpec {
 /// (hierarchical namespace off). The per-tier `credentialsSecretRef`
 /// overrides are refused. `--require-bucket-protection` is not rendered:
 /// the status condition `BucketProtectionVerified` is `False` with reason
-/// `NotImplementedForAzure`, and versioning, soft delete and an
-/// immutability policy are configured by hand.
+/// `NotImplementedForAzure`, and blob versioning with a lifecycle rule that
+/// deletes previous versions, and soft delete with a bounded retention, are
+/// configured by hand.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureSpec {
-    /// Storage account (`--azure-account`): lowercase letters and digits.
+    /// Storage account (`--azure-account`): 3 to 24 lowercase letters and
+    /// digits.
     pub account: String,
 
-    /// Container (`--azure-container`): lowercase letters, digits and `-`.
+    /// Container (`--azure-container`): 3 to 63 lowercase letters, digits and
+    /// single hyphens, starting and ending with a letter or digit.
     pub container: String,
 
-    /// Client ID of the user-assigned managed identity every pod runs as,
-    /// unless `roleClientIds` names one for its role. Changing the
-    /// `qualify` role's client ID re-runs store qualification.
+    /// Client ID (a UUID) of the user-assigned managed identity a role's
+    /// ServiceAccount is annotated with, unless `roleClientIds` names one for
+    /// that role. A pod keeps the identity it was admitted with, so changing
+    /// a tier's client ID rolls that tier's pods, and changing the `qualify`
+    /// role's client ID re-runs store qualification.
     pub client_id: String,
 
     /// Per-role client IDs, one managed identity per role with its own role
@@ -2066,6 +2071,51 @@ const AZURE_TIER_OVERRIDE_RULE: &str = "!has(self.storage.azure) || \
     (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
     (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))";
 
+/// `storage.azure.account`: an Azure storage account name, 3 to 24 lowercase
+/// letters and digits.
+const AZURE_ACCOUNT_PATTERN: &str = "^[a-z0-9]{3,24}$";
+
+/// `storage.azure.container`: an Azure container name, 3 to 63 lowercase
+/// letters, digits and single hyphens, starting and ending with a letter or
+/// digit. The length is `minLength`/`maxLength` beside it.
+const AZURE_CONTAINER_PATTERN: &str = "^[a-z0-9]+(-[a-z0-9]+)*$";
+
+/// `storage.azure.clientId` and every `roleClientIds` entry: a UUID.
+const AZURE_CLIENT_ID_PATTERN: &str =
+    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
+
+/// Stamp the name and client ID patterns onto the `storage.azure` schema, so
+/// the API server refuses a malformed value at admission rather than the
+/// pods failing at startup.
+fn inject_azure_field_validation(azure: &mut JSONSchemaProps) {
+    let Some(props) = azure.properties.as_mut() else {
+        return;
+    };
+    let constrain = |schema: &mut JSONSchemaProps, pattern: &str, min: i64, max: i64| {
+        schema.pattern = Some(pattern.to_string());
+        schema.min_length = Some(min);
+        schema.max_length = Some(max);
+    };
+    if let Some(account) = props.get_mut("account") {
+        constrain(account, AZURE_ACCOUNT_PATTERN, 3, 24);
+    }
+    if let Some(container) = props.get_mut("container") {
+        constrain(container, AZURE_CONTAINER_PATTERN, 3, 63);
+    }
+    if let Some(client_id) = props.get_mut("clientId") {
+        constrain(client_id, AZURE_CLIENT_ID_PATTERN, 36, 36);
+    }
+    let Some(role_ids) = props
+        .get_mut("roleClientIds")
+        .and_then(|role_ids| role_ids.properties.as_mut())
+    else {
+        return;
+    };
+    for role_id in role_ids.values_mut() {
+        constrain(role_id, AZURE_CLIENT_ID_PATTERN, 36, 36);
+    }
+}
+
 /// Attach the storage rules (ADR-0034, Pod Identity storage credentials
 /// amendment; ADR-4158 D11): on `storage`, exactly one backend; on
 /// `storage.s3`, the shared Secret is required under `static`; on `spec`,
@@ -2121,11 +2171,20 @@ fn inject_storage_auth_guards(crd: &mut CustomResourceDefinition) {
         let mut storage_rules = storage.x_kubernetes_validations.take().unwrap_or_default();
         storage_rules.push(one_of_rule.clone());
         storage.x_kubernetes_validations = Some(storage_rules);
-        let Some(s3) = storage
-            .properties
-            .as_mut()
-            .and_then(|storage_props| storage_props.get_mut("s3"))
-        else {
+        let Some(storage_props) = storage.properties.as_mut() else {
+            continue;
+        };
+        // An explicit `null` must not count as present to the one-of rule
+        // while serde reads it as absent, so neither backend admits one.
+        for backend in ["s3", "azure"] {
+            if let Some(schema) = storage_props.get_mut(backend) {
+                schema.nullable = None;
+            }
+        }
+        if let Some(azure) = storage_props.get_mut("azure") {
+            inject_azure_field_validation(azure);
+        }
+        let Some(s3) = storage_props.get_mut("s3") else {
             continue;
         };
         let mut s3_rules = s3.x_kubernetes_validations.take().unwrap_or_default();
@@ -3868,5 +3927,82 @@ mod tests {
             None,
             "neither"
         );
+    }
+
+    /// Neither backend is `nullable`: an explicit `null` beside the other
+    /// backend would otherwise pass the schema while `has()` and serde
+    /// disagree about whether it is present.
+    #[test]
+    fn neither_storage_backend_is_nullable() {
+        let storage = storage_schema();
+        let props = storage.properties.expect("storage properties");
+        for backend in ["s3", "azure"] {
+            let schema = props.get(backend).expect("backend property");
+            assert_eq!(schema.nullable, None, "storage.{backend}");
+        }
+    }
+
+    /// The `storage.azure` schema node of the generated CRD.
+    fn azure_schema() -> JSONSchemaProps {
+        storage_schema()
+            .properties
+            .and_then(|p| p.get("azure").cloned())
+            .expect("azure prop")
+    }
+
+    /// Whether `value` passes a string schema's `pattern`, `minLength` and
+    /// `maxLength`, evaluated the way the API server does.
+    fn string_schema_admits(schema: &JSONSchemaProps, value: &str) -> bool {
+        let pattern = schema.pattern.as_deref().expect("a pattern");
+        let regex = regex::Regex::new(pattern).expect("the pattern compiles");
+        let len = i64::try_from(value.chars().count()).expect("a short value");
+        regex.is_match(value)
+            && schema.min_length.is_none_or(|min| len >= min)
+            && schema.max_length.is_none_or(|max| len <= max)
+    }
+
+    #[test]
+    fn azure_names_and_client_ids_are_validated_at_admission() {
+        let azure = azure_schema();
+        let props = azure.properties.as_ref().expect("azure properties");
+        let field = |name: &str| props.get(name).cloned().expect("azure field");
+        let role_ids = field("roleClientIds")
+            .properties
+            .expect("roleClientIds properties");
+        assert_eq!(role_ids.len(), 4);
+
+        let uuid = "0f3c2a1b-4d5e-6f70-8192-a3b4c5d6e7f8";
+        let (a24, a25) = ("a".repeat(24), "a".repeat(25));
+        let (a63, a64) = ("a".repeat(63), "a".repeat(64));
+        let mut cases: Vec<(&str, JSONSchemaProps, &str, &str)> = vec![
+            ("account", field("account"), "ravelprod01", "Ravel-Prod"),
+            ("account", field("account"), "abc", "ab"),
+            ("account", field("account"), &a24, &a25),
+            ("container", field("container"), "ravel-data", "ravel--data"),
+            ("container", field("container"), "r0d", "-ravel"),
+            ("container", field("container"), "abc", "ravel-"),
+            ("container", field("container"), &a63, &a64),
+            ("container", field("container"), "a-b", "a_b"),
+            ("clientId", field("clientId"), uuid, "shared-id"),
+            (
+                "clientId",
+                field("clientId"),
+                uuid,
+                "0f3c2a1b4d5e6f708192a3b4c5d6e7f8",
+            ),
+        ];
+        for (role, schema) in &role_ids {
+            cases.push((role.as_str(), schema.clone(), uuid, "maintain-id"));
+        }
+        for (name, schema, accepted, refused) in &cases {
+            assert!(
+                string_schema_admits(schema, accepted),
+                "{name} accepts {accepted:?}"
+            );
+            assert!(
+                !string_schema_admits(schema, refused),
+                "{name} refuses {refused:?}"
+            );
+        }
     }
 }

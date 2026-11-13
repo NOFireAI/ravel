@@ -27,9 +27,9 @@ use kube::core::DynamicObject;
 use kube::{Api, Client, Resource, ResourceExt};
 use kube_runtime::controller::{Action, Controller};
 use kube_runtime::{WatchStreamExt, predicates, reflector, watcher};
-use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::azure::{AzureConfig, AzureStore};
 use ravel_object_store::s3::{S3Config, S3HttpConfig, S3Store};
+use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_types::{Signal, TenantHash, TenantHashScheme, TenantId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -848,7 +848,7 @@ async fn build_auth_store(
         Some(StorageBackend::S3(s3)) => s3,
         Some(StorageBackend::Azure(azure)) => {
             let config = AzureConfig::new(azure.account.clone(), azure.container.clone());
-            let store = AzureStore::new(config).await.map_err(Error::Store)?;
+            let store = bounded_store_construction(AzureStore::new(config)).await?;
             return Ok(Arc::new(store));
         }
         None => return Err(RenderError::StorageBackendNotExactlyOne.into()),
@@ -871,6 +871,64 @@ async fn build_auth_store(
     let store =
         S3Store::with_http_config(config, auth_store_http_config(s3)).map_err(Error::Store)?;
     Ok(Arc::new(store))
+}
+
+/// How long [`build_auth_store`] waits for an [`AzureStore`] to finish
+/// constructing. Construction makes network requests (the
+/// hierarchical-namespace check), and a hung one must not hold the reconcile.
+pub(crate) const AZURE_AUTH_STORE_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Await a store construction for at most [`AZURE_AUTH_STORE_BUILD_TIMEOUT`].
+/// Running out is [`StoreError::Timeout`] under [`Error::Store`], the error a
+/// failed construction returns, so both reach the same `Degraded` condition.
+async fn bounded_store_construction<T>(
+    construction: impl Future<Output = Result<T, StoreError>>,
+) -> Result<T, Error> {
+    tokio::time::timeout(AZURE_AUTH_STORE_BUILD_TIMEOUT, construction)
+        .await
+        .map_err(|_| Error::Store(StoreError::Timeout))?
+        .map_err(Error::Store)
+}
+
+/// The two steps that open the operator's own store: `sys/auth` convergence
+/// when a deployment key is configured, then the `shardOverrides` reshard
+/// when the spec names at least one tenant. `build` runs at most once per
+/// pass, and not at all when neither step applies, so an Azure store's
+/// construction requests are made once.
+async fn converge_store_state<F, Fut>(
+    spec: &RavelClusterSpec,
+    deployment_key: Option<&[u8; 32]>,
+    token_values: &BTreeMap<String, Vec<u8>>,
+    now_ns: fn() -> i64,
+    build: F,
+) -> Result<(), Error>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Arc<dyn ObjectStoreBackend>, Error>>,
+{
+    let shard_overrides = spec
+        .shard_overrides
+        .as_ref()
+        .filter(|overrides| !overrides.tenants.is_empty());
+    if deployment_key.is_none() && shard_overrides.is_none() {
+        return Ok(());
+    }
+    let store = build().await?;
+    if let Some(deployment_key) = deployment_key {
+        reconcile_sys_auth_best_effort(deployment_key, token_values, store.as_ref(), now_ns())
+            .await;
+    }
+    if let Some(shard_overrides) = shard_overrides {
+        reconcile_shard_overrides(
+            spec,
+            shard_overrides,
+            deployment_key,
+            store.as_ref(),
+            now_ns(),
+        )
+        .await;
+    }
+    Ok(())
 }
 
 /// The HTTP client config [`build_auth_store`] connects with: the default
@@ -1953,36 +2011,19 @@ async fn reconcile_inner(
         obj.spec.deployment_key_secret_ref.as_ref(),
     )
     .await?;
-    if let Some(deployment_key) = deployment_key_secret.key {
-        let store =
-            build_auth_store(client, namespace, &obj.spec, &ctx.pod_identity_credentials).await?;
-        reconcile_sys_auth_best_effort(
-            &deployment_key,
-            &token_secret.token_values,
-            store.as_ref(),
-            now_ns(),
-        )
-        .await;
-    }
-
-    // Converge shardOverrides to the ADR-0052 resharding mechanism (#147,
+    //
+    // Then converge shardOverrides to the ADR-0052 resharding mechanism (#147,
     // ADR-0076 decision 2), whenever the spec names at least one tenant.
     // Best-effort per (tenant, signal): see reconcile_shard_overrides's doc
     // comment for why a misconfigured override cannot block reconciliation.
-    if let Some(shard_overrides) = obj.spec.shard_overrides.as_ref()
-        && !shard_overrides.tenants.is_empty()
-    {
-        let store =
-            build_auth_store(client, namespace, &obj.spec, &ctx.pod_identity_credentials).await?;
-        reconcile_shard_overrides(
-            &obj.spec,
-            shard_overrides,
-            deployment_key_secret.key.as_ref(),
-            store.as_ref(),
-            now_ns(),
-        )
-        .await;
-    }
+    converge_store_state(
+        &obj.spec,
+        deployment_key_secret.key.as_ref(),
+        &token_secret.token_values,
+        now_ns,
+        || build_auth_store(client, namespace, &obj.spec, &ctx.pod_identity_credentials),
+    )
+    .await?;
 
     // Reuse the credential resourceVersions resolved before the gate (finding 3):
     // each Deployment's pod-template checksum is computed (in reconcile) from the
@@ -7723,6 +7764,133 @@ mod tests {
                 "the retried attempt must have succeeded"
             );
         }
+
+        fn fixed_now_ns() -> i64 {
+            10 * RESHARD_NS_PER_HOUR
+        }
+
+        /// Run [`converge_store_state`] with a build closure that counts its
+        /// calls and hands out `store`; returns the count.
+        async fn converge_counting_builds(
+            spec: &RavelClusterSpec,
+            deployment_key: Option<&[u8; 32]>,
+            token_values: &BTreeMap<String, Vec<u8>>,
+            store: Arc<dyn ObjectStoreBackend>,
+        ) -> usize {
+            let builds = std::sync::atomic::AtomicUsize::new(0);
+            converge_store_state(spec, deployment_key, token_values, fixed_now_ns, || {
+                builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { Ok(store) }
+            })
+            .await
+            .expect("converges");
+            builds.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// With both a deployment key and shard overrides, one pass builds
+        /// the operator's store once and both steps write through it.
+        #[tokio::test]
+        async fn one_pass_builds_the_store_once_for_sys_auth_and_the_reshard() {
+            let deployment_key = [1u8; 32];
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory_store());
+            let hash = tenant_hash_for("acme", Some(&deployment_key));
+            ravel_catalog::validate_or_adopt(
+                store.as_ref(),
+                &hash,
+                Signal::Metrics,
+                4,
+                1_000,
+                AbsentPolicy::CreateFromConfig,
+            )
+            .await
+            .expect("seed generation-0 record");
+            let mut spec = test_spec(4);
+            spec.shard_overrides = Some(overrides(&[("acme", 1)], MIN_RESHARD_LEAD_HOURS));
+            let token_values = BTreeMap::from([("acme".to_string(), b"token-a".to_vec())]);
+
+            let builds = converge_counting_builds(
+                &spec,
+                Some(&deployment_key),
+                &token_values,
+                Arc::clone(&store),
+            )
+            .await;
+            assert_eq!(builds, 1);
+
+            let (map, _) = ravel_catalog::read_auth_map(store.as_ref(), &deployment_key)
+                .await
+                .expect("read succeeds")
+                .expect("sys/auth converged");
+            assert_eq!(map.entries.len(), 1);
+            let generations =
+                ravel_catalog::read_generations_from_store(store.as_ref(), &hash, Signal::Metrics)
+                    .await
+                    .expect("read succeeds")
+                    .expect("record exists");
+            assert_eq!(generations.last().map(|g| g.shard_count), Some(1));
+        }
+
+        /// Each step alone builds once; neither builds nothing.
+        #[tokio::test]
+        async fn the_store_is_built_only_when_a_step_needs_it() {
+            let deployment_key = [1u8; 32];
+            let token_values = BTreeMap::new();
+            let store = || -> Arc<dyn ObjectStoreBackend> { Arc::new(memory_store()) };
+            let mut with_overrides = test_spec(4);
+            with_overrides.shard_overrides =
+                Some(overrides(&[("acme", 1)], MIN_RESHARD_LEAD_HOURS));
+            let mut empty_overrides = test_spec(4);
+            empty_overrides.shard_overrides = Some(overrides(&[], MIN_RESHARD_LEAD_HOURS));
+
+            for (case, spec, key, expected) in [
+                ("neither", test_spec(4), None, 0),
+                ("empty shardOverrides", empty_overrides, None, 0),
+                (
+                    "deployment key only",
+                    test_spec(4),
+                    Some(&deployment_key),
+                    1,
+                ),
+                ("shardOverrides only", with_overrides, None, 1),
+            ] {
+                assert_eq!(
+                    converge_counting_builds(&spec, key, &token_values, store()).await,
+                    expected,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// A store construction that never answers is cut off after
+    /// [`AZURE_AUTH_STORE_BUILD_TIMEOUT`] on tokio's paused clock, and reaches
+    /// the same `Degraded` reason a construction error does.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_store_construction_times_out_into_the_construction_error_path() {
+        let started = tokio::time::Instant::now();
+        let hung = bounded_store_construction(std::future::pending::<Result<(), StoreError>>())
+            .await
+            .expect_err("a hung construction times out");
+        assert_eq!(started.elapsed(), AZURE_AUTH_STORE_BUILD_TIMEOUT);
+        assert_eq!(AZURE_AUTH_STORE_BUILD_TIMEOUT, Duration::from_secs(30));
+        assert!(matches!(hung, Error::Store(StoreError::Timeout)), "{hung}");
+
+        let failed = bounded_store_construction(async {
+            Err::<(), _>(StoreError::Permanent("hierarchical namespace".to_string()))
+        })
+        .await
+        .expect_err("a failed construction is an error");
+        assert!(matches!(failed, Error::Store(StoreError::Permanent(_))));
+        assert_eq!(
+            degraded_reason(&hung).0,
+            degraded_reason(&failed).0,
+            "a timeout and a construction error share one Degraded reason"
+        );
+
+        let built = bounded_store_construction(async { Ok::<_, StoreError>(7) })
+            .await
+            .expect("a prompt construction passes through");
+        assert_eq!(built, 7);
     }
 
     // ---- storage.s3.auth: podIdentity ----
