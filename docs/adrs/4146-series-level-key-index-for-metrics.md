@@ -140,9 +140,20 @@ field), sliced on `key8`, bucketed by the existing mix, referenced from
   same series give the same `skey`. Two distinct series sharing a prefix
   merge into one key; decision 3 shows that this only adds objects.
 - **`series_label`, key type `Bytes`.** `key8 = key8_bytes(pair)`, where
-  `pair` is the ADR-0005 label encoding of one label of a series,
-  `u16_le(len(name)) name u16_le(len(value)) value`, and the metric name
-  is the pair (`__name__`, name). The entry is a posting (decision 5's
+  `pair` is `u16_le(len(name)) name u16_le(len(value)) value` over one
+  label of the series' stored label set, and the metric name is the pair
+  (`__name__`, name). That byte string is this index's own convention,
+  not a frozen contract: ADR-0005's canonical stream encodes the metric
+  name as its own length-prefixed field and leaves `__name__` out of its
+  label list (crates/ravel-types/src/lib.rs:417-451), so it defines no
+  bytes for the name pair. The stored label set does carry `__name__`
+  (LABEL_DICT ordinal 0, docs/segment-format.md:231; a series' label set
+  is its schema's names paired with value ordinals,
+  docs/segment-format.md:300-302), which is why indexing it is exact. The
+  fold and the router must produce the same bytes for every pair, so R1
+  defines the encoding once, in the codec both call, with a test pinning
+  the bytes of a `__name__` pair and of an ordinary one. The entry is a
+  posting (decision 5's
   entry kind 1): the ascending `skey`s of every series of the part that
   carries the pair. Every label a series stores is indexed; an
   empty-valued label is absent from identity and from storage (ADR-0031)
