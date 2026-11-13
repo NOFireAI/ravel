@@ -1234,9 +1234,19 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    tokens name), `tokens_unmatched`, per statement `segments_in_window`,
    `named_in_window`, `name_pruned`, `token_only_fetched`,
    `unrouted_fetched_expected`, `holders`, `value_holders`,
-   `expected_routed_prunes`, `route_bound`, `route_bound_reason` and
+   `expected_routed_prunes`, `route_bound`, `route_bound_reason`,
    `routed_pruned_by_label_index` (the distinct whole-number
-   `segmentsPrunedByLabelIndex` values of its `stage1-routed` records), the
+   `segmentsPrunedByLabelIndex` values of its `stage1-routed` records) and
+   ADR-3694 row 3's three figures under `routed_open_check`:
+   `value_holders_beyond_resolved` (`value_holders` minus the resolved
+   set), `routed_opened_minus_expected` (over the statement's answered
+   `stage1-routed` records, `segmentsFetched`, the objects opened, minus
+   `value_holders` plus `token_only_fetched`, the difference of largest
+   magnitude) and `routed_probe_wire_bytes_per_opened_object` (the median
+   over those records of the probe phase's `s3GetWireBytes` over the
+   record's `segmentsFetched`), each null when an input is missing or not
+   a whole number, a record has no probe phase or opened no object, or no
+   routed record answered (the row 3 `stage1-check` cases), the
    skipped count, each check below with the sentence stating it, and the
    route-bound list. The window check compares the `segmentsFetched` of
    every one of a statement's `stage1-unrouted` records with its
@@ -1776,6 +1786,26 @@ it). The reference pass's own label-index prunes are in
 the `ci` band file sets no floor on them, since on `ci` the router can prune
 nothing; a profile band file whose corpus prunes can require one. Every basis is a
 prediction until a `stage1=true` dispatch measures it.
+
+The `cardinality` file carries ADR-3694's restated row 3 (the amendment's
+"Row 3, restated to value holders" and "The leaf GET bound per value";
+measured 2026-11-10, comment 6790288400; owner decision comment
+6790537615). Value holders are stamped per run, not held to a count; the
+row's target is read against each run's own stamp. Bytes are decimal,
+KB = 1,000 bytes, and wire bytes are as transferred, with retries and range
+reads as the server counts them in `s3GetWireBytes`. Each row has a
+`stage1-check` case (run.test.sh, the row 3 cases):
+
+| figure | file and path | band | basis |
+|---|---|---|---|
+| `holders_single_counter_rate_value_holders` | holders.json `statements[id=mb_single_counter_rate].value_holders` | [1, null] | stamped per run; T8 stamped 1,597 and its rerun 1,596; fails only when absent or below 1 |
+| `holders_single_counter_rate_value_holders_beyond_resolved` | stamps.json `stage1.holders.statements[id=mb_single_counter_rate].value_holders_beyond_resolved` | [null, 0] | the upper bound on the value holders: a value holder is an object of the resolved set; a band's bounds are fixed numbers, so it is checked as this difference |
+| `holders_single_counter_rate_opened_minus_expected` | stamps.json `stage1.holders.statements[id=mb_single_counter_rate].routed_opened_minus_expected` | [0, 0] | objects opened = value holders plus `token_only_fetched`; T8 opened 1,601 = 1,597 + 4 |
+| `holders_single_counter_rate_probe_wire_bytes_per_opened_object` | stamps.json `stage1.holders.statements[id=mb_single_counter_rate].routed_probe_wire_bytes_per_opened_object` | [0, 434000] | target 394 KB, the T8 figure (631.5 MB probe wire over 1,601 objects opened); the 434 KB miss line, 10 % above, is predicted |
+| `route_values_leaf_gets_over_bound` | stage1-compare.json `statements_leaf_gets_over_bound_count` | [0, 0] | leaf GETs at most (1 + n) x covering parts, which assumes the query read cache and one slice per part; T8 read 3 against bounds of 6 and 10 |
+
+The prune count itself (`segmentsPrunedByLabelIndex` = the resolved set
+minus value holders) is `holders_routed_prune_mismatches`, [0, 0].
 
 The nightly workflow's manual dispatch takes a `stage1` input (default
 false) that sets `MB_STAGE1=1` and then runs `stage1-check.sh` with the `ci`
