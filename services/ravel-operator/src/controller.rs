@@ -4013,8 +4013,8 @@ mod tests {
     #[test]
     fn a_schemeless_endpoint_degrades_the_cluster_with_its_own_reason() {
         let mut spec = spec_with_affinity(None);
-        spec.storage.s3.endpoint = Some("rustfs:9000".to_string());
-        spec.storage.s3.allow_http = false;
+        spec.storage.test_s3_mut().endpoint = Some("rustfs:9000".to_string());
+        spec.storage.test_s3_mut().allow_http = false;
 
         let err = Error::Render(
             s3_allow_http(&spec).expect_err("a schemeless endpoint must refuse the reconcile"),
@@ -4047,7 +4047,7 @@ mod tests {
 
         // A plaintext non-loopback endpoint keeps its own, different reason, so
         // the two misconfigurations are never reported as one.
-        spec.storage.s3.endpoint = Some("http://rustfs:9000".to_string());
+        spec.storage.test_s3_mut().endpoint = Some("http://rustfs:9000".to_string());
         let (plaintext_reason, _) = degraded_reason(&Error::Render(
             s3_allow_http(&spec).expect_err("plaintext to a non-loopback host must refuse"),
         ));
@@ -4065,8 +4065,8 @@ mod tests {
     fn build_auth_store_refuses_a_plaintext_endpoint_without_allow_http() {
         let config_for = |endpoint: Option<&str>, allow_http: bool| {
             let mut spec = spec_with_affinity(None);
-            spec.storage.s3.endpoint = endpoint.map(str::to_string);
-            spec.storage.s3.allow_http = allow_http;
+            spec.storage.test_s3_mut().endpoint = endpoint.map(str::to_string);
+            spec.storage.test_s3_mut().allow_http = allow_http;
             auth_store_config(&spec, "key".to_string(), "secret".to_string())
         };
 
@@ -4121,19 +4121,19 @@ mod tests {
         use ravel_object_store::s3::UploadIntegrity;
 
         let mut spec = spec_with_affinity(None);
-        let http = auth_store_http_config(&spec);
+        let http = auth_store_http_config(spec.storage.test_s3());
         assert_eq!(http.upload_integrity, UploadIntegrity::Crc64Nvme);
         assert!(http.request_stored_checksum);
 
-        spec.storage.s3.upload_integrity = S3UploadIntegrity::Off;
-        spec.storage.s3.request_stored_checksum = false;
-        let http = auth_store_http_config(&spec);
+        spec.storage.test_s3_mut().upload_integrity = S3UploadIntegrity::Off;
+        spec.storage.test_s3_mut().request_stored_checksum = false;
+        let http = auth_store_http_config(spec.storage.test_s3());
         assert_eq!(http.upload_integrity, UploadIntegrity::Off);
         assert!(!http.request_stored_checksum);
 
-        spec.storage.s3.upload_integrity = S3UploadIntegrity::Sha256;
+        spec.storage.test_s3_mut().upload_integrity = S3UploadIntegrity::Sha256;
         assert_eq!(
-            auth_store_http_config(&spec).upload_integrity,
+            auth_store_http_config(spec.storage.test_s3()).upload_integrity,
             UploadIntegrity::Sha256
         );
     }
@@ -4145,7 +4145,7 @@ mod tests {
             image_pull_policy: None,
             shards: 4,
             storage: StorageSpec {
-                s3: S3Spec {
+                s3: Some(S3Spec {
                     bucket: "ravel-data".to_string(),
                     region: "eu-west-1".to_string(),
                     endpoint: None,
@@ -4156,7 +4156,8 @@ mod tests {
                     credentials_secret_ref: Some(LocalSecretRef {
                         name: "ravel-s3".to_string(),
                     }),
-                },
+                }),
+                azure: None,
             },
             tenant_tokens_secret_ref: None,
             deployment_key_secret_ref: None,
@@ -7366,7 +7367,7 @@ mod tests {
                 image_pull_policy: None,
                 shards,
                 storage: crate::crd::StorageSpec {
-                    s3: crate::crd::S3Spec {
+                    s3: Some(crate::crd::S3Spec {
                         bucket: "b".to_string(),
                         region: "us-east-1".to_string(),
                         endpoint: None,
@@ -7377,7 +7378,8 @@ mod tests {
                         credentials_secret_ref: Some(LocalSecretRef {
                             name: "creds".to_string(),
                         }),
-                    },
+                    }),
+                    azure: None,
                 },
                 tenant_tokens_secret_ref: None,
                 deployment_key_secret_ref: None,
@@ -7647,8 +7649,8 @@ mod tests {
 
     fn pod_identity_cluster_spec() -> RavelClusterSpec {
         let mut spec = spec_with_affinity(None);
-        spec.storage.s3.auth = crate::crd::S3AuthSpec::PodIdentity;
-        spec.storage.s3.credentials_secret_ref = None;
+        spec.storage.test_s3_mut().auth = crate::crd::S3AuthSpec::PodIdentity;
+        spec.storage.test_s3_mut().credentials_secret_ref = None;
         spec
     }
 
@@ -7735,7 +7737,7 @@ mod tests {
     #[tokio::test]
     async fn pod_identity_reads_no_credential_secret() {
         let mut spec = pod_identity_cluster_spec();
-        spec.storage.s3.credentials_secret_ref = Some(LocalSecretRef {
+        spec.storage.test_s3_mut().credentials_secret_ref = Some(LocalSecretRef {
             name: "deleted-long-ago".to_string(),
         });
         let versions = resolve_credential_resource_versions(&unreachable_client(), "ns", &spec)

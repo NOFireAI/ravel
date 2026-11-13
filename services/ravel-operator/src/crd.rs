@@ -176,6 +176,19 @@ pub enum StorageBackend<'a> {
     Azure(&'a AzureSpec),
 }
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+impl StorageSpec {
+    /// `storage.s3` of a spec a test built with it.
+    pub(crate) fn test_s3(&self) -> &S3Spec {
+        self.s3.as_ref().expect("the test spec sets storage.s3")
+    }
+
+    pub(crate) fn test_s3_mut(&mut self) -> &mut S3Spec {
+        self.s3.as_mut().expect("the test spec sets storage.s3")
+    }
+}
+
 impl StorageSpec {
     /// The configured backend, or `None` when neither or both are set.
     pub fn backend(&self) -> Option<StorageBackend<'_>> {
