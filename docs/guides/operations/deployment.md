@@ -222,9 +222,13 @@ On `--store gcs`, Ravel probes none of the bucket's protection, and
 Configure the bucket's retention policy, object
 versioning and soft delete on the bucket itself, and verify them there.
 The same holds on `--store azure`: Ravel sends no protection probe to Azure,
-`--require-bucket-protection` is refused at startup, and soft delete,
-versioning and an immutability policy are configured and verified on the
-account and container.
+`--require-bucket-protection` is refused at startup, and the account and
+container are configured and verified by hand: blob versioning paired with a
+lifecycle management rule that deletes previous versions, soft delete with a
+bounded retention period, and an immutability policy only where it does not
+refuse the deletes that retention and erasure need. See
+[Required bucket configuration](../../object-store-contract.md#required-bucket-configuration-adr-0064-7-adr-0072-decision-3)
+in the store contract.
 
 On `--store s3`, the check reads the bucket's configuration once per start. A
 bucket changed under a running process is seen at the next restart. The check
