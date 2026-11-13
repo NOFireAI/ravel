@@ -12148,4 +12148,476 @@ mod tests {
         );
         assert!(!args.iter().any(|a| a == "--mcp-max-body-bytes"));
     }
+
+    // ---- storage.azure: workload identity (issue #4165, ADR-4158) ----
+
+    const AZURE_CLIENT_ID: &str = "00000000-0000-0000-0000-00000000c1d0";
+
+    fn azure_spec() -> RavelClusterSpec {
+        let mut spec = base_spec();
+        spec.storage = StorageSpec {
+            s3: None,
+            azure: Some(AzureSpec {
+                account: "ravelacct".to_string(),
+                container: "ravel-data".to_string(),
+                client_id: AZURE_CLIENT_ID.to_string(),
+                role_client_ids: None,
+            }),
+        };
+        spec
+    }
+
+    fn azure_mut(spec: &mut RavelClusterSpec) -> &mut AzureSpec {
+        spec.storage.azure.as_mut().expect("an azure spec")
+    }
+
+    /// No credential Secret exists under Azure, so none has a resourceVersion.
+    fn azure_ctx() -> RenderCtx {
+        RenderCtx {
+            credential_resource_versions: BTreeMap::new(),
+            ..ctx()
+        }
+    }
+
+    /// The four tier pods of an Azure cluster, with their pod template labels.
+    fn azure_pods(
+        spec: &RavelClusterSpec,
+    ) -> Vec<(&'static str, BTreeMap<String, String>, PodSpec)> {
+        let objects = desired_objects(spec, "prod", "ns", &azure_ctx()).expect("azure renders");
+        let template = |d: &Deployment| {
+            d.spec
+                .as_ref()
+                .map(|s| s.template.clone())
+                .expect("template")
+        };
+        let job = desired_qualify_job(spec, "prod", None, None);
+        let job_template = job.spec.map(|s| s.template).expect("job template");
+        [
+            ("gateway", template(&objects.gateway_deployment)),
+            ("query", template(&objects.query_deployment)),
+            (
+                "maintain",
+                template(objects.maintain.deployment().expect("maintain renders")),
+            ),
+            ("qualify", job_template),
+        ]
+        .into_iter()
+        .map(|(component, t)| {
+            let labels = t.metadata.and_then(|m| m.labels).unwrap_or_default();
+            (component, labels, t.spec.expect("pod spec"))
+        })
+        .collect()
+    }
+
+    fn service_account_client_ids(spec: &RavelClusterSpec) -> Vec<(String, Option<String>)> {
+        desired_tier_service_accounts(spec, "prod")
+            .into_iter()
+            .map(|sa| {
+                let id = sa
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(AZURE_WORKLOAD_IDENTITY_CLIENT_ID_ANNOTATION).cloned());
+                (sa.metadata.name.expect("name"), id)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn azure_cluster_renders_store_args_and_workload_identity() {
+        let spec = azure_spec();
+        let objects = desired_objects(&spec, "prod", "ns", &azure_ctx()).expect("azure renders");
+        let tokens = [
+            "--tenant-token",
+            "$(RAVEL_TENANT_TOKEN_0)=acme",
+            "--tenant-token",
+            "$(RAVEL_TENANT_TOKEN_1)=globex",
+        ];
+        let store = [
+            "--store",
+            "azure",
+            "--shards",
+            "8",
+            "--azure-account",
+            "ravelacct",
+            "--azure-container",
+            "ravel-data",
+            "--tenant-hash-unkeyed",
+        ];
+        let expected_gateway: Vec<&str> = [
+            "--mode",
+            "gateway",
+            "--listen-http",
+            "0.0.0.0:4318",
+            "--listen-grpc",
+            "0.0.0.0:4317",
+        ]
+        .into_iter()
+        .chain(store)
+        .chain(tokens)
+        .collect();
+        let expected_query: Vec<&str> = ["--mode", "query", "--listen-http", "0.0.0.0:4318"]
+            .into_iter()
+            .chain(store)
+            .chain(tokens)
+            .collect();
+        let expected_maintain: Vec<&str> = [
+            "--mode",
+            "maintain",
+            "--listen-http",
+            "0.0.0.0:4318",
+            "--maintain-key-file",
+            "/etc/ravel/maintain-key/keys",
+        ]
+        .into_iter()
+        .chain(store)
+        .chain(tokens)
+        .chain([
+            "--maintain-interval-secs",
+            "600",
+            "--retention-default",
+            "30d",
+            "--retention-tenant",
+            "acme=7d",
+        ])
+        .collect();
+        assert_eq!(args_of(&objects.gateway_deployment), expected_gateway);
+        assert_eq!(args_of(&objects.query_deployment), expected_query);
+        assert_eq!(
+            args_of(objects.maintain.deployment().expect("maintain renders")),
+            expected_maintain
+        );
+
+        let job = desired_qualify_job(&spec, "prod", None, None);
+        let job_labels = job.metadata.labels.clone();
+        let job_pod = job
+            .spec
+            .and_then(|s| s.template.spec)
+            .expect("job pod spec");
+        assert_eq!(
+            job_pod.containers[0].args.as_deref(),
+            Some(
+                ["--store", "azure", "store", "qualify"]
+                    .map(str::to_string)
+                    .as_slice()
+            )
+        );
+        assert_eq!(
+            job_pod.containers[0].env,
+            Some(vec![
+                EnvVar {
+                    name: "RAVEL_AZURE_ACCOUNT".to_string(),
+                    value: Some("ravelacct".to_string()),
+                    ..Default::default()
+                },
+                EnvVar {
+                    name: "RAVEL_AZURE_CONTAINER".to_string(),
+                    value: Some("ravel-data".to_string()),
+                    ..Default::default()
+                },
+            ])
+        );
+        assert_eq!(job_labels, Some(labels("prod", QUALIFY_COMPONENT)));
+
+        for (component, template_labels, pod) in azure_pods(&spec) {
+            assert_eq!(
+                template_labels.get(AZURE_WORKLOAD_IDENTITY_USE_LABEL),
+                Some(&"true".to_string()),
+                "{component}: the workload identity webhook selects on the label"
+            );
+            let mut without_use = template_labels.clone();
+            without_use.remove(AZURE_WORKLOAD_IDENTITY_USE_LABEL);
+            assert_eq!(without_use, labels("prod", component), "{component}");
+            assert_eq!(
+                pod.service_account_name.as_deref(),
+                Some(format!("prod-{component}").as_str()),
+                "{component}"
+            );
+            assert_eq!(pod.init_containers, None, "{component}: no sidecar");
+            assert!(
+                !pod.volumes
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|v| v.name == AWS_CREDENTIALS_VOLUME_NAME),
+                "{component}: no aws-credentials volume"
+            );
+            for container in &pod.containers {
+                let args = container.args.clone().unwrap_or_default();
+                assert!(
+                    !args
+                        .iter()
+                        .any(|a| a.starts_with("--s3-") || a == "--require-bucket-protection"),
+                    "{component}: {args:?}"
+                );
+                let env = container.env.clone().unwrap_or_default();
+                assert!(
+                    !env.iter().any(|v| v.name.starts_with("RAVEL_S3_")),
+                    "{component}: {env:?}"
+                );
+                assert!(
+                    !container
+                        .volume_mounts
+                        .clone()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|m| m.name == AWS_CREDENTIALS_VOLUME_NAME),
+                    "{component}"
+                );
+            }
+        }
+
+        // The selector stays the S3 one, so a backend switch never needs a
+        // Deployment recreate.
+        assert_eq!(
+            objects
+                .gateway_deployment
+                .spec
+                .as_ref()
+                .and_then(|s| s.selector.match_labels.clone()),
+            desired_objects(&base_spec(), "prod", "ns", &ctx())
+                .expect("renders")
+                .gateway_deployment
+                .spec
+                .and_then(|s| s.selector.match_labels)
+        );
+
+        let names = ["prod-gateway", "prod-query", "prod-maintain", "prod-qualify"];
+        assert_eq!(
+            service_account_client_ids(&spec),
+            names.map(|n| (n.to_string(), Some(AZURE_CLIENT_ID.to_string())))
+        );
+        for (sa, component) in desired_tier_service_accounts(&spec, "prod")
+            .iter()
+            .zip(POD_IDENTITY_COMPONENTS)
+        {
+            assert_eq!(sa.metadata.labels, Some(labels("prod", component)));
+        }
+
+        let mut per_role = azure_spec();
+        azure_mut(&mut per_role).role_client_ids = Some(crate::crd::AzureRoleClientIds {
+            gateway: Some("gateway-id".to_string()),
+            query: None,
+            maintain: Some("maintain-id".to_string()),
+            qualify: Some("qualify-id".to_string()),
+        });
+        assert_eq!(
+            service_account_client_ids(&per_role),
+            vec![
+                ("prod-gateway".to_string(), Some("gateway-id".to_string())),
+                ("prod-query".to_string(), Some(AZURE_CLIENT_ID.to_string())),
+                ("prod-maintain".to_string(), Some("maintain-id".to_string())),
+                ("prod-qualify".to_string(), Some("qualify-id".to_string())),
+            ]
+        );
+
+        assert!(per_role_credentials(&spec));
+        assert_eq!(validate_storage_auth(&spec, None), Ok(()));
+        assert_eq!(
+            tier_credentials_secret_name(&spec, spec.gateway.credentials_secret_ref.as_ref()),
+            None
+        );
+    }
+
+    #[test]
+    fn azure_refuses_tier_overrides_and_an_ambiguous_storage_block() {
+        let mut tier_override = azure_spec();
+        tier_override.maintain.credentials_secret_ref = Some(LocalSecretRef {
+            name: "maintain-s3".to_string(),
+        });
+        assert_eq!(
+            desired_objects(&tier_override, "prod", "ns", &azure_ctx()).err(),
+            Some(RenderError::AzureTierOverride { tier: "maintain" })
+        );
+
+        let mut neither = base_spec();
+        neither.storage.s3 = None;
+        let mut both = azure_spec();
+        both.storage.s3 = base_spec().storage.s3;
+        for spec in [neither, both] {
+            assert_eq!(
+                validate_storage_auth(&spec, Some(SIDECAR_IMAGE)),
+                Err(RenderError::StorageBackendNotExactlyOne)
+            );
+            assert_eq!(
+                desired_objects(&spec, "prod", "ns", &pod_identity_ctx()).err(),
+                Some(RenderError::StorageBackendNotExactlyOne)
+            );
+            // The infallible renders never fall back to the server's memory
+            // store default.
+            let job = desired_qualify_job(&spec, "prod", None, None);
+            let args = job
+                .spec
+                .and_then(|s| s.template.spec)
+                .map(|p| p.containers[0].args.clone().unwrap_or_default())
+                .expect("job pod spec");
+            assert_eq!(args, ["--store", "unconfigured", "store", "qualify"]);
+        }
+    }
+
+    /// blake3 of every pod-bearing object and ServiceAccount the render
+    /// produces for `spec` under `ctx`, serialized as the apiserver sees it.
+    fn full_render_hash(spec: &RavelClusterSpec, ctx: &RenderCtx, rv: Option<&str>) -> String {
+        let objects = desired_objects(spec, "prod", "ns", ctx).expect("renders");
+        let job = desired_qualify_job(spec, "prod", rv, ctx.credentials_sidecar_image.as_deref());
+        let accounts = desired_tier_service_accounts(spec, "prod");
+        let value = serde_json::json!([
+            objects.gateway_deployment,
+            objects.query_deployment,
+            objects.maintain.deployment(),
+            job,
+            accounts,
+        ]);
+        blake3::hash(&serde_json::to_vec(&value).expect("serializes"))
+            .to_hex()
+            .to_string()
+    }
+
+    /// The two full-render hashes were computed by this same helper on the
+    /// tree before `storage` became a one-of, so an S3 cluster's pods, Job
+    /// and ServiceAccounts are byte-identical across the upgrade and no
+    /// rollout or re-qualification follows it.
+    #[test]
+    fn s3_cluster_render_is_unchanged_by_the_storage_one_of() {
+        assert_eq!(
+            full_render_hash(&base_spec(), &ctx(), Some("rv-golden")),
+            "3546d30f83b09e7f48135d5fe33e19c619fb733bd12b32fa3e36197f31273df0"
+        );
+        assert_eq!(
+            full_render_hash(&pod_identity_spec(), &pod_identity_ctx(), None),
+            "70db745d80915f0b17037ce2ca92df65aeaf961c2ba19e1a16c8a1e0f56f2855"
+        );
+        assert_eq!(
+            qualify_job_input_hash(&base_spec(), Some("rv-golden")),
+            "24d69826f4e13844ba25471e9d505437d20d498de5bfa5de0dc60e08162010d2"
+        );
+        assert_eq!(
+            query_render_hash(&base_spec()),
+            "8dd388d49b621b16038eace2f47d8f4544ad9e4009fb2c9557dc18e3b82dd3da"
+        );
+        for template_labels in pod_identity_pods_with_labels() {
+            assert!(!template_labels.contains_key(AZURE_WORKLOAD_IDENTITY_USE_LABEL));
+        }
+        for sa in desired_tier_service_accounts(&pod_identity_spec(), "prod") {
+            assert_eq!(sa.metadata.annotations, None);
+        }
+    }
+
+    fn pod_identity_pods_with_labels() -> Vec<BTreeMap<String, String>> {
+        let objects = desired_objects(&pod_identity_spec(), "prod", "ns", &pod_identity_ctx())
+            .expect("renders");
+        let job = desired_qualify_job(&pod_identity_spec(), "prod", None, Some(SIDECAR_IMAGE));
+        [
+            objects.gateway_deployment.spec.map(|s| s.template),
+            objects.query_deployment.spec.map(|s| s.template),
+            objects
+                .maintain
+                .into_deployment()
+                .and_then(|d| d.spec)
+                .map(|s| s.template),
+            job.spec.map(|s| s.template),
+        ]
+        .into_iter()
+        .map(|t| {
+            t.and_then(|t| t.metadata)
+                .and_then(|m| m.labels)
+                .unwrap_or_default()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn azure_service_account_sweep_follows_the_owned_accounts() {
+        let all = possible_tier_service_account_names("prod");
+
+        // An Azure cluster with the marker recorded keeps all four.
+        assert!(tier_service_accounts_to_sweep(&azure_spec(), "prod", true).is_empty());
+        assert_eq!(
+            pod_identity_service_accounts_marker(&azure_spec(), false, false),
+            Some(true)
+        );
+
+        // Pod Identity edited to Azure: the recorded accounts stay, now
+        // carrying the client-id annotation, and the marker stays set.
+        assert!(tier_service_accounts_to_sweep(&pod_identity_spec(), "prod", true).is_empty());
+        assert!(tier_service_accounts_to_sweep(&azure_spec(), "prod", true).is_empty());
+        assert_eq!(
+            service_account_client_ids(&azure_spec()),
+            all.iter()
+                .map(|n| (n.clone(), Some(AZURE_CLIENT_ID.to_string())))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            pod_identity_service_accounts_marker(&azure_spec(), true, false),
+            Some(true)
+        );
+
+        // Azure edited to S3 static: all four are swept, then the marker clears.
+        assert_eq!(
+            tier_service_accounts_to_sweep(&base_spec(), "prod", true),
+            all
+        );
+        assert_eq!(
+            pod_identity_service_accounts_marker(&base_spec(), true, false),
+            Some(true)
+        );
+        assert_eq!(
+            pod_identity_service_accounts_marker(&base_spec(), true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn azure_qualify_hash_moves_on_account_container_image_and_qualify_client_id() {
+        let base = qualify_job_input_hash(&azure_spec(), None);
+        assert_eq!(base, qualify_job_input_hash(&azure_spec(), None));
+        assert_eq!(
+            base,
+            qualify_job_input_hash(&azure_spec(), Some("rv")),
+            "no Secret enters an Azure hash"
+        );
+
+        let mut account = azure_spec();
+        azure_mut(&mut account).account = "otheracct".to_string();
+        let mut container = azure_spec();
+        azure_mut(&mut container).container = "other-container".to_string();
+        let mut image = azure_spec();
+        image.image = "registry.example/ravel:v2".to_string();
+        let mut client_id = azure_spec();
+        azure_mut(&mut client_id).client_id = "another-client".to_string();
+        let mut qualify_id = azure_spec();
+        azure_mut(&mut qualify_id).role_client_ids = Some(crate::crd::AzureRoleClientIds {
+            qualify: Some("qualify-id".to_string()),
+            ..Default::default()
+        });
+        for (field, spec) in [
+            ("account", account),
+            ("container", container),
+            ("image", image),
+            ("clientId (the qualify fallback)", client_id),
+            ("roleClientIds.qualify", qualify_id),
+        ] {
+            assert_ne!(base, qualify_job_input_hash(&spec, None), "{field}");
+        }
+
+        let mut tier_ids = azure_spec();
+        azure_mut(&mut tier_ids).role_client_ids = Some(crate::crd::AzureRoleClientIds {
+            gateway: Some("gateway-id".to_string()),
+            query: Some("query-id".to_string()),
+            maintain: Some("maintain-id".to_string()),
+            qualify: None,
+        });
+        assert_eq!(base, qualify_job_input_hash(&tier_ids, None));
+
+        assert_ne!(base, qualify_job_input_hash(&base_spec(), None));
+        assert_ne!(base, qualify_job_input_hash(&pod_identity_spec(), None));
+
+        let job = desired_qualify_job(&azure_spec(), "prod", None, None);
+        assert_eq!(
+            job.metadata
+                .annotations
+                .and_then(|a| a.get(QUALIFY_SPEC_HASH_ANNOTATION).cloned()),
+            Some(base)
+        );
+    }
 }
