@@ -3338,6 +3338,12 @@ fn degraded_reason(err: &Error) -> (String, String) {
         Error::Render(RenderError::PodIdentityTierOverride { .. }) => {
             ("PodIdentityTierOverride".to_string(), err.to_string())
         }
+        Error::Render(RenderError::StorageBackendNotExactlyOne) => {
+            ("StorageBackendNotExactlyOne".to_string(), err.to_string())
+        }
+        Error::Render(RenderError::AzureTierOverride { .. }) => {
+            ("AzureTierOverride".to_string(), err.to_string())
+        }
         // The message names the two webhook variables and asks whether the
         // operator's own ServiceAccount carries an association.
         Error::PodIdentityCredentialsUnavailable(_) => (
@@ -3811,8 +3817,8 @@ pub async fn run_on(
 mod tests {
     use super::*;
     use crate::crd::{
-        DistributedQuerySpec, GatewaySpec, IngestAffinitySpec, MaintainSpec, ProbesSpec, QuerySpec,
-        S3Spec, StorageSpec,
+        AzureSpec, DistributedQuerySpec, GatewaySpec, IngestAffinitySpec, MaintainSpec, ProbesSpec,
+        QuerySpec, S3Spec, StorageSpec,
     };
     use kube::Config;
 
@@ -4180,6 +4186,21 @@ mod tests {
         }
     }
 
+    /// `spec_with_affinity(None)` moved onto `storage.azure`.
+    fn azure_spec() -> RavelClusterSpec {
+        let mut spec = spec_with_affinity(None);
+        spec.storage = StorageSpec {
+            s3: None,
+            azure: Some(AzureSpec {
+                account: "ravelacct".to_string(),
+                container: "ravel-data".to_string(),
+                client_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                role_client_ids: None,
+            }),
+        };
+        spec
+    }
+
     /// Condition `type`s in order, which is what the assertions below are
     /// really about: a condition present at all, and no other one dropped.
     fn condition_types(conditions: &[Condition]) -> Vec<&str> {
@@ -4376,6 +4397,14 @@ mod tests {
         );
         produced.push(CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED);
 
+        // BucketProtectionVerified: spec_conditions on a storage.azure spec.
+        let azure_extra = spec_conditions(&azure_spec(), Some(1));
+        assert_eq!(
+            condition_types(&azure_extra),
+            vec![CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED]
+        );
+        produced.push(CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED);
+
         let mut produced_sorted = produced.clone();
         produced_sorted.sort_unstable();
         let mut expected_sorted = CONDITION_TYPES.to_vec();
@@ -4383,6 +4412,49 @@ mod tests {
         assert_eq!(
             produced_sorted, expected_sorted,
             "every entry in CONDITION_TYPES must be demonstrated reachable here: got {produced:?}"
+        );
+    }
+
+    /// An Azure cluster reports BucketProtectionVerified=False with reason
+    /// NotImplementedForAzure on both status writers; an S3 cluster reports
+    /// no such condition at all.
+    #[test]
+    fn bucket_protection_verified_is_false_on_azure_and_absent_on_s3() {
+        let azure = spec_conditions(&azure_spec(), Some(3));
+        let cond = find(&azure, CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED);
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, "NotImplementedForAzure");
+        assert_eq!(cond.observed_generation, Some(3));
+
+        let success = build_status(
+            Some(3),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            PersistedStatus::default(),
+            azure.clone(),
+        );
+        assert_eq!(
+            find(&success.conditions, CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED).status,
+            "False"
+        );
+        let degraded = build_degraded_status(
+            Some(3),
+            "ReconcileError",
+            "boom",
+            PersistedStatus::default(),
+            azure,
+        );
+        assert_eq!(
+            find(&degraded.conditions, CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED).status,
+            "False"
+        );
+
+        let s3 = spec_conditions(&spec_with_affinity(None), Some(3));
+        assert!(
+            !condition_types(&s3).contains(&CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED),
+            "an S3 cluster carries no BucketProtectionVerified condition: {s3:?}"
         );
     }
 
@@ -7696,6 +7768,17 @@ mod tests {
         assert_eq!(reason, "PodIdentityTierOverride");
         assert!(
             message.contains("spec.maintain.credentialsSecretRef"),
+            "{message}"
+        );
+        let (reason, _) = degraded_reason(&Error::Render(
+            RenderError::StorageBackendNotExactlyOne,
+        ));
+        assert_eq!(reason, "StorageBackendNotExactlyOne");
+        let (reason, message) =
+            degraded_reason(&Error::Render(RenderError::AzureTierOverride { tier: "query" }));
+        assert_eq!(reason, "AzureTierOverride");
+        assert!(
+            message.contains("spec.query.credentialsSecretRef"),
             "{message}"
         );
     }
