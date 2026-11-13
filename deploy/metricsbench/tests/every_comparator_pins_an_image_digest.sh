@@ -236,12 +236,15 @@ RUN_IMAGE_VAR_REF_RESOLVED='"$ref"'
 # assertion to notice -- same rationale as category 5's `find` call.
 
 # Exact number of `image:` lines across every deploy/k8s manifest: rustfs.yaml
-# (rustfs, aws-cli), floci.yaml (floci, curlimages/curl), and the two kind-loaded
-# example/operator manifests below. Update deliberately if a manifest gains,
-# loses, or repoints an `image:` line.
-K8S_EXPECTED_IMAGE_COUNT=6
+# (rustfs, aws-cli), floci.yaml (floci, curlimages/curl), and the three
+# local-tag example/operator manifests below: examples/ravelcluster-dev.yaml
+# and operator/operator.yaml, which kind loads, and
+# examples/ravelcluster-azure.yaml, whose `ravel-server:latest` is a
+# placeholder for a pinned release image. Update deliberately if a manifest
+# gains, loses, or repoints an `image:` line.
+K8S_EXPECTED_IMAGE_COUNT=7
 
-# Of those six, the number that must carry a digest pin: every reference
+# Of those seven, the number that must carry a digest pin: every reference
 # except the two kind-loaded local-tag exemptions below. Update deliberately
 # alongside K8S_EXPECTED_IMAGE_COUNT.
 K8S_EXPECTED_PINNED_COUNT=4

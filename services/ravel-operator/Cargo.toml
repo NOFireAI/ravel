@@ -96,6 +96,13 @@ bytes = "1"
 # `Deserializer`/`Value`/`from_value` API, so the multi-document parse above is
 # unchanged.
 serde_yaml_ng = "0.10"
+# Evaluates the CRD's `storage.azure` patterns in a test, the way the API
+# server does at admission. Already a workspace pin; adds no new external
+# crate.
+regex = { workspace = true }
+# `start_paused` for the store-construction timeout test: time advances on
+# tokio's paused clock, not the wall clock.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

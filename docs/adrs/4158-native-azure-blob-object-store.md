@@ -338,7 +338,9 @@ without this decision `--store azure` would be reachable only by hand.
   role with `gateway`, `query`, `maintain` and `qualify`, which is how
   ADR-0055's per-role scoping is expressed on Azure: one managed identity
   per role, each with its own role assignment on the container. There is
-  no endpoint field and no secret reference.
+  no endpoint field and no secret reference. The CRD validates the shape
+  of the account, the container and every client ID (the 2026-11-13
+  operator correction below).
 - **Identity wiring.** The operator owns the four ServiceAccounts it
   already owns under Pod Identity (`<name>-gateway`, `-query`, `-maintain`,
   `-qualify`). Under `storage.azure` each carries the annotation
@@ -348,6 +350,9 @@ without this decision `--store azure` would be reachable only by hand.
   `serviceAccountName`. The AKS workload identity webhook then injects the
   token file and the `AZURE_*` variables D3 reads. There is no sidecar and
   no credentials file: `object_store` reads the federated token itself.
+  Each tier's pod template also carries its client ID as an annotation, so
+  that a client ID change rolls the tier (the 2026-11-13 operator
+  correction below).
   In the operator's code all of this sits behind `pod_identity(spec)`
   today, which reads `storage.s3.auth` and is false on an Azure cluster.
   So the gate is split in two. Rendering the four ServiceAccounts, setting
@@ -372,7 +377,8 @@ without this decision `--store azure` would be reachable only by hand.
   set it for production, so its absence must not be silent. An Azure
   cluster carries the status condition `BucketProtectionVerified=False`
   with reason `NotImplementedForAzure`, and the guide says what to
-  configure by hand (versioning, soft delete, an immutability policy).
+  configure by hand (versioning, soft delete, an immutability policy;
+  the 2026-11-13 operator correction below replaces this list).
   When the probes exist (D10) the flag is rendered and the condition goes.
 - **The qualify hash** for an Azure cluster covers the account, the
   container, the image and the `qualify` client ID. A change to any of
@@ -383,7 +389,8 @@ without this decision `--store azure` would be reachable only by hand.
   workload identity mechanism. Its consumers (`sys/auth` convergence,
   resharding) already take `&dyn ObjectStoreBackend`. The operator's
   Deployment and ServiceAccount manifests gain the label and a client-ID
-  annotation placeholder, documented as needed only for Azure clusters.
+  annotation placeholder (the 2026-11-13 operator correction below makes
+  both opt-in and commented), documented as needed only for Azure clusters.
 - **Proof.** Render and reconcile tests against the fake apiserver pin the
   arguments, labels, annotations, the one-of rule and the unchanged S3
   hashes. No test in CI starts an operator-rendered cluster on Azure: the
@@ -626,3 +633,40 @@ hold as written, and one answer the Measured section leaves out.
   retry clears one. This replaces D5's wording that only a 409 for a lease
   is `Permanent`, and narrows "409 and 412 are the precondition outcomes
   named in D1" to codes that are not lease codes, except on a create.
+
+## Correction (2026-11-13): operator details from review
+
+<!-- amendment-applies: sections="D11. The operator runs a `RavelCluster` on Azure with AKS workload identity" pointer="2026-11-13 operator correction" -->
+<!-- amendment-supersedes: phrase="versioning, soft delete, an immutability policy" pointer="2026-11-13 operator correction" -->
+<!-- amendment-supersedes: phrase="manifests gain the label and a client-ID" pointer="2026-11-13 operator correction" -->
+
+The review of #4165 showed four places where D11 did not hold as written.
+
+- **A client ID change rolls the tier.** The workload identity webhook
+  sets `AZURE_CLIENT_ID` on a pod only when it admits the pod, so a change
+  to a ServiceAccount's client-ID annotation alone leaves running pods on
+  the old identity. Under `storage.azure` each tier's pod template carries
+  the annotation `ravel.nofire.ai/azure-client-id` with that tier's client
+  ID (its `roleClientIds` entry, or `clientId` when the entry is unset), so
+  a client ID change rolls exactly the tiers whose ID changed. The qualify
+  Job carries none: its client ID is already in the qualify hash, and a
+  change re-runs qualification. A cluster on `storage.s3` renders no such
+  annotation, and the pinned S3 hashes do not move.
+- **The operator's label and annotation are opt-in.** The operator's own
+  store client opens the container only for `sys/auth` convergence and for
+  a reshard, that is only for a cluster that sets `deploymentKeySecretRef`
+  or names a tenant under `shardOverrides`. The shipped `operator.yaml`
+  and `rbac.yaml` therefore carry the `azure.workload.identity/use` label
+  and the client-ID annotation as comments, to be enabled by hand for such
+  a cluster, followed by a restart of the operator pod.
+- **What to configure by hand** on the container replaces "versioning,
+  soft delete, an immutability policy": blob versioning paired with a
+  lifecycle rule that deletes previous versions, soft delete with a bounded
+  retention, and an immutability policy only where it does not refuse the
+  deletes retention and erasure need. The list follows
+  `docs/object-store-contract.md`, "Required bucket configuration".
+- **The CRD validates names and client IDs.** `account` must be 3 to 24
+  lowercase letters and digits, `container` 3 to 63 lowercase letters,
+  digits and single hyphens starting and ending with a letter or digit,
+  and `clientId` and every `roleClientIds` entry a UUID. A cluster that
+  breaks any of these is refused at admission.

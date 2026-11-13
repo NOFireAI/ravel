@@ -1,0 +1,61 @@
+# A RavelCluster on Azure Blob Storage with AKS workload identity (ADR-4158
+# D11, issue #4165). No storage credential Secret exists: the operator renders
+# the ServiceAccounts prod-gateway, prod-query, prod-maintain and prod-qualify,
+# annotates each with azure.workload.identity/client-id, and labels every pod
+# azure.workload.identity/use: "true" so the workload identity webhook
+# injects the federated token.
+#
+# Before applying, on the Azure side (docs/guides/kubernetes.md, "Azure Blob
+# Storage with workload identity", has the commands):
+#   - an AKS cluster with the OIDC issuer and workload identity enabled;
+#   - a storage account with hierarchical namespace disabled, and the
+#     container below;
+#   - a user-assigned managed identity per role (or one shared one), each
+#     with a federated credential for
+#     system:serviceaccount:ravel-system:prod-<role> and a Storage Blob Data
+#     role on the container;
+#   - the operator's own identity, federated for
+#     system:serviceaccount:ravel-system:ravel-operator, only if this cluster
+#     sets deploymentKeySecretRef or shardOverrides (opt-in, see rbac.yaml);
+#   - blob versioning paired with a lifecycle rule that deletes previous
+#     versions, and soft delete with a bounded retention, set by hand: the
+#     operator runs no bucket-protection check on Azure and reports
+#     BucketProtectionVerified=False.
+apiVersion: ravel.nofire.ai/v1alpha1
+kind: RavelCluster
+metadata:
+  name: prod
+  namespace: ravel-system
+spec:
+  # Replace with a release image pinned to a digest (ADR-0037).
+  image: ravel-server:latest
+  shards: 8
+  storage:
+    azure:
+      account: ravelprod
+      container: ravel-data
+      # The identity every role uses unless roleClientIds names its own.
+      clientId: 00000000-0000-0000-0000-000000000000
+      # One identity per role scopes each role's data access separately
+      # (ADR-0055). Changing a tier's client ID rolls that tier's pods;
+      # changing qualify's re-runs store qualification.
+      roleClientIds:
+        gateway: 00000000-0000-0000-0000-000000000001
+        query: 00000000-0000-0000-0000-000000000002
+        maintain: 00000000-0000-0000-0000-000000000003
+        qualify: 00000000-0000-0000-0000-000000000004
+  tenantTokensSecretRef:
+    name: ravel-tenant-tokens
+  auditTokenKeySecretRef:
+    name: ravel-audit-token-key
+  gateway:
+    replicas: 2
+  query:
+    replicas: 2
+  maintain:
+    enabled: true
+    intervalSecs: 300
+    keySecretRef:
+      name: ravel-maintain-keys
+  retention:
+    default: 30d
