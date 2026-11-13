@@ -145,12 +145,12 @@ pub use audit_schema::{
 };
 pub use bounded_topk::{BOUNDED_TOPK_AGGREGATE_RULE, BoundedTopKAggregate};
 pub use bucket_spill_tuning::{
-    BUCKET_SPILL_MAX_CHUNK_ROWS, BUCKET_SPILL_MIN_CHUNK_ROWS, BucketRetryFigures, BucketRetryShape,
-    BucketSpillInputs, BucketSpillPlanShape, BucketSpillTuning, DEFAULT_NOFILE_SOFT, NoTuning,
-    RETRY_NOT_ADMITTED, RETRY_ORDER_PRESERVING_EXCHANGE, bucket_retry_derivation,
-    bucket_retry_tuning, bucket_spill_descriptor_budget, bucket_spill_min_descriptor_need,
-    derive_bucket_spill_tuning, routed_chunk_charge, spill_consumers, spill_slots,
-    with_bucket_spill_tuning,
+    BUCKET_SPILL_MAX_CHUNK_ROWS, BUCKET_SPILL_MIN_CHUNK_BYTES, BUCKET_SPILL_MIN_CHUNK_ROWS,
+    BucketRetryFigures, BucketRetryShape, BucketSpillInputs, BucketSpillPlanShape,
+    BucketSpillTuning, DEFAULT_NOFILE_SOFT, NoTuning, RETRY_NOT_ADMITTED,
+    RETRY_ORDER_PRESERVING_EXCHANGE, bucket_retry_derivation, bucket_retry_tuning,
+    bucket_spill_descriptor_budget, bucket_spill_min_descriptor_need, derive_bucket_spill_tuning,
+    routed_chunk_charge, spill_consumers, spill_slots, with_bucket_spill_tuning,
 };
 pub use bucketed_final_aggregate::{
     BUCKET_SPILL_BATCHES_WRITTEN, BUCKET_SPILL_BYTES_READ, BUCKET_SPILL_ROWS_READ,

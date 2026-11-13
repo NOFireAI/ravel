@@ -2693,4 +2693,291 @@ mod tests {
             }
         }
     }
+
+    /// The byte budget of the routed-chunk tests: 4 KiB.
+    const BUDGET: usize = 4096;
+
+    /// The length of the one routed value larger than [`BUDGET`].
+    const OVERSIZED: usize = 5000;
+
+    const VARIABLE_WIDTH_TYPES: [DataType; 6] = [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::Utf8View,
+        DataType::BinaryView,
+    ];
+
+    /// The string key of row `i`: NULL, the empty string, a string a view
+    /// holds inline, one it does not, and at row 1,234 one value larger
+    /// than [`BUDGET`].
+    fn string_key(i: usize) -> Option<String> {
+        match i % 10 {
+            _ if i == 1234 => Some("x".repeat(OVERSIZED)),
+            0 => None,
+            1 => Some(String::new()),
+            2..=4 => Some(format!("s{i}")),
+            _ => Some(format!("a-longer-key-{i}")),
+        }
+    }
+
+    /// An Int64, an Int32 and a `string` column of 3,000 rows (sliced, so
+    /// every source starts at an offset), the shape of ClickBench statement
+    /// 19's routed keys.
+    fn mixed_columns(string: &DataType) -> Vec<ArrayRef> {
+        use datafusion::arrow::array::{Int32Array, Int64Array, StringArray};
+        use datafusion::arrow::compute::cast;
+
+        let rows = 3007;
+        let a: ArrayRef = Arc::new(Int64Array::from_iter(
+            (0..rows).map(|i| (i % 11 != 3).then_some(i as i64 % 1000)),
+        ));
+        let b: ArrayRef = Arc::new(Int32Array::from_iter_values(
+            (0..rows).map(|i| i as i32 % 7),
+        ));
+        let s: ArrayRef = Arc::new((0..rows).map(string_key).collect::<StringArray>());
+        let s = cast(&s, string).expect("cast the string key");
+        [a, b, s]
+            .into_iter()
+            .map(|column| column.slice(7, rows - 7))
+            .collect()
+    }
+
+    fn routed_layouts(columns: &[ArrayRef]) -> Vec<(DataType, RoutedLayout)> {
+        columns
+            .iter()
+            .map(|column| {
+                let data_type = column.data_type().clone();
+                let layout = match data_type.primitive_width() {
+                    Some(width) => RoutedLayout::Fixed(width),
+                    None => variable_width_layout(&data_type).expect("a routable type"),
+                };
+                (data_type, layout)
+            })
+            .collect()
+    }
+
+    /// Every row of `columns`, as integers and bytes, sorted.
+    fn rows_of(columns: &[ArrayRef]) -> Vec<(Option<i64>, Option<i32>, Option<Vec<u8>>)> {
+        use datafusion::arrow::datatypes::{Int32Type, Int64Type};
+
+        let bytes: Vec<Option<Vec<u8>>> = {
+            let s = &columns[2];
+            let owned = |v: Option<&[u8]>| v.map(<[u8]>::to_vec);
+            match s.data_type() {
+                DataType::Utf8 => s
+                    .as_string::<i32>()
+                    .iter()
+                    .map(|v| owned(v.map(str::as_bytes)))
+                    .collect(),
+                DataType::LargeUtf8 => s
+                    .as_string::<i64>()
+                    .iter()
+                    .map(|v| owned(v.map(str::as_bytes)))
+                    .collect(),
+                DataType::Utf8View => s
+                    .as_string_view()
+                    .iter()
+                    .map(|v| owned(v.map(str::as_bytes)))
+                    .collect(),
+                DataType::Binary => s.as_binary::<i32>().iter().map(owned).collect(),
+                DataType::LargeBinary => s.as_binary::<i64>().iter().map(owned).collect(),
+                DataType::BinaryView => s.as_binary_view().iter().map(owned).collect(),
+                other => panic!("not a string or binary type: {other}"),
+            }
+        };
+        let mut rows: Vec<_> = columns[0]
+            .as_primitive::<Int64Type>()
+            .iter()
+            .zip(columns[1].as_primitive::<Int32Type>().iter())
+            .zip(bytes)
+            .map(|((a, b), s)| (a, b, s))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// The address ranges of every buffer `columns` hold.
+    fn buffer_ranges(columns: &[ArrayRef]) -> Vec<std::ops::Range<usize>> {
+        fn walk(data: &ArrayData, out: &mut Vec<std::ops::Range<usize>>) {
+            for buffer in data.buffers() {
+                let start = buffer.as_ptr() as usize;
+                out.push(start..start + buffer.len());
+            }
+            for child in data.child_data() {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        for column in columns {
+            walk(&column.to_data(), &mut out);
+        }
+        out.retain(|range| !range.is_empty());
+        out
+    }
+
+    /// Route `columns` into byte-budgeted chunks of [`BUDGET`] bytes and at
+    /// most `row_cap` rows, and every chunk the router holds after.
+    fn route_into_chunks(columns: &[ArrayRef], row_cap: usize) -> (Vec<SealedChunk>, usize) {
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut reservation = MemoryConsumer::new("routed-chunks").register(&pool);
+        let mut router = Router::new(routed_layouts(columns), 3, 2, row_cap, BUDGET);
+        assert_eq!(router.budget, Some(BUDGET));
+        // Two calls, so chunks keep filling across batches.
+        let half = columns[0].len() / 2;
+        for (offset, len) in [(0, half), (half, columns[0].len() - half)] {
+            let batch: Vec<ArrayRef> = columns
+                .iter()
+                .map(|column| column.slice(offset, len))
+                .collect();
+            let routed = router
+                .route(&batch, &mut reservation, None)
+                .expect("route a batch");
+            assert_eq!(routed, len);
+        }
+        let mut chunks = Vec::new();
+        for bucket in 0..router.buckets.len() {
+            while let Some(chunk) = router.pop_chunk(bucket).expect("seal a chunk") {
+                chunks.push(chunk);
+            }
+        }
+        (chunks, reservation.size())
+    }
+
+    /// ADR-4143 decision 3: on a route with a string or binary column, every
+    /// chunk is charged its budget in full and holds no more than that,
+    /// counting views or offsets, fixed-width values, validity and the
+    /// string bytes, which are copied into the chunk's own memory; a value
+    /// larger than the budget takes a chunk of its own charged at its size;
+    /// and every row comes back exactly, NULL apart from the empty string.
+    #[test]
+    fn byte_chunks_hold_at_most_their_budget_and_copy_their_strings() {
+        for string in &VARIABLE_WIDTH_TYPES {
+            let columns = mixed_columns(string);
+            let source_ranges = buffer_ranges(&columns);
+            for row_cap in [8192, 64] {
+                let (chunks, reserved) = route_into_chunks(&columns, row_cap);
+                let what = format!("{string}, {row_cap}-row cap");
+
+                let charged: usize = chunks.iter().map(|chunk| chunk.charged).sum();
+                assert_eq!(
+                    reserved, charged,
+                    "{what}: the reservation is every chunk's charge"
+                );
+
+                let mut oversized = 0;
+                for chunk in &chunks {
+                    let rows = chunk.columns[0].len();
+                    assert!((1..=row_cap).contains(&rows), "{what}: {rows} rows");
+                    let held: usize = chunk
+                        .columns
+                        .iter()
+                        .map(|column| column.get_buffer_memory_size())
+                        .sum();
+                    assert!(
+                        held <= chunk.charged,
+                        "{what}: a chunk of {rows} rows holds {held} bytes, charged {}",
+                        chunk.charged
+                    );
+                    if chunk.charged == BUDGET {
+                        continue;
+                    }
+                    oversized += 1;
+                    assert_eq!(rows, 1, "{what}: only a lone row passes the budget");
+                    let types = routed_layouts(&chunk.columns);
+                    let data: Vec<ArrayData> = chunk.columns.iter().map(|c| c.to_data()).collect();
+                    let sources = ByteSource::of(&chunk.columns, &data, &types).expect("sources");
+                    let alone = ByteChunk::new(&types, usize::MAX, 1)
+                        .bytes_with(&sources, 0)
+                        .expect("a size");
+                    assert_eq!(chunk.charged, alone, "{what}: charged at its size");
+                    assert!(alone > BUDGET);
+                }
+                assert_eq!(oversized, 1, "{what}: one value larger than the budget");
+
+                let chunk_ranges: Vec<_> = chunks
+                    .iter()
+                    .flat_map(|chunk| buffer_ranges(&chunk.columns))
+                    .collect();
+                for chunk_range in &chunk_ranges {
+                    for source in &source_ranges {
+                        assert!(
+                            chunk_range.end <= source.start || source.end <= chunk_range.start,
+                            "{what}: a chunk buffer {chunk_range:?} lies in a source buffer \
+                             {source:?}"
+                        );
+                    }
+                }
+
+                let mut routed = Vec::new();
+                for chunk in &chunks {
+                    routed.extend(rows_of(&chunk.columns));
+                }
+                routed.sort();
+                let expected = rows_of(&columns);
+                assert_eq!(routed, expected, "{what}: every row back exactly");
+                let nulls = expected.iter().filter(|row| row.2.is_none()).count();
+                let empties = expected
+                    .iter()
+                    .filter(|row| row.2.as_deref() == Some(&[][..]))
+                    .count();
+                assert!(
+                    nulls > 0 && empties > 0,
+                    "{what}: {nulls} NULL, {empties} empty"
+                );
+            }
+            // The byte budget seals chunks well before the row cap: 3,000
+            // rows of this shape need more than 3 chunks per bucket.
+            let (chunks, _) = route_into_chunks(&columns, 8192);
+            assert!(chunks.len() > 4 * 3, "{string}: {} chunks", chunks.len());
+        }
+    }
+
+    /// The forced route's slices are cut where a byte-budgeted chunk seals:
+    /// each slice fits the budget and the row cap, and stops only where the
+    /// next row would pass one of them; a row larger than the budget is a
+    /// slice of its own.
+    #[test]
+    fn byte_slices_cut_where_chunks_seal() {
+        for string in &VARIABLE_WIDTH_TYPES {
+            let columns = mixed_columns(string);
+            let types = routed_layouts(&columns);
+            let data: Vec<ArrayData> = columns.iter().map(|c| c.to_data()).collect();
+            let sources = ByteSource::of(&columns, &data, &types).expect("sources");
+            let rows = columns[0].len();
+            for row_cap in [8192, 64] {
+                let mut start = 0;
+                let mut slices = 0;
+                let mut lone = 0;
+                while start < rows {
+                    let take = byte_slice_rows(&types, &sources, start, rows, BUDGET, row_cap);
+                    assert!((1..=row_cap).contains(&take), "{string}: {take} rows");
+                    let mut chunk = ByteChunk::new(&types, BUDGET, row_cap);
+                    if !chunk.fits(&sources, start) {
+                        assert_eq!(take, 1, "{string}: an oversized row alone");
+                        lone += 1;
+                    } else {
+                        for row in start..start + take {
+                            assert!(chunk.fits(&sources, row), "{string}: row {row} fits");
+                            chunk.push_row(&sources, row);
+                        }
+                        let end = start + take;
+                        assert!(
+                            end == rows || !chunk.fits(&sources, end),
+                            "{string}: the slice from {start} stopped at {end} with room"
+                        );
+                    }
+                    start += take;
+                    slices += 1;
+                }
+                assert_eq!(lone, 1, "{string}");
+                if row_cap > rows {
+                    assert!(slices > 12, "{string}: {slices} slices of {rows} rows");
+                }
+            }
+        }
+    }
 }
