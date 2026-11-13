@@ -1698,12 +1698,18 @@ What you create on the Azure side, outside Ravel:
    qualification with
    `access denied: account information ... HTTP 403 AuthorizationPermissionMismatch`.
    Create a role that holds that one action and assign it to each identity
-   on the storage account:
+   on the storage account. A custom role's name is unique in the
+   directory, and this one can only be assigned on the account it lists,
+   so name it after the account. For a second Ravel storage account,
+   either create a second role named after that account, or add the
+   account to this role's `AssignableScopes` with
+   `az role definition update`:
 
    ```sh
-   ACCOUNT_ID=/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>
+   ACCOUNT=<account>
+   ACCOUNT_ID=/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/$ACCOUNT
    az role definition create --role-definition '{
-     "Name": "ravel-blob-account-info",
+     "Name": "ravel-'"$ACCOUNT"'-blob-account-info",
      "IsCustom": true,
      "Description": "Read blob account information (SKU, kind, hierarchical namespace flag).",
      "Actions": ["Microsoft.Storage/storageAccounts/blobServices/getInfo/action"],
@@ -1712,7 +1718,7 @@ What you create on the Azure side, outside Ravel:
    }'
    az role assignment create --assignee-object-id <principal ID> \
      --assignee-principal-type ServicePrincipal \
-     --role ravel-blob-account-info --scope "$ACCOUNT_ID"
+     --role "ravel-$ACCOUNT-blob-account-info" --scope "$ACCOUNT_ID"
    ```
 
    The action reads the account's SKU, kind and namespace flag and nothing
