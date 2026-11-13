@@ -98,6 +98,17 @@ stops these commits being created in the first place (specs tell executors
 to format before the gated commit); this step is the backstop for branches
 written before that discipline, or that slip.
 
+After that clean, a second pass always runs: it replays every retained
+commit under the merger's git identity, drops the fleet-executor
+`Signed-off-by`, and drops any AI attribution line (a `Co-Authored-By`
+naming Claude or Anthropic, a `Generated with` line, a `Claude-Session`
+line) through `scripts/guards/strip-attribution-trailers.sh`. An executor's
+harness adds such a line by default, and `assert-clean-authorship.sh`
+refuses a branch that carries one, so without the strip the script would
+do all of its rewriting and then fail at its own guard. A `Co-Authored-By`
+naming a person is kept. The tree is never changed by either pass, so a
+gates-pass receipt for the result tree stays valid.
+
 ## Procedure
 
 `fleet-result-merge.sh` is the path: it enforces the pre-flight guard

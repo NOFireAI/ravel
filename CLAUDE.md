@@ -346,6 +346,11 @@ Run by hand, at the step named:
   Claim the pull request with a comment before reading its findings.
 - Before a landing sequence: `assert-gh-auth.sh`. After any manual amend
   or script-bypassing merge: `assert-clean-authorship.sh <ref>`.
+  `fleet-result-merge.sh` removes an executor's AI attribution lines
+  (`Co-Authored-By` naming Claude or Anthropic, `Generated with`,
+  `Claude-Session`) while it re-authors a result branch, through
+  `strip-attribution-trailers.sh`; a manual landing has to remove them
+  itself, and the guard refuses a branch that still carries one.
 - Before a merge: `assert-green-head.sh <pr> [--rerun]` (1 is a real
   failure, 4 a flake, 6 cancelled or timed out) and
   `assert-struct-literals-current.sh <branch>` (run by
