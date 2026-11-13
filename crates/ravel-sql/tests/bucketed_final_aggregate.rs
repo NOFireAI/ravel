@@ -240,6 +240,16 @@ fn executor_over(
     config: SqlConfig,
     max_tenant_bytes: usize,
 ) -> SqlExecutor {
+    executor_declaring(store, config, max_tenant_bytes, declared())
+}
+
+/// [`executor_over`] with `columns` declared.
+fn executor_declaring(
+    store: Arc<dyn ObjectStoreBackend>,
+    config: SqlConfig,
+    max_tenant_bytes: usize,
+    columns: Vec<DeclaredColumn>,
+) -> SqlExecutor {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     SqlExecutor::new(
@@ -250,7 +260,7 @@ fn executor_over(
         config,
         max_tenant_bytes,
     )
-    .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared())))
+    .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(columns)))
 }
 
 /// Rows in the retry's large logs fixture: unique keys enough that every
@@ -291,6 +301,51 @@ async fn big_executor(config: SqlConfig, max_tenant_bytes: usize) -> SqlExecutor
     )
     .await;
     executor_over(store, config, max_tenant_bytes)
+}
+
+/// The [`BIG_ROWS`] fixture with a string attribute `u` on row `i`: absent
+/// (NULL) when `i % 10 = 0`, empty when `i % 10 = 1`, `u{i}` (at most 8
+/// bytes, held inline in a view) when `i % 10 < 5`, else
+/// `/catalog/item/{i:07}` (21 bytes, copied). Every non-empty value is
+/// unique.
+fn big_str_rlog() -> bytes::Bytes {
+    static RLOG: std::sync::OnceLock<bytes::Bytes> = std::sync::OnceLock::new();
+    RLOG.get_or_init(|| {
+        let first = log_record(0);
+        let mut writer = rlog_writer(&tenant());
+        for i in 0..BIG_ROWS {
+            let mut record = log_record_in(first.stream_id, first.stream_attrs.clone(), i);
+            let u = match i % 10 {
+                0 => None,
+                1 => Some(String::new()),
+                2..=4 => Some(format!("u{i}")),
+                _ => Some(format!("/catalog/item/{i:07}")),
+            };
+            if let Some(u) = u {
+                record.attrs.push(("u".to_string(), AttrValue::Str(u)));
+            }
+            writer.push(record).expect("push record");
+        }
+        bytes::Bytes::from(writer.finish().expect("finish rlog"))
+    })
+    .clone()
+}
+
+/// An executor over a fresh store holding [`big_str_rlog`], with `u`
+/// declared a string.
+async fn big_str_executor(config: SqlConfig, max_tenant_bytes: usize) -> SqlExecutor {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_rlog(
+        store.as_ref(),
+        &tenant(),
+        big_str_rlog(),
+        BIG_ROWS as u64,
+        (1, BIG_ROWS),
+    )
+    .await;
+    let mut columns = declared();
+    columns.push(DeclaredColumn::new("u", DeclaredType::Str));
+    executor_declaring(store, config, max_tenant_bytes, columns)
 }
 
 fn request(sql: &str) -> SqlRequest {
@@ -523,7 +578,9 @@ async fn the_plan_is_unchanged_when_the_field_is_none() {
 // ---------------------------------------------------------------------------
 
 /// Every shape the rule must refuse, each a `FinalPartitioned` aggregate the
-/// rule would otherwise see.
+/// rule would otherwise see. The string and binary keys are refused by the
+/// first attempt's rule only; the refusal retry's admits them (ADR-4143
+/// decision 3, `spill_rule_admits_string_and_binary_keys_only`).
 const REFUSED_SHAPES: &[(&str, &str)] = &[
     (
         "a string key",
@@ -536,6 +593,22 @@ const REFUSED_SHAPES: &[(&str, &str)] = &[
     (
         "a view key",
         "SELECT arrow_cast(body, 'Utf8View') AS k, count(*) FROM logs GROUP BY k",
+    ),
+    (
+        "a LargeUtf8 key",
+        "SELECT arrow_cast(body, 'LargeUtf8') AS k, count(*) FROM logs GROUP BY k",
+    ),
+    (
+        "a Binary key",
+        "SELECT arrow_cast(body, 'Binary') AS k, count(*) FROM logs GROUP BY k",
+    ),
+    (
+        "a LargeBinary key",
+        "SELECT arrow_cast(body, 'LargeBinary') AS k, count(*) FROM logs GROUP BY k",
+    ),
+    (
+        "a BinaryView key",
+        "SELECT arrow_cast(body, 'BinaryView') AS k, count(*) FROM logs GROUP BY k",
     ),
     (
         "a Boolean key",
@@ -3072,28 +3145,39 @@ const RETRY_TIES_SQL: &str =
 /// budgets hold for its own merge reservation.
 const RETRY_GROUPS_SQL: &str = "SELECT a, count(*) AS c FROM logs GROUP BY a";
 
-/// A string key, which the bucketed rule does not admit.
-const RETRY_STRING_SQL: &str = "SELECT arrow_cast(a, 'Utf8') AS k, count(*) AS c FROM logs \
-                                GROUP BY k ORDER BY c DESC LIMIT 10";
+/// A string key beside a Decimal128 one, which the bucketed rule does not
+/// admit with spill or without: a route copies a string, never a decimal.
+const RETRY_UNADMITTED_SQL: &str = "SELECT arrow_cast(a, 'Utf8') AS k, \
+                                    CAST(a AS DECIMAL(20, 2)) AS d, count(*) AS c \
+                                    FROM logs GROUP BY k, d ORDER BY c DESC LIMIT 10";
+
+/// The tenant a refused run reads: the small `logs` fixture, the big one
+/// keyed by a fixed-width column, or the big one keyed by a declared string.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryFixture {
+    Small,
+    Big,
+    BigStr,
+}
 
 /// How a refused run's first attempt is made to refuse: a process budget of
 /// `tenths` of the unlimited peak, with the executor's descriptor limit at
 /// `nofile_soft` (the default when `None`), over `partitions` final
-/// partitions of the [`BIG_ROWS`] fixture when `big`, else of [`ROWS`].
+/// partitions of `fixture`.
 #[derive(Clone, Copy)]
 struct Refusal {
     tenths: u64,
     nofile_soft: Option<u64>,
     partitions: usize,
-    big: bool,
+    fixture: RetryFixture,
 }
 
 /// An executor over `refusal`'s fixture under `config`.
 async fn retry_executor(refusal: Refusal, config: SqlConfig) -> SqlExecutor {
-    if refusal.big {
-        big_executor(config, 1 << 30).await
-    } else {
-        executor(ROWS, config).await
+    match refusal.fixture {
+        RetryFixture::Small => executor(ROWS, config).await,
+        RetryFixture::Big => big_executor(config, 1 << 30).await,
+        RetryFixture::BigStr => big_str_executor(config, 1 << 30).await,
     }
 }
 
@@ -3102,7 +3186,7 @@ async fn retry_executor(refusal: Refusal, config: SqlConfig) -> SqlExecutor {
 /// the refused run wrote.
 async fn refused_run(sql: &str, refusal: Refusal) -> (RetryRun, Result<RetryRun, String>, String) {
     let scratch = tempfile::tempdir().expect("scratch root");
-    let query_bytes = if refusal.big {
+    let query_bytes = if refusal.fixture != RetryFixture::Small {
         BIG_QUERY_BYTES
     } else {
         ravel_sql::DEFAULT_MAX_QUERY_BYTES
@@ -3151,7 +3235,7 @@ const fn bucket_refusal(partitions: usize) -> Refusal {
         tenths: 9,
         nofile_soft: Some(1 << 16),
         partitions,
-        big: true,
+        fixture: RetryFixture::Big,
     }
 }
 
@@ -3167,6 +3251,14 @@ fn sorted(mut rows: Vec<String>) -> Vec<String> {
 /// (not the placeholder's 6 bits and 8192 rows), and the execs wrote state
 /// rows and read every one of them back.
 fn assert_bucket_spilled(run: &RetryRun, log: &str, partitions: usize) {
+    assert_bucket_spilled_on(run, log, partitions, "a@0");
+}
+
+/// [`assert_bucket_spilled`] over an exchange hashing on `key`, with the
+/// chunk byte budget, on the report, the INFO line and every exec line
+/// alike when the route has a string column and absent from all three when
+/// it does not.
+fn assert_bucket_spilled_on(run: &RetryRun, log: &str, partitions: usize, key: &str) {
     let report = run.report.expect("the retry reports");
     assert_eq!(
         (report.retry_plan, report.retry_plan_reason),
@@ -3175,16 +3267,26 @@ fn assert_bucket_spilled(run: &RetryRun, log: &str, partitions: usize) {
     );
     let bits = report.bits.expect("bits");
     let rows = report.routed_chunk_rows.expect("rows");
+    let chunk_bytes = report.routed_chunk_bytes;
     assert!(bits >= 1, "{report:?}");
-    assert_ne!((bits, rows), (6, 8192), "the placeholder's tuning");
+    assert_ne!(
+        (bits, rows, chunk_bytes),
+        (6, 8192, chunk_bytes.map(|_| 1 << 20)),
+        "the placeholder's tuning"
+    );
     assert_eq!(retry_info_field(log, "retry_plan"), "bucket");
     assert_eq!(retry_info_field(log, "retry_plan_reason"), "none");
     assert_eq!(
         (
             retry_info_field(log, "bits"),
-            retry_info_field(log, "routed_chunk_rows")
+            retry_info_field(log, "routed_chunk_rows"),
+            retry_info_field(log, "routed_chunk_bytes")
         ),
-        (bits.to_string(), rows.to_string()),
+        (
+            bits.to_string(),
+            rows.to_string(),
+            chunk_bytes.map_or("none".to_string(), |bytes| bytes.to_string())
+        ),
         "the INFO line is the report"
     );
     assert!(report.bucket_spill_bytes_written > 0, "{report:?}");
@@ -3196,15 +3298,22 @@ fn assert_bucket_spilled(run: &RetryRun, log: &str, partitions: usize) {
     let plan = run.plan.as_deref().expect("the retry's plan");
     assert!(
         plan.contains(&format!(
-            "RepartitionExec: partitioning=Hash([a@0], {partitions})"
+            "RepartitionExec: partitioning=Hash([{key}], {partitions})"
         )),
         "{plan}"
     );
     let execs = bucketed_lines(plan);
     assert!(!execs.is_empty(), "{plan}");
+    let tuning = match chunk_bytes {
+        Some(bytes) => {
+            format!("bits={bits}, routed_chunk_rows={rows}, routed_chunk_bytes={bytes},")
+        }
+        None => format!("bits={bits}, routed_chunk_rows={rows},"),
+    };
     for exec in execs {
         assert!(
-            exec.contains(&format!("bits={bits}, routed_chunk_rows={rows},")),
+            exec.contains(&tuning)
+                && (chunk_bytes.is_some() || !exec.contains("routed_chunk_bytes")),
             "the exec runs at the INFO line's tuning: {exec}"
         );
     }
@@ -3823,17 +3932,28 @@ async fn a_failed_bucketed_retry_is_the_statements_error() {
     drop(taken);
 }
 
-/// A string-keyed final aggregate, which the bucketed rule does not admit,
-/// keeps today's sort-merge retry, and the INFO line says `not_admitted`.
+/// A key the bucketed rule does not admit even with spill keeps today's
+/// sort-merge retry. Through the executor, a string key beside a decimal
+/// one retries with `sort_merge` and `not_admitted`, no chunk budget, and
+/// the unlimited run's answer. A float key never reaches the retry there:
+/// the executor plans it as one single-stage aggregate (ADR-0094), whose
+/// refusal is not a spillable one. Planned through a session to a
+/// `FinalPartitioned` aggregate, the retry's rule built with spill leaves a
+/// float key's aggregate in place, and the retry's derivation answers
+/// `not_admitted`.
+///
+/// Prove-the-test: admit `Decimal128` or `Float64` in
+/// `variable_width_layout` and the retry plans a bucketed exec, or the
+/// session plan gains one.
 #[tokio::test]
 async fn retry_keeps_sort_merge_for_unadmitted_shape() {
     let refusal = Refusal {
         tenths: 9,
         nofile_soft: None,
         partitions: RETRY_PARTITIONS,
-        big: false,
+        fixture: RetryFixture::Small,
     };
-    let (unlimited, run, log) = answered_retry(RETRY_STRING_SQL, refusal).await;
+    let (unlimited, run, log) = answered_retry(RETRY_UNADMITTED_SQL, refusal).await;
     let report = run.report.expect("the retry reports");
     assert_eq!(
         (report.retry_plan, report.retry_plan_reason),
@@ -3841,10 +3961,34 @@ async fn retry_keeps_sort_merge_for_unadmitted_shape() {
     );
     assert_eq!(retry_info_field(&log, "retry_plan"), "sort_merge");
     assert_eq!(retry_info_field(&log, "retry_plan_reason"), "not_admitted");
+    assert_eq!(retry_info_field(&log, "routed_chunk_bytes"), "none");
     let plan = run.plan.expect("the retry's plan");
     assert!(bucketed_lines(&plan).is_empty(), "{plan}");
     assert!(!plan.contains("RepartitionExec"), "{plan}");
     assert_eq!(run.rows, unlimited.rows);
+
+    let float = retry_planned(
+        "SELECT value, count(*) AS c FROM samples GROUP BY value",
+        RETRY_PARTITIONS,
+        string_tuning(PHASE_2),
+    )
+    .await;
+    assert!(
+        final_aggregate(&float.physical).is_some() && find_bucketed(&float.physical).is_none(),
+        "{}",
+        displayable(float.physical.as_ref()).indent(false)
+    );
+    let figures = ravel_sql::BucketRetryFigures {
+        asked_bytes: 1 << 20,
+        consumed_rows: Some(STRING_SAMPLES as u64),
+        query_limit: ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+        nofile_soft: ravel_sql::DEFAULT_NOFILE_SOFT,
+        slots: 1,
+    };
+    assert_eq!(
+        ravel_sql::bucket_retry_tuning(&float.physical, figures),
+        Err(ravel_sql::RETRY_NOT_ADMITTED)
+    );
 }
 
 /// A candidate plan whose hash exchange preserves order is not kept: the
@@ -3911,4 +4055,353 @@ async fn retry_refuses_an_order_preserving_exchange() {
         "{}",
         displayable(tampered.as_ref()).indent(true)
     );
+}
+
+// ---------------------------------------------------------------------------
+// String and binary keys in the retry (ADR-4143 decision 3, issue #4132)
+// ---------------------------------------------------------------------------
+
+/// The string and binary key types the refusal retry routes.
+const VARIABLE_WIDTH_KEYS: [&str; 6] = [
+    "Utf8",
+    "LargeUtf8",
+    "Utf8View",
+    "Binary",
+    "LargeBinary",
+    "BinaryView",
+];
+
+/// The chunk byte budget `B` of the string-key runs: about 90 rows of the
+/// long keys and their counts, so every bucket seals many chunks.
+const STRING_CHUNK_BYTES: usize = 4096;
+
+/// The triggers of the string-key runs, at 32 buckets and a cap of 1 MiB
+/// that holds one bucket's string table: [`PHASE_2`], and [`PHASE_1`] on a
+/// stock table larger than the cap.
+const STRING_TRIGGERS: [Trigger; 2] = [
+    Trigger {
+        cap_at_two: 1 << 20,
+        ..PHASE_2
+    },
+    Trigger {
+        bits: 5,
+        scales: false,
+        ..PHASE_1
+    },
+];
+
+/// Samples in the string-key fixture: a stock table of its groups is larger
+/// than the [`STRING_TRIGGERS`] cap at 2 and 4 partitions.
+const STRING_SAMPLES: i64 = 160_000;
+
+/// The one key value larger than [`STRING_CHUNK_BYTES`].
+const OVERSIZED_KEY_BYTES: usize = 5000;
+
+/// The groups of [`string_key_sql`] over [`STRING_SAMPLES`]: NULL, the
+/// empty string, 64,000 values of `t % 80000` and the oversized value.
+const STRING_KEY_GROUPS: usize = 2 + 64_000 + 1;
+
+/// A subquery of `t` and the key `k` cast to `data_type`: NULL when
+/// `t % 10 = 0`, empty when `t % 10 = 1`, `s{t % 80000}` (at most 6 bytes,
+/// inline in a view) when `t % 10 < 5`, else `a-longer-key-{t % 80000}` (at
+/// least 14 bytes, copied into a chunk), so each of those is on two rows;
+/// and on row 1234 alone, [`OVERSIZED_KEY_BYTES`] bytes of `x`.
+fn string_keyed(data_type: &str) -> String {
+    format!(
+        "(SELECT t, arrow_cast(CASE WHEN t = 1234 THEN repeat('x', {OVERSIZED_KEY_BYTES}) \
+         WHEN t % 10 = 0 THEN NULL WHEN t % 10 = 1 THEN '' \
+         WHEN t % 10 < 5 THEN concat('s', t % 80000) \
+         ELSE concat('a-longer-key-', t % 80000) END, '{data_type}') AS k \
+         FROM (SELECT arrow_cast(ts, 'Int64') AS t FROM samples))"
+    )
+}
+
+/// Every group of the [`string_keyed`] key, with whether it is NULL, so the
+/// NULL group and the empty string's render apart.
+fn string_key_sql(data_type: &str) -> String {
+    format!(
+        "SELECT k IS NULL AS null_key, k, count(*) AS c FROM {} GROUP BY k",
+        string_keyed(data_type)
+    )
+}
+
+/// A composite key of `t % 97` (Int64), `t % 5` (Int32) and the `Utf8View`
+/// [`string_keyed`] key.
+fn composite_key_sql() -> String {
+    format!(
+        "SELECT a, b, k IS NULL AS null_key, k, count(*) AS c FROM \
+         (SELECT t % 97 AS a, arrow_cast(t % 5, 'Int32') AS b, k FROM {}) GROUP BY a, b, k",
+        string_keyed("Utf8View")
+    )
+}
+
+/// The charge of the chunk the oversized row takes alone, over `columns`
+/// routed columns one of which is the string key: per column a validity
+/// bitmap and one value, view or offset, each rounded up to 64 bytes, and
+/// the copied string rounded up to 64.
+fn oversized_charge(columns: usize) -> usize {
+    columns * 128 + OVERSIZED_KEY_BYTES.next_multiple_of(64)
+}
+
+/// `trigger`'s tuning on a string route: chunks of [`STRING_CHUNK_BYTES`]
+/// bytes and at most 8,192 rows, as the derivation sets them.
+fn string_tuning(trigger: Trigger) -> BucketedFinalAggregation {
+    BucketedFinalAggregation {
+        routed_chunk_rows: ravel_sql::BUCKET_SPILL_MAX_CHUNK_ROWS,
+        routed_chunk_bytes: STRING_CHUNK_BYTES,
+        ..trigger.tuning()
+    }
+}
+
+/// `sql` over the samples fixture at `partitions`, planned with the
+/// bucketed rule off and rewritten by the refusal retry's rule, built
+/// `with_spill(true)` at `tuning`.
+async fn retry_planned(sql: &str, partitions: usize, tuning: BucketedFinalAggregation) -> Planned {
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    let mut planned =
+        Planned::with_samples(sql, sql_config(partitions, None, None), STRING_SAMPLES).await;
+    planned.physical = ravel_sql::BucketedFinalAggregateRule::new(tuning)
+        .with_spill(true)
+        .optimize(
+            Arc::clone(&planned.physical),
+            &datafusion::common::config::ConfigOptions::default(),
+        )
+        .expect("the retry's rule");
+    planned
+}
+
+/// The first `FinalPartitioned` aggregate of `plan`.
+fn final_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<AggregateExec> {
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+        && *aggregate.mode() == AggregateMode::FinalPartitioned
+    {
+        return Some(aggregate.clone());
+    }
+    plan.children().into_iter().find_map(final_aggregate)
+}
+
+/// A spilled string-key run within ADR-4143 decision 3's chunk budget, on
+/// `columns` routed columns: every routed row written at most once and
+/// every written row read back, and the bytes decoded from the files at
+/// most one budget `B` per message, plus what the oversized row's chunk
+/// holds past `B`. After a phase 2 trigger the oversized row's chunk was
+/// charged at its size, once.
+fn assert_within_chunk_budget(what: &str, run: &SpillRun, columns: usize, phase_2: bool) {
+    assert!(
+        run.spilled_rows <= run.routed_rows,
+        "{what}: {} rows written for {} routed",
+        run.spilled_rows,
+        run.routed_rows
+    );
+    assert_eq!(
+        run.rows_read, run.spilled_rows,
+        "{what}: rows decoded against rows written"
+    );
+    let oversized = oversized_charge(columns);
+    let bound = run.batches_written * STRING_CHUNK_BYTES + (oversized - STRING_CHUNK_BYTES);
+    eprintln!(
+        "{what}: {} bytes decoded from {} messages of {} rows, bound {bound}",
+        run.bytes_read, run.batches_written, run.rows_read
+    );
+    assert!(
+        run.bytes_read <= bound,
+        "{what}: {} bytes decoded from {} messages, over the {bound}-byte bound",
+        run.bytes_read,
+        run.batches_written
+    );
+    if phase_2 {
+        let asks = run
+            .events
+            .iter()
+            .filter(|(_, event)| *event == PoolEvent::Grown(oversized))
+            .count();
+        assert_eq!(
+            asks, 1,
+            "{what}: the oversized row's chunk is charged its {oversized} bytes once"
+        );
+    }
+}
+
+/// ADR-4143 decision 3: the refusal retry's rule admits a string or binary
+/// key, and the first attempt's does not; a float, Boolean or Decimal128
+/// key is refused by both. Each statement reaches a
+/// `FinalPartitioned` aggregate, so a refusal is the rule's.
+///
+/// Prove-the-test: drop `spill &&` from `admits` and the first attempt's
+/// rule admits every string key (`!admits(&aggregate, false)` fails).
+#[tokio::test]
+async fn spill_rule_admits_string_and_binary_keys_only() {
+    let mut cases: Vec<(String, String, bool)> = VARIABLE_WIDTH_KEYS
+        .iter()
+        .map(|key| (format!("a {key} key"), string_key_sql(key), true))
+        .collect();
+    cases.push((
+        "an Int64, Int32 and Utf8View key".to_string(),
+        composite_key_sql(),
+        true,
+    ));
+    // `DictionaryGroupKeysAsViews` groups a dictionary key as `Utf8View`,
+    // the shape a declared string column reaches the final aggregate in.
+    cases.push((
+        "a dictionary key, grouped as Utf8View".to_string(),
+        "SELECT arrow_cast(concat('s', arrow_cast(ts, 'Int64')), 'Dictionary(Int32, Utf8)') \
+         AS k, count(*) FROM samples GROUP BY k"
+            .to_string(),
+        true,
+    ));
+    for (what, sql) in [
+        (
+            "a Float64 key",
+            "SELECT value, count(*) FROM samples GROUP BY value",
+        ),
+        (
+            "a Boolean key",
+            "SELECT arrow_cast(ts, 'Int64') > 100 AS k, count(*) FROM samples GROUP BY k",
+        ),
+        (
+            "a Decimal128 key",
+            "SELECT CAST(arrow_cast(ts, 'Int64') AS DECIMAL(20, 2)) AS k, count(*) \
+             FROM samples GROUP BY k",
+        ),
+        (
+            "a Utf8 and Float64 key",
+            "SELECT concat('s', arrow_cast(ts, 'Int64')) AS k, value, count(*) \
+             FROM samples GROUP BY k, value",
+        ),
+    ] {
+        cases.push((what.to_string(), sql.to_string(), false));
+    }
+    for (what, sql, admitted) in cases {
+        let off = Planned::new(&sql, sql_config(4, None, None)).await;
+        let aggregate = final_aggregate(&off.physical).unwrap_or_else(|| {
+            panic!(
+                "{what} has no FinalPartitioned aggregate:\n{}",
+                displayable(off.physical.as_ref()).indent(false)
+            )
+        });
+        assert!(
+            !ravel_sql::BucketedFinalAggregateRule::admits(&aggregate, false),
+            "the first attempt's rule admits {what}"
+        );
+        assert_eq!(
+            ravel_sql::BucketedFinalAggregateRule::admits(&aggregate, true),
+            admitted,
+            "the retry's rule on {what}"
+        );
+        let first = Planned::new(&sql, sql_config(4, Some(bucketed(ENGAGE_GROUPS)), None)).await;
+        assert!(
+            find_bucketed(&first.physical).is_none(),
+            "the first attempt planned buckets for {what}"
+        );
+        let retry = retry_planned(&sql, 4, string_tuning(STRING_TRIGGERS[0])).await;
+        assert_eq!(
+            find_bucketed(&retry.physical).is_some(),
+            admitted,
+            "the retry's plan for {what}"
+        );
+    }
+}
+
+/// ADR-4143 decision 3: every string and binary key type, routed in
+/// chunks of `B` = 4,096 bytes, answers as the stock final does, through a
+/// phase 2 trigger and a forced route alike: NULL and the empty string stay
+/// two groups (#3521), keys of 12 bytes or less and longer ones round-trip,
+/// and one value of 5,000 bytes, larger than `B`, takes a chunk of its own,
+/// charged at its size. The bytes decoded back stay within one budget per
+/// message.
+///
+/// Prove-the-test: seal on rows alone (`fits` without its byte check) and
+/// the decoded bytes pass `batches x B` and no 5,312-byte charge is asked;
+/// keep the source batch's views and buffers instead of copying and the
+/// decoded bytes pass the bound too.
+#[tokio::test]
+async fn bucket_spill_routes_string_keys_exactly() {
+    for key in VARIABLE_WIDTH_KEYS {
+        let sql = string_key_sql(key);
+        let expected = unspilled_rows_of(&sql, 2, STRING_SAMPLES).await;
+        assert_eq!(expected.len(), STRING_KEY_GROUPS, "{key}");
+        for group in ["true||16000", "false||16000"] {
+            assert!(
+                expected.iter().any(|row| row == group),
+                "{key}: no {group} group"
+            );
+        }
+        for trigger in STRING_TRIGGERS {
+            let what = format!("{key} at {}", trigger.name);
+            let planned = retry_planned(&sql, 2, string_tuning(trigger)).await;
+            let plan = format!("{}", displayable(planned.physical.as_ref()).indent(false));
+            assert!(
+                plan.contains(&format!("routed_chunk_bytes={STRING_CHUNK_BYTES},")),
+                "{what}: {plan}"
+            );
+            let run = spilled_planned(&planned, 2, trigger).await;
+            assert_eq!(run.rows, expected, "{what}: the answers differ");
+            assert_within_chunk_budget(&what, &run, 2, trigger.name == STRING_TRIGGERS[0].name);
+        }
+    }
+}
+
+/// [`bucket_spill_routes_string_keys_exactly`] on a route mixing fixed and
+/// variable width: an Int64, an Int32 and a `Utf8View` key and an Int64
+/// count, at 2 and 4 partitions and 64 buckets, so one bucket's table of
+/// the composite key's groups fits the cap.
+#[tokio::test]
+async fn bucket_spill_routes_a_composite_string_key_exactly() {
+    let sql = composite_key_sql();
+    for partitions in [2, 4] {
+        let expected = unspilled_rows_of(&sql, partitions, STRING_SAMPLES).await;
+        for trigger in STRING_TRIGGERS.map(|trigger| Trigger { bits: 6, ..trigger }) {
+            let what = format!("at {partitions} partitions, {}", trigger.name);
+            let planned = retry_planned(&sql, partitions, string_tuning(trigger)).await;
+            let run = spilled_planned(&planned, partitions, trigger).await;
+            assert!(run.rows == expected, "{what}: the answers differ");
+            assert_within_chunk_budget(&what, &run, 4, trigger.name == STRING_TRIGGERS[0].name);
+        }
+    }
+}
+
+/// The declared string column `u` of [`big_str_rlog`], as production plans
+/// it: projected as a dictionary, grouped as `Utf8View`.
+const RETRY_STR_SQL: &str = "SELECT u, count(*) AS c FROM logs GROUP BY u";
+
+/// The groups of [`RETRY_STR_SQL`]: NULL, the empty string and every other
+/// value, each unique.
+const RETRY_STR_GROUPS: usize = 2 + (BIG_ROWS as usize) / 10 * 8;
+
+/// Issue #4132: a refused GROUP BY on a declared string column retries
+/// through buckets (`retry_plan="bucket"`) at a derived chunk budget of at
+/// least `B_min` and 8,192 rows, which the report, the INFO line's
+/// `routed_chunk_bytes` and every exec line agree on; it answers every
+/// group as the unlimited first attempt does, NULL and the empty string
+/// apart; and it writes each state row at most once and reads every one
+/// back.
+///
+/// Prove-the-test: drop the variable-width arm from `admits` and the retry
+/// keeps `sort_merge` with `not_admitted`.
+#[tokio::test]
+async fn bucket_spill_retry_admits_a_declared_str_key() {
+    let refusal = Refusal {
+        fixture: RetryFixture::BigStr,
+        ..bucket_refusal(RETRY_PARTITIONS)
+    };
+    let (unlimited, bucket, log) = answered_retry(RETRY_STR_SQL, refusal).await;
+    assert_bucket_spilled_on(&bucket, &log, RETRY_PARTITIONS, "u@0");
+    let report = bucket.report.expect("the retry reports");
+    let chunk_bytes = report.routed_chunk_bytes.expect("a string route's budget");
+    assert!(
+        chunk_bytes >= ravel_sql::BUCKET_SPILL_MIN_CHUNK_BYTES,
+        "{report:?}"
+    );
+    assert_eq!(
+        report.routed_chunk_rows,
+        Some(ravel_sql::BUCKET_SPILL_MAX_CHUNK_ROWS),
+        "{report:?}"
+    );
+    assert!(
+        report.bucket_spill_rows_written <= BIG_ROWS as u64,
+        "more state rows written than rows scanned: {report:?}"
+    );
+    let (bucket, unlimited) = (sorted(bucket.rows), sorted(unlimited.rows));
+    assert_eq!(bucket.len(), RETRY_STR_GROUPS);
+    assert!(bucket == unlimited, "the answers differ");
 }
