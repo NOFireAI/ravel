@@ -99,8 +99,9 @@ fn check_identity(recorded: &str, configured: Option<&str>) -> IdentityCheck {
 ///
 /// `configured_identity` is the [`crate::config::Cli::backend_identity`]
 /// string this process is configured for (the `s3://` form of
-/// [`ravel_object_store::conformance::s3_backend_identity`] or the `gs://` form
-/// of [`ravel_object_store::conformance::gcs_backend_identity`]), or `None` for
+/// [`ravel_object_store::conformance::s3_backend_identity`], the `gs://` form
+/// of [`ravel_object_store::conformance::gcs_backend_identity`], or the `az://`
+/// form of [`ravel_object_store::conformance::azure_backend_identity`]), or `None` for
 /// the exempt memory store. When it is present and differs from the record's `backend_identity`,
 /// [`enforce`] logs a warning and starts anyway. The record lives in the
 /// bucket, so a replicated, restored, or migrated bucket carries a

@@ -1771,6 +1771,9 @@ pub fn build_sql_state_with_parquet(
             Some(crate::config::RavelBucket::Gcs { bucket, endpoint }) => {
                 stores.refusing(ravel_sql::RavelBucket::Gcs { endpoint, bucket })
             }
+            Some(crate::config::RavelBucket::Azure { account, container }) => {
+                stores.refusing(ravel_sql::RavelBucket::Azure { account, container })
+            }
             None => stores,
         };
         Arc::new(stores) as Arc<dyn ravel_sql::ExternalStores>
@@ -3556,6 +3559,32 @@ mod tests {
                 "{ravel_bucket:?}: {refused:?}"
             );
         }
+        // ADR-4158 D7: Ravel's container as `--store azure` reaches it, so
+        // an Azure profile on the same account and container is refused.
+        let azure = build(Some(crate::config::ParquetProfiles {
+            profiles: ravel_object_store::external::load_profiles(
+                r#"[{"name": "lake", "kind": "azure", "account": "ravelacct",
+                     "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}}]"#,
+            )
+            .expect("profiles"),
+            ravel_bucket: Some(crate::config::RavelBucket::Azure {
+                account: "ravelacct".to_string(),
+                container: "ravel-data".to_string(),
+            }),
+        }));
+        let refused = azure
+            .executor
+            .parquet_sources()
+            .expect("sources")
+            .external_stores()
+            .expect("profile stores")
+            .store("lake", "ravel-data")
+            .err()
+            .expect("Ravel's container is refused");
+        assert!(
+            matches!(refused, ravel_sql::ExternalStoreError::RavelBucket { .. }),
+            "{refused:?}"
+        );
         let unconfigured = build(None);
         assert!(
             !unconfigured

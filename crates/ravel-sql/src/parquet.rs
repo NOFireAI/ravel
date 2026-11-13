@@ -93,13 +93,18 @@ pub enum ExternalStoreError {
 /// (ADR-3456 decision D7). Under `--store s3`: the S3 endpoint (`None` for
 /// AWS's regional endpoint), the region and the bucket name, addressed
 /// path-style. Under `--store gcs`: the bucket on GCS, or at `--gcs-endpoint`
-/// with `/<bucket>` appended when one is set.
+/// with `/<bucket>` appended when one is set. Under `--store azure`
+/// (ADR-4158 decision D7): the container at its account's public blob
+/// endpoint, whatever `--azure-endpoint` says, because an Azure profile has no
+/// endpoint of its own.
 ///
 /// A (profile, bucket) reaches it when their bucket addresses overlap. A
 /// bucket address is where the S3 client sends requests for the bucket: an
 /// explicit endpoint as written when virtual-hosted, the endpoint with
 /// `/<bucket>` appended when path-style, and AWS's regional endpoint for the
-/// region when there is none; a GCS profile's is the bucket on GCS. Two
+/// region when there is none; a GCS profile's is the bucket on GCS; an Azure
+/// profile's is the container at its account's public blob endpoint, and it
+/// is compared only with an Azure bucket of Ravel's. Two
 /// addresses overlap when they are on the same service (the same AWS
 /// partition, GCS, or the same host and port, a missing port read as the
 /// scheme's default) and one's bucket and path segments begin with the
@@ -120,6 +125,8 @@ pub enum RavelBucket {
         endpoint: Option<String>,
         bucket: String,
     },
+    /// Under `--store azure`: the storage account and the container.
+    Azure { account: String, container: String },
 }
 
 impl RavelBucket {
@@ -143,6 +150,7 @@ impl RavelBucket {
                 endpoint: Some(endpoint),
                 bucket,
             } => BucketAddress::of_url(&format!("{}/{bucket}", endpoint.trim_end_matches('/'))),
+            RavelBucket::Azure { account, container } => BucketAddress::azure(account, container),
         };
         let theirs = match &profile.kind {
             ExternalKind::S3 {
@@ -155,7 +163,10 @@ impl RavelBucket {
                 service: Service::Gcs,
                 segments: vec![bucket.to_string()],
             },
-            ExternalKind::Azure { .. } => return false,
+            ExternalKind::Azure { account, .. } => match self {
+                RavelBucket::Azure { .. } => BucketAddress::azure(account, bucket),
+                RavelBucket::S3 { .. } | RavelBucket::Gcs { .. } => return false,
+            },
         };
         ravel.overlaps(&theirs)
     }
@@ -198,6 +209,14 @@ impl BucketAddress {
             (None, true) => format!("https://s3.{region}.amazonaws.com/{bucket}"),
         };
         Self::of_url(&url)
+    }
+
+    /// The address of `container` in the Azure storage `account`, at the
+    /// public endpoint `object_store`'s `MicrosoftAzureBuilder` uses.
+    fn azure(account: &str, container: &str) -> Self {
+        Self::of_url(&format!(
+            "https://{account}.blob.core.windows.net/{container}"
+        ))
     }
 
     fn of_url(url: &str) -> Self {
@@ -1677,6 +1696,72 @@ mod tests {
             bucket: "ravel".to_string(),
         };
         assert!(!fake.is_reached_by(&profiles[0], "ravel"));
+    }
+
+    /// ADR-4158 D7: under `--store azure` an Azure profile on Ravel's own
+    /// account and container is refused before anything is opened. The same
+    /// account with another container and another account with the same
+    /// container name are other containers, and an Azure profile on a Ravel
+    /// bucket that is not on Azure is never Ravel's.
+    #[tokio::test]
+    async fn an_azure_profile_on_ravels_azure_container_is_refused() {
+        let profiles = ravel_object_store::external::load_profiles(
+            r#"[{"name": "own", "kind": "azure", "account": "ravelacct",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}},
+                {"name": "other", "kind": "azure", "account": "otheracct",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}},
+                {"name": "g", "kind": "gcs", "credentials": {"mode": "application_default"}}]"#,
+        )
+        .expect("profiles");
+        let ravel = RavelBucket::Azure {
+            account: "ravelacct".to_string(),
+            container: "ravel".to_string(),
+        };
+        assert!(ravel.is_reached_by(&profiles[0], "ravel"));
+        assert!(
+            !ravel.is_reached_by(&profiles[0], "lake"),
+            "the same account with another container"
+        );
+        assert!(
+            !ravel.is_reached_by(&profiles[1], "ravel"),
+            "another account with the same container name"
+        );
+        assert!(!ravel.is_reached_by(&profiles[2], "ravel"));
+        for not_azure in [
+            RavelBucket::S3 {
+                endpoint: None,
+                region: "us-east-1".to_string(),
+                bucket: "ravel".to_string(),
+            },
+            RavelBucket::Gcs {
+                endpoint: None,
+                bucket: "ravel".to_string(),
+            },
+        ] {
+            assert!(
+                !not_azure.is_reached_by(&profiles[0], "ravel"),
+                "{not_azure:?}"
+            );
+        }
+
+        let stores = ProfileStores::new(profiles).refusing(ravel);
+        assert!(
+            matches!(
+                stores.store("own", "ravel"),
+                Err(ExternalStoreError::RavelBucket { ref profile, ref bucket })
+                    if profile == "own" && bucket == "ravel"
+            ),
+            "an Azure profile on Ravel's Azure container is refused"
+        );
+        for (profile, container) in [("own", "lake"), ("other", "ravel")] {
+            assert!(
+                !matches!(
+                    stores.store(profile, container),
+                    Err(ExternalStoreError::RavelBucket { .. })
+                ),
+                "{profile}/{container} is not Ravel's container"
+            );
+        }
     }
 
     /// A path-style profile endpoint carrying a path moves the bucket it

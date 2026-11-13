@@ -389,6 +389,14 @@ a cluster) and refuses the S3-only control-plane flags (`--s3-*`,
 `--s3-kms-key`, `--tenant-kms-config`, `--require-bucket-protection`) rather
 than ignoring them.
 
+`ravel-server` also runs on an Azure Blob Storage container (`--store azure`,
+ADR-4158), gated the same way on a record naming `az://<account>/<container>`.
+It takes its credential from the `AZURE_*` environment (AKS workload
+identity, a managed identity, or an account key), refuses a
+hierarchical-namespace account, and refuses every `--s3-*` and `--gcs-*` flag,
+`--s3-kms-key`, `--tenant-kms-config` and `--require-bucket-protection`.
+`ravel-cli` does not take `--store azure` yet.
+
 On Kubernetes the operator makes that run itself. The operator supports
 `--store s3` only; a GCS deployment runs the qualification and the servers
 itself (ADR-3456 decision D8):

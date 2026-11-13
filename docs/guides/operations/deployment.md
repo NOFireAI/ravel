@@ -40,6 +40,12 @@ ravel-cli --store gcs --gcs-bucket my-ravel-bucket store qualify
 The record names the backend as `gs://<bucket>`, and `ravel-server --store
 gcs` refuses to start until it exists, exactly as on S3.
 
+`ravel-server --store azure` is gated the same way, on a record naming
+`az://<account>/<container>`. `ravel-cli` does not take `--store azure` yet,
+so it cannot qualify an Azure container in this release, and the server
+refuses to start on one until a record exists (see
+[Azure Blob Storage](configuration.md#azure-blob-storage)).
+
 Ravel's commit protocol and catalog need two things from the store. The store
 must honor conditional writes, so that it rejects a losing writer and does not
 overwrite silently. A listing must show every write that is complete.
@@ -206,10 +212,11 @@ the compose `createbucket` one-shots, create such a bucket. It has one enabled
 rule over the whole bucket with `ExpiredObjectDeleteMarker`, `NoncurrentDays`
 1 and `AbortIncompleteMultipartUpload` after 7 days.
 
-On `--store gcs`, Ravel probes none of the bucket's protection, and
-`--require-bucket-protection` is refused at startup rather than ignored.
-Configure the bucket's retention policy, object
-versioning and soft delete on the bucket itself, and verify them there.
+On `--store gcs` and `--store azure`, Ravel probes none of the bucket's or
+container's protection, and `--require-bucket-protection` is refused at
+startup rather than ignored. Configure the retention policy, versioning and
+soft delete on the bucket, or on the storage account and container, and
+verify them there.
 
 On `--store s3`, the check reads the bucket's configuration once per start. A
 bucket changed under a running process is seen at the next restart. The check

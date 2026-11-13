@@ -145,13 +145,16 @@ pub enum StoreKind {
     S3,
     #[value(name = "gcs")]
     Gcs,
+    #[value(name = "azure")]
+    Azure,
 }
 
-/// The flags `--store gcs` refuses when passed on the command line or through
-/// the environment (ADR-3456 decision D6), as (clap id, flag): every `--s3-*`
-/// store flag, and the S3 control-plane features with no GCS implementation.
-/// A defaulted value is never a refusal.
-const GCS_REFUSED_FLAGS: [(&str, &str); 15] = [
+/// The flags `--store gcs` (ADR-3456 decision D6) and `--store azure`
+/// (ADR-4158 decision D7) refuse when passed on the command line or through
+/// the environment, as (clap id, flag): every `--s3-*` store flag, and the S3
+/// control-plane features with no GCS or Azure implementation. A defaulted
+/// value is never a refusal.
+const S3_ONLY_FLAGS: [(&str, &str); 15] = [
     ("s3_endpoint", "--s3-endpoint"),
     ("s3_allow_http", "--s3-allow-http"),
     ("s3_bucket", "--s3-bucket"),
@@ -172,19 +175,35 @@ const GCS_REFUSED_FLAGS: [(&str, &str); 15] = [
     ("require_bucket_protection", "--require-bucket-protection"),
 ];
 
+/// The flags that configure `--store gcs`, as (clap id, flag), refused under
+/// every other store.
+const GCS_FLAGS: [(&str, &str); 2] = [
+    ("gcs_bucket", "--gcs-bucket"),
+    ("gcs_endpoint", "--gcs-endpoint"),
+];
+
+/// The flags that configure `--store azure`, as (clap id, flag), refused under
+/// every other store (ADR-4158 decision D7).
+const AZURE_FLAGS: [(&str, &str); 3] = [
+    ("azure_account", "--azure-account"),
+    ("azure_container", "--azure-container"),
+    ("azure_endpoint", "--azure-endpoint"),
+];
+
 /// `--parquet-profiles`, loaded, and Ravel's own data bucket, which no Parquet
 /// table may read a file from (ADR-2040 decision D4).
 #[derive(Debug, Clone)]
 pub struct ParquetProfiles {
     pub profiles: Vec<ravel_object_store::external::ExternalProfile>,
     /// `--s3-bucket` at `--s3-endpoint` under `--store s3`, `--gcs-bucket`
-    /// under `--store gcs`; `None` under `--store memory`, whose objects no
+    /// under `--store gcs`, `--azure-container` in `--azure-account` under
+    /// `--store azure`; `None` under `--store memory`, whose objects no
     /// profile can reach.
     pub ravel_bucket: Option<RavelBucket>,
 }
 
 /// Ravel's own data bucket as the configured store reaches it (ADR-3456
-/// decision D7).
+/// decision D7, ADR-4158 decision D7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RavelBucket {
     /// `--store s3`: the bucket, the endpoint it is reached at (`None` for
@@ -200,6 +219,8 @@ pub enum RavelBucket {
         bucket: String,
         endpoint: Option<String>,
     },
+    /// `--store azure`: the storage account and the container.
+    Azure { account: String, container: String },
 }
 
 /// Which credential source `--store s3` uses (ADR-0106). The CLI-facing mirror
@@ -1018,10 +1039,12 @@ pub struct Cli {
     pub listen_health: Option<SocketAddr>,
 
     /// The object store every durable object is kept in: `memory` (in-process,
-    /// lost on exit), `s3` (an S3-compatible bucket, the `--s3-*` flags) or
-    /// `gcs` (a Google Cloud Storage bucket, `--gcs-bucket`). `s3` and `gcs`
-    /// refuse to start on a bucket `ravel-cli store qualify` has not
-    /// qualified.
+    /// lost on exit), `s3` (an S3-compatible bucket, the `--s3-*` flags),
+    /// `gcs` (a Google Cloud Storage bucket, `--gcs-bucket`) or `azure` (an
+    /// Azure Blob Storage container, `--azure-account` and
+    /// `--azure-container`). `s3`, `gcs` and `azure` refuse to start on a
+    /// bucket or container without a `sys/qualification` record, which
+    /// `ravel-cli store qualify` writes for `s3` and `gcs`.
     #[arg(long, value_enum, default_value = "memory")]
     pub store: StoreKind,
 
@@ -1353,7 +1376,8 @@ pub struct StartupCheckArgs {
     /// this gate existed. Enforcement itself stays at the bucket/IAM layer
     /// (ADR-0042 decision 3); this only makes a silently-unprotected
     /// production deployment impossible to start. Refused under
-    /// `--store gcs`, which has no bucket-protection check (ADR-3456 D6).
+    /// `--store gcs` and `--store azure`, which have no bucket-protection
+    /// check (ADR-3456 D6, ADR-4158 D7).
     #[arg(long, env = "RAVEL_REQUIRE_BUCKET_PROTECTION")]
     pub require_bucket_protection: bool,
 
@@ -1468,7 +1492,7 @@ pub struct AuditArgs {
     pub audit_max_age: Option<String>,
 }
 
-/// The GCS and S3 backends behind `--store`.
+/// The GCS, Azure and S3 backends behind `--store`.
 #[derive(Debug, clap::Args)]
 pub struct ObjectStoreArgs {
     /// The Google Cloud Storage bucket `--store gcs` keeps every object in
@@ -1487,6 +1511,37 @@ pub struct ObjectStoreArgs {
     /// refused.
     #[arg(long = "gcs-endpoint", value_name = "URL", hide = true)]
     pub gcs_endpoint: Option<String>,
+
+    /// The Azure storage account `--store azure` keeps every object in
+    /// (ADR-4158 decision D6). Required under `--store azure` and refused
+    /// under any other store. Credentials come from the standard `AZURE_*`
+    /// environment only (AKS workload identity, a managed identity, or
+    /// `AZURE_STORAGE_ACCOUNT_KEY`); no flag carries an Azure credential.
+    #[arg(
+        long = "azure-account",
+        env = "RAVEL_AZURE_ACCOUNT",
+        value_name = "ACCOUNT"
+    )]
+    pub azure_account: Option<String>,
+
+    /// The blob container in `--azure-account` that `--store azure` keeps
+    /// every object in (ADR-4158 decision D6). Required under `--store azure`
+    /// and refused under any other store.
+    #[arg(
+        long = "azure-container",
+        env = "RAVEL_AZURE_CONTAINER",
+        value_name = "CONTAINER"
+    )]
+    pub azure_container: Option<String>,
+
+    /// Account URL `--store azure` sends requests to instead of
+    /// `https://<account>.blob.core.windows.net`, for tests against a fake
+    /// endpoint or the emulator (ADR-4158 decision D3). Recorded in the
+    /// backend identity as `az://<account>/<container>@<endpoint>`. A
+    /// loopback `http://` endpoint is accepted; plaintext to any other host
+    /// is refused.
+    #[arg(long = "azure-endpoint", value_name = "URL", hide = true)]
+    pub azure_endpoint: Option<String>,
 
     #[arg(long, env = "RAVEL_S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
@@ -1555,7 +1610,8 @@ pub struct ObjectStoreArgs {
     /// commit records included, with no transport checksum. `sha256` is
     /// verified on upload only: a read of an object stored with it is
     /// counted in `ravel_store_get_unverified_total`. Ignored under
-    /// `--store memory`; refused when passed under `--store gcs`.
+    /// `--store memory`; refused when passed under `--store gcs` or
+    /// `--store azure`.
     #[arg(
         long,
         value_enum,
@@ -1572,7 +1628,7 @@ pub struct ObjectStoreArgs {
     /// the header: every full-object read is then served unverified and
     /// counted in `ravel_store_get_unverified_total`. The bare flag means
     /// `true`. Ignored under `--store memory`; refused when passed under
-    /// `--store gcs`, where its default is ignored.
+    /// `--store gcs` or `--store azure`, where its default is ignored.
     #[arg(
         long = "s3-request-stored-checksum",
         env = "RAVEL_S3_REQUEST_STORED_CHECKSUM",
@@ -1594,8 +1650,10 @@ pub struct ObjectStoreArgs {
     /// `KmsRoutingStore` routes an unconfigured tenant's writes to the
     /// default store verbatim). Absent (the default): no behavior change,
     /// whatever bucket-default SSE the deployment has continues to apply.
-    /// Refused under `--store gcs`: a GCS bucket's customer-managed key is
-    /// its default key, set outside Ravel (ADR-3456 D6).
+    /// Refused under `--store gcs` and `--store azure`: a GCS bucket's
+    /// customer-managed key is its default key, and an Azure account's is an
+    /// account or encryption-scope setting, both set outside Ravel (ADR-3456
+    /// D6, ADR-4158 D7).
     #[arg(long, env = "RAVEL_S3_KMS_KEY")]
     pub s3_kms_key: Option<String>,
 }
@@ -1608,7 +1666,7 @@ pub struct TenantConfigArgs {
     /// key ARN. Requires `--store s3` (`KmsRoutingStore`'s per-tenant
     /// builder always constructs a real `S3Store`; there is no sensible
     /// `S3Config` to build one from under `--store memory`, and `--store gcs`
-    /// refuses it outright). Absent (the
+    /// and `--store azure` refuse it outright). Absent (the
     /// default): no `KmsRoutingStore` in the chain at all, byte-for-byte
     /// today's store. See [`crate::tenant_kms`] for the file format and the
     /// key-epoch bootstrap this triggers on first configuration of a
@@ -7404,41 +7462,78 @@ impl Cli {
                 }
             }
         }
-        if cli.store == StoreKind::Gcs {
-            if cli.object_store.gcs_bucket.is_none() {
-                return Err(Self::command().error(
-                    clap::error::ErrorKind::MissingRequiredArgument,
-                    "--store gcs requires --gcs-bucket (or RAVEL_GCS_BUCKET): the Google Cloud \
-                     Storage bucket every object is kept in (ADR-3456 decision D5).",
-                ));
-            }
-            for (id, flag) in GCS_REFUSED_FLAGS {
+        let refuse_s3_only = |store: &str, decision: &str| {
+            for (id, flag) in S3_ONLY_FLAGS {
                 if passed(id) {
                     return Err(Self::command().error(
                         clap::error::ErrorKind::ArgumentConflict,
                         format!(
-                            "{flag} configures an S3 store feature that --store gcs does not \
-                             implement (ADR-3456 decision D6), and it is refused rather than \
+                            "{flag} configures an S3 store feature that --store {store} does \
+                             not implement ({decision}), and it is refused rather than \
                              ignored. Drop the flag (and unset its environment variable)."
                         ),
                     ));
                 }
             }
-        } else {
-            for (id, flag) in [
-                ("gcs_bucket", "--gcs-bucket"),
-                ("gcs_endpoint", "--gcs-endpoint"),
-            ] {
+            Ok(())
+        };
+        let refuse_other_store = |flags: &[(&str, &str)], owner: &str| {
+            for (id, flag) in flags {
                 if passed(id) {
                     return Err(Self::command().error(
                         clap::error::ErrorKind::ArgumentConflict,
                         format!(
-                            "{flag} configures --store gcs, and this process runs another store. \
-                             Pass --store gcs, or drop the flag (and unset its environment \
-                             variable)."
+                            "{flag} configures --store {owner}, and this process runs another \
+                             store. Pass --store {owner}, or drop the flag (and unset its \
+                             environment variable)."
                         ),
                     ));
                 }
+            }
+            Ok(())
+        };
+        match cli.store {
+            StoreKind::Gcs => {
+                if cli.object_store.gcs_bucket.is_none() {
+                    return Err(Self::command().error(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "--store gcs requires --gcs-bucket (or RAVEL_GCS_BUCKET): the Google \
+                         Cloud Storage bucket every object is kept in (ADR-3456 decision D5).",
+                    ));
+                }
+                refuse_s3_only("gcs", "ADR-3456 decision D6")?;
+                refuse_other_store(&AZURE_FLAGS, "azure")?;
+            }
+            StoreKind::Azure => {
+                for (missing, flag, env) in [
+                    (
+                        cli.object_store.azure_account.is_none(),
+                        "--azure-account",
+                        "RAVEL_AZURE_ACCOUNT",
+                    ),
+                    (
+                        cli.object_store.azure_container.is_none(),
+                        "--azure-container",
+                        "RAVEL_AZURE_CONTAINER",
+                    ),
+                ] {
+                    if missing {
+                        return Err(Self::command().error(
+                            clap::error::ErrorKind::MissingRequiredArgument,
+                            format!(
+                                "--store azure requires {flag} (or {env}): every object is kept \
+                                 in the --azure-container of the --azure-account (ADR-4158 \
+                                 decision D6)."
+                            ),
+                        ));
+                    }
+                }
+                refuse_s3_only("azure", "ADR-4158 decision D7")?;
+                refuse_other_store(&GCS_FLAGS, "gcs")?;
+            }
+            StoreKind::Memory | StoreKind::S3 => {
+                refuse_other_store(&GCS_FLAGS, "gcs")?;
+                refuse_other_store(&AZURE_FLAGS, "azure")?;
             }
         }
         Ok(cli)
@@ -7447,10 +7542,12 @@ impl Cli {
     /// The `backend_identity` this process compares against a
     /// `sys/qualification` record at startup (ADR-0050 section 6, D2), or
     /// `None` for the exempt memory store. Built from
-    /// [`ravel_object_store::conformance::s3_backend_identity`] and
-    /// [`ravel_object_store::conformance::gcs_backend_identity`], the same
-    /// functions `ravel-cli store qualify` writes the record with, so the
-    /// reader and writer never disagree on format.
+    /// [`ravel_object_store::conformance::s3_backend_identity`],
+    /// [`ravel_object_store::conformance::gcs_backend_identity`] and
+    /// [`ravel_object_store::conformance::azure_backend_identity`], the
+    /// functions a qualification writer builds the record with (`ravel-cli
+    /// store qualify` for S3 and GCS), so the reader and writer never
+    /// disagree on format.
     pub fn backend_identity(&self) -> Option<String> {
         match self.store {
             StoreKind::Memory => None,
@@ -7461,6 +7558,17 @@ impl Cli {
             StoreKind::Gcs => Some(ravel_object_store::conformance::gcs_backend_identity(
                 self.object_store.gcs_bucket.as_deref().unwrap_or_default(),
                 self.object_store.gcs_endpoint.as_deref(),
+            )),
+            StoreKind::Azure => Some(ravel_object_store::conformance::azure_backend_identity(
+                self.object_store
+                    .azure_account
+                    .as_deref()
+                    .unwrap_or_default(),
+                self.object_store
+                    .azure_container
+                    .as_deref()
+                    .unwrap_or_default(),
+                self.object_store.azure_endpoint.as_deref(),
             )),
         }
     }
@@ -8351,8 +8459,9 @@ impl Cli {
     }
 
     /// Whether this deployment's store is a `--store s3` deployment against a
-    /// loopback `--s3-endpoint`, or a `--store gcs` one against a loopback
-    /// `--gcs-endpoint`: the single place this predicate is computed
+    /// loopback `--s3-endpoint`, a `--store gcs` one against a loopback
+    /// `--gcs-endpoint`, or a `--store azure` one against a loopback
+    /// `--azure-endpoint`: the single place this predicate is computed
     /// (ADR-2023 decision 3), read by [`Self::performance_flags`] to size the
     /// fetcher cache's loopback share and by [`Self::resolve_logs_fetch_policy`]
     /// for the loopback policy default (ADR-2677 decision 7). Each endpoint is
@@ -8363,6 +8472,7 @@ impl Cli {
             StoreKind::Memory => None,
             StoreKind::S3 => self.object_store.s3_endpoint.as_deref(),
             StoreKind::Gcs => self.object_store.gcs_endpoint.as_deref(),
+            StoreKind::Azure => self.object_store.azure_endpoint.as_deref(),
         };
         endpoint.is_some_and(crate::store::is_loopback_endpoint)
     }
@@ -9331,6 +9441,11 @@ impl Cli {
             StoreKind::Gcs => {
                 crate::store::resolve_gcs_allow_http(self.object_store.gcs_endpoint.as_deref())?;
             }
+            StoreKind::Azure => {
+                crate::store::resolve_azure_allow_http(
+                    self.object_store.azure_endpoint.as_deref(),
+                )?;
+            }
         }
 
         // No value of `--max-inflight-ingest-requests` is invalid (`0` is a
@@ -10039,13 +10154,15 @@ impl Cli {
 
         // `KmsRoutingStore`'s per-tenant builder always constructs a real
         // `S3Store` (crates/ravel-object-store/src/kms_routing.rs); under
-        // `--store memory` or `--store gcs` there is no `S3Config` to build
-        // one from, so the flag would be silently inert. Fail startup instead.
-        // `parse_validated_from` already refuses it under `--store gcs`
-        // (ADR-3456 decision D6); this covers a `Cli` built without it.
+        // `--store memory`, `--store gcs` or `--store azure` there is no
+        // `S3Config` to build one from, so the flag would be silently inert.
+        // Fail startup instead. `parse_validated_from` already refuses it
+        // under `--store gcs` and `--store azure` (ADR-3456 decision D6,
+        // ADR-4158 decision D7); this covers a `Cli` built without it.
         if self.tenant_config.tenant_kms_config.is_some() && !matches!(self.store, StoreKind::S3) {
             let store = match self.store {
                 StoreKind::Gcs => "--store gcs",
+                StoreKind::Azure => "--store azure",
                 StoreKind::Memory | StoreKind::S3 => "--store memory",
             };
             anyhow::bail!(
@@ -10323,6 +10440,12 @@ impl Cli {
                     bucket,
                     endpoint: self.object_store.gcs_endpoint.clone(),
                 }),
+            StoreKind::Azure => self
+                .object_store
+                .azure_account
+                .clone()
+                .zip(self.object_store.azure_container.clone())
+                .map(|(account, container)| RavelBucket::Azure { account, container }),
         };
         Ok(Some(ParquetProfiles {
             profiles,
@@ -18791,13 +18914,15 @@ mod tests {
         cli.validate().expect("a plain --store gcs start validates");
     }
 
-    /// ADR-3456 D6: each refused flag, passed on the command line, refuses
-    /// `--store gcs` with an error naming it, including a value equal to the
-    /// flag's default (the refusal reads where the value came from, not what
-    /// it is). The same flags through their environment variables are pinned
-    /// against the built binary in `tests/gcs_flag_refusal_binary.rs`.
+    /// ADR-3456 D6 and ADR-4158 D7: each refused flag, passed on the command
+    /// line, refuses `--store gcs` and `--store azure` with an error naming
+    /// it, including a value equal to the flag's default (the refusal reads
+    /// where the value came from, not what it is). The same flags through
+    /// their environment variables are pinned against the built binary in
+    /// `tests/gcs_flag_refusal_binary.rs` and
+    /// `tests/azure_flag_refusal_binary.rs`.
     #[test]
-    fn gcs_store_refuses_every_passed_s3_flag() {
+    fn gcs_and_azure_stores_refuse_every_passed_s3_flag() {
         let cases: [(&str, &[&str]); 16] = [
             ("--s3-endpoint", &["--s3-endpoint", "http://127.0.0.1:9000"]),
             ("--s3-allow-http", &["--s3-allow-http"]),
@@ -18831,46 +18956,81 @@ mod tests {
                 &["--require-bucket-protection"],
             ),
         ];
-        for (flag, extra) in cases {
-            let mut args = vec!["--store", "gcs", "--gcs-bucket", "b"];
-            args.extend_from_slice(extra);
-            let err = validated(&args)
-                .err()
-                .unwrap_or_else(|| panic!("{extra:?} must refuse --store gcs"));
-            assert_eq!(
-                err.kind(),
-                clap::error::ErrorKind::ArgumentConflict,
-                "{extra:?}"
-            );
-            let message = err.to_string();
-            assert!(
-                message.contains(flag) && message.contains("--store gcs"),
-                "the refusal must name {flag} and the store, got: {message}"
-            );
+        let stores: [(&str, &[&str]); 2] = [
+            ("gcs", &["--store", "gcs", "--gcs-bucket", "b"]),
+            (
+                "azure",
+                &[
+                    "--store",
+                    "azure",
+                    "--azure-account",
+                    "acct",
+                    "--azure-container",
+                    "cont",
+                ],
+            ),
+        ];
+        for (store, base) in stores {
+            for (flag, extra) in cases {
+                let mut args = base.to_vec();
+                args.extend_from_slice(extra);
+                let err = validated(&args)
+                    .err()
+                    .unwrap_or_else(|| panic!("{extra:?} must refuse --store {store}"));
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "{extra:?}"
+                );
+                let message = err.to_string();
+                assert!(
+                    message.contains(flag) && message.contains(&format!("--store {store}")),
+                    "the refusal must name {flag} and the store, got: {message}"
+                );
+            }
         }
     }
 
-    /// Every `--s3-*` flag clap knows is in [`GCS_REFUSED_FLAGS`], so a new
-    /// S3 flag cannot be accepted and ignored under `--store gcs` by being
-    /// left off the list. `--max-s3-requests` is a query budget, not a store
-    /// flag, and does not start with `--s3-`.
+    /// Every `--s3-*` flag clap knows is in [`S3_ONLY_FLAGS`], so a new S3
+    /// flag cannot be accepted and ignored under `--store gcs` or `--store
+    /// azure` by being left off the list. `--max-s3-requests` is a query
+    /// budget, not a store flag, and does not start with `--s3-`. The GCS and
+    /// Azure lists are pinned the same way against their prefixes.
     #[test]
-    fn gcs_refusal_list_covers_every_s3_flag() {
+    fn s3_only_list_covers_every_s3_flag() {
         use clap::CommandFactory;
-        let listed: std::collections::BTreeSet<&str> =
-            GCS_REFUSED_FLAGS.iter().map(|(_, flag)| *flag).collect();
         let command = Cli::command();
-        let s3_flags: Vec<String> = command
-            .get_arguments()
-            .filter_map(|arg| arg.get_long())
-            .filter(|long| long.starts_with("s3-"))
-            .map(|long| format!("--{long}"))
-            .collect();
+        let longs_with = |prefix: &str| -> std::collections::BTreeSet<String> {
+            command
+                .get_arguments()
+                .filter_map(|arg| arg.get_long())
+                .filter(|long| long.starts_with(prefix))
+                .map(|long| format!("--{long}"))
+                .collect()
+        };
+        for (prefix, list) in [("gcs-", &GCS_FLAGS[..]), ("azure-", &AZURE_FLAGS[..])] {
+            let listed: std::collections::BTreeSet<String> =
+                list.iter().map(|(_, flag)| flag.to_string()).collect();
+            assert_eq!(listed, longs_with(prefix), "{prefix}");
+            for (id, flag) in list {
+                let arg = command
+                    .get_arguments()
+                    .find(|arg| arg.get_id().as_str() == *id)
+                    .unwrap_or_else(|| panic!("{id} names no argument"));
+                assert_eq!(
+                    arg.get_long().map(|long| format!("--{long}")),
+                    Some(flag.to_string())
+                );
+            }
+        }
+        let listed: std::collections::BTreeSet<&str> =
+            S3_ONLY_FLAGS.iter().map(|(_, flag)| *flag).collect();
+        let s3_flags = longs_with("s3-");
         assert!(s3_flags.len() >= 13, "{s3_flags:?}");
         for flag in &s3_flags {
             assert!(listed.contains(flag.as_str()), "{flag} is not refused");
         }
-        for (id, flag) in GCS_REFUSED_FLAGS {
+        for (id, flag) in S3_ONLY_FLAGS {
             let arg = command
                 .get_arguments()
                 .find(|arg| arg.get_id().as_str() == id)
@@ -18890,12 +19050,25 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         assert!(err.to_string().contains("--gcs-bucket"), "{err}");
 
-        for store in ["memory", "s3"] {
+        let elsewhere: [&[&str]; 3] = [
+            &["--store", "memory"],
+            &["--store", "s3"],
+            &[
+                "--store",
+                "azure",
+                "--azure-account",
+                "acct",
+                "--azure-container",
+                "cont",
+            ],
+        ];
+        for base in elsewhere {
+            let store = base[1];
             for extra in [
                 ["--gcs-bucket", "b"],
                 ["--gcs-endpoint", "http://127.0.0.1:4443"],
             ] {
-                let mut args = vec!["--store", store];
+                let mut args = base.to_vec();
                 args.extend_from_slice(&extra);
                 let err = validated(&args)
                     .err()
@@ -18933,6 +19106,142 @@ mod tests {
             assert!(err.to_string().contains("--gcs-endpoint"), "{err}");
         }
         assert!(!cli(&["--store", "gcs", "--gcs-bucket", "b"]).store_is_loopback());
+    }
+
+    const AZURE_BASE: [&str; 6] = [
+        "--store",
+        "azure",
+        "--azure-account",
+        "acct",
+        "--azure-container",
+        "cont",
+    ];
+
+    /// ADR-4158 D6/D7: plain `--store azure` with an account and a container
+    /// parses and validates. The defaulted S3 flags (`--s3-request-stored-
+    /// checksum` defaults to true) are ignored, not refused.
+    #[test]
+    fn plain_azure_store_parses_and_validates() {
+        let cli = validated(&AZURE_BASE).expect("a plain --store azure start is accepted");
+        assert_eq!(cli.store, StoreKind::Azure);
+        assert_eq!(cli.object_store.azure_account.as_deref(), Some("acct"));
+        assert_eq!(cli.object_store.azure_container.as_deref(), Some("cont"));
+        assert!(
+            cli.object_store.s3_request_stored_checksum,
+            "the defaulted value is still true, and is not a refusal"
+        );
+        cli.validate()
+            .expect("a plain --store azure start validates");
+        assert!(!cli.store_is_loopback());
+    }
+
+    /// ADR-4158 D6: `--azure-account` and `--azure-container` are both
+    /// required under `--store azure`; the GCS flags are refused there, and
+    /// the three Azure flags are refused under every other store.
+    #[test]
+    fn azure_account_and_container_are_required_and_azure_flags_refused_elsewhere() {
+        for (args, missing) in [
+            (&["--store", "azure"][..], "--azure-account"),
+            (
+                &["--store", "azure", "--azure-container", "cont"][..],
+                "--azure-account",
+            ),
+            (
+                &["--store", "azure", "--azure-account", "acct"][..],
+                "--azure-container",
+            ),
+        ] {
+            let err = validated(args).expect_err(missing);
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            assert!(err.to_string().contains(missing), "{err}");
+        }
+
+        for extra in [
+            ["--gcs-bucket", "b"],
+            ["--gcs-endpoint", "http://127.0.0.1:4443"],
+        ] {
+            let mut args = AZURE_BASE.to_vec();
+            args.extend_from_slice(&extra);
+            let err = validated(&args)
+                .err()
+                .unwrap_or_else(|| panic!("{extra:?} must refuse --store azure"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert!(err.to_string().contains(extra[0]), "{err}");
+        }
+
+        let elsewhere: [&[&str]; 3] = [
+            &["--store", "memory"],
+            &[
+                "--store",
+                "s3",
+                "--s3-bucket",
+                "b",
+                "--s3-access-key",
+                "k",
+                "--s3-secret-key",
+                "s",
+            ],
+            &["--store", "gcs", "--gcs-bucket", "b"],
+        ];
+        for base in elsewhere {
+            let store = base[1];
+            for extra in [
+                ["--azure-account", "acct"],
+                ["--azure-container", "cont"],
+                ["--azure-endpoint", "http://127.0.0.1:10000/acct"],
+            ] {
+                let mut args = base.to_vec();
+                args.extend_from_slice(&extra);
+                let err = validated(&args)
+                    .err()
+                    .unwrap_or_else(|| panic!("{extra:?} must refuse --store {store}"));
+                assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+                let message = err.to_string();
+                assert!(
+                    message.contains(extra[0]) && message.contains("--store azure"),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// `--azure-endpoint` takes https to any host or plain http to a
+    /// loopback host; plaintext to another host and a schemeless endpoint
+    /// are refused at validate, naming the flag. A loopback endpoint makes
+    /// the store loopback (ADR-2023 decision 3).
+    #[test]
+    fn azure_endpoint_plaintext_rules_and_loopback() {
+        let azure = |endpoint: &str| {
+            let mut args = AZURE_BASE.to_vec();
+            args.extend_from_slice(&["--azure-endpoint", endpoint]);
+            cli(&args)
+        };
+        let loopback = azure("http://127.0.0.1:10000/acct");
+        loopback.validate().expect("loopback plaintext is accepted");
+        assert!(loopback.store_is_loopback());
+        let tls = azure("https://acct.blob.example.com");
+        tls.validate().expect("https is accepted");
+        assert!(!tls.store_is_loopback());
+        for refused in ["http://azure.example.com/acct", "azure.example.com/acct"] {
+            let err = azure(refused).validate().expect_err(refused);
+            assert!(err.to_string().contains("--azure-endpoint"), "{err}");
+        }
+    }
+
+    /// ADR-4158 D6: `az://<account>/<container>`, and
+    /// `az://<account>/<container>@<endpoint>` once `--azure-endpoint` is set.
+    #[test]
+    fn azure_backend_identity_names_account_container_and_endpoint() {
+        assert_eq!(
+            cli(&AZURE_BASE).backend_identity().as_deref(),
+            Some("az://acct/cont")
+        );
+        let mut args = AZURE_BASE.to_vec();
+        args.extend_from_slice(&["--azure-endpoint", "http://127.0.0.1:10000/acct"]);
+        assert_eq!(
+            cli(&args).backend_identity().as_deref(),
+            Some("az://acct/cont@http://127.0.0.1:10000/acct")
+        );
     }
 
     /// Reachability (ADR-0074): the shipped
@@ -20174,6 +20483,28 @@ mod tests {
             Some(RavelBucket::Gcs {
                 bucket: "ravel-data".to_string(),
                 endpoint: None,
+            })
+        );
+        // ADR-4158: under `--store azure` Ravel's side is the account and
+        // container.
+        let azure = cli(&[
+            "--parquet-profiles",
+            path,
+            "--store",
+            "azure",
+            "--azure-account",
+            "ravelacct",
+            "--azure-container",
+            "ravel-data",
+        ])
+        .parse_parquet_profiles()
+        .expect("valid file")
+        .expect("profiles");
+        assert_eq!(
+            azure.ravel_bucket,
+            Some(RavelBucket::Azure {
+                account: "ravelacct".to_string(),
+                container: "ravel-data".to_string(),
             })
         );
         let duplicate = tempfile::NamedTempFile::new().expect("temp file");
