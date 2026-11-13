@@ -195,8 +195,9 @@ RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.32.0}'
 # `quickstart` job and its two telemetrygen runs were removed (ADR-0081 A6).
 # Lowered 13->12 when metricsbench-nightly.yml stopped starting its own
 # RustFS container and ran deploy/metricsbench/run.sh against the compose
-# stack instead (issue #940).
-RUN_IMAGE_EXPECTED_COUNT=12
+# stack instead (issue #940). Raised 12->13 when ci.yml's
+# object-store-contract job started the Azurite emulator (ADR-4158 D8).
+RUN_IMAGE_EXPECTED_COUNT=13
 
 # Of those, the number that must carry a digest pin: every reference except
 # the three shell-variable exemptions below. Update deliberately alongside
@@ -204,8 +205,9 @@ RUN_IMAGE_EXPECTED_COUNT=12
 # which is digest pinned. Lowered 12->9 with the three AWS CLI runs above,
 # all of which were digest pinned. Lowered 9->7 with the two telemetrygen
 # runs above, both digest pinned. Lowered 7->6 with metricsbench-nightly.yml's
-# RustFS run above, which was digest pinned.
-RUN_IMAGE_EXPECTED_PINNED_COUNT=6
+# RustFS run above, which was digest pinned. Raised 6->7 with the Azurite
+# run above, which is digest pinned.
+RUN_IMAGE_EXPECTED_PINNED_COUNT=7
 
 # The exact text of an extracted image argument (same stripping as the
 # extraction below: the whitespace-delimited token itself, quotes included
