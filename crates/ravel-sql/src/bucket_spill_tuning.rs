@@ -781,6 +781,79 @@ mod tests {
         );
     }
 
+    /// ADR-4143 decision 3: on a route with a string or binary column the
+    /// chunk budget is `B = floor((S - table(bits)) / (2^bits + 1))` at the
+    /// 8,192-row cap, and `B_min` (16 KiB) stands in for the floor chunk in
+    /// the second `bits` condition. One 16 B view column and one 8 B column,
+    /// `N = n`, `P = C = 1`, `L` 64 MiB plus `S`, so `table(b) =
+    /// ceil(2 x A / 2^b)`:
+    ///
+    /// - `S` 1,000,000 B, `A` 100,000 B: `table(0)` is 200,000 B and two
+    ///   16 KiB chunks fit beside it, so `bits` 0 and `B` 400,000 B.
+    /// - `S` 120,000 B, `A` 44,000 B: `table(0)` is 88,000 B, within `0.75 x
+    ///   S`, but `B` would be 16,000 B, under `B_min`. At `bits` 1 `table(1)`
+    ///   is 44,000 B and `B` is 25,333 B.
+    /// - `S` 120,000 B, `A` 50,000 B: `bits` 1, `table(1)` 50,000 B, `B`
+    ///   23,333 B. A floor of 1,024 rows' charge, 24,832 B for these widths,
+    ///   would leave no tuning: `table(b) + (2^b + 1) x 24,832` passes `S`
+    ///   at every `bits` (74,496 B of chunks beside `table(1)`).
+    /// - `S` 60,000 B, `A` 20,000 B: `table(b) + (2^b + 1) x 16 KiB` passes
+    ///   `S` at every `bits`, so no tuning.
+    ///
+    /// Prove-the-test: give a variable-width route the fixed-width floor
+    /// chunk, `routed_chunk_charge(.., BUCKET_SPILL_MIN_CHUNK_ROWS)`, and the
+    /// third case answers `TooManyBits`.
+    #[test]
+    fn bucket_spill_derivation_budgets_variable_width_chunks_in_bytes() {
+        let derive = |asked_bytes, share: usize| {
+            derive_bucket_spill_tuning(&BucketSpillInputs {
+                asked_bytes,
+                total_rows: Some(1),
+                consumed_rows: Some(1),
+                partitions: 1,
+                spill_consumers: 1,
+                query_limit: (64 << 20) + share,
+                column_widths: vec![16, 8],
+                variable_width: true,
+                nofile_soft: 524_288,
+                slots: 1,
+            })
+        };
+        assert_eq!(
+            derive(100_000, 1_000_000),
+            Ok(BucketSpillTuning {
+                bits: 0,
+                routed_chunk_rows: BUCKET_SPILL_MAX_CHUNK_ROWS,
+                routed_chunk_bytes: Some(400_000),
+                descriptor_need: 3,
+            })
+        );
+        assert!((120_000 - 88_000) / 2 < BUCKET_SPILL_MIN_CHUNK_BYTES);
+        assert_eq!(
+            derive(44_000, 120_000),
+            Ok(BucketSpillTuning {
+                bits: 1,
+                routed_chunk_rows: BUCKET_SPILL_MAX_CHUNK_ROWS,
+                routed_chunk_bytes: Some(25_333),
+                descriptor_need: 5,
+            })
+        );
+        assert_eq!(
+            routed_chunk_charge(&[16, 8], BUCKET_SPILL_MIN_CHUNK_ROWS),
+            Some(24_832)
+        );
+        assert_eq!(
+            derive(50_000, 120_000),
+            Ok(BucketSpillTuning {
+                bits: 1,
+                routed_chunk_rows: BUCKET_SPILL_MAX_CHUNK_ROWS,
+                routed_chunk_bytes: Some(23_333),
+                descriptor_need: 5,
+            })
+        );
+        assert_eq!(derive(20_000, 60_000), Err(NoTuning::TooManyBits));
+    }
+
     /// The largest `T` that tunes q33 on c6a.large at item 4's `S`,
     /// 32,585,819 B: at `bits` 7 `table(7)` may take `S` less 129 floor
     /// chunks of 66,304 B, 24,032,603 B, so `T` up to 24,609,385,472 B
