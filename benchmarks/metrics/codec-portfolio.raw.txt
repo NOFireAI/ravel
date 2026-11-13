@@ -491,3 +491,273 @@ rule: bytes <= 75% of production AND dec >= production dec AND bit-exact
 $ curl -sS -m 15 -o /dev/null -w 'HTTP_CODE=%{http_code}\n' https://arxiv.org/abs/2601.00695
 HTTP_CODE=200
 curl exit 0
+
+$ cargo run --release -p ravel-bench --bin codec_bakeoff   # DeXOR run, issue #3925, 2026-11-13
+========================================================================
+Value codec bake-off (issue #312, ADR-0092 decision 6)
+========================================================================
+cpu:     AMD EPYC 7R13 Processor
+cores:   16
+memory:  30.6 GiB
+os:      Linux 7.0.0-1011-aws x86_64
+rustc:   rustc 1.97.1 (8bab26f4f 2026-07-14)
+commit:  bcab1849bc0933f9b6744abf4b4c8c7d5474208b
+========================================================================
+
+bytes/sample = codec payload (production excludes its 6-byte page header).
+throughput = median Mval/s over repeated runs; production timings frame a whole
+run (TS + VAL) through the public API, so they understate value-only speed.
+'dec in MB/s' = INPUT-side, DERIVED: dec Mval/s scaled by the real compressed
+byte count (challenger payload; production = compressed VAL page incl. 6-byte
+header), not n*8. It folds in the compression ratio, so it restates columns
+already on the row; read it only as the compressed-input rate.
+'dec out MB/s' = OUTPUT-side: bytes the decoder writes, dec Mval/s * 8. Flat
+across datasets and orders of magnitude below DRAM bandwidth (tens of GB/s),
+so THIS is the evidence decode is CPU-bound, not memory-bandwidth-bound. All
+throughput is single-threaded.
+'ratio' = challenger bytes / production bytes; adoption needs <= 0.75 AND
+dec >= production dec AND a bit-exact round trip.
+cores (available_parallelism): 16   (throughput below is 1 thread)
+
+======================= 60 samples per page =======================
+(metricsbench_history values: seed=927000933, n=60, drawn via metrics_stream_sample::sample_series, 2 series joined end to end, at most 8)
+
+counter_int_resets  (n=60, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  counter_int_resets      60 production           0.6000          7.3         53.1         37.2        424.7        -  ok
+  counter_int_resets      60 alp                  1.0667         26.9        214.7        229.1       1717.9    1.778  ok
+  counter_int_resets      60 gcd_delta_for        0.6000         61.3        140.5         84.3       1124.2    1.000  ok
+  counter_int_resets      60 chimp128             2.9667         21.9         51.5        152.7        411.7    4.944  ok
+  counter_int_resets      60 bytesplit_zstd       2.2500          8.0         21.8         49.0        174.4    3.750  ok
+  counter_int_resets      60 raw_f64              8.0000        974.0        834.2       6673.9       6673.9   13.333  ok
+  counter_int_resets      60 alp_vectorized       1.2000         64.2        208.7        250.4       1669.3    2.000  ok
+  counter_int_resets      60 alp_rd               1.2167         21.3        140.5        171.0       1124.1    2.028  ok
+  counter_int_resets      60 dexor                1.3667         21.3         33.9         46.4        271.4    2.278  ok
+
+gauge_int  (n=60, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_int               60 production           0.6167          7.2         53.1         38.1        425.0        -  ok
+  gauge_int               60 alp                  0.8667         27.9        249.3        216.0       1994.2    1.405  ok
+  gauge_int               60 gcd_delta_for        0.6167         63.9        190.7        117.6       1525.8    1.000  ok
+  gauge_int               60 chimp128             2.5667         23.6         59.8        153.5        478.4    4.162  ok
+  gauge_int               60 bytesplit_zstd       1.6667          8.0         18.5         30.9        148.3    2.703  ok
+  gauge_int               60 raw_f64              8.0000        991.2        918.2       7345.5       7345.5   12.973  ok
+  gauge_int               60 alp_vectorized       0.8333         53.4        227.8        189.8       1822.3    1.351  ok
+  gauge_int               60 alp_rd               0.8500         28.1        234.0        198.9       1872.0    1.378  ok
+  gauge_int               60 dexor                1.2167         22.7         34.7         42.2        277.3    1.973  ok
+
+gauge_dec2  (n=60, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_dec2              60 production           1.1333          5.8         50.9         62.8        407.4        -  ok
+  gauge_dec2              60 alp                  1.3833         17.3        259.0        358.3       2072.3    1.221  ok
+  gauge_dec2              60 gcd_delta_for        1.1333         51.1        128.3        145.4       1026.1    1.000  ok
+  gauge_dec2              60 chimp128             4.0000         18.9         34.9        139.4        278.9    3.529  ok
+  gauge_dec2              60 bytesplit_zstd       5.7167          7.1         12.7         72.4        101.4    5.044  ok
+  gauge_dec2              60 raw_f64              8.0000        993.0        894.3       7154.4       7154.4    7.059  ok
+  gauge_dec2              60 alp_vectorized       1.3500         39.9        141.2        190.6       1129.3    1.191  ok
+  gauge_dec2              60 alp_rd               1.3667         22.9        204.6        279.6       1636.4    1.206  ok
+  gauge_dec2              60 dexor                1.7000         18.7         31.6         53.7        252.8    1.500  ok
+
+gauge_dec3  (n=60, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_dec3              60 production           1.5167          5.6         49.8         80.5        398.3        -  ok
+  gauge_dec3              60 alp                  1.7667         17.3        254.2        449.1       2033.5    1.165  ok
+  gauge_dec3              60 gcd_delta_for        1.5167         50.4        121.7        184.5        973.3    1.000  ok
+  gauge_dec3              60 chimp128             5.5333         15.9         23.2        128.6        185.9    3.648  ok
+  gauge_dec3              60 bytesplit_zstd       6.6833          6.8         22.1        147.6        176.7    4.407  ok
+  gauge_dec3              60 raw_f64              8.0000        994.3        919.1       7352.5       7352.5    5.275  ok
+  gauge_dec3              60 alp_vectorized       1.7333         33.6        186.1        322.6       1488.8    1.143  ok
+  gauge_dec3              60 alp_rd               1.7500         19.9        188.1        329.2       1505.0    1.154  ok
+  gauge_dec3              60 dexor                2.1167         15.5         29.2         61.7        233.4    1.396  ok
+
+noisy_float  (n=60, production val enc=17(raw_f64))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  noisy_float             60 production           8.0000          3.6         58.5        474.2        468.4        -  ok
+  noisy_float             60 alp                  8.4833          6.6         67.7        574.5        541.7    1.060  ok
+  noisy_float             60 gcd_delta_for        8.0167        135.5        946.0       7583.6       7567.8    1.002  ok
+  noisy_float             60 chimp128             7.9833         12.9         16.7        133.2        133.5    0.998  ok
+  noisy_float             60 bytesplit_zstd       8.0167          6.6         22.0        176.7        176.4    1.002  ok
+  noisy_float             60 raw_f64              8.0000        992.7        894.8       7158.4       7158.4    1.000  ok
+  noisy_float             60 alp_vectorized       8.4333         11.9         81.3        685.2        650.0    1.054  ok
+  noisy_float             60 alp_rd               8.4333          8.8         60.8        512.4        486.1    1.054  ok
+  noisy_float             60 dexor                7.3333          7.0         15.8        116.2        126.7    0.917  ok
+
+constant  (n=60, production val enc=18(alp))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  constant                60 production           0.0833         10.0         65.7         12.0        525.4        -  ok
+  constant                60 alp                  0.0833         44.9        522.9         43.6       4182.9    1.000  ok
+  constant                60 gcd_delta_for        0.1000         98.7        199.7         20.0       1597.8    1.200  ok
+  constant                60 chimp128             1.2500         31.7        123.0        153.7        984.0   15.000  ok
+  constant                60 bytesplit_zstd       0.4167         16.0         21.9          9.1        175.3    5.000  ok
+  constant                60 raw_f64              8.0000        992.7        897.7       7181.4       7181.4   96.000  ok
+  constant                60 alp_vectorized       0.0667         89.5        699.2         46.6       5593.5    0.800  ok
+  constant                60 alp_rd               0.0833         56.9        706.7         58.9       5653.2    1.000  ok
+  constant                60 dexor                0.2833         33.4         41.6         11.8        333.1    3.400  ok
+
+sparse  (n=60, production val enc=18(alp))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  sparse                  60 production           0.5333          8.5         60.7         38.4        485.7        -  ok
+  sparse                  60 alp                  0.5333         32.2        327.7        174.8       2621.9    1.000  ok
+  sparse                  60 gcd_delta_for        1.4833         67.5        123.4        183.1        987.3    2.781  ok
+  sparse                  60 chimp128             1.8333         28.1         81.8        149.9        654.2    3.438  ok
+  sparse                  60 bytesplit_zstd       1.3500         14.2         20.7         27.9        165.4    2.531  ok
+  sparse                  60 raw_f64              8.0000        994.3        918.8       7350.5       7350.5   15.000  ok
+  sparse                  60 alp_vectorized       1.3167         64.2        204.1        268.7       1632.9    2.469  ok
+  sparse                  60 alp_rd               1.3333         28.0        203.3        271.1       1626.4    2.500  ok
+  sparse                  60 dexor                0.7000         29.1         35.2         24.6        281.6    1.312  ok
+
+float_counter(ctrl)  (n=60, production val enc=16(gorilla))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  float_counter(ctrl)     60 production           7.1833          3.6          6.9         50.0         54.9        -  ok
+  float_counter(ctrl)     60 alp                  8.3500          6.2         68.4        571.0        547.1    1.162  ok
+  float_counter(ctrl)     60 gcd_delta_for        8.0167        105.3        946.1       7584.5       7568.7    1.116  ok
+  float_counter(ctrl)     60 chimp128             6.8833         14.8         19.9        137.0        159.2    0.958  ok
+  float_counter(ctrl)     60 bytesplit_zstd       7.3500         11.7         22.6        166.1        180.8    1.023  ok
+  float_counter(ctrl)     60 raw_f64              8.0000        994.7        950.1       7600.8       7600.8    1.114  ok
+  float_counter(ctrl)     60 alp_vectorized       8.3000          8.7         81.1        673.2        648.9    1.155  ok
+  float_counter(ctrl)     60 alp_rd               8.3167          7.5         81.1        674.4        648.7    1.158  ok
+  float_counter(ctrl)     60 dexor                7.0000          7.8         15.5        108.3        123.7    0.974  ok
+
+metricsbench_history  (n=60, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  metricsbench_history    60 production           2.4833          4.4         46.9        121.1        374.9        -  ok
+  metricsbench_history    60 alp                  5.1833          8.6        280.4       1453.5       2243.4    2.087  ok
+  metricsbench_history    60 gcd_delta_for        2.4833         41.4        109.3        271.5        874.5    1.000  ok
+  metricsbench_history    60 chimp128             4.5833         17.7         31.1        142.6        249.0    1.846  ok
+  metricsbench_history    60 bytesplit_zstd       3.5500          7.4         21.8         77.6        174.8    1.430  ok
+  metricsbench_history    60 raw_f64              8.0000        992.6        895.9       7166.9       7166.9    3.221  ok
+  metricsbench_history    60 alp_vectorized       5.1333         15.0        109.1        559.9        872.6    2.067  ok
+  metricsbench_history    60 alp_rd               5.1500         10.5        102.8        529.6        822.7    2.074  ok
+  metricsbench_history    60 dexor                5.7000          7.1         15.8         89.9        126.2    2.295  ok
+
+======================= 500 samples per page =======================
+(metricsbench_history values: seed=927000933, n=500, drawn via metrics_stream_sample::sample_series, 2 series joined end to end, at most 8)
+
+counter_int_resets  (n=500, production val enc=18(alp))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  counter_int_resets     500 production           1.0260          9.5         82.5         85.6        659.7        -  ok
+  counter_int_resets     500 alp                  1.0260         35.8        348.4        357.5       2787.2    1.000  ok
+  counter_int_resets     500 gcd_delta_for        1.2620         59.6        178.0        224.7       1424.2    1.230  ok
+  counter_int_resets     500 chimp128             2.9120         38.0         52.4        152.6        419.3    2.838  ok
+  counter_int_resets     500 bytesplit_zstd       1.5140         34.4         59.0         89.3        472.0    1.476  ok
+  counter_int_resets     500 raw_f64              8.0000       1097.2       1083.2       8666.0       8666.0    7.797  ok
+  counter_int_resets     500 alp_vectorized       1.2580         71.6        231.6        291.4       1853.2    1.226  ok
+  counter_int_resets     500 alp_rd               1.2600         20.0        231.6        291.8       1852.5    1.228  ok
+  counter_int_resets     500 dexor                1.4400         20.2         33.0         47.6        264.3    1.404  ok
+
+gauge_int  (n=500, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_int              500 production           0.5140         10.4         73.7         38.8        589.4        -  ok
+  gauge_int              500 alp                  1.0120         36.3        370.7        375.1       2965.3    1.969  ok
+  gauge_int              500 gcd_delta_for        0.5140         66.3        216.5        111.3       1732.3    1.000  ok
+  gauge_int              500 chimp128             2.5440         40.9         59.3        150.7        474.0    4.949  ok
+  gauge_int              500 bytesplit_zstd       0.9060         41.1         67.5         61.1        539.7    1.763  ok
+  gauge_int              500 raw_f64              8.0000       1099.8       1085.0       8680.3       8680.3   15.564  ok
+  gauge_int              500 alp_vectorized       1.0100         72.6        249.8        252.3       1998.1    1.965  ok
+  gauge_int              500 alp_rd               1.0120         32.6        249.2        252.2       1993.3    1.969  ok
+  gauge_int              500 dexor                1.1760         22.3         34.1         40.1        272.8    2.288  ok
+
+gauge_dec2  (n=500, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_dec2             500 production           1.0160          7.5         70.3         72.3        562.5        -  ok
+  gauge_dec2             500 alp                  1.3940         24.6        407.2        567.6       3257.5    1.372  ok
+  gauge_dec2             500 gcd_delta_for        1.0160         57.4        187.4        190.4       1499.5    1.000  ok
+  gauge_dec2             500 chimp128             2.8720         35.8         51.9        149.0        415.1    2.827  ok
+  gauge_dec2             500 bytesplit_zstd       4.5920         35.1         56.6        259.9        452.7    4.520  ok
+  gauge_dec2             500 raw_f64              8.0000       1096.9       1083.1       8664.8       8664.8    7.874  ok
+  gauge_dec2             500 alp_vectorized       1.3880         43.3        224.5        311.6       1795.7    1.366  ok
+  gauge_dec2             500 alp_rd               1.3900         27.1        224.4        311.9       1795.0    1.368  ok
+  gauge_dec2             500 dexor                1.6940         10.8         20.6         34.9        164.8    1.667  ok
+
+gauge_dec3  (n=500, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  gauge_dec3             500 production           1.3920          5.4         58.5         82.1        467.8        -  ok
+  gauge_dec3             500 alp                  1.8940         19.5        389.0        736.8       3111.9    1.361  ok
+  gauge_dec3             500 gcd_delta_for        1.3920         47.1        103.3        143.7        826.1    1.000  ok
+  gauge_dec3             500 chimp128             4.2260         16.2         22.5         95.0        179.9    3.036  ok
+  gauge_dec3             500 bytesplit_zstd       5.8780         31.9         55.4        325.6        443.1    4.223  ok
+  gauge_dec3             500 raw_f64              8.0000       1072.3       1031.8       8254.2       8254.2    5.747  ok
+  gauge_dec3             500 alp_vectorized       1.8880         34.9        199.2        376.1       1593.7    1.356  ok
+  gauge_dec3             500 alp_rd               1.8900         21.5        177.9        336.3       1423.6    1.358  ok
+  gauge_dec3             500 dexor                2.1440         13.6         27.7         59.4        221.6    1.540  ok
+
+noisy_float  (n=500, production val enc=17(raw_f64))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  noisy_float            500 production           8.0000          3.7         50.7        406.2        405.6        -  ok
+  noisy_float            500 alp                  8.4560          7.1         69.8        590.2        558.4    1.057  ok
+  noisy_float            500 gcd_delta_for        8.0020        287.7       1017.8       8144.7       8142.7    1.000  ok
+  noisy_float            500 chimp128             7.9600         15.8         16.3        129.5        130.2    0.995  ok
+  noisy_float            500 bytesplit_zstd       7.5140         28.4         54.5        409.8        436.3    0.939  ok
+  noisy_float            500 raw_f64              8.0000        618.2       1078.5       8627.9       8627.9    1.000  ok
+  noisy_float            500 alp_vectorized       8.4500         12.1         85.0        718.0        679.8    1.056  ok
+  noisy_float            500 alp_rd               7.5500          8.1         70.9        535.3        567.2    0.944  ok
+  noisy_float            500 dexor                7.3280          5.8         15.6        114.2        124.7    0.916  ok
+
+constant  (n=500, production val enc=18(alp))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  constant               500 production           0.0100         13.2         93.9          2.1        751.4        -  ok
+  constant               500 alp                  0.0100         54.6        631.5          6.3       5051.9    1.000  ok
+  constant               500 gcd_delta_for        0.0120        103.1        432.7          5.2       3461.9    1.200  ok
+  constant               500 chimp128             1.1400         95.0        135.6        154.6       1085.0  114.000  ok
+  constant               500 bytesplit_zstd       0.0540         83.1        101.3          5.5        810.3    5.400  ok
+  constant               500 raw_f64              8.0000       1066.5       1063.2       8505.6       8505.6  800.000  ok
+  constant               500 alp_vectorized       0.0080         92.0        922.9          7.4       7383.2    0.800  ok
+  constant               500 alp_rd               0.0100         61.3        847.7          8.5       6781.8    1.000  ok
+  constant               500 dexor                0.2540         32.3         39.7         10.1        317.4   25.400  ok
+
+sparse  (n=500, production val enc=18(alp))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  sparse                 500 production           0.4020          9.0         49.5         20.5        396.4        -  ok
+  sparse                 500 alp                  0.4020         23.8        287.5        115.6       2299.6    1.000  ok
+  sparse                 500 gcd_delta_for        1.3880         45.4        100.4        139.4        803.3    3.453  ok
+  sparse                 500 chimp128             1.6820         35.2         45.7         76.9        365.9    4.184  ok
+  sparse                 500 bytesplit_zstd       0.5840         26.8         38.6         22.5        308.6    1.453  ok
+  sparse                 500 raw_f64              8.0000        653.6        548.4       4386.9       4386.9   19.900  ok
+  sparse                 500 alp_vectorized       1.2580         40.2        128.3        161.4       1026.4    3.129  ok
+  sparse                 500 alp_rd               1.2600         18.4        128.8        162.3       1030.8    3.134  ok
+  sparse                 500 dexor                0.6440         18.4         28.8         18.5        230.3    1.602  ok
+
+float_counter(ctrl)  (n=500, production val enc=17(raw_f64))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  float_counter(ctrl)    500 production           8.0000          3.6         85.4        683.9        682.8        -  ok
+  float_counter(ctrl)    500 alp                  8.3480          7.0         73.8        615.7        590.1    1.044  ok
+  float_counter(ctrl)    500 gcd_delta_for        8.0020        287.4       1083.6       8671.0       8668.9    1.000  ok
+  float_counter(ctrl)    500 chimp128             6.4860         21.6         20.8        134.8        166.3    0.811  ok
+  float_counter(ctrl)    500 bytesplit_zstd       6.4120         47.9         95.6        612.9        764.7    0.801  ok
+  float_counter(ctrl)    500 raw_f64              8.0000       1101.6       1085.7       8685.8       8685.8    1.000  ok
+  float_counter(ctrl)    500 alp_vectorized       8.3420         10.8         84.8        707.2        678.2    1.043  ok
+  float_counter(ctrl)    500 alp_rd               7.2680          7.4         72.9        529.6        582.9    0.908  ok
+  float_counter(ctrl)    500 dexor                6.8160          7.6         15.1        103.2        121.1    0.852  ok
+
+metricsbench_history  (n=500, production val enc=19(gcd_delta_for))
+  dataset                  n codec              B/sample   enc Mval/s   dec Mval/s  dec in MB/s dec out MB/s    ratio  roundtrip
+  metricsbench_history   500 production           2.2780          5.3         61.8        141.6        494.7        -  ok
+  metricsbench_history   500 alp                  5.0220          9.8        411.6       2067.1       3293.0    2.205  ok
+  metricsbench_history   500 gcd_delta_for        2.2780         49.7        147.0        335.0       1176.3    1.000  ok
+  metricsbench_history   500 chimp128             4.4580         27.7         29.8        132.9        238.4    1.957  ok
+  metricsbench_history   500 bytesplit_zstd       2.8360         32.6         61.4        174.2        491.5    1.245  ok
+  metricsbench_history   500 raw_f64              8.0000       1089.0       1065.8       8526.5       8526.5    3.512  ok
+  metricsbench_history   500 alp_vectorized       5.0160         15.6        116.2        583.0        929.8    2.202  ok
+  metricsbench_history   500 alp_rd               5.0180         10.6        116.1        582.7        929.0    2.203  ok
+  metricsbench_history   500 dexor                5.7020          6.7         16.1         91.6        128.5    2.503  ok
+
+======================= adoption summary =======================
+rule: bytes <= 75% of production AND dec >= production dec AND bit-exact
+  counter_int_resets      60 adopt: none
+  gauge_int               60 adopt: none
+  gauge_dec2              60 adopt: none
+  gauge_dec3              60 adopt: none
+  noisy_float             60 adopt: none
+  constant                60 adopt: none
+  sparse                  60 adopt: none
+  float_counter(ctrl)     60 adopt: none
+  metricsbench_history    60 adopt: none
+  counter_int_resets     500 adopt: none
+  gauge_int              500 adopt: none
+  gauge_dec2             500 adopt: none
+  gauge_dec3             500 adopt: none
+  noisy_float            500 adopt: none
+  constant               500 adopt: none
+  sparse                 500 adopt: none
+  float_counter(ctrl)    500 adopt: none
+  metricsbench_history   500 adopt: none
