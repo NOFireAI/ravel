@@ -2384,12 +2384,79 @@ jobs:
             echo "::error::floci_contract did not run (expected 1 passed)"
             exit 1
           fi
+      # Azurite: the first-party Azure Blob emulator (ADR-4158 D8). Beside
+      # RustFS and floci so the Azure backend's own contract case runs in
+      # every pull request that touches object_store_area, catching the fake
+      # and the real service disagreeing. No --loose: that flag makes
+      # Azurite accept and silently ignore headers it does not implement,
+      # which would hide a precondition AzureStore depends on.
+      - name: Start Azurite
+        run: |
+          docker run -d --name azurite \
+            -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite:3.35.0@sha256:647c63a91102a9d8e8000aab803436e1fc85fbb285e7ce830a82ee5d6661cf37 \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+      - name: Wait for Azurite to be live
+        run: |
+          # Azurite has no unauthenticated health endpoint; any HTTP response
+          # (even the 4xx an unsigned request against the blob endpoint draws)
+          # proves the port is accepting connections, so curl's exit status is
+          # ignored and only "did we get a status line at all" is checked.
+          for _ in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/devstoreaccount1 || true)
+            if [ "$code" != "000" ]; then
+              echo "Azurite is live (HTTP $code)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Azurite did not become healthy in time"
+          docker logs azurite || true
+          exit 1
+      - name: Create the contract-suite container in Azurite
+        run: |
+          # devstoreaccount1's account key is Azurite's fixed development
+          # key, published in Microsoft's Azurite documentation; it is not a
+          # secret and is identical in every Azurite install.
+          AZURITE_ACCOUNT_KEY='Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=='
+          az storage container create \
+            --name ravel-object-store-test \
+            --connection-string "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=${AZURITE_ACCOUNT_KEY};BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+      - name: Run object-store contract suite against Azurite
+        env:
+          RAVEL_AZURITE_URL: http://127.0.0.1:10000/devstoreaccount1
+          RAVEL_AZURITE_ACCOUNT: devstoreaccount1
+          RAVEL_AZURITE_CONTAINER: ravel-object-store-test
+          # Azurite's fixed public development key; see the container-create
+          # step above.
+          RAVEL_AZURITE_ACCOUNT_KEY: 'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=='
+        run: |
+          set -o pipefail
+          # Same invocation shape as the RustFS and floci steps above; see
+          # the RustFS step's comment for why --no-capture and --color never
+          # are needed for the greps below.
+          cargo nextest run --locked -p ravel-object-store --test contract \
+            -E 'test(=azurite_contract)' --no-capture --color never 2>&1 \
+            | tee azurite-contract-output.txt
+          # Prove the suite actually ran against Azurite rather than taking
+          # the RAVEL_AZURITE_URL-unset early return.
+          if grep -q "skipping Azurite contract test" azurite-contract-output.txt; then
+            echo "::error::azurite_contract skipped despite RAVEL_AZURITE_URL set"
+            exit 1
+          fi
+          if ! grep -qE "1 tests? run: 1 passed" azurite-contract-output.txt; then
+            echo "::error::azurite_contract did not run (expected 1 passed)"
+            exit 1
+          fi
       - name: Stop RustFS
         if: always()
         run: docker rm -f rustfs || true
       - name: Stop floci
         if: always()
         run: docker rm -f floci || true
+      - name: Stop Azurite
+        if: always()
+        run: docker rm -f azurite || true
 
   # End-to-end ingest+query benchmark smoke test against real RustFS (issue
   # #266): every other ravel-bench benchmark only runs against in-process
