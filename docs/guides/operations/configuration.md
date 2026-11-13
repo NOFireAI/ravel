@@ -352,7 +352,14 @@ also reads the platform's own `IDENTITY_HEADER` variable:
 - On AKS, use workload identity. The AKS webhook injects
   `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`. Give
   the identity a role that can read, write, list and delete blobs in the
-  container (for example `Storage Blob Data Contributor` on the container).
+  container (for example `Storage Blob Data Contributor` on the container),
+  and a role holding the action
+  `Microsoft.Storage/storageAccounts/blobServices/getInfo/action` on the
+  storage account. The store reads the hierarchical-namespace flag with
+  that action when it starts, no Storage Blob Data role holds it, and
+  without it the process exits with
+  `HTTP 403 AuthorizationPermissionMismatch`. The Kubernetes guide's Azure
+  section has the role definition.
 - On a VM or node with a managed identity and none of the variables above
   set, the identity is taken from the instance metadata service. This path
   sends the platform's `IDENTITY_HEADER` variable, when set, as the

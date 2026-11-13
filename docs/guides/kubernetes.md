@@ -1669,8 +1669,11 @@ What you create on the Azure side, outside Ravel:
      --subject system:serviceaccount:ravel-system:prod-gateway
    ```
 
-4. A role assignment for each identity on the container. Every Ravel role
-   reads, writes and deletes blobs, so each needs
+4. Two role assignments for each identity: one for the data, on the
+   container, and one for a single account-level question, on the storage
+   account.
+
+   Every Ravel role reads, writes and deletes blobs, so each needs
    `Storage Blob Data Contributor`, scoped to the container rather than the
    account. The operator's identity needs it on every container whose
    `RavelCluster` sets `deploymentKeySecretRef` or `shardOverrides`, since
@@ -1685,6 +1688,37 @@ What you create on the Azure side, outside Ravel:
      --role "Storage Blob Data Contributor" \
      --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>/blobServices/default/containers/<container>
    ```
+
+   When a Ravel process starts, its store asks the account whether it has a
+   hierarchical namespace, and refuses to run if it cannot read the answer.
+   That request is authorised by the action
+   `Microsoft.Storage/storageAccounts/blobServices/getInfo/action`. The
+   Storage Blob Data roles do not hold it, at the container or at the
+   account, so an identity with only the assignment above fails
+   qualification with
+   `access denied: account information ... HTTP 403 AuthorizationPermissionMismatch`.
+   Create a role that holds that one action and assign it to each identity
+   on the storage account:
+
+   ```sh
+   ACCOUNT_ID=/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>
+   az role definition create --role-definition '{
+     "Name": "ravel-blob-account-info",
+     "IsCustom": true,
+     "Description": "Read blob account information (SKU, kind, hierarchical namespace flag).",
+     "Actions": ["Microsoft.Storage/storageAccounts/blobServices/getInfo/action"],
+     "NotActions": [], "DataActions": [], "NotDataActions": [],
+     "AssignableScopes": ["'"$ACCOUNT_ID"'"]
+   }'
+   az role assignment create --assignee-object-id <principal ID> \
+     --assignee-principal-type ServicePrincipal \
+     --role ravel-blob-account-info --scope "$ACCOUNT_ID"
+   ```
+
+   The action reads the account's SKU, kind and namespace flag and nothing
+   else: it grants no access to any container's data. A new role
+   assignment can take a few minutes to apply; the operator retries
+   qualification by itself.
 
 5. For the operator, only when a `RavelCluster` on `storage.azure` sets
    `deploymentKeySecretRef` or names a tenant under `shardOverrides`:
