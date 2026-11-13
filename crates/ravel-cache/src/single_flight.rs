@@ -614,11 +614,12 @@ mod cancelled_leader_drop_order {
     }
 
     /// One cancelled leader costs its follower exactly one re-entry, and the
-    /// follower resolves with its own fetch rather than `LeaderLost`. The
-    /// follower is woken on another worker while the cancelled leader's guard
-    /// is still running, so the drop order is raced for real. On the path
-    /// where the follower re-enters and finds the key vacant it leads at once,
-    /// and the count is still 1: one per cancelled leader followed.
+    /// follower resolves with its own fetch rather than `LeaderLost`, on a
+    /// multi-thread runtime where the follower wakes while the guard may still
+    /// be running. The follower re-enters, finds the key vacant and leads at
+    /// once, and the count is still 1: one per cancelled leader followed. The
+    /// window between deposit and removal is too narrow for this test to hit
+    /// on its own; the two probe tests above pin that order deterministically.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn one_cancellation_costs_a_follower_exactly_one_reentry() {
         let flight: Arc<SingleFlight<u64, u64, &'static str>> = Arc::new(SingleFlight::new());
