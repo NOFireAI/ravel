@@ -3107,12 +3107,13 @@ fn string_keys_sql(string_type: &str, composite: bool) -> String {
 #[tokio::test]
 async fn bucket_spill_routes_string_keys_exactly() {
     const FIXED: [(bool, usize, usize); 2] = [(false, 8, 5312), (true, 8 + 4 + 8, 5568)];
-    // Each trigger's cap per partition count it runs at: the phase 2 cap
-    // must hold one bucket's table and still refuse the retained chunks; the
-    // phase 1 cap must refuse the stock table after granting it a batch.
-    let triggers: [(&str, usize, u8, &[(usize, usize)]); 2] = [
-        ("phase 2", ENGAGE_GROUPS, 4, &[(2, 1 << 20), (4, 640 << 10)]),
-        ("phase 1", 1 << 20, 4, &[(2, 1 << 20)]),
+    // Each trigger's cap at 2 partitions and, where it runs there, at 4: the
+    // phase 2 cap must hold one bucket's table and still refuse the retained
+    // chunks; the phase 1 cap must refuse the stock table after granting it
+    // a batch.
+    let triggers = [
+        ("phase 2", ENGAGE_GROUPS, 4, 1 << 20, Some(640 << 10)),
+        ("phase 1", 1 << 20, 4, 1 << 20, None),
     ];
     let mut runs = 0;
     for string in STRING_KEY_TYPES {
@@ -3133,9 +3134,11 @@ async fn bucket_spill_routes_string_keys_exactly() {
                         );
                     }
                 }
-                for (name, engage_groups, bits, caps) in triggers {
-                    let Some(&(_, cap)) = caps.iter().find(|(at, _)| *at == partitions) else {
-                        continue;
+                for (name, engage_groups, bits, cap_at_two, cap_at_four) in triggers {
+                    let cap = match (partitions, cap_at_four) {
+                        (2, _) => cap_at_two,
+                        (_, Some(cap)) => cap,
+                        (_, None) => continue,
                     };
                     let what = format!("{string} composite={composite} {name} at {partitions}");
                     let tuning = BucketedFinalAggregation {
