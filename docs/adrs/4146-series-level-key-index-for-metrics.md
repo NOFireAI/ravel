@@ -120,6 +120,7 @@ flowchart LR
     A -->|"S at most S_max"| B["pass B: probe series_class for S:<br/>classes C"]
     B --> C["pass C: probe class_objects for C:<br/>entries kept"]
     A -->|"part declines: no refs, rejected leaf,<br/>S over S_max, ceiling"| V["label_value route<br/>(ADR-3694), then tier 1"]
+    B -->|"B or C over Q_BC"| V
     C --> T1["tier 1 probe and exact decode<br/>on survivors"]
     V --> T1
   end
@@ -139,9 +140,20 @@ field), sliced on `key8`, bucketed by the existing mix, referenced from
   same series give the same `skey`. Two distinct series sharing a prefix
   merge into one key; decision 3 shows that this only adds objects.
 - **`series_label`, key type `Bytes`.** `key8 = key8_bytes(pair)`, where
-  `pair` is the ADR-0005 label encoding of one label of a series,
-  `u16_le(len(name)) name u16_le(len(value)) value`, and the metric name
-  is the pair (`__name__`, name). The entry is a posting (decision 5's
+  `pair` is `u16_le(len(name)) name u16_le(len(value)) value` over one
+  label of the series' stored label set, and the metric name is the pair
+  (`__name__`, name). That byte string is this index's own convention,
+  not a frozen contract: ADR-0005's canonical stream encodes the metric
+  name as its own length-prefixed field and leaves `__name__` out of its
+  label list (crates/ravel-types/src/lib.rs:417-451), so it defines no
+  bytes for the name pair. The stored label set does carry `__name__`
+  (LABEL_DICT ordinal 0, docs/segment-format.md:231; a series' label set
+  is its schema's names paired with value ordinals,
+  docs/segment-format.md:300-302), which is why indexing it is exact. The
+  fold and the router must produce the same bytes for every pair, so R1
+  defines the encoding once, in the codec both call, with a test pinning
+  the bytes of a `__name__` pair and of an ordinary one. The entry is a
+  posting (decision 5's
   entry kind 1): the ascending `skey`s of every series of the part that
   carries the pair. Every label a series stores is indexed; an
   empty-valued label is absent from identity and from storage (ADR-0031)
@@ -191,9 +203,16 @@ for it as today.
   to that `skey`'s pair set. Labels are decoded from every covered entry,
   so the pairs of a series are the union over every stored label set the
   part holds for its `skey`. Then the classes, then the three sorted entry
-  lists, sliced and encoded by the existing splitter
-  (`split_key_index_entries`) and encoder, with entry kind 1 for the
-  first two fields.
+  lists, sliced and encoded. `class_objects` is entry kind 0 and uses the
+  existing splitter (`split_key_index_entries`) and encoder as they are.
+  The two posting fields need a kind-1 variant of both: the splitter takes
+  `&[KeyIndexLeafEntry]`, whose shape is `(key8, entry_ordinal: u64,
+  blocks: Vec<u32>)`, and requires the list sorted and unique by `(key8,
+  entry_ordinal)` (kidx.rs:172-179, kidx.rs:554-565), while a posting has
+  no entry ordinal, one entry per `key8`, and `u64` elements. A posting
+  entry type, its splitter (cuts between `key8`s, each sized by its delta
+  bytes) and its encoder are new code, shipped with the R1 decoder, whose
+  round-trip test needs them, and called by the W1 build.
 - **Carry (ADR-3939 decision 5).** A re-encoded part carries from the
   previous part's three fields: the previous `series_class` and
   `class_objects` leaves give each `skey`'s entry set, remapped by data
@@ -230,17 +249,37 @@ part that carries refs for all three fields:
    A key absent from the part's leaf is an empty posting. `S` is the
    intersection of the postings.
 2. If `S` is empty, every covered entry of the part is pruned for the
-   plan. If `|S|` is above `S_max` (proposed 4,096, predicted; an owner
-   question), the part declines (step 5).
-3. Pass B probes `series_class` with `S`, giving the classes `C`.
+   plan. If `|S|` is above `S_max`, the part declines (step 5). `S_max`
+   is 192, derived from the byte budget `Q_BC` of step 3 in section
+   "Expected cost" (predicted); it spares pass B's prefix GET on a part
+   the budget would most likely decline, and the budget, not `S_max`, is
+   the bound.
+3. Pass B probes `series_class` with `S`, giving the classes `C`. Passes
+   B and C run under a byte budget of their own, `Q_BC` = 4 MiB per
+   covering part (predicted), shared: pass C gets what pass B left. It
+   counts every byte a pass reads past its prefix, bridged or not. The
+   existing set probe checks only bridged runs, against
+   `max_bridged_bytes`, before it reads past the prefix
+   (kidx.rs:1469-1475), and its plan records no bridged bytes at or under
+   `B_run` distinct buckets (kidx.rs:1589-1591), so the series route sets
+   `max_bridged_bytes` to its share and adds the same comparison over the
+   touched buckets in the unbridged case. The existing policy,
+   `part_entry_count x KEY_INDEX_T1_BYTES` (kidx.rs:1301-1308), is not
+   used for these passes: it bounds nothing at these leaf sizes (section
+   "Expected cost").
 4. Pass C probes `class_objects` with `C`. The plan keeps the entries
    these name plus every uncovered entry, and drops the part's other
    entries.
 5. A part that declines, at any step, is handed to the label-value route
    of ADR-3694 for that plan: no series refs, a series leaf rejected (an
    unaccepted version, a binding mismatch, corruption, a failed GET), `S`
-   over `S_max`, a pass over its GET ceiling, or a decode reservation
-   refused. That route keeps its own fallback to tier 1.
+   over `S_max`, a pass over its GET ceiling, a pass B or C over its share
+   of `Q_BC` at or under `B_run` buckets (step 3), or a set probe that
+   declines with either `KeyIndexSetDecline` variant (kidx.rs:1321-1333):
+   `OverBudget`, more than `b_run` distinct buckets whose bridged runs
+   exceed `max_bridged_bytes` (here the pass's share of `Q_BC`), or
+   `ReservationRefused`, a frame's `decoded_bound` refused under ADR-1170.
+   That route keeps its own fallback to tier 1.
 
 Passes are shared across plans as `route_values` shares one pass per
 distinct value today: pass A probes the union of the plans' pairs once,
@@ -359,8 +398,10 @@ Index bytes per part, before zstd (the deltas of hashed keys barely
 compress):
 
 - `series_label`: `D x 10 + N_s x L x b_s`. A posting of `p` keys has a
-  mean delta of `2^64 / p`, so `b_s` is about `(64 - log2 p) / 7` rounded
-  up: 7 for `p` from 2^15 to 2^22, 8 to 9 for small postings.
+  mean delta of `2^64 / p`, so `b_s` is about `ceil((64 - log2 p) / 7)`:
+  7 for 2^15 <= `p` < 2^22 (exactly 6 at `p` = 2^22), 8 for 2^8 <= `p` <
+  2^15, 9 for 2 <= `p` < 2^8, and 10 for a posting of one element, whose
+  one delta from -1 can be as large as 2^64 - 1.
 - `series_class`: `N_s x (8 + 1 + 2)`, for `C` under 16,384.
 - `class_objects`: one entry of about 11 B per (class, entry); with
   disjoint shard classes that is `E x 11`.
@@ -373,6 +414,32 @@ On one-slice fields that is `3 + k + min(M, 64) + min(M_c, 64)`. Each pass
 is one set probe under the ADR-3692 ceiling `P_max x (1 + min(keys,
 B_run))`, so pass A's ceiling at `k = 5` is 1,024 x 6 = 6,144 GETs, and
 each stays under it at any part count up to `P_max`.
+
+`min(M, 64)` bounds requests, not bytes. Leaf bytes per pass follow the
+set probe's read plan: GET 1 reads the prefix; then, for `d` distinct
+non-empty buckets, one GET per bucket while `d` is at most `B_run`, and
+above that the smallest gaps between touched buckets are bridged until
+`B_run` runs remain, each read whole (`bound_runs`, kidx.rs:1371-1396;
+the plan at kidx.rs:1589-1594). The tier-1 form has the same shape: over
+`B_run` buckets it reads one range from the first touched bucket to the
+last (log_fetcher.rs:7109). For a pass `X` with `keys` keys over a leaf of
+body `W_X` bytes in `2^b` buckets of about `W_X / 2^b` each:
+
+```text
+d       = 2^b x (1 - (1 - 2^-b)^keys)          expected, for hashed keys
+bytes_X = prefix_X + d x W_X / 2^b             if d <= B_run
+bytes_X = prefix_X + sum of the B_run runs      if d >  B_run, at most W_X
+```
+
+Pass A has `keys = k`, so `d <= k` and it never bridges below 65 pairs.
+Passes B and C have `keys = M` and `M_c`: a large intersection reaches
+the bridged case, and once `M` is a sizeable fraction of `2^b` the runs
+cover almost the whole leaf. The existing probe declines a bridged plan
+only above `part_entry_count x KEY_INDEX_T1_BYTES`, 11 KiB per entry
+(kidx.rs:118, kidx.rs:1301-1308, the check at kidx.rs:1469-1475), which is
+far above any series leaf of a part. That is why passes B and C carry the
+budget `Q_BC` of decision 3 step 3, and why `S_max` is derived from it
+below rather than chosen as a series count.
 
 ### Worked example: the cardinality tenant and `mb_single_counter_rate`
 
@@ -392,7 +459,8 @@ each stays under it at any part count up to `P_max`.
 | leaf GETs per covering part | 3 + 5 + 1 + 1 = 10 on one-slice fields; at most 2 x 5 + 2 + 2 = 14 if every key falls in its own slice | predicted, from the formula above |
 | leaf GETs today for the same statement | 3 per record on 1 covering part, bound (1 + n) = 6 | measured 2026-11-10, comment 6790288400 |
 | pass A bytes | postings of `__name__` (300,000 series) 2.1 MB, job (250,000) 1.75 MB, method and status (75,000 each) 0.53 MB each, instance-0 a few KB: about 4.9 MB, in buckets of about 14 KB average otherwise (`bucket_bits` 11 for a 29.4 MB body, `choose_key_index_bucket_bits` at kidx.rs:293) | predicted, series counts from the `series_permille` and label value counts in benchmarks/metrics/workload.json:1 |
-| passes B and C bytes | three prefixes of about 8 KB (`4 x 2^11` directory bytes) and two buckets of a few KB | predicted |
+| passes B and C bytes | two prefixes, about 8 KB for `series_class` (`4 x 2^11` directory bytes; `bucket_bits` 11 for an 11.0 MB body) and 1 KB for `class_objects` (`4 x 2^8`; `bucket_bits` 8 for 0.28 MB), plus one bucket each of about 5.4 KB (11.0 MB / 2^11) and 1.1 KB (0.28 MB / 2^8): about 16 KB | predicted, `choose_key_index_bucket_bits` at kidx.rs:293 |
+| the existing bridged budget | `part_entry_count x KEY_INDEX_T1_BYTES` = 25,401 x 11,264 B = 286.1 MB per part, against an 11.0 MB `series_class` leaf: no pass B on this part could reach it | predicted; the policy at kidx.rs:1301-1308, 11 KiB at kidx.rs:118 |
 | objects opened | 141 series holders plus 4 token objects = 145, against 1,601 | predicted; 141 and 4 from comment 6790288400 |
 | probe wire | 145 x 394 KB = 57 MB, against 631.5 MB | predicted; 394 KB per object measured 2026-11-10, comment 6790288400 |
 | plan phase | 1,067 GETs and 69.9 MB scaled by 145 / 1,601: about 97 GETs and 6.3 MB | predicted, assuming plan cost per opened object stays as measured in comment 6790288400 |
@@ -405,6 +473,50 @@ about 8 x 4.9 = 39 MB (predicted). Latency: three sequential leaf rounds
 instead of one, each a GET 1 then bucket reads, predicted at three
 first-byte latencies more than the label-value route, against 1,456
 fewer objects probed.
+
+### Passes B and C at a large intersection, and `S_max`
+
+Pass B bytes past the prefix on the worked example's `series_class` leaf
+(`W` = 11.0 MB, 2^11 buckets of about 5.4 KB), by the formula above. All
+predicted: each figure is the mean of 200 random key sets per `M` (2,000
+for 192 to 204) run through a copy of `bound_runs` (kidx.rs:1371-1396)
+with buckets of equal size.
+
+| `M` | distinct buckets `d` | pass B bytes |
+|---|---|---|
+| 1 | 1 | 5.4 KB |
+| 64 | 63 | 0.34 MB |
+| 128 | 124 | 2.1 MB |
+| 192 | about 183 | 3.68 MB |
+| 204 | about 194 | 3.92 MB |
+| 256 | 241 | 4.8 MB |
+| 512 | 453 | 7.1 MB |
+| 1,024 | 806 | 8.8 MB |
+| 4,096 | 1,770 | 10.5 MB |
+
+Above about 1,000 keys pass B reads most of the leaf: a plan whose
+intersection is 4,000 series reads about 10.5 MB of `series_class` per
+covering part, where the existing budget of 286.1 MB would let it.
+
+The budget. `Q_BC` = 4 MiB = 4,194,304 B per covering part for passes B
+and C together, predicted. It is about pass A's 4.9 MB on the worked
+statement, so a routed part's leaf bytes stay under about twice pass A's;
+and it is the probe wire of 4,194,304 / 394 KB = 10.6 opened objects, so
+passes B and C pay for themselves on a part where the route prunes 11
+objects or more.
+
+`S_max` from the budget, on the worked example. Pass C can read at most
+its whole leaf, 25,401 x 11 = 279,411 B, and the two prefixes take 8,192 +
+1,024 = 9,216 B, so pass B's share is 4,194,304 - 279,411 - 9,216 =
+3,905,677 B. The predicted mean crosses that between `M` = 200 (3.84 MB)
+and 204 (3.92 MB). `S_max` is 192, the largest multiple of `B_run` below
+the crossing (3.68 MB, plus at most 0.29 MB for pass C and the prefixes:
+3.97 MB, under 4.19 MB). `S_max` is a pre-check, not the bound: a key set
+that falls unevenly, or a part whose leaf is larger than this one, is
+still held to `Q_BC` by the probe before it reads past pass B's prefix,
+and declines with about 8 KB read. On a part whose `series_class` leaf is
+smaller, a fixed 192 declines some plans the budget would admit, which
+costs the label-value route's bytes and never an object.
 
 Fold, per tenant (predicted):
 
@@ -489,7 +601,8 @@ Fold, per tenant (predicted):
   few KB, and two more sequential leaf rounds. A broad selector whose
   intersection is over `S_max` pays pass A and then the label-value
   passes too; the measurement below records that cost on the 21
-  statements.
+  statements. Passes B and C never read more than `Q_BC`, 4 MiB, per
+  covering part.
 - The fold writes three more fields per metrics part, predicted at 0.15 %
   of data bytes on the cardinality tenant, decodes label sets of new
   series, and reads catalog ranges on a rebuild.
@@ -522,6 +635,7 @@ objects, not from the index.
 | A6. fold | series index bytes at most 0.5 % of part data bytes on the cardinality tenant (40.7 MB, 0.15 %, predicted); uncovered parts 0; an advancing fold with the switch on issues no GET beyond the same fold with it off | over 1 % of part data bytes, or any extra GET on an advance | predicted |
 | A7. erasure | with a pending `.dreq`, no series leaf built, `segmentsPrunedBySeriesIndex` 0 and results equal to the unrouted run | any series prune while pending | predicted; the rule is ADR-2707 decision 6 |
 | A8. older reader | a query node at the step-1-less build over a HEAD carrying version 3 refs routes on `label_value` alone with equal results | any refusal or difference | predicted |
+| A9. large intersection, `mb_selective_job_rate_sum` (benchmarks/metrics/metrics.corpus.json:69; `k` = 2, `M` about 75,000: 300,000 `metricsbench_requests_total` series over 4 `job` values), leaf bytes per covering part | `k` and `M` recorded. Run 1, default `S_max`: the part declines after pass A, no pass B or C GET; series leaf bytes are pass A's, about 2.1 + 1.75 = 3.85 MB. Run 2, the same statement with `S_max` lifted above `M` (a resolve override R2 exposes for this check only): pass B records `distinct_buckets` 2,048 and `bridged_bytes` about the whole `series_class` leaf, 11.0 MB (the probe's own figures, kidx.rs:1467-1468), declines on `Q_BC` after its prefix, and passes B and C read about 8 KB past pass A | run 1: any pass B or C GET, or pass A over 6.2 MB per covering part (A3's ratio of miss to target, 8 / 5, applied to 3.85 MB); run 2: any pass B or C bucket read, passes B and C over 4 MiB per covering part, or a recorded `bridged_bytes` outside 10 % of the `series_class` leaf's body bytes as written | predicted; `M` from the `series_permille` and `job` values in benchmarks/metrics/workload.json:1, the bytes from section "Expected cost" |
 
 The miss line on A1 is exactness, not a tolerance: the route has no
 approximate step, so any object above `series_holders` plus token objects
@@ -532,9 +646,11 @@ judged on object count, not on a different per-object probe.
 
 ## Open questions for the owner
 
-1. `S_max`: 4,096 series per plan and part is a guess at where passes B
-   and C stop paying for themselves. A lower value sends broad selectors
-   to the label-value route sooner.
+1. `Q_BC`: 4 MiB per covering part for passes B and C, about pass A's
+   bytes and about 11 opened objects of probe wire. `S_max` (192) follows
+   from it on the worked example; a different `Q_BC` moves `S_max` along
+   the table in section "Expected cost". A lower value sends broad
+   selectors to the label-value route sooner.
 2. The cap: one `metrics_series_index_max_ratio_ppm` at 1 %, separate
    from the label index's 1 %, or one shared cap over all four fields.
 3. Large postings: pass A reads about 4.9 MB, mostly the `__name__` and
@@ -552,7 +668,7 @@ judged on object count, not on a different per-object probe.
 
 | task | decision | crates | depends on | risk |
 |---|---|---|---|---|
-| R1 leaf version 3 reader: header `entry_kind`, posting decoder and its property, fuzz and corrupt-input tests, `inspect kidx` prints the kind, docs/catalog-and-mvcc.md | 5 | ravel-catalog, ravel-cli, proto | owner approval | medium: a format change |
-| R2 series route in the resolve: passes A to C, the declines, the new counters and pass rows, the ordering against `label_value`, docs/query-engine.md | 3, 4 | ravel-query, ravel-server | R1 | medium |
-| W1 the fold build and carry behind `metrics_series_index`, off; the cap and its report | 1, 2 | ravel-catalog, ravel-server, ravel-cli | R1 released to every process | medium |
+| R1 leaf version 3 reader: header `entry_kind`, the posting entry type with its decoder, kind-1 splitter and encoder (codec only, no fold calls them), the shared pair encoding of decision 1, the property, fuzz and corrupt-input tests, `inspect kidx` prints the kind, docs/catalog-and-mvcc.md | 5 | ravel-catalog, ravel-cli, proto | owner approval | medium: a format change |
+| R2 series route in the resolve: passes A to C, `S_max` and the `Q_BC` byte budget with its unbridged-case check and the `S_max` override A9 uses, the declines, the new counters and pass rows, the ordering against `label_value`, docs/query-engine.md | 3, 4 | ravel-query, ravel-server | R1 | medium |
+| W1 the fold build and carry behind `metrics_series_index`, off, writing the posting fields through R1's kind-1 splitter and encoder; the cap and its report | 1, 2 | ravel-catalog, ravel-server, ravel-cli | R1 released to every process | medium |
 | M1 harness `series_holders` stamp and the acceptance run | acceptance | ravel-bench | R2, W1 | low |
