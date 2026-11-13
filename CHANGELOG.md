@@ -6,6 +6,141 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-11-13
+
+### Added
+
+- **`ravel-server --mode maintain` sets the two-level merge's level-2
+  workers and run block size.** `--maintain-level2-workers` and
+  `--maintain-run-block-records` match `ravel-cli maintain`'s
+  `--level2-workers` and `--run-block-records`, and each is refused at
+  startup at zero or without `--maintain-scratch-dir`.
+- **`ravel-object-store` gains `AzureStore`, a read-write backend for Azure
+  Blob Storage (ADR-4158).** The blob's ETag is the version token,
+  `CreateIfAbsent` and `CasVersion` are `If-None-Match: *` and `If-Match`,
+  and a suffix read is a HEAD followed by an `If-Match` ranged GET, since
+  Azure answers a suffix range with the whole blob. A pinned read that
+  meets a 412 sends one HEAD without `If-Match`: a 404 `BlobNotFound` there
+  is `NotFound`, a success `PreconditionFailed`, and any other failure of
+  the HEAD is returned as it is, since Azurite answers `If-Match` on an
+  absent key with 412 where Azure answered a GET with 404. A write or
+  delete refused by a lease (a 412 or 409 with a `Lease` error code) is
+  `AlreadyExists` on a create and `Permanent` otherwise. Listing runs
+  through its own List Blobs client. Four `AZURE_*` variables are the only ones Ravel reads and passes
+  to the client builder (workload identity or a shared key); the
+  managed-identity fallback reads the platform's own `IDENTITY_HEADER`. An
+  account with hierarchical namespace enabled is refused at construction:
+  `x-ms-is-hns-enabled` is read from the container URL, then from the
+  account URL when the first answer lacks it, and only `false` is
+  accepted. That request needs the control-plane action
+  `Microsoft.Storage/storageAccounts/blobServices/getInfo/action` on the
+  storage account, which no Storage Blob Data role holds, so an identity
+  with only a data role is refused with HTTP 403
+  `AuthorizationPermissionMismatch`; each identity needs a second role
+  assignment on the account (`docs/guides/kubernetes.md`, Azure step 4).
+  An in-process fake (`azure::fake`, behind `test-support`) runs the
+  contract suite in every test run.
+- **`ravel-server --store azure` keeps every object in an Azure Blob Storage
+  container (ADR-4158).** `--azure-account` (`RAVEL_AZURE_ACCOUNT`) and
+  `--azure-container` (`RAVEL_AZURE_CONTAINER`) are required; the credential
+  comes from the standard `AZURE_*` environment, never from a flag. The
+  server refuses to start on an account with hierarchical namespace enabled
+  and on a container with no qualification record, whose backend identity is
+  `az://<account>/<container>`. Under `--store azure` every `--s3-*` and
+  `--gcs-*` flag, `--s3-kms-key`, `--tenant-kms-config` and
+  `--require-bucket-protection` is refused, and every `--azure-*` flag is
+  refused under any other store; a flag left at its default is not refused.
+  A Parquet profile of kind `azure` on Ravel's own account and container, or
+  one whose account is not a valid storage account name, is refused when a
+  statement or DDL opens its store, not at startup. An `--azure-endpoint`
+  or `--gcs-endpoint` that carries userinfo is refused without printing it.
+- **`ravel-cli --store azure` builds its store on an Azure Blob Storage
+  container (ADR-4158).** `--azure-account`
+  (`RAVEL_AZURE_ACCOUNT`) and `--azure-container` (`RAVEL_AZURE_CONTAINER`)
+  name it. No flag carries a credential: it comes from the environment, as
+  AKS workload identity (`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`,
+  `AZURE_TENANT_ID`), a shared key (`AZURE_STORAGE_ACCOUNT_KEY`) or a
+  managed identity.
+  `store qualify` records `az://<account>/<container>` as the backend
+  identity, with `@<endpoint>` appended when the hidden `--azure-endpoint`
+  replaces Azure's endpoint, and `--list-page-size` sets the listing's
+  `maxresults`, which List Blobs takes from 1 to 5000: a larger value is
+  refused when the store is built. Under `--store azure`, a command that
+  builds the store refuses a given `--s3-*` or `--gcs-*` flag; `--tenant-kms-config` is
+  refused, `store verify-protection` exits 2 saying Azure container
+  protection is not checked, and `agents dev` refuses. Under `--store s3`,
+  `gcs` or `memory` a given `--azure-*` flag is refused when the command
+  builds the store. An `--azure-endpoint` or `--gcs-endpoint` carrying
+  userinfo (`user:password@`) is refused without printing it.
+- **The operator runs a `RavelCluster` on Azure Blob Storage with AKS
+  workload identity.** `spec.storage.azure` takes `account`, `container`,
+  `clientId` and optional per-role `roleClientIds`, each shape-checked at
+  admission; exactly one of `storage.s3` and `storage.azure` must be set.
+  Each tier and the qualify Job run as their own ServiceAccount annotated
+  with `azure.workload.identity/client-id`, with `--store azure` and no
+  stored credential, and a client ID change rolls the tier it applies to.
+  The operator's own workload identity label and annotation are opt-in,
+  needed only for `deploymentKeySecretRef` or `shardOverrides`. Each
+  identity needs `Storage Blob Data Contributor` on the container and a role
+  on the storage account holding the account-information action above;
+  without the second, the qualify Job fails with HTTP 403. The cluster
+  reports `BucketProtectionVerified=False` (`NotImplementedForAzure`) until
+  a container protection check exists.
+
+### Fixed
+
+- **Correction to the 0.32.0 notes.** The bucketed spill retry entry compared
+  statement 33's hot time with "82.0 s and 91.5 s in the published v0.31.1
+  results". Those figures are from Ravel's own run of the ClickBench entry on
+  the tree v0.31.1 was cut from, not from results ClickBench publishes;
+  ClickBench's published Ravel results are from v0.28.0, and
+  ClickHouse/ClickBench#3256 submits the v0.32.0 results. The entry's
+  v0.32.0 figures, 9.4 s on c6a.2xlarge and 17.5 s on c6a.xlarge, came from
+  the pre-release M8 run (#4072 comment 6802934028). The v0.32.0
+  publication run on the released binaries measured 9.6 s on
+  c6a.2xlarge and 16.8 s on c6a.xlarge (#4072 comment 6818187104).
+- **The bucketed refusal retry tunes on small hosts where its routed chunk
+  used to fall below the 1,024-row floor.** The derivation now gives the open
+  routed chunks the part of each stream's memory share the bucket table
+  leaves, instead of a fixed quarter of it (ADR-4143 decision 1). ClickBench
+  statement 33 on c6a.large, at the figures M8 logged for its refused first
+  attempt (12.65 GB of projected table bytes, a 1,461,083,554 B effective
+  limit), now derives `bits` 7 with 2,452-row chunks and a descriptor need of
+  4,112, where it previously kept the sort-merge retry with
+  `retry_plan_reason="chunk_too_small"`.
+  A retry that still cannot tune now reports `too_many_bits` (or
+  `descriptor_budget`) instead of `chunk_too_small`, which keeps its string
+  but is no longer returned.
+- **A query no longer fails because another query that shared its cache fetch
+  was cancelled.** When the read cache coalesces concurrent reads of one object,
+  a leader whose query is torn down for its memory budget used to leave every
+  follower with a transient "upstream storage temporarily unavailable" error
+  (HTTP 503) even though object storage never failed. A follower of a cancelled
+  leader now re-enters the coalescing slot, where it runs the fetch itself if
+  no other caller has taken the slot or follows the one that has (at most 8
+  re-entries, so a storm of cancellations still degrades to the old transient
+  error). A leader that panics still fails its followers, so a deterministic
+  panic is not repeated once per follower.
+
+### Changed
+
+- **The metrics label index is on by default wherever key-index leaves are
+  built** (ADR-3694 decision 2 and its Stage 1 acceptance amendment).
+  `ravel-server --fold-metrics-label-index` is replaced by
+  `--no-fold-metrics-label-index`, and `ravel-cli catalog fold
+  --metrics-label-index` by `--no-metrics-label-index`; neither opt-out is
+  refused without the leaf build flag, and the server refuses its opt-out in
+  `--mode gateway`. `--rebuild-key-index --signal metrics` now builds the
+  `label_value` leaf without a flag. Upgrade note: an operator already
+  running `--fold-key-index-leaves` or `--key-index-leaves` for logs or spans
+  starts building metrics leaves unless they pass the opt-out. The first fold
+  with the leaf on reads each metrics object's footer and LABEL_DICT, about 8
+  GETs per object in the Stage 1 acceptance measurement (202,931 GETs
+  for 25,401 objects); the cost of later folds was not measured. Metrics days
+  sealed before the upgrade carry no leaf: each fold counts them in
+  `key_index_parts_missing_declared_leaves` and warns until `ravel-cli
+  catalog fold --rebuild-key-index --signal metrics` attaches it.
+
 ## [0.32.0] - 2026-11-11
 
 ### Added
