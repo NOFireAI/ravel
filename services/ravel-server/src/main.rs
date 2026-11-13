@@ -9,9 +9,7 @@ use anyhow::Context;
 use ravel_maintain::RetentionConfig;
 use ravel_server::alert_sink::DEFAULT_SINK_TIMEOUT;
 use ravel_server::alerting::{DEFAULT_QUERY_DEADLINE, load_rules_file};
-use ravel_server::{
-    AlertEvalConfig, Cli, FoldTaskConfig, MaintenanceTaskConfig, Mode, ServerConfig,
-};
+use ravel_server::{AlertEvalConfig, Cli, MaintenanceTaskConfig, Mode, ServerConfig};
 use tracing_subscriber::EnvFilter;
 
 // jemalloc is compiled into this binary so the allocator is part of the
@@ -631,13 +629,7 @@ async fn main() -> anyhow::Result<()> {
         tenant_resolver: resolver_bundle.resolver,
         mtls_listener,
         fold_tenants,
-        fold: FoldTaskConfig {
-            enabled: !cli.disable_fold,
-            fold_interval: Duration::from_secs(cli.fold_interval_secs),
-            build_key_index_leaves: cli.fold_key_index_leaves,
-            key_index_build_max_pairs: cli.fold_key_index_build_max_pairs,
-            metrics_label_index: !cli.maintenance.no_fold_metrics_label_index,
-        },
+        fold: cli.fold_task_config(),
         maintain: MaintenanceTaskConfig {
             enabled: matches!(cli.mode, Mode::Maintain),
             interval: Duration::from_secs(cli.maintain_interval_secs),

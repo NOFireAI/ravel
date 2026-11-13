@@ -1,8 +1,8 @@
 //! `ravel-cli catalog fold --no-metrics-label-index` (ADR-3694 decision 2 and
 //! its Stage 1 acceptance amendment): the metrics label index is on by
 //! default wherever leaves are built, the opt-out reaches the catalog the
-//! fold and the rebuild run with, a default fold without `--key-index-leaves`
-//! is not refused and builds nothing, and a metrics rebuild with the opt-out
+//! fold and the rebuild run with, a fold with `--no-key-index-leaves` is not
+//! refused and builds nothing, and a metrics rebuild with the opt-out
 //! is refused. Each case maps the opt-out to the catalog switch as
 //! `catalog fold` does, as its negation.
 //!
@@ -133,8 +133,8 @@ async fn kidx_objects(store: &MemoryStore) -> usize {
         .count()
 }
 
-/// One `catalog fold --signal metrics`, with `--key-index-leaves` when
-/// `key_index_leaves` and `--no-metrics-label-index` when
+/// One `catalog fold --signal metrics`, with the leaf switch on (the
+/// default) when `key_index_leaves`, `--no-key-index-leaves` otherwise, and `--no-metrics-label-index` when
 /// `no_metrics_label_index`.
 async fn fold_metrics(
     store: Arc<MemoryStore>,
@@ -159,7 +159,7 @@ async fn fold_metrics(
     .await
 }
 
-/// With `--key-index-leaves` and no other flag a metrics fold builds the
+/// With the leaf switch on and no other flag a metrics fold builds the
 /// `label_value` leaf: one leaf is written and the pending erasure set is
 /// listed once. With `--no-metrics-label-index` there is no leaf and no
 /// listing.
@@ -191,12 +191,12 @@ async fn the_metrics_label_index_is_on_by_default_and_the_opt_out_reaches_the_fo
     assert_eq!(kidx_objects(&off).await, 0);
 }
 
-/// A default `catalog fold`, without `--key-index-leaves`, is not refused for
-/// the metrics label index it has on: it reads no LABEL_DICT, lists no
+/// A `catalog fold --no-key-index-leaves` is not refused for the metrics
+/// label index it has on by default: it reads no LABEL_DICT, lists no
 /// erasure request and writes no leaf, and issues exactly the GETs of the
 /// same fold with `--no-metrics-label-index`.
 #[tokio::test]
-async fn a_default_fold_without_key_index_leaves_reads_no_label_dict_and_writes_no_leaf() {
+async fn a_fold_with_the_leaf_switch_off_reads_no_label_dict_and_writes_no_leaf() {
     let mut get_requests = Vec::new();
     for no_metrics_label_index in [false, true] {
         let store = Arc::new(MemoryStore::new());

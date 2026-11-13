@@ -1083,19 +1083,37 @@ pub struct Cli {
     pub fold_interval_secs: u64,
 
     /// Builds per-part key-index leaves (ADR-2707 decision 4) in every fold
-    /// this process runs, scheduled and on-demand. Off by default, kept off
-    /// by ADR-3692's Stage 1 amendment because an advancing fold's passes
-    /// and rewritten leaf bytes grow with the tail; the spans `trace_id` lookup reads
-    /// the leaves where they exist (tier 2). When on, every part a fold
-    /// re-encodes has each new entry's KEY_IDX section read by ranged GET, up
-    /// to three GETs per entry; the tail part, re-encoded on every fold that
-    /// advances the watermark, carries the entries its previous leaves cover
-    /// by one GET per leaf instead, and reads again each entry those leaves
-    /// left uncovered. Refused in `--mode gateway`, which runs no fold.
-    #[arg(long)]
+    /// this process runs, scheduled and on-demand. This is the default (issue
+    /// #3927), so the flag changes nothing and is kept so existing command
+    /// lines still start; it cannot be combined with
+    /// `--no-fold-key-index-leaves`. With the build on, a fold seals a part
+    /// at every UTC day boundary (ADR-3939 decision 1), and the spans
+    /// `trace_id` lookup reads the leaves where they exist (tier 2); every
+    /// part a fold re-encodes has each new entry's KEY_IDX section read by
+    /// ranged GET, up to three GETs per entry, and a re-encoded part carries
+    /// the entries its previous leaves cover by one GET per leaf instead,
+    /// reading again each entry those leaves left uncovered. Refused in
+    /// `--mode gateway`, which runs no fold.
+    #[arg(
+        long = "fold-key-index-leaves",
+        conflicts_with = "fold_key_index_leaves"
+    )]
+    pub fold_key_index_leaves_on: bool,
+
+    /// Turns off the key-index leaf build in every fold this process runs.
+    /// The resolved switch: on unless this flag is passed. A switch-off fold
+    /// over a HEAD whose parts already carry leaf refs re-partitions the
+    /// tenant's history by entry count, drops the refs of every part it
+    /// re-encodes, reports `key_index_switch_off_over_leaves` and logs a
+    /// warning; the next switch-on fold rebuilds every day's leaves
+    /// (ADR-3939 decision 4). Every process that folds a tenant (the
+    /// maintain tier, any on-demand fold, any `ravel-cli catalog fold`) must
+    /// therefore agree on the switch. Refused in `--mode gateway`, which
+    /// runs no fold.
+    #[arg(long = "no-fold-key-index-leaves", action = clap::ArgAction::SetFalse)]
     pub fold_key_index_leaves: bool,
 
-    /// With `--fold-key-index-leaves`, the most (entry, key8) pairs, read and
+    /// The most (entry, key8) pairs, read and
     /// carried from previous parts' leaves, the key-index leaf build
     /// holds for one part at a time (ADR-3692 decision 5). Each field the
     /// build indexes gets a share, max(1, N / fields). A field over its
@@ -1106,8 +1124,9 @@ pub struct Cli {
     /// run) + 1 pairs per field, pinned by the catalog test
     /// every_pass_holds_at_most_its_share_open_slice_included; about 88 B a
     /// one-block pair is an upper-bound estimate. The leaves equal a build
-    /// from scratch at the same budget. At least 1. Refused without
-    /// `--fold-key-index-leaves` and in `--mode gateway`, which runs no fold.
+    /// from scratch at the same budget. At least 1. Refused with
+    /// `--no-fold-key-index-leaves`, which turns off the build it bounds, and
+    /// in `--mode gateway`, which runs no fold.
     #[arg(long,
           default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
           value_parser = clap::value_parser!(u64).range(1..))]
@@ -1717,14 +1736,15 @@ pub struct TenantConfigArgs {
 #[derive(Debug, clap::Args)]
 pub struct MaintenanceArgs {
     /// Turns off the metrics `label_value` leaf. By default, every fold this
-    /// process runs with `--fold-key-index-leaves`, scheduled and on-demand,
-    /// also builds that leaf from each metrics object's LABEL_DICT (ADR-3694
+    /// process runs with the key-index leaf build on (the default; see
+    /// `--no-fold-key-index-leaves`), scheduled and on-demand, also builds
+    /// that leaf from each metrics object's LABEL_DICT (ADR-3694
     /// decision 2 and its Stage 1 acceptance amendment), at about 8 GETs per
     /// object on the first fold with the leaf on (measured in that amendment's
     /// row 7). A PromQL selector's
     /// positive equality values are then routed through those leaves before
     /// any object is opened, and an object a value is proven absent from is
-    /// not read (ADR-3694 decision 3). Without `--fold-key-index-leaves` no
+    /// not read (ADR-3694 decision 3). With `--no-fold-key-index-leaves` no
     /// leaf is built and this flag changes nothing. While a tenant has a
     /// pending metrics erasure the fold writes no metrics leaf and the query
     /// routes nothing. Refused in `--mode gateway`, which runs no fold.
@@ -7414,7 +7434,8 @@ impl Cli {
         }
         if !cli.mode.runs_scheduled_fold() && !cli.mode.mounts_on_demand_fold() {
             for (id, flag) in [
-                ("fold_key_index_leaves", "--fold-key-index-leaves"),
+                ("fold_key_index_leaves_on", "--fold-key-index-leaves"),
+                ("fold_key_index_leaves", "--no-fold-key-index-leaves"),
                 (
                     "fold_key_index_build_max_pairs",
                     "--fold-key-index-build-max-pairs",
@@ -7439,10 +7460,9 @@ impl Cli {
         // no fold refuses the budget for that reason first.
         if passed("fold_key_index_build_max_pairs") && !cli.fold_key_index_leaves {
             return Err(Self::command().error(
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "--fold-key-index-build-max-pairs bounds the key-index leaf build, which runs \
-                 only with --fold-key-index-leaves. Pass --fold-key-index-leaves, or drop the \
-                 flag.",
+                clap::error::ErrorKind::ArgumentConflict,
+                "--fold-key-index-build-max-pairs bounds the key-index leaf build, which \
+                 --no-fold-key-index-leaves turns off. Drop one of the two flags.",
             ));
         }
         if !cli.mode.runs_scheduled_fold() {
@@ -8333,6 +8353,20 @@ impl Cli {
             )
         })?;
         Ok(floor)
+    }
+
+    /// The fold configuration `main.rs` puts on [`crate::ServerConfig`], which
+    /// [`crate::query::build_catalog_for_server`] maps onto the catalog both
+    /// the scheduled and the on-demand fold run with. The key-index leaf
+    /// build is on unless `--no-fold-key-index-leaves` was passed.
+    pub fn fold_task_config(&self) -> crate::FoldTaskConfig {
+        crate::FoldTaskConfig {
+            enabled: !self.disable_fold,
+            fold_interval: std::time::Duration::from_secs(self.fold_interval_secs),
+            build_key_index_leaves: self.fold_key_index_leaves,
+            key_index_build_max_pairs: self.fold_key_index_build_max_pairs,
+            metrics_label_index: !self.maintenance.no_fold_metrics_label_index,
+        }
     }
 
     /// Resolve the per-shard flush concurrency pair. Effective concurrency is
@@ -12444,49 +12478,69 @@ mod tests {
         assert_eq!(cli.fold_interval_secs, 300);
     }
 
-    /// ADR-2707 decision 4: `--fold-key-index-leaves` is off by default, is
-    /// accepted in every mode that runs a fold by either route (scheduled in
-    /// `maintain` and `all`, on demand in `query` and `all`), and is refused
-    /// in `gateway`, which runs none.
+    /// Issue #3927 (ADR-3939 decision 4): the key-index leaf build is on by
+    /// default in every mode that runs a fold by either route (scheduled in
+    /// `maintain` and `all`, on demand in `query` and `all`).
+    /// `--no-fold-key-index-leaves` turns it off, `--fold-key-index-leaves`
+    /// still parses and states the default, and the two together are
+    /// refused. A gateway, which runs no fold, starts with neither flag and
+    /// refuses each one passed explicitly.
     #[test]
-    fn fold_key_index_leaves_is_off_by_default_and_refused_where_no_fold_runs() {
+    fn fold_key_index_leaves_is_on_by_default_with_an_opt_out() {
+        let parse = |mode: &str, extra: &[&str]| {
+            let mut args = vec!["ravel-server", "--mode", mode];
+            args.extend_from_slice(extra);
+            Cli::parse_validated_from(args)
+        };
         for mode in ["maintain", "all", "query"] {
-            let cli = Cli::parse_validated_from(["ravel-server", "--mode", mode])
-                .unwrap_or_else(|err| panic!("--mode {mode} starts without the flag: {err}"));
-            assert!(
-                !cli.fold_key_index_leaves,
-                "--mode {mode}: the leaf build is off by default"
-            );
-            let cli = Cli::parse_validated_from([
-                "ravel-server",
-                "--mode",
+            for (extra, on) in [
+                (&[][..], true),
+                (&["--fold-key-index-leaves"][..], true),
+                (&["--no-fold-key-index-leaves"][..], false),
+            ] {
+                let cli = parse(mode, extra)
+                    .unwrap_or_else(|err| panic!("--mode {mode} {extra:?} must start: {err}"));
+                assert_eq!(
+                    cli.fold_key_index_leaves, on,
+                    "--mode {mode} {extra:?}: the resolved leaf switch"
+                );
+                assert_eq!(cli.fold_task_config().build_key_index_leaves, on);
+            }
+            let err = parse(
                 mode,
-                "--fold-key-index-leaves",
-            ])
-            .unwrap_or_else(|err| panic!("--mode {mode} must accept the flag: {err}"));
+                &["--fold-key-index-leaves", "--no-fold-key-index-leaves"],
+            )
+            .expect_err("the switch and its opt-out together must be refused");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+            let message = err.to_string();
             assert!(
-                cli.fold_key_index_leaves,
-                "--mode {mode}: the flag turns it on"
+                message.contains("--fold-key-index-leaves")
+                    && message.contains("--no-fold-key-index-leaves"),
+                "the refusal must name both flags, got: {message}"
             );
         }
 
-        let err = Cli::parse_validated_from([
-            "ravel-server",
-            "--mode",
-            "gateway",
-            "--fold-key-index-leaves",
-        ])
-        .expect_err("a gateway runs no fold and must refuse the flag");
-        let message = err.to_string();
+        let cli = parse("gateway", &[]).expect("a gateway that passes neither flag starts");
         assert!(
-            message.contains("--fold-key-index-leaves") && message.contains("gateway"),
-            "the refusal must name the flag and the mode, got: {message}"
+            cli.fold_key_index_leaves,
+            "the resolved default is the same in every mode; a gateway never reads it"
         );
+        for flag in ["--fold-key-index-leaves", "--no-fold-key-index-leaves"] {
+            let err = parse("gateway", &[flag])
+                .expect_err("a gateway runs no fold and must refuse the flag passed explicitly");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("{flag} configures the catalog fold"))
+                    && message.contains("gateway"),
+                "the refusal must name the flag and the mode, got: {message}"
+            );
+        }
     }
 
     /// ADR-3692 decision 5: `--fold-key-index-build-max-pairs` defaults to
-    /// the catalog's 8,000,000, is accepted beside `--fold-key-index-leaves`
-    /// wherever a fold runs, and is refused without that flag, at 0, and in
+    /// the catalog's 8,000,000, is accepted with no leaf flag (the build is
+    /// on by default) and beside `--fold-key-index-leaves` wherever a fold
+    /// runs, and is refused with `--no-fold-key-index-leaves`, at 0, and in
     /// `gateway`, as `ravel-cli catalog fold --key-index-build-max-pairs` is.
     #[test]
     fn fold_key_index_build_max_pairs_defaults_and_is_refused_where_no_fold_runs() {
@@ -12494,33 +12548,35 @@ mod tests {
             let cli = Cli::parse_validated_from(["ravel-server", "--mode", mode])
                 .unwrap_or_else(|err| panic!("--mode {mode} starts without the flag: {err}"));
             assert_eq!(cli.fold_key_index_build_max_pairs, 8_000_000);
-            let cli = Cli::parse_validated_from([
-                "ravel-server",
-                "--mode",
-                mode,
-                "--fold-key-index-leaves",
-                "--fold-key-index-build-max-pairs",
-                "1000",
-            ])
-            .unwrap_or_else(|err| panic!("--mode {mode} must accept the flag: {err}"));
-            assert_eq!(cli.fold_key_index_build_max_pairs, 1000);
+            for extra in [&[][..], &["--fold-key-index-leaves"][..]] {
+                let mut args = vec!["ravel-server", "--mode", mode];
+                args.extend_from_slice(extra);
+                args.extend(["--fold-key-index-build-max-pairs", "1000"]);
+                let cli = Cli::parse_validated_from(args).unwrap_or_else(|err| {
+                    panic!("--mode {mode} {extra:?} must accept the flag: {err}")
+                });
+                assert_eq!(cli.fold_key_index_build_max_pairs, 1000);
+                assert_eq!(cli.fold_task_config().key_index_build_max_pairs, 1000);
+            }
             let err = Cli::parse_validated_from([
                 "ravel-server",
                 "--mode",
                 mode,
+                "--no-fold-key-index-leaves",
                 "--fold-key-index-build-max-pairs",
                 "1000",
             ])
-            .expect_err("the budget without the leaf build must be refused");
+            .expect_err("the budget with the leaf build turned off must be refused");
+            let message = err.to_string();
             assert!(
-                err.to_string().contains("--fold-key-index-leaves"),
-                "the refusal must name the missing flag, got: {err}"
+                message.contains("--fold-key-index-build-max-pairs")
+                    && message.contains("--no-fold-key-index-leaves turns off"),
+                "the refusal must name both flags, got: {message}"
             );
             let err = Cli::parse_validated_from([
                 "ravel-server",
                 "--mode",
                 mode,
-                "--fold-key-index-leaves",
                 "--fold-key-index-build-max-pairs",
                 "0",
             ])
@@ -12546,17 +12602,17 @@ mod tests {
     }
 
     /// ADR-3694 Stage 1 acceptance amendment (issue #4145): the metrics label
-    /// index is on by default in every mode that folds, with or without
-    /// `--fold-key-index-leaves`, so a default server is not refused. The
-    /// opt-out `--no-fold-metrics-label-index` parses in those modes, with
-    /// or without the leaf build, and is refused in `gateway`.
+    /// index is on by default in every mode that folds, with the leaf build
+    /// on or off, so a default server is not refused. The opt-out
+    /// `--no-fold-metrics-label-index` parses in those modes, with or without
+    /// the leaf build, and is refused in `gateway`.
     #[test]
     fn fold_metrics_label_index_is_on_by_default_with_an_opt_out() {
         for mode in ["maintain", "all", "query"] {
             for leaves in [false, true] {
                 let mut args = vec!["ravel-server", "--mode", mode];
-                if leaves {
-                    args.push("--fold-key-index-leaves");
+                if !leaves {
+                    args.push("--no-fold-key-index-leaves");
                 }
                 let cli = Cli::parse_validated_from(args.clone()).unwrap_or_else(|err| {
                     panic!("--mode {mode} (leaves {leaves}) starts without the flag: {err}")

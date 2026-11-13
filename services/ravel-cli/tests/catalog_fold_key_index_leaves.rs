@@ -1,11 +1,18 @@
-//! `ravel-cli catalog fold --key-index-leaves` (ADR-2707 decision 4): the
-//! flag reaches the catalog the fold runs with, and without it the fold reads
-//! no KEY_IDX section and writes no leaf.
+//! `ravel-cli catalog fold`'s key-index leaf switch (ADR-2707 decision 4, on
+//! by default since issue #3927): it reaches the catalog the fold runs with,
+//! and off (`--no-key-index-leaves`) the fold reads no KEY_IDX section and
+//! writes no leaf.
 //!
 //! Driven in-process against one `MemoryStore` per case, for the reason
-//! `tests/catalog_signal.rs` gives.
+//! `tests/catalog_signal.rs` gives, except the default-switch test, which runs
+//! the binary against the fake S3 endpoint so it reads the switch the shipped
+//! command line resolves.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+#[allow(clippy::expect_used, dead_code)]
+#[path = "../src/fake_s3.rs"]
+mod fake_s3;
 
 use std::sync::Arc;
 
@@ -50,6 +57,16 @@ async fn publish_spans(store: &MemoryStore, now_ns: i64) {
 /// Publishes RSPAN object `writer_seq` at `base_ts` with one span per id
 /// `i` in `ids`, trace id `[i; 16]`, so its key8 is `[i; 8]`.
 async fn publish_trace_spans(store: &MemoryStore, writer_seq: u64, base_ts: i64, ids: &[u8]) {
+    publish_trace_spans_to(store, writer_seq, base_ts, ids).await;
+}
+
+/// [`publish_trace_spans`] into any store.
+async fn publish_trace_spans_to(
+    store: &dyn ObjectStoreBackend,
+    writer_seq: u64,
+    base_ts: i64,
+    ids: &[u8],
+) {
     let tenant_hash = TenantId::new(TENANT).hash();
     let writer_id = Uuid::from_u128(u128::from(writer_seq));
     let mut writer = RspanWriter::new(
@@ -141,8 +158,8 @@ async fn fold_spans(key_index_leaves: bool) -> (ravel_catalog::FoldReport, usize
     (report, kidx_objects(&store).await)
 }
 
-/// Without the flag a spans fold, whose objects always carry a KEY_IDX
-/// section, issues no section read and writes no leaf; with it, the same
+/// With the switch off a spans fold, whose objects always carry a KEY_IDX
+/// section, issues no section read and writes no leaf; with it on, the same
 /// fold reads the section and publishes one leaf.
 #[tokio::test]
 async fn the_key_index_leaves_flag_reaches_the_fold() {
@@ -425,4 +442,81 @@ async fn a_switch_off_fold_over_leaves_is_reported() {
         serde_json::json!(0),
         "the leaf switch is off, so nothing is carried: {printed}"
     );
+}
+
+/// The JSON fold report of `ravel-cli catalog fold --signal spans` run as a
+/// process with `flags`, over a fresh fake S3 bucket holding one sealed spans
+/// object, and the number of `.kidx` objects the bucket holds afterwards.
+async fn binary_fold_spans(flags: &[&str]) -> (serde_json::Value, usize) {
+    use clap::Parser;
+    let (endpoint, fake) = fake_s3::spawn(fake_s3::Echo::Stored, &[]).await;
+    let store_flags: Vec<String> = [
+        "--store",
+        "s3",
+        "--s3-bucket",
+        "ravel-test",
+        "--s3-endpoint",
+        &endpoint,
+        "--s3-access-key",
+        "test",
+        "--s3-secret-key",
+        "test",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    let mut argv = vec!["ravel-cli".to_string()];
+    argv.extend(store_flags.iter().cloned());
+    let args = ravel_cli::store::StoreArgs::try_parse_from(argv).expect("store flags parse");
+    let plain = ravel_cli::store::build_store(&args).expect("plain store");
+    let now = ravel_cli::now_ns().expect("system clock readable");
+    publish_trace_spans_to(plain.as_ref(), 1, now - SEALED_AGE_NS, &[1, 2, 3]).await;
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"));
+    cmd.args(&store_flags)
+        .arg("--tenant-hash-unkeyed")
+        .args([
+            "catalog", "fold", "--tenant", TENANT, "--shards", "1", "--signal", "spans", "--json",
+        ])
+        .args(flags)
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env_remove("RUST_LOG");
+    let out = tokio::task::spawn_blocking(move || cmd.output())
+        .await
+        .expect("join")
+        .expect("run ravel-cli");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "catalog fold {flags:?} failed\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON report");
+    assert_eq!(report["entry_count"], serde_json::json!(1), "{stdout}");
+    let kidx = fake
+        .puts()
+        .iter()
+        .filter(|put| put.key.ends_with(".kidx"))
+        .count();
+    (report, kidx)
+}
+
+/// Issue #3927: the shipped `catalog fold` builds key-index leaves with no
+/// flag and with `--key-index-leaves`, and builds none with
+/// `--no-key-index-leaves`. Run as a process, so the switch is the one the
+/// binary's own command line resolves and passes to the fold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_binary_builds_leaves_by_default_and_the_opt_out_turns_them_off() {
+    for (flags, leaves) in [
+        (&[][..], 1),
+        (&["--key-index-leaves"][..], 1),
+        (&["--no-key-index-leaves"][..], 0),
+    ] {
+        let (report, kidx) = binary_fold_spans(flags).await;
+        assert_eq!(
+            report["key_index_leaves_written"],
+            serde_json::json!(leaves),
+            "{flags:?}: {report}"
+        );
+        assert_eq!(kidx, leaves, "{flags:?}: .kidx objects PUT");
+    }
 }
