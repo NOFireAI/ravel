@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::config::{Cli, Mode, StoreKind};
 use bytes::Bytes;
 use ravel_cache::{Cache, CacheLimits, DiskCache, TieredCache};
+use ravel_object_store::azure::{AzureConfig, AzureStore};
 use ravel_object_store::gcs::{GcsConfig, GcsStore};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
@@ -116,11 +117,11 @@ impl std::error::Error for UnsatisfiedCapabilities {}
 /// `mandatory()` set exactly (see `Capabilities::mandatory`).
 ///
 /// `upload_checksum` is not required by any mode, including maintain, and no
-/// mode may add it. Unlike `multipart`, which some backend could supply and
-/// which one mode genuinely needs, `upload_checksum` is permanently
-/// unsatisfiable by S3, the only durable backend: the `object_store` client
-/// cannot put a caller-supplied CRC32C on the wire at all (and
-/// the `Capabilities::mandatory` doc). Gating startup on it rejected every
+/// mode may add it. Unlike `multipart`, which one mode genuinely needs, it is
+/// not something every durable backend supplies: `GcsStore` and `AzureStore`
+/// declare it false, and the `object_store` S3 client cannot put a
+/// caller-supplied CRC32C on the wire at all (see the
+/// `Capabilities::mandatory` doc). Gating startup on it rejected every
 /// S3-compatible endpoint in every mode. Read-time integrity still comes
 /// from the segment crc32c hierarchy and `put()`'s local pre-flight check.
 pub fn required_capabilities(mode: Mode) -> Capabilities {
@@ -359,12 +360,25 @@ pub use ravel_object_store::s3::{
     resolve_s3_allow_http,
 };
 
-/// Whether `--store gcs` may speak plaintext HTTP to `--gcs-endpoint`. No
-/// endpoint (GCS itself) and an `https://` endpoint are `false`; a loopback
-/// `http://` endpoint, a fake on this host, is `true`. Every other endpoint is
-/// refused: there is no flag accepting plaintext GCS across the network, and
-/// an endpoint with no scheme is not a usable URL.
+/// Whether `--store gcs` may speak plaintext HTTP to `--gcs-endpoint`, by
+/// [`resolve_hidden_endpoint_allow_http`]'s rule.
 pub fn resolve_gcs_allow_http(endpoint: Option<&str>) -> anyhow::Result<bool> {
+    resolve_hidden_endpoint_allow_http("--gcs-endpoint", endpoint)
+}
+
+/// Whether `--store azure` may speak plaintext HTTP to `--azure-endpoint`, by
+/// [`resolve_hidden_endpoint_allow_http`]'s rule (ADR-4158 decision D3).
+pub fn resolve_azure_allow_http(endpoint: Option<&str>) -> anyhow::Result<bool> {
+    resolve_hidden_endpoint_allow_http("--azure-endpoint", endpoint)
+}
+
+/// The rule for a hidden test endpoint flag (`--gcs-endpoint`,
+/// `--azure-endpoint`). No endpoint (the cloud service itself) and an
+/// `https://` endpoint are `false`; a loopback `http://` endpoint, a fake on
+/// this host, is `true`. Every other endpoint is refused: there is no flag
+/// accepting plaintext object storage across the network for these stores,
+/// and an endpoint with no scheme is not a usable URL.
+fn resolve_hidden_endpoint_allow_http(flag: &str, endpoint: Option<&str>) -> anyhow::Result<bool> {
     let Some(endpoint) = endpoint else {
         return Ok(false);
     };
@@ -375,8 +389,8 @@ pub fn resolve_gcs_allow_http(endpoint: Option<&str>) -> anyhow::Result<bool> {
         return Ok(true);
     }
     anyhow::bail!(
-        "--gcs-endpoint {endpoint:?} is refused: it must be an https:// URL, or an http:// URL \
-         whose host is loopback (a fake endpoint on this host)"
+        "{flag} {endpoint:?} is refused: it must be an https:// URL, or an http:// URL whose \
+         host is loopback (a fake endpoint on this host)"
     )
 }
 
@@ -432,7 +446,7 @@ type BackendChain = (
 /// `cache_max_bytes` is the RESOLVED `--cache-max-bytes` (issue #1141), handed
 /// straight to [`build_cache`]; see that function for why it is a parameter
 /// rather than a field read.
-pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore> {
+pub async fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore> {
     let (store, metrics, kms, s3): BackendChain = match cli.store {
         StoreKind::Memory => {
             let instrumented = InstrumentedStore::new(MemoryStore::new());
@@ -558,6 +572,37 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
             let metrics = Arc::new(StoreMetrics::default());
             let store = GcsStore::with_metrics(config, Arc::clone(&metrics))
                 .map_err(|err| anyhow::anyhow!("failed to build GCS store: {err}"))?;
+            let instrumented = InstrumentedStore::with_metrics(store, Arc::clone(&metrics));
+            (Arc::new(instrumented), metrics, None, None)
+        }
+        StoreKind::Azure => {
+            let account = cli.object_store.azure_account.clone().ok_or_else(|| {
+                anyhow::anyhow!("--store azure requires --azure-account (RAVEL_AZURE_ACCOUNT)")
+            })?;
+            let container = cli.object_store.azure_container.clone().ok_or_else(|| {
+                anyhow::anyhow!("--store azure requires --azure-container (RAVEL_AZURE_CONTAINER)")
+            })?;
+            let allow_http = resolve_azure_allow_http(cli.object_store.azure_endpoint.as_deref())?;
+            // The S3 path's timeouts, as on the GCS path.
+            let http = cli.s3_http_config();
+            let mut config = AzureConfig::new(account, container);
+            config.endpoint = cli.object_store.azure_endpoint.clone();
+            config.allow_http = allow_http;
+            config.request_timeout = http.request_timeout;
+            config.connect_timeout = http.connect_timeout;
+            // A fake endpoint takes no credentials. Only a test build of this
+            // crate can ask for that (ADR-4158 decision D3); everywhere else
+            // `--azure-endpoint` is an account URL and requests are signed.
+            #[cfg(feature = "azure-test-endpoint")]
+            {
+                config.skip_signature = config.endpoint.is_some();
+            }
+            let metrics = Arc::new(StoreMetrics::default());
+            // Construction sends Get Account Information and refuses a
+            // hierarchical-namespace account (ADR-4158 decision D6).
+            let store = AzureStore::with_metrics(config, Arc::clone(&metrics))
+                .await
+                .map_err(|err| anyhow::anyhow!("failed to build Azure store: {err}"))?;
             let instrumented = InstrumentedStore::with_metrics(store, Arc::clone(&metrics));
             (Arc::new(instrumented), metrics, None, None)
         }
@@ -842,8 +887,65 @@ mod tests {
         .expect("a maintain-mode GCS command line parses");
         assert_eq!(cli.mode, Mode::Maintain);
         assert_eq!(cli.store, StoreKind::Gcs);
-        if let Err(err) = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES) {
+        if let Err(err) = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES).await {
             panic!("maintain mode must start on GCS, got: {err:#}");
+        }
+    }
+
+    /// `--mode maintain --store azure` passes the capability gate: `AzureStore`
+    /// declares multipart, and `build_store` builds it against the fake.
+    #[tokio::test]
+    async fn maintain_mode_accepts_the_azure_backend() {
+        use clap::Parser;
+        use ravel_object_store::azure::fake::FakeAzure;
+
+        let fake = FakeAzure::start("ravelmaintain", "data")
+            .await
+            .expect("fake Azure");
+        let azure = AzureStore::new(fake.config()).await.expect("AzureStore");
+        check_capabilities(&azure, Mode::Maintain)
+            .expect("AzureStore's declared capabilities satisfy maintain mode");
+
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--mode",
+            "maintain",
+            "--store",
+            "azure",
+            "--azure-account",
+            fake.account(),
+            "--azure-container",
+            fake.container(),
+            "--azure-endpoint",
+            fake.endpoint(),
+        ])
+        .expect("a maintain-mode Azure command line parses");
+        assert_eq!(cli.mode, Mode::Maintain);
+        assert_eq!(cli.store, StoreKind::Azure);
+        if let Err(err) = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES).await {
+            panic!("maintain mode must start on Azure, got: {err:#}");
+        }
+    }
+
+    /// `--azure-endpoint`'s rule is `--gcs-endpoint`'s, one helper naming
+    /// each flag: https and loopback http are accepted, plaintext to another
+    /// host and a schemeless endpoint are refused.
+    #[test]
+    fn azure_and_gcs_endpoints_share_one_rule() {
+        for (resolve, flag) in [
+            (
+                resolve_azure_allow_http as fn(Option<&str>) -> anyhow::Result<bool>,
+                "--azure-endpoint",
+            ),
+            (resolve_gcs_allow_http, "--gcs-endpoint"),
+        ] {
+            assert!(!resolve(None).expect("no endpoint"));
+            assert!(!resolve(Some("https://blob.example.com")).expect("https"));
+            assert!(resolve(Some("http://127.0.0.1:10000/acct")).expect("loopback http"));
+            for refused in ["http://blob.example.com", "blob.example.com"] {
+                let err = resolve(Some(refused)).expect_err(refused);
+                assert!(err.to_string().contains(flag), "{err}");
+            }
         }
     }
 
@@ -868,14 +970,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_store_memory_starts() {
+    #[tokio::test]
+    async fn build_store_memory_starts() {
         // End-to-end through the production construction path: the default
         // memory backend is built and passes the capability gate.
         use clap::Parser;
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert!(matches!(cli.store, StoreKind::Memory));
         build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("memory backend must build and satisfy the capability gate");
     }
 
@@ -896,6 +999,7 @@ mod tests {
             kms,
             ..
         } = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("memory backend must build");
         assert!(
             kms.is_none(),
@@ -960,8 +1064,8 @@ mod tests {
     /// S3 client is configured with (`build_store` exposes no way to read it
     /// back off the built `S3Store`), and `build_store` itself, the only S3
     /// client constructor in the shipping binary, for the refusal.
-    #[test]
-    fn s3_endpoint_scheme_decides_allow_http_and_plaintext_non_loopback_needs_the_flag() {
+    #[tokio::test]
+    async fn s3_endpoint_scheme_decides_allow_http_and_plaintext_non_loopback_needs_the_flag() {
         // https, and real AWS with no endpoint at all: never plaintext, so a
         // redirect or a misconfigured proxy cannot downgrade the connection.
         assert_eq!(
@@ -978,6 +1082,7 @@ mod tests {
             &s3_cli("https://s3.us-east-1.amazonaws.com", false),
             crate::config::DEFAULT_CACHE_MAX_BYTES,
         )
+        .await
         .expect("an https endpoint must build");
 
         // Loopback plaintext: allowed, and unflagged. Every local-development
@@ -996,6 +1101,7 @@ mod tests {
                 &s3_cli(endpoint, false),
                 crate::config::DEFAULT_CACHE_MAX_BYTES,
             )
+            .await
             .unwrap_or_else(|e| panic!("{endpoint} must build without the flag, got: {e}"));
         }
 
@@ -1012,7 +1118,9 @@ mod tests {
         let err = match build_store(
             &s3_cli("http://rustfs:9000", false),
             crate::config::DEFAULT_CACHE_MAX_BYTES,
-        ) {
+        )
+        .await
+        {
             // `BuiltStore` is not `Debug`, so `expect_err` is unavailable.
             Ok(_) => panic!("build_store must refuse plaintext to a non-loopback host"),
             Err(err) => err,
@@ -1032,6 +1140,7 @@ mod tests {
             &s3_cli("http://rustfs:9000", true),
             crate::config::DEFAULT_CACHE_MAX_BYTES,
         )
+        .await
         .expect("--s3-allow-http must let a plaintext non-loopback endpoint build");
 
         // Scheme and host name are case-insensitive, so an upper-case
@@ -1078,7 +1187,9 @@ mod tests {
             let err = match build_store(
                 &s3_cli(endpoint, false),
                 crate::config::DEFAULT_CACHE_MAX_BYTES,
-            ) {
+            )
+            .await
+            {
                 // `BuiltStore` is not `Debug`, so `expect_err` is unavailable.
                 Ok(_) => panic!("build_store must refuse the schemeless endpoint {endpoint}"),
                 Err(err) => err,
@@ -1106,8 +1217,8 @@ mod tests {
     /// The SSE-KMS off-by-default guarantee: `--store s3` with no
     /// `--tenant-kms-config` builds exactly the base chain, no
     /// `KmsRoutingStore` anywhere in it.
-    #[test]
-    fn build_store_s3_without_tenant_kms_config_inserts_no_kms_routing() {
+    #[tokio::test]
+    async fn build_store_s3_without_tenant_kms_config_inserts_no_kms_routing() {
         use clap::Parser;
 
         let cli = Cli::try_parse_from([
@@ -1125,6 +1236,7 @@ mod tests {
         ])
         .expect("flags parse");
         let kms = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("dummy S3 config must build without network access")
             .kms;
         assert!(
@@ -1173,6 +1285,7 @@ mod tests {
             kms,
             ..
         } = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("dummy S3 config must build without network access");
         let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
 
@@ -1237,6 +1350,7 @@ mod tests {
             kms,
             ..
         } = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("dummy S3 config must build without network access");
         let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
 
@@ -1401,6 +1515,7 @@ mod tests {
             args.extend(kms_args.iter().copied());
             let cli = Cli::try_parse_from(args).expect("flags parse");
             let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+                .await
                 .expect("dummy S3 config must build without network access");
             let s3 = built.s3.expect("--store s3 must return the base S3Store");
             assert_eq!(
@@ -1541,8 +1656,8 @@ mod tests {
 
     /// `build_store`'s error text, panicking with `context` if it succeeded.
     /// `BuiltStore` is not `Debug`, so `expect_err` is unavailable.
-    fn build_store_error(cli: &Cli, context: &str) -> String {
-        match build_store(cli, crate::config::DEFAULT_CACHE_MAX_BYTES) {
+    async fn build_store_error(cli: &Cli, context: &str) -> String {
+        match build_store(cli, crate::config::DEFAULT_CACHE_MAX_BYTES).await {
             Ok(_) => panic!("{context}"),
             Err(err) => err.to_string(),
         }
@@ -1755,7 +1870,8 @@ mod tests {
     /// signed with anything else (or with no token at all) fails here.
     ///
     /// `spawn_blocking`: `S3Store::new` blocks on the eager IMDS fetch, which
-    /// has to reach the mock task on this same runtime.
+    /// has to reach the mock task on this same runtime; the blocking thread
+    /// drives the now-async `build_store` through the runtime's handle.
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_role_auth_builds_serving_store() {
         use clap::Parser;
@@ -1782,8 +1898,9 @@ mod tests {
             "precondition: instance-role starts with no inline keys set"
         );
 
+        let runtime = tokio::runtime::Handle::current();
         let built = tokio::task::spawn_blocking(move || {
-            build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            runtime.block_on(build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES))
         })
         .await
         .expect("join")
@@ -1843,6 +1960,7 @@ mod tests {
         argv.extend_from_slice(extra);
         let cli = Cli::try_parse_from(argv).expect("flags parse");
         let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("static-key S3 config must build without network access");
         built
             .foreground
@@ -2031,8 +2149,8 @@ mod tests {
     /// would reject the same mix, but with the `S3Config` field names, so an
     /// error naming `--s3-access-key` can only have come from the CLI-level
     /// check.
-    #[test]
-    fn instance_role_auth_rejects_inline_keys() {
+    #[tokio::test]
+    async fn instance_role_auth_rejects_inline_keys() {
         use clap::Parser;
 
         for (flag, value) in [
@@ -2057,7 +2175,8 @@ mod tests {
             .expect("flags parse");
 
             let rendered =
-                build_store_error(&cli, &format!("instance-role plus {flag} must be an error"));
+                build_store_error(&cli, &format!("instance-role plus {flag} must be an error"))
+                    .await;
             assert!(
                 rendered.contains("--s3-auth instance-role") && rendered.contains(flag),
                 "the error must name both conflicting flags, got: {rendered}"
@@ -2069,8 +2188,8 @@ mod tests {
     /// keys with their exact pre-ADR-0106 messages. This is the
     /// no-behavior-change half of the change: the new flag must not have made
     /// any existing deployment's startup differ.
-    #[test]
-    fn static_auth_is_the_default_and_still_requires_both_keys() {
+    #[tokio::test]
+    async fn static_auth_is_the_default_and_still_requires_both_keys() {
         use clap::Parser;
 
         let base = [
@@ -2095,7 +2214,7 @@ mod tests {
         assert!(cli.object_store.s3_instance_metadata_endpoint.is_none());
 
         assert_eq!(
-            build_store_error(&cli, "static mode without keys must fail"),
+            build_store_error(&cli, "static mode without keys must fail").await,
             "--store s3 requires RAVEL_S3_ACCESS_KEY",
             "the access-key error text must be unchanged"
         );
@@ -2104,7 +2223,7 @@ mod tests {
         with_key.extend(["--s3-access-key", "test"]);
         let cli = Cli::try_parse_from(with_key).expect("flags parse");
         assert_eq!(
-            build_store_error(&cli, "static mode without a secret key must fail"),
+            build_store_error(&cli, "static mode without a secret key must fail").await,
             "--store s3 requires RAVEL_S3_SECRET_KEY",
             "the secret-key error text must be unchanged"
         );
@@ -2115,8 +2234,8 @@ mod tests {
     /// missing file fails the build, and a valid one builds. That failure is
     /// only reachable if the flag's value was actually placed in
     /// `S3Config::credentials_file`.
-    #[test]
-    fn session_token_and_credentials_file_flags_reach_the_store() {
+    #[tokio::test]
+    async fn session_token_and_credentials_file_flags_reach_the_store() {
         use clap::Parser;
         use std::io::Write;
 
@@ -2142,6 +2261,7 @@ mod tests {
             Some("sts-token")
         );
         build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("a session token must not break construction");
 
         let mut missing_file = base.to_vec();
@@ -2150,7 +2270,8 @@ mod tests {
         let err = build_store_error(
             &cli,
             "an unreadable --s3-credentials-file must fail construction",
-        );
+        )
+        .await;
         assert!(
             err.contains("/nonexistent/ravel-creds.json"),
             "the error must name the path the flag carried, got: {err}"
@@ -2164,6 +2285,7 @@ mod tests {
         with_file.extend(["--s3-credentials-file", file_path]);
         let cli = Cli::try_parse_from(with_file).expect("flags parse");
         build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("a readable --s3-credentials-file must build");
     }
 
@@ -2198,6 +2320,7 @@ mod tests {
             "the store scheduler must default off (ADR-0070 decision 2)"
         );
         let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("memory backend must build");
         assert!(
             Arc::ptr_eq(&built.foreground, &built.background),
@@ -2213,6 +2336,7 @@ mod tests {
             .expect("scheduling flag parses");
         assert!(cli.store_scheduler.store_scheduling);
         let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .await
             .expect("scheduled memory backend must build");
         assert!(
             !Arc::ptr_eq(&built.foreground, &built.background),
