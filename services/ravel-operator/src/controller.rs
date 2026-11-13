@@ -7871,6 +7871,7 @@ mod tests {
         let hung = bounded_store_construction(std::future::pending::<Result<(), StoreError>>())
             .await
             .expect_err("a hung construction times out");
+        // hygiene-allow: wall-clock -- tokio's paused clock, advanced only by the timeout
         assert_eq!(started.elapsed(), AZURE_AUTH_STORE_BUILD_TIMEOUT);
         assert_eq!(AZURE_AUTH_STORE_BUILD_TIMEOUT, Duration::from_secs(30));
         assert!(matches!(hung, Error::Store(StoreError::Timeout)), "{hung}");
