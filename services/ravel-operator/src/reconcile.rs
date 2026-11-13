@@ -4935,7 +4935,7 @@ mod tests {
             image_pull_policy: Some("IfNotPresent".to_string()),
             shards: 8,
             storage: StorageSpec {
-                s3: S3Spec {
+                s3: Some(S3Spec {
                     bucket: "ravel-data".to_string(),
                     region: "eu-west-1".to_string(),
                     endpoint: Some("http://rustfs:9000".to_string()),
@@ -4949,7 +4949,8 @@ mod tests {
                     credentials_secret_ref: Some(LocalSecretRef {
                         name: "ravel-s3".to_string(),
                     }),
-                },
+                }),
+                azure: None,
             },
             tenant_tokens_secret_ref: Some(LocalSecretRef {
                 name: "ravel-tokens".to_string(),
@@ -6270,8 +6271,8 @@ mod tests {
         // with the field unset no longer renders at all (it is refused, see
         // `a_plaintext_endpoint_without_allow_http_is_refused_at_render_time`).
         let mut spec = base_spec();
-        spec.storage.s3.endpoint = Some("https://rustfs.example:9000".to_string());
-        spec.storage.s3.allow_http = false;
+        spec.storage.test_s3_mut().endpoint = Some("https://rustfs.example:9000".to_string());
+        spec.storage.test_s3_mut().allow_http = false;
         for deployment in [
             desired_gateway_deployment(&spec, "prod", &ctx()),
             desired_query_deployment(&spec, "prod", &ctx()),
@@ -6285,7 +6286,7 @@ mod tests {
 
         let spec = base_spec();
         assert!(
-            spec.storage.s3.allow_http,
+            spec.storage.test_s3().allow_http,
             "precondition: the baseline sets allowHttp for its plaintext endpoint"
         );
         for deployment in [
@@ -6321,7 +6322,7 @@ mod tests {
     fn s3_checksum_fields_render_only_away_from_the_server_default() {
         let spec = base_spec();
         assert_eq!(
-            spec.storage.s3.upload_integrity,
+            spec.storage.test_s3().upload_integrity,
             S3UploadIntegrity::Crc64Nvme,
             "precondition: the baseline carries the default"
         );
@@ -6338,7 +6339,7 @@ mod tests {
             (S3UploadIntegrity::Sha256, "sha256"),
         ] {
             let mut spec = base_spec();
-            spec.storage.s3.upload_integrity = mode;
+            spec.storage.test_s3_mut().upload_integrity = mode;
             for args in server_args(&spec) {
                 assert_eq!(
                     arg_value(&args, "--s3-upload-integrity").as_deref(),
@@ -6349,7 +6350,7 @@ mod tests {
         }
 
         let mut spec = base_spec();
-        spec.storage.s3.request_stored_checksum = false;
+        spec.storage.test_s3_mut().request_stored_checksum = false;
         for args in server_args(&spec) {
             assert!(
                 args.iter()
@@ -6395,8 +6396,8 @@ mod tests {
     #[test]
     fn a_plaintext_endpoint_without_allow_http_is_refused_at_render_time() {
         let mut spec = base_spec();
-        spec.storage.s3.endpoint = Some("http://rustfs:9000".to_string());
-        spec.storage.s3.allow_http = false;
+        spec.storage.test_s3_mut().endpoint = Some("http://rustfs:9000".to_string());
+        spec.storage.test_s3_mut().allow_http = false;
 
         let err = desired_objects(&spec, "prod", "default", &ctx())
             .expect_err("a plaintext non-loopback endpoint with allowHttp unset must refuse");
@@ -6420,21 +6421,21 @@ mod tests {
 
         // The remediation the message asks for renders cleanly, and so does
         // the https:// endpoint that needs no flag at all.
-        spec.storage.s3.allow_http = true;
+        spec.storage.test_s3_mut().allow_http = true;
         desired_objects(&spec, "prod", "default", &ctx())
             .expect("allowHttp true renders the plaintext endpoint");
-        spec.storage.s3.allow_http = false;
-        spec.storage.s3.endpoint = Some("https://rustfs.example:9000".to_string());
+        spec.storage.test_s3_mut().allow_http = false;
+        spec.storage.test_s3_mut().endpoint = Some("https://rustfs.example:9000".to_string());
         desired_objects(&spec, "prod", "default", &ctx())
             .expect("an https endpoint renders without the field");
 
         // Loopback is unchanged: a plaintext connection that never leaves the
         // host has no on-path attacker, and the kind lane depends on it.
-        spec.storage.s3.endpoint = Some("http://127.0.0.1:9000".to_string());
+        spec.storage.test_s3_mut().endpoint = Some("http://127.0.0.1:9000".to_string());
         desired_objects(&spec, "prod", "default", &ctx())
             .expect("a loopback plaintext endpoint renders unflagged");
         // Real AWS S3 (no endpoint at all) never reaches the rule.
-        spec.storage.s3.endpoint = None;
+        spec.storage.test_s3_mut().endpoint = None;
         desired_objects(&spec, "prod", "default", &ctx()).expect("no endpoint renders unflagged");
     }
 
@@ -6457,8 +6458,8 @@ mod tests {
         // prefix match on the scheme, not a substring search.
         for endpoint in ["rustfs:9000", "my-http-proxy:9000"] {
             for allow_http in [false, true] {
-                spec.storage.s3.endpoint = Some(endpoint.to_string());
-                spec.storage.s3.allow_http = allow_http;
+                spec.storage.test_s3_mut().endpoint = Some(endpoint.to_string());
+                spec.storage.test_s3_mut().allow_http = allow_http;
                 let err = desired_objects(&spec, "prod", "default", &ctx())
                     .expect_err("an endpoint with no scheme must refuse the render");
                 assert_eq!(
@@ -6479,8 +6480,8 @@ mod tests {
         }
 
         // An upper-case scheme is a scheme (RFC 3986 section 3.1) and renders.
-        spec.storage.s3.endpoint = Some("HTTPS://rustfs.example:9000".to_string());
-        spec.storage.s3.allow_http = false;
+        spec.storage.test_s3_mut().endpoint = Some("HTTPS://rustfs.example:9000".to_string());
+        spec.storage.test_s3_mut().allow_http = false;
         desired_objects(&spec, "prod", "default", &ctx())
             .expect("an upper-case https scheme is valid and must render");
     }
@@ -6488,7 +6489,7 @@ mod tests {
     #[test]
     fn region_and_endpoint_optionality() {
         let mut spec = base_spec();
-        spec.storage.s3.endpoint = None;
+        spec.storage.test_s3_mut().endpoint = None;
         let g = desired_gateway_deployment(&spec, "prod", &ctx());
         let args = args_of(&g);
         assert!(arg_value(&args, "--s3-endpoint").is_none());
@@ -9527,15 +9528,15 @@ mod tests {
         );
 
         let mut bucket = spec.clone();
-        bucket.storage.s3.bucket = "other-bucket".to_string();
+        bucket.storage.test_s3_mut().bucket = "other-bucket".to_string();
         let mut region = spec.clone();
-        region.storage.s3.region = "us-east-1".to_string();
+        region.storage.test_s3_mut().region = "us-east-1".to_string();
         let mut endpoint = spec.clone();
-        endpoint.storage.s3.endpoint = Some("http://other:9000".to_string());
+        endpoint.storage.test_s3_mut().endpoint = Some("http://other:9000".to_string());
         let mut image = spec.clone();
         image.image = "registry.example/ravel:v2".to_string();
         let mut creds = spec.clone();
-        creds.storage.s3.credentials_secret_ref = Some(LocalSecretRef {
+        creds.storage.test_s3_mut().credentials_secret_ref = Some(LocalSecretRef {
             name: "other-s3".to_string(),
         });
         // `allowHttp` is in the hash (finding 3, issue #1707) even though it
@@ -9547,12 +9548,12 @@ mod tests {
         // nothing proves `ravel-cli` can reach the store over plaintext
         // before the Deployments are allowed up.
         let mut allow_http = spec.clone();
-        allow_http.storage.s3.allow_http = !spec.storage.s3.allow_http;
+        allow_http.storage.test_s3_mut().allow_http = !spec.storage.test_s3().allow_http;
         let mut upload_integrity = spec.clone();
-        upload_integrity.storage.s3.upload_integrity = S3UploadIntegrity::Off;
+        upload_integrity.storage.test_s3_mut().upload_integrity = S3UploadIntegrity::Off;
         let mut stored_checksum = spec.clone();
-        stored_checksum.storage.s3.request_stored_checksum =
-            !spec.storage.s3.request_stored_checksum;
+        stored_checksum.storage.test_s3_mut().request_stored_checksum =
+            !spec.storage.test_s3().request_stored_checksum;
         for (label, changed) in [
             ("bucket", &bucket),
             ("region", &region),
@@ -9594,9 +9595,9 @@ mod tests {
         // different store (the flag/env is omitted only for None), so the two must
         // hash differently. as_deref().unwrap_or("") fed the hasher "" for both.
         let mut endpoint_none = spec.clone();
-        endpoint_none.storage.s3.endpoint = None;
+        endpoint_none.storage.test_s3_mut().endpoint = None;
         let mut endpoint_empty = spec.clone();
-        endpoint_empty.storage.s3.endpoint = Some(String::new());
+        endpoint_empty.storage.test_s3_mut().endpoint = Some(String::new());
         assert_ne!(
             qualify_job_input_hash(&endpoint_none, Some("rv-1")),
             qualify_job_input_hash(&endpoint_empty, Some("rv-1")),
@@ -9711,8 +9712,8 @@ mod tests {
         // The `false` half needs an https:// endpoint: a plaintext endpoint
         // with the field unset is refused at render time (finding 2).
         let mut spec = base_spec();
-        spec.storage.s3.endpoint = Some("https://rustfs.example:9000".to_string());
-        spec.storage.s3.allow_http = false;
+        spec.storage.test_s3_mut().endpoint = Some("https://rustfs.example:9000".to_string());
+        spec.storage.test_s3_mut().allow_http = false;
         let names_of = |job: &Job| -> Vec<String> {
             job.spec
                 .as_ref()
@@ -9733,7 +9734,7 @@ mod tests {
 
         let spec = base_spec();
         assert!(
-            spec.storage.s3.allow_http,
+            spec.storage.test_s3().allow_http,
             "precondition: the baseline sets allowHttp for its plaintext endpoint"
         );
         let job = desired_qualify_job(&spec, "prod", Some("rv-1"), None);
@@ -9785,16 +9786,16 @@ mod tests {
 
         let crc = base_spec();
         assert_eq!(
-            crc.storage.s3.upload_integrity,
+            crc.storage.test_s3().upload_integrity,
             S3UploadIntegrity::Crc64Nvme
         );
-        assert!(crc.storage.s3.request_stored_checksum);
+        assert!(crc.storage.test_s3().request_stored_checksum);
         for (mode, value) in [
             (S3UploadIntegrity::Off, "off"),
             (S3UploadIntegrity::Sha256, "sha256"),
         ] {
             let mut other = crc.clone();
-            other.storage.s3.upload_integrity = mode;
+            other.storage.test_s3_mut().upload_integrity = mode;
             assert_ne!(
                 qualify_job_input_hash(&crc, Some("rv-1")),
                 qualify_job_input_hash(&other, Some("rv-1")),
@@ -9811,7 +9812,7 @@ mod tests {
         }
 
         let mut unrequested = crc.clone();
-        unrequested.storage.s3.request_stored_checksum = false;
+        unrequested.storage.test_s3_mut().request_stored_checksum = false;
         assert_ne!(
             qualify_job_input_hash(&crc, Some("rv-1")),
             qualify_job_input_hash(&unrequested, Some("rv-1")),
@@ -9954,31 +9955,31 @@ mod tests {
         // deliberately excluding both knobs, through the same `blake3_hex`
         // composition the production hasher uses. If it folded either knob in,
         // this reference would diverge and the assertion would fail.
-        let endpoint = match spec.storage.s3.endpoint.as_deref() {
+        let endpoint = match spec.storage.test_s3().endpoint.as_deref() {
             Some(value) => format!("\u{1}{value}"),
             None => "\u{0}".to_string(),
         };
-        let allow_http = if spec.storage.s3.allow_http {
+        let allow_http = if spec.storage.test_s3().allow_http {
             "true"
         } else {
             "false"
         };
-        let request_stored_checksum = if spec.storage.s3.request_stored_checksum {
+        let request_stored_checksum = if spec.storage.test_s3().request_stored_checksum {
             "true"
         } else {
             "false"
         };
         let credentials_rv = format!("\u{1}{}", "rv-1");
         let expected = blake3_hex(&[
-            spec.storage.s3.bucket.as_str(),
-            spec.storage.s3.region.as_str(),
+            spec.storage.test_s3().bucket.as_str(),
+            spec.storage.test_s3().region.as_str(),
             endpoint.as_str(),
             allow_http,
-            spec.storage.s3.upload_integrity.flag_value(),
+            spec.storage.test_s3().upload_integrity.flag_value(),
             request_stored_checksum,
             spec.image.as_str(),
             spec.storage
-                .s3
+                .test_s3()
                 .credentials_secret_ref
                 .as_ref()
                 .expect("the base spec is static")
@@ -10317,31 +10318,31 @@ mod tests {
     #[test]
     fn qualify_input_hash_excludes_retry_state() {
         let spec = base_spec();
-        let endpoint = match spec.storage.s3.endpoint.as_deref() {
+        let endpoint = match spec.storage.test_s3().endpoint.as_deref() {
             Some(value) => format!("\u{1}{value}"),
             None => "\u{0}".to_string(),
         };
-        let allow_http = if spec.storage.s3.allow_http {
+        let allow_http = if spec.storage.test_s3().allow_http {
             "true"
         } else {
             "false"
         };
-        let request_stored_checksum = if spec.storage.s3.request_stored_checksum {
+        let request_stored_checksum = if spec.storage.test_s3().request_stored_checksum {
             "true"
         } else {
             "false"
         };
         let credentials_rv = format!("\u{1}{}", "rv");
         let expected = blake3_hex(&[
-            spec.storage.s3.bucket.as_str(),
-            spec.storage.s3.region.as_str(),
+            spec.storage.test_s3().bucket.as_str(),
+            spec.storage.test_s3().region.as_str(),
             endpoint.as_str(),
             allow_http,
-            spec.storage.s3.upload_integrity.flag_value(),
+            spec.storage.test_s3().upload_integrity.flag_value(),
             request_stored_checksum,
             spec.image.as_str(),
             spec.storage
-                .s3
+                .test_s3()
                 .credentials_secret_ref
                 .as_ref()
                 .expect("the base spec is static")
@@ -11027,8 +11028,8 @@ mod tests {
 
     fn pod_identity_spec() -> RavelClusterSpec {
         let mut spec = base_spec();
-        spec.storage.s3.auth = S3AuthSpec::PodIdentity;
-        spec.storage.s3.credentials_secret_ref = None;
+        spec.storage.test_s3_mut().auth = S3AuthSpec::PodIdentity;
+        spec.storage.test_s3_mut().credentials_secret_ref = None;
         spec
     }
 
@@ -11441,7 +11442,7 @@ mod tests {
         );
 
         let mut static_without_secret = base_spec();
-        static_without_secret.storage.s3.credentials_secret_ref = None;
+        static_without_secret.storage.test_s3_mut().credentials_secret_ref = None;
         assert_eq!(
             desired_objects(&static_without_secret, "prod", "ns", &ctx()).err(),
             Some(RenderError::StaticCredentialsSecretRefMissing)
@@ -11450,7 +11451,7 @@ mod tests {
         // A leftover shared ref under podIdentity is not read and does not
         // stop the render.
         let mut leftover = pod_identity_spec();
-        leftover.storage.s3.credentials_secret_ref = Some(LocalSecretRef {
+        leftover.storage.test_s3_mut().credentials_secret_ref = Some(LocalSecretRef {
             name: "ravel-s3".to_string(),
         });
         assert!(desired_objects(&leftover, "prod", "ns", &pod_identity_ctx()).is_ok());
@@ -11463,7 +11464,7 @@ mod tests {
         // pins that a static cluster's hash did not move.
         let pod_identity = qualify_job_input_hash(&pod_identity_spec(), None);
         let mut static_without_secret = base_spec();
-        static_without_secret.storage.s3.credentials_secret_ref = None;
+        static_without_secret.storage.test_s3_mut().credentials_secret_ref = None;
         assert_ne!(
             pod_identity,
             qualify_job_input_hash(&static_without_secret, None),
