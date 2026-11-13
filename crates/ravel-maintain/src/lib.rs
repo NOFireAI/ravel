@@ -104,7 +104,9 @@ pub use erasure_rewrite::{
     build_rewrite, erasure_rewrite_bucket, erasure_unwritable_objects_total,
     pending_erasure_requests, publish_rewrite_record,
 };
-pub use error::{MaintainError, MergeCursorBudgetSite, Result, TwoLevelCheck};
+pub use error::{
+    MaintainError, MergeCursorBudgetSite, PartIndexRefusalKind, Result, TwoLevelCheck,
+};
 pub use gc_config::{
     GC_CONFIG_KEY, GC_FORMAT_VERSION, GC_FORMAT_VERSION_V1, GcAccessOp, GcConfigError,
     GcConfigProposal, GcConfigValues, SetOutcome, bootstrap_gc_config,

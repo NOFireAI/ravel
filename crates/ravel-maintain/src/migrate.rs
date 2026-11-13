@@ -300,6 +300,16 @@ pub enum NotMigratedReason {
     /// The rewrite passed its `max_compaction_lifetime_ns` deadline before its
     /// record PUT and abandoned the publish.
     PublishAbandoned,
+    /// The rewrite's RLOG merge refused a part index for its ranges' windows
+    /// or the unit's record count against the part key's space
+    /// ([`crate::error::MaintainError::is_part_index_refusal`], ADR-3853):
+    /// refused before or during encode, so no record was published. The
+    /// bucket's L0 inputs stay live and raw, the same build refuses the unit
+    /// again, and a later walk retries it (issue #4127).
+    PartIndexRefusal {
+        /// Which of the two refusals this was.
+        refusal: crate::error::PartIndexRefusalKind,
+    },
 }
 
 /// One bucket the walk dispatched a rewrite for that published nothing, named
@@ -1777,6 +1787,31 @@ pub async fn migrate_family(
                                     object_key,
                                     reason,
                                 });
+                                spent += l0_below;
+                                None
+                            }
+                            // Refused for its part-index windows (ADR-3853): the
+                            // same build refuses this bucket's unchanged inputs
+                            // again, so hold it as not-migrated and let the walk
+                            // reach later buckets rather than abort (issue #4127).
+                            Err(err) if err.is_part_index_refusal() => {
+                                let Some(refusal) = err.part_index_refusal_kind() else {
+                                    return Err(err);
+                                };
+                                tracing::warn!(
+                                    tenant = %tenant_hash.to_hex(),
+                                    signal = ?signal,
+                                    shard,
+                                    ingest_hour = hour,
+                                    refusal = refusal.name(),
+                                    "migrate refused a bucket for its part-index \
+                                     windows; the walk goes on and a later run \
+                                     retries the unchanged inputs (issue #4127)"
+                                );
+                                not_migrated(
+                                    &mut report,
+                                    NotMigratedReason::PartIndexRefusal { refusal },
+                                );
                                 spent += l0_below;
                                 None
                             }
