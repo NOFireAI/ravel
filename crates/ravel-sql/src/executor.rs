@@ -9522,7 +9522,10 @@ pub(crate) mod tests {
         let logged = recovered.to_string();
         assert_eq!(logged, original.to_string());
         assert!(logged.contains(SHARED_KEY), "log lost the key: {logged}");
-        assert!(logged.contains(SHARED_CAUSE), "log lost the cause: {logged}");
+        assert!(
+            logged.contains(SHARED_CAUSE),
+            "log lost the cause: {logged}"
+        );
         assert_eq!(recovered.client_message(), original.client_message());
         assert_eq!(recovered.class(), original.class());
     }
@@ -9560,13 +9563,12 @@ pub(crate) mod tests {
     fn a_context_wrapped_shared_error_logs_the_original_cause() {
         let original = store_fault();
         let shared = DataFusionError::Shared(Arc::new(store_fault().into()));
-        let wrapped = DataFusionError::Context("while repartitioning".to_string(), Box::new(shared));
+        let wrapped =
+            DataFusionError::Context("while repartitioning".to_string(), Box::new(shared));
         assert_shared_keeps_cause(wrapped, &original);
 
-        let inner = DataFusionError::Context(
-            "while scanning".to_string(),
-            Box::new(store_fault().into()),
-        );
+        let inner =
+            DataFusionError::Context("while scanning".to_string(), Box::new(store_fault().into()));
         assert_shared_keeps_cause(DataFusionError::Shared(Arc::new(inner)), &original);
     }
 
@@ -9606,14 +9608,20 @@ pub(crate) mod tests {
             (SqlError::Plan(SHARED_CAUSE.to_string()), MSG_PLAN),
             (SqlError::Execution(SHARED_CAUSE.to_string()), MSG_EXECUTION),
             (SqlError::Internal(SHARED_CAUSE.to_string()), MSG_INTERNAL),
-            (SqlError::OperatorPanic(SHARED_CAUSE.to_string()), MSG_INTERNAL),
+            (
+                SqlError::OperatorPanic(SHARED_CAUSE.to_string()),
+                MSG_INTERNAL,
+            ),
         ];
         for (original, fixed) in cases {
             let class = original.class();
             assert_eq!(original.client_message(), fixed, "{original}");
             let wrapped = DataFusionError::Shared(Arc::new(original.into()));
             let recovered = take_sql_error(wrapped).expect("recovered");
-            assert!(matches!(recovered, SqlError::Shared { .. }), "{recovered:?}");
+            assert!(
+                matches!(recovered, SqlError::Shared { .. }),
+                "{recovered:?}"
+            );
             assert_eq!(recovered.class(), class, "{recovered}");
             let message = recovered.client_message();
             assert_eq!(message, fixed, "{recovered}");
