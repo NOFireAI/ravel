@@ -4827,11 +4827,7 @@ async fn read_back_once(
                     &window,
                 )
                 .await;
-            let count = timed(
-                READBACK_QUERY_HISTOGRAM_SERIES.to_string(),
-                started,
-                result,
-            )?;
+            let count = timed(READBACK_QUERY_HISTOGRAM_SERIES.to_string(), started, result)?;
             query_stats.insert(
                 READBACK_QUERY_HISTOGRAM_SERIES.to_string(),
                 ReadbackQueryStats::series(),
