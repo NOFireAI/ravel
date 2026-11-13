@@ -1248,10 +1248,18 @@ fn dexor_reconstruct(a: i64, delta: i32, mag: u64, negative_bit: bool, q: i32) -
     Some(if negative { -m } else { m }.to_bits())
 }
 
-/// Encoder tail test: `v * 10^-k` is within the tolerance of an integer.
+/// Encoder tail test: `v * 10^-k` is within the tolerance of a nonzero
+/// integer, or `v` is zero. Without the nonzero condition every small value
+/// passes at a high `k` (`1 * 10^-11` is within the tolerance of 0), so a
+/// value after a zero keeps the zero's clamped tail and escapes, and since
+/// exceptions do not move `q_prev`, so does every small value after it.
 fn dexor_is_int(v: f64, k: i32) -> bool {
+    if v == 0.0 {
+        return true;
+    }
     let x = dexor_scale(v, -k);
-    x.is_finite() && (x - x.round()).abs() < DEXOR_TOLERANCE
+    let r = x.round();
+    x.is_finite() && r != 0.0 && (x - r).abs() < DEXOR_TOLERANCE
 }
 
 /// The fields of one main-pipeline value, or `None` when it must take the
@@ -1906,6 +1914,34 @@ mod tests {
             );
             roundtrip(&Dexor, values);
         }
+    }
+
+    /// A zero clamps the tail to q = 11; the next small integer must find
+    /// its own tail (q = 0) instead of staying at 11 and escaping, and a
+    /// counter that resets to zero stays in the main pipeline throughout.
+    #[test]
+    fn dexor_value_after_zero_finds_its_tail() {
+        let mut state = DexorState::new();
+        let mut w = BitWriter::new();
+        dexor_encode_value(&mut state, &mut w, 0.0f64.to_bits());
+        assert_eq!(state.q_prev, DEXOR_Q_MAX);
+        let (q, ..) = dexor_main_fields(&state, 1.0f64.to_bits()).expect("main pipeline");
+        assert_eq!(q, 0);
+
+        let values: Vec<f64> = [5, 9, 0, 1, 3, 9, 17, 0, 2, 21, 140]
+            .iter()
+            .map(|&i| f64::from(i))
+            .collect();
+        let mut state = DexorState::new();
+        let mut w = BitWriter::new();
+        for v in &values {
+            assert!(
+                dexor_main_fields(&state, v.to_bits()).is_some(),
+                "{v} took the exception path"
+            );
+            dexor_encode_value(&mut state, &mut w, v.to_bits());
+        }
+        roundtrip(&Dexor, &values);
     }
 
     #[test]
