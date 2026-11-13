@@ -478,7 +478,9 @@ STUB
 # bucket-iam, create, binding or instance-delete. STUB_NO_SA makes the
 # service account unreadable and STUB_NO_GRANT leaves the results bucket's
 # policy without its objectAdmin binding. STUB_GCS_DOWN fails every storage
-# listing as an unreachable endpoint would.
+# listing as an unreachable endpoint would. A machine type's architecture is
+# STUB_MACHINE_ARCH (default X86_64; set it empty for an answer with no
+# architecture), and STUB_GCLOUD_FAIL=machine-type fails the lookup.
 export FAKE_GCS="$TMP/gcs"
 mkdir -p "$FAKE_GCS" "$STUB_DIR/gce"
 cat >"$STUBS/gcloud" <<'STUB'
@@ -532,6 +534,9 @@ case "${pos[0]:-} ${pos[1]:-} ${pos[2]:-}" in
   "storage buckets create") failing bucket-create; mkdir -p "$(gcs "${pos[3]}")" ;;
   "storage buckets add-iam-policy-binding") failing bucket-iam; echo etag ;;
   "storage buckets describe") [ -d "$(gcs "${pos[3]}")" ] || { echo "ERROR: NotFound" >&2; exit 1; }; echo "${pos[3]#gs://}" ;;
+  "compute machine-types describe")
+    failing machine-type
+    echo "${STUB_MACHINE_ARCH-X86_64}" ;;
   "compute instances create")
     failing create
     cp "$meta" "$STUB_DIR/startup-${pos[3]}" && echo us-central1-a >"$STUB_DIR/gce/${pos[3]}" ;;
@@ -5238,6 +5243,30 @@ launch_gcp() {
   PATH="$GITSTUBS:$PATH" STUB_TAG_SHA="${STUB_TAG_SHA-$SHA_A}" bash "$KIT_SRC/launch-gcp.sh" "$@"
 }
 
+# Catches: setup-gcp.sh --dry-run stating the objectAdmin grant as done when
+# it only printed the change; a real run must still state it.
+reset_log
+code=0
+bash "$KIT_SRC/setup-gcp.sh" --dry-run "$GCP_TOML" >"$TMP/gsetup-dry.out" 2>"$TMP/gsetup-dry.err" || code=$?
+if [ "$code" = 0 ] && ! grep -q ' has roles/storage.objectAdmin' "$TMP/gsetup-dry.out" \
+  && grep -q 'dry run, nothing granted: .* would get roles/storage.objectAdmin on gs://kit-test-gcs-bucket' "$TMP/gsetup-dry.out" \
+  && grep -q '^DRY-RUN: gcloud storage buckets add-iam-policy-binding' "$TMP/gsetup-dry.err" \
+  && ! grep -q 'add-iam-policy-binding' "$STUB_LOG"; then
+  pass "setup-gcp --dry-run prints the grant as a planned change and does not state it as done"
+else
+  fail "setup-gcp dry run" "exit $code: $(tr '\n' ';' <"$TMP/gsetup-dry.out" | head -c 300)"
+fi
+reset_log
+code=0
+bash "$KIT_SRC/setup-gcp.sh" "$GCP_TOML" >"$TMP/gsetup.out" 2>"$TMP/gsetup.err" || code=$?
+if [ "$code" = 0 ] && grep -q " has roles/storage.objectAdmin on gs://kit-test-gcs-bucket" "$TMP/gsetup.out" \
+  && grep -q 'add-iam-policy-binding gs://kit-test-gcs-bucket' "$STUB_LOG"; then
+  pass "setup-gcp states the grant after it made it"
+else
+  fail "setup-gcp" "exit $code: $(tr '\n' ';' <"$TMP/gsetup.out" | head -c 300) $(head -c 300 "$TMP/gsetup.err")"
+fi
+rm -rf "$FAKE_GCS/kit-test-gcs-bucket"
+
 # Catches: a dry run that reaches gcloud, or a create that drops the 590
 # minute DELETE, the service account, the boot disk size or the label; or a
 # user-data without the guest shutdown, the reboot guard, the digest checks,
@@ -5263,6 +5292,12 @@ if [ "$code" = 0 ] && [ -n "$grun" ] && [ "$ok" = 1 ] && [ ! -s "$STUB_LOG" ] \
   && grep -q '^DRY-RUN: gcloud compute instances add-iam-policy-binding .*roles/compute.instanceAdmin.v1' "$TMP/gdry.err" \
   && grep -q '^DRY-RUN: gcloud storage buckets create gs://kit-test-cb-.*--uniform-bucket-level-access --soft-delete-duration 0' "$TMP/gdry.err"; then
   pass "launch-gcp dry run prints the bucket, the self-deleting instance and the user-data, and calls nothing"
+  if grep -q '^launch-gcp: dry run, nothing was created' "$TMP/gdry.out" \
+    && grep -q '^DRY-RUN: gcloud compute machine-types describe c2d-highcpu-16 ' "$TMP/gdry.err"; then
+    pass "launch-gcp dry run says nothing was created and prints the machine type lookup"
+  else
+    fail "launch-gcp dry run notice" "stdout: $(head -c 300 "$TMP/gdry.out")"
+  fi
 else
   fail "launch-gcp dry run" "exit $code, run id '$grun', calls: $(tr '\n' ';' <"$STUB_LOG" | head -c 300)"
 fi
@@ -5303,6 +5338,14 @@ gcp_refusal "a mapping other than the tag's" 64 "differs from v9.9.9's" "$GCP_TO
 gcp_refusal "a service account without objectAdmin on the results bucket" 65 'lacks roles/storage.objectAdmin' \
   "$GCP_TOML" STUB_NO_GRANT=1
 gcp_refusal "a missing service account" 65 'does not exist or cannot be read' "$GCP_TOML" STUB_NO_SA=1
+# Catches: an arm64 machine type reaching a box whose release step has no
+# pinned digest for it; a lookup that fails or answers nothing launching anyway.
+gcp_refusal "an arm64 machine type" 64 'machine type c2d-highcpu-16 is arm64; only linux-amd64 release artifacts are pinned' \
+  "$GCP_TOML" STUB_MACHINE_ARCH=ARM64
+gcp_refusal "a machine type with no architecture" 64 'cannot tell the architecture of machine type c2d-highcpu-16' \
+  "$GCP_TOML" STUB_MACHINE_ARCH=
+gcp_refusal "a machine type lookup that fails" 64 'cannot look up the architecture of machine type c2d-highcpu-16' \
+  "$GCP_TOML" STUB_GCLOUD_FAIL=machine-type
 # Catches: a pre-registration missing a figure reaching a launch.
 grep -v '^hot_sum_s = ' "$GCP_PREREG" >"$TMP/prereg-short.toml"
 sed "s#^prereg = .*#prereg = \"$TMP/prereg-short.toml\"#" "$GCP_TOML" >"$TMP/gcp-short.toml"
@@ -5350,6 +5393,14 @@ if [ "$code" = 0 ] && [ -f "$GCP_RUN_DIR/in/kit.sha256" ] && [ -f "$GCP_RUN_DIR/
   pass "launch-gcp uploads in/, makes the store bucket and the instance, and lets the box delete only itself"
 else
   fail "launch-gcp" "exit $code, run id '$GCP_RUN_ID', kit.tgz holds '$tar_list': $(tail -n 3 "$TMP/glaunch.err")"
+fi
+# Catches: the check refusing an x86_64 type, or a launch that never asked
+# GCE, and an instance created before the answer came.
+if [ "$code" = 0 ] && grep -q '^gcloud compute machine-types describe c2d-highcpu-16 ' "$STUB_LOG" \
+  && [ "$(grep -n '^gcloud compute machine-types describe' "$STUB_LOG" | head -n 1 | cut -d: -f1)" -lt "$(grep -n '^gcloud compute instances create' "$STUB_LOG" | head -n 1 | cut -d: -f1)" ]; then
+  pass "launch-gcp asks GCE for the machine type's architecture before it creates anything, and launches an x86_64 one"
+else
+  fail "launch-gcp x86_64 machine type" "exit $code: $(tr '\n' ';' <"$STUB_LOG" | head -c 300)"
 fi
 cp "$STUB_DIR/startup-$GCP_INSTANCE" "$TMP/startup-gcp"
 

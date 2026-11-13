@@ -13,6 +13,9 @@
 #     (cosign verify-blob, bound to the release workflow's identity for the
 #     tag) and lists ravel_server_sha256 and ravel_cli_sha256 for the
 #     linux-amd64 binaries;
+#   - the machine type is x86_64 (gcloud compute machine-types describe,
+#     architecture): only linux-amd64 release artifacts are pinned, so an
+#     arm64 type, or an answer it cannot read, is refused;
 #   - the service account exists and holds roles/storage.objectAdmin on the
 #     results bucket (setup-gcp.sh grants it).
 # It then stages the kit (box/run.sh, lib/kit.py, the corpus, the mapping and
@@ -231,6 +234,21 @@ if [ "$DRY_RUN" != 1 ]; then
   done
 fi
 
+# The machine type's architecture. The box picks its release binaries by
+# uname -m but run.toml pins the linux-amd64 digests only.
+if [ "$DRY_RUN" = 1 ]; then
+  run gcloud compute machine-types describe "$MACHINE" --project "$PROJECT" --zone "$ZONE" --format='value(architecture)'
+else
+  arch="$(gcloud compute machine-types describe "$MACHINE" --project "$PROJECT" --zone "$ZONE" --format='value(architecture)')" \
+    || die64 "cannot look up the architecture of machine type $MACHINE in $ZONE"
+  arch="$(printf '%s' "$arch" | tr -d '[:space:]')"
+  case "$arch" in
+    X86_64) ;;
+    ARM64) die64 "machine type $MACHINE is arm64; only linux-amd64 release artifacts are pinned, so arm64 machine types are refused" ;;
+    *) die64 "cannot tell the architecture of machine type $MACHINE (gcloud answered '$arch'); only linux-amd64 release artifacts are pinned, so a machine type that is not x86_64 is refused" ;;
+  esac
+fi
+
 # The service account and its access to the results bucket.
 if [ "$DRY_RUN" = 1 ]; then
   run gcloud iam service-accounts describe "$SA" --project "$PROJECT"
@@ -380,6 +398,7 @@ run gcloud compute instances add-iam-policy-binding "$INSTANCE" --project "$PROJ
   || { echo "launch-gcp: cannot let $SA delete $INSTANCE" >&2; exit 1; }
 LAUNCH_OK=1
 
+[ "$DRY_RUN" != 1 ] || echo "launch-gcp: dry run, nothing was created; these are the names a real launch would use"
 printf 'run id:        %s\n' "$RUN_ID"
 printf 'instance:      %s (%s, %s, %s %s)\n' "$INSTANCE" "$ZONE" "$MACHINE" "$TAG" "$SHA"
 printf 'store bucket:  gs://%s\n' "$STORE_BUCKET"

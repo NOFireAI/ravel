@@ -80,19 +80,22 @@ Read every command the dry run prints. The real launch:
    `SHA256SUMS.pem`, verifies the signature with `cosign verify-blob` against
    the release workflow's identity for the tag, and checks that it lists the
    two pinned digests;
-3. checks that the service account exists and holds objectAdmin on the
+3. asks GCE for the architecture of `instance_type` and refuses anything but
+   `X86_64`, or an answer it cannot read, because only the linux-amd64
+   release artifacts are pinned (arm64 machine types are refused);
+4. checks that the service account exists and holds objectAdmin on the
    results bucket;
-4. uploads `kit.tgz`, `kit.sha256` and the resolved `run.toml` to
+5. uploads `kit.tgz`, `kit.sha256` and the resolved `run.toml` to
    `gs://<bucket>/<prefix>/runs/<run-id>/in/`;
-5. creates the store bucket `<store_bucket_prefix>-<suffix>`, where the
+6. creates the store bucket `<store_bucket_prefix>-<suffix>`, where the
    suffix is the run id without its `clickbench-` head, lowercased (at most
    63 characters in all), and grants the
    account objectAdmin on it;
-6. creates the instance and grants the account
+7. creates the instance and grants the account
    `roles/compute.instanceAdmin.v1` on that one instance, so the box can delete
    itself.
 
-If step 5 or 6 fails, it deletes what it created. It prints the run id, the
+If step 6 or 7 fails, it deletes what it created. It prints the run id, the
 instance, the store bucket and the commands for the next two steps, and exits.
 
 ### How the box ends
@@ -126,7 +129,9 @@ again on a half-used box.
   `SELECT 1` before the load, so a binary without the SQL surface fails
   there;
 - after `declare`, step `declared` checks that `typed-attr-column show`
-  reports as many columns as the mapping has entries, and step `footprint`
+  reports as many columns as `kit.py mapping-columns` counts: the mapping
+  entries that are not f64, which is what `typed-attr-column set` declares
+  (104 for `hits.mapping.toml`). Step `footprint`
   lists the bucket and stamps its objects and bytes by key class;
 - the server runs without an `LD_PRELOAD`, as the release ships;
 - uploads, listings and the self-delete use the metadata server's token with
