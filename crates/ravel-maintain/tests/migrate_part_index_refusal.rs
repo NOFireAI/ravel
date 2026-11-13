@@ -22,7 +22,7 @@ use ravel_maintain::claim_guard::ClaimSleeper;
 use ravel_maintain::{
     Bucket, ClaimParticipant, Clock, CompactorConfig, Coordination, FixedClock, MaintainError,
     MigrateBudget, MigrationPath, NotMigratedBucket, NotMigratedReason, PartIndexRefusalKind,
-    migrate_family,
+    Verification, migrate_family,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
@@ -180,6 +180,16 @@ async fn a_part_index_refusal_is_not_migrated_and_the_walk_goes_on() {
     assert_eq!(report.records_migrated, 4, "{report:?}");
     assert!(report.unwritable_skipped.is_empty(), "{report:?}");
     assert!(report.walk_complete, "{report:?}");
+    assert_eq!(
+        report.verification,
+        Some(Verification::Stragglers {
+            l0: 1,
+            l1: 0,
+            rewrite_parts: 0,
+            blocked: Vec::new(),
+        }),
+        "the refused bucket's one input holds the floor down, and nothing else does"
+    );
     assert_eq!(
         bucket_entries(&store, HOUR - 2).await,
         (0, 1),

@@ -883,9 +883,9 @@ async fn migrate_bucket_format_scoped(
             }
             return Err(err);
         }
-        // Refused for its part-index windows (ADR-3853): nothing was built, so
-        // release the claim now rather than hold the bucket's migration off
-        // for the lease, as compaction does for the same refusal
+        // Refused for its part-index windows (ADR-3853): no record was
+        // published, so release the claim now rather than hold the bucket's
+        // migration off for the lease, as compaction does for the same refusal
         // (crate::compact's part-index-refusal arm, issue #4127).
         Err(err) if err.is_part_index_refusal() => {
             if let Some(guard) = guard
