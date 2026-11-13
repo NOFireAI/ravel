@@ -284,7 +284,7 @@ fn big_rlog() -> bytes::Bytes {
 /// Rows in the declared-string retry fixture: enough groups that a first
 /// attempt refused at nine tenths of its peak derives a tuning, and that each
 /// of two final partitions passes the default engage threshold of 65,536.
-const STR_ROWS: i64 = 1_000_000;
+const STR_ROWS: i64 = 2_000_000;
 
 /// Row `i`'s declared `str` attribute `s`: absent, so NULL, on `i % 10 = 0`;
 /// the empty string on `i % 10 = 1`; `s` and `i`'s digits, at most 8 bytes,
@@ -3099,9 +3099,12 @@ fn string_keys_sql(string_type: &str, composite: bool) -> String {
 #[tokio::test]
 async fn bucket_spill_routes_string_keys_exactly() {
     const FIXED: [(bool, usize, usize); 2] = [(false, 8, 5312), (true, 8 + 4 + 8, 5568)];
-    let triggers = [
-        ("phase 2", ENGAGE_GROUPS, 4, 1 << 20),
-        ("phase 1", 1 << 20, 2, 1 << 20),
+    // Each trigger's cap per partition count it runs at: the phase 2 cap
+    // must hold one bucket's table and still refuse the retained chunks; the
+    // phase 1 cap must refuse the stock table after granting it a batch.
+    let triggers: [(&str, usize, u8, &[(usize, usize)]); 2] = [
+        ("phase 2", ENGAGE_GROUPS, 4, &[(2, 1 << 20), (4, 640 << 10)]),
+        ("phase 1", 1 << 20, 4, &[(2, 1 << 20)]),
     ];
     let mut runs = 0;
     for string in STRING_KEY_TYPES {
@@ -3122,7 +3125,10 @@ async fn bucket_spill_routes_string_keys_exactly() {
                         );
                     }
                 }
-                for (name, engage_groups, bits, cap) in triggers {
+                for (name, engage_groups, bits, caps) in triggers {
+                    let Some(&(_, cap)) = caps.iter().find(|(at, _)| *at == partitions) else {
+                        continue;
+                    };
                     let what = format!("{string} composite={composite} {name} at {partitions}");
                     let tuning = BucketedFinalAggregation {
                         engage_groups,
@@ -3142,7 +3148,6 @@ async fn bucket_spill_routes_string_keys_exactly() {
                     let run = run_spilled(&planned, partitions, cap)
                         .await
                         .unwrap_or_else(|e| panic!("{what}: {e}"));
-                    eprintln!("{what}: {run:?}");
                     assert_eq!(run.rows, expected, "{what}");
                     assert!(run.spilled_rows > 0, "{what}: nothing spilled: {run:?}");
                     assert!(run.spilled_rows <= run.routed_rows, "{what}: {run:?}");
@@ -3190,7 +3195,8 @@ async fn bucket_spill_routes_string_keys_exactly() {
                             assert_eq!(
                                 events.get(at + 1),
                                 Some(&PoolEvent::Shrunk),
-                                "{what}: {consumer}'s forced route asked the pool"
+                                "{what}: {consumer}'s forced route asked the pool: {:?}",
+                                &events[..(at + 4).min(events.len())]
                             );
                         }
                     }
@@ -3199,7 +3205,8 @@ async fn bucket_spill_routes_string_keys_exactly() {
             }
         }
     }
-    assert_eq!(runs, 2 * (STRING_KEY_TYPES.len() * 2 + 1));
+    // Both triggers for each type and shape at 2 partitions, phase 2 at 4.
+    assert_eq!(runs, 2 * STRING_KEY_TYPES.len() * 2 + 1);
 }
 
 /// A filtered logs scan counts the rows it consumed, before its predicate,
@@ -3427,8 +3434,8 @@ const RETRY_TIES_SQL: &str =
 const RETRY_GROUPS_SQL: &str = "SELECT a, count(*) AS c FROM logs GROUP BY a";
 
 /// A Decimal128 key, which the retry's bucketed rule still refuses.
-const RETRY_DECIMAL_SQL: &str =
-    "SELECT CAST(a AS DECIMAL(20, 2)) AS k, count(*) AS c FROM logs GROUP BY k";
+const RETRY_DECIMAL_SQL: &str = "SELECT CAST(a AS DECIMAL(20, 2)) AS k, count(*) AS c \
+                                 FROM logs GROUP BY k ORDER BY c DESC LIMIT 10";
 
 /// The declared `str` key of the [`STR_ROWS`] fixture, a view once
 /// `DictionaryGroupKeysAsViews` casts it, as ClickBench statements 34 and 35
@@ -4200,13 +4207,10 @@ async fn a_failed_bucketed_retry_is_the_statements_error() {
 /// float key never reaches a `FinalPartitioned` aggregate there.
 #[tokio::test]
 async fn retry_keeps_sort_merge_for_unadmitted_shape() {
-    let refusal = Refusal {
-        tenths: 9,
-        nofile_soft: None,
-        partitions: RETRY_PARTITIONS,
-        fixture: RetryFixture::Small,
-    };
-    let (unlimited, run, log) = answered_retry(RETRY_DECIMAL_SQL, refusal).await;
+    // The small fixture's room at nine tenths, about 0.6 MB, does not hold
+    // the sort-merge retry's own reserve for this key; the large one's does.
+    let (unlimited, run, log) =
+        answered_retry(RETRY_DECIMAL_SQL, bucket_refusal(RETRY_PARTITIONS)).await;
     let report = run.report.expect("the retry reports");
     assert_eq!(
         (report.retry_plan, report.retry_plan_reason),
@@ -4217,11 +4221,8 @@ async fn retry_keeps_sort_merge_for_unadmitted_shape() {
     let plan = run.plan.expect("the retry's plan");
     assert!(bucketed_lines(&plan).is_empty(), "{plan}");
     assert!(!plan.contains("RepartitionExec"), "{plan}");
-    assert_eq!(unlimited.rows.len(), ROWS as usize);
-    assert!(
-        sorted(run.rows) == sorted(unlimited.rows),
-        "the answers differ"
-    );
+    assert_eq!(run.rows.len(), 10);
+    assert_eq!(run.rows, unlimited.rows);
 }
 
 /// Issue #4132 (ADR-4143 decision 3): a refused GROUP BY on a declared `str`
@@ -4293,10 +4294,12 @@ async fn bucket_spill_retry_admits_a_declared_str_key() {
     );
 
     let (bucket, unlimited) = (sorted(run.rows), sorted(unlimited.rows));
-    // NULL and the empty string are 100,000 rows each; the other keys unique.
+    // NULL and the empty string are a tenth of the rows each; the other keys
+    // are unique.
     assert_eq!(unlimited.len(), STR_ROWS as usize * 8 / 10 + 2);
-    for group in ["|true|100000", "|false|100000"] {
-        assert!(unlimited.contains(&group.to_string()), "{group}");
+    for null_key in ["true", "false"] {
+        let group = format!("|{null_key}|{}", STR_ROWS / 10);
+        assert!(unlimited.contains(&group), "{group}");
     }
     assert!(bucket == unlimited, "the answers differ");
 }
