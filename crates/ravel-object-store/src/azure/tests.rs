@@ -1290,6 +1290,140 @@ async fn a_hierarchical_namespace_account_is_refused_at_construction() {
     assert_eq!(fake.requests().len(), 1);
 }
 
+/// Get Account Information refused with 403
+/// `AuthorizationPermissionMismatch` names the missing control-plane action
+/// (issue #4178).
+#[tokio::test]
+async fn account_information_permission_mismatch_names_the_control_plane_action() {
+    let fake = fake().await;
+    fake.fail_next_with_code(403, "AuthorizationPermissionMismatch", 1);
+    let denied = AzureStore::new(fake.config()).await;
+    let message = match denied {
+        Err(StoreError::AccessDenied(message)) => message,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        message.contains("Microsoft.Storage/storageAccounts/blobServices/getInfo/action"),
+        "{message}"
+    );
+    assert!(
+        message.contains("HTTP 403 AuthorizationPermissionMismatch"),
+        "{message}"
+    );
+    assert!(message.contains("docs/guides/kubernetes.md"), "{message}");
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].query_param("restype"), Some("account"));
+}
+
+/// A different 403 code on Get Account Information keeps the exact plain
+/// access-denied text it had before the getInfo hint existed: the hint is
+/// specific to `AuthorizationPermissionMismatch` (issue #4178). Asserted by
+/// `ends_with` on the status/code tail, not full equality, because the
+/// leading context embeds the fake's dynamically bound container path.
+#[tokio::test]
+async fn account_information_other_403_keeps_the_plain_text() {
+    let fake = fake().await;
+    fake.fail_next_with_code(403, "AuthorizationFailure", 1);
+    let denied = AzureStore::new(fake.config()).await;
+    let message = match denied {
+        Err(StoreError::AccessDenied(message)) => message,
+        other => panic!("{other:?}"),
+    };
+    assert!(!message.contains("getInfo"), "{message}");
+    assert!(
+        message.ends_with("HTTP 403 AuthorizationFailure"),
+        "{message}"
+    );
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+}
+
+/// A 403 `AuthorizationPermissionMismatch` on an ordinary blob request (Get
+/// Blob Properties, through the same `AzureRestClient` as Get Account
+/// Information) keeps the exact plain access-denied text it had before the
+/// getInfo hint existed: the hint is specific to Get Account Information,
+/// never a data-plane request (issue #4178). Asserted by full equality,
+/// unlike the Get Account Information case above, because `head`'s context
+/// is just the key and carries nothing dynamic.
+#[tokio::test]
+async fn a_blob_request_permission_mismatch_keeps_the_plain_text() {
+    let fake = fake().await;
+    let store = store(&fake).await;
+    fake.clear_requests();
+    fake.fail_next_with_code(403, "AuthorizationPermissionMismatch", 1);
+    let denied = store.head("e/k").await;
+    let message = match denied {
+        Err(StoreError::AccessDenied(message)) => message,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        message,
+        "head \"e/k\": HTTP 403 AuthorizationPermissionMismatch"
+    );
+    let requests = blob_requests(&fake, "e/k");
+    assert_eq!(requests.len(), 1, "{requests:?}");
+}
+
+/// Get Account Information refused with 401 keeps the plain access-denied
+/// text: the getInfo hint fires only on a 403
+/// `AuthorizationPermissionMismatch` (issue #4178).
+#[tokio::test]
+async fn account_information_401_keeps_the_plain_text() {
+    let fake = fake().await;
+    fake.fail_next(401, 1);
+    let denied = AzureStore::new(fake.config()).await;
+    let message = match denied {
+        Err(StoreError::AccessDenied(message)) => message,
+        other => panic!("{other:?}"),
+    };
+    assert!(!message.contains("getInfo"), "{message}");
+    assert!(
+        message.ends_with("HTTP 401 NoAuthenticationInformation"),
+        "{message}"
+    );
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+}
+
+/// A 403 `AuthorizationPermissionMismatch` on a list request keeps the plain
+/// access-denied text: the getInfo hint is specific to Get Account
+/// Information, never a listing (issue #4178).
+#[tokio::test]
+async fn a_list_request_permission_mismatch_keeps_the_plain_text() {
+    let fake = fake().await;
+    let store = store(&fake).await;
+    fake.clear_requests();
+    fake.fail_next_with_code(403, "AuthorizationPermissionMismatch", 1);
+    let denied = store.list("e/", None).await;
+    let message = match denied {
+        Err(StoreError::AccessDenied(message)) => message,
+        other => panic!("{other:?}"),
+    };
+    assert!(!message.contains("getInfo"), "{message}");
+}
+
+/// Get Account Information refused with 404 `ResourceNotFound` is
+/// `StoreError::Permanent` naming the container as missing, the same as on
+/// main before this change: the `AccountInformation` subject's 404 arm is
+/// unconditional and does not depend on the getInfo hint (issue #4178).
+#[tokio::test]
+async fn account_information_404_is_permanent_container_missing() {
+    let fake = fake().await;
+    fake.fail_next_with_code(404, "ResourceNotFound", 1);
+    let denied = AzureStore::new(fake.config()).await;
+    let message = match denied {
+        Err(StoreError::Permanent(message)) => message,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        message.contains("the container does not exist"),
+        "{message}"
+    );
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+}
+
 #[test]
 fn credentials_are_read_from_the_four_keys_only() {
     let asked = parking_lot::Mutex::new(Vec::new());
