@@ -1,6 +1,6 @@
 # ADR-4146: a series-level key index for metrics, routed before the label-value index
 
-Status: Proposed. Issue: #4146.
+Status: Accepted (2026-11-13). Issue: #4146.
 Date: 2026-11-13
 Builds on: ADR-3694 (decision 2, the metrics `label_value` leaf; decision
 3 and the per-value routing amendment, the metrics route; the Stage 1
@@ -190,8 +190,10 @@ for it as today.
   takes effect only where `metrics_label_index` is on and the fold builds
   leaves (`build_key_index_leaves`), the rule the Stage 1 acceptance
   amendment set for the label index. `declared_key_index_fields` returns
-  the three fields after `label_value` when it is on. The default is
-  decided by this ADR's acceptance, not by the code change.
+  the three fields after `label_value` when it is on. The default stays
+  off. Turning it on, in a deployment or as the default, is an owner
+  decision taken on the result of section "Acceptance", not on this
+  ADR's status and not by the code change.
 - **Inputs.** For an object the postings build holds whole
   (fold.rs:5046-5049), SERIES_IDS and the SERIES_META (or
   SERIES_META_CHUNKS) label sets come from the held bytes, with no GET.
@@ -275,7 +277,9 @@ planned for its keys alone.
    `S_max` is 192, derived from the byte budget `Q_BC` of step 3 in
    section "Expected cost" (predicted); it spares pass B's prefix GET on
    a key set the budget would most likely decline, and the budget, not
-   `S_max`, is the bound.
+   `S_max`, is the bound. The pre-check is skipped on a part whose
+   `series_class` body (`size` minus `prefix_len`) is within pass B's
+   share of `Q_BC`: no key set can exceed the budget there.
 3. Pass B probes `series_class` with the union of the admitted plans'
    `S`, giving each plan its classes `C`. Passes B and C run under a byte
    budget of their own, `Q_BC` = 4 MiB on-object per covering part
@@ -293,7 +297,11 @@ planned for its keys alone.
    of `Q_BC`) as the probe's own backstop. The existing policy,
    `part_entry_count x KEY_INDEX_T1_BYTES` (kidx.rs:1301-1308), is not
    used for these passes: it bounds nothing at these leaf sizes (section
-   "Expected cost").
+   "Expected cost"). A field of several leaf slices shares one
+   allowance: `Q_A` and `Q_BC` are summed over the slices a pass probes
+   on a part, and each slice probe's `max_bridged_bytes`, and the
+   route's own count in the unbridged case, is what the earlier slices
+   of that pass left.
 4. Pass C probes `class_objects` with the union of the admitted plans'
    `C`. Each plan keeps the entries its own `C` names plus every
    uncovered entry, and drops the part's other entries.
@@ -308,7 +316,7 @@ planned for its keys alone.
    declines with either `KeyIndexSetDecline` variant (kidx.rs:1321-1333):
    `OverBudget`, more than `b_run` distinct buckets whose bridged runs
    exceed `max_bridged_bytes` (here `Q_A` or the pass's share of `Q_BC`),
-   or `ReservationRefused`, a frame's `decoded_bound` refused under
+   or `ReservationRefused`, a frame's decode bound refused under
    ADR-1170. A plan individually inside every budget can therefore
    decline because of the other plans, either not admitted behind
    cheaper ones or taken down by a shared probe's decline; it then pays
@@ -347,7 +355,7 @@ can go wrong widens instead of narrowing:
   label-value route, which is itself exact (ADR-3694 decision 2).
 
 Intersecting over fewer than all of the plan's pairs is also a superset,
-so a later optimisation that skips a pair (see open questions) stays
+so a later optimisation that skips a pair (see owner decision 3) stays
 exact. False positives come from the collisions above, and they are the
 only way the series route can open an object holding no matching series;
 the negative, regex and empty-value matchers stay with the exact decode,
@@ -393,10 +401,19 @@ Both counters are zero when the switch is off.
   three new fields only; `label_value`, logs and spans leaves keep being
   written at 2, because nothing in them changed and an older reader keeps
   accepting them. `key_index_leaf_version_accepted` accepts 3 for metrics.
-  The posting decoder keeps the hostile-frame bound of `decoded_bound`:
-  a posting is at least 10 wire bytes and decodes to a `Vec<u64>` of at
-  most 8 bytes per wire byte, so the bound is restated for kind 1 and the
-  frame-count refusal is kept.
+  Kind 1 has a decode bound of its own, `16 x uncompressed_len + 64`;
+  `decoded_bound` stays as it is for kind 0. A posting is at least 10
+  wire bytes (key8, a one-byte count, one one-byte delta) and decodes to
+  a 32-byte posting entry plus 8 bytes per delta, so at most 8 decoded
+  bytes per wire byte, reached by a posting of one-byte deltas. The peak
+  is the larger of the raw buffer beside the postings (9 bytes per wire
+  byte) and the postings beside the matches a probe copies out (16). The
+  decoder refuses, before it allocates, a frame claiming more than
+  `uncompressed_len / 10` postings and a count that leaves less than one
+  byte per delta or less than 10 bytes for each posting still to come,
+  and allocates each list at exactly its count. R1 pins this with the
+  kind-1 analogue of `decoded_bound_dominates_the_adversarial_frame`
+  (most postings per byte, and one posting of all one-byte deltas).
 - **Readers before writers.** Step 1 ships the reader: the decoder for
   kind 1, version 3 accepted, the series route, `inspect kidx` printing
   the kind, with no writer. Step 2 ships the writer behind
@@ -449,8 +466,8 @@ count those bytes (kidx.rs:1355-1365), the latter checked against
 acceptance band are on-object. Three figures are decompressed by
 construction and say so: the size formulas below, `bucket_bits`, which
 the writer chooses from the decompressed body (kidx.rs:291-293), and a
-decode reservation, which `decoded_bound` takes from a frame's
-uncompressed length (kidx.rs:144). The on-object figures come from
+decode reservation, which the decode bounds take from a frame's
+uncompressed length (kidx.rs:144 for kind 0; decision 5 for kind 1). The on-object figures come from
 docs/adrs/assets/4146-leaf-bytes-sim.py (seed 4146): it builds the three
 fields of the worked part from the generator's label rules with random
 keys in place of BLAKE3 prefixes, compresses each bucket as the writer
@@ -541,11 +558,11 @@ series count.
 | plan phase | 1,067 GETs and 69.9 MB scaled by 145 / 1,601: about 97 GETs and 6.3 MB | predicted, assuming plan cost per opened object stays as measured in comment 6790288400 |
 | dollars, plan plus probe plus leaf | about 220 GETs ($0.0001) and 68 MB = 0.064 GiB ($0.0006), about $0.0007, against $0.0074 | predicted, at the $0.40 per million GETs and $0.01 per GiB of docs/adrs/3694-long-range-metrics-exact-economics.md:789-794 |
 
-Decode memory, from decompressed bytes as `decoded_bound` takes them: the
+Decode memory, from decompressed bytes as the decode bounds take them: the
 largest frame pass A reads is the `__name__` posting's bucket, about 2.1
-MB decompressed (1.94 MB on-object), which reserves `decoded_bound` = 8 x
-2.1 = 16.8 MB under ADR-1170 while it decodes; the whole of pass A
-reserves about 8 x 4.9 = 39 MB (predicted). Latency: three sequential leaf rounds
+MB decompressed (1.94 MB on-object), which reserves the kind-1 bound of
+decision 5, 16 x 2.1 = 33.6 MB, under ADR-1170 while it decodes; the
+whole of pass A reserves about 16 x 4.9 = 78 MB (predicted). Latency: three sequential leaf rounds
 instead of one, each a GET 1 then bucket reads, predicted at three
 first-byte latencies more than the label-value route, against 1,456
 fewer objects probed.
@@ -781,33 +798,33 @@ is either a named key collision (predicted 0 at these sizes: for
 10^-8) or a defect. A2's per-object line is row 3's, so the decision is
 judged on object count, not on a different per-object probe.
 
-## Open questions for the owner
+## Owner decisions (2026-11-13)
 
-1. `Q_A` and `Q_BC`: 8 MiB per covering part for pass A, 1.6 times the
-   largest corpus plan and about 21 opened objects of probe wire, and 4
-   MiB for passes B and C, about pass A's bytes on the worked statement
-   and about 11 opened objects. `S_max` (192) follows from `Q_BC` on the
-   worked example; a different `Q_BC` moves `S_max` along the table in
-   section "Expected cost". Lower values send broad selectors, and
-   statements of many plans, to the label-value route sooner.
-2. The cap: one `metrics_series_index_max_ratio_ppm` at 1 %, separate
-   from the label index's 1 %, or one shared cap over all four fields.
-3. Large postings: pass A reads 4.62 MB on-object, mostly the `__name__` and
-   `job` postings. Intersection over a subset is exact, so a per-key
-   length written in the leaf would let the router skip the largest
-   postings; that is another format detail, deferred unless A3's bytes
-   matter.
-4. Whether `label_value` should still be built for parts the series index
-   covers. This ADR keeps it, since it answers single-pair plans and
-   declined parts; dropping it would save its 0.77 % of data bytes.
-5. Whether the harness's `series_holders` stamp is a new harness task or
-   part of the measurement task, and which issue owns it.
+1. `Q_A` = 8 MiB, `Q_BC` = 4 MiB and `S_max` = 192 are accepted as
+   reader constants, with the `S_max` pre-check skipped on a part whose
+   whole `series_class` body fits pass B's share (decision 3, step 2),
+   so a tenant whose leaf is that small never declines a plan on `S_max`
+   for no byte reason.
+2. The cap is a separate `metrics_series_index_max_ratio_ppm` at 1 %. A
+   shared cap would let the series fields uncover `label_value`, their
+   fallback, and would change behaviour with the switch off.
+3. Per-key posting lengths are deferred, with no version 3 field for
+   them. M1 records pass A bytes per key; revisit only if series leaf
+   bytes exceed 15 % of a statement's plan plus probe wire (predicted 7
+   %: 4.64 of 68 MB), and try skipping by directory frame size first,
+   which needs no format change.
+4. `label_value` keeps being built on parts the series index covers. It
+   answers one-pair plans, every decline and older readers (A8 depends on
+   it). Revisit after M1 with the share of plans it answered on covered
+   parts.
+5. The harness's `series_holders` stamp is part of M1, owned by #4146,
+   merged before the run, with the pre-registration comment on #4146.
 
 ## Plan
 
 | task | decision | crates | depends on | risk |
 |---|---|---|---|---|
-| R1 leaf version 3 reader: header `entry_kind`, the posting entry type with its decoder, kind-1 splitter and encoder (codec only, no fold calls them), the shared pair encoding of decision 1, the property, fuzz and corrupt-input tests, `inspect kidx` prints the kind, docs/catalog-and-mvcc.md | 5 | ravel-catalog, ravel-cli, proto | owner approval | medium: a format change |
-| R2 series route in the resolve: passes A to C shared over the statement's routed plans, the `Q_A` and `Q_BC` byte budgets over each pass's union with their unbridged-case checks, the cheapest-first admission of plans to each pass, `S_max` over the union and the `S_max` override A9 uses, the per-plan and per-part declines, the new counters and pass rows, the ordering against `label_value`, docs/query-engine.md | 3, 4 | ravel-query, ravel-server | R1 | medium |
+| R1 leaf version 3 reader: header `entry_kind`, the posting entry type with its decoder, kind-1 splitter and encoder (codec only, no fold calls them), the shared pair encoding of decision 1, the kind-1 decode bound and its test (decision 5), the property, fuzz and corrupt-input tests, `inspect kidx` prints the kind, docs/catalog-and-mvcc.md | 5 | ravel-catalog, ravel-cli, proto | none (accepted 2026-11-13) | medium: a format change |
+| R2 series route in the resolve: passes A to C shared over the statement's routed plans, the `Q_A` and `Q_BC` byte budgets over each pass's union with their unbridged-case checks, the cheapest-first admission of plans to each pass, the budgets summed over a pass's slices and the `S_max` skip (decision 3), `S_max` over the union and the `S_max` override A9 uses, the per-plan and per-part declines, the new counters and pass rows, the ordering against `label_value`, docs/query-engine.md | 3, 4 | ravel-query, ravel-server | R1 | medium |
 | W1 the fold build and carry behind `metrics_series_index`, off, writing the posting fields through R1's kind-1 splitter and encoder; the cap and its report | 1, 2 | ravel-catalog, ravel-server, ravel-cli | R1 released to every process | medium |
 | M1 harness `series_holders` stamp and the acceptance run | acceptance | ravel-bench | R2, W1 | low |
