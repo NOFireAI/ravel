@@ -2505,8 +2505,8 @@ impl NotMigratedRetry {
 /// One line per bucket the walk dispatched a rewrite for that published
 /// nothing, with the path and the reason, followed by the sentence that says
 /// when a later run retries them and, when a part_index_refusal bucket is
-/// listed, what a retry of it meets. Returns the empty string for an empty
-/// list.
+/// listed and the run did not raise the floor, what a retry of it meets.
+/// Returns the empty string for an empty list.
 fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -> String {
     if buckets.is_empty() {
         return String::new();
@@ -2551,17 +2551,20 @@ fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -
              passed it. Nothing is left to retry.\n"
         }
     });
-    if buckets
-        .iter()
-        .any(|b| matches!(b.reason, NotMigratedReason::PartIndexRefusal { .. }))
+    if retry != NotMigratedRetry::Resolved
+        && buckets
+            .iter()
+            .any(|b| matches!(b.reason, NotMigratedReason::PartIndexRefusal { .. }))
     {
         out.push_str(
             "# A part_index_refusal bucket was refused part indexes by its RLOG merge \
              (ADR-3853): part_key_space when its records pass the part key's indexes times \
              the range quantum, part_range_window when a range's parts outgrow its window. A \
-             retry with the same inputs and settings is refused the same way, as compaction \
-             refuses it, and its records keep the floor from rising while they stay below the \
-             target.\n",
+             retry with the same inputs is refused the same way, as compaction refuses it, and \
+             its records keep the floor from rising while they stay below the target. \
+             Re-running migrate is not the remedy: the bucket clears when retention ages it \
+             out (subject to the format-version hold, which keeps an object this build cannot \
+             read). That is not a command you run.\n",
         );
     }
     out
@@ -2943,11 +2946,12 @@ fn migrate_verdict(
                  not re-encode, and the {} not_migrated line(s) the buckets the next migrate \
                  run retries: this run drained the walk and cleared its cursor, so the next run \
                  starts over. The {} unwritable_skipped line(s) name buckets no migrate run \
-                 rewrites while the log object each names is there.",
+                 rewrites while the log object each names is there.{}",
                 blocked.len(),
                 report.reencode_blocked.len(),
                 report.not_migrated.len(),
                 report.unwritable_skipped.len(),
+                part_index_refusal_straggler_note(&report.not_migrated),
             )
         }
         None => {
@@ -2956,6 +2960,26 @@ fn migrate_verdict(
             anyhow::bail!("migrate completed the walk but produced no verification result")
         }
     }
+}
+
+/// The straggler verdict's sentence on the not_migrated buckets a part-index
+/// refusal held back, which the next run retries to no effect. Empty when none
+/// is listed.
+fn part_index_refusal_straggler_note(not_migrated: &[NotMigratedBucket]) -> String {
+    let refused = not_migrated
+        .iter()
+        .filter(|b| matches!(b.reason, NotMigratedReason::PartIndexRefusal { .. }))
+        .count();
+    if refused == 0 {
+        return String::new();
+    }
+    format!(
+        " Of the not_migrated line(s), the {refused} with reason=part_index_refusal name \
+         buckets the next run retries and its RLOG merge refuses the same way, as compaction \
+         does (ADR-3853), so re-running is not the remedy for them either: each clears when \
+         retention ages the bucket out (subject to the format-version hold, which keeps an \
+         object this build cannot read)."
+    )
 }
 
 /// The verdict for a migrate run that did not already fail on stragglers: an
@@ -4101,9 +4125,27 @@ mod tests {
              # A part_index_refusal bucket was refused part indexes by its RLOG merge \
              (ADR-3853): part_key_space when its records pass the part key's indexes times \
              the range quantum, part_range_window when a range's parts outgrow its window. A \
-             retry with the same inputs and settings is refused the same way, as compaction \
-             refuses it, and its records keep the floor from rising while they stay below the \
-             target.\n"
+             retry with the same inputs is refused the same way, as compaction refuses it, and \
+             its records keep the floor from rising while they stay below the target. \
+             Re-running migrate is not the remedy: the bucket clears when retention ages it \
+             out (subject to the format-version hold, which keeps an object this build cannot \
+             read). That is not a command you run.\n"
+        );
+        let refused = [not_migrated(
+            MigrationPath::L0Migration,
+            NotMigratedReason::PartIndexRefusal {
+                refusal: ravel_maintain::PartIndexRefusalKind::RangeWindow,
+            },
+        )];
+        assert!(
+            not_migrated_report(&refused, NotMigratedRetry::AfterTheWalkDrains)
+                .contains("# A part_index_refusal bucket was refused part indexes"),
+            "a budget stop still explains the refusal"
+        );
+        assert!(
+            !not_migrated_report(&refused, NotMigratedRetry::Resolved)
+                .contains("# A part_index_refusal bucket was refused part indexes"),
+            "a run that raised the floor does not explain a refusal nothing is left of"
         );
         assert!(
             !not_migrated_report(
@@ -4290,6 +4332,68 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// The straggler verdict names a part_index_refusal bucket as one that
+    /// re-running does not clear, and says what does; a run whose not_migrated
+    /// list holds no such bucket ends its text where it did before.
+    ///
+    /// Non-vacuity: return `String::new()` from
+    /// `part_index_refusal_straggler_note` and the refused case fails; append
+    /// its sentence unconditionally and the claim-skip case fails.
+    #[test]
+    fn the_straggler_verdict_names_a_part_index_refusal_as_not_retried_away() {
+        let bucket = |reason| NotMigratedBucket {
+            shard: 0,
+            ingest_hour: 1,
+            path: MigrationPath::L0Migration,
+            reason,
+        };
+        let verdict = |not_migrated: Vec<NotMigratedBucket>| {
+            let report = FamilyMigrateReport {
+                walk_complete: true,
+                verification: Some(Verification::Stragglers {
+                    l0: 2,
+                    l1: 0,
+                    rewrite_parts: 0,
+                    blocked: Vec::new(),
+                }),
+                not_migrated,
+                ..FamilyMigrateReport::default()
+            };
+            let mut out: Vec<u8> = Vec::new();
+            migrate_verdict(&mut out, "acme", Signal::Logs, "rlog", 2, 0, &report)
+                .expect_err("stragglers fail the run")
+                .to_string()
+        };
+        let unchanged_end = "The 0 unwritable_skipped line(s) name buckets no migrate run \
+                             rewrites while the log object each names is there.";
+
+        let skipped = verdict(vec![bucket(NotMigratedReason::ClaimSkipped {
+            reason: ravel_maintain::ClaimSkipReason::HeldByAnother,
+        })]);
+        assert!(skipped.ends_with(unchanged_end), "{skipped}");
+        assert!(!skipped.contains("part_index_refusal"), "{skipped}");
+
+        let refused = verdict(vec![
+            bucket(NotMigratedReason::ClaimSkipped {
+                reason: ravel_maintain::ClaimSkipReason::HeldByAnother,
+            }),
+            bucket(NotMigratedReason::PartIndexRefusal {
+                refusal: ravel_maintain::PartIndexRefusalKind::RangeWindow,
+            }),
+        ]);
+        assert!(
+            refused.ends_with(&format!(
+                "{unchanged_end} Of the not_migrated line(s), the 1 with \
+                 reason=part_index_refusal name buckets the next run retries and its RLOG \
+                 merge refuses the same way, as compaction does (ADR-3853), so re-running is \
+                 not the remedy for them either: each clears when retention ages the bucket \
+                 out (subject to the format-version hold, which keeps an object this build \
+                 cannot read)."
+            )),
+            "{refused}"
+        );
     }
 
     /// A bucket the walk skipped for an unwritable log object (issue #2580)

@@ -303,9 +303,15 @@ pub enum NotMigratedReason {
     /// The rewrite's RLOG merge refused a part index for its ranges' windows
     /// or the unit's record count against the part key's space
     /// ([`crate::error::MaintainError::is_part_index_refusal`], ADR-3853):
-    /// refused before or during encode, so no record was published. The
-    /// bucket's L0 inputs stay live and raw, the same build refuses the unit
-    /// again, and a later walk retries it (issue #4127).
+    /// refused before or during encode, so no record was published. A
+    /// `PartRangeWindow` refusal is raised when a part is opened past its
+    /// range's window, so it can leave parts that earlier steps of the same
+    /// merge already PUT, referenced by no record, as compaction leaves them
+    /// on the same refusal. The unreferenced-part sweep deletes such an `l1/` object only
+    /// once its bucket holds a compaction record or a retention tombstone
+    /// ([`crate::sweep_unreferenced_parts`]). The bucket's L0 inputs stay live
+    /// and raw, the same build refuses the unit again, and a later walk
+    /// retries it (issue #4127).
     PartIndexRefusal {
         /// Which of the two refusals this was.
         refusal: crate::error::PartIndexRefusalKind,

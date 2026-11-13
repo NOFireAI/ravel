@@ -1614,11 +1614,16 @@ A `not_migrated` line names the path that the bucket was dispatched to
   publish.
 - `part_index_refusal refusal=<kind>`: the bucket's RLOG merge was refused
   because its parts do not fit the part index (`part_key_space` or
-  `part_range_window`), so no record was published. The run
+  `part_range_window`), so no record was published. A `part_range_window`
+  refusal can leave parts that the same merge had already written, named by
+  no record, as compaction does on the same refusal. The run
   completes the bucket's claim and the walk goes on to later buckets. The
   bucket's L0 inputs stay live, so the floor does not rise past it, and a
-  retry with the same inputs and settings is refused the same way; a `#`
-  line under the list says so.
+  retry with the same inputs is refused the same way. Re-running `migrate`
+  is not the remedy: retention clears the bucket when it ages the bucket out,
+  subject to the format-version hold. Unless the re-audit raised the floor, a
+  `#` line under the list says so, and the straggler error names these
+  buckets too.
 
 When a `not_migrated` bucket is retried depends on how the run ended. The `# `
 line under the list says which case applies:
