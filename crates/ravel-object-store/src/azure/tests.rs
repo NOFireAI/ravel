@@ -440,6 +440,20 @@ async fn a_pin_with_a_version_selects_it_on_the_head_and_the_get() {
         requests[0].query_param("versionid"),
         Some("2026-11-12T00:00:00.0000000Z")
     );
+
+    // The HEAD that settles a 412 keeps the selector and drops the If-Match;
+    // without the selector it would find the live blob.
+    fake.clear_requests();
+    fake.fail_next(412, 1);
+    let read = store.get_pinned("s/k", GetRange::Full, &pin).await;
+    assert!(matches!(read, Err(StoreError::NotFound)), "{read:?}");
+    let requests = blob_requests(&fake, "s/k");
+    assert_eq!(methods(&requests), ["GET", "HEAD"]);
+    assert_eq!(
+        requests[1].query_param("versionid"),
+        Some("2026-11-12T00:00:00.0000000Z")
+    );
+    assert_eq!(requests[1].header("if-match"), None);
 }
 
 #[tokio::test]
