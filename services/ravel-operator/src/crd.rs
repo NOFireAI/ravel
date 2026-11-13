@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 
 /// `RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface
 /// (`services/ravel-server/src/config.rs`); the memory store is deliberately
-/// unrepresentable (ADR-0034 decision 2), so `storage.s3` is mandatory.
+/// unrepresentable (ADR-0034 decision 2), so exactly one of `storage.s3` and
+/// `storage.azure` is required.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[kube(
     group = "ravel.nofire.ai",
@@ -3760,7 +3761,11 @@ mod tests {
             Some("storage must set exactly one of s3 and azure")
         );
         assert!(
-            !storage.required.clone().unwrap_or_default().contains(&"s3".to_string()),
+            !storage
+                .required
+                .clone()
+                .unwrap_or_default()
+                .contains(&"s3".to_string()),
             "storage.s3 is optional in the schema; the one-of rule requires a backend"
         );
 
