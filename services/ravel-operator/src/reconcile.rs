@@ -37,11 +37,11 @@ use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use ravel_object_store::s3::{S3EndpointRefusal, resolve_s3_allow_http};
 
 use crate::crd::{
-    AffinityBackend, AffinityKeySource, GATEWAY_DEFAULT_CPU_REQUEST,
+    AffinityBackend, AffinityKeySource, AzureSpec, GATEWAY_DEFAULT_CPU_REQUEST,
     GATEWAY_DEFAULT_MEMORY_REQUEST, GatewayReference, IngestAffinitySpec, LocalSecretRef,
     MAINTAIN_DEFAULT_CPU_REQUEST, MAINTAIN_DEFAULT_MEMORY_REQUEST, MaintainScratchSpec,
     QUERY_DEFAULT_CPU_REQUEST, QUERY_DEFAULT_MEMORY_REQUEST, RavelClusterSpec,
-    ResourceRequirementsSpec, S3AuthSpec, S3Spec, S3UploadIntegrity, StorageBackend, AzureSpec,
+    ResourceRequirementsSpec, S3AuthSpec, S3Spec, S3UploadIntegrity, StorageBackend,
 };
 
 /// A spec that cannot be rendered into a valid object set.
@@ -1250,10 +1250,7 @@ fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
         // the server refuses keeps a render that bypassed it from starting on
         // the default in-process memory store.
         None => {
-            return vec![
-                "--store".to_string(),
-                "unconfigured".to_string(),
-            ];
+            return vec!["--store".to_string(), "unconfigured".to_string()];
         }
     };
     let mut args = vec![
@@ -3747,11 +3744,7 @@ pub fn qualify_job_input_hash(
     // Job's annotation must move with it. The cost is one re-qualification per
     // existing cluster on the upgrade that adds this field, which is the same
     // cost any other hashed input would carry.
-    let allow_http = if s3.allow_http {
-        "true"
-    } else {
-        "false"
-    };
+    let allow_http = if s3.allow_http { "true" } else { "false" };
     // The two checksum settings are hashed for the same reason as `allowHttp`:
     // `store qualify` PUTs with the upload checksum and requests the stored
     // one, so an endpoint that rejects either header fails qualification, and
@@ -9552,8 +9545,10 @@ mod tests {
         let mut upload_integrity = spec.clone();
         upload_integrity.storage.test_s3_mut().upload_integrity = S3UploadIntegrity::Off;
         let mut stored_checksum = spec.clone();
-        stored_checksum.storage.test_s3_mut().request_stored_checksum =
-            !spec.storage.test_s3().request_stored_checksum;
+        stored_checksum
+            .storage
+            .test_s3_mut()
+            .request_stored_checksum = !spec.storage.test_s3().request_stored_checksum;
         for (label, changed) in [
             ("bucket", &bucket),
             ("region", &region),
@@ -11442,7 +11437,10 @@ mod tests {
         );
 
         let mut static_without_secret = base_spec();
-        static_without_secret.storage.test_s3_mut().credentials_secret_ref = None;
+        static_without_secret
+            .storage
+            .test_s3_mut()
+            .credentials_secret_ref = None;
         assert_eq!(
             desired_objects(&static_without_secret, "prod", "ns", &ctx()).err(),
             Some(RenderError::StaticCredentialsSecretRefMissing)
@@ -11464,7 +11462,10 @@ mod tests {
         // pins that a static cluster's hash did not move.
         let pod_identity = qualify_job_input_hash(&pod_identity_spec(), None);
         let mut static_without_secret = base_spec();
-        static_without_secret.storage.test_s3_mut().credentials_secret_ref = None;
+        static_without_secret
+            .storage
+            .test_s3_mut()
+            .credentials_secret_ref = None;
         assert_ne!(
             pod_identity,
             qualify_job_input_hash(&static_without_secret, None),
@@ -12382,7 +12383,12 @@ mod tests {
                 .and_then(|s| s.selector.match_labels)
         );
 
-        let names = ["prod-gateway", "prod-query", "prod-maintain", "prod-qualify"];
+        let names = [
+            "prod-gateway",
+            "prod-query",
+            "prod-maintain",
+            "prod-qualify",
+        ];
         assert_eq!(
             service_account_client_ids(&spec),
             names.map(|n| (n.to_string(), Some(AZURE_CLIENT_ID.to_string())))
@@ -12598,7 +12604,9 @@ mod tests {
             .and_then(|m| m.labels)
             .unwrap_or_default();
         assert_eq!(
-            labels.get(AZURE_WORKLOAD_IDENTITY_USE_LABEL).map(String::as_str),
+            labels
+                .get(AZURE_WORKLOAD_IDENTITY_USE_LABEL)
+                .map(String::as_str),
             Some("true")
         );
     }

@@ -4436,7 +4436,11 @@ mod tests {
             azure.clone(),
         );
         assert_eq!(
-            find(&success.conditions, CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED).status,
+            find(
+                &success.conditions,
+                CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED
+            )
+            .status,
             "False"
         );
         let degraded = build_degraded_status(
@@ -4447,7 +4451,11 @@ mod tests {
             azure,
         );
         assert_eq!(
-            find(&degraded.conditions, CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED).status,
+            find(
+                &degraded.conditions,
+                CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED
+            )
+            .status,
             "False"
         );
 
@@ -7770,12 +7778,11 @@ mod tests {
             message.contains("spec.maintain.credentialsSecretRef"),
             "{message}"
         );
-        let (reason, _) = degraded_reason(&Error::Render(
-            RenderError::StorageBackendNotExactlyOne,
-        ));
+        let (reason, _) = degraded_reason(&Error::Render(RenderError::StorageBackendNotExactlyOne));
         assert_eq!(reason, "StorageBackendNotExactlyOne");
-        let (reason, message) =
-            degraded_reason(&Error::Render(RenderError::AzureTierOverride { tier: "query" }));
+        let (reason, message) = degraded_reason(&Error::Render(RenderError::AzureTierOverride {
+            tier: "query",
+        }));
         assert_eq!(reason, "AzureTierOverride");
         assert!(
             message.contains("spec.query.credentialsSecretRef"),

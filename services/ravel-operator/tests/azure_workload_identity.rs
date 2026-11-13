@@ -288,8 +288,7 @@ async fn annotated_service_accounts_are_applied_before_the_qualify_job() {
             .get(&account_path(component))
             .expect("the account was applied");
         assert_eq!(
-            account["metadata"]["annotations"]["azure.workload.identity/client-id"],
-            client_id,
+            account["metadata"]["annotations"]["azure.workload.identity/client-id"], client_id,
             "{component}"
         );
     }
