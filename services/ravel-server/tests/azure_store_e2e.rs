@@ -4,8 +4,12 @@
 //!
 //! The container is qualified first through `ravel_object_store::conformance`,
 //! as `ravel-cli store qualify` would, then the server is built from the
-//! parsed command line the way `main` builds it: `Cli::parse_validated_from`,
-//! `build_store`, the qualification gate, then `ravel_server::start`.
+//! parsed command line through the steps `main` runs on it:
+//! `Cli::parse_validated_from`, `Cli::validate`, `build_store`, the
+//! qualification gate, then `ravel_server::start`. The `ServerConfig` handed
+//! to `start` is built by hand here rather than from the command line, so the
+//! test drives the real store and its startup gate but not `main`'s mapping
+//! from flags to server settings.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -54,7 +58,7 @@ fn now_ns() -> i64 {
 
 /// The command line under test, validated the way `main` validates it.
 fn azure_cli(fake: &FakeAzure) -> Cli {
-    Cli::parse_validated_from([
+    let cli = Cli::parse_validated_from([
         "ravel-server",
         "--store",
         "azure",
@@ -65,7 +69,10 @@ fn azure_cli(fake: &FakeAzure) -> Cli {
         "--azure-endpoint",
         fake.endpoint(),
     ])
-    .expect("--store azure with an account, a container and a loopback endpoint is accepted")
+    .expect("--store azure with an account, a container and a loopback endpoint is accepted");
+    cli.validate()
+        .expect("--store azure with a loopback endpoint passes Cli::validate");
+    cli
 }
 
 /// Runs the conformance suite through `built`'s store and writes the
