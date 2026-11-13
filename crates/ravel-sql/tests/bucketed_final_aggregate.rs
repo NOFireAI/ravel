@@ -4181,8 +4181,8 @@ fn final_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<AggregateExec> {
 }
 
 /// A spilled string-key run within ADR-4143 decision 3's chunk budget, on
-/// `columns` routed columns: every routed row written at most once and
-/// every written row read back, and the bytes decoded from the files at
+/// `columns` routed columns: no more rows written than routed, every
+/// written row read back, and the bytes decoded from the files at
 /// most one budget `B` per message, plus what the oversized row's chunk
 /// holds past `B`. After a phase 2 trigger the oversized row's chunk was
 /// charged at its size, once.
@@ -4311,9 +4311,9 @@ async fn spill_rule_admits_string_and_binary_keys_only() {
 /// message.
 ///
 /// Prove-the-test: seal on rows alone (`fits` without its byte check) and
-/// the decoded bytes pass `batches x B` and no 5,312-byte charge is asked;
-/// keep the source batch's views and buffers instead of copying and the
-/// decoded bytes pass the bound too.
+/// no chunk seals before 8,192 rows, so the phase 2 trigger spills
+/// nothing. A chunk that keeps the source batch's views and buffers is
+/// caught by `byte_chunks_hold_at_most_their_budget_and_copy_their_strings`.
 #[tokio::test]
 async fn bucket_spill_routes_string_keys_exactly() {
     for key in VARIABLE_WIDTH_KEYS {
@@ -4373,8 +4373,8 @@ const RETRY_STR_GROUPS: usize = 2 + (BIG_ROWS as usize) / 10 * 8;
 /// least `B_min` and 8,192 rows, which the report, the INFO line's
 /// `routed_chunk_bytes` and every exec line agree on; it answers every
 /// group as the unlimited first attempt does, NULL and the empty string
-/// apart; and it writes each state row at most once and reads every one
-/// back.
+/// apart; and it writes no more state rows than the scan read and reads
+/// every one it wrote back.
 ///
 /// Prove-the-test: drop the variable-width arm from `admits` and the retry
 /// keeps `sort_merge` with `not_admitted`.
