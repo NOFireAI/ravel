@@ -406,10 +406,11 @@ replication and Object Lock configuration of the primary bucket. It writes
 nothing. It uses read-only requests signed with the same `--store s3`
 credentials that every other `ravel-cli` command uses.
 
-The command checks S3 buckets only. Under `--store gcs` it refuses and exits
-`2` before it sends any request, and prints no report: it does not check GCS
-bucket protection (retention policy, object versioning, soft delete). Verify
-those with the platform tooling of the bucket.
+The command checks S3 buckets only. Under `--store gcs` or `--store azure` it
+refuses and exits `2` before it sends any request, and prints no report: it
+does not check GCS bucket protection (retention policy, object versioning,
+soft delete) or Azure container protection. Verify those with the platform
+tooling of the bucket or container.
 
 Run it at least daily, and after any change to the policy or the lifecycle
 rules of the bucket:
@@ -470,12 +471,12 @@ The exit code is the verdict:
 - an endpoint with no such API,
 - a response that does not parse,
 - a condition missing from the report,
-- a store other than `--store s3` (under `--store gcs`, a refusal with no
-  report),
+- a store other than `--store s3` (under `--store gcs` or `--store azure`, a
+  refusal with no report),
 - a report that could not be written to stdout,
 - a usage error, such as a missing `--expected-noncurrent-days`.
 
-On a usage error, or under `--store gcs`, the command exits before it reads
+On a usage error, or under `--store gcs` or `--store azure`, the command exits before it reads
 anything and prints no per-condition lines. A script that treats `2` as "could not verify" must
 therefore also check that a summary line was printed.
 
