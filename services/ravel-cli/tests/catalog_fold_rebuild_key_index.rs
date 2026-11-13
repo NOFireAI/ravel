@@ -1,5 +1,5 @@
 //! `ravel-cli catalog fold --rebuild-key-index` (ADR-2707 decision 4,
-//! "Lifecycle"): on a spans tenant folded with `--key-index-leaves` off, the
+//! "Lifecycle"): on a spans tenant folded with `--no-key-index-leaves`, the
 //! rebuild attaches a leaf to the part without re-encoding it and prints every
 //! report field, `largest_unindexed_part_entries` first after the store and signal.
 //!

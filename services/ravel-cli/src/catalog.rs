@@ -119,7 +119,8 @@ pub async fn fold(
 /// that carry no commit token until a HEAD rebuild. `now_ns` itself is not moved.
 ///
 /// `build_key_index_leaves` sets [`CatalogConfig::build_key_index_leaves`]
-/// for this fold (`--key-index-leaves`); [`fold`] passes `false`.
+/// for this fold: `catalog fold` passes `true` unless `--no-key-index-leaves`
+/// is given; [`fold`] passes `false`.
 #[allow(clippy::too_many_arguments)]
 pub async fn fold_with_writers_stopped(
     store: Arc<dyn ObjectStoreBackend>,

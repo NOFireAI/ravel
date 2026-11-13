@@ -68,9 +68,11 @@ pub struct FoldTaskConfig {
     /// re-refuses it at the enabled loop's spawn site.
     pub fold_interval: Duration,
     /// Whether this process's folds, scheduled and on-demand, build per-part
-    /// key-index leaves (`--fold-key-index-leaves`, ADR-2707 decision 4).
-    /// [`crate::query::build_catalog_for_server`] maps it onto
-    /// `CatalogConfig::build_key_index_leaves`. Default `false`.
+    /// key-index leaves (on unless `--no-fold-key-index-leaves`, ADR-2707
+    /// decision 4, issue #3927). [`crate::query::build_catalog_for_server`]
+    /// maps it onto `CatalogConfig::build_key_index_leaves`. The struct
+    /// default is `false`; the binary's value comes from
+    /// [`crate::config::Cli::fold_task_config`].
     pub build_key_index_leaves: bool,
     /// The leaf build's pair budget per part, across its fields
     /// (`--fold-key-index-build-max-pairs`, ADR-3692 decision 5), mapped onto

@@ -2715,12 +2715,14 @@ enum CatalogCommand {
         #[arg(long)]
         writers_stopped: bool,
         /// Build per-part key-index leaves (ADR-2707 decision 4) in this
-        /// fold. Off by default, kept off by ADR-3692's Stage 1 amendment
-        /// because an advancing fold's passes and rewritten leaf bytes grow
-        /// with the tail; the spans `trace_id` lookup reads the leaves where they exist
-        /// (tier 2). When on, every part the fold re-encodes has each new
-        /// entry's KEY_IDX section read by ranged GET, up to three GETs per
-        /// entry; a re-encoded part, such as the tail on every fold that
+        /// fold. This is the default (issue #3927), so the flag changes
+        /// nothing and is kept so existing command lines still run; it cannot
+        /// be combined with `--no-key-index-leaves`. With the build on, the
+        /// fold seals a part at every UTC day boundary (ADR-3939 decision 1),
+        /// and the spans `trace_id` lookup reads the leaves where they exist
+        /// (tier 2); every part the fold re-encodes has each new entry's
+        /// KEY_IDX section read by ranged GET, up to three GETs per entry,
+        /// and a re-encoded part, such as the tail on every fold that
         /// advances the watermark, carries instead the entries covered by the
         /// leaves of the previous parts it overlaps, by one GET per leaf slice
         /// its build fetches, and reads again each entry those leaves left
@@ -2728,9 +2730,20 @@ enum CatalogCommand {
         /// declares a key-index column or turns on trace-id indexing, and to
         /// `--signal metrics` unless `--no-metrics-label-index` is passed;
         /// metrics with it ignores it.
-        #[arg(long)]
+        #[arg(long = "key-index-leaves", conflicts_with = "key_index_leaves")]
+        key_index_leaves_on: bool,
+        /// Turn off the key-index leaf build in this fold. The resolved
+        /// switch: on unless this flag is passed. A switch-off fold over a
+        /// HEAD whose parts already carry leaf refs re-partitions the tenant's
+        /// history by entry count, drops the refs of every part it
+        /// re-encodes, reports `key_index_switch_off_over_leaves` and logs a
+        /// warning; the next switch-on fold rebuilds every day's leaves
+        /// (ADR-3939 decision 4). Every process that folds a tenant (the
+        /// ravel-server maintain tier, any on-demand fold, this command) must
+        /// therefore agree on the switch.
+        #[arg(long = "no-key-index-leaves", action = clap::ArgAction::SetFalse)]
         key_index_leaves: bool,
-        /// With `--key-index-leaves`, the most (entry, key8) pairs, read and
+        /// The most (entry, key8) pairs, read and
         /// carried from previous parts' leaves, one pass of a part's leaf
         /// build holds (ADR-3692 decision 5). On `--signal metrics`, unless
         /// `--no-metrics-label-index` is passed, the fold also holds up to N more: the LABEL_DICT pairs of objects its
@@ -2745,14 +2758,17 @@ enum CatalogCommand {
         /// largest key8 run) + 1 pairs per field, pinned by the catalog test
         /// every_pass_holds_at_most_its_share_open_slice_included; about 88 B
         /// a one-block pair is an upper-bound estimate. The leaves equal a
-        /// build from scratch at the same budget. At least 1.
-        #[arg(long, value_name = "N", requires = "key_index_leaves",
+        /// build from scratch at the same budget. At least 1. Refused with
+        /// `--no-key-index-leaves`, which turns off the build it bounds, and
+        /// with `--rebuild-key-index`.
+        #[arg(long, value_name = "N",
+              conflicts_with_all = ["key_index_leaves", "rebuild_key_index"],
               default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
               value_parser = clap::value_parser!(u64).range(1..))]
         key_index_build_max_pairs: u64,
         /// Turn off the metrics `label_value` leaf. By default, with
-        /// `--key-index-leaves` or `--rebuild-key-index` and `--signal
-        /// metrics`, the fold or rebuild builds that leaf (ADR-3694 decision
+        /// `--signal metrics`, a fold (unless `--no-key-index-leaves` is
+        /// passed) or `--rebuild-key-index` builds that leaf (ADR-3694 decision
         /// 2 and its Stage 1 acceptance amendment): every label name and
         /// value in each object's LABEL_DICT, keyed
         /// by key8_str at block 0, so a probe names the objects holding a
@@ -2769,9 +2785,9 @@ enum CatalogCommand {
         /// pass 1% of its objects' bytes gets no leaf
         /// (`metrics_label_index_parts_over_cap`).
         /// While any metrics erasure request is pending, no metrics leaf is
-        /// built (`metrics_label_index_parts_erasure_gated`). Without
-        /// `--key-index-leaves` or `--rebuild-key-index` no leaf is built and
-        /// this flag changes nothing. With it a metrics rebuild is refused.
+        /// built (`metrics_label_index_parts_erasure_gated`). A fold with
+        /// `--no-key-index-leaves` builds no leaf, and this flag changes
+        /// nothing there. With it a metrics rebuild is refused.
         #[arg(long)]
         no_metrics_label_index: bool,
         /// Instead of folding, attach key-index leaves to the parts already in
@@ -2783,14 +2799,16 @@ enum CatalogCommand {
         /// written. Publishes HEAD once per batch (`--batch-entries`), so an
         /// interrupted run keeps every earlier batch and a rerun skips the
         /// parts they indexed; a part with an entry whose ranged GET failed
-        /// gains no ref and is read again by a rerun (`parts_deferred`). Needs
-        /// no `--key-index-leaves` (and refuses it), holds no claim and seals
+        /// gains no ref and is read again by a rerun (`parts_deferred`).
+        /// Refuses `--key-index-leaves` and `--no-key-index-leaves`: the
+        /// rebuild builds leaves whatever the fold switch, holds no claim and seals
         /// no hour, so `--writers-stopped` changes nothing here. Applies to
         /// `--signal spans`, to a logs tenant that declares a key-index
         /// field (a logs tenant that declares none is refused), and to
         /// `--signal metrics` (refused with `--no-metrics-label-index`),
         /// where the ranged reads are of LABEL_DICT instead of KEY_IDX.
-        #[arg(long, conflicts_with_all = ["key_index_leaves", "max_flush_lifetime"])]
+        #[arg(long, conflicts_with_all = ["key_index_leaves_on", "key_index_leaves",
+                                          "max_flush_lifetime"])]
         rebuild_key_index: bool,
         /// With `--rebuild-key-index`, rebuild only this field. Refused unless
         /// the tenant declares it (`trace_id` for spans; a logs tenant's
@@ -5596,36 +5614,55 @@ mod tests {
         assert!(scope_set("none").is_err());
     }
 
-    /// `catalog fold --key-index-leaves` is off unless passed (ADR-2707
-    /// decision 4).
+    /// `catalog fold` builds key-index leaves by default (issue #3927,
+    /// ADR-3939 decision 4): the resolved switch is on with no flag and with
+    /// `--key-index-leaves`, off with `--no-key-index-leaves`, and the two
+    /// together are refused.
     #[test]
-    fn catalog_fold_key_index_leaves_is_off_unless_passed() {
-        let parse = |extra: &[&str]| {
+    fn catalog_fold_key_index_leaves_is_on_by_default_with_an_opt_out() {
+        let try_parse = |extra: &[&str]| {
             let argv = ["ravel", "catalog", "fold", "--tenant", "acme"]
                 .iter()
                 .chain(extra)
                 .copied()
                 .collect::<Vec<_>>();
-            let Command::Catalog {
-                command:
-                    super::CatalogCommand::Fold {
-                        key_index_leaves, ..
-                    },
-            } = Cli::try_parse_from(argv)
-                .expect("a catalog fold invocation parses")
-                .command
-            else {
-                panic!("expected the catalog fold subcommand");
-            };
-            key_index_leaves
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Command::Catalog {
+                    command:
+                        super::CatalogCommand::Fold {
+                            key_index_leaves, ..
+                        },
+                } => key_index_leaves,
+                _ => panic!("expected the catalog fold subcommand"),
+            })
         };
-        assert!(!parse(&[]), "the leaf build is off by default");
-        assert!(parse(&["--key-index-leaves"]), "the flag turns it on");
+        assert!(
+            try_parse(&[]).expect("a plain fold parses"),
+            "the leaf build is on by default"
+        );
+        assert!(
+            try_parse(&["--key-index-leaves"]).expect("the switch still parses"),
+            "--key-index-leaves states the default"
+        );
+        assert!(
+            !try_parse(&["--no-key-index-leaves"]).expect("the opt-out parses"),
+            "--no-key-index-leaves turns the build off"
+        );
+        let err = try_parse(&["--key-index-leaves", "--no-key-index-leaves"])
+            .expect_err("the switch and its opt-out together must be refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let message = err.to_string();
+        assert!(
+            message.contains("--key-index-leaves") && message.contains("--no-key-index-leaves"),
+            "the refusal must name both flags, got: {message}"
+        );
     }
 
     /// `catalog fold --key-index-build-max-pairs` (ADR-3692 decision 5)
-    /// defaults to 8,000,000, refuses 0 at parse time, and is refused
-    /// without `--key-index-leaves`, the build it bounds.
+    /// defaults to 8,000,000, refuses 0 at parse time, is accepted with no
+    /// leaf flag (the build is on by default) and beside
+    /// `--key-index-leaves`, and is refused with `--no-key-index-leaves`,
+    /// which turns off the build it bounds, and with `--rebuild-key-index`.
     #[test]
     fn catalog_fold_key_index_build_max_pairs_flag() {
         let try_parse = |extra: &[&str]| {
@@ -5651,18 +5688,34 @@ mod tests {
             "the default budget is 8,000,000 pairs"
         );
         assert_eq!(
+            try_parse(&["--key-index-build-max-pairs", "1000"])
+                .expect("a budget with the default leaf build parses"),
+            1000
+        );
+        assert_eq!(
             try_parse(&["--key-index-leaves", "--key-index-build-max-pairs", "1000"])
                 .expect("a budget beside the leaf build parses"),
             1000
         );
         assert!(
-            try_parse(&["--key-index-leaves", "--key-index-build-max-pairs", "0"]).is_err(),
+            try_parse(&["--key-index-build-max-pairs", "0"]).is_err(),
             "a budget of 0 is refused"
         );
-        assert!(
-            try_parse(&["--key-index-build-max-pairs", "1000"]).is_err(),
-            "the budget is refused without --key-index-leaves"
-        );
+        for extra in [
+            &[
+                "--no-key-index-leaves",
+                "--key-index-build-max-pairs",
+                "1000",
+            ][..],
+            &["--rebuild-key-index", "--key-index-build-max-pairs", "1000"][..],
+        ] {
+            let err = try_parse(extra).expect_err("the budget is refused here");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{extra:?}"
+            );
+        }
     }
 
     /// `catalog fold --retention-default` is unset by default, parses a
@@ -5718,8 +5771,8 @@ mod tests {
 
     /// `catalog fold --no-metrics-label-index` (the ADR-3694 Stage 1
     /// acceptance amendment) is not passed by default, so the metrics label
-    /// index is on, and the opt-out parses alone, beside `--key-index-leaves`
-    /// and beside `--rebuild-key-index`
+    /// index is on, and the opt-out parses alone, beside `--key-index-leaves`,
+    /// beside `--no-key-index-leaves` and beside `--rebuild-key-index`
     /// (`tests/catalog_fold_metrics_label_index.rs` runs each).
     #[test]
     fn catalog_fold_metrics_label_index_flag() {
@@ -5742,6 +5795,11 @@ mod tests {
         };
         assert!(!parse(&[]), "the metrics leaf is on by default");
         assert!(!parse(&["--key-index-leaves"]));
+        assert!(!parse(&["--no-key-index-leaves"]));
+        assert!(parse(&[
+            "--no-key-index-leaves",
+            "--no-metrics-label-index"
+        ]));
         assert!(!parse(&["--rebuild-key-index"]));
         assert!(parse(&["--no-metrics-label-index"]));
         assert!(parse(&["--key-index-leaves", "--no-metrics-label-index"]));
@@ -5750,7 +5808,8 @@ mod tests {
 
     /// `catalog fold --rebuild-key-index` (ADR-2707 decision 4): `--field`
     /// and `--batch-entries` are refused without it, it is refused beside
-    /// `--key-index-leaves` and `--max-flush-lifetime`, and it accepts
+    /// `--key-index-leaves`, `--no-key-index-leaves` and
+    /// `--max-flush-lifetime`, and it accepts
     /// `--writers-stopped`. `--batch-entries` defaults to 250,000 and refuses
     /// 0 at parse time.
     #[test]
@@ -5804,6 +5863,10 @@ mod tests {
             ),
             (
                 &["--rebuild-key-index", "--key-index-leaves"],
+                clap::error::ErrorKind::ArgumentConflict,
+            ),
+            (
+                &["--rebuild-key-index", "--no-key-index-leaves"],
                 clap::error::ErrorKind::ArgumentConflict,
             ),
             (

@@ -317,9 +317,9 @@ under the `keyIndex` entry of `stats.phases`.
 
 ### Key-index leaves
 
-When the catalog is folded with key-index leaves (`ravel-server
---fold-key-index-leaves`, or `ravel-cli catalog fold --key-index-leaves`),
-each folded part also carries a small index of the trace ids its objects
+When the catalog is folded with key-index leaves (the default of
+`ravel-server` and `ravel-cli catalog fold`; `--no-fold-key-index-leaves`
+and `--no-key-index-leaves` turn the build off), each folded part also carries a small index of the trace ids its objects
 hold. A `trace_id =` lookup reads two ranged GETs of that index per part,
 then opens only the objects that hold the trace, each at the blocks the
 index names, without reading their KEY_IDX. Objects of the part that do not

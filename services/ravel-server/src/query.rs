@@ -2545,16 +2545,24 @@ mod catalog_cache_tests {
         );
     }
 
-    /// `--fold-key-index-leaves` reaches the catalog both the scheduled and
-    /// the on-demand fold run with, and the leaf build stays off without it.
+    /// The key-index leaf switch ravel-server's command line resolves reaches
+    /// the catalog both the scheduled and the on-demand fold run with: on
+    /// with no flag (issue #3927) and with `--fold-key-index-leaves`, off with
+    /// `--no-fold-key-index-leaves`. Driven from the parsed `Cli` through
+    /// `Cli::fold_task_config`, the mapping `main.rs` uses, so a default that
+    /// changed only on the clap struct would fail here.
     #[test]
     fn build_catalog_for_server_maps_the_key_index_leaf_switch() {
-        for enabled in [false, true] {
+        for (flags, enabled) in [
+            (&[][..], true),
+            (&["--fold-key-index-leaves"][..], true),
+            (&["--no-fold-key-index-leaves"][..], false),
+        ] {
+            let mut args = vec!["ravel-server", "--mode", "maintain"];
+            args.extend_from_slice(flags);
+            let cli = crate::Cli::parse_validated_from(args).expect("flags parse");
             let config = crate::ServerConfig {
-                fold: crate::FoldTaskConfig {
-                    build_key_index_leaves: enabled,
-                    ..crate::FoldTaskConfig::default()
-                },
+                fold: cli.fold_task_config(),
                 cpu_gate_permits: Default::default(),
                 ..server_config()
             };
@@ -2564,12 +2572,12 @@ mod catalog_cache_tests {
             assert_eq!(
                 catalog.config().build_key_index_leaves,
                 enabled,
-                "the fold's key-index leaf switch must reach the server catalog"
+                "{flags:?}: the resolved key-index leaf switch must reach the server catalog"
             );
         }
         assert!(
             !crate::FoldTaskConfig::default().build_key_index_leaves,
-            "the leaf build is off by default"
+            "the library default stays off; the binary's default comes from its command line"
         );
     }
 

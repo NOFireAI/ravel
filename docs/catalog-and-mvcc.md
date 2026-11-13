@@ -918,13 +918,16 @@ build and HEAD attachment, and the sweep's `kidx` kind are implemented: the
 fold (the server's scheduled and on-demand fold and `ravel-cli catalog
 fold`) can write leaves for logs and spans, and for metrics with a second
 switch (the `label_value` leaf, below). The leaf build is behind a
-switch that is off by default (`CatalogConfig::build_key_index_leaves`,
-`ravel-server --fold-key-index-leaves`, `ravel-cli catalog fold
---key-index-leaves`). ADR-3692's Stage 1 amendment measured it on real
-S3 and kept it off for both signals. Logs missed the leaf-bytes row, and
-an advancing fold's passes, held previous leaf bytes and rewritten leaf
-bytes grow with the tail. The default is reconsidered once the advance
-is bounded by the new hour. Every process that runs a fold for a tenant
+switch, `CatalogConfig::build_key_index_leaves`. The library default stays
+off, but both binaries that fold turn it on unless told otherwise:
+`ravel-server` builds leaves unless `--no-fold-key-index-leaves` is given,
+and `ravel-cli catalog fold` unless `--no-key-index-leaves` is given
+(`--fold-key-index-leaves` and `--key-index-leaves` are still accepted and
+change nothing). ADR-3692's Stage 1 amendment measured the build on real
+S3 and kept it off for both signals; the day seal (below, ADR-3939) bounds
+an advance by the tail's day rather than the whole history, and the
+binaries' default turned on with it. The switch is one per process, so a
+metrics fold builds the `label_value` leaf by default as well. Every process that runs a fold for a tenant
 (a maintain-mode process, and a query-mode process serving on-demand
 folds) MUST agree on the switch, since the switch also governs the
 partition (the day seal below, and "Rollout of the day seal"): a fold
@@ -937,6 +940,27 @@ whichever part carries them
 (`key_index_switch_off_over_leaves_reads_a_non_tail_part`). The query path ("Reader") probes the
 leaves for a spans `trace_id` lookup and for a logs scan's declared-key
 equality, once per scan (docs/query-engine.md, "Tier-2 router").
+
+<a id="upgrading-to-the-default-leaf-build"></a>
+**Upgrading to the default leaf build.** A deployment that folded with the
+switch off (the earlier default) turns it on by upgrading, unless every
+folder passes the opt-out. The first fold with the switch on re-partitions
+the tenant's whole retained history into UTC-day parts and builds every
+day's leaves: a one-time rebuild whose cost "Rollout of the day seal"
+(below) states, about 39.2 GB of leaves over about 750 passes for a 30-day
+logs tenant. Later advances build leaves only for the tail and for days a
+late record changed. Before the upgrade, every process that folds a tenant
+(each `ravel-server --mode maintain` process, a `--mode query` or
+`--mode all` process serving on-demand folds, and any scheduled or manual
+`ravel-cli catalog fold`) MUST run a version with this default, and all of
+them MUST agree on the switch: either all of them build leaves, or all of
+them pass the opt-out (`--no-fold-key-index-leaves`,
+`--no-key-index-leaves`). A folder left on the switch-off side re-partitions
+the tenant by entry count on each of its folds, drops the leaf refs of
+every part it re-encodes, sets `key_index_switch_off_over_leaves` and logs
+the switch-disagreement warning, and the next switch-on fold rebuilds those
+days again. A logs tenant that declares no key-index field builds no leaf
+either way, but still gets the day seal.
 
 **Day seal (ADR-3939 decisions 1 and 2).** With `build_key_index_leaves`
 on, the fold's sealing policy (ADR-0063 section 1: a part seals at an
@@ -1255,7 +1279,8 @@ every entry and tail object outside the shard `shard_for_span` selects for
 that hour's generation (ADR-0052). These probes are their own cost phase
 (`keyIndex` under `stats.phases`) and are never pooled into a scan counter.
 
-**Fold.** With the switch off (the default), the fold reads no footer or
+**Fold.** With the switch off (`--no-fold-key-index-leaves`,
+`--no-key-index-leaves`), the fold reads no footer or
 KEY_IDX section, writes no leaf, and re-encodes every part it re-encodes
 without `key_index` refs, dropping any the part carried; a part carried
 forward by reference keeps its refs unchanged. The sweep does not read the
@@ -1384,8 +1409,9 @@ those three. All five are zero with the switch off.
 KEY_IDX section; their tier-1 source is LABEL_DICT
 (docs/segment-format.md), read whole by
 `ravel_segment::label_dict_strings`. With `build_key_index_leaves` and
-`CatalogConfig::metrics_label_index` both on (`ravel-cli catalog fold
---key-index-leaves`, or `ravel-server --fold-key-index-leaves`: the second
+`CatalogConfig::metrics_label_index` both on (the default of `ravel-cli
+catalog fold` and of `ravel-server`, unless `--no-key-index-leaves` or
+`--no-fold-key-index-leaves` turns the first off; the second
 switch is on by default, ADR-3694's Stage 1 acceptance amendment, and
 `--no-metrics-label-index` or `--no-fold-metrics-label-index` turns it
 off), the metrics fold builds one
@@ -1902,7 +1928,8 @@ their `.csnap` baselines are untouched, so none of the fold's per-part
 machinery runs: no content-hash carry-forward, no dirty-hour reconcile,
 no column-stats baseline, no part, `.csnap` or `.cstat` PUT, no window
 LIST. It runs regardless of `build_key_index_leaves`, and the CLI refuses
-it beside `--key-index-leaves` and `--max-flush-lifetime`. A logs tenant
+it beside `--key-index-leaves`, `--no-key-index-leaves` and
+`--max-flush-lifetime`. A logs tenant
 that declares no key-index field, or has no tenant config, is refused
 before HEAD is read, with a typed error naming the tenant
 (`KeyIndexRebuildError::NoFieldDeclared`). It publishes

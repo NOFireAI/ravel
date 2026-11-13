@@ -2175,8 +2175,9 @@ object written before keeps its own field list, and
 
 ### Key-index leaf build budget
 
-With `--fold-key-index-leaves` on, the fold builds per-part key-index
-leaves from the KEY_IDX sections. The tail part is re-encoded on every fold
+By default the fold builds per-part key-index leaves from the KEY_IDX
+sections; `--no-fold-key-index-leaves` (ravel-server) and
+`--no-key-index-leaves` (`ravel-cli catalog fold`) turn the build off. The tail part is re-encoded on every fold
 that advances the watermark, and its build takes the entries the previous
 tail's leaves already cover from those leaves, one GET per leaf, and reads
 the sections of the new entries and of the entries those leaves left
@@ -2193,8 +2194,9 @@ up to N more: the LABEL_DICT pairs
 of objects its postings build fetched whole, only for the parts it builds a
 leaf for, each part's pairs released once its leaf is built. Every field the
 build indexes gets a fixed share, `max(1, N / fields)`. Each flag is
-refused without its leaf build flag (`--fold-key-index-leaves`,
-`--key-index-leaves`) and at 0; the default is 8,000,000. A part over the
+refused beside its leaf build opt-out (`--no-fold-key-index-leaves`,
+`--no-key-index-leaves`) and at 0, and the CLI flag beside
+`--rebuild-key-index`; the default is 8,000,000. A part over the
 budget is built in passes over disjoint key8 ranges, each pass reading the
 sections it needs again and closing its leaf slices before the next, so a
 smaller budget trades memory for section reads and leaves. One key8's
@@ -2219,7 +2221,7 @@ flag, since it runs no fold. The fold report and `/metrics` count the work
 in `key_index_sections_read`, `key_index_entries_carried`,
 `key_index_build_passes` and `key_index_leaf_gets`.
 
-`--fold-key-index-leaves` stays off by default. An advancing fold reads
+The leaf build is on by default. An advancing fold reads
 the sections of the new entries and of the entries still uncovered, but it
 reads them once per pass. It also reads every previous leaf with one GET
 each, holds those bytes in memory outside the pair budget, and rewrites
@@ -2241,24 +2243,50 @@ advance:
 
 The previous leaf bytes held in memory are about the leaf bytes rewritten,
 so peak memory grows by about that much over the 25-hour figure. These
-are projections from the pass rule, not measurements. Before turning the
-flag on for a tenant whose tail lives longer than about a day, size the
-fold's memory for its tail's leaf bytes, and its request budget for the
-section GETs.
+are projections from the pass rule, not measurements. The day seal splits
+the tail at each UTC day, so a tail holds at most the latest day's entries
+once the history is sealed; the first fold with the build on pays the
+whole history once (see "Turning the leaf build on" below). Size the fold's
+memory for the tail's leaf bytes, and its request budget for the section
+GETs.
+
+### Turning the leaf build on
+
+Upgrading to a version that builds key-index leaves by default turns the
+build on for every folder that does not pass the opt-out. The first fold
+with the build on re-partitions each tenant's whole retained history into
+UTC-day parts and builds every day's leaves, a one-time rebuild; for a
+30-day logs tenant that one fold writes about 39 GB of leaves. Later
+folds build leaves only for the tail and for days a late record changed.
+
+Every process that folds a tenant must run the new version before the
+upgrade takes effect, and all of them must agree on the switch: every
+`ravel-server --mode maintain` process, every `--mode query` or
+`--mode all` process that serves on-demand folds, and any scheduled or
+manual `ravel-cli catalog fold`. A folder with the build off re-partitions
+the tenant again on each of its folds, drops the leaves of every part it
+re-encodes, sets `key_index_switch_off_over_leaves` in its fold report and
+logs a warning, and the next fold with the build on rebuilds those days.
+To keep the build off, pass `--no-fold-key-index-leaves` to every server
+and `--no-key-index-leaves` to every `ravel-cli catalog fold`. The
+[catalog spec](../../catalog-and-mvcc.md#upgrading-to-the-default-leaf-build)
+states the rule and the cost.
 
 ### Metrics label-value leaves
 
-With `--fold-key-index-leaves` (ravel-server) or `--key-index-leaves`
-(`ravel-cli catalog fold`), every fold, scheduled and on-demand, also
-builds the metrics `label_value` leaf from each metrics object's
+With the leaf build on (the default; `--no-fold-key-index-leaves` for
+ravel-server and `--no-key-index-leaves` for `ravel-cli catalog fold` turn
+it off), every fold, scheduled and on-demand, also builds the metrics
+`label_value` leaf from each metrics object's
 LABEL_DICT by default. `--no-fold-metrics-label-index` (ravel-server) and
-`--no-metrics-label-index` (`ravel-cli catalog fold`) turn it off. Without
-the leaf build flag no leaf is built and the opt-out changes nothing; the
+`--no-metrics-label-index` (`ravel-cli catalog fold`) turn it off. With
+the leaf build off no leaf is built and the opt-out changes nothing; the
 server refuses the opt-out in `--mode gateway`, which runs no fold. While a
 tenant has a pending metrics erasure the fold writes no metrics leaf.
 
-An operator already running `--fold-key-index-leaves` for logs or spans
-starts building metrics leaves on upgrade. The first fold with the leaf on
+The leaf build is one switch per process, so a folder that builds logs or
+spans leaves, by default or through `--fold-key-index-leaves`, also builds
+metrics leaves. The first fold with the leaf on
 reads each metrics object's footer and LABEL_DICT: the Stage 1 acceptance
 measurement counted 202,931 GETs for 25,401 objects, about 8
 per object, and leaf bytes of 0.77 % of the re-encoded parts' data bytes.
