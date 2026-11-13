@@ -19,6 +19,12 @@
 //!   `(2^bits + 1) x b(c) <= S - table(bits)`: the open chunks and the
 //!   read-back chunk take what the table leaves.
 //!
+//! A route with a string or binary column (ADR-4143 decision 3) budgets
+//! its chunks in bytes instead: `b(1024)` above is `B_min`, 16 KiB, and the
+//! derivation returns `routed_chunk_bytes`, `B = floor((S - table(bits)) /
+//! (2^bits + 1))`, with `routed_chunk_rows` at 8192, the row count at which
+//! such a chunk seals whatever its bytes.
+//!
 //! Any condition in [`NoTuning`] keeps the retry's sort-merge plan.
 
 use std::sync::Arc;
@@ -43,7 +49,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
 use crate::bucketed_final_aggregate::{
-    BUCKETED_FINAL_AGGREGATE_MAX_BITS, BucketedFinalAggregateExec, routed_types,
+    BUCKETED_FINAL_AGGREGATE_MAX_BITS, BucketedFinalAggregateExec, RoutedLayout, routed_types,
 };
 use crate::config::BucketedFinalAggregation;
 use crate::logs_scan::LogsScanExec;
@@ -56,6 +62,11 @@ pub const BUCKET_SPILL_MAX_CHUNK_ROWS: usize = 8192;
 /// The smallest `routed_chunk_rows` the derivation returns; below it the
 /// retry keeps its sort-merge plan.
 pub const BUCKET_SPILL_MIN_CHUNK_ROWS: usize = 1024;
+
+/// `B_min`: the smallest byte budget the derivation gives a chunk on a route
+/// with a string or binary column (ADR-4143 decision 3). It stands in for
+/// `b(1024)` in the `bits` condition.
+pub const BUCKET_SPILL_MIN_CHUNK_BYTES: usize = 16 * 1024;
 
 /// The first attempt's and the retry plan's figures the derivation reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +86,11 @@ pub struct BucketSpillInputs {
     /// `L`: the per-query memory limit.
     pub query_limit: usize,
     /// The routed columns' fixed widths in bytes, keys then state; `w` is
-    /// their sum.
+    /// their sum. A string or binary column counts its 16-byte view.
     pub column_widths: Vec<usize>,
+    /// Whether a routed column is a string or binary type, so the chunks are
+    /// budgeted in bytes.
+    pub variable_width: bool,
     /// The soft `RLIMIT_NOFILE` read once at server start.
     pub nofile_soft: u64,
     /// `slots`: how many retries can hold scratch at once
@@ -89,6 +103,9 @@ pub struct BucketSpillInputs {
 pub struct BucketSpillTuning {
     pub bits: u8,
     pub routed_chunk_rows: usize,
+    /// `B`, each chunk's byte budget, on a route with a string or binary
+    /// column; `None` on a fixed-width route.
+    pub routed_chunk_bytes: Option<usize>,
     /// `2 x P x 2^bits + P`, the descriptors one retry can hold open.
     pub descriptor_need: u64,
 }
@@ -107,7 +124,7 @@ pub enum NoTuning {
     NoExactTotal,
     /// The plan holds a node the `C` table does not list.
     UnlistedNode(String),
-    /// A routed column is not fixed width.
+    /// A routed column is neither fixed width nor a string or binary type.
     NotFixedWidth,
     /// A figure is zero or does not fit the arithmetic (`P`, `C`, `w`, or a
     /// share `L - H` of nothing).
@@ -226,8 +243,12 @@ pub fn derive_bucket_spill_tuning(
         .checked_mul(inputs.partitions as u128)
         .map(|divisor| (numerator / 4).div_ceil(divisor))
         .ok_or(NoTuning::Degenerate)?;
-    let floor_chunk = routed_chunk_charge(&inputs.column_widths, BUCKET_SPILL_MIN_CHUNK_ROWS)
-        .map(|charge| charge as u128);
+    let floor_chunk = if inputs.variable_width {
+        Some(BUCKET_SPILL_MIN_CHUNK_BYTES as u128)
+    } else {
+        routed_chunk_charge(&inputs.column_widths, BUCKET_SPILL_MIN_CHUNK_ROWS)
+            .map(|charge| charge as u128)
+    };
     let mut bits: u8 = 0;
     let table = loop {
         // A `2^b x unit` past u128 exceeds every u128 numerator: the table fits.
@@ -252,6 +273,10 @@ pub fn derive_bucket_spill_tuning(
     let per_chunk = (share - table) / ((1usize << bits) + 1);
     let mut rows = 0;
     let (mut low, mut high) = (1usize, BUCKET_SPILL_MAX_CHUNK_ROWS);
+    if inputs.variable_width {
+        rows = BUCKET_SPILL_MAX_CHUNK_ROWS;
+        high = 0;
+    }
     while low <= high {
         let mid = low + (high - low) / 2;
         match routed_chunk_charge(&inputs.column_widths, mid) {
@@ -274,6 +299,7 @@ pub fn derive_bucket_spill_tuning(
     Ok(BucketSpillTuning {
         bits,
         routed_chunk_rows: rows,
+        routed_chunk_bytes: inputs.variable_width.then_some(per_chunk),
         descriptor_need,
     })
 }
@@ -285,8 +311,11 @@ pub struct BucketSpillPlanShape {
     pub partitions: usize,
     /// `C`, counted from the `C` table over every node.
     pub spill_consumers: usize,
-    /// The routed columns' widths, keys then state.
+    /// The routed columns' widths, keys then state; 16 for a string or
+    /// binary column's view.
     pub column_widths: Vec<usize>,
+    /// Whether a routed column is a string or binary type.
+    pub variable_width: bool,
     /// `N`: the checked `sample_count` sum of the one `LogsScanExec`.
     pub total_rows: Option<u64>,
 }
@@ -305,12 +334,19 @@ impl BucketSpillPlanShape {
         let partitions = exec.properties().partitioning.partition_count();
         let input = exec.aggregate().input();
         // A routed type that does not resolve has no width either.
-        let column_widths = routed_types(exec.aggregate())
+        let layouts = routed_types(exec.aggregate())
             .ok()
             .and_then(Result::ok)
-            .ok_or(NoTuning::NotFixedWidth)?
+            .ok_or(NoTuning::NotFixedWidth)?;
+        let variable_width = layouts
+            .iter()
+            .any(|(_, layout)| !matches!(layout, RoutedLayout::Fixed(_)));
+        let column_widths = layouts
             .into_iter()
-            .map(|(_, width)| width)
+            .map(|(_, layout)| match layout {
+                RoutedLayout::Fixed(width) => width,
+                RoutedLayout::Offsets(_) | RoutedLayout::Views => 16,
+            })
             .collect();
         let mut leaves = Vec::new();
         collect_leaves(input, &mut leaves);
@@ -324,6 +360,7 @@ impl BucketSpillPlanShape {
             partitions,
             spill_consumers,
             column_widths,
+            variable_width,
             total_rows: scan.sample_count_total(),
         })
     }
@@ -430,6 +467,7 @@ pub fn bucket_retry_derivation(
         spill_consumers: shape.spill_consumers,
         query_limit: figures.query_limit,
         column_widths: shape.column_widths,
+        variable_width: shape.variable_width,
         nofile_soft: figures.nofile_soft,
         slots: figures.slots,
     })
@@ -439,7 +477,7 @@ pub fn bucket_retry_derivation(
 }
 
 /// `plan` with every [`BucketedFinalAggregateExec`] rebuilt at `tuning`'s
-/// `bits` and `routed_chunk_rows`, with spill on, keeping its
+/// `bits`, `routed_chunk_rows` and `routed_chunk_bytes`, with spill on, keeping its
 /// `engage_groups` and per-bucket top-k.
 pub fn with_bucket_spill_tuning(
     plan: Arc<dyn ExecutionPlan>,
@@ -452,6 +490,9 @@ pub fn with_bucket_spill_tuning(
         let config = BucketedFinalAggregation {
             bits: tuning.bits,
             routed_chunk_rows: tuning.routed_chunk_rows,
+            routed_chunk_bytes: tuning
+                .routed_chunk_bytes
+                .unwrap_or(exec.config().routed_chunk_bytes),
             ..exec.config()
         };
         let tuned = BucketedFinalAggregateExec::new(Arc::clone(exec.aggregate()), config)
@@ -599,6 +640,7 @@ mod tests {
             spill_consumers: box6a.partial + 16 + 16,
             query_limit: box6a.query_limit,
             column_widths: Q33_WIDTHS.to_vec(),
+            variable_width: false,
             nofile_soft,
             slots: spill_slots(box6a.spill_max),
         }
@@ -614,6 +656,7 @@ mod tests {
             Ok(BucketSpillTuning {
                 bits: 4,
                 routed_chunk_rows: 8192,
+                routed_chunk_bytes: None,
                 descriptor_need: 528,
             })
         );
@@ -628,6 +671,7 @@ mod tests {
             Ok(BucketSpillTuning {
                 bits: 5,
                 routed_chunk_rows: 8192,
+                routed_chunk_bytes: None,
                 descriptor_need: 1040,
             })
         );
@@ -646,6 +690,7 @@ mod tests {
             BucketSpillTuning {
                 bits: 6,
                 routed_chunk_rows: 3336,
+                routed_chunk_bytes: None,
                 descriptor_need: 2064,
             }
         );
@@ -673,6 +718,7 @@ mod tests {
             spill_consumers: 40,
             query_limit: 1_461_083_554,
             column_widths: Q33_WIDTHS.to_vec(),
+            variable_width: false,
             nofile_soft: 8320,
             slots: 1,
         };
@@ -681,6 +727,7 @@ mod tests {
             Ok(BucketSpillTuning {
                 bits: 7,
                 routed_chunk_rows: 2452,
+                routed_chunk_bytes: None,
                 descriptor_need: 4112,
             })
         );
@@ -707,6 +754,7 @@ mod tests {
             spill_consumers: 40,
             query_limit: 1_461_083_554,
             column_widths: Q33_WIDTHS.to_vec(),
+            variable_width: false,
             nofile_soft: 524_288,
             slots: 1,
         };
@@ -727,6 +775,7 @@ mod tests {
             Ok(BucketSpillTuning {
                 bits: 8,
                 routed_chunk_rows: 1232,
+                routed_chunk_bytes: None,
                 descriptor_need: 8208,
             })
         );
@@ -752,6 +801,7 @@ mod tests {
             Ok(BucketSpillTuning {
                 bits: 7,
                 routed_chunk_rows: 1024,
+                routed_chunk_bytes: None,
                 descriptor_need: 4112,
             })
         );
@@ -763,6 +813,7 @@ mod tests {
             Ok(BucketSpillTuning {
                 bits: 8,
                 routed_chunk_rows: 1024,
+                routed_chunk_bytes: None,
                 descriptor_need: 8208,
             })
         );
@@ -796,6 +847,7 @@ mod tests {
                 spill_consumers: 1,
                 query_limit: (64 << 20) + share,
                 column_widths: vec![8],
+                variable_width: false,
                 nofile_soft: 524_288,
                 slots: 1,
             })
@@ -811,6 +863,7 @@ mod tests {
             Ok(BucketSpillTuning {
                 bits: 0,
                 routed_chunk_rows: 4096,
+                routed_chunk_bytes: None,
                 descriptor_need: 9,
             })
         );
@@ -819,6 +872,7 @@ mod tests {
             Ok(BucketSpillTuning {
                 bits: 2,
                 routed_chunk_rows: 4096,
+                routed_chunk_bytes: None,
                 descriptor_need: 9,
             })
         );
@@ -827,6 +881,7 @@ mod tests {
             Ok(BucketSpillTuning {
                 bits: 1,
                 routed_chunk_rows: 1496,
+                routed_chunk_bytes: None,
                 descriptor_need: 15,
             })
         );
@@ -917,6 +972,7 @@ mod tests {
             spill_consumers: 1,
             query_limit: usize::MAX,
             column_widths: vec![usize::MAX],
+            variable_width: false,
             nofile_soft: u64::MAX,
             slots: u64::MAX,
         };

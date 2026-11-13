@@ -6210,6 +6210,7 @@ impl FirstRefusal {
             retry_plan_reason,
             bits: tuning.map(|tuning| tuning.bits),
             routed_chunk_rows: tuning.map(|tuning| tuning.routed_chunk_rows),
+            routed_chunk_bytes: tuning.and_then(|tuning| tuning.routed_chunk_bytes),
             spill_bytes_written: spill.bytes_written,
             spill_bytes_read: spill.bytes_read,
             spill_files: spill.files,
@@ -6278,6 +6279,10 @@ pub struct SpillRetryReport {
     /// The bucketed retry's derived `routed_chunk_rows`; `None` for
     /// `sort_merge`.
     pub routed_chunk_rows: Option<usize>,
+    /// The bucketed retry's derived chunk byte budget `B`, on a route with a
+    /// string or binary column (ADR-4143 decision 3); `None` for a
+    /// fixed-width route and for `sort_merge`.
+    pub routed_chunk_bytes: Option<usize>,
     /// [`SpillCounts::bytes_written`] of the retry, over every operator.
     pub spill_bytes_written: u64,
     /// [`SpillCounts::bytes_read`] of the retry: `None` on DataFusion 55,
@@ -6372,6 +6377,7 @@ impl SpillRetryReport {
             routed_chunk_rows = self
                 .routed_chunk_rows
                 .map_or_else(|| "none".to_string(), |rows| rows.to_string()),
+            routed_chunk_bytes = or_none(self.routed_chunk_bytes),
             exchange_spill_bytes_written = self.exchange_spill_bytes_written,
             exchange_spill_files = self.exchange_spill_files,
             bucket_spill_bytes_written = self.bucket_spill_bytes_written,
@@ -10207,6 +10213,7 @@ pub(crate) mod tests {
                 ("retry_plan_reason", "none"),
                 ("bits", "4"),
                 ("routed_chunk_rows", "2048"),
+                ("routed_chunk_bytes", "262144"),
                 ("exchange_spill_bytes_written", "1024"),
                 ("exchange_spill_files", "1"),
                 ("bucket_spill_bytes_written", "3072"),
@@ -10253,6 +10260,7 @@ pub(crate) mod tests {
                 ("retry_plan_reason", "descriptor_budget"),
                 ("bits", "none"),
                 ("routed_chunk_rows", "none"),
+                ("routed_chunk_bytes", "none"),
                 ("exchange_spill_bytes_written", "0"),
                 ("exchange_spill_files", "0"),
                 ("bucket_spill_bytes_written", "0"),
@@ -10295,6 +10303,7 @@ pub(crate) mod tests {
                 ("retry_plan_reason", "not_planned"),
                 ("bits", "none"),
                 ("routed_chunk_rows", "none"),
+                ("routed_chunk_bytes", "none"),
                 ("exchange_spill_bytes_written", "0"),
                 ("exchange_spill_files", "0"),
                 ("bucket_spill_bytes_written", "0"),
@@ -10358,6 +10367,7 @@ pub(crate) mod tests {
             Some(RetryPlan::Bucket(BucketSpillTuning {
                 bits: 4,
                 routed_chunk_rows: 2048,
+                routed_chunk_bytes: Some(262_144),
                 descriptor_need: 66,
             })),
             Some(BucketSpillFigures {
@@ -10433,6 +10443,7 @@ pub(crate) mod tests {
         let tuning = BucketSpillTuning {
             bits: 4,
             routed_chunk_rows: 8192,
+            routed_chunk_bytes: None,
             descriptor_need: 66,
         };
         let report = first.report(

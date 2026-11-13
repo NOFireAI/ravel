@@ -476,6 +476,7 @@ async fn answers_match_the_stock_final_at_1_4_and_32_partitions() {
             engage_groups: ENGAGE_GROUPS,
             bits: 6,
             routed_chunk_rows: 64,
+            routed_chunk_bytes: 1 << 20,
         };
         let on = executor(ROWS, sql_config(partitions, Some(tuning), None)).await;
         let off = executor(ROWS, sql_config(partitions, None, None)).await;
@@ -709,6 +710,7 @@ async fn peak_asked_bytes_are_lower_than_the_stock_final_on_unique_keys() {
         engage_groups: 4096,
         bits: 6,
         routed_chunk_rows: 1024,
+        routed_chunk_bytes: 1 << 20,
     };
     let on = executor(PEAK_ROWS, sql_config(4, Some(tuning), None)).await;
     let off = executor(PEAK_ROWS, sql_config(4, None, None)).await;
@@ -856,6 +858,7 @@ async fn every_partition_fills_its_buckets_on_unique_keys_at_32_partitions() {
         engage_groups: ENGAGE_GROUPS,
         bits: 6,
         routed_chunk_rows: 256,
+        routed_chunk_bytes: 1 << 20,
     };
     let planned = Planned::new(SAMPLES_SQL, sql_config(PARTITIONS, Some(tuning), None)).await;
     let batches = collect(Arc::clone(&planned.physical), planned.ctx.task_ctx())
@@ -1051,6 +1054,7 @@ async fn a_refused_bucket_grow_fails_the_query_with_resources_exhausted() {
         engage_groups: ENGAGE_GROUPS,
         bits: 6,
         routed_chunk_rows: 4_000_000,
+        routed_chunk_bytes: 1 << 20,
     };
     let mut config = sql_config(4, Some(tuning), None);
     config.max_query_bytes = 16 << 20;
@@ -1100,6 +1104,7 @@ async fn dropping_the_stream_releases_every_bucket() {
         engage_groups: ENGAGE_GROUPS,
         bits: 2,
         routed_chunk_rows: 1024,
+        routed_chunk_bytes: 1 << 20,
     };
     let planned = Planned::new(SAMPLES_SQL, sql_config(PARTITIONS, Some(tuning), None)).await;
     let exec = planned.bucketed();
@@ -1253,6 +1258,7 @@ async fn repeated_and_null_keys_routed_after_engagement_answer_as_the_stock_fina
         engage_groups: 16,
         bits: 6,
         routed_chunk_rows: 64,
+        routed_chunk_bytes: 1 << 20,
     };
     for partitions in [1usize, 4, 32] {
         let on = Planned::with_samples(
@@ -1423,6 +1429,7 @@ async fn per_bucket_topk_is_exact_on_ties() {
             engage_groups: ENGAGE_GROUPS,
             bits: if partitions == 32 { 2 } else { 6 },
             routed_chunk_rows: 64,
+            routed_chunk_bytes: 1 << 20,
         };
         let on = Planned::with_samples(
             TIE_SQL,
@@ -1540,6 +1547,7 @@ async fn per_bucket_topk_feeds_the_sort_at_most_64_times_k_rows_per_partition() 
         engage_groups: ENGAGE_GROUPS,
         bits: 6,
         routed_chunk_rows: 256,
+        routed_chunk_bytes: 1 << 20,
     };
     let planned = Planned::new(Q33_SAMPLES_SQL, sql_config(PARTITIONS, Some(tuning), None)).await;
     let exec = planned.bucketed();
@@ -1589,6 +1597,7 @@ async fn per_bucket_topk_does_not_engage_without_a_fetch_above() {
         engage_groups: ENGAGE_GROUPS,
         bits: 6,
         routed_chunk_rows: 256,
+        routed_chunk_bytes: 1 << 20,
     };
     for sql in statements {
         // The first-groups bound (ADR-3985) would cut the `LIMIT` with no
@@ -1676,6 +1685,7 @@ async fn per_bucket_topk_releases_the_pending_bucket_output() {
         engage_groups: ENGAGE_GROUPS,
         bits: 1,
         routed_chunk_rows: 256,
+        routed_chunk_bytes: 1 << 20,
     };
     let first_batches = |planned: &Planned, exec: Arc<dyn ExecutionPlan>| {
         let task_ctx = planned.ctx.task_ctx();
@@ -2074,6 +2084,7 @@ impl Trigger {
             engage_groups: self.engage_groups,
             bits: self.bits,
             routed_chunk_rows: SPILL_CHUNK_ROWS,
+            routed_chunk_bytes: 1 << 20,
         }
     }
 
@@ -2562,6 +2573,7 @@ async fn bucket_spill_drain_refusal_spills_later_buckets() {
         engage_groups: ENGAGE_GROUPS,
         bits: 2,
         routed_chunk_rows: 256,
+        routed_chunk_bytes: 1 << 20,
     };
     let expected = unspilled_rows(SAMPLES_SQL, PARTITIONS).await;
     // Spilling nothing is too loose; spilling every routed row, or failing,
@@ -2668,6 +2680,7 @@ async fn bucket_spill_plan_shape_reads_the_planned_statement() {
             // over the one scan partition.
             spill_consumers: 5,
             column_widths: vec![8, 8],
+            variable_width: false,
             total_rows: Some(ROWS as u64),
         },
         "{}",
@@ -3467,6 +3480,7 @@ async fn groups_inputs(
         spill_consumers: report.spillable_consumers.expect("C"),
         query_limit,
         column_widths: shape.column_widths,
+        variable_width: false,
         nofile_soft: ravel_sql::DEFAULT_NOFILE_SOFT,
         slots: 1,
     }

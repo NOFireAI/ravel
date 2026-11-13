@@ -128,7 +128,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use datafusion::arrow::array::{
-    Array, ArrayData, ArrayRef, MutableArrayData, UInt32Array, make_array,
+    Array, ArrayData, ArrayRef, AsArray, MutableArrayData, UInt32Array, make_array,
 };
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer};
 use datafusion::arrow::compute::{lexsort_to_indices, take, take_record_batch};
@@ -235,8 +235,10 @@ impl BucketedFinalAggregateRule {
     }
 
     /// Whether `aggregate` qualifies for the bucketed final (ADR-3565
-    /// decision 1's conditions). See the module docs.
-    pub fn admits(aggregate: &AggregateExec) -> bool {
+    /// decision 1's conditions) under a rule built `with_spill(spill)`. A
+    /// string or binary key qualifies only with spill, the refusal retry's
+    /// mode (ADR-4143 decision 3). See the module docs.
+    pub fn admits(aggregate: &AggregateExec, spill: bool) -> bool {
         if *aggregate.mode() != AggregateMode::FinalPartitioned
             || aggregate.limit_options().is_some()
             || *aggregate.input_order_mode() != InputOrderMode::Linear
@@ -257,7 +259,9 @@ impl BucketedFinalAggregateRule {
             return false;
         };
         let keys_qualify = group_schema.fields().iter().all(|field| {
-            field.name() != Aggregate::INTERNAL_GROUPING_ID && is_bucketed_key(field.data_type())
+            field.name() != Aggregate::INTERNAL_GROUPING_ID
+                && (is_bucketed_key(field.data_type())
+                    || spill && variable_width_layout(field.data_type()).is_some())
         });
         keys_qualify
             && aggregate.aggr_expr().iter().all(|aggr| {
@@ -300,7 +304,7 @@ impl BucketedFinalAggregateRule {
         let Some(aggregate) = node.downcast_ref::<AggregateExec>() else {
             return Ok(node);
         };
-        if !Self::admits(aggregate) {
+        if !Self::admits(aggregate, self.spill) {
             return Ok(node);
         }
         let exec = BucketedFinalAggregateExec::new(Arc::new(aggregate.clone()), self.config)
@@ -359,6 +363,32 @@ fn is_bucketed_state(data_type: &DataType) -> bool {
             data_type,
             DataType::Duration(_) | DataType::Decimal128(_, _)
         )
+}
+
+/// How a routed column is laid out in a bucket chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutedLayout {
+    /// `width` bytes per value.
+    Fixed(usize),
+    /// Offsets of `width` bytes (4 or 8) and a data block: Utf8, Binary,
+    /// LargeUtf8 and LargeBinary.
+    Offsets(usize),
+    /// 16-byte views and a data block: Utf8View and BinaryView.
+    Views,
+}
+
+/// The layout of a variable-width routed type, the string and binary types
+/// a retry's key may take (ADR-4143 decision 3); `None` for every other
+/// type.
+fn variable_width_layout(data_type: &DataType) -> Option<RoutedLayout> {
+    match data_type {
+        DataType::Utf8 | DataType::Binary => Some(RoutedLayout::Offsets(size_of::<i32>())),
+        DataType::LargeUtf8 | DataType::LargeBinary => {
+            Some(RoutedLayout::Offsets(size_of::<i64>()))
+        }
+        DataType::Utf8View | DataType::BinaryView => Some(RoutedLayout::Views),
+        _ => None,
+    }
 }
 
 /// The two-phase final aggregate. One child, the replaced aggregate's
@@ -532,6 +562,13 @@ impl DisplayAs for BucketedFinalAggregateExec {
                     self.config.bits.min(BUCKETED_FINAL_AGGREGATE_MAX_BITS),
                     self.config.routed_chunk_rows.max(1),
                 )?;
+                if routes_variable_width(&self.aggregate) {
+                    write!(
+                        f,
+                        ", routed_chunk_bytes={}",
+                        self.config.routed_chunk_bytes.max(1)
+                    )?;
+                }
                 if let Some(topk) = &self.topk {
                     write!(f, ", topk=[{}], k={}", topk.ordering(), topk.fetch())?;
                 }
@@ -712,13 +749,13 @@ impl ColumnChunk {
     }
 }
 
-/// The type and width of every column a final `aggregate`'s stream routes:
-/// its keys, then every accumulator's state, or the first type that is not
-/// fixed width. The bucket spill derivation reads the widths through this
-/// same function.
+/// The type and layout of every column a final `aggregate`'s stream routes:
+/// its keys, then every accumulator's state, or the first type that is
+/// neither fixed width nor a string or binary type. The bucket spill
+/// derivation reads the layouts through this same function.
 pub(crate) fn routed_types(
     aggregate: &AggregateExec,
-) -> DFResult<Result<Vec<(DataType, usize)>, DataType>> {
+) -> DFResult<Result<Vec<(DataType, RoutedLayout)>, DataType>> {
     let input_schema = aggregate.input().schema();
     let group_by = aggregate.group_expr();
     let state_args = aggregate_expressions(
@@ -740,12 +777,497 @@ pub(crate) fn routed_types(
                 .collect::<DFResult<Vec<_>>>()?,
         )
     {
-        let Some(width) = data_type.primitive_width() else {
-            return Ok(Err(data_type));
+        let layout = match data_type.primitive_width() {
+            Some(width) => RoutedLayout::Fixed(width),
+            None => match variable_width_layout(&data_type) {
+                Some(layout) => layout,
+                None => return Ok(Err(data_type)),
+            },
         };
-        types.push((data_type, width));
+        types.push((data_type, layout));
     }
     Ok(Ok(types))
+}
+
+/// Whether a final `aggregate` routes a string or binary column, so its
+/// chunks are budgeted in bytes rather than rows.
+pub(crate) fn routes_variable_width(aggregate: &AggregateExec) -> bool {
+    matches!(
+        routed_types(aggregate),
+        Ok(Ok(types)) if types
+            .iter()
+            .any(|(_, layout)| !matches!(layout, RoutedLayout::Fixed(_)))
+    )
+}
+
+/// The bytes of view or offset a byte-budgeted chunk is charged per row of
+/// a variable-width column: a view's 16, which covers an offset's 4 or 8.
+const VARIABLE_WIDTH_ROW_BYTES: usize = 16;
+
+/// The longest string a view holds inline; a longer one is copied into the
+/// chunk's data block.
+const VIEW_INLINE_BYTES: usize = 12;
+
+/// The bytes a byte-budgeted chunk of `rows` rows holds, `copied[i]` of them
+/// string bytes copied into column `i`'s data block: per column its
+/// validity bitmap, its fixed-width values or
+/// [`VARIABLE_WIDTH_ROW_BYTES`] per row of view or offset, and its copied
+/// bytes, each rounded up to 64 bytes as allocated. `None` past `usize`, or
+/// when a data block passes what its offsets or views can address.
+fn byte_chunk_bytes(layouts: &[RoutedLayout], rows: usize, copied: &[usize]) -> Option<usize> {
+    layouts
+        .iter()
+        .zip(copied)
+        .try_fold(0usize, |acc, (layout, &copied)| {
+            let addressable = match layout {
+                RoutedLayout::Fixed(_) => 0,
+                RoutedLayout::Offsets(width) if *width == size_of::<i32>() => i32::MAX as usize,
+                RoutedLayout::Offsets(_) => i64::MAX as usize,
+                RoutedLayout::Views => u32::MAX as usize,
+            };
+            if copied > addressable {
+                return None;
+            }
+            let per_row = match layout {
+                RoutedLayout::Fixed(width) => *width,
+                RoutedLayout::Offsets(_) | RoutedLayout::Views => VARIABLE_WIDTH_ROW_BYTES,
+            };
+            let validity = rows.div_ceil(8).checked_next_multiple_of(64)?;
+            let values = rows.checked_mul(per_row)?.checked_next_multiple_of(64)?;
+            let data = copied.checked_next_multiple_of(64)?;
+            acc.checked_add(validity)?
+                .checked_add(values)?
+                .checked_add(data)
+        })
+}
+
+/// One column of an input batch, read row by row into a byte-budgeted
+/// chunk.
+enum ByteSource<'a> {
+    Fixed(SourceColumn<'a>),
+    Offsets32 {
+        offsets: &'a [i32],
+        data: &'a [u8],
+        nulls: Option<&'a NullBuffer>,
+    },
+    Offsets64 {
+        offsets: &'a [i64],
+        data: &'a [u8],
+        nulls: Option<&'a NullBuffer>,
+    },
+    Views {
+        views: &'a [u128],
+        /// `views` as bytes, where a short string's inline bytes are.
+        view_bytes: &'a [u8],
+        buffers: &'a [Buffer],
+        nulls: Option<&'a NullBuffer>,
+    },
+}
+
+impl<'a> ByteSource<'a> {
+    /// The sources of `columns`, whose `data` is each column's `to_data()`,
+    /// checked against the routed `types`.
+    fn of(
+        columns: &'a [ArrayRef],
+        data: &'a [ArrayData],
+        types: &[(DataType, RoutedLayout)],
+    ) -> DFResult<Vec<Self>> {
+        let rows = columns.first().map_or(0, |column| column.len());
+        let mut sources = Vec::with_capacity(columns.len());
+        for ((column, data), (data_type, layout)) in columns.iter().zip(data).zip(types) {
+            let nulls = column.nulls();
+            let source = if column.data_type() != data_type || column.len() != rows {
+                None
+            } else {
+                match (layout, data_type) {
+                    (RoutedLayout::Fixed(width), _) => {
+                        let values = match data.buffers() {
+                            [values] => values.as_slice(),
+                            _ => &[],
+                        };
+                        (values.len() >= (data.offset() + rows) * width).then_some(
+                            ByteSource::Fixed(SourceColumn {
+                                values,
+                                offset: data.offset(),
+                                nulls,
+                            }),
+                        )
+                    }
+                    (RoutedLayout::Offsets(_), DataType::Utf8) => column
+                        .as_string_opt::<i32>()
+                        .map(|array| ByteSource::Offsets32 {
+                            offsets: array.value_offsets(),
+                            data: array.value_data(),
+                            nulls,
+                        }),
+                    (RoutedLayout::Offsets(_), DataType::Binary) => column
+                        .as_binary_opt::<i32>()
+                        .map(|array| ByteSource::Offsets32 {
+                            offsets: array.value_offsets(),
+                            data: array.value_data(),
+                            nulls,
+                        }),
+                    (RoutedLayout::Offsets(_), DataType::LargeUtf8) => column
+                        .as_string_opt::<i64>()
+                        .map(|array| ByteSource::Offsets64 {
+                            offsets: array.value_offsets(),
+                            data: array.value_data(),
+                            nulls,
+                        }),
+                    (RoutedLayout::Offsets(_), DataType::LargeBinary) => column
+                        .as_binary_opt::<i64>()
+                        .map(|array| ByteSource::Offsets64 {
+                            offsets: array.value_offsets(),
+                            data: array.value_data(),
+                            nulls,
+                        }),
+                    (RoutedLayout::Views, DataType::Utf8View) => {
+                        column.as_string_view_opt().map(|array| ByteSource::Views {
+                            views: array.views(),
+                            view_bytes: array.views().inner().as_slice(),
+                            buffers: array.data_buffers(),
+                            nulls,
+                        })
+                    }
+                    (RoutedLayout::Views, DataType::BinaryView) => {
+                        column.as_binary_view_opt().map(|array| ByteSource::Views {
+                            views: array.views(),
+                            view_bytes: array.views().inner().as_slice(),
+                            buffers: array.data_buffers(),
+                            nulls,
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            let Some(source) = source else {
+                return Err(DataFusionError::Internal(format!(
+                    "BucketedFinalAggregateExec: a routed {} column of {} rows does not match \
+                     the expected {data_type} column of {rows} rows",
+                    column.data_type(),
+                    column.len(),
+                )));
+            };
+            sources.push(source);
+        }
+        Ok(sources)
+    }
+
+    fn is_null(&self, row: usize) -> bool {
+        let nulls = match self {
+            ByteSource::Fixed(source) => source.nulls,
+            ByteSource::Offsets32 { nulls, .. }
+            | ByteSource::Offsets64 { nulls, .. }
+            | ByteSource::Views { nulls, .. } => *nulls,
+        };
+        nulls.is_some_and(|nulls| nulls.is_null(row))
+    }
+
+    /// The bytes of a variable-width value at `row`; empty for a fixed-width
+    /// column.
+    fn value(&self, row: usize) -> &'a [u8] {
+        match *self {
+            ByteSource::Fixed(..) => &[],
+            ByteSource::Offsets32 { offsets, data, .. } => {
+                &data[offsets[row] as usize..offsets[row + 1] as usize]
+            }
+            ByteSource::Offsets64 { offsets, data, .. } => {
+                &data[offsets[row] as usize..offsets[row + 1] as usize]
+            }
+            ByteSource::Views {
+                views,
+                view_bytes,
+                buffers,
+                ..
+            } => {
+                let view = views[row];
+                let len = view as u32 as usize;
+                if len <= VIEW_INLINE_BYTES {
+                    let at = row * size_of::<u128>() + size_of::<u32>();
+                    &view_bytes[at..at + len]
+                } else {
+                    let buffer = (view >> 64) as u32 as usize;
+                    let offset = (view >> 96) as u32 as usize;
+                    &buffers[buffer][offset..offset + len]
+                }
+            }
+        }
+    }
+
+    /// The bytes the value at `row` copies into a chunk's data block: none
+    /// for a null, a fixed-width value or a string a view holds inline.
+    fn copied(&self, row: usize) -> usize {
+        if self.is_null(row) {
+            return 0;
+        }
+        match self {
+            ByteSource::Fixed(..) => 0,
+            ByteSource::Offsets32 { .. } | ByteSource::Offsets64 { .. } => self.value(row).len(),
+            ByteSource::Views { views, .. } => match views[row] as u32 as usize {
+                len if len > VIEW_INLINE_BYTES => len,
+                _ => 0,
+            },
+        }
+    }
+}
+
+/// A bucket's chunk on a route with a variable-width column (ADR-4143
+/// decision 3): one budget of `budget` bytes, charged in full before a row
+/// is written, which every row's fixed-width values, view or offset,
+/// validity and copied string bytes come out of ([`byte_chunk_bytes`]).
+/// Strings are copied into the chunk's own data block, so no source batch
+/// stays alive behind it, and its buffers' capacities never sum past the
+/// budget.
+struct ByteChunk {
+    types: Vec<(DataType, RoutedLayout)>,
+    /// Per column: the validity bitmap, the values (fixed-width values,
+    /// offsets or views) and the data block.
+    buffers: Vec<[MutableBuffer; 3]>,
+    null_counts: Vec<usize>,
+    copied: Vec<usize>,
+    len: usize,
+    budget: usize,
+    row_cap: usize,
+}
+
+/// A chunk's buffer slots.
+const VALIDITY: usize = 0;
+const VALUES: usize = 1;
+const DATA: usize = 2;
+
+impl ByteChunk {
+    /// An empty chunk of `budget` bytes and at most `row_cap` rows,
+    /// allocating nothing yet.
+    fn new(types: &[(DataType, RoutedLayout)], budget: usize, row_cap: usize) -> Self {
+        ByteChunk {
+            types: types.to_vec(),
+            buffers: types
+                .iter()
+                .map(|_| std::array::from_fn(|_| MutableBuffer::new(0)))
+                .collect(),
+            null_counts: vec![0; types.len()],
+            copied: vec![0; types.len()],
+            len: 0,
+            budget,
+            row_cap,
+        }
+    }
+
+    /// The bytes the chunk would hold with `row` of `sources` added, by
+    /// the budget's measure; `None` when they pass `usize` or what a data
+    /// block can address.
+    fn bytes_with(&self, sources: &[ByteSource<'_>], row: usize) -> Option<usize> {
+        let copied: Vec<usize> = self
+            .copied
+            .iter()
+            .zip(sources)
+            .map(|(copied, source)| copied.checked_add(source.copied(row)))
+            .collect::<Option<_>>()?;
+        let layouts: Vec<RoutedLayout> = self.types.iter().map(|(_, layout)| *layout).collect();
+        byte_chunk_bytes(&layouts, self.len + 1, &copied)
+    }
+
+    /// Whether `row` of `sources` fits: under the row cap and, with it, at
+    /// most the budget.
+    fn fits(&self, sources: &[ByteSource<'_>], row: usize) -> bool {
+        self.len < self.row_cap
+            && self
+                .bytes_with(sources, row)
+                .is_some_and(|bytes| bytes <= self.budget)
+    }
+
+    /// The capacity every buffer of the chunk holds.
+    fn capacity(&self) -> usize {
+        self.buffers
+            .iter()
+            .flatten()
+            .map(MutableBuffer::capacity)
+            .sum()
+    }
+
+    /// Make room for `len` bytes in `column`'s buffer `slot`, keeping every
+    /// buffer's capacity together within the budget: double when that fits,
+    /// else grow to exactly what is asked, after shrinking every other
+    /// buffer to its length when even that does not fit. The caller has
+    /// checked the row fits, so the exact sizes always do.
+    fn reserve(&mut self, column: usize, slot: usize, len: usize) {
+        let held = self.buffers[column][slot].capacity();
+        if len <= held {
+            return;
+        }
+        let exact = len.next_multiple_of(64);
+        let doubled = exact.max(held.saturating_mul(2));
+        let others = self.capacity() - held;
+        let buffer = &mut self.buffers[column][slot];
+        if others.saturating_add(doubled) <= self.budget {
+            buffer.reserve(len - buffer.len());
+            return;
+        }
+        if others.saturating_add(exact) > self.budget {
+            for (index, buffers) in self.buffers.iter_mut().enumerate() {
+                for (at, other) in buffers.iter_mut().enumerate() {
+                    if (index, at) != (column, slot) {
+                        other.shrink_to_fit();
+                    }
+                }
+            }
+        }
+        let buffer = &mut self.buffers[column][slot];
+        let mut grown = MutableBuffer::with_capacity(exact);
+        grown.extend_from_slice(buffer.as_slice());
+        *buffer = grown;
+    }
+
+    /// Size every buffer for exactly `rows` of `sources`, on an empty chunk
+    /// that takes them all: an uncharged piece, which grows no buffer.
+    fn reserve_exact(&mut self, sources: &[ByteSource<'_>], rows: &[u32]) {
+        for (column, source) in sources.iter().enumerate() {
+            let copied: usize = rows.iter().map(|&row| source.copied(row as usize)).sum();
+            let values = match self.types[column].1 {
+                RoutedLayout::Fixed(width) => rows.len() * width,
+                RoutedLayout::Offsets(width) => (rows.len() + 1) * width,
+                RoutedLayout::Views => rows.len() * size_of::<u128>(),
+            };
+            self.buffers[column] = [
+                MutableBuffer::with_capacity(rows.len().div_ceil(8)),
+                MutableBuffer::with_capacity(values),
+                MutableBuffer::with_capacity(copied),
+            ];
+        }
+    }
+
+    /// Copy `row` of `sources` into the chunk. The caller has checked it
+    /// [`fits`](Self::fits), or sized the chunk for it.
+    fn push_row(&mut self, sources: &[ByteSource<'_>], row: usize) {
+        let at = self.len;
+        for (column, source) in sources.iter().enumerate() {
+            let layout = self.types[column].1;
+            if at % 8 == 0 {
+                self.reserve(column, VALIDITY, at / 8 + 1);
+                self.buffers[column][VALIDITY].push(0u8);
+            }
+            let null = source.is_null(row);
+            if null {
+                self.null_counts[column] += 1;
+            } else {
+                bit_util::set_bit(self.buffers[column][VALIDITY].as_slice_mut(), at);
+            }
+            match (layout, source) {
+                (RoutedLayout::Fixed(width), ByteSource::Fixed(source)) => {
+                    let start = (source.offset + row) * width;
+                    self.reserve(column, VALUES, (at + 1) * width);
+                    self.buffers[column][VALUES]
+                        .extend_from_slice(&source.values[start..start + width]);
+                }
+                (RoutedLayout::Offsets(width), _) => {
+                    let value = if null { &[][..] } else { source.value(row) };
+                    let data_len = self.buffers[column][DATA].len() + value.len();
+                    self.reserve(column, VALUES, (at + 2) * width);
+                    self.reserve(column, DATA, data_len);
+                    let [_, offsets, data] = &mut self.buffers[column];
+                    if at == 0 {
+                        offsets.extend_zeros(width);
+                    }
+                    if width == size_of::<i32>() {
+                        offsets.extend_from_slice(&(data_len as i32).to_ne_bytes());
+                    } else {
+                        offsets.extend_from_slice(&(data_len as i64).to_ne_bytes());
+                    }
+                    data.extend_from_slice(value);
+                }
+                (RoutedLayout::Views, ByteSource::Views { views, .. }) => {
+                    self.reserve(column, VALUES, (at + 1) * size_of::<u128>());
+                    let view = if null { 0 } else { views[row] };
+                    let len = view as u32 as usize;
+                    let view = if len > VIEW_INLINE_BYTES {
+                        let value = source.value(row);
+                        let offset = self.buffers[column][DATA].len();
+                        self.reserve(column, DATA, offset + len);
+                        self.buffers[column][DATA].extend_from_slice(value);
+                        // Length and prefix kept, buffer 0 of the chunk at
+                        // the copy's offset.
+                        (view & u128::from(u64::MAX)) | ((offset as u128) << 96)
+                    } else {
+                        view
+                    };
+                    self.buffers[column][VALUES].extend_from_slice(&view.to_ne_bytes());
+                }
+                _ => {}
+            }
+            self.copied[column] += source.copied(row);
+        }
+        self.len += 1;
+    }
+
+    /// The chunk's arrays, charged at the budget.
+    fn seal(self) -> DFResult<SealedChunk> {
+        let len = self.len;
+        let mut columns = Vec::with_capacity(self.types.len());
+        for (((data_type, layout), [validity, mut values, data]), null_count) in self
+            .types
+            .into_iter()
+            .zip(self.buffers)
+            .zip(self.null_counts)
+        {
+            let nulls = (null_count > 0)
+                .then(|| NullBuffer::new(BooleanBuffer::new(Buffer::from(validity), 0, len)));
+            let mut builder = ArrayData::builder(data_type).len(len).nulls(nulls);
+            match layout {
+                RoutedLayout::Fixed(_) => {
+                    builder = builder.add_buffer(Buffer::from(values));
+                }
+                RoutedLayout::Offsets(width) => {
+                    if values.is_empty() {
+                        values.extend_zeros(width);
+                    }
+                    builder = builder
+                        .add_buffer(Buffer::from(values))
+                        .add_buffer(Buffer::from(data));
+                }
+                RoutedLayout::Views => {
+                    builder = builder.add_buffer(Buffer::from(values));
+                    if !data.is_empty() {
+                        builder = builder.add_buffer(Buffer::from(data));
+                    }
+                }
+            }
+            columns.push(make_array(builder.build()?));
+        }
+        Ok(SealedChunk {
+            columns,
+            charged: self.budget,
+        })
+    }
+}
+
+/// The rows from `start` one slice of `sources` takes when it is cut the
+/// way a byte-budgeted chunk seals: until the next row would take it past
+/// `budget` bytes, or at `row_cap` rows; a row larger than `budget` alone.
+/// At least one row while any remain.
+fn byte_slice_rows(
+    types: &[(DataType, RoutedLayout)],
+    sources: &[ByteSource<'_>],
+    start: usize,
+    rows: usize,
+    budget: usize,
+    row_cap: usize,
+) -> usize {
+    let mut fill = ByteChunk::new(types, budget, row_cap.max(1));
+    let mut row = start;
+    while row < rows && fill.len < fill.row_cap {
+        let fits = fill
+            .bytes_with(sources, row)
+            .is_some_and(|bytes| bytes <= budget);
+        if !fits {
+            break;
+        }
+        for (copied, source) in fill.copied.iter_mut().zip(sources) {
+            *copied += source.copied(row);
+        }
+        fill.len += 1;
+        row += 1;
+    }
+    fill.len.max(1).min(rows.saturating_sub(start))
 }
 
 /// A bucket's chunk still taking rows.
@@ -827,12 +1349,20 @@ struct SealedChunk {
 struct Bucket {
     sealed: Vec<SealedChunk>,
     open: Option<OpenChunk>,
+    /// The chunk being filled on a route with a variable-width column.
+    filling: Option<ByteChunk>,
     rows: usize,
 }
 
-/// The phase-1 router: every column's type and width, and the buckets.
+/// The phase-1 router: every column's type and layout, and the buckets.
 struct Router {
-    types: Vec<(DataType, usize)>,
+    types: Vec<(DataType, RoutedLayout)>,
+    /// Every column's type and width on a fixed-width route; empty on a
+    /// route with a variable-width column.
+    widths: Vec<(DataType, usize)>,
+    /// The byte budget of a chunk on a route with a variable-width column;
+    /// `None` on a fixed-width route, whose chunks are sized by rows.
+    budget: Option<usize>,
     key_count: usize,
     bits: u8,
     chunk_rows: usize,
@@ -854,10 +1384,26 @@ struct Router {
 const ROUTER_ROW_SCRATCH: usize = size_of::<u64>() + size_of::<u32>();
 
 impl Router {
-    fn new(types: Vec<(DataType, usize)>, key_count: usize, bits: u8, chunk_rows: usize) -> Self {
+    fn new(
+        types: Vec<(DataType, RoutedLayout)>,
+        key_count: usize,
+        bits: u8,
+        chunk_rows: usize,
+        chunk_bytes: usize,
+    ) -> Self {
         let bucket_count = 1usize << bits;
+        let widths: Option<Vec<(DataType, usize)>> = types
+            .iter()
+            .map(|(data_type, layout)| match layout {
+                RoutedLayout::Fixed(width) => Some((data_type.clone(), *width)),
+                RoutedLayout::Offsets(_) | RoutedLayout::Views => None,
+            })
+            .collect();
+        let budget = widths.is_none().then_some(chunk_bytes);
         Router {
             types,
+            widths: widths.unwrap_or_default(),
+            budget,
             key_count,
             bits,
             chunk_rows,
@@ -923,8 +1469,12 @@ impl Router {
             return Ok(0);
         }
         let data: Vec<ArrayData> = columns.iter().map(|column| column.to_data()).collect();
+        if let Some(budget) = self.budget {
+            let sources = ByteSource::of(columns, &data, &self.types)?;
+            return self.route_bytes(columns, &sources, budget, reservation, spill);
+        }
         let mut sources = Vec::with_capacity(columns.len());
-        for ((column, data), (data_type, width)) in columns.iter().zip(&data).zip(&self.types) {
+        for ((column, data), (data_type, width)) in columns.iter().zip(&data).zip(&self.widths) {
             let values = match data.buffers() {
                 [values] => values.as_slice(),
                 _ => &[],
@@ -969,7 +1519,7 @@ impl Router {
                             _ => self.buckets[bucket].sealed.push(sealed),
                         }
                     }
-                    let chunk = OpenChunk::allocate(&self.types, self.chunk_rows);
+                    let chunk = OpenChunk::allocate(&self.widths, self.chunk_rows);
                     if let Err(err) = try_grow_named(reservation, chunk.charged) {
                         let Some(spill) = spill.as_deref_mut() else {
                             return Err(err);
@@ -1008,6 +1558,109 @@ impl Router {
             }
         }
         Ok(rows)
+    }
+
+    /// [`route`](Self::route) on a route with a variable-width column
+    /// (ADR-4143 decision 3): each bucket fills one [`ByteChunk`] of
+    /// `budget` bytes at a time, charged in full before a row is written,
+    /// and sealed when the next row would take it past the budget or past
+    /// `chunk_rows` rows. A row larger than the budget takes a chunk of its
+    /// own, charged at its size.
+    fn route_bytes(
+        &mut self,
+        columns: &[ArrayRef],
+        sources: &[ByteSource<'_>],
+        budget: usize,
+        reservation: &mut MemoryReservation,
+        mut spill: Option<&mut BucketSpill>,
+    ) -> DFResult<usize> {
+        let rows = columns.first().map_or(0, |column| column.len());
+        self.sort_by_bucket(columns, rows)?;
+        for bucket in 0..self.buckets.len() {
+            let (start, end) = (self.offsets[bucket], self.offsets[bucket + 1]);
+            let mut done = start;
+            while done < end {
+                let row = self.order[done] as usize;
+                if !self.buckets[bucket]
+                    .filling
+                    .as_ref()
+                    .is_some_and(|filling| filling.fits(sources, row))
+                {
+                    if let Some(full) = self.buckets[bucket].filling.take() {
+                        let sealed = full.seal()?;
+                        match spill.as_deref_mut() {
+                            Some(spill) if spill.triggered => {
+                                spill.write(bucket, sealed.columns)?;
+                                reservation.shrink(sealed.charged);
+                            }
+                            _ => self.buckets[bucket].sealed.push(sealed),
+                        }
+                    }
+                    let mut chunk = ByteChunk::new(&self.types, budget, self.chunk_rows);
+                    if !chunk.fits(sources, row) {
+                        let Some(size) = chunk.bytes_with(sources, row) else {
+                            return Err(DataFusionError::Internal(
+                                "BucketedFinalAggregateExec: a routed value passes what a \
+                                 chunk can address"
+                                    .to_string(),
+                            ));
+                        };
+                        chunk = ByteChunk::new(&self.types, size, 1);
+                    }
+                    if !self.grant(chunk.budget, reservation, &mut spill)? {
+                        // Not even one chunk fits with nothing retained: the
+                        // bucket's rows of this batch go to its file
+                        // uncharged, as the forced route writes them.
+                        let Some(spill) = spill.as_deref_mut() else {
+                            return Err(DataFusionError::Internal(
+                                "BucketedFinalAggregateExec: a refused chunk without spill"
+                                    .to_string(),
+                            ));
+                        };
+                        self.write_byte_rows(bucket, sources, done, end, spill)?;
+                        done = end;
+                        continue;
+                    }
+                    self.buckets[bucket].filling = Some(chunk);
+                }
+                let target = &mut self.buckets[bucket];
+                let Some(filling) = target.filling.as_mut() else {
+                    return Err(DataFusionError::Internal(
+                        "BucketedFinalAggregateExec: a bucket has no open chunk".to_string(),
+                    ));
+                };
+                filling.push_row(sources, row);
+                target.rows += 1;
+                done += 1;
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Charge `bytes` for a new chunk. With `spill`, a refusal is a spill
+    /// trigger: every retained chunk is written and the charge asked again.
+    /// `Ok(false)` when it is refused even then.
+    fn grant(
+        &mut self,
+        bytes: usize,
+        reservation: &mut MemoryReservation,
+        spill: &mut Option<&mut BucketSpill>,
+    ) -> DFResult<bool> {
+        let Err(err) = try_grow_named(reservation, bytes) else {
+            return Ok(true);
+        };
+        let Some(spill) = spill.as_deref_mut() else {
+            return Err(err);
+        };
+        if !is_refusal(&err) {
+            return Err(err);
+        }
+        self.spill_retained(0, reservation, spill)?;
+        match try_grow_named(reservation, bytes) {
+            Ok(()) => Ok(true),
+            Err(err) if is_refusal(&err) => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     /// Hash `rows` rows of `columns`' keys and counting-sort the row indices
@@ -1051,6 +1704,15 @@ impl Router {
             return Ok(());
         }
         self.sort_by_bucket(columns, rows)?;
+        if self.budget.is_some() {
+            let data: Vec<ArrayData> = columns.iter().map(|column| column.to_data()).collect();
+            let sources = ByteSource::of(columns, &data, &self.types)?;
+            for bucket in 0..self.buckets.len() {
+                let (start, end) = (self.offsets[bucket], self.offsets[bucket + 1]);
+                self.write_byte_rows(bucket, &sources, start, end, spill)?;
+            }
+            return Ok(());
+        }
         for bucket in 0..self.buckets.len() {
             let (start, end) = (self.offsets[bucket], self.offsets[bucket + 1]);
             self.write_rows(bucket, columns, start, end, spill)?;
@@ -1081,12 +1743,36 @@ impl Router {
         Ok(())
     }
 
+    /// [`write_rows`](Self::write_rows) on a route with a variable-width
+    /// column: the piece's strings are copied into buffers sized for exactly
+    /// these rows, so it keeps no source batch alive while it is written.
+    fn write_byte_rows(
+        &mut self,
+        bucket: usize,
+        sources: &[ByteSource<'_>],
+        start: usize,
+        end: usize,
+        spill: &mut BucketSpill,
+    ) -> DFResult<()> {
+        if start >= end {
+            return Ok(());
+        }
+        let rows = &self.order[start..end];
+        let mut piece = ByteChunk::new(&self.types, usize::MAX, usize::MAX);
+        piece.reserve_exact(sources, rows);
+        for &row in rows {
+            piece.push_row(sources, row as usize);
+        }
+        spill.write(bucket, piece.seal()?.columns)?;
+        self.buckets[bucket].rows += end - start;
+        Ok(())
+    }
+
     /// Whether any bucket from `from` on still holds a chunk in memory.
     fn retains(&self, from: usize) -> bool {
-        self.buckets
-            .iter()
-            .skip(from)
-            .any(|bucket| !bucket.sealed.is_empty() || bucket.open.is_some())
+        self.buckets.iter().skip(from).any(|bucket| {
+            !bucket.sealed.is_empty() || bucket.open.is_some() || bucket.filling.is_some()
+        })
     }
 
     /// Write every chunk held by the buckets from `from` on to their files
@@ -1104,6 +1790,9 @@ impl Router {
             if let Some(open) = target.open.take() {
                 chunks.push(open.seal()?);
             }
+            if let Some(filling) = target.filling.take() {
+                chunks.push(filling.seal()?);
+            }
             for chunk in chunks {
                 spill.write(bucket, chunk.columns)?;
                 reservation.shrink(chunk.charged);
@@ -1120,6 +1809,9 @@ impl Router {
         };
         if let Some(chunk) = target.sealed.pop() {
             return Ok(Some(chunk));
+        }
+        if let Some(filling) = target.filling.take() {
+            return filling.seal().map(Some);
         }
         target.open.take().map(OpenChunk::seal).transpose()
     }
@@ -1282,9 +1974,9 @@ struct BucketedStream {
     group_values: Box<dyn GroupValues>,
     accumulators: Vec<Box<dyn GroupsAccumulator>>,
     group_indices: Vec<usize>,
-    /// Every routed column's type and width: keys, then each accumulator's
+    /// Every routed column's type and layout: keys, then each accumulator's
     /// state.
-    routed_types: Vec<(DataType, usize)>,
+    routed_types: Vec<(DataType, RoutedLayout)>,
     key_count: usize,
     router: Option<Router>,
     pending: Option<PendingOutput>,
@@ -1334,7 +2026,8 @@ impl BucketedStream {
         let key_count = group_schema.fields().len();
         let routed_types = routed_types(aggregate)?.map_err(|data_type| {
             DataFusionError::Internal(format!(
-                "BucketedFinalAggregateExec: routed column type {data_type} is not fixed width"
+                "BucketedFinalAggregateExec: routed column type {data_type} is neither fixed \
+                 width nor a string or binary type"
             ))
         })?;
         let group_values = new_group_values(group_schema, &GroupOrdering::None)?;
@@ -1464,6 +2157,7 @@ impl BucketedStream {
             self.key_count,
             bits,
             self.config.routed_chunk_rows.max(1),
+            self.config.routed_chunk_bytes.max(1),
         );
         let mut state = self.group_values.emit(EmitTo::All)?;
         for accumulator in &mut self.accumulators {
@@ -1491,15 +2185,37 @@ impl BucketedStream {
         };
         let bits = self.config.bits.min(BUCKETED_FINAL_AGGREGATE_MAX_BITS);
         let slice_rows = self.config.routed_chunk_rows.max(1);
-        let mut router = Router::new(self.routed_types.clone(), self.key_count, bits, slice_rows);
+        let mut router = Router::new(
+            self.routed_types.clone(),
+            self.key_count,
+            bits,
+            slice_rows,
+            self.config.routed_chunk_bytes.max(1),
+        );
         let mut state = self.group_values.emit(EmitTo::All)?;
         for accumulator in &mut self.accumulators {
             state.extend(accumulator.state(EmitTo::All)?);
         }
         let rows = state.first().map_or(0, |column| column.len());
+        // A route with a variable-width column cuts its slices the way its
+        // chunks seal (ADR-4143 decision 3), at most `budget` bytes or
+        // `slice_rows` rows each; a fixed-width route cuts them by rows.
+        let state_data: Vec<ArrayData> = match router.budget {
+            Some(_) => state.iter().map(|column| column.to_data()).collect(),
+            None => Vec::new(),
+        };
+        let byte_sources = match router.budget {
+            Some(_) => Some(ByteSource::of(&state, &state_data, &router.types)?),
+            None => None,
+        };
         let mut start = 0;
         while start < rows {
-            let len = slice_rows.min(rows - start);
+            let len = match (&byte_sources, router.budget) {
+                (Some(sources), Some(budget)) => {
+                    byte_slice_rows(&router.types, sources, start, rows, budget, slice_rows)
+                }
+                _ => slice_rows.min(rows - start),
+            };
             let slice: Vec<ArrayRef> = state
                 .iter()
                 .map(|column| column.slice(start, len))
@@ -1507,6 +2223,8 @@ impl BucketedStream {
             router.write_slice(&slice, spill)?;
             start += len;
         }
+        drop(byte_sources);
+        drop(state_data);
         drop(state);
         self.group_values.clear_shrink(0);
         self.group_indices = Vec::new();
@@ -1520,7 +2238,12 @@ impl BucketedStream {
             .table_bytes
             .saturating_sub(self.table_size())
             .saturating_sub(router.scratch_size());
-        router.fix_scratch((held / ROUTER_ROW_SCRATCH).min(slice_rows.max(self.batch_size)));
+        let scratch_cap = match router.budget {
+            // Sized to a slice's row cap, as decision 3 bounds it.
+            Some(_) => slice_rows,
+            None => slice_rows.max(self.batch_size),
+        };
+        router.fix_scratch((held / ROUTER_ROW_SCRATCH).min(scratch_cap));
         self.metrics.routed_rows.add(rows);
         self.metrics.engaged.add(1);
         self.router = Some(router);

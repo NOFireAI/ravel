@@ -447,6 +447,14 @@ pub struct BucketedFinalAggregation {
     /// MiB for one `Int64` key and a count at the defaults. Default 8192; zero
     /// is read as one.
     pub routed_chunk_rows: usize,
+    /// Bytes per bucket chunk on a route with a string or binary column
+    /// (ADR-4143 decision 3), which the refusal retry alone admits. Each
+    /// such chunk is charged this budget before a row is written to it, and
+    /// seals when the next row would pass it or at `routed_chunk_rows` rows;
+    /// a row larger than the budget takes a chunk of its own, charged at its
+    /// size. Ignored by a fixed-width route. Default 1 MiB; zero is read as
+    /// one.
+    pub routed_chunk_bytes: usize,
 }
 
 impl Default for BucketedFinalAggregation {
@@ -455,6 +463,7 @@ impl Default for BucketedFinalAggregation {
             engage_groups: 65_536,
             bits: 6,
             routed_chunk_rows: 8192,
+            routed_chunk_bytes: 1 << 20,
         }
     }
 }
