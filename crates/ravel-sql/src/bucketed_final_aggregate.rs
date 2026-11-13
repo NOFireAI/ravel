@@ -1353,8 +1353,10 @@ struct SealedChunk {
 struct Bucket {
     sealed: Vec<SealedChunk>,
     open: Option<OpenChunk>,
-    /// The chunk being filled on a route with a variable-width column.
-    filling: Option<ByteChunk>,
+    /// The chunk being filled on a route with a variable-width column, boxed
+    /// so a fixed-width route's buckets, charged as router scratch, stay one
+    /// pointer larger and no more.
+    filling: Option<Box<ByteChunk>>,
     rows: usize,
 }
 
@@ -1625,7 +1627,7 @@ impl Router {
                         done = end;
                         continue;
                     }
-                    self.buckets[bucket].filling = Some(chunk);
+                    self.buckets[bucket].filling = Some(Box::new(chunk));
                 }
                 let target = &mut self.buckets[bucket];
                 let Some(filling) = target.filling.as_mut() else {

@@ -727,7 +727,8 @@ fn rewritten(
 /// rule runs, so each refusal is the gate's.
 ///
 /// Prove-the-test: drop the `spill &&` from `admits`' key condition and the
-/// first attempt's rule replaces the string keys; drop the
+/// first attempt's rule replaces a Utf8 key (this test and
+/// `every_refusal_condition_leaves_the_plan_unchanged` fail); drop the
 /// `variable_width_layout` arm and the retry's rule replaces none.
 #[tokio::test]
 async fn spill_rule_admits_string_and_binary_keys_only() {
@@ -3085,17 +3086,20 @@ fn string_keys_sql(string_type: &str, composite: bool) -> String {
 /// key larger than the chunk budget `B`, and an Int64 and Int32 key beside
 /// them, spilled at each phase's trigger, answers exactly as the stock final
 /// does; writes each routed row at most once and reads each written row back
-/// once, within the column bytes of the rows written; charges each routed
-/// chunk `B`, and the oversized row's chunk its own size; and at the phase 1
-/// trigger routes the stock table to the files with no ask of the pool.
+/// once, within the column bytes of the rows written; asks the pool for
+/// chunks of `B`, and at the phase 2 trigger for the oversized row's chunk at
+/// its own size; and at the phase 1 trigger routes the stock table to the
+/// files with no ask of the pool. That no chunk holds more than its charge is
+/// the unit test `byte_chunks_hold_at_most_their_budget_and_copy_their_strings`.
 ///
 /// The oversized chunk's charge is every column's validity and values, 64 B
 /// each as allocated, and the 5,000-byte key rounded up to 5,056 B: 5,312 B
 /// with the count beside the key, 5,568 B with the two integer keys too.
 ///
-/// Prove-the-test: drop the `spill` refusal for a full chunk in `route_bytes`
-/// (`chunk.fits` check) and a chunk is charged past `B`; key the bucket on a
-/// key column's view rather than its bytes and the answer splits a group.
+/// Prove-the-test: drop the budget from `ByteChunk::fits`, so chunks seal on
+/// rows alone, and the phase 2 cap is never reached, so nothing spills; keep
+/// each long string's view into the source batch instead of copying it and
+/// the read-back fails on an invalid buffer slice.
 #[tokio::test]
 async fn bucket_spill_routes_string_keys_exactly() {
     const FIXED: [(bool, usize, usize); 2] = [(false, 8, 5312), (true, 8 + 4 + 8, 5568)];
@@ -3445,8 +3449,6 @@ const RETRY_STR_SQL: &str = "SELECT s, s IS NULL AS null_key, count(*) AS c FROM
 /// The logs fixture a refused run reads.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RetryFixture {
-    /// [`ROWS`] rows.
-    Small,
     /// [`BIG_ROWS`] rows.
     Big,
     /// [`STR_ROWS`] rows with the declared `str` attribute `s`.
@@ -3468,7 +3470,6 @@ struct Refusal {
 /// An executor over `refusal`'s fixture under `config`.
 async fn retry_executor(refusal: Refusal, config: SqlConfig) -> SqlExecutor {
     match refusal.fixture {
-        RetryFixture::Small => executor(ROWS, config).await,
         RetryFixture::Big => big_executor(config, 1 << 30).await,
         RetryFixture::Strings => str_executor(config).await,
     }
@@ -3479,11 +3480,7 @@ async fn retry_executor(refusal: Refusal, config: SqlConfig) -> SqlExecutor {
 /// the refused run wrote.
 async fn refused_run(sql: &str, refusal: Refusal) -> (RetryRun, Result<RetryRun, String>, String) {
     let scratch = tempfile::tempdir().expect("scratch root");
-    let query_bytes = match refusal.fixture {
-        RetryFixture::Small => ravel_sql::DEFAULT_MAX_QUERY_BYTES,
-        RetryFixture::Big | RetryFixture::Strings => BIG_QUERY_BYTES,
-    };
-    let config = || retry_config(scratch.path(), refusal.partitions, query_bytes);
+    let config = || retry_config(scratch.path(), refusal.partitions, BIG_QUERY_BYTES);
     let unlimited = retry_run(&retry_executor(refusal, config()).await, sql)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -4235,10 +4232,8 @@ async fn retry_keeps_sort_merge_for_unadmitted_shape() {
 /// rows written than the fixture's rows, the most the final aggregate is
 /// handed.
 ///
-/// Prove-the-test: build the retry's rule without spill, or drop the
-/// `variable_width_layout` arm from `admits`, and the retry is
-/// `sort_merge`/`not_admitted`; drop `routed_chunk_bytes` from the INFO line
-/// and `retry_info_field` panics.
+/// Prove-the-test: drop the `variable_width_layout` arm from `admits` and the
+/// retry is `sort_merge` with `not_admitted`.
 #[tokio::test]
 async fn bucket_spill_retry_admits_a_declared_str_key() {
     let refusal = Refusal {
