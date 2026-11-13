@@ -883,6 +883,27 @@ async fn migrate_bucket_format_scoped(
             }
             return Err(err);
         }
+        // Refused for its part-index windows (ADR-3853): nothing was built, so
+        // release the claim now rather than hold the bucket's migration off
+        // for the lease, as compaction does for the same refusal
+        // (crate::compact's part-index-refusal arm, issue #4127).
+        Err(err) if err.is_part_index_refusal() => {
+            if let Some(guard) = guard
+                && guard.cancelled_at().await.is_none()
+                && let Err(claim_err) = guard.complete(store).await
+            {
+                tracing::warn!(
+                    signal = ?bucket.signal,
+                    shard = bucket.shard,
+                    ingest_hour_bucket = bucket.ingest_hour_bucket,
+                    work_id = %guard.work_id_hex(),
+                    error = %claim_err,
+                    "migration refused for its part-index windows, and marking its claim \
+                     completed failed; the claim ages out under its lease (ADR-1029)"
+                );
+            }
+            return Err(err);
+        }
         other => other?,
     };
 
