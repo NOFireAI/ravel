@@ -5244,6 +5244,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "tokio",
  "tonic",
  "tonic-prost",

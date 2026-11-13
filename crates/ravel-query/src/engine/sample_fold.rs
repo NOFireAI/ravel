@@ -128,6 +128,8 @@ struct FoldedSample<V> {
 struct FoldedSeries<V> {
     labels: LabelSet,
     levels: Vec<Vec<FoldedSample<V>>>,
+    /// The bytes `levels`' samples take, under [`sample_len`].
+    sample_bytes: u64,
 }
 
 /// One decoded run, in the shape both fetched kinds share.
@@ -210,22 +212,87 @@ impl<V: FoldValue> RunFold<V> {
         }
     }
 
-    /// Folds one object's runs in, then reserves whatever the fold now holds
-    /// beyond what it has already reserved. A series past `max_series` is
-    /// refused with [`QueryError::TooManySeries`] (ADR-0051 S7) the moment it
-    /// would be added; a run whose priority column is not parallel to its
-    /// samples, or whose timestamps descend, with the error the merge returns
-    /// for it; and a refused reservation with
-    /// [`FetchError::FetchMemoryExhausted`], the error a fetch reservation
-    /// returns.
+    /// Reserves the most folding `runs` in can make the fold hold, then
+    /// folds them in, so the fold never holds more than it has reserved
+    /// (issue #4118). A series past `max_series` is refused with
+    /// [`QueryError::TooManySeries`] (ADR-0051 S7) the moment it would be
+    /// added; a run whose priority column is not parallel to its samples, or
+    /// whose timestamps descend, with the error the merge returns for it; and
+    /// a refused reservation with [`FetchError::FetchMemoryExhausted`], the
+    /// error a fetch reservation returns, before any of `runs` is folded.
     pub(super) fn absorb<R: Into<FoldRun<V>>>(
         &mut self,
         runs: impl IntoIterator<Item = R>,
     ) -> Result<(), QueryError> {
-        for run in runs {
-            self.absorb_run(run.into())?;
+        let runs: Vec<FoldRun<V>> = runs.into_iter().map(Into::into).collect();
+        let mut growth = 0u64;
+        let mut incoming: HashMap<SeriesId, u64> = HashMap::new();
+        for run in &runs {
+            let (added, samples) = self.growth_bound(run);
+            growth = growth.saturating_add(added);
+            let series = incoming.entry(run.series_id).or_default();
+            *series = series.saturating_add(samples);
         }
-        self.reserve_retained()
+        // One merge runs at a time, and the level it builds holds at most the
+        // samples its series held before this call plus every sample this
+        // call brings it.
+        let merge = incoming
+            .iter()
+            .map(|(id, samples)| self.held_sample_len(id).saturating_add(*samples))
+            .max()
+            .unwrap_or(0);
+        self.reserve_up_to(self.retained.saturating_add(growth).saturating_add(merge))?;
+        for run in runs {
+            self.absorb_run(run)?;
+        }
+        Ok(())
+    }
+
+    /// The most folding `run` in adds to [`RunFold::retained`], and the
+    /// bytes its samples alone take. The growth counts every sample as kept,
+    /// the series' labels when it is new, and one prefix entry for each change
+    /// of provenance prefix along the run that the fold has not interned.
+    fn growth_bound(&self, run: &FoldRun<V>) -> (u64, u64) {
+        let inline = std::mem::size_of::<FoldedSample<V>>() as u64;
+        let samples = run
+            .values
+            .iter()
+            .map(|value| inline.saturating_add(value.heap_len()))
+            .fold(0u64, u64::saturating_add);
+        let held = self.by_series.get(&run.series_id);
+        let labels = if held.is_some() {
+            0
+        } else {
+            retained_series_len(&run.labels)
+        };
+        let prefixes = match &run.priorities {
+            RunPriorities::RunWide(prefix) => u64::from(!self.prefix_ids.contains_key(prefix)),
+            RunPriorities::PerSample(column) => {
+                let mut last = None;
+                let mut new = 0u64;
+                for p in column {
+                    let key = (p.created_unix_ns, p.writer_epoch, p.writer_seq);
+                    if last != Some(key) && !self.prefix_ids.contains_key(&key) {
+                        new += 1;
+                    }
+                    last = Some(key);
+                }
+                new
+            }
+        };
+        (
+            samples
+                .saturating_add(labels)
+                .saturating_add(prefixes.saturating_mul(PREFIX_LEN)),
+            samples,
+        )
+    }
+
+    /// The bytes the samples the fold holds for `series_id` take.
+    fn held_sample_len(&self, series_id: &SeriesId) -> u64 {
+        self.by_series
+            .get(series_id)
+            .map_or(0, |series| series.sample_bytes)
     }
 
     fn absorb_run(&mut self, run: FoldRun<V>) -> Result<(), QueryError> {
@@ -290,6 +357,7 @@ impl<V: FoldValue> RunFold<V> {
                 entry.insert(FoldedSeries {
                     labels: run.labels,
                     levels: Vec::new(),
+                    sample_bytes: 0,
                 })
             }
         };
@@ -307,6 +375,10 @@ impl<V: FoldValue> RunFold<V> {
         if !level.is_empty() {
             series.levels.push(level);
         }
+        series.sample_bytes = series
+            .sample_bytes
+            .saturating_add(added)
+            .saturating_sub(dropped);
         self.retained = self.retained.saturating_sub(dropped);
         Ok(())
     }
@@ -332,19 +404,22 @@ impl<V: FoldValue> RunFold<V> {
         serves_over(&self.prefixes, a, b)
     }
 
-    fn reserve_retained(&mut self) -> Result<(), QueryError> {
+    /// Grows the fold's reservation to at least `bytes`. The reservation only
+    /// grows: it is the most any absorb could have made the fold hold.
+    fn reserve_up_to(&mut self, bytes: u64) -> Result<(), QueryError> {
         let charged = self.charged();
-        if self.retained <= charged {
+        if bytes <= charged {
             return Ok(());
         }
-        let reservation = self.budget.reserve(self.retained - charged).map_err(|e| {
-            FetchError::FetchMemoryExhausted {
-                requested: e.requested,
-                reserved: e.reserved,
-                limit: e.limit,
-                cause: e.cause,
-            }
-        })?;
+        let reservation =
+            self.budget
+                .reserve(bytes - charged)
+                .map_err(|e| FetchError::FetchMemoryExhausted {
+                    requested: e.requested,
+                    reserved: e.reserved,
+                    limit: e.limit,
+                    cause: e.cause,
+                })?;
         self.reservations.push(reservation);
         Ok(())
     }
@@ -361,10 +436,19 @@ impl<V: FoldValue> RunFold<V> {
             .sum()
     }
 
+    /// Hands the fold's reservations to the caller, which holds them for as
+    /// long as it holds the series [`into_series`](RunFold::into_series)
+    /// returns: those take no more than the fold reserved, since a merged
+    /// sample is smaller than a held one (issue #4118).
+    pub(super) fn take_reservations(&mut self) -> Vec<ravel_memory::Reservation> {
+        std::mem::take(&mut self.reservations)
+    }
+
     /// Collapses each series' runs into one, converts each held sample with
     /// `convert`, and checks `max_samples` over the whole result, counting one
-    /// sample per `(series, ts)` slot as the merge does. The reservations are
-    /// released when this returns: the caller owns the samples from here.
+    /// sample per `(series, ts)` slot as the merge does. Reservations not
+    /// taken with [`take_reservations`](RunFold::take_reservations) are
+    /// released when this returns.
     fn finish<T>(
         self,
         max_samples: usize,
@@ -772,15 +856,18 @@ mod tests {
         assert_eq!(format!("{err:?}"), format!("{want:?}"));
     }
 
-    /// Issue #3747: the bytes reserved for a known result are its series'
-    /// ids and label sets, its held samples and its distinct provenance
-    /// prefixes. Two objects carry the same series at the same three
-    /// timestamps under two provenance prefixes; the merged result is one
-    /// series of three samples, and the second object's copies are dropped
-    /// before the charge is taken, so the charge is one series, three
-    /// samples and two prefixes, not one copy per object.
+    /// Issue #3747: the bytes held for a known result are its series' ids
+    /// and label sets, its held samples and its distinct provenance prefixes.
+    /// Two objects carry the same series at the same three timestamps under
+    /// two provenance prefixes; the merged result is one series of three
+    /// samples, and the second object's copies are dropped, so what is held
+    /// is one series, three samples and two prefixes, not one copy per object.
+    ///
+    /// Issue #4118: each absorb reserves before it folds: every incoming
+    /// sample, the labels of a new series, one prefix per unseen provenance
+    /// prefix, and the level the merge builds beside the levels it replaces.
     #[test]
-    fn the_fold_reserves_exactly_what_it_held() {
+    fn the_fold_reserves_what_an_absorb_can_hold_before_holding_it() {
         let budget = unlimited();
         let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
         let samples = [(1, 1.0), (2, 2.0), (3, 3.0)];
@@ -800,19 +887,65 @@ mod tests {
         assert_eq!(PREFIX_LEN, prefix_len);
 
         let one_object = series_len + 3 * sample_len + prefix_len;
-        assert_eq!(fold.charged(), one_object);
-        assert_eq!(budget.reserved(), one_object);
+        assert_eq!(fold.retained, one_object);
+        // The merge level of the first absorb is the three incoming samples.
+        let first_bound = one_object + 3 * sample_len;
+        assert_eq!(fold.charged(), first_bound);
+        assert_eq!(budget.reserved(), first_bound);
 
         fold.absorb(vec![scalar_run(7, &samples, (2, 1, 1), None)])
             .expect("absorb");
         let merged = series_len + 3 * sample_len + 2 * prefix_len;
-        assert_eq!(fold.charged(), merged);
-        assert_eq!(budget.reserved(), merged);
+        assert_eq!(fold.retained, merged);
+        // Before the second absorb the fold held `one_object`; it can add
+        // three samples and one prefix, and its merge builds a level of the
+        // three held samples and the three incoming ones.
+        let second_bound = one_object + (3 * sample_len + prefix_len) + 6 * sample_len;
+        assert_eq!(fold.charged(), second_bound);
+        assert_eq!(budget.reserved(), second_bound);
 
         let series = fold.into_series(usize::MAX).expect("finish");
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].samples.len(), 3);
         assert_eq!(budget.reserved(), 0, "released once the result is built");
+    }
+
+    /// Reservations taken from the fold stay held after its result is built,
+    /// until the caller drops them (issue #4118).
+    #[test]
+    fn taken_reservations_outlive_the_result() {
+        let budget = unlimited();
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        fold.absorb(vec![scalar_run(7, &[(1, 1.0)], (1, 1, 1), None)])
+            .expect("absorb");
+        let charged = fold.charged();
+        assert!(charged > 0);
+        let held = fold.take_reservations();
+        let series = fold.into_series(usize::MAX).expect("finish");
+        assert_eq!(series.len(), 1);
+        assert_eq!(budget.reserved(), charged, "held with the series");
+        drop(held);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// An absorb whose bound does not fit is refused before it folds a run.
+    #[test]
+    fn an_absorb_over_the_budget_is_refused_before_folding() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(64));
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        let err = fold
+            .absorb(vec![scalar_run(7, &[(1, 1.0), (2, 2.0)], (1, 1, 1), None)])
+            .expect_err("the bound exceeds 64 B");
+        assert!(
+            matches!(
+                err,
+                QueryError::Fetch(FetchError::FetchMemoryExhausted { limit: 64, .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fold.retained, 0, "nothing was folded");
+        assert!(fold.by_series.is_empty());
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// A fold dropped before its result is built, as on a failed query,

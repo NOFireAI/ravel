@@ -10,11 +10,12 @@ use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError, Version};
 use ravel_promql::{LabelMatcher, MatchOp, matches_series};
 use ravel_segment::{
-    ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry,
+    CatalogCharge, ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry,
     SampleProvenance, SeriesEntry, SeriesEntryV4, ValPageKind, ValueKind, check_identity,
-    decode_catalog_matching_v4, decode_catalog_v4, decode_catalog_v5, decode_catalog_v5_chunked,
-    decode_catalog_v5_chunked_matching, decode_run_histogram_pages, decode_run_pages_soa,
-    label_dict_holds_all, open_from_suffix, plan_ranges_v4,
+    decode_catalog_matching_v4_charged, decode_catalog_v4_charged, decode_catalog_v5_charged,
+    decode_catalog_v5_chunked_charged, decode_catalog_v5_chunked_matching_charged,
+    decode_run_histogram_pages, decode_run_pages_soa, label_dict_holds_all, open_from_suffix,
+    plan_ranges_v4,
 };
 use ravel_types::accounting::{AccessIntent, AccountedOp, QueryAccounting};
 
@@ -196,18 +197,99 @@ pub(crate) enum ListedObject {
     },
 }
 
-/// The series a catalog decode selected, and the reservation charging the
+/// The series a catalog decode selected, and the reservations charging the
 /// decoded catalog to the memory budget (ADR-1702 decision 6) for as long as
-/// they are held. Derefs to the entries. `None` holds nothing: a decode that
-/// retained no entries has nothing left to charge.
+/// they are held: the section figure taken before the decode, and the
+/// per-sample provenance the decode admitted ([`BudgetCatalogCharge`]).
+/// Derefs to the entries. An empty list holds nothing: a decode that retained
+/// no entries has nothing left to charge.
 struct DecodedCatalog {
     entries: Vec<SeriesEntryV4>,
-    reservation: Option<ravel_memory::Reservation>,
+    reservations: Vec<ravel_memory::Reservation>,
 }
 
 impl DecodedCatalog {
-    fn into_parts(self) -> (Vec<SeriesEntryV4>, Option<ravel_memory::Reservation>) {
-        (self.entries, self.reservation)
+    fn into_parts(self) -> (Vec<SeriesEntryV4>, Vec<ravel_memory::Reservation>) {
+        (self.entries, self.reservations)
+    }
+
+    /// The bytes these entries hold reserved.
+    fn held(&self) -> u64 {
+        self.reservations
+            .iter()
+            .map(ravel_memory::Reservation::size)
+            .fold(0, u64::saturating_add)
+    }
+}
+
+/// The fetch memory budget as a catalog decode's [`CatalogCharge`]: each
+/// figure the decoder admits is reserved before the decoder allocates it,
+/// and the reservation of exactly that figure is dropped when the decoder
+/// reports it freed. What is still reserved when the decode returns charges
+/// the provenance of the entries it returned.
+struct BudgetCatalogCharge {
+    budget: std::sync::Arc<ravel_memory::MemoryBudget>,
+    held: Vec<ravel_memory::Reservation>,
+    refused: Option<ravel_memory::MemoryExhausted>,
+}
+
+impl BudgetCatalogCharge {
+    fn new(budget: &std::sync::Arc<ravel_memory::MemoryBudget>) -> Self {
+        Self {
+            budget: std::sync::Arc::clone(budget),
+            held: Vec::new(),
+            refused: None,
+        }
+    }
+
+    /// The decode's outcome with what it left reserved. A decode the budget
+    /// refused is [`FetchError::FetchMemoryExhausted`] for the refused figure,
+    /// any other decode error is the object's corruption, and in both cases
+    /// every reservation the decode took is released here.
+    fn settle<T>(
+        self,
+        key: &str,
+        decoded: Result<T, ravel_segment::SegmentError>,
+    ) -> Result<(T, Vec<ravel_memory::Reservation>), FetchError> {
+        match (decoded, self.refused) {
+            (Ok(value), _) => Ok((value, self.held)),
+            (Err(ravel_segment::SegmentError::CatalogChargeRefused), Some(e)) => {
+                Err(FetchError::FetchMemoryExhausted {
+                    requested: e.requested,
+                    reserved: e.reserved,
+                    limit: e.limit,
+                    cause: e.cause,
+                })
+            }
+            (Err(source), _) => Err(corrupt(key, source)),
+        }
+    }
+}
+
+impl CatalogCharge for BudgetCatalogCharge {
+    fn admit(&mut self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        match self.budget.reserve(bytes) {
+            Ok(reservation) => {
+                self.held.push(reservation);
+                true
+            }
+            Err(e) => {
+                self.refused = Some(e);
+                false
+            }
+        }
+    }
+
+    fn release(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(i) = self.held.iter().rposition(|r| r.size() == bytes) {
+            self.held.swap_remove(i);
+        }
     }
 }
 
@@ -1374,6 +1456,9 @@ pub(crate) struct BatchObservation {
     pub(crate) batch_owned: u64,
     /// Series the batch fetched.
     pub(crate) series: usize,
+    /// Bytes the batch's decode reserves once its pages are in, not yet
+    /// counted in `budget_reserved`.
+    pub(crate) decoded_len: u64,
 }
 
 impl SegmentFetcher {
@@ -1659,11 +1744,11 @@ impl SegmentFetcher {
     /// structs, and exchanging upward would turn a filter that retained
     /// everything into a new refusal point.
     fn shrink_to_retained(&self, decoded: DecodedCatalog) -> DecodedCatalog {
-        let held = decoded.reservation.as_ref().map_or(0, |r| r.size());
+        let held = decoded.held();
         if decoded.entries.is_empty() {
             return DecodedCatalog {
                 entries: decoded.entries,
-                reservation: None,
+                reservations: Vec::new(),
             };
         }
         let retained = retained_catalog_len(&decoded.entries);
@@ -1673,7 +1758,7 @@ impl SegmentFetcher {
         match self.memory_budget.reserve(retained) {
             Ok(reservation) => DecodedCatalog {
                 entries: decoded.entries,
-                reservation: Some(reservation),
+                reservations: vec![reservation],
             },
             Err(_) => decoded,
         }
@@ -2372,30 +2457,46 @@ impl SegmentFetcher {
                 // filter it.
                 let reservation = self.reserve_catalog_decode(footer, regions)?;
                 let limits = self.limits;
-                let (decoded, reservation) = match &self.read_gate {
-                    None => (
-                        decode_series_meta_catalog(footer, &dict, &ids, &meta, matchers, limits),
-                        reservation,
-                    ),
+                let mut charge = BudgetCatalogCharge::new(&self.memory_budget);
+                let (decoded, reservation, charge) = match &self.read_gate {
+                    None => {
+                        let decoded = decode_series_meta_catalog(
+                            footer,
+                            &dict,
+                            &ids,
+                            &meta,
+                            matchers,
+                            limits,
+                            &mut charge,
+                        );
+                        (decoded, reservation, charge)
+                    }
                     Some(gate) => {
                         let size = JobSize::Bytes(reservation.size());
                         let footer = footer.clone();
                         let matchers = matchers.to_vec();
                         gate.run(ReadSite::SegmentSection, size, move || {
                             let decoded = decode_series_meta_catalog(
-                                &footer, &dict, &ids, &meta, &matchers, limits,
+                                &footer,
+                                &dict,
+                                &ids,
+                                &meta,
+                                &matchers,
+                                limits,
+                                &mut charge,
                             );
-                            (decoded, reservation)
+                            (decoded, reservation, charge)
                         })
                         .await
                         .map_err(|err| gate_failed(key, err))?
                     }
                 };
-                let (entries, materialized) = decoded.map_err(|source| corrupt(key, source))?;
+                let ((entries, materialized), mut reservations) = charge.settle(key, decoded)?;
                 self.record_materialized(materialized);
+                reservations.push(reservation);
                 DecodedCatalog {
                     entries,
-                    reservation: Some(reservation),
+                    reservations,
                 }
             } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
                 let (entries, reservation) = self
@@ -2417,7 +2518,7 @@ impl SegmentFetcher {
                 // the filter keeps the result correct whichever decode ran.
                 DecodedCatalog {
                     entries: filter_matching(entries, matchers),
-                    reservation,
+                    reservations: reservation,
                 }
             } else {
                 self.ensure_ranges(
@@ -2435,29 +2536,42 @@ impl SegmentFetcher {
                     .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
                 let reservation = self.reserve_catalog_decode(footer, regions)?;
                 let limits = self.limits;
-                let (decoded, reservation) = match &self.read_gate {
-                    None => (
-                        decode_whole_object_catalog(footer, &object, matchers, limits),
-                        reservation,
-                    ),
+                let mut charge = BudgetCatalogCharge::new(&self.memory_budget);
+                let (decoded, reservation, charge) = match &self.read_gate {
+                    None => {
+                        let decoded = decode_whole_object_catalog(
+                            footer,
+                            &object,
+                            matchers,
+                            limits,
+                            &mut charge,
+                        );
+                        (decoded, reservation, charge)
+                    }
                     Some(gate) => {
                         let size = JobSize::Bytes(reservation.size());
                         let footer = footer.clone();
                         let matchers = matchers.to_vec();
                         gate.run(ReadSite::SegmentSection, size, move || {
-                            let decoded =
-                                decode_whole_object_catalog(&footer, &object, &matchers, limits);
-                            (decoded, reservation)
+                            let decoded = decode_whole_object_catalog(
+                                &footer,
+                                &object,
+                                &matchers,
+                                limits,
+                                &mut charge,
+                            );
+                            (decoded, reservation, charge)
                         })
                         .await
                         .map_err(|err| gate_failed(key, err))?
                     }
                 };
-                let (entries, materialized) = decoded.map_err(|source| corrupt(key, source))?;
+                let ((entries, materialized), mut reservations) = charge.settle(key, decoded)?;
                 self.record_materialized(materialized);
+                reservations.push(reservation);
                 DecodedCatalog {
                     entries,
-                    reservation: Some(reservation),
+                    reservations,
                 }
             };
             accounting.add_series_matched(matched.len() as u64);
@@ -2631,7 +2745,7 @@ impl SegmentFetcher {
                 probe.finish(true);
                 return Ok(DecodedCatalog {
                     entries: Vec::new(),
-                    reservation: None,
+                    reservations: Vec::new(),
                 });
             }
             probe.finish(false);
@@ -2662,29 +2776,47 @@ impl SegmentFetcher {
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
         let reservation = self.reserve_catalog_decode(footer, regions)?;
         let limits = self.limits;
-        let (decoded, reservation) = match &self.read_gate {
-            None => (
-                decode_chunked_catalog(footer, &dict, &ids, &idx, &chunks, matchers, limits),
-                reservation,
-            ),
+        let mut charge = BudgetCatalogCharge::new(&self.memory_budget);
+        let (decoded, reservation, charge) = match &self.read_gate {
+            None => {
+                let decoded = decode_chunked_catalog(
+                    footer,
+                    &dict,
+                    &ids,
+                    &idx,
+                    &chunks,
+                    matchers,
+                    limits,
+                    &mut charge,
+                );
+                (decoded, reservation, charge)
+            }
             Some(gate) => {
                 let size = JobSize::Bytes(reservation.size());
                 let footer = footer.clone();
                 let matchers = matchers.to_vec();
                 gate.run(ReadSite::SegmentSparseCatalog, size, move || {
                     let decoded = decode_chunked_catalog(
-                        &footer, &dict, &ids, &idx, &chunks, &matchers, limits,
+                        &footer,
+                        &dict,
+                        &ids,
+                        &idx,
+                        &chunks,
+                        &matchers,
+                        limits,
+                        &mut charge,
                     );
-                    (decoded, reservation)
+                    (decoded, reservation, charge)
                 })
                 .await
                 .map_err(|err| gate_failed(key, err))?
             }
         };
-        let entries = decoded.map_err(|source| corrupt(key, source))?;
+        let (entries, mut reservations) = charge.settle(key, decoded)?;
+        reservations.push(reservation);
         Ok(DecodedCatalog {
             entries,
-            reservation: Some(reservation),
+            reservations,
         })
     }
 
@@ -2960,12 +3092,14 @@ impl SegmentFetcher {
             SegmentLevel::L0 => (u64::MAX, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT),
             SegmentLevel::L1 { .. } => (self.fetch_batch_bytes(), usize::MAX),
         };
+        let level_is_l0 = matches!(seg_ref.level, SegmentLevel::L0);
         for batch in page_batches(
             &wanted,
             &scalar_planned,
             &histogram_planned,
             batch_bytes,
             self.coalesce_gap,
+            |entry| decoded_units_len(entry, level_is_l0),
         )
         .map_err(|source| corrupt(key, source))?
         {
@@ -2997,12 +3131,22 @@ impl SegmentFetcher {
                 accounting.scan(),
             )
             .await?;
+            // The decoded runs are charged before they are built and held
+            // until the sink has folded them (issue #4118): a page batch
+            // decodes to far more than its stored bytes.
+            let decoded_len = scalar_entries
+                .iter()
+                .chain(histogram_entries)
+                .map(|entry| decoded_units_len(entry, level_is_l0))
+                .fold(0, u64::saturating_add);
             #[cfg(test)]
             self.observe_batch(
                 &regions,
                 &batch_regions,
                 scalar_entries.len() + histogram_entries.len(),
+                decoded_len,
             );
+            let decoded_reservation = self.reserve_fetch(decoded_len)?;
             let scalar_out = if scalar_entries.is_empty() {
                 Vec::new()
             } else {
@@ -3032,6 +3176,7 @@ impl SegmentFetcher {
                 )?
             };
             sink(scalar_out, histogram_out)?;
+            drop(decoded_reservation);
             drop(batch_regions);
         }
         Ok(stats)
@@ -3039,7 +3184,13 @@ impl SegmentFetcher {
 
     /// Records one page batch's reservations on the test probe, if any.
     #[cfg(test)]
-    fn observe_batch(&self, segment: &FetchedRegions, batch: &FetchedRegions, series: usize) {
+    fn observe_batch(
+        &self,
+        segment: &FetchedRegions,
+        batch: &FetchedRegions,
+        series: usize,
+        decoded_len: u64,
+    ) {
         if let Some(probe) = &self.batch_probe {
             probe
                 .lock()
@@ -3050,6 +3201,7 @@ impl SegmentFetcher {
                     batch_reserved: batch.reserved_bytes(),
                     batch_owned: batch.owned_bytes(),
                     series,
+                    decoded_len,
                 });
         }
     }
@@ -4095,10 +4247,62 @@ fn coalesced_batch_bytes(sections: &[SectionSpan; 3], gap: u64) -> u64 {
     own.saturating_add(bridged)
 }
 
+/// The bytes decoding `entry`'s runs materializes before the sample fold
+/// takes them: per sample its timestamp and value, and, for a run that
+/// carries a per-sample provenance column, its [`SamplePriority`]; per
+/// emitted unit (one per series on L0, one per run on L1) the unit itself
+/// and its copy of the series' labels. A histogram sample is charged its
+/// inline [`HistogramValue`] twice, since a run's decode builds its samples
+/// once before splitting them into the unit's columns; the span and bucket
+/// vectors a histogram value points to are not counted here, and are charged
+/// by the fold that holds them.
+fn decoded_units_len(entry: &SeriesEntryV4, level_is_l0: bool) -> u64 {
+    let histogram = entry.entry.value_kind == ValueKind::Histogram;
+    let (sample_bytes, unit_bytes) = if histogram {
+        (
+            std::mem::size_of::<i64>()
+                + 2 * std::mem::size_of::<HistogramValue>()
+                + std::mem::size_of::<i64>(),
+            std::mem::size_of::<RunHistogramDecode>(),
+        )
+    } else {
+        (
+            std::mem::size_of::<i64>() + std::mem::size_of::<f64>(),
+            std::mem::size_of::<RunDecode>(),
+        )
+    };
+    let labels = entry.entry.labels.iter().fold(0u64, |acc, label| {
+        acc.saturating_add(std::mem::size_of::<ravel_types::Label>() as u64)
+            .saturating_add(label.name.len() as u64)
+            .saturating_add(label.value.len() as u64)
+    });
+    let units = if level_is_l0 {
+        1
+    } else {
+        entry.runs.len() as u64
+    };
+    let per_unit = (unit_bytes as u64).saturating_add(labels);
+    let samples = entry.runs.iter().enumerate().fold(0u64, |acc, (i, run)| {
+        let with_priority = entry
+            .per_sample_provenance
+            .get(i)
+            .is_some_and(Option::is_some);
+        let per_sample = sample_bytes
+            + if with_priority {
+                std::mem::size_of::<SamplePriority>()
+            } else {
+                0
+            };
+        acc.saturating_add(u64::from(run.sample_count).saturating_mul(per_sample as u64))
+    });
+    units.saturating_mul(per_unit).saturating_add(samples)
+}
+
 /// Cuts `wanted` (catalog order) into consecutive batches of whole series
 /// whose coalesced page bytes at `coalesce_gap`, bridged gaps included, are
-/// at most `batch_bytes`; a series whose own coalesced bytes exceed
-/// `batch_bytes` is a batch of its own. `scalar_planned` and
+/// at most `batch_bytes`, and whose `decoded_len` summed is at most
+/// `batch_bytes` too; a series whose own coalesced bytes or decoded length
+/// exceed `batch_bytes` is a batch of its own. `scalar_planned` and
 /// `histogram_planned` are the `plan_ranges_v4` output for `wanted`'s scalar
 /// and histogram series, one entry per run, in the same order.
 ///
@@ -4119,6 +4323,7 @@ fn page_batches(
     histogram_planned: &[ravel_segment::PlannedRunRange],
     batch_bytes: u64,
     coalesce_gap: u64,
+    decoded_len: impl Fn(&SeriesEntryV4) -> u64,
 ) -> Result<Vec<PageBatch>, ravel_segment::SegmentError> {
     const TS: usize = 0;
     const VAL: usize = 1;
@@ -4134,8 +4339,10 @@ fn page_batches(
         histogram_plans: 0..0,
     };
     let mut sections = [SectionSpan::default(); 3];
+    let mut decoded = 0u64;
     for entry in wanted {
         let histogram_kind = entry.entry.value_kind == ValueKind::Histogram;
+        let series_decoded = decoded_len(entry);
         let (plans, start) = if histogram_kind {
             (histogram_planned, histogram_plans)
         } else {
@@ -4159,8 +4366,12 @@ fn page_batches(
             sections
         };
         let joined = with_series(sections);
+        let joined_decoded = decoded.saturating_add(series_decoded);
         let current_is_empty = current.scalar.is_empty() && current.histogram.is_empty();
-        if !current_is_empty && coalesced_batch_bytes(&joined, coalesce_gap) > batch_bytes {
+        if !current_is_empty
+            && (coalesced_batch_bytes(&joined, coalesce_gap) > batch_bytes
+                || joined_decoded > batch_bytes)
+        {
             batches.push(current);
             current = PageBatch {
                 scalar: scalar..scalar,
@@ -4169,8 +4380,10 @@ fn page_batches(
                 histogram_plans: histogram_plans..histogram_plans,
             };
             sections = with_series([SectionSpan::default(); 3]);
+            decoded = series_decoded;
         } else {
             sections = joined;
+            decoded = joined_decoded;
         }
         if histogram_kind {
             histogram += 1;
@@ -4295,14 +4508,17 @@ fn decode_series_meta_catalog(
     meta: &[u8],
     matchers: &[LabelMatcher],
     limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<(Vec<SeriesEntryV4>, usize), ravel_segment::SegmentError> {
     if let Some(equals) = ordinal_equals(matchers) {
-        decode_catalog_matching_v4(footer, dict, ids, meta, &equals, limits).map(|matched| {
-            let materialized = matched.len();
-            (matched, materialized)
-        })
+        decode_catalog_matching_v4_charged(footer, dict, ids, meta, &equals, limits, charge).map(
+            |matched| {
+                let materialized = matched.len();
+                (matched, materialized)
+            },
+        )
     } else {
-        decode_catalog_v4(footer, dict, ids, meta, limits).map(|entries| {
+        decode_catalog_v4_charged(footer, dict, ids, meta, limits, charge).map(|entries| {
             let materialized = entries.len();
             (filter_matching(entries, matchers), materialized)
         })
@@ -4313,6 +4529,7 @@ fn decode_series_meta_catalog(
 /// [`decode_catalog_v5_chunked_matching`] when every matcher is a non-empty
 /// positive equality, otherwise the unpruned [`decode_catalog_v5_chunked`].
 /// Unfiltered either way; the caller runs `filter_matching`.
+#[allow(clippy::too_many_arguments)]
 fn decode_chunked_catalog(
     footer: &Footer,
     dict: &[u8],
@@ -4321,12 +4538,13 @@ fn decode_chunked_catalog(
     chunks: &[u8],
     matchers: &[LabelMatcher],
     limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<Vec<SeriesEntryV4>, ravel_segment::SegmentError> {
     match ordinal_equals(matchers) {
-        Some(equals) => {
-            decode_catalog_v5_chunked_matching(footer, dict, ids, idx, chunks, &equals, limits)
-        }
-        None => decode_catalog_v5_chunked(footer, dict, ids, idx, chunks, limits),
+        Some(equals) => decode_catalog_v5_chunked_matching_charged(
+            footer, dict, ids, idx, chunks, &equals, limits, charge,
+        ),
+        None => decode_catalog_v5_chunked_charged(footer, dict, ids, idx, chunks, limits, charge),
     }
 }
 
@@ -4337,8 +4555,9 @@ fn decode_whole_object_catalog(
     object: &[u8],
     matchers: &[LabelMatcher],
     limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<(Vec<SeriesEntryV4>, usize), ravel_segment::SegmentError> {
-    decode_catalog_v5(footer, object, limits).map(|entries| {
+    decode_catalog_v5_charged(footer, object, limits, charge).map(|entries| {
         let materialized = entries.len();
         (filter_matching(entries, matchers), materialized)
     })
@@ -5062,8 +5281,9 @@ mod tests {
             .expect("get object")
             .data;
         let loc = ravel_segment::open_from_full(&object, ReaderLimits::default()).expect("open");
-        let entries = decode_catalog_v5(&loc.footer, &object, ReaderLimits::default())
-            .expect("decode catalog");
+        let entries =
+            ravel_segment::decode_catalog_v5(&loc.footer, &object, ReaderLimits::default())
+                .expect("decode catalog");
         let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
         let ranges = plan_ranges_v4(&loc.footer, &selected).expect("plan ranges");
         let mut kinds = Vec::new();
@@ -5204,8 +5424,9 @@ mod tests {
             .expect("get object")
             .data;
         let loc = ravel_segment::open_from_full(&object, ReaderLimits::default()).expect("open");
-        let entries = decode_catalog_v5(&loc.footer, &object, ReaderLimits::default())
-            .expect("decode catalog");
+        let entries =
+            ravel_segment::decode_catalog_v5(&loc.footer, &object, ReaderLimits::default())
+                .expect("decode catalog");
         let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
         let ranges = plan_ranges_v4(&loc.footer, &selected).expect("plan ranges");
         let mut kinds = Vec::new();
@@ -6956,7 +7177,7 @@ mod tests {
         let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
         let decoded = DecodedCatalog {
             entries: Vec::new(),
-            reservation: Some(budget.reserve(4096).expect("the held figure fits")),
+            reservations: vec![budget.reserve(4096).expect("the held figure fits")],
         };
         budget.reserve_unchecked(4097);
         assert_eq!(budget.reserved(), 8193);
@@ -6990,7 +7211,7 @@ mod tests {
         let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
         let decoded = DecodedCatalog {
             entries,
-            reservation: Some(budget.reserve(held).expect("the held figure fits")),
+            reservations: vec![budget.reserve(held).expect("the held figure fits")],
         };
         budget.reserve_unchecked(1);
 
@@ -8246,6 +8467,12 @@ mod tests {
                 b.batch_owned,
                 b.batch_reserved
             );
+            assert!(
+                b.series == 1 || b.decoded_len <= batch_bytes,
+                "batch {i}: {} series decode to {} B, over fetch_batch_bytes ({batch_bytes} B)",
+                b.series,
+                b.decoded_len
+            );
         }
         let series: Vec<usize> = batched.batches.iter().map(|b| b.series).collect();
         assert_eq!(series, BATCH_SERIES_AT_DEFAULT_GAP, "series per batch");
@@ -8399,8 +8626,8 @@ mod tests {
         // (case, matchers, coalesce gap, page sections the selection touches,
         // batches)
         let cases: [(&str, &[LabelMatcher], u64, u64, u64); 2] = [
-            ("every series, zero gap", &[], 0, 3, 23),
-            ("every third series, 512-byte gap", &selective, 512, 3, 23),
+            ("every series, zero gap", &[], 0, 3, 52),
+            ("every third series, 512-byte gap", &selective, 512, 3, 32),
         ];
         for (label, matchers, gap, sections, expected_batches) in cases {
             let whole = batch_run(&bytes, tenant_hash, &seg_ref, matchers, |f| {
@@ -8466,7 +8693,9 @@ mod tests {
                 )))
         })
         .await;
-        assert_eq!(fits.batches.len(), 9, "batches");
+        // Cut on the decoded bytes as well as the pages: nine batches on the
+        // pages alone.
+        assert_eq!(fits.batches.len(), 16, "batches");
         let first_batch = fits.batches[0].batch_reserved;
         let open_and_catalog_gets = fits.store_gets - fits.scan_gets();
 
@@ -8498,6 +8727,48 @@ mod tests {
         assert_eq!(budget.reserved(), 0, "the refusal holds nothing");
     }
 
+    /// Issue #4118: a batch's decoded runs are reserved before the batch is
+    /// decoded. A budget that holds the open, the catalog and the batch's
+    /// pages but is one byte short of its decoded runs refuses with the
+    /// decoded figure, after the page GET and before any page is decoded: the
+    /// scan accounted no decompressed bytes.
+    #[tokio::test]
+    async fn a_batch_whose_decode_does_not_fit_is_refused_before_it_decodes() {
+        let (bytes, tenant_hash, seg_ref) = batched_l1_segment(64, 256, false);
+        let one_batch = |f: SegmentFetcher| ranged_l1(f).with_fetch_batch_floor(u64::MAX);
+        let whole = batch_run(&bytes, tenant_hash, &seg_ref, &[], one_batch).await;
+        assert_eq!(whole.batches.len(), 1);
+        assert!(
+            whole.phases.scan.decompressed_bytes > 0,
+            "the unbudgeted read decodes its pages"
+        );
+        let first = whole.batches[0];
+        assert!(first.decoded_len > 0);
+        let limit = first.budget_reserved + first.decoded_len - 1;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let refused = batch_run(&bytes, tenant_hash, &seg_ref, &[], |f| {
+            one_batch(f).with_memory_budget(Arc::clone(&budget))
+        })
+        .await;
+        match &refused.decoded {
+            Err(FetchError::FetchMemoryExhausted {
+                requested,
+                limit: refused_limit,
+                ..
+            }) => {
+                assert_eq!(*requested, first.decoded_len, "the batch's decoded runs");
+                assert_eq!(*refused_limit, limit);
+            }
+            other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(refused.batches.len(), 1, "the batch's pages were fetched");
+        assert_eq!(
+            refused.phases.scan.decompressed_bytes, 0,
+            "no page was decoded"
+        );
+        assert_eq!(budget.reserved(), 0, "the refusal holds nothing");
+    }
+
     /// L0 is never batched: under a fetch share far below its pages an L0
     /// fetch issues exactly the GETs and wire bytes it issues unbudgeted, one
     /// batch, within the per-segment pin of `MAX_GETS_PER_L0_SEGMENT_FETCH`.
@@ -8518,7 +8789,8 @@ mod tests {
         assert_eq!(unbudgeted.batches.len(), 1);
         let pages = unbudgeted.batches[0].batch_reserved;
         let held = unbudgeted.batches[0].segment_reserved + pages;
-        let budget = Arc::new(ravel_memory::MemoryBudget::new(2 * held));
+        let decoded = unbudgeted.batches[0].decoded_len;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(2 * (held + decoded)));
         let configure = |f: SegmentFetcher| {
             ranged_l1(f)
                 .with_fetch_batch_floor(1)
@@ -8528,8 +8800,9 @@ mod tests {
         let share =
             configure(SegmentFetcher::new(Arc::new(MemoryStore::new()))).fetch_batch_bytes();
         assert!(
-            share * 4 < pages,
-            "an L1 part of these pages would be cut into batches: share {share}, pages {pages}"
+            share < pages && share < decoded,
+            "an L1 part of these pages would be cut into batches on its pages and on its \
+             decoded bytes: share {share}, pages {pages}, decoded {decoded}"
         );
         let budgeted = batch_run(&bytes, tenant_hash, &seg_ref, &matchers, configure).await;
         assert_eq!(budgeted.batches.len(), 1, "one batch");
@@ -9863,12 +10136,13 @@ mod tests {
         };
         let wanted = [&entry];
         let full: Vec<_> = (0..3).map(plan).collect();
-        let batches = page_batches(&wanted, &full, &[], u64::MAX, 0).expect("consistent plans");
+        let batches =
+            page_batches(&wanted, &full, &[], u64::MAX, 0, |_| 0).expect("consistent plans");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].scalar_plans, 0..3);
 
         let short: Vec<_> = (0..2).map(plan).collect();
-        let result = page_batches(&wanted, &short, &[], u64::MAX, 0);
+        let result = page_batches(&wanted, &short, &[], u64::MAX, 0, |_| 0);
         assert!(
             matches!(result, Err(ravel_segment::SegmentError::SectionOutOfBounds)),
             "a series with more runs than planned ranges must refuse, got {:?}",
@@ -9941,7 +10215,7 @@ mod tests {
         let mut surplus_scalar = scalar_list();
         surplus_scalar.push(plan(&b, 1, 5));
         assert_eq!(
-            page_batches(&wanted, &surplus_scalar, &histogram, u64::MAX, 0),
+            page_batches(&wanted, &surplus_scalar, &histogram, u64::MAX, 0, |_| 0),
             Err(ravel_segment::SegmentError::SectionOutOfBounds),
             "a surplus scalar plan must refuse"
         );
@@ -9950,14 +10224,15 @@ mod tests {
         let mut surplus_histogram = histogram_list();
         surplus_histogram.push(plan(&h, 2, 5));
         assert_eq!(
-            page_batches(&wanted, &scalar, &surplus_histogram, u64::MAX, 0),
+            page_batches(&wanted, &scalar, &surplus_histogram, u64::MAX, 0, |_| 0),
             Err(ravel_segment::SegmentError::SectionOutOfBounds),
             "a surplus histogram plan must refuse"
         );
 
         // (iii) Exact lists batch. Each run is 16 coalesced bytes, so at 32
         // bytes per batch `a`, `h` and `b` land in three batches.
-        let batches = page_batches(&wanted, &scalar, &histogram, 32, 0).expect("consistent plans");
+        let batches =
+            page_batches(&wanted, &scalar, &histogram, 32, 0, |_| 0).expect("consistent plans");
         let scalar_plans: Vec<_> = batches.iter().map(|b| b.scalar_plans.clone()).collect();
         let histogram_plans: Vec<_> = batches.iter().map(|b| b.histogram_plans.clone()).collect();
         assert_eq!(scalar_plans, vec![0..2, 2..2, 2..3]);
@@ -9972,6 +10247,21 @@ mod tests {
                 assert_eq!(pair[0].end, pair[1].start, "plan ranges must be contiguous");
             }
         }
+
+        // (iv) The decoded runs cut batches too (issue #4118). The three
+        // series' pages coalesce to 80 bytes, one batch at 80; at 20 decoded
+        // bytes a series they stay one batch, and at 30 `b` would take the
+        // decoded runs to 90 and starts a second batch.
+        let batches_at = |decoded: u64| {
+            page_batches(&wanted, &scalar, &histogram, 80, 0, move |_| decoded)
+                .expect("consistent plans")
+                .iter()
+                .map(|b| (b.scalar.clone(), b.histogram.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(batches_at(0), vec![(0..2, 0..1)], "the pages fit one batch");
+        assert_eq!(batches_at(20), vec![(0..2, 0..1)]);
+        assert_eq!(batches_at(30), vec![(0..1, 0..1), (1..2, 1..1)]);
     }
 
     /// An out-of-order range is counted as its length plus two gaps; ascending
