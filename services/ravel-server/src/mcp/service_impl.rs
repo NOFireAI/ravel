@@ -707,7 +707,7 @@ impl QueryBackend for ServiceBackend {
             .sql_execute_at(tenant_hash, request, resolve_at_ns)
             .await
             .map_err(failure)?;
-        let envelope = self.sql_envelope(request, &outcome)?;
+        let envelope = self.sql_envelope(tenant_hash, request, &outcome)?;
         let signal = cursor_signal(
             outcome.target,
             outcome.signal_tables_named,
@@ -763,7 +763,7 @@ impl QueryBackend for ServiceBackend {
             .sql_execute(tenant_hash, &native)
             .await
             .map_err(failure)?;
-        let mut envelope = self.sql_envelope(&native, &outcome)?;
+        let mut envelope = self.sql_envelope(tenant_hash, &native, &outcome)?;
         envelope.scope.signal = "traces".to_string();
         envelope.scope.table = "spans".to_string();
         Ok(envelope)
@@ -968,20 +968,15 @@ impl ServiceBackend {
     /// it.
     fn sql_envelope(
         &self,
+        tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
         outcome: &ravel_sql::SqlOutcome,
     ) -> Result<Envelope, Failure> {
         let mut envelope = self.sql_base(request);
-        // A result the JSON encoding cannot hold is the caller's choice of
-        // column, not an internal fault; anything else is one.
-        let output = outcome.output.to_json().map_err(|error| match error {
-            ravel_sql::SqlError::UnencodableResult {
-                column,
-                data_type,
-                reason,
-            } => d4::unencodable_sql_result(&column, &data_type, reason),
-            error => d4::internal(format!("sql result encoding: {error}")),
-        })?;
+        let output = outcome
+            .output
+            .to_json()
+            .map_err(|error| sql_encoding_failure(error, tenant_hash))?;
         envelope.data = d4::sql_data(&output);
         if let Some(predicate) = &outcome.stats.window_predicate {
             envelope.scope.predicates_applied.push(predicate.clone());
@@ -1027,8 +1022,46 @@ fn failure(error: ServiceError) -> Failure {
     d4::failure(&error)
 }
 
+/// Turn a failure of encoding a SQL result as JSON into a caller-facing
+/// [`Failure`].
+///
+/// A [`ravel_sql::SqlError::UnencodableResult`] is the caller's choice of
+/// column; its message names only the column, its Arrow type and a fixed
+/// reason, never the value, so it is surfaced verbatim. Any other encoding
+/// error carries internal detail in its `Display` (an Arrow writer message, a
+/// corrupt-column description), so the caller receives only its fixed,
+/// redacted [`client_message`](ravel_sql::SqlError::client_message) and the
+/// full error is logged once at warn with the tenant hash, in the style of
+/// [`ServiceError::from_sql`]. Its `Display` text never reaches the caller.
+///
+/// The failure stays [`FailureClass::Internal`]: an encoding fault on this
+/// side is not the caller's statement to fix, so it keeps the class the
+/// caller can act on rather than adopting the `Unsupported` class
+/// `from_sql` would assign a [`ravel_sql::SqlError::Internal`].
+fn sql_encoding_failure(error: ravel_sql::SqlError, tenant_hash: TenantHash) -> Failure {
+    match error {
+        ravel_sql::SqlError::UnencodableResult {
+            column,
+            data_type,
+            reason,
+        } => d4::unencodable_sql_result(&column, &data_type, reason),
+        error => {
+            let client_message = error.client_message();
+            tracing::warn!(
+                tenant = %tenant_hash.to_hex(),
+                error = %error,
+                client_message = %client_message,
+                "mcp sql result encoding error redacted from client response",
+            );
+            d4::internal(client_message)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     /// No selector is the whole matcher set `{}`; selectors are recorded as
@@ -1083,5 +1116,128 @@ mod tests {
             ]
         );
         assert!(stats_unbounded_components(&QueryStats::default()).is_empty());
+    }
+
+    /// An internal failure of the JSON encoding step carries detail in its
+    /// `Display` (here a fake object key), so the caller receives only the
+    /// fixed `client_message`, under the `Internal` class, and never the
+    /// detail. This is the HTTP SQL surface's redaction, reached through the
+    /// same `ServiceError::from_sql`.
+    ///
+    /// FLIP (current code, which formats the `Display` into the failure): the
+    /// message is `sql result encoding: ...` and both assertions below fail.
+    /// FLIP (a fix that returns `client_message` but appends the `Display`):
+    /// the exact-equality and the `!contains` assertions both fail.
+    #[test]
+    fn an_internal_encoding_error_is_redacted_to_the_fixed_client_message() {
+        const DETAIL: &str = "arrow IPC writer at key s3://tenant-7/seg-0001";
+        let failure = sql_encoding_failure(
+            ravel_sql::SqlError::Internal(DETAIL.to_string()),
+            TenantHash([0xAB; 16]),
+        );
+        assert_eq!(failure.class, FailureClass::Internal);
+        assert_eq!(failure.message, ravel_sql::MSG_INTERNAL);
+        assert!(
+            !failure.message.contains("s3://"),
+            "the internal detail leaked to the caller: {}",
+            failure.message
+        );
+    }
+
+    /// A result the JSON encoding cannot hold is the caller's choice of
+    /// column: the message names the column, its Arrow type and the fixed
+    /// reason, byte-equal to what `/mcp` returns today, and is classed
+    /// `Unsupported`, not redacted away.
+    ///
+    /// FLIP (a fix that redacts every encoding error): this arm returns
+    /// `MSG_INTERNAL` and every assertion below fails.
+    #[test]
+    fn an_unencodable_result_names_the_column_type_and_reason() {
+        let failure = sql_encoding_failure(
+            ravel_sql::SqlError::UnencodableResult {
+                column: "d".to_string(),
+                data_type: "Date64".to_string(),
+                reason: "a JSON date must be a whole day",
+            },
+            TenantHash([0xAB; 16]),
+        );
+        assert_eq!(failure.class, FailureClass::Unsupported);
+        assert_eq!(
+            failure.message,
+            d4::unencodable_sql_result("d", "Date64", "a JSON date must be a whole day").message
+        );
+        assert!(failure.message.contains("column \"d\" of type Date64"));
+        assert!(failure.message.contains("a JSON date must be a whole day"));
+    }
+
+    /// A `tracing` writer that appends every emitted byte to a shared buffer so
+    /// a test can read what the server logged.
+    #[derive(Clone)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The full internal error reaches the server log once, with the tenant
+    /// hash, even though the caller is told only the fixed message. The detail
+    /// the caller never sees must be present for the operator.
+    ///
+    /// FLIP (a fix that redacts without logging): the buffer holds neither the
+    /// detail nor the tenant hash and both assertions below fail.
+    #[test]
+    fn the_full_internal_error_is_logged_with_the_tenant_hash() {
+        const DETAIL: &str = "arrow IPC writer at key s3://tenant-7/seg-0001";
+        // `from_sql`'s warn callsite is also reached by `sql.rs`'s tests in
+        // this binary; while one dispatcher is registered tracing caches a
+        // callsite's interest from the first thread to touch it, so a second
+        // dispatcher kept alive for the process forces interest to be computed
+        // per dispatch and this thread's subscriber to see the event.
+        static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLog(buffer.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let tenant = TenantHash([0xAB; 16]);
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let _failure =
+                sql_encoding_failure(ravel_sql::SqlError::Internal(DETAIL.to_string()), tenant);
+        }
+
+        let log = String::from_utf8(buffer.lock().expect("log buffer lock").clone())
+            .expect("log bytes are utf-8");
+        assert!(
+            log.contains(DETAIL),
+            "the full error must reach the server log: {log}"
+        );
+        assert!(
+            log.contains(&tenant.to_hex()),
+            "the log must name the tenant: {log}"
+        );
     }
 }
