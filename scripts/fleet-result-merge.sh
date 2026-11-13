@@ -329,6 +329,10 @@ start_ref="refs/heads/task/${task_id}/start"
 pr_branch="task/${task_id}/merge"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dry_run="${FLEET_MERGE_DRY_RUN:-0}"
+# Read now, while the caller's checkout is on disk: the re-authoring pass
+# below runs with a result branch's base checked out, and a base older than
+# strip-attribution-trailers.sh does not have the file.
+strip_attribution_src="$(cat "${script_dir}/guards/strip-attribution-trailers.sh")"
 
 # --- Recovery trap -------------------------------------------------------
 # A failure anywhere below (a cherry-pick conflict, an aborted gate run, a
@@ -463,8 +467,9 @@ fi
 #
 # This pass ALWAYS runs. It replays every retained commit onto the base with
 # the merger's git identity as author and committer, preserving the original
-# author date, dropping any fleet-executor sign-off, and adding the merger's
-# own DCO sign-off. The result is the cleaned, correctly-attributed history
+# author date, dropping any fleet-executor sign-off and any AI attribution
+# line (scripts/guards/strip-attribution-trailers.sh), and adding the
+# merger's own DCO sign-off. The result is the cleaned, correctly-attributed history
 # that gets pushed to the PR branch.
 merge_name="$(git config user.name || true)"
 merge_email="$(git config user.email || true)"
@@ -481,10 +486,12 @@ git checkout -q -B "${authorship_branch}" "${base}"
 while IFS= read -r sha; do
   git cherry-pick -n "${sha}"
   msg_file="$(mktemp)"
-  # Keep every trailer except a sign-off from the fleet-executor identity;
-  # the merger's sign-off is (re)added by `git commit -s` below.
+  # Keep every trailer except a sign-off from the fleet-executor identity
+  # and the AI attribution lines assert-clean-authorship.sh refuses; the
+  # merger's sign-off is (re)added by `git commit -s` below.
   git log -1 --format=%B "${sha}" \
-    | grep -viE '^Signed-off-by:[[:space:]]+.*<fleet-executor@nofire\.ai>[[:space:]]*$' \
+    | bash -c "${strip_attribution_src}" \
+    | { grep -viE '^Signed-off-by:[[:space:]]+.*<fleet-executor@nofire\.ai>[[:space:]]*$' || true; } \
     >"${msg_file}"
   GIT_AUTHOR_NAME="${merge_name}" GIT_AUTHOR_EMAIL="${merge_email}" \
   GIT_AUTHOR_DATE="$(git log -1 --format=%aI "${sha}")" \

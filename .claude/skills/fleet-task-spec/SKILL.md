@@ -45,7 +45,8 @@ lost when your workdir is torn down.
 
 UNATTENDED TASK: never ask for confirmation or approval; when your work
 passes the gates, commit it and end with a report. Committing
-(git commit -s) is part of the deliverable.
+(git commit -s) is part of the deliverable. A commit message carries no
+Co-Authored-By line and no other attribution of the tool that wrote it.
 
 DEGRADED-BOX TRIPWIRE, your very first command, before reading anything:
 

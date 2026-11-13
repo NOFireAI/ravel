@@ -300,6 +300,8 @@ fi
 e2e_tools="${tmproot}/e2e-tools"
 mkdir -p "${e2e_tools}/scripts/guards" "${e2e_tools}/bin"
 cp "${SCRIPT}" "${e2e_tools}/scripts/fleet-result-merge.sh"
+# Not a stub: the merge script pipes every commit message through it.
+cp "$(dirname "${SCRIPT}")/guards/strip-attribution-trailers.sh" "${e2e_tools}/scripts/guards/"
 # The stub bodies are single-quoted on purpose: they expand when the stub runs.
 # shellcheck disable=SC2016
 {
@@ -314,10 +316,11 @@ cp "${SCRIPT}" "${e2e_tools}/scripts/fleet-result-merge.sh"
 chmod +x "${e2e_tools}"/scripts/*.sh "${e2e_tools}"/scripts/guards/*.sh "${e2e_tools}/bin/gh"
 printf 'feat(scratch): land the result\n\nThe body.\n' >"${e2e_tools}/message.txt"
 
-# merge_run <name> <stub guard exit> [ALLOW_STALE_SHAPE_SITES value]: build a
-# scratch origin with main and task/t1/result, run the merge script from a
-# clone on main, and leave its exit code in e2e_rc, its output in
-# <dir>/run.log and the stubs' call log in <dir>/calls.log.
+# merge_run <name> <stub guard exit> [ALLOW_STALE_SHAPE_SITES value]
+# [result commit body]: build a scratch origin with main and task/t1/result,
+# run the merge script from a clone on main, and leave its exit code in
+# e2e_rc, its output in <dir>/run.log and the stubs' call log in
+# <dir>/calls.log.
 merge_run() {
   local dir="${tmproot}/e2e-$1"
   e2e_dir="${dir}"
@@ -326,7 +329,7 @@ merge_run() {
   git -C "${dir}/work" remote add origin "${dir}/origin.git"
   git -C "${dir}/work" push -q origin main
   git -C "${dir}/work" checkout -q -b result
-  commit_in "${dir}/work" deliverable.txt "feat(scratch): add the deliverable" "" "${DELIVERABLE_AUTHOR}"
+  commit_in "${dir}/work" deliverable.txt "feat(scratch): add the deliverable" "${4:-}" "${DELIVERABLE_AUTHOR}"
   git -C "${dir}/work" push -q origin result:refs/heads/task/t1/result
   git -C "${dir}/work" checkout -q main
   git -C "${dir}/work" branch -q -D result
@@ -368,6 +371,32 @@ check_eq "shape guard exit 0: PR created" "1" "$(called "${e2e_dir}" "gh pr crea
 check_eq "shape guard exit 0: the guard checked the pushed head against origin/main" \
   "shape-guard $(merge_ref "${e2e_dir}") origin/main" \
   "$(grep '^shape-guard' "${e2e_dir}/calls.log")"
+if [[ ${e2e_rc} -ne 0 ]]; then
+  cat "${e2e_dir}/run.log"
+fi
+
+# (k) An executor's AI attribution line never reaches the pushed history
+# (issue #4169). This run uses the real authorship guard, not the stub: the
+# script used to do all of its rewriting and then fail at that guard, so the
+# guard passing inside the script is the thing to prove.
+cp "$(dirname "${SCRIPT}")/guards/assert-clean-authorship.sh" "${e2e_tools}/scripts/guards/assert-clean-authorship.sh"
+merge_run attribution 0 "" "Why it was needed.
+
+Refs: #7
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+check_eq "attribution: script exits 0 past the real authorship guard" "0" "${e2e_rc}"
+check_eq "attribution: PR created" "1" "$(called "${e2e_dir}" "gh pr create")"
+pushed_body="$(git -C "${e2e_dir}/origin.git" log -1 --format=%B "$(merge_ref "${e2e_dir}")" 2>/dev/null)"
+check_eq "attribution: no Co-Authored-By in the pushed commit" "0" \
+  "$(printf '%s\n' "${pushed_body}" | grep -c -i '^co-authored-by:')"
+check_eq "attribution: Refs trailer kept" "1" \
+  "$(printf '%s\n' "${pushed_body}" | grep -c -F 'Refs: #7')"
+check_eq "attribution: one sign-off, the merger's" \
+  "Signed-off-by: $(git -C "${e2e_dir}/work" config user.name) <$(git -C "${e2e_dir}/work" config user.email)>" \
+  "$(printf '%s\n' "${pushed_body}" | grep -i '^signed-off-by:')"
+check_eq "attribution: the tree is the result's tree" \
+  "$(git -C "${e2e_dir}/origin.git" rev-parse refs/heads/task/t1/result^{tree})" \
+  "$(git -C "${e2e_dir}/origin.git" rev-parse "$(merge_ref "${e2e_dir}")^{tree}")"
 if [[ ${e2e_rc} -ne 0 ]]; then
   cat "${e2e_dir}/run.log"
 fi
