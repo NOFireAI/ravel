@@ -6,8 +6,9 @@ any candidate named here requires its own ADR and an RSEG format version
 bump (docs/segment-format.md); this document is evidence for that future
 decision, not the decision itself.
 
-Raw program output (both binaries, full stdout, plus the DeXOR fetch) is
-committed beside this file as `codec-portfolio.raw.txt`. Every figure quoted
+Raw program output (both binaries, full stdout, plus the DeXOR fetch, then
+a second `codec_bakeoff` run with DeXOR added) is committed beside this
+file as `codec-portfolio.raw.txt`. Every figure quoted
 below, ratios included, is copied verbatim from that file, except where the
 text says it subtracts production's 6-byte page header or takes a byte
 difference, and then the operands are quoted beside it. Line numbers are
@@ -239,11 +240,95 @@ on decode (74.0 against 85.9 and 72.1 against 87.2 Mval/s). On
 
 ## DeXOR (arXiv 2601.00695)
 
-**Not evaluated in this report; tracked in issue #3925.** The abstract page
-was reachable from this box for this run (`HTTP_CODE=200`; the command and
-its output are at the end of the raw file). The earlier run of this report,
-on a different executor, timed out on the same fetch. Nothing is implemented
-under the DeXOR name here.
+Issue #3925 adds `dexor` as a `codec_bakeoff` challenger
+(`crates/ravel-bench/src/codecs.rs`). It splits each value at its decimal
+tail and at the longest decimal prefix it shares with the previous value,
+stores only the decimal suffix below that prefix behind a 2-bit case code,
+and sends any value whose decimal reconstruction does not reproduce its
+exact bits to an exception path (IEEE 754 sign and fraction plus an
+adaptive-width exponent delta, or the raw 64-bit word).
+
+The implementation follows the orchestrator's extraction of the paper in
+issue #3925, not the authors' code, and its bit layout is not meant to
+interoperate with theirs. The extraction marks these points as choices
+where the paper is silent or ambiguous:
+
+- Initial state: previous value `+0.0`, previous tail and prefix
+  coordinates 0, exception exponent width 1. The first value has no
+  special path.
+- Both sides compute the prefix from the previous value and never cache it
+  across values.
+- Reconstruction builds the decimal integer first, scales it by `10^q` in
+  one multiply or divide, and applies the sign last, so `-0.0` survives the
+  decimal path.
+- Field order: the tail coordinate (as `q + 20` in 5 bits) before `o - q`
+  (4 bits); in an exception, the exponent delta before sign and fraction
+  (Figure 6a draws it last). Suffix widths come from a fixed table, and the
+  value count comes from the container, with no stream header.
+- The exception exponent delta is taken against the previous exception
+  value, not the previous stream value.
+- The width contracts after more than 8 consecutive deltas inside the
+  smaller range (the text's "more than rho", not Figure 6b's ">= rho").
+- Non-finite values go straight to the exception path; the tail tolerance
+  `|x - round(x)| < 1e-6` is two-sided where the paper writes `trunc`; the
+  tail coordinate is clamped to [-20, 11]; the paper's prior-knowledge mode
+  is not implemented.
+
+One more choice was made while implementing it: the encoder's tail test
+also requires a nonzero rounded digit (any zero passes). As extracted, the
+absolute tolerance accepts every small value at the highest tail, so a
+zero, which clamps the tail to 11, made every later value below about
+`1e5` an exception: before this change `counter_int_resets` n=500 measured
+6.4020 B/sample, with 437 of its 500 values on the exception path. The tail
+search runs in the encoder only, so this changes the ratio, not the
+decoded bits.
+
+Every main-pipeline value is checked by running the decoder's
+reconstruction on the fields about to be written and comparing by
+`f64::to_bits`; any mismatch takes the exception path.
+
+**Measurement stamp**: AMD EPYC 7R13 Processor, 16 cores, 30.6 GiB memory,
+Linux 7.0.0-1011-aws x86_64; rustc 1.97.1 (8bab26f4f 2026-07-14), release
+profile; commit bcab1849bc0933f9b6744abf4b4c8c7d5474208b, measured
+2026-11-13. That is a work-in-progress commit folded on merge; the codec
+and the binary are identical in the commit that lands. The run is the
+second `codec_bakeoff` block in the raw file, and production's figures
+below come from that same run. Production's bytes per sample equal the
+first run's on all 18 rows; its throughputs are a separate measurement.
+
+| dataset | n | production enc | production B/sample | enc Mval/s | dec Mval/s | dexor B/sample | ratio | enc Mval/s | dec Mval/s |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| counter_int_resets | 60 | 19 | 0.6000 | 7.3 | 53.1 | 1.3667 | 2.278 | 21.3 | 33.9 |
+| gauge_int | 60 | 19 | 0.6167 | 7.2 | 53.1 | 1.2167 | 1.973 | 22.7 | 34.7 |
+| gauge_dec2 | 60 | 19 | 1.1333 | 5.8 | 50.9 | 1.7000 | 1.500 | 18.7 | 31.6 |
+| gauge_dec3 | 60 | 19 | 1.5167 | 5.6 | 49.8 | 2.1167 | 1.396 | 15.5 | 29.2 |
+| noisy_float | 60 | 17 | 8.0000 | 3.6 | 58.5 | 7.3333 | 0.917 | 7.0 | 15.8 |
+| constant | 60 | 18 | 0.0833 | 10.0 | 65.7 | 0.2833 | 3.400 | 33.4 | 41.6 |
+| sparse | 60 | 18 | 0.5333 | 8.5 | 60.7 | 0.7000 | 1.312 | 29.1 | 35.2 |
+| float_counter(ctrl) | 60 | 16 | 7.1833 | 3.6 | 6.9 | 7.0000 | 0.974 | 7.8 | 15.5 |
+| metricsbench_history | 60 | 19 | 2.4833 | 4.4 | 46.9 | 5.7000 | 2.295 | 7.1 | 15.8 |
+| counter_int_resets | 500 | 18 | 1.0260 | 9.5 | 82.5 | 1.4400 | 1.404 | 20.2 | 33.0 |
+| gauge_int | 500 | 19 | 0.5140 | 10.4 | 73.7 | 1.1760 | 2.288 | 22.3 | 34.1 |
+| gauge_dec2 | 500 | 19 | 1.0160 | 7.5 | 70.3 | 1.6940 | 1.667 | 10.8 | 20.6 |
+| gauge_dec3 | 500 | 19 | 1.3920 | 5.4 | 58.5 | 2.1440 | 1.540 | 13.6 | 27.7 |
+| noisy_float | 500 | 17 | 8.0000 | 3.7 | 50.7 | 7.3280 | 0.916 | 5.8 | 15.6 |
+| constant | 500 | 18 | 0.0100 | 13.2 | 93.9 | 0.2540 | 25.400 | 32.3 | 39.7 |
+| sparse | 500 | 18 | 0.4020 | 9.0 | 49.5 | 0.6440 | 1.602 | 18.4 | 28.8 |
+| float_counter(ctrl) | 500 | 17 | 8.0000 | 3.6 | 85.4 | 6.8160 | 0.852 | 7.6 | 15.1 |
+| metricsbench_history | 500 | 19 | 2.2780 | 5.3 | 61.8 | 5.7020 | 2.503 | 6.7 | 16.1 |
+
+The binary's adoption summary prints `adopt: none` for all 18 rows of this
+run too.
+
+**dexor: reject.** It misses the byte bound on all 18 rows. Its best
+ratios are 0.852 (`float_counter(ctrl)`, n=500), 0.916 and 0.917
+(`noisy_float`, n=500 and n=60) and 0.974 (`float_counter(ctrl)`, n=60),
+all above 0.75. The decode prong clears on one row, `float_counter(ctrl)`
+n=60, where production picks Gorilla (15.5 against 6.9 Mval/s); on the
+other 17 it decodes at 15.1 to 41.6 Mval/s against production's 46.9 to
+93.9. On every integer and fixed-decimal shape production's enc 18 or 19
+is smaller (ratio 1.312 to 25.400), and on `metricsbench_history` DeXOR is
+2.295 (n=60) and 2.503 (n=500) times production's size.
 
 ## Class closure: fixed-row coverage in ravel-segment
 
