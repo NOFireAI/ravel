@@ -333,14 +333,21 @@ impl ListFetch for AzureRestClient {
     }
 }
 
-/// What a 404 means for one request (ADR-4158 D5).
+/// What a 404 means for one request (ADR-4158 D5), and, for
+/// `AccountInformation`, which 403 gets the control-plane-action hint
+/// (issue #4178).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Subject {
     /// A blob request: a 404 is [`StoreError::NotFound`] unless its code is
     /// `ContainerNotFound`.
     Blob,
-    /// A listing or an account request: any 404 is the container missing.
+    /// A listing request: any 404 is the container missing.
     Container,
+    /// Get Account Information, through the container or the account URL:
+    /// any 404 is the container or account missing, and a 403
+    /// `AuthorizationPermissionMismatch` names the missing control-plane
+    /// action rather than the generic access-denied text.
+    AccountInformation,
 }
 
 impl AzureRestClient {
@@ -474,7 +481,7 @@ impl AzureRestClient {
                 path,
                 &query,
                 None,
-                Subject::Container,
+                Subject::AccountInformation,
             )
             .await?;
         Ok(headers)
@@ -747,15 +754,39 @@ impl Failure {
 }
 
 /// A final status, classified by the status, the `x-ms-error-code` and, for a
-/// 404, what the request addressed (ADR-4158 D5).
+/// 404, what the request addressed (ADR-4158 D5). A 403
+/// `AuthorizationPermissionMismatch` on `AccountInformation` names the
+/// missing control-plane action (ADR-4158, the 2026-11-13 correction about
+/// the account-information permission): the built-in Storage
+/// Blob Data roles authorize data actions on blobs and a few container
+/// actions, never this one, so an identity holding only those roles cannot
+/// read the hierarchical-namespace flag and `refuse_hierarchical_namespace`
+/// treats the unreadable answer as a refusal (D6). Every other 401 and 403,
+/// on any subject, keeps the plain access-denied text: a 403 on a blob or
+/// list request is a data-plane permission gap the getInfo action does not
+/// explain.
 fn status_error(context: &str, status: u16, code: Option<&str>, subject: Subject) -> StoreError {
     let detail = match code {
         Some(code) => format!("{context}: HTTP {status} {code}"),
         None => format!("{context}: HTTP {status}"),
     };
     match status {
+        403 if subject == Subject::AccountInformation
+            && code == Some("AuthorizationPermissionMismatch") =>
+        {
+            StoreError::AccessDenied(format!(
+                "{detail}: the identity needs the control-plane action \
+                 Microsoft.Storage/storageAccounts/blobServices/getInfo/action \
+                 on the storage account, which the built-in Storage Blob Data \
+                 roles do not include (see docs/guides/kubernetes.md, \
+                 \"Azure Blob Storage with workload identity\")"
+            ))
+        }
         401 | 403 => StoreError::AccessDenied(detail),
-        404 if code == Some("ContainerNotFound") || subject == Subject::Container => {
+        404 if code == Some("ContainerNotFound")
+            || subject == Subject::Container
+            || subject == Subject::AccountInformation =>
+        {
             StoreError::Permanent(format!("{detail}: the container does not exist"))
         }
         404 => StoreError::NotFound,

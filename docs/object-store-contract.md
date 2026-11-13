@@ -1181,7 +1181,14 @@ Errors are classified by status and `x-ms-error-code` (ADR-4158 D5): 404
 `CasVersion` put), 404 `ContainerNotFound` is `Permanent` on every operation,
 multipart `put_part` and `complete` included, 401 and 403 are
 `AccessDenied`, 416 is `InvalidRange`, and 429, 503 and 500 are retried and,
-once the retries run out, surface as a retryable error.
+once the retries run out, surface as a retryable error. Get Account
+Information's 403 `AuthorizationPermissionMismatch` is `AccessDenied` with a
+longer message naming the control-plane action
+`Microsoft.Storage/storageAccounts/blobServices/getInfo/action`, which the
+built-in Storage Blob Data roles do not include, and pointing at
+`docs/guides/kubernetes.md`'s "Azure Blob Storage with workload identity"
+(ADR-4158, the 2026-11-13 correction about the account-information
+permission); every other 401 and 403 keeps the plain text.
 
 Both clients send through the S3 adapter's connector, scoped to the store's
 own host (`<account>.blob.core.windows.net`, or the endpoint's host and

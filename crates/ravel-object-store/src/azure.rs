@@ -65,7 +65,17 @@
 //! A 404 `ContainerNotFound` is [`StoreError::Permanent`] on every operation;
 //! a 404 `BlobNotFound` is [`StoreError::NotFound`] (`delete` treats it as
 //! success). 401 and 403 are [`StoreError::AccessDenied`], 416 is
-//! [`StoreError::InvalidRange`], and 429, 503 and 5xx are retryable.
+//! [`StoreError::InvalidRange`], and 429, 503 and 5xx are retryable. Get
+//! Account Information's 403 `AuthorizationPermissionMismatch` (the request
+//! `refuse_hierarchical_namespace` sends at construction, through the
+//! container URL and, when that answer lacks the header, the account URL)
+//! gets a longer [`StoreError::AccessDenied`] naming the control-plane action
+//! `Microsoft.Storage/storageAccounts/blobServices/getInfo/action`, which the
+//! built-in Storage Blob Data roles do not include, and pointing at
+//! `docs/guides/kubernetes.md`'s "Azure Blob Storage with workload identity"
+//! (ADR-4158, the 2026-11-13 correction about the account-information
+//! permission). Every other 403, and this one with any other code, keeps
+//! the plain text.
 //!
 //! # Instrumentation
 //!
