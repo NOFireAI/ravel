@@ -35,10 +35,21 @@
 //! [`BucketedFinalAggregateRule::admits`] is the whole predicate: a
 //! `FinalPartitioned` aggregate with no limit, linear input order and no
 //! dynamic filter; one grouping set with no `__grouping_id` key; every key a
-//! fixed-width integer, date, timestamp, time or interval; every aggregate
-//! with a `GroupsAccumulator`, no ordering requirement, and state fields that
-//! are fixed-width integer, temporal or `Decimal128`, never float. Anything
-//! else keeps the stock plan (`every_refusal_condition_leaves_the_plan_unchanged`).
+//! fixed-width integer, date, timestamp, time or interval, or, in spill mode
+//! alone (the refusal retry, ADR-4143 decision 3), a string or binary type;
+//! every aggregate with a `GroupsAccumulator`, no ordering requirement, and
+//! state fields that are fixed-width integer, temporal or `Decimal128`, never
+//! float. Anything else keeps the stock plan
+//! (`every_refusal_condition_leaves_the_plan_unchanged`).
+//!
+//! A route with a string or binary column budgets each chunk in bytes
+//! instead of rows (`ByteChunk`): one budget of `routed_chunk_bytes`,
+//! charged before a row is written and never passed, out of which every
+//! column's validity, fixed-width values, 16 bytes of view or offset per row
+//! and copied string bytes come. Strings are copied into the chunk's own
+//! data block, so a chunk keeps no input batch alive. A chunk seals when the
+//! next row would pass the budget or at `routed_chunk_rows` rows; a row
+//! larger than the budget takes a chunk of its own, charged at its size.
 //!
 //! The rule runs before `CompactSlices`, which wraps only `AggregateExec`, so
 //! a converted aggregate gets neither half of that rule: the slice compaction
@@ -97,7 +108,10 @@
 //! written when it fills and each bucket's last chunk when input ends. A
 //! refusal while the stream still holds its stock table first routes that
 //! table's state straight to the files in slices of `routed_chunk_rows`
-//! rows, under the table's own charge and with no grow, then asks again.
+//! rows (on a route with a string or binary column, slices cut as its
+//! chunks seal: at most `routed_chunk_bytes` bytes or `routed_chunk_rows`
+//! rows, or one larger row alone), under the table's own charge and with no
+//! grow, then asks again.
 //! When input ends each bucket is read back from its file, aggregated alone,
 //! emitted, and its file deleted before the next bucket starts, so every
 //! routed row is written at most once and nothing is merged. A refusal with
@@ -808,37 +822,28 @@ const VARIABLE_WIDTH_ROW_BYTES: usize = 16;
 /// chunk's data block.
 const VIEW_INLINE_BYTES: usize = 12;
 
-/// The bytes a byte-budgeted chunk of `rows` rows holds, `copied[i]` of them
-/// string bytes copied into column `i`'s data block: per column its
-/// validity bitmap, its fixed-width values or
-/// [`VARIABLE_WIDTH_ROW_BYTES`] per row of view or offset, and its copied
-/// bytes, each rounded up to 64 bytes as allocated. `None` past `usize`, or
-/// when a data block passes what its offsets or views can address.
-fn byte_chunk_bytes(layouts: &[RoutedLayout], rows: usize, copied: &[usize]) -> Option<usize> {
-    layouts
-        .iter()
-        .zip(copied)
-        .try_fold(0usize, |acc, (layout, &copied)| {
-            let addressable = match layout {
-                RoutedLayout::Fixed(_) => 0,
-                RoutedLayout::Offsets(width) if *width == size_of::<i32>() => i32::MAX as usize,
-                RoutedLayout::Offsets(_) => i64::MAX as usize,
-                RoutedLayout::Views => u32::MAX as usize,
-            };
-            if copied > addressable {
-                return None;
-            }
-            let per_row = match layout {
-                RoutedLayout::Fixed(width) => *width,
-                RoutedLayout::Offsets(_) | RoutedLayout::Views => VARIABLE_WIDTH_ROW_BYTES,
-            };
-            let validity = rows.div_ceil(8).checked_next_multiple_of(64)?;
-            let values = rows.checked_mul(per_row)?.checked_next_multiple_of(64)?;
-            let data = copied.checked_next_multiple_of(64)?;
-            acc.checked_add(validity)?
-                .checked_add(values)?
-                .checked_add(data)
-        })
+/// The bytes one column of a byte-budgeted chunk of `rows` rows holds,
+/// `copied` of them string bytes copied into its data block: its validity
+/// bitmap, its fixed-width values or [`VARIABLE_WIDTH_ROW_BYTES`] per row of
+/// view or offset, and its copied bytes, each rounded up to 64 bytes as
+/// allocated. A chunk holds the sum over its columns. `None` past `usize`,
+/// or when the data block passes what its offsets or views can address.
+fn routed_column_bytes(layout: RoutedLayout, rows: usize, copied: usize) -> Option<usize> {
+    let (per_row, addressable) = match layout {
+        RoutedLayout::Fixed(width) => (width, 0),
+        RoutedLayout::Offsets(width) if width == size_of::<i32>() => {
+            (VARIABLE_WIDTH_ROW_BYTES, i32::MAX as usize)
+        }
+        RoutedLayout::Offsets(_) => (VARIABLE_WIDTH_ROW_BYTES, i64::MAX as usize),
+        RoutedLayout::Views => (VARIABLE_WIDTH_ROW_BYTES, u32::MAX as usize),
+    };
+    if copied > addressable {
+        return None;
+    }
+    let validity = rows.div_ceil(8).checked_next_multiple_of(64)?;
+    let values = rows.checked_mul(per_row)?.checked_next_multiple_of(64)?;
+    let data = copied.checked_next_multiple_of(64)?;
+    validity.checked_add(values)?.checked_add(data)
 }
 
 /// One column of an input batch, read row by row into a byte-budgeted
@@ -1014,7 +1019,7 @@ impl<'a> ByteSource<'a> {
 /// A bucket's chunk on a route with a variable-width column (ADR-4143
 /// decision 3): one budget of `budget` bytes, charged in full before a row
 /// is written, which every row's fixed-width values, view or offset,
-/// validity and copied string bytes come out of ([`byte_chunk_bytes`]).
+/// validity and copied string bytes come out of ([`routed_column_bytes`]).
 /// Strings are copied into the chunk's own data block, so no source batch
 /// stays alive behind it, and its buffers' capacities never sum past the
 /// budget.
@@ -1057,14 +1062,13 @@ impl ByteChunk {
     /// the budget's measure; `None` when they pass `usize` or what a data
     /// block can address.
     fn bytes_with(&self, sources: &[ByteSource<'_>], row: usize) -> Option<usize> {
-        let copied: Vec<usize> = self
-            .copied
-            .iter()
-            .zip(sources)
-            .map(|(copied, source)| copied.checked_add(source.copied(row)))
-            .collect::<Option<_>>()?;
-        let layouts: Vec<RoutedLayout> = self.types.iter().map(|(_, layout)| *layout).collect();
-        byte_chunk_bytes(&layouts, self.len + 1, &copied)
+        self.types.iter().zip(&self.copied).zip(sources).try_fold(
+            0usize,
+            |acc, (((_, layout), copied), source)| {
+                let copied = copied.checked_add(source.copied(row))?;
+                acc.checked_add(routed_column_bytes(*layout, self.len + 1, copied)?)
+            },
+        )
     }
 
     /// Whether `row` of `sources` fits: under the row cap and, with it, at
