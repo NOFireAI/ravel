@@ -9,8 +9,8 @@
 **Ravel acknowledges a write when S3 has it.**
 
 Ravel is a database for OpenTelemetry metrics, logs, and traces that keeps
-all of its state in object storage: any S3-compatible store, or Google Cloud
-Storage. There is no write-ahead log, no replicated ingest quorum, and no
+all of its state in object storage: any S3-compatible store, Google Cloud
+Storage, or Azure Blob Storage. There is no write-ahead log, no replicated ingest quorum, and no
 StatefulSet to run. Kill any Ravel process at any moment, and every strictly
 acknowledged write is still in the bucket.
 

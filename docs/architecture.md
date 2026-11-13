@@ -380,14 +380,18 @@ record. A deployment runs `ravel-cli store qualify` once before its first
 server starts. That run proves that the backend honours the semantics that
 the commit protocol depends on, before any data depends on them.
 
-The durable backends are an S3-compatible bucket (`--store s3`) and a Google
-Cloud Storage bucket (`--store gcs`, ADR-3456). Both are gated the same way:
-the record names the backend as `s3://<bucket>` or `gs://<bucket>`, and the
-server compares it with its own configuration at startup. A GCS server
-authenticates with Application Default Credentials (GKE Workload Identity in
-a cluster) and refuses the S3-only control-plane flags (`--s3-*`,
+The durable backends are an S3-compatible bucket (`--store s3`), a Google
+Cloud Storage bucket (`--store gcs`, ADR-3456) and an Azure Blob Storage
+container (`--store azure`, ADR-4158). All three are gated the same way: the
+record names the backend as `s3://<bucket>`, `gs://<bucket>` or
+`az://<account>/<container>`, and the server compares it with its own
+configuration at startup. A GCS server authenticates with Application Default
+Credentials (GKE Workload Identity in a cluster), and an Azure server with the
+standard `AZURE_*` environment (AKS workload identity, a managed identity, or
+an account key). Both refuse the S3-only control-plane flags (`--s3-*`,
 `--s3-kms-key`, `--tenant-kms-config`, `--require-bucket-protection`) rather
-than ignoring them.
+than ignoring them, and an Azure server also refuses the `--gcs-*` flags and
+an account with hierarchical namespace enabled.
 
 On Kubernetes the operator makes that run itself. The operator supports
 `--store s3` only; a GCS deployment runs the qualification and the servers

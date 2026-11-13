@@ -223,7 +223,9 @@ async fn server_on_gcs_ingests_and_reads_logs() {
     let identity = format!("gs://{BUCKET}@{}", fake.endpoint());
     assert_eq!(cli.backend_identity().as_deref(), Some(identity.as_str()));
 
-    let built = build_store(&cli, CACHE_MAX_BYTES).expect("the gcs store builds");
+    let built = build_store(&cli, CACHE_MAX_BYTES)
+        .await
+        .expect("the gcs store builds");
     qualify(&built, &identity).await;
     ravel_server::qualification::enforce(
         built.foreground.as_ref(),
@@ -296,7 +298,9 @@ async fn server_on_gcs_refuses_an_unqualified_bucket() {
     let fake = FakeGcs::start(BUCKET).await.expect("fake GCS starts");
     let cli = gcs_cli(&fake);
     assert_eq!(cli.store, StoreKind::Gcs);
-    let built = build_store(&cli, CACHE_MAX_BYTES).expect("the gcs store builds");
+    let built = build_store(&cli, CACHE_MAX_BYTES)
+        .await
+        .expect("the gcs store builds");
     let err = ravel_server::qualification::enforce(
         built.foreground.as_ref(),
         cli.store,
