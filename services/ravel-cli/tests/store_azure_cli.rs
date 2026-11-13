@@ -167,11 +167,11 @@ async fn list_page_size_reaches_the_azure_listing() {
     }
 }
 
-/// A qualification taken with one container is not one of another: each
-/// container's record names that container, so the record of `data` is not
-/// the identity a process configured for `other` compares against; and a
-/// qualify pointed at a container the account does not serve fails without
-/// writing a record.
+/// `--azure-container` routes the requests: a qualify of each container
+/// writes a record naming that container into that container, and a qualify
+/// pointed at a container the endpoint does not serve fails, its report
+/// naming `ContainerNotFound`, and leaves the served container's record
+/// untouched.
 #[tokio::test(flavor = "multi_thread")]
 async fn qualification_of_one_container_is_not_one_of_another() {
     let data = FakeAzure::start(ACCOUNT, CONTAINER)
@@ -198,11 +198,6 @@ async fn qualification_of_one_container_is_not_one_of_another() {
         other_identity,
         format!("az://{ACCOUNT}/other@{}", other.endpoint())
     );
-    assert_ne!(
-        data_identity,
-        format!("az://{ACCOUNT}/other@{}", data.endpoint()),
-        "the record of one container must not match the identity of another on the same endpoint"
-    );
 
     let before = data.data_of(QUALIFICATION_KEY);
     let output = run(ravel_cli(args(
@@ -211,9 +206,23 @@ async fn qualification_of_one_container_is_not_one_of_another() {
     )))
     .await;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
         "qualify against a container the account does not serve must fail; stdout:\n{stdout}"
+    );
+    // The error on stderr names the container qualified, and the per-property
+    // report on stdout carries the store's reason.
+    assert!(
+        stderr.contains(&format!(
+            "store qualification failed: az://{ACCOUNT}/other@{}",
+            data.endpoint()
+        )),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("the Azure container does not exist (ContainerNotFound)"),
+        "the property failures name the missing container; stdout:\n{stdout}"
     );
     assert!(
         !stdout.contains(&format!("wrote {QUALIFICATION_KEY}")),
@@ -418,7 +427,7 @@ fn account_and_container_are_required_under_azure() {
 }
 
 /// `agents dev` drives the compose RustFS bucket, so `--store azure` refuses
-/// with the shape of its `--store gcs` refusal.
+/// with the shape of its `--store gcs` refusal, before the store is built.
 #[tokio::test(flavor = "multi_thread")]
 async fn agents_dev_refuses_azure() {
     let fake = FakeAzure::start(ACCOUNT, CONTAINER)
@@ -433,13 +442,7 @@ async fn agents_dev_refuses_azure() {
         &output,
         &["agents dev refuses --store azure: it starts, creates and qualifies the compose"],
     );
-    assert!(
-        fake.requests()
-            .iter()
-            .all(|request| request.method != "PUT"),
-        "a refused dev writes nothing: {:?}",
-        fake.requests()
-    );
+    assert_no_requests(&fake);
 }
 
 /// The tenant-KMS commands refuse `--tenant-kms-config` under `--store azure`
