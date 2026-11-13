@@ -1612,6 +1612,13 @@ A `not_migrated` line names the path that the bucket was dispatched to
 - `record_set_changed`: the bucket's records changed before the publish.
 - `publish_abandoned`: the run passed its compaction deadline before the
   publish.
+- `part_index_refusal refusal=<kind>`: the bucket's RLOG merge was refused
+  because its parts do not fit the part index (`part_key_space` or
+  `part_range_window`), so no record was published. The run
+  completes the bucket's claim and the walk goes on to later buckets. The
+  bucket's L0 inputs stay live, so the floor does not rise past it, and a
+  retry with the same inputs and settings is refused the same way; a `#`
+  line under the list says so.
 
 When a `not_migrated` bucket is retried depends on how the run ended. The `# `
 line under the list says which case applies:

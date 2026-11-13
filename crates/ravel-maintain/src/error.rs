@@ -598,6 +598,30 @@ pub enum MaintainError {
     },
 }
 
+/// Which construction of [`MaintainError::is_part_index_refusal`] fired
+/// (issue #4127): a migrate walk's [`crate::migrate::NotMigratedReason`]
+/// keeps this apart rather than the refusal's full message, since
+/// [`MaintainError`] carries an `f64` field elsewhere and so is not `Eq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartIndexRefusalKind {
+    /// [`MaintainError::PartRangeWindow`]: a range's parts outgrew its
+    /// window.
+    RangeWindow,
+    /// [`MaintainError::PartKeySpace`]: the unit's records pass the part
+    /// key's indexes times the range quantum.
+    KeySpace,
+}
+
+impl PartIndexRefusalKind {
+    /// The `refusal` label value.
+    pub fn name(self) -> &'static str {
+        match self {
+            PartIndexRefusalKind::RangeWindow => "part_range_window",
+            PartIndexRefusalKind::KeySpace => "part_key_space",
+        }
+    }
+}
+
 impl MaintainError {
     /// The trailer version an RSEG, RLOG or RSPAN reader refused, when this
     /// error is that refusal.
@@ -620,6 +644,16 @@ impl MaintainError {
             self,
             MaintainError::PartRangeWindow { .. } | MaintainError::PartKeySpace { .. }
         )
+    }
+
+    /// Which part-index refusal this is, when [`Self::is_part_index_refusal`]
+    /// is true; `None` otherwise.
+    pub fn part_index_refusal_kind(&self) -> Option<PartIndexRefusalKind> {
+        match self {
+            MaintainError::PartRangeWindow { .. } => Some(PartIndexRefusalKind::RangeWindow),
+            MaintainError::PartKeySpace { .. } => Some(PartIndexRefusalKind::KeySpace),
+            _ => None,
+        }
     }
 
     /// The reader's own error out of [`MaintainError::InputOutOfWindow`]; any

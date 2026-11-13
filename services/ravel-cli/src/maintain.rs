@@ -2504,7 +2504,9 @@ impl NotMigratedRetry {
 
 /// One line per bucket the walk dispatched a rewrite for that published
 /// nothing, with the path and the reason, followed by the sentence that says
-/// when a later run retries them. Returns the empty string for an empty list.
+/// when a later run retries them and, when a part_index_refusal bucket is
+/// listed, what a retry of it meets. Returns the empty string for an empty
+/// list.
 fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -> String {
     if buckets.is_empty() {
         return String::new();
@@ -2522,6 +2524,9 @@ fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -
             NotMigratedReason::Cancelled { at } => format!("cancelled checkpoint={}", at.name()),
             NotMigratedReason::RecordSetChanged => "record_set_changed".to_string(),
             NotMigratedReason::PublishAbandoned => "publish_abandoned".to_string(),
+            NotMigratedReason::PartIndexRefusal { refusal } => {
+                format!("part_index_refusal refusal={}", refusal.name())
+            }
         };
         out.push_str(&format!(
             "not_migrated: shard={} hour={} path={path} reason={reason}\n",
@@ -2546,6 +2551,19 @@ fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -
              passed it. Nothing is left to retry.\n"
         }
     });
+    if buckets
+        .iter()
+        .any(|b| matches!(b.reason, NotMigratedReason::PartIndexRefusal { .. }))
+    {
+        out.push_str(
+            "# A part_index_refusal bucket was refused part indexes by its RLOG merge \
+             (ADR-3853): part_key_space when its records pass the part key's indexes times \
+             the range quantum, part_range_window when a range's parts outgrow its window. A \
+             retry with the same inputs and settings is refused the same way, as compaction \
+             refuses it, and its records keep the floor from rising while they stay below the \
+             target.\n",
+        );
+    }
     out
 }
 
@@ -4052,6 +4070,18 @@ mod tests {
                         NotMigratedReason::RecordSetChanged
                     ),
                     not_migrated(MigrationPath::Reencode, NotMigratedReason::PublishAbandoned),
+                    not_migrated(
+                        MigrationPath::L0Migration,
+                        NotMigratedReason::PartIndexRefusal {
+                            refusal: ravel_maintain::PartIndexRefusalKind::KeySpace
+                        }
+                    ),
+                    not_migrated(
+                        MigrationPath::L0Migration,
+                        NotMigratedReason::PartIndexRefusal {
+                            refusal: ravel_maintain::PartIndexRefusalKind::RangeWindow
+                        }
+                    ),
                 ],
                 NotMigratedRetry::NextRun
             ),
@@ -4061,9 +4091,30 @@ mod tests {
              checkpoint=part_boundary\n\
              not_migrated: shard=0 hour=5 path=l0_migration reason=record_set_changed\n\
              not_migrated: shard=0 hour=5 path=reencode reason=publish_abandoned\n\
+             not_migrated: shard=0 hour=5 path=l0_migration reason=part_index_refusal \
+             refusal=part_key_space\n\
+             not_migrated: shard=0 hour=5 path=l0_migration reason=part_index_refusal \
+             refusal=part_range_window\n\
              # Each not_migrated bucket published nothing this run. This run drained the walk \
              and cleared its cursor, so the next migrate run starts over and retries every one \
-             of them.\n"
+             of them.\n\
+             # A part_index_refusal bucket was refused part indexes by its RLOG merge \
+             (ADR-3853): part_key_space when its records pass the part key's indexes times \
+             the range quantum, part_range_window when a range's parts outgrow its window. A \
+             retry with the same inputs and settings is refused the same way, as compaction \
+             refuses it, and its records keep the floor from rising while they stay below the \
+             target.\n"
+        );
+        assert!(
+            !not_migrated_report(
+                &[not_migrated(
+                    MigrationPath::L0Migration,
+                    NotMigratedReason::RecordSetChanged
+                )],
+                NotMigratedRetry::NextRun
+            )
+            .contains("part_index_refusal"),
+            "the part-index comment prints only beside a part_index_refusal bucket"
         );
         assert_eq!(not_migrated_report(&[], NotMigratedRetry::NextRun), "");
     }
@@ -4105,8 +4156,9 @@ mod tests {
     }
 
     /// Each kind of bucket a migrate run can leave below the target without
-    /// raising the floor: one per `reencode_blocked` reason and a
-    /// `not_migrated` claim skip, with the line it prints.
+    /// raising the floor: one per `reencode_blocked` reason, a `not_migrated`
+    /// claim skip and a `not_migrated` part-index refusal, with the line it
+    /// prints.
     fn unmigrated_buckets() -> Vec<(FamilyMigrateReport, &'static str)> {
         let blocked = |reason| FamilyMigrateReport {
             reencode_blocked: vec![ReencodeBlockedBucket {
@@ -4146,6 +4198,21 @@ mod tests {
                 "not_migrated: shard=0 hour=1 path=l0_migration reason=claim_skipped \
                  claim_reason=held_by_another\n",
             ),
+            (
+                FamilyMigrateReport {
+                    not_migrated: vec![NotMigratedBucket {
+                        shard: 0,
+                        ingest_hour: 1,
+                        path: MigrationPath::L0Migration,
+                        reason: NotMigratedReason::PartIndexRefusal {
+                            refusal: ravel_maintain::PartIndexRefusalKind::KeySpace,
+                        },
+                    }],
+                    ..FamilyMigrateReport::default()
+                },
+                "not_migrated: shard=0 hour=1 path=l0_migration reason=part_index_refusal \
+                 refusal=part_key_space\n",
+            ),
         ]
     }
 
@@ -4158,7 +4225,7 @@ mod tests {
     /// `migrate_verdict` return an error when `reencode_blocked` holds a
     /// contested_overlap or multiple_records bucket or `not_migrated` is
     /// non-empty, as the earlier budget-stop verdict did, and the `expect`
-    /// fails for those three cases.
+    /// fails for those four cases.
     #[test]
     fn a_budget_stop_exits_zero_and_prints_every_unmigrated_bucket() {
         for (mut report, line) in unmigrated_buckets() {
