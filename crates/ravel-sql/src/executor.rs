@@ -7406,20 +7406,34 @@ pub(crate) fn take_sql_error(err: DataFusionError) -> Result<SqlError, DataFusio
 /// `class()`/`client_message()` rather than collapsed into a generic
 /// execution failure, so a budget error that happens to cross a `Shared`
 /// boundary keeps its own HTTP class and text (checkpoint review finding).
+/// Its `Display` is kept as the rebuilt error's detail for the server log.
 fn classify_shared(err: &DataFusionError) -> Option<SqlError> {
     match err {
         DataFusionError::External(boxed) => {
             let sql = boxed.downcast_ref::<SqlError>()?;
-            Some(if sql.is_segment_not_found() {
-                SqlError::Fetch(ravel_query::FetchError::Store {
-                    key: String::new(),
-                    source: ravel_object_store::StoreError::NotFound,
-                })
-            } else {
+            Some(match sql {
+                _ if sql.is_segment_not_found() => {
+                    SqlError::Fetch(ravel_query::FetchError::Store {
+                        key: String::new(),
+                        source: ravel_object_store::StoreError::NotFound,
+                    })
+                }
+                // Rebuilt at an earlier boundary: carry its detail as is, so
+                // the log keeps the innermost error's cause.
                 SqlError::Shared {
+                    class,
+                    message,
+                    detail,
+                } => SqlError::Shared {
+                    class: *class,
+                    message: message.clone(),
+                    detail: detail.clone(),
+                },
+                _ => SqlError::Shared {
                     class: sql.class(),
                     message: sql.client_message(),
-                }
+                    detail: sql.to_string(),
+                },
             })
         }
         DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
@@ -9482,6 +9496,134 @@ pub(crate) mod tests {
         assert_eq!(recovered.client_message(), want_message);
         assert!(recovered.client_message().contains("20"));
         assert!(recovered.client_message().contains("10"));
+    }
+
+    const SHARED_KEY: &str = "t/deadbeefcafef00d/metrics/l0/0/writer-7.1.2.0123456789abcdef.rseg";
+    const SHARED_CAUSE: &str = "bucket=prod-telemetry request-id=shared-cause";
+
+    /// A store fault whose `Display` names the key and the backend's text,
+    /// and whose client message is the fixed transient one.
+    fn store_fault() -> SqlError {
+        SqlError::Fetch(FetchError::Store {
+            key: SHARED_KEY.to_string(),
+            source: StoreError::AccessDenied(SHARED_CAUSE.to_string()),
+        })
+    }
+
+    /// Recover through `take_sql_error` and check the rebuilt error against
+    /// the original: same class and client text, and the original's own
+    /// `Display` (key and backend cause) as the logged detail.
+    fn assert_shared_keeps_cause(wrapped: DataFusionError, original: &SqlError) {
+        let recovered = take_sql_error(wrapped).expect("recovered");
+        assert!(
+            matches!(recovered, SqlError::Shared { .. }),
+            "expected a rebuilt Shared, got {recovered:?}"
+        );
+        let logged = recovered.to_string();
+        assert_eq!(logged, original.to_string());
+        assert!(logged.contains(SHARED_KEY), "log lost the key: {logged}");
+        assert!(logged.contains(SHARED_CAUSE), "log lost the cause: {logged}");
+        assert_eq!(recovered.client_message(), original.client_message());
+        assert_eq!(recovered.class(), original.class());
+    }
+
+    /// Issue #4174: the error a `RepartitionExec` hands every output
+    /// partition keeps its cause in the server log line, which prints the
+    /// error's `Display`.
+    #[test]
+    fn a_shared_error_logs_the_original_cause() {
+        let original = store_fault();
+        let wrapped = DataFusionError::Shared(Arc::new(store_fault().into()));
+        assert_shared_keeps_cause(wrapped, &original);
+    }
+
+    #[test]
+    fn a_doubly_shared_error_logs_the_innermost_cause() {
+        let original = store_fault();
+        let inner = DataFusionError::Shared(Arc::new(store_fault().into()));
+        assert_shared_keeps_cause(DataFusionError::Shared(Arc::new(inner)), &original);
+    }
+
+    /// An error already rebuilt at one boundary, re-raised through the plan
+    /// and shared again, keeps the first boundary's detail rather than a
+    /// detail built from the rebuilt error's client text.
+    #[test]
+    fn a_rebuilt_shared_error_shared_again_keeps_its_detail() {
+        let original = store_fault();
+        let first = take_sql_error(DataFusionError::Shared(Arc::new(store_fault().into())))
+            .expect("recovered");
+        let again = DataFusionError::Shared(Arc::new(first.into()));
+        assert_shared_keeps_cause(again, &original);
+    }
+
+    #[test]
+    fn a_context_wrapped_shared_error_logs_the_original_cause() {
+        let original = store_fault();
+        let shared = DataFusionError::Shared(Arc::new(store_fault().into()));
+        let wrapped = DataFusionError::Context("while repartitioning".to_string(), Box::new(shared));
+        assert_shared_keeps_cause(wrapped, &original);
+
+        let inner = DataFusionError::Context(
+            "while scanning".to_string(),
+            Box::new(store_fault().into()),
+        );
+        assert_shared_keeps_cause(DataFusionError::Shared(Arc::new(inner)), &original);
+    }
+
+    /// Redaction pin: for every fixed client message, a `Shared` rebuilt from
+    /// an error of that class returns exactly that message, and the message
+    /// carries nothing of the detail the log line gets.
+    #[test]
+    fn a_shared_error_redacts_to_the_fixed_client_message() {
+        use crate::error::{
+            MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_SPILL_UNAVAILABLE,
+            MSG_UNAVAILABLE, MSG_UNSATISFIABLE,
+        };
+
+        let cases: Vec<(SqlError, &str)> = vec![
+            (store_fault(), MSG_UNAVAILABLE),
+            (
+                SqlError::Fetch(FetchError::Store {
+                    key: SHARED_KEY.to_string(),
+                    source: StoreError::Corrupted(SHARED_CAUSE.to_string()),
+                }),
+                MSG_CORRUPT,
+            ),
+            (
+                SqlError::Catalog(ravel_catalog::CatalogError::UnsatisfiableToken {
+                    shard: 0,
+                    writer_id: SHARED_CAUSE.to_string(),
+                    epoch: 1,
+                    seq: 2,
+                    ingest_hour_bucket: 3,
+                }),
+                MSG_UNSATISFIABLE,
+            ),
+            (
+                SqlError::SpillUnavailable(format!("/scratch/{SHARED_CAUSE}")),
+                MSG_SPILL_UNAVAILABLE,
+            ),
+            (SqlError::Plan(SHARED_CAUSE.to_string()), MSG_PLAN),
+            (SqlError::Execution(SHARED_CAUSE.to_string()), MSG_EXECUTION),
+            (SqlError::Internal(SHARED_CAUSE.to_string()), MSG_INTERNAL),
+            (SqlError::OperatorPanic(SHARED_CAUSE.to_string()), MSG_INTERNAL),
+        ];
+        for (original, fixed) in cases {
+            let class = original.class();
+            assert_eq!(original.client_message(), fixed, "{original}");
+            let wrapped = DataFusionError::Shared(Arc::new(original.into()));
+            let recovered = take_sql_error(wrapped).expect("recovered");
+            assert!(matches!(recovered, SqlError::Shared { .. }), "{recovered:?}");
+            assert_eq!(recovered.class(), class, "{recovered}");
+            let message = recovered.client_message();
+            assert_eq!(message, fixed, "{recovered}");
+            assert!(!message.contains(SHARED_CAUSE), "leaked cause: {message}");
+            assert!(!message.contains(SHARED_KEY), "leaked key: {message}");
+            assert!(
+                recovered.to_string().contains(SHARED_CAUSE),
+                "log lost the cause: {recovered}"
+            );
+        }
     }
 
     #[test]
