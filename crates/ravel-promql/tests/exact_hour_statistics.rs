@@ -1447,10 +1447,12 @@ fn hist_fixtures() -> Vec<HistFixture> {
             markers: markers.clone(),
         },
         HistFixture {
-            // `hist_staleness` with custom buckets.
+            // `hist_staleness`'s layout with custom buckets. The constant
+            // first bucket makes the 0.9 quantile, which falls in (1,2],
+            // depend on how many reset corrections were added.
             name: "hist_custom_buckets",
             kind: Kind::Custom,
-            samples: staleness_layout(|v| custom(&CUSTOM_BOUNDS, &[v, v / 2.0, 0.1], v * 0.75)),
+            samples: staleness_layout(|v| custom(&CUSTOM_BOUNDS, &[0.1, v / 2.0, v], v * 1.1)),
             markers,
         },
         HistFixture {
@@ -2287,8 +2289,9 @@ fn histogram_sum_rejects_telescoped_hour_sum() {
 fn histogram_rows_reassociations_disagree_on_pinned_windows() {
     // Every window where the rows' condition holds, both forms of mutant (a),
     // all three rows. The telescoped sum disagrees with the evaluator where it
-    // reads the 120m NaN sum, and through rounding on `hist_staleness`'s and
-    // `hist_custom_buckets`' (0m,120m]; corrections summed once never do.
+    // reads the 120m NaN sum and, through rounding, on `hist_staleness` and
+    // `hist_custom_buckets`; corrections summed once disagree on
+    // `hist_custom_buckets` only.
     let mut disagree = Vec::new();
     for fx in hist_fixtures() {
         for &w in WINDOWS {
@@ -2307,6 +2310,7 @@ fn histogram_rows_reassociations_disagree_on_pinned_windows() {
         }
     }
     let telescoped_sum = |w| ("hist_schema_change", w, Hist::Sum, Combine::Reassociate);
+    let custom = |w, f, how| ("hist_custom_buckets", w, f, how);
     assert_eq!(
         disagree,
         vec![
@@ -2315,7 +2319,16 @@ fn histogram_rows_reassociations_disagree_on_pinned_windows() {
             telescoped_sum("(70m,130m]"),
             ("hist_staleness", "(0m,120m]", Hist::Count, Combine::Reassociate),
             ("hist_staleness", "(0m,120m]", Hist::Quantile, Combine::Reassociate),
-            ("hist_custom_buckets", "(0m,120m]", Hist::Count, Combine::Reassociate),
+            custom("(0m,180m]", Hist::Count, Combine::Reassociate),
+            custom("(0m,180m]", Hist::Quantile, Combine::Reassociate),
+            custom("(0m,120m]", Hist::Count, Combine::CorrectionsOnce),
+            custom("(0m,120m]", Hist::Quantile, Combine::Reassociate),
+            custom("(0m,120m]", Hist::Quantile, Combine::CorrectionsOnce),
+            custom("(34m,167m]", Hist::Count, Combine::CorrectionsOnce),
+            custom("(34m,167m]", Hist::Sum, Combine::Reassociate),
+            custom("(34m,167m]", Hist::Quantile, Combine::CorrectionsOnce),
+            custom("(70m,130m]", Hist::Count, Combine::Reassociate),
+            custom("(70m,130m]", Hist::Quantile, Combine::Reassociate),
         ]
     );
 }
