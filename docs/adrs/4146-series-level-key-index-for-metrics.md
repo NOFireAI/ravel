@@ -203,9 +203,16 @@ for it as today.
   to that `skey`'s pair set. Labels are decoded from every covered entry,
   so the pairs of a series are the union over every stored label set the
   part holds for its `skey`. Then the classes, then the three sorted entry
-  lists, sliced and encoded by the existing splitter
-  (`split_key_index_entries`) and encoder, with entry kind 1 for the
-  first two fields.
+  lists, sliced and encoded. `class_objects` is entry kind 0 and uses the
+  existing splitter (`split_key_index_entries`) and encoder as they are.
+  The two posting fields need a kind-1 variant of both: the splitter takes
+  `&[KeyIndexLeafEntry]`, whose shape is `(key8, entry_ordinal: u64,
+  blocks: Vec<u32>)`, and requires the list sorted and unique by `(key8,
+  entry_ordinal)` (kidx.rs:172-179, kidx.rs:554-565), while a posting has
+  no entry ordinal, one entry per `key8`, and `u64` elements. A posting
+  entry type, its splitter (cuts between `key8`s, each sized by its delta
+  bytes) and its encoder are new code, shipped with the R1 decoder, whose
+  round-trip test needs them, and called by the W1 build.
 - **Carry (ADR-3939 decision 5).** A re-encoded part carries from the
   previous part's three fields: the previous `series_class` and
   `class_objects` leaves give each `skey`'s entry set, remapped by data
@@ -244,8 +251,9 @@ part that carries refs for all three fields:
 2. If `S` is empty, every covered entry of the part is pruned for the
    plan. If `|S|` is above `S_max`, the part declines (step 5). `S_max`
    is 192, derived from the byte budget `Q_BC` of step 3 in section
-   "Expected cost" (predicted); it only spares pass B's prefix GET on a
-   part the budget would decline anyway.
+   "Expected cost" (predicted); it spares pass B's prefix GET on a part
+   the budget would most likely decline, and the budget, not `S_max`, is
+   the bound.
 3. Pass B probes `series_class` with `S`, giving the classes `C`. Passes
    B and C run under a byte budget of their own, `Q_BC` = 4 MiB per
    covering part (predicted), shared: pass C gets what pass B left. It
@@ -660,7 +668,7 @@ judged on object count, not on a different per-object probe.
 
 | task | decision | crates | depends on | risk |
 |---|---|---|---|---|
-| R1 leaf version 3 reader: header `entry_kind`, posting decoder and its property, fuzz and corrupt-input tests, `inspect kidx` prints the kind, docs/catalog-and-mvcc.md | 5 | ravel-catalog, ravel-cli, proto | owner approval | medium: a format change |
+| R1 leaf version 3 reader: header `entry_kind`, the posting entry type with its decoder, kind-1 splitter and encoder (codec only, no fold calls them), the shared pair encoding of decision 1, the property, fuzz and corrupt-input tests, `inspect kidx` prints the kind, docs/catalog-and-mvcc.md | 5 | ravel-catalog, ravel-cli, proto | owner approval | medium: a format change |
 | R2 series route in the resolve: passes A to C, `S_max` and the `Q_BC` byte budget with its unbridged-case check and the `S_max` override A9 uses, the declines, the new counters and pass rows, the ordering against `label_value`, docs/query-engine.md | 3, 4 | ravel-query, ravel-server | R1 | medium |
-| W1 the fold build and carry behind `metrics_series_index`, off; the cap and its report | 1, 2 | ravel-catalog, ravel-server, ravel-cli | R1 released to every process | medium |
+| W1 the fold build and carry behind `metrics_series_index`, off, writing the posting fields through R1's kind-1 splitter and encoder; the cap and its report | 1, 2 | ravel-catalog, ravel-server, ravel-cli | R1 released to every process | medium |
 | M1 harness `series_holders` stamp and the acceptance run | acceptance | ravel-bench | R2, W1 | low |
