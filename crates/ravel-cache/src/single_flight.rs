@@ -7,21 +7,44 @@
 //!
 //! One call per key becomes the leader and runs the fetch; every other
 //! concurrent call for that key is a follower that waits on a `watch`
-//! channel for the leader's result instead of calling fetch itself. Two
-//! failure modes are easy to get wrong here and are both handled by
-//! [`LeaderGuard`]:
+//! channel for the leader's result instead of calling fetch itself. The
+//! leader deposits one of three outcomes on that channel, and
+//! [`LeaderGuard`]'s `Drop` is what guarantees it does so even when the
+//! leader never reaches the end of `fetch`:
 //!
-//! - A failing fetch must reach every follower as an error rather than
-//!   leaving any of them parked forever. The leader sends its `Err`
-//!   result on the watch channel like any other result.
-//! - A leader whose task is cancelled or that panics before `fetch`
-//!   resolves must not leave followers waiting forever either. Both cases
-//!   unwind the leader's stack (a cancelled future is dropped, a panic
-//!   unwinds), and Rust runs destructors during unwinding, so
-//!   [`LeaderGuard`]'s `Drop` fires exactly when the leader never got to
-//!   send a real result. It sends [`SingleFlightError::LeaderLost`] and
-//!   removes the in-flight slot so the next call for that key starts a
-//!   fresh leader rather than joining a dead one.
+//! - A finished fetch (`Ok`, or an `Err` the follower receives as
+//!   [`SingleFlightError::Upstream`]) is deposited by the leader itself, so
+//!   a failing fetch reaches every follower as that error rather than
+//!   leaving any of them parked.
+//! - A cancelled leader, its future dropped before `fetch` resolved,
+//!   deposits a cancellation signal. Dropping a future is not a panic, so
+//!   [`LeaderGuard`]'s `Drop` reads `std::thread::panicking()` as false and
+//!   records the cancellation. A follower that receives it does not fail:
+//!   it re-enters the slot for the key, becoming the new leader if the slot
+//!   is now vacant (running its own `fetch` under its own cancellation) or
+//!   following whoever leads it otherwise. The reason is issue #4174: a
+//!   query torn down for its memory budget drops the fetch it was leading,
+//!   and healthy followers in other queries must not inherit a 503 from a
+//!   store that never failed. Re-entry is bounded by
+//!   `MAX_CANCELLED_LEADER_REENTRIES`; a follower still following when the
+//!   bound is exhausted returns [`SingleFlightError::LeaderLost`].
+//! - A panicking leader unwinds its stack, so `Drop` reads
+//!   `std::thread::panicking()` as true and records a panic. Followers of a
+//!   panicking leader receive [`SingleFlightError::LeaderLost`] and do NOT
+//!   re-enter, because a deterministic panic would otherwise repeat once
+//!   per follower.
+//!
+//! The cancelled/panicked distinction is carried on the channel through an
+//! internal `LeaderOutcome` signal, not through [`SingleFlightError`], so
+//! the public error enum is unchanged.
+//!
+//! Role and the collapse counter stay truthful across re-entry.
+//! [`SingleFlight::run`] reports [`Role::Leader`] for the call that ran
+//! `fetch` and [`Role::Follower`] for a call that rode another's result, so
+//! a re-entering follower that takes over leadership is counted as a leader,
+//! not as a collapse. [`SingleFlight::run_with_reentries`] additionally reports
+//! how many times the call re-entered after a cancelled leader, which the cache
+//! records on a counter separate from the collapse counter.
 //!
 //! A completed leader removes its own slot before returning, and does so
 //! only if the slot still belongs to that leader's attempt (matched by a
@@ -48,8 +71,12 @@ pub enum Role {
 
 /// Error a `SingleFlight::run` call resolves to. `Upstream` carries the
 /// fetch's own error, cloned to every waiter. `LeaderLost` is synthesized
-/// when the leader's future is dropped (cancelled) or unwinds from a
-/// panic before it produces a result.
+/// when the leader unwinds from a panic before producing a result, or when a
+/// follower whose leader was cancelled has re-entered the slot
+/// `MAX_CANCELLED_LEADER_REENTRIES` times without any attempt resolving. A
+/// leader that is merely cancelled (its future dropped) does not reach a
+/// follower as `LeaderLost` on its own: the follower re-enters and runs the
+/// fetch instead (issue #4174).
 #[derive(Debug, Clone)]
 pub enum SingleFlightError<E> {
     Upstream(E),
@@ -58,14 +85,69 @@ pub enum SingleFlightError<E> {
 
 type Outcome<V, E> = Result<V, SingleFlightError<E>>;
 
+/// How many times a follower whose leader was cancelled re-enters the slot
+/// before giving up with [`SingleFlightError::LeaderLost`]. A cancelled leader
+/// is almost always a single query torn down for its memory budget, so the
+/// first healthy follower to take over resolves the fetch and the common path
+/// re-enters at most once; the bound only bites under a storm of back-to-back
+/// cancellations racing one key. Eight tolerates several consecutive
+/// budget-driven teardowns before surfacing the transient error that exists
+/// today, while keeping the worst-case extra work a small constant.
+pub(crate) const MAX_CANCELLED_LEADER_REENTRIES: u32 = 8;
+
+/// What a leader deposits on its slot's `watch` channel for followers. Kept
+/// internal so the cancelled/panicked distinction never widens the public
+/// [`SingleFlightError`].
+enum LeaderOutcome<V, E> {
+    /// The leader finished and produced a result: `Ok`, or an upstream `Err`
+    /// the follower receives as [`SingleFlightError::Upstream`].
+    Resolved(Outcome<V, E>),
+    /// The leader's future was dropped before producing a result. A follower
+    /// re-enters the slot rather than failing.
+    Cancelled,
+    /// The leader unwound from a panic before producing a result. A follower
+    /// returns [`SingleFlightError::LeaderLost`] and does not re-enter.
+    Panicked,
+}
+
+// `watch::Receiver::borrow_and_update().clone()` clones the stored value, so
+// the channel payload must be `Clone`; a manual impl avoids a `V: Clone + E:
+// Clone` bound being demanded everywhere the type name appears, as a derive
+// would.
+impl<V, E> Clone for LeaderOutcome<V, E>
+where
+    V: Clone,
+    E: Clone,
+{
+    fn clone(&self) -> Self {
+        match self {
+            LeaderOutcome::Resolved(result) => LeaderOutcome::Resolved(result.clone()),
+            LeaderOutcome::Cancelled => LeaderOutcome::Cancelled,
+            LeaderOutcome::Panicked => LeaderOutcome::Panicked,
+        }
+    }
+}
+
+/// What a follower's [`SingleFlight::wait`] decided the leader's deposited
+/// outcome means for this follower.
+enum FollowerWait<V, E> {
+    /// The leader produced a result; return it.
+    Resolved(Outcome<V, E>),
+    /// The leader was cancelled; re-enter the slot (subject to the bound).
+    Retry,
+    /// The leader panicked, or its sender dropped without depositing an
+    /// outcome; return [`SingleFlightError::LeaderLost`] and do not retry.
+    Lost,
+}
+
 struct Slot<V, E> {
     id: u64,
-    tx: watch::Sender<Option<Outcome<V, E>>>,
+    tx: watch::Sender<Option<LeaderOutcome<V, E>>>,
 }
 
 enum LockOutcome<V, E> {
-    Follower(watch::Receiver<Option<Outcome<V, E>>>),
-    Leader(u64, watch::Sender<Option<Outcome<V, E>>>),
+    Follower(watch::Receiver<Option<LeaderOutcome<V, E>>>),
+    Leader(u64, watch::Sender<Option<LeaderOutcome<V, E>>>),
 }
 
 /// A request-coalescing map keyed by `K`, producing values `V` or errors
@@ -94,30 +176,79 @@ where
         Self::default()
     }
 
-    /// Run `fetch` for `key`, collapsing concurrent calls for the same
-    /// key into one invocation. Returns the result and which [`Role`]
-    /// this call played.
+    /// Run `fetch` for `key`, collapsing concurrent calls for the same key
+    /// into one invocation. Returns the result and which [`Role`] this call
+    /// played. The arity-stable entry point for callers that do not record the
+    /// re-entry count ([`run_with_reentries`](Self::run_with_reentries) is the
+    /// variant the RAM and tiered caches use to feed their counter); the
+    /// cancelled-leader retry behaviour is identical through both.
     pub async fn run<F, Fut>(&self, key: K, fetch: F) -> (Outcome<V, E>, Role)
     where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<V, E>> + Send,
     {
-        let outcome = {
-            let mut inflight = self.inflight.lock();
-            match inflight.entry(key.clone()) {
-                MapEntry::Occupied(slot) => LockOutcome::Follower(slot.get().tx.subscribe()),
-                MapEntry::Vacant(vacant) => {
-                    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                    let (tx, _rx) = watch::channel(None);
-                    vacant.insert(Slot { id, tx: tx.clone() });
-                    LockOutcome::Leader(id, tx)
-                }
-            }
-        };
+        let (result, role, _reentries) = self.run_with_reentries(key, fetch).await;
+        (result, role)
+    }
 
-        match outcome {
-            LockOutcome::Follower(mut rx) => (Self::wait(&mut rx).await, Role::Follower),
-            LockOutcome::Leader(id, tx) => self.run_as_leader(key, id, tx, fetch).await,
+    /// [`run`](Self::run), also reporting how many times this call lost a
+    /// cancelled leader and re-entered the slot (0 on the common path, at most
+    /// `MAX_CANCELLED_LEADER_REENTRIES`). The caches record that count on a
+    /// counter separate from the collapse counter.
+    ///
+    /// `fetch` is `FnOnce` and runs at most once: only the branch that becomes
+    /// leader consumes it, and that branch returns, so a re-entry after a
+    /// cancelled leader never re-runs a `fetch` that already produced a result.
+    pub async fn run_with_reentries<F, Fut>(&self, key: K, fetch: F) -> (Outcome<V, E>, Role, u32)
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<V, E>> + Send,
+    {
+        let mut reentries: u32 = 0;
+        loop {
+            let outcome = {
+                let mut inflight = self.inflight.lock();
+                match inflight.entry(key.clone()) {
+                    MapEntry::Occupied(slot) => LockOutcome::Follower(slot.get().tx.subscribe()),
+                    MapEntry::Vacant(vacant) => {
+                        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                        let (tx, _rx) = watch::channel(None);
+                        vacant.insert(Slot { id, tx: tx.clone() });
+                        LockOutcome::Leader(id, tx)
+                    }
+                }
+            };
+
+            match outcome {
+                // Moving `fetch` is sound inside the loop: this branch diverges
+                // (`return`), so the loop's only back-edge is the follower
+                // `continue` below, which never touches `fetch`.
+                LockOutcome::Leader(id, tx) => {
+                    let (result, role) = self.run_as_leader(key, id, tx, fetch).await;
+                    return (result, role, reentries);
+                }
+                LockOutcome::Follower(mut rx) => match Self::wait(&mut rx).await {
+                    FollowerWait::Resolved(result) => return (result, Role::Follower, reentries),
+                    FollowerWait::Lost => {
+                        return (
+                            Err(SingleFlightError::LeaderLost),
+                            Role::Follower,
+                            reentries,
+                        );
+                    }
+                    FollowerWait::Retry => {
+                        if reentries >= MAX_CANCELLED_LEADER_REENTRIES {
+                            return (
+                                Err(SingleFlightError::LeaderLost),
+                                Role::Follower,
+                                reentries,
+                            );
+                        }
+                        reentries += 1;
+                        continue;
+                    }
+                },
+            }
         }
     }
 
@@ -135,19 +266,24 @@ where
         self.inflight.lock().contains_key(key)
     }
 
-    async fn wait(rx: &mut watch::Receiver<Option<Outcome<V, E>>>) -> Outcome<V, E> {
+    async fn wait(rx: &mut watch::Receiver<Option<LeaderOutcome<V, E>>>) -> FollowerWait<V, E> {
         loop {
             let current = rx.borrow_and_update().clone();
-            if let Some(result) = current {
-                return result;
-            }
-            if rx.changed().await.is_err() {
-                // The sender was dropped without ever sending: the
-                // leader's guard fired without a result to send (should
-                // not happen; the guard always sends before dropping) or
-                // was dropped before installing one. Either way, do not
-                // hang.
-                return Err(SingleFlightError::LeaderLost);
+            match current {
+                Some(LeaderOutcome::Resolved(result)) => return FollowerWait::Resolved(result),
+                Some(LeaderOutcome::Cancelled) => return FollowerWait::Retry,
+                Some(LeaderOutcome::Panicked) => return FollowerWait::Lost,
+                None => {
+                    if rx.changed().await.is_err() {
+                        // The sender was dropped without ever depositing an
+                        // outcome: the leader's guard fired without one (should
+                        // not happen; the guard always deposits before dropping)
+                        // or was dropped before installing one. Either way, do
+                        // not hang, and do not retry on a signal that may not be
+                        // a clean cancellation.
+                        return FollowerWait::Lost;
+                    }
+                }
             }
         }
     }
@@ -156,7 +292,7 @@ where
         &self,
         key: K,
         id: u64,
-        tx: watch::Sender<Option<Outcome<V, E>>>,
+        tx: watch::Sender<Option<LeaderOutcome<V, E>>>,
         fetch: F,
     ) -> (Outcome<V, E>, Role)
     where
@@ -181,7 +317,9 @@ where
         // between this line and `remove_if_current` sees `None`, then sees
         // every sender drop, and reports `LeaderLost` for a fetch that
         // succeeded. `send_replace` stores the value regardless of receivers.
-        guard.tx.send_replace(Some(result.clone()));
+        guard
+            .tx
+            .send_replace(Some(LeaderOutcome::Resolved(result.clone())));
         self.remove_if_current(&key, id);
 
         (result, Role::Leader)
@@ -197,11 +335,14 @@ where
     }
 }
 
-/// Unblocks every follower if the leader never gets to send a result: a
-/// cancelled leader future is dropped, and a panicking one unwinds, and
-/// either way this `Drop` runs and sends [`SingleFlightError::LeaderLost`]
-/// on its way out. A leader that finishes normally sets `done` first, so
-/// this is then a no-op.
+/// Unblocks every follower if the leader never gets to deposit a result: a
+/// cancelled leader future is dropped, and a panicking one unwinds, and either
+/// way this `Drop` runs. It distinguishes the two with
+/// `std::thread::panicking()` -- false during a plain drop (cancellation),
+/// true while unwinding a panic -- and deposits `LeaderOutcome::Cancelled` or
+/// `LeaderOutcome::Panicked` accordingly, so a follower retries a cancelled
+/// leader but surfaces [`SingleFlightError::LeaderLost`] for a panicking one.
+/// A leader that finishes normally sets `done` first, so this is then a no-op.
 struct LeaderGuard<'a, K, V, E>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
@@ -211,7 +352,7 @@ where
     flight: &'a SingleFlight<K, V, E>,
     key: K,
     id: u64,
-    tx: watch::Sender<Option<Outcome<V, E>>>,
+    tx: watch::Sender<Option<LeaderOutcome<V, E>>>,
     done: bool,
 }
 
@@ -223,13 +364,23 @@ where
 {
     fn drop(&mut self) {
         if !self.done {
-            // `send_replace` for the same reason as the success path. Here a
-            // discarded value would be benign, since a follower that missed it
-            // falls through to the sender-dropped branch and reports
-            // `LeaderLost` anyway, which is the correct answer. Kept identical
-            // so the two paths cannot drift.
-            self.tx
-                .send_replace(Some(Err(SingleFlightError::LeaderLost)));
+            // Cancellation (a plain drop) and a panic reach here the same way,
+            // but a follower must treat them differently: retry a cancelled
+            // leader, give up on a panicking one. `std::thread::panicking()` is
+            // the only signal available in a destructor that tells them apart,
+            // and it is reliable here because this guard lives on the leader's
+            // own stack, which unwinds only on the leader's own panic.
+            let outcome = if std::thread::panicking() {
+                LeaderOutcome::Panicked
+            } else {
+                LeaderOutcome::Cancelled
+            };
+            // `send_replace` for the same reason as the success path: it stores
+            // the value regardless of the receiver count. A follower that misses
+            // it falls through to the sender-dropped branch, which returns
+            // `LeaderLost` without retrying -- the conservative answer when the
+            // cancel/panic signal was lost.
+            self.tx.send_replace(Some(outcome));
             self.flight.remove_if_current(&self.key, self.id);
         }
     }

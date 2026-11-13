@@ -359,9 +359,9 @@ where
         // that consults disk and, only on a disk miss, runs the upstream
         // fetch. Followers neither consult disk nor fetch (decision 5,
         // extended across both tiers).
-        let (outcome, role) = self
+        let (outcome, role, reentries) = self
             .single_flight
-            .run(key, move || async move {
+            .run_with_reentries(key, move || async move {
                 // `DiskCache::get` is std::fs I/O; run it on the blocking
                 // pool rather than the async worker thread (issue #1702). A
                 // `JoinError` (the blocking task panicked or was cancelled)
@@ -397,6 +397,14 @@ where
             })
             .await;
 
+        // Recorded before the error match: a follower that re-entered and still
+        // ended in `LeaderLost` (the bound was exhausted) did re-enter, so its
+        // work must be counted even on the error path (issue #4174).
+        if reentries > 0 {
+            self.ram
+                .metrics()
+                .record_cancelled_leader_reentries(reentries);
+        }
         let (bytes, served) = match outcome {
             Ok(value) => value,
             Err(err) => return Err(err),
@@ -504,9 +512,9 @@ where
         // admits to BOTH tiers (decision 3). `Served::Upstream` records that
         // these bytes are the fresh upstream fetch, never a cache serve, so
         // they are never corrupted.
-        let (outcome, role) = self
+        let (outcome, role, reentries) = self
             .single_flight
-            .run(key, move || async move {
+            .run_with_reentries(key, move || async move {
                 // The caller's peek may have missed while an earlier flight
                 // for `key` was running and reached here after that flight
                 // left the map. On success, when the RAM tier admits the
@@ -537,6 +545,14 @@ where
             })
             .await;
 
+        // Recorded before the error match, for the same reason as
+        // `get_or_fetch_outcome_with_intent`: a re-entry counts even when the
+        // bound is then exhausted into `LeaderLost` (issue #4174).
+        if reentries > 0 {
+            self.ram
+                .metrics()
+                .record_cancelled_leader_reentries(reentries);
+        }
         let (bytes, served) = match outcome {
             Ok(value) => value,
             Err(err) => return Err(err),
