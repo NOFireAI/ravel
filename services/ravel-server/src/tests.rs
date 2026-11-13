@@ -566,16 +566,22 @@ struct ReservationStep {
 
 /// Splits [`fetch_reservation_steps`] for the one-segment instant query these
 /// tests run into the totals a held GET can observe, and the size of the
-/// catalog decode's reservation (ADR-1702 decision 6). The query reserves five
+/// catalog decode's reservation (ADR-1702 decision 6). The query reserves six
 /// times: the segment open's first GET (`open_get`, the footer tail of an
 /// object over the whole-object threshold), the catalog-section range read,
-/// the catalog decode, the page read, then the sample fold's charge for the
-/// samples it retains (#3747). The open GET's bytes stay held by the regions
-/// it fills (ADR-1170), so each later step reserves on top of it. The decode
-/// reserves between GETs, so no held GET sees its own running total, and it
-/// charges decoded output rather than cache-bound bytes, so it is never marked
-/// handed off. The fold reserves after the page read's GET has returned, on
-/// top of everything the batch still holds, so no held GET observes it either.
+/// the catalog decode, the page read, the page batch's decoded runs (#4118),
+/// then the sample fold's charge for the samples it retains (#3747). The open
+/// GET's bytes stay held by the regions it fills (ADR-1170), so each later step
+/// reserves on top of it. The decode reserves between GETs, so no held GET sees
+/// its own running total, and it charges decoded output rather than
+/// cache-bound bytes, so it is never marked handed off. The batch reserves its
+/// decoded runs after the page read's GET has returned and before it decodes
+/// them, and the fold reserves while those runs are still held, so no held GET
+/// observes either.
+///
+/// The batch step is pinned to the decode of `metric`'s one L0 series: 16
+/// bytes (timestamp and value) per sample, plus one unit carrying a copy of
+/// the series' `__name__` label and the unit's own fixed size.
 ///
 /// The returned totals are the open GET's, the range read's and the page
 /// read's, in that order. The decode figure is the decode step's own total
@@ -585,11 +591,11 @@ struct ReservationStep {
 /// oracle run builds, the shrink's reserve is refused whatever its order. The
 /// callers' `seen == observable` assertion under an unlimited budget is what
 /// fails if the fixture ever shrinks.
-fn split_decode_step(steps: &[ReservationStep], open_get: u64) -> (Vec<u64>, u64) {
+fn split_decode_step(steps: &[ReservationStep], open_get: u64, metric: &str) -> (Vec<u64>, u64) {
     assert_eq!(
         steps.len(),
-        5,
-        "open GET, range read, catalog decode, page read, sample fold: {steps:?}"
+        6,
+        "open GET, range read, catalog decode, page read, decoded batch, sample fold: {steps:?}"
     );
     assert_eq!(
         steps[0],
@@ -614,10 +620,28 @@ fn split_decode_step(steps: &[ReservationStep], open_get: u64) -> (Vec<u64>, u64
     );
     assert_eq!(
         steps[4].held, steps[3].total,
-        "the sample fold reserves on top of everything the fetch still holds: {steps:?}"
+        "the decoded batch reserves on top of everything the page read left held: {steps:?}"
+    );
+    let samples =
+        LARGE_SEGMENT_SAMPLES * (std::mem::size_of::<i64>() + std::mem::size_of::<f64>()) as u64;
+    let label = (std::mem::size_of::<Label>() + "__name__".len() + metric.len()) as u64;
+    let unit = (steps[4].total - steps[4].held)
+        .checked_sub(samples + label)
+        .unwrap_or_else(|| {
+            panic!("the decoded batch charges every sample and the label copy: {steps:?}")
+        });
+    assert!(
+        (1..=512).contains(&unit),
+        "the decoded batch charges one unit's fixed size beyond its samples and label \
+         copy, got {unit}: {steps:?}"
+    );
+    assert_eq!(
+        steps[5].held, steps[4].total,
+        "the sample fold reserves on top of everything the fetch still holds, the \
+         decoded batch included: {steps:?}"
     );
     assert!(
-        steps[4].total > steps[4].held,
+        steps[5].total > steps[5].held,
         "the sample fold charges the samples it retains: {steps:?}"
     );
     (
@@ -1450,7 +1474,8 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
     let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
     let steps =
         fetch_reservation_steps(&store, &tenant, "big_gauge_gauge", query_time_s, now).await;
-    let (observable, _decode) = split_decode_step(&steps, open_get_len(object_size));
+    let (observable, _decode) =
+        split_decode_step(&steps, open_get_len(object_size), "big_gauge_gauge");
 
     let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
     let mut query = Box::pin(state.engine.instant(
@@ -1562,7 +1587,8 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
     let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
     let steps =
         fetch_reservation_steps(&store, &tenant, "big_gauge_overlap", query_time_s, now).await;
-    let (observable, decode) = split_decode_step(&steps, open_get_len(object_size));
+    let (observable, decode) =
+        split_decode_step(&steps, open_get_len(object_size), "big_gauge_overlap");
 
     let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
     let mut query = Box::pin(state.engine.instant(
