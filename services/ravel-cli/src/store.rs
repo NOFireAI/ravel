@@ -386,10 +386,11 @@ pub struct StoreArgs {
     /// as AKS workload identity (`AZURE_FEDERATED_TOKEN_FILE`,
     /// `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`), a shared key
     /// (`AZURE_STORAGE_ACCOUNT_KEY`) or a managed identity. Under `--store
-    /// azure` every `--s3-*` and `--gcs-*` flag given on the command line or
-    /// through its environment variable is refused rather than ignored; a
-    /// defaulted one is not. Under any other `--store`, a command that builds
-    /// the store refuses a given `--azure-*` flag.
+    /// azure`, a command that builds the store refuses every `--s3-*` and
+    /// `--gcs-*` flag given on the command line or through its environment
+    /// variable rather than ignoring it; a defaulted one is not refused. Under
+    /// any other `--store`, a command that builds the store refuses a given
+    /// `--azure-*` flag.
     #[arg(long, env = "RAVEL_AZURE_ACCOUNT")]
     pub azure_account: Option<String>,
 
