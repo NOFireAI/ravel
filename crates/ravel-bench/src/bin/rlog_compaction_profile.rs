@@ -18,12 +18,20 @@
 //! the compactor's writer settings, once per `PageChoice`, because
 //! `CompactorConfig` does not expose the page choice.
 //!
+//! `--scratch-dir` with `--merge-resident-ceiling-bytes` drives a modest
+//! bucket through the two-level merge (ADR-3853, issue #4141), and
+//! `--level1-workers`, `--level2-workers`, `--run-block-records` and
+//! `--range-records` set the `CompactorConfig` fields `ravel-cli`'s flags
+//! set. A two-level run reports level-1 and level-2 wall, process CPU and CPU
+//! per record, split at the compactor's own tracing events.
+//!
 //! Measurement only: it changes no library behaviour. One JSON document goes
 //! to stdout, a human table to stderr.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -41,7 +49,8 @@ use ravel_logseg::{
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, MergeMemoryTracker, PhaseRequests,
     RequestLedger, ResolvedL1PartMemoryTarget, compact_bucket, detect_host_memory_total_bytes,
-    host_memory_budget_bytes, merge_memory_budget_bytes, validate_rlog_zstd_level,
+    host_memory_budget_bytes, merge_memory_budget_bytes, validate_rlog_level2_settings,
+    validate_rlog_run_block_target_records, validate_rlog_zstd_level,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
@@ -219,6 +228,62 @@ struct Args {
     /// Exhaustive and Estimated and report both.
     #[arg(long)]
     page_choice_ab: bool,
+    /// Scratch directory for the two-level merge's runs (ADR-3853); sets
+    /// `CompactorConfig::scratch_dir` as `ravel-cli --scratch-dir` does.
+    /// Without it every bucket merges single-level.
+    #[arg(long)]
+    scratch_dir: Option<PathBuf>,
+    /// Replaces `CompactorConfig::merge_resident_ceiling_bytes`, the seam
+    /// `ravel-cli`'s tests use to route a small bucket through the two-level
+    /// merge: a ceiling below the bucket's resident need plans a cursor merge.
+    #[arg(long)]
+    merge_resident_ceiling_bytes: Option<u64>,
+    /// `CompactorConfig::level1_workers` (`ravel-cli --level1-workers`).
+    /// Needs --scratch-dir.
+    #[arg(long)]
+    level1_workers: Option<usize>,
+    /// `CompactorConfig::level2_workers` (`ravel-cli --level2-workers`).
+    /// Needs --scratch-dir.
+    #[arg(long)]
+    level2_workers: Option<usize>,
+    /// `CompactorConfig::rlog_run_block_target_records`
+    /// (`ravel-cli --run-block-records`). Needs --scratch-dir.
+    #[arg(long)]
+    run_block_records: Option<usize>,
+    /// `CompactorConfig::rlog_range_records` (`ravel-cli --range-records`).
+    #[arg(long)]
+    range_records: Option<u64>,
+}
+
+impl Args {
+    /// Refuses the knob combinations `ravel-cli`'s `ScratchOptions::validate`
+    /// refuses: a worker count or run block target without a scratch
+    /// directory, and any of them or the range quantum at zero.
+    fn validate_knobs(&self) -> Result<(), String> {
+        if self.scratch_dir.is_none() {
+            for (set, flag) in [
+                (self.level1_workers.is_some(), "--level1-workers"),
+                (self.level2_workers.is_some(), "--level2-workers"),
+                (self.run_block_records.is_some(), "--run-block-records"),
+            ] {
+                if set {
+                    return Err(format!("{flag} needs --scratch-dir"));
+                }
+            }
+        }
+        if self.level1_workers == Some(0) {
+            return Err("--level1-workers must be at least 1, got 0".to_string());
+        }
+        if let Some(records) = self.run_block_records {
+            validate_rlog_run_block_target_records(records).map_err(|e| e.to_string())?;
+        }
+        validate_rlog_level2_settings(
+            self.level2_workers,
+            self.range_records
+                .unwrap_or(ravel_maintain::rlog::LEVEL2_RANGE_RECORDS),
+        )
+        .map_err(|e| e.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -897,6 +962,9 @@ impl ObjectStoreBackend for TimingStore {
 
 struct CapturedEvent {
     at: Instant,
+    /// Process CPU when the event fired, so the windows between events have
+    /// a CPU figure as well as a wall one.
+    cpu_s: f64,
     level: tracing::Level,
     message: String,
     fields: BTreeMap<String, String>,
@@ -945,6 +1013,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
             .expect("events lock")
             .push(CapturedEvent {
                 at: Instant::now(),
+                cpu_s: process_cpu_s(),
                 level,
                 message: visitor.message,
                 fields: visitor.fields,
@@ -1151,6 +1220,25 @@ mod prof {
         names.iter().any(|n| pats.iter().any(|p| n.contains(p)))
     }
 
+    /// Two-level merge levels by stack marker. Work a worker hands to another
+    /// task or thread (a pipelined encode) carries no worker frame and lands
+    /// in the third row.
+    pub const LEVELS: [&str; 3] = [
+        "level 1 (rlog::level1_worker on the stack)",
+        "level 2 (rlog::level2_worker* on the stack)",
+        "neither worker on the stack",
+    ];
+
+    fn level_of(names: &[String]) -> &'static str {
+        if any(names, &["rlog::level1_worker"]) {
+            LEVELS[0]
+        } else if any(names, &["rlog::level2_worker"]) {
+            LEVELS[1]
+        } else {
+            LEVELS[2]
+        }
+    }
+
     fn zstd(names: &[String], decompress: bool) -> bool {
         names.iter().any(|n| {
             let l = n.to_ascii_lowercase();
@@ -1310,6 +1398,8 @@ mod prof {
         let mut zstd_decompress: u64 = 0;
         let mut unattributed_by: HashMap<String, u64> = HashMap::new();
         let mut resolved_leaf_samples: u64 = 0;
+        let mut level_samples: BTreeMap<&'static str, u64> = BTreeMap::new();
+        let mut level_leaf: HashMap<&'static str, HashMap<String, u64>> = HashMap::new();
         let unnamed: BTreeSet<usize> = report
             .data
             .keys()
@@ -1355,6 +1445,13 @@ mod prof {
                 );
                 *unattributed_by.entry(key).or_default() += count;
             }
+            let level = level_of(&names);
+            *level_samples.entry(level).or_default() += count;
+            *level_leaf
+                .entry(level)
+                .or_default()
+                .entry(leaf_name.clone())
+                .or_default() += count;
             *leaf.entry(leaf_name).or_default() += count;
             let unique: HashSet<&String> = names.iter().collect();
             for n in unique {
@@ -1411,6 +1508,29 @@ mod prof {
                 json!({"phase": p, "samples": c, "share_pct": pct(c), "cpu_s_est": c as f64 / f64::from(HZ)})
             })
             .collect();
+        let level_rows: Vec<Value> = LEVELS
+            .iter()
+            .map(|l| {
+                let c = level_samples.get(l).copied().unwrap_or(0);
+                let mut leaves: Vec<(&String, u64)> = level_leaf
+                    .get(l)
+                    .map(|m| m.iter().map(|(k, v)| (k, *v)).collect())
+                    .unwrap_or_default();
+                leaves.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+                let top: Vec<Value> = leaves
+                    .into_iter()
+                    .take(15)
+                    .map(|(name, n)| {
+                        json!({
+                            "function": name,
+                            "samples": n,
+                            "share_of_level_pct": if c == 0 { 0.0 } else { n as f64 * 100.0 / c as f64 },
+                        })
+                    })
+                    .collect();
+                json!({"level": l, "samples": c, "share_pct": pct(c), "cpu_s_est": c as f64 / f64::from(HZ), "leaf_exclusive_top15": top})
+            })
+            .collect();
         let mut thread_rows: Vec<(String, u64)> = threads.into_iter().collect();
         thread_rows.sort_by_key(|r| std::cmp::Reverse(r.1));
         json!({
@@ -1428,6 +1548,7 @@ mod prof {
             "inclusive_top10_distinct_below_95pct": distinct_chain_top(&inclusive, 10, 95.0, total),
             "inclusive_top100": top(&inclusive, 100, f64::INFINITY),
             "phases": phase_rows,
+            "levels": level_rows,
             "zstd_decompress_samples_in_block_decode": zstd_decompress,
             "samples_by_thread": thread_rows.iter().take(12).map(|(t, c)| json!({"thread": t, "samples": c, "share_pct": pct(*c)})).collect::<Vec<_>>(),
         })
@@ -1437,15 +1558,25 @@ mod prof {
 // ---------------------------------------------------------------------------
 // The run.
 
-fn compactor_config(zstd_level: Option<i32>, ledger: RequestLedger) -> (CompactorConfig, Value) {
-    // Mirrors ravel-cli's build_compactor_config for `compact-bucket` with no
-    // knob set and one concurrent merge.
+fn compactor_config(args: &Args, ledger: RequestLedger) -> (CompactorConfig, Value) {
+    // Mirrors ravel-cli's build_compactor_config for `compact-bucket` with one
+    // concurrent merge and the scratch knobs `args` carries.
     let mut config = CompactorConfig {
         dry_run: false,
         merge_memory_tracker: Some(MergeMemoryTracker::new()),
+        scratch_dir: args.scratch_dir.clone(),
+        level1_workers: args.level1_workers,
+        level2_workers: args.level2_workers,
+        merge_resident_ceiling_bytes: args.merge_resident_ceiling_bytes,
         format_floor: Some(ravel_ingest::FormatFloorPolicy::default()),
         ..CompactorConfig::default()
     };
+    if let Some(records) = args.run_block_records {
+        config.rlog_run_block_target_records = records;
+    }
+    if let Some(records) = args.range_records {
+        config.rlog_range_records = records;
+    }
     let host_total = detect_host_memory_total_bytes();
     let budget = host_total.map(|total| {
         merge_memory_budget_bytes(
@@ -1460,7 +1591,7 @@ fn compactor_config(zstd_level: Option<i32>, ledger: RequestLedger) -> (Compacto
         ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION,
     );
     target.apply_to(&mut config);
-    if let Some(level) = zstd_level {
+    if let Some(level) = args.zstd_level {
         config.rlog_zstd_level = validate_rlog_zstd_level(level).expect("valid zstd level");
     }
     config.request_ledger = Some(ledger);
@@ -1476,7 +1607,15 @@ fn compactor_config(zstd_level: Option<i32>, ledger: RequestLedger) -> (Compacto
         "merge_cursor_budget_bytes": config.merge_cursor_budget_bytes,
         "merge_resident_ceiling_bytes": config.merge_resident_ceiling_bytes,
         "input_read_concurrency": config.input_read_concurrency,
-        "page_choice": "Exhaustive (RlogConfig::default(); CompactorConfig has no page_choice)",
+        "scratch_dir": config.scratch_dir.as_ref().map(|p| p.display().to_string()),
+        "level1_workers": config.level1_workers,
+        "level2_workers": config.level2_workers,
+        "rlog_run_block_target_records": config.rlog_run_block_target_records,
+        "rlog_range_records": config.rlog_range_records,
+        "rlog_run_memory_target_bytes": config.rlog_run_memory_target_bytes,
+        "geometry_floor_decoded_rows": config.geometry_floor_decoded_rows,
+        "unit_concurrency": config.unit_concurrency,
+        "page_choice":"Exhaustive (RlogConfig::default(); CompactorConfig has no page_choice)",
     });
     (config, resolved)
 }
@@ -1506,6 +1645,63 @@ fn union_s(mut spans: Vec<(f64, f64)>) -> f64 {
     total
 }
 
+/// The event `two_level_merge` emits once level 1 has finished, the run
+/// catalogs are loaded and level 2 is planned, before level 2 merges.
+const TWO_LEVEL_EVENT: &str = "rlog two-level merge (ADR-3853)";
+
+/// Wall seconds from the call start and process CPU seconds since it, at one
+/// tracing event.
+#[derive(Clone, Copy, Debug)]
+struct Mark {
+    wall_s: f64,
+    cpu_s: f64,
+}
+
+/// The two-level merge's windows, split at the compactor's events: the input
+/// catalog load and bucket plan (merge started to the first read-mode
+/// event), level 1 (to the two-level event; it includes the run catalog load
+/// and the level-2 plan), level 2 (to merge ended) and the publish after it.
+/// Every record passes through both levels, so each level's CPU per record
+/// divides by the input records. A missing event leaves its windows null.
+fn two_level_report(
+    started: Option<Mark>,
+    plan: Option<Mark>,
+    two_level: Option<Mark>,
+    ended: Option<Mark>,
+    end: Mark,
+    records: u64,
+) -> Value {
+    let window = |a: Option<Mark>, b: Option<Mark>| match (a, b) {
+        (Some(a), Some(b)) => Some((b.wall_s - a.wall_s, b.cpu_s - a.cpu_s)),
+        _ => None,
+    };
+    let level1 = two_level.and(window(plan, two_level));
+    let level2 = two_level.and(window(two_level, ended));
+    let wall = |w: Option<(f64, f64)>| w.map(|w| w.0);
+    let cpu = |w: Option<(f64, f64)>| w.map(|w| w.1);
+    let per_record = |w: Option<(f64, f64)>| {
+        w.filter(|_| records > 0)
+            .map(|w| w.1 * 1e6 / records as f64)
+    };
+    let share = match (level1, level2) {
+        (Some(a), Some(b)) if end.cpu_s > 0.0 => Some((a.1 + b.1) / end.cpu_s),
+        _ => None,
+    };
+    json!({
+        "plan_wall_s": wall(window(started, plan)),
+        "plan_cpu_s": cpu(window(started, plan)),
+        "level1_wall_s": wall(level1),
+        "level1_cpu_s": cpu(level1),
+        "level1_cpu_us_per_record": per_record(level1),
+        "level2_wall_s": wall(level2),
+        "level2_cpu_s": cpu(level2),
+        "level2_cpu_us_per_record": per_record(level2),
+        "publish_wall_s": wall(window(ended, Some(end))),
+        "publish_cpu_s": cpu(window(ended, Some(end))),
+        "levels_share_of_process_cpu": share,
+    })
+}
+
 struct Compacted {
     report: Value,
     parts: Vec<(ravel_proto::commit::v1::CompactionPart, Bytes)>,
@@ -1529,7 +1725,7 @@ async fn run(
     let bucket = Bucket::new(th, Signal::Logs, SHARD, HOUR);
     let clock = FixedClock::new((i64::from(HOUR) + 1) * NS_PER_HOUR + SEAL_PADDING_NS);
     let ledger = RequestLedger::new();
-    let (config, resolved) = compactor_config(args.zstd_level, ledger.clone());
+    let (config, resolved) = compactor_config(args, ledger.clone());
 
     events.lock().expect("events lock").clear();
     store.armed.store(true, Ordering::Relaxed);
@@ -1595,6 +1791,36 @@ async fn run(
     let mode_at = mode_event.map(|e| rel(e.at));
     let merge_ended = find("compaction merge ended").map(|e| rel(e.at));
     let mode = mode_event.map(|e| e.fields.clone()).unwrap_or_default();
+    let mark = |e: &CapturedEvent| Mark {
+        wall_s: rel(e.at),
+        cpu_s: e.cpu_s - cpu0,
+    };
+    let two_level_events: Vec<&CapturedEvent> = evs
+        .iter()
+        .filter(|e| e.message.contains(TWO_LEVEL_EVENT))
+        .collect();
+    let two_level = two_level_report(
+        find("compaction merge started").map(mark),
+        mode_event.map(mark),
+        two_level_events.first().map(|e| mark(e)),
+        find("compaction merge ended").map(mark),
+        Mark { wall_s, cpu_s },
+        l0_records,
+    );
+    let lr = ledger.report();
+    let two_level = json!({
+        "route": if two_level_events.is_empty() { "single-level" } else { "two-level" },
+        "two_level_events": two_level_events.len(),
+        "event_fields": two_level_events.first().map(|e| e.fields.clone()),
+        "split": two_level,
+        "ledger": {
+            "level1_groups": lr.level1_groups,
+            "level1_workers": lr.level1_workers,
+            "level2_workers": lr.level2_workers,
+            "level2_ranges": lr.level2_ranges,
+            "encode_builders": lr.encode_builders,
+        },
+    });
     let warnings: Vec<String> = evs
         .iter()
         .filter(|e| e.level <= tracing::Level::WARN)
@@ -1660,7 +1886,6 @@ async fn run(
         },
     });
 
-    let lr = ledger.report();
     let ledger_json = json!({
         "list": phase_requests(&lr.list),
         "record_read": phase_requests(&lr.record_read),
@@ -1729,6 +1954,7 @@ async fn run(
         "busiest_thread_cpu_s": busiest,
         "threads_cpu_s": thread_rows.iter().take(8).map(|r| json!({"tid": r.0, "comm": r.1, "cpu_s": r.2})).collect::<Vec<_>>(),
         "timeline": timeline,
+        "two_level": two_level,
         "request_ledger": ledger_json,
         "warnings": warnings,
         "profile": profile,
@@ -1867,6 +2093,23 @@ fn print_table(doc: &Value) {
         f(&r["busiest_thread_cpu_s"]),
         f(&r["records_per_s_per_core (records / process cpu)"])
     );
+    let tl = &r["two_level"];
+    let split = &tl["split"];
+    let _ = writeln!(
+        out,
+        "route {} | level 1 wall {} s cpu {} s ({} us/record) | level 2 wall {} s cpu {} s ({} us/record) | levels share of CPU {}",
+        f(&tl["route"]),
+        f(&split["level1_wall_s"]),
+        f(&split["level1_cpu_s"]),
+        f(&split["level1_cpu_us_per_record"]),
+        f(&split["level2_wall_s"]),
+        f(&split["level2_cpu_s"]),
+        f(&split["level2_cpu_us_per_record"]),
+        f(&split["levels_share_of_process_cpu"])
+    );
+    if let Some(fields) = tl["event_fields"].as_object() {
+        let _ = writeln!(out, "two-level event: {}", Value::Object(fields.clone()));
+    }
     let t = &r["timeline"];
     let _ = writeln!(out, "timeline (s from call start):");
     for k in [
@@ -1904,6 +2147,15 @@ fn print_table(doc: &Value) {
                 out,
                 "  {:<46} {:>6} {:>7}",
                 f(&row["phase"]),
+                f(&row["share_pct"]),
+                f(&row["cpu_s_est"])
+            );
+        }
+        for row in p["levels"].as_array().into_iter().flatten() {
+            let _ = writeln!(
+                out,
+                "  {:<46} {:>6} {:>7}",
+                f(&row["level"]),
                 f(&row["share_pct"]),
                 f(&row["cpu_s_est"])
             );
@@ -1949,6 +2201,10 @@ fn print_table(doc: &Value) {
 
 fn main() {
     let args = Args::parse();
+    if let Err(e) = args.validate_knobs() {
+        eprintln!("rlog_compaction_profile: {e}");
+        std::process::exit(2);
+    }
     let events = Arc::new(Mutex::new(Vec::new()));
     tracing_subscriber::registry()
         .with(EventCapture {
@@ -2003,6 +2259,7 @@ fn main() {
     let profiled = cfg!(feature = "profiling")
         && std::env::var_os(ravel_bench::profiling::PROFILE_ENV).is_some_and(|p| !p.is_empty());
     let mut failures = check_figures(&doc, args.inputs, args.page_choice_ab, profiled);
+    failures.extend(check_two_level(&doc, &args));
     let rate = doc["run"][RATE_KEY].as_f64().unwrap_or(f64::NAN);
     let realism = if args.inputs == REALISM_INPUTS {
         match check_realism(rate) {
@@ -2140,12 +2397,110 @@ fn check_figures(doc: &Value, inputs: usize, page_choice_ab: bool, profiled: boo
         }
         for key in [
             "phases",
+            "levels",
             "leaf_exclusive_top15",
             "inclusive_top10_distinct_below_95pct",
         ] {
             if p[key].as_array().is_none_or(Vec::is_empty) {
                 failures.push(format!("profile: {key} absent or empty"));
             }
+        }
+    }
+    failures
+}
+
+/// The figures a two-level run reports under `run.two_level.split`, each
+/// exactly once.
+const TWO_LEVEL_FIGURES: [&str; 7] = [
+    "level1_wall_s",
+    "level1_cpu_s",
+    "level1_cpu_us_per_record",
+    "level2_wall_s",
+    "level2_cpu_s",
+    "level2_cpu_us_per_record",
+    "levels_share_of_process_cpu",
+];
+
+/// The share of the call's process CPU the two level windows must cover
+/// together. The rest is the input catalog load, the bucket plan and the
+/// publish; a share outside the band means a window was cut at the wrong
+/// event.
+const LEVELS_SHARE_BAND: (f64, f64) = (0.80, 1.0);
+
+/// With `--scratch-dir` set the run must have taken the two-level route
+/// once, report every `TWO_LEVEL_FIGURES` key exactly once and positive, have
+/// its levels cover `LEVELS_SHARE_BAND` of the process CPU, and carry every
+/// knob it was given in the resolved config and, for the worker counts, in
+/// the two-level event. Without a scratch directory nothing is checked.
+fn check_two_level(doc: &Value, args: &Args) -> Vec<String> {
+    let mut failures = Vec::new();
+    if args.scratch_dir.is_none() {
+        return failures;
+    }
+    let run = &doc["run"];
+    let tl = &run["two_level"];
+    if tl["route"] != "two-level" || tl["two_level_events"] != 1 {
+        failures.push(format!(
+            "route {} with {} two-level events, want two-level with 1",
+            tl["route"], tl["two_level_events"]
+        ));
+    }
+    let text = serde_json::to_string(run).unwrap_or_default();
+    let split = &tl["split"];
+    for key in TWO_LEVEL_FIGURES {
+        let quoted = serde_json::to_string(key).unwrap_or_default();
+        let count = text.matches(&format!("{quoted}:")).count();
+        let value = split[key].as_f64();
+        if count != 1 || value.is_none_or(|v| v.is_nan() || v <= 0.0) {
+            failures.push(format!(
+                "figure {key}: reported {count} times, value {}",
+                split[key]
+            ));
+        }
+    }
+    if let Some(share) = split["levels_share_of_process_cpu"].as_f64() {
+        let (lo, hi) = LEVELS_SHARE_BAND;
+        if !(lo..=hi).contains(&share) {
+            failures.push(format!(
+                "levels cover {share:.3} of process CPU, band [{lo}, {hi}]"
+            ));
+        }
+    }
+    let config = &run["config"];
+    let knobs = [
+        ("level1_workers", args.level1_workers.map(|v| v as u64)),
+        ("level2_workers", args.level2_workers.map(|v| v as u64)),
+        (
+            "rlog_run_block_target_records",
+            args.run_block_records.map(|v| v as u64),
+        ),
+        ("rlog_range_records", args.range_records),
+        (
+            "merge_resident_ceiling_bytes",
+            args.merge_resident_ceiling_bytes,
+        ),
+    ];
+    for (field, want) in knobs {
+        if let Some(want) = want
+            && config[field].as_u64() != Some(want)
+        {
+            failures.push(format!("config {field} {}, want {want}", config[field]));
+        }
+    }
+    for (field, want) in [
+        ("level1_workers", args.level1_workers),
+        ("level2_workers", args.level2_workers),
+    ] {
+        let got = tl["event_fields"][field]
+            .as_str()
+            .and_then(|v| v.parse().ok());
+        if let Some(want) = want
+            && got != Some(want)
+        {
+            failures.push(format!(
+                "two-level event {field} {}, want {want}",
+                tl["event_fields"][field]
+            ));
         }
     }
     failures
@@ -2315,5 +2670,289 @@ mod tests {
                 "{shown}"
             );
         }
+    }
+
+    fn parse(extra: &[&str]) -> Args {
+        Args::parse_from(["rlog_compaction_profile"].iter().chain(extra))
+    }
+
+    const ALL_KNOBS: [&str; 12] = [
+        "--scratch-dir",
+        ".gate-logs/scratch",
+        "--merge-resident-ceiling-bytes",
+        "4294967296",
+        "--level1-workers",
+        "3",
+        "--level2-workers",
+        "1",
+        "--run-block-records",
+        "8192",
+        "--range-records",
+        "1000000000",
+    ];
+
+    #[test]
+    fn knobs_set_the_config_fields_the_cli_flags_set() {
+        let args = parse(&ALL_KNOBS);
+        assert_eq!(args.validate_knobs(), Ok(()));
+        let (config, resolved) = compactor_config(&args, RequestLedger::new());
+        assert_eq!(
+            config.scratch_dir.as_deref(),
+            Some(std::path::Path::new(".gate-logs/scratch"))
+        );
+        assert_eq!(config.merge_resident_ceiling_bytes, Some(4_294_967_296));
+        assert_eq!(config.level1_workers, Some(3));
+        assert_eq!(config.level2_workers, Some(1));
+        assert_eq!(config.rlog_run_block_target_records, 8_192);
+        assert_eq!(config.rlog_range_records, 1_000_000_000);
+        assert_eq!(resolved["level1_workers"], 3);
+        assert_eq!(resolved["level2_workers"], 1);
+        assert_eq!(resolved["rlog_run_block_target_records"], 8_192);
+        assert_eq!(resolved["rlog_range_records"], 1_000_000_000u64);
+        assert_eq!(resolved["merge_resident_ceiling_bytes"], 4_294_967_296u64);
+    }
+
+    #[test]
+    fn no_knob_keeps_the_compactor_defaults() {
+        let args = parse(&[]);
+        assert_eq!(args.validate_knobs(), Ok(()));
+        let (config, _) = compactor_config(&args, RequestLedger::new());
+        let default = CompactorConfig::default();
+        assert_eq!(config.scratch_dir, None);
+        assert_eq!(config.merge_resident_ceiling_bytes, None);
+        assert_eq!(config.level1_workers, None);
+        assert_eq!(config.level2_workers, None);
+        assert_eq!(
+            config.rlog_run_block_target_records,
+            default.rlog_run_block_target_records
+        );
+        assert_eq!(config.rlog_range_records, default.rlog_range_records);
+        assert_eq!(
+            config.rlog_run_block_target_records,
+            ravel_maintain::rlog::RUN_BLOCK_TARGET_RECORDS
+        );
+        assert_eq!(
+            config.rlog_range_records,
+            ravel_maintain::rlog::LEVEL2_RANGE_RECORDS
+        );
+    }
+
+    #[test]
+    fn validate_knobs_refuses_what_the_cli_refuses() {
+        for (flags, want) in [
+            (
+                &["--level1-workers", "2"][..],
+                "--level1-workers needs --scratch-dir",
+            ),
+            (
+                &["--level2-workers", "2"][..],
+                "--level2-workers needs --scratch-dir",
+            ),
+            (
+                &["--run-block-records", "8192"][..],
+                "--run-block-records needs --scratch-dir",
+            ),
+            (
+                &["--scratch-dir", "s", "--level1-workers", "0"][..],
+                "--level1-workers must be at least 1, got 0",
+            ),
+            (
+                &["--scratch-dir", "s", "--level2-workers", "0"][..],
+                "level2_workers must be at least 1, got 0",
+            ),
+            (
+                &["--scratch-dir", "s", "--run-block-records", "0"][..],
+                "rlog run block target records must be at least 1, got 0",
+            ),
+            (
+                &["--range-records", "0"][..],
+                "rlog_range_records must be at least 1, got 0",
+            ),
+        ] {
+            assert_eq!(
+                parse(flags).validate_knobs(),
+                Err(want.to_string()),
+                "{flags:?}"
+            );
+        }
+        // The range quantum applies to the single-level route too, so it
+        // needs no scratch directory, as in ravel-cli.
+        assert_eq!(parse(&["--range-records", "5"]).validate_knobs(), Ok(()));
+    }
+
+    fn mark(wall_s: f64, cpu_s: f64) -> Option<Mark> {
+        Some(Mark { wall_s, cpu_s })
+    }
+
+    #[test]
+    fn two_level_report_splits_at_the_events() {
+        let split = two_level_report(
+            mark(1.0, 1.0),
+            mark(3.0, 5.0),
+            mark(13.0, 45.0),
+            mark(33.0, 95.0),
+            Mark {
+                wall_s: 34.0,
+                cpu_s: 96.0,
+            },
+            1_000_000,
+        );
+        let want: [(&str, f64); 11] = [
+            ("plan_wall_s", 2.0),
+            ("plan_cpu_s", 4.0),
+            ("level1_wall_s", 10.0),
+            ("level1_cpu_s", 40.0),
+            ("level1_cpu_us_per_record", 40.0),
+            ("level2_wall_s", 20.0),
+            ("level2_cpu_s", 50.0),
+            ("level2_cpu_us_per_record", 50.0),
+            ("publish_wall_s", 1.0),
+            ("publish_cpu_s", 1.0),
+            ("levels_share_of_process_cpu", 90.0 / 96.0),
+        ];
+        for (key, value) in want {
+            assert_eq!(
+                split[key].as_f64().map(f64::to_bits),
+                Some(value.to_bits()),
+                "{key}: {}",
+                split[key]
+            );
+        }
+    }
+
+    #[test]
+    fn two_level_report_leaves_the_levels_null_on_a_single_level_run() {
+        let split = two_level_report(
+            mark(1.0, 1.0),
+            mark(3.0, 5.0),
+            None,
+            mark(33.0, 95.0),
+            Mark {
+                wall_s: 34.0,
+                cpu_s: 96.0,
+            },
+            1_000_000,
+        );
+        for key in TWO_LEVEL_FIGURES {
+            assert!(split[key].is_null(), "{key}: {}", split[key]);
+        }
+        assert_eq!(split["plan_cpu_s"], 4.0);
+    }
+
+    /// A two-level document consistent with `ALL_KNOBS`.
+    fn two_level_doc() -> Value {
+        let split = two_level_report(
+            mark(1.0, 1.0),
+            mark(3.0, 5.0),
+            mark(13.0, 45.0),
+            mark(33.0, 95.0),
+            Mark {
+                wall_s: 34.0,
+                cpu_s: 96.0,
+            },
+            1_000_000,
+        );
+        json!({"run": {
+            "config": {
+                "level1_workers": 3,
+                "level2_workers": 1,
+                "rlog_run_block_target_records": 8_192,
+                "rlog_range_records": 1_000_000_000u64,
+                "merge_resident_ceiling_bytes": 4_294_967_296u64,
+            },
+            "two_level": {
+                "route": "two-level",
+                "two_level_events": 1,
+                "event_fields": {"level1_workers": "3", "level2_workers": "1"},
+                "split": split,
+            },
+        }})
+    }
+
+    #[test]
+    fn check_two_level_passes_a_consistent_two_level_run() {
+        assert_eq!(
+            check_two_level(&two_level_doc(), &parse(&ALL_KNOBS)),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn check_two_level_checks_nothing_without_a_scratch_dir() {
+        assert_eq!(
+            check_two_level(&json!({}), &parse(&[])),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn check_two_level_refuses_a_single_level_route() {
+        let mut doc = two_level_doc();
+        doc["run"]["two_level"]["route"] = json!("single-level");
+        doc["run"]["two_level"]["two_level_events"] = json!(0);
+        doc["run"]["two_level"]["event_fields"] = Value::Null;
+        doc["run"]["two_level"]["split"]["level2_cpu_s"] = Value::Null;
+        let failures = check_two_level(&doc, &parse(&ALL_KNOBS));
+        assert_eq!(
+            failures,
+            [
+                "route \"single-level\" with 0 two-level events, want two-level with 1",
+                "figure level2_cpu_s: reported 1 times, value null",
+                "two-level event level1_workers null, want 3",
+                "two-level event level2_workers null, want 1",
+            ]
+        );
+    }
+
+    #[test]
+    fn check_two_level_refuses_a_duplicated_or_non_positive_figure() {
+        let mut doc = two_level_doc();
+        doc["run"]["timeline"] = json!({"level1_cpu_s": 40.0});
+        doc["run"]["two_level"]["split"]["level2_wall_s"] = json!(0.0);
+        let failures = check_two_level(&doc, &parse(&ALL_KNOBS));
+        assert_eq!(
+            failures,
+            [
+                "figure level1_cpu_s: reported 2 times, value 40.0",
+                "figure level2_wall_s: reported 1 times, value 0.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn check_two_level_refuses_a_share_outside_the_band() {
+        for share in [0.79, 1.01] {
+            let mut doc = two_level_doc();
+            doc["run"]["two_level"]["split"]["levels_share_of_process_cpu"] = json!(share);
+            let (lo, hi) = LEVELS_SHARE_BAND;
+            assert_eq!(
+                check_two_level(&doc, &parse(&ALL_KNOBS)),
+                [format!(
+                    "levels cover {share:.3} of process CPU, band [{lo}, {hi}]"
+                )]
+            );
+        }
+        for share in [0.80, 1.0] {
+            let mut doc = two_level_doc();
+            doc["run"]["two_level"]["split"]["levels_share_of_process_cpu"] = json!(share);
+            assert_eq!(
+                check_two_level(&doc, &parse(&ALL_KNOBS)),
+                Vec::<String>::new()
+            );
+        }
+    }
+
+    #[test]
+    fn check_two_level_refuses_a_knob_the_run_did_not_carry() {
+        let mut doc = two_level_doc();
+        doc["run"]["config"]["rlog_run_block_target_records"] = json!(1_024);
+        doc["run"]["two_level"]["event_fields"]["level2_workers"] = json!("2");
+        assert_eq!(
+            check_two_level(&doc, &parse(&ALL_KNOBS)),
+            [
+                "config rlog_run_block_target_records 1024, want 8192",
+                "two-level event level2_workers \"2\", want 1",
+            ]
+        );
     }
 }
