@@ -149,10 +149,10 @@ blob returns `InvalidRange`, as a suffix of it does on S3.
 A pinned suffix read (`get_pinned` with `Suffix`) does not take `E` from
 its own HEAD. `E` is the pin's ETag, sent as `If-Match` on the HEAD and on
 the GET, with the pin's `versionid` on both when it has one. A 412 on
-either request is `PreconditionFailed`, returned at once (the 2026-11-13
-correction settles that 412 with one HEAD first): the key no longer
-holds the pinned object, and retrying against whatever replaced it would serve bytes the
-caller did not pin.
+either request is never retried against a new version: the key no longer
+holds the pinned object, and retrying against whatever replaced it would
+serve bytes the caller did not pin. It is settled by the one HEAD the
+2026-11-13 correction describes, whose answer names the outcome.
 
 A suffix read on Azure costs two billed requests where S3 and GCS cost one.
 The connector counts both attempts, and `StoreMetrics` counts one `get`
@@ -580,15 +580,23 @@ not be written, `a/0` and `a/b`, because `a` already existed as a blob.
 
 Running the implementation against Azurite 3.35.0 on 2026-11-13, and the
 review of #4161, showed three places where the decisions above did not
-hold as written.
+hold as written, and one answer the Measured section leaves out.
 
 - **Azurite measurements (2026-11-13).** Get Account Information on the
   container URL answers without `x-ms-is-hns-enabled`; on the account URL
   it answers `false`. A GET or HEAD with `If-Match` on an absent key
-  answers 412 `ConditionNotMet`, where Azure answers 404 `BlobNotFound`.
+  answers 412 `ConditionNotMet`, where Azure answered a GET with 404
+  `BlobNotFound` (measured 2026-11-12, P8; see the next bullet). A HEAD
+  with `If-Match` on an absent key was not measured on Azure.
   `startFrom` is ignored, which D1's listing filter already tolerates. A
   suffix range (`bytes=-n`) answers 500, which D2 never sends. Azure itself
   sends the HNS header on both URLs (P15).
+- **Measured, P8 and P1 to P4.** The 2026-11-12 run also sent a GET with
+  `If-Match` to a key that never existed, and Azure answered 404
+  `BlobNotFound` (row P8 of the results comment on #4158); that answer
+  belongs with the Measured section's P8 bullet. The P1 to P4 bullet's
+  "on a present key and on an absent one" is about Put Blob with
+  `If-Match`, which answers 412 on an absent key; a GET does not.
 - **D6, hierarchical namespace.** Construction reads `x-ms-is-hns-enabled`
   from the container URL first and, when that answer carries no header,
   from the account URL. Only `false` is accepted: `true` from either, a
@@ -598,15 +606,23 @@ hold as written.
   cannot tell a deleted key from a replaced one. Any pinned read (`Full`,
   `Range` or `Suffix`, on its HEAD or its GET) that meets a 412 sends one
   HEAD that keeps the pin's `versionid` and drops the `If-Match`. A 404
-  there is `NotFound`; any other answer is `PreconditionFailed`. Nothing is
-  retried: the HEAD only names the outcome. Against Azure, which answers
-  404 on an absent key, the extra HEAD is sent only when the blob was
-  replaced, so it costs one request on a path that already fails. An
-  unpinned suffix read keeps D2's three rounds.
+  `BlobNotFound` there is `NotFound` and a success is `PreconditionFailed`;
+  any other failure of that HEAD is returned as it is, so a throttled or
+  transient HEAD stays retryable, a 401 or 403 stays `AccessDenied` and a
+  404 `ContainerNotFound` stays `Permanent`. Nothing is retried against a
+  new version: the HEAD only names the outcome. The extra HEAD is sent
+  whenever a pinned request answers 412. Against Azure, which answered a
+  GET on an absent key with 404 (P8), a GET's 412 means the blob was
+  replaced; for a HEAD that was not measured. Either way it costs one
+  request on a path that already fails. An unpinned suffix read keeps D2's
+  three rounds.
 - **D5, leases.** A leased blob refuses a write or a delete with a 412 or
-  a 409 whose `x-ms-error-code` starts with `Lease`. That is `Permanent` in
-  every put mode and on delete, never `AlreadyExists` or
-  `PreconditionFailed`: Ravel takes no leases, so no retry clears one. This
-  replaces D5's wording that only a 409 for a lease is `Permanent`, and
-  narrows "409 and 412 are the precondition outcomes named in D1" to codes
-  that are not lease codes.
+  a 409 whose `x-ms-error-code` starts with `Lease`. A lease is held only
+  on a blob that exists, so under `CreateIfAbsent` that answer proves the
+  key exists and is `AlreadyExists`, as the contract requires for a create
+  that lost to an existing object. Under `CasVersion` and `Overwrite`, on
+  delete, and on a multipart upload's Put Block and Put Block List it is
+  `Permanent`, never `PreconditionFailed`: Ravel takes no leases, so no
+  retry clears one. This replaces D5's wording that only a 409 for a lease
+  is `Permanent`, and narrows "409 and 412 are the precondition outcomes
+  named in D1" to codes that are not lease codes, except on a create.
