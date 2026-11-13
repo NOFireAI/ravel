@@ -479,8 +479,8 @@ STUB
 # service account unreadable and STUB_NO_GRANT leaves the results bucket's
 # policy without its objectAdmin binding. STUB_GCS_DOWN fails every storage
 # listing as an unreachable endpoint would. A machine type's architecture is
-# STUB_MACHINE_ARCH (default X86_64; set it empty for an answer with no
-# architecture), and STUB_GCLOUD_FAIL=machine-type fails the lookup.
+# STUB_MACHINE_ARCH (default empty, as GCE answers for x86 types; X86_64,
+# ARM64 or another value to set it), and STUB_GCLOUD_FAIL=machine-type fails the lookup.
 export FAKE_GCS="$TMP/gcs"
 mkdir -p "$FAKE_GCS" "$STUB_DIR/gce"
 cat >"$STUBS/gcloud" <<'STUB'
@@ -536,7 +536,7 @@ case "${pos[0]:-} ${pos[1]:-} ${pos[2]:-}" in
   "storage buckets describe") [ -d "$(gcs "${pos[3]}")" ] || { echo "ERROR: NotFound" >&2; exit 1; }; echo "${pos[3]#gs://}" ;;
   "compute machine-types describe")
     failing machine-type
-    echo "${STUB_MACHINE_ARCH-X86_64}" ;;
+    echo "${STUB_MACHINE_ARCH-}" ;;
   "compute instances create")
     failing create
     cp "$meta" "$STUB_DIR/startup-${pos[3]}" && echo us-central1-a >"$STUB_DIR/gce/${pos[3]}" ;;
@@ -5339,13 +5339,25 @@ gcp_refusal "a service account without objectAdmin on the results bucket" 65 'la
   "$GCP_TOML" STUB_NO_GRANT=1
 gcp_refusal "a missing service account" 65 'does not exist or cannot be read' "$GCP_TOML" STUB_NO_SA=1
 # Catches: an arm64 machine type reaching a box whose release step has no
-# pinned digest for it; a lookup that fails or answers nothing launching anyway.
-gcp_refusal "an arm64 machine type" 64 'machine type c2d-highcpu-16 is arm64; only linux-amd64 release artifacts are pinned' \
+# pinned digest for it; a lookup that fails launching anyway.
+gcp_refusal "an arm64 machine type" 64 'machine type c2d-highcpu-16 reports architecture ARM64; only linux-amd64 release artifacts are pinned' \
   "$GCP_TOML" STUB_MACHINE_ARCH=ARM64
-gcp_refusal "a machine type with no architecture" 64 'cannot tell the architecture of machine type c2d-highcpu-16' \
-  "$GCP_TOML" STUB_MACHINE_ARCH=
-gcp_refusal "a machine type lookup that fails" 64 'cannot look up the architecture of machine type c2d-highcpu-16' \
+gcp_refusal "a machine type reporting an unknown architecture" 64 'machine type c2d-highcpu-16 reports architecture RISCV64; only linux-amd64' \
+  "$GCP_TOML" STUB_MACHINE_ARCH=RISCV64
+gcp_refusal "a machine type lookup that fails" 64 'cannot tell the architecture of machine type c2d-highcpu-16' \
   "$GCP_TOML" STUB_GCLOUD_FAIL=machine-type
+# Catches: an explicit X86_64 answer refused.
+reset_log
+code=0
+STUB_MACHINE_ARCH=X86_64 launch_gcp "$GCP_TOML" >/dev/null 2>"$TMP/gx86.err" || code=$?
+if [ "$code" = 0 ] && grep -q 'gcloud compute instances create' "$STUB_LOG"; then
+  pass "launch-gcp launches a machine type GCE reports as X86_64"
+else
+  fail "launch-gcp X86_64 machine type" "exit $code: $(tail -n 3 "$TMP/gx86.err")"
+fi
+rm -f "$STUB_DIR"/gce/*
+rm -rf "$FAKE_GCS"/kit-test-cb-*
+
 # Catches: a pre-registration missing a figure reaching a launch.
 grep -v '^hot_sum_s = ' "$GCP_PREREG" >"$TMP/prereg-short.toml"
 sed "s#^prereg = .*#prereg = \"$TMP/prereg-short.toml\"#" "$GCP_TOML" >"$TMP/gcp-short.toml"
@@ -5394,11 +5406,12 @@ if [ "$code" = 0 ] && [ -f "$GCP_RUN_DIR/in/kit.sha256" ] && [ -f "$GCP_RUN_DIR/
 else
   fail "launch-gcp" "exit $code, run id '$GCP_RUN_ID', kit.tgz holds '$tar_list': $(tail -n 3 "$TMP/glaunch.err")"
 fi
-# Catches: the check refusing an x86_64 type, or a launch that never asked
-# GCE, and an instance created before the answer came.
+# Catches: the check refusing an x86 type (the stub answers empty, as GCE
+# does), or a launch that never asked GCE, and an instance created before the
+# answer came.
 if [ "$code" = 0 ] && grep -q '^gcloud compute machine-types describe c2d-highcpu-16 ' "$STUB_LOG" \
   && [ "$(grep -n '^gcloud compute machine-types describe' "$STUB_LOG" | head -n 1 | cut -d: -f1)" -lt "$(grep -n '^gcloud compute instances create' "$STUB_LOG" | head -n 1 | cut -d: -f1)" ]; then
-  pass "launch-gcp asks GCE for the machine type's architecture before it creates anything, and launches an x86_64 one"
+  pass "launch-gcp asks GCE for the machine type's architecture before it creates anything, and launches an x86 one"
 else
   fail "launch-gcp x86_64 machine type" "exit $code: $(tr '\n' ';' <"$STUB_LOG" | head -c 300)"
 fi
