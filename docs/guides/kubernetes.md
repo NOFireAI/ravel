@@ -1587,7 +1587,7 @@ Under `spec.storage.azure` the cluster stores its data in an Azure Blob
 Storage container and every pod, the qualify Job and the operator itself
 authenticate through AKS workload identity. No storage key
 exists in any Secret and the CRD has no field for one. The server image must
-be one whose `ravel-server` and `ravel-cli` accept `--store azure`.
+be 0.33.0 or later: earlier images have no `--store azure`.
 
 ```yaml
 spec:

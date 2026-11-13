@@ -51,6 +51,18 @@ ravel-cli --store azure --azure-account ravelprod --azure-container ravel-data s
 The record names the backend as `az://<account>/<container>`, and
 `ravel-server --store azure` refuses to start until it exists.
 
+That credential needs two grants. `Storage Blob Data Contributor` on the
+container covers the blobs. The second is the action
+`Microsoft.Storage/storageAccounts/blobServices/getInfo/action` on the storage
+account: every Ravel process reads the account's hierarchical-namespace flag
+when it builds the store, and the Storage Blob Data roles do not hold that
+action. An identity with only the data role is refused with
+`HTTP 403 AuthorizationPermissionMismatch`, by `store qualify` and by the
+server alike. The
+[Kubernetes guide](../kubernetes.md#azure-blob-storage-with-workload-identity)
+shows a custom role that holds the one action, and the same role works outside
+Kubernetes.
+
 Ravel's commit protocol and catalog need two things from the store. The store
 must honor conditional writes, so that it rejects a losing writer and does not
 overwrite silently. A listing must show every write that is complete.
