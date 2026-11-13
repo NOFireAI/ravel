@@ -8870,7 +8870,11 @@ mod tests {
     /// day, counting each refusal in `refused`. Otherwise it counts the
     /// non-marker points of the selector's series in `(time - range, time]`,
     /// answers an instant selector with no sample, and `/api/v1/series` as
-    /// [`query_stub`] does.
+    /// [`query_stub`] does. The `n`th `count_over_time` answer it serves,
+    /// from 1, carries `data.stats` with `segmentsFetched` `n`,
+    /// `io.unfoldedSegmentsResolved` `100 + n`, `accounting.requests` `n`
+    /// and the five PromQL phases at `n` GETs each, so every call's stats
+    /// differ from every other's.
     fn day_limited_query_stub(
         points: Vec<LogicalPoint>,
         refused: Arc<std::sync::atomic::AtomicUsize>,
@@ -8883,6 +8887,7 @@ mod tests {
                 .collect()
         };
         let points = Arc::new(points);
+        let counted = Arc::new(std::sync::atomic::AtomicU64::new(0));
         axum::Router::new()
             .route(
                 "/api/v1/series",
@@ -8911,6 +8916,7 @@ mod tests {
                     move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
                         let points = Arc::clone(&points);
                         let refused = Arc::clone(&refused);
+                        let counted = Arc::clone(&counted);
                         async move {
                             let params = pairs(&raw);
                             let param = |name: &str| {
@@ -8973,11 +8979,33 @@ mod tests {
                             } else {
                                 serde_json::json!([{"metric": {}, "value": [0, count.to_string()]}])
                             };
+                            let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            let phases: Vec<serde_json::Value> =
+                                ["resolve", "plan", "probe", "scan", "keyIndex"]
+                                    .into_iter()
+                                    .map(|phase| {
+                                        serde_json::json!({
+                                            "phase": phase,
+                                            "s3GetRequests": n,
+                                            "s3GetWireBytes": 100 * n,
+                                            "s3ListRequests": 0,
+                                        })
+                                    })
+                                    .collect();
                             (
                                 axum::http::StatusCode::OK,
                                 axum::Json(serde_json::json!({
                                     "status": "success",
-                                    "data": {"resultType": "vector", "result": result},
+                                    "data": {
+                                        "resultType": "vector",
+                                        "result": result,
+                                        "stats": {
+                                            "accounting": {"requests": n},
+                                            "phases": phases,
+                                            "segmentsFetched": n,
+                                            "io": {"unfoldedSegmentsResolved": 100 + n},
+                                        },
+                                    },
                                 })),
                             )
                         }
@@ -9059,6 +9087,171 @@ mod tests {
                 .any(|(k, _)| *k == READBACK_QUERY_HISTOGRAM_SAMPLES),
             "{counted:?}"
         );
+    }
+
+    /// The keys of one serialized [`ReadbackCallStats`], in field order.
+    const READBACK_CALL_STATS_KEYS: [&str; 12] = [
+        "window",
+        "query_ms",
+        "accounting",
+        "phases",
+        "segmentsFetched",
+        "segmentsPruned",
+        "segmentsPrunedByDictionary",
+        "segmentsPrunedByLabelIndex",
+        "labelIndexValues",
+        "estimate",
+        "io",
+        "unfoldedSegmentsResolved",
+    ];
+
+    /// A two-day read-back records every `/api/v1/query` call of each
+    /// windowed count as its own entry, in query order, with its window
+    /// beside it and the `data.stats` members a `ravel_cost` record copies:
+    /// every entry carries the five PromQL phases, the stub's per-call
+    /// `segmentsFetched` runs 1, 2, 3, ... across all calls (so no entry is
+    /// a sum and no call is dropped), `unfoldedSegmentsResolved` is copied
+    /// out of `io`, and a member the answer lacks is `null`. Both series
+    /// listings carry the no-stats marker instead. Recorded with no metrics
+    /// URL. The README names every key.
+    ///
+    /// TO SEE THIS FAIL: in `ApiReader::instant_count`, return the whole
+    /// answer body in place of `data.stats` (every entry's `phases` and
+    /// `segmentsFetched` read `null`), or in `windowed_count` push only the
+    /// first window's call (each per-call list holds one entry, not three).
+    #[tokio::test]
+    async fn readback_records_each_windowed_calls_stats_with_its_window() {
+        let base = base_ts_ms() - 2 * READBACK_COUNT_WINDOW;
+        let points = two_day_mix(base);
+        let (addr, server) = serve(write_stub(vec![Canned::ok(None)])).await;
+        let config = HttpReplayConfig {
+            receiver: Receiver::Prometheus,
+            endpoint: format!("http://{addr}/api/v1/write"),
+            bearer_token: None,
+            tenant: None,
+            batch_size: 3,
+            max_retries: 0,
+            timeout_secs: 5,
+            shards: 1,
+            stall_ceiling: None,
+        };
+        let outcome = replay_over_http_with_plan(&config, &mut SlicePoints::new(&points))
+            .await
+            .expect("replay");
+        server.abort();
+
+        let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (addr, server) = serve(day_limited_query_stub(points, refused)).await;
+        let readback = readback_over_http(
+            &ReadbackConfig {
+                query_url: format!("http://{addr}"),
+                bearer_token: None,
+                timeout_secs: 5,
+                settle_secs: 0,
+                metrics_url: None,
+            },
+            &outcome.result,
+            &outcome.plan,
+        )
+        .await
+        .expect("read back");
+        server.abort();
+        assert!(readback.matches_expected, "{readback:?}");
+
+        let windows: Vec<ReadbackCallWindow> = readback_count_windows(
+            outcome.plan.min_ts_ms.expect("min"),
+            outcome.plan.max_ts_ms.expect("max"),
+            READBACK_COUNT_WINDOW,
+        )
+        .into_iter()
+        .map(|w| ReadbackCallWindow {
+            end_ms: w.end_ms,
+            range_ms: w.range_ms,
+        })
+        .collect();
+        assert_eq!(windows.len(), 3);
+
+        let json = serde_json::to_value(&readback).expect("serializes");
+        let stats = json["query_stats"].as_object().expect("query_stats object");
+        // The reads in the order read_back_once issues them.
+        let order = [
+            READBACK_QUERY_SERIES,
+            "samples.0",
+            READBACK_QUERY_HISTOGRAM_SERIES,
+            READBACK_QUERY_HISTOGRAM_SAMPLES,
+        ];
+        let mut keys: Vec<&str> = order.to_vec();
+        keys.sort_unstable();
+        assert_eq!(
+            stats.keys().map(String::as_str).collect::<Vec<_>>(),
+            keys,
+            "{json}"
+        );
+        let mut call = 0u64;
+        for name in order {
+            let entry = &stats[name];
+            if name == READBACK_QUERY_SERIES || name == READBACK_QUERY_HISTOGRAM_SERIES {
+                assert_eq!(
+                    entry,
+                    &serde_json::json!({"stats": "none", "reason": READBACK_SERIES_NO_STATS}),
+                    "{name}"
+                );
+                continue;
+            }
+            assert_eq!(entry["stats"], "per_call", "{name}: {entry}");
+            let calls = entry["calls"].as_array().expect("calls list");
+            assert_eq!(calls.len(), windows.len(), "{name}: one entry per call");
+            for (got, window) in calls.iter().zip(&windows) {
+                call += 1;
+                let got_keys: Vec<&str> = got
+                    .as_object()
+                    .expect("entry object")
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                let mut want_keys = READBACK_CALL_STATS_KEYS.to_vec();
+                want_keys.sort_unstable();
+                assert_eq!(got_keys, want_keys, "{name}: {got}");
+                assert_eq!(
+                    got["window"],
+                    serde_json::json!({"end_ms": window.end_ms, "range_ms": window.range_ms}),
+                    "{name}"
+                );
+                let phases: Vec<&str> = got["phases"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{name}: no phase list in {got}"))
+                    .iter()
+                    .filter_map(|p| p["phase"].as_str())
+                    .collect();
+                assert_eq!(
+                    phases,
+                    ["resolve", "plan", "probe", "scan", "keyIndex"],
+                    "{name}"
+                );
+                assert_eq!(got["segmentsFetched"], call, "{name}: {got}");
+                assert_eq!(got["unfoldedSegmentsResolved"], 100 + call, "{name}");
+                assert_eq!(got["io"]["unfoldedSegmentsResolved"], 100 + call, "{name}");
+                assert_eq!(got["accounting"]["requests"], call, "{name}");
+                assert!(got["segmentsPruned"].is_null(), "{name}: {got}");
+                assert!(got["query_ms"].is_u64(), "{name}: {got}");
+            }
+        }
+        assert_eq!(call, 6, "two windowed reads of three calls each");
+        assert!(readback.query_cost.is_empty(), "no metrics URL, no cost");
+
+        let readme = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/metricsbench/README.md"
+        ))
+        .expect("README");
+        let row = readme
+            .split("\n\n")
+            .find(|p| p.contains("`readback.query_stats`"))
+            .expect("a README paragraph on readback.query_stats");
+        for key in READBACK_CALL_STATS_KEYS {
+            assert!(row.contains(&format!("`{key}`")), "README omits {key}");
+        }
+        assert!(row.contains(READBACK_SERIES_NO_STATS), "{row}");
     }
 
     /// A receiver that acknowledges writes before it makes them queryable

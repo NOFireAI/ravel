@@ -1615,6 +1615,33 @@ which count every request the process served in that interval:
 counter went down across the query. `run.sh` passes Ravel's `/metrics` URL
 to the folded read-back for this with or without `MB_STAGE1`.
 
+`ingest.json` (each HTTP row's unfolded read-back) and
+`readback-folded.json` also record `readback.query_stats`, the statements'
+own cost (ADR-3694 decision 5), with or without a metrics URL, keyed like
+`query_ms`. Each `samples.N` and `histogram_samples` read is
+`{"stats": "per_call", "calls": [...]}`: one entry per `/api/v1/query`
+call of its windowed count, in query order, never summed. Each entry
+carries `window` (`end_ms` and `range_ms`, the `count_over_time` window
+the call evaluated), `query_ms` (that call's wall time), then, copied from
+the answer's `data.stats` as a `ravel_cost` record copies them, each `null`
+(never 0) when the answer has no such member: `accounting`, `phases`
+(Ravel's PromQL phases `resolve`, `plan`, `probe`, `scan` and `keyIndex`),
+`segmentsFetched`, `segmentsPruned`, `segmentsPrunedByDictionary`,
+`segmentsPrunedByLabelIndex`, `labelIndexValues`, `estimate`, `io`, and
+`unfoldedSegmentsResolved`, copied out of `io`. The `series` and
+`histogram_series` listings record `{"stats": "none", "reason":
+"/api/v1/series answers carry no data.stats"}`. The `stale_marker`
+instant query records none. For example (values illustrative):
+
+```json
+"samples.0": {"stats": "per_call", "calls": [
+  {"window": {"end_ms": 1760086400000, "range_ms": 86400000}, "query_ms": 41,
+   "accounting": {...}, "phases": [{"phase": "resolve", ...}, ...],
+   "segmentsFetched": 4, "segmentsPruned": 6, "segmentsPrunedByDictionary": 3,
+   "segmentsPrunedByLabelIndex": 0, "labelIndexValues": null,
+   "estimate": null, "io": {...}, "unfoldedSegmentsResolved": 2}, ...]}
+```
+
 **holders.json.** How many data objects in each selective statement's fetch
 window hold a series it asks for, counted without the router or the key
 index. `segments_in_window` is every object whose event time range overlaps
