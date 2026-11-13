@@ -44,7 +44,7 @@ use std::time::Instant;
 
 use ravel_bench::bench_env::env_header;
 use ravel_bench::codecs::{
-    Alp, AlpRd, AlpVectorized, ByteSplitZstd, Chimp128, GcdDeltaFor, RawF64, ValueCodec,
+    Alp, AlpRd, AlpVectorized, ByteSplitZstd, Chimp128, Dexor, GcdDeltaFor, RawF64, ValueCodec,
 };
 use ravel_bench::metrics_stream_sample::sample_series;
 use ravel_bench::segment_support::{decode_scalar_run, production_scalar_run, scalar_val_page};
@@ -60,6 +60,18 @@ const INNER_REPS: usize = 4000;
 /// Adoption threshold: a challenger must use at most this fraction of
 /// production's bytes per sample.
 const BYTE_RATIO_MAX: f64 = 0.75;
+
+/// Throughput timing knobs. Tests shrink them so the report guard stays cheap.
+#[derive(Clone, Copy)]
+struct Timing {
+    rounds: usize,
+    inner_reps: usize,
+}
+
+const FULL_TIMING: Timing = Timing {
+    rounds: MEASURE_ROUNDS,
+    inner_reps: INNER_REPS,
+};
 
 /// One synthetic value stream and its human name.
 struct Dataset {
@@ -127,20 +139,20 @@ fn median(mut xs: Vec<f64>) -> f64 {
     xs[xs.len() / 2]
 }
 
-/// Median Mval/s (millions of values per second) over [`MEASURE_ROUNDS`] timed
-/// rounds of [`INNER_REPS`] repetitions each.
-fn throughput_mvps<F: FnMut()>(mut f: F, n_values: usize) -> f64 {
+/// Median Mval/s (millions of values per second) over `timing.rounds` timed
+/// rounds of `timing.inner_reps` repetitions each, after three warm-up calls.
+fn throughput_mvps<F: FnMut()>(timing: Timing, mut f: F, n_values: usize) -> f64 {
     for _ in 0..3 {
         f();
     }
-    let mut rounds = Vec::with_capacity(MEASURE_ROUNDS);
-    for _ in 0..MEASURE_ROUNDS {
+    let mut rounds = Vec::with_capacity(timing.rounds);
+    for _ in 0..timing.rounds {
         let start = Instant::now();
-        for _ in 0..INNER_REPS {
+        for _ in 0..timing.inner_reps {
             f();
         }
         let elapsed = start.elapsed().as_secs_f64().max(1e-12);
-        rounds.push((n_values as f64 * INNER_REPS as f64) / elapsed / 1e6);
+        rounds.push((n_values as f64 * timing.inner_reps as f64) / elapsed / 1e6);
     }
     median(rounds)
 }
@@ -220,7 +232,7 @@ struct DatasetSummary {
     challengers: Vec<ChallengerSummary>,
 }
 
-fn measure_challenger(codec: &dyn ValueCodec, values: &[f64]) -> Cell {
+fn measure_challenger(codec: &dyn ValueCodec, values: &[f64], timing: Timing) -> Cell {
     let n = values.len();
     let encoded = codec.encode(values);
     let roundtrip_ok = codec
@@ -228,12 +240,14 @@ fn measure_challenger(codec: &dyn ValueCodec, values: &[f64]) -> Cell {
         .map(|d| bits_eq(&d, values))
         .unwrap_or(false);
     let enc_mvps = throughput_mvps(
+        timing,
         || {
             black_box(codec.encode(black_box(values)));
         },
         n,
     );
     let dec_mvps = throughput_mvps(
+        timing,
         || {
             black_box(codec.decode(black_box(&encoded), n)).ok();
         },
@@ -251,7 +265,7 @@ fn measure_challenger(codec: &dyn ValueCodec, values: &[f64]) -> Cell {
     }
 }
 
-fn measure_production(values: &[f64]) -> Cell {
+fn measure_production(values: &[f64], timing: Timing) -> Cell {
     let n = values.len();
     let run = production_scalar_run(values);
     let page = scalar_val_page(&run);
@@ -262,12 +276,14 @@ fn measure_production(values: &[f64]) -> Cell {
     let (_ts, decoded) = decode_scalar_run(&run);
     let roundtrip_ok = bits_eq(&decoded, values);
     let enc_mvps = throughput_mvps(
+        timing,
         || {
             black_box(production_scalar_run(black_box(values)));
         },
         n,
     );
     let dec_mvps = throughput_mvps(
+        timing,
         || {
             black_box(decode_scalar_run(black_box(&run)));
         },
@@ -292,7 +308,7 @@ fn measure_production(values: &[f64]) -> Cell {
 /// every challenger row) and returns the per-dataset summaries used by the
 /// adoption pass. Every cell row starts with its dataset, page size and
 /// codec, so a test can count each cell's line in the rendered text.
-fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
+fn page_report(page: usize, timing: Timing) -> (String, Vec<DatasetSummary>) {
     let mut out = String::new();
     let mut summary: Vec<DatasetSummary> = Vec::new();
 
@@ -319,7 +335,7 @@ fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
     }
 
     for ds in datasets {
-        let prod = measure_production(&ds.values);
+        let prod = measure_production(&ds.values, timing);
         let challengers: Vec<Cell> = [
             &Alp as &dyn ValueCodec,
             &GcdDeltaFor,
@@ -328,9 +344,10 @@ fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
             &RawF64,
             &AlpVectorized,
             &AlpRd,
+            &Dexor,
         ]
         .iter()
-        .map(|c| measure_challenger(*c, &ds.values))
+        .map(|c| measure_challenger(*c, &ds.values, timing))
         .collect();
 
         let enc_tag = prod
@@ -402,7 +419,7 @@ fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
 
 /// Renders the whole report below the environment header: every page
 /// size's block, then the adoption summary. `main` prints exactly this.
-fn render_report(page_sizes: &[usize]) -> String {
+fn render_report(page_sizes: &[usize], timing: Timing) -> String {
     let mut out = String::new();
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -431,7 +448,7 @@ fn render_report(page_sizes: &[usize]) -> String {
     let mut summary: Vec<DatasetSummary> = Vec::new();
 
     for &page in page_sizes {
-        let (page_out, page_summary) = page_report(page);
+        let (page_out, page_summary) = page_report(page, timing);
         out.push_str(&page_out);
         summary.extend(page_summary);
     }
@@ -480,7 +497,7 @@ fn render_report(page_sizes: &[usize]) -> String {
 
 fn main() {
     let mut out = env_header("Value codec bake-off (issue #312, ADR-0092 decision 6)");
-    out.push_str(&render_report(&PAGE_SIZES));
+    out.push_str(&render_report(&PAGE_SIZES, FULL_TIMING));
     print!("{out}");
 }
 
@@ -499,6 +516,13 @@ fn enc_name(tag: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One timed round of one call: the tests check what the report holds
+    /// and how its figures are derived, not the figures themselves.
+    const TEST_TIMING: Timing = Timing {
+        rounds: 1,
+        inner_reps: 1,
+    };
 
     /// Deliverable-4 guard, PRODUCTION call site: the input-side decode
     /// bandwidth must come from the real compressed VAL page length, not from
@@ -537,7 +561,7 @@ mod tests {
         // And it is exactly what measure_production wired in: its recorded
         // input-side dec MB/s equals the value rate scaled by the compressed
         // page length.
-        let cell = measure_production(&values);
+        let cell = measure_production(&values, TEST_TIMING);
         assert!(
             (cell.dec_in_mb_per_sec - dec_in_mb_per_sec(cell.dec_mvps, page.len(), n)).abs() < 1e-9
         );
@@ -562,7 +586,7 @@ mod tests {
             encoded.len()
         );
 
-        let cell = measure_challenger(&GcdDeltaFor, &values);
+        let cell = measure_challenger(&GcdDeltaFor, &values, TEST_TIMING);
         // Recorded input-side bandwidth uses the codec's real encoded length.
         assert!(
             (cell.dec_in_mb_per_sec - dec_in_mb_per_sec(cell.dec_mvps, encoded.len(), n)).abs()
@@ -586,9 +610,9 @@ mod tests {
         assert!((dec_out_mb_per_sec(20.0) - 160.0).abs() < 1e-9);
 
         let values = vec![7.0f64; 500];
-        let prod = measure_production(&values);
+        let prod = measure_production(&values, TEST_TIMING);
         assert!((prod.dec_out_mb_per_sec - prod.dec_mvps * 8.0).abs() < 1e-9);
-        let chal = measure_challenger(&GcdDeltaFor, &values);
+        let chal = measure_challenger(&GcdDeltaFor, &values, TEST_TIMING);
         assert!((chal.dec_out_mb_per_sec - chal.dec_mvps * 8.0).abs() < 1e-9);
     }
 
@@ -598,7 +622,7 @@ mod tests {
     }
 
     const TEST_PAGE: usize = 4;
-    const CODECS: [&str; 8] = [
+    const CODECS: [&str; 9] = [
         "production",
         "alp",
         "gcd_delta_for",
@@ -607,6 +631,7 @@ mod tests {
         "raw_f64",
         "alp_vectorized",
         "alp_rd",
+        "dexor",
     ];
 
     fn datasets() -> Vec<&'static str> {
@@ -669,15 +694,24 @@ mod tests {
         Ok(())
     }
 
+    /// The report at [`TEST_PAGE`] under [`TEST_TIMING`], rendered once and
+    /// shared by every guard test.
+    fn reduced_report() -> String {
+        static REPORT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        REPORT
+            .get_or_init(|| render_report(&[TEST_PAGE], TEST_TIMING))
+            .clone()
+    }
+
     #[test]
     fn report_has_every_cell_exactly_once() {
-        let out = render_report(&[TEST_PAGE]);
+        let out = reduced_report();
         check_cells(&out, TEST_PAGE).unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]
     fn guard_rejects_a_duplicated_cell() {
-        let out = render_report(&[TEST_PAGE]);
+        let out = reduced_report();
         let line = out
             .lines()
             .find(|l| cell_key(l) == Some(("metricsbench_history", TEST_PAGE, "alp_rd")))
@@ -692,7 +726,7 @@ mod tests {
 
     #[test]
     fn guard_rejects_a_dropped_cell() {
-        let out = render_report(&[TEST_PAGE]);
+        let out = reduced_report();
         let kept: Vec<&str> = out
             .lines()
             .filter(|l| cell_key(l) != Some(("gauge_int", TEST_PAGE, "production")))
