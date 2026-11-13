@@ -61,6 +61,9 @@ pub fn decode_ts_deltas_into(
     max_ts_ns: i64,
     out: &mut Vec<i64>,
 ) -> Result<(), SegmentError> {
+    // Every delta takes at least one byte, so a well-formed page reserves
+    // exactly its samples and a corrupt `count` reserves at most its bytes.
+    out.reserve(count.min(bytes.len()));
     let mut pos = 0usize;
     let mut accum = 0i64;
     for i in 0..count {

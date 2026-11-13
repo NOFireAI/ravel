@@ -5,6 +5,7 @@
 //! and counts from stored bytes are untrusted; bounds-check everything and
 //! verify crc32c on every section/page/footer touched.
 
+mod catalog_charge;
 mod crc;
 mod error;
 mod exemplars;
@@ -20,6 +21,9 @@ mod value_codecs;
 mod varint;
 mod writer;
 
+pub use catalog_charge::{
+    CatalogCharge, PROVENANCE_COLUMN_BYTES_PER_SAMPLE, SAMPLE_PROVENANCE_BYTES, Uncharged,
+};
 pub use error::{SegmentError, WriteError};
 pub use exemplars::{
     ExemplarInput, ExemplarRecord, decode_exemplars_section, probe_exemplars_by_series,
@@ -34,9 +38,9 @@ pub use identity::{ExpectedIdentity, check_identity};
 pub use reader::{
     FooterLocation, FooterOutcome, PlannedRunRange, RunEntry, SampleProvenance, SeriesEntry,
     SeriesEntryV4, TrailerClass, ValPageKind, ValueKind, classify_trailer,
-    decode_catalog_matching_v4, decode_catalog_v4, decode_run_histogram_pages,
-    decode_run_pages_soa, decode_series_ids, open_from_full, open_from_suffix, parse_footer,
-    plan_ranges_v4, validate_sections,
+    decode_catalog_matching_v4, decode_catalog_matching_v4_charged, decode_catalog_v4,
+    decode_catalog_v4_charged, decode_run_histogram_pages, decode_run_pages_soa, decode_series_ids,
+    open_from_full, open_from_suffix, parse_footer, plan_ranges_v4, validate_sections,
 };
 /// RSEG v5 catalog (docs/segment-format.md): `decode_catalog_v5` is the
 /// whole-catalog decode over the whole object (folding to the run-major
@@ -48,10 +52,11 @@ pub use reader::{
 /// SERIES_IDS window, then a crc-verified meta chunk, then decode that
 /// series' runs.
 pub use sparse::{
-    ChunkLocation, IdWindow, SparseIdIndex, decode_catalog_v5, decode_catalog_v5_chunked,
-    decode_catalog_v5_chunked_matching, decode_chunk_runs, find_index_in_window,
-    label_dict_holds_all, label_dict_strings, parse_series_idx, verify_and_decompress_chunk_frame,
-    verify_id_window,
+    ChunkLocation, IdWindow, SparseIdIndex, decode_catalog_v5, decode_catalog_v5_charged,
+    decode_catalog_v5_chunked, decode_catalog_v5_chunked_charged,
+    decode_catalog_v5_chunked_matching, decode_catalog_v5_chunked_matching_charged,
+    decode_chunk_runs, find_index_in_window, label_dict_holds_all, label_dict_strings,
+    parse_series_idx, verify_and_decompress_chunk_frame, verify_id_window,
 };
 pub use writer::{
     CompactionMetaV4, HistogramSample, IngestBounds, RunInputV4, RunInputV7, RunValuePageV4,

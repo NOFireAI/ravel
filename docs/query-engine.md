@@ -1349,20 +1349,34 @@ tied to the buffer it accounts for:
   amendment): an L1 segment's selected pages are fetched one batch at a time. A
   batch is a group of whole series, in catalog order, whose coalesced page
   bytes at the fetcher's coalesce gap, bridged gaps included, are at most
-  `fetch_batch_bytes`: the budget's limit divided by twice the GET permits,
-  never below 8 MiB (`FETCH_BATCH_FLOOR_BYTES`). The count keeps one tail per
+  `fetch_batch_bytes`, and whose decoded runs (below) are at most
+  `fetch_batch_bytes` too: the budget's limit divided by twice the GET permits,
+  never below 8 MiB (`FETCH_BATCH_FLOOR_BYTES`). The page count keeps one tail per
   page section (TS, VAL, HIST), reset at each batch, and also charges a gap the
   coalescer bridges between two sections (`page_batches`,
   `coalesced_batch_bytes_is_the_coalesced_runs`). A series whose own coalesced
-  bytes exceed `fetch_batch_bytes` is a batch alone and reserves exactly those
-  bytes (`a_series_over_the_batch_bytes_is_fetched_alone`). Each batch is one
+  bytes or decoded runs exceed `fetch_batch_bytes` is a batch alone and
+  reserves exactly its pages (`a_series_over_the_batch_bytes_is_fetched_alone`).
+  Each batch is one
   `ensure_ranges` call into a `FetchedRegions` of its own, borrowing the
   segment's open and catalog regions rather than fetching them again, and is
   decoded into the query's sample fold and dropped before the next batch
-  reserves. The batch reservation covers the page bytes as stored; the decoded
-  samples are charged by the fold's `reserve_retained`. Every batch of more
-  than one series reserves at most `fetch_batch_bytes`, and the fetch's peak is
-  one batch over what the segment already holds
+  reserves. The batch reservation covers the page bytes as stored. Once a
+  batch's pages are in, and before any of them is decoded, the batch also
+  reserves its decoded runs, held until the sample fold has taken them:
+  per sample its timestamp and value (a histogram's inline
+  value counted twice, since a run's decode builds its samples once before
+  splitting them) and, for a run with a per-sample provenance column, its
+  `SamplePriority`; per emitted unit the unit and its copy of the series'
+  labels (`decoded_units_len`). A histogram value's span and bucket vectors
+  are not in that figure; the fold charges them as it holds them. A page
+  stores a regular counter in well under a byte per sample, so the decoded
+  runs are many times the batch's pages. A decode the budget refuses is
+  refused after the batch's page GET and before any page is decoded
+  (`a_batch_whose_decode_does_not_fit_is_refused_before_it_decodes`). Every
+  batch of more than one series reserves at most `fetch_batch_bytes` of pages
+  and at most `fetch_batch_bytes` of decoded runs, and the fetch's peak is one
+  batch over what the segment already holds
   (`one_call_never_reserves_more_than_one_batch`,
   `an_l1_part_over_the_fetch_limit_answers_in_batches`). A batch after the
   first that does not fit fails the statement with fetch memory exhausted and
@@ -1443,9 +1457,26 @@ path), falling back to the footer figure only when that directory is not
 readable. On the 4096-series fixture the two differ by an order of magnitude:
 8,599 stored bytes against 90,356 inflated.
 
+**Per-sample provenance.** An L1 segment whose runs the compactor
+merged from several inputs carries the per-sample provenance extension
+(ADR-0092 decision 1): four `encode_i64` columns over every flagged sample.
+They store a run-wide constant in a few bytes, so no section figure covers what
+they decode to: up to 64 bytes of decoded columns per sample (16 per column,
+since an RLE column's buffer grows by doubling) and one 32-byte
+`SampleProvenance` per sample, for every sample in the object whatever the
+matchers select. The catalog decode admits both figures to the budget through
+`ravel_segment::CatalogCharge` before it allocates them, releases the columns
+once they are freed, and keeps admitted only the provenance of the entries it
+returns, which it moves out of the decoded columns rather than copying. A
+whole SERIES_META section holds every sample's provenance at once while it
+decodes; a chunked catalog holds one frame's beyond what its result keeps. A
+budget that cannot hold them refuses the decode with the same typed
+`FetchMemoryExhausted` before the columns are decoded
+(`crates/ravel-query/tests/l1_read_memory.rs`).
+
 Once the matchers have run, `decode_selected` exchanges the whole-catalog
 reservation for one sized to the entries that survived, measured over their
-structs, label strings and runs. A selective query on a large object therefore
+structs, label strings, runs and provenance. A selective query on a large object therefore
 holds a few hundred bytes through its page fetches rather than the whole
 catalog's charge. The exchange only ever shrinks: on an object small enough
 that the decoded entries measure more than the sections they came from, the
@@ -1499,18 +1530,25 @@ object's fetch completes (`RunFold` in `engine/sample_fold.rs`), keeping on a
 duplicate `(series, timestamp)` the sample the dedup order serves, so the
 result is the one `merge_soa_runs` gives over every object at once, whatever
 order the objects complete in. Cross-selector and federation scalar runs fold
-into the same accumulator. After each object the fold reserves what it holds
-against the same budget: each series' id and labels (`retained_series_len`),
-each held sample and each distinct provenance prefix. A read whose merged
-samples do not fit is refused with the same 422 `FetchMemoryExhausted`,
-against the budget's limit, and the reservation is released when the series
-are handed to the evaluator or when the read fails. `max_series` is checked
-as each series is added and `max_samples` once the fold is finished, with the
-merge's errors. The reservation is the most the fold held after any object, so
-it does not shrink when a later object's duplicates are dropped. The
-distributed coordinator still holds every slice's runs until the last slice
-answers before they are folded, federation histogram runs are merged whole as
-before, and a series' run is held unreserved while it is folded in.
+into the same accumulator. The fold holds, against the same budget, each
+series' id and labels (`retained_series_len`), each held sample and each
+distinct provenance prefix, and it reserves before it folds a batch of runs
+in, not after: every incoming sample as if kept, the labels of
+each series it does not hold yet, one prefix per unseen provenance prefix
+along each run, and the level the merge of one series builds beside the
+levels it replaces. A read whose merged samples do not fit is refused with
+the same 422 `FetchMemoryExhausted`, against the budget's limit, before the
+batch is folded. The reservation is the most any batch could have made the
+fold hold, so it does not shrink when a later object's duplicates are dropped.
+`max_series` is checked as each series is added and `max_samples` once the
+fold is finished, with the merge's errors. The local fetch holds a batch's
+decoded runs under the batch's own reservation (above) while the fold takes
+them. When the fold is finished its reservation moves to the merged series
+the evaluator reads and is released with them when the evaluation ends, or
+when the read fails; a range query's selector-cache copies are charged on top
+of it. The distributed coordinator still holds every slice's runs until the
+last slice answers before they are folded, and federation histogram runs are
+merged whole as before, both unreserved until they are folded.
 
 **Objects a discovery read skips.** The same reads also keep the id of every
 series a decoded object held, matched or not, and charge 32 bytes per id to

@@ -9,6 +9,10 @@ use std::collections::HashSet;
 use ravel_proto::segment::v1::{Footer, Section};
 use ravel_types::{Label, LabelSet, SeriesId};
 
+use crate::catalog_charge::{
+    CatalogCharge, PROVENANCE_COLUMN_BYTES_PER_SAMPLE, SAMPLE_PROVENANCE_BYTES, Uncharged,
+    provenance_bytes,
+};
 use crate::crc::page_crc;
 use crate::error::SegmentError;
 use crate::format::{
@@ -1609,6 +1613,7 @@ fn parse_series_meta_tail_v4(
     count: u32,
     run_total: u32,
     limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<SeriesMetaTailV4, SegmentError> {
     let block = take_block(meta_bytes, pos)?;
     let mut bpos = 0usize;
@@ -1798,7 +1803,7 @@ fn parse_series_meta_tail_v4(
     // `encode_i64` columns) follow, consumed here so the trailing-bytes check
     // below still catches genuine garbage past the extension.
     let per_sample_provenance = if *pos < meta_bytes.len() {
-        parse_provenance_extension(meta_bytes, pos, footer, &sample_count, limits)?
+        parse_provenance_extension(meta_bytes, pos, footer, &sample_count, limits, charge)?
     } else {
         Vec::new()
     };
@@ -1889,6 +1894,7 @@ fn parse_provenance_extension(
     footer: &Footer,
     sample_count: &[u32],
     limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<Vec<Option<Vec<SampleProvenance>>>, SegmentError> {
     let run_total = sample_count.len();
     let presence = take_encoded_i64_block(meta_bytes, pos, run_total)?;
@@ -1933,6 +1939,15 @@ fn parse_provenance_extension(
     }
     let prov_total = to_usize(prov_sample_total)?;
 
+    // Both halves of the live decode are admitted before either is
+    // allocated. The columns are freed (and released) before this returns;
+    // the structs stay admitted with the tail that holds them.
+    let column_bytes = prov_sample_total.saturating_mul(PROVENANCE_COLUMN_BYTES_PER_SAMPLE);
+    let struct_bytes = prov_sample_total.saturating_mul(SAMPLE_PROVENANCE_BYTES);
+    if !charge.admit(column_bytes) || !charge.admit(struct_bytes) {
+        return Err(SegmentError::CatalogChargeRefused);
+    }
+
     let created_delta = take_encoded_i64_block(meta_bytes, pos, prov_total)?;
     let epoch = take_encoded_i64_block(meta_bytes, pos, prov_total)?;
     let seq = take_encoded_i64_block(meta_bytes, pos, prov_total)?;
@@ -1964,6 +1979,8 @@ fn parse_provenance_extension(
         }
         out.push(Some(column));
     }
+    drop((created_delta, epoch, seq, in_page_index));
+    charge.release(column_bytes);
     Ok(out)
 }
 
@@ -2038,6 +2055,26 @@ pub fn decode_catalog_v4(
     series_meta_bytes: &[u8],
     limits: ReaderLimits,
 ) -> Result<Vec<SeriesEntryV4>, SegmentError> {
+    decode_catalog_v4_charged(
+        footer,
+        label_dict_bytes,
+        series_ids_bytes,
+        series_meta_bytes,
+        limits,
+        &mut Uncharged,
+    )
+}
+
+/// [`decode_catalog_v4`] with the per-sample provenance it materializes
+/// admitted to `charge` before it is allocated (see [`CatalogCharge`]).
+pub fn decode_catalog_v4_charged(
+    footer: &Footer,
+    label_dict_bytes: &[u8],
+    series_ids_bytes: &[u8],
+    series_meta_bytes: &[u8],
+    limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
     let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
         .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
     let series_ids_section = find_section(footer, section_kind::SERIES_IDS)
@@ -2059,6 +2096,7 @@ pub fn decode_catalog_v4(
         &series_ids,
         &meta_bytes,
         limits,
+        charge,
     )
 }
 
@@ -2078,6 +2116,7 @@ pub(crate) fn decode_catalog_v4_from_decoded(
     series_ids: &[[u8; 16]],
     meta_bytes: &[u8],
     limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<Vec<SeriesEntryV4>, SegmentError> {
     let series_ids_count = series_ids.len() as u64;
 
@@ -2090,9 +2129,11 @@ pub(crate) fn decode_catalog_v4_from_decoded(
     let schema_ref = parse_schema_ref_block_v2(meta_bytes, &mut pos, meta_count, schema_count)?;
     let value_ord =
         parse_value_ord_block_all_v2(meta_bytes, &mut pos, meta_count, &schema_ref, &schemas)?;
-    let tail =
-        parse_series_meta_tail_v4(meta_bytes, &mut pos, footer, meta_count, run_total, limits)?;
+    let mut tail = parse_series_meta_tail_v4(
+        meta_bytes, &mut pos, footer, meta_count, run_total, limits, charge,
+    )?;
     check_value_kind_pages_v4(footer, &tail.value_kind, &tail.run_count, &tail.runs)?;
+    let tail_provenance = provenance_bytes(&tail.per_sample_provenance);
 
     let mut resolver = DictResolver::new(dict_bytes, dict_index);
     let mut entries = Vec::with_capacity(series_ids.len());
@@ -2120,7 +2161,10 @@ pub(crate) fn decode_catalog_v4_from_decoded(
             if tail.per_sample_provenance.is_empty() {
                 Vec::new()
             } else {
-                tail.per_sample_provenance[roff..roff + run_count].to_vec()
+                tail.per_sample_provenance[roff..roff + run_count]
+                    .iter_mut()
+                    .map(std::mem::take)
+                    .collect()
             };
         roff += run_count;
 
@@ -2151,7 +2195,31 @@ pub(crate) fn decode_catalog_v4_from_decoded(
             per_sample_provenance,
         });
     }
+    hand_over_provenance(&entries, tail, tail_provenance, charge)?;
     Ok(entries)
+}
+
+/// Moves the provenance a decode returns from the tail's admission to its
+/// own: admits what `entries` hold, then frees the tail and releases the
+/// `tail_provenance` bytes [`parse_provenance_extension`] admitted for it.
+/// The entries' provenance was moved out of the tail, so the two admissions
+/// overlap only until the tail is dropped here.
+fn hand_over_provenance(
+    entries: &[SeriesEntryV4],
+    tail: SeriesMetaTailV4,
+    tail_provenance: u64,
+    charge: &mut dyn CatalogCharge,
+) -> Result<(), SegmentError> {
+    let kept = entries
+        .iter()
+        .map(|e| provenance_bytes(&e.per_sample_provenance))
+        .fold(0, u64::saturating_add);
+    if !charge.admit(kept) {
+        return Err(SegmentError::CatalogChargeRefused);
+    }
+    drop(tail);
+    charge.release(tail_provenance);
+    Ok(())
 }
 
 /// Decodes only the series whose labels satisfy every `(name, value)`
@@ -2170,6 +2238,30 @@ pub fn decode_catalog_matching_v4(
     series_meta_bytes: &[u8],
     equals: &[(&str, &str)],
     limits: ReaderLimits,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
+    decode_catalog_matching_v4_charged(
+        footer,
+        label_dict_bytes,
+        series_ids_bytes,
+        series_meta_bytes,
+        equals,
+        limits,
+        &mut Uncharged,
+    )
+}
+
+/// [`decode_catalog_matching_v4`] with the per-sample provenance it
+/// materializes admitted to `charge` before it is allocated (see
+/// [`CatalogCharge`]). Only the matched series' provenance stays admitted
+/// once it returns.
+pub fn decode_catalog_matching_v4_charged(
+    footer: &Footer,
+    label_dict_bytes: &[u8],
+    series_ids_bytes: &[u8],
+    series_meta_bytes: &[u8],
+    equals: &[(&str, &str)],
+    limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<Vec<SeriesEntryV4>, SegmentError> {
     let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
         .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
@@ -2239,9 +2331,17 @@ pub fn decode_catalog_matching_v4(
         &schemas,
         &schema_plausible,
     )?;
-    let tail =
-        parse_series_meta_tail_v4(&meta_bytes, &mut pos, footer, meta_count, run_total, limits)?;
+    let mut tail = parse_series_meta_tail_v4(
+        &meta_bytes,
+        &mut pos,
+        footer,
+        meta_count,
+        run_total,
+        limits,
+        charge,
+    )?;
     check_value_kind_pages_v4(footer, &tail.value_kind, &tail.run_count, &tail.runs)?;
+    let tail_provenance = provenance_bytes(&tail.per_sample_provenance);
 
     let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
     let mut entries = Vec::new();
@@ -2249,12 +2349,12 @@ pub fn decode_catalog_matching_v4(
     for i in 0..series_ids.len() {
         let run_count = tail.run_count[i] as usize;
         let run_slice = &tail.runs[roff..roff + run_count];
-        let prov_slice: &[Option<Vec<SampleProvenance>>] = if tail.per_sample_provenance.is_empty()
-        {
-            &[]
-        } else {
-            &tail.per_sample_provenance[roff..roff + run_count]
-        };
+        let prov_slice: &mut [Option<Vec<SampleProvenance>>] =
+            if tail.per_sample_provenance.is_empty() {
+                &mut []
+            } else {
+                &mut tail.per_sample_provenance[roff..roff + run_count]
+            };
         roff += run_count;
 
         let Some(vals) = &value_ord[i] else {
@@ -2306,9 +2406,10 @@ pub fn decode_catalog_matching_v4(
                 hist_page: (0, 0),
             },
             runs: run_slice.to_vec(),
-            per_sample_provenance: prov_slice.to_vec(),
+            per_sample_provenance: prov_slice.iter_mut().map(std::mem::take).collect(),
         });
     }
+    hand_over_provenance(&entries, tail, tail_provenance, charge)?;
     Ok(entries)
 }
 
@@ -2477,6 +2578,7 @@ mod dict_resolver_tests {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod provenance_extension_tests {
     use super::{SampleProvenance, parse_provenance_extension, take_encoded_i64_block};
+    use crate::catalog_charge::Uncharged;
     use crate::error::SegmentError;
     use crate::reader::ReaderLimits;
     use crate::varint::write_uvarint;
@@ -2518,6 +2620,7 @@ mod provenance_extension_tests {
             &footer(100),
             &sample_count,
             ReaderLimits::default(),
+            &mut Uncharged,
         )
         .expect("valid extension parses");
         assert_eq!(pos, meta.len(), "parser consumes exactly the extension");
@@ -2542,6 +2645,100 @@ mod provenance_extension_tests {
         assert_eq!(out[1], None);
     }
 
+    /// Records every admit and release, refusing admits past `limit`.
+    struct Ledger {
+        limit: u64,
+        held: u64,
+        events: Vec<(&'static str, u64)>,
+    }
+
+    impl crate::CatalogCharge for Ledger {
+        fn admit(&mut self, bytes: u64) -> bool {
+            if self.held + bytes > self.limit {
+                self.events.push(("refused", bytes));
+                return false;
+            }
+            self.held += bytes;
+            self.events.push(("admit", bytes));
+            true
+        }
+
+        fn release(&mut self, bytes: u64) {
+            self.held -= bytes;
+            self.events.push(("release", bytes));
+        }
+    }
+
+    fn two_flagged_samples() -> (Vec<u8>, [u32; 2]) {
+        let mut meta = encoded_block(&[1, 0]);
+        meta.extend(encoded_block(&[5, 6]));
+        meta.extend(encoded_block(&[7, 8]));
+        meta.extend(encoded_block(&[9, 10]));
+        meta.extend(encoded_block(&[0, 1]));
+        (meta, [2, 1])
+    }
+
+    /// Issue #4118: the columns and the structs are admitted before either is
+    /// allocated, the columns released once freed, and the structs left
+    /// admitted for the tail that holds them.
+    #[test]
+    fn the_extension_admits_its_decode_before_allocating_it() {
+        let (meta, sample_count) = two_flagged_samples();
+        let mut ledger = Ledger {
+            limit: u64::MAX,
+            held: 0,
+            events: Vec::new(),
+        };
+        let mut pos = 0usize;
+        let out = parse_provenance_extension(
+            &meta,
+            &mut pos,
+            &footer(100),
+            &sample_count,
+            ReaderLimits::default(),
+            &mut ledger,
+        )
+        .expect("valid extension parses");
+        let columns = 2 * crate::PROVENANCE_COLUMN_BYTES_PER_SAMPLE;
+        let structs = 2 * crate::SAMPLE_PROVENANCE_BYTES;
+        assert_eq!(crate::PROVENANCE_COLUMN_BYTES_PER_SAMPLE, 64);
+        assert_eq!(crate::SAMPLE_PROVENANCE_BYTES, 32);
+        assert_eq!(
+            ledger.events,
+            vec![("admit", columns), ("admit", structs), ("release", columns)]
+        );
+        assert_eq!(ledger.held, structs);
+        assert_eq!(crate::catalog_charge::provenance_bytes(&out), structs);
+    }
+
+    /// A refused admit is the typed refusal, before any column is decoded:
+    /// the cursor has not moved past the presence column.
+    #[test]
+    fn a_refused_admit_stops_the_extension_before_its_columns() {
+        let (meta, sample_count) = two_flagged_samples();
+        let presence_len = encoded_block(&[1, 0]).len();
+        for limit in [0, 2 * crate::PROVENANCE_COLUMN_BYTES_PER_SAMPLE] {
+            let mut ledger = Ledger {
+                limit,
+                held: 0,
+                events: Vec::new(),
+            };
+            let mut pos = 0usize;
+            let err = parse_provenance_extension(
+                &meta,
+                &mut pos,
+                &footer(100),
+                &sample_count,
+                ReaderLimits::default(),
+                &mut ledger,
+            )
+            .expect_err("the ledger refuses");
+            assert_eq!(err, SegmentError::CatalogChargeRefused, "limit {limit}");
+            assert_eq!(pos, presence_len, "limit {limit}: no column was read");
+            assert_eq!(ledger.events.last().map(|e| e.0), Some("refused"));
+        }
+    }
+
     #[test]
     fn presence_value_out_of_range_is_typed() {
         let meta = encoded_block(&[2]); // presence value 2 is neither 0 nor 1
@@ -2552,6 +2749,7 @@ mod provenance_extension_tests {
             &footer(0),
             &[3u32],
             ReaderLimits::default(),
+            &mut Uncharged,
         )
         .expect_err("presence 2 must be rejected");
         assert!(matches!(err, SegmentError::InvalidProvenancePresence(2)));
@@ -2567,6 +2765,7 @@ mod provenance_extension_tests {
             &footer(0),
             &[3u32],
             ReaderLimits::default(),
+            &mut Uncharged,
         )
         .expect_err("all-zero presence must be rejected");
         assert!(matches!(err, SegmentError::EmptyProvenanceExtension));
@@ -2588,6 +2787,7 @@ mod provenance_extension_tests {
             &footer(0),
             &sample_count,
             ReaderLimits::default(),
+            &mut Uncharged,
         )
         .expect_err("a missing column must be a typed error");
         // A typed SegmentError, never a panic (the assert above proves no
@@ -2613,6 +2813,7 @@ mod provenance_extension_tests {
             &footer(0),
             &[1u32],
             ReaderLimits::default(),
+            &mut Uncharged,
         )
         .expect_err("invalid enc tag must be rejected");
         assert!(matches!(err, SegmentError::ProvenanceColumnCodec(_)));
@@ -2633,6 +2834,7 @@ mod provenance_extension_tests {
             &footer(0),
             &sample_count,
             ReaderLimits::default(),
+            &mut Uncharged,
         )
         .expect_err("negative in-page index must be rejected");
         assert!(matches!(err, SegmentError::FieldOverflow));

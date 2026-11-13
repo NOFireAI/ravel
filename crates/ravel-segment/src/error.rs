@@ -271,6 +271,11 @@ pub enum SegmentError {
         "SERIES_META provenance columns would decode to {live_bytes} live bytes, exceeding the {cap}-byte section budget"
     )]
     ProvenanceLiveBudgetExceeded { live_bytes: u64, cap: u64 },
+    /// The caller's [`CatalogCharge`](crate::CatalogCharge) refused the bytes
+    /// a catalog decode was about to allocate. Not a property of the object:
+    /// the caller holds the reason.
+    #[error("catalog decode refused by its memory charge")]
+    CatalogChargeRefused,
 
     // --- RSEG v7 page codecs (ADR-0092 decision 6, issue #312): VAL_ALP,
     // VAL_GCD_DELTA_FOR, and TS_GCD_I64 decode. A corrupt or truncated page
