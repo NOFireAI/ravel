@@ -133,6 +133,14 @@ impl RavelBucket {
     /// Whether `profile` reaching `bucket` addresses this bucket, or a
     /// location containing it, by configuration.
     fn is_reached_by(&self, profile: &ExternalProfile, bucket: &str) -> bool {
+        // An account that is not a storage account name cannot be compared
+        // with Ravel's, so it fails closed.
+        if let (RavelBucket::Azure { .. }, ExternalKind::Azure { account, .. }) =
+            (self, &profile.kind)
+            && !is_storage_account_name(account)
+        {
+            return true;
+        }
         let ravel = match self {
             RavelBucket::S3 {
                 endpoint,
@@ -167,6 +175,12 @@ impl RavelBucket {
         };
         ravel.overlaps(&theirs)
     }
+}
+
+/// Whether `account`, lowercased, is a valid Azure storage account name: 3 to
+/// 24 ASCII lowercase letters and digits.
+fn is_storage_account_name(account: &str) -> bool {
+    (3..=24).contains(&account.len()) && account.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Where requests for one bucket go: the service and the leading path
@@ -1733,11 +1747,53 @@ mod tests {
         }
     }
 
-    /// An Azure profile is never Ravel's bucket when Ravel runs on S3 or GCS.
+    /// Under `--store azure` an Azure profile whose account is not a valid
+    /// storage account name may still resolve to Ravel's account while
+    /// comparing unequal, so it is refused as reaching Ravel's container; a
+    /// valid foreign account is still allowed.
+    #[test]
+    fn an_azure_profile_with_an_invalid_account_is_refused_under_azure() {
+        let profiles = ravel_object_store::external::load_profiles(
+            r#"[{"name": "crafted", "kind": "azure", "account": "ravelprod.blob.core.windows.net#",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}},
+                {"name": "other", "kind": "azure", "account": "customer01",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}}]"#,
+        )
+        .expect("profiles");
+        let ravel = RavelBucket::Azure {
+            account: "ravelprod".to_string(),
+            container: "data".to_string(),
+        };
+        assert!(ravel.is_reached_by(&profiles[0], "data"));
+        assert!(ravel.is_reached_by(&profiles[0], "lake"));
+        assert!(!ravel.is_reached_by(&profiles[1], "data"));
+
+        let stores = ProfileStores::new(profiles).refusing(ravel);
+        assert!(
+            matches!(
+                stores.store("crafted", "data"),
+                Err(ExternalStoreError::RavelBucket { ref profile, ref bucket })
+                    if profile == "crafted" && bucket == "data"
+            ),
+            "a crafted account is refused"
+        );
+        assert!(
+            !matches!(
+                stores.store("other", "data"),
+                Err(ExternalStoreError::RavelBucket { .. })
+            ),
+            "a valid foreign account is not Ravel's container"
+        );
+    }
+
+    /// An Azure profile is never Ravel's bucket when Ravel runs on S3 or GCS,
+    /// whatever its account.
     #[test]
     fn an_azure_profile_is_not_ravels_s3_or_gcs_bucket() {
         let profiles = ravel_object_store::external::load_profiles(
             r#"[{"name": "z", "kind": "azure", "account": "ravelprod",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}},
+                {"name": "crafted", "kind": "azure", "account": "ravelprod.blob.core.windows.net#",
                  "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}}]"#,
         )
         .expect("profiles");
@@ -1752,7 +1808,9 @@ mod tests {
                 bucket: "data".to_string(),
             },
         ] {
-            assert!(!ravel.is_reached_by(&profiles[0], "data"), "{ravel:?}");
+            for profile in &profiles {
+                assert!(!ravel.is_reached_by(profile, "data"), "{ravel:?}");
+            }
         }
     }
 
