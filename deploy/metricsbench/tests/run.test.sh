@@ -209,7 +209,10 @@
 #                                       summing exactly to ravel-objects.json's
 #                                       data count, distinct ingest hours and
 #                                       snapshot parts, the stamp naming the
-#                                       inspector commands; x0: a second count;
+#                                       inspector commands, catalog list called
+#                                       with --json and run.sh's field list
+#                                       equal to ravel-cli's test's; x0: a
+#                                       second count;
 #                                       x1: no snapshot HEAD, x2: a failed
 #                                       catalog list, x3: no fold, x4: a failed
 #                                       catalog inspect and x6: a non-JSON
@@ -229,15 +232,22 @@
 #                                       cold-ravel-diagnostic marked non-
 #                                       comparable, the five phases per record,
 #                                       report.json's timed rows unchanged and
-#                                       only the standard run writing it; y1:
-#                                       failing cold runs are recorded, exit 0;
-#                                       y2: a failed ingest runs none; y3: the
-#                                       real corpus's four history entries; y4:
-#                                       a failed restart and y5: a failed
-#                                       readiness wait are recorded runs; y6: a
-#                                       missing record is a named failed run;
-#                                       y7: an unloadable corpus is a stamped
-#                                       failure; b: not taken
+#                                       only the standard run writing it, each
+#                                       run's resolve GETs,
+#                                       unfoldedSegmentsResolved and fold
+#                                       cycles, and the fold cycles before and
+#                                       after the pass; y1: failing cold runs
+#                                       are recorded, exit 0; y2: a failed
+#                                       ingest runs none; y3: the real corpus's
+#                                       four history entries; y4: a failed
+#                                       restart and y5: a failed readiness wait
+#                                       are recorded runs; y6: a missing record
+#                                       is a named failed run; y7: an
+#                                       unloadable corpus is a stamped failure;
+#                                       y8: no fold-cycles sample is null with
+#                                       why; y9: a duplicate record and y10: an
+#                                       unreadable runs file are stamped
+#                                       failures, no file; b: not taken
 #   z  MB_STAGE1 (issue #3968)      -> z0: ravel.yml's entrypoint is the
 #                                       image's ENTRYPOINT plus an empty
 #                                       RAVEL_SERVER_EXTRA_FLAGS (rendered by
@@ -1130,7 +1140,9 @@ case "$url" in
   */metrics)
     # Scrape k (1-based) reports k*STUB_GETS_PER_SCRAPE (default 100) store
     # GETs, k*STUB_FETCH_MISSES_PER_SCRAPE (default 95) fetch-cache misses and
-    # k*3 commit-record cache entries, so consecutive scrapes differ by those.
+    # k*3 commit-record cache entries and k*2 metrics fold cycles (beside a
+    # logs fold-cycle count; STUB_NO_FOLD_CYCLES drops both), so consecutive
+    # scrapes differ by those.
     # Every scrape reports metrics flushes by size 40, age 100, age_adaptive
     # 20, age_floor 30 and arrival 10 (200 disjoint), beside a logs flush
     # count and the rerouted and grace-extended sub-counts
@@ -1150,6 +1162,9 @@ case "$url" in
       printf '# no fold yet\nravel_up 1\n' >"$out"
     else
       printf '# TYPE ravel_catalog_fold_last_success_timestamp_seconds gauge\nravel_catalog_fold_last_success_timestamp_seconds 1761000000\n' >"$out"
+    fi
+    if [ -z "${STUB_NO_FOLD_CYCLES:-}" ]; then
+      printf 'ravel_catalog_fold_cycles_total{mode="all",signal="metrics"} %s\nravel_catalog_fold_cycles_total{mode="all",signal="logs"} 7777\n' "$((k * 2))" >>"$out"
     fi
     printf 'ravel_store_calls_total{mode="all",op="get"} %s\nravel_store_calls_total{mode="all",op="put"} 7\n' "$((k * ${STUB_GETS_PER_SCRAPE:-100}))" >>"$out"
     if [ -z "${STUB_NO_FETCH_MISSES:-}" ]; then
@@ -1359,6 +1374,16 @@ case "$out" in
     else
       rmdir "${out%/*}/runs.json.tmp" 2>/dev/null
     fi
+    # STUB_COLD_DUP_RECORD=ID.R: that run's record is already in the runs
+    # file before its own lands, so the file ends with a duplicate.
+    # STUB_COLD_CLOBBER_RUNS=ID.R: that run leaves the runs file unreadable.
+    if [ "${out##*/}" = "${STUB_COLD_DUP_RECORD:-unset}.report.json" ]; then
+      python3 -I -c 'import json, sys; p, i, r = sys.argv[1:]; d = json.load(open(p)); d.append({"entry": i, "repetition": int(r)}); json.dump(d, open(p, "w"))' \
+        "${out%/*}/runs.json" "${STUB_COLD_DUP_RECORD%.*}" "${STUB_COLD_DUP_RECORD##*.}"
+    fi
+    if [ "${out##*/}" = "${STUB_COLD_CLOBBER_RUNS:-unset}.report.json" ]; then
+      printf 'not json\n' >"${out%/*}/runs.json"
+    fi
     ;;
 esac
 # Each record also carries the Stage 1 fields: --pass-label and --fold-state
@@ -1387,13 +1412,16 @@ esac
 # "rep2" object, keyed the same way, adds a rep-2 record per entry to that
 # pass with those fields replaced.
 # Every phase also carries the per-phase cost the server reports: 1 GET of
-# 100 wire bytes.
+# 100 wire bytes. A cold-ravel-diagnostic/ run of repetition R reports R
+# resolve-phase GETs and io.unfoldedSegmentsResolved 10*R.
 # Entry STUB_TWO_HASH_ENTRY gets a second record in every pass, rep 2, with
 # result_hash blake3:<entry>-rep2.
 python3 -I - "$corpus" "$diag" "$out" "$verdict" "$@" <<'PY'
-import json, os, sys
+import json, os, re, sys
 corpus, diag, out, verdict = sys.argv[1:5]
 rest = sys.argv[5:]
+cold_m = re.search(r"/cold-ravel-diagnostic/[^/]*\.(\d+)\.report\.json$", out)
+cold_rep = int(cold_m.group(1)) if cold_m else None
 def flag(name):
     return rest[rest.index(name) + 1] if name in rest else None
 label, state = flag("--pass-label"), flag("--fold-state")
@@ -1432,6 +1460,9 @@ def record(i):
     if i == failed:
         r.update({"status": "failed: stub", "result_hash": None, "segmentsFetched": None,
                   "segmentsPruned": None, "segmentsPrunedByLabelIndex": None, "labelIndexValues": None})
+    if cold_rep is not None:
+        r["phases"] = [dict(p, s3GetRequests=cold_rep) if p["phase"] == "resolve" else p for p in r["phases"]]
+        r["io"] = {"unfoldedSegmentsResolved": 10 * cold_rep}
     if os.environ.get("STUB_RUN_FIGURES"):
         figs = json.load(open(os.environ["STUB_RUN_FIGURES"]))["records"].get(label) or {}
         over = {**figs.get("*", {}), **figs.get(i, {})}
@@ -2705,7 +2736,35 @@ PY
 else
   fail "x: the entries are not read after the fold"
 fi
-expect_log "x: the entries listing asks for JSON" "catalog list --tenant metricsbench --shards 4 --hours"
+expect_log "x: the entries listing names the tenant and shards" "catalog list --tenant metricsbench --shards 4 --hours"
+# The compose call the stub answers with the spans listing is the last
+# `catalog list` command before the stub's catalog-list state line.
+if python3 -I - "${LOG}" <<'PY'; then
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+listed = next(i for i, l in enumerate(lines) if l.startswith("docker-state catalog-list "))
+calls = [l for l in lines[:listed] if l.startswith("docker compose ") and " catalog list " in l]
+sys.exit(0 if calls and calls[-1].split()[-1] == "--json" and calls[-1].split().count("--json") == 1 else 1)
+PY
+  pass "x: the spans capture calls catalog list with --json"
+else
+  fail "x: the spans capture does not call catalog list with --json"
+fi
+# run.sh's SPANS_SEGMENT_FIELDS and the ravel-cli test that pins catalog list
+# --json's keys each spell the list; a key added to one alone fails here.
+if python3 -I - "${HERE}/../run.sh" "${HERE}/../../../services/ravel-cli/src/main.rs" <<'PY'; then
+import ast, re, sys
+sh = re.findall(r"^\s*SPANS_SEGMENT_FIELDS = (\(.*\))$", open(sys.argv[1]).read(), re.M)
+rs = re.findall(r"const SPANS_SEGMENT_FIELDS: \[&str; (\d+)\] = \[([^\]]*)\];", open(sys.argv[2]).read())
+if len(sh) != 1 or len(rs) != 1:
+    sys.exit(1)
+cli = re.findall(r'"([^"]+)"', rs[0][1])
+sys.exit(0 if list(ast.literal_eval(sh[0])) == cli and len(cli) == int(rs[0][0]) > 0 else 1)
+PY
+  pass "x: run.sh's SPANS_SEGMENT_FIELDS is the list ravel-cli's catalog_list_json_line test pins"
+else
+  fail "x: run.sh's SPANS_SEGMENT_FIELDS and ravel-cli's catalog_list_json_line test list differ, or either is not found once"
+fi
 check "x: a ci run selects no cold entry, stamped with the corpus path" 'j("stamps.json")["cold_ravel_diagnostic"] == "not applicable: no entry of class long_range or mb_full_range_avg_over_time in the corpus " + j("stamps.json")["corpus"] + " is declared for profile ci" and j("stamps.json")["corpus"].endswith("benchmarks/metrics/metrics.corpus.json")'
 expect_no_file x cold-ravel-diagnostic.json
 expect_no_log "x: a ci run restarts nothing for a cold pass" " restart --no-deps ravel-server"
@@ -2725,7 +2784,7 @@ mapfile -t args < <(full_args "${TMP}/x2/out")
 STUB_SPANS_LIST_EXIT=3 run_case x2 "${args[@]}"
 expect_rc x2 0
 expect_no_file x2 ravel-object-spans.json
-check "x2: a failed inspector is stamped with its command, the run passes" 'j("stamps.json")["object_spans"].startswith("failed: ravel-cli catalog list --tenant metricsbench") and j("stamps.json")["object_spans"].endswith("exited 3") and j("stamps.json")["status"] == "passed"'
+check "x2: a failed catalog list is stamped with its command, the run passes" 'j("stamps.json")["object_spans"].startswith("failed: ravel-cli catalog list --tenant metricsbench") and j("stamps.json")["object_spans"].endswith("exited 3") and j("stamps.json")["status"] == "passed"'
 
 mapfile -t args < <(full_args "${TMP}/x3/out")
 STUB_INGEST_ROW_FAILURE=ravel run_case x3 "${args[@]}"
@@ -2845,10 +2904,14 @@ check "y: the standard steps are unchanged" 'j("stamps.json")["steps_completed"]
 
 check "y: the corpus path used is stamped, and named in the file and the stamp" 'j("stamps.json")["corpus"] == "'"${TMP}"'/corpus.json" == j("cold-ravel-diagnostic.json")["corpus"] == j("stamps.json")["cold_ravel_diagnostic"]["corpus"] and j("stamps.json")["cold_ravel_diagnostic"]["missing_runs"] == []'
 check "y: the note says each repetition also queries the Prometheus oracle" '"Prometheus oracle" in j("cold-ravel-diagnostic.json")["note"]'
+check "y: each run records its resolve-phase GETs and unfoldedSegmentsResolved as its ravel_cost measured them" 'all(r["catalog_state"]["resolve_s3_get_requests"] == r["repetition"] and r["catalog_state"]["unfolded_segments_resolved"] == 10 * r["repetition"] and r["catalog_state"]["why_null"] == {} for r in j("cold-ravel-diagnostic.json")["runs"])'
+check "y: each run records the metrics fold cycles of the scrape after its query, between the scrapes before and after the pass" 'isinstance(j("cold-ravel-diagnostic.json")["fold_cycles"]["before_pass"], int) and [r["catalog_state"]["fold_cycles_since_restart"] for r in j("cold-ravel-diagnostic.json")["runs"]] == [j("cold-ravel-diagnostic.json")["fold_cycles"]["before_pass"] + 2 * n for n in range(1, 16)] and j("cold-ravel-diagnostic.json")["fold_cycles"]["after_pass"] == j("cold-ravel-diagnostic.json")["fold_cycles"]["before_pass"] + 32'
+check "y: the fold cycles name the metric and say the counter restarts with the server" 'j("cold-ravel-diagnostic.json")["fold_cycles"]["metric"] == "ravel_catalog_fold_cycles_total{signal=\"metrics\"}" and "process-local" in j("cold-ravel-diagnostic.json")["fold_cycles"]["note"] and "restarts ravel-server before every repetition" in j("cold-ravel-diagnostic.json")["fold_cycles"]["note"] and set(j("cold-ravel-diagnostic.json")["fold_cycles"]) == {"metric", "before_pass", "after_pass", "note"}'
 
 METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_COLD_QUERY_EXIT=1 run_cold y1
 expect_rc y1 0
 check "y1: failed cold runs are recorded and stamped, the run passes, report.json untouched" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 15 and all(r["status"] == "failed: metricsbench_query exited 1" and r["ravel_cost"] is None for r in j("cold-ravel-diagnostic.json")["runs"]) and j("report.json") == {"stub": "report", "timed_rows": 6}'
+check "y1: a failed query's catalog state is null with why for its cost figures, its fold cycles still measured" 'all(r["catalog_state"]["resolve_s3_get_requests"] is None and r["catalog_state"]["unfolded_segments_resolved"] is None and r["catalog_state"]["why_null"] == {"resolve_s3_get_requests": "the run recorded no ravel_cost (failed: metricsbench_query exited 1)", "unfolded_segments_resolved": "the run recorded no ravel_cost (failed: metricsbench_query exited 1)"} and isinstance(r["catalog_state"]["fold_cycles_since_restart"], int) for r in j("cold-ravel-diagnostic.json")["runs"])'
 
 STUB_INGEST_READBACK_FAIL=mimir METRICSBENCH_CORPUS="${TMP}/corpus.json" run_cold y2
 expect_rc y2 70
@@ -2866,6 +2929,7 @@ METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_RESTART_EXIT=1 run_cold y4
 expect_rc y4 0
 check "y4: every failed restart is a recorded run, stamped, the run passes" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 15 and all(r["status"] == "failed: docker compose restart --no-deps ravel-server failed" for r in j("cold-ravel-diagnostic.json")["runs"])'
 expect_no_log "y4: no cold query after a failed restart" "--out ${OUT}/cold-ravel-diagnostic/"
+check "y4: a run with no query records its fold cycles null with why, the pass's own scrapes still measured" 'all(r["catalog_state"]["fold_cycles_since_restart"] is None and r["catalog_state"]["why_null"]["fold_cycles_since_restart"] == "no /metrics scrape is recorded for this run (failed: docker compose restart --no-deps ravel-server failed)" for r in j("cold-ravel-diagnostic.json")["runs"]) and j("cold-ravel-diagnostic.json")["fold_cycles"]["after_pass"] == j("cold-ravel-diagnostic.json")["fold_cycles"]["before_pass"] + 2'
 
 METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_RESTART_NOT_READY=1 run_cold y5
 expect_rc y5 0
@@ -2877,6 +2941,7 @@ METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_COLD_DROP_RECORD=zz_long_any.3 run
 expect_rc y6 0
 expect_err "y6: the lost record is reported" "could not record zz_long_any repetition 3"
 check "y6: a missing record is a failed run naming its entry and repetition, the count still 3 x 5" 'len(j("cold-ravel-diagnostic.json")["runs"]) == 15 and [(r["entry"], r["repetition"]) for r in j("cold-ravel-diagnostic.json")["runs"] if r["ravel_cost"] is None] == [("zz_long_any", 3)] and [r["status"] for r in j("cold-ravel-diagnostic.json")["runs"] if r["ravel_cost"] is None] == ["failed: no record was written for this run"] and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 1 and j("stamps.json")["cold_ravel_diagnostic"]["missing_runs"] == [{"entry": "zz_long_any", "repetition": 3}] and j("stamps.json")["status"] == "passed"'
+check "y6: the missing record's catalog state is all null, each with why" '[r["catalog_state"] for r in j("cold-ravel-diagnostic.json")["runs"] if r["ravel_cost"] is None] == [{"resolve_s3_get_requests": None, "unfolded_segments_resolved": None, "fold_cycles_since_restart": None, "why_null": {"resolve_s3_get_requests": "the run recorded no ravel_cost (failed: no record was written for this run)", "unfolded_segments_resolved": "the run recorded no ravel_cost (failed: no record was written for this run)", "fold_cycles_since_restart": "no /metrics scrape is recorded for this run (failed: no record was written for this run)"}}]'
 
 cp "${TMP}/corpus.json" "${TMP}/corpus-y7.json"
 METRICSBENCH_CORPUS="${TMP}/corpus-y7.json" STUB_CORPUS_CLOBBER=1 run_cold y7
@@ -2884,6 +2949,22 @@ expect_rc y7 0
 expect_no_file y7 cold-ravel-diagnostic.json
 check "y7: a corpus that cannot be loaded is a stamped failure, not not applicable" 'j("stamps.json")["cold_ravel_diagnostic"] == "failed: the corpus '"${TMP}"'/corpus-y7.json could not be loaded (JSONDecodeError)" and j("stamps.json")["status"] == "passed"'
 expect_no_log "y7: nothing restarted for it" " restart --no-deps ravel-server"
+
+METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_NO_FOLD_CYCLES=1 run_cold y8
+expect_rc y8 0
+check "y8: with no fold-cycles sample every fold-cycles figure is null with why, the run passes" 'all(r["catalog_state"]["fold_cycles_since_restart"] is None and r["catalog_state"]["why_null"]["fold_cycles_since_restart"].startswith("0 ravel_catalog_fold_cycles_total{signal=\"metrics\"} samples in ") for r in j("cold-ravel-diagnostic.json")["runs"]) and j("cold-ravel-diagnostic.json")["fold_cycles"]["before_pass"] is None and j("cold-ravel-diagnostic.json")["fold_cycles"]["before_pass_why_null"] == "0 ravel_catalog_fold_cycles_total{signal=\"metrics\"} samples in ravel-metrics-before.txt, want exactly 1" and j("cold-ravel-diagnostic.json")["fold_cycles"]["after_pass"] is None and j("stamps.json")["status"] == "passed"'
+
+METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_COLD_DUP_RECORD=zz_long_any.2 run_cold y9
+expect_rc y9 0
+expect_no_file y9 cold-ravel-diagnostic.json
+check "y9: a duplicate record is a stamped failure naming it, nothing written, the run passes" 'j("stamps.json")["cold_ravel_diagnostic"].startswith("failed: cold-ravel-diagnostic.json not written: runs.json holds a duplicate or unexpected record: {'"'"'entry'"'"': '"'"'zz_long_any'"'"', '"'"'repetition'"'"': 2, ") and j("stamps.json")["status"] == "passed"'
+expect_err "y9: the duplicate is reported" "cold ravel diagnostic: runs.json holds a duplicate or unexpected record"
+
+METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_COLD_CLOBBER_RUNS=mb_full_range_avg_over_time.5 run_cold y10
+expect_rc y10 0
+expect_no_file y10 cold-ravel-diagnostic.json
+check "y10: an unreadable runs file is its own stamped failure, not fifteen missing records" 'j("stamps.json")["cold_ravel_diagnostic"] == "failed: cold-ravel-diagnostic.json not written: runs.json is not readable (JSONDecodeError)" and j("stamps.json")["status"] == "passed"'
+expect_err "y10: the record that could not land is reported" "could not record mb_full_range_avg_over_time repetition 5"
 
 # --- z: MB_STAGE1 (ADR-3694 Stage 1, issue #3968) ------------------------------------
 # z0: the rendered default command line. ravel.yml's entrypoint with an empty

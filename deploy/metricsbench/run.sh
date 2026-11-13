@@ -664,6 +664,64 @@ def listed_objects(path):
                 rows.append(json.loads(l))
     return rows
 
+FOLD_CYCLES_METRIC = 'ravel_catalog_fold_cycles_total{signal="metrics"}'
+FOLD_CYCLES_NOTE = ("the counter is process-local and the cold pass restarts ravel-server before every repetition, "
+                    "so each figure counts the metrics folds since the last restart, not since the run began")
+
+def fold_cycles(path, missing):
+    # (count, None) from one /metrics scrape, or (None, why).
+    if not path:
+        return None, missing
+    try:
+        with open(path) as f:
+            samples = [l.split() for l in f
+                       if l.startswith("ravel_catalog_fold_cycles_total{") and 'signal="metrics"' in l]
+    except OSError as e:
+        return None, f"the /metrics scrape {os.path.basename(path)} is not readable ({type(e).__name__})"
+    if len(samples) != 1:
+        return None, f"{len(samples)} {FOLD_CYCLES_METRIC} samples in {os.path.basename(path)}, want exactly 1"
+    try:
+        v = float(samples[0][-1])
+    except ValueError:
+        v = None
+    if v is None or not v.is_integer() or v < 0:
+        return None, f"the {FOLD_CYCLES_METRIC} sample {samples[0][-1]!r} is not a count"
+    return int(v), None
+
+def cold_catalog_state(cost, failed, query_ran, metrics_path):
+    # One cold run's catalog state as measured: its resolve-phase GETs and
+    # io.unfoldedSegmentsResolved from its ravel_cost, and the metrics fold
+    # cycles since its restart. A figure that was not measured is null, with
+    # why under why_null.
+    state = {"resolve_s3_get_requests": None, "unfolded_segments_resolved": None, "fold_cycles_since_restart": None}
+    why = {}
+    if cost is None:
+        for k in ("resolve_s3_get_requests", "unfolded_segments_resolved"):
+            why[k] = f"the run recorded no ravel_cost ({failed})" if failed else "the run recorded no ravel_cost"
+    else:
+        phases = cost.get("phases")
+        resolve = [p for p in phases if isinstance(p, dict) and p.get("phase") == "resolve"] \
+            if isinstance(phases, list) else []
+        gets = resolve[0].get("s3GetRequests") if len(resolve) == 1 else None
+        if isinstance(gets, int) and not isinstance(gets, bool):
+            state["resolve_s3_get_requests"] = gets
+        else:
+            why["resolve_s3_get_requests"] = (f"the ravel_cost carries {len(resolve)} resolve phases, want exactly 1"
+                                              if len(resolve) != 1 else "the resolve phase carries no s3GetRequests")
+        io = cost.get("io")
+        unfolded = io.get("unfoldedSegmentsResolved") if isinstance(io, dict) else None
+        if isinstance(unfolded, int) and not isinstance(unfolded, bool):
+            state["unfolded_segments_resolved"] = unfolded
+        else:
+            why["unfolded_segments_resolved"] = "the ravel_cost carries no io.unfoldedSegmentsResolved"
+    missing = "Ravel's /metrics did not answer 200 with a body after this run's query" if query_ran \
+        else f"no /metrics scrape is recorded for this run ({failed})"
+    state["fold_cycles_since_restart"], cycles_why = fold_cycles(metrics_path, missing)
+    if cycles_why:
+        why["fold_cycles_since_restart"] = cycles_why
+    state["why_null"] = why
+    return state
+
 op, args = sys.argv[1], sys.argv[2:]
 
 if op == "set":
@@ -1240,8 +1298,9 @@ elif op == "cold-select":
     print("\n".join(ids))
 elif op == "cold-record":
     # runs file, entry, repetition, the query's exit code, its diagnostics
-    # file: append the one run's record.
-    runs_path, entry, rep, code, diag_path = args
+    # file, Ravel's /metrics scraped after the query ("" when not scraped):
+    # append the one run's record.
+    runs_path, entry, rep, code, diag_path, metrics_path = args
     runs = load(runs_path) if os.path.exists(runs_path) else []
     rec = {"entry": entry, "repetition": int(rep), "status": None, "latency_ms": None, "ravel_cost": None}
     why = None
@@ -1263,18 +1322,27 @@ elif op == "cold-record":
             rec["latency_ms"] = cost[0].get("latency_ms")
     if why:
         rec["status"] = why
+    rec["catalog_state"] = cold_catalog_state(rec["ravel_cost"], why, code.isdigit(), metrics_path)
     runs.append(rec)
     dump(runs_path, runs)
 elif op == "cold-final":
     # Every (entry, repetition) has exactly one record: a run whose
     # cold-record never landed gets a failed one here, naming it. Exit 4 and
-    # why on stdout for a duplicate or unexpected record, writing nothing.
-    runs_path, out_path, prof, regime, reps, corpus_path, *ids = args
+    # why on stdout for an unreadable runs file or a duplicate or unexpected
+    # record, writing nothing. BEFORE and AFTER are Ravel's /metrics scraped
+    # around the pass, "" when not scraped.
+    runs_path, out_path, prof, regime, reps, before_path, after_path, corpus_path, *ids = args
     reps = int(reps)
-    try:
-        recorded = load(runs_path) if os.path.exists(runs_path) else []
-        assert isinstance(recorded, list)
-    except (OSError, ValueError, AssertionError):
+    if os.path.exists(runs_path):
+        try:
+            recorded = load(runs_path)
+        except (OSError, ValueError) as e:
+            print(f"runs.json is not readable ({type(e).__name__})")
+            sys.exit(4)
+        if not isinstance(recorded, list):
+            print(f"runs.json holds a {type(recorded).__name__}, not a list of run records")
+            sys.exit(4)
+    else:
         recorded = []
     want = [(i, r) for i in ids for r in range(1, reps + 1)]
     by_run = {}
@@ -1285,14 +1353,19 @@ elif op == "cold-final":
             sys.exit(4)
         by_run[k] = rec
     missing = [{"entry": i, "repetition": r} for i, r in want if (i, r) not in by_run]
-    runs = [by_run.get((i, r)) or {"entry": i, "repetition": r, "status": "failed: no record was written for this run",
-                                   "latency_ms": None, "ravel_cost": None} for i, r in want]
-    if len(runs) != len(ids) * reps:
-        print(f"{len(runs)} run records, want {len(ids)} entries x {reps} repetitions")
-        sys.exit(4)
+    lost = "failed: no record was written for this run"
+    runs = [by_run.get((i, r)) or {"entry": i, "repetition": r, "status": lost, "latency_ms": None, "ravel_cost": None,
+                                   "catalog_state": cold_catalog_state(None, lost, False, "")} for i, r in want]
+    cycles = {}
+    for side, path in (("before_pass", before_path), ("after_pass", after_path)):
+        n, why = fold_cycles(path, f"Ravel's /metrics was not scraped {side.replace('_', ' ')}")
+        cycles[side] = n
+        if why:
+            cycles[f"{side}_why_null"] = why
     doc = {"regime": regime, "comparable": False,
            "note": "diagnostic, not comparable: Ravel only, one restart per repetition, never in report.json's timed denominators; each repetition also queries the Prometheus oracle that metricsbench_query requires, and only Ravel's cost is recorded here; the cross-engine cold and warm procedure is issue #3794 (M9)",
-           "profile": prof, "corpus": corpus_path, "repetitions_per_entry": reps, "entries": ids, "runs": runs}
+           "profile": prof, "corpus": corpus_path, "repetitions_per_entry": reps, "entries": ids,
+           "fold_cycles": {"metric": FOLD_CYCLES_METRIC, **cycles, "note": FOLD_CYCLES_NOTE}, "runs": runs}
     dump(out_path, doc)
     bad = [r for r in runs if r["ravel_cost"] is None]
     print(json.dumps({"regime": regime, "comparable": False, "file": os.path.basename(out_path),
@@ -3244,6 +3317,8 @@ cold_pass() {
     say "${label}: ${ids:-cold-select exited ${code}}"
     return 0
   fi
+  local before="${dir}/ravel-metrics-before.txt" after="${dir}/ravel-metrics-after.txt" scraped
+  scrape_ravel_metrics "$before" || before=""
   for id in $ids; do
     code=0
     "${it_env[@]}" GITHUB_SHA="$ravel_source_commit" "${bin_dir}/metricsbench_report" provenance \
@@ -3278,19 +3353,22 @@ cold_pass() {
           --diagnostics "${dir}/${id}.${r}.diagnostics.json" --out "${dir}/${id}.${r}.report.json" \
           ${query_extra[@]+"${query_extra[@]}"} \
           >"${dir}/${id}.${r}.query.log" 2>&1 || qcode=$?
-        py cold-record "$runs" "$id" "$r" "$qcode" "${dir}/${id}.${r}.diagnostics.json" ||
+        scraped="${dir}/${id}.${r}.ravel-metrics.txt"
+        scrape_ravel_metrics "$scraped" || scraped=""
+        py cold-record "$runs" "$id" "$r" "$qcode" "${dir}/${id}.${r}.diagnostics.json" "$scraped" ||
           say "${label}: could not record ${id} repetition ${r}"
       else
         say "${label}: ${id} repetition ${r}: ${why}"
-        py cold-record "$runs" "$id" "$r" "${why}" "${dir}/none" ||
+        py cold-record "$runs" "$id" "$r" "${why}" "${dir}/none" "" ||
           say "${label}: could not record ${id} repetition ${r}"
       fi
     done
   done
+  scrape_ravel_metrics "$after" || after=""
   code=0
   # shellcheck disable=SC2086
   line="$(py cold-final "$runs" "$final" "$profile" "$regime" "$COLD_REPS" \
-    "$CORPUS" $ids)" || code=$?
+    "$before" "$after" "$CORPUS" $ids)" || code=$?
   if [ "$code" -ne 0 ]; then
     rm -f "$final"
     stamp_str "$key" "failed: ${final##*/} not written: ${line:-cold-final exited ${code}}"
