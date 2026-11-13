@@ -250,7 +250,11 @@
 #               unrouted_fetched_expected, holders (a series-level index's
 #               bound), value_holders (the label-value router's bound),
 #               expected_routed_prunes, the routed records'
-#               segmentsPrunedByLabelIndex values and route_bound; the method;
+#               segmentsPrunedByLabelIndex values, route_bound, and ADR-3694
+#               row 3's figures (value_holders less the resolved set, the
+#               routed records' segmentsFetched less value_holders plus
+#               token_only_fetched, and their median probe-phase
+#               s3GetWireBytes per object fetched); the method;
 #               the statements an unrouted record of which has a
 #               segmentsFetched other than unrouted_fetched_expected, and the
 #               route-bound statements a routed record of which has a
@@ -2089,6 +2093,15 @@ elif op == "stage1-holders":
             if isinstance(phases, list) else []
         return any((whole(p.get("s3GetRequests")) and p["s3GetRequests"] > 0)
                    or (whole(p.get("cacheHits")) and p["cacheHits"] > 0) for p in key_index)
+    def probe_wire_bytes(r):
+        # The record's probe-phase s3GetWireBytes alone; None when it has no
+        # probe phase or one lacks the figure.
+        phases = r.get("phases")
+        probe = [p for p in phases if isinstance(p, dict) and p.get("phase") == "probe"] \
+            if isinstance(phases, list) else []
+        if not probe or not all(whole(p.get("s3GetWireBytes")) and p["s3GetWireBytes"] >= 0 for p in probe):
+            return None
+        return sum(p["s3GetWireBytes"] for p in probe)
     # Only an answered (ok or incorrect) record carries the figures checked
     # below. A statement whose every record of a pass timed out is counted
     # apart from one whose answered record lacks a figure.
@@ -2110,6 +2123,20 @@ elif op == "stage1-holders":
                                      "value_holders", "expected_routed_prunes", "route_bound",
                                      "route_bound_reason")}
         row["routed_pruned_by_label_index"] = sorted(set(v for v in seen_pruned if v is not None))
+        # ADR-3694 row 3, restated: the routed pass opens value_holders plus
+        # token_only_fetched objects. Objects opened is each routed record's
+        # segmentsFetched, the post-pruning snapshot size
+        # (QueryStats::segments_fetched, crates/ravel-query/src/engine.rs).
+        vh, tok = s.get("value_holders"), s.get("token_only_fetched")
+        row["value_holders_beyond_resolved"] = vh - resolved if whole(vh) and whole(resolved) else None
+        mine = [r for r in answered(routed_rows) if r.get("entry") == sid]
+        opened = [r.get("segmentsFetched") for r in mine]
+        diffs = [o - (vh + tok) for o in opened if whole(o)] if whole(vh) and whole(tok) else []
+        row["routed_opened_minus_expected"] = max(diffs, key=abs) if mine and len(diffs) == len(mine) else None
+        per_object = [w / o for w, o in ((probe_wire_bytes(r), r.get("segmentsFetched")) for r in mine)
+                      if w is not None and whole(o) and o > 0]
+        row["routed_probe_wire_bytes_per_opened_object"] = \
+            median(per_object) if mine and len(per_object) == len(mine) else None
         per.append(row)
         if s.get("route_bound") is not True:
             unbound.append({"id": sid, "reason": s.get("route_bound_reason")})
@@ -2164,6 +2191,7 @@ elif op == "stage1-holders":
                       "routed_leaf_check": "for each route_bound statement whose resolved set holds at least one object, the answered (ok or incorrect) stage1-routed records whose keyIndex phase shows no leaf read (no s3GetRequests and no cacheHits, or no keyIndex phase at all); a statement whose resolved set is empty is not counted, since its snapshot holds only token objects, which carry no part and so no leaf to read",
                       "routed_leaf_unread_count": sum(u["records"] for u in leaf_unread),
                       "routed_leaf_unread": leaf_unread,
+                      "routed_open_check": "per statement, ADR-3694 row 3 restated: value_holders_beyond_resolved is value_holders minus the resolved set (named_in_window or segments_in_window, as the window check reads it), at most 0 when every value holder lies in that set; routed_opened_minus_expected is, over the answered (ok or incorrect) stage1-routed records of the statement, the segmentsFetched (objects opened, the post-pruning snapshot size) minus value_holders plus token_only_fetched of largest magnitude; routed_probe_wire_bytes_per_opened_object is the median over those records of the probe phase's s3GetWireBytes (wire bytes as transferred, retries and range reads as the server counts them) over that record's segmentsFetched; each is null when an input is not a whole number, a record has no probe phase or opened no object, or the statement has no answered routed record",
                       "route_bound_check": "a statement whose selectors each carry a label=\"value\" matcher with a non-empty value is route_bound; for any other the router probes only that selector's metric name and keeps every object holding it, so it carries no value_holders and is left out of every comparison with the routed pass",
                       "route_unbound_count": len(unbound), "route_unbound": unbound}))
 else:

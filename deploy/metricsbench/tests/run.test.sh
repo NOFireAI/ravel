@@ -376,6 +376,14 @@
 #                                       duplicated, not finite (a NaN figure
 #                                       out of band, a NaN bound 65), a
 #                                       profile mismatch (65) and usage (64).
+#                                       The cardinality file's ADR-3694 row 3
+#                                       figures on T8-shaped runs: in band
+#                                       at T8, out of band at 435,000 probe
+#                                       wire bytes per opened object, one
+#                                       object opened beyond holders plus
+#                                       tokens, value holders beyond the
+#                                       resolved set and no probe phase;
+#                                       missing without the figure.
 #                                       box-run.sh, sourced: the band file
 #                                       per profile (refused for cardinality
 #                                       without MB_STAGE1_BANDS) and
@@ -3030,8 +3038,8 @@ expect_log "z: metricsbench_holders gets the corpus, ingest report, workload, li
 expect_log "z: metricsbench_holders reads the listing beside the objects" "--objects-list ${OUT}/stage1-objects.jsonl --objects-dir ${OUT}/stage1-objects --out ${OUT}/holders.json"
 expect_no_file z stage1-objects
 expect_file z stage1-objects.jsonl
-check "z: stage1.holders stamps the method, the counts and the window, holder and value-holder figures per statement, every window checked against segmentsFetched and every routed prune against expected_routed_prunes" '{k: v for k, v in j("stamps.json")["stage1"]["holders"].items() if not k.endswith("_check")} == {"file": "holders.json", "bucket": "ravel-metricsbench", "method": "stub method", "listing_state": "routed: listed after stage1-routed, objects_above_watermark against stage1.routed_catalog.watermark_hour", "listing_watermark_hour": 490001, "objects_listed": 300, "objects_above_watermark": 0, "objects_l0": 300, "objects_l1": 0, "series_total": 40, "min_commit_tokens": 1, "token_objects": 1, "tokens_unmatched": [], "statements": [{"id": i, "segments_in_window": 10, "named_in_window": 4, "name_pruned": True, "token_only_fetched": 0, "unrouted_fetched_expected": 4, "holders": 2, "value_holders": 1, "expected_routed_prunes": 3, "route_bound": True, "route_bound_reason": None, "routed_pruned_by_label_index": [3]} for i in '"${CORPUS_IDS}"'], "skipped": 1, "window_mismatches_count": 0, "window_mismatches": [], "window_unchecked_count": 0, "window_unchecked": [], "window_unchecked_timed_out_count": 0, "window_unchecked_timed_out": [], "routed_prune_mismatches_count": 0, "routed_prune_mismatches": [], "routed_prune_unchecked_count": 0, "routed_prune_unchecked": [], "routed_prune_unchecked_timed_out_count": 0, "routed_prune_unchecked_timed_out": [], "routed_leaf_unread_count": 0, "routed_leaf_unread": [], "route_unbound_count": 0, "route_unbound": []}'
-check "z: each check sentence names what it compares" 'sorted(k for k in j("stamps.json")["stage1"]["holders"] if k.endswith("_check")) == ["bound_check", "route_bound_check", "routed_leaf_check", "routed_prune_check", "window_check"] and all(w in j("stamps.json")["stage1"]["holders"]["window_check"] for w in ("segmentsFetched of every stage1-unrouted record", "== unrouted_fetched_expected", "token_only_fetched", "min_commit_token", "only answered (ok or incorrect) records are compared", "window_unchecked_timed_out")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_prune_check"] for w in ("segmentsPrunedByLabelIndex of every answered (ok or incorrect) stage1-routed record", "== expected_routed_prunes", "routed_prune_unchecked_timed_out")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_leaf_check"] for w in ("keyIndex phase", "s3GetRequests", "cacheHits")) and all(w in j("stamps.json")["stage1"]["holders"]["bound_check"] for w in ("series-level index", "not the label-value router", "value_holders", "LABEL_DICT", "the router'"'"'s bound"))'
+check "z: stage1.holders stamps the method, the counts and the window, holder and value-holder figures per statement, every window checked against segmentsFetched and every routed prune against expected_routed_prunes" '{k: v for k, v in j("stamps.json")["stage1"]["holders"].items() if not k.endswith("_check")} == {"file": "holders.json", "bucket": "ravel-metricsbench", "method": "stub method", "listing_state": "routed: listed after stage1-routed, objects_above_watermark against stage1.routed_catalog.watermark_hour", "listing_watermark_hour": 490001, "objects_listed": 300, "objects_above_watermark": 0, "objects_l0": 300, "objects_l1": 0, "series_total": 40, "min_commit_tokens": 1, "token_objects": 1, "tokens_unmatched": [], "statements": [{"id": i, "segments_in_window": 10, "named_in_window": 4, "name_pruned": True, "token_only_fetched": 0, "unrouted_fetched_expected": 4, "holders": 2, "value_holders": 1, "expected_routed_prunes": 3, "route_bound": True, "route_bound_reason": None, "routed_pruned_by_label_index": [3], "value_holders_beyond_resolved": -3, "routed_opened_minus_expected": 3, "routed_probe_wire_bytes_per_opened_object": 25.0} for i in '"${CORPUS_IDS}"'], "skipped": 1, "window_mismatches_count": 0, "window_mismatches": [], "window_unchecked_count": 0, "window_unchecked": [], "window_unchecked_timed_out_count": 0, "window_unchecked_timed_out": [], "routed_prune_mismatches_count": 0, "routed_prune_mismatches": [], "routed_prune_unchecked_count": 0, "routed_prune_unchecked": [], "routed_prune_unchecked_timed_out_count": 0, "routed_prune_unchecked_timed_out": [], "routed_leaf_unread_count": 0, "routed_leaf_unread": [], "route_unbound_count": 0, "route_unbound": []}'
+check "z: each check sentence names what it compares" 'sorted(k for k in j("stamps.json")["stage1"]["holders"] if k.endswith("_check")) == ["bound_check", "route_bound_check", "routed_leaf_check", "routed_open_check", "routed_prune_check", "window_check"] and all(w in j("stamps.json")["stage1"]["holders"]["routed_open_check"] for w in ("value_holders minus the resolved set", "segmentsFetched (objects opened", "value_holders plus token_only_fetched", "median", "probe phase'"'"'s s3GetWireBytes")) and all(w in j("stamps.json")["stage1"]["holders"]["window_check"] for w in ("segmentsFetched of every stage1-unrouted record", "== unrouted_fetched_expected", "token_only_fetched", "min_commit_token", "only answered (ok or incorrect) records are compared", "window_unchecked_timed_out")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_prune_check"] for w in ("segmentsPrunedByLabelIndex of every answered (ok or incorrect) stage1-routed record", "== expected_routed_prunes", "routed_prune_unchecked_timed_out")) and all(w in j("stamps.json")["stage1"]["holders"]["routed_leaf_check"] for w in ("keyIndex phase", "s3GetRequests", "cacheHits")) and all(w in j("stamps.json")["stage1"]["holders"]["bound_check"] for w in ("series-level index", "not the label-value router", "value_holders", "LABEL_DICT", "the router'"'"'s bound"))'
 check "z: the cold records are counted against the selected entries x repetitions in both passes" 'all(j("stamps.json")["stage1"][f"{w}_cold_records"] == {"applicable": True, "expected_records": 5, "records": 5, "records_short": 0, "basis": f"stage1.{w}_cold: records with a ravel_cost (runs - failed_runs) against entries x repetitions_per_entry"} for w in ("unrouted", "routed"))'
 check "z: the query step's records keep their own label" 'all(r["pass_label"] == "background-folded" for r in j("diagnostics.json")["ravel_cost"])'
 expect_log "z: the main report's provenance is marked non-comparable with its reason" "--config comparable=false --config comparability_reason=MB_STAGE1=1: ravel-server ran with ${UP_FLAGS} (not the default command line) through this report's passes"
@@ -3789,7 +3797,7 @@ for c in za zn; do
   card_failed="$(sed -n 's/^stage1-check: \([0-9]*\) of [0-9]* figures failed$/\1/p' "${CHECK_ERR}")"
   if { [ "${rc}" -eq 0 ] || [ "${rc}" -eq 1 ]; } && ! grep -qE '^(missing|duplicated) ' "${CHECK_ERR}" &&
     { { [ "${rc}" -eq 0 ] && [ "$(wc -l <"${CHECK_OUT}")" -eq "${CARD_FIGURES}" ]; } || { [ "${rc}" -eq 1 ] && [ -n "${card_failed}" ]; }; } &&
-    [ "${CARD_FIGURES}" -eq 64 ]; then
+    [ "${CARD_FIGURES}" -eq 67 ]; then
     pass "check cardinality ${c}: the pre-registered file resolves every one of its ${CARD_FIGURES} figures (exit ${rc}, ${card_failed:-0} outside the cardinality bounds)"
   else
     fail "check cardinality ${c}: exit ${rc}, stderr $(cat "${CHECK_ERR}")"
@@ -4103,6 +4111,96 @@ if grep -qxF 'ok holders_window_mismatches = 0 in [0, 0] (stamps.json stage1.hol
 else
   fail "check run 42495422937: stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
 fi
+
+# ADR-3694 row 3, restated (issue #4149): the cardinality band file's four
+# row-3 figures against cardinality runs shaped as T8 measured
+# mb_single_counter_rate: a resolved set of 2,899 objects, 1,597 value
+# holders, 4 token-only objects, 1,601 objects opened by the routed pass.
+# Each routed record carries 5,000,000,000 scan-phase wire bytes beside its
+# probe phase, so a figure summing every phase lands outside the band where
+# the probe phase alone is inside it; and the 435,000-byte run is outside the
+# band per opened object while inside it per object of the resolved set.
+# t8_run NAME PROBE_BYTES_PER_OBJECT OPENED VALUE_HOLDERS: the run, then rc,
+# CHECK_OUT and CHECK_ERR from the row-3 figures of the shipped file.
+python3 -I - "${CARD_BANDS}" "${TMP}/row3-bands.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["figures"] = [f for f in d["figures"] if f["name"].startswith("holders_single_counter_rate_")]
+json.dump(d, open(sys.argv[2], "w"))
+PY
+ROW3_FIGURES="$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["figures"]))' "${TMP}/row3-bands.json")"
+if [ "${ROW3_FIGURES}" -eq 4 ]; then pass "row 3: the cardinality band file carries the four row-3 figures"; else fail "row 3: ${ROW3_FIGURES} row-3 figures"; fi
+t8_run() {
+  local name="$1" per="$2" opened="$3" vh="$4"
+  python3 -I - "${TMP}/run-${name}.json" "${per}" "${opened}" "${vh}" <<'PY'
+import json, sys
+path, per, opened, vh = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+phase = lambda n, b: {"name": n, "requests": 1, "phase": n, "s3GetRequests": 1, "s3GetWireBytes": b}
+phases = [phase("resolve", 1000), phase("plan", 1000), phase("probe", per * opened),
+          phase("scan", 5000000000), phase("decode", 0),
+          {"phase": "keyIndex", "s3GetRequests": 3, "cacheHits": 0}]
+json.dump({"holders": {"report": {}, "statements": {"mb_single_counter_rate": {
+               "segments_in_window": 2899, "named_in_window": 2899, "name_pruned": True,
+               "token_only_fetched": 4, "unrouted_fetched_expected": 2903,
+               "value_holders": vh, "expected_routed_prunes": 2899 - vh}}},
+           "records": {"folded-unrouted": {"mb_single_counter_rate": {"segmentsFetched": 2903}},
+                       "folded-routed": {"mb_single_counter_rate": {
+                           "segmentsFetched": opened, "segmentsPrunedByLabelIndex": 2899 - vh,
+                           "phases": phases}}}}, open(path, "w"))
+PY
+  MB_STAGE1=1 STUB_RUN_FIGURES="${TMP}/run-${name}.json" run_stage1 "${name}" cardinality
+  expect_rc "${name}" 0
+  run_check "${name}" "${TMP}/row3-bands.json" "${TMP}/${name}/out"
+}
+ROW3_PATH="stamps.json stage1.holders.statements[id=mb_single_counter_rate]"
+t8_run row3-t8 394000 1601 1597
+expect_rc "row 3 at T8" 0
+if [ "$(cat "${CHECK_OUT}")" = "ok holders_single_counter_rate_value_holders = 1597 in [1, null] (holders.json statements[id=mb_single_counter_rate].value_holders)
+ok holders_single_counter_rate_value_holders_beyond_resolved = -1302 in [null, 0] (${ROW3_PATH}.value_holders_beyond_resolved)
+ok holders_single_counter_rate_opened_minus_expected = 0 in [0, 0] (${ROW3_PATH}.routed_opened_minus_expected)
+ok holders_single_counter_rate_probe_wire_bytes_per_opened_object = 394000.0 in [0, 434000] (${ROW3_PATH}.routed_probe_wire_bytes_per_opened_object)" ]; then
+  pass "row 3 at T8: 1,597 value holders, opened = holders + 4 token objects, 394,000 probe wire bytes per opened object, every figure in band"
+else
+  fail "row 3 at T8: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
+fi
+t8_run row3-over 435000 1601 1597
+expect_rc "row 3 over the miss line" 1
+expect_check_err "row 3 over the miss line: the per-object figure named" "out of band holders_single_counter_rate_probe_wire_bytes_per_opened_object = 435000.0 not in [0, 434000] (${ROW3_PATH}.routed_probe_wire_bytes_per_opened_object)"
+expect_check_err "row 3 over the miss line: one failure counted" "stage1-check: 1 of ${ROW3_FIGURES} figures failed"
+t8_run row3-opened 394000 1602 1597
+expect_rc "row 3 one object opened beyond holders plus tokens" 1
+expect_check_err "row 3 one object opened beyond holders plus tokens: the difference named" "out of band holders_single_counter_rate_opened_minus_expected = 1 not in [0, 0] (${ROW3_PATH}.routed_opened_minus_expected)"
+expect_check_err "row 3 one object opened beyond holders plus tokens: one failure counted" "stage1-check: 1 of ${ROW3_FIGURES} figures failed"
+t8_run row3-beyond 394000 2904 2900
+expect_rc "row 3 value holders beyond the resolved set" 1
+expect_check_err "row 3 value holders beyond the resolved set: named" "out of band holders_single_counter_rate_value_holders_beyond_resolved = 1 not in [null, 0] (${ROW3_PATH}.value_holders_beyond_resolved)"
+expect_check_err "row 3 value holders beyond the resolved set: one failure counted" "stage1-check: 1 of ${ROW3_FIGURES} figures failed"
+rm -rf "${TMP}/check-row3-missing" && cp -R "${TMP}/row3-t8/out" "${TMP}/check-row3-missing"
+python3 -I - "${TMP}/check-row3-missing/stamps.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for s in d["stage1"]["holders"]["statements"]:
+    if s["id"] == "mb_single_counter_rate":
+        del s["routed_probe_wire_bytes_per_opened_object"]
+json.dump(d, open(sys.argv[1], "w"))
+PY
+run_check row3-missing "${TMP}/row3-bands.json" "${TMP}/check-row3-missing"
+expect_rc "row 3 without the per-object figure" 1
+expect_check_err "row 3 without the per-object figure: missing, not passed" "missing holders_single_counter_rate_probe_wire_bytes_per_opened_object: no routed_probe_wire_bytes_per_opened_object in stage1.holders.statements[id=mb_single_counter_rate] (${ROW3_PATH}.routed_probe_wire_bytes_per_opened_object)"
+expect_check_err "row 3 without the per-object figure: one failure counted" "stage1-check: 1 of ${ROW3_FIGURES} figures failed"
+# A routed record with no probe phase stamps null, out of band rather than 0.
+python3 -I - "${TMP}/run-row3-t8.json" "${TMP}/run-row3-noprobe.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+rec = d["records"]["folded-routed"]["mb_single_counter_rate"]
+rec["phases"] = [p for p in rec["phases"] if p["phase"] != "probe"]
+json.dump(d, open(sys.argv[2], "w"))
+PY
+MB_STAGE1=1 STUB_RUN_FIGURES="${TMP}/run-row3-noprobe.json" run_stage1 row3-noprobe cardinality
+expect_rc row3-noprobe 0
+run_check row3-noprobe "${TMP}/row3-bands.json" "${TMP}/row3-noprobe/out"
+expect_rc "row 3 with no probe phase" 1
+expect_check_err "row 3 with no probe phase: null is not a number" "out of band holders_single_counter_rate_probe_wire_bytes_per_opened_object = null: not a number, band [0, 434000] (${ROW3_PATH}.routed_probe_wire_bytes_per_opened_object)"
 
 # --- box-run.sh's band selection and check ----------------------------------------
 BOXRUN="${HERE}/../aws/box-run.sh"
