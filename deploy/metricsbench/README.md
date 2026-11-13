@@ -787,7 +787,29 @@ verification (step 6), after which the run goes on as a diagnostic:
     not comparable and that each repetition also queries the Prometheus
     oracle, and exactly one record per entry and repetition with its
     `status`, `latency_ms` and `ravel_cost` record (`accounting` and
-    `phases`, the shape `diagnostics.json` carries) (case y). A failed
+    `phases`, the shape `diagnostics.json` carries) (case y). Each record
+    also carries `catalog_state`, the catalog state that run measured:
+    `resolve_s3_get_requests` (the resolve phase's `s3GetRequests` in its
+    `ravel_cost`), `unfolded_segments_resolved` (its
+    `io.unfoldedSegmentsResolved`) and `fold_cycles_since_restart` (the
+    `ravel_catalog_fold_cycles_total{signal="metrics"}` sample of Ravel's
+    `/metrics`, scraped once after the run's query into
+    `cold-ravel-diagnostic/<entry>.<repetition>.ravel-metrics.txt`). A
+    figure that was not measured is null, and `why_null` maps it to the
+    reason: no `ravel_cost` (case y1), no query run or no record (cases
+    y4, y6), or a scrape that failed or does not hold exactly one metrics
+    sample (case y8); `why_null` is `{}` when every figure was measured.
+    The file's `fold_cycles` holds the same counter scraped once before
+    the pass's first restart (`before_pass`) and once after its last query
+    (`after_pass`), each null with `before_pass_why_null` or
+    `after_pass_why_null` when not measured, the metric name, and a note:
+    the counter is process-local and every repetition restarts
+    ravel-server, so each figure counts the folds since the last restart,
+    not since the run began (case y). A runs file that cold-final cannot
+    read stamps `failed: cold-ravel-diagnostic.json not written: runs.json
+    is not readable (...)` (case y10), and a duplicate or unexpected record
+    stamps `failed: ... runs.json holds a duplicate or unexpected record:
+    ...` (case y9); neither writes the file or fails the run. A failed
     restart (case y4), readiness wait (case y5) or query run (case y1) is
     recorded in that run's `status`, counted in the `cold_ravel_diagnostic`
     stamp's `failed_runs`, and does not fail the run. After the first
