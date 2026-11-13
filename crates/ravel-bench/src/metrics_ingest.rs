@@ -1144,6 +1144,125 @@ pub struct Readback {
     /// empty, and left out of the JSON, otherwise.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub query_cost: BTreeMap<String, ReadbackQueryCost>,
+    /// The statement's own cost of each read of the reported read-back, keyed
+    /// as in `query_ms` (ADR-3694 decision 5): every `/api/v1/query` call of
+    /// each [`READBACK_QUERY_SAMPLES`] and [`READBACK_QUERY_HISTOGRAM_SAMPLES`]
+    /// read in query order, and the no-stats marker for
+    /// [`READBACK_QUERY_SERIES`] and [`READBACK_QUERY_HISTOGRAM_SERIES`].
+    /// Recorded with or without [`ReadbackConfig::metrics_url`]. Empty when
+    /// no window was queried, and in a report written before the field
+    /// existed.
+    #[serde(default)]
+    pub query_stats: BTreeMap<String, ReadbackQueryStats>,
+}
+
+/// What one named read-back query's answers say it cost.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stats")]
+pub enum ReadbackQueryStats {
+    /// The read's answer has no `data.stats` member: `/api/v1/series`.
+    #[serde(rename = "none")]
+    NoStats {
+        /// Why there is nothing to record.
+        reason: String,
+    },
+    /// One entry per `/api/v1/query` call, never summed.
+    #[serde(rename = "per_call")]
+    PerCall { calls: Vec<ReadbackCallStats> },
+}
+
+/// The [`ReadbackQueryStats::NoStats`] reason of a series listing.
+pub const READBACK_SERIES_NO_STATS: &str = "/api/v1/series answers carry no data.stats";
+
+/// One `/api/v1/query` call of a read-back: the window it counted, its wall
+/// time, and the members of its answer's `data.stats` that a `ravel_cost`
+/// record copies (`metrics_query::RavelCost`), each `null`, never 0, when
+/// the answer has no such member.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadbackCallStats {
+    /// The `count_over_time` window this call evaluated.
+    pub window: ReadbackCallWindow,
+    /// Wall milliseconds of this call, the body read included.
+    pub query_ms: u64,
+    pub accounting: Option<serde_json::Value>,
+    pub phases: Option<serde_json::Value>,
+    #[serde(rename = "segmentsFetched")]
+    pub segments_fetched: Option<serde_json::Value>,
+    #[serde(rename = "segmentsPruned")]
+    pub segments_pruned: Option<serde_json::Value>,
+    #[serde(rename = "segmentsPrunedByDictionary")]
+    pub segments_pruned_by_dictionary: Option<serde_json::Value>,
+    #[serde(rename = "segmentsPrunedByLabelIndex")]
+    pub segments_pruned_by_label_index: Option<serde_json::Value>,
+    #[serde(rename = "labelIndexValues")]
+    pub label_index_values: Option<serde_json::Value>,
+    pub estimate: Option<serde_json::Value>,
+    pub io: Option<serde_json::Value>,
+    /// `io.unfoldedSegmentsResolved`, copied out of `io`: the segments this
+    /// call's resolve took from the unfolded listing rather than a folded
+    /// snapshot part.
+    #[serde(rename = "unfoldedSegmentsResolved")]
+    pub unfolded_segments_resolved: Option<serde_json::Value>,
+}
+
+/// A [`CountWindow`] as a read-back report records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadbackCallWindow {
+    pub end_ms: i64,
+    pub range_ms: i64,
+}
+
+impl ReadbackCallStats {
+    /// The record of one call over `window` that took `query_ms`, from its
+    /// answer's `data.stats` (`null` when the answer carried none).
+    fn of(window: CountWindow, query_ms: u64, stats: &serde_json::Value) -> Self {
+        let field = |name: &str| stats.get(name).cloned();
+        ReadbackCallStats {
+            window: ReadbackCallWindow {
+                end_ms: window.end_ms,
+                range_ms: window.range_ms,
+            },
+            query_ms,
+            accounting: field("accounting"),
+            phases: field("phases"),
+            segments_fetched: field("segmentsFetched"),
+            segments_pruned: field("segmentsPruned"),
+            segments_pruned_by_dictionary: field("segmentsPrunedByDictionary"),
+            segments_pruned_by_label_index: field("segmentsPrunedByLabelIndex"),
+            label_index_values: field("labelIndexValues"),
+            estimate: field("estimate"),
+            io: field("io"),
+            unfolded_segments_resolved: stats
+                .get("io")
+                .and_then(|io| io.get("unfoldedSegmentsResolved"))
+                .cloned(),
+        }
+    }
+}
+
+/// One `count_over_time` call of a windowed read: its window, wall time and
+/// the answer's `data.stats`.
+struct CountCall {
+    window: CountWindow,
+    query_ms: u64,
+    stats: serde_json::Value,
+}
+
+impl ReadbackQueryStats {
+    fn per_call(calls: &[CountCall]) -> Self {
+        ReadbackQueryStats::PerCall {
+            calls: calls
+                .iter()
+                .map(|c| ReadbackCallStats::of(c.window, c.query_ms, &c.stats))
+                .collect(),
+        }
+    }
+
+    fn series() -> Self {
+        ReadbackQueryStats::NoStats {
+            reason: READBACK_SERIES_NO_STATS.to_string(),
+        }
+    }
 }
 
 /// What one named read-back query cost the receiver. `phases` is the query's
@@ -4653,6 +4772,7 @@ async fn read_back_once(
 
     let metrics_url = config.metrics_url.as_deref();
     let mut query_cost = BTreeMap::new();
+    let mut query_stats = BTreeMap::new();
 
     let before = scrape_get_counters(&client, metrics_url).await;
     let started = std::time::Instant::now();
@@ -4666,6 +4786,10 @@ async fn read_back_once(
         )
         .await;
     let series_count = timed(READBACK_QUERY_SERIES.to_string(), started, result)?;
+    query_stats.insert(
+        READBACK_QUERY_SERIES.to_string(),
+        ReadbackQueryStats::series(),
+    );
     if let Some(before) = before {
         let after = scrape_get_counters(&client, metrics_url).await;
         query_cost.insert(
@@ -4678,14 +4802,16 @@ async fn read_back_once(
         let name = format!("{READBACK_QUERY_SAMPLES}.{index}");
         query_windows.insert(name.clone(), window_count);
         let before = scrape_get_counters(&client, metrics_url).await;
-        let mut stats = Vec::new();
+        let mut calls = Vec::new();
         let started = std::time::Instant::now();
         let result = reader
-            .windowed_count(&probe.selector, &count_windows, &mut stats)
+            .windowed_count(&probe.selector, &count_windows, &mut calls)
             .await;
         sample_count += timed(name.clone(), started, result)?;
+        query_stats.insert(name.clone(), ReadbackQueryStats::per_call(&calls));
         if let Some(before) = before {
             let after = scrape_get_counters(&client, metrics_url).await;
+            let stats = calls.into_iter().map(|c| c.stats).collect();
             query_cost.insert(name, ReadbackQueryCost::between(before, after, stats));
         }
     }
@@ -4701,11 +4827,16 @@ async fn read_back_once(
                     &window,
                 )
                 .await;
-            Some(timed(
+            let count = timed(
                 READBACK_QUERY_HISTOGRAM_SERIES.to_string(),
                 started,
                 result,
-            )?)
+            )?;
+            query_stats.insert(
+                READBACK_QUERY_HISTOGRAM_SERIES.to_string(),
+                ReadbackQueryStats::series(),
+            );
+            Some(count)
         }
         None => None,
     };
@@ -4715,15 +4846,21 @@ async fn read_back_once(
     ) {
         (Some(_), Some(probe)) => {
             query_windows.insert(READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(), window_count);
+            let mut calls = Vec::new();
             let started = std::time::Instant::now();
             let result = reader
-                .windowed_count(&probe.selector, &count_windows, &mut Vec::new())
+                .windowed_count(&probe.selector, &count_windows, &mut calls)
                 .await;
-            Some(timed(
+            let count = timed(
                 READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(),
                 started,
                 result,
-            )?)
+            )?;
+            query_stats.insert(
+                READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(),
+                ReadbackQueryStats::per_call(&calls),
+            );
+            Some(count)
         }
         _ => None,
     };
@@ -4786,6 +4923,7 @@ async fn read_back_once(
         query_ms,
         query_windows,
         query_cost,
+        query_stats,
     })
 }
 
@@ -4954,6 +5092,7 @@ fn empty_window_readback(query_url: String, expected: ReadbackExpected) -> Readb
         query_ms: BTreeMap::new(),
         query_windows: BTreeMap::new(),
         query_cost: BTreeMap::new(),
+        query_stats: BTreeMap::new(),
     }
 }
 
@@ -5067,16 +5206,14 @@ impl ApiReader<'_> {
         Ok((result, data.get("stats").cloned().unwrap_or_default()))
     }
 
-    /// The single value of a `count_over_time` instant query; an empty
-    /// result is zero. The answer's `data.stats` is pushed onto `stats`.
+    /// The single value of a `count_over_time` instant query, an empty
+    /// result being zero, and the answer's `data.stats`.
     async fn instant_count(
         &self,
         query: &str,
         ts_ms: i64,
-        stats: &mut Vec<serde_json::Value>,
-    ) -> Result<u64, String> {
+    ) -> Result<(u64, serde_json::Value), String> {
         let (result, answer_stats) = self.instant_with_stats(query, ts_ms).await?;
-        stats.push(answer_stats);
         let mut total = 0u64;
         for element in &result {
             let text = element
@@ -5089,25 +5226,25 @@ impl ApiReader<'_> {
                 .map_err(|e| format!("query value {text} is not a number: {e}"))?;
             total += value as u64;
         }
-        Ok(total)
+        Ok((total, answer_stats))
     }
 
     /// `count_over_time` of `selector` summed over `windows`, one instant
-    /// query per window at its end; a failure names the window. Each
-    /// window's `data.stats` is pushed onto `stats` in query order.
+    /// query per window at its end; a failure names the window. Each call is
+    /// pushed onto `calls` in query order.
     async fn windowed_count(
         &self,
         selector: &str,
         windows: &[CountWindow],
-        stats: &mut Vec<serde_json::Value>,
+        calls: &mut Vec<CountCall>,
     ) -> Result<u64, String> {
         let mut total = 0u64;
         for window in windows {
-            let count = self
+            let started = std::time::Instant::now();
+            let (count, stats) = self
                 .instant_count(
                     &format!("count_over_time({selector}[{}ms])", window.range_ms),
                     window.end_ms,
-                    stats,
                 )
                 .await
                 .map_err(|e| {
@@ -5116,6 +5253,11 @@ impl ApiReader<'_> {
                         window.end_ms, window.range_ms
                     )
                 })?;
+            calls.push(CountCall {
+                window: *window,
+                query_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                stats,
+            });
             total = total.saturating_add(count);
         }
         Ok(total)
