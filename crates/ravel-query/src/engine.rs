@@ -1642,6 +1642,7 @@ impl QueryEngine {
                     histogram_series: Vec::new(),
                     log_series: Vec::new(),
                     precomputed_count: None,
+                    _held: Vec::new(),
                 },
                 QueryStats::default(),
             ));
@@ -2021,6 +2022,7 @@ impl QueryEngine {
                     histogram_series: Vec::new(),
                     log_series: Vec::new(),
                     precomputed_count: None,
+                    _held: Vec::new(),
                 },
                 QueryStats::default(),
             ));
@@ -2094,6 +2096,7 @@ impl QueryEngine {
             // plan). Every plan's scalar runs go into `scalar_fold`, below.
             type PerPlan = (
                 Vec<HistogramSeriesData>,
+                Vec<ravel_memory::Reservation>,
                 FetchStats,
                 Option<Vec<crate::distrib::codec::PartialAggregate>>,
                 bool,
@@ -2267,9 +2270,11 @@ impl QueryEngine {
                                     &mut histogram_fold,
                                 )
                                 .await?;
+                            let histogram_held = histogram_fold.take_reservations();
                             let histograms = histogram_fold.into_series(max_samples)?;
                             Ok::<PerPlan, QueryError>((
                                 histograms,
+                                histogram_held,
                                 page_stats,
                                 pushdown_partials,
                                 excludes_spend,
@@ -2313,8 +2318,16 @@ impl QueryEngine {
             // that fell back to a local re-fetch or folded a retried slice, or
             // a federated remote that answered (below).
             let mut excludes_spend = route_spent;
+            let mut held: Vec<ravel_memory::Reservation> = Vec::new();
             for r in results {
-                let (histograms, per_plan_stats, pushdown_partials, plan_excludes_spend) = r?;
+                let (
+                    histograms,
+                    histogram_held,
+                    per_plan_stats,
+                    pushdown_partials,
+                    plan_excludes_spend,
+                ) = r?;
+                held.extend(histogram_held);
                 excludes_spend |= plan_excludes_spend;
                 for series in histograms {
                     insert_or_union_histogram_series(&mut combined_histograms, series);
@@ -2399,10 +2412,11 @@ impl QueryEngine {
                 .raw_f64_bytes
                 .saturating_add(fed_stats.raw_f64_bytes);
 
-            let mut series = scalar_fold
+            let mut scalar_fold = scalar_fold
                 .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .into_series(max_samples)?;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            held.extend(scalar_fold.take_reservations());
+            let mut series = scalar_fold.into_series(max_samples)?;
             series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
             let mut histogram_series: Vec<HistogramSeriesData> =
                 combined_histograms.into_values().collect();
@@ -2441,6 +2455,7 @@ impl QueryEngine {
                         // `attempt` closure.
                         log_series: Vec::new(),
                         precomputed_count,
+                        _held: held,
                     },
                     fed_warnings,
                     fed_partial,
@@ -5468,6 +5483,10 @@ struct MergedSource {
     /// ADR-0103 collected pushdown count table. Written by `prefetch` and read
     /// by `query_precomputed_count` (this impl) on the T4b fast path.
     precomputed_count: Option<PrecomputedCount>,
+    /// The sample folds' reservations for `series` and `histogram_series`,
+    /// held for as long as the evaluation reads them (issue #4118). Never
+    /// read: dropping the source releases them.
+    _held: Vec<ravel_memory::Reservation>,
 }
 
 impl MergedSource {
@@ -6213,6 +6232,7 @@ mod merge_tests {
             histogram_series: Vec::new(),
             log_series: Vec::new(),
             precomputed_count: None,
+            _held: Vec::new(),
         };
         let got = source
             .query(
@@ -6249,6 +6269,7 @@ mod merge_tests {
                 histogram_series: Vec::new(),
                 log_series: Vec::new(),
                 precomputed_count: None,
+                _held: Vec::new(),
             };
             let got = source.query(&[], window).expect("query");
             prop_assert_eq!(got.len(), 2);
@@ -6283,6 +6304,7 @@ mod merge_tests {
                 ],
                 log_series: Vec::new(),
                 precomputed_count: None,
+                _held: Vec::new(),
             };
             let got = source.query_histograms(&[], window).expect("query");
             prop_assert_eq!(got.len(), 2);
@@ -7564,6 +7586,7 @@ mod histogram_source_tests {
             histogram_series,
             log_series: Vec::new(),
             precomputed_count: None,
+            _held: Vec::new(),
         }
     }
 
@@ -8847,14 +8870,14 @@ mod prefetch_tests {
 
     /// Issue #3105: a range query's selector-cache entries are charged to the
     /// engine's memory budget. Eight keys of about 2.5 KB each against a
-    /// 6656-byte budget, which also holds the fetch's sample fold (about
-    /// 5.9 KB) beside the 438 bytes the segment fetch still holds while the
-    /// fold absorbs, both released before evaluation. Of those 438 bytes, 351
-    /// are the open GET (the whole object), which the open now reserves, and
-    /// 87 the decoded catalog's reservation. An L0 segment is one batch and
-    /// does not need them held through the fold; the hold comes from sharing
-    /// the batched path, and it is why this budget is 6656 bytes rather than
-    /// 6144. With it the first two are
+    /// 17715-byte budget, which also holds the fetch's sample fold: 11721
+    /// bytes, reserved before the fold absorbs the segment's runs (each
+    /// incoming sample, the series' labels, its provenance prefix and the
+    /// level the merge builds) and held through evaluation, since the merged
+    /// series the evaluator reads are the fold's (issue #4118). While the
+    /// fold absorbs, the segment fetch also holds 4487 bytes (the open GET,
+    /// the decoded catalog and the decoded batch), released before
+    /// evaluation. With it the first two are
     /// cached, the other six are read at every step, the response carries one
     /// info naming them, the answer is the unconstrained one, and the budget
     /// is back to zero afterwards. The six fallbacks are not refusals the
@@ -8863,7 +8886,7 @@ mod prefetch_tests {
     /// `ravel_memory_gate_refusals_total` must not move.
     #[tokio::test]
     async fn a_range_query_over_its_memory_budget_reads_per_step_and_says_so() {
-        let budget = Arc::new(ravel_memory::MemoryBudget::new(6656));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(17715));
         let (value, annotations, _) =
             eight_offsets_range(EngineConfig::default(), Arc::clone(&budget))
                 .await
@@ -8881,14 +8904,14 @@ mod prefetch_tests {
         assert_eq!(budget.gate_refusals(), 0);
         assert!(annotations.warnings().is_empty());
         assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
-        // The first refusal is the third key, against the two cached entries:
-        // `m` reads 141 points and each offset key 140, one 16-byte `Sample`
-        // less, so 2505 + 2489 bytes are held.
+        // The first refusal is the third key, against the fold and the two
+        // cached entries: `m` reads 141 points and each offset key 140, one
+        // 16-byte `Sample` less, so 11721 + 2505 + 2489 bytes are held.
         assert_eq!(
             annotations.infos()[0],
             "6 selector(s) read at every step instead of once per query: \
              6 refused by the query memory budget (first refusal: memory exhausted: \
-             requested 2489 bytes, 4994 of 6656 byte limit already reserved)"
+             requested 2489 bytes, 16715 of 17715 byte limit already reserved)"
         );
 
         let unconstrained = Arc::new(ravel_memory::MemoryBudget::unlimited());
@@ -10072,6 +10095,7 @@ mod prefetch_tests {
                 end_ns: 200,
                 counts: vec![(labels("m"), 5)],
             }),
+            _held: Vec::new(),
         };
 
         assert_eq!(
@@ -12712,7 +12736,8 @@ mod l1_batch_tests {
     /// and folded, and the query still returns no samples, so batches already
     /// folded never become a partial answer. The batches are sized by the
     /// floor alone, since every limit here sits below `2 * PERMITS` floors;
-    /// the limit fits batch 0 with its fold and is one byte short of batch 1.
+    /// the limit fits batch 0 with its fold and is one byte short of batch
+    /// 1's decoded runs.
     #[tokio::test]
     async fn a_later_batch_over_the_limit_fails_the_statement_with_no_samples() {
         let store = l1_tenant().await;
@@ -12738,10 +12763,18 @@ mod l1_batch_tests {
             observed[1].batch_reserved > observed[0].batch_reserved,
             "batch 1 is larger than batch 0: {sizes:?}"
         );
-        // Before batch 1 reserves, the budget holds the catalog and batch 0's
-        // fold; batch 0's peak is the same with batch 0's pages in place of
-        // batch 1's, so it fits.
-        let limit = observed[1].budget_reserved - 1;
+        // A batch reserves its pages, then its decoded runs, then the fold's
+        // growth. When batch 1 has its pages, the budget holds the catalog,
+        // batch 0's fold and batch 1's pages; one byte short of adding batch
+        // 1's decoded runs refuses batch 1 after its GET and before its
+        // decode. Batch 0 held the same with its own pages and decoded runs in
+        // place of batch 1's, and those are smaller, so it fits.
+        let batch_peak = |b: &BatchObservation| b.batch_reserved + b.decoded_len;
+        assert!(
+            batch_peak(&observed[1]) > batch_peak(&observed[0]),
+            "batch 1 holds more than batch 0: {sizes:?}"
+        );
+        let limit = observed[1].budget_reserved + observed[1].decoded_len - 1;
 
         let probe = Arc::default();
         let refusing = engine(Arc::clone(&store), Some(limit), floor, Arc::clone(&probe));
@@ -12755,13 +12788,18 @@ mod l1_batch_tests {
                 limit: refused_limit,
                 ..
             }) => {
-                assert_eq!(requested, observed[1].batch_reserved, "batch 1's bytes");
+                assert_eq!(requested, observed[1].decoded_len, "batch 1's decoded runs");
                 assert_eq!(refused_limit, limit);
             }
             other => panic!("expected FetchMemoryExhausted, got {other:?}"),
         }
         let seen: Vec<BatchObservation> = probe.lock().expect("probe").clone();
-        assert_eq!(seen.len(), 1, "batch 0 was fetched and folded first");
+        assert_eq!(
+            seen.len(),
+            2,
+            "batch 0 was fetched and folded, batch 1 fetched and refused"
+        );
         assert_eq!(seen[0].batch_reserved, observed[0].batch_reserved);
+        assert_eq!(seen[1].batch_reserved, observed[1].batch_reserved);
     }
 }

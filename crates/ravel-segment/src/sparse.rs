@@ -30,6 +30,10 @@ use bytes::Bytes;
 use prost::Message;
 use ravel_proto::segment::v1::{Footer, Section};
 
+use crate::catalog_charge::{
+    CatalogCharge, PROVENANCE_COLUMN_BYTES_PER_SAMPLE, SAMPLE_PROVENANCE_BYTES, Uncharged,
+    provenance_bytes,
+};
 use crate::crc::footer_crc;
 use crate::error::{SegmentError, WriteError};
 use crate::format::{
@@ -536,6 +540,7 @@ fn decode_chunk_frame(
     val_section_len: u64,
     hist_section_len: u64,
     limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<ChunkFrame, SegmentError> {
     let mut pos = 0usize;
     let n = take_u32(frame_raw, &mut pos)? as usize;
@@ -612,7 +617,7 @@ fn decode_chunk_frame(
     // `footer.base_created_unix_ns`. Absent for a provenance-free frame, in
     // which case the trailing-bytes check below still fires on real garbage.
     let provenance = if pos < frame_raw.len() {
-        parse_chunk_provenance(frame_raw, &mut pos, footer, &sample_count, limits)?
+        parse_chunk_provenance(frame_raw, &mut pos, footer, &sample_count, limits, charge)?
     } else {
         Vec::new()
     };
@@ -702,6 +707,7 @@ fn parse_chunk_provenance(
     footer: &Footer,
     sample_count: &[u64],
     limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<Vec<Option<Vec<SampleProvenance>>>, SegmentError> {
     let run_total = sample_count.len();
     let presence = take_encoded_i64_block(frame_raw, pos, run_total)?;
@@ -742,6 +748,15 @@ fn parse_chunk_provenance(
     }
     let prov_total = usize::try_from(prov_sample_total).map_err(|_| SegmentError::FieldOverflow)?;
 
+    // Admitted before allocation, as the whole-section reader does: the
+    // columns are released once freed below, the structs stay admitted with
+    // the frame that holds them.
+    let column_bytes = prov_sample_total.saturating_mul(PROVENANCE_COLUMN_BYTES_PER_SAMPLE);
+    let struct_bytes = prov_sample_total.saturating_mul(SAMPLE_PROVENANCE_BYTES);
+    if !charge.admit(column_bytes) || !charge.admit(struct_bytes) {
+        return Err(SegmentError::CatalogChargeRefused);
+    }
+
     let created_delta = take_encoded_i64_block(frame_raw, pos, prov_total)?;
     let epoch = take_encoded_i64_block(frame_raw, pos, prov_total)?;
     let seq = take_encoded_i64_block(frame_raw, pos, prov_total)?;
@@ -773,6 +788,8 @@ fn parse_chunk_provenance(
         }
         out.push(Some(column));
     }
+    drop((created_delta, epoch, seq, in_page_index));
+    charge.release(column_bytes);
     Ok(out)
 }
 
@@ -810,7 +827,15 @@ pub fn decode_chunk_runs(
     let hist_len = find_section(footer, section_kind::HIST_PAGES)
         .map(|s| s.len)
         .unwrap_or(0);
-    let frame = decode_chunk_frame(frame_raw, footer, ts_len, val_len, hist_len, limits)?;
+    let frame = decode_chunk_frame(
+        frame_raw,
+        footer,
+        ts_len,
+        val_len,
+        hist_len,
+        limits,
+        &mut Uncharged,
+    )?;
     let row = usize::try_from(row_in_chunk).map_err(|_| SegmentError::SectionOutOfBounds)?;
     if row >= frame.n {
         return Err(SegmentError::SectionOutOfBounds);
@@ -836,6 +861,17 @@ pub fn decode_catalog_v5(
     footer: &Footer,
     object_bytes: &[u8],
     limits: ReaderLimits,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
+    decode_catalog_v5_charged(footer, object_bytes, limits, &mut Uncharged)
+}
+
+/// [`decode_catalog_v5`] with the per-sample provenance it materializes
+/// admitted to `charge` before it is allocated (see [`CatalogCharge`]).
+pub fn decode_catalog_v5_charged(
+    footer: &Footer,
+    object_bytes: &[u8],
+    limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<Vec<SeriesEntryV4>, SegmentError> {
     let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
         .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
@@ -869,6 +905,7 @@ pub fn decode_catalog_v5(
             &series_ids,
             &meta_bytes,
             limits,
+            charge,
         );
     }
 
@@ -880,13 +917,15 @@ pub fn decode_catalog_v5(
         .ok_or(SegmentError::SparseSectionsIncomplete)?;
     let chunks_section = find_section(footer, section_kind::SERIES_META_CHUNKS)
         .ok_or(SegmentError::SparseSectionsIncomplete)?;
-    decode_catalog_v5_chunked(
+    decode_chunked(
         footer,
         slice(object_bytes, label_dict_section)?,
         slice(object_bytes, series_ids_section)?,
         slice(object_bytes, idx_section)?,
         slice(object_bytes, chunks_section)?,
+        None,
         limits,
+        charge,
     )
 }
 
@@ -915,6 +954,31 @@ pub fn decode_catalog_v5_chunked(
     meta_chunks_stored: &[u8],
     limits: ReaderLimits,
 ) -> Result<Vec<SeriesEntryV4>, SegmentError> {
+    decode_catalog_v5_chunked_charged(
+        footer,
+        label_dict_stored,
+        series_ids_stored,
+        series_idx_stored,
+        meta_chunks_stored,
+        limits,
+        &mut Uncharged,
+    )
+}
+
+/// [`decode_catalog_v5_chunked`] with each chunk frame's per-sample
+/// provenance admitted to `charge` before it is allocated (see
+/// [`CatalogCharge`]). A frame's provenance is released once the frame is
+/// freed, except what the returned entries hold, so the decode holds one
+/// frame's provenance beyond its result at a time.
+pub fn decode_catalog_v5_chunked_charged(
+    footer: &Footer,
+    label_dict_stored: &[u8],
+    series_ids_stored: &[u8],
+    series_idx_stored: &[u8],
+    meta_chunks_stored: &[u8],
+    limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
     decode_chunked(
         footer,
         label_dict_stored,
@@ -923,6 +987,7 @@ pub fn decode_catalog_v5_chunked(
         meta_chunks_stored,
         None,
         limits,
+        charge,
     )
 }
 
@@ -953,6 +1018,33 @@ pub fn decode_catalog_v5_chunked_matching(
     equals: &[(&str, &str)],
     limits: ReaderLimits,
 ) -> Result<Vec<SeriesEntryV4>, SegmentError> {
+    decode_catalog_v5_chunked_matching_charged(
+        footer,
+        label_dict_stored,
+        series_ids_stored,
+        series_idx_stored,
+        meta_chunks_stored,
+        equals,
+        limits,
+        &mut Uncharged,
+    )
+}
+
+/// [`decode_catalog_v5_chunked_matching`] with each chunk frame's per-sample
+/// provenance admitted to `charge` before it is allocated, as
+/// [`decode_catalog_v5_chunked_charged`] does. Only the matched series'
+/// provenance stays admitted once it returns.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_catalog_v5_chunked_matching_charged(
+    footer: &Footer,
+    label_dict_stored: &[u8],
+    series_ids_stored: &[u8],
+    series_idx_stored: &[u8],
+    meta_chunks_stored: &[u8],
+    equals: &[(&str, &str)],
+    limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
     decode_chunked(
         footer,
         label_dict_stored,
@@ -961,6 +1053,7 @@ pub fn decode_catalog_v5_chunked_matching(
         meta_chunks_stored,
         Some(equals),
         limits,
+        charge,
     )
 }
 
@@ -1070,6 +1163,7 @@ fn resolve_equals(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_chunked(
     footer: &Footer,
     label_dict_stored: &[u8],
@@ -1078,6 +1172,7 @@ fn decode_chunked(
     meta_chunks_stored: &[u8],
     equals: Option<&[(&str, &str)]>,
     limits: ReaderLimits,
+    charge: &mut dyn CatalogCharge,
 ) -> Result<Vec<SeriesEntryV4>, SegmentError> {
     let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
         .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
@@ -1184,7 +1279,11 @@ fn decode_chunked(
         }
         let frame_raw = ravel_codec::zstd_frame::decompress(stored, cap)
             .map_err(|e| SegmentError::Decompress(e.to_string()))?;
-        let frame = decode_chunk_frame(&frame_raw, footer, ts_len, val_len, hist_len, limits)?;
+        let mut frame = decode_chunk_frame(
+            &frame_raw, footer, ts_len, val_len, hist_len, limits, charge,
+        )?;
+        let frame_provenance = provenance_bytes(&frame.provenance);
+        let mut kept_provenance = 0u64;
         if frame.n != chunk.n as usize {
             return Err(SegmentError::BadChunkFrame);
         }
@@ -1244,10 +1343,10 @@ fn decode_chunked(
             // Per-sample provenance for this series' runs (ADR-0092 decision 1).
             // Empty when the frame carried no extension, else the run slice
             // parallel to `runs`, exactly as the whole-section decode produces.
-            let prov_slice: &[Option<Vec<SampleProvenance>>] = if frame.provenance.is_empty() {
-                &[]
+            let prov_slice: &mut [Option<Vec<SampleProvenance>>] = if frame.provenance.is_empty() {
+                &mut []
             } else {
-                &frame.provenance[roff..roff + rc]
+                &mut frame.provenance[roff..roff + rc]
             };
             roff += rc;
 
@@ -1270,7 +1369,10 @@ fn decode_chunked(
                 continue;
             };
             let runs: Vec<RunEntry> = run_slice.to_vec();
-            let per_sample_provenance = prov_slice.to_vec();
+            let per_sample_provenance: Vec<Option<Vec<SampleProvenance>>> =
+                prov_slice.iter_mut().map(std::mem::take).collect();
+            kept_provenance =
+                kept_provenance.saturating_add(provenance_bytes(&per_sample_provenance));
             entries.push(SeriesEntryV4 {
                 entry: SeriesEntry {
                     series_id: SeriesId(series_id),
@@ -1290,6 +1392,13 @@ fn decode_chunked(
         if voff != frame.value_ord.len() {
             return Err(SegmentError::BadBlockLen);
         }
+        // The kept series' provenance was moved out of the frame; it is
+        // admitted as theirs before the frame's admission is released.
+        if !charge.admit(kept_provenance) {
+            return Err(SegmentError::CatalogChargeRefused);
+        }
+        drop(frame);
+        charge.release(frame_provenance);
     }
 
     if run_total_sum != u64::from(run_total) {

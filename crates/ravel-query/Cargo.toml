@@ -146,6 +146,15 @@ tracing-subscriber = { workspace = true }
 # ravel-segment, and ravel-logseg already depend on it.
 zstd = { workspace = true }
 
+# tests/l1_read_memory.rs installs jemalloc as its test binary's global
+# allocator and reads its allocated-bytes statistic, the figure ravel-server
+# reports, to measure what a PromQL read over large L1 objects really
+# allocates against what it charged to the memory budget (issue #4118). The
+# same versions ravel-server links; nothing new enters Cargo.lock.
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+
 [[bench]]
 name = "fetch_soa_vs_fetch"
 harness = false
