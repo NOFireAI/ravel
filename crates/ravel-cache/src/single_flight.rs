@@ -17,8 +17,8 @@
 //!   a failing fetch reaches every follower as that error rather than
 //!   leaving any of them parked.
 //! - A cancelled leader, its future dropped before `fetch` resolved,
-//!   deposits a cancellation signal. Dropping a future is not a panic, so
-//!   [`LeaderGuard`]'s `Drop` reads `std::thread::panicking()` as false and
+//!   deposits a cancellation signal. A drop outside any unwind reads
+//!   `std::thread::panicking()` as false, so [`LeaderGuard`]'s `Drop`
 //!   records the cancellation. A follower that receives it does not fail:
 //!   it re-enters the slot for the key, becoming the new leader if the slot
 //!   is now vacant (running its own `fetch` under its own cancellation) or
@@ -28,11 +28,19 @@
 //!   store that never failed. Re-entry is bounded by
 //!   `MAX_CANCELLED_LEADER_REENTRIES`; a follower still following when the
 //!   bound is exhausted returns [`SingleFlightError::LeaderLost`].
-//! - A panicking leader unwinds its stack, so `Drop` reads
-//!   `std::thread::panicking()` as true and records a panic. Followers of a
-//!   panicking leader receive [`SingleFlightError::LeaderLost`] and do NOT
-//!   re-enter, because a deterministic panic would otherwise repeat once
-//!   per follower.
+//! - A leader whose fetch panicked is dropped during that unwind, so `Drop`
+//!   reads `std::thread::panicking()` as true and records a panic. Followers
+//!   of a panicking leader receive [`SingleFlightError::LeaderLost`] and do
+//!   NOT re-enter, because a deterministic panic would otherwise repeat once
+//!   per follower. `panicking()` is true for any drop during an unwind on
+//!   that thread, so a cancelled leader dropped while an unrelated panic
+//!   unwinds the same thread is also recorded as a panic; its followers then
+//!   get `LeaderLost` instead of re-entering.
+//!
+//! A cancelled or panicking leader removes its slot before it deposits the
+//! outcome. A follower can only subscribe to a slot it finds in the map, so
+//! a follower woken by a cancellation never finds that leader's slot again
+//! and counts one re-entry per cancelled leader it followed.
 //!
 //! The cancelled/panicked distinction is carried on the channel through an
 //! internal `LeaderOutcome` signal, not through [`SingleFlightError`], so
@@ -85,14 +93,14 @@ pub enum SingleFlightError<E> {
 
 type Outcome<V, E> = Result<V, SingleFlightError<E>>;
 
-/// How many times a follower whose leader was cancelled re-enters the slot
-/// before giving up with [`SingleFlightError::LeaderLost`]. A cancelled leader
-/// is almost always a single query torn down for its memory budget, so the
-/// first healthy follower to take over resolves the fetch and the common path
-/// re-enters at most once; the bound only bites under a storm of back-to-back
-/// cancellations racing one key. Eight tolerates several consecutive
-/// budget-driven teardowns before surfacing the transient error that exists
-/// today, while keeping the worst-case extra work a small constant.
+/// How many cancelled leaders one follower follows before giving up: the
+/// follower re-enters the slot after each of its leaders is cancelled, and
+/// once it has re-entered this many times the next cancellation returns
+/// [`SingleFlightError::LeaderLost`]. It bounds how long one follower keeps
+/// waiting through a chain of cancellations, not how many fetches run: each
+/// caller runs its own fetch at most once whatever the value. A cancelled
+/// leader is almost always a single query torn down for its memory budget, so
+/// the common path re-enters at most once.
 pub(crate) const MAX_CANCELLED_LEADER_REENTRIES: u32 = 8;
 
 /// What a leader deposits on its slot's `watch` channel for followers. Kept
@@ -317,6 +325,9 @@ where
         // between this line and `remove_if_current` sees `None`, then sees
         // every sender drop, and reports `LeaderLost` for a fetch that
         // succeeded. `send_replace` stores the value regardless of receivers.
+        // Depositing before the removal is safe on this path: a caller that
+        // finds the slot in between reads `Resolved` and returns it without
+        // re-entering.
         guard
             .tx
             .send_replace(Some(LeaderOutcome::Resolved(result.clone())));
@@ -336,10 +347,10 @@ where
 }
 
 /// Unblocks every follower if the leader never gets to deposit a result: a
-/// cancelled leader future is dropped, and a panicking one unwinds, and either
-/// way this `Drop` runs. It distinguishes the two with
-/// `std::thread::panicking()` -- false during a plain drop (cancellation),
-/// true while unwinding a panic -- and deposits `LeaderOutcome::Cancelled` or
+/// cancelled leader future is dropped, and a panicking one is dropped during
+/// the unwind, and either way this `Drop` runs. It distinguishes the two with
+/// `std::thread::panicking()` -- false for a drop outside any unwind, true for
+/// a drop during one -- and deposits `LeaderOutcome::Cancelled` or
 /// `LeaderOutcome::Panicked` accordingly, so a follower retries a cancelled
 /// leader but surfaces [`SingleFlightError::LeaderLost`] for a panicking one.
 /// A leader that finishes normally sets `done` first, so this is then a no-op.
@@ -367,9 +378,11 @@ where
             // Cancellation (a plain drop) and a panic reach here the same way,
             // but a follower must treat them differently: retry a cancelled
             // leader, give up on a panicking one. `std::thread::panicking()` is
-            // the only signal available in a destructor that tells them apart,
-            // and it is reliable here because this guard lives on the leader's
-            // own stack, which unwinds only on the leader's own panic.
+            // the only signal available in a destructor that tells them apart.
+            // It is true for any drop during an unwind on this thread: a leader
+            // whose own fetch panicked reports `Panicked`, and so does a
+            // cancelled leader dropped during an unrelated unwind, which only
+            // costs its followers the retry.
             let outcome = if std::thread::panicking() {
                 LeaderOutcome::Panicked
             } else {
@@ -380,8 +393,15 @@ where
             // it falls through to the sender-dropped branch, which returns
             // `LeaderLost` without retrying -- the conservative answer when the
             // cancel/panic signal was lost.
-            self.tx.send_replace(Some(outcome));
+            //
+            // Remove the slot before depositing. A follower woken by the outcome
+            // re-enters the map; if this slot were still there it would
+            // subscribe to it again, read the same outcome at once, and spend a
+            // re-entry per lap on one cancellation. Followers already subscribed
+            // still receive the outcome, because `self.tx` lives until the end
+            // of this function.
             self.flight.remove_if_current(&self.key, self.id);
+            self.tx.send_replace(Some(outcome));
         }
     }
 }
@@ -441,5 +461,220 @@ mod send_replace_regression {
             0,
             "a fetch that returned Ok was reported to a follower as LeaderLost"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod cancelled_leader_drop_order {
+    use std::hash::Hasher;
+    use std::panic::AssertUnwindSafe;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    type ProbeRx = watch::Receiver<Option<LeaderOutcome<u64, &'static str>>>;
+
+    /// Records, at the moment a dropping leader looks its slot up to remove it,
+    /// whether that leader's outcome is already visible on the channel.
+    #[derive(Default)]
+    struct Probe {
+        armed: AtomicBool,
+        rx: Mutex<Option<ProbeRx>>,
+        outcome_visible_at_removal: Mutex<Option<bool>>,
+    }
+
+    /// A key whose `Hash` runs the probe once after it is armed. The first
+    /// hash of the key after arming is the guard's own lookup in
+    /// `remove_if_current`, made under the map lock.
+    #[derive(Clone)]
+    struct ProbeKey {
+        id: u64,
+        probe: Arc<Probe>,
+    }
+
+    impl PartialEq for ProbeKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Eq for ProbeKey {}
+
+    impl Hash for ProbeKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.id.hash(state);
+            if self.probe.armed.swap(false, Ordering::SeqCst) {
+                let visible = self
+                    .probe
+                    .rx
+                    .lock()
+                    .as_ref()
+                    .map(|rx| rx.borrow().is_some());
+                *self.probe.outcome_visible_at_removal.lock() = visible;
+            }
+        }
+    }
+
+    fn poll_now<F: Future + ?Sized>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    fn subscribe_and_arm(flight: &SingleFlight<ProbeKey, u64, &'static str>, key: &ProbeKey) {
+        let rx = flight
+            .inflight
+            .lock()
+            .get(key)
+            .map(|slot| slot.tx.subscribe());
+        assert!(rx.is_some(), "the parked leader holds the slot");
+        *key.probe.rx.lock() = rx;
+        key.probe.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// A cancelled leader's slot is gone from the map before its `Cancelled`
+    /// becomes visible, so no follower woken by it can find and re-subscribe to
+    /// that slot. Fails on the deposit-then-remove order: the probe then sees
+    /// the outcome already deposited while the guard is still removing.
+    #[test]
+    fn cancelled_leader_removes_its_slot_before_the_outcome_is_visible() {
+        let flight = SingleFlight::<ProbeKey, u64, &'static str>::new();
+        let key = ProbeKey {
+            id: 1,
+            probe: Arc::new(Probe::default()),
+        };
+        let mut leader = Box::pin(flight.run(key.clone(), || {
+            std::future::pending::<Result<u64, &'static str>>()
+        }));
+        assert!(poll_now(&mut leader).is_pending());
+        subscribe_and_arm(&flight, &key);
+
+        drop(leader);
+
+        assert_eq!(
+            *key.probe.outcome_visible_at_removal.lock(),
+            Some(false),
+            "the cancelled leader's outcome was visible while its slot was still in the map"
+        );
+        assert!(!flight.is_in_flight(&key));
+        let rx = key
+            .probe
+            .rx
+            .lock()
+            .take()
+            .expect("the probe holds a receiver");
+        assert!(matches!(*rx.borrow(), Some(LeaderOutcome::Cancelled)));
+    }
+
+    /// The panic path shares the cancelled path's order: the slot is removed
+    /// before `Panicked` is visible, so only callers that subscribed while the
+    /// leader was in flight inherit the panic.
+    #[test]
+    fn panicking_leader_removes_its_slot_before_the_outcome_is_visible() {
+        let flight = SingleFlight::<ProbeKey, u64, &'static str>::new();
+        let key = ProbeKey {
+            id: 2,
+            probe: Arc::new(Probe::default()),
+        };
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let mut leader = Box::pin(flight.run(key.clone(), move || async move {
+            let _ = go_rx.await;
+            panic!("leader fetch panics after the follower subscribed");
+        }));
+        assert!(poll_now(&mut leader).is_pending());
+        subscribe_and_arm(&flight, &key);
+
+        go_tx
+            .send(())
+            .expect("the leader is parked on the receiver");
+        let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| poll_now(&mut leader)));
+        assert!(unwound.is_err(), "the leader's fetch panicked");
+
+        assert_eq!(
+            *key.probe.outcome_visible_at_removal.lock(),
+            Some(false),
+            "the panicking leader's outcome was visible while its slot was still in the map"
+        );
+        assert!(!flight.is_in_flight(&key));
+        let rx = key
+            .probe
+            .rx
+            .lock()
+            .take()
+            .expect("the probe holds a receiver");
+        assert!(matches!(*rx.borrow(), Some(LeaderOutcome::Panicked)));
+    }
+
+    /// One cancelled leader costs its follower exactly one re-entry, and the
+    /// follower resolves with its own fetch rather than `LeaderLost`. The
+    /// follower is woken on another worker while the cancelled leader's guard
+    /// is still running, so the drop order is raced for real. On the path
+    /// where the follower re-enters and finds the key vacant it leads at once,
+    /// and the count is still 1: one per cancelled leader followed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_cancellation_costs_a_follower_exactly_one_reentry() {
+        let flight: Arc<SingleFlight<u64, u64, &'static str>> = Arc::new(SingleFlight::new());
+
+        for round in 0..2_000u64 {
+            let (entered_tx, entered_rx) = oneshot::channel::<()>();
+            let leader = {
+                let flight = Arc::clone(&flight);
+                tokio::spawn(async move {
+                    flight
+                        .run(round, move || async move {
+                            let _ = entered_tx.send(());
+                            std::future::pending::<Result<u64, &'static str>>().await
+                        })
+                        .await
+                })
+            };
+            entered_rx.await.expect("the leader enters its fetch");
+
+            let follower = {
+                let flight = Arc::clone(&flight);
+                tokio::spawn(async move {
+                    flight
+                        .run_with_reentries(round, move || async move {
+                            Ok::<u64, &'static str>(round + 1)
+                        })
+                        .await
+                })
+            };
+            // The timeout only guards against a hang.
+            timeout(Duration::from_secs(10), async {
+                while flight.waiters(&round) < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the follower subscribes to the parked leader");
+
+            leader.abort();
+
+            let (result, role, reentries) = timeout(Duration::from_secs(10), follower)
+                .await
+                .expect("the follower does not hang")
+                .expect("the follower task joins");
+            match result {
+                Ok(value) => assert_eq!(value, round + 1, "round {round}"),
+                Err(SingleFlightError::LeaderLost) => {
+                    panic!("round {round}: one cancellation reached the follower as LeaderLost")
+                }
+                Err(other) => panic!("round {round}: unexpected error {other:?}"),
+            }
+            assert_eq!(role, Role::Leader, "round {round}");
+            assert_eq!(
+                reentries, 1,
+                "round {round}: one cancellation must cost exactly one re-entry"
+            );
+        }
     }
 }

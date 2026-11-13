@@ -514,10 +514,15 @@ mod tests {
                     .await
             }));
         }
-        // Both followers registered on the original leader.
-        while flight.waiters(&key) < 2 {
-            tokio::task::yield_now().await;
-        }
+        // Both followers registered on the original leader. The timeout only
+        // guards against a hang.
+        timeout(Duration::from_secs(10), async {
+            while flight.waiters(&key) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both followers subscribe to the original leader");
 
         leader.abort();
         let _ = leader.await;
