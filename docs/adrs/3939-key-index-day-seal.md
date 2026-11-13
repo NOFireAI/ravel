@@ -684,18 +684,20 @@ rule, but no run measured one.
   11.98 s unfolded in run A, and 3.02 s against 11.88 s in run D.
 - W6 (runs A, D and E): 14 leaf GETs (band 14).
 - W7 (runs A, D and E): 4 leaf GETs, 2 parts covered.
-- A7 and W5 (run B, reduced rate, 26 slices per day part, so a per-part
-  bound of 126 by the harness-state amendment): 3,720 leaf GETs (band
+- W5 (run B, reduced rate, 26 slices per day part): 3,720 leaf GETs (band
   3,780), 30 of 30 days covered, 0 tier-1 probe GETs,
   `parts_beyond_ceiling` 0.
+- A7's coverage (run B): 30 of 30 day parts covered, which is min(30,
+  floor(2,048 / 126)) or more.
 - F2 (run B): p50 4.03 s against 29.07 s unfolded (band 2 x).
-- F3 (run B): per-day bound 139.
 
 **Not measured in any run.**
-- F3's per-part leaf GETs and `SlowDown` count, and W6's round trips: the
-  query stats carry no per-part breakdown and no `SlowDown` count. Run B's
-  3,720 GETs over 30 parts is 124 per part on average; no part's own count
-  was measured.
+- A7's per-day-part bound (126 GETs by the harness-state amendment), F3's
+  per-part leaf GETs (bound 139, 126 + 10%) and `SlowDown` count, and W6's
+  round trips: the query stats carry no per-part breakdown and no
+  `SlowDown` count. Run B's 3,720 GETs over 30 parts is 124 per part on
+  average; no part's own count was measured, so neither A7's bound nor
+  F3's is judged.
 - A4's switch-off partition is unit-tested only. The test is D1's
   `day_sealed_folds_of_one_entry_set_write_identical_heads` in
   crates/ravel-catalog/src/fold.rs.
