@@ -575,7 +575,9 @@ account all sixteen predictions hold, so no decision changes:
 - P14: `x-ms-error-code` is present on a failed HEAD, and tells
   `BlobNotFound` from `ContainerNotFound`.
 - P15: `x-ms-is-hns-enabled` is `false` on the flat account and `true` on
-  the other, from the account URL and from the container URL.
+  the other, from the account URL and from the container URL. (This ran
+  as a subscription owner; the AKS staging correction below says what
+  that hid.)
 - P16: every response carried `Date`.
 
 On the hierarchical-namespace account, two of the seventeen P10 keys could
@@ -675,7 +677,7 @@ The review of #4165 showed four places where D11 did not hold as written.
 
 ## Correction (2026-11-13): the account-information permission, from the AKS staging run
 
-<!-- amendment-applies: sections="D6. Selection, identity and qualification|D11. The operator runs a `RavelCluster` on Azure with AKS workload identity" pointer="AKS staging correction" -->
+<!-- amendment-applies: sections="D6. Selection, identity and qualification|D11. The operator runs a `RavelCluster` on Azure with AKS workload identity|Measured (2026-11-12)" pointer="AKS staging correction" -->
 
 The first run of an operator-rendered cluster on AKS (#4166, images built
 from main c1c153313) showed that the Measured section's P15 answer was
