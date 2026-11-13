@@ -2789,10 +2789,13 @@ pub(crate) const CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED: &str =
 /// main HTTP port instead of the dedicated health listener (issue #3112).
 pub(crate) const CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT: &str = "HealthProbeOnMainHttpPort";
 
-/// `status.conditions[].type` value saying whether the container's protection
-/// (versioning, soft delete, an immutability policy) was checked. Set only on a
-/// `storage.azure` cluster, always False: `--require-bucket-protection` has no
-/// Azure probes and is not rendered there (ADR-4158 D11).
+/// `status.conditions[].type` value saying whether the container's
+/// protection (blob versioning paired with a lifecycle rule that deletes
+/// previous versions; soft delete with a bounded retention; an immutability
+/// policy only where it does not refuse the deletes retention and erasure
+/// need) was checked. Set only on a `storage.azure` cluster, always False:
+/// `--require-bucket-protection` has no Azure probes and is not rendered
+/// there (ADR-4158 D11, 2026-11-13 operator correction).
 pub(crate) const CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED: &str = "BucketProtectionVerified";
 
 /// The `BucketProtectionVerified=False` reason on an Azure cluster.
@@ -2931,10 +2934,13 @@ fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) ->
             observed_generation,
             BUCKET_PROTECTION_NOT_IMPLEMENTED_FOR_AZURE_REASON,
             "no container-protection check runs on Azure Blob Storage, so \
-             --require-bucket-protection is not rendered; configure blob \
-             versioning, soft delete and an immutability policy on the \
-             container by hand (see docs/guides/kubernetes.md, \
-             \"Azure Blob Storage with workload identity\")",
+             --require-bucket-protection is not rendered; configure the \
+             container by hand: blob versioning paired with a lifecycle \
+             rule that deletes previous versions, soft delete with a \
+             bounded retention, and an immutability policy only where it \
+             does not refuse the deletes retention and erasure need (see \
+             docs/guides/kubernetes.md, \"Azure Blob Storage with workload \
+             identity\")",
         ));
     }
 
@@ -4466,6 +4472,24 @@ mod tests {
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "NotImplementedForAzure");
         assert_eq!(cond.observed_generation, Some(3));
+        assert!(cond.message.contains("lifecycle rule"), "{}", cond.message);
+        assert!(
+            cond.message.contains("bounded retention"),
+            "{}",
+            cond.message
+        );
+        assert!(
+            !cond
+                .message
+                .contains("soft delete and an immutability policy"),
+            "{}",
+            cond.message
+        );
+        assert!(
+            cond.message.contains("only where it does not refuse"),
+            "{}",
+            cond.message
+        );
 
         let success = build_status(
             Some(3),
