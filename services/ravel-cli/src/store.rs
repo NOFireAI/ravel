@@ -971,10 +971,12 @@ pub fn build_store_handle(
 }
 
 /// Runs [`AzureStore::new`], which is async because construction sends Get
-/// Account Information, from this synchronous builder. It blocks the calling
-/// worker of the multi-thread runtime the binary runs on; there is no other
-/// runtime the store's connections could outlive, so any other caller is
-/// refused.
+/// Account Information, from this synchronous builder, on the tokio runtime
+/// the calling thread is inside. The usual caller is the binary's main thread
+/// inside the multi-thread runtime's `block_on`, which waits for the request;
+/// a worker or `spawn_blocking` thread of that runtime is accepted too.
+/// Refused only when the thread is in no runtime, or in a current-thread one,
+/// where `block_in_place` would panic.
 fn construct_azure_store(config: AzureConfig) -> anyhow::Result<AzureStore> {
     let handle = tokio::runtime::Handle::try_current().map_err(|_| {
         anyhow::anyhow!("--store azure must be built inside the command's tokio runtime")
@@ -1004,12 +1006,22 @@ fn refuse_given_azure_flags(args: &StoreArgs, kind: StoreKind) -> anyhow::Result
 /// Whether a `--<flag>` endpoint may be plain HTTP: `https://` to any host is
 /// `false`, `http://` to a loopback host is `true`, and anything else is
 /// refused, since a plaintext request to the network carries the credential.
+/// An endpoint with userinfo in its authority is refused whatever its scheme,
+/// and no refusal prints the userinfo.
 fn endpoint_allows_http(flag: &str, endpoint: &str) -> anyhow::Result<bool> {
+    let (start, end) = endpoint_authority(endpoint);
+    if endpoint[start..end].contains('@') {
+        anyhow::bail!(
+            "--{flag} carries userinfo (user:password@) in its host part; remove it, the \
+             endpoint takes no credential"
+        );
+    }
+    let shown = endpoint_without_userinfo(endpoint);
     let lowercased = endpoint.to_ascii_lowercase();
     if lowercased.starts_with("http://") {
         if !is_loopback_endpoint(endpoint) {
             anyhow::bail!(
-                "--{flag} {endpoint:?} is plaintext HTTP to a host that is not loopback; use \
+                "--{flag} {shown:?} is plaintext HTTP to a host that is not loopback; use \
                  https:// so the credential is not sent in the clear"
             );
         }
@@ -1017,7 +1029,27 @@ fn endpoint_allows_http(flag: &str, endpoint: &str) -> anyhow::Result<bool> {
     } else if lowercased.starts_with("https://") {
         Ok(false)
     } else {
-        anyhow::bail!("--{flag} {endpoint:?} needs an http:// or https:// scheme");
+        anyhow::bail!("--{flag} {shown:?} needs an http:// or https:// scheme");
+    }
+}
+
+/// The endpoint's authority as `(start, end)` byte offsets: after `://` when
+/// there is one, else from the start, up to the first `/`, `?` or `#`.
+fn endpoint_authority(endpoint: &str) -> (usize, usize) {
+    let start = endpoint.find("://").map_or(0, |i| i + 3);
+    let end = endpoint[start..]
+        .find(['/', '?', '#'])
+        .map_or(endpoint.len(), |i| start + i);
+    (start, end)
+}
+
+/// `endpoint` with any userinfo (`user:password@`) removed from its
+/// authority, so an error can print it without echoing a credential.
+fn endpoint_without_userinfo(endpoint: &str) -> String {
+    let (start, end) = endpoint_authority(endpoint);
+    match endpoint[start..end].rfind('@') {
+        Some(at) => format!("{}{}", &endpoint[..start], &endpoint[start + at + 1..]),
+        None => endpoint.to_string(),
     }
 }
 
@@ -2786,6 +2818,64 @@ mod tests {
         assert!(
             schemeless.contains("needs an http:// or https:// scheme"),
             "{schemeless}"
+        );
+    }
+
+    /// An endpoint carrying userinfo is refused under gcs and azure, whatever
+    /// its scheme or host, and the refusal names the flag without echoing the
+    /// secret.
+    #[test]
+    fn endpoint_with_userinfo_is_refused_without_echoing_it() {
+        let endpoints = [
+            "http://user:secret@remote.example/",
+            "http://user:secret@127.0.0.1:9/",
+            "https://user:secret@remote.example/",
+            "user:secret@remote.example",
+        ];
+        for endpoint in endpoints {
+            let gcs = gcs_config_error(&gcs_args(&[
+                "--gcs-bucket",
+                "b",
+                "--gcs-endpoint",
+                endpoint,
+            ]));
+            let azure = azure_config_error(&azure_args(&[
+                "--azure-account",
+                "acct",
+                "--azure-container",
+                "data",
+                "--azure-endpoint",
+                endpoint,
+            ]));
+            for (flag, err) in [("--gcs-endpoint", gcs), ("--azure-endpoint", azure)] {
+                assert!(!err.contains("secret"), "{flag} {endpoint}: {err}");
+                assert!(
+                    err.contains(flag) && err.contains("userinfo"),
+                    "{flag} {endpoint}: {err}"
+                );
+            }
+        }
+    }
+
+    /// The other endpoint refusals print the endpoint with any userinfo
+    /// removed, and leave one without userinfo as written.
+    #[test]
+    fn endpoint_without_userinfo_strips_only_the_userinfo() {
+        assert_eq!(
+            endpoint_without_userinfo("http://user:secret@remote.example/a@b"),
+            "http://remote.example/a@b"
+        );
+        assert_eq!(
+            endpoint_without_userinfo("user:secret@remote.example"),
+            "remote.example"
+        );
+        assert_eq!(
+            endpoint_without_userinfo("http://remote.example/a@b?c=@d#@e"),
+            "http://remote.example/a@b?c=@d#@e"
+        );
+        assert_eq!(
+            endpoint_without_userinfo("http://remote.example?x=@localhost"),
+            "http://remote.example?x=@localhost"
         );
     }
 
