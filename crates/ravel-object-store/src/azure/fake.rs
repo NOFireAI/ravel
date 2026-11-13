@@ -347,7 +347,8 @@ impl FakeAzure {
 
     /// Whether a GET or HEAD with `If-Match` on an absent blob is 412
     /// `ConditionNotMet`, as Azurite answers, rather than 404 `BlobNotFound`,
-    /// as Azure does.
+    /// as Azure answered a GET (measured 2026-11-12, P8; a HEAD was not
+    /// measured).
     pub fn set_if_match_on_absent_is_412(&self, on: bool) {
         self.inner
             .if_match_on_absent_is_412

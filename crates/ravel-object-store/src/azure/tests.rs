@@ -322,8 +322,9 @@ enum PinnedFate {
 
 /// A pinned read that meets a 412 asks once more, with a HEAD that drops the
 /// `If-Match`: Azurite answers `If-Match` on an absent key with 412 where
-/// Azure answers 404, and only that HEAD tells a gone key from a replaced
-/// one. Every case runs with the fake answering as Azure and as Azurite.
+/// Azure answered a GET with 404 (measured 2026-11-12, P8; a HEAD was not
+/// measured), and only that HEAD tells a gone key from a replaced one. Every
+/// case runs with the fake answering 404 and answering 412.
 #[tokio::test]
 async fn a_pinned_read_tells_a_gone_key_from_a_replaced_one() {
     for azurite in [false, true] {
@@ -401,6 +402,72 @@ async fn a_pinned_read_tells_a_gone_key_from_a_replaced_one() {
                     assert_eq!(settle.header("if-match"), None, "{case}");
                 }
             }
+        }
+    }
+}
+
+/// The HEAD that settles a pinned 412 reports its own failure as it is: only
+/// a 404 `BlobNotFound` from it is `NotFound` and only a success is
+/// `PreconditionFailed`.
+#[tokio::test]
+async fn a_failed_settling_head_is_returned_as_it_is() {
+    for range in [GetRange::Full, GetRange::Range(1, 4), GetRange::Suffix(3)] {
+        for (status, code) in [
+            (503, "ServerBusy"),
+            (403, "AuthorizationFailure"),
+            (404, "ContainerNotFound"),
+        ] {
+            let case = format!("{range:?}, {status} {code}");
+            let fake = fake().await;
+            fake.set_if_match_on_absent_is_412(true);
+            let store = store(&fake).await;
+            store
+                .put(
+                    "s/k",
+                    Bytes::from_static(b"0123456789"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put");
+            let (_, pin) = store.pin_of("s/k").await.expect("pin_of");
+            fake.clear_requests();
+            // The pinned request meets the 412 the fake gives an absent key in
+            // this mode (queued, so the queue reaches the settling HEAD next);
+            // every attempt of that HEAD then fails.
+            fake.fail_next_with_code(412, "ConditionNotMet", 1);
+            let attempts = if status == 503 { 3 } else { 1 };
+            fake.fail_next_with_code(status, code, attempts);
+
+            let read = store.get_pinned("s/never", range, &pin).await;
+
+            match (status, &read) {
+                (503, Err(e)) => assert!(e.is_retryable(), "{case}: {read:?}"),
+                (403, Err(StoreError::AccessDenied(_))) => {}
+                (404, Err(StoreError::Permanent(message))) => {
+                    assert!(message.contains("ContainerNotFound"), "{case}: {message}");
+                }
+                _ => panic!("{case}: {read:?}"),
+            }
+            let requests = blob_requests(&fake, "s/never");
+            assert_eq!(
+                requests[0].header("if-match"),
+                Some(pin.etag.as_str()),
+                "{case}"
+            );
+            assert!(
+                requests[1..]
+                    .iter()
+                    .all(|r| r.method == "HEAD" && r.header("if-match").is_none()),
+                "{case}: {:?}",
+                methods(&requests)
+            );
+            assert_eq!(
+                requests.len(),
+                1 + attempts,
+                "{case}: {:?}",
+                methods(&requests)
+            );
+            assert_eq!(fake.requests().len(), requests.len(), "{case}");
         }
     }
 }
@@ -672,51 +739,87 @@ async fn error_rows_follow_the_adr() {
 }
 
 #[tokio::test]
-async fn a_lease_conflict_is_permanent_on_every_put_mode_and_on_delete() {
+async fn a_lease_conflict_is_already_exists_on_a_create_and_permanent_elsewhere() {
     let fake = fake().await;
     let store = store(&fake).await;
     let live = store
         .put("l/k", Bytes::from_static(b"x"), PutOptions::default())
         .await
         .expect("put");
-    let modes = [
-        ("create", create()),
-        ("cas", cas(&live.version)),
-        ("overwrite", PutOptions::default()),
-    ];
     for (status, code) in [
         (412, "LeaseIdMissing"),
         (412, "LeaseIdMismatchWithBlobOperation"),
         (409, "LeaseAlreadyPresent"),
     ] {
-        for (name, opts) in &modes {
-            fake.fail_next_with_code(status, code, 1);
-            fake.clear_requests();
-            let put = store
-                .put("l/k", Bytes::from_static(b"y"), opts.clone())
-                .await;
-            match put {
-                Err(StoreError::Permanent(message)) => {
-                    assert!(message.contains(code), "{status} {code} {name}: {message}");
-                }
-                other => panic!("{status} {code} {name}: {other:?}"),
+        let leased = |what: &str, outcome: &Result<_, StoreError>| match outcome {
+            Err(StoreError::Permanent(message)) => {
+                assert!(message.contains(code), "{status} {code} {what}: {message}");
+                assert!(
+                    message.contains("the blob is leased"),
+                    "{status} {code} {what}: {message}"
+                );
             }
-            assert_eq!(
-                methods(&blob_requests(&fake, "l/k")),
-                ["PUT"],
-                "{status} {code} {name}: no settle, no retry"
-            );
-        }
+            other => panic!("{status} {code} {what}: {other:?}"),
+        };
+
+        // A lease exists only on an existing blob: the create lost to it.
+        fake.fail_next_with_code(status, code, 1);
+        fake.clear_requests();
+        let put = store.put("l/k", Bytes::from_static(b"y"), create()).await;
+        assert!(
+            matches!(put, Err(StoreError::AlreadyExists)),
+            "{status} {code} create: {put:?}"
+        );
+        assert_eq!(
+            methods(&blob_requests(&fake, "l/k")),
+            ["PUT"],
+            "{status} {code} create: no settle, no retry"
+        );
+
+        fake.fail_next_with_code(status, code, 1);
+        fake.clear_requests();
+        let put = store
+            .put("l/k", Bytes::from_static(b"y"), cas(&live.version))
+            .await
+            .map(|_| ());
+        leased("cas", &put);
+        assert_eq!(methods(&blob_requests(&fake, "l/k")), ["PUT"], "{code} cas");
+
+        fake.fail_next_with_code(status, code, 1);
+        fake.clear_requests();
+        let put = store
+            .put("l/k", Bytes::from_static(b"y"), PutOptions::default())
+            .await
+            .map(|_| ());
+        leased("overwrite", &put);
+        assert_eq!(
+            methods(&blob_requests(&fake, "l/k")),
+            ["PUT"],
+            "{code} overwrite"
+        );
+
         fake.fail_next_with_code(status, code, 1);
         fake.clear_requests();
         let delete = store.delete("l/k").await;
-        match delete {
-            Err(StoreError::Permanent(message)) => {
-                assert!(message.contains(code), "{status} {code} delete: {message}");
-            }
-            other => panic!("{status} {code} delete: {other:?}"),
-        }
+        leased("delete", &delete);
         assert_eq!(methods(&blob_requests(&fake, "l/k")), ["DELETE"]);
+
+        let mut upload = store.put_multipart("l/k").await.expect("open");
+        fake.fail_next_with_code(status, code, 1);
+        let part = upload
+            .put_part(Bytes::from_static(b"part"), None)
+            .await
+            .map(|_| ());
+        leased("put_part", &part);
+
+        let mut upload = store.put_multipart("l/k").await.expect("open");
+        upload
+            .put_part(Bytes::from_static(b"part"), None)
+            .await
+            .expect("part");
+        fake.fail_next_with_code(status, code, 1);
+        let complete = upload.complete().await.map(|_| ());
+        leased("complete", &complete);
     }
 
     // A 412 with any other code keeps its meaning.
@@ -1564,6 +1667,17 @@ async fn container_not_found_during_a_multipart_upload_is_permanent() {
         "{complete:?}"
     );
 
+    // Any 409 during an upload is Permanent, never AlreadyExists.
+    let mut upload = store.put_multipart("u/k").await.expect("open");
+    fake.fail_next_with_code(409, "SnapshotsPresent", 1);
+    let part = upload.put_part(Bytes::from_static(b"only"), None).await;
+    match part {
+        Err(StoreError::Permanent(message)) => {
+            assert!(message.contains("SnapshotsPresent"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+
     // A 404 without that code during an upload is still NotFound.
     let mut upload = store.put_multipart("u/k").await.expect("open");
     fake.fail_next_with_code(404, "BlobNotFound", 1);
@@ -1649,6 +1763,8 @@ fn the_store_authority_is_the_endpoints_host_and_port() {
         ("https://host.example:443/acct", "host.example"),
         ("HTTPS://host.example:443", "host.example"),
         ("http://127.0.0.1:80/acct", "127.0.0.1"),
+        ("http://127.0.0.1:080/acct", "127.0.0.1"),
+        ("https://host.example:0443", "host.example"),
         ("http://[::1]:80/acct", "[::1]"),
         ("https://host.example:80/acct", "host.example:80"),
         ("http://host.example:443/acct", "host.example:443"),

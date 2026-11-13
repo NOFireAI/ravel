@@ -1121,9 +1121,12 @@ present is `AlreadyExists`, absent is `Transient`. `CasVersion(v)` sends
 `If-Match: v` and maps a 412, and a 404, to `PreconditionFailed`.
 `Overwrite` sends no precondition. A leased blob answers a write with a 412
 (or a 409) whose error code starts with `Lease` (`LeaseIdMissing` and its
-family); that is `Permanent` in every put mode and on `delete`, never
-`AlreadyExists` or `PreconditionFailed`, since `AzureStore` takes no lease
-that could clear it.
+family). A lease is held only on a blob that exists, so under
+`CreateIfAbsent` that answer is `AlreadyExists`, the create having lost to
+an existing object. Under `CasVersion` and `Overwrite`, on `delete`, and on
+a multipart upload's `put_part` and `complete` it is `Permanent`, never
+`PreconditionFailed`, since `AzureStore` takes no lease that could clear
+it.
 
 `Full` is one GET and `Range` one ranged GET. **A suffix read costs two
 requests.** Azure answers a suffix range (`bytes=-n`) with 200 and the whole
@@ -1136,9 +1139,14 @@ suffix of one version of the blob. A zero-length blob is `InvalidRange`. A
 pinned suffix read sends the pin's ETag, and its `versionid` when it has one,
 on the HEAD and on the GET, with no retry. A 412 on any pinned read (`Full`,
 `Range` or `Suffix`) is settled by one more HEAD that keeps the `versionid`
-and drops the `If-Match`: a 404 is `NotFound`, any other answer
-`PreconditionFailed`. Azure answers `If-Match` on an absent key with 404,
-which needs no settling; Azurite 3.35.0 answers 412 (measured 2026-11-13).
+and drops the `If-Match`: a 404 `BlobNotFound` is `NotFound`, a success
+`PreconditionFailed`, and any other failure of that HEAD is returned as it
+is (`Throttled`, `Timeout` and `Transient` stay retryable, `AccessDenied`
+stays `AccessDenied`, a 404 `ContainerNotFound` stays `Permanent`). Azure
+answered a GET with `If-Match` on an absent key with 404 `BlobNotFound`
+(ADR-4158, measured 2026-11-12, P8), which needs no settling; a HEAD with
+`If-Match` on an absent key was not measured on Azure. Azurite 3.35.0
+answers 412 (measured 2026-11-13).
 The connector counts every request as an attempt; `StoreMetrics` counts one
 `get` call.
 
@@ -1191,7 +1199,9 @@ upload" hold unchanged; the completed version is the Put Block List
 response's ETag. Nothing is visible before `complete`. `abort` sends
 nothing: Azure has no abort call and discards uncommitted blocks itself
 after seven days (ADR-4158 D1), so no lifecycle rule is needed for them.
-`complete` is unconditional, as on S3.
+`complete` is unconditional, as on S3. On `put_part` and `complete` a 404
+`ContainerNotFound`, any 409, and a 412 whose code starts with `Lease` are
+`Permanent`; any other error maps as an `Overwrite` put's does.
 
 `AzureStore` has no upload checksums (`upload_checksum: false`; a caller's
 CRC32C is still checked against the buffer before the request, and is not
