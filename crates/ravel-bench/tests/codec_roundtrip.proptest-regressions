@@ -9,3 +9,4 @@ cc 81b4fb83a48e7e1b1a8cb4bd20c044979f6539f6765c0239840aa1cb82c0c77f # shrinks to
 cc a8c28f256e19a8687e82d123031dad7bc66c2f642f8ab676ae1a4cd93a012088 # shrinks to seeds = [1]
 cc bb80f26211aee3070a2784e1701aae00b2b892f40562b966bd1cfb30998efc7b # shrinks to values = [5e-324]
 cc 2ea30bf8e8f0ad96dfd6a4130f342c922db59bc7cbfe6a14b2ded99ebef3466c # shrinks to start = 0, steps = [0, 0, 0, 0, 0, 0, 0], places = 0, specials = [(Index(0), -0.0)]
+cc d7555019b5ac7ab1d76ffeb6048268e2ed1e3862ca4936185da733a6c4bc5937 # shrinks to values = [-3.8787759627728398]
