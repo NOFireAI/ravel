@@ -14,7 +14,7 @@
 
 use ravel_promql::Evaluator;
 use ravel_promql::histogram::{
-    CUSTOM_BUCKETS_SCALE, FloatHistogram, ResetHint, Span, histogram_quantile,
+    CUSTOM_BUCKETS_SCALE, FloatHistogram, ResetHint, Span, histogram_quantile, sum_histograms,
 };
 use ravel_promql::testsource::TestSource;
 
@@ -693,11 +693,13 @@ fn one_reset_per_hour(fx: &Fixture, w: Window) -> bool {
 /// Compares the combination with the evaluator on every fixture and window
 /// where `holds` says the row's condition holds. Returns the number of windows
 /// that produced a value, after asserting every fixture had at least one
-/// window compared.
+/// window where the evaluator produced one. `absent_over_time` is the
+/// exception: it produces a value only for an empty window, so its per-fixture
+/// gate counts every comparison and its test pins the total instead.
 fn assert_float_row_exact(f: Float, holds: impl Fn(&Fixture, Window) -> bool) -> usize {
     let mut produced = 0;
     for fx in float_fixtures() {
-        let mut compared = 0;
+        let mut covered = 0;
         for &w in WINDOWS {
             if !holds(&fx, w) {
                 continue;
@@ -709,12 +711,14 @@ fn assert_float_row_exact(f: Float, holds: impl Fn(&Fixture, Window) -> bool) ->
                 "{f:?} on {} over {}: combined {got:x?}, evaluator {expected:x?}",
                 fx.name, w.label
             );
-            compared += 1;
             if expected.is_some() {
                 produced += 1;
             }
+            if expected.is_some() || f == Float::Absent {
+                covered += 1;
+            }
         }
-        assert!(compared > 0, "{f:?}: no window compared on {}", fx.name);
+        assert!(covered > 0, "{f:?}: no window produced a value on {}", fx.name);
     }
     produced
 }
@@ -1341,24 +1345,72 @@ fn hist(scale: i32, first_index: i32, counts: &[f64], sum: f64) -> FloatHistogra
     }
 }
 
+const CUSTOM_BOUNDS: [f64; 3] = [0.5, 1.0, 2.0];
+
+/// A custom-bucket (schema -53) histogram with `bounds` as its custom values.
+fn custom(bounds: &[f64], counts: &[f64], sum: f64) -> FloatHistogram {
+    FloatHistogram {
+        scale: CUSTOM_BUCKETS_SCALE,
+        custom_values: bounds.to_vec(),
+        ..hist(0, 0, counts, sum)
+    }
+}
+
+/// Which matrix rows a fixture belongs to: the exponential-schema rows, or the
+/// custom-bucket rows (which also take the windows that mix the two).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Exponential,
+    Custom,
+}
+
 struct HistFixture {
     name: &'static str,
+    kind: Kind,
     samples: Vec<(i64, FloatHistogram)>,
+    /// Float staleness markers on the same series. The evaluator's histogram
+    /// selection reads only the histogram samples, so no row reads them.
+    markers: Vec<i64>,
+}
+
+/// The `resets` float fixture's layout without its 90m sample: one reset
+/// inside each of (0m,60m] and (60m,120m], one across the 60m boundary.
+fn staleness_layout(make: impl Fn(f64) -> FloatHistogram) -> Vec<(i64, FloatHistogram)> {
+    [
+        (10, 10.1),
+        (20, 20.2),
+        (30, 5.3),
+        (45, 15.4),
+        (60, 25.7),
+        (75, 3.3),
+        (110, 23.1),
+        (120, 2.2),
+        (130, 12.7),
+        (150, 22.9),
+        (170, 33.1),
+    ]
+    .into_iter()
+    .map(|(m, v)| (m * MIN_NS, make(v)))
+    .collect()
 }
 
 fn hist_fixtures() -> Vec<HistFixture> {
-    let two_resets = |counts: fn(f64) -> Vec<f64>| -> Vec<(i64, FloatHistogram)> {
+    let two_resets = |make: &dyn Fn(f64) -> FloatHistogram| -> Vec<(i64, FloatHistogram)> {
         two_resets_samples()
             .into_iter()
-            .map(|(ts, c)| (ts, hist(0, 1, &counts(c), c)))
+            .map(|(ts, c)| (ts, make(c)))
             .collect()
     };
+    // (85m,95m] holds the 90m marker and nothing else.
+    let markers = vec![40 * MIN_NS, 90 * MIN_NS];
+    let other_bounds = [0.5, 1.0, 4.0];
     vec![
         HistFixture {
             // Scale 1 -> 0 inside (0m,60m] (a decrease, not a reset), 0 -> 1
             // across the 60m boundary (a reset), a bucket reset inside
             // (60m,120m], 1 -> 0 across 120m; NaN sums with two payloads.
             name: "hist_schema_change",
+            kind: Kind::Exponential,
             samples: vec![
                 (10 * MIN_NS, hist(1, 1, &[1.0, 1.0, 1.0, 1.0], 4.0)),
                 (30 * MIN_NS, hist(1, 1, &[2.0, 2.0, 2.0, 2.0], 8.5)),
@@ -1372,18 +1424,103 @@ fn hist_fixtures() -> Vec<HistFixture> {
                 (150 * MIN_NS, hist(0, 1, &[7.0, 7.0], 15.5)),
                 (170 * MIN_NS, hist(0, 1, &[9.0, 9.0], nan_b())),
             ],
+            markers: Vec::new(),
         },
         HistFixture {
             // Two bucket resets inside (0m,60m], buckets [c, c].
             name: "hist_two_resets_one_hour",
-            samples: two_resets(|c| vec![c, c]),
+            kind: Kind::Exponential,
+            samples: two_resets(&|c| hist(0, 1, &[c, c], c)),
+            markers: Vec::new(),
         },
         HistFixture {
             // The same resets, buckets [c, c, 1.0].
             name: "hist_two_resets_one_hour_offset",
-            samples: two_resets(|c| vec![c, c, 1.0]),
+            kind: Kind::Exponential,
+            samples: two_resets(&|c| hist(0, 1, &[c, c, 1.0], c)),
+            markers: Vec::new(),
+        },
+        HistFixture {
+            name: "hist_staleness",
+            kind: Kind::Exponential,
+            samples: staleness_layout(|v| hist(0, 1, &[v, v / 2.0, 0.1], v * 0.75)),
+            markers: markers.clone(),
+        },
+        HistFixture {
+            // `hist_staleness` with custom buckets.
+            name: "hist_custom_buckets",
+            kind: Kind::Custom,
+            samples: staleness_layout(|v| custom(&CUSTOM_BOUNDS, &[v, v / 2.0, 0.1], v * 0.75)),
+            markers,
+        },
+        HistFixture {
+            // `hist_two_resets_one_hour` with custom buckets.
+            name: "hist_custom_two_resets_one_hour",
+            kind: Kind::Custom,
+            samples: two_resets(&|c| custom(&CUSTOM_BOUNDS, &[c, c], c)),
+            markers: Vec::new(),
+        },
+        HistFixture {
+            // A custom-bucket histogram at 50m between exponential ones.
+            name: "hist_custom_beside_exponential",
+            kind: Kind::Custom,
+            samples: vec![
+                (10 * MIN_NS, hist(0, 1, &[1.0, 1.0], 2.0)),
+                (30 * MIN_NS, hist(0, 1, &[2.0, 2.0], 4.5)),
+                (50 * MIN_NS, custom(&[1.0, 2.0], &[3.0, 3.0], 6.0)),
+                (70 * MIN_NS, hist(0, 1, &[4.0, 4.0], 9.0)),
+                (90 * MIN_NS, hist(0, 1, &[5.0, 5.0], 11.5)),
+            ],
+            markers: Vec::new(),
+        },
+        HistFixture {
+            // The custom bounds change between 70m and 90m.
+            name: "hist_custom_bounds_change",
+            kind: Kind::Custom,
+            samples: [(10, 1.0), (30, 2.0), (50, 3.0), (70, 4.0)]
+                .into_iter()
+                .map(|(m, v)| (m, custom(&CUSTOM_BOUNDS, &[v, v / 2.0], v * 1.25)))
+                .chain(
+                    [(90, 5.0), (110, 6.0), (130, 7.0)]
+                        .into_iter()
+                        .map(|(m, v)| (m, custom(&other_bounds, &[v, v / 2.0], v * 1.25))),
+                )
+                .map(|(m, h)| (m * MIN_NS, h))
+                .collect(),
+            markers: Vec::new(),
         },
     ]
+}
+
+fn hist_fixture(name: &str) -> HistFixture {
+    hist_fixtures()
+        .into_iter()
+        .find(|f| f.name == name)
+        .expect("known fixture")
+}
+
+/// The schema family of a run of histograms: exponential, custom with one set
+/// of bounds (compared by bit pattern, as `custom_bounds_match` does), or a
+/// mix of either. `histogram_rate` returns no value for a mixed window.
+#[derive(Clone, Debug, PartialEq)]
+enum Family {
+    Exponential,
+    Custom(Vec<u64>),
+    Mixed,
+}
+
+impl Family {
+    fn of(h: &FloatHistogram) -> Family {
+        if h.uses_custom_buckets() {
+            Family::Custom(h.custom_values.iter().map(|v| v.to_bits()).collect())
+        } else {
+            Family::Exponential
+        }
+    }
+
+    fn join(self, other: Family) -> Family {
+        if self == other { self } else { Family::Mixed }
+    }
 }
 
 /// Per-hour statistic for the native-histogram rows.
@@ -1391,8 +1528,14 @@ struct HistHour {
     n: usize,
     first: (i64, FloatHistogram),
     last: (i64, FloatHistogram),
+    /// The sample before `last`, when the hour holds two or more.
+    before_last: Option<(i64, FloatHistogram)>,
     min_scale: i32,
+    family: Family,
+    /// Adjacent pairs inside the hour that `detect_reset` calls a reset.
     resets: usize,
+    /// Adjacent pairs inside the hour that are not `equals`.
+    changes: usize,
     /// The earlier histogram of every in-hour reset pair, summed in time order.
     correction: Option<FloatHistogram>,
 }
@@ -1400,9 +1543,13 @@ struct HistHour {
 impl HistHour {
     fn of(seg: &[(i64, FloatHistogram)]) -> HistHour {
         let mut resets = 0;
+        let mut changes = 0;
         let mut correction: Option<FloatHistogram> = None;
         for pair in seg.windows(2) {
             let prev = &pair[0].1;
+            if !pair[1].1.equals(prev) {
+                changes += 1;
+            }
             if pair[1].1.detect_reset(prev) {
                 resets += 1;
                 correction = Some(match correction {
@@ -1420,8 +1567,15 @@ impl HistHour {
             n: seg.len(),
             first: seg[0].clone(),
             last: seg[seg.len() - 1].clone(),
+            before_last: seg.len().checked_sub(2).map(|i| seg[i].clone()),
             min_scale: seg.iter().map(|(_, h)| h.scale).min().unwrap_or(i32::MAX),
+            family: seg
+                .iter()
+                .map(|(_, h)| Family::of(h))
+                .reduce(Family::join)
+                .expect("non-empty segment"),
             resets,
+            changes,
             correction,
         }
     }
@@ -1432,23 +1586,89 @@ enum Hist {
     Count,
     Sum,
     Quantile,
+    Delta,
+    Irate,
+    Idelta,
+    Resets,
+    Changes,
+    CountOverTime,
+    PresentOverTime,
+    AbsentOverTime,
+    LastOverTime,
 }
 
 impl Hist {
     fn query(self, w: Window) -> String {
-        match self {
-            Hist::Count => format!("histogram_count(increase(h[{}m]))", w.range_min),
-            Hist::Sum => format!("histogram_sum(rate(h[{}m]))", w.range_min),
-            Hist::Quantile => format!("histogram_quantile(0.9, rate(h[{}m]))", w.range_min),
+        let name = match self {
+            Hist::Count => return format!("histogram_count(increase(h[{}m]))", w.range_min),
+            Hist::Sum => return format!("histogram_sum(rate(h[{}m]))", w.range_min),
+            Hist::Quantile => {
+                return format!("histogram_quantile(0.9, rate(h[{}m]))", w.range_min);
+            }
+            Hist::Delta => "delta",
+            Hist::Irate => "irate",
+            Hist::Idelta => "idelta",
+            Hist::Resets => "resets",
+            Hist::Changes => "changes",
+            Hist::CountOverTime => "count_over_time",
+            Hist::PresentOverTime => "present_over_time",
+            Hist::AbsentOverTime => "absent_over_time",
+            Hist::LastOverTime => "last_over_time",
+        };
+        format!("{name}(h[{}m])", w.range_min)
+    }
+}
+
+/// Every field of a histogram result, floats by bit pattern.
+#[derive(Debug, PartialEq)]
+struct HistBits {
+    counter_reset_hint: ResetHint,
+    scale: i32,
+    zero_threshold: u64,
+    zero_count: u64,
+    count: u64,
+    sum: u64,
+    positive_spans: Vec<Span>,
+    negative_spans: Vec<Span>,
+    positive_buckets: Vec<u64>,
+    negative_buckets: Vec<u64>,
+    custom_values: Vec<u64>,
+}
+
+impl HistBits {
+    fn of(h: &FloatHistogram) -> HistBits {
+        let all = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect();
+        HistBits {
+            counter_reset_hint: h.counter_reset_hint,
+            scale: h.scale,
+            zero_threshold: h.zero_threshold.to_bits(),
+            zero_count: h.zero_count.to_bits(),
+            count: h.count.to_bits(),
+            sum: h.sum.to_bits(),
+            positive_spans: h.positive_spans.clone(),
+            negative_spans: h.negative_spans.clone(),
+            positive_buckets: all(&h.positive_buckets),
+            negative_buckets: all(&h.negative_buckets),
+            custom_values: all(&h.custom_values),
         }
     }
+}
 
-    fn read(self, h: &FloatHistogram) -> f64 {
-        match self {
-            Hist::Count => h.observation_count(),
-            Hist::Sum => h.observation_sum(),
-            Hist::Quantile => histogram_quantile(0.9, h),
-        }
+/// One instant result element: a float or a native histogram.
+#[derive(Debug, PartialEq)]
+enum Out {
+    Float(u64),
+    Hist(HistBits),
+}
+
+fn float_out(v: f64) -> Out {
+    Out::Float(v.to_bits())
+}
+
+fn float_bits(out: Option<Out>) -> u64 {
+    match out {
+        Some(Out::Float(b)) => b,
+        other => panic!("expected a float result, got {other:?}"),
     }
 }
 
@@ -1469,17 +1689,104 @@ fn add_to(total: Option<FloatHistogram>, h: FloatHistogram) -> FloatHistogram {
     }
 }
 
+fn combine_hist(f: Hist, hours: &[HistHour], w: Window, how: Combine) -> Option<Out> {
+    if f == Hist::AbsentOverTime {
+        return hours.is_empty().then(|| float_out(1.0));
+    }
+    let last_hour = hours.last()?;
+    match f {
+        Hist::CountOverTime => Some(float_out(
+            hours.iter().map(|h| h.n).sum::<usize>() as f64
+        )),
+        Hist::PresentOverTime => Some(float_out(1.0)),
+        Hist::LastOverTime => Some(Out::Hist(HistBits::of(&last_hour.last.1))),
+        Hist::Resets | Hist::Changes => {
+            let mut total = 0;
+            for (k, h) in hours.iter().enumerate() {
+                total += if f == Hist::Resets {
+                    h.resets
+                } else {
+                    h.changes
+                };
+                if k == 0 {
+                    continue;
+                }
+                let (a, b) = (&hours[k - 1].last.1, &h.first.1);
+                let counted = if f == Hist::Resets {
+                    b.detect_reset(a)
+                } else {
+                    !b.equals(a)
+                };
+                if counted {
+                    total += 1;
+                }
+            }
+            Some(float_out(total as f64))
+        }
+        Hist::Irate | Hist::Idelta => {
+            let previous = match &last_hour.before_last {
+                Some(p) => p,
+                None => &hours.get(hours.len().checked_sub(2)?)?.last,
+            };
+            instant_hist(previous, &last_hour.last, f == Hist::Irate)
+                .map(|h| Out::Hist(HistBits::of(&h)))
+        }
+        _ => windowed_rate(f, hours, w, how),
+    }
+}
+
+/// `instant_value_hist` (`functions/rate.rs`) over the window's last two
+/// histograms.
+fn instant_hist(
+    previous: &(i64, FloatHistogram),
+    last: &(i64, FloatHistogram),
+    is_rate: bool,
+) -> Option<FloatHistogram> {
+    let interval_ns = last.0 - previous.0;
+    if interval_ns == 0 {
+        return None;
+    }
+    let (previous, last) = (&previous.1, &last.1);
+    let mismatch = previous.uses_custom_buckets() != last.uses_custom_buckets();
+    if mismatch && !is_rate {
+        return None;
+    }
+    if !mismatch && last.uses_custom_buckets() && !last.custom_bounds_match(previous) {
+        return None;
+    }
+    let mut result = last.clone();
+    if !(is_rate && (mismatch || last.detect_reset(previous))) {
+        let scale = previous.scale.min(last.scale);
+        result = result.copy_to_scale(scale);
+        result.sub_assign(&previous.copy_to_scale(scale));
+    }
+    result.counter_reset_hint = ResetHint::Gauge;
+    if is_rate {
+        result.div(ns_to_seconds(interval_ns));
+    }
+    Some(result)
+}
+
 /// The windowed reduction of `histogram_rate` plus the extrapolation factor of
-/// `histogram_extrapolated_rate`, rebuilt from the hour statistics. `how` is
-/// `Exact`, or one of the two forms of mutant (a): `Reassociate` (telescoped)
-/// or `CorrectionsOnce`.
-fn combine_hist(f: Hist, hours: &[HistHour], w: Window, how: Combine) -> Option<f64> {
+/// `histogram_extrapolated_rate`, rebuilt from the hour statistics, for
+/// `delta` and the three `rate`/`increase` rows. `how` is `Exact`, or one of
+/// the two forms of mutant (a): `Reassociate` (telescoped) or
+/// `CorrectionsOnce`.
+fn windowed_rate(f: Hist, hours: &[HistHour], w: Window, how: Combine) -> Option<Out> {
     let first = &hours.first()?.first;
     let last = &hours.last()?.last;
     let n: usize = hours.iter().map(|h| h.n).sum();
     if n < 2 || ns_to_seconds(last.0 - first.0) == 0.0 {
         return None;
     }
+    let family = hours
+        .iter()
+        .map(|h| h.family.clone())
+        .reduce(Family::join)?;
+    if family == Family::Mixed {
+        return None;
+    }
+    let is_counter = f != Hist::Delta;
     let scale = hours.iter().map(|h| h.min_scale).min()?;
     let mut reduced = if how == Combine::Reassociate {
         telescoped_hist(hours, scale)?
@@ -1488,6 +1795,9 @@ fn combine_hist(f: Hist, hours: &[HistHour], w: Window, how: Combine) -> Option<
         reduced.sub_assign(&first.1.copy_to_scale(scale));
         let mut once: Option<FloatHistogram> = None;
         for (k, h) in hours.iter().enumerate() {
+            if !is_counter {
+                break;
+            }
             let boundary = (k > 0 && h.first.1.detect_reset(&hours[k - 1].last.1))
                 .then(|| hours[k - 1].last.1.copy_to_scale(scale));
             let in_hour = h.correction.as_ref().map(|c| c.copy_to_scale(scale));
@@ -1505,8 +1815,14 @@ fn combine_hist(f: Hist, hours: &[HistHour], w: Window, how: Combine) -> Option<
         reduced
     };
     reduced.counter_reset_hint = ResetHint::Gauge;
-    reduced.mul(histogram_factor(first.0, last.0, n, w, f != Hist::Count));
-    Some(f.read(&reduced))
+    let is_rate = matches!(f, Hist::Sum | Hist::Quantile);
+    reduced.mul(histogram_factor(first.0, last.0, n, w, is_rate));
+    Some(match f {
+        Hist::Count => float_out(reduced.observation_count()),
+        Hist::Sum => float_out(reduced.observation_sum()),
+        Hist::Quantile => float_out(histogram_quantile(0.9, &reduced)),
+        _ => Out::Hist(HistBits::of(&reduced)),
+    })
 }
 
 /// Mutant (a) for the histogram rows: each hour's own increase plus the gap
@@ -1534,80 +1850,271 @@ fn telescoped_hist(hours: &[HistHour], scale: i32) -> Option<FloatHistogram> {
     total
 }
 
-fn eval_hist(fx: &HistFixture, f: Hist, w: Window) -> Option<f64> {
-    let source = TestSource::new()
+fn eval_hist_query(fx: &HistFixture, query: &str, w: Window) -> Vec<ravel_promql::InstantSample> {
+    let mut source = TestSource::new()
         .with_histogram_series(&[("__name__", "h")], &fx.samples)
         .expect("valid series");
-    let result = Evaluator::new()
-        .instant(&source, &f.query(w), w.eval_ms())
-        .expect("evaluates");
-    assert!(result.len() <= 1);
-    result.first().map(|s| s.value)
+    if !fx.markers.is_empty() {
+        let markers: Vec<(i64, f64)> = fx.markers.iter().map(|&ts| (ts, stale())).collect();
+        source = source
+            .with_series(&[("__name__", "h")], &markers)
+            .expect("valid series");
+    }
+    Evaluator::new()
+        .instant(&source, query, w.eval_ms())
+        .expect("evaluates")
 }
 
-/// The histogram rows' schema condition: every histogram in the window uses an
-/// exponential schema. `histogram_rate` returns `None` for a window mixing
-/// custom and exponential schemas or holding custom bounds that differ, and
-/// `combine_hist` checks neither, so custom-bucket windows are not classified.
-fn exponential_only(fx: &HistFixture, w: Window) -> bool {
-    hour_segments(&fx.samples, w, |_| false, Stale::Drop)
-        .iter()
-        .flatten()
-        .all(|(_, h)| !h.uses_custom_buckets())
+fn eval_hist(fx: &HistFixture, f: Hist, w: Window) -> Option<Out> {
+    let result = eval_hist_query(fx, &f.query(w), w);
+    assert!(result.len() <= 1, "{f:?}: one series in, at most one out");
+    result.first().map(|s| match &s.histogram {
+        Some(h) => Out::Hist(HistBits::of(h)),
+        None => float_out(s.value),
+    })
 }
 
-/// The histogram rows' full condition: exponential schemas only, and at most
-/// one histogram reset inside each hour segment.
-fn hist_condition_holds(fx: &HistFixture, w: Window, hours: &[HistHour]) -> bool {
-    exponential_only(fx, w) && hours.iter().all(|h| h.resets <= 1)
+/// The condition of the `rate`/`increase` rows: at most one histogram reset
+/// inside each hour segment.
+fn one_hist_reset_per_hour(hours: &[HistHour]) -> bool {
+    hours.iter().all(|h| h.resets <= 1)
 }
 
-fn hist_fixture(name: &str) -> HistFixture {
-    hist_fixtures()
-        .into_iter()
-        .find(|f| f.name == name)
-        .expect("known fixture")
+fn every_hour(_: &[HistHour]) -> bool {
+    true
 }
 
-fn assert_hist_row_exact(f: Hist) {
+/// [`assert_float_row_exact`] for the histogram rows of one kind.
+fn assert_hist_row_exact(f: Hist, kind: Kind, holds: impl Fn(&[HistHour]) -> bool) -> usize {
     let mut produced = 0;
-    for fx in hist_fixtures() {
-        let mut compared = 0;
+    for fx in hist_fixtures().into_iter().filter(|fx| fx.kind == kind) {
+        let mut covered = 0;
         for &w in WINDOWS {
             let hours = hist_hours(&fx, w);
-            if !hist_condition_holds(&fx, w, &hours) {
+            if !holds(&hours) {
                 continue;
             }
-            let expected = bits(eval_hist(&fx, f, w));
-            let got = bits(combine_hist(f, &hours, w, Combine::Exact));
+            let expected = eval_hist(&fx, f, w);
+            let got = combine_hist(f, &hours, w, Combine::Exact);
             assert_eq!(
                 got, expected,
-                "{f:?} on {} over {}: combined {got:x?}, evaluator {expected:x?}",
+                "{f:?} on {} over {}: combined, then evaluator",
                 fx.name, w.label
             );
-            compared += 1;
             if expected.is_some() {
                 produced += 1;
             }
+            if expected.is_some() || f == Hist::AbsentOverTime {
+                covered += 1;
+            }
         }
-        assert!(compared > 0, "{f:?}: no window compared on {}", fx.name);
+        assert!(covered > 0, "{f:?}: no window produced a value on {}", fx.name);
     }
-    assert!(produced > 0);
+    produced
 }
 
 #[test]
 fn histogram_count_exact_with_one_reset_per_hour() {
-    assert_hist_row_exact(Hist::Count);
+    assert!(assert_hist_row_exact(Hist::Count, Kind::Exponential, one_hist_reset_per_hour) > 0);
+}
+
+#[test]
+fn histogram_count_custom_buckets_exact_with_one_reset_per_hour() {
+    assert!(assert_hist_row_exact(Hist::Count, Kind::Custom, one_hist_reset_per_hour) > 0);
 }
 
 #[test]
 fn histogram_sum_exact_with_one_reset_per_hour() {
-    assert_hist_row_exact(Hist::Sum);
+    assert!(assert_hist_row_exact(Hist::Sum, Kind::Exponential, one_hist_reset_per_hour) > 0);
+}
+
+#[test]
+fn histogram_sum_custom_buckets_exact_with_one_reset_per_hour() {
+    assert!(assert_hist_row_exact(Hist::Sum, Kind::Custom, one_hist_reset_per_hour) > 0);
 }
 
 #[test]
 fn histogram_quantile_exact_with_one_reset_per_hour() {
-    assert_hist_row_exact(Hist::Quantile);
+    assert!(assert_hist_row_exact(Hist::Quantile, Kind::Exponential, one_hist_reset_per_hour) > 0);
+}
+
+#[test]
+fn histogram_quantile_custom_buckets_exact_with_one_reset_per_hour() {
+    assert!(assert_hist_row_exact(Hist::Quantile, Kind::Custom, one_hist_reset_per_hour) > 0);
+}
+
+#[test]
+fn delta_histogram_exact_from_hour_endpoints() {
+    assert!(assert_hist_row_exact(Hist::Delta, Kind::Exponential, every_hour) > 0);
+}
+
+#[test]
+fn delta_custom_histogram_exact_from_hour_endpoints() {
+    assert!(assert_hist_row_exact(Hist::Delta, Kind::Custom, every_hour) > 0);
+}
+
+#[test]
+fn irate_histogram_exact_from_hour_last_two_samples() {
+    assert!(assert_hist_row_exact(Hist::Irate, Kind::Exponential, every_hour) > 0);
+}
+
+#[test]
+fn irate_custom_histogram_exact_from_hour_last_two_samples() {
+    assert!(assert_hist_row_exact(Hist::Irate, Kind::Custom, every_hour) > 0);
+}
+
+#[test]
+fn idelta_histogram_exact_from_hour_last_two_samples() {
+    assert!(assert_hist_row_exact(Hist::Idelta, Kind::Exponential, every_hour) > 0);
+}
+
+#[test]
+fn idelta_custom_histogram_exact_from_hour_last_two_samples() {
+    assert!(assert_hist_row_exact(Hist::Idelta, Kind::Custom, every_hour) > 0);
+}
+
+#[test]
+fn resets_histogram_exact_from_hour_pairs_and_edges() {
+    assert!(assert_hist_row_exact(Hist::Resets, Kind::Exponential, every_hour) > 0);
+}
+
+#[test]
+fn resets_custom_histogram_exact_from_hour_pairs_and_edges() {
+    assert!(assert_hist_row_exact(Hist::Resets, Kind::Custom, every_hour) > 0);
+}
+
+#[test]
+fn changes_histogram_exact_from_hour_pairs_and_edges() {
+    assert!(assert_hist_row_exact(Hist::Changes, Kind::Exponential, every_hour) > 0);
+}
+
+#[test]
+fn changes_custom_histogram_exact_from_hour_pairs_and_edges() {
+    assert!(assert_hist_row_exact(Hist::Changes, Kind::Custom, every_hour) > 0);
+}
+
+#[test]
+fn count_over_time_histogram_exact_from_hour_counts() {
+    assert!(assert_hist_row_exact(Hist::CountOverTime, Kind::Exponential, every_hour) > 0);
+}
+
+#[test]
+fn count_over_time_custom_histogram_exact_from_hour_counts() {
+    assert!(assert_hist_row_exact(Hist::CountOverTime, Kind::Custom, every_hour) > 0);
+}
+
+#[test]
+fn present_over_time_histogram_exact_from_hour_presence() {
+    assert!(assert_hist_row_exact(Hist::PresentOverTime, Kind::Exponential, every_hour) > 0);
+}
+
+#[test]
+fn present_over_time_custom_histogram_exact_from_hour_presence() {
+    assert!(assert_hist_row_exact(Hist::PresentOverTime, Kind::Custom, every_hour) > 0);
+}
+
+#[test]
+fn absent_over_time_histogram_exact_from_hour_presence() {
+    // The one empty window is `hist_staleness`'s marker-only (85m,95m].
+    assert_eq!(
+        assert_hist_row_exact(Hist::AbsentOverTime, Kind::Exponential, every_hour),
+        1
+    );
+}
+
+#[test]
+fn absent_over_time_custom_histogram_exact_from_hour_presence() {
+    // The one empty window is `hist_custom_buckets`'s marker-only (85m,95m].
+    assert_eq!(
+        assert_hist_row_exact(Hist::AbsentOverTime, Kind::Custom, every_hour),
+        1
+    );
+}
+
+#[test]
+fn last_over_time_histogram_exact_from_hour_last_sample() {
+    assert!(assert_hist_row_exact(Hist::LastOverTime, Kind::Exponential, every_hour) > 0);
+}
+
+#[test]
+fn last_over_time_custom_histogram_exact_from_hour_last_sample() {
+    assert!(assert_hist_row_exact(Hist::LastOverTime, Kind::Custom, every_hour) > 0);
+}
+
+/// The window's histogram sum rebuilt from per-hour sums, and the sample
+/// count.
+fn sum_of_hour_sums(fx: &HistFixture, w: Window) -> (FloatHistogram, usize) {
+    let segments = hour_segments(&fx.samples, w, |_| false, Stale::Drop);
+    let hour_sums: Vec<FloatHistogram> = segments
+        .iter()
+        .map(|seg| sum_histograms(seg.iter().map(|(_, h)| h)).expect("one family per hour"))
+        .collect();
+    let n = segments.iter().map(Vec::len).sum();
+    (sum_histograms(hour_sums.iter()).expect("one family per window"), n)
+}
+
+fn assert_hist_raw_only(fx: &str, query: &str, avg: bool) -> (u64, u64) {
+    let fx = hist_fixture(fx);
+    let w = window("(0m,180m]");
+    let result = eval_hist_query(&fx, query, w);
+    let evaluator = result[0].histogram.clone().expect("a histogram result");
+    let (mut combined, n) = sum_of_hour_sums(&fx, w);
+    if avg {
+        combined.div(n as f64);
+    }
+    // Only the observation sum differs; the bucket layout is the same.
+    assert_eq!(evaluator.positive_spans, combined.positive_spans);
+    (evaluator.sum.to_bits(), combined.sum.to_bits())
+}
+
+#[test]
+fn sum_over_time_histogram_raw_only_hour_sums_differ() {
+    let got = assert_hist_raw_only("hist_staleness", "sum_over_time(h[180m])", false);
+    assert_eq!(got, (0, 0));
+}
+
+#[test]
+fn sum_over_time_custom_histogram_raw_only_hour_sums_differ() {
+    let got = assert_hist_raw_only("hist_custom_buckets", "sum_over_time(h[180m])", false);
+    assert_eq!(got, (0, 0));
+}
+
+#[test]
+fn avg_over_time_histogram_raw_only_hour_sums_differ() {
+    let got = assert_hist_raw_only("hist_staleness", "avg_over_time(h[180m])", true);
+    assert_eq!(got, (0, 0));
+}
+
+#[test]
+fn avg_over_time_custom_histogram_raw_only_hour_sums_differ() {
+    let got = assert_hist_raw_only("hist_custom_buckets", "avg_over_time(h[180m])", true);
+    assert_eq!(got, (0, 0));
+}
+
+#[test]
+fn float_only_range_functions_drop_histogram_windows() {
+    // Every window of every histogram fixture, both kinds: no element and no
+    // error, the `HistOverTime::Drop` arm of `histogram_over_time`.
+    let queries: [fn(Window) -> String; 7] = [
+        |w| format!("min_over_time(h[{}m])", w.range_min),
+        |w| format!("max_over_time(h[{}m])", w.range_min),
+        |w| format!("stddev_over_time(h[{}m])", w.range_min),
+        |w| format!("stdvar_over_time(h[{}m])", w.range_min),
+        |w| format!("quantile_over_time(0.5, h[{}m])", w.range_min),
+        |w| format!("predict_linear(h[{}m], 600)", w.range_min),
+        |w| format!("deriv(h[{}m])", w.range_min),
+    ];
+    let mut kinds = Vec::new();
+    for fx in hist_fixtures() {
+        for &w in WINDOWS {
+            for query in &queries {
+                let q = query(w);
+                assert!(eval_hist_query(&fx, &q, w).is_empty(), "{q} on {}", fx.name);
+            }
+        }
+        kinds.push(fx.kind);
+    }
+    assert!(kinds.contains(&Kind::Exponential) && kinds.contains(&Kind::Custom));
 }
 
 #[test]
@@ -1621,8 +2128,8 @@ fn histogram_rows_condition_fails_on_two_resets_in_one_hour() {
         let hours = hist_hours(&fx, w);
         assert_eq!(hours[0].resets, 2);
         for f in [Hist::Count, Hist::Sum, Hist::Quantile] {
-            let expected = bits(eval_hist(&fx, f, w)).expect("evaluates");
-            let got = bits(combine_hist(f, &hours, w, Combine::Exact)).expect("combines");
+            let expected = float_bits(eval_hist(&fx, f, w));
+            let got = float_bits(combine_hist(f, &hours, w, Combine::Exact));
             found.push((fx.name, f, expected, got));
         }
     }
@@ -1672,45 +2179,50 @@ fn histogram_rows_condition_fails_on_two_resets_in_one_hour() {
 }
 
 #[test]
-fn histogram_rows_raw_only_with_custom_buckets_beside_exponential() {
-    let custom = FloatHistogram {
-        scale: CUSTOM_BUCKETS_SCALE,
-        custom_values: vec![1.0, 2.0],
-        ..hist(0, 0, &[3.0, 3.0], 6.0)
-    };
-    let fx = HistFixture {
-        name: "hist_custom_beside_exponential",
-        samples: vec![
-            (10 * MIN_NS, hist(0, 1, &[1.0, 1.0], 2.0)),
-            (30 * MIN_NS, hist(0, 1, &[2.0, 2.0], 4.5)),
-            (50 * MIN_NS, custom),
-            (70 * MIN_NS, hist(0, 1, &[4.0, 4.0], 9.0)),
-            (90 * MIN_NS, hist(0, 1, &[5.0, 5.0], 11.5)),
-        ],
-    };
-    // The custom-bucket histogram at 50m sits beside exponential ones: the
-    // evaluator returns no value, and the combination is not compared.
-    let mixed = window("(0m,120m]");
-    assert!(!exponential_only(&fx, mixed));
+fn custom_histogram_rows_condition_fails_on_two_resets_in_one_hour() {
+    let fx = hist_fixture("hist_custom_two_resets_one_hour");
+    let w = window("(0m,120m]");
+    let hours = hist_hours(&fx, w);
+    assert_eq!(hours[0].resets, 2);
+    let mut found = Vec::new();
     for f in [Hist::Count, Hist::Sum, Hist::Quantile] {
-        assert_eq!(bits(eval_hist(&fx, f, mixed)), None, "{f:?}");
+        let expected = float_bits(eval_hist(&fx, f, w));
+        let got = float_bits(combine_hist(f, &hours, w, Combine::Exact));
+        found.push((f, expected, got));
     }
-    // Without it, the same series is classified and the combination agrees.
-    let exponential = window("(60m,120m]");
-    assert!(exponential_only(&fx, exponential));
-    for f in [Hist::Count, Hist::Sum, Hist::Quantile] {
-        let expected = bits(eval_hist(&fx, f, exponential));
-        assert!(expected.is_some(), "{f:?}");
-        assert_eq!(
-            bits(combine_hist(
-                f,
-                &hist_hours(&fx, exponential),
-                exponential,
-                Combine::Exact
-            )),
-            expected,
-            "{f:?}"
-        );
+    assert_eq!(found, vec![]);
+}
+
+#[test]
+fn histogram_rows_exact_where_the_window_mixes_schemas_or_bounds() {
+    // `histogram_rate` returns no value for a window that mixes exponential
+    // and custom schemas or holds two custom bound sets; the hour family
+    // statistic gives the combination the same answer.
+    for (fx, mixed, single) in [
+        ("hist_custom_beside_exponential", "(0m,120m]", "(60m,120m]"),
+        ("hist_custom_bounds_change", "(60m,120m]", "(70m,130m]"),
+    ] {
+        let fx = hist_fixture(fx);
+        for (label, want_value) in [(mixed, false), (single, true)] {
+            let w = window(label);
+            let hours = hist_hours(&fx, w);
+            let family = hours
+                .iter()
+                .map(|h| h.family.clone())
+                .reduce(Family::join)
+                .expect("non-empty window");
+            assert_eq!(family == Family::Mixed, !want_value, "{} {label}", fx.name);
+            for f in [Hist::Count, Hist::Sum, Hist::Quantile, Hist::Delta] {
+                let expected = eval_hist(&fx, f, w);
+                assert_eq!(expected.is_some(), want_value, "{f:?} {} {label}", fx.name);
+                assert_eq!(
+                    combine_hist(f, &hours, w, Combine::Exact),
+                    expected,
+                    "{f:?} {} {label}",
+                    fx.name
+                );
+            }
+        }
     }
 }
 
@@ -1721,15 +2233,12 @@ fn histogram_sum_rejects_telescoped_hour_sum() {
     let fx = hist_fixture("hist_schema_change");
     let w = window("(34m,167m]");
     let hours = hist_hours(&fx, w);
-    let expected = bits(eval_hist(&fx, Hist::Sum, w));
-    assert_eq!(expected, Some(0x3f76_24fe_38ca_86e2));
+    let expected = eval_hist(&fx, Hist::Sum, w);
+    assert_eq!(expected, Some(Out::Float(0x3f76_24fe_38ca_86e2)));
+    assert_eq!(combine_hist(Hist::Sum, &hours, w, Combine::Exact), expected);
     assert_eq!(
-        bits(combine_hist(Hist::Sum, &hours, w, Combine::Exact)),
-        expected
-    );
-    assert_eq!(
-        bits(combine_hist(Hist::Sum, &hours, w, Combine::Reassociate)),
-        Some(NAN_A)
+        combine_hist(Hist::Sum, &hours, w, Combine::Reassociate),
+        Some(Out::Float(NAN_A))
     );
 }
 
@@ -1742,13 +2251,13 @@ fn histogram_rows_reassociations_differ_only_through_the_nan_sum() {
     for fx in hist_fixtures() {
         for &w in WINDOWS {
             let hours = hist_hours(&fx, w);
-            if !hist_condition_holds(&fx, w, &hours) {
+            if !one_hist_reset_per_hour(&hours) {
                 continue;
             }
             for f in [Hist::Count, Hist::Sum, Hist::Quantile] {
-                let expected = bits(eval_hist(&fx, f, w));
+                let expected = eval_hist(&fx, f, w);
                 for how in [Combine::Reassociate, Combine::CorrectionsOnce] {
-                    if bits(combine_hist(f, &hours, w, how)) != expected {
+                    if combine_hist(f, &hours, w, how) != expected {
                         disagree.push((fx.name, w.label, f, how));
                     }
                 }
