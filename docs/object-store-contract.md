@@ -1230,9 +1230,12 @@ pinned-read cases and a suffix read raced against overwrites against
 `RAVEL_AZURE_TEST_ACCOUNT` and `RAVEL_AZURE_TEST_CONTAINER` are set
 (`azure_contract`, with ambient credentials). The two gated tests print a
 skip line when unset. The fake answers a suffix range as Azure does, so a
-regression that sends one reads the wrong bytes in a test. No shipped binary
-builds an `AzureStore` yet: `--store azure` in ravel-server, ravel-cli and
-the operator (ADR-4158 D6, D11) is follow-up work.
+regression that sends one reads the wrong bytes in a test. ravel-server
+builds an `AzureStore` for `--store azure`
+(`services/ravel-server/src/store.rs`), and
+`maintain_mode_accepts_the_azure_backend` there pins that maintain mode's
+capability check passes on it. `--store azure` in ravel-cli and the
+operator (ADR-4158 D6, D11) is follow-up work.
 
 ### Credentials
 

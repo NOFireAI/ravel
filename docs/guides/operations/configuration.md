@@ -14,7 +14,7 @@ and [the generated CLI flag reference](../../reference/ravel-cli-flags.md).
 | Task | Section |
 |---|---|
 | Choose which jobs a process runs | [Process modes](#process-modes) |
-| Choose a store and its credentials | [Storage backend and credentials](#storage-backend-and-credentials), [Choosing a credential source](#choosing-a-credential-source), [Google Cloud Storage](#google-cloud-storage) |
+| Choose a store and its credentials | [Storage backend and credentials](#storage-backend-and-credentials), [Choosing a credential source](#choosing-a-credential-source), [Google Cloud Storage](#google-cloud-storage), [Azure Blob Storage](#azure-blob-storage) |
 | Scope a credential to one job | [Storage credential roles](#storage-credential-roles) |
 | Encrypt objects with a KMS key | [Encrypting objects with SSE-KMS](#encrypting-objects-with-sse-kms) |
 | Add tenants and tokens | [Tenancy setup](#tenancy-setup), [Token file](#token-file), [Production authentication](#production-authentication) |
@@ -51,9 +51,10 @@ Read [Maintenance](maintenance.md) before you decide that you do not need a
 
 ## Storage backend and credentials
 
-`--store s3` and `--store gcs` are the durable stores: an S3-compatible
-bucket, or a Google Cloud Storage bucket (see
-[Google Cloud Storage](#google-cloud-storage)). `--store memory` is an
+`--store s3`, `--store gcs` and `--store azure` are the durable stores: an
+S3-compatible bucket, a Google Cloud Storage bucket (see
+[Google Cloud Storage](#google-cloud-storage)), or an Azure Blob Storage
+container (see [Azure Blob Storage](#azure-blob-storage)). `--store memory` is an
 in-process store for tests and local experiments, and nothing in it survives
 process exit.
 
@@ -331,6 +332,76 @@ A Parquet credential profile that resolves to Ravel's own GCS bucket is
 refused at config time, as one on Ravel's own S3 bucket is under
 `--store s3`.
 
+### Azure Blob Storage
+
+`ravel-server --store azure --azure-account <account> --azure-container
+<container>` keeps every object in one container of an Azure storage
+account. `--azure-account` (`RAVEL_AZURE_ACCOUNT`) and `--azure-container`
+(`RAVEL_AZURE_CONTAINER`) are both required under `--store azure`, and each
+is refused under any other store. The account name is lowercase letters and
+digits; the container name is lowercase letters, digits and `-`.
+
+```sh
+ravel-server --store azure --azure-account ravelprod --azure-container ravel-data ...
+```
+
+No Ravel flag carries an Azure credential. The store reads only these
+variables of the standard `AZURE_*` environment, and no other:
+
+- On AKS, use workload identity. The AKS webhook injects
+  `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`. Give
+  the identity a role that can read, write, list and delete blobs in the
+  container (for example `Storage Blob Data Contributor` on the container).
+- On a VM or node with a managed identity and none of the variables above
+  set, the identity is taken from the instance metadata service.
+- `AZURE_STORAGE_ACCOUNT_KEY` signs with the account's shared key, where you
+  choose one.
+
+A SAS token and the Azure CLI login are not accepted for Ravel's own store: a
+SAS expires under a running server, and the CLI credential is a developer
+login.
+
+The account must not have hierarchical namespace (Data Lake Storage Gen2)
+enabled. Building the store sends Get Account Information and refuses to
+start, naming the setting, when the answer says hierarchical namespace is on
+or when it cannot be read. On such an account a key cannot be
+written beneath an existing key, which Ravel's key layout does not rule out.
+
+The store uses the same request and connect timeouts as `--store s3` and
+reports into the same store metrics (`ravel_store_calls_total`,
+`ravel_store_attempts_total` and the rest). One difference shows in them:
+Azure answers a suffix range with the whole blob, so a read of the last `n`
+bytes of an object is two requests, a HEAD for the length and ETag and then a
+ranged GET conditional on that ETag. It counts one `get` call and two
+attempts, where S3 and GCS spend one request. The server refuses to start on a
+container that has not been qualified, as on S3: qualify it first (see
+[qualify the store](deployment.md#qualify-the-store)). Its backend identity is
+`az://<account>/<container>`. `ravel-cli` does not take `--store azure` yet,
+so `store qualify` cannot write that record from the shipped tools, and
+`--store azure` is not yet supported for production use.
+
+Under `--store azure` each of these flags is refused at startup with an error
+naming it, whether it was passed on the command line or set through its
+environment variable:
+
+- every `--s3-*` flag and every `--gcs-*` flag;
+- `--s3-kms-key` and `--tenant-kms-config`. Customer-managed keys on Azure are
+  an account or encryption-scope setting made outside Ravel;
+- `--require-bucket-protection`. Ravel sends no bucket-protection probe to
+  Azure, so a server asked to require protection refuses to start rather than
+  start unverified. Configure soft delete, versioning and immutability on the
+  account and container yourself.
+
+A flag left at its default is not given: `--s3-request-stored-checksum`
+defaults to on and is ignored under `--store azure`. Unset any `RAVEL_S3_*` or
+`RAVEL_GCS_*` variable a shared environment exports before starting an Azure
+server.
+
+A Parquet credential profile of kind `azure` whose account and container are
+Ravel's own is refused at config time, as one on Ravel's own S3 bucket is
+under `--store s3`. The account is compared without regard to case, since it
+becomes a host name.
+
 ## Storage credential roles
 
 You can give each process an S3 credential that is scoped to its job. A
@@ -536,8 +607,8 @@ builds is constructed with that key id.
 - It routes writes for the keyspace of a configured tenant to a lazily built
   store, which is constructed with the key of that tenant.
 - Every other tenant, and every read, goes to the default store unchanged.
-- It requires `--store s3` and refuses to start under `--store memory` or
-  `--store gcs`.
+- It requires `--store s3` and refuses to start under `--store memory`,
+  `--store gcs` or `--store azure`.
 
 ```toml
 # --tenant-kms-config kms-tenants.toml
