@@ -292,6 +292,35 @@ async fn dev_command_refuses_the_gcs_store() {
     assert!(out.is_empty(), "a refused dev printed a ready line");
 }
 
+/// `agents dev` refuses `--store azure` as it refuses `--store gcs`.
+#[tokio::test]
+async fn dev_command_refuses_the_azure_store() {
+    let mut host = RecordingHost::default();
+    let mut out = Vec::new();
+    let err = agents::run_dev(
+        &dev_options(StoreSelection::explicit(StoreKind::Azure)),
+        &mut host,
+        "tok",
+        &mut out,
+        false,
+    )
+    .await
+    .expect_err("dev on the azure store must refuse");
+    assert!(
+        matches!(
+            err.downcast_ref::<AgentsCliError>(),
+            Some(AgentsCliError::DevRefusesAzureStore)
+        ),
+        "{err}"
+    );
+    assert!(
+        host.calls.is_empty(),
+        "a refused dev started {:?}",
+        host.calls
+    );
+    assert!(out.is_empty(), "a refused dev printed a ready line");
+}
+
 #[tokio::test]
 async fn dev_command_refuses_the_memory_store_and_inspect_reads_head_from_the_bucket() {
     for (selection, defaulted) in [
