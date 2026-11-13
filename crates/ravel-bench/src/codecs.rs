@@ -5,7 +5,8 @@
 //! is measured through its public segment API in the bin, not reimplemented
 //! here.
 //!
-//! Four challengers plus a raw baseline:
+//! Challengers plus a raw baseline (`AlpVectorized` and `AlpRd` are
+//! documented at their definitions):
 //!
 //! - [`Alp`]: Adaptive Lossless floating-Point compression (Afroozeh,
 //!   Kuffo, Boncz, "ALP: Adaptive Lossless floating-Point Compression",
@@ -30,6 +31,11 @@
 //! - [`ByteSplitZstd`]: byte-stream-split. Transpose the eight byte planes of
 //!   the f64 stream (all byte-0s, then all byte-1s, ...) so each plane is
 //!   low-entropy, then zstd level 3 over the transposed buffer.
+//! - [`Dexor`]: DeXOR (Lv et al., arXiv 2601.00695). Each value is split
+//!   at its decimal tail and its longest common decimal prefix with the
+//!   previous value, and only the decimal suffix is stored; values the
+//!   decimal model does not reproduce bit-exactly take an exception path
+//!   with an adaptive-width exponent delta.
 //! - [`RawF64`]: little-endian `f64` bytes, no compression (RSEG enc 17's
 //!   payload, the 8-bytes-per-sample floor).
 //!
@@ -1089,6 +1095,325 @@ impl ValueCodec for AlpRd {
     }
 }
 
+// --- DeXOR (issue #3925) -------------------------------------------------
+
+/// Decimal-space tolerance for the tail search and the prefix rounding.
+/// Encoder-side choices only change the ratio: every main-pipeline value is
+/// verified by the decoder's own `dexor_reconstruct` before it is written.
+const DEXOR_TOLERANCE: f64 = 1e-6;
+/// Lowest and highest tail coordinate `q`, stored as `q + 20` in 5 bits.
+const DEXOR_Q_MIN: i32 = -20;
+const DEXOR_Q_MAX: i32 = 11;
+/// Largest `o - q`; a wider gap goes to the exception path.
+const DEXOR_DELTA_MAX: i32 = 15;
+/// `ceil(log2(10^delta))`: the suffix width for each `delta` in `0..=15`.
+const DEXOR_SUFFIX_BITS: [u32; 16] = [0, 4, 7, 10, 14, 17, 20, 24, 27, 30, 34, 37, 40, 44, 47, 50];
+/// Exception exponent field width bounds and the contraction threshold rho.
+const DEXOR_EL_MAX: u32 = 12;
+const DEXOR_RHO: u32 = 8;
+/// `2^53`: integers at or above it are not all exactly representable.
+const DEXOR_EXACT_INT: f64 = 9_007_199_254_740_992.0;
+/// `1e0..=1e26` as literals; the scale range `o` and `q` can reach.
+const DEXOR_POW10: [f64; 27] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26,
+];
+/// `10^delta` for `delta` in `0..=15`, as exact integers.
+const DEXOR_POW10_I64: [i64; 16] = [
+    1,
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+    10_000_000_000,
+    100_000_000_000,
+    1_000_000_000_000,
+    10_000_000_000_000,
+    100_000_000_000_000,
+    1_000_000_000_000_000,
+];
+
+const DEXOR_CASE_SAME_QO: u64 = 0b10;
+const DEXOR_CASE_SAME_Q: u64 = 0b01;
+const DEXOR_CASE_NEW_Q: u64 = 0b00;
+const DEXOR_CASE_EXCEPTION: u64 = 0b11;
+
+/// DeXOR (Lv et al., "DeXOR: Enabling XOR in Decimal Space for Streaming
+/// Lossless Compression of Floating-point Data", arXiv 2601.00695): each
+/// value is split at its decimal tail `q` and its longest common decimal
+/// prefix `o` with the previous value; only the decimal suffix below `o` is
+/// stored, plus 2-bit case codes that reuse the previous `q`/`o`. Values the
+/// decimal model cannot reproduce bit-exactly take an exception path that
+/// stores the IEEE 754 sign, fraction and an adaptive-width exponent delta.
+/// Stateless handle; the per-stream state lives in each call.
+///
+/// Implemented from an extraction of the paper, not from the authors' code;
+/// the bit layout is not meant to interoperate with theirs.
+pub struct Dexor;
+
+/// Encoder and decoder state; both sides apply the same updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DexorState {
+    prev_bits: u64,
+    q_prev: i32,
+    o_prev: i32,
+    /// Exponent of the previous exception value, not the previous value.
+    exp_prev: u16,
+    el: u32,
+    contract_count: u32,
+}
+
+impl DexorState {
+    fn new() -> Self {
+        DexorState {
+            prev_bits: 0,
+            q_prev: 0,
+            o_prev: 0,
+            exp_prev: 0,
+            el: 1,
+            contract_count: 0,
+        }
+    }
+
+    /// Records a main-pipeline value.
+    fn main_value(&mut self, bits: u64, q: i32, o: i32) {
+        self.prev_bits = bits;
+        self.q_prev = q;
+        self.o_prev = o;
+    }
+
+    /// Records an exception value whose exponent delta was `es`, or that
+    /// took the overflow (raw 64 bits) form.
+    fn exception_value(&mut self, bits: u64, es: i32, overflow: bool) {
+        self.prev_bits = bits;
+        self.exp_prev = ((bits >> 52) & 0x7FF) as u16;
+        if overflow {
+            self.el = (self.el + 1).min(DEXOR_EL_MAX);
+            self.contract_count = 0;
+        } else if self.el >= 2 && es.unsigned_abs() < (1u32 << (self.el - 2)) {
+            self.contract_count += 1;
+            if self.contract_count > DEXOR_RHO {
+                self.el -= 1;
+                self.contract_count = 0;
+            }
+        } else {
+            self.contract_count = 0;
+        }
+    }
+}
+
+/// `x * 10^k` as one correctly rounded multiply or divide; `|k| <= 26`.
+fn dexor_scale(x: f64, k: i32) -> f64 {
+    let p = DEXOR_POW10[k.unsigned_abs() as usize];
+    if k >= 0 { x * p } else { x / p }
+}
+
+/// The decimal prefix of the previous value at coordinate `o`, in units of
+/// `10^o`, with values within the tolerance of an integer rounded to it.
+/// `None` when the prefix is not a finite integer below `2^53`.
+fn dexor_prefix(prev_bits: u64, o: i32) -> Option<i64> {
+    let x = dexor_scale(f64::from_bits(prev_bits), -o);
+    if !x.is_finite() {
+        return None;
+    }
+    let r = x.round();
+    let a = if (x - r).abs() < DEXOR_TOLERANCE {
+        r
+    } else {
+        x.trunc()
+    };
+    if a.abs() >= DEXOR_EXACT_INT {
+        return None;
+    }
+    Some(a as i64)
+}
+
+/// Rebuilds a main-pipeline value from its prefix `a`, suffix magnitude and
+/// sign: the integer `a * 10^delta +- mag`, then one scale by `10^q`, sign
+/// applied last so `-0.0` survives. `None` when the integer reaches `2^53`.
+fn dexor_reconstruct(a: i64, delta: i32, mag: u64, negative_bit: bool, q: i32) -> Option<u64> {
+    let p = i128::from(DEXOR_POW10_I64[delta as usize]);
+    let sgn: i128 = if a < 0 { -1 } else { 1 };
+    let n = i128::from(a) * p + sgn * i128::from(mag);
+    if n.unsigned_abs() >= 1u128 << 53 {
+        return None;
+    }
+    let negative = if a != 0 { a < 0 } else { negative_bit };
+    let m = dexor_scale(n.unsigned_abs() as f64, q);
+    Some(if negative { -m } else { m }.to_bits())
+}
+
+/// Encoder tail test: `v * 10^-k` is within the tolerance of a nonzero
+/// integer, or `v` is zero. Without the nonzero condition every small value
+/// passes at a high `k` (`1 * 10^-11` is within the tolerance of 0), so a
+/// value after a zero keeps the zero's clamped tail and escapes, and since
+/// exceptions do not move `q_prev`, so does every small value after it.
+fn dexor_is_int(v: f64, k: i32) -> bool {
+    if v == 0.0 {
+        return true;
+    }
+    let x = dexor_scale(v, -k);
+    let r = x.round();
+    x.is_finite() && r != 0.0 && (x - r).abs() < DEXOR_TOLERANCE
+}
+
+/// The fields of one main-pipeline value, or `None` when it must take the
+/// exception path. Encoder only.
+fn dexor_main_fields(state: &DexorState, bits: u64) -> Option<(i32, i32, i64, u64, bool)> {
+    let v = f64::from_bits(bits);
+    if !v.is_finite() {
+        return None;
+    }
+    let mut q = state.q_prev;
+    if dexor_is_int(v, q) {
+        while q < DEXOR_Q_MAX && dexor_is_int(v, q + 1) {
+            q += 1;
+        }
+    } else {
+        while q > DEXOR_Q_MIN && !dexor_is_int(v, q) {
+            q -= 1;
+        }
+        if !dexor_is_int(v, q) {
+            return None;
+        }
+    }
+    let nv = dexor_scale(v, -q).round();
+    if nv.abs() >= DEXOR_EXACT_INT {
+        return None;
+    }
+    let nv = nv as i64;
+    let (delta, a) = (0..=DEXOR_DELTA_MAX).find_map(|delta| {
+        let av = nv / DEXOR_POW10_I64[delta as usize];
+        (dexor_prefix(state.prev_bits, q + delta) == Some(av)).then_some((delta, av))
+    })?;
+    let mag = (nv - a * DEXOR_POW10_I64[delta as usize]).unsigned_abs();
+    let negative = v.is_sign_negative();
+    (dexor_reconstruct(a, delta, mag, negative, q) == Some(bits))
+        .then_some((q, delta, a, mag, negative))
+}
+
+/// Writes one exception value's fields (no case code) and updates `state`.
+fn dexor_write_exception(state: &mut DexorState, w: &mut BitWriter, bits: u64) {
+    let exp = ((bits >> 52) & 0x7FF) as i32;
+    let es = exp - i32::from(state.exp_prev);
+    let bias = (1i32 << (state.el - 1)) - 1;
+    let overflow = es.abs() > bias;
+    if overflow {
+        w.write_bits((1u64 << state.el) - 1, state.el);
+        w.write_bits(bits, 64);
+    } else {
+        w.write_bits((es + bias) as u64, state.el);
+        w.write_bits(bits >> 63, 1);
+        w.write_bits(bits & ((1u64 << 52) - 1), 52);
+    }
+    state.exception_value(bits, es, overflow);
+}
+
+/// Reads one exception value's fields (after its case code).
+fn dexor_read_exception(state: &mut DexorState, r: &mut BitReader<'_>) -> Result<u64, CodecError> {
+    let field = r.read_bits(state.el)?;
+    let ovf = (1u64 << state.el) - 1;
+    let (bits, es, overflow) = if field == ovf {
+        let bits = r.read_bits(64)?;
+        let es = ((bits >> 52) & 0x7FF) as i32 - i32::from(state.exp_prev);
+        (bits, es, true)
+    } else {
+        let bias = (1i32 << (state.el - 1)) - 1;
+        let es = field as i32 - bias;
+        let exp = i32::from(state.exp_prev) + es;
+        if !(0..=0x7FF).contains(&exp) {
+            return Err(CodecError::Corrupt);
+        }
+        let sign = r.read_bits(1)?;
+        let frac = r.read_bits(52)?;
+        ((sign << 63) | ((exp as u64) << 52) | frac, es, false)
+    };
+    state.exception_value(bits, es, overflow);
+    Ok(bits)
+}
+
+/// Encodes one value (case code and fields) and updates `state`.
+fn dexor_encode_value(state: &mut DexorState, w: &mut BitWriter, bits: u64) {
+    let Some((q, delta, a, mag, negative)) = dexor_main_fields(state, bits) else {
+        w.write_bits(DEXOR_CASE_EXCEPTION, 2);
+        dexor_write_exception(state, w, bits);
+        return;
+    };
+    let o = q + delta;
+    if q == state.q_prev && o == state.o_prev {
+        w.write_bits(DEXOR_CASE_SAME_QO, 2);
+    } else if q == state.q_prev {
+        w.write_bits(DEXOR_CASE_SAME_Q, 2);
+        w.write_bits(delta as u64, 4);
+    } else {
+        w.write_bits(DEXOR_CASE_NEW_Q, 2);
+        w.write_bits((q - DEXOR_Q_MIN) as u64, 5);
+        w.write_bits(delta as u64, 4);
+    }
+    if a == 0 {
+        w.write_bits(u64::from(negative), 1);
+    }
+    w.write_bits(mag, DEXOR_SUFFIX_BITS[delta as usize]);
+    state.main_value(bits, q, o);
+}
+
+impl ValueCodec for Dexor {
+    fn name(&self) -> &'static str {
+        "dexor"
+    }
+
+    fn encode(&self, values: &[f64]) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        let mut state = DexorState::new();
+        for v in values {
+            dexor_encode_value(&mut state, &mut w, v.to_bits());
+        }
+        w.finish()
+    }
+
+    fn decode(&self, bytes: &[u8], count: usize) -> Result<Vec<f64>, CodecError> {
+        // Every value costs at least its 2-bit case code.
+        if count > bytes.len().saturating_mul(4) {
+            return Err(CodecError::Truncated);
+        }
+        let mut out = Vec::with_capacity(count);
+        let mut r = BitReader::new(bytes);
+        let mut state = DexorState::new();
+        for _ in 0..count {
+            let case = r.read_bits(2)?;
+            if case == DEXOR_CASE_EXCEPTION {
+                out.push(f64::from_bits(dexor_read_exception(&mut state, &mut r)?));
+                continue;
+            }
+            let (q, delta) = match case {
+                DEXOR_CASE_SAME_QO => (state.q_prev, state.o_prev - state.q_prev),
+                DEXOR_CASE_SAME_Q => (state.q_prev, r.read_bits(4)? as i32),
+                _ => {
+                    let q = r.read_bits(5)? as i32 + DEXOR_Q_MIN;
+                    (q, r.read_bits(4)? as i32)
+                }
+            };
+            if !(DEXOR_Q_MIN..=DEXOR_Q_MAX).contains(&q) || !(0..=DEXOR_DELTA_MAX).contains(&delta)
+            {
+                return Err(CodecError::Corrupt);
+            }
+            let o = q + delta;
+            let a = dexor_prefix(state.prev_bits, o).ok_or(CodecError::Corrupt)?;
+            let negative = a == 0 && r.read_bits(1)? == 1;
+            let mag = r.read_bits(DEXOR_SUFFIX_BITS[delta as usize])?;
+            let bits = dexor_reconstruct(a, delta, mag, negative, q).ok_or(CodecError::Corrupt)?;
+            state.main_value(bits, q, o);
+            out.push(f64::from_bits(bits));
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -1138,6 +1463,7 @@ mod tests {
         roundtrip(&RawF64, &values);
         roundtrip(&AlpVectorized, &values);
         roundtrip(&AlpRd, &values);
+        roundtrip(&Dexor, &values);
     }
 
     #[test]
@@ -1150,6 +1476,7 @@ mod tests {
             roundtrip(&RawF64, &values);
             roundtrip(&AlpVectorized, &values);
             roundtrip(&AlpRd, &values);
+            roundtrip(&Dexor, &values);
         }
     }
 
@@ -1165,6 +1492,7 @@ mod tests {
             roundtrip(&GcdDeltaFor, values);
             roundtrip(&AlpVectorized, values);
             roundtrip(&AlpRd, values);
+            roundtrip(&Dexor, values);
         }
     }
 
@@ -1249,6 +1577,7 @@ mod tests {
             GcdDeltaFor.encode(&values),
             AlpVectorized.encode(&values),
             AlpRd.encode(&values),
+            Dexor.encode(&values),
         ]
         .into_iter()
         .enumerate()
@@ -1263,7 +1592,8 @@ mod tests {
                     3 => Alp.decode(truncated, values.len()),
                     4 => GcdDeltaFor.decode(truncated, values.len()),
                     5 => AlpVectorized.decode(truncated, values.len()),
-                    _ => AlpRd.decode(truncated, values.len()),
+                    6 => AlpRd.decode(truncated, values.len()),
+                    _ => Dexor.decode(truncated, values.len()),
                 };
                 // No panic is the assertion; result may be Ok or Err.
             }
@@ -1315,5 +1645,308 @@ mod tests {
         assert_eq!(AlpRd.decode(&bytes, values.len()), Err(CodecError::Corrupt));
         let bytes = rd_frame(None, Some(values.len() as u64 + 1), &values);
         assert_eq!(AlpRd.decode(&bytes, values.len()), Err(CodecError::Corrupt));
+    }
+
+    /// Every bit written so far, including the partial last byte, as '0'/'1'.
+    fn written_bits(w: &BitWriter) -> String {
+        let mut s: String = w.buf.iter().map(|b| format!("{b:08b}")).collect();
+        for i in (0..w.nbits).rev() {
+            s.push(if (w.cur >> i) & 1 == 1 { '1' } else { '0' });
+        }
+        s
+    }
+
+    fn dexor_state(prev: f64, q_prev: i32, o_prev: i32) -> DexorState {
+        DexorState {
+            prev_bits: prev.to_bits(),
+            q_prev,
+            o_prev,
+            ..DexorState::new()
+        }
+    }
+
+    /// Paper Fig. 3 / Examples 3-7: 88.1479 after 88.1537 at q = -4 shares
+    /// the prefix 88.1 (o = -1), so it is case 01, delta 3, suffix 479 in
+    /// 10 bits, and no sign bit because the prefix is nonzero.
+    #[test]
+    fn dexor_pins_paper_example_case_01() {
+        let mut state = dexor_state(88.1537, -4, 0);
+        let mut w = BitWriter::new();
+        dexor_encode_value(&mut state, &mut w, 88.1479f64.to_bits());
+        assert_eq!(written_bits(&w), "01".to_owned() + "0011" + "0111011111");
+        assert_eq!((state.q_prev, state.o_prev), (-4, -1));
+        assert_eq!(state.prev_bits, 88.1479f64.to_bits());
+    }
+
+    /// Paper Fig. 1: 64.56 after 64.5487 moves the tail to q = -2, so case
+    /// 00 with q + 20 = 18, delta 1 and suffix 6 in 4 bits.
+    #[test]
+    fn dexor_pins_paper_example_case_00() {
+        let mut state = dexor_state(64.5487, -4, 0);
+        let mut w = BitWriter::new();
+        dexor_encode_value(&mut state, &mut w, 64.56f64.to_bits());
+        assert_eq!(
+            written_bits(&w),
+            "00".to_owned() + "10010" + "0001" + "0110"
+        );
+        assert_eq!((state.q_prev, state.o_prev), (-2, -1));
+    }
+
+    /// A repeated value costs case 01 with delta 0 once, then case 10 alone.
+    #[test]
+    fn dexor_repeated_value_is_two_bits() {
+        let mut state = dexor_state(12.5, -1, 1);
+        let mut w = BitWriter::new();
+        dexor_encode_value(&mut state, &mut w, 12.5f64.to_bits());
+        dexor_encode_value(&mut state, &mut w, 12.5f64.to_bits());
+        assert_eq!(written_bits(&w), "01".to_owned() + "0000" + "10");
+    }
+
+    /// Paper Examples 9-11: exception exponent deltas 3, 1, 1 from EL = 1.
+    /// The first overflows (field "1" then the raw word, 65 bits) and widens
+    /// EL to 2; the next two fit (field "10", sign, fraction: 55 bits each).
+    #[test]
+    fn dexor_pins_paper_exception_example() {
+        let mut state = DexorState {
+            exp_prev: 1000,
+            ..DexorState::new()
+        };
+        let frac = 0x000A_BCDE_F012_3456u64;
+        let words: Vec<u64> = [1003u64, 1004, 1005]
+            .iter()
+            .map(|&e| (e << 52) | frac)
+            .collect();
+        let mut w = BitWriter::new();
+        let mut lens = Vec::new();
+        for &bits in &words {
+            let before = written_bits(&w).len();
+            dexor_write_exception(&mut state, &mut w, bits);
+            lens.push(written_bits(&w).len() - before);
+        }
+        assert_eq!(lens, [65, 55, 55]);
+        let frac_bits = format!("{frac:052b}");
+        let expected = "1".to_owned()
+            + &format!("{:064b}", words[0])
+            + "10"
+            + "0"
+            + &frac_bits
+            + "10"
+            + "0"
+            + &frac_bits;
+        assert_eq!(written_bits(&w), expected);
+        assert_eq!(written_bits(&w).len(), 175);
+        assert_eq!((state.el, state.exp_prev), (2, 1005));
+
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let mut dec = DexorState {
+            exp_prev: 1000,
+            ..DexorState::new()
+        };
+        for &bits in &words {
+            assert_eq!(dexor_read_exception(&mut dec, &mut r), Ok(bits));
+        }
+        assert_eq!(dec, state);
+    }
+
+    /// EL widens by one on an overflow, contracts only after more than
+    /// rho = 8 consecutive deltas inside the smaller range, and a delta
+    /// outside it resets the count.
+    #[test]
+    fn dexor_exception_width_expands_and_contracts() {
+        let word = |exp: u64| exp << 52;
+        let mut state = DexorState {
+            exp_prev: 1000,
+            ..DexorState::new()
+        };
+        let mut w = BitWriter::new();
+        dexor_write_exception(&mut state, &mut w, word(1003));
+        assert_eq!((state.el, state.contract_count), (2, 0));
+        for _ in 0..5 {
+            dexor_write_exception(&mut state, &mut w, word(1003));
+        }
+        assert_eq!((state.el, state.contract_count), (2, 5));
+        // |ES| = 1 fits EL = 2 but not EL = 1, so the run is interrupted.
+        dexor_write_exception(&mut state, &mut w, word(1004));
+        assert_eq!((state.el, state.contract_count), (2, 0));
+        for i in 1..=DEXOR_RHO {
+            dexor_write_exception(&mut state, &mut w, word(1004));
+            assert_eq!((state.el, state.contract_count), (2, i));
+        }
+        dexor_write_exception(&mut state, &mut w, word(1004));
+        assert_eq!((state.el, state.contract_count), (1, 0));
+    }
+
+    /// The exception exponent delta is taken against the previous exception
+    /// value, not the previous stream value: with exp_prev = 1023 from an
+    /// earlier exception and a main-pipeline 100.0 (exponent 1029) in
+    /// between, 1.0000000000000002 (exponent 1023) has ES = 0 and fits the
+    /// 1-bit field (2 + 1 + 53 = 56 bits) instead of overflowing.
+    #[test]
+    fn dexor_exception_delta_is_against_previous_exception() {
+        let mut state = DexorState {
+            exp_prev: 1023,
+            ..dexor_state(100.0, 0, 2)
+        };
+        let v = 1.000_000_000_000_000_2f64;
+        let mut w = BitWriter::new();
+        dexor_encode_value(&mut state, &mut w, v.to_bits());
+        let frac = v.to_bits() & ((1u64 << 52) - 1);
+        assert_eq!(
+            written_bits(&w),
+            "11".to_owned() + "0" + "0" + &format!("{frac:052b}")
+        );
+        assert_eq!((state.exp_prev, state.q_prev, state.o_prev), (1023, 0, 2));
+        assert_eq!(state.prev_bits, v.to_bits());
+    }
+
+    /// Values whose decimal reconstruction differs from the input in the
+    /// last bits must take the exception path: 0.1 + 0.2 looks like 0.3
+    /// within the tolerance, 1.0000000000000002 like 1, and 19.0000005 like
+    /// 19 (the paper's misclassified-tail example).
+    #[test]
+    fn dexor_near_decimal_values_are_exceptions() {
+        for v in [0.1f64 + 0.2, 1.000_000_000_000_000_2, 19.000_000_5] {
+            let state = DexorState::new();
+            assert_eq!(
+                dexor_main_fields(&state, v.to_bits()),
+                None,
+                "{v:e} must be an exception"
+            );
+            roundtrip(&Dexor, &[v]);
+        }
+    }
+
+    /// Both zeros go through the main pipeline with a zero prefix, and the
+    /// sign bit alone tells them apart.
+    #[test]
+    fn dexor_signed_zero_takes_the_main_pipeline() {
+        let state = DexorState::new();
+        let (_, _, a, mag, negative) =
+            dexor_main_fields(&state, (-0.0f64).to_bits()).expect("main pipeline");
+        assert_eq!((a, mag, negative), (0, 0, true));
+        let (_, _, a, _, negative) =
+            dexor_main_fields(&state, 0.0f64.to_bits()).expect("main pipeline");
+        assert_eq!((a, negative), (0, false));
+        roundtrip(&Dexor, &[0.0, -0.0, 5.5, -0.0, 0.0]);
+    }
+
+    fn dexor_hard_floats() -> Vec<f64> {
+        vec![
+            f64::NAN,
+            f64::from_bits(0x7FF8_0000_0000_0001), // quiet NaN with payload
+            f64::from_bits(0x7FF0_0000_0000_0001), // signalling NaN
+            f64::from_bits(0x7FF4_0000_0000_0000), // signalling NaN, high payload bit
+            f64::from_bits(0xFFF8_DEAD_BEEF_CAFE), // negative NaN with payload
+            f64::from_bits(0x7ff0_0000_0000_0002), // Prometheus stale marker
+            -0.0,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits(1),                     // smallest positive subnormal
+            f64::from_bits(0x000F_FFFF_FFFF_FFFF), // largest subnormal
+            f64::from_bits(0x8000_0000_0000_0001), // smallest negative subnormal
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+            0.1 + 0.2,
+            1.000_000_000_000_000_2,
+            1e300,
+            -1e-300,
+        ]
+    }
+
+    #[test]
+    fn dexor_hard_floats_roundtrip_in_every_position() {
+        let hard = dexor_hard_floats();
+        roundtrip(&Dexor, &hard);
+        for &h in &hard {
+            roundtrip(&Dexor, &[h]);
+            roundtrip(&Dexor, &[12.34, h, 12.35, h, h, 12.36]);
+        }
+        let mut reversed = hard.clone();
+        reversed.reverse();
+        roundtrip(&Dexor, &reversed);
+    }
+
+    /// A deterministic random walk at `places` decimals: each value is the
+    /// nearest double to its decimal, as a scraped gauge would be.
+    fn decimal_walk(n: usize, places: u32, seed: u64) -> Vec<f64> {
+        let scale = 10i64.pow(places) as f64;
+        let mut x: u64 = seed;
+        let mut level: i64 = 2_000 * 10i64.pow(places);
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                level += ((x >> 33) % 201) as i64 - 100;
+                level as f64 / scale
+            })
+            .collect()
+    }
+
+    /// Integer counters and fixed-decimal gauges never take the exception
+    /// path, and encode well below raw f64.
+    #[test]
+    fn dexor_decimal_series_stay_in_main_pipeline() {
+        let counter: Vec<f64> = (0..500).map(|i| (i * 3 + 1_000_000) as f64).collect();
+        let mut series = vec![counter];
+        for places in 1..=6 {
+            series.push(decimal_walk(500, places, u64::from(places)));
+        }
+        for values in &series {
+            let mut state = DexorState::new();
+            let mut w = BitWriter::new();
+            for v in values {
+                assert!(
+                    dexor_main_fields(&state, v.to_bits()).is_some(),
+                    "{v} took the exception path"
+                );
+                dexor_encode_value(&mut state, &mut w, v.to_bits());
+            }
+            let encoded = Dexor.encode(values);
+            assert!(
+                encoded.len() * 2 < values.len() * 8,
+                "{} bytes for {} values is not below half of raw",
+                encoded.len(),
+                values.len()
+            );
+            roundtrip(&Dexor, values);
+        }
+    }
+
+    /// A zero clamps the tail to q = 11; the next small integer must find
+    /// its own tail (q = 0) instead of staying at 11 and escaping, and a
+    /// counter that resets to zero stays in the main pipeline throughout.
+    #[test]
+    fn dexor_value_after_zero_finds_its_tail() {
+        let mut state = DexorState::new();
+        let mut w = BitWriter::new();
+        dexor_encode_value(&mut state, &mut w, 0.0f64.to_bits());
+        assert_eq!(state.q_prev, DEXOR_Q_MAX);
+        let (q, ..) = dexor_main_fields(&state, 1.0f64.to_bits()).expect("main pipeline");
+        assert_eq!(q, 0);
+
+        let values: Vec<f64> = [5, 9, 0, 1, 3, 9, 17, 0, 2, 21, 140]
+            .iter()
+            .map(|&i| f64::from(i))
+            .collect();
+        let mut state = DexorState::new();
+        let mut w = BitWriter::new();
+        for v in &values {
+            assert!(
+                dexor_main_fields(&state, v.to_bits()).is_some(),
+                "{v} took the exception path"
+            );
+            dexor_encode_value(&mut state, &mut w, v.to_bits());
+        }
+        roundtrip(&Dexor, &values);
+    }
+
+    #[test]
+    fn dexor_count_above_stream_capacity_is_truncated() {
+        assert_eq!(Dexor.decode(&[0u8; 2], 9), Err(CodecError::Truncated));
+        assert_eq!(Dexor.decode(&[], 1), Err(CodecError::Truncated));
     }
 }
