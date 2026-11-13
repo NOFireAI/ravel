@@ -15,10 +15,12 @@
 #     system:serviceaccount:ravel-system:prod-<role> and a Storage Blob Data
 #     role on the container;
 #   - the operator's own identity, federated for
-#     system:serviceaccount:ravel-system:ravel-operator (see rbac.yaml);
-#   - blob versioning, soft delete and an immutability policy on the
-#     container, set by hand: the operator runs no bucket-protection check on
-#     Azure and reports BucketProtectionVerified=False.
+#     system:serviceaccount:ravel-system:ravel-operator, only if this cluster
+#     sets deploymentKeySecretRef or shardOverrides (opt-in, see rbac.yaml);
+#   - blob versioning paired with a lifecycle rule that deletes previous
+#     versions, and soft delete with a bounded retention, set by hand: the
+#     operator runs no bucket-protection check on Azure and reports
+#     BucketProtectionVerified=False.
 apiVersion: ravel.nofire.ai/v1alpha1
 kind: RavelCluster
 metadata:
@@ -35,7 +37,8 @@ spec:
       # The identity every role uses unless roleClientIds names its own.
       clientId: 00000000-0000-0000-0000-000000000000
       # One identity per role scopes each role's data access separately
-      # (ADR-0055). Changing qualify's client ID re-runs store qualification.
+      # (ADR-0055). Changing a tier's client ID rolls that tier's pods;
+      # changing qualify's re-runs store qualification.
       roleClientIds:
         gateway: 00000000-0000-0000-0000-000000000001
         query: 00000000-0000-0000-0000-000000000002
