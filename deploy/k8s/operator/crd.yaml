@@ -23,7 +23,7 @@
             "description": "Auto-generated derived type for RavelClusterSpec via `CustomResource`",
             "properties": {
               "spec": {
-                "description": "`RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface\n(`services/ravel-server/src/config.rs`); the memory store is deliberately\nunrepresentable (ADR-0034 decision 2), so `storage.s3` is mandatory.",
+                "description": "`RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface\n(`services/ravel-server/src/config.rs`); the memory store is deliberately\nunrepresentable (ADR-0034 decision 2), so exactly one of `storage.s3` and\n`storage.azure` is required.",
                 "properties": {
                   "auditTokenKeySecretRef": {
                     "description": "Secret with a single key `key` holding 64 hex characters, the\nquery-audit token key the query tier reads as\n`RAVEL_AUDIT_TOKEN_KEY` (#1487). Query tier only: gateway and\nmaintain never read a query-audit token. The query tier reads the key\nonly when `RAVEL_AUDIT_MODE` is `required` or `best-effort`; the\nquery audit is off by default since #2791. Omit on a cluster with\n`deploymentKeySecretRef` set -- the server derives the key from the\ndeployment key. Omitting both leaves the query tier unable to start\naudit tokenization: the operator does not generate this Secret\n(issue #126's `secrets get`-only posture forbids the create/patch\nthat would need), so a cluster with neither ref set reports\n`AuditTokenKeyMissing` and its query tier's Deployment is left as it\nis until this field is set.",
@@ -690,8 +690,76 @@
                     ]
                   },
                   "storage": {
-                    "description": "Object storage backend. S3 only: a per-process memory store is\nincoherent across pods (ADR-0034 decision 2).",
+                    "description": "Object storage backend: exactly one of `s3` and `azure`. A\nper-process memory store is incoherent across pods (ADR-0034\ndecision 2).",
                     "properties": {
+                      "azure": {
+                        "description": "Azure Blob Storage backend, authenticated through AKS workload\nidentity (ADR-4158 D11).",
+                        "properties": {
+                          "account": {
+                            "description": "Storage account (`--azure-account`): 3 to 24 lowercase letters and\ndigits.",
+                            "maxLength": 24,
+                            "minLength": 3,
+                            "pattern": "^[a-z0-9]{3,24}$",
+                            "type": "string"
+                          },
+                          "clientId": {
+                            "description": "Client ID (a UUID) of the user-assigned managed identity a role's\nServiceAccount is annotated with, unless `roleClientIds` names one for\nthat role. A pod keeps the identity it was admitted with, so changing\na tier's client ID rolls that tier's pods, and changing the `qualify`\nrole's client ID re-runs store qualification.",
+                            "maxLength": 36,
+                            "minLength": 36,
+                            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                            "type": "string"
+                          },
+                          "container": {
+                            "description": "Container (`--azure-container`): 3 to 63 lowercase letters, digits and\nsingle hyphens, starting and ending with a letter or digit.",
+                            "maxLength": 63,
+                            "minLength": 3,
+                            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+                            "type": "string"
+                          },
+                          "roleClientIds": {
+                            "description": "Per-role client IDs, one managed identity per role with its own role\nassignment on the container (ADR-0055's per-role scoping on Azure).\nA role left unset uses `clientId`.",
+                            "nullable": true,
+                            "properties": {
+                              "gateway": {
+                                "maxLength": 36,
+                                "minLength": 36,
+                                "nullable": true,
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                                "type": "string"
+                              },
+                              "maintain": {
+                                "maxLength": 36,
+                                "minLength": 36,
+                                "nullable": true,
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                                "type": "string"
+                              },
+                              "qualify": {
+                                "description": "The store-qualification Job's identity.",
+                                "maxLength": 36,
+                                "minLength": 36,
+                                "nullable": true,
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                                "type": "string"
+                              },
+                              "query": {
+                                "maxLength": 36,
+                                "minLength": 36,
+                                "nullable": true,
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "account",
+                          "clientId",
+                          "container"
+                        ],
+                        "type": "object"
+                      },
                       "s3": {
                         "description": "S3 (or S3-compatible) backend.",
                         "properties": {
@@ -765,10 +833,13 @@
                         ]
                       }
                     },
-                    "required": [
-                      "s3"
-                    ],
-                    "type": "object"
+                    "type": "object",
+                    "x-kubernetes-validations": [
+                      {
+                        "message": "storage must set exactly one of s3 and azure",
+                        "rule": "has(self.s3) != has(self.azure)"
+                      }
+                    ]
                   },
                   "tenantTokensSecretRef": {
                     "description": "Secret whose keys are tenant names and whose values are the bearer\ntokens for those tenants. The operator renders `--tenant-token\n$(VAR)=<tenant>` using kubelet `$(VAR)` expansion so token values never\nappear in the Pod spec.\n\nWARNING: `ravel-server`'s `parse_tenant_tokens`\n(`services/ravel-server/src/config.rs`) splits each `--tenant-token`\nargument on the FIRST `=` via `str::split_once('=')`. A token VALUE that\ncontains `=` is therefore mis-parsed (the suffix after the first `=` is\ntaken as part of the tenant, not the token). This is pre-existing\nbehavior in a different crate, out of this operator's scope to change;\nchoose token values without `=` until a native token source lands.\n\nThe rendered pair carries neither a capability suffix nor a\n`subject=LABEL` entry, since a Secret key admits no `;`; issue #3580\ntracks a CRD field for them.",
@@ -794,7 +865,11 @@
                 "x-kubernetes-validations": [
                   {
                     "message": "gateway, query and maintain credentialsSecretRef overrides are refused under storage.s3.auth: podIdentity; each tier's role comes from the Pod Identity association on its ServiceAccount (<name>-gateway, <name>-query, <name>-maintain)",
-                    "rule": "!has(self.storage.s3.auth) || self.storage.s3.auth != 'podIdentity' || ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && (!has(self.query) || !has(self.query.credentialsSecretRef)) && (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))"
+                    "rule": "!has(self.storage.s3) || !has(self.storage.s3.auth) || self.storage.s3.auth != 'podIdentity' || ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && (!has(self.query) || !has(self.query.credentialsSecretRef)) && (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))"
+                  },
+                  {
+                    "message": "gateway, query and maintain credentialsSecretRef overrides are refused under storage.azure; each tier's identity is the client ID on its ServiceAccount (storage.azure.clientId or roleClientIds)",
+                    "rule": "!has(self.storage.azure) || ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && (!has(self.query) || !has(self.query.credentialsSecretRef)) && (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))"
                   }
                 ]
               },
@@ -803,7 +878,7 @@
                 "nullable": true,
                 "properties": {
                   "conditions": {
-                    "description": "Status conditions the operator actually sets: `Available`, `Degraded`,\n`StoreQualified`, `KubernetesVersionUnsupported`,\n`IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`. The\noperator emits no `Progressing` condition.",
+                    "description": "Status conditions the operator actually sets: `Available`, `Degraded`,\n`StoreQualified`, `KubernetesVersionUnsupported`,\n`IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`,\n`BucketProtectionVerified` (on a `storage.azure` cluster only, False\nwith reason NotImplementedForAzure: no bucket-protection check runs\nthere). The operator emits no `Progressing` condition.",
                     "items": {
                       "description": "A standard Kubernetes status condition (the `metav1.Condition` shape). Kept\nas a local type rather than `k8s-openapi`'s `Condition` so the status schema\nderives from `schemars` without the `k8s-openapi` schemars coupling.",
                       "properties": {
@@ -869,7 +944,7 @@
                     "type": "integer"
                   },
                   "podIdentityServiceAccounts": {
-                    "description": "`true` once the operator has applied the `storage.s3.auth: podIdentity`\nServiceAccounts (`<name>-gateway`, `-query`, `-maintain`, `-qualify`).\nThe operator deletes those accounts after a switch back to `static`\nonly while this is set, and clears it once they are gone, so a cluster\nthat never ran under `podIdentity` never touches ServiceAccounts with\nthose names. Recorded here because the operator's RBAC cannot read a\nServiceAccount to check who owns it.\n\nSerialized even when absent (as explicit `null`) so the status merge\npatch clears it after the sweep.",
+                    "description": "`true` once the operator has applied the ServiceAccounts it owns under\n`storage.s3.auth: podIdentity` or `storage.azure` (`<name>-gateway`,\n`-query`, `-maintain`, `-qualify`). The operator deletes those\naccounts after a switch to S3 `static` only while this is set, and\nclears it once they are gone, so a cluster that never ran under either\nnever touches ServiceAccounts with those names. Recorded here because\nthe operator's RBAC cannot read a ServiceAccount to check who owns it.\n\nSerialized even when absent (as explicit `null`) so the status merge\npatch clears it after the sweep.",
                     "nullable": true,
                     "type": "boolean"
                   },
@@ -896,7 +971,7 @@
                     "type": "integer"
                   },
                   "storeQualifiedHash": {
-                    "description": "The qualify-Job input hash (bucket, region, endpoint, `allowHttp`,\n`uploadIntegrity`, `requestStoredChecksum`, image, credentials Secret\nname and that Secret's `resourceVersion`) that store qualification last\nsucceeded against (issue #36).\nThe operator gates serving on `ravel-cli store qualify` before it creates any\nDeployment; recording the qualified inputs here makes that gate durable:\na later pass whose inputs still hash to this value proceeds without\nre-running qualification even after the one-shot Job has been\nTTL-garbage-collected, and a pass whose inputs no longer match re-runs it\n(the `StoreQualified` condition flips back to `Pending`) without tearing\ndown the running Deployments. Absent until the first qualification\nsucceeds. Qualification is never re-run on a schedule; only an input\nchange re-triggers it.",
+                    "description": "The qualify-Job input hash (bucket, region, endpoint, `allowHttp`,\n`uploadIntegrity`, `requestStoredChecksum`, image, credentials Secret\nname and that Secret's `resourceVersion`; on Azure the account,\ncontainer, image and `qualify` client ID) that store qualification last\nsucceeded against (issue #36).\nThe operator gates serving on `ravel-cli store qualify` before it creates any\nDeployment; recording the qualified inputs here makes that gate durable:\na later pass whose inputs still hash to this value proceeds without\nre-running qualification even after the one-shot Job has been\nTTL-garbage-collected, and a pass whose inputs no longer match re-runs it\n(the `StoreQualified` condition flips back to `Pending`) without tearing\ndown the running Deployments. Absent until the first qualification\nsucceeds. Qualification is never re-run on a schedule; only an input\nchange re-triggers it.",
                     "nullable": true,
                     "type": "string"
                   }

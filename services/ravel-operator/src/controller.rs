@@ -27,8 +27,9 @@ use kube::core::DynamicObject;
 use kube::{Api, Client, Resource, ResourceExt};
 use kube_runtime::controller::{Action, Controller};
 use kube_runtime::{WatchStreamExt, predicates, reflector, watcher};
-use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::azure::{AzureConfig, AzureStore};
 use ravel_object_store::s3::{S3Config, S3HttpConfig, S3Store};
+use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_types::{Signal, TenantHash, TenantHashScheme, TenantId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -40,7 +41,7 @@ use crate::metrics::{ReconcileMetrics, ReconcileResult};
 
 use crate::crd::{
     AffinityBackend, Condition, LocalSecretRef, MIN_RESHARD_LEAD_HOURS, RavelCluster,
-    RavelClusterSpec, RavelClusterStatus, ShardOverridesSpec,
+    RavelClusterSpec, RavelClusterStatus, S3Spec, ShardOverridesSpec, StorageBackend,
 };
 use crate::pod_identity::{AgentEndpoint, OperatorCredentialCache};
 use crate::reconcile::{
@@ -451,17 +452,18 @@ async fn resolve_credential_resource_versions(
     spec: &crate::crd::RavelClusterSpec,
 ) -> Result<std::collections::BTreeMap<String, String>, Error> {
     let mut versions = std::collections::BTreeMap::new();
-    // Under podIdentity no pod reads a credential Secret, so none is read
-    // here either: a leftover `credentialsSecretRef` naming a deleted Secret
-    // must not hold the cluster.
-    if pod_identity(spec) {
+    // Under podIdentity and on Azure no pod reads a credential Secret, so
+    // none is read here either: a leftover `credentialsSecretRef` naming a
+    // deleted Secret must not hold the cluster.
+    let Some(s3) = spec.storage.s3.as_ref() else {
+        return Ok(versions);
+    };
+    if pod_identity(spec) || spec.storage.azure.is_some() {
         return Ok(versions);
     }
     let refs = [
         (
-            spec.storage
-                .s3
-                .credentials_secret_ref
+            s3.credentials_secret_ref
                 .as_ref()
                 .map(|r| r.name.as_str())
                 .unwrap_or(""),
@@ -517,6 +519,7 @@ fn shared_credentials_rv<'a>(
 ) -> Option<&'a str> {
     spec.storage
         .s3
+        .as_ref()?
         .credentials_secret_ref
         .as_ref()
         .and_then(|secret| versions.get(&secret.name))
@@ -831,12 +834,25 @@ async fn resolve_s3_credentials(
 /// store from them in memory (`auth: Static` with the session token, no
 /// file). Without the webhook variables in the operator's environment this
 /// fails with [`Error::PodIdentityCredentialsUnavailable`] naming them.
+///
+/// Under `storage.azure` it is an [`AzureStore`] authenticated as the
+/// operator's own ServiceAccount through AKS workload identity: the webhook
+/// injects the `AZURE_*` variables it reads, and no Secret is read.
 async fn build_auth_store(
     client: &Client,
     namespace: &str,
     spec: &RavelClusterSpec,
     credentials: &OperatorCredentialCache,
-) -> Result<S3Store, Error> {
+) -> Result<Arc<dyn ObjectStoreBackend>, Error> {
+    let s3 = match spec.storage.backend() {
+        Some(StorageBackend::S3(s3)) => s3,
+        Some(StorageBackend::Azure(azure)) => {
+            let config = AzureConfig::new(azure.account.clone(), azure.container.clone());
+            let store = bounded_store_construction(AzureStore::new(config)).await?;
+            return Ok(Arc::new(store));
+        }
+        None => return Err(RenderError::StorageBackendNotExactlyOne.into()),
+    };
     let config = if pod_identity(spec) {
         let endpoint = AgentEndpoint::from_env()?;
         let role = credentials.get(&endpoint, SystemTime::now()).await?;
@@ -844,9 +860,7 @@ async fn build_auth_store(
         config.session_token = Some(role.session_token);
         config
     } else {
-        let secret_ref = spec
-            .storage
-            .s3
+        let secret_ref = s3
             .credentials_secret_ref
             .as_ref()
             .ok_or(RenderError::StaticCredentialsSecretRefMissing)?;
@@ -854,16 +868,76 @@ async fn build_auth_store(
             resolve_s3_credentials(client, namespace, secret_ref).await?;
         auth_store_config(spec, access_key_id, secret_access_key)?
     };
-    S3Store::with_http_config(config, auth_store_http_config(spec)).map_err(Error::Store)
+    let store =
+        S3Store::with_http_config(config, auth_store_http_config(s3)).map_err(Error::Store)?;
+    Ok(Arc::new(store))
+}
+
+/// How long [`build_auth_store`] waits for an [`AzureStore`] to finish
+/// constructing. Construction makes network requests (the
+/// hierarchical-namespace check), and a hung one must not hold the reconcile.
+pub(crate) const AZURE_AUTH_STORE_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Await a store construction for at most [`AZURE_AUTH_STORE_BUILD_TIMEOUT`].
+/// Running out is [`StoreError::Timeout`] under [`Error::Store`], the error a
+/// failed construction returns, so both reach the same `Degraded` condition.
+async fn bounded_store_construction<T>(
+    construction: impl Future<Output = Result<T, StoreError>>,
+) -> Result<T, Error> {
+    tokio::time::timeout(AZURE_AUTH_STORE_BUILD_TIMEOUT, construction)
+        .await
+        .map_err(|_| Error::Store(StoreError::Timeout))?
+        .map_err(Error::Store)
+}
+
+/// The two steps that open the operator's own store: `sys/auth` convergence
+/// when a deployment key is configured, then the `shardOverrides` reshard
+/// when the spec names at least one tenant. `build` runs at most once per
+/// pass, and not at all when neither step applies, so an Azure store's
+/// construction requests are made once.
+async fn converge_store_state<F, Fut>(
+    spec: &RavelClusterSpec,
+    deployment_key: Option<&[u8; 32]>,
+    token_values: &BTreeMap<String, Vec<u8>>,
+    now_ns: fn() -> i64,
+    build: F,
+) -> Result<(), Error>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Arc<dyn ObjectStoreBackend>, Error>>,
+{
+    let shard_overrides = spec
+        .shard_overrides
+        .as_ref()
+        .filter(|overrides| !overrides.tenants.is_empty());
+    if deployment_key.is_none() && shard_overrides.is_none() {
+        return Ok(());
+    }
+    let store = build().await?;
+    if let Some(deployment_key) = deployment_key {
+        reconcile_sys_auth_best_effort(deployment_key, token_values, store.as_ref(), now_ns())
+            .await;
+    }
+    if let Some(shard_overrides) = shard_overrides {
+        reconcile_shard_overrides(
+            spec,
+            shard_overrides,
+            deployment_key,
+            store.as_ref(),
+            now_ns(),
+        )
+        .await;
+    }
+    Ok(())
 }
 
 /// The HTTP client config [`build_auth_store`] connects with: the default
 /// tuning plus `spec.storage.s3.uploadIntegrity` and `requestStoredChecksum`,
 /// so the operator's own writes carry the checksum the server's do.
-fn auth_store_http_config(spec: &RavelClusterSpec) -> S3HttpConfig {
+fn auth_store_http_config(s3: &S3Spec) -> S3HttpConfig {
     S3HttpConfig {
-        upload_integrity: spec.storage.s3.upload_integrity.mode(),
-        request_stored_checksum: spec.storage.s3.request_stored_checksum,
+        upload_integrity: s3.upload_integrity.mode(),
+        request_stored_checksum: s3.request_stored_checksum,
         ..Default::default()
     }
 }
@@ -884,10 +958,15 @@ fn auth_store_config(
     // and the `shardOverrides` reshard, so deriving it from presence let the
     // operator downgrade connections the pods it renders refuse.
     let allow_http = s3_allow_http(spec)?;
-    let endpoint = spec.storage.s3.endpoint.clone();
+    let s3 = spec
+        .storage
+        .s3
+        .as_ref()
+        .ok_or(RenderError::StorageBackendNotExactlyOne)?;
+    let endpoint = s3.endpoint.clone();
     Ok(S3Config {
-        bucket: spec.storage.s3.bucket.clone(),
-        region: spec.storage.s3.region.clone(),
+        bucket: s3.bucket.clone(),
+        region: s3.region.clone(),
         endpoint,
         access_key_id,
         secret_access_key,
@@ -1932,36 +2011,19 @@ async fn reconcile_inner(
         obj.spec.deployment_key_secret_ref.as_ref(),
     )
     .await?;
-    if let Some(deployment_key) = deployment_key_secret.key {
-        let store =
-            build_auth_store(client, namespace, &obj.spec, &ctx.pod_identity_credentials).await?;
-        reconcile_sys_auth_best_effort(
-            &deployment_key,
-            &token_secret.token_values,
-            &store,
-            now_ns(),
-        )
-        .await;
-    }
-
-    // Converge shardOverrides to the ADR-0052 resharding mechanism (#147,
+    //
+    // Then converge shardOverrides to the ADR-0052 resharding mechanism (#147,
     // ADR-0076 decision 2), whenever the spec names at least one tenant.
     // Best-effort per (tenant, signal): see reconcile_shard_overrides's doc
     // comment for why a misconfigured override cannot block reconciliation.
-    if let Some(shard_overrides) = obj.spec.shard_overrides.as_ref()
-        && !shard_overrides.tenants.is_empty()
-    {
-        let store =
-            build_auth_store(client, namespace, &obj.spec, &ctx.pod_identity_credentials).await?;
-        reconcile_shard_overrides(
-            &obj.spec,
-            shard_overrides,
-            deployment_key_secret.key.as_ref(),
-            &store,
-            now_ns(),
-        )
-        .await;
-    }
+    converge_store_state(
+        &obj.spec,
+        deployment_key_secret.key.as_ref(),
+        &token_secret.token_values,
+        now_ns,
+        || build_auth_store(client, namespace, &obj.spec, &ctx.pod_identity_credentials),
+    )
+    .await?;
 
     // Reuse the credential resourceVersions resolved before the gate (finding 3):
     // each Deployment's pod-template checksum is computed (in reconcile) from the
@@ -2727,6 +2789,16 @@ pub(crate) const CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED: &str =
 /// main HTTP port instead of the dedicated health listener (issue #3112).
 pub(crate) const CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT: &str = "HealthProbeOnMainHttpPort";
 
+/// `status.conditions[].type` value saying whether the container's protection
+/// (versioning, soft delete, an immutability policy) was checked. Set only on a
+/// `storage.azure` cluster, always False: `--require-bucket-protection` has no
+/// Azure probes and is not rendered there (ADR-4158 D11).
+pub(crate) const CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED: &str = "BucketProtectionVerified";
+
+/// The `BucketProtectionVerified=False` reason on an Azure cluster.
+pub(crate) const BUCKET_PROTECTION_NOT_IMPLEMENTED_FOR_AZURE_REASON: &str =
+    "NotImplementedForAzure";
+
 /// `status.conditions[].type` value for an apiserver below
 /// [`MIN_KUBERNETES_MINOR_VERSION`] (issue #1714).
 pub(crate) const CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED: &str =
@@ -2746,6 +2818,7 @@ pub(crate) const CONDITION_TYPES: &[&str] = &[
     CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED,
     CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED,
     CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT,
+    CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED,
 ];
 
 /// Build a status Condition, stamping the current time as its transition time.
@@ -2819,6 +2892,11 @@ fn preserve_transition_times(
 /// opted out) still probes the main HTTP port instead of the dedicated
 /// health listener. See [`health_probe_on_main_http_port_condition`].
 ///
+/// `BucketProtectionVerified=False` with reason `NotImplementedForAzure` is
+/// set on every `storage.azure` cluster: the operator renders
+/// `--require-bucket-protection` for S3 (ADR-0072) and has no Azure probes,
+/// so the missing check is reported rather than silent (ADR-4158 D11).
+///
 /// The reconcile pass hands the result to whichever status writer runs; there
 /// is deliberately no read-modify-write against live status, which would race
 /// a concurrent writer.
@@ -2844,6 +2922,20 @@ fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) ->
 
     if let Some(cond) = health_probe_on_main_http_port_condition(spec, observed_generation) {
         conditions.push(cond);
+    }
+
+    if spec.storage.azure.is_some() {
+        conditions.push(condition(
+            CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED,
+            false,
+            observed_generation,
+            BUCKET_PROTECTION_NOT_IMPLEMENTED_FOR_AZURE_REASON,
+            "no container-protection check runs on Azure Blob Storage, so \
+             --require-bucket-protection is not rendered; configure blob \
+             versioning, soft delete and an immutability policy on the \
+             container by hand (see docs/guides/kubernetes.md, \
+             \"Azure Blob Storage with workload identity\")",
+        ));
     }
 
     conditions
@@ -3286,6 +3378,12 @@ fn degraded_reason(err: &Error) -> (String, String) {
         ),
         Error::Render(RenderError::PodIdentityTierOverride { .. }) => {
             ("PodIdentityTierOverride".to_string(), err.to_string())
+        }
+        Error::Render(RenderError::StorageBackendNotExactlyOne) => {
+            ("StorageBackendNotExactlyOne".to_string(), err.to_string())
+        }
+        Error::Render(RenderError::AzureTierOverride { .. }) => {
+            ("AzureTierOverride".to_string(), err.to_string())
         }
         // The message names the two webhook variables and asks whether the
         // operator's own ServiceAccount carries an association.
@@ -3760,8 +3858,8 @@ pub async fn run_on(
 mod tests {
     use super::*;
     use crate::crd::{
-        DistributedQuerySpec, GatewaySpec, IngestAffinitySpec, MaintainSpec, ProbesSpec, QuerySpec,
-        S3Spec, StorageSpec,
+        AzureSpec, DistributedQuerySpec, GatewaySpec, IngestAffinitySpec, MaintainSpec, ProbesSpec,
+        QuerySpec, S3Spec, StorageSpec,
     };
     use kube::Config;
 
@@ -3962,8 +4060,8 @@ mod tests {
     #[test]
     fn a_schemeless_endpoint_degrades_the_cluster_with_its_own_reason() {
         let mut spec = spec_with_affinity(None);
-        spec.storage.s3.endpoint = Some("rustfs:9000".to_string());
-        spec.storage.s3.allow_http = false;
+        spec.storage.test_s3_mut().endpoint = Some("rustfs:9000".to_string());
+        spec.storage.test_s3_mut().allow_http = false;
 
         let err = Error::Render(
             s3_allow_http(&spec).expect_err("a schemeless endpoint must refuse the reconcile"),
@@ -3996,7 +4094,7 @@ mod tests {
 
         // A plaintext non-loopback endpoint keeps its own, different reason, so
         // the two misconfigurations are never reported as one.
-        spec.storage.s3.endpoint = Some("http://rustfs:9000".to_string());
+        spec.storage.test_s3_mut().endpoint = Some("http://rustfs:9000".to_string());
         let (plaintext_reason, _) = degraded_reason(&Error::Render(
             s3_allow_http(&spec).expect_err("plaintext to a non-loopback host must refuse"),
         ));
@@ -4014,8 +4112,8 @@ mod tests {
     fn build_auth_store_refuses_a_plaintext_endpoint_without_allow_http() {
         let config_for = |endpoint: Option<&str>, allow_http: bool| {
             let mut spec = spec_with_affinity(None);
-            spec.storage.s3.endpoint = endpoint.map(str::to_string);
-            spec.storage.s3.allow_http = allow_http;
+            spec.storage.test_s3_mut().endpoint = endpoint.map(str::to_string);
+            spec.storage.test_s3_mut().allow_http = allow_http;
             auth_store_config(&spec, "key".to_string(), "secret".to_string())
         };
 
@@ -4070,19 +4168,19 @@ mod tests {
         use ravel_object_store::s3::UploadIntegrity;
 
         let mut spec = spec_with_affinity(None);
-        let http = auth_store_http_config(&spec);
+        let http = auth_store_http_config(spec.storage.test_s3());
         assert_eq!(http.upload_integrity, UploadIntegrity::Crc64Nvme);
         assert!(http.request_stored_checksum);
 
-        spec.storage.s3.upload_integrity = S3UploadIntegrity::Off;
-        spec.storage.s3.request_stored_checksum = false;
-        let http = auth_store_http_config(&spec);
+        spec.storage.test_s3_mut().upload_integrity = S3UploadIntegrity::Off;
+        spec.storage.test_s3_mut().request_stored_checksum = false;
+        let http = auth_store_http_config(spec.storage.test_s3());
         assert_eq!(http.upload_integrity, UploadIntegrity::Off);
         assert!(!http.request_stored_checksum);
 
-        spec.storage.s3.upload_integrity = S3UploadIntegrity::Sha256;
+        spec.storage.test_s3_mut().upload_integrity = S3UploadIntegrity::Sha256;
         assert_eq!(
-            auth_store_http_config(&spec).upload_integrity,
+            auth_store_http_config(spec.storage.test_s3()).upload_integrity,
             UploadIntegrity::Sha256
         );
     }
@@ -4094,7 +4192,7 @@ mod tests {
             image_pull_policy: None,
             shards: 4,
             storage: StorageSpec {
-                s3: S3Spec {
+                s3: Some(S3Spec {
                     bucket: "ravel-data".to_string(),
                     region: "eu-west-1".to_string(),
                     endpoint: None,
@@ -4105,7 +4203,8 @@ mod tests {
                     credentials_secret_ref: Some(LocalSecretRef {
                         name: "ravel-s3".to_string(),
                     }),
-                },
+                }),
+                azure: None,
             },
             tenant_tokens_secret_ref: None,
             deployment_key_secret_ref: None,
@@ -4126,6 +4225,21 @@ mod tests {
             retention: None,
             shard_overrides: None,
         }
+    }
+
+    /// `spec_with_affinity(None)` moved onto `storage.azure`.
+    fn azure_spec() -> RavelClusterSpec {
+        let mut spec = spec_with_affinity(None);
+        spec.storage = StorageSpec {
+            s3: None,
+            azure: Some(AzureSpec {
+                account: "ravelacct".to_string(),
+                container: "ravel-data".to_string(),
+                client_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                role_client_ids: None,
+            }),
+        };
+        spec
     }
 
     /// Condition `type`s in order, which is what the assertions below are
@@ -4324,6 +4438,14 @@ mod tests {
         );
         produced.push(CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED);
 
+        // BucketProtectionVerified: spec_conditions on a storage.azure spec.
+        let azure_extra = spec_conditions(&azure_spec(), Some(1));
+        assert_eq!(
+            condition_types(&azure_extra),
+            vec![CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED]
+        );
+        produced.push(CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED);
+
         let mut produced_sorted = produced.clone();
         produced_sorted.sort_unstable();
         let mut expected_sorted = CONDITION_TYPES.to_vec();
@@ -4331,6 +4453,57 @@ mod tests {
         assert_eq!(
             produced_sorted, expected_sorted,
             "every entry in CONDITION_TYPES must be demonstrated reachable here: got {produced:?}"
+        );
+    }
+
+    /// An Azure cluster reports BucketProtectionVerified=False with reason
+    /// NotImplementedForAzure on both status writers; an S3 cluster reports
+    /// no such condition at all.
+    #[test]
+    fn bucket_protection_verified_is_false_on_azure_and_absent_on_s3() {
+        let azure = spec_conditions(&azure_spec(), Some(3));
+        let cond = find(&azure, CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED);
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, "NotImplementedForAzure");
+        assert_eq!(cond.observed_generation, Some(3));
+
+        let success = build_status(
+            Some(3),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            PersistedStatus::default(),
+            azure.clone(),
+        );
+        assert_eq!(
+            find(
+                &success.conditions,
+                CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED
+            )
+            .status,
+            "False"
+        );
+        let degraded = build_degraded_status(
+            Some(3),
+            "ReconcileError",
+            "boom",
+            PersistedStatus::default(),
+            azure,
+        );
+        assert_eq!(
+            find(
+                &degraded.conditions,
+                CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED
+            )
+            .status,
+            "False"
+        );
+
+        let s3 = spec_conditions(&spec_with_affinity(None), Some(3));
+        assert!(
+            !condition_types(&s3).contains(&CONDITION_TYPE_BUCKET_PROTECTION_VERIFIED),
+            "an S3 cluster carries no BucketProtectionVerified condition: {s3:?}"
         );
     }
 
@@ -7315,7 +7488,7 @@ mod tests {
                 image_pull_policy: None,
                 shards,
                 storage: crate::crd::StorageSpec {
-                    s3: crate::crd::S3Spec {
+                    s3: Some(crate::crd::S3Spec {
                         bucket: "b".to_string(),
                         region: "us-east-1".to_string(),
                         endpoint: None,
@@ -7326,7 +7499,8 @@ mod tests {
                         credentials_secret_ref: Some(LocalSecretRef {
                             name: "creds".to_string(),
                         }),
-                    },
+                    }),
+                    azure: None,
                 },
                 tenant_tokens_secret_ref: None,
                 deployment_key_secret_ref: None,
@@ -7590,14 +7764,141 @@ mod tests {
                 "the retried attempt must have succeeded"
             );
         }
+
+        fn fixed_now_ns() -> i64 {
+            10 * RESHARD_NS_PER_HOUR
+        }
+
+        /// Run [`converge_store_state`] with a build closure that counts its
+        /// calls and hands out `store`; returns the count.
+        async fn converge_counting_builds(
+            spec: &RavelClusterSpec,
+            deployment_key: Option<&[u8; 32]>,
+            token_values: &BTreeMap<String, Vec<u8>>,
+            store: Arc<dyn ObjectStoreBackend>,
+        ) -> usize {
+            let builds = std::sync::atomic::AtomicUsize::new(0);
+            converge_store_state(spec, deployment_key, token_values, fixed_now_ns, || {
+                builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { Ok(store) }
+            })
+            .await
+            .expect("converges");
+            builds.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// With both a deployment key and shard overrides, one pass builds
+        /// the operator's store once and both steps write through it.
+        #[tokio::test]
+        async fn one_pass_builds_the_store_once_for_sys_auth_and_the_reshard() {
+            let deployment_key = [1u8; 32];
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory_store());
+            let hash = tenant_hash_for("acme", Some(&deployment_key));
+            ravel_catalog::validate_or_adopt(
+                store.as_ref(),
+                &hash,
+                Signal::Metrics,
+                4,
+                1_000,
+                AbsentPolicy::CreateFromConfig,
+            )
+            .await
+            .expect("seed generation-0 record");
+            let mut spec = test_spec(4);
+            spec.shard_overrides = Some(overrides(&[("acme", 1)], MIN_RESHARD_LEAD_HOURS));
+            let token_values = BTreeMap::from([("acme".to_string(), b"token-a".to_vec())]);
+
+            let builds = converge_counting_builds(
+                &spec,
+                Some(&deployment_key),
+                &token_values,
+                Arc::clone(&store),
+            )
+            .await;
+            assert_eq!(builds, 1);
+
+            let (map, _) = ravel_catalog::read_auth_map(store.as_ref(), &deployment_key)
+                .await
+                .expect("read succeeds")
+                .expect("sys/auth converged");
+            assert_eq!(map.entries.len(), 1);
+            let generations =
+                ravel_catalog::read_generations_from_store(store.as_ref(), &hash, Signal::Metrics)
+                    .await
+                    .expect("read succeeds")
+                    .expect("record exists");
+            assert_eq!(generations.last().map(|g| g.shard_count), Some(1));
+        }
+
+        /// Each step alone builds once; neither builds nothing.
+        #[tokio::test]
+        async fn the_store_is_built_only_when_a_step_needs_it() {
+            let deployment_key = [1u8; 32];
+            let token_values = BTreeMap::new();
+            let store = || -> Arc<dyn ObjectStoreBackend> { Arc::new(memory_store()) };
+            let mut with_overrides = test_spec(4);
+            with_overrides.shard_overrides =
+                Some(overrides(&[("acme", 1)], MIN_RESHARD_LEAD_HOURS));
+            let mut empty_overrides = test_spec(4);
+            empty_overrides.shard_overrides = Some(overrides(&[], MIN_RESHARD_LEAD_HOURS));
+
+            for (case, spec, key, expected) in [
+                ("neither", test_spec(4), None, 0),
+                ("empty shardOverrides", empty_overrides, None, 0),
+                (
+                    "deployment key only",
+                    test_spec(4),
+                    Some(&deployment_key),
+                    1,
+                ),
+                ("shardOverrides only", with_overrides, None, 1),
+            ] {
+                assert_eq!(
+                    converge_counting_builds(&spec, key, &token_values, store()).await,
+                    expected,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// A store construction that never answers is cut off after
+    /// [`AZURE_AUTH_STORE_BUILD_TIMEOUT`] on tokio's paused clock, and reaches
+    /// the same `Degraded` reason a construction error does.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_store_construction_times_out_into_the_construction_error_path() {
+        let started = tokio::time::Instant::now();
+        let hung = bounded_store_construction(std::future::pending::<Result<(), StoreError>>())
+            .await
+            .expect_err("a hung construction times out");
+        assert_eq!(started.elapsed(), AZURE_AUTH_STORE_BUILD_TIMEOUT);
+        assert_eq!(AZURE_AUTH_STORE_BUILD_TIMEOUT, Duration::from_secs(30));
+        assert!(matches!(hung, Error::Store(StoreError::Timeout)), "{hung}");
+
+        let failed = bounded_store_construction(async {
+            Err::<(), _>(StoreError::Permanent("hierarchical namespace".to_string()))
+        })
+        .await
+        .expect_err("a failed construction is an error");
+        assert!(matches!(failed, Error::Store(StoreError::Permanent(_))));
+        assert_eq!(
+            degraded_reason(&hung).0,
+            degraded_reason(&failed).0,
+            "a timeout and a construction error share one Degraded reason"
+        );
+
+        let built = bounded_store_construction(async { Ok::<_, StoreError>(7) })
+            .await
+            .expect("a prompt construction passes through");
+        assert_eq!(built, 7);
     }
 
     // ---- storage.s3.auth: podIdentity ----
 
     fn pod_identity_cluster_spec() -> RavelClusterSpec {
         let mut spec = spec_with_affinity(None);
-        spec.storage.s3.auth = crate::crd::S3AuthSpec::PodIdentity;
-        spec.storage.s3.credentials_secret_ref = None;
+        spec.storage.test_s3_mut().auth = crate::crd::S3AuthSpec::PodIdentity;
+        spec.storage.test_s3_mut().credentials_secret_ref = None;
         spec
     }
 
@@ -7645,6 +7946,16 @@ mod tests {
             message.contains("spec.maintain.credentialsSecretRef"),
             "{message}"
         );
+        let (reason, _) = degraded_reason(&Error::Render(RenderError::StorageBackendNotExactlyOne));
+        assert_eq!(reason, "StorageBackendNotExactlyOne");
+        let (reason, message) = degraded_reason(&Error::Render(RenderError::AzureTierOverride {
+            tier: "query",
+        }));
+        assert_eq!(reason, "AzureTierOverride");
+        assert!(
+            message.contains("spec.query.credentialsSecretRef"),
+            "{message}"
+        );
     }
 
     /// The operator's own store under podIdentity reads no Secret and, with
@@ -7684,7 +7995,7 @@ mod tests {
     #[tokio::test]
     async fn pod_identity_reads_no_credential_secret() {
         let mut spec = pod_identity_cluster_spec();
-        spec.storage.s3.credentials_secret_ref = Some(LocalSecretRef {
+        spec.storage.test_s3_mut().credentials_secret_ref = Some(LocalSecretRef {
             name: "deleted-long-ago".to_string(),
         });
         let versions = resolve_credential_resource_versions(&unreachable_client(), "ns", &spec)

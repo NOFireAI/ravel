@@ -598,19 +598,19 @@ d="$(new_tree kind_local_tag_is_exempt)"
 check "kind_local_tag_is_exempt: ravel-server:latest in ravelcluster-dev.yaml is not unpinned" \
   "${d}" 0 "examples/ravelcluster-dev.yaml:15: ravel-server:latest"
 check "kind_local_tag_is_exempt: ravel-operator:latest in operator.yaml is not unpinned" \
-  "${d}" 0 "operator/operator.yaml:53: ravel-operator:latest"
+  "${d}" 0 "operator/operator.yaml:58: ravel-operator:latest"
 check "kind_local_tag_is_exempt: exempt marker is used, not [UNPINNED]" \
   "${d}" 0 "[kind-local, exempt]"
 
 # Removing a k8s manifest image line must fail both the total-count and the
 # pin-required-count assertions, not silently scan fewer references. Deleting
-# rustfs.yaml's (pin-required) RustFS image line drops the total from 6 to 5
+# rustfs.yaml's (pin-required) RustFS image line drops the total from 7 to 6
 # and the pin-required count from 4 to 3.
 d="$(new_tree k8s-wrong-count)"
 mutate "${d}/deploy/k8s/rustfs.yaml" \
   '/^          image: ghcr\.io\/rustfs\/rustfs:/d'
 check "removing a k8s manifest image line fails the k8s total-count assertion" \
-  "${d}" 1 "found 5 k8s manifest image references, expected exactly 6"
+  "${d}" 1 "found 6 k8s manifest image references, expected exactly 7"
 check "removing a k8s manifest image line also fails the k8s pin-required-count assertion" \
   "${d}" 1 "found 3 pin-required k8s manifest image references, expected exactly 4"
 

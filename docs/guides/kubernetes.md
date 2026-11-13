@@ -195,6 +195,17 @@ override rewrites the container's `image:` but not this env value, so
 change the env with its own patch and check that the rendered manifest
 carries the same reference in both places.
 
+The operator pod template in `operator.yaml` has a commented
+`azure.workload.identity/use: "true"` label, and the `ravel-operator`
+ServiceAccount in `rbac.yaml` a commented
+`azure.workload.identity/client-id` annotation. Both are opt-in, and needed
+only when the operator manages a `RavelCluster` on `storage.azure` that sets
+`deploymentKeySecretRef` or names a tenant under `shardOverrides`: those are
+the only paths on which the operator's own store client opens the container,
+and it authenticates through AKS workload identity. Uncomment both, set the
+operator's client ID, and restart the operator pod (see
+[Azure Blob Storage with workload identity](#azure-blob-storage-with-workload-identity)).
+
 `crd.yaml` is generated from the Rust spec types. To regenerate it, run
 `cargo run -p ravel-operator -- --print-crd`.
 
@@ -230,7 +241,8 @@ Services in the namespace of each `RavelCluster`. Its ClusterRole grants:
 - the full lifecycle of Deployments, Services, Ingresses,
   `gateway.networking.k8s.io` HTTPRoutes/GRPCRoutes, the ServiceAccounts,
   Roles, and RoleBindings it renders for the `ravelNative` ingest router, and
-  the ServiceAccounts it renders under `storage.s3.auth: podIdentity`,
+  the ServiceAccounts it renders under `storage.s3.auth: podIdentity` or
+  `storage.azure`,
 - `RavelCluster` and its status subresource,
 - `get` on Secrets,
 - `get`/`list`/`watch` on `endpointslices` (needed to create the router's own
@@ -299,7 +311,9 @@ kubelet skew caveat above applies to it the same way.
 Group `ravel.nofire.ai`, version `v1alpha1`, namespaced, short name `rc`.
 
 A minimal example is in
-[`deploy/k8s/examples/ravelcluster-dev.yaml`](../../deploy/k8s/examples/ravelcluster-dev.yaml).
+[`deploy/k8s/examples/ravelcluster-dev.yaml`](../../deploy/k8s/examples/ravelcluster-dev.yaml),
+and an Azure one in
+[`deploy/k8s/examples/ravelcluster-azure.yaml`](../../deploy/k8s/examples/ravelcluster-azure.yaml).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -308,7 +322,7 @@ A minimal example is in
 | `spec.shards` | integer | required | Feeds `--shards` to the gateway, query, and maintain from one field, so nothing can break the must-match invariant. **Immutable after creation** through a CEL rule; use `spec.shardOverrides` for per-tenant resharding. |
 | `spec.shardOverrides.leadHours` | integer | `2` | Minimum hours of lead time an override needs before its shard count takes effect, matching the resharding mechanism's activation-hour semantics. Rejected below the mechanism's own floor. |
 | `spec.shardOverrides.tenants` | map | none | Per-tenant target shard count, tenant name to integer. A target that differs from the tenant's current active shard count drives a durable `append_generation` reshard; a target equal to the current count is a no-op. Lowering a tenant's shard count is the primary operator-facing cost control, and it has costs of its own (a single-actor throughput ceiling, shard-0 concentration, coarser maintenance units) documented in [shard-overrides.md](shard-overrides.md). |
-| `spec.storage.s3.bucket` | string | required | |
+| `spec.storage.s3.bucket` | string | required under `storage.s3` | |
 | `spec.storage.s3.region` | string | `us-east-1` | |
 | `spec.storage.s3.endpoint` | string | none | Omit for real AWS S3. Path-style addressing is always used. |
 | `spec.storage.s3.allowHttp` | boolean | `false` | Renders `--s3-allow-http` on every server container, and `RAVEL_S3_ALLOW_HTTP=true` on the store-qualification Job that runs `ravel-cli store qualify` before any server pod exists. Required when `endpoint` is a plaintext `http://` URL whose host is not loopback: no pod reaches its object store over loopback, so without it the operator refuses the cluster at render time (`Degraded`, reason `PlaintextS3Endpoint`, message naming this field) and creates no Deployment, Service, or qualify Job, rather than moving telemetry and S3 credentials across the cluster network in the clear. The same rule governs the operator's own S3 client, the one that reconciles `sys/auth` and applies `shardOverrides`. Editing this field re-runs store qualification, since it changes whether that check can reach the store. Leave unset for an `https://` endpoint and for real AWS S3. |
@@ -316,6 +330,10 @@ A minimal example is in
 | `spec.storage.s3.requestStoredChecksum` | boolean | `true` | Whether requests ask the endpoint for the checksum it stored, so full-object reads are verified. `false` renders `--s3-request-stored-checksum=false` on every server container and applies to the operator's own S3 client; every full-object read is then counted in `ravel_store_get_unverified_total`. The store-qualification Job always carries the value as `RAVEL_S3_REQUEST_STORED_CHECKSUM`, and editing this field re-runs it. |
 | `spec.storage.s3.auth` | string | `static` | Where the pods and the operator get their storage credentials. `static`: the key pair in `credentialsSecretRef`. `podIdentity`: EKS Pod Identity roles, with no key in any Secret; see [Pod Identity](#pod-identity). IRSA (web identity) is not supported. Switching modes re-runs store qualification. |
 | `spec.storage.s3.credentialsSecretRef.name` | string | required under `auth: static` | Secret with keys `accessKeyId` and `secretAccessKey`. A CEL rule refuses a `static` cluster without it. Not read under `auth: podIdentity`. |
+| `spec.storage.azure.account` | string | required under `storage.azure` | Storage account, 3 to 24 lowercase letters and digits (the CRD refuses any other shape at admission), rendered as `--azure-account` on every server container and `RAVEL_AZURE_ACCOUNT` on the store-qualification Job. The account must have hierarchical namespace disabled. See [Azure Blob Storage with workload identity](#azure-blob-storage-with-workload-identity). |
+| `spec.storage.azure.container` | string | required under `storage.azure` | Container, 3 to 63 lowercase letters, digits and single hyphens, starting and ending with a letter or digit (checked at admission), rendered as `--azure-container` and `RAVEL_AZURE_CONTAINER`. |
+| `spec.storage.azure.clientId` | string | required under `storage.azure` | Client ID (a UUID, checked at admission) of the user-assigned managed identity the pods run as, written as the `azure.workload.identity/client-id` annotation on each of the four operator-owned ServiceAccounts whose role `roleClientIds` leaves unset. Changing it rolls the pods of every tier `roleClientIds` leaves unset. |
+| `spec.storage.azure.roleClientIds.gateway`, `.query`, `.maintain`, `.qualify` | string | `clientId` | Per-role client ID (a UUID), so each role can run as its own managed identity with its own data access. Editing a tier's entry rolls that tier's pods. Editing the `qualify` entry, or `clientId` while `qualify` is unset, re-runs store qualification. |
 | `spec.tenantTokensSecretRef.name` | string | none | Secret whose keys are tenant names and whose values are bearer tokens. |
 | `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
 | `spec.auditTokenKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters): the query-audit token key. Omit on a cluster with `deploymentKeySecretRef` set. See "Query-audit token key" below. |
@@ -365,8 +383,11 @@ A minimal example is in
 | `spec.retention.tenants` | map | none | Per-tenant overrides, tenant name to duration. |
 | `spec.probes.dedicatedHealthPort` | boolean | `true` | Probe the dedicated health listener on 4316 instead of the main HTTP port. Requires a server image of v0.19.0 or newer, which has `--listen-health`. Set `false` to keep probes on the main HTTP port. An existing cluster keeps its stored value; see "The dedicated health port" below. |
 
-`storage.s3` is mandatory. No field selects the memory store, because a
-non-durable per-process store is incoherent across multiple pods. No field
+`spec.storage` sets exactly one of `s3` and `azure`: a CEL rule on
+`storage` refuses a spec with neither or both at admission, and the
+operator refuses one admitted before the rule existed with `Degraded`,
+reason `StorageBackendNotExactlyOne`. No field selects the memory store,
+because a non-durable per-process store is incoherent across multiple pods. No field
 can produce `--dev-insecure-tenant-header`, and the operator never sets it
 under any configuration.
 
@@ -826,7 +847,7 @@ For a `RavelCluster` named `dev`:
 | `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative`. See [ingest-affinity.md](ingest-affinity.md). |
 | `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayApi`, independent of the backend. |
 | `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayApi.grpc` is `false`. |
-| `dev-gateway`, `dev-query`, `dev-maintain`, `dev-qualify` | ServiceAccount | The accounts the three tiers and the qualify Job run as. Only under `storage.s3.auth: podIdentity`; see [Pod Identity](#pod-identity). After a switch back to `static` the operator deletes them by name, so do not create accounts with these names yourself in a cluster that has run under `podIdentity`. A cluster that never ran under `podIdentity` does not touch them. |
+| `dev-gateway`, `dev-query`, `dev-maintain`, `dev-qualify` | ServiceAccount | The accounts the three tiers and the qualify Job run as. Only under `storage.s3.auth: podIdentity` or `storage.azure`; see [Pod Identity](#pod-identity) and [Azure Blob Storage with workload identity](#azure-blob-storage-with-workload-identity). After a switch to S3 `static` the operator deletes them by name, so do not create accounts with these names yourself in a cluster that has run under either. A cluster that never ran under either does not touch them. |
 
 You can scale `spec.maintain.replicas` above one safely. Maintain renders
 `RollingUpdate`, the same as gateway and query. It defaults to one replica
@@ -883,8 +904,11 @@ The operator recreates the Job only when its inputs change: the bucket,
 region, endpoint, `allowHttp`, `uploadIntegrity`, `requestStoredChecksum`,
 server image, or the shared credentials Secret's name or `resourceVersion`.
 A switch of `storage.s3.auth` between `static` and `podIdentity` is a change
-of input too. Upgrading the operator does not re-qualify a `static` cluster:
-its inputs hash exactly as before the field existed.
+of input too. On a `storage.azure` cluster the inputs are the account, the
+container, the server image and the `qualify` client ID, and a switch
+between S3 and Azure always re-qualifies. Upgrading the operator does not
+re-qualify an S3 cluster: its inputs hash exactly as before the `auth` and
+`azure` fields existed.
 
 - A rotation of that Secret in place bumps its `resourceVersion`. A rotation
   to credentials that no longer pass qualification therefore re-qualifies
@@ -952,8 +976,8 @@ kubectl get -n ravel-system ravelcluster dev -o jsonpath='{.status}'
 `qualifyFailureCount` and `qualifyNextRetryTime` are the machine-readable
 form of the retry-budget state that the `StoreQualified` message describes in
 prose. `podIdentityServiceAccounts` is `true` from the first
-`storage.s3.auth: podIdentity` pass until the operator has deleted those
-ServiceAccounts after a switch back to `static`.
+`storage.s3.auth: podIdentity` or `storage.azure` pass until the operator
+has deleted those ServiceAccounts after a switch to S3 `static`.
 
 The conditions are:
 
@@ -980,6 +1004,11 @@ The conditions are:
   every write until the default flipped to `true` (see "The
   dedicated health port" below). Absent once probes resolve to the dedicated
   listener, whether from an explicit `true` or the current schema default.
+- `BucketProtectionVerified`. Present only on a `storage.azure` cluster,
+  with status `False` and reason `NotImplementedForAzure`: the operator
+  renders no `--require-bucket-protection` there, because no Azure
+  container-protection check exists yet. Configure the protection by hand;
+  see [Azure Blob Storage with workload identity](#azure-blob-storage-with-workload-identity).
 
 The operator emits no `Progressing` condition, so do not wait on one.
 
@@ -1552,10 +1581,179 @@ What else changes under `podIdentity`:
   and the seconds left on the current file, and an error once that file's
   credential has expired.
 
+### Azure Blob Storage with workload identity
+
+Under `spec.storage.azure` the cluster stores its data in an Azure Blob
+Storage container and every pod, the qualify Job and the operator itself
+authenticate through AKS workload identity. No storage key
+exists in any Secret and the CRD has no field for one. The server image must
+be one whose `ravel-server` and `ravel-cli` accept `--store azure`.
+
+```yaml
+spec:
+  storage:
+    azure:
+      account: ravelprod
+      container: ravel-data
+      clientId: <managed identity client ID>
+      roleClientIds:          # optional, one identity per role
+        gateway: <client ID>
+        query: <client ID>
+        maintain: <client ID>
+        qualify: <client ID>
+```
+
+[`deploy/k8s/examples/ravelcluster-azure.yaml`](../../deploy/k8s/examples/ravelcluster-azure.yaml)
+is a complete example.
+
+What the operator renders:
+
+- The same four ServiceAccounts as under [Pod Identity](#pod-identity),
+  `<name>-gateway`, `<name>-query`, `<name>-maintain` and
+  `<name>-qualify`, each annotated `azure.workload.identity/client-id`
+  with its role's entry in `roleClientIds`, or `clientId` when that entry
+  is unset. Each pod runs as its account.
+- The label `azure.workload.identity/use: "true"` on each tier's pod
+  template and on the qualify Job's. The AKS webhook then injects
+  `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE` and
+  the projected token. The Deployment selectors do not change.
+- The annotation `ravel.nofire.ai/azure-client-id` on each tier's pod
+  template, holding that tier's client ID. The webhook sets
+  `AZURE_CLIENT_ID` only when it admits a pod, so a running pod keeps the
+  identity it started with; the annotation makes a client ID change roll
+  the tier whose ID changed, and only that tier. The qualify Job carries no
+  such annotation: a change to its client ID re-runs qualification instead.
+- `--store azure --azure-account <account> --azure-container <container>`
+  on every tier, and `ravel-cli --store azure store qualify` with
+  `RAVEL_AZURE_ACCOUNT` and `RAVEL_AZURE_CONTAINER` on the qualify Job. No
+  `--s3-*` flag, no `RAVEL_S3_*` variable, no credentials sidecar and no
+  `aws-credentials` volume.
+
+What you create on the Azure side, outside Ravel:
+
+1. An AKS cluster with the OIDC issuer and workload identity enabled:
+
+   ```sh
+   az aks update -g <rg> -n <aks> --enable-oidc-issuer --enable-workload-identity
+   ISSUER=$(az aks show -g <rg> -n <aks> --query oidcIssuerProfile.issuerUrl -o tsv)
+   ```
+
+2. A storage account with hierarchical namespace disabled, which is the
+   default (`--enable-hierarchical-namespace false`), and the container.
+   Only a flat-namespace account works: the store reads
+   `x-ms-is-hns-enabled` when it starts and refuses an ADLS Gen2 account,
+   whose listing order differs from the one Ravel depends on. The qualify
+   Job then fails and no Deployment is created.
+
+3. A user-assigned managed identity per role (or one shared by all, named
+   in `clientId`), and one for the operator. Each needs a federated
+   credential with the cluster's issuer, audience
+   `api://AzureADTokenExchange`, and one of these five subjects, where
+   `<namespace>` and `<name>` are the `RavelCluster`'s:
+
+   | Subject | Identity |
+   |---|---|
+   | `system:serviceaccount:<namespace>:<name>-gateway` | gateway |
+   | `system:serviceaccount:<namespace>:<name>-query` | query |
+   | `system:serviceaccount:<namespace>:<name>-maintain` | maintain |
+   | `system:serviceaccount:<namespace>:<name>-qualify` | qualify |
+   | `system:serviceaccount:ravel-system:ravel-operator` | the operator, in the shipped manifests |
+
+   One shared identity needs all four `RavelCluster` subjects as separate
+   federated credentials on it.
+
+   ```sh
+   az identity federated-credential create -g <rg> \
+     --identity-name ravel-prod-gateway --name prod-gateway \
+     --issuer "$ISSUER" --audiences api://AzureADTokenExchange \
+     --subject system:serviceaccount:ravel-system:prod-gateway
+   ```
+
+4. A role assignment for each identity on the container. Every Ravel role
+   reads, writes and deletes blobs, so each needs
+   `Storage Blob Data Contributor`, scoped to the container rather than the
+   account. The operator's identity needs it on every container whose
+   `RavelCluster` sets `deploymentKeySecretRef` or `shardOverrides`, since
+   it writes `sys/auth` and the reshard records there. Narrowing a role to
+   its key prefixes, as the S3 templates in `deploy/iam/` do, takes an
+   attribute-based condition on the assignment; Ravel ships no template for
+   it yet.
+
+   ```sh
+   az role assignment create --assignee-object-id <principal ID> \
+     --assignee-principal-type ServicePrincipal \
+     --role "Storage Blob Data Contributor" \
+     --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>/blobServices/default/containers/<container>
+   ```
+
+5. For the operator, only when a `RavelCluster` on `storage.azure` sets
+   `deploymentKeySecretRef` or names a tenant under `shardOverrides`:
+   uncomment the `azure.workload.identity/client-id` annotation on the
+   `ravel-operator` ServiceAccount in `rbac.yaml` and set its client ID,
+   and uncomment the `azure.workload.identity/use: "true"` label on the
+   operator pod template in `operator.yaml`. Both are opt-in and ship
+   commented. Then restart the operator pod
+   (`kubectl -n ravel-system rollout restart deployment/ravel-operator`):
+   the webhook injects the identity only when it admits a pod, so a pod
+   that was running before the label and annotation were applied has no
+   Azure credential.
+
+The federated credentials and role assignments can exist before the
+ServiceAccounts do. The operator applies the accounts before the qualify
+Job, as under Pod Identity, so the first deploy does not wait on them.
+
+Container protection is yours to configure. On S3 the operator renders
+`--require-bucket-protection`, which refuses to start a server on a bucket
+without versioning and Object Lock. No equivalent check exists
+for Azure yet, so the operator renders no such flag and reports the gap
+instead of hiding it: every `storage.azure` cluster carries the condition
+`BucketProtectionVerified=False` with reason `NotImplementedForAzure`.
+Configure, by hand, following
+[`docs/object-store-contract.md`, "Required bucket configuration"](../object-store-contract.md#required-bucket-configuration-adr-0064-7-adr-0072-decision-3):
+
+- blob versioning on the storage account only paired with a lifecycle
+  management rule that deletes previous versions. Versioning without that
+  rule turns every Ravel delete (the retention sweep, selective erasure)
+  into a soft delete that keeps the bytes indefinitely;
+- blob soft delete and container soft delete with a bounded retention,
+  longer than your recovery window and no longer than your erasure
+  obligations allow, since soft-deleted data stays restorable until the
+  retention ends;
+- an immutability policy only where it does not refuse the deletes that
+  retention and erasure need. A container-level time-based policy refuses
+  the delete of every blob in the container younger than its retention
+  interval, tenant data included, so it does not fit.
+
+Store qualification does not check any of this. The qualify Job writes
+and deletes only under `sys/qualify/<run-id>/` and writes the single
+`sys/qualification` key, so a policy that refuses deletes elsewhere in the
+container passes qualification and fails later, when retention or erasure
+first deletes there.
+
+What else changes under `storage.azure`:
+
+- The per-tier `credentialsSecretRef` overrides are refused at admission by
+  a CEL rule, and at render time with `Degraded`, reason
+  `AzureTierOverride`. Each tier's identity is its ServiceAccount's client
+  ID.
+- The operator reads no credential Secret for the store, its own client
+  included. It opens the container at most once per reconcile pass, and
+  only for `sys/auth` convergence or a reshard; a client that takes longer
+  than 30 s to start degrades the cluster with reason `ReconcileError`, as
+  a client that fails to start does.
+- A client ID change rolls the affected tier: editing
+  `roleClientIds.<tier>` rolls that tier's pods, and editing `clientId`
+  rolls every tier whose `roleClientIds` entry is unset.
+- The cluster counts as per-role, so the maintain-first `sys/gc` bootstrap
+  order below applies.
+- A switch between `storage.s3` and `storage.azure` re-runs store
+  qualification. A switch from S3 Pod Identity keeps the four
+  ServiceAccounts, now annotated; a switch to S3 `static` deletes them.
+
 ### The `sys/gc` bootstrap order
 
-A per-mode `credentialsSecretRef`, or `storage.s3.auth: podIdentity`, also
-changes the order in which the operator applies the three Deployments. Every
+A per-mode `credentialsSecretRef`, `storage.s3.auth: podIdentity`, or
+`storage.azure` also changes the order in which the operator applies the three Deployments. Every
 `ravel-server` mode creates the durable `sys/gc` object if it is absent and
 then validates itself against it.
 Under the per-role policies, only Maintain and Admin can write it.
