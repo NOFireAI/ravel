@@ -783,11 +783,13 @@ judged on object count, not on a different per-object probe.
 
 ## Open questions for the owner
 
-1. `Q_BC`: 4 MiB per covering part for passes B and C, about pass A's
-   bytes and about 11 opened objects of probe wire. `S_max` (192) follows
-   from it on the worked example; a different `Q_BC` moves `S_max` along
-   the table in section "Expected cost". A lower value sends broad
-   selectors to the label-value route sooner.
+1. `Q_A` and `Q_BC`: 8 MiB per covering part for pass A, 1.6 times the
+   largest corpus plan and about 21 opened objects of probe wire, and 4
+   MiB for passes B and C, about pass A's bytes on the worked statement
+   and about 11 opened objects. `S_max` (192) follows from `Q_BC` on the
+   worked example; a different `Q_BC` moves `S_max` along the table in
+   section "Expected cost". Lower values send broad selectors, and
+   statements of many plans, to the label-value route sooner.
 2. The cap: one `metrics_series_index_max_ratio_ppm` at 1 %, separate
    from the label index's 1 %, or one shared cap over all four fields.
 3. Large postings: pass A reads 4.62 MB on-object, mostly the `__name__` and
@@ -806,6 +808,6 @@ judged on object count, not on a different per-object probe.
 | task | decision | crates | depends on | risk |
 |---|---|---|---|---|
 | R1 leaf version 3 reader: header `entry_kind`, the posting entry type with its decoder, kind-1 splitter and encoder (codec only, no fold calls them), the shared pair encoding of decision 1, the property, fuzz and corrupt-input tests, `inspect kidx` prints the kind, docs/catalog-and-mvcc.md | 5 | ravel-catalog, ravel-cli, proto | owner approval | medium: a format change |
-| R2 series route in the resolve: passes A to C, `S_max` and the `Q_BC` byte budget with its unbridged-case check and the `S_max` override A9 uses, the declines, the new counters and pass rows, the ordering against `label_value`, docs/query-engine.md | 3, 4 | ravel-query, ravel-server | R1 | medium |
+| R2 series route in the resolve: passes A to C shared over the statement's routed plans, the `Q_A` and `Q_BC` byte budgets over each pass's union with their unbridged-case checks, the cheapest-first admission of plans to each pass, `S_max` over the union and the `S_max` override A9 uses, the per-plan and per-part declines, the new counters and pass rows, the ordering against `label_value`, docs/query-engine.md | 3, 4 | ravel-query, ravel-server | R1 | medium |
 | W1 the fold build and carry behind `metrics_series_index`, off, writing the posting fields through R1's kind-1 splitter and encoder; the cap and its report | 1, 2 | ravel-catalog, ravel-server, ravel-cli | R1 released to every process | medium |
 | M1 harness `series_holders` stamp and the acceptance run | acceptance | ravel-bench | R2, W1 | low |
