@@ -2316,37 +2316,33 @@ async fn a_zero_decode_workers_is_refused_by_the_logs_loader() {
     let mut memory = LoadMemoryOptions::new(LoadMemoryRequest::Unbudgeted);
     memory.decode_workers = Some(0);
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let result = tokio::time::timeout(
-        Duration::from_secs(60),
-        load_instrumented_at(
-            Arc::clone(&store),
-            &pq,
-            "acme",
-            &m,
-            1,
-            10,
-            0,
-            Some(1),
-            Some(1),
-            DEFAULT_MAX_INFLIGHT_FLUSHES,
-            DEFAULT_DECODE_QUEUE_BATCHES,
-            Some(PER_BATCH_TARGET_BYTES),
-            None,
-            NOW_NS,
-            TestClock::new(NOW_NS) as Arc<dyn Clock>,
-            LoadPath::Columnar,
-            None,
-            None,
-            RlogZstdLevel::default(),
-            RlogGroupTargetBlocks::DEFAULT,
-            RlogChunkOrder::DEFAULT,
-            Some(memory),
-            false,
-            Arc::new(TenantRules::none()),
-        ),
+    let result = load_instrumented_at(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &m,
+        1,
+        10,
+        0,
+        Some(1),
+        Some(1),
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        Some(PER_BATCH_TARGET_BYTES),
+        None,
+        NOW_NS,
+        TestClock::new(NOW_NS) as Arc<dyn Clock>,
+        LoadPath::Columnar,
+        None,
+        None,
+        RlogZstdLevel::default(),
+        RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
+        Some(memory),
+        false,
+        Arc::new(TenantRules::none()),
     )
-    .await
-    .expect("the load returns");
+    .await;
     match result {
         Err(LoadError::Setup(msg)) => assert_eq!(msg, DECODE_WORKERS_ZERO),
         other => panic!("expected the --decode-workers setup error: {other:?}"),
