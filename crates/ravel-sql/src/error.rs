@@ -534,10 +534,16 @@ pub enum SqlError {
     /// from the original error *before* it is behind the `Arc`, so a
     /// `TooManySamples` or `ResourcesExhausted` that happens to cross a
     /// `Shared` boundary still keeps its own class and text instead of
-    /// collapsing into a generic execution failure. Never constructed
-    /// outside `classify_shared`.
-    #[error("{message}")]
-    Shared { class: ErrorClass, message: String },
+    /// collapsing into a generic execution failure. `detail` is the original
+    /// error's own `Display`, so the server log keeps the cause, and
+    /// `Display` prints it. `client_message()` returns `message`, not
+    /// `detail`. Production code constructs it only in `classify_shared`.
+    #[error("{detail}")]
+    Shared {
+        class: ErrorClass,
+        message: String,
+        detail: String,
+    },
 }
 
 impl From<ParquetQueryError> for SqlError {
@@ -1922,8 +1928,14 @@ mod tests {
         let shared = SqlError::Shared {
             class: ErrorClass::Unavailable,
             message: MSG_CORRUPT.to_string(),
+            detail: format!("segment fetch failed: {LEAKY_KEY}"),
         };
         assert_eq!(shared.class(), ErrorClass::Unavailable);
+        assert!(!shared.is_integrity_fault());
+        // The client gets the captured message; the detail is for the log.
+        assert_eq!(shared.client_message(), MSG_CORRUPT);
+        assert_redacted(&shared.client_message());
+        assert!(shared.to_string().contains(LEAKY_KEY));
         assert_eq!(
             SqlError::DeadlineExceeded { millis: 5 }.class(),
             ErrorClass::Timeout
