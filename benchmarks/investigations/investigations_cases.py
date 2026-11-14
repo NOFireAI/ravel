@@ -6062,12 +6062,14 @@ class Box(Workdir):
 
     def sourced_states(self, script=None):
         """run.sh sourced, outside a dry run, with a ravel-cli stub that
-        prints its arguments and exits 7: the folded_no_leaves and
+        answers --help with no text (no leaf-off flag) and otherwise prints
+        its arguments and exits 7: the folded_no_leaves and
         folded_leaves states' folds fail for real (inv.py measure runs the
         stub), and run_states runs both. Returns (exit, output, out dir)."""
         stub = self.path("stub-cli")
         with open(stub, "w") as f:
-            f.write('#!/bin/sh\necho "stub ravel-cli refused: $*"\nexit 7\n')
+            f.write('#!/bin/sh\ncase " $* " in *" --help "*) exit 0 ;; esac\n'
+                    'echo "stub ravel-cli refused: $*"\nexit 7\n')
         os.chmod(stub, 0o755)
         out = self.path("out")
         driver = self.path("driver.sh")
@@ -6076,6 +6078,7 @@ class Box(Workdir):
 source {script or os.path.join(BOX, "run.sh")} --dry-run --lane local --run-toml {os.path.join(BOX, "run.local-smoke.toml")} --out {out}
 DRY_RUN=0
 load_config
+BIN={stub}
 CLI=({stub})
 STATES="folded_no_leaves folded_leaves"
 run_states
