@@ -4,8 +4,9 @@
 //! built.
 //!
 //! Every wait in this module is released by an event the test arranges.
-//! [`HANG_GUARD`] only turns a regression that never releases into a failure
-//! instead of a hung run; no assertion depends on how long anything takes.
+//! [`HANG_GUARD`] and [`RUN_GUARD`] only turn a regression that never
+//! releases into a failure instead of a hung run; no assertion depends on how
+//! long anything takes.
 
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -15,6 +16,10 @@ use ravel_ingest::IngestByteBudgetLimit;
 use super::*;
 
 const HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// The hang guard on a whole decode run, longer than [`HANG_GUARD`] so a
+/// gated build that gives up is reported by the assertion on it.
+const RUN_GUARD: Duration = Duration::from_secs(120);
 
 /// One emitted outcome, reduced to what a sequence comparison needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +133,7 @@ impl Decode<'_> {
     ) -> Vec<Emitted> {
         let budgeted = charger.is_some();
         let (mut rx, handle) = self.spawn(workers, hook, charger);
-        let drained = tokio::time::timeout(HANG_GUARD, async {
+        let drained = tokio::time::timeout(RUN_GUARD, async {
             let mut out = Vec::new();
             while let Some(p) = rx.recv().await {
                 out.push(emitted(p, budgeted));
@@ -451,7 +456,7 @@ async fn every_batch_is_charged_before_its_build_starts() {
     );
     gate.release();
 
-    let rest = tokio::time::timeout(HANG_GUARD, async {
+    let rest = tokio::time::timeout(RUN_GUARD, async {
         let mut out = Vec::new();
         while let Some(p) = rx.recv().await {
             out.push(emitted(p, true));
