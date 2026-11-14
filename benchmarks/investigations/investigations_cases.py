@@ -1695,6 +1695,38 @@ class Evaluate(Workdir):
     def test_duplicate_fold_stamp(self):
         self.assertEqual(self.check_duplicate_stamp(), [])
 
+    def check_leaf_off_fold_leaves(self, evaluate_py=EVALUATE):
+        """Failures of the leaf-off-fold-wrote-leaves case; empty when evaluate is right. folded_no_leaves
+        and many_parts_24 ran with the leaf-off flag, yet their reports say leaves were written, as a
+        ravel-cli that renamed or moved its opt-out would report."""
+        path = os.path.join(self.run_dir, "stamps", "folds.jsonl")
+        folds = read_jsonl(path)
+        for f in folds:
+            if (f["transition"], f["signal"]) == ("folded_no_leaves", "spans"):
+                f["report"]["key_index_leaves_written"] = 5
+            elif f["transition"] == "many_parts_24":
+                f["report"]["key_index_leaves_written"] = 4
+        write_jsonl(path, folds)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = []
+        if code != 1:
+            out.append(f"exit {code}")
+        if res["verdict"] != "fail":
+            out.append(f"verdict {res['verdict']}")
+        for want in ("wrong fold folded_no_leaves/inv/spans key_index_leaves_written 5, want 0: the fold ran "
+                     "with the leaf-off flag (stamps/fold_flags.json) and still built leaves",
+                     "wrong fold many_parts_24/mp24/spans key_index_leaves_written 4, want 0: the fold ran "
+                     "with the leaf-off flag (stamps/fold_flags.json) and still built leaves"):
+            if want not in res["problems"]:
+                out.append(f"no '{want}' in problems {res['problems']}")
+        if any(p.startswith(("wrong fold folded_no_leaves/inv/logs", "wrong fold fold_advance",
+                             "wrong fold many_parts_24_leaf_rebuild")) for p in res["problems"]):
+            out.append(f"a fold that wrote no leaf, or was meant to, refused: {res['problems']}")
+        return out
+
+    def test_leaf_off_fold_leaves(self):
+        self.assertEqual(self.check_leaf_off_fold_leaves(), [])
+
     def test_band_miss(self):
         code, res, _ = self.go(self.pass_bands(PASS_BANDS.replace('target_if = "v >= 1"', 'target_if = "v >= 10000"')))
         self.assertEqual(code, 1)
@@ -4358,6 +4390,11 @@ FLIPS = {
         "            problems.add(\"duplicate\", f\"{name} {'/'.join(str(x) for x in k)}\")\n            out[k] = None\n",
         "            out[k] = line\n",
         "check_duplicate_stamp",
+    ),
+    "a leaf-off fold's key_index_leaves_written unread": (
+        "        elif line and LEAF_OFF_FOLD.fullmatch(k[0]):\n",
+        "        elif False:\n",
+        "check_leaf_off_fold_leaves",
     ),
     "absent catalog stamp skipped": (
         '                    problems.add("missing", f"covering_parts.{s}.{lab}")',

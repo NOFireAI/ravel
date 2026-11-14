@@ -216,7 +216,13 @@ its keyIndex GETs at 2 x that count.
   lists it as an option (a ravel-cli built after issue #4200 builds key-index
   leaves unless told not to), nothing otherwise (one built before it builds
   no leaf unless asked). The help is read once per run, before the first
-  such fold, and the choice is stamped in `stamps/fold_flags.json`.
+  such fold, and the choice is stamped in `stamps/fold_flags.json`. The
+  evaluator fails the run (problem `wrong fold <transition>/<tenant>/<signal>
+  key_index_leaves_written N, want 0`) when a `folded_no_leaves` or
+  `many_parts_N` fold report in `stamps/folds.jsonl` carries
+  `key_index_leaves_written` above 0, so a ravel-cli whose opt-out the help
+  read missed cannot build leaves unnoticed; a report without that field
+  comes from a ravel-cli that predates leaves and passes.
 - `folded_leaves`: `catalog fold --key-index-leaves`, then `catalog fold
   --rebuild-key-index` (stamped as transition `leaf_rebuild`). The leaves
   fold right after a plain fold has nothing left to seal and writes no leaf;

@@ -79,6 +79,9 @@ DAY_PARTS_TENANTS = {"day_parts_7": "dp7", "day_parts_30": "dp30"}
 PREFOLD_STATES = ("day_parts_7", "day_parts_30")
 INFLIGHT_STATES = ("compaction_in_flight",)
 SIGNALS = ("spans", "logs")
+# The fold transitions box/run.sh runs with the leaf-off flag
+# (stamps/fold_flags.json folds), each meant to build no key-index leaf.
+LEAF_OFF_FOLD = re.compile(r"folded_no_leaves|many_parts_[1-9][0-9]*")
 
 # The only stats fields this build does not report. A successful call lacking
 # one of them reads unsupported-on-this-build; lacking anything else, missing.
@@ -1041,6 +1044,13 @@ def required_stamps(run_dir, cfg, live, problems):
             problems.add("missing", f"stamps/folds.jsonl {'/'.join(k)}")
         elif line and line.get("exit") != 0:
             problems.add("failed", f"fold {'/'.join(k)} exit {line.get('exit')}")
+        elif line and LEAF_OFF_FOLD.fullmatch(k[0]):
+            # A report with no key_index_leaves_written comes from a ravel-cli
+            # that predates key-index leaves, whose fold builds none.
+            leaves = (line.get("report") or {}).get("key_index_leaves_written")
+            if leaves is not None and leaves != 0:
+                problems.add("wrong", f"fold {'/'.join(k)} key_index_leaves_written {leaves}, want 0: the fold "
+                                      f"ran with the leaf-off flag (stamps/fold_flags.json) and still built leaves")
 
     if live.get("compaction_in_flight") is None:
         for sig in SIGNALS:
