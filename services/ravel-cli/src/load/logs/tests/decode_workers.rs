@@ -380,13 +380,14 @@ async fn four_decode_workers_run_builds_concurrently_and_one_does_not() {
     let four = Arc::new(Gate::default());
     let hold = |seq: u64, log: &BuildLog| seq == 0 && log.active < 2;
     decode.run(4, Some(gated(&four, hold)), None).await;
-    let log = four.lock();
-    assert!(
-        !log.timed_out,
-        "a second build started while batch 0 was held"
-    );
-    assert!(log.max_active >= 2, "max in flight {}", log.max_active);
-    drop(log);
+    {
+        let log = four.lock();
+        assert!(
+            !log.timed_out,
+            "a second build started while batch 0 was held"
+        );
+        assert!(log.max_active >= 2, "max in flight {}", log.max_active);
+    }
 
     let one = Arc::new(Gate::default());
     let batches = decode.run(1, Some(gated(&one, |_, _| false)), None).await;
