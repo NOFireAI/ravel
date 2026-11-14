@@ -4252,7 +4252,7 @@ fn coalesced_batch_bytes(sections: &[SectionSpan; 3], gap: u64) -> u64 {
 /// carries a per-sample provenance column, its [`SamplePriority`]; per
 /// emitted unit (one per series on L0, one per run on L1) the unit itself
 /// and its copy of the series' labels. A histogram sample is charged its
-/// inline [`HistogramValue`] twice, since a run's decode builds its samples
+/// timestamp and inline [`HistogramValue`] twice, since a run's decode builds its samples
 /// once before splitting them into the unit's columns; the span and bucket
 /// vectors a histogram value points to are not counted here, and are charged
 /// by the fold that holds them.

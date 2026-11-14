@@ -1029,7 +1029,7 @@ this section records the change against the amendment it corrects.
   or its decoded runs past `fetch_batch_bytes`, the same limit, with the
   same 8 MiB floor, for both (`page_batches`).
 - A batch's decoded runs are, per sample, its timestamp and value (a
-  histogram's inline value counted twice) and, for a run with a
+  histogram's timestamp and inline value each counted twice) and, for a run with a
   per-sample provenance column, its `SamplePriority`; per emitted unit,
   the unit and its copy of the series' labels (`decoded_units_len`). A
   histogram value's span and bucket vectors are not in that figure; the
@@ -1041,7 +1041,8 @@ this section records the change against the amendment it corrects.
   (`a_batch_whose_decode_does_not_fit_is_refused_before_it_decodes`).
 - A series whose own coalesced bytes or decoded runs exceed
   `fetch_batch_bytes` is a batch alone
-  (`a_series_over_the_batch_bytes_is_fetched_alone`). Every batch of more
+  (`a_series_over_the_batch_bytes_is_fetched_alone` pins the coalesced
+  bytes case; no test yet pins a series alone on its decoded runs). Every batch of more
   than one series reserves at most `fetch_batch_bytes` of pages and at
   most `fetch_batch_bytes` of decoded runs
   (`one_call_never_reserves_more_than_one_batch`).
