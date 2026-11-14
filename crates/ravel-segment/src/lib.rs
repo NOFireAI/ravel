@@ -40,7 +40,8 @@ pub use reader::{
     SeriesEntryV4, TrailerClass, ValPageKind, ValueKind, classify_trailer,
     decode_catalog_matching_v4, decode_catalog_matching_v4_charged, decode_catalog_v4,
     decode_catalog_v4_charged, decode_run_histogram_pages, decode_run_pages_soa, decode_series_ids,
-    open_from_full, open_from_suffix, parse_footer, plan_ranges_v4, validate_sections,
+    hist_page_heap_bound, open_from_full, open_from_suffix, page_payload_len, parse_footer,
+    plan_ranges_v4, validate_sections,
 };
 /// RSEG v5 catalog (docs/segment-format.md): `decode_catalog_v5` is the
 /// whole-catalog decode over the whole object (folding to the run-major

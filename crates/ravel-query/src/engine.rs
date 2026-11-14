@@ -2376,10 +2376,12 @@ impl QueryEngine {
             excludes_spend |= fed_spend_folded;
             // Bind the lock to its own statement so the guard is dropped
             // before the next await.
-            let absorbed = scalar_fold
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .absorb(fed_runs.into_iter().flatten());
+            let absorbed = {
+                let mut fold = scalar_fold
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                fed_runs.into_iter().try_for_each(|runs| fold.absorb(runs))
+            };
             absorbed?;
             // Merge every remote's native-histogram runs into the same
             // deduplicated pool the local per-selector histograms populated
