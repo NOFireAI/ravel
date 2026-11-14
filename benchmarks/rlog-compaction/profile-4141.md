@@ -303,8 +303,9 @@ of a two-level merge costs about one whole single-level merge. Level 1 cost
 2,739,830 records in resident read mode, while every two-level arm merged
 460 inputs and 5,408,099 records in cursor mode (see the deviations above).
 Bucket size and read mode both differ, so the per-record comparison is
-suggestive only: no same-bucket single-level control exists yet, and
-follow-up 2 adds one. The suggestion is what both levels doing a full
+suggestive only: no same-bucket single-level control exists yet, and none
+is reachable with this bench today (follow-up 2 says what one needs). The
+suggestion is what both levels doing a full
 decode, merge and encode of every record predicts. The issue's pre-phase-B
 figure of about 27 us/record per level, about 55 for both levels, is
 what one pass costs here, not two. So the pre-phase-B figure is the anomaly
@@ -335,10 +336,17 @@ issue's 2x compares two runs that differ in more than the phase-B change.
    - Before committing to it, check that a run without blooms is still a
      valid RLOG object under docs/log-segment-format.md, because the format
      is frozen. If it is not, this needs an ADR.
-   - Measure it with one arm against A on this bucket, and in the same run
-     add the missing control: a single-level merge of this same 460-input
-     bucket in cursor read mode, so each level's CPU per record can be
-     compared against one pass over the same records and read mode.
+   - Measure it with one arm against A on this bucket. The missing
+     same-bucket control, a single-level merge of this 460-input bucket in
+     cursor read mode, is not runnable today: without `--scratch-dir` the
+     plan is refused with `MergeGeometryUnsupported`, as arm S's deviation
+     above records for the smaller bucket, because `geometry_refusal`
+     refuses a cursor plan whose predicted decoded rows exceed both
+     `MIN_GEOMETRY_PREDICTED_DECODED_ROWS` (10,000,000) and 16 times the
+     input records (crates/ravel-maintain/src/rlog.rs:1317-1348). The control
+     needs the bench to expose `geometry_floor_decoded_rows` as a flag, the
+     way services/ravel-cli/src/maintain.rs:273-277 does as a test seam, set
+     above the plan's predicted decoded rows.
 3. Level-2 worker derivation: never derive W2 = 1 into the pipelined path
    when inline encode fits, because the pipelined path costs 25-30% more
    level-2 CPU per record. Today W2 = 1 is reached by configuration, by a
