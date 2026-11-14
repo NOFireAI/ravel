@@ -885,7 +885,9 @@ keeps it off.
   `build_key_index_leaves` stays off by default under ADR-3692's Stage 1
   amendment, #3927 bounds the advancing build first, and epic #3939 owns
   the preconditions for turning the leaf switch on. Until then a metrics
-  leaf is built only where an operator turns leaves on.
+  leaf is built only where an operator turns leaves on. (Superseded: since
+  the leaf-default amendment below, leaves are on by default, so a default
+  deployment builds the metrics leaf.)
 - The leaf switch is one bool across signals. After this change an
   operator who runs leaves for logs or spans also builds metrics leaves,
   at the cost row 7 measured for the first switch-on fold (about 8 GETs
@@ -976,3 +978,35 @@ refuse every `ravel-server --mode maintain`, `all` or `query` and every
 - Row 7's per-advance cost of the metrics leaf is not measured.
 - The end-to-end erasure test above (#4147) and the series-level index
   (#4146) are follow-ups.
+
+## Amendment (issues #3927 and #3939): leaves are on by default, so the metrics leaf is too
+
+<!-- amendment-applies: sections="Amendment (issues #3868 and #3694): Stage 1 acceptance, row 3 restated, and `metrics_label_index` on wherever leaves are built" pointer="leaf-default amendment" -->
+
+Date: 2026-11-14. ADR-3692's leaf-default amendment turns
+`build_key_index_leaves` on by default in `ravel-server` and
+`ravel-cli catalog fold`, on the logs and spans figures of ADR-3939's
+Stage 2. The switch is one bool across signals. Asked whether to split it
+per signal, the owner chose on 2026-11-14 to keep it whole, so metrics
+folds are covered too. Because `metrics_label_index` already defaults on
+wherever leaves are built, a default deployment now:
+
+- builds the metrics `label_value` leaf on every fold, at about 8 GETs per
+  object on the first fold with the leaf on (Stage 1 row 7);
+- seals metrics parts at the UTC day, as ADR-3939 decision 1 does for
+  every signal when the switch is on;
+- routes a PromQL selector's positive equality values through those leaves
+  before any object is opened (decision 3).
+
+`--no-fold-metrics-label-index` (server) and `--no-metrics-label-index`
+(catalog fold) turn off the metrics leaf alone. `--no-fold-key-index-leaves`
+and `--no-key-index-leaves` turn off every leaf and the day seal.
+
+Not measured, and accepted with the decision:
+- the metrics leaf's per-advance cost (row 7);
+- a metrics day seal on real S3;
+- Stage 1's row 6 miss, where 8 GiB containers died on the L1 query pass
+  and the 4-merge maintain (#4118). That miss is open, and it was not
+  re-run with the leaf on by default.
+
+Refs: #3927, #3939
