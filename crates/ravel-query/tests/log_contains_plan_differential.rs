@@ -611,6 +611,113 @@ async fn contains_only_plan_matches_the_readers_prune_block_for_block() {
     assert_eq!(checked, 30);
 }
 
+/// The SQL logs scan re-filters above its `Inexact` residual, so a row count
+/// through SQL stays right even if the subset open stopped evaluating the
+/// `Contains` arm. This pins the arm at the open itself: a `Contains`-only
+/// plan above the bound takes the directory branch, and the raw subset open
+/// it feeds (the one `open_segment_subset` issues) returns exactly the rows
+/// whose `URL` contains the needle. One row in seven matches, so a scan that
+/// skipped the arm would return every row of the surviving blocks.
+#[tokio::test]
+async fn contains_only_directory_plan_subset_scan_returns_exactly_the_matching_rows() {
+    let inner = Arc::new(MemoryStore::new());
+    let objects = vec![
+        write_object(inner.as_ref(), 0, Shape::BloomAll).await,
+        write_object(inner.as_ref(), 1, Shape::BloomText).await,
+    ];
+    let store = Arc::new(RecordingStore {
+        inner,
+        gets: Mutex::new(Vec::new()),
+    });
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+    let suffix = objects
+        .iter()
+        .map(|o| o.bytes.len() as u64 - o.blocks_section().1)
+        .min()
+        .expect("objects");
+    let smallest = objects
+        .iter()
+        .map(|o| o.seg.object_size)
+        .min()
+        .expect("objects");
+    let ranged = fetcher(backend, suffix, smallest / 2);
+
+    // Rows 40..=99 are exactly blocks 2, 3 and 4.
+    let (lo, hi) = (40usize, 99usize);
+    for obj in &objects {
+        let label = shape_name(obj.shape);
+        assert!(
+            obj.seg.object_size > ranged.plan_whole_object_bound(),
+            "{label}"
+        );
+        let (blocks_start, blocks_end) = obj.blocks_section();
+        let q = LogQuery::new(obj.base + lo as i64, obj.base + hi as i64).with_content(google());
+        assert!(q.plan_contains_only_decidable(), "{label}");
+
+        store.take();
+        let (survivors, dirs, _, carried_footer, carried_object) = ranged
+            .plan_segment(&obj.seg, TENANT, &q, &QueryAccounting::new())
+            .await
+            .expect("plan")
+            .expect("relevant segment");
+        let plan_gets = store.take();
+        assert!(
+            carried_footer.is_some(),
+            "{label}: the plan takes the directory branch"
+        );
+        assert!(carried_object.is_none(), "{label}: no fallback read");
+        assert!(
+            plan_gets
+                .iter()
+                .all(|g| g.end <= blocks_start || blocks_end <= g.start),
+            "{label}: the plan read BLOCKS bytes: {plan_gets:?}"
+        );
+        assert_eq!(survivors, vec![2, 3, 4], "{label}");
+
+        let mut scan = ranged
+            .scan_accounted_with_tenant_subset_raw(
+                &obj.seg,
+                TENANT,
+                &q,
+                &ColumnSelection::all(),
+                &survivors,
+                &survivors,
+                carried_footer.as_ref(),
+                None,
+                Some(&dirs),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("subset open")
+            .expect("relevant segment");
+        let mut returned = Vec::new();
+        while let Some(block) = scan.next_block().expect("block") {
+            returned.extend(block);
+        }
+
+        let expected: Vec<i64> = (lo..=hi)
+            .map(|i| record(obj.base, i))
+            .filter(|r| {
+                r.attrs.iter().any(|(k, v)| {
+                    k == "URL" && matches!(v, AttrValue::Str(s) if s.contains("google"))
+                })
+            })
+            .map(|r| r.ts_ns)
+            .collect();
+        let rows_in_survivors = survivors.len() * ROWS_PER_BLOCK;
+        assert_eq!(rows_in_survivors, 60, "{label}");
+        assert_eq!(expected.len(), 8, "{label}: rows 44, 51, ..., 93 match");
+        assert_eq!(
+            returned.len(),
+            expected.len(),
+            "{label}: the subset scan returns exactly the matching rows"
+        );
+        let mut got: Vec<i64> = returned.iter().map(|r| r.ts_ns).collect();
+        got.sort_unstable();
+        assert_eq!(got, expected, "{label}: the matching rows themselves");
+    }
+}
+
 /// At or under `plan_whole_object_bound()` a `Contains`-only plan reads the
 /// object whole, once, and carries those bytes to the scan, rather than a
 /// footer probe the scan would follow with a second read under another key.
