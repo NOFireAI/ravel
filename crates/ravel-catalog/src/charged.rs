@@ -11,8 +11,73 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use ravel_memory::{MemoryBudget, MemoryExhausted, Reservation};
+use ravel_segment::CatalogCharge;
 
 use crate::snapshot_format::{DecodedPart, DecodedPostings};
+
+/// A [`ravel_segment::CatalogCharge`] backed by a [`MemoryBudget`]: each figure
+/// a catalog decode admits is reserved against the budget before the decode
+/// allocates it, and the reservation of that figure is dropped when the decode
+/// reports it freed. A decode the budget refuses stops with
+/// [`ravel_segment::SegmentError::CatalogChargeRefused`] before allocating, and
+/// [`refused`](Self::refused) carries the exhaustion it hit.
+///
+/// This is the same hook `ravel-query`'s fetcher uses to charge the per-sample
+/// provenance decode on the PromQL read path (issue #4118); it is shared here
+/// so the catalog fold's postings build and the `query_exemplars` surface charge
+/// that same decode against the process budget rather than decoding it uncharged
+/// (issue #4194). Both of those callers discard the provenance, so each drops
+/// this charge (and frees what it decoded) as soon as the decode returns.
+#[derive(Debug)]
+pub struct BudgetCatalogCharge {
+    budget: Arc<MemoryBudget>,
+    held: Vec<Reservation>,
+    refused: Option<MemoryExhausted>,
+}
+
+impl BudgetCatalogCharge {
+    /// A charge against `budget`.
+    pub fn new(budget: &Arc<MemoryBudget>) -> Self {
+        Self {
+            budget: Arc::clone(budget),
+            held: Vec::new(),
+            refused: None,
+        }
+    }
+
+    /// The exhaustion a refused admission hit, set once a decode this charge
+    /// backed returns [`ravel_segment::SegmentError::CatalogChargeRefused`].
+    pub fn refused(&self) -> Option<&MemoryExhausted> {
+        self.refused.as_ref()
+    }
+}
+
+impl CatalogCharge for BudgetCatalogCharge {
+    fn admit(&mut self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        match self.budget.reserve(bytes) {
+            Ok(reservation) => {
+                self.held.push(reservation);
+                true
+            }
+            Err(e) => {
+                self.refused = Some(e);
+                false
+            }
+        }
+    }
+
+    fn release(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(i) = self.held.iter().rposition(|r| r.size() == bytes) {
+            self.held.swap_remove(i);
+        }
+    }
+}
 
 /// A decoded snapshot part and the reservation for its entry body.
 pub(crate) type ChargedPart = Charged<DecodedPart>;

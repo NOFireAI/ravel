@@ -6268,8 +6268,9 @@ impl Catalog {
             .collect();
         for (ordinal, entry) in entries.iter().enumerate().skip(decode_start) {
             let fetched = fetch_segment_object(self.store(), tenant, signal, entry).await;
+            let mut charge = crate::BudgetCatalogCharge::new(self.memory_budget());
             let names = match fetched.and_then(|(_, data, location)| {
-                let names = segment_names_from_object(&location, &data)?;
+                let names = segment_names_from_object(&location, &data, &mut charge)?;
                 if let Some(held) = held_label_dicts.as_deref_mut() {
                     held.offer(ordinal, || {
                         metrics_label_value_from_object(tenant, &data, &location)
@@ -6915,7 +6916,10 @@ pub async fn fetch_segment_names(
     entry: &SnapshotEntry,
 ) -> Result<HashSet<String>, PostingsBuildError> {
     let (_, data, location) = fetch_segment_object(store, tenant, signal, entry).await?;
-    segment_names_from_object(&location, &data)
+    // The scrubber derives names at rest with no query memory budget to charge
+    // against (issue #4194 scopes the charge to the fold's postings build and
+    // the exemplar surface), so its decode is uncharged, exactly as before.
+    segment_names_from_object(&location, &data, &mut ravel_segment::Uncharged)
 }
 
 /// One entry's segment, fetched whole with one GET, its footer opened and
@@ -6995,6 +6999,7 @@ async fn fetch_segment_object(
 fn segment_names_from_object(
     location: &ravel_segment::FooterLocation,
     data: &[u8],
+    charge: &mut dyn ravel_segment::CatalogCharge,
 ) -> Result<HashSet<String>, PostingsBuildError> {
     let limits = ReaderLimits::default();
     // ADR-0027: v7 is the only supported version (`open_from_full` has
@@ -7003,10 +7008,14 @@ fn segment_names_from_object(
     // per-sample provenance extension, which the postings build ignores) spans
     // sections, so it is decoded over the whole object -- already in hand here
     // via the `GetRange::Full` GET -- and folded to the per-series
-    // `SeriesEntry` view the postings build consumes.
+    // `SeriesEntry` view the postings build consumes. The decode runs through
+    // `charge` so the per-sample provenance it materializes but never reads is
+    // charged against the process memory budget before it allocates (issue
+    // #4194); the postings build drops the provenance in the `.map(|e| e.entry)`
+    // below.
     let series: Vec<ravel_segment::SeriesEntry> = match location.version {
         ravel_segment::VERSION_V7 => {
-            ravel_segment::decode_catalog_v5(&location.footer, data, limits)?
+            ravel_segment::decode_catalog_v5_charged(&location.footer, data, limits, charge)?
                 .into_iter()
                 .map(|e| e.entry)
                 .collect()
@@ -20685,6 +20694,198 @@ pub(crate) mod tests {
         assert_eq!(
             probe_label(&catalog, part, CPU_SECONDS).await,
             matches(&[(ordinal[&0], &[0]), (ordinal[&7], &[0])], &[])
+        );
+    }
+
+    /// Writes an L1 compaction part whose single run carries a per-sample
+    /// provenance column (ADR-0092), so the postings build's whole-object
+    /// catalog decode materializes the extension. Returns the `SnapshotEntry`
+    /// that resolves to it, built exactly as `build_l1_snapshot_entry` does from
+    /// the compaction record, so `fetch_segment_object` reconstructs the same
+    /// key the part is stored under.
+    async fn publish_l1_with_provenance(
+        store: &MemoryStore,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+        metric: &str,
+        samples: usize,
+    ) -> SnapshotEntry {
+        let tenant_id = TenantId::new("fold-provenance-charge-test");
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant_id, metric, &labels).expect("series id");
+        let values = ravel_segment::SeriesValues::Scalar(
+            (0..samples)
+                .map(|k| Sample {
+                    ts_ns: created_unix_ns + k as i64,
+                    value: k as f64,
+                })
+                .collect(),
+        );
+        let run = ravel_segment::encode_run_v4(&series_id, created_unix_ns, 1, 1, &values)
+            .expect("frame run");
+        let provenance = Some(
+            (0..samples)
+                .map(|k| ravel_segment::SampleProvenance {
+                    created_unix_ns,
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    in_page_index: k as u32,
+                })
+                .collect(),
+        );
+        let input_set_hash =
+            *blake3::hash(format!("l1-prov-{shard}-{ingest_hour_bucket}").as_bytes()).as_bytes();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant().0,
+            shard,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: created_unix_ns - 1,
+            max_ingest_ts_ns: created_unix_ns + samples as i64,
+        };
+        let meta = ravel_segment::CompactionMetaV4 {
+            ingest_hour_bucket,
+            input_set_hash,
+            part_index: 0,
+            level: 1,
+        };
+        let series = vec![ravel_segment::SeriesInputV7 {
+            series_id,
+            labels,
+            runs: vec![ravel_segment::RunInputV7 { run, provenance }],
+        }];
+        let written = ravel_segment::SegmentWriter::write_v7_with_provenance(
+            series,
+            identity,
+            bounds,
+            meta,
+            Vec::new(),
+        )
+        .expect("write L1 with provenance");
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: written.summary.blake3.to_vec(),
+            object_size: written.bytes.len() as u64,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            run_count: 1,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: u32::from(ravel_segment::VERSION_V7),
+            declared_column_stats: Vec::new(),
+        };
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics).into(),
+            shard,
+            ingest_hour_bucket,
+            level: 1,
+            inputs: Vec::new(),
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part],
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        let data_key =
+            keys::reconstruct_l1_part_key(&record, &record.parts[0]).expect("l1 part key");
+        publish::put_data_object(store, &data_key, written.bytes)
+            .await
+            .expect("put l1 part object");
+        let mut coverage = declared_stats::StampCoverage::default();
+        build_l1_snapshot_entry(&data_key, &record, &record.parts[0], &mut coverage)
+            .expect("snapshot entry")
+    }
+
+    /// The postings build decodes an L1 part's per-sample provenance (ADR-0092)
+    /// that it never reads, so that decode is charged against the catalog's
+    /// memory budget before it allocates (issue #4194). Under a budget smaller
+    /// than the provenance columns the decode is refused before allocating them,
+    /// the budget counts the refusal, and the build aborts (`None`); under an
+    /// ample budget the build returns the part's name exactly.
+    ///
+    /// FLIP: route the decode through `decode_catalog_v5` (uncharged) in
+    /// `segment_names_from_object` and the small-budget build no longer refuses
+    /// -- it decodes the provenance uncharged and returns the name, the
+    /// unbounded behavior this fix removes.
+    #[tokio::test]
+    async fn the_postings_build_charges_l1_provenance_before_it_allocates() {
+        const METRIC: &str = "provenance_charged_total";
+        // 64 samples: 64 * PROVENANCE_COLUMN_BYTES_PER_SAMPLE (64 B) = 4096 B of
+        // columns, so a budget of a few bytes cannot admit them.
+        const SAMPLES: usize = 64;
+        let hour = 480_000u32;
+        let created = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
+
+        let store = Arc::new(MemoryStore::new());
+        let entry = publish_l1_with_provenance(&store, 0, hour, created, METRIC, SAMPLES).await;
+
+        // A budget far below the 4096-byte provenance columns.
+        let small = Arc::new(ravel_memory::MemoryBudget::new(8));
+        let catalog = Catalog::new(store.clone(), CatalogConfig::default())
+            .expect("catalog")
+            .with_memory_budget(Arc::clone(&small));
+        let mut counters = RequestCounters::default();
+        let refused = catalog
+            .build_postings(
+                &tenant(),
+                Signal::Metrics,
+                std::slice::from_ref(&entry),
+                0,
+                Vec::new(),
+                None,
+                &mut counters,
+            )
+            .await;
+        assert!(
+            refused.is_none(),
+            "an over-budget provenance decode aborts the postings build"
+        );
+        assert!(
+            small.accounted_refusals() >= 1,
+            "the budget counted the refused provenance admission"
+        );
+
+        // An ample budget admits the provenance and the build returns the name.
+        let ample = Arc::new(ravel_memory::MemoryBudget::new(64 * 1024 * 1024));
+        let catalog = Catalog::new(store.clone(), CatalogConfig::default())
+            .expect("catalog")
+            .with_memory_budget(Arc::clone(&ample));
+        let mut counters = RequestCounters::default();
+        let built = catalog
+            .build_postings(
+                &tenant(),
+                Signal::Metrics,
+                std::slice::from_ref(&entry),
+                0,
+                Vec::new(),
+                None,
+                &mut counters,
+            )
+            .await
+            .expect("an in-budget postings build returns names");
+        assert_eq!(
+            built,
+            vec![NamePostings {
+                name: METRIC.to_string(),
+                ordinals: vec![0],
+            }],
+            "the in-budget build names the part exactly, unchanged by the charge"
+        );
+        assert_eq!(
+            ample.accounted_refusals(),
+            0,
+            "the ample budget refused nothing"
         );
     }
 
