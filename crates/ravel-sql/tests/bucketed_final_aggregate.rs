@@ -3101,9 +3101,10 @@ fn string_keys_sql(string_type: &str, composite: bool) -> String {
 /// with the count beside the key, 5,568 B with the two integer keys too.
 ///
 /// Prove-the-test: drop the budget from `ByteChunk::fits`, so chunks seal on
-/// rows alone, and the phase 2 cap is never reached, so nothing spills; keep
-/// each long string's view into the source batch instead of copying it and
-/// the read-back fails on an invalid buffer slice.
+/// rows alone, and the phase 2 cap is never reached, so nothing spills. A
+/// chunk that keeps views into its source batches, with their buffers
+/// attached, still answers exactly here; the unit test named above is the
+/// one that fails on it.
 #[tokio::test]
 async fn bucket_spill_routes_string_keys_exactly() {
     const FIXED: [(bool, usize, usize); 2] = [(false, 8, 5312), (true, 8 + 4 + 8, 5568)];
