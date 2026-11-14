@@ -3784,7 +3784,7 @@ fn level2_worker_count(configured: Option<usize>, fit: &Level2Fit, ranges: usize
         .max(1)
 }
 
-/// `W2`, each range worker's plan, over its own streams under `ceiling / W2`
+/// `W2`, each range worker's plan, over its own streams within `ceiling / W2`
 /// (ADR-3853 D5 amendment), and the builders each worker keeps in flight. A
 /// configured [`CompactorConfig::level2_workers`] is taken as it is, capped at
 /// the range count, and refused through `refuse` with the worker ceiling when
@@ -3793,7 +3793,9 @@ fn level2_worker_count(configured: Option<usize>, fit: &Level2Fit, ranges: usize
 /// plan fits; it is refused only when one worker does not fit the whole
 /// ceiling. At `W2 = 1` the plan and `E` come from [`level2_pipeline_plan`],
 /// with `whole`, the plan over every stream under the whole ceiling, as its
-/// last resort; several workers encode inline with one builder each.
+/// last resort; several workers encode inline with one builder each, and
+/// each worker's plan is drawn under `ceiling / W2` less that builder's final
+/// part target (ADR-3853, #4140 correction).
 #[allow(clippy::too_many_arguments)]
 fn level2_plans(
     config: &CompactorConfig,
@@ -18320,7 +18322,12 @@ mod tests {
         async fn compact_builder_beside_passes(
             level2_workers: Option<usize>,
             name: &str,
-        ) -> (Result<CompactionOutcome>, Run, ProbeStore, std::path::PathBuf) {
+        ) -> (
+            Result<CompactionOutcome>,
+            Run,
+            ProbeStore,
+            std::path::PathBuf,
+        ) {
             let (_, _, per_input) = single_level_oracle().await;
             let dir = fresh_scratch(name);
             let base = range_worker_config(per_input, 1, dir.clone());
@@ -18400,8 +18407,7 @@ mod tests {
                 }) => {
                     assert_eq!(ceiling_bytes, 1_488_718 / 3);
                     assert_eq!(part_target_bytes, 3 * RANGE_PART);
-                    let need = (runs * blocks_per_run * run_block_bytes)
-                        .max(stream_estimate_bytes)
+                    let need = (runs * blocks_per_run * run_block_bytes).max(stream_estimate_bytes)
                         + in_flight_bytes
                         + part_target_bytes;
                     assert!(
