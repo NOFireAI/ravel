@@ -131,7 +131,8 @@ pub enum TwoLevelCheck {
         /// The final parts' memory split target.
         part_target_bytes: u64,
         /// The ceiling one level-2 worker plans under: `U / W2`, `U` itself
-        /// at one worker.
+        /// at one worker. At `W2 > 1` the worker's passes are planned under
+        /// this less one final part target, its inline builder's.
         ceiling_bytes: u64,
     },
     /// Constraint (b) priced before level 1 reads a block (ADR-3853 D4, D5):
