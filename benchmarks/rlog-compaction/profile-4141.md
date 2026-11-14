@@ -298,8 +298,12 @@ the issue's doubling each candidate explains here:
 
 The bench instead shows a shape that does not depend on phase B: each level
 of a two-level merge costs about one whole single-level merge. Level 1 cost
-50.6 us/record and level 2 cost 49.3, against 53.8 for a single-level merge of
-the same records' shape (S). That is what both levels doing a full
+50.6 us/record and level 2 cost 49.3, against 53.8 for a single-level merge
+(S). S is a reference, not a like-for-like arm: it merged 230 inputs and
+2,739,830 records in resident read mode, while every two-level arm merged
+460 inputs and 5,408,099 records in cursor mode (see the deviations above),
+so the comparison holds per record across a different bucket size and read
+mode, and a same-bucket single-level figure is part of follow-up 1. That is what both levels doing a full
 decode, merge and encode of every record predicts. The issue's pre-phase-B
 figure of about 27 us/record per level, about 55 for both levels, is
 what one pass costs here, not two. So the pre-phase-B figure is the anomaly

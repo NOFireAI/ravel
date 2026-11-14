@@ -1615,7 +1615,7 @@ fn compactor_config(args: &Args, ledger: RequestLedger) -> (CompactorConfig, Val
         "rlog_run_memory_target_bytes": config.rlog_run_memory_target_bytes,
         "geometry_floor_decoded_rows": config.geometry_floor_decoded_rows,
         "unit_concurrency": config.unit_concurrency,
-        "page_choice":"Exhaustive (RlogConfig::default(); CompactorConfig has no page_choice)",
+        "page_choice": "Exhaustive (RlogConfig::default(); CompactorConfig has no page_choice)",
     });
     (config, resolved)
 }
