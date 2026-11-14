@@ -211,7 +211,12 @@ its keyIndex GETs at 2 x that count.
 ### States
 
 - `unfolded`: the base loads only.
-- `folded_no_leaves`: `catalog fold --writers-stopped` per tenant and signal.
+- `folded_no_leaves`: `catalog fold --writers-stopped` per tenant and signal,
+  plus the leaf-off flag: `--no-key-index-leaves` when `catalog fold --help`
+  lists it as an option (a ravel-cli built after issue #4200 builds key-index
+  leaves unless told not to), nothing otherwise (one built before it builds
+  no leaf unless asked). The help is read once per run, before the first
+  such fold, and the choice is stamped in `stamps/fold_flags.json`.
 - `folded_leaves`: `catalog fold --key-index-leaves`, then `catalog fold
   --rebuild-key-index` (stamped as transition `leaf_rebuild`). The leaves
   fold right after a plain fold has nothing left to seal and writes no leaf;
@@ -281,7 +286,8 @@ its keyIndex GETs at 2 x that count.
   `--ingest-hour-start` that puts the last hour below the current one, one
   batch per hour, with no fold during the loads (the load refuses once a HEAD
   appears), then folded with `--writers-stopped --snapshot-part-max-entries
-  1` so each hour is its own part, then leaves rebuilt. The stamped part
+  1` and the leaf-off flag (as `folded_no_leaves`) so each hour is its own
+  part, then leaves rebuilt. The stamped part
   count is banded (rows 9 and 10).
 
   The corpus is generated with `gen_corpus.py --even-hours`: exactly
@@ -789,7 +795,8 @@ reports `missing stamps/<name>` for any it needs and does not find;
 | `declare.json` | each tenant's declared columns and key index, as `typed-attr-column show` printed them |
 | `tenants.json` | the tenants the run loaded and their store prefixes |
 | `loads.jsonl` | one line per load (hour, tenant, signal): exit code, ingest hour and the load report |
-| `folds.jsonl` | one line per fold (transition, tenant, signal): exit code, the `--json` report, wall time, CPU seconds and peak RSS; the kind names the fold's flags (`--key-index-leaves`, `--key-index-build-max-pairs N`, `--retention-default Rs`) |
+| `folds.jsonl` | one line per fold (transition, tenant, signal): exit code, the `--json` report, wall time, CPU seconds and peak RSS; the kind names the fold's flags (`--key-index-leaves`, `--no-key-index-leaves`, `--key-index-build-max-pairs N`, `--retention-default Rs`) |
+| `fold_flags.json` | the leaf-off flag read from `catalog fold --help`: `leaf_off` (`--no-key-index-leaves` or empty), `spelling` (`opt-out` or `opt-in`), which leaf flags the help `lists`, and the `folds` that pass it |
 | `census.jsonl` | one line per state: object count and bytes per tenant, signal and key class, listed from the store |
 | `transitions.jsonl` | one line per state entered: when, and in which ingest hour |
 | `restarts.jsonl` | one line per cold call: the server pid, the cache-drop result and the warmup |
