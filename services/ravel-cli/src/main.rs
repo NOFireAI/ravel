@@ -609,8 +609,9 @@ enum Command {
         skip_rows: u64,
         /// Number of stride read cursors over the Parquet file's row groups
         /// (issue #560). One decode thread reads the cursors in turn, not in
-        /// parallel; what they buy is spread, not read concurrency. A file sorted by a resource-attribute column
-        /// (e.g. ClickBench's `hits.parquet`, sorted by `CounterID`) puts one
+        /// parallel; what they buy is spread, not read concurrency. A file
+        /// sorted by a resource-attribute column (e.g. ClickBench's
+        /// `hits.parquet`, sorted by `CounterID`) puts one
         /// value's rows in one contiguous run, so a single sequential reader
         /// fills each `--batch-rows` batch with just that one value: one
         /// `shard_for_log` hash, one shard, no spread across `--shards`. K

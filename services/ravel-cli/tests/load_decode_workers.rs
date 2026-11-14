@@ -183,7 +183,7 @@ async fn load_with_workers(
 ///
 /// Prove-the-test: emit each built batch as it arrives
 /// (`ready.pop_first()` for `ready.remove(&self.next_emit)` in
-/// `DecodeCoordinator::run`) and the four-worker objects differ.
+/// `DecodeCoordinator::run`) and the four-worker load writes fewer rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_and_four_decode_workers_write_the_same_objects() {
     let (_dir, pq, mapping) = fixture();

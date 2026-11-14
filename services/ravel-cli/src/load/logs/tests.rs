@@ -2302,6 +2302,58 @@ async fn a_zero_ack_margin_is_refused_by_the_logs_loader() {
     assert!(list_data_objects(store.as_ref()).await.is_empty());
 }
 
+/// A library caller's `decode_workers` of 0 is refused with a typed
+/// [`LoadError::Setup`] before any write (issue #4210), not only by the CLI.
+///
+/// Prove-the-test: delete the `DECODE_WORKERS_ZERO` guard in
+/// `load_with_drain_reflush_period` and this load does not return that
+/// setup error.
+#[tokio::test]
+async fn a_zero_decode_workers_is_refused_by_the_logs_loader() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(10, 1);
+    let mut memory = LoadMemoryOptions::new(LoadMemoryRequest::Unbudgeted);
+    memory.decode_workers = Some(0);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        load_instrumented_at(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &m,
+            1,
+            10,
+            0,
+            Some(1),
+            Some(1),
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            Some(PER_BATCH_TARGET_BYTES),
+            None,
+            NOW_NS,
+            TestClock::new(NOW_NS) as Arc<dyn Clock>,
+            LoadPath::Columnar,
+            None,
+            None,
+            RlogZstdLevel::default(),
+            RlogGroupTargetBlocks::DEFAULT,
+            RlogChunkOrder::DEFAULT,
+            Some(memory),
+            false,
+            Arc::new(TenantRules::none()),
+        ),
+    )
+    .await
+    .expect("the load returns");
+    match result {
+        Err(LoadError::Setup(msg)) => assert_eq!(msg, DECODE_WORKERS_ZERO),
+        other => panic!("expected the --decode-workers setup error: {other:?}"),
+    }
+    assert!(list_data_objects(store.as_ref()).await.is_empty());
+}
+
 /// Shards in the issue #3273 uneven-share test.
 const UNEVEN_SHARDS: u32 = 4;
 
