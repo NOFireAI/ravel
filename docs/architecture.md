@@ -419,6 +419,20 @@ support GCS; a GCS deployment runs the qualification and the servers itself
 The capability table, the qualification suite, and the retry and timeout
 contract are in [docs/object-store-contract.md](object-store-contract.md).
 
+### Store GET concurrency
+
+The server's fetchers draw their object store GETs from one process-wide
+permit pool (ADR-1195). Its size is `--store-get-concurrency`,
+else the legacy `--fetch-concurrency`, else a value derived from host cores,
+`max(8, 2 x cores)`. When neither flag is set and the store is a loopback
+endpoint (`--store s3`, `gcs` or `azure` against a loopback endpoint), the
+derived value is capped at 64 (ADR-4203 decision 3). The startup line
+`performance default resolved setting="store_get_concurrency"` then carries
+`source="derived-loopback-cap"` when the cap lowered the value, and
+`source="derived"` when the derived value was already 64 or less. Only the GET
+permits are capped: `--sql-partition-count` and `--promql-fetch-fanout` keep
+the uncapped derivation, and a flag value is used as given.
+
 ## Where the trust and failure boundaries are
 
 The tenant is the isolation boundary. A tenant never appears in an object
