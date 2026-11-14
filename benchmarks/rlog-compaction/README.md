@@ -29,7 +29,9 @@ L0 -> L1 compaction goes. It changes no library behaviour.
    the compaction call at 997 Hz. It writes a flamegraph, the top 15
    exclusive leaves, the top inclusive frames and the samples split by phase
    using stack markers. It also splits the samples by merge level, using
-   the `rlog::level1_worker` and `rlog::level2_worker` frames.
+   the `rlog::level1_worker` and `rlog::level2_worker` frames; work a worker
+   hands to another task or thread lands in the "neither" row,
+   which held 56 % of arm A's samples (profile-4141.md).
 7. With `--scratch-dir`, it lets the call take the ADR-3853 two-level merge
    (issue #4141). The worker, run block and range knobs set the same
    `CompactorConfig` fields as `ravel-cli maintain`'s flags of the same
@@ -222,4 +224,6 @@ The bin exits 1, after printing the document, when any of these is true:
   U = 4 GiB, the phase-B default costs 50.6 us/record at level 1 and 49.3
   at level 2. Run block 8,192, the range cut and W1 up to 4 move neither
   level by 10% or more. W2 = 1 with pipelined encode costs 25-30% more at
-  level 2. A single-level merge costs 53.8 us/record.
+  level 2. A single-level merge costs 53.8 us/record (reference arm S: 230
+  inputs, 2.74M records, resident read mode, so not the same bucket or read
+  mode as the two-level arms).
