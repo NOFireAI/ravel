@@ -637,7 +637,8 @@ between the two when the coalesce gap bridges it. Each batch is planned,
 coalesced and fetched by `ensure_ranges` into a `FetchedRegions` of its
 own, decoded into the sample fold, and dropped before the next batch
 reserves. No batch shares or chains regions with another, so a batch's
-reservation is at most its count.
+reservation is at most its count. The decoded-size correction below adds
+a second cut, on the batch's decoded runs, and a reservation for them.
 
 - L0 segments are never batched, so `MAX_GETS_PER_L0_SEGMENT_FETCH` and
   ADR-1306's per-flush law are unchanged.
@@ -1010,3 +1011,50 @@ Not measured, and accepted with the decision:
   re-run with the leaf on by default.
 
 Refs: #3927, #3939
+
+## Correction (issue #4118): a batch is cut on decoded size as well as stored bytes
+
+<!-- amendment-applies: sections="Amendment (issue #3864): a batch is a group of whole series" pointer="decoded-size correction" -->
+
+Date: 2026-11-14. The whole-series batch amendment bounds a batch by its
+coalesced page bytes alone, and its reservation covers the pages as
+stored. A page stores a regular counter in well under a byte per sample,
+so a batch's decoded runs are many times its pages, and that reservation
+did not cover them (#4118). The fetcher now cuts and reserves on both.
+The normative text is docs/query-engine.md, "RSEG metrics page batches";
+this section records the change against the amendment it corrects.
+
+- An L1 batch is still a group of whole series in catalog order. It
+  closes before a series that would take either its coalesced page bytes
+  or its decoded runs past `fetch_batch_bytes`, the same limit, with the
+  same 8 MiB floor, for both (`page_batches`).
+- A batch's decoded runs are, per sample, its timestamp and value (a
+  histogram's inline value counted twice) and, for a run with a
+  per-sample provenance column, its `SamplePriority`; per emitted unit,
+  the unit and its copy of the series' labels (`decoded_units_len`). A
+  histogram value's span and bucket vectors are not in that figure; the
+  fold charges them as it holds them.
+- Once a batch's pages are in, and before any of them is decoded, the
+  batch reserves its decoded runs and holds them until the sample fold
+  has taken them. A decode the budget refuses is refused after the
+  batch's page GET and before any page is decoded
+  (`a_batch_whose_decode_does_not_fit_is_refused_before_it_decodes`).
+- A series whose own coalesced bytes or decoded runs exceed
+  `fetch_batch_bytes` is a batch alone
+  (`a_series_over_the_batch_bytes_is_fetched_alone`). Every batch of more
+  than one series reserves at most `fetch_batch_bytes` of pages and at
+  most `fetch_batch_bytes` of decoded runs
+  (`one_call_never_reserves_more_than_one_batch`).
+- L0 segments are still never batched, so their per-flush GET bound is
+  unchanged (`l0_is_one_batch_whatever_the_fetch_share`). The one L0
+  batch still reserves its decoded runs before decoding, so an L0 read is
+  charged its whole matched selection's decoded size at once. A statement
+  over L0 objects can therefore be refused with fetch memory exhausted
+  under a budget its page bytes alone fit, and with no batch cut it
+  cannot answer in parts.
+- The scan GET and wire-byte bounds of the whole-series batch amendment
+  are stated per batch and hold as written. The decoded cut can raise the
+  number of batches, and with it the extra GETs and wire bytes those
+  bounds allow.
+
+Refs: #4118, #4195
