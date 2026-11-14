@@ -301,9 +301,10 @@ of a two-level merge costs about one whole single-level merge. Level 1 cost
 50.6 us/record and level 2 cost 49.3, against 53.8 for a single-level merge
 (S). S is a reference, not a like-for-like arm: it merged 230 inputs and
 2,739,830 records in resident read mode, while every two-level arm merged
-460 inputs and 5,408,099 records in cursor mode (see the deviations above),
-so the comparison holds per record across a different bucket size and read
-mode, and a same-bucket single-level figure is part of follow-up 1. That is what both levels doing a full
+460 inputs and 5,408,099 records in cursor mode (see the deviations above).
+Bucket size and read mode both differ, so the per-record comparison is
+suggestive only: no same-bucket single-level control exists yet, and
+follow-up 2 adds one. The suggestion is what both levels doing a full
 decode, merge and encode of every record predicts. The issue's pre-phase-B
 figure of about 27 us/record per level, about 55 for both levels, is
 what one pass costs here, not two. So the pre-phase-B figure is the anomaly
@@ -334,7 +335,10 @@ issue's 2x compares two runs that differ in more than the phase-B change.
    - Before committing to it, check that a run without blooms is still a
      valid RLOG object under docs/log-segment-format.md, because the format
      is frozen. If it is not, this needs an ADR.
-   - Measure it with one arm against A on this bucket.
+   - Measure it with one arm against A on this bucket, and in the same run
+     add the missing control: a single-level merge of this same 460-input
+     bucket in cursor read mode, so each level's CPU per record can be
+     compared against one pass over the same records and read mode.
 3. Level-2 worker derivation: never derive W2 = 1 into the pipelined path
    when inline encode fits, because the pipelined path costs 25-30% more
    level-2 CPU per record. Today W2 = 1 is reached by configuration, by a
