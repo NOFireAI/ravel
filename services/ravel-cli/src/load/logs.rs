@@ -621,7 +621,13 @@ pub(super) async fn load_with_drain_reflush_period(
         now_ns,
         batch_rows,
         path,
-        on_build_start.map(|hook| Arc::new(move |_| hook()) as SeqBuildHook),
+        on_build_start.map(|hook| {
+            Arc::new(move |_, event| {
+                if event == BuildEvent::Started {
+                    hook();
+                }
+            }) as SeqBuildHook
+        }),
         on_batch_queued,
         decode_queue_batches,
         charger,
@@ -1504,10 +1510,21 @@ pub fn default_decode_workers() -> usize {
         .max(1)
 }
 
+/// Where in its build a batch is when a [`SeqBuildHook`] fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildEvent {
+    /// On the thread that builds the batch, after its estimate is charged and
+    /// before the build runs.
+    Started,
+    /// After the build's outcome was handed to the coordinator, which has not
+    /// necessarily emitted it.
+    Delivered,
+}
+
 /// A build hook that also receives the batch's sequence number, 0 for the
-/// first batch the pipeline collects. Called on the thread that builds the
-/// batch, as its build starts and after its estimate is charged.
-type SeqBuildHook = Arc<dyn Fn(u64) + Send + Sync>;
+/// first batch the pipeline collects. Tests use it to hold builds and observe
+/// how many run at once; production passes `None`.
+type SeqBuildHook = Arc<dyn Fn(u64, BuildEvent) + Send + Sync>;
 
 /// One batch's dealt spans, with the sequence number it is emitted at.
 type BuildJob = (u64, Vec<(RecordBatch, u64)>);
@@ -1523,22 +1540,22 @@ struct BuildContext {
     rules: Arc<TenantRules>,
     now_ns: i64,
     path: LoadPath,
-    on_build_start: Option<SeqBuildHook>,
+    on_build: Option<SeqBuildHook>,
 }
 
 impl BuildContext {
-    fn build(&self, seq: u64, spans: &[(RecordBatch, u64)]) -> Prefetched {
-        if let Some(hook) = &self.on_build_start {
-            hook(seq);
+    fn notify(&self, seq: u64, event: BuildEvent) {
+        if let Some(hook) = &self.on_build {
+            hook(seq, event);
         }
+    }
+
+    fn build(&self, seq: u64, spans: &[(RecordBatch, u64)]) -> Prefetched {
+        self.notify(seq, BuildEvent::Started);
         match self.path {
-            LoadPath::Row => build_stride_rows(
-                spans,
-                &self.mapping,
-                &self.limits,
-                &self.rules,
-                self.now_ns,
-            ),
+            LoadPath::Row => {
+                build_stride_rows(spans, &self.mapping, &self.limits, &self.rules, self.now_ns)
+            }
             LoadPath::Columnar => match build_columnar_batch(
                 spans,
                 &self.mapping,
@@ -1616,7 +1633,11 @@ impl<'ctx> Builders<'ctx> {
     /// outcome is returned; in the pool it is queued and `None` is returned.
     fn dispatch(&self, seq: u64, spans: Vec<(RecordBatch, u64)>) -> Option<Prefetched> {
         match self {
-            Builders::Inline(ctx) => Some(ctx.build(seq, &spans)),
+            Builders::Inline(ctx) => {
+                let out = ctx.build(seq, &spans);
+                ctx.notify(seq, BuildEvent::Delivered);
+                Some(out)
+            }
             Builders::Pool { jobs, .. } => {
                 // A failed send means every worker has exited; the next
                 // `recv` reports it.
@@ -1658,6 +1679,7 @@ fn build_worker(
         if results.send((seq, out)).is_err() {
             return;
         }
+        ctx.notify(seq, BuildEvent::Delivered);
     }
 }
 
@@ -1855,7 +1877,7 @@ fn spawn_decode_pipeline(
     now_ns: i64,
     batch_rows: usize,
     path: LoadPath,
-    on_build_start: Option<SeqBuildHook>,
+    on_build: Option<SeqBuildHook>,
     on_batch_queued: Option<BuildStartHook>,
     queue_depth: usize,
     charger: Option<BatchCharger>,
@@ -1872,7 +1894,7 @@ fn spawn_decode_pipeline(
             rules,
             now_ns,
             path,
-            on_build_start,
+            on_build,
         };
         std::thread::scope(|scope| {
             let builders = Builders::start(scope, &ctx, decode_workers);

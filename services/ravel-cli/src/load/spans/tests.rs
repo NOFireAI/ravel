@@ -327,7 +327,10 @@ fn metrics_and_spans_warn_on_a_non_default_zstd_level_and_logs_does_not() {
 /// logs load, or unset, it is not.
 #[test]
 fn metrics_and_spans_warn_on_decode_workers_and_logs_does_not() {
-    assert_eq!(unused_decode_workers_warning(Some(4), SignalArg::Logs), None);
+    assert_eq!(
+        unused_decode_workers_warning(Some(4), SignalArg::Logs),
+        None
+    );
     assert_eq!(unused_decode_workers_warning(None, SignalArg::Spans), None);
     assert_eq!(
         unused_decode_workers_warning(Some(4), SignalArg::Metrics).as_deref(),

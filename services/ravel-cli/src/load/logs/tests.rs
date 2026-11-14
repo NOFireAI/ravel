@@ -609,6 +609,7 @@ async fn production_dealer_rlog_bytes_do_not_depend_on_reader_batch_size() {
     }
 }
 
+mod decode_workers;
 mod pre_2613;
 
 /// Deal `k` cursors over `groups` row groups of `group_rows` rows each at
