@@ -459,13 +459,26 @@ help_style() {
     *) echo "${STUB_HELP_STYLE:-opt-out}" ;;
   esac
 }
+# leaf_style: ravel-cli catalog fold's key-index leaf flags,
+# STUB_LEAF_HELP_STYLE: opt-in (the default, an image built before issue
+# #4200: --key-index-leaves only, no leaf unless asked) or opt-out (built
+# after: --key-index-leaves and --no-key-index-leaves, leaves by default).
+leaf_style() {
+  echo "${STUB_LEAF_HELP_STYLE:-opt-in}"
+}
 # reject_flags IMAGE WORDS...: exit 2 as clap does on a label index flag
-# IMAGE's binaries do not take.
+# IMAGE's binaries do not take, or on --no-key-index-leaves where leaf_style
+# is opt-in.
 reject_flags() {
   local style w
   style="$(help_style "$1")"
   shift
   for w in "$@"; do
+    if [ "$(leaf_style):${w}" = "opt-in:--no-key-index-leaves" ]; then
+      printf 'docker-reject %s %s\n' "${RAVEL_IMAGE-}" "$w" >>"${STUB_LOG}"
+      echo "error: unexpected argument '${w}' found" >&2
+      exit 2
+    fi
     case "${style}:${w}" in
       opt-out:--fold-metrics-label-index | opt-out:--metrics-label-index | \
         opt-in:--no-fold-metrics-label-index | opt-in:--no-metrics-label-index | \
@@ -889,10 +902,20 @@ JSON
                 echo "$n" >"${STUB_STATE}.folds"
                 prev_head="$(cat "${STUB_STATE}.head" 2>/dev/null || echo head-0)"
                 switch_off=false leafy=""
-                case " $* " in
+                # A fold builds leaves when asked, or on an opt-out leaf_style
+                # binary unless told not to; with a label index default of
+                # opt-out and no --no-metrics-label-index, every part then
+                # carries a label_value leaf, which inspect reports.
+                case "$(leaf_style): $* " in
                   *" --key-index-leaves "*) leafy=-leaves ;;
-                  *) case "$prev_head" in *leaves*) switch_off=true ;; esac ;;
+                  opt-out:*" --no-key-index-leaves "*) ;;
+                  opt-out:*) leafy=-leaves ;;
                 esac
+                if [ -z "$leafy" ]; then
+                  case "$prev_head" in *leaves*) switch_off=true ;; esac
+                elif [ "$(help_style "${RAVEL_IMAGE-}")" = opt-out ]; then
+                  case " $* " in *" --no-metrics-label-index "*) ;; *) : >"${STUB_STATE}.labelled" ;; esac
+                fi
                 [ -z "${STUB_SWITCH_OFF_OVER_LEAVES:-}" ] || switch_off=true
                 echo "head-${n}${leafy}" >"${STUB_STATE}.head"
                 if [ ! -e "${STUB_STATE}.extra" ]; then
@@ -915,10 +938,12 @@ JSON
     esac
     ;;
   # docker run --rm --network none --entrypoint BINARY IMAGE ARGS (run.sh
-  # step stage1-flags, ARGS ending in --help): BINARY's option lines with the
-  # label index flags help_style gives IMAGE, each option's description on
+  # steps fold-flags and stage1-flags, ARGS ending in --help): BINARY's
+  # option lines with the label index flags help_style gives IMAGE and, for
+  # ravel-cli, the leaf flags leaf_style gives, each option's description on
   # the lines below it, one of which opens with the other spelling's flag
-  # (only an option line counts); exit STUB_HELP_EXIT.
+  # (only an option line counts); exit STUB_HELP_EXIT, or STUB_FOLD_HELP_EXIT
+  # for ravel-cli.
   run)
     shift
     entry="" image=""
@@ -934,12 +959,23 @@ JSON
       echo "stub: cannot run ${entry} in ${image}" >&2
       exit "${STUB_HELP_EXIT}"
     fi
+    if [ "${entry##*/}" = ravel-cli ] && [ "${STUB_FOLD_HELP_EXIT:-0}" -ne 0 ]; then
+      echo "stub: cannot run ${entry} in ${image}" >&2
+      exit "${STUB_FOLD_HELP_EXIT}"
+    fi
     case "$entry" in
       */ravel-server) leaves=--fold-key-index-leaves in=--fold-metrics-label-index out=--no-fold-metrics-label-index ;;
       *) leaves=--key-index-leaves in=--metrics-label-index out=--no-metrics-label-index ;;
     esac
     printf 'Usage: %s [OPTIONS]\n\nOptions:\n' "${entry##*/}"
-    printf '      %s\n          Build key-index leaves\n' "$leaves"
+    if [ "$leaves" = --key-index-leaves ] && [ "$(leaf_style)" = opt-out ]; then
+      printf '      %s\n          Build key-index leaves (the default)\n' "$leaves"
+      printf '      --no-key-index-leaves\n          Build no key-index leaves\n'
+    elif [ "$leaves" = --key-index-leaves ]; then
+      printf '      %s\n          Build key-index leaves;\n          --no-key-index-leaves is the opt-out of later images\n' "$leaves"
+    else
+      printf '      %s\n          Build key-index leaves\n' "$leaves"
+    fi
     case "$(help_style "$image")" in
       opt-in | both) printf '      %s\n          Build the metrics label index;\n          %s is the opt-out of later images\n' "$in" "$out" ;;
     esac

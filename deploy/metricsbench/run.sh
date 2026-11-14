@@ -48,6 +48,20 @@
 #               downloaded and checked against it; any other sha256 is
 #               refused with exit 65 before anything starts. Its path is
 #               exported as S3S_FS_BIN and stamped (object_store)
+#   fold-flags  the main image's ravel-cli catalog fold --help, read with
+#               docker run --rm --network none into <out>/fold-flags.help.txt
+#               (no stack needed). An image built after issue #4200 builds
+#               key-index leaves by default and lists --no-key-index-leaves
+#               as an option; then that flag is the leaf-off flag. One that
+#               does not list it builds no leaf unless asked, and the
+#               leaf-off flag is empty. The folds meant to build no leaf
+#               (fold, stage1-fold, stage1-extra-hour-fold-off) pass it; the
+#               folds that pass --key-index-leaves or --rebuild-key-index
+#               are unchanged. Stamped as key_index_leaves_flag: the flag,
+#               the spelling (opt-out or opt-in), which of the two leaf flags
+#               the help lists, the image, command and help file. A probe
+#               that exits non-zero fails the step before up. Not run in a
+#               diagnostic run, which stamps it not applicable
 #   up          docker compose up -d of docker-compose.yml plus ravel.yml,
 #               RAVEL_IMAGE and S3S_FS_BIN set
 #   qualify     the one-shots createbuckets and ravel-qualify exited 0
@@ -110,8 +124,8 @@
 #   stop        docker compose stop ravel-server: the fold below runs with
 #               --writers-stopped, which ADR-2677 decision 1 makes safe only
 #               once the writer has exited. Stamped as ravel_restart
-#   fold        ravel-cli catalog fold --signal metrics --writers-stopped, run
-#               through `docker compose run` on the ravel-qualify service (so
+#   fold        ravel-cli catalog fold --signal metrics --writers-stopped and
+#               the leaf-off flag (see fold-flags), run through `docker compose run` on the ravel-qualify service (so
 #               it reads the same store as the server in either lane), into
 #               <out>/fold.out. Fails unless seal_through_hour is Some(N) and
 #               watermark_hour is at or after the hour the ingest step ended
@@ -189,7 +203,8 @@
 #               --fold-key-index-leaves and the label index off (the unrouted
 #               flags, stamped as stage1.fold_restart), then
 #               ravel-cli catalog fold --signal metrics --json on
-#               ravel-qualify, with no leaf flag and no --writers-stopped, into
+#               ravel-qualify, with the leaf-off flag (see fold-flags) and no
+#               --writers-stopped, into
 #               <out>/stage1-fold.json; stamped as stage1.fold with its wall time
 #   stage1-unrouted  ravel-server recreated with the same flags (stamped as
 #               stage1.unrouted_restart). Then ravel-cli catalog inspect
@@ -304,7 +319,8 @@
 #               index on timed (stage1.extra_hour_fold_on) and
 #               its HEAD saved
 #   stage1-extra-hour-fold-off  the leafless HEAD put back and read back,
-#               then catalog fold --writers-stopped with no leaf flag timed
+#               then catalog fold --writers-stopped with the leaf-off flag
+#               (see fold-flags) timed
 #               (stage1.extra_hour_fold_off), refused unless it reports
 #               key_index_switch_off_over_leaves false
 #   stage1-extra-hour  the leaf-on fold's HEAD put back and read back,
@@ -1807,7 +1823,7 @@ elif op == "stage1-extra-hour":
     leaf_bytes = on["key_index_leaf_bytes_written"]
     off_ms, on_ms = int(off_ms), int(on_ms)
     print(json.dumps({
-        "method": "ravel-server stopped; the routed HEAD saved after stage1-leaves put back and read back, catalog fold --writers-stopped --key-index-leaves with the label index on (stage1.label_index_flags.cli names its flag, if any) timed from it, its HEAD saved; the HEAD saved before stage1-leaves (no leaf ever built on it) put back and read back, catalog fold --writers-stopped with no leaf flag timed from it; the leaf-on fold's HEAD put back and read back. The catalog HEAD is the one mutable catalog object; parts, leaves and data objects are immutable and content-keyed. The leaf-on fold runs first, so an object it wrote that the leaf-off fold would write with the same content is already there for the leaf-off fold, which can only make the leaf-off fold cheaper: wall_ratio_on_off errs high",
+        "method": "ravel-server stopped; the routed HEAD saved after stage1-leaves put back and read back, catalog fold --writers-stopped --key-index-leaves with the label index on (stage1.label_index_flags.cli names its flag, if any) timed from it, its HEAD saved; the HEAD saved before stage1-leaves (no leaf ever built on it) put back and read back, catalog fold --writers-stopped with the leaf-off flag (key_index_leaves_flag.flag, empty on an image that builds no leaf unless asked) timed from it; the leaf-on fold's HEAD put back and read back. The catalog HEAD is the one mutable catalog object; parts, leaves and data objects are immutable and content-keyed. The leaf-on fold runs first, so an object it wrote that the leaf-off fold would write with the same content is already there for the leaf-off fold, which can only make the leaf-off fold cheaper: wall_ratio_on_off errs high",
         "start_mismatches": int(off["previous_watermark_hour"] != prev),
         "head_sha256": {"fold_off_start": off_head, "fold_on_start": on_head, "after": end_head},
         "previous_watermark_hour": prev, "watermark_hour": on["watermark_hour"],
@@ -2686,6 +2702,7 @@ stamp_set comparator_images null
 stamp_set ravel_catalog_fold null
 stamp_set mimir_readiness null
 stamp_set ravel_catalog_fold_writers_stopped null
+stamp_set key_index_leaves_flag null
 stamp_set ravel_restart null
 stamp_set readback_folded null
 stamp_set ravel_objects null
@@ -2992,11 +3009,55 @@ fold_field() {
   sed -n "s/^[[:space:]]*$1[[:space:]]*:[[:space:]]*//p" "${out_dir}/fold.out"
 }
 
+# KEY_INDEX_LEAVES_OFF: the flag that keeps ravel-cli catalog fold from
+# building key-index leaves on the main image, set by fold_flags_step:
+# --no-key-index-leaves on a binary that builds them by default, empty on one
+# that builds them only when asked.
+KEY_INDEX_LEAVES_OFF=""
+
+# fold_flags_step: step fold-flags, before up. The main image's ravel-cli
+# catalog fold --help read with no network into <out>/fold-flags.help.txt;
+# KEY_INDEX_LEAVES_OFF set to --no-key-index-leaves when that text lists it on
+# an option line (clap indents those by at most six spaces and their
+# descriptions by more), empty otherwise, and stamped as
+# key_index_leaves_flag. Only the opt-out decides: a binary built after issue
+# #4200 lists both --key-index-leaves and --no-key-index-leaves.
+fold_flags_step() {
+  local file="${out_dir}/fold-flags.help.txt" log="${out_dir}/fold-flags.help.log" code=0 has_in=0 has_out=0
+  local option='^ {0,6}(-[[:alnum:]], )?'
+  local probe=("$DOCKER" run --rm --network none --entrypoint /usr/local/bin/ravel-cli "$ravel_image" catalog fold --help)
+  "${probe[@]}" >"$file" 2>"$log" || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "$log"
+    stamp_str key_index_leaves_flag "failed: docker run --rm --network none --entrypoint /usr/local/bin/ravel-cli ${ravel_image} catalog fold --help exited ${code}"
+    fail_step fold-flags "docker run --rm --network none --entrypoint /usr/local/bin/ravel-cli ${ravel_image} catalog fold --help exited ${code}; see ${log}"
+  fi
+  if grep -Eq -- "${option}--key-index-leaves([ =]|\$)" "$file"; then has_in=1; fi
+  if grep -Eq -- "${option}--no-key-index-leaves([ =]|\$)" "$file"; then has_out=1; fi
+  KEY_INDEX_LEAVES_OFF=""
+  [ "$has_out" -eq 0 ] || KEY_INDEX_LEAVES_OFF="--no-key-index-leaves"
+  stamp_set key_index_leaves_flag "$(python3 -I -c '
+import json, sys
+image, flag, has_in, has_out = sys.argv[1:5]
+print(json.dumps({
+    "flag": flag,
+    "spelling": "opt-out" if flag else "opt-in",
+    "lists": [f for f, has in (("--key-index-leaves", has_in), ("--no-key-index-leaves", has_out)) if has == "1"],
+    "image": image,
+    "command": "ravel-cli catalog fold --help",
+    "help": "fold-flags.help.txt",
+    "folds": ["fold", "stage1-fold", "stage1-extra-hour-fold-off"],
+    "method": "the main image'"'"'s ravel-cli run with docker run --rm --network none --entrypoint /usr/local/bin/ravel-cli IMAGE catalog fold --help; flag is --no-key-index-leaves when an option line of that text lists it (an image built after issue #4200, which builds key-index leaves unless told not to), empty otherwise (built before it: no leaf unless asked); the folds named in folds, each meant to build no leaf, pass it, and the folds that pass --key-index-leaves or --rebuild-key-index are unchanged",
+}))' "$ravel_image" "$KEY_INDEX_LEAVES_OFF" "$has_in" "$has_out")"
+  say "fold-flags: leaf-off flag ${KEY_INDEX_LEAVES_OFF:-<none>}"
+}
+
 fold_step() {
   local code=0 seal watermark entries buckets no_op precondition="met"
   compose run --rm --no-deps -T ravel-qualify \
     --store s3 --tenant-hash-unkeyed catalog fold \
     --tenant "$RAVEL_TENANT" --shards "$RAVEL_SHARDS" --signal metrics --writers-stopped \
+    ${KEY_INDEX_LEAVES_OFF:+"$KEY_INDEX_LEAVES_OFF"} \
     >"${out_dir}/fold.out" 2>&1 || code=$?
   if [ "$code" -ne 0 ]; then
     show_log "${out_dir}/fold.out"
@@ -3923,7 +3984,8 @@ stage1_control_step() {
 # stage1_steps saved is put back and read back, and a --writers-stopped fold
 # with --key-index-leaves and the label index on is timed from it; its HEAD is
 # saved. The leafless HEAD stage1_steps saved before stage1-leaves is put
-# back and read back, and the same fold with no leaf switch is timed from it,
+# back and read back, and the same fold with the leaf-off flag
+# (KEY_INDEX_LEAVES_OFF) instead of the leaf switch is timed from it,
 # refused unless it reports no key-index switch-off over leaves. The leaf-on
 # fold's HEAD is then put back and read back, so the later steps read the
 # snapshot the leaf-on fold published.
@@ -3963,7 +4025,7 @@ stage1_extra_hour_step() {
   fold_on_head="$STAGE1_HEAD_SHA"
   stage1_head_restore stage1-extra-hour-fold-off head-leafless "$STAGE1_LEAFLESS_HEAD"
   stage1_catalog_fold stage1-extra-hour-fold-off stage1.extra_hour_fold_off stage1-fold stage1-extra-hour-fold-off \
-    --signal metrics --writers-stopped
+    --signal metrics --writers-stopped ${KEY_INDEX_LEAVES_OFF:+"$KEY_INDEX_LEAVES_OFF"}
   switch_off="$(py get "$STAMPS" stage1.extra_hour_fold_off.key_index_switch_off_over_leaves)" ||
     fail_step stage1-extra-hour "stage1.extra_hour_fold_off.key_index_switch_off_over_leaves could not be read"
   if [ "$switch_off" != False ]; then
@@ -4219,7 +4281,8 @@ stage1_steps() {
   # later recreate keeps --disable-fold.
   stage1_recreate stage1-fold stage1.fold_restart "$STAGE1_UNROUTED_FLAGS"
   stamp_str stage1.background_fold "off from stage1-fold onward: ravel-server was recreated with --disable-fold before stage1-fold, and every later Stage 1 recreate (stage1.unrouted_restart, stage1.restart) passes it too, so only stage1-fold and stage1-leaves change the snapshot the passes read"
-  stage1_catalog_fold stage1-fold stage1.fold stage1-fold stage1-fold --signal metrics
+  stage1_catalog_fold stage1-fold stage1.fold stage1-fold stage1-fold --signal metrics \
+    ${KEY_INDEX_LEAVES_OFF:+"$KEY_INDEX_LEAVES_OFF"}
   stage1_recreate stage1-unrouted stage1.unrouted_restart "$STAGE1_UNROUTED_FLAGS"
   stage1_pass unrouted
   # The arms that change the tenant (a new hour, L1 rewrites, an erasure) run
@@ -4279,6 +4342,7 @@ run_diagnostic() {
   stamp_str ravel_restart "not applicable: diagnostic run starts no Ravel"
   stamp_str readback_folded "not applicable: diagnostic run starts no Ravel"
   stamp_str ravel_objects "not applicable: diagnostic run starts no Ravel"
+  stamp_str key_index_leaves_flag "not applicable: diagnostic run starts no Ravel and runs no fold"
   stamp_str query_scrapes "not applicable: diagnostic run starts no Ravel or Mimir and runs no query step"
   stamp_str object_spans "not applicable: diagnostic run starts no Ravel"
   stamp_str cold_ravel_diagnostic "not applicable: diagnostic run starts no Ravel"
@@ -4325,6 +4389,7 @@ run_full() {
   else
     fetch_s3s_fs
   fi
+  fold_flags_step
   [ "$stage1" -eq 0 ] || stage1_label_index_flags
 
   STACK_UP=1
