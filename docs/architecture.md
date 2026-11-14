@@ -321,6 +321,15 @@ differ only in requests issued, never in rows returned.
 [docs/query-engine.md](query-engine.md) holds the engine contract, and
 [guides/query.md](guides/query.md) the endpoints.
 
+The segment fetchers (RSEG, RLOG, RSPAN) share one process-wide pool of GET
+permits, sized by `--store-get-concurrency`. Unset, it is derived at startup with the
+other performance defaults as `max(8, 2 x cores)`, except on a loopback store
+endpoint, where the derived value is capped at 64 (ADR-4203 decision 3): a
+loopback store measured slower with 384 permits than with 32. The startup
+line `performance default resolved setting="store_get_concurrency"` names
+the source, `derived-loopback-cap` when the cap lowered the value. An
+explicit `--store-get-concurrency` or `--fetch-concurrency` is used as given.
+
 Maintenance reshapes the bucket without changing any answer. It has four
 loops:
 

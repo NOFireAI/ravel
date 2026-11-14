@@ -2612,7 +2612,8 @@ pub struct QueryArgs {
     /// the single process-owned `GetLimiter` every fetcher (RSEG, RLOG, RSPAN)
     /// shares. Default when unset: derived,
     /// `max(MIN_DERIVED_FETCH_CONCURRENCY, FETCH_CONCURRENCY_PER_CORE *
-    /// cores)`.
+    /// cores)`, capped at 64 on a loopback store endpoint (ADR-4203 decision
+    /// 3).
     ///
     /// Legacy precedence: `--fetch-concurrency` still sets this (and the two
     /// flags below) when neither is given explicitly. Setting both
@@ -5618,6 +5619,21 @@ pub const PERF_SOURCE_DERIVED_AVAILABLE: &str = "derived-available";
 /// `MemAvailable` ignored: the limit is already this process's share of the
 /// host (ADR-1170, amended 2026-10-03 by issue #2367).
 pub const PERF_SOURCE_DERIVED_CGROUP: &str = "derived-cgroup";
+/// [`ResolvedPerformanceDefaults`] source: neither `--store-get-concurrency`
+/// nor `--fetch-concurrency` was set, the store is a loopback endpoint, and
+/// the derived `store_get_concurrency` was above
+/// [`LOOPBACK_STORE_GET_CONCURRENCY_CAP`], so the cap is the value in force
+/// (ADR-4203 decision 3).
+pub const PERF_SOURCE_DERIVED_LOOPBACK_CAP: &str = "derived-loopback-cap";
+
+/// The ceiling on the derived `store_get_concurrency` when the store is a
+/// loopback endpoint (ADR-4203 decision 3). On a loopback store a GET permit
+/// count that grows with cores measured slower, not faster: 384 permits
+/// against 32 made ClickBench Q29 64% slower on the whole-segment fast path
+/// (ADR-4203 Stage 0 amendment), and issue #3714 measured listen overflows and
+/// body-read retries at 384. An explicit `--store-get-concurrency` or
+/// `--fetch-concurrency` is not capped.
+pub const LOOPBACK_STORE_GET_CONCURRENCY_CAP: usize = 64;
 
 /// The operator's explicit performance flags: `None` per field means "derive".
 /// One field is not a flag: `store_is_loopback`, a fact about the store the
@@ -5663,9 +5679,12 @@ pub struct PerformanceFlags {
     pub column_stats_cache_max_bytes: Option<u64>,
     /// Whether this deployment's store is a `--store s3` deployment against a
     /// loopback `--s3-endpoint`, computed by [`Cli::store_is_loopback`]: the
-    /// same predicate [`Cli::resolve_logs_fetch_policy`] uses. Only the
-    /// fetcher cache's derivation (ADR-2023) reads this; the catalog byte
-    /// cache does not.
+    /// same predicate [`Cli::resolve_logs_fetch_policy`] uses. Two
+    /// derivations in [`resolve_performance_defaults`] read this: the fetcher
+    /// cache's share (ADR-2023) and the cap on a derived
+    /// `store_get_concurrency` (ADR-4203 decision 3). The catalog byte cache,
+    /// the column-statistics cache, `sql_partition_count` and
+    /// `promql_fetch_fanout` do not.
     pub store_is_loopback: bool,
     /// `--sql-max-query-bytes`.
     pub sql_max_query_bytes: Option<usize>,
@@ -5981,6 +6000,14 @@ fn resolve_knob(
 ///
 /// - `fetch_concurrency`: `max(MIN_DERIVED_FETCH_CONCURRENCY,
 ///   FETCH_CONCURRENCY_PER_CORE * cores)`.
+/// - `store_get_concurrency`, `sql_partition_count`, `promql_fetch_fanout`
+///   (ADR-1195): the same derived value, or the legacy `--fetch-concurrency`
+///   when that is set. When `flags.store_is_loopback` and neither
+///   `--store-get-concurrency` nor `--fetch-concurrency` is set,
+///   `store_get_concurrency` alone is `min(derived,`
+///   [`LOOPBACK_STORE_GET_CONCURRENCY_CAP`]`)`, sourced
+///   [`PERF_SOURCE_DERIVED_LOOPBACK_CAP`] when the cap lowered it (ADR-4203
+///   decision 3).
 /// - `catalog_resolve_concurrency` (ADR-1733 decision 2):
 ///   `clamp(Q * RESOLVE_CONCURRENCY_PER_QUERY, RESOLVE_CONCURRENCY_PER_QUERY,
 ///   ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY)`, then held at
@@ -6082,11 +6109,19 @@ pub fn resolve_performance_defaults(
         None => (derived_fetch_concurrency, PERF_SOURCE_DERIVED),
     };
 
-    let (store_get_concurrency, store_get_concurrency_source) = resolve_knob(
-        flags.store_get_concurrency,
-        flags.fetch_concurrency,
-        derived_fetch_concurrency,
-    );
+    let (store_get_concurrency, store_get_concurrency_source) =
+        match (flags.store_get_concurrency, flags.fetch_concurrency) {
+            (None, None)
+                if flags.store_is_loopback
+                    && derived_fetch_concurrency > LOOPBACK_STORE_GET_CONCURRENCY_CAP =>
+            {
+                (
+                    LOOPBACK_STORE_GET_CONCURRENCY_CAP,
+                    PERF_SOURCE_DERIVED_LOOPBACK_CAP,
+                )
+            }
+            (explicit, legacy) => resolve_knob(explicit, legacy, derived_fetch_concurrency),
+        };
     let (sql_partition_count, sql_partition_count_source) = resolve_knob(
         flags.sql_partition_count,
         flags.fetch_concurrency,
@@ -6279,7 +6314,8 @@ pub fn resolve_performance_defaults(
     // The catalog byte cache is a SEPARATE LRU from the fetcher cache, resolved
     // from its own `--catalog-cache-max-bytes` flag: `--cache-max-bytes` no
     // longer reaches it (ADR-2023), and its derived share never varies with
-    // `flags.store_is_loopback` -- only the fetcher cache's does.
+    // `flags.store_is_loopback` -- of the byte caches, only the fetcher
+    // cache's does.
     let (catalog_cache_max_bytes, catalog_cache_source) = match flags.catalog_cache_max_bytes {
         Some(n) => (n, PERF_SOURCE_FLAG),
         None if flags.memory_budget_not_applicable => (0, PERF_SOURCE_NOT_APPLICABLE),
@@ -8494,7 +8530,9 @@ impl Cli {
     /// `--gcs-endpoint`, or a `--store azure` one against a loopback
     /// `--azure-endpoint`: the single place this predicate is computed
     /// (ADR-2023 decision 3), read by [`Self::performance_flags`] to size the
-    /// fetcher cache's loopback share and by [`Self::resolve_logs_fetch_policy`]
+    /// fetcher cache's loopback share and cap a derived
+    /// `store_get_concurrency` (ADR-4203 decision 3), and by
+    /// [`Self::resolve_logs_fetch_policy`]
     /// for the loopback policy default (ADR-2677 decision 7). Each endpoint is
     /// read only under its own store, so a stray exported `RAVEL_S3_ENDPOINT`
     /// cannot change behaviour for a `--store memory` start.
@@ -13309,6 +13347,152 @@ mod tests {
         // unaffected: this flag governs only GET concurrency.
         assert_eq!(engine.sql_partition_count(), REFERENCE_FETCH_CONCURRENCY);
         assert_eq!(engine.promql_fetch_fanout(), REFERENCE_FETCH_CONCURRENCY);
+    }
+
+    /// A 192-core host with 384 GiB of `MemTotal`: the c6a.metal shape whose
+    /// derived `store_get_concurrency` is 384.
+    fn metal_host() -> HostProfile {
+        let mem = 384 * 1024 * 1024 * 1024;
+        HostProfile::new(192, Some(mem), Some(mem), None, None, None)
+    }
+
+    /// ADR-4203 decision 3: on a loopback store with no
+    /// `--store-get-concurrency` and no `--fetch-concurrency`, the derived
+    /// GET permit count is capped at 64, sourced `derived-loopback-cap`, and
+    /// that capped value is the one the engine's GET permit pool is built
+    /// from and the startup stamp names. A non-loopback store, an explicit
+    /// flag, the legacy flag, and a derived value already at or under 64 are
+    /// untouched, and so is `sql_partition_count`.
+    ///
+    /// Prove-the-test: cap the explicit flag too and the flag case reads 64,
+    /// not 384; drop the `store_is_loopback` condition and the remote case
+    /// reads 64; cap `sql_partition_count` as well and it reads 64, not 384;
+    /// set the loopback value to 64 instead of `min(derived, 64)` and the
+    /// 16-core host reads 64, not 32.
+    #[test]
+    fn derived_store_get_concurrency_on_loopback_is_capped_and_reaches_the_engine() {
+        let loopback = PerformanceFlags {
+            store_is_loopback: true,
+            ..PerformanceFlags::default()
+        };
+
+        let capped = resolve_performance_defaults(metal_host(), loopback);
+        assert_eq!(capped.store_get_concurrency, 64);
+        assert_eq!(
+            capped.sources.store_get_concurrency,
+            PERF_SOURCE_DERIVED_LOOPBACK_CAP
+        );
+        assert_eq!(capped.sql_partition_count, 384);
+        assert_eq!(capped.sources.sql_partition_count, PERF_SOURCE_DERIVED);
+        assert_eq!(capped.promql_fetch_fanout, 384);
+        assert_eq!(capped.sources.promql_fetch_fanout, PERF_SOURCE_DERIVED);
+        assert_eq!(capped.fetch_concurrency, 384);
+
+        let remote = resolve_performance_defaults(metal_host(), PerformanceFlags::default());
+        assert_eq!(remote.store_get_concurrency, 384);
+        assert_eq!(remote.sources.store_get_concurrency, PERF_SOURCE_DERIVED);
+
+        let explicit = resolve_performance_defaults(
+            metal_host(),
+            PerformanceFlags {
+                store_get_concurrency: Some(384),
+                ..loopback
+            },
+        );
+        assert_eq!(explicit.store_get_concurrency, 384);
+        assert_eq!(explicit.sources.store_get_concurrency, PERF_SOURCE_FLAG);
+
+        let legacy = resolve_performance_defaults(
+            metal_host(),
+            PerformanceFlags {
+                fetch_concurrency: Some(384),
+                ..loopback
+            },
+        );
+        assert_eq!(legacy.store_get_concurrency, 384);
+        assert_eq!(
+            legacy.sources.store_get_concurrency,
+            PERF_SOURCE_LEGACY_FLAG
+        );
+
+        let small = resolve_performance_defaults(reference_host(), loopback);
+        assert_eq!(small.store_get_concurrency, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(small.sources.store_get_concurrency, PERF_SOURCE_DERIVED);
+
+        // Through the CLI and the wiring `start` uses, as `engine_from` does,
+        // but on the 192-core host.
+        let loopback_cli = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
+        let resolved = loopback_cli
+            .resolve_performance(metal_host())
+            .expect("performance defaults resolve");
+        assert_eq!(resolved.store_get_concurrency, 64);
+        let engine = loopback_cli
+            .query_budgets(&resolved)
+            .expect("budgets resolve")
+            .apply_to_engine(ravel_query::EngineConfig::default())
+            .expect("engine config resolves");
+        assert_eq!(
+            engine.store_get_concurrency(),
+            resolved.store_get_concurrency,
+            "the engine's GET permit pool must be built from the capped value"
+        );
+        assert_eq!(engine.sql_partition_count(), 384);
+
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        resolved.emit(metal_host());
+        let lines = captured.lock();
+        let stamp: Vec<&String> = lines
+            .iter()
+            .filter(|l| {
+                l.contains("performance default resolved")
+                    && l.contains("setting=\"store_get_concurrency\"")
+            })
+            .collect();
+        assert_eq!(stamp.len(), 1, "exactly one stamp line: {lines:?}");
+        assert!(stamp[0].contains(" value=64"), "{}", stamp[0]);
+        assert!(
+            stamp[0].contains(" source=\"derived-loopback-cap\""),
+            "{}",
+            stamp[0]
+        );
+    }
+
+    /// ADR-4203 decision 3 against ADR-2677 decision 7: the loopback GET cap
+    /// does not change the loopback logs fetch policy default, but on a
+    /// 192-core loopback host it takes `store_get_concurrency` below the
+    /// 256 latency-first was measured at, so `precondition_met` is false
+    /// there, as it already was on any host under 128 cores.
+    #[test]
+    fn loopback_get_cap_leaves_latency_first_precondition_unmet_on_a_large_host() {
+        let loopback_cli = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
+        let resolved = loopback_cli
+            .resolve_performance(metal_host())
+            .expect("performance defaults resolve");
+        let stamp = loopback_cli
+            .query_budgets(&resolved)
+            .expect("budgets resolve")
+            .logs_fetch_stamp();
+        assert_eq!(stamp.policy, "latency-first");
+        assert_eq!(
+            stamp.policy_source,
+            LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
+        );
+        assert_eq!(stamp.latency_first_measured_concurrency, Some(256));
+        assert_eq!(stamp.store_get_concurrency, 64);
+        assert_eq!(stamp.sql_partition_count, 384);
+        assert_eq!(stamp.latency_first_precondition_met(), Some(false));
+
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        stamp.emit();
+        let lines = captured.lock();
+        assert!(
+            lines.iter().any(
+                |l| l.contains("latency-first is the default on a loopback store")
+                    && l.contains("store_get_concurrency=64")
+                    && l.contains("precondition_met=false")
+            ),
+            "lines: {lines:?}"
+        );
     }
 
     /// ADR-1195 reachability: `--sql-partition-count` must reach the
