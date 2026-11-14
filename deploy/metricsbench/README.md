@@ -588,6 +588,26 @@ A compose project `metricsbench` that already has containers or volumes is
 refused with exit 65 before anything starts (case h), since an earlier run's
 data would be measured.
 
+**Leaf-off fold flag.** Before `up`, a full run reads the main image's
+`ravel-cli catalog fold --help` with `docker run --rm --network none
+--entrypoint /usr/local/bin/ravel-cli IMAGE catalog fold --help` into
+`fold-flags.help.txt`; no stack is needed. A ravel-cli built after issue
+#4200 builds key-index leaves in every fold unless given
+`--no-key-index-leaves`, and its help lists that flag as an option (beside
+`--key-index-leaves`, which it still accepts). When the help lists it, the
+leaf-off flag is `--no-key-index-leaves`; otherwise it is empty, since a
+ravel-cli built before #4200 builds no leaf unless asked and refuses the
+unknown flag (cases kl1 to kl3). The three folds meant to build no leaf
+pass it: `fold` (step 16), Stage 1's `stage1-fold` and its
+`stage1-extra-hour-fold-off`. A fold that passes `--key-index-leaves` or
+`--rebuild-key-index` is unchanged (cases kl1, kl2). `key_index_leaves_flag`
+in `stamps.json` records the flag, the spelling (`opt-out` or `opt-in`),
+which of the two leaf flags the help lists, the image, the command, the help
+file and the folds that pass it (cases kl1 to kl3). A probe that exits
+non-zero ends the run with exit 70 at `fold-flags` before anything is
+brought up (case kl4). The falsification run starts no Ravel, probes
+nothing and stamps `key_index_leaves_flag` not applicable (case u9).
+
 Steps, in order, stopping at the first failure, except a failed ingest
 verification (step 6), after which the run goes on as a diagnostic:
 
@@ -841,8 +861,8 @@ verification (step 6), after which the run goes on as a diagnostic:
     u, u1). A failed stop exits 70 naming stop, and no fold runs (case
     u2a). `ravel_restart` says it stopped.
 16. `fold`: `ravel-cli --store s3 --tenant-hash-unkeyed catalog fold
-    --tenant metricsbench --shards 4 --signal metrics --writers-stopped`,
-    run as `docker compose run --rm --no-deps -T ravel-qualify ...`, so it
+    --tenant metricsbench --shards 4 --signal metrics --writers-stopped`
+    and the leaf-off flag (above; case kl3), run as `docker compose run --rm --no-deps -T ravel-qualify ...`, so it
     reads the store `ravel-qualify` carries in either lane: s3s-fs here,
     the real-S3 bucket under `real-s3.yml` (cases u, u10). Every writer has
     stopped by then: the ingest bin has exited and `ravel-server` is
@@ -1128,7 +1148,8 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    --fold-key-index-leaves` and the label index off (the unrouted flags,
    stamped as `stage1.fold_restart`), then
    `ravel-cli catalog fold --signal metrics --json` on `ravel-qualify` with
-   no leaf flag and no `--writers-stopped`, into `stage1-fold.json`.
+   the leaf-off flag and no `--writers-stopped`, into `stage1-fold.json`
+   (case kl1).
    `stage1.fold` stamps its `wall_ms`, `watermark_hour`,
    `previous_watermark_hour`, `no_op`, `entry_count`, `buckets_folded`, the
    LIST, GET and PUT request counts and the key-index leaves and leaf bytes
@@ -1386,7 +1407,7 @@ own step, as the run records it; a request the run does not count says so.
     read-back one listing and one GET per HEAD, none counted.
 12. `stage1-extra-hour-fold-off`: the leafless HEAD put back and read back
     the same way, then `catalog fold --signal metrics --writers-stopped` with
-    no leaf flag, timed (`stage1.extra_hour_fold_off`). A fold-off report
+    the leaf-off flag (case kl1), timed (`stage1.extra_hour_fold_off`). A fold-off report
     whose `key_index_switch_off_over_leaves` is not `false` ends the run with
     exit 70 and `stage1.extra_hour` stamped `refused:` (case zg2): that flag
     says the fold read a HEAD carrying leaf refs, so it re-encoded parts the

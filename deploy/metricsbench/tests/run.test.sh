@@ -371,8 +371,20 @@
 #                                       control image listing neither and
 #                                       zs5: a failed probe exit 70 at
 #                                       stage1-flags with nothing up; zs6
-#                                       (z6's run): no probe without
-#                                       MB_STAGE1.
+#                                       (z6's run): no label index probe
+#                                       without MB_STAGE1, only fold-flags'.
+#                                       Leaf-off fold flag (issue #4202):
+#                                       kl1: an image whose fold builds
+#                                       leaves by default, every arm on,
+#                                       --no-key-index-leaves on fold,
+#                                       stage1-fold and
+#                                       stage1-extra-hour-fold-off only;
+#                                       kl2: an opt-in image, no leaf flag
+#                                       there; kl3: the folded step's fold
+#                                       without MB_STAGE1, the probe before
+#                                       up; kl4: a failed probe exit 70 at
+#                                       fold-flags with nothing up; each
+#                                       stamps key_index_leaves_flag.
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za
 #                                       (the reference prune band n/a),
@@ -1835,7 +1847,7 @@ expect_rc q3 70
 check "q3: stamps name ingest and list memory as failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["memory"] and j("stamps.json")["deferred_failures"] == ["memory"]'
 expect_err "q3: the band is still said" "--rss-band ravel-server:0:1073741824 above"
 check "q3: the breach does not stop the folded steps, memory not done" 'j("stamps.json")["steps_completed"][-5:] == ["validate","stop","fold","start","readback-folded"] and "memory" not in j("stamps.json")["steps_completed"]'
-expect_log "q3: the fold ran after the breach" "catalog fold"
+expect_log "q3: the fold ran after the breach" "--tenant-hash-unkeyed catalog fold"
 expect_log "q3: the folded read-back ran after the breach" "--readback-only"
 expect_err "q3: the exit still names ingest" "step ingest failed:"
 
@@ -1858,7 +1870,7 @@ expect_no_log "q4: validate not run" "metricsbench_report validate"
 expect_file q4 memory-summary.json
 check "q4: the breach is recorded in memory-summary.json" 'j("memory-summary.json")["verdict"] == "band_violated" and [b["verdict"] for b in j("memory-summary.json")["bands"]] == ["above"]'
 expect_log "q4: torn down" " down -v"
-expect_no_log "q4: the run ends before the fold" "catalog fold"
+expect_no_log "q4: the run ends before the fold" "--tenant-hash-unkeyed catalog fold"
 
 # --- r: ingest fails with every row verified ---------------------------------------
 mapfile -t args < <(full_args "${TMP}/r/out")
@@ -2346,7 +2358,7 @@ fi
 if python3 -I - "${LOG}" <<'PY'; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
-fold = next(i for i, l in enumerate(lines) if "catalog fold" in l)
+fold = next(i for i, l in enumerate(lines) if "--tenant-hash-unkeyed catalog fold" in l)
 after = lines[fold + 1:]
 calls = [l for l in after if l.startswith(("docker-compose-up ", "docker-compose-start "))]
 oneshots = [l for l in after if l.startswith("docker-oneshot ")
@@ -2380,7 +2392,7 @@ def first(s, after=-1):
     return next(i for i, l in enumerate(lines) if i > after and s in l)
 mem = max(i for i, l in enumerate(lines) if l.startswith("docker inspect id-"))
 stop = first(" stop ravel-server")
-fold = first("catalog fold")
+fold = first("--tenant-hash-unkeyed catalog fold")
 start = first("docker-compose-up -d --no-deps --no-recreate ravel-server")
 ready = first("/api/v1/status/buildinfo", start)
 before = first("/metrics", start)
@@ -2428,7 +2440,7 @@ STUB_STOP_EXIT=1 run_case u2a "${args[@]}"
 expect_rc u2a 70
 expect_err "u2a: message names step stop" "step stop failed: docker compose stop ravel-server exited 1"
 check "u2a: stamps name step stop, the failed stop stamped" 'j("stamps.json")["failed_step"] == "stop" and j("stamps.json")["ravel_restart"] == "not stopped: docker compose stop ravel-server exited 1; no fold ran" and j("stamps.json")["steps_completed"][-1] == "memory"'
-expect_no_log "u2a: no fold" "catalog fold"
+expect_no_log "u2a: no fold" "--tenant-hash-unkeyed catalog fold"
 
 # u2b: starting ravel-server fails after the fold: no read-back.
 mapfile -t args < <(full_args "${TMP}/u2b/out")
@@ -2474,7 +2486,7 @@ STUB_INGEST_READBACK_FAIL=victoriametrics STUB_INGEST_ROW_FAILURE=ravel run_case
 expect_rc u7 70
 check "u7: stamps name ingest, no stop, fold, start or readback-folded" 'j("stamps.json")["failed_step"] == "ingest" and not {"stop","fold","start","readback-folded"} & set(j("stamps.json")["steps_completed"]) and "memory" in j("stamps.json")["steps_completed"]'
 check "u7: each of the three stamps skipped for the row_failure" 'all(j("stamps.json")[k].startswith("skipped: the ravel row has a row_failure") for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded"))'
-expect_no_log "u7: no fold" "catalog fold"
+expect_no_log "u7: no fold" "--tenant-hash-unkeyed catalog fold"
 expect_no_log "u7: no folded read-back" "--readback-only"
 
 # u8: the Ravel row stalled: skipped the same way.
@@ -2482,7 +2494,7 @@ mapfile -t args < <(full_args "${TMP}/u8/out")
 STUB_INGEST_STALL=ravel run_case u8 "${args[@]}"
 expect_rc u8 70
 check "u8: each of the three stamps skipped for the stall" 'all(j("stamps.json")[k].startswith("skipped: the ravel row stalled") for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded"))'
-expect_no_log "u8: no fold" "catalog fold"
+expect_no_log "u8: no fold" "--tenant-hash-unkeyed catalog fold"
 
 # u9: the diagnostic mode (case f) runs none of them.
 OUT="${TMP}/f/out"
