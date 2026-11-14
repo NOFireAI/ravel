@@ -2377,7 +2377,9 @@ impl LogSegmentFetcher {
 
             // Skip-index-only survivor count (#761): when every block-level predicate
             // the query carries is decidable from the skip index alone -- ts bounds
-            // and prune-only NumRange arms, no index-prunable content arm, no attribute-equality
+            // and prune-only NumRange arms, a content list that is empty or holds
+            // only `Contains` arms (any other content arm, even one no index on
+            // this object covers, keeps the fallback), no attribute-equality
             // POSTINGS prune, no stream filter -- the surviving-block count is exactly
             // `candidate_blocks` over those arms, with no BLOCKS byte fetched and no
             // block decoded. The reader's full prune (skip, then POSTINGS, then bloom)
