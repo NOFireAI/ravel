@@ -128,9 +128,10 @@
 #               the leaf-off flag (see fold-flags), run through `docker
 #               compose run` on the ravel-qualify service (so it reads the
 #               same store as the server in either lane), into
-#               <out>/fold.out. Fails unless seal_through_hour is Some(N) and
-#               watermark_hour is at or after the hour the ingest step ended
-#               in. Stamped as ravel_catalog_fold_writers_stopped. A failed
+#               <out>/fold.out. Fails unless key_index_leaves_written is 0
+#               (a report without that line predates key-index leaves and
+#               passes), seal_through_hour is Some(N) and watermark_hour is
+#               at or after the hour the ingest step ended in. Stamped as ravel_catalog_fold_writers_stopped. A failed
 #               fold ends the run with the server still stopped
 #   start       docker compose up -d --no-deps --no-recreate ravel-server:
 #               the stopped container alone, since compose start would also
@@ -207,8 +208,9 @@
 #               ravel-qualify, with the leaf-off flag (see fold-flags) and no
 #               --writers-stopped, into
 #               <out>/stage1-fold.json; stamped as stage1.fold with its wall time
-#   stage1-unrouted  ravel-server recreated with the same flags (stamped as
-#               stage1.unrouted_restart). Then ravel-cli catalog inspect
+#   stage1-unrouted  refused unless stage1.fold reports
+#               key_index_leaves_written 0. Then ravel-server recreated with
+#               the same flags (stamped as stage1.unrouted_restart). Then ravel-cli catalog inspect
 #               --signal metrics into <out>/stage1-unrouted.inspect.txt,
 #               stamped as stage1.unrouted_catalog: the HEAD's watermark_hour,
 #               its part count and the parts carrying a label_value key-index
@@ -323,7 +325,8 @@
 #               then catalog fold --writers-stopped with the leaf-off flag
 #               (see fold-flags) timed
 #               (stage1.extra_hour_fold_off), refused unless it reports
-#               key_index_switch_off_over_leaves false
+#               key_index_switch_off_over_leaves false and
+#               key_index_leaves_written 0
 #   stage1-extra-hour  the leaf-on fold's HEAD put back and read back,
 #               inspect and listing into
 #               <out>/stage1-extra-hour.inspect.txt and .objects.jsonl;
@@ -969,7 +972,7 @@ elif op == "ravel-row-state":
             print(f"the ravel row's replay failed ({fr.get('error')})")
             sys.exit(3)
 elif op == "fold-stamp":
-    seal, watermark, entries, buckets, no_op, end_hour, precondition = args
+    seal, watermark, entries, buckets, no_op, leaves, end_hour, precondition = args
     def hour(v):
         m = re.fullmatch(r"Some\((\d+)\)", v)
         return int(m.group(1)) if m else v
@@ -978,6 +981,7 @@ elif op == "fold-stamp":
     print(json.dumps({"seal_through_hour": hour(seal), "watermark_hour": hour(watermark),
                       "entry_count": num(entries), "buckets_folded": num(buckets),
                       "no_op": {"true": True, "false": False}.get(no_op, no_op or None),
+                      "key_index_leaves_written": num(leaves),
                       "ingest_end_hour": int(end_hour), "precondition": precondition}))
 elif op == "readback-folded":
     # The bin's stdout, its exit code, the two /metrics scrapes ("" when one
@@ -3054,7 +3058,7 @@ print(json.dumps({
 }
 
 fold_step() {
-  local code=0 seal watermark entries buckets no_op precondition="met"
+  local code=0 seal watermark entries buckets no_op n leaves precondition="met"
   compose run --rm --no-deps -T ravel-qualify \
     --store s3 --tenant-hash-unkeyed catalog fold \
     --tenant "$RAVEL_TENANT" --shards "$RAVEL_SHARDS" --signal metrics --writers-stopped \
@@ -3069,7 +3073,17 @@ fold_step() {
   entries="$(fold_field entry_count)" || fail_step fold "no single entry_count in fold.out"
   buckets="$(fold_field buckets_folded)" || fail_step fold "no single buckets_folded in fold.out"
   no_op="$(fold_field no_op)" || no_op=""
-  if ! [[ "$seal" =~ ^Some\(([0-9]+)\)$ ]]; then
+  # A report with no key_index_leaves_written line comes from a ravel-cli
+  # built before key-index leaves, whose fold builds none.
+  n="$(grep -c "^[[:space:]]*key_index_leaves_written[[:space:]]*:" "${out_dir}/fold.out" 2>/dev/null)" || true
+  if [ "${n:-0}" = 0 ]; then
+    leaves="absent: fold.out carries no key_index_leaves_written line, so this ravel-cli predates key-index leaves and its fold builds none"
+  else
+    leaves="$(fold_field key_index_leaves_written)" || fail_step fold "no single key_index_leaves_written in fold.out"
+  fi
+  if [ "${n:-0}" != 0 ] && [ "$leaves" != 0 ]; then
+    precondition="fold wrote key-index leaves: key_index_leaves_written=${leaves}, want 0, with the leaf-off flag (key_index_leaves_flag.flag) ${KEY_INDEX_LEAVES_OFF:-empty}"
+  elif ! [[ "$seal" =~ ^Some\(([0-9]+)\)$ ]]; then
     precondition="fold sealed nothing: seal_through_hour=$seal"
   elif ! [[ "$watermark" =~ ^Some\(([0-9]+)\)$ ]] || [ "${BASH_REMATCH[1]}" -lt "$INGEST_END_HOUR" ]; then
     precondition="watermark_hour=$watermark is before hour $INGEST_END_HOUR, in which the ingest step ended"
@@ -3077,7 +3091,7 @@ fold_step() {
     precondition="entry_count '$entries' or buckets_folded '$buckets' is not a whole number"
   fi
   stamp_set ravel_catalog_fold_writers_stopped \
-    "$(py fold-stamp "$seal" "$watermark" "$entries" "$buckets" "$no_op" "$INGEST_END_HOUR" "$precondition")"
+    "$(py fold-stamp "$seal" "$watermark" "$entries" "$buckets" "$no_op" "$leaves" "$INGEST_END_HOUR" "$precondition")"
   [ "$precondition" = "met" ] || fail_step fold "$precondition"
   step_done fold
 }
@@ -3572,6 +3586,21 @@ stage1_catalog_fold() {
   step_done "$step"
 }
 
+# stage1_no_leaves_written STEP KEY REFUSAL_KEY: the fold stamped as KEY, run
+# with the leaf-off flag, must report key_index_leaves_written 0; otherwise
+# REFUSAL_KEY is stamped refused and STEP fails. The inspect guards count
+# label_value leaves only, so this is what catches a leaf of any field, or a
+# ravel-cli whose leaf opt-out the fold-flags probe did not find.
+stage1_no_leaves_written() {
+  local step="$1" key="$2" refusal="$3" leaves
+  leaves="$(py get "$STAMPS" "${key}.key_index_leaves_written")" ||
+    fail_step "$step" "${key}.key_index_leaves_written could not be read"
+  if [ "$leaves" != 0 ]; then
+    stamp_str "$refusal" "refused: ${key} reports key_index_leaves_written ${leaves}, want 0, with the leaf-off flag (key_index_leaves_flag.flag) ${KEY_INDEX_LEAVES_OFF:-empty}"
+    fail_step "$step" "${key} reports key_index_leaves_written ${leaves}, want 0, with the leaf-off flag (key_index_leaves_flag.flag) ${KEY_INDEX_LEAVES_OFF:-empty}"
+  fi
+}
+
 # stage1_recreate STEP STAMP_KEY FLAGS: ravel-server recreated alone with
 # RAVEL_SERVER_EXTRA_FLAGS=FLAGS (compose recreates the container when its
 # entrypoint changes, --force-recreate also when it does not; --no-deps keeps
@@ -3987,7 +4016,8 @@ stage1_control_step() {
 # saved. The leafless HEAD stage1_steps saved before stage1-leaves is put
 # back and read back, and the same fold with the leaf-off flag
 # (KEY_INDEX_LEAVES_OFF) instead of the leaf switch is timed from it,
-# refused unless it reports no key-index switch-off over leaves. The leaf-on
+# refused unless it reports no key-index switch-off over leaves and no
+# key-index leaf written. The leaf-on
 # fold's HEAD is then put back and read back, so the later steps read the
 # snapshot the leaf-on fold published.
 stage1_extra_hour_step() {
@@ -4033,6 +4063,7 @@ stage1_extra_hour_step() {
     stamp_str stage1.extra_hour "refused: the leaf-off fold reports key_index_switch_off_over_leaves ${switch_off}, so it did not start from a leafless lineage"
     fail_step stage1-extra-hour "the leaf-off fold reports key_index_switch_off_over_leaves ${switch_off}, want false"
   fi
+  stage1_no_leaves_written stage1-extra-hour stage1.extra_hour_fold_off stage1.extra_hour
   stage1_head_restore stage1-extra-hour head-fold-on "$fold_on_head"
   rm -rf "${out_dir}/stage1-s3"
   stage1_inspect stage1-extra-hour stage1-extra-hour.inspect.txt
@@ -4284,6 +4315,7 @@ stage1_steps() {
   stamp_str stage1.background_fold "off from stage1-fold onward: ravel-server was recreated with --disable-fold before stage1-fold, and every later Stage 1 recreate (stage1.unrouted_restart, stage1.restart) passes it too, so only stage1-fold and stage1-leaves change the snapshot the passes read"
   stage1_catalog_fold stage1-fold stage1.fold stage1-fold stage1-fold --signal metrics \
     ${KEY_INDEX_LEAVES_OFF:+"$KEY_INDEX_LEAVES_OFF"}
+  stage1_no_leaves_written stage1-unrouted stage1.fold stage1.unrouted
   stage1_recreate stage1-unrouted stage1.unrouted_restart "$STAGE1_UNROUTED_FLAGS"
   stage1_pass unrouted
   # The arms that change the tenant (a new hour, L1 rewrites, an erasure) run

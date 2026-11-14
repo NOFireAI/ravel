@@ -605,7 +605,10 @@ in `stamps.json` records the flag, the spelling (`opt-out` or `opt-in`),
 which of the two leaf flags the help lists, the image, the command, the help
 file and the folds that pass it (cases kl1 to kl3). A probe that exits
 non-zero ends the run with exit 70 at `fold-flags` before anything is
-brought up (case kl4). The falsification run starts no Ravel, probes
+brought up (case kl4). Each of the three folds is then refused with exit 70
+if its report says it wrote a key-index leaf anyway, as a ravel-cli that
+renamed or moved its opt-out would (cases kl5 to kl7; step 16, Stage 1 steps
+2 and 12). The falsification run starts no Ravel, probes
 nothing and stamps `key_index_leaves_flag` not applicable (case u9).
 
 Steps, in order, stopping at the first failure, except a failed ingest
@@ -873,11 +876,18 @@ verification (step 6), after which the run goes on as a diagnostic:
     divided by 3600) the clock read when the ingest step returned (case u2);
     what those two clauses can and cannot catch is under step 18. A failed
     fold ends the run with `ravel-server` still stopped, and `start` does not
-    run (cases u1, u2); the teardown removes the stack either way.
+    run (cases u1, u2); the teardown removes the stack either way. It also
+    fails, before those two clauses, when the report's
+    `key_index_leaves_written` is present and not 0: the fold ran with the
+    leaf-off flag and built leaves anyway (case kl6). A report with no
+    `key_index_leaves_written` line comes from a ravel-cli that predates
+    key-index leaves and builds none; the step passes and the stamp says so
+    (case kl8).
     `ravel_catalog_fold_writers_stopped` stamps `seal_through_hour`,
-    `watermark_hour`, `entry_count`, `buckets_folded`, `no_op`, that
+    `watermark_hour`, `entry_count`, `buckets_folded`, `no_op`,
+    `key_index_leaves_written` (the figure, or `absent: ...`), that
     `ingest_end_hour` and `precondition` (`met`, or why not) (cases u, u1,
-    u2).
+    u2, kl6, kl8).
 17. `start`: `docker compose up -d --no-deps --no-recreate ravel-server`,
     which starts the stopped `ravel-server` container alone, then Ravel's
     `/api/v1/status/buildinfo` answers 200 as in `ready`, before the
@@ -1155,8 +1165,13 @@ only `stage1-fold` and `stage1-leaves` change the snapshot;
    `previous_watermark_hour`, `no_op`, `entry_count`, `buckets_folded`, the
    LIST, GET and PUT request counts and the key-index leaves and leaf bytes
    it wrote.
-2. `stage1-unrouted`: ravel-server recreated with the same flags (stamped as
-   `stage1.unrouted_restart`). Then `ravel-cli catalog inspect --signal
+2. `stage1-unrouted`: refused first (exit 70 naming the step,
+   `stage1.unrouted` stamped `refused:` with the figure and the leaf-off
+   flag) unless `stage1.fold`'s `key_index_leaves_written` is 0 (case kl7):
+   the inspect guard below counts `label_value` leaves only, so a leaf of
+   another field, or a ravel-cli whose opt-out the `fold-flags` probe
+   missed, would pass it. Then ravel-server recreated with the same flags
+   (stamped as `stage1.unrouted_restart`). Then `ravel-cli catalog inspect --signal
    metrics` into `stage1-unrouted.inspect.txt`, stamped as
    `stage1.unrouted_catalog`: the snapshot HEAD's `watermark_hour`, its
    `parts`, and `label_value_leaf_parts` and `label_value_leaf_refs` (the
@@ -1414,7 +1429,11 @@ own step, as the run records it; a request the run does not count says so.
     exit 70 and `stage1.extra_hour` stamped `refused:` (case zg2): that flag
     says the fold read a HEAD carrying leaf refs, so it re-encoded parts the
     leaf-on fold did not and the two wall times would not time the same
-    work. Each fold's `put_requests` and `key_index_switch_off_over_leaves`
+    work. A fold-off report whose `key_index_leaves_written` is not 0 ends
+    the run the same way, `stage1.extra_hour` stamped `refused:` with the
+    figure and the leaf-off flag (case kl5): the flag was passed and the
+    fold built leaves anyway, so `wall_ratio_on_off` would compare leaf-on
+    against leaf-on. Each fold's `put_requests` and `key_index_switch_off_over_leaves`
     are stamped with the rest of its report. The leaf-off fold runs second,
     on whatever the leaf-on fold left warm, so `wall_ratio_on_off` errs
     high, never low.

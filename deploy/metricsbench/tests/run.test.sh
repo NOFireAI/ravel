@@ -385,6 +385,15 @@
 #                                       up; kl4: a failed probe exit 70 at
 #                                       fold-flags with nothing up; each
 #                                       stamps key_index_leaves_flag.
+#                                       A leaf-off fold that reports
+#                                       key_index_leaves_written 3 exits
+#                                       70: kl5 the extra-hour leaf-off
+#                                       fold at stage1-extra-hour, kl6 the
+#                                       folded step's fold at fold, kl7
+#                                       the stage1-fold baseline at
+#                                       stage1-unrouted; kl8: a text report
+#                                       with no such line passes, stamped
+#                                       absent.
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za
 #                                       (the reference prune band n/a),
@@ -895,7 +904,11 @@ JSON
           # $STUB_STATE.head, named "-leaves" when it carries leaf refs; a
           # fold with no --key-index-leaves over such a HEAD reports
           # key_index_switch_off_over_leaves true (fold.rs:401-410), as does
-          # every fold with STUB_SWITCH_OFF_OVER_LEAVES.
+          # every fold with STUB_SWITCH_OFF_OVER_LEAVES. STUB_LEAKED_LEAVES_FOLD
+          # names one leaf-off fold (fold, stage1-fold or extra-off) that
+          # reports key_index_leaves_written STUB_LEAKED_LEAVES (default 3)
+          # all the same; STUB_FOLD_NO_LEAF_LINE leaves that line out of the
+          # text report.
           *" catalog fold "*)
             printf 'docker-state fold ravel-server=%s\n' "$(cat "${STUB_STATE}.ravel" 2>/dev/null || echo running)" >>"${STUB_LOG}"
             reject_flags "${RAVEL_IMAGE-}" "$@"
@@ -931,10 +944,13 @@ JSON
                 [ -z "${STUB_SWITCH_OFF_OVER_LEAVES:-}" ] || switch_off=true
                 echo "head-${n}${leafy}" >"${STUB_STATE}.head"
                 if [ ! -e "${STUB_STATE}.extra" ]; then
-                  foldreport json "{\"watermark_hour\": 490001, \"previous_watermark_hour\": 490001, \"no_op\": true, \"list_requests\": 4, \"get_requests\": 6, \"key_index_switch_off_over_leaves\": ${switch_off}}"
+                  leaves=0
+                  [ "${STUB_LEAKED_LEAVES_FOLD:-}" != stage1-fold ] || [ "$n" -ne 1 ] || leaves="${STUB_LEAKED_LEAVES:-3}"
+                  foldreport json "{\"watermark_hour\": 490001, \"previous_watermark_hour\": 490001, \"no_op\": true, \"list_requests\": 4, \"get_requests\": 6, \"key_index_leaves_written\": ${leaves}, \"key_index_switch_off_over_leaves\": ${switch_off}}"
                 else
                   leaves=0 bytes=0
                   [ -z "$leafy" ] || { leaves=2 bytes="${STUB_EXTRA_LEAF_BYTES:-10}"; }
+                  [ -n "$leafy" ] || [ "${STUB_LEAKED_LEAVES_FOLD:-}" != extra-off ] || { leaves="${STUB_LEAKED_LEAVES:-3}" bytes=30; }
                   foldreport json "{\"watermark_hour\": 490002, \"previous_watermark_hour\": 490001, \"entry_count\": 30, \"buckets_folded\": 4, \"list_requests\": 4, \"get_requests\": 6, \"put_requests\": 3, \"key_index_leaves_written\": ${leaves}, \"key_index_leaf_bytes_written\": ${bytes}, \"key_index_switch_off_over_leaves\": ${switch_off}}"
                 fi
                 exit 0
@@ -943,7 +959,11 @@ JSON
             hour=$(($(date -u +%s) / 3600))
             seal="${STUB_FOLD_SEAL:-Some(${hour})}"
             case "$seal" in Some\(*\)) seal="${seal#Some(}" seal="${seal%)}" ;; *) seal=null ;; esac
-            foldreport text "{\"watermark_hour\": $((hour - ${STUB_FOLD_WATERMARK_LAG:-0})), \"buckets_folded\": 2, \"entry_count\": 420, \"part_bytes\": 9000, \"seal_through_hour\": ${seal}}"
+            leaves=0
+            [ "${STUB_LEAKED_LEAVES_FOLD:-}" != fold ] || leaves="${STUB_LEAKED_LEAVES:-3}"
+            omit=""
+            [ -z "${STUB_FOLD_NO_LEAF_LINE:-}" ] || omit=key_index_leaves_written
+            foldreport text "{\"watermark_hour\": $((hour - ${STUB_FOLD_WATERMARK_LAG:-0})), \"buckets_folded\": 2, \"entry_count\": 420, \"part_bytes\": 9000, \"seal_through_hour\": ${seal}, \"key_index_leaves_written\": ${leaves}, \"_omit\": \"${omit}\"}"
             ;;
         esac
         ;;
@@ -1063,6 +1083,8 @@ import json
 import sys
 
 mode, overrides = sys.argv[1], json.loads(sys.argv[2])
+# _omit: a text report field left out, as a ravel-cli that predates it prints.
+omit = overrides.pop("_omit", "")
 if mode == "rebuild":
     # crates/ravel-catalog/src/key_index_rebuild.rs:83-138, every field.
     leaves = overrides.get("leaves_written", 0)
@@ -1131,7 +1153,8 @@ for k in ["buckets_folded", "entry_count", "part_bytes", "parts_total", "parts_r
           "key_index_leaves_written", "key_index_leaf_bytes_written", "key_index_uncovered_entries",
           "key_index_sections_read", "key_index_entries_carried", "key_index_build_passes",
           "key_index_pair_budget"]:
-    print(f"{k}: {show(doc[k])}")
+    if k != omit:
+        print(f"{k}: {show(doc[k])}")
 print("key_index_field_pairs: " + json.dumps(doc["key_index_field_pairs"], separators=(",", ":"), sort_keys=True))
 for k in ["key_index_switch_off_over_leaves", "key_index_parts_missing_declared_leaves", "key_index_leaf_gets",
           "metrics_label_index_parts_over_cap", "metrics_label_index_parts_erasure_gated",
@@ -3932,6 +3955,7 @@ expect_rc kl3 0
 expect_log "kl3: the folded step's fold passes --no-key-index-leaves" "ravel.yml run --rm --no-deps -T ravel-qualify --store s3 --tenant-hash-unkeyed catalog fold --tenant metricsbench --shards 4 --signal metrics --writers-stopped --no-key-index-leaves"
 expect_no_log "kl3: no flag refused" "docker-reject "
 kl_stamp_check kl3 opt-out
+check "kl3: the fold stamp carries the report's key_index_leaves_written 0" 'j("stamps.json")["ravel_catalog_fold_writers_stopped"]["key_index_leaves_written"] == 0'
 if python3 -I - "${LOG}" <<'PY'; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
@@ -3948,6 +3972,36 @@ STUB_FOLD_HELP_EXIT=125 run_stage1 kl4 ci
 expect_rc kl4 70
 check "kl4: fold-flags named, the stamp names the failed docker run" 'j("stamps.json")["failed_step"] == "fold-flags" and j("stamps.json")["key_index_leaves_flag"] == "failed: docker run --rm --network none --entrypoint /usr/local/bin/ravel-cli '"${IMAGE}"' catalog fold --help exited 125"'
 expect_no_log "kl4: nothing brought up" "docker-env up "
+# kl5 to kl8: a leaf-off fold must report key_index_leaves_written 0. The
+# help lists the opt-out and each fold passes it, but the stubbed fold
+# reports 3 leaves written all the same, as a ravel-cli that renamed or
+# moved its opt-out would.
+# kl5: the extra-hour leaf-off fold, which starts from the leafless HEAD
+# (no switch-off over leaves) and leaves the snapshot's label_value parts
+# alone.
+MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour STUB_LEAF_HELP_STYLE=opt-out STUB_LEAKED_LEAVES_FOLD=extra-off \
+  run_stage1 kl5 ci
+expect_rc kl5 70
+expect_err "kl5: the refusal names the step, the figure and the flag" "step stage1-extra-hour failed: stage1.extra_hour_fold_off reports key_index_leaves_written 3, want 0, with the leaf-off flag (key_index_leaves_flag.flag) --no-key-index-leaves"
+check "kl5: the extra hour is stamped refused after both folds, the leaf-off fold with no switch-off over leaves" 'j("stamps.json")["failed_step"] == "stage1-extra-hour" and j("stamps.json")["stage1"]["extra_hour"] == "refused: stage1.extra_hour_fold_off reports key_index_leaves_written 3, want 0, with the leaf-off flag (key_index_leaves_flag.flag) --no-key-index-leaves" and j("stamps.json")["stage1"]["extra_hour_fold_off"]["key_index_switch_off_over_leaves"] is False and j("stamps.json")["steps_completed"][-2:] == ["stage1-extra-hour-fold-on", "stage1-extra-hour-fold-off"]'
+check "kl5: the label_value guards passed: the unrouted snapshot carried no label_value leaf" 'j("stamps.json")["stage1"]["unrouted_catalog"]["label_value_leaf_parts"] == 0'
+# kl6: the folded step's fold.
+STUB_LEAF_HELP_STYLE=opt-out STUB_LEAKED_LEAVES_FOLD=fold run_stage1 kl6 ci
+expect_rc kl6 70
+expect_err "kl6: the refusal names step fold and the figure" "step fold failed: fold wrote key-index leaves: key_index_leaves_written=3, want 0, with the leaf-off flag (key_index_leaves_flag.flag) --no-key-index-leaves"
+check "kl6: fold named, its stamp carries the figure and the refusal" 'j("stamps.json")["failed_step"] == "fold" and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["key_index_leaves_written"] == 3 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"] == "fold wrote key-index leaves: key_index_leaves_written=3, want 0, with the leaf-off flag (key_index_leaves_flag.flag) --no-key-index-leaves"'
+expect_no_log "kl6: ravel-server not started after the refused fold" "ravel.yml up -d --no-deps --no-recreate ravel-server"
+# kl7: the stage1-fold baseline. Its leaves carry no label_value ref, so the
+# unrouted pass's label_value guard alone would let them through.
+MB_STAGE1=1 STUB_LEAF_HELP_STYLE=opt-out STUB_LEAKED_LEAVES_FOLD=stage1-fold run_stage1 kl7 ci
+expect_rc kl7 70
+expect_err "kl7: the refusal names the unrouted step and the figure" "step stage1-unrouted failed: stage1.fold reports key_index_leaves_written 3, want 0, with the leaf-off flag (key_index_leaves_flag.flag) --no-key-index-leaves"
+check "kl7: stage1.unrouted stamped refused before any unrouted pass" 'j("stamps.json")["failed_step"] == "stage1-unrouted" and j("stamps.json")["stage1"]["unrouted"] == "refused: stage1.fold reports key_index_leaves_written 3, want 0, with the leaf-off flag (key_index_leaves_flag.flag) --no-key-index-leaves" and j("stamps.json")["stage1"]["unrouted_catalog"] is None and j("stamps.json")["steps_completed"][-1] == "stage1-fold"'
+# kl8: a fold report from a ravel-cli that predates key-index leaves has no
+# key_index_leaves_written line: the fold step passes and says so.
+STUB_FOLD_NO_LEAF_LINE=1 run_stage1 kl8 ci
+expect_rc kl8 0
+check "kl8: the fold stamp says the report has no leaf line" 'j("stamps.json")["ravel_catalog_fold_writers_stopped"]["key_index_leaves_written"].startswith("absent: fold.out carries no key_index_leaves_written line") and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"] == "met"'
 
 # --- z: stage1-check.sh ------------------------------------------------------------------
 CHECK="${HERE}/../stage1-check.sh"
