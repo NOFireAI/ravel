@@ -535,9 +535,9 @@ pub enum SqlError {
     /// `TooManySamples` or `ResourcesExhausted` that happens to cross a
     /// `Shared` boundary still keeps its own class and text instead of
     /// collapsing into a generic execution failure. `detail` is the original
-    /// error's own `Display`, so the server log keeps the cause; it is never
-    /// the client text, which stays `message`. Never constructed outside
-    /// `classify_shared`.
+    /// error's own `Display`, so the server log keeps the cause, and
+    /// `Display` prints it. `client_message()` returns `message`, not
+    /// `detail`. Production code constructs it only in `classify_shared`.
     #[error("{detail}")]
     Shared {
         class: ErrorClass,
