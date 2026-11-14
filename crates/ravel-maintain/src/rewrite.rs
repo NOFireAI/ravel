@@ -245,6 +245,7 @@ pub(crate) fn emit_request_report(config: &CompactorConfig, bucket: &Bucket, ok:
             scratch_write_bytes = r.scratch_write_bytes,
             scratch_read_bytes = r.scratch_read_bytes,
             level2_workers = r.level2_workers,
+            level2_workers_predicted = r.level2_workers_predicted,
             level2_ranges = r.level2_ranges,
             "compaction store requests by phase (received and sent bytes are different kinds; do not sum them together)"
         );

@@ -233,6 +233,12 @@ pub struct RunRequestReport {
     /// Level-2 workers `W2` a two-level merge ran its ranges on (ADR-3853
     /// D5); zero for a single-level merge. Not a request count.
     pub level2_workers: u64,
+    /// The `W2` the joint derivation predicted before level 1 (ADR-3853,
+    /// #4140 amendment), when level 2 re-derived a different
+    /// [`Self::level2_workers`] from the runs level 1 wrote; zero when the two
+    /// agree, when `W2` was configured, or for a single-level merge. Not a
+    /// request count.
+    pub level2_workers_predicted: u64,
     /// Ranges a two-level merge cut level 2's stream key space into
     /// (ADR-3853 D5); zero for a single-level merge. Not a request count.
     pub level2_ranges: u64,
@@ -305,6 +311,7 @@ struct RequestLedgerInner {
     scratch_read_bytes: AtomicU64,
     level1_workers: AtomicU64,
     level2_workers: AtomicU64,
+    level2_workers_predicted: AtomicU64,
     level2_ranges: AtomicU64,
     encode_builders: AtomicU64,
     /// Whether a run's scope is currently open. Read only by
@@ -397,6 +404,9 @@ impl RequestLedger {
         self.inner.scratch_read_bytes.store(0, Ordering::Relaxed);
         self.inner.level1_workers.store(0, Ordering::Relaxed);
         self.inner.level2_workers.store(0, Ordering::Relaxed);
+        self.inner
+            .level2_workers_predicted
+            .store(0, Ordering::Relaxed);
         self.inner.level2_ranges.store(0, Ordering::Relaxed);
         self.inner.encode_builders.store(0, Ordering::Relaxed);
     }
@@ -430,6 +440,14 @@ impl RequestLedger {
     pub fn record_level2_ranges(&self, workers: u64, ranges: u64) {
         self.inner.level2_workers.store(workers, Ordering::Relaxed);
         self.inner.level2_ranges.store(ranges, Ordering::Relaxed);
+    }
+
+    /// Record the `W2` a two-level RLOG merge predicted before level 1, when
+    /// it differs from the one level 2 ran on, or zero.
+    pub fn record_level2_workers_predicted(&self, predicted: u64) {
+        self.inner
+            .level2_workers_predicted
+            .store(predicted, Ordering::Relaxed);
     }
 
     /// Record the level-2 encode depth `E` of a two-level RLOG merge.
@@ -555,6 +573,7 @@ impl RequestLedger {
             scratch_read_bytes: self.inner.scratch_read_bytes.load(Ordering::Relaxed),
             level1_workers: self.inner.level1_workers.load(Ordering::Relaxed),
             level2_workers: self.inner.level2_workers.load(Ordering::Relaxed),
+            level2_workers_predicted: self.inner.level2_workers_predicted.load(Ordering::Relaxed),
             level2_ranges: self.inner.level2_ranges.load(Ordering::Relaxed),
             encode_builders: self.inner.encode_builders.load(Ordering::Relaxed),
         }
