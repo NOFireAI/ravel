@@ -371,8 +371,20 @@
 #                                       control image listing neither and
 #                                       zs5: a failed probe exit 70 at
 #                                       stage1-flags with nothing up; zs6
-#                                       (z6's run): no probe without
-#                                       MB_STAGE1.
+#                                       (z6's run): no label index probe
+#                                       without MB_STAGE1, only fold-flags'.
+#                                       Leaf-off fold flag (issue #4202):
+#                                       kl1: an image whose fold builds
+#                                       leaves by default, every arm on,
+#                                       --no-key-index-leaves on fold,
+#                                       stage1-fold and
+#                                       stage1-extra-hour-fold-off only;
+#                                       kl2: an opt-in image, no leaf flag
+#                                       there; kl3: the folded step's fold
+#                                       without MB_STAGE1, the probe before
+#                                       up; kl4: a failed probe exit 70 at
+#                                       fold-flags with nothing up; each
+#                                       stamps key_index_leaves_flag.
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za
 #                                       (the reference prune band n/a),
@@ -459,13 +471,26 @@ help_style() {
     *) echo "${STUB_HELP_STYLE:-opt-out}" ;;
   esac
 }
+# leaf_style: ravel-cli catalog fold's key-index leaf flags,
+# STUB_LEAF_HELP_STYLE: opt-in (the default, an image built before issue
+# #4200: --key-index-leaves only, no leaf unless asked) or opt-out (built
+# after: --key-index-leaves and --no-key-index-leaves, leaves by default).
+leaf_style() {
+  echo "${STUB_LEAF_HELP_STYLE:-opt-in}"
+}
 # reject_flags IMAGE WORDS...: exit 2 as clap does on a label index flag
-# IMAGE's binaries do not take.
+# IMAGE's binaries do not take, or on --no-key-index-leaves where leaf_style
+# is opt-in.
 reject_flags() {
   local style w
   style="$(help_style "$1")"
   shift
   for w in "$@"; do
+    if [ "$(leaf_style):${w}" = "opt-in:--no-key-index-leaves" ]; then
+      printf 'docker-reject %s %s\n' "${RAVEL_IMAGE-}" "$w" >>"${STUB_LOG}"
+      echo "error: unexpected argument '${w}' found" >&2
+      exit 2
+    fi
     case "${style}:${w}" in
       opt-out:--fold-metrics-label-index | opt-out:--metrics-label-index | \
         opt-in:--no-fold-metrics-label-index | opt-in:--no-metrics-label-index | \
@@ -889,10 +914,20 @@ JSON
                 echo "$n" >"${STUB_STATE}.folds"
                 prev_head="$(cat "${STUB_STATE}.head" 2>/dev/null || echo head-0)"
                 switch_off=false leafy=""
-                case " $* " in
+                # A fold builds leaves when asked, or on an opt-out leaf_style
+                # binary unless told not to; with a label index default of
+                # opt-out and no --no-metrics-label-index, every part then
+                # carries a label_value leaf, which inspect reports.
+                case "$(leaf_style): $* " in
                   *" --key-index-leaves "*) leafy=-leaves ;;
-                  *) case "$prev_head" in *leaves*) switch_off=true ;; esac ;;
+                  opt-out:*" --no-key-index-leaves "*) ;;
+                  opt-out:*) leafy=-leaves ;;
                 esac
+                if [ -z "$leafy" ]; then
+                  case "$prev_head" in *leaves*) switch_off=true ;; esac
+                elif [ "$(help_style "${RAVEL_IMAGE-}")" = opt-out ]; then
+                  case " $* " in *" --no-metrics-label-index "*) ;; *) : >"${STUB_STATE}.labelled" ;; esac
+                fi
                 [ -z "${STUB_SWITCH_OFF_OVER_LEAVES:-}" ] || switch_off=true
                 echo "head-${n}${leafy}" >"${STUB_STATE}.head"
                 if [ ! -e "${STUB_STATE}.extra" ]; then
@@ -915,10 +950,12 @@ JSON
     esac
     ;;
   # docker run --rm --network none --entrypoint BINARY IMAGE ARGS (run.sh
-  # step stage1-flags, ARGS ending in --help): BINARY's option lines with the
-  # label index flags help_style gives IMAGE, each option's description on
+  # steps fold-flags and stage1-flags, ARGS ending in --help): BINARY's
+  # option lines with the label index flags help_style gives IMAGE and, for
+  # ravel-cli, the leaf flags leaf_style gives, each option's description on
   # the lines below it, one of which opens with the other spelling's flag
-  # (only an option line counts); exit STUB_HELP_EXIT.
+  # (only an option line counts); exit STUB_HELP_EXIT for ravel-server and
+  # STUB_FOLD_HELP_EXIT for ravel-cli.
   run)
     shift
     entry="" image=""
@@ -930,16 +967,25 @@ JSON
         *) image="$1" && shift && break ;;
       esac
     done
-    if [ "${STUB_HELP_EXIT:-0}" -ne 0 ]; then
+    help_exit="${STUB_HELP_EXIT:-0}"
+    [ "${entry##*/}" != ravel-cli ] || help_exit="${STUB_FOLD_HELP_EXIT:-0}"
+    if [ "$help_exit" -ne 0 ]; then
       echo "stub: cannot run ${entry} in ${image}" >&2
-      exit "${STUB_HELP_EXIT}"
+      exit "$help_exit"
     fi
     case "$entry" in
       */ravel-server) leaves=--fold-key-index-leaves in=--fold-metrics-label-index out=--no-fold-metrics-label-index ;;
       *) leaves=--key-index-leaves in=--metrics-label-index out=--no-metrics-label-index ;;
     esac
     printf 'Usage: %s [OPTIONS]\n\nOptions:\n' "${entry##*/}"
-    printf '      %s\n          Build key-index leaves\n' "$leaves"
+    if [ "$leaves" = --key-index-leaves ] && [ "$(leaf_style)" = opt-out ]; then
+      printf '      %s\n          Build key-index leaves (the default)\n' "$leaves"
+      printf '      --no-key-index-leaves\n          Build no key-index leaves\n'
+    elif [ "$leaves" = --key-index-leaves ]; then
+      printf '      %s\n          Build key-index leaves;\n          --no-key-index-leaves is the opt-out of later images\n' "$leaves"
+    else
+      printf '      %s\n          Build key-index leaves\n' "$leaves"
+    fi
     case "$(help_style "$image")" in
       opt-in | both) printf '      %s\n          Build the metrics label index;\n          %s is the opt-out of later images\n' "$in" "$out" ;;
     esac
@@ -1801,7 +1847,7 @@ expect_rc q3 70
 check "q3: stamps name ingest and list memory as failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["memory"] and j("stamps.json")["deferred_failures"] == ["memory"]'
 expect_err "q3: the band is still said" "--rss-band ravel-server:0:1073741824 above"
 check "q3: the breach does not stop the folded steps, memory not done" 'j("stamps.json")["steps_completed"][-5:] == ["validate","stop","fold","start","readback-folded"] and "memory" not in j("stamps.json")["steps_completed"]'
-expect_log "q3: the fold ran after the breach" "catalog fold"
+expect_log "q3: the fold ran after the breach" "--tenant-hash-unkeyed catalog fold"
 expect_log "q3: the folded read-back ran after the breach" "--readback-only"
 expect_err "q3: the exit still names ingest" "step ingest failed:"
 
@@ -1824,7 +1870,7 @@ expect_no_log "q4: validate not run" "metricsbench_report validate"
 expect_file q4 memory-summary.json
 check "q4: the breach is recorded in memory-summary.json" 'j("memory-summary.json")["verdict"] == "band_violated" and [b["verdict"] for b in j("memory-summary.json")["bands"]] == ["above"]'
 expect_log "q4: torn down" " down -v"
-expect_no_log "q4: the run ends before the fold" "catalog fold"
+expect_no_log "q4: the run ends before the fold" "--tenant-hash-unkeyed catalog fold"
 
 # --- r: ingest fails with every row verified ---------------------------------------
 mapfile -t args < <(full_args "${TMP}/r/out")
@@ -2312,7 +2358,7 @@ fi
 if python3 -I - "${LOG}" <<'PY'; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
-fold = next(i for i, l in enumerate(lines) if "catalog fold" in l)
+fold = next(i for i, l in enumerate(lines) if "--tenant-hash-unkeyed catalog fold" in l)
 after = lines[fold + 1:]
 calls = [l for l in after if l.startswith(("docker-compose-up ", "docker-compose-start "))]
 oneshots = [l for l in after if l.startswith("docker-oneshot ")
@@ -2346,7 +2392,7 @@ def first(s, after=-1):
     return next(i for i, l in enumerate(lines) if i > after and s in l)
 mem = max(i for i, l in enumerate(lines) if l.startswith("docker inspect id-"))
 stop = first(" stop ravel-server")
-fold = first("catalog fold")
+fold = first("--tenant-hash-unkeyed catalog fold")
 start = first("docker-compose-up -d --no-deps --no-recreate ravel-server")
 ready = first("/api/v1/status/buildinfo", start)
 before = first("/metrics", start)
@@ -2394,7 +2440,7 @@ STUB_STOP_EXIT=1 run_case u2a "${args[@]}"
 expect_rc u2a 70
 expect_err "u2a: message names step stop" "step stop failed: docker compose stop ravel-server exited 1"
 check "u2a: stamps name step stop, the failed stop stamped" 'j("stamps.json")["failed_step"] == "stop" and j("stamps.json")["ravel_restart"] == "not stopped: docker compose stop ravel-server exited 1; no fold ran" and j("stamps.json")["steps_completed"][-1] == "memory"'
-expect_no_log "u2a: no fold" "catalog fold"
+expect_no_log "u2a: no fold" "--tenant-hash-unkeyed catalog fold"
 
 # u2b: starting ravel-server fails after the fold: no read-back.
 mapfile -t args < <(full_args "${TMP}/u2b/out")
@@ -2440,7 +2486,7 @@ STUB_INGEST_READBACK_FAIL=victoriametrics STUB_INGEST_ROW_FAILURE=ravel run_case
 expect_rc u7 70
 check "u7: stamps name ingest, no stop, fold, start or readback-folded" 'j("stamps.json")["failed_step"] == "ingest" and not {"stop","fold","start","readback-folded"} & set(j("stamps.json")["steps_completed"]) and "memory" in j("stamps.json")["steps_completed"]'
 check "u7: each of the three stamps skipped for the row_failure" 'all(j("stamps.json")[k].startswith("skipped: the ravel row has a row_failure") for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded"))'
-expect_no_log "u7: no fold" "catalog fold"
+expect_no_log "u7: no fold" "--tenant-hash-unkeyed catalog fold"
 expect_no_log "u7: no folded read-back" "--readback-only"
 
 # u8: the Ravel row stalled: skipped the same way.
@@ -2448,13 +2494,15 @@ mapfile -t args < <(full_args "${TMP}/u8/out")
 STUB_INGEST_STALL=ravel run_case u8 "${args[@]}"
 expect_rc u8 70
 check "u8: each of the three stamps skipped for the stall" 'all(j("stamps.json")[k].startswith("skipped: the ravel row stalled") for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded"))'
-expect_no_log "u8: no fold" "catalog fold"
+expect_no_log "u8: no fold" "--tenant-hash-unkeyed catalog fold"
 
 # u9: the diagnostic mode (case f) runs none of them.
 OUT="${TMP}/f/out"
 LOG="${TMP}/f/calls.log"
 check "u9: diagnostic stamps the three not applicable" 'all(j("stamps.json")[k] == "not applicable: diagnostic run starts no Ravel" for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded")) and not {"stop","fold","start","readback-folded"} & set(j("stamps.json")["steps_completed"])'
 expect_no_log "u9: diagnostic runs no fold" "catalog fold"
+check "u9: diagnostic stamps key_index_leaves_flag not applicable and probes nothing" 'j("stamps.json")["key_index_leaves_flag"] == "not applicable: diagnostic run starts no Ravel and runs no fold"'
+expect_no_log "u9: diagnostic runs no help probe" "docker run --rm --network none"
 expect_no_log "u9: diagnostic stops nothing" "stop ravel-server"
 expect_no_log "u9: diagnostic starts no ravel-server" "up -d --no-deps --no-recreate ravel-server"
 expect_no_log "u9: diagnostic runs no compose start" "docker-compose-start "
@@ -3719,15 +3767,17 @@ check "z19: every record says unknown" 'all(r["pass_label"] == "unknown" and r["
 
 # --- zs: the label index flag spelling (issue #4145) -------------------------------
 # stage1_flags_check CASE LOG WANT_UP WANT_UNROUTED WANT_ROUTED WANT_CONTROL
-# CLI_ON: ravel-server's flags at up and at each recreate, and every Stage 1
-# catalog fold's flags, against the listed sets; CLI_ON is the label index
-# flag a leaf-building fold passes ("" when the image builds it by default).
+# CLI_ON [ARMS [LEAF_OFF]]: ravel-server's flags at up and at each recreate,
+# and every catalog fold's flags, against the listed sets; CLI_ON is the label
+# index flag a leaf-building fold passes ("" when the image builds it by
+# default), LEAF_OFF the leaf-off flag the folds meant to build no leaf pass.
 # With WANT_CONTROL set the control arm ran, and with arms the extra-hour, l1
 # and erasure folds are checked too.
 stage1_flags_check() {
   python3 -I - "$@" <<'PY'
 import re, sys
 case, log, up, unrouted, routed, control, cli_on, arms = sys.argv[1:9]
+off = f" {sys.argv[9]}" if len(sys.argv) > 9 and sys.argv[9] else ""
 lines = open(log).read().splitlines()
 ups = [l.split("=", 1)[1] for l in lines if l.startswith("docker-env up RAVEL_SERVER_EXTRA_FLAGS=")]
 recreates = [l.split("=", 1)[1] for l in lines if l.startswith("docker-env recreate ")]
@@ -3735,12 +3785,12 @@ folds = [re.search(r" catalog fold --tenant \S+ --shards \S+ (.*)$", l).group(1)
          for l in lines if l.startswith("docker compose ") and " catalog fold " in l]
 on = f" {cli_on}" if cli_on else ""
 want_recreates = [unrouted, unrouted] + ([control, unrouted] if control else []) + [routed]
-want_folds = ["--signal metrics --writers-stopped", "--signal metrics --json",
+want_folds = [f"--signal metrics --writers-stopped{off}", f"--signal metrics{off} --json",
               f"--rebuild-key-index --signal metrics{on} --json"]
 if arms == "arms":
     want_recreates += [routed, routed]
     leafy = f"--signal metrics --writers-stopped --key-index-leaves{on} --json"
-    want_folds += [leafy, "--signal metrics --writers-stopped --json", leafy, leafy]
+    want_folds += [leafy, f"--signal metrics --writers-stopped{off} --json", leafy, leafy]
 problems = []
 if ups != [up]:
     problems.append(f"up flags {ups}, want [{up!r}]")
@@ -3795,14 +3845,15 @@ lines = open(sys.argv[1]).read().splitlines()
 main, control = sys.argv[2:4]
 probes = [l for l in lines if l.startswith("docker run ")]
 up = next(i for i, l in enumerate(lines) if l.startswith("docker-env up "))
-want = [f"docker run --rm --network none --entrypoint /usr/local/bin/ravel-server {main} --help",
+want = [f"docker run --rm --network none --entrypoint /usr/local/bin/ravel-cli {main} catalog fold --help",
+        f"docker run --rm --network none --entrypoint /usr/local/bin/ravel-server {main} --help",
         f"docker run --rm --network none --entrypoint /usr/local/bin/ravel-cli {main} catalog fold --help",
         f"docker run --rm --network none --entrypoint /usr/local/bin/ravel-server {control} --help"]
 sys.exit(0 if probes == want and all(lines.index(p) < up for p in probes) else 1)
 PY
-  pass "zs2: the three probes run before up, each binary's --help with no network"
+  pass "zs2: fold-flags' probe and the three label index probes run before up, each binary's --help with no network"
 else
-  fail "zs2: the probes are not the three listed, before up"
+  fail "zs2: the probes are not the four listed, before up"
 fi
 
 # zs3: a binary listing neither spelling, or both, fails stage1-flags before
@@ -3824,12 +3875,79 @@ MB_STAGE1=1 STUB_HELP_EXIT=125 run_stage1 zs5 ci
 expect_rc zs5 70
 check "zs5: stage1-flags named, the stamp names the failed docker run" 'j("stamps.json")["failed_step"] == "stage1-flags" and j("stamps.json")["stage1"]["label_index_flags"] == "failed: docker run --rm --network none --entrypoint /usr/local/bin/ravel-server '"${IMAGE}"' --help exited 125"'
 expect_no_log "zs5: nothing brought up" "docker-env up "
-# zs6: without MB_STAGE1 no binary is probed.
-if grep -q '^docker run ' "${TMP}/z6/calls.log"; then
-  fail "zs6 (z6's run): MB_STAGE1=0 probed a binary"
+# zs6: without MB_STAGE1 no label index probe runs; fold-flags' probe runs
+# in every full run.
+if [ "$(grep '^docker run ' "${TMP}/z6/calls.log")" = "docker run --rm --network none --entrypoint /usr/local/bin/ravel-cli ${IMAGE} catalog fold --help" ]; then
+  pass "zs6 (z6's run): MB_STAGE1=0 probes only ravel-cli catalog fold --help, for fold-flags"
 else
-  pass "zs6 (z6's run): MB_STAGE1=0 probes nothing"
+  fail "zs6 (z6's run): MB_STAGE1=0 probes other than fold-flags' one: $(grep '^docker run ' "${TMP}/z6/calls.log")"
 fi
+
+# --- kl: the leaf-off fold flag (issue #4202) ------------------------------------
+# An image built after issue #4200 builds key-index leaves in every catalog
+# fold unless given --no-key-index-leaves, and its help lists both leaf
+# flags; one built before builds them only with --key-index-leaves and
+# refuses the opt-out (the stub exits 2 and logs docker-reject). The folds
+# meant to build no leaf (fold, stage1-fold, stage1-extra-hour-fold-off)
+# carry the opt-out exactly on the first; every other fold is unchanged.
+# kl_stamp_check CASE SPELLING: stamps.json's key_index_leaves_flag for that
+# spelling, and the help file it names.
+kl_stamp_check() {
+  local flag="" lists='["--key-index-leaves"]'
+  if [ "$2" = opt-out ]; then
+    flag="--no-key-index-leaves" lists='["--key-index-leaves", "--no-key-index-leaves"]'
+  fi
+  check "$1: key_index_leaves_flag stamps the ${2} reading" '{k: v for k, v in j("stamps.json")["key_index_leaves_flag"].items() if k != "method"} == {"flag": "'"${flag}"'", "spelling": "'"$2"'", "lists": '"${lists}"', "image": "'"${IMAGE}"'", "command": "ravel-cli catalog fold --help", "help": "fold-flags.help.txt", "folds": ["fold", "stage1-fold", "stage1-extra-hour-fold-off"]}'
+  expect_file "$1" fold-flags.help.txt
+}
+# kl1: an opt-out leaf image with every arm on: the opt-out on the three
+# leaf-off folds, nowhere else, and no flag refused.
+MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour,l1,erasure STUB_LEAF_HELP_STYLE=opt-out \
+  STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 kl1 ci
+expect_rc kl1 0
+if stage1_flags_check kl1 "${LOG}" "${UP_FLAGS}" "${UNROUTED_FLAGS}" "${ROUTED_FLAGS}" "" "" arms --no-key-index-leaves; then
+  pass "kl1: an opt-out leaf image: --no-key-index-leaves on fold, stage1-fold and stage1-extra-hour-fold-off only"
+else
+  fail "kl1: the folds on an opt-out leaf image do not carry exactly the listed flags"
+fi
+expect_no_log "kl1: no flag refused" "docker-reject "
+kl_stamp_check kl1 opt-out
+check "kl1: the stage1-fold baseline built no label_value leaf" 'j("stamps.json")["stage1"]["unrouted_catalog"]["label_value_leaf_parts"] == 0'
+check "kl1: the extra-hour leaf-off fold wrote no leaf" 'j("stamps.json")["stage1"]["extra_hour_fold_off"]["key_index_leaves_written"] == 0'
+# kl2: the same run on an opt-in leaf image: no leaf flag on those folds.
+MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour,l1,erasure STUB_LEAF_HELP_STYLE=opt-in \
+  STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 kl2 ci
+expect_rc kl2 0
+if stage1_flags_check kl2 "${LOG}" "${UP_FLAGS}" "${UNROUTED_FLAGS}" "${ROUTED_FLAGS}" "" "" arms ""; then
+  pass "kl2: an opt-in leaf image: no leaf-off flag on any fold"
+else
+  fail "kl2: the folds on an opt-in leaf image do not carry exactly the listed flags"
+fi
+expect_no_log "kl2: no flag refused" "docker-reject "
+kl_stamp_check kl2 opt-in
+# kl3: without MB_STAGE1, the folded step's fold carries the opt-out on an
+# opt-out leaf image, and the probe runs before up.
+STUB_LEAF_HELP_STYLE=opt-out run_stage1 kl3 ci
+expect_rc kl3 0
+expect_log "kl3: the folded step's fold passes --no-key-index-leaves" "ravel.yml run --rm --no-deps -T ravel-qualify --store s3 --tenant-hash-unkeyed catalog fold --tenant metricsbench --shards 4 --signal metrics --writers-stopped --no-key-index-leaves"
+expect_no_log "kl3: no flag refused" "docker-reject "
+kl_stamp_check kl3 opt-out
+if python3 -I - "${LOG}" <<'PY'; then
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+probe = next(i for i, l in enumerate(lines) if l.startswith("docker run ") and l.endswith(" catalog fold --help"))
+up = next(i for i, l in enumerate(lines) if l.startswith("docker-env up "))
+sys.exit(0 if probe < up else 1)
+PY
+  pass "kl3: fold-flags' probe runs before up"
+else
+  fail "kl3: fold-flags' probe does not run before up"
+fi
+# kl4: the probe fails: exit 70 at fold-flags with nothing up.
+STUB_FOLD_HELP_EXIT=125 run_stage1 kl4 ci
+expect_rc kl4 70
+check "kl4: fold-flags named, the stamp names the failed docker run" 'j("stamps.json")["failed_step"] == "fold-flags" and j("stamps.json")["key_index_leaves_flag"] == "failed: docker run --rm --network none --entrypoint /usr/local/bin/ravel-cli '"${IMAGE}"' catalog fold --help exited 125"'
+expect_no_log "kl4: nothing brought up" "docker-env up "
 
 # --- z: stage1-check.sh ------------------------------------------------------------------
 CHECK="${HERE}/../stage1-check.sh"

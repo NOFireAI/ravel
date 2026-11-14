@@ -402,6 +402,9 @@ load_config() {
   # Set by fold(); empty until a fold ran, which the mixed state checks
   # before it waits (set -u would otherwise end the run there).
   FOLD_HOUR=""
+  # Set by leaf_off_flag before the first fold meant to build no leaf.
+  LEAF_OFF=""
+  LEAF_OFF_READ=0
   RUN_MAX_MINUTES="$(cfg run.max_minutes --default 540)"
   STEP_ESTIMATE_DEFAULT="$(cfg step_estimate_minutes.default --default 30)"
   NEEDLE_MAX="$(cfg run.needle_blocks_max_objects --default 0)"
@@ -899,6 +902,38 @@ fold() {
   FOLD_HOUR="$(now_hour)"
 }
 
+# leaf_off_flag: LEAF_OFF, the flag that keeps a catalog fold from building
+# key-index leaves, read once per run from "$BIN" catalog fold --help into
+# work/fold-help-leaves.out: --no-key-index-leaves when an option line lists
+# it (a ravel-cli built after issue #4200, which builds leaves unless told
+# not to), empty otherwise (built before it: no leaf unless asked). Stamped
+# as stamps/fold_flags.json. A dry run prints the read and takes the help
+# from INV_DRY_RUN_FOLD_HELP (the cases' hook), else from no text. Non-zero
+# (failed_at set) when the help could not be read.
+leaf_off_flag() {
+  [ "$LEAF_OFF_READ" = 0 ] || return 0
+  local help="$WORK/fold-help-leaves.out" code=0
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'DRY-RUN: %q catalog fold --help lists --no-key-index-leaves\n' "$BIN"
+    help="${INV_DRY_RUN_FOLD_HELP:-/dev/null}"
+  else
+    "$BIN" catalog fold --help >"$help" 2>&1 || code=$?
+    [ "$code" = 0 ] || { failed_at "catalog fold --help" "$code" "$help"; return 1; }
+  fi
+  local option='^ {0,6}(-[[:alnum:]], )?' lists="" spelling=opt-in
+  LEAF_OFF=""
+  if grep -Eq -e "${option}--key-index-leaves([ =]|\$)" "$help"; then lists='"--key-index-leaves"'; fi
+  if grep -Eq -e "${option}--no-key-index-leaves([ =]|\$)" "$help"; then
+    LEAF_OFF=--no-key-index-leaves
+    spelling=opt-out
+    lists="${lists:+$lists, }\"--no-key-index-leaves\""
+  fi
+  LEAF_OFF_READ=1
+  printf 'LEAF-OFF %s\n' "${LEAF_OFF:-<none>}"
+  stamp fold_flags.json leaf_off="$LEAF_OFF" spelling="$spelling" lists:="[$lists]" \
+    command="ravel-cli catalog fold --help" folds:='["folded_no_leaves", "many_parts_N"]'
+}
+
 # rebuild_leaves TRANSITION: attach key-index leaves to the parts already in
 # HEAD, per $TRIPLES entry. A --key-index-leaves fold right after a plain one
 # has no hour left to seal, so it re-encodes nothing and writes no leaf (its
@@ -1262,10 +1297,11 @@ state_many_parts() {
     --batch-rows "$rows" --target-bytes 1 || return 1
   TRIPLES="$t:spans:spans"
   fits "many_parts_$n" fold "$est" || { TRIPLES="$saved"; return 0; }
-  fold "many_parts_$n" --snapshot-part-max-entries "$MP_MAX_ENTRIES" || { TRIPLES="$saved"; return 1; }
+  leaf_off_flag || { TRIPLES="$saved"; return 1; }
+  fold "many_parts_$n" --snapshot-part-max-entries "$MP_MAX_ENTRIES" ${LEAF_OFF:+"$LEAF_OFF"} || { TRIPLES="$saved"; return 1; }
   fits "many_parts_$n" "leaf rebuild" "$est" || { TRIPLES="$saved"; return 0; }
   rebuild_leaves "many_parts_${n}_leaf_rebuild" || { TRIPLES="$saved"; return 1; }
-  transition "many_parts_$n" "tenant $t: $n strided ingest hours from $start, parts of at most $MP_MAX_ENTRIES entries"
+  transition "many_parts_$n" "tenant $t: $n strided ingest hours from $start, parts of at most $MP_MAX_ENTRIES entries${LEAF_OFF:+, folded with $LEAF_OFF}"
   census "many_parts_$n"
   statements "many_parts_$n" --tenant "$t" --sub "many_parts_$n"
   TRIPLES="$saved"
@@ -1649,8 +1685,9 @@ state_unfolded() {
 
 state_folded_no_leaves() {
   fits folded_no_leaves fold "$(estimate_s folded_no_leaves)" || return 0
-  fold folded_no_leaves || return 1
-  transition folded_no_leaves "catalog fold --writers-stopped, no leaves"
+  leaf_off_flag || return 1
+  fold folded_no_leaves ${LEAF_OFF:+"$LEAF_OFF"} || return 1
+  transition folded_no_leaves "catalog fold --writers-stopped${LEAF_OFF:+ $LEAF_OFF}, no leaves"
   census folded_no_leaves
   statements folded_no_leaves
   return 0
