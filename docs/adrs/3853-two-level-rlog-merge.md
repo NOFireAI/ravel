@@ -909,7 +909,8 @@ need = R x 2 x price(one run block) + reads in flight + final part target
 ```
 
 and `W2` workers fit `U` when `W2 x need <= U`. Each worker plans its
-passes under `U / W2` with its own `MergeMemoryTracker`, and the unit's
+passes within `U / W2` (under it less one final part target since the
+#4123 correction) with its own `MergeMemoryTracker`, and the unit's
 tracker raises each of its high-water marks to at least the workers' sum,
 as level 1's does, so the sum of what the workers' plans admit, each
 worker's read side and its one builder, stays within `U`. That bounds the
@@ -922,8 +923,9 @@ each worker encodes inline with one builder, counted in `need`. Level-2
 workers keep the full `merge_cursor_budget_bytes`, not a `W2`th of it:
 `reservation_batches` cuts a keyed bucket's batch-major batches by it
 (ADR-2135), so dividing it would move the emitted sequence with `W2`. Each
-worker's plan is still drawn under `U / W2`, and level 2 runs no worker
-whose plan is a cursor merge.
+worker's plan is still drawn under `U / W2` (less its builder's final part
+target since the #4123 correction), and level 2 runs no worker whose plan
+is a cursor merge.
 `each_range_worker_plans_under_its_share_of_the_ceiling` pins the share
 on a unit whose last ranges hold most of the bytes, and the parts test
 below pins the unit's mark at or above the workers' sum. Before
@@ -1218,8 +1220,8 @@ only, and refused with its worker ceiling when it does not fit
 Re-deriving moves no range: the ranges are cut from the per-stream record
 tally and `rlog_range_records` alone, and their part-index windows from
 the unit's records, before `W2` is chosen
-(`crates/ravel-maintain/src/rlog.rs:4301`,
-`crates/ravel-maintain/src/rlog.rs:4305`); `W2` only decides which worker
+(`crates/ravel-maintain/src/rlog.rs:4306`,
+`crates/ravel-maintain/src/rlog.rs:4310`); `W2` only decides which worker
 takes which ranges.
 
 Predicted at hour 498272's geometry, with M1's input counts, its `W1`, its
@@ -1273,17 +1275,18 @@ requests by phase` and `compaction merge ended` log lines, beside
 <!-- amendment-applies: sections="Amendment (2026-11-06): parallel level-1 workers and a derived encode depth (#3873)|Amendment (2026-11-11): the range workers amendment, level 2 on `W2` workers (#4108)" pointer="#4123 correction" -->
 <!-- amendment-supersedes: phrase="computed once per unit, after (b) holds" pointer="#4123 correction" -->
 <!-- amendment-supersedes: phrase="can take the writer term one final part target past the single one (b)" pointer="#4123 correction" -->
+<!-- amendment-supersedes: phrase="worker's plan is still drawn under `U / W2`" pointer="#4123 correction" -->
 
 The #3873 amendment sized `E` from the room `U` leaves beside level 2's
 resident side and reads in flight, and level 2 at `W2 = 1` then planned its
 passes under the whole of `U`. The plan's pass budget is `U` less the held
 raw bytes or the reads in flight and the largest hot-stream cursor charge
-`c` (`crates/ravel-maintain/src/rlog.rs:4952`,
-`crates/ravel-maintain/src/rlog.rs:4961`): it does not take out the `E`
+`c` (`crates/ravel-maintain/src/rlog.rs:4957`,
+`crates/ravel-maintain/src/rlog.rs:4966`): it does not take out the `E`
 final parts, so the builders and the pass rows were admitted against the
 same room. The plan's floor does not reserve it either: the floor is
-compared with the room (`crates/ravel-maintain/src/rlog.rs:4951`,
-`crates/ravel-maintain/src/rlog.rs:4962`), not subtracted from the budget.
+compared with the room (`crates/ravel-maintain/src/rlog.rs:4956`,
+`crates/ravel-maintain/src/rlog.rs:4967`), not subtracted from the budget.
 On the padded range fixture at `W2 = 1` the unit peaked at 2,770,910 bytes
 against `U` = 2,139,680 with `E` = 16 (#4108 executor report, issue
 #4123). That `U` does not reproduce on this tree: the padded fixture's own
@@ -1333,11 +1336,62 @@ at or under `U`; with the #3873 formula it fails at 1,339,571 (measured
 2026-11-14). A smaller pass budget can cut more passes over the same runs:
 `two_level_merge_matches_single_level_bytes_and_keys` now pins 8 level-2
 passes where it pinned 7, at 4 cores, with the same part keys, content
-hashes and bytes, and every run block still decoded once.
+hashes and bytes, and every run block still decoded once. The core share
+now moves `level2_passes`: `k` starts at `min(core share, fit)`
+(`crates/ravel-maintain/src/rlog.rs:1916`,
+`crates/ravel-maintain/src/rlog.rs:1918`) and the plan is drawn under `U -
+k x final part target` (`crates/ravel-maintain/src/rlog.rs:1937`,
+`crates/ravel-maintain/src/rlog.rs:1942`), so the same unit on hosts with
+different core counts can report different `level2_passes`, a host
+difference and not a regression. That test pins the core share at 4 for
+this reason. At `W2 > 1` the core share already moved the pass count
+through `W2`.
 
-**Not corrected here.** At `W2 > 1` each range worker encodes inline with
-one builder, counted in `need`, and plans under `U / W2`; its pass budget
-does not take that builder out either, so a worker whose passes fill their
-budget can pass `U / W2` by up to one final part target (predicted, from
-the budget formula; no fixture shows it). Reserving it would let a
-configured `W2` be refused where it is admitted today, a separate change.
+**At `W2 > 1`, each worker's builder beside its passes.** Each range
+worker encodes inline with one builder, counted in `need`. Before this
+correction it planned its passes under the whole `U / W2`, whose pass
+budget does not take that builder out, so a worker whose passes filled
+their budget could pass `U / W2` by one final part target and the unit
+could pass `U` by `W2 x final part target`. The #4140 amendment raises a
+derived `W2` from the joint prediction toward the core share
+(`crates/ravel-maintain/src/rlog.rs:3777`), and so raises that sum: at its
+shard 1 geometry `W2` goes from 2 to 8, and the overshoot from 3,145,728,000
+to 12,582,912,000 bytes against a `U` of 21,474,836,480 (predicted, final
+parts of 1,572,864,000 bytes). Now each worker's plan is drawn under `U /
+W2` less one final part target
+(`crates/ravel-maintain/src/rlog.rs:3827`,
+`crates/ravel-maintain/src/rlog.rs:3832`), as the one-worker rule reserves
+its `k` builders. The plan's pass budget and reads, or its held raw bytes,
+stay within that reduced ceiling, and the builder's part takes the rest:
+each worker stays within `U / W2` and the unit within `U`, with no floor
+exception, since a worker holds exactly one builder. A builder still
+closes at its target plus the record that crosses it, as the writer term
+always has. Since the plan compares its floor, one final part target, with
+the reduced ceiling, a worker now needs `U / W2` to hold two final part
+targets plus its reads in flight (its held raw bytes when resident) and
+largest hot-stream cursor charge
+(`crates/ravel-maintain/src/rlog.rs:4956`,
+`crates/ravel-maintain/src/rlog.rs:4967`). A derived `W2` is the largest
+count that fits this: it starts at the #4140 amendment's count and is
+lowered one worker at a time while a worker's read side does not fit `U /
+W2` or its plan is a cursor merge, never below 1 (`crates/ravel-maintain/src/rlog.rs:3841`). At the #4140
+amendment's shard 1 geometry, 7 workers leave 3,067,833,782 bytes each,
+under two final part targets, so `W2` is at most 6 there, not 8
+(predicted). A configured `level2_workers` is not lowered: one that fit
+before and does not fit this rule is refused after level 1 with
+`LevelTwoFit`, whose `ceiling_bytes` is still the worker's share `U / W2`
+(`crates/ravel-maintain/src/rlog.rs:3842`).
+
+`range_workers_plan_their_passes_beside_their_builder` runs 60 inputs of
+40 evenly padded streams with a final part target of 294,912 bytes under
+`U` = 1,488,718 and 3 cores: the read side admits 3 workers, but under `U
+/ 3` less a part target the plans are cursor merges, so the unit runs 2,
+and the unit's peak and each worker's peak stay within `U` and `U / 2`.
+Planned under the whole `U / 3`, as before, the unit ran 3 workers and
+peaked at 1,638,811 bytes, each worker past `U / 3`; with the builder
+reserved but 3 workers kept, the assertion that `W2` is 2 fails (measured
+2026-11-14).
+`a_configured_level2_worker_count_unfit_beside_its_builder_is_refused`
+configures 3 on the same unit, whose `need` fits `U / 3`, and asserts the
+`LevelTwoFit` refusal at `U / 3` with no part published; before this
+correction it compacted.
