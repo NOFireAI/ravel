@@ -421,7 +421,8 @@ wrote and read, uncompressed on neither side, as stored), `level1_passes`
 and `level2_passes`, `level1_groups`, and GETs per input in the catalog and
 block phases from the request ledger (`RequestPhase`,
 `crates/ravel-maintain/src/request_ledger.rs:81-121`). Scratch traffic is
-not a store request and is never pooled into the ledger's phases.
+not a store request and is never pooled into the ledger's phases. The
+#4140 amendment adds `level2_workers_predicted`.
 
 Bands for hour 498273, shard 0 (N = 19,177, about 242M records, 16.7 GiB).
 Every figure is predicted; the profile task 108ffe3b (bin
@@ -926,7 +927,8 @@ on a unit whose last ranges hold most of the bytes, and the parts test
 below pins the unit's mark at or above the workers' sum. Before
 level 1 the run block is priced at the run block target, not at the inputs'
 largest block: the inputs' highest price per record times the records a run
-block holds, `rlog_run_block_target_records` or a whole group's largest
+block holds (the #4140 amendment prices it at the 99th percentile instead),
+`rlog_run_block_target_records` or a whole group's largest
 inputs if fewer. The prediction `PredictedLevelTwoFit` uses that price.
 After level 1, level 2 checks `need` again against the runs it actually
 wrote, with `resident` the larger of the runs' term and the largest
@@ -952,7 +954,8 @@ share, capped by what the measured `need` fits. `level2_workers` names
 `U`, and `Some(0)` is refused, like a zero range quantum,
 with `InvalidRlogLevel2Setting` before the run's first store request.
 After level 1 a derived `W2` is capped at the range count and at what the
-measured `need` fits, then lowered one worker at a time until every
+measured `need` fits (the #4140 amendment starts it from the core share, not
+from the predicted `W2`), then lowered one worker at a time until every
 worker's plan avoids the cursor mode; it is refused only when one worker
 does not fit `U`. A configured `W2` is capped at the range count and
 refused with its worker ceiling, `U / W2`, when it does not fit.
@@ -1172,4 +1175,92 @@ with.
 
 **Counters.** `level2_workers` and `level2_ranges` are in the request
 ledger and on the `rlog two-level merge`, `compaction store requests by
-phase` and `compaction merge ended` log lines.
+phase` and `compaction merge ended` log lines; the #4140 amendment adds
+`level2_workers_predicted` beside them.
+
+## Amendment (2026-11-14): the #4140 amendment, `W2` re-derived after level 1 and a robust run-block price
+
+<!-- amendment-applies: sections="D6. Counters and bands|Amendment (2026-11-11): the range workers amendment, level 2 on `W2` workers (#4108)" pointer="#4140 amendment" -->
+<!-- amendment-supersedes: phrase="highest price per record" pointer="#4140 amendment" -->
+
+Hour 498272 ran both shards through the range workers amendment's joint
+derivation, with these results (M1, issue #4140):
+
+| | shard 0 | shard 1 | source |
+|---|---|---|---|
+| inputs | 24,239 | 24,719 | M1, issue #4140 |
+| raw | 10.49 GB | 10.79 GB | M1, issue #4140 |
+| chosen `(W1, W2)` | (6, 5) | (2, 2) | M1, issue #4140 |
+| level-2 records/s, against 134k | 178.2k | 74.5k | M1, issue #4140 |
+| per-worker ceilings | 3.58 GB and 4.29 GB | 10.7 GB at both levels | M1, issue #4140 |
+| measured `run_block_bytes` | 3,776,885 | 3,800,408 | M1, issue #4140 |
+
+The two shards wrote run blocks within 1% of each other, yet shard 1 ran
+level 2 on 2 workers at 74.5k records/s and shard 0 on 5 at 178.2k. The
+per-worker ceilings put `U` at 20 GiB for both (20 GiB / 6 = 3.58 GB, / 5 =
+4.29 GB, / 2 = 10.7 GB). Two things let a prediction made before level 1
+decide level 2. The prediction priced the run block at the inputs' highest
+price per record, so one block over few records set the price for the
+whole unit. And after level 1 a derived `W2` was capped at the predicted
+one, so the measured runs could lower `W2` but never raise it.
+
+**`W2` is re-derived from the measured runs.** After level 1 a derived `W2`
+is `min(core share, floor(U / need))` with `need` measured from the runs
+level 1 wrote (the #3943 correction's terms), capped at the range count,
+at least 1, and then lowered one worker at a time until no worker's plan is
+a cursor merge, as before. The predicted `W2` no longer bounds it. A
+configured `level2_workers` still wins: it is capped at the range count
+only, and refused with its worker ceiling when it does not fit
+(`level2_worker_count`, `crates/ravel-maintain/src/rlog.rs:3741`).
+Re-deriving moves no range: the ranges are cut from the per-stream record
+tally and `rlog_range_records` alone, and their part-index windows from
+the unit's records, before `W2` is chosen
+(`crates/ravel-maintain/src/rlog.rs:4263`,
+`crates/ravel-maintain/src/rlog.rs:4267`); `W2` only decides which worker
+takes which ranges.
+
+Predicted at hour 498272's geometry, with M1's input counts, its `W1`, its
+measured run blocks and `U` of 20 GiB, and with the terms M1 does not
+report taken from the #3943 shape (a per-input cost of 50 MB, 54,132,381
+bytes in flight, final parts of 1,572,864,000 bytes, a 256 MiB run target,
+a core share of 32); `level2_rederives_its_workers_from_the_measured_runs`
+pins every figure:
+
+| | shard 0 | shard 1 | source |
+|---|---|---|---|
+| `G` at `U / W1` | 66 | 209 | predicted |
+| runs `R` | 368 | 119 | predicted |
+| `need` per level-2 worker | 4,406,783,741 bytes | 2,531,493,485 bytes | predicted |
+| re-derived `W2` | 4 | 8 | predicted |
+
+The same test pins configured counts of 1, 2, 5 and 9 used unchanged, even
+where one worker's `need` does not fit, and 9 capped at 4 ranges.
+
+**The prediction prices the 99th percentile.** Before level 1 the run
+block is priced at the price per record at which the inputs' cheapest
+blocks, sorted by price per record, first hold 99% of the input records
+(`level1_block_rate`), times the records a run block holds. A block over
+few records then cannot set the price: a block that holds 1% of the records
+or fewer is priced only if it is among the cheapest. The prediction still
+admits only what fits. Level 1 is bounded by constraint (a), `G x per_input
++ run_target <= U / W1`, which reads each input's whole raw and decoded
+cost and never the price per record, so no price lets a level-1 worker
+pass `U / W1`, and with every input at the outlier's price the percentile
+is that price, the maximum. Level 2 is checked again after level 1 against
+the measured `need`, and a unit the prediction admitted whose runs do not
+fit is refused with `LevelTwoFit`, after a level-1 pass, the one-sided
+trade the #3943 correction already accepts.
+`level1_block_rate_leaves_out_blocks_over_few_records` pins the percentile,
+the uniform case at the maximum, and constraint (a) for the `W1` both the
+robust and the outlier price derive on the 19,177-input shape.
+`an_outlier_input_block_moves_no_level2_worker_count` adds one input
+holding a single record at more than 10x the other blocks' price per record
+to the two-level fixture and asserts that `W1`, the runs and `W2` are those
+of the unit without it, derived (`W1` 1, 3 runs, `W2` 4 where the
+prediction gave 3) and configured (`W2` 2).
+
+**Counters.** `level2_workers_predicted` is the predicted `W2` when the
+re-derived one differs from it and `W2` was derived, and 0 otherwise. It is
+in the request ledger and on the `rlog two-level merge`, `compaction store
+requests by phase` and `compaction merge ended` log lines, beside
+`level2_workers`, which is the count level 2 ran.
