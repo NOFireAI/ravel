@@ -85,8 +85,8 @@ pub struct BucketSpillInputs {
     pub spill_consumers: usize,
     /// `L`: the per-query memory limit.
     pub query_limit: usize,
-    /// The routed columns' fixed widths in bytes, keys then state; `w` is
-    /// their sum. A string or binary column counts its 16-byte view.
+    /// The routed columns' widths in bytes, keys then state; `w` is their
+    /// sum. A string or binary column counts its 16-byte view.
     pub column_widths: Vec<usize>,
     /// Whether a routed column is a string or binary type, so the chunks are
     /// budgeted in bytes.
