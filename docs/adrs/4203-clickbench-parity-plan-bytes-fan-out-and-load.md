@@ -14,7 +14,8 @@ statements (Q21-Q24) account for 107.4 s of Ravel's 116.4 s regression.
 Measured as ClickBench scores it (geometric mean over 43 statements of
 `(ravel + 0.01) / (clickhouse + 0.01)`), the cold ratio is 1.35 on
 c6a.4xlarge, 2.25 on c6a.metal, 2.09 on c7a.metal-48xl, 1.15 on c8g.4xlarge
-and 2.03 on c8g.metal-48xl. Bulk load takes 397 to 666 s against
+and 2.03 on c8g.metal-48xl (c6a.2xlarge: see the Stage 0 amendment below).
+Bulk load takes 397 to 666 s against
 ClickHouse's 106 to 183 s and does not get faster with cores.
 
 Three facts in the code produce the large-machine regression.
@@ -51,7 +52,8 @@ so the figures in Consequences can be checked.
 
 On c6a.4xlarge the cold ratio is carried by two statements: Q2 at 41x and
 Q1 at 7.7x (0.485 s and 0.082 s against 0.002 s). Without them the ratio is
-1.18; with Q8, Q28, Q30 and Q18 also at parity it is 1.04.
+1.18; with Q8, Q28, Q30 and Q18 also at parity it is 1.04 (both figures
+reworded in the Stage 0 amendment below).
 
 On load: 581 s on c6a.4xlarge against 165 s for ClickHouse, and 562 s on
 c6a.metal. The loader decodes every read cursor on one blocking thread
@@ -146,7 +148,8 @@ per-statement promise:
 
 4. **Under an ascending-ts TopK the first round of opens is bounded
    independently of the partition count.** Specified only if Stage 0 shows
-   `blocks_scanned` for Q25 rising with partitions.
+   `blocks_scanned` for Q25 rising with partitions. (The trigger is restated
+   in the Stage 0 amendment below.)
 
 5. **The parity work outside decisions 1 to 4 and 6 is routed, not
    dropped.** Each item names its home and the figure it must move:
@@ -295,3 +298,41 @@ flowchart LR
   the same pull request.
 - The `--read-cursors` help text says cursors read in parallel; it is
   corrected by the task that makes it true.
+
+## Amendment (2026-11-14): Stage 0 step 1 outcomes and the decision 4 trigger
+
+<!-- amendment-applies: sections="Context|Decision" pointer="Stage 0 amendment" -->
+
+Stage 0 step 1 ran on one c6a.4xlarge (run s0-20261114T180450Z, readout
+#4203 comment 6882960874): six arms, three rounds, the published v0.32.0
+entry and its 222-object tenant.
+
+- **Context, the cause of the 31 to 35 s.** With 384 partitions and GET
+  permits held at 32, Q21-Q24 take 31.5 to 34.0 s and the plan phase reads
+  8,385,333,984 wire bytes in 443 GETs (1.007 x the l0 bytes) with no scan
+  bytes: the bytes at the gp2 cap carry the time, not a GET burst. At the
+  boundary, 222 partitions take 5.41 s on Q21 and 223 take 32.83 s, a 5.6x
+  step in plan plus scan bytes. Decision 1 attacks the measured cause.
+- **Decision 2 stands.** Q25 and Q27 take the same time at 222 and 223
+  partitions (1.45 and 1.47 s), so the fewer-segments rejection does not
+  cause their slowdown; partition width does (0.25 s at 32 partitions).
+- **Decision 4, trigger not met.** `blocks_scanned` for Q25 does not grow
+  with partitions (119 to 156 at 32, 116 to 135 at 384), which by the band
+  written before the run refutes the reading behind decision 4. Decision 4
+  is not specified on this evidence, and task #4209 is held. A candidate
+  explanation was noticed after the run: objects opened grow with
+  partitions (63 to 64 at 32, all 222 at 222 and 384; `blocksTotal` about
+  3,814 against 13,141) while `blocks_scanned` stays flat. Because that
+  figure was chosen after the data was in, it is not evidence here. It is
+  tested by a fresh pre-registration (#4203 comment 6883009414: objects
+  opened about min(222, 2 x partitions) at 16, 32, 64 and 128 partitions).
+  Decision 4 is restated on that figure only if that test passes; if it
+  fails, #4209 is cancelled and the Q25 and Q27 slowdown is re-traced.
+- **Decision 3, supporting evidence.** On the fast path, 384 GET permits
+  against 32 make Q29 64% slower (10.13 against 6.16 s), Q28 23% and Q23
+  13%. The cap value 64 is still first measured at 384 partitions by the
+  metal confirmation run.
+- **Context, the ratios.** c6a.2xlarge's cold ratio is 1.51, so all six
+  published machines carry a current figure. "Without them the ratio is
+  1.18" means the ratio with Q1 and Q2 at parity, not with them dropped;
+  likewise 1.04 is the ratio with Q1, Q2, Q8, Q28, Q30 and Q18 at parity.
