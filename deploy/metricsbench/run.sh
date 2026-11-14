@@ -125,8 +125,9 @@
 #               --writers-stopped, which ADR-2677 decision 1 makes safe only
 #               once the writer has exited. Stamped as ravel_restart
 #   fold        ravel-cli catalog fold --signal metrics --writers-stopped and
-#               the leaf-off flag (see fold-flags), run through `docker compose run` on the ravel-qualify service (so
-#               it reads the same store as the server in either lane), into
+#               the leaf-off flag (see fold-flags), run through `docker
+#               compose run` on the ravel-qualify service (so it reads the
+#               same store as the server in either lane), into
 #               <out>/fold.out. Fails unless seal_through_hour is Some(N) and
 #               watermark_hour is at or after the hour the ingest step ended
 #               in. Stamped as ravel_catalog_fold_writers_stopped. A failed

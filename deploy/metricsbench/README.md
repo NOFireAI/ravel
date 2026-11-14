@@ -862,7 +862,8 @@ verification (step 6), after which the run goes on as a diagnostic:
     u2a). `ravel_restart` says it stopped.
 16. `fold`: `ravel-cli --store s3 --tenant-hash-unkeyed catalog fold
     --tenant metricsbench --shards 4 --signal metrics --writers-stopped`
-    and the leaf-off flag (above; case kl3), run as `docker compose run --rm --no-deps -T ravel-qualify ...`, so it
+    and the leaf-off flag (above; case kl3), run as `docker compose run
+    --rm --no-deps -T ravel-qualify ...`, so it
     reads the store `ravel-qualify` carries in either lane: s3s-fs here,
     the real-S3 bucket under `real-s3.yml` (cases u, u10). Every writer has
     stopped by then: the ingest bin has exited and `ravel-server` is
@@ -1407,7 +1408,8 @@ own step, as the run records it; a request the run does not count says so.
     read-back one listing and one GET per HEAD, none counted.
 12. `stage1-extra-hour-fold-off`: the leafless HEAD put back and read back
     the same way, then `catalog fold --signal metrics --writers-stopped` with
-    the leaf-off flag (case kl1), timed (`stage1.extra_hour_fold_off`). A fold-off report
+    the leaf-off flag (case kl1), timed (`stage1.extra_hour_fold_off`). A
+    fold-off report
     whose `key_index_switch_off_over_leaves` is not `false` ends the run with
     exit 70 and `stage1.extra_hour` stamped `refused:` (case zg2): that flag
     says the fold read a HEAD carrying leaf refs, so it re-encoded parts the
