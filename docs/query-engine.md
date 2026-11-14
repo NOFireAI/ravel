@@ -594,7 +594,9 @@ partition:
   STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR for each relevant segment
   (`SegmentDirectories`) and carries them to every per-unit subset open
   that follows. On the two footer-carrying branches (the predicate-free fast
-  branch and the skip-decidable branch) it also carries the footer; the
+  branch and the skip-decidable branch, which a `Contains`-only content
+  list on an object above the bound also takes) it also carries the
+  footer; the
   whole-object fallback branch carries no footer and carries the directories its
   own open decoded. The subset open builds its reader from the carried
   directories (`RlogReader::from_decoded`), resolves stream-attribute filters and
@@ -858,6 +860,27 @@ A predicate the skip index cannot decide (a `has_word`/text arm, which bloom
 prunes only at decode; an `attrs['k']='v'` POSTINGS equality; a stream filter)
 still reads the whole object in the plan phase and is counted in the
 `plan_full_reads` metric, so a report can see which statements still pay it.
+
+A content list of only `Contains` arms (`col LIKE '%lit%'` on a declared Str
+column) no longer takes that fallback above the bound (ADR-4203 decision 1).
+`plan_segment` plans it on the skip-decidable branch when all of these hold
+(`LogQuery::plan_contains_only_decidable` plus the branch's own guard): the
+content list is non-empty and every arm is `Contains`, there is no
+stream-attribute arm, every prune arm is `NumRange` or `NumNotEq` (the prune
+list may be empty), the segment's catalog span is well formed and overlaps the
+query window, and the object is above `plan_whole_object_bound`. No index
+covers a `Contains` arm, so the reader drops no block for it: the survivors are
+`candidate_blocks` over the ts window and the numeric prune arms, the plan
+reads the footer and the four directories and no BLOCKS byte, the footer and
+directories are carried to the subset opens, and the segment is not counted in
+`plan_full_reads`. The scan evaluates the arm per row. A content list that
+mixes `Contains` with any other arm keeps the fallback, and an object at or
+under the bound is still read whole, once, with the bytes carried to the scan.
+`crates/ravel-query/tests/log_contains_plan_differential.rs` checks the
+survivor list against the reader's own prune on objects with BLOOM over every
+string column and with bloom scope `Text`, and
+`crates/ravel-sql/tests/logs_contains_plan_bytes.rs` pins the plan-phase reads
+of a `LIKE` scan with more partitions than segments.
 
 A segment at or under `LogSegmentFetcher::plan_whole_object_bound`, the larger
 of the block-range threshold and the projection break-even (set under

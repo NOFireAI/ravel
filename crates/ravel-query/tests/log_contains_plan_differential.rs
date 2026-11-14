@@ -364,6 +364,17 @@ fn cases() -> Vec<Case> {
             vec![region(30, 64)],
             Expect::Directories(3),
         ),
+        // No block holds a single RegionID, so the arm drops none.
+        case(
+            "contains, window and NumNotEq",
+            Some((40, 99)),
+            vec![google()],
+            vec![Predicate::NumNotEq {
+                field: FieldSel::Attr("RegionID".to_string()),
+                value: 30,
+            }],
+            Expect::Directories(3),
+        ),
         case(
             "contains, NumRange outside every block",
             None,
@@ -597,7 +608,7 @@ async fn contains_only_plan_matches_the_readers_prune_block_for_block() {
         }
     }
     assert_eq!(checked, 2 * cases().len());
-    assert_eq!(checked, 28);
+    assert_eq!(checked, 30);
 }
 
 /// At or under `plan_whole_object_bound()` a `Contains`-only plan reads the
