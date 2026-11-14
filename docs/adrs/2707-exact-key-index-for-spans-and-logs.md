@@ -976,6 +976,9 @@ Refs: #2707, #849, #2680, #1848, #1869, #1987, #1382
 Decision 4's leaf build is implemented and ships off by default, behind
 `CatalogConfig::build_key_index_leaves`, exposed as `ravel-server
 --fold-key-index-leaves` and `ravel-cli catalog fold --key-index-leaves`.
+(Since the leaf-default amendment at the end of this ADR, both binaries
+build leaves by default, and the opt-outs are `--no-fold-key-index-leaves`
+and `--no-key-index-leaves`. `CatalogConfig::default` stays off.)
 With it off, the fold issues no footer or KEY_IDX read, writes no leaf, and
 writes a re-encoded part without `key_index` refs (dropping any it had); a
 part carried forward by reference keeps its refs unchanged, and the sweep
@@ -1588,3 +1591,17 @@ GET recorder; the real-S3 figures stay predicted until a lane measures them.
 | build memory at the default budget | at most `F x (max(share, R_max) + 1)` held pairs at about 88 B each, plus what ADR-3692's #3704 amendment lists | not measured | predicted |
 
 Refs: #3704, #3692
+
+## Amendment (issues #3927 and #3939): the leaf build is on by default
+
+<!-- amendment-applies: sections="Amendment (issue #2994): the leaf build ships off by default behind a switch" pointer="leaf-default amendment" -->
+
+Date: 2026-11-14. `ravel-server` and `ravel-cli catalog fold` now build
+key-index leaves by default for every signal, and
+`CatalogConfig::default` stays off. The cost that kept the build off was a
+tail rebuilt on every advancing fold. That cost is bounded now: ADR-3692's
+pair budget caps the memory, and ADR-3939's UTC-day seal rebuilds one day's
+leaves per advance. The decision, its measured basis and what it leaves
+unmeasured are in ADR-3692's leaf-default amendment.
+
+Refs: #3927, #3939

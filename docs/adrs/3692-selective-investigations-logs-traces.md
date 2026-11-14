@@ -1,7 +1,8 @@
 # ADR-3692: selective investigations across logs and traces, routed before payloads are fetched
 
 Status: Proposed. Issue: #3692 (epic). Stage 1 measured 2026-11-07; the
-leaf switch stays off (Stage 1 amendment).
+leaf switch stayed off (Stage 1 amendment) until 2026-11-14, when it
+turned on by default (leaf-default amendment).
 Date: 2026-11-02
 Builds on: ADR-2707 (exact-key index: decisions 4, 5 and 7 and the leaf
 build switch amendment), ADR-0849 (snapshot-bound index plane, sections 1
@@ -1400,7 +1401,9 @@ rows 7 and 8 hold. It stays off for both:
 #3927 holds both items: bounding the advance, and then the per-signal
 switch, with a figure at 7 days of tail pre-registered. Until it closes,
 the flags keep their meaning, and an operator who turns the switch on
-pays the per-advance cost above.
+pays the per-advance cost above. (Superseded: the leaf-default amendment
+below turns the switch on by default for every signal, after ADR-3939's
+Stage 2.)
 
 ### Follow-ups
 
@@ -1596,3 +1599,49 @@ fails on the 1,025-part control), `a_part_costing_more_than_its_tier_one_probe_i
 (mutant: the test dropped; fails on a leaf GET against a 2-entry part
 probed with 100 keys). The row 18 time bound and the harness's
 `advanced_leaves` state are unchanged.
+
+## Amendment (issues #3927 and #3939): the leaf switch is on by default
+
+<!-- amendment-applies: sections="Amendment (issue #3707): Stage 1 on real S3, and the leaf switch stays off" pointer="leaf-default amendment" -->
+
+Date: 2026-11-14. The Stage 1 amendment kept `build_key_index_leaves` off
+for both signals until the advance was bounded and a per-signal decision
+was made. Epic #3939 did both. ADR-3939 seals the tail at the UTC day, so
+an advance rebuilds one day's leaves rather than the whole tail's. Its
+Stage 2 ran on real S3, and the figures are in ADR-3939's D3' results
+amendment. #3927's precondition (comment 6703881894) was a leaf-routed
+key-set p50 no higher than the unfolded p50 at 10 and 100 keys, on a tail
+that has advanced at least once. Run D measured it for every key field:
+
+| key field | 10 keys, leaf / unfolded | 100 keys, leaf / unfolded | source |
+|---|---|---|---|
+| logs request_id | 1.28 / 16.85 s | 3.02 / 11.88 s | comment 6847040976 |
+| logs trace_id | 1.12 / 17.29 s | 2.19 / 7.92 s | comment 6847040976 |
+| spans trace_id | 1.10 / 15.06 s | 1.81 / 5.51 s | comment 6847040976 |
+
+So the owner decided on 2026-11-13 to turn the switch on, and on
+2026-11-14 to keep it one switch rather than split it per signal. It is on
+for logs, spans and metrics:
+
+- `ravel-server` builds leaves in every fold it runs unless
+  `--no-fold-key-index-leaves` is passed. `ravel-cli catalog fold` builds
+  them unless `--no-key-index-leaves` is passed. The old opt-in flags
+  (`--fold-key-index-leaves`, `--key-index-leaves`) are still accepted and
+  conflict with their opt-outs. A mode that runs no fold starts with no
+  flag, and refuses a leaf flag only when it is passed.
+- `CatalogConfig::default` keeps `build_key_index_leaves` false, so the
+  library stays opt-in and the binaries decide.
+- Metrics follows the same switch: a metrics fold now builds the
+  `label_value` leaf and seals at UTC days by default. ADR-3694's
+  leaf-default amendment records that, and `--no-fold-metrics-label-index`
+  still turns off the metrics leaf alone.
+- The first fold with the switch on re-partitions a tenant's history into
+  UTC-day parts and builds every day's leaves once (ADR-3939 decision 4).
+  Every folder of a tenant must run this version and agree on the switch.
+  docs/catalog-and-mvcc.md carries the upgrade note.
+
+Not measured, and accepted with the decision: ADR-3939's F3 (per-part
+leaf GETs and `SlowDown` responses), and A1, W1 and A2, which read one
+build pass over their band on a fold that also sealed a day.
+
+Refs: #3927, #3939
