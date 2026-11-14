@@ -48,7 +48,8 @@ measured 169 listen overflows and 1,743 body-read retries at 384 on
 c6a.metal, and c8g.metal finishes sooner than the read alone could. The
 decision below does not depend on the answer, because it removes both the
 bytes and the uncapped burst; Stage 0 measures which one carried the time
-so the figures in Consequences can be checked.
+so the figures in Consequences can be checked. (Settled: the bytes; see the
+Stage 0 amendment below.)
 
 On c6a.4xlarge the cold ratio is carried by two statements: Q2 at 41x and
 Q1 at 7.7x (0.485 s and 0.082 s against 0.002 s). Without them the ratio is
@@ -94,7 +95,9 @@ per-statement promise:
   #3231) and 0.082 s cold. At 27 ms the shifted ratio is 3.1x. Q2 has the
   same floor plus one read. Two statements at 3.1x add a factor of 1.054 to
   the geomean, so the other 41 must average 1.04 or better for 1.10. Parity
-  here is a geomean and total target, not every statement.
+  here is a geomean and total target, not every statement. (Stage 0 found
+  the catalog already warm before the timed query; see the Stage 0
+  amendment below for what that changes in this bullet.)
 - **c6a.metal cold total at or under 73.9 s and load at or under 165 s.**
   Not shown reachable by anything measured so far. Both are marked unknown
   until the metal confirmation run and the Stage 0 load profile, rather
@@ -180,6 +183,9 @@ per-statement promise:
      load CPU;
    - remove non-loader seconds from the timed load if they exceed 20 s.
 
+   (The measured numbers, and the order and set they select, are in the
+   Stage 0 amendment below.)
+
 7. **No persistent format changes.** Page choice selects among encodings
    the format already defines (`docs/log-segment-format.md:737-738`:
    readers are unaffected by which choice wrote an object). That passage
@@ -259,7 +265,8 @@ flowchart LR
   memory accounting, and `partition_columnar` discards them
   (`crates/ravel-ingest/src/log_router.rs:1234`). No measurement of a
   dictionary-carrying load exists. Reopened only if the profile puts
-  `build_columnar_batch` above 15% of load CPU.
+  `build_columnar_batch` above 15% of load CPU. (The profile measured 17.7%;
+  the copy question is reopened in the Stage 0 amendment below.)
 - **Parallelise the load now, from the code reading.** The same reasoning
   produced the columnar path, which measured flat. The profile comes first.
 - **Raise zstd level or change object geometry to shrink cold reads.**
@@ -284,7 +291,8 @@ flowchart LR
   with the items decision 5 routes to #3217 and #3231 (M-B, M-C).
 - Expected load after the decision 6 changes the profile supports: 300 to
   400 s on c6a.4xlarge, low confidence until the profile exists. L-B (165
-  s) is not shown reachable.
+  s) is not shown reachable. (Revised against the profile in the Stage 0
+  amendment below.)
 - A loopback deployment on a large machine issues fewer concurrent GETs
   than before. Hot statements that were GET-bound at 384 may slow; the
   metal confirmation run checks hot total and geomean against the published
@@ -299,35 +307,39 @@ flowchart LR
 - The `--read-cursors` help text says cursors read in parallel; it is
   corrected by the task that makes it true.
 
-## Amendment (2026-11-14): Stage 0 step 1 outcomes and the decision 4 trigger
+## Amendment (2026-11-14): Stage 0 outcomes
 
-<!-- amendment-applies: sections="Context|Decision" pointer="Stage 0 amendment" -->
+<!-- amendment-applies: sections="Context|Target|Decision|Rejected alternatives|Consequences" pointer="Stage 0 amendment" -->
 
-Stage 0 step 1 ran on one c6a.4xlarge (run s0-20261114T180450Z, readout
-#4203 comment 6882960874): six arms, three rounds, the published v0.32.0
-entry and its 222-object tenant.
+Stage 0 ran on one c6a.4xlarge (run s0-20261114T180450Z), the published
+v0.32.0 entry and its 222-object tenant. The bands were written before the
+run in the #4203 issue body (Stage 0, steps 1 and 2) and comment
+6881934320, amended before any data in comment 6882019950. Readouts: step 1
+in comment 6882960874, step 2 and the Q25 test in comment 6883696111.
 
-- **Context, the cause of the 31 to 35 s.** With 384 partitions and GET
-  permits held at 32, Q21-Q24 take 31.5 to 34.0 s and the plan phase reads
-  8,385,333,984 wire bytes in 443 GETs (1.007 x the l0 bytes) with no scan
-  bytes: the bytes at the gp2 cap carry the time, not a GET burst. At the
-  boundary, 222 partitions take 5.41 s on Q21 and 223 take 32.83 s, a 5.6x
-  step in plan plus scan bytes. Decision 1 attacks the measured cause.
+**Query route (step 1: six arms, three rounds).**
+
+- **Context, the cause of the 31 to 35 s: the bytes.** With 384 partitions
+  and GET permits held at 32, Q21-Q24 take 31.5 to 34.0 s and the plan
+  phase reads 8,385,333,984 wire bytes in 443 GETs (1.007 x the l0 bytes)
+  with no scan bytes, at the gp2 cap. At the boundary, 222 partitions take
+  5.41 s on Q21 and 223 take 32.83 s (6.07x in time, 5.6x in plan plus
+  scan bytes). Decision 1 attacks the measured cause.
 - **Decision 2 stands.** Q25 and Q27 take the same time at 222 and 223
-  partitions (1.45 and 1.47 s), so the fewer-segments rejection does not
-  cause their slowdown; partition width does (0.25 s at 32 partitions).
-- **Decision 4, trigger not met.** `blocks_scanned` for Q25 does not grow
-  with partitions (119 to 156 at 32, 116 to 135 at 384), which by the band
-  written before the run refutes the reading behind decision 4. Decision 4
-  is not specified on this evidence, and task #4209 is held. A candidate
-  explanation was noticed after the run: objects opened grow with
-  partitions (63 to 64 at 32, all 222 at 222 and 384; `blocksTotal` about
-  3,814 against 13,141) while `blocks_scanned` stays flat. Because that
-  figure was chosen after the data was in, it is not evidence here. It is
-  tested by a fresh pre-registration (#4203 comment 6883009414: objects
-  opened about min(222, 2 x partitions) at 16, 32, 64 and 128 partitions).
-  Decision 4 is restated on that figure only if that test passes; if it
-  fails, #4209 is cancelled and the Q25 and Q27 slowdown is re-traced.
+  partitions (1.45 and 1.47 s), so the fewer-segments rejection is ruled
+  out as the cause of their slowdown. What does cause it is not
+  established: they take 0.25 s at 32 partitions, and the one explanation
+  tested (below) was refuted.
+- **Decision 4 is withdrawn.** Its trigger, `blocks_scanned` for Q25
+  growing with partitions, did not fire (119 to 156 at 32, 116 to 135 at
+  384); by the band written before the run that refutes its reading. An
+  explanation noticed after the run (objects opened growing as about
+  min(222, 2 x partitions)) was not used as evidence; it was pre-registered
+  separately (comment 6883009414) and refuted: 53, 64, 72 and 128 objects
+  opened at 16, 32, 64 and 128 partitions, with 64 inside the 15% of 32
+  that the pre-registration named as refutation. Task #4209 is cancelled.
+  The Q25 and Q27 slowdown goes to the partition-width item in decision 5
+  (#3231) with these figures as its starting point.
 - **Decision 3, supporting evidence.** On the fast path, 384 GET permits
   against 32 make Q29 64% slower (10.13 against 6.16 s), Q28 23% and Q23
   13%. The cap value 64 is still first measured at 384 partitions by the
@@ -336,3 +348,70 @@ entry and its 222-object tenant.
   published machines carry a current figure. "Without them the ratio is
   1.18" means the ratio with Q1 and Q2 at parity, not with them dropped;
   likewise 1.04 is the ratio with Q1, Q2, Q8, Q28, Q30 and Q18 at parity.
+
+**Bulk load (step 2).** b0 is v0.32.0 built from source with default
+features: 640.8 s wall, 3,099.8 CPU-s (4.84 of 16 cores), 222 objects,
+8,328,210,617 l0 bytes, equal to the release binary's load to 0.2% on wall
+and byte for byte on l0. The five numbers decision 6 asked for, from the
+profiled load's flamegraph (inclusive shares of load CPU):
+
+1. The decode pipeline's one blocking thread carries 18.6% of 3,169 CPU-s,
+   about 590 s over a 658 s wall: about 90% busy. Parquet decode is 0.8% of
+   load CPU; `build_columnar_batch` is 17.7%.
+2. Flush encode (`RlogWriter::finish_with_stats`) is 70.5%, about 3.4
+   cores. Of load CPU, column staging is 18.4%, the
+   `columnar_key_values` grid 10.7%, `BTreeSet<u32>` inserts 5.0% and zstd
+   5.8%.
+3. CPU on discarded page candidates is small: `i64_candidates` 3.3%.
+4. `build_columnar_batch` at 17.7% is above the 15% trigger.
+5. About 2 s of the published load is outside the loader.
+
+One-variable arms against b0: `PageChoice::Estimated` cut CPU 11.9% and
+wall 5.0% (band: 10 to 30%, missed) for 2.43% more l0 bytes, with Q21, Q28
+and Q29 cold 0.1% to 2.6% slower on that tenant; a 16-permit write gate
+left wall unchanged (+0.5%, band 5 to 25% lower, missed) and l0 bytes
+identical. A cut of 12% in encode CPU moving wall 5%, and parallel page
+encode moving it 0%, while the decoder thread stays about 90% busy, put
+the single decoder on the load's critical path.
+
+So decision 6's list is ordered and narrowed as follows:
+
+- Decode each cursor on its own blocking task (#4210) is first, and its
+  acceptance shows wall falling, not only CPU.
+- The write gate (#4211) is held until the decoder is off the critical
+  path, then re-measured.
+- Estimated page choice (#4212) stays, after #4210: its win is small and
+  its stored-byte and cold-read cost is inside the bands.
+- Removing non-loader seconds (#4216) is cancelled (2 s).
+- New: remove row-shaped materialization from the columnar load path (the
+  `columnar_key_values` grid, the per-row attribute vectors in
+  `partition_columnar` at 7.4%, the `BTreeSet`, the value clones; about a
+  third of load CPU in total). This reopens the rejected alternative on
+  carrying column buffers further into the writer, on the 15% trigger it
+  named; whether Parquet dictionaries are carried is decided inside that
+  task from its own measurement, under the ADR-2614 memory accounting.
+- Consequences, the load expectation: 300 to 400 s stays the expectation
+  after the changes above; it now rests on the profile rather than on the
+  code reading. L-B (165 s) is still not shown reachable.
+
+**Decision 8, added: per-object metadata is loaded before readiness.** The
+startup warm-up (ADR-0046) already resolves each tenant's catalog before
+`/readyz`: every cold statement's resolve phase on this box was 223 cache
+hits, 0 misses, one GET of 33 bytes. Per-object metadata is not warmed:
+Q21's plan phase on the stock arm is 222 GETs and 57,190,858 bytes of
+footers and directories, all misses, inside the timed query, and Q2 and Q8
+read their 222 footers inside their scan phase (439 GETs, 182,887,672
+bytes). The warm-up therefore also reads each recent logs object's footer
+and four directories, not column pages, into the read cache before
+`/readyz` latches, within the cache budget and the existing warm-up
+deadline, and degrades to warming less on any failure, as ADR-0046
+requires. It applies to every deployment, as ClickHouse loads part
+metadata at startup. Task #4218.
+
+**The Q1 floor.** Q1 cold takes 0.100 to 0.115 s and reads nothing after
+the catalog (one GET, 33 bytes, 223 cache hits). The Target section's
+reasoning that a restarted server must resolve the catalog from the store
+before answering does not describe this run: the catalog is already warm.
+Where the 0.1 s goes is not measured; it is handed to #3231 with this
+figure, and the "not reachable" bullet for Q1 and Q2 stands only as a
+statement that nothing measured so far reaches it.
