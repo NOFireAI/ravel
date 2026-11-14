@@ -5,12 +5,12 @@
 //! NaN payloads (distinct payloads stay distinct), `-0.0`, denormals, and both
 //! infinities round-trip through the `f64` bit pattern, never `==`.
 //!
-//! - [`encode_alp`] / [`decode_alp`] (VAL_ALP, enc 18): the best single
+//! - [`encode_alp`] / [`decode_alp_into`] (VAL_ALP, enc 18): the best single
 //!   exponent that fits the most values; any value the model does not
 //!   reproduce bit-exactly is stored as a raw-`f64` exception. Targets integer
 //!   counters and decimal gauges; falls back to about raw size (never larger,
 //!   because per-page selection keeps the smaller) on noisy floats.
-//! - [`encode_gcd_delta_for`] / [`decode_gcd_delta_for`] (VAL_GCD_DELTA_FOR,
+//! - [`encode_gcd_delta_for`] / [`decode_gcd_delta_for_into`] (VAL_GCD_DELTA_FOR,
 //!   enc 19): the smallest exponent that fits *every* value (else a whole-page
 //!   raw fallback), delta the integers, divide the deltas by their GCD, then
 //!   frame-of-reference bit-pack the reduced deltas. Targets constant series
@@ -22,7 +22,7 @@
 
 use crate::error::SegmentError;
 use crate::varint::{read_uvarint, read_zigzag_varint, write_uvarint, write_zigzag_varint};
-use ravel_codec::encoding::{Enc, decode_i64, encode_i64};
+use ravel_codec::encoding::{Enc, decode_i64_into, encode_i64};
 
 /// Largest decimal exponent either integer-model codec will try. `10^18`
 /// still fits an `i64` (max `~9.22e18`); a decimal that needs more places is
@@ -154,18 +154,20 @@ fn for_pack(out: &mut Vec<u8>, values: &[i64]) {
     }
 }
 
-/// Inverse of [`for_pack`] for exactly `count` values. A `bit_width > 64` or a
-/// packed region shorter than `count * width` bits is a typed error, never a
-/// panic.
-fn for_unpack(bytes: &[u8], pos: &mut usize, count: usize) -> Result<Vec<i64>, SegmentError> {
+/// The header of a [`for_pack`] region holding exactly `count` values: its
+/// minimum, its bit width and its packed bytes, which [`for_unpack_into`]
+/// expands. A `bit_width > 64` or a packed region shorter than
+/// `count * width` bits is a typed error, never a panic.
+fn for_header<'a>(
+    bytes: &'a [u8],
+    pos: &mut usize,
+    count: usize,
+) -> Result<(i64, u32, &'a [u8]), SegmentError> {
     let min = read_zigzag_varint(bytes, pos)?;
     let bit_width = u32::from(*bytes.get(*pos).ok_or(SegmentError::Truncated)?);
     *pos += 1;
     if bit_width > 64 {
         return Err(codec_err("FOR bit width exceeds 64"));
-    }
-    if bit_width == 0 {
-        return Ok(vec![min; count]);
     }
     let need_bits = (count as u64)
         .checked_mul(u64::from(bit_width))
@@ -174,16 +176,25 @@ fn for_unpack(bytes: &[u8], pos: &mut usize, count: usize) -> Result<Vec<i64>, S
     let end = pos.checked_add(need).ok_or(SegmentError::Truncated)?;
     let region = bytes.get(*pos..end).ok_or(SegmentError::Truncated)?;
     *pos += need;
+    Ok((min, bit_width, region))
+}
+
+/// Inverse of [`for_pack`]: expands a region [`for_header`] validated for
+/// `out.len()` values into `out`.
+fn for_unpack_into(min: i64, bit_width: u32, region: &[u8], out: &mut [i64]) {
+    if bit_width == 0 {
+        out.fill(min);
+        return;
+    }
     let mask = if bit_width == 64 {
         u64::MAX
     } else {
         (1u64 << bit_width) - 1
     };
-    let mut out = Vec::with_capacity(count);
     let mut acc: u128 = 0;
     let mut nbits: u32 = 0;
     let mut byte_idx = 0usize;
-    for _ in 0..count {
+    for slot in out {
         while nbits < bit_width {
             acc |= u128::from(region[byte_idx]) << nbits;
             byte_idx += 1;
@@ -192,9 +203,47 @@ fn for_unpack(bytes: &[u8], pos: &mut usize, count: usize) -> Result<Vec<i64>, S
         let off = (acc as u64) & mask;
         acc >>= bit_width;
         nbits -= bit_width;
-        out.push((min as u64).wrapping_add(off) as i64);
+        *slot = (min as u64).wrapping_add(off) as i64;
     }
-    Ok(out)
+}
+
+/// Appends `count` values to `out` that `fill` decodes as integers and
+/// `to_f64` converts, without a second buffer: `out` is turned into its bit
+/// patterns and collected back in place (`f64` and `i64` share size and
+/// alignment, so both collects reuse `out`'s allocation), and the integers
+/// are decoded straight into its tail. The decode's peak is therefore `out`
+/// grown by `count` values, the 8 bytes per sample its caller charges. The
+/// values `out` held before are bit-exact afterwards, on error too; on error
+/// nothing is appended.
+fn append_via_i64(
+    out: &mut Vec<f64>,
+    count: usize,
+    fill: impl FnOnce(&mut [i64]) -> Result<(), SegmentError>,
+    to_f64: impl Fn(i64) -> f64,
+) -> Result<(), SegmentError> {
+    let prefix = out.len();
+    let mut bits: Vec<i64> = std::mem::take(out)
+        .into_iter()
+        .map(|v| v.to_bits() as i64)
+        .collect();
+    bits.reserve_exact(count);
+    bits.resize(prefix + count, 0);
+    let filled = fill(&mut bits[prefix..]);
+    *out = bits
+        .into_iter()
+        .enumerate()
+        .map(|(i, d)| {
+            if i < prefix {
+                f64::from_bits(d as u64)
+            } else {
+                to_f64(d)
+            }
+        })
+        .collect();
+    if filled.is_err() {
+        out.truncate(prefix);
+    }
+    filled
 }
 
 // --- ALP (VAL_ALP, enc 18) ----------------------------------------------
@@ -234,12 +283,23 @@ pub fn encode_alp(values: &[f64]) -> Vec<u8> {
     out
 }
 
-/// Decodes exactly `count` values from an ALP payload. Every structural
-/// violation is a typed [`SegmentError`], never a panic and never wrong data.
+/// [`decode_alp_into`] into a fresh vector.
+#[cfg(test)]
 pub fn decode_alp(bytes: &[u8], count: usize) -> Result<Vec<f64>, SegmentError> {
+    let mut out = Vec::new();
+    decode_alp_into(bytes, count, &mut out)?;
+    Ok(out)
+}
+
+/// Decodes exactly `count` values from an ALP payload, appending them to
+/// `out` with no intermediate buffer: the integer stream is decoded straight
+/// into `out`'s new tail ([`append_via_i64`]). Every structural violation is
+/// a typed [`SegmentError`], never a panic and never wrong data; on error
+/// `out` keeps exactly the values it held.
+pub fn decode_alp_into(bytes: &[u8], count: usize, out: &mut Vec<f64>) -> Result<(), SegmentError> {
     if count == 0 {
         if bytes.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         return Err(codec_err("ALP payload for zero values is non-empty"));
     }
@@ -257,12 +317,36 @@ pub fn decode_alp(bytes: &[u8], count: usize) -> Result<Vec<f64>, SegmentError> 
     let int_end = pos.checked_add(int_len).ok_or(SegmentError::Truncated)?;
     let int_bytes = bytes.get(pos..int_end).ok_or(SegmentError::Truncated)?;
     pos += int_len;
-    let digits = decode_i64(enc, int_bytes, count)
-        .map_err(|e| SegmentError::ValuePageCodec(e.to_string()))?;
-    if digits.len() != count {
+    if matches!(enc, Enc::Plain | Enc::DeltaZigzag | Enc::DoubleDelta) && count > int_bytes.len() {
+        // Every varint takes at least one byte; refuse before sizing by `count`.
         return Err(codec_err("ALP integer stream length mismatch"));
     }
-    let mut out: Vec<f64> = digits.iter().map(|&d| (d as f64) / POW10[e]).collect();
+    let prefix = out.len();
+    let pow = POW10[e];
+    append_via_i64(
+        out,
+        count,
+        |slots| {
+            decode_i64_into(enc, int_bytes, None, slots, Ok)
+                .map(|_| ())
+                .map_err(|e| SegmentError::ValuePageCodec(e.to_string()))
+        },
+        |d| (d as f64) / pow,
+    )?;
+    let patched = patch_alp_exceptions(bytes, pos, &mut out[prefix..]);
+    if patched.is_err() {
+        out.truncate(prefix);
+    }
+    patched
+}
+
+/// Reads ALP's exception list from `pos` to the end of `bytes`, overwriting
+/// each listed position of `values` with its raw `f64`.
+fn patch_alp_exceptions(
+    bytes: &[u8],
+    mut pos: usize,
+    values: &mut [f64],
+) -> Result<(), SegmentError> {
     let n_exc =
         usize::try_from(read_uvarint(bytes, &mut pos)?).map_err(|_| SegmentError::FieldOverflow)?;
     for _ in 0..n_exc {
@@ -272,14 +356,15 @@ pub fn decode_alp(bytes: &[u8], count: usize) -> Result<Vec<f64>, SegmentError> 
         let raw = bytes.get(pos..raw_end).ok_or(SegmentError::Truncated)?;
         pos += 8;
         let arr: [u8; 8] = raw.try_into().map_err(|_| SegmentError::Truncated)?;
-        *out.get_mut(idx)
+        *values
+            .get_mut(idx)
             .ok_or_else(|| codec_err("ALP exception index out of range"))? =
             f64::from_bits(u64::from_le_bytes(arr));
     }
     if pos != bytes.len() {
         return Err(SegmentError::TrailingBytes);
     }
-    Ok(out)
+    Ok(())
 }
 
 // --- GCD-of-deltas + frame-of-reference (VAL_GCD_DELTA_FOR, enc 19) ------
@@ -324,13 +409,27 @@ pub fn encode_gcd_delta_for(values: &[f64]) -> Vec<u8> {
     })
 }
 
-/// Decodes exactly `count` values from a GCD-delta-FOR payload. Every
-/// structural violation is a typed [`SegmentError`], never a panic and never
-/// wrong data.
+/// [`decode_gcd_delta_for_into`] into a fresh vector.
+#[cfg(test)]
 pub fn decode_gcd_delta_for(bytes: &[u8], count: usize) -> Result<Vec<f64>, SegmentError> {
+    let mut out = Vec::new();
+    decode_gcd_delta_for_into(bytes, count, &mut out)?;
+    Ok(out)
+}
+
+/// Decodes exactly `count` values from a GCD-delta-FOR payload, appending
+/// them to `out` with no intermediate buffer: the reduced deltas are unpacked
+/// and accumulated in `out`'s new tail ([`append_via_i64`]). Every structural
+/// violation is a typed [`SegmentError`], never a panic and never wrong data;
+/// on error `out` keeps exactly the values it held.
+pub fn decode_gcd_delta_for_into(
+    bytes: &[u8],
+    count: usize,
+    out: &mut Vec<f64>,
+) -> Result<(), SegmentError> {
     if count == 0 {
         if bytes.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         return Err(codec_err("GCD-FOR payload for zero values is non-empty"));
     }
@@ -341,12 +440,12 @@ pub fn decode_gcd_delta_for(bytes: &[u8], count: usize) -> Result<Vec<f64>, Segm
             if body.len() != expected {
                 return Err(codec_err("GCD-FOR raw body length mismatch"));
             }
-            let mut out = Vec::with_capacity(count);
+            out.reserve_exact(count);
             for chunk in body.chunks_exact(8) {
                 let arr: [u8; 8] = chunk.try_into().map_err(|_| SegmentError::Truncated)?;
                 out.push(f64::from_bits(u64::from_le_bytes(arr)));
             }
-            Ok(out)
+            Ok(())
         }
         GDF_MODEL => {
             let mut pos = 0usize;
@@ -360,24 +459,33 @@ pub fn decode_gcd_delta_for(bytes: &[u8], count: usize) -> Result<Vec<f64>, Segm
             if g == 0 {
                 return Err(codec_err("GCD-FOR divisor is zero"));
             }
-            let reduced = for_unpack(body, &mut pos, count - 1)?;
+            let (min, bit_width, region) = for_header(body, &mut pos, count - 1)?;
             if pos != body.len() {
                 return Err(SegmentError::TrailingBytes);
             }
             let g = g as i64;
-            let mut digits = Vec::with_capacity(count);
-            digits.push(first);
-            let mut acc = first;
-            for r in reduced {
-                let step = r
-                    .checked_mul(g)
-                    .ok_or_else(|| codec_err("GCD-FOR delta overflow"))?;
-                acc = acc
-                    .checked_add(step)
-                    .ok_or_else(|| codec_err("GCD-FOR accumulation overflow"))?;
-                digits.push(acc);
-            }
-            Ok(digits.iter().map(|&d| (d as f64) / POW10[e]).collect())
+            let pow = POW10[e];
+            append_via_i64(
+                out,
+                count,
+                |slots| {
+                    let (head, rest) = slots.split_first_mut().ok_or(SegmentError::Truncated)?;
+                    *head = first;
+                    for_unpack_into(min, bit_width, region, rest);
+                    let mut acc = first;
+                    for slot in rest {
+                        let step = slot
+                            .checked_mul(g)
+                            .ok_or_else(|| codec_err("GCD-FOR delta overflow"))?;
+                        acc = acc
+                            .checked_add(step)
+                            .ok_or_else(|| codec_err("GCD-FOR accumulation overflow"))?;
+                        *slot = acc;
+                    }
+                    Ok(())
+                },
+                |d| (d as f64) / pow,
+            )
         }
         _ => Err(codec_err("GCD-FOR marker byte invalid")),
     }
@@ -412,6 +520,8 @@ mod tests {
             1e17,
         ]
     }
+
+    type DecodeInto = fn(&[u8], usize, &mut Vec<f64>) -> Result<(), SegmentError>;
 
     fn bits(v: &[f64]) -> Vec<u64> {
         v.iter().map(|x| x.to_bits()).collect()
@@ -513,6 +623,34 @@ mod tests {
             let gdf = encode_gcd_delta_for(&vals);
             let g = decode_gcd_delta_for(&gdf, vals.len()).expect("gcd decodes");
             prop_assert_eq!(bits(&g), bits(&vals));
+        }
+
+        /// Decoding into a vector that already holds values appends the
+        /// fresh decode after them and leaves them bit-exact, NaN payloads
+        /// included; a payload that fails leaves the vector exactly as it was.
+        #[test]
+        fn decoding_into_appends_and_keeps_what_was_there(
+            held in proptest::collection::vec(any::<f64>(), 0..16),
+            vals in proptest::collection::vec(-1_000_000i64..1_000_000, 1..48),
+            cut in any::<usize>(),
+        ) {
+            let vals: Vec<f64> = vals.iter().map(|&i| i as f64 / 100.0).collect();
+            let decoders: [(Vec<u8>, DecodeInto); 2] = [
+                (encode_alp(&vals), decode_alp_into),
+                (encode_gcd_delta_for(&vals), decode_gcd_delta_for_into),
+            ];
+            for (payload, decode) in decoders {
+                let mut out = held.clone();
+                decode(&payload, vals.len(), &mut out).expect("decodes");
+                prop_assert_eq!(bits(&out[..held.len()]), bits(&held));
+                prop_assert_eq!(bits(&out[held.len()..]), bits(&vals));
+
+                let truncated = &payload[..cut % payload.len()];
+                let mut out = held.clone();
+                if decode(truncated, vals.len(), &mut out).is_err() {
+                    prop_assert_eq!(bits(&out), bits(&held));
+                }
+            }
         }
 
         /// A single-bit mutation or truncation of a valid stream yields a typed

@@ -469,10 +469,22 @@ pub(crate) mod decode_counter {
 
     thread_local! {
         static LABEL_DICT_DECODES: Cell<u64> = const { Cell::new(0) };
+        static I64_BLOCK_DECODES: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(crate) fn reset() {
         LABEL_DICT_DECODES.with(|c| c.set(0));
+        I64_BLOCK_DECODES.with(|c| c.set(0));
+    }
+
+    /// `encode_i64` column blocks decoded (allocated) on this thread since
+    /// the last [`reset`].
+    pub(crate) fn i64_block_decodes() -> u64 {
+        I64_BLOCK_DECODES.with(Cell::get)
+    }
+
+    pub(crate) fn record_i64_block() {
+        I64_BLOCK_DECODES.with(|c| c.set(c.get() + 1));
     }
 
     pub(crate) fn label_dict_decodes() -> u64 {
@@ -908,11 +920,11 @@ fn decode_val_page_into(
             Ok(ValPageKind::RawF64)
         }
         page_enc::VAL_ALP => {
-            out.extend(crate::value_codecs::decode_alp(scratch, count)?);
+            crate::value_codecs::decode_alp_into(scratch, count, out)?;
             Ok(ValPageKind::Alp)
         }
         page_enc::VAL_GCD_DELTA_FOR => {
-            out.extend(crate::value_codecs::decode_gcd_delta_for(scratch, count)?);
+            crate::value_codecs::decode_gcd_delta_for_into(scratch, count, out)?;
             Ok(ValPageKind::GcdDeltaFor)
         }
         other => Err(SegmentError::InvalidEncoding(other)),
@@ -942,7 +954,7 @@ fn decode_hist_spans(
     pos: &mut usize,
 ) -> Result<(Vec<HistogramSpan>, u64), SegmentError> {
     let span_count = to_usize(read_uvarint(bytes, pos)?)?;
-    let mut spans = Vec::with_capacity(span_count.min(bytes.len()));
+    let mut spans = Vec::with_capacity(span_count.min(remaining(bytes, *pos) / 2));
     let mut total: u64 = 0;
     for _ in 0..span_count {
         let offset = read_zigzag_varint(bytes, pos)?;
@@ -965,7 +977,7 @@ fn decode_hist_spans(
 
 fn decode_hist_int_counts(bytes: &[u8], pos: &mut usize, n: u64) -> Result<Vec<u64>, SegmentError> {
     let n = to_usize(n)?;
-    let mut out = Vec::with_capacity(n.min(bytes.len()));
+    let mut out = Vec::with_capacity(n.min(remaining(bytes, *pos)));
     for _ in 0..n {
         out.push(read_uvarint(bytes, pos)?);
     }
@@ -978,11 +990,69 @@ fn decode_hist_float_counts(
     n: u64,
 ) -> Result<Vec<f64>, SegmentError> {
     let n = to_usize(n)?;
-    let mut out = Vec::with_capacity(n.min(bytes.len()));
+    let mut out = Vec::with_capacity(n.min(remaining(bytes, *pos) / 8));
     for _ in 0..n {
         out.push(take_f64_le(bytes, pos)?);
     }
     Ok(out)
+}
+
+/// Bytes of `bytes` from `pos` on. Each histogram vector is pre-sized to at
+/// most the elements these bytes can still encode, so its capacity never
+/// outruns the payload whatever count a corrupt record declares.
+fn remaining(bytes: &[u8], pos: usize) -> usize {
+    bytes.len().saturating_sub(pos)
+}
+
+/// The fewest bytes one HIST_SPANS record encodes outside its heap vectors:
+/// the flags byte, a one-byte `scale`, the 8-byte `zero_threshold`, the two
+/// counts (one varint byte each in the integer form, 16 bytes in the float
+/// form) and the two span-count varints.
+const HIST_RECORD_MIN_FIXED_BYTES: u64 = 14;
+
+/// Heap bytes one HIST_SPANS heap element holds per payload byte it takes
+/// at the least: a `u64` bucket count is a varint of at least one byte. A
+/// span (8 bytes held, at least 2 encoded) or an `f64` count or custom bound
+/// (8 held, 8 encoded) holds less.
+const HIST_HEAP_BYTES_PER_PAYLOAD_BYTE: u64 = 8;
+
+/// The decompressed payload length of a stored page (any kind), read from
+/// its 6-byte header and, for an LZ4 page, the 4-byte uncompressed-size
+/// prefix: what decoding the page first allocates as its decompression
+/// buffer. Reads no more than those 10 bytes; it neither checks the crc nor
+/// decompresses, and decoding the page refuses one whose prefix lies.
+pub fn page_payload_len(page: &[u8]) -> Result<u64, SegmentError> {
+    if page.len() < 6 {
+        return Err(SegmentError::Truncated);
+    }
+    let payload = &page[6..];
+    match page[1] {
+        page_comp::NONE => Ok(payload.len() as u64),
+        page_comp::LZ4 => {
+            let prefix = payload.get(..4).ok_or(SegmentError::Truncated)?;
+            Ok(u64::from(u32::from_le_bytes([
+                prefix[0], prefix[1], prefix[2], prefix[3],
+            ])))
+        }
+        other => Err(SegmentError::InvalidCompression(other)),
+    }
+}
+
+/// An upper bound, by construction, on the heap bytes the span, bucket-count
+/// and custom-bound vectors of `sample_count` histogram values take when
+/// decoded from a HIST_SPANS payload of `payload_len` decompressed bytes
+/// ([`page_payload_len`]): every record spends at least
+/// [`HIST_RECORD_MIN_FIXED_BYTES`] outside those vectors, and every vector
+/// element held costs at most [`HIST_HEAP_BYTES_PER_PAYLOAD_BYTE`] heap bytes
+/// per payload byte, so the vectors hold at most
+/// `8 * (payload_len - 14 * sample_count)` bytes. Each vector is sized
+/// exactly to its count on a page that decodes. A corrupt page that fails
+/// part-way holds at most `8 * payload_len` before the error frees it,
+/// since no vector is pre-sized past what the remaining bytes can encode.
+pub fn hist_page_heap_bound(payload_len: u64, sample_count: u32) -> u64 {
+    payload_len
+        .saturating_sub(HIST_RECORD_MIN_FIXED_BYTES.saturating_mul(u64::from(sample_count)))
+        .saturating_mul(HIST_HEAP_BYTES_PER_PAYLOAD_BYTE)
 }
 
 /// Decodes one HIST_SPANS record, enforcing every Corrupted rule: reserved flag bits zero, `scale >=
@@ -1036,7 +1106,7 @@ fn decode_histogram_record(bytes: &[u8], pos: &mut usize) -> Result<HistogramVal
         if n == 0 {
             return Err(SegmentError::HistogramCustomValuesMismatch);
         }
-        let mut bounds = Vec::with_capacity(n.min(bytes.len()));
+        let mut bounds = Vec::with_capacity(n.min(remaining(bytes, *pos) / 8));
         for _ in 0..n {
             bounds.push(take_f64_le(bytes, pos)?);
         }
@@ -1204,6 +1274,9 @@ pub fn decode_run_histogram_pages(
         &mut scratch,
         &mut timestamps,
     )?;
+    // A fresh buffer, so the HIST payload's is exactly its
+    // `page_payload_len` rather than grown from the TS payload's.
+    scratch = Vec::new();
     let mut values = Vec::new();
     decode_hist_page_into(
         series_id,
@@ -1875,6 +1948,8 @@ pub(crate) fn take_encoded_i64_block(
         .ok_or_else(|| SegmentError::ProvenanceColumnCodec("empty column block".into()))?;
     let enc = ravel_codec::encoding::Enc::from_u8(enc_byte)
         .map_err(|e| SegmentError::ProvenanceColumnCodec(e.to_string()))?;
+    #[cfg(test)]
+    decode_counter::record_i64_block();
     ravel_codec::encoding::decode_i64(enc, payload, count)
         .map_err(|e| SegmentError::ProvenanceColumnCodec(e.to_string()))
 }
@@ -2645,27 +2720,47 @@ mod provenance_extension_tests {
         assert_eq!(out[1], None);
     }
 
-    /// Records every admit and release, refusing admits past `limit`.
+    /// Records every admit and release, refusing admits past `limit`, with
+    /// the number of `encode_i64` column blocks decoded when it happened.
     struct Ledger {
         limit: u64,
         held: u64,
         events: Vec<(&'static str, u64)>,
+        blocks_decoded_at: Vec<u64>,
+    }
+
+    impl Ledger {
+        fn new(limit: u64) -> Self {
+            super::decode_counter::reset();
+            Self {
+                limit,
+                held: 0,
+                events: Vec::new(),
+                blocks_decoded_at: Vec::new(),
+            }
+        }
+
+        fn record(&mut self, event: &'static str, bytes: u64) {
+            self.events.push((event, bytes));
+            self.blocks_decoded_at
+                .push(super::decode_counter::i64_block_decodes());
+        }
     }
 
     impl crate::CatalogCharge for Ledger {
         fn admit(&mut self, bytes: u64) -> bool {
             if self.held + bytes > self.limit {
-                self.events.push(("refused", bytes));
+                self.record("refused", bytes);
                 return false;
             }
             self.held += bytes;
-            self.events.push(("admit", bytes));
+            self.record("admit", bytes);
             true
         }
 
         fn release(&mut self, bytes: u64) {
             self.held -= bytes;
-            self.events.push(("release", bytes));
+            self.record("release", bytes);
         }
     }
 
@@ -2680,15 +2775,13 @@ mod provenance_extension_tests {
 
     /// Issue #4118: the columns and the structs are admitted before either is
     /// allocated, the columns released once freed, and the structs left
-    /// admitted for the tail that holds them.
+    /// admitted for the tail that holds them. Both admits see only the
+    /// presence column decoded, so an admit moved after the four column
+    /// decodes fails here.
     #[test]
     fn the_extension_admits_its_decode_before_allocating_it() {
         let (meta, sample_count) = two_flagged_samples();
-        let mut ledger = Ledger {
-            limit: u64::MAX,
-            held: 0,
-            events: Vec::new(),
-        };
+        let mut ledger = Ledger::new(u64::MAX);
         let mut pos = 0usize;
         let out = parse_provenance_extension(
             &meta,
@@ -2707,6 +2800,7 @@ mod provenance_extension_tests {
             ledger.events,
             vec![("admit", columns), ("admit", structs), ("release", columns)]
         );
+        assert_eq!(ledger.blocks_decoded_at, vec![1, 1, 5]);
         assert_eq!(ledger.held, structs);
         assert_eq!(crate::catalog_charge::provenance_bytes(&out), structs);
     }
@@ -2718,11 +2812,7 @@ mod provenance_extension_tests {
         let (meta, sample_count) = two_flagged_samples();
         let presence_len = encoded_block(&[1, 0]).len();
         for limit in [0, 2 * crate::PROVENANCE_COLUMN_BYTES_PER_SAMPLE] {
-            let mut ledger = Ledger {
-                limit,
-                held: 0,
-                events: Vec::new(),
-            };
+            let mut ledger = Ledger::new(limit);
             let mut pos = 0usize;
             let err = parse_provenance_extension(
                 &meta,
@@ -2927,6 +3017,159 @@ mod zstd_section_tests {
         assert_eq!(
             decode_section_bytes(&section, &stored, limits).expect("after errors"),
             data
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod hist_heap_bound_tests {
+    use super::{decode_histogram_record, hist_page_heap_bound, page_payload_len};
+    use crate::error::SegmentError;
+    use crate::format::{page_comp, page_enc};
+    use crate::histogram::{
+        HistogramCounts, HistogramSpan, HistogramValue, ResetHint, encode_histogram_record_into,
+    };
+
+    fn int_value(spans: &[HistogramSpan], counts: Vec<u64>) -> HistogramValue {
+        HistogramValue {
+            scale: 0,
+            zero_threshold: 0.0,
+            sum: None,
+            custom_values: None,
+            positive_spans: spans.to_vec(),
+            negative_spans: Vec::new(),
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: counts.iter().sum(),
+                positive: counts,
+                negative: Vec::new(),
+            },
+            reset_hint: ResetHint::Unknown,
+        }
+    }
+
+    /// The heap bytes `value`'s vectors actually allocated.
+    fn allocated_heap(value: &HistogramValue) -> u64 {
+        let counts = match &value.counts {
+            HistogramCounts::Int {
+                positive, negative, ..
+            } => (positive.capacity() + negative.capacity()) * 8,
+            HistogramCounts::Float {
+                positive, negative, ..
+            } => (positive.capacity() + negative.capacity()) * 8,
+        };
+        let spans = (value.positive_spans.capacity() + value.negative_spans.capacity())
+            * std::mem::size_of::<HistogramSpan>();
+        let custom = value.custom_values.as_ref().map_or(0, |c| c.capacity() * 8);
+        (counts + spans + custom) as u64
+    }
+
+    fn span(offset: i32, length: u32) -> HistogramSpan {
+        HistogramSpan { offset, length }
+    }
+
+    /// Decodes every record of `payload`, returning the heap they allocated.
+    fn decode_all(payload: &[u8], n: usize) -> u64 {
+        let mut pos = 0;
+        let mut heap = 0;
+        for _ in 0..n {
+            let value = decode_histogram_record(payload, &mut pos).expect("record decodes");
+            heap += allocated_heap(&value);
+        }
+        assert_eq!(pos, payload.len());
+        heap
+    }
+
+    /// The bound's two constants are exact: a record with no buckets is 14
+    /// bytes and allocates nothing, and each zero-valued integer bucket adds
+    /// one payload byte and 8 heap bytes, so the bound's only slack is the
+    /// 8 bytes per span (2 bytes encoded, 8 held, charged 16) while its
+    /// length is a one-byte varint.
+    #[test]
+    fn the_bound_is_tight_for_integer_buckets() {
+        assert_eq!(std::mem::size_of::<HistogramSpan>(), 8);
+        let mut payload = Vec::new();
+        encode_histogram_record_into(&mut payload, &int_value(&[], Vec::new())).expect("encodes");
+        assert_eq!(payload.len(), 14);
+        assert_eq!(decode_all(&payload, 1), 0);
+        assert_eq!(hist_page_heap_bound(payload.len() as u64, 1), 0);
+
+        for buckets in [1u32, 7, 127] {
+            let mut payload = Vec::new();
+            let value = int_value(&[span(0, buckets)], vec![0; buckets as usize]);
+            encode_histogram_record_into(&mut payload, &value).expect("encodes");
+            let heap = decode_all(&payload, 1);
+            assert_eq!(heap, 8 + 8 * u64::from(buckets), "{buckets} buckets");
+            assert_eq!(
+                hist_page_heap_bound(payload.len() as u64, 1),
+                heap + 8,
+                "{buckets} buckets"
+            );
+        }
+    }
+
+    /// Every record shape stays within the bound, summed over a page: float
+    /// counts, both sides, custom bounds, a sum and multi-byte varints.
+    #[test]
+    fn every_record_shape_stays_within_the_bound() {
+        let float = HistogramValue {
+            scale: 3,
+            zero_threshold: 1e-9,
+            sum: Some(12.5),
+            custom_values: None,
+            positive_spans: vec![span(-2, 2), span(3, 1)],
+            negative_spans: vec![span(0, 2)],
+            counts: HistogramCounts::Float {
+                zero_count: 1.0,
+                count: 10.0,
+                positive: vec![1.0, 2.0, 3.0],
+                negative: vec![1.5, 1.5],
+            },
+            reset_hint: ResetHint::No,
+        };
+        let custom = HistogramValue {
+            scale: -53,
+            custom_values: Some(vec![0.5, 1.0, 2.0]),
+            ..int_value(&[span(0, 3)], vec![300, 70_000, 1])
+        };
+        let wide = int_value(
+            &[span(1000, 40), span(-7, 9)],
+            (0..49).map(|i| i * 1_000_003).collect(),
+        );
+        let values = [float, custom, wide, int_value(&[], Vec::new())];
+        let mut payload = Vec::new();
+        for value in &values {
+            encode_histogram_record_into(&mut payload, value).expect("encodes");
+        }
+        let heap = decode_all(&payload, values.len());
+        assert!(heap > 0);
+        let bound = hist_page_heap_bound(payload.len() as u64, values.len() as u32);
+        assert!(heap <= bound, "heap {heap} over bound {bound}");
+    }
+
+    #[test]
+    fn the_payload_length_comes_from_the_header_or_the_lz4_prefix() {
+        let mut none = vec![page_enc::HIST_SPANS, page_comp::NONE, 0, 0, 0, 0];
+        none.extend_from_slice(&[7; 33]);
+        assert_eq!(page_payload_len(&none), Ok(33));
+
+        let mut lz4 = vec![page_enc::HIST_SPANS, page_comp::LZ4, 0, 0, 0, 0];
+        lz4.extend_from_slice(&5000u32.to_le_bytes());
+        lz4.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(page_payload_len(&lz4), Ok(5000));
+
+        assert_eq!(
+            page_payload_len(&lz4[..8]),
+            Err(SegmentError::Truncated),
+            "an LZ4 page without its whole prefix"
+        );
+        assert_eq!(page_payload_len(&none[..5]), Err(SegmentError::Truncated));
+        let mut unknown = none.clone();
+        unknown[1] = 0xEE;
+        assert_eq!(
+            page_payload_len(&unknown),
+            Err(SegmentError::InvalidCompression(0xEE))
         );
     }
 }

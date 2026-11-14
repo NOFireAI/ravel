@@ -5306,6 +5306,8 @@ dependencies = [
  "ravel-proto",
  "ravel-types",
  "thiserror",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "tokio",
  "zstd",
 ]
