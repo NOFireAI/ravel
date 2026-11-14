@@ -5520,6 +5520,87 @@ class Box(Workdir):
         self.assertNotIn("terminate", text)
         self.assertNotIn("shutdown", text)
 
+    # ravel-cli catalog fold --help, option lines indented as clap prints
+    # them. Before issue #4200 only the opt-in is an option (a description
+    # line names the opt-out, which must not count); after it both are, and
+    # a fold builds leaves unless given --no-key-index-leaves.
+    LEAF_FOLD_HELP = {
+        "opt-in": ("Usage: ravel-cli catalog fold [OPTIONS]\n\nOptions:\n"
+                   "      --key-index-leaves\n          Build key-index leaves;\n"
+                   "          --no-key-index-leaves is the opt-out of later builds\n"
+                   "  -h, --help\n          Print help\n"),
+        "opt-out": ("Usage: ravel-cli catalog fold [OPTIONS]\n\nOptions:\n"
+                    "      --key-index-leaves\n          Build key-index leaves (the default)\n"
+                    "      --no-key-index-leaves\n          Build no key-index leaves\n"
+                    "  -h, --help\n          Print help\n"),
+    }
+
+    def leaf_off_failures(self, script, generation, lane):
+        """What is wrong with the leaf-off folds of a dry run of SCRIPT whose
+        catalog fold --help is LEAF_FOLD_HELP[generation]: [] when the read runs
+        once, the folds meant to build no leaf (folded_no_leaves and
+        many_parts_N) carry --no-key-index-leaves exactly when the help lists
+        it, no other fold carries it, and the choice is printed and stamped."""
+        helpf = self.path(f"fold-help-{generation}.txt")
+        with open(helpf, "w") as f:
+            f.write(self.LEAF_FOLD_HELP[generation])
+        toml = os.path.join(BOX, "run.local-smoke.toml" if lane == "local" else "run.example.toml")
+        p = subprocess.run([BASH, script, "--dry-run", "--lane", lane, "--run-toml", toml,
+                            "--out", self.path(f"out-{generation}-{lane}")],
+                           capture_output=True, text=True, env=dict(os.environ, INV_DRY_RUN_FOLD_HELP=helpf))
+        text = p.stdout + p.stderr
+        if p.returncode != 0:
+            return [f"exit {p.returncode}: {text[-400:]}"]
+        want = generation == "opt-out"
+        out = []
+        b = self.blocks(text)
+        read = "catalog fold --help lists --no-key-index-leaves"
+        if text.count(read) != 1 or not any(read in x for x in b["state:folded_no_leaves"]):
+            out.append(f"the help read {text.count(read)} times, want once, in folded_no_leaves")
+        if text.count("STAMP stamps/fold_flags.json") != 1:
+            out.append("stamps/fold_flags.json not stamped once")
+        leaf_off = [x for x in text.splitlines() if x.startswith("LEAF-OFF ")]
+        if leaf_off != [f"LEAF-OFF {'--no-key-index-leaves' if want else '<none>'}"]:
+            out.append(f"printed choice {leaf_off}")
+        off_states = ["folded_no_leaves"] + [s for s in self.LANE_STATES[lane] if s.startswith("many_parts_")]
+        for step, lines in b.items():
+            state = step.removeprefix("state:")
+            folds = [x for x in lines if "catalog fold" in x and "DRY-RUN:" in x and "--help" not in x]
+            for x in folds:
+                leafless = state in off_states and "--rebuild-key-index" not in x
+                has = "--no-key-index-leaves" in x.split()
+                if has != (want and leafless):
+                    out.append(f"{state}: fold {'carries' if has else 'lacks'} --no-key-index-leaves: {x}")
+            if state in off_states and not any("--rebuild-key-index" not in x for x in folds):
+                out.append(f"{state}: no leaf-off fold ran")
+        return out
+
+    def test_leaf_off_folds_follow_the_fold_help(self):
+        # Issue #4202: folded_no_leaves and many_parts_N stay leafless on a
+        # ravel-cli that builds key-index leaves by default, and pass no
+        # unknown flag to one that does not.
+        script = os.path.join(BOX, "run.sh")
+        for lane in ("local", "s3"):
+            for generation in ("opt-in", "opt-out"):
+                with self.subTest(lane=lane, generation=generation):
+                    self.assertEqual(self.leaf_off_failures(script, generation, lane), [])
+
+    def test_leaf_off_wrong_versions_fail(self):
+        # Two wrong versions, each failing one help generation: the opt-out
+        # passed unconditionally (an opt-in ravel-cli refuses the unknown
+        # flag), and the reading keyed on --key-index-leaves, which a #4200
+        # ravel-cli also lists (its folds would build leaves).
+        detect = 'if grep -Eq -e "${option}--no-key-index-leaves([ =]|\\$)" "$help"; then\n'
+        done = "  LEAF_OFF_READ=1\n"
+        test = "test_leaf_off_folds_follow_the_fold_help"
+        self.flip_check(done, "  LEAF_OFF=--no-key-index-leaves\n" + done, "run.sh",
+                        lambda s: self.leaf_off_failures(s, "opt-in", "local"),
+                        "--no-key-index-leaves passed unconditionally", test)
+        self.flip_check(detect, detect.replace('if grep -Eq -e "${option}--no-key-index-leaves',
+                                               'if ! grep -Eq -e "${option}--key-index-leaves'), "run.sh",
+                        lambda s: self.leaf_off_failures(s, "opt-out", "local"),
+                        "the leaf-off reading keyed on --key-index-leaves", test)
+
     def dirty_paths_line(self, run_sh_src=None):
         """The local dry run's dirty_paths with a git whose status fails."""
         d = self.path("gitstub")
