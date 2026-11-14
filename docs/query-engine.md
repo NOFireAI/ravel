@@ -1389,8 +1389,8 @@ tied to the buffer it accounts for:
   reserves. The batch reservation covers the page bytes as stored. Once a
   batch's pages are in, and before any of them is decoded, the batch also
   reserves its decoded runs, held until the sample fold has taken them:
-  per sample its timestamp and value (a histogram's inline
-  value counted twice, since a run's decode builds its samples once before
+  per sample its timestamp and value (a histogram's timestamp and inline
+  value each counted twice, since a run's decode builds its samples once before
   splitting them) and, for a run with a per-sample provenance column, its
   `SamplePriority`; per emitted unit the unit and its copy of the series'
   labels (`decoded_units_len`). A histogram value's span and bucket vectors
