@@ -3820,11 +3820,14 @@ fn level2_plans(
             builders = e;
             Some(vec![plan])
         } else {
+            // Each worker's one inline builder holds a final part beside its
+            // passes, so the passes are planned under what that part leaves.
+            let passes = ceiling.saturating_sub(fit.part_target);
             let plans = (0..workers)
                 .map(|w| {
                     let streams =
                         level2_streams(ranges, &level2_assignment(ranges.len(), workers, w));
-                    plan_merge_with(config, runs, &stream_ids[streams], width_ns, ceiling, floor)
+                    plan_merge_with(config, runs, &stream_ids[streams], width_ns, passes, floor)
                 })
                 .collect::<Result<Vec<MergePlan>>>()?;
             Some(plans)
@@ -18287,6 +18290,129 @@ mod tests {
             );
             assert_eq!(published_records(&store).await.len(), 2400);
             assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// 60 inputs of the 40 range fixture streams, every record padded by
+        /// 1,000 bytes, so the runs' streams decode alike and a pass fills
+        /// its budget.
+        fn even_padded_inputs() -> Vec<L0Input> {
+            let pad = "x".repeat(1_000);
+            let inputs = (0..60u32)
+                .map(|i| {
+                    (0..40u32)
+                        .map(|s| {
+                            record(
+                                s,
+                                1_000 + i64::from(i % 3),
+                                &format!("in{i} s{s} k0{pad}"),
+                                vec![("k".to_string(), AttrValue::I64(0))],
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            blocked(inputs, 40)
+        }
+
+        /// The range fixture over [`even_padded_inputs`] with a final part
+        /// target of 294,912 bytes, under a ceiling of 1,488,718, three
+        /// cores and `level2_workers` workers (derived when `None`).
+        async fn compact_builder_beside_passes(
+            level2_workers: Option<usize>,
+            name: &str,
+        ) -> (Result<CompactionOutcome>, Run, ProbeStore, std::path::PathBuf) {
+            let (_, _, per_input) = single_level_oracle().await;
+            let dir = fresh_scratch(name);
+            let base = range_worker_config(per_input, 1, dir.clone());
+            let ceiling = base.merge_resident_ceiling() * 13 / 10;
+            assert_eq!(ceiling, 1_488_718);
+            let config = CompactorConfig {
+                merge_resident_ceiling_bytes: Some(ceiling),
+                level2_workers,
+                rlog_l1_part_memory_target_bytes: Some(3 * RANGE_PART),
+                ..base
+            };
+            let store = ProbeStore::new();
+            seed_inputs(&store, &even_padded_inputs()).await;
+            USABLE_CORES_OVERRIDE.with(|c| c.set(Some(3)));
+            let (outcome, run) = compact_logged(&store, &config).await;
+            USABLE_CORES_OVERRIDE.with(|c| c.set(None));
+            (outcome, run, store, dir)
+        }
+
+        /// ADR-3853, #4140 correction: at `W2 > 1` each range worker plans its
+        /// passes under `U / W2` less the one final part its inline builder
+        /// holds, and a derived `W2` is the largest count whose plans fit that.
+        /// Here the core share and the read side admit 3 workers, but under
+        /// `U / 3` less a part target no plan avoids the cursor path, so the
+        /// unit runs at 2, and the unit's peak, the sum of the workers' peaks,
+        /// and each worker's peak stay within `U` and `U / 2`. Planned under
+        /// the whole `U / 3`, as before the correction, the same unit ran 3
+        /// workers that peaked at 1,638,811 bytes together, each past `U / 3`.
+        #[tokio::test]
+        async fn range_workers_plan_their_passes_beside_their_builder() {
+            let (outcome, run, store, dir) =
+                compact_builder_beside_passes(None, "builder-beside-passes").await;
+            assert!(
+                matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                "{outcome:?}"
+            );
+            let ceiling = 1_488_718;
+            let peak = run.tracker.peak_resident_bytes();
+            let level2 = run.tracker.level2_worker_peak_bytes();
+            let worker_ceiling = ceiling / level2.len().max(1) as u64;
+            assert!(
+                peak <= ceiling && level2.iter().all(|p| *p > 0 && *p <= worker_ceiling),
+                "unit peak {peak} against U {ceiling}, level-2 worker peaks {level2:?} against \
+                 U / W2 {worker_ceiling}: each worker's passes are planned beside its one \
+                 builder, so no worker passes its share and the unit does not pass U"
+            );
+            let line = run.line("rlog two-level merge");
+            assert_eq!(log_field(&line, "cores_per_unit"), 3, "{line}");
+            assert_eq!(log_field(&line, "level2_workers"), 2, "{line}");
+            assert_eq!(level2.len(), 2, "{level2:?}");
+            assert_eq!(published_records(&store).await.len(), 2400);
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// ADR-3853, #4140 correction: a configured `W2` is not lowered. The
+        /// geometry above at a configured 3 workers fits the read side check,
+        /// `need <= U / 3`, and ran before the correction; with each worker's
+        /// passes planned beside its builder it is refused at that worker
+        /// ceiling after level 1, and no part is published.
+        #[tokio::test]
+        async fn a_configured_level2_worker_count_unfit_beside_its_builder_is_refused() {
+            let (outcome, run, store, _) =
+                compact_builder_beside_passes(Some(3), "builder-beside-passes-configured").await;
+            match outcome {
+                Ok(CompactionOutcome::TwoLevelUnsupported {
+                    inputs: 60,
+                    check:
+                        TwoLevelCheck::LevelTwoFit {
+                            runs,
+                            blocks_per_run,
+                            run_block_bytes,
+                            stream_estimate_bytes,
+                            in_flight_bytes,
+                            part_target_bytes,
+                            ceiling_bytes,
+                        },
+                }) => {
+                    assert_eq!(ceiling_bytes, 1_488_718 / 3);
+                    assert_eq!(part_target_bytes, 3 * RANGE_PART);
+                    let need = (runs * blocks_per_run * run_block_bytes)
+                        .max(stream_estimate_bytes)
+                        + in_flight_bytes
+                        + part_target_bytes;
+                    assert!(
+                        need <= ceiling_bytes,
+                        "the read side fits U / 3: {need} {ceiling_bytes}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(run.report.level1_groups > 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 0);
         }
 
         /// The two-level fixture plus a 61st input of one record, in its own
