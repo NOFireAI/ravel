@@ -390,7 +390,8 @@ pub struct LoadReport {
     /// [`LoadReport::write_wait`] this partitions the loop's own wall clock into
     /// the two things it can be waiting on, so "the load is slow" resolves to a
     /// side without guessing: a large `decode_wait` means the decode stage
-    /// (span collection plus the `--decode-workers` builds) is the constraint, a large `write_wait` means the write path is.
+    /// (span collection plus the `--decode-workers` builds) is the
+    /// constraint, a large `write_wait` means the write path is.
     ///
     /// Bracketed on [`Instant`], not the injected `Clock`: these are
     /// measurements of the loader process, and a test clock (which the loader

@@ -2164,6 +2164,47 @@ moved from 1 to 4 later, for tenant isolation rather than throughput (ADR-2708
 D3). Every published ClickBench load figure predates both changes and
 needs re-measuring.
 
+### Bulk-load decode workers (issue #4210)
+
+A logs load's decode stage has two parts: collecting each batch's rows from
+the `--read-cursors` cursors, and building those rows into a columnar batch
+(`build_columnar_batch`). Collection stays on one thread, which reads the
+cursors and deals every batch's rows in the same order as before. The builds
+run on `--decode-workers` threads (W), and the built batches are handed to the
+shard writers strictly in the order they were dealt, so the batch sequence the
+writers see, and the objects they write, are the same at any W. A rejected
+row ends the sequence at the same point too: every batch dealt before it is
+handed on, and nothing after it. `1` builds on the decode thread
+itself, the pipeline before this flag. Unset, W is one worker per four
+available cores, at least 1 (`available_parallelism / 4`, from ADR-4203's
+stage 0 split of about one core of build per four of flush encode), so a
+four-core host keeps one worker. `0` is rejected. Metrics and spans loads have
+no build stage to spread; they ignore the flag and warn when it is set.
+
+Each batch's estimated size is charged to `--load-memory-bytes` before its
+build starts, at the bytes per row of the last batch handed on; the first batch
+builds alone, since nothing has measured a batch yet. At most W batches are
+dealt and not yet handed on at once, and fewer when the budget holds fewer
+estimated batches. The batch next in line waits for its charge; a later batch
+is built only if its charge fits now. When a batch is handed on, its charge is
+corrected to its built size. One exception keeps the oldest batch from being
+starved: if it outgrew its estimate and the growth does not fit while later
+batches hold their estimates, those estimates are refunded, and each later
+batch is charged its full built size when its turn comes instead.
+
+A batch's rows are views into its cursors' decoded Arrow, so a batch keeps up
+to K cursor buffers alive until its build ends. The memory floor counts them
+per worker: `128 MiB + W * K * 32 MiB + F * 72 MiB`, where K is the cursor
+count and F the concurrent flushes. Built batches are inside the budget, so
+the load's high-water mark is the floor plus the budget.
+
+The load summary prints `decode_wait` and `write_wait` once each, in seconds,
+and the report JSON carries them as `decode_wait_ms` and `write_wait_ms`
+(logs loads only). `decode_wait` is the time the submit loop waited for the
+decode stage's next batch; `write_wait` is the time it spent blocked resolving
+an in-flight write. This change claims no wall-time effect: the build now runs on W
+workers, and epic #4203 measures what that buys on a real corpus.
+
 ## Metrics (self-observability)
 
 `IngestMetrics` (crates/ravel-ingest/src/metrics.rs) exposes process-global
