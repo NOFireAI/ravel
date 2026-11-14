@@ -28,7 +28,14 @@ L0 -> L1 compaction goes. It changes no library behaviour.
 6. With the `profiling` feature and `RAVEL_BENCH_PROFILE_SVG` set, it samples
    the compaction call at 997 Hz. It writes a flamegraph, the top 15
    exclusive leaves, the top inclusive frames and the samples split by phase
-   using stack markers.
+   using stack markers. It also splits the samples by merge level, using
+   the `rlog::level1_worker` and `rlog::level2_worker` frames.
+7. With `--scratch-dir`, it lets the call take the ADR-3853 two-level merge
+   (issue #4141). The worker, run block and range knobs set the same
+   `CompactorConfig` fields as `ravel-cli maintain`'s flags of the same
+   names. The report splits the call's wall time and process CPU into
+   level 1 and level 2 at the compactor's events, and gives each level's
+   CPU per input record.
 
 One JSON document goes to stdout. A human-readable table goes to stderr.
 
@@ -63,12 +70,39 @@ The plain build is used for timing:
 cargo build --release -p ravel-bench --bin rlog_compaction_profile
 B=target/release/rlog_compaction_profile    # or $CARGO_TARGET_DIR/release/...
 
-$B                          # defaults: 230 inputs, compactor default zstd level (9)
+$B                          # defaults: 230 inputs, compactor default zstd level (3)
 $B --zstd-level 3           # L1 parts at zstd level 3
 $B --zstd-level 1
 $B --page-choice-ab         # plus the Exhaustive / Estimated re-encode
 $B --inputs 60              # smaller bucket; the realism band is not applied
 ```
+
+To take the two-level merge, give it a scratch directory and a resident
+ceiling below the bucket's resident need. With the ceiling at 4 GiB, the
+460-input bucket plans cursor mode and routes two-level (profile-4141.md):
+
+```sh
+S=.gate-logs/scratch        # local disk, never a tmpfs HOME
+$B --inputs 460 --scratch-dir $S --merge-resident-ceiling-bytes 4294967296
+$B ... --run-block-records 8192 --level1-workers 1 --level2-workers 2
+$B ... --level2-workers 1   # one level-2 worker, pipelined encode
+$B ... --range-records 1000000000000   # one range
+```
+
+| Flag | `CompactorConfig` field | Needs `--scratch-dir` |
+|---|---|---|
+| `--scratch-dir` | `scratch_dir` | |
+| `--merge-resident-ceiling-bytes` | `merge_resident_ceiling_bytes` | no |
+| `--level1-workers` | `level1_workers` | yes |
+| `--level2-workers` | `level2_workers` | yes |
+| `--run-block-records` | `rlog_run_block_target_records` | yes |
+| `--range-records` | `rlog_range_records` | no |
+
+The bin refuses (exit 2) a flag that needs a scratch directory without one,
+and a zero worker count, run block or range quantum, the same way the CLI
+does. Pinning one worker count leaves the other derived, and the joint
+derivation can move it: `--level2-workers 1` alone derives W1 = 2 on the
+460-input bucket. To change W2 alone, pin both.
 
 The profiled build needs frame pointers. Build it from `crates/ravel-bench`
 with `RUSTFLAGS` unset (see `crates/ravel-bench/PROFILING.md`):
@@ -119,8 +153,24 @@ Other knobs: `--streams`, `--min-streams-per-object`,
   - Memory: `peaks`, `memory_target_flushes`.
   - `timeline`: event times and store-operation unions per phase.
   - `request_ledger`: requests and wire bytes per phase.
+  - `two_level`:
+    - `route`: `two-level` or `single-level`.
+    - `two_level_events`: the count of "rlog two-level merge (ADR-3853)"
+      events.
+    - `event_fields`: that event's fields, among them W1, W2, group size,
+      runs, run blocks, ranges and encode builders.
+    - `ledger`: the request ledger's level-1 groups and workers, level-2
+      workers and ranges, and encode builders.
+    - `split`: `level1_wall_s`, `level1_cpu_s`, `level1_cpu_us_per_record`,
+      the same three for level 2, `plan_*`, `publish_*` and
+      `levels_share_of_process_cpu`. Level 1 runs from the first read-mode
+      event to the two-level event, so it includes the run catalog load and
+      the level-2 plan. Level 2 runs from there to "compaction merge
+      ended". Both divide by `records_in`. On a single-level run, the level
+      figures are null.
   - `profile`: null unless the run is profiled. When profiled, it holds
-    `samples`, `phases`, `leaf_exclusive_top15`,
+    `samples`, `phases`, `levels` (samples per merge level, each with its
+    own top 15 exclusive leaves), `leaf_exclusive_top15`,
     `inclusive_top10_distinct_below_95pct` and the other profile fields.
 - `page_choice_ab`: null, or two rows (Exhaustive, then Estimated). Each row
   has `bytes`, `l1_l0_ratio`, `encode_thread_cpu_s`, `encode_wall_s`,
@@ -150,6 +200,16 @@ The bin exits 1, after printing the document, when any of these is true:
   row has no bytes, ratio or encode CPU.
 - On a profiled run: there are no samples, or the phase, leaf or inclusive
   table is empty, or attribution failed (`ravel_bench::profiling`).
+- With `--scratch-dir` (`check_two_level`), any of these:
+  - the route is not two-level, or the two-level event did not fire exactly
+    once;
+  - one of the 7 `TWO_LEVEL_FIGURES` in `two_level.split` is not reported
+    exactly once with a positive value;
+  - the levels cover less than **0.80** of the process CPU, or more than
+    1.0;
+  - a given knob's value differs from the one in `run.config` or is missing
+    there, or, for the worker counts, differs from the event's or is
+    missing there.
 
 `realism_band_refuses_outside_8k_to_70k` checks the band's edges.
 
@@ -157,3 +217,9 @@ The bin exits 1, after printing the document, when any of these is true:
 
 - [profile-2026-11-05.md](profile-2026-11-05.md): the ADR-3853 T7
   measurement, re-run on 2026-11-06.
+- [profile-4141.md](profile-4141.md): two-level CPU per record by arm
+  (issue #4141, measured 2026-11-13 and 2026-11-14). At 460 inputs and
+  U = 4 GiB, the phase-B default costs 50.6 us/record at level 1 and 49.3
+  at level 2. Run block 8,192, the range cut and W1 up to 4 move neither
+  level by 10% or more. W2 = 1 with pipelined encode costs 25-30% more at
+  level 2. A single-level merge costs 53.8 us/record.
