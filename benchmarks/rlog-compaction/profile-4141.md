@@ -119,3 +119,23 @@ A run that fails a check is reported, not averaged.
 There are two profiled runs: arm A, and the arm whose CPU per record moves
 most against A. Each gives the top 15 exclusive leaves, overall and per
 level, and the leaves whose share moved by more than 2 percentage points.
+
+## Deviations from the pre-registration (decided after rep 1, 2026-11-14)
+
+- Arm C, as registered (`--level2-workers 1` alone), changed two variables.
+  With W2 fixed at 1, the joint derivation picks W1 = 2, which gives 28
+  level-1 groups instead of 13. Arm C1 (`--level1-workers 1
+  --level2-workers 1`) was added. It changes W2 alone. C stays in the table
+  as run.
+- Arm S, as registered (no scratch, default 20 GiB ceiling), would plan the
+  460-input bucket resident on a 15.2 GiB host. At an 8 GiB ceiling the bucket
+  plans cursor mode, and the single-level path refuses it with
+  `GeometryUnsupported { predicted_decoded_rows: 7754049402 }` (log
+  `refused-single8g-1`). S therefore runs the bench's standard 230-input
+  bucket (2,739,830 records, resident, single-level). That is below the
+  5M-record floor, and S is a reference only.
+- Arm F (`--level1-workers 4`) was added after rep 1. It is exploratory, not
+  pre-registered. It tests the parallel level-1 contention candidate, which
+  the registered arms never vary because the default derives W1 = 1 here.
+
+## Results
