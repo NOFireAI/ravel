@@ -381,6 +381,7 @@ impl Drop for MergeInFlight {
             bucket = %self.bucket,
             outcome = %self.outcome,
             level2_workers = report.level2_workers,
+            level2_workers_predicted = report.level2_workers_predicted,
             level2_ranges = report.level2_ranges,
             "compaction merge ended"
         );

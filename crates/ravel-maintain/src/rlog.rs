@@ -1671,9 +1671,8 @@ struct Level1InputCost {
     /// The [`pass_block_cost`] of each of its blocks, summed: what it adds to
     /// its group's run.
     decoded: u64,
-    /// The block with the highest of those costs per record, as its
-    /// `(cost, records)`.
-    block_rate: (u64, u64),
+    /// Each of its blocks that holds a record, as its `(cost, records)`.
+    block_rates: Vec<(u64, u64)>,
     /// Its candidate row groups, as [`candidate_group_extents`] gives them.
     extents: BTreeSet<(u64, u64)>,
 }
@@ -1693,29 +1692,52 @@ fn level1_input_bytes(catalog: &RlogInputCatalog) -> Result<Level1InputCost> {
         .iter()
         .fold(0u64, |a, (s, e)| a.saturating_add(e.saturating_sub(*s)));
     let mut decoded = 0u64;
-    let mut block_rate = (0u64, 1u64);
+    let mut block_rates = Vec::with_capacity(catalog.pricing.block_rows.len());
     #[cfg(test)]
     LEVEL1_PRICING.with(|c| c.set(c.get().block_walk()));
     for (block, &records) in catalog.pricing.block_rows.iter().enumerate() {
         let cost = pass_block_cost(&catalog.pricing, block)?;
         decoded = decoded.saturating_add(cost);
-        let records = u64::from(records);
-        if records > 0 && higher_rate((cost, records), block_rate) {
-            block_rate = (cost, records);
+        if records > 0 {
+            block_rates.push((cost, u64::from(records)));
         }
     }
     Ok(Level1InputCost {
         raw,
         decoded,
-        block_rate,
+        block_rates,
         extents,
     })
 }
 
-/// Whether `a`'s price per record, each a `(price, records)` pair, is above
-/// `b`'s.
-fn higher_rate(a: (u64, u64), b: (u64, u64)) -> bool {
-    u128::from(a.0) * u128::from(b.1) > u128::from(b.0) * u128::from(a.1)
+/// `a`'s price per record against `b`'s, each a `(price, records)` pair.
+fn rate_order(a: (u64, u64), b: (u64, u64)) -> std::cmp::Ordering {
+    (u128::from(a.0) * u128::from(b.1)).cmp(&(u128::from(b.0) * u128::from(a.1)))
+}
+
+/// The share of the input records, in percent, whose blocks
+/// [`level1_block_rate`] prices a run block from.
+const LEVEL1_RATE_RECORDS_PERCENT: u128 = 99;
+
+/// The input block rate a run block is predicted at before level 1 (ADR-3853,
+/// #4140 amendment): with `rates` ordered by price per record, the rate at
+/// which the cheapest blocks first hold [`LEVEL1_RATE_RECORDS_PERCENT`] of the
+/// records. A block over few records, whose fixed per-block terms make its
+/// rate the highest, holds too few records to set it; when every block is at
+/// one rate, it is that rate, the highest.
+fn level1_block_rate(mut rates: Vec<(u64, u64)>) -> (u64, u64) {
+    rates.retain(|&(_, records)| records > 0);
+    rates.sort_unstable_by(|a, b| rate_order(*a, *b));
+    let total: u128 = rates.iter().map(|&(_, r)| u128::from(r)).sum();
+    let wanted = (total * LEVEL1_RATE_RECORDS_PERCENT).div_ceil(100);
+    let mut held = 0u128;
+    for &rate in &rates {
+        held += u128::from(rate.1);
+        if held >= wanted {
+            return rate;
+        }
+    }
+    (0, 1)
 }
 
 /// Pricing walks a two-level merge made before level 1, for a test that each
@@ -1785,8 +1807,8 @@ struct Level1Shape {
     per_input: u64,
     /// `N`, the inputs level 1 cuts into groups.
     inputs: usize,
-    /// The input block with the highest pass price per record, as its
-    /// `(price, records)`: what a run block costs per record it holds.
+    /// The input block rate [`level1_block_rate`] prices a run block at, as
+    /// its `(price, records)`: what a run block costs per record it holds.
     block_rate: (u64, u64),
     /// The records a run block closes at,
     /// [`CompactorConfig::rlog_run_block_target_records`].
@@ -1809,7 +1831,7 @@ impl Level1Shape {
     }
 
     /// The predicted price of one level-2 block (ADR-3853 D5): the input
-    /// blocks' highest price per record at the records a run block holds, the
+    /// blocks' price per record at the records a run block holds, the
     /// run block target or a whole group's largest inputs if fewer.
     fn run_block_bytes(&self, group_size: u64) -> u64 {
         let (price, records) = self.block_rate;
@@ -1943,6 +1965,23 @@ impl LevelStop {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`usable_cores`] reports instead of asking the host, so a test's
+    /// core share does not move with the machine it runs on.
+    static USABLE_CORES_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The cores a two-level merge divides into its unit's core share.
+fn usable_cores() -> usize {
+    #[cfg(test)]
+    if let Some(cores) = USABLE_CORES_OVERRIDE.with(std::cell::Cell::get) {
+        return cores;
+    }
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
 #[cfg(test)]
@@ -2655,19 +2694,19 @@ async fn two_level_merge(
         .map(level1_input_bytes)
         .collect::<Result<Vec<_>>>()?;
     let per_input = costs.iter().map(Level1InputCost::total).max().unwrap_or(0);
-    let share = config.unit_core_share(
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-    );
+    let share = config.unit_core_share(usable_cores());
     let (workers, level2_workers) = match config.level1_workers {
         Some(workers) => (workers.max(1), None),
         None => {
             let shape = Level1Shape {
                 per_input,
                 inputs,
-                block_rate: costs
-                    .iter()
-                    .map(|c| c.block_rate)
-                    .fold((0, 1), |a, b| if higher_rate(b, a) { b } else { a }),
+                block_rate: level1_block_rate(
+                    costs
+                        .iter()
+                        .flat_map(|c| c.block_rates.iter().copied())
+                        .collect(),
+                ),
                 run_block_records: config.rlog_run_block_target_records as u64,
                 input_records: catalogs.iter().map(|c| c.record_count).max().unwrap_or(0),
                 in_flight: largest_in_flight(
@@ -2851,9 +2890,10 @@ struct TwoLevelLayout {
     workers: usize,
     /// `U / W1`, each worker's resident ceiling.
     worker_ceiling: u64,
-    /// `W2` as [`derive_level_workers`] predicted it; `None` when
-    /// [`CompactorConfig::level1_workers`] is configured and no pair was
-    /// derived.
+    /// `W2` as [`derive_level_workers`] predicted it, or the configured one it
+    /// kept; `None` when [`CompactorConfig::level1_workers`] is configured and
+    /// no pair was derived. Level 2 re-derives its own after level 1
+    /// ([`level2_worker_count`]); this is only reported beside it.
     level2_workers: Option<usize>,
     need: u64,
     free: u64,
@@ -3685,23 +3725,38 @@ fn level2_streams(
 }
 
 /// What level 2's worker count is checked against (ADR-3853 D5): one worker's
-/// read side, `need`, under the unit's `ceiling`, and the `W2` the joint
-/// derivation predicted before level 1 ran.
+/// read side, `need`, measured over the runs level 1 wrote, under the unit's
+/// `ceiling`, and the unit's core `share`.
 struct Level2Fit {
     need: u64,
     ceiling: u64,
-    predicted: usize,
+    share: usize,
+}
+
+/// The `W2` level 2 starts from (ADR-3853, #4140 amendment): a configured
+/// [`CompactorConfig::level2_workers`] as it is, otherwise re-derived from the
+/// measured read side, `min(share, ceiling / need)`; either capped at the
+/// `ranges` level 1's tally cut, and at least 1. The joint derivation's
+/// prediction is not an input: it priced the runs before they existed.
+fn level2_worker_count(configured: Option<usize>, fit: &Level2Fit, ranges: usize) -> usize {
+    configured
+        .unwrap_or_else(|| {
+            let most = usize::try_from(fit.ceiling / fit.need.max(1)).unwrap_or(usize::MAX);
+            fit.share.min(most)
+        })
+        .min(ranges)
+        .max(1)
 }
 
 /// `W2` and each range worker's plan, over its own streams under
 /// `ceiling / W2` (ADR-3853 D5 amendment). A configured
 /// [`CompactorConfig::level2_workers`] is taken as it is, capped at the range
 /// count, and refused through `refuse` with the worker ceiling when one
-/// worker's read side or plan does not fit it. A derived one is the predicted
-/// `W2`, capped at what the measured read side fits and at the range count,
-/// and lowered one worker at a time until every plan fits; it is refused only
-/// when one worker does not fit the whole ceiling. `whole` is the plan over
-/// every stream under the whole ceiling, the one worker's plan at `W2 = 1`.
+/// worker's read side or plan does not fit it. A derived one starts from
+/// [`level2_worker_count`] and is lowered one worker at a time until every
+/// plan fits; it is refused only when one worker does not fit the whole
+/// ceiling. `whole` is the plan over every stream under the whole ceiling,
+/// the one worker's plan at `W2 = 1`.
 #[allow(clippy::too_many_arguments)]
 fn level2_plans(
     config: &CompactorConfig,
@@ -3714,12 +3769,7 @@ fn level2_plans(
     refuse: impl Fn(u64) -> MaintainError,
 ) -> Result<(usize, Vec<MergePlan>)> {
     let derived = config.level2_workers.is_none();
-    let most = usize::try_from(fit.ceiling / fit.need.max(1)).unwrap_or(usize::MAX);
-    let mut workers = config
-        .level2_workers
-        .unwrap_or_else(|| fit.predicted.min(most))
-        .min(ranges.len())
-        .max(1);
+    let mut workers = level2_worker_count(config.level2_workers, &fit, ranges.len());
     let floor = config.rlog_memory_target_bytes();
     let mut whole = Some(whole);
     loop {
@@ -4233,7 +4283,7 @@ async fn merge_in_unit(
         Level2Fit {
             need,
             ceiling,
-            predicted: layout.level2_workers.unwrap_or(layout.share),
+            share: layout.share,
         },
         plan,
         |ceiling_bytes| MaintainError::MergeTwoLevelUnsupported {
@@ -4249,9 +4299,16 @@ async fn merge_in_unit(
     } else {
         1
     };
+    // The joint derivation's `W2`, kept beside the re-derived one only where
+    // they differ; zero when they agree or when `W2` was configured.
+    let level2_workers_predicted = layout
+        .level2_workers
+        .filter(|&p| config.level2_workers.is_none() && p != level2_workers)
+        .unwrap_or(0);
     if let Some(l) = &ledger {
         l.record_encode_builders(builders as u64);
         l.record_level2_ranges(level2_workers as u64, range_count);
+        l.record_level2_workers_predicted(level2_workers_predicted as u64);
     }
     let level2_mode = plans.first().map_or("none", |p| p.mode.name());
     tracing::info!(
@@ -4274,6 +4331,7 @@ async fn merge_in_unit(
         level1_workers = layout.workers,
         level1_ceiling_bytes = layout.worker_ceiling,
         level2_workers,
+        level2_workers_predicted,
         level2_ranges = range_count,
         level2_ceiling_bytes = level2_ceiling,
         encode_builders = builders,
@@ -18141,6 +18199,111 @@ mod tests {
             assert!(scratch_entries(&dir).is_empty());
         }
 
+        /// The two-level fixture plus a 61st input of one record, in its own
+        /// block: the fixed per-block terms of [`pass_block_cost`] over one
+        /// record make that block the inputs' highest price per record.
+        fn outlier_block_inputs() -> Vec<L0Input> {
+            let mut inputs = two_level_inputs();
+            inputs.push(L0Input {
+                records: vec![record(
+                    7,
+                    1_005,
+                    "outlier s7",
+                    vec![("k".to_string(), AttrValue::I64(0))],
+                )],
+                cfg: stream_blocked_cfg(TWO_LEVEL_RUN_BLOCK),
+                clustering: None,
+            });
+            inputs
+        }
+
+        /// ADR-3853, #4140 amendment: one input whose block is costly over few
+        /// records moves neither the prediction before level 1 nor `W2` after
+        /// it. The two-level fixture and the same fixture with
+        /// [`outlier_block_inputs`]'s extra input, under 4 cores and a
+        /// ceiling of twice the G = 11 one, both write 3 runs of the same run
+        /// blocks within a few bytes. Level 2 re-derives `W2` from those runs,
+        /// 4 for both, above the 3 predicted before level 1; the report keeps
+        /// the 3 beside it. A configured `W2` of 2 is used unchanged for both.
+        #[tokio::test]
+        async fn an_outlier_input_block_moves_no_level2_worker_count() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &outlier_block_inputs()).await;
+            let mut rates = Vec::new();
+            for catalog in &catalogs_of(&probe, &keys).await {
+                rates.extend(level1_input_bytes(catalog).expect("price").block_rates);
+            }
+            let highest = rates
+                .iter()
+                .copied()
+                .max_by(|a, b| rate_order(*a, *b))
+                .expect("rates");
+            assert_eq!(highest.1, 1, "the outlier's one-record block: {highest:?}");
+            let priced = level1_block_rate(rates);
+            assert_eq!(priced.1, TWO_LEVEL_RUN_BLOCK as u64, "{priced:?}");
+            assert!(
+                u128::from(highest.0) * u128::from(priced.1)
+                    > 10 * u128::from(priced.0) * u128::from(highest.1),
+                "the outlier's rate is over 10x the priced one: {highest:?} {priced:?}"
+            );
+
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let ceiling = 2 * group_ceiling(per_input, TWO_LEVEL_RUN_TARGET, 11);
+            USABLE_CORES_OVERRIDE.with(|c| c.set(Some(4)));
+            let mut seen = Vec::new();
+            for configured in [None, Some(2)] {
+                for (outlier, inputs) in
+                    [(false, two_level_inputs()), (true, outlier_block_inputs())]
+                {
+                    let store = ProbeStore::new();
+                    seed_inputs(&store, &inputs).await;
+                    let dir =
+                        fresh_scratch(&format!("outlier-w2-{outlier}-{}", configured.unwrap_or(0)));
+                    let config = CompactorConfig {
+                        rlog_range_records: RANGE_QUANTUM,
+                        level2_workers: configured,
+                        ..two_level_config(ceiling, TWO_LEVEL_RUN_TARGET, Some(dir.clone()))
+                    };
+                    let (outcome, run) = compact_logged(&store, &config).await;
+                    assert!(
+                        matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                        "outlier {outlier}, configured {configured:?}: {outcome:?}"
+                    );
+                    let line = run.line("rlog two-level merge");
+                    assert_eq!(log_field(&line, "level2_ranges"), 4, "{line}");
+                    assert_eq!(
+                        log_field(&line, "level2_workers_predicted"),
+                        run.report.level2_workers_predicted,
+                        "{line}"
+                    );
+                    seen.push((
+                        configured,
+                        log_field(&line, "level1_workers"),
+                        log_field(&line, "runs"),
+                        log_field(&line, "run_block_bytes"),
+                        run.report.level2_workers,
+                        run.report.level2_workers_predicted,
+                    ));
+                    assert!(scratch_entries(&dir).is_empty());
+                }
+            }
+            USABLE_CORES_OVERRIDE.with(|c| c.set(None));
+            for pair in seen.chunks(2) {
+                let [(configured, w1, runs, block, w2, predicted), outlier] = pair else {
+                    panic!("{seen:?}");
+                };
+                assert_eq!((outlier.1, outlier.2), (*w1, *runs), "{seen:?}");
+                assert!(block.abs_diff(outlier.3) <= 8, "{seen:?}");
+                assert_eq!((outlier.4, outlier.5), (*w2, *predicted), "{seen:?}");
+                match configured {
+                    None => assert_eq!((*w1, *runs, *w2, *predicted), (1, 3, 4, 3), "{seen:?}"),
+                    Some(n) => assert_eq!((*w2, *predicted), (*n as u64, 0), "{seen:?}"),
+                }
+            }
+        }
+
         /// The part indexes of every L1 part object on `store`, published or
         /// not, ascending.
         async fn l1_part_indexes(store: &dyn ObjectStoreBackend) -> Vec<u32> {
@@ -19231,6 +19394,111 @@ mod tests {
             assert_eq!(derive_level_workers(&defaults, 8, None), Some((1, 1)));
         }
 
+        /// ADR-3853, #4140 amendment, at hour 498272's geometry (M1, issue
+        /// #4140): 24,239 and 24,719 inputs, `W1` 6 and 2 as M1 chose them,
+        /// measured run blocks of 3,776,885 and 3,800,408 bytes, and `U` of 20
+        /// GiB, with the per-input cost, reads in flight and final part
+        /// target of the #3943 shape and 32 cores, which M1 does not report.
+        /// Level 2 re-derives `W2` from the runs: 4 and 8, where M1 ran 5 and
+        /// 2. A configured count is used unchanged, capped only at the
+        /// ranges.
+        #[test]
+        fn level2_rederives_its_workers_from_the_measured_runs() {
+            const GIB: u64 = 1 << 30;
+            let ceiling = 20 * GIB;
+            let tail = 54_132_381 + 1_572_864_000;
+            let need = |inputs: u64, w1: u64, run_block: u64| {
+                let group = level1_group_size(50_000_000, 256 << 20, ceiling / w1, inputs as usize);
+                let runs = inputs.div_ceil(group);
+                (group, runs, runs * LEVEL2_BLOCKS_PER_RUN * run_block + tail)
+            };
+            let shard0 = need(24_239, 6, 3_776_885);
+            let shard1 = need(24_719, 2, 3_800_408);
+            assert_eq!(shard0, (66, 368, 4_406_783_741));
+            assert_eq!(shard1, (209, 119, 2_531_493_485));
+            let fit = |need: u64| Level2Fit {
+                need,
+                ceiling,
+                share: 32,
+            };
+            assert_eq!(level2_worker_count(None, &fit(shard0.2), usize::MAX), 4);
+            assert_eq!(level2_worker_count(None, &fit(shard1.2), usize::MAX), 8);
+            assert_eq!(
+                level2_worker_count(None, &fit(shard1.2), 3),
+                3,
+                "the ranges"
+            );
+            assert_eq!(level2_worker_count(None, &fit(ceiling + 1), 97), 1);
+            let share = Level2Fit {
+                share: 6,
+                ..fit(shard1.2)
+            };
+            assert_eq!(level2_worker_count(None, &share, usize::MAX), 6);
+            for configured in [1, 2, 5, 9] {
+                assert_eq!(
+                    level2_worker_count(Some(configured), &fit(shard1.2), 97),
+                    configured
+                );
+                assert_eq!(
+                    level2_worker_count(Some(configured), &fit(ceiling + 1), 97),
+                    configured,
+                    "a configured count is refused by its plans, not lowered"
+                );
+            }
+            assert_eq!(level2_worker_count(Some(9), &fit(shard1.2), 4), 4);
+        }
+
+        /// ADR-3853, #4140 amendment: the run block is priced at the rate under
+        /// which the cheapest blocks hold 99% of the input records, so a block
+        /// over few records does not set it, and a rate that every block
+        /// shares, an outlier's included, is the rate. Constraint (a) never
+        /// reads the rate, so the level-1 groups of the `W1` either price
+        /// derives fit `U / W1`.
+        #[test]
+        fn level1_block_rate_leaves_out_blocks_over_few_records() {
+            let mut rates = vec![(21_733, 40); 59];
+            rates.push((5_984, 1));
+            assert_eq!(level1_block_rate(rates.clone()), (21_733, 40));
+            assert_eq!(level1_block_rate(vec![(5_984, 1); 60]), (5_984, 1));
+            assert_eq!(level1_block_rate(vec![(1_000, 98), (5_000, 2)]), (5_000, 2));
+            assert_eq!(
+                level1_block_rate(vec![(1_000, 99), (5_000, 1)]),
+                (1_000, 99)
+            );
+            assert_eq!(level1_block_rate(vec![(9, 0)]), (0, 1));
+            assert_eq!(level1_block_rate(Vec::new()), (0, 1));
+            assert_eq!(
+                level1_block_rate(vec![(u64::MAX, u64::MAX); 3]),
+                (u64::MAX, u64::MAX)
+            );
+
+            const GIB: u64 = 1 << 30;
+            for block_rate in [(21_733 * 1_024, 40 * 1_024), (5_984 * 1_024, 1_024)] {
+                let shape = Level1Shape {
+                    per_input: 50_000_000,
+                    inputs: 19_177,
+                    block_rate,
+                    run_block_records: 1_024,
+                    input_records: 1 << 40,
+                    in_flight: 54_132_381,
+                    run_target: 256 << 20,
+                    part_target: 1_572_864_000,
+                    ceiling: 20 * GIB,
+                };
+                let (w1, _) = derive_level_workers(&shape, 32, None).expect("a pair");
+                let group = level1_group_size(
+                    shape.per_input,
+                    shape.run_target,
+                    shape.ceiling / w1 as u64,
+                    shape.inputs,
+                );
+                assert!(
+                    group * shape.per_input + shape.run_target <= shape.ceiling / w1 as u64,
+                    "{block_rate:?}: W1 {w1}, G {group}"
+                );
+            }
+        }
+
         /// ADR-3853 D4 and D3 at the production shape: 32 cores, 4 units of
         /// 5 GiB at once or one of 20 GiB, 256 MiB run targets, the
         /// 19,177-input bucket. `(W1, W2)` minimise `1/W1 + 1/W2` with each
@@ -19679,17 +19947,16 @@ mod tests {
             let (oracle, _, per_input) = single_level_oracle().await;
             let probe = ProbeStore::new();
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
-            let mut block_rate = (0u64, 1u64);
+            let mut rates = Vec::new();
             let mut input_records = 0u64;
             let mut lens = Vec::new();
             for catalog in &catalogs_of(&probe, &keys).await {
                 let cost = level1_input_bytes(catalog).expect("price");
-                if higher_rate(cost.block_rate, block_rate) {
-                    block_rate = cost.block_rate;
-                }
+                rates.extend(cost.block_rates.iter().copied());
                 input_records = input_records.max(catalog.record_count);
                 lens.extend(cost.extents.iter().map(|(s, e)| e - s));
             }
+            let block_rate = level1_block_rate(rates);
             let in_flight =
                 largest_in_flight(lens, CompactorConfig::default().input_read_concurrency);
             let predicted_tail = in_flight + TWO_LEVEL_PART;
