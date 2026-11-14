@@ -14,8 +14,8 @@ use ravel_segment::{
     SampleProvenance, SeriesEntry, SeriesEntryV4, ValPageKind, ValueKind, check_identity,
     decode_catalog_matching_v4_charged, decode_catalog_v4_charged, decode_catalog_v5_charged,
     decode_catalog_v5_chunked_charged, decode_catalog_v5_chunked_matching_charged,
-    decode_run_histogram_pages, decode_run_pages_soa, label_dict_holds_all, open_from_suffix,
-    plan_ranges_v4,
+    decode_run_histogram_pages, decode_run_pages_soa, hist_page_heap_bound, label_dict_holds_all,
+    open_from_suffix, page_payload_len, plan_ranges_v4,
 };
 use ravel_types::accounting::{AccessIntent, AccountedOp, QueryAccounting};
 
@@ -1456,9 +1456,16 @@ pub(crate) struct BatchObservation {
     pub(crate) batch_owned: u64,
     /// Series the batch fetched.
     pub(crate) series: usize,
-    /// Bytes the batch's decode reserves once its pages are in, not yet
-    /// counted in `budget_reserved`.
+    /// Bytes the batch's decode groups reserve once its pages are in, summed;
+    /// not yet counted in `budget_reserved`.
     pub(crate) decoded_len: u64,
+    /// Groups the batch decodes in, one reservation each.
+    pub(crate) decode_groups: usize,
+    /// What the first group reserves, the first decode reservation the
+    /// batch requests.
+    pub(crate) first_group_charge: u64,
+    /// The largest reservation of a group holding more than one series, or 0.
+    pub(crate) largest_shared_group_charge: u64,
 }
 
 impl SegmentFetcher {
@@ -2990,6 +2997,10 @@ impl SegmentFetcher {
         let samples =
             decode_run_histogram_pages(series_id, run, &ts_bytes, &hist_bytes, self.limits)
                 .map_err(|source| corrupt(key, source))?;
+        // Exact, so the columns hold the `decoded_units_len` charge rather
+        // than a doubled capacity.
+        timestamps.reserve_exact(samples.len());
+        values.reserve_exact(samples.len());
         let mut added_bytes: u64 = 0;
         for sample in samples {
             added_bytes = added_bytes.saturating_add(8 + histogram_value_footprint(&sample.value));
@@ -3133,50 +3144,66 @@ impl SegmentFetcher {
             .await?;
             // The decoded runs are charged before they are built and held
             // until the sink has folded them (issue #4118): a page batch
-            // decodes to far more than its stored bytes.
-            let decoded_len = scalar_entries
+            // decodes to far more than its stored bytes. A histogram series is
+            // charged its span and bucket vectors too, bounded from its fetched
+            // pages' headers (issue #4198), so the batch decodes in groups that
+            // each reserve at most `batch_bytes`.
+            let scalar_len = scalar_entries
                 .iter()
-                .chain(histogram_entries)
                 .map(|entry| decoded_units_len(entry, level_is_l0))
                 .fold(0, u64::saturating_add);
-            #[cfg(test)]
-            self.observe_batch(
-                &regions,
+            let groups = decode_groups(
+                scalar_len,
+                !scalar_entries.is_empty(),
+                histogram_entries,
+                histogram_plans,
                 &batch_regions,
-                scalar_entries.len() + histogram_entries.len(),
-                decoded_len,
-            );
-            let decoded_reservation = self.reserve_fetch(decoded_len)?;
-            let scalar_out = if scalar_entries.is_empty() {
-                Vec::new()
-            } else {
-                let (out, batch_stats) = self.build_scalar_decodes(
-                    key,
-                    seg_ref,
-                    scalar_entries,
-                    scalar_plans,
-                    &batch_regions,
-                    count_stats,
-                    accounting.scan(),
-                )?;
-                stats.raw_f64_pages += batch_stats.raw_f64_pages;
-                stats.raw_f64_bytes += batch_stats.raw_f64_bytes;
-                out
-            };
-            let histogram_out = if histogram_entries.is_empty() {
-                Vec::new()
-            } else {
-                self.build_histogram_decodes(
-                    key,
-                    seg_ref,
-                    histogram_entries,
-                    histogram_plans,
-                    &batch_regions,
-                    accounting.scan(),
-                )?
-            };
-            sink(scalar_out, histogram_out)?;
-            drop(decoded_reservation);
+                level_is_l0,
+                self.limits,
+                batch_bytes,
+            )
+            .map_err(|source| corrupt(key, source))?;
+            #[cfg(test)]
+            self.observe_batch(&regions, &batch_regions, scalar_entries.len(), &groups);
+            for group in groups {
+                let decoded_reservation = self.reserve_fetch(group.charge)?;
+                let scalar_out = if group.with_scalar {
+                    let (out, batch_stats) = self.build_scalar_decodes(
+                        key,
+                        seg_ref,
+                        scalar_entries,
+                        scalar_plans,
+                        &batch_regions,
+                        count_stats,
+                        accounting.scan(),
+                    )?;
+                    stats.raw_f64_pages += batch_stats.raw_f64_pages;
+                    stats.raw_f64_bytes += batch_stats.raw_f64_bytes;
+                    out
+                } else {
+                    Vec::new()
+                };
+                let group_entries = histogram_entries
+                    .get(group.histogram)
+                    .ok_or_else(out_of_bounds)?;
+                let histogram_out = if group_entries.is_empty() {
+                    Vec::new()
+                } else {
+                    let group_plans = histogram_plans
+                        .get(group.histogram_plans)
+                        .ok_or_else(out_of_bounds)?;
+                    self.build_histogram_decodes(
+                        key,
+                        seg_ref,
+                        group_entries,
+                        group_plans,
+                        &batch_regions,
+                        accounting.scan(),
+                    )?
+                };
+                sink(scalar_out, histogram_out)?;
+                drop(decoded_reservation);
+            }
             drop(batch_regions);
         }
         Ok(stats)
@@ -3188,10 +3215,12 @@ impl SegmentFetcher {
         &self,
         segment: &FetchedRegions,
         batch: &FetchedRegions,
-        series: usize,
-        decoded_len: u64,
+        scalar_series: usize,
+        groups: &[DecodeGroup],
     ) {
         if let Some(probe) = &self.batch_probe {
+            let group_series =
+                |g: &DecodeGroup| usize::from(g.with_scalar) * scalar_series + g.histogram.len();
             probe
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3200,8 +3229,16 @@ impl SegmentFetcher {
                     segment_reserved: segment.reserved_bytes(),
                     batch_reserved: batch.reserved_bytes(),
                     batch_owned: batch.owned_bytes(),
-                    series,
-                    decoded_len,
+                    series: groups.iter().map(|g| g.histogram.len()).sum::<usize>() + scalar_series,
+                    decoded_len: groups.iter().map(|g| g.charge).sum(),
+                    decode_groups: groups.len(),
+                    first_group_charge: groups.first().map_or(0, |g| g.charge),
+                    largest_shared_group_charge: groups
+                        .iter()
+                        .filter(|g| group_series(g) > 1)
+                        .map(|g| g.charge)
+                        .max()
+                        .unwrap_or(0),
                 });
         }
     }
@@ -4252,10 +4289,11 @@ fn coalesced_batch_bytes(sections: &[SectionSpan; 3], gap: u64) -> u64 {
 /// carries a per-sample provenance column, its [`SamplePriority`]; per
 /// emitted unit (one per series on L0, one per run on L1) the unit itself
 /// and its copy of the series' labels. A histogram sample is charged its
-/// timestamp and inline [`HistogramValue`] twice, since a run's decode builds its samples
-/// once before splitting them into the unit's columns; the span and bucket
-/// vectors a histogram value points to are not counted here, and are charged
-/// by the fold that holds them.
+/// timestamp and inline [`HistogramValue`] twice, since a run's decode builds
+/// its samples once before splitting them into the unit's columns. The span
+/// and bucket vectors a histogram value points to are not counted here: they
+/// depend on the series' fetched pages, and [`decode_groups`] adds their bound
+/// before the decode.
 fn decoded_units_len(entry: &SeriesEntryV4, level_is_l0: bool) -> u64 {
     let histogram = entry.entry.value_kind == ValueKind::Histogram;
     let (sample_bytes, unit_bytes) = if histogram {
@@ -4296,6 +4334,102 @@ fn decoded_units_len(entry: &SeriesEntryV4, level_is_l0: bool) -> u64 {
         acc.saturating_add(u64::from(run.sample_count).saturating_mul(per_sample as u64))
     });
     units.saturating_mul(per_unit).saturating_add(samples)
+}
+
+/// One reservation of a fetched page batch's decode: the batch's scalar
+/// series when `with_scalar`, and a run of its histogram series, as index
+/// ranges into the batch's histogram series and their plans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodeGroup {
+    with_scalar: bool,
+    histogram: std::ops::Range<usize>,
+    histogram_plans: std::ops::Range<usize>,
+    /// Bytes the group's decode reserves before it runs.
+    charge: u64,
+}
+
+/// Splits a fetched page batch's decode into consecutive groups, each charged
+/// before it decodes and released once the sink has taken its units.
+///
+/// `scalar_len` is the batch's scalar series' [`decoded_units_len`], carried
+/// by the first group. A histogram series adds its [`decoded_units_len`] and,
+/// per run, the [`hist_page_heap_bound`] of its HIST page's payload: the
+/// span, bucket and custom-bound vectors its values hold once decoded. A group
+/// also charges the largest decompression buffer any of its runs allocates,
+/// the run's TS or HIST payload: a run's decode holds one of the two at a
+/// time, and runs decode one after another. Payload lengths are read from the
+/// fetched pages' headers ([`page_payload_len`]) and capped at the reader's
+/// page limit, past which the decode refuses a page before allocating.
+///
+/// A group is cut before a histogram series that would take its charge past
+/// `batch_bytes`, and a series over `batch_bytes` on its own is a group
+/// alone, so an L0 batch, at `u64::MAX`, is one group.
+#[allow(clippy::too_many_arguments)]
+fn decode_groups(
+    scalar_len: u64,
+    has_scalar: bool,
+    histogram: &[&SeriesEntryV4],
+    histogram_plans: &[ravel_segment::PlannedRunRange],
+    regions: &FetchedRegions,
+    level_is_l0: bool,
+    limits: ReaderLimits,
+    batch_bytes: u64,
+) -> Result<Vec<DecodeGroup>, ravel_segment::SegmentError> {
+    use ravel_segment::SegmentError;
+    let payload_len = |(offset, len): (u64, u64)| {
+        let page = regions
+            .slice(offset, len)
+            .ok_or(SegmentError::SectionOutOfBounds)?;
+        Ok::<u64, SegmentError>(page_payload_len(&page)?.min(limits.max_page_uncompressed_bytes))
+    };
+    let mut groups = Vec::new();
+    let mut current = DecodeGroup {
+        with_scalar: has_scalar,
+        histogram: 0..0,
+        histogram_plans: 0..0,
+        charge: scalar_len,
+    };
+    let (mut held, mut buffer) = (scalar_len, 0u64);
+    let mut plan = 0usize;
+    for (i, entry) in histogram.iter().enumerate() {
+        let end = plan
+            .checked_add(entry.runs.len())
+            .ok_or(SegmentError::SectionOutOfBounds)?;
+        let plans = histogram_plans
+            .get(plan..end)
+            .ok_or(SegmentError::SectionOutOfBounds)?;
+        let mut series_held = decoded_units_len(entry, level_is_l0);
+        let mut series_buffer = 0u64;
+        for (run, p) in entry.runs.iter().zip(plans) {
+            let hist = payload_len(p.hist_range)?;
+            series_held = series_held.saturating_add(hist_page_heap_bound(hist, run.sample_count));
+            series_buffer = series_buffer.max(payload_len(p.ts_range)?).max(hist);
+        }
+        let joined_held = held.saturating_add(series_held);
+        let joined_buffer = buffer.max(series_buffer);
+        let current_is_empty = !current.with_scalar && current.histogram.is_empty();
+        if !current_is_empty && joined_held.saturating_add(joined_buffer) > batch_bytes {
+            let next = DecodeGroup {
+                with_scalar: false,
+                histogram: i..i,
+                histogram_plans: plan..plan,
+                charge: 0,
+            };
+            groups.push(std::mem::replace(&mut current, next));
+            (held, buffer) = (series_held, series_buffer);
+        } else {
+            (held, buffer) = (joined_held, joined_buffer);
+        }
+        current.histogram.end = i + 1;
+        current.histogram_plans.end = end;
+        current.charge = held.saturating_add(buffer);
+        plan = end;
+    }
+    if plan != histogram_plans.len() {
+        return Err(SegmentError::SectionOutOfBounds);
+    }
+    groups.push(current);
+    Ok(groups)
 }
 
 /// Cuts `wanted` (catalog order) into consecutive batches of whole series
@@ -6266,6 +6400,28 @@ mod tests {
         }
     }
 
+    /// A histogram of one positive span holding `positive`'s buckets.
+    fn wide_hist_value(positive: Vec<u64>, sum: f64) -> HistogramValue {
+        HistogramValue {
+            scale: 2,
+            zero_threshold: 1e-9,
+            sum: Some(sum),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: u32::try_from(positive.len()).expect("span length"),
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: positive.iter().sum(),
+                positive,
+                negative: vec![],
+            },
+            reset_hint: ResetHint::Unknown,
+        }
+    }
+
     fn hist_series(metric: &str, samples: Vec<HistogramSample>) -> SeriesInputV3 {
         let label_set = labels(metric);
         let tenant_id = ravel_types::TenantId::new("t".to_string());
@@ -8198,6 +8354,17 @@ mod tests {
         samples: usize,
         histograms: bool,
     ) -> (Bytes, TenantHash, SegmentRef) {
+        batched_l1_segment_of(count, samples, histograms, 1)
+    }
+
+    /// [`batched_l1_segment`] whose histograms hold `buckets` positive buckets
+    /// in one span; one bucket is [`hist_value`]'s shape.
+    fn batched_l1_segment_of(
+        count: usize,
+        samples: usize,
+        histograms: bool,
+        buckets: usize,
+    ) -> (Bytes, TenantHash, SegmentRef) {
         let tenant_hash = TenantHash([15u8; 16]);
         let identity = SegmentIdentity {
             tenant_hash: tenant_hash.0,
@@ -8243,7 +8410,14 @@ mod tests {
                             .iter()
                             .map(|&ts_ns| HistogramSample {
                                 ts_ns,
-                                value: hist_value(1 + next() % 50, (next() % 1_000) as f64),
+                                value: if buckets == 1 {
+                                    hist_value(1 + next() % 50, (next() % 1_000) as f64)
+                                } else {
+                                    wide_hist_value(
+                                        (0..buckets).map(|_| next() % 50).collect(),
+                                        (next() % 1_000) as f64,
+                                    )
+                                },
                             })
                             .collect(),
                     )
@@ -8468,10 +8642,11 @@ mod tests {
                 b.batch_reserved
             );
             assert!(
-                b.series == 1 || b.decoded_len <= batch_bytes,
-                "batch {i}: {} series decode to {} B, over fetch_batch_bytes ({batch_bytes} B)",
+                b.largest_shared_group_charge <= batch_bytes,
+                "batch {i}: a group of its {} series decodes to {} B, over fetch_batch_bytes \
+                 ({batch_bytes} B)",
                 b.series,
-                b.decoded_len
+                b.largest_shared_group_charge
             );
         }
         let series: Vec<usize> = batched.batches.iter().map(|b| b.series).collect();
@@ -8744,6 +8919,10 @@ mod tests {
         );
         let first = whole.batches[0];
         assert!(first.decoded_len > 0);
+        assert_eq!(
+            first.decode_groups, 1,
+            "a scalar batch decodes as one group"
+        );
         let limit = first.budget_reserved + first.decoded_len - 1;
         let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
         let refused = batch_run(&bytes, tenant_hash, &seg_ref, &[], |f| {
@@ -8767,6 +8946,113 @@ mod tests {
             "no page was decoded"
         );
         assert_eq!(budget.reserved(), 0, "the refusal holds nothing");
+    }
+
+    /// Positive buckets per histogram of the issue #4198 fixtures: each
+    /// sample's span and bucket vectors hold more than its inline value.
+    const WIDE_BUCKETS: usize = 64;
+
+    /// Issue #4198: a histogram series' decode is charged its span and bucket
+    /// vectors, bounded from its fetched pages, before it runs. Every fourth
+    /// series of the part is a histogram of [`WIDE_BUCKETS`] buckets in one
+    /// span. The one batch's decode charge covers every sample's inline
+    /// columns and those vectors, and a budget one byte short of it refuses
+    /// with that figure before any page is decoded.
+    #[tokio::test]
+    async fn a_histogram_batch_charges_its_buckets_before_it_decodes() {
+        const COUNT: usize = 16;
+        const SAMPLES: usize = 64;
+        let (bytes, tenant_hash, seg_ref) =
+            batched_l1_segment_of(COUNT, SAMPLES, true, WIDE_BUCKETS);
+        let one_batch = |f: SegmentFetcher| ranged_l1(f).with_fetch_batch_floor(u64::MAX);
+        let whole = batch_run(&bytes, tenant_hash, &seg_ref, &[], one_batch).await;
+        assert_eq!(whole.batches.len(), 1);
+        let first = whole.batches[0];
+        assert_eq!(first.decode_groups, 1, "an unbounded batch is one group");
+        assert_eq!(first.first_group_charge, first.decoded_len);
+        let histogram_samples = (COUNT / 4 * SAMPLES) as u64;
+        let scalar_samples = (COUNT * SAMPLES) as u64 - histogram_samples;
+        let inline = scalar_samples * 16
+            + histogram_samples * (16 + 2 * std::mem::size_of::<HistogramValue>() as u64);
+        // One span and WIDE_BUCKETS counts, 8 bytes each, per histogram.
+        let heap = histogram_samples * 8 * (1 + WIDE_BUCKETS as u64);
+        assert!(
+            first.decoded_len >= inline + heap,
+            "the decode charge {} B covers the columns ({inline} B) and the span and bucket \
+             vectors ({heap} B)",
+            first.decoded_len
+        );
+        let limit = first.budget_reserved + first.decoded_len - 1;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let refused = batch_run(&bytes, tenant_hash, &seg_ref, &[], |f| {
+            one_batch(f).with_memory_budget(Arc::clone(&budget))
+        })
+        .await;
+        match &refused.decoded {
+            Err(FetchError::FetchMemoryExhausted { requested, .. }) => {
+                assert_eq!(*requested, first.decoded_len, "the batch's decode charge");
+            }
+            other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            refused.phases.scan.decompressed_bytes, 0,
+            "no page was decoded"
+        );
+        assert_eq!(budget.reserved(), 0, "the refusal holds nothing");
+    }
+
+    /// Issue #4198: a batch whose pages and inline columns fit
+    /// `fetch_batch_bytes` but whose span and bucket vectors take its decode
+    /// past it decodes in groups, one at a time, each reserving at most
+    /// `fetch_batch_bytes` unless it holds a single series, and answers
+    /// bitwise what the one-group decode answers. The budget holds the
+    /// batch's pages and one group, not the whole decode.
+    #[tokio::test]
+    async fn a_batch_over_its_decode_share_decodes_in_groups() {
+        const COUNT: usize = 16;
+        const SAMPLES: usize = 64;
+        let (bytes, tenant_hash, seg_ref) =
+            batched_l1_segment_of(COUNT, SAMPLES, true, WIDE_BUCKETS);
+        let whole = batch_run(&bytes, tenant_hash, &seg_ref, &[], |f| {
+            ranged_l1(f).with_fetch_batch_floor(u64::MAX)
+        })
+        .await;
+        let first = whole.batches[0];
+        let batch_bytes = first.decoded_len / 2;
+        let limit = first.budget_reserved + batch_bytes;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let configure = |f: SegmentFetcher| {
+            ranged_l1(f)
+                .with_fetch_batch_floor(batch_bytes)
+                .with_memory_budget(Arc::clone(&budget))
+        };
+        assert_eq!(
+            configure(SegmentFetcher::new(Arc::new(MemoryStore::new()))).fetch_batch_bytes(),
+            batch_bytes
+        );
+        let grouped = batch_run(&bytes, tenant_hash, &seg_ref, &[], configure).await;
+        assert_eq!(
+            grouped.batches.len(),
+            1,
+            "the pages and columns are one batch"
+        );
+        let b = grouped.batches[0];
+        assert!(b.decode_groups > 1, "{} groups", b.decode_groups);
+        assert!(
+            b.largest_shared_group_charge <= batch_bytes,
+            "a group reserves {} B, over fetch_batch_bytes ({batch_bytes} B)",
+            b.largest_shared_group_charge
+        );
+        assert!(
+            first.budget_reserved + b.decoded_len > limit,
+            "the groups together would not fit the budget"
+        );
+        assert_eq!(
+            grouped.decoded(),
+            whole.decoded(),
+            "bitwise the same samples"
+        );
+        assert_eq!(budget.reserved(), 0, "every group released its reservation");
     }
 
     /// L0 is never batched: under a fetch share far below its pages an L0

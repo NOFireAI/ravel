@@ -1394,14 +1394,25 @@ tied to the buffer it accounts for:
   splitting them) and, for a run with a per-sample provenance column, its
   `SamplePriority`; per emitted unit the unit and its copy of the series'
   labels (`decoded_units_len`). A histogram value's span and bucket vectors
-  are not in that figure; the fold charges them as it holds them, after the
-  decode has allocated them. A page
+  (8 bytes per span, 8 per bucket) are charged before the decode too, by a
+  bound taken from the fetched pages: a HIST page record takes at least 14
+  bytes besides its spans, buckets and custom bounds, and every 8-byte element
+  of those vectors takes at least one payload byte, so a run whose page
+  decompresses to P bytes over n samples holds at most 8 x (P - 14n) bytes of
+  them (`hist_page_heap_bound`), whatever counts the page claims. The charge also covers the largest page's decompressed scratch.
+  The batch decodes in groups of whole series whose charge is at most
+  `fetch_batch_bytes` (`decode_groups`); each group reserves, decodes, is
+  folded and released before the next reserves, and a series over the share
+  is a group alone
+  (`a_histogram_batch_charges_its_buckets_before_it_decodes`,
+  `a_batch_over_its_decode_share_decodes_in_groups`). A page
   stores a regular counter in well under a byte per sample, so the decoded
   runs are many times the batch's pages. A decode the budget refuses is
   refused after the batch's page GET and before any page is decoded
   (`a_batch_whose_decode_does_not_fit_is_refused_before_it_decodes`). Every
-  batch of more than one series reserves at most `fetch_batch_bytes` of pages
-  and at most `fetch_batch_bytes` of decoded runs, and the fetch's peak is one
+  batch of more than one series reserves at most `fetch_batch_bytes` of pages,
+  every decode group of more than one series at most `fetch_batch_bytes` of
+  decoded runs, and the fetch's peak is one
   batch over what the segment already holds
   (`one_call_never_reserves_more_than_one_batch`,
   `an_l1_part_over_the_fetch_limit_answers_in_batches`). A batch after the
@@ -1569,7 +1580,11 @@ distinct provenance prefix, and it reserves before it folds a batch of runs
 in, not after: every incoming sample as if kept, the labels of
 each series it does not hold yet, one prefix per unseen provenance prefix
 along each run, and the level the merge of one series builds beside the
-levels it replaces. A read whose merged samples do not fit is refused with
+levels it replaces. The bound is read off the fetched runs where they lie,
+sorted by series in place, so the fold allocates nothing of its own before
+it reserves; a merge frees the two levels it consumed before it shrinks the
+level it built, so the shrink's copy reuses their bytes. A read whose merged
+samples do not fit is refused with
 the same 422 `FetchMemoryExhausted`, against the budget's limit, before the
 batch is folded. The reservation is the most any batch could have made the
 fold hold, so it does not shrink when a later object's duplicates are dropped.

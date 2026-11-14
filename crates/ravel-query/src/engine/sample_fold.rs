@@ -151,35 +151,59 @@ fn run_priorities(
     }
 }
 
-impl From<FetchedSeriesSoa> for FoldRun<f64> {
-    fn from(fs: FetchedSeriesSoa) -> Self {
-        Self {
-            series_id: fs.series_id,
-            labels: fs.labels,
-            timestamps: fs.timestamps,
-            values: fs.values,
-            priorities: run_priorities(
-                fs.per_sample_priorities,
-                (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq),
-            ),
-        }
-    }
+/// A fetched run the fold bounds by reference, so [`RunFold::absorb`]
+/// reserves before it converts or holds anything of its own.
+pub(super) trait FoldInput<V> {
+    fn series_id(&self) -> SeriesId;
+    fn labels(&self) -> &LabelSet;
+    fn values(&self) -> &[V];
+    /// The run-wide provenance prefix, used when there is no per-sample column.
+    fn prefix(&self) -> ProvenancePrefix;
+    fn per_sample(&self) -> Option<&[crate::fetcher::SamplePriority]>;
+    fn into_run(self) -> FoldRun<V>;
 }
 
-impl From<FetchedHistogramSeries> for FoldRun<HistogramValue> {
-    fn from(fs: FetchedHistogramSeries) -> Self {
-        Self {
-            series_id: fs.series_id,
-            labels: fs.labels,
-            timestamps: fs.timestamps,
-            values: fs.values,
-            priorities: run_priorities(
-                fs.per_sample_priorities,
-                (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq),
-            ),
+macro_rules! fetched_fold_input {
+    ($fetched:ty, $value:ty) => {
+        impl FoldInput<$value> for $fetched {
+            fn series_id(&self) -> SeriesId {
+                self.series_id
+            }
+
+            fn labels(&self) -> &LabelSet {
+                &self.labels
+            }
+
+            fn values(&self) -> &[$value] {
+                &self.values
+            }
+
+            fn prefix(&self) -> ProvenancePrefix {
+                (self.created_unix_ns, self.writer_epoch, self.writer_seq)
+            }
+
+            fn per_sample(&self) -> Option<&[crate::fetcher::SamplePriority]> {
+                self.per_sample_priorities.as_deref()
+            }
+
+            fn into_run(self) -> FoldRun<$value> {
+                FoldRun {
+                    series_id: self.series_id,
+                    labels: self.labels,
+                    timestamps: self.timestamps,
+                    values: self.values,
+                    priorities: run_priorities(
+                        self.per_sample_priorities,
+                        (self.created_unix_ns, self.writer_epoch, self.writer_seq),
+                    ),
+                }
+            }
         }
-    }
+    };
 }
+
+fetched_fold_input!(FetchedSeriesSoa, f64);
+fetched_fold_input!(FetchedHistogramSeries, HistogramValue);
 
 /// A sample read's matched series, folded in as each object's fetch
 /// completes. See the module docs.
@@ -220,30 +244,32 @@ impl<V: FoldValue> RunFold<V> {
     /// whose timestamps descend, with the error the merge returns for it; and
     /// a refused reservation with [`FetchError::FetchMemoryExhausted`], the
     /// error a fetch reservation returns, before any of `runs` is folded.
-    pub(super) fn absorb<R: Into<FoldRun<V>>>(
-        &mut self,
-        runs: impl IntoIterator<Item = R>,
-    ) -> Result<(), QueryError> {
-        let runs: Vec<FoldRun<V>> = runs.into_iter().map(Into::into).collect();
+    ///
+    /// The bound is computed over `runs` in place, sorted by series so each
+    /// series' incoming samples sum without a side table (issue #4198); the
+    /// fold's output does not depend on the order runs are folded in.
+    pub(super) fn absorb<R: FoldInput<V>>(&mut self, mut runs: Vec<R>) -> Result<(), QueryError> {
+        runs.sort_unstable_by_key(FoldInput::series_id);
         let mut growth = 0u64;
-        let mut incoming: HashMap<SeriesId, u64> = HashMap::new();
-        for run in &runs {
-            let (added, samples) = self.growth_bound(run);
-            growth = growth.saturating_add(added);
-            let series = incoming.entry(run.series_id).or_default();
-            *series = series.saturating_add(samples);
-        }
         // One merge runs at a time, and the level it builds holds at most the
         // samples its series held before this call plus every sample this
         // call brings it.
-        let merge = incoming
-            .iter()
-            .map(|(id, samples)| self.held_sample_len(id).saturating_add(*samples))
-            .max()
-            .unwrap_or(0);
+        let mut merge = 0u64;
+        for series in runs.chunk_by(|a, b| a.series_id() == b.series_id()) {
+            let mut incoming = 0u64;
+            for run in series {
+                let (added, samples) = self.growth_bound(run);
+                growth = growth.saturating_add(added);
+                incoming = incoming.saturating_add(samples);
+            }
+            if let Some(run) = series.first() {
+                let held = self.held_sample_len(&run.series_id());
+                merge = merge.max(held.saturating_add(incoming));
+            }
+        }
         self.reserve_up_to(self.retained.saturating_add(growth).saturating_add(merge))?;
         for run in runs {
-            self.absorb_run(run)?;
+            self.absorb_run(run.into_run())?;
         }
         Ok(())
     }
@@ -252,22 +278,22 @@ impl<V: FoldValue> RunFold<V> {
     /// bytes its samples alone take. The growth counts every sample as kept,
     /// the series' labels when it is new, and one prefix entry for each change
     /// of provenance prefix along the run that the fold has not interned.
-    fn growth_bound(&self, run: &FoldRun<V>) -> (u64, u64) {
+    fn growth_bound(&self, run: &impl FoldInput<V>) -> (u64, u64) {
         let inline = std::mem::size_of::<FoldedSample<V>>() as u64;
         let samples = run
-            .values
+            .values()
             .iter()
             .map(|value| inline.saturating_add(value.heap_len()))
             .fold(0u64, u64::saturating_add);
-        let held = self.by_series.get(&run.series_id);
+        let held = self.by_series.get(&run.series_id());
         let labels = if held.is_some() {
             0
         } else {
-            retained_series_len(&run.labels)
+            retained_series_len(run.labels())
         };
-        let prefixes = match &run.priorities {
-            RunPriorities::RunWide(prefix) => u64::from(!self.prefix_ids.contains_key(prefix)),
-            RunPriorities::PerSample(column) => {
+        let prefixes = match run.per_sample() {
+            None => u64::from(!self.prefix_ids.contains_key(&run.prefix())),
+            Some(column) => {
                 let mut last = None;
                 let mut new = 0u64;
                 for p in column {
@@ -575,6 +601,10 @@ fn merge_levels<V: FoldValue>(
             out.push(sample);
         }
     }
+    // The emptied inputs still hold their buffers, which the fold charges as
+    // held levels. Freed first, the shrunk copy takes bytes they released, so
+    // the merge holds at most the inputs plus `out`, as `absorb` reserved.
+    drop((a, b));
     if out.len() < out.capacity() {
         out.shrink_to_fit();
     }
@@ -908,6 +938,59 @@ mod tests {
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].samples.len(), 3);
         assert_eq!(budget.reserved(), 0, "released once the result is built");
+    }
+
+    /// A run that records the budget's reservation when the fold converts it.
+    struct Observed {
+        run: FetchedSeriesSoa,
+        budget: Arc<ravel_memory::MemoryBudget>,
+        seen: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl FoldInput<f64> for Observed {
+        fn series_id(&self) -> SeriesId {
+            self.run.series_id()
+        }
+        fn labels(&self) -> &LabelSet {
+            self.run.labels()
+        }
+        fn values(&self) -> &[f64] {
+            self.run.values()
+        }
+        fn prefix(&self) -> ProvenancePrefix {
+            self.run.prefix()
+        }
+        fn per_sample(&self) -> Option<&[SamplePriority]> {
+            self.run.per_sample()
+        }
+        fn into_run(self) -> FoldRun<f64> {
+            self.seen.lock().expect("lock").push(self.budget.reserved());
+            self.run.into_run()
+        }
+    }
+
+    /// Issue #4198: an absorb bounds its runs where they lie and reserves
+    /// before it converts the first of them, so every conversion sees the
+    /// whole call's reservation already held.
+    #[test]
+    fn an_absorb_reserves_before_it_converts_a_run() {
+        let budget = unlimited();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = |series, prefix| Observed {
+            run: scalar_run(series, &[(1, 1.0), (2, 2.0)], prefix, None),
+            budget: Arc::clone(&budget),
+            seen: Arc::clone(&seen),
+        };
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        fold.absorb(vec![
+            observed(2, (1, 1, 1)),
+            observed(1, (1, 1, 1)),
+            observed(2, (2, 1, 1)),
+        ])
+        .expect("absorb");
+        let charged = fold.charged();
+        assert!(charged > 0);
+        assert_eq!(*seen.lock().expect("lock"), vec![charged; 3]);
     }
 
     /// Reservations taken from the fold stay held after its result is built,

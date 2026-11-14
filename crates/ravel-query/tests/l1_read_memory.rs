@@ -1,5 +1,6 @@
 //! What a PromQL read over large L1 metrics objects allocates, against what
-//! it charges to the memory budget (issue #4118).
+//! it charges to the memory budget (issue #4118), native-histogram objects
+//! included (issue #4198).
 //!
 //! The shape is the one that took ravel-server past its container limit: a
 //! few L1 parts, each holding many series with every hour of each series in
@@ -33,8 +34,9 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_query::{EngineConfig, FetchError, GetLimiter, QueryEngine, QueryError};
 use ravel_segment::{
-    IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7,
-    decode_catalog_v5, open_from_full,
+    HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ReaderLimits,
+    ResetHint, SegmentIdentity, SegmentWriter, SeriesEntryV4, SeriesInput, SeriesInputV3,
+    SeriesValues, VERSION_V7, ValueKind, WrittenSegment, decode_catalog_v5, open_from_full,
 };
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 use tikv_jemalloc_ctl::{epoch, stats};
@@ -127,20 +129,34 @@ fn counter_value(i: usize, k: i64) -> f64 {
     step * k as f64 + (k % 3) as f64 * 0.25
 }
 
-async fn put_l0(store: &MemoryStore, seq: u64, series: Vec<SeriesInput>) {
-    let writer_id = Uuid::from_u128(u128::from(seq) + 1);
-    let identity = SegmentIdentity {
+fn l0_writer_id(seq: u64) -> Uuid {
+    Uuid::from_u128(u128::from(seq) + 1)
+}
+
+fn l0_identity(seq: u64) -> SegmentIdentity {
+    SegmentIdentity {
         tenant_hash: TENANT.0,
         shard: 0,
-        writer_id: writer_id.to_string(),
+        writer_id: l0_writer_id(seq).to_string(),
         writer_epoch: 1,
         writer_seq: seq,
-    };
-    let bounds = IngestBounds {
+    }
+}
+
+fn l0_bounds() -> IngestBounds {
+    IngestBounds {
         min_ingest_ts_ns: hour_start(),
         max_ingest_ts_ns: hour_start() + 10,
-    };
-    let written = SegmentWriter::write(series, identity, bounds).expect("write L0");
+    }
+}
+
+async fn put_l0(store: &MemoryStore, seq: u64, series: Vec<SeriesInput>) {
+    let written = SegmentWriter::write(series, l0_identity(seq), l0_bounds()).expect("write L0");
+    put_written_l0(store, seq, written).await;
+}
+
+async fn put_written_l0(store: &MemoryStore, seq: u64, written: WrittenSegment) {
+    let writer_id = l0_writer_id(seq);
     let rec = record::build(NewCommitRecord {
         tenant_hash: TENANT,
         signal: Signal::Metrics,
@@ -268,6 +284,20 @@ async fn l1_tenant(shape: Shape) -> (Arc<MemoryStore>, u64) {
             .collect();
         put_l0(&store, u64::try_from(flush).expect("flush") + 1, inputs).await;
     }
+    let (bytes, entries) = compact_l1(&store).await;
+    let with_provenance = entries
+        .iter()
+        .any(|e| e.per_sample_provenance.iter().any(Option::is_some));
+    assert_eq!(
+        with_provenance, merged_runs,
+        "{shape:?}: the part carries the provenance extension exactly when runs merged"
+    );
+    (store, bytes)
+}
+
+/// Compacts the hour's L0 flushes into L1 and returns the summed size of
+/// the L1 parts that resolve and every catalog entry they hold.
+async fn compact_l1(store: &Arc<MemoryStore>) -> (u64, Vec<SeriesEntryV4>) {
     let outcome = compact_bucket(
         store.as_ref(),
         &FixedClock::new(hour_start() + 3 * NS_PER_HOUR),
@@ -305,6 +335,7 @@ async fn l1_tenant(shape: Shape) -> (Arc<MemoryStore>, u64) {
         "only L1 parts resolve"
     );
     let mut bytes = 0;
+    let mut entries = Vec::new();
     for segment in &snapshot.segments {
         bytes += segment.object_size;
         let object = store
@@ -315,17 +346,10 @@ async fn l1_tenant(shape: Shape) -> (Arc<MemoryStore>, u64) {
         let footer = open_from_full(&object, ReaderLimits::default())
             .expect("footer")
             .footer;
-        let entries =
-            decode_catalog_v5(&footer, &object, ReaderLimits::default()).expect("catalog");
-        let with_provenance = entries
-            .iter()
-            .any(|e| e.per_sample_provenance.iter().any(Option::is_some));
-        assert_eq!(
-            with_provenance, merged_runs,
-            "{shape:?}: the part carries the provenance extension exactly when runs merged"
-        );
+        entries
+            .extend(decode_catalog_v5(&footer, &object, ReaderLimits::default()).expect("catalog"));
     }
-    (store, bytes)
+    (bytes, entries)
 }
 
 fn engine(store: &Arc<MemoryStore>, budget: &Arc<MemoryBudget>) -> QueryEngine {
@@ -546,4 +570,218 @@ fn an_in_budget_read_of_a_chunked_catalog_l1_part_answers_as_unlimited() {
 #[test]
 fn an_in_budget_read_of_an_l1_part_without_provenance_answers_as_unlimited() {
     serialized(assert_in_budget_answers(UNMERGED));
+}
+
+// Native histograms (issue #4198).
+//
+// `/api/v1/query_range` calls `QueryEngine::range_hist_with_budgets`, which
+// runs `range_inner`; its `prefetch` reaches `prefetch_metric_plans`, then
+// `fetch_samples_and_histograms_maybe_distributed` and
+// `fetch_all_samples_and_histograms`, which hands each L1 part to
+// `SegmentFetcher::fetch_soa_and_histograms_into`. Its `fetch_decoded`
+// fetches a page batch, charges each decode group with `reserve_fetch`
+// (`decode_groups`), and only then decodes it: `build_histogram_decodes`,
+// `decode_histogram_run`, `ravel_segment::decode_run_histogram_pages`. That
+// decode allocates one span vector and one bucket vector per sample, 8 B per
+// entry, which the per-sample charge does not cover; the group charge adds
+// a bound on them taken from the fetched pages' sizes.
+
+const HIST_METRIC: &str = "request_duration_seconds";
+
+/// A native-histogram tenant's shape. Each sample carries one span of
+/// `buckets` integer buckets.
+#[derive(Debug, Clone, Copy)]
+struct HistShape {
+    series: usize,
+    buckets: usize,
+}
+
+/// Two series of 500-bucket histograms every 15 s. Each series' span and
+/// bucket vectors hold about 11 MiB once decoded, more than the small
+/// budget, while its fetched pages (about 3 MB), the scratch they decode
+/// through, and its samples' per-sample charge (under 1 MiB) fit in it: a
+/// read that charged the vectors a fixed few bytes per sample would admit
+/// the decode.
+const WIDE_HIST: HistShape = HistShape {
+    series: 2,
+    buckets: 500,
+};
+
+const HIST_INTERVAL_NS: i64 = 15 * NS_PER_SEC;
+
+fn hist_series_labels(i: usize) -> (SeriesId, LabelSet) {
+    let labels = LabelSet::new(vec![
+        Label {
+            name: "__name__".to_string(),
+            value: HIST_METRIC.to_string(),
+        },
+        Label {
+            name: "instance".to_string(),
+            value: format!("instance-{i}"),
+        },
+    ])
+    .expect("labels");
+    let id = SeriesId::compute(&TenantId::new("t"), HIST_METRIC, &labels).expect("series id");
+    (id, labels)
+}
+
+/// Series `i` at sample `k`: a counter histogram whose every bucket grows
+/// by a small per-bucket step.
+fn hist_value(i: usize, k: i64, buckets: usize) -> HistogramValue {
+    let k = u64::try_from(k).expect("sample index");
+    let positive: Vec<u64> = (0..buckets)
+        .map(|j| k * (j as u64 % 3 + 1) + i as u64)
+        .collect();
+    HistogramValue {
+        scale: 0,
+        zero_threshold: 0.0,
+        sum: Some(k as f64 * 0.25 * (i + 1) as f64),
+        custom_values: None,
+        positive_spans: vec![HistogramSpan {
+            offset: 0,
+            length: u32::try_from(buckets).expect("buckets"),
+        }],
+        negative_spans: vec![],
+        counts: HistogramCounts::Int {
+            zero_count: 0,
+            count: positive.iter().sum(),
+            positive,
+            negative: vec![],
+        },
+        reset_hint: ResetHint::Unknown,
+    }
+}
+
+/// `shape.series` histogram series over `SPAN_HOURS`, written as `FLUSHES`
+/// L0 flushes that each hold a quarter of the span for every series, and
+/// compacted into L1.
+async fn l1_hist_tenant(shape: HistShape) -> (Arc<MemoryStore>, u64) {
+    let store = Arc::new(MemoryStore::new());
+    let per_flush = SPAN_HOURS * NS_PER_HOUR / HIST_INTERVAL_NS / FLUSHES;
+    for flush in 0..FLUSHES {
+        let inputs: Vec<SeriesInputV3> = (0..shape.series)
+            .map(|i| {
+                let (series_id, labels) = hist_series_labels(i);
+                let samples = (flush * per_flush..(flush + 1) * per_flush)
+                    .map(|k| HistogramSample {
+                        ts_ns: hour_start() + k * HIST_INTERVAL_NS,
+                        value: hist_value(i, k, shape.buckets),
+                    })
+                    .collect();
+                SeriesInputV3 {
+                    series_id,
+                    labels,
+                    values: SeriesValues::Histogram(samples),
+                }
+            })
+            .collect();
+        let seq = u64::try_from(flush).expect("flush") + 1;
+        let written = SegmentWriter::write_histograms(inputs, l0_identity(seq), l0_bounds())
+            .expect("write histogram L0");
+        put_written_l0(&store, seq, written).await;
+    }
+    let (bytes, entries) = compact_l1(&store).await;
+    assert_eq!(
+        entries.len(),
+        shape.series,
+        "{shape:?}: every series compacted"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.entry.value_kind == ValueKind::Histogram),
+        "{shape:?}: every series is a histogram series"
+    );
+    (store, bytes)
+}
+
+const HIST_FANOUT: &str = "sum(histogram_count(rate(request_duration_seconds[5m])))";
+const HIST_SINGLE: &str =
+    r#"histogram_sum(rate(request_duration_seconds{instance="instance-1"}[5m]))"#;
+
+/// A histogram read whose decoded spans and buckets alone need more than
+/// the budget is refused with the budget's typed error, and the process
+/// never allocates more than the budget plus the fixed overhead on the way:
+/// the decode's span and bucket vectors are charged before they exist.
+#[test]
+fn an_over_budget_read_of_wide_native_histograms_is_refused_within_the_budget() {
+    serialized(async {
+        let shape = WIDE_HIST;
+        let (store, object_bytes) = l1_hist_tenant(shape).await;
+        let mut failures = Vec::new();
+        for query in [HIST_FANOUT, HIST_SINGLE] {
+            let m = measure(&store, SMALL_BUDGET, query).await;
+            let figures = format!(
+                "{query} over {shape:?} ({object_bytes} B of L1): peak allocated {} B, \
+                 peak reserved {} B, budget {SMALL_BUDGET} B, {} refusals",
+                m.peak_allocated, m.peak_reserved, m.refusals
+            );
+            eprintln!("{figures}");
+            assert_budget_error(&m, query);
+            assert!(m.refusals >= 1, "{query}: the budget counted the refusal");
+            if m.peak_allocated > SMALL_BUDGET + FIXED_OVERHEAD {
+                failures.push(figures);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the process allocated past the budget plus {FIXED_OVERHEAD} B:\n{}",
+            failures.join("\n")
+        );
+    });
+}
+
+/// What the evaluator holds for a histogram statement, uncharged: the inner
+/// `rate`'s per-series histogram at every step, and as much again for the
+/// vectors the outer function reads it as.
+fn hist_evaluation_len(query: &str, shape: HistShape) -> u64 {
+    let series = if query == HIST_SINGLE {
+        1
+    } else {
+        shape.series as u64
+    };
+    let histogram = std::mem::size_of::<ravel_promql::FloatHistogram>()
+        + std::mem::size_of::<ravel_promql::HistogramSample>()
+        + shape.buckets * std::mem::size_of::<f64>()
+        + std::mem::size_of::<HistogramSpan>();
+    2 * series * STEPS * histogram as u64
+}
+
+/// A histogram read that fits the budget answers exactly what an unlimited
+/// engine answers, and allocates no more than the budget held reserved plus
+/// the fixed overhead and the evaluator's own output. The renderings are
+/// compared whole, as in `assert_in_budget_answers`.
+#[test]
+fn an_in_budget_read_of_wide_native_histograms_answers_as_unlimited() {
+    serialized(async {
+        let shape = WIDE_HIST;
+        let (store, object_bytes) = l1_hist_tenant(shape).await;
+        for query in [HIST_SINGLE, HIST_FANOUT] {
+            let unlimited = measure(&store, u64::MAX, query).await;
+            let reference = unlimited.result.expect("an unlimited engine answers");
+            let m = measure(&store, IN_BUDGET, query).await;
+            eprintln!(
+                "objects={object_bytes}B query={query}: peak allocated {} B, peak reserved {} B, \
+                 budget {IN_BUDGET} B, refusals {}; unlimited peak allocated {} B",
+                m.peak_allocated, m.peak_reserved, m.refusals, unlimited.peak_allocated
+            );
+            let answer = m
+                .result
+                .unwrap_or_else(|e| panic!("{query} at {IN_BUDGET} B answers, got: {e}"));
+            assert_eq!(answer, reference, "{query}: the same answer as unlimited");
+            assert!(
+                m.peak_allocated <= IN_BUDGET + FIXED_OVERHEAD,
+                "{query}: the process allocated {} B at its peak against a {IN_BUDGET} B budget",
+                m.peak_allocated
+            );
+            let evaluation = hist_evaluation_len(query, shape);
+            assert!(
+                m.peak_allocated <= m.peak_reserved + FIXED_OVERHEAD + evaluation,
+                "{query}: the process allocated {} B at its peak but the budget held at most \
+                 {} B (plus {FIXED_OVERHEAD} B fixed and {evaluation} B of evaluation output)",
+                m.peak_allocated,
+                m.peak_reserved
+            );
+        }
+    });
 }
