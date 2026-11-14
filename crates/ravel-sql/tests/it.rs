@@ -78,6 +78,8 @@ mod live_accounting;
 mod logs_columnar;
 #[path = "logs_contains_fetch_bytes.rs"]
 mod logs_contains_fetch_bytes;
+#[path = "logs_contains_plan_bytes.rs"]
+mod logs_contains_plan_bytes;
 #[path = "logs_contains_route.rs"]
 mod logs_contains_route;
 #[path = "logs_count_from_stats.rs"]
