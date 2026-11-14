@@ -364,6 +364,54 @@ impl LogQuery {
             && key_equals.is_empty()
             && key_in.is_none()
     }
+
+    /// Whether a plan pass can name this query's surviving blocks from the
+    /// footer and the four directories although its content list is not empty
+    /// (ADR-4203 decision 1): the content list holds one or more
+    /// [`Predicate::Contains`] arms and nothing else, there is no
+    /// stream-attribute arm, and every prune-only arm is a
+    /// [`Predicate::NumRange`] or a [`Predicate::NumNotEq`] (the prune list
+    /// may be empty).
+    ///
+    /// No index covers a `Contains` arm: `RlogReader::scan_blocks` places
+    /// neither BLOOM nor POSTINGS for it and drops no block for it, so for such
+    /// a query the reader's survivors are its skip step's, `candidate_blocks`
+    /// over the ts window and the numeric prune arms. The scan still evaluates
+    /// the arm per row. Pending erasure and KEY_IDX arms are not consulted:
+    /// erasure filters rows inside surviving blocks, and the KEY_IDX probe
+    /// narrows the blocks read, never the reader's survivor list.
+    ///
+    /// Destructures `Self` by name for the reason
+    /// [`is_block_predicate_free`](Self::is_block_predicate_free) does: a
+    /// false positive publishes a survivor list the scan does not stripe.
+    #[must_use]
+    pub fn plan_contains_only_decidable(&self) -> bool {
+        let Self {
+            ts_min_ns: _,
+            ts_max_ns: _,
+            stream_attrs,
+            content,
+            prune,
+            erasure: _,
+            key_equals: _,
+            key_in: _,
+        } = self;
+        !content.is_empty()
+            && content
+                .iter()
+                .all(|p| matches!(p, Predicate::Contains { .. }))
+            && stream_attrs.is_empty()
+            && prune_arms_skip_decidable(prune)
+    }
+}
+
+/// Whether every prune-only arm is decided by the skip index's numeric stats
+/// alone: a [`Predicate::NumRange`] or a [`Predicate::NumNotEq`]. An
+/// attribute-equality `Equals` prunes only through POSTINGS.
+fn prune_arms_skip_decidable(prune: &[Predicate]) -> bool {
+    prune
+        .iter()
+        .all(|p| matches!(p, Predicate::NumRange { .. } | Predicate::NumNotEq { .. }))
 }
 
 /// Exact per-block figures for one segment, derived from its SKIP_IDX alone
@@ -2329,13 +2377,19 @@ impl LogSegmentFetcher {
 
             // Skip-index-only survivor count (#761): when every block-level predicate
             // the query carries is decidable from the skip index alone -- ts bounds
-            // and prune-only NumRange arms, no text/content arm, no attribute-equality
+            // and prune-only NumRange arms, no index-prunable content arm, no attribute-equality
             // POSTINGS prune, no stream filter -- the surviving-block count is exactly
             // `candidate_blocks` over those arms, with no BLOCKS byte fetched and no
             // block decoded. The reader's full prune (skip, then POSTINGS, then bloom)
             // reduces to the skip step for such a query, so this count equals the
             // survivor list a subset open will stripe over, and the footer read here
             // carries forward so those opens skip their own probe (#693 part 3).
+            //
+            // A content list of only `Contains` arms takes this branch too
+            // (ADR-4203 decision 1, `LogQuery::plan_contains_only_decidable`):
+            // no index covers the arm, the reader drops no block for it, so its
+            // survivors are the same skip-step candidates, and the scan
+            // evaluates the arm per row.
             //
             // The relevance check is the one the fallback's `tenant_bytes` runs: it
             // is what turns an out-of-window segment into the `None` the caller
@@ -2345,7 +2399,7 @@ impl LogSegmentFetcher {
             if seg_ref.object_size > whole_object_bound
                 && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
                 && Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
-                && Self::plan_skip_decidable(query)
+                && (Self::plan_skip_decidable(query) || query.plan_contains_only_decidable())
             {
                 // The `page_fetch` phase span the other plan paths carry (#782), so
                 // the trace shows the probe and section GETs this branch issues.
@@ -2423,7 +2477,7 @@ impl LogSegmentFetcher {
                 )));
             }
 
-            // Fallback: a predicate the skip index cannot decide (a `has_word`/text
+            // Fallback: a predicate the skip index cannot decide (a `has_word`/`equals`
             // content arm with only a per-block bloom, an attribute-equality POSTINGS
             // prune, a stream filter), or an object at or below
             // `plan_whole_object_bound`. Read as before --
@@ -2882,11 +2936,7 @@ impl LogSegmentFetcher {
             key_equals: _,
             key_in: _,
         } = query;
-        content.is_empty()
-            && stream_attrs.is_empty()
-            && prune
-                .iter()
-                .all(|p| matches!(p, Predicate::NumRange { .. } | Predicate::NumNotEq { .. }))
+        content.is_empty() && stream_attrs.is_empty() && prune_arms_skip_decidable(prune)
     }
 
     /// The predicate-free plan fast path (#693): read the footer via the
