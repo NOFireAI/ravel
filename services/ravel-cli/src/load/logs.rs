@@ -435,6 +435,11 @@ pub(super) async fn load_with_drain_reflush_period(
     // shared with the metrics and spans loaders.
     validate_target_bytes(target_bytes)?;
     validate_ack_margin(load_memory.as_ref().and_then(|o| o.ack_margin))?;
+    // Same shape as the guards above: `--decode-workers` bounds how many
+    // batches build at once (issue #4210), and 0 workers would build none.
+    if load_memory.as_ref().and_then(|o| o.decode_workers) == Some(0) {
+        return Err(LoadError::Setup(DECODE_WORKERS_ZERO.to_string()));
+    }
 
     let limits = LogIngestLimits::default();
     let tenant_id = TenantId::new(tenant);
@@ -526,9 +531,13 @@ pub(super) async fn load_with_drain_reflush_period(
     // is sized with the resolved cursor count, not the flag.
     let memory_options = load_memory
         .unwrap_or_else(|| LoadMemoryOptions::new(LoadMemoryRequest::from_flag_on_host(None)));
+    let decode_workers = memory_options
+        .decode_workers
+        .unwrap_or_else(default_decode_workers);
     let load_memory = LoadMemory::resolve(
         memory_options.request,
         cursor_count,
+        decode_workers,
         u64::from(shards) * u64::from(max_inflight_flushes),
     )
     .map_err(LoadError::Setup)?;
@@ -577,7 +586,9 @@ pub(super) async fn load_with_drain_reflush_period(
 
     // Decode/encode overlap (issue #680). A single blocking decoder task owns
     // the K stride cursors and drives the existing `collect_spans` +
-    // `build_columnar_batch` stage, in row-group order, pushing each built batch
+    // `build_columnar_batch` stage, collecting spans in row-group order on
+    // one thread and building on `decode_workers` threads (issue #4210),
+    // pushing each built batch in collection order
     // into a bounded channel; this loop pulls from that channel and drives the
     // shard writes. The channel is the decouple point that replaces the former
     // single-batch lookahead (issue #541): the decoder runs ahead by up to
@@ -609,10 +620,11 @@ pub(super) async fn load_with_drain_reflush_period(
         now_ns,
         batch_rows,
         path,
-        on_build_start,
+        on_build_start.map(|hook| Arc::new(move |_| hook()) as SeqBuildHook),
         on_batch_queued,
         decode_queue_batches,
         charger,
+        decode_workers,
     );
 
     // Above the default target a shard buffer holds charged batches until it
@@ -1438,12 +1450,11 @@ fn spawn_stall_flusher(
 }
 
 /// Charges each built columnar batch to the load's memory budget (issue
-/// #2626): an estimate before the build, from the previous batch's measured
-/// bytes per row (zero for the first batch, which nothing else is held
-/// beside, so its correction is admitted however large it is), corrected to
-/// the built batch's measured
-/// [`ColumnarLogBatch::heap_bytes`] once it exists. Both steps wait for room
-/// and never fail.
+/// #2626): an estimate before the build, from the last emitted batch's
+/// measured bytes per row (zero for the first batch, which is built alone, so
+/// its correction is admitted however large it is), corrected to the built
+/// batch's measured [`ColumnarLogBatch::heap_bytes`] when it is emitted in
+/// sequence. Both steps wait for room and never fail.
 pub(super) struct BatchCharger {
     budget: Arc<IngestByteBudget>,
     bytes_per_row: Option<u64>,
@@ -1457,95 +1468,428 @@ impl BatchCharger {
         }
     }
 
-    fn charge_before_build(&self, rows: usize) -> IngestByteCharge {
-        let estimate = self
-            .bytes_per_row
-            .map_or(0, |per_row| per_row.saturating_mul(rows as u64));
-        self.budget.charge_waiting(estimate)
+    fn estimate(&self, rows: usize) -> u64 {
+        self.bytes_per_row
+            .map_or(0, |per_row| per_row.saturating_mul(rows as u64))
     }
 
-    fn settle(
-        &mut self,
-        mut charge: IngestByteCharge,
-        batch: &ColumnarLogBatch,
-    ) -> IngestByteCharge {
-        let bytes = batch.heap_bytes() as u64;
-        charge.resize_waiting(bytes);
+    /// Whether `bytes` more fit under the ceiling now. The decode coordinator
+    /// is the only thread that charges this budget and every other holder
+    /// only refunds, so a charge that fits now is admitted without waiting.
+    fn fits_now(&self, bytes: u64) -> bool {
+        self.budget
+            .ceiling()
+            .is_none_or(|limit| self.budget.in_flight_bytes().saturating_add(bytes) <= limit)
+    }
+
+    fn observe(&mut self, batch: &ColumnarLogBatch) {
         if batch.num_rows > 0 {
-            self.bytes_per_row = Some(bytes.div_ceil(batch.num_rows as u64));
+            self.bytes_per_row = Some((batch.heap_bytes() as u64).div_ceil(batch.num_rows as u64));
         }
-        charge
     }
 }
 
-/// Spawn the decode/build stage (issue #680) as one blocking task that owns the
-/// K stride cursors and feeds a bounded channel. Each iteration decodes and
-/// builds exactly one batch through the same `collect_spans` +
-/// `build_columnar_batch` (or row) path the former inline loop used, in
-/// row-group order, then `blocking_send`s the outcome; the send blocks when the
-/// channel already holds `queue_depth` batches, which is the back-pressure that
-/// bounds the queue's memory to `queue_depth` built batches. The task stops
-/// after sending a terminal outcome (`Done`/`BatchFailed`/`RowRejected`) or when
-/// the receiver is dropped (the loader returned early). Returns the receiving
-/// half plus the task's join handle, which the caller reaps to distinguish a
-/// clean end from a decode-task panic.
+/// The default `--decode-workers`: one build worker per this many available
+/// cores, at least one. Stage 0 of ADR-4203 measured `build_columnar_batch` at
+/// 17.7% of load CPU against 70.5% for flush encode, about one core of build
+/// per four of encode.
+pub const DECODE_WORKERS_CORES_PER_WORKER: usize = 4;
+
+/// [`DECODE_WORKERS_CORES_PER_WORKER`] applied to this host's available
+/// parallelism, 1 when it cannot be read.
+pub fn default_decode_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |cores| cores.get() / DECODE_WORKERS_CORES_PER_WORKER)
+        .max(1)
+}
+
+/// A build hook that also receives the batch's sequence number, 0 for the
+/// first batch the pipeline collects. Called on the thread that builds the
+/// batch, as its build starts and after its estimate is charged.
+type SeqBuildHook = Arc<dyn Fn(u64) + Send + Sync>;
+
+/// One batch's dealt spans, with the sequence number it is emitted at.
+type BuildJob = (u64, Vec<(RecordBatch, u64)>);
+
+/// A build worker's outcome for one job; `Err` carries a build panic's
+/// payload to the coordinator, which re-raises it.
+type BuildResult = (u64, std::thread::Result<Prefetched>);
+
+/// What a build needs besides its spans, shared by every build worker.
+struct BuildContext {
+    mapping: Arc<Mapping>,
+    limits: LogIngestLimits,
+    rules: Arc<TenantRules>,
+    now_ns: i64,
+    path: LoadPath,
+    on_build_start: Option<SeqBuildHook>,
+}
+
+impl BuildContext {
+    fn build(&self, seq: u64, spans: &[(RecordBatch, u64)]) -> Prefetched {
+        if let Some(hook) = &self.on_build_start {
+            hook(seq);
+        }
+        match self.path {
+            LoadPath::Row => build_stride_rows(
+                spans,
+                &self.mapping,
+                &self.limits,
+                &self.rules,
+                self.now_ns,
+            ),
+            LoadPath::Columnar => match build_columnar_batch(
+                spans,
+                &self.mapping,
+                &self.limits,
+                &self.rules,
+                self.now_ns,
+            ) {
+                Ok(batch) => Prefetched::Batch(Built::Columnar(Box::new(batch), None)),
+                Err(ColBuildError::Batch(reason)) => Prefetched::BatchFailed { reason },
+                Err(ColBuildError::Row { row, reason }) => Prefetched::RowRejected { row, reason },
+            },
+        }
+    }
+}
+
+/// Where the coordinator's batches are built: on the coordinator itself
+/// (`--decode-workers 1`, or no worker thread could be started) or on a pool
+/// of scoped worker threads fed through a shared job queue.
+enum Builders<'ctx> {
+    Inline(&'ctx BuildContext),
+    Pool {
+        jobs: std::sync::mpsc::Sender<BuildJob>,
+        results: std::sync::mpsc::Receiver<BuildResult>,
+        workers: usize,
+    },
+}
+
+impl<'ctx> Builders<'ctx> {
+    /// Starts `workers` build threads inside `scope`. A worker that cannot be
+    /// spawned is left out; with none started the builds run inline.
+    fn start<'scope>(
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        ctx: &'ctx BuildContext,
+        workers: usize,
+    ) -> Self
+    where
+        'ctx: 'scope,
+    {
+        if workers <= 1 {
+            return Builders::Inline(ctx);
+        }
+        let (jobs, job_rx) = std::sync::mpsc::channel::<BuildJob>();
+        let (result_tx, results) = std::sync::mpsc::channel::<BuildResult>();
+        let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
+        let mut started = 0;
+        for i in 0..workers {
+            let job_rx = Arc::clone(&job_rx);
+            let result_tx = result_tx.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("ravel-load-build-{i}"))
+                .spawn_scoped(scope, move || build_worker(ctx, &job_rx, &result_tx));
+            if spawned.is_ok() {
+                started += 1;
+            }
+        }
+        if started == 0 {
+            return Builders::Inline(ctx);
+        }
+        Builders::Pool {
+            jobs,
+            results,
+            workers: started,
+        }
+    }
+
+    /// How many batches can build at once.
+    fn parallelism(&self) -> usize {
+        match self {
+            Builders::Inline(_) => 1,
+            Builders::Pool { workers, .. } => *workers,
+        }
+    }
+
+    /// Hands one batch to the builders. Inline, the build runs here and its
+    /// outcome is returned; in the pool it is queued and `None` is returned.
+    fn dispatch(&self, seq: u64, spans: Vec<(RecordBatch, u64)>) -> Option<Prefetched> {
+        match self {
+            Builders::Inline(ctx) => Some(ctx.build(seq, &spans)),
+            Builders::Pool { jobs, .. } => {
+                // A failed send means every worker has exited; the next
+                // `recv` reports it.
+                let _ = jobs.send((seq, spans));
+                None
+            }
+        }
+    }
+
+    /// Waits for one pooled build to finish. `None` when no worker is left to
+    /// answer. A build that panicked is re-raised here, on the coordinator,
+    /// so the loader sees the decode task fail.
+    fn recv(&self) -> Option<(u64, Prefetched)> {
+        match self {
+            Builders::Inline(_) => None,
+            Builders::Pool { results, .. } => match results.recv() {
+                Ok((seq, Ok(out))) => Some((seq, out)),
+                Ok((_, Err(panic))) => std::panic::resume_unwind(panic),
+                Err(_) => None,
+            },
+        }
+    }
+}
+
+fn build_worker(
+    ctx: &BuildContext,
+    jobs: &std::sync::Mutex<std::sync::mpsc::Receiver<BuildJob>>,
+    results: &std::sync::mpsc::Sender<BuildResult>,
+) {
+    loop {
+        let job = jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+        let Ok((seq, spans)) = job else {
+            return;
+        };
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.build(seq, &spans)));
+        if results.send((seq, out)).is_err() {
+            return;
+        }
+    }
+}
+
+/// The decode stage's single coordinator (issue #4210): it owns the K stride
+/// cursors and collects every batch's spans in deal order on one thread,
+/// hands each batch to the [`Builders`], and emits the outcomes strictly in
+/// collection order, so the batch sequence the loader receives is the one a
+/// single decode thread would produce whatever order the builds finish in.
+///
+/// At most `workers` batches are collected and not yet emitted at once (the
+/// window). With a budget, each batch's estimate is charged before its build
+/// is dispatched and stays charged until the batch is emitted with its
+/// measured size, so every batch being built or held for re-sequencing is
+/// charged. The first batch is built alone, since no estimate exists before
+/// it; after it the window is also capped at the number of estimated batches
+/// the budget holds. A batch that does not fit while earlier ones are still
+/// building waits for one of them, holding only its spans, rather than for
+/// the budget: earlier batches charge and emit first, so waiting on the
+/// budget behind them could wait on charges only this thread can release.
+struct DecodeCoordinator {
+    state: StrideCursors,
+    batch_rows: usize,
+    workers: usize,
+    charger: Option<BatchCharger>,
+    /// Estimate charges of collected batches not yet emitted, by sequence
+    /// number. A batch missing here is charged in full when it is emitted.
+    charges: std::collections::HashMap<u64, IngestByteCharge>,
+    /// Finished outcomes waiting for every earlier batch to be emitted.
+    ready: std::collections::BTreeMap<u64, Prefetched>,
+    /// Collected spans whose estimate did not fit yet.
+    held: Option<BuildJob>,
+    building: usize,
+    next_seq: u64,
+    next_emit: u64,
+    /// A terminal outcome has been collected or built; nothing more is
+    /// collected.
+    input_ended: bool,
+}
+
+impl DecodeCoordinator {
+    fn window(&self) -> usize {
+        usize::try_from(self.next_seq - self.next_emit).unwrap_or(usize::MAX)
+    }
+
+    fn window_cap(&self) -> usize {
+        let Some(charger) = &self.charger else {
+            return self.workers;
+        };
+        let Some(per_row) = charger.bytes_per_row else {
+            return 1;
+        };
+        match charger.budget.ceiling() {
+            None => self.workers,
+            Some(limit) => {
+                let batch = per_row.saturating_mul(self.batch_rows as u64).max(1);
+                let fit = usize::try_from(limit / batch).unwrap_or(usize::MAX);
+                self.workers.min(fit.max(1))
+            }
+        }
+    }
+
+    /// Charges the estimate for the batch at `seq` and reports whether its
+    /// build may start. The oldest unemitted batch waits for room, as the
+    /// single decode thread did; a later one is charged only if it fits now.
+    fn charge_for_build(&mut self, seq: u64, rows: usize) -> bool {
+        let Some(charger) = &self.charger else {
+            return true;
+        };
+        let estimate = charger.estimate(rows);
+        if seq != self.next_emit && !charger.fits_now(estimate) {
+            return false;
+        }
+        self.charges
+            .insert(seq, charger.budget.charge_waiting(estimate));
+        true
+    }
+
+    /// Corrects the emitted batch's charge to its measured bytes. When the
+    /// growth does not fit while later batches hold estimates, those are
+    /// refunded first (each is charged in full at its own emission), so this
+    /// wait depends only on batches already handed downstream, as the single
+    /// decode thread's did, and a batch larger than the budget is admitted
+    /// once nothing else is held.
+    fn settle(&mut self, seq: u64, out: Prefetched) -> Prefetched {
+        let estimate = self.charges.remove(&seq);
+        let Some(charger) = self.charger.as_mut() else {
+            return out;
+        };
+        let Prefetched::Batch(Built::Columnar(batch, _)) = out else {
+            return out;
+        };
+        let bytes = batch.heap_bytes() as u64;
+        let growth = bytes.saturating_sub(estimate.as_ref().map_or(0, IngestByteCharge::bytes));
+        if growth > 0 && !self.charges.is_empty() && !charger.fits_now(growth) {
+            self.charges.clear();
+        }
+        let charge = match estimate {
+            Some(mut charge) => {
+                charge.resize_waiting(bytes);
+                charge
+            }
+            None => charger.budget.charge_waiting(bytes),
+        };
+        charger.observe(&batch);
+        Prefetched::Batch(Built::Columnar(batch, Some(charge)))
+    }
+
+    fn received(&mut self, seq: u64, out: Prefetched) {
+        if !matches!(out, Prefetched::Batch(_)) {
+            // Nothing after a terminal outcome is emitted, so stop collecting
+            // and drop spans waiting for their charge.
+            self.input_ended = true;
+            self.held = None;
+        }
+        self.ready.insert(seq, out);
+    }
+
+    fn run(
+        mut self,
+        builders: &Builders<'_>,
+        tx: &tokio::sync::mpsc::Sender<Prefetched>,
+        on_batch_queued: Option<&BuildStartHook>,
+    ) {
+        loop {
+            while let Some(out) = self.ready.remove(&self.next_emit) {
+                let seq = self.next_emit;
+                self.next_emit += 1;
+                let out = self.settle(seq, out);
+                let is_batch = matches!(out, Prefetched::Batch(_));
+                if tx.blocking_send(out).is_err() {
+                    // Receiver dropped: the loader returned early (a write
+                    // failed, or an earlier terminal outcome was consumed).
+                    return;
+                }
+                if !is_batch {
+                    return;
+                }
+                if let Some(hook) = on_batch_queued {
+                    hook();
+                }
+            }
+            if self.held.is_none() && !self.input_ended && self.window() < self.window_cap() {
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                match collect_spans(&mut self.state, self.batch_rows, None) {
+                    SpanOutcome::Done => self.received(seq, Prefetched::Done),
+                    SpanOutcome::Failed(reason) => {
+                        self.received(seq, Prefetched::BatchFailed { reason })
+                    }
+                    SpanOutcome::Spans(spans) => self.held = Some((seq, spans)),
+                }
+                continue;
+            }
+            if let Some((seq, spans)) = self.held.take() {
+                let rows = spans.iter().map(|(b, _)| b.num_rows()).sum();
+                if self.charge_for_build(seq, rows) {
+                    match builders.dispatch(seq, spans) {
+                        Some(out) => self.received(seq, out),
+                        None => self.building += 1,
+                    }
+                    continue;
+                }
+                self.held = Some((seq, spans));
+            }
+            if self.building == 0 {
+                return;
+            }
+            let Some((seq, out)) = builders.recv() else {
+                return;
+            };
+            self.building -= 1;
+            self.received(seq, out);
+        }
+    }
+}
+
+/// Spawn the decode/build stage (issues #680, #4210) as one blocking task
+/// feeding a bounded channel. On it a [`DecodeCoordinator`] collects each
+/// batch's spans from the K stride cursors in deal order and builds the
+/// batches on `decode_workers` threads (inline at 1), emitting the outcomes in
+/// collection order through `blocking_send`; the send blocks when the channel
+/// already holds `queue_depth` batches, which is the back-pressure that
+/// bounds the queue to `queue_depth` built batches. The task stops after
+/// sending a terminal outcome (`Done`/`BatchFailed`/`RowRejected`), which
+/// follows every batch before it and no batch after it, or when the receiver
+/// is dropped (the loader returned early). Returns the receiving half plus
+/// the task's join handle, which the caller reaps to distinguish a clean end
+/// from a decode-task panic.
 #[allow(clippy::too_many_arguments)]
 fn spawn_decode_pipeline(
-    mut state: StrideCursors,
+    state: StrideCursors,
     mapping: Arc<Mapping>,
     limits: LogIngestLimits,
     rules: Arc<TenantRules>,
     now_ns: i64,
     batch_rows: usize,
     path: LoadPath,
-    on_build_start: Option<BuildStartHook>,
+    on_build_start: Option<SeqBuildHook>,
     on_batch_queued: Option<BuildStartHook>,
     queue_depth: usize,
-    mut charger: Option<BatchCharger>,
+    charger: Option<BatchCharger>,
+    decode_workers: usize,
 ) -> (
     tokio::sync::mpsc::Receiver<Prefetched>,
     tokio::task::JoinHandle<()>,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(queue_depth);
     let handle = tokio::task::spawn_blocking(move || {
-        loop {
-            let (next_state, built) = match path {
-                LoadPath::Row => decode_and_build_stride(
-                    state,
-                    Arc::clone(&mapping),
-                    limits.clone(),
-                    &rules,
-                    now_ns,
-                    batch_rows,
-                    on_build_start.as_ref(),
-                ),
-                LoadPath::Columnar => decode_and_build_stride_columnar(
-                    state,
-                    Arc::clone(&mapping),
-                    limits.clone(),
-                    &rules,
-                    now_ns,
-                    batch_rows,
-                    on_build_start.as_ref(),
-                    charger.as_mut(),
-                ),
+        let ctx = BuildContext {
+            mapping,
+            limits,
+            rules,
+            now_ns,
+            path,
+            on_build_start,
+        };
+        std::thread::scope(|scope| {
+            let builders = Builders::start(scope, &ctx, decode_workers);
+            let coordinator = DecodeCoordinator {
+                state,
+                batch_rows,
+                workers: builders.parallelism(),
+                charger,
+                charges: std::collections::HashMap::new(),
+                ready: std::collections::BTreeMap::new(),
+                held: None,
+                building: 0,
+                next_seq: 0,
+                next_emit: 0,
+                input_ended: false,
             };
-            state = next_state;
-            let is_batch = matches!(built, Prefetched::Batch(_));
-            if tx.blocking_send(built).is_err() {
-                // Receiver dropped: the loader returned early (a write failed,
-                // or an earlier terminal outcome was consumed). Stop decoding.
-                break;
-            }
-            if is_batch {
-                if let Some(hook) = &on_batch_queued {
-                    hook();
-                }
-            } else {
-                // A terminal outcome was the last thing to send.
-                break;
-            }
-        }
+            coordinator.run(&builders, &tx, on_batch_queued.as_ref());
+        });
     });
     (rx, handle)
 }
@@ -1815,7 +2159,7 @@ struct StrideCursors {
     /// Rotates which live cursors receive the remainder share each round, so
     /// a live-cursor count that outnumbers `batch_rows` (an unusual but valid
     /// configuration) does not starve any cursor forever: see
-    /// [`decode_and_build_stride`].
+    /// [`collect_spans`].
     deal_offset: usize,
     /// `--skip-rows`: the count of leading rows, by FILE-absolute position, to
     /// drop before mapping (issue #1713). Applied in [`collect_spans`] against
@@ -2007,91 +2351,38 @@ fn collect_spans(
     SpanOutcome::Spans(spans)
 }
 
-/// Assemble one batch's spans and build its records row by row (the
+/// Build one batch's records row by row from its dealt spans (the
 /// differential-reference path, [`LoadPath::Row`]).
-fn decode_and_build_stride(
-    mut state: StrideCursors,
-    mapping: Arc<Mapping>,
-    limits: LogIngestLimits,
+fn build_stride_rows(
+    spans: &[(RecordBatch, u64)],
+    mapping: &Mapping,
+    limits: &LogIngestLimits,
     rules: &TenantRules,
     now_ns: i64,
-    batch_rows: usize,
-    on_build_start: Option<&BuildStartHook>,
-) -> (StrideCursors, Prefetched) {
-    let spans = match collect_spans(&mut state, batch_rows, on_build_start) {
-        SpanOutcome::Done => return (state, Prefetched::Done),
-        SpanOutcome::Failed(reason) => return (state, Prefetched::BatchFailed { reason }),
-        SpanOutcome::Spans(spans) => spans,
-    };
-
+) -> Prefetched {
     let total_rows: usize = spans.iter().map(|(b, _)| b.num_rows()).sum();
     let mut records = Vec::with_capacity(total_rows);
-    for (batch, file_base) in &spans {
+    for (batch, file_base) in spans {
         // Resolve column indices once per span (schema is stable across
         // spans and batches, but re-resolving keeps this self-contained and
         // cheap).
-        let cols = match ColumnIndex::resolve(batch, &mapping) {
+        let cols = match ColumnIndex::resolve(batch, mapping) {
             Ok(cols) => cols,
-            Err(reason) => return (state, Prefetched::BatchFailed { reason }),
+            Err(reason) => return Prefetched::BatchFailed { reason },
         };
         for row in 0..batch.num_rows() {
-            match build_record(batch, &cols, &mapping, &limits, rules, now_ns, row) {
+            match build_record(batch, &cols, mapping, limits, rules, now_ns, row) {
                 Ok(record) => records.push(record),
                 Err(reason) => {
-                    return (
-                        state,
-                        Prefetched::RowRejected {
-                            row: file_base + row as u64,
-                            reason,
-                        },
-                    );
+                    return Prefetched::RowRejected {
+                        row: file_base + row as u64,
+                        reason,
+                    };
                 }
             }
         }
     }
-    (state, Prefetched::Batch(Built::Row(records)))
-}
-
-/// Assemble one batch's spans and build a [`ColumnarLogBatch`] directly, column
-/// by column, without materializing a per-row struct (ADR-0109 decision 1, the
-/// path [`load`] drives). Byte-identical output to [`decode_and_build_stride`]
-/// on the same spans is the acceptance anchor (decision 7). With a `charger`
-/// the batch is charged after its spans are collected and before it is built,
-/// so the decoder waits there, holding only the spans, while the budget is
-/// full.
-#[allow(clippy::too_many_arguments)]
-fn decode_and_build_stride_columnar(
-    mut state: StrideCursors,
-    mapping: Arc<Mapping>,
-    limits: LogIngestLimits,
-    rules: &TenantRules,
-    now_ns: i64,
-    batch_rows: usize,
-    on_build_start: Option<&BuildStartHook>,
-    charger: Option<&mut BatchCharger>,
-) -> (StrideCursors, Prefetched) {
-    let spans = match collect_spans(&mut state, batch_rows, on_build_start) {
-        SpanOutcome::Done => return (state, Prefetched::Done),
-        SpanOutcome::Failed(reason) => return (state, Prefetched::BatchFailed { reason }),
-        SpanOutcome::Spans(spans) => spans,
-    };
-
-    let rows: usize = spans.iter().map(|(b, _)| b.num_rows()).sum();
-    let charge = charger.as_deref().map(|c| c.charge_before_build(rows));
-    match build_columnar_batch(&spans, &mapping, &limits, rules, now_ns) {
-        Ok(batch) => {
-            let charge = match (charger, charge) {
-                (Some(charger), Some(charge)) => Some(charger.settle(charge, &batch)),
-                _ => None,
-            };
-            (
-                state,
-                Prefetched::Batch(Built::Columnar(Box::new(batch), charge)),
-            )
-        }
-        Err(ColBuildError::Batch(reason)) => (state, Prefetched::BatchFailed { reason }),
-        Err(ColBuildError::Row { row, reason }) => (state, Prefetched::RowRejected { row, reason }),
-    }
+    Prefetched::Batch(Built::Row(records))
 }
 
 /// The early shard-skew warning checkpoint (issue #560): the number of data

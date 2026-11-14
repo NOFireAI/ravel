@@ -115,13 +115,13 @@ impl GeometryRequest {
     }
 
     /// The memory budget a metrics or spans load bounds a derived depth by:
-    /// one read cursor and `concurrent_flushes` flushes outside it. Those
+    /// one read cursor, one build and `concurrent_flushes` flushes outside it. Those
     /// loads charge nothing to it.
     pub(super) fn sequential_memory_budget(
         &self,
         concurrent_flushes: u64,
     ) -> Result<Option<u64>, LoadError> {
-        LoadMemory::resolve(self.load_memory, 1, concurrent_flushes)
+        LoadMemory::resolve(self.load_memory, 1, 1, concurrent_flushes)
             .map(|memory| memory.map(|m| m.budget_bytes))
             .map_err(LoadError::Setup)
     }

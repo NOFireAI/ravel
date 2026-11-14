@@ -994,6 +994,11 @@ pub(super) const DECODE_QUEUE_BATCHES_ZERO: &str = "--decode-queue-batches must 
                                          of decoded batches allowed to queue ahead of the shard \
                                          writers); 0 was given";
 
+/// `--decode-workers 0`, rejected on the logs signal.
+pub(super) const DECODE_WORKERS_ZERO: &str = "--decode-workers must be at least 1 (the number of \
+                                              threads building decoded batches), or omitted for \
+                                              one per four available cores; 0 was given";
+
 /// Reject the two lever values both sequential paths call invalid and warn
 /// about a value either path would ignore, shared by the metrics and spans
 /// loads because the rule and the reasoning are identical on both.

@@ -461,6 +461,7 @@ async fn decode_object_hashes(
         None,
         queue_depth,
         None,
+        1,
     );
     let mut hashes = Vec::new();
     while let Some(p) = rx.recv().await {
@@ -1239,18 +1240,18 @@ async fn next_batch_decode_overlaps_current_batch_write() {
 /// A rejected row in the *second* batch must report its absolute index
 /// into the whole file, not an index relative to that batch or to its own
 /// stride cursor's partition. `file_base` is threaded through
-/// `decode_and_build_stride`, a free function outside the loop the
+/// `build_stride_rows`, a free function outside the loop the
 /// prefetch refactor introduced, and easy to drop by accident (no
 /// existing test drove a real multi-batch `load()` far enough to catch
 /// it: `future_skew_beyond_the_bound_is_rejected` calls `build_record`
 /// directly on row 0, and `batch_failed_reports_durable_tokens_not_empty`
 /// hand-constructs a `LoadError` rather than running a load). Change
-/// `file_base + row as u64` to `row as u64` in `decode_and_build_stride`'s
+/// `file_base + row as u64` to `row as u64` in `build_stride_rows`'s
 /// `RowRejected` arm and the first half of this test (the `read-cursors`
 /// auto-resolved to `1` case below) fails at `assert_eq!(row, 2, ..)` with
 /// `left: 0, right: 2` -- confirmed by performing the flip. The test
 /// panics there, before ever reaching the second half, because both
-/// halves exercise the same shared line: `decode_and_build_stride` is now
+/// halves exercise the same shared line: `build_stride_rows` is now
 /// the only row-decode path, used for every `--read-cursors` value
 /// including `1`, so this one flip is non-vacuous for both.
 ///
