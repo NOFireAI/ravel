@@ -151,15 +151,15 @@ per-statement promise:
 
 4. **Under an ascending-ts TopK the first round of opens is bounded
    independently of the partition count.** Specified only if Stage 0 shows
-   `blocks_scanned` for Q25 rising with partitions. (The trigger is restated
-   in the Stage 0 amendment below.)
+   `blocks_scanned` for Q25 rising with partitions. (Withdrawn in the Stage 0
+   amendment below: the trigger did not fire, and the task is cancelled.)
 
 5. **The parity work outside decisions 1 to 4 and 6 is routed, not
    dropped.** Each item names its home and the figure it must move:
 
    | Item | Figure | Home |
    |---|---|---|
-   | Cold resolve floor after a restart | Q1 0.082 s against 0.002 s | #3231 |
+   | Cold resolve floor after a restart (restated as the Q1 per-statement floor in the Stage 0 amendment below) | Q1 0.082 s against 0.002 s | #3231 |
    | Narrow-column cold read | Q2 0.485 s (41x), Q8 | ADR-3217 amendment, #3217 |
    | String length from offsets | Q28 5.415 s against 0.792 s | ADR-3217 amendment, #3217 |
    | Q30 cold | from the per-phase split | ADR-3217 amendment, #3217 |
@@ -195,6 +195,9 @@ per-statement promise:
    same page choice the objects must be byte-identical to today's.
    Dictionaries are an in-memory batch representation. No RLOG layout,
    proto, key layout or commit token is touched, so no version bump.
+
+   (Decision 8, per-object metadata loaded before readiness, is added in the
+   Stage 0 amendment below.)
 
 ```mermaid
 flowchart TD
@@ -336,8 +339,11 @@ in comment 6882960874, step 2 and the Q25 test in comment 6883696111.
   explanation noticed after the run (objects opened growing as about
   min(222, 2 x partitions)) was not used as evidence; it was pre-registered
   separately (comment 6883009414) and refuted: 53, 64, 72 and 128 objects
-  opened at 16, 32, 64 and 128 partitions, with 64 inside the 15% of 32
-  that the pre-registration named as refutation. Task #4209 is cancelled.
+  opened at 16, 32, 64 and 128 partitions. The prediction held at 32 and
+  128 but not at 16 (53 against 26 to 40) or 64 (72 against 110 to 150),
+  and the pre-registration named this as its refutation: the 64-partition
+  figure (72) within 15% of the 32-partition figure (64). Task #4209 is
+  cancelled.
   The Q25 and Q27 slowdown goes to the partition-width item in decision 5
   (#3231) with these figures as its starting point.
 - **Decision 3, supporting evidence.** On the fast path, 384 GET permits
@@ -374,19 +380,30 @@ identical. A cut of 12% in encode CPU moving wall 5%, and parallel page
 encode moving it 0%, while the decoder thread stays about 90% busy, put
 the single decoder on the load's critical path.
 
-So decision 6's list is ordered and narrowed as follows:
+So decision 6's six items, plus one, are settled as follows:
 
-- Decode each cursor on its own blocking task (#4210) is first, and its
-  acceptance shows wall falling, not only CPU.
+- Decode each cursor on its own blocking task (#4210) is first. Its tests
+  prove builds run concurrently and the batch sequence is unchanged; its
+  effect on wall is measured by the epic on the published entry load
+  before the write gate is re-measured.
 - The write gate (#4211) is held until the decoder is off the critical
   path, then re-measured.
 - Estimated page choice (#4212) stays, after #4210: its win is small and
   its stored-byte and cold-read cost is inside the bands.
+- Deriving loader shards, cursors and flush concurrency from cores (#4214)
+  stays, after #4210, and is not measured yet: Stage 0 ran on one machine
+  size, and the metal load (562 s against 581 s on c6a.4xlarge) is the
+  only evidence. It is specified from a load on a larger machine.
+- Parallelising the flush sort and content hash (#4215) is cancelled: the
+  flush sort is 0.75% of load CPU and no content-hash frame appears in the
+  profile, under the 15% trigger.
 - Removing non-loader seconds (#4216) is cancelled (2 s).
-- New: remove row-shaped materialization from the columnar load path (the
-  `columnar_key_values` grid, the per-row attribute vectors in
-  `partition_columnar` at 7.4%, the `BTreeSet`, the value clones; about a
-  third of load CPU in total). This reopens the rejected alternative on
+- New (#4220): remove row-shaped materialization from the columnar load
+  path: the `columnar_key_values` grid (10.7%), the per-row attribute
+  vectors in `partition_columnar` (7.4%), the `BTreeSet` inserts (5.0%) and
+  the `ColumnValue` pushes, clones and drops (about 13%). Those inclusive
+  shares sum to about 36% and may overlap, so "about a third of load CPU"
+  is an upper estimate. This reopens the rejected alternative on
   carrying column buffers further into the writer, on the 15% trigger it
   named; whether Parquet dictionaries are carried is decided inside that
   task from its own measurement, under the ADR-2614 memory accounting.
@@ -401,12 +418,17 @@ hits, 0 misses, one GET of 33 bytes. Per-object metadata is not warmed:
 Q21's plan phase on the stock arm is 222 GETs and 57,190,858 bytes of
 footers and directories, all misses, inside the timed query, and Q2 and Q8
 read their 222 footers inside their scan phase (439 GETs, 182,887,672
-bytes). The warm-up therefore also reads each recent logs object's footer
-and four directories, not column pages, into the read cache before
-`/readyz` latches, within the cache budget and the existing warm-up
-deadline, and degrades to warming less on any failure, as ADR-0046
-requires. It applies to every deployment, as ClickHouse loads part
-metadata at startup. Task #4218.
+bytes). The warm-up therefore also reads the footer and four directories,
+not column pages, of every logs object in the window it already warms,
+into the read cache before `/readyz` latches. This metadata pass is not
+bounded by the warm-up's whole-object part cap
+(`MAX_PARTS_PER_TENANT_PER_SIGNAL`, 4 parts per tenant and signal, which
+stays for whole-object warming), because at four objects it would leave
+218 of these 222 reads in the timed query. It is bounded by the read-cache
+budget and the existing 10 s `WARM_DEADLINE`, and degrades to warming less
+on any failure, as ADR-0046 requires. On this tenant it is about 57 MB, or
+about 0.2 s at the volume's 256 MB/s. It applies to every deployment, as
+ClickHouse loads part metadata at startup. Task #4218.
 
 **The Q1 floor.** Q1 cold takes 0.100 to 0.115 s and reads nothing after
 the catalog (one GET, 33 bytes, 223 cache hits). The Target section's
