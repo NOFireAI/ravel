@@ -1901,10 +1901,11 @@ fn derive_level_workers(
     best
 }
 
-/// `E`, the level-2 builders in flight at once, the open one included
-/// (ADR-3853 D3): the cores the unit may use, capped by how many final parts
-/// fit in what `U` leaves beside level 2's resident read side and in-flight
-/// GETs, and never under 2.
+/// The most level-2 builders one range worker may reserve room for, the open
+/// one included (ADR-3853 D3, #4123 correction): the cores the unit may use,
+/// capped by how many final parts fit in what `U` leaves beside level 2's
+/// resident read side and in-flight GETs. [`level2_pipeline_plan`] takes `E`
+/// from it, floored at 2.
 fn level2_encode_builders(
     share: usize,
     ceiling: u64,
@@ -1914,7 +1915,38 @@ fn level2_encode_builders(
 ) -> usize {
     let room = ceiling.saturating_sub(resident).saturating_sub(in_flight);
     let fit = usize::try_from(room / part_target.max(1)).unwrap_or(usize::MAX);
-    share.min(fit).max(2)
+    share.min(fit)
+}
+
+/// The one range worker's plan and `E` (ADR-3853 D3, #4123 correction): the
+/// plan is drawn under `ceiling - k x part_target`, with `k` the most builders
+/// up to `fit.builders` whose plan is not a cursor merge, so the pass budget
+/// and the `k` final parts never share room, and `E = max(2, k)`. Only the
+/// floor of 2 takes the unit past `U`, by `(2 - k)` final part targets. With
+/// no `k` above 0 left off the cursor path the plan is `whole`, the one under
+/// the whole ceiling.
+fn level2_pipeline_plan(
+    config: &CompactorConfig,
+    runs: &[RlogInputCatalog],
+    stream_ids: &[LogStreamId],
+    width_ns: i64,
+    fit: &Level2Fit,
+    whole: Option<MergePlan>,
+) -> Result<(MergePlan, usize)> {
+    let floor = config.rlog_memory_target_bytes();
+    for k in (1..=fit.builders).rev() {
+        let reserved = (k as u64).saturating_mul(fit.part_target);
+        let ceiling = fit.ceiling.saturating_sub(reserved);
+        let plan = plan_merge_with(config, runs, stream_ids, width_ns, ceiling, floor)?;
+        if plan.mode != MergeReadMode::Cursor {
+            return Ok((plan, k.max(2)));
+        }
+    }
+    let plan = match whole {
+        Some(plan) => plan,
+        None => plan_merge_with(config, runs, stream_ids, width_ns, fit.ceiling, floor)?,
+    };
+    Ok((plan, 2))
 }
 
 /// The stop token every worker of one level of a unit shares (ADR-3853 D4,
@@ -3726,11 +3758,15 @@ fn level2_streams(
 
 /// What level 2's worker count is checked against (ADR-3853 D5): one worker's
 /// read side, `need`, measured over the runs level 1 wrote, under the unit's
-/// `ceiling`, and the unit's core `share`.
+/// `ceiling`, and the unit's core `share`; and, for one range worker, the most
+/// final parts of `part_target` bytes it may reserve room for
+/// ([`level2_encode_builders`]).
 struct Level2Fit {
     need: u64,
     ceiling: u64,
     share: usize,
+    builders: usize,
+    part_target: u64,
 }
 
 /// The `W2` level 2 starts from (ADR-3853, #4140 amendment): a configured
@@ -3748,15 +3784,16 @@ fn level2_worker_count(configured: Option<usize>, fit: &Level2Fit, ranges: usize
         .max(1)
 }
 
-/// `W2` and each range worker's plan, over its own streams under
-/// `ceiling / W2` (ADR-3853 D5 amendment). A configured
-/// [`CompactorConfig::level2_workers`] is taken as it is, capped at the range
-/// count, and refused through `refuse` with the worker ceiling when one
-/// worker's read side or plan does not fit it. A derived one starts from
+/// `W2`, each range worker's plan, over its own streams under `ceiling / W2`
+/// (ADR-3853 D5 amendment), and the builders each worker keeps in flight. A
+/// configured [`CompactorConfig::level2_workers`] is taken as it is, capped at
+/// the range count, and refused through `refuse` with the worker ceiling when
+/// one worker's read side or plan does not fit it. A derived one starts from
 /// [`level2_worker_count`] and is lowered one worker at a time until every
 /// plan fits; it is refused only when one worker does not fit the whole
-/// ceiling. `whole` is the plan over every stream under the whole ceiling,
-/// the one worker's plan at `W2 = 1`.
+/// ceiling. At `W2 = 1` the plan and `E` come from [`level2_pipeline_plan`],
+/// with `whole`, the plan over every stream under the whole ceiling, as its
+/// last resort; several workers encode inline with one builder each.
 #[allow(clippy::too_many_arguments)]
 fn level2_plans(
     config: &CompactorConfig,
@@ -3767,20 +3804,21 @@ fn level2_plans(
     fit: Level2Fit,
     whole: MergePlan,
     refuse: impl Fn(u64) -> MaintainError,
-) -> Result<(usize, Vec<MergePlan>)> {
+) -> Result<(usize, Vec<MergePlan>, usize)> {
     let derived = config.level2_workers.is_none();
     let mut workers = level2_worker_count(config.level2_workers, &fit, ranges.len());
     let floor = config.rlog_memory_target_bytes();
     let mut whole = Some(whole);
     loop {
         let ceiling = fit.ceiling / workers as u64;
+        let mut builders = 1;
         let plans = if fit.need > ceiling {
             None
         } else if workers == 1 {
-            Some(vec![match whole.take() {
-                Some(plan) => plan,
-                None => plan_merge_with(config, runs, stream_ids, width_ns, ceiling, floor)?,
-            }])
+            let (plan, e) =
+                level2_pipeline_plan(config, runs, stream_ids, width_ns, &fit, whole.take())?;
+            builders = e;
+            Some(vec![plan])
         } else {
             let plans = (0..workers)
                 .map(|w| {
@@ -3793,7 +3831,7 @@ fn level2_plans(
         };
         match plans {
             Some(plans) if plans.iter().all(|p| p.mode != MergeReadMode::Cursor) => {
-                return Ok((workers, plans));
+                return Ok((workers, plans, builders));
             }
             _ if derived && workers > 1 => workers -= 1,
             _ => return Err(refuse(ceiling)),
@@ -4274,7 +4312,10 @@ async fn merge_in_unit(
         }
     }
     befores.push(before);
-    let (level2_workers, plans) = level2_plans(
+    // One range worker keeps D3's encode pipeline with `E` builders; several
+    // encode inline, so each holds one builder, the `part_target` its fit was
+    // checked with.
+    let (level2_workers, plans, builders) = level2_plans(
         config,
         &runs,
         stream_ids,
@@ -4284,6 +4325,14 @@ async fn merge_in_unit(
             need,
             ceiling,
             share: layout.share,
+            builders: level2_encode_builders(
+                layout.share,
+                ceiling,
+                resident,
+                in_flight,
+                part_target,
+            ),
+            part_target,
         },
         plan,
         |ceiling_bytes| MaintainError::MergeTwoLevelUnsupported {
@@ -4292,13 +4341,6 @@ async fn merge_in_unit(
         },
     )?;
     let level2_ceiling = ceiling / level2_workers as u64;
-    // One range worker keeps D3's encode pipeline; several encode inline, so
-    // each holds one builder, the `part_target` its fit was checked with.
-    let builders = if level2_workers == 1 {
-        level2_encode_builders(layout.share, ceiling, resident, in_flight, part_target)
-    } else {
-        1
-    };
     // The joint derivation's `W2`, kept beside the re-derived one only where
     // they differ; zero when they agree or when `W2` was configured.
     let level2_workers_predicted = layout
@@ -17656,7 +17698,11 @@ mod tests {
             let input_groups = group_extents(&probe, &keys).await.len() as u64;
             assert_eq!(input_groups, 60);
 
+            // The cores set how many final parts level 2 reserves room for,
+            // and so its pass budget and pass count.
+            USABLE_CORES_OVERRIDE.with(|c| c.set(Some(4)));
             let (outcome, run, store, _) = compact_two_level(&config).await;
+            USABLE_CORES_OVERRIDE.with(|c| c.set(None));
             assert!(matches!(
                 outcome.expect("two-level compact"),
                 CompactionOutcome::Compacted { .. }
@@ -17688,10 +17734,10 @@ mod tests {
             assert_eq!(r.block_read.requests, single.report.block_read.requests);
             assert!(run_blocks > 0);
             assert_eq!(run_blocks, 100, "{line}");
-            assert_eq!(r.level2_passes, 7, "{r:?}");
+            assert_eq!(r.level2_passes, 8, "{r:?}");
             assert_eq!(
                 r.level2_block_decodes, run_blocks,
-                "each run block decoded once across 7 passes: {r:?}"
+                "each run block decoded once across 8 passes: {r:?}"
             );
             assert!(r.scratch_write_bytes > 0, "{r:?}");
             assert!(r.scratch_read_bytes >= r.scratch_write_bytes, "{r:?}");
@@ -18195,6 +18241,50 @@ mod tests {
                 "{peaks:?} against {worker_ceiling}"
             );
             assert!(peaks[1] > peaks[0], "the padded ranges' worker: {peaks:?}");
+            assert_eq!(published_records(&store).await.len(), 2400);
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// ADR-3853, #4123 correction: one range worker plans its passes under
+        /// what its `E` final parts leave of `U`, so the builders in flight
+        /// and the pass rows are never admitted against the same room. The
+        /// padded range fixture at `W2 = 1`, under the range fixture's
+        /// ceiling of 1,145,168 bytes and 16 cores, keeps `E` = 7 builders,
+        /// and the unit's peak, every term the tracker counts, stays at or
+        /// under `U`; planned under the whole ceiling, as before the
+        /// correction, the same unit peaked at 1,339,571 bytes.
+        #[tokio::test]
+        async fn one_range_worker_keeps_its_builders_and_passes_under_the_ceiling() {
+            let (_, _, per_input) = single_level_oracle().await;
+            let dir = fresh_scratch("pipeline-peak");
+            let config = range_worker_config(per_input, 1, dir.clone());
+            let ceiling = config.merge_resident_ceiling();
+            assert_eq!(ceiling, 1_145_168);
+            let store = ProbeStore::new();
+            seed_inputs(&store, &padded_tail_inputs()).await;
+            USABLE_CORES_OVERRIDE.with(|c| c.set(Some(16)));
+            let (outcome, run) = compact_logged(&store, &config).await;
+            USABLE_CORES_OVERRIDE.with(|c| c.set(None));
+            assert!(
+                matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                "{outcome:?}"
+            );
+            let line = run.line("rlog two-level merge");
+            assert_eq!(log_field(&line, "level2_workers"), 1, "{line}");
+            assert_eq!(log_field(&line, "cores_per_unit"), 16, "{line}");
+            let builders = log_field(&line, "encode_builders");
+            assert_eq!(builders, 7, "{line}");
+            let peak = run.tracker.peak_resident_bytes();
+            let level2 = run.tracker.level2_worker_peak_bytes();
+            assert_eq!(level2.len(), 1, "{level2:?}");
+            assert!(
+                peak <= ceiling && level2[0] <= ceiling,
+                "unit peak {peak}, level-2 worker peak {}, against U {ceiling}: E {builders} \
+                 is above its floor of 2, so no builder may take the unit past U; only the \
+                 floor, where fewer than 2 final parts fit beside the read side, may, by one \
+                 part target for each builder the room does not hold",
+                level2[0]
+            );
             assert_eq!(published_records(&store).await.len(), 2400);
             assert!(scratch_entries(&dir).is_empty());
         }
@@ -19420,6 +19510,8 @@ mod tests {
                 need,
                 ceiling,
                 share: 32,
+                builders: 0,
+                part_target: 1_572_864_000,
             };
             assert_eq!(level2_worker_count(None, &fit(shard0.2), usize::MAX), 4);
             assert_eq!(level2_worker_count(None, &fit(shard1.2), usize::MAX), 8);
@@ -19506,8 +19598,9 @@ mod tests {
         /// runs `W1` leaves: measured pricing gives (4, 5) of 8 or (17, 11)
         /// of 32; ceiling pricing fits a level-2 worker only where groups
         /// leave few enough runs, (1, 1) of 8 or (3, 4) of 32.
-        /// `E` is the core share while final parts fit beside level 2's
-        /// resident side, and 2 when they do not.
+        /// The builders level 2 reserves room for are the core share while
+        /// final parts fit beside level 2's resident side, and as many as fit
+        /// when they do not.
         #[test]
         fn level1_workers_and_encode_builders_at_the_production_shape() {
             const GIB: u64 = 1 << 30;
@@ -19582,12 +19675,13 @@ mod tests {
             );
             assert_eq!(
                 level2_encode_builders(share, ceiling, 113 * 2 * 22_000_000, 32_000_000, TARGET),
-                2
+                1
             );
+            assert_eq!(level2_encode_builders(1, ceiling, 0, 0, TARGET), 1);
             assert_eq!(
-                level2_encode_builders(1, ceiling, 0, 0, TARGET),
-                2,
-                "never under 2"
+                level2_encode_builders(share, ceiling, ceiling, 0, TARGET),
+                0,
+                "no room is reserved where no final part fits; E's floor of 2 is the pipeline's"
             );
         }
 

@@ -730,7 +730,8 @@ first error; a lost claim ends the unit `Cancelled` with its publish
 **`E` is derived (D3).** D3 fixed `E` at 2. Writing parts is about 80% of
 merge CPU (the #3853 comment 6670968041 measurement the #3878 amendment
 cites), so two builders leave level 2 encoding on about one core. `E` is
-now computed once per unit, after (b) holds:
+now computed once per unit, after (b) holds (the #4123 correction replaces
+this formula):
 
 ```
 E = max(2, min(core share, (U - resident - reads in flight) / final part target))
@@ -743,8 +744,9 @@ block)` with `R` in runs, the #3943 correction). `E` is on the
 ledger. Parts are still PUT in `part_index` order, and the tracker's writer
 term carries every builder in flight, not only the open one. The floor of 2
 can take the writer term one final part target past the single one (b)
-reserves, when `U` leaves room for fewer than two parts beside the resident
-side; (b) itself is unchanged.
+reserves (the #4123 correction states the bound that holds), when `U`
+leaves room for fewer than two parts beside the resident side; (b) itself
+is unchanged.
 
 ## Correction (2026-11-07): constraint (b) counts runs at two blocks per run (#3943)
 
@@ -914,7 +916,7 @@ worker's read side and its one builder, stays within `U`. That bounds the
 plans, not the unit's peak: at `W2 = 1` level 2 keeps D3's pipeline, whose
 `E` is sized from the room beside the resident side and reads in flight
 without the pass budget, so the writer term and the pass rows share one
-room; on the padded range fixture that peaks at 2,770,910 bytes against `U`
+room (the #4123 correction plans them apart); on the padded range fixture that peaks at 2,770,910 bytes against `U`
 = 2,139,680 with `E` = 16 (issue #4123, present at 059209f). At `W2 > 1`
 each worker encodes inline with one builder, counted in `need`. Level-2
 workers keep the full `merge_cursor_budget_bytes`, not a `W2`th of it:
@@ -1169,7 +1171,8 @@ once, by the unit after every worker has returned, under `CreateIfAbsent`,
 as before. `a_failed_level2_worker_stops_every_level2_worker` pins it.
 
 **Encode.** One level-2 worker keeps D3's pipeline with `E` builders, so
-the server defaults encode as before. Several encode each closed part
+the server defaults encode as before (the #4123 correction plans its passes
+beside them). Several encode each closed part
 inline, one builder per worker, the final part target its fit was checked
 with.
 
@@ -1211,12 +1214,12 @@ at least 1, and then lowered one worker at a time until no worker's plan is
 a cursor merge, as before. The predicted `W2` no longer bounds it. A
 configured `level2_workers` still wins: it is capped at the range count
 only, and refused with its worker ceiling when it does not fit
-(`level2_worker_count`, `crates/ravel-maintain/src/rlog.rs:3741`).
+(`level2_worker_count`, `crates/ravel-maintain/src/rlog.rs:3777`).
 Re-deriving moves no range: the ranges are cut from the per-stream record
 tally and `rlog_range_records` alone, and their part-index windows from
 the unit's records, before `W2` is chosen
-(`crates/ravel-maintain/src/rlog.rs:4263`,
-`crates/ravel-maintain/src/rlog.rs:4267`); `W2` only decides which worker
+(`crates/ravel-maintain/src/rlog.rs:4301`,
+`crates/ravel-maintain/src/rlog.rs:4305`); `W2` only decides which worker
 takes which ranges.
 
 Predicted at hour 498272's geometry, with M1's input counts, its `W1`, its
@@ -1264,3 +1267,77 @@ re-derived one differs from it and `W2` was derived, and 0 otherwise. It is
 in the request ledger and on the `rlog two-level merge`, `compaction store
 requests by phase` and `compaction merge ended` log lines, beside
 `level2_workers`, which is the count level 2 ran.
+
+## Correction (2026-11-14): the #4123 correction, one range worker's builders and passes never share room
+
+<!-- amendment-applies: sections="Amendment (2026-11-06): parallel level-1 workers and a derived encode depth (#3873)|Amendment (2026-11-11): the range workers amendment, level 2 on `W2` workers (#4108)" pointer="#4123 correction" -->
+<!-- amendment-supersedes: phrase="computed once per unit, after (b) holds" pointer="#4123 correction" -->
+<!-- amendment-supersedes: phrase="can take the writer term one final part target past the single one (b)" pointer="#4123 correction" -->
+
+The #3873 amendment sized `E` from the room `U` leaves beside level 2's
+resident side and reads in flight, and level 2 at `W2 = 1` then planned its
+passes under the whole of `U`. The plan's pass budget is `U` less the held
+raw bytes or the reads in flight and the largest hot-stream cursor charge
+`c` (`crates/ravel-maintain/src/rlog.rs:4952`,
+`crates/ravel-maintain/src/rlog.rs:4961`): it does not take out the `E`
+final parts, so the builders and the pass rows were admitted against the
+same room. The plan's floor does not reserve it either: the floor is
+compared with the room (`crates/ravel-maintain/src/rlog.rs:4951`,
+`crates/ravel-maintain/src/rlog.rs:4962`), not subtracted from the budget.
+On the padded range fixture at `W2 = 1` the unit peaked at 2,770,910 bytes
+against `U` = 2,139,680 with `E` = 16 (#4108 executor report, issue
+#4123). That `U` does not reproduce on this tree: the padded fixture's own
+per-input cost now gives `U` = 3,131,168, where the passes never fill the
+budget and the same 16 builders peak at 2,801,023, under it (measured
+2026-11-14). Under the range fixture's ceiling, 1,145,168 bytes, they do:
+`E` = 7 and a peak of 1,339,571 (measured 2026-11-14).
+
+**The two options.** Issue #4123 offers two. Option (1) keeps the plan and
+takes `E` after it, `max(2, min(core share, (U - resident - reads in
+flight - pass budget) / final part target))`. The pass budget already holds
+everything `U` leaves after the reads and `c`, so that room is at most `c`
+less `resident`, and `E` is the floor of 2 on every unit whose largest
+stream is not on cursors: on the fixture above the room is 0 against a pass
+budget of 1,105,892 and `E` is 2 (measured 2026-11-14). That undoes the
+#3873 amendment's encode parallelism to remove an overshoot. Option (2)
+keeps `E` and plans the passes under `U - (E - 1) x final part target`.
+This correction takes option (2) and reserves all `E` builders, not `E -
+1`: since the plan's floor is not taken out of its budget, reserving `E -
+1` leaves the open builder sharing room with the passes, one final part
+target past `U` (predicted from the budget formula above; on the fixture
+the passes did not reach that room and the `E - 1` variant stayed under
+`U`, measured 2026-11-14).
+
+**The rule.** For one range worker, `k` starts at the most builders whose
+final parts fit beside the read side, `min(core share, (U - resident -
+reads in flight) / final part target)` (`level2_encode_builders`, which no
+longer applies the floor), and the worker's plan is drawn under `U - k x
+final part target`; while that plan is a cursor merge `k` drops by one.
+`E = max(2, k)`. With no `k` of 1 or more off the cursor path the plan is
+the one under the whole `U`, as before, with `E` = 2. So the read side the
+plan admits and the `k` builders reserved beside it sum to `U`, and only
+the floor of 2 adds builders without room: the unit passes `U` by at most
+`(2 - k)` final part targets, one when `k` is 1 and two when `k` is 0.
+Constraint (b) puts one final part beside the read side, so the first `k`
+tried is at least 1. A builder still closes at its target plus the record
+that crosses it, as the writer term always has. Refusals do not move: the
+plan under the whole `U` is the last one tried, and a unit is refused only
+when that plan is a cursor merge, as before (`level2_pipeline_plan`,
+`crates/ravel-maintain/src/rlog.rs:1928`). Choosing `k` plans up to `k`
+times over resident metadata, no store request.
+
+`one_range_worker_keeps_its_builders_and_passes_under_the_ceiling` runs the
+padded range fixture at `W2 = 1` under 16 cores and the range fixture's
+ceiling and asserts `E` = 7 and a unit peak, every term the tracker counts,
+at or under `U`; with the #3873 formula it fails at 1,339,571 (measured
+2026-11-14). A smaller pass budget can cut more passes over the same runs:
+`two_level_merge_matches_single_level_bytes_and_keys` now pins 8 level-2
+passes where it pinned 7, at 4 cores, with the same part keys, content
+hashes and bytes, and every run block still decoded once.
+
+**Not corrected here.** At `W2 > 1` each range worker encodes inline with
+one builder, counted in `need`, and plans under `U / W2`; its pass budget
+does not take that builder out either, so a worker whose passes fill their
+budget can pass `U / W2` by up to one final part target (predicted, from
+the budget formula; no fixture shows it). Reserving it would let a
+configured `W2` be refused where it is admitted today, a separate change.
