@@ -339,8 +339,9 @@ in comment 6882960874, step 2 and the Q25 test in comment 6883696111.
   explanation noticed after the run (objects opened growing as about
   min(222, 2 x partitions)) was not used as evidence; it was pre-registered
   separately (comment 6883009414) and refuted: 53, 64, 72 and 128 objects
-  opened at 16, 32, 64 and 128 partitions. The prediction held at 32 and
-  128 but not at 16 (53 against 26 to 40) or 64 (72 against 110 to 150),
+  opened at 16, 32, 64 and 128 partitions. The prediction held only at 32;
+  it missed at 16 (53 against 26 to 40), 64 (72 against 110 to 150) and 128
+  (128 against 215 to 222),
   and the pre-registration named this as its refutation: the 64-partition
   figure (72) within 15% of the 32-partition figure (64). Task #4209 is
   cancelled.
@@ -372,20 +373,23 @@ profiled load's flamegraph (inclusive shares of load CPU):
 4. `build_columnar_batch` at 17.7% is above the 15% trigger.
 5. About 2 s of the published load is outside the loader.
 
-One-variable arms against b0: `PageChoice::Estimated` cut CPU 11.9% and
+One-variable arms against b0: `PageChoice::Estimated` cut total load CPU 11.9% and
 wall 5.0% (band: 10 to 30%, missed) for 2.43% more l0 bytes, with Q21, Q28
 and Q29 cold 0.1% to 2.6% slower on that tenant; a 16-permit write gate
 left wall unchanged (+0.5%, band 5 to 25% lower, missed) and l0 bytes
-identical. A cut of 12% in encode CPU moving wall 5%, and parallel page
+identical. A 12% cut in total load CPU (all of it in encode) moving wall 5%, and parallel page
 encode moving it 0%, while the decoder thread stays about 90% busy, put
 the single decoder on the load's critical path.
 
 So decision 6's six items, plus one, are settled as follows:
 
 - Decode each cursor on its own blocking task (#4210) is first. Its tests
-  prove builds run concurrently and the batch sequence is unchanged; its
-  effect on wall is measured by the epic on the published entry load
-  before the write gate is re-measured.
+  prove builds run concurrently and the batch sequence is unchanged. The
+  figure it must move is measured by the epic on the published entry load
+  after it lands, against b0: wall at least 10% under 640.8 s, or the
+  decode thread under 85% busy. If neither moves, the reading that the
+  decoder is the critical path is revisited before the write gate is
+  re-measured.
 - The write gate (#4211) is held until the decoder is off the critical
   path, then re-measured.
 - Estimated page choice (#4212) stays, after #4210: its win is small and
