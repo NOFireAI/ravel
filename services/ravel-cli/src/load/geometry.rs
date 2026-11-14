@@ -649,6 +649,14 @@ pub struct LoadLayoutReport {
     /// from a load that did not set the stride.
     #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
     pub synthetic_ingest_hours: Option<SyntheticIngestHours>,
+    /// A logs load's `decode_wait` (issue #800) in whole milliseconds; absent
+    /// from a metrics or spans load, which does not measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_wait_ms: Option<u64>,
+    /// A logs load's `write_wait` (issue #800) in whole milliseconds; absent
+    /// from a metrics or spans load, which does not measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_wait_ms: Option<u64>,
 }
 
 /// The prefix of the summary line carrying [`LoadLayoutReport`] as JSON.

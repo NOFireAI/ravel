@@ -1,12 +1,16 @@
 //! The logs loader's memory budget (`--load-memory-bytes`, issue #2626,
 //! ADR-2614 decision 5).
 //!
-//! Every built batch is charged to the budget from before the decoder builds
-//! it until the last flush carrying its rows finishes: an estimate before the
-//! build (the previous batch's measured bytes per row, 0 for the first batch),
-//! corrected to the built batch's measured
-//! [`ravel_logseg::ColumnarLogBatch::heap_bytes`] once it exists. The decoder
-//! waits for room and never fails, so the budget bounds what the pipeline
+//! Every built batch is charged to the budget from before a decode worker
+//! builds it until the last flush carrying its rows finishes: an estimate
+//! before the build (the last emitted batch's measured bytes per row, 0 for
+//! the first batch, which builds alone), corrected to the built batch's
+//! measured [`ravel_logseg::ColumnarLogBatch::heap_bytes`] when it is emitted
+//! in sequence. One exception: when the oldest unemitted batch's correction
+//! does not fit, the estimates of the later batches still building are
+//! refunded so it waits only on batches already downstream, and each of those
+//! is charged in full when it is emitted. The decoder waits for room and never
+//! fails, so the budget bounds what the pipeline
 //! holds in batches; memory it does not hold in batches (the process itself,
 //! the Parquet read cursors' decode buffers, each flush's writer working set)
 //! is the floor, which the derived default leaves out of the host's memory.

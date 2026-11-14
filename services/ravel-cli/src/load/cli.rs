@@ -222,6 +222,7 @@ pub async fn run(
     pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
+    decode_workers: Option<usize>,
     target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     ack_margin: Option<Duration>,
@@ -247,6 +248,7 @@ pub async fn run(
         pipeline_depth,
         max_inflight_flushes,
         decode_queue_batches,
+        decode_workers,
         target_bytes,
         max_flush_delay,
         ack_margin,
@@ -414,6 +416,7 @@ pub(crate) async fn run_fold_warning_to(
         pipeline_depth,
         max_inflight_flushes,
         decode_queue_batches,
+        None,
         target_bytes,
         max_flush_delay,
         ack_margin,
@@ -453,6 +456,7 @@ pub async fn run_load_reporting(
     pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
+    decode_workers: Option<usize>,
     target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     ack_margin: Option<Duration>,
@@ -489,6 +493,9 @@ pub async fn run_load_reporting(
     };
     let _ = writeln!(warnings, "{admission_warning}");
     if let Some(warning) = unused_zstd_level_warning(zstd_level, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    if let Some(warning) = unused_decode_workers_warning(decode_workers, signal) {
         let _ = writeln!(warnings, "{warning}");
     }
     if let Some(warning) = unused_group_target_blocks_warning(group_target_blocks, signal) {
@@ -633,6 +640,7 @@ pub async fn run_load_reporting(
 
     let mut memory_options = LoadMemoryOptions::new(load_memory);
     memory_options.ack_margin = ack_margin;
+    memory_options.decode_workers = decode_workers;
     let strided = lane.is_some();
     memory_options.hour_stride = lane;
     let one_batch_warning = Arc::clone(&memory_options.one_batch_warning);
@@ -1092,6 +1100,26 @@ pub(super) fn unused_zstd_level_warning(
     })
 }
 
+/// The warning for a `--decode-workers` a metrics or spans load cannot use,
+/// or `None` when the flag is unset or the load is a logs load. Only the logs
+/// loader builds batches on a worker pool.
+pub(super) fn unused_decode_workers_warning(
+    decode_workers: Option<usize>,
+    signal: SignalArg,
+) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    decode_workers.map(|workers| {
+        format!(
+            "warning: a {noun} load ignores --decode-workers {workers}. Only a logs load builds \
+             its batches on decode workers."
+        )
+    })
+}
+
 /// The warning for a `--group-target-blocks` a metrics or spans load cannot
 /// use, or `None` when the value is the default or the load is a logs load.
 /// The row-group size reaches only the RLOG writer a logs flush runs.
@@ -1327,6 +1355,14 @@ fn print_summary(report: &LoadReport, fold_covered: bool) {
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
+    println!(
+        "  decode_wait      : {:.3}s",
+        report.decode_wait.as_secs_f64()
+    );
+    println!(
+        "  write_wait       : {:.3}s",
+        report.write_wait.as_secs_f64()
+    );
     if let Some(fold) = &report.fold {
         print!("{}", fold_summary(fold, fold_covered));
     }

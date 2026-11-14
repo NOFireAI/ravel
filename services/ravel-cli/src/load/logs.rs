@@ -194,7 +194,8 @@ type BuildStartHook = Arc<dyn Fn() + Send + Sync>;
 
 /// [`load`] with the decode/build hooks and the decode-queue depth injected. See
 /// [`load`] for the contract; `on_build_start` fires once per batch that has
-/// data to build, on the blocking decode/build task, before the per-row loop.
+/// data to build, on the thread that builds it, after its estimate is charged
+/// and before the build runs.
 /// `on_batch_queued` fires once per built batch after it is handed to the
 /// decode->encode channel (issue #680), so a test can observe how far the
 /// decoder has run ahead of the encoders while a write is held. Both are `None`

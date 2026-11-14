@@ -607,8 +607,9 @@ enum Command {
         /// See docs/guides/ingest.md. Defaults to 0 (no skip).
         #[arg(long, default_value_t = 0)]
         skip_rows: u64,
-        /// Number of parallel stride read cursors over the Parquet file's row
-        /// groups (issue #560). A file sorted by a resource-attribute column
+        /// Number of stride read cursors over the Parquet file's row groups
+        /// (issue #560). One decode thread reads the cursors in turn, not in
+        /// parallel; what they buy is spread, not read concurrency. A file sorted by a resource-attribute column
         /// (e.g. ClickBench's `hits.parquet`, sorted by `CounterID`) puts one
         /// value's rows in one contiguous run, so a single sequential reader
         /// fills each `--batch-rows` batch with just that one value: one
@@ -717,9 +718,9 @@ enum Command {
         max_inflight_flushes: u32,
         /// Number of decoded batches allowed to sit queued between the Parquet
         /// decode/build stage and the shard writers (issue #680). A bounded
-        /// channel decouples the two: the reader decodes batch N+1 (and, with
-        /// `--read-cursors > 1`, stride-reads several row-group regions in
-        /// parallel) while the encoders write batch N, so decode and encode
+        /// channel decouples the two: the reader decodes batch N+1 (with
+        /// `--read-cursors > 1`, drawing its rows from each cursor's row-group
+        /// region in turn) while the encoders write batch N, so decode and encode
         /// overlap instead of running in lockstep. The reader blocks when the
         /// channel is full, so the queue holds at most this many built batches;
         /// the extra memory is roughly this count times one batch's built size,
@@ -728,6 +729,24 @@ enum Command {
         /// least 1; 0 is rejected.
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_DECODE_QUEUE_BATCHES)]
         decode_queue_batches: usize,
+        /// Number of threads that build decoded batches on a logs load (issue
+        /// #4210). One decode thread still reads the `--read-cursors` cursors
+        /// and deals every batch's rows in the same order as before; the
+        /// batches' builds (mapping the rows into columnar batches) run on
+        /// this many workers, and the built batches are handed to the shard
+        /// writers in the order they were dealt, so the objects written are
+        /// the same at any value. `1` builds on the decode thread itself,
+        /// the pipeline before this flag. Defaults to one worker per four
+        /// available cores, at least 1 (`available_parallelism / 4`). At
+        /// most this many batches are dealt and not yet handed on at once,
+        /// each charged to `--load-memory-bytes` before its build starts, and
+        /// fewer when that budget holds fewer estimated batches; the first
+        /// batch builds alone. Each such batch keeps its cursors' decoded
+        /// Arrow alive while it builds, so the memory floor counts
+        /// `--read-cursors` buffers per worker. Metrics and spans loads
+        /// ignore it. `0` is rejected.
+        #[arg(long, value_name = "W")]
+        decode_workers: Option<usize>,
         /// The object-size setting: the estimated UNCOMPRESSED content a
         /// shard's buffer accumulates before it flushes as one object (issue
         /// #801). Unset, the target is derived once the first batch is
@@ -4148,6 +4167,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             pipeline_depth,
             max_inflight_flushes,
             decode_queue_batches,
+            decode_workers,
             target_bytes,
             max_flush_delay,
             ack_margin,
@@ -4188,6 +4208,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 pipeline_depth,
                 max_inflight_flushes,
                 decode_queue_batches,
+                decode_workers,
                 target_bytes,
                 max_flush_delay,
                 ack_margin,

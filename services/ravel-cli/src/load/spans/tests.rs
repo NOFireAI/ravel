@@ -323,6 +323,28 @@ fn metrics_and_spans_warn_on_a_non_default_zstd_level_and_logs_does_not() {
     );
 }
 
+/// `--decode-workers` on a metrics or spans load is named as ignored; on a
+/// logs load, or unset, it is not.
+#[test]
+fn metrics_and_spans_warn_on_decode_workers_and_logs_does_not() {
+    assert_eq!(unused_decode_workers_warning(Some(4), SignalArg::Logs), None);
+    assert_eq!(unused_decode_workers_warning(None, SignalArg::Spans), None);
+    assert_eq!(
+        unused_decode_workers_warning(Some(4), SignalArg::Metrics).as_deref(),
+        Some(
+            "warning: a metrics load ignores --decode-workers 4. Only a logs load builds \
+             its batches on decode workers."
+        )
+    );
+    assert_eq!(
+        unused_decode_workers_warning(Some(2), SignalArg::Spans).as_deref(),
+        Some(
+            "warning: a spans load ignores --decode-workers 2. Only a logs load builds \
+             its batches on decode workers."
+        )
+    );
+}
+
 /// A non-default `--group-target-blocks` on a metrics or spans load is named
 /// as ignored; the default, or any value on a logs load, is not.
 #[test]

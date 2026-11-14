@@ -114,6 +114,7 @@ async fn load_at(level: i32, parquet: &Path, mapping: &Path, now_ns: i64) -> Loa
         Some(1),
         1,
         DEFAULT_DECODE_QUEUE_BATCHES,
+        None,
         Some(PER_BATCH_TARGET_BYTES),
         None,
         None,

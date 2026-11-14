@@ -78,6 +78,8 @@ impl SpansLoadReport {
             target_bytes_no_effect_warning: self.target_bytes_no_effect_warning.clone(),
             realign_gave_up: self.realign_gave_up,
             synthetic_ingest_hours: self.synthetic_ingest_hours.clone(),
+            decode_wait_ms: None,
+            write_wait_ms: None,
         }
     }
 }
