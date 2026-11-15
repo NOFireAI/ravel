@@ -27,8 +27,7 @@
 //!
 //! The logs metadata pass (ADR-4203 decision 8) is not bounded by that part
 //! cap, and runs only after every tenant's whole-part warm has finished, so
-//! it spends only the deadline time that warm leaves, and its ceiling counts
-//! the bytes that warm left resident. For every logs
+//! it spends only the deadline time that warm leaves. For every logs
 //! object in the resolved window that the query path plans from its
 //! directories (above [`LogSegmentFetcher::plan_whole_object_bound`]), it
 //! reads the footer and the four directories (STREAM_DIR, FIELD_DIR,
@@ -44,10 +43,13 @@
 //! POSTINGS section outside the probe and within the coalesce gap of the
 //! missing SKIP_IDX and PAGE_DIR joins them in one read, whose extent then
 //! differs from the warmed one and misses the cache. The pass reads no column
-//! page. It stops admitting objects once the read cache's resident bytes plus
-//! the probes in flight would pass [`METADATA_CACHE_SHARE_DIVISOR`]'s share of
-//! the cache budget, and runs at most the store GET concurrency's permit count
-//! of objects at once.
+//! page. Its ceiling is [`METADATA_CACHE_SHARE_DIVISOR`]'s share of the cache
+//! budget, charged only with the bytes the pass's own reads fetch from the
+//! store: the whole-part warm's residents do not consume it, and an object
+//! already cached charges nothing. It stops admitting objects once the bytes
+//! its completed reads fetched plus its own probe length would pass the
+//! ceiling, and runs at most the store GET concurrency's permit count of
+//! objects at once.
 //!
 //! Every failure degrades to "warm less than planned," never to a startup
 //! failure: tenant discovery erroring, a resolve erroring, a fetch erroring,
@@ -80,10 +82,10 @@ use ravel_types::{Signal, TenantHash, TimeRange};
 /// Per (tenant, signal), the number of most-recent parts warmed whole.
 const MAX_PARTS_PER_TENANT_PER_SIGNAL: usize = 4;
 
-/// The logs metadata pass fills at most `1 / METADATA_CACHE_SHARE_DIVISOR` of
-/// the read cache's byte budget, counting every resident byte. The rest is
-/// left for the column pages the first statements insert: a full cache would
-/// evict warmed metadata a statement has not read yet.
+/// The logs metadata pass's ceiling is `1 / METADATA_CACHE_SHARE_DIVISOR` of
+/// the read cache's byte budget, charged with the bytes the pass itself
+/// fetches. The rest is left for the column pages the first statements insert:
+/// a full cache would evict warmed metadata a statement has not read yet.
 const METADATA_CACHE_SHARE_DIVISOR: u64 = 2;
 
 /// The query path's logs fetch quantities and the read cache's byte budget:
@@ -225,9 +227,9 @@ async fn warm_cache_inner(
 
     // Every tenant's whole-part warm runs before any metadata pass, so the
     // uncapped pass of one tenant cannot spend the deadline a later tenant's
-    // whole-part warm needs.
+    // whole-part warm needs. Each tenant keeps only the parts its pass probes.
     let mut total_parts_warmed: usize = 0;
-    let mut logs_windows: Vec<(TenantHash, Vec<SegmentRef>)> = Vec::new();
+    let mut planned_windows: Vec<(TenantHash, Vec<SegmentRef>)> = Vec::new();
     for tenant in tenants {
         total_parts_warmed += warm_metrics(&catalog, &metrics_fetcher, tenant, now_ns).await;
         let (warmed, mut parts) = warm_logs(&catalog, &logs_fetcher, tenant, now_ns).await;
@@ -235,13 +237,14 @@ async fn warm_cache_inner(
         if let Some(pass) = metadata_pass.as_ref() {
             parts.retain(|part| pass.fetcher.plans_segment(part));
             if !parts.is_empty() {
-                logs_windows.push((tenant, parts));
+                parts.shrink_to_fit();
+                planned_windows.push((tenant, parts));
             }
         }
     }
     if let Some(pass) = metadata_pass.as_mut() {
-        for (tenant, parts) in &logs_windows {
-            let warmed = pass.warm(*tenant, parts).await;
+        for (tenant, planned) in &planned_windows {
+            let warmed = pass.warm(*tenant, planned).await;
             tracing::info!(
                 tenant_hash = %tenant.to_hex(),
                 signal = ?Signal::Logs,
@@ -280,8 +283,11 @@ struct MetadataWarmed {
 /// budget is the one read cache every tenant shares.
 struct LogsMetadataPass {
     fetcher: LogSegmentFetcher,
-    cache: ReadCache,
     ceiling: u64,
+    /// The bytes the pass's completed reads fetched from the store, failed
+    /// ones included: what the pass has added to the cache, charged against
+    /// `ceiling`.
+    charged: u64,
     concurrency: usize,
     budget_reached: bool,
     total: MetadataWarmed,
@@ -310,7 +316,7 @@ impl LogsMetadataPass {
             .with_get_limiter(get_limiter)
             .with_memory_budget(memory_budget)
             .with_read_gate(read_gate)
-            .with_cache(cache.clone());
+            .with_cache(cache);
         if shape.max_fetch_run_bytes != 0 {
             fetcher = match fetcher.with_max_fetch_run_bytes(shape.max_fetch_run_bytes) {
                 Ok(fetcher) => fetcher,
@@ -325,50 +331,46 @@ impl LogsMetadataPass {
         }
         Some(Self {
             fetcher,
-            cache,
             ceiling: shape.cache_max_bytes / METADATA_CACHE_SHARE_DIVISOR,
+            charged: 0,
             concurrency,
             budget_reached: false,
             total: MetadataWarmed::default(),
         })
     }
 
-    fn resident_bytes(&self) -> u64 {
-        match &self.cache {
-            ReadCache::Ram(ram) => ram.total_bytes(),
-            ReadCache::Tiered(tiered) => tiered.ram_total_bytes(),
-        }
-    }
-
-    /// Reads the footer and four directories of every part in `parts` the
-    /// query path plans from its directories, most recent first, up to
-    /// `concurrency` objects at once. An object is admitted only while the
-    /// resident bytes, the in-flight objects' probe lengths and its own probe
-    /// length stay within the ceiling; the first object that does not fit
-    /// ends the pass for every later tenant too. A failed read skips that
-    /// object.
-    async fn warm(&mut self, tenant: TenantHash, parts: &[SegmentRef]) -> MetadataWarmed {
+    /// Reads the footer and four directories of every part in `planned`, which
+    /// holds only parts the query path plans from their directories, most
+    /// recent first, up to `concurrency` objects at once. An object is
+    /// admitted while the bytes the pass has charged, the in-flight objects'
+    /// probe lengths and its own probe length stay within the ceiling. One
+    /// that does not fit waits for the reads in flight, which can come back
+    /// as cache hits that charge nothing; one that does not fit beside the
+    /// completed reads alone ends the pass for every later tenant too. A
+    /// failed read skips that object.
+    async fn warm(&mut self, tenant: TenantHash, planned: &[SegmentRef]) -> MetadataWarmed {
         let mut warmed = MetadataWarmed::default();
         let fetcher = &self.fetcher;
-        let mut pending = parts.iter().filter(|part| fetcher.plans_segment(part));
+        let mut pending = planned.iter().peekable();
         let mut in_flight = FuturesUnordered::new();
         let mut in_flight_bytes: u64 = 0;
         loop {
             while !self.budget_reached && in_flight.len() < self.concurrency {
-                let Some(part) = pending.next() else {
+                let Some(&part) = pending.peek() else {
                     break;
                 };
                 let estimate = ravel_query::derive_suffix_len(part.object_size)
                     .min(part.object_size)
                     .max(1);
                 let charged = self
-                    .resident_bytes()
+                    .charged
                     .saturating_add(in_flight_bytes)
                     .saturating_add(estimate);
                 if charged > self.ceiling {
-                    self.budget_reached = true;
+                    self.budget_reached = in_flight.is_empty();
                     break;
                 }
+                pending.next();
                 in_flight_bytes = in_flight_bytes.saturating_add(estimate);
                 in_flight.push(async move {
                     let accounting = warm_accounting();
@@ -376,21 +378,19 @@ impl LogsMetadataPass {
                         .block_range_fetcher()
                         .fetch_plan_directories(part, tenant, &accounting)
                         .await;
-                    (
-                        part,
-                        estimate,
-                        result.map(|_| accounting.snapshot().total_s3_bytes()),
-                    )
+                    let fetched = accounting.snapshot().total_s3_bytes();
+                    (part, estimate, result.map(|_| ()), fetched)
                 });
             }
-            let Some((part, estimate, result)) = in_flight.next().await else {
+            let Some((part, estimate, result, fetched)) = in_flight.next().await else {
                 break;
             };
             in_flight_bytes = in_flight_bytes.saturating_sub(estimate);
+            self.charged = self.charged.saturating_add(fetched);
             match result {
-                Ok(bytes) => {
+                Ok(()) => {
                     warmed.objects += 1;
-                    warmed.bytes = warmed.bytes.saturating_add(bytes);
+                    warmed.bytes = warmed.bytes.saturating_add(fetched);
                 }
                 Err(err) => {
                     tracing::debug!(

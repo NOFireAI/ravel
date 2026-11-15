@@ -411,8 +411,10 @@ segments are warmed. A first log query that plans from those directories, or
 opens such a segment by range, then reads its footer from the cache instead
 of storage; a query that reads a whole segment in one request, or that also
 needs the segment's key index, bloom or postings, gains less or nothing. The
-pass uses at most half of `--cache-max-bytes`, counting what the cache already
-holds, and stops when the next segment would not fit.
+pass's ceiling is half of `--cache-max-bytes`, counting only the bytes the
+pass itself fetches from storage, not the segments warmed whole before it. It
+stops when the next segment's footer read would not fit beside what it has
+fetched; directory reads past that footer read can take it somewhat above.
 docs/query-engine.md, "Startup warm-up of logs metadata", has the details.
 
 "Most recent" is measured from the latest ingest hour of each tenant, not from

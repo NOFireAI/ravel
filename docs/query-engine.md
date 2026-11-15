@@ -7322,14 +7322,21 @@ Which first statements hit those entries:
   read's extent differs from the pass's and misses the cache.
 
 Bounds. The pass runs inside the warm-up's 10-second deadline, in whatever
-time the whole-part warm leaves. It admits an
-object only while the read cache's resident bytes, plus the probes in flight,
-plus its own probe stay within half of `--cache-max-bytes`; the first object
-that does not fit ends the pass for every later tenant too, and startup
-continues. The admission check counts each object's probe length, not the
-directory reads after it, so resident bytes can end above half when
-directories reach past the probe. At most the store GET concurrency's permit
-count of objects is read at once. A failed read skips that object.
+time the whole-part warm leaves. Its ceiling is half of `--cache-max-bytes`,
+charged only with the bytes the pass's own reads fetch from the store,
+including the reads of an object whose read then fails. The whole-part
+warm's residents do not count against it, so a whole-part warm that alone
+fills more than half the cache does not stop the pass, and an object whose
+probe and directories are already cached charges nothing. It admits an
+object only while the charged bytes, plus the probe lengths of the objects
+in flight, plus its own probe length stay within the ceiling. An object that
+does not fit waits for the reads in flight; one that does not fit beside the
+completed reads alone ends the pass for every later tenant too, and startup
+continues. The admission check counts an in-flight object's probe length,
+not the directory reads after it, so the bytes the pass fetches can end
+above the ceiling when directories reach past the probe. At most the store
+GET concurrency's permit count of objects is read at once. A failed read
+skips that object.
 
 The `cache warmup: pass complete` log line reports `metadata_objects_warmed`,
 `metadata_bytes_warmed` (bytes fetched from the store) and
@@ -7350,10 +7357,14 @@ STREAM_DIR and FIELD_DIR start before the probe
 first statement issues no footer GET and no directory GET, where an unwarmed
 run issues one probe and two directory reads per object. Two more tests pin
 the bounds: `the_metadata_warm_stops_at_the_cache_budget` (footer GETs equal
-the objects the pass did not reach) and
+the objects the pass did not reach, under a ceiling the whole-part warm's
+residents alone exceed) and
 `a_failed_metadata_read_skips_only_that_object`. In `cache_warm.rs`,
 `a_metadata_pass_that_spends_the_deadline_leaves_later_whole_part_warms_intact`
-pins the order.
+pins the order, and `the_metadata_ceiling_counts_only_the_pass_s_own_bytes`
+pins the ceiling to the byte: with the whole-part warm's residents above
+the ceiling, a ceiling equal to the sizes of the two objects the pass
+fetches admits both, and one byte less admits one.
 
 See docs/guides/caching.md for CLI flags, metrics, and known gaps, and
 docs/adrs/0046-read-cache-tier.md for the funnel/keying/eviction design
