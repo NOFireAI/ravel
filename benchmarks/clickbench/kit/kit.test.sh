@@ -391,12 +391,18 @@ STUB
 # ravel-cli's load summary with STUB_LOAD_ROWS rows written (default the hits
 # row count) and STUB_LOAD_OBJECTS objects written (default 100; "none"
 # leaves the line out). STUB_FOLD=unsealed
-# makes the fold seal nothing, STUB_FOLD=twice prints entry_count twice, and
-# STUB_FOLD_ENTRIES sets the entry_count it prints (default 100).
+# makes the fold seal nothing, STUB_FOLD=twice prints entry_count twice,
+# STUB_FOLD_ENTRIES sets the entry_count it prints (default 100), and
+# STUB_FOLD_LEAVES, when set, the key_index_leaves_written line it prints.
+# STUB_LEAF_HELP=1 makes both binaries' --help list the key-index leaf
+# switch's two spellings, as a binary built after issue #4200 does.
 cat >"$BINSTUBS/ravel-server" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
-  --help) echo "Usage: ravel-server [OPTIONS]"; exit 0 ;;
+  --help)
+    echo "Usage: ravel-server [OPTIONS]"
+    [ "${STUB_LEAF_HELP:-}" != 1 ] || printf '      --fold-key-index-leaves\n      --no-fold-key-index-leaves\n'
+    exit 0 ;;
   --version) echo "error: unexpected argument '--version' found" >&2; exit 2 ;;
 esac
 echo "$*" >>"$STUB_DIR/server-argv"
@@ -465,7 +471,11 @@ case " $* " in
     printf 'bulk load complete\n  rows_skipped     : 0\n  rows_written     : %s\n  rows/sec         : 1000\n' \
       "${STUB_LOAD_ROWS:-99997497}"
     [ "${STUB_LOAD_OBJECTS:-100}" = none ] || printf '  objects written  : %s\n' "${STUB_LOAD_OBJECTS:-100}" ;;
+  *" catalog fold --help "*)
+    echo "Usage: ravel-cli catalog fold [OPTIONS] --tenant <TENANT>"
+    [ "${STUB_LEAF_HELP:-}" != 1 ] || printf '      --key-index-leaves\n      --no-key-index-leaves\n' ;;
   *" catalog fold "*)
+    [ -z "${STUB_FOLD_LEAVES:-}" ] || echo "key_index_leaves_written: $STUB_FOLD_LEAVES"
     if [ "${STUB_FOLD:-}" = unsealed ]; then echo "seal_through_hour: None"; else echo "seal_through_hour: Some(491234)"; fi
     printf 'previous_watermark_hour: Some(491200)\nwatermark_hour: Some(491235)\nentry_count: %s\nbuckets_folded: 5\npart_bytes: 12345\n' "${STUB_FOLD_ENTRIES:-100}"
     [ "${STUB_FOLD:-}" != twice ] || echo "entry_count: 100" ;;
@@ -2055,6 +2065,70 @@ else
   fail "fold field twice" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
 fi
 rm -rf "$OUT_A"
+
+# leaf_stamp BOX: the fold stamp's precondition, key_index_leaves_flag (or
+# <none>) and key_index_leaves_written.
+leaf_stamp() {
+  python3 -c 'import json, sys; f = json.load(open(sys.argv[1])); print(f["precondition"], f["key_index_leaves_flag"] or "<none>", f["key_index_leaves_written"])' \
+    "$1/kit/stamps/fold" 2>/dev/null
+}
+
+# Catches: binaries built after issue #4200, which build key-index leaves
+# unless told not to, run without the opt-out: the fold must pass
+# --no-key-index-leaves and the server --no-fold-key-index-leaves when their
+# --help lists them, and a fold reporting no leaf is not refused for it (the
+# run fails here only on its entry ratio).
+code=0
+run_box A box-leafoff STUB_LEAF_HELP=1 STUB_FOLD_LEAVES=0 STUB_FOLD_ENTRIES=50 || code=$?
+got="$(leaf_stamp "$TMP/box-leafoff")"
+if [ "$code" = 1 ] && grep -q 'fold entry_count 50 is under' "$OUT_A/FAILED" 2>/dev/null \
+  && [ "$got" = "failed --no-key-index-leaves 0" ] \
+  && grep -q -- ' catalog fold .*--writers-stopped --no-key-index-leaves$' "$STUB_DIR/cli-argv" \
+  && grep -q -- '--listen-health 127.0.0.1:4319 --no-fold-key-index-leaves --memory-budget-bytes' "$TMP/box-leafoff/kit/arm.env"; then
+  pass "binaries listing the leaf opt-out get it on the fold and the server, and a leafless fold passes the leaf check"
+else
+  fail "leaf opt-out" "exit $code, stamp '$got', FAILED: $(head -n 2 "$OUT_A/FAILED" 2>/dev/null); fold argv: $(grep ' catalog fold ' "$STUB_DIR/cli-argv" | tail -n 1)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: the opt-out passed and its effect never checked: a fold reporting
+# key_index_leaves_written above 0 must fail the run at step fold, before any
+# statement runs.
+code=0
+run_box A box-leafwrote STUB_LEAF_HELP=1 STUB_FOLD_LEAVES=12 || code=$?
+got="$(leaf_stamp "$TMP/box-leafwrote")"
+if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'fold wrote key-index leaves: key_index_leaves_written=12, want 0' "$OUT_A/FAILED" \
+  && [ "$got" = "failed --no-key-index-leaves 12" ] \
+  && [ ! -e "$TMP/box-leafwrote/kit/out/benchmark/calls.jsonl" ]; then
+  pass "a fold that wrote key-index leaves fails as FAILED step=fold"
+else
+  fail "leaves written" "exit $code, stamp '$got', FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a fold given the opt-out whose report carries no
+# key_index_leaves_written line passing unchecked.
+code=0
+run_box A box-leafmissing STUB_LEAF_HELP=1 || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'fold.out carries key_index_leaves_written 0 times, not once' "$OUT_A/FAILED"; then
+  pass "a fold given the leaf opt-out must report key_index_leaves_written"
+else
+  fail "leaves line missing" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: the opt-out passed to binaries whose --help does not list it (built
+# before issue #4200, which reject the flag): arm A's happy-path run folded
+# with no leaf flag and stamped none, and its report's missing
+# key_index_leaves_written line is accepted.
+got="$(leaf_stamp "$BOX_A")"
+if [ "$got" = "met <none> None" ] && ! grep -q -- 'key-index-leaves' "$BOX_A/kit/arm.env"; then
+  pass "binaries that do not list the leaf opt-out fold and serve without it"
+else
+  fail "leaf opt-out on an old binary" "stamp '$got'; arm.env: $(grep -c key-index "$BOX_A/kit/arm.env")"
+fi
 
 # Catches: a load whose row count is never checked: a load that wrote one row
 # short of run.toml's rows_expected must fail the run at step load.

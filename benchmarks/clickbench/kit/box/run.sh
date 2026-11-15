@@ -799,13 +799,19 @@ resolve_arm_env() {
     stamp "arm.env kept"
     return 0
   fi
-  local preload="" flags extra=() key f code=0
+  local preload="" flags extra=() key f code=0 leaf_off="" help="$KIT/server-help.out"
   # The release binary runs as published, with no LD_PRELOAD.
   [ "$CLOUD" = gcp ] \
     || preload="$(ls /usr/lib64/libtcmalloc.so.4 /usr/lib64/libtcmalloc.so 2>/dev/null | head -n 1)"
+  # The server's scheduled fold builds no key-index leaf either, as for
+  # do_fold: --no-fold-key-index-leaves when its --help lists it (built after
+  # issue #4200), nothing otherwise (no leaf unless asked).
+  "$BIN_DIR/ravel-server-$SHA" --help >"$help" 2>&1 \
+    || { say "ravel-server --help failed: $(head -c 300 "$help")"; return 1; }
+  if help_lists "$help" --no-fold-key-index-leaves; then leaf_off=--no-fold-key-index-leaves; fi
   flags=("${STORE_ARGS[@]}" --shards "$SHARDS" --tenant-hash-unkeyed
     --tenant-token-file "$TOKEN_FILE"
-    --listen-http 127.0.0.1:4318 --listen-health 127.0.0.1:4319
+    --listen-http 127.0.0.1:4318 --listen-health 127.0.0.1:4319 ${leaf_off:+"$leaf_off"}
     --memory-budget-bytes "$MEMORY_BUDGET" --audit-mode "$AUDIT_MODE")
   if [ "$AUDIT_MODE" = required ]; then
     flags+=(--audit-text "$AUDIT_TEXT")
@@ -1056,6 +1062,12 @@ timed() {
   /usr/bin/time -f "$format" -o "$file" "$@"
 }
 
+# help_lists FILE FLAG: 0 when an option line of the --help text in FILE
+# lists FLAG.
+help_lists() {
+  grep -Eq -e "^ {0,6}(-[[:alnum:]], )?$2([ =]|\$)" "$1"
+}
+
 # out_field FILE KEY: the value of FILE's one `KEY: value` line. No such line,
 # or more than one, is a failure naming the count.
 out_field() {
@@ -1100,11 +1112,26 @@ fold_field() {
 # least FOLD_MIN_RATIO of the objects the load wrote, the load report's
 # "objects written". The bucket's key delta is not that figure: it also
 # counts a commit record per object, so it is stamped beside it only.
+#
+# The fold builds no key-index leaf, the state the published figures were
+# taken in: --no-key-index-leaves is passed when the fold's --help lists it (a
+# ravel-cli built after issue #4200 builds leaves and seals parts at the UTC
+# day unless told not to), and a fold that reports key_index_leaves_written
+# above 0 fails the precondition. A binary built before it builds no leaf
+# unless asked, and its report may carry no such line.
 do_fold() {
+  local leaf_off="" help="$KIT/fold-help.out"
+  "$CLI_BIN" "${STORE_ARGS[@]}" --tenant-hash-unkeyed catalog fold --help >"$help" 2>&1 \
+    || { say "ravel-cli catalog fold --help failed: $(head -c 300 "$help")"; return 1; }
+  if help_lists "$help" --no-key-index-leaves; then leaf_off=--no-key-index-leaves; fi
   "$CLI_BIN" "${STORE_ARGS[@]}" --tenant-hash-unkeyed catalog fold \
     --tenant "$TENANT" --shards "$SHARDS" --signal logs --writers-stopped \
-    >"$KIT/fold.out" 2>&1 || return 1
-  local seal entries watermark buckets part before after written keys ok
+    ${leaf_off:+"$leaf_off"} >"$KIT/fold.out" 2>&1 || return 1
+  local seal entries watermark buckets part before after written keys ok leaves="" n
+  n="$(grep -c "^[[:space:]]*key_index_leaves_written[[:space:]]*:" "$KIT/fold.out" 2>/dev/null)" || true
+  if [ -n "$leaf_off" ] || [ "${n:-0}" != 0 ]; then
+    leaves="$(fold_field key_index_leaves_written)" || return 1
+  fi
   seal="$(fold_field seal_through_hour)" || return 1
   watermark="$(fold_field watermark_hour)" || return 1
   entries="$(fold_field entry_count)" || return 1
@@ -1120,13 +1147,18 @@ do_fold() {
   [[ "$entries" =~ ^[0-9]+$ ]] || { say "fold printed no entry_count"; return 1; }
   ok="$(python3 -c 'import sys; print(int(int(sys.argv[1]) >= float(sys.argv[3]) * int(sys.argv[2])))' \
     "$entries" "$written" "$FOLD_MIN_RATIO")" || return 1
+  local no_leaves=1
+  [ -z "$leaves" ] || [ "$leaves" = 0 ] || no_leaves=0
   mkdir -p "$STAMPS"
-  printf '{"verified_at": %s, "seal_through_hour": %s, "watermark_hour": %s, "entry_count": %s, "buckets_folded": %s, "part_bytes": %s, "objects_written_by_load": %s, "store_keys_added_by_load": %s, "min_entry_ratio": %s, "precondition": %s}\n' \
+  printf '{"verified_at": %s, "seal_through_hour": %s, "watermark_hour": %s, "entry_count": %s, "buckets_folded": %s, "part_bytes": %s, "objects_written_by_load": %s, "store_keys_added_by_load": %s, "min_entry_ratio": %s, "key_index_leaves_flag": %s, "key_index_leaves_written": %s, "precondition": %s}\n' \
     "$(json_str "$(utc_now)")" "$(json_str "$seal")" "$(json_str "$watermark")" \
     "$(json_num "$entries")" "$(json_num "$buckets")" "$(json_num "$part")" \
     "$(json_num "$written")" "$(json_num "$keys")" "$(json_num "$FOLD_MIN_RATIO")" \
-    "$([ "$ok" = 1 ] && echo '"met"' || echo '"failed"')" >"$STAMPS/fold"
+    "$(json_str "$leaf_off")" "$(json_num "$leaves")" \
+    "$([ "$ok" = 1 ] && [ "$no_leaves" = 1 ] && echo '"met"' || echo '"failed"')" >"$STAMPS/fold"
   [ "$ok" = 1 ] || { say "fold entry_count $entries is under $FOLD_MIN_RATIO of the $written objects the load wrote"; return 1; }
+  [ "$no_leaves" = 1 ] \
+    || { say "fold wrote key-index leaves: key_index_leaves_written=$leaves, want 0, leaf-off flag '${leaf_off}'"; return 1; }
 }
 
 do_declare() {
