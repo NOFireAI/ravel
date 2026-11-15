@@ -1262,8 +1262,15 @@ mod tests {
         let fetcher = LogSegmentFetcher::new(store).with_cache(ReadCache::Ram(cache.clone()));
         let (warmed, parts) = warm_logs(&catalog, &fetcher, tenant, now).await;
 
-        assert_eq!(warmed, MAX_PARTS_PER_TENANT_PER_SIGNAL, "parts warmed whole");
-        assert_eq!(cache.len(), MAX_PARTS_PER_TENANT_PER_SIGNAL, "cache entries");
+        assert_eq!(
+            warmed, MAX_PARTS_PER_TENANT_PER_SIGNAL,
+            "parts warmed whole"
+        );
+        assert_eq!(
+            cache.len(),
+            MAX_PARTS_PER_TENANT_PER_SIGNAL,
+            "cache entries"
+        );
         let order: Vec<(u32, i64)> = parts
             .iter()
             .map(|part| (part.ingest_hour_bucket, part.max_event_ts_ns))

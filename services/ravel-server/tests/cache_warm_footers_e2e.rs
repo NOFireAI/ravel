@@ -1108,7 +1108,7 @@ async fn capture_log<T>(body: impl std::future::Future<Output = T>) -> (T, Vec<S
 /// reads exactly the other objects' footers.
 ///
 /// Seen failing against the event-time window the warm-up resolved before
-/// (`metadata_objects_warmed=0`, so the roomy statement reads 6 footers),
+/// (the result log reads `parts_warmed=0 metadata_objects_warmed=0`),
 /// against a selection that takes the oldest ingest hour first (the whole-part
 /// warm reads the 2 older-hour objects, and the budgeted statement reads the
 /// footers of the newest hour's first 2), and against one ordered by event
@@ -1122,8 +1122,7 @@ async fn a_tenant_whose_event_times_predate_its_ingest_window_is_warmed() {
         .collect();
 
     let (query, partitions) = STRIPED;
-    let (mut server, log) =
-        capture_log(tenant.restart(partitions, ROOMY_CACHE_BYTES, true)).await;
+    let (mut server, log) = capture_log(tenant.restart(partitions, ROOMY_CACHE_BYTES, true)).await;
     let pass_complete: Vec<&String> = log
         .iter()
         .filter(|line| line.contains("cache warmup: pass complete"))
@@ -1137,7 +1136,11 @@ async fn a_tenant_whose_event_times_predate_its_ingest_window_is_warmed() {
     );
     let warm_gets = std::mem::take(&mut server.warm_gets);
     assert_eq!(
-        warm_gets.whole.keys().cloned().collect::<BTreeSet<String>>(),
+        warm_gets
+            .whole
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<String>>(),
         newest_hour,
         "the whole-part warm reads the newest ingest hour's objects: {warm_gets:?}"
     );
@@ -1149,7 +1152,10 @@ async fn a_tenant_whose_event_times_predate_its_ingest_window_is_warmed() {
         "warmed, no footer GET and no directory GET: {:?}",
         run.gets
     );
-    assert!(run.gets.page_total() > 0, "the statement scans column pages");
+    assert!(
+        run.gets.page_total() > 0,
+        "the statement scans column pages"
+    );
     assert_eq!(
         (
             phase_figure(&run.stats, "plan", "segmentsOpened"),
@@ -1189,7 +1195,11 @@ async fn a_tenant_whose_event_times_predate_its_ingest_window_is_warmed() {
     );
 }
 
-fn server_config(partitions: usize, cache_max_bytes: u64, max_ingest_lag: Duration) -> ServerConfig {
+fn server_config(
+    partitions: usize,
+    cache_max_bytes: u64,
+    max_ingest_lag: Duration,
+) -> ServerConfig {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     ServerConfig {

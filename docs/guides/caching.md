@@ -405,7 +405,7 @@ bounded number of the most recent metric and log segments of that tenant. The
 first real query after a restart then does not pay the full cold cost.
 
 For logs it also reads the footer and directories of every log segment in the
-same window that a query plans from its directories, without the segment's
+same warm set that a query plans from its directories, without the segment's
 column pages. This metadata pass runs after every tenant's most recent
 segments are warmed. A first log query that plans from those directories, or
 opens such a segment by range, then reads its footer from the cache instead
@@ -417,9 +417,13 @@ stops when the next segment's footer read would not fit beside what it has
 fetched; directory reads past that footer read can take it somewhat above.
 docs/query-engine.md, "Startup warm-up of logs metadata", has the details.
 
-"Most recent" is measured from the latest ingest hour of each tenant, not from
-wall-clock time. A tenant that has not ingested in the last day still gets its
-most recent parts warmed, not zero.
+"Most recent" means most recently ingested, measured from the latest ingest
+hour of each tenant, not from wall-clock time. A tenant that has not ingested
+in the last day still gets its most recent parts warmed, not zero. The warm
+set is the segments stored in that latest ingest hour and the 24 hours before
+it, whatever their event times, newest ingest hour first. A tenant loaded with
+old data, such as a benchmark set whose event times are years in the past, is
+warmed the same way as one ingesting live data.
 
 Warmup is best-effort:
 

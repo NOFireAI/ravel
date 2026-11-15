@@ -123,7 +123,10 @@ async fn listing_selects_by_ingest_hour_not_event_time() {
     };
     let catalog = Catalog::new(store.clone(), config()).expect("catalog");
 
-    assert_eq!(ingest_hours(&catalog, 1001, 1002).await, keys_in(1001, 1002));
+    assert_eq!(
+        ingest_hours(&catalog, 1001, 1002).await,
+        keys_in(1001, 1002)
+    );
     assert_eq!(
         ingest_hours(&catalog, 1002, u32::MAX).await,
         keys_in(1002, NOW_HOUR)
@@ -165,7 +168,11 @@ async fn a_folded_snapshot_selects_by_ingest_hour_not_event_time() {
         )
         .await
         .expect("fold");
-    assert_eq!(report.watermark_hour, Some(1000), "the fold seals hour 1000");
+    assert_eq!(
+        report.watermark_hour,
+        Some(1000),
+        "the fold seals hour 1000"
+    );
     let recent_1001 = publish_filed(store.as_ref(), 1001).await;
     let recent_1002 = publish_filed(store.as_ref(), 1002).await;
     let recent_1003 = publish_filed(store.as_ref(), 1003).await;
