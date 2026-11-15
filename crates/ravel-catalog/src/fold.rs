@@ -16810,10 +16810,9 @@ pub(crate) mod tests {
     /// Rules out a peek that fires only for `.npost` (it is a `.kidx` refusal)
     /// and one that only covers the carry path.
     ///
-    /// FLIP: gate the peek's `.kidx` branch on `carry_reads` instead of
-    /// `!carry_reads` and the switch-off fold rebuilds over the newer leaf, so
-    /// `expect_err` panics. FLIP: PUT a leaf before the peek and the
-    /// store-unchanged assertion fails.
+    /// FLIP: skip the peek's `.kidx` loop and the switch-off fold rebuilds
+    /// over the newer leaf, so `expect_err` panics. FLIP: PUT a leaf before
+    /// the peek and the store-unchanged assertion fails.
     #[tokio::test]
     async fn newer_kidx_leaf_without_a_carry_fails_the_cycle() {
         let inner = recording_store();
@@ -16943,6 +16942,475 @@ pub(crate) mod tests {
             (&stats_key, CatalogPartKind::ColumnStats, 4),
         )
         .await;
+    }
+
+    /// Overwrites `head.parts[index]`'s object with `bytes` and re-points
+    /// `signal`'s HEAD at it, as a build that wrote those bytes would.
+    async fn replace_part(
+        store: &dyn ObjectStoreBackend,
+        signal: Signal,
+        head: &mut SnapshotHead,
+        index: usize,
+        bytes: Vec<u8>,
+    ) {
+        head.parts[index].blake3 = blake3::hash(&bytes).as_bytes().to_vec();
+        head.parts[index].size = bytes.len() as u64;
+        store
+            .put(
+                &head.parts[index].key,
+                Bytes::from(bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put the replaced part");
+        store
+            .put(
+                &head_object_key(&tenant(), signal),
+                Bytes::from(snapshot_format::encode_head(head).expect("encode head")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put the re-pointed HEAD");
+    }
+
+    /// A logs HEAD of two parts (hour 10 sealed, hour 11 the tail, under a
+    /// two-entry part ceiling) whose first part is stamped below the read
+    /// set, plus a new hour-12 segment, so the next fold fails its load of
+    /// the first part, rebuilds, and never reads the second. Returns the
+    /// store, a catalog, the next fold's `now_ns` and the re-pointed HEAD.
+    async fn two_part_rebuild_case() -> (Arc<MemoryStore>, Catalog, i64, SnapshotHead) {
+        let store = Arc::new(MemoryStore::new());
+        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404]).await;
+        publish_logs_segment(store.as_ref(), 2, 10, &[500]).await;
+        publish_logs_segment(store.as_ref(), 3, 11, &[200]).await;
+        let cfg = CatalogConfig {
+            snapshot_part_max_entries: 2,
+            ..config(1)
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        let mut head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(head.parts.len(), 2, "hour 10 seals off from hour 11's tail");
+        let mut first = part_bytes(store.as_ref(), &head, 0).await;
+        first[4] = 0;
+        replace_part(store.as_ref(), Signal::Logs, &mut head, 0, first).await;
+        publish_logs_segment(store.as_ref(), 4, 12, &[200]).await;
+        (store, catalog, now_at_seal(12), head)
+    }
+
+    /// The stored bytes of `head.parts[index]`.
+    async fn part_bytes(store: &dyn ObjectStoreBackend, head: &SnapshotHead, index: usize) -> Vec<u8> {
+        store
+            .get(&head.parts[index].key, GetRange::Full)
+            .await
+            .expect("part stored")
+            .data
+            .to_vec()
+    }
+
+    /// ADR-4233 H1, #4235 (finding 3): a rebuilt fold stops loading previous
+    /// parts at the first that fails, so it never reads the second part, yet
+    /// the HEAD it publishes drops it. The peek reads every part after the
+    /// failed one whole and decodes it before any PUT. The second case's
+    /// part has a current envelope and an entry level above the read set,
+    /// which only a full decode finds.
+    ///
+    /// Rules out a peek of the envelope prefix alone (the second case
+    /// rebuilds over the newer part, so `expect_err` panics; this is the
+    /// line that flips against c45196af7), and a peek limited to the part
+    /// whose load failed (the first part is not newer, so neither case
+    /// fails).
+    #[tokio::test]
+    async fn newer_second_part_on_a_rebuilt_fold_fails_the_cycle() {
+        let (store, catalog, now, mut head) = two_part_rebuild_case().await;
+        let key = head.parts[1].key.clone();
+        let mut second = part_bytes(store.as_ref(), &head, 1).await;
+        second[4] = 2;
+        replace_part(store.as_ref(), Signal::Logs, &mut head, 1, second).await;
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Logs,
+            now,
+            (&key, CatalogPartKind::Snapshot, 2),
+        )
+        .await;
+
+        let (store, catalog, now, mut head) = two_part_rebuild_case().await;
+        let key = head.parts[1].key.clone();
+        let second = part_bytes(store.as_ref(), &head, 1).await;
+        let mut decoded = snapshot_format::decode_part(&second, &PartLimits::default())
+            .expect("the second part decodes");
+        decoded.entries[0].level = 2;
+        let header = decoded.header;
+        let relevelled = snapshot_format::encode_part_ranged_unvalidated(
+            header.tenant_hash.try_into().expect("a 16-byte tenant hash"),
+            header.signal,
+            header.shard_count,
+            header.min_hour,
+            header.watermark_hour,
+            &decoded.entries,
+        )
+        .expect("frame the part");
+        assert_eq!(relevelled[4], second[4], "the envelope version is unchanged");
+        replace_part(store.as_ref(), Signal::Logs, &mut head, 1, relevelled).await;
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Logs,
+            now,
+            (&key, CatalogPartKind::Snapshot, 2),
+        )
+        .await;
+    }
+
+    /// ADR-4233 H1, #4235 (finding 3): with the leaf switch on, a rebuilt
+    /// fold carries no leaf from the previous parts, so a second part's leaf
+    /// is dropped without a carry read. The two-part fixture of
+    /// [`a_part_carried_forward_keeps_its_key_index_refs`] has its first
+    /// part stamped below the read set, forcing the rebuild, and its second
+    /// part's leaf restamped to version 3 with its HEAD ref, as a newer build
+    /// writes them.
+    ///
+    /// Rules out a peek that skips a part's leaves whenever the leaf switch
+    /// is on and the part's refs match the declared fields (c45196af7's
+    /// `carry_reads_part_leaves`: the fold rebuilds over the newer leaf and
+    /// `expect_err` panics), and a peek of the first part's leaves only (the
+    /// newer leaf is the second part's).
+    #[tokio::test]
+    async fn newer_kidx_leaf_on_a_rebuilt_fold_with_the_switch_on_fails_the_cycle() {
+        let h1 = KIDX_HOUR;
+        let store = Arc::new(MemoryStore::new());
+        declare_user_id_key_index(store.as_ref()).await;
+        publish_user_id_logs(store.as_ref(), 1, h1, &[10, 20], 2, 0, true).await;
+        publish_user_id_logs(store.as_ref(), 2, h1, &[10, 30], 2, 0, true).await;
+        publish_user_id_logs(store.as_ref(), 3, h1 + 1, &[40], 2, 0, true).await;
+        let cfg = CatalogConfig {
+            snapshot_part_max_entries: 2,
+            ..kidx_config()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        fold_through(&catalog, Signal::Logs, h1 + 1).await;
+        let mut head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(head.parts.len(), 2);
+        assert_eq!(head.parts[1].key_index.len(), 1);
+
+        let leaf_ref = head.parts[1].key_index[0].clone();
+        let bytes = store
+            .get(&leaf_ref.key, GetRange::Full)
+            .await
+            .expect("leaf stored")
+            .data;
+        let restamped =
+            snapshot_format::restamp_key_index_leaf_version(&bytes, 3).expect("restamp the leaf");
+        head.parts[1].key_index[0] = SnapshotKeyIndexLeafRef {
+            key: leaf_ref.key.clone(),
+            ..restamped.leaf_ref
+        };
+        store
+            .put(
+                &leaf_ref.key,
+                Bytes::from(restamped.bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite the leaf");
+        let mut first = part_bytes(store.as_ref(), &head, 0).await;
+        first[4] = 0;
+        replace_part(store.as_ref(), Signal::Logs, &mut head, 0, first).await;
+
+        publish_user_id_logs(store.as_ref(), 4, h1 + 2, &[50], 2, 0, true).await;
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Logs,
+            now_inside(h1 + 2) + 5 * 60 * 1_000_000_000,
+            (&leaf_ref.key, CatalogPartKind::KeyIndexLeaf, 3),
+        )
+        .await;
+    }
+
+    /// A logs HEAD with an I64 typed column over hour 10, folded through an
+    /// operator seal so the hour stays held open, whose part's `.cstat` has
+    /// its envelope version byte set to `version`, plus a late hour-10
+    /// segment. The next fold finds hour 10 dirty, re-encodes its part,
+    /// reads no statistics baseline for it, and drops its `.cstat`. Returns
+    /// the `.cstat` key.
+    async fn dirty_cstat_case(version: u8) -> (Arc<RecordingStore>, Catalog, i64, String) {
+        let store = Arc::new(RecordingStore::new());
+        set_status_column_config(store.as_ref()).await;
+        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
+        publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        fold_logs_sealing(&catalog, now_inside(10), Some(10)).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let stats_key = head.parts[0]
+            .column_stats
+            .as_ref()
+            .expect("a v3 column-stats ref")
+            .key
+            .clone();
+        let mut stats = store
+            .get(&stats_key, GetRange::Full)
+            .await
+            .expect("column stats stored")
+            .data
+            .to_vec();
+        stats[4] = version;
+        store
+            .put(&stats_key, Bytes::from(stats), PutOptions::default())
+            .await
+            .expect("overwrite the column stats");
+        publish_logs_segment(store.as_ref(), 3, 10, &[200, 200]).await;
+        (
+            store,
+            catalog,
+            now_inside(10) + 5 * 60 * 1_000_000_000,
+            stats_key,
+        )
+    }
+
+    /// ADR-4233 H1, #4235 (finding 5): a part covering a dirty hour reads no
+    /// statistics baseline, so only the peek reads its `.cstat`. The second
+    /// case's object has a current envelope and a column whose
+    /// `declared_type` is above this build's set, which only a full decode
+    /// finds.
+    ///
+    /// Rules out a peek of the envelope prefix alone (the second case
+    /// re-encodes over the newer object, so `expect_err` panics; this is the
+    /// line that flips against c45196af7), and a peek that skips dirty parts
+    /// on a typed tenant (neither case fails).
+    #[tokio::test]
+    async fn newer_cstat_on_a_dirty_hour_fails_the_cycle() {
+        let (store, catalog, now, stats_key) = dirty_cstat_case(4).await;
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Logs,
+            now,
+            (&stats_key, CatalogPartKind::ColumnStats, 4),
+        )
+        .await;
+
+        let (store, catalog, now, stats_key) = dirty_cstat_case(3).await;
+        let stats = store
+            .get(&stats_key, GetRange::Full)
+            .await
+            .expect("column stats stored")
+            .data;
+        let mut decoded = snapshot_format::decode_column_stats(
+            &stats,
+            &snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("the current object decodes");
+        decoded.segments[0].columns[0].declared_type = 5;
+        let retyped = snapshot_format::frame_column_stats(
+            stats[4],
+            decoded
+                .header
+                .tenant_hash
+                .clone()
+                .try_into()
+                .expect("a 16-byte tenant hash"),
+            decoded.header.signal,
+            decoded.header.part_blake3.clone(),
+            &decoded.segments,
+        )
+        .expect("frame the object");
+        store
+            .put(&stats_key, Bytes::from(retyped), PutOptions::default())
+            .await
+            .expect("overwrite the column stats");
+        assert_fold_refuses_newer_part(
+            store.as_ref(),
+            &catalog,
+            Signal::Logs,
+            now,
+            (&stats_key, CatalogPartKind::ColumnStats, 5),
+        )
+        .await;
+    }
+
+    /// One store-fault case of [`a_store_error_on_a_dropped_object_fails_the_cycle_before_any_put`]
+    /// and [`a_not_found_dropped_object_keeps_the_fold_going`]: the store as
+    /// a fixture left it, the catalog config and signal of its next fold, and
+    /// that fold's `now_ns`.
+    struct DroppedObjectCase {
+        name: &'static str,
+        inner: Arc<dyn ObjectStoreBackend>,
+        config: CatalogConfig,
+        signal: Signal,
+        now_ns: i64,
+        /// Keys whose GETs the fault matches.
+        key_contains: String,
+        /// The matching GET the fault replaces, counted from the first.
+        nth: u64,
+        /// `newer_part_peek_gets` of the fold when that GET is `NotFound`.
+        peek_gets: u64,
+    }
+
+    /// The cases where a GET of an object the next fold drops or replaces
+    /// fails. `peek` cases fault a GET only the pre-PUT peek issues; the
+    /// others fault the fold's own read of that object.
+    async fn dropped_object_cases() -> Vec<DroppedObjectCase> {
+        let mut cases = Vec::new();
+
+        let (store, _, now_ns, part_key) = csnap_version_case(1).await;
+        cases.push(DroppedObjectCase {
+            name: "read: previous .csnap",
+            inner: store,
+            config: config(1),
+            signal: Signal::Metrics,
+            now_ns,
+            key_contains: part_key,
+            nth: 1,
+            // The rebuild's `.npost` prefix.
+            peek_gets: 1,
+        });
+
+        let (store, _, now_ns, _) = csnap_version_case(0).await;
+        cases.push(DroppedObjectCase {
+            name: "peek: .npost on a rebuild",
+            inner: store,
+            config: config(1),
+            signal: Signal::Metrics,
+            now_ns,
+            key_contains: ".npost".to_string(),
+            nth: 1,
+            peek_gets: 1,
+        });
+
+        let (store, _, now_ns, head) = two_part_rebuild_case().await;
+        cases.push(DroppedObjectCase {
+            name: "peek: second .csnap on a rebuild",
+            inner: store,
+            config: CatalogConfig {
+                snapshot_part_max_entries: 2,
+                ..config(1)
+            },
+            signal: Signal::Logs,
+            now_ns,
+            key_contains: head.parts[1].key.clone(),
+            nth: 1,
+            peek_gets: 1,
+        });
+
+        // Both peek the leaf prefix and the dirty tail's `.cstat`.
+        for (name, nth) in [("peek: .kidx leaf", 1), ("read: carried .kidx leaf", 2)] {
+            let store = recording_store();
+            let first = advancing_fixture(&store).await;
+            cases.push(DroppedObjectCase {
+                name,
+                inner: store,
+                config: kidx_config(),
+                signal: Signal::Logs,
+                now_ns: now_inside(KIDX_HOUR) + 5 * 60 * 1_000_000_000,
+                key_contains: first.parts[0].key_index[0].key.clone(),
+                nth,
+                peek_gets: 2,
+            });
+        }
+
+        let (store, _, now_ns, stats_key) = dirty_cstat_case(3).await;
+        cases.push(DroppedObjectCase {
+            name: "peek: .cstat of a dirty part",
+            inner: store,
+            config: config(1),
+            signal: Signal::Logs,
+            now_ns,
+            key_contains: stats_key,
+            nth: 1,
+            peek_gets: 1,
+        });
+        cases
+    }
+
+    /// ADR-4233 H1, #4235 (findings 1 and 2): a GET of an object the next
+    /// HEAD drops or replaces that fails with anything but `NotFound` fails
+    /// the cycle with `CatalogError::Store` before any PUT, on the pre-PUT
+    /// peek and on the fold's own reads alike. The object is left unchecked,
+    /// and the catalog sweep deletes `snap/` and `idx/` objects HEAD no
+    /// longer names. Every case asserts the fault fired exactly once (the
+    /// cycle stops at the first refused GET) and that the store holds the
+    /// same objects and bytes afterwards. The `.npost` and `.cstat` baseline
+    /// reads have their own tests
+    /// (`npost_baseline_store_error_fails_the_cycle_before_any_put`,
+    /// `cstat_baseline_store_error_fails_the_cycle_before_any_put`).
+    ///
+    /// Rules out a peek that treats a store error as "nothing newer" (every
+    /// `peek` case folds to `Ok`, so `expect_err` panics; against c45196af7
+    /// this is the line that flips, for the `read` cases too, since its read
+    /// paths fell back to a rebuild), and a fix that fails only after the
+    /// parts are PUT (the store-unchanged assertion fails).
+    #[tokio::test]
+    async fn a_store_error_on_a_dropped_object_fails_the_cycle_before_any_put() {
+        for case in dropped_object_cases().await {
+            let message = format!("refused: {}", case.name);
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Permanent(message.clone()))
+                    .with_key_contains(case.key_contains.as_str())
+                    .with_occurrence(Occurrence::Nth(case.nth)),
+            );
+            let store = Arc::new(FaultStore::new(Arc::clone(&case.inner), plan));
+            let catalog = Catalog::new(store.clone(), case.config).expect("catalog");
+            assert_fold_fails_on_store_error(
+                case.inner.as_ref(),
+                &catalog,
+                case.signal,
+                case.now_ns,
+                &message,
+            )
+            .await;
+            assert_eq!(
+                store.fault_count(Op::Get, FaultKind::Permanent),
+                1,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    /// The other side of
+    /// [`a_store_error_on_a_dropped_object_fails_the_cycle_before_any_put`]:
+    /// the same GETs answering `NotFound` leave nothing newer to drop, and
+    /// the fold succeeds as it did before the peek existed. Rules out a fix
+    /// that fails the cycle on every GET error, `NotFound` included.
+    #[tokio::test]
+    async fn a_not_found_dropped_object_keeps_the_fold_going() {
+        for case in dropped_object_cases().await {
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                    .with_key_contains(case.key_contains.as_str())
+                    .with_occurrence(Occurrence::Nth(case.nth)),
+            );
+            let store = Arc::new(FaultStore::new(Arc::clone(&case.inner), plan));
+            let catalog = Catalog::new(store.clone(), case.config).expect("catalog");
+            let report = catalog
+                .fold(&tenant(), case.signal, Uuid::new_v4(), case.now_ns, &[], None)
+                .await
+                .unwrap_or_else(|err| panic!("{}: {err:?}", case.name));
+            assert_eq!(
+                store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+                1,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                report.newer_part_peek_gets, case.peek_gets,
+                "{}: {report:?}",
+                case.name
+            );
+        }
     }
 
     /// ADR-4233 H11, #4235: a tenant config record stamped above
