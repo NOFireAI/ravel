@@ -3210,6 +3210,24 @@ by default). The typed error carries the count and the limit so the caller
 can narrow its own range and retry; it maps to HTTP 422 on every query
 endpoint.
 
+`Catalog::resolve_ingest_hours(tenant, signal, start_hour, end_hour, now_ns,
+accounting) -> Snapshot` selects by ingest hour instead of event time, for
+callers that want data by when it was ingested (the server's startup cache
+warm-up). Its listing window is the explicit inclusive range
+`[start_hour, end_hour]` of unix ingest hours rather than one derived from an
+event-time range, and step 4's event-time filter is not applied: every segment
+filed in those hours is returned, whatever its event times. It takes no
+`min_tokens` and no name filter. Everything else is the same code as
+`resolve`: hours at or below the folded snapshot's watermark are served from
+its parts and only the hours above it are listed (next section), with the
+same supersession, tombstone and selective-erasure handling and the same
+request cap. `end_hour` is clamped to the hour of `now_ns +
+clock_skew_allowance`, the upper edge of every `resolve` window, so a bucket
+filed in a later hour is not returned, and a range whose start is past the
+clamped end selects no segment. Its only source is object storage: the
+commit records, snapshot HEAD and parts it reads are objects, fetched
+directly or through the same caches `resolve` uses.
+
 ## Snapshot resolution from a folded snapshot
 
 Step 1 of the listing
