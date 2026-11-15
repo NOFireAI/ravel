@@ -79,7 +79,10 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{CacheFetchError, LogFetchError, LogSegmentFetcher, PhaseAccounting};
+use ravel_query::{
+    BlockRangeFetcher, CacheFetchError, LogFetchError, LogSegmentFetcher, PhaseAccounting,
+    PhaseWireByteCounts, QueryPhase,
+};
 use ravel_sql::{
     CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
     SqlConfig, SqlError, TenantDelegatingPool, TenantMemoryAccountant, build_session,
@@ -706,12 +709,12 @@ async fn phase_two_reads_only_the_segments_holding_the_winners() {
 }
 
 /// The same statements with no read cache, where phase 2's re-reads ARE real
-/// object-store requests: exactly one per block fetched, on top of phase 1's
-/// one per segment. This is the cost side of the trade the ADR states, pinned
-/// as a figure rather than described -- in requests AND in bytes, because the
-/// two do not say the same thing here (see the byte assertions below).
+/// object-store requests: exactly one per segment holding a winner, however
+/// many of its blocks win, on top of phase 1's one per segment. This is the
+/// cost side of the trade the ADR states, pinned as a figure rather than
+/// described -- in requests AND in bytes.
 #[tokio::test]
-async fn without_a_cache_phase_two_costs_exactly_one_get_per_fetched_block() {
+async fn without_a_cache_phase_two_costs_exactly_one_get_per_fetched_segment() {
     let one = run(&wide_statement(1), Setup::new().uncached()).await;
     let all = run(&wide_statement(10), Setup::new().uncached()).await;
     let baseline = run(&wide_statement(10), Setup::new().rule(false).uncached()).await;
@@ -726,37 +729,34 @@ async fn without_a_cache_phase_two_costs_exactly_one_get_per_fetched_block() {
     assert_eq!(
         one.gets,
         SEGMENTS as u64 + 1,
-        "one winner: four segment reads plus one block read"
+        "one winner: four segment reads plus one segment open"
     );
+    assert_eq!(all.blocks_fetched, MATCHES);
+    assert_eq!(all.segments_fetched, SEGMENTS);
     assert_eq!(
         all.gets,
-        SEGMENTS as u64 + MATCHES as u64,
-        "ten winners: four segment reads plus ten block reads"
-    );
-    assert_eq!(
-        all.gets - baseline.gets,
-        all.blocks_fetched as u64,
-        "the whole extra request cost is one GET per block phase 2 fetched"
+        2 * SEGMENTS as u64,
+        "ten winners in ten blocks of four segments: four segment reads plus \
+         four segment opens"
     );
 
-    // Bytes, not just requests. Phase 2 restricts the DECODE to one block, but
-    // its byte fetch is the query's normal fetch for that object: these fixture
-    // objects are below the block-range threshold, so each block read is a
-    // whole-object GET, exactly as the baseline's segment reads are. So the
-    // cost is one object's bytes per winner, not one block's. 27,577 is the
-    // four objects a single pass moves (the baseline); 96,370 is that plus
-    // 68,793 for the ten whole-object block reads, and 34,235 is that plus
-    // 6,658 for one. See ADR-0774's consequences: narrowing that fetch to the
-    // named block indices is a ravel-query follow-up, and it is what would make
-    // the byte cost per-block rather than per-object.
+    // Bytes, not just requests. These fixture objects are below the
+    // block-range threshold, so each phase-2 open is a whole-object GET,
+    // exactly as the baseline's segment reads are: the cost is one object's
+    // bytes per segment holding a winner. 27,577 is the four objects a single
+    // pass moves (the baseline); 55,154 is that plus the same four objects
+    // once more, and 34,235 is that plus 6,658 for one.
+    // `phase_two_over_a_ranged_object_reads_only_the_winners_pages_in_one_open`
+    // pins the per-page cost above the threshold.
     assert_eq!(baseline.bytes, 27_577, "the four objects, once");
     assert_eq!(
         one.bytes, 34_235,
-        "one winner adds one whole-object block read"
+        "one winner adds one whole-object segment open"
     );
     assert_eq!(
-        all.bytes, 96_370,
-        "ten winners add ten whole-object block reads"
+        all.bytes,
+        2 * 27_577,
+        "ten winners across four segments add each object once more"
     );
     // And the rows are still identical, so the extra reads bought nothing but
     // the decode saving.
@@ -1274,4 +1274,293 @@ async fn a_fast_path_open_that_prunes_a_block_refuses_to_stamp_a_row_ref() {
         ),
         "expected the typed survivor-mismatch error, got {err:?}"
     );
+}
+
+// ---- phase 2 over an object above the block-range threshold ---------------
+
+/// Blocks in the ranged fixture's one segment, one row group of
+/// [`RECORDS_PER_BLOCK`]-record blocks.
+const RANGED_BLOCKS: usize = 10;
+const RANGED_RECORDS: usize = RANGED_BLOCKS * RECORDS_PER_BLOCK;
+/// Leading blocks the statement's ts window prunes, ahead of every winner.
+const RANGED_PRUNED: usize = 2;
+const RANGED_TS_BASE: i64 = 100;
+/// The statement's limit. Of the [`NEEDLE`] records inside the window (14,
+/// 21, 28 and 35), the first three win: whole-object blocks 3, 5 and 7, which
+/// are positions 1, 3 and 5 of the eight-block survivor list.
+const RANGED_K: usize = 3;
+const RANGED_WINNER_BLOCKS: [u32; RANGED_K] = [3, 5, 7];
+
+/// One segment of [`RANGED_BLOCKS`] blocks, `ts` = `RANGED_TS_BASE + index`,
+/// carrying [`NEEDLE`] every seventh record as [`record`] does. Level L1, so
+/// the ranged read issues one GET per page run rather than bridging them down
+/// to the L0 request cap, which keeps every phase-2 byte a winner's page byte.
+/// Returns the snapshot and the object's bytes.
+async fn ranged_snapshot(store: &dyn ObjectStoreBackend) -> (Snapshot, Vec<u8>) {
+    let recs: Vec<LogRecord> = (0..RANGED_RECORDS)
+        .map(|i| {
+            let mut r = record(i);
+            r.ts_ns = RANGED_TS_BASE + i as i64;
+            r.observed_ts_ns = r.ts_ns;
+            r
+        })
+        .collect();
+    let mut w = RlogWriter::new(block_config(None), identity(1));
+    for r in &recs {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let key = "logs/ranged.rlog".to_string();
+    let size = bytes.len() as u64;
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    store
+        .put(
+            &key,
+            bytes::Bytes::from(bytes.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put");
+    let snapshot = Snapshot {
+        segments: vec![SegmentRef {
+            data_object_key: key,
+            object_size: size,
+            min_event_ts_ns: RANGED_TS_BASE,
+            max_event_ts_ns: RANGED_TS_BASE + RANGED_RECORDS as i64 - 1,
+            ingest_hour_bucket: 0,
+            sample_count: RANGED_RECORDS as u64,
+            series_count: 1,
+            shard: 0,
+            content_hash,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L1 {
+                input_set_hash: [3u8; 32],
+                part_index: 0,
+            },
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    (snapshot, bytes)
+}
+
+/// A fetcher that reads `object` ranged: no size crossover, no coalescing
+/// across a hole, and a suffix probe of exactly the bytes after BLOCKS, so no
+/// block page arrives with the probe.
+fn ranged_fetcher(store: Arc<dyn ObjectStoreBackend>, object: &[u8]) -> LogSegmentFetcher {
+    let footer = ravel_logseg::footer::open(object).expect("footer");
+    let blocks = footer
+        .section(ravel_logseg::footer::kind::BLOCKS)
+        .expect("BLOCKS");
+    let tail = object.len() as u64 - (blocks.offset + blocks.len);
+    LogSegmentFetcher::new(Arc::clone(&store))
+        .with_block_range(BlockRangeFetcher::new(store).with_coalesce_gap(0))
+        .with_block_range_threshold(0)
+        .with_suffix_len(tail)
+}
+
+/// The byte runs `blocks`' pages occupy in `object` across every column, as
+/// `[start, end)` with touching runs joined: what a read of exactly those
+/// blocks' pages in all columns transfers with no coalescing gap.
+fn winner_page_runs(object: &[u8], blocks: &[u32]) -> Vec<(u64, u64)> {
+    let footer = ravel_logseg::footer::open(object).expect("footer");
+    let offset = footer
+        .section(ravel_logseg::footer::kind::BLOCKS)
+        .expect("BLOCKS")
+        .offset;
+    let reader = RlogReader::new(object, &RlogConfig::default()).expect("open");
+    let scan = reader
+        .scan_blocks(
+            &Predicate::TsRange {
+                min_ns: i64::MIN,
+                max_ns: i64::MAX,
+            },
+            &[],
+            &ColumnSelection::fixed_only(),
+        )
+        .expect("scan");
+    let page_dir = scan.page_dir();
+    assert_eq!(page_dir.groups.len(), 1, "one row group");
+    let mut pages: Vec<(u64, u64)> = page_dir
+        .projected_page_ranges(0, blocks, None)
+        .expect("page ranges")
+        .into_iter()
+        .map(|(start, len)| (offset + start, offset + start + len))
+        .collect();
+    pages.sort_unstable();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in pages {
+        match runs.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => runs.push((start, end)),
+        }
+    }
+    runs
+}
+
+struct RangedRun {
+    rows: Vec<RecordBatch>,
+    explain: String,
+    gets: u64,
+    bytes: u64,
+    wire: PhaseWireByteCounts,
+    row_refs: usize,
+    blocks_fetched: usize,
+    segments_fetched: usize,
+}
+
+async fn run_ranged(sql: &str, rule: bool) -> (RangedRun, Vec<u8>) {
+    let base = Arc::new(MemoryStore::new());
+    let (snapshot, object) = ranged_snapshot(base.as_ref()).await;
+    let counting = CountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    let fetcher = ranged_fetcher(store, &object);
+    let wire = fetcher.phase_wire_byte_counter();
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash(TENANT),
+        fetcher,
+        PhaseAccounting::pooled_over(&QueryAccounting::new()),
+    )
+    .with_declared_columns(declared_columns());
+    let ctx = session(provider, &config(Setup::new().rule(rule)));
+    let plan = ctx
+        .sql(sql)
+        .await
+        .expect("statement plans")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let rows = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("statement runs");
+    let run = RangedRun {
+        rows,
+        explain: displayable(plan.as_ref()).indent(false).to_string(),
+        gets: counting.gets(),
+        bytes: counting.bytes(),
+        wire: wire.snapshot(),
+        row_refs: metric(&plan, "LogsRowFetchExec", "row_refs"),
+        blocks_fetched: metric(&plan, "LogsRowFetchExec", "blocks_fetched"),
+        segments_fetched: metric(&plan, "LogsRowFetchExec", "segments_fetched"),
+    };
+    (run, object)
+}
+
+fn ranged_statement(needle: &str) -> String {
+    format!(
+        "SELECT * FROM logs WHERE ts >= {} AND ts <= {} AND body LIKE '%{needle}%' \
+         ORDER BY ts LIMIT {RANGED_K}",
+        ts_literal(RANGED_TS_BASE + (RANGED_PRUNED * RECORDS_PER_BLOCK) as i64),
+        ts_literal(RANGED_TS_BASE + RANGED_RECORDS as i64 - 1),
+    )
+}
+
+/// Phase 2 over an object above the block-range threshold reads the
+/// winners' pages and nothing else, through one open of the object.
+///
+/// The ts window prunes blocks 0 and 1, so a row ref's block position is not
+/// its whole-object index: the three winners sit in blocks 3, 5 and 7, at
+/// positions 1, 3 and 5. Phase 2's cost is measured as the difference from
+/// the same statement over a needle nothing carries, whose phase 1 reads the
+/// same bytes and whose phase 2 reads nothing.
+#[tokio::test]
+async fn phase_two_over_a_ranged_object_reads_only_the_winners_pages_in_one_open() {
+    let (winners, object) = run_ranged(&ranged_statement(NEEDLE), true).await;
+    let (empty, _) = run_ranged(&ranged_statement("NOTHINGMATCHESTHIS"), true).await;
+    let (single, _) = run_ranged(&ranged_statement(NEEDLE), false).await;
+    assert!(
+        winners.explain.contains("LogsRowFetchExec"),
+        "the rule fires:\n{}",
+        winners.explain
+    );
+    assert_eq!(empty.row_refs, 0);
+    let phase_two = winners.wire.saturating_sub(&empty.wire);
+    let runs = winner_page_runs(&object, &RANGED_WINNER_BLOCKS);
+    let page_bytes: u64 = runs.iter().map(|(start, end)| end - start).sum();
+    eprintln!(
+        "[ranged] object={} winners gets={} bytes={} empty gets={} bytes={} \
+         phase2 gets={} bytes={} scan gets={} bytes={} probe gets={} bytes={} \
+         plan gets={} bytes={} expected runs={} page_bytes={} \
+         row_refs={} blocks_fetched={} segments_fetched={}",
+        object.len(),
+        winners.gets,
+        winners.bytes,
+        empty.gets,
+        empty.bytes,
+        winners.gets - empty.gets,
+        winners.bytes - empty.bytes,
+        phase_two.phase_requests(QueryPhase::Scan),
+        phase_two.phase(QueryPhase::Scan),
+        phase_two.phase_requests(QueryPhase::Probe),
+        phase_two.phase(QueryPhase::Probe),
+        phase_two.phase_requests(QueryPhase::Plan),
+        phase_two.phase(QueryPhase::Plan),
+        runs.len(),
+        page_bytes,
+        winners.row_refs,
+        winners.blocks_fetched,
+        winners.segments_fetched,
+    );
+    assert_eq!(
+        ts_of(&winners.rows),
+        vec![
+            RANGED_TS_BASE + 14,
+            RANGED_TS_BASE + 21,
+            RANGED_TS_BASE + 28
+        ]
+    );
+    assert_eq!(
+        winners.rows, single.rows,
+        "late materialization returns the single-phase plan's rows"
+    );
+    assert_eq!(winners.row_refs, RANGED_K);
+    assert_eq!(winners.blocks_fetched, RANGED_K);
+    assert_eq!(winners.segments_fetched, 1);
+
+    // The block data: exactly the winners' pages in every column, one GET
+    // per run of them, charged to the scan phase. Reading every surviving
+    // block's pages instead crosses the coverage threshold and reads the
+    // whole object.
+    assert_eq!(
+        phase_two.phase(QueryPhase::Scan),
+        page_bytes,
+        "phase 2 moves the three winners' page bytes and nothing else"
+    );
+    assert_eq!(
+        phase_two.phase_requests(QueryPhase::Scan),
+        runs.len() as u64,
+        "one GET per run of winner pages"
+    );
+    // The metadata: one suffix probe, so the object is opened once, not once
+    // per winning block.
+    let footer = ravel_logseg::footer::open(&object).expect("footer");
+    let blocks = footer
+        .section(ravel_logseg::footer::kind::BLOCKS)
+        .expect("BLOCKS");
+    let tail = object.len() as u64 - (blocks.offset + blocks.len);
+    assert_eq!(
+        phase_two.phase_requests(QueryPhase::Probe),
+        1,
+        "one open of the object"
+    );
+    assert_eq!(phase_two.phase(QueryPhase::Probe), tail);
+    assert_eq!(phase_two.phase_requests(QueryPhase::Plan), 0);
+    // The same figures on the store's own counters, as literals: 115 page
+    // runs of 2,952 bytes plus one 6,437-byte probe. Before phase 2 resolved
+    // positions to blocks it read every surviving block of the object once
+    // per winning block: 6 GETs and 66,990 bytes, three probes and three
+    // whole-object reads of this 15,893-byte object.
+    assert_eq!(runs.len(), 115);
+    assert_eq!(page_bytes, 2_952);
+    assert_eq!(tail, 6_437);
+    assert_eq!(winners.gets - empty.gets, 116);
+    assert_eq!(winners.bytes - empty.bytes, 9_389);
+    assert_eq!(winners.gets - empty.gets, phase_two.total_requests());
+    assert_eq!(winners.bytes - empty.bytes, phase_two.total());
 }

@@ -3125,26 +3125,27 @@ impl RowFetchSource {
         query
     }
 
-    /// Decode one block of one segment and return the records at the named
-    /// surviving-row positions, paired with the output position each belongs
-    /// at.
+    /// Decode the named blocks of one segment through one open of it and
+    /// return the records at the named surviving-row positions, paired with
+    /// the output position each belongs at.
     ///
-    /// `block` is a position in the segment's surviving-block list for this
-    /// query, exactly as [`LogsScanExec`]'s striped path uses, and `rows` are
-    /// positions in that block's surviving-row list. Both are what phase 1
-    /// recorded while draining the same block of the same immutable object
-    /// under the same query, so both resolve; an index that does not is a typed
-    /// error, never a wrong row.
-    pub(crate) async fn fetch_block(
+    /// `blocks` is ascending by block, and each block is a position in the
+    /// segment's surviving-block list for this query, exactly as
+    /// [`LogsScanExec`]'s striped path uses; its rows are positions in that
+    /// block's surviving-row list. Both are what phase 1 recorded while
+    /// draining the same block of the same immutable object under the same
+    /// query, so both resolve; an index that does not is a typed error, never
+    /// a wrong row.
+    pub(crate) async fn fetch_blocks(
         &self,
         segment: usize,
-        block: usize,
-        rows: &[(usize, usize)],
+        blocks: &[(usize, Vec<(usize, usize)>)],
     ) -> DFResult<Vec<(usize, LogRecord)>> {
         let seg = self.segments.get(segment).ok_or_else(|| {
             DataFusionError::Internal(format!("row-ref segment ordinal {segment} out of range"))
         })?;
         let query = self.query();
+        let positions: Vec<usize> = blocks.iter().map(|(block, _)| *block).collect();
         let opened = self
             .fetcher
             .scan_accounted_with_tenant_subset(
@@ -3152,7 +3153,7 @@ impl RowFetchSource {
                 self.tenant_hash,
                 &query,
                 &self.columns,
-                &[block],
+                &positions,
                 None,
                 None,
                 &self.accounting,
@@ -3169,28 +3170,31 @@ impl RowFetchSource {
                 seg.data_object_key
             )));
         };
-        // On the fetcher's read gate when it carries one, like the scan's own
-        // row path.
-        let records = scan
-            .next_block_on_gate()
-            .await
-            .map_err(SqlError::from)?
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "row-ref block {block} not in segment {}'s surviving list",
-                    seg.data_object_key
-                ))
-            })?;
-        let mut out = Vec::with_capacity(rows.len());
-        for &(row, position) in rows {
-            let record = records.get(row).ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "row-ref row {row} past block {block}'s {} surviving rows in segment {}",
-                    records.len(),
-                    seg.data_object_key
-                ))
-            })?;
-            out.push((position, record.clone()));
+        // The subset open drains its blocks in ascending position order, the
+        // order of `blocks`. On the fetcher's read gate when it carries one,
+        // like the scan's own row path.
+        let mut out = Vec::with_capacity(blocks.iter().map(|(_, rows)| rows.len()).sum());
+        for (block, rows) in blocks {
+            let records = scan
+                .next_block_on_gate()
+                .await
+                .map_err(SqlError::from)?
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "row-ref block {block} not in segment {}'s surviving list",
+                        seg.data_object_key
+                    ))
+                })?;
+            for &(row, position) in rows {
+                let record = records.get(row).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "row-ref row {row} past block {block}'s {} surviving rows in segment {}",
+                        records.len(),
+                        seg.data_object_key
+                    ))
+                })?;
+                out.push((position, record.clone()));
+            }
         }
         Ok(out)
     }

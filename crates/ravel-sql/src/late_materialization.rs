@@ -763,28 +763,37 @@ async fn fetch_rows(
         return Ok((Vec::new(), reservation));
     }
 
-    // Group by block, keeping each row's output position so the result can be
-    // restored to phase-1 order. `BTreeMap` so blocks are fetched in
-    // (segment, block) order, which is the order their bytes sit in.
-    let mut groups: BTreeMap<(usize, usize), Vec<(usize, usize)>> = BTreeMap::new();
+    // Group by segment, then block, keeping each row's output position so the
+    // result can be restored to phase-1 order. `BTreeMap` so each segment's
+    // blocks are listed ascending, the order the subset open drains them and
+    // the order their bytes sit in.
+    let mut groups: BTreeMap<usize, BTreeMap<usize, Vec<(usize, usize)>>> = BTreeMap::new();
     for (position, &value) in packed.iter().enumerate() {
         let row_ref = RowRef::unpack(value);
         groups
-            .entry((row_ref.segment, row_ref.block))
+            .entry(row_ref.segment)
+            .or_default()
+            .entry(row_ref.block)
             .or_default()
             .push((row_ref.row, position));
     }
-    metrics.blocks_fetched.add(groups.len());
-    let segments: HashSet<usize> = groups.keys().map(|&(segment, _)| segment).collect();
-    metrics.segments_fetched.add(segments.len());
+    metrics
+        .blocks_fetched
+        .add(groups.values().map(BTreeMap::len).sum());
+    metrics.segments_fetched.add(groups.len());
+    let groups: Vec<(usize, Vec<(usize, Vec<(usize, usize)>)>)> = groups
+        .into_iter()
+        .map(|(segment, blocks)| (segment, blocks.into_iter().collect()))
+        .collect();
 
-    // One fetch per block, `concurrency` in flight. Built as a `Vec` of
-    // not-yet-polled futures for the same reason `compute_plan_counts` is: a
-    // closure returning a future that borrows its argument cannot satisfy the
-    // higher-ranked bound `buffered` needs here.
+    // One open per segment, covering all of its winning blocks, `concurrency`
+    // in flight. Built as a `Vec` of not-yet-polled futures for the same
+    // reason `compute_plan_counts` is: a closure returning a future that
+    // borrows its argument cannot satisfy the higher-ranked bound `buffered`
+    // needs here.
     let mut fetches = Vec::with_capacity(groups.len());
-    for (&(segment, block), rows) in &groups {
-        fetches.push(source.fetch_block(segment, block, rows));
+    for (segment, blocks) in &groups {
+        fetches.push(source.fetch_blocks(*segment, blocks));
     }
     let fetched: Vec<Vec<(usize, LogRecord)>> = futures::stream::iter(fetches)
         .buffered(source.concurrency().max(1))

@@ -3314,14 +3314,22 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
         // `indices` is only raw whole-object block indices when `raw` holds
-        // (ADR-2414 decision A1 deliverable 3): the ordinal case's indices are
-        // positions into the pruned survivor list, a different index space
-        // that must never restrict the object-level candidate set below.
-        let owned_blocks = raw.then(|| OwnedBlocks {
-            blocks: indices,
-            survivors: expected_survivors,
-            dirs: dirs.map(|d| &**d),
-        });
+        // (ADR-2414 decision A1 deliverable 3). The ordinal case's indices
+        // are positions into the pruned survivor list, a different index
+        // space: the ranged read resolves them against the skip step's
+        // candidates, which are that list only when the reader's prune is
+        // the skip step alone. Any other query reads every candidate.
+        let owned_blocks = if raw {
+            Some(BlockSubset::Owned(OwnedBlocks {
+                blocks: indices,
+                survivors: expected_survivors,
+                dirs: dirs.map(|d| &**d),
+            }))
+        } else if Self::prune_is_skip_step(query) || query.plan_contains_only_decidable() {
+            Some(BlockSubset::Positions(indices))
+        } else {
+            None
+        };
         let Some((bytes, _blocks_read)) = self
             .tenant_bytes_with_footer(
                 seg_ref,
@@ -3483,7 +3491,7 @@ impl LogSegmentFetcher {
         columns: &ColumnSelection,
         footer: Option<&footer::LogFooter>,
         carried_whole: Option<CarriedWholeObject>,
-        owned_blocks: Option<OwnedBlocks<'_>>,
+        owned_blocks: Option<BlockSubset<'_>>,
         primed: Option<&PrimedProbe>,
         phase: ProbePhase,
         accounting: &QueryAccounting,
@@ -4794,6 +4802,32 @@ struct OwnedBlocks<'a> {
     blocks: &'a [usize],
     survivors: &'a [usize],
     dirs: Option<&'a SegmentDirectories>,
+}
+
+/// The blocks a subset open's ranged read restricts a version-4 object to.
+#[derive(Clone, Copy)]
+enum BlockSubset<'a> {
+    /// A striped partition's share of whole-object block indices
+    /// (ADR-2414 decision A1).
+    Owned(OwnedBlocks<'a>),
+    /// Ascending positions into the skip step's survivor list, the
+    /// ordinal form a row ref records (ADR-0774). Only passed for a query
+    /// whose reader survivors are the skip step's
+    /// ([`LogSegmentFetcher::prune_is_skip_step`] or
+    /// [`LogQuery::plan_contains_only_decidable`]), so the position the
+    /// reader resolves names the same block the read fetched. The read is
+    /// the object's only reader, so it has no fences and weighs the coverage
+    /// crossover on these blocks' bytes alone.
+    Positions(&'a [usize]),
+}
+
+impl<'a> BlockSubset<'a> {
+    fn dirs(self) -> Option<&'a SegmentDirectories> {
+        match self {
+            BlockSubset::Owned(owned) => owned.dirs,
+            BlockSubset::Positions(_) => None,
+        }
+    }
 }
 
 /// Which of BLOOM and POSTINGS the scan over a ranged read can read, so the
@@ -7393,7 +7427,7 @@ impl BlockRangeFetcher {
         columns: &ColumnSelection,
         plan_footer: Option<CarriedFooter<'_>>,
         phases: ReadPhases,
-        owned_blocks: Option<OwnedBlocks<'_>>,
+        owned_blocks: Option<BlockSubset<'_>>,
         primed: Option<&PrimedProbe>,
         filter_sections: FilterSections,
         accounting: &QueryAccounting,
@@ -7426,7 +7460,7 @@ impl BlockRangeFetcher {
         columns: &ColumnSelection,
         plan_footer: Option<CarriedFooter<'_>>,
         phases: ReadPhases,
-        owned_blocks: Option<OwnedBlocks<'_>>,
+        owned_blocks: Option<BlockSubset<'_>>,
         primed: Option<&PrimedProbe>,
         filter_sections: FilterSections,
         accounting: &QueryAccounting,
@@ -7936,14 +7970,14 @@ impl BlockRangeFetcher {
         mut asm: ObjectAssembler,
         pin: &EtagPin,
         phases: ReadPhases,
-        owned_blocks: Option<OwnedBlocks<'_>>,
+        owned_blocks: Option<BlockSubset<'_>>,
         filter_sections: FilterSections,
         accounting: &QueryAccounting,
         mut stats: BlockRangeStats,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let total_size = seg_ref.object_size;
-        let dirs = owned_blocks.and_then(|o| o.dirs);
+        let dirs = owned_blocks.and_then(BlockSubset::dirs);
         let blocks_desc = *footer
             .section(kind::BLOCKS)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing BLOCKS".into())))?;
@@ -8111,11 +8145,34 @@ impl BlockRangeFetcher {
         // all pruned is owned by no partition, so it is weighed from the
         // segment's survivor list, not from every group PAGE_DIR lists.
         let mut partial_share = false;
-        if let Some(OwnedBlocks {
+        if let Some(BlockSubset::Positions(positions)) = owned_blocks {
+            // ADR-0774 phase 2: each position names `candidates`' entry, the
+            // same survivor list the reader will resolve it against. A
+            // position past its end was recorded against another list.
+            let mut picked = positions
+                .iter()
+                .map(|&p| {
+                    candidates.get(p).copied().ok_or_else(|| {
+                        corrupt(
+                            key,
+                            LogSegError::Corrupted(format!(
+                                "segment survivor mismatch: position {p} past the {} \
+                                 surviving blocks",
+                                candidates.len()
+                            )),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<usize>, LogFetchError>>()?;
+            picked.sort_unstable();
+            picked.dedup();
+            candidates = picked;
+        }
+        if let Some(BlockSubset::Owned(OwnedBlocks {
             blocks: owned,
             survivors,
             ..
-        }) = owned_blocks
+        })) = owned_blocks
         {
             let group_of = |b: usize| {
                 u32::try_from(b)
@@ -16633,7 +16690,7 @@ mod owned_block_plan_tests {
                 &ColumnSelection::fixed_only(),
                 None,
                 ReadPhases::SCAN,
-                owned,
+                owned.map(BlockSubset::Owned),
                 None,
                 FilterSections::ALL,
                 &QueryAccounting::new(),
@@ -16942,7 +16999,7 @@ mod owned_block_plan_tests {
                 columns,
                 None,
                 ReadPhases::SCAN,
-                owned,
+                owned.map(BlockSubset::Owned),
                 None,
                 FilterSections::ALL,
                 &QueryAccounting::new(),
@@ -17161,11 +17218,11 @@ mod owned_block_plan_tests {
                 &ColumnSelection::fixed_only(),
                 None,
                 ReadPhases::SCAN,
-                Some(OwnedBlocks {
+                Some(BlockSubset::Owned(OwnedBlocks {
                     blocks: owned,
                     survivors,
                     dirs: None,
-                }),
+                })),
                 None,
                 FilterSections::ALL,
                 &QueryAccounting::new(),
