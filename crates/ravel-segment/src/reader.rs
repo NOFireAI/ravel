@@ -3311,7 +3311,12 @@ mod tests {
         let loc = open_from_full(&obj, ReaderLimits::default()).expect("open");
         let mut footer = loc.footer.clone();
         let mut out = obj[..loc.footer_offset as usize].to_vec();
-        let kinds = [UNKNOWN_KIND + 2, UNKNOWN_KIND, UNKNOWN_KIND + 2, UNKNOWN_KIND + 1];
+        let kinds = [
+            UNKNOWN_KIND + 2,
+            UNKNOWN_KIND,
+            UNKNOWN_KIND + 2,
+            UNKNOWN_KIND + 1,
+        ];
         for kind in kinds {
             let payload = format!("payload for {kind}").into_bytes();
             footer.sections.push(Section {
