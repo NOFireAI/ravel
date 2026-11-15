@@ -75,6 +75,7 @@ async fn row_groups_at(
         Some(1),
         1,
         DEFAULT_DECODE_QUEUE_BATCHES,
+        None,
         Some(PER_BATCH_TARGET_BYTES),
         None,
         None,

@@ -461,6 +461,7 @@ async fn decode_object_hashes(
         None,
         queue_depth,
         None,
+        1,
     );
     let mut hashes = Vec::new();
     while let Some(p) = rx.recv().await {
@@ -608,6 +609,7 @@ async fn production_dealer_rlog_bytes_do_not_depend_on_reader_batch_size() {
     }
 }
 
+mod decode_workers;
 mod pre_2613;
 
 /// Deal `k` cursors over `groups` row groups of `group_rows` rows each at
@@ -1239,18 +1241,18 @@ async fn next_batch_decode_overlaps_current_batch_write() {
 /// A rejected row in the *second* batch must report its absolute index
 /// into the whole file, not an index relative to that batch or to its own
 /// stride cursor's partition. `file_base` is threaded through
-/// `decode_and_build_stride`, a free function outside the loop the
+/// `build_stride_rows`, a free function outside the loop the
 /// prefetch refactor introduced, and easy to drop by accident (no
 /// existing test drove a real multi-batch `load()` far enough to catch
 /// it: `future_skew_beyond_the_bound_is_rejected` calls `build_record`
 /// directly on row 0, and `batch_failed_reports_durable_tokens_not_empty`
 /// hand-constructs a `LoadError` rather than running a load). Change
-/// `file_base + row as u64` to `row as u64` in `decode_and_build_stride`'s
+/// `file_base + row as u64` to `row as u64` in `build_stride_rows`'s
 /// `RowRejected` arm and the first half of this test (the `read-cursors`
 /// auto-resolved to `1` case below) fails at `assert_eq!(row, 2, ..)` with
 /// `left: 0, right: 2` -- confirmed by performing the flip. The test
 /// panics there, before ever reaching the second half, because both
-/// halves exercise the same shared line: `decode_and_build_stride` is now
+/// halves exercise the same shared line: `build_stride_rows` is now
 /// the only row-decode path, used for every `--read-cursors` value
 /// including `1`, so this one flip is non-vacuous for both.
 ///
@@ -1729,6 +1731,17 @@ fn bodied_rows_fixture(
     first_body: &str,
     later_body: &str,
 ) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+    let bodies: Vec<&str> = (0..batches)
+        .map(|g| if g == 0 { first_body } else { later_body })
+        .collect();
+    bodies_fixture(batch_rows, &bodies)
+}
+
+/// [`uniform_rows_fixture`] with row group `g`'s body `bodies[g]`.
+fn bodies_fixture(
+    batch_rows: usize,
+    bodies: &[&str],
+) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
     use parquet::arrow::ArrowWriter;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1740,14 +1753,11 @@ fn bodied_rows_fixture(
             ("msg", str_col(vec![body; batch_rows])),
         ])
     };
-    let first = group(first_body);
-    let later = group(later_body);
+    let groups: Vec<RecordBatch> = bodies.iter().map(|body| group(body)).collect();
     let file = std::fs::File::create(&pq).expect("create parquet");
-    let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
-    for g in 0..batches {
-        writer
-            .write(if g == 0 { &first } else { &later })
-            .expect("write row group");
+    let mut writer = ArrowWriter::try_new(file, groups[0].schema(), None).expect("arrow writer");
+    for g in &groups {
+        writer.write(g).expect("write row group");
         writer.flush().expect("flush row group");
     }
     writer.close().expect("close writer");
@@ -2296,6 +2306,54 @@ async fn a_zero_ack_margin_is_refused_by_the_logs_loader() {
     match err {
         LoadError::Setup(msg) => assert!(msg.contains("--ack-margin"), "{msg}"),
         other => panic!("expected a setup error naming --ack-margin: {other:?}"),
+    }
+    assert!(list_data_objects(store.as_ref()).await.is_empty());
+}
+
+/// A library caller's `decode_workers` of 0 is refused with a typed
+/// [`LoadError::Setup`] before any write (issue #4210), not only by the CLI.
+///
+/// Prove-the-test: delete the `DECODE_WORKERS_ZERO` guard in
+/// `load_with_drain_reflush_period` and this load does not return that
+/// setup error.
+#[tokio::test]
+async fn a_zero_decode_workers_is_refused_by_the_logs_loader() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(10, 1);
+    let mut memory = LoadMemoryOptions::new(LoadMemoryRequest::Unbudgeted);
+    memory.decode_workers = Some(0);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let result = load_instrumented_at(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &m,
+        1,
+        10,
+        0,
+        Some(1),
+        Some(1),
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        Some(PER_BATCH_TARGET_BYTES),
+        None,
+        NOW_NS,
+        TestClock::new(NOW_NS) as Arc<dyn Clock>,
+        LoadPath::Columnar,
+        None,
+        None,
+        RlogZstdLevel::default(),
+        RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
+        Some(memory),
+        false,
+        Arc::new(TenantRules::none()),
+    )
+    .await;
+    match result {
+        Err(LoadError::Setup(msg)) => assert_eq!(msg, DECODE_WORKERS_ZERO),
+        other => panic!("expected the --decode-workers setup error: {other:?}"),
     }
     assert!(list_data_objects(store.as_ref()).await.is_empty());
 }

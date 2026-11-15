@@ -1132,12 +1132,14 @@ async fn a_derived_budget_below_one_batch_runs_one_batch_at_a_time() {
         memory.source,
         load::LoadMemorySource::Host { total_bytes: HOST }
     );
-    // One read cursor (the fixture is one row group) and 2 shards times the
-    // default 4 in-flight flushes: the floor is sized with the resolved
-    // cursor count, not `--shards`.
+    // One read cursor (the fixture is one row group), one decode worker and
+    // 2 shards times the default 4 in-flight flushes: the floor is sized with
+    // the resolved cursor count, not `--shards`, and the default worker count
+    // is capped to 1 because no count's floor leaves this host room for a
+    // batch.
     assert_eq!(
         memory.floor_bytes,
-        load::LoadMemory::floor_bytes(1, 2 * u64::from(load::DEFAULT_MAX_INFLIGHT_FLUSHES))
+        load::LoadMemory::floor_bytes(1, 1, 2 * u64::from(load::DEFAULT_MAX_INFLIGHT_FLUSHES))
     );
     // The peak is the larger of a batch's pre-build estimate (the previous
     // batch's bytes per row) and its measured size, never two batches.

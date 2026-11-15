@@ -287,6 +287,7 @@ async fn load_one(store: &Arc<dyn ObjectStoreBackend>, fx: &Fixture) -> bytes::B
         Some(1),
         1,
         DEFAULT_DECODE_QUEUE_BATCHES,
+        None,
         Some(PER_BATCH_TARGET_BYTES),
         None,
         None,

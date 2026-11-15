@@ -222,6 +222,7 @@ pub async fn run(
     pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
+    decode_workers: Option<usize>,
     target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     ack_margin: Option<Duration>,
@@ -247,6 +248,7 @@ pub async fn run(
         pipeline_depth,
         max_inflight_flushes,
         decode_queue_batches,
+        decode_workers,
         target_bytes,
         max_flush_delay,
         ack_margin,
@@ -414,6 +416,7 @@ pub(crate) async fn run_fold_warning_to(
         pipeline_depth,
         max_inflight_flushes,
         decode_queue_batches,
+        None,
         target_bytes,
         max_flush_delay,
         ack_margin,
@@ -453,6 +456,7 @@ pub async fn run_load_reporting(
     pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
+    decode_workers: Option<usize>,
     target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     ack_margin: Option<Duration>,
@@ -479,6 +483,11 @@ pub async fn run_load_reporting(
              `ravel-cli catalog fold --signal {name} --writers-stopped` once the load has exited"
         );
     }
+    // Rejected on every signal, before the warning that a metrics or spans
+    // load ignores the flag: 0 is invalid wherever it would apply.
+    if decode_workers == Some(0) {
+        return Err(LoadError::Setup(DECODE_WORKERS_ZERO.to_string()).into());
+    }
     let max_flush_delay = Some(max_flush_delay.unwrap_or(DEFAULT_MAX_FLUSH_DELAY));
     // A diagnostic that cannot be written is not worth failing a durable load
     // over, here or below.
@@ -489,6 +498,9 @@ pub async fn run_load_reporting(
     };
     let _ = writeln!(warnings, "{admission_warning}");
     if let Some(warning) = unused_zstd_level_warning(zstd_level, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    if let Some(warning) = unused_decode_workers_warning(decode_workers, signal) {
         let _ = writeln!(warnings, "{warning}");
     }
     if let Some(warning) = unused_group_target_blocks_warning(group_target_blocks, signal) {
@@ -633,6 +645,7 @@ pub async fn run_load_reporting(
 
     let mut memory_options = LoadMemoryOptions::new(load_memory);
     memory_options.ack_margin = ack_margin;
+    memory_options.decode_workers = decode_workers;
     let strided = lane.is_some();
     memory_options.hour_stride = lane;
     let one_batch_warning = Arc::clone(&memory_options.one_batch_warning);
@@ -994,6 +1007,11 @@ pub(super) const DECODE_QUEUE_BATCHES_ZERO: &str = "--decode-queue-batches must 
                                          of decoded batches allowed to queue ahead of the shard \
                                          writers); 0 was given";
 
+/// `--decode-workers 0`, rejected on every signal.
+pub(super) const DECODE_WORKERS_ZERO: &str = "--decode-workers must be at least 1 (the number of \
+                                              threads building decoded batches), or omitted for \
+                                              the derived default; 0 was given";
+
 /// Reject the two lever values both sequential paths call invalid and warn
 /// about a value either path would ignore, shared by the metrics and spans
 /// loads because the rule and the reasoning are identical on both.
@@ -1083,6 +1101,26 @@ pub(super) fn unused_zstd_level_warning(
             "warning: a {noun} load ignores --zstd-level {}. The level applies only to the \
              RLOG objects a logs load writes.",
             zstd_level.get()
+        )
+    })
+}
+
+/// The warning for a `--decode-workers` a metrics or spans load cannot use,
+/// or `None` when the flag is unset or the load is a logs load. Only the logs
+/// loader builds batches on a worker pool.
+pub(super) fn unused_decode_workers_warning(
+    decode_workers: Option<usize>,
+    signal: SignalArg,
+) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    decode_workers.map(|workers| {
+        format!(
+            "warning: a {noun} load ignores --decode-workers {workers}. Only a logs load builds \
+             its batches on decode workers."
         )
     })
 }
@@ -1322,6 +1360,14 @@ fn print_summary(report: &LoadReport, fold_covered: bool) {
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
+    println!(
+        "  decode_wait      : {:.3}s",
+        report.decode_wait.as_secs_f64()
+    );
+    println!(
+        "  write_wait       : {:.3}s",
+        report.write_wait.as_secs_f64()
+    );
     if let Some(fold) = &report.fold {
         print!("{}", fold_summary(fold, fold_covered));
     }

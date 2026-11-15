@@ -115,13 +115,13 @@ impl GeometryRequest {
     }
 
     /// The memory budget a metrics or spans load bounds a derived depth by:
-    /// one read cursor and `concurrent_flushes` flushes outside it. Those
+    /// one read cursor, one build and `concurrent_flushes` flushes outside it. Those
     /// loads charge nothing to it.
     pub(super) fn sequential_memory_budget(
         &self,
         concurrent_flushes: u64,
     ) -> Result<Option<u64>, LoadError> {
-        LoadMemory::resolve(self.load_memory, 1, concurrent_flushes)
+        LoadMemory::resolve(self.load_memory, 1, 1, concurrent_flushes)
             .map(|memory| memory.map(|m| m.budget_bytes))
             .map_err(LoadError::Setup)
     }
@@ -649,6 +649,14 @@ pub struct LoadLayoutReport {
     /// from a load that did not set the stride.
     #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
     pub synthetic_ingest_hours: Option<SyntheticIngestHours>,
+    /// A logs load's `decode_wait` (issue #800) in whole milliseconds; absent
+    /// from a metrics or spans load, which does not measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_wait_ms: Option<u64>,
+    /// A logs load's `write_wait` (issue #800) in whole milliseconds; absent
+    /// from a metrics or spans load, which does not measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_wait_ms: Option<u64>,
 }
 
 /// The prefix of the summary line carrying [`LoadLayoutReport`] as JSON.

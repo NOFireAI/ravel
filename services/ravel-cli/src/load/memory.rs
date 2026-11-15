@@ -1,15 +1,21 @@
 //! The logs loader's memory budget (`--load-memory-bytes`, issue #2626,
 //! ADR-2614 decision 5).
 //!
-//! Every built batch is charged to the budget from before the decoder builds
-//! it until the last flush carrying its rows finishes: an estimate before the
-//! build (the previous batch's measured bytes per row, 0 for the first batch),
-//! corrected to the built batch's measured
-//! [`ravel_logseg::ColumnarLogBatch::heap_bytes`] once it exists. The decoder
+//! Every batch being built or held is charged to the budget, on every path,
+//! from before a decode worker builds it until the last flush carrying its
+//! rows finishes: an estimate before the build (the last emitted batch's
+//! measured bytes per row, 0 for the first batch, which builds alone),
+//! resized to the built batch's measured
+//! [`ravel_logseg::ColumnarLogBatch::heap_bytes`] when it is emitted in
+//! sequence. No charge is refunded while its batch exists. When the oldest
+//! unemitted batch's measured size cannot fit beside the later batches'
+//! estimates, those later batches' built outputs are dropped, their charges
+//! refunded, and they are rebuilt from their spans after it. The decoder
 //! waits for room and never fails, so the budget bounds what the pipeline
-//! holds in batches; memory it does not hold in batches (the process itself,
-//! the Parquet read cursors' decode buffers, each flush's writer working set)
-//! is the floor, which the derived default leaves out of the host's memory.
+//! holds in batches, give or take how far a batch not yet emitted exceeds its
+//! estimate; memory it does not hold in batches (the process itself, the
+//! Parquet read cursors' decode buffers, each flush's writer working set) is
+//! the floor, which the derived default leaves out of the host's memory.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -118,6 +124,10 @@ pub struct LoadMemoryOptions {
     /// `--ingest-hour-stride`'s lane, carried here for the same reason as
     /// `on_geometry`: the load advances its clock before each batch.
     pub hour_stride: Option<Arc<HourStrideLane>>,
+    /// `--decode-workers`, carried here for the same reason as
+    /// `on_geometry`; `None` is [`crate::load::default_decode_workers`]
+    /// capped by [`LoadMemory::cap_decode_workers`].
+    pub decode_workers: Option<usize>,
 }
 
 impl LoadMemoryOptions {
@@ -130,6 +140,7 @@ impl LoadMemoryOptions {
             on_geometry: None,
             ack_margin: None,
             hour_stride: None,
+            decode_workers: None,
         }
     }
 }
@@ -161,16 +172,32 @@ pub struct LoadMemory {
 }
 
 impl LoadMemory {
-    /// The floor for `read_cursors` cursors and `concurrent_flushes` flushes
-    /// (shards times `--max-inflight-flushes`).
-    pub fn floor_bytes(read_cursors: usize, concurrent_flushes: u64) -> u64 {
+    /// The floor for `read_cursors` cursors (K), `decode_workers` build
+    /// workers (W) and `concurrent_flushes` flushes (F, shards times
+    /// `--max-inflight-flushes`):
+    ///
+    /// `baseline + W * K * per_read_cursor + F * per_flush`.
+    ///
+    /// A batch's spans are views into its K cursors' decoded Arrow, so they
+    /// keep up to K cursor buffers alive until the batch is emitted (a
+    /// budgeted pool keeps them past the build, to rebuild the batch if its
+    /// output is dropped). The decode stage holds at most W batches collected
+    /// and not yet emitted (being built, waiting for their charge, held for
+    /// re-sequencing, or waiting to be rebuilt), so up to W batches' spans
+    /// are alive at once; at W = 1 this is the K buffers the cursors hold
+    /// anyway. The built batches themselves are charged to the budget, so
+    /// the load's high-water mark is this floor plus the budget, plus however
+    /// far batches not yet emitted exceed their estimates; a batch larger
+    /// than the budget is admitted alone.
+    pub fn floor_bytes(read_cursors: usize, decode_workers: usize, concurrent_flushes: u64) -> u64 {
+        let span_buffers = (read_cursors as u64).saturating_mul(decode_workers.max(1) as u64);
         LOAD_MEMORY_BASELINE_BYTES
-            .saturating_add(LOAD_MEMORY_PER_READ_CURSOR_BYTES.saturating_mul(read_cursors as u64))
+            .saturating_add(LOAD_MEMORY_PER_READ_CURSOR_BYTES.saturating_mul(span_buffers))
             .saturating_add(LOAD_MEMORY_PER_FLUSH_BYTES.saturating_mul(concurrent_flushes))
     }
 
-    /// Resolves `request` once the load's read-cursor count is known: the flag
-    /// as given, the host's memory less the floor (0 when the floor is not
+    /// Resolves `request` once the load's read-cursor and decode-worker
+    /// counts are known: the flag as given, the host's memory less the floor (0 when the floor is not
     /// below it), or [`LOAD_MEMORY_FALLBACK_BYTES`]. `None` for
     /// [`LoadMemoryRequest::Unbudgeted`]. A derived budget is never refused
     /// here: below one batch the load admits one batch at a time and says so
@@ -178,9 +205,10 @@ impl LoadMemory {
     pub fn resolve(
         request: LoadMemoryRequest,
         read_cursors: usize,
+        decode_workers: usize,
         concurrent_flushes: u64,
     ) -> Result<Option<Self>, String> {
-        let floor_bytes = Self::floor_bytes(read_cursors, concurrent_flushes);
+        let floor_bytes = Self::floor_bytes(read_cursors, decode_workers, concurrent_flushes);
         let (budget_bytes, source) = match request {
             LoadMemoryRequest::Unbudgeted => return Ok(None),
             LoadMemoryRequest::Flag(0) => {
@@ -202,6 +230,35 @@ impl LoadMemory {
             floor_bytes,
             source,
         }))
+    }
+
+    /// The default decode-worker count `workers`, lowered until its floor
+    /// leaves a derived budget of at least `batch_bytes`: the largest count in
+    /// `1..=workers` that does, 1 when none does. Each worker adds `K` cursor
+    /// buffers to the floor, which a derived budget gives up one for one. A
+    /// flag or the fallback budget does not shrink with the floor, so
+    /// `workers` is returned unchanged for any request but a readable host
+    /// total.
+    pub fn cap_decode_workers(
+        request: LoadMemoryRequest,
+        read_cursors: usize,
+        workers: usize,
+        concurrent_flushes: u64,
+        batch_bytes: u64,
+    ) -> usize {
+        let LoadMemoryRequest::Derived {
+            host_total_bytes: Some(total_bytes),
+        } = request
+        else {
+            return workers;
+        };
+        (1..=workers.max(1))
+            .rev()
+            .find(|&w| {
+                total_bytes.saturating_sub(Self::floor_bytes(read_cursors, w, concurrent_flushes))
+                    >= batch_bytes
+            })
+            .unwrap_or(1)
     }
 
     /// Whether the operator set the budget. Only an explicit budget below one
@@ -230,7 +287,8 @@ impl LoadMemory {
              loader's derived memory budget of {} bytes ({}; estimated non-batch floor {} \
              bytes). The load continues admitting one batch at a time, an effective budget of \
              one batch ({batch_bytes} bytes for this one). Set --load-memory-bytes, or lower \
-             --batch-rows, --read-cursors, --shards or --max-inflight-flushes.",
+             --batch-rows, --read-cursors, --decode-workers, --shards or \
+             --max-inflight-flushes.",
             self.budget_bytes,
             self.source_label(),
             self.floor_bytes
@@ -259,7 +317,7 @@ mod tests {
     use super::*;
 
     fn resolve(request: LoadMemoryRequest) -> LoadMemory {
-        LoadMemory::resolve(request, 4, 4)
+        LoadMemory::resolve(request, 4, 1, 4)
             .expect("resolves")
             .expect("budgeted")
     }
@@ -267,14 +325,28 @@ mod tests {
     #[test]
     fn floor_sums_baseline_cursors_and_flushes() {
         assert_eq!(
-            LoadMemory::floor_bytes(16, 16),
+            LoadMemory::floor_bytes(16, 1, 16),
             (128 + 16 * 32 + 16 * 72) * MIB
+        );
+    }
+
+    /// Each of W decode workers can hold one batch's spans, K cursor
+    /// buffers, so the cursor term scales with W.
+    #[test]
+    fn floor_holds_one_batch_of_spans_per_decode_worker() {
+        assert_eq!(
+            LoadMemory::floor_bytes(16, 4, 16),
+            (128 + 4 * 16 * 32 + 16 * 72) * MIB
+        );
+        assert_eq!(
+            LoadMemory::floor_bytes(16, 0, 16),
+            LoadMemory::floor_bytes(16, 1, 16)
         );
     }
 
     #[test]
     fn flag_wins_and_host_derives_less_the_floor() {
-        let floor = LoadMemory::floor_bytes(4, 4);
+        let floor = LoadMemory::floor_bytes(4, 1, 4);
         let flag = resolve(LoadMemoryRequest::Flag(5_000));
         assert_eq!(flag.budget_bytes, 5_000);
         assert_eq!(flag.source, LoadMemorySource::Flag);
@@ -291,9 +363,9 @@ mod tests {
             }
         );
         assert!(!host.is_explicit());
-        assert!(LoadMemory::resolve(LoadMemoryRequest::Flag(0), 4, 4).is_err());
+        assert!(LoadMemory::resolve(LoadMemoryRequest::Flag(0), 4, 1, 4).is_err());
         assert_eq!(
-            LoadMemory::resolve(LoadMemoryRequest::Unbudgeted, 4, 4),
+            LoadMemory::resolve(LoadMemoryRequest::Unbudgeted, 4, 1, 4),
             Ok(None)
         );
     }
@@ -303,7 +375,7 @@ mod tests {
     /// rather than refusing a default load.
     #[test]
     fn a_host_at_or_below_the_floor_derives_zero_not_a_refusal() {
-        let floor = LoadMemory::floor_bytes(4, 4);
+        let floor = LoadMemory::floor_bytes(4, 1, 4);
         for total_bytes in [floor, floor - 1, 1] {
             let host = resolve(LoadMemoryRequest::Derived {
                 host_total_bytes: Some(total_bytes),
@@ -317,9 +389,45 @@ mod tests {
                 format!("floor {floor} bytes"),
                 "one batch at a time".to_string(),
                 "9000 bytes for this one".to_string(),
+                "--decode-workers".to_string(),
             ] {
                 assert!(warning.contains(&needle), "{needle:?} missing: {warning}");
             }
+        }
+    }
+
+    /// A derived default worker count is lowered to the largest whose floor
+    /// still leaves one batch of budget, and never below 1; a flag or the
+    /// fallback keeps it.
+    #[test]
+    fn the_derived_worker_count_leaves_one_batch_of_budget() {
+        let batch = 100 * MIB;
+        let host = |total_bytes| LoadMemoryRequest::Derived {
+            host_total_bytes: Some(total_bytes),
+        };
+        let budget_at =
+            |total: u64, w: usize| total.saturating_sub(LoadMemory::floor_bytes(16, w, 16));
+        // Room for one batch beside the floor of 2 workers, not of 3.
+        let total = LoadMemory::floor_bytes(16, 2, 16) + batch;
+        assert_eq!(budget_at(total, 2), batch);
+        assert!(budget_at(total, 3) < batch);
+        assert_eq!(
+            LoadMemory::cap_decode_workers(host(total), 16, 8, 16, batch),
+            2
+        );
+        assert_eq!(
+            LoadMemory::cap_decode_workers(host(total * 4), 16, 8, 16, batch),
+            8
+        );
+        assert_eq!(LoadMemory::cap_decode_workers(host(1), 16, 8, 16, batch), 1);
+        for request in [
+            LoadMemoryRequest::Flag(1),
+            LoadMemoryRequest::Derived {
+                host_total_bytes: None,
+            },
+            LoadMemoryRequest::Unbudgeted,
+        ] {
+            assert_eq!(LoadMemory::cap_decode_workers(request, 16, 8, 16, batch), 8);
         }
     }
 
