@@ -33,6 +33,9 @@ async-trait = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+# The dev edge only adds `test-support`, so a test can store a key no
+# operation can address (`MemoryStore::insert_foreign`, ADR-4233 decision 6).
+ravel-object-store = { workspace = true, features = ["test-support"] }
 ravel-segment = { workspace = true }
 # test-util for `#[tokio::test(start_paused = true)]`: the write-budget
 # deadline tests race a held PUT against a paused clock.

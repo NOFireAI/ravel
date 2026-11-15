@@ -150,19 +150,18 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     // ADR-1746 decision 4: checked before the inputs are read and every PUT.
     let checked = crate::format_floor::check_output_floor(store, config, bucket, "rewrite").await;
     let outcome = match checked {
-        Ok(()) => {
-            load_then_rewrite::<C>(
-                store,
-                clock,
-                config,
-                bucket,
-                commit_keys,
-                conservation,
-                start_ns,
-                None,
-            )
-            .await
-        }
+        Ok(()) => load_then_rewrite::<C>(
+            store,
+            clock,
+            config,
+            bucket,
+            commit_keys,
+            conservation,
+            start_ns,
+            None,
+        )
+        .await
+        .map_err(MaintainError::without_input_context),
         Err(err) => Err(err),
     }
     .and_then(|fenced| match fenced {
@@ -255,7 +254,10 @@ pub(crate) fn emit_request_report(config: &CompactorConfig, bucket: &Bucket, ok:
 /// [`rewrite_and_publish`]'s body, with the request ledger's run scope already
 /// opened and guaranteed to be closed by its caller: read the input commit
 /// records, then run the primitive over them. `planned` is passed through to
-/// [`rewrite_and_publish_loaded`], whose pre-publish re-list it enables.
+/// [`rewrite_and_publish_loaded`], whose pre-publish re-list it enables. An
+/// input outside the reader window stays wrapped as
+/// [`MaintainError::InputOutOfWindow`], so a migration can name the object it
+/// holds the bucket for.
 #[allow(clippy::too_many_arguments)]
 async fn load_then_rewrite<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
@@ -288,7 +290,6 @@ async fn load_then_rewrite<C: SegmentCodec>(
         UnwritableInputs::Fail,
     )
     .await
-    .map_err(MaintainError::without_input_context)
 }
 
 /// [`SegmentCodec::load_input_catalog`], with a reader's refusal of the input's
@@ -867,7 +868,11 @@ async fn migrate_bucket_format_scoped(
     {
         // Refused before the merge, so nothing was built: release the claim
         // now rather than hold the bucket's compaction off for the lease.
-        Err(err @ MaintainError::UnwritableInput { .. }) => {
+        Err(
+            err @ (MaintainError::UnwritableInput { .. }
+            | MaintainError::InputOutOfWindow { .. }
+            | MaintainError::NewerThanWritable { .. }),
+        ) => {
             if let Some(guard) = guard
                 && guard.cancelled_at().await.is_none()
                 && let Err(claim_err) = guard.complete(store).await
@@ -878,8 +883,8 @@ async fn migrate_bucket_format_scoped(
                     ingest_hour_bucket = bucket.ingest_hour_bucket,
                     work_id = %guard.work_id_hex(),
                     error = %claim_err,
-                    "migration refused an unwritable input, and marking its claim completed \
-                     failed; the claim ages out under its lease (ADR-1029)"
+                    "migration refused an input before the merge, and marking its claim \
+                     completed failed; the claim ages out under its lease (ADR-1029)"
                 );
             }
             return Err(err);
@@ -2153,7 +2158,7 @@ mod tests {
         .await
         .expect_err("an input recorded above the output version must be rejected");
         assert!(
-            matches!(err, MaintainError::Invariant(_)),
+            matches!(err, MaintainError::NewerThanWritable { .. }),
             "expected the validate_rewrite_inputs fail-closed-on-newer guard, got {err:?}"
         );
         assert!(

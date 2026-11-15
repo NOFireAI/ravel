@@ -143,6 +143,51 @@ async fn scan_stops_at_first_unsealed_hour() {
     );
 }
 
+/// ADR-4233 decision 4, H9: a scan cursor under another build's tag is left in
+/// place. Its body would decode as "done through HOUR + 1" under this build's
+/// layout, yet the pass compacts both hours from the beginning and writes no
+/// cursor over it.
+#[tokio::test]
+async fn unknown_scan_cursor_tag_is_left_in_place() {
+    let store = MemoryStore::new();
+    for s in two_at(HOUR, 10).into_iter().chain(two_at(HOUR + 1, 20)) {
+        seed_input(&store, &s).await;
+    }
+    let cursor_key = keys::maint_cursor_key(&tenant_hash(), Signal::Metrics, SHARD).unwrap();
+    let mut payload = vec![0x7F];
+    payload.extend_from_slice(&(HOUR + 1).to_le_bytes());
+    let foreign = bytes::Bytes::from(payload);
+    store
+        .put(
+            &cursor_key,
+            foreign.clone(),
+            ravel_object_store::PutOptions::default(),
+        )
+        .await
+        .expect("put foreign cursor");
+    let clock = FixedClock::new((i64::from(HOUR + 1) + 1) * NS_PER_HOUR + 2 * NS_PER_HOUR);
+
+    let report = scan_and_compact(
+        &store,
+        &clock,
+        &CompactorConfig::default(),
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("scan");
+
+    assert_eq!(report.compacted, 2, "the pass started from the beginning");
+    assert_eq!(report.cursor_advanced_to, None, "no cursor was written");
+    let stored = store
+        .get(&cursor_key, GetRange::Full)
+        .await
+        .expect("cursor still present")
+        .data;
+    assert_eq!(stored, foreign, "the stored cursor is unchanged");
+}
+
 // --- Terminal-bucket memo -------------------------------------
 //
 // The maintain loop re-lists and re-reads every retained bucket on every tick.
@@ -1610,7 +1655,7 @@ async fn a_corrupt_version_byte_is_not_held() {
 async fn a_newer_metrics_input_that_fails_its_hash_is_not_held() {
     let err = scan_error_with_one_altered(Format::Rseg, Alteration::OutOfWindowCorruptBody).await;
     assert!(
-        matches!(err, MaintainError::Invariant(ref msg) if msg.contains("newer than the current output version")),
+        matches!(err, MaintainError::NewerThanWritable { .. }),
         "the newer-than-writable refusal: {err:?}"
     );
 }
@@ -1622,7 +1667,7 @@ async fn a_newer_metrics_input_that_fails_its_hash_is_not_held() {
 async fn a_newer_metrics_record_over_a_readable_object_is_not_held() {
     let err = scan_error_with_one_altered(Format::Rseg, Alteration::NewerRecordOnly).await;
     assert!(
-        matches!(err, MaintainError::Invariant(ref msg) if msg.contains("newer than the current output version")),
+        matches!(err, MaintainError::NewerThanWritable { .. }),
         "the newer-than-writable refusal: {err:?}"
     );
 }
