@@ -47,6 +47,7 @@ pub(super) fn build_batch(
     } else {
         Vec::new()
     };
+    let keys = KeyCells::resolve(projection, declared, attr_keys, full_len, &merged);
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
     for &i in projection {
@@ -128,7 +129,10 @@ pub(super) fn build_batch(
             // a `Str` declaration renders as text here, reads NULL there) is
             // reproduced exactly.
             other if other >= full_len => match attr_keys.get(other - full_len) {
-                Some(key) => attr_key_column_array(key, &merged),
+                Some(key) => match keys.as_ref().and_then(|k| k.column(other)) {
+                    Some(values) => attr_key_values_array(values.iter().copied()),
+                    None => attr_key_column_array(key, &merged),
+                },
                 None => {
                     return Err(DataFusionError::Internal(format!(
                         "logs scan projection index {other} out of range"
@@ -145,7 +149,10 @@ pub(super) fn build_batch(
                 .checked_sub(FIRST_DECLARED_COL)
                 .and_then(|k| declared.get(k))
             {
-                Some(dc) => declared_column_array(dc, &merged),
+                Some(dc) => match keys.as_ref().and_then(|k| k.column(other)) {
+                    Some(values) => declared_values_array(dc, values.iter().copied()),
+                    None => declared_column_array(dc, &merged),
+                },
                 None => {
                     return Err(DataFusionError::Internal(format!(
                         "logs scan projection index {other} out of range"
@@ -181,6 +188,15 @@ pub(super) fn build_batch(
 /// column reads identically to the same logical value that overflowed into
 /// `attrs_raw` and decoded back as `List`/`Map`.
 fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>]) -> ArrayRef {
+    declared_values_array(dc, merged.iter().map(|row| find_attr(row, &dc.key)))
+}
+
+/// [`declared_column_array`] over each row's already-resolved value for the
+/// column's key, in row order.
+fn declared_values_array<'v>(
+    dc: &DeclaredColumn,
+    values: impl Iterator<Item = Option<&'v AttrValue>>,
+) -> ArrayRef {
     match dc.ty {
         // Dictionary-typed to match the fast path's schema (ADR-0099 decision
         // 5): every batch DataFusion validates carries one type per column, so
@@ -190,8 +206,8 @@ fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>
         // wrong variant or absent key is a NULL cell, never a cast (decision 7).
         DeclaredType::Str => {
             let mut b = StringDictionaryBuilder::<Int32Type>::new();
-            for row in merged {
-                match find_attr(row, &dc.key) {
+            for value in values {
+                match value {
                     Some(AttrValue::Str(s)) => b.append_value(s),
                     _ => b.append_null(),
                 }
@@ -200,8 +216,8 @@ fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>
         }
         DeclaredType::I64 => {
             let mut b = Int64Builder::new();
-            for row in merged {
-                match find_attr(row, &dc.key) {
+            for value in values {
+                match value {
                     Some(AttrValue::I64(v)) => b.append_value(*v),
                     _ => b.append_null(),
                 }
@@ -210,8 +226,8 @@ fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>
         }
         DeclaredType::Bool => {
             let mut b = BooleanBuilder::new();
-            for row in merged {
-                match find_attr(row, &dc.key) {
+            for value in values {
+                match value {
                     Some(AttrValue::Bool(v)) => b.append_value(*v),
                     _ => b.append_null(),
                 }
@@ -220,8 +236,8 @@ fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>
         }
         DeclaredType::Bytes => {
             let mut b = BinaryBuilder::new();
-            for row in merged {
-                match find_attr(row, &dc.key) {
+            for value in values {
+                match value {
                     Some(AttrValue::Bytes(bytes)) => b.append_value(bytes),
                     // A record-level `List`/`Map` value that fit the dynamic-
                     // column budget was canonicalized into a `Bytes` column at
@@ -252,14 +268,111 @@ fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>
 /// overflow fallback of an otherwise-columnar query; the common case is
 /// [`build_attr_key_columnar_array`].
 fn attr_key_column_array(key: &str, merged: &[Vec<(String, AttrValue)>]) -> ArrayRef {
+    attr_key_values_array(merged.iter().map(|row| find_attr(row, key)))
+}
+
+/// [`attr_key_column_array`] over each row's already-resolved value for the
+/// key, in row order.
+fn attr_key_values_array<'v>(values: impl Iterator<Item = Option<&'v AttrValue>>) -> ArrayRef {
     let mut b = StringBuilder::new();
-    for row in merged {
-        match find_attr(row, key) {
+    for value in values {
+        match value {
             Some(v) => b.append_value(attr_value_to_string(v)),
             None => b.append_null(),
         }
     }
     Arc::new(b.finish())
+}
+
+/// The fewest projected key columns (declared typed columns plus synthetic
+/// `attrs['k']` columns) for which a row-path batch resolves them with
+/// [`KeyCells`] instead of one [`find_attr`] per column. The one-pass
+/// resolution looks up every merged entry of a row in a map, which costs about
+/// as much as a few linear searches of that row, so a projection naming one or
+/// two keys keeps the per-column search.
+const ONE_PASS_MIN_KEY_COLUMNS: usize = 4;
+
+/// Each projected key column's value for every row of a row-path batch,
+/// resolved in one pass over each row's merged view.
+///
+/// Per column, a key is a linear [`find_attr`] over the row's merged entries,
+/// so a projection of a tenant's whole declared vocabulary (`SELECT *`) costs
+/// columns x entries string comparisons per row. Here each merged entry is
+/// looked up once. The first entry of a row holding a key wins, the value
+/// [`find_attr`] returns; a resource and a scope attribute can share a key.
+struct KeyCells<'a> {
+    /// Projection index to its key's slot in `cells`. A declared column and an
+    /// `attrs['k']` column of the same key share one slot.
+    slot_of_column: HashMap<usize, usize>,
+    /// `cells[slot][row]`.
+    cells: Vec<Vec<Option<&'a AttrValue>>>,
+}
+
+impl<'a> KeyCells<'a> {
+    /// `None` when the projection names fewer than
+    /// [`ONE_PASS_MIN_KEY_COLUMNS`] key columns.
+    fn resolve(
+        projection: &[usize],
+        declared: &[DeclaredColumn],
+        attr_keys: &[String],
+        full_len: usize,
+        merged: &'a [Vec<(String, AttrValue)>],
+    ) -> Option<Self> {
+        let mut slot_of_key: HashMap<&str, usize> = HashMap::new();
+        let mut slot_of_column = HashMap::new();
+        for &index in projection {
+            let Some(key) = projected_key(index, declared, attr_keys, full_len) else {
+                continue;
+            };
+            let next = slot_of_key.len();
+            let slot = *slot_of_key.entry(key).or_insert(next);
+            slot_of_column.insert(index, slot);
+        }
+        if slot_of_column.len() < ONE_PASS_MIN_KEY_COLUMNS {
+            return None;
+        }
+        let mut cells = vec![vec![None; merged.len()]; slot_of_key.len()];
+        for (row, entries) in merged.iter().enumerate() {
+            for (key, value) in entries {
+                if let Some(&slot) = slot_of_key.get(key.as_str())
+                    && let Some(cell) = cells.get_mut(slot).and_then(|c| c.get_mut(row))
+                    && cell.is_none()
+                {
+                    *cell = Some(value);
+                }
+            }
+        }
+        Some(Self {
+            slot_of_column,
+            cells,
+        })
+    }
+
+    /// The resolved values of the column at projection index `index`, in row
+    /// order, or `None` for a column that is not a key column.
+    fn column(&self, index: usize) -> Option<&[Option<&'a AttrValue>]> {
+        let slot = *self.slot_of_column.get(&index)?;
+        self.cells.get(slot).map(Vec::as_slice)
+    }
+}
+
+/// The attribute key the column at projection index `index` reads, mirroring
+/// [`build_batch`]'s dispatch: `attr_keys[index - full_len]` at or past
+/// `full_len`, else the declared column at `index - FIRST_DECLARED_COL`, else
+/// none (a fixed column).
+fn projected_key<'k>(
+    index: usize,
+    declared: &'k [DeclaredColumn],
+    attr_keys: &'k [String],
+    full_len: usize,
+) -> Option<&'k str> {
+    if index >= full_len {
+        return attr_keys.get(index - full_len).map(String::as_str);
+    }
+    index
+        .checked_sub(FIRST_DECLARED_COL)
+        .and_then(|k| declared.get(k))
+        .map(|dc| dc.key.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -6446,5 +6559,171 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod key_cells_tests {
+    use super::*;
+    use crate::logs_schema::logs_schema_with_declared;
+    use datafusion::arrow::array::{Array, Int64Array};
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use ravel_logseg::record::stream_attrs_bytes;
+    use ravel_types::logstream::LogStreamId;
+
+    fn kv(pairs: &[(&str, AttrValue)]) -> Vec<(String, AttrValue)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    fn rec(
+        resource: &[(&str, AttrValue)],
+        scope: &[(&str, AttrValue)],
+        attrs: &[(&str, AttrValue)],
+    ) -> LogRecord {
+        LogRecord {
+            stream_id: LogStreamId([7; 16]),
+            stream_attrs: stream_attrs_bytes(&kv(resource), "scope", "1", &kv(scope)),
+            ts_ns: 1,
+            observed_ts_ns: 1,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "b".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: kv(attrs),
+        }
+    }
+
+    /// A row-path batch projecting enough key columns to take the one-pass
+    /// resolution builds every key column identical to the per-column
+    /// `find_attr` build over the same merged views.
+    ///
+    /// The input covers: a key carried by both the resource and the scope
+    /// (`dup`, resource first, so the first occurrence is the resource's 1), a
+    /// record value overriding a resource value (`svc`), an absent key, a value
+    /// of a different variant than declared (NULL), a `List` under a `Bytes`
+    /// declaration (canonical bytes), and an `attrs['svc']` column sharing its
+    /// key, and so its slot, with the declared `svc` column. Letting the last
+    /// occurrence win instead makes the `dup` column read 2 on the first row and
+    /// fails the comparison.
+    #[test]
+    fn one_pass_key_columns_match_per_column_find_attr() {
+        let declared = vec![
+            DeclaredColumn::new("dup", DeclaredType::I64),
+            DeclaredColumn::new("svc", DeclaredType::Str),
+            DeclaredColumn::new("n", DeclaredType::I64),
+            DeclaredColumn::new("ok", DeclaredType::Bool),
+            DeclaredColumn::new("blob", DeclaredType::Bytes),
+        ];
+        let records = vec![
+            rec(
+                &[
+                    ("dup", AttrValue::I64(1)),
+                    ("svc", AttrValue::Str("res".into())),
+                ],
+                &[("dup", AttrValue::I64(2))],
+                &[
+                    ("svc", AttrValue::Str("rec".into())),
+                    ("n", AttrValue::I64(5)),
+                    ("ok", AttrValue::Bool(true)),
+                    (
+                        "blob",
+                        AttrValue::List(vec![AttrValue::I64(1), AttrValue::Str("x".into())]),
+                    ),
+                ],
+            ),
+            rec(
+                &[("svc", AttrValue::Str("res".into()))],
+                &[],
+                &[
+                    ("n", AttrValue::Str("not an int".into())),
+                    ("blob", AttrValue::Bytes(vec![1, 2])),
+                ],
+            ),
+            rec(&[], &[("dup", AttrValue::I64(3))], &[]),
+        ];
+        let full = logs_schema_with_declared(&declared);
+        let full_len = full.fields().len();
+        let attr_keys = vec!["svc".to_string()];
+        let mut projection: Vec<usize> =
+            (FIRST_DECLARED_COL..FIRST_DECLARED_COL + declared.len()).collect();
+        projection.push(full_len);
+        let mut fields: Vec<Field> = (FIRST_DECLARED_COL..full_len)
+            .map(|i| full.field(i).clone())
+            .collect();
+        fields.push(Field::new("svc", DataType::Utf8, true));
+        let schema = Arc::new(Schema::new(fields));
+
+        let merged: Vec<Vec<(String, AttrValue)>> = records
+            .iter()
+            .map(|r| merged_attrs(r).expect("merge"))
+            .collect();
+        assert!(
+            KeyCells::resolve(&projection, &declared, &attr_keys, full_len, &merged).is_some(),
+            "six key columns take the one-pass resolution"
+        );
+        let batch = build_batch(
+            &records,
+            schema,
+            &projection,
+            &declared,
+            &attr_keys,
+            full_len,
+            None,
+        )
+        .expect("build");
+
+        for (pos, dc) in declared.iter().enumerate() {
+            let want = declared_column_array(dc, &merged);
+            assert_eq!(
+                batch.column(pos).to_data(),
+                want.to_data(),
+                "declared column {}",
+                dc.key
+            );
+        }
+        let want = attr_key_column_array("svc", &merged);
+        assert_eq!(
+            batch.column(declared.len()).to_data(),
+            want.to_data(),
+            "attrs['svc'] column"
+        );
+        let dup = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("dup is I64");
+        assert_eq!(dup.value(0), 1, "the resource's dup precedes the scope's");
+        assert_eq!(
+            dup.value(2),
+            3,
+            "the scope's dup when the resource has none"
+        );
+    }
+
+    /// Below the threshold the batch keeps the per-column search, and the
+    /// count is of key columns, not of fixed ones.
+    #[test]
+    fn one_pass_resolution_starts_at_the_threshold() {
+        let declared: Vec<DeclaredColumn> = (0..ONE_PASS_MIN_KEY_COLUMNS)
+            .map(|i| DeclaredColumn::new(&format!("k{i}"), DeclaredType::I64))
+            .collect();
+        let full_len = FIRST_DECLARED_COL + declared.len();
+        let merged = vec![kv(&[("k0", AttrValue::I64(1))])];
+        let mut below: Vec<usize> = (0..FIRST_DECLARED_COL).collect();
+        below.extend(FIRST_DECLARED_COL..full_len - 1);
+        assert!(KeyCells::resolve(&below, &declared, &[], full_len, &merged).is_none());
+        let at: Vec<usize> = (FIRST_DECLARED_COL..full_len).collect();
+        let keys = KeyCells::resolve(&at, &declared, &[], full_len, &merged).expect("at threshold");
+        assert_eq!(
+            keys.column(FIRST_DECLARED_COL),
+            Some(&[Some(&AttrValue::I64(1))][..])
+        );
+        assert_eq!(keys.column(LOG_COL_TS), None, "a fixed column has no slot");
     }
 }
