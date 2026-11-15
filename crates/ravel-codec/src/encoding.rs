@@ -1727,6 +1727,7 @@ mod tests {
                         assert!(msg.contains(what), "tag {tag}: {msg}")
                     }
                     Ok(()) => panic!("tag {tag} decoded as {what}"),
+                    Err(e) => panic!("tag {tag}: expected Corrupted, got {e:?}"),
                 };
                 is_refusal(
                     decode_i64(enc, bytes, 0).map(|_| ()),

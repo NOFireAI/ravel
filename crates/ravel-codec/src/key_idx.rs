@@ -613,9 +613,10 @@ impl<'a> KeyIdxPrefix<'a> {
             .first()
             .ok_or_else(|| corrupted("header truncated at version"))?;
         if !KEY_IDX_VERSIONS.contains(&version) {
-            return Err(corrupted(format_args!(
-                "version {version} is not a known version {KEY_IDX_VERSIONS:?}"
-            )));
+            return Err(CodecError::UnsupportedSectionVersion {
+                section: "KEY_IDX",
+                version: u16::from(version),
+            });
         }
         let (raw, crc_at) = parse_raw_header(prefix)?;
         let stored_crc = read_u32(prefix, crc_at)
@@ -1145,6 +1146,7 @@ mod tests {
         match result {
             Err(CodecError::Corrupted(message)) => message,
             Ok(value) => panic!("expected Corrupted, got Ok({value:?})"),
+            Err(e) => panic!("expected Corrupted, got {e:?}"),
         }
     }
 
@@ -1641,6 +1643,25 @@ mod tests {
         for i in 0..crc_at + 4 {
             let mut bytes = v2.bytes.clone();
             bytes[i] ^= 0x01;
+            if i == 0 {
+                // Version byte 2 flips to 3, not in KEY_IDX_VERSIONS: caught
+                // by the version check before the header crc is read.
+                assert!(matches!(
+                    probe_user(&bytes, v2.prefix_len, &a.key),
+                    Err(CodecError::UnsupportedSectionVersion {
+                        section: "KEY_IDX",
+                        version: 3
+                    })
+                ));
+                assert!(matches!(
+                    verify_key_idx(&bytes, v2.prefix_len),
+                    Err(CodecError::UnsupportedSectionVersion {
+                        section: "KEY_IDX",
+                        version: 3
+                    })
+                ));
+                continue;
+            }
             corrupted_message(probe_user(&bytes, v2.prefix_len, &a.key));
             corrupted_message(verify_key_idx(&bytes, v2.prefix_len));
         }
@@ -1779,6 +1800,27 @@ mod tests {
         for i in 0..crc_at + 4 {
             let mut bytes = s.bytes.clone();
             bytes[i] ^= 0x01;
+            if i == 0 {
+                // Byte 0 is the version: flipping it to 0 (not in
+                // KEY_IDX_VERSIONS) is caught by the version check before the
+                // header crc is even read, so it surfaces as the typed
+                // version error, not Corrupted.
+                assert!(matches!(
+                    probe_user(&bytes, s.prefix_len, &a.key),
+                    Err(CodecError::UnsupportedSectionVersion {
+                        section: "KEY_IDX",
+                        version: 0
+                    })
+                ));
+                assert!(matches!(
+                    verify_key_idx(&bytes, s.prefix_len),
+                    Err(CodecError::UnsupportedSectionVersion {
+                        section: "KEY_IDX",
+                        version: 0
+                    })
+                ));
+                continue;
+            }
             corrupted_message(probe_user(&bytes, s.prefix_len, &a.key));
             corrupted_message(verify_key_idx(&bytes, s.prefix_len));
         }
@@ -1865,8 +1907,18 @@ mod tests {
         };
         check(reseal(&s.bytes, |h| h.reserved = 1), "reserved field is 1");
         check(reseal(&s.bytes, |h| h.reserved = 0x8000), "reserved field");
-        check(reseal(&s.bytes, |h| h.version = 3), "version 3");
-        check(reseal(&s.bytes, |h| h.version = 0), "version 0");
+        let check_version = |bytes: Vec<u8>, want: u16| {
+            assert!(matches!(
+                probe_user(&bytes, p, &a.key),
+                Err(CodecError::UnsupportedSectionVersion { section: "KEY_IDX", version }) if version == want
+            ));
+            assert!(matches!(
+                verify_key_idx(&bytes, p),
+                Err(CodecError::UnsupportedSectionVersion { section: "KEY_IDX", version }) if version == want
+            ));
+        };
+        check_version(reseal(&s.bytes, |h| h.version = 3), 3);
+        check_version(reseal(&s.bytes, |h| h.version = 0), 0);
         check(reseal(&s.bytes, |h| h.bucket_bits = 0), "bucket_bits 0");
         check(reseal(&s.bytes, |h| h.bucket_bits = 17), "bucket_bits 17");
         check(
@@ -1914,6 +1966,67 @@ mod tests {
             reseal(&s.bytes, |h| h.fields[0].name = vec![0xff]),
             "not UTF-8",
         );
+    }
+
+    /// Several versions above the known set (not only `KEY_IDX_VERSION_2 + 1`):
+    /// rules out an implementation that special-cases the first unknown value
+    /// and falls back to `Corrupted` for anything further out.
+    #[test]
+    fn newer_version_is_typed_unsupported() {
+        let a = acceptance_section();
+        let s = &a.section;
+        let p = s.prefix_len;
+        for version in [KEY_IDX_VERSION_2 + 1, KEY_IDX_VERSION_2 + 2, 100, 254, 255] {
+            let bytes = reseal(&s.bytes, |h| h.version = version);
+            assert!(
+                matches!(
+                    probe_user(&bytes, p, &a.key),
+                    Err(CodecError::UnsupportedSectionVersion {
+                        section: "KEY_IDX",
+                        version: v
+                    }) if v == u16::from(version)
+                ),
+                "version {version} did not probe as a typed UnsupportedSectionVersion"
+            );
+            assert!(
+                matches!(
+                    verify_key_idx(&bytes, p),
+                    Err(CodecError::UnsupportedSectionVersion {
+                        section: "KEY_IDX",
+                        version: v
+                    }) if v == u16::from(version)
+                ),
+                "version {version} did not verify as a typed UnsupportedSectionVersion"
+            );
+        }
+    }
+
+    proptest! {
+        /// Any version above the known set (1, 2) yields the typed variant,
+        /// never `Corrupted` and never a panic, however far above the known
+        /// set it lands.
+        #[test]
+        fn any_version_above_known_set_is_typed_unsupported(
+            version in (KEY_IDX_VERSION_2 + 1)..=u8::MAX,
+        ) {
+            let a = acceptance_section();
+            let s = &a.section;
+            let bytes = reseal(&s.bytes, |h| h.version = version);
+            match verify_key_idx(&bytes, s.prefix_len) {
+                Err(CodecError::UnsupportedSectionVersion { section, version: v }) => {
+                    prop_assert_eq!(section, "KEY_IDX");
+                    prop_assert_eq!(v, u16::from(version));
+                }
+                Ok(_) => prop_assert!(
+                    false,
+                    "version {version}: expected UnsupportedSectionVersion, got Ok"
+                ),
+                Err(e) => prop_assert!(
+                    false,
+                    "version {version}: expected UnsupportedSectionVersion, got {e:?}"
+                ),
+            }
+        }
     }
 
     #[test]

@@ -525,6 +525,7 @@ mod tests {
             level: 0,
             input_set_hash: Vec::new(),
             part_index: 0,
+            unknown_section_kinds: Vec::new(),
         };
         write_footer_and_trailer(&mut obj, &footer);
 
@@ -667,6 +668,7 @@ mod tests {
             level: 0,
             input_set_hash: Vec::new(),
             part_index: 0,
+            unknown_section_kinds: Vec::new(),
         };
         write_footer_and_trailer(&mut obj, &footer);
 
@@ -763,6 +765,7 @@ mod tests {
             level: 0,
             input_set_hash: Vec::new(),
             part_index: 0,
+            unknown_section_kinds: Vec::new(),
         };
         write_footer_and_trailer(&mut obj, &footer);
         obj

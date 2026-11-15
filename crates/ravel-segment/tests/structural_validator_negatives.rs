@@ -82,7 +82,7 @@ fn valid_v7_footer_accepted() {
     let (footer, region) = valid_footer();
     assert_eq!(
         validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
-        Ok(())
+        Ok(Vec::new())
     );
 }
 
@@ -188,7 +188,7 @@ fn unknown_kind_is_skipped_not_rejected() {
     footer.sections.push(unknown);
     assert_eq!(
         validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
-        Ok(())
+        Ok(vec![0xBEEF])
     );
 }
 

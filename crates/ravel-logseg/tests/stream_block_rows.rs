@@ -138,6 +138,7 @@ fn variant(e: &LogSegError) -> &'static str {
     match e {
         LogSegError::Corrupted(_) => "Corrupted",
         LogSegError::UnsupportedVersion(_) => "UnsupportedVersion",
+        LogSegError::UnsupportedSectionVersion { .. } => "UnsupportedSectionVersion",
         LogSegError::LimitExceeded(_) => "LimitExceeded",
         LogSegError::Unplaced { .. } => "Unplaced",
         LogSegError::InconsistentStreamAttrs(_) => "InconsistentStreamAttrs",

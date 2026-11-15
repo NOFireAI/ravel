@@ -1171,6 +1171,7 @@ impl RlogWriter {
             part_index,
             sort_descriptor: self.sort_descriptor.clone(),
             clustering_generation: self.clustering_generation,
+            unknown_section_kinds: Vec::new(),
         };
         write_footer_and_trailer(&mut object, &footer);
         Ok((
@@ -2208,6 +2209,7 @@ impl RlogWriter {
             part_index,
             sort_descriptor: self.sort_descriptor.clone(),
             clustering_generation: self.clustering_generation,
+            unknown_section_kinds: Vec::new(),
         };
         write_footer_and_trailer(&mut object, &footer);
         Ok((

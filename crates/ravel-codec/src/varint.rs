@@ -185,6 +185,7 @@ mod proptests {
                     prop_assert!(pos <= bytes.len());
                 }
                 Err(CodecError::Corrupted(_)) => {}
+                Err(e) => prop_assert!(false, "unexpected error: {e:?}"),
             }
         }
 

@@ -41,6 +41,17 @@ pub struct FooterLocation {
     /// successfully parsed object carries an admitted version and nothing else.
     /// Today the window holds only [`crate::VERSION_V7`], so this is always 7.
     pub version: u16,
+    /// Section kind ids this object's directory names that this build's
+    /// `validate_sections_v7` does not recognize (ADR-4233 decision 4,
+    /// hazard H6, reader side). Every kind the writer that produced this
+    /// object knows about is skipped over, bounds-checked but otherwise
+    /// untouched (docs/segment-format.md: unknown kinds are skipped); this
+    /// is the list of what was skipped. Empty for an object this build
+    /// wrote. Sorted ascending, deduplicated. Populated by
+    /// [`open_from_full`]/[`open_from_suffix`]; empty on a `FooterLocation`
+    /// built any other way (e.g. directly from `parse_footer`, before
+    /// `validate_sections` has run).
+    pub unknown_section_kinds: Vec<u32>,
 }
 
 /// The trailer's fixed fields, after the version gate. Parsed once, by
@@ -152,7 +163,11 @@ pub fn classify_trailer(total_size: u64, tail: &[u8]) -> TrailerClass {
 
 /// Result of attempting to locate the footer from a (possibly partial)
 /// suffix of the object.
+// `FooterLocation` (the `Ready` variant) outgrew `NeedRange` once H6 added
+// `unknown_section_kinds`; boxing it would change the public return type for
+// callers in other crates, which is out of scope here.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum FooterOutcome {
     Ready(FooterLocation),
     /// Fetch `object[offset .. offset + len)` (a suffix ending at the
@@ -224,6 +239,7 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
         trailer_offset: total_size - trailer_len,
         total_size,
         version: version.number(),
+        unknown_section_kinds: Vec::new(),
     }))
 }
 
@@ -256,7 +272,7 @@ pub fn validate_sections(
     version: u16,
     page_region_end: u64,
     limits: ReaderLimits,
-) -> Result<(), SegmentError> {
+) -> Result<Vec<u32>, SegmentError> {
     let Some(version) = SegmentVersion::from_number(version) else {
         return Err(SegmentError::UnsupportedVersion(version));
     };
@@ -277,10 +293,11 @@ fn validate_sections_v7(
     footer: &Footer,
     page_region_end: u64,
     limits: ReaderLimits,
-) -> Result<(), SegmentError> {
+) -> Result<Vec<u32>, SegmentError> {
     // 0 LABEL_DICT, 1 SERIES_IDS, 2 SERIES_META, 3 TS_PAGES, 4 VAL_PAGES,
     // 5 HIST_PAGES, 6 SERIES_IDX, 7 SERIES_META_CHUNKS, 8 EXEMPLARS.
     let mut seen = [false; 9];
+    let mut unknown_kinds = Vec::new();
     for section in &footer.sections {
         let end = section
             .offset
@@ -299,7 +316,12 @@ fn validate_sections_v7(
             section_kind::SERIES_IDX => 6,
             section_kind::SERIES_META_CHUNKS => 7,
             section_kind::EXEMPLARS => 8,
-            _ => continue,
+            _ => {
+                if !unknown_kinds.contains(&section.kind) {
+                    unknown_kinds.push(section.kind);
+                }
+                continue;
+            }
         };
         if seen[idx] {
             return Err(SegmentError::DuplicateSection(section.kind));
@@ -312,6 +334,7 @@ fn validate_sections_v7(
             });
         }
     }
+    unknown_kinds.sort_unstable();
     const NAMES: [&str; 2] = ["LABEL_DICT", "SERIES_IDS"];
     for (i, name) in NAMES.iter().enumerate() {
         if !seen[i] {
@@ -337,14 +360,15 @@ fn validate_sections_v7(
     if footer.series_count > 0 && !seen[4] && !seen[5] {
         return Err(SegmentError::MissingSection("VAL_PAGES or HIST_PAGES"));
     }
-    Ok(())
+    Ok(unknown_kinds)
 }
 
 /// Convenience: parse and validate a footer from the complete object bytes.
 pub fn open_from_full(bytes: &[u8], limits: ReaderLimits) -> Result<FooterLocation, SegmentError> {
     match parse_footer(bytes.len() as u64, bytes)? {
-        FooterOutcome::Ready(loc) => {
-            validate_sections(&loc.footer, loc.version, loc.footer_offset, limits)?;
+        FooterOutcome::Ready(mut loc) => {
+            loc.unknown_section_kinds =
+                validate_sections(&loc.footer, loc.version, loc.footer_offset, limits)?;
             Ok(loc)
         }
         FooterOutcome::NeedRange { .. } => Err(SegmentError::Truncated),
@@ -360,8 +384,9 @@ pub fn open_from_suffix(
     limits: ReaderLimits,
 ) -> Result<FooterOutcome, SegmentError> {
     match parse_footer(total_size, suffix)? {
-        FooterOutcome::Ready(loc) => {
-            validate_sections(&loc.footer, loc.version, loc.footer_offset, limits)?;
+        FooterOutcome::Ready(mut loc) => {
+            loc.unknown_section_kinds =
+                validate_sections(&loc.footer, loc.version, loc.footer_offset, limits)?;
             Ok(FooterOutcome::Ready(loc))
         }
         need @ FooterOutcome::NeedRange { .. } => Ok(need),
@@ -3170,6 +3195,162 @@ mod hist_heap_bound_tests {
         assert_eq!(
             page_payload_len(&unknown),
             Err(SegmentError::InvalidCompression(0xEE))
+        );
+    }
+}
+
+/// H6 (ADR-4233 decision 4): a section kind this build does not recognize is
+/// skipped, not rejected, and its kind id is reported on the opened object
+/// rather than silently dropped.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use prost::Message;
+
+    use super::*;
+    use crate::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, decode_catalog_v5};
+
+    /// A section kind id no `section_kind` constant names: real objects this
+    /// build writes never carry it.
+    const UNKNOWN_KIND: u32 = 0xFEED_0001;
+
+    fn written_object() -> Vec<u8> {
+        let labels = LabelSet::new(vec![Label {
+            name: ravel_types::METRIC_NAME_LABEL.to_string(),
+            value: "h6_unknown_kind".to_string(),
+        }])
+        .expect("labels");
+        let samples = (0..16)
+            .map(|i| ravel_types::Sample {
+                ts_ns: 1_700_000_000_000_000_000 + i as i64 * 15_000_000_000,
+                value: i as f64,
+            })
+            .collect();
+        let written = SegmentWriter::write(
+            vec![SeriesInput {
+                series_id: SeriesId([0x11; 16]),
+                labels,
+                samples,
+            }],
+            SegmentIdentity {
+                tenant_hash: [0x22; 16],
+                shard: 0,
+                writer_id: "h6-unknown-kind".to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 100_000,
+            },
+        )
+        .expect("write object");
+        written.bytes.to_vec()
+    }
+
+    /// Splices one extra section of kind `UNKNOWN_KIND` into `obj`'s
+    /// directory, its bytes stored raw (uncompressed) past the last real
+    /// section, and re-seals the footer and trailer crcs so the result opens
+    /// as a well-formed object with one more, unrecognized, section.
+    fn with_unknown_section(obj: &[u8], payload: &[u8]) -> Vec<u8> {
+        let loc = open_from_full(obj, ReaderLimits::default()).expect("open original");
+        let mut footer = loc.footer.clone();
+        let mut out = obj[..loc.footer_offset as usize].to_vec();
+        out.extend_from_slice(payload);
+        footer.sections.push(Section {
+            kind: UNKNOWN_KIND,
+            offset: loc.footer_offset,
+            len: payload.len() as u64,
+            crc32c: crc32c::crc32c(payload),
+            comp: compression::NONE,
+            uncompressed_len: payload.len() as u64,
+        });
+
+        let footer_bytes = footer.encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        out.extend_from_slice(&footer_bytes);
+        let trailer = &obj[loc.trailer_offset as usize..];
+        let (version, tail) = (&trailer[8..10], &trailer[10..16]);
+        let mut crc = crc32c::crc32c(&footer_bytes);
+        crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
+        crc = crc32c::crc32c_append(crc, version);
+        crc = crc32c::crc32c_append(crc, tail);
+        out.extend_from_slice(&footer_len.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(version);
+        out.extend_from_slice(tail);
+        out
+    }
+
+    #[test]
+    fn unknown_section_kind_is_reported() {
+        let obj = written_object();
+        let before = open_from_full(&obj, ReaderLimits::default()).expect("open before splice");
+        assert_eq!(
+            before.unknown_section_kinds,
+            Vec::<u32>::new(),
+            "an object this build wrote reports no unknown kinds"
+        );
+
+        let spliced = with_unknown_section(&obj, b"opaque future-section bytes");
+        let after = open_from_full(&spliced, ReaderLimits::default()).expect("open spliced");
+        assert_eq!(after.unknown_section_kinds, vec![UNKNOWN_KIND]);
+
+        // Data still decodes correctly: the unknown section is skipped, not
+        // mistaken for a known one, and every known section is unaffected.
+        let before_entries =
+            decode_catalog_v5(&before.footer, &obj, ReaderLimits::default()).expect("catalog");
+        let after_entries =
+            decode_catalog_v5(&after.footer, &spliced, ReaderLimits::default()).expect("catalog");
+        assert_eq!(before_entries.len(), after_entries.len());
+        assert_eq!(before_entries[0].runs, after_entries[0].runs);
+    }
+
+    /// Rules out an implementation that always reports an empty list
+    /// regardless of what the directory holds: a second, distinct unknown
+    /// kind is reported too, and the list is sorted and deduplicated.
+    #[test]
+    fn multiple_unknown_kinds_are_all_reported_sorted_and_deduped() {
+        let obj = written_object();
+        let loc = open_from_full(&obj, ReaderLimits::default()).expect("open");
+        let mut footer = loc.footer.clone();
+        let mut out = obj[..loc.footer_offset as usize].to_vec();
+        let kinds = [
+            UNKNOWN_KIND + 2,
+            UNKNOWN_KIND,
+            UNKNOWN_KIND + 2,
+            UNKNOWN_KIND + 1,
+        ];
+        for kind in kinds {
+            let payload = format!("payload for {kind}").into_bytes();
+            footer.sections.push(Section {
+                kind,
+                offset: out.len() as u64,
+                len: payload.len() as u64,
+                crc32c: crc32c::crc32c(&payload),
+                comp: compression::NONE,
+                uncompressed_len: payload.len() as u64,
+            });
+            out.extend_from_slice(&payload);
+        }
+        let footer_bytes = footer.encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        out.extend_from_slice(&footer_bytes);
+        let trailer = &obj[loc.trailer_offset as usize..];
+        let (version, tail) = (&trailer[8..10], &trailer[10..16]);
+        let mut crc = crc32c::crc32c(&footer_bytes);
+        crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
+        crc = crc32c::crc32c_append(crc, version);
+        crc = crc32c::crc32c_append(crc, tail);
+        out.extend_from_slice(&footer_len.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(version);
+        out.extend_from_slice(tail);
+
+        let after = open_from_full(&out, ReaderLimits::default()).expect("open spliced");
+        assert_eq!(
+            after.unknown_section_kinds,
+            vec![UNKNOWN_KIND, UNKNOWN_KIND + 1, UNKNOWN_KIND + 2]
         );
     }
 }
