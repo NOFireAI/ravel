@@ -754,9 +754,11 @@ pub struct ServerConfig {
     /// The resolved RAM budget for the query fetcher cache
     /// (`ResolvedPerformanceDefaults::cache_max_bytes`). `main` builds the
     /// fetcher cache from the resolved struct (`store::build_store`) before this
-    /// config exists; [`start`] reads this value only as the floor of the SQL
+    /// config exists; [`start`] reads this value as the floor of the SQL
     /// bulk-scan threshold when it is handed a read cache
-    /// ([`query::resolve_cache_bulk_scan_min_bytes`]), and hands the catalog
+    /// ([`query::resolve_cache_bulk_scan_min_bytes`]) and as the budget the
+    /// startup warm-up's logs metadata pass takes half of for its ceiling
+    /// ([`cache_warm::LogsMetadataWarm::new`]), and hands the catalog
     /// byte cache its own
     /// [`Self::catalog_cache_max_bytes`]. The two are independent LRU ceilings,
     /// so neither claims the other's derived share of RAM. Ignored when
