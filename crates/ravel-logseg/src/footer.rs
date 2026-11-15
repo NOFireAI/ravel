@@ -1562,4 +1562,81 @@ mod tests {
             Err(LogSegError::Corrupted(m)) if m == "footer sort descriptor bucket width 0 unknown"
         ));
     }
+
+    /// A section kind id no `kind` constant names: real objects this build
+    /// writes never carry it.
+    const UNKNOWN_KIND: u32 = 0xFEED_0001;
+
+    /// H6 (ADR-4233 decision 4): a section kind this build does not
+    /// recognize is skipped, not rejected, and its kind id is reported on
+    /// the opened footer rather than silently dropped.
+    #[test]
+    fn unknown_section_kind_is_reported() {
+        let before = open(&{
+            let mut obj = vec![0u8; 5];
+            write_footer_and_trailer(&mut obj, &sample_footer(sample_sections()));
+            obj
+        })
+        .expect("open before splice");
+        assert_eq!(
+            before.unknown_section_kinds,
+            Vec::<u32>::new(),
+            "an object this build wrote reports no unknown kinds"
+        );
+
+        let mut sections = sample_sections();
+        sections.push(SectionDesc {
+            kind: UNKNOWN_KIND,
+            offset: 5,
+            len: 3,
+            crc32c: 0,
+            comp: COMP_NONE,
+            uncomp_len: 3,
+            prefix_len: 0,
+        });
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(b"fut");
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+
+        let after = open(&obj).expect("open spliced");
+        assert_eq!(after.unknown_section_kinds, vec![UNKNOWN_KIND]);
+        // Data still decodes correctly: every known section is unaffected.
+        assert_eq!(after.section(kind::BLOCKS).map(|s| s.offset), Some(2));
+        assert_eq!(after.record_count, before.record_count);
+    }
+
+    /// Rules out an implementation that always reports an empty list
+    /// regardless of what the directory holds: a second, distinct unknown
+    /// kind is reported too, and the list is sorted and deduplicated.
+    #[test]
+    fn multiple_unknown_kinds_are_all_reported_sorted_and_deduped() {
+        let mut sections = sample_sections();
+        let kinds = [
+            UNKNOWN_KIND + 2,
+            UNKNOWN_KIND,
+            UNKNOWN_KIND + 2,
+            UNKNOWN_KIND + 1,
+        ];
+        let mut offset = 5u64;
+        for k in kinds {
+            sections.push(SectionDesc {
+                kind: k,
+                offset,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: 1,
+                prefix_len: 0,
+            });
+            offset += 1;
+        }
+        let mut obj = vec![0u8; offset as usize];
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+
+        let got = open(&obj).expect("open spliced");
+        assert_eq!(
+            got.unknown_section_kinds,
+            vec![UNKNOWN_KIND, UNKNOWN_KIND + 1, UNKNOWN_KIND + 2]
+        );
+    }
 }
