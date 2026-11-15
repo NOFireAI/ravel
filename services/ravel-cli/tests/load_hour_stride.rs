@@ -241,6 +241,7 @@ async fn load_signal(
         None,
         None,
         None,
+        None,
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
