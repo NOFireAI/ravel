@@ -1516,8 +1516,9 @@ enum BuildEvent {
     /// On the thread that builds the batch, after its estimate is charged and
     /// before the build runs.
     Started,
-    /// After the build's outcome was handed to the coordinator, which has not
-    /// necessarily emitted it.
+    /// After the build finished, before its outcome is handed to the
+    /// coordinator, so the coordinator cannot emit the batch before this
+    /// fires.
     Delivered,
 }
 
@@ -1676,10 +1677,10 @@ fn build_worker(
             return;
         };
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.build(seq, &spans)));
+        ctx.notify(seq, BuildEvent::Delivered);
         if results.send((seq, out)).is_err() {
             return;
         }
-        ctx.notify(seq, BuildEvent::Delivered);
     }
 }
 
@@ -1692,13 +1693,15 @@ fn build_worker(
 /// At most `workers` batches are collected and not yet emitted at once (the
 /// window). With a budget, each batch's estimate is charged before its build
 /// is dispatched and stays charged until the batch is emitted with its
-/// measured size, so every batch being built or held for re-sequencing is
-/// charged. The first batch is built alone, since no estimate exists before
-/// it; after it the window is also capped at the number of estimated batches
-/// the budget holds. A batch that does not fit while earlier ones are still
-/// building waits for one of them, holding only its spans, rather than for
-/// the budget: earlier batches charge and emit first, so waiting on the
-/// budget behind them could wait on charges only this thread can release.
+/// measured size, so every batch being built or held for re-sequencing
+/// carries a charge on every path. The first batch is built alone, since no
+/// estimate exists before it; after it the window is also capped at the
+/// number of estimated batches the budget holds. A batch that does not fit
+/// while earlier ones are still building waits for one of them, holding only
+/// its spans, rather than for the budget: earlier batches charge and emit
+/// first, so waiting on the budget behind them could wait on charges only
+/// this thread can release. [`Self::settle`] is where the oldest batch's
+/// correction waits; it never refunds a charge of a batch that still exists.
 struct DecodeCoordinator {
     state: StrideCursors,
     batch_rows: usize,
@@ -1711,6 +1714,13 @@ struct DecodeCoordinator {
     ready: std::collections::BTreeMap<u64, Prefetched>,
     /// Collected spans whose estimate did not fit yet.
     held: Option<BuildJob>,
+    /// A copy of each dispatched batch's spans until the batch is emitted,
+    /// kept only when a budgeted pool may have to rebuild it
+    /// ([`Self::discard_after`]). The copy shares the cursors' Arrow buffers.
+    dispatched: std::collections::HashMap<u64, Vec<(RecordBatch, u64)>>,
+    /// Batches whose built outcome was dropped to make room, rebuilt in
+    /// sequence order before anything new is collected.
+    rebuild: std::collections::BTreeMap<u64, Vec<(RecordBatch, u64)>>,
     building: usize,
     next_seq: u64,
     next_emit: u64,
@@ -1757,25 +1767,37 @@ impl DecodeCoordinator {
         true
     }
 
-    /// Corrects the emitted batch's charge to its measured bytes. When the
-    /// growth does not fit while later batches hold estimates, those are
-    /// refunded first (each is charged in full at its own emission), so this
-    /// wait depends only on batches already handed downstream, as the single
-    /// decode thread's did, and a batch larger than the budget is admitted
-    /// once nothing else is held.
-    fn settle(&mut self, seq: u64, out: Prefetched) -> Prefetched {
+    /// Corrects the emitted batch's charge to its measured bytes, keeping
+    /// every later batch's estimate charged while it waits. Only this thread
+    /// charges the budget, so while it waits the budget only drains, and once
+    /// nothing downstream is held it holds exactly this thread's charges: the
+    /// wait ends if the batch fits the ceiling beside the later batches'
+    /// estimates. When it does not, the later batches' built outcomes are
+    /// dropped and rebuilt afterwards ([`Self::discard_after`]), and the batch
+    /// is admitted as the single decode thread admitted any batch: once
+    /// nothing else is held, past the ceiling if it is larger.
+    fn settle(&mut self, seq: u64, out: Prefetched, builders: &Builders<'_>) -> Prefetched {
         let estimate = self.charges.remove(&seq);
-        let Some(charger) = self.charger.as_mut() else {
+        self.dispatched.remove(&seq);
+        let Some(charger) = self.charger.as_ref() else {
             return out;
         };
         let Prefetched::Batch(Built::Columnar(batch, _)) = out else {
             return out;
         };
         let bytes = batch.heap_bytes() as u64;
-        let growth = bytes.saturating_sub(estimate.as_ref().map_or(0, IngestByteCharge::bytes));
-        if growth > 0 && !self.charges.is_empty() && !charger.fits_now(growth) {
-            self.charges.clear();
+        let later: u64 = self.charges.values().map(IngestByteCharge::bytes).sum();
+        let never_fits = later > 0
+            && charger
+                .budget
+                .ceiling()
+                .is_some_and(|limit| bytes.saturating_add(later) > limit);
+        if never_fits {
+            self.discard_after(seq, builders);
         }
+        let Some(charger) = self.charger.as_mut() else {
+            return Prefetched::Batch(Built::Columnar(batch, None));
+        };
         let charge = match estimate {
             Some(mut charge) => {
                 charge.resize_waiting(bytes);
@@ -1787,12 +1809,62 @@ impl DecodeCoordinator {
         Prefetched::Batch(Built::Columnar(batch, Some(charge)))
     }
 
+    /// Drops the built outcome of every batch after `seq` and only then
+    /// refunds its charge, so no batch that still holds its output is left
+    /// uncharged; builds still running are waited for first. Their spans,
+    /// and any held ones, are queued for [`Self::rebuild`] in sequence order.
+    /// A terminal outcome holds no batch and stays ready, and nothing after
+    /// it is rebuilt.
+    fn discard_after(&mut self, seq: u64, builders: &Builders<'_>) {
+        while self.building > 0 {
+            let Some((done, out)) = builders.recv() else {
+                break;
+            };
+            self.building -= 1;
+            self.received(done, out);
+        }
+        let built: Vec<u64> = self
+            .ready
+            .range(seq + 1..)
+            .filter(|(later, out)| {
+                matches!(out, Prefetched::Batch(_)) && self.dispatched.contains_key(later)
+            })
+            .map(|(&later, _)| later)
+            .collect();
+        for later in built {
+            drop(self.ready.remove(&later));
+            drop(self.charges.remove(&later));
+            if let Some(spans) = self.dispatched.remove(&later) {
+                self.rebuild.insert(later, spans);
+            }
+        }
+        if let Some((held, spans)) = self.held.take() {
+            self.rebuild.insert(held, spans);
+        }
+        if let Some(&end) = self.ready.keys().next() {
+            self.rebuild.retain(|&later, _| later < end);
+        }
+    }
+
+    /// Whether a dispatched batch's spans are kept for a rebuild: only a
+    /// pool under a ceiling can have later batches to discard.
+    fn keeps_spans(&self) -> bool {
+        self.workers > 1
+            && self
+                .charger
+                .as_ref()
+                .is_some_and(|charger| charger.budget.ceiling().is_some())
+    }
+
     fn received(&mut self, seq: u64, out: Prefetched) {
         if !matches!(out, Prefetched::Batch(_)) {
             // Nothing after a terminal outcome is emitted, so stop collecting
-            // and drop spans waiting for their charge.
+            // and drop spans after it that are waiting for a build.
             self.input_ended = true;
-            self.held = None;
+            if self.held.as_ref().is_some_and(|(held, _)| *held > seq) {
+                self.held = None;
+            }
+            self.rebuild.retain(|&later, _| later < seq);
         }
         self.ready.insert(seq, out);
     }
@@ -1807,7 +1879,7 @@ impl DecodeCoordinator {
             while let Some(out) = self.ready.remove(&self.next_emit) {
                 let seq = self.next_emit;
                 self.next_emit += 1;
-                let out = self.settle(seq, out);
+                let out = self.settle(seq, out, builders);
                 let is_batch = matches!(out, Prefetched::Batch(_));
                 if tx.blocking_send(out).is_err() {
                     // Receiver dropped: the loader returned early (a write
@@ -1820,6 +1892,9 @@ impl DecodeCoordinator {
                 if let Some(hook) = on_batch_queued {
                     hook();
                 }
+            }
+            if self.held.is_none() {
+                self.held = self.rebuild.pop_first();
             }
             if self.held.is_none() && !self.input_ended && self.window() < self.window_cap() {
                 let seq = self.next_seq;
@@ -1836,6 +1911,9 @@ impl DecodeCoordinator {
             if let Some((seq, spans)) = self.held.take() {
                 let rows = spans.iter().map(|(b, _)| b.num_rows()).sum();
                 if self.charge_for_build(seq, rows) {
+                    if self.keeps_spans() {
+                        self.dispatched.insert(seq, spans.clone());
+                    }
                     match builders.dispatch(seq, spans) {
                         Some(out) => self.received(seq, out),
                         None => self.building += 1,
@@ -1906,6 +1984,8 @@ fn spawn_decode_pipeline(
                 charges: std::collections::HashMap::new(),
                 ready: std::collections::BTreeMap::new(),
                 held: None,
+                dispatched: std::collections::HashMap::new(),
+                rebuild: std::collections::BTreeMap::new(),
                 building: 0,
                 next_seq: 0,
                 next_emit: 0,
