@@ -626,6 +626,24 @@ pub enum KeyIndexLeafRejection {
     Read(String),
 }
 
+impl KeyIndexLeafRejection {
+    /// The header `format_version` when it is above every version this build
+    /// knows: a leaf a newer build wrote. A version below the known set, and
+    /// every other rejection, is `None`.
+    pub fn newer_version(&self) -> Option<u32> {
+        match self {
+            KeyIndexLeafRejection::UnsupportedVersion(version)
+                if KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN
+                    .iter()
+                    .all(|known| version > known) =>
+            {
+                Some(*version)
+            }
+            _ => None,
+        }
+    }
+}
+
 fn corrupted(msg: impl std::fmt::Display) -> KeyIndexLeafRejection {
     KeyIndexLeafRejection::Corrupted(msg.to_string())
 }

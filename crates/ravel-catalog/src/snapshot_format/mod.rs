@@ -19,7 +19,7 @@ pub use column_stats::{
 pub(crate) use column_stats::{SegmentMeter, decode_column_stats_streamed};
 #[cfg(test)]
 pub use column_stats::{encode_column_stats, encode_column_stats_v2};
-pub use error::SnapshotFormatError;
+pub use error::{CatalogPartKind, NewerPartVersion, SnapshotFormatError};
 pub use head::{
     HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSION_2, HEAD_FORMAT_VERSIONS, decode_head, encode_head,
     head_format_version_for, head_format_version_is_newer,
