@@ -351,6 +351,26 @@ printf -- '- Log, alert and audit objects move to RLOG v6.\n' >"${d}/changelog.d
 commit_all "${d}" "feat(logseg): bump RLOG to v6"
 check "singular_log_names_the_logs_signal" "${d}" "${base}" HEAD 0 "fragments in"
 
+# --- format_drill_definitions_are_not_anchors --------------------------------
+# A cfg(feature = "format-drill") twin of SUPPORTED_VERSIONS or WINDOW is a
+# test-only window; the cfg(not(...)) definition stays the anchor, so adding
+# the twin is not a bump and is not a second anchor match.
+
+d="$(new_repo format-drill)"
+base="$(git -C "${d}" rev-parse HEAD)"
+printf '/// RLOG trailer version.\npub const VERSION: u16 = 5;\n#[cfg(not(feature = "format-drill"))]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);\n#[cfg(feature = "format-drill")]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION_DRILL);\n' >"${d}/${RLOG}"
+printf 'pub const VERSION: u16 = 1;\nimpl SegmentVersion {\n    #[cfg(not(feature = "format-drill"))]\n    pub const WINDOW: &'"'"'static [SegmentVersion] = &[SegmentVersion::V7];\n    #[cfg(feature = "format-drill")]\n    pub const WINDOW: &'"'"'static [SegmentVersion] = &[SegmentVersion::Drill, SegmentVersion::V7];\n}\n' >"${d}/${RSEG}"
+commit_all "${d}" "feat(segment,logseg): add the format-drill window"
+check "format_drill_definitions_are_not_anchors" "${d}" "${base}" HEAD 0 "clean"
+
+# --- default_window_change_beside_a_drill_twin_is_still_a_bump ---------------
+
+d="$(new_repo drill-and-bump)"
+base="$(git -C "${d}" rev-parse HEAD)"
+printf '/// RLOG trailer version.\npub const VERSION: u16 = 5;\n#[cfg(not(feature = "format-drill"))]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION);\n#[cfg(feature = "format-drill")]\npub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION_DRILL);\n' >"${d}/${RLOG}"
+commit_all "${d}" "feat(logseg): widen the RLOG reader window"
+check "default_window_change_beside_a_drill_twin_is_still_a_bump" "${d}" "${base}" HEAD 1 "RLOG"
+
 echo
 echo "check-format-bump-release-note.test.sh: ${passes} passed, ${fails} failed"
 [[ "${fails}" -eq 0 ]]

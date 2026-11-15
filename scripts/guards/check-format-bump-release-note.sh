@@ -94,14 +94,23 @@ formats=(
 
 # anchor_value <commit> <file> <regex>: prints the single captured value, or
 # fails when the file is absent or the anchor matches zero or several lines.
+#
+# A definition whose preceding line is the attribute
+# #[cfg(feature = "format-drill")] is skipped: that feature exists only for the
+# compatibility tests and release builds refuse it (ADR-4233 decision 9), so
+# the window it widens is never one a deployment reads. The default
+# definition beside it, under #[cfg(not(feature = "format-drill"))], is the
+# anchor.
 anchor_value() {
-  local commit="$1" file="$2" re="$3" content line found=0 value=""
+  local commit="$1" file="$2" re="$3" content line prev="" trimmed found=0 value=""
   content="$(git show "${commit}:${file}" 2>/dev/null)" || return 1
   while IFS= read -r line; do
-    if [[ "${line}" =~ ${re} ]]; then
+    if [[ "${line}" =~ ${re} ]] && [[ "${prev}" != '#[cfg(feature = "format-drill")]' ]]; then
       found=$((found + 1))
       value="${BASH_REMATCH[1]}"
     fi
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [[ -n "${trimmed}" ]] && prev="${trimmed}"
   done <<<"${content}"
   [[ "${found}" -eq 1 ]] || return 1
   printf '%s\n' "${value}"
