@@ -359,13 +359,13 @@ async fn a_terminal_outcome_follows_every_earlier_batch_and_nothing_after_it() {
 }
 
 /// Four workers run builds at once and one worker runs one at a time. The
-/// four-worker run holds batch 0's build until a second build has started,
-/// so it counts two in flight without timing anything.
+/// four-worker run holds the first build to start until a second build has
+/// started, so it counts two in flight without timing anything.
 ///
 /// Prove-the-test: have `Builders::start` return `Builders::Inline` for every
 /// worker count (the single-thread pipeline the dispatch ref ran) and the
-/// four-worker case fails: batch 0 gives up on the hang guard with one build
-/// in flight.
+/// four-worker case fails: the first build gives up on the hang guard with one
+/// build in flight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn four_decode_workers_run_builds_concurrently_and_one_does_not() {
     let (_dir, pq, m) = uneven_row_group_fixture();
@@ -378,13 +378,17 @@ async fn four_decode_workers_run_builds_concurrently_and_one_does_not() {
     };
 
     let four = Arc::new(Gate::default());
-    let hold = |seq: u64, log: &BuildLog| seq == 0 && log.active < 2;
+    // Hold the first build to start until a second has started. `started` only
+    // grows, so this never depends on which worker reaches its build first nor
+    // on a build finishing: whichever two builds start first overlap, and both
+    // are released the instant the second one starts.
+    let hold = |_seq: u64, log: &BuildLog| log.started.len() < 2;
     decode.run(4, Some(gated(&four, hold)), None).await;
     {
         let log = four.lock();
         assert!(
             !log.timed_out,
-            "a second build started while batch 0 was held"
+            "a second build started while the first was held"
         );
         assert!(log.max_active >= 2, "max in flight {}", log.max_active);
     }
@@ -446,7 +450,17 @@ async fn every_batch_is_charged_before_its_build_starts() {
     .expect("wait joins");
     assert_eq!(held.0, 4, "four builds held: {held:?}");
     assert_eq!(
-        held.1,
+        held.1.first(),
+        Some(&0),
+        "batch 0 builds before the window: {held:?}"
+    );
+    // The workers pull the window's jobs FIFO, but which worker reaches its
+    // `Started` notify first is a scheduling race, so the window is a set, not
+    // an order: exactly seq 0 (built alone) plus the four that follow it.
+    let mut started = held.1.clone();
+    started.sort_unstable();
+    assert_eq!(
+        started,
         vec![0, 1, 2, 3, 4],
         "a window of four after batch 0"
     );

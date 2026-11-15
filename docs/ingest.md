@@ -2164,7 +2164,7 @@ moved from 1 to 4 later, for tenant isolation rather than throughput (ADR-2708
 D3). Every published ClickBench load figure predates both changes and
 needs re-measuring.
 
-### Bulk-load decode workers (issue #4210)
+### Bulk-load decode workers
 
 A logs load's decode stage has two parts: collecting each batch's rows from
 the `--read-cursors` cursors, and building those rows into a columnar batch
@@ -2203,7 +2203,8 @@ and the report JSON carries them as `decode_wait_ms` and `write_wait_ms`
 (logs loads only). `decode_wait` is the time the submit loop waited for the
 decode stage's next batch; `write_wait` is the time it spent blocked resolving
 an in-flight write. This change claims no wall-time effect: the build now runs on W
-workers, and epic #4203 measures what that buys on a real corpus.
+workers, and ADR-4203's ClickBench benchmark measures what that buys on a
+real corpus.
 
 ## Metrics (self-observability)
 
