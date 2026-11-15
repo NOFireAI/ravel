@@ -129,23 +129,23 @@ The **baseline release** is the first release that ships decisions 2 to 5
 baseline onward. It replaces ADR-0531 decisions 1 and 2: the window policy
 starts at the baseline, not at v1.0.
 
-- **Existing stores (owner choice at approval; recommended: adopt).** A
-  store written only by v0.24.0 to v0.33.x holds the baseline's bulk
-  versions (RSEG 7, RLOG 5, RSPAN 5) and metadata inside the baseline's read
-  sets. Recommended: adopt it in place. `ravel-cli compat init` runs the
-  census of decision 7 over every tenant, signal and family, and only on a
-  clean result creates `sys/compat` at the baseline versions. A baseline
-  binary runs on such a store before `init` exactly as v0.33 does; `init` is
-  required before any activation (decision 3). The alternative is to refuse
-  any store that has no `sys/compat` and was not created by the baseline,
-  which costs every current deployment a re-ingest to stay inside the
-  contract for no format difference.
-- **Unsupported starting points.** A store still holding objects at a
-  version no baseline reader admits (RSPAN 4 from v0.23.0 or earlier, RLOG 4
-  or earlier from v0.19.0 or earlier) is refused by `compat init`, which
-  names each (tenant, signal, version, count). No bridge reader is built.
-  The remedy is to re-ingest or discard those objects; the retention
-  version hold keeps them, unreadable, meanwhile.
+- **Existing stores (owner, 2026-11-15: nothing before v0.33 is in
+  scope).** A store written by v0.33.x holds the baseline's bulk versions
+  (RSEG 7, RLOG 5, RSPAN 5) and metadata inside the baseline's read sets,
+  and is adopted in place: `ravel-cli compat init` runs the census of
+  decision 7 over every tenant, signal and family, and only on a clean
+  result creates `sys/compat` at the baseline versions. A baseline binary
+  runs on such a store before `init` exactly as v0.33 does; `init` is
+  required before any activation (decision 3).
+- **Unsupported starting points.** Stores, data and processes from releases
+  before v0.33.0 are outside the contract: no test covers them and no
+  bridge exists. `compat init` decides by content, not by which release
+  wrote the store, so it refuses any object at a version no baseline reader
+  admits and names each (tenant, signal, version, count); the remedy is to
+  re-ingest or discard those objects, and the retention version hold keeps
+  them, unreadable, meanwhile. A store with nothing outside the read sets
+  passes the census whatever wrote it, but only v0.33.x stores are
+  supported.
 - **Unsupported processes.** A release before the baseline is not part of
   the contract. It may run beside the baseline until the first activation
   above the baseline (decision 3), because until then the baseline writes
@@ -609,18 +609,15 @@ For a class A family:
 | retention, erasure, legal hold, pinned query and Flight ticket during migrate | held objects counted; pinned inputs keep certify waiting; erasure completes at the active version |
 | retired-reader startup with no, stale, contradicted, or `Current` certificate | refuse, refuse, refuse, start |
 
-- **Released binaries at a real format boundary.** The bulk boundary
-  available in shipped releases is RSPAN 4 to 5 (v0.23.0 writes 4, v0.24.0
-  onward reads only 5); the images are published as
+- **Released binaries.** The images are published as
   `ghcr.io/nofireai/ravel-server:<version>`. Against isolated RustFS
-  buckets:
-  - v0.23.0 writes spans (RSPAN 4); the baseline's `compat init` refuses
-    the store and names the version and count; nothing is written.
-  - The baseline writes spans (RSPAN 5); v0.23.0 opens the bucket, every
-    query touching those objects fails typed, and the drill asserts by
-    listing that it deleted and rewrote nothing.
-  - v0.33.0 writes every signal; the baseline reads it with exact results
-    and `compat init` adopts it.
+  buckets, v0.33.0 writes every signal; the baseline reads it with exact
+  results and `compat init` adopts it. No bulk format boundary exists
+  between v0.33.0 and the baseline (both write RSEG 7, RLOG 5, RSPAN 5), and
+  boundaries in older releases are out of scope by the owner's decision, so
+  a two-version boundary is exercised by the format-drill version until the
+  first real bump, whose release adds its corpus and is covered by the
+  previous-release lane below.
 - **Released-binary fence drill (wave 0).** The released v0.33.0 image runs
   against an isolated RustFS bucket whose provisioning records were fenced
   and whose alert lease was parked by the baseline code, including a run
@@ -668,13 +665,12 @@ For a family F with baseline version N and a release introducing N+1:
 
 | Release | Reads F | Writes F | Runs beside |
 |---|---|---|---|
-| pre-baseline (≤ v0.33) | N | N | baseline and B+1 until the first activation above the baseline |
+| v0.33.x (pre-baseline; older releases are out of scope) | N | N | baseline and B+1 until the first activation above the baseline |
 | baseline B | N | N | B+1 before and after activation (refuses F publishes after) |
 | B+1 (introduces N+1) | N, N+1 | active version | B, B+2 |
 | B+2 (retires N) | N+1 | N+1 | B+1; starts only on a certificate |
 
-Supported upgrade paths: v0.24.0 to v0.33.x then B (rolling, no activation
-needed); B to B+1 (rolling), activate, migrate, certify, then B+2 (rolling).
+Supported upgrade paths: v0.33.x to B (rolling, no activation needed); B to B+1 (rolling), activate, migrate, certify, then B+2 (rolling).
 B straight to B+2 is refused by B+2 at startup. Unsupported: any store
 holding versions outside B's read set (decision 1).
 
@@ -700,8 +696,9 @@ holding versions outside B's read set (decision 1).
   audit are not provisioned, and an operator would have to activate every
   bucket. The provisioning record carries the fence, `sys/compat` the
   decision.
-- **Rebuild bridges for RSPAN 4 and RLOG 4.** Out of scope by the owner's
-  decision (2026-11-15): the contract starts at the baseline.
+- **Support stores from releases before v0.33, or rebuild bridges for RSPAN
+  4 and RLOG 4.** Out of scope by the owner's decisions (2026-11-15): the
+  contract starts at v0.33.x stores and the baseline release.
 - **Bump a production format to demonstrate the framework.** It would carry
   a real reader and corpus forever for no user value. The drill feature
   proves the mechanism without shipping a version.
