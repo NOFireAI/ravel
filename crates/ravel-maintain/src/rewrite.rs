@@ -1121,8 +1121,9 @@ pub(crate) fn current_part_version(signal: Signal) -> Result<u32> {
 /// the records a version 2 record supersedes (item 4), and at least one of that
 /// record's parts below the current version. Every other case returns the
 /// [`ReencodeOutcome`] that names it, having written nothing. A part recorded
-/// above the current version is an [`MaintainError::Invariant`]: a forward
-/// re-encode cannot write it (ADR-0066 decision 2).
+/// above the current version is [`MaintainError::NewerThanWritable`] naming the
+/// record: a forward re-encode cannot write it (ADR-0066 decision 2), and the
+/// `migrate` walk holds the bucket on it (ADR-4233 decision 6).
 ///
 /// Every part is re-encoded with exact contents (item 7). An RSEG part is read
 /// whole and re-encoded part for part: each run is decoded and re-encoded with
@@ -1216,12 +1217,11 @@ async fn reencode_compaction_parts_scoped(
         .iter()
         .find(|p| p.segment_format_version > target_version)
     {
-        return Err(MaintainError::Invariant(format!(
-            "compaction record {predecessor_key} has part {} recorded at format version {}, \
-             newer than the current output version {target_version}: a re-encode cannot \
-             write it (ADR-0066 decision 2)",
-            newer.part_index, newer.segment_format_version
-        )));
+        return Err(MaintainError::NewerThanWritable {
+            commit_key: predecessor_key.to_string(),
+            version: newer.segment_format_version,
+            writable: target_version,
+        });
     }
     if !predecessor
         .parts
