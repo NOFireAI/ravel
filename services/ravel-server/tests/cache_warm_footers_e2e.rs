@@ -524,13 +524,13 @@ async fn backdated_tenant() -> (Tenant, Vec<String>) {
     let tenant = ingest_at(OBJECTS, export, EVENT_2013_NS, BACKFILL_INGEST_LAG).await;
     let (older, newer) = tenant.keys.split_at(OLDER_HOUR_OBJECTS);
     let ingested = tenant.ingest_hours().await;
-    let newest_hour = *ingested.values().min().expect("an ingest hour");
-    tenant.refile(newer, newest_hour).await;
-    tenant.refile(older, newest_hour - 1).await;
+    let newer_hour = *ingested.values().min().expect("an ingest hour");
+    tenant.refile(newer, newer_hour).await;
+    tenant.refile(older, newer_hour - 1).await;
     let refiled = tenant.ingest_hours().await;
     assert!(
-        newer.iter().all(|key| refiled[key] == newest_hour)
-            && older.iter().all(|key| refiled[key] == newest_hour - 1),
+        newer.iter().all(|key| refiled[key] == newer_hour)
+            && older.iter().all(|key| refiled[key] == newer_hour - 1),
         "two ingest hours: {refiled:?}"
     );
     let warm_order = [newer, older].concat();
