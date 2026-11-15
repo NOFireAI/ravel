@@ -492,9 +492,9 @@ fn push_section(object: &mut Vec<u8>, sections: &mut Vec<SectionDesc>, kind: u32
 mod tests {
     use super::*;
     use crate::footer::open;
+    use crate::reader::RspanReader;
     #[cfg(feature = "format-drill")]
     use crate::reader::SpanQuery;
-    use crate::reader::RspanReader;
     use crate::record::StatusCode;
 
     fn identity() -> ObjectIdentity {
