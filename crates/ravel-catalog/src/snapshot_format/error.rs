@@ -311,6 +311,20 @@ pub enum SnapshotFormatError {
     /// decision 2): the job panicked, or the runtime dropped it.
     #[error("decode job on the read CPU gate failed: {0}")]
     DecodeJob(ravel_cpu_gate::CpuGateError),
+
+    /// A fold read a previous catalog part a newer build wrote (ADR-4233 H1):
+    /// `field` holds `version`, above what this build reads. The fold refuses
+    /// the cycle rather than rebuild over it, which would drop whatever the
+    /// newer format carries; the remediation is to upgrade this process.
+    #[error(
+        "catalog part {key:?} ({kind}) carries {field} {version}, newer than this build reads; upgrade this process (the fold must not rebuild over a newer part)"
+    )]
+    NewerPart {
+        key: String,
+        kind: CatalogPartKind,
+        field: &'static str,
+        version: u32,
+    },
 }
 
 /// The highest `SnapshotEntry.level` `part.rs`'s entry validation accepts
@@ -358,6 +372,7 @@ impl SnapshotFormatError {
             SnapshotFormatError::ColumnStatsUnknownDeclaredType { declared_type, .. } => {
                 *declared_type > MAX_DECLARED_TYPE
             }
+            SnapshotFormatError::NewerPart { .. } => true,
 
             SnapshotFormatError::TooSmall { .. }
             | SnapshotFormatError::BadMagic
@@ -447,6 +462,99 @@ impl SnapshotFormatError {
             | SnapshotFormatError::DecodeJob(_) => false,
         }
     }
+
+    /// The part kind, field and stored value when this error is a newer
+    /// format version (see [`Self::is_newer_format_version`]) on a catalog
+    /// part object. `None` for every other error, and for a newer HEAD, which
+    /// is not a part.
+    ///
+    /// The `.kidx` leaf codec reports its version through
+    /// `KeyIndexLeafRejection::newer_version` instead; a fold that refuses a
+    /// newer leaf reports it here as [`SnapshotFormatError::NewerPart`].
+    pub fn newer_part_version(&self) -> Option<NewerPartVersion> {
+        if !self.is_newer_format_version() {
+            return None;
+        }
+        let (kind, field, version) = match self {
+            SnapshotFormatError::UnsupportedVersion(v) => {
+                (CatalogPartKind::Snapshot, "format_version", u32::from(*v))
+            }
+            SnapshotFormatError::UnsupportedLevel(level) => {
+                (CatalogPartKind::Snapshot, "entry level", *level)
+            }
+            SnapshotFormatError::PostingsUnsupportedVersion(v) => {
+                (CatalogPartKind::Postings, "format_version", u32::from(*v))
+            }
+            SnapshotFormatError::ColumnStatsUnsupportedVersion(v) => (
+                CatalogPartKind::ColumnStats,
+                "format_version",
+                u32::from(*v),
+            ),
+            SnapshotFormatError::ColumnStatsUnknownDeclaredType { declared_type, .. } => (
+                CatalogPartKind::ColumnStats,
+                "declared_type",
+                *declared_type,
+            ),
+            SnapshotFormatError::NewerPart {
+                kind,
+                field,
+                version,
+                ..
+            } => (*kind, *field, *version),
+            _ => return None,
+        };
+        Some(NewerPartVersion {
+            kind,
+            field,
+            version,
+        })
+    }
+}
+
+/// The catalog part object kinds a fold reads back from the previous HEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogPartKind {
+    /// A snapshot part (`.csnap`).
+    Snapshot,
+    /// A name postings object (`.npost`).
+    Postings,
+    /// A per-part column-stats object (`.cstat`).
+    ColumnStats,
+    /// A key-index leaf (`.kidx`).
+    KeyIndexLeaf,
+}
+
+impl std::fmt::Display for CatalogPartKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CatalogPartKind::Snapshot => ".csnap",
+            CatalogPartKind::Postings => ".npost",
+            CatalogPartKind::ColumnStats => ".cstat",
+            CatalogPartKind::KeyIndexLeaf => ".kidx",
+        })
+    }
+}
+
+impl NewerPartVersion {
+    /// The fold's refusal for the part at `key`.
+    pub fn refusal(self, key: &str) -> SnapshotFormatError {
+        SnapshotFormatError::NewerPart {
+            key: key.to_string(),
+            kind: self.kind,
+            field: self.field,
+            version: self.version,
+        }
+    }
+}
+
+/// A catalog part carrying a value above what this build reads, from
+/// [`SnapshotFormatError::newer_part_version`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewerPartVersion {
+    pub kind: CatalogPartKind,
+    /// Which stored field is above the read set.
+    pub field: &'static str,
+    pub version: u32,
 }
 
 #[cfg(test)]
@@ -500,7 +608,28 @@ mod tests {
         ];
         for err in &not_newer {
             assert!(!err.is_newer_format_version(), "{err:?}");
+            assert_eq!(err.newer_part_version(), None, "{err:?}");
         }
+
+        let part_kinds: Vec<Option<(CatalogPartKind, u32)>> = newer
+            .iter()
+            .map(|err| err.newer_part_version().map(|n| (n.kind, n.version)))
+            .collect();
+        assert_eq!(
+            part_kinds,
+            vec![
+                Some((CatalogPartKind::Snapshot, u32::from(VERSION) + 1)),
+                Some((CatalogPartKind::Snapshot, MAX_ENTRY_LEVEL + 1)),
+                // A newer HEAD is not a part.
+                None,
+                Some((CatalogPartKind::Postings, u32::from(POSTINGS_VERSION) + 1)),
+                Some((
+                    CatalogPartKind::ColumnStats,
+                    u32::from(column_stats_max) + 1
+                )),
+                Some((CatalogPartKind::ColumnStats, MAX_DECLARED_TYPE + 1)),
+            ]
+        );
     }
 
     /// `MAX_DECLARED_TYPE` is the highest tag the column validator accepts:

@@ -88,6 +88,19 @@ pub fn key_index_leaf_versions_for_signal(signal: Signal) -> &'static [u32] {
     }
 }
 
+/// Whether a leaf of `signal` at `format_version` is above every version the
+/// signal reads ([`key_index_leaf_versions_for_signal`]): a leaf a newer
+/// build wrote, which a fold must refuse rather than rebuild over (ADR-4233
+/// H1). Distinct from `!key_index_leaf_version_accepted`, which is also true
+/// for a version the signal does not read but is not newer (a logs
+/// version-1 leaf, or a metrics v3 leaf met as logs): those keep the rebuild
+/// path, this fails the cycle.
+pub fn key_index_leaf_version_is_newer(signal: Signal, format_version: u32) -> bool {
+    key_index_leaf_versions_for_signal(signal)
+        .iter()
+        .all(|&known| format_version > known)
+}
+
 /// The metrics field whose entries are label-pair postings (ADR-4146
 /// decision 1): `key8` is [`series_label_pair_key8`] of one pair, the
 /// posting the series keys carrying it.
@@ -1035,6 +1048,24 @@ pub enum KeyIndexLeafRejection {
     EntryKindMismatch { expected: u32, actual: u32 },
     #[error("key-index leaf read failed: {0}")]
     Read(String),
+}
+
+impl KeyIndexLeafRejection {
+    /// The header `format_version` when it is above every version `signal`
+    /// reads ([`key_index_leaf_version_is_newer`]): a leaf a newer build
+    /// wrote. A version within or below the signal's read set (a metrics v3
+    /// leaf met as logs is below logs's ceiling, not newer), and every other
+    /// rejection, is `None`.
+    pub fn newer_version(&self, signal: Signal) -> Option<u32> {
+        match self {
+            KeyIndexLeafRejection::UnsupportedVersion(version)
+                if key_index_leaf_version_is_newer(signal, *version) =>
+            {
+                Some(*version)
+            }
+            _ => None,
+        }
+    }
 }
 
 fn corrupted(msg: impl std::fmt::Display) -> KeyIndexLeafRejection {
