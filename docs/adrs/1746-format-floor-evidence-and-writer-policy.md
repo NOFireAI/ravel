@@ -84,7 +84,9 @@ change, and this ADR follows the same rule.
    is the audit, not a later estimate. A floor from an earlier build carries
    zeros, which decode as "basis unknown".
 
-2. **A stored floor is a pointer to evidence, never the evidence.** Any
+2. **A stored floor is a pointer to evidence, never the evidence.** (For
+   retiring a class A reader, an ADR-4233 certificate replaces the
+   per-bucket `Current` requirement; see the ADR-4233 amendment below.) Any
    consumer that would act on a floor first classifies it against current
    records into one of four states, and only `Current` counts:
 
@@ -440,3 +442,18 @@ left open in seven places.
 - **The override (decision 5).** `--write-below-format-floor` resolves into
   the compactor config every mode builds, and the ingest routers take the
   same policy from there, so one flag covers both roles in a process.
+
+## Amendment (2026-11-15, #4233): retiring a class A reader takes a certificate
+
+<!-- amendment-applies: sections="Decision" pointer="ADR-4233 amendment" -->
+
+Decision 2 required `Current` on every bucket before an old reader is
+deleted. From ADR-4233's baseline release that requirement is replaced, for
+the class A families, by an ADR-4233 certificate: a strict census of every
+signal the family carries, alerts and audit included, that also reads each
+member object's trailer, waits out the bound on late writes before it
+starts, raises each provisioned bucket's floor with its basis as `migrate`
+does, and is kept checkable afterwards by a late-write pass. The floor
+classification stays as it is and remains what `audit-versions` reports;
+the certificate is what a reader-retiring release reads at startup. Once a
+family is certified, `--write-below-format-floor` is refused for it.

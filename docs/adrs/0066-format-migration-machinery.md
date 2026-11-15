@@ -57,6 +57,8 @@ Classify every persistent format into one of four migration classes with a named
 
 ### 1. Version lifecycle policy: N/N-1 window, readers first
 
+From the baseline release, writers no longer always emit N: they emit the activated version, and the window opens at the baseline rather than v1.0; see the ADR-4233 amendment below.
+
 ADR-0027's single-version policy is superseded at (and only at) first public release, exactly as its decision 7 anticipated. From then on, for the bulk data-object formats (Class A below):
 
 - Writers always emit the current version N. There is never a "write the old format for compatibility" mode.
@@ -741,3 +743,22 @@ reads only {1, 2} and refuses a version-3 record on every path, including
 build (v0.20.0) or later before any process runs Release B (the release after
 v0.23.0). A Release A binary reads a
 version-3 record and refuses to rewrite it, which is the intended strip guard.
+
+## Amendment (2026-11-15, #4233): writers emit the activated version, from a baseline release
+
+<!-- amendment-applies: sections="1. Version lifecycle policy: N/N-1 window, readers first" pointer="ADR-4233 amendment" -->
+
+ADR-4233 replaces decision 1's "writers always emit the current version N"
+from its baseline release onward. A release that introduces version N+1 of
+a family ships the reader and the writer for N and N+1, and every writer
+takes its emitted version from the family's activation in `sys/compat`, so
+installing a binary does not change what it writes. Readers-before-writers
+becomes enforced rather than advised: activation is the step that lets
+writers emit N+1, and processes that cannot read it are fenced (ADR-4233
+decision 4). Deleting the N reader still needs evidence, now an ADR-4233
+certificate rather than every bucket's floor alone, and only for the class A
+families. The window opens at the baseline release, not at v1.0. The
+`ProvisioningRecord` read set becomes {1, 2, 3, 4}; version 4 carries
+`compat_epoch` and `compat_fenced_unix_ns` and is written only by an
+activation's fence, so the R1 table row for `ProvisioningRecord` changes
+with the code that adds the reader.
