@@ -369,7 +369,14 @@ the marker lookup ever runs.
 **Fail-open on a bad marker, fail-closed on a failed lookup, never a lost
 ack.** A corrupt or unparseable marker is treated as a miss: the request
 proceeds down the normal path (at-least-once), it is never surfaced as an
-error to the caller. A store error on a probe of the lookup (a marker GET
+error to the caller. A marker written by a newer build (a marker version above
+the one this build reads) is not corrupt: the keyed request is refused with the
+same retryable error as a failed lookup (HTTP 503 / gRPC `UNAVAILABLE`) before
+any of its data is written, since the request may already have landed under
+that marker; it is counted on
+`ravel_ingest_idempotency_newer_marker_refusals_total`, not on
+`ravel_ingest_idempotency_lookup_failures_total`. A corrupt marker keeps the
+handling above. A store error on a probe of the lookup (a marker GET
 refused, `AccessDenied` included, or any other store failure; a missing marker
 is a miss, not an error) at an hour newer than every marker found means the
 gateway cannot tell whether the request already landed, so the keyed request
@@ -383,7 +390,7 @@ any of the request's data is written. The write gets what is left of that one
 admission between the two. The bound is on the lookup: the lookup cannot leave
 the write a zero budget, under which a strict write could time out after its
 records were enqueued, flush durably with no marker written, and be stored
-twice by the retry. The response says
+twice by the retry. The response to a failed lookup says
 only that the idempotency marker lookup failed; the store error and the marker
 key go to the gateway's log. A request without a key performs no lookup and is
 unaffected: its write gets the whole `ack_deadline`. A `write_marker` failure after a
