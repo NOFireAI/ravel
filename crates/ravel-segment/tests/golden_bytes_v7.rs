@@ -640,3 +640,25 @@ fn two_exemplars_sharing_a_key_both_survive_a_round_trip() {
     assert_eq!(probed.len(), 2);
     assert_eq!(probed[1].trace_id, [0x33; 16]);
 }
+
+/// BLAKE3 (hex) of the default writer's output for two of the fixed inputs
+/// above, computed on the commit before the writers took a version argument
+/// (issue #4242). The constructors that take no version keep emitting the
+/// window's current version byte for byte.
+const NO_SPARSE_DEFAULT_BLAKE3: &str =
+    "7a5fca31c13f8ff6f1a48f33225bf1930dcd3b209bc2aa6270375faa4a7e3ac4";
+const MERGED_PROVENANCE_DEFAULT_BLAKE3: &str =
+    "a2b621be14ac3b001cc37c6f0871da65f3c2ca88f7fb96faa8802f63d9c7829d";
+
+#[test]
+fn default_writer_output_matches_the_digest_pinned_before_the_version_parameter() {
+    assert_eq!(
+        blake3::hash(&write_no_sparse()).to_hex().as_str(),
+        NO_SPARSE_DEFAULT_BLAKE3
+    );
+    assert_eq!(
+        blake3::hash(&write_merged_provenance()).to_hex().as_str(),
+        MERGED_PROVENANCE_DEFAULT_BLAKE3
+    );
+    assert_eq!(write_sparse().blake3, SPARSE_BLAKE3);
+}

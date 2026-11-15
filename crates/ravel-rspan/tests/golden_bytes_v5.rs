@@ -198,3 +198,16 @@ fn capture_golden_rspan_v5() {
     std::fs::create_dir_all(dir).expect("create fixtures dir");
     std::fs::write(format!("{dir}/golden_rspan_v5.bin"), write_golden()).expect("write fixture");
 }
+
+/// BLAKE3 (hex) of [`write_golden`]'s output, computed on the commit before
+/// the writer took a version argument (issue #4242). A writer built without a
+/// version keeps emitting the window's current version byte for byte.
+const DEFAULT_BLAKE3: &str = "8a4f417f4aee86699255f70a151c2fb52e15df39d18194861eab31d9b97530c1";
+
+#[test]
+fn default_writer_output_matches_the_digest_pinned_before_the_version_parameter() {
+    assert_eq!(
+        blake3::hash(&write_golden()).to_hex().as_str(),
+        DEFAULT_BLAKE3
+    );
+}

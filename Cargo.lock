@@ -5281,6 +5281,7 @@ dependencies = [
 name = "ravel-rspan"
 version = "0.33.0"
 dependencies = [
+ "blake3",
  "crc32c",
  "proptest",
  "prost",
