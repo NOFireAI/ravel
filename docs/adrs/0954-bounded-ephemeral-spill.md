@@ -1409,7 +1409,9 @@ This is the parallel bucket spill amendment. The figures are from epic
    - the retry plan, `bucket`, `bucket_without_disk` (a bucketed exec
      ran with spill on and a disk manager that allows no temp files, so
      it could not spill) or `sort_merge`, and for both bucketed values
-     the derived `bits` and `routed_chunk_rows`;
+     the derived `bits` and `routed_chunk_rows`, and `routed_chunk_bytes`,
+     the byte budget of a chunk on a route with a string or binary column
+     (`none` on a fixed-width route; ADR-3565 string-keys amendment);
    - `exchange_spill_bytes_written` and `exchange_spill_files`: the spill
      metrics of every `RepartitionExec` in the plan, read through
      `accumulate_spill_counts` (`spill.rs:815`) as today's per-operator
