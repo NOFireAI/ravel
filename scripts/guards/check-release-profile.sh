@@ -22,10 +22,19 @@
 #      `CARGO_PROFILE_RELEASE_*` variable, which overrides the manifest.
 #   4. publish-images.yml builds from the root Dockerfile: it names no other
 #      Dockerfile.
+#   5. The test-only `format-drill` feature of ravel-segment, ravel-logseg and
+#      ravel-rspan (ADR-4233 decision 9) cannot reach a published image. Neither
+#      the Dockerfile nor publish-images.yml names `format-drill` or
+#      `--all-features` outside a comment. In the workspace manifests (the root
+#      one, crates/*, services/*) `format-drill` appears only under a
+#      dev-dependencies table or in the value of a feature itself named
+#      `format-drill`: never in `default`, a forward under another name (which
+#      the Dockerfile could enable without naming it), or a non-dev dependency.
 #
 # Exit 0 clean, 1 on a finding, 2 when an anchor is missing (no
-# `[profile.release]` table, no `cargo build` line, a file that is not there):
-# a scan that found nothing to check is not a pass.
+# `[profile.release]` table, no `cargo build` line, a file that is not there,
+# a drill crate that no longer declares the feature): a scan that found
+# nothing to check is not a pass.
 #
 # Run: scripts/guards/check-release-profile.sh
 # Cases: scripts/guards/check-release-profile.test.sh
@@ -48,8 +57,13 @@ missing() {
   exit 2
 }
 
+drill_crates=(crates/ravel-segment crates/ravel-logseg crates/ravel-rspan)
+
 for f in "${manifest}" "${dockerfile}" "${publish}"; do
   [[ -f "${f}" ]] || missing "${f} does not exist"
+done
+for c in "${drill_crates[@]}"; do
+  [[ -f "${c}/Cargo.toml" ]] || missing "${c}/Cargo.toml does not exist"
 done
 
 # --- 1. the release profile --------------------------------------------------
@@ -188,9 +202,54 @@ while IFS= read -r hit; do
 done < <(grep -nE '^[[:space:]]*file:[[:space:]]*' "${publish}" \
   | grep -vE '^[0-9]+:[[:space:]]*file:[[:space:]]*(\./)?Dockerfile[[:space:]]*$' || true)
 
+# --- 5. format-drill stays out of release builds -------------------------------
+
+for f in "${dockerfile}" "${publish}"; do
+  while IFS= read -r hit; do
+    [[ -n "${hit}" ]] || continue
+    finding "${f}:${hit%%:*}: release build enables format-drill or --all-features: ${hit#*:}"
+  done < <(awk '
+    { line = $0; sub(/(^|[[:space:]])#.*$/, "", line) }
+    line ~ /format-drill|--all-features/ { print NR ":" $0 }
+  ' "${f}")
+done
+
+for c in "${drill_crates[@]}"; do
+  awk '
+    /^[[:space:]]*\[/ { in_features = ($0 == "[features]"); next }
+    in_features && /^[[:space:]]*format-drill[[:space:]]*=/ { found = 1 }
+    END { exit !found }
+  ' "${c}/Cargo.toml" || missing "${c}/Cargo.toml declares no format-drill feature"
+done
+
+# Each line naming format-drill, with the table it sits in and the key it
+# belongs to (a continuation line of a multi-line array keeps the key that
+# opened it). Allowed: any dev-dependencies table, and the value of a
+# `format-drill` feature.
+manifests=("${manifest}")
+for f in crates/*/Cargo.toml services/*/Cargo.toml; do
+  [[ -f "${f}" ]] && manifests+=("${f}")
+done
+for f in "${manifests[@]}"; do
+  while IFS= read -r hit; do
+    [[ -n "${hit}" ]] || continue
+    finding "${f}:${hit%%:*}: enables format-drill outside dev-dependencies or its own definition: ${hit#*:}"
+  done < <(awk '
+    /^[[:space:]]*\[/ { table = $0; gsub(/[[:space:]]/, "", table); key = ""; next }
+    { line = $0; sub(/(^|[[:space:]])#.*$/, "", line) }
+    match(line, /^[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*=/) {
+      key = substr(line, RSTART, RLENGTH); sub(/=$/, "", key); gsub(/[[:space:]]/, "", key)
+    }
+    index(line, "format-drill") == 0 { next }
+    table ~ /dev-dependencies/ { next }
+    table == "[features]" && key == "format-drill" { next }
+    { print FNR ":" $0 }
+  ' "${f}")
+done
+
 if [[ "${findings}" -gt 0 ]]; then
   printf '%s finding(s): published binaries would not be built on the optimised release profile\n' "${findings}"
   exit 1
 fi
-printf 'release profile guard: clean (lto=%s, codegen-units=%s, debug=%s, %s cargo build(s) in %s)\n' \
-  "${lto}" "${units}" "${debug}" "${builds}" "${dockerfile}"
+printf 'release profile guard: clean (lto=%s, codegen-units=%s, debug=%s, %s cargo build(s) in %s; format-drill test-only: %s defining crate(s), %s manifest(s) scanned)\n' \
+  "${lto}" "${units}" "${debug}" "${builds}" "${dockerfile}" "${#drill_crates[@]}" "${#manifests[@]}"

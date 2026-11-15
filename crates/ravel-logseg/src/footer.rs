@@ -98,12 +98,58 @@ impl SupportedVersions {
 
 /// RLOG's supported-version window: `{5}` since ADR-2135, which deleted the
 /// version-4 reader under the same pre-release posture ADR-0892 applied to
-/// version 3, keeping RLOG in line with RSPAN and RSEG. The
-/// writer emits `SUPPORTED_VERSIONS.newest()`; the reader accepts that and
-/// nothing else. This is the single source the writer, the reader gate,
+/// version 3, keeping RLOG in line with RSPAN and RSEG. Without the
+/// test-only `format-drill` feature the writer emits `SUPPORTED_VERSIONS.newest()`
+/// and the reader accepts that and nothing else. This is the single source the writer, the reader gate,
 /// `audit-versions`, `migrate`, and the compactor's `OUTPUT_FORMAT_VERSION` all
 /// read.
+#[cfg(not(feature = "format-drill"))]
 pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);
+
+/// Under the test-only `format-drill` feature the window is two wide,
+/// `{VERSION_DRILL, VERSION}` (ADR-4233 decision 9).
+#[cfg(feature = "format-drill")]
+pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION_DRILL);
+
+/// The drill version (ADR-4233 decision 9): [`VERSION`]'s bytes under trailer
+/// version 6, so compatibility tests run against two real window versions.
+/// No reader behaviour differs between the two; only the trailer field (and
+/// the footer crc over it) does. Exists only under the test-only
+/// `format-drill` feature, which `scripts/guards/check-release-profile.sh`
+/// refuses in the published-image build.
+#[cfg(feature = "format-drill")]
+pub const VERSION_DRILL: u16 = VERSION + 1;
+
+/// The trailer version an [`crate::writer::RlogWriter`] emits (ADR-4233
+/// decision 2). Holds only a version inside [`SUPPORTED_VERSIONS`]: the one
+/// constructor refuses anything else, so a writer cannot be asked to emit an
+/// object this build's reader would reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteVersion(u16);
+
+impl WriteVersion {
+    /// What a writer emits unless told otherwise: [`VERSION`], under
+    /// `format-drill` too, since a writer emits the older window version until
+    /// the newer is activated (ADR-4233 decision 2).
+    pub const CURRENT: WriteVersion = WriteVersion(VERSION);
+
+    /// `version` as a write version, or [`LogSegError::UnsupportedVersion`]
+    /// when it is outside [`SUPPORTED_VERSIONS`].
+    pub fn new(version: u16) -> Result<Self, LogSegError> {
+        if SUPPORTED_VERSIONS.contains(version) {
+            Ok(WriteVersion(version))
+        } else {
+            Err(LogSegError::UnsupportedVersion(version))
+        }
+    }
+
+    /// The trailer version number.
+    pub const fn number(self) -> u16 {
+        self.0
+    }
+}
+
+const _: () = assert!(SUPPORTED_VERSIONS.contains(WriteVersion::CURRENT.number()));
 
 /// Signal byte for log segments.
 pub const SIGNAL_LOGS: u8 = 2;
@@ -448,7 +494,13 @@ impl LogFooter {
 /// checksum), then `footer_len`
 /// (u32 LE), `version` (u16 LE), `signal`, `reserved`, `magic` — every trailer
 /// byte except the crc field itself (ADR-0010 §4).
-fn footer_crc(footer_bytes: &[u8], footer_len: u32, version: u16, signal: u8, reserved: u8) -> u32 {
+pub(crate) fn footer_crc(
+    footer_bytes: &[u8],
+    footer_len: u32,
+    version: u16,
+    signal: u8,
+    reserved: u8,
+) -> u32 {
     let mut crc = crc32c::crc32c(footer_bytes);
     crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
     crc = crc32c::crc32c_append(crc, &version.to_le_bytes());
@@ -463,7 +515,8 @@ pub fn write_footer_and_trailer(out: &mut Vec<u8>, footer: &LogFooter) {
 
 /// [`write_footer_and_trailer`] with the trailer version named explicitly.
 ///
-/// The writer always emits [`VERSION`]. This exists so a test can stamp a
+/// The writer emits its [`WriteVersion`] through this. It takes a bare `u16`
+/// so a test can also stamp a
 /// version the reader does not accept, and assert the typed rejection, without
 /// a second copy of the trailer arithmetic: a hand-rolled trailer whose
 /// `footer_crc32c` did not cover the substituted version byte would be refused
@@ -900,7 +953,7 @@ mod tests {
     /// rejection is the version check, not an incidental crc mismatch.
     #[test]
     fn rejects_newer_trailer_as_unsupported_version() {
-        let newer = VERSION + 1;
+        let newer = SUPPORTED_VERSIONS.newest() + 1;
         let footer = sample_footer(sample_sections());
         let footer_bytes = footer.to_proto().encode_to_vec();
         let footer_len = footer_bytes.len() as u32;
@@ -977,6 +1030,7 @@ mod tests {
     /// Today's RLOG window is a single version: ADR-0892 deleted the version-3
     /// reader and ADR-2135 the version-4 one, so nothing but [`VERSION`] is
     /// accepted.
+    #[cfg(not(feature = "format-drill"))]
     #[test]
     fn todays_window_accepts_only_the_current_version() {
         assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION);

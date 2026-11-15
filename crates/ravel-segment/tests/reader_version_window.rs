@@ -3,7 +3,8 @@
 //! what a version outside the window produces, and that the trailer gate and
 //! the structural validator admit exactly the same set.
 //!
-//! The window holds only v7 today, so an "outside the window" fixture is a real
+//! The window holds only v7 today (v7 and the drill version 8 under the
+//! test-only `format-drill` feature), so an "outside the window" fixture is a real
 //! v7 object with its trailer version field overwritten. That is not a
 //! reconstructed old object and does not pretend to be one: the version field
 //! is read before anything that depends on the layout (docs/segment-format.md
@@ -105,7 +106,9 @@ fn a_version_inside_the_window_reads_normally() {
 /// `UnsupportedVersion`, not `FooterCrcMismatch`.
 #[test]
 fn a_version_outside_the_window_fails_with_unsupported_version() {
-    for version in [0u16, 1, 6, 8, 100, u16::MAX] {
+    // One past the newest: 8 by default, 9 under `format-drill`.
+    let next = SUPPORTED_VERSIONS.newest() + 1;
+    for version in [0u16, 1, 6, next, 100, u16::MAX] {
         assert!(
             !SUPPORTED_VERSIONS.contains(version),
             "fixture version {version} must be outside today's window"
@@ -188,10 +191,11 @@ fn classify_trailer_separates_an_old_version_from_corruption() {
         TrailerClass::Readable(SegmentVersion::V7)
     );
 
-    let stamped = object_stamped(8);
+    let next = SUPPORTED_VERSIONS.newest() + 1;
+    let stamped = object_stamped(next);
     assert_eq!(
         classify_trailer(total, &stamped[stamped.len() - TRAILER_LEN_USIZE..]),
-        TrailerClass::OutsideVersionWindow(8),
+        TrailerClass::OutsideVersionWindow(next),
         "a version this build does not admit is not corruption"
     );
 

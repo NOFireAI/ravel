@@ -21,6 +21,12 @@ stage-timing = []
 # reader's refusal can be exercised. Off by default; only dev-dependencies may
 # enable it, never a production crate.
 test-support = []
+# Test-only (ADR-4233 decision 9, issue #4242): adds the drill version, v5's
+# bytes under trailer version 6, widens the reader window to {6, 5} and lets
+# `WriteVersion::new(6)` succeed, so compatibility tests run against two real
+# versions. Off by default; scripts/guards/check-release-profile.sh refuses it
+# in the published-image build and in any default or non-dev feature set.
+format-drill = []
 
 [dependencies]
 bytes = { workspace = true }

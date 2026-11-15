@@ -46,7 +46,9 @@ pub(crate) mod pb {
 
 pub use columnar::{BytesColumn, ColumnarBlockView, I64Column};
 pub use error::SpanSegError;
-pub use footer::{SpanFooter, SuffixOutcome, decode_section, open, open_from_suffix, read_section};
+pub use footer::{
+    SpanFooter, SuffixOutcome, WriteVersion, decode_section, open, open_from_suffix, read_section,
+};
 pub use key_index::{
     KEY_IDX_BUCKET_MAX_ENTRIES, KeyIdxBlockFinding, KeyIdxInspection, KeyIdxSummary,
     TRACE_ID_FIELD, TRACE_KEY_IDX_BUCKET_BITS, TRACE_KEY_IDX_BUCKETS, TraceKeyProbe,
