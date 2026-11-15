@@ -82,7 +82,7 @@ use ravel_catalog::{
 use ravel_commit::{keys, record};
 use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum, Version,
-    list_all,
+    list_all_reporting,
 };
 use ravel_proto::commit::v1::{CompactionRecord, RewriteRecord};
 use ravel_types::{Signal, TenantHash};
@@ -94,7 +94,7 @@ use crate::compact::CompactionInputSkipReason;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::publish::PublishOutcome;
-use crate::read::{BucketListing, list_bucket, load_inputs};
+use crate::read::{BucketListing, list_bucket_strict, load_inputs, refuse_unaddressable};
 use crate::rewrite::{
     MigrateOutcome, ReencodeOutcome, current_part_version, migrate_bucket_format,
     reencode_compaction_parts,
@@ -338,6 +338,100 @@ pub struct UnwritableBucket {
     pub reason: CompactionInputSkipReason,
 }
 
+/// One bucket the walk held (ADR-4233 decision 6): an input the migration
+/// cannot carry forward. The walk goes on past it, and a run that held any
+/// bucket fails with [`MaintainError::MigrateHeld`] and raises no floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrateHeldBucket {
+    pub shard: u32,
+    pub ingest_hour: u32,
+    pub reason: MigrateHoldReason,
+}
+
+/// Why the walk held a [`MigrateHeldBucket`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrateHoldReason {
+    /// The input's trailer version is outside this build's reader window.
+    InputOutOfWindow { object_key: String, version: u16 },
+    /// The input's commit record is stamped at a format version above the one
+    /// this build writes.
+    NewerThanWritable { commit_key: String, version: u32 },
+    /// The input object failed to decode.
+    CorruptInput { detail: String },
+}
+
+impl MigrateHoldReason {
+    /// The `reason` label value.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MigrateHoldReason::InputOutOfWindow { .. } => "input_out_of_window",
+            MigrateHoldReason::NewerThanWritable { .. } => "newer_than_writable",
+            MigrateHoldReason::CorruptInput { .. } => "corrupt_input",
+        }
+    }
+
+    /// The hold a migration refusal maps to, or `None` for an error that still
+    /// fails the run.
+    fn from_refusal(err: &MaintainError) -> Option<Self> {
+        match err {
+            MaintainError::InputOutOfWindow {
+                object_key,
+                version,
+                ..
+            } => Some(MigrateHoldReason::InputOutOfWindow {
+                object_key: object_key.clone(),
+                version: *version,
+            }),
+            MaintainError::NewerThanWritable {
+                commit_key,
+                version,
+                ..
+            } => Some(MigrateHoldReason::NewerThanWritable {
+                commit_key: commit_key.clone(),
+                version: *version,
+            }),
+            MaintainError::Segment(_) | MaintainError::LogSeg(_) | MaintainError::SpanSeg(_) => {
+                Some(MigrateHoldReason::CorruptInput {
+                    detail: err.to_string(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for MigrateHoldReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MigrateHoldReason::InputOutOfWindow {
+                object_key,
+                version,
+            } => write!(
+                f,
+                "{}: {object_key:?} is at format version {version}, outside this build's reader window",
+                self.name()
+            ),
+            MigrateHoldReason::NewerThanWritable {
+                commit_key,
+                version,
+            } => write!(
+                f,
+                "{}: {commit_key:?} is recorded at format version {version}, above what this build writes",
+                self.name()
+            ),
+            MigrateHoldReason::CorruptInput { detail } => write!(f, "{}: {detail}", self.name()),
+        }
+    }
+}
+
+/// Each of `held` with its reason, for [`MaintainError::MigrateHeld`]'s message.
+pub(crate) fn display_held(held: &[MigrateHeldBucket]) -> String {
+    held.iter()
+        .map(|h| format!("shard {} hour {}: {}", h.shard, h.ingest_hour, h.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// What one [`count_below_target`] pass found below the target, with the three
 /// sources kept apart (ADR-1331 decision 1).
 ///
@@ -573,29 +667,50 @@ fn migrate_cursor_key(tenant_hash: &TenantHash, signal: Signal, family: &str) ->
     )
 }
 
-/// Read the advisory migrate cursor. Returns the recorded `(shard, hour)`
-/// position (the last bucket the walk finished) and the object version for the
-/// next CAS. A decode failure or unrecognized payload is treated as "no usable
-/// position" (`None`, rescan from the start) while keeping the version so the
-/// stale bytes can be CAS-overwritten cleanly; store faults propagate.
-async fn read_cursor(
-    store: &dyn ObjectStoreBackend,
-    key: &str,
-) -> Result<(Option<(u32, u32)>, Option<Version>)> {
+/// What [`read_cursor`] found at the migrate-cursor key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredCursor {
+    Absent,
+    /// The last `(shard, hour)` the walk finished, and the version for the
+    /// next CAS.
+    Usable {
+        position: (u32, u32),
+        version: Version,
+    },
+    /// This build's tag with a malformed body (or an empty payload): no usable
+    /// position, CAS-overwritten by the next write.
+    Unrecognized {
+        version: Version,
+    },
+    /// Another build's tag (ADR-4233 decision 4, H9): the run starts from the
+    /// beginning and leaves it in place, writing and deleting nothing.
+    ForeignTag {
+        tag: u8,
+    },
+}
+
+/// Read the advisory migrate cursor. A decode failure is "no usable position"
+/// (rescan from the start), never an error; store faults propagate.
+async fn read_cursor(store: &dyn ObjectStoreBackend, key: &str) -> Result<StoredCursor> {
     match store.get(key, GetRange::Full).await {
         Ok(got) => {
             let data = got.data;
-            if data.len() == MIGRATE_CURSOR_LEN && data[0] == MIGRATE_CURSOR_TAG {
-                let shard = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-                let hour = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
-                Ok((Some((shard, hour)), Some(got.version)))
-            } else {
-                // Unrecognized payload: ignore the position (full rescan) but
-                // keep the version so the next write CAS-overwrites it cleanly.
-                Ok((None, Some(got.version)))
+            match data.first() {
+                Some(&tag) if tag != MIGRATE_CURSOR_TAG => Ok(StoredCursor::ForeignTag { tag }),
+                Some(_) if data.len() == MIGRATE_CURSOR_LEN => {
+                    let shard = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+                    let hour = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
+                    Ok(StoredCursor::Usable {
+                        position: (shard, hour),
+                        version: got.version,
+                    })
+                }
+                _ => Ok(StoredCursor::Unrecognized {
+                    version: got.version,
+                }),
             }
         }
-        Err(StoreError::NotFound) => Ok((None, None)),
+        Err(StoreError::NotFound) => Ok(StoredCursor::Absent),
         Err(e) => Err(MaintainError::Store(e)),
     }
 }
@@ -671,6 +786,20 @@ async fn list_shard_hours(
 ) -> Result<Vec<u32>> {
     let shard_prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)?;
     let listed = store.list_delimited(&shard_prefix).await?;
+    // Strict (ADR-4233 decision 6): an hour under an unaddressable prefix, or a
+    // key the census cannot address, would otherwise drop out of the walk.
+    if let Some(key) = listed
+        .unaddressable
+        .first()
+        .map(|k| k.key.clone())
+        .or_else(|| listed.unaddressable_prefixes.first().cloned())
+    {
+        return Err(MaintainError::UnaddressableKey {
+            prefix: shard_prefix,
+            key,
+            count: (listed.unaddressable.len() + listed.unaddressable_prefixes.len()) as u64,
+        });
+    }
     let mut hours: Vec<u32> = Vec::new();
     for common in &listed.common_prefixes {
         let rest = common
@@ -1047,7 +1176,9 @@ async fn read_shard_family(
     use prost::Message;
 
     let prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)?;
-    let metas = list_all(store, &prefix).await?;
+    let listed = list_all_reporting(store, &prefix).await?;
+    refuse_unaddressable(&prefix, &listed.unaddressable)?;
+    let metas = listed.objects;
 
     // First pass: classify every key by shape (parsing a key's shape is free,
     // it only inspects the filename), read each compaction and rewrite record,
@@ -1350,7 +1481,7 @@ async fn refusal_is_permanent(
     config: &CompactorConfig,
     target_version: u32,
 ) -> Result<bool> {
-    let fresh = list_bucket(store, bucket).await?;
+    let fresh = list_bucket_strict(store, bucket).await?;
     let served = raw_served_commit_keys(store, bucket, &fresh).await?;
     if served.records_read == 0 {
         return Ok(false);
@@ -1711,7 +1842,25 @@ pub async fn migrate_family(
     let scan_shards = scan_shard_count(store, &tenant_hash, signal, configured_shards).await?;
 
     let cursor_key = migrate_cursor_key(&tenant_hash, signal, family);
-    let (start_after, cursor_version) = read_cursor(store, &cursor_key).await?;
+    let (start_after, cursor_version, cursor_writable) =
+        match read_cursor(store, &cursor_key).await? {
+            StoredCursor::Absent => (None, None, true),
+            StoredCursor::Usable { position, version } => (Some(position), Some(version), true),
+            StoredCursor::Unrecognized { version } => (None, Some(version), true),
+            StoredCursor::ForeignTag { tag } => {
+                tracing::warn!(
+                    tenant = %tenant_hash.to_hex(),
+                    signal = ?signal,
+                    family,
+                    cursor_key = %cursor_key,
+                    tag,
+                    "migrate cursor carries a tag this build does not know; walking from the \
+                     beginning and leaving the stored cursor in place"
+                );
+                (None, None, false)
+            }
+        };
+    let mut held: Vec<MigrateHeldBucket> = Vec::new();
 
     let mut report = FamilyMigrateReport::default();
     let mut spent = 0u64;
@@ -1744,7 +1893,7 @@ pub async fn migrate_family(
             // resolve to a winner and a loser leaves every loser-only input
             // served as a raw L0 segment, so record presence would skip a live
             // below-target record that the re-audit rightly counts.
-            let listing = list_bucket(store, &bucket).await?;
+            let listing = list_bucket_strict(store, &bucket).await?;
             if bucket.is_sealed(now, config) && listing.tombstone_key.is_none() {
                 let served = raw_served_commit_keys(store, &bucket, &listing).await?;
                 let l0_below = if served.keys.is_empty() {
@@ -1821,7 +1970,33 @@ pub async fn migrate_family(
                                 spent += l0_below;
                                 None
                             }
-                            other => Some(other?),
+                            Ok(migrated) => Some(migrated),
+                            // An input the migration cannot carry forward holds
+                            // the bucket (ADR-4233 decision 6): the walk goes
+                            // on, and the run fails at its end without raising
+                            // the floor.
+                            Err(err) => {
+                                let Some(reason) = MigrateHoldReason::from_refusal(&err) else {
+                                    return Err(err);
+                                };
+                                tracing::warn!(
+                                    tenant = %tenant_hash.to_hex(),
+                                    signal = ?signal,
+                                    shard,
+                                    ingest_hour = hour,
+                                    reason = reason.name(),
+                                    error = %err,
+                                    "migrate held a bucket; the walk goes on and the floor \
+                                     stays unraised"
+                                );
+                                held.push(MigrateHeldBucket {
+                                    shard,
+                                    ingest_hour: hour,
+                                    reason,
+                                });
+                                spent += l0_below;
+                                None
+                            }
                         };
                     if let Some(migrated) = migrated {
                         match migrated {
@@ -1952,10 +2127,10 @@ pub async fn migrate_family(
         // Budget exhausted mid-walk: persist the advisory cursor at the last
         // examined bucket (best-effort CAS) and return control; the caller
         // re-invokes and resumes from here.
-        if let Some((shard, hour)) = position {
+        if let Some((shard, hour)) = position.filter(|_| cursor_writable) {
             write_cursor(store, &cursor_key, shard, hour, cursor_version).await?;
         }
-        return Ok(report);
+        return held_or(report, held);
     }
 
     // The walk drained, so there is nothing left to resume: clear the cursor.
@@ -1967,7 +2142,15 @@ pub async fn migrate_family(
     // tells the operator to perform. Deleting is idempotent and the cursor is
     // advisory, so losing it only ever costs a rescan.
     report.cursor_advanced_to = None;
-    store.delete(&cursor_key).await?;
+    if cursor_writable {
+        store.delete(&cursor_key).await?;
+    }
+
+    // A held bucket blocks the raise whatever the re-audit would find, so the
+    // re-audit is not run.
+    if !held.is_empty() {
+        return held_or(report, held);
+    }
 
     // The walk drained within budget. Re-audit FRESH before raising the floor:
     // this is the race close. A record that landed below the target between the
@@ -2057,6 +2240,21 @@ pub async fn migrate_family(
     Ok(report)
 }
 
+/// `report`, or [`MaintainError::MigrateHeld`] carrying it when the walk held
+/// any bucket.
+fn held_or(
+    report: FamilyMigrateReport,
+    held: Vec<MigrateHeldBucket>,
+) -> Result<FamilyMigrateReport> {
+    if held.is_empty() {
+        return Ok(report);
+    }
+    Err(MaintainError::MigrateHeld {
+        held,
+        report: Box::new(report),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -2086,6 +2284,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::read::list_bucket;
     use crate::{CompactorConfig, FixedClock};
 
     const TENANT: &str = "acme";
@@ -2140,7 +2339,8 @@ mod tests {
     /// commit record as given. The object bytes are always real v7; only the
     /// metadata a caller reads without decoding can be made to disagree, which
     /// is how a "below target" or "straggler" record is fabricated over a real
-    /// object. A distinct `seq` keeps each seeded object's key unique.
+    /// object. A distinct `seq` keeps each seeded object's key unique. Returns
+    /// the data object's key.
     async fn seed_at(
         store: &dyn ObjectStoreBackend,
         shard: u32,
@@ -2148,7 +2348,7 @@ mod tests {
         seq: u64,
         metric: &str,
         segment_format_version: u32,
-    ) {
+    ) -> String {
         let th = tenant_hash();
         let writer_id = Uuid::from_u128(u128::from(seq));
         let created = i64::from(hour) * NS_PER_HOUR + (seq as i64) * 1_000_000;
@@ -2211,6 +2411,7 @@ mod tests {
             .put(&commit_key, record::encode(&rec), PutOptions::default())
             .await
             .expect("put commit record");
+        data_key
     }
 
     /// Count compaction records physically present under one `(shard, hour)`
@@ -4959,5 +5160,378 @@ mod tests {
             assert!(!report.walk_complete, "{report:?}");
             assert_eq!(report.cursor_advanced_to, Some((0, hour)), "{report:?}");
         }
+    }
+
+    /// Overwrite one stored RSEG object's trailer `version: u16` in place.
+    async fn stamp_rseg_version(store: &dyn ObjectStoreBackend, key: &str, version: u16) {
+        let got = store
+            .get(key, GetRange::Full)
+            .await
+            .expect("object present");
+        let mut bytes = got.data.to_vec();
+        let at = bytes.len() - ravel_segment::TRAILER_LEN as usize + 8;
+        bytes[at..at + 2].copy_from_slice(&version.to_le_bytes());
+        store
+            .put(key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("overwrite");
+    }
+
+    /// A trailer version no reader in this build accepts.
+    fn out_of_window_rseg_version() -> u16 {
+        ravel_segment::SUPPORTED_VERSIONS.newest() + 1
+    }
+
+    /// What a [`CursorDeleteStore`] does when the drained walk clears its
+    /// cursor: the last store call before the held check and the re-audit.
+    enum OnCursorDelete {
+        /// Delete every commit record in `(shard, hour)`, so a re-audit that
+        /// runs after it finds that bucket clean.
+        DropCommits { shard: u32, hour: u32 },
+        /// Store a key no operation can address.
+        InsertForeign(String),
+    }
+
+    /// Runs its [`OnCursorDelete`] once, before forwarding the delete of
+    /// `cursor_key`: after the walk, before the floor decision.
+    struct CursorDeleteStore {
+        inner: Arc<MemoryStore>,
+        cursor_key: String,
+        action: OnCursorDelete,
+        fired: AtomicBool,
+    }
+
+    impl CursorDeleteStore {
+        fn new(inner: Arc<MemoryStore>, action: OnCursorDelete) -> Self {
+            CursorDeleteStore {
+                inner,
+                cursor_key: migrate_cursor_key(&tenant_hash(), Signal::Metrics, FAMILY),
+                action,
+                fired: AtomicBool::new(false),
+            }
+        }
+
+        fn fired(&self) -> bool {
+            self.fired.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for CursorDeleteStore {
+        async fn put(&self, key: &str, data: Bytes, opts: PutOptions) -> StoreResult<PutOutcome> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> StoreResult<GetOutcome> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> StoreResult<ObjectMeta> {
+            self.inner.head(key).await
+        }
+
+        async fn list(&self, prefix: &str, page: Option<PageToken>) -> StoreResult<ListPage> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> StoreResult<DelimitedList> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> StoreResult<()> {
+            if key == self.cursor_key && !self.fired.swap(true, Ordering::SeqCst) {
+                match &self.action {
+                    OnCursorDelete::DropCommits { shard, hour } => {
+                        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, *shard, *hour);
+                        let listed = list_bucket(self.inner.as_ref(), &bucket)
+                            .await
+                            .expect("list bucket");
+                        for commit_key in listed.commit_keys {
+                            self.inner.delete(&commit_key).await?;
+                        }
+                    }
+                    OnCursorDelete::InsertForeign(foreign) => {
+                        self.inner
+                            .insert_foreign(foreign, Bytes::from_static(b"foreign"));
+                    }
+                }
+            }
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                multipart: false,
+                ..self.inner.capabilities()
+            }
+        }
+    }
+
+    async fn run_migrate(
+        store: &dyn ObjectStoreBackend,
+        now_hour: u32,
+        target: u32,
+        budget: MigrateBudget,
+    ) -> Result<FamilyMigrateReport> {
+        let clock = FixedClock::new(sealed_now_ns_for(now_hour));
+        migrate_family(
+            store,
+            &clock,
+            &CompactorConfig::default(),
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            target,
+            1,
+            budget,
+            "test",
+        )
+        .await
+    }
+
+    /// ADR-4233 decision 6: an input outside the reader window holds its
+    /// bucket. The walk migrates the buckets on either side of it, the run
+    /// fails with [`MaintainError::MigrateHeld`] naming the bucket, the
+    /// object and the reason, and no floor is raised.
+    #[tokio::test]
+    async fn out_of_window_input_holds_bucket_and_walk_continues() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        let held_key = seed_at(&store, 0, 101, 2, "beta", target - 1).await;
+        seed_at(&store, 0, 102, 3, "gamma", target - 1).await;
+        let version = out_of_window_rseg_version();
+        stamp_rseg_version(&store, &held_key, version).await;
+
+        let err = run_migrate(&store, 102, target, MigrateBudget::unlimited())
+            .await
+            .expect_err("a held bucket fails the run");
+        let message = err.to_string();
+        let MaintainError::MigrateHeld { held, report } = err else {
+            panic!("expected MigrateHeld, got {message}");
+        };
+        assert_eq!(
+            held,
+            vec![MigrateHeldBucket {
+                shard: 0,
+                ingest_hour: 101,
+                reason: MigrateHoldReason::InputOutOfWindow {
+                    object_key: held_key.clone(),
+                    version,
+                },
+            }]
+        );
+        assert!(report.walk_complete, "{report:?}");
+        assert_eq!(report.buckets_migrated, 2, "{report:?}");
+        assert_eq!(report.verification, None, "no re-audit ran: {report:?}");
+        assert_eq!(compaction_record_count(&store, 0, 100).await, 1);
+        assert_eq!(compaction_record_count(&store, 0, 101).await, 0);
+        assert_eq!(compaction_record_count(&store, 0, 102).await, 1);
+        assert!(
+            message.contains("input_out_of_window") && message.contains(&held_key),
+            "the error names the reason and the object: {message}"
+        );
+        assert!(
+            message.contains("shard 0 hour 101"),
+            "the error names the bucket: {message}"
+        );
+        let floor = current_floor_from_store(&store, &tenant_hash(), Signal::Metrics, FAMILY)
+            .await
+            .expect("read floor");
+        assert_eq!(floor, None, "a held bucket raises no floor");
+    }
+
+    /// A hold refuses the floor on its own, not through the re-audit. The
+    /// held bucket's commit record is deleted after the walk, so a re-audit
+    /// would come back clean; a hold that only skipped the bucket would then
+    /// raise the floor.
+    #[tokio::test]
+    async fn a_held_bucket_refuses_the_floor_when_the_re_audit_would_pass() {
+        let inner = Arc::new(MemoryStore::new());
+        provision(inner.as_ref(), 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(inner.as_ref(), 0, 100, 1, "alpha", target - 1).await;
+        let held_key = seed_at(inner.as_ref(), 0, 101, 2, "beta", target - 1).await;
+        stamp_rseg_version(inner.as_ref(), &held_key, out_of_window_rseg_version()).await;
+        let store = CursorDeleteStore::new(
+            Arc::clone(&inner),
+            OnCursorDelete::DropCommits {
+                shard: 0,
+                hour: 101,
+            },
+        );
+
+        let err = run_migrate(&store, 101, target, MigrateBudget::unlimited())
+            .await
+            .expect_err("a held bucket fails the run");
+        assert!(
+            store.fired(),
+            "the injection never ran; the test is vacuous"
+        );
+        assert!(
+            matches!(&err, MaintainError::MigrateHeld { held, .. } if held.len() == 1),
+            "{err}"
+        );
+        let floor =
+            current_floor_from_store(inner.as_ref(), &tenant_hash(), Signal::Metrics, FAMILY)
+                .await
+                .expect("read floor");
+        assert_eq!(floor, None, "a held bucket raises no floor");
+    }
+
+    fn foreign_key_in(shard: u32, hour: u32) -> String {
+        let prefix = keys::commit_shard_hour_prefix(&tenant_hash(), Signal::Metrics, shard, hour)
+            .expect("bucket prefix");
+        format!("{prefix}bad%key.cmt")
+    }
+
+    fn assert_unaddressable(result: Result<impl std::fmt::Debug>, key: &str, what: &str) {
+        match result {
+            Err(MaintainError::UnaddressableKey {
+                key: named, count, ..
+            }) => {
+                assert_eq!(named, key, "{what} names the key");
+                assert_eq!(count, 1, "{what} counts the key");
+            }
+            other => panic!("{what}: expected UnaddressableKey, got {other:?}"),
+        }
+    }
+
+    /// ADR-4233 decision 6: a key the store cannot address fails the walk,
+    /// the census and the below-target audit with a typed error naming it,
+    /// rather than shortening the population each one counts. No floor is
+    /// raised.
+    #[tokio::test]
+    async fn unaddressable_key_fails_the_census() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        let foreign = foreign_key_in(0, 100);
+        store.insert_foreign(&foreign, Bytes::from_static(b"foreign"));
+
+        assert_unaddressable(
+            run_migrate(&store, 100, target, MigrateBudget::unlimited()).await,
+            &foreign,
+            "migrate",
+        );
+        assert_unaddressable(
+            census_family(&store, &tenant_hash(), Signal::Metrics, 1).await,
+            &foreign,
+            "census",
+        );
+        assert_unaddressable(
+            count_below_target(&store, &tenant_hash(), Signal::Metrics, 1, target).await,
+            &foreign,
+            "audit",
+        );
+        let floor = current_floor_from_store(&store, &tenant_hash(), Signal::Metrics, FAMILY)
+            .await
+            .expect("read floor");
+        assert_eq!(floor, None, "a failed run raises no floor");
+    }
+
+    /// The verification re-audit uses the reporting listing as the walk does.
+    /// The key lands after the walk, so only the re-audit can see it.
+    #[tokio::test]
+    async fn an_unaddressable_key_after_the_walk_fails_the_re_audit() {
+        let inner = Arc::new(MemoryStore::new());
+        provision(inner.as_ref(), 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(inner.as_ref(), 0, 100, 1, "alpha", target - 1).await;
+        let foreign = foreign_key_in(0, 100);
+        let store = CursorDeleteStore::new(
+            Arc::clone(&inner),
+            OnCursorDelete::InsertForeign(foreign.clone()),
+        );
+
+        let result = run_migrate(&store, 100, target, MigrateBudget::unlimited()).await;
+        assert!(
+            store.fired(),
+            "the injection never ran; the test is vacuous"
+        );
+        assert_unaddressable(result, &foreign, "re-audit");
+        let floor =
+            current_floor_from_store(inner.as_ref(), &tenant_hash(), Signal::Metrics, FAMILY)
+                .await
+                .expect("read floor");
+        assert_eq!(floor, None, "a failed re-audit raises no floor");
+    }
+
+    /// A failed listing page under the census still fails it, as a store
+    /// error rather than an unaddressable key.
+    #[tokio::test]
+    async fn a_failed_census_page_propagates() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+
+        let mem = MemoryStore::with_page_size(1);
+        let target = VERSION_V7 as u32;
+        seed_at(&mem, 0, 100, 1, "alpha", target - 1).await;
+        seed_at(&mem, 0, 100, 2, "beta", target - 1).await;
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash(), Signal::Metrics, 0).expect("shard prefix");
+        let store = FaultStore::new(
+            mem,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Permanent("page lost".into()))
+                    .with_key_contains(shard_prefix)
+                    .with_occurrence(Occurrence::Nth(2)),
+            ),
+        );
+
+        let err = census_family(&store, &tenant_hash(), Signal::Metrics, 1)
+            .await
+            .expect_err("a failed page fails the census");
+        assert!(matches!(err, MaintainError::Store(_)), "{err:?}");
+        assert_eq!(store.fault_count(Op::List, FaultKind::Permanent), 1);
+    }
+
+    /// ADR-4233 decision 4, H9: a cursor payload under another build's tag is
+    /// left in place. The run walks from the beginning (the payload's body
+    /// would decode as `(0, 100)` under this build's layout, which would skip
+    /// hour 100), and neither the budget stop's CAS write nor the drain's
+    /// delete touches it.
+    #[tokio::test]
+    async fn unknown_cursor_tag_is_left_in_place() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        seed_at(&store, 0, 101, 2, "beta", target - 1).await;
+        let cursor_key = migrate_cursor_key(&tenant_hash(), Signal::Metrics, FAMILY);
+        let foreign = Bytes::from_static(&[0x7F, 0, 0, 0, 0, 100, 0, 0, 0]);
+        store
+            .put(&cursor_key, foreign.clone(), PutOptions::default())
+            .await
+            .expect("put foreign cursor");
+        let stored = || async {
+            store
+                .get(&cursor_key, GetRange::Full)
+                .await
+                .expect("cursor still present")
+                .data
+        };
+
+        let first = run_migrate(&store, 101, target, MigrateBudget::records(1))
+            .await
+            .expect("budget stop");
+        assert!(first.budget_exhausted, "{first:?}");
+        assert_eq!(first.buckets_migrated, 1, "{first:?}");
+        assert_eq!(
+            compaction_record_count(&store, 0, 100).await,
+            1,
+            "the walk started from the beginning"
+        );
+        assert_eq!(stored().await, foreign, "the budget stop wrote no cursor");
+
+        let second = run_migrate(&store, 101, target, MigrateBudget::unlimited())
+            .await
+            .expect("drain");
+        assert!(second.walk_complete, "{second:?}");
+        assert_eq!(compaction_record_count(&store, 0, 101).await, 1);
+        assert_eq!(stored().await, foreign, "the drain deleted no cursor");
     }
 }

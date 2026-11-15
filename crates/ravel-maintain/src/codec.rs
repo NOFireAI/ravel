@@ -209,13 +209,11 @@ impl SegmentCodec for RsegCodec {
         for input in inputs {
             let version = input.record.segment_format_version;
             if Self::recorded_newer_than_writable(input) {
-                return Err(crate::error::MaintainError::Invariant(format!(
-                    "RSEG rewrite input {:?} is recorded as format version {version}, newer than \
-                     the current output version {OUTPUT_FORMAT_VERSION}: a rewrite migrates an \
-                     older object forward and cannot write a version this build does not know, so \
-                     a newer-than-writable input is refused fail-closed (ADR-0066 decision 2)",
-                    input.commit_key
-                )));
+                return Err(crate::error::MaintainError::NewerThanWritable {
+                    commit_key: input.commit_key.clone(),
+                    version,
+                    writable: OUTPUT_FORMAT_VERSION,
+                });
             }
         }
         Ok(())
